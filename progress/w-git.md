@@ -177,3 +177,30 @@
   (ClientGone needed for hooks: driver hands it only to body_end); (3) memory per push attribution; (4) store commit
   passes; (5) t_a665 derived deadline; Windows restart spin check. Note: w-balance's t_a724_a_rebuild_reads... is
   load-flaky (passes alone).
+- 2026-11-20 ~11:15: LANDED 4f 061f4956a (propagate a stack step a unit), 4g 6737b04a7 (replay moves admitted an object
+  a turn: r110 restart spin), keepalive 61b178d42 (main 85d66d9cb). Local target DELETED on main's urgent order (Mac
+  disk); NO cargo on this Mac: builds/tests via kiln run with no `on` (CARGO_TARGET_DIR=~/.cache/w-git-target.noindex,
+  CARGO_INCREMENTAL=0). Post-merge confirm run r20 in flight.
+- NEXT: ruling asked on http-edge status-at-head (streamed routes) for the two long-history edge tests; then memory per
+  push (attribution, identical objects stored once, bounded working set); then Repository::commit's O(objects) passes;
+  t_a665 derived deadline. Findings sent: svn ssh test fails after w-svn 28e57ac18.
+- ~11:50 LANDED A-722 head at once 51158a4fb (main bbc6aa614): StatusMode::AtHead in http-edge; git smart services.
+  Told w-interop/w-hg/w-svn/main. Build route now: push a work branch, then kiln run (needs macos,tool:cargo,cpus=4,
+  sync false) in ~/.cache/w-git-clone worktree ~/.cache/w-git-wt on the Studio (kiln's repo sync times out).
+  r119 (w-interop): git cut 24/27 with zero spins/kills/restarts thanks to 4g.
+- NEXT: memory per push (attribution: pack buffer, fork, index rows, objects; identical objects stored once by
+  identity across concurrent pushes; bounded per-push working set), then Repository::commit O(objects) passes, then
+  t_a665 derived deadline.
+- ~12:40 LOAD CONFIRM sent: long-history edge tests 12/12 at load 55-59 (release, .local-2, 60 PID burners).
+- MEMORY PER PUSH (Ada's MEMORY SIZING rule, briefs/common.md): ATTRIBUTION (diag branch agents/w-git-memdiag, test
+  git_push::tests::diag_memory_of_one_push, request file ~/.cache/w-git-runs/v150.req on .local-2): v1.5.0 push 9.4 MiB
+  -> admission peak 34.4 MiB transient; ContentStore 309 MiB after = every object inflated (git: 304.6 MiB inflated:
+  blobs 231, trees 69, commits 4.5). Plan = ruling B, sent to main:
+  B1 rows name object by (pack ContentId, entry offset, kind, len); pushed pack held once by identity.
+  B2 reads (Place::Indexed, IndexedObjects, bytes_of, PushedObjects, hook_view text, graph, sparse, revision, derived
+     trees/commits, paths) inflate from the pack in place; delta bases via a per-shard scratch sized by EWMA of the
+     working set, given back idle; no per-object alloc; turned read for long chains.
+  B3 quarantine keeps entry places, not inflated objects (intake admit_queued -> GitPush::admit_all -> admit_object
+     -> Push::admit -> Quarantine::admit put windows).
+  B4 remove object_bytes/put_object inflated copies (upload/encoding/sparse read the pack). No hold_bytes, no new store.
+  Red per step: resident <= k*pack + base, k derived. Worktree ~/slates-work/w-git-packed (from origin/main 86e23c4ef).

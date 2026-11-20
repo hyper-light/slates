@@ -150,3 +150,111 @@
   t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it (image.units_past_budget=41, reply.undeliverable=2).
   NEXT: failing test with units_past_budget at 0, slice that path, then see full.dump / the 2 undeliverable replies.
   Disk: one worktree only; CARGO_INCREMENTAL=0.
+## A-652 export half -- LANDED main a3f2602d7 (commit 4222a1049): id minted in publish (two exports collided).
+## volume-id mint sweep -- LANDED main 3f65086f4 (commit 9cbdadac2): ShardState::volume_ids_minted reservation.
+  Whole slates-server lib suite killed by watchdog (shard spinning ~3.3 s) on this loaded Mac with and without it.
+- NEXT: migration::export resumable inside a revision: (1) a changed path a call, (2) a text a window at a time.
+## exporter slicing part 1 LANDED 04dccfddb (f3683fb6d), part 2 LANDED bc180d633 (d82eb41e5), part 3 LANDED 9b82c4f31 (515bc3c22)
+  Calls now: a changed path, or a text window (format 2 one walk; format 3 measured a window a call before its record).
+- NEXT: g268's lock-expiry case (by reading: commit drive judges locks at start.now, drive.rs:2435; FSFS judges per call;
+  only a DAV LOCK with a Timeout makes an expiring lock; svnserve's locks never expire).
+## Release measurements (big Studio, adas-mac-studio.local-2) -- LANDED main c2f300d96 (BENCHMARKS + GAPS)
+- Export calls vs 14 us slice: fmt2 median 167.8 us (digest of 100 KB piece), fmt3 p99 289.6 us (100 KB window).
+- 500 MB svn commit: E210009 request-size refusal over svn:// and DAV; RSS 37->50 MB. Intake rules 1 and 2 fail.
+- How to run on the Studio: kiln sync of a worktree times out (its .git points at the main repo); ship a standalone
+  repo: git archive HEAD -> ~/slates-work/w-svn-ship (git init, one commit) and kiln run with cwd there, on
+  adas-mac-studio.local-2 (has svn 1.15.0; no GitHub key).
+- Asked main: is svn's byte store for the intake w-perf's S4 slice 2 (A-716)? Format 2 piece slicing needs a measured
+  MD5+SHA-1 rate (like archive_slice_bytes' BLAKE3 rate): waiting on main's ordering.
+
+## INTAKE (main's order 1, Ada: perf gaps fixed upfront) -- in progress
+- Agreed with w-perf (slates-work-89): stage/append/seal/discard in slates-merge (LANDED e9b70d6d4, commit 6487601b2);
+  w-perf wires the server's TextSink over them; vcs_store charges each piece (lend/settle_objects, shard's budget);
+  1b (set a path from a held identity) is mine, with the landing.
+- Drive plan (slates-svn commit::drive): `pub trait TextSink` (&self: stage -> StagedText(u64), append, seal(identity),
+  discard, release(identity), read sealed via text) passed as `texts: &dyn TextSink` to Drive::take/resume/edit/
+  resume_edit (World gets it; Sources gets `texts` field for serve.rs). Delta streams: window applied into a scratch
+  Vec, md5/sha1/blake3 incremental, appended to sink; textdelta_end seals; Work.texts -> identities (+facts);
+  Revision::of_work reads bytes back via the sink until w-perf's c3 drops the log copy. Room = window in flight.
+  Abort/refusal: discard open, release sealed. Server: interim sink queues appends per receive and applies under
+  with_state after (or w-perf's wiring).
+- Red (by use, Studio): a commit larger than a request's room lands; peak RSS minus stored text independent of size.
+- Intake part 1 LANDED main 2d8ab9f3d (commit b5c4b8848): drive streams windows through TextSink; Sources::texts;
+  listener Opened::texts, tunnel SvnCommand::texts (SvnStores::lend/commit take texts), DavCommit owns Box<dyn TextSink>,
+  Merged::Accepted(work, texts); commit_work(.., texts); NoRoom E160000. Interim server sink = HeldTexts per connection.
+  w-perf told (wires green sink; apply_holding should take the work's texts set). By-use 500 MB rerun: r30 on Studio.
+## INTAKE PART 2 -- DECIDED (main, 2026-11-20): option (B)
+- Sink writes each window into vcs_store's content plane (git's quarantine shape, A-662/A-719: GitPush::admit_all,
+  push_sealed entries with a store move); the revision's log entry names text identities + a store move; green
+  increment sets the path from the identity (A-716 1b, mine, merge crate); landing walks rows/identities a turn at a
+  time. w-perf told by main: sink wires into the content plane, green's held table points at store identities.
+- Conditions: (1) durability order as A-727 for git: content durable (content plane image barrier; f62687455 homes
+  barrier) before the entry naming it commits; replication content before record. Red: kill between content write and
+  entry -> after recovery commit whole or absent. (2) Measure 500 MB before/after in release on the big Studio over DAV
+  and svn://: wall time, peak RSS vs text, landing's longest step, and stock svnserve on FSFS too.
+- Records.rs ownership proposed to w-perf: w-perf owns text storage/c2/format; I own the landing walk entry points.
+- Before (base 2d8ab9f3d): svn:// E210002 (daemon restarted, shard 0 spun 1.06 s in landing), DAV 8.0 s once / spun
+  once; RSS 6.0-6.2 GB (12x). A-740 labels added to vcs_svn::land and vcs_http::svn::land (to prove the spin site).
+- LANDED 134626b40 (A-740 labels on vcs_svn::land / vcs_http::svn::land; proof run r32 on Studio pending).
+- LANDED main 4839b01f8 (commit e211d430c): slates-vcs ContentStore::begin_object/put_window/finish_object/
+  abandon_object (streaming put_object twin; test an_object_put_a_window_at_a_time_is_the_object_put_whole).
+- Proposed split to w-perf (awaiting reply): (1) streaming put = mine (done); (2) naming = store object root
+  (records name_text too: w-perf); (3) server TextSink over ContentStore under vcs_store::Lent = w-perf; (4) landing:
+  entry names identities + store move, durability barrier before entry, 1b, walk in turns = mine.
+- Open question for main: 1b under (B) means the merge green's file blocks over the content plane's arena chunks
+  (A-727: "can be one block") -- a merge-crate storage change (w-engine?), not just an op.
+- Naming RULED (main via w-perf, inbox/identity-rule-from-w-perf.md @2db786af6): identity = plain BLAKE3 everywhere that
+  crosses a node; store root node-local (w-perf: finish_object returns BLAKE3, alias to root). Entry names (identity, len).
+- c2 LANDED by w-perf 14215b0c3: records keep texts as skip-delta svndiff2/LZ4 (KeptText, keep_fresh at apply).
+  Asked main: under (B) records keep sink texts as Stored{len} references (no delta), or slice keep_fresh? Awaiting.
+- No content-image durability barrier API exists (A-727 slice b owes it): asked main who builds it.
+- Big Studio (adas-mac-studio.local-2) runner stopped answering during r33 (release 500 MB + landing timing patch on
+  7346bd343; patch in ~/slates-work/w-svn-ship commit 0ca395b, ~/.cache/w-svn-ship/timing.patch). Told main.
+- Item 2 LANDED main 63ab25b9f (commit ebd4a5ff0): DaemonConfig::svn_digest_bytes_per_second (aws-lc MD5+SHA-1 at
+  derive), svn_text_piece_bytes(), Exporter::with_text_piece. Release numbers owed (Studio down).
+- Intake part 2: svn half committed LOCAL ONLY in w-svn-a703 (wip commit "stored texts named by a revision..."):
+  records Stored{len}, Revision.stored, codec v2, of_work reads no bytes; svn lib 563/563. Server half waits on
+  w-perf's identity alias (BLAKE3->root) and w-balance's barrier (inbox/w-svn-from-w-balance.md). 1b is w-engine's next.
+- Reported by reading: c2's exporter `load` rebuilds a whole text through its delta chain in one call.
+- Alias LANDED (w-perf 9010c5630). w-perf: I do (b) in my interim: svn_texts.rs HeadTexts store arm (order green ->
+  store -> records; keep records arm), lend_in repository = view over records + HeadTexts, replay holds each stored
+  identity. w-perf stays out of svn_texts.rs/svn_view.rs/svn land paths; I stay out of vcs content.rs,
+  content_holder.rs, vcs_store.rs recover/restore fns, arena_windows.rs (w-perf's a3b for ~1h).
+- Server half plan: svn_commit.rs Storing{queue,current,put} + begin_storing/store_step (within_budget, sink
+  sealed_piece, copy_slice_bytes a step)/release_stored; Building.text_bytes falls back to content store
+  (object_bytes(root_of)); commit_work(state,..,work,now) (no sink); land paths loop store_step with yield, barrier
+  (stub local), commit, release on refusal / release extra holds already held.
+- LOCAL wip commits in w-svn-a703 (NOT for main until barrier): svn half; server landing in turns
+  (svn_commit::Storing/begin_storing/store_step/held_twice/release_stored/release_texts/land_work + LOCAL
+  content_durable() stand-in), Building.store arm under lent_state, async SvnStores::commit (tunnel) and
+  vcs_http SvnStores::land (DAV), TextSink::sealed_piece. Server lib builds.
+- NEXT (read side): svn_texts.rs HeadTexts{green, store, records} store arm + `type SvnView<'a> = WithTexts<'a,
+  HeadTexts<'a>>`; lend_in/lent_of lend the view (under lent_state); GATs: vcs_http SvnStores `type Repository<'a>`,
+  vcs_ssh SvnStores `type Green<'a>`, CommitWorld<'_, SvnView<'_>>; then replay holds stored identities; then tests.
+- 2026-11-20: read side + replay hold + tests done (LOCAL ea3daf5d7); merged origin/main (alias 9010c5630, barrier
+  5a189220a); stand-in replaced by vcs_store::content_ticket/content_durable (budget fleet::live_budget), refusal
+  Uncommitted::NotDurable; crash test daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry.
+  Building/testing; then land part 2 whole. Next: exporter `load` sliced rebuild (item 2), then DeltaV v1.
+- A-761 part 2 LANDED main 28e57ac18 (squash of w-svn-a703; base 234c11f8e). Red: crash test with barrier bypassed
+  -> (false,1,None); green. Server focused 128/128, svn 569/569. Exporter reads stored texts via svn_view::with_view.
+- NEXT: item 2, exporter `load` rebuild sliced (TextReading: chain a window a step; store a window a step; green a
+  copy slice a step; cache = delta's two). Then DeltaV v1 (read w-interop progress first).
+- 2026-11-20: LANDED b1206d96c (svn landing waits on the barrier only when it put texts; red vcs_ssh::svn::tests stock
+  mkdir on main, my filter vcs_ssh::tests::svn had named no module -- sweep with `cargo test -p slates-server --lib svn`).
+  LANDED A-762 507d722b3 + 2cf1b1d35: exporter reads a text a bounded step a call (TextSource::read_step, TextReading).
+  Ledger edits now from ~/slates-work/w-svn-ledger (shared checkout had another agent's staged state).
+- NEXT: DeltaV v1 for pre-1.7 clients (MKACTIVITY/CHECKOUT/MERGE; review piece 14); w-interop piece 5 done, no overlap.
+  Owed: Linux daemon:: run on kiln (r36 never started, no room); 500 MB commit re-measured after w-engine 1b.
+- DeltaV v1 (pre-1.7 / no-v2 serf clients) PLAN, sources in ~/slates-work/g234-svn-src/dav-1.14 (1.14.x mod_dav_svn +
+  ra_serf commit.c): OPTIONS activity-collection-set -> `!svn/act/`; MKACTIVITY act/UUID 201; discover_vcc PROPFIND;
+  checked-in -> `!svn/ver/REV/PATH`; CHECKOUT vcc (body activity-set href) -> 201 Location `!svn/wbl/ACT/REV`;
+  PROPPATCH wbl = revprops; CHECKOUT ver/REV/path -> 201 Location `!svn/wrk/ACT/path` (out-of-date check by rev);
+  PUT/MKCOL/DELETE/COPY/PROPPATCH under wrk == txr; MERGE source=activity href; DELETE act. Map onto DavCommit: an
+  activity = a transaction begun lazily (revprops from the wbl PROPPATCH) and wrk/ACT/path == txr/TXN/path.
+  Part 1 slates-svn sans-io (URIs, CHECKOUT body/answer, activity state), part 2 server site, part 3 by-use (stock
+  svn 1.15 against a no-v2 OPTIONS test hook, on a machine with svn).
+- DeltaV v1 parts, revised: 1 READS -- site.rs serves vcc/default (checked-in -> bln/YOUNGEST), bln/N
+  (baseline-collection -> bc/N/, version-name), ver/N/PATH (a version resource: PROPFIND, GET) as repos.c answers
+  them; 2 WRITES sans-io (dav/activity.rs: URIs, CHECKOUT body, mod_dav's 201 HTML body pinned from httpd 2.4.x
+  mod_dav.h DAV_RESPONSE_BODY_1..5 + "X Y has been created.", Cache-Control no-cache; DavCommit activity + checked-out
+  revisions); 3 server; 4 by-use.

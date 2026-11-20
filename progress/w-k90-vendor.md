@@ -148,3 +148,6 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
  AFTER REBOOT (10:35): probe edits (deepen/partial, now w-bugs') backed out, saved as
     ~/.cache/w-k90-vendor-probe-deepen-partial.patch. Merged to f265b858d. The r110 encode spin = base 944588f6a, which
     predates the fix 67dd4ef4 (landed 982ea33d). Told main (inbox/main-from-w-k90-vendor-encode-spin.md) + run request.
+ Deterministic level LANDED 7c37b6fe via 80081899 (base 159f1c87): learn::Rates measured once a process
+    (DaemonConfig::git_rates, logged), in Exchange; Learning clockless; a kind sampled once per repository. Gate test
+    red on main -> green; rule-4 held answer byte for byte. A/B is main's run (inbox note). NEXT: item 3 (v0 in turns).

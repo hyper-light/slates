@@ -141,3 +141,9 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   (agents/w-k90-microvm-resync-d288, b9006561b) waits on Shards' coordinator (R15), carried by kiln meanwhile.
 - NOT mine any more: item 3's KVM proof (w-k90-kvm, handoff above); WHP BLOCKED (jupiter).
 - Nothing unpushed; worktrees of landed work removed. Verified at kiln origin/main 0a17f46e5.
+- 2026-11-20 (Ada via main: "run focused tests locally and merge"): Shards D288 MERGED to shards main
+  7158020b6..b9006561b (fast-forward; base origin/main 7158020b6). Focused tests on this Mac (macOS arm64, local):
+  ipc 1/1, api 3/3, vmm 4/4, vm-process 1/1, shards bin 3/3; fmt clean. Commit unsigned: no `gits` here and the
+  session's signer refuses (Shards R15 asks for signed commits: flagged to main). Pre-amend branch
+  agents/w-k90-microvm-resync deleted. kiln still carries it as vendor/patches/shards/0002 (identical content); it
+  folds away when kiln and Hex re-vendor Shards together at or past b9006561b (Hex's pin b4db7e69c unreachable here).
