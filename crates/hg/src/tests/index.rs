@@ -246,7 +246,9 @@ fn the_history_7_2_stored_is_numbered_as_7_2_numbered_it() {
   assert!(copy.block.is_some());
   let meta = index.revision(&store, Log::File(b"meta"), 0).unwrap();
   assert_eq!(
-    meta.block.map(|block| store.get(&block).map(<[u8]>::len)),
+    meta
+      .block
+      .map(|block| store.bytes_of(&block).map(|bytes| bytes.len())),
     Some(Some(0))
   );
 }
@@ -379,8 +381,15 @@ fn a_log_row_never_meets_an_object_key_whatever_a_path_s_length() {
   assert!(index.commit_objects(&mut store, &mut quarantine).is_ok());
   let node = Node::try_from(id.as_slice()).unwrap();
   let (kind, len, root) = index.object(&store, &node).unwrap();
-  let object = (kind, len, store.get(&root));
-  assert_eq!(object, (FILE, 18, Some(&b"the object's bytes"[..])));
+  let object = (kind, len, store.bytes_of(&root));
+  assert_eq!(
+    object,
+    (
+      FILE,
+      18,
+      Some(std::borrow::Cow::Borrowed(&b"the object's bytes"[..]))
+    )
+  );
   let revision = index.revision(&store, log, 0).map(|row| row.node);
   assert_eq!(
     (revision, quarantine.is_empty()),
@@ -676,4 +685,72 @@ proptest! {
     }
     check_model(&index, &store, log, &model, &parents);
   }
+}
+
+/// A manifest of `paths` files, each line `path NUL 40 hex digits` of its version.
+fn manifest_of(paths: usize, version: &[usize]) -> Vec<u8> {
+  (0..paths)
+    .flat_map(|at| {
+      let node = format!("{:040x}", version.get(at).copied().unwrap_or(0));
+      format!("dir/path-{at:05}\0{node}\n").into_bytes()
+    })
+    .collect()
+}
+
+/// A-729 (the manifests' 5.5 GB: Mercurial's own repository's manifest log is 57,007 revisions, 9.4 MB as revlog deltas
+/// and 5,501,443,727 bytes as whole texts, `hg debugrevlog -m`). Do: append 300 manifests of 400 paths, each changing
+/// one path's node from the one before. Expect: every manifest read back whole as it was appended
+/// (`HgIndex::revision_text`); each row's chain within its text's length (the derived snapshot bound); and the content
+/// store holding under a tenth of the texts' bytes, where whole texts would hold them all.
+#[test]
+fn manifests_are_kept_as_deltas_and_read_back_whole() {
+  let (mut index, mut store, held) = with_one_changeset();
+  store.release(&held).unwrap();
+  let (paths, revisions) = (400_usize, 300_usize);
+  let mut version = vec![0_usize; paths];
+  let mut texts = Vec::new();
+  let mut previous = NULL_NODE;
+  let before = store.used();
+  for rev in 0..revisions {
+    version[(rev * 7) % paths] = rev + 1;
+    let text = manifest_of(paths, &version);
+    let node = crate::node::compute(&previous, &NULL_NODE, &text).unwrap();
+    let put = store.put_object(&text).unwrap();
+    let row = NewRevision {
+      node,
+      p1: previous,
+      p2: NULL_NODE,
+      link: [9; NODE_LEN],
+      flags: 0,
+      len: u64::try_from(text.len()).unwrap(),
+      bytes: put,
+      block: None,
+    };
+    index
+      .append_revisions(&mut store, Log::Manifest, &[row])
+      .unwrap();
+    store.release(&put).unwrap();
+    previous = node;
+    texts.push(text);
+  }
+  let whole: usize = texts.iter().map(Vec::len).sum();
+  for (rev, text) in (0_u32..).zip(&texts) {
+    assert_eq!(
+      index.revision_text(&store, Log::Manifest, rev).as_ref(),
+      Some(text),
+      "manifest {rev}"
+    );
+    let row = index.revision(&store, Log::Manifest, rev).unwrap();
+    assert!(
+      row.chain <= row.len,
+      "manifest {rev}: chain {} past its text {}",
+      row.chain,
+      row.len
+    );
+  }
+  let kept = store.used() - before;
+  assert!(
+    kept * 10 < u64::try_from(whole).unwrap(),
+    "{kept} bytes kept for {whole} bytes of texts"
+  );
 }

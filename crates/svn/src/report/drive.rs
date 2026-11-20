@@ -56,6 +56,7 @@
 #[cfg(test)]
 pub(crate) mod green;
 pub(crate) mod history;
+pub mod replay;
 #[cfg(test)]
 mod tests;
 
@@ -236,6 +237,11 @@ impl DriveFailure {
       code: SVN_ERR_FS_CORRUPT,
       message: String::from("Filesystem is corrupt"),
     }
+  }
+
+  /// A revision past the youngest, in FSFS's words (`svn_fs_revision_root`).
+  fn no_such_revision(revision: Revision) -> Self {
+    Self::of_index(&IndexRefusal::NoSuchRevision { revision })
   }
 
   /// The refusal of an index refusal, in FSFS's words where FSFS has them.

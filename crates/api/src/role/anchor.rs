@@ -694,13 +694,14 @@ fn on_lapse(
     Lapse::Withheld => {
       slates_machine::log_line!(
         "slates anchor: the daemon's heartbeat lapsed ({} ms old, past {} ms: the {} ms window plus this anchor's \
-         lateness p99 of {} ms over {} waits, at most {} ms); killing it",
+         lateness p99 of {} ms over {} waits, at most {} ms); {}; killing it",
         beat_age / NS_PER_MS,
         seen.bound / NS_PER_MS,
         LIVENESS_BUDGET_NS / NS_PER_MS,
         lateness.p99_ns() / NS_PER_MS,
         lateness.len(),
-        slates_server::watchdog::WINDOW_CEILING_NS / NS_PER_MS
+        slates_server::watchdog::WINDOW_CEILING_NS / NS_PER_MS,
+        stuck_task_words(supervisor.stuck_task())
       );
       supervisor.kill().map_err(|e| failed("kill", e))?;
       Ok(true)
@@ -760,6 +761,19 @@ fn judge_lapse(watchdog_looking: bool, window_ns: u64, process: impl FnOnce() ->
     Some(said) => Lapse::Stuck(said),
     None => Lapse::Starved,
   }
+}
+
+/// What the daemon's watchdog found its stuck shard polling (A-740), in the kill line's words.
+fn stuck_task_words(task: Option<slates_anchor::StuckTask>) -> String {
+  task.map_or_else(
+    || "its watchdog recorded no stuck task".to_owned(),
+    |task| {
+      format!(
+        "its watchdog found shard {} stuck in task {}, at its poll {}",
+        task.shard, task.label, task.polls
+      )
+    },
+  )
 }
 
 /// What a start's verdict says when it is to be killed, naming the window it was judged by: a wedge's, `window_ns`

@@ -295,6 +295,15 @@ impl<'a> Indexed<'a> {
       return Ok(None);
     };
     let text = match row.block {
+      // A manifest kept as a delta (A-729): its text rebuilt from its chain, charged to the room as a copy is.
+      None if row.base != NONE => {
+        room.charge(row.len)?;
+        let rebuilt = self.index.revision_text(self.store, log, rev);
+        if rebuilt.is_some() {
+          count_lend(&self.lends, false);
+        }
+        rebuilt.map(Cow::Owned)
+      }
       None => lend(self.store, &row.bytes, row.len, &self.lends, room)?,
       Some(block) => framed(self.store, [&block, &row.bytes], row.len, &self.lends, room)?,
     };
@@ -713,8 +722,8 @@ fn append_within(bytes: &mut Vec<u8>, part: &[u8], capacity: usize) -> bool {
 
 /// The parts of a text, in order, copied into one buffer of exactly `len` bytes, `len` charged to `room` first; `None`
 /// where they do not come to exactly `len`.
-fn copied<'p>(
-  parts: impl Iterator<Item = &'p [u8]>,
+fn copied<P: AsRef<[u8]>>(
+  parts: impl Iterator<Item = P>,
   len: u64,
   room: &mut Admission,
 ) -> Result<Option<Vec<u8>>, PastAdmission> {
@@ -724,7 +733,7 @@ fn copied<'p>(
   };
   let mut bytes = Vec::with_capacity(capacity);
   for part in parts {
-    if !append_within(&mut bytes, part, capacity) {
+    if !append_within(&mut bytes, part.as_ref(), capacity) {
       return Ok(None);
     }
   }
@@ -748,8 +757,8 @@ fn lend<'a>(
     if to_u64(first.len()) != len {
       return Ok(None);
     }
-    count_lend(lends, true);
-    return Ok(Some(Cow::Borrowed(first)));
+    count_lend(lends, matches!(first, Cow::Borrowed(_)));
+    return Ok(Some(first));
   }
   let bytes = copied(store.windows(root), len, room)?;
   if bytes.is_some() {
@@ -768,9 +777,9 @@ fn framed<'a>(
   lends: &Cell<Lends>,
   room: &mut Admission,
 ) -> Result<Option<Cow<'a, [u8]>>, PastAdmission> {
-  let parts = core::iter::once(MARKER)
+  let parts = core::iter::once(Cow::Borrowed(MARKER))
     .chain(store.windows(block))
-    .chain(core::iter::once(MARKER))
+    .chain(core::iter::once(Cow::Borrowed(MARKER)))
     .chain(store.windows(bytes));
   let text = copied(parts, len, room)?;
   if text.is_some() {

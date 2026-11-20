@@ -1,5 +1,6 @@
 use std::io::{Read, Write as _};
 use std::net::TcpStream as ClientStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,8 @@ use slates_ssh::keylife::RECOMMENDED_KEY_TIME_NS;
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 
 use super::site::{
-  Command, Dispatched, Next, RecordKeys, Refused, Services, SshSite, Start, Stepped, ToolSite,
-  Unserved,
+  ClientGone, Command, Dispatched, Next, RecordKeys, Refused, Services, SshSite, Start, Stepped,
+  ToolSite, Unserved,
 };
 use super::ssh_client::{Client, ClientOptions, put_string, read_string};
 use super::svn::tests as svn_tests;
@@ -80,6 +81,14 @@ const CLIENT_PACKET: u32 = 1 << 15;
 const READY: &[u8] = b"ready\n";
 /// Shape: what the tests' client sends the command, as a push sends its pack.
 const PACK: &[u8] = b"pack";
+/// Shape: the input on which a [`Scripted`] command waits for its client to go, as a hook's run waits (A-665 part 4a's
+/// signal, on this edge), marking [`SAW_ITS_CLIENT_GO`].
+const WATCHES_ITS_CLIENT: &[u8] = b"watch";
+/// Whether a [`Scripted`] command given [`WATCHES_ITS_CLIENT`] saw its client go: one test's alone.
+static SAW_ITS_CLIENT_GO: AtomicBool = AtomicBool::new(false);
+/// Shape: how long a client listens for a signal it must not cause: a tenth of a liveness window, far past a loopback
+/// round trip.
+const MOMENT_NS: u64 = LIVENESS_BUDGET_NS / 10;
 
 /// The blob of the Ed25519 key of `seed` (RFC 8709 §4).
 fn blob(seed: &[u8; 32]) -> Vec<u8> {
@@ -189,7 +198,8 @@ impl SshSite for LooksUp {
 }
 
 /// A command shaped as a push: it writes [`READY`], waits for its client's input, consumes it, answers `got:` and the
-/// input, and exits with status 0.
+/// input, and exits with status 0. Given [`WATCHES_ITS_CLIENT`], it first waits in that step until its client has gone,
+/// as a hook's run waits, and marks [`SAW_ITS_CLIENT_GO`].
 #[derive(Default)]
 struct Scripted {
   /// Whether it wrote [`READY`].
@@ -208,7 +218,11 @@ impl Command for Scripted {
 
   fn input_end(&mut self) {}
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
+  async fn step(&mut self, gone: ClientGone<'_>) -> Result<Stepped, Refused> {
+    if self.input == WATCHES_ITS_CLIENT {
+      gone.gone().await;
+      SAW_ITS_CLIENT_GO.store(true, Ordering::SeqCst);
+    }
     if !self.greeted {
       self.greeted = true;
       self.out.extend_from_slice(READY);
@@ -584,15 +598,21 @@ fn pushed() -> Transcript {
   }
 }
 
-/// Parks this thread until `span` has passed; `park_timeout` may return early, so it parks again until then.
-fn park_for(span: Duration) {
-  let until = Instant::now() + span;
-  while let Some(left) = until.checked_duration_since(Instant::now()) {
-    if left.is_zero() {
-      break;
-    }
-    std::thread::park_timeout(left);
+/// Lets `ns` pass on the runtime's timer, on a runtime of the client's own: the pause is the test's input, the time a
+/// slow client takes between two steps, so nothing else could stand in for it.
+fn pause(ns: u64) {
+  if ns == 0 {
+    return;
   }
+  let runtime = runtime();
+  runtime
+    .spawn(async move {
+      slates_rt::futures::sleep(ns)
+        .await
+        .expect("the client's pause on its runtime's timer");
+    })
+    .expect("the pause's task");
+  runtime.run_until_idle();
 }
 
 /// A whole session with the held key: authenticate (pausing `auth_pause_ns` between the server's `PK_OK` and the
@@ -600,13 +620,13 @@ fn park_for(span: Duration) {
 fn session(address: SocketAddrV4, auth_pause_ns: u64, push_pause_ns: u64) -> Option<Transcript> {
   let mut peer = Peer::connect(address)?;
   (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
-  park_for(Duration::from_nanos(auth_pause_ns));
+  pause(auth_pause_ns);
   (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
   exec(&mut peer, b"git-receive-pack '/r.git'").then_some(())?;
   let ready = peer.next(&[94])?;
   let mut at = 5;
   (read_string(&ready, &mut at) == READY).then_some(())?;
-  park_for(Duration::from_nanos(push_pause_ns));
+  pause(push_pause_ns);
   send_data(&mut peer, PACK);
   let mut transcript = transcript(&mut peer);
   transcript.out.splice(0..0, READY.iter().copied());
@@ -649,6 +669,48 @@ fn a_held_key_runs_its_command_and_its_connection_teaches_the_edge() {
     seen.key_time_ns < RECOMMENDED_KEY_TIME_NS,
     "{}",
     seen.key_time_ns
+  );
+}
+
+/// Whether [`SAW_ITS_CLIENT_GO`] is marked within `for_ns`, looked at every [`TICK_NS`].
+fn marked_within(for_ns: u64) -> bool {
+  let until = Instant::now() + Duration::from_nanos(for_ns);
+  while !SAW_ITS_CLIENT_GO.load(Ordering::SeqCst) && Instant::now() < until {
+    std::thread::park_timeout(Duration::from_nanos(TICK_NS));
+  }
+  SAW_ITS_CLIENT_GO.load(Ordering::SeqCst)
+}
+
+/// Kiln goal 90's slates piece: the SSH edge's signal of its client gone (A-730's owed item; the HTTP edge's since A-665
+/// part 4a), which ends a hook's run over SSH. Do: run a command that, once given [`WATCHES_ITS_CLIENT`], waits within
+/// its step for its client to go; watch for a moment while the client is there; then send the channel's EOF (an
+/// encrypted packet the edge does not read while the command steps, queued ahead of the close, as a client's last
+/// packets are) and close the socket. Expect: the signal quiet while the client is there, and resolved once it closed,
+/// behind its EOF, within the client's patience.
+#[test]
+fn g90_a_command_waiting_within_its_step_learns_its_ssh_client_has_gone() {
+  let ((while_there, once_gone), _) = served(ONE_SEAT, |address| {
+    let watched = (|| {
+      let mut peer = Peer::connect(address)?;
+      (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+      (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+      exec(&mut peer, b"git-receive-pack '/r.git'").then_some(())?;
+      peer.next(&[94])?;
+      send_data(&mut peer, WATCHES_ITS_CLIENT);
+      Some(peer)
+    })();
+    let Some(mut peer) = watched else {
+      return (true, false);
+    };
+    let while_there = marked_within(MOMENT_NS);
+    send_eof(&mut peer);
+    drop(peer);
+    (while_there, marked_within(PATIENCE_NS))
+  });
+  assert_eq!(
+    (while_there, once_gone),
+    (false, true),
+    "the signal is quiet while the client is there, and resolves once it closes behind its EOF"
   );
 }
 
@@ -832,7 +894,7 @@ impl Command for SaysWhere {
 
   fn input_end(&mut self) {}
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
+  async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     Ok(Stepped {
       consumed: 0,
       next: Next::Exited(0),

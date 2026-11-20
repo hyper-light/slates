@@ -484,7 +484,9 @@ pub fn encode(
   identity: Option<[u8; 32]>,
   signature: Option<Signature>,
 ) -> Vec<u8> {
-  let mut out = Vec::with_capacity(increment_bytes.len().saturating_add(ENTRY_OVERHEAD_BYTES));
+  // Reserved at the entry's bound once, never grown: the effects follow the increment's bytes, and growing past a
+  // revision-sized buffer copied it whole (A-742: 250 MiB of such copies in a 1,000-revision import).
+  let mut out = Vec::with_capacity(entry_bound(increment_bytes.len(), increment));
   out.extend_from_slice(&MAGIC.to_le_bytes());
   out.extend_from_slice(&VERSION.to_le_bytes());
   put_bytes(&mut out, increment_bytes);

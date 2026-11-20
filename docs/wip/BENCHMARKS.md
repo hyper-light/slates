@@ -14742,6 +14742,65 @@ Ranked plan, each owed:
 - M4, the green checkpoint's whole-green copy (47 MiB in two allocations).
 - M5, fixed per daemon: the timer wheels' 898 MiB reservation, the segment's 43 MiB unit set, 47 MiB of thread stacks.
 
+## A green's history names the file's block: the svn import's merge-engine heap before and after (A-728; UI goal 93; 2026-11-20)
+
+- **Machine and builds:** the Mac Studio of the entries above (Adas-Mac-Studio.local, 32 cores), 2026-11-20 ~08:37
+  UTC, load average 5.68 at the start and 17.03 at the end (shared; not quiesced). Release builds of `slates-cli`:
+  *after*, main 99ecba1b1 (A-728 parts 1 and 2 in); *before*, the same tree with `crates/merge/src/{history,dims,
+  engine,engine/branch,engine/reanchor}.rs` taken back to e71043ff6 (since then only A-728 and a test-only lint touched
+  them), so the two differ by A-728 alone (`nm` finds `Value::seal` in after only).
+- **Data:** git/git's newest 1,000 first-parent commits as a dump (`git_to_svn_dump.py src.git master 1000`, 223 MiB),
+  the dataset of "Where the svn server's time and memory go" above.
+- **Command:** `crates/cli/bench/svn_history_mem.sh SLATES git-1000.dump LABEL`, three runs each, interleaved, before
+  first. Every import answered `revisions: 1000 youngest: 1000`.
+
+| Live heap after the import, by stack | before 1 | 2 | 3 | after 1 | 2 | 3 |
+|---|---|---|---|---|---|---|
+| the content history (`slates_merge::history`) | 50.3 | 50.3 | 50.3 | 2.0 | 2.0 | 2.0 |
+| `Green::commit`, all | 285.1 | 285.1 | 285.1 | 200.0 | 200.0 | 200.0 |
+| physical footprint (GB, as `malloc_history` rounds it) | 2.5 | 2.5 | 2.5 | 2.4 | 2.4 | 2.5 |
+
+MiB unless marked. The history's own allocations go from 50.3 MiB, its whole copies of files (`Value::whole`), to
+2.0 MiB, its piece lists (`Value::named`, 0.9 MiB) and the like: every value it keeps whole is now the file's block.
+Under `Green::commit` the heap falls by 85.1 MiB (30%): the 48.3 MiB above, and 35.5 MiB fewer bytes in allocations
+inlined into `commit` and `engine::apply` (228.6 MiB before, 193.1 after), which hold the new files' bytes. That second
+part is inferred, not traced: the history's copies made by callers the release build inlines into `commit` (the seed's
+and the splice's) carry no history frame, so they counted there. The footprint moves within its rounding.
+
+Said plainly, this is less than the 234.8 MiB A-723 quoted for the history: that row of the table above is everything
+`Green::commit` allocates, about 226 MiB of it the current files' own bytes (the greens' file blocks), which A-728
+keeps; the history held 50.3 MiB of them twice, and now holds none. The service folds this repository's history to
+its floor as it imports (the row is flat from 250 to 1,000 revisions), which is why the history was 50 MiB and not the
+dump's size.
+
+**Part 4, the honest charge (same machine and dump, 2026-11-20 ~08:57 UTC, load 3.37 to 5.03).** Release builds of main
+52c1d8af5 and of it with part 4, `slates repository import` of the 1,000-revision dump, then `slates status --json`
+(`committed_bytes`, which the merge service's retention charge is part of): the owner shard grew by 646,696,917 bytes
+in every run, three of each, interleaved. The service folds this green's history as the import goes, since no reader
+holds a version, so the history retains nothing at rest with or without part 4; the honest charge differs only while a
+reader holds history (the merge tests: one 1-byte edit of a 2 KiB file reserves and retains 2,072 bytes, 25 before).
+
+## Freed memory returns to the OS: the svn import's footprint before and after (A-742; UI goal 93; 2026-11-20)
+
+- **Machine and builds:** the Mac Studio of the entries above, 2026-11-20 ~10:11 UTC, load average 4.87 at the start
+  and 6.62 at the end (shared; not quiesced). Release builds of `slates-cli` from main de9591c70 (*before*) and of it
+  with A-742 (*after*).
+- **Data:** git/git's newest 1,000 first-parent commits as a dump (`git-1000.dump`, 223 MiB).
+- **Command:** for each build, a fresh anchor, `slates repository create project --tool svn`, `slates repository import
+  project git-1000.dump`, then `footprint PID` at once and five seconds later, and `slates status --json`; three runs
+  each, interleaved, before first.
+
+| | footprint after the import (MB) | 5 s later | import (s) | large blocks mapped / returned |
+|---|---|---|---|---|
+| before 1 / 2 / 3 | 2,417 / 2,551 / 2,423 | 2,417 / 2,551 / 2,423 | 1.74 / 1.83 / 1.73 | (no allocator) |
+| after 1 / 2 / 3 | 1,431 / 1,486 / 1,495 | 1,432 / 1,486 / 1,495 | 1.77 / 1.78 / 1.69 | 695 / 575 blocks, 4.21 GB returned |
+
+About 1,000 MB (40 %) less, at once and steady, in the same time. With the allocator alone (the temporaries not yet
+cut) the import ended at 1,575 / 1,645 / 1,562 MB but took 2.04 / 2.27 / 2.87 s, 5.77 GB of fresh pages faulted in;
+cutting the temporaries brought both down. Measured-and-rejected: `malloc_zone_pressure_relief(NULL, 0)` after the
+import released 0 bytes (footprint 2,457 and 2,545 MB). With the system allocator alone the freed memory came back on
+its schedule: five seconds after the import 1,565 to 1,834 MB in three runs and none in two others.
+
 ## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
 
 - **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
@@ -14828,3 +14887,97 @@ Where one push's 229 MiB goes (`MallocStackLogging=1`, `malloc_history -allBySiz
 the content store's arena regions grown for them. Owed, and what the next run measures: the intake keeping the
 client's deltas compressed and naming blobs in the green's identity table (w-git's streaming intake; A-716 slice 1a's
 `Green::hold_bytes`), and the register entries naming objects by identity rather than holding them.
+
+## Many repositories of mixed sizes and skewed activity on one daemon: every push lands, and the toys are starved 14 times over while one hot repository pushes (A-724 piece 7; Ada's goal of 2026-11-20; 2026-11-20)
+
+- **The command:** `crates/cli/bench/multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0
+  --steps 1,10,100,1000`. Size classes are git/git's packs at v0.99 (4,507 objects, 1,180,907 bytes), v1.0.0
+  (12,232 objects, 3,434,408 bytes) and v1.5.0 (34,296 objects, 9,871,550 bytes). By rank, a step of R repositories
+  gives rank 1 the largest class, ranks 2 to 10 the next and the rest the smallest. It sends about R pushes at once,
+  repository i taking its Zipf (s = 1) share, each push a new branch. Every step runs on a fresh daemon. Each class's
+  baseline is one push alone on its own daemon. The script's docstring states the bounds.
+- **The machine and build:** adas-mac-studio.local-2, Apple M3 Ultra, 32 cores, 96 GiB; release `slates` built from
+  1e84630b1 (main 129cd0d1b with the script); dataset `~/.cache/g309-scale/src.git` (git/git, w-perf's); load 5.2 at
+  the start; 44,675 MiB free. One run (N = 1) of each step: every figure below is that run's.
+
+| Step | Pushes | Wall | Peak RSS | Class | Pushes (repositories) | p50 | p99 | p99 / alone |
+|---|---|---|---|---|---|---|---|---|
+| alone | 1 each | | 73 / 195 / 808 MiB held | 0 / 1 / 2 | 1 (1) each | 0.180 / 0.640 / 2.677 s | | 1 |
+| R = 1 | 1 | 2.748 s | 965 MiB | 2 | 1 (1) | 2.744 s | 2.744 s | 1.0 |
+| R = 10 | 9 | 5.587 s | 2,252 MiB | 1 | 6 (9) | 0.812 s | 1.116 s | 1.7 |
+| | | | | 2 | 3 (1) | 5.530 s | 5.583 s | 2.1 |
+| R = 100 | 86 | 30.136 s | 9,417 MiB | 0 | 30 (90) | 0.516 s | 2.534 s | **14.1** |
+| | | | | 1 | 37 (9) | 2.538 s | 4.322 s | 6.8 |
+| | | | | 2 | 19 (1) | 29.575 s | 30.132 s | 11.3 |
+| R = 1,000 | not run | | | | | | | |
+
+- **What it says.** Every push landed and none was refused (A-724 piece 3's room never refused one). But at R = 100,
+  the small repositories' p99 was 14.1 times their push alone while one hot repository's 19 pushes ran for 30 s. Piece
+  3 divides memory room, not the shard's CPU: a toy whose shard also serves the hot repository waits behind its steps.
+  So the next piece is the CPU half of §4.17.5's shares, the shard's step quanta scheduled fairly by repository.
+- **What stopped it.** R = 1,000 was not run. Its memory, estimated from the memory each class's push held in the steps
+  before, was 202,091 MiB against 30,107 MiB free. A push still holds about 70 to 80 times its pack (the section above;
+  w-perf's A-723 and A-727 bring that to one copy a byte), so the thousand-repository step waits on them.
+- **Found by use.** One push of git/git v2.0.0 (164,487 objects, a 55,889,275-byte pack) ended the daemon: an empty
+  HTTP answer and the daemon gone after 2.6 to 5.0 s, peak RSS about 1.5 GiB, alone and at R = 1 (the first run, with
+  v2.0.0 as a fourth class). Reported to main as a run request; the giant class waits on its fix.
+
+## Fair turns by repository on a shard: measured and rejected, the toys slower and the daemon ended (A-724 piece 3c; 2026-11-20)
+
+- **The experiment:** start-time fair queuing of a shard's git push steps by repository (Goyal, Vin and Cheng,
+  SIGCOMM 1996). Each repository's tag advanced by its steps' measured time; a step started only while its repository's
+  tag was within one step quantum of the least tag among the repositories waiting, else it yielded the shard. Built at
+  fdfcf2421 (branch `agents/w-balance-cpu`), never on main.
+- **The command and machine:** as the section above (`multi_repo_load.py ... v0.99 v1.0.0 v1.5.0 --steps 1,10,100`,
+  adas-mac-studio.local-2, M3 Ultra, 32 cores), release built from fdfcf2421, load 9.9 at the start, one run.
+
+| R = 100 | Without (main, the section above) | With fair turns |
+|---|---|---|
+| small class p99 / alone | 14.1 (2.534 s) | 22.8 (4.462 s) |
+| medium class p99 / alone | 6.8 | 7.1 |
+| hot repository's 19 pushes | all ok, 30.1 s | none ok: 12 connections reset, 7 empty answers; the daemon gone |
+
+- **Why it lost.** The toys grew slower, not faster, so their wait was not the owner shard's CPU taken by the hot
+  repository's steps. Rejected. The cause of the toys' p99 is to be found by profiling the R = 100 step (owed, A-724),
+  not guessed.
+- **Corrected (2026-11-20, a later run).** This section first said the daemon ended because waiting steps re-polled by
+  yielding. A run of main itself (release from b8e4591, no fair turns, the same command at R = 100, load 10.0) ended the
+  daemon the same way: the hot repository's 19 pushes 10 connections reset and 9 empty answers; the toys' p99 16.5 times
+  alone (5.293 s), the medium class 10.1 times. So the daemon's end is not this experiment's: main regressed between
+  1e84630b1 (the section above: every push ok) and b8e4591, or the end is intermittent. The rejection stands on the
+  toys' p99 alone. Reported to main; the run's profile is `~/.cache/w-balance/r100.sample` on adas-mac-studio.local-2.
+
+## Many repositories on one daemon, held to their fair share: no class starved under today's placement; a hot repository 7.6 times slower than spread would allow (A-724 piece 7; main's ruling of 2026-11-20; 2026-11-20)
+
+- **The measure.** Under saturation no push can match its time alone, so a class's p99 is held to its **fair-share
+  ideal** (main's ruling): when its repository would finish under processor sharing of the daemon's shards among the
+  repositories with work, each repository's work its pushes times its class's push alone (`fair_share_ideal` in
+  `crates/cli/bench/multi_repo_load.py`). The ideal is taken twice: each repository confined to one shard (its whole
+  intake on its owner, as today), and spread over as many shards as it has pushes (what intake off the owner shard,
+  A-722, is to allow). Near 1 is fair; well above 1 is starvation.
+- **The command and machine.** `multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 --steps 1,10,100`,
+  and the control `... v0.99 --steps 100` (every repository small). adas-mac-studio.local-2, M3 Ultra, 32 cores, a
+  23-shard daemon; release built from bc2b042e0 (main 2963b7ad5 with the harness), the script at c291fe8be;
+  load 8.8 to 10.3; one run each. v1.5.0 is left out: 19 concurrent pushes of it to one repository end the daemon on
+  main (routed to w-git, A-722's by-use proof).
+
+| Run | Class | Pushes (repositories) | p50 | p99 | p99 / alone | p99 / fair share, one shard | p99 / fair share, spread |
+|---|---|---|---|---|---|---|---|
+| R = 10 | small (v0.99) | 6 (9) | 0.238 s | 0.339 s | 1.6 | 0.78 | 1.56 |
+| | hot (v1.0.0) | 3 (1) | 1.667 s | 1.707 s | 2.2 | 0.75 | 2.24 |
+| R = 100 | small | 67 (99) | 0.831 s | 2.007 s | 9.2 | 0.87 | 2.72 |
+| | hot | 19 (1) | 10.202 s | 10.437 s | 13.7 | 0.72 | 7.61 |
+| R = 100, all small | small | 86 (100) | 0.918 s | 3.115 s | 15.5 | 0.79 | 4.08 |
+
+- **What it says.** Measured against the fair share today's placement allows, no class is starved: every ratio is
+  under one. The 9 to 16 times "alone" figures of the sections above were the daemon saturated, not a repository
+  starved. The gap is the spread column: a hot repository's 19 pushes ran one after another on its owner shard (10.2 s
+  against 1.4 s spread). This is the before figure for A-722's intake off the owner shard.
+- **How it was found** (each step one run, R = 100, the 32-core Studio). The toys sent their whole request in 0.14 s at
+  p99 and waited 4.48 s for the answer, so the wait was the server's. Per-repository lanes on a shard (at most one step
+  of a repository at once, the rest parked in order; branch `agents/w-balance-lanes`, 1b8010400) measured dead even
+  (toys' p99 4.42 s and 4.57 s against 4.55 s) and were rejected. An all-small control showed the same factor with no
+  hot repository. The names' placement was even (one repository a partition at R = 10). Every shard thread ran at 35 to
+  99 percent CPU during the burst (`ps -M`). The `kevent` frames that topped `sample`'s stacks are the runtime's
+  zero-timeout polls before it parks, busy and not idle; an earlier reading of them as idle was wrong.
+

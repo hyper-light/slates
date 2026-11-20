@@ -56,7 +56,7 @@ use slates_hg::Admission;
 use slates_hg::serve::stdio::{EXIT_STATUS, PastWindow, Progress, Push, Stdio};
 
 use super::channel_window;
-use super::site::{self, Command, HG_ABORT_STATUS, Next, Refused, Service, Stepped};
+use super::site::{self, ClientGone, Command, HG_ABORT_STATUS, Next, Refused, Service, Stepped};
 use crate::vcs_http::hg::HgStores;
 
 /// Format: 7.2's warning to a client that asks for hidden changesets its server's configuration does not let it see
@@ -168,7 +168,7 @@ impl<S: HgStores> Command for HgCommand<S> {
     self.stdio.eof();
   }
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
+  async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     let Self {
       stores,
       repository,

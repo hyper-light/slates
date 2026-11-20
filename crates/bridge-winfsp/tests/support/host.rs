@@ -18,9 +18,11 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
 use slates_anchor::handles::{
-  ENV_HANDLES, HandleMessage, HoldBounds, WHAT_WINFSP_MOUNT, parse_env,
+  ENV_HANDLES, HandleMessage, HoldBounds, WHAT_WINFSP_MOUNT, parse_env, parse_handoff,
 };
-use slates_anchor::held_windows::{Channel, Held, channel, handle_from_value, handle_value};
+use slates_anchor::held_windows::{
+  Channel, Held, channel, handle_from_value, handle_value, read_table,
+};
 use slates_bridge_core::{Attachments, Rights, View, VolumeBridge};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_ipc::win_spawn::{
@@ -35,6 +37,9 @@ use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+
+/// Shape: the relief receiver's beat in these drive tests (A-725), as the daemon's watchdog beat (100 ms).
+const RELIEF_BEAT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Shape: what the anchor holds in these fixtures: one WinFsp drive's handles and no Shards DAX section, as the
 /// anchor's own tests bound a mount-only hold (`held_windows`'s `attachments(1)`; A-448 split the one bound in two).
@@ -383,7 +388,11 @@ fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
     let value = u64::from_str_radix(&std::env::var(CHANNEL).unwrap(), 16).unwrap();
     (Channel::adopt(inherited_handle(value)), None)
   } else {
-    let (channel, mut entries) = parse_env(&std::env::var(ENV_HANDLES).unwrap(), 1).unwrap();
+    // ENV_HANDLES names the inherited section the handoff table is in (A-460), read as the daemon reads it
+    // (`slates_server::anchor_hold_windows::handed_table`).
+    let (section, len) = parse_handoff(&std::env::var(ENV_HANDLES).unwrap(), 1).unwrap();
+    let table = read_table(inherited_handle(section), len).unwrap();
+    let (channel, mut entries) = parse_env(&table, 1).unwrap();
     let entry = entries.pop().unwrap();
     assert_eq!(entry.id, ENTRY);
     let mut values = entry.values.into_iter();
@@ -425,7 +434,10 @@ fn serve(role: &str, drive: &str) -> ! {
     (true, NameSearch::CaseSensitive),
     send,
     Waker::noop().clone(),
-    slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+    (
+      slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+      RELIEF_BEAT,
+    ),
     inherited,
   )
   .unwrap();
@@ -1174,7 +1186,10 @@ fn purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_ti
     (false, NameSearch::CaseSensitive),
     send,
     Waker::noop().clone(),
-    slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+    (
+      slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
+      RELIEF_BEAT,
+    ),
     None,
   )
   .unwrap();

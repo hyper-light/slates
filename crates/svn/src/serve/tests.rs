@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 
 mod commit;
+mod replay;
 
 /// A budget past anything one call of the fixtures writes.
 const PLENTY: Budget = Budget {
@@ -193,9 +194,14 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
           ..fixture.sources_with(&locks)
         };
         let mut draw = || drawn;
-        let judged = connection.lock_verb(&given, &mut draw, LOCK_ROOM, &mut out);
-        if judged.unwrap().is_some() {
+        // No hook configured: each pre-hook goes on, and no post-hook's verdict is a failure (A-730).
+        if let Some(call) = connection.lock_verb(&given, &mut out).unwrap() {
+          let verdicts = call.paths.iter().map(|_| Ok(None)).collect();
+          connection
+            .lock_judged(&given, verdicts, &mut draw, LOCK_ROOM)
+            .unwrap();
           connection.locks_landed(Ok(()), &mut out).unwrap();
+          connection.locks_finished(Ok(()), &mut out).unwrap();
         }
       }
       Ok(Turn::Unserved { .. }) => return (out, Ending::Unserved(before)),
@@ -514,29 +520,22 @@ fn reparent_moves_the_session_within_its_repository() {
   assert_eq!((out.as_str(), turn), ("", Err(Refused::Malformed)));
 }
 
-/// A-656 (commands not served yet, and items that are no command): send `replay`, then
-/// `get-latest-rev`; then an item that is a number; expect "Unknown editor command 'replay'"
-/// (210001) and the connection going on, the youngest revision answered, then the connection's
-/// end.
+/// A-656 (a command `svnserve` does not know, and items that are no command; every command of its
+/// set is served since A-703): send `frobnicate`, then `get-latest-rev`; then an item that is a
+/// number; expect "Unknown command 'frobnicate'" as the read commands answer one and the connection
+/// going on, the youngest revision answered, then the connection's end.
 #[test]
-fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
+fn an_unknown_command_is_answered_and_the_session_goes_on() {
   let fixture = fixture();
   let mut connection = established();
-  let item = b"( replay ( 6 0 true ) ) ";
+  let item = b"( frobnicate ( ) ) ";
   let (out, turn) = send(&fixture, &mut connection, item);
-  let message = "Unknown editor command 'replay'";
-  assert_eq!(
-    out,
-    format!(
-      "( failure ( ( 210001 {}:{message} 0: 0 ) ) ) ",
-      message.len()
-    )
-  );
-  let unserved = Turn::Unserved {
-    command: "replay",
+  assert!(out.starts_with("( failure ( ( 210001 "), "{out}");
+  assert!(out.contains("'frobnicate'"), "{out}");
+  let took = Turn::Took {
     consumed: item.len(),
   };
-  assert_eq!(turn, Ok(format!("{unserved:?}")));
+  assert_eq!(turn, Ok(format!("{took:?}")));
   let (out, _) = send(&fixture, &mut connection, b"( get-latest-rev ( ) ) ");
   assert!(out.ends_with("( success ( 6 ) ) "), "{out}");
   let (out, turn) = send(&fixture, &mut connection, b"5 ");
@@ -1583,25 +1582,17 @@ fn failure_of(errors: &[(u32, &str)]) -> String {
 const TRIVIAL_AUTH: &str = "( success ( ( ) 0: ) ) ";
 
 /// A-702 part 1 (`serve.c` `change_rev_prop`, `change_rev_prop2`, `do_change_rev_prop`; `fs-wrap.c`
-/// `svn_repos_fs_change_rev_prop4`). Do: through alice's tunnel, change revision 1's `svn:log`; send `change-rev-prop2`
-/// naming both `dont-care` and a previous value; set `svn:log` to a value holding a carriage return; change revision
-/// 99's, past the head. Expect, in `svnserve`'s order: the trivial authentication request then "Repository has not been
-/// enabled to accept revision propchanges" (165006), as for a repository with no pre-revprop-change hook; the
-/// previous-value refusal (200004) with nothing before it; the trivial request then `svn_repos__validate_prop`'s chain
-/// (125005, 125017); the trivial request then "No such revision 99" (160006). Before A-702 each was "Unknown editor
-/// command" (210001).
+/// `svn_repos_fs_change_rev_prop4`). Do: through alice's tunnel, send `change-rev-prop2` naming both `dont-care` and a
+/// previous value; set `svn:log` to a value holding a carriage return; change revision 99's, past the head. Expect, in
+/// `svnserve`'s order: the previous-value refusal (200004) with nothing before it; the trivial request then
+/// `svn_repos__validate_prop`'s chain (125005, 125017); the trivial request then "No such revision 99" (160006). Before
+/// A-702 each was "Unknown editor command" (210001).
 #[test]
-fn a_revision_property_change_is_answered_as_svnserve_answers_one_without_a_hook() {
+fn a_revision_property_change_is_refused_before_its_hooks_as_svnserve_refuses_it() {
   let fixture = fixture();
   let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
-  let no_hook = "Repository has not been enabled to accept revision propchanges;\nask the administrator to create \
-                 a pre-revprop-change hook";
   let both = "'previous-value' and 'dont-care' cannot both be set in 'change-rev-prop2' request";
-  let cases: [(&[u8], String); 4] = [
-    (
-      b"( change-rev-prop ( 1 7:svn:log 3:new ) ) ",
-      format!("{TRIVIAL_AUTH}{}", failure_of(&[(165_006, no_hook)])),
-    ),
+  let cases: [(&[u8], String); 3] = [
     (
       b"( change-rev-prop2 ( 1 7:svn:log ( 3:new ) ( true 3:old ) ) ) ",
       failure_of(&[(200_004, both)]),
@@ -1641,9 +1632,182 @@ fn a_revision_property_change_is_answered_as_svnserve_answers_one_without_a_hook
   }
 }
 
+/// Sends `command`, a revision property change past its checks, through alice's tunnel: the pre-hook's call it hands
+/// out, its trivial authentication request written.
+fn revision_property_hook(
+  fixture: &Fixture,
+  connection: &mut Connection,
+  command: &[u8],
+) -> crate::serve::RevisionPropertyCall {
+  let sources = fixture.sources();
+  let mut out = Vec::new();
+  let turn = connection.receive(Some(&sources), command, &mut out, PLENTY);
+  assert_eq!(String::from_utf8_lossy(&out), TRIVIAL_AUTH);
+  match turn {
+    Ok(Turn::RevisionPropertyHook { call, consumed }) if consumed == command.len() => *call,
+    other => panic!("{other:?}"),
+  }
+}
+
+/// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`). Do: through alice's tunnel, change revision 1's
+/// `svn:log` from `r1` to `new`; allow pre-revprop-change; land the record; allow post-revprop-change. Expect:
+/// pre-revprop-change's call for revision 1, alice, `svn:log`, modified, `new`; the record of revision 1's properties
+/// whole with `svn:log` `new` and the rest as held; post-revprop-change's call with the old value `r1`; then
+/// `( success ( ) )`, and the connection waiting on its next command. Out of turn, each call is the caller's error.
+#[test]
+fn a_revision_property_change_runs_its_hooks_around_its_record() {
+  use crate::commit::record::Record;
+  use crate::reads::Repository as _;
+  use crate::serve::RevisionPropertyAction;
+  let fixture = fixture();
+  let sources = fixture.sources();
+  let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
+  let mut out = Vec::new();
+  assert_eq!(
+    connection.revision_property_landed(Ok(()), &mut out),
+    Err(Refused::OutOfTurn)
+  );
+  let call = revision_property_hook(
+    &fixture,
+    &mut connection,
+    b"( change-rev-prop ( 1 7:svn:log 3:new ) ) ",
+  );
+  assert_eq!(
+    (
+      call.revision,
+      call.user.as_str(),
+      call.name.as_str(),
+      call.action,
+      call.value.as_slice()
+    ),
+    (
+      1,
+      "alice",
+      "svn:log",
+      RevisionPropertyAction::Modified,
+      b"new".as_slice()
+    )
+  );
+  assert_eq!(
+    connection.revision_property_finished(Ok(()), &mut out),
+    Err(Refused::OutOfTurn)
+  );
+  let record = connection
+    .revision_property_hooked(&sources, Ok(()), &mut out)
+    .unwrap();
+  let Some(Record::RevisionProperties {
+    revision,
+    properties,
+  }) = record
+  else {
+    panic!("{record:?}");
+  };
+  let held = sources.repository.revision_properties(1).unwrap();
+  assert_eq!(
+    (
+      revision,
+      properties.get(b"svn:log".as_slice()).map(Vec::as_slice),
+      properties.len(),
+    ),
+    (1, Some(b"new".as_slice()), held.len())
+  );
+  let post = connection
+    .revision_property_landed(Ok(()), &mut out)
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    (post.action, post.value.as_slice()),
+    (RevisionPropertyAction::Modified, b"r1".as_slice())
+  );
+  assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+  connection
+    .revision_property_finished(Ok(()), &mut out)
+    .unwrap();
+  assert_eq!(String::from_utf8_lossy(&out), "( success ( ) ) ");
+  assert_eq!(connection.waiting(), Waiting::Command);
+}
+
+/// A-702 part 2 (`fs-wrap.c`, FSFS's `change_rev_prop`, `hooks.c`). Do: through alice's tunnel, refuse a change's
+/// pre-revprop-change; ask `change-rev-prop2` expecting `svn:log` to be `old` where it is `r1`, then expecting it absent;
+/// refuse a landing; fail a post-revprop-change. Expect: the hook's chain as the answer; "revprop 'svn:log' has
+/// unexpected value in filesystem" (160049) after the hook, twice, the action read from the value expected (modified,
+/// then added); the landing's failure; the post-hook's chain, the connection waiting on its next command after each.
+#[test]
+fn a_revision_property_change_is_refused_after_its_pre_hook_as_svnserve_refuses_it() {
+  use crate::serve::RevisionPropertyAction;
+  let fixture = fixture();
+  let sources = fixture.sources();
+  let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
+  let change = b"( change-rev-prop ( 1 7:svn:log 3:new ) ) ";
+  let hook = [(165_001, "pre-revprop-change hook failed".to_owned())];
+  let mismatch = b"( change-rev-prop2 ( 1 7:svn:log ( 3:new ) ( false 3:old ) ) ) ";
+  let absent = b"( change-rev-prop2 ( 1 7:svn:log ( 3:new ) ( false ) ) ) ";
+  let hooked = |connection: &mut Connection, command: &[u8], verdict| {
+    let call = revision_property_hook(&fixture, connection, command);
+    let mut out = Vec::new();
+    let record = connection.revision_property_hooked(&sources, verdict, &mut out);
+    assert_eq!(record, Ok(None));
+    assert_eq!(connection.waiting(), Waiting::Command);
+    (call.action, String::from_utf8_lossy(&out).into_owned())
+  };
+  assert_eq!(
+    hooked(&mut connection, change, Err(hook.to_vec())),
+    (
+      RevisionPropertyAction::Modified,
+      failure_of(&[(165_001, "pre-revprop-change hook failed")])
+    )
+  );
+  assert_eq!(
+    hooked(&mut connection, mismatch, Ok(())),
+    (
+      RevisionPropertyAction::Modified,
+      failure_of(&[(
+        160_049,
+        "revprop 'svn:log' has unexpected value in filesystem"
+      )])
+    )
+  );
+  assert_eq!(
+    hooked(&mut connection, absent, Ok(())),
+    (
+      RevisionPropertyAction::Added,
+      failure_of(&[(
+        160_049,
+        "revprop 'svn:log' has unexpected value in filesystem"
+      )])
+    )
+  );
+  let mut out = Vec::new();
+  revision_property_hook(&fixture, &mut connection, change);
+  connection
+    .revision_property_hooked(&sources, Ok(()), &mut out)
+    .unwrap();
+  let landed = connection.revision_property_landed(Err((160_000, "refused".to_owned())), &mut out);
+  assert_eq!(
+    (landed, String::from_utf8_lossy(&out).into_owned()),
+    (Ok(None), failure_of(&[(160_000, "refused")]))
+  );
+  out.clear();
+  revision_property_hook(&fixture, &mut connection, change);
+  connection
+    .revision_property_hooked(&sources, Ok(()), &mut out)
+    .unwrap();
+  connection
+    .revision_property_landed(Ok(()), &mut out)
+    .unwrap();
+  connection
+    .revision_property_finished(Err(hook.to_vec()), &mut out)
+    .unwrap();
+  assert_eq!(
+    String::from_utf8_lossy(&out),
+    failure_of(&[(165_001, "pre-revprop-change hook failed")])
+  );
+  assert_eq!(connection.waiting(), Waiting::Command);
+}
+
 /// A-702 part 1 (`must_have_access` for a write, no user needed). Do: on an anonymous session, which may read alone,
 /// change revision 1's `svn:log`; answer the authentication asked with alice's CRAM-MD5. Expect: CRAM-MD5 asked for the
-/// command, then, alice authenticated, the change run again with no trivial request and refused for the missing hook.
+/// command, then, alice authenticated, the change run again with no trivial request, its pre-hook's call handed out.
 #[test]
 fn an_anonymous_revision_property_change_authenticates_first() {
   let fixture = fixture();
@@ -1656,12 +1820,17 @@ fn an_anonymous_revision_property_change_authenticates_first() {
   assert_eq!(asked, cram_md5_request());
   let (authenticated, verdict) = cram_md5(&mut connection, b"alice", ALICE_SECRET);
   assert!(matches!(verdict, Verdict::Established(_)), "{verdict:?}");
-  let (rerun, _) = send(&fixture, &mut connection, b"");
-  let no_hook = "Repository has not been enabled to accept revision propchanges;\nask the administrator to create \
-                 a pre-revprop-change hook";
+  let (rerun, turn) = send(&fixture, &mut connection, b"");
   assert!(
     authenticated.ends_with("( success ( ) ) "),
     "{authenticated}"
   );
-  assert_eq!(rerun, failure_of(&[(165_006, no_hook)]));
+  assert_eq!(rerun, "");
+  let turn = turn.unwrap();
+  assert!(
+    turn.starts_with("RevisionPropertyHook")
+      && turn.contains("user: \"alice\"")
+      && turn.contains("consumed: 0"),
+    "{turn}"
+  );
 }

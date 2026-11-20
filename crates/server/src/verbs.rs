@@ -78,7 +78,7 @@ pub(crate) fn to_db_principal(principal: &slates_ipc::protocol::Principal) -> Pr
 
 /// A catalog principal as the wire names it (A-237), host included; `None` for one a client never names (a SID, a
 /// certificate).
-fn to_wire_principal(principal: &Principal) -> Option<slates_ipc::protocol::Principal> {
+pub(crate) fn to_wire_principal(principal: &Principal) -> Option<slates_ipc::protocol::Principal> {
   match principal {
     Principal::Uid { host, uid } => Some(slates_ipc::protocol::Principal::Uid {
       host: host.0,
@@ -2648,7 +2648,8 @@ pub(crate) fn route_gated(
     | RequestBody::BindBranch { repository, .. }
     | RequestBody::RetireBranch { repository, .. }
     | RequestBody::SetRepositoryPolicy { repository, .. }
-    | RequestBody::ImportRepository { repository, .. } => {
+    | RequestBody::ImportRepository { repository, .. }
+    | RequestBody::DescribeRepositoryPolicy { repository } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -3996,6 +3997,39 @@ fn release_part_back(state: &mut ShardState, request: u64, part: &ReplyBody) {
   }
 }
 
+/// Counter: blocks the large-allocation path mapped (`slates_mem::large`, A-742). Format: a counter name in the
+/// status report, on the control shard alone (the path is the process's).
+pub(crate) const LARGE_MAPPED: &str = "mem.large.mapped";
+/// Counter: blocks the large-allocation path unmapped, each given back to the OS. Format: a counter name.
+pub(crate) const LARGE_UNMAPPED: &str = "mem.large.unmapped";
+/// Counter: bytes the large-allocation path holds mapped now. Format: a counter name.
+pub(crate) const LARGE_MAPPED_BYTES: &str = "mem.large.mapped_bytes";
+/// Counter: bytes the large-allocation path gave back to the OS. Format: a counter name.
+pub(crate) const LARGE_RETURNED_BYTES: &str = "mem.large.returned_bytes";
+/// Counter: mappings the OS refused the large-allocation path. Format: a counter name.
+pub(crate) const LARGE_REFUSED: &str = "mem.large.refused";
+
+/// The large-allocation path's give-back counters (`slates_mem::large`), reported by the control shard alone so the
+/// process's figures appear once; none elsewhere, and none that are zero.
+fn large_counts(state: &ShardState) -> impl Iterator<Item = RefusalCount> {
+  let stats = slates_mem::large::stats();
+  let rows = [
+    (LARGE_MAPPED, stats.mapped),
+    (LARGE_UNMAPPED, stats.unmapped),
+    (LARGE_MAPPED_BYTES, stats.mapped_bytes),
+    (LARGE_RETURNED_BYTES, stats.returned_bytes),
+    (LARGE_REFUSED, stats.refused),
+  ];
+  let control = is_control_shard(state);
+  rows
+    .into_iter()
+    .filter(move |(_, count)| control && *count > 0)
+    .map(|(kind, count)| RefusalCount {
+      kind: kind.to_owned(),
+      count,
+    })
+}
+
 /// Gathers one shard's part of a status; the last part delivers the whole. A report `shard` did not serve is settled
 /// refused ([`settle_unserved`]): before A-557 it was skipped, and the status answered without that shard.
 fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
@@ -4206,6 +4240,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
           count,
         }),
       )
+      .chain(large_counts(state))
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -5189,6 +5224,10 @@ fn dispatch_inner(
     // (A-678, A-652 part 3).
     RequestBody::ImportRepository { repository, path } => {
       crate::repository::import::import_repository(state, principal, (&repository, &path))
+    }
+    // A repository's policy read whole by its owner (A-622; `slates repository policy`).
+    RequestBody::DescribeRepositoryPolicy { repository } => {
+      crate::repository::describe_policy(state, principal, &repository)
     }
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {
@@ -9339,6 +9378,19 @@ fn submit(
       }
       reply
     }
+    None if crate::vcs_store::paths::whole_build::building(state, green_id) => {
+      // The green's map is being built whole after a push (A-664's live whole builds): the submit waits, parked, and
+      // runs again once the build ends.
+      let kind = ParkedKind::Local {
+        principal: principal.clone(),
+        work,
+        evidence,
+        signature,
+        authorship,
+        approval,
+      };
+      return park_submit(state, green_id, kind);
+    }
     None => {
       // The restatement an acceptance records must fit before the verdict (A-207), so a submit is refused rather than
       // accepted with the work's log unable to record it.
@@ -9598,11 +9650,13 @@ fn judge_submission(
       // A git repository's green keeps the version's map of paths to git's files and its git trees (A-664 part 3,
       // `vcs_store::paths`), and the version becomes git's commit the server makes, recorded with the version in this
       // transaction and admitted to the repository's store (A-664 part 3, `vcs_store::commits`).
-      crate::vcs_store::paths::advance(state, green_id, version);
-      crate::vcs_store::commits::make(state, green_id, version, &policy.authorship);
+      crate::vcs_store::commits::after_submit(state, green_id, version, &policy.authorship);
       // A Subversion repository's green: the version becomes the revision the server makes of it, recorded in this
       // transaction (A-664's Subversion objects, `vcs_store::svn_made`).
       crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship);
+      // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
+      // transaction (A-731, `vcs_store::hg_made`).
+      crate::vcs_store::hg_made::make(state, green_id, version, &policy.authorship);
       // The acceptance is published only once the version's merge record is **committed at the
       // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
       // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
@@ -10051,6 +10105,24 @@ pub(crate) fn owner_judge(
   if let Some(owed) = acknowledgement_owed(state, origin, id.client, &verb) {
     return Some(owed);
   }
+  if crate::vcs_store::paths::whole_build::building(state, sealed.green) {
+    // The green's map is being built whole after a push (A-664's live whole builds): parked until the build ends.
+    let green = sealed.green;
+    let parked = ParkedSubmit {
+      origin,
+      id,
+      route: Some(back),
+      kind: ParkedKind::Owner {
+        sealed,
+        evidence,
+        policy,
+      },
+      parked_ns: state.clock.monotonic_ns(),
+    };
+    return crate::vcs_store::paths::whole_build::park(state, green, parked)
+      .err()
+      .map(refused);
+  }
   state.db.begin();
   state.current_request = Some((origin, id));
   state.reply_route = Some(back);
@@ -10070,6 +10142,192 @@ pub(crate) fn owner_judge(
       Some(refused(refusal_of_db(&error)))
     }
   }
+}
+
+/// A submit parked behind its green's whole build (A-664's live whole builds, `crate::vcs_store::paths::whole_build`):
+/// its request, where its answer goes, and what runs it again once the build ends.
+pub(crate) struct ParkedSubmit {
+  /// The completion key's origin.
+  origin: u64,
+  /// The request.
+  id: RequestId,
+  /// Where its answer goes; none where the request carried no route.
+  route: Option<crate::merge_service::ReplyRoute>,
+  /// What runs it again.
+  kind: ParkedKind,
+  /// When it parked, on the shard's monotonic clock: it waits at most the node's failover delay
+  /// (`crate::vcs_store::paths::whole_build`, "Bounds").
+  parked_ns: u64,
+}
+
+impl ParkedSubmit {
+  /// Its request's completion key: a retry of it joins its entry.
+  pub(crate) fn key(&self) -> (u64, u32, u32) {
+    (self.origin, self.id.client, self.id.sequence)
+  }
+
+  /// Whether it has waited past `bound_ns` at `now_ns`.
+  pub(crate) fn overdue(&self, now_ns: u64, bound_ns: u64) -> bool {
+    now_ns.saturating_sub(self.parked_ns) > bound_ns
+  }
+}
+
+/// Answers a parked submit that waited past its bound `Overloaded`, unrecorded, so its retry runs (as a forward that
+/// never started is answered); nothing of it ran. Whether the answer was handed on.
+pub(crate) fn answer_overdue(state: &ShardState, parked: ParkedSubmit) -> bool {
+  let ParkedSubmit {
+    origin, id, route, ..
+  } = parked;
+  let shard = state.shard;
+  route
+    .is_some_and(|route| answered_on(route, (origin, id), refused(Refusal::Overloaded { shard })))
+}
+
+/// What a parked submit runs again: the owner's step of a submit asked from a work's shard ([`owner_judge`]), or the
+/// verb of a work on the green's own shard ([`submit`]).
+enum ParkedKind {
+  /// Asked from a work's shard.
+  Owner {
+    /// The work.
+    sealed: crate::work_home::SealedWork,
+    /// Its evidence.
+    evidence: Vec<[u8; 32]>,
+    /// Its policy.
+    policy: SubmitPolicy,
+  },
+  /// Asked on the green's shard.
+  Local {
+    /// Who asked.
+    principal: Principal,
+    /// The work.
+    work: VolumeId,
+    /// Its evidence.
+    evidence: Vec<[u8; 32]>,
+    /// Its signature.
+    signature: Option<Vec<u8>>,
+    /// Its authorship.
+    authorship: slates_ipc::protocol::Authorship,
+    /// Its approval.
+    approval: Approval,
+  },
+}
+
+/// Parks the running submit behind `green`'s build: its request deferred as an acceptance that waits is (no completion,
+/// no reply, `merge_service::defer_acceptance`), or refused `Overloaded` at the bound.
+fn park_submit(state: &mut ShardState, green: DbVolumeId, kind: ParkedKind) -> ReplyBody {
+  let Some((origin, id)) = state.current_request else {
+    return refused(Refusal::Overloaded { shard: state.shard });
+  };
+  let parked = ParkedSubmit {
+    origin,
+    id,
+    route: state.reply_route,
+    kind,
+    parked_ns: state.clock.monotonic_ns(),
+  };
+  match crate::vcs_store::paths::whole_build::park(state, green, parked) {
+    Ok(()) => {
+      state.reply_route = None;
+      state.acceptance_deferred = true;
+      refused(Refusal::Overloaded { shard: state.shard })
+    }
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Runs each parked submit again in its own transaction, in the order they came, and answers it on its route.
+pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
+  for submit in parked {
+    let ParkedSubmit {
+      origin,
+      id,
+      route,
+      kind,
+      ..
+    } = submit;
+    let reply = match kind {
+      ParkedKind::Owner {
+        sealed,
+        evidence,
+        policy,
+      } => {
+        route.and_then(|back| owner_judge(state, (origin, id), (sealed, evidence, policy), back))
+      }
+      ParkedKind::Local {
+        principal,
+        work,
+        evidence,
+        signature,
+        authorship,
+        approval,
+      } => {
+        let verb = (work, (evidence, signature, authorship), approval);
+        resumed_local(state, (origin, id), route, &principal, verb)
+      }
+    };
+    if let (Some(reply), Some(route)) = (reply, route)
+      && !answered_on(route, (origin, id), reply)
+    {
+      state.count("vcs_store.paths.whole_build.undelivered", 1);
+    }
+  }
+}
+
+/// A parked local submit run again in its own transaction, as `run_recorded` runs a verb: its reply, recorded as its
+/// completion, or none where it waits again (an acceptance deferred, or parked behind a later build).
+fn resumed_local(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  route: Option<crate::merge_service::ReplyRoute>,
+  principal: &Principal,
+  (work, carried, approval): (
+    VolumeId,
+    (
+      Vec<[u8; 32]>,
+      Option<Vec<u8>>,
+      slates_ipc::protocol::Authorship,
+    ),
+    Approval,
+  ),
+) -> Option<ReplyBody> {
+  state.db.begin();
+  state.current_request = Some((origin, id));
+  state.reply_route = route;
+  let reply = submit(state, principal, work, carried, approval);
+  state.current_request = None;
+  state.reply_route = None;
+  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let reply = if deferred {
+    reply
+  } else {
+    record_completion(state, origin, id, reply)
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => (!deferred).then_some(reply),
+    Err(error) => {
+      reconcile_unpublished_effects(state);
+      Some(refused(refusal_of_db(&error)))
+    }
+  }
+}
+
+/// Answers `reply` on `route`, as a waiting acceptance's answer goes (`merge_service::resolve_accepted`): whether it
+/// was handed on.
+fn answered_on(
+  route: crate::merge_service::ReplyRoute,
+  (origin, id): (u64, RequestId),
+  reply: ReplyBody,
+) -> bool {
+  crate::xshard::hand_reply_home(route.shard, move || {
+    if route.through_work {
+      let _ = crate::state::with_state_counted(|s| {
+        crate::work_home::answered_late(s, origin, id, reply);
+      });
+      return;
+    }
+    crate::state::deliver(route.client_index, route.request, reply, true);
+  })
+  .is_ok()
 }
 
 /// The owner's step of a rebase asked from a work's shard (A-247): nothing of the green changes, so it records nothing
@@ -11966,12 +12224,19 @@ pub(crate) fn end_attachment(
   // Its pace goes with it (A-384).
   state.attachment_paces.remove(&record.id);
   crate::merge_service::forget_attachment(state, record.id);
-  // A mount that survived a takeover holds its volume's kept files until it ends, however it ends (U10).
+  // The attachment's kernel can hold nothing of the volume any more, however it ended: every reference and open it
+  // held is given back, and a mount that survived a takeover lets the files kept for it go (U10). An ordinary FUSE
+  // mount ends with no `FUSE_DESTROY` (Linux sends it only to fuseblk and virtio-fs) and its `FORGET`s may be lost
+  // with its connection, so until A-739 a file it held open or looked up, unlinked meanwhile, stayed charged to the
+  // volume for good (CI ubuntu, 2026-11-20: 1 MiB after a lazy unmount and the last close).
   if let Some(&handle) = state.by_id.get(&record.volume)
     && let Ok(slot) = state.volumes.get_mut(handle)
     && slot
       .volume
-      .end_takeover_holder(&mut state.store, record.id)
+      .sweep_attachment(
+        &mut state.store,
+        slates_vfs::ids::RefOwner::Attachment(record.id),
+      )
       .is_err()
   {
     state.count(TAKEOVER_KEPT_UNRELEASED, 1);
@@ -18895,8 +19160,8 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
   }
 }
 
-/// Format: mounts that ended with the files kept for them (U10) refused reclamation: they stay charged to the volume until
-/// its next restart. Zero is the healthy reading.
+/// Format: attachments whose end refused the sweep of their references (A-739) or the reclamation of the files kept for
+/// them (U10): those stay charged to the volume until its next restart. Zero is the healthy reading.
 const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 /// Format: revocations acknowledged while a FUSE mount they fenced was still dropping its kernel's cache, past
 /// the told bound (`told::bound_ns`, AUD-29-84): its requests were refused, but a page its kernel held may have been read

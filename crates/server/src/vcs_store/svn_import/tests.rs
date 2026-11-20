@@ -256,6 +256,7 @@ fn t_a652_the_records_an_import_committed_are_made_again_from_the_log() {
     assert!(imported(state, svn, PART1).0.is_ok());
     let replayed = count(state, crate::vcs_store::REPLAYED);
     crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
     assert_eq!(state.vcs_stores.unrecovered(svn), None);
     assert!(
       history(state, svn) == Some((PART1_LAST, PART1.to_vec())),

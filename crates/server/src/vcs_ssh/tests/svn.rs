@@ -37,7 +37,7 @@ use slates_svn::report::exchange::Budget;
 use slates_svn::serve::{Limits, Policy, Sources};
 
 use super::super::site::{
-  Command, Dispatched, GIT_DIE_STATUS, Next, NotYet, Refused, SshSite, ToolSite,
+  ClientGone, Command, Dispatched, GIT_DIE_STATUS, Next, NotYet, Refused, SshSite, ToolSite,
 };
 use super::{EitherCommand, Opening, SvnServices, SvnStores, TunnelBounds};
 use crate::repository::svn_commit::{Committed, Uncommitted as Unlanded};
@@ -326,6 +326,8 @@ impl KeyHolders for NoKeys {
 struct Held {
   /// Their owner.
   owner: Principal,
+  /// The hooks their policy configures (A-730).
+  hooks: Vec<slates_db::catalog::HookConfig>,
 }
 
 impl Repositories for Held {
@@ -341,6 +343,7 @@ impl Repositories for Held {
       _ => return None,
     };
     Some(RepositoryRecord {
+      index_bits: 0,
       id,
       name: name.to_owned(),
       tool,
@@ -350,7 +353,7 @@ impl Repositories for Held {
       policy: RepositoryPolicy {
         version: 1,
         rules: Vec::new(),
-        hooks: Vec::new(),
+        hooks: self.hooks.clone(),
         hooks_env: Vec::new(),
         signers: Vec::new(),
       },
@@ -522,17 +525,17 @@ impl SvnStores for Lends {
     )
   }
 
-  fn land_locks(
+  fn land_record(
     &mut self,
     id: RepositoryId,
     _principal: &Principal,
-    entries: Vec<slates_svn::lock::LockEntry>,
+    record: slates_svn::commit::record::Record,
   ) -> Option<Result<(), Unlanded>> {
     if !self.holds(id) {
       return None;
     }
     let mut next = self.created.current.get().clone();
-    Some(match next.apply_lock_entries(&entries) {
+    Some(match next.commit_record(record) {
       Ok(()) => {
         self.created.current.set(Box::leak(Box::new(next)));
         Ok(())
@@ -562,7 +565,10 @@ type TunnelSite<K> = ToolSite<K, Held, SvnServices<NotYet, Held, Lends>>;
 /// The site with Subversion's tunnel over [`Held`]'s repositories and `lends`, `keys` its lookup and `owner` the
 /// repositories' owner, every other service not served.
 fn site_over<K>(keys: K, owner: Principal, lends: Lends) -> TunnelSite<K> {
-  let held = Held { owner };
+  let held = Held {
+    owner,
+    hooks: Vec::new(),
+  };
   let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
   ToolSite::new(keys, held, services)
 }
@@ -657,7 +663,8 @@ fn drive<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
       Next::Input => hand_over(command, runs.next()),
       Next::More => {}
     }
-    let stepped = ready(command.step()).expect("a tunnel ends as svnserve ends, never failed");
+    let stepped = ready(command.step(ClientGone::never()))
+      .expect("a tunnel ends as svnserve ends, never failed");
     consumed += stepped.consumed;
     next = stepped.next;
   }
@@ -1114,4 +1121,194 @@ fn the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit() {
     (answered, consumed, youngest),
     (Answered::of(&expected, "", 0), MKDIR_CLIENT.len(), Some(1))
   );
+}
+
+/// A hook program written as a shell script into `dir`, named for its point, made executable and run once (macOS
+/// assesses an executable at its first run, which is no part of the hook's): its path.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn hook_script(dir: &std::path::Path, point: &str, body: &str) -> String {
+  use std::os::unix::fs::PermissionsExt;
+  let path = dir.join(point);
+  std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("the hook written");
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("made executable");
+  let _ = std::process::Command::new(&path)
+    .env_clear()
+    .current_dir(dir)
+    .output();
+  path.to_string_lossy().into_owned()
+}
+
+/// A hook at `point` running `program`, named for the point.
+#[cfg(unix)]
+fn hook_at(
+  point: slates_db::catalog::HookPointName,
+  program: String,
+) -> slates_db::catalog::HookConfig {
+  slates_db::catalog::HookConfig {
+    point,
+    name: point.name().to_owned(),
+    program,
+  }
+}
+
+/// Runs `command` as [`drive`] does, each step awaited, a hook's run among them.
+#[cfg(unix)]
+async fn drive_awaiting<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
+  let mut answered = Answered::default();
+  let mut consumed = 0;
+  let mut runs = runs.iter();
+  let mut next = Next::More;
+  for _ in 0..MOST_STEPS {
+    take(command, &mut answered);
+    match next {
+      Next::Exited(status) => {
+        answered.status = Some(status);
+        return (answered, consumed);
+      }
+      Next::Input => hand_over(command, runs.next()),
+      Next::More => {}
+    }
+    let stepped = command
+      .step(ClientGone::never())
+      .await
+      .expect("a tunnel ends as svnserve ends, never failed");
+    consumed += stepped.consumed;
+    next = stepped.next;
+  }
+  panic!("a tunnel that never exits: {answered:?}");
+}
+
+/// The recorded `mkdir` connection's client bytes run through a tunnel whose repository's policy runs `hooks`, on a
+/// runtime of its own (a hook is a process the run awaits): what the tunnel gave its client, and the youngest revision
+/// then.
+#[cfg(unix)]
+fn commit_under_hooks(hooks: Vec<slates_db::catalog::HookConfig>) -> (Answered, u64) {
+  use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
+  let lends = Lends::created();
+  let held = Held {
+    owner: principal(OWNER),
+    hooks,
+  };
+  let services = SvnServices::new(NotYet, held.clone(), lends.clone(), BOUNDS);
+  let mut site = ToolSite::new(NoKeys, held, services);
+  let Dispatched::Run(mut command) = site.dispatch(&principal(OWNER), &Asked::Subversion, None)
+  else {
+    panic!("the tunnel was refused");
+  };
+  let runtime = LocalRuntime::new(&RuntimeConfig {
+    shards: 1,
+    tasks_per_shard: 8,
+    timers_per_shard: 8,
+    ring_entries: 8,
+    step_budget_ns: 1_000_000,
+    timer_tick_ns: 100_000,
+    batch: 8,
+    pin: false,
+    cores: Vec::new(),
+    page_bytes: 4096,
+    spin_ns: 0,
+    wake_tracking: None,
+  })
+  .expect("a local runtime");
+  let (sent, got) = std::sync::mpsc::channel();
+  runtime
+    .spawn(async move {
+      let bound = 10 * crate::daemon::LIVENESS_BUDGET_NS;
+      let ran =
+        slates_rt::futures::within(bound, drive_awaiting(&mut command, &[MKDIR_CLIENT])).await;
+      let _ = sent.send(ran.ok().flatten());
+    })
+    .expect("the tunnel's task");
+  runtime.run_until_idle();
+  let (answered, _) = got
+    .recv()
+    .ok()
+    .flatten()
+    .expect("the tunnel ended within the test's bound");
+  (answered, lends.youngest())
+}
+
+/// A-730 part 3 (`svnserve -t` runs its repository's hooks as `svnserve -d` does). Do: through a tunnel whose
+/// repository's policy configures a start-commit hook that writes to standard error and exits 1, hand over the recorded
+/// `mkdir` commit. Expect: the commit refused at `open-root` in `svnserve`'s words, "Commit blocked by start-commit hook
+/// (exit code 1) with output:" and the hook's standard error (E165001); no revision made. Before A-730 the tunnel
+/// refused a commit at a configured point in its own words, the hook never run.
+#[cfg(unix)]
+#[test]
+fn a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words() {
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let refusing = hook_script(&dir.path, "start-commit", "echo 'not today' >&2\nexit 1");
+  let (answered, youngest) = commit_under_hooks(vec![hook_at(
+    slates_db::catalog::HookPointName::SvnStartCommit,
+    refusing,
+  )]);
+  let out = String::from_utf8_lossy(&answered.out).into_owned();
+  let words = "Commit blocked by start-commit hook (exit code 1) with output:\nnot today\n";
+  assert!(
+    out.contains("165001") && out.contains(&format!("{}:{words}", words.len())),
+    "{out}"
+  );
+  assert_eq!(youngest, 0);
+}
+
+/// A-730 part 3. Do: through a tunnel whose repository's policy configures start-commit and pre-commit hooks that
+/// record their arguments and accept, and a post-commit hook that writes to standard error and exits 1, hand over the
+/// recorded `mkdir` commit. Expect: start-commit given the repository, the tunnel's user (the principal the key proved),
+/// `mergeinfo` and the transaction; pre-commit the repository and the same transaction; the commit made as revision 1,
+/// its `commit-info` carrying post-commit's failure in `svnserve`'s words.
+#[cfg(unix)]
+#[test]
+fn a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them() {
+  use slates_db::catalog::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let start = hook_script(
+    &dir.path,
+    "start-commit",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/start.args"),
+  );
+  let pre = hook_script(
+    &dir.path,
+    "pre-commit",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args"),
+  );
+  let post = hook_script(&dir.path, "post-commit", "echo 'post said no' >&2\nexit 1");
+  let (answered, youngest) = commit_under_hooks(vec![
+    hook_at(HookPointName::SvnStartCommit, start),
+    hook_at(HookPointName::SvnPreCommit, pre),
+    hook_at(HookPointName::SvnPostCommit, post),
+  ]);
+  #[allow(clippy::disallowed_methods)]
+  // test code: what the hooks recorded in its own scratch directory
+  let lines = |file: &str| -> Vec<String> {
+    std::fs::read_to_string(dir.path.join(file))
+      .unwrap_or_default()
+      .lines()
+      .map(str::to_owned)
+      .collect()
+  };
+  let (started, precommitted) = (lines("start.args"), lines("pre.args"));
+  let repos = format!("/{REPOSITORY}");
+  let user = crate::lfs::owner_name(&principal(OWNER));
+  assert_eq!(
+    (
+      started.first(),
+      started.get(1),
+      started.get(2).map(String::as_str),
+      precommitted.first(),
+      precommitted.get(1) == started.get(3),
+    ),
+    (
+      Some(&repos),
+      Some(&user),
+      Some("mergeinfo"),
+      Some(&repos),
+      true
+    ),
+    "start-commit {started:?}, pre-commit {precommitted:?}"
+  );
+  let out = String::from_utf8_lossy(&answered.out).into_owned();
+  assert!(out.contains("post said no"), "{out}");
+  assert_eq!(youngest, 1);
 }

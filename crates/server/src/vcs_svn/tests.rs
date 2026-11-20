@@ -510,3 +510,541 @@ fn read_items_or_word(stream: &mut ClientStream) -> String {
   }
   format!("{}{}", text(&word), read_items(stream, 1))
 }
+
+/// A hook program written as a shell script into `dir`, named for its point, made executable: its path. A hook's
+/// environment is its repository's hooks-env alone (A-623), so the script names every program by its absolute path.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+pub(crate) fn hook_script(dir: &std::path::Path, point: &str, body: &str) -> String {
+  use std::os::unix::fs::PermissionsExt;
+  let path = dir.join(point);
+  std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("the hook written");
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("made executable");
+  // Run once here, as a hook already in place has run before: macOS assesses an executable at its first run, 0.16 to
+  // 0.29 s for a new script on the Mac Studio, and longer under parallel tests, which is no part of the hook's run.
+  let _ = std::process::Command::new(&path)
+    .env_clear()
+    .current_dir(dir)
+    .output();
+  path.to_string_lossy().into_owned()
+}
+
+/// Configures Subversion repository `name`'s policy, from its first version, to run `hooks` (each a point and its
+/// program), with no hooks-env.
+#[cfg(unix)]
+fn set_svn_hooks(
+  daemon: &Daemon,
+  partition: usize,
+  name: &str,
+  hooks: Vec<(slates_ipc::protocol::HookPointName, String)>,
+) {
+  let name = name.to_owned();
+  let reply = crate::daemon::observe_at(daemon, partition, move |state| {
+    crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::SetRepositoryPolicy {
+        repository: name.clone(),
+        read: 0,
+        rules: Vec::new(),
+        hooks: hooks
+          .iter()
+          .map(|(point, program)| slates_ipc::protocol::HookConfig {
+            point: *point,
+            name: point_name(*point).to_owned(),
+            program: program.clone(),
+          })
+          .collect(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+      },
+    )
+  });
+  assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// The name Subversion gives a hook at `point` (its file's name under `hooks/`), which a hook of the point is named for.
+#[cfg(unix)]
+fn point_name(point: slates_ipc::protocol::HookPointName) -> &'static str {
+  use slates_ipc::protocol::HookPointName as Point;
+  match point {
+    Point::SvnStartCommit => "start-commit",
+    Point::SvnPreCommit => "pre-commit",
+    Point::SvnPostCommit => "post-commit",
+    Point::SvnPreRevpropChange => "pre-revprop-change",
+    Point::SvnPostRevpropChange => "post-revprop-change",
+    Point::SvnPreLock => "pre-lock",
+    Point::SvnPostLock => "post-lock",
+    Point::SvnPreUnlock => "pre-unlock",
+    Point::SvnPostUnlock => "post-unlock",
+    _ => "other",
+  }
+}
+
+/// What a hook script recorded in `dir` under `file`: its lines.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn recorded_lines(dir: &std::path::Path, file: &str) -> Vec<String> {
+  std::fs::read_to_string(dir.join(file))
+    .unwrap_or_default()
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Signs in to a fresh Subversion repository on the other shard's partition whose policy runs `hooks`, and sends stock
+/// `svn` 1.15.0's recorded `mkdir` commit of `/trunk`: the repository's name, the commit's answer (`items` items: five
+/// for a commit made, three for one refused at `open-root`) and the youngest revision then, asked on a second
+/// connection, since a refused commit's client sends `abort-edit`, which the recording does not hold.
+#[cfg(unix)]
+fn commit_under_hooks(
+  items: usize,
+  hooks: impl FnOnce(&str) -> Vec<(slates_ipc::protocol::HookPointName, String)>,
+) -> (String, String, String) {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-hooked-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  set_svn_hooks(&daemon, OTHER, &name, hooks(&name));
+  let root = format!("svn://127.0.0.1:{port}/{name}");
+  let mut signed = sign_in(port, &greeting, &root);
+  // A hook's process is started and reaped within the answer: the client waits ten windows for it.
+  signed
+    .stream
+    .set_read_timeout(Some(Duration::from_nanos(10 * PATIENCE_NS)))
+    .expect("the client's wait");
+  let commit_at = MKDIR_COMMIT
+    .windows(COMMIT_START.len())
+    .position(|window| window == COMMIT_START)
+    .expect("the recorded commit");
+  let committed = asked(&mut signed.stream, &MKDIR_COMMIT[commit_at..], items);
+  let mut other = sign_in(port, &greeting, &root);
+  let latest = asked(&mut other.stream, b"( get-latest-rev ( ) ) ", 2);
+  (name, committed, latest)
+}
+
+/// A-730 (`svn_repos__hooks_start_commit`, `check_hook_result`). Do: configure a start-commit hook that writes to standard
+/// error and exits 1, and send the recorded commit. Expect: the commit refused at `open-root` in `svnserve`'s words,
+/// "Commit blocked by start-commit hook (exit code 1) with output:" and the hook's standard error (E165001), and the
+/// youngest revision still 0. Before A-730 the listener refused any commit to a repository with a hook configured, in
+/// its own words ("does not run this repository's hooks yet"), whatever the hook would have said.
+#[cfg(unix)]
+#[test]
+fn a_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words() {
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let refusing = hook_script(&dir.path, "start-commit", "echo 'not today' >&2\nexit 1");
+  let (_, committed, latest) = commit_under_hooks(3, |_| {
+    vec![(
+      slates_ipc::protocol::HookPointName::SvnStartCommit,
+      refusing,
+    )]
+  });
+  let words = "Commit blocked by start-commit hook (exit code 1) with output:\nnot today\n";
+  assert!(
+    committed.contains("165001") && committed.contains(&format!("{}:{words}", words.len())),
+    "{committed}"
+  );
+  assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 0 ) ) ");
+}
+
+/// A-730 (`hooks.c` and `commit.c`, as A-623 recorded stock `svnserve` 1.15.0's runs). Do: configure a start-commit hook
+/// and a pre-commit hook that each record their arguments (and pre-commit its standard input) and accept, and a
+/// post-commit hook that writes to standard error and exits 1; send the recorded commit. Expect: start-commit given the
+/// repository, the user, `mergeinfo` (the client announced it) and the transaction; pre-commit the repository and the
+/// same transaction, its standard input empty (no lock tokens); the commit made as revision 1, its `commit-info` carrying
+/// post-commit's failure in `svnserve`'s words as `post-commit-err`.
+#[cfg(unix)]
+#[test]
+fn a_commit_over_svn_runs_its_repositorys_commit_hooks_as_svnserve_runs_them() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let start = hook_script(
+    &dir.path,
+    "start-commit",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/start.args"),
+  );
+  let pre = hook_script(
+    &dir.path,
+    "pre-commit",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args\n/bin/cat > {at}/pre.stdin"
+    ),
+  );
+  let post = hook_script(&dir.path, "post-commit", "echo 'post said no' >&2\nexit 1");
+  let (name, committed, latest) = commit_under_hooks(5, |_| {
+    vec![
+      (HookPointName::SvnStartCommit, start),
+      (HookPointName::SvnPreCommit, pre),
+      (HookPointName::SvnPostCommit, post),
+    ]
+  });
+  let started = recorded_lines(&dir.path, "start.args");
+  let precommitted = recorded_lines(&dir.path, "pre.args");
+  let repos = format!("/{name}");
+  assert_eq!(
+    (
+      started.first(),
+      started.get(2).map(String::as_str),
+      started.len(),
+      precommitted.first(),
+      precommitted.get(1),
+      precommitted.len(),
+      recorded_lines(&dir.path, "pre.stdin").len(),
+    ),
+    (
+      Some(&repos),
+      Some("mergeinfo"),
+      4,
+      Some(&repos),
+      started.get(3),
+      2,
+      0
+    ),
+    "start-commit {started:?}, pre-commit {precommitted:?}"
+  );
+  assert!(committed.contains("post said no"), "{committed}");
+  assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 1 ) ) ");
+}
+
+/// Stock `svn` 1.15.0's recorded commit of additions and deletions, whose `new.txt` the lock tests' file commit takes its
+/// text delta and checksum from.
+#[cfg(unix)]
+const ADD_DELETE_COMMIT: &[u8] =
+  include_bytes!("../../../svn/fixtures/commit/add-delete.1.client.bin");
+
+/// A commit adding `new.txt` at the session's root ("a new file"), its text delta and checksum as stock `svn` sent them
+/// for that file in [`ADD_DELETE_COMMIT`].
+#[cfg(unix)]
+fn new_file_commit() -> Vec<u8> {
+  let start = b"( apply-textdelta ( 2:c1 ( ) ) ) ";
+  let end = b"( close-file ( 2:c1 ( 32:aff8766b86bae76c1fc4a203ab1b1ec6 ) ) ) ";
+  let from = ADD_DELETE_COMMIT
+    .windows(start.len())
+    .position(|window| window == start)
+    .expect("the recorded file's delta");
+  let to = ADD_DELETE_COMMIT
+    .windows(end.len())
+    .position(|window| window == end)
+    .expect("the recorded file's close")
+    + end.len();
+  let mut commit =
+    b"( commit ( 4:file ( ) false ( ( 7:svn:log 4:file ) ) ) ) ( open-root ( ( ) 2:d0 ) ) \
+( add-file ( 7:new.txt 2:d0 2:c1 ( ) ) ) ( close-dir ( 2:d0 ) ) "
+      .to_vec();
+  commit.extend_from_slice(&ADD_DELETE_COMMIT[from..to]);
+  commit.extend_from_slice(b"( close-edit ( ) ) ");
+  commit
+}
+
+/// Signs in to a fresh Subversion repository on the other shard's partition whose policy runs `hooks`, commits
+/// [`new_file_commit`], then asks `verb` (a lock verb's item): what it answered through its `done` and one item more.
+#[cfg(unix)]
+fn lock_under_hooks(
+  hooks: Vec<(slates_ipc::protocol::HookPointName, String)>,
+  verbs: &[&[u8]],
+) -> Vec<String> {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-locked-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  set_svn_hooks(&daemon, OTHER, &name, hooks);
+  let root = format!("svn://127.0.0.1:{port}/{name}");
+  let mut signed = sign_in(port, &greeting, &root);
+  signed
+    .stream
+    .set_read_timeout(Some(Duration::from_nanos(10 * PATIENCE_NS)))
+    .expect("the client's wait");
+  let committed = asked(&mut signed.stream, &new_file_commit(), 5);
+  assert!(committed.ends_with(" ) ( ) ) "), "{committed}");
+  verbs
+    .iter()
+    .map(|verb| {
+      let answered = asked(&mut signed.stream, verb, 2);
+      format!("{answered}{}", read_items_or_word(&mut signed.stream))
+    })
+    .collect()
+}
+
+/// A-730 (`hooks.c` `svn_repos__hooks_pre_lock`, `check_hook_result`; `fs-wrap.c` `svn_repos_fs_lock_many`). Do: commit
+/// a file, configure a pre-lock hook that writes to standard error and exits 1, ask `lock-many` for the file, then
+/// `get-lock` of it. Expect: the path refused in `svnserve`'s words, "Lock blocked by pre-lock hook (exit code 1) with
+/// output:" and the hook's standard error (E165001), then `done` and success; and no lock held.
+#[cfg(unix)]
+#[test]
+fn a_pre_lock_hook_that_refuses_refuses_its_path_in_svnserves_words() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let refusing = hook_script(&dir.path, "pre-lock", "echo 'no locks here' >&2\nexit 1");
+  let answers = lock_under_hooks(
+    vec![(HookPointName::SvnPreLock, refusing)],
+    &[b"( lock-many ( ( 4:held ) false ( ( 7:new.txt ( ) ) ) ) ) "],
+  );
+  let words = "Lock blocked by pre-lock hook (exit code 1) with output:\nno locks here\n";
+  let locked = answers.first().expect("the lock's answer");
+  assert!(
+    locked.contains("165001") && locked.contains(&format!("{}:{words}", words.len())),
+    "{locked}"
+  );
+  assert!(locked.ends_with("done ( success ( ) ) "), "{locked}");
+}
+
+/// A-730 (`hooks.c`, as A-623 recorded stock `svnserve` 1.15.0's runs). Do: commit a file; configure a pre-lock hook that
+/// records its arguments and writes a token to standard output, and a post-lock hook that records its arguments and
+/// standard input, writes to standard error and exits 1; ask `lock-many` for the file. Expect: pre-lock given the
+/// repository, the path, the user, the comment and `0` (not stolen); the file locked with the hook's token; then, after
+/// `done`, post-lock's failure (E165008 "Locking succeeded, but post-lock hook failed" over E165001), post-lock given the
+/// repository and the user, the locked path on its standard input.
+#[cfg(unix)]
+#[test]
+fn a_lock_runs_pre_lock_for_its_token_and_post_lock_after_it_as_svnserve_does() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let pre = hook_script(
+    &dir.path,
+    "pre-lock",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args\nprintf 'opaquelocktoken:from-the-hook'"
+    ),
+  );
+  let post = hook_script(
+    &dir.path,
+    "post-lock",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/post.args\n/bin/cat > {at}/post.stdin\n\
+       echo 'post said no' >&2\nexit 1"
+    ),
+  );
+  let answers = lock_under_hooks(
+    vec![
+      (HookPointName::SvnPreLock, pre),
+      (HookPointName::SvnPostLock, post),
+    ],
+    &[b"( lock-many ( ( 4:held ) false ( ( 7:new.txt ( ) ) ) ) ) "],
+  );
+  let locked = answers.first().expect("the lock's answer");
+  let pre_args = recorded_lines(&dir.path, "pre.args");
+  let post_args = recorded_lines(&dir.path, "post.args");
+  assert_eq!(
+    (
+      pre_args.get(1).map(String::as_str),
+      pre_args.get(3).map(String::as_str),
+      pre_args.get(4).map(String::as_str),
+      pre_args.len(),
+      post_args.len(),
+      post_args.first() == pre_args.first(),
+      post_args.get(1) == pre_args.get(2),
+      recorded_lines(&dir.path, "post.stdin"),
+    ),
+    (
+      Some("/new.txt"),
+      Some("held"),
+      Some("0"),
+      5,
+      2,
+      true,
+      true,
+      vec!["/new.txt".to_owned()]
+    ),
+    "pre-lock {pre_args:?}, post-lock {post_args:?}"
+  );
+  assert!(locked.contains("opaquelocktoken:from-the-hook"), "{locked}");
+  assert!(
+    locked.contains("done ( failure ( ( 165008 ") && locked.contains("post said no"),
+    "{locked}"
+  );
+}
+
+/// The svn:// listener's turns yield (w-interop's git/git `svnrdump dump`, 2026-11-20: one `replay-range` held shard 0
+/// 3596 ms without a step). Do: sign in, then send 64 `get-latest-rev` commands in one write, so every turn after the
+/// first finds its command already read, and read their 128 answers as fast as they come. Expect: every answer, and no
+/// turn begun in the same shard poll as the turn before it (`TURNS_UNYIELDED` 0 on every shard). Red before the yield
+/// (a469a6b85's parent): 63 or so, one for each pipelined command after the first.
+#[test]
+fn pipelined_commands_are_answered_one_turn_a_shard_poll() {
+  const COMMANDS: usize = 64;
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-pipelined-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  let mut signed = sign_in(port, &greeting, &format!("svn://127.0.0.1:{port}/{name}"));
+  let answers = asked(
+    &mut signed.stream,
+    &b"( get-latest-rev ( ) ) ".repeat(COMMANDS),
+    2 * COMMANDS,
+  );
+  assert_eq!(
+    answers,
+    "( success ( ( ) 0: ) ) ( success ( 0 ) ) ".repeat(COMMANDS)
+  );
+  let unyielded: Vec<u64> = [LISTENER, OTHER]
+    .into_iter()
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        state
+          .refusals
+          .get(super::TURNS_UNYIELDED)
+          .copied()
+          .unwrap_or(0)
+      })
+    })
+    .collect();
+  assert_eq!(unyielded, vec![0, 0]);
+}
+
+/// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`; `hooks.c` `svn_repos__hooks_pre_revprop_change`,
+/// `_post_revprop_change`). Do: commit a file with log `file`; configure a pre-revprop-change hook that records its
+/// arguments and standard input and allows, and a post-revprop-change hook that records its standard input; change
+/// revision 1's `svn:log` to `new`, then ask `rev-proplist` of revision 1. Expect: the change's success; pre-revprop-change
+/// given the repository, `1`, the user, `svn:log` and `M`, the new value on its standard input; post-revprop-change the
+/// old value `file` on its; and the revision's `svn:log` now `new`. Before A-702 part 2 every change was refused 165006.
+#[cfg(unix)]
+#[test]
+fn a_revision_property_change_runs_its_hooks_and_lands_as_svnserve_does() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let pre = hook_script(
+    &dir.path,
+    "pre-revprop-change",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args\n/bin/cat > {at}/pre.stdin"
+    ),
+  );
+  let post = hook_script(
+    &dir.path,
+    "post-revprop-change",
+    &format!("/bin/cat > {at}/post.stdin"),
+  );
+  let answers = lock_under_hooks(
+    vec![
+      (HookPointName::SvnPreRevpropChange, pre),
+      (HookPointName::SvnPostRevpropChange, post),
+    ],
+    &[
+      b"( change-rev-prop ( 1 7:svn:log 3:new ) ) ",
+      b"( rev-proplist ( 1 ) ) ",
+    ],
+  );
+  let pre_args = recorded_lines(&dir.path, "pre.args");
+  assert_eq!(
+    (
+      answers
+        .first()
+        .is_some_and(|changed| changed.ends_with("( success ( ) ") && !changed.contains("failure")),
+      pre_args.get(1).map(String::as_str),
+      pre_args.get(3).map(String::as_str),
+      pre_args.get(4).map(String::as_str),
+      recorded_lines(&dir.path, "pre.stdin"),
+      recorded_lines(&dir.path, "post.stdin"),
+    ),
+    (
+      true,
+      Some("1"),
+      Some("svn:log"),
+      Some("M"),
+      vec!["new".to_owned()],
+      vec!["file".to_owned()],
+    ),
+    "pre-revprop-change {pre_args:?}"
+  );
+  let listed = answers.get(1).expect("the list's answer");
+  assert!(listed.contains("7:svn:log 3:new"), "{listed}");
+}
+
+/// A-702 part 2 (`hooks.c` `svn_repos__hooks_pre_revprop_change`). Do: commit a file with no hook configured, change
+/// revision 1's `svn:log`. Expect: the trivial authentication request, then 165006 "Repository has not been enabled to
+/// accept revision propchanges", as `svnserve` answers a repository with no pre-revprop-change hook.
+#[cfg(unix)]
+#[test]
+fn a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it() {
+  let answers = lock_under_hooks(Vec::new(), &[b"( change-rev-prop ( 1 7:svn:log 3:new ) ) "]);
+  let changed = answers.first().expect("the change's answer");
+  assert!(
+    changed.contains("( success ( ( ) 0: ) ) ( failure ( ( 165006 ")
+      && changed.contains("ask the administrator to create a pre-revprop-change hook"),
+    "{changed}"
+  );
+}
+
+/// A-730 (`hooks.c` `svn_repos__hooks_pre_unlock`, `_post_unlock`). Do: commit a file; configure a pre-lock hook that
+/// gives the lock's token, and pre-unlock and post-unlock hooks that record their arguments and standard input and
+/// accept; lock the file, then unlock it with the token. Expect: the unlock answered as `svnserve` answers one path
+/// unlocked (the path, `done`, success); pre-unlock given the repository, the path, the user, the token and `0` (not
+/// broken); post-unlock the repository and the user, the unlocked path on its standard input.
+#[cfg(unix)]
+#[test]
+fn an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let token = hook_script(&dir.path, "pre-lock", "printf 'opaquelocktoken:to-unlock'");
+  let pre = hook_script(
+    &dir.path,
+    "pre-unlock",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args"),
+  );
+  let post = hook_script(
+    &dir.path,
+    "post-unlock",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/post.args\n/bin/cat > {at}/post.stdin"
+    ),
+  );
+  let answers = lock_under_hooks(
+    vec![
+      (HookPointName::SvnPreLock, token),
+      (HookPointName::SvnPreUnlock, pre),
+      (HookPointName::SvnPostUnlock, post),
+    ],
+    &[
+      b"( lock-many ( ( 4:held ) false ( ( 7:new.txt ( ) ) ) ) ) ",
+      b"( unlock-many ( false ( ( 7:new.txt ( 25:opaquelocktoken:to-unlock ) ) ) ) ) ",
+    ],
+  );
+  let unlocked = answers.get(1).expect("the unlock's answer");
+  let pre_args = recorded_lines(&dir.path, "pre.args");
+  assert_eq!(
+    (
+      pre_args.get(1).map(String::as_str),
+      pre_args.get(3).map(String::as_str),
+      pre_args.get(4).map(String::as_str),
+      pre_args.len(),
+      recorded_lines(&dir.path, "post.args").len(),
+      recorded_lines(&dir.path, "post.stdin"),
+    ),
+    (
+      Some("/new.txt"),
+      Some("opaquelocktoken:to-unlock"),
+      Some("0"),
+      5,
+      2,
+      vec!["/new.txt".to_owned()]
+    ),
+    "pre-unlock {pre_args:?}"
+  );
+  assert!(
+    unlocked.contains("( success ( 7:new.txt ) )") && unlocked.ends_with("done ( success ( ) ) "),
+    "{unlocked}"
+  );
+}

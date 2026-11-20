@@ -262,6 +262,43 @@ fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
   });
 }
 
+/// A-732 (found by use, w-perf: importing Mercurial's own repository, 57,036 changesets, crash-looped the daemon, its
+/// shard spinning past the watchdog's 1 s window at every restart: the recovery replayed the import's record in one
+/// unit, and the landing wrote it in one step). Do: import the `states` repository a unit a turn and land it; then make
+/// its store again as a recovery does, its slices a nanosecond, polling the recovery until it ends. Expect: the record
+/// written over more turns than the import's own (a revision a turn at the least), the recovery yielding between its
+/// units, at least one a revision of the record, and the store's rows after it the rows the landing left.
+#[test]
+fn t_a732_a_recovery_replays_an_import_record_a_revision_a_unit() {
+  crate::daemon::audit_on_shard(|state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    let (turns, ended) = to_its_end(state, id);
+    let finished = ended.expect("imported");
+    let revisions =
+      u64::from(finished.changesets) + u64::from(finished.manifests) + finished.file_revisions;
+    assert!(turns > revisions, "{turns} turns for {revisions} revisions");
+    assert_eq!(land(state, id), Ok(()));
+    let landed = rows_of(state, id);
+    crate::vcs_store::free(state, id);
+    let mut slices = crate::recovery_slices::RecoverySlices::begin(1);
+    let polls = {
+      let recovery = crate::vcs_store::recover(state, &mut slices);
+      let mut recovery = std::pin::pin!(recovery);
+      let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+      let mut polls = 1u64;
+      while recovery.as_mut().poll(&mut context).is_pending() {
+        polls = polls.saturating_add(1);
+      }
+      polls
+    };
+    let units = slices.finish().units;
+    assert!(polls > 1, "the recovery never yielded");
+    assert!(units > revisions, "{units} units for {revisions} revisions");
+    assert_eq!(rows_of(state, id), landed);
+  });
+}
+
 /// A-675 (refused midway): do import the `states` repository with its manifest log cut in half, a unit a turn. Expect
 /// the import refused after more than one turn, by the import's own refusal; the store's index still empty, the content
 /// store holding what it held before, the shard's retention charge what it was before (the room and the kept texts
@@ -558,4 +595,51 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
     check_settled(state, id);
     assert_eq!(count(state, LANDING_REFUSED), 1);
   });
+}
+
+/// A-732 (a rebuild's replay: `vcs_store::rebuild` made a Mercurial store again from its records in one step, where a
+/// large repository's records held the shard past the watchdog's window). Do: on a running daemon, import and land the
+/// `states` repository, then rebuild its store; read the store's state at once, then again until the rebuild's task
+/// ends. Expect: at once, the store lent to nothing (rebuilding, not held for a read or a push); after, lent again and
+/// holding the rows the landing left, the replay counted.
+#[test]
+fn t_a732_a_rebuild_replays_a_mercurial_store_a_step_a_turn() {
+  let daemon = crate::daemon::audit_daemon();
+  let (id, landed, during) = crate::daemon::observe_first(&daemon, |state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    let (_, ended) = to_its_end(state, id);
+    assert!(ended.is_ok(), "{ended:?}");
+    assert_eq!(land(state, id), Ok(()));
+    let landed = rows_of(state, id);
+    crate::vcs_store::rebuild(state, id);
+    let during = (
+      state.vcs_stores.rebuilding(id),
+      crate::vcs_store::hg_view::held_here(state, id),
+    );
+    (id, landed, during)
+  });
+  let began = Instant::now();
+  let rebuilding = loop {
+    let rebuilding =
+      crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.rebuilding(id));
+    if !rebuilding || began.elapsed() > TASK_WAIT {
+      break rebuilding;
+    }
+  };
+  let (rows, held) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      rows_of(state, id),
+      crate::vcs_store::hg_view::held_here(state, id),
+    )
+  });
+  daemon.stop();
+  assert_eq!(
+    during,
+    (true, false),
+    "the store was lent while it was made again"
+  );
+  assert!(!rebuilding, "still rebuilding after {TASK_WAIT:?}");
+  assert!(held);
+  assert_eq!(rows, landed);
 }

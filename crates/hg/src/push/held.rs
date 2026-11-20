@@ -13,13 +13,11 @@
 
 use std::borrow::Cow;
 
-use slates_vcs::{ContentId, ContentStore};
+use slates_vcs::ContentStore;
 
 use super::verify::Held;
 use crate::Node;
-use crate::filerev::MARKER;
 use crate::index::{HgIndex, Log};
-use crate::read::to_u64;
 
 /// What a repository holds: its index, and the store its rows' contents live in.
 #[derive(Clone, Copy)]
@@ -43,28 +41,8 @@ impl<'a> IndexHeld<'a> {
     if row.node != *node {
       return None;
     }
-    let Some(block) = row.block else {
-      return self.store.object_bytes(&row.bytes, row.len);
-    };
-    let block = whole(self.store, &block);
-    let markers = to_u64(MARKER.len()).checked_mul(2)?;
-    let framing = to_u64(block.len()).checked_add(markers)?;
-    let bytes = self
-      .store
-      .object_bytes(&row.bytes, row.len.checked_sub(framing)?)?;
-    let mut text = Vec::with_capacity(usize::try_from(row.len).ok()?);
-    text.extend_from_slice(MARKER);
-    text.extend_from_slice(&block);
-    text.extend_from_slice(MARKER);
-    text.extend_from_slice(&bytes);
-    Some(text)
+    self.index.revision_text(self.store, log, rev)
   }
-}
-
-/// Every window of a content, in order: a short read where the store no longer holds its tree whole, which the caller's
-/// length check refuses.
-fn whole(store: &ContentStore, root: &ContentId) -> Vec<u8> {
-  store.windows(root).flatten().copied().collect()
 }
 
 impl Held for IndexHeld<'_> {

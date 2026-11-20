@@ -119,7 +119,8 @@ impl receive::Repository for IndexedObjects<'_> {
       return Some(kept);
     }
     let (row, content) = self.repository.indexed(self.store, id)?;
-    if let Some(window) = as_kept(self.store, &content, row.len) {
+    // A window the store lends is lent again with no copy; one it copies out is kept below, as an assembled object is.
+    if let Some(Cow::Borrowed(window)) = as_kept(self.store, &content, row.len) {
       count(&self.counters, |counters| &mut counters.lent_as_kept);
       return Some((row.kind, window));
     }
@@ -180,7 +181,7 @@ impl<'a> PushedObjects<'a> {
   fn bytes(&self, content: &ContentId, len: u64) -> Result<Cow<'a, [u8]>, Unavailable> {
     if let Some(window) = as_kept(self.store, content, len) {
       count(&self.counters, |counters| &mut counters.lent_as_kept);
-      return Ok(Cow::Borrowed(window));
+      return Ok(window);
     }
     let bytes =
       self
@@ -256,8 +257,9 @@ fn count(counters: &Cell<ViewCounters>, which: impl FnOnce(&mut ViewCounters) ->
 }
 
 /// An object's bytes as the store keeps them when they are one window (slates-vcs: an object of at most one window is
-/// that window), lent with no copy; `None` when they span several.
-fn as_kept<'s>(store: &'s ContentStore, root: &ContentId, len: u64) -> Option<&'s [u8]> {
+/// that window), lent with no copy where the store's storage lends it and copied out where it cannot (A-727); `None`
+/// when they span several.
+fn as_kept<'s>(store: &'s ContentStore, root: &ContentId, len: u64) -> Option<Cow<'s, [u8]>> {
   let mut windows = store.windows(root);
   let first = windows.next()?;
   (windows.next().is_none() && to_u64(first.len()) == len).then_some(first)

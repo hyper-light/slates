@@ -104,7 +104,7 @@ use slates_ssh::userauth::{KeyHolders, RECOMMENDED_FAILURE_LIMIT};
 
 use crate::vcs_http::Bounds;
 use crate::vcs_http::git::Located;
-use site::{Command, Dispatched, Next, Refused, SshSite};
+use site::{ClientGone, Command, Dispatched, Next, Refused, SshSite};
 use waits::{Overdue, Phase, PhaseWaits, Tracker};
 
 /// Derived: the transport's packet cap: the size every peer accepts (RFC 4253 §6.1: "All implementations MUST be able to
@@ -1138,7 +1138,9 @@ impl<S: SshSite> Link<S> {
     Turn::Moved
   }
 
-  /// Steps the command and gives the input it consumed back to the client's window, then yields: one step a turn.
+  /// Steps the command and gives the input it consumed back to the client's window, then yields: one step a turn. The
+  /// step is told when its client has gone (`site::ClientGone`), the client's bytes it took meanwhile kept after those
+  /// already unread, at most one read in all ([`READ_BYTES`]), and fed to the session after it as a read's are.
   async fn step(&mut self) -> Result<Turn, Why> {
     let Some(command) = self
       .running
@@ -1148,7 +1150,13 @@ impl<S: SshSite> Link<S> {
       // A command-less run (a refusal, a failure) always has its exit queued, so it is never stepped.
       return Ok(Turn::Idle);
     };
-    match command.step().await {
+    let kept = RefCell::new(Vec::new());
+    let room = READ_BYTES.saturating_sub(self.unread.len());
+    let stepped = command
+      .step(ClientGone::watching(&self.stream, &kept, room))
+      .await;
+    self.unread.append(&mut kept.into_inner());
+    match stepped {
       Ok(stepped) => {
         if let Some(running) = self.running.as_mut() {
           running.next = stepped.next;

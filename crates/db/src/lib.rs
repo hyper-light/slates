@@ -40,6 +40,7 @@ pub mod art;
 pub mod catalog;
 pub mod credentials;
 pub mod error;
+pub mod identity_homes;
 pub mod ledger;
 pub mod live;
 pub mod mirror;
