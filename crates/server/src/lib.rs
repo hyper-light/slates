@@ -210,8 +210,8 @@ mod vcs_http;
 mod vcs_svn;
 // §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
 // phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
-// dispatched by its tool. No caller outside tests until the daemon starts an edge (its piece: the address, the host
-// key's keeping, the key store and the repositories).
+// dispatched by its tool. The daemon starts it with `--vcs-ssh` (A-684, `vcs_ssh::daemon_edge`); the services' parts
+// whose entry points have not landed (`site::NotYet`) are reached by tests alone.
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_ssh;
 // git's push on its repository's owner shard (A-654 part 2): the one driver both edges call a step at a time (the
