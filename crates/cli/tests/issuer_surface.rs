@@ -7,6 +7,9 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 use std::io::BufRead;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
@@ -15,9 +18,8 @@ use std::time::Duration;
 /// Shape: the shards of the test's daemon, as `tests/cli.rs` starts one.
 const SHARDS: &str = "2";
 
-/// Shape: how long the anchor gets to say its daemon serves and to print its surface: a guard against an anchor that
-/// never does, far above what a start takes on any development machine, never a measure of one.
-const PATIENCE: Duration = Duration::from_secs(120);
+/// Shape: the pause between looks at the anchor's tree while a line is awaited.
+const POLL: Duration = Duration::from_millis(20);
 
 /// Format: the start of the line a daemon prints once it serves (`crates/api/src/role/daemon.rs`); its instance follows.
 const SERVING_LINE: &str = "slates daemon: instance ";
@@ -61,13 +63,25 @@ fn forward_lines(child: &mut Child) -> Receiver<String> {
 
 /// Reads the anchor's lines until its daemon serves and it has printed its issuer surface, in either order: the
 /// surface's pairs.
-fn surface_once_served(lines: &Receiver<String>, instance: &str) -> Vec<(String, String)> {
+/// Each line is waited for while the anchor's tree gains CPU ([`process_wait::Judged`]; until 2026-11-20 within
+/// `PATIENCE`, 120 s of the wall).
+fn surface_once_served(
+  lines: &Receiver<String>,
+  instance: &str,
+  judged: &mut process_wait::Judged,
+) -> Vec<(String, String)> {
   let serving = format!("{SERVING_LINE}{instance} serving on ");
   let (mut served, mut surface) = (false, None);
   while !served || surface.is_none() {
-    let line = lines
-      .recv_timeout(PATIENCE)
-      .expect("the anchor served and printed its issuer surface within the patience");
+    let line = loop {
+      match lines.recv_timeout(POLL) {
+        Ok(line) => break line,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+          judged.look("the anchor served and printed its issuer surface")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the anchor's lines ended"),
+      }
+    };
     assert!(
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served: {line}"
@@ -129,8 +143,9 @@ fn a_separate_process_with_the_printed_surface_mints_a_credential_and_none_witho
     .spawn()
     .unwrap();
   let lines = forward_lines(&mut child);
+  let mut judged = process_wait::Judged::of(child.id());
   let _anchor = Anchor { child };
-  let surface = surface_once_served(&lines, &instance);
+  let surface = surface_once_served(&lines, &instance, &mut judged);
   assert!(!surface.is_empty(), "the anchor printed an empty surface");
   let mut bootstrapped = false;
   for _ in 0..50 {

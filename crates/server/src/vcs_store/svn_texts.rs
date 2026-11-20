@@ -8,21 +8,24 @@
 //! again by a recovery holds none (the table is not in its checkpoint, A-716 slice 1c), so the recovery holds every
 //! file of the head, in byte order, once the records are replayed ([`rehold_head`]): the same table every time.
 //!
-//! **Reading.** [`HeadTexts`] is the Subversion sources' text source (`slates_svn::migration::TextSource`): a text the
-//! green holds is read from it, borrowed; any other from the records. The records still hold every text's bytes until
-//! step c3; the read through the records goes with them, in the same series (main's condition), and until then it is
-//! named in GAPS.
+//! **Reading** (c3). [`HeadTexts`] is the Subversion sources' text source (`slates_svn::migration::TextSource`). A text
+//! of the head is read from the green, which holds it (borrowed, no copy-out). Any other text is read from the one place
+//! the records say it is kept, never tried in turn: a text a commit stored (main's ruling (B)) from the content store by
+//! its identity, its length the records'; a text the records keep themselves (an import's or a made revision's, as a
+//! skip-delta svndiff, c2) from the records. A text kept in neither is no text. A read takes a piece at a time
+//! (`text_at`): the green's bytes from the offset, the store's window holding it, or the records' delta window holding
+//! it, its source view made window by window down the chain; nothing is made whole.
 //!
 //! **Room.** The table's entries are bounded by what the shard could admit, an entry its identity, its block and its
-//! count: [`set_room`] derives it before each hold, so a hold past it is refused typed, counted, and the text read from
-//! the records.
+//! count: [`set_room`] derives it before each hold, so a hold past it is refused typed and counted, and the text read
+//! from where the records keep it.
 
 use std::borrow::Cow;
 
 use slates_db::catalog::{RepositoryId, VolumeId as DbVolumeId};
 use slates_merge::engine::Green;
 use slates_svn::index::{Action, ChangedPath, ContentIdentity, Index, NodeKind};
-use slates_svn::migration::{Repository as SvnRecords, TextSource};
+use slates_svn::migration::{Repository as SvnRecords, TextReading, TextSource};
 
 use crate::state::ShardState;
 
@@ -49,19 +52,72 @@ pub(crate) struct HeadTexts<'a> {
 }
 
 impl TextSource for HeadTexts<'_> {
-  /// The green's held text, then the content store's (a text a commit stored, read whole through its root), then the
-  /// records' (until c3 removes that arm).
+  /// The head's text from the green; any other from where the records keep it (module docs, "Reading").
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
       return Some(Cow::Borrowed(bytes));
     }
-    if let (Some(store), Some(len)) = (self.store, self.records.stored_len(identity)) {
-      let id = slates_vcs::ContentId(*identity);
-      if let Some(bytes) = store.object_bytes(&store.root_of(&id), len) {
-        return Some(Cow::Owned(bytes));
+    match self.records.stored_len(identity) {
+      Some(len) => {
+        let store = self.store?;
+        let id = slates_vcs::ContentId(*identity);
+        store.object_bytes(&store.root_of(&id), len).map(Cow::Owned)
       }
+      None => self.records.text(identity),
     }
-    TextSource::text(self.records, identity)
+  }
+
+  /// The text from `offset`, a piece at a time (a fetch's read, main's order after w-bugs' runs 10/11): from the green,
+  /// borrowed to the text's end; else the content store's window holding `offset`; else the records' delta window
+  /// holding it. Nothing is made whole.
+  fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
+    if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
+      return bytes
+        .get(usize::try_from(offset).ok()?..)
+        .map(Cow::Borrowed);
+    }
+    match self.records.stored_len(identity) {
+      Some(len) => {
+        if offset >= len {
+          return (offset == len).then_some(Cow::Borrowed(&[]));
+        }
+        let store = self.store?;
+        let root = store.root_of(&slates_vcs::ContentId(*identity));
+        let window = u64::try_from(store.window()).ok()?;
+        let piece = store.window_at(&root, len, offset.checked_div(window)?)?;
+        let from = usize::try_from(offset.checked_rem(window)?).ok()?;
+        match piece {
+          Cow::Borrowed(bytes) => bytes.get(from..).map(Cow::Borrowed),
+          Cow::Owned(bytes) => bytes.get(from..).map(|rest| Cow::Owned(rest.to_vec())),
+        }
+      }
+      None => self.records.text_at(identity, offset).map(Cow::Owned),
+    }
+  }
+
+  /// A step of the same order: the green's held text a window's room copied, the content store's a window of the
+  /// store read (`ContentStore::window_at`, from the window the bytes read so far reach), the records' a delta window
+  /// applied.
+  fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+    if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
+      return Some(reading.copy_step(bytes));
+    }
+    let Some(len) = self.records.stored_len(identity) else {
+      return TextSource::read_step(self.records, identity, reading);
+    };
+    // A stored text is read from the content store alone (c3: one place a text, no arm after another).
+    let store = self.store?;
+    let root = store.root_of(&slates_vcs::ContentId(*identity));
+    let window = u64::try_from(store.window()).ok()?;
+    let read = reading.read();
+    if read >= len {
+      return Some(true);
+    }
+    let piece = store.window_at(&root, len, read.checked_div(window)?)?;
+    let skip = usize::try_from(read.checked_rem(window)?).ok()?;
+    let wanted = usize::try_from(len.saturating_sub(read)).ok()?;
+    let rest = piece.get(skip..)?;
+    Some(reading.append(rest.get(..wanted).unwrap_or(rest), len))
   }
 }
 
@@ -222,4 +278,58 @@ pub(crate) fn rehold_head(state: &mut ShardState, id: RepositoryId, green: DbVol
   let mut head = Vec::new();
   files_at(records.index(), "/", records.youngest(), &mut head);
   follow(state, green, &[], &head);
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use slates_svn::migration::Room;
+
+  /// A-761 with main's item 2 of 2026-11-20 (a text read a bounded step at a time). Do: put a 10,000-byte text into a
+  /// content store of 4,096-byte windows; land revision 1 with `/trunk/a.txt` naming that text as stored (the records
+  /// keep its length, no bytes); read it through `HeadTexts` a step at a time, and whole. Expect: the text, in three
+  /// steps, a store window each; the whole read the same bytes.
+  #[test]
+  fn a_stored_text_is_read_a_store_window_a_step() {
+    let window = 4_096;
+    let bytes: Vec<u8> = (0..10_000u32).map(|at| (at % 253) as u8).collect();
+    let mut store = slates_vcs::ContentStore::new(1 << 20, window).unwrap();
+    let put = store.put_object(&bytes).unwrap();
+    let identity = *blake3::hash(&bytes).as_bytes();
+    assert_eq!(put.0, identity);
+    let uuid = slates_svn::dump::Uuid::parse(b"00000000-0000-4000-8000-00000000a761").unwrap();
+    let room = Room {
+      entries: 1 << 10,
+      bytes: 1 << 20,
+    };
+    let mut records = SvnRecords::new(uuid, b"2026-11-20T00:00:00.000000Z", room).unwrap();
+    let mut revision = crate::repository::svn_commit::tests::first();
+    let file = revision
+      .record
+      .changes
+      .iter_mut()
+      .find(|row| row.path == "/trunk/a.txt")
+      .unwrap();
+    let alpha = file.text.unwrap().identity;
+    file.text = Some(slates_svn::commit::drive::text_of(&bytes).unwrap());
+    revision.contents.remove(&alpha);
+    revision
+      .stored
+      .insert(identity, u64::try_from(bytes.len()).unwrap());
+    let checked = records.check(revision).unwrap();
+    records.apply(checked).unwrap();
+    let texts = HeadTexts {
+      green: None,
+      store: Some(&store),
+      records: &records,
+    };
+    let mut reading = TextReading::new();
+    let mut steps = 0;
+    while !texts.read_step(&identity, &mut reading).unwrap() {
+      steps += 1;
+      assert!(steps < 10, "the reading never ended");
+    }
+    assert_eq!((steps + 1, reading.bytes()), (3, bytes.as_slice()));
+    assert_eq!(texts.text(&identity).as_deref(), Some(bytes.as_slice()));
+  }
 }

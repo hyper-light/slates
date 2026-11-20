@@ -1518,9 +1518,13 @@ fn built_in_turns(
   loop {
     turns += 1;
     // The clock is read once a unit after the turn's first: a deadline `units` reads on.
-    building
-      .pace()
-      .turn(NOW.load(std::sync::atomic::Ordering::Relaxed) + units);
+    // Units of a few bytes too, so a unit's copy and hash slices are held to the one-call build.
+    let now = NOW.load(std::sync::atomic::Ordering::Relaxed);
+    let slices = crate::pace::Slices {
+      copy_bytes: 7,
+      hash_bytes: 5,
+    };
+    building.pace().turn_from(now, (now + units, slices));
     if let Some(built) = building.advance(green, store) {
       return (built, turns);
     }

@@ -1395,6 +1395,20 @@ impl Daemon {
       .wait()
   }
 
+  /// Records `point` as the root mount this daemon published (§4.6, D-1; A-645 P3) on every shard: the point a hook is
+  /// handed its repository's view beneath (`ShardState::root_mount`). What the root mount's publication calls once the
+  /// mount is made (A-645 (a), owed); until a daemon has published one, a configured hook is refused, typed, for git
+  /// and Subversion alike. Refused where a shard does not answer.
+  pub fn record_root_mount(&self, point: &std::path::Path) -> Result<(), ObserveError> {
+    for shard in &self.shards {
+      let point = point.to_path_buf();
+      self.observe(Some(*shard), move |state| {
+        state.root_mount = Some(point.clone());
+      })?;
+    }
+    Ok(())
+  }
+
   /// Like [`Self::observe`] for a question of the shard's runtime context rather than of its state (a
   /// task count), answered the same way.
   fn observe_shard<T, Q>(&self, target: Option<ShardId>, question: Q) -> Result<T, ObserveError>
@@ -1632,8 +1646,8 @@ impl Daemon {
   /// docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md). The hold is a task on the
   /// control shard, where the record sessions live, and it sleeps on the shard's timer, so the shard keeps
   /// serving meanwhile. A session that is not in its link when the hold starts (out on a dispatch or a
-  /// discovery page, or being established by its link task after a membership change) is waited for, paced
-  /// at the fleet's poll interval, for at most [`session_wait_ns`], as a forward waits for it
+  /// discovery page, or being established by its link task after a membership change) is waited for, woken by
+  /// its return or its link's change (`fleet::session_returned`), for at most [`session_wait_ns`], as a forward waits for it
   /// (`fleet::forward_over_leader_session`); taking only what is there at the first look made the hold a race
   /// against those (CI run 36275755772, docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md). Returns
   /// once the hold has run its take, with what it found ([`SessionHold`]); the typed refusal when the control
@@ -1666,7 +1680,14 @@ impl Daemon {
             };
             break (sessions, outcome);
           }
-          pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
+          // Woken by the session's return or its link's change, within what is left of the wait.
+          let left = session_wait_ns().saturating_sub(waited_ns);
+          if crate::fleet::session_returned(&[peer], left)
+            .await
+            .is_none()
+          {
+            pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
+          }
         };
         let _ = taken.send(outcome);
         if !sessions.is_empty() {
@@ -4813,6 +4834,7 @@ async fn init_shard(
     push_turns: crate::git_push::PushTurns::default(),
     burst_seen: None,
     last_burst: 0,
+    burst_closed_ns: 0,
     refill_settled: None,
     give_back_rate: GiveBackRate::default(),
     content_range,
@@ -4992,6 +5014,9 @@ async fn init_shard(
     root_learner_pace: crate::fleet::LearnerPace::default(),
     root_newer_seen: None,
     record_sessions: std::collections::BTreeMap::new(),
+    session_waiters: std::collections::BTreeMap::new(),
+    session_woken: std::collections::BTreeSet::new(),
+    next_session_wait: 0,
     record_dials: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
     discovery_withhold_replies: false,
@@ -5088,6 +5113,7 @@ async fn init_shard(
     vcs_usage: slates_vcs::Ledger::new(config.clients_per_shard),
     #[cfg(unix)]
     hook_times: crate::vcs_hooks::HookTimesTable::default(),
+    root_mount: None,
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),
   };
@@ -5558,7 +5584,7 @@ async fn purge_if_idle() -> bool {
       // The give-backs' slices come before the reserve's refill (A-226 after A-214): while any is left, the next turn
       // gives back another.
       if purged.more || recovery_left {
-        return Some(true);
+        return Some((true, true));
       }
       let pages = s.config.prefault_slice_pages();
       let refilled = s.store.content.arena_mut().prefault(&keep, pages);
@@ -5566,12 +5592,14 @@ async fn purge_if_idle() -> bool {
         CONTENT_PREFAULTED,
         u64::try_from(refilled.bytes).unwrap_or(u64::MAX),
       );
-      Some(refilled.more)
+      // A reserve still held decays at the coming passes, so the shard is not settled while it holds one.
+      Some((refilled.more, keep.is_empty()))
     })
     .flatten();
-    if step != Some(true) {
-      // Settled once a step found the shard idle and left nothing; a busy shard owes the next pass.
-      return step == Some(false);
+    if step.is_none_or(|(more, _)| !more) {
+      // Settled once a step found the shard idle, left nothing and holds no reserve that is still to decay; a busy
+      // shard owes the next pass, and so does one whose reserve the next passes shrink.
+      return step.is_some_and(|(_, reserve_gone)| reserve_gone);
     }
     // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
     // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
@@ -5626,6 +5654,7 @@ fn note_burst(s: &mut ShardState, allocations: u64) {
           .saturating_sub(before.saturating_sub(allocated))
       };
       s.burst_seen = Some((allocations, allocated));
+      s.burst_closed_ns = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
       s.refill_settled = None;
     }
     None => s.burst_seen = Some((allocations, allocated)),
@@ -5683,7 +5712,7 @@ fn refill_slice() -> bool {
 /// reserve_per_shard, the arena's free bytes)`, as the
 /// free blocks the next allocations of a chunk window would take (`ChunkArena::upcoming`): the burst bounded by the
 /// shard's memory share and by what its arena holds free.
-fn prefault_reserve(s: &ShardState) -> Vec<slates_mem::arena::KeptRun> {
+fn prefault_reserve(s: &mut ShardState) -> Vec<slates_mem::arena::KeptRun> {
   let bytes = prefault_reserve_bytes(s);
   if bytes == 0 {
     return Vec::new();
@@ -5696,17 +5725,39 @@ fn prefault_reserve(s: &ShardState) -> Vec<slates_mem::arena::KeptRun> {
 
 /// The bytes of [`prefault_reserve`]: what an idle shard keeps pre-faulted (A-214), also reported per shard by the
 /// status's content ranges (A-745).
-pub(crate) fn prefault_reserve_bytes(s: &ShardState) -> usize {
+pub(crate) fn prefault_reserve_bytes(s: &mut ShardState) -> usize {
   let arena = s.store.content.arena();
   // The busy period under way counts as soon as it has grown past the last one: an idle moment inside it, or right
   // after it, comes before the sweep pass that closes it.
   let running = s.burst_seen.map_or(0, |(_, before)| {
     arena.allocated_bytes().saturating_sub(before)
   });
-  s.last_burst
+  let idle_ns =
+    slates_vfs::clock::Clock::monotonic_ns(&mut s.clock).saturating_sub(s.burst_closed_ns);
+  let reserve = decayed_reserve(s.last_burst, idle_ns, crate::idle_sweep::interval_ns())
     .max(running)
     .min(usize::try_from(s.config.reserve_per_shard).unwrap_or(usize::MAX))
-    .min(arena.free_bytes())
+    .min(arena.free_bytes());
+  // Less than one discard is never given back on its own (`purge_keeping` keeps a shorter range resident), so a
+  // reserve decayed below it is none, and the sweep stops waking for it.
+  if reserve < s.config.discard_from_bytes {
+    0
+  } else {
+    reserve
+  }
+}
+
+/// Derived (w-sizing piece 1, MEMORY SIZING in main's common brief: "shrink when the demand goes, with an estimator
+/// that decays"): the reserve held for a burst of `burst` bytes once the shard has been idle `idle_ns` since the sweep
+/// pass that closed it. A burst is reserved whole for one sweep interval, the shard's own unit of idleness (the next
+/// pass after the one that closed it: a burst that recurs at the sweep's cadence lands on resident pages, as A-214
+/// measured), then halved each interval after, so an idle shard gives the pages back within
+/// `log2(burst / discard size)` intervals instead of holding its largest burst for as long as it stays idle. The
+/// halving is the decay the purge can act on at each pass; no rate is assumed beyond the interval itself.
+pub(crate) fn decayed_reserve(burst: usize, idle_ns: u64, interval_ns: u64) -> usize {
+  let intervals = idle_ns.checked_div(interval_ns.max(1)).unwrap_or(0);
+  let halvings = u32::try_from(intervals.saturating_sub(1)).unwrap_or(u32::MAX);
+  burst.checked_shr(halvings).unwrap_or(0)
 }
 
 /// The pressure hold across a daemon's shards (§4.2, admission.md §5.5), from the host's free memory at the daemon's
@@ -6928,6 +6979,59 @@ pub(crate) fn beat_is_late(gap_ns: u64, overrun_ns: u64) -> bool {
 }
 
 #[cfg(test)]
+mod decayed_reserve_tests {
+  use super::decayed_reserve;
+
+  /// Shape: the sweep's interval the rule is judged in: a second, the liveness budget it is today.
+  const INTERVAL_NS: u64 = 1_000_000_000;
+  /// Shape: a burst of 5 GiB, the size of the transient a large Mercurial push left as the shard's last burst.
+  const BURST: usize = 5 << 30;
+
+  /// w-sizing piece 1 (MEMORY SIZING). Do: ask the reserve held for a burst at the pass that closed it, within the first
+  /// sweep interval after it, at each later interval, and after 20 seconds and an hour idle. Expect the burst whole
+  /// through its first interval (A-214: a burst recurring at the sweep's cadence lands on resident pages), half at the
+  /// second, a quarter at the third, under a millionth of it after 20 seconds, and none after an hour. Before, the
+  /// reserve was the burst whole however long the shard stayed idle.
+  #[test]
+  fn a_reserve_is_held_one_interval_then_halves_each_interval_after() {
+    assert_eq!(
+      decayed_reserve(BURST, 0, INTERVAL_NS),
+      BURST,
+      "at the close"
+    );
+    assert_eq!(
+      decayed_reserve(BURST, INTERVAL_NS - 1, INTERVAL_NS),
+      BURST,
+      "within the first interval"
+    );
+    assert_eq!(
+      decayed_reserve(BURST, INTERVAL_NS, INTERVAL_NS),
+      BURST,
+      "at the first interval's end, the first pass after the close"
+    );
+    assert_eq!(
+      decayed_reserve(BURST, 2 * INTERVAL_NS, INTERVAL_NS),
+      BURST / 2
+    );
+    assert_eq!(
+      decayed_reserve(BURST, 3 * INTERVAL_NS, INTERVAL_NS),
+      BURST / 4
+    );
+    assert!(decayed_reserve(BURST, 20 * INTERVAL_NS, INTERVAL_NS) < BURST >> 18);
+    assert_eq!(
+      decayed_reserve(BURST, 3_600 * INTERVAL_NS, INTERVAL_NS),
+      0,
+      "an hour idle"
+    );
+    assert_eq!(
+      decayed_reserve(BURST, u64::MAX, 0),
+      0,
+      "a zero interval decays, never divides by zero"
+    );
+  }
+}
+
+#[cfg(test)]
 mod late_beat_tests {
   use super::{LIVENESS_BUDGET_NS, beat_is_late};
 
@@ -8013,11 +8117,14 @@ mod tests {
         .ok()
     };
     let mut seen = observe();
-    for _ in 0..600 {
+    // Derived: 600 looks 50 ms apart, the wait the successor is given to answer with the blob read back.
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
       if seen.as_ref().is_some_and(|seen| seen.0.is_some()) {
         break;
       }
-      std::thread::sleep(std::time::Duration::from_millis(50));
+      std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
       seen = observe();
     }
     second.stop();

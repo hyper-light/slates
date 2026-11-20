@@ -34,7 +34,9 @@
 //! **A `pushkey`** (A-758, [`super::keys`]) is landed as a push of one advisory `pushkey` part through the same caller:
 //! [`pushkey_request`] reads its four arguments and writes that push, or answers a namespace no key is moved in at once,
 //! and [`pushkeyed`] frames what the push came to as the command's string in `application/mercurial-0.1` (`1` or `0`,
-//! then any words for the client).
+//! then any words for the client). A `batch` holding a `pushkey` call is answered by its caller a call at a time
+//! ([`batch_request`], [`session::Batch`]), the call's push landed between its neighbours, and only over `POST`, as
+//! 7.2 checks a batched call's `push` permission.
 //!
 //! **Stricter than 7.2, on purpose.** A named argument the request lacks, or post arguments that are not a length
 //! within the body, is answered out of band, where 7.2's `KeyError` and `int()` end in a `500`; so is a `heads` item
@@ -48,7 +50,9 @@
 use super::Refusal;
 use super::getbundle::{Answering, Store};
 use super::keys;
-use super::session::{self, Answer, BUNDLE2_REQUIRED, Refused, Transport, dispatch, spec_of};
+use super::session::{
+  self, Answer, BUNDLE2_REQUIRED, Batch, Refused, Transport, dispatch, spec_of,
+};
 use crate::compression::{self, Engine};
 use crate::http::{self, MEDIA_TYPE_ERROR, MEDIA_TYPE_V1, MEDIA_TYPE_V2, ProtocolCaps, Request};
 use crate::push::Outcome;
@@ -75,6 +79,11 @@ const PUSH_COMMANDS: [&[u8]; 2] = [b"pushkey", b"unbundle"];
 pub const UNBUNDLE: &[u8] = b"unbundle";
 /// Format: see [`UNBUNDLE`].
 const HEADS: &[u8] = b"heads";
+
+/// Format: the command a batch is sent as, and the argument its spec names (`batch`, `cmds`).
+pub const BATCH: &[u8] = b"batch";
+/// Format: see [`BATCH`].
+const CMDS: &[u8] = b"cmds";
 
 /// Format: the bytes `pusherr` frames its words with (`0` and a line end before them, a line end after).
 const PUSH_ERROR_FRAMING: u64 = 3;
@@ -471,6 +480,34 @@ pub fn pushkeyed(outcome: &Outcome, admission: &mut Admission) -> Answered {
       refused: None,
     },
     Err(past) => error(Refused::from(past)),
+  }
+}
+
+/// What an HTTP `batch` brings (the module doc's `pushkey`): its calls, read by `batch`'s spec as any request's
+/// arguments are, for its caller to answer a call at a time ([`session::Batch`]), landing a `pushkey` call's push between
+/// them; or the answer to arguments that cannot be read. Everything read is charged to `admission`.
+pub fn batch_request(request: &Request<'_>, admission: &mut Admission) -> Result<Batch, Answered> {
+  let mut buffer = Vec::new();
+  let fields = http::fields(request, admission, &mut buffer)
+    .map_err(|refusal| error(Refused::Http(refusal)))?;
+  let spec = spec_of(BATCH).ok_or_else(not_available)?;
+  let arguments = fields
+    .arguments(spec, admission)
+    .map_err(|refusal| error(Refused::Http(refusal)))?;
+  let cmds = arguments.get(spec, CMDS).unwrap_or_default();
+  Batch::begin(cmds, admission).map_err(error)
+}
+
+/// A batch's answer over HTTP: a string in `application/mercurial-0.1`, as any command's string is; a refusal of the
+/// batch, out of band.
+pub fn batched(answer: Result<Vec<u8>, Refused>) -> Answered {
+  match answer {
+    Ok(body) => Answered {
+      media_type: MEDIA_TYPE_V1,
+      body,
+      refused: None,
+    },
+    Err(refused) => error(refused),
   }
 }
 

@@ -87,6 +87,9 @@ pub struct Repository {
   /// Every text a node-revision names, by content identity, as a delta against its skip-delta predecessor's text
   /// (S4 slice 2 c2, module docs "Texts").
   texts: BTreeMap<ContentIdentity, KeptText>,
+  /// How many texts were made whole from their chains ([`Repository::text`]): a read makes a window at a time
+  /// ([`Repository::text_at`]) and never counts here.
+  made_whole: std::cell::Cell<u64>,
   /// Every text a commit brought through its sink (§4.17.1 "A push's intake"; main's ruling of 2026-11-20 on c2 and
   /// (B)), by content identity, with its length: held once in the repository's content store, read through the lent
   /// [`TextSource`], never copied or deltified here. A later version's background job deltifies one its node moved past
@@ -118,6 +121,7 @@ impl Repository {
       revision_properties: vec![properties],
       contents: BTreeMap::new(),
       texts: BTreeMap::new(),
+      made_whole: std::cell::Cell::new(0),
       stored: BTreeMap::new(),
       locks: LockTable::new(),
       transactions: 0,
@@ -229,7 +233,104 @@ impl Repository {
       let (_, windows) = svndiff::decode_all(&kept.delta).ok()?;
       bytes = svndiff::apply_all(&bytes, &windows).ok()?;
     }
+    self.made_whole.set(self.made_whole.get().saturating_add(1));
     Some(Cow::Owned(bytes))
+  }
+
+  /// How many texts were made whole from their chains: the reads' non-vacuity counter (a read makes a window at a time).
+  pub fn texts_made_whole(&self) -> u64 {
+    self.made_whole.get()
+  }
+
+  /// The bytes of the text held under `identity` from `offset` to the end of the delta window that holds `offset`: one
+  /// window made, its source view made the same way from its base's windows, never the text whole (§4.17.4 item 11: a
+  /// read streams, nothing is assembled whole). Empty at the text's end; none past it, or for a text not held.
+  pub fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Vec<u8>> {
+    if let Some(bytes) = self.contents.get(identity) {
+      // A text whose bytes are a property list's too is that list's bytes.
+      return bytes
+        .get(usize::try_from(offset).ok()?..)
+        .map(<[u8]>::to_vec);
+    }
+    let kept = self.texts.get(identity)?;
+    if offset >= kept.len() {
+      return (offset == kept.len()).then(Vec::new);
+    }
+    let index = kept.window_holding(offset)?;
+    let (start, made) = self.made_window(kept, index, 0)?;
+    made
+      .get(usize::try_from(offset.checked_sub(start)?).ok()?..)
+      .map(<[u8]>::to_vec)
+  }
+
+  /// Window `index` of `kept`'s delta made: where its bytes start in the text, and the bytes. Its source view comes
+  /// from the base's windows ([`Repository::range_of`]), `depth` deltas down the chain.
+  fn made_window(&self, kept: &KeptText, index: usize, depth: usize) -> Option<(u64, Vec<u8>)> {
+    if depth > MAX_CHAIN {
+      return None;
+    }
+    let (start, _, at) = *kept.windows.get(index)?;
+    let mut decoder = svndiff::Decoder::new();
+    let header = kept.delta.get(..svndiff::HEADER_LEN)?;
+    matches!(
+      decoder.decode(header).ok()?,
+      svndiff::Decoded::Header { .. }
+    )
+    .then_some(())?;
+    let svndiff::Decoded::Window { window, .. } = decoder.decode(kept.delta.get(at..)?).ok()?
+    else {
+      return None;
+    };
+    let source = if window.source_len > 0 {
+      self.range_of(
+        &kept.base?,
+        window.source_offset,
+        window.source_len,
+        depth.saturating_add(1),
+      )?
+    } else {
+      Vec::new()
+    };
+    let mut made = Vec::with_capacity(usize::try_from(window.target_len).ok()?);
+    svndiff::apply(&window, &source, &mut made).ok()?;
+    Some((start, made))
+  }
+
+  /// `len` bytes of the text held under `identity` from `offset`, made window by window ([`Repository::made_window`]).
+  fn range_of(
+    &self,
+    identity: &ContentIdentity,
+    offset: u64,
+    len: u64,
+    depth: usize,
+  ) -> Option<Vec<u8>> {
+    let end = offset.checked_add(len)?;
+    if let Some(bytes) = self.contents.get(identity) {
+      return bytes
+        .get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)
+        .map(<[u8]>::to_vec);
+    }
+    let kept = self.texts.get(identity)?;
+    let mut out = Vec::with_capacity(usize::try_from(len).ok()?);
+    let mut at = offset;
+    while at < end {
+      let index = kept.window_holding(at)?;
+      let (start, made) = self.made_window(kept, index, depth)?;
+      let from = usize::try_from(at.checked_sub(start)?).ok()?;
+      let to = usize::try_from(
+        end
+          .min(start.saturating_add(u64::try_from(made.len()).ok()?))
+          .checked_sub(start)?,
+      )
+      .ok()?;
+      let piece = made.get(from..to)?;
+      if piece.is_empty() {
+        return None;
+      }
+      out.extend_from_slice(piece);
+      at = at.saturating_add(u64::try_from(piece.len()).ok()?);
+    }
+    Some(out)
   }
 
   /// How many deltas reading the text held under `identity` applies ([`Repository::text`]); none when not held.
@@ -290,13 +391,20 @@ impl Repository {
         Some(base) => self.text(&base).ok_or(StepRefusal::Corrupt)?.into_owned(),
         None => Vec::new(),
       };
-      let delta = encode_delta(&base_bytes, &bytes).ok_or(StepRefusal::Corrupt)?;
+      let (delta, windows) = encode_delta(&base_bytes, &bytes).ok_or(StepRefusal::Corrupt)?;
       saved = saved.saturating_add(
         u64::try_from(bytes.len())
           .unwrap_or(u64::MAX)
           .saturating_sub(u64::try_from(delta.len()).unwrap_or(u64::MAX)),
       );
-      self.texts.insert(text.identity, KeptText { base, delta });
+      self.texts.insert(
+        text.identity,
+        KeptText {
+          base,
+          delta,
+          windows,
+        },
+      );
     }
     // The property lists the rows name, kept whole; a text's bytes are in its delta alone.
     let lists: BTreeSet<ContentIdentity> = changes
@@ -718,6 +826,29 @@ struct KeptText {
   base: Option<ContentIdentity>,
   /// The delta's bytes.
   delta: Vec<u8>,
+  /// Each window of the delta: where its target bytes start in the text, how many it makes, and where its encoding
+  /// starts in [`KeptText::delta`], so a read makes the window it needs alone ([`Repository::text_at`]).
+  windows: Vec<(u64, u64, usize)>,
+}
+
+impl KeptText {
+  /// The text's length: what its windows make.
+  fn len(&self) -> u64 {
+    self
+      .windows
+      .last()
+      .map_or(0, |(start, len, _)| start.saturating_add(*len))
+  }
+
+  /// The window whose target bytes hold `offset`.
+  fn window_holding(&self, offset: u64) -> Option<usize> {
+    let after = self
+      .windows
+      .partition_point(|(start, _, _)| *start <= offset);
+    let index = after.checked_sub(1)?;
+    let (start, len, _) = self.windows.get(index)?;
+    (offset < start.saturating_add(*len)).then_some(index)
+  }
 }
 
 /// The most deltas one read applies: a node's predecessor count is a `u64`, and the skip-delta rule halves the distance
@@ -727,16 +858,20 @@ const MAX_CHAIN: usize = 65;
 
 /// `target` as an svndiff of version 2 against `source`, each window's sections LZ4 blocks where that is shorter, as
 /// FSFS 1.10 and later write a representation; none if the encoder refuses a window it made, which it never does.
-fn encode_delta(source: &[u8], target: &[u8]) -> Option<Vec<u8>> {
+fn encode_delta(source: &[u8], target: &[u8]) -> Option<(Vec<u8>, Vec<(u64, u64, usize)>)> {
   let room = std::num::NonZeroUsize::new(usize::try_from(svndiff::WINDOW_LIMIT).ok()?)?;
   let mut encoder = svndiff::Encoder::new(svndiff::Version::Two);
   let mut out = encoder.header().to_vec();
+  let mut windows = Vec::new();
+  let mut made = 0u64;
   for window in svndiff::deltas(source, target, room).ok()? {
+    windows.push((made, window.target_len, out.len()));
+    made = made.saturating_add(window.target_len);
     encoder
       .window(&window, svndiff::Compression::Lz4, &mut out)
       .ok()?;
   }
-  Some(out)
+  Some((out, windows))
 }
 
 /// A revision the commit step checked against a repository ([`Repository::check`]): what [`Repository::apply`]
@@ -872,7 +1007,7 @@ impl ReadSource for Repository {
   }
 
   fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
-    from_offset(TextSource::text(self, identity)?, offset)
+    TextSource::text_at(self, identity, offset)
   }
 }
 
@@ -883,6 +1018,19 @@ pub trait TextSource {
   /// The text held under `identity`, whole: borrowed where the source holds it in one piece, owned where it must copy
   /// it; none where the source holds no such text.
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>>;
+
+  /// The text held under `identity` from `offset`: a run of at least one byte where any is left (a read's next piece,
+  /// as [`crate::reads::Repository::text`] answers), empty at its end, none past it or where the source holds no such
+  /// text. A source that keeps texts in pieces answers the piece holding `offset` and makes nothing whole.
+  fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
+    from_offset(self.text(identity)?, offset)
+  }
+
+  /// Reads `identity`'s text into `reading` a bounded step (§4.17.1 "A fetch's answer", rule 3: the export's text
+  /// rebuild sliced, main's item 2 of 2026-11-20): at most one window's room of bytes copied, or one svndiff window of
+  /// a delta chain applied. True once `reading` holds the text whole ([`TextReading::bytes`]); none where the source
+  /// holds no such text or its chain does not hold together.
+  fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool>;
 }
 
 /// The records hold their own texts until the green's content index serves them (S4's second slice, A-716): a text
@@ -891,6 +1039,143 @@ impl TextSource for Repository {
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     Repository::text(self, identity)
   }
+
+  fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
+    Repository::text_at(self, identity, offset).map(Cow::Owned)
+  }
+
+  fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+    Repository::read_step(self, identity, reading)
+  }
+}
+
+/// A text being read a bounded step at a time ([`TextSource::read_step`]): the bytes read so far, and, for a text the
+/// records keep as a chain of deltas, where its rebuild stands: the chain from its first delta, the level being made,
+/// how much of that level's delta is decoded, the level below whole and the level being made so far.
+#[derive(Clone, Debug, Default)]
+pub struct TextReading {
+  /// The text's bytes read so far; the whole text once a step answered true.
+  bytes: Vec<u8>,
+  /// The chain's identities, its first delta (against nothing) first; empty before the rebuild's first step.
+  chain: Vec<ContentIdentity>,
+  /// The level being made, an index into `chain`.
+  level: usize,
+  /// How many bytes of that level's delta are decoded.
+  decoded: usize,
+  /// The delta's decoder.
+  decoder: svndiff::Decoder,
+  /// The level below, whole: the source the level's windows read.
+  below: Vec<u8>,
+}
+
+impl TextReading {
+  /// A reading that has read nothing.
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// The bytes read so far: the text whole once a step answered true.
+  pub fn bytes(&self) -> &[u8] {
+    &self.bytes
+  }
+
+  /// The text read, the reading ended.
+  pub fn into_bytes(self) -> Vec<u8> {
+    self.bytes
+  }
+
+  /// How many bytes are read so far: where the next piece of a text held in one piece starts.
+  pub fn read(&self) -> u64 {
+    u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+  }
+
+  /// Appends `piece`, the next of a text read in pieces (a content store's window), true once `len` bytes are read.
+  pub fn append(&mut self, piece: &[u8], len: u64) -> bool {
+    self.bytes.extend_from_slice(piece);
+    self.read() >= len
+  }
+
+  /// Copies the next piece of `whole`, a text held in one piece, at most a window's room ([`svndiff::WINDOW_LIMIT`]);
+  /// true once all of it is copied.
+  pub fn copy_step(&mut self, whole: &[u8]) -> bool {
+    let room = usize::try_from(svndiff::WINDOW_LIMIT).unwrap_or(usize::MAX);
+    let rest = whole.get(self.bytes.len()..).unwrap_or_default();
+    self
+      .bytes
+      .extend_from_slice(rest.get(..room).unwrap_or(rest));
+    self.bytes.len() >= whole.len()
+  }
+}
+
+impl Repository {
+  /// The chain of kept texts `identity`'s is made from, its first delta first: none for a chain past [`MAX_CHAIN`] or
+  /// one naming a text not kept.
+  fn chain_of(&self, identity: &ContentIdentity) -> Option<Vec<ContentIdentity>> {
+    let mut chain = Vec::new();
+    let mut at = *identity;
+    loop {
+      let kept = self.texts.get(&at)?;
+      chain.push(at);
+      match kept.base {
+        Some(base) if chain.len() <= MAX_CHAIN => at = base,
+        Some(_) => return None,
+        None => break,
+      }
+    }
+    chain.reverse();
+    Some(chain)
+  }
+
+  /// One step of reading the text held under `identity` into `reading` ([`TextSource::read_step`]): a property list's
+  /// bytes copied a window's room a step; a kept text made from its chain one svndiff window a step, its first delta
+  /// first, each level read against the one below it whole, as [`Repository::text`] makes it whole.
+  pub fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+    if !self.texts.contains_key(identity) {
+      return self
+        .contents
+        .get(identity)
+        .map(|bytes| reading.copy_step(bytes));
+    }
+    if reading.chain.is_empty() {
+      reading.chain = self.chain_of(identity)?;
+      reading.bytes.clear();
+    }
+    let kept = self.texts.get(reading.chain.get(reading.level)?)?;
+    decoded_step(reading, &kept.delta)?;
+    if reading.decoded < kept.delta.len() {
+      return Some(false);
+    }
+    reading.decoder.finish(&[]).ok()?;
+    reading.level = reading.level.checked_add(1)?;
+    reading.decoded = 0;
+    reading.decoder = svndiff::Decoder::new();
+    if reading.level >= reading.chain.len() {
+      reading.below = Vec::new();
+      return Some(true);
+    }
+    reading.below = std::mem::take(&mut reading.bytes);
+    Some(false)
+  }
+}
+
+/// The next piece of a level's `delta` decoded into `reading`: its header, or a window applied over the level below;
+/// none for a delta cut short or one that does not decode.
+fn decoded_step(reading: &mut TextReading, delta: &[u8]) -> Option<()> {
+  let rest = delta.get(reading.decoded..)?;
+  match reading.decoder.decode(rest).ok()? {
+    svndiff::Decoded::Header { consumed, .. } => {
+      reading.decoded = reading.decoded.checked_add(consumed)?;
+    }
+    svndiff::Decoded::Window { window, consumed } => {
+      let start = usize::try_from(window.source_offset).ok()?;
+      let end = start.checked_add(usize::try_from(window.source_len).ok()?)?;
+      let view = reading.below.get(start..end)?;
+      svndiff::apply(&window, view, &mut reading.bytes).ok()?;
+      reading.decoded = reading.decoded.checked_add(consumed)?;
+    }
+    svndiff::Decoded::NeedMore { .. } => return None,
+  }
+  Some(())
 }
 
 /// `text` from `offset` to its end: none past it, as a read's source answers.
@@ -933,7 +1218,7 @@ impl<T: TextSource + ?Sized> ReadSource for WithTexts<'_, T> {
   }
 
   fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
-    from_offset(self.texts.text(identity)?, offset)
+    self.texts.text_at(identity, offset)
   }
 }
 

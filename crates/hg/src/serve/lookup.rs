@@ -2,18 +2,23 @@
 //! served view, answered `1 <node>\n`, or `0 <why>\n` in 7.2's words.
 //!
 //! **The order 7.2 tries** (`revsymbol`): `.`, `tip` and `null`; a revision number written as `%d` writes it, a
-//! negative one counted from the end; 40 hexadecimal digits naming a held node; a bookmark, then a branch's tip (its
-//! last open head, else its last head); a node's hexadecimal prefix, a leading `x` dropped, among the held nodes and
-//! the null node (7.2's radix tree holds it); else `unknown revision '<name>'`. A prefix more than one node starts
-//! with is `00changelog@<prefix>: ambiguous identifier`. Recorded from stock 7.2 (`hg serve --stdio`).
+//! negative one counted from the end; 40 hexadecimal digits naming a held node; then the names' namespaces in 7.2's
+//! order (`namespaces.py`): a bookmark, a global tag (`crate::tags`, the `.hgtags` of the view's heads, oldest first),
+//! and a branch's tip (its last open head, else its last head); a node's hexadecimal prefix, a leading `x` dropped,
+//! among the held nodes and the null node (7.2's radix tree holds it); else `unknown revision '<name>'`. A prefix more
+//! than one node starts with is `00changelog@<prefix>: ambiguous identifier`. A tag naming a node the view does not
+//! serve stops the walk as unknown, as 7.2's `revsymbol` refuses it rather than trying a branch. Recorded from stock
+//! 7.2 (`hg serve --stdio`, `hg log -r`). An owner's `--from` asks the same order (A-575, [`resolve_name`]).
 //!
-//! **Apart from 7.2.** `.` is the null node: a served repository has no working directory, so no parent. Tags beyond
-//! `tip` are not resolved (the served view holds no `.hgtags` reading yet); such a name is answered as 7.2 answers a
-//! name it does not know.
+//! **Apart from 7.2.** `.` is the null node: a served repository has no working directory, so no parent; and it has no
+//! local tags (`.hg/localtags`), so the global ones are all it holds.
 
-use super::discovery::branch_head_revs;
+use std::collections::HashSet;
+
+use super::discovery::{branch_head_revs, head_revs};
 use super::{Refusal, Repository, Rev, node_of};
 use crate::pushkey::{encode_hex, hex_node};
+use crate::tags::Tag;
 use crate::{Admission, NULL_NODE, Node};
 
 /// Format: the answer's flag for a name resolved.
@@ -67,6 +72,20 @@ pub fn lookup(
   Ok(())
 }
 
+/// The node `name` names in the served view in 7.2's order (module docs): none for a name 7.2 does not know, or a
+/// prefix more than one node begins. An owner's verb that names a changeset by a Mercurial name (A-575's `--from`)
+/// resolves it here, as a client's `lookup` does.
+pub fn resolve_name(
+  repo: &impl Repository,
+  name: &[u8],
+  admission: &mut Admission,
+) -> Result<Option<Node>, Refusal> {
+  Ok(match resolve(repo, name, admission)? {
+    Resolved::Node(node) => Some(node),
+    Resolved::Ambiguous(_) | Resolved::Unknown => None,
+  })
+}
+
 /// `key` resolved in 7.2's order (module docs).
 fn resolve(
   repo: &impl Repository,
@@ -93,10 +112,41 @@ fn resolve(
   {
     return Ok(Resolved::Node(node));
   }
+  if let Some(tagged) = tagged(repo, key, admission)? {
+    return Ok(tagged);
+  }
   if let Some(rev) = branch_tip(repo, key, admission)? {
     return node_of(repo, rev).map(Resolved::Node);
   }
   prefixed(repo, key.strip_prefix(b"x").unwrap_or(key))
+}
+
+/// What global tag `name` names (module docs): the `.hgtags` of each head of the view, oldest head first, each file
+/// revision once (7.2's `_filterfnodes`), folded by [`Tag`]; a node the view does not serve is unknown. None where no
+/// tag has the name, or its word is the null node.
+fn tagged(
+  repo: &impl Repository,
+  name: &[u8],
+  admission: &mut Admission,
+) -> Result<Option<Resolved>, Refusal> {
+  let heads = head_revs(repo, admission)?;
+  admission.charge_items::<Node>(heads.len())?;
+  let mut read: HashSet<Node> = HashSet::with_capacity(heads.len());
+  let mut tag = Tag::new(name);
+  for head in heads {
+    let Some(file) = repo.tags_file(head, admission)? else {
+      continue;
+    };
+    if read.insert(file) {
+      tag.read(&repo.tags_text(&file, admission)?);
+    }
+  }
+  Ok(tag.node().map(|node| {
+    Node::try_from(node)
+      .ok()
+      .filter(|node| repo.rev(node).is_some())
+      .map_or(Resolved::Unknown, Resolved::Node)
+  }))
 }
 
 /// The served view's tip, the null node when it holds none.

@@ -1573,6 +1573,84 @@ async fn next_or_end(
   }
 }
 
+/// A discovery exchange's reply to the peer of `certificate`, the peer it names started on `driver`; nothing (counted)
+/// for a refused or unanswered one.
+async fn served_discovery(
+  certificate: &CertificateDer<'static>,
+  request: &[u8],
+  driver: &PeerDriver,
+) -> Vec<u8> {
+  // Test support: a fault holds this reply after the request arrived (never reachable from the
+  // wire), so a peer's exchange is pending — its endpoint borrowed — while this node is then
+  // stopped: the interrupted-discovery restart the replacement-voter regression forces.
+  while state::with_state(|state| state.discovery_withhold_replies).unwrap_or(false) {
+    crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
+  }
+  let outcome = state::with_state(|state| crate::discovery::serve(state, certificate, request));
+  match outcome {
+    Some(Ok((reply, peer))) => {
+      if let Some(peer) = peer {
+        driver.start(peer);
+      }
+      reply
+    }
+    Some(Err(refusal)) => {
+      count_refusal(refusal.counter());
+      Vec::new()
+    }
+    None => Vec::new(),
+  }
+}
+
+/// Whether a request of `kind` is a takeover's fetch of a live log (g251).
+fn is_live_fetch(kind: u64, request: &[u8]) -> bool {
+  kind == slates_cluster::live::LIVE_STATE_STREAM && slates_db::live::is_fetch(request)
+}
+
+/// Whether a request of `kind` is a live message large enough to be hashed in turns of its own (A-757 part 4).
+fn is_large_live_message(kind: u64, request: &[u8]) -> bool {
+  (kind == slates_cluster::live::LIVE_ENTRY_STREAM
+    || kind == slates_cluster::live::LIVE_ENTRIES_STREAM)
+    && crate::live_ship::hashed_in_turns(request.len())
+}
+
+/// Where a peer's request is served: on a task of its own (its stream id, and its reply when the task answered at once),
+/// or here, one at a time (its stream id, kind and bytes).
+enum PeerRequestServed {
+  Spawned(u64, Option<Vec<u8>>),
+  Here(u64, u64, Vec<u8>),
+}
+
+/// Whether the session still holds after a spawned request's reply, `served` when its task answered at once: the
+/// reply sent on `stream_id`, or none yet to send.
+fn replied(endpoint: &mut Endpoint, stream_id: u64, served: Option<Vec<u8>>) -> bool {
+  served.is_none_or(|reply| endpoint.reply(stream_id, reply).is_ok())
+}
+
+/// The member id currently learned for `peer_anchor`, or its `seed` until it announces itself.
+fn learned_host(peer_anchor: HostId, seed: HostId) -> HostId {
+  state::with_state(|s| {
+    s.learned_members
+      .get(&peer_anchor)
+      .map_or(seed, |learned| learned.host)
+  })
+  .unwrap_or(seed)
+}
+
+/// The record session `endpoint` holds, established: the certificate its peer presented, or none (counted) where the
+/// handshake failed or the peer presented none.
+async fn established_peer(endpoint: &mut Endpoint) -> Option<CertificateDer<'static>> {
+  if let Err(e) = endpoint.establish().await {
+    count_accept_failure(&e, endpoint.handshake_stall(), "record");
+    return None;
+  }
+  let certificate = endpoint.peer_certificate();
+  if certificate.is_none() {
+    count_refusal(ACCEPT_REFUSED);
+  }
+  certificate
+}
+
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
 /// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
 /// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
@@ -1591,10 +1669,9 @@ async fn serve_peer_records(
   roster: Vec<Rostered>,
   driver: PeerDriver,
 ) {
-  if let Err(e) = endpoint.establish().await {
-    count_accept_failure(&e, endpoint.handshake_stall(), "record");
+  let Some(certificate) = established_peer(&mut endpoint).await else {
     return;
-  }
+  };
   // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** anchor — the
   // one the roster holds for the certificate it presented, the same anchor its member ids derive from and its
   // announcements are validated against, so every plane names the node by one id. The RIFL completion origin
@@ -1602,10 +1679,6 @@ async fn serve_peer_records(
   // member id — what records and ownership key on — is whatever is currently learned for that anchor (its
   // seed until it announces itself; a restart moves it), resolved per request so a node that restarted
   // mid-session is served under the id it now writes as.
-  let Some(certificate) = endpoint.peer_certificate() else {
-    count_refusal(ACCEPT_REFUSED);
-    return;
-  };
   let peer_anchor = rostered_anchor(&roster, &certificate);
   let seed = crate::deploy::member_id(peer_anchor, 0);
   // The peer dialed this session and keeps it only while it keeps direct contact with this node (A-337).
@@ -1632,12 +1705,9 @@ async fn serve_peer_records(
     let Some(next) = next_or_end(&mut endpoint, &mut forwards).await else {
       return;
     };
-    let (stream_id, stream, request) = match next {
+    let dispatched = match next {
       crate::forward_lane::Next::Forwarded { stream_id, reply } => {
-        if endpoint.reply(stream_id, reply).is_err() {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, Some(reply))
       }
       crate::forward_lane::Next::Request {
         stream_id,
@@ -1649,12 +1719,7 @@ async fn serve_peer_records(
           verbs::injected_forward_silence(&request).await;
           verbs::serve_forward(control, peer_anchor, &request).await
         });
-        if let Some(reply) = served
-          && endpoint.reply(stream_id, reply).is_err()
-        {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, served)
       }
       // A takeover's fetch of a live log is laid out in turns of this shard (g251), so it too runs on its own task: a
       // long log's answer holds no other request of the peer.
@@ -1662,26 +1727,13 @@ async fn serve_peer_records(
         stream_id,
         kind,
         request,
-      } if kind == slates_cluster::live::LIVE_STATE_STREAM
-        && enrolled
-        && slates_db::live::is_fetch(&request) =>
-      {
-        let peer_host = state::with_state(|s| {
-          s.learned_members
-            .get(&peer_anchor)
-            .map_or(seed, |learned| learned.host)
-        })
-        .unwrap_or(seed);
+      } if enrolled && is_live_fetch(kind, &request) => {
+        let peer_host = learned_host(peer_anchor, seed);
         let served = forwards.spawn(stream_id, async move {
           withheld_live_state().await;
           crate::live_ship::serve_fetch(local, peer_host, request).await
         });
-        if let Some(reply) = served
-          && endpoint.reply(stream_id, reply).is_err()
-        {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, served)
       }
       // A large live message is taken in turns of its own (A-757 part 4): its entries' identities are hashed a slice a
       // turn before they are taken, so it holds no other request of the peer and no poll of this shard long. The owner
@@ -1690,17 +1742,8 @@ async fn serve_peer_records(
         stream_id,
         kind,
         request,
-      } if (kind == slates_cluster::live::LIVE_ENTRY_STREAM
-        || kind == slates_cluster::live::LIVE_ENTRIES_STREAM)
-        && enrolled
-        && crate::live_ship::hashed_in_turns(request.len()) =>
-      {
-        let peer_host = state::with_state(|s| {
-          s.learned_members
-            .get(&peer_anchor)
-            .map_or(seed, |learned| learned.host)
-        })
-        .unwrap_or(seed);
+      } if enrolled && is_large_live_message(kind, &request) => {
+        let peer_host = learned_host(peer_anchor, seed);
         let served = forwards.spawn(stream_id, async move {
           let object = slates_db::live::object_of(&request);
           let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
@@ -1712,12 +1755,7 @@ async fn serve_peer_records(
             }
           }
         });
-        if let Some(reply) = served
-          && endpoint.reply(stream_id, reply).is_err()
-        {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, served)
       }
       // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
       crate::forward_lane::Next::Request {
@@ -1728,44 +1766,28 @@ async fn serve_peer_records(
         let served = forwards.spawn(stream_id, async move {
           crate::work_route::serve(control, &request).await
         });
-        if let Some(reply) = served
-          && endpoint.reply(stream_id, reply).is_err()
-        {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, served)
       }
       crate::forward_lane::Next::Request {
         stream_id,
         kind,
         request,
-      } => (stream_id, kind, request),
+      } => PeerRequestServed::Here(stream_id, kind, request),
+    };
+    let (stream_id, stream, request) = match dispatched {
+      PeerRequestServed::Spawned(stream_id, served) => {
+        if !replied(&mut endpoint, stream_id, served) {
+          return;
+        }
+        continue;
+      }
+      PeerRequestServed::Here(stream_id, stream, request) => (stream_id, stream, request),
     };
     let reply = {
       let certificate = certificate.clone();
       async move {
         if stream == crate::discovery::STREAM {
-          // Test support: a fault holds this reply after the request arrived (never reachable from the
-          // wire), so a peer's exchange is pending — its endpoint borrowed — while this node is then
-          // stopped: the interrupted-discovery restart the replacement-voter regression forces.
-          while state::with_state(|state| state.discovery_withhold_replies).unwrap_or(false) {
-            crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
-          }
-          let outcome =
-            state::with_state(|state| crate::discovery::serve(state, &certificate, &request));
-          return match outcome {
-            Some(Ok((reply, peer))) => {
-              if let Some(peer) = peer {
-                driver.start(peer);
-              }
-              reply
-            }
-            Some(Err(refusal)) => {
-              count_refusal(refusal.counter());
-              Vec::new()
-            }
-            None => Vec::new(),
-          };
+          return served_discovery(&certificate, &request, &driver).await;
         }
         if !enrolled {
           count_refusal(ACCEPT_REFUSED);
@@ -1805,12 +1827,7 @@ async fn serve_peer_records(
           // A message that puts a live log's entries in a copy first has the volume's claim admitted on this node
           // (§4.2, g229: `live_ship::admit_claim`), answered `NoRoom` when it cannot be.
           slates_cluster::live::LIVE_ENTRY_STREAM | slates_cluster::live::LIVE_ENTRIES_STREAM => {
-            let peer_host = state::with_state(|s| {
-              s.learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |learned| learned.host)
-            })
-            .unwrap_or(seed);
+            let peer_host = learned_host(peer_anchor, seed);
             let object = slates_db::live::object_of(&request);
             let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
             match admission.refusal() {
@@ -1826,12 +1843,7 @@ async fn serve_peer_records(
             }
           }
           slates_cluster::live::LIVE_STATE_STREAM => {
-            let peer_host = state::with_state(|s| {
-              s.learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |learned| learned.host)
-            })
-            .unwrap_or(seed);
+            let peer_host = learned_host(peer_anchor, seed);
             // An owner's ask that this candidate make a volume's admission before it turns live shipping on (§4.2, A-401).
             if slates_db::live::is_admit(&request) {
               return crate::live_ship::serve_admit(control, local, peer_host, &request).await;
@@ -1893,6 +1905,12 @@ async fn serve_peer_records(
               crate::daemon::LIVENESS_BUDGET_NS,
             )
             .await
+          }
+          // A credential enrolled or revoked elsewhere in the region (A-764, `slates_cluster::credentials`): applied to
+          // the partition its id routes to and answered whether it is held as asked.
+          slates_cluster::credentials::CREDENTIAL_STREAM => {
+            crate::credentials::serve_remote(control, &request, crate::daemon::LIVENESS_BUDGET_NS)
+              .await
           }
           stream if is_content_stream(stream) => {
             let reply = state::with_state(|s| {
@@ -7639,7 +7657,10 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       // loop sees it back in the neighbourhood and re-establishes. A believed-dead peer is never dialed
       // (that establish would block on a peer that will not answer, `docs/bugs/2026-09-10-*`), so idling
       // costs nothing until the peer is alive again.
-      state::with_state(|s| s.record_sessions.remove(&peer_host));
+      state::with_state(|s| {
+        s.record_sessions.remove(&peer_host);
+        sessions_changed(s, peer_host);
+      });
       dial_settled(peer_host);
       crate::daemon::pace(HEARTBEAT_NS).await;
       continue;
@@ -7875,6 +7896,7 @@ fn refresh_record_identity_in(
     .map_or(previous, |learned| learned.host);
   if current != previous {
     state.record_sessions.remove(&previous);
+    sessions_changed(state, previous);
     // The dial's record is the previous id's: the link's dial under the new id starts afresh.
     state.record_dials.remove(&previous);
     let previous_was_a_live_incarnation = previous != crate::deploy::member_id(anchor, 0);
@@ -7906,6 +7928,7 @@ async fn enroll_record_session(
       state
         .record_sessions
         .insert(peer_host, crate::state::RecordLink::up(session));
+      sessions_changed(state, peer_host);
     });
     crate::live_ship::holder_reached(peer_host);
   }
@@ -7934,8 +7957,10 @@ async fn refresh_discovery(
         if let Some(link) = state.record_sessions.get_mut(&peer_host) {
           link.endpoint = Some(session);
         }
+        sessions_changed(state, peer_host);
       } else {
         state.record_sessions.remove(&peer_host);
+        sessions_changed(state, peer_host);
         // A discovery page can be the first exchange to meet the restarted peer's reset (A-261): counted as a reset,
         // as a borrower's return counts it, not left to read as an unexplained drop.
         if session.peer_reset() {
@@ -8266,6 +8291,7 @@ impl Dispatch {
       state::with_state(|s| {
         for host in &lost {
           s.record_sessions.remove(host);
+          sessions_changed(s, *host);
         }
       });
     }
@@ -8957,8 +8983,16 @@ async fn take_campaign_sessions(
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
-    // A refused sleep (off a shard) ends the wait with what was taken, never a spin.
-    if futures::sleep(budget.poll_interval_ns).await.is_err() {
+    // Waits for one of the voters' sessions to come back (or its link to change) within what is left, then takes
+    // again; it slept the fleet's poll interval between looks before 2026-11-20. A test's campaign hold ends at its
+    // instant, not at an event, so while one holds the wait ends there too. No wait possible (off a shard) ends the wait
+    // with what was taken, never a spin.
+    let now = futures::now_ns();
+    let mut left = budget.deadline_ns.saturating_sub(now.saturating_sub(began));
+    if out.iter().any(|voter| withheld.contains(voter)) && now < withheld_until {
+      left = left.min(withheld_until.saturating_sub(now));
+    }
+    if session_returned(&out, left).await.is_none() {
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
@@ -10710,6 +10744,9 @@ async fn follow_configuration(
   // Windows homed by identity in the region (A-724 piece 6): at a new configuration, offered to their homes and let go
   // here once every home holds them, a turn a period (`vcs_store::homes::heal_region`).
   crate::vcs_store::homes::heal_region(origin, shards, budget).await;
+  // Credentials as fleet state (A-764): at a new configuration, every credential this node holds offered to every other
+  // member, so one that joined or came back with nothing holds what the region holds (`credentials::heal_region`).
+  crate::credentials::heal_region(origin, shards, budget).await;
   // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
   // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
   crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;
@@ -11609,6 +11646,127 @@ const NS_PER_MS: u64 = 1_000_000;
 /// ([`return_sessions`]), for the link to dial again.
 const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
 
+/// Format: a wait for a record session out on loan woken by its return or its link's change ([`session_returned`]),
+/// the non-vacuity count of the woken wait.
+pub(crate) const SESSION_WAIT_WOKEN: &str = "fleet.session_wait.woken";
+/// Format: such a wait that met its deadline unwoken.
+pub(crate) const SESSION_WAIT_ELAPSED: &str = "fleet.session_wait.elapsed";
+/// Format: such waits woken by the session's own return to its link ([`return_sessions`]), the count that tells a wake
+/// at the return from one by any other change of the link.
+pub(crate) const SESSION_WAIT_RETURNED: &str = "fleet.session_wait.returned";
+
+/// Waits, on the control shard, for a record session to one of `hosts` to come back from its loan, or for its link to
+/// change (installed or dropped), for at most `left_ns`: `Some(true)` when such a change woke it, `Some(false)` at the
+/// deadline, `None` when no wait could be made (off a shard, as a refused sleep was): the caller ends its wait then, never
+/// spins. A borrower that finds a session out waits here for the event and looks again at once; before
+/// 2026-11-20 each slept a pace (a timer tick, a tenth of a period, the fleet's poll interval) and looked again, so a
+/// session handed back just after a look waited out the rest of the pace (main's sweep after A-697's release bench).
+pub(crate) async fn session_returned(hosts: &[HostId], left_ns: u64) -> Option<bool> {
+  let woken = match futures::within(
+    left_ns,
+    SessionChange {
+      hosts: hosts.to_vec(),
+      token: None,
+    },
+  )
+  .await
+  {
+    Ok(Some(Some(()))) => true,
+    Ok(Some(None)) | Err(_) => return None,
+    Ok(None) => false,
+  };
+  let _ = state::with_state(|s| {
+    s.count(
+      if woken {
+        SESSION_WAIT_WOKEN
+      } else {
+        SESSION_WAIT_ELAPSED
+      },
+      1,
+    );
+  });
+  Some(woken)
+}
+
+/// The wait of [`session_returned`]: registered with its waker under each of `hosts` at its first poll, on the shard it
+/// runs on (the control shard, where the sessions are), and ready once [`sessions_changed`] woke its token; `None` when
+/// the shard's state could not be read (off a shard). Dropped, it takes its registrations away, so none outlives it.
+struct SessionChange {
+  hosts: Vec<HostId>,
+  token: Option<u64>,
+}
+
+impl std::future::Future for SessionChange {
+  type Output = Option<()>;
+
+  fn poll(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Option<()>> {
+    let this = self.get_mut();
+    let polled = state::with_state(|s| match this.token {
+      Some(token) if s.session_woken.remove(&token) => std::task::Poll::Ready(Some(())),
+      Some(_) => std::task::Poll::Pending,
+      None => {
+        let token = s.next_session_wait;
+        s.next_session_wait = token.wrapping_add(1);
+        for host in &this.hosts {
+          s.session_waiters
+            .entry(*host)
+            .or_default()
+            .push((token, cx.waker().clone()));
+        }
+        this.token = Some(token);
+        std::task::Poll::Pending
+      }
+    });
+    polled.unwrap_or(std::task::Poll::Ready(None))
+  }
+}
+
+impl Drop for SessionChange {
+  fn drop(&mut self) {
+    let Some(token) = self.token else {
+      return;
+    };
+    let hosts = std::mem::take(&mut self.hosts);
+    let _ = state::with_state(|s| {
+      s.session_woken.remove(&token);
+      for host in hosts {
+        if let Some(waiters) = s.session_waiters.get_mut(&host) {
+          waiters.retain(|(waiting, _)| *waiting != token);
+          if waiters.is_empty() {
+            s.session_waiters.remove(&host);
+          }
+        }
+      }
+    });
+  }
+}
+
+/// Answers every wait for `host`'s record session ([`session_returned`]): its session handed back, or its link installed
+/// or dropped. Called wherever `record_sessions` changes for a host. Each wait is woken once, and leaves the lists of the
+/// other peers it waited for. Returns how many it woke.
+pub(crate) fn sessions_changed(state: &mut ShardState, host: HostId) -> u64 {
+  let Some(waiters) = state.session_waiters.remove(&host) else {
+    return 0;
+  };
+  let mut woken = 0u64;
+  for (token, waker) in waiters {
+    if state.session_woken.insert(token) {
+      for others in state.session_waiters.values_mut() {
+        others.retain(|(waiting, _)| *waiting != token);
+      }
+      waker.wake();
+      woken = woken.saturating_add(1);
+    }
+  }
+  state
+    .session_waiters
+    .retain(|_, waiters| !waiters.is_empty());
+  woken
+}
+
 /// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
 /// that left it — the entry still there, its session out, and the returning session's connection id the
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
@@ -11670,6 +11828,9 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         }
         _ => s.count(LINK_STALE_RETURN, 1),
       }
+      // Whatever became of it (handed back, dropped, or a stale return), the borrowers waiting for this peer look again.
+      let woken = sessions_changed(s, host);
+      s.count(SESSION_WAIT_RETURNED, woken);
     }
   });
 }

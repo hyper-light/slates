@@ -121,6 +121,7 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
       reader: start.principal.clone(),
       version: start.version,
       advertise: start.advertise,
+      request_room: Admission::new(room),
       admission: Admission::new(room),
       request: Vec::new(),
       answer: None,
@@ -142,7 +143,11 @@ pub(crate) struct Upload<L: StoreLender> {
   version: Version,
   /// Whether the exchange is the advertisement.
   advertise: bool,
-  /// The request's room: its bytes, and all upload-pack keeps answering it.
+  /// The request's room: its bytes as they arrive (A-745: a request's room bounds the request, and its answer is
+  /// admitted on its own).
+  request_room: Admission,
+  /// The answer's room: all upload-pack keeps answering the request, the room it began with, a request's own bytes
+  /// never taken from it, as the SSH edge admits each answer afresh (`vcs_ssh::git`'s `serve`).
   admission: Admission,
   /// The request, as its body arrived.
   request: Vec<u8>,
@@ -155,7 +160,7 @@ pub(crate) struct Upload<L: StoreLender> {
 impl<L: StoreLender> Exchange for Upload<L> {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     self
-      .admission
+      .request_room
       .charge(u64::try_from(run.len()).unwrap_or(u64::MAX))
       .map_err(|_| Failed(Status::CONTENT_TOO_LARGE))?;
     self.request.extend_from_slice(run);
@@ -173,6 +178,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
       request,
       answer,
       generation,
+      ..
     } = self;
     let unavailable = Failed(Status::SERVICE_UNAVAILABLE);
     let made = if *advertise {
@@ -199,7 +205,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     Ok(())
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
     let Self {
       lender,
       repository,

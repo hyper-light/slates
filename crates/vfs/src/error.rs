@@ -143,6 +143,12 @@ pub enum VfsError {
     /// The version this build reads.
     expected: u16,
   },
+  /// A referenced file's content identity was not answered (A-645 P3 ruling 2): the shard's content store does not
+  /// hold it, holds fewer bytes than the piece shows, or no store was lent to the read. Nothing is returned for it.
+  ReferenceUnresolved,
+  /// The volume still holds content identities its referenced files name (A-645 P3 ruling 2): its owner releases them
+  /// (`Volume::release_references`) before it destroys the volume, so no hold outlives what it was taken for.
+  ReferencesHeld,
 }
 
 impl VfsError {
@@ -184,6 +190,7 @@ impl VfsError {
       | Self::RecoveryIncomplete
       | Self::Integrity
       | Self::JournalIncomplete { .. }
+      | Self::ReferenceUnresolved
       | Self::RecoveryVersion { .. } => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
@@ -193,7 +200,7 @@ impl VfsError {
       Self::DigestCacheFull => "ENOSPC",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",
-      Self::BarrierIncomplete { .. } => "EBUSY",
+      Self::BarrierIncomplete { .. } | Self::ReferencesHeld => "EBUSY",
     }
   }
 }

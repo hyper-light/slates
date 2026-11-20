@@ -317,6 +317,9 @@ pub struct ShardState {
   /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
   /// shard keeps free pages pre-faulted for (`daemon::purge_if_idle`).
   pub(crate) last_burst: usize,
+  /// When the idle sweep pass closed [`ShardState::last_burst`] (the shard's monotonic clock, nanoseconds): the reserve
+  /// held for it decays from then (`daemon::prefault_reserve_bytes`, w-sizing piece 1).
+  pub(crate) burst_closed_ns: u64,
   /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
   /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
   pub(crate) refill_settled: Option<u64>,
@@ -790,6 +793,11 @@ pub struct ShardState {
   /// bounded by the hooks their policies configure. Unix alone, where hooks run.
   #[cfg(unix)]
   pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
+  /// The root mount this daemon published (§4.6, D-1; A-645 P3): the point the host shows every volume beneath, which a
+  /// hook is handed its repository's view beneath. The daemon's own record of the mount it made, written on every shard
+  /// when it publishes the mount, never a configured value that could drift from the mount (main's ruling of
+  /// 2026-11-20). None until then, and a configured hook is refused, typed, while it is none.
+  pub(crate) root_mount: Option<std::path::PathBuf>,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
@@ -1059,6 +1067,16 @@ pub struct ShardState {
   /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
   /// fleet loop runs).
   pub record_sessions: BTreeMap<slates_db::HostId, RecordLink>,
+  /// The waits for a record session out on loan (`crate::fleet::session_returned`), by the peer each waits for: each a
+  /// token and its task's waker, woken when that peer's session is handed back or its link installed or dropped
+  /// (`crate::fleet::sessions_changed`). On the control shard, where the sessions are. Bounded by the borrowers waiting at
+  /// once, a registration a peer each, every list drained at its peer's next change.
+  pub session_waiters: BTreeMap<slates_db::HostId, Vec<(u64, std::task::Waker)>>,
+  /// The waits [`Self::session_waiters`] woke and that have not yet seen it, by token: each taken by its wait at its next
+  /// poll or dropped with it. Bounded as the waiters are.
+  pub session_woken: std::collections::BTreeSet<u64>,
+  /// The next wait's token.
+  pub next_session_wait: u64,
   /// Each peer's record dial ([`RecordDial`]), as its link task last left it: read by status and by a fleet whose
   /// formation failed. One entry a peer, bounded by the fleet's peer capacity as `pairs_delivered` is.
   pub record_dials: BTreeMap<slates_db::HostId, RecordDial>,

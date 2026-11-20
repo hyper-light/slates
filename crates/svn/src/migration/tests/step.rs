@@ -393,6 +393,17 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
       }
       TextSource::text(self.0, identity)
     }
+
+    fn read_step(
+      &self,
+      identity: &ContentIdentity,
+      reading: &mut crate::migration::TextReading,
+    ) -> Option<bool> {
+      if *identity == (self.1).0 {
+        return Some(reading.copy_step(&(self.1).1));
+      }
+      TextSource::read_step(self.0, identity, reading)
+    }
   }
   let exported = |repository: &Repository, texts: &dyn TextSource, format: Format| {
     let mut exporter = Exporter::new(repository, 0, repository.youngest(), format)?;
@@ -422,5 +433,146 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
   assert_eq!(
     exported(&stored, &stored, Format::Two),
     Err(MigrationRefusal::Corrupt)
+  );
+}
+
+/// main's order of 2026-11-20 (w-bugs' runs 10/11: svn checkout and update 3 to 12 times as slow after c2, the fetch's
+/// 1,024-byte steps each making the whole text through its chain). Do: commit revision 1, then 20 edits of [`FILE`], a
+/// 300 KiB text changing one line in each; read every revision's text through the read source in 1,024-byte pieces,
+/// as a fetch reads. Expect: every piece the text's own bytes at its offset and at most one delta window long; no
+/// text made whole from its chain by the reads (the counter where the commits left it); the text's end read empty.
+#[test]
+fn s4_c2_a_fetch_reads_a_texts_pieces_a_window_at_a_time_never_making_it_whole() {
+  use crate::reads::Repository as _;
+  let mut repository = created();
+  repository.commit(first()).unwrap();
+  let line =
+    |at: usize, version: usize| format!("{at:06} a line of the long file, version {version:04}\n");
+  let version = |n: usize| -> Vec<u8> {
+    (0..7_000)
+      .map(|at| line(at, if at == n * 331 % 7_000 { n } else { 0 }))
+      .collect::<String>()
+      .into_bytes()
+  };
+  let mut texts = Vec::new();
+  for n in 1..=20usize {
+    let bytes = version(n);
+    repository
+      .commit(edit(u64::try_from(n).unwrap(), &bytes, Vec::new()))
+      .unwrap();
+    texts.push(bytes);
+  }
+  let window = usize::try_from(crate::svndiff::WINDOW_LIMIT).unwrap();
+  // Each commit made its base whole to deltify against: the reads below add none.
+  let made_by_commits = repository.texts_made_whole();
+  for bytes in &texts {
+    let identity = *blake3::hash(bytes).as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+      let run =
+        crate::reads::Repository::text(&repository, &identity, u64::try_from(at).unwrap()).unwrap();
+      assert!(!run.is_empty() && run.len() <= window);
+      let piece = &run[..run.len().min(1_024)];
+      assert_eq!(piece, &bytes[at..at + piece.len()]);
+      at += piece.len();
+    }
+    let end =
+      crate::reads::Repository::text(&repository, &identity, u64::try_from(bytes.len()).unwrap())
+        .unwrap();
+    assert!(end.is_empty());
+  }
+  assert_eq!(
+    repository.texts_made_whole(),
+    made_by_commits,
+    "a read makes a window, never a text"
+  );
+}
+
+/// c2's exporter text rebuild sliced (main's item 2 of 2026-11-20; Ada's rule: a performance gap is fixed first). Do:
+/// commit [`FILE`] with a 512 KiB text, then edit a few of its bytes in each of 31 revisions, so the youngest text is
+/// kept as a chain of skip deltas; export the youngest revision alone in format 2 through a source that counts what
+/// each call asks of it. Expect: the dump carries the text; no call reads a text whole, and none takes more than one
+/// bounded step of reading (a window of the chain); and the reading took at least a step for each window of the chain,
+/// so it walked the chain rather than skipping it. Before, the call that wrote the text's first piece read it whole
+/// (512 KiB, a chain of 6: that call 6.18 ms against a whole read of 6.04 ms, debug, this Mac).
+#[test]
+fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
+  use std::cell::Cell;
+
+  use crate::dump::Format;
+  use crate::migration::{Exporter, Exporting, TextReading, TextSource};
+  use crate::svndiff::WINDOW_LIMIT;
+  /// The records as a text source, counting the whole reads and the steps asked of it.
+  struct Counted<'a> {
+    records: &'a Repository,
+    whole: Cell<u64>,
+    steps: Cell<u64>,
+  }
+  impl TextSource for Counted<'_> {
+    fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+      self.whole.set(self.whole.get() + 1);
+      TextSource::text(self.records, identity)
+    }
+
+    fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+      self.steps.set(self.steps.get() + 1);
+      TextSource::read_step(self.records, identity, reading)
+    }
+  }
+  const LEN: usize = 512 * 1024;
+  let mut bytes: Vec<u8> = (0..LEN).map(|at| u8::try_from(at % 251).unwrap()).collect();
+  let mut repository = created();
+  let mut opening = first();
+  let (alpha, _) = content(b"alpha\n");
+  opening.contents.remove(&alpha);
+  let (identity, held) = content(&bytes);
+  opening.contents.insert(identity, held);
+  if let Some(file) = opening
+    .record
+    .changes
+    .iter_mut()
+    .find(|row| row.path == FILE)
+  {
+    file.text = Some(text_of(&bytes));
+  }
+  let checked = repository.check(opening).unwrap();
+  repository.apply(checked).unwrap();
+  for head in 1..32u64 {
+    let at = usize::try_from(head).unwrap() * 4_099 % LEN;
+    bytes[at] = bytes[at].wrapping_add(1);
+    let checked = repository.check(edit(head, &bytes, Vec::new())).unwrap();
+    repository.apply(checked).unwrap();
+  }
+  let youngest = repository.youngest();
+  let identity = *blake3::hash(&bytes).as_bytes();
+  let chain = u64::try_from(repository.text_chain(&identity).unwrap()).unwrap();
+  assert!(chain >= 5, "a chain of {chain}");
+  let counted = Counted {
+    records: &repository,
+    whole: Cell::new(0),
+    steps: Cell::new(0),
+  };
+  let mut exporter = Exporter::new(&repository, youngest, youngest, Format::Two).unwrap();
+  let mut dump = Vec::new();
+  let mut most_steps = 0;
+  loop {
+    let before = counted.steps.get();
+    let exported = exporter.export(&repository, &counted, &mut dump).unwrap();
+    most_steps = most_steps.max(counted.steps.get() - before);
+    if exported == Exporting::Done {
+      break;
+    }
+  }
+  let windows = chain * u64::try_from(LEN).unwrap().div_ceil(WINDOW_LIMIT);
+  assert!(
+    dump
+      .windows(bytes.len())
+      .any(|window| window == bytes.as_slice())
+  );
+  assert_eq!((counted.whole.get(), most_steps), (0, 1));
+  assert!(
+    counted.steps.get() >= windows,
+    "{} steps for {windows} windows",
+    counted.steps.get()
   );
 }

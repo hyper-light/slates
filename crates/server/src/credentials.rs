@@ -317,6 +317,286 @@ pub(crate) fn revoke(
   }
 }
 
+/// Counter: a credential a member of the region sent this node, held here as asked (A-764).
+const FLEET_APPLIED: &str = "credential.fleet.applied";
+/// Counter: a credential a member sent that this node could not hold (its partition's shard silent, or the database
+/// refused it).
+const FLEET_NOT_APPLIED: &str = "credential.fleet.not_applied";
+/// Counter: an enrollment or revocation that reached fewer members than it must, refused `CredentialUnreplicated`.
+const FLEET_SHORT: &str = "credential.fleet.short";
+/// Counter: a credential this node offered the region at a configuration change (the healer).
+const FLEET_OFFERED: &str = "credential.fleet.offered";
+
+/// A member's credential message applied here, on the shard holding the partition its id routes to (A-764, the module
+/// doc's fleet half): an enrollment held, a revocation let go. Idempotent: a record already held, or an id already gone,
+/// is held as asked. Whether it is held as asked now.
+pub(crate) fn apply_here(
+  state: &mut ShardState,
+  message: &slates_cluster::credentials::CredentialMessage,
+) -> bool {
+  use slates_cluster::credentials::CredentialMessage;
+  let held = state
+    .db
+    .partition()
+    .credentials()
+    .get(&message.id())
+    .is_some();
+  let op = match message {
+    CredentialMessage::Enroll { record } if !held => Op::CredentialEnrolled {
+      record: record.clone(),
+    },
+    CredentialMessage::Revoke { id } if held => Op::CredentialRevoked { id: *id },
+    CredentialMessage::Enroll { .. } | CredentialMessage::Revoke { .. } => return true,
+    CredentialMessage::Answer { .. } => return false,
+  };
+  let now = state.clock.monotonic_ns();
+  let applied = state.db.mutate(&mut state.segment, &op, now).is_ok();
+  state.count(
+    if applied {
+      FLEET_APPLIED
+    } else {
+      FLEET_NOT_APPLIED
+    },
+    1,
+  );
+  applied
+}
+
+/// `message` applied on this daemon's shard for the partition its id routes to ([`apply_here`]), asked from shard
+/// `origin` and waited for in that shard's own time.
+async fn apply_on_partition(
+  origin: u16,
+  message: slates_cluster::credentials::CredentialMessage,
+  budget_ns: u64,
+) -> bool {
+  let id = message.id();
+  let Some(Some(owner)) =
+    crate::state::with_state(|state| shard_of_partition(state, owner_of(&id, state.shards.len())))
+  else {
+    return false;
+  };
+  crate::xshard::call_in_shard_time(
+    origin,
+    owner,
+    move |state| apply_here(state, &message),
+    budget_ns,
+  )
+  .await
+  .unwrap_or(false)
+}
+
+/// A member's credential exchange (`slates_cluster::credentials`, its stream on the record session), served on shard
+/// `origin`: applied to the partition the id routes to and answered whether it is held as asked. Bytes that are no
+/// message are answered with none.
+pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) -> Vec<u8> {
+  use slates_cluster::credentials::CredentialMessage;
+  let Ok(message) = CredentialMessage::decode(request) else {
+    return Vec::new();
+  };
+  let id = message.id();
+  let held = apply_on_partition(origin, message, budget_ns).await;
+  CredentialMessage::Answer { id, held }.encode()
+}
+
+/// `message` sent to every other member of the region on the credential stream, within `budget`: how many answered
+/// that they hold it as asked, and how many members there are, this one among them.
+async fn to_region(
+  message: &slates_cluster::credentials::CredentialMessage,
+  budget: slates_cluster::CommitBudget,
+) -> (usize, usize) {
+  use slates_cluster::credentials::{CREDENTIAL_STREAM, CredentialMessage};
+  let Some((local, members)) =
+    crate::state::with_state(|state| (state.fleet.host(), state.fleet.members().to_vec()))
+  else {
+    return (0, 1);
+  };
+  let others: Vec<slates_db::HostId> = members
+    .iter()
+    .copied()
+    .filter(|member| *member != local)
+    .collect();
+  let total = others.len().saturating_add(1);
+  if others.is_empty() {
+    return (0, total);
+  }
+  let id = message.id();
+  let request = message.encode();
+  let sessions = crate::fleet::take_sessions("credentials.region", |host| others.contains(&host));
+  let outgoing: Vec<_> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.clone(), endpoint))
+    .collect();
+  let (replied, _stragglers) = slates_cluster::broadcast(
+    outgoing,
+    CREDENTIAL_STREAM,
+    slates_transport::connection::Priority::Bulk,
+    budget,
+  )
+  .await;
+  let mut held = 0usize;
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    if let Ok(CredentialMessage::Answer {
+      id: answered,
+      held: true,
+    }) = CredentialMessage::decode(&reply.bytes)
+      && answered == id
+    {
+      held = held.saturating_add(1);
+    }
+    returned.push((host, endpoint));
+  }
+  crate::fleet::return_sessions(returned);
+  (held, total)
+}
+
+/// The fleet's `f` now, as this node's configuration says it.
+fn region_f() -> usize {
+  crate::state::with_state(|state| {
+    usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX)
+  })
+  .unwrap_or(0)
+}
+
+/// An enrollment as the channel serves it (A-764): recorded on the partition its id routes to as before (`enroll`),
+/// then sent to every other member of the region; answered `CredentialEnrolled` once `f + 1` members hold it, this one
+/// among them, and refused `CredentialUnreplicated` otherwise (what was held stays; the same enrollment again reaches
+/// the rest, and is held as asked where it is already).
+pub(crate) async fn enroll_in_region(
+  origin: u16,
+  owner: u16,
+  (channel, asked): (Principal, Enrollment),
+  budget: slates_cluster::CommitBudget,
+) -> ReplyBody {
+  let reply = crate::xshard::call_in_shard_time(
+    origin,
+    owner,
+    move |state| enroll(state, &channel, asked),
+    budget.max_deadline_ns(),
+  )
+  .await
+  .unwrap_or_else(|| refused(Refusal::NotFound));
+  let ReplyBody::CredentialEnrolled { id } = reply else {
+    return reply;
+  };
+  let record = crate::xshard::call_in_shard_time(
+    origin,
+    owner,
+    move |state| state.db.partition().credentials().get(&id).cloned(),
+    budget.max_deadline_ns(),
+  )
+  .await
+  .flatten();
+  let Some(record) = record else {
+    return refused(Refusal::NotFound);
+  };
+  let (held, total) = to_region(
+    &slates_cluster::credentials::CredentialMessage::Enroll { record },
+    budget,
+  )
+  .await;
+  let held = held.saturating_add(1);
+  let needed = region_f().saturating_add(1).min(total);
+  if slates_cluster::credentials::enrolled_durably(held, needed.saturating_sub(1)) {
+    ReplyBody::CredentialEnrolled { id }
+  } else {
+    crate::state::with_state(|state| state.count(FLEET_SHORT, 1));
+    refused(Refusal::CredentialUnreplicated {
+      held: u64::try_from(held).unwrap_or(u64::MAX),
+      needed: u64::try_from(needed).unwrap_or(u64::MAX),
+    })
+  }
+}
+
+/// A revocation as the channel serves it (A-764): let go on the partition its id routes to (`revoke`; an id this node
+/// no longer holds, gone here already, goes on to the rest), then from every other member of the region; answered
+/// `CredentialRevoked` only once every member has let it go, since a member that still held it would go on proving a
+/// revoked credential, and refused `CredentialUnreplicated` otherwise (the same revocation again reaches the rest).
+pub(crate) async fn revoke_in_region(
+  origin: u16,
+  owner: u16,
+  (channel, id, proof): (Principal, [u8; 32], [u8; 32]),
+  budget: slates_cluster::CommitBudget,
+) -> ReplyBody {
+  let reply = crate::xshard::call_in_shard_time(
+    origin,
+    owner,
+    move |state| revoke(state, &channel, id, proof),
+    budget.max_deadline_ns(),
+  )
+  .await
+  .unwrap_or_else(|| refused(Refusal::NotFound));
+  match reply {
+    ReplyBody::CredentialRevoked => {}
+    ReplyBody::Refused {
+      refusal: Refusal::NotFound,
+      ..
+    } => {}
+    other => return other,
+  }
+  let (held, total) = to_region(
+    &slates_cluster::credentials::CredentialMessage::Revoke { id },
+    budget,
+  )
+  .await;
+  let held = held.saturating_add(1);
+  if held >= total {
+    ReplyBody::CredentialRevoked
+  } else {
+    crate::state::with_state(|state| state.count(FLEET_SHORT, 1));
+    refused(Refusal::CredentialUnreplicated {
+      held: u64::try_from(held).unwrap_or(u64::MAX),
+      needed: u64::try_from(total).unwrap_or(u64::MAX),
+    })
+  }
+}
+
+/// The region's credentials healed at a configuration change (A-764, the module doc's fleet half): every credential
+/// this node holds offered to every other member, so a member that joined, or came back with nothing, holds what the
+/// region holds. An offer of what a member holds already is held as asked there. Run where the configuration's other
+/// followers run (`fleet::follow_configuration`), once per installed version.
+pub(crate) async fn heal_region(origin: u16, shards: &[u16], budget: slates_cluster::CommitBudget) {
+  let Some(version) = crate::state::with_state(|state| state.fleet.configuration().version) else {
+    return;
+  };
+  let begun = HEALED.with(|healed| healed.get() == Some(version));
+  if begun {
+    return;
+  }
+  HEALED.with(|healed| healed.set(Some(version)));
+  for shard in shards {
+    let records = crate::xshard::call_in_shard_time(
+      origin,
+      *shard,
+      |state| {
+        state
+          .db
+          .partition()
+          .credentials()
+          .records()
+          .cloned()
+          .collect::<Vec<_>>()
+      },
+      budget.max_deadline_ns(),
+    )
+    .await
+    .unwrap_or_default();
+    for record in records {
+      let _ = to_region(
+        &slates_cluster::credentials::CredentialMessage::Enroll { record },
+        budget,
+      )
+      .await;
+      crate::state::with_state(|state| state.count(FLEET_OFFERED, 1));
+    }
+  }
+}
+
+thread_local! {
+  /// The configuration version this node last healed the region's credentials at ([`heal_region`]).
+  static HEALED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Why a lookup gave no answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unanswered {

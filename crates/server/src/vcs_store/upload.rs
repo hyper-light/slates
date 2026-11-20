@@ -357,6 +357,7 @@ pub(super) fn exchange(config: &DaemonConfig) -> Exchange {
   Exchange {
     ns: NANOS_PER_SECOND,
     bytes: config.memcpy_bytes_per_second.max(1),
+    rates: config.git_rates,
   }
 }
 

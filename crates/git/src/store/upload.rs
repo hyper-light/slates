@@ -865,7 +865,6 @@ impl<A: Answered> Upload<A> {
       levels: &mut self.levels,
       depth: self.depth,
       exchange: cx.exchange,
-      clock: &mut *cx.clock,
     };
     let level = fragment::level(row.kind, &first, &mut learning).map_err(StoreRefused::Encoding)?;
     self.emit(&written, out);
@@ -1083,7 +1082,6 @@ impl<A: Answered> Upload<A> {
       levels: &mut self.levels,
       depth: self.depth,
       exchange: cx.exchange,
-      clock: &mut *cx.clock,
     };
     let (entry, placed) = self
       .encoder
@@ -1185,7 +1183,6 @@ impl<A: Answered> Upload<A> {
     let Some(candidate) = searching.candidates.get(searching.trying).copied() else {
       return self.searched(cx, *searching, out).map(Some);
     };
-    let start = cx.clock.now_ns();
     let base = (candidate.id, candidate.len, candidate.content);
     let step = if read_window(cx.store, base, &mut searching.base_bytes)? {
       SearchStep::More
@@ -1198,9 +1195,12 @@ impl<A: Answered> Upload<A> {
       } = &mut *searching;
       search.step(base_bytes, target_bytes, cx.store.window())
     };
-    let spent = cx.clock.now_ns().saturating_sub(start);
-    searching.trial_ns = searching.trial_ns.saturating_add(spent);
     if let SearchStep::Done(delta) = step {
+      // The trial's time is the machine's measured rate over the bytes it searched (`Rates`), never the clock's.
+      searching.trial_ns = cx
+        .exchange
+        .rates
+        .search_ns(candidate.len, searching.target.1.len);
       self.tried(&mut searching, delta);
     }
     Ok(Some(Pending::Search(searching)))
@@ -1266,7 +1266,6 @@ impl<A: Answered> Upload<A> {
       levels: &mut self.levels,
       depth: self.depth,
       exchange: cx.exchange,
-      clock: &mut *cx.clock,
     };
     let level = fragment::level(row.kind, first, &mut learning).map_err(StoreRefused::Encoding)?;
     let large = Large {

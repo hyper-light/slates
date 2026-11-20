@@ -316,6 +316,9 @@ pub(crate) struct LiveVolume {
   /// A whole entry being sealed in turns, and the publications made since, queued to follow it in order ([`WholeBuild`],
   /// A-377): while it is here nothing is appended to the log.
   building: Option<Box<WholeBuild>>,
+  /// An install image being sealed in turns of this shard at a head ([`ImageBuild`], A-757 part 5); none while no image
+  /// is building.
+  image_build: Option<Box<ImageBuild>>,
   /// When the publication being built reached the shipper, on the host's monotonic clock: taken by the entry appended for
   /// it ([`LiveVolume::newest`]), the start of its hops (`fleet.live.hop.*`).
   publishing_ns: Option<u64>,
@@ -3012,6 +3015,13 @@ const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
 /// Counter: one turn of a whole entry's sealing ([`advance_whole_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_WHOLE_BUILD_TURNS: &str = "fleet.live.whole_build_turns";
+/// Counter: the install images sealed in turns of a build of their own (A-757 part 5).
+const LIVE_IMAGE_BUILDS: &str = "fleet.live.image_builds";
+/// Counter: the turns an install image's build sealed in (A-757 part 5).
+const LIVE_IMAGE_BUILD_TURNS: &str = "fleet.live.image_build_turns";
+/// Counter: an image build dropped because its volume's head moved (or it was superseded, or owes a whole record) before
+/// it was sealed: the image stays owed (A-757 part 5).
+const LIVE_IMAGE_STALE: &str = "fleet.live.image_stale";
 /// Counter: the turns a holder hashed a large live message's entries in before taking them (A-757 part 4).
 const LIVE_HELD_HASH_TURNS: &str = "fleet.live.held_hash_turns";
 /// Counter: the large deltas sealed and hashed in turns of a build of their own (A-757 part 2b).
@@ -3054,6 +3064,7 @@ fn new_live_volume(shipper: Shipper) -> LiveVolume {
     heard: 0,
     unanswered_since_ns: None,
     building: None,
+    image_build: None,
     publishing_ns: None,
     newest: None,
     resolved_ns: None,
@@ -3121,6 +3132,177 @@ fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bo
   u64::try_from(kept).unwrap_or(u64::MAX) >= size
 }
 
+/// An install image sealed in turns of its owner shard (A-757 part 5; A-377's whole build is its model): the volume's
+/// plain body captured at the shipper's head in the turn that owed it (a memcpy a byte), then sealed a piece a turn at
+/// the rate the build measures ([`piece_bytes`]) by a task of the shard, and made the install image once every piece is
+/// sealed, if the head is still the one it was captured at. A head moved meanwhile drops it: the image stays owed, and the
+/// next publication or period captures it again.
+#[derive(Debug)]
+struct ImageBuild {
+  /// The head the body was captured at.
+  head: Head,
+  /// The volume's plain body (`LivePublication` bytes).
+  body: Vec<u8>,
+  /// The offset in `body` of the next piece to seal.
+  next: usize,
+  /// The pieces sealed so far, in order.
+  sealed: Vec<SealedPiece>,
+  /// The volume's lineage key wrapped for its neighbours, and the anchors it covers.
+  sealing: Option<crate::head::HeadSealing>,
+  /// See [`ImageBuild::sealing`].
+  anchors: Vec<u64>,
+  /// The bytes sealed so far and the clock time their seals took.
+  seal_rate: (u64, u64),
+}
+
+/// Begins `id`'s [`ImageBuild`] over the captured `body` at the shipper's head, and the task that seals it.
+fn begin_image_build(state: &mut ShardState, id: slates_db::catalog::VolumeId, body: Vec<u8>) {
+  let Some((sealing, anchors)) = whole_sealing(state, id, true) else {
+    return;
+  };
+  let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
+    return;
+  };
+  let Some(head) = live.shipper.head() else {
+    return;
+  };
+  live.image_build = Some(Box::new(ImageBuild {
+    head,
+    body,
+    next: 0,
+    sealed: Vec::new(),
+    sealing,
+    anchors,
+    seal_rate: (0, 0),
+  }));
+  state.count(LIVE_IMAGE_BUILDS, 1);
+  let spawned =
+    slates_rt::futures::spawn(image_build_task(id)).and_then(slates_rt::futures::detach);
+  if spawned.is_err()
+    && let Some(live) = state.live.shipping.get_mut(&id.bytes)
+  {
+    live.image_build = None;
+  }
+}
+
+/// The task that seals an [`ImageBuild`] a turn at a time: it yields, then runs one turn, until the image is made or the
+/// build is dropped.
+async fn image_build_task(id: slates_db::catalog::VolumeId) {
+  loop {
+    slates_rt::futures::yield_now().await;
+    match state::with_state(|s| advance_image_build(s, id)) {
+      Some(Advance::More) => {}
+      Some(Advance::Done) | None => return,
+    }
+  }
+}
+
+/// One turn of `id`'s [`ImageBuild`]: its next pieces sealed until the seal turns' share of the quantum has passed, each
+/// sized to what is left of it ([`piece_bytes`], a page at least); once every piece is sealed, the image made at its head
+/// ([`install_image`]). Dropped, the image still owed, when the volume was superseded, owes a whole record, its keys are
+/// refused, or its head moved since the capture (counted `fleet.live.image_stale`).
+fn advance_image_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Advance {
+  let current = state.live.shipping.get(&id.bytes).and_then(|live| {
+    let build = live.image_build.as_ref()?;
+    Some(live.fenced.is_none() && !live.owes_whole && live.shipper.head() == Some(build.head))
+  });
+  match current {
+    None => return Advance::Done,
+    Some(false) => {
+      drop_image_build(state, id, LIVE_IMAGE_STALE);
+      return Advance::Done;
+    }
+    Some(true) => {}
+  }
+  let Some((lineage, namer, segment)) = body_keys(state, id) else {
+    drop_image_build(state, id, "fleet.live.refused.no_payload");
+    return Advance::Done;
+  };
+  let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
+  let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES)
+    .unwrap_or(usize::MAX)
+    .max(1);
+  let floor = usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES)
+    .unwrap_or(cap)
+    .clamp(1, cap);
+  state.count(LIVE_IMAGE_BUILD_TURNS, 1);
+  let began = slates_rt::futures::now_ns();
+  let Some(build) = state
+    .live
+    .shipping
+    .get_mut(&id.bytes)
+    .and_then(|live| live.image_build.as_mut())
+  else {
+    return Advance::Done;
+  };
+  loop {
+    let left = quantum.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    let size = piece_bytes(build.seal_rate, left, floor, cap);
+    let Some(piece) = build
+      .body
+      .get(build.next..build.next.saturating_add(size).min(build.body.len()))
+      .filter(|piece| !piece.is_empty())
+    else {
+      break;
+    };
+    let piece_began = slates_rt::futures::now_ns();
+    let chunk = slates_archive::Archive::raw_chunk(piece.to_vec());
+    let Ok(sealed) = slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, segment) else {
+      drop_image_build(state, id, "fleet.live.refused.no_payload");
+      return Advance::Done;
+    };
+    let (rate_bytes, rate_ns) = build.seal_rate;
+    build.seal_rate = (
+      rate_bytes.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX)),
+      rate_ns.saturating_add(slates_rt::futures::now_ns().saturating_sub(piece_began)),
+    );
+    build.next = build.next.saturating_add(piece.len());
+    build.sealed.push(SealedPiece {
+      name: sealed.name.to_vec(),
+      bytes: sealed.bytes,
+    });
+    if slates_rt::futures::now_ns().saturating_sub(began) >= quantum {
+      break;
+    }
+  }
+  if build.next < build.body.len() {
+    return Advance::More;
+  }
+  let Some(build) = state
+    .live
+    .shipping
+    .get_mut(&id.bytes)
+    .and_then(|live| live.image_build.take())
+  else {
+    return Advance::Done;
+  };
+  let ImageBuild {
+    head,
+    sealed,
+    sealing,
+    anchors,
+    ..
+  } = *build;
+  let mut image = vec![KIND_WHOLE, BODY_SEALED];
+  image.extend_from_slice(
+    &SealedBody {
+      sealing,
+      pieces: sealed,
+    }
+    .to_bytes(),
+  );
+  install_image(state, id, Some(head), image, Some(anchors));
+  Advance::Done
+}
+
+/// Ends `id`'s [`ImageBuild`] unmade (`why` counted): the image stays owed.
+fn drop_image_build(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'static str) {
+  if let Some(live) = state.live.shipping.get_mut(&id.bytes) {
+    live.image_build = None;
+  }
+  state.count(why, 1);
+}
+
 /// Makes the install image a holder behind the retained tail is owed ([`LiveVolume::owes_image`]): the volume's whole
 /// state, sealed as a whole payload, at the shipper's head, which it must equal, so this runs only where the volume's
 /// state is its head's: right after a publication is appended ([`published`]), or on the record period for a volume with
@@ -3142,18 +3324,52 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   {
     return;
   }
+  // An image sealing in turns is the one owed: the next is judged once it ends ([`advance_image_build`]).
+  if state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .is_some_and(|live| live.image_build.is_some())
+  {
+    return;
+  }
   let Some(record) = whole_record(state, id) else {
     return;
   };
-  let Some((image, anchors)) = payload(state, id, true, record) else {
+  let Some(body) = plain_body(state, id, record) else {
     return;
   };
+  // A sealed image of more than one piece is sealed in turns of its own (A-757 part 5), as a whole entry is (A-377):
+  // sealed here, a 3 MiB volume's image held the owner shard 183 to 264 ms of a debug build's CPU in the record period's
+  // one turn under `taskpolicy -b` (w-forming's probes).
+  if sealed_in_pieces(state, &body) {
+    begin_image_build(state, id, body);
+    return;
+  }
+  let Some((image, anchors)) = sealed_payload(state, id, true, body) else {
+    return;
+  };
+  install_image(state, id, None, image, anchors);
+}
+
+/// Makes `image` (sealed under `anchors`' keys, `None` in the clear) the volume's install image at the shipper's head, or
+/// at `at` when it was captured there ([`advance_image_build`]), which the head must still be.
+fn install_image(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  at: Option<Head>,
+  image: Vec<u8>,
+  anchors: Option<Vec<u64>>,
+) {
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return;
   };
   let Some(head) = live.shipper.head() else {
     return;
   };
+  if at.is_some_and(|at| at != head) {
+    return;
+  }
   live.shipper.mark_checkpoint(head);
   live.shipper.set_bounds(Bounds::of_whole(image.len()));
   // The image is the whole state now, held here; the shipper keeps no entry for it.
@@ -3303,19 +3519,6 @@ fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Opt
     .map(|host| host as &mut dyn slates_vfs::host::HostFs);
   let image = slot.volume.to_standalone_image(store, host).ok()?;
   Some(VolumeRecord::Full { image }.to_bytes())
-}
-
-/// The entry payload of `record`: its kind and body byte, then the body (the record and its content runs), sealed
-/// under the volume's lineage key where this node seals; and, for a sealed whole entry, the anchors its copies of the
-/// lineage key are wrapped for (`None` for a clear body).
-fn payload(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  whole: bool,
-  record: Vec<u8>,
-) -> Option<(Vec<u8>, Option<Vec<u64>>)> {
-  let body = plain_body(state, id, record)?;
-  sealed_payload(state, id, whole, body)
 }
 
 /// The plain body of a publication of `record` (A-377 split it from [`payload`]): the record and its content runs, read
@@ -3538,18 +3741,20 @@ fn content_runs(
   record: &[u8],
 ) -> Option<Vec<LiveRun>> {
   let decoded = <VolumeRecord as Wire>::decode(&mut &record[..]).ok()?;
-  let inodes: Vec<&InodeImage> = match &decoded {
-    VolumeRecord::Full { image } => image.inodes.iter().collect(),
+  // Each inode with whether its writes alone changed it (a delta's patch): such a file ships the bytes they changed.
+  let inodes: Vec<(&InodeImage, bool)> = match &decoded {
+    VolumeRecord::Full { image } => image.inodes.iter().map(|inode| (inode, false)).collect(),
     VolumeRecord::Delta { delta } => delta
       .inodes
       .iter()
-      .chain(delta.patches.iter().map(|patch| &patch.inode))
+      .map(|inode| (inode, false))
+      .chain(delta.patches.iter().map(|patch| (&patch.inode, true)))
       .collect(),
   };
   let handle = *state.by_id.get(&id)?;
   let slot = state.volumes.get(handle).ok()?;
   let mut runs = Vec::new();
-  for inode in inodes {
+  for (inode, patched) in inodes {
     let BodyImage::Chunked { extents, open } = &inode.body else {
       continue;
     };
@@ -3560,6 +3765,12 @@ fn content_runs(
       .collect();
     if let Some(open) = open {
       spans.push((open.offset, open.len));
+    }
+    // A patched file ships the bytes its writes changed within its extents, not the windows its image carries: its
+    // holders keep the rest from the entries before (a successor overlays the runs, [`overlay_run`]). Until 2026-11-20
+    // a page written into a 3 MiB live file shipped about 313 KB (w-forming).
+    if patched && let Some(writes) = slot.volume.published_writes(inode.no) {
+      spans = clipped_to_writes(&spans, writes);
     }
     for (offset, len) in spans {
       let mut bytes = vec![0u8; usize::try_from(len).ok()?];
@@ -3576,6 +3787,93 @@ fn content_runs(
     }
   }
   Some(runs)
+}
+
+/// The parts of `spans` (offset, length) inside the byte ranges `writes` changed, in order.
+fn clipped_to_writes(
+  spans: &[(u64, u64)],
+  writes: &[slates_vfs::delta::WindowSpan],
+) -> Vec<(u64, u64)> {
+  let mut clipped = Vec::new();
+  for (offset, len) in spans.iter().copied() {
+    let end = offset.saturating_add(len);
+    for write in writes {
+      let (from, to) = (offset.max(write.from), end.min(write.to));
+      if from < to {
+        clipped.push((from, to.saturating_sub(from)));
+      }
+    }
+  }
+  clipped
+}
+
+/// Lays `bytes`, a run of inode `inode` at `offset`, over a rebuild's runs: what it covers of earlier runs is replaced,
+/// the rest of them kept, so the runs stay disjoint and each byte is the latest shipped (a patched file's entries ship
+/// only the bytes their writes changed, [`content_runs`]).
+fn overlay_run(runs: &mut BTreeMap<(u64, u64), Vec<u8>>, inode: u64, offset: u64, bytes: Vec<u8>) {
+  let end = offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+  let overlapping: Vec<(u64, u64)> = runs
+    .range((inode, 0)..(inode, end))
+    .filter(|((_, at), held)| {
+      at.saturating_add(u64::try_from(held.len()).unwrap_or(u64::MAX)) > offset
+    })
+    .map(|(key, _)| *key)
+    .collect();
+  for key in overlapping {
+    let Some(held) = runs.remove(&key) else {
+      continue;
+    };
+    let (_, at) = key;
+    let held_end = at.saturating_add(u64::try_from(held.len()).unwrap_or(u64::MAX));
+    if at < offset {
+      let keep = usize::try_from(offset.saturating_sub(at)).unwrap_or(0);
+      runs.insert((inode, at), held.get(..keep).unwrap_or_default().to_vec());
+    }
+    if held_end > end {
+      let skip = usize::try_from(end.saturating_sub(at)).unwrap_or(0);
+      runs.insert((inode, end), held.get(skip..).unwrap_or_default().to_vec());
+    }
+  }
+  runs.insert((inode, offset), bytes);
+}
+
+/// The `len` bytes of inode `inode` from `offset` out of a rebuild's runs ([`overlay_run`]), `None` when any of them
+/// is not there.
+fn run_bytes(
+  runs: &BTreeMap<(u64, u64), Vec<u8>>,
+  inode: u64,
+  offset: u64,
+  len: u64,
+) -> Option<Vec<u8>> {
+  let end = offset.checked_add(len)?;
+  let mut bytes = Vec::with_capacity(usize::try_from(len).ok()?);
+  let mut at = offset;
+  let first = runs
+    .range(..=(inode, offset))
+    .next_back()
+    .filter(|((held_inode, _), _)| *held_inode == inode)
+    .map(|(key, _)| *key);
+  let start = first.unwrap_or((inode, offset));
+  for ((held_inode, held_at), held) in runs.range(start..(inode, end)) {
+    if *held_inode != inode {
+      continue;
+    }
+    let held_end = held_at.saturating_add(u64::try_from(held.len()).unwrap_or(u64::MAX));
+    if held_end <= at {
+      continue;
+    }
+    if *held_at > at {
+      return None;
+    }
+    let from = usize::try_from(at.saturating_sub(*held_at)).ok()?;
+    let to = usize::try_from(held_end.min(end).saturating_sub(*held_at)).ok()?;
+    bytes.extend_from_slice(held.get(from..to)?);
+    at = held_end.min(end);
+    if at >= end {
+      break;
+    }
+  }
+  (at >= end).then_some(bytes)
 }
 
 /// Counter: a shipper's holder set could not be recorded in its volume's catalog (A-240); retried at its next send.
@@ -4314,8 +4612,8 @@ fn exchange_budget_for(bytes: usize, path: HolderPath) -> slates_cluster::Commit
   )
 }
 
-/// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
-/// within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
+/// Borrows `holder`'s record session, waiting for it while another dispatch has it out, woken by its return
+/// (`crate::fleet::session_returned`), within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
 /// write's message waited for whichever later dispatch carried it, at worst the next record period: two in three sends of
 /// a stable-write run found the session out, and the rare write took about 100 ms (2026-11-05, BENCHMARKS "What live
 /// shipping adds to a stable NFS write"). The forward path learned the same (`fleet::forward_over_leader_session`).
@@ -4340,8 +4638,13 @@ async fn borrow_session(
       return sessions;
     }
     missed = true;
-    // Shape: one tick of the shard's timer wheel, the finest park there is (`sleep` rounds up to it).
-    if slates_rt::futures::sleep(1).await.is_err() {
+    // Waits for the session's return (or its link's change) within what is left of the deadline, then looks again. It
+    // waited a timer tick at a time before 2026-11-20, a park and a look per tick for as long as the session was out.
+    let left = deadline_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    if crate::fleet::session_returned(&[holder], left)
+      .await
+      .is_none()
+    {
       return Vec::new();
     }
   }
@@ -4467,6 +4770,7 @@ fn lose_links(hosts: &[HostId]) {
   let _ = state::with_state(|s| {
     for host in hosts {
       s.record_sessions.remove(host);
+      crate::fleet::sessions_changed(s, *host);
       s.count(LIVE_LINK_LOST, 1);
     }
   });
@@ -7007,7 +7311,7 @@ fn apply_payload(
     }
   }
   for run in publication.runs {
-    runs.insert((run.inode, run.offset), run.bytes);
+    overlay_run(runs, run.inode, run.offset, run.bytes);
   }
   Ok(())
 }
@@ -7194,11 +7498,8 @@ fn node_of(
         .map(|extent| (extent.offset, extent.len))
         .chain(open.iter().map(|open| (open.offset, open.len)));
       for (offset, len) in spans {
-        let bytes = runs.get(&(inode.no, offset)).ok_or(REFUSED_LAYOUT)?;
-        if u64::try_from(bytes.len()).ok() != Some(len) {
-          return Err(REFUSED_LAYOUT);
-        }
-        let chunk = slates_archive::Archive::raw_chunk(bytes.clone());
+        let bytes = run_bytes(runs, inode.no, offset, len).ok_or(REFUSED_LAYOUT)?;
+        let chunk = slates_archive::Archive::raw_chunk(bytes);
         laid.push(slates_archive::Extent {
           offset,
           len,
@@ -7274,6 +7575,82 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A successor's runs overlaid (w-forming, 2026-11-20: a patched file's entries ship only the bytes their writes
+  /// changed). Do: lay random runs of two inodes over each other, in order, and read back ranges, against a byte array
+  /// per inode written the same way as the oracle. Expect every range the runs cover read back as the oracle holds it,
+  /// a range reaching a byte no run covered refused, and the runs kept disjoint.
+  #[test]
+  fn overlaid_runs_read_back_the_latest_bytes_and_refuse_a_gap() {
+    /// Shape: the bytes each inode's oracle spans.
+    const SPAN: usize = 512;
+    let mut runs = std::collections::BTreeMap::new();
+    let mut oracle = [[None::<u8>; SPAN]; 2];
+    let mut seed: u64 = 0x5eed;
+    let mut next = |bound: u64| {
+      seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+      (seed >> 33) % bound
+    };
+    for round in 0..400u64 {
+      let inode = next(2);
+      let offset = next(SPAN as u64 - 1);
+      let len = 1 + next(64.min(SPAN as u64 - offset));
+      let byte = u8::try_from(round % 251).unwrap();
+      super::overlay_run(
+        &mut runs,
+        inode,
+        offset,
+        vec![byte; usize::try_from(len).unwrap()],
+      );
+      for at in offset..offset + len {
+        oracle[usize::try_from(inode).unwrap()][usize::try_from(at).unwrap()] = Some(byte);
+      }
+    }
+    for ((inode, at), bytes) in &runs {
+      let next_key = runs.range((*inode, *at + 1)..(*inode, u64::MAX)).next();
+      if let Some(((_, next_at), _)) = next_key {
+        assert!(
+          *at + u64::try_from(bytes.len()).unwrap() <= *next_at,
+          "disjoint"
+        );
+      }
+    }
+    for _ in 0..400 {
+      let inode = next(2);
+      let offset = next(SPAN as u64 - 1);
+      let len = 1 + next(SPAN as u64 - offset - 1);
+      let expected: Option<Vec<u8>> = (offset..offset + len)
+        .map(|at| oracle[usize::try_from(inode).unwrap()][usize::try_from(at).unwrap()])
+        .collect();
+      assert_eq!(
+        super::run_bytes(&runs, inode, offset, len),
+        expected,
+        "{inode} {offset} {len}"
+      );
+    }
+  }
+
+  /// A patched file's spans clipped to the byte ranges its writes changed. Do: clip two extents to writes inside one,
+  /// across both, and outside both. Expect the parts inside the writes, in order, and nothing for the one outside.
+  #[test]
+  fn a_patched_files_spans_are_clipped_to_its_writes() {
+    let w = |from, to| slates_vfs::delta::WindowSpan { from, to };
+    let spans = [(0, 100), (100, 100)];
+    assert_eq!(
+      super::clipped_to_writes(&spans, &[w(10, 20)]),
+      vec![(10, 10)]
+    );
+    assert_eq!(
+      super::clipped_to_writes(&spans, &[w(90, 110)]),
+      vec![(90, 10), (100, 10)]
+    );
+    assert_eq!(
+      super::clipped_to_writes(&spans, &[w(300, 400)]),
+      Vec::<(u64, u64)>::new()
+    );
+  }
 
   /// A whole build's piece sizing (w-forming, 2026-11-20; found by use: a turn sealed a MiB however small its quantum).
   /// Do: size a piece with no rate measured, with a rate that fits half a MiB in the quantum left, with one that fits a

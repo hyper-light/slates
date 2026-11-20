@@ -55,6 +55,11 @@ pub struct Checking {
 }
 
 impl Checking {
+  /// The request whose push is checked.
+  pub(crate) fn request(&self) -> &Request {
+    &self.request
+  }
+
   /// The checks of `request` and its pack, `unpacked` (none when no pack was due), not yet begun.
   pub fn new(request: Request, unpacked: Option<Result<Kept, PackRefused>>) -> Checking {
     let stage = match &unpacked {

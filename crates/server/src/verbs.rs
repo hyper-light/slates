@@ -2486,6 +2486,36 @@ fn serve_on_channel(
       proof,
     ));
   }
+  // A version-control credential is fleet state (A-764): served on the channel, recorded on the partition its id
+  // routes to and sent to every other member of the region before it answers.
+  if let RequestBody::EnrollCredential {
+    principal: proven,
+    material,
+    expires_ns,
+    proof,
+  } = body
+  {
+    let asked = crate::credentials::Enrollment {
+      principal: proven,
+      material,
+      expires_ns,
+      proof,
+    };
+    return Break(credential_on_channel(
+      state,
+      (client.index(), request.request),
+      principal,
+      CredentialAsk::Enroll(asked),
+    ));
+  }
+  if let RequestBody::RevokeCredential { id, proof } = body {
+    return Break(credential_on_channel(
+      state,
+      (client.index(), request.request),
+      principal,
+      CredentialAsk::Revoke { id, proof },
+    ));
+  }
   if let RequestBody::SetPolicy {
     subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
     policy,
@@ -4393,6 +4423,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     },
     failover: failover_report(state),
     repositories: repository_usage_reports(state),
+    memory: crate::content_ranges::memory(state),
   }
 }
 
@@ -4659,6 +4690,40 @@ fn demux_sum(
   })
 }
 
+/// The daemon's memory by kind (§4.14; A-232's gotcha): every shard's parts summed kind by kind, in the order first seen,
+/// then the heap's (`slates_mem::heap`), read now. A kind is `measured` once every shard's part of it is, and its written
+/// bytes are known only where every part's are.
+fn daemon_memory(
+  parts: &[slates_ipc::protocol::MemoryKindReport],
+) -> Vec<slates_ipc::protocol::MemoryKindReport> {
+  let mut kinds: Vec<slates_ipc::protocol::MemoryKindReport> = Vec::new();
+  for part in parts {
+    match kinds.iter_mut().find(|kind| kind.kind == part.kind) {
+      Some(kind) => {
+        kind.mappings = kind.mappings.saturating_add(part.mappings);
+        kind.reserved_bytes = kind.reserved_bytes.saturating_add(part.reserved_bytes);
+        kind.resident_bytes = kind.resident_bytes.saturating_add(part.resident_bytes);
+        kind.modified_bytes = kind
+          .modified_bytes
+          .zip(part.modified_bytes)
+          .map(|(sum, more)| sum.saturating_add(more));
+        kind.measured &= part.measured;
+      }
+      None => kinds.push(part.clone()),
+    }
+  }
+  let heap = slates_mem::heap::stats();
+  kinds.push(slates_ipc::protocol::MemoryKindReport {
+    kind: "heap".to_owned(),
+    mappings: heap.large_mappings,
+    reserved_bytes: heap.reserved,
+    resident_bytes: heap.in_use.min(heap.reserved),
+    modified_bytes: None,
+    measured: true,
+  });
+  kinds
+}
+
 /// The daemon's view: the anchor's words in the segment and the process-wide counters, over
 /// every shard's part.
 fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody {
@@ -4684,6 +4749,10 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       )
     })
     .unwrap_or((0, 0, 0, 0, 0, false));
+  let shards_memory: Vec<slates_ipc::protocol::MemoryKindReport> = shards
+    .iter()
+    .flat_map(|shard| shard.memory.iter().cloned())
+    .collect();
   let fleet = fleet_report(state, &shards);
   // The node's recipient lives on the control shard: its part carries the id, whichever shard answers.
   let control_recipient = shards
@@ -4708,6 +4777,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       dumps_local_full: crate::local_dumps::full(),
       anchor: state.origin_anchor.0,
       recovered,
+      memory: daemon_memory(&shards_memory),
     }),
   }
 }
@@ -4833,6 +4903,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::IdentityRequired { .. } => "identity_required",
     Refusal::ImportRefused { .. } => "import_refused",
     Refusal::CopyRefused { .. } => "copy_refused",
+    Refusal::CredentialUnreplicated { .. } => "credential_unreplicated",
   }
 }
 
@@ -5750,6 +5821,60 @@ fn consumer_gate(
     }),
     other => Ok(other),
   }
+}
+
+/// What a credential request asks ([`credential_on_channel`]).
+enum CredentialAsk {
+  /// `EnrollCredential`.
+  Enroll(crate::credentials::Enrollment),
+  /// `RevokeCredential`.
+  Revoke {
+    /// The credential's id.
+    id: [u8; 32],
+    /// The proof of issuer authority.
+    proof: [u8; 32],
+  },
+}
+
+/// A credential enrolled or revoked as fleet state (A-764), served on the channel: as a task, recorded on the partition
+/// its id routes to (`crate::credentials::enroll` and `revoke`, every refusal of theirs as before) and sent to every other
+/// member of the region, answered once as many hold it as it must reach
+/// (`crate::credentials::enroll_in_region`, `revoke_in_region`).
+fn credential_on_channel(
+  state: &mut ShardState,
+  (client_index, request): (u32, u64),
+  principal: &Principal,
+  asked: CredentialAsk,
+) -> Served {
+  let id = match &asked {
+    CredentialAsk::Enroll(enrollment) => crate::credentials::id_of(&enrollment.material),
+    CredentialAsk::Revoke { id, .. } => *id,
+  };
+  let origin = state.shard;
+  let Some(owner) =
+    shard_of_partition(state, crate::credentials::owner_of(&id, state.shards.len()))
+  else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  let channel = principal.clone();
+  let budget = crate::fleet::live_budget();
+  let task = slates_rt::futures::spawn(async move {
+    let reply = match asked {
+      CredentialAsk::Enroll(enrollment) => {
+        crate::credentials::enroll_in_region(origin, owner, (channel, enrollment), budget).await
+      }
+      CredentialAsk::Revoke { id, proof } => {
+        crate::credentials::revoke_in_region(origin, owner, (channel, id, proof), budget).await
+      }
+    };
+    crate::state::deliver(client_index, request, reply, false);
+  });
+  let Ok(task) = task else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  // Freshly admitted on this shard, with no await before detaching: the slot is still live.
+  let _ = slates_rt::futures::detach(task);
+  Served::Forwarded
 }
 
 /// Sets a consumer's write policy (A-285), served on the channel as a revocation is: refused `Forbidden` for a consumer
@@ -9704,6 +9829,25 @@ fn refused_before_building(
     .or_else(|| crate::identities::refused_for_its_commit(state, green_id, authorship))
 }
 
+/// `sealed`'s increment built on this shard: a copy composed here counted, and the compose phase timed where the work's
+/// shard did not compose it (A-697's measured breakdown: the compose phase wherever it runs).
+fn composed_here(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
+  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
+    state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
+  }
+  let compose_start = state.clock.monotonic_ns();
+  let built = build_increment(state, sealed, evidence)?;
+  if sealed.composed.is_none() {
+    let composed_ns = state.clock.monotonic_ns().saturating_sub(compose_start);
+    crate::merge_service::count_phase(state, crate::work_home::SUBMIT_COMPOSE, composed_ns);
+  }
+  Ok(built)
+}
+
 /// The owner's half of a submit (§4.16, A-247): judges a work's sealed increment against the green and commits it, as
 /// the single serialized step of the green. Runs in the transaction of the verb that asked, whether on this shard or
 /// through [`owner_judge`]. The work's own reset is the caller's to settle.
@@ -9732,19 +9876,10 @@ fn judge_submission(
   // this verb, on the single-threaded owner shard — every declared operation before it is in the
   // increment, and a write that arrives after it is a later verb that lands in the next increment,
   // never this one.
-  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
-    state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
-  }
-  let compose_start = state.clock.monotonic_ns();
-  let (green_id, inc) = match build_increment(state, sealed, evidence) {
+  let (green_id, inc) = match composed_here(state, sealed, evidence) {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
-  // Composed here, not on the work's shard (A-697's measured breakdown: the compose phase wherever it runs).
-  if sealed.composed.is_none() {
-    let composed_ns = state.clock.monotonic_ns().saturating_sub(compose_start);
-    crate::merge_service::count_phase(state, crate::work_home::SUBMIT_COMPOSE, composed_ns);
-  }
   // Signed work (A-321): the signature is judged over the merge's statement, once the increment it names is built. It
   // permits nothing — the modes above did — and is recorded with the version as its provenance. An asked merge answers
   // with the verdict, so the approver sees it and a signer learns the statement from a held submit, whatever the
