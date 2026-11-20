@@ -6868,6 +6868,16 @@ version.
 > `a_forward_is_never_refused_below_its_paths_floor` (a 1 s SLO, below any path's silence window: answered after 2.04 s,
 > refused at 1.004 s with the floor removed;
 > `docs/bugs/2026-11-18-a-starved-forward-lane-was-judged-on-the-wall.md`).
+>
+> **Status (2026-11-20, a lane's floor said once).** A lane is kept while it is idle, so what it measured of its path
+> outlives a forward; idle lanes of peers no longer in the council's configuration are pruned as forwards are queued
+> (`ForwardLanes::prune_idle`), which bounds the lanes by the members and the lanes in use. A lane's floor is said in
+> the log only where what the log last said of the lane differs from what is so now, at most once a window, the longer
+> of the failover delay and the floor (one forward's whole life), and each line tells the crossings since the last
+> (`forward_lane::note_floor`, counted `fleet.forward.floor_logged`). Before, a lane left with nothing was dropped and
+> the next forward made it afresh, its floor measured from nothing, so every forward crossed the delay again and logged:
+> about a million lines, 260 MB, in one of w-fed-faults' flows (CLAUDE.md §2 item 8). Test:
+> `a_lane_measured_past_the_failover_delay_logs_it_once`.
 
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
@@ -22705,7 +22715,8 @@ asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its
 taken by position at the owner (`work_home::verdict_over_fleet`, `SubmitComputed`, `Green::submit_computed`). Part d
 (2026-11-20): the submit settles once the holder's replica holds the version (`work_home::hold_until_replica`,
 `replica_reached`). Part e (2026-11-20): a holder's work is recovered from its log over the holder's replica
-(`work_home::holder_replay`, `Unbuilt::holder`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+(`work_home::holder_replay`, `Unbuilt::holder`). A holder's work rebases over the replica, and a copy it declares is
+composed over the replica (`verbs::replica_rebase`, `verbs::compose_on_replica`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22731,8 +22742,9 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
     by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
     replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b), the submit answered once the
-    node's replica holds the version it made; after a restart it comes back from its log over the node's replica.
-    Its rebase, a copy it submits, and takeover follow in A-697's later parts. Until A-400 a work was placed on
+    node's replica holds the version it made; after a restart it comes back from its log over the node's replica; it
+    rebases over the replica, and a copy it declares is composed over the replica. Takeover follows in A-697's last
+    part. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -32840,8 +32852,8 @@ Applied in the same change to:
   stall budget), the link's redial pace, and four probe timeouts (the stall budget's tail, the replacement's handshake,
   its first discovery page, and the forward's exchange). Each driving turn measures it on the session it borrowed. The
   floor never lowers a forward's bound: a replacement's fresh estimator measures a shorter one than the silent session
-  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log once a crossing
-  and counts it (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
+  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log, at most once a
+  window since 2026-11-20 (§4.8's status of that day), and counts each crossing (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
   as A-129 runs the fleet's timers at their measured floors and reports the overrun.
 - **Why the floor and not a longer SLO.** The SLO is the operator's; the floor is the path's, and only the path knows
   it. On loopback, quiet, the floor is about 3.1 s (the window floored at three initial probe timeouts, about 2 s), inside
@@ -55817,6 +55829,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   back that label, the shard and the pid. Red first: with the record not written the test fails ("the watchdog recorded
   no stuck task"); green, the line reads "shard 1 is spinning: 3198 ms of CPU … in task liveness::spinner, at its
   poll 1" (macOS arm64, Mac Studio 2).
+- **Follow-up (2026-11-20, w-forming; found by use: a 2,933 ms poll and every fleet loop's long poll were named by
+  lines inside helpers).** Work spawned through a helper is labelled with the helper's caller: `fleet::spawn_detached`
+  is `#[track_caller]`, and `xshard::task_within` and `task_in_shard_time` are `#[track_caller]` functions that take
+  their caller's site and spawn the work with `slates_rt::futures::spawn_at` (the call is made when the helper is
+  called, its answer awaited after). Tests: `fleet::spawn_label_tests::a_fleet_loops_label_names_the_line_that_spawned_it`
+  and `xshard::tests::a_cross_shard_tasks_label_names_the_line_that_asked_for_it`, red before (named `fleet.rs:7034`
+  and `xshard.rs:1092`).
 - **Applied in the same change to** the watchdog's module docs, amendments.tsv.
 
 ### A-664 Subversion objects, symbolic links — A submitted symbolic link is a file of `link ` and its target whose list is `svn:special` (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -56219,7 +56238,8 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   node's anchor) and only for a work another node made (the id's creator); a client of the holder is refused at its
   channel (`route_gated`), a client of the owner by the owner's check, both `Unsupported`. The owner cannot yet tell
   which node made the work from the anchor alone (an id names a member id, which is derived from the anchor and the
-  boot's nonce), so any other member may move such a floor; members are mutually authenticated.
+  boot's nonce), so any other member may move such a floor; members are mutually authenticated. (Closed the same day,
+  below: the work's own member alone.)
 - **Counters.** `merge.work.floor_told_owner_node` (the test's non-vacuity count), `merge.work.floor_not_sent`.
 - **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
   a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed` (two nodes at `f = 1`, B with the hook:
@@ -56327,3 +56347,40 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   2). Its first run, before the same-step install, answered `Unpublished` for the poll's whole deadline (the red). Fleet
   `a_holder` 20 of 20 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62,
   `merge_origin::` 17 of 17, `merge_service::` 14 of 14, `takeover::` 18 of 18; fmt clean.
+
+### A-697, rebase and copies — A holder's work rebases over the holder's replica, and a copy it declares is composed there (2026-11-20, w-shared for UI goal 93; main's order: before the routing flip, which would otherwise refuse both)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/verbs.rs` (`replica_rebase`, `compose_on_replica`, `rebase_answer` shared with `map_rebase`),
+`crates/server/src/work_home.rs`, `crates/server/tests/fleet.rs`.
+- **Rebase.** A rebase is a pure function of the versions it maps through (A-658: `Green::rebase` reads the green and
+  changes nothing), so a holder's replica answers the owner's rebase. A holder's work's rebase goes to the node's control
+  shard (`work_home::answer_on_owner`) and is mapped over the replica onto its head (`verbs::replica_rebase`), a version
+  the owner committed; the work settles as any rebase does, and its floor rises at the owner (part b). A replica without
+  the work's base answers retryable. The answer's mapping is one function for the owner and the holder
+  (`verbs::rebase_answer`).
+- **Copies.** A work holding a copy leaves its increment to be composed where the green's bytes are, since the copy's
+  source is the green's (`work_home::holds_copy`, A-626). For a holder's work that is the replica: the submit composes it
+  on the control shard before computing its verdict (`work_home::computed_request`), and the rebase before mapping it,
+  by the owner's composition over the replica (`verbs::compose_on_replica`, as `build_increment`), counted
+  `merge.work.composed_on_replica`. The gate's two `Unsupported` refusals (part c) are gone.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows` (two nodes at `f = 1`: B's work writes `g`, A
+  commits version 2, B's work rebases: `Rebased` at 2, mapped on B's replica once, reads `f` as version 2 holds it and
+  keeps `g`; A's floor rose to 2) and `a_holders_work_submits_a_copy_composed_over_the_holders_replica` (B's work copies
+  `f` to `f2` and submits: version 2, composed on B's replica, A's green reads `f2` "hello"). Fleet `a_holder` 22 of 22;
+  `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62, `merge_service::` 14 of 14; fmt clean.
+
+### A-697, the node verbs' authority — A work's node verbs are its own member's alone (2026-11-20, w-shared for UI goal 93; main's ruling on part b's open point)
+Applied in the same change to: part b's entry (its "Who may send it" closed), GAPS (A-247's step two),
+`crates/server/src/verbs.rs` (`serve_forward`, `node_verb_work`).
+- **Rule (main).** A node's verb about one of its works (`AdmitWork`, `MoveWorkFloor`, `SubmitComputed`) is served only
+  when the work's id names, as its creator (its high bytes), the member this node has learned for the fleet link's
+  authenticated anchor (`member_task::anchor_of`, read on the control shard, where `serve_forward` runs). Fleet
+  certificates bind member ids, so no boot nonce is needed; a warm restart keeps the member id, so the member that made
+  a work moves its floor after one. Any other member is refused `Forbidden`, before anything is dispatched or recorded.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --lib
+  verbs::tests::a_works_floor_is_moved_by_the_member_its_id_names_alone` (a one-shard daemon owning a green, member
+  0x51 learned for the peer's anchor: a drop of a 0x51 work's floor moved it; a drop of a 0x52 work's floor refused
+  `Forbidden` and the floor kept). Red with the check removed: the second floor dropped. Fleet `a_holder` 22 of 22 (the
+  admissions, floor moves and computed submits of every holder test pass the check); `verbs::` 63 of 63, `work_home` 2
+  of 2; fmt clean.

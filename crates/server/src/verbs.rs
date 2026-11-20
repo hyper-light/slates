@@ -967,6 +967,19 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   // uid means something only on its host, so the owner judges it as (origin, account) and never by the origin's word.
   let principal = principal.rehosted(origin);
   let requester = principal.clone();
+  // A node's verb about one of its works (A-697) is the work's own member's alone: the id's creator must be the member
+  // this node has learned for the link's authenticated anchor (fleet certificates bind member ids). Any other member is
+  // refused, however its principal reads.
+  if let Some(work) = node_verb_work(&body)
+    && !crate::state::try_with_state(|s| {
+      crate::member_task::anchor_of(s, ObjectId(work.bytes).creator()) == Some(origin)
+    })
+    .unwrap_or(false)
+  {
+    return encode_body(&refused(Refusal::Forbidden {
+      verb: "a node's verb about another member's work".to_owned(),
+    }));
+  }
   if let RequestBody::PromoteRegion { region } = body {
     return encode_body(
       &crate::state::try_with_state(|s| propose_region_promotion(s, region))
@@ -1026,6 +1039,17 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// The work a node's verb is about (A-697: `AdmitWork`, `MoveWorkFloor`, `SubmitComputed`), whose creator alone may send
+/// it; `None` for any other verb.
+fn node_verb_work(body: &RequestBody) -> Option<VolumeId> {
+  match body {
+    RequestBody::AdmitWork { work, .. }
+    | RequestBody::MoveWorkFloor { work, .. }
+    | RequestBody::SubmitComputed { work, .. } => Some(*work),
+    _ => None,
+  }
 }
 
 /// The refusal for a shard whose state refused a borrow (`state::try_with_state`), by what refused it (A-564). Fenced
@@ -10039,17 +10063,104 @@ fn map_rebase(
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
   };
   // A rebase reads the green and changes nothing (A-658); the engine is lent as for any verb on it.
-  let Some(engine) = state.greens.get_mut(&green_id) else {
+  let Some(engine) = state.greens.get(&green_id) else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
-  match engine.rebase(&inc) {
+  rebase_answer(&engine, green_id, &inc, sealed.composed.is_some())
+}
+
+/// Format: a rebase of a work on a holder node mapped over the node's replica of its green (A-697), the non-vacuity
+/// count of [`replica_rebase`].
+pub(crate) const REBASED_ON_REPLICA: &str = "merge.work.rebased_on_replica";
+
+/// A rebase of a work on a holder node (A-697): its composed increment mapped through this node's replica of the green,
+/// on the control shard, onto the replica's head, a version the owner committed (A-658: `Green::rebase` is a pure
+/// function of the versions it maps through, so any copy that holds them answers the owner's rebase). Nothing of the
+/// green changes and nothing is recorded; the work's floor then rises at the owner (`MoveWorkFloor`). A replica that
+/// lacks the work's base answers retryable (`merge.work.replica_behind`).
+pub(crate) fn replica_rebase(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+) -> crate::work_home::RebaseAnswer {
+  use crate::work_home::RebaseAnswer;
+  let inc = match &sealed.composed {
+    Some(inc) => inc.clone(),
+    None => match compose_on_replica(state, sealed, Vec::new()) {
+      Ok(inc) => inc,
+      Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
+    },
+  };
+  let Some(replica) = state.merge.replicas.get(&ObjectId(sealed.green.bytes)) else {
+    state.count(crate::work_home::REPLICA_BEHIND, 1);
+    return RebaseAnswer::Reply(refused(Refusal::Overloaded { shard: state.shard }));
+  };
+  if inc.base > replica.head() {
+    state.count(crate::work_home::REPLICA_BEHIND, 1);
+    return RebaseAnswer::Reply(refused(Refusal::Overloaded { shard: state.shard }));
+  }
+  let answer = rebase_answer(replica, sealed.green, &inc, true);
+  state.count(REBASED_ON_REPLICA, 1);
+  answer
+}
+
+/// Format: a holder's work's increment composed on the control shard over the node's replica of its green, since it
+/// holds a copy, whose source's bytes the green holds (A-697; a copy's increment is composed where the green is,
+/// `work_home::holds_copy`).
+pub(crate) const COMPOSED_ON_REPLICA: &str = "merge.work.composed_on_replica";
+
+/// A holder's work's increment composed over this node's replica of its green (A-697), as the owner composes one over
+/// its green ([`build_increment`]): for a work holding a copy, whose source's bytes the work's shard does not hold.
+/// `Overloaded`, retryable, while the replica lacks the work's base.
+pub(crate) fn compose_on_replica(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+) -> Result<slates_merge::engine::Increment, Refusal> {
+  let behind = Refusal::Overloaded { shard: state.shard };
+  let Some(replica) = state
+    .merge
+    .replicas
+    .get(&ObjectId(sealed.green.bytes))
+    .filter(|replica| sealed.base_version <= replica.head())
+  else {
+    state.count(crate::work_home::REPLICA_BEHIND, 1);
+    return Err(behind);
+  };
+  let base = replica.base_for(sealed.base_version, &sealed.journal);
+  let files_base = crate::work_files::Base {
+    green: Some(replica),
+    fetched: None,
+    version: sealed.base_version,
+  };
+  let inc = compose_increment(
+    (sealed.work, sealed.base_version),
+    &base,
+    (&sealed.files, files_base),
+    &sealed.journal,
+    evidence,
+  )?;
+  state.count(COMPOSED_ON_REPLICA, 1);
+  Ok(inc)
+}
+
+/// What `engine`'s rebase of `inc` gives a work over `green_id` (A-247, A-658): the work's new delta and journal over the
+/// head, with the head's entries of every path the journal names when the work composes its own increments; or the
+/// reply that ends it (a conflict's windows, an unknown base, a refused copy).
+fn rebase_answer(
+  engine: &slates_merge::engine::Green,
+  green_id: DbVolumeId,
+  inc: &slates_merge::engine::Increment,
+  composes: bool,
+) -> crate::work_home::RebaseAnswer {
+  use crate::work_home::RebaseAnswer;
+  match engine.rebase(inc) {
     slates_merge::engine::Rebased::Rebased {
       version,
       changed,
       journal,
     } => {
       // A work that composed its own increment composes its next one too: it is given the entries it will need.
-      let entries = if sealed.composed.is_some() {
+      let entries = if composes {
         journal
           .iter()
           .flat_map(VolumeOp::names)
@@ -24285,6 +24396,85 @@ mod tests {
       ))
       .ok()?;
     super::decode_body::<ReplyBody>(&bytes).ok()
+  }
+
+  /// A-697 (a work's floor is moved by its own member alone). Do: on a one-shard daemon owning a green, learn member
+  /// 0x51 for [`PEER`]'s anchor; record floors for a work whose id names member 0x51 and for one whose id names member
+  /// 0x52; forward from [`PEER`] a `MoveWorkFloor` dropping each. Expect: the first answered `WorkFloorMoved` and its
+  /// floor gone; the second refused `Forbidden`, another member's work, and its floor kept.
+  #[test]
+  fn a_works_floor_is_moved_by_the_member_its_id_names_alone() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let named = |member: u64| {
+      let mut bytes = [0x11; 16];
+      bytes[..8].copy_from_slice(&member.to_be_bytes());
+      super::VolumeId { bytes }
+    };
+    let (own, anothers) = (named(0x51), named(0x52));
+    let green = crate::daemon::observe_first(&daemon, move |state| {
+      state.learned_members.insert(
+        PEER,
+        crate::state::LearnedMember {
+          boot_nonce: 1,
+          host: HostId(0x51),
+          previous: None,
+        },
+      );
+      let super::ReplyBody::GreenCreated { id } = super::dispatch(
+        state,
+        1,
+        &scatter_asker(),
+        super::RequestBody::CreateGreen {
+          name: "floored".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ) else {
+        return None;
+      };
+      for work in [own, anothers] {
+        super::owner_floor(
+          state,
+          super::to_db_volume(id),
+          super::to_db_volume(work),
+          Some(0),
+        );
+      }
+      Some(id)
+    })
+    .expect("a green");
+    let drop_floor = |work| super::RequestBody::MoveWorkFloor {
+      green,
+      work,
+      base: None,
+    };
+    let moved = served_as_forwarded(&daemon, drop_floor(own));
+    let refused = served_as_forwarded(&daemon, drop_floor(anothers));
+    let floors = crate::daemon::observe_first(&daemon, move |state| {
+      let partition = state.db.partition();
+      [own, anothers]
+        .map(|work| partition.work_floor(super::to_db_volume(green), super::to_db_volume(work)))
+    });
+    daemon.stop();
+    assert_eq!(
+      moved,
+      Some(ReplyBody::WorkFloorMoved),
+      "its own member's move"
+    );
+    assert!(
+      matches!(
+        refused,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Forbidden { .. }
+        })
+      ),
+      "another member's work: {refused:?}"
+    );
+    assert_eq!(
+      floors,
+      [None, Some(0)],
+      "the first dropped, the second kept"
+    );
   }
 
   /// What the fenced-owner test was answered for a volume whose owner shard is fenced: asked by a client on another
