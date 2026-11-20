@@ -108,3 +108,9 @@
 ## NOW: S4 slice 1 (agreed with w-perf): slates-svn records keep text identity+size+checksums, no bytes; readers via
 ## lent `TextSource` (`fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>>`); Room charges places.
 ## w-perf does slice 2 (server TextSource over Green::held, svn_commit drops text bytes, rebuild re-holds).
+
+## S4 slice 1 -- LANDED main 21f03d433 (commit 7e1171e09) + follow-up 1d7c602ec (commit 5ff74820f), both verified
+- TextSource / WithTexts / Cow text traits. My push of 21f03d433 met main's new dav/report_file_revs/tests.rs and broke
+  slates-svn's lib-test build on main for one push; fixed by 5ff74820f (landed 1d7c602ec). Landed tree: svn 157/157
+  (reads/dav/serve), server lib tests compile. Lesson: re-run after the last merge even when only tests changed.
+- NEXT: w-perf's slice 2. My queue: A-702 part 2 waits on w-reaper's hooks piece; A-703 replay/replay-range next.
