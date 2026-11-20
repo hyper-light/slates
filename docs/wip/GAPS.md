@@ -162,7 +162,8 @@
 > handle an object; piece 2a: the negotiation's walk keeps its sets as runs, its stacks charged at their deepest (a 3,000-
 > commit clone negotiated within 4 KiB); piece 2b part 1: the choice of the pack's objects a unit at a time
 > (`negotiation::begin`, `Negotiating::step`); part 2: `upload::serve_in_turns` and `Answer::write_within` choose them
-> within the owner's quantum, the answer the same bytes. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> within the owner's quantum, the answer the same bytes; piece 3a: sets in runs or bits, whichever is smaller, and packets
+> sized from the room (a clone within 4 KiB). Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -220,7 +221,11 @@
 > branch): kept in an index fork and recorded as a push's are (`Source::Made`, the green's key and the version beside
 > the revisions) in the submit's own transaction; a line's or bookmark's head is the made changeset while its version
 > is the green's head, else the one a push named (`hg_made::head_of`), and a recovery puts the made node back from the
-> record. Owed: copies as file revisions naming their source; merges' second parents; the holders' changesets.
+> record. Copies BUILT: a path a work copied (A-626 part 4's `WorkOp::Copy`, a file or under a copied directory) is a
+> file revision whose block names its source and the source's node (`copy`, `copyrev`) with a null first parent,
+> held to stock 7.2's nodes for `hg cp` unchanged and changed (`push::made`'s test) and through a submit (`hg_made`'s).
+> Owed: merges' second parents; the holders' changesets; a directory copy's paths as files (the version names the
+> tree at its destination alone).
 > **A-720 (2026-11-20, w-hg; main's ruling after w-perf's 57,036-changeset push tripped the watchdog: a push's working
 > set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
 > push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
@@ -4651,8 +4656,9 @@
 > node). What it owes: a rule for the work's node (the creating client's, with its name reachable from any node), the
 > owner's asks over the fleet exchange, and the lease gate on the owner's half of a remote verdict.
 > Progress (A-697, 2026-11-20): part a1 built, the owner's admission of another node's work by a forwarded
-> `AdmitWork` (rights from the green's record, the floor at the head, answered once); parts a2 (the holder serves the
-> creation, behind a test hook), b to f, and the routing flip are open.
+> `AdmitWork` (rights from the green's record, the floor at the head, answered once); part a2 built behind a test hook
+> (a holder makes the work on its client's partition, admitted over the fleet, its base read from its replica); parts
+> b to f and the routing flip are open.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's

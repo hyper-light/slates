@@ -72,9 +72,27 @@ const ABORT_PACKET: usize = ABORT
   .len()
   .saturating_add(pktline::MAX_LEN.saturating_sub(MAX_BAND_DATA));
 
-/// Format: the most one framing holds: a packet at the format's longest, then the flush after the pack's last data or,
-/// after the data a source wrote before it refused, git's band-3 words, whichever is longer.
-const FRAMED_MOST: usize = pktline::MAX_LEN.saturating_add(longer(FLUSH.len(), ABORT_PACKET));
+/// Derived: the parts of a request's room one packet's data may take while its pack is framed (A-745, §4.17.1 "A fetch's
+/// answer" rule 2: a request's room bounds a slice, never a repository): the data being filled and the packet framed
+/// from it, each with as much again for the step that writes it, so a quarter of the room left as the pack begins.
+const PACKET_SHARE: u64 = 4;
+
+/// The most data one packet of a pack framed as `framing` carries within a request whose room has `left` bytes when the
+/// pack begins: the format's own most where the room holds it four times over ([`PACKET_SHARE`]), else a quarter of the
+/// room, at least a byte. A client reads packets of any length up to the format's most, so a smaller room only means more
+/// of them.
+fn packet_data(framing: Framing, left: u64) -> usize {
+  let share = usize::try_from(left / PACKET_SHARE).unwrap_or(usize::MAX);
+  framing.data().min(share).max(1)
+}
+
+/// The most one framing of packets of `data` bytes holds: a packet, its length and band byte, then the flush after the
+/// pack's last data or git's band-3 words, whichever is longer.
+fn framed_most(data: usize) -> usize {
+  data
+    .saturating_add(pktline::MAX_LEN.saturating_sub(MAX_BAND_DATA))
+    .saturating_add(longer(FLUSH.len(), ABORT_PACKET))
+}
 
 /// The longer of two lengths, for the bounds above.
 const fn longer(first: usize, second: usize) -> usize {
@@ -154,6 +172,8 @@ pub(super) struct Choosing {
   framing: Framing,
   /// How many bytes of the response come before the pack.
   at: u64,
+  /// The most data one packet of the pack carries, sized as the answer is made ([`packet_data`]).
+  packet: usize,
 }
 
 impl Choosing {
@@ -173,6 +193,7 @@ impl Choosing {
       ofs_delta,
       framing,
       at,
+      packet: framing.data(),
     }
   }
 }
@@ -187,6 +208,8 @@ struct Streaming<K> {
   at: u64,
   /// The data of the packet being filled, as its source wrote it, until the packet is full or the pack has ended.
   data: Vec<u8>,
+  /// The most data one packet carries ([`packet_data`]).
+  packet: usize,
   /// The packet framed and not yet written whole, with the flush after it when it is the pack's last.
   framed: Vec<u8>,
   /// How much of them is written.
@@ -270,16 +293,18 @@ impl<K> Answer<K> {
     source: K,
     admission: &mut Admission,
   ) -> Result<Answer<K>, Refusal> {
+    let packet = packet_data(framing, admission.left());
     admission
-      .charge(to_u64(MAX_BAND_DATA).saturating_add(to_u64(FRAMED_MOST)))
+      .charge(to_u64(packet).saturating_add(to_u64(framed_most(packet))))
       .map_err(Refusal::PastAdmission)?;
     Ok(Answer {
       pack: Some(Streaming {
         source,
         framing,
         at,
-        data: Vec::with_capacity(MAX_BAND_DATA),
-        framed: Vec::with_capacity(FRAMED_MOST),
+        data: Vec::with_capacity(packet),
+        packet,
+        framed: Vec::with_capacity(framed_most(packet)),
         framed_written: 0,
         closed: false,
       }),
@@ -294,11 +319,12 @@ impl<K> Answer<K> {
     choosing: Choosing,
     admission: &mut Admission,
   ) -> Result<Answer<K>, Refusal> {
+    let packet = packet_data(choosing.framing, admission.left());
     admission
-      .charge(to_u64(MAX_BAND_DATA).saturating_add(to_u64(FRAMED_MOST)))
+      .charge(to_u64(packet).saturating_add(to_u64(framed_most(packet))))
       .map_err(Refusal::PastAdmission)?;
     Ok(Answer {
-      choosing: Some(Box::new(choosing)),
+      choosing: Some(Box::new(Choosing { packet, ..choosing })),
       ..Answer::whole(head)
     })
   }
@@ -345,8 +371,9 @@ impl<K> Answer<K> {
           source,
           framing: choosing.framing,
           at: choosing.at,
-          data: Vec::with_capacity(MAX_BAND_DATA),
-          framed: Vec::with_capacity(FRAMED_MOST),
+          data: Vec::with_capacity(choosing.packet),
+          packet: choosing.packet,
+          framed: Vec::with_capacity(framed_most(choosing.packet)),
           framed_written: 0,
           closed: false,
         });
@@ -492,9 +519,9 @@ impl<K> Streaming<K> {
   ) -> Result<(), Refusal> {
     self.framed.clear();
     self.framed_written = 0;
-    let room = self.framing.data().saturating_sub(self.data.len());
+    let room = self.packet.saturating_sub(self.data.len());
     match packs.write(served, &mut self.source, admission, &mut self.data, room) {
-      Ok(true) if self.data.len() < self.framing.data() => Ok(()),
+      Ok(true) if self.data.len() < self.packet => Ok(()),
       Ok(more) => self
         .frame_data(more)
         .or_else(|refusal| self.end_early(refusal)),

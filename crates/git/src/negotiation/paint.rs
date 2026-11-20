@@ -16,7 +16,6 @@ use std::collections::{BTreeSet, BinaryHeap};
 use super::ready::generation;
 use super::{Counters, Graph, Held, Peak, Refusal};
 use crate::Admission;
-use crate::positions::Positions;
 
 /// Paint: reached from a want.
 pub(super) const WANT: u8 = 1;
@@ -169,12 +168,15 @@ impl<N: Copy + Ord + Into<u64>> Paint<N> {
     Ok(false)
   }
 
-  /// The commits taken painted [`WANT`] alone: reached from a want and from no have, as runs of positions.
-  pub(super) fn chosen(&self) -> Positions {
-    self
-      .taken
-      .positions()
-      .intersection(self.want.positions())
-      .difference(self.have.positions())
+  /// The commits taken painted [`WANT`] alone: reached from a want and from no have, kept as [`Held`] keeps a set and
+  /// charged to `admission` as it grows.
+  pub(super) fn chosen(&self, admission: &mut Admission) -> Result<Held, Refusal> {
+    let mut chosen = Held::default();
+    for position in self.taken.iter() {
+      if self.want.contains(position) && !self.have.contains(position) {
+        chosen.insert(position, admission)?;
+      }
+    }
+    Ok(chosen)
   }
 }
