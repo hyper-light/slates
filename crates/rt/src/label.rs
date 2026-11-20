@@ -141,7 +141,7 @@ impl Polling {
   /// What a pulse word says.
   pub(crate) fn unpack(word: u64) -> Self {
     Self {
-      label: label_of(u32::try_from(word >> 32).unwrap_or(0)),
+      label: label_of(u32::try_from(word >> u32::BITS).unwrap_or(0)),
       polls: word & u64::from(u32::MAX),
     }
   }

@@ -1831,7 +1831,8 @@ fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId
 
 /// A-732's sibling for git (main's ruling of 2026-11-20: a large repository's rebuild in one step spun past the
 /// watchdog and crash-looped the daemon). Do: push five commits to a git repository; make its store again from the log.
-/// Expect: the rebuild under way and the store lent to nothing; its five records replayed one a turn; then the store
+/// Expect: the rebuild under way and the store lent to nothing; its five records replayed a turn each at least (a pack
+/// record over as many as its units take, A-722 part 4); then the store
 /// lent again and its green's map made again by its build. Red before the change: the store was made whole at once.
 #[test]
 fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
@@ -1854,7 +1855,51 @@ fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
       .vcs_stores
       .git_ref(repository)
       .is_some_and(|(_, git)| git.heads.contains_key(&green_key(root)));
-    (during, turns == records && records == 5, lent, mapped)
+    (during, turns >= records && records == 5, lent, mapped)
   });
   assert_eq!(seen, ((true, true), true, true, true));
+}
+
+/// Shape: the files of the one commit whose push's record holds many objects: enough that a replay a unit a turn takes
+/// many turns, few enough for a test's step.
+const MANY_FILES: usize = 64;
+
+/// A-722 part 4 (main's ruling 2026-11-20: a large pack record's replay ran in one turn and crash-looped the daemon). Do:
+/// push one commit of [`MANY_FILES`] files to a git repository, one record whose pack holds every blob, the tree and the
+/// commit; make its store again from the log, each turn held to no time at all. Expect: the one record replayed over
+/// at least as many turns as its pack has objects, and the store made again holding the commit at the green's head.
+/// Red before the change: the record was replayed whole in one turn.
+#[test]
+fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "many-objects", VcsTool::Git);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
+      .map(|n| {
+        (
+          format!("f{n}").into_bytes(),
+          format!("file {n}\n").into_bytes(),
+        )
+      })
+      .collect();
+    let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
+    let tree = tree_of(&objects);
+    push_through(state, (repository, root), &objects, (None, commit, tree));
+    let held = records(state, repository).len();
+    super::rebuild(state, repository);
+    let mut turns = 0usize;
+    while super::rebuild_turn_once_within(state, repository, 0) {
+      turns = turns.saturating_add(1);
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    let key = green_key(root);
+    let head = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(content, git)| {
+        let newest = git.repository.versions(key).checked_sub(1)?;
+        git.repository.head(content, key, newest)
+      });
+    (held, turns >= objects.len(), head == Some(commit))
+  });
+  assert_eq!(seen, (1, true, true));
 }

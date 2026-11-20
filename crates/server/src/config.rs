@@ -1588,7 +1588,13 @@ impl DaemonConfig {
   /// The bytes one archive-walk slice may hash on the calling shard now: half its live step quantum at the
   /// machine's measured BLAKE3 throughput.
   pub fn archive_slice_bytes(&self) -> u64 {
-    archive_slice_bytes(self.blake3_bytes_per_second, self.step_quantum_ns())
+    self.archive_slice_bytes_within(self.step_quantum_ns())
+  }
+
+  /// [`DaemonConfig::archive_slice_bytes`] for a turn of `quantum_ns` (a git record's replay, whose quantum a test may
+  /// cut, A-722 part 4): half of it at the machine's measured BLAKE3 throughput.
+  pub fn archive_slice_bytes_within(&self, quantum_ns: u64) -> u64 {
+    archive_slice_bytes(self.blake3_bytes_per_second, quantum_ns)
   }
 
   /// The content bytes one slice of copy-bound work (a DAX backing's fill, an image's build) may move on the calling

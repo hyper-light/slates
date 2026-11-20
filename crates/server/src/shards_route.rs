@@ -241,7 +241,11 @@ pub(crate) async fn serve(listener: Listener) {
     }
     loop {
       match listener.accept() {
-        Ok(Some(connection)) => admit(connection),
+        Ok(Some(slates_ipc::route::Accepted::Connection(connection))) => admit(connection),
+        // A client gone before its connection was taken: its exchange ended before it began, a hello cut short.
+        Ok(Some(slates_ipc::route::Accepted::Departed)) => {
+          let _ = state::with_state_counted(|s| s.count(MALFORMED, 1));
+        }
         Ok(None) => break,
         Err(_) => {
           let _ = state::with_state_counted(|s| s.count(FAILED, 1));
