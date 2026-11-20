@@ -7317,8 +7317,11 @@
 >   their stock clients' `exit_within` keeps `PATIENCE`, owed: a client waiting on a stock server has no slates tree to
 >   judge beside it. `load_scale` since 2026-11-20: its `eventually` and its wait for an anchor's daemon judged the
 >   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
->   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `winfsp` (Windows-only, ~45 call sites; its own pass), with
->   `recovered::await_recovered`'s wall form; `start_judgment`, `shards`, `winfsp_semantics` and `live_winfsp` since
+>   5 s `START_WAIT` retry gone. `winfsp` since 2026-11-20: its daemon's successor, adoptions, counters and recovered
+>   daemon judged in the daemon's own CPU (`DaemonWatch`, re-aimed at each daemon `status` names); a drive's arrival and
+>   departure, a process's exit and a view following a change held to the observation budget (`KERNEL_WAIT`; owed:
+>   Windows' device-change event for the drive, which needs a window's message loop); the purge race's wedge bound kept;
+>   `recovered::await_recovered`'s wall form removed with its last caller. `start_judgment`, `shards`, `winfsp_semantics` and `live_winfsp` since
 >   2026-11-20, judged on Windows by the anchor's process or the daemon's (the pid its `status` names), since Windows
 >   lists no instance's processes by command line and a tree's children are not listed there; `start_judgment`'s
 >   replacement bound and `winfsp_semantics`' wedge bound (`within_wait`) kept as what those tests prove
