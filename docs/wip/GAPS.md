@@ -313,10 +313,11 @@
 > (a2) BUILT 479f950ed: windows are chunks of the shard's own chunk store, lent per step by a swap under a guard (main's
 > ruling (ii)). (a3) BUILT 782eb711c: the windows' table in the shard image (held pieces), claimed before the volumes,
 > held again by the replay. (c) c1 BUILT: a Subversion head's texts held by the green by path (`vcs_store::svn_texts`),
-> held again at a recovery; `HeadTexts` reads the green, then the records: that second read path is OWED away with c3
-> (the reads switched to it, the records dropping text bytes), in one series. OWED: (b) git v3 (w-balance's names, on
-> main's f+1 ruling), (c) c2 (an old text kept as an svndiff delta in the repository store before the green folds it)
-> and c3, (d) replication.
+> held again at a recovery. c2 BUILT 14215b0c3: the records keep texts as skip-delta svndiffs. c3 BUILT: `HeadTexts`
+> reads a head text from the green and any other from the one place the records say it is kept (the content store for
+> a stored text, A-761 p2; the records' delta for an imported or made one), no arm tried after another. a3b BUILT
+> 9b9d8dec6 (lists and names in the shard image). OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); the
+> background deltify of a superseded stored text (main's ruling on A-761); (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
