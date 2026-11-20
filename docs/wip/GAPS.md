@@ -1340,6 +1340,8 @@
 > export, update, commits, properties, server-side copies, switch, merge, delete and revert pass; `lock` is refused
 > (`Server doesn't support the lock command`), HTTP meets `path not found` (A-681) and the SSH edge answers
 > `svnserve -t is not served yet`: 22 of 27 (main 4785858, debug, Mac Studio).
+> Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
+> (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
