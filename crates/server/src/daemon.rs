@@ -1356,8 +1356,12 @@ impl Daemon {
     self.pending(target, budget_ns, move || state::try_with_state(question))
   }
 
-  /// Runs `question` on this daemon's shard at `target` and returns its answer within
-  /// [`OBSERVE_BUDGET_NS`] ([`Self::observation`]). That budget is **generous on purpose**: under noisy,
+  /// Runs `question` on this daemon's shard at `target` and returns its answer once the shard runs it, while the shard
+  /// lives (A-232's rule; `Observation::patient`, looked at every liveness window): however long the shard is busy,
+  /// starved or held alone by other work, only its going ends the wait, and a stuck shard is its watchdog's to end. Until
+  /// 2026-11-20 the answer was waited for within [`OBSERVE_BUDGET_NS`], ten liveness windows, and a control shard held
+  /// alone by recovered work past that budget's CPU refused every default observation, the stop watch's install among
+  /// them (w-interop's restart loop). That budget was **generous on purpose**: under noisy,
   /// heavy CPU load a live shard can be starved of the scheduler for several seconds before it services
   /// this one-shot question, and a tight budget would end the observation with a deadline where the
   /// shard was merely slow — so a slow shard answers, and only a wedged one ends the observation, with
@@ -1374,7 +1378,7 @@ impl Daemon {
     Q: FnOnce(&mut ShardState) -> T + Clone + Send + 'static,
   {
     self
-      .observation(target, OBSERVE_BUDGET_NS, question)?
+      .pending_patient(target, move || state::try_with_state(question))?
       .wait()
   }
 
@@ -1386,7 +1390,7 @@ impl Daemon {
     Q: FnOnce(&slates_rt::shard::ShardContext) -> T + Clone + Send + 'static,
   {
     self
-      .pending(target, OBSERVE_BUDGET_NS, move || {
+      .pending_patient(target, move || {
         registry::with_current(question).ok_or(StateAccess::Absent)
       })?
       .wait()
@@ -1426,6 +1430,26 @@ impl Daemon {
   /// The observation core: a question in the unified form (it answers, or names why the shard's state
   /// was out of reach), pinned to the registration holding the shard at `target`, with the refusals
   /// decidable before a submission decided here.
+  /// The observation of `question` at `target` that waits while the shard lives (`Observation::patient`), looking every
+  /// liveness window: the default observations' form ([`Self::observe`]).
+  fn pending_patient<T, Q>(
+    &self,
+    target: Option<ShardId>,
+    question: Q,
+  ) -> Result<Observation<T, Q>, ObserveError>
+  where
+    T: Send + 'static,
+    Q: FnOnce() -> Result<T, StateAccess> + Clone + Send + 'static,
+  {
+    let shard = target.ok_or(ObserveError::NoTarget)?;
+    let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
+    let holder = runtime.holder_of(shard).ok_or(ObserveError::ShardGone {
+      shard: shard.0,
+      stage: ObserveStage::Submission,
+    })?;
+    Ok(Observation::patient(holder, LIVENESS_BUDGET_NS, question))
+  }
+
   fn pending<T, Q>(
     &self,
     target: Option<ShardId>,

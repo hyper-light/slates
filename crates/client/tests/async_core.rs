@@ -9,7 +9,7 @@
 #![cfg(unix)]
 
 use std::os::fd::{BorrowedFd, RawFd};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use slates_client::{Client, ClientError, Deadlines, RequestId};
 use slates_ipc::protocol::{NamePolicy, ReplyBody, RequestBody, SizeClass};
@@ -20,8 +20,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so a client's shard and the control shard differ.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the fast-path spin budget (nanoseconds): a tenth of a second, well past a live daemon's
 /// microsecond reply, so the fast path always catches it here.
 const SPIN_NS: u64 = 100_000_000;
@@ -83,15 +81,9 @@ fn await_live<T>(daemon: &Daemon, what: &str, mut step: impl FnMut() -> Option<T
 }
 
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
   loop {
     match Client::connect(instance, deadlines()) {
       Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::hint::spin_loop();
-      }
       Err(e) => panic!("{e}"),
     }
   }

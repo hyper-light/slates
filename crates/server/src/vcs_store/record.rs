@@ -52,6 +52,13 @@ const VERSION: u32 = 2;
 /// Format: the first version, each object's bytes inflated: still read, since a segment holds entries written by it.
 const VERSION_INFLATED: u32 = 1;
 
+/// Format: version 3 (A-724 piece 8c, main's ruling of 2026-11-20 (ii)): the objects' names kept as one content
+/// (`super::record_names`), the record holding its identity (the BLAKE3 of the names' bytes, the identity rule) and
+/// the count; written only once the names are durable at `f + 1` homes in the region (`super::homes`), so a replay on
+/// any node can read them. Read always; written only where the writer is asked for it (records stay version 2 until a
+/// takeover proves the region path).
+const VERSION_NAMED: u32 = 3;
+
 /// Format: the bytes of a word: the magic, the version.
 const WORD_BYTES: usize = size_of::<u32>();
 
@@ -144,8 +151,10 @@ pub(crate) struct RecordedObject<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Record<'a> {
   /// Version 2's objects, named by type, content identity and length, in the order they were admitted; empty for
-  /// version 1, whose objects carry their bytes.
+  /// version 1, whose objects carry their bytes, and for version 3, whose names are a content ([`Record::named`]).
   pub(crate) names: Vec<(Kind, ContentId, u64)>,
+  /// Version 3's names: the identity of the content holding them (`super::record_names`) and their count.
+  pub(crate) named: Option<(ContentId, u64)>,
   /// Version 2's pack as the client sent it, compressed and with its deltas, which a replay reads its objects from;
   /// empty for version 1, and for a record that brought no object.
   pub(crate) pack: &'a [u8],
@@ -195,6 +204,38 @@ impl RecordWriter {
     lacks: impl Fn(&ObjectId) -> bool,
     (deepest, moves): (u64, &[RecordedMove]),
   ) -> Result<Vec<u8>, WriteRefused> {
+    self.finish_as((content, format), lacks, (deepest, moves), None)
+  }
+
+  /// The names a version-3 record of the objects `lacks` says the repository lacks keeps as a content
+  /// (`super::record_names::names_to_content`), in the order they were admitted.
+  pub(crate) fn names_of(&self, lacks: impl Fn(&ObjectId) -> bool) -> Vec<(Kind, ContentId, u64)> {
+    self
+      .lacked(lacks)
+      .map(|noted| (noted.kind, noted.identity, noted.len))
+      .collect()
+  }
+
+  /// [`RecordWriter::finish`] as version 3 (module docs' [`VERSION_NAMED`]): the names the content `named` holds (its
+  /// identity and count, put and homed by the caller before) in place of each name.
+  pub(crate) fn finish_named(
+    &self,
+    (content, format): (&ContentStore, ObjectFormat),
+    lacks: impl Fn(&ObjectId) -> bool,
+    (deepest, moves): (u64, &[RecordedMove]),
+    named: (ContentId, u64),
+  ) -> Result<Vec<u8>, WriteRefused> {
+    self.finish_as((content, format), lacks, (deepest, moves), Some(named))
+  }
+
+  /// [`RecordWriter::finish`] and [`RecordWriter::finish_named`]: version 3 when `named`, else version 2.
+  fn finish_as(
+    &self,
+    (content, format): (&ContentStore, ObjectFormat),
+    lacks: impl Fn(&ObjectId) -> bool,
+    (deepest, moves): (u64, &[RecordedMove]),
+    named: Option<(ContentId, u64)>,
+  ) -> Result<Vec<u8>, WriteRefused> {
     let objects: Vec<&Noted> = self.lacked(lacks).collect();
     // A record that brings no object (a later append of a push, a delete) carries no pack; objects no client sent as a
     // pack (the server's own commits) are written as one, each whole, so every record is a pack.
@@ -207,18 +248,35 @@ impl RecordWriter {
     } else {
       &self.pack
     };
-    let len = record_len(moves, &objects, pack.len()).ok_or(WriteRefused::Allocation)?;
+    let inline: &[&Noted] = if named.is_some() { &[] } else { &objects };
+    let len = record_len(moves, inline, pack.len()).ok_or(WriteRefused::Allocation)?;
     let mut out = Vec::new();
     out
-      .try_reserve_exact(len)
+      .try_reserve_exact(len.saturating_add(IDENTITY_BYTES))
       .map_err(|_| WriteRefused::Allocation)?;
-    write_head(&mut out, deepest, moves);
-    let count = u64::try_from(objects.len()).unwrap_or(u64::MAX);
-    out.extend_from_slice(&count.to_le_bytes());
-    for noted in objects {
-      out.push(noted.kind.pack_number());
-      out.extend_from_slice(&noted.identity.0);
-      out.extend_from_slice(&noted.len.to_le_bytes());
+    write_head(
+      &mut out,
+      if named.is_some() {
+        VERSION_NAMED
+      } else {
+        VERSION
+      },
+      (deepest, moves),
+    );
+    match named {
+      Some((identity, count)) => {
+        out.extend_from_slice(&identity.0);
+        out.extend_from_slice(&count.to_le_bytes());
+      }
+      None => {
+        let count = u64::try_from(objects.len()).unwrap_or(u64::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for noted in objects {
+          out.push(noted.kind.pack_number());
+          out.extend_from_slice(&noted.identity.0);
+          out.extend_from_slice(&noted.len.to_le_bytes());
+        }
+      }
     }
     let pack_len = u64::try_from(pack.len()).unwrap_or(u64::MAX);
     out.extend_from_slice(&pack_len.to_le_bytes());
@@ -263,10 +321,10 @@ fn record_len(moves: &[RecordedMove], objects: &[&Noted], pack: usize) -> Option
   len.checked_add(LONG_BYTES)?.checked_add(pack)
 }
 
-/// Writes the record's head and its moves.
-fn write_head(out: &mut Vec<u8>, deepest: u64, moves: &[RecordedMove]) {
+/// Writes the record's head, of `version`, and its moves.
+fn write_head(out: &mut Vec<u8>, version: u32, (deepest, moves): (u64, &[RecordedMove])) {
   out.extend_from_slice(&MAGIC.to_le_bytes());
-  out.extend_from_slice(&VERSION.to_le_bytes());
+  out.extend_from_slice(&version.to_le_bytes());
   out.extend_from_slice(&deepest.to_le_bytes());
   let count = u64::try_from(moves.len()).unwrap_or(u64::MAX);
   out.extend_from_slice(&count.to_le_bytes());
@@ -379,7 +437,7 @@ impl<'a> Record<'a> {
       return Err(RecordRefused::Magic);
     }
     let version = reader.word()?;
-    if version != VERSION && version != VERSION_INFLATED {
+    if version != VERSION && version != VERSION_INFLATED && version != VERSION_NAMED {
       return Err(RecordRefused::Version { version });
     }
     let deepest = reader.long()?;
@@ -388,8 +446,15 @@ impl<'a> Record<'a> {
     for _ in 0..count {
       moves.push(reader.one_move(format)?);
     }
-    let count = reader.count(OBJECT_MIN_BYTES)?;
-    let (mut objects, mut names) = (Vec::new(), Vec::new());
+    let (mut objects, mut names, mut named) = (Vec::new(), Vec::new(), None);
+    let count = if version == VERSION_NAMED {
+      let identity =
+        ContentId::from_slice(reader.take(IDENTITY_BYTES)?).ok_or(RecordRefused::Truncated)?;
+      named = Some((identity, reader.long()?));
+      0
+    } else {
+      reader.count(OBJECT_MIN_BYTES)?
+    };
     if version == VERSION_INFLATED {
       objects.reserve(count);
       for _ in 0..count {
@@ -412,6 +477,7 @@ impl<'a> Record<'a> {
     }
     Ok(Record {
       names,
+      named,
       pack,
       deepest,
       moves,

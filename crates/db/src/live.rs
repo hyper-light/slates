@@ -1613,6 +1613,32 @@ impl Shipper {
         durable: self.durable,
       });
     }
+    self.append_hashed_as(payload, hashed, true)
+  }
+
+  /// [`Shipper::append_kept`] with the identity `hashed` hashed over `payload` in turns (A-757 part 2b: a large delta built
+  /// in turns of its own); refused as [`Shipper::append_checkpoint_hashed`] is, and for credit as a delta is.
+  pub fn append_hashed(
+    &mut self,
+    payload: Vec<u8>,
+    hashed: EntryHasher,
+  ) -> Result<Head, LiveError> {
+    self.admit(payload.len())?;
+    self.append_hashed_as(payload, hashed, false)
+  }
+
+  /// Whether a delta of `payload_len` bytes would be admitted now ([`Shipper::append`]'s credit).
+  pub fn admits_delta(&self, payload_len: usize) -> bool {
+    self.admit(payload_len).is_ok()
+  }
+
+  /// The append both hashed appends share, a whole state when `whole`.
+  fn append_hashed_as(
+    &mut self,
+    payload: Vec<u8>,
+    hashed: EntryHasher,
+    whole: bool,
+  ) -> Result<Head, LiveError> {
     let (position, previous) = self.next_link()?;
     if hashed.position != position
       || hashed.previous != previous
@@ -1635,7 +1661,7 @@ impl Shipper {
       previous,
       payload,
     };
-    Ok(self.push_entry(entry, head, true, Kept::Retained).0)
+    Ok(self.push_entry(entry, head, whole, Kept::Retained).0)
   }
 
   /// Keeps `entry`, whose head is `head`, at the end of the chain, unsettled as a whole state when `whole`: its head,

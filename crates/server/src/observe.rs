@@ -230,6 +230,9 @@ impl std::fmt::Display for ObserveError {
 pub struct Observation<T, Q> {
   holder: SlotHolder,
   budget_ns: u64,
+  /// Whether the observation waits while its shard lives ([`Observation::patient`]): `budget_ns` is then only how often
+  /// it looks, never a bound.
+  patient: bool,
   question: Q,
   answer: PhantomData<fn() -> T>,
 }
@@ -280,6 +283,8 @@ struct OwnTime {
   cpu_budget_ns: u64,
   /// The CPU time the shard had run when the observation began.
   began: Option<u64>,
+  /// Whether the wait goes on while the shard's clock can be read, whatever it did ([`Observation::patient`]).
+  patient: bool,
   /// The shard's progress at the last window's end (first: at the observation's start); it only rises.
   mark: Option<u64>,
 }
@@ -296,6 +301,12 @@ pub(crate) fn held_to_this_build(ns: u64) -> u64 {
 
 impl ShardTime {
   pub(crate) fn new(holder: SlotHolder, budget_ns: u64) -> Self {
+    ShardTime::with(holder, budget_ns, false)
+  }
+
+  /// [`ShardTime::new`], or with `patient` the wait that goes on while the shard lives, a window of `budget_ns` at a
+  /// time ([`Observation::patient`]).
+  pub(crate) fn with(holder: SlotHolder, budget_ns: u64, patient: bool) -> Self {
     let began = slates_rt::registry::shard_cpu(holder);
     ShardTime {
       holder,
@@ -303,6 +314,7 @@ impl ShardTime {
         budget_ns,
         cpu_budget_ns: held_to_this_build(budget_ns),
         began: began.map(|reading| reading.spent_ns),
+        patient,
         mark: began.map(|reading| reading.progress),
       },
     }
@@ -354,6 +366,11 @@ impl OwnTime {
     scheduler: impl FnOnce() -> Option<RunReading>,
   ) -> Option<u64> {
     let first = clock()?;
+    if self.patient {
+      // The shard is there: another window, whatever it did in this one.
+      self.mark = Some(first.progress);
+      return Some(self.budget_ns);
+    }
     if self.progressed_by(first) {
       return self.worked_to(first);
     }
@@ -429,6 +446,23 @@ where
     Observation {
       holder,
       budget_ns,
+      patient: false,
+      question,
+      answer: PhantomData,
+    }
+  }
+
+  /// An observation of the shard `holder` names that waits while the shard lives (A-232's rule): admitted, run and
+  /// answered whenever the shard gets to it, looked at every `window_ns`, and ended only by the shard's going (its clock
+  /// unread, its task dropped, its channel refusing). How long the shard is busy, starved or held alone by other work
+  /// does not end it; a stuck shard is its watchdog's to end, and with it the daemon. Until 2026-11-20 every default
+  /// observation had the observe budget (ten liveness windows, a fixed 10 s), and a shard that stepped busy past that
+  /// budget's CPU without reaching the question ended it, the hazard w-interop's stop watch met (`Daemon::observe`).
+  pub(crate) fn patient(holder: SlotHolder, window_ns: u64, question: Q) -> Self {
+    Observation {
+      holder,
+      budget_ns: window_ns,
+      patient: true,
       question,
       answer: PhantomData,
     }
@@ -448,7 +482,7 @@ where
     let mut deadline = began
       .checked_add(Duration::from_nanos(self.budget_ns))
       .unwrap_or(began);
-    let mut time = ShardTime::new(self.holder, self.budget_ns);
+    let mut time = ShardTime::with(self.holder, self.budget_ns, self.patient);
     // The pace is a timed wait on a channel nobody sends on: the thread parks, it does not spin, so it
     // steals no CPU from the shard it waits on; the sender is held so the wait runs its full span.
     let (_pace_sender, pace) = channel::<()>();
@@ -712,8 +746,47 @@ mod tests {
       budget_ns: BUDGET_NS,
       cpu_budget_ns: BUDGET_NS,
       began: Some(BEGAN_NS),
+      patient: false,
       mark: Some(MARK),
     }
+  }
+
+  /// A-232's rule for a default observation (2026-11-20, w-interop's restart loop). Do: end windows of a patient wait
+  /// whose clock shows the shard ran ten budgets of CPU while stepping, then none and not runnable, then no clock at all.
+  /// Expect another window each time the clock reads, whatever the shard did, and the wait ended only when the clock
+  /// cannot be read (the shard gone). The same readings end an impatient wait at the first, as a busy shard that never
+  /// answers.
+  #[test]
+  fn a_patient_wait_goes_on_while_the_shard_lives_and_ends_at_its_going() {
+    let mut patient = OwnTime {
+      patient: true,
+      ..begun()
+    };
+    let mut impatient = begun();
+    let busy = || scripted(vec![at(BEGAN_NS + 10 * BUDGET_NS, MARK + 1)]);
+    assert_eq!(
+      patient.next_window_ns(busy(), || seen(RunState::Runnable)),
+      Some(BUDGET_NS),
+      "a shard stepping busy past any budget is waited on"
+    );
+    assert_eq!(
+      impatient.next_window_ns(busy(), || seen(RunState::Runnable)),
+      None,
+      "the impatient rule gives a busy shard up at its budget"
+    );
+    assert_eq!(
+      patient.next_window_ns(
+        scripted(vec![at(BEGAN_NS + 10 * BUDGET_NS, MARK + 1)]),
+        || { seen(RunState::Blocked) }
+      ),
+      Some(BUDGET_NS),
+      "a shard that stood still is still there: its watchdog judges it, not the wait"
+    );
+    assert_eq!(
+      patient.next_window_ns(|| None, || seen(RunState::Runnable)),
+      None,
+      "a shard whose clock cannot be read is gone"
+    );
   }
 
   /// A-318's sibling, §4.14. Do: in a build measured three times as slow as machine code (its CPU budget three wall

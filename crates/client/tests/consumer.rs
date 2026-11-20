@@ -23,7 +23,7 @@
 use std::ffi::{OsStr, OsString};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use slates_anchor::AnchorSegment;
 use slates_client::{
@@ -47,8 +47,6 @@ const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so the consumer's record is enrolled on one partition and
 /// attested from a channel on another (the cross-shard read of the attestation).
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the bytes of a workload's captured output the harness holds: a few tagged lines and the
 /// environment dump, well under a mebibyte.
 const OUTPUT_CAP: usize = 1 << 20;
@@ -88,15 +86,9 @@ fn deadlines() -> Deadlines {
 }
 
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
   loop {
     match Client::connect(instance, deadlines()) {
       Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::hint::spin_loop();
-      }
       Err(e) => panic!("{e}"),
     }
   }
