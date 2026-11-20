@@ -18,6 +18,15 @@ use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use std::collections::BTreeMap;
 
+/// A budget of `room` bytes and as many steps, untimed: a slice as the readers' callers gave one before A-751's quantum.
+fn untimed(room: usize) -> crate::report::exchange::Budget {
+  crate::report::exchange::Budget {
+    room,
+    steps: room,
+    quantum: None,
+  }
+}
+
 /// A transaction name of the form §4.17.4 item 3.1 gives.
 const TRANSACTION: &str = "0-1z";
 
@@ -376,7 +385,13 @@ fn drained(
   };
   loop {
     match stream
-      .resume(&fixture.index, &fixture.green, session, out, SLICE_ROOM)
+      .resume(
+        &fixture.index,
+        &fixture.green,
+        session,
+        out,
+        untimed(SLICE_ROOM),
+      )
       .unwrap()
     {
       Progress::More => {}
@@ -1006,14 +1021,26 @@ fn streamed<R: Repository>(
   };
   let mut slices = 1;
   while stream
-    .resume(&fixture.index, repository, &ROOT_SESSION, &mut out, room)
+    .resume(
+      &fixture.index,
+      repository,
+      &ROOT_SESSION,
+      &mut out,
+      untimed(room),
+    )
     .unwrap()
     == Progress::More
   {
     slices += 1;
   }
   let whole = out.len();
-  let again = stream.resume(&fixture.index, repository, &ROOT_SESSION, &mut out, room);
+  let again = stream.resume(
+    &fixture.index,
+    repository,
+    &ROOT_SESSION,
+    &mut out,
+    untimed(room),
+  );
   assert_eq!((again, out.len()), (Ok(Progress::Done), whole));
   (outcome, out, slices)
 }
@@ -2052,7 +2079,13 @@ fn hostile_command_holds(command: &str) -> Result<(), TestCaseError> {
   };
   let mut slices = 0_usize;
   while stream
-    .resume(&fixture.index, &fixture.green, &ROOT_SESSION, &mut out, 1)
+    .resume(
+      &fixture.index,
+      &fixture.green,
+      &ROOT_SESSION,
+      &mut out,
+      untimed(1),
+    )
     .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?
     == Progress::More
   {
@@ -2422,7 +2455,7 @@ fn items_log(fixture: &Fixture, case: &LogCase, rules: Option<&PrincipalRules>) 
       &fixture.green,
       &session,
       &mut out,
-      SLICE_ROOM,
+      untimed(SLICE_ROOM),
     )
     .unwrap()
     == Progress::More

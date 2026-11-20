@@ -69,10 +69,9 @@ use crate::index::{
 use crate::lock::{AprTime, LockTable};
 use crate::reads::Repository;
 use crate::svndiff::{
-  Compression, Encoder, Instruction, Made, Version, WINDOW_LIMIT, Window, WindowMaking, deltas,
+  Compression, Encoder, Instruction, Made, Version, WINDOW_LIMIT, Window, WindowMaking,
 };
 use std::collections::{BTreeMap, VecDeque};
-use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 /// The facts of the node an [`Call::OpenRoot`], [`Call::Open`] or [`Call::Add`] names, as the
@@ -333,8 +332,6 @@ enum Owned {
   ChangeProperty(String, Option<Vec<u8>>),
   /// [`Call::ApplyTextDelta`].
   ApplyTextDelta(Option<[u8; 16]>),
-  /// [`Call::Window`].
-  Window(Window),
   /// [`Call::DeltaPiece`]: the write's length, the piece's start in it, and the piece.
   DeltaPiece(usize, usize, Vec<u8>),
   /// [`Call::TextDeltaEnd`].
@@ -384,7 +381,6 @@ impl Owned {
       Self::ApplyTextDelta(base_md5) => Call::ApplyTextDelta {
         base_md5: *base_md5,
       },
-      Self::Window(window) => Call::Window(window),
       Self::DeltaPiece(write, at, bytes) => Call::DeltaPiece {
         write: *write,
         at: *at,
@@ -604,7 +600,7 @@ struct FileFrame {
 /// source piece read [`STEP_WORK`] bytes a step, the window made [`STEP_WORK`] units a step
 /// ([`WindowMaking`]), then its writes sent [`STEP_WORK`] bytes a piece ([`Call::DeltaPiece`]).
 #[derive(Clone, Debug)]
-struct WindowWork {
+pub(crate) struct WindowWork {
   /// Where its source view starts in the source text.
   view: u64,
   /// The target piece, read so far.
@@ -1337,11 +1333,8 @@ impl Drive {
     Ok(())
   }
 
-  /// One step of the delta's next window, `txdelta_next_window`'s (A-751): the target's next piece
-  /// of up to [`WINDOW_LIMIT`] bytes and the source's piece at the same place read, the window made
-  /// by Subversion's deltifier ([`WindowMaking`]), or as new data once the source has run out, its
-  /// view where the source ended, then its writes sent a piece at a time, each part
-  /// [`STEP_WORK`] at most a step; at the text's end, the delta's end next.
+  /// One step of the delta's next window, `txdelta_next_window`'s ([`window_unit`]); at the text's
+  /// end, the delta's end next.
   fn window<R: Repository + ?Sized>(
     &mut self,
     file: &mut FileFrame,
@@ -1351,91 +1344,19 @@ impl Drive {
       file.phase = FilePhase::End;
       return Ok(());
     };
-    let mut work = match file.window.take() {
-      Some(work) => work,
-      None => Box::new(begun_window(file, &text)?),
+    let delta = Delta {
+      text,
+      source: file.source,
+      sent: &mut file.sent,
+      header_sent: &mut file.header_sent,
     };
-    if work.target.len() < work.target_len {
-      let offset = file.sent;
-      read_piece(
-        sources.repository,
-        &text,
-        offset,
-        &mut work.target,
-        work.target_len,
-      )?;
-    } else if work.source.len() < work.source_len {
-      let source = file.source.ok_or_else(DriveFailure::corrupt)?;
-      let view = work.view;
-      read_piece(
-        sources.repository,
-        &source,
-        view,
-        &mut work.source,
-        work.source_len,
-      )?;
-    } else if work.making.as_ref().and_then(WindowMaking::made).is_none() {
-      self.make_window(&mut work)?;
-    } else if self.send_piece(file, &mut work)? {
-      let length = u64::try_from(work.target_len).map_err(|_| DriveFailure::corrupt())?;
-      file.sent = file.sent.saturating_add(length);
-      return Ok(());
-    }
-    file.window = Some(work);
-    Ok(())
-  }
-
-  /// [`STEP_WORK`] units of the window's making, begun once both pieces are read.
-  fn make_window(&self, work: &mut WindowWork) -> Result<(), DriveFailure> {
-    let (version, compression) = self.encoding;
-    let making = match &mut work.making {
-      Some(making) => making,
-      None => work.making.insert(
-        WindowMaking::new(
-          (work.view, work.source_len),
-          work.target_len,
-          version,
-          compression,
-        )
-        .map_err(|_| DriveFailure::corrupt())?,
-      ),
-    };
-    making
-      .step(&work.source, &work.target, STEP_WORK)
-      .map_err(|_| DriveFailure::corrupt())?;
-    Ok(())
-  }
-
-  /// The made window's next piece, [`STEP_WORK`] bytes at most of its current write. Whether the
-  /// window's last write is sent.
-  fn send_piece(
-    &mut self,
-    file: &mut FileFrame,
-    work: &mut WindowWork,
-  ) -> Result<bool, DriveFailure> {
-    let made = work
-      .making
-      .as_ref()
-      .and_then(WindowMaking::made)
-      .ok_or_else(DriveFailure::corrupt)?;
-    let header = Encoder::new(self.encoding.0).header();
-    let owed = *work.header.get_or_insert(!file.header_sent);
-    let writes = window_writes(&made, owed.then_some(&header[..]), self.encoding.0);
-    let Some(write) = writes.get(work.write) else {
-      return Ok(true);
-    };
-    let total = write.iter().map(|part| part.len()).sum::<usize>();
-    let piece = piece_of(write, work.at, STEP_WORK);
-    self
-      .pending
-      .push_back(Owned::DeltaPiece(total, work.at, piece));
-    file.header_sent = true;
-    work.at = work.at.saturating_add(STEP_WORK).min(total);
-    if work.at >= total {
-      work.write = work.write.saturating_add(1);
-      work.at = 0;
-    }
-    Ok(work.write >= writes.len())
+    let pending = &mut self.pending;
+    window_unit(
+      &mut file.window,
+      delta,
+      (self.encoding, sources.repository),
+      &mut |write, at, piece| pending.push_back(Owned::DeltaPiece(write, at, piece)),
+    )
   }
 
   /// `delta_proplists`: the entry properties, the lock token's removal when the lock is gone, then
@@ -1752,10 +1673,14 @@ fn property_changes(
   changes
 }
 
+/// The whole-window path the drive took before A-751, kept as its tests' oracle.
+#[cfg(test)]
 /// The one window that makes `target`, at most a window's room, from `source`, at most as much: the
 /// target as new data when the source is empty (`compute_window`), else the deltifier's window, its
 /// source view counted from the source piece's start.
 fn window_of(source: &[u8], target: &[u8]) -> Result<Window, DriveFailure> {
+  use crate::svndiff::deltas;
+  use std::num::NonZeroUsize;
   let length = u64::try_from(target.len()).map_err(|_| DriveFailure::corrupt())?;
   if source.is_empty() {
     return Ok(Window {
@@ -1776,14 +1701,116 @@ fn window_of(source: &[u8], target: &[u8]) -> Result<Window, DriveFailure> {
     .ok_or_else(DriveFailure::corrupt)
 }
 
-/// The window `txdelta_next_window` makes next of `file`'s `text`: its target piece's length, and
-/// its source piece's, viewed where the target piece starts, or where the source ended.
-fn begun_window(file: &FileFrame, text: &Text) -> Result<WindowWork, DriveFailure> {
+/// A text delta a drive is sending, as one step of its window takes it ([`window_unit`]).
+pub(crate) struct Delta<'a> {
+  /// The target text.
+  pub(crate) text: Text,
+  /// The text the delta applies to, if any.
+  pub(crate) source: Option<Text>,
+  /// How many bytes of the target the windows have sent.
+  pub(crate) sent: &'a mut u64,
+  /// Whether the delta's svndiff header is sent.
+  pub(crate) header_sent: &'a mut bool,
+}
+
+/// One step of a delta's next window, `txdelta_next_window`'s (A-751), for the update drive and the
+/// replay drive alike: the target's next piece of up to [`WINDOW_LIMIT`] bytes and the source's
+/// piece at the same place read, the window made by Subversion's deltifier ([`WindowMaking`]), or
+/// as new data once the source has run out, its view where the source ended, then its writes sent
+/// a piece at a time to `sink` (the write's length, the piece's start in it, the piece: a drive's
+/// [`Call::DeltaPiece`], a `get-file-revs` string), each part [`STEP_WORK`] at most a step. Once the
+/// window's last write is sent, `delta.sent` moves past it and `work` is empty again.
+pub(crate) fn window_unit<R: Repository + ?Sized>(
+  work_held: &mut Option<Box<WindowWork>>,
+  delta: Delta<'_>,
+  (encoding, repository): ((Version, Compression), &R),
+  sink: &mut dyn FnMut(usize, usize, Vec<u8>),
+) -> Result<(), DriveFailure> {
+  let mut work = match work_held.take() {
+    Some(work) => work,
+    None => Box::new(begun_window(*delta.sent, delta.source, &delta.text)?),
+  };
+  if work.target.len() < work.target_len {
+    let piece = (*delta.sent, work.target_len);
+    read_piece(repository, &delta.text, piece, &mut work.target)?;
+  } else if work.source.len() < work.source_len {
+    let source = delta.source.ok_or_else(DriveFailure::corrupt)?;
+    let piece = (work.view, work.source_len);
+    read_piece(repository, &source, piece, &mut work.source)?;
+  } else if work.making.as_ref().and_then(WindowMaking::made).is_none() {
+    make_window(&mut work, encoding)?;
+  } else if send_piece(&mut work, delta.header_sent, encoding.0, sink)? {
+    let length = u64::try_from(work.target_len).map_err(|_| DriveFailure::corrupt())?;
+    *delta.sent = delta.sent.saturating_add(length);
+    return Ok(());
+  }
+  *work_held = Some(work);
+  Ok(())
+}
+
+/// [`STEP_WORK`] units of the window's making, begun once both pieces are read.
+fn make_window(
+  work: &mut WindowWork,
+  (version, compression): (Version, Compression),
+) -> Result<(), DriveFailure> {
+  let making = match &mut work.making {
+    Some(making) => making,
+    None => work.making.insert(
+      WindowMaking::new(
+        (work.view, work.source_len),
+        work.target_len,
+        version,
+        compression,
+      )
+      .map_err(|_| DriveFailure::corrupt())?,
+    ),
+  };
+  making
+    .step(&work.source, &work.target, STEP_WORK)
+    .map_err(|_| DriveFailure::corrupt())?;
+  Ok(())
+}
+
+/// The made window's next piece, [`STEP_WORK`] bytes at most of its current write, the delta's
+/// header in its first write where it is owed. Whether the window's last write is sent.
+fn send_piece(
+  work: &mut WindowWork,
+  header_sent: &mut bool,
+  version: Version,
+  sink: &mut dyn FnMut(usize, usize, Vec<u8>),
+) -> Result<bool, DriveFailure> {
+  let made = work
+    .making
+    .as_ref()
+    .and_then(WindowMaking::made)
+    .ok_or_else(DriveFailure::corrupt)?;
+  let header = Encoder::new(version).header();
+  let owed = *work.header.get_or_insert(!*header_sent);
+  let writes = window_writes(&made, owed.then_some(&header[..]), version);
+  let Some(write) = writes.get(work.write) else {
+    return Ok(true);
+  };
+  let total = write.iter().map(|part| part.len()).sum::<usize>();
+  let piece = piece_of(write, work.at, STEP_WORK);
+  sink(total, work.at, piece);
+  *header_sent = true;
+  work.at = work.at.saturating_add(STEP_WORK).min(total);
+  if work.at >= total {
+    work.write = work.write.saturating_add(1);
+    work.at = 0;
+  }
+  Ok(work.write >= writes.len())
+}
+
+/// The window `txdelta_next_window` makes next of `text` with `sent` bytes of it sent: its target
+/// piece's length, and its source piece's, viewed where the target piece starts, or where the source
+/// ended.
+fn begun_window(sent: u64, source: Option<Text>, text: &Text) -> Result<WindowWork, DriveFailure> {
   let corrupt = |_| DriveFailure::corrupt();
   let target_len =
-    usize::try_from(text.size.saturating_sub(file.sent).min(WINDOW_LIMIT)).map_err(corrupt)?;
-  let source_size = file.source.map_or(0, |source| source.size);
-  let view = file.sent.min(source_size);
+    usize::try_from(text.size.saturating_sub(sent).min(WINDOW_LIMIT)).map_err(corrupt)?;
+  let source_size = source.map_or(0, |source| source.size);
+  let view = sent.min(source_size);
   let source_len =
     usize::try_from(source_size.saturating_sub(view).min(WINDOW_LIMIT)).map_err(corrupt)?;
   Ok(WindowWork {
@@ -1803,9 +1830,8 @@ fn begun_window(file: &FileFrame, text: &Text) -> Result<WindowWork, DriveFailur
 fn read_piece<R: Repository + ?Sized>(
   repository: &R,
   text: &Text,
-  offset: u64,
+  (offset, want): (u64, usize),
   piece: &mut Vec<u8>,
-  want: usize,
 ) -> Result<(), DriveFailure> {
   let at = u64::try_from(piece.len())
     .ok()
@@ -1874,28 +1900,4 @@ fn piece_of(parts: &[&[u8]], at: usize, most: usize) -> Vec<u8> {
     skip = 0;
   }
   piece
-}
-
-/// Up to [`WINDOW_LIMIT`] bytes of `text` from `offset`, gathered from the green's runs.
-fn read_window<R: Repository + ?Sized>(
-  repository: &R,
-  text: &Text,
-  offset: u64,
-) -> Result<Vec<u8>, DriveFailure> {
-  let left = text.size.saturating_sub(offset).min(WINDOW_LIMIT);
-  let want = usize::try_from(left).map_err(|_| DriveFailure::corrupt())?;
-  let mut window = Vec::with_capacity(want);
-  while window.len() < want {
-    let at = u64::try_from(window.len())
-      .ok()
-      .and_then(|read| offset.checked_add(read))
-      .ok_or_else(DriveFailure::corrupt)?;
-    let run = repository
-      .text(&text.identity, at)
-      .filter(|run| !run.is_empty())
-      .ok_or_else(DriveFailure::corrupt)?;
-    let take = run.len().min(want.saturating_sub(window.len()));
-    window.extend_from_slice(run.get(..take).ok_or_else(DriveFailure::corrupt)?);
-  }
-  Ok(window)
 }

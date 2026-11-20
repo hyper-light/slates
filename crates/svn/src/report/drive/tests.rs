@@ -523,15 +523,16 @@ fn a_changed_text_is_sent_as_a_delta_against_its_base() {
 
 /// The time no drive step may take: far past one of [`STEP_WORK`] units even in a debug build, far short of a whole
 /// window's making there (milliseconds).
-const STEP_BUDGET: std::time::Duration = std::time::Duration::from_micros(500);
+pub(super) const STEP_BUDGET: std::time::Duration = std::time::Duration::from_micros(500);
 
-/// How many timed runs the budget test makes: a step the machine took away from the test (a preemption) is not the
-/// drive's, so the run with the fewest steps past the budget is the one judged.
-const TIMED_RUNS: usize = 3;
+/// How many more times a step past [`STEP_BUDGET`] is timed again from its state before it: a step's time is the least
+/// of its timings, so time the machine took away from the test (a preemption, measured up to 3.6 ms under the suite's
+/// load) is not charged to it, while a step whose own work is past the budget stays past it every time.
+pub(super) const RETIMES: usize = 2;
 
 /// The svndiff stream the whole-window path made of `/trunk/big.txt` from its text at `from` to its text at `to`
 /// (`read_window`, `window_of`, `Encoder::window`): the bytes a drive's pieces must make.
-fn big_text_stream(
+pub(super) fn big_text_stream(
   (from, to): (Option<&[u8]>, &[u8]),
   (version, compression): (Version, Compression),
 ) -> Vec<u8> {
@@ -554,8 +555,8 @@ fn big_text_stream(
 
 /// A-751, main's red at the drive ("a large text's window driven with the past-budget counter at 0, and the bytes equal
 /// to the whole window's"). Do: drive `/trunk` from r5 to r6, where `big.txt` (6,000 lines, several windows) is edited,
-/// and from r4, where it is added, in version 0 and in version 2 with LZ4, a step a call, timing each call. Expect: in
-/// the best of [`TIMED_RUNS`] runs no call past [`STEP_BUDGET`]; `big.txt`'s delta the stream the whole-window path made,
+/// and from r4, where it is added, in version 0 and in version 2 with LZ4, a step a call, timing each call (a call past
+/// the budget timed again from its state before, [`RETIMES`]). Expect: no call past [`STEP_BUDGET`]; `big.txt`'s delta the stream the whole-window path made,
 /// byte for byte. Red before the change: a window was made and written in one step, milliseconds in a debug build.
 #[test]
 fn a_large_texts_windows_are_driven_with_no_step_past_its_budget() {
@@ -584,40 +585,41 @@ fn a_large_texts_windows_are_driven_with_no_step_past_its_budget() {
   for (from, base) in [(5, Some(text_at(5))), (4, None)] {
     for encoding in encodings {
       let expected = big_text_stream((base.as_deref(), &text_at(6)), encoding);
-      let mut runs = Vec::new();
-      for _ in 0..TIMED_RUNS {
-        let mut drive =
-          Drive::new(trunk_report(from, 6, false), b"u").with_encoding(encoding.0, encoding.1);
-        let (mut past, mut longest, mut streams) = (0usize, std::time::Duration::ZERO, Vec::new());
-        let mut stream: Option<Vec<u8>> = None;
-        loop {
-          let began = std::time::Instant::now();
-          let next = drive.next(&sources, 1);
-          let took = began.elapsed();
-          longest = longest.max(took);
-          past += usize::from(took > STEP_BUDGET);
-          match next {
-            Next::Ended => break,
-            Next::Call(Call::ApplyTextDelta { .. }) => stream = Some(Vec::new()),
-            Next::Call(Call::DeltaPiece { bytes, .. }) => {
-              stream.as_mut().unwrap().extend_from_slice(bytes)
-            }
-            Next::Call(Call::TextDeltaEnd) => streams.push(stream.take().unwrap()),
-            _ => {}
+      let mut drive =
+        Drive::new(trunk_report(from, 6, false), b"u").with_encoding(encoding.0, encoding.1);
+      let (mut past, mut longest, mut streams) = (0usize, std::time::Duration::ZERO, Vec::new());
+      let mut stream: Option<Vec<u8>> = None;
+      loop {
+        let before = drive.clone();
+        let began = std::time::Instant::now();
+        let next = drive.next(&sources, 1);
+        let mut took = began.elapsed();
+        for _ in 0..RETIMES {
+          if took <= STEP_BUDGET {
+            break;
           }
+          let mut again = before.clone();
+          let began = std::time::Instant::now();
+          let _ = again.next(&sources, 1);
+          took = took.min(began.elapsed());
         }
-        assert!(
-          streams.contains(&expected),
-          "r{from}, {encoding:?}: big.txt's stream"
-        );
-        runs.push((past, longest));
+        longest = longest.max(took);
+        past += usize::from(took > STEP_BUDGET);
+        match next {
+          Next::Ended => break,
+          Next::Call(Call::ApplyTextDelta { .. }) => stream = Some(Vec::new()),
+          Next::Call(Call::DeltaPiece { bytes, .. }) => {
+            stream.as_mut().unwrap().extend_from_slice(bytes)
+          }
+          Next::Call(Call::TextDeltaEnd) => streams.push(stream.take().unwrap()),
+          _ => {}
+        }
       }
-      let fewest = runs.iter().map(|(past, _)| *past).min();
-      assert_eq!(
-        fewest,
-        Some(0),
-        "r{from}, {encoding:?}: (past, longest) {runs:?}"
+      assert!(
+        streams.contains(&expected),
+        "r{from}, {encoding:?}: big.txt's stream"
       );
+      assert_eq!(past, 0, "r{from}, {encoding:?}: longest step {longest:?}");
     }
   }
 }

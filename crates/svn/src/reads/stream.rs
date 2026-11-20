@@ -20,6 +20,7 @@ use super::segments::SegmentStream;
 use super::{Reads, Repository, Session};
 use crate::index::Index;
 use crate::ra_svn::ItemError;
+use crate::report::exchange::Budget;
 
 /// What remains of a streaming answer after its head.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,8 +93,8 @@ impl Stream {
     }
   }
 
-  /// Writes the answer's next items into `out`, until what this slice wrote and visited reaches `room` or the answer is
-  /// whole; at least one step.
+  /// Writes the answer's next items into `out`, until what this slice wrote and visited reaches the budget's room or the
+  /// answer is whole; at least one step; `get-file-revs` within the budget's quantum too (A-751).
   ///
   /// # Errors
   /// [`ItemError`] when an item cannot be written, which no item here can give: every word written is the protocol's.
@@ -103,8 +104,9 @@ impl Stream {
     repository: &R,
     session: &Session<'_>,
     out: &mut Vec<u8>,
-    room: usize,
+    budget: Budget,
   ) -> Result<Progress, ItemError> {
+    let room = budget.room;
     let mut reads = Reads {
       index,
       repository,
@@ -119,7 +121,7 @@ impl Stream {
       Rest::List(list) => list.resume(&mut reads, room),
       Rest::Segments(segments) => segments.resume(&mut reads, room),
       Rest::Log(log) => log.resume(&mut reads, room),
-      Rest::FileRevs(revisions) => revisions.resume(&mut reads, room),
+      Rest::FileRevs(revisions) => revisions.resume(&mut reads, budget),
     }
   }
 }

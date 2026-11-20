@@ -1661,13 +1661,7 @@ impl Connection {
     let authentication = established.reads_authentication(&sources.policy);
     let session = established.reads_session(&sources.policy, authentication);
     let progress = stream
-      .resume(
-        sources.index,
-        sources.repository,
-        &session,
-        out,
-        budget.room,
-      )
+      .resume(sources.index, sources.repository, &session, out, budget)
       .map_err(Refused::Item)?;
     self.phase = match progress {
       reads::Progress::More => Phase::Streaming(established, stream),
