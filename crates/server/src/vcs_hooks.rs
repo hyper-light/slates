@@ -60,6 +60,10 @@
 //! its client (§2 ban 9: no task without an owner); git lets a `post-receive` run on after its client has gone, and a
 //! notification that must outlive its push belongs to a repository's own queue (§4.17.3's observing hooks), not here.
 
+use std::collections::BTreeMap;
+
+use slates_db::catalog::{HookConfig, RepositoryId, RepositoryPolicy};
+
 use crate::learned_wait::LearnedWait;
 
 /// When a hook runs.
@@ -1254,6 +1258,76 @@ impl Lesson {
   }
 }
 
+/// Every configured hook's learned times on this shard (A-622's table; A-665 part 4b): one [`HookTimes`] a hook, named
+/// by its repository and its name (git and Subversion keep one hook a point, named for it; Mercurial's names tell its
+/// hooks at a point apart), kept with the program it learned from, so a hook configured to run another program starts
+/// unlearned. A run's lesson is taught as it ends, and the times of hooks its repository's policy no longer configures
+/// are dropped then, so the table holds at most the hooks configured on the repositories whose hooks ran here.
+#[derive(Debug, Default)]
+pub(crate) struct HookTimesTable {
+  /// Each hook's times, by its repository and its name.
+  hooks: BTreeMap<(RepositoryId, String), Learned>,
+}
+
+/// One hook's times, and the program they were learned from.
+#[derive(Debug)]
+struct Learned {
+  /// The program its runs ran.
+  program: String,
+  /// What they taught.
+  times: HookTimes,
+}
+
+impl HookTimesTable {
+  /// The bound `repository`'s `hook` is held to (`HookTimes::bound_ns`): none before a run of its program finished.
+  pub(crate) fn bound_ns(&self, repository: RepositoryId, hook: &HookConfig) -> Option<u64> {
+    self.times(repository, hook).and_then(HookTimes::bound_ns)
+  }
+
+  /// What `repository`'s `hook` has learned from its program's runs, if any ran.
+  pub(crate) fn times(&self, repository: RepositoryId, hook: &HookConfig) -> Option<&HookTimes> {
+    self
+      .hooks
+      .get(&(repository, hook.name.clone()))
+      .filter(|learned| learned.program == hook.program)
+      .map(|learned| &learned.times)
+  }
+
+  /// Teaches `repository`'s `hook`, as `policy` configures it, what one of its runs showed (the type's doc).
+  pub(crate) fn teach(
+    &mut self,
+    repository: RepositoryId,
+    policy: &RepositoryPolicy,
+    hook: &HookConfig,
+    lesson: Lesson,
+  ) {
+    let unconfigured: Vec<(RepositoryId, String)> = self
+      .hooks
+      .range((repository, String::new())..)
+      .take_while(|((of, _), _)| *of == repository)
+      .filter(|((_, name), _)| !policy.hooks.iter().any(|kept| kept.name == *name))
+      .map(|(key, _)| key.clone())
+      .collect();
+    for key in unconfigured {
+      self.hooks.remove(&key);
+    }
+    let learned = self
+      .hooks
+      .entry((repository, hook.name.clone()))
+      .or_insert_with(|| Learned {
+        program: hook.program.clone(),
+        times: HookTimes::default(),
+      });
+    if learned.program != hook.program {
+      *learned = Learned {
+        program: hook.program.clone(),
+        times: HookTimes::default(),
+      };
+    }
+    lesson.teach(&mut learned.times);
+  }
+}
+
 /// How a hook's process ended, as its driver reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExitStatus {
@@ -1605,12 +1679,12 @@ mod tests {
 
   use super::{
     Changegroup, CommittedView, EnvValue, Event, ExitStatus, HookDirectory, HookInput, HookPoint,
-    HookRun, HookTimes, LockToken, Outcome, PendingView, Phase, RefUpdate, RevpropAction,
-    RevpropChange, StartRefused, Step, SvnError, SvnHooksEnv, SvnLockToken, SvnTold, Unconfigured,
-    View, Words, WordsFrom, git_post_receive, git_pre_receive, git_update, hg_changegroup,
-    hg_pretxnchangegroup, svn_lock_token, svn_post_commit, svn_post_lock, svn_post_revprop_change,
-    svn_post_unlock, svn_pre_commit, svn_pre_lock, svn_pre_revprop_change, svn_pre_unlock,
-    svn_start_commit, svn_told, svn_told_unconfigured,
+    HookRun, HookTimes, HookTimesTable, Lesson, LockToken, Outcome, PendingView, Phase, RefUpdate,
+    RevpropAction, RevpropChange, StartRefused, Step, SvnError, SvnHooksEnv, SvnLockToken, SvnTold,
+    Unconfigured, View, Words, WordsFrom, git_post_receive, git_pre_receive, git_update,
+    hg_changegroup, hg_pretxnchangegroup, svn_lock_token, svn_post_commit, svn_post_lock,
+    svn_post_revprop_change, svn_post_unlock, svn_pre_commit, svn_pre_lock, svn_pre_revprop_change,
+    svn_pre_unlock, svn_start_commit, svn_told, svn_told_unconfigured,
   };
   use crate::daemon::LIVENESS_BUDGET_NS;
 
@@ -3381,5 +3455,59 @@ mod tests {
       told!("lock-token-from-the-hook"),
       b"25:opaquelocktoken:fixture-b "
     ));
+  }
+
+  /// A hook named `name` at git's `pre-receive`, running `program`.
+  fn configured_hook(name: &str, program: &str) -> slates_db::catalog::HookConfig {
+    slates_db::catalog::HookConfig {
+      point: slates_db::catalog::HookPointName::GitPreReceive,
+      name: name.to_owned(),
+      program: program.to_owned(),
+    }
+  }
+
+  /// What `table` has learned of `repository`'s `hook`: its finished runs and its bound.
+  fn learned_of(
+    table: &HookTimesTable,
+    repository: slates_db::catalog::RepositoryId,
+    hook: &slates_db::catalog::HookConfig,
+  ) -> (Option<u64>, Option<u64>) {
+    (
+      table.times(repository, hook).map(HookTimes::finished_runs),
+      table.bound_ns(repository, hook),
+    )
+  }
+
+  /// A-665 part 4b (A-622's table of learned times). Do: teach a repository's hook one finished
+  /// run; then reconfigure it to run another program; then teach another hook under a policy that
+  /// no longer configures the first. Expect: the first hook learned a bound past the run's length,
+  /// another repository's hook of the same name nothing; the reconfigured hook starts unlearned;
+  /// the hook its policy dropped is forgotten.
+  #[test]
+  fn t_a665_a_hooks_times_are_its_own_program_on_its_own_repository() {
+    let repository = slates_db::catalog::RepositoryId { bytes: [1; 16] };
+    let other = slates_db::catalog::RepositoryId { bytes: [2; 16] };
+    let first = configured_hook("pre-receive", "/hooks/check");
+    let second = configured_hook("update", "/hooks/update");
+    let finished = Lesson {
+      ran_ns: Some(QUICK_NS),
+      cut: false,
+    };
+    let mut policy = slates_db::catalog::RepositoryPolicy {
+      hooks: vec![first.clone(), second.clone()],
+      ..Default::default()
+    };
+    let mut table = HookTimesTable::default();
+    table.teach(repository, &policy, &first, finished);
+    let (runs, bound) = learned_of(&table, repository, &first);
+    assert_eq!(runs, Some(1));
+    assert!(bound.is_some_and(|bound| bound > QUICK_NS), "{bound:?}");
+    assert_eq!(learned_of(&table, other, &first), (None, None));
+    let moved = configured_hook("pre-receive", "/hooks/another");
+    assert_eq!(learned_of(&table, repository, &moved), (None, None));
+    policy.hooks = vec![second.clone()];
+    table.teach(repository, &policy, &second, finished);
+    assert_eq!(learned_of(&table, repository, &first), (None, None));
+    assert_eq!(learned_of(&table, repository, &second).0, Some(1));
   }
 }

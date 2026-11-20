@@ -34,8 +34,11 @@
 //! refs as they stood before the push, where git moves each ref right after its hook (without
 //! `atomic`), so a later command's hook there sees an earlier ref moved. The band-2 lines of
 //! commands refused otherwise (the policy's, the verdicts') follow every hook's words, where git
-//! interleaves them command by command. The hooks' learned times are owed (A-622's list): a run is
-//! bounded by its client alone.
+//! interleaves them command by command.
+//!
+//! **How long a hook may take.** Each run is held to the bound its hook has learned on the owner
+//! shard (`ShardState::hook_times`, A-665 part 4b), none before a run of it finished, and taught
+//! what it showed as its answer comes back; it ends too when its client goes (the edge's signal).
 
 use std::path::PathBuf;
 
@@ -78,6 +81,17 @@ enum At {
   Update(usize),
   /// `post-receive`.
   PostReceive,
+}
+
+impl At {
+  /// The hook point it is.
+  fn point(&self) -> HookPoint {
+    match self {
+      At::PreReceive => HookPoint::GitPreReceive,
+      At::Update(_) => HookPoint::GitUpdate,
+      At::PostReceive => HookPoint::GitPostReceive,
+    }
+  }
 }
 
 /// A hook's view under way, and where it is shown once sealed.
@@ -146,18 +160,20 @@ pub(crate) struct HookCall {
   input: HookInput,
   /// How many bytes of the hook's words are kept: what the push may still hold.
   words_cap: usize,
+  /// The bound its hook has learned on this shard, none before a run of it finished.
+  bound_ns: Option<u64>,
 }
 
 impl HookCall {
-  /// Runs the hook until it ends or `client_gone` resolves (A-622 part 3's driver, with no learned
-  /// bound: the module docs).
+  /// Runs the hook until it ends, runs past its learned bound or `client_gone` resolves (A-622
+  /// part 3's driver: the module docs).
   pub(crate) async fn run(self, client_gone: impl core::future::Future<Output = ()>) -> HookAnswer {
     let site = GitHookSite {
       policy: &self.policy,
       view: &self.presented,
       words_cap: self.words_cap,
     };
-    HookAnswer(run(&site, &self.input, None, client_gone).await)
+    HookAnswer(run(&site, &self.input, self.bound_ns, client_gone).await)
   }
 }
 
@@ -278,14 +294,43 @@ impl PushHooks {
     }
   }
 
-  /// The run of the hook at `input`'s point in `presented`, its words kept up to `words_cap`.
-  fn call(&self, presented: Presented, input: HookInput, words_cap: usize) -> HookCall {
+  /// The run of `repository`'s hook at `input`'s point in `presented`, its words kept up to
+  /// `words_cap`, held to the bound it has learned on this shard (`state`'s `hook_times`).
+  fn call(
+    &self,
+    (state, repository): (&ShardState, RepositoryId),
+    presented: Presented,
+    input: HookInput,
+    words_cap: usize,
+  ) -> HookCall {
+    let bound_ns = configured(&self.policy, input.point)
+      .and_then(|hook| state.hook_times.bound_ns(repository, hook));
     HookCall {
       policy: self.policy.clone(),
       presented,
       input,
       words_cap,
+      bound_ns,
     }
+  }
+
+  /// Teaches the shard's times of `repository`'s hook at `point` what its run, `answer`, showed:
+  /// nothing where no hook ran.
+  fn learn(
+    &self,
+    (state, repository): (&mut ShardState, RepositoryId),
+    point: HookPoint,
+    answer: &HookAnswer,
+  ) {
+    let Ok(ran) = &answer.0 else {
+      return;
+    };
+    let (Some(lesson), Some(hook)) = (ran.lesson, configured(&self.policy, point)) else {
+      return;
+    };
+    state
+      .hook_times
+      .teach(repository, &self.policy, hook, lesson);
   }
 
   /// Whether a hook is configured at `point`.
@@ -319,9 +364,12 @@ pub(super) fn before<P: PresentView>(
       }
       Turn::Shown(presented) => {
         if let Some(input) = input_before(&hooking.hooks) {
-          let call = hooking
-            .hooks
-            .call(presented, input, room_of(&push.admission));
+          let call = hooking.hooks.call(
+            (&*state, repository),
+            presented,
+            input,
+            room_of(&push.admission),
+          );
           push.answer = AnswerState::Hooking(Box::new(hooking));
           return Ok(Answering::Hook(call));
         }
@@ -478,9 +526,12 @@ pub(super) fn observe<P: PresentView>(
     Turn::Shown(presented) => {
       let view = CommittedView(observing.hooks.views);
       let input = git_post_receive(view, &applied, Some(&observing.hooks.options));
-      let call = observing
-        .hooks
-        .call(presented, input, room_of(&push.admission));
+      let call = observing.hooks.call(
+        (&*state, push.repository),
+        presented,
+        input,
+        room_of(&push.admission),
+      );
       push.answer = AnswerState::Observing(Box::new(observing));
       Ok(Answering::Hook(call))
     }
@@ -510,12 +561,21 @@ pub(super) fn ran<P: PresentView>(
   match core::mem::replace(&mut push.answer, AnswerState::Done) {
     AnswerState::Hooking(mut hooking) => {
       hooking.hooks.close(state, &mut push.presenter);
+      let point = hooking.hooks.at.point();
+      hooking
+        .hooks
+        .learn((&mut *state, push.repository), point, &answer);
       decided(&mut hooking, &mut push.admission, answer, out);
       push.answer = AnswerState::Hooking(hooking);
       Ok(())
     }
     AnswerState::Observing(mut observing) => {
       observing.hooks.close(state, &mut push.presenter);
+      observing.hooks.learn(
+        (&mut *state, push.repository),
+        HookPoint::GitPostReceive,
+        &answer,
+      );
       let (through, said) = judged(answer, HookPoint::GitPostReceive);
       if !through {
         state.count(POST_RECEIVE_UNACCEPTED, 1);
@@ -543,12 +603,7 @@ fn decided(
   answer: HookAnswer,
   out: &mut impl Out,
 ) {
-  let point = match hooking.hooks.at {
-    At::PreReceive => HookPoint::GitPreReceive,
-    At::Update(_) => HookPoint::GitUpdate,
-    At::PostReceive => HookPoint::GitPostReceive,
-  };
-  let (through, said) = judged(answer, point);
+  let (through, said) = judged(answer, hooking.hooks.at.point());
   if through {
     relay((&hooking.hooks.requested, admission), &said.hook_words, out);
   } else {

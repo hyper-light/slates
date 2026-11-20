@@ -4893,6 +4893,7 @@ async fn init_shard(
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
     vcs_stores: crate::vcs_store::VcsStores::default(),
+    hook_times: crate::vcs_hooks::HookTimesTable::default(),
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),
   };

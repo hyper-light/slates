@@ -832,7 +832,8 @@ fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothin
 /// Expect: `main` applied and holding the first text, one record appended; on band 2,
 /// `pre-receive`'s line naming the create, then `update`'s naming the ref and its two ids, before
 /// the report on band 1, then `post-receive`'s lines after it, its view's `packed-refs` naming
-/// `main` at the pushed commit: it ran after the update; three views shown and withdrawn.
+/// `main` at the pushed commit: it ran after the update; three views shown and withdrawn; each hook's
+/// one run taught the shard's table of learned times (A-665 part 4b).
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update() {
@@ -855,6 +856,7 @@ fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update
   let repository = hooked_repository(&daemon, "accepted", &[&pre, &update, &post]);
   let driven = pushed_with_hooks(&daemon, repository, scenario!("create").request);
   let held = held(&daemon, repository, "main");
+  let learned = finished_runs(&daemon, repository, &[&pre, &update, &post]);
   daemon.stop();
   let (answer, received, shown) = driven.unwrap();
   assert_eq!(reasons(&received), [b"ok"]);
@@ -872,6 +874,31 @@ fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update
   );
   assert_report_between_the_hooks(&answer);
   assert_eq!(shown, (3, 3));
+  assert_eq!(learned, [Some(1); 3], "each hook learned its one run");
+}
+
+/// How many finished runs the shard's table of learned times (A-665 part 4b) holds for each of
+/// `repository`'s `hooks` on `daemon`'s shard; none for a hook it holds nothing of.
+#[cfg(unix)]
+fn finished_runs(
+  daemon: &crate::Daemon,
+  repository: RepositoryId,
+  hooks: &[&Script],
+) -> Vec<Option<u64>> {
+  let names: Vec<String> = hooks.iter().map(|hook| hook.config.name.clone()).collect();
+  crate::daemon::observe_first(daemon, move |state| {
+    let record = super::record_of(state, repository).expect("the repository's record");
+    names
+      .iter()
+      .map(|name| {
+        let hook = record.policy.hooks.iter().find(|hook| hook.name == *name)?;
+        state
+          .hook_times
+          .times(repository, hook)
+          .map(crate::vcs_hooks::HookTimes::finished_runs)
+      })
+      .collect()
+  })
 }
 
 /// Asserts that `answer`'s report, on band 1, comes after two band-2 packets (`pre-receive`'s and

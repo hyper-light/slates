@@ -26,7 +26,7 @@ use super::{
 };
 use crate::lfs::LfsCall;
 use crate::vcs_http::daemon_edge::ShardLfs;
-use crate::vcs_http::{Answer, Decided, Exchange, Failed, Site};
+use crate::vcs_http::{Answer, ClientGone, Decided, Exchange, Failed, Site};
 
 /// Shape: room enough for every head these tests send.
 const ROOM: u64 = 1 << 20;
@@ -70,7 +70,7 @@ impl Exchange for NoExchange {
     match *self {}
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
     match *self {}
   }
 
@@ -201,7 +201,7 @@ impl Exchange for Scripted {
     Ok(())
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
     self.reply = Some(format!("took {}", self.took).into_bytes());
     Ok(())
   }
@@ -533,7 +533,7 @@ fn a_service_request_streams_its_body_to_the_service_and_its_reply_back() {
     .collect();
   assert_eq!((fields, head_only, proven), (result, false, true));
   ready(exchange.body(b"abc")).unwrap();
-  ready(exchange.body_end()).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
   assert_eq!(replies(&mut exchange), [b"took 3".to_vec()]);
 }
 
@@ -687,7 +687,7 @@ fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
     &[OWNER_BEARER, "Git-Protocol: version=2"],
   );
   let (_, _, mut exchange, _) = served(ready(site.answer(&head(&advertise), true)));
-  ready(exchange.body_end()).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
   let advertisement = replies(&mut exchange).concat();
   assert!(
     advertisement.starts_with(b"000eversion 2\n"),
@@ -712,7 +712,7 @@ fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
   );
   let (_, _, mut exchange, _) = served(ready(site.answer(&head(&post), true)));
   ready(exchange.body(ls_refs)).unwrap();
-  ready(exchange.body_end()).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
   assert_eq!(replies(&mut exchange).concat(), b"0000");
 }
 
@@ -734,7 +734,7 @@ fn a_request_upload_pack_refuses_is_answered_in_gits_words() {
   );
   let (_, _, mut exchange, proven) = served(ready(site.answer(&head(&post), true)));
   ready(exchange.body(garbage)).unwrap();
-  ready(exchange.body_end()).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
   let answer = replies(&mut exchange).concat();
   assert!(proven);
   assert!(
@@ -1030,7 +1030,7 @@ fn a_served_lfs_request_is_answered_after_its_body_with_its_services_status_and_
   for run in [&b"{\"path\":"[..], &b"\"a.bin\"}"[..]] {
     ready(exchange.body(run)).unwrap();
   }
-  ready(exchange.body_end()).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
   let said = (
     exchange.reply_status(),
     ready(exchange.reply_fields()).unwrap(),

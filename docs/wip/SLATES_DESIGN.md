@@ -13295,8 +13295,10 @@ engine: the verdict, rebase, position mapping, the register).
 > with each one's words in git's order and `post-receive` reading the moved ref in its view's `packed-refs`, a refusing
 > `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
 > with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
-> and `protected_fixtures` 49 of 49, fmt clean). Owed: the read-only attachment; the
-> edges' signal of a client gone, which ends a hook's run; the hooks' learned times; seals kept as derived data.
+> and `protected_fixtures` 49 of 49, fmt clean). The HTTP edge's signal of a client gone ends a hook's run (A-665 part
+> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended). Each hook's run
+> is held to the bound it learned on the owner shard and teaches it as it ends (A-665 part 4b, `ShardState::hook_times`).
+> Owed: the read-only attachment; the SSH edge's signal; seals kept as derived data.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -38031,6 +38033,8 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 - **Owed.** The lineage model's mirror of the rule and its own oracle (a live owner's copy let go only while a record at
   least as new is on `f + 1` members), main's to compile and run beyond its default cases; the content release signal
   (a successor confirms once its adopted content is re-placed, a settle certifies content too); the Lineage.tla text.
+  (Status 2026-11-19: the mirror and its oracle are built, A-707; the content release signal is A-529, A-538 and A-546;
+  the text is A-518.)
 
 ### A-502 — The owner feeds a turn's changes to each replica's shard in one message after the turn's replies, and each replica acknowledges a turn once (2026-11-18, goal 87 via g083; A-273; §4.16 "Rebase off the owner"; A-457, A-465, A-473)
 
@@ -53951,6 +53955,58 @@ and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `c
   their snapshot); `slates-server` `repository::tests::a_repository_and_every_green_made_for_it_share_one_line` (a
   repository, its root and branches on one line; an adopted lone green's repository on its own).
 - **Owed.** The server's takeover adopting a repository's logs and records whole (2c).
+
+### A-707 — The lineage model judges a live owner's settled-away copy and the narrowed round (2026-11-19, UI goal 84 (kiln d9f7a795, w-unresolved); §4.8 "Promotion and takeover"; A-508's and A-556's owed model mirror; A-272 (ii), A-309)
+
+`crates/db/tests/lineage_model.rs`, the executable counterpart of `docs/wip/models/Lineage.tla`, ran neither rule the
+server has run since A-508 and A-556: its live branch let a copy go only on a confirmation, and its round waited on
+every recovery cohort.
+- **The settle rule.** A copy routed to its live writer with no confirmation to judge, held outside all of that owner's
+  neighbourhoods, goes where `RegionalConfiguration::settled_away` holds, and is kept and counted otherwise, as
+  `takeover::settle_away` does.
+- **Its oracle.** Such a release has no adoption to make the copy stale, so A-309's oracle cannot judge it. It is held
+  to the guarantee the rule rests on, `Lineage.tla`'s `SettleKeepsFPlusOne`: where the copy's record was placed, `f + 1`
+  other members hold a record at least as new (a later adoption, or the same adoption at that sequence or after).
+- **The narrowed wait.** The round judges readiness on `readiness_cohorts` and `readiness_current_cohorts`, as the
+  server's round does, so A-556's narrowing is judged by A-309's oracle on every generated history.
+- **Non-vacuity.** Two new verdicts, `reclaimed_settled_away` and `kept_outside`, must each be reached over the fixed
+  seeds.
+
+Applied in the same change to: A-508's owed line (status), GAPS (A-272 (ii)'s A-508 line), the model's module doc.
+
+- **Evidence.** macOS arm64, this Mac, local, 2026-11-19: `cargo test --locked -p slates-db --test lineage_model` 4 of
+  4. Over the 400 fixed seeds: `reclaimed_settled_away` 72, `kept_outside` 2,526, `reclaimed_confirmed` 114,
+  `reclaimed_unasked` 2, `adopted` 764 (242 past tolerance), `completed` 638, no violation. `cargo fmt -p slates-db --
+  --check` clean.
+- **Owed (main's).** The model beyond its default cases (`PROPTEST_CASES`); clippy for the test target.
+
+### A-665 part 4a — The HTTP edge tells a hook's run its client has gone (2026-11-20, w-git for UI goal 93; §4.17.2 "Hooks, in git's terms")
+- **Change.** `Exchange::body_end` takes `vcs_http::ClientGone`, the connection's socket watched once the request's
+  body has ended: its end of stream or a reset resolves it; bytes queued there (a pipelined request, a TLS record such as
+  `close_notify`) leave it unknown and are left for the edge, nothing consumed. git's receive-pack hands it to each
+  hook's run (`git_push`'s `HookCall::run`), so a hook whose client went is ended and what it would have judged refused,
+  in place of `pending()`.
+- **Tests.** `vcs_http::tests::serve::a_service_answering_after_the_body_learns_its_client_has_gone`: quiet while the
+  client waits for its answer, resolved once it closes.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_http::tests::
+  vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, the new test named in the output; fmt clean on the changed files.
+- **Owed.** The SSH edge's signal (the channel's close); a TLS client that sends `close_notify` before it closes is not
+  seen gone; the hooks' learned times; the daemon's presenter (A-665 part 4, main's ruling: the read-only view volume).
+
+### A-665 part 4b — A git hook's run is held to the times its hook learned (2026-11-20, w-git for UI goal 93; §4.17.1 "Policy", A-622's table)
+- **Change.** `vcs_hooks::HookTimesTable` on each shard (`ShardState::hook_times`): one `HookTimes` per configured
+  hook, keyed by its repository and name, kept with the program it learned from (a hook set to run another program
+  starts unlearned); the times of hooks the repository's policy no longer configures are dropped as a run teaches.
+  git's push driver hands each hook call the bound its hook learned (none before a run finished) and teaches the run's
+  lesson as its answer comes back (`git_push`'s `PushHooks::{call, learn}`), so a hook past its learned bound is
+  ended and what it would have judged refused, `ran past its bound`.
+- **Tests.** `vcs_hooks::tests::t_a665_a_hooks_times_are_its_own_program_on_its_own_repository`;
+  `git_push::tests::t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` (each of its three
+  hooks taught one finished run).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_http::tests::
+  vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, both tests named in the output; fmt clean on the changed files.
+- **Owed.** Forgetting a removed repository's hooks (the table drops them only as one of its hooks runs); Subversion's
+  and Mercurial's callers reading and teaching the same table; the daemon's presenter (A-665 part 4).
 
 ### A-636 part 2c-1 — A repository's record is its own register: shipped to its family's candidates at each change and adopted by its successor (2026-11-20, w-shared for UI goal 93)
 - **Why.** 2c's successor rebuilds a repository from what it holds as a holder, and nothing shipped a repository's own
