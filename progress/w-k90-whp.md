@@ -40,5 +40,17 @@ progress/w-k90-microvm.md, progress/w-k90-kvm.md, g262's W8 notes, run-requests 
 - r1/r2 never placed (Mac links down); r3 (adas-macbook-pro-2, fmt + 2 slates_e2e checks + lib w8_p4_, KILN_SHARDS=lint)
   running ~17:20Z.
 
+## LANDED 2026-11-20 ~09:32 PST on kiln main (merge-base checked): 7aac3c730 (piece 5 + whp-drive.yml), 4f9992f42
+(piece 4), merge 72e6daa92 over main 842cc2c2f, ac1a78f64 (ci.yml Windows Slates job --skip microvm::), 0a17f46e5 (YAML
+fix: ac1a78f64's plain scalar broke ci.yml parse ~1 min: GitHub runs 44784109897, 44784124403 failed at 0 s).
+- Red that drove piece 4: GitHub 44773050371 (7aac3c730, windows-2025, HypervisorPresent True): drive compiled and ran
+  (1 test; 31 min build), runner said microVMs yes, then failed "gives agents no Slates volume of their own: ... WinFsp is
+  not installed (SLATES_E2E=1 requires one)". Log ~/.cache/w-k90-whp-logs/gh-44773050371.log (this MacBook).
+- Green focused tests: kiln r5 (adas-mac-studio-3, clone of 4f9992f42, KILN_SHARDS=lint): checks::g266_a_sessions_host_mounts...,
+  checks::g266_kilns_word_on_a_runners_workspaces... 2/2; lib api::tests::w8_p4_... 1/1. kiln AGENTS.md: no tree-wide
+  cargo fmt (clippy is the check); clippy on 3 OSes owed (main's gate).
+- Running: GitHub whp drive 44784112194 on main ac1a78f64. Next: read it; piece 3 if DAX reads fail EACCES.
+- Inbox note left for w-k90-win (its ci.yml step changed).
+
 ## For main to delete
 - (none)
