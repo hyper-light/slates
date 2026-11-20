@@ -129,3 +129,9 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
 - PIECE 5 DONE per main's criteria. Owed (GAPS): LOCK/UNLOCK + commit lock tokens (lock test still ignored); reports
   file-revs (blame), diff's, mergeinfo (merge); PUT body whole in room; abandoned txn expiry.
 - Next: tell main; ask nothing; continue queue: re-run hg/git matrices when w-hg/w-git push-spin fixes land; monitor.
+
+## Piece 6 (main ~08:30Z): (1) HTTP LOCK/UNLOCK + commit lock tokens; (2) PUT streamed; (3) abandoned txn deadline
+- (1) written: commit Drive::present_lock/keep_locks; DavCommit::present/keep_locks/if_tokens (+test); server
+  CommitHeaders(If, X-SVN-Options, Timeout, Lock-Token, version_text), LOCK/UNLOCK via SvnStores::lock_verb
+  (ServedRecords lands Record::Locks), MERGE presents lock-token-list + keep-locks; lock test un-ignored.
+  Scratch agents/w-interop-locks. Files told to main (w-reaper takes blame/diff/mergeinfo reports).

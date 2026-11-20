@@ -1017,3 +1017,4 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   8c1feae15 (usage per repository, §4.17.5) + P2 4bbf7f4ba (share division, weighted DRF); w-interop A-681 B 7f81be683
   (update-report) + C d858d1904 (HTTPv2 commits): SVN OVER HTTP PROVEN, matrix HTTP 23/27, svn:// 26/27. w-perf A-716
   1a 5efce021a (held.rs). w-interop next: HTTP locks, streamed PUT, abandoned txn deadline.
+- ~03:10 PST check: all 16 w-* agents working (w-fed-faults building piece 3 locally; its Linux run r9 queued behind adacachy's stuck kiln CI, whose stale-run cancels wait on Ada's click). Disks: Mac 93 GiB, Studio-2 89, Studio-4 128, big Studio 1.2 TiB.
