@@ -21110,10 +21110,9 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
   let told_before = told(&daemon_b);
   let destroyed = holder.call(&RequestBody::Destroy { volume: work });
   let both = [&daemon_a, &daemon_b];
+  // B counts the move once A's answer is back, which may be after A dropped the floor: both are waited for.
   let dropped = poll_until(&both, PLACEMENT_DEADLINE, || {
-    daemon_a
-      .work_floor(green, work)
-      .map(|floor| floor.is_none())
+    Ok(daemon_a.work_floor(green, work)?.is_none() && told(&daemon_b) > told_before)
   });
   let told_after = told(&daemon_b);
   daemon_b.serve_works_on_holders(false).unwrap();
@@ -21197,6 +21196,129 @@ fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_posi
   );
   assert_eq!(works_bytes, greens_bytes, "B's work, based on it, reads it");
   assert!(floor_rose, "A's floor for the work rose to its new base");
+}
+
+/// A-697 part d (a holder's submit settles once its replica holds the version): in a three-node `f = 1` fleet (every
+/// node a holder, a quorum of two), A owns a green at version 1 (`f` holding "hello"), which B and C replicate; B serves
+/// works over greens A owns (the test hook) and makes one at base 1. Do: B withholds every merge record (A commits with
+/// C alone); B's work edits `f` and submits; once B holds the owner's answer for a version its replica lacks, B takes
+/// records again. Expect: the submit answered `Submitted` at version 2 only after B's replica took version 2 (B's two
+/// counters, held and settled, each moved), and B's work then reads "hello world" on its new base.
+#[test]
+fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committed() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let (daemon_a, daemon_b, daemon_c) = (&daemons[0], &daemons[1], &daemons[2]);
+  let (green, owners_work) = green_and_work_on(daemon_a.instance(), &[daemon_b]);
+  let mut owner = Client::connect(daemon_a.instance());
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let replicated = poll_until(&all, PLACEMENT_DEADLINE, || {
+    Ok(
+      daemon_b.merge_holder_state(green)?.version == Some(1)
+        && daemon_c.merge_holder_state(green)?.version == Some(1),
+    )
+  });
+  assert!(replicated, "B and C replicate the green at version 1");
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  let edited = holder.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 5,
+    delete_len: 0,
+    bytes: b" world".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let count = |daemon: &Daemon, name: &str| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let (held_before, settled_before) = (
+    count(daemon_b, "merge.work.settle_awaits_replica"),
+    count(daemon_b, "merge.work.settled_on_replica"),
+  );
+  let withheld = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
+    refuse_content_puts: false,
+    corrupt_next_inputs: false,
+    refuse_records: true,
+    refuse_work_catalogs: false,
+  });
+  let mut client = common::client::connect(daemon_b.instance());
+  let word = client
+    .begin(&RequestBody::submit(work, Vec::new()))
+    .map(|id| id.word());
+  let held = poll_until(&all, PLACEMENT_DEADLINE, || {
+    Ok(count(daemon_b, "merge.work.settle_awaits_replica") > held_before)
+  });
+  let replica_behind = daemon_b
+    .merge_holder_state(green)
+    .map(|state| state.version);
+  let lifted = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault::default());
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| answer_within(&mut client, *word));
+  let settled = count(daemon_b, "merge.work.settled_on_replica") - settled_before;
+  let replica_after = daemon_b
+    .merge_holder_state(green)
+    .map(|state| state.version);
+  let works_bytes = head_bytes(&mut holder, work, "f");
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert_eq!(withheld, Ok(()));
+  assert_eq!(lifted, Ok(()));
+  assert!(held, "B held the owner's answer for its replica");
+  assert_eq!(
+    replica_behind,
+    Ok(Some(1)),
+    "while B's replica lacked version 2"
+  );
+  assert!(
+    matches!(
+      answer,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }))
+    ),
+    "answered once the replica held it: {answer:?}"
+  );
+  assert!(settled >= 1, "settled on the replica: {settled}");
+  assert_eq!(replica_after, Ok(Some(2)));
+  assert_eq!(
+    works_bytes,
+    Ok(b"hello world".to_vec()),
+    "the work reads its new base"
+  );
 }
 
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
