@@ -69,3 +69,10 @@
 - NOW: green_chains import bug NOT fixed by f37a96515 (w-perf rerun on 9ea6e1311: still refused at revision 1,685,
   RSS 3.4 GiB). Suspect: the repository log entries (each revision's record + contents, EntryParts.objects) are
   charged to the partition's merge budget (green_chain_bytes) and never fold. Investigating.
+
+## A-714 content charged per repository to the shard -- LANDED main b705a24c5 (commit 5ddb7e09b, verified on origin/main)
+- db: objects no longer charged to the merge budget (Repositories::objects_bytes); server: vcs_store::settle_objects
+  (after append, at make/recovery, credited at free), admit_objects for svn revisions only. Local: server 105/105 then
+  61/61 after merge, db 29/29, fmt clean. A-716 (w-perf) takes svn texts held once.
+- Ledger rule now: A-number is mine only after pushing its line on agents/fanout-state (next free A-720).
+- NEXT: A-693 part 2 (svn:// lock verbs; interop E170003), then DAV pieces (g297 brief: the two HTTP rows, A-681).

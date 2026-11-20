@@ -920,3 +920,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   kiln run on adas-mac-studio-2.local (SSH verified 23:50) like w-fed-faults. Broadcast to all 14 agents.
 - Goal stack items 487 (A-583 three-daemon fleet test) + 488 (A-503 move test): passed macOS arm64 (8eeb004bd);
   Linux x86_64 run r627 started by main at 60e23101a (kiln linux/amd64) -> mark both met when it passes.
+- ~00:05 PST A-714 LANDED main b705a24c5 (w-svn, 5ddb7e09b): repository entry objects charged per repository to the
+  owner shard's memory budget (trued up after each append and at recovery, credited on free); admitted git/hg pushes
+  never refused by it; svn revisions check room first. db 29/29, server 105/105 + 61/61; GAPS: content held 2x (3x svn
+  texts). w-perf asked to rerun the 5,000-rev import; if refused for room, A-716 before T4. w-svn next: A-693 p2 lock.
