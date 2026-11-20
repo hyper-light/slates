@@ -5,7 +5,8 @@
 - Read: CLAUDE.md; design D-11, D-28, §4.8 (role, data model, lookup, placement), §4.10 (content replication,
   ownership follows the writer), §4.11 cost model, §4.17/§4.17.1 (objects, push intake A-719, residency, A-714,
   A-662, learned tunables), A-636 2b-2 (family placement), A-704, A-713; w-perf's progress (A-723, A-718).
-- BLOCKED: commits fail. commit.gpgsign=true is injected on the command line; kiln-git-sign refuses this session.
+- (resolved) commits: kiln-git-sign refuses this session; Ada OK'd -c commit.gpgsign=false.
+- OLD: commits fail. commit.gpgsign=true is injected on the command line; kiln-git-sign refuses this session.
   A-724 row is appended to amendments.tsv locally, NOT pushed (so not yet mine). Not overriding signing.
 - Disk: 18 GB free on this Studio (< 20 GB guard). No builds until main says so.
 - Outline below = first deliverable. No code before main's go.
@@ -56,3 +57,11 @@ P1 per-repository/principal accounting + `slates status` rows; P2 share model, p
 compress); P5 intake off the owner shard / content by identity across shards; P6 fleet placement by identity
 (after ruling); P7 harness and measurements (ask main before heavy load).
 Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake). I own balancing, not copies.
+
+## Piece log
+- 2026-11-20 Ada said go (main's go not seen; Ada's overrides). P1 LANDED main 8c1feae15 (merge 6090a4502), checked
+  with merge-base. Files: crates/vcs/src/usage.rs (new), server state.rs/daemon.rs (ShardState::vcs_usage),
+  git_push.rs (charge_step/charge_answer, answer_turn), vcs_store/upload.rs (lend_on counts), vcs_store.rs (free
+  forgets); docs §4.17.5 + A-724 log entry + GAPS line. Target ~/.cache/w-balance-target. Clone ~/slates-work/w-balance.
+- NEXT: P2 share model (pure module in slates-vcs: decayed rates, SHARDS MRC, utility split + floor, DRF weights) with
+  a serial reference-allocator oracle.
