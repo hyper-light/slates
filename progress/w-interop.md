@@ -156,3 +156,6 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
 - jupiter: git 2.56.0.windows.2, OpenSSH, cargo 1.99, uvx (hg 7.2 via uvx), NO svn (not installing without Ada).
   Clone C:\Users\corph\.cache\w-interop\src, target C:\Users\corph\.cache\w-interop-target. r50: git_interop +
   svn_interop on Windows (background).
+- r51 release hg push (main 1533d52b): killed at 183 s (shard 0 spins 1093 ms > 1051 ms window), daemon peak RSS
+  13,861 MiB, matrix 17/24. Reported to main for w-hg. Release target ~/.cache/w-interop-release-target (Studio).
+- r50 Windows git_interop+svn_interop building on jupiter.

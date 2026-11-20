@@ -97,3 +97,8 @@
   pack; moves' admission sliced pre-append; landing = new Index::adopt (O(runs)) + staged values; stale fork re-base;
   admission window+post-state on vcs_share::room; blobs-as-green-ops later, blocked on w-perf 1b/1c + green blob
   source). Awaiting objections; meanwhile checking readers' tolerance of position holes (Positions, upload runs).
+- MAIN APPROVED A-722 points 1-7; point 2 change: readers tolerate position holes (fix any dense-assuming reader,
+  e.g. hook_view units.rs cover over Positions::span(0,next_position)); NO compaction at landing. Point 8 reframed
+  (ruling B): index resolves oid -> (pack identity, offset); upload/encoding/sparse decode from stored pack in place;
+  head files from the green; ContentStore::object_bytes inflated copy + put_object go away. Build 1-7 first, then 8.
+  Piece order: (a) slates-vcs Index::adopt (+ parent epoch / stale check) ...
