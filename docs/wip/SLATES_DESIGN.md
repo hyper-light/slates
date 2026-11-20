@@ -52526,7 +52526,9 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
   `paths::remake_green_sliced`), a push's whole build sliced by a task with submits parked until it ends (BUILT
-  2026-11-20, `paths::whole_build`), a submit's own whole build and a whole map's release owed; a copy made through a work
+  2026-11-20, `paths::whole_build`), a submit's own whole build too, its commit owed durably in the submit's
+  transaction and made at the build's end from what it staged (BUILT 2026-11-20, `vcs_store::owed`), a whole map's
+  release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name; its copies and symbolic links owed); Mercurial's manifests by the
   same rule.
@@ -54983,3 +54985,30 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
   restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
   (main's).
+
+### A-664 live whole builds, part 2 — A submit whose map is built whole owes its commit durably, made at the build's end from what it staged (2026-11-20, w-shared for UI goal 93; main's ruling (a) and its three requirements)
+- **Why.** A green's first submit, or one past a copy, built the whole head's map in its own step, which part 1 moved
+  off the shard's steps for a push. A submit's commit is made over that map, so moving the build defers the commit past
+  the version's own transaction; what makes it (message, identity, the owner's second) lived only in the submit's step,
+  and a restart between the two would have left the version with no commit.
+- **Change.** `commits::after_submit`, from `verbs::judge_submission`: where the step would build whole
+  (`paths::needs_whole`), the submit stages an owed commit (`vcs_store::owed::Owed`: the green's key and version, the
+  second, the message and the identity; magic "SGOC", typed refusals) in its own transaction, as an entry of the register
+  holding it alone, then begins the build (`paths::whole_build::start`). The build's end keeps the map, then makes the
+  commit from the staged record alone, never the clock (`commits::make_owed`, in a transaction of its own), before the
+  submits parked behind it run. The made commit's move of the green to that version settles it (`commit_moves`, live and
+  in a replay alike). A replay restores an owed record no made commit settled (`replay_git`), and a store made again
+  (`make_whole`, a recovery) starts its build again, which, the map made again already, makes the commit alone
+  (`whole_build::resume_owed`). One owed a green: submits to a green whose build runs are parked (part 1).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::owed::tests::an_owed_commit_reads_back_whole_and_refuses_every_damaged_form` (every cut `Short` or
+  `Foreign`, a trailing byte, a push record's magic); `vcs_store::commits::tests::
+  t_a664_owed_a_first_submits_commit_is_owed_then_made_at_its_staged_second` (owed and staged, none made; then made at
+  the staged second with its message, nothing owed); `t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_record`
+  (main's determinism rule: two restarts before the build ends, then the commit's text exactly the staged record's
+  over its tree, and a store made again after it lists the same commit and owes nothing). The submit tests drive a
+  first submit's build to its end (`whole_build::settle`); a commit git refuses leaves its owed record in the register
+  until the next made commit settles it. `cargo test --locked -p slates-server --lib -- vcs_store:: repository::
+  git_push:: vcs_http::git work_home:: identities:: --test-threads=4` 148 of 148; fmt clean.
+- **Owed.** The push storm (a build moved to the newest head at a slice boundary, never restarted; main's next); a
+  parked submit's wait bounded by the failover delay; a whole map's release sliced.

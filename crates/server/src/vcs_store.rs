@@ -104,6 +104,7 @@ pub(crate) mod hg_made;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
 pub(crate) mod lfs_record;
+pub(crate) mod owed;
 pub(crate) mod paths;
 pub(crate) mod record;
 pub(crate) mod svn_import;
@@ -239,6 +240,9 @@ pub(crate) struct GitStore {
   /// of an index apart from the git objects', put there by its entry's append ([`admit_lfs`]) and by a recovery's
   /// replay of that entry's record ([`lfs_record`]), and given back with the store.
   pub(crate) lfs: LfsObjects,
+  /// The commits owed by submits whose maps are built whole after them (A-664's live whole builds, part 2, [`owed`]),
+  /// by the green's key: one a green, each settled as the made commit's move of its green to its version commits.
+  pub(crate) owed: BTreeMap<u64, owed::Owed>,
 }
 
 impl GitStore {
@@ -255,6 +259,7 @@ impl GitStore {
       versions: BTreeMap::new(),
       charged: 0,
       lfs: LfsObjects::new(),
+      owed: BTreeMap::new(),
     }
   }
 
@@ -350,6 +355,8 @@ pub(crate) enum ReplayRefused {
   Lfs(ObjectRefused),
   /// A version-2 git record's pack (A-723) that git's reader refuses: its bytes, or a base outside it the store lacks.
   Pack(slates_git::unpack::Refusal),
+  /// An owed commit's record's bytes (A-664's live whole builds, part 2).
+  Owed(owed::OwedRefused),
 }
 
 /// The repository's objects as the bases a replayed pack's reference deltas may name (A-723), read through the index view
@@ -1302,6 +1309,14 @@ fn commit_moves(
   store.charged = store.charged.saturating_add(cost);
   for (key, version, _) in keyed {
     store.versions.entry(*key).or_default().push(*version);
+    // A made commit's move of its green to the version a commit was owed of settles it ([`owed`]).
+    if store
+      .owed
+      .get(key)
+      .is_some_and(|owed| owed.version <= *version)
+    {
+      store.owed.remove(key);
+    }
   }
   Ok(keep_values(content, store, moves))
 }
@@ -1388,6 +1403,18 @@ fn replay_git(
   store: &mut GitStore,
   bytes: &[u8],
 ) -> Result<u64, ReplayRefused> {
+  // An owed commit's record (A-664's live whole builds, part 2): owed again, unless a made commit settled it already.
+  if owed::is_owed(bytes) {
+    let owed = owed::Owed::decode(bytes).map_err(ReplayRefused::Owed)?;
+    let settled = store
+      .versions(owed.key)
+      .last()
+      .is_some_and(|made| *made >= owed.version);
+    if !settled {
+      store.owed.insert(owed.key, owed);
+    }
+    return Ok(0);
+  }
   let format = store.repository.format();
   let record = Record::decode(bytes, format).map_err(ReplayRefused::Record)?;
   let mut push = Push::new(format);
@@ -1770,6 +1797,7 @@ pub(crate) async fn recover(
       paths::remake_green_sliced(state, green, slices).await;
       slices.unit_done().await;
     }
+    paths::whole_build::resume_owed(state, record.id);
   }
 }
 
@@ -1791,4 +1819,6 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
 pub(crate) fn make_whole(state: &mut ShardState, record: &RepositoryRecord) {
   make_from_log(state, record);
   paths::remake(state, record.id);
+  // A commit a submit owed and no made commit settled is made by its build's end (A-664's live whole builds, part 2).
+  paths::whole_build::resume_owed(state, record.id);
 }

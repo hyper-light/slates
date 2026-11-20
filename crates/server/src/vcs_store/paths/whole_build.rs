@@ -82,6 +82,9 @@ struct Build {
   parked: Vec<ParkedSubmit>,
   /// The task driving it.
   task: Option<slates_rt::TaskId>,
+  /// Whether the green's map of `version` is kept already (a recovery made it again, and a commit is owed of it): the
+  /// build then puts nothing and keeps nothing, and its end makes the owed commit alone.
+  kept: bool,
 }
 
 /// Whether `green`'s map is being built whole: a submit to it is parked ([`park`]).
@@ -104,7 +107,14 @@ pub(crate) fn start(
     .remove(&green)
     .map(|old| retire(state, old))
     .unwrap_or_default();
-  let Some(paths) = state.greens.get(&green).map(|engine| head_paths(&engine)) else {
+  let kept = kept_at(state, repository, green) == Some(version);
+  let Some(paths) = state.greens.get(&green).map(|engine| {
+    if kept {
+      Vec::new()
+    } else {
+      head_paths(&engine)
+    }
+  }) else {
     crate::verbs::resume_all(state, parked);
     return;
   };
@@ -121,9 +131,48 @@ pub(crate) fn start(
     held: Vec::new(),
     parked,
     task,
+    kept,
   };
   state.vcs_stores.whole_builds.0.insert(green, build);
   state.count(BEGUN, 1);
+}
+
+/// The version of `green`'s map the store keeps, if any.
+fn kept_at(state: &ShardState, repository: RepositoryId, green: DbVolumeId) -> Option<u64> {
+  let key = super::super::green_key(green);
+  let (_, git) = state.vcs_stores.git_ref(repository)?;
+  git.heads.get(&key).map(|head| head.version)
+}
+
+/// Starts a build for each commit `repository`'s store owes once it is made again from the log (`super::super::owed`):
+/// the green's map is kept already, made again by the recovery, so the build's end makes the commit alone, from what
+/// was staged. A commit owed of a version that is not its green's head is left owed, counted unmade.
+pub(crate) fn resume_owed(state: &mut ShardState, repository: RepositoryId) {
+  let owed: Vec<(u64, u64)> = state
+    .vcs_stores
+    .git_ref(repository)
+    .map(|(_, git)| {
+      git
+        .owed
+        .values()
+        .map(|owed| (owed.key, owed.version))
+        .collect()
+    })
+    .unwrap_or_default();
+  for (key, version) in owed {
+    let green = state
+      .db
+      .partition()
+      .repositories()
+      .members_of(repository)
+      .map(|member| member.green)
+      .find(|green| super::super::green_key(*green) == key);
+    let head = green.and_then(|green| state.greens.get(&green).map(|engine| engine.head()));
+    match (green, head) {
+      (Some(green), Some(head)) if head == version => start(state, repository, green, version),
+      _ => state.count(super::super::commits::UNMADE, 1),
+    }
+  }
 }
 
 /// The head's paths that git holds a file at, in the map's order (`super::whole_head`'s names).
@@ -264,21 +313,27 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
     entries,
     held,
     parked,
+    kept,
     ..
   } = build;
-  // The map's and trees' nodes are lent the room the shard could admit now, as a step's are (`super::stepped`).
-  super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
-  let answer = made_holding(
-    &mut state.vcs_stores,
-    repository,
-    (key, version),
-    Plan::Put(entries),
-    held,
-  );
-  if !super::super::settle_in(&mut state.store, &mut state.vcs_stores) {
-    state.count(super::super::CHARGE_SHORT, 1);
+  if !kept {
+    // The map's and trees' nodes are lent the room the shard could admit now, as a step's are (`super::stepped`).
+    super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
+    let answer = made_holding(
+      &mut state.vcs_stores,
+      repository,
+      (key, version),
+      Plan::Put(entries),
+      held,
+    );
+    if !super::super::settle_in(&mut state.store, &mut state.vcs_stores) {
+      state.count(super::super::CHARGE_SHORT, 1);
+    }
+    count(state, answer, BUILT);
   }
-  count(state, answer, BUILT);
+  // The commit a submit owes of this version, made from what it staged, before the submits parked behind it run, so
+  // each names it as its parent (A-664's live whole builds, part 2).
+  super::super::commits::make_owed(state, green);
   crate::verbs::resume_all(state, parked);
 }
 
