@@ -100,11 +100,16 @@ every profile name a run leaves behind here; no other admin steps or installs.
   device takes none of yet). Ask: three edits in volume ...05 with no host mount, harness at /mnt/c/..., change request
   exactly its changes, landing held then written on the person's approval; Bypass: LAND_WRITTEN at once (3 written).
   Log C:\Users\corph\w-k90-whp\drive-cc1ecb625.log.
-- Rerun at current main 63da2c592 (36 commits on, incl. w-k90-kvm's 22bb3fb9e in the microVM sandbox path): r27, log
-  C:\Users\corph\w-k90-whp\drive-<sha>.log. goals_done after it.
+- Rerun at current main 63da2c592 (36 commits on, incl. w-k90-kvm's 22bb3fb9e in the microVM sandbox path): r34
+  PASSED: 1 passed, 0 failed, 1863.63 s (the fixture's runner reconnected to its server 4 times before the first session
+  opened; then every step held). Log C:\Users\corph\w-k90-whp\drive-63da2c592.log.
+- GOAL MET: goals_done 01a1fa3695247602901e94e021bfa56e (plan 01a1fa36 step 6) with this evidence.
+- Open (not mine, reported): windows-latest clippy errors in workspace/container.rs, sandbox/container.rs,
+  workspace/slates.rs, slates_fleet.rs (others' code); kiln should re-vendor Slates past 721f4ff97 to fold 0003 away.
 
 ## AppContainer profiles left on jupiter by my runs
 - After r26: 164 profiles, identical to the baseline: none added, none removed (Shards removed its per-VM profiles).
+- After r34: 164 profiles, none new since the baseline. My runs left NO AppContainer profile on jupiter.
 - Baseline before r26 (HKCU ...\AppContainer\Mappings monikers, C:\Users\corph\w-k90-whp\appcontainers-before.txt):
   164 profiles, 2 of them Shards' and not mine: shards.pipes-s0.41940.0, shards.pipes-s0.48268.0.
 
