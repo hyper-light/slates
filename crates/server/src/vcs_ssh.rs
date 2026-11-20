@@ -848,33 +848,38 @@ impl<S: SshSite> Link<S> {
   /// Runs the connection until it ends or moves to its repository's shard (the module doc's loop).
   async fn run(&mut self) -> Exit {
     loop {
-      if !self.session.pending_output().is_empty() {
-        if let Err(why) = self.write().await {
-          return Exit::Ended(why);
-        }
-        continue;
-      }
-      if self.session.is_closed() {
-        return Exit::Ended(Why::Refused);
-      }
-      if let Some(event) = self.session.poll_event() {
-        match self.on_event(event).await {
-          Some(exit) => return exit,
-          None => continue,
-        }
-      }
-      if !self.unread.is_empty() && self.feed() {
-        continue;
-      }
-      match self.turn().await {
-        Ok(Turn::Moved) => continue,
-        Ok(Turn::Client | Turn::Idle) => {}
-        Err(why) => return Exit::Ended(why),
-      }
-      if let Err(why) = self.read().await {
-        return Exit::Ended(why);
+      if let Some(exit) = self.pass().await {
+        return exit;
       }
     }
+  }
+
+  /// One pass of the loop: pending output written, or the session's end, an event, unread bytes fed, or a turn and a
+  /// read; how the connection left if it did, `None` to go round again.
+  async fn pass(&mut self) -> Option<Exit> {
+    if !self.session.pending_output().is_empty() {
+      return self.write().await.err().map(Exit::Ended);
+    }
+    if self.session.is_closed() {
+      return Some(Exit::Ended(Why::Refused));
+    }
+    if let Some(event) = self.session.poll_event() {
+      return self.on_event(event).await;
+    }
+    if !self.unread.is_empty() && self.feed() {
+      return None;
+    }
+    self.turn_and_read().await
+  }
+
+  /// The loop's turn, then a read unless the connection moved; how it left if it did.
+  async fn turn_and_read(&mut self) -> Option<Exit> {
+    match self.turn().await {
+      Ok(Turn::Moved) => return None,
+      Ok(Turn::Client | Turn::Idle) => {}
+      Err(why) => return Some(Exit::Ended(why)),
+    }
+    self.read().await.err().map(Exit::Ended)
   }
 
   /// Writes what the session has to send, within the phase's wait: the client's room is waited for.

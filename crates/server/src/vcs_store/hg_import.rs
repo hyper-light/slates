@@ -97,8 +97,8 @@ enum Stage {
   /// Under way: the import, the host its directory is read through (the import's own, closed when it is done) and the
   /// repository's directory on the host.
   Running {
-    /// The import.
-    import: Import,
+    /// The import, boxed: it is by far the largest of a stage.
+    import: Box<Import>,
     /// The host.
     host: Box<dyn HostFs>,
     /// The directory.
@@ -247,7 +247,7 @@ pub(crate) fn begin(
     Ok(import) => {
       let importing = Importing {
         stage: Stage::Running {
-          import,
+          import: Box::new(import),
           host,
           directory,
         },
@@ -381,7 +381,7 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
     Some(Importing {
       stage: Stage::Running { import, .. },
       reserved,
-    }) => (import, reserved),
+    }) => (*import, reserved),
     Some(done) => {
       state.vcs_stores.imports.insert(id, done);
       return Err(ImportFailed::Busy);
@@ -412,15 +412,15 @@ fn place(
   stores: &mut VcsStores,
   id: RepositoryId,
   index: HgIndex,
-) -> Result<bool, (ImportFailed, HgIndex)> {
+) -> Result<bool, Box<(ImportFailed, HgIndex)>> {
   let Some(content) = stores.content.as_mut() else {
-    return Err((ImportFailed::NoStore, index));
+    return Err(Box::new((ImportFailed::NoStore, index)));
   };
   let Some(RepositoryStore::Mercurial(store)) = stores.entries.get_mut(&id) else {
-    return Err((ImportFailed::NoStore, index));
+    return Err(Box::new((ImportFailed::NoStore, index)));
   };
   if !holds_none(&mut store.index) {
-    return Err((ImportFailed::NotEmpty, index));
+    return Err(Box::new((ImportFailed::NotEmpty, index)));
   }
   let empty = core::mem::replace(&mut store.index, index);
   let released = empty.release(content).is_ok();
@@ -448,7 +448,8 @@ pub(crate) fn place_imported(
       settle(state);
       Ok(())
     }
-    Err((failed, back)) => {
+    Err(refused) => {
+      let (failed, back) = *refused;
       *index = Some(back);
       Err(match failed {
         ImportFailed::NotEmpty => Refusal::ImportRefused {
@@ -476,7 +477,7 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   };
   state.store.budget.credit_retention(reserved);
   let whole = match (state.vcs_stores.content.as_mut(), stage) {
-    (Some(content), Stage::Running { import, .. }) => import.abandon(content).is_ok(),
+    (Some(content), Stage::Running { import, .. }) => (*import).abandon(content).is_ok(),
     (Some(content), Stage::Done { imported, .. }) => {
       let Imported { index, .. } = *imported;
       index.release(content).is_ok()

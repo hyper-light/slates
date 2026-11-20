@@ -224,7 +224,7 @@ pub(crate) enum Gate {
   Answer(ReplyBody),
 }
 
-/// What a verb needs of the owner.
+/// What a verb needs of the owner. A sealed work is boxed: it is far larger than any other need.
 enum Need {
   Files(Vec<String>),
   Page {
@@ -235,12 +235,12 @@ enum Need {
   Sizes,
   Verdict {
     evidence: Vec<[u8; 32]>,
-    sealed: SealedWork,
+    sealed: Box<SealedWork>,
     /// The work's merge mode and the launcher's approval, if any (A-285): the green's owner holds no record of the work.
     policy: crate::verbs::SubmitPolicy,
   },
   Rebase {
-    sealed: SealedWork,
+    sealed: Box<SealedWork>,
   },
   Admit {
     green: DbVolumeId,
@@ -372,7 +372,7 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       let sealed = seal(state, work);
       Some(
         base_missing(state, &sealed).unwrap_or_else(|| Need::Rebase {
-          sealed: composed(state, sealed, Vec::new()),
+          sealed: Box::new(composed(state, sealed, Vec::new())),
         }),
       )
     }
@@ -460,7 +460,7 @@ fn verdict_need(
   }
   base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
     evidence: evidence.to_vec(),
-    sealed: composed(state, sealed, evidence.to_vec()),
+    sealed: Box::new(composed(state, sealed, evidence.to_vec())),
     policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature, authorship)),
   })
 }
@@ -1252,13 +1252,13 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
       evidence,
       sealed,
       policy,
-    } => match crate::verbs::owner_judge(state, (origin, id), (sealed, evidence, policy), back) {
+    } => match crate::verbs::owner_judge(state, (origin, id), (*sealed, evidence, policy), back) {
       Some(reply) => Outcome::Answered(Answered::Verdict(reply)),
       None => Outcome::Deferred,
     },
-    Need::Rebase { sealed } => {
-      Outcome::Answered(Answered::Rebased(crate::verbs::owner_rebase(state, sealed)))
-    }
+    Need::Rebase { sealed } => Outcome::Answered(Answered::Rebased(crate::verbs::owner_rebase(
+      state, *sealed,
+    ))),
     Need::Admit {
       green, id: work, ..
     } => Outcome::Answered(Answered::Admitted(crate::verbs::owner_admit(

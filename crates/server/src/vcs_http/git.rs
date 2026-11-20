@@ -448,8 +448,8 @@ impl<L: LfsService> Exchange for LfsExchange<L> {
 pub(crate) enum SiteExchange<E, L> {
   /// git's service.
   Git(GitExchange<E>),
-  /// Git LFS.
-  Lfs(LfsExchange<L>),
+  /// Git LFS, boxed: its exchange is by far the larger.
+  Lfs(Box<LfsExchange<L>>),
 }
 
 impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
@@ -691,7 +691,7 @@ impl<A: Authenticator, R: Repositories, S: GitServices, L: LfsService + Clone> G
         fields: Fields::new(),
         head_only: false,
         status: StatusMode::AfterBody,
-        exchange: SiteExchange::Lfs(exchange),
+        exchange: SiteExchange::Lfs(Box::new(exchange)),
       },
       proven: true,
     }

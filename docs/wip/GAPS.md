@@ -140,6 +140,10 @@
 > held left out of the pack; S2 (history's latest value = the file's block), S3 (w-git, A-722), S4 (svn texts by identity),
 > S5 (w-hg); the push bound (a streamed window per connection, admission refusal before the body); push_load re-run.
 >
+> **A-728 (2026-11-20, w-engine; A-723's S2):** part 1 BUILT: a green's content history names the file's block for every
+> value stored whole (first change, seed, restore, a whole replace), so a changed file is held once; retire gives the
+> history's holds back a step at a time. OWED: part 2 a splice's added runs in the new block; part 3 svn_scale before/after.
+>
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
 > room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the

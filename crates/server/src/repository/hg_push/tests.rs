@@ -69,11 +69,14 @@ fn parsed(hex: &str) -> Node {
     .unwrap()
 }
 
+/// One changeset of a test's served view: its node, its parents' revisions, its branch and its phase.
+type ViewChangeset = (Node, [Option<Rev>; 2], Vec<u8>, Phase);
+
 /// A served view a test builds from a fixture's listings: `{rev} {node} {p1} {p2} {phase} {branch}` a line, and
 /// `{name} {node}` a bookmark.
 #[derive(Clone, Debug, Default)]
 struct View {
-  changesets: Vec<(Node, [Option<Rev>; 2], Vec<u8>, Phase)>,
+  changesets: Vec<ViewChangeset>,
   bookmarks: Vec<(Vec<u8>, Node)>,
 }
 
@@ -385,7 +388,7 @@ impl Hg {
     state: &mut ShardState,
     unbundle: &Unbundle,
     view: &View,
-  ) -> Result<Prepared, Refused> {
+  ) -> Result<Prepared, Box<Refused>> {
     super::prepare_whole(
       state,
       self.repository,
@@ -412,9 +415,9 @@ impl Hg {
     state: &mut ShardState,
     unbundle: &Unbundle,
     view: &View,
-  ) -> Result<Reply, Refused> {
+  ) -> Result<Reply, Box<Refused>> {
     let prepared = self.prepare(state, unbundle, view)?;
-    self.land(state, prepared).answer
+    self.land(state, prepared).answer.map_err(Box::new)
   }
 
   /// The green a name binds.
@@ -915,11 +918,22 @@ fn a_bookmark_moves_on_its_own_green() {
 /// of one, a line's name or a name without its end read as no bookmark.
 #[test]
 fn names_read_as_themselves_and_escape_what_would_meet() {
+  assert_names_escape();
+  assert_lines_read_back();
+  assert_bookmarks_read_back();
+}
+
+/// A stock name reads as itself; `:`, `%`, a control byte and bytes not UTF-8 escaped.
+fn assert_names_escape() {
   assert_eq!(line_name(b"default", 0), "branch:default:0");
   assert_eq!(line_name(b"stable/7.2", 12), "branch:stable/7.2:12");
   assert_eq!(bookmark_name(b"main"), "bookmark:main:");
   assert_eq!(line_name(b"a:b%c\n", 1), "branch:a%3Ab%25c%0A:1");
   assert_eq!(bookmark_name(b"caf\xc3\xa9\xff"), "bookmark:caf\u{e9}%FF:");
+}
+
+/// A line's name reads back as its branch and number, and a second spelling of one as none.
+fn assert_lines_read_back() {
   assert_eq!(line_of("branch:a%3Ab:01"), None);
   assert_eq!(
     line_of("branch:%41:0"),
@@ -927,6 +941,11 @@ fn names_read_as_themselves_and_escape_what_would_meet() {
     "a second spelling of `A` read as a line"
   );
   assert_eq!(line_of("branch:a%3Ab:1"), Some((b"a:b".to_vec(), 1)));
+}
+
+/// A bookmark's name reads back as its bookmark; a second spelling of one, a line's name or a name without its end
+/// reads as no bookmark.
+fn assert_bookmarks_read_back() {
   assert_eq!(bookmark_of("bookmark:main:"), Some(b"main".to_vec()));
   assert_eq!(
     bookmark_of("bookmark:caf\u{e9}%FF:"),
@@ -1112,10 +1131,10 @@ fn the_policy_refuses_before_the_verdict_in_acls_words() {
     );
     assert_eq!(
       super::admitted(state, (&owner(), plain.repository), &prepared),
-      Err(Refused::Abort {
+      Err(Box::new(Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      })
+      }))
     );
     set_policy(state, ("acl-plain", 1), Vec::new());
     assert_eq!(
@@ -1152,10 +1171,10 @@ fn the_policy_refuses_before_the_verdict_in_acls_words() {
     );
     assert_eq!(
       super::admitted(state, (&owner(), marks.repository), &prepared),
-      Err(Refused::Abort {
+      Err(Box::new(Refused::Abort {
         message: listed.into_bytes(),
         hint: None
-      })
+      }))
     );
   });
 }
@@ -1201,10 +1220,10 @@ fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
     );
     assert_eq!(
       super::admitted(state, (&owner(), marks.repository), &prepared),
-      Err(Refused::Abort {
+      Err(Box::new(Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      })
+      }))
     );
   });
 }
@@ -1244,10 +1263,10 @@ fn the_policy_names_the_branch_acl_meets_first() {
     );
     assert_eq!(
       super::admitted(state, (&owner(), two.repository), &prepared),
-      Err(Refused::Abort {
+      Err(Box::new(Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      })
+      }))
     );
   });
 }

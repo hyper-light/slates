@@ -116,7 +116,7 @@ fn to_usize(count: u64) -> usize {
 /// elements, nesting levels and attributes as many as parsed elements (`size_of::<Element>()` each) fit in the room.
 pub(crate) fn xml_bounds(room: u64) -> XmlBounds {
   let bytes = to_usize(room);
-  let elements = bytes / size_of::<Element>().max(1);
+  let elements = bytes.checked_div(size_of::<Element>()).unwrap_or(bytes);
   XmlBounds {
     body_bytes: bytes,
     depth: elements,
@@ -1063,7 +1063,7 @@ impl<S: SvnStores> SvnExchange<S> {
               .answers
               .iter()
               .find(|(named, _)| *named == path)
-              .map(|(_, answer)| answer.as_ref().map(|()| ()));
+              .map(|(_, answer)| answer.as_ref().map(|_unit| ()));
             match decided {
               Some(decided) => {
                 let answer = locking::unlock_answer(&request, decided, &filesystem);
