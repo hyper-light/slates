@@ -105,6 +105,7 @@
 > Owed: compression of cold content.
 > Piece 5b's placement policy for A-722's intake off the owner (`vcs_share::place::intake_shard`, two choices by
 > intakes decoding) built, waiting for w-git's A-722 to call it.
+> Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >

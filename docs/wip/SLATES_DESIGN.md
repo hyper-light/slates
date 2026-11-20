@@ -54729,6 +54729,13 @@ Applied in the same change to:
   push holds a `Decoding` guard from its start (today on its owner). Tests: `vcs_share::place::tests` (19 pushes of one
   repository over 23 shards: at most two decoding on any shard, against all 19 on the owner today; the count follows its
   guards; a tie stays). `intake_shard` and `decoding_on` wait for A-722 to call them.
+- **Piece 6's node half, the batch forms (2026-11-20, agreed with w-perf).** `vcs_store::homes::home_many`, `read_many`
+  and `let_go_many`: a request's windows go to their homes in one cross-shard call a home shard a turn, each call
+  working through its items until the home's step quantum is spent (at least one) and answering the rest for the next
+  turn, answers in the request's order, reads checked against their names. Test:
+  `vcs_store::homes::tests::a_batch_of_windows_goes_to_each_home_in_one_call_a_shard` (five batches of 259 windows over
+  four homes: 151 calls in a debug build; every window homed, read back in order, held twice where sent twice, freed).
+  Owed: the region's half once w-fed-faults answers; the owner's rows and reads through them with w-perf's a2 and a3.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
