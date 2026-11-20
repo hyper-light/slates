@@ -105,6 +105,15 @@ row svnsync bash -c "svnadmin create $WORK/mirror && svnadmin setuuid $WORK/mirr
      svn:sync-from-url \"\$SYNC_FROM_URL\" file://$WORK/mirror; } \
   && svnadmin dump --quiet $WORK/mirror > $WORK/sync.dump \
   && { [ -z \"\$EXPECT_SYNC\" ] || cmp $WORK/sync.dump \"\$EXPECT_SYNC\"; }"
+# Revision properties (A-702 part 2): an allowing pre-revprop-change hook set with the owner's policy verb, then
+# revision 1's svn:log changed and read back over svn:// and over svn+ssh.
+printf '#!/bin/sh\nexit 0\n' > "$WORK/allow-revprop-change" && chmod +x "$WORK/allow-revprop-change"
+row revprop-hook "$SLATES" --instance "$INSTANCE" repository policy project \
+  --hook "pre-revprop-change=$WORK/allow-revprop-change"
+row revprop-svn bash -c "sv propset -q --revprop -r1 svn:log matrix-svn \$0 \
+  && [ \"\$(sv propget --revprop -r1 svn:log \$0)\" = matrix-svn ]" "$SVNURL"
+row revprop-ssh bash -c "ss propset -q --revprop -r1 svn:log matrix-ssh \$0 \
+  && [ \"\$(ss propget --revprop -r1 svn:log \$0)\" = matrix-ssh ]" "$SSHURL"
 row info bash -c "$R info $URL/trunk"
 row ls bash -c "$R ls $URL/trunk"
 row cat bash -c "f=\$($R ls $URL/trunk | grep -v /\$ | head -1) && $R cat $URL/trunk/\$f"
