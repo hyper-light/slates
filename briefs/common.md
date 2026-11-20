@@ -95,6 +95,14 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
 - GAPS may name it only while that fix is in flight. Never write "owed" for a performance gap and move on.
 - A stopgap that shrinks a gap without bounding it is not the fix. Go straight to the bound.
 
+## KEEP YOUR CHECKOUT CURRENT (ADA 2026-11-20 ~07:05 PST: "all agents need to also be keeping their local checkout up to date")
+- Bring your working tree up to date: `git fetch origin && git merge origin/main`. Never rebase, reset, checkout or stash.
+  Do it at the start of every piece, before every test run you report, and at least every 30 minutes while you work.
+  The same goes for kiln, Shards and Hex checkouts, each against its own origin/main.
+- Name the base commit (origin/main's short hash) with every result you report. A result from a stale tree is not a
+  result: g227's "red on clean main" list came from a main four hours old, and half of it was already fixed.
+- Delete worktrees whose work has landed, by exact path (`git worktree remove`), so stale trees don't pile up.
+
 ## ON ORIGIN/MAIN, REGULARLY (ADA 2026-11-20 ~07:00 PST: "be sure we're also regularly pushing these changes origin/main")
 - Finished work never sits on a branch. Each piece lands on origin/main within about 30 minutes of being green, under the
   fast landing rule, confirmed with `git merge-base --is-ancestor`.
