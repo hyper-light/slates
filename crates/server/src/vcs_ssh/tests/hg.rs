@@ -515,9 +515,15 @@ impl Channel {
   /// Drives `command` as the edge does until it waits for input or exits: what it wrote is taken before each step, and a
   /// refusal's words are sent with its status.
   fn drive<C: Command>(&mut self, command: &mut C) {
+    ready(self.drive_awaiting(command));
+  }
+
+  /// [`Channel::drive`] awaiting each step: a step over the daemon's lenders may yield between its slices (A-720: a
+  /// push taken into its fork a slice at a time), which the shard's executor serves as it does on the edge.
+  async fn drive_awaiting<C: Command>(&mut self, command: &mut C) {
     while self.exited.is_none() {
       self.take(command);
-      match ready(command.step()) {
+      match command.step().await {
         Ok(Stepped { consumed, next }) => {
           self.consumed += consumed;
           match next {
@@ -1031,7 +1037,7 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
 
 /// Stock 7.2's client bytes of `ssh-push` sent to `record`'s repository as the SSH site starts `serve --stdio` over the
 /// daemon's lenders for its owner, a kilobyte at a time, then the end of its input: what its channel took.
-fn stock_push_session(record: &RepositoryRecord) -> Result<Channel, String> {
+async fn stock_push_session(record: &RepositoryRecord) -> Result<Channel, String> {
   let mut services = ToolServices::new(ShardStores, ServedViews, ThisShard, room());
   let principal = owner();
   let start = Start {
@@ -1048,10 +1054,10 @@ fn stock_push_session(record: &RepositoryRecord) -> Result<Channel, String> {
     command
       .input(piece)
       .map_err(|refused| format!("{refused:?}"))?;
-    channel.drive(&mut command);
+    channel.drive_awaiting(&mut command).await;
   }
   command.input_end();
-  channel.drive(&mut command);
+  channel.drive_awaiting(&mut command).await;
   Ok(channel)
 }
 
@@ -1116,7 +1122,7 @@ fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it
   let (sent, outcome) = mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {
-      let _ = sent.send(stock_push_session(&record));
+      let _ = sent.send(stock_push_session(&record).await);
     })
     .expect("the session's task");
     slates_rt::futures::detach(task).expect("detached");
