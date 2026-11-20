@@ -3808,7 +3808,7 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.plane.announcements_sent",
     // The idle sweep's events (`slates_server::idle_sweep`, A-715), named by the constants the daemon counts them under, so one added there is not missed
     // here: the idle purge's freed bytes, what a shard was doing at each pass (A-214: sealing, deferred, busy, idle),
-    // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
+    // and a give-back that left its rest for the
     // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
     // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
     CONTENT_PURGED,
