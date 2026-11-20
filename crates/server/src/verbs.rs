@@ -12172,10 +12172,7 @@ pub(crate) fn end_attachment(
     && let Ok(slot) = state.volumes.get_mut(handle)
     && slot
       .volume
-      .sweep_attachment(
-        &mut state.store,
-        slates_vfs::ids::RefOwner::Attachment(record.id),
-      )
+      .end_takeover_holder(&mut state.store, record.id)
       .is_err()
   {
     state.count(TAKEOVER_KEPT_UNRELEASED, 1);
