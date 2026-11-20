@@ -199,3 +199,13 @@
 - Cross six targets, structural, literals, unsafe, fmt: clean. Still red: server tests/recovery.rs two sleeps,
   w-sizing's piece (inbox/w-sizing-from-w-lint.md).
 - r35 (Windows) and r36 (Linux) for g226 lost to kiln timeouts; re-run on current main as r37/r38 in the background.
+
+## 2026-11-20 between rounds (main 37c84db43 -> 0916cf5b4)
+- api container_engine.rs (7e7e242f3), Windows-only `ask`: literals 4096 / 10 ms -> Shape lines (eb410fdac). Its
+  10 ms `thread::sleep` poll loop is D-9-disallowed and Windows clippy (r37) refused slates-api and thus slates-cli;
+  rewritten as a condition wait (pipe readers send on a channel, `recv_timeout` under the observe budget, kill past
+  budget or cap, then wait) at 088e05d50 on agents/w-lint-winapi-check; jupiter check r41 before it lands on main.
+- mem arena.rs (2dc414a84) walk test: needless_range_loop + 12/10 on every target -> 0916cf5b4 (arena 19 pass).
+- xtask helm_chart golden fails here only because local helm is v4.1.0 and CI pins v4.3.0 (blank lines between
+  documents); not a main breakage.
+- r38/r39 (Linux) lost to a runner restart / no room; r40 running on the Linux runner.
