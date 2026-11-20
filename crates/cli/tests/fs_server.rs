@@ -24,13 +24,12 @@
   clippy::string_slice
 )]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Shape: how long each phase of the two-node fleet gets — to answer, to form and to serve a forwarded verb — a few
-/// protocol periods on loopback, widened for two daemons booting on a shared machine (the three-node CLI flow allows
-/// 40 s a phase).
-const FLEET_WAIT: Duration = Duration::from_secs(40);
 /// Shape: the pause between polls.
 const POLL_MS: u64 = 50;
 /// Shape: shards per daemon: two, so a verb may land on a shard that does not own its volume.
@@ -113,17 +112,18 @@ fn pause() {
   std::thread::sleep(Duration::from_millis(POLL_MS));
 }
 
-/// Retries `verb` until it succeeds or the phase's wait is spent; its stdout.
+/// Retries `verb` until it succeeds, while `instance`'s processes progress ([`process_wait::InstanceWait`]; until
+/// 2026-11-20 within the phase's wait, `FLEET_WAIT`, 40 s of the wall); its stdout.
 fn eventually(instance: &str, args: &[&str]) -> String {
-  let started = Instant::now();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, out, err) = run(instance, args);
     if code == 0 {
       return out;
     }
-    assert!(
-      started.elapsed() < FLEET_WAIT,
-      "slates {args:?} at {instance} never answered: {code} {out}{err}"
+    progress.check(
+      instance,
+      &format!("slates {args:?} answered (last: {code} {out}{err})"),
     );
     pause();
   }
@@ -144,10 +144,17 @@ impl Drop for Daemon {
       && let Some(pid) = rustix::process::Pid::from_raw(raw)
       && rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
     {
-      let deadline = Instant::now() + FLEET_WAIT;
-      while Instant::now() < deadline {
+      // While the anchor's tree gains CPU (until 2026-11-20 within the fleet wait); a stuck stop is killed below.
+      let mut judged = process_wait::Judged::of(self.child.id());
+      loop {
         if matches!(self.child.try_wait(), Ok(Some(_))) {
           return;
+        }
+        if matches!(
+          judged.judge(),
+          process_wait::Verdict::Stalled | process_wait::Verdict::SpentItsBudget
+        ) {
+          break;
         }
         pause();
       }
@@ -864,13 +871,12 @@ fn agent_channel(instance: &str, launcher: &slates_api::LauncherSecret) -> slate
   let mut enrolling = slates_api::Instance::attach(instance).unwrap();
   let issuer = slates_api::Issuer::from_launcher_secret(launcher);
   // A fleet node that has not imported its groups yet refuses a durable record `NoGroup` and imports them within a
-  // phase's wait (§4.8), as `eventually` waits out a verb's.
-  let deadline = Instant::now() + FLEET_WAIT;
+  // phase's wait (§4.8), as `eventually` waits out a verb's: while the node's processes progress.
+  let mut progress = process_wait::InstanceWait::new();
   let (consumer, capability) = loop {
     match issuer.enroll(&mut enrolling, account) {
-      Err(slates_api::Error::Unusable(slates_api::Unusable::NoGroup))
-        if Instant::now() < deadline =>
-      {
+      Err(slates_api::Error::Unusable(slates_api::Unusable::NoGroup)) => {
+        progress.check(instance, "the node imported its groups");
         pause();
       }
       enrolled => break enrolled.unwrap(),
@@ -1100,6 +1106,32 @@ fn until(
   }
 }
 
+/// Waits until `done` holds of the owner's (attachments, lease epoch), while the processes of `nodes` progress
+/// ([`process_wait::InstanceWait`]); how long it took.
+fn until_while_progressing(
+  server: &str,
+  volume: &str,
+  nodes: &[&str],
+  done: impl Fn(u64, Option<u64>) -> bool,
+) -> Duration {
+  let started = Instant::now();
+  let mut progress = process_wait::InstanceWait::new();
+  loop {
+    let (attachments, lease) = holders(server, volume);
+    if done(attachments, lease) {
+      return started.elapsed();
+    }
+    progress.check_all(
+      nodes,
+      &format!(
+        "no attachment left (still {attachments}, lease {lease:?}); the owner's fleet: {}",
+        fleet_lines(server)
+      ),
+    );
+    pause();
+  }
+}
+
 /// The `fleet_` and remote-attachment lines of `instance`'s `status`, for a failure to show where membership stood.
 fn fleet_lines(instance: &str) -> String {
   let (_, out, err) = run(instance, &["status"]);
@@ -1257,10 +1289,6 @@ fn a_forward_naming_another_hosts_attachment_is_refused() {
   drop(dir);
 }
 
-/// Shape: how long a retired node takes to leave the configuration on loopback: the three-process CLI flow's phase wait
-/// (`FLEET_WAIT` in `tests/cli.rs`: a few protocol periods, widened for daemons booting on a shared machine).
-const RETIREMENT_WAIT: Duration = Duration::from_secs(40);
-
 /// A-222, the retired-host sweep. Do: a three-node fleet (server, client, witness); from the client node a holder
 /// process attaches the server's volume for writing; then kill the client node's daemon, so no reap of its clients can
 /// come. Expect: the owner holds the remote attachment until the fleet retires the client node, then ends it
@@ -1330,7 +1358,10 @@ fn a_retired_hosts_attachments_end_at_the_owner() {
   let killed = Instant::now();
   drop(daemons.remove(1));
   let printed = std::cell::Cell::new(Instant::now());
-  let ended = until(&server, &volume, RETIREMENT_WAIT, |attachments, _| {
+  // The retirement is waited for while the survivors' processes progress (until 2026-11-20 within `RETIREMENT_WAIT`, the
+  // three-process CLI flow's 40 s phase wait).
+  let survivors = [server.as_str(), instances[2].as_str()];
+  let ended = until_while_progressing(&server, &volume, &survivors, |attachments, _| {
     if attachments != 0 && printed.get().elapsed() >= Duration::from_secs(5) {
       printed.set(Instant::now());
       eprintln!(
@@ -1587,14 +1618,15 @@ fn recovery_bound(path: &PathEstimates) -> Duration {
   handshake + probe + admission + fetch + read
 }
 
-/// Polls `probe` until it gives a value or the phase's wait is spent.
-fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
-  let started = Instant::now();
+/// Polls `probe` until it gives a value, while the processes of `nodes` progress ([`process_wait::InstanceWait`]; until
+/// 2026-11-20 within the phase's wait, `FLEET_WAIT`, 40 s of the wall).
+fn wait_for<T>(what: &str, nodes: &[&str], mut probe: impl FnMut() -> Option<T>) -> T {
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     if let Some(value) = probe() {
       return value;
     }
-    assert!(started.elapsed() < FLEET_WAIT, "{what} never came");
+    progress.check_all(nodes, what);
     pause();
   }
 }
@@ -1721,9 +1753,11 @@ fn a_client_node_cut_off_as_the_root_forms_is_configured_and_forwards_within_its
   let server_host = status_value(&ok(&server, &["status"]), "fleet_host")
     .unwrap()
     .to_owned();
-  let path = wait_for("the client's estimates of its path to the server", || {
-    path_estimates(&client, &server_host)
-  });
+  let path = wait_for(
+    "the client's estimates of its path to the server",
+    &[&server, &client],
+    || path_estimates(&client, &server_host),
+  );
   let began = Instant::now();
   ok(&client, &["status"]);
   let observe = began.elapsed();

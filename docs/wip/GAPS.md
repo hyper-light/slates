@@ -7210,9 +7210,16 @@
 >   `STALE_WRITE_WAIT` kept as the deadline that test proves). `cli`'s container waits (`CONTAINER_WAIT`,
 >   `DOCKER_INFO_WAIT`) stay: they wait on Docker Desktop's VM, no process of the test's tree. `vcs_edge_restart` since
 >   2026-11-20: its anchor's lines judged in the anchor's process tree (`process_wait::Judged`, which Windows builds too),
->   its listeners' first answers read without a timeout, `PATIENCE` gone. Owed in `cli/tests`: `vm`, `start_judgment`
+>   its listeners' first answers read without a timeout, `PATIENCE` gone. `fs_server` since 2026-11-20: `eventually`, the
+>   enroll's wait for the node's groups, the path-estimate wait and the retired host's attachments judged over the nodes'
+>   processes, an anchor's stop on drop judged in its tree; `FLEET_WAIT` and `RETIREMENT_WAIT` gone; the silent holder's
+>   bound, the heal's give-up and the cut's length kept as what those tests prove, and `DOCKER_WAIT` on Docker. `live_chaos`
+>   since 2026-11-20: its waits were already judged (`wait_answers` in CPU, `FleetWait` over the box's CPU share,
+>   b25a5b7a6); its successor wait now judged over the instance's processes and its NFS barrier read without a timeout.
+>   `support/relay` keeps its bounds: they wait on the test's own relay thread and loopback datagrams, no slates process,
+>   and its absence waits are what its tests prove. Owed in `cli/tests`: `vm`, `start_judgment`
 >   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
->   are not listed yet), `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
+>   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
