@@ -32,3 +32,16 @@ w-perf's store change), not by window identities: windows are node-local cuts. O
 restart, the alias identity -> root has to survive (an image piece), or a v3 replay can't find rows longer than a
 window. Homes' region Put will carry an object keyed by its BLAKE3, cut at each home, since a Mac and a Linux home cut
 differently. The f+1 recommendation above stands.
+
+### 2026-11-20: (ii) built and landed, gated off (base 96e24c824 -> 7317f6cce)
+- 09427301d: record v3 codec, names by BLAKE3 of their rows plus the count. Replay reads them by identity and holds them.
+- c42b938f2: `homes::home_in_region`, f+1 `Kept` (the local home only after its image is published).
+- 7317f6cce: the push's decision homes its names before the record (edges await off-step), v3 written only if still the
+  same names, else v2. Gate `vcs_store::write_version_3()` = false.
+Still owed before the gate turns on:
+1. The takeover test (owner killed after a v3 push, successor on another node replays and serves the names). That needs
+   replay to FETCH missing names from region homes. The record replay is sync, so I'll add a prefetch before a v3
+   record's replay.
+2. The release A/B, v2 against v3, with the publication-interval cost.
+3. Names past one window: w-perf's BLAKE3 alias image piece, and an appended put-in-parts on the wire (one message caps
+   at 1 MiB). Until then pushes whose names exceed a window write v2.
