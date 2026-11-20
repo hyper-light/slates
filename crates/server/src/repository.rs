@@ -578,6 +578,80 @@ fn spelled(record: &RepositoryRecord, name: &str) -> String {
   }
 }
 
+/// The green a branch named `from` is made from (A-575): a name the namespace spells, or any name of a repository of
+/// a tool other than Mercurial, as given; a Mercurial repository's other names as Mercurial resolves them
+/// ([`hg_source`]). `NotFound` for a name nothing binds.
+fn source_of(
+  state: &mut ShardState,
+  record: &RepositoryRecord,
+  from: &str,
+) -> Result<DbVolumeId, Refusal> {
+  let spelled_already = hg_push::line_of(from).is_some() || hg_push::bookmark_of(from).is_some();
+  if record.tool != slates_db::catalog::VcsTool::Mercurial || spelled_already {
+    return state
+      .db
+      .partition()
+      .repositories()
+      .branch(record.id, from)
+      .ok_or(Refusal::NotFound);
+  }
+  hg_source(state, record.id, from)
+}
+
+/// The green a Mercurial repository's branch named `from` is made from (A-575; main's ruling of 2026-11-20: "follow
+/// Mercurial's own name lookup, bookmark, then tag, then branch"). `from` is resolved over the served view as 7.2's
+/// `lookup` resolves it (`slates_hg::serve::lookup::resolve_name`: a revision number or node first, then a bookmark,
+/// a global tag, a branch's tip), so `default` names its branch's tip-most open head. The green is the one whose head
+/// is that changeset: the bookmark `from` names where it heads it, else the line that does (each line is one head of a
+/// branch), else any bookmark that does. Refused `NotFound` for a name Mercurial does not know; `ContentUnavailable`
+/// where the view cannot be made here (an import filling it, a store this shard does not hold); and `Unsupported` for
+/// a changeset no line or bookmark heads (a tag inside a line's history), since a green is branched at a version and a
+/// changeset below a head names none yet (GAPS A-575).
+fn hg_source(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  from: &str,
+) -> Result<DbVolumeId, Refusal> {
+  let mut room = slates_hg::Admission::new(crate::vcs_share::room(state, repository).bytes);
+  let resolved =
+    crate::vcs_store::hg_view::resolved_in(state, repository, from.as_bytes(), &mut room)
+      .ok_or(Refusal::ContentUnavailable)?
+      .map_err(|_| Refusal::ContentUnavailable)?;
+  let node = resolved.ok_or(Refusal::NotFound)?;
+  let repositories = state.db.partition().repositories();
+  let heads = |green: &DbVolumeId| crate::vcs_store::hg_made::head_of(state, *green) == Some(node);
+  let bookmark = repositories.branch(repository, &hg_push::bookmark_name(from.as_bytes()));
+  let line = || {
+    repositories
+      .branches(repository, hg_push::LINE_TAG)
+      .map(|(_, green)| green)
+      .find(heads)
+  };
+  let any_bookmark = || {
+    repositories
+      .branches(repository, hg_push::BOOKMARK_TAG)
+      .map(|(_, green)| green)
+      .find(heads)
+  };
+  bookmark
+    .filter(heads)
+    .or_else(line)
+    .or_else(any_bookmark)
+    .ok_or_else(|| Refusal::Unsupported {
+      feature: format!(
+        "a branch made at `{from}`, changeset {}, which no line or bookmark of the repository heads",
+        hex(&node)
+      ),
+    })
+}
+
+/// A changeset's node in hexadecimal, as Mercurial writes it.
+fn hex(node: &slates_hg::Node) -> String {
+  let mut out = Vec::new();
+  slates_hg::pushkey::encode_hex(node, &mut out);
+  String::from_utf8_lossy(&out).into_owned()
+}
+
 /// `CreateBranch` (module docs): branch `name` of `repository` at `version` of branch `from`, made without a walk.
 /// Answered `GreenCreated` with the new member.
 pub(crate) fn create_branch(
@@ -593,9 +667,10 @@ pub(crate) fn create_branch(
   if let Some(reply) = no_subversion_branch(&record) {
     return reply;
   }
-  let (name, from) = (spelled(&record, name), spelled(&record, from));
-  let Some(source) = state.db.partition().repositories().branch(record.id, &from) else {
-    return refused(Refusal::NotFound);
+  let name = spelled(&record, name);
+  let source = match source_of(state, &record, from) {
+    Ok(source) => source,
+    Err(refusal) => return refused(refusal),
   };
   let version = match branch_version(state, source, version) {
     Ok(version) => version,

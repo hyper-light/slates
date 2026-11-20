@@ -105,6 +105,22 @@ impl Repository for View {
       })
       .map(|old| old.node)
   }
+
+  fn tags_file(
+    &self,
+    _rev: crate::serve::Rev,
+    _admission: &mut crate::Admission,
+  ) -> Result<Option<Node>, crate::serve::Refusal> {
+    Ok(None)
+  }
+
+  fn tags_text(
+    &self,
+    _node: &Node,
+    _admission: &mut crate::Admission,
+  ) -> Result<Vec<u8>, crate::serve::Refusal> {
+    Err(crate::serve::Refusal::Store { what: "tags" })
+  }
 }
 
 /// Nothing held: an empty repository.

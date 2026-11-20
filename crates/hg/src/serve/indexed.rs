@@ -371,6 +371,47 @@ impl Repository for Indexed<'_> {
   fn draft_roots(&self) -> impl Iterator<Item = Node> {
     self.draft_roots.iter().copied()
   }
+
+  fn tags_file(&self, rev: Rev, admission: &mut Admission) -> Result<Option<Node>, Refusal> {
+    let row = self.row(rev).ok_or(Refusal::Graph { rev })?;
+    if row.manifest == NULL_NODE {
+      return Ok(None);
+    }
+    let manifest = self.text_of(Log::Manifest, &row.manifest, admission)?;
+    Ok(crate::manifest::find(&manifest, TAGS_PATH).map(|entry| entry.node))
+  }
+
+  fn tags_text(&self, node: &Node, admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
+    let text = self.text_of(Log::File(TAGS_PATH), node, admission)?;
+    let split = crate::filerev::split(&text).map_err(|_| Refusal::Store { what: "tags" })?;
+    Ok(split.bytes.to_vec())
+  }
+}
+
+/// Format: the path of the file Mercurial keeps its global tags in.
+const TAGS_PATH: &[u8] = b".hgtags";
+
+impl Indexed<'_> {
+  /// The whole text of `node` in `log` (the manifest log or `.hgtags`'s), charged to `admission` by its length before it
+  /// is read; refused as the store's fault where the index lacks it.
+  fn text_of(
+    &self,
+    log: Log<'_>,
+    node: &Node,
+    admission: &mut Admission,
+  ) -> Result<Vec<u8>, Refusal> {
+    let missing = Refusal::Store { what: "tags" };
+    let rev = self.index.rev(self.store, log, node).ok_or(missing)?;
+    let row = self.index.revision(self.store, log, rev).ok_or(missing)?;
+    if row.node != *node {
+      return Err(missing);
+    }
+    admission.charge(row.len)?;
+    self
+      .index
+      .revision_text(self.store, log, rev)
+      .ok_or(missing)
+  }
 }
 
 impl Store for Indexed<'_> {

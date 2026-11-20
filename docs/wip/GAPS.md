@@ -965,7 +965,10 @@
 > and revprops files from the index and the green, laid out a revision a step and generated when read; stock
 > `svnadmin verify`, `dump` (whole and `--deltas`) and `svnlook changed` read the golden repository's view as the
 > repository the dump came from. Part 2: `fsfs::transaction_files`, an open transaction's directory and
-> prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. Owed: P3 (the presenter under
+> prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. P3's
+> referenced file BUILT (2026-11-20, main's ruling 2): `slates_vfs::referenced`, a read-only file of content-store
+> identities read through the store's seam (zero bytes copied over a view of 64 texts), held by its volume until
+> released, `EROFS` to every change; the server's seam over `ContentStore`. Owed: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
@@ -1747,6 +1750,13 @@
 > now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
 > (`hg_push::owner_name`); `hg_view`'s test creates `topic` from `one`, retires and binds it, listed as a bookmark at
 > `one`'s node, gone, and back. Owed (main's lane): the same with stock hg through the CLI (`hg pull`, `hg bookmarks`).
+> `--from` follows Mercurial's own lookup (w-hg, 2026-11-20; main's ruling): `--from default` was refused `NotFound`,
+> read as the bookmark `default`. It now resolves as 7.2's `revsymbol` does (`slates_hg::serve::lookup::resolve_name`:
+> a bookmark, then a global tag, then the branch's tip-most open head) and branches from the green heading that
+> changeset; the served `lookup` resolves tags too (`slates_hg::tags`, held to 7.2's own `_readtags`/`_updatetags` on
+> 300 generated `.hgtags` sequences and to `hg log -r` on a recorded repository). Owed: a branch made at a changeset no
+> line or bookmark heads (a tag inside a line's history), refused `Unsupported` until a green can be branched at the
+> version whose head it was.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -3068,7 +3078,9 @@
 >   more than one piece is now captured at the head, sealed in turns of an `ImageBuild` and made the image if the head
 >   has not moved (else dropped, still owed). **Still measured, debug under `taskpolicy -b` on main 359da2388:** a
 >   takeover's `make_taken` 38 ms of one poll's CPU; a forward-lane child 17 ms; the record period's capture of an owed
->   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall); and, after A-347's open, the takeover's
+>   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall. **A-763 (2026-11-20):** a live write ships the
+>   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
+>   309,760 after)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -7217,12 +7229,17 @@
 >   since 2026-11-20: its waits were already judged (`wait_answers` in CPU, `FleetWait` over the box's CPU share,
 >   b25a5b7a6); its successor wait now judged over the instance's processes and its NFS barrier read without a timeout.
 >   `support/relay` keeps its bounds: they wait on the test's own relay thread and loopback datagrams, no slates process,
->   and its absence waits are what its tests prove. Owed in `cli/tests`: `vm`, `start_judgment`
+>   and its absence waits are what its tests prove. The interop suites (`git_interop`, `hg_interop`, `svn_interop`,
+>   `svn_http_reports`) and `issuer_surface` since 2026-11-20: a daemon's settling and the anchor's lines judged in the
+>   anchor's tree (`process_wait::Judged`, which every platform builds; `Judged::of_all` judges several trees together);
+>   their stock clients' `exit_within` keeps `PATIENCE`, owed: a client waiting on a stock server has no slates tree to
+>   judge beside it. `load_scale` since 2026-11-20: its `eventually` and its wait for an anchor's daemon judged the
+>   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
+>   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `vm`, `start_judgment`
 >   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
 >   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
->   own platforms), `cli/src/verbs.rs`' test module
->   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
+>   own platforms), `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
 >   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or

@@ -1006,7 +1006,9 @@ impl Error {
   /// A volume-core refusal, by the class of thing a consumer does about it (A-299).
   fn of_volume(refusal: VolumeRefusal) -> Error {
     match refusal {
-      VolumeRefusal::Pinned | VolumeRefusal::DaxMapped => Error::Busy(Busy::Volume(refusal)),
+      VolumeRefusal::Pinned | VolumeRefusal::DaxMapped | VolumeRefusal::ReferencesHeld => {
+        Error::Busy(Busy::Volume(refusal))
+      }
       VolumeRefusal::StaleHandle | VolumeRefusal::BaseDrift => Error::Stale(Stale::Volume(refusal)),
       VolumeRefusal::NotPermitted | VolumeRefusal::LinkProtected => {
         Error::Denied(Denied::Volume(refusal))
@@ -1016,9 +1018,9 @@ impl Error {
       | VolumeRefusal::DigestCacheFull
       | VolumeRefusal::Memory
       | VolumeRefusal::RetentionExceeded => Error::Exhausted(Exhausted::Volume(refusal)),
-      VolumeRefusal::JournalIncomplete { .. } | VolumeRefusal::RecoveryVersion { .. } => {
-        Error::Unusable(Unusable::Volume(refusal))
-      }
+      VolumeRefusal::JournalIncomplete { .. }
+      | VolumeRefusal::RecoveryVersion { .. }
+      | VolumeRefusal::ReferenceUnresolved => Error::Unusable(Unusable::Volume(refusal)),
       VolumeRefusal::NotDirectory
       | VolumeRefusal::IsDirectory
       | VolumeRefusal::NotEmpty
@@ -1796,7 +1798,7 @@ mod tests {
   #[test]
   fn a_volume_cores_holders_and_moved_views_are_typed() {
     use slates_ipc::protocol::VolumeRefusal as V;
-    for held in [V::Pinned, V::DaxMapped] {
+    for held in [V::Pinned, V::DaxMapped, V::ReferencesHeld] {
       assert_eq!(volume_refused(held), Error::Busy(Busy::Volume(held)));
     }
     for moved in [V::StaleHandle, V::BaseDrift] {
@@ -1836,7 +1838,7 @@ mod tests {
       found: 3,
       expected: 4,
     };
-    for unusable in [journal, image] {
+    for unusable in [journal, image, V::ReferenceUnresolved] {
       assert_eq!(
         volume_refused(unusable),
         Error::Unusable(Unusable::Volume(unusable))
