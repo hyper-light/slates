@@ -45,6 +45,14 @@
   recovery deleted-file 1/1. To land: fresh worktree from origin/main, squash, docs (A-214 status, GAPS, BENCHMARKS).
 - A/B now branch-based (A = branch~2, B = branch tip), no sync: r6 macOS, r7 Linux (both queued). r5 was stopped by me
   just as it started on d1323898 (mistake).
+- A/B DONE (r6, big Studio, release, interleaved x3): provisioning 1-client p99 A 226.7/197.4/203.5 vs B
+  232.5/200.6/182.3 us (both fail 50 us at load 9-31 alike); NFS best equal; kept rounds ~5% to A; NFS peak RSS A
+  1,137-1,139 vs B 625-627 MiB. => removal.
+- A-777 LANDED main 21a306a04 (reserve removed, -907 lines; BENCHMARKS entry with all N; design A-214 status + A-777
+  section; GAPS). Worktree ~/slates-work/w-sizing-land. Branch agents/w-sizing-noprefault kept until r7 (Linux A/B) runs.
+- r12 (kiln, d1323898, its hg source ~/.cache/w-hg-mem/hg 84 MB): hg history push before (47dc24b72) vs after
+  (21a306a04), interleaved BAAB: rss, top MEM, system free/reusable, status content ranges after push and after 20 s.
+- Proposal to main: inbox/main-from-w-sizing-content-extents.md (content as extents made on demand; needs ruling).
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 
