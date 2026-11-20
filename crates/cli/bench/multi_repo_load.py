@@ -5,7 +5,8 @@ Ada's goal of 2026-11-20: one server serves toy repositories and monorepos at on
 
 What it shows. Whether one daemon divides itself among many repositories so that a huge or hot repository never
 starves the others: per size class, each push's wall time to its whole answer at p50 and p99 against the same class's
-push made alone (its starvation ratio), the refusals by kind, and the daemon's resident set before and at its peak.
+push made alone (its starvation ratio), split into connecting, sending the whole request and waiting for the answer;
+the refusals by kind; and the daemon's resident set before and at its peak.
 
 The repositories. A step of R repositories gives the repository of rank i (1 to R) the pack of size class
 `classes - 1 - min(classes - 1, d(i))`, where d(1) = 0 and d(i) = floor(log10(i - 1)) + 1: rank 1 the largest, ranks
@@ -99,11 +100,19 @@ def pressed() -> bool:
     return level.isdigit() and int(level) > 1
 
 
+# Each push's time split in three, the sum its wall time (A-724: where a starved push waits): connecting, sending the
+# whole request (until the socket took its last byte), and waiting from then for the whole answer.
+SPLITS: dict[str, tuple[float, float, float]] = {}
+
+
 async def push(port: int, token: str, repository: str, body: bytes, branch: str) -> tuple[float, str]:
-    """One push over its own connection: its wall time to the whole answer, and `ok` or its refusal's words."""
+    """One push over its own connection: its wall time to the whole answer, and `ok` or its refusal's words. Its split
+    is kept in SPLITS under its repository and branch."""
     start = time.perf_counter()
+    connected = sent = start
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        connected = time.perf_counter()
         head = (
             f"POST /{repository}/git-receive-pack HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
             f"Authorization: Bearer {token}\r\nContent-Type: application/x-git-receive-pack-request\r\n"
@@ -112,6 +121,7 @@ async def push(port: int, token: str, repository: str, body: bytes, branch: str)
         writer.write(head)
         writer.write(body)
         await writer.drain()
+        sent = time.perf_counter()
         status_line = await reader.readline()
         headers = {}
         while (line := await reader.readline()) not in (b"\r\n", b"\n", b""):
@@ -141,7 +151,9 @@ async def push(port: int, token: str, repository: str, body: bytes, branch: str)
             words = "report: " + ("; ".join(found)[:120] if found else repr(text[:80]))
     except (OSError, asyncio.IncompleteReadError, ValueError) as error:
         words = f"transport: {type(error).__name__}: {error}"[:120]
-    return time.perf_counter() - start, words
+    end = time.perf_counter()
+    SPLITS[f"{repository}/{branch}"] = (connected - start, max(0.0, sent - connected), max(0.0, end - sent))
+    return end - start, words
 
 
 async def sample_peak(pid: int, stop: asyncio.Event) -> int:
@@ -170,6 +182,8 @@ async def burst(daemon: Daemon, pushes: list[tuple[str, int, bytes, str]]) -> tu
     stop.set()
     peak = await sampler
     results = [(size, took, words) for (_, size, _, _), (took, words) in zip(pushes, answers)]
+    splits = [SPLITS.get(f"{name}/{branch}", (0.0, 0.0, 0.0)) for name, _, _, branch in pushes]
+    burst.splits = [(size, split) for (_, size, _, _), split in zip(pushes, splits)]
     return results, wall, before, peak
 
 
@@ -253,6 +267,10 @@ def main():
             for _, words in mine:
                 kinds[words] = kinds.get(words, 0) + 1
             p99 = quantile(times, 0.99)
+            parts = [split for got, split in burst.splits if got == size]
+            for at, name in enumerate(("connect", "send", "answer")):
+                values = [split[at] for split in parts]
+                print(f"    {name}: p50 {quantile(values, 0.5):.3f} s, p99 {quantile(values, 0.99):.3f} s", flush=True)
             print(f"  class {size}: {len(mine)} pushes over {classes.count(size)} repositories, "
                   f"p50 {quantile(times, 0.5):.3f} s, p99 {p99:.3f} s, starvation {p99 / alone[size]:.1f}x alone; "
                   + ", ".join(f"{k} x{v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])), flush=True)
