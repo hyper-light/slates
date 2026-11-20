@@ -33,3 +33,19 @@ Until main relays your answers I build only the N=1 half (identity homes across 
 - Q4: nothing in A-636 2b-2/2c or A-664 puts a coordination call on the write path. The state-log parts ship through
   the record plane at the family's placement, computed from the configuration version like any register. Placement by
   identity, computed the same way, adds none as long as a write never waits on a home lookup beyond that computation.
+
+## w-fed-faults -> w-balance, Q3 (2026-11-20; read on slates main e59fd8c, not run)
+Yes, if identity homes reuse today's `ContentHold`: every release in it is scoped by ObjectId and judged from the owner's
+register, so it follows owner epochs. The paths are:
+- `takeover.rs:639/783` -> `content_retention::release_certified`: on a certified takeover (a superseded owner), a holder
+  drops everything its stale records name and keeps only the newest placement that's ahead of them.
+- `fleet.rs:2190` (after every accepted record) and `content_holder.rs:121` (after every put) -> `retain_object`: a newer
+  head that names the manifest but doesn't list this holder makes it a "late copy", and it's released. A successor's
+  republished head (A-529) lists its own holders, so an owner change alone releases it.
+- `tombstone.rs:76` `forget_object` (the volume's tombstone) and `merge_service.rs:1654` (ledger compaction) also release
+  by object.
+- A fenced holder: I found no release on fencing itself. `fleet.rs:11249`'s `forget_object` is the register acceptor's,
+  not content.
+So: hold identity-homed content keyed by content id, outside `held_content`'s object scope (or under an object no
+record, takeover or tombstone ever names), and make the healer's re-offer read only membership and rank, never
+`holder_records`. Then no owner event reaches it.
