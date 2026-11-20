@@ -65,7 +65,7 @@
 > 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
-> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test BUILT 2026-11-20 (`WorkOp::Copy`, A-626 part 4's work verb; the SDKs', MCP's and the CLI's surfaces for it owed);
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
