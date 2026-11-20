@@ -226,3 +226,16 @@
     them at the commit from the pack (turned), so the in-flight peak drops; landed size unchanged until w-store.
   * Red: in-flight resident of a v1.5.0 push before landing <= k*pack + base (today the quarantine holds inflated).
   * Worktree ~/slates-work/w-git-packed has a DIAG commit at HEAD: make a fresh worktree from origin/main first.
+- B2 STEP LIST (worktree ~/slates-work/w-git-inflight, fresh from origin/main 62e5e5009):
+  A. slates-git Push owns the in-flight pack (Vec, appended per run by the server before session.input_into) and is
+     a PackSource; Push gains `placed: BTreeMap<id,(Kind, offset, len, identity)>` beside the vcs Quarantine; Push
+     accessors (object, held, held_after, len, is_empty, abandon/release_holds) cover both.
+  B. Repository::locate gains Place::InPack{kind, offset, len}; bytes_of / references / tag reads go through
+     store::packed::read (Bases = index + push placed); PushedObjects view the same.
+  C. Staging's Rows unit puts a fresh in-pack object's bytes into the content store (put_object) for its row contents,
+     a unit a turn (landed size unchanged until w-store's changeset store).
+  D. Server intake admit_queued records places (identity via ContentStore::object_id, no put); Quarantined::content
+     reads in place; the session stops keeping its own pack copy (take_pack -> the push's).
+  E. Record writer names by identity (unchanged); its pack is the push's.
+  F. Red: in-flight resident of a v1.5.0 push before its seal <= k*pack + base (diag measured 16.9-34 MiB admission +
+     content 14 MiB+ during input today).

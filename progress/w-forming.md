@@ -1,3 +1,12 @@
+# STATUS 2026-11-20 late (w-forming): A-768 LANDED 586cf5035 (main merge 4c9e0b759; base 51a061d36): a live log's
+# whole capture read in turns from pinned chunks (Chunk::pins, a free while pinned waits for the last unpin;
+# Volume::pin_extents; Capture stage of WholeBuild; pins released at last turn / drop_build / forget / no longer live).
+# Red: capture in 1 turn for 524,288 B; after 9 turns at zero quantum, body == one-turn read at the same head with the
+# head overwritten+unlinked between turns; pins 0 after completion, drop, forget. Probe split (debug, -b): image 2.0-3.0
+# ms (still one turn), reads 4.5-6 ms (now sliced); large delta runs 3.3 ms (one turn). Earlier: 4d53c3a07 (real base
+# 6337049f6), A-763 1b093e7d4. NEXT per main: (a) takeover rebuild turn 193 ms -> slices; (b) takeover stall
+# (no survivor serving), anchor log ~/.cache/w-forming-runs/takeover-stall-pr15-run1.log. Run requests queued.
+
 # STATUS 2026-11-20 (w-forming): main's queue DONE. Landed on main: b25a5b7a6 (CPU-judged start wait), 2add29641 +
 # 897fda7bd (forming 147/148, GAPS), a1439bcb1 (run 7 not reproduced), cfca7dd22 (A-740 helper labels), 1933e6ca6
 # (FleetWait = window / cpu share), cdfbb4020 (A-755 seal pieces sized to quantum), A-757 parts 1 adacdeec8, 2 5a9a5d41e,

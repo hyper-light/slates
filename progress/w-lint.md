@@ -175,3 +175,16 @@
 - Windows r34 at 159f1c8 (r33 lost to a kiln timeout): referenced-content tests from bc6cc7ab1 (vfs tests/referenced.rs
   unwrap_in_result, slicing, cast; server vcs_store/referenced.rs cast) -> 6e5f6a53a, landed via 2d3f218cb; vfs
   referenced 6 pass, server referenced 2 pass locally.
+
+## 2026-11-20 main's run requests (g226 / 599603559, slates-mem 80 -> 83, cross matrix)
+- (2) `cargo xtask unsafe`: slates-mem 83/83 ok. The three new sites in mem/src/heap.rs (zeroed malloc_statistics_t,
+  malloc_zone_statistics on macOS; mallinfo2 on glibc) each have a SAFETY line directly above.
+- (3) Cross clippy matrix (ci.yml's crate set, pure-hash) on 51a061d36: x86_64/aarch64 linux gnu, x86_64/aarch64 linux
+  musl, x86_64/aarch64 windows msvc all clean -- mallinfo2 compiled on both gnu triples, the None fallback on musl and
+  Windows.
+- (1) Native: Linux amd64 (r36) and jupiter Windows (r35) clippy + slates-mem heap test running in the background.
+- Host wall on 606d0d0ec was broken by the day's landings; fixed in place: 60cc4073a (git learn/packed/answer, svn
+  records/step, hg serve tests, server credentials test split, cli memory_lines, xtask's included process_wait.rs,
+  Cargo.lock missing xtask's libc so --locked refused) and 111d561a0 (merge stack boxing + named_tests split, svn dav
+  site no-op as_deref). recovery.rs's two sleeps (6ea16f4c5) sent to w-sizing (inbox/w-sizing-from-w-lint.md).
+- xtask tests/helm_chart.rs the_render_equals_the_golden fails here; not from these changes; noted, not chased yet.
