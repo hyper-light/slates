@@ -82,6 +82,10 @@ pub struct Refined {
   pub anchored: bool,
 }
 
+/// A unit's tallies by its hash.
+/// Shape: its occurrences in the base and in the post, then where it last occurred in each (four).
+type UnitCounts = [u32; 4];
+
 /// A sub-problem of the search: units `[b0, b1)` of the base's middle against `[p0, p1)` of the writer's.
 #[derive(Clone, Copy, Debug)]
 struct Region {
@@ -103,7 +107,7 @@ pub struct Refiner {
   backward: Vec<usize>,
   stack: Vec<Region>,
   hunks: Vec<Hunk>,
-  counts: std::collections::HashMap<u64, [u32; 4], std::hash::BuildHasherDefault<Fnv>>,
+  counts: std::collections::HashMap<u64, UnitCounts, std::hash::BuildHasherDefault<Fnv>>,
   anchors: Vec<(u32, u32)>,
   piles: Vec<u32>,
   previous: Vec<u32>,
@@ -146,6 +150,7 @@ enum Class {
 }
 
 fn class(byte: u8) -> Class {
+  // Format: UTF-8; a byte at or past 0x80 belongs to a character outside ASCII, a word's.
   if byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80 {
     Class::Word
   } else if byte == b' ' || byte == b'\t' {
@@ -227,6 +232,126 @@ fn set(v: &mut [usize], k: isize, offset: usize, x: usize) {
   }
 }
 
+/// A middle-snake search's fixed shape (Myers 1986, §4b): the region's two lengths, their difference and its parity,
+/// and the diagonal vectors' offset.
+#[derive(Clone, Copy, Debug)]
+struct Snake {
+  n: usize,
+  m: usize,
+  delta: isize,
+  odd: bool,
+  offset: usize,
+}
+
+/// A length as a diagonal coordinate: a middle's units, far below `isize::MAX`.
+fn signed(value: usize) -> isize {
+  isize::try_from(value).unwrap_or(isize::MAX)
+}
+
+/// A diagonal coordinate the caller holds non-negative, as an index.
+fn unsigned(value: isize) -> usize {
+  usize::try_from(value).unwrap_or(0)
+}
+
+/// The furthest x a round `d` reaches on diagonal `k` of `v`, before its snake: from `k + 1` down, or `k - 1` across.
+fn furthest(v: &[usize], k: isize, d: isize, offset: usize) -> usize {
+  if k == d.saturating_neg()
+    || (k != d && get(v, k.saturating_sub(1), offset) < get(v, k.saturating_add(1), offset))
+  {
+    get(v, k.saturating_add(1), offset)
+  } else {
+    get(v, k.saturating_sub(1), offset).saturating_add(1)
+  }
+}
+
+/// Round `d` of the forward search over region `r`: each diagonal's furthest reach and its snake, into `vf`; the
+/// middle snake's start where it overlaps the backward search's reach in `vb` (odd `delta`).
+fn forward_round(
+  vf: &mut [usize],
+  vb: &[usize],
+  texts: &Texts<'_>,
+  r: Region,
+  s: Snake,
+  d: isize,
+  steps: &mut u64,
+) -> Option<(usize, usize)> {
+  let mut k = d.saturating_neg();
+  while k <= d {
+    *steps = steps.saturating_add(1);
+    let mut x = furthest(vf, k, d, s.offset);
+    let y0 = signed(x).saturating_sub(k);
+    let x0 = x;
+    if y0 >= 0 {
+      let mut y = unsigned(y0);
+      while x < s.n && y < s.m && texts.same(r.b0.saturating_add(x), r.p0.saturating_add(y), steps)
+      {
+        x = x.saturating_add(1);
+        y = y.saturating_add(1);
+      }
+    }
+    set(vf, k, s.offset, x);
+    let other = k.saturating_sub(s.delta);
+    if s.odd
+      && other.abs() < d
+      && x.saturating_add(get(vb, other.saturating_neg(), s.offset)) >= s.n
+      && y0 >= 0
+    {
+      return Some((r.b0.saturating_add(x0), r.p0.saturating_add(unsigned(y0))));
+    }
+    k = k.saturating_add(2);
+  }
+  None
+}
+
+/// Round `d` of the backward search over region `r`, from the ends: each diagonal's furthest reach into `vb`; the
+/// middle snake's point where it overlaps the forward search's reach in `vf` (even `delta`).
+fn backward_round(
+  vb: &mut [usize],
+  vf: &[usize],
+  texts: &Texts<'_>,
+  r: Region,
+  s: Snake,
+  d: isize,
+  steps: &mut u64,
+) -> Option<(usize, usize)> {
+  let mut k = d.saturating_neg();
+  while k <= d {
+    *steps = steps.saturating_add(1);
+    let mut x = furthest(vb, k, d, s.offset);
+    let mut y = signed(x).saturating_sub(k);
+    if y >= 0 {
+      while x < s.n
+        && unsigned(y) < s.m
+        && texts.same(
+          r.b0.saturating_add(s.n.saturating_sub(x).saturating_sub(1)),
+          r.p0
+            .saturating_add(s.m.saturating_sub(unsigned(y)).saturating_sub(1)),
+          steps,
+        )
+      {
+        x = x.saturating_add(1);
+        y = y.saturating_add(1);
+      }
+    }
+    set(vb, k, s.offset, x);
+    let other = k.saturating_sub(s.delta);
+    if !s.odd
+      && other.abs() <= d
+      && x.saturating_add(get(vf, other.saturating_neg(), s.offset)) >= s.n
+      && y >= 0
+      && unsigned(y) <= s.m
+      && x <= s.n
+    {
+      return Some((
+        r.b0.saturating_add(s.n.saturating_sub(x)),
+        r.p0.saturating_add(s.m.saturating_sub(unsigned(y))),
+      ));
+    }
+    k = k.saturating_add(2);
+  }
+  None
+}
+
 impl Refiner {
   /// A refiner with empty scratch.
   pub fn new() -> Refiner {
@@ -267,7 +392,7 @@ impl Refiner {
         self
           .counts
           .capacity()
-          .saturating_mul(size_of::<(u64, [u32; 4])>()),
+          .saturating_mul(size_of::<(u64, UnitCounts)>()),
       )
       .saturating_add(
         self
@@ -385,10 +510,8 @@ impl Refiner {
     self.hunks.push(hunk);
   }
 
-  /// Fills the stack with the gaps between the anchors of the two middles' `counts` units: the units that occur exactly
-  /// once in each, in an order both files keep (the longest increasing run of their positions, patience sorting, as
-  /// Bram Cohen's patience diff anchors on unique lines). The gaps are pushed last first, so they are searched in order.
-  fn anchor(&mut self, texts: &Texts<'_>, (n, m): (usize, usize)) {
+  /// Counts each unit of the two middles (`n` and `m` units) by its hash: how often it occurs in each, and where last.
+  fn count_units(&mut self, texts: &Texts<'_>, (n, m): (usize, usize)) {
     self.counts.clear();
     for (side, units) in [(0usize, n), (1, m)] {
       for index in 0..units {
@@ -407,6 +530,13 @@ impl Refiner {
         }
       }
     }
+  }
+
+  /// Fills the stack with the gaps between the anchors of the two middles' `counts` units: the units that occur exactly
+  /// once in each, in an order both files keep (the longest increasing run of their positions, patience sorting, as
+  /// Bram Cohen's patience diff anchors on unique lines). The gaps are pushed last first, so they are searched in order.
+  fn anchor(&mut self, texts: &Texts<'_>, (n, m): (usize, usize)) {
+    self.count_units(texts, (n, m));
     // The candidates in base order, then the longest run increasing in post order.
     self.anchors.clear();
     for index in 0..n {
@@ -523,7 +653,7 @@ impl Refiner {
   ) -> Option<(usize, usize)> {
     let n = r.b1.saturating_sub(r.b0);
     let m = r.p1.saturating_sub(r.p0);
-    let delta = (n as isize).saturating_sub(m as isize);
+    let delta = signed(n).saturating_sub(signed(m));
     let odd = delta & 1 != 0;
     let most = n.saturating_add(m).saturating_add(1) / 2;
     // A round d visits d + 1 diagonals each way, so the budget left bounds d by its square root.
@@ -535,85 +665,35 @@ impl Refiner {
     self.forward.resize(width, 0);
     self.backward.clear();
     self.backward.resize(width, 0);
-    let (vf, vb) = (&mut self.forward, &mut self.backward);
-    for d in 0..=(rounds as isize) {
-      let mut k = d.saturating_neg();
-      while k <= d {
-        done.steps = done.steps.saturating_add(1);
-        let mut x = if k == d.saturating_neg()
-          || (k != d && get(vf, k.saturating_sub(1), offset) < get(vf, k.saturating_add(1), offset))
-        {
-          get(vf, k.saturating_add(1), offset)
-        } else {
-          get(vf, k.saturating_sub(1), offset).saturating_add(1)
-        };
-        let y = (x as isize).saturating_sub(k);
-        let (x0, y0) = (x, y);
-        if y >= 0 {
-          let mut y = y as usize;
-          while x < n
-            && y < m
-            && texts.same(
-              r.b0.saturating_add(x),
-              r.p0.saturating_add(y),
-              &mut done.steps,
-            )
-          {
-            x = x.saturating_add(1);
-            y = y.saturating_add(1);
-          }
-        }
-        set(vf, k, offset, x);
-        let other = k.saturating_sub(delta);
-        if odd
-          && other.abs() < d
-          && x.saturating_add(get(vb, other.saturating_neg(), offset)) >= n
-          && y0 >= 0
-        {
-          return Some((r.b0.saturating_add(x0), r.p0.saturating_add(y0 as usize)));
-        }
-        k = k.saturating_add(2);
+    let snake = Snake {
+      n,
+      m,
+      delta,
+      odd,
+      offset,
+    };
+    for d in 0..=signed(rounds) {
+      if let Some(at) = forward_round(
+        &mut self.forward,
+        &self.backward,
+        texts,
+        r,
+        snake,
+        d,
+        &mut done.steps,
+      ) {
+        return Some(at);
       }
-      let mut k = d.saturating_neg();
-      while k <= d {
-        done.steps = done.steps.saturating_add(1);
-        let mut x = if k == d.saturating_neg()
-          || (k != d && get(vb, k.saturating_sub(1), offset) < get(vb, k.saturating_add(1), offset))
-        {
-          get(vb, k.saturating_add(1), offset)
-        } else {
-          get(vb, k.saturating_sub(1), offset).saturating_add(1)
-        };
-        let mut y = (x as isize).saturating_sub(k);
-        if y >= 0 {
-          while x < n
-            && (y as usize) < m
-            && texts.same(
-              r.b0.saturating_add(n.saturating_sub(x).saturating_sub(1)),
-              r.p0
-                .saturating_add(m.saturating_sub(y as usize).saturating_sub(1)),
-              &mut done.steps,
-            )
-          {
-            x = x.saturating_add(1);
-            y = y.saturating_add(1);
-          }
-        }
-        set(vb, k, offset, x);
-        let other = k.saturating_sub(delta);
-        if !odd
-          && other.abs() <= d
-          && x.saturating_add(get(vf, other.saturating_neg(), offset)) >= n
-          && y >= 0
-          && (y as usize) <= m
-          && x <= n
-        {
-          return Some((
-            r.b0.saturating_add(n.saturating_sub(x)),
-            r.p0.saturating_add(m.saturating_sub(y as usize)),
-          ));
-        }
-        k = k.saturating_add(2);
+      if let Some(at) = backward_round(
+        &mut self.backward,
+        &self.forward,
+        texts,
+        r,
+        snake,
+        d,
+        &mut done.steps,
+      ) {
+        return Some(at);
       }
       if done.steps > budget {
         return None;
@@ -772,6 +852,9 @@ fn whole_replacement(ops: &[Op]) -> Option<(u64, u64, u64)> {
   }
 }
 
+/// A path's two texts, base and post, as [`refine_rewrites`]' `files` lends them.
+pub type BaseAndPost<'f> = (Cow<'f, [u8]>, Cow<'f, [u8]>);
+
 /// Recovers every whole-file replacement in `doc` as the edit it was (this module's docs), rewriting `doc`'s ops and
 /// relaying the post-state `plan` compactly (the seal's layout: each laid run at the next offset, in the order the seal
 /// laid them). `files` answers a path's base bytes and the writer's bytes; a path it cannot answer, or whose bytes do
@@ -781,7 +864,7 @@ pub fn refine_rewrites<'f>(
   doc: &mut OpsDoc,
   plan: &mut PostStatePlan,
   refiner: &mut Refiner,
-  files: &mut dyn FnMut(&str) -> Option<(Cow<'f, [u8]>, Cow<'f, [u8]>)>,
+  files: &mut dyn FnMut(&str) -> Option<BaseAndPost<'f>>,
 ) -> Rewrites {
   let mut done = Rewrites::default();
   // Each op, with where its bytes sat in the old layout (`None` when not laid): ops are in canonical order, so a

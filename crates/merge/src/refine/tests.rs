@@ -13,6 +13,11 @@ use crate::increment::{Base, PostStatePlan, VolumeOp, compose_volume_planned};
 use crate::ops_doc::{Op, OpKind};
 use crate::origin::Origin;
 
+/// A test's offset or length as an index: test texts are far below `usize::MAX`.
+fn ix(value: u64) -> usize {
+  usize::try_from(value).unwrap()
+}
+
 const PATH: &str = "src/lib.rs";
 
 /// The reference applier: the writer's file rebuilt from the base and the ops (base coordinates, any order a path's
@@ -28,18 +33,16 @@ fn apply(base: &[u8], post: &[u8], ops: &[Op]) -> Vec<u8> {
   let mut out = Vec::new();
   let mut cursor = 0usize;
   for op in sorted {
-    let at = op.at as usize;
+    let at = ix(op.at);
     out.extend_from_slice(&base[cursor..at.max(cursor)]);
     cursor = cursor.max(at);
-    let len = op.len as usize;
+    let len = ix(op.len);
     match op.kind {
       OpKind::Overwrite => {
-        out.extend_from_slice(&post[op.src as usize..op.src as usize + len]);
+        out.extend_from_slice(&post[ix(op.src)..ix(op.src) + len]);
         cursor = at + len;
       }
-      OpKind::Insert | OpKind::Extend => {
-        out.extend_from_slice(&post[op.src as usize..op.src as usize + len])
-      }
+      OpKind::Insert | OpKind::Extend => out.extend_from_slice(&post[ix(op.src)..ix(op.src) + len]),
       OpKind::Delete | OpKind::Truncate => cursor = at + len,
       other => panic!("not a content op: {other:?}"),
     }
@@ -70,7 +73,7 @@ fn text() -> impl Strategy<Value = Vec<u8>> {
     Just(&b")"[..]),
     Just(&b";"[..]),
     Just(&b"42"[..]),
-    Just(&"é".as_bytes()[..]),
+    Just("é".as_bytes()),
   ];
   prop::collection::vec(token, 0..80).prop_map(|tokens| tokens.concat())
 }
@@ -101,7 +104,7 @@ proptest! {
         (&base, hunk.base_at), (&base, hunk.base_at + hunk.base_len),
         (&post, hunk.post_at), (&post, hunk.post_at + hunk.post_len),
       ] {
-        let at = at as usize;
+        let at = ix(at);
         prop_assert!(at == 0 || at == text.len() || boundary(Grain::Token, text, at), "{hunk:?}");
       }
     }
@@ -123,11 +126,11 @@ fn a_one_token_change_in_a_rewrite_is_one_token_range() {
   assert_eq!(hunks.len(), 1, "{hunks:?}");
   let hunk = hunks[0];
   assert_eq!(
-    &base[hunk.base_at as usize..(hunk.base_at + hunk.base_len) as usize],
+    &base[ix(hunk.base_at)..ix(hunk.base_at + hunk.base_len)],
     b"compute"
   );
   assert_eq!(
-    &post[hunk.post_at as usize..(hunk.post_at + hunk.post_len) as usize],
+    &post[ix(hunk.post_at)..ix(hunk.post_at + hunk.post_len)],
     b"measure"
   );
 }
@@ -200,7 +203,7 @@ fn rewrite(
   let (mut doc, mut plan) = compose_volume_planned(&base_of, &journal).unwrap();
   if refine {
     let done = refine_rewrites(&mut doc, &mut plan, &mut Refiner::new(), &mut |path| {
-      (path == PATH).then(|| (Cow::Borrowed(base), Cow::Borrowed(post)))
+      (path == PATH).then_some((Cow::Borrowed(base), Cow::Borrowed(post)))
     });
     assert_eq!(done.paths, 1, "the rewrite was recognised: {done:?}");
   }
@@ -220,12 +223,12 @@ fn laid(ops: &[Op], plan: &PostStatePlan, file: &[u8]) -> Vec<u8> {
   let mut post = Vec::new();
   for op in ops {
     if matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend) {
-      let from = plan[&op.src] as usize;
-      let end = (op.src + op.len) as usize;
+      let from = ix(plan[&op.src]);
+      let end = ix(op.src + op.len);
       if post.len() < end {
         post.resize(end, 0);
       }
-      post[op.src as usize..end].copy_from_slice(&file[from..from + op.len as usize]);
+      post[ix(op.src)..end].copy_from_slice(&file[from..from + ix(op.len)]);
     }
   }
   post
@@ -288,8 +291,14 @@ fn two_rewrites_of_different_lines_merge_as_their_edits_would() {
     matches!(two, Outcome::Conflict { .. }),
     "unrefined: {two:?}"
   );
+  both_edits_held(&base, (&first, &second), &both);
+}
+
+/// Refined, through truncate-and-write and through write-and-rename: both of `first` and `second` accepted over `base`,
+/// the green holding `both`.
+fn both_edits_held(base: &str, (first, second): (&str, &str), both: &str) {
   for rename in [false, true] {
-    let (one, two, content) = judge(&base, &first, &second, (rename, true));
+    let (one, two, content) = judge(base, first, second, (rename, true));
     assert!(matches!(one, Outcome::Accepted { .. }), "{one:?}");
     assert!(matches!(two, Outcome::Accepted { .. }), "{two:?}");
     assert_eq!(content, both);
@@ -391,8 +400,8 @@ fn a_reindent_of_every_line_is_anchored_and_touches_only_blanks() {
   assert_eq!(cost.kept_whole, 0, "{cost:?}");
   assert_eq!(hunks.len(), 2_000);
   for hunk in hunks {
-    let added = &post[hunk.post_at as usize..(hunk.post_at + hunk.post_len) as usize];
-    let removed = &base[hunk.base_at as usize..(hunk.base_at + hunk.base_len) as usize];
+    let added = &post[ix(hunk.post_at)..ix(hunk.post_at + hunk.post_len)];
+    let removed = &base[ix(hunk.base_at)..ix(hunk.base_at + hunk.base_len)];
     assert!(added.iter().chain(removed).all(|b| *b == b' '), "{hunk:?}");
   }
   // Memory: the scratch is linear in the two files: units (four bytes each, both files) and the anchors' table (one
