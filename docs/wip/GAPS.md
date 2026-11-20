@@ -176,8 +176,9 @@
 > live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
 > in place); the landing appends that, where it appended every text whole. An import's record (version 3) writes a
 > manifest the index keeps as a delta as that delta and its base's node, never rebuilt (Mercurial's own manifests:
-> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. Owed: a made
-> changeset's record still holds its manifest whole (version 1); the names list (the changegroup names every node, so none is written yet);
+> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. A made changeset's
+> record (version 3 too) writes its manifest as its delta against its first parent's text (`write_made`'s `parent`,
+> read from the index; replayed through the same rebuild, held by A-731's rebuild test). Owed: the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.
 > **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
 > FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
@@ -2423,6 +2424,10 @@
 > run 21 failed after forming, a successor owner's shard 0 spinning 5.6 s without a step right after its takeover
 > (watchdog exit 4; owed, w-forming's queue). An earlier sweep on the build before A-735 hung twice on a replaced
 > member's client claim (A-735).
+> **Combined (2026-11-20, w-forming, same box and flow under `taskpolicy -b`, main with A-735):** 147 of 148 runs
+> formed and settled (sw48c 48/48, rp2 40/40, rp3 54/55, rp4 5/5 with the CPU-judged start wait), past the 143 at which
+> a 1-in-48 stall shows with 95% odds; the one other run (rp3 run 9) never reached forming, an initial daemon starved
+> past the old 30 s wall start wait (fixed in b25a5b7a6). No stall of membership in any run.
 > **Start waits under load (2026-11-20, w-forming; same box):** at load 29 to 31 on its 14 CPUs (other agents' builds,
 > Spotlight indexing cargo targets, a VM), the fleet daemons' control shards went 8 to 12 s between heartbeat turns
 > ("the control shard's beat task ran 12053 ms after its last turn", against windows of 1 to 4.2 s, with 4 to 35 long
