@@ -12304,9 +12304,14 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
 > fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
 > none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
-> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). Owed for git: the walk's own
-> sets (piece 2: negotiation and plan a step at a time, `upload::Answering`), the server driving it a turn at a time
-> within a request's room (piece 3, reverting A-713's shard room).
+> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). **Piece 2a BUILT (same
+> day):** the walk keeps what it meets as runs too (`negotiation::Held`: the paint's three sets, the commits sent, what
+> the client holds, the objects chosen, the trees done and opened, a `tree:` filter's depths aside), charged a run as a
+> set's runs grow, and its queue and stacks at their longest (`negotiation::Peak`), never once an entry pushed: a clone
+> of 3,000 commits pushed in one piece, 9,000 objects, is negotiated within 4 KiB (it was refused there, `PastAdmission`).
+> Positions met in no order (a set the store gave piece by piece) cost a run an object, 16 bytes against the 8 the sets
+> charged; one push's order costs a run a kind or less. Owed for git: the walk a step at a time and `upload::Answering`
+> (piece 2b), the server driving it a turn at a time within a request's room (piece 3, reverting A-713's shard room).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -52671,7 +52676,7 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name, its symbolic links `svn:special`
-  files; its copies owed until a work makes one); Mercurial's manifests by the
+  files, its copies copy-from rows); Mercurial's manifests by the
   same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
@@ -55991,3 +55996,18 @@ at each append and each snapshot); `crates/server` (`content_ranges`: the regist
   `a_copy_refusal_is_typed_invalid_by_its_case`; by use against a real daemon, a copy of nothing refused with its case:
   MCP's test, the Python SDK 4 of 4, the Node SDK 9 of 9, the CLI's JSON flow (`SLATES_TEST_CLI=1`); `slates-ipc
   --test wire_order` published; fmt clean.
+
+### A-664 Subversion objects, copies — A copy a work submits is the made revision's copy-from row (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Change.** `verbs::judge_submission` hands the version's copies (`vcs_store::svn_made::copies_of`, its increment's
+  `Copy` operations: destination, source, the source's version, which version N = revision N makes the copy-from
+  revision, and its replace) to `svn_made::make`. A copy's destination is a row with its copy source (`copy_row`): `add`,
+  or `replace` where something stood there or it replaces, the source's kind at its revision, its text and property list
+  set where the head differs from the source's; a path beneath it is judged against the source's node at the copy-from
+  revision (`copy_beneath`); a directory above a node added beneath it stood where it stood in the source. A copy the
+  version holds and the submit did not hand over is still refused, counted.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `repository::svn_commit::tests::
+  t_a664_svn_a_submitted_copy_is_a_copy_from_row` (red before: the copy refused, revision 2 unmade; green: its one row
+  adds `/branches/b` copied from `/trunk` at revision 1, the records hold `/branches/b/a.txt`, a client's revision lands
+  as 3); `cargo test --locked -p slates-server --lib -- repository::svn_commit:: vcs_svn vcs_store:: identities::
+  --test-threads=4` 116 of 116; fmt clean.
+- **Owed.** A stock `svn log -v` and `svn checkout` over the made copy by use (main's).

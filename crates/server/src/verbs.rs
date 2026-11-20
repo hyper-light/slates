@@ -9693,6 +9693,9 @@ fn judge_submission(
   crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
     slates_merge::engine::Outcome::Accepted { version } => {
+      // The copies the version made, read before the increment's parts move: a Subversion green's revision names them
+      // (`vcs_store::svn_made`).
+      let copies = crate::vcs_store::svn_made::copies_of(&inc);
       // The wait goes first, in this transaction, so a version is never durable without it (A-252).
       if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
         return refused(refusal_of_db(&e));
@@ -9732,7 +9735,7 @@ fn judge_submission(
       crate::vcs_store::commits::after_submit(state, green_id, version, &policy.authorship);
       // A Subversion repository's green: the version becomes the revision the server makes of it, recorded in this
       // transaction (A-664's Subversion objects, `vcs_store::svn_made`).
-      crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship);
+      crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship, &copies);
       // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
       // transaction (A-731, `vcs_store::hg_made`).
       crate::vcs_store::hg_made::make(state, green_id, version, &policy.authorship);
