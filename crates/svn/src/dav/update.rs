@@ -222,7 +222,7 @@ impl UpdateWalk {
       let before = written.len();
       match self.drive.next(&sources, budget.steps.max(1)) {
         Next::Call(call) => {
-          if writer.call(call).is_err() {
+          if crate::diag_steps::timed("dav:write-call", || writer.call(call)).is_err() {
             break Stop::Refused;
           }
         }
