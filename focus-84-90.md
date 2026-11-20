@@ -953,3 +953,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - ~00:55 PST w-interop landed 78eea35b9 (git matrix tag row; git 26->27/27 expected at v1.0.0); hg 17/24. It was
   idle-waiting -> REASSIGNED A-681's remaining DAV pieces (DAV routing + update-report; the two svn HTTP rows) from
   w-svn to w-interop. w-svn: E160004 fix, then A-693 p2 lock.
+- ~01:00 PST w-git A-719 p1 landed 20ffba05f (81c36bd99): push checks (fsck + connectivity) a turn at a time under the
+  step quantum (Answering::Turned). Debug 3,000-commit push: prepare and decide still 0.3-2.7 s in one step -> next
+  parts: streamed store-once intake + §4.17.1 rule, then verdicts sliced. Ruling: w-git's intake does NOT wait on
+  A-718 (w-perf's T4 is behind A-716 + load test); w-perf builds T4 on the new store.
