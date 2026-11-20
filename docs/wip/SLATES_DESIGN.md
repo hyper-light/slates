@@ -15861,9 +15861,7 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > out the post-hook, `locks_finished` ends it), so the connection task runs each hook between them. Held to the
 > listener's tests: a refusing pre-lock answered in `svnserve`'s words with no lock held; pre-lock's arguments and
 > token, post-lock's arguments, standard input and failure after `done`; pre- and post-unlock's arguments and standard
-> input. **Part 3:** the `svn+ssh://` tunnel (`svnserve -t`) runs them the same way through the same runner, the
-> repository's policy its record's; no signal of the client gone reaches the SSH edge yet, so a run there ends at its
-> learned bound or by itself. Owed: that signal, the revprop hooks' calls (A-702 part 2) and DAV's.
+> input. Owed: `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -52527,7 +52525,8 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (BUILT 2026-11-20 through A-636 part 2c-2: a successor's
   rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
-  `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
+  `paths::remake_green_sliced`), a push's whole build sliced by a task with submits parked until it ends (BUILT
+  2026-11-20, `paths::whole_build`), a submit's own whole build and a whole map's release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name; its copies and symbolic links owed); Mercurial's manifests by the
   same rule.
@@ -54611,6 +54610,71 @@ Applied in the same change to:
   its start to its drop), with `git_push::` and `vcs_store::upload::` 16 of 16 and `vcs_http::git:: vcs_http::hg
   vcs_ssh::` 84 of 85; the one failure, `vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it`
   ("a step that waits"), fails alike on main b0655e8a3 and is reported.
+- **Piece 3c, fair turns by repository: measured and rejected (2026-11-20).** BENCHMARKS.md, "Fair turns by
+  repository on a shard": at R = 100 the toys' p99 grew from 14.1 to 22.8 times alone and the daemon ended. The toys'
+  wait is not the owner shard's CPU; the R = 100 step is to be profiled first. Also in this change: `share::divide`'s
+  full-resource tolerance is derived from Higham's bound for the solver's own operations (w-lint's R3 finding).
+- **Piece 4a, what an overrun drops first (2026-11-20).** `slates_vcs::cold::choose`: §4.11's cost model over a
+  repository's rebuildable values (bytes, measured rebuild time, expected reads): a value is dropped when its bytes'
+  worth at the repository's pressure passes its rebuilds' cost, highest saving a byte first, until the overrun is
+  covered (Dantzig 1957's greedy order). `slates_git::store::Repository::kept_fragments` lists each version's kept
+  fragments with the bytes dropping them gives back (content and entries' charge), and `drop_fragments` lets them go, the
+  next fetch encoding the version again (A-718). Tests: `slates-vcs` `cold::tests` (an oracle over 500 generated choices
+  against a serial reference: positive savings, a prefix of the order, the overrun covered by the shortest such prefix;
+  pressure letting a costly cache go); `slates-git` `store::tests::fragments::a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same`
+  (the bytes given back exact, the version re-encoded to the same fragments, the pack read back whole). Owed (4b): the
+  server's trigger (a repository whose grant `vcs_share::room` finds below what it holds drops by this choice, its
+  reads from its usage row, its rebuild times measured), then compression of cold content.
+- **Piece 4b, the trigger (2026-11-20).** What a repository holds now counts its kept fragments (`vcs_share`'s
+  `held_by`); while repositories contend (`vcs_share::room`'s divided path), each claimant holding more than its grant
+  gives back what §4.11's cost model says to (`vcs_store::git_encode::relieve`, counted `vcs_store.git_encode.dropped`):
+  the rebuild of a byte priced at what this repository's own encodings took (its usage row learns `derive_ns` and
+  `derive_bytes` at every encoding turn), on each read its row expects (its fetches over its answered intakes). Nothing
+  is dropped while its encoding runs, or before one was measured. Test: `vcs_share::tests::t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room`
+  (stock git's pushes encoded; with no reads to come every fragment dropped, bytes given back exactly, encoded again;
+  with fetches a thousandfold its pushes, kept), with `vcs_share:: git_push:: vcs_store::upload::` 17 of 17 and
+  `slates-vcs` `usage` green. Owed: compression of cold content; a drop of many versions a turn at a time.
+- **Piece 5a, identity homes across a node's shards (2026-11-20).** `crate::vcs_store::homes`: a window (at most one
+  window of content, named by its plain BLAKE3) is homed at the shard of the node that rendezvous ranks first for its
+  identity, kept there in that shard's one content store (deduplicated with what its repositories hold, charged to its
+  budget, held once a sender), read back and let go by identity through cross-shard calls judged in the home's own
+  time; an object past a window homes as its windows. The weight is the one every placement ranks by:
+  `slates_db::register::rendezvous_weight_of` (factored out of `rendezvous_weight` with its outputs unchanged) and
+  `rendezvous_ranked_by_key`, so piece 6's fleet homes rank the region's members the same way. No catalog, no
+  coordination call. Tests: `vcs_store::homes::tests` (the home is the ranking's head and homes spread over four
+  shards; on a four-shard daemon 64 windows homed, read back whole, one homed twice kept to its second let-go, all
+  freed, past a window refused) and `slates-db` `register::` 93 of 93. Owed: the cold trigger's third lever moving a
+  repository's cold windows to their homes and the stores reading through them; the intake's decoding and hashing on
+  the shard its connection arrived at (with w-git's A-722).
+- **Piece 5, A-727's barrier at the homes (2026-11-20, agreed with w-perf).** `vcs_store::homes::keep_here` and `home`
+  answer a `HomeTicket { shard, generation }`: the home and the first of its images that holds the window. The home's
+  barrier (A-727, w-perf's) calls `image_begun(g)` when image g captures the shard's content table and
+  `image_published(g)` when it is durable; `published(origin, ticket, budget)` waits on the home, as a task there, until
+  its image of the ticket's generation is published, so an entry's request awaits it and no step waits. Agreed with
+  w-perf (proposal in inbox `w-perf-from-w-balance.md`, its reply by kiln message, 2026-11-20): rows {identity, length, home} with the holder count
+  at the owner, bytes at the home; reads `Read::Here(Cow)` or `Read::Elsewhere { home }`, fetched between steps into a
+  charged per-request cache; `let_go` batched; the owner the default home for small repositories. Test:
+  `vcs_store::homes::tests::a_homed_windows_ticket_is_published_only_once_its_homes_image_is`. Owed: `home_many`,
+  `read_many` and the batched `let_go` (after w-perf's slice a3).
+- **Piece 6, §4.10 amended (2026-11-20, main's ruling).** §4.10 "Content homed by identity": the owner keeps its
+  register, landing, tails, fences and hot set by family placement; a repository's cold content is homed by identity
+  (one weight, a node's shards and f+1 of the region's members), fetched by identity, durable at its homes before any
+  record naming it. Agreed: w-shared (the ranking keyed by content id; a successor's rebuild fetches from homes), main
+  (a move leaves cold content at its homes; no coordination call). Owed: w-fed-faults' answer on fault paths, then the
+  region's half.
+- **Piece 7, the proof harness and its first run (2026-11-20).** `crates/cli/bench/multi_repo_load.py`
+  (BENCHMARKS.md, "Many repositories of mixed sizes and skewed activity on one daemon"). At R = 100 on the 32-core
+  Studio, every push landed, but the small repositories' p99 was 14.1 times their push alone while one hot repository
+  pushed: piece 3's memory share does not schedule CPU, so the shard's step quanta scheduled fairly by repository is next.
+  R = 1,000 waits on one copy a byte (A-723, A-727). A push of git/git v2.0.0 ends the daemon (reported).
+- **Pieces 8 and 9, designed (2026-11-20, main's input from w-perf).** §4.17.5 "The partition's snapshot, sized by its
+  data" and "A giant repository's metadata across partitions": a slot of 746,962,928 bytes fixed at boot holds every
+  record of its partition, and about 41 bytes an object puts the Linux kernel at 58% of it and Google's monorepo
+  (Potvin and Levenberg, CACM 2016) at 55 slots. The snapshot names a repository's sealed index tables by identity, not
+  their rows; the slot is derived at each snapshot and grown by a re-laid segment at a handoff, refused typed before it
+  is passed; an index is cut into `2^b` ranges by object id, each range held where rendezvous over `(family, range)`
+  ranks first, `b` one integer in the repository's record, a push's rows committed by the owner's one landing record.
+  Nothing built yet.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -54654,14 +54718,6 @@ version-2 record through git's own reader, `StoreBases`, `ReplayRefused::Pack`, 
   against the Studio's 746,962,928-byte segment region, the wall a 5,000-revision Subversion import met at revision
   3,540); the objects the repository already holds left out of the recorded pack; the push_load re-run at N = 1, 10 and
   100 once S1 and S3 are in, against today's 229 MiB a push.
-- **Pieces 8 and 9, designed (2026-11-20, main's input from w-perf).** §4.17.5 "The partition's snapshot, sized by its
-  data" and "A giant repository's metadata across partitions": a slot of 746,962,928 bytes fixed at boot holds every
-  record of its partition, and about 41 bytes an object puts the Linux kernel at 58% of it and Google's monorepo
-  (Potvin and Levenberg, CACM 2016) at 55 slots. The snapshot names a repository's sealed index tables by identity, not
-  their rows; the slot is derived at each snapshot and grown by a re-laid segment at a handoff, refused typed before it
-  is passed; an index is cut into `2^b` ranges by object id, each range held where rendezvous over `(family, range)`
-  ranks first, `b` one integer in the repository's record, a push's rows committed by the owner's one landing record.
-  Nothing built yet.
 
 ### A-727 — Repository bytes leave the partition snapshot: the version-control content store in the shard's chunk arena, its table in the shard image, records naming identities (2026-11-20, w-perf for UI goal 93; main's ruling, option 2; §4.17.1 "Objects" and "Durability and residency", §4.8 "Recovery", §4.10, A-64, A-99, A-662, A-716, A-723)
 
@@ -54706,26 +54762,6 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   committed image names is not reused before a newer image commits; (a3) the content table in the shard image and its
   recovery before the records; (b) git's record version 3; (c) Subversion's texts with A-716's slices; (d) replication's
   content-before-record order, held by the two-node test.
-- **Piece 4a, what an overrun drops first (2026-11-20).** `slates_vcs::cold::choose`: §4.11's cost model over a
-  repository's rebuildable values (bytes, measured rebuild time, expected reads): a value is dropped when its bytes'
-  worth at the repository's pressure passes its rebuilds' cost, highest saving a byte first, until the overrun is
-  covered (Dantzig 1957's greedy order). `slates_git::store::Repository::kept_fragments` lists each version's kept
-  fragments with the bytes dropping them gives back (content and entries' charge), and `drop_fragments` lets them go, the
-  next fetch encoding the version again (A-718). Tests: `slates-vcs` `cold::tests` (an oracle over 500 generated choices
-  against a serial reference: positive savings, a prefix of the order, the overrun covered by the shortest such prefix;
-  pressure letting a costly cache go); `slates-git` `store::tests::fragments::a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same`
-  (the bytes given back exact, the version re-encoded to the same fragments, the pack read back whole). Owed (4b): the
-  server's trigger (a repository whose grant `vcs_share::room` finds below what it holds drops by this choice, its
-  reads from its usage row, its rebuild times measured), then compression of cold content.
-- **Piece 4b, the trigger (2026-11-20).** What a repository holds now counts its kept fragments (`vcs_share`'s
-  `held_by`); while repositories contend (`vcs_share::room`'s divided path), each claimant holding more than its grant
-  gives back what §4.11's cost model says to (`vcs_store::git_encode::relieve`, counted `vcs_store.git_encode.dropped`):
-  the rebuild of a byte priced at what this repository's own encodings took (its usage row learns `derive_ns` and
-  `derive_bytes` at every encoding turn), on each read its row expects (its fetches over its answered intakes). Nothing
-  is dropped while its encoding runs, or before one was measured. Test: `vcs_share::tests::t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room`
-  (stock git's pushes encoded; with no reads to come every fragment dropped, bytes given back exactly, encoded again;
-  with fetches a thousandfold its pushes, kept), with `vcs_share:: git_push:: vcs_store::upload::` 17 of 17 and
-  `slates-vcs` `usage` green. Owed: compression of cold content; a drop of many versions a turn at a time.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
@@ -54751,7 +54787,6 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
 - **Owed.** `svn:author` (the principal's Subversion name among its identities, A-664 part 1); a copy as a row with
   its source; symbolic links as `svn:special` files; Mercurial's changesets of a submitted version; a stock `svn
   update` over the made revision by use (main's).
-
 
 ### A-728 — A green's content history names the file's block: a changed file's bytes held once (2026-11-20, w-engine; step S2 of A-723's content-once plan; §4.16 "The history" (A-242's status), D-28, §4.11; A-242, A-534, A-575, A-716, A-723)
 
@@ -54811,19 +54846,6 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   stack (`crates/cli/bench/svn_history_mem.sh`, three runs each, identical): the content history 50.3 MiB before,
   2.0 MiB after; everything under `Green::commit` 285.1 MiB before, 200.0 MiB after (85.1 MiB, 30%, less). A-723's
   234.8 MiB was that `Green::commit` row, mostly the current files' blocks, which stay.
-- **Piece 5a, identity homes across a node's shards (2026-11-20).** `crate::vcs_store::homes`: a window (at most one
-  window of content, named by its plain BLAKE3) is homed at the shard of the node that rendezvous ranks first for its
-  identity, kept there in that shard's one content store (deduplicated with what its repositories hold, charged to its
-  budget, held once a sender), read back and let go by identity through cross-shard calls judged in the home's own
-  time; an object past a window homes as its windows. The weight is the one every placement ranks by:
-  `slates_db::register::rendezvous_weight_of` (factored out of `rendezvous_weight` with its outputs unchanged) and
-  `rendezvous_ranked_by_key`, so piece 6's fleet homes rank the region's members the same way. No catalog, no
-  coordination call. Tests: `vcs_store::homes::tests` (the home is the ranking's head and homes spread over four
-  shards; on a four-shard daemon 64 windows homed, read back whole, one homed twice kept to its second let-go, all
-  freed, past a window refused) and `slates-db` `register::` 93 of 93. Owed: the cold trigger's third lever moving a
-  repository's cold windows to their homes and the stores reading through them; the intake's decoding and hashing on
-  the shard its connection arrived at (with w-git's A-722).
-
 
 
 ### A-726 — `svn blame` and `svn diff` over HTTP: the `file-revs-report` and `get-locations` served through the DAV site (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 5 "HTTP"; A-681, A-627, A-613)
@@ -54853,12 +54875,6 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed.** A mergeinfo catalog with descendants streamed (written whole within the reply's room now). Deltas in
   the svndiff version `Accept-Encoding` prefers. The interop harness copied into `svn_http_reports.rs` folded into one
   module with `svn_interop.rs` once that file's pieces land.
-- **Piece 6, §4.10 amended (2026-11-20, main's ruling).** §4.10 "Content homed by identity": the owner keeps its
-  register, landing, tails, fences and hot set by family placement; a repository's cold content is homed by identity
-  (one weight, a node's shards and f+1 of the region's members), fetched by identity, durable at its homes before any
-  record naming it. Agreed: w-shared (the ranking keyed by content id; a successor's rebuild fetches from homes), main
-  (a move leaves cold content at its homes; no coordination call). Owed: w-fed-faults' answer on fault paths, then the
-  region's half.
 
 ### A-719 part 3 — git's push is read straight into its quarantine (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" items 3 to 5)
 - **Change (slates-git).** The receive session reads a pack into a site the caller gives it (`Session::input_into`,
@@ -54899,26 +54915,6 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   --test-threads=4` 43 of 43; `slates-ipc --test wire_order` 2 of 2; fmt clean.
 - **Owed.** The svn:// edge's own CRAM user and this name agreeing for one principal (the edge names its CRAM user;
   main's by-use check); copies and symbolic links (next pieces).
-- **Piece 7, the proof harness and its first run (2026-11-20).** `crates/cli/bench/multi_repo_load.py`
-  (BENCHMARKS.md, "Many repositories of mixed sizes and skewed activity on one daemon"). At R = 100 on the 32-core
-  Studio, every push landed, but the small repositories' p99 was 14.1 times their push alone while one hot repository
-  pushed: piece 3's memory share does not schedule CPU, so the shard's step quanta scheduled fairly by repository is next.
-  R = 1,000 waits on one copy a byte (A-723, A-727). A push of git/git v2.0.0 ends the daemon (reported).
-- **Piece 5, A-727's barrier at the homes (2026-11-20, agreed with w-perf).** `vcs_store::homes::keep_here` and `home`
-  answer a `HomeTicket { shard, generation }`: the home and the first of its images that holds the window. The home's
-  barrier (A-727, w-perf's) calls `image_begun(g)` when image g captures the shard's content table and
-  `image_published(g)` when it is durable; `published(origin, ticket, budget)` waits on the home, as a task there, until
-  its image of the ticket's generation is published, so an entry's request awaits it and no step waits. Agreed with
-  w-perf (proposal in inbox `w-perf-from-w-balance.md`, its reply by kiln message, 2026-11-20): rows {identity, length, home} with the holder count
-  at the owner, bytes at the home; reads `Read::Here(Cow)` or `Read::Elsewhere { home }`, fetched between steps into a
-  charged per-request cache; `let_go` batched; the owner the default home for small repositories. Test:
-  `vcs_store::homes::tests::a_homed_windows_ticket_is_published_only_once_its_homes_image_is`. Owed: `home_many`,
-  `read_many` and the batched `let_go` (after w-perf's slice a3).
-- **Piece 3c, fair turns by repository: measured and rejected (2026-11-20).** BENCHMARKS.md, "Fair turns by
-  repository on a shard": at R = 100 the toys' p99 grew from 14.1 to 22.8 times alone and the daemon ended. The toys'
-  wait is not the owner shard's CPU; the R = 100 step is to be profiled first. Also in this change: `share::divide`'s
-  full-resource tolerance is derived from Higham's bound for the solver's own operations (w-lint's R3 finding).
-
 
 ### A-730 — ra_svn runs a repository's hooks (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 9; A-661 part 2, A-622, A-623, A-648)
 
@@ -54957,4 +54953,33 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `vcs_ssh::svn::tests::a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`,
   `a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them` (the tunnel driven on a runtime of its own).
 - **Owed.** The SSH edge's signal of the client gone, for a hook's run. The revprop hooks' calls with A-702 part 2
-  (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
+  (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view.
+
+### A-664 live whole builds, part 1 — A push's whole map built in slices after its answer, the submits that need it parked (2026-11-20, w-shared for UI goal 93; main's ruling (a))
+- **Why.** A push that leaves a git green with no map of the version before (its first push, one past a copy) built
+  the whole head's map and trees in the push's own step: every file hashed as git's blob, then the map and trees. A
+  large repository's first push was one step as long as that build, which the watchdog judges a stuck shard (CLAUDE.md
+  §3 "Bounded work everywhere"). A push carries its own commits, so its answer needs no map.
+- **Change.** `paths::advance_after_push`, from the push's apply: a step that would build whole (`needs_whole`, read over
+  the change alone) begins a build instead (`paths::whole_build::start`): a record of the head's paths kept in the
+  store, one a green, driven by a task of the shard a slice at a time (each slice puts files, one a unit, lent the room
+  each brings, until the shard's step budget is spent, then yields), whose end builds the map and trees of what was put
+  (`Plan::Put`) and keeps them as the green's head. A push to the green meanwhile starts it again at the new head. A
+  submit to the green while it runs is parked (`verbs::ParkedSubmit`: an owner's step asked from a work's shard, or the
+  verb on the green's shard), its request deferred as a waiting acceptance is, a retry joining its entry, bounded by the
+  shard's client credit and refused `Overloaded` past it; the build's end runs each again in its own transaction, in
+  order, and answers it on its route (`verbs::resume_all`). Freeing the repository gives the build's holds back and
+  runs its parked submits.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::commits::tests::t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer` (answered with no map
+  and the build under way; more slices than one; the pushed tree kept, built once) and
+  `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` (a recorded submit parked during the build, the green
+  still at the pushed version; at its end, run again: version 2, its commit made over the kept map). The push tests
+  drive a push's build to its end before reading the store (`whole_build::settle`). `cargo test --locked -p
+  slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities:: --test-threads=4`
+  143 of 143; fmt clean.
+- **Owed.** Part 2: a submit's own whole build (a green's first submit, one past a copy) with its made commit owed
+  durably in the submit's transaction (main's ruling: replay reads no clock, the completion settles the owed entry,
+  one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
+  restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
+  (main's).
