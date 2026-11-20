@@ -14581,6 +14581,9 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
    advertise it while it is held. Whether an artefact stays is learned (the table below).
 
 **Push.** Each step names what it refuses; nothing takes effect before step 6.
+Status (A-729 part 1, the index's storage): a manifest is kept as its delta against the one before while its chain's
+delta bytes stay within its text's length (derived, as 7.2's `deltas.py` bounds a delta), else whole; every reader
+rebuilds it through `HgIndex::revision_text`.
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
 working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
 push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
@@ -15387,8 +15390,10 @@ and export by landing).
 >
 > **Status (2026-11-19, A-702 part 1).** `change-rev-prop` and `change-rev-prop2` are answered as `svnserve` answers a
 > repository with no pre-revprop-change hook ("Repository has not been enabled to accept revision propchanges",
-> 165006), after its checks in its order (`slates_svn::serve::revprops`). The change itself waits on ra_svn running a
-> repository's hooks.
+> 165006), after its checks in its order (`slates_svn::serve::revprops`). Since A-702 part 2 (2026-11-20) the change
+> itself is made: pre-revprop-change, the previous value's check (160049), the revision's properties landed whole as a
+> `Record::RevisionProperties` through the owner's step, then post-revprop-change with the old value, over `svn://` and
+> `svn+ssh://`.
 >
 > **Status (2026-11-19, S4 slice 1, with A-716).** A Subversion text is read through a source its reader is lent
 > (`slates_svn::migration::TextSource`; `WithTexts` pairs the records with one), so the green's content index can
@@ -15898,8 +15903,8 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > DAV commit stops at its hooks (`DavCommit::begin_hooked` and `resume_begin`, `merge_hooked` and `resume_merge`), so
 > the exchange runs each between two lends. Held to the daemon edge's tests over HTTPS: a refusing start-commit answers
 > the POST in `svnserve`'s words; a DAV commit's start- and pre-commit given their arguments and post-commit's failure in
-> `S:post-commit-err`; a refusing pre-lock answers the LOCK. Owed: the revprop hooks' calls (A-702 part 2, w-svn), the
-> SSH edge's client-gone signal, REPOS as A-645's FSFS-layout view.
+> `S:post-commit-err`; a refusing pre-lock answers the LOCK. The ra_svn revprop hooks run since A-702 part 2. Owed: DAV's
+> revprop change, the SSH edge's client-gone signal, REPOS as A-645's FSFS-layout view.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -54768,6 +54773,36 @@ Applied in the same change to:
   (`t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot`: a slot shrunk below the admittable room binds
   alone and is divided beside another; the share test against the lesser resource), 23 of 23 with `git_push::` and
   `vcs_store::upload::`; `vcs_http::git:: vcs_http::hg vcs_ssh::` 88 of 88.
+- **Piece 8c, a push's names by identity: the codec (2026-11-20, main's ruling).** `slates_vcs::rows`: a list of
+  fixed-width rows written back to back and put whole as content (`put`, `put_object`: a list past a window cut at the
+  window under one root), read back by its root and row count with its length checked against `count × width` before
+  anything is cut (`read`, `rows_of`), every mismatch refused typed. A git record's version 3 will keep its push's name
+  rows (41 bytes each) as one such list, one root and a count: about 100 bytes a push in the snapshot, against 41 an
+  object. Tests: `rows::tests` (200 generated lists across windows read back in order; the same rows one identity;
+  hostile lengths, widths and roots refused; git/git cut at v1.0.0's 12,232 names behind one root). The record's
+  switch waits for A-727 a3: until a shard's content is durable in its image and recovered before the records, a
+  record naming its rows by identity would find nothing after a restart, since today's store is rebuilt from the
+  records themselves.
+- **Piece 6's region half, its rule (2026-11-20, on w-fed-faults' answer to Q3).** `slates_db::identity_homes`: a
+  content's homes are the `f + 1` region members the shared rendezvous weight ranks first for its id (`homes`), and the
+  healer's plan (`heal`) offers it to every home that lacks it and, only once every home holds it, releases it where it
+  is held and is not a home. Their inputs are the content id, the members and `f` alone: w-fed-faults found every
+  release in today's `ContentHold` scoped by an object and judged from the owner's register (a certified takeover, a late
+  copy under a newer head, a tombstone, a ledger's compaction), so identity-homed content is kept by its id outside it
+  and no owner event can reach its homes. Tests: `identity_homes::tests` (300 generated regions: f + 1 distinct homes,
+  a join moving only the newcomer in and a departure only the leaver out; the healer adding before it removes; no owner
+  event an input). Owed: the transport (a window shipped to a remote home's shard by identity, held there outside
+  `ContentHold`), the healer's loop over held identities, and the successor's rebuild fetching from homes (w-shared).
+- **Piece 6's region half, its wire (2026-11-20, main's ruling: built as proposed).** `slates_cluster::homes`: the home
+  exchanges' own messages on their own stream (`HOME_STREAM`, 30), never `ContentHold`: `Put` (an identity and its
+  window), `Read`, `LetGo`, and the member's `Answer` (kept with the image generation it is durable from, its bytes, let
+  go, or refused by kind: not a home, misnamed, not held, no room, unanswered). The door's rule, `admits`: a member keeps
+  a window only if the configuration it knows ranks it among the window's homes and the bytes hash to the identity they
+  came under. A window's bytes are capped at the archive format's chunk cap before they are copied. Tests:
+  `homes::tests` (300 generated messages round-trip; every cut refused; flips never panic; exactly a window's two homes
+  of nine keep it, others refused `NotAHome`; other bytes under its name `Misnamed`; hostile lengths and kinds). Owed
+  (6c-2): the daemon serving the stream (the home shard's `keep_here`, the answer after its image is published), the
+  sender's batched calls and the healer's loop at each configuration change.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55059,8 +55094,8 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   and the lock verbs' through `vcs_svn::pre_lock_hooks` and `post_lock_hook`. Tests:
   `vcs_ssh::svn::tests::a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`,
   `a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them` (the tunnel driven on a runtime of its own).
-- **Owed.** The revprop hooks' calls with A-702 part 2
-  (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view.
+- **Owed.** DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view. (The revprop hooks run since
+  A-702 part 2.)
 
 ### A-664 live whole builds, part 1 — A push's whole map built in slices after its answer, the submits that need it parked (2026-11-20, w-shared for UI goal 93; main's ruling (a))
 - **Why.** A push that leaves a git green with no map of the version before (its first push, one past a copy) built
@@ -55376,6 +55411,16 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed.** P3 (the presenter under SLATES_ROOT, after A-727 a2: the hook drivers handing the view's path as REPOS),
   P4, the root mount's publication.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
+
+### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Change.** A parked submit keeps the instant it parked (`verbs::ParkedSubmit::parked_ns`); at each slice of its
+  green's build, one that has waited past the node's failover delay (`ShardState::failover_ns`, the most a reply is
+  held, the bound `base_wait` keeps) is answered `Overloaded` on its route, unrecorded, so its retry runs, nothing of it
+  having run; counted `vcs_store.paths.whole_build.overdue` (zero is the healthy reading).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::commits::tests::
+  t_a664_live_a_parked_submit_waits_at_most_its_bound` (parked once; none answered within an unbounded wait; answered
+  overdue past a bound of none; the build's end runs nothing of it). `cargo test --locked -p slates-server --lib --
+  vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities:: --test-threads=4` 153 of 153; fmt clean.
 
 ### A-740 — A stuck shard's report names the task it was polling (2026-11-20, w-reaper, main's urgent piece; §4.3 tasks, §4.14 `daemon.alive`; A-228, A-232, A-318)
 

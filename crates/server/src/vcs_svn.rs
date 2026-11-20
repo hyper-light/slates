@@ -673,6 +673,14 @@ enum Next {
   },
   /// The client asked for a lock verb, its first `consumed` bytes: judge it, land its entries, answer it.
   LockAsked(usize),
+  /// The client asked for a revision property change past its checks, its first `consumed` bytes: run its hooks
+  /// around its record.
+  RevisionProperty {
+    /// The pre-hook's call.
+    call: Box<slates_svn::serve::RevisionPropertyCall>,
+    /// The bytes taken.
+    consumed: usize,
+  },
   /// The commit's drive accepted `work` at `close-edit`, its first `consumed` bytes taken: land it.
   Accepted {
     /// The work.
@@ -819,6 +827,10 @@ async fn follow(
     Next::LockAsked(consumed) => {
       consume(conversation, consumed);
       lock(stream, conversation, out).await
+    }
+    Next::RevisionProperty { call, consumed } => {
+      consume(conversation, consumed);
+      revision_property(stream, conversation, &call, out).await
     }
     Next::Hook { due, consumed } => {
       consume(conversation, consumed);
@@ -986,6 +998,7 @@ fn next_of(
     },
     Ok(Turn::CommitAsked { consumed }) => Next::CommitAsked(consumed),
     Ok(Turn::LockAsked { consumed }) => Next::LockAsked(consumed),
+    Ok(Turn::RevisionPropertyHook { call, consumed }) => Next::RevisionProperty { call, consumed },
     Ok(Turn::Hook { due, consumed }) => Next::Hook { due, consumed },
     Ok(Turn::Accepted { work, consumed }) => Next::Accepted { work, consumed },
     Err(_) => Next::End,
@@ -1131,19 +1144,115 @@ fn land_locks(
   if entries.is_empty() {
     return Ok(());
   }
-  let id = opened.id;
-  crate::state::with_state(|state| {
-    svn_commit::record(
-      state,
-      (principal, id),
-      slates_svn::commit::record::Record::Locks(entries),
-    )
-  })
-  .unwrap_or(Err(svn_commit::Uncommitted::NotHeld))
-  .map_err(|refused| {
+  land_record(
+    (principal, opened.id),
+    slates_svn::commit::record::Record::Locks(entries),
+  )
+  .map_err(|failure| {
     crate::fleet::count_refusal(LOCKS_REFUSED);
-    refused.failure()
+    failure
   })
+}
+
+/// Lands `record` on `repository`'s logs by `principal` through the owner's step (`svn_commit::record`): `Ok`, or the
+/// step's refusal as the connection answers it.
+fn land_record(
+  (principal, repository): (&Principal, RepositoryId),
+  record: slates_svn::commit::record::Record,
+) -> Result<(), (u32, String)> {
+  crate::state::with_state(|state| svn_commit::record(state, (principal, repository), record))
+    .unwrap_or(Err(svn_commit::Uncommitted::NotHeld))
+    .map_err(|refused| refused.failure())
+}
+
+/// Runs the client's revision property change past its checks (A-702 part 2; `fs-wrap.c`
+/// `svn_repos_fs_change_rev_prop4`), `call` its pre-hook's: pre-revprop-change, whose refusal (165006 where none is
+/// configured) is the answer; then the change judged over the repository's sources and its record landed through the
+/// owner's step with no wait between (`Record::RevisionProperties`), so no other change lands in between; then
+/// post-revprop-change with the old value, its verdict the command's end. Whether the conversation goes on, the answer in
+/// `out`; a client that left while a hook ran ends it.
+async fn revision_property(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  call: &slates_svn::serve::RevisionPropertyCall,
+  out: &mut Vec<u8>,
+) -> bool {
+  let room = conversation.limits.item_bytes;
+  let Some(hooked) = conversation.opened.as_ref().map(Opened::hooked) else {
+    return false;
+  };
+  let site = HookSite::Listener(stream);
+  let Some(verdict) =
+    revision_property_hook(site, &hooked, room, HookPoint::SvnPreRevpropChange, call).await
+  else {
+    return false;
+  };
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = &mut *conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return false;
+  };
+  let judged = lent_sources(opened, principal, |sources| {
+    connection.revision_property_hooked(sources, verdict, out)
+  });
+  let record = match judged {
+    Some(Ok(Some(record))) => record,
+    Some(Ok(None)) => return true,
+    Some(Err(_)) | None => return false,
+  };
+  let landed = land_record((principal, opened.id), record);
+  let post = match connection.revision_property_landed(landed, out) {
+    Ok(Some(post)) => post,
+    Ok(None) => return true,
+    Err(_) => return false,
+  };
+  let Some(ended) =
+    revision_property_hook(site, &hooked, room, HookPoint::SvnPostRevpropChange, &post).await
+  else {
+    return false;
+  };
+  conversation
+    .connection
+    .revision_property_finished(ended, out)
+    .is_ok()
+}
+
+/// Runs the revision-property hook at `point` (pre- or post-revprop-change) for `call` (A-702 part 2): its verdict, or
+/// `None` where the client left before it ended.
+pub(crate) async fn revision_property_hook(
+  site: HookSite<'_>,
+  hooked: &Hooked,
+  words_cap: usize,
+  point: HookPoint,
+  call: &slates_svn::serve::RevisionPropertyCall,
+) -> Option<Result<(), Vec<(u32, String)>>> {
+  use slates_svn::serve::RevisionPropertyAction as Action;
+  let action = match call.action {
+    Action::Added => vcs_hooks::RevpropAction::Added,
+    Action::Modified => vcs_hooks::RevpropAction::Modified,
+    Action::Deleted => vcs_hooks::RevpropAction::Deleted,
+  };
+  let input = if point == HookPoint::SvnPreRevpropChange {
+    vcs_hooks::svn_pre_revprop_change
+  } else {
+    vcs_hooks::svn_post_revprop_change
+  };
+  run_hook(site, hooked, words_cap, point, |env, repos| {
+    let change = vcs_hooks::RevpropChange {
+      repository: repos,
+      revision: call.revision,
+      author: &call.user,
+      property: &call.name,
+      action,
+    };
+    input(CommittedView(call.revision), env, change, &call.value)
+  })
+  .await
+  .verdict
 }
 
 /// Runs the verb's pre-hook for each path in `call` in turn (A-730): each path's verdict, its refusal's chain or
