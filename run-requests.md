@@ -6785,3 +6785,5 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-git main 183150ab8 (A-719 part 2, unpack::Keep): clippy + xtask; Linux/Windows cargo test -p slates-git --lib -- unpack:: receive:: store:: upload::
 - 2026-11-20 w-shared A-664 sliced whole builds part 1 (main 469436cce): clippy + xtask; Linux/Windows `cargo test -p slates-server --lib -- vcs_store::paths:: vcs_store::tests`; recovery timing over a large git repository (recovery's longest slice CPU in the boot log)
 - A-693 part 2 landed main 576a8a860: stock svn lock/unlock over svn:// and svn+ssh (w-interop's matrix E170003 row) [w-svn]
+
+- w-balance (2026-11-20, finding by use, pre-existing on main b0655e8a3): `cargo test --locked -p slates-server --lib -- vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it` panics `a step that waits` (vcs_ssh/tests/hg.rs:487); macOS arm64 Mac Studio. Owner: w-hg?
