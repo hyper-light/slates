@@ -1,5 +1,10 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 rebase+copies = 4f61920f0 (main b279ba52c). Main's new order (2026-11-20): (1) MoveWorkFloor
+  authority = the fleet link's authenticated member id equals the work id's creator member; red: another member refused;
+  (2) increment too large for the forward lane carried in bounded parts; (3) a creation dropped at restart releases its
+  floor at the owner at recovery; then (4) f: routing flip + hook deleted in the same change, no dual path.
+
 ## LANDED 2026-11-20: A-697 part e = 76b5dd46a (main 285ab0923): holder work recovery over the replica. NEXT: part f (takeover
   + routing flip: delete the test hook Daemon::serve_works_on_holders/WorkHome::on_holders, replace green_elsewhere's hook
   with the real "replicated here" rule, two-node f=1 e2e with taken-by-position counter; takeover of A -> successor
