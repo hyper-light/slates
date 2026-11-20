@@ -11195,6 +11195,13 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > linearizable and the fast-path counter equal to the oracle's disjoint count
 > (`crates/merge/tests/shuttle_green.rs`).
 
+> **Status (2026-11-20, A-774 part 2).** A mount reads its green where it lies: a mounted work's slot is an overlay
+> whose base is its green at the work's base version, pinned while the mount lives (counted in the reachable floor),
+> served through a tree host (`slates_vfs::host::tree`) lent with the green for each NFS or FUSE request
+> (`crates/server/src/green_tree.rs`); a submit declares the overlay's diverged set. 8 mounts over a 64 MiB green add
+> 1.5 MB resident (548 MB when each copied the green) and a mount is made in 1.3 ms (34 ms), against 0.6 ms over a
+> 16-file green (`crates/server/tests/mounted_work_cow.rs`). Owed: the green's landing view still copies its head.
+
 > **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
 > (`crates/server/src/mounted_work.rs`; GAP-A9-14): a work's first attach or mount makes a slot under its own id
 > holding its files over its base, served by every bridge, and snapshotted as the mount's base; a submit first

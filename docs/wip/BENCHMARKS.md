@@ -15720,3 +15720,17 @@ alone exhausts its budget.
   lately hold (`Step::Putting`). The same push then answered in 168,761 steps, fewer than before B2 (173,409); its time,
   9.44 s, was taken while the Studio built other work, so the steps are the comparison. Its longest step, 48 ms, is
   its last: the landing (the commit's whole passes, next).
+
+## A mounted work reads its green where it lies: a mount costs its divergence (A-774 part 2; main's order 1; 2026-11-20)
+
+`crates/server/tests/mounted_work_cow.rs`, release, macOS arm64 (this MacBook, local), interleaved, 5 runs a side, all
+shown. A 64 MiB green of 1,024 files of 64 KiB; 8 works each requested, mounted over the daemon's NFS, one file read
+through the mount and saved by temp file and rename. Before: main 3406df928 (each mount's slot seeded with a copy of the
+work's files, a2415c930). After: the slot an overlay over the green's pinned version (`slates_vfs::host::tree`).
+
+| side | resident added by 8 mounts (MB) | mount made, median, 64 MiB green (ms) | over a 16-file green (ms) |
+|---|---|---|---|
+| before | 547.0, 547.1, 547.0, 547.1, 547.1 | 11.14, 9.45, 12.94, 9.38, 10.41 | 0.54, 0.65, 0.58, 0.67, 0.68 |
+| after | 0.75, 0.75, 0.72, 0.82, 0.79 | 0.53, 0.78, 0.69, 0.60, 0.71 | 0.32, 0.56, 0.46, 0.42, 6.91 |
+
+Bound the test holds: 8 x (256 KiB + one 64 KiB file) + 8 MiB = 11.0 MB. A mount's own bytes: 90-102 KB.
