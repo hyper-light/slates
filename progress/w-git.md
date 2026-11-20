@@ -184,3 +184,10 @@
 - NEXT: ruling asked on http-edge status-at-head (streamed routes) for the two long-history edge tests; then memory per
   push (attribution, identical objects stored once, bounded working set); then Repository::commit's O(objects) passes;
   t_a665 derived deadline. Findings sent: svn ssh test fails after w-svn 28e57ac18.
+- ~11:50 LANDED A-722 head at once 51158a4fb (main bbc6aa614): StatusMode::AtHead in http-edge; git smart services.
+  Told w-interop/w-hg/w-svn/main. Build route now: push a work branch, then kiln run (needs macos,tool:cargo,cpus=4,
+  sync false) in ~/.cache/w-git-clone worktree ~/.cache/w-git-wt on the Studio (kiln's repo sync times out).
+  r119 (w-interop): git cut 24/27 with zero spins/kills/restarts thanks to 4g.
+- NEXT: memory per push (attribution: pack buffer, fork, index rows, objects; identical objects stored once by
+  identity across concurrent pushes; bounded per-push working set), then Repository::commit O(objects) passes, then
+  t_a665 derived deadline.
