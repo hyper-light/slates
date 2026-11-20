@@ -1,0 +1,9 @@
+0012command=fetch
+0017object-format=sha1
+0001000ethin-pack
+000eofs-delta
+0010no-progress
+0032want d0f175d3390380c935e9b56e0cebb715995d838d
+0048filter sparse:oid=d0f175d3390380c935e9b56e0cebb715995d838d:dir/file
+0009done
+0000

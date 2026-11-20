@@ -584,6 +584,58 @@ fn no_table_passes_the_window_and_the_tail_seals_once_its_rows_no_longer_fit_one
   assert_empty(&store);
 }
 
+/// The first byte of the key of each row `index` reads from `start`.
+fn keys_from(index: &Index, store: &ContentStore, start: &[u8]) -> Vec<u8> {
+  index
+    .iter_from(store, start)
+    .filter_map(|row| row.key().first().copied())
+    .collect()
+}
+
+/// A-640 part 4 (an abbreviated name's objects are the rows from its prefix). Do: insert the forty even keys below 80
+/// under a window of 256 bytes, sealing when due, and merge every run into one of seven tables; insert 1, 31 and 99
+/// into the tail; read from the empty start, from 26 (inside the run's third table), from 27 (between two keys) and
+/// from 100 (past every key). Expect: from each start, every key not before it, in order, the tail's merged in.
+#[test]
+fn rows_from_a_start_inside_a_run_of_many_tables_are_read_from_there_on() {
+  let mut store = store();
+  let mut index = Index::new();
+  for key in (0..80u8).step_by(2) {
+    insert_plain(&mut index, &mut store, key);
+    if index.seal_due(&store) {
+      index.seal(&mut store).unwrap();
+    }
+  }
+  index.seal_all(&mut store).unwrap();
+  index.compact(&mut store, usize::MAX).unwrap();
+  for key in [1u8, 31, 99] {
+    insert_plain(&mut index, &mut store, key);
+  }
+  let every: Vec<u8> = (0..80u8)
+    .step_by(2)
+    .chain([1, 31, 99])
+    .collect::<BTreeSet<u8>>()
+    .into_iter()
+    .collect();
+  let not_before = |start: u8| {
+    every
+      .iter()
+      .copied()
+      .filter(|key| *key >= start)
+      .collect::<Vec<u8>>()
+  };
+  assert_eq!(
+    index.run_tables().iter().map(Vec::len).collect::<Vec<_>>(),
+    vec![7]
+  );
+  assert_eq!(
+    [&[][..], &[26], &[27], &[100]].map(|start| keys_from(&index, &store, start)),
+    [every.clone(), not_before(26), not_before(27), Vec::new()]
+  );
+  index.release(&mut store).unwrap();
+  assert_empty(&store);
+}
+
 /// Looks up `count` keys no run holds.
 fn miss(index: &Index, store: &ContentStore, count: u8) {
   for at in 0..count {
@@ -1171,7 +1223,38 @@ fn apply(real: &mut Real, model: &mut Model, step: &Step) {
   }
 }
 
-/// One index reads as its model map, row by row and key by key, and holds no table longer than the window.
+/// The starts [`check_from`] reads from: before every key; the first, middle and last keys, each also with a byte after
+/// it (a start between two keys) and its first byte alone (a prefix of a longer key); and past every key.
+fn starts(model: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<Vec<u8>> {
+  let keys: Vec<&Vec<u8>> = model.keys().collect();
+  let chosen = [keys.first(), keys.get(keys.len() / 2), keys.last()];
+  let mut starts = vec![Vec::new(), vec![u8::MAX; 64]];
+  for key in chosen.into_iter().flatten() {
+    starts.push(key.to_vec());
+    starts.push([key.as_slice(), &[0]].concat());
+    starts.push(key.iter().take(1).copied().collect());
+  }
+  starts
+}
+
+/// A-640 part 4 (an abbreviated name's objects are the rows from its prefix): the index's rows from each of
+/// [`starts`] are the model's from it, in key order.
+fn check_from(index: &Index, store: &ContentStore, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
+  for start in starts(model) {
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = index
+      .iter_from(store, &start)
+      .map(|row| (row.key().to_vec(), row.body().to_vec()))
+      .collect();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = model
+      .range(start.clone()..)
+      .map(|(key, body)| (key.clone(), body.clone()))
+      .collect();
+    assert_eq!(rows, expected, "from {start:?}");
+  }
+}
+
+/// One index reads as its model map, row by row and key by key, from each of a few starts, and holds no table longer
+/// than the window.
 fn check_index(index: &Index, store: &ContentStore, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
   let rows: BTreeMap<Vec<u8>, Vec<u8>> = read(index, store).into_iter().collect();
   assert_eq!(&rows, model);
@@ -1180,6 +1263,7 @@ fn check_index(index: &Index, store: &ContentStore, model: &BTreeMap<Vec<u8>, Ve
     let found = index.get(store, key).map(|row| row.body().to_vec());
     assert_eq!(found.as_ref(), Some(body));
   }
+  check_from(index, store, model);
   assert_tables_within_the_window(index, store);
 }
 
