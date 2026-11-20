@@ -1550,7 +1550,7 @@ pub(crate) async fn recover(
       .map(|member| member.green)
       .collect();
     for green in greens {
-      paths::remake_green(state, green);
+      paths::remake_green_sliced(state, green, slices).await;
       slices.unit_done().await;
     }
   }
