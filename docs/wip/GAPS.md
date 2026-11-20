@@ -114,6 +114,11 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-710 (2026-11-20, w-perf, UI goal 93):** `slates repository import NAME PATH` (absolute PATH: a Mercurial
+> repository's directory or a Subversion dump) asks `ImportRepository` through `Client::import_repository` and prints
+> what it took or its typed refusal. By use (Studio, 543606da3): Mercurial's own repository is refused `PastRoom { room:
+> 278528 }`, the hg room every push past ~250 changesets also meets (413); owed to w-hg.
+>
 > **A-685 (2026-11-19, g305; piece 1's client half):** a repository is made from the command line, `slates repository
 > create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]`, through
 > `Client::create_repository`; each tool's defaults are the server crate's (`object_formats`, `root_binding`: git SHA-1
@@ -409,7 +414,7 @@
 > of 38 and 60 of 60). Owed: the lender of a Subversion store over A-662's map (the records A-655 part 2b keeps there, a
 > directory's entries from the green, the repository's `svnserve.conf` facts; the DAV site's own `SvnStores`, A-681,
 > waits for the same lender), without which the daemon's site cannot start the tunnel; the accepted work handed to A-655
-> part 2b's owner step (`repository::svn_commit::commit`); the tunnel moved to the shard of the repository its URL names
+> part 2b's owner step (built since, A-698); the tunnel moved to the shard of the repository its URL names
 > (A-651 part 4 moves a connection for a named repository); the daemon's edge (A-684, built); a configured hook run, not
 > refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve`
 > exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a
@@ -448,6 +453,17 @@
 > test runs). Stock git's live `git push` over SSH runs since 2026-11-20 (`git_interop.rs`'s
 > `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`, un-ignored by w-interop, passing; its evidence on g083's
 > stock git line).
+> **A-698 (2026-11-20, g229; commits over ra_svn):** the work A-656's connection accepts lands through A-655 part 2b's
+> step: `repository::svn_commit::commit_work`, which `svn://` and the SSH tunnel share, makes the revision at the
+> owner's instant, judges it again with the commit's locks (`Work::locks`) and lands it; `commit-info` or `close-edit`'s
+> failure answers it (the step's refusals in FSFS's words, its own under the nearest error,
+> `serve::Uncommitted::Refused`); the tunnel lands through its lender (`SvnStores::commit`). Held to the recorded
+> `mkdir` commit byte for byte through the tunnel, and on a real shard. (macOS arm64, Mac Studio, kiln r509: red 52 of
+> 55, green 55 of 55; slates-svn 115 of 115; fmt clean.) Since 2026-11-19 (w-svn) the `svn://` listener lands
+> its signed-in sessions' commits through the same step (`vcs_svn` `land`; a stock `mkdir` commit over the listener,
+> then revision 1, on a two-shard daemon; macOS arm64, this Mac, local: server `vcs_svn::` 11 of 11 with
+> `repository::svn_commit::`, `vcs_ssh` 59 of 59, slates-svn 120 of 120). Owed: the tunnel's production lender in the
+> daemon's SSH site; a configured hook run; stock `svn` over `svn://` end to end (the interop leg).
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -2885,8 +2901,9 @@
 >   rebuild from the log too; the fleet's own three-daemon tests of a takeover and of a live-shipped clone's move are
 >   written (A-583: `a_captured_clone_taken_over_after_its_owners_loss_lands_against_its_capture` and
 >   `a_moved_live_shipped_captured_clone_lands_on_its_new_owner_against_its_capture`, `crates/server/tests/fleet.rs`),
->   their first compile and run owed to main, as is A-503's own move test (A-589:
->   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c); owed
+>   and A-503's own move test (A-589:
+>   `a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one`, a to b, then b to c),
+>   all three compiled and passed unchanged on macOS arm64 (2026-11-19), the Linux lane owed; owed
 >   of it, a mark for a live-shipped clone a takeover rebuilt from its log after its owner's loss (the log position its head
 >   was sealed at), and a clone whose owner dies before its first snapshot is placed, which its successor serves as an
 >   empty tree (sealed at its making, or its catalog naming its capture, A-544; a live one is answered only once its log

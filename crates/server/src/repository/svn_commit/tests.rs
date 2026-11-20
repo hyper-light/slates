@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
 use slates_ipc::protocol::{ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_svn::commit::drive::Work;
 use slates_svn::commit::record::Record;
 use slates_svn::commit::revision::{Revision, StepRefusal};
 use slates_svn::commit::{CommitRefusal, ConflictKind};
@@ -14,13 +15,15 @@ use slates_svn::index::{
 };
 use slates_svn::lock::{AprTime, CommitLocks};
 
-use super::{Committed, PROPS, UNSUPPORTED, Uncommitted, commit};
+use super::{Committed, PROPS, UNSUPPORTED, Uncommitted, commit, commit_work};
 use crate::repository::push::AppendRefused;
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
 /// Shape: the date every test revision carries.
 const DATE: &str = "2026-11-19T20:00:00.000000Z";
+/// Shape: [`DATE`]'s instant: microseconds since the epoch.
+const DATE_INSTANT: AprTime = AprTime(1_795_118_400_000_000);
 
 /// The repository's owner.
 fn owner() -> Principal {
@@ -531,5 +534,49 @@ fn t_a655_the_records_are_made_again_from_the_log() {
     );
     let (_, held, charged) = kept(state, svn);
     assert_eq!((count, charged), (4, held));
+  });
+}
+
+/// A-698 (`commit_work`: what both ra_svn transports call with the work their connection accepted). Do: land a client's
+/// accepted work adding `/trunk`, by alice, presenting no lock, at [`DATE`]'s instant. Expect: revision 1, dated by that
+/// instant and by alice, as `commit-info` carries them; the green at version 1 holding `/trunk`; the register's second
+/// record the revision the step made.
+#[test]
+fn t_a698_a_clients_accepted_work_lands_through_the_step() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    let work = Work {
+      head: 0,
+      record: RevisionRecord {
+        transaction: "0-1".to_owned(),
+        changes: vec![row("/trunk", Action::Add, NodeKind::Directory)],
+      },
+      lock_entries: Vec::new(),
+      revision_properties: vec![
+        (b"svn:author".to_vec(), b"alice".to_vec()),
+        (b"svn:log".to_vec(), b"a change".to_vec()),
+      ],
+      texts: BTreeMap::new(),
+      property_lists: BTreeMap::new(),
+      locks: CommitLocks {
+        user: Some("alice".to_owned()),
+        ..CommitLocks::default()
+      },
+    };
+    let landed = commit_work(state, (&owner(), svn), work, DATE_INSTANT);
+    let made = revision(
+      0,
+      vec![row("/trunk", Action::Add, NodeKind::Directory)],
+      &[],
+    );
+    let records = logged(state, svn);
+    let second = records.get(1).map(|bytes| Record::decode(bytes));
+    let seen = (
+      landed,
+      green_head(state, green),
+      green_dir(state, green, "trunk"),
+    );
+    assert_eq!(seen, (answered(1), Some(1), true));
+    assert_eq!(second, Some(Ok(Record::Revision(made))));
   });
 }

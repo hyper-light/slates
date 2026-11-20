@@ -14040,6 +14040,8 @@ signature verification).
 > register's first entry, with the phase roots and bookmarks it answers, and a recovery); until then an import is not
 > served.
 >
+> **Status (2026-11-20, A-710):** the command line asks it: `slates repository import NAME PATH` (PATH absolute).
+>
 > **Status (2026-11-19, A-678: the import verb).** A client asks the daemon to import a Mercurial repository's directory
 > with `ImportRepository { repository, path }`, served on the partition the repository's name hashes to and for its
 > owner alone: the directory is opened as a base is (read-only, never through a link), A-675's import started, and the
@@ -15223,7 +15225,9 @@ and export by landing).
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
 > token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's
-> principal writing where the repository's policy reaches it. Owed: commits through the owner's step (A-698).
+> principal writing where the repository's policy reaches it. Since A-698 a signed-in session's commit drive runs over
+> those sources and its accepted work lands through `repository::svn_commit::commit_work`, `close-edit` answered with
+> `commit-info` or the step's refusal; a configured hook refuses the commit (none runs yet).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -15450,6 +15454,20 @@ for Subversion.)
 > work handed to the owner's commit step (`repository::svn_commit::commit`); the daemon's edge (A-684); a configured
 > hook run rather than refused; CRAM-MD5 through the tunnel; a client that leaves during a refused edit's drop ends
 > E210002 where `svnserve` exits 0; `svn checkout svn+ssh://` with a stock client against a daemon (main's run).
+
+> **Status (2026-11-20, A-698: ra_svn commits land through the owner's step).** The work an ra_svn connection accepts at
+> `close-edit` lands through A-655 part 2b's step: `repository::svn_commit::commit_work`, the one entry both transports
+> call (`svn://` and `svnserve -t` through the SSH tunnel share A-656's connection), makes the revision of the work at
+> the owner's instant, judges it again with the commit's locks (`Work::locks`, carried out of the drive) and lands it;
+> the connection answers `commit-info` (the revision, its date, its author) or `close-edit`'s failure, the step's
+> refusals in FSFS's words and its own (the store not held, the budget, the log) in slates' words under Subversion's
+> nearest error (`serve::Uncommitted::Refused`). The tunnel lands a work through its lender (`SvnStores::commit`). Held
+> to stock `svnserve -t`: the recorded `mkdir` commit answered byte for byte, its `commit-info` naming the principal the
+> key proved where the recording named `alice`; and on a real shard, a client's work landed as the green's version 1
+> with its record. (macOS arm64, Mac Studio, kiln r509: `--lib -- vcs_ssh:: repository::svn_commit::` red 52 of 55, the
+> three new tests failing with the step stubbed back to today's refusal, green 55 of 55; slates-svn `commit:: serve::
+> migration::` 115 of 115; fmt clean.) Owed: the production lender that lends and commits on the owner shard (g297's);
+> `svn://` calling `commit_work` once its lookup opens a repository (g234's); a configured hook run.
 
 - **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
@@ -41926,8 +41944,10 @@ takes the target it expects).
   Last, c lands the clone into the captured tree with an outsider's edit to `/kept`. Its plan must be the agent's
   changes since the capture alone, and the landing must write `/changed` as b left it and `/made` as c did, the
   outsider's file kept.
-- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
-  helper.
+- **Run.** Compiled and passed unchanged, with A-583's two fleet tests, on macOS arm64, local, over 3fee2f575
+  (2026-11-19, w-fed-a503): `cargo test --locked -p slates-server --test fleet -- --exact <name>`, 1 passed (22.5 s);
+  A-583's two, 2 passed (27.2 s); `cargo fmt -p slates-server -- --check` clean. No code fix was needed; the Linux
+  x86_64 lane is owed. Nothing new in the server's library needed a helper.
 
 ### A-555, third piece — A FUSE request that meets a pending base is kept off the device and dispatched again when its fetch lands (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base", §4.6 "Linux (own /dev/fuse driver)"; A-555; Linux-only, written and filed for main's build)
 Applied in the same change to: `crates/bridge-fuse` (`channel`: `dispatch_kept` beside `dispatch_ready`, both through
@@ -54004,3 +54024,44 @@ Applied in the same change to: A-508's owed line (status), GAPS (A-272 (ii)'s A-
   vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, both tests named in the output; fmt clean on the changed files.
 - **Owed.** Forgetting a removed repository's hooks (the table drops them only as one of its hooks runs); Subversion's
   and Mercurial's callers reading and teaching the same table; the daemon's presenter (A-665 part 4).
+
+### A-698 — Commits over ra_svn: the work A-656's connection accepts lands through A-655 part 2b's owner step, for `svn://` and the svn+ssh tunnel alike (2026-11-20, g229, UI goal 93; §4.17.4 items 3.2 to 3.5 and pieces 7 and 12; after A-688, A-656 and A-655 part 2b)
+Applied in the same change to:
+- §4.17.4's status under "The wire" (svn+ssh), after A-688's; GAPS (the §4.17 entry: A-698's line after A-688's,
+  whose owed item it closes);
+- `crates/svn` (`commit::drive::Work::locks`; `serve::Uncommitted::Refused`); `crates/server`
+  (`repository::svn_commit::commit_work` and `Uncommitted::answered`; `vcs_ssh::svn`: `SvnStores::commit`, the
+  accepted work landed and answered; their tests).
+- **The entry** (`commit_work`). A client's accepted work becomes the revision the step commits at the owner's instant
+  (`Revision::of_work`, which gives it its `svn:date`), judged again with the commit's locks at that instant (who
+  commits, the tokens it presented, whether it keeps them: `Work::locks`, which the drive now carries out with the
+  work, since a work whose head moved is merged again and its locks verified as the table stands, as FSFS's commit
+  does), then checked, made the green's next version and appended with its record (A-655 part 2b). `svn://` and the
+  SSH tunnel call it alike: they share A-656's connection.
+- **The answer.** A landed work: `close-edit`'s success, the trivial auth request and `commit-info` (`serve.c`
+  1555-1577), its revision, date and author, no post-commit words (no hook runs yet). A refused one: `close-edit`'s
+  failure, then the client's commands dropped until its `abort-edit` (`editorp.c` 1149-1208): the step's refusals in
+  their own FSFS words (`StepRefusal`); the others, which no FSFS commit meets, in slates' words under the nearest
+  error: the store not held here and the shard's budget and the log's refusal as `SVN_ERR_FS_GENERAL` (160000), a
+  green not at its youngest revision as `SVN_ERR_FS_CORRUPT` (160004), a row the step cannot declare yet as
+  `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
+- **The tunnel.** Its lender lands the work (`SvnStores::commit`): the production lender does so on the owner shard
+  through `commit_work` (g297's, with the lending); the tests' lender through the records' own check and apply. A
+  repository configuring a hook at a point the drive waits on still refuses the commit there, now in words saying the
+  tunnel runs no hook yet.
+- **Tests.** `vcs_ssh::svn::tests::a_stock_commit_lands_through_the_owners_step_as_svnserve_t_answered_it` (the
+  recorded `mkdir` connection, split inside an item, answered byte for byte as stock `svnserve -t` answered it but the
+  author `commit-info` names, the principal the key proved; exit 0; the work landed once, the repository at revision
+  1); `a_work_the_owners_step_refuses_is_answered_as_close_edits_failure` (a step with no room: `close-edit` refused
+  160000 in slates' words, `abort-edit`, exit 0, revision 0); `repository::svn_commit::tests::
+  t_a698_a_clients_accepted_work_lands_through_the_step` (on a real shard: revision 1 dated by the instant and by the
+  work's author, the green at version 1 holding `/trunk`, the register's second record the revision made).
+- **Runs.** macOS arm64, the Mac Studio, kiln r509, 2026-11-20 (00:11 to 00:19Z, load 12 to 17), over main
+  `8c7965bf4` with the change (`ba264d42c`): `cargo fmt -p slates-server -p slates-svn -- --check` clean; red, a scratch
+  copy whose `commit_work` refuses `NotHeld` and whose tunnel refuses every work 200007 as before, `cargo test --locked
+  -p slates-server --lib -- vcs_ssh:: repository::svn_commit:: --test-threads=4` 52 passed, 3 failed (the three
+  above); green 55 of 55; `cargo test --locked -p slates-svn --lib -- commit:: serve:: migration::` 115 of 115. No
+  integration target commits through ra_svn yet: the daemon starts no SSH edge (A-684) and `svn://` opens no
+  repository (g234's lookup).
+- **Owed.** The production lender (g297's); `svn://`'s call once its lookup opens a repository (g234's); a configured
+  hook run, and post-commit's words; the other platforms' runs and the red-checks (main's).
