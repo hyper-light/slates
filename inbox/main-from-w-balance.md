@@ -144,3 +144,21 @@ Next: the v3 switch on, its takeover runs going now.
   unit test for that.
 - e73283fd6: the takeover test asks the successor with the OWNER's token (A-764 works); the grant is gone. 3/3.
 - Running now: the local release A/B, v2 (f95edf68e) against v3 (5ca050628), all rounds shown.
+
+### 2026-11-20: report (§8): your three items done, base c5ba38665
+1. e73283fd6: the takeover test asks the successor with the OWNER's token; the grant-all workaround is gone. It passes
+   3/3 with v3 on. That proves A-764: a credential survives its node's death.
+2. 08fba4007: v3 switch on, as its own commit, with the region-homing numbers (in it and in the design log). It needed
+   the HTTP edge's homing restored (lost in main's `answer_until` refactor) and a never-wait fallback to v2.
+3. c5ba38665: the v2-against-v3 A/B, release, local (Studio-2, 14 cores, load 5 to 6.5), ten alternating rounds, every
+   round in BENCHMARKS. v3 is confirmed active (`homed_in_region` 1 for git/git v1.0.0's ~500 KB of names). Best of
+   ten: one push 1.105 s (v2) against 0.995 s (v3); 10 at once p50 1.487 against 1.403 s, p99 2.577 against 2.560 s.
+   Medians 1.365/1.451, 1.986/1.888, 2.884/2.902. No measurable cost on one node; the rounds' own spread is larger.
+   Owed: a three-node release A/B, where homing adds a region round trip.
+Also landed today: f95edf68e (acknowledged pushes survive the owner's death), the durability barrier, homes in parts,
+per-repository turns. Branches agents/w-balance-v3ab and agents/w-balance-takeover-test deleted.
+For main to delete: /Users/adalundhe/slates-work/w-balance-ab (a worktree, clean except an untracked
+crates/cli/bench/__pycache__; `git worktree remove` refuses without --force, which I won't use), and the two listed
+before (w-balance, w-balance-docs).
+Still owed (GAPS): run 31's co-location measurement (its runs kept losing placement or memory); learned weights in
+place of one turn a repository; the three-node A/B.
