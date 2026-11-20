@@ -15605,3 +15605,27 @@ alone exhausts its budget.
 - **Competitor.** `git diff --no-index --diff-algorithm={myers,histogram,patience}` (git 2.50.1) of the same re-indent
   of `engine.rs` (274 KiB to 300 KiB) takes 10 to 40 ms a process, at line grain and including process start. The
   refiner's p99 save, at token grain, is about 14 ms for that file.
+
+## A push read where it lies in its pack while it is judged: none of its objects in the store until it lands (A-722 memory B2, in-flight half; main's ruling B; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; the diagnostic test of B1 (one push driven by phase on a
+  daemon's shard, its request 64 KiB a call; branch agents/w-git-memdiag's test, never main) over a receive-pack request
+  of git/git's v1.5.0 (9.4 MiB of pack, 34,296 objects), before (main e73283fd6) and after (5518fb2bc).
+
+| | content store after input | quarantined after input | admission peak | content peak (landing) | content after | answer steps | test time |
+|---|---|---|---|---|---|---|---|
+| before | 14.4 MiB | 10,644 objects, inflated | 34.4 MiB | 310.3 MiB | 309.0 MiB | 173,409 | 6.71 s |
+| after (5518fb2bc) | 0.0 MiB | 10,644 objects, in place | 34.4 MiB | 310.3 MiB | 309.0 MiB | 229,619 | 9.73 s |
+| after, staging in resolution order | 0.0 MiB | 10,644 objects, in place | 34.4 MiB | 310.3 MiB | 309.0 MiB | 168,761 | 9.44 s (loaded) |
+
+- **What it says.** While the push is read and checked, the content store holds none of its objects; the push holds its
+  pack and what it read lately (at most the pack again). What lands is put at staging, so the landed size is the same:
+  the landed half (changesets, a clone's pack derived from them) is w-store's seam, owed. The admission (the session's
+  charge for the pack and its reader) is unchanged. (After input, 10,644 is the pack's whole objects; its 23,653 deltas
+  resolve in the answer's first turns, held in place the same way.)
+- **What it cost, and the cut.** The push took 3.0 s more (+45%) and 56,210 more steps of the shard's quantum. A
+  profile (`sample`, 5 s mid-push) put zlib's inflate on top: staging read each object in place in its name's order,
+  random against the pack, so each read inflated its chain again (git/git v1.5.0: chains 12.6 deep on average). Staging
+  now puts the pack's objects in the order the reader resolved them, each just after its base, which the objects read
+  lately hold (`Step::Putting`). The same push then answered in 168,761 steps, fewer than before B2 (173,409); its time,
+  9.44 s, was taken while the Studio built other work, so the steps are the comparison. Its longest step, 48 ms, is
+  its last: the landing (the commit's whole passes, next).

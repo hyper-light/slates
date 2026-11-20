@@ -168,6 +168,11 @@ pub struct Push {
   pack: Vec<u8>,
   /// The objects of `pack`, by name. One entry an object: what names it to where it lies.
   placed: BTreeMap<ObjectId, Placed>,
+  /// The objects of `pack` in the order they were admitted: the order the pack's reader resolved them, each delta after
+  /// its base. Kept so staging reads each object just after its base, which the objects read lately then hold, rather
+  /// than its whole chain again in its name's order (git/git's v1.5.0: chains 12.6 deep on average); one name an
+  /// object.
+  order: Vec<ObjectId>,
   /// The buffers an object is read from the pack with, and the objects read lately (`packed::Scratch`): reused read
   /// after read; what it keeps lately is held to the pack's length. In a cell because a read is a look, not a change.
   reading: RefCell<Scratch>,
@@ -185,6 +190,7 @@ impl Push {
       staged: None,
       pack: Vec::new(),
       placed: BTreeMap::new(),
+      order: Vec::new(),
       reading: RefCell::new(Scratch::default()),
     }
   }
@@ -277,6 +283,7 @@ impl Push {
         stored: None,
       },
     );
+    self.order.push(id);
     self.sealed = false;
     self.deepest = self.deepest.max(incoming.depth);
     Ok((id, Admitted::New))
@@ -524,6 +531,12 @@ impl Push {
     }
   }
 
+  /// The `at`th object of the push's pack in the order it was admitted (the order its reader resolved it), none past the
+  /// last.
+  pub(crate) fn placed_in_order(&self, at: usize) -> Option<ObjectId> {
+    self.order.get(at).copied()
+  }
+
   /// The content-store root of an object held under `id`: where it is stored, or where its pack's entry was put there
   /// ([`Push::put_placed`]); none for an entry not put.
   pub(crate) fn stored(&self, id: &ObjectId) -> Option<ContentId> {
@@ -552,6 +565,7 @@ impl Push {
       }
     }
     self.pack = Vec::new();
+    self.order = Vec::new();
     *self.reading.get_mut() = Scratch::default();
     first
   }

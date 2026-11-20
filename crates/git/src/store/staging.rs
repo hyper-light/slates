@@ -50,6 +50,13 @@ enum Step {
     /// The numbers so far.
     done: BTreeMap<ObjectId, u64>,
   },
+  /// Each object of the push's pack that the repository does not index put in the content store, an object a unit, in
+  /// the order the pack's reader resolved them (`Push::placed_in_order`): each read just after its base, so the objects
+  /// read lately hold its chain. The census after it finds each put.
+  Putting {
+    /// The next, in that order.
+    next: usize,
+  },
   /// The fork the rows are written into made, and the next position read: what the staging is current against. A
   /// landing after it moves the index's rows or its next position, so the commit stages the push again (A-722 part
   /// 4b's race, found by reading after the 100-push run: a fork made at the rows' step met rows another push landed
@@ -172,7 +179,7 @@ impl Repository {
       old.fork.release(store)?;
     }
     Ok(Staging {
-      step: Step::Forking,
+      step: Step::Putting { next: 0 },
     })
   }
 
@@ -301,13 +308,24 @@ impl Repository {
       } => {
         let Some(id) = ids.get(next).copied() else {
           push.seal_with(&done);
-          return Ok(Step::Forking);
+          return Ok(Step::Putting { next: 0 });
         };
         self.generations_from(store, push, id, &mut done)?;
         Ok(Step::Generations {
           ids,
           next: next.saturating_add(1),
           done,
+        })
+      }
+      Step::Putting { next } => {
+        let Some(id) = push.placed_in_order(next) else {
+          return Ok(Step::Forking);
+        };
+        if self.indexed(store, &id).is_none() {
+          self.stored_for_row(store, push, &id)?;
+        }
+        Ok(Step::Putting {
+          next: next.saturating_add(1),
         })
       }
       Step::Forking => Ok(Step::Fresh {

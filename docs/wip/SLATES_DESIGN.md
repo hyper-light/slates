@@ -55930,7 +55930,9 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (`Repository::bytes_of`) read it in place. A chain is resolved from the objects read lately
   (`packed::Recent`, git's delta base cache): each object the reader resolves is kept there taken whole, each object a
   read builds copied in, held to the pack's length, so a push's resident is at most twice its pack. Staging puts each
-  object new to the repository in the content store as its row is written (`Push::put_placed`, a census unit an object),
+  object new to the repository in the content store before its census, an object a unit, in the order the pack's reader
+  resolved them (`Push::placed_in_order`, `Step::Putting`), each read just after its base so the objects read lately
+  hold its chain (`Push::put_placed`; in its name's order each was its whole chain again, +45% CPU on v1.5.0),
   and the hook view's pushed pack is made from those. The record writes the push's own pack (`RecordWriter::finish`'s
   `pack`), as before byte for byte. Objects no pack brought (the server's own commits, a replay's) are held in the
   content store as before.
