@@ -43,7 +43,10 @@
   node-revision budget, View::revision_file generated on read, texts streamed; revprops/fixed files/dirs), Index::created_in.
   Test crates/svn/tests/fsfs_view.rs 3/3; on Studio-1 (kiln on adas-mac-studio.local-2 = d1323898, stock 1.15.0):
   svnadmin verify ok, dump == full.dump, dump --deltas == deltas.dump, svnlook changed == changed.txt.
-  NEXT: A-738 P2 (db/transactions/<txn>.txt + txn-protorevs for svnlook -t), then P3 after a2.
+  A-738 P2 LANDED: main a75731c (9143016): fsfs::transaction_files from Index::trial (Trial::made/node_revision
+  added); node.<n>.<c>(+.props/.children), props, next-ids, changes, txn-protorevs/<txn>.rev streamed. Oracle on
+  Studio-1: each golden revision's work tried on R-1 -> svnlook -t == svnlook -r (changed/info/tree/dirs-changed/diff).
+  NEXT: P3 waits for A-727 a2 (w-perf) + SLATES_ROOT placement (b); then P4 (git), then (a) root mount publication.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
