@@ -445,6 +445,12 @@ fn push_holding(
   let pushed = push_planned(state, &record, (steps, parts), &mut held, stored);
   if pushed.is_err() {
     held.give_back(state);
+  } else {
+    // The entry's objects are the repository's content, charged to this shard's memory budget as retention, never the
+    // partition's merge budget (A-662; `vcs_store::settle_objects`). A push was admitted what its shard could hold by
+    // its own admission (A-704, A-711), so its charge never refuses it; a Subversion revision asks first
+    // (`svn_commit`'s land, `vcs_store::admit_objects`).
+    crate::vcs_store::settle_objects(state, repository);
   }
   pushed
 }

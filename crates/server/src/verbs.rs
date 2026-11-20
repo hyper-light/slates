@@ -6746,6 +6746,7 @@ pub(crate) fn publish_created_volume(
   match state.volumes.insert(slot) {
     Ok(h) => {
       state.by_id.insert(id, h);
+      crate::base_hints::enrol(state, h);
       ReplyBody::Created {
         id: to_wire_volume(id),
       }
@@ -10643,6 +10644,7 @@ pub(crate) fn publish_clone_as(
   match state.volumes.insert(slot) {
     Ok(h) => {
       state.by_id.insert(id, h);
+      crate::base_hints::enrol(state, h);
       Ok(id)
     }
     // The slot did not land: give both credits back (they are `Copy`), never leaking on this path.
@@ -18612,6 +18614,7 @@ fn rebuild_volume(
     .insert(slot)
     .map_err(|e| resources(format!("the volume table: {e}")))?;
   state.by_id.insert(record.id, handle);
+  crate::base_hints::enrol(state, handle);
   Ok(prefix)
 }
 

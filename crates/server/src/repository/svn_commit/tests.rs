@@ -614,3 +614,46 @@ fn subversion_revisions_fold_their_greens_chain_as_they_land() {
     );
   });
 }
+
+/// Shape: the partition's merge budget in the content test: small, so a few revisions' records pass it.
+const SMALL_MERGE_BUDGET: usize = 64 << 10;
+
+/// Shape: each revision's text in the content test: a quarter of [`SMALL_MERGE_BUDGET`].
+const QUARTER_TEXT: usize = SMALL_MERGE_BUDGET / 4;
+
+/// Found by use (w-perf, 2026-11-19: `slates repository import` of git/git's newest 5,000 commits as a dump refused
+/// `TableAtCapacity { table: "green_chains" }` at revision 1,685). Do: on a shard whose partition's merge budget is
+/// [`SMALL_MERGE_BUDGET`], land revision 1, then eight revisions each bringing a text a quarter of that budget. Expect:
+/// every revision lands, the register's objects hold more than the merge budget, and the shard's budget charges them:
+/// a repository's content is bounded by what its owner shard can hold (A-662, `vcs_store::settle_objects`), never by
+/// the merge budget the partition's chains share. Before the fix each revision's record was charged to the merge
+/// budget, so the repository's whole content had to fit in it.
+#[test]
+fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget() {
+  let landed = crate::daemon::audit_on_shard_configured(
+    |state| {
+      let (svn, _green) = subversion(state, "svn");
+      let mut answers = vec![commit(state, (&owner(), svn), first(), None)];
+      for head in 1..9u64 {
+        let bytes = vec![u8::try_from(head).unwrap_or(0); QUARTER_TEXT];
+        let rows = vec![file("/trunk/a.txt", Action::Modify, &bytes)];
+        answers.push(commit(
+          state,
+          (&owner(), svn),
+          revision(head, rows, &[&bytes]),
+          None,
+        ));
+      }
+      let held = state.db.partition().repositories().objects_bytes(svn);
+      let charged = state.vcs_stores.objects_charged(svn);
+      (
+        answers,
+        held > SMALL_MERGE_BUDGET,
+        charged == u64::try_from(held).unwrap_or(0),
+      )
+    },
+    |config| config.caps.green_chain_bytes = SMALL_MERGE_BUDGET,
+  );
+  let expected: Vec<_> = (1..10).map(answered).collect();
+  assert_eq!(landed, (expected, true, true));
+}

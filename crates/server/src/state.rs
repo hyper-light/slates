@@ -718,6 +718,9 @@ pub struct ShardState {
   pub(crate) capture_deadlines: crate::deadlines::CaptureDeadlines,
   /// The shard's deadline keeper, woken when a deadline is set earlier than the one it sleeps for (A-522).
   pub(crate) deadline_task: Option<slates_rt::TaskId>,
+  /// The shard's hint watcher's part (A-709, `crate::base_hints`): the set of its base watchers and the volumes owed a
+  /// drain.
+  pub(crate) base_hints: crate::base_hints::BaseHints,
   /// The deadline the keeper sleeps until, `None` while none is set (`crate::deadlines::noted` reads it).
   pub(crate) deadline_armed: Option<u64>,
   /// When a destroy whose completion record the catalog refused is tried again (A-536): the shard's window after the
@@ -1184,6 +1187,22 @@ pub struct ShardState {
   /// When the deadline keeper next hands a purge round to the reaper (A-570, `crate::nfs::note_purges`): at once at a
   /// start whose partition owes purges, a retry window on while the NFSv4 table owes any; `None` while none is owed.
   pub(crate) nfs_purge_at: Option<u64>,
+  /// When the earliest unreturned delegation recall lapses (RFC 8881 §10.4.5; A-709): set by each recall drain
+  /// (`crate::delegation::drain`), kept by the deadline keeper, which drains again then to revoke it; `None` while no
+  /// recall is outstanding.
+  pub(crate) delegation_lapse_at: Option<u64>,
+  /// When the deadline keeper next hands the idle sweep a pass (A-715): set a sweep's interval after the write, free or
+  /// allocation that owes one ([`crate::idle_sweep::after_borrow`]), and after a pass that left work; `None` while the
+  /// shard owes no sweep, which is then never woken for one.
+  pub(crate) idle_sweep_at: Option<u64>,
+  /// The idle sweep (A-715): its task, woken by the keeper at `idle_sweep_at`.
+  pub(crate) idle_sweeper: Option<slates_rt::TaskId>,
+  /// Whether a sweep pass is asked for or under way (A-715): set by the keeper at `idle_sweep_at`, cleared by the sweep
+  /// as its pass ends, so nothing arms another while one runs.
+  pub(crate) idle_sweep_running: bool,
+  /// The content arena's allocation count and allocated bytes as the last sweep pass ended (A-715): a borrow that finds
+  /// either changed owes a sweep (a write's allocation, a delete's free once published).
+  pub(crate) idle_sweep_seen: (u64, usize),
   /// Whether the reaper owes a purge round (A-570): set by the keeper at `nfs_purge_at`, taken by the reaper.
   pub(crate) nfs_purge_owed: bool,
   /// When the deadline keeper re-arms the backed route's huge-page placement (A-570): a retry window after the host
@@ -1318,6 +1337,11 @@ pub struct ShardState {
   /// held inputs. Each carries the attempts made, which `fleet::materialize_pending_greens` bounds. Bounded by the
   /// objects this node owns; empty on a laptop.
   pub pending_green_materializations: BTreeMap<ObjectId, PendingGreen>,
+  /// The repositories this node took over whose records it adopted (A-636 part 2c-1): each repository's own register,
+  /// with the sequence adopted and the record it held, kept until the repository is rebuilt from it and its state logs
+  /// (part 2c-2). Bounded by the repositories this node owns, at most a partition's volume capacity a partition; empty
+  /// on a laptop.
+  pub pending_repositories: BTreeMap<ObjectId, (u64, slates_db::catalog::RepositoryRecord)>,
   /// Taken-over volumes whose register this node adopted as a **tombstone** (AUD-29-43), each with the tombstone's
   /// sequence and the attempts to record it: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where
   /// the record plane ships the tombstone's remaining stages. Never materialized. One given up on past the failover
@@ -1509,6 +1533,10 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     let result = f(state);
     // A deadline the borrow set before the one the shard's keeper sleeps for wakes it, whichever path set it (A-536).
     crate::deadlines::after_borrow(state);
+    // A volume owed a hint drain whose host a landing gave back wakes the hint watcher (A-709).
+    crate::base_hints::after_borrow(state);
+    // A write, free or allocation the idle sweep owes a pass arms it (A-715).
+    crate::idle_sweep::after_borrow(state);
     crate::retention::retain(state).map_err(StateAccess::Retention)?;
     Ok(result)
   })
