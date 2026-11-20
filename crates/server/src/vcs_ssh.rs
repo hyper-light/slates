@@ -104,7 +104,7 @@ use slates_ssh::userauth::{KeyHolders, RECOMMENDED_FAILURE_LIMIT};
 
 use crate::vcs_http::Bounds;
 use crate::vcs_http::git::Located;
-use site::{Command, Dispatched, Next, Refused, SshSite};
+use site::{ClientGone, Command, Dispatched, Next, Refused, SshSite};
 use waits::{Overdue, Phase, PhaseWaits, Tracker};
 
 /// Derived: the transport's packet cap: the size every peer accepts (RFC 4253 §6.1: "All implementations MUST be able to
@@ -1148,7 +1148,7 @@ impl<S: SshSite> Link<S> {
       // A command-less run (a refusal, a failure) always has its exit queued, so it is never stepped.
       return Ok(Turn::Idle);
     };
-    match command.step().await {
+    match command.step(ClientGone::never()).await {
       Ok(stepped) => {
         if let Some(running) = self.running.as_mut() {
           running.next = stepped.next;
