@@ -380,6 +380,10 @@ fn land(
   (checked, record): (Checked, Vec<u8>),
 ) -> Result<Committed, Uncommitted> {
   let work = version_of(state, (repository, green), &checked, &record)?;
+  // The record is the repository's content in the partition's register, charged to this shard's memory budget
+  // (`vcs_store::settle_objects`): a revision is admitted only while the shard could hold it.
+  crate::vcs_store::admit_objects(state, record.len())
+    .map_err(|available| Uncommitted::Budget { available })?;
   let growth = grown(&checked);
   crate::vcs_store::reserve_svn(state, repository, growth)
     .map_err(|available| Uncommitted::Budget { available })?;

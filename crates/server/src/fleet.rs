@@ -2491,7 +2491,47 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     heads.extend(owed_tombstone(state, config, tombstone, local));
   }
   heads.extend(owed_state_log_parts(state, config, local));
+  heads.extend(owed_repositories(state, config, local));
   heads
+}
+
+/// The repositories' own registers this owner shard still owes some candidate (A-636 part 2c-1): each repository's
+/// record (`crate::catalog::repository_value`) at its sequence (`crate::catalog::repository_sequence`), to the
+/// candidates its family places it on, its state logs' and its greens' (A-636 part 2b-2), as a volume's catalog ships to
+/// its volume's. A repository this node lost to a successor ships nothing, as a lost volume does: its successor owns its
+/// registers.
+fn owed_repositories(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  local: HostId,
+) -> Vec<Head> {
+  let repositories = state.db.partition().repositories();
+  repositories
+    .repositories()
+    .filter(|record| {
+      !crate::verbs::lost_to_a_successor(
+        state,
+        DbVolumeId {
+          bytes: record.id.bytes,
+        },
+      )
+    })
+    .filter_map(|record| {
+      let names = repositories
+        .log_position(record.id, slates_db::catalog::StateLog::Names)
+        .unwrap_or(0);
+      owed_record(
+        state,
+        config,
+        (
+          ObjectId(record.id.bytes),
+          crate::catalog::repository_sequence(record, names),
+        ),
+        crate::catalog::repository_value(record),
+        local,
+      )
+    })
+    .collect()
 }
 
 /// The parts of the repositories' state logs this owner shard still owes some candidate (A-636 part 2b;
@@ -13138,6 +13178,77 @@ mod state_log_tests {
         vec![4]
       );
       assert!(!state.placed_heads.contains_key(&register));
+    });
+  }
+
+  /// A-636 part 2c-1. Do: on an owner shard in a region of three at `f = 1`, create a repository and a branch of it, ask
+  /// the record plane what it owes for the repository's own register; record both remote candidates' acknowledgements as
+  /// `ship_head`'s round records them and ask again; then retire the branch's name and ask again. Expect: the
+  /// repository's record owed at its own id, to its family's candidates, at sequence 5 (policy version 0, the names log
+  /// at 4, plus one), its value the record as the database holds it; nothing owed once both candidates hold it; after
+  /// the retire, the record owed again at 6 to both.
+  #[test]
+  fn an_owners_repository_record_is_owed_to_its_familys_candidates_at_each_change() {
+    crate::daemon::audit_on_shard(|state| {
+      let (local, [b, c]) = region_of_three(state);
+      let repo = repository_and_branch(state, "recorded");
+      let object = ObjectId(repo.bytes);
+      let config = state.fleet.configuration().clone();
+      let owed_now = |state: &ShardState| {
+        super::owed_repositories(state, &config, local)
+          .into_iter()
+          .map(|head| {
+            (
+              head.object,
+              head.record.sequence,
+              head.shape.candidates,
+              head.record.value,
+            )
+          })
+          .collect::<Vec<_>>()
+      };
+      let record = state
+        .db
+        .partition()
+        .repositories()
+        .repository(repo)
+        .cloned()
+        .unwrap();
+      let candidates = config.place(object).candidates;
+      assert_eq!(
+        owed_now(state),
+        vec![(
+          object,
+          5,
+          candidates.clone(),
+          crate::catalog::repository_value(&record)
+        )]
+      );
+      assert_eq!(
+        crate::catalog::repository_of(&crate::catalog::repository_value(&record)),
+        Some(record)
+      );
+      let placement = Placement {
+        acked: vec![local, b, c],
+        ..config.place(object)
+      };
+      super::record_acks_in(state, object, 5, FIRST_EPOCH, placement);
+      assert_eq!(owed_now(state), Vec::new());
+      let retired = crate::verbs::dispatch(
+        state,
+        1,
+        &owner(),
+        RequestBody::RetireBranch {
+          repository: "recorded".to_owned(),
+          name: "topic".to_owned(),
+        },
+      );
+      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+      let again: Vec<(u64, Vec<HostId>)> = owed_now(state)
+        .into_iter()
+        .map(|(_, sequence, candidates, _)| (sequence, candidates))
+        .collect();
+      assert_eq!(again, vec![(6, candidates)]);
     });
   }
 

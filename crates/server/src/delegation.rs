@@ -1,6 +1,6 @@
 //! Delegation recalls in the daemon (RFC 8881 §10.2, §10.4.4–10.4.5; §4.6 A-79): after each operation a shard serves,
 //! the recalls its changes asked for are sent, and delegations not returned within a lease of their recall are
-//! revoked.
+//! revoked, by the shard's deadline keeper at the earliest one's lapse when no call comes first (A-709).
 //!
 //! A change to a delegated file by anyone but its holder is refused at the volume core's recall gate
 //! (`slates_vfs::recall_gate`) and its inode queued there with the change's actor; an NFSv4 open that conflicts with
@@ -80,6 +80,31 @@ pub(crate) fn drain(s: &mut ShardState) {
     }
   }
   crate::nfs_state::record_files(s, None);
+  arm_lapse(s, now, lease);
+}
+
+/// Arms the shard's deadline keeper for the earliest unreturned recall's lapse, a lease and a nanosecond after it began
+/// (`revoke_lapsed`'s rule), measured from `now` (the drain's reading of the shard's clock) and set on the keeper's own
+/// clock (A-709). Until A-709 a delegation nobody returned was revoked at the reap loop's next tick, a liveness window
+/// late at worst, when no call was served meanwhile.
+fn arm_lapse(s: &mut ShardState, now: u64, lease: u64) {
+  let due_in = s
+    .nfs_v4_files
+    .as_ref()
+    .and_then(|files| files.earliest_recall_ns())
+    .map(|began| {
+      began
+        .saturating_add(lease)
+        .saturating_add(1)
+        .saturating_sub(now)
+    });
+  s.delegation_lapse_at = due_in.map(|span| {
+    use slates_vfs::clock::Clock;
+    s.clock.monotonic_ns().saturating_add(span)
+  });
+  if let Some(at) = s.delegation_lapse_at {
+    crate::deadlines::noted(s, at);
+  }
 }
 
 /// The session a recall to `clientid` goes to: a session of the client held on this shard whose back channel has

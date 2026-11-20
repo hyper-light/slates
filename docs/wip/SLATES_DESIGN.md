@@ -5005,6 +5005,24 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-20, A-715: the idle sweep leaves the tick, and the reap loop and its tick are deleted).** The idle
+> sweep (the seal of files idle one to two intervals, the publication of what it moved or a free deferred, the idle
+> purge, recovery give-back and reserve refill) runs a pass at its own deadline on the keeper
+> (`crate::idle_sweep`): armed a liveness budget after the write that stamps a file for the seal, an allocation, a
+> published free or a deferred free, and after a pass that leaves work; a pass that settles the shard arms nothing, so
+> an idle shard is never woken (`an_idle_shard_runs_no_sweep_pass`: no pass in three intervals, where the tick ran
+> one an interval). With it the reap loop, its interval and its sweep are gone: every reap job runs at its own event
+> or deadline (dead clients at their hang-up, A-475; A-522 to A-570's deadlines; base hints at the kernel's report,
+> A-709).
+
+> **Status (2026-11-20, A-709: base hints leave the tick).** Each overlay's watcher descriptor (inotify, a kqueue) is
+> entered in one set of its shard's (`slates_base::HintSet`, an epoll or a kqueue, one-shot, keyed by the volume's
+> generational handle), and one task a shard (`crate::base_hints::watcher`) awaits that set's readability: a report
+> drains the ready volumes' hints, re-arms their watchers and sends the recalls they asked for, so an outsider's edit
+> reaches the shard at the kernel's report (10 ms in the unit test, macOS arm64) where it waited up to a window. A
+> volume whose host a landing has lent out is owed and drained when a state borrow finds it back. A delegation nobody
+> returned lapses at its own deadline on the keeper (`delegation::arm_lapse`). Left on the tick: the idle seal.
+
 > **Status (2026-11-19, A-570: the pressure hold leaves the tick).** The pressure hold's sampler (`crate::pressure`, a
 > task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
 > them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
@@ -12026,8 +12044,10 @@ decides the details.
 > register at the position it leaves the log at, in order, committed at `f + 1`, and a holder keeps it only where it
 > continues its copy of the log, so every holder's copy is a prefix and a successor can rebuild the repository's state
 > from it and keep or drop each operation whole. A repository's greens are of its family (A-636 part 2b-2), so every
-> log of a repository, its greens' included, is placed on one set of holders and follows one successor. Owed: the
-> server's takeover by this rule (2c); and the repository policy's check before the verdict (A-622's next part).
+> log of a repository, its greens' included, is placed on one set of holders and follows one successor; and its record
+> (name, tool, format, owner, policy) is its own register, shipped as its catalog is a volume's and adopted by its
+> successor (A-636 part 2c-1). Owed: the successor's rebuild of the repository from its record and its logs by this
+> rule (2c-2); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12455,6 +12475,13 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-19, A-714, w-svn, found by use: a 5,000-revision Subversion import refused `green_chains` at 1,685).** An
+> entry's objects are the repository's content: the register keeps them as before, but the owner shard charges them to
+> its memory budget as retention with the tool store (`vcs_store::settle_objects`: trued up after each append and at a
+> recovery, given back with the repository; a push's own admission bounds it, a Subversion revision asks
+> `admit_objects` first), never to the partition's merge budget, so a
+> repository's bound is what its shard can hold. This replaces A-662's "charged to the merge budget" below.
+>
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
 > (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each
@@ -12569,7 +12596,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
    every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
    operation's identity and spans (A-636 part 2b); and a repository's greens minted in its family, placed and taken
-   over as it is (A-636 part 2b-2); owed: the server's takeover by the rule (2c).
+   over as it is (A-636 part 2b-2); and its record shipped as its own register and adopted by its successor (A-636 part
+   2c-1); owed: the successor's rebuild of the repository by the rule (2c-2).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -14534,7 +14562,8 @@ is offered only when it holds nothing the principal may not read. The same rende
 admission hooks see and what an export lands (§4.15).
 Status (A-706, stream clones part 1): `slates_hg::render` renders the index whole into those files, each revision a full
 text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
-deltas, the rendering appended as versions commit, `stream_out` and `stream2` are later parts.
+deltas, the rendering appended as versions commit and `stream2` are later parts; `stream_out` (A-712) sends the
+rendered revlogs as 7.2's version 1 stream, refused `1\n` while a changeset is secret.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -54083,3 +54112,66 @@ Applied in the same change to:
   bc2803d66, reported); fmt clean on the changed files.
 - **Owed.** upload-pack's answer made in slices (its negotiation and the pack's plan run in one step: a 1,200-commit
   fetch's ran past a liveness window in a debug build); the git-matrix clone rows by use (main's).
+
+### A-709 — Base hints drained at the kernel's report, one hint set a shard; a delegation lapses at its own deadline (2026-11-20, w-reaper; the event-driven reaper's piece 6; §4.5, §4.7, §4.15; RFC 8881 §10.2; A-122, A-570)
+
+- **What was there.** The reap loop's tick drained every overlay volume's watcher once a liveness window
+  (`daemon::process_base_hints`), then ran `delegation::drain`, whether any watcher had hints or not; an outsider's edit
+  beneath a delegation waited up to a window, and a delegation nobody returned was revoked at the next tick.
+- **Change.** `slates_base::HintSet`: an epoll (`EPOLLIN | EPOLLONESHOT`) or a kqueue (`EVFILT_READ`, `EV_ONESHOT`) of
+  the shard's, each overlay's watcher descriptor entered under its volume's handle (index, generation), so a destroyed
+  volume is a stale handle and a closed watcher leaves the set with its descriptor. `crate::base_hints::watcher`, one
+  task a shard (`LOOP_TASKS_PER_SHARD` 8 -> 9), awaits the set and drains the ready volumes; a volume made, cloned or
+  recovered is entered as it joins the table; a lent-out host is owed until a borrow finds it back. `delegation::drain`
+  arms the deadline keeper at the earliest unreturned recall's lapse (`earliest_recall_ns`). The macOS watcher's kevent
+  calls folded into one (slates-base unsafe 11 -> 10). Windows keeps no watcher: its arms are no-ops (main's build).
+- **Tests.** `slates-server` `base_hints::tests::an_outsiders_edit_is_drained_at_the_kernels_report_without_a_tick`
+  (drained 10 ms after the write, bound half a window); `slates-base` `hint_set::tests` (2);
+  `slates-bridge-nfs` `the_earliest_unreturned_recall_names_when_its_revocation_falls_due`. macOS arm64, Mac Studio.
+- **Applied in the same change to** §4.7's status, GAPS (the reaper series), amendments.tsv.
+- **Owed.** The Linux epoll arm built and run (main's); the idle seal with its purge, then the tick's deletion.
+
+### A-636 part 2c-1 — A repository's record is its own register: shipped to its family's candidates at each change and adopted by its successor (2026-11-20, w-shared for UI goal 93)
+- **Why.** 2c's successor rebuilds a repository from what it holds as a holder, and nothing shipped a repository's own
+  record (its name, tool, object format, owner and policy): the state logs carry its namespace and state, the greens'
+  logs their versions, but no holder could make the repository they belong to. Split from 2c (main, 2026-11-20): 2c-1
+  ships and adopts the record; 2c-2 rebuilds the repository from it and its logs by part 1's rule.
+- **Change.** The record is the value of the repository's own register (its id in the own class, which nothing else
+  used), class byte `REPOSITORY_CLASS` = 6 (`crate::catalog::repository_value`, `repository_of`), a single value a holder
+  keeps at its newest. Its sequence is one past its policy's version plus its names log's position
+  (`repository_sequence`): after its creation a record changes only by a policy setting or a default branch moved,
+  which moves the names log, so one sequence never names two values and each change ships as a newer record. The owner
+  ships it as a volume's catalog ships (`fleet::owed_repositories`, through `owed_record` and the record plane's
+  rounds), to its family's candidates (A-636 part 2b-2); a repository lost to a successor ships nothing. A successor's
+  adoption reads it by its class (`takeover::adopt_own`) and keeps it as a pending repository with the sequence adopted
+  (`ShardState::pending_repositories`, counted `fleet.takeover.repository_adopted`), never as a volume or a green.
+- **The cost.** One more register commit per names change or policy setting, beside the names log's own part; batched
+  with it later (owed).
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20: `cargo test --locked -p slates-server --lib -- fleet::state_log_tests
+  takeover:: state_log mirror:: repository::tests --test-threads=4` 33 of 33; fmt clean). `slates-server` `fleet::state_log_tests::an_owners_repository_record_is_owed_to_its_familys_candidates_at_each_change`
+  (owed at 5 to the family's candidates, held by both, owed again at 6 after a retire);
+  `takeover::tests::a_repositorys_record_is_adopted_as_its_own_never_as_a_volume_or_a_green` (kept pending with its
+  sequence, counted once; a cut-short value and one of another class kept as none).
+- **Owed.** The rebuild (2c-2): once a repository's record and its four state logs are adopted and its greens rebuilt,
+  its successor keeps each state log's records only where every log they span holds them whole (part 1's rule, a
+  green's log judged by its adopted head), records the repository whole in its database and makes its store from the
+  log; the record's commit batched with the names log's part.
+
+### A-715 — The idle sweep at its own deadline; the reap loop and its tick deleted (2026-11-20, w-reaper; the event-driven reaper's last piece; §4.2, §4.7; A-99, A-105, A-117, A-214, A-226, A-709)
+
+- **What was there.** `daemon::reap_loop` paced a liveness window and ran the idle sweep (`seal_idle_content`, then
+  `purge_if_idle`) on every shard at every tick, owed or not; it was the last job on the tick.
+- **Change.** `crate::idle_sweep`: one task a shard (the reap loop's slot, `LOOP_TASKS_PER_SHARD` unchanged) runs a pass
+  when the deadline keeper reaches `idle_sweep_at`. Each state borrow closes by arming it a liveness budget on when the
+  shard owes a pass: a sealing volume's write was stamped (`Store::sweep_owed`, new, set at the stamp), the content
+  arena's allocation count or allocated bytes moved since the last pass, or frees are deferred. A pass that does not
+  settle the shard (a file not yet aged, a publication, a busy arena, a give-back that left slices) arms the next; one
+  that settles arms nothing. The first pass is armed at the shard's start for the recovery give-back. The aging rule
+  (sealed one to two intervals after the last write) and the purge's idle test are unchanged. `reap_loop` deleted.
+- **Tests.** `slates-server` `idle_sweep::tests::an_idle_shard_runs_no_sweep_pass` (no pass in three intervals once
+  settled) and `a_write_on_a_settled_shard_arms_a_pass`; `give_back`, `purge`, `deadlines`, `base_hints`, `idle` lib
+  filters green; `slates-vfs --lib seal` green. macOS arm64, Mac Studio.
+- **Applied in the same change to** §4.7's status, GAPS (the reaper series closed), amendments.tsv.
+- **Owed.** Linux runs of `recovery.rs`'s idle-sweep tests (`a_sealed_files_plaintext_leaves_the_content_object`,
+  `a_deleted_files_plaintext_leaves_the_content_object`, `a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted`,
+  `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it`) (main's).
