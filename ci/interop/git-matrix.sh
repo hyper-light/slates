@@ -30,7 +30,7 @@ row() {
   local log="$WORK/logs/$name.log" start end code
   mkdir -p "$WORK/logs"
   start=$(date +%s)
-  perl -e 'alarm shift; exec @ARGV' "$STEP_LIMIT" "$@" >"$log" 2>&1
+  perl -e 'alarm shift; exec @ARGV or exit 127' "$STEP_LIMIT" "$@" >"$log" 2>&1
   code=$?
   end=$(date +%s)
   if [ "$code" -eq 0 ]; then ROWS+=("PASS $name $((end - start))s"); else
