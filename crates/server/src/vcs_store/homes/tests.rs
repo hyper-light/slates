@@ -170,8 +170,12 @@ fn a_homed_windows_ticket_is_published_only_once_its_homes_image_is() {
         budget,
       )
       .await;
+      // Nothing else publishes on a schedule, so the ticket's wait publishes its home itself (group commit): durable
+      // only once an image of its generation is published there.
       let short = budget / 50;
-      if published(origin, ticket, short).await {
+      if published(origin, ticket, short).await
+        && !home_published(origin, other, generation, budget).await
+      {
         outcome.push("a ticket answered durable before its image was published".to_owned());
       }
       // The publication comes from another task while this one waits on the ticket.
@@ -317,14 +321,21 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
         bytes: bytes.clone(),
       }
       .encode();
+      // The put's wait publishes its home itself when nothing else has (group commit): kept only once an image of the
+      // generation it names is published there.
       let before = HomeMessage::decode(&serve_remote(origin, &put, short).await);
-      if !matches!(
-        before,
+      let durable = match &before {
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Kept { generation },
+          ..
+        }) => home_published(origin, home, *generation, budget).await,
         Ok(HomeMessage::Answer {
           outcome: HomeOutcome::Refused(HomeRefusal::Unanswered),
           ..
-        })
-      ) {
+        }) => true,
+        _ => false,
+      };
+      if !durable {
         outcome.push(format!(
           "acknowledged before its image was published: {before:?}"
         ));
@@ -553,11 +564,28 @@ fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
       let identity = ContentId::of(&bytes);
       let home = home_of(&shards, &identity).unwrap();
       let short = slates_cluster::CommitBudget::hard(budget / 50, (budget / 500).max(1));
+      // Homed only once its home has published an image holding it: the wait publishes the home itself where nothing
+      // else has, counted.
       if home_in_region(origin, &shards, bytes.clone(), short)
         .await
         .is_ok()
+        && crate::xshard::call_in_shard_time(
+          origin,
+          home,
+          |state| {
+            state
+              .refusals
+              .get(super::HOME_PUBLISHED)
+              .copied()
+              .unwrap_or(0)
+          },
+          budget,
+        )
+        .await
+        .unwrap_or(0)
+          == 0
       {
-        outcome.push("homed before any publication".to_owned());
+        outcome.push("homed with no publication of its home".to_owned());
       }
       let publisher = slates_rt::futures::spawn(async move {
         let _ =
@@ -590,4 +618,16 @@ fn an_object_is_homed_in_the_region_only_once_its_homes_image_is_published() {
   });
   let outcome = answered.recv().unwrap();
   assert!(outcome.is_empty(), "{outcome:?}");
+}
+
+/// Whether shard `shard`'s image of `generation` is published, asked from shard `origin`.
+async fn home_published(origin: u16, shard: u16, generation: u64, budget: u64) -> bool {
+  crate::xshard::call_in_shard_time(
+    origin,
+    shard,
+    move |_| super::published_here(generation),
+    budget,
+  )
+  .await
+  .unwrap_or(false)
 }
