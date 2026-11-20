@@ -56221,7 +56221,8 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   node's anchor) and only for a work another node made (the id's creator); a client of the holder is refused at its
   channel (`route_gated`), a client of the owner by the owner's check, both `Unsupported`. The owner cannot yet tell
   which node made the work from the anchor alone (an id names a member id, which is derived from the anchor and the
-  boot's nonce), so any other member may move such a floor; members are mutually authenticated.
+  boot's nonce), so any other member may move such a floor; members are mutually authenticated. (Closed the same day,
+  below: the work's own member alone.)
 - **Counters.** `merge.work.floor_told_owner_node` (the test's non-vacuity count), `merge.work.floor_not_sent`.
 - **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
   a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed` (two nodes at `f = 1`, B with the hook:
@@ -56351,3 +56352,18 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   keeps `g`; A's floor rose to 2) and `a_holders_work_submits_a_copy_composed_over_the_holders_replica` (B's work copies
   `f` to `f2` and submits: version 2, composed on B's replica, A's green reads `f2` "hello"). Fleet `a_holder` 22 of 22;
   `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62, `merge_service::` 14 of 14; fmt clean.
+
+### A-697, the node verbs' authority — A work's node verbs are its own member's alone (2026-11-20, w-shared for UI goal 93; main's ruling on part b's open point)
+Applied in the same change to: part b's entry (its "Who may send it" closed), GAPS (A-247's step two),
+`crates/server/src/verbs.rs` (`serve_forward`, `node_verb_work`).
+- **Rule (main).** A node's verb about one of its works (`AdmitWork`, `MoveWorkFloor`, `SubmitComputed`) is served only
+  when the work's id names, as its creator (its high bytes), the member this node has learned for the fleet link's
+  authenticated anchor (`member_task::anchor_of`, read on the control shard, where `serve_forward` runs). Fleet
+  certificates bind member ids, so no boot nonce is needed; a warm restart keeps the member id, so the member that made
+  a work moves its floor after one. Any other member is refused `Forbidden`, before anything is dispatched or recorded.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --lib
+  verbs::tests::a_works_floor_is_moved_by_the_member_its_id_names_alone` (a one-shard daemon owning a green, member
+  0x51 learned for the peer's anchor: a drop of a 0x51 work's floor moved it; a drop of a 0x52 work's floor refused
+  `Forbidden` and the floor kept). Red with the check removed: the second floor dropped. Fleet `a_holder` 22 of 22 (the
+  admissions, floor moves and computed submits of every holder test pass the check); `verbs::` 63 of 63, `work_home` 2
+  of 2; fmt clean.
