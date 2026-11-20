@@ -140,3 +140,9 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
 - (2) next: PUT body streamed into the drive (bounded window), §4.17.1 "A push's intake". Plan: SvnExchange::body()
   feeds each run to the transaction's open file as a TextdeltaChunk (open file at first run, close at body_end), so the
   exchange holds no body; DavCommit gets begin_put/put_chunk/end_put; on_commit per run.
+- LANDED (2): 15f4dbdde (fast-forward; on main, checked). Run over b3b267347: svn 137/137, server 116/116, svn_interop
+  5/5, matrix HTTP 24/27. Studio disk fine (1.1 TiB; kiln's "GB free" is memory); matrix scratch removed.
+- (3) next: abandoned transaction released at a derived deadline. Plan: VcsStores.dav_commits value gains `last_ns`
+  (owner clock wall ns at last step); deadline derived = the edge's idle wait bound? Find the edge's per-connection idle
+  bound (Bounds) or the liveness/observation budget; sweep on begin/take (bounded scan of the repo's entries) + on a
+  timer? Prefer: expire lazily on every table access (begin, take) across the whole table -- bounded by its bound.
