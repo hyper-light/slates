@@ -128,3 +128,7 @@
   referenced_bytes 1,048,576), WITH OR WITHOUT a takeover. Cause: nothing sweeps a FUSE attachment's references at an
   ordinary end (no FUSE_DESTROY; only virtio-fs/NFSv4 call sweep_attachment); end_attachment only ends the takeover
   holder. Fix: end_attachment sweeps RefOwner::Attachment(record.id) (sweep_attachment ends the holder too).
+- A-739 (B14's fix) wip on agents/w-bugs-a739 (worktree ~/slates-work/w-bugs-a739): end_attachment sweeps
+  RefOwner::Attachment(record.id); new cli test a_file_an_ended_mount_held_is_given_back + the takeover one. Mac:
+  server --test attachment_term 4/4, attach_forms 9/9. CI: diag-w-bugs-a739-green-1 vs -red-2 (red-1 was identical to
+  green: sed missed the reflowed call).
