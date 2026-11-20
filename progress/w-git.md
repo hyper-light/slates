@@ -248,3 +248,9 @@
   Studio (kiln .local-2, own target): check clean; slates-git --lib 579 passed incl. both b2_ tests; server --lib
   git_push/vcs_store/git_hooks/vcs_http/git_protect 198 passed (pre-merge). b2 bound test: 4 MiB inflated -> held in
   store 4,194,304 B before, in place 41,568 B (the pack). v1.5.0 diag before/after running (target-rel, delete after).
+- 14:00 B2 in-flight half LANDED 5518fb2bc. 14:15 LANDED 00e6da185: t_a665 derived deadline (Progress per step,
+  TEST_BOUND_NS each) + commit's landed runs by position (no positions clone, no id map/sort). Main recorded both.
+- v1.5.0 diag (release): before 14.4 MiB content after input, 173,409 steps, 6.71 s; after 0.0 MiB, 229,619 steps,
+  9.73 s (+45% CPU). Suspect: staging reads in id order -> chains re-inflated. Fix drafted (agents/w-git-order
+  cf0941c6e: Push.order = admission order, staging Step::Putting before Forking). Profile run r42 (sample) pending.
+- Replied to w-store's changeset-log ask (inbox/w-store-from-w-git-changeset-log-2026-11-20.md): names section.
