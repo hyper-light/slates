@@ -274,6 +274,25 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> Site for SvnSite<A
   }
 }
 
+/// Format: the methods git's and Mercurial's clients send (git's smart HTTP and Git LFS: GET, HEAD and POST; hg's wire
+/// protocol: GET and POST), which a Subversion request needs its special segment to be told by.
+const SHARED_METHODS: [&[u8]; 3] = [b"GET", b"HEAD", b"POST"];
+
+/// Whether `head` is Subversion's (A-681; the daemon's `ToolSites` routes it here): a method no other tool's client sends
+/// (OPTIONS, PROPFIND, REPORT, MERGE, PUT, ...), or a path with the special URI's segment ([`site::SPECIAL`]), as stock
+/// svn's GETs and HTTPv2 POSTs name `!svn/...`. The segment is compared as sent: svn writes it unescaped.
+pub(crate) fn dav_request(head: &Head<'_>) -> bool {
+  if !SHARED_METHODS.contains(&head.method) {
+    return true;
+  }
+  let Target::Path { path, .. } = head.target else {
+    return false;
+  };
+  path
+    .split(|byte| *byte == b'/')
+    .any(|segment| segment == site::SPECIAL.as_bytes())
+}
+
 /// Routes `head` (the module doc's names): its repository's name and the path below its root, read within `room`;
 /// refused `400` where the path's escapes cannot be read, `414` where it is past `room`, and `404` where no repository
 /// is named.

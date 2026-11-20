@@ -12480,6 +12480,16 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-20, A-716 slice 1a: a text held once, by content identity).** A green holds texts by identity in a
+> table of its file blocks (`crates/merge/src/held.rs`; `Green::hold_path`, `hold_bytes`, `held`, `release_held`,
+> `set_held_room`): by path, the head file's own block with one more holder, so no byte is copied; or by bytes, a block
+> no path names, for an intake that streams objects before any tree. A held text outlives its file's change and
+> removal, and is let go with its last holder. The table's room is its owner's to derive (zero until set), every hold
+> past it refused typed. It replaces the copies each tool keeps of the green's bytes (A-64: a Subversion text was held
+> three times, the records' copy alone 1.37 times the dump; BENCHMARKS.md). Owed: a green op setting a path from a held
+> identity (slice 1b), the table in the checkpoint (1c), Subversion's records reading through it (2, 3), git's and
+> Mercurial's intakes holding by bytes (w-git, w-hg).
+
 > **Status (2026-11-19, A-714, w-svn, found by use: a 5,000-revision Subversion import refused `green_chains` at 1,685).** An
 > entry's objects are the repository's content: the register keeps them as before, but the owner shard charges them to
 > its memory budget as retention with the tool store (`vcs_store::settle_objects`: trued up after each append and at a
