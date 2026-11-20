@@ -445,8 +445,9 @@ fn pushed_three(
 
 /// A-664's live whole builds (a push's; main's ruling of 2026-11-20). Do: push a commit of three files to a git
 /// repository's root green, whose map the push leaves to its build; read the green's kept tree; drive the build's slices
-/// to its end; read it again. Expect: the push answered with no map kept and the build under way; the build ran in
-/// more slices than one (a test's step budget is none, so a file a slice) and kept the pushed commit's tree, built once.
+/// to its end, each slice given no budget (`whole_build::settle`, so the count is the files', whatever the load); read it
+/// again. Expect: the push answered with no map kept and the build under way; the build ran in three slices, one a
+/// file, and kept the pushed commit's tree, built once.
 #[test]
 fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
   let seen = crate::daemon::audit_on_shard(|state| {
@@ -465,11 +466,11 @@ fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
     (
       answered,
       built,
-      slices > 1,
+      slices,
       count(state, crate::vcs_store::paths::BUILT),
     )
   });
-  assert_eq!(seen, ((None, true), (true, false), true, 1));
+  assert_eq!(seen, ((None, true), (true, false), 3, 1));
 }
 
 /// A-664's live whole builds (a submit parked behind one). Do: push a commit of three files to a git repository's root
@@ -655,4 +656,95 @@ fn t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_
     (again.head, again.text, owing),
     (first.head, first.text, Some(0))
   );
+}
+
+/// A-664's live whole builds (main's ruling of 2026-11-20: tens of thousands of concurrent pushes, so a busy green's
+/// build must end). Do: push a commit of sixty-one files to a git repository's root green, its map left to its build;
+/// then fifty pushes, each a commit over the one before changing `README`, with one slice of the build (one file)
+/// between each two; drive the build to its end. Expect: no build started again, the build moved to the newest head at
+/// its slices' boundaries, built once, and the tree kept the last push's.
+#[test]
+fn t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, green) = git_repository(state, "storm");
+    let root = to_db_volume(green);
+    let mut files: Vec<(Vec<u8>, Vec<u8>)> = (0..60)
+      .map(|serial| {
+        (
+          format!("f{serial}").into_bytes(),
+          format!("file {serial}\n").into_bytes(),
+        )
+      })
+      .collect();
+    files.insert(0, (b"README".to_vec(), b"one\n".to_vec()));
+    let (objects, mut head) = commit_of(&files, &[], FIRST_DATE);
+    let mut tree = tree_of(&objects);
+    push_unsettled(state, (repository, root), &objects, (None, head, tree));
+    for push in 0..50u64 {
+      crate::vcs_store::paths::whole_build::step_once(state);
+      if let Some(readme) = files.first_mut() {
+        readme.1 = format!("push {push}\n").into_bytes();
+      }
+      let (objects, next) = commit_of(&files, &[head], FIRST_DATE.saturating_add(push + 1));
+      let before = tree;
+      tree = tree_of(&objects);
+      push_unsettled(
+        state,
+        (repository, root),
+        &objects,
+        (Some(before), next, tree),
+      );
+      head = next;
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    let whole_build = |name| count(state, name);
+    (
+      whole_build(crate::vcs_store::paths::whole_build::RESTARTED),
+      whole_build(crate::vcs_store::paths::whole_build::MOVED) > 0,
+      whole_build(crate::vcs_store::paths::BUILT),
+      kept_tree(state, repository, green_key(root)) == Some(tree),
+    )
+  });
+  assert_eq!(seen, (0, true, 1, true));
+}
+
+/// A-664's live whole builds (a parked submit's wait bounded by the node's failover delay; main's ruling). Do: push a
+/// commit of three files to a git repository's root green, its map left to its build; submit a work while the build
+/// runs, parked; answer the overdue at an instant within an unbounded wait, then past a bound of none; drive the build to
+/// its end. Expect: parked once; nothing answered within the wait; answered overdue past it, once; the build ends with
+/// the green still at the pushed version, since nothing of the submit ran (its retry runs it again).
+#[test]
+fn t_a664_live_a_parked_submit_waits_at_most_its_bound() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, green) = git_repository(state, "overdue");
+    let root = to_db_volume(green);
+    pushed_three(state, (repository, root));
+    let ask = crate::vcs_store::paths::tests::ask;
+    let made = ask(
+      state,
+      slates_ipc::protocol::RequestBody::CreateWork {
+        green,
+        name: "work-overdue".to_owned(),
+      },
+    );
+    let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+      return (0, 0, 0, None);
+    };
+    recorded_submit(state, crate::identities::authored(work, "too late"));
+    let overdue = crate::vcs_store::paths::whole_build::OVERDUE;
+    let now = slates_rt::futures::now_ns();
+    crate::vcs_store::paths::whole_build::answer_overdue_at(state, (now, u64::MAX));
+    let within = count(state, overdue);
+    crate::vcs_store::paths::whole_build::answer_overdue_at(state, (u64::MAX, 0));
+    let past = count(state, overdue);
+    crate::vcs_store::paths::whole_build::settle(state);
+    let head = state.greens.get(&root).map(|engine| engine.head());
+    (
+      count(state, crate::vcs_store::paths::whole_build::PARKED),
+      within,
+      past,
+      head,
+    )
+  });
+  assert_eq!(seen, (1, 0, 1, Some(1)));
 }

@@ -26,6 +26,11 @@
 //! (`crate::vcs_store::git_encode::relieve`), the values worth more as room than as time saved, before the asker's room
 //! is read.
 //!
+//! **Two resources.** A push's record grows its partition's snapshot (A-724 piece 8a), so the slot's room left
+//! (`slates_db::replay::Db::snapshot_room`) is divided with memory by dominant-resource fairness: each repository holds
+//! its records' bytes of it, claims them and its traffic's mean, and its room is the lesser headroom; alone, the lesser
+//! of what the shard admits and what the slot has left ([`Bound::Snapshot`]).
+//!
 //! **Live intakes.** An intake is live from its start until its [`Live`] guard drops (the push answered, refused or
 //! abandoned however its edge ended), kept in a map of this shard's thread apart from its state, so a guard dropped
 //! while the state is borrowed still counts its end. One entry a repository with an intake under way, so bounded by
@@ -51,8 +56,14 @@ pub(crate) const NARROWED: &str = "vcs_share.narrowed";
 pub(crate) enum Bound {
   /// What the shard can admit (A-704's bound): a work past it is refused in the tool's words for a pack too large.
   Shard,
-  /// The repository's share among repositories with intakes under way: a work past it is refused typed, retryably,
-  /// naming the share and what the repository holds.
+  /// The partition's snapshot slot's room left (A-724 piece 8a): a work past it is refused typed, naming the room, since
+  /// its record would not fit the snapshot until the slot is laid out larger.
+  Snapshot {
+    /// The slot's room left, in bytes.
+    room: u64,
+  },
+  /// The repository's share among repositories with intakes under way, of memory or of the snapshot slot, whichever
+  /// binds: a work past it is refused typed, retryably, naming the share and what the repository holds of it.
   Share {
     /// The repository's grant of the shard's contested room, in bytes.
     share: u64,
@@ -123,6 +134,9 @@ fn live_intakes() -> Vec<(RepositoryId, u64)> {
 /// The room repository `repository`'s next work is admitted on `state`'s shard (module docs).
 pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
   let admittable = state.store.admittable();
+  // A-724 piece 8a: a push's record grows its partition's snapshot (today by about its pack), so the slot's room left
+  // is a resource as memory is (`slates_db::replay::Db::snapshot_room`).
+  let slot_room = state.db.snapshot_room(&state.segment);
   let live = live_intakes();
   let others: Vec<(RepositoryId, u64)> = live
     .iter()
@@ -131,10 +145,7 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
     .collect();
   if others.is_empty() {
     state.count(FAST, 1);
-    return Room {
-      bytes: admittable,
-      bound: Bound::Shard,
-    };
+    return alone(admittable, slot_room);
   }
   state.count(DIVIDED, 1);
   let own_live = live
@@ -143,66 +154,102 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
     .map_or(0, |(_, count)| *count);
   let mut claimants = vec![(repository, own_live.saturating_add(1))];
   claimants.extend(others);
-  let held: Vec<u64> = claimants
+  let held: Vec<[u64; 2]> = claimants
     .iter()
-    .map(|(id, _)| held_by(state, *id))
+    .map(|(id, _)| [held_by(state, *id), snapshot_held_by(state, *id)])
     .collect();
-  let capacity = held
-    .iter()
-    .fold(admittable, |total, bytes| total.saturating_add(*bytes));
-  // The asker claims all it holds and all the shard can admit, so its room is whatever the others' claims leave it;
-  // the others claim what their own traffic says they will use.
-  let claims: Vec<Claim<1>> = claimants
+  let capacity = held.iter().fold([admittable, slot_room], |total, held| {
+    [
+      total[0].saturating_add(held[0]),
+      total[1].saturating_add(held[1]),
+    ]
+  });
+  // The asker claims all it holds and all of each resource that is free, so its room is whatever the others' claims
+  // leave it; the others claim what their own traffic says they will use, of memory and of the slot alike.
+  let claims: Vec<Claim<2>> = claimants
     .iter()
     .zip(&held)
     .enumerate()
     .map(|(at, ((id, intakes), held))| {
       let demand = if at == 0 {
-        held.saturating_add(admittable)
+        [
+          held[0].saturating_add(admittable),
+          held[1].saturating_add(slot_room),
+        ]
       } else {
-        demand_of(state, *id, (*held, *intakes), admittable)
+        [
+          demand_of(state, *id, (held[0], *intakes), admittable),
+          demand_of(state, *id, (held[1], *intakes), slot_room),
+        ]
       };
       Claim {
-        demand: [amount_of(demand)],
+        demand: demand.map(amount_of),
         weight: 1.0,
       }
     })
     .collect();
-  let grants = divide(&[amount_of(capacity)], &claims);
-  let share = grants
-    .first()
-    .and_then(|grant| grant.granted.first())
-    .map_or(0, |granted| whole_units(*granted));
-  // The cold trigger (A-724 piece 4): each claimant holding more than its grant gives back what its rebuildable values
-  // are worth giving back, by §4.11's cost model at its pressure (what it holds over its grant).
+  let grants = divide(&capacity.map(amount_of), &claims);
+  // The cold trigger (A-724 piece 4): each claimant holding more memory than its grant gives back what its rebuildable
+  // values are worth giving back, by §4.11's cost model at its pressure (what it holds over its grant).
   for ((id, _), (grant, holding)) in claimants.iter().zip(
     grants
       .iter()
       .filter_map(|grant| grant.granted.first())
-      .zip(&held),
+      .zip(held.iter().map(|held| held[0])),
   ) {
     let grant = whole_units(*grant);
-    if *holding > grant {
-      let pressure = amount_of(*holding) / amount_of(grant.max(1));
+    if holding > grant {
+      let pressure = amount_of(holding) / amount_of(grant.max(1));
       crate::vcs_store::git_encode::relieve(state, *id, holding.saturating_sub(grant), pressure);
     }
   }
-  let own_held = held_by(state, repository);
-  let headroom = share.saturating_sub(own_held);
-  if headroom >= admittable {
-    return Room {
-      bytes: admittable,
-      bound: Bound::Shard,
-    };
+  let own = grants
+    .first()
+    .map_or([0, 0], |grant| grant.granted.map(whole_units));
+  let own_held = [
+    held_by(state, repository),
+    snapshot_held_by(state, repository),
+  ];
+  let headroom = [
+    own[0].saturating_sub(own_held[0]),
+    own[1].saturating_sub(own_held[1]),
+  ];
+  let shared = headroom[0].min(headroom[1]);
+  if shared >= admittable.min(slot_room) {
+    return alone(admittable, slot_room);
   }
   state.count(NARROWED, 1);
+  // The resource whose share binds names the refusal: its grant and what the repository holds of it.
+  let binding = usize::from(headroom[1] < headroom[0]);
   Room {
-    bytes: headroom,
+    bytes: shared,
     bound: Bound::Share {
-      share,
-      held: own_held,
+      share: own.get(binding).copied().unwrap_or(0),
+      held: own_held.get(binding).copied().unwrap_or(0),
     },
   }
+}
+
+/// A repository's room with no other taking new room: all the shard can admit, or the snapshot slot's room left where
+/// that is less ([`Bound::Snapshot`]).
+fn alone(admittable: u64, slot_room: u64) -> Room {
+  if slot_room < admittable {
+    Room {
+      bytes: slot_room,
+      bound: Bound::Snapshot { room: slot_room },
+    }
+  } else {
+    Room {
+      bytes: admittable,
+      bound: Bound::Shard,
+    }
+  }
+}
+
+/// What repository `id`'s records hold of its partition's snapshot (A-724 piece 8a): its entries' bytes in the
+/// partition's register, which every snapshot carries (`slates_db` `Repositories::objects_bytes`).
+fn snapshot_held_by(state: &ShardState, id: RepositoryId) -> u64 {
+  u64::try_from(state.db.partition().repositories().objects_bytes(id)).unwrap_or(u64::MAX)
 }
 
 /// What repository `id` holds of its shard: its entries' objects (A-662, A-714) and its derived values that can be made
@@ -232,6 +279,8 @@ fn demand_of(
     .unwrap_or(admittable);
   held.saturating_add(per_intake.saturating_mul(intakes))
 }
+
+pub(crate) mod place;
 
 #[cfg(test)]
 mod tests;

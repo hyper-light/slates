@@ -412,7 +412,7 @@ async fn run_command(command: &mut impl Command) -> Result<(Vec<u8>, Next), Stri
   let mut written = Vec::new();
   for _ in 0..STEPS {
     let stepped = command
-      .step()
+      .step(crate::vcs_ssh::site::ClientGone::never())
       .await
       .map_err(|refused| format!("{refused:?}"))?;
     let out = command.output().1.to_vec();

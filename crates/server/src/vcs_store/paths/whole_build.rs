@@ -12,8 +12,16 @@
 //! one a unit, lent the room each brings, until the shard's step budget is spent (§4.3's quantum, at least one file),
 //! settles the charge, and yields; the last builds the map and trees of what was put and keeps them as the green's head
 //! (`Plan::Put`, as a recovery's sliced remake does). The files are read from the green at each slice by their paths,
-//! so nothing borrowed outlives a step. A push to the green before the build ends restarts it at the new head: the
-//! builds keep the head's map alone.
+//! so nothing borrowed outlives a step.
+//!
+//! **A push meanwhile** (main's ruling of 2026-11-20: tens of thousands of concurrent pushes, so a busy green's build
+//! must finish). A push to the green while its build runs leaves the build alone; at its next slice's boundary the build
+//! moves to the green's newest head once ([`moved`]): each path the change index names since its version loses what
+//! was put of it and is put again from the head, and everything else put stays. So a storm of pushes adds its changed
+//! paths to the build, never its whole head again, and the build ends. Only a change holding a copy, which the index
+//! names at its destination alone, starts the build again from nothing ([`RESTARTED`]). A commit a submit owed of the
+//! version the build began at is then not made over the newer map (`super::super::commits::make_owed` checks its
+//! version) and is settled by the push's own move, counted unmade.
 //!
 //! **The submits that need it wait, parked.** A submit to a green whose build is under way would build the map whole
 //! in its own step, the cost this module moves off the shard's steps: so it is parked ([`park`]), its verb's inputs and
@@ -25,6 +33,9 @@
 //! the entries put so far, a version's files at most. The parked submits of a green are bounded by the shard's client
 //! credit (`clients_per_shard × slots`, the bound `crate::base_wait` keeps), every request that can be in flight; a
 //! submit past it is refused `Overloaded`, counted ([`PARK_REFUSED`]), and a retry of a parked request joins its entry.
+//! A parked submit waits at most the node's failover delay (`ShardState::failover_ns`, the most a reply is held, the
+//! bound `crate::base_wait` keeps): at each slice one that has waited longer is answered `Overloaded`, unrecorded, so its
+//! retry runs, counted ([`OVERDUE`]).
 //!
 //! **Cancellation.** The build lives in the store's map, keyed by its green, and its task holds the key alone: a task
 //! cancelled between slices leaks nothing, and freeing the repository gives back every hold the build took and runs its
@@ -49,8 +60,20 @@ use crate::verbs::ParkedSubmit;
 pub(crate) const BEGUN: &str = "vcs_store.paths.whole_build.begun";
 /// Counter: a whole build's slices. Format: a counter name in the daemon's status report.
 pub(crate) const SLICES: &str = "vcs_store.paths.whole_build.slices";
+/// Counter: a build moved to its green's newest head at a slice's boundary, a push having landed meanwhile. Format: a
+/// counter name in the daemon's status report.
+pub(crate) const MOVED: &str = "vcs_store.paths.whole_build.moved";
+/// Counter: a build started again from nothing, the change since it began holding a copy: zero under any storm of
+/// pushes that copy nothing. Format: a counter name in the daemon's status report.
+pub(crate) const RESTARTED: &str = "vcs_store.paths.whole_build.restarted";
 /// Counter: a submit parked behind a whole build. Format: a counter name in the daemon's status report.
 pub(crate) const PARKED: &str = "vcs_store.paths.whole_build.parked";
+/// Counter: a parked submit answered `Overloaded` once it waited past the node's failover delay; zero is the healthy
+/// reading. Format: a counter name in the daemon's status report.
+pub(crate) const OVERDUE: &str = "vcs_store.paths.whole_build.overdue";
+/// Counter: an overdue submit's answer not handed on (its route's shard did not take it). Format: a counter name in the
+/// daemon's status report.
+const UNDELIVERED: &str = "vcs_store.paths.whole_build.overdue_undelivered";
 /// Counter: a submit refused at the parked bound. Format: a counter name in the daemon's status report.
 pub(crate) const PARK_REFUSED: &str = "vcs_store.paths.whole_build.park_refused";
 
@@ -195,29 +218,39 @@ fn head_paths(engine: &slates_merge::engine::Green) -> Vec<String> {
 
 /// Drives `green`'s build a slice at a time, yielding between slices, until it ends or is replaced.
 async fn drive(green: DbVolumeId) {
-  while crate::state::with_state_counted(|state| slice(state, green)) == Some(true) {
+  while crate::state::with_state_counted(|state| {
+    let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
+    slice(state, green, budget)
+  }) == Some(true)
+  {
     slates_rt::futures::yield_now().await;
   }
 }
 
-/// One slice of `green`'s build (module docs): whether more remain. A build no longer kept, or whose green is gone,
-/// has none.
-fn slice(state: &mut ShardState, green: DbVolumeId) -> bool {
+/// One slice of `green`'s build (module docs), putting files until `budget_ns` is spent (at least one): whether more
+/// remain. A build no longer kept, or whose green is gone, has none.
+fn slice(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
   let Some(mut build) = state.vcs_stores.whole_builds.0.remove(&green) else {
     return false;
   };
   state.count(SLICES, 1);
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  answer_overdue(state, &mut build, (now, state.failover_ns));
   let head = state.greens.get(&green).map(|engine| engine.head());
   match head {
     Some(head) if head == build.version => {}
     Some(head) => {
-      // A push moved the green meanwhile: the build starts again at its head, the parked submits carried over.
-      state.vcs_stores.whole_builds.0.insert(green, build);
-      let repository = build_repository(state, green);
-      if let Some(repository) = repository {
-        start(state, repository, green, head);
+      // Pushes moved the green meanwhile: the build moves to its newest head here, at a slice's boundary, carrying what
+      // the change since left standing (module docs, "A push meanwhile").
+      if !moved(state, green, &mut build, head) {
+        state.vcs_stores.whole_builds.0.insert(green, build);
+        let repository = build_repository(state, green);
+        if let Some(repository) = repository {
+          state.count(RESTARTED, 1);
+          start(state, repository, green, head);
+        }
+        return false;
       }
-      return false;
     }
     None => {
       let parked = retire(state, build);
@@ -225,7 +258,7 @@ fn slice(state: &mut ShardState, green: DbVolumeId) -> bool {
       return false;
     }
   }
-  match put_some(state, green, &mut build) {
+  match put_some(state, (green, budget_ns), &mut build) {
     Ok(()) if build.at < build.paths.len() => {
       state.vcs_stores.whole_builds.0.insert(green, build);
       true
@@ -243,6 +276,29 @@ fn slice(state: &mut ShardState, green: DbVolumeId) -> bool {
   }
 }
 
+/// Moves `build` from its version to the green's `head` (module docs, "A push meanwhile"): each path the change index
+/// names between them loses what was put of it and is put again from the head, where git holds a file there; what the
+/// change left alone stays put. False where the change holds a copy, which the index names at its destination alone, so
+/// what it brought cannot be told from the change: the caller starts the build again (counted, [`RESTARTED`]).
+fn moved(state: &mut ShardState, green: DbVolumeId, build: &mut Build, head: u64) -> bool {
+  let Some(engine) = state.greens.get(&green) else {
+    return false;
+  };
+  let Some(changed) = super::named(&engine, build.version, head) else {
+    return false;
+  };
+  for path in changed {
+    build.entries.remove(map_path(&path));
+    if !map_path(&path).is_empty() && super::git_file(&engine, &path).is_some() {
+      build.paths.push(path);
+    }
+  }
+  build.version = head;
+  drop(engine);
+  state.count(MOVED, 1);
+  true
+}
+
 /// The repository of the build kept for `green`.
 fn build_repository(state: &ShardState, green: DbVolumeId) -> Option<RepositoryId> {
   state
@@ -257,10 +313,9 @@ fn build_repository(state: &ShardState, green: DbVolumeId) -> Option<RepositoryI
 /// least one), then settles the charge.
 fn put_some(
   state: &mut ShardState,
-  green: DbVolumeId,
+  (green, budget): (DbVolumeId, u64),
   build: &mut Build,
 ) -> Result<(), StepRefused> {
-  let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
   let began = slates_rt::futures::now_ns();
   let ShardState {
     store,
@@ -337,6 +392,22 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
   crate::verbs::resume_all(state, parked);
 }
 
+/// Answers each submit parked behind `build` that has waited past `bound_ns` at `now_ns` (module docs, "Bounds"):
+/// `Overloaded`, unrecorded, so its retry runs; counted ([`OVERDUE`]).
+fn answer_overdue(state: &mut ShardState, build: &mut Build, (now_ns, bound_ns): (u64, u64)) {
+  let (overdue, waiting): (Vec<ParkedSubmit>, Vec<ParkedSubmit>) =
+    std::mem::take(&mut build.parked)
+      .into_iter()
+      .partition(|parked| parked.overdue(now_ns, bound_ns));
+  build.parked = waiting;
+  for parked in overdue {
+    state.count(OVERDUE, 1);
+    if !crate::verbs::answer_overdue(state, parked) {
+      state.count(UNDELIVERED, 1);
+    }
+  }
+}
+
 /// Parks `submit` behind `green`'s build (module docs): a retry of a parked request joins its entry, taking its route.
 /// `Overloaded` past the shard's client credit, or for a green with no build under way.
 pub(crate) fn park(
@@ -400,11 +471,35 @@ fn retire(state: &mut ShardState, build: Build) -> Vec<ParkedSubmit> {
 }
 
 /// Drives every build of the shard to its end, a slice at a time, in this step: what a test that pushes and then reads
-/// the map does, since a test's step runs no other task between its calls.
+/// the map does, since a test's step runs no other task between its calls. Each slice is given no budget, so it puts one
+/// file whatever the machine's load: a test's count of slices is the build's files, never a measure of time.
 #[cfg(test)]
 pub(crate) fn settle(state: &mut ShardState) {
   let greens: Vec<DbVolumeId> = state.vcs_stores.whole_builds.0.keys().copied().collect();
   for green in greens {
-    while slice(state, green) {}
+    while slice(state, green, 0) {}
+  }
+}
+
+/// One slice of each build of the shard, given no budget (one file): what a test interleaving pushes with a build runs
+/// between two pushes.
+#[cfg(test)]
+pub(crate) fn step_once(state: &mut ShardState) {
+  let greens: Vec<DbVolumeId> = state.vcs_stores.whole_builds.0.keys().copied().collect();
+  for green in greens {
+    slice(state, green, 0);
+  }
+}
+
+/// Answers the submits parked behind each build of the shard that, at `now_ns`, have waited past `bound_ns`: what a
+/// test that cannot wait out a failover delay runs.
+#[cfg(test)]
+pub(crate) fn answer_overdue_at(state: &mut ShardState, (now_ns, bound_ns): (u64, u64)) {
+  let greens: Vec<DbVolumeId> = state.vcs_stores.whole_builds.0.keys().copied().collect();
+  for green in greens {
+    if let Some(mut build) = state.vcs_stores.whole_builds.0.remove(&green) {
+      answer_overdue(state, &mut build, (now_ns, bound_ns));
+      state.vcs_stores.whole_builds.0.insert(green, build);
+    }
   }
 }

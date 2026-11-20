@@ -37,7 +37,7 @@ use slates_svn::report::exchange::Budget;
 use slates_svn::serve::{Limits, Policy, Sources};
 
 use super::super::site::{
-  Command, Dispatched, GIT_DIE_STATUS, Next, NotYet, Refused, SshSite, ToolSite,
+  ClientGone, Command, Dispatched, GIT_DIE_STATUS, Next, NotYet, Refused, SshSite, ToolSite,
 };
 use super::{EitherCommand, Opening, SvnServices, SvnStores, TunnelBounds};
 use crate::repository::svn_commit::{Committed, Uncommitted as Unlanded};
@@ -524,17 +524,17 @@ impl SvnStores for Lends {
     )
   }
 
-  fn land_locks(
+  fn land_record(
     &mut self,
     id: RepositoryId,
     _principal: &Principal,
-    entries: Vec<slates_svn::lock::LockEntry>,
+    record: slates_svn::commit::record::Record,
   ) -> Option<Result<(), Unlanded>> {
     if !self.holds(id) {
       return None;
     }
     let mut next = self.created.current.get().clone();
-    Some(match next.apply_lock_entries(&entries) {
+    Some(match next.commit_record(record) {
       Ok(()) => {
         self.created.current.set(Box::leak(Box::new(next)));
         Ok(())
@@ -662,7 +662,8 @@ fn drive<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
       Next::Input => hand_over(command, runs.next()),
       Next::More => {}
     }
-    let stepped = ready(command.step()).expect("a tunnel ends as svnserve ends, never failed");
+    let stepped = ready(command.step(ClientGone::never()))
+      .expect("a tunnel ends as svnserve ends, never failed");
     consumed += stepped.consumed;
     next = stepped.next;
   }
@@ -1168,7 +1169,7 @@ async fn drive_awaiting<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
       Next::More => {}
     }
     let stepped = command
-      .step()
+      .step(ClientGone::never())
       .await
       .expect("a tunnel ends as svnserve ends, never failed");
     consumed += stepped.consumed;

@@ -32,28 +32,27 @@ fn t_a724_a_repository_alone_is_admitted_all_the_shard_can_hold_by_the_fast_path
     let toy = git_repository(state, "toy");
     let own = Live::begin(toy);
     let admittable = state.store.admittable();
-    assert_eq!(
-      room(state, toy),
-      Room {
-        bytes: admittable,
-        bound: Bound::Shard
-      }
-    );
-    assert_eq!((counted(state, FAST), counted(state, DIVIDED)), (1, 0));
+    let slot_room = state.db.snapshot_room(&state.segment);
+    assert_eq!(room(state, toy), super::alone(admittable, slot_room));
+    assert_eq!(room(state, toy).bytes, admittable.min(slot_room));
+    assert_eq!((counted(state, FAST), counted(state, DIVIDED)), (2, 0));
     drop(own);
   });
 }
 
 /// A-724 piece 3. Do: push into a monorepo with no answered intake yet (its claim is everything the shard can admit)
-/// while a toy repository asks for room. Expect: the toy's room is its equal half of the shard, bound by its share and
-/// counted; once the monorepo's intakes are known to bring little, the toy is given all but that little; and once the
-/// monorepo's intake ends, the toy is alone again and given everything by the fast path.
+/// while a toy repository asks for room. Expect: the toy's room is its equal half of the shard's lesser free resource
+/// (memory or the snapshot slot's room), bound by its share and counted; once the monorepo's intakes are known to bring
+/// little, the toy is given all but that little; and once the monorepo's intake ends, the toy is alone again and given
+/// everything by the fast path.
 #[test]
 fn t_a724_a_repositorys_room_is_its_share_while_others_push_and_learns_from_their_traffic() {
   crate::daemon::audit_on_shard(|state| {
     let monorepo = git_repository(state, "monorepo");
     let toy = git_repository(state, "toy");
     let admittable = state.store.admittable();
+    // Memory and the snapshot slot are divided together (A-724 piece 8a): the lesser room binds.
+    let free = admittable.min(state.db.snapshot_room(&state.segment));
     let pushing = Live::begin(monorepo);
     let halved = room(state, toy);
     assert!(
@@ -61,25 +60,20 @@ fn t_a724_a_repositorys_room_is_its_share_while_others_push_and_learns_from_thei
       "the toy's room is bound by its share: {halved:?}"
     );
     assert!(
-      halved.bytes.abs_diff(admittable / 2) <= 1,
-      "an equal half of {admittable}: {halved:?}"
+      halved.bytes.abs_diff(free / 2) <= 1,
+      "an equal half of {free}: {halved:?}"
     );
     assert_eq!((counted(state, DIVIDED), counted(state, NARROWED)), (1, 1));
-    let typical = admittable / 64;
+    let typical = free / 64;
     answered_intake(state, monorepo, typical);
     let learned = room(state, toy);
     assert!(
-      learned.bytes.abs_diff(admittable - typical) <= 1,
+      learned.bytes.abs_diff(free - typical) <= 1,
       "all but the monorepo's typical intake of {typical}: {learned:?}"
     );
     drop(pushing);
-    assert_eq!(
-      room(state, toy),
-      Room {
-        bytes: admittable,
-        bound: Bound::Shard
-      }
-    );
+    let slot_room = state.db.snapshot_room(&state.segment);
+    assert_eq!(room(state, toy), super::alone(admittable, slot_room));
     assert_eq!(counted(state, FAST), 1);
   });
 }
@@ -103,7 +97,10 @@ fn t_a724_a_push_is_live_from_its_start_until_it_drops() {
     .expect("started");
     assert!(matches!(room(state, other).bound, Bound::Share { .. }));
     drop(push);
-    assert_eq!(room(state, other).bound, Bound::Shard);
+    assert!(matches!(
+      room(state, other).bound,
+      Bound::Shard | Bound::Snapshot { .. }
+    ));
   });
 }
 
@@ -164,4 +161,42 @@ fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_cost
     );
     assert_eq!(kept_bytes(state, pushed), kept_again);
   });
+}
+
+/// A-724 piece 8a in admission. Do: on a daemon whose snapshot slot is smaller than what its shard can admit, ask a
+/// repository's room alone, then while another repository pushes. Expect: alone, the slot's room left, bound by the
+/// snapshot and naming it; beside another, at most that, the slot divided between them.
+#[test]
+fn t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot() {
+  crate::daemon::audit_on_shard_configured(
+    |state| {
+      let toy = git_repository(state, "toy");
+      let other = git_repository(state, "other");
+      let admittable = state.store.admittable();
+      let slot_room = state.db.snapshot_room(&state.segment);
+      assert!(
+        slot_room < admittable,
+        "the fixture's slot ({slot_room}) not below the admittable room ({admittable})"
+      );
+      assert_eq!(
+        room(state, toy),
+        Room {
+          bytes: slot_room,
+          bound: Bound::Snapshot { room: slot_room }
+        }
+      );
+      let pushing = Live::begin(other);
+      let shared = room(state, toy);
+      assert!(shared.bytes <= slot_room, "{shared:?}");
+      assert!(
+        shared.bytes.abs_diff(slot_room / 2) <= 1 || matches!(shared.bound, Bound::Snapshot { .. }),
+        "the slot is divided between the two: {shared:?} of {slot_room}"
+      );
+      drop(pushing);
+    },
+    |config| {
+      // The slot shrunk below the shard's admittable room, as a giant repository's partition meets it.
+      config.geometry.snapshot_bytes = config.geometry.page.saturating_mul(1 << 8);
+    },
+  );
 }

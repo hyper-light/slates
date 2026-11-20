@@ -1027,12 +1027,13 @@ impl<A: Answered> Upload<A> {
     };
     let (_, row, _) = cx.repository.stored_at(cx.store, position)?;
     let blobs = row.kind == Kind::Blob;
-    if offered.insert((row.green, row.version, blobs))
-      && let Ok(version) = usize::try_from(row.version)
-      && let Some(kept) = cx.repository.fragment_part(row.green, version, blobs)
+    if let Some((green, version)) = cx.repository.bringer_of(position)
+      && offered.insert((green, version, blobs))
+      && let Ok(version) = usize::try_from(version)
+      && let Some(kept) = cx.repository.fragment_part(green, version, blobs)
     {
       let source = Source::Fragment {
-        green: row.green,
+        green,
         version,
         blobs,
       };

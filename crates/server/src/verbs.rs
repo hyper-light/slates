@@ -10112,6 +10112,7 @@ pub(crate) fn owner_judge(
         evidence,
         policy,
       },
+      parked_ns: state.clock.monotonic_ns(),
     };
     return crate::vcs_store::paths::whole_build::park(state, green, parked)
       .err()
@@ -10149,6 +10150,9 @@ pub(crate) struct ParkedSubmit {
   route: Option<crate::merge_service::ReplyRoute>,
   /// What runs it again.
   kind: ParkedKind,
+  /// When it parked, on the shard's monotonic clock: it waits at most the node's failover delay
+  /// (`crate::vcs_store::paths::whole_build`, "Bounds").
+  parked_ns: u64,
 }
 
 impl ParkedSubmit {
@@ -10156,6 +10160,22 @@ impl ParkedSubmit {
   pub(crate) fn key(&self) -> (u64, u32, u32) {
     (self.origin, self.id.client, self.id.sequence)
   }
+
+  /// Whether it has waited past `bound_ns` at `now_ns`.
+  pub(crate) fn overdue(&self, now_ns: u64, bound_ns: u64) -> bool {
+    now_ns.saturating_sub(self.parked_ns) > bound_ns
+  }
+}
+
+/// Answers a parked submit that waited past its bound `Overloaded`, unrecorded, so its retry runs (as a forward that
+/// never started is answered); nothing of it ran. Whether the answer was handed on.
+pub(crate) fn answer_overdue(state: &ShardState, parked: ParkedSubmit) -> bool {
+  let ParkedSubmit {
+    origin, id, route, ..
+  } = parked;
+  let shard = state.shard;
+  route
+    .is_some_and(|route| answered_on(route, (origin, id), refused(Refusal::Overloaded { shard })))
 }
 
 /// What a parked submit runs again: the owner's step of a submit asked from a work's shard ([`owner_judge`]), or the
@@ -10198,6 +10218,7 @@ fn park_submit(state: &mut ShardState, green: DbVolumeId, kind: ParkedKind) -> R
     id,
     route: state.reply_route,
     kind,
+    parked_ns: state.clock.monotonic_ns(),
   };
   match crate::vcs_store::paths::whole_build::park(state, green, parked) {
     Ok(()) => {
@@ -10217,6 +10238,7 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
       id,
       route,
       kind,
+      ..
     } = submit;
     let reply = match kind {
       ParkedKind::Owner {
@@ -12197,12 +12219,19 @@ pub(crate) fn end_attachment(
   // Its pace goes with it (A-384).
   state.attachment_paces.remove(&record.id);
   crate::merge_service::forget_attachment(state, record.id);
-  // A mount that survived a takeover holds its volume's kept files until it ends, however it ends (U10).
+  // The attachment's kernel can hold nothing of the volume any more, however it ended: every reference and open it
+  // held is given back, and a mount that survived a takeover lets the files kept for it go (U10). An ordinary FUSE
+  // mount ends with no `FUSE_DESTROY` (Linux sends it only to fuseblk and virtio-fs) and its `FORGET`s may be lost
+  // with its connection, so until A-739 a file it held open or looked up, unlinked meanwhile, stayed charged to the
+  // volume for good (CI ubuntu, 2026-11-20: 1 MiB after a lazy unmount and the last close).
   if let Some(&handle) = state.by_id.get(&record.volume)
     && let Ok(slot) = state.volumes.get_mut(handle)
     && slot
       .volume
-      .end_takeover_holder(&mut state.store, record.id)
+      .sweep_attachment(
+        &mut state.store,
+        slates_vfs::ids::RefOwner::Attachment(record.id),
+      )
       .is_err()
   {
     state.count(TAKEOVER_KEPT_UNRELEASED, 1);
@@ -19126,8 +19155,8 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
   }
 }
 
-/// Format: mounts that ended with the files kept for them (U10) refused reclamation: they stay charged to the volume until
-/// its next restart. Zero is the healthy reading.
+/// Format: attachments whose end refused the sweep of their references (A-739) or the reclamation of the files kept for
+/// them (U10): those stay charged to the volume until its next restart. Zero is the healthy reading.
 const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 /// Format: revocations acknowledged while a FUSE mount they fenced was still dropping its kernel's cache, past
 /// the told bound (`told::bound_ns`, AUD-29-84): its requests were refused, but a page its kernel held may have been read

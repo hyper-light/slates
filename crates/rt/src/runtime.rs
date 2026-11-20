@@ -615,6 +615,7 @@ impl Runtime {
   /// channel is full (its admission limit) or the shard is gone. `Ok` is a **submission**: the request
   /// is in the shard's control channel, and whether the shard admits it is answered only to a receipt
   /// ([`Self::spawn_on_with_receipt`]).
+  #[track_caller]
   pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(
     &self,
     shard: ShardId,
@@ -628,6 +629,7 @@ impl Runtime {
   /// ([`AdmissionReceipt`]): refused here when the shard's control channel is full or the shard is gone;
   /// otherwise the receipt reports, once the shard drains the request, whether the task was admitted
   /// (and as which task), refused (the arena full), or terminated unadmitted (the shard shutting down).
+  #[track_caller]
   pub fn spawn_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
     &self,
     shard: ShardId,
@@ -768,6 +770,7 @@ impl LocalRuntime {
   }
 
   /// Spawns a joinable task.
+  #[track_caller]
   pub fn spawn<F: Future<Output = ()> + 'static>(&self, future: F) -> Result<TaskId, RtError> {
     self
       .context()

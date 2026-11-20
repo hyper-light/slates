@@ -810,8 +810,8 @@ impl Work<'_> {
       Some(_) => return Err(bad()),
       None => return Err(TreesRefused::Content(ContentRefused::NotHeld)),
     }
-    let bytes = self.store.get(&content).ok_or_else(bad)?;
-    ObjectId::from_bytes(self.format, bytes).ok_or_else(bad)
+    let bytes = self.store.bytes_of(&content).ok_or_else(bad)?;
+    ObjectId::from_bytes(self.format, &bytes).ok_or_else(bad)
   }
 
   /// The directory at `path` of `names` made: its tree written in git's order, checked by strict fsck and named, the

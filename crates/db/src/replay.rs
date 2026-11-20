@@ -135,6 +135,8 @@ pub struct Db {
   /// ([`Db::set_recovery_budget`]; GAPS §5).
   recovery_budget_ns: u64,
   /// The last snapshot's size (the recovered one's after a boot, zero with none): the doubling rule's floor.
+  /// Snapshots or records refused for the slot's room (A-724 piece 8, [`DbError::SnapshotRoom`]).
+  snapshot_room_refusals: u64,
   snapshot_floor_bytes: u64,
   /// Operations applied since `begin`, waiting to go into one record at `commit`.
   pending: Option<Vec<Op>>,
@@ -254,6 +256,7 @@ pub fn recover(
     replay_work_ns_since_snapshot: replay_ns,
     recovery_budget_ns: RECOVERY_BUDGET_NS,
     snapshot_floor_bytes: snapshot_bytes,
+    snapshot_room_refusals: 0,
     pending: None,
     last_now_ns: now_ns,
     rollbacks: 0,
@@ -347,6 +350,11 @@ fn append_record(
     encoded.decode_as_replayed(seq)?;
     log.write(segment, seq, &encoded)
   })
+}
+
+/// One snapshot slot's bytes in `segment` (its geometry's, derived at boot: `snapshot_bytes_per_partition`).
+fn slot_bytes(segment: &AnchorSegment) -> u64 {
+  segment.geometry().snapshot_bytes
 }
 
 impl Db {
@@ -489,6 +497,18 @@ impl Db {
     }
     let seq = self.next_seq;
     let entry = LogEntry { ops: vec![op] };
+    // A-724 piece 8: past the slot's projected room, the state so far is snapshotted now, measured exactly; if the
+    // record still would not fit beside it, the mutation is refused, typed, with nothing applied.
+    if self.past_snapshot_room(segment, &entry) {
+      self.snapshot(segment)?;
+      if self.past_snapshot_room(segment, &entry) {
+        self.snapshot_room_refusals = self.snapshot_room_refusals.saturating_add(1);
+        return Err(DbError::SnapshotRoom {
+          needed: self.projected_snapshot_bytes(&entry),
+          room: slot_bytes(segment),
+        });
+      }
+    }
     // The work a replay repeats for this record, timed step by step: the append's ([`append_record`]), then the apply.
     let mut work_ns = 0;
     let bytes = match append_record(&self.log, segment, seq, &entry, &mut work_ns) {
@@ -553,6 +573,18 @@ impl Db {
     }
     let entry = LogEntry { ops };
     let seq = self.next_seq;
+    // A-724 piece 8: past the slot's projected room, the applied effects go into a snapshot now, measured exactly (as
+    // a full log's do); one that cannot fit the slot rolls the transaction back, typed, before anything is written.
+    if self.past_snapshot_room(segment, &entry) {
+      return match self.snapshot_or_fault(segment) {
+        Ok(()) => {
+          self.next_seq = seq.saturating_add(1);
+          self.logged.extend(made);
+          Ok(Some(seq))
+        }
+        Err(cause) => Err(self.rollback(segment, seq, cause)),
+      };
+    }
     let appended = if self
       .publication_fault
       .take_if(|f| *f == PublicationFault::BeforeAppend)
@@ -688,6 +720,12 @@ impl Db {
     let started = Instant::now();
     let snapshot = self.partition.to_snapshot(seq);
     let bytes = snapshot.to_bytes();
+    let needed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let room = slot_bytes(segment);
+    if needed > room {
+      self.snapshot_room_refusals = self.snapshot_room_refusals.saturating_add(1);
+      return Err(DbError::SnapshotRoom { needed, room });
+    }
     segment.publish(RegionKind::Snapshot(self.index, self.next_slot), &bytes)?;
     let snapshot_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -705,6 +743,37 @@ impl Db {
       .snapshot_bytes_written
       .saturating_add(snapshot_bytes);
     Ok(())
+  }
+
+  /// What the partition's next snapshot would take after `entry` is recorded, at most (A-724 piece 8): the last
+  /// snapshot's exact bytes, every record's bytes since, and `entry`'s. An upper bound: a record that removes state
+  /// counts as growth until a snapshot measures it.
+  fn projected_snapshot_bytes(&self, entry: &LogEntry) -> u64 {
+    let entry_bytes = u64::try_from(LogRing::encode(entry).body_len()).unwrap_or(u64::MAX);
+    self
+      .snapshot_floor_bytes
+      .saturating_add(self.since_snapshot_bytes)
+      .saturating_add(entry_bytes)
+  }
+
+  /// Whether recording `entry` could pass the snapshot slot ([`projected_snapshot_bytes`]).
+  fn past_snapshot_room(&self, segment: &AnchorSegment, entry: &LogEntry) -> bool {
+    self.projected_snapshot_bytes(entry) > slot_bytes(segment)
+  }
+
+  /// The bytes the partition's next snapshot may still grow by before it passes its slot, at most (A-724 piece 8,
+  /// what admission reads): the slot less the last snapshot's bytes and every record's since.
+  pub fn snapshot_room(&self, segment: &AnchorSegment) -> u64 {
+    slot_bytes(segment).saturating_sub(
+      self
+        .snapshot_floor_bytes
+        .saturating_add(self.since_snapshot_bytes),
+    )
+  }
+
+  /// Snapshots or records refused for the slot's room ([`DbError::SnapshotRoom`]).
+  pub fn snapshot_room_refusals(&self) -> u64 {
+    self.snapshot_room_refusals
   }
 
   /// The log's bytes used, free and capacity.
@@ -912,6 +981,133 @@ mod tests {
       replay_ns <= measured_ns + noise_ns,
       "a tail the commits measured at {measured_ns} ns of replay work replayed in {replay_ns} ns past the baseline \
        ({noise_ns} ns of noise): the trigger would let it run past its budget"
+    );
+  }
+
+  /// Shape: one signer key's bytes in the snapshot-room tests: a list of `SIGNERS_SMALL` of them is a fifth of the test
+  /// slot, `SIGNERS_LARGE` of them a slot and a half.
+  const SIGNER_BYTES: usize = 1 << 10;
+  /// Shape: signer keys a small list holds (about 200 KiB, a fifth of [`SNAPSHOT_BYTES`]).
+  const SIGNERS_SMALL: usize = 200;
+  /// Shape: signer keys a large list holds (about 1.5 MiB, past [`SNAPSHOT_BYTES`]).
+  const SIGNERS_LARGE: usize = 1_536;
+
+  /// `count` signer keys of [`SIGNER_BYTES`] each, distinct by their first bytes.
+  fn signer_keys(count: usize) -> Vec<Vec<u8>> {
+    (0..count)
+      .map(|n| {
+        let mut key = vec![u8::try_from(n % 251).unwrap(); SIGNER_BYTES];
+        key[1] = u8::try_from(n / 251).unwrap();
+        key
+      })
+      .collect()
+  }
+
+  /// A-724 piece 8 (§4.17.5 "The partition's snapshot, sized by its data"). Do: on a 1 MiB snapshot slot, set a
+  /// volume's signers to a list a fifth of the slot fifteen times over (records three slots long, the state still a
+  /// fifth), then to a list a slot and a half long; recover. Expect: no record refused while the state fits, however
+  /// far its records pass the slot (the projection's crossing measured exactly by a snapshot); the long list refused
+  /// `SnapshotRoom`, typed, its bytes past the slot named, with nothing applied and counted; the room read before it
+  /// within the slot; the recovered partition holding the short list.
+  #[test]
+  fn a_record_whose_state_would_pass_the_snapshot_slot_is_refused_typed_and_one_that_fits_never_is()
+  {
+    let mut segment = segment_named("slates-db-snapshot-room");
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    let record = volume();
+    let id = record.id;
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    let small = signer_keys(SIGNERS_SMALL);
+    for _ in 0..15 {
+      db.mutate(
+        &mut segment,
+        &Op::VolumeSignersSet {
+          id,
+          keys: small.clone(),
+        },
+        0,
+      )
+      .expect("a state within the slot is never refused");
+    }
+    assert!(db.snapshot_room(&segment) <= SNAPSHOT_BYTES);
+    let refused = db.mutate(
+      &mut segment,
+      &Op::VolumeSignersSet {
+        id,
+        keys: signer_keys(SIGNERS_LARGE),
+      },
+      0,
+    );
+    match refused {
+      Err(DbError::SnapshotRoom { needed, room }) => {
+        assert_eq!(room, SNAPSHOT_BYTES);
+        assert!(needed > room, "named {needed} bytes against {room}");
+      }
+      other => panic!("not refused SnapshotRoom: {other:?}"),
+    }
+    assert_eq!(db.snapshot_room_refusals(), 1);
+    assert_eq!(
+      db.partition().volume(id).unwrap().policy.signers.len(),
+      SIGNERS_SMALL,
+      "nothing applied"
+    );
+    drop(db);
+    let recovered = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    assert_eq!(
+      recovered
+        .partition()
+        .volume(id)
+        .unwrap()
+        .policy
+        .signers
+        .len(),
+      SIGNERS_SMALL
+    );
+  }
+
+  /// A-724 piece 8. Do: inside a transaction, set a volume's signers to a list a slot and a half long, and commit.
+  /// Expect: the commit refused `Unpublished` with `SnapshotRoom` its cause, the transaction rolled back to the short list
+  /// a recovery would build, and nothing written past the slot.
+  #[test]
+  fn a_transaction_whose_state_would_pass_the_snapshot_slot_rolls_back_typed() {
+    let mut segment = segment_named("slates-db-snapshot-room-tx");
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    let record = volume();
+    let id = record.id;
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    db.mutate(
+      &mut segment,
+      &Op::VolumeSignersSet {
+        id,
+        keys: signer_keys(SIGNERS_SMALL),
+      },
+      0,
+    )
+    .unwrap();
+    db.begin();
+    db.mutate(
+      &mut segment,
+      &Op::VolumeSignersSet {
+        id,
+        keys: signer_keys(SIGNERS_LARGE),
+      },
+      0,
+    )
+    .unwrap();
+    match db.commit(&mut segment) {
+      Err(DbError::Unpublished { cause, .. }) => {
+        assert!(
+          matches!(*cause, DbError::SnapshotRoom { .. }),
+          "cause {cause:?}"
+        );
+      }
+      other => panic!("not rolled back for the slot: {other:?}"),
+    }
+    assert_eq!(
+      db.partition().volume(id).unwrap().policy.signers.len(),
+      SIGNERS_SMALL
     );
   }
 

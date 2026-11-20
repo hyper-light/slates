@@ -573,6 +573,10 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp raised 159 -> 160 on 2026-11-20 (A-725, the relief receiver; counted by hand, for main's
+# `cargo xtask unsafe` to confirm): `inflight/relief.rs` `take_pointer`, the one `Box::from_raw` that takes the operation
+# state back out of the slot it was parked in by `Box::into_raw` (an `AtomicPtr` swapped empty, so its only owner); the
+# dispatcher's journal view moved its one slice block into `RegionAt::capture` and adds none.
 # slates-bridge-winfsp raised 156 -> 159 on 2026-11-19 (A-551, a folding volume's drive names each open by the spelling
 # Windows holds or the volume stores; counted by hand, for main's `cargo xtask unsafe` to confirm): in `host.rs` the
 # call of ntdll's `RtlUpcaseUnicodeChar` in `system_upcase`, the system's upcase table the driver compares names by,
@@ -658,7 +662,7 @@ slates-bridge-fskit = 9
 # channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
 # intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
 # go (-3). Measured by `cargo xtask unsafe`.
-slates-bridge-winfsp = 159
+slates-bridge-winfsp = 160
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25
