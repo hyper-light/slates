@@ -58,13 +58,15 @@ impl MapStore {
 impl ReferencedContent for MapStore {
   fn run_at(&self, id: &Identity, len: u64, offset: u64) -> Result<Cow<'_, [u8]>, VfsError> {
     let object = self.objects.get(id).ok_or(VfsError::ReferenceUnresolved)?;
-    let len = usize::try_from(len).unwrap();
-    let offset = usize::try_from(offset).unwrap();
+    let len = usize::try_from(len).map_err(|_| VfsError::ReferenceUnresolved)?;
+    let offset = usize::try_from(offset).map_err(|_| VfsError::ReferenceUnresolved)?;
     if len != object.len() || offset >= len {
       return Err(VfsError::ReferenceUnresolved);
     }
     let end = ((offset / WINDOW + 1) * WINDOW).min(len);
-    let run = &object[offset..end];
+    let run = object
+      .get(offset..end)
+      .ok_or(VfsError::ReferenceUnresolved)?;
     Ok(if self.copies {
       Cow::Owned(run.to_vec())
     } else {
@@ -96,7 +98,7 @@ impl ReferencedHolds for MapStore {
 fn text(n: usize) -> Vec<u8> {
   let len = 1 + (n * 37) % (4 * WINDOW + 5);
   (0..len)
-    .map(|at| ((n * 131 + at * 7) % 251) as u8)
+    .map(|at| u8::try_from((n * 131 + at * 7) % 251).unwrap())
     .collect()
 }
 
@@ -132,7 +134,7 @@ fn read_whole(volume: &Volume, store: &Store, no: InodeNo, content: &MapStore) -
     if read == 0 {
       return out;
     }
-    out.extend_from_slice(&buf[..read]);
+    out.extend_from_slice(buf.get(..read).unwrap());
   }
 }
 

@@ -258,7 +258,7 @@ impl Encoding {
     loop {
       let unit_start = clock.now_ns();
       let stage = self.stage_index();
-      let progress = match self.unit(repository, store, &mut *clock, exchange) {
+      let progress = match self.unit(repository, store, exchange) {
         Ok(progress) => progress,
         Err(refused) => {
           self.stage = Stage::Refused(refused);
@@ -319,7 +319,6 @@ impl Encoding {
     &mut self,
     repository: &mut Repository,
     store: &mut ContentStore,
-    clock: &mut dyn Clock,
     exchange: Exchange,
   ) -> Result<Progress, StoreRefused> {
     let stage = core::mem::replace(&mut self.stage, Stage::Done);
@@ -330,7 +329,7 @@ impl Encoding {
         blobs,
         part,
         current,
-      } => self.encode(repository, store, clock, exchange, (blobs, *part, current))?,
+      } => self.encode(repository, store, exchange, (blobs, *part, current))?,
       keeping @ Stage::Keep { .. } => self.keep(repository, store, keeping)?,
       Stage::Done => return Ok(Progress::Done),
       Stage::Refused(refused) => return Err(refused),
@@ -426,7 +425,6 @@ impl Encoding {
     &mut self,
     repository: &mut Repository,
     store: &ContentStore,
-    clock: &mut dyn Clock,
     exchange: Exchange,
     (blobs, mut part, current): (bool, Part, Option<Box<Current>>),
   ) -> Result<Stage, StoreRefused> {
@@ -466,13 +464,13 @@ impl Encoding {
               bytes: named.bytes,
             }),
           };
-          let learning = repository.learning(exchange, clock);
+          let learning = repository.learning(exchange);
           let putting = part.encoder.begin(to_encode, at, &learning);
           Some(Box::new(Current::Put(Box::new(putting))))
         }
       }
       Current::Put(ref mut putting) => {
-        let mut learning = repository.learning(exchange, clock);
+        let mut learning = repository.learning(exchange);
         let put = part
           .encoder
           .step(putting, &mut learning, window)

@@ -13898,7 +13898,19 @@ cooperative slices (§4.3).
 > most a window and one row, the daemon living; `vcs_store::git_encode::tests::a718_no_unit_...`, ignored, its pack
 > named by `SLATES_ENCODE_PACK`). Owed: the encoding from the push's own intake (git's pack reuse, w-git's streaming
 > intake), the base pack's rebuild, kept fragments across a recovery, the parts' bytes held between turns charged, a pair
-> of trees read whole and the parts' record made in one unit.
+> of trees read whole and the parts' record made in one unit. **The encoder's bytes one function of its input (same day,
+> w-k90-vendor; main's ruling):** the zlib level and the delta window had been chosen from each level's sample and each
+> trial timed on the shard's clock, so one snapshot's objects deflated to other bytes from run to run and replica to
+> replica (A-745 rule 4's held-answer test found two streams of one generation deflating a tag at two levels), and every
+> fragment sampled every level again. Now the owner measures what the work costs once a process
+> (`slates_git::store::learn::Rates::measure`: each level's nanoseconds a KiB over a seeded text corpus of two deflate
+> windows, and a delta search's; `DaemonConfig::git_rates`, logged with the boot's derivations), carried in the exchange;
+> a level's sample and a trial are charged those rates over their bytes, and a kind's levels are sampled once, on the
+> first object of it a repository encodes. Held: a version's fragments the same bytes under a clock ticking a nanosecond
+> a read and one jumping by large random amounts (`a_versions_fragments_are_the_same_bytes_whatever_the_owners_clock_reads`,
+> red on main: the commit's entry deflated apart); rule 4's held answer now the start generation's byte for byte. Owed:
+> the release A/B on git/git (CPU per encoded MiB and bytes out, per-object timing against the rates; main's run), and
+> one deployment's rates shared by its nodes (each node measures its own today, so two machines may choose apart).
 
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
@@ -56968,3 +56980,34 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   `live_ship::tests::overlaid_runs_read_back_the_latest_bytes_and_refuse_a_gap` (a byte-array oracle) and
   `a_patched_files_spans_are_clipped_to_its_writes`; the takeover flows that serve written volumes from a successor's
   rebuild (live_fleet's warm-restart, no-copy and stopped-successor takeovers; the live_chaos fresh-member flow).
+
+### §4.8 amended — A borrower waiting for a record session out on loan is woken by its return, never paced (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family one of three)
+Applied in the same change to: §4.8 "Lookup" (a forward that finds its peer's session out), GAPS (the sweep's line),
+`crates/server/src/fleet.rs` (`session_returned`, `SessionChange`, `sessions_changed`, `return_sessions`, the link's
+install, refresh and removals, `take_campaign_sessions`), `crates/server/src/forward_lane.rs` (`drive_turn`),
+`crates/server/src/live_ship.rs` (`borrow_session`, the lost links), `crates/server/src/owner_location.rs`
+(`wait_for_returning_sessions`), `crates/server/src/member_task.rs`, `crates/server/src/daemon.rs`
+(`hold_record_session`), `crates/server/src/state.rs` (`session_waiters`, `session_woken`), `crates/server/tests/fleet.rs`.
+- **What was there.** A borrower that found its peer's record session out on another borrower's loan slept a pace and
+  looked again: the forward lane a tenth of a period (10 ms), a live write's shipper one timer tick at a time, a
+  campaign and a location round the fleet's poll interval, the test hook a tenth of a period. A session handed back just
+  after a look waited out the rest of the pace, and the tick-at-a-time wait parked and looked once a tick for as long as
+  the session was out.
+- **Change.** `fleet::session_returned(hosts, left)` waits, within the caller's own deadline, for a change of one of
+  those peers' record links: a `Send` future that registers its task's waker under each peer at its first poll, on the
+  control shard where the sessions are, and takes its registrations away when dropped. `fleet::sessions_changed(host)`
+  wakes every wait for that peer once (and takes it off the other peers' lists) wherever `record_sessions` changes:
+  every arm of `return_sessions` (handed back, dropped as reset or silent, a stale return), the link's install and its
+  discovery refresh, and each removal (the link task's, a learned id's replacement, a restarted peer's, the live
+  shipper's lost links). No wait possible (off a shard) ends the caller's wait as a refused sleep did; a test's campaign
+  hold, which ends at an instant and not at an event, caps the campaign's wait at that instant.
+- **Counters.** `fleet.session_wait.woken`, `fleet.session_wait.elapsed`, and `fleet.session_wait.returned`: the waits
+  woken by the session's own return, the test's red (a discovery refresh also wakes a wait, so the plain woken count
+  passed with the return's wake removed).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_forward_waiting_for_its_lent_session_is_woken_by_its_return` (two nodes at `f = 1`; B holds its session to A out for
+  50 ms by the test hook while a client on B asks A's green's versions, three times: answered in 52.3 to 53.2 ms, B's
+  returned counter moved by three, none elapsed). Red with the return's wake removed: the returned counter 0 and the
+  test failed; with the plain woken counter as the check, the forwards took 532, 916 and 965 ms, woken only by a later
+  refresh. Focused runs listed with the landing.
+

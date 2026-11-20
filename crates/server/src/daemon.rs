@@ -1646,8 +1646,8 @@ impl Daemon {
   /// docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md). The hold is a task on the
   /// control shard, where the record sessions live, and it sleeps on the shard's timer, so the shard keeps
   /// serving meanwhile. A session that is not in its link when the hold starts (out on a dispatch or a
-  /// discovery page, or being established by its link task after a membership change) is waited for, paced
-  /// at the fleet's poll interval, for at most [`session_wait_ns`], as a forward waits for it
+  /// discovery page, or being established by its link task after a membership change) is waited for, woken by
+  /// its return or its link's change (`fleet::session_returned`), for at most [`session_wait_ns`], as a forward waits for it
   /// (`fleet::forward_over_leader_session`); taking only what is there at the first look made the hold a race
   /// against those (CI run 36275755772, docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md). Returns
   /// once the hold has run its take, with what it found ([`SessionHold`]); the typed refusal when the control
@@ -1680,7 +1680,14 @@ impl Daemon {
             };
             break (sessions, outcome);
           }
-          pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
+          // Woken by the session's return or its link's change, within what is left of the wait.
+          let left = session_wait_ns().saturating_sub(waited_ns);
+          if crate::fleet::session_returned(&[peer], left)
+            .await
+            .is_none()
+          {
+            pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
+          }
         };
         let _ = taken.send(outcome);
         if !sessions.is_empty() {
@@ -5007,6 +5014,9 @@ async fn init_shard(
     root_learner_pace: crate::fleet::LearnerPace::default(),
     root_newer_seen: None,
     record_sessions: std::collections::BTreeMap::new(),
+    session_waiters: std::collections::BTreeMap::new(),
+    session_woken: std::collections::BTreeSet::new(),
+    next_session_wait: 0,
     record_dials: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
     discovery_withhold_replies: false,

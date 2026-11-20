@@ -326,10 +326,11 @@
 > (a2) BUILT 479f950ed: windows are chunks of the shard's own chunk store, lent per step by a swap under a guard (main's
 > ruling (ii)). (a3) BUILT 782eb711c: the windows' table in the shard image (held pieces), claimed before the volumes,
 > held again by the replay. (c) c1 BUILT: a Subversion head's texts held by the green by path (`vcs_store::svn_texts`),
-> held again at a recovery; `HeadTexts` reads the green, then the records: that second read path is OWED away with c3
-> (the reads switched to it, the records dropping text bytes), in one series. OWED: (b) git v3 (w-balance's names, on
-> main's f+1 ruling), (c) c2 (an old text kept as an svndiff delta in the repository store before the green folds it)
-> and c3, (d) replication.
+> held again at a recovery. c2 BUILT 14215b0c3: the records keep texts as skip-delta svndiffs. c3 BUILT: `HeadTexts`
+> reads a head text from the green and any other from the one place the records say it is kept (the content store for
+> a stored text, A-761 p2; the records' delta for an imported or made one), no arm tried after another. a3b BUILT
+> 9b9d8dec6 (lists and names in the shard image). OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); the
+> background deltify of a superseded stored text (main's ruling on A-761); (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -378,6 +379,9 @@
 > kept fragments made again after a recovery without a fetch paying; the parts' bytes an encoding holds between turns
 > charged; a pair of trees read whole and the parts' record in one unit. Each other unit is a window's work at most
 > (w-k90-vendor, 2026-11-20: the 56 MB git/git v2.0.0 push's encoding had spun the shard 3.5 s in one object's unit).
+> The level and the window are chosen from the bytes saved and the machine's rates measured once a process
+> (`learn::Rates`), not timed per object: one input, one output. OWED: the release A/B on git/git; a deployment's rates
+> shared by its nodes.
 >
 > **A-654 (2026-11-19, g258; git's push end to end).** Part 1 BUILT (slates-git): a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). Part 2 BUILT: the server's driver `crates/server/src/git_push.rs`, one entry point for both edges (`ReceivePack::start`, `input`, `end`, `answer`, each one step on the owner shard): the advertisement of each branch whose green holds a git head (namespace name `N` is `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under A-622's policy hidden; input and end over A-638's index view lent the shard's room (`vcs_store::with_room`); a configured git hook refusing every command `hook not run` until A-665 part 2's view; the checked objects admitted to A-662's quarantine and sealed; each command asked of A-622's policy through A-644 part 2's check point (`git_protect`: the right its change needs, then a protected name's linear history and signed commits on what it brings) before its work is built, refused in git's words; A-654 part 1's verdicts over the shard's greens, a ref's base its green's head alone, held at the append by compare and swap; `push_sealed` per entry, or once for all under `atomic`; git's report. Part 3 BUILT: git's HTTP site serves receive-pack through the driver (`vcs_http::git::receive`: each service from its own half, each step lent the state of the shard the connection moved to, a failure before any reply a status, a command's refusal the report's), proven by stock git's `create` push over loopback TLS to a daemon. The SSH site's call BUILT (A-683: `vcs_ssh::receive`, each step lent the shard's state through the HTTP site's seam, `ShardLender`). OWED: the live `git push` over HTTPS and over SSH with stock git's binary (main's runs); the hooks run over A-665 part 2's view (`pre-receive`, `update`, `post-receive`); a push based on an older version than its green's head, refused as a ref that moved until A-664's server-made commits; a principal the policy allows who is not the owner, whom A-635's append refuses `Forbidden`; push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8); a tag of a tag; a create while the default branch is unborn and holds files no commit names (A-664's).
 >
@@ -4893,8 +4897,8 @@
 > holder submit took 3.5-4.8 s and a local one 2.8-3.4 s in a debug build, with the inputs shipped back to the holder
 > that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
-> time). Owed from that sweep, each with its own wake: the waits for a lent record session (`forward_lane.rs`,
-> `fleet.rs` campaign sessions, `owner_location.rs`, `live_ship.rs`), a broadcast's stragglers (`owner_location.rs`), a
+> time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
+> pace between looks). Owed from that sweep, each with its own wake: a broadcast's stragglers (`owner_location.rs`), a
 > FUSE mount helper's exit (`fuse.rs`); the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
 

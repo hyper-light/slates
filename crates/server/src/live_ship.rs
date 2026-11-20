@@ -4612,8 +4612,8 @@ fn exchange_budget_for(bytes: usize, path: HolderPath) -> slates_cluster::Commit
   )
 }
 
-/// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
-/// within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
+/// Borrows `holder`'s record session, waiting for it while another dispatch has it out, woken by its return
+/// (`crate::fleet::session_returned`), within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
 /// write's message waited for whichever later dispatch carried it, at worst the next record period: two in three sends of
 /// a stable-write run found the session out, and the rare write took about 100 ms (2026-11-05, BENCHMARKS "What live
 /// shipping adds to a stable NFS write"). The forward path learned the same (`fleet::forward_over_leader_session`).
@@ -4638,8 +4638,13 @@ async fn borrow_session(
       return sessions;
     }
     missed = true;
-    // Shape: one tick of the shard's timer wheel, the finest park there is (`sleep` rounds up to it).
-    if slates_rt::futures::sleep(1).await.is_err() {
+    // Waits for the session's return (or its link's change) within what is left of the deadline, then looks again. It
+    // waited a timer tick at a time before 2026-11-20, a park and a look per tick for as long as the session was out.
+    let left = deadline_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    if crate::fleet::session_returned(&[holder], left)
+      .await
+      .is_none()
+    {
       return Vec::new();
     }
   }
@@ -4765,6 +4770,7 @@ fn lose_links(hosts: &[HostId]) {
   let _ = state::with_state(|s| {
     for host in hosts {
       s.record_sessions.remove(host);
+      crate::fleet::sessions_changed(s, *host);
       s.count(LIVE_LINK_LOST, 1);
     }
   });

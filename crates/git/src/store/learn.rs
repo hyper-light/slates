@@ -12,8 +12,10 @@
 //!   cost a delta search for every pair of its objects.
 //! - **The level** ([`Levels`]): for each kind of object and each level zlib defines, the bytes
 //!   in, the bytes out and the time, summed over sampled objects; the level is the one whose
-//!   saved bytes most outweigh its time at the exchange (§4.11's cost model). Each fragment
-//!   samples every level on one object of each kind it holds.
+//!   saved bytes most outweigh its time at the exchange (§4.11's cost model). A kind's levels are
+//!   sampled once, on the first object of it the repository encodes (its first window), and each
+//!   sample's time is the owner's measured rate ([`Rates`]), never a clock's, so the level is one
+//!   function of the bytes and the machine's rates (main's ruling, 2026-11-20).
 //! - **The depth** ([`Depth`]): the deepest delta chain a push's pack carried, as the
 //!   deployment's own git clients chose it (their `pack.depth`), at most git's own limit; before
 //!   any push carried a delta, the encoder makes none.
@@ -42,6 +44,107 @@ pub struct Exchange {
   pub ns: u64,
   /// The bytes they buy.
   pub bytes: u64,
+  /// What deflating and searching cost on this machine, measured once ([`Rates`]): the time a level or a delta trial
+  /// is charged when the encoder learns, so the bytes it writes are one function of its input (main's ruling,
+  /// 2026-11-20).
+  pub rates: Rates,
+}
+
+/// What the encoder's work costs on the owner's machine, measured once by the owner and fixed for its life
+/// ([`Rates::measure`]), logged with its inputs as every derived value is (R3): the nanoseconds a KiB of input takes at
+/// each zlib level, and a KiB of a delta search's source and target. Before this the encoder timed each level it
+/// sampled and each trial on the shard's clock, so one snapshot's objects deflated to other bytes from run to run and
+/// replica to replica (found by A-745 rule 4's held-answer test, 2026-11-20); now a level and a window are chosen from
+/// the bytes each saved, measured on the data, and these rates, so one input gives one output, as A-607 chose its
+/// deflate engine by measurement once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rates {
+  /// Nanoseconds a KiB of input takes to deflate, by level.
+  pub deflate_ns_per_kib: [u64; LEVELS_USIZE],
+  /// Nanoseconds a KiB of a delta search's source and target takes.
+  pub search_ns_per_kib: u64,
+}
+
+/// [`LEVELS`] as an array length.
+const LEVELS_USIZE: usize = 10;
+
+/// Format: the bytes in a KiB, the rates' unit of input.
+const KIB: u64 = 1024;
+
+/// Format: deflate's window, 32 KiB (RFC 1951 §2.3: distances reach 32,768 bytes back). The rates' corpus is two windows,
+/// so every match distance the format allows is met.
+const DEFLATE_WINDOW: usize = 32 * 1024;
+
+impl Rates {
+  /// The nanoseconds `bytes` of input take to deflate at `level`.
+  pub fn deflate_ns(&self, level: u32, bytes: u64) -> u64 {
+    let per_kib = usize::try_from(level)
+      .ok()
+      .and_then(|level| self.deflate_ns_per_kib.get(level))
+      .copied()
+      .unwrap_or(0);
+    per_kib.saturating_mul(bytes) / KIB
+  }
+
+  /// The nanoseconds a delta search over a `source`-byte base and a `target`-byte object takes.
+  pub fn search_ns(&self, source: u64, target: u64) -> u64 {
+    self
+      .search_ns_per_kib
+      .saturating_mul(source.saturating_add(target))
+      / KIB
+  }
+
+  /// The rates measured on `clock` (the owner's), over a corpus of two deflate windows of text-like bytes made by a
+  /// seeded generator: each level deflating the corpus once, and one delta search of the corpus against a copy of it
+  /// with a byte changed in every [`KIB`]. The corpus and the copy are what a pushed text file and its next version
+  /// are like; the measure is the owner's to make once and keep.
+  pub fn measure(clock: &mut dyn Clock) -> Rates {
+    let corpus = corpus(DEFLATE_WINDOW.saturating_mul(2));
+    let kib = (u64::try_from(corpus.len()).unwrap_or(u64::MAX) / KIB).max(1);
+    let mut deflate_ns_per_kib = [0_u64; LEVELS_USIZE];
+    for (level, slot) in (0..LEVELS).zip(deflate_ns_per_kib.iter_mut()) {
+      let start = clock.now_ns();
+      let _ = super::fragment::deflate(&corpus, level);
+      *slot = clock.now_ns().saturating_sub(start) / kib;
+    }
+    let mut changed = corpus.clone();
+    let step = usize::try_from(KIB).unwrap_or(1);
+    for byte in changed.iter_mut().step_by(step) {
+      *byte = byte.wrapping_add(1);
+    }
+    let start = clock.now_ns();
+    let _ = super::deltas::delta_of(&corpus, &changed);
+    let search_ns_per_kib = clock.now_ns().saturating_sub(start) / kib.saturating_mul(2);
+    Rates {
+      deflate_ns_per_kib,
+      search_ns_per_kib,
+    }
+  }
+}
+
+/// `len` text-like bytes: words of lowercase letters drawn by a xorshift generator from a fixed seed, separated by
+/// spaces and a line break every few words.
+fn corpus(len: usize) -> Vec<u8> {
+  // Format: xorshift64's shifts (Marsaglia, "Xorshift RNGs", 2003) and a nonzero seed.
+  let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+  let mut next = move || {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state
+  };
+  let mut out = Vec::with_capacity(len);
+  while out.len() < len {
+    let word = next();
+    let letters = (word % 8).saturating_add(1);
+    for at in 0..letters {
+      let letter = u8::try_from((word >> (8 + at * 5)) % 26).unwrap_or(0);
+      out.push(b'a'.saturating_add(letter));
+    }
+    out.push(if word % 11 == 0 { b'\n' } else { b' ' });
+  }
+  out.truncate(len);
+  out
 }
 
 impl Exchange {
