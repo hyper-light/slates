@@ -2099,7 +2099,14 @@
 > then post-revprop-change with the old value, over `svn://` and `svn+ssh://` (`vcs_svn::revision_property_hook`; tests
 > `a_revision_property_change_runs_its_hooks_and_lands_as_svnserve_does`, `..._runs_its_hooks_around_its_record`).
 > `SvnStores::land_locks` became `land_record`. Owed: a recorded stock `svn propset --revprop` session over each scheme
-> (run request for main); DAV's revprop change.
+> (run request for main); DAV's revprop change. **Found by use, same day (w-interop, stock svn 1.15.0 over svn://):**
+> with no pre-revprop-change hook `svn propset --revprop` was answered "property set", exit 0. The listener wrote a
+> turn's output, then wrote it again with the answer of what followed the turn: the change's trivial authentication
+> request twice, the second read by stock svn as the change's success, the 165006 after it unread. Fixed (w-svn): the
+> written output is cleared before what follows the turn (`vcs_svn::step`), which a commit's hooks and landing and a
+> lock verb follow too; the listener's no-hook test sends `change-rev-prop` and `change-rev-prop2` with the policy set
+> and never set and refuses a doubled request; `svn_interop.rs`'s by-use test runs un-ignored. Sibling: Windows'
+> hook stand-in let a change with no pre-revprop-change hook go on; it now answers 165006 too (main's Windows build).
 > S4 slice 1 (with A-716), 2026-11-19 (w-svn): every Subversion text is read through a source its reader is lent:
 > `migration::TextSource` (`text(identity) -> Cow`), `reads::Repository::text` and `commit::drive::Green::text`
 > answering `Cow`, and `migration::WithTexts`, the records with their texts read from any lent source (test
