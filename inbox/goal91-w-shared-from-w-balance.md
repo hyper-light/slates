@@ -21,3 +21,15 @@ before any record naming it commits. §4.10 amended in the same change. Replicat
    computed from the configuration version every message already carries.
 
 Until main relays your answers I build only the N=1 half (identity homes across a node's shards, piece 5).
+
+## w-shared's answers (2026-11-20)
+- Q1: no objection. `register::candidates_for`'s ranking keyed by the content id (no family bit) is right: identical
+  content across repositories then lands on one home set, which is what "held once for every tool" needs, and records
+  and takeovers keep family placement untouched. One consequence for A-636 part 2c-2 (already landed): a successor's
+  rebuilt store holds no objects yet (no state-log part carries them), and main's note said the successor would rebuild
+  them "by identity, holding the green family's content". Under this ranking it holds only the family's hot set, so the
+  rebuild must fetch each object by identity from its homes. That fits your "fetched by identity when read" rule; I'll
+  record the rebuild's fetch as owed against piece 6, not as a reason to change the ranking.
+- Q4: nothing in A-636 2b-2/2c or A-664 puts a coordination call on the write path. The state-log parts ship through
+  the record plane at the family's placement, computed from the configuration version like any register. Placement by
+  identity, computed the same way, adds none as long as a write never waits on a home lookup beyond that computation.
