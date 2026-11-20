@@ -1666,6 +1666,13 @@
 > `bind_branch`, `retire_branch`). Found by use: a branch the namespace binds is not among the refs git's site serves
 > (`git ls-remote` lists `main` alone after `branch create topic --from main`); `git_interop.rs` holds the by-use test
 > ignored for w-git.
+> **Stock-client interop per platform (w-interop, 2026-11-20, debug builds, ci/interop matrices):** macOS arm64 (Mac
+> Studio): git 26 of 27 over git/git cut at v1.0.0 (the v2.0.0 push still spins, owed to w-git), hg 4 of 24 over
+> Mercurial's whole history (the push lands in 142 s release, 5,460 MiB; every clone refused `PastAdmission`, owed to
+> w-hg), svn 32 of 32 over both datasets. Windows x86_64 (jupiter, git 2.56 for Windows, hg 7.2 under uv, main
+> 95044a3): git 4 of 27 (the clone spins the edge's connection task, `vcs_http.rs:834`, and the restarted daemon its
+> start, `daemon.rs:1094`; each restart moves the edges to new ports, owed to w-reaper's held listener), hg 4 of 24
+> (pushes land; clones refused as on macOS), svn not run (no client there). Linux: not yet run.
 > Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
 > verbs named `topic` was no bookmark and `--from one` was refused `NotFound`. In a Mercurial repository the three verbs
 > now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
@@ -4648,8 +4655,9 @@
 > node). What it owes: a rule for the work's node (the creating client's, with its name reachable from any node), the
 > owner's asks over the fleet exchange, and the lease gate on the owner's half of a remote verdict.
 > Progress (A-697, 2026-11-20): part a1 built, the owner's admission of another node's work by a forwarded
-> `AdmitWork` (rights from the green's record, the floor at the head, answered once); parts a2 (the holder serves the
-> creation, behind a test hook), b to f, and the routing flip are open.
+> `AdmitWork` (rights from the green's record, the floor at the head, answered once); part a2 built behind a test hook
+> (a holder makes the work on its client's partition, admitted over the fleet, its base read from its replica); parts
+> b to f and the routing flip are open.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's

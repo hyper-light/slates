@@ -76,6 +76,20 @@ pub(crate) const PENDING_SETTLED_FIRST: &str = "merge.work.pending_settled_first
 const PENDING_STUCK: &str = "merge.work.pending_stuck";
 /// Format: a pending submit whose request could not be decoded; the work's verbs then run as though it had none.
 const PENDING_UNREADABLE: &str = "merge.work.pending_unreadable";
+/// Format: a work's admission asked of its green's owner on another node (A-697 part a), the non-vacuity count of
+/// [`admit_over_fleet`].
+pub(crate) const ASKED_THE_OWNER_NODE: &str = "merge.work.asked_owner_node";
+/// Format: a base read of a work on a holder node answered by the node's replica of its green (A-697 part a), the
+/// non-vacuity count of [`answer_on_owner`]'s replica reads.
+pub(crate) const READ_FROM_REPLICA: &str = "merge.work.read_from_replica";
+/// Format: a base read the node's replica could not answer, holding no such green or not yet the work's base version
+/// (A-697 part a): answered retryable, unrecorded.
+pub(crate) const REPLICA_BEHIND: &str = "merge.work.replica_behind";
+/// Format: a floor a work on a holder node would move or drop at its green's owner on another node, which A-697 part b
+/// carries; until then the owner keeps the floor the admission recorded.
+pub(crate) const FLOOR_OWED_HOLDER: &str = "merge.work.floor_owed_holder";
+/// Format: an admission over the fleet whose creation was not committed when its ask was to leave: not asked.
+const ADMISSION_UNSTAGED: &str = "merge.work.admission_unstaged";
 /// Format: a work's increment composed on its own shard (A-247), the non-vacuity count of `composed`.
 pub(crate) const COMPOSED_ON_WORK: &str = "merge.work.composed_on_work";
 /// Counter: a work's journal holding a copy (A-626 part 4) composed by its green's owner, against `Green::base_for`,
@@ -214,6 +228,10 @@ pub(crate) struct WorkHome {
   routing: BTreeSet<DbVolumeId>,
   /// Test support (`Daemon::lose_next_owner_answer`): the next verdict or admission an ask brings back is lost.
   pub(crate) lose_next_answer: bool,
+  /// Test support (`Daemon::serve_works_on_holders`; A-697, until its last piece puts the rule that a node holding a
+  /// green's replica serves its works in its place): this node serves the works of greens another node owns
+  /// ([`green_elsewhere`]). Never set from the wire; off, nothing here changes.
+  pub(crate) on_holders: bool,
 }
 
 /// What [`gate`] decided for a verb.
@@ -280,6 +298,21 @@ fn remote_work(state: &ShardState, body: &RequestBody) -> Option<(DbVolumeId, Db
     return None;
   };
   (!state.greens.contains_key(&green)).then_some((volume, green))
+}
+
+/// Whether `green` is owned by another node while this node serves works over it (A-697 part a): only with the test hook
+/// on ([`WorkHome::on_holders`]) until A-697's last piece puts the real rule ("replicated here") in its place. The owner
+/// is the one this node's routing names, else the green's creator; a green on this shard never is.
+pub(crate) fn green_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
+  if !state.work_home.on_holders || state.greens.contains_key(&green) {
+    return false;
+  }
+  let object = slates_db::register::ObjectId(green.bytes);
+  state
+    .fleet
+    .object_owner(object)
+    .unwrap_or_else(|| object.creator())
+    != state.fleet.host()
 }
 
 /// Whether the caller's rights let the verb reach the owner; a verb refused here runs, and its own check answers.
@@ -625,9 +658,10 @@ pub(crate) fn gate(
       Err(refusal) => Gate::Answer(crate::verbs::refused(refusal)),
     };
   }
-  let Some((work, _green)) = remote_work(state, &body) else {
+  let Some((work, green)) = remote_work(state, &body) else {
     return Gate::Run(body);
   };
+  let elsewhere = green_elsewhere(state, green);
   if let Some(gate) = settle_pending_first(state, (client_id, principal), &body, work) {
     return gate;
   }
@@ -640,6 +674,12 @@ pub(crate) fn gate(
   } else {
     None
   };
+  // A verdict and a rebase of a work on a holder node are the commit by position (A-697 part c), not built yet.
+  if elsewhere && matches!(need, Some(Need::Verdict { .. } | Need::Rebase { .. })) {
+    return Gate::Answer(crate::verbs::refused(Refusal::Unsupported {
+      feature: "a verdict for a work on a holder node (A-697 part c)".to_owned(),
+    }));
+  }
   if !queued && need.is_none() {
     return Gate::Run(body);
   }
@@ -701,8 +741,10 @@ fn create_need(
 ) -> Result<Option<Need>, Refusal> {
   let owner = crate::verbs::owner_of(crate::verbs::to_wire_volume(green));
   let named_here = crate::verbs::owner_of_name(name, state.shards.len()) == state.partition;
-  let green_here =
-    state.greens.contains_key(&green) || crate::verbs::shard_of_partition(state, owner).is_none();
+  // A green another node owns is admitted by that node (A-697 part a), whatever partition its id names here.
+  let green_here = !green_elsewhere(state, green)
+    && (state.greens.contains_key(&green)
+      || crate::verbs::shard_of_partition(state, owner).is_none());
   if let Some(Err(refusal)) = &state.work_home.named {
     let refusal = refusal.clone();
     crate::verbs::settle_creation(state, name).map_err(|e| crate::error::refusal_of_db(&e))?;
@@ -1050,6 +1092,16 @@ fn start_ask(
       1,
     );
   }
+  // A green another node owns admits its work there, by a forward (A-697 part a).
+  if let Need::Admit {
+    green,
+    id: work,
+    name,
+  } = &need
+    && green_elsewhere(state, *green)
+  {
+    return admit_over_fleet(state, queue, id, principal, (*green, *work, name.clone()));
+  }
   // Every ask goes to its green's owner but a new work's name's, which goes to the partition the name hashes to (A-400).
   let (green, target) = match &need {
     Need::Verdict { sealed, .. } | Need::Rebase { sealed } => (sealed.green, None),
@@ -1068,7 +1120,17 @@ fn start_ask(
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
   let owner_partition =
     target.unwrap_or_else(|| crate::verbs::owner_of(crate::verbs::to_wire_volume(green)));
-  let Some(owner) = crate::verbs::shard_of_partition(state, owner_partition) else {
+  // A base read of a work on a holder node goes to the node's control shard, which holds its replica of the green
+  // (A-697 part a); a verdict or a rebase of one is refused at the gate.
+  let owner = if target.is_none() && green_elsewhere(state, green) {
+    if matches!(need, Need::Verdict { .. } | Need::Rebase { .. }) {
+      return false;
+    }
+    state.shards.first().copied()
+  } else {
+    crate::verbs::shard_of_partition(state, owner_partition)
+  };
+  let Some(owner) = owner else {
     return false;
   };
   let Some(here) = crate::verbs::shard_of_partition(state, state.partition) else {
@@ -1138,6 +1200,102 @@ fn start_ask(
   }
 }
 
+/// Asks `green`'s owner on another node to admit the work `work` this shard is making (A-697 part a): `AdmitWork`,
+/// forwarded from the control shard, where the fleet's sessions live, under the creation's own request id, so the owner's
+/// completion record answers a resend once. Asked once the creation's pending record is committed, as an outbox's ask
+/// is ([`staged`]). The answer resumes the creation: `WorkAdmitted` its admission, a refusal the owner gave its answer;
+/// no answer within the parked verb's bound, or one that says the ask was not started, answers it retryable,
+/// unrecorded, and its resend asks again. Returns whether the ask was started.
+fn admit_over_fleet(
+  state: &mut ShardState,
+  queue: DbVolumeId,
+  id: RequestId,
+  principal: &Principal,
+  (green, work, name): (DbVolumeId, DbVolumeId, String),
+) -> bool {
+  let (Some(here), Some(control)) = (
+    crate::verbs::shard_of_partition(state, state.partition),
+    state.shards.first().copied(),
+  ) else {
+    return false;
+  };
+  let region = state
+    .node_regions
+    .get(&state.fleet.host())
+    .map_or(0, |region| region.0);
+  let wire_green = crate::verbs::to_wire_volume(green);
+  let request = crate::verbs::forwarded_request(
+    state,
+    id.word(),
+    principal.clone(),
+    RequestBody::AdmitWork {
+      green: wire_green,
+      work: crate::verbs::to_wire_volume(work),
+    },
+  );
+  let deadline = park_bound_ns(state);
+  state.count(ASKED_THE_OWNER_NODE, 1);
+  let asked = slates_rt::futures::spawn(async move {
+    let staged = state::with_state_counted(|s| {
+      let staged = s
+        .db
+        .partition()
+        .pending_creation(&name)
+        .is_some_and(|pending| pending.work == work);
+      if !staged {
+        s.count(ADMISSION_UNSTAGED, 1);
+        resolve(s, queue, None);
+      }
+      staged
+    });
+    if staged != Some(true) {
+      return;
+    }
+    let reply = crate::xshard::task_within(
+      here,
+      control,
+      move || async move {
+        crate::verbs::resolve_and_forward(wire_green, region, None, vec![request])
+          .await
+          .0
+          .first()
+          .clone()
+      },
+      deadline,
+    )
+    .await;
+    let _ = state::with_state_counted(|s| resolve(s, queue, admitted_over_fleet(reply)));
+  });
+  match asked {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+      true
+    }
+    Err(_) => false,
+  }
+}
+
+/// What the green's owner on another node answered an `AdmitWork` (A-697 part a): the admission, or the refusal it gave;
+/// `None` (answered retryable, unrecorded) for no answer, one that says the ask was not started or did not reach the
+/// owner, and any other reply.
+fn admitted_over_fleet(reply: Option<ReplyBody>) -> Option<Answered> {
+  match reply? {
+    ReplyBody::WorkAdmitted { id, base } => Some(Answered::Admitted(Ok(Admitted {
+      id: crate::verbs::to_db_volume(id),
+      base,
+    }))),
+    ReplyBody::Refused {
+      refusal:
+        Refusal::Overloaded { .. }
+        | Refusal::Unpublished { .. }
+        | Refusal::OwnerUnreachable { .. }
+        | Refusal::HomedElsewhere { .. },
+    } => None,
+    ReplyBody::Refused { refusal } => Some(Answered::Admitted(Err(refusal))),
+    _ => None,
+  }
+}
+
 /// What the owner answered for one ask of a batch.
 #[allow(
   clippy::large_enum_variant,
@@ -1147,6 +1305,9 @@ enum Outcome {
   Answered(Answered),
   /// The owner took the verdict and answers when it commits.
   Deferred,
+  /// Nothing to answer yet: a holder's replica without the work's base version (A-697 part a). The verb is answered
+  /// retryable, unrecorded.
+  Unanswered,
 }
 
 /// Sends `here`'s outbox to `owner` a batch at a time until it is empty: one of the at most [`BATCHES_OUT`] senders out
@@ -1238,6 +1399,22 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     back,
     ..
   } = item;
+  if matches!(need, Need::Files(_) | Need::Page { .. } | Need::Sizes)
+    && state.work_home.on_holders
+    && !state.greens.contains_key(&green)
+  {
+    // A holder's base read, answered by its replica of the green (A-697 part a), once that holds the work's base.
+    let holds = state
+      .merge
+      .replicas
+      .get(&slates_db::register::ObjectId(green.bytes))
+      .is_some_and(|replica| replica.head() >= version);
+    if !holds {
+      state.count(REPLICA_BEHIND, 1);
+      return Outcome::Unanswered;
+    }
+    state.count(READ_FROM_REPLICA, 1);
+  }
   match need {
     Need::Files(paths) => Outcome::Answered(Answered::Base(crate::verbs::owner_files(
       state, green, version, &paths,
@@ -1308,6 +1485,7 @@ fn settle_outcome(state: &mut ShardState, queue: DbVolumeId, outcome: Outcome) {
     // `answered_late` resumes the verb when its record commits at the quorum, and the deadline releases the work if it
     // never does.
     Outcome::Deferred => defer_oldest(state, queue),
+    Outcome::Unanswered => resolve(state, queue, None),
   }
 }
 
@@ -1580,6 +1758,10 @@ pub(crate) fn tell_floor(
   work: DbVolumeId,
   base: Option<u64>,
 ) {
+  if green_elsewhere(state, green) {
+    state.count(FLOOR_OWED_HOLDER, 1);
+    return;
+  }
   if state.greens.contains_key(&green) {
     let now = state.clock.monotonic_ns();
     let op = match base {

@@ -688,6 +688,27 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     })
   }
 
+  /// [`Reader::resolve_turn`] for a pack read whole into the reader's own keeper ([`Reader::read`]), a thin pack's
+  /// outside bases read from `outside`: a turn of [`Reader::finish_with`]'s resolution (A-722 part 4: a record's replay
+  /// resolves its pack in turns, then finishes it with nothing left to resolve).
+  pub fn resolve_turn_with<O: Outside + ?Sized>(
+    &mut self,
+    outside: &O,
+    admission: &mut Admission,
+    quantum: crate::store::hook_view::Quantum<'_>,
+  ) -> Result<bool, Refusal> {
+    let mut held = core::mem::take(&mut self.held);
+    let turned = {
+      let mut beside = Beside {
+        outside,
+        held: &mut held,
+      };
+      self.resolve_turn(admission, &mut beside, quantum)
+    };
+    self.held = held;
+    turned
+  }
+
   /// [`Reader::finish_with`] for a pack read into `keep` ([`Reader::read_into`]), which holds a thin pack's outside
   /// bases too: the waiting deltas resolved into it, and every object's place in pack order, charged to `admission`
   /// first.
