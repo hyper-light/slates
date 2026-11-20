@@ -567,6 +567,15 @@ pub(crate) fn branch_version(
   Ok(version)
 }
 
+/// A branch's name as the owner's verbs give it, spelled as `record`'s namespace holds it: a Mercurial repository's
+/// names its bookmarks (`hg_push::owner_name`), every other tool's as given.
+fn spelled(record: &RepositoryRecord, name: &str) -> String {
+  match record.tool {
+    slates_db::catalog::VcsTool::Mercurial => hg_push::owner_name(name),
+    _ => name.to_owned(),
+  }
+}
+
 /// `CreateBranch` (module docs): branch `name` of `repository` at `version` of branch `from`, made without a walk.
 /// Answered `GreenCreated` with the new member.
 pub(crate) fn create_branch(
@@ -579,7 +588,8 @@ pub(crate) fn create_branch(
     Ok(record) => record,
     Err(reply) => return *reply,
   };
-  let Some(source) = state.db.partition().repositories().branch(record.id, from) else {
+  let (name, from) = (spelled(&record, name), spelled(&record, from));
+  let Some(source) = state.db.partition().repositories().branch(record.id, &from) else {
     return refused(Refusal::NotFound);
   };
   let version = match branch_version(state, source, version) {
@@ -598,7 +608,7 @@ pub(crate) fn create_branch(
   let made = record_branch(
     state,
     principal,
-    (&record, name),
+    (&record, &name),
     (source, version),
     require_evidence,
   );
@@ -681,7 +691,7 @@ pub(crate) fn bind_branch(
   // One entry of the repository's register (A-603), whose guard binds a member of this lineage only.
   let entry = next_entry(state, record.id).map(|mut entry| {
     entry.names.push(NameChange::Bind {
-      name: name.to_owned(),
+      name: spelled(&record, name),
       green: to_db_volume(green),
     });
     entry
@@ -705,7 +715,7 @@ pub(crate) fn retire_branch(
   // One entry of the repository's register (A-603).
   let entry = next_entry(state, record.id).map(|mut entry| {
     entry.names.push(NameChange::Retire {
-      name: name.to_owned(),
+      name: spelled(&record, name),
     });
     entry
   });
