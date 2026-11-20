@@ -6817,3 +6817,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-git A-722 part 3 (main 7b93d68c3): w-perf push_load.py / git_scale.sh rerun (push intake changed: rows staged at the seal into an index fork)
 - 2026-11-20 w-shared copy surfaces (main 807a6f3c0): clippy + xtask over cli/mcp/sdk-python/sdk-node; the SDK lane (maturin wheel + napi pack) on Linux/macOS/Windows; Windows CLI JSON flow
 - 2026-11-20 w-shared hard-link copy (main 95044a373): clippy + xtask; slates-merge whole lib + its copy proptest at a high case count; Linux/Windows
+- 2026-11-20 w-bugs A-747 (main 4e9c31aba): owed (main): clippy ipc/server; Linux run of slates-ipc --lib route:: (accept on Linux: departed path).
