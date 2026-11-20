@@ -1,5 +1,10 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 part b = 26454e7de (main b93699f93): MoveWorkFloor/WorkFloorMoved, verbs::move_work_floor (monotone,
+  forwards_as_read), work_home::tell_floor_over_fleet, route_gated refuses it from clients. NEXT: part c (commit by
+  position: holder computes increment + verdict on its replica, owner takes commit by position carrying increment +
+  computed form; judge_computed + commit_judged, A-658 3b). Gate refuses Verdict/Rebase for elsewhere works today.
+
 ## LANDED 2026-11-20: A-697 part a2 = fd679ecd4 (main 57ea648f2): hook Daemon::serve_works_on_holders / WorkHome::on_holders;
   work_home::green_elsewhere, admit_over_fleet; verbs::base_engine (replica reads on control shard); verdict/rebase
   refused Unsupported (part c), floor moves counted owed FLOOR_OWED_HOLDER (part b). NEXT: part b (floors at the owner:
