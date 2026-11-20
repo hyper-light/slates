@@ -82,7 +82,7 @@ impl Pair {
   }
 
   /// Moves the server's output to the client; whether there was any.
-  fn to_client(&mut self) -> bool {
+  fn send_to_client(&mut self) -> bool {
     let out = self.server.pending_output().to_vec();
     self.server.consume_output(out.len()).unwrap();
     self.client.feed(&out);
@@ -100,14 +100,14 @@ impl Pair {
   }
 
   /// Passes `input` to the server, taking its events and moving its output whenever it waits on them.
-  fn to_server(&mut self, input: &[u8]) -> Result<(), SessionRefusal> {
+  fn send_to_server(&mut self, input: &[u8]) -> Result<(), SessionRefusal> {
     let mut rest = input;
     let mut stalls = 0u32;
     while !rest.is_empty() && !self.server.is_closed() {
       let used = self.server.receive(rest, self.now)?;
       rest = rest.get(used..).unwrap_or(&[]);
       let moved = self.take_events() || used > 0;
-      if !moved && (!self.to_client() || stalls > 10_000) {
+      if !moved && (!self.send_to_client() || stalls > 10_000) {
         break;
       }
       stalls += u32::from(!moved);
@@ -120,7 +120,7 @@ impl Pair {
   /// so waits on its caller (a key lookup).
   fn pump(&mut self) -> Result<(), SessionRefusal> {
     for _ in 0..1_000 {
-      let sent = self.to_client();
+      let sent = self.send_to_client();
       let fresh = self.client.take_output();
       let held = self.unread.len();
       if !sent && fresh.is_empty() && held == 0 {
@@ -129,7 +129,7 @@ impl Pair {
       }
       let mut input = std::mem::take(&mut self.unread);
       input.extend_from_slice(&fresh);
-      self.to_server(&input)?;
+      self.send_to_server(&input)?;
       if !sent && fresh.is_empty() && self.unread.len() == held {
         self.take_events();
         return Ok(());
@@ -535,7 +535,7 @@ fn data_past_the_window_or_the_packet_is_refused() {
       ))
     )
   );
-  pair.to_client();
+  pair.send_to_client();
   assert_eq!(&pair.last()[..5], &[1, 0, 0, 0, 2]);
 }
 
@@ -610,7 +610,7 @@ fn too_many_failures_end_with_no_more_methods() {
     .client
     .send(&query(b"git", "ssh-ed25519", &stranger.blob));
   let outcome = pair.exchange(&query(b"git", "ssh-ed25519", &stranger.blob));
-  pair.to_client();
+  pair.send_to_client();
   let reason = pair.last()[1..5].to_vec();
   assert_eq!(
     (outcome, reason),
@@ -640,7 +640,7 @@ fn replies_and_data_wait_out_the_servers_own_rekey() {
     &[],
   ));
   let request = pair.client.take_output();
-  pair.to_server(&request).unwrap();
+  pair.send_to_server(&request).unwrap();
   let queued = pair.server.send_data(b"after the rekey");
   pair.server.consume_output(kexinit.len()).unwrap();
   pair.client.feed(&kexinit);

@@ -44,6 +44,9 @@ pub(super) struct History {
   hint: Option<(String, Revision)>,
 }
 
+/// A copy crossed: the revision it was made in, and its source joined with the rest of the path.
+type CopyCrossed = (Revision, (String, Revision));
+
 impl<R: Repository + ?Sized> Reads<'_, R> {
   /// `svn_fs_node_history2`: the history of the node at `path` in `revision`, not yet reported; refused when the path
   /// is absent there ("File not found").
@@ -128,7 +131,7 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
     path: &str,
     revision: Revision,
     commit_revision: Revision,
-  ) -> Result<Option<(Revision, (String, Revision))>, Failure> {
+  ) -> Result<Option<CopyCrossed>, Failure> {
     let youngest = copies::youngest_copy_root(self.index, path, revision)
       .map_err(|refusal| Failure::of_index(&refusal))?;
     let Some((copied_in, copy_path)) = youngest else {

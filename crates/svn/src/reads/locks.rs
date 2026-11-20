@@ -14,7 +14,8 @@ use super::{Failure, Outcome, Reads, Repository, full_path};
 use crate::lock::{AprTime, Depth, Lock, LockTable};
 use crate::ra_svn::{ItemError, Value};
 
-/// `SVN_ERR_INCORRECT_PARAMS` (`svn_error_codes.h`: `SVN_ERR_MISC_CATEGORY_START` + 4).
+/// `SVN_ERR_INCORRECT_PARAMS`.
+/// Format: the miscellaneous category's start, 200,000, plus 4 (`svn_error_codes.h`).
 const SVN_ERR_INCORRECT_PARAMS: u32 = 200_004;
 
 /// `get_locks`' refusal of a depth it does not take, in its words.

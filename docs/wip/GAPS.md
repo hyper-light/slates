@@ -115,6 +115,12 @@
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
 >
+> **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
+> name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
+> entry's bound in bounded parts across entries (git/git's 607 MiB pack vs a 747 MB segment region); objects already
+> held left out of the pack; S2 (history's latest value = the file's block), S3 (w-git, A-722), S4 (svn texts by identity),
+> S5 (w-hg); the push bound (a streamed window per connection, admission refusal before the body); push_load re-run.
+>
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
 > room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the
@@ -1425,6 +1431,13 @@
 > working-copy state checked by the ra_svn reporter's own rules (`report::whole_report`); OPTIONS says
 > `SVN-Allow-Bulk-Updates: Prefer`, so stock svn asks send-all. Stock svn 1.15's checkout (2,000 git/git revisions'
 > trunk in 5 s), export and update over HTTP pass; blame and diff ask reports still `501`; commits wait on POST.
+> **A-681 part C, HTTPv2 commits (w-interop, 2026-11-20):** `dav::commit::DavCommit` drives a POST's transaction
+> (`create-txn-with-props`) and its PUT, MKCOL, DELETE, COPY, PROPPATCH and MERGE through the one commit drive
+> (`Drive::edit`, typed), kept on the owner shard between requests (`VcsStores`, one a repository and principal) and
+> landed by `svn_commit::commit_work`; the HTTP edge now serves a `204` with no framing (ra_serf requires it for an
+> updating PUT and a DELETE). Stock svn 1.15's HTTP round trip runs un-ignored and passes; svn matrix over HTTP 23 of
+> 27. Owed: LOCK/UNLOCK and a commit's lock tokens (`If`, `S:lock-token-list`); the reports blame, diff and merge ask
+> (`file-revs`, a diff's, `mergeinfo`); a PUT's body held whole within the room; an abandoned transaction's expiry.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

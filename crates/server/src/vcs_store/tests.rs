@@ -155,62 +155,88 @@ fn holding(kind: Kind, bytes: &[u8]) -> (ContentStore, Noted) {
   )
 }
 
-/// A-662 (the record's format, pinned). Do: write a record of one delete, one move and one object held by a content
-/// store, then read it back. Expect: the bytes the module's encoding states, byte for byte, the object's bytes read back
-/// from its root; and the same moves and object read back.
+/// A-662, A-723 (the record's format, pinned: objects named, then the pack as sent). Do: write a record of one delete,
+/// one move and one object, with a pack kept, then read it back; and read back a version-1 record (each object's bytes
+/// inflated) as a segment written before A-723 holds one. Expect: the bytes the module's encoding states, byte for
+/// byte: the object named by its type, identity and length, then the pack's length and bytes, never the object's bytes;
+/// the same moves, name and pack read back; and the version-1 record's object read back with its bytes.
 #[test]
 fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   let head = ObjectId::from_bytes(FORMAT, &[0xab; 20]).expect("an id");
   let (content, noted) = holding(Kind::Blob, b"hi");
   let mut writer = RecordWriter::default();
   writer.object(noted);
+  writer.keep_pack(b"PACK-bytes".to_vec());
   let moves: Vec<RecordedMove> = vec![(7, 4, None), (9, 5, Some(head))];
   let bytes = writer
-    .finish(&content, |_| true, (3, &moves))
+    .finish((&content, FORMAT), |_| true, (3, &moves))
     .expect("written");
-  let mut expected = Vec::new();
-  expected.extend_from_slice(b"SGPR");
-  expected.extend_from_slice(&1u32.to_le_bytes());
-  expected.extend_from_slice(&3u64.to_le_bytes());
-  expected.extend_from_slice(&2u64.to_le_bytes());
-  expected.extend_from_slice(&7u64.to_le_bytes());
-  expected.extend_from_slice(&4u64.to_le_bytes());
-  expected.push(0);
-  expected.extend_from_slice(&9u64.to_le_bytes());
-  expected.extend_from_slice(&5u64.to_le_bytes());
-  expected.push(1);
-  expected.extend_from_slice(&[0xab; 20]);
+  let mut head_bytes = Vec::new();
+  head_bytes.extend_from_slice(b"SGPR");
+  head_bytes.extend_from_slice(&2u32.to_le_bytes());
+  head_bytes.extend_from_slice(&3u64.to_le_bytes());
+  head_bytes.extend_from_slice(&2u64.to_le_bytes());
+  head_bytes.extend_from_slice(&7u64.to_le_bytes());
+  head_bytes.extend_from_slice(&4u64.to_le_bytes());
+  head_bytes.push(0);
+  head_bytes.extend_from_slice(&9u64.to_le_bytes());
+  head_bytes.extend_from_slice(&5u64.to_le_bytes());
+  head_bytes.push(1);
+  head_bytes.extend_from_slice(&[0xab; 20]);
+  let mut expected = head_bytes.clone();
   expected.extend_from_slice(&1u64.to_le_bytes());
   expected.push(3);
   expected.extend_from_slice(&noted.identity.0);
   expected.extend_from_slice(&2u64.to_le_bytes());
-  expected.extend_from_slice(b"hi");
+  expected.extend_from_slice(&10u64.to_le_bytes());
+  expected.extend_from_slice(b"PACK-bytes");
   assert_eq!(bytes, expected);
+  let read = Record {
+    names: vec![(Kind::Blob, noted.identity, 2)],
+    pack: b"PACK-bytes",
+    deepest: 3,
+    moves: moves.clone(),
+    objects: Vec::new(),
+  };
+  assert_eq!(Record::decode(&bytes, FORMAT), Ok(read));
+  let mut inflated = head_bytes;
+  inflated.splice(4..8, 1u32.to_le_bytes());
+  inflated.extend_from_slice(&1u64.to_le_bytes());
+  inflated.push(3);
+  inflated.extend_from_slice(&noted.identity.0);
+  inflated.extend_from_slice(&2u64.to_le_bytes());
+  inflated.extend_from_slice(b"hi");
   let object = RecordedObject {
     kind: Kind::Blob,
     identity: noted.identity,
     content: b"hi",
   };
   let read = Record {
+    names: Vec::new(),
+    pack: &[],
     deepest: 3,
     moves,
     objects: vec![object],
   };
-  assert_eq!(Record::decode(&bytes, FORMAT), Ok(read));
+  assert_eq!(Record::decode(&inflated, FORMAT), Ok(read));
 }
 
-/// A-662 (the record written when an append commits, its bytes read back). Do: note three objects, the third longer
-/// than three windows; write the record with the second one held by the repository by then; then write one naming an
-/// object the content store does not hold. Expect: the record holds the first and the third in the order noted, the
-/// long one's bytes whole from its windows, and not the second; the object not held refused `Unreadable`, never
-/// written short.
+/// A-662, A-723 (the record written when an append commits). Do: note three objects; write the record with the second
+/// one held by the repository by then, a pack kept; write it again with every object held; write one naming an object
+/// the content store does not hold, with no pack kept; and one naming a held object with no pack kept. Expect: the first
+/// record names the first and the third in the order noted, not the second, and carries the kept pack; the second names
+/// none and carries no pack; the third refused `Unreadable`, never written short; the fourth carries a pack made of the
+/// object whole (`slates_git::pack::of_whole`), as the server's own commits are recorded.
 #[test]
 fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_bytes_not_held() {
   let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
   let long: Vec<u8> = (0..=u8::MAX).cycle().take(WINDOW * 3 + 5).collect();
   let mut writer = RecordWriter::default();
+  writer.keep_pack(b"the pack".to_vec());
+  let mut identities = Vec::new();
   for bytes in [&b"one"[..], b"two", &long] {
     let identity = content.put_object(bytes).expect("held");
+    identities.push(identity);
     let (id, _) = blob(bytes);
     let len = u64::try_from(bytes.len()).expect("a length");
     writer.object(Noted {
@@ -222,23 +248,50 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
   }
   let (held, _) = blob(b"two");
   let bytes = writer
-    .finish(&content, |id| *id != held, (0, &[]))
+    .finish((&content, FORMAT), |id| *id != held, (0, &[]))
     .expect("written");
   let read = Record::decode(&bytes, FORMAT).expect("read back");
-  let contents: Vec<&[u8]> = read.objects.iter().map(|object| object.content).collect();
-  assert_eq!(contents, vec![&b"one"[..], &long[..]]);
-  let (ghost, _) = blob(b"never held");
-  let mut unheld = RecordWriter::default();
-  unheld.object(Noted {
+  let long_len = u64::try_from(long.len()).expect("a length");
+  assert_eq!(
+    (read.names, read.pack),
+    (
+      vec![
+        (Kind::Blob, identities[0], 3),
+        (Kind::Blob, identities[2], long_len)
+      ],
+      &b"the pack"[..]
+    )
+  );
+  let none = writer
+    .finish((&content, FORMAT), |_| false, (0, &[]))
+    .expect("written");
+  let read = Record::decode(&none, FORMAT).expect("read back");
+  assert_eq!((read.names.len(), read.pack), (0, &[][..]));
+  let (ghost, _) = blob(b"never packed");
+  let mut unpacked = RecordWriter::default();
+  unpacked.object(Noted {
     kind: Kind::Blob,
     id: ghost,
     identity: ContentId([9; 32]),
-    len: 10,
+    len: 12,
   });
   assert_eq!(
-    unheld.finish(&content, |_| true, (0, &[])),
+    unpacked.finish((&content, FORMAT), |_| true, (0, &[])),
     Err(WriteRefused::Unreadable { id: ghost })
   );
+  let (one, _) = blob(b"one");
+  let mut sent_none = RecordWriter::default();
+  sent_none.object(Noted {
+    kind: Kind::Blob,
+    id: one,
+    identity: identities[0],
+    len: 3,
+  });
+  let made = sent_none
+    .finish((&content, FORMAT), |_| true, (0, &[]))
+    .expect("written");
+  let read = Record::decode(&made, FORMAT).expect("read back");
+  assert!(read.pack.starts_with(b"PACK"), "{:?}", read.pack);
 }
 
 /// A-662 (hostile input on a parser of bytes the log holds). Do: read a record cut at every length, one whose counts are
@@ -251,8 +304,9 @@ fn t_a662_hostile_records_are_refused_by_kind() {
   let (content, noted) = holding(Kind::Commit, b"commit");
   let mut writer = RecordWriter::default();
   writer.object(noted);
+  writer.keep_pack(b"a pack".to_vec());
   let bytes = writer
-    .finish(&content, |_| true, (0, &[(1, 1, Some(head))]))
+    .finish((&content, FORMAT), |_| true, (0, &[(1, 1, Some(head))]))
     .expect("written");
   for cut in 0..bytes.len() {
     let read = Record::decode(bytes.get(..cut).expect("a prefix"), FORMAT);
@@ -279,10 +333,10 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
   );
   let magic = with(0..4, b"GCHN");
   assert_eq!(Record::decode(&magic, FORMAT), Err(RecordRefused::Magic));
-  let version = with(4..8, &2u32.to_le_bytes());
+  let version = with(4..8, &3u32.to_le_bytes());
   assert_eq!(
     Record::decode(&version, FORMAT),
-    Err(RecordRefused::Version { version: 2 })
+    Err(RecordRefused::Version { version: 3 })
   );
   // Format: the objects' count follows the header (24 bytes), the move's key, version and marker (17) and its head (20).
   let objects_at = 24 + 17 + 20;
@@ -934,9 +988,10 @@ fn t_a662_a_fixed_history_makes_every_kind_of_push_and_recovers() {
 }
 
 /// A-662 (guard then apply: a replay refuses what is not what its record names, and leaves nothing). Do: replay a
-/// record whose object's bytes were changed, one whose objects the store holds already (a record the live admission
-/// would not have made), and one whose head names a commit nobody sent. Expect: refused `Identity`, `Diverged` and the
-/// store's `Missing` in turn, and each refused replay leaves the store as it was.
+/// record whose pack's last byte was changed, one whose objects the store holds already (a record the live admission
+/// would not have made), and one whose head names a commit nobody sent. Expect: refused by git's reader (`Pack`, A-723:
+/// the pack's trailer no longer its checksum), `Diverged` and the store's `Missing` in turn, and each refused replay
+/// leaves the store as it was.
 #[test]
 fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   let mut live = Live::new();
@@ -951,10 +1006,11 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
     *byte ^= 1;
   }
   let mut store = live.recovered().expect("recovered");
-  assert_eq!(
+  // A-723: the record's last bytes are its pack's trailer, so the changed record's pack is refused by git's reader.
+  assert!(matches!(
     replay_git(&mut store.content, &mut store.store, &changed),
-    Err(ReplayRefused::Identity)
-  );
+    Err(ReplayRefused::Pack(_))
+  ));
   assert_eq!(store.facts(), before);
   assert!(matches!(
     replay_git(&mut store.content, &mut store.store, &record),
@@ -963,7 +1019,11 @@ fn t_a662_a_record_not_what_it_names_is_refused_and_leaves_nothing() {
   assert_eq!(store.facts(), before);
   let nobody = ObjectId::from_bytes(FORMAT, &[0x5a; 20]).expect("an id");
   let missing = RecordWriter::default()
-    .finish(&store.content, |_| true, (0, &[(1, 1, Some(nobody))]))
+    .finish(
+      (&store.content, FORMAT),
+      |_| true,
+      (0, &[(1, 1, Some(nobody))]),
+    )
     .expect("written");
   assert!(matches!(
     replay_git(&mut store.content, &mut store.store, &missing),
@@ -1106,6 +1166,52 @@ fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
 }
 
 /// A push begun on the shard with `objects` admitted at `depth`.
+/// A zlib stream of `data` in stored (uncompressed) blocks, as a pack entry's data may be (RFC 1950, RFC 1951 §3.2.4):
+/// what git's reader inflates, made with no compressor.
+fn zlib_stored(data: &[u8]) -> Vec<u8> {
+  let mut out = vec![0x78, 0x01];
+  let mut blocks = data.chunks(usize::from(u16::MAX)).peekable();
+  if blocks.peek().is_none() {
+    out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+  }
+  while let Some(block) = blocks.next() {
+    out.push(u8::from(blocks.peek().is_none()));
+    let len = u16::try_from(block.len()).expect("a stored block's length");
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(block);
+  }
+  let (mut a, mut b) = (1u32, 0u32);
+  for byte in data {
+    a = (a + u32::from(*byte)) % 65_521;
+    b = (b + a) % 65_521;
+  }
+  out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+  out
+}
+
+/// A pack of `objects`, each whole, as a client sends them (A-723: the pack the record keeps).
+pub(crate) fn pack_of(objects: &[Brought]) -> Vec<u8> {
+  let mut out = Vec::new();
+  let count = u32::try_from(objects.len()).expect("a count");
+  let mut writer = slates_git::pack::Writer::new(FORMAT, count, &mut out);
+  let mut at = slates_git::entry::PACK_HEADER_LEN;
+  for (kind, _, bytes) in objects {
+    let mut head = Vec::new();
+    let header = slates_git::entry::Header {
+      representation: slates_git::entry::Representation::Whole(*kind),
+      size: u64::try_from(bytes.len()).expect("a size"),
+    };
+    slates_git::entry::write(header, at, &mut head).expect("a header");
+    let data = zlib_stored(bytes);
+    slates_git::out::Out::put(&mut writer, &head);
+    slates_git::out::Out::put(&mut writer, &data);
+    at += u64::try_from(head.len() + data.len()).expect("an offset");
+  }
+  writer.finish().expect("a trailer");
+  out
+}
+
 fn begun_at(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -1113,6 +1219,7 @@ fn begun_at(
   depth: u64,
 ) -> GitPush {
   let mut push = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
+  push.keep_pack(pack_of(objects));
   let arriving: Vec<Incoming<'_>> = objects
     .iter()
     .map(|brought| incoming(brought, depth))
@@ -1298,7 +1405,7 @@ fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
     .expect("topic");
     sealed.abandon(state);
     let last = records(state, repository).pop().expect("a record");
-    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.objects.len()));
+    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.names.len()));
     assert_eq!(read, Ok((DEEP, 0)));
     let greens = [green_key(root), green_key(created_green(&made))];
     assert_made_again_whole(state, repository, &greens);
@@ -1334,7 +1441,7 @@ fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
     .expect("the second");
     second.abandon(state);
     let last = records(state, repository).pop().expect("a record");
-    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.objects.len()));
+    let read = Record::decode(&last, FORMAT).map(|record| (record.deepest, record.names.len()));
     assert_eq!(read, Ok((DEEP, 0)));
     let learned = state
       .vcs_stores
@@ -1392,7 +1499,7 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
     sealed.abandon(state);
     let last = records(state, repository).pop().expect("a record");
     let read = Record::decode(&last, FORMAT).expect("a record");
-    assert_eq!(read.objects.len(), second.len());
+    assert_eq!(read.names.len(), second.len());
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     let key = green_key(root);
     let newest = store
@@ -1470,7 +1577,7 @@ fn assert_recorded_and_charged(
     .iter()
     .map(|bytes| Record::decode(bytes, FORMAT).expect("a record"))
     .collect();
-  let counts: Vec<usize> = read.iter().map(|record| record.objects.len()).collect();
+  let counts: Vec<usize> = read.iter().map(|record| record.names.len()).collect();
   // The second push's README blob is the first's, already held, so only its new blob, tree and commit are recorded.
   assert_eq!(counts, vec![first, second - 1]);
   assert!(read.iter().all(|record| record.moves.len() == 1
