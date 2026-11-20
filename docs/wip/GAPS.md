@@ -114,6 +114,11 @@
 > as a delta against its source's checkpoint, so a branch can be made below that checkpoint and a live branch no longer
 > holds its source's history from its version (today it does, within the source's retention budget); the record's
 > replication and a branch made through the register (piece 2); a green at a commit that is no version's head (piece 3).
+> **A-710 (2026-11-20, w-perf, UI goal 93):** `slates repository import NAME PATH` (absolute PATH: a Mercurial
+> repository's directory or a Subversion dump) asks `ImportRepository` through `Client::import_repository` and prints
+> what it took or its typed refusal. By use (Studio, 543606da3): Mercurial's own repository is refused `PastRoom { room:
+> 278528 }`, the hg room every push past ~250 changesets also meets (413); owed to w-hg.
+>
 > **A-685 (2026-11-19, g305; piece 1's client half):** a repository is made from the command line, `slates repository
 > create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]`, through
 > `Client::create_repository`; each tool's defaults are the server crate's (`object_formats`, `root_binding`: git SHA-1
