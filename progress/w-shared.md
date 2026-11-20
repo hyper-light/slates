@@ -1,5 +1,20 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: copy surfaces b6f6426ac (main 807a6f3c0). NOW: engine copy of hard links (main's 4 steps; inbox note to
+  w-engine on files first). Python venv at ~/slates-work/w-shared-scratch/venv (maturin develop); Node addon = cdylib copied
+  to scratch slates.node; daemon = ~/.cache/w-shared-local-target/debug/slates (cargo build -p slates-cli).
+
+## QUEUE (main 2026-11-20): copy surfaces (MCP done uncommitted: decode+exhaustive work_op_kind+by-use test; CLI copy verb
+  added uncommitted, needs by-use test; then Python SDK, Node SDK) -> engine copy of hard links (amend A-586/§4.16: names
+  sharing a node inside the copy share one new node; a node with a name outside gets its own node, bytes by identity;
+  failing test in paths::tests + slates-merge copy tests; build in engine/copy.rs incl. checkpoint/replay v4; every
+  remaining "does not yet copy" a typed refusal, never TypeChanged; inbox note to w-engine on files touched first)
+  -> svn copy rows -> A-697 -> A-658 3c.
+
+## NOW (main reorder): WorkOp::Copy on every surface first (CLI, Python SDK, Node SDK, MCP), each proven by use vs a real
+  daemon (work copies, submits, reads copied tree); make WorkOp matches exhaustive where a surface lists/decodes them.
+  Then svn_made copy-from rows (design noted above), A-697, A-658 3c.
+
 ## LANDED 2026-11-20: A-626 part 4 work verb 7fed9d428 (main 9e8e489d6). NOW: svn_made copy-from rows (pass the increment's
   Copy ops (path=dest, src=source, at=version, REPLACE flag) from judge_submission; rows Add/Replace with copy_from; paths
   beneath a dest compared to the source at its revision). Then A-697, A-658 3c.
