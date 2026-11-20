@@ -6,11 +6,21 @@
 //! copy-from revision: FSFS copies only from a committed revision, `libsvn_fs_fs/tree.c` `copy_helper`). The verdict
 //! judges it node-exclusively, an addition: refused when the destination or anything beneath it is present at the head
 //! (unless the copy replaces it, below) or changed after the increment's base, when nothing stood in the source's tree
-//! at its version, when the source's tree holds a hard link (Subversion has none, and each would add one more name to
-//! the reverse map of links, `links_to`), and when the destination is the root (always present; an editor never adds
-//! it). Accepted, the head's maps copy the source's tree by reference (`crate::dims`, "A tree is copied by
+//! at its version, when a hard link in the source's tree names a node outside it that changed after the version (below),
+//! and when the destination is the root (always present; an editor never adds it). Accepted, the head's maps copy the source's tree by reference (`crate::dims`, "A tree is copied by
 //! reference"). The root is a source like any other: its tree is every key (a stock client copies `^/` into a child,
 //! `libsvn_client/copy.c` refusing a copy into its own child only between working copies).
+//!
+//! **A hard link in the copied tree** (main's ruling of 2026-11-20: an agent's workspace holds hard links routinely, a
+//! `git clone --local` linking its objects). The rule is a snapshot's: names in the copied tree that share a node keep
+//! sharing one new node in the copy, so a copied link names its node's copy; a name whose node lies outside the copied
+//! tree gets a node of its own in the copy, holding that node's bytes, mode or IPC node, its bytes named by the content
+//! they hold, never copied by the outside node. The graft shares the map of links as it shares every map, so a copied
+//! link still names its node in the source; the version's commit then derives each copied link's own effect
+//! ([`Green::copy_link_effects`]: a link naming the copy's node, or the link removed and a node of its own made), from
+//! the head before the copies land, as a node's moves are derived, so a replay derives the same and the chain entry
+//! records none. The node outside is read from the head, so the verdict refuses a copy whose outside nodes changed after
+//! its version ([`Green::outside_link_moved`]).
 //!
 //! **A copy from a version its source changed after** (A-626 part 2; FSFS copies from any committed revision, its
 //! node-revisions kept whole) brings the tree as it stood then. The maps hold only the head, so the copy grafts the
@@ -910,7 +920,7 @@ impl Green {
       source: &spec.source,
       fix,
     };
-    if !brought.holds_tree(&spec.source) || self.hardlinks.holds_tree(&spec.source) {
+    if !brought.holds_tree(&spec.source) || self.outside_link_moved(&spec.source, spec.version) {
       return refused(MergeConflictClass::TypeChanged);
     }
     Ok(Effect::CopyTree {
@@ -920,6 +930,62 @@ impl Green {
       replace: spec.replace,
       fix: fix.cloned().map(Box::new),
     })
+  }
+
+  /// Whether a hard link in `source`'s tree names a node outside it whose bytes or node changed after `version`: the
+  /// copy gives such a link a node of its own holding the node's bytes ([`Green::copy_link_effects`]), read from the
+  /// head, which holds them as they stood at the version only where nothing changed them since.
+  fn outside_link_moved(&self, source: &str, version: u64) -> bool {
+    self
+      .hardlinks
+      .prefix(source)
+      .filter(|(link, _)| in_tree(link, source))
+      .any(|(_, target)| !in_tree(target, source) && self.tree_changed_after(target, version))
+  }
+
+  /// The effects a version's copies of trees holding hard links add to it (main's ruling of 2026-11-20, A-586's hard
+  /// link in a copied tree): a copy shares every node of its source's tree by reference, a hard link's name among them,
+  /// so a copied link still names its node in the source. Names in the copied tree that share a node keep sharing one,
+  /// the copy's: each copied link names its node's copy ([`Effect::Hardlink`], which keeps the reverse map of links).
+  /// A link whose node lies outside the copied tree gets a node of its own in the copy, holding the node's bytes, mode or
+  /// IPC node, its bytes named by the content they hold, never by the outside node. Derived from the head before the
+  /// copies land and the version's own effects, as a node's moves are ([`Green::node_moves`]), so a replay derives the
+  /// same and the chain entry records none; a copy's verdict accepts no source whose outside nodes changed since its
+  /// version ([`Green::outside_link_moved`]), so the head holds what the version held. O(the links in the copied trees).
+  pub(super) fn copy_link_effects(&self, effects: &[Effect]) -> Vec<Effect> {
+    let mut linked = Vec::new();
+    for effect in effects {
+      let Effect::CopyTree { dst, from, .. } = effect else {
+        continue;
+      };
+      for (link, target) in self.hardlinks.prefix(from) {
+        let Some(rel) = relative(&link, from) else {
+          continue;
+        };
+        let copied = joined(dst, rel);
+        match relative(target, from) {
+          Some(node) => linked.push(Effect::Hardlink(copied, joined(dst, node))),
+          None => self.own_node(copied, target, &mut linked),
+        }
+      }
+    }
+    linked
+  }
+
+  /// A copied link `copied` given a node of its own holding what the outside node at `target` holds (see
+  /// [`Green::copy_link_effects`]): its link removed, then its IPC node or its bytes, and its mode.
+  fn own_node(&self, copied: String, target: &str, linked: &mut Vec<Effect>) {
+    linked.push(Effect::RemoveHardlink(copied.clone()));
+    if let Some(node) = self.specials.get(target) {
+      linked.push(Effect::Special(copied, *node));
+      return;
+    }
+    if let Some(mode) = self.modes.get(target) {
+      linked.push(Effect::Mode(copied.clone(), *mode));
+    }
+    let bytes = self.content.get(target).map(<[u8]>::to_vec);
+    let source = ContentSource::Copied(target.to_owned(), Vec::new());
+    linked.push(Effect::SetContent(copied, bytes, Vec::new(), source));
   }
 
   /// What a copy of `source` at `version` changes in the head's tree it grafts, so it brings the tree as it stood at the

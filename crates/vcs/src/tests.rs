@@ -232,7 +232,7 @@ fn the_same_bytes_from_git_and_mercurial_are_one_content_held_by_both_repositori
   hg_repository.seal_all(&mut store).unwrap();
   assert_eq!(store.holders(&content), 2);
   git_repository.release(&mut store).unwrap();
-  assert_eq!(store.get(&content), Some(bytes));
+  assert_eq!(store.bytes_of(&content).as_deref(), Some(bytes));
   hg_repository.release(&mut store).unwrap();
   assert_empty(&store);
 }
@@ -383,7 +383,7 @@ fn an_object_longer_than_a_window_arrives_as_its_windows_and_reads_back_through_
   assert!(
     store
       .identities()
-      .all(|id| store.get(id).unwrap().len() <= WINDOW)
+      .all(|id| store.len_of(id).unwrap() <= u64::try_from(WINDOW).unwrap())
   );
   repository.release(&mut store).unwrap();
   assert_empty(&store);
@@ -1324,7 +1324,10 @@ fn check(real: &Real, model: &Model) {
   let tables = check_indexes(real, model);
   let named = model.named();
   for (content, bytes) in &named {
-    assert_eq!(real.store.get(content), Some(bytes.as_slice()));
+    assert_eq!(
+      real.store.bytes_of(content).as_deref(),
+      Some(bytes.as_slice())
+    );
   }
   for content in real.store.identities() {
     assert!(

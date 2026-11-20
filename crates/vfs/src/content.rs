@@ -327,6 +327,12 @@ impl ChunkStore {
     }
   }
 
+  /// A store over no memory, holding no chunk record: the placeholder a lender leaves where its chunk store was while
+  /// it is lent for one step (A-727: the shard's chunk store lent to its repository content), allocating no block.
+  pub fn empty(page: usize) -> ChunkStore {
+    ChunkStore::new(ChunkArena::new(page), page, 0)
+  }
+
   /// Seals chunks from now on with `cipher` (A-99): a chunk sealed under a key is encrypted in the arena and opened
   /// on every read.
   pub fn set_cipher(&mut self, cipher: Box<dyn ChunkCipher>) {
