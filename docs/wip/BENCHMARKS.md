@@ -15720,3 +15720,84 @@ alone exhausts its budget.
   lately hold (`Step::Putting`). The same push then answered in 168,761 steps, fewer than before B2 (173,409); its time,
   9.44 s, was taken while the Studio built other work, so the steps are the comparison. Its longest step, 48 ms, is
   its last: the landing (the commit's whole passes, next).
+
+## Paced work yields only when someone waits: a push's build in a twentieth of the turns, newcomers held (A-783; main's pacing call of 2026-11-20 15:35, condition (d); 2026-11-20)
+
+- **The builds:** A = main at 779840fba; B = the same tree with A-783 (`slates-pace`, the runtime's probe and ceiling,
+  the push build on them). Both carry the same measurement, the runtime's counters as status rows (`rt.steps`,
+  `rt.polls`, `rt.long_steps`, `rt.poll_log2.*`; landed with A-783), release, each in its own target directory.
+- **The command:** `crates/cli/bench/pacing_ab.py A_SLATES A_BENCH B_SLATES B_BENCH ~/.cache/g309-scale/src.git
+  'v1.0.0^{commit}' --rounds N --pushes 8 --load idle|both`: a fresh daemon a side a round, the sides alternating their
+  order each round; 8 pushes of git/git cut at v1.0.0 (12,232 objects, 3.4 MB) at once, each to its own repository;
+  meanwhile a newcomer, a ref advertisement of an idle repository, one after another, timed from its send to the
+  answer's first byte; the runtime's and the build's counters from `slates status` before and after; then
+  `provision_bench`'s single-client spinning p99 (R9's gated row, the bench stopped once it prints). `cores` adds as
+  many CPU burners as cores (`yes`).
+- **The machine:** the big Studio (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), shared with other agents' builds and
+  a live chaos run: load at each pass's start and end below. Every round shown.
+
+**Pass 1** (16:36–16:43 PST, load 5.5 at the start): B before the batch fix (below).
+
+| round | A wall s | B wall s | A newcomer p99 / max ms | B newcomer p99 / max ms |
+|---|---|---|---|---|
+| idle 1 | 6.124 | 3.038 | 8.27 / 18.93 | 8.74 / 42.03 |
+| idle 2 | 5.236 | 2.940 | 4.30 / 11.19 | 6.75 / 37.40 |
+| idle 3 | 5.983 | 5.237 | 3.40 / 17.24 | 2.66 / 92.08 |
+| idle 4 | 6.280 | 6.060 | 3.13 / 12.02 | 2.47 / 92.29 |
+| idle 5 | 6.493 | 4.712 | 3.34 / 11.85 | 2.96 / 105.54 |
+| cores 1 | 18.642 | 4.170 | 6.57 / 52.58 | 8.77 / 62.40 |
+| cores 2 | 7.210 | 4.576 | 9.01 / 41.77 | 8.28 / 74.31 |
+| cores 3 | 16.692 | 12.579 | 21.62 / 130.10 | 22.09 / 147.94 |
+| cores 4 | 19.247 | 14.751 | 11.63 / 81.80 | 19.40 / 123.68 |
+| cores 5 | 13.849 | 13.071 | 25.06 / 108.79 | 10.70 / 125.51 |
+
+Walls fell, but B's newcomer max rose to about the ceiling (100 ms) idle, while its builds yielded 0 to 3 times a
+round in most rounds. **Found:** a shard's step takes a batch of ready tasks out of its queue and polls them in turn, so
+the tasks after the one running a paced turn were in neither the queue nor the control channel, and the probe never saw
+them. The daemon's log (a scratch diagnostic build, never landed) showed it: a newcomer's connection, moved to its
+repository's shard just as a build turn began there, was taken into that step's batch; the turn asked 4,263 times over
+80 ms and found no one; the newcomer was first polled 94 ms after its move was sent. Fixed in B (the probe counts the
+batch's tasks not yet polled; red first, `a_task_ready_in_the_same_batch_is_seen_waiting`).
+
+**Pass 2** (17:16–17:32, load 15.8 at the start, 41.8 at the end, the box's other work rising through it): B fixed.
+
+| round | A wall s | B wall s | A newcomer p99 / max ms | B newcomer p99 / max ms | B turns that yielded |
+|---|---|---|---|---|---|
+| idle 1 | 10.551 | 4.312 | 1.91 / 12.18 | 8.52 / 20.70 | 68 |
+| idle 2 | 5.542 | 6.810 | 48.91 / 111.29 | 105.80 / 144.65 | 55 |
+| idle 3 | 4.675 | 5.642 | 34.64 / 82.80 | 42.39 / 57.60 | 44 |
+| idle 4 | 4.270 | 4.070 | 46.34 / 70.70 | 40.16 / 49.04 | 37 |
+| idle 5 | 4.080 | 4.025 | 28.46 / 35.66 | 37.94 / 59.19 | 62 |
+| cores 1 | 8.465 | 11.266 | 80.60 / 126.49 | 74.50 / 127.22 | 12 |
+| cores 2 | 9.313 | 6.118 | 17.84 / 129.15 | 48.96 / 132.48 | 88 |
+| cores 3 | 8.215 | 4.495 | 20.05 / 70.52 | 26.16 / 63.63 | 110 |
+| cores 4 | 11.656 | 7.643 | 8.75 / 51.64 | 14.57 / 40.79 | 35 |
+| cores 5 | 6.992 | 6.234 | 27.22 / 62.13 | 25.07 / 64.32 | 75 |
+
+The host's own load dominates these rounds (A's newcomer p50 went from 0.78 to 5.5 ms between rounds 1 and 2): even
+at load, best wall 6.992 s (A) against 4.495 s (B); idle about even.
+
+**Pass 3** (17:34–17:39, load 11.5 at the start, 20.8 at the end): B fixed, idle, seven rounds, the build's own turns
+read too (`push.build.turns`, both sides).
+
+| round | A wall s | B wall s | A build turns | B build turns | A newcomer p99 / max ms | B newcomer p99 / max ms | A / B provision p99 µs |
+|---|---|---|---|---|---|---|---|
+| 1 | 7.864 | 7.195 | 370,207 | 89,140 | 2.81 / 12.52 | 3.07 / 15.11 | 197.9 / 173.5 |
+| 2 | 8.704 | 7.061 | 371,069 | 62,828 | 2.41 / 12.89 | 2.21 / 13.62 | 176.4 / 183.5 |
+| 3 | 9.869 | 6.011 | 371,480 | 22,643 | 2.29 / 13.12 | 2.53 / 11.51 | 173.0 / 188.1 |
+| 4 | 9.204 | 6.648 | 371,456 | 18,682 | 2.22 / 34.41 | 5.28 / 20.23 | 165.7 / 176.4 |
+| 5 | 8.888 | 8.056 | 371,345 | 128,776 | 2.51 / 29.34 | 1.99 / 12.70 | 173.0 / 172.3 |
+| 6 | 9.948 | 9.549 | 370,669 | 118,865 | 2.54 / 12.85 | 2.76 / 12.06 | 191.3 / 183.0 |
+| 7 | 10.766 | 12.255 | 370,951 | 369,786 | 2.80 / 14.27 | 2.10 / 15.74 | 200.8 / 265.2 |
+
+- **What it says.** The build's turns fall 3 to 20 times in six rounds of seven, and the wall with them: best 7.864 s
+  (A) against 6.011 s (B), median 9.204 against 7.195 s. Newcomers hold: p99 median 2.51 ms (A) against 2.53 ms (B), max
+  median 13.12 against 13.62 ms. Provisioning holds (R9's row, median 176.4 against 183.0 µs; both above the 50 µs
+  floor on this loaded host, A as much as B). Kept: B.
+- **Owed.** In round 7 every one of B's turns yielded at its first ask (369,778 of 369,786), so it gained nothing: some
+  task on those shards was ready at nearly every quantum. Which one, and whether it is a real waiter or a task that
+  yields for its own sake, is the next measure (GAPS, A-783). The longest-step column is the shard's since its start,
+  the boot's on both sides, so it is not in the tables; the poll histograms put p999 at 0.5 to 2 ms on both.
+- **Not this change's.** `provision_bench`'s 8-client form hung on both sides (pass 1 and its own timing run): one
+  client waits in `Client::round_trip` for a reply that never comes, every shard parked in `kevent`, the main thread
+  joining it (reported to main with both stacks).

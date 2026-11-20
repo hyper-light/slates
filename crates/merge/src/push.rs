@@ -441,6 +441,19 @@ enum Stage {
   Done,
 }
 
+impl Stage {
+  /// The unit kind a unit of this stage is, for its cost estimate (A-783, `crate::pace::KINDS`).
+  fn kind(&self) -> usize {
+    match self {
+      Stage::Begin | Stage::Walk(_) => crate::pace::WALK,
+      Stage::Named { .. } | Stage::Entries { .. } | Stage::Copies { .. } => crate::pace::BASE,
+      Stage::Compose { .. } => crate::pace::COMPOSE,
+      Stage::Post(_) => crate::pace::POST,
+      Stage::Identity(_) | Stage::Done => crate::pace::HASH,
+    }
+  }
+}
+
 impl Building {
   /// A build of `push` within `room` bytes, each turn under `pace`.
   pub fn new(push: &Push<'_>, room: u64, pace: Pace) -> Building {
@@ -485,7 +498,7 @@ impl Building {
       // So a turn whose budget is shorter than one unit still runs one unit of the composition (its first tick takes
       // the turn's first unit), and the build always moves.
       let composing = matches!(self.stage, Stage::Compose { .. });
-      if !composing && !self.pace.more() {
+      if !composing && !self.pace.more(self.stage.kind()) {
         return None;
       }
       match self.unit(green, objects) {

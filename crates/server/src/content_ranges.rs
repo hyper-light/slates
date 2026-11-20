@@ -417,6 +417,27 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
   for (name, count) in state.push_turns.rows() {
     rows.push((name.to_owned(), count));
   }
+  // The runtime's own counters, the shard's since its start: steps, polls, polls past their allowance, the longest
+  // poll, and polls by length (A-783; `crates/cli/bench/pacing_ab.py` reads them before and after its pushes).
+  if let Some(counters) = slates_rt::registry::with_current(|context| context.counters()) {
+    for (name, count) in [
+      ("rt.steps", counters.steps),
+      ("rt.polls", counters.polls),
+      ("rt.long_steps", counters.long_steps),
+      ("rt.preempted_steps", counters.preempted_steps),
+      ("rt.unattributed_steps", counters.unattributed_steps),
+      ("rt.longest_step_ns", counters.longest_step_ns),
+      ("rt.waiting_asked", counters.waiting_asked),
+      ("rt.waiting_found", counters.waiting_found),
+    ] {
+      rows.push((name.to_owned(), count));
+    }
+    for (bucket, count) in counters.poll_log2.iter().enumerate() {
+      if *count > 0 {
+        rows.push((format!("rt.poll_log2.{bucket}"), *count));
+      }
+    }
+  }
   rows
     .into_iter()
     .map(|(kind, count)| RefusalCount { kind, count })

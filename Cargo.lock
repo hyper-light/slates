@@ -1682,6 +1682,7 @@ dependencies = [
  "sha1-checked",
  "slates-http",
  "slates-merge",
+ "slates-pace",
  "slates-test-seeds",
  "slates-vcs",
 ]
@@ -1823,8 +1824,13 @@ dependencies = [
  "proptest",
  "shuttle",
  "slates-merge",
+ "slates-pace",
  "slates-test-seeds",
 ]
+
+[[package]]
+name = "slates-pace"
+version = "0.1.0"
 
 [[package]]
 name = "slates-rt"
@@ -1902,6 +1908,7 @@ dependencies = [
  "slates-machine",
  "slates-mem",
  "slates-merge",
+ "slates-pace",
  "slates-rt",
  "slates-seal",
  "slates-ssh",

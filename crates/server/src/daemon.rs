@@ -5920,6 +5920,9 @@ async fn serve_loop() {
   #[cfg(windows)]
   let _end_winfsp_mounts = EndWinFspMounts;
   let _end_streams = EndStreams;
+  // A-783: a paced step on this shard may go on past its quantum while no one waits, to the watchdog's look: a step
+  // that ends within a look leaves every look a step to see, so no stuck verdict comes of it.
+  futures::set_step_ceiling_ns(HEARTBEAT_NS);
   if let Some(task) = futures::current_task() {
     let _ =
       registry::with_current(|ctx| ctx.register_poller(task, Box::new(state::any_ring_ready)));

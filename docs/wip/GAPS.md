@@ -23622,3 +23622,13 @@ runs on the box at load average 74 to 93, and never alone.
   (A-63), and the successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
   Through a FUSE mount kept across a `SIGKILL`, the file the kernel let go is freed (diag-slabs-37, run 42483804268, the
   CLI flow 93); with the logging taken out its 1,048,576 bytes stay referenced (diag-slabs-38, run 42483804055). Record: `docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`.
+
+> **A-783 (2026-11-20, w-engine; main's pacing call):** paced work yields at the quantum only when someone waits
+> (`slates-pace`, `slates_rt::futures::others_waiting`, ceiling = the watchdog's look); the push build runs on it. The
+> A/B (BENCHMARKS "Paced work yields only when someone waits"): the build's turns 3 to 20 times fewer in six rounds of
+> seven, wall best 7.864 against 6.011 s, newcomers and provisioning held; it found the probe blind to the rest of a
+> step's batch, fixed in the same change. OWED: (1) git's answer and admission paths (w-git), Mercurial's (w-hg) and
+> Subversion's landings (w-svn) move onto the primitive; (2) in one round of seven every build turn yielded at its first
+> ask (369,778 of 369,786): find which task is ready at nearly every quantum on a push's shard, and whether it waits or
+> only yields for its own sake; (3) the A/B again on a quiet machine (this one ran beside other agents' work, load 5 to
+> 45).

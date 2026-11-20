@@ -1503,6 +1503,11 @@ fn every_push_is_the_oracles_work_and_leaves_the_client_where_it_is() {
 /// A test clock: each read a nanosecond later.
 static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether anyone waits: always, in a build in turns.
+fn someone_waits() -> bool {
+  true
+}
+
 /// [`NOW`], read.
 fn now() -> u64 {
   NOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1522,12 +1527,20 @@ fn built_in_turns(
     turns += 1;
     // The clock is read once a unit after the turn's first: a deadline `units` reads on.
     // Units of a few bytes too, so a unit's copy and hash slices are held to the one-call build.
-    let now = NOW.load(std::sync::atomic::Ordering::Relaxed);
+    let at = NOW.load(std::sync::atomic::Ordering::Relaxed);
     let slices = crate::pace::Slices {
       copy_bytes: 7,
       hash_bytes: 5,
     };
-    building.pace().turn_from(now, (now + units, slices));
+    // Someone always waits, so each turn yields at its quantum of `units` reads.
+    let env = slates_pace::Env {
+      clock: now,
+      waiting: someone_waits,
+      quantum_ns: units,
+      ceiling_ns: units,
+      target_ppm: 1,
+    };
+    building.pace().turn_from(at, (env, slices));
     if let Some(built) = building.advance(green, store) {
       return (built, turns);
     }
