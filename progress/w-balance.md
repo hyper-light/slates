@@ -184,3 +184,9 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   HOME_STREAM=30, admits). c77324051 serve_remote + fleet.rs dispatch arm; acks only after published() (Unanswered
   until A-727 a3 calls image_begun/image_published).
 - NEXT: P6 sender + healer loop (6c-3); 9b; record v3 after a3.
+- Cleared target incremental (9.5 GB); target 27 GB; Studio-2 53 GB free.
+- 9f57e4810 LANDED P6 healer: keep_for_region/let_go_for_region (idempotent), heal_region from follow_configuration
+  (pass only per new config version, turn per period within round budget), fleet:: 33/33.
+- 1b449bcc9 LANDED flake fix: homes tests recv() not recv_timeout; region publish sequenced; 20/20 under 4 burners.
+  NOTE: I used `pkill -x yes` to stop my burners (matches any yes process; prefer PIDs next time).
+- NEXT: 9b. Record v3 switch after A-727 a3.
