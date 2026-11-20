@@ -462,11 +462,15 @@ fn replay_connection(
             ..sources(&view)
           };
           let mut draw = || drawn;
-          let judged = connection.lock_verb(&given, &mut draw, ROOM, &mut out);
-          judged.unwrap().unwrap()
+          let call = connection.lock_verb(&given, &mut out).unwrap().unwrap();
+          let verdicts = call.paths.iter().map(|_| Ok(None)).collect();
+          connection
+            .lock_judged(&given, verdicts, &mut draw, ROOM)
+            .unwrap()
         };
         replay.records.apply_lock_entries(&entries).unwrap();
         connection.locks_landed(Ok(()), &mut out).unwrap();
+        connection.locks_finished(Ok(()), &mut out).unwrap();
       }
       other => panic!("{name}: {other:?}"),
     }

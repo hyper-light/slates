@@ -58,6 +58,7 @@ pub mod classify;
 pub mod commit;
 pub mod held;
 pub mod intake;
+pub mod made;
 pub mod reply;
 pub mod tree;
 pub mod verify;

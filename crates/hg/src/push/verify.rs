@@ -125,6 +125,45 @@ pub struct Verified {
 }
 
 impl Verified {
+  /// What `changesets`, `manifests` and `files` bring, nothing held (A-731: the revisions the server makes of a
+  /// submitted version), each found by its node.
+  pub fn of(
+    changesets: Vec<Arrived>,
+    manifests: Vec<Arrived>,
+    files: Vec<(Vec<u8>, Vec<Arrived>)>,
+  ) -> Self {
+    let changeset_at = changesets
+      .iter()
+      .enumerate()
+      .map(|(at, arrived)| (arrived.node, at))
+      .collect();
+    let manifest_at = manifests
+      .iter()
+      .enumerate()
+      .map(|(at, arrived)| (arrived.node, at))
+      .collect();
+    let file_at = files
+      .iter()
+      .enumerate()
+      .flat_map(|(log, (path, revisions))| {
+        revisions
+          .iter()
+          .enumerate()
+          .map(move |(at, arrived)| ((path.clone(), arrived.node), (log, at)))
+      })
+      .collect();
+    Verified {
+      changesets,
+      manifests,
+      files,
+      passed_over: 0,
+      held_changesets: Vec::new(),
+      changeset_at,
+      manifest_at,
+      file_at,
+    }
+  }
+
   /// The new changeset `node`, if the push brought it.
   pub fn changeset(&self, node: &Node) -> Option<&Arrived> {
     self.changesets.get(*self.changeset_at.get(node)?)

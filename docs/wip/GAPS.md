@@ -58,8 +58,10 @@
 > commit; a register entry's objects reach no holder yet, A-636); a branch `CreateBranch` makes named by a ref from its
 > creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
-> push's, a green's first submit's, past a copy) and a whole map's release sliced a unit at a time, and the build of
-> the put files in slices of its own (a recovery's remake puts the files a unit each, BUILT 2026-11-20); a branch's first
+> push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
+> until it ends; a green's first submit's and one past a copy owed, with the owed commit main approved) and a whole
+> map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
+> the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
@@ -110,6 +112,13 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
+> repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
+> `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
+> branch): kept in an index fork and recorded as a push's are (`Source::Made`, the green's key and the version beside
+> the revisions) in the submit's own transaction; a line's or bookmark's head is the made changeset while its version
+> is the green's head, else the one a push named (`hg_made::head_of`), and a recovery puts the made node back from the
+> record. Owed: copies as file revisions naming their source; merges' second parents; the holders' changesets.
 > **A-720 (2026-11-20, w-hg; main's ruling after w-perf's 57,036-changeset push tripped the watchdog: a push's working
 > set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
 > push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
@@ -749,8 +758,14 @@
 > driver, held to the hook's learned bound, ended if the client hangs up, the lesson taught to the shard's hook times;
 > where it refused any commit to a repository with a hook configured ("does not run this repository's hooks yet").
 > REPOS is `/<name>` until A-645's read-only FSFS-layout view gives `svnlook` a directory. Windows keeps the refusal
-> (no driver there). Owed: the lock and unlock hooks (part 2), `svn+ssh://` (part 3), the revprop hooks' calls (A-702
-> part 2, w-svn, on this runner), DAV's.
+> (no driver there). **Part 2 (same day):** the lock verbs run pre-lock or pre-unlock for each writable path before it
+> is judged (a refusal that path's answer in `check_hook_result`'s words; pre-lock's standard output the lock's token)
+> and post-lock or post-unlock once over the paths changed after their answers, its failure after `done`, the locks
+> standing (`fs-wrap.c`); `slates_svn::serve`'s lock verb is four calls now (`lock_verb`, `lock_judged`, `locks_landed`,
+> `locks_finished`). **Part 3 (same day):** the `svn+ssh://` tunnel runs the same hooks through the same runner
+> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). Owed: the tunnel's signal of its client
+> gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); the revprop hooks'
+> calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
