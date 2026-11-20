@@ -7136,6 +7136,13 @@
 >   run is slower than a plain one (fsx 8.5 s to 164.5 s on the Studio, with 407 whole states shipped past the live
 >   credit, `refused.no_credit` 411; 6 to 27 s to 62 to 82 s on Linux arm64), which is AC-8.9's credit and live-write
 >   latency's to cut (g230, g076b). Windows remains as recorded above.
+> - **Linux over the daemon's own FUSE mount conforms too (2026-11-20, goal 226).** The `native-linux-fuse` lane no longer
+>   reaches its volume through the NFS adapter for fsx, fsstress and pjdfstest: the first two run over `slates mount`,
+>   unprivileged, and pjdfstest as root over `slates mount --shared`. Diagnostics run 44731860624 (`ubuntu-latest`,
+>   Ubuntu 26.04.1, load 1 to 3.3): fsx 10,000 operations and fsstress 4 × 500 passed plain and live, pjdfstest 8,770 of
+>   8,798 cases passed both ways (0 failed, 28 todo), `compare` 0 differing, every live log durable and held. The two NFS
+>   limits the lane's pjdfstest list held pass over FUSE, so the list is empty. Commands and counts:
+>   `docs/wip/conformance.md` (the live-shipped pair).
 
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
