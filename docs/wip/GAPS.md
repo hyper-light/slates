@@ -1919,7 +1919,13 @@
 > new volume holding `DUMP_FILE`, walked twice a revision a unit (measured, then written a copy slice at a time, both
 > hashed, a differing second walk refused), the caller landing the volume under a grant; landed by w-svn from g268's
 > work, with a fix found by its own test: two exports side by side minted one volume id at their walks' end, the
-> second refused `AlreadyExists` at its record, so the id is minted in the publishing atom now. **Owed, measured
+> second refused `AlreadyExists` at its record, so the id is minted in the publishing atom now. The sibling sweep (main,
+> same day): every id minted before the record that holds it could repeat, since `verbs::fresh_volume_id_at` named
+> the database's next sequence unreserved: an image's identity at its plan, an archive export's and an archive
+> import's volume at admission, a name alias's. Each mint is now the shard's alone (`ShardState::volume_ids_minted`,
+> held to the counter's bound); held by `image::tests::two_imports_admitted_side_by_side_mint_distinct_volume_ids`
+> (red: one id twice). Minting inside the recording transaction was not the structural form: an image's identity
+> holds its id before its volume is recorded. **Owed, measured
 > 2026-11-20 (debug, this MacBook):** a unit is one revision whole, the exporter writing a revision or nothing
 > (`migration::export`), so a revision's texts are staged whole and its unit is unbounded: against a 14 µs copy-slice
 > budget, a 195-byte revision took 60 µs and one with a 107 KB text 2.4 ms, `image.units_past_budget` 87 over the
@@ -1944,7 +1950,10 @@
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). A-586 (2026-11-19, g295): the engine's `Copy` (`OpKind` 16), built: recorded once at its
 > destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
-> key, the identity one entry a copy, hard links refused by kind, the root a source and never a destination, a branch
+> key, the identity one entry a copy, hard links refused by kind (BUILT 2026-11-20, w-shared, main's ruling: a copied
+> tree's links share the copy's nodes, a link naming a node outside it gets a node of its own, `Green::copy_link_effects`;
+> refused only where that outside node changed after the copy's version, still as `TypeChanged`, owed its own typed
+> refusal), the root a source and never a destination, a branch
 > made before a copy cutting it, a review comment on a copied file moving with it (A-596); held to a reference green
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain
