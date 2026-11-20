@@ -72,8 +72,8 @@ impl core::fmt::Debug for GitReplay {
 enum Stage {
   /// The push sealed and staged a unit at a time, once every object is in and the names compared.
   Sealing {
-    /// The seal and stage under way.
-    staging: slates_git::store::Staging,
+    /// The seal and stage under way (boxed: it is most of the stage's size).
+    staging: Box<slates_git::store::Staging>,
   },
   /// The pack read a chunk at a time.
   Reading {
@@ -246,7 +246,12 @@ impl GitReplay {
             .repository
             .sealing(content, &mut self.push)
             .map_err(|refused| ReplayRefused::Git(GitRefused::Store(refused)))?;
-          (Stage::Sealing { staging }, false)
+          (
+            Stage::Sealing {
+              staging: Box::new(staging),
+            },
+            false,
+          )
         }
       },
       Stage::Sealing { mut staging } => {

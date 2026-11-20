@@ -583,7 +583,7 @@ impl<P> ReceivePack<P> {
         }));
         return Ok(Sealed::Turned);
       }
-      Ok(SealTurn::Sealed(sealed)) => sealed,
+      Ok(SealTurn::Sealed(sealed)) => *sealed,
       Err(refused) => return Ok(Sealed::Declined(Declining::unadmitted(&refused))),
     };
     #[cfg(unix)]
@@ -872,8 +872,8 @@ impl<P> Drop for ReceivePack<P> {
     // A push dropped while its seal or its decision is under way gives back its sealing push or its sealed push
     // (A-722 part 4); one dropped mid-hooks gives back what its hooks hold.
     let held = match answer {
-      AnswerState::Sealing(sealing) => Some(Held::Sealing(sealing.sealing)),
-      AnswerState::Deciding(decision) => Some(Held::Sealed(decision.sealed)),
+      AnswerState::Sealing(sealing) => Some(Held::Sealing(Box::new(sealing.sealing))),
+      AnswerState::Deciding(decision) => Some(Held::Sealed(Box::new(decision.sealed))),
       #[cfg(unix)]
       other => {
         hooks::dropped(other);
@@ -899,10 +899,10 @@ impl<P> Drop for ReceivePack<P> {
 
 /// What a push dropped mid-answer still holds of the shard.
 enum Held {
-  /// Its seal under way.
-  Sealing(SealingPush),
+  /// Its seal under way (boxed, as each of them: the two differ by hundreds of bytes).
+  Sealing(Box<SealingPush>),
   /// Its sealed push, its commands being decided.
-  Sealed(SealedPush),
+  Sealed(Box<SealedPush>),
 }
 
 /// `repository`'s record on this shard's partition.
@@ -1120,21 +1120,23 @@ const PHASE_END: usize = 1;
 const PHASE_CHECK: usize = 2;
 /// Format: the answer's last step (seal, hooks' views, verdicts, commit and report), one that answers `Answered`.
 const PHASE_ANSWER: usize = 3;
+/// Derived: the phases a push's steps are counted in, the last one's index and one.
+const PHASES: usize = PHASE_ANSWER + 1;
 
 /// Each phase's steps of a git push on this shard, per repository (A-724's profile: where a push holds its shard, and
 /// how long it waits between its steps): indexed by phase [input, end, check turn, answer].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PhaseSteps {
   /// The longest step of each phase, nanoseconds.
-  pub(crate) longest: [u64; 4],
+  pub(crate) longest: [u64; PHASES],
   /// Steps of each phase.
-  pub(crate) steps: [u64; 4],
+  pub(crate) steps: [u64; PHASES],
   /// The nanoseconds those steps ran.
-  pub(crate) ns: [u64; 4],
+  pub(crate) ns: [u64; PHASES],
   /// The nanoseconds from the repository's previous push step's end to each step's start, summed by the step's phase:
   /// before a check turn or an answer step, the time the push waited for its shard (it was ready); before an input step,
   /// that and the client's bytes.
-  pub(crate) gap_ns: [u64; 4],
+  pub(crate) gap_ns: [u64; PHASES],
   /// The nanoseconds from each push's beginning (its session made, `vcs_usage`'s `begun`) to its first step.
   pub(crate) first_gap_ns: u64,
   /// The shard clock at the repository's latest push step's end; zero before its first.

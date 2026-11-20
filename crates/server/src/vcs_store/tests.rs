@@ -1930,7 +1930,7 @@ fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
       turns += 1;
       match sealing.turn(state, 0).expect("a turn") {
         super::SealTurn::More(more) => sealing = *more,
-        super::SealTurn::Sealed(sealed) => break sealed,
+        super::SealTurn::Sealed(sealed) => break *sealed,
       }
     };
     let changes = vec![BranchChange::Update {
