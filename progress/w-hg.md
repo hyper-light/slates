@@ -107,3 +107,7 @@
   LANDED main (piece d8b23d0e5, merge 5a917afcd). Local hg 75/75, server 136/136 (61/61 on landed tree).
   Still one step: the landing's append of an entry as large as the record -> S5 (A-729) fixes by identity-only records.
 - NOW: S5 (A-729).
+- A-729 part 1 (manifests kept as deltas in the index; delta::encode_lines; HgIndex::revision_text) LANDED main
+  (piece 2a42df233, merge d7713a435). Local hg lib 354/354, server 137/137, cli stock_hg 4/4.
+- NEXT: (1) slice vcs_store::rebuild's replay (post-recovery spin per w-interop rerun); (2) S5 part 2 (SHGR v2:
+  names + changegroup deltas; replay re-intakes).
