@@ -50,6 +50,7 @@ pub fn stream_out(
       .saturating_add(DECIMAL_BYTES)
       .saturating_add(2)
   });
+  // Format: the first two lines: `0` and a line end; the count, a space, the total and a line end.
   let lines = DECIMAL_BYTES.saturating_mul(2).saturating_add(4);
   admission.charge(total.saturating_add(heads).saturating_add(lines))?;
   out.extend_from_slice(STREAMING);

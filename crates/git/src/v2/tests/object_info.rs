@@ -360,7 +360,7 @@ fn an_argument_out_of_its_grammar_is_refused_by_kind() {
       },
     ),
     (
-      &format!("oid {}", &blob[..39]),
+      &format!("oid {}", blob.get(..39).unwrap()),
       Refusal::ObjectId {
         at,
         refusal: HexRefusal::Length { len: 39 },

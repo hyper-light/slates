@@ -70,9 +70,10 @@ impl StoreLender for ShardStores {
     crate::state::with_state_counted(|state| lendable(state, id).is_some()).unwrap_or(false)
   }
 
-  /// Derived: this shard's arena capacity and what its pool could still lend (`Store::admittable`), as a push's room.
-  fn room(&mut self) -> Option<u64> {
-    crate::state::with_state_counted(|state| crate::git_push::push_room(state))
+  /// Derived: the room repository `id`'s works are admitted on this shard (`crate::vcs_share::room`, A-724), as a
+  /// push's.
+  fn room(&mut self, id: RepositoryId) -> Option<u64> {
+    crate::state::with_state_counted(|state| crate::vcs_share::room(state, id).bytes)
   }
 
   fn lend<R>(

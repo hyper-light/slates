@@ -86,6 +86,9 @@ const RESERVED_3: [&[u8]; 4] = [b"aux", b"con", b"prn", b"nul"];
 /// Format: Windows' reserved names of three letters before a digit 1 to 9 (`_winres4`).
 const RESERVED_4: [&[u8]; 2] = [b"com", b"lpt"];
 
+/// Format: the digits after one of [`RESERVED_4`] that make a reserved name (`_auxencode`: `b'1' <= n[3:4] <= b'9'`).
+const RESERVED_DIGITS: core::ops::RangeInclusive<u8> = b'1'..=b'9';
+
 /// Format: the lengths of those names, and where the digit or the escaped letter stands.
 const SHORT_NAME: usize = 3;
 
@@ -161,7 +164,7 @@ pub fn decode_dir(path: &[u8]) -> Vec<u8> {
 
 /// Whether 7.2 escapes `byte` as `~xx` (`_reserved`).
 fn reserved(byte: u8) -> bool {
-  byte < CONTROLS_END || byte >= FIRST_HIGH || WINDOWS_RESERVED.contains(&byte)
+  !(CONTROLS_END..FIRST_HIGH).contains(&byte) || WINDOWS_RESERVED.contains(&byte)
 }
 
 /// Appends `byte` as `~` and two lower-case hexadecimal digits.
@@ -215,7 +218,7 @@ fn windows_reserved(segment: &[u8]) -> bool {
   let digit = segment.get(SHORT_NAME).copied().unwrap_or_default();
   (name == SHORT_NAME && RESERVED_3.contains(&head))
     || (name == SHORT_NAME.saturating_add(1)
-      && (b'1'..=b'9').contains(&digit)
+      && RESERVED_DIGITS.contains(&digit)
       && RESERVED_4.contains(&head))
 }
 
@@ -826,11 +829,14 @@ mod tests {
     );
   }
 
+  /// A path, whether `dotencode` is on, and the segments 7.2 encodes it to.
+  type Encoded<'p> = (&'p [u8], bool, &'p [&'p [u8]]);
+
   /// A-630 (7.2's doctests of `_auxencode`): do encode the segments of 7.2's two examples, with and without
   /// `dotencode`, and a name ending in a period and a space. Expect 7.2's segments.
   #[test]
   fn reserved_names_are_encoded_as_7_2_encodes_them() {
-    let cases: [(&[u8], bool, &[&[u8]]); 3] = [
+    let cases: [Encoded<'_>; 3] = [
       (
         b".foo/aux.txt/txt.aux/con/prn/nul/foo.",
         true,

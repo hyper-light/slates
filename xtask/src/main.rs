@@ -348,11 +348,7 @@ fn out_of_line_cfg_test_modules(source: &str) -> impl Iterator<Item = (Option<&s
     if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
       return None;
     }
-    let declared = trimmed
-      .trim_start_matches("pub(crate) ")
-      .trim_start_matches("pub(super) ")
-      .trim_start_matches("pub ");
-    let module = declared
+    let module = without_visibility(trimmed)
       .strip_prefix("mod ")
       .and_then(|rest| rest.strip_suffix(';'))
       .map(str::trim)
@@ -362,6 +358,16 @@ fn out_of_line_cfg_test_modules(source: &str) -> impl Iterator<Item = (Option<&s
     path_attr = None;
     module
   })
+}
+
+/// An item's line without its visibility (`pub`, `pub(crate)`, `pub(super)`), so `pub(crate) mod tests {` reads as
+/// a module as `mod tests {` does (2026-11-20: `crates/server/src/hg_base.rs`'s `pub(crate) mod tests` read as
+/// production code, its fixtures as 21 tuning literals).
+fn without_visibility(line: &str) -> &str {
+  line
+    .trim_start_matches("pub(crate) ")
+    .trim_start_matches("pub(super) ")
+    .trim_start_matches("pub ")
 }
 
 /// Splits a source file into lines, marking the ones inside a `#[cfg(test)]` module.
@@ -378,7 +384,7 @@ fn lines_with_test_flag(source: &str) -> Vec<(usize, &str, bool)> {
     let trimmed = line.trim_start();
     if trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
       armed = true;
-    } else if armed && trimmed.starts_with("mod ") {
+    } else if armed && without_visibility(trimmed).starts_with("mod ") {
       in_test = true;
       armed = false;
       depth = 0;
@@ -1066,7 +1072,20 @@ mod structural {
 
   #[cfg(test)]
   mod out_of_line_test_modules {
-    use crate::{declared_by_path_under_cfg_test, declared_under_cfg_test};
+    use crate::{declared_by_path_under_cfg_test, declared_under_cfg_test, lines_with_test_flag};
+
+    /// 2026-11-20 (R3). Do: mark the lines of an inline test module declared with a visibility, then a production item
+    /// after it. Expect: the module's lines are test code and the item's are not.
+    #[test]
+    fn an_inline_test_module_with_a_visibility_is_test_code() {
+      let source =
+        "#[cfg(test)]\npub(crate) mod tests {\n  const N: u32 = 9;\n}\nconst M: u32 = 9;\n";
+      let flags: Vec<bool> = lines_with_test_flag(source)
+        .into_iter()
+        .map(|(_, _, in_test)| in_test)
+        .collect();
+      assert_eq!(flags, vec![false, true, true, true, false]);
+    }
 
     /// 2026-11-20 (R3). Do: read declaring files that put a module under `#[cfg(test)]` with a `#[path]` naming a file,
     /// before or after the `cfg`, and files whose `#[path]` module is not under `cfg(test)` or names another file.
@@ -1479,6 +1498,12 @@ mod literals {
       let tuple_field = i > 1
         && bytes[i - 1] == b'.'
         && (bytes[i - 2].is_ascii_alphanumeric() || matches!(bytes[i - 2], b'_' | b')' | b']'));
+      // A character literal's digit (`b'9'`, `'3'`) is a character, never a quantity.
+      let char_literal = i > 0 && bytes[i - 1] == b'\'' && bytes.get(i + 1) == Some(&b'\'');
+      if c.is_ascii_digit() && char_literal {
+        i += 1;
+        continue;
+      }
       if c.is_ascii_digit() && tuple_field {
         while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
           i += 1;
@@ -1569,6 +1594,7 @@ mod literals {
     #[test]
     fn a_tuple_fields_index_is_a_position_not_a_literal() {
       assert!(numeric_literals("top.3 = true; pair.0.1; f().4; v[i].5").is_empty());
+      assert!(numeric_literals("b'0'..=b'9' => d, '3' => t").is_empty());
       assert_eq!(
         numeric_literals("let r = 0..7; let x = 3.5;"),
         vec!["0", "7", "3.5"]

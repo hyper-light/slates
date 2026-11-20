@@ -80,7 +80,8 @@
 > **A-724 piece 1 (2026-11-20, w-balance; many repositories balanced by learned usage, §4.17.5).** BUILT: each
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
-> demands and weights read from the rows (2), admission by share (3), the cold trigger (4), intake off the owner and
+> one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
+> Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
 > **A-719 part 2 (2026-11-20, w-git).** BUILT: the pack reader's keeper seam (`unpack::Keep`): each object handed to its
@@ -1920,6 +1921,11 @@
 > answered as `svnserve` answers them: stock `svn`'s recorded `lock-bob` and `lock-a` sessions byte for byte. macOS
 > arm64, this Mac, local: slates-svn 239 of 239, server `vcs_svn::` `vcs_ssh::svn::` `repository::svn_commit::`.
 > Owed: the pre-lock and post-lock hooks; a lock's expiry set by a client (ra_svn names none).
+> A-702 part 1, 2026-11-19 (w-svn): `change-rev-prop` and `change-rev-prop2` answered as `svnserve` answers a
+> repository with no pre-revprop-change hook (165006), after its checks in its order (the previous-value refusal,
+> write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
+> revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
+> its `Record::RevisionProperties` through the owner's step, post-revprop-change.
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:

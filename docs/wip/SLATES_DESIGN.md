@@ -15310,6 +15310,11 @@ and export by landing).
 > (`slates_svn::serve::locks`), their entries landed through the owner's step as a `Record::Locks`, then answered as
 > `svnserve` answers them, over `svn://` and `svn+ssh://`. Owed: the pre-lock and post-lock hooks.
 >
+> **Status (2026-11-19, A-702 part 1).** `change-rev-prop` and `change-rev-prop2` are answered as `svnserve` answers a
+> repository with no pre-revprop-change hook ("Repository has not been enabled to accept revision propchanges",
+> 165006), after its checks in its order (`slates_svn::serve::revprops`). The change itself waits on ra_svn running a
+> repository's hooks.
+>
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
 > token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's
@@ -15938,9 +15943,20 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > **Status (2026-11-20, A-724 piece 1).** Designed below; piece 1 built: each repository's usage counted on its owner
 > shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
 > order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
-> dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3), the cold trigger (4), intake off the owner
+> dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3; its room built, below), the cold trigger (4), intake off the owner
 > shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
 > amends §4.10's content placement), and the many-repository load proof (7).
+
+> **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
+> the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
+> push. It replaces A-704's `git_push::push_room`. A repository alone in taking new room gets all the shard can admit
+> (the fast path, counted `vcs_share.fast`); while others have intakes under way (each push counted live by a guard
+> until it drops), the contested room (what the shard can admit plus what those repositories hold) is divided by
+> `share::divide`, the asker claiming all of it and each other claiming what it holds plus its answered intakes' mean
+> bytes for each intake under way, and the asker's room is its grant less what it holds (`vcs_share.narrowed` when it
+> binds). Owed: A-722's reservation checking this room and its typed refusal carrying the bound, with git's, Mercurial's
+> and Subversion's words for a share (the seam proposed to w-git); Mercurial's and Subversion's intakes counted live;
+> backpressure before refusal; a fetch's room as a claim of its own.
 
 **Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
 several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
@@ -54453,6 +54469,14 @@ Applied in the same change to:
   the paper's own 9-CPU, 18-GB example; a monorepo beside a toy; degenerate claims never not-a-number). The oracle's
   first runs found a resource with no room left that the remaining claims never use stopping them at level zero, fixed.
   Owed: the demands read from the usage rows and the weights learned (piece 2's other half), feeding admission (3).
+- **Piece 3a, one room (2026-11-20).** `crate::vcs_share::room` replaces `git_push::push_room` at every caller (git's
+  push, git's fetch over HTTP and SSH through `StoreLender::room`, which now names the repository, and Mercurial's
+  `HgStores::push_room`); a `vcs_share::Live` guard counts a push live from `ReceivePack::start` until it drops. Tests:
+  `slates-server` `vcs_share::tests` (alone: all the shard admits by the fast path; beside a monorepo with no history:
+  an equal half, bound by the share; once the monorepo's intakes are known small: all but that; a real push live from
+  its start to its drop), with `git_push::` and `vcs_store::upload::` 16 of 16 and `vcs_http::git:: vcs_http::hg
+  vcs_ssh::` 84 of 85; the one failure, `vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it`
+  ("a step that waits"), fails alike on main b0655e8a3 and is reported.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
