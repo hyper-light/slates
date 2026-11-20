@@ -7315,9 +7315,11 @@
 >   their stock clients' `exit_within` keeps `PATIENCE`, owed: a client waiting on a stock server has no slates tree to
 >   judge beside it. `load_scale` since 2026-11-20: its `eventually` and its wait for an anchor's daemon judged the
 >   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
->   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `vm`, `start_judgment`
->   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
->   are not listed yet), `winfsp`, `live_winfsp` and `winfsp_semantics`
+>   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `winfsp` (Windows-only, ~45 call sites; its own pass), with
+>   `recovered::await_recovered`'s wall form; `start_judgment`, `shards`, `winfsp_semantics` and `live_winfsp` since
+>   2026-11-20, judged on Windows by the anchor's process or the daemon's (the pid its `status` names), since Windows
+>   lists no instance's processes by command line and a tree's children are not listed there; `start_judgment`'s
+>   replacement bound and `winfsp_semantics`' wedge bound (`within_wait`) kept as what those tests prove
 >   (`recovered::await_recovered`'s wall form goes with `winfsp`, which runs only on Windows); the VM harness `vm` and
 >   its suites (`guest_dax`, `guest_image`, `guest_vhost`) since 2026-11-20: the guest's boot, replies, console lines
 >   and power-off waited for while the VM's process tree gains CPU (`process_wait::Judged`; `BOOT_WAIT`, `REPLY_WAIT` and
