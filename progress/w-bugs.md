@@ -187,3 +187,8 @@
   checkout + update across 500 revs over svn:// and DAV), instrumented (diag-only) with per-conversation shard
   long_steps/longest_step_ns, the most bytes a turn wrote vs the room. Worktree ~/slates-work/w-bugs-svn (branch has
   the diag commit; a real change starts fresh from origin/main). Inbox note left for w-svn.
+- svn fetch run 4 (macos-latest; Linux names no issuer surface so no token): checkout svn:// 4.97 s, DAV 5.88 s, update
+  across 500 revs 2.0 / 2.03 s (4,872 files, 1,000 revs). FOUND: DAV report runs write up to 410,243 B against a room
+  of 278,528 (1.47x) -- the room does not bound a slice. Quantum on CI mac 3.95 us; lifetime longest_step 1.04 s (the
+  import). svn:// bytes were measured after step() clears out -- wrong place. Run 5 measures each slice's own time and
+  bytes (svn:// answer(), DAV report.resume()).
