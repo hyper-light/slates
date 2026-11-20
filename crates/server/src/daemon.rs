@@ -4849,10 +4849,6 @@ async fn init_shard(
     purge_seen_allocations: 0,
     content_sweep: crate::content_ranges::Sweep::default(),
     push_turns: crate::git_push::PushTurns::default(),
-    burst_seen: None,
-    last_burst: 0,
-    burst_closed_ns: 0,
-    refill_settled: None,
     give_back_rate: GiveBackRate::default(),
     content_range,
     delta_range: delta_range(config, partition, content_range),
@@ -5180,7 +5176,6 @@ async fn init_shard(
   }
   slices.unit_done().await;
   rebuild_and_report(&mut state, shard, &mut slices).await;
-  start_burst_measure(&mut state);
   #[cfg(windows)]
   crate::anchor_hold::install(
     windows_channel,
@@ -5188,7 +5183,6 @@ async fn init_shard(
   )
   .map_err(crate::anchor_hold::HoldRefusal::into_server)?;
   state::install(state);
-  register_idle_refill(shard);
   // The FUSE mounts whose devices the anchor held, served again (A-61); then the dead ones of a killed
   // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
   #[cfg(target_os = "linux")]
@@ -5564,11 +5558,10 @@ fn return_dead_recovery_timed(
 /// stops costing RAM for what it no longer holds. Before 2026-10-06 nothing ever went back: a deleted 128 MiB file left
 /// the content object at 168 MiB allocated.
 ///
-/// Except its reserve (A-214): the free blocks the next allocations of a chunk window would take, as many bytes as the
-/// shard's last write burst grew its content by ([`prefault_reserve`]). The purge keeps them, and once it is done the
-/// refill faults in those of them not resident, a slice of `quantum / page_fault_ns` pages at a time, so a burst after
-/// idle writes onto resident pages: a large write over fresh pages spent 41.5% of the shard faulting them in (CI run
-/// 41986870989). The work stops as soon as a request makes the shard allocate.
+/// Every free block goes back; nothing is kept pre-faulted (w-sizing, MEMORY SIZING; A-214's reserve removed). A-214 kept
+/// the last write burst's worth of free pages resident and faulted them back in at idle, so one large push left its whole
+/// burst resident behind it (w-hg's release run after hg's history push: 4,931.4 MiB, and 3.5 GB more faulted at idle).
+/// Measured against none: BENCHMARKS, "The idle prefault reserve, measured against none".
 async fn purge_if_idle() -> bool {
   loop {
     let step = state::with_state(|s| {
@@ -5580,18 +5573,12 @@ async fn purge_if_idle() -> bool {
         return None;
       }
       s.count(TICKS_IDLE, 1);
-      note_burst(s, allocations);
-      let keep = prefault_reserve(s);
       let slice_blocks = usize::try_from(s.config.archive_slice_bytes())
         .unwrap_or(usize::MAX)
         .checked_div(s.config.discard_from_bytes.max(1))
         .unwrap_or(0)
         .max(1);
-      let purged = s
-        .store
-        .content
-        .arena_mut()
-        .purge_keeping(slice_blocks, &keep);
+      let purged = s.store.content.arena_mut().purge(slice_blocks);
       let (log, recovery_left) = if purged.more {
         (0, false)
       } else {
@@ -5601,25 +5588,13 @@ async fn purge_if_idle() -> bool {
       };
       let bytes = purged.bytes.saturating_add(log);
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
-      // The give-backs' slices come before the reserve's refill (A-226 after A-214): while any is left, the next turn
-      // gives back another.
-      if purged.more || recovery_left {
-        return Some((true, true));
-      }
-      let pages = s.config.prefault_slice_pages();
-      let refilled = s.store.content.arena_mut().prefault(&keep, pages);
-      s.count(
-        CONTENT_PREFAULTED,
-        u64::try_from(refilled.bytes).unwrap_or(u64::MAX),
-      );
-      // A reserve still held decays at the coming passes, so the shard is not settled while it holds one.
-      Some((refilled.more, keep.is_empty()))
+      // While any give-back is left, the next turn gives back another (A-226).
+      Some(purged.more || recovery_left)
     })
     .flatten();
-    if step.is_none_or(|(more, _)| !more) {
-      // Settled once a step found the shard idle, left nothing and holds no reserve that is still to decay; a busy
-      // shard owes the next pass, and so does one whose reserve the next passes shrink.
-      return step.is_some_and(|(_, reserve_gone)| reserve_gone);
+    if step != Some(true) {
+      // Settled once a step found the shard idle and left nothing; a busy shard owes the next pass.
+      return step == Some(false);
     }
     // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
     // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
@@ -5648,137 +5623,8 @@ pub const TICKS_SEALING: &str = "content.ticks.sealing";
 pub const TICKS_DEFERRED: &str = "content.ticks.deferred";
 /// Counter: purge steps that found the arena had allocated since the previous sweep pass (A-105).
 pub const TICKS_BUSY: &str = "content.ticks.busy";
-/// Counter: purge steps that found the shard idle: the purge ran, and the reserve's refill (A-105, A-214).
+/// Counter: purge steps that found the shard idle, so the purge ran (A-105).
 pub const TICKS_IDLE: &str = "content.ticks.idle";
-
-/// Counter: free content bytes an idle shard faulted in for its reserve (A-214), the refill's non-vacuity count.
-pub const CONTENT_PREFAULTED: &str = "content.prefaulted_bytes";
-
-/// Ends a busy period at an idle sweep pass (A-214): when the arena allocated or freed since the last idle pass, the
-/// period's net change of allocated bytes decides the reserve. A period that grew the content is the last write burst,
-/// its net growth; one that shrank it takes what it freed off the burst, so a written file deleted later takes its
-/// reserve with it. Before 2026-11-05 a period ended only when the allocation count moved, which a free does not move:
-/// a delete-only period left the reserve the written file's size, and it kept the deleted file's own pages resident
-/// (A-205's give-back test on both Windows lanes, main CI 42119714654;
-/// `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it`). The measure starts when the shard has
-/// recovered (`init_shard`); without one, the first idle tick only takes it.
-fn note_burst(s: &mut ShardState, allocations: u64) {
-  let allocated = s.store.content.arena().allocated_bytes();
-  match s.burst_seen {
-    Some((seen, before)) if seen == allocations && before == allocated => {}
-    Some((_, before)) => {
-      s.last_burst = if allocated >= before {
-        allocated.saturating_sub(before)
-      } else {
-        s.last_burst
-          .saturating_sub(before.saturating_sub(allocated))
-      };
-      s.burst_seen = Some((allocations, allocated));
-      s.burst_closed_ns = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
-      s.refill_settled = None;
-    }
-    None => s.burst_seen = Some((allocations, allocated)),
-  }
-}
-
-/// Starts the burst measure from the content the shard holds once recovered (A-214): what a restart adopted is not a
-/// write burst, and a write made before the first idle tick is.
-fn start_burst_measure(state: &mut ShardState) {
-  state.burst_seen = Some((
-    state.store.content.arena().allocations(),
-    state.store.content.arena().allocated_bytes(),
-  ));
-}
-
-/// Registers the reserve's refill as shard `shard`'s idle work (A-214). Refused, it still refills at each idle reap
-/// tick, and says so.
-fn register_idle_refill(shard: u16) {
-  if let Some(Err(refusal)) =
-    registry::with_current(|ctx| ctx.set_idle_work(Box::new(refill_slice)))
-  {
-    slates_machine::log_line!(
-      "slates-server: shard {shard}: the reserve's idle refill was refused ({refusal}); it refills at idle sweep passes only"
-    );
-  }
-}
-
-/// The shard's idle work (A-214, registered with the runtime at the shard's start): one slice of its reserve's refill,
-/// `quantum / page_fault_ns` pages, whenever the shard has nothing else to do and its idle spin has run out, so a
-/// burst's pages are faulted in the moment the shard goes quiet rather than at the next idle sweep pass, which the incumbent
-/// harness's second-long pauses never reached (A-105's test needs a whole quiet tick). Whether it faulted anything or
-/// has more to fault; once it finds nothing it stays quiet until the arena allocates again.
-fn refill_slice() -> bool {
-  state::with_state(|s| {
-    let allocations = s.store.content.arena().allocations();
-    if s.refill_settled == Some(allocations) {
-      return false;
-    }
-    let keep = prefault_reserve(s);
-    let pages = s.config.prefault_slice_pages();
-    let refilled = s.store.content.arena_mut().prefault(&keep, pages);
-    s.count(
-      CONTENT_PREFAULTED,
-      u64::try_from(refilled.bytes).unwrap_or(u64::MAX),
-    );
-    if !refilled.more {
-      s.refill_settled = Some(allocations);
-    }
-    refilled.bytes > 0 || refilled.more
-  })
-  .unwrap_or(false)
-}
-
-/// Derived (A-214): an idle shard's reserve, `min(max(last write burst, the growth since the last idle tick),
-/// reserve_per_shard, the arena's free bytes)`, as the
-/// free blocks the next allocations of a chunk window would take (`ChunkArena::upcoming`): the burst bounded by the
-/// shard's memory share and by what its arena holds free.
-fn prefault_reserve(s: &mut ShardState) -> Vec<slates_mem::arena::KeptRun> {
-  let bytes = prefault_reserve_bytes(s);
-  if bytes == 0 {
-    return Vec::new();
-  }
-  s.store
-    .content
-    .arena()
-    .upcoming(s.store.content.chunk_bytes(), bytes)
-}
-
-/// The bytes of [`prefault_reserve`]: what an idle shard keeps pre-faulted (A-214), also reported per shard by the
-/// status's content ranges (A-745).
-pub(crate) fn prefault_reserve_bytes(s: &mut ShardState) -> usize {
-  let arena = s.store.content.arena();
-  // The busy period under way counts as soon as it has grown past the last one: an idle moment inside it, or right
-  // after it, comes before the sweep pass that closes it.
-  let running = s.burst_seen.map_or(0, |(_, before)| {
-    arena.allocated_bytes().saturating_sub(before)
-  });
-  let idle_ns =
-    slates_vfs::clock::Clock::monotonic_ns(&mut s.clock).saturating_sub(s.burst_closed_ns);
-  let reserve = decayed_reserve(s.last_burst, idle_ns, crate::idle_sweep::interval_ns())
-    .max(running)
-    .min(usize::try_from(s.config.reserve_per_shard).unwrap_or(usize::MAX))
-    .min(arena.free_bytes());
-  // Less than one discard is never given back on its own (`purge_keeping` keeps a shorter range resident), so a
-  // reserve decayed below it is none, and the sweep stops waking for it.
-  if reserve < s.config.discard_from_bytes {
-    0
-  } else {
-    reserve
-  }
-}
-
-/// Derived (w-sizing piece 1, MEMORY SIZING in main's common brief: "shrink when the demand goes, with an estimator
-/// that decays"): the reserve held for a burst of `burst` bytes once the shard has been idle `idle_ns` since the sweep
-/// pass that closed it. A burst is reserved whole for one sweep interval, the shard's own unit of idleness (the next
-/// pass after the one that closed it: a burst that recurs at the sweep's cadence lands on resident pages, as A-214
-/// measured), then halved each interval after, so an idle shard gives the pages back within
-/// `log2(burst / discard size)` intervals instead of holding its largest burst for as long as it stays idle. The
-/// halving is the decay the purge can act on at each pass; no rate is assumed beyond the interval itself.
-pub(crate) fn decayed_reserve(burst: usize, idle_ns: u64, interval_ns: u64) -> usize {
-  let intervals = idle_ns.checked_div(interval_ns.max(1)).unwrap_or(0);
-  let halvings = u32::try_from(intervals.saturating_sub(1)).unwrap_or(u32::MAX);
-  burst.checked_shr(halvings).unwrap_or(0)
-}
 
 /// The pressure hold across a daemon's shards (§4.2, admission.md §5.5), from the host's free memory at the daemon's
 /// first sample (`baseline`) and now (`available`), the daemon's own resident growth since then (`own_growth`), and its
@@ -6996,59 +6842,6 @@ pub(crate) const LATE_BEAT_SHARE: u64 = 2;
 /// rule is tested on every host.
 pub(crate) fn beat_is_late(gap_ns: u64, overrun_ns: u64) -> bool {
   gap_ns >= crate::watchdog::watch_window_ns(overrun_ns) / LATE_BEAT_SHARE
-}
-
-#[cfg(test)]
-mod decayed_reserve_tests {
-  use super::decayed_reserve;
-
-  /// Shape: the sweep's interval the rule is judged in: a second, the liveness budget it is today.
-  const INTERVAL_NS: u64 = 1_000_000_000;
-  /// Shape: a burst of 5 GiB, the size of the transient a large Mercurial push left as the shard's last burst.
-  const BURST: usize = 5 << 30;
-
-  /// w-sizing piece 1 (MEMORY SIZING). Do: ask the reserve held for a burst at the pass that closed it, within the first
-  /// sweep interval after it, at each later interval, and after 20 seconds and an hour idle. Expect the burst whole
-  /// through its first interval (A-214: a burst recurring at the sweep's cadence lands on resident pages), half at the
-  /// second, a quarter at the third, under a millionth of it after 20 seconds, and none after an hour. Before, the
-  /// reserve was the burst whole however long the shard stayed idle.
-  #[test]
-  fn a_reserve_is_held_one_interval_then_halves_each_interval_after() {
-    assert_eq!(
-      decayed_reserve(BURST, 0, INTERVAL_NS),
-      BURST,
-      "at the close"
-    );
-    assert_eq!(
-      decayed_reserve(BURST, INTERVAL_NS - 1, INTERVAL_NS),
-      BURST,
-      "within the first interval"
-    );
-    assert_eq!(
-      decayed_reserve(BURST, INTERVAL_NS, INTERVAL_NS),
-      BURST,
-      "at the first interval's end, the first pass after the close"
-    );
-    assert_eq!(
-      decayed_reserve(BURST, 2 * INTERVAL_NS, INTERVAL_NS),
-      BURST / 2
-    );
-    assert_eq!(
-      decayed_reserve(BURST, 3 * INTERVAL_NS, INTERVAL_NS),
-      BURST / 4
-    );
-    assert!(decayed_reserve(BURST, 20 * INTERVAL_NS, INTERVAL_NS) < BURST >> 18);
-    assert_eq!(
-      decayed_reserve(BURST, 3_600 * INTERVAL_NS, INTERVAL_NS),
-      0,
-      "an hour idle"
-    );
-    assert_eq!(
-      decayed_reserve(BURST, u64::MAX, 0),
-      0,
-      "a zero interval decays, never divides by zero"
-    );
-  }
 }
 
 #[cfg(test)]

@@ -2,12 +2,14 @@
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
-> only a ceiling. **A-765 BUILT:** an idle shard's prefault reserve (A-214) decays: the last burst whole for one sweep
+> only a ceiling. **A-777 BUILT:** the idle prefault reserve (A-214) is removed: provisioning p99 unchanged, NFS peak
+> RSS 1,137 -> 625 MiB, writes right after idle ~5% slower (BENCHMARKS). **A-765 (superseded):** the reserve decayed: the last burst whole for one sweep
 > interval, then halved each interval (`daemon::decayed_reserve`); before, the burst was held whole for as long as the
 > shard stayed idle (macOS arm64, Studio-4: a 64 MiB burst still reserved whole after 20 s idle; after, 0 and 234 MB
 > given back). **Measure the footprint on macOS, not RSS:** a given-back page of a shared object leaves the footprint
 > but stays in RSS and vmmap's resident until the kernel wants it (a 64 MiB `shm_open` probe: footprint 64 -> 0 MiB,
-> RSS 64 -> 64); `slates_machine::facts::resident_now`, which the pressure hold's own growth reads, is RSS (open).
+> RSS 64 -> 64). Correction (same day): those pages stay physically held (not reclaimed in 10 s under pressure), so RSS,
+> which `slates_machine::facts::resident_now` reads, is the honest holding and the footprint understates it.
 > **Open, by size:**
 > `reserve_per_shard` = memory / shards / 3 sizes each shard's slice of the content object (write log R/4, image slots
 > 2R, delta log R, arena R: about 1.4 times the machine's memory of address space, ~220 GB on the 96 GB Studio, g226),
@@ -22,9 +24,8 @@
 >   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
 >   grown by doubling; the arena grown by pool extents (A-98) as content arrives; the write log from the measured
 >   write stream between barriers.
-> - The idle prefault reserve (A-214): the last burst, capped at R. A-765 decays it; w-hg's release run held 4,931.4
->   MiB resident after hg's history push and faulted 3.5 GB more at idle. -> Removed unless the A/B (prefault vs none,
->   R9 provisioning p99, RSS) shows it pays; if it does, an EWMA of the pages a turn touches.
+> - The idle prefault reserve (A-214): the last burst, capped at R; w-hg's release run held 4,931.4 MiB resident after
+>   hg's history push. REMOVED by A-777.
 > - Tables from R: `table_bytes` (R x TABLE_SHARE), `max_inodes`, `max_dirs`, `max_chunks`, `metadata_class_bytes`,
 >   the volume record bound. -> Grown on demand (doubling, given back on shrink), bounded by admission, not
 >   preallocated from R.
@@ -37,8 +38,8 @@
 > - Give-back on macOS: `MADV_FREE_REUSABLE` over the shared content object leaves RSS (probe: 513 MiB stays, not
 >   reclaimed in 10 s under pressure); a purgeable Mach memory entry set `VM_PURGABLE_EMPTY` frees at once (513 -> 1
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
-> - Allocations on the idle path: `prefault_reserve` builds a `Vec` a pass, `purge_keeping` clones the region order,
->   `pieces_against` a `Vec` a run. -> Reused per-shard scratch.
+> - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
+>   the reserve's per-pass run list removed with the reserve (A-777).
 >
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's

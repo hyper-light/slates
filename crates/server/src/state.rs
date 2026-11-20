@@ -311,18 +311,6 @@ pub struct ShardState {
   pub(crate) content_sweep: crate::content_ranges::Sweep,
   /// The turns pushes' work builds took (A-752, `crate::git_push::PushTurns`).
   pub(crate) push_turns: crate::git_push::PushTurns,
-  /// The content arena's allocation count and allocated bytes at the last idle sweep pass (A-214), `None` before the
-  /// first: a later idle tick with another count ends a busy period, whose net growth is the allocated bytes' rise.
-  pub(crate) burst_seen: Option<(u64, usize)>,
-  /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
-  /// shard keeps free pages pre-faulted for (`daemon::purge_if_idle`).
-  pub(crate) last_burst: usize,
-  /// When the idle sweep pass closed [`ShardState::last_burst`] (the shard's monotonic clock, nanoseconds): the reserve
-  /// held for it decays from then (`daemon::prefault_reserve_bytes`, w-sizing piece 1).
-  pub(crate) burst_closed_ns: u64,
-  /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
-  /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
-  pub(crate) refill_settled: Option<u64>,
   /// What one idle give-back step walks (A-226), the recovery memory's and the write log's alike: the bytes the shard
   /// gave back in one step quantum of its own thread's CPU, measured by the steps for the next (A-491,
   /// `daemon::GiveBackRate`); a page until the first rate is learned.

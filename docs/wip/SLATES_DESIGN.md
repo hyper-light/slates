@@ -21052,7 +21052,9 @@ Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
   back.
 - Amended by A-214 (2026-11-05): an idle shard keeps its last write burst's net growth of free pages pre-faulted, and
   the purge gives back every free block beyond it.
-- Amended by A-765 (2026-11-20, w-sizing): that reserve decays. It is the burst whole for one sweep interval after the
+- Amended by A-777 (2026-11-20, w-sizing): the reserve is removed; the purge gives every free block back and nothing is
+  kept pre-faulted (BENCHMARKS, "The idle prefault reserve against none").
+- Amended by A-765 (2026-11-20, w-sizing), superseded by A-777: that reserve decays. It is the burst whole for one sweep interval after the
   pass that closed it, then halved each interval (`daemon::decayed_reserve`), and the sweep stays armed while a
   reserve is held, so an idle shard gives a burst's pages back within log2(burst / discard size) intervals.
 - Owed:
@@ -23518,6 +23520,11 @@ Status: built 2026-11-06.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
+> **Status (2026-11-20): removed by A-777.** Measured against none on the big Studio, the reserve bought about 5% on
+> writes landing right after idle and nothing on the provisioning p99, for 512 MiB more peak RSS in the NFS bench; after
+> hg's history push it held the whole 4,931.4 MiB burst resident (w-hg). Ada's MEMORY SIZING rule: a burst leaves
+> nothing resident behind it.
+>
 > **Status (2026-11-05): reverted from main, then re-landed on `agents/nfs-write` with two fixes.** Main CI 42119714654
 > found its reserve keeping deleted files' pages resident, against A-205's give-back on both Windows lanes, and its
 > arena test failing under Miri.
@@ -57535,6 +57542,20 @@ Evidence: `cargo test --locked -p slates-server --test session_log` 1 passed (tw
 one waiting landing: exactly two named; the landing gone once granted and run); `-p slates-db --test model
 every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
 `args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
+
+### A-777 — An idle shard keeps nothing pre-faulted; A-214's reserve removed (2026-11-20, w-sizing; MEMORY SIZING; amends A-105, removes A-214 and A-765)
+Applied in the same change to: `crates/server/src/daemon.rs` (the purge gives every free block back; the reserve, its
+refill and the burst measure gone), `state.rs`, `config.rs` (`prefault_slice_pages`, `page_fault_ns`),
+`content_ranges.rs` (the `arena.prefault_reserve` row), `crates/mem/src/arena.rs` (`prefault`, `upcoming`, `KeptRun`, the
+purge's keep set), `buddy.rs` (`upcoming`), the tests (`a_burst_leaves_nothing_resident_behind_it_but_its_data`; A-214's
+own removed), `crates/cli/examples/nfs_large_write.rs`, BENCHMARKS, GAPS.
+
+Status: built 2026-11-20.
+- Why: after a push of hg's history the reserve held the whole last burst, 4,931.4 MiB, and faulted 3.5 GB more in at
+  idle (w-hg, release 1d4909821). A-765's decay still held a burst whole for a sweep interval.
+- Measured (BENCHMARKS, "The idle prefault reserve against none"): the provisioning p99 is the same with and without it;
+  the NFS bench's peak RSS fell 1,137-1,139 to 625-627 MiB; writes landing right after idle ran about 5% slower.
+- The rule now: an idle shard gives every free block back (A-105); a burst after idle faults its own pages.
 
 ### A-776 — A whole-file rewrite is judged as the edit it was (2026-11-20, w-rewrite-ops; main's brief on the Slates-vs-Sapling comparison, gap D-O17; §4.16 "Composition at seal", AC-6.10, D-27)
 

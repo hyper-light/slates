@@ -15606,6 +15606,22 @@ alone exhausts its budget.
   of `engine.rs` (274 KiB to 300 KiB) takes 10 to 40 ms a process, at line grain and including process start. The
   refiner's p99 save, at token grain, is about 14 ms for that file.
 
+## The idle prefault reserve against none (A-777; main's items 1-2 after A-765; 2026-11-20)
+- **The command and machine:** Adas-Mac-Studio.local (macOS arm64, 32 cores), kiln run r6, release, interleaved, three
+  rounds: A = main 5518fb2bc (the reserve, A-765's decay), B = agents/w-sizing-noprefault (none).
+  `provision_bench` (R9, AC-2.1) then `nfs_large_write`, each under a Python `getrusage` wrapper for peak RSS. Load
+  average 8.7 to 30.8 (a shared Studio).
+- **Provisioning, 1 client spinning, p99 (us):** A 226.7, 197.4, 203.5; B 232.5, 200.6, 182.3. Both arms fail the 50 us
+  floor at this load alike. Parked p99: A 296.7, 287.5, 255.3; B 276.8, 241.3, 263.2.
+- **NFS large write, best (MiB/s):** v3 A 1,962.8, 2,051.1, 2,154.1; B 1,945.9, 2,045.8, 2,103.0. v4 A 1,945.3,
+  2,047.9, 2,144.2; B 1,928.1, 2,031.3, 2,061.4.
+- **Kept rounds after idle (MiB/s, five a round):** A 1,534.7 1,677.5 1,696.9 1,650.9 1,601.3 / 1,528.8 1,637.4
+  1,688.2 1,688.8 1,628.7 / 1,672.8 1,737.4 1,747.3 1,738.8 1,673.0; B 1,543.9 1,442.4 1,560.6 1,552.3 1,649.5 / 1,547.9
+  1,571.7 1,542.0 1,611.8 1,395.2 / 1,628.0 1,681.1 1,689.9 1,689.4 1,579.9. About 5% to A.
+- **Peak RSS, NFS bench (MiB):** A 1,139.2, 1,136.9, 1,137.0; B 626.5, 625.0, 625.0. Provisioning: 420-423 both.
+- **Verdict:** measured and rejected, the reserve (A-214, A-765): 512 MiB of peak RSS for about 5% on writes landing
+  right after idle and nothing on R9. Removed by A-777. Linux run (r7) owed as a follow-up.
+
 ## A push read where it lies in its pack while it is judged: none of its objects in the store until it lands (A-722 memory B2, in-flight half; main's ruling B; 2026-11-20)
 - **The command and machine:** adas-mac-studio.local-2, release; the diagnostic test of B1 (one push driven by phase on a
   daemon's shard, its request 64 KiB a call; branch agents/w-git-memdiag's test, never main) over a receive-pack request
