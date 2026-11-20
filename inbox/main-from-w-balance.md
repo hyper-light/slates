@@ -25,3 +25,10 @@ Proposal (please rule):
   Until the region path is proven by a takeover test, records stay v2.
 - (i) v3 on the owner's local image alone: smaller now, but a takeover's replay is refused. I don't recommend it.
 Either way the push's latency gains up to one publication interval. I'll measure it before landing.
+
+### Update after the identity rule (w-perf 2db786af6)
+v3 names the rows by the BLAKE3 of their whole bytes plus the count (through `rows::put`, which becomes BLAKE3 with
+w-perf's store change), not by window identities: windows are node-local cuts. One gap, asked of w-perf: after a
+restart, the alias identity -> root has to survive (an image piece), or a v3 replay can't find rows longer than a
+window. Homes' region Put will carry an object keyed by its BLAKE3, cut at each home, since a Mac and a Linux home cut
+differently. The f+1 recommendation above stands.
