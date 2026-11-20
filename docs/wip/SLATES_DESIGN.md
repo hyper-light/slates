@@ -54780,6 +54780,16 @@ Applied in the same change to:
   switch waits for A-727 a3: until a shard's content is durable in its image and recovered before the records, a
   record naming its rows by identity would find nothing after a restart, since today's store is rebuilt from the
   records themselves.
+- **Piece 6's region half, its rule (2026-11-20, on w-fed-faults' answer to Q3).** `slates_db::identity_homes`: a
+  content's homes are the `f + 1` region members the shared rendezvous weight ranks first for its id (`homes`), and the
+  healer's plan (`heal`) offers it to every home that lacks it and, only once every home holds it, releases it where it
+  is held and is not a home. Their inputs are the content id, the members and `f` alone: w-fed-faults found every
+  release in today's `ContentHold` scoped by an object and judged from the owner's register (a certified takeover, a late
+  copy under a newer head, a tombstone, a ledger's compaction), so identity-homed content is kept by its id outside it
+  and no owner event can reach its homes. Tests: `identity_homes::tests` (300 generated regions: f + 1 distinct homes,
+  a join moving only the newcomer in and a departure only the leaver out; the healer adding before it removes; no owner
+  event an input). Owed: the transport (a window shipped to a remote home's shard by identity, held there outside
+  `ContentHold`), the healer's loop over held identities, and the successor's rebuild fetching from homes (w-shared).
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
