@@ -10,8 +10,10 @@
 //!    past the request's room is `414`, as git's routes answer a target past theirs. A wire request (a `cmd` 7.2's
 //!    table holds) by a method other than `GET` or `POST` is `405` with `Allow`.
 //! 2. The credentials, judged as git's site judges them (its `prove`, over A-625 part 3's credential record): none, or
-//!    none proving a principal (unknown, expired, a revoked consumer's, an SSH key's), is `401` with the challenges
-//!    the connection accepts; a repeated or malformed `Authorization` is `400`; a record that did not answer is `503`.
+//!    none proving a principal (unknown, expired, a revoked consumer's, an SSH key's), is `401` with the edge's
+//!    challenges, Basic's first, which stock 7.2 reads (A-686: its urllib reads the first challenge alone, and Basic
+//!    with the token as the password is taken on the loopback cleartext edge as over TLS); a repeated or malformed
+//!    `Authorization` is `400`; a record that did not answer is `503`.
 //! 3. The repository's shard. A repository another shard holds moves the proven request's connection there whole
 //!    (`Answer::Move`, A-625 part 3), where it is decided again.
 //! 4. The repository. None of that name, or one of another tool, is `404`.
@@ -48,7 +50,7 @@ use slates_hg::{Admission, http as hg_wire};
 use slates_http::head::{Head, Target};
 use slates_http::percent::{self, Plus};
 use slates_http::reply::Status;
-use slates_http_edge::connection::Fields;
+use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential;
 
 use super::git::{Authenticator, Located, Repositories, Unproven};
@@ -184,8 +186,8 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     }
   }
 
-  /// The answer to `head`, on a connection that is TLS when `secure`, in the module doc's order.
-  pub(crate) async fn answer(&mut self, head: &Head<'_>, secure: bool) -> Decided<HgExchange<S>> {
+  /// The answer to `head`, on any connection, in the module doc's order.
+  pub(crate) async fn answer(&mut self, head: &Head<'_>) -> Decided<HgExchange<S>> {
     let routed = match route(head, self.room) {
       Ok(routed) => routed,
       Err(status) => return refused_with(status, Fields::new(), false),
@@ -193,9 +195,9 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     if routed.permission.is_some() && head.method != GET && head.method != PUSH_METHOD {
       return refused_with(Status::METHOD_NOT_ALLOWED, allow(WIRE_METHODS), false);
     }
-    let principal = match self.proof(head, secure).await {
+    let principal = match self.proof(head).await {
       Proof::Principal(principal) => principal,
-      Proof::Unauthorized => return self.unauthorized(secure),
+      Proof::Unauthorized => return self.unauthorized(),
       Proof::Refused(status) => return refused_with(status, Fields::new(), false),
     };
     if let Located::Elsewhere(shard) = self.repositories.locate(&routed.name) {
@@ -222,6 +224,7 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
         answer: Answer::Serve {
           fields: Fields::new(),
           head_only: false,
+          status: StatusMode::Streamed,
           exchange,
         },
         proven: true,
@@ -231,8 +234,8 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
   }
 
   /// What `head`'s credentials prove, as git's site reads them.
-  async fn proof(&self, head: &Head<'_>, secure: bool) -> Proof {
-    let credential = match credential::credential(head, secure) {
+  async fn proof(&self, head: &Head<'_>) -> Proof {
+    let credential = match credential::credential(head) {
       Ok(Some(credential)) => credential,
       Ok(None) => return Proof::Unauthorized,
       Err(refused) if refused.status() == Status::UNAUTHORIZED => return Proof::Unauthorized,
@@ -247,9 +250,9 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     }
   }
 
-  /// `401` with the challenges a connection that is TLS when `secure` accepts.
-  fn unauthorized(&self, secure: bool) -> Decided<HgExchange<S>> {
-    let Ok(challenges) = credential::challenges(&self.realm, secure) else {
+  /// `401` with the challenges, Basic's first and then Bearer's.
+  fn unauthorized(&self) -> Decided<HgExchange<S>> {
+    let Ok(challenges) = credential::challenges(&self.realm) else {
       // A realm a challenge cannot carry is the operator's misconfiguration, never the client's.
       return refused_with(Status::INTERNAL_SERVER_ERROR, Fields::new(), false);
     };
@@ -264,8 +267,9 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
 impl<A: Authenticator, R: Repositories, S: HgStores + Clone> Site for HgSite<A, R, S> {
   type Exchange = HgExchange<S>;
 
-  async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
-    self.answer(head, secure).await
+  /// The site's answer, whatever the connection: no step of it reads whether the connection is TLS (A-686).
+  async fn decide(&mut self, head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
+    self.answer(head).await
   }
 }
 

@@ -13475,11 +13475,13 @@ fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
 const VCS_HTTP_CLEARTEXT_LINE: &str =
   "slates daemon: the version-control HTTP edge serves cleartext on 127.0.0.1:";
 
-/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: start an anchor whose daemon is asked for the version-control HTTP
-/// edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the daemon names; ask that
-/// port for a repository's refs with no credentials. Expect: the daemon names the edge's port before it says it serves,
-/// and the edge answers `401` with a Bearer challenge and no Basic one (Basic's password is taken over TLS alone): the
-/// flag went from the anchor to its daemon, which started the shared edge.
+/// A-625 part 3 (§4.17.2 "Transports" item 1), A-629 part 2c and A-686. Do: start an anchor whose daemon is asked for
+/// the version-control HTTP edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the
+/// daemon names; ask that port for a repository's refs with no credentials, then for its Git LFS locks. Expect: the
+/// daemon names the edge's port before it says it serves, and the edge answers each `401` with Basic's challenge first
+/// and Bearer's after it (main's ruling, 2026-11-19: Basic's password is taken on the loopback edge as over TLS, and
+/// stock Mercurial reads the first challenge alone), the LFS request's in `LFS-Authenticate` too: the flag went from the
+/// anchor to its daemon, which started the shared edge, and git's site routes Git LFS through its authentication.
 #[test]
 fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   use std::io::{BufRead, Write};
@@ -13525,10 +13527,21 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   }
   anchor.drain = Some(echo_the_rest(stderr));
   let port = port.expect("the daemon named its edge's port before it served");
-  let head = bare_request(port, WAIT_FOR).expect("the edge answered");
-  assert!(head.starts_with("http/1.1 401 "), "{head}");
-  assert!(head.contains("www-authenticate: bearer realm="), "{head}");
-  assert!(!head.contains("basic"), "{head}");
+  let refs = bare_request(port, WAIT_FOR).expect("the edge answered");
+  assert!(basic_then_bearer(&refs, "www-authenticate"), "{refs}");
+  let locks = answer_head(port, LFS_LOCKS_REQUEST, WAIT_FOR).expect("the edge answered LFS");
+  assert!(basic_then_bearer(&locks, "lfs-authenticate"), "{locks}");
+}
+
+/// Shape: a Git LFS locks listing of `r.git` with no credentials, as git-lfs asks it (A-629 part 2c).
+const LFS_LOCKS_REQUEST: &str = "GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n";
+
+/// Whether `head`, in lower case, is a `401` whose `field` offers Basic's challenge first and Bearer's after it (A-686).
+fn basic_then_bearer(head: &str, field: &str) -> bool {
+  let basic = head.find(&format!("{field}: basic realm="));
+  let bearer = head.find(&format!("{field}: bearer realm="));
+  head.starts_with("http/1.1 401 ")
+    && matches!((basic, bearer), (Some(basic), Some(bearer)) if basic < bearer)
 }
 
 /// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
@@ -13690,13 +13703,18 @@ const STOCK_HG: &str = "SLATES_TEST_HG";
 
 /// Format: the start of the daemon's line naming its SSH edge's address, in the words of the HTTP edge's line (main's
 /// ruling, 2026-11-19); the port follows, and the line names the host key's SHA256 fingerprint too, so [`port_on`]
-/// reads the port's digits alone. A-684 (g299) makes the line with `--vcs-ssh <addr>`; until it lands no daemon starts
-/// the SSH edge (`crates/server/src/vcs_ssh.rs`, its Owed).
+/// reads the port's digits alone. The daemon role writes it when started with `--vcs-ssh <addr>` (A-684,
+/// `crates/api/src/role/daemon.rs`): the port, then [`VCS_SSH_KEY_WORDS`] and the key's fingerprint.
 const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves on 127.0.0.1:";
 
 /// Format: the user name stock hg gives, over SSH and as Basic's user name. It proves nothing: the key the test
 /// enrolled proves the principal over SSH, and the token, Basic's password, over HTTP.
 const HG_USER: &str = "slates";
+
+/// Format: why a test that mints a credential skips where the anchor names no issuer surface through the environment
+/// ([`PRINTS_ISSUER_SURFACE`]): the issuer's verbs (`credential token|key`) prove the human's authority with it.
+const NO_ISSUER_SURFACE: &str = "this platform publishes no issuer surface through the environment, so a separate \
+  process cannot mint a credential (on Linux it is a descriptor only the anchor's children hold)";
 
 /// Stock Mercurial 7.2's command, or `None` when this host runs none, which the caller skips loudly: the words
 /// [`STOCK_HG`] names, answering `--version` with 7.2's line.
@@ -13760,8 +13778,33 @@ fn hg_nodes(hg: &[String], dir: &str) -> Vec<String> {
 }
 
 /// Starts an anchor whose daemon is asked for `edges` (`--vcs-http`, `--vcs-ssh`) and waits until it serves: the
-/// anchor, and the daemon's lines before it served, which name the edges' ports.
+/// anchor, and the lines read until its daemon served, which name the edges' ports.
 fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<String>) {
+  let (anchor, lines, _) = anchor_with_edges_as(instance, edges, false);
+  (anchor, lines)
+}
+
+/// [`anchor_with_edges`] for a test that mints a credential, which the issuer's verbs do (`credential token|key`):
+/// read on until the anchor has named its issuer surface too, where this platform names one
+/// ([`PRINTS_ISSUER_SURFACE`]), and its daemon then answering verbs steadily with its consensus group bootstrapped, as
+/// [`start_anchor_with_vcs_http`] waits (A-685's test): the anchor, the lines read, and the surface's exports, none
+/// where this platform names none.
+fn anchor_with_edges_and_issuer(
+  instance: &str,
+  edges: &[&str],
+) -> (AnchorProcess, Vec<String>, Option<Vec<(String, String)>>) {
+  anchor_with_edges_as(instance, edges, true)
+}
+
+/// Starts an anchor whose daemon is asked for `edges` and reads its lines, echoing each, until the daemon serves and,
+/// when `issuer` is asked on a platform that names one, the anchor has named its issuer surface, the two processes'
+/// lines taken in whichever order they arrive ([`await_serving`]'s rule); with `issuer`, then waits for the daemon as
+/// [`start_anchor_with_issuer_surface`] does. The anchor, the lines read and the surface's exports when asked.
+fn anchor_with_edges_as(
+  instance: &str,
+  edges: &[&str],
+  issuer: bool,
+) -> (AnchorProcess, Vec<String>, Option<Vec<(String, String)>>) {
   use std::io::{BufRead, Write};
   let mut child = slates()
     .args([
@@ -13780,8 +13823,9 @@ fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<Stri
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
   let mut anchor = AnchorProcess { child, drain: None };
   let serving_line = format!("{SERVING_LINE}{instance} serving on ");
-  let mut lines = Vec::new();
-  loop {
+  let wants_issuer = issuer && PRINTS_ISSUER_SURFACE;
+  let (mut lines, mut exports, mut served) = (Vec::new(), None, false);
+  while !served || (wants_issuer && exports.is_none()) {
     let mut line = String::new();
     let read = stderr.read_line(&mut line).unwrap();
     assert!(
@@ -13793,13 +13837,15 @@ fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<Stri
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served: {line}"
     );
-    if line.starts_with(&serving_line) {
-      break;
-    }
+    served |= line.starts_with(&serving_line);
+    exports = exports.or_else(|| issuer_exports(&line));
     lines.push(line);
   }
   anchor.drain = Some(echo_the_rest(stderr));
-  (anchor, lines)
+  if issuer {
+    await_stable_daemon(instance, true);
+  }
+  (anchor, lines, exports.filter(|_| wants_issuer))
 }
 
 /// The port named on the line of `lines` that begins with `prefix`: the digits right after it, so what the line names
@@ -13852,21 +13898,17 @@ fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
   );
 }
 
-/// A-650 part 1 and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a Basic challenge,
-/// which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial 7.2, given no
-/// credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort: http
-/// authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
-/// stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass. As of main 34d10acb5 the daemon's edge serves git's site
-/// alone (`DaemonSite`), so hg's request is answered `404` (hg: `abort: HTTP Error 404: Not Found`; Mac Studio, kiln
-/// r174): the hg site's stores and lender are A-680 (g303). That site's `401` offers Bearer alone, which crashes 7.2
-/// ("** unknown exception encountered", `ValueError: AbstractDigestAuthHandler does not support the following scheme:
-/// 'Bearer'`, raised at Python 3.12's `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1; measured on
-/// the Mac Studio on 2026-11-19 against a stub answering that `401`), since urllib's digest handler reads the first
-/// challenge alone and refuses any scheme but Digest and Basic: Basic's challenge first on every connection is A-686
-/// (g258).
+/// A-650 part 1, A-680 part 2a and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a
+/// Basic challenge, which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial
+/// 7.2, given no credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort:
+/// http authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]). Its waits, as they ended: the daemon's edge served git's site alone, so hg's request
+/// met `404` (`abort: HTTP Error 404: Not Found`; Mac Studio, kiln r174), until A-680 part 2a put Mercurial's site
+/// beside it; that site's `401` offered Bearer alone, which crashed 7.2 ("** unknown exception encountered",
+/// `ValueError: AbstractDigestAuthHandler does not support the following scheme: 'Bearer'`, raised at Python 3.12's
+/// `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1), since urllib's digest handler reads the first
+/// challenge alone, until A-686 put Basic's challenge first on every connection.
 #[test]
-#[ignore = "waits on A-686 (g258: Basic's challenge first; stock hg 7.2 crashes on a first Bearer challenge); \
-            the hg site and its lender are on the daemon's edge (A-680 part 2a)"]
 fn stock_hg_without_credentials_is_refused_in_its_own_words() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13896,17 +13938,16 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 
 /// A-650 part 1 and A-686 (§4.17.3 "Access": Basic with a token as the password, over TLS or the loopback edge, main's
 /// ruling of 2026-11-19). Do: start an anchor with its HTTP edge on loopback (`--vcs-http 127.0.0.1:0`); make a
-/// Mercurial repository through the CLI ([`create_hg_repository`]) and a token (`credential token`); with the token as
-/// Basic's password (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and
-/// pull it back ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips
-/// loudly without stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass: as of main 34d10acb5 the CLI has no
-/// `repository create` (A-685, g305; `unknown flag --tool`, kiln r174), the daemon's edge serves git's site alone and
-/// the hg site holds no store (A-680, g303: the hg site's stores and lender, its pushes' `unbundle` with them), and the
-/// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
-/// [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
+/// Mercurial repository through the CLI ([`create_hg_repository`]) and a token (`credential token`, the issuer's verb,
+/// run with the anchor's issuer surface: [`anchor_with_edges_and_issuer`]); with the token as Basic's password
+/// (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and pull it back
+/// ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]), and where the platform names no issuer surface ([`NO_ISSUER_SURFACE`]). Ignored until
+/// it can pass: the hg site's pushes (`unbundle` through `hg_push`) are A-680 part 2b (g303); `slates repository
+/// create` (A-685), the hg site on the daemon's edge (A-680 part 2a) and the edge's Basic, its challenge first and
+/// taken on the loopback edge (A-686, [`stock_hg_without_credentials_is_refused_in_its_own_words`]), are built.
 #[test]
-#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push) and A-686 (g258: Basic \
-            with the token as password on the loopback edge, Basic's challenge first)"]
+#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push)"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13915,11 +13956,16 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
     return;
   };
   let instance = format!("cli-hg-http-{}", std::process::id());
-  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let (_anchor, lines, issuer) =
+    anchor_with_edges_and_issuer(&instance, &["--vcs-http", "127.0.0.1:0"]);
   let port =
     port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
+  let Some(issuer) = issuer else {
+    eprintln!("SKIP stock hg over the HTTP edge: {NO_ISSUER_SURFACE}");
+    return;
+  };
   create_hg_repository(&instance, "r");
-  let (code, out, err) = run(&instance, &["credential", "token"]);
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "token"]);
   assert_eq!(code, 0, "credential token: {out}{err}");
   let token = out
     .lines()
@@ -13944,9 +13990,11 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 
 /// A-650 and A-679 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo> serve
 /// --stdio` in Mercurial's quoting). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make a
-/// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`); run
-/// [`hg_round_trip`] over `ssh://` with OpenSSH holding that key alone. Expect each step done and both copies holding
-/// the same two changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`. Ignored until it can
+/// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`, the issuer's
+/// verb, run with the anchor's issuer surface: [`anchor_with_edges_and_issuer`]); run [`hg_round_trip`] over `ssh://`
+/// with OpenSSH holding that key alone. Expect each step done and both copies holding the same two changesets. Skips
+/// loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`, and where the platform names no issuer surface
+/// ([`NO_ISSUER_SURFACE`]). Ignored until it can
 /// pass: no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag --vcs-ssh`, kiln r174 over
 /// main 34d10acb5), and the edge's Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`, over
 /// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece, as the
@@ -13986,10 +14034,15 @@ fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   assert!(made.status.success(), "ssh-keygen: {made:?}");
   let public = std::fs::read_to_string(format!("{key}.pub")).unwrap();
   let instance = format!("cli-hg-ssh-{}", std::process::id());
-  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (_anchor, lines, issuer) =
+    anchor_with_edges_and_issuer(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
   let port = port_on(&lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+  let Some(issuer) = issuer else {
+    eprintln!("SKIP stock hg over the SSH edge: {NO_ISSUER_SURFACE}");
+    return;
+  };
   create_hg_repository(&instance, "r");
-  let (code, out, err) = run(&instance, &["credential", "key", public.trim()]);
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "key", public.trim()]);
   assert_eq!(code, 0, "credential key: {out}{err}");
   let ssh = format!(
     "ui.ssh=ssh -i {key} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no \
@@ -14361,5 +14414,295 @@ fn a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again() {
     again,
     Some(port),
     "the restarted daemon serves the svn:// listener on the port its anchor holds"
+  );
+}
+
+/// Format: the words between the port and the host key's fingerprint in the daemon's SSH edge line, after
+/// [`VCS_SSH_LINE`] (`crates/api/src/role/daemon.rs`).
+const VCS_SSH_KEY_WORDS: &str = " with the ED25519 host key ";
+/// Format: SSH's messages the host key reader sends or reads (RFC 4250 §4.1.2; RFC 5656 §7.1): a disconnect, KEXINIT,
+/// the client's ephemeral key and the server's reply.
+const SSH_MSG_DISCONNECT: u8 = 1;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEXINIT: u8 = 20;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
+/// Format: the most bytes of a packet the reader takes: RFC 4253 §6.1's 35000, which every implementation processes.
+const SSH_PACKET_CAP: usize = 35_000;
+/// Format: the longest identification line, carriage return and line feed included (RFC 4253 §4.2).
+const SSH_LINE_CAP: usize = 255;
+/// Format: the block a cleartext packet's length aligns to, and its least padding (RFC 4253 §6: "or 8, whichever is
+/// larger"; "at least four bytes of padding").
+const SSH_CLEAR_BLOCK: usize = 8;
+/// Format: see [`SSH_CLEAR_BLOCK`].
+const SSH_LEAST_PADDING: usize = 4;
+/// Format: X25519's base point, u = 9 (RFC 7748 §4.1), as the reader's ephemeral public key: any 32 bytes are one (§5),
+/// and the reader keeps nothing the exchange derives, so its own key needs no secret half.
+const X25519_BASE_POINT: [u8; 32] = {
+  let mut point = [0u8; 32];
+  point[0] = 9;
+  point
+};
+
+/// The port and host key fingerprint `line` names, when it is a daemon's SSH edge line.
+fn ssh_edge_of(line: &str) -> Option<(u16, String)> {
+  let rest = line.strip_prefix(VCS_SSH_LINE)?;
+  let (port, fingerprint) = rest.trim().split_once(VCS_SSH_KEY_WORDS)?;
+  Some((port.parse().ok()?, fingerprint.to_owned()))
+}
+
+/// `bytes` as an SSH string (RFC 4251 §5): its length, then itself.
+fn put_ssh_string(out: &mut Vec<u8>, bytes: &[u8]) {
+  out.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+  out.extend_from_slice(bytes);
+}
+
+/// The SSH string at `at` in `bytes`, and where the next field starts; none past the end.
+fn ssh_string(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
+  let start = at.checked_add(4)?;
+  let length = u32::from_be_bytes(bytes.get(at..start)?.try_into().ok()?);
+  let end = start.checked_add(usize::try_from(length).ok()?)?;
+  Some((bytes.get(start..end)?, end))
+}
+
+/// `payload` as a cleartext SSH packet (RFC 4253 §6): its length, its padding's length, itself and its padding.
+fn ssh_packet(payload: &[u8]) -> Vec<u8> {
+  let unpadded = 4 + 1 + payload.len();
+  let mut padding = SSH_CLEAR_BLOCK - unpadded % SSH_CLEAR_BLOCK;
+  if padding < SSH_LEAST_PADDING {
+    padding += SSH_CLEAR_BLOCK;
+  }
+  let mut packet = Vec::new();
+  packet.extend_from_slice(
+    &u32::try_from(1 + payload.len() + padding)
+      .unwrap()
+      .to_be_bytes(),
+  );
+  packet.push(u8::try_from(padding).unwrap());
+  packet.extend_from_slice(payload);
+  packet.resize(packet.len() + padding, 0);
+  packet
+}
+
+/// The reader's KEXINIT (RFC 4253 §7.1): `curve25519-sha256` (RFC 8731) and `ssh-ed25519` (RFC 8709) alone, an AEAD
+/// cipher each way (whose MAC lists are not negotiated), no compression, no guess.
+fn ssh_kexinit() -> Vec<u8> {
+  let mut payload = vec![SSH_MSG_KEXINIT];
+  payload.extend_from_slice(&[0u8; 16]);
+  for list in [
+    "curve25519-sha256",
+    "ssh-ed25519",
+    "chacha20-poly1305@openssh.com",
+    "chacha20-poly1305@openssh.com",
+    "hmac-sha2-256",
+    "hmac-sha2-256",
+    "none",
+    "none",
+    "",
+    "",
+  ] {
+    put_ssh_string(&mut payload, list.as_bytes());
+  }
+  payload.push(0);
+  payload.extend_from_slice(&0u32.to_be_bytes());
+  payload
+}
+
+/// An error of the reader's, for what the server sent it.
+fn ssh_refusal(what: String) -> std::io::Error {
+  std::io::Error::new(std::io::ErrorKind::InvalidData, what)
+}
+
+/// Reads the server's identification line (RFC 4253 §4.2), passing over the lines a server may send before it.
+fn ssh_identification(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+  use std::io::Read;
+  loop {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while line.last() != Some(&b'\n') {
+      stream.read_exact(&mut byte)?;
+      line.extend_from_slice(&byte);
+      if line.len() > SSH_LINE_CAP {
+        return Err(ssh_refusal(format!("a line past {SSH_LINE_CAP} bytes")));
+      }
+    }
+    if line.starts_with(b"SSH-") {
+      return Ok(());
+    }
+  }
+}
+
+/// The payload of the next cleartext packet `stream` brings (RFC 4253 §6), one past [`SSH_PACKET_CAP`] refused.
+fn ssh_payload(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+  use std::io::Read;
+  let mut length = [0u8; 4];
+  stream.read_exact(&mut length)?;
+  let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+  if length > SSH_PACKET_CAP {
+    return Err(ssh_refusal(format!("a packet of {length} bytes")));
+  }
+  let mut packet = vec![0u8; length];
+  stream.read_exact(&mut packet)?;
+  let padding = usize::from(packet.first().copied().unwrap_or_default());
+  packet
+    .get(1..length.saturating_sub(padding))
+    .map(<[u8]>::to_vec)
+    .ok_or_else(|| ssh_refusal(format!("a packet of {length} bytes padded {padding}")))
+}
+
+/// The host key blob the SSH edge at loopback `port` sends in its first key exchange, waiting `patience` for each read:
+/// RFC 5656 §4's `K_S` in the server's `SSH_MSG_KEX_ECDH_REPLY`, cleartext before the keys are taken; or why there was
+/// none (a refused connection among them). A reader written for this test from the RFCs: it offers what
+/// [`ssh_kexinit`] lists, sends its ephemeral key once the server's KEXINIT came, and reads up to the server's reply.
+/// It checks no signature: the edge's own tests do, with slates-ssh's client written from the RFCs
+/// (`crates/server/src/vcs_ssh/tests/daemon_edge.rs`).
+fn ssh_host_key(port: u16, patience: Duration) -> std::io::Result<Vec<u8>> {
+  use std::io::Write;
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  stream.write_all(b"SSH-2.0-slates_cli_test\r\n")?;
+  stream.write_all(&ssh_packet(&ssh_kexinit()))?;
+  ssh_identification(&mut stream)?;
+  loop {
+    let payload = ssh_payload(&mut stream)?;
+    match payload.first().copied() {
+      Some(SSH_MSG_KEXINIT) => {
+        let mut init = vec![SSH_MSG_KEX_ECDH_INIT];
+        put_ssh_string(&mut init, &X25519_BASE_POINT);
+        stream.write_all(&ssh_packet(&init))?;
+      }
+      Some(SSH_MSG_KEX_ECDH_REPLY) => {
+        return ssh_string(&payload, 1)
+          .map(|(key, _)| key.to_vec())
+          .ok_or_else(|| ssh_refusal("a reply without its host key".to_owned()));
+      }
+      Some(SSH_MSG_DISCONNECT) => {
+        return Err(ssh_refusal("the edge disconnected".to_owned()));
+      }
+      _ => {}
+    }
+  }
+}
+
+/// The port and host key fingerprint the next daemon of an anchor names for its SSH edge, from the anchor's forwarded
+/// `lines`, read until that daemon says it serves (`serving_line`); none if it named none first.
+fn ssh_edge_before_serving(
+  lines: &std::sync::mpsc::Receiver<String>,
+  serving_line: &str,
+) -> Option<(u16, String)> {
+  let mut edge = None;
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the daemon served within the start's ceiling");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    edge = ssh_edge_of(&line).or(edge);
+    if line.starts_with(serving_line) {
+      return edge;
+    }
+  }
+}
+
+/// What an anchor's forwarded `lines` show of its daemon's restart after a kill, its SSH edge at `port`: the
+/// successor's pid; the host key the edge presents at `port` once the anchor said it restarted the daemon, asked
+/// before the successor served; and the port and fingerprint the successor names before it serves (`serving_line`).
+fn ssh_edge_across_a_restart(
+  lines: &std::sync::mpsc::Receiver<String>,
+  serving_line: &str,
+  port: u16,
+) -> (
+  Option<u32>,
+  Option<std::io::Result<Vec<u8>>>,
+  Option<(u16, String)>,
+) {
+  let (mut successor, mut while_restarting, mut again, mut served) = (None, None, None, false);
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served again: {line}"
+    );
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(ssh_host_key(port, START_CEILING));
+    }
+    again = ssh_edge_of(&line).or(again);
+    served |= line.starts_with(serving_line);
+  }
+  (successor, while_restarting, again)
+}
+
+/// A-684 (§4.17.2 "Transports" item 2). Do: start an anchor with the version-control SSH edge on loopback
+/// (`--vcs-ssh 127.0.0.1:0`); read the port and host key fingerprint its daemon names; take the edge's host key from a
+/// key exchange; kill the daemon; once the anchor says it restarted it, take the key again at the same port, before the
+/// successor serves; read what the successor names. Expect: the daemon names the edge's port and its key's fingerprint
+/// before it says it serves; the key the edge presents is the one the fingerprint names; the exchange begun while the
+/// daemon was gone is answered by its successor with the same key; and the successor names the same port and
+/// fingerprint: the anchor holds the edge's listener and its host key, so a restart keeps both and a client's
+/// `known_hosts` line stays good.
+#[test]
+fn an_anchors_vcs_ssh_edge_names_its_host_key_and_a_restart_keeps_port_and_key() {
+  let instance = format!("cli-vcs-ssh-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-ssh",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let (port, fingerprint) = ssh_edge_before_serving(&lines, &serving_line)
+    .expect("the daemon named its SSH edge's port and host key before it served");
+  let key = ssh_host_key(port, WAIT_FOR).expect("the edge's host key");
+  assert_eq!(
+    slates_server::credentials::key_fingerprint(&key),
+    fingerprint,
+    "the edge presents the key its daemon names"
+  );
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let (successor, while_restarting, again) = ssh_edge_across_a_restart(&lines, &serving_line, port);
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let restarted = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the edge's port was dropped while its daemon restarted: {error}")
+    });
+  assert_eq!(restarted, key, "the successor presents the anchor's key");
+  assert_eq!(
+    again,
+    Some((port, fingerprint)),
+    "the restarted daemon serves the edge on the port its anchor holds, with the key it holds"
   );
 }

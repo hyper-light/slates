@@ -21,8 +21,10 @@
 //! Stock `svn`, `svnadmin` and `svnserve` are found on the PATH, and a host without them, or whose `svn` is not of the
 //! 1.15 line, skips loudly. Each test's working copies, `svn`'s configuration, its SSH key and the control's
 //! repositories live in a scratch directory in the build output (`CARGO_TARGET_TMPDIR`), named with the process id and
-//! removed at its end; `svn` reads no user's configuration and caches no credential. Unix only, as `tests/cli.rs` is:
-//! the control's tunnel runs through `sh`, and the SSH leg's through OpenSSH's `ssh`.
+//! removed at its end; `svn` reads no user's configuration and caches no credential. A slates leg mints its credential
+//! (`slates credential token|key`, the issuer's verbs) with the anchor's issuer surface, which the anchor names on macOS
+//! and Windows; on Linux the surface is a descriptor only the anchor's children hold, so those legs skip loudly there.
+//! Unix only, as `tests/cli.rs` is: the control's tunnel runs through `sh`, and the SSH leg's through OpenSSH's `ssh`.
 #![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
@@ -94,6 +96,20 @@ const VCS_SVN_LINE: &str = "slates daemon: the svn:// listener serves on 127.0.0
 /// Mercurial interop tests assume it, until A-684 (g299) prints one; the port's digits are read, and what follows them
 /// (the host key's fingerprint) is left.
 const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves on 127.0.0.1:";
+
+/// Format: the start of the anchor's line naming its issuer surface (`crates/api/src/role/anchor.rs`): the variables a
+/// separate process exports to prove the human's authority, `NAME=VALUE` pairs separated by spaces. The issuer's verbs
+/// (`credential token|key`) refuse without them.
+const ISSUER_SURFACE_LINE: &str = "slates anchor: issuer surface: export ";
+
+/// Shape: whether the anchor names its issuer surface through the environment: on macOS and Windows; on Linux the
+/// surface is a descriptor only its children hold (`tests/cli.rs`, `PRINTS_ISSUER_SURFACE`, which records why this is
+/// a platform fact and never read from the order of two processes' lines).
+const PRINTS_ISSUER_SURFACE: bool = cfg!(not(target_os = "linux"));
+
+/// Format: why a leg that mints a credential skips where the anchor names no issuer surface ([`PRINTS_ISSUER_SURFACE`]).
+const NO_ISSUER_SURFACE: &str = "this platform publishes no issuer surface through the environment, so a separate \
+  process cannot mint a credential (on Linux it is a descriptor only the anchor's children hold)";
 
 /// A scratch directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a
 /// count, removed when dropped, even when an assertion fails (A-50: a test's host files live in the build output, never
@@ -480,9 +496,20 @@ impl Drop for Anchor {
 
 /// Runs `slates --instance INSTANCE ARGS`: its exit code and both outputs.
 fn slates(instance: &str, args: &[&str]) -> (i32, String, String) {
+  slates_as_issuer(instance, &[], args)
+}
+
+/// Runs `slates --instance INSTANCE ARGS` with the issuer surface's variables `issuer` in its environment, as the
+/// issuer's verbs need: its exit code and both outputs.
+fn slates_as_issuer(
+  instance: &str,
+  issuer: &[(String, String)],
+  args: &[&str],
+) -> (i32, String, String) {
   let output = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args(["--instance", instance])
     .args(args)
+    .envs(issuer.iter().map(|(name, value)| (name, value)))
     .output()
     .unwrap();
   (
@@ -503,11 +530,15 @@ fn value_of(text: &str, key: &str) -> String {
     .to_owned()
 }
 
+/// The anchor's issuer surface, where this platform names one: the variables the issuer's verbs run with.
+type IssuerSurface = Option<Vec<(String, String)>>;
+
 /// Starts `slates anchor` whose daemon is asked for `edges` (a flag and a loopback address whose port the system
-/// picks), reads what the anchor says until its daemon serves, waits until the daemon answers verbs steadily, and makes
-/// the root consensus group as a first start does (`slates bootstrap root`): the anchor, and the lines said before the
-/// daemon served, which name the edges' ports.
-fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>) {
+/// picks), reads what the anchor says until its daemon serves and, where this platform names one, the anchor has named
+/// its issuer surface ([`lines_until_serving`]), waits until the daemon answers verbs steadily, and makes the root
+/// consensus group as a first start does (`slates bootstrap root`): the anchor, the lines read, which name the edges'
+/// ports, and the issuer surface.
+fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>, IssuerSurface) {
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -524,23 +555,24 @@ fn start_anchor(instance: &str, edges: &[&str]) -> (Anchor, Vec<String>) {
     .unwrap();
   let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
   let mut anchor = Anchor { child, drain: None };
-  let lines = lines_until_serving(&mut stderr, instance);
+  let (lines, issuer) = lines_until_serving(&mut stderr, instance);
   anchor.drain = Some(std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
   }));
   settle(instance);
   let (code, out, err) = slates(instance, &["bootstrap", "root"]);
   assert_eq!(code, 0, "bootstrap root: {out}{err}");
-  (anchor, lines)
+  (anchor, lines, issuer)
 }
 
-/// Reads the anchor's lines until its daemon says it serves, echoing each to this process's standard error, where they
-/// went before it was piped: the lines before the serving one. Ends the test where the anchor ends first or reports its
-/// daemon in a crash loop, the anchor's own bound on a daemon that cannot serve.
-fn lines_until_serving(stderr: &mut impl BufRead, instance: &str) -> Vec<String> {
+/// Reads the anchor's lines until its daemon says it serves and, where this platform names one, the anchor has named its
+/// issuer surface, the two processes' lines taken in whichever order they arrive, echoing each to this process's
+/// standard error, where they went before it was piped: the lines read, and the issuer surface. Ends the test where the
+/// anchor ends first or reports its daemon in a crash loop, the anchor's own bound on a daemon that cannot serve.
+fn lines_until_serving(stderr: &mut impl BufRead, instance: &str) -> (Vec<String>, IssuerSurface) {
   let serving = format!("{SERVING_LINE}{instance} serving on ");
-  let mut lines = Vec::new();
-  loop {
+  let (mut lines, mut issuer, mut served) = (Vec::new(), None, false);
+  while !served || (PRINTS_ISSUER_SURFACE && issuer.is_none()) {
     let mut line = String::new();
     let read = stderr.read_line(&mut line).unwrap();
     assert!(
@@ -552,11 +584,31 @@ fn lines_until_serving(stderr: &mut impl BufRead, instance: &str) -> Vec<String>
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served: {line}"
     );
-    if line.starts_with(&serving) {
-      return lines;
-    }
+    served |= line.starts_with(&serving);
+    issuer = issuer.or_else(|| issuer_surface(&line));
     lines.push(line);
   }
+  (lines, issuer)
+}
+
+/// The variables of the anchor's issuer-surface line ([`ISSUER_SURFACE_LINE`]), or `None` for any other line.
+fn issuer_surface(line: &str) -> Option<Vec<(String, String)>> {
+  let pairs = line.trim().strip_prefix(ISSUER_SURFACE_LINE)?;
+  Some(
+    pairs
+      .split(' ')
+      .filter_map(|pair| pair.split_once('='))
+      .map(|(name, value)| (name.to_owned(), value.to_owned()))
+      .collect(),
+  )
+}
+
+/// The issuer surface `issuer`, or `None` where this platform names none, which is said for `leg` as its skip.
+fn issuer_or_skip(issuer: IssuerSurface, leg: &str) -> IssuerSurface {
+  if issuer.is_none() {
+    eprintln!("skipping {leg}: {NO_ISSUER_SURFACE}");
+  }
+  issuer
 }
 
 /// Waits until the daemon answers [`STABLE_STREAK`] verbs in a row, within [`PATIENCE`].
@@ -598,10 +650,10 @@ fn create_repository(instance: &str) {
   assert_eq!(code, 0, "repository create: {out}{err}");
 }
 
-/// A token `slates credential token` mints for this process's own principal: its id and the token, as the verb prints
-/// them.
-fn minted_token(instance: &str) -> (String, String) {
-  let (code, out, err) = slates(instance, &["credential", "token"]);
+/// A token `slates credential token` mints for this process's own principal, run with the anchor's issuer surface
+/// `issuer`, as the issuer's verbs must be: its id and the token, as the verb prints them.
+fn minted_token(instance: &str, issuer: &[(String, String)]) -> (String, String) {
+  let (code, out, err) = slates_as_issuer(instance, issuer, &["credential", "token"]);
   assert_eq!(code, 0, "credential token: {out}{err}");
   (value_of(&out, "id"), value_of(&out, "token"))
 }
@@ -626,21 +678,23 @@ struct Leg {
 }
 
 /// The HTTP leg of session `session`: an anchor with its HTTP edge on loopback (`--vcs-http 127.0.0.1:0`), the
-/// repository, a token, and `svn` giving the token as Basic's password at `http://127.0.0.1:PORT/project`.
-fn http_leg(session: &str) -> Leg {
+/// repository, a token, and `svn` giving the token as Basic's password at `http://127.0.0.1:PORT/project`; `None` where
+/// this platform names no issuer surface to mint the token with, which is said as the leg's skip.
+fn http_leg(session: &str) -> Option<Leg> {
   let instance = format!("svn-http-{session}-{}", std::process::id());
-  let (anchor, lines) = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let (anchor, lines, issuer) = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
   let port = port_after(&lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port");
+  let issuer = issuer_or_skip(issuer, &format!("the HTTP leg of {session}"))?;
   create_repository(&instance);
-  let (_, token) = minted_token(&instance);
+  let (_, token) = minted_token(&instance, &issuer);
   let scratch = Scratch::new(&format!("svn-http-{session}"));
   let svn = Svn::new(&scratch, session, credentials(USER.to_owned(), token));
-  Leg {
+  Some(Leg {
     _anchor: anchor,
     _scratch: scratch,
     svn,
     url: format!("http://127.0.0.1:{port}/{REPOSITORY}"),
-  }
+  })
 }
 
 /// §4.17.4 item 14 over `svn://` (item 5's svn://: the daemon's svn:// listener running A-656's connection). Do: start
@@ -660,10 +714,13 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
     return;
   }
   let instance = format!("svn-protocol-{}", std::process::id());
-  let (_anchor, lines) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
   let port = port_after(&lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port");
+  let Some(issuer) = issuer_or_skip(issuer, "stock svn over svn://") else {
+    return;
+  };
   create_repository(&instance);
-  let (id, token) = minted_token(&instance);
+  let (id, token) = minted_token(&instance, &issuer);
   let scratch = Scratch::new("svn-protocol");
   let svn = Svn::new(&scratch, "trip", credentials(id, token));
   round_trip(&svn, &format!("svn://127.0.0.1:{port}/{REPOSITORY}"));
@@ -674,26 +731,28 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
 /// (`--vcs-http 127.0.0.1:0`); make the repository and a token; run the round trip as stock `svn` 1.15 at
 /// `http://127.0.0.1:PORT/project`, the token as Basic's password. Expect: every step as against `svnserve`. Skips
 /// loudly without stock Subversion 1.15. Ignored until it can pass: the edge serves no Subversion site until A-681
-/// (g297: its reads, then its commits); serf sends Basic credentials only after a Basic challenge, which the loopback
-/// edge offers from A-686 (g258); `slates repository create` is A-685 (g305).
+/// (g297: its reads, then its commits); `slates repository create` is A-685 (g305). serf sends Basic credentials only
+/// after a Basic challenge, which the loopback edge offers first, and takes, since A-686 (g258).
 #[test]
-#[ignore = "waits on A-681's reads and commits (g297), A-686 (g258) and A-685 (g305)"]
+#[ignore = "waits on A-681's reads and commits (g297) and A-685 (g305)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_the_vcs_http_edge() {
   if !stock_svn() {
     eprintln!("skipping stock svn over HTTP: no stock Subversion 1.15 here (svn on the PATH)");
     return;
   }
-  let leg = http_leg("trip");
+  let Some(leg) = http_leg("trip") else {
+    return;
+  };
   round_trip(&leg.svn, &leg.url);
 }
 
 /// §4.17.4 item 14's lock session over `http://` (item 7's locks: `LOCK`, `UNLOCK` and the lock discovery `svn`
 /// reads). Do: start the HTTP leg as the HTTP round trip does; run the lock session. Expect: every step as against
 /// `svnserve`. Skips loudly without stock Subversion 1.15. Ignored until it can pass: A-681 (g297) serves `LOCK` and
-/// `UNLOCK` in a part after its reads and commits (A-627 built their bodies over A-602's lock table); A-686 (g258);
-/// A-685 (g305).
+/// `UNLOCK` in a part after its reads and commits (A-627 built their bodies over A-602's lock table); A-685 (g305). The
+/// edge's Basic, offered first and taken on loopback, is built (A-686, g258).
 #[test]
-#[ignore = "waits on A-681's commits, LOCK and UNLOCK (g297), A-686 (g258) and A-685 (g305)"]
+#[ignore = "waits on A-681's commits, LOCK and UNLOCK (g297) and A-685 (g305)"]
 fn stock_svn_locks_and_unlocks_over_the_vcs_http_edge() {
   if !stock_svn() {
     eprintln!(
@@ -701,7 +760,9 @@ fn stock_svn_locks_and_unlocks_over_the_vcs_http_edge() {
     );
     return;
   }
-  let leg = http_leg("locks");
+  let Some(leg) = http_leg("locks") else {
+    return;
+  };
   locking(&leg.svn, &leg.url);
 }
 
@@ -751,10 +812,13 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh() {
     return;
   };
   let instance = format!("svn-ssh-{}", std::process::id());
-  let (_anchor, lines) = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
   let port = port_after(&lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+  let Some(issuer) = issuer_or_skip(issuer, "stock svn over svn+ssh") else {
+    return;
+  };
   create_repository(&instance);
-  let (code, out, err) = slates(&instance, &["credential", "key", &public]);
+  let (code, out, err) = slates_as_issuer(&instance, &issuer, &["credential", "key", &public]);
   assert_eq!(code, 0, "credential key: {out}{err}");
   let tunnel = format!(
     "config:tunnels:ssh=ssh -q -F /dev/null -p {port} -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \

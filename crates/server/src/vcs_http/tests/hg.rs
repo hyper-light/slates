@@ -22,7 +22,7 @@ use slates_http_edge::credential::Credential;
 
 use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
 use super::{Fastest, HgSite, HgStores};
-use crate::vcs_http::{Answer, Decided, Exchange, Failed};
+use crate::vcs_http::{Answer, Decided, Exchange, Failed, Site};
 
 /// Shape: room enough for every request these tests send.
 const ROOM: u64 = 1 << 20;
@@ -38,9 +38,13 @@ const OWNER_TOKEN: &[u8] = b"owner-token";
 const STRANGER_TOKEN: &[u8] = b"stranger-token";
 /// Shape: the owner's credentials as a bearer token.
 const OWNER_BEARER: &str = "Authorization: Bearer owner-token";
+/// Shape: the owner's token as Basic's password (`hg:owner-token`).
+const OWNER_BASIC: &str = "Authorization: Basic aGc6b3duZXItdG9rZW4=";
 /// Shape: the stranger's.
 const STRANGER_BEARER: &str = "Authorization: Bearer stranger-token";
-/// Shape: the challenge a `401` carries over cleartext.
+/// Shape: the challenges a `401` carries, in this order, on every connection.
+const BASIC_CHALLENGE: &str = "Basic realm=\"slates\", charset=\"UTF-8\"";
+/// Shape: as [`BASIC_CHALLENGE`].
 const BEARER_CHALLENGE: &str = "Bearer realm=\"slates\"";
 /// Shape: the id of the Mercurial repository `hg`, whose store the tests' shard holds.
 const HG: RepositoryId = RepositoryId { bytes: [1; 16] };
@@ -171,6 +175,10 @@ impl Repository for Empty {
   fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
     std::iter::empty()
   }
+
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    std::iter::empty()
+  }
 }
 
 impl Store for Empty {
@@ -265,7 +273,7 @@ fn refused_status(
   fields: &[&str],
 ) -> Option<Status> {
   let bytes = request(method, target, fields);
-  refusal(&ready(site.answer(&head(&bytes), false))).map(|(status, _)| status)
+  refusal(&ready(site.decide(&head(&bytes), false))).map(|(status, _)| status)
 }
 
 /// A rule letting the stranger reach `hg` with `right` on every named branch.
@@ -287,13 +295,15 @@ fn stranger_may(right: PolicyRight) -> PolicyRule {
 /// a path escaping a slash, no credentials, a repository of no name and one of git's, hgweb's own page, `unbundle` by
 /// `GET`, `unbundle` by `POST` from a stranger who may only read, and a repository whose store this shard does not
 /// hold; then, with no rule, the stranger's `heads`. Expect `405`, `400`, `401`, `404` twice, `503`, `405`, `403` and
-/// `503`, and the owner's `heads` at `/hg/` served; then the stranger `403` and the owner's `heads` at `/hg` served.
-/// Every case is judged before any is compared, so a failing run names each that differs.
+/// `503`, and the owner's `heads` at `/hg/` served, by a bearer token and by Basic with the token as its password alike
+/// (A-686: the loopback cleartext connection these tests decide on takes Basic); then the stranger `403` and the
+/// owner's `heads` at `/hg` served. Every case is judged before any is compared, so a failing run names each that
+/// differs.
 #[test]
 fn each_step_of_hgwebs_order_refuses_with_its_status() {
   let mut open = site(vec![stranger_may(PolicyRight::Read)]);
   let mut strict = site(Vec::new());
-  let cases: [(&str, &str, &str, &[&str], Option<Status>); 12] = [
+  let cases: [(&str, &str, &str, &[&str], Option<Status>); 13] = [
     (
       "open",
       "PUT",
@@ -358,6 +368,7 @@ fn each_step_of_hgwebs_order_refuses_with_its_status() {
       Some(Status::SERVICE_UNAVAILABLE),
     ),
     ("open", "GET", "/hg/?cmd=heads", &[OWNER_BEARER], None),
+    ("open", "GET", "/hg/?cmd=heads", &[OWNER_BASIC], None),
     (
       "strict",
       "GET",
@@ -385,23 +396,23 @@ fn each_step_of_hgwebs_order_refuses_with_its_status() {
   assert_eq!(judged, expected);
 }
 
-/// AC-HG.9, A-650 part 1: do send a wire command by `PUT`, the owner's `unbundle` by `GET`, and `heads` with no
-/// credentials. Expect the first two's `Allow` naming the methods each may use, and the `401` carrying the bearer
-/// challenge a cleartext connection accepts; the first and the last decided before any principal is proved, the second
-/// after the owner's proof.
+/// AC-HG.9, A-650 part 1 and A-686: do send a wire command by `PUT`, the owner's `unbundle` by `GET`, and `heads` with
+/// no credentials, on a loopback cleartext connection. Expect the first two's `Allow` naming the methods each may use,
+/// and the `401` carrying Basic's challenge first and Bearer's second, as on every connection (stock Mercurial 7.2's
+/// urllib reads the first challenge alone and crashed on a Bearer first); the first and the last decided before any
+/// principal is proved, the second after the owner's proof.
 #[test]
 fn refusals_name_what_the_client_may_do_instead() {
   let mut site = site(Vec::new());
   let mut named = |method: &str, target: &str, fields: &[&str]| {
     let bytes = request(method, target, fields);
-    let decided = ready(site.answer(&head(&bytes), false));
+    let decided = ready(site.decide(&head(&bytes), false));
     (refusal(&decided).unwrap().1, decided.proven)
   };
   let allow = |methods: &str| vec![(b"Allow".to_vec(), methods.as_bytes().to_vec())];
-  let challenge = vec![(
-    b"WWW-Authenticate".to_vec(),
-    BEARER_CHALLENGE.as_bytes().to_vec(),
-  )];
+  let challenge = [BASIC_CHALLENGE, BEARER_CHALLENGE]
+    .map(|value| (b"WWW-Authenticate".to_vec(), value.as_bytes().to_vec()))
+    .to_vec();
   assert_eq!(
     (
       named("PUT", "/hg?cmd=heads", &[OWNER_BEARER]),
@@ -483,7 +494,7 @@ fn a_request_for_a_repository_another_shard_holds_moves_there_once_proven() {
   let mut site = site(Vec::new());
   let mut decide = |fields: &[&str]| {
     let bytes = request("GET", "/away?cmd=capabilities", fields);
-    let decided = ready(site.answer(&head(&bytes), false));
+    let decided = ready(site.answer(&head(&bytes)));
     let refused = refusal(&decided).map(|(status, _)| status);
     let moved = match &decided.answer {
       Answer::Move { shard } => Some(*shard),
@@ -536,11 +547,12 @@ fn served<S: HgStores + Clone>(
   let mut all = vec![OWNER_BEARER];
   all.extend_from_slice(fields);
   let bytes = request(method, target, &all);
-  match ready(site.answer(&head(&bytes), false)).answer {
+  match ready(site.answer(&head(&bytes))).answer {
     Answer::Serve {
       fields,
       head_only,
       exchange,
+      ..
     } => {
       assert!(fields.is_empty() && !head_only);
       exchange
