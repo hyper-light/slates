@@ -82,7 +82,7 @@ use super::{CommitRefusal, check_out_of_date, verdict};
 use crate::authz::{Access, Authz, Principal, PrincipalRules, RepositoryPath};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, IndexRefusal, NodeKind, PropertyList,
-  Revision, RevisionRecord, Text,
+  PropertyPairs, Revision, RevisionRecord, Text,
 };
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockRefusal, LockTable};
 use crate::mergeinfo::{Mergeinfo, MergeinfoRefusal};
@@ -747,7 +747,7 @@ pub struct Pending<'drive> {
   /// The texts it made, by identity.
   pub texts: &'drive BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists it made, by identity, each sorted by name.
-  pub property_lists: &'drive BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  pub property_lists: &'drive BTreeMap<ContentIdentity, PropertyPairs>,
 }
 
 /// An accepted work: what the caller commits.
@@ -768,7 +768,7 @@ pub struct Work {
   /// The texts the work made, by identity.
   pub texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists the work made, by identity, each sorted by name.
-  pub property_lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  pub property_lists: BTreeMap<ContentIdentity, PropertyPairs>,
   /// The commit's locks: who commits, the tokens it presented and whether it keeps them, which the owner's step judges
   /// the work again with where its verdict's facts moved (A-655 part 2b; A-698).
   pub locks: CommitLocks,
@@ -838,7 +838,7 @@ struct File {
   /// Its full path.
   path: String,
   /// Its text delta, while one is open.
-  delta: Option<Delta>,
+  delta: Option<Box<Delta>>,
   /// Whether its write was checked (`checked_write`): from the start for one the drive added.
   checked: bool,
 }
@@ -1254,7 +1254,7 @@ pub struct Drive {
   /// The texts the work made.
   texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists the work made.
-  property_lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  property_lists: BTreeMap<ContentIdentity, PropertyPairs>,
   /// The bytes held: the work's texts and property lists, and its open deltas'.
   held: usize,
   /// The kinds of the nodes the drive deleted and then replaced, by path, for a deletion of the replacement.
@@ -1946,7 +1946,7 @@ impl Drive {
       digests: Digests::new()?,
     };
     if let Some(Baton::File(file)) = self.tokens.get_mut(token) {
-      file.delta = Some(delta);
+      file.delta = Some(Box::new(delta));
     }
     Ok(Outcome::Taken)
   }
@@ -2130,7 +2130,7 @@ impl Drive {
     &self,
     green: &G,
     properties: PropertyList,
-  ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DriveRefusal> {
+  ) -> Result<PropertyPairs, DriveRefusal> {
     let PropertyList::Held { identity, .. } = properties else {
       return Ok(Vec::new());
     };
@@ -2591,7 +2591,18 @@ fn strtoul(text: &[u8]) -> (i64, &[u8]) {
 }
 
 /// The seconds since 1970 `apr_time_exp_get` computes for a date, or `None` for a month outside the year.
-fn epoch_seconds([year, month, day]: [i64; 3], [hour, minute, second]: [i64; 3]) -> Option<i64> {
+fn epoch_seconds(date: [i64; 3], [hour, minute, second]: [i64; 3]) -> Option<i64> {
+  epoch_days(date)?
+    .checked_mul(HOURS_PER_DAY)?
+    .checked_add(hour)?
+    .checked_mul(SIXTY)?
+    .checked_add(minute)?
+    .checked_mul(SIXTY)?
+    .checked_add(second)
+}
+
+/// The days since 1970 `apr_time_exp_get` computes for a date, or `None` for a month outside the year.
+fn epoch_days([year, month, day]: [i64; 3]) -> Option<i64> {
   let month = month.checked_sub(1)?;
   let offset = *DAY_OFFSET.get(usize::try_from(month).ok()?)?;
   let mut year = year.checked_sub(TM_YEAR_BASE)?;
@@ -2599,7 +2610,7 @@ fn epoch_seconds([year, month, day]: [i64; 3], [hour, minute, second]: [i64; 3])
     year = year.checked_sub(1)?;
   }
   let centuries = year.checked_div(CENTURY)?;
-  let days = year
+  year
     .checked_mul(DAYS_PER_YEAR)?
     .checked_add(year.checked_div(LEAP_EVERY)?)?
     .checked_sub(centuries)?
@@ -2611,14 +2622,7 @@ fn epoch_seconds([year, month, day]: [i64; 3], [hour, minute, second]: [i64; 3])
     .checked_add(offset)?
     .checked_add(day)?
     .checked_sub(1)?
-    .checked_sub(EPOCH_DAYS)?;
-  days
-    .checked_mul(HOURS_PER_DAY)?
-    .checked_add(hour)?
-    .checked_mul(SIXTY)?
-    .checked_add(minute)?
-    .checked_mul(SIXTY)?
-    .checked_add(second)
+    .checked_sub(EPOCH_DAYS)
 }
 
 /// Writes a failure with every error of its chain, outermost first, each with a release build's empty file and zero
