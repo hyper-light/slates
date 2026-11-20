@@ -924,3 +924,6 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   owner shard's memory budget (trued up after each append and at recovery, credited on free); admitted git/hg pushes
   never refused by it; svn revisions check room first. db 29/29, server 105/105 + 61/61; GAPS: content held 2x (3x svn
   texts). w-perf asked to rerun the 5,000-rev import; if refused for room, A-716 before T4. w-svn next: A-693 p2 lock.
+- ~00:10 PST ADA: "the change that stores svn file text once (A-716) -> we should do that anyway" -> A-716 now
+  unconditional for w-perf: rerun (measure) -> A-716 (unless T4 lands within ~30 min) -> T4 -> register entry objects
+  name content by identity (A-662, every tool; seam with w-svn).
