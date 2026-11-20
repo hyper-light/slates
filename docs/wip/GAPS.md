@@ -118,6 +118,12 @@
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
 >
+> **A-727 (2026-11-20, w-perf, UI goal 93; designed):** repository bytes leave the partition snapshot (the 747 MB
+> wall a 5,000-revision svn import met is the snapshot, the sum of every retained record): the vcs content store in the
+> shard's chunk arena of the anchor's content object, its table in the shard image recovered before the records, records
+> naming identities (git v3: names + the pack's root identity), entries waiting on the next image barrier (group commit).
+> OWED: slices (a1) read seam, (a2) arena storage, (a3) image table + recovery order, (b) git v3, (c) svn, (d) replication.
+>
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
 > entry's bound in bounded parts across entries (git/git's 607 MiB pack vs a 747 MB segment region); objects already
@@ -1441,6 +1447,10 @@
 > updating PUT and a DELETE). Stock svn 1.15's HTTP round trip runs un-ignored and passes; svn matrix over HTTP 23 of
 > 27. Owed: LOCK/UNLOCK and a commit's lock tokens (`If`, `S:lock-token-list`); the reports blame, diff and merge ask
 > (`file-revs`, a diff's, `mergeinfo`); a PUT's body held whole within the room; an abandoned transaction's expiry.
+> **A-681, HTTP locks (w-interop, 2026-11-20):** LOCK and UNLOCK of a public path over A-627's readers and writers
+> and the lock table, their entries landed as `Record::Locks` (`SvnStores::lock_verb`); a commit presents its tokens
+> (`If`, the MERGE's `S:lock-token-list`, `keep-locks`; `Drive::present_lock`). Stock svn 1.15's HTTP lock session
+> runs un-ignored and passes (`svn_interop.rs` 5 of 5, none ignored).
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

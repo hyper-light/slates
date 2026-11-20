@@ -745,11 +745,11 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_the_vcs_http_edge() {
 
 /// §4.17.4 item 14's lock session over `http://` (item 7's locks: `LOCK`, `UNLOCK` and the lock discovery `svn`
 /// reads). Do: start the HTTP leg as the HTTP round trip does; run the lock session. Expect: every step as against
-/// `svnserve`. Skips loudly without stock Subversion 1.15. Ignored until it can pass: A-681 (g297) serves `LOCK` and
-/// `UNLOCK` in a part after its reads and commits (A-627 built their bodies over A-602's lock table). The edge's Basic,
-/// offered first and taken on loopback, is built (A-686, g258).
+/// `svnserve`. Skips loudly without stock Subversion 1.15. Its waits, as they ended: A-681's commits, then its `LOCK`
+/// and `UNLOCK` over A-627's bodies and A-602's lock table, landed as A-693 part 2's `Record::Locks`, with a commit's
+/// lock tokens (the `If` header, the MERGE's `S:lock-token-list`); the edge's Basic, offered first and taken on loopback
+/// (A-686, g258).
 #[test]
-#[ignore = "waits on A-681's LOCK and UNLOCK and a commit's lock tokens (the If header, the MERGE's lock-token-list)"]
 fn stock_svn_locks_and_unlocks_over_the_vcs_http_edge() {
   if !stock_svn() {
     eprintln!(
