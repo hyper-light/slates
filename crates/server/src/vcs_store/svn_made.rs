@@ -14,7 +14,8 @@
 //! with its digests (`slates_svn::commit::drive::text_of`), its bytes brought with the revision; a node's property list
 //! the identity its reserved attribute names (`svn_commit::PROPS`), which the records must hold. A directory a row adds
 //! beneath that did not stand before is added too, and a deletion beneath a deleted directory is the directory's. Its
-//! revision properties: `svn:log`, the submit's message, and `svn:date`, the owner's instant.
+//! revision properties: `svn:log`, the submit's message, `svn:date`, the owner's instant, and `svn:author`, the
+//! principal's own name its session carries (`crate::identities`), as the svn+ssh edge names a commit's author.
 //!
 //! **Recorded as an import's is** (`svn_commit::land_made`): checked by the records, its record appended in the submit's
 //! own transaction in an entry of the register holding it alone, after the version's own record, so the version and its
@@ -24,8 +25,7 @@
 //! copy in the change (A-586: the index names a copy at its destination alone), a symbolic link or a special file (no
 //! Subversion node the step makes yet), a property list the records do not hold, the records' or the budget's refusal.
 //!
-//! **Owed** (GAPS, A-664): `svn:author`, which needs the principal's Subversion name among its identities (A-664 part
-//! 1 keeps git's and Mercurial's); a copy as a row with its source; symbolic links as `svn:special` files.
+//! **Owed** (GAPS, A-664): a copy as a row with its source; symbolic links as `svn:special` files.
 
 use std::collections::BTreeMap;
 
@@ -52,6 +52,8 @@ pub(crate) const UNMADE: &str = "vcs.svn.revision_unmade";
 
 /// Format: the property `svn:log`.
 const LOG: &[u8] = b"svn:log";
+/// Format: the property `svn:author`.
+const AUTHOR: &[u8] = b"svn:author";
 /// Format: the property `svn:date`.
 const DATE: &[u8] = b"svn:date";
 /// Format: the property `svn:mergeinfo`, which a property list's row says it holds.
@@ -184,6 +186,9 @@ fn revision_of(
   let mut properties = BTreeMap::from([(DATE.to_vec(), date.into_bytes())]);
   if let Some(message) = &authorship.message {
     properties.insert(LOG.to_vec(), message.as_bytes().to_vec());
+  }
+  if let Some(author) = &authorship.identities.subversion {
+    properties.insert(AUTHOR.to_vec(), author.as_bytes().to_vec());
   }
   Ok(Revision {
     head: youngest,

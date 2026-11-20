@@ -130,9 +130,9 @@ fn hrefs(body: &str) -> Vec<String> {
 }
 
 /// A-681 (`version.c` `get_option`): do send the OPTIONS stock svn opens a session with, asking for the activity
-/// collection; expect `200`, the HTTPv2 stubs built from the root, the youngest revision 6, the one capability served
-/// (`log-revprops`; every other names a report or a commit this site does not serve yet), mergeinfo answered `no`, and
-/// the activity collection's href.
+/// collection; expect `200`, the HTTPv2 stubs built from the root, the youngest revision 6, the capabilities served
+/// (`log-revprops` and, since A-726 part 2, `mergeinfo`; every other names a report or a commit this site does not
+/// serve yet), mergeinfo answered `yes`, and the activity collection's href.
 #[test]
 fn an_options_answer_lists_the_httpv2_facts_and_no_capability_unserved() {
   let fixture = Fixture::new();
@@ -154,12 +154,13 @@ fn an_options_answer_lists_the_httpv2_facts_and_no_capability_unserved() {
         "1,2",
         "version-control,checkout,working-resource",
         "merge,baseline,activity,version-controlled-collection",
-        "http://subversion.tigris.org/xmlns/dav/svn/log-revprops"
+        "http://subversion.tigris.org/xmlns/dav/svn/log-revprops",
+        "http://subversion.tigris.org/xmlns/dav/svn/mergeinfo"
       ],
       vec!["6"],
       vec!["/repo"],
       vec!["/repo/!svn/rvr"],
-      vec!["no"],
+      vec!["yes"],
       vec![UUID],
     )
   );
@@ -345,7 +346,7 @@ fn streamed(fixture: &Fixture, answer: Answer) -> (Headers, Vec<u8>) {
       .text(&text.identity, u64::try_from(bytes.len()).unwrap())
       .filter(|piece| !piece.is_empty())
     {
-      bytes.extend_from_slice(piece);
+      bytes.extend_from_slice(&piece);
     }
   }
   (headers, bytes)

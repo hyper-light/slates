@@ -25,7 +25,7 @@ use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::{self, ObjectRefused, commit::Commit, tag::Tag, tree::Tree};
 use crate::store::hook_view::Quantum;
 use crate::store::learn::Clock;
-use crate::unpack::Object;
+use crate::unpack::Placed;
 
 /// Whether a command's new tip is connected; worse states order later.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -169,6 +169,24 @@ impl Walk {
     Ok(self.pass == Pass::Done)
   }
 
+  /// The edges of the object at the pass's position, as `pushed` lends its bytes, handed to `each`:
+  /// whether it could be read. A blob names nothing, so its bytes are not read; an object whose
+  /// bytes are not lent could not be read.
+  fn edges_of(
+    &self,
+    placed: &Placed,
+    (format, pushed): (ObjectFormat, &Pushed<'_>),
+    each: &mut impl FnMut(ObjectId, bool),
+  ) -> Result<bool, Refusal> {
+    if placed.kind == Kind::Blob {
+      return Ok(true);
+    }
+    match pushed.content(self.at) {
+      Some(content) => for_each_edge((placed.kind, &content), format, each),
+      None => Ok(false),
+    }
+  }
+
   /// One unit of the walk: one object of a pass, a pass's end, or the propagation whole.
   fn unit<R: Repository + ?Sized>(
     &mut self,
@@ -194,13 +212,13 @@ impl Walk {
   /// counted.
   fn judge<R: Repository + ?Sized>(
     &mut self,
-    object: &Object,
+    object: &Placed,
     (request, pushed, repository): (&Request, &Pushed<'_>, &R),
   ) -> Result<(), Refusal> {
     let shallow_commit = self.shallow.binary_search(&object.id).is_ok();
     let mut state = Connected::Complete;
     let mut inside = self.inside;
-    let read = for_each_edge(object, request.format, &mut |target, parent| {
+    let read = self.edges_of(object, (request.format, pushed), &mut |target, parent| {
       if pushed.position(&target).is_some() {
         inside = inside.saturating_add(1);
       } else if !repository.holds(&target) {
@@ -237,18 +255,20 @@ impl Walk {
   /// The second pass's object: its run of targets among the pushed objects kept.
   fn keep_edges(
     &mut self,
-    object: &Object,
+    object: &Placed,
     format: ObjectFormat,
     pushed: &Pushed<'_>,
   ) -> Result<(), Refusal> {
-    let targets = &mut self.targets;
-    for_each_edge(object, format, &mut |target, _| {
+    let mut targets = core::mem::take(&mut self.targets);
+    let read = self.edges_of(object, (format, pushed), &mut |target, _| {
       if let Some(at) = pushed.position(&target)
         && targets.len() < targets.capacity()
       {
         targets.push(at);
       }
-    })?;
+    });
+    self.targets = targets;
+    read?;
     self.offsets.push(self.targets.len());
     self.at = self.at.saturating_add(1);
     Ok(())
@@ -289,17 +309,17 @@ fn sorted(ids: &[ObjectId], admission: &mut Admission) -> Result<Vec<ObjectId>, 
   Ok(sorted)
 }
 
-/// Hands each object `object` names to `each`, with whether it is a commit's parent: whether the
-/// object could be read. The read's transient structures, bounded by the object's own bytes, take a
+/// Hands each object an object of `kind` holding `content` names to `each`, with whether it is a
+/// commit's parent: whether the object could be read. The read's transient structures, bounded by the object's own bytes, take a
 /// scratch admission of their own (this module's **Bounds**).
 fn for_each_edge(
-  object: &Object,
+  (kind, content): (Kind, &[u8]),
   format: ObjectFormat,
   each: &mut impl FnMut(ObjectId, bool),
 ) -> Result<bool, Refusal> {
   let mut scratch = Admission::new(u64::MAX);
-  let read = match object.kind {
-    Kind::Commit => Commit::parse(&object.content, &mut scratch).map(|commit| {
+  let read = match kind {
+    Kind::Commit => Commit::parse(content, &mut scratch).map(|commit| {
       let tree = commit.tree(format);
       if let Some(tree) = tree {
         each(tree, false);
@@ -308,9 +328,9 @@ fn for_each_edge(
       tree.is_some()
     }),
     Kind::Tree => {
-      Tree::parse(&object.content, format, &mut scratch).map(|tree| tree_edges(&tree, format, each))
+      Tree::parse(content, format, &mut scratch).map(|tree| tree_edges(&tree, format, each))
     }
-    Kind::Tag => Tag::parse(&object.content, &mut scratch).map(|tag| {
+    Kind::Tag => Tag::parse(content, &mut scratch).map(|tag| {
       let target = tag.object(format);
       if let Some(target) = target {
         each(target, false);

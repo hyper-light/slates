@@ -25,14 +25,15 @@
 //! nothing written. Bytes after the push's end are not the push's: the session takes none of them.
 
 use super::{
-  Advertised, Checked, Checking, HiddenRefs, Judge, NO_INDEX, Received, Refusal, Repository,
-  Request, RequestReader, check, decide, finished_pack, visible, write_advertisement, write_report,
+  Advertised, Checked, Checking, HiddenRefs, InMemory, Judge, NO_INDEX, Received, Refusal,
+  Repository, Request, RequestReader, check, decide, finished_pack, visible, write_advertisement,
+  write_report,
 };
 use crate::Admission;
 use crate::object_name::ObjectId;
 use crate::out::Out;
 use crate::store::hook_view::Quantum;
-use crate::unpack::{self, NoIndex};
+use crate::unpack::{self, Contents, Held, Keep, NoIndex};
 
 /// What a session reads or does next.
 enum State<'s> {
@@ -61,6 +62,12 @@ pub struct Session<'s, H> {
   hidden: H,
   /// What comes next.
   state: State<'s>,
+  /// The objects of a pack read into the session's own keeper ([`Session::input`]); none of a pack
+  /// read into the caller's ([`Session::input_into`]).
+  held: Held,
+  /// The first object of the pack git's checks refuse, found as each object was kept (A-719 part 3:
+  /// its bytes in hand, so the checks after the pack read none of them again for this).
+  refused: Option<(ObjectId, crate::objects::FsckId)>,
   /// The pack's bytes as the client sent them, compressed and with its deltas, charged to the admission as they arrive
   /// (A-723): what the push's record keeps durably in place of its objects inflated, taken once by the caller
   /// ([`Session::take_pack`]).
@@ -74,6 +81,8 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       advertised: *advertised,
       hidden,
       state: State::Request(RequestReader::new(advertised)),
+      held: Held::default(),
+      refused: None,
       pack: Vec::new(),
     }
   }
@@ -85,27 +94,45 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
   }
 
   /// Takes the client's next bytes, a thin pack's bases and a push of deletes' checks read from
-  /// `repository`: whether the push is now read whole, checked or with its pack's checks to make
-  /// ([`Session::check_turn`]). Once read whole, and once done, it takes no more. A refusal ends the
-  /// session.
+  /// `repository`, the pack's objects kept in the session's own memory: whether the push is now
+  /// read whole, checked or with its pack's checks to make ([`Session::check_turn`]). Once read
+  /// whole, and once done, it takes no more. A refusal ends the session.
   pub fn input<R: Repository + ?Sized>(
     &mut self,
     bytes: &[u8],
     repository: &R,
     admission: &mut Admission,
   ) -> Result<bool, Refusal> {
-    let taken = self.take(bytes, repository, admission);
+    let mut held = core::mem::take(&mut self.held);
+    let mut site = InMemory {
+      repository,
+      held: &mut held,
+    };
+    let taken = self.input_into(bytes, &mut site, admission);
+    self.held = held;
+    taken
+  }
+
+  /// [`Session::input`], the pack read into `site` (A-719 part 3): its keeper, which a server's
+  /// quarantine is, and the repository its thin bases and a push of deletes' checks are read from.
+  pub fn input_into<S: Keep + Repository>(
+    &mut self,
+    bytes: &[u8],
+    site: &mut S,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let taken = self.take(bytes, site, admission);
     if taken.is_err() {
       self.state = State::Done;
     }
     taken
   }
 
-  /// [`Session::input`]'s reading, before a refusal ends the session.
-  fn take<R: Repository + ?Sized>(
+  /// [`Session::input_into`]'s reading, before a refusal ends the session.
+  fn take<S: Keep + Repository>(
     &mut self,
     bytes: &[u8],
-    repository: &R,
+    site: &mut S,
     admission: &mut Admission,
   ) -> Result<bool, Refusal> {
     let mut rest = bytes;
@@ -120,7 +147,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       };
       let request = reader.request()?;
       if !request.wants_pack() {
-        let checked = check(request, None, repository, &self.hidden, admission)?;
+        let checked = check(request, None, (&*site, &*site), &self.hidden, admission)?;
         self.state = State::Checked(checked);
         return Ok(true);
       }
@@ -134,11 +161,16 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       .charge(crate::to_u64(rest.len()))
       .map_err(Refusal::PastAdmission)?;
     self.pack.extend_from_slice(rest);
-    let read = reader.read(rest, admission).map(|_| ());
+    let mut fscking = Fscking {
+      site: &mut *site,
+      format: self.advertised.format,
+      refused: &mut self.refused,
+    };
+    let read = reader.read_into(rest, admission, &mut fscking).map(|_| ());
     if read.is_ok() && !reader.is_whole() {
       return Ok(false);
     }
-    self.check_pack(read, repository, admission)
+    self.check_pack(read, site, admission)
   }
 
   /// The client's bytes have ended: whether the push is now read whole, checked or with its pack's
@@ -149,6 +181,22 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     repository: &R,
     admission: &mut Admission,
   ) -> Result<bool, Refusal> {
+    let mut held = core::mem::take(&mut self.held);
+    let mut site = InMemory {
+      repository,
+      held: &mut held,
+    };
+    let ended = self.end_into(&mut site, admission);
+    self.held = held;
+    ended
+  }
+
+  /// [`Session::end`], the pack read into `site` ([`Session::input_into`]).
+  pub fn end_into<S: Keep + Repository>(
+    &mut self,
+    site: &mut S,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
     match &self.state {
       State::Request(_) => {
         let State::Request(reader) = core::mem::replace(&mut self.state, State::Done) else {
@@ -157,7 +205,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
         reader.request().map(|_| false)
       }
       State::Pack { .. } => {
-        let checked = self.check_pack(Ok(()), repository, admission);
+        let checked = self.check_pack(Ok(()), site, admission);
         if checked.is_err() {
           self.state = State::Done;
         }
@@ -167,13 +215,18 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     }
   }
 
-  /// The push, read and checked, until it is answered: its objects for the caller's quarantine,
-  /// and each command's refusal by the checks.
+  /// The push, read and checked, until it is answered: each object's place, and each command's
+  /// refusal by the checks.
   pub fn checked(&self) -> Option<&Checked> {
     match &self.state {
       State::Checked(checked) => Some(checked),
       _ => None,
     }
+  }
+
+  /// The bytes of the objects the session read into its own memory ([`Session::input`]).
+  pub fn kept(&self) -> &dyn Contents {
+    &self.held
   }
 
   /// Decides the checked push through `judge` and writes the answer to `out`: what was received,
@@ -185,6 +238,22 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     admission: &mut Admission,
   ) -> Result<Option<Received>, Refusal> {
     let received = self.decide(judge, admission)?;
+    if let Some(received) = &received {
+      write_report(received, out)?;
+    }
+    Ok(received)
+  }
+
+  /// [`Session::answer`] for a push read into the caller's site, its objects' bytes lent to the
+  /// judge from `contents` where the caller lends them (a server's judge reads its own store).
+  pub fn answer_with<J: Judge + ?Sized>(
+    &mut self,
+    judge: &mut J,
+    contents: Option<&dyn Contents>,
+    out: &mut impl Out,
+    admission: &mut Admission,
+  ) -> Result<Option<Received>, Refusal> {
+    let received = self.decide_with(judge, contents, admission)?;
     if let Some(received) = &received {
       write_report(received, out)?;
     }
@@ -203,7 +272,20 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     let State::Checked(checked) = core::mem::replace(&mut self.state, State::Done) else {
       return Ok(None);
     };
-    decide(checked, judge, admission).map(Some)
+    decide(checked, Some(&self.held), judge, admission).map(Some)
+  }
+
+  /// [`Session::decide`] for a push read into the caller's site ([`Session::answer_with`]).
+  pub fn decide_with<J: Judge + ?Sized>(
+    &mut self,
+    judge: &mut J,
+    contents: Option<&dyn Contents>,
+    admission: &mut Admission,
+  ) -> Result<Option<Received>, Refusal> {
+    let State::Checked(checked) = core::mem::replace(&mut self.state, State::Done) else {
+      return Ok(None);
+    };
+    decide(checked, contents, judge, admission).map(Some)
   }
 
   /// The pack's bytes as the client sent them (A-723), taken once: the caller's record keeps them durably, compressed and
@@ -217,18 +299,31 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     matches!(self.state, State::Done)
   }
 
-  /// Finishes the pack that has ended or been refused (`read`), its checks to make a turn at a time.
-  fn check_pack<R: Repository + ?Sized>(
+  /// Finishes the pack that has ended or been refused (`read`) into `site`, its checks to make a
+  /// turn at a time.
+  fn check_pack<S: Keep + Repository>(
     &mut self,
     read: Result<(), unpack::Refusal>,
-    repository: &R,
+    site: &mut S,
     admission: &mut Admission,
   ) -> Result<bool, Refusal> {
     let State::Pack { request, reader } = core::mem::replace(&mut self.state, State::Done) else {
       return Ok(false);
     };
-    let unpacked = finished_pack(reader, read, repository, admission);
-    self.state = State::Checking(Checking::new(request, Some(unpacked)));
+    let mut fscking = Fscking {
+      site,
+      format: self.advertised.format,
+      refused: &mut self.refused,
+    };
+    let unpacked = finished_pack(reader, read, &mut fscking, admission);
+    let unpacked = match (unpacked, self.refused) {
+      (Ok(kept), Some((id, finding))) => Err(super::PackRefused {
+        objects: u32::try_from(kept.objects.len()).ok(),
+        why: super::PackRefusal::Fsck { id, finding },
+      }),
+      (unpacked, _) => unpacked,
+    };
+    self.state = State::Checking(Checking::fscked(request, Some(unpacked)));
     Ok(true)
   }
 
@@ -237,12 +332,26 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     matches!(self.state, State::Checking(_))
   }
 
-  /// One turn of the pack's checks against `repository`, for `quantum` and at least one unit of
-  /// work (A-719): whether the push is now checked ([`Session::checked`]). A push already checked
-  /// answers so at once; one with no checks under way, `false`. A refusal ends the session.
+  /// One turn of the pack's checks against `repository`, the objects read back from the session's
+  /// own memory, for `quantum` and at least one unit of work (A-719): whether the push is now
+  /// checked ([`Session::checked`]). A push already checked answers so at once; one with no checks
+  /// under way, `false`. A refusal ends the session.
   pub fn check_turn<R: Repository + ?Sized>(
     &mut self,
     repository: &R,
+    admission: &mut Admission,
+    quantum: Quantum<'_>,
+  ) -> Result<bool, Refusal> {
+    let held = core::mem::take(&mut self.held);
+    let turned = self.check_turn_with((repository, &held), admission, quantum);
+    self.held = held;
+    turned
+  }
+
+  /// [`Session::check_turn`], the objects read back from `contents`, the caller's site.
+  pub fn check_turn_with<R: Repository + ?Sized, C: Contents>(
+    &mut self,
+    (repository, contents): (&R, &C),
     admission: &mut Admission,
     quantum: Quantum<'_>,
   ) -> Result<bool, Refusal> {
@@ -251,7 +360,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
       State::Checked(_) => return Ok(true),
       _ => return Ok(false),
     };
-    let turned = checking.turn(repository, admission, quantum);
+    let turned = checking.turn((repository, contents), admission, quantum);
     let done = match turned {
       Ok(done) => done,
       Err(refusal) => {
@@ -265,7 +374,56 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     let State::Checking(checking) = core::mem::replace(&mut self.state, State::Done) else {
       return Ok(false);
     };
-    self.state = State::Checked(checking.checked(repository, &self.hidden, admission)?);
+    let checked = checking.checked((repository, contents), &self.hidden, admission)?;
+    self.state = State::Checked(checked);
     Ok(true)
+  }
+}
+
+/// The caller's site as the session reads a pack into it, every object checked as git checks a push
+/// as it is kept (A-719 part 3; `super::fsck`), the first refused noted.
+struct Fscking<'f, S: ?Sized> {
+  /// The caller's site.
+  site: &'f mut S,
+  /// The hash the pack's objects are in.
+  format: crate::object_name::ObjectFormat,
+  /// The first object refused, if any.
+  refused: &'f mut Option<(ObjectId, crate::objects::FsckId)>,
+}
+
+impl<S: Repository + ?Sized> Repository for Fscking<'_, S> {
+  fn object(&self, id: &ObjectId) -> Option<(crate::object_name::Kind, &[u8])> {
+    self.site.object(id)
+  }
+
+  fn holds(&self, id: &ObjectId) -> bool {
+    self.site.holds(id)
+  }
+}
+
+impl<S: Contents + ?Sized> Contents for Fscking<'_, S> {
+  fn content(&self, at: usize, id: &ObjectId) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self.site.content(at, id)
+  }
+}
+
+impl<S: Keep + ?Sized> Keep for Fscking<'_, S> {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: unpack::Object,
+    hold: crate::Hold,
+    admission: &mut Admission,
+  ) -> Result<(), unpack::Refusal> {
+    if self.refused.is_none()
+      && let Some(finding) = super::fsck::refusal_of(object.kind, &object.content, self.format)
+    {
+      *self.refused = Some((object.id, finding));
+    }
+    self.site.keep(at, object, hold, admission)
+  }
+
+  fn release(&mut self, hold: crate::Hold, admission: &mut Admission) {
+    self.site.release(hold, admission);
   }
 }

@@ -357,11 +357,13 @@ fn receive_pack_resolves_a_thin_pack_against_the_store() {
   assert_eq!(received.outcomes, [receive::Outcome::Ok(Vec::new())]);
   let unpacked = received.unpacked.unwrap().unwrap();
   for (id, edit) in ids.iter().zip(&edits) {
-    let made = unpacked.objects.iter().find(|object| object.id == *id);
+    // A name is its content's hash: the edit made is the object of its name.
     assert_eq!(
-      made.map(|object| object.content.as_slice()),
-      Some(edit.as_slice())
+      name_of(ObjectFormat::Sha1, Kind::Blob, edit).ok(),
+      Some(*id)
     );
+    let made = unpacked.objects.iter().find(|object| object.id == *id);
+    assert!(made.is_some(), "{id} not made");
   }
   let counters = ViewCounters {
     lent_as_kept: 0,

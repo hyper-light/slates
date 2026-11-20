@@ -84,7 +84,9 @@ use crate::object_name::{Kind, ObjectId};
 use crate::objects::FsckId;
 use crate::pack;
 use crate::pktline;
-use crate::unpack::{self, NoIndex, Object, Outside, Unpacked};
+use std::borrow::Cow;
+
+use crate::unpack::{self, Contents, Held, Keep, Kept, NoIndex, Object, Outside, Placed};
 use crate::{Admission, PastAdmission, to_u64};
 
 /// What the repository a push is made to holds (A-614's object store implements it, A-638).
@@ -125,15 +127,6 @@ impl HiddenRefs for NoneHidden {
 impl<T: HiddenRefs + ?Sized> HiddenRefs for &T {
   fn is_hidden(&self, name: &[u8]) -> bool {
     (**self).is_hidden(name)
-  }
-}
-
-/// A repository's objects, as the pack reader takes a thin pack's bases from.
-struct Bases<'r, R: ?Sized>(&'r R);
-
-impl<R: Repository + ?Sized> Outside for Bases<'_, R> {
-  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
-    self.0.object(id)
   }
 }
 
@@ -234,25 +227,32 @@ pub enum PackRefusal {
 pub struct Received {
   /// The request.
   pub request: Request,
-  /// The pack's objects, or why it was refused; `None` when no pack was due (only deletes, or no
-  /// command).
-  pub unpacked: Option<Result<Unpacked, PackRefused>>,
+  /// The pack's objects' places, or why it was refused; `None` when no pack was due (only deletes,
+  /// or no command).
+  pub unpacked: Option<Result<Kept, PackRefused>>,
   /// Each command's outcome.
   pub outcomes: Vec<Outcome>,
 }
 
-/// The objects a push's pack brought, by name.
+/// The objects a push's pack brought, by name: each one's place, and its bytes where the caller
+/// lends them (A-719 part 3: a server's judge reads them from its own store instead).
 pub struct Pushed<'a> {
-  /// The objects, in pack order.
-  objects: &'a [Object],
+  /// The objects' places, in pack order.
+  objects: &'a [Placed],
   /// Each object's name and position, sorted by name.
   by_id: Vec<(ObjectId, usize)>,
+  /// Where their bytes are read, where the caller lends them.
+  contents: Option<&'a dyn Contents>,
 }
 
 impl<'a> Pushed<'a> {
-  /// The objects a pack brought, indexed by name in a table charged to `admission` before it is
-  /// made.
-  pub fn new(objects: &'a [Object], admission: &mut Admission) -> Result<Self, Refusal> {
+  /// The objects a pack brought, their bytes read from `contents` where it is lent, indexed by name
+  /// in a table charged to `admission` before it is made.
+  pub fn new(
+    objects: &'a [Placed],
+    contents: Option<&'a dyn Contents>,
+    admission: &mut Admission,
+  ) -> Result<Self, Refusal> {
     admission
       .charge_items::<(ObjectId, usize)>(objects.len())
       .map_err(Refusal::PastAdmission)?;
@@ -265,12 +265,25 @@ impl<'a> Pushed<'a> {
         .map(|(at, object)| (object.id, at)),
     );
     by_id.sort_unstable();
-    Ok(Self { objects, by_id })
+    Ok(Self {
+      objects,
+      by_id,
+      contents,
+    })
   }
 
-  /// The pushed object named `id`, if the pack brought it.
-  pub fn object(&self, id: &ObjectId) -> Option<&'a Object> {
-    self.position(id).and_then(|at| self.objects.get(at))
+  /// The pushed object named `id`, its type and bytes, if the pack brought it and its bytes are
+  /// lent.
+  pub fn object(&self, id: &ObjectId) -> Option<(Kind, Cow<'a, [u8]>)> {
+    let at = self.position(id)?;
+    let placed = self.objects.get(at)?;
+    Some((placed.kind, self.contents?.content(at, id)?))
+  }
+
+  /// The bytes of the object at position `at`, if they are lent.
+  pub fn content(&self, at: usize) -> Option<Cow<'a, [u8]>> {
+    let placed = self.objects.get(at)?;
+    self.contents?.content(at, &placed.id)
   }
 
   /// The position in pack order of the object named `id`, if the pack brought it.
@@ -283,9 +296,82 @@ impl<'a> Pushed<'a> {
       .map(|(_, at)| *at)
   }
 
-  /// The objects, in pack order.
-  pub fn objects(&self) -> &'a [Object] {
+  /// The objects' places, in pack order.
+  pub fn objects(&self) -> &'a [Placed] {
     self.objects
+  }
+}
+
+/// A pack read into memory over `repository`: the keeper a session keeps of its own, and
+/// [`receive`]'s.
+pub(crate) struct InMemory<'a, R: ?Sized> {
+  /// The repository.
+  pub(crate) repository: &'a R,
+  /// The objects kept.
+  pub(crate) held: &'a mut Held,
+}
+
+impl<R: Repository + ?Sized> Repository for InMemory<'_, R> {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    self.repository.object(id)
+  }
+
+  fn holds(&self, id: &ObjectId) -> bool {
+    self.repository.holds(id)
+  }
+}
+
+impl<R: ?Sized> Contents for InMemory<'_, R> {
+  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    self.held.content(at, id)
+  }
+}
+
+impl<R: ?Sized> Keep for InMemory<'_, R> {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: Object,
+    hold: crate::Hold,
+    admission: &mut Admission,
+  ) -> Result<(), unpack::Refusal> {
+    self.held.keep(at, object, hold, admission)
+  }
+
+  fn release(&mut self, hold: crate::Hold, admission: &mut Admission) {
+    self.held.release(hold, admission);
+  }
+}
+
+/// A push's site as the pack reader finishes a thin pack: its keeper, and its repository as the
+/// outside bases.
+struct Thin<'s, S: ?Sized>(&'s mut S);
+
+impl<S: Repository + ?Sized> Outside for Thin<'_, S> {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    Repository::object(&*self.0, id)
+  }
+}
+
+impl<S: Contents + ?Sized> Contents for Thin<'_, S> {
+  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    self.0.content(at, id)
+  }
+}
+
+impl<S: Keep + ?Sized> Keep for Thin<'_, S> {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: Object,
+    hold: crate::Hold,
+    admission: &mut Admission,
+  ) -> Result<(), unpack::Refusal> {
+    self.0.keep(at, object, hold, admission)
+  }
+
+  fn release(&mut self, hold: crate::Hold, admission: &mut Admission) {
+    self.0.release(hold, admission);
   }
 }
 
@@ -413,42 +499,47 @@ where
   let mut reader = RequestReader::new(advertised);
   let took = reader.read(bytes, admission)?;
   let request = reader.request()?;
+  let mut held = Held::default();
+  let mut site = InMemory {
+    repository,
+    held: &mut held,
+  };
   let unpacked = request.wants_pack().then(|| {
     let mut pack = unpack::Reader::new(advertised.format, &NO_INDEX);
-    let read = pack.read(bytes.get(took..).unwrap_or_default(), admission);
-    finished_pack(pack, read.map(|_| ()), repository, admission)
+    let read = pack.read_into(bytes.get(took..).unwrap_or_default(), admission, &mut site);
+    finished_pack(pack, read.map(|_| ()), &mut site, admission)
   });
-  let checked = check(request, unpacked, repository, hidden, admission)?;
-  decide(checked, judge, admission)
+  let checked = check(request, unpacked, (repository, &held), hidden, admission)?;
+  decide(checked, Some(&held), judge, admission)
 }
 
-/// The pack's outcome once its bytes have ended or been refused (`read`): finished with its bases
-/// from `repository`; or refused, with the objects its header counted. Its objects are checked by
-/// [`check`] (or [`Checking`] a turn at a time).
-fn finished_pack<R: Repository + ?Sized>(
+/// The pack's outcome once its bytes have ended or been refused (`read`): finished into `site`, its
+/// keeper, with a thin pack's bases from the repository it is; or refused, with the objects its
+/// header counted. Its objects are checked by [`check`] (or [`Checking`] a turn at a time).
+fn finished_pack<S: Keep + Repository>(
   reader: unpack::Reader<'_, NoIndex>,
   read: Result<(), unpack::Refusal>,
-  repository: &R,
+  site: &mut S,
   admission: &mut Admission,
-) -> Result<Unpacked, PackRefused> {
+) -> Result<Kept, PackRefused> {
   let objects = reader.objects();
   let refused = |why| PackRefused { objects, why };
   read.map_err(|refusal| refused(PackRefusal::Unpack(refusal)))?;
   reader
-    .finish_with(&Bases(repository), admission)
+    .finish_into(admission, &mut Thin(site))
     .map_err(|refusal| refused(PackRefusal::Unpack(refusal)))
 }
 
 /// A push read and checked, before any verdict: its request, its pack's objects or why the pack was
-/// refused, and each command's refusal by the protocol's own checks. The caller may admit the
-/// pushed objects to its store's quarantine here ([`Checked::objects`]), holding nothing of
-/// receive-pack's, and then hand the push to [`decide`].
+/// refused, and each command's refusal by the protocol's own checks. Its objects are where the
+/// pack was read into (A-719 part 3: a server's quarantine), so the push holds none of their
+/// bytes; the caller hands it to [`decide`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checked {
   /// The request.
   pub request: Request,
-  /// The pack's objects, or why it was refused; `None` when no pack was due.
-  pub unpacked: Option<Result<Unpacked, PackRefused>>,
+  /// The pack's objects' places, or why it was refused; `None` when no pack was due.
+  pub unpacked: Option<Result<Kept, PackRefused>>,
   /// Each command's refusal by the checks, in the order sent; `None` for one they passed.
   pub early: Vec<Option<Outcome>>,
   /// The pushed objects' names and positions, sorted by name, charged once by [`check`].
@@ -456,8 +547,9 @@ pub struct Checked {
 }
 
 impl Checked {
-  /// The objects the push brought, in pack order: none when no pack was due or it was refused.
-  pub fn objects(&self) -> &[Object] {
+  /// The places of the objects the push brought, in pack order: none when no pack was due or it
+  /// was refused.
+  pub fn objects(&self) -> &[Placed] {
     match &self.unpacked {
       Some(Ok(unpacked)) => unpacked.objects.as_slice(),
       _ => &[],
@@ -469,18 +561,19 @@ impl Checked {
 /// git's checks refuse (git's `transfer.fsckObjects`); otherwise each new tip's connectivity against
 /// `repository`, then each ref against `hidden`. The tables made on the way are charged to
 /// `admission` before they are made. The checks run whole: [`Checking`] makes them a turn at a time.
-pub fn check<R, H>(
+pub fn check<R, C, H>(
   request: Request,
-  unpacked: Option<Result<Unpacked, PackRefused>>,
-  repository: &R,
+  unpacked: Option<Result<Kept, PackRefused>>,
+  (repository, contents): (&R, &C),
   hidden: &H,
   admission: &mut Admission,
 ) -> Result<Checked, Refusal>
 where
   R: Repository + ?Sized,
+  C: Contents,
   H: HiddenRefs + ?Sized,
 {
-  Checking::new(request, unpacked).checked(repository, hidden, admission)
+  Checking::new(request, unpacked).checked((repository, contents), hidden, admission)
 }
 
 /// Decides a checked push: each command no check refused has `judge`'s verdict and then its append,
@@ -488,6 +581,7 @@ where
 /// outcomes are charged to `admission` before they are made.
 pub fn decide<J: Judge + ?Sized>(
   checked: Checked,
+  contents: Option<&dyn Contents>,
   judge: &mut J,
   admission: &mut Admission,
 ) -> Result<Received, Refusal> {
@@ -502,7 +596,11 @@ pub fn decide<J: Judge + ?Sized>(
     Some(Ok(unpacked)) => unpacked.objects.as_slice(),
     _ => &[],
   };
-  let pushed = Pushed { objects, by_id };
+  let pushed = Pushed {
+    objects,
+    by_id,
+    contents,
+  };
   if request.requested.atomic {
     atomic_outcomes(&request, &pushed, judge, early, &mut outcomes, admission)?;
   } else {

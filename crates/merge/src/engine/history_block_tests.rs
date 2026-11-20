@@ -48,6 +48,37 @@ fn balanced(green: &Green) {
   );
 }
 
+/// Version 3 of the A-728 test's file: 8 bytes overwritten at 100 over `second` (its versions 1 and 2 `first` and
+/// `second`, each `len` bytes named). Expect the splice to name nothing and own its 8 bytes, every version to read back
+/// exactly and the totals to equal their recount. Returns version 3's bytes.
+fn overwritten_by_a_splice(green: &mut Green, first: &[u8], second: &[u8], len: u64) -> Vec<u8> {
+  let edited = green.submit(&increment(
+    3,
+    2,
+    "f",
+    &[(OpKind::Overwrite, 100, 8)],
+    b"ABCDEFGH",
+  ));
+  assert_eq!(edited, Outcome::Accepted { version: 3 });
+  let mut third = second.to_vec();
+  third[100..108].copy_from_slice(b"ABCDEFGH");
+  assert_eq!(
+    green.history_blocks_named(),
+    (2, 2 * len),
+    "a splice names nothing"
+  );
+  assert_eq!(
+    green.history_owned_bytes(),
+    8,
+    "a splice owns what it added"
+  );
+  assert_eq!(green.content("f"), Some(third.as_slice()));
+  assert_eq!(green.content_ref_at("f", 2).as_deref(), Some(second));
+  assert_eq!(green.content_ref_at("f", 1).as_deref(), Some(first));
+  balanced(green);
+  third
+}
+
 /// A-728 (the shared path's non-vacuity counter). Do: create a 64 KiB file, replace it whole, overwrite 8 of its
 /// bytes, then fold the history to the head. Expect: the create and the whole replace each name the file's block (the
 /// counter moves by two values and 128 KiB) and the history owns no byte after them; every version reads back exactly;
@@ -89,36 +120,7 @@ fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
   );
   balanced(&green);
 
-  let edited = green.submit(&increment(
-    3,
-    2,
-    "f",
-    &[(OpKind::Overwrite, 100, 8)],
-    b"ABCDEFGH",
-  ));
-  assert_eq!(edited, Outcome::Accepted { version: 3 });
-  let mut third = second.clone();
-  third[100..108].copy_from_slice(b"ABCDEFGH");
-  assert_eq!(
-    green.history_blocks_named(),
-    (2, 2 * LEN),
-    "a splice names nothing"
-  );
-  assert_eq!(
-    green.history_owned_bytes(),
-    8,
-    "a splice owns what it added"
-  );
-  assert_eq!(green.content("f"), Some(third.as_slice()));
-  assert_eq!(
-    green.content_ref_at("f", 2).as_deref(),
-    Some(second.as_slice())
-  );
-  assert_eq!(
-    green.content_ref_at("f", 1).as_deref(),
-    Some(first.as_slice())
-  );
-  balanced(&green);
+  let third = overwritten_by_a_splice(&mut green, &first, &second, LEN);
 
   green.fold_history_before(3);
   assert_eq!(green.content("f"), Some(third.as_slice()));

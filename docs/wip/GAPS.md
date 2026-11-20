@@ -63,8 +63,9 @@
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
-> read before from the records and after from the green, recorded in the submit's transaction), its copies as rows with
-> their sources, symbolic links as `svn:special` files and `svn:author` owed; Mercurial's changesets of a submitted
+> read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
+> principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20), its copies as rows with their
+> sources and symbolic links as `svn:special` files owed; Mercurial's changesets of a submitted
 > version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
@@ -77,6 +78,9 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-719 part 3 (2026-11-20, w-git).** BUILT: git's push read straight into its quarantine (`git_push::intake`),
+> each object fsck'd as kept, the session holding places not bytes. Owed: the verdicts and the seal a turn at a time;
+> the walk reading each commit and tree twice; S3 (A-722).
 > **A-724 piece 1 (2026-11-20, w-balance; many repositories balanced by learned usage, §4.17.5).** BUILT: each
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
@@ -118,7 +122,10 @@
 > its fork back. Part 2b BUILT: a fork made from an index another push replaced since is re-based by node at
 > landing (`intake::Rebase`: each kept row appended again to a fork of the index as it is, by node, its content reused,
 > a row the index already holds passed over), a slice at a time, then judged and landed; `land` never puts a stale
-> fork in the index's place. Owed: part 3, the import's room per repository; S5 (main's convergence plan): file
+> fork in the index's place. Part 3 BUILT: an import's room is what its shard could admit, a bound only,
+> the shard charged what it holds between turns (`Import::holding`), trued up each turn (it was one client region,
+> 278,528 B: Mercurial's own repository refused `PastRoom`); the by-use import of that repository is w-perf's run.
+> Owed: part 3's by-use proof; S5 (main's convergence plan): file
 > texts as the work's green files by identity, changelog and manifests as deltas, rows naming content by identity.
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
@@ -1484,8 +1491,10 @@
 > site (`dav::report_file_revs`, `dav::report_locations`; the svn:// walks with `mod_dav_svn`'s writers); `svn diff`
 > needed nothing new (the update-report's diff form). Stock svn 1.15's `blame`, `blame -r 2`, `diff -r 1:3`, `diff -c
 > 2`, `diff --summarize`, a two-peg URL diff and `cat -r 1` over HTTP match `svnserve -t`'s byte for byte but for the
-> author (`tests/svn_http_reports.rs`). Owed: part 2, the `mergeinfo-report` and OPTIONS' `SVN-Repository-MergeInfo:
-> yes` (`svn blame -g` is refused by the client until then, and `svn merge`); deltas in svndiff 0 whatever
+> author (`tests/svn_http_reports.rs`). **Part 2:** the `mergeinfo-report` (`dav::report_mergeinfo`, the svn://
+> catalog) and OPTIONS' `SVN-Repository-MergeInfo: yes` with the `mergeinfo` capability: stock svn 1.15's `svn merge
+> ^/branch`, `svn blame -g`, `svn mergeinfo` and `propget svn:mergeinfo` over HTTP match `svnserve -t`'s. Owed: a
+> catalog with descendants written whole within the reply's room (streamed is owed); deltas in svndiff 0 whatever
 > `Accept-Encoding` prefers; the copied interop harness folded into one module with `tests/svn_interop.rs`.
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
@@ -1967,6 +1976,13 @@
 > write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
 > revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
 > its `Record::RevisionProperties` through the owner's step, post-revprop-change.
+> S4 slice 1 (with A-716), 2026-11-19 (w-svn): every Subversion text is read through a source its reader is lent:
+> `migration::TextSource` (`text(identity) -> Cow`), `reads::Repository::text` and `commit::drive::Green::text`
+> answering `Cow`, and `migration::WithTexts`, the records with their texts read from any lent source (test
+> `a_view_reads_texts_from_its_lent_source_alone`). The records still serve their own texts through it. Owed (slice 2,
+> w-perf): the lenders lend the green's content index as the source, the records keep each text's identity and
+> place without its bytes, the importer's delta base, the export and `svn_commit`'s lookups read through the source,
+> and a rebuild re-holds the texts.
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
