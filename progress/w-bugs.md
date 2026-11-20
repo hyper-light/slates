@@ -144,3 +144,7 @@
 - B5 in flight: diag-w-bugs-b5-1 (both arches): a written file's open+close via PowerShell: arm64 NTFS 73 us, WinFsp
   memfs 190 us (no 4 ms on the platform's own sample FS); x86_64 NTFS 51 us, memfs 123 us. The slates half failed
   before timing (unknown step); b5-2 logs each slates step.
+- B5 NOT REPRODUCED (diag-w-bugs-b5-4, main 137bf3633): written-file open+close p50 arm64 slates 229 us vs memfs
+  186 us vs NTFS 68 us; x86_64 93 / 44 / 13 us. No 4-5 ms. Closed in bug-claims.
+- Goal 87 B-list now: landed B3 (A-725), B14 (A-739), B16; fixed earlier B4; answered B15; not reproduced B5, B11;
+  reading findings B8, B9 (main's). Plus A-717, A-737 found and landed on the way.
