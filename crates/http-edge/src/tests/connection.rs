@@ -891,3 +891,55 @@ fn a_service_may_answer_no_content_with_no_framing_and_no_body() {
   let one = "HTTP/1.1 204 No Content\r\n\r\n";
   assert_eq!((written, asked), (format!("{one}{one}"), 2));
 }
+
+/// A-722's head at once (main's ruling of 2026-11-20: the edge writes a streamed git service's status and headers once
+/// its head is judged, before its body is read, as git's `http-backend` does; a long push's pack decoded after the
+/// client's last byte had kept the reply's head unsent past the client's read window). Do: decide a POST of ten body
+/// bytes `StatusMode::AtHead`, hand the connection its head and three of the bytes, and step it until it asks for more
+/// to read; then the rest, and a reply. Expect: the reply's head written before the body's last byte was read; the
+/// whole body taken; the reply's runs after the head, chunked, once.
+#[test]
+fn an_at_head_routes_reply_head_is_written_before_its_body_is_read() {
+  let mut connection = Connection::clear(ROOM);
+  let head = b"POST /r.git/git-receive-pack HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nabc";
+  connection.receive(head);
+  let mut written = Vec::new();
+  loop {
+    match connection.next_step() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Decide => connection.decide(Decision::Serve {
+        fields: fields(&[("Content-Type", "application/x-git-receive-pack-result")]),
+        head_only: false,
+        status: StatusMode::AtHead,
+      }),
+      Next::Body(_) => connection.body_taken(),
+      Next::Read => break,
+      other => panic!("unexpected before the body's end: {other:?}"),
+    }
+  }
+  let head_before_body = String::from_utf8_lossy(&written).into_owned();
+  connection.receive(b"defghij");
+  let mut ended = false;
+  loop {
+    match connection.next_step() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Body(_) => connection.body_taken(),
+      Next::BodyEnd => {}
+      Next::Reply if !ended => {
+        connection.reply(b"0000");
+        ended = true;
+      }
+      Next::Reply => connection.reply_end(),
+      Next::Read | Next::Close => break,
+      other => panic!("unexpected: {other:?}"),
+    }
+  }
+  assert!(
+    head_before_body.starts_with("HTTP/1.1 200 OK\r\n")
+      && head_before_body.contains("application/x-git-receive-pack-result"),
+    "{head_before_body:?}"
+  );
+  let reply = String::from_utf8_lossy(&written).into_owned();
+  assert_eq!(reply.matches("HTTP/1.1 200 OK").count(), 1, "{reply:?}");
+  assert!(reply.ends_with("4\r\n0000\r\n0\r\n\r\n"), "{reply:?}");
+}

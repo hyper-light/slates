@@ -12293,6 +12293,7 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
 > landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
 > revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
+> The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
 mirrored).** One server serves tens of thousands of concurrent clones, many of one repository, so an answer is held to
@@ -55738,6 +55739,21 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722's head at once — A git service's reply head is written before its body is read (2026-11-20, w-git for UI goal 93; main's ruling)
+- **Why.** The edge's engine wrote a reply's status and headers only once the service's reply began, after the whole
+  request body was read. A long push's pack is decoded as its body is read, so after the client's last byte the
+  connection was silent until the push was answered, and the long-history edge tests' client gave up reading at a load
+  of 40 to 67. git's `http-backend` writes its head (`200`, the result's media type, chunked) before it runs the
+  service.
+- **Change.** `slates_http_edge::connection::StatusMode::AtHead`: a route whose head is all known at its decision has
+  `200` and the decision's fields written at once, after any `100 Continue` and before any of its body is read; the
+  reply then streams from it, and a failure after it ends the connection short of the reply's end, as a cut git answer
+  does. git's smart services (`vcs_http::git`, upload-pack's and receive-pack's results and advertisements) take it.
+  Mercurial's commands stay `Streamed` (their media type is named as the reply begins) and Subversion's site `AfterBody`;
+  w-hg and w-svn were told.
+- **Tests.** `slates-http-edge` `connection::tests::an_at_head_routes_reply_head_is_written_before_its_body_is_read` (red
+  with the head written at the reply: no head before the body's end).
+
 ### A-722's keepalive — A long push's answer writes git's keepalive while it is made (2026-11-20, w-git for UI goal 93; main's order: the two load-only edge tests)
 - **Why.** Over the HTTP edge a push's answer was made whole in the exchange's `body_end` and written only after it, so a
   long push wrote nothing until its report: at a load of 56 to 67 the long-history edge tests' client gave up reading
@@ -55749,10 +55765,7 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   going (`ClientGone`) as `body_end` is, so a hook run in the reply's turns ends with its client. A push without
   side-band is answered whole as before, and a refusal before any reply still answers with a status. The edge tests'
   long-history requests now ask stock git's capabilities (`report-status-v2 side-band-64k ...`).
-- **Owed.** The silence before the reply begins: the edge's engine writes the status only once the body is read, while
-  git's `http-backend` writes its head before it reads the body, so a long pack's decode after the client's last byte
-  is silent (the two long-history tests still meet their 10 s read wait at a load of 40 to 50). The status written at
-  the head on a streamed route is an `http-edge` change (proposed to main).
+- **The silence before the reply begins** is A-722's head at once (the section above).
 - **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`
   (a daemon whose interval is none: the answer begins with `0005\1`, its report whole after the keepalives);
   `slates-server --lib -- vcs_http:: git_push:: vcs_ssh::` 156 passed, the two long-history tests (owed above) and
@@ -56893,6 +56906,18 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   4.9 ms, the best within a heartbeat). Red with the waiter never attached: each waited out the liveness budget, about
   1.02 s. Fleet `a_forwarded_submit` and `a_holder`; `slates-server --lib merge_service:: verbs:: xshard:: work_home`;
   fmt clean.
+
+### A-762 — The dump exporter reads a text a bounded step a call (2026-11-20, w-svn for UI goal 93; main's item 2; §4.17.1 "A fetch's answer", rule 3)
+
+- Found by reading: c2's exporter `load` rebuilt a text through its whole delta chain in one call. Measured (debug): a
+  512 KiB text with a chain of 6, the longest export call 6.18 ms against a whole read of 6.04 ms.
+- `TextSource::read_step` with `migration::TextReading`: the records rebuild a chain one svndiff window a step, its
+  first delta first; `svn_texts::HeadTexts` reads a stored text a store window a step (`ContentStore::window_at`) and a
+  green's held text a window's room a step. The exporter's call whose texts are not whole takes one step and writes
+  nothing; its cache holds a delta's two texts and the one being read.
+- Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read; red before) and
+  `a_stored_text_is_read_a_store_window_a_step`.
+- **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.
 
 ### §4.8 amended — A borrower waiting for a record session out on loan is woken by its return, never paced (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family one of three)
 Applied in the same change to: §4.8 "Lookup" (a forward that finds its peer's session out), GAPS (the sweep's line),

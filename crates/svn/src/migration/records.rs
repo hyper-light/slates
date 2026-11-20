@@ -883,6 +883,12 @@ pub trait TextSource {
   /// The text held under `identity`, whole: borrowed where the source holds it in one piece, owned where it must copy
   /// it; none where the source holds no such text.
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>>;
+
+  /// Reads `identity`'s text into `reading` a bounded step (§4.17.1 "A fetch's answer", rule 3: the export's text
+  /// rebuild sliced, main's item 2 of 2026-11-20): at most one window's room of bytes copied, or one svndiff window of
+  /// a delta chain applied. True once `reading` holds the text whole ([`TextReading::bytes`]); none where the source
+  /// holds no such text or its chain does not hold together.
+  fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool>;
 }
 
 /// The records hold their own texts until the green's content index serves them (S4's second slice, A-716): a text
@@ -890,6 +896,124 @@ pub trait TextSource {
 impl TextSource for Repository {
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     Repository::text(self, identity)
+  }
+
+  fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+    Repository::read_step(self, identity, reading)
+  }
+}
+
+/// A text being read a bounded step at a time ([`TextSource::read_step`]): the bytes read so far, and, for a text the
+/// records keep as a chain of deltas, where its rebuild stands: the chain from its first delta, the level being made,
+/// how much of that level's delta is decoded, the level below whole and the level being made so far.
+#[derive(Clone, Debug, Default)]
+pub struct TextReading {
+  /// The text's bytes read so far; the whole text once a step answered true.
+  bytes: Vec<u8>,
+  /// The chain's identities, its first delta (against nothing) first; empty before the rebuild's first step.
+  chain: Vec<ContentIdentity>,
+  /// The level being made, an index into `chain`.
+  level: usize,
+  /// How many bytes of that level's delta are decoded.
+  decoded: usize,
+  /// The delta's decoder.
+  decoder: svndiff::Decoder,
+  /// The level below, whole: the source the level's windows read.
+  below: Vec<u8>,
+}
+
+impl TextReading {
+  /// A reading that has read nothing.
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// The bytes read so far: the text whole once a step answered true.
+  pub fn bytes(&self) -> &[u8] {
+    &self.bytes
+  }
+
+  /// The text read, the reading ended.
+  pub fn into_bytes(self) -> Vec<u8> {
+    self.bytes
+  }
+
+  /// How many bytes are read so far: where the next piece of a text held in one piece starts.
+  pub fn read(&self) -> u64 {
+    u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+  }
+
+  /// Appends `piece`, the next of a text read in pieces (a content store's window), true once `len` bytes are read.
+  pub fn append(&mut self, piece: &[u8], len: u64) -> bool {
+    self.bytes.extend_from_slice(piece);
+    self.read() >= len
+  }
+
+  /// Copies the next piece of `whole`, a text held in one piece, at most a window's room ([`svndiff::WINDOW_LIMIT`]);
+  /// true once all of it is copied.
+  pub fn copy_step(&mut self, whole: &[u8]) -> bool {
+    let room = usize::try_from(svndiff::WINDOW_LIMIT).unwrap_or(usize::MAX);
+    let rest = whole.get(self.bytes.len()..).unwrap_or_default();
+    self
+      .bytes
+      .extend_from_slice(rest.get(..room).unwrap_or(rest));
+    self.bytes.len() >= whole.len()
+  }
+}
+
+impl Repository {
+  /// One step of reading the text held under `identity` into `reading` ([`TextSource::read_step`]): a property list's
+  /// bytes copied a window's room a step; a kept text made from its chain one svndiff window a step, its first delta
+  /// first, each level read against the one below it whole, as [`Repository::text`] makes it whole.
+  pub fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+    if !self.texts.contains_key(identity) {
+      return self
+        .contents
+        .get(identity)
+        .map(|bytes| reading.copy_step(bytes));
+    }
+    if reading.chain.is_empty() {
+      let mut at = *identity;
+      loop {
+        let kept = self.texts.get(&at)?;
+        reading.chain.push(at);
+        match kept.base {
+          Some(base) if reading.chain.len() <= MAX_CHAIN => at = base,
+          Some(_) => return None,
+          None => break,
+        }
+      }
+      reading.chain.reverse();
+      reading.bytes.clear();
+    }
+    let kept = self.texts.get(reading.chain.get(reading.level)?)?;
+    let rest = kept.delta.get(reading.decoded..)?;
+    match reading.decoder.decode(rest).ok()? {
+      svndiff::Decoded::Header { consumed, .. } => {
+        reading.decoded = reading.decoded.checked_add(consumed)?;
+      }
+      svndiff::Decoded::Window { window, consumed } => {
+        let start = usize::try_from(window.source_offset).ok()?;
+        let end = start.checked_add(usize::try_from(window.source_len).ok()?)?;
+        let view = reading.below.get(start..end)?;
+        svndiff::apply(&window, view, &mut reading.bytes).ok()?;
+        reading.decoded = reading.decoded.checked_add(consumed)?;
+      }
+      svndiff::Decoded::NeedMore { .. } => return None,
+    }
+    if reading.decoded < kept.delta.len() {
+      return Some(false);
+    }
+    reading.decoder.finish(&[]).ok()?;
+    reading.level = reading.level.checked_add(1)?;
+    reading.decoded = 0;
+    reading.decoder = svndiff::Decoder::new();
+    if reading.level >= reading.chain.len() {
+      reading.below = Vec::new();
+      return Some(true);
+    }
+    reading.below = std::mem::take(&mut reading.bytes);
+    Some(false)
   }
 }
 

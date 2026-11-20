@@ -2108,7 +2108,13 @@
 > durable (`vcs_store::content_durable`, A-727 slice b), a refusal giving every put text back (`NotDurable`); reads
 > find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity and
 > refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
-> Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. **The export's text
+> read sliced (A-762, same day, w-svn, main's item 2; found by reading):** the exporter rebuilt a text through its whole delta
+> chain in one call (512 KiB, a chain of 6: the longest call 6.18 ms against a whole read of 6.04 ms, debug). Now a text
+> is read a bounded step a call (`TextSource::read_step`, `migration::TextReading`): a chain one svndiff window a step,
+> a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
+> writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
+> and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -7193,10 +7199,27 @@
 >   and its `FLEET_WAIT` waits (every node's processes judged together, `StartProgress::look_all`; the fleet submit run
 >   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone; `cli`'s map,
 >   second-mount, journal-pipeline and referenced-bytes waits judged the same (`WAIT_FOR` now bounds only what no slates
->   process holds: a sibling test's child keeping a mount busy or a pipe's end open, and a container probe's map). Owed
->   in `cli/tests`: `cli`'s container waits (`CONTAINER_WAIT`, `DOCKER_INFO_WAIT`, on Docker) and `shards_reader`'s
->   read timeout, `live_fleet`, `vm`,
->   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
+>   process holds: a sibling test's child keeping a mount busy or a pipe's end open, and a container probe's map); its
+>   waits for an unmount to show in Linux's mount table wait on the table's own notification (`POLLPRI` on
+>   `/proc/self/mountinfo`) within the observation budget (`MOUNT_TABLE_WAIT`), no poll and no CPU budget (main's
+>   ruling: the waiter spends none); `shards_reader` reads its handed end without a timeout. Owed
+>   in `cli/tests`: `live_fleet` since 2026-11-20 (its start, formation, catch-up, takeover, restart, transient-write
+>   and v4-commit waits judged over the nodes' processes with the judgment `cli`'s `StartProgress` was, now
+>   `process_wait::InstanceWait`; its NFS reads with no timeout; a stop awaited on the kernel's report, `waitid` for a
+>   stopped child, within the observation budget; `FLEET_WAIT` and `START_WAIT` gone; the fenced owner's
+>   `STALE_WRITE_WAIT` kept as the deadline that test proves). `cli`'s container waits (`CONTAINER_WAIT`,
+>   `DOCKER_INFO_WAIT`) stay: they wait on Docker Desktop's VM, no process of the test's tree. `vcs_edge_restart` since
+>   2026-11-20: its anchor's lines judged in the anchor's process tree (`process_wait::Judged`, which Windows builds too),
+>   its listeners' first answers read without a timeout, `PATIENCE` gone. `fs_server` since 2026-11-20: `eventually`, the
+>   enroll's wait for the node's groups, the path-estimate wait and the retired host's attachments judged over the nodes'
+>   processes, an anchor's stop on drop judged in its tree; `FLEET_WAIT` and `RETIREMENT_WAIT` gone; the silent holder's
+>   bound, the heal's give-up and the cut's length kept as what those tests prove, and `DOCKER_WAIT` on Docker. `live_chaos`
+>   since 2026-11-20: its waits were already judged (`wait_answers` in CPU, `FleetWait` over the box's CPU share,
+>   b25a5b7a6); its successor wait now judged over the instance's processes and its NFS barrier read without a timeout.
+>   `support/relay` keeps its bounds: they wait on the test's own relay thread and loopback datagrams, no slates process,
+>   and its absence waits are what its tests prove. Owed in `cli/tests`: `vm`, `start_judgment`
+>   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
+>   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as

@@ -41,7 +41,7 @@ use super::MigrationRefusal;
 use super::paths::{
   absolute, basename, compare_paths, dirname, join, longest_ancestor, names, relative,
 };
-use super::records::{Facts, Properties, Repository, TextSource, node};
+use super::records::{Facts, Properties, Repository, TextReading, TextSource, node};
 use crate::dump::{
   CopyFrom, DeltaBase, Event, Format, NodeAction, NodeHeader, Property, PropertySection,
   RevisionHeader, TextSection, Writer, section_len,
@@ -102,8 +102,18 @@ struct Pending {
   /// The next changed path's delta's svndiff length, once measured.
   measured: Option<u64>,
   /// The texts the window calls read, made once from the records' deltas and kept while they are written (S4 c2):
-  /// at most a delta's two, the newest kept.
-  texts: Vec<(ContentIdentity, Vec<u8>)>,
+  /// at most a delta's two, the newest kept, and the one being read a step a call.
+  texts: Loaded,
+}
+
+/// The texts a record's window calls read ([`load`]): those read whole, at most a delta's two, and the one being read
+/// a bounded step a call ([`TextSource::read_step`]), so no call rebuilds a text whole.
+#[derive(Clone, Debug, Default)]
+struct Loaded {
+  /// The texts read whole, by identity.
+  held: Vec<(ContentIdentity, Vec<u8>)>,
+  /// The text being read, and where its reading stands.
+  reading: Option<(ContentIdentity, TextReading)>,
 }
 
 /// A delta's svndiff length being measured a window a call, no window kept: its texts, where the deltifier stands, and
@@ -274,7 +284,7 @@ impl Exporter {
       text: None,
       measuring: None,
       measured: None,
-      texts: Vec::new(),
+      texts: Loaded::default(),
     });
     Ok(false)
   }
@@ -823,39 +833,54 @@ fn window_room() -> Result<NonZeroUsize, MigrationRefusal> {
   NonZeroUsize::new(room).ok_or(MigrationRefusal::Corrupt)
 }
 
-/// The texts the window calls read held in `texts` (`Pending::texts`): each of `wanted` made from the records once,
-/// and the texts no longer wanted let go, so it holds a delta's two at most.
+/// Whether every text of `wanted` is held in `texts` (`Pending::texts`); if not, one bounded step of reading the first
+/// missing one ([`TextSource::read_step`]), so a call that reads writes nothing and the next goes on. The texts no
+/// longer wanted are let go, so it holds a delta's two at most, and the one being read.
 fn load(
   repository: &dyn TextSource,
-  texts: &mut Vec<(ContentIdentity, Vec<u8>)>,
+  texts: &mut Loaded,
   wanted: &[Option<Text>],
-) -> Result<(), MigrationRefusal> {
-  texts.retain(|(identity, _)| {
+) -> Result<bool, MigrationRefusal> {
+  let is_wanted = |identity: &ContentIdentity| {
     wanted
       .iter()
       .flatten()
       .any(|text| text.identity == *identity)
+  };
+  texts.held.retain(|(identity, _)| is_wanted(identity));
+  let missing = wanted.iter().flatten().find(|text| {
+    !texts
+      .held
+      .iter()
+      .any(|(identity, _)| *identity == text.identity)
   });
-  for text in wanted.iter().flatten() {
-    if texts.iter().any(|(identity, _)| *identity == text.identity) {
-      continue;
-    }
-    let bytes = repository
-      .text(&text.identity)
-      .ok_or(MigrationRefusal::Corrupt)?
-      .into_owned();
-    texts.push((text.identity, bytes));
+  let Some(missing) = missing else {
+    texts.reading = None;
+    return Ok(true);
+  };
+  if texts
+    .reading
+    .as_ref()
+    .is_none_or(|(identity, _)| *identity != missing.identity)
+  {
+    texts.reading = Some((missing.identity, TextReading::new()));
   }
-  Ok(())
+  let (identity, reading) = texts.reading.as_mut().ok_or(MigrationRefusal::Corrupt)?;
+  let whole = repository
+    .read_step(identity, reading)
+    .ok_or(MigrationRefusal::Corrupt)?;
+  if whole {
+    let (identity, reading) = texts.reading.take().ok_or(MigrationRefusal::Corrupt)?;
+    texts.held.push((identity, reading.into_bytes()));
+  }
+  Ok(false)
 }
 
 /// The bytes of `text` among `texts`, the empty text for none ([`load`] read it first).
-fn bytes_of(
-  texts: &[(ContentIdentity, Vec<u8>)],
-  text: Option<Text>,
-) -> Result<&[u8], MigrationRefusal> {
+fn bytes_of(texts: &Loaded, text: Option<Text>) -> Result<&[u8], MigrationRefusal> {
   match text {
     Some(text) => texts
+      .held
       .iter()
       .find(|(identity, _)| *identity == text.identity)
       .map(|(_, bytes)| bytes.as_slice())
@@ -869,12 +894,14 @@ fn write_text(
   repository: &dyn TextSource,
   stream: &mut Stream<'_>,
   (texting, text_piece): (Texting, NonZeroUsize),
-  texts: &mut Vec<(ContentIdentity, Vec<u8>)>,
+  texts: &mut Loaded,
 ) -> Result<Option<Texting>, MigrationRefusal> {
   let room = window_room()?;
   match texting {
     Texting::Whole { text, sent } => {
-      load(repository, texts, &[text])?;
+      if !load(repository, texts, &[text])? {
+        return Ok(Some(texting));
+      }
       let bytes = bytes_of(texts, text)?;
       let start = usize::try_from(sent).map_err(|_| MigrationRefusal::Corrupt)?;
       let rest = bytes.get(start..).unwrap_or_default();
@@ -893,7 +920,9 @@ fn write_text(
       }))
     }
     Texting::Delta { source, target, at } => {
-      load(repository, texts, &[source, target])?;
+      if !load(repository, texts, &[source, target])? {
+        return Ok(Some(texting));
+      }
       let (from, to) = (bytes_of(texts, source)?, bytes_of(texts, target)?);
       let mut made = match at {
         Some(at) => deltas_at(from, to, room, at),
@@ -923,10 +952,12 @@ fn write_text(
 fn measure_window(
   repository: &dyn TextSource,
   measuring: Measuring,
-  texts: &mut Vec<(ContentIdentity, Vec<u8>)>,
+  texts: &mut Loaded,
 ) -> Result<Option<Measuring>, MigrationRefusal> {
   let room = window_room()?;
-  load(repository, texts, &[measuring.source, measuring.target])?;
+  if !load(repository, texts, &[measuring.source, measuring.target])? {
+    return Ok(Some(measuring));
+  }
   let (from, to) = (
     bytes_of(texts, measuring.source)?,
     bytes_of(texts, measuring.target)?,
