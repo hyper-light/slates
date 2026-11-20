@@ -197,3 +197,24 @@ fn a_refused_request_ends_its_transaction() {
     (404, true, 404, true, true)
   );
 }
+
+/// A-681 (RFC 4918 §10.4; `libsvn_ra_serf/commit.c` `setup_put_headers`): do read the `If` header ra_serf sends with a
+/// locked file's PUT, a tagged list naming a resource and two tokens, and one naming no lock token. Expect the tokens
+/// alone, in order, and none from the last.
+#[test]
+fn an_if_header_presents_its_lock_tokens_and_no_resource_tag() {
+  assert_eq!(
+    (
+      DavCommit::if_tokens("(<opaquelocktoken:6b4a5e2c-0000>)"),
+      DavCommit::if_tokens(
+        "<http://svn.example/repo/a> (<opaquelocktoken:one>) (Not <opaquelocktoken:two>)"
+      ),
+      DavCommit::if_tokens("([\"etag\"])"),
+    ),
+    (
+      vec!["opaquelocktoken:6b4a5e2c-0000"],
+      vec!["opaquelocktoken:one", "opaquelocktoken:two"],
+      Vec::<&str>::new(),
+    )
+  );
+}
