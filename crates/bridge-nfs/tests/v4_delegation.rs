@@ -254,6 +254,29 @@ fn a_recalled_file_is_not_delegated_again_within_the_quiet_period() {
   );
 }
 
+/// §10.4.5, A-709: do recall a delegation its holder never returns; expect the earliest outstanding recall to name the
+/// instant it began, none before the recall, the revocation due exactly a lease and a nanosecond after it, and none
+/// outstanding once it is revoked: the instant the shard's keeper sleeps to.
+#[test]
+fn the_earliest_unreturned_recall_names_when_its_revocation_falls_due() {
+  let mut files = owner();
+  let fh = handle(11, 1);
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
+  files.delegate_read(A, &fh, 0, QUIET).unwrap();
+  assert_eq!(files.earliest_recall_ns(), None, "nothing recalled yet");
+  files.recall(&fh, Some(B), Conflict::Change, 100);
+  assert_eq!(files.earliest_recall_ns(), Some(100));
+  assert!(files.revoke_lapsed(100 + LEASE, LEASE, QUIET).is_empty());
+  assert_eq!(files.revoke_lapsed(101 + LEASE, LEASE, QUIET).len(), 1);
+  assert_eq!(
+    files.earliest_recall_ns(),
+    None,
+    "revoked: none outstanding"
+  );
+}
+
 /// §10.4.5: do recall a delegation its holder never returns; expect it revoked once a lease has passed since the
 /// recall, journaled as cleared, and not before.
 #[test]

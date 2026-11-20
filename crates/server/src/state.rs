@@ -718,6 +718,9 @@ pub struct ShardState {
   pub(crate) capture_deadlines: crate::deadlines::CaptureDeadlines,
   /// The shard's deadline keeper, woken when a deadline is set earlier than the one it sleeps for (A-522).
   pub(crate) deadline_task: Option<slates_rt::TaskId>,
+  /// The shard's hint watcher's part (A-709, `crate::base_hints`): the set of its base watchers and the volumes owed a
+  /// drain.
+  pub(crate) base_hints: crate::base_hints::BaseHints,
   /// The deadline the keeper sleeps until, `None` while none is set (`crate::deadlines::noted` reads it).
   pub(crate) deadline_armed: Option<u64>,
   /// When a destroy whose completion record the catalog refused is tried again (A-536): the shard's window after the
@@ -1184,6 +1187,10 @@ pub struct ShardState {
   /// When the deadline keeper next hands a purge round to the reaper (A-570, `crate::nfs::note_purges`): at once at a
   /// start whose partition owes purges, a retry window on while the NFSv4 table owes any; `None` while none is owed.
   pub(crate) nfs_purge_at: Option<u64>,
+  /// When the earliest unreturned delegation recall lapses (RFC 8881 §10.4.5; A-709): set by each recall drain
+  /// (`crate::delegation::drain`), kept by the deadline keeper, which drains again then to revoke it; `None` while no
+  /// recall is outstanding.
+  pub(crate) delegation_lapse_at: Option<u64>,
   /// Whether the reaper owes a purge round (A-570): set by the keeper at `nfs_purge_at`, taken by the reaper.
   pub(crate) nfs_purge_owed: bool,
   /// When the deadline keeper re-arms the backed route's huge-page placement (A-570): a retry window after the host
@@ -1514,6 +1521,8 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     let result = f(state);
     // A deadline the borrow set before the one the shard's keeper sleeps for wakes it, whichever path set it (A-536).
     crate::deadlines::after_borrow(state);
+    // A volume owed a hint drain whose host a landing gave back wakes the hint watcher (A-709).
+    crate::base_hints::after_borrow(state);
     crate::retention::retain(state).map_err(StateAccess::Retention)?;
     Ok(result)
   })

@@ -703,11 +703,9 @@ fn http_leg(session: &str) -> Option<Leg> {
 /// and the token as the user and password `svn` answers CRAM-MD5 with, as A-692 proves a token's principal (the token's
 /// record keeps its CRAM-MD5 keyed contexts; `slates_server::credentials::cram_md5_key`). Expect: every step as
 /// against `svnserve` ([`stock_svn_sessions_hold_against_stock_svnserve`]). Skips loudly without stock Subversion
-/// 1.15. Ignored until it can pass: the listener (A-689, g234) answers every URL "No repository found" until its next
-/// slice looks the repository up, lends its sources, asks `cram_md5_key` for a client's key and calls A-655 part 2b's
-/// commit step.
+/// 1.15. Its waits, as they ended: the listener (A-689) answered every URL "No repository found" until A-695 looked the
+/// repository up, and its commits landed through the owner's step since 7bedc3a88.
 #[test]
-#[ignore = "waits on A-689 and its repository lookup (g234)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   if !stock_svn() {
     eprintln!("skipping stock svn over svn://: no stock Subversion 1.15 here (svn on the PATH)");
@@ -794,10 +792,9 @@ fn ssh_key(scratch: &Scratch) -> Option<(String, String)> {
 /// 127.0.0.1:0`); make the repository and enroll the key (`slates credential key`); run the round trip as stock `svn`
 /// 1.15 at `svn+ssh://slates@127.0.0.1/project`, its `ssh` tunnel OpenSSH holding that key alone at the edge's port,
 /// reading no user's configuration and keeping no host key. Expect: every step as against `svnserve`. Skips loudly
-/// without stock Subversion 1.15, `ssh` or `ssh-keygen`. Ignored until it can pass: no daemon starts the SSH edge until
-/// A-684 (g299), whose port line [`VCS_SSH_LINE`] assumes; the edge runs no `svnserve -t` until A-688 (g229).
+/// without stock Subversion 1.15, `ssh` or `ssh-keygen`. Its waits, as they ended: the daemon's SSH edge (A-684), and
+/// `svnserve -t` on it over its shard's records, committing through the owner's step (fc79d36ae).
 #[test]
-#[ignore = "waits on A-684 (g299) and A-688 (g229)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh() {
   if !stock_svn() || !openssh() {
     eprintln!(

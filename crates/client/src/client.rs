@@ -3861,6 +3861,45 @@ impl Client {
     }
   }
 
+  /// Imports a history into repository `repository`'s empty store (A-678, A-652 part 3; the CLI's verb A-710): `path`
+  /// is a host path the daemon reads, a Mercurial repository's directory for a Mercurial repository or a Subversion
+  /// dump for a Subversion one; answered when the import ends, with what it took. Refused typed (`ImportRefused` with
+  /// its fault, `NotFound` for no such repository), nothing imported.
+  pub fn import_repository(
+    &mut self,
+    repository: &str,
+    path: &str,
+  ) -> Result<Imported, ClientError> {
+    match self.call(&RequestBody::ImportRepository {
+      repository: repository.to_owned(),
+      path: path.to_owned(),
+    })? {
+      ReplyBody::RepositoryImported {
+        changesets,
+        manifests,
+        file_logs,
+        file_revisions,
+        markers,
+      } => Ok(Imported::Mercurial {
+        changesets,
+        manifests,
+        file_logs,
+        file_revisions,
+        markers,
+      }),
+      ReplyBody::DumpImported {
+        revisions,
+        youngest,
+      } => Ok(Imported::Dump {
+        revisions,
+        youngest,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "import_repository",
+      }),
+    }
+  }
+
   /// Re-pins a green attachment to `version`, or to the head (§4.16 `advance`): the version now
   /// pinned and the paths the move invalidated.
   pub fn advance(
@@ -5489,4 +5528,30 @@ fn fs_done(reply: ReplyBody, verb: &'static str) -> Result<u64, ClientError> {
     ReplyBody::FsDone { size } => Ok(size),
     _ => Err(ClientError::UnexpectedReply { verb }),
   }
+}
+
+/// What a repository's import took ([`Client::import_repository`], A-710).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Imported {
+  /// A Mercurial repository's directory: its changesets, manifest revisions, file logs, file revisions over every file
+  /// log, and obsolescence markers.
+  Mercurial {
+    /// The changesets.
+    changesets: u32,
+    /// The manifest revisions.
+    manifests: u32,
+    /// The file logs.
+    file_logs: u64,
+    /// The file revisions, over every file log.
+    file_revisions: u64,
+    /// The obsolescence markers.
+    markers: u64,
+  },
+  /// A Subversion dump: the revisions it committed, and the repository's youngest revision now.
+  Dump {
+    /// The revisions committed.
+    revisions: u64,
+    /// The youngest revision.
+    youngest: u64,
+  },
 }

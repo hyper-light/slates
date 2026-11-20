@@ -287,12 +287,23 @@ fn challenge_of(item: &str) -> &str {
   item.get(length_end + 1..length_end + 1 + length).unwrap()
 }
 
-/// A stock client's CRAM-MD5 session with the listener at `port` for `url`, whose root URL is `root`: greeted, it
-/// answers as stock `svn` 1.15.0 answered `svnserve`, chooses CRAM-MD5, answers the challenge as the token's id with
-/// [`TOKEN`] as its password, and asks `get-latest-rev`. What the listener wrote after its greeting, and what stock
-/// `svnserve` 1.15.0 wrote in its own recorded `cram-md5` session (the realm and the UUID the repository's, the
-/// challenge the listener's).
-fn cram_session(port: u16, greeting: &[u8], url: &str, root: &str) -> (String, String) {
+/// A client signed in: its stream, what the listener wrote after its greeting (the authentication request, the
+/// challenge, the success and `repos-info`), the challenge's item and the repository's UUID.
+struct SignedIn {
+  /// The stream.
+  stream: ClientStream,
+  /// What the listener wrote after its greeting.
+  written: String,
+  /// The challenge's item.
+  step: String,
+  /// The repository's UUID, as its realm named it.
+  uuid: String,
+}
+
+/// A stock client's CRAM-MD5 sign-in with the listener at `port` for `url` (the greeting checked against `greeting`):
+/// it answers as stock `svn` 1.15.0 answered `svnserve`, chooses CRAM-MD5, and answers the challenge as the token's id
+/// with [`TOKEN`] as its password.
+fn sign_in(port: u16, greeting: &[u8], url: &str) -> SignedIn {
   let mut stream = ClientStream::connect(("127.0.0.1", port)).expect("the listener takes it");
   stream
     .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
@@ -321,21 +332,45 @@ fn cram_session(port: u16, greeting: &[u8], url: &str, root: &str) -> (String, S
     .write_all(format!("{}:{response} ", response.len()).as_bytes())
     .expect("the response");
   let established = read_items(&mut stream, 2);
-  stream
-    .write_all(b"( get-latest-rev ( ) ) ")
-    .expect("the command");
-  let latest = read_items(&mut stream, 2);
   let uuid = asked
     .split_once("36:")
     .and_then(|(_, rest)| rest.get(..36))
     .unwrap_or_default()
     .to_owned();
-  let expected = format!(
-    "( success ( ( CRAM-MD5 ) 36:{uuid} ) ) {step}( success ( ) ) ( success ( 36:{uuid} {} ( mergeinfo ) ) ) \
-     ( success ( ( ) 0: ) ) ( success ( 0 ) ) ",
+  SignedIn {
+    stream,
+    written: format!("{asked}{step}{established}"),
+    step,
+    uuid,
+  }
+}
+
+/// Writes `command` to `stream` and reads the `items` whole items the listener answers it with.
+fn asked(stream: &mut ClientStream, command: &[u8], items: usize) -> String {
+  stream.write_all(command).expect("the command");
+  read_items(stream, items)
+}
+
+/// What stock `svnserve` 1.15.0 wrote in its recorded `cram-md5` session after its greeting, for a repository of
+/// `uuid` at root URL `root` and the listener's challenge item `step`.
+fn signed_in_as_svnserve(uuid: &str, step: &str, root: &str) -> String {
+  format!(
+    "( success ( ( CRAM-MD5 ) 36:{uuid} ) ) {step}( success ( ) ) ( success ( 36:{uuid} {} ( mergeinfo ) ) ) ",
     string_item(root)
+  )
+}
+
+/// A stock client's CRAM-MD5 session with the listener at `port` for `url`, whose root URL is `root`, asking
+/// `get-latest-rev` once signed in: what the listener wrote after its greeting, and what stock `svnserve` 1.15.0 wrote
+/// in its own recorded `cram-md5` session (the realm and the UUID the repository's, the challenge the listener's).
+fn cram_session(port: u16, greeting: &[u8], url: &str, root: &str) -> (String, String) {
+  let mut signed = sign_in(port, greeting, url);
+  let latest = asked(&mut signed.stream, b"( get-latest-rev ( ) ) ", 2);
+  let expected = format!(
+    "{}( success ( ( ) 0: ) ) ( success ( 0 ) ) ",
+    signed_in_as_svnserve(&signed.uuid, &signed.step, root)
   );
-  (format!("{asked}{step}{established}{latest}"), expected)
+  (format!("{}{latest}", signed.written), expected)
 }
 
 /// A-692's svn:// half (§4.17.4 item 10; A-695's lookup). Do: on a daemon of two shards, enroll a token for the
@@ -379,4 +414,45 @@ fn a_stock_client_signs_in_with_an_enrolled_token_on_either_shard_and_reads() {
 fn a_daemon_that_is_no_fleet_node_starts_no_listener_off_loopback() {
   let daemon = daemon(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
   assert_eq!(daemon.vcs_svn_port(), None);
+}
+
+/// Format: stock `svn` 1.15.0's `mkdir` commit as it wrote it to `svnserve` (A-655's recording), from its `commit` to
+/// its `close-edit`.
+const MKDIR_COMMIT: &[u8] = include_bytes!("../../../svn/fixtures/commit/mkdir.1.client.bin");
+
+/// Format: where the recorded client's commit starts, after its handshake.
+const COMMIT_START: &[u8] = b"( commit ";
+
+/// A-698's svn:// half (§4.17.4 piece 7; after A-692 continued (1)). Do: on a daemon of two shards, enroll a token for
+/// the repositories' owner and create a Subversion repository on the other shard's partition; sign in over the
+/// listener with the token, send stock `svn` 1.15.0's recorded `mkdir` commit of `/trunk`, then ask `get-latest-rev`.
+/// Expect: the commit is answered as `svnserve` answered it (the trivial authentication, the commit's success,
+/// `close-edit`'s, the trivial authentication again, then `commit-info` naming revision 1), and the youngest revision
+/// is then 1: the work landed through the owner's commit step on the shard the connection moved to. Before this, the
+/// listener ended the connection at the commit.
+#[test]
+fn a_stock_commit_over_svn_lands_through_the_owners_step() {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  let root = format!("svn://127.0.0.1:{port}/{name}");
+  let mut signed = sign_in(port, &greeting, &root);
+  let commit_at = MKDIR_COMMIT
+    .windows(COMMIT_START.len())
+    .position(|window| window == COMMIT_START)
+    .expect("the recorded commit");
+  let committed = asked(&mut signed.stream, &MKDIR_COMMIT[commit_at..], 5);
+  let latest = asked(&mut signed.stream, b"( get-latest-rev ( ) ) ", 2);
+  let made =
+    "( success ( ( ) 0: ) ) ( success ( ) ) ( success ( ) ) ( success ( ( ) 0: ) ) ( 1 ( 27:";
+  assert!(committed.starts_with(made), "{committed}");
+  assert!(committed.ends_with(" ) ( ) ) "), "{committed}");
+  assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 1 ) ) ");
 }

@@ -27,7 +27,8 @@
 //! repository's served view (`crate::vcs_store::hg_view::ServedViews`, A-680 part 2a, A-679), lent on the owner's shard,
 //! and git's receive-pack through the push driver on the owner's shard, its state lent a step at a time as the HTTP
 //! edge's git site lends it (`crate::vcs_http::git::ThisShard`, A-683), each request and each push admitted the edge's
-//! room; Subversion's tunnel refused as not served until its stores' lender lands (A-688).
+//! room; and Subversion's `svnserve -t` tunnel (A-688's `SvnServices`) over the records the shard holds
+//! (`crate::vcs_store::svn_view::TunnelRecords`), its commits landed through the owner's commit step (A-698).
 //!
 //! Each reason the edge cannot start (no host key, an address that does not bind, a listener held elsewhere) leaves the
 //! daemon serving everything else, logged, as the HTTP edge's does.
@@ -39,13 +40,17 @@ use slates_ssh::entropy::{Entropy, SystemEntropy};
 use slates_ssh::hostkey::{ED25519_SEED_LEN, HostKey};
 
 use super::site::{RecordKeys, ToolServices, ToolSite};
+use super::svn::{SvnServices, TunnelBounds};
 use super::{EdgeState, HostSeed, keep_here, serve};
 use crate::config::{DaemonConfig, VcsSshConfig};
 use crate::daemon::VcsSshEdge;
 use crate::vcs_http::ShardRepositories;
 use crate::vcs_http::git::ThisShard;
 use crate::vcs_store::hg_view::ServedViews;
+use crate::vcs_store::svn_view::TunnelRecords;
 use crate::vcs_store::upload::ShardStores;
+use slates_svn::report::exchange::Budget;
+use slates_svn::serve::Limits;
 
 /// Counter: an edge whose listener's task the control shard's arena refused.
 const NOT_STARTED: &str = "vcs_ssh.not_started";
@@ -53,8 +58,46 @@ const NOT_STARTED: &str = "vcs_ssh.not_started";
 const NOT_KEPT: &str = "vcs_ssh.not_kept";
 
 /// The SSH site as the daemon serves it (the module doc, "What it serves").
-pub(crate) type DaemonSite =
-  ToolSite<RecordKeys, ShardRepositories, ToolServices<ShardStores, ServedViews, ThisShard>>;
+pub(crate) type DaemonSite = ToolSite<
+  RecordKeys,
+  ShardRepositories,
+  SvnServices<ToolServices<ShardStores, ServedViews, ThisShard>, ShardRepositories, TunnelRecords>,
+>;
+
+/// Format: the fewest bytes a path spends on one of its names: a name of one byte and its `/`.
+const NAME_BYTES: usize = 2;
+
+/// The daemon's SSH site, each request and push admitted `room` bytes (the module doc, "What it serves"): the tunnel's
+/// items, reports and new content each bounded by the same room, and the nodes a drive holds open by the deepest path
+/// one item can carry.
+pub(crate) fn daemon_site(room: u64) -> DaemonSite {
+  let bytes = usize::try_from(room).unwrap_or(usize::MAX);
+  // Derived: the deepest path the repository holds and its root: no path a client names or a commit adds holds more
+  // names than one item can carry.
+  let most_open = (bytes / NAME_BYTES).saturating_add(1);
+  let bounds = TunnelBounds {
+    limits: Limits {
+      item_bytes: bytes,
+      report_room: bytes,
+      most_open,
+    },
+    budget: Budget {
+      room: bytes,
+      steps: most_open,
+    },
+    commit_room: bytes,
+  };
+  ToolSite::new(
+    RecordKeys,
+    ShardRepositories,
+    SvnServices::new(
+      ToolServices::new(ShardStores, ServedViews, ThisShard, room),
+      ShardRepositories,
+      TunnelRecords,
+      bounds,
+    ),
+  )
+}
 
 /// Starts the SSH edge `config` names, if it names one (the module doc): every shard of `shards` keeps its edge state and
 /// the `control` shard serves the listener, its host key read from `segment` where the anchor published one. The edge's
@@ -118,15 +161,7 @@ pub(crate) fn start(
       return;
     };
     let served = futures::spawn(async move {
-      if let Err(refused) = serve(listener, state, move || {
-        DaemonSite::new(
-          RecordKeys,
-          ShardRepositories,
-          ToolServices::new(ShardStores, ServedViews, ThisShard, room),
-        )
-      })
-      .await
-      {
+      if let Err(refused) = serve(listener, state, move || daemon_site(room)).await {
         slates_machine::log_line!("slates-server: the SSH edge stopped: {refused}");
       }
     });

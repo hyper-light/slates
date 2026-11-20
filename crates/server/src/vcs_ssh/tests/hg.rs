@@ -408,6 +408,10 @@ impl StoreLender for NoGit {
     false
   }
 
+  fn room(&mut self) -> Option<u64> {
+    None
+  }
+
   fn lend<R>(
     &mut self,
     _asked: (RepositoryId, &Principal),

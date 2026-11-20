@@ -35,6 +35,7 @@ pub mod lookup;
 pub mod pull;
 pub mod session;
 pub mod stdio;
+pub mod stream;
 
 use crate::read::to_u64;
 use crate::{Admission, NODE_LEN, Node, PastAdmission, phases::Phase, pushkey};

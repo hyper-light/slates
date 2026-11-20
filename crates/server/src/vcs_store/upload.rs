@@ -69,6 +69,11 @@ impl StoreLender for ShardStores {
     crate::state::with_state_counted(|state| lendable(state, id).is_some()).unwrap_or(false)
   }
 
+  /// Derived: this shard's arena capacity and what its pool could still lend (`Store::admittable`), as a push's room.
+  fn room(&mut self) -> Option<u64> {
+    crate::state::with_state_counted(|state| crate::git_push::push_room(state))
+  }
+
   fn lend<R>(
     &mut self,
     (id, reader): (RepositoryId, &Principal),

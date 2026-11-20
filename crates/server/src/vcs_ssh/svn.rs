@@ -28,13 +28,12 @@
 //!
 //! **A commit.** The client's `commit` begins the drive (`Connection::commit`) with its transaction named B, a `-` and
 //! this connection's count of commits begun in base 36, B the youngest revision: §4.17.4 item 1 names it by the work's
-//! id, and the tunnel opens no work until it calls the owner's commit step. A hook the drive waits for (A-661) passes
-//! where the repository's policy configures none at its point, as `svnserve` answers a point with no hook
-//! (`crate::svn_hooks`); where one is configured the commit is refused there with the not-served words, since running a
-//! hook needs the transaction's view, owed with the commit step, and no hook is ever skipped. An accepted work is
-//! refused `Uncommitted::NotServed`, "This server does not make commits yet" (200007), until the tunnel hands it to the
-//! owner's commit step (A-655 part 2b's `repository::svn_commit::commit`, which runs on the owner shard's state and
-//! which neither ra_svn transport calls yet).
+//! id. A hook the drive waits for (A-661) passes where the repository's policy configures none at its point, as
+//! `svnserve` answers a point with no hook (`crate::svn_hooks`); where one is configured the commit is refused there,
+//! since the tunnel runs no hook yet and none is ever skipped. The work the drive accepts lands through the owner's
+//! commit step ([`SvnStores::commit`]: A-655 part 2b's `repository::svn_commit::commit_work`, the one both ra_svn
+//! transports call, A-698), and `close-edit` is answered with `commit-info` (the revision, its date and author) or with
+//! the step's refusal as its failure, after which the client's commands are dropped until its `abort-edit`.
 //!
 //! **How the tunnel ends**, as stock `svnserve -t` 1.15.0 ends: the error that ended the connection on standard error,
 //! `svnserve: E` and its number in six digits, `: ` and its message, and `EXIT_FAILURE` (1); a clean end, 0 with
@@ -58,25 +57,24 @@
 //! **Owed** (GAPS, the §4.17 entry): the lender over A-662's map (the records A-655 part 2b keeps in its Subversion
 //! arm: the index, revision properties, contents, lock table and UUID; with a directory's entries from the green and
 //! the repository's `svnserve.conf` facts; the HTTP edge's DAV site waits for the same lender behind its own
-//! `SvnStores`); the accepted work handed to the owner's commit step, and the hooks' view; CRAM-MD5 through the tunnel,
+//! `SvnStores`), which lends and commits on the owner shard; the hooks run, with their view; CRAM-MD5 through the tunnel,
 //! whose keys the record of credentials does not hold yet (a lender that lists it gets every challenge failed, as
 //! `svnserve` fails one it cannot make); a URL canonicalized as `svn_uri_canonicalize` would (stock clients send
 //! canonical URLs); the drop's ending above.
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
-use slates_svn::commit::drive::{Due, Green};
+use slates_svn::commit::drive::{Due, Green, Work};
 use slates_svn::handshake::{self, Access, Repository, Unserved as Refusal};
 use slates_svn::ra_svn::ItemError;
 use slates_svn::reads;
 use slates_svn::report::{self, exchange::Budget};
-use slates_svn::serve::{
-  self, CommitStart, Connection, Limits, Sources, Turn, Uncommitted, Waiting,
-};
+use slates_svn::serve::{self, CommitStart, Connection, Limits, Made, Sources, Turn, Waiting};
 
 use super::site::{
   Command, Next, Refused, SVNSERVE_FAILURE_STATUS, Service, Services, Start, Stepped, Unserved,
   not_served,
 };
+use crate::repository::svn_commit::{self, Committed};
 use crate::vcs_hooks::HookPoint;
 use crate::vcs_http::git::Repositories;
 use crate::vcs_policy::{self, Right};
@@ -90,6 +88,8 @@ const STORE_NOT_HELD: &str = "vcs_ssh.svn_store_not_held";
 const NO_ACCESS: &str = "vcs_ssh.svn_no_access";
 /// Format: the refusal count of a tunnel ended with no words: where `svnserve` aborts, or on the tunnel's own error.
 const UNWORDED_END: &str = "vcs_ssh.svn_unworded_end";
+/// Format: the refusal count of an accepted work the owner's commit step refused.
+const COMMIT_REFUSED: &str = "vcs_ssh.svn_commit_refused";
 
 /// Format: the scheme every ra_svn URL starts with (`serve.c` `skip_scheme_part`).
 const SVN_SCHEME: &[u8] = b"svn";
@@ -119,9 +119,9 @@ const CLOSED_WORDS: &str = "Network connection closed unexpectedly";
 const MALFORMED_WORDS: &str = "Malformed network data";
 /// The words of an item past its bound: `SVN_ERR_RA_SVN_REQUEST_SIZE`'s own (slates-svn's `report::Refused`).
 const TOO_LONG_WORDS: &str = "Client request too long";
-/// The words a commit is refused with until the tunnel calls the owner's commit step (slates-svn's
-/// `Uncommitted::NotServed`).
-const NOT_COMMITTED_WORDS: &str = "This server does not make commits yet";
+/// The words a commit is refused with at a point where the repository configures a hook, which the tunnel does not run
+/// yet (the module doc's commit).
+const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
 
 /// The rights some name of a repository must grant a principal for its tunnel to open it: any of the four, each command
 /// then judged by the session, as the site judges Mercurial's `serve --stdio`.
@@ -154,6 +154,15 @@ pub(crate) trait SvnStores {
   fn holds(&self, id: RepositoryId) -> bool;
   /// Runs `step` over what repository `id`'s sessions are opened with; none when its store is not held here.
   fn opening<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Opening<'_>) -> T) -> Option<T>;
+  /// Lands `work`, which `principal`'s commit made on repository `id` and the connection accepted, through the owner's
+  /// commit step (`repository::svn_commit::commit_work` at the owner's instant, A-698): the revision it made, or why
+  /// not; none when its store is not held here.
+  fn commit(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    work: Work,
+  ) -> Option<Result<Committed, svn_commit::Uncommitted>>;
   /// Runs `step` over repository `id`'s sources at the owner's instant; none when its store is not held here.
   fn lend<T>(
     &mut self,
@@ -326,7 +335,12 @@ enum Received {
     consumed: usize,
   },
   /// The commit's drive accepted its work.
-  Accepted(usize),
+  Accepted {
+    /// The work.
+    work: Box<Work>,
+    /// The bytes taken.
+    consumed: usize,
+  },
   /// The connection refused the client's bytes and ended.
   Ended(serve::Refused),
   /// The repository's store is not held here any longer.
@@ -352,7 +366,7 @@ impl Received {
       Turn::KeyNeeded { consumed, .. } => Received::Key(consumed),
       Turn::CommitAsked { consumed } => Received::CommitAsked(consumed),
       Turn::Hook { due, consumed } => Received::Hook { due, consumed },
-      Turn::Accepted { consumed, .. } => Received::Accepted(consumed),
+      Turn::Accepted { work, consumed } => Received::Accepted { work, consumed },
     }
   }
 }
@@ -417,8 +431,8 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
         self.answer_hook(&due);
         consumed
       }
-      Received::Accepted(consumed) => {
-        self.refuse_work();
+      Received::Accepted { work, consumed } => {
+        self.land(*work);
         consumed
       }
       Received::Ended(refused) => {
@@ -596,7 +610,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       .iter()
       .any(|hook| HookPoint::of(hook.point) == point);
     let answer = if configured {
-      Err(vec![(UNSUPPORTED_FEATURE, NOT_COMMITTED_WORDS.to_owned())])
+      Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
     } else {
       Ok(())
     };
@@ -609,18 +623,40 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let answered = stores.lend(id, |sources| connection.answer_hook(answer, sources, out));
     match answered {
       None => self.not_held(),
-      Some(Ok(Turn::Accepted { .. })) => self.refuse_work(),
+      Some(Ok(Turn::Accepted { work, .. })) => self.land(*work),
       Some(Ok(_)) => {}
       Some(Err(refused)) => self.end(refused),
     }
   }
 
-  /// Refuses the accepted work: the daemon makes no commits yet (the module doc).
-  fn refuse_work(&mut self) {
-    let refused = self
-      .connection
-      .not_committed(&Uncommitted::NotServed, &mut self.out);
-    self.end_if_refused(refused);
+  /// Lands the accepted `work` through the owner's commit step (the module doc's commit) and answers `close-edit` with
+  /// the revision it made, or with its refusal.
+  fn land(&mut self, work: Work) {
+    let Some(id) = self.opened.as_ref().map(|record| record.id) else {
+      return self.not_held();
+    };
+    let Some(landed) = self.stores.commit(id, &self.principal, work) else {
+      return self.not_held();
+    };
+    let answered = match &landed {
+      // A client's work always carries the date the step gave it (`Revision::of_work`).
+      Ok(committed) => self.connection.committed(
+        &Made {
+          revision: committed.revision,
+          date: committed.date.as_deref().unwrap_or_default(),
+          author: committed.author.as_deref(),
+          post_commit_error: None,
+        },
+        &mut self.out,
+      ),
+      Err(refused) => {
+        crate::fleet::count_refusal(COMMIT_REFUSED);
+        self
+          .connection
+          .not_committed(&refused.answered(), &mut self.out)
+      }
+    };
+    self.end_if_refused(answered);
   }
 
   /// Ends the tunnel where `result` is the connection's refusal.
@@ -821,7 +857,7 @@ fn hex_digit(byte: u8) -> Option<u32> {
 }
 
 /// The name of the transaction a connection's `count`th commit begins on `base` (the module doc's commit).
-fn transaction_name(base: u64, count: u64) -> String {
+pub(crate) fn transaction_name(base: u64, count: u64) -> String {
   let mut digits = Vec::new();
   let mut left = count;
   loop {

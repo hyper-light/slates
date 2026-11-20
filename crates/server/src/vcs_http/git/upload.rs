@@ -1,7 +1,8 @@
 //! git's upload-pack behind the HTTP edge (A-625 part 3; §4.17.2 "A fetch" and "Transports" item 1; A-640 part 2's
 //! `slates_git::upload`): `GET <repo>/info/refs?service=git-upload-pack` answered with the advertisement, and a `POST
 //! <repo>/git-upload-pack` answered as `git upload-pack --stateless-rpc` answers one, its request held whole once its
-//! body has ended (upload-pack reads a command request whole, `Asked::Request`) and charged to the request's room.
+//! body has ended (upload-pack reads a command request whole, `Asked::Request`) and charged to the request's room: what
+//! the repository's shard could admit when the request began ([`StoreLender::room`], A-713), never one ring region.
 //!
 //! **The store, lent a step at a time.** A repository's store is lent afresh for each step of an answer ([`StoreLender`];
 //! A-640 part 2: "It is lent afresh for each step of an answer, so a shard's state is never held across a wait"), and the
@@ -35,6 +36,11 @@ pub(crate) trait StoreLender {
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
 
+  /// The room a request is admitted (A-713): what the shard the stores live on could admit now, as a push is admitted
+  /// (A-704), since everything upload-pack keeps answering it is that shard's to hold; never one request's room, which a
+  /// long history's walk and its pack's list of objects pass. None when the shard's state is not lent.
+  fn room(&mut self) -> Option<u64>;
+
   /// Runs `step` over the store of the repository `asked` names as upload-pack answers a request of the principal it
   /// names, with the pack source: the refs that principal may read, in name order and each once, and the branch `HEAD`
   /// names, read as the step runs; none when the store is not held here.
@@ -54,20 +60,19 @@ pub(crate) trait StoreLender {
   ) -> Option<R>;
 }
 
-/// git's services with upload-pack served from the stores `lender` lends, each request admitted `room` bytes;
-/// receive-pack is not its half: it answers `503` for it ([`super::Halves`] pairs the two).
+/// git's services with upload-pack served from the stores `lender` lends, each request admitted the room its stores'
+/// shard could admit ([`StoreLender::room`]); receive-pack is not its half: it answers `503` for it ([`super::Halves`]
+/// pairs the two).
 #[derive(Clone, Debug)]
 pub(crate) struct UploadServices<L> {
   /// Where the stores are lent.
   lender: L,
-  /// The bytes each request may hold: the edge's request room.
-  room: u64,
 }
 
 impl<L> UploadServices<L> {
-  /// Upload-pack over `lender`'s stores, each request admitted `room` bytes.
-  pub(crate) fn new(lender: L, room: u64) -> Self {
-    Self { lender, room }
+  /// Upload-pack over `lender`'s stores.
+  pub(crate) fn new(lender: L) -> Self {
+    Self { lender }
   }
 }
 
@@ -78,13 +83,14 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
     if start.service != Service::UploadPack || !self.lender.holds(start.repository.id) {
       return Err(ServiceRefused::Unavailable);
     }
+    let room = self.lender.room().ok_or(ServiceRefused::Unavailable)?;
     Ok(Upload {
       lender: self.lender.clone(),
       repository: start.repository.id,
       reader: start.principal.clone(),
       version: start.version,
       advertise: start.advertise,
-      admission: Admission::new(self.room),
+      admission: Admission::new(room),
       request: Vec::new(),
       answer: None,
     })

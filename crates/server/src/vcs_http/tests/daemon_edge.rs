@@ -29,7 +29,7 @@ use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 
 use crate::config::{EdgeIdentity, VcsHttpConfig};
 use crate::daemon::{Daemon, SegmentSource};
-use crate::repository::hg_push::tests::{Commit, changegroup, history_of};
+use crate::repository::hg_push::tests::{Commit, Made, changegroup, history_of};
 use crate::vcs_http::{Counts, EdgeState, here};
 
 /// Shape: the daemon's shards: two, so a repository can live on a shard other than the listener's.
@@ -52,8 +52,9 @@ const EXPIRED_TOKEN: &str = "slates_expired";
 const LONG_AGO_NS: u64 = 1;
 /// Shape: the owner's token as Basic's password for the user `git`: `git:slates_owner` in base64 (RFC 7617 §2).
 const OWNER_BASIC: &str = "Authorization: Basic Z2l0OnNsYXRlc19vd25lcg==";
-/// Shape: how long a client waits for an answer: the daemon's liveness budget.
-const PATIENCE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+/// Shape: how long a client waits for an answer: ten of the daemon's liveness budgets, past a [`LONG_HISTORY`] push's
+/// and fetch's answers in a debug build, as a stock client waits for as long as its server works.
+const PATIENCE_NS: u64 = 10 * crate::daemon::LIVENESS_BUDGET_NS;
 
 /// The repository's owner, the principal of the human's channel that created it.
 fn owner() -> Principal {
@@ -762,8 +763,102 @@ fn a_push_whose_pack_is_larger_than_one_ring_region_lands_through_the_daemons_ed
   assert_eq!(after, (200, served_advertisement(&main)));
 }
 
-/// Shape: the room a pack is read whole within here: far past the `create` push's three small objects.
-const PACK_ROOM: u64 = 1 << 20;
+/// Shape: the commits of [`long_history`]: as many as git/git's history to v1.0.0 (2,930), whose every clone was refused
+/// for its room.
+const LONG_HISTORY: usize = 3_000;
+
+/// Stock git's request creating `main` at the last of `commits` commits in one line, each changing the one file, and that
+/// commit: three objects a commit.
+fn long_history(commits: usize) -> (Vec<u8>, ObjectId) {
+  use slates_git::object_name::Kind;
+  let mut objects: Vec<(Kind, Vec<u8>)> = Vec::new();
+  let mut parent: Option<ObjectId> = None;
+  for at in 0..commits {
+    let blob = format!("line {at}\n").into_bytes();
+    let mut tree = b"100644 file\0".to_vec();
+    tree.extend_from_slice(git_name(Kind::Blob, &blob).as_bytes());
+    let tree_id = git_name(Kind::Tree, &tree);
+    let parent_line = parent.map_or_else(String::new, |parent| format!("parent {parent}\n"));
+    let commit = format!(
+      "tree {tree_id}\n{parent_line}author A <a@example.com> 1700000000 +0000\n\
+       committer A <a@example.com> 1700000000 +0000\n\ncommit {at}\n"
+    )
+    .into_bytes();
+    parent = Some(git_name(Kind::Commit, &commit));
+    objects.extend([
+      (Kind::Commit, commit),
+      (Kind::Tree, tree),
+      (Kind::Blob, blob),
+    ]);
+  }
+  let last = parent.expect("a commit");
+  let listed: Vec<(Kind, &[u8])> = objects
+    .iter()
+    .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+    .collect();
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {last} refs/heads/main\0 report-status");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&stored_pack(&listed));
+  (request, last)
+}
+
+/// A v2 `fetch` of `want` with `done` and no progress, as `git clone` asks for a branch's commit.
+fn fetch_of(want: ObjectId) -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for argument in [
+    format!("want {want}\n"),
+    "no-progress\n".to_owned(),
+    "done\n".to_owned(),
+  ] {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// A-713 (found by use, 2026-11-20: with git/git cut at v1.0.0, 2,930 commits in a 3.4 MB pack, the push landed and every
+/// clone, over HTTP and SSH, was refused `upload-pack: the request needs more room than the server admits`). Do: start a
+/// two-shard daemon whose edge serves loopback TLS, each request admitted one ring region; push a line of
+/// [`LONG_HISTORY`] commits as stock git posts it; then, as the owner at protocol v2, fetch its last commit with `done`,
+/// as `git clone` asks. Expect: the push `200`; the fetch `200`, its packfile section a whole pack holding every object
+/// pushed: a fetch is admitted what its repository's shard can serve, never one request's room.
+#[test]
+fn a_long_history_pushed_over_the_daemons_edge_is_fetched_whole_over_it() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, last) = long_history(LONG_HISTORY);
+  let created = pushed(edge, &name, &request);
+  let fetched = uploaded(edge, &name, &fetch_of(last));
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_eq!(fetched.0, 200);
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_pack = request.get(commands_end..).expect("the push's pack");
+  let answer = String::from_utf8_lossy(
+    fetched
+      .1
+      .get(..fetched.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert!(answer.starts_with("000dpackfile\n"), "{answer}");
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    ids_in(pushed_pack).len()
+  );
+}
+
+/// Shape: the room a pack is read whole within here: far past the [`long_history`] push's objects.
+const PACK_ROOM: u64 = 1 << 26;
 
 /// The data packets of `bytes` from `at` to the first flush, each whole, and where that flush ends; bytes that end
 /// before one fail the test.
@@ -1083,7 +1178,13 @@ fn wire_history_bundle() -> Vec<u8> {
     THIRD,
     "the history rebuilt is the captured server's"
   );
-  let group = changegroup(&made, &[0, 1, 2]);
+  history_bundle(&made, &[0, 1, 2])
+}
+
+/// A bundle2 as stock hg 7.2 pushes `made`'s changesets at `revs`: their changegroup (version 03), and bookmark `main`
+/// at the first.
+fn history_bundle(made: &[Made], revs: &[usize]) -> Vec<u8> {
+  let group = changegroup(made, revs);
   let mut marks = Vec::new();
   hg_bookmarks::encode(
     &[Bookmark {
@@ -1125,6 +1226,52 @@ fn wire_history_bundle() -> Vec<u8> {
   let mut out = Vec::new();
   bundle.encode(&mut out).expect("a bundle2");
   out
+}
+
+/// A-711 (found by use, 2026-11-20: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets in an 84 MiB
+/// store, answered `abort: HTTP Error 413: Content Too Large` after 7.5 s; hg's twin of A-704). Do: start a two-shard
+/// daemon whose edge serves loopback TLS, each request admitted one ring region (the edge's `Bounds::room`); create a
+/// Mercurial repository and push, as stock hg posts it, one changeset whose one file is twice that room, so the bundle
+/// and what reading it builds are each past it; then ask `heads`. Expect the push `200` in `application/mercurial-0.1`
+/// and `heads` the pushed changeset: a push is bounded by what its repository's shard can hold, never by one request's
+/// room.
+#[test]
+fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let room = super::bounds_of(&crate::DaemonConfig::derive(
+    &crate::daemon::test_profile(),
+    &instance,
+    Some(SHARDS),
+  ))
+  .room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|_| {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      state.to_be_bytes()[0]
+    })
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let heads = hg_command(edge, &name, "heads");
+  daemon.stop();
+  assert_eq!(
+    (pushed.0, pushed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&pushed.2)
+  );
+  let tip = crate::verbs::hex_of(&made[0].node);
+  assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
 }
 
 /// `bundle` pushed to Mercurial repository `name` by its owner as stock hg 7.2 pushes over HTTP: the answer's status,
