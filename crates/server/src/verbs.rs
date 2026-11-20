@@ -10993,6 +10993,86 @@ fn clone_as(
   }
 }
 
+/// Claims the alias the name's partition holds for `id`, a volume this partition began serving without making it here:
+/// moved here (its adoption) or taken over (the successor's materialization), both `fleet::make_taken` (goal 91's live
+/// move). A clone named for another partition than its origin's is found by name only through that alias (A-236), and
+/// the node it came from released its own (`moves::release`), so without one here a `MNT` of its name, routed to the
+/// name's partition (`nfs::routed`), finds nothing and the kernel's mount is refused `NOENT`. Nothing when the name
+/// hashes here. The claim is the clone's own two steps, reserved then confirmed, on the name's shard; one not taken
+/// (the name held by another volume, or the shard not answering) is counted and left as it is.
+pub(crate) async fn claim_name_alias(id: DbVolumeId) {
+  let claim = crate::state::with_state(|s| {
+    let name = s.db.partition().volume(id)?.name.clone();
+    let name_partition = owner_of_name(&name, s.shards.len());
+    if name_partition == s.partition {
+      return None;
+    }
+    Some((s.shard, shard_of_partition(s, name_partition)?, name))
+  })
+  .flatten();
+  let Some((this, name_shard, name)) = claim else {
+    return;
+  };
+  let claimed = crate::xshard::call_in_shard_time(
+    this,
+    name_shard,
+    move |s| claim_alias(s, &name, id),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await;
+  if !matches!(claimed, Some(Ok(()))) {
+    let _ = crate::state::with_state(|s| s.count(ALIAS_STEP_UNTAKEN, 1));
+  }
+}
+
+/// [`claim_name_alias`]'s steps on the name's partition: nothing when its alias already names `id` confirmed, the
+/// confirmation when it names `id` reserved, else the reservation and its confirmation; refused when the name is
+/// another volume's here, or another volume's alias.
+fn claim_alias(state: &mut ShardState, name: &str, id: DbVolumeId) -> Result<(), Refusal> {
+  let partition = state.db.partition();
+  if let Some(existing) = partition.volume_by_name(name) {
+    return Err(Refusal::AlreadyExists {
+      existing: to_wire_volume(existing.id),
+    });
+  }
+  match partition
+    .name_alias(name)
+    .map(|alias| (alias.volume, alias.confirmed))
+  {
+    Some((volume, true)) if volume == id => return Ok(()),
+    Some((volume, false)) if volume == id => {
+      return alias_step(
+        state,
+        &Op::NameAliasConfirmed {
+          name: name.to_owned(),
+        },
+      );
+    }
+    Some((volume, _)) => {
+      return Err(Refusal::AlreadyExists {
+        existing: to_wire_volume(volume),
+      });
+    }
+    None => {}
+  }
+  alias_step(
+    state,
+    &Op::NameAliasReserved {
+      record: slates_db::catalog::NameAliasRecord {
+        name: name.to_owned(),
+        volume: id,
+        confirmed: false,
+      },
+    },
+  )?;
+  alias_step(
+    state,
+    &Op::NameAliasConfirmed {
+      name: name.to_owned(),
+    },
+  )
+}
+
 /// Releases the alias the name's partition holds for `id`, a volume of this partition destroyed under `name` (A-236,
 /// `slates_db::alias::DESTROY_STEPS`). Nothing when the name hashes here, which holds no alias for it. The release is a
 /// message to the name's shard, which takes it only while its alias still names `id`; one not taken (refused,

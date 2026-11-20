@@ -95,6 +95,13 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-756 (2026-11-20, w-fed-move; BUG found by use: kiln's live move, goal 91).** FIXED: a volume a node made by
+> materialization (moved there, or taken over) is found there by its name: the node claims the alias its name's
+> partition holds for it (A-236), as a clone made under another partition's name does; the old owner releases its own.
+> Before, a `MNT` of a moved captured clone's name found nothing on its new owner unless the name hashed to the clone's
+> partition, and the kernel's mount was refused `NOENT` (kiln: four runs of five). Open: a reserved alias's confirm, or
+> a claim the name's shard didn't take, waits for the next recovery's reconciliation (A-236's own rule).
+>
 > **A-743 (2026-11-20, w-git).** BUILT: a branch `CreateBranch` makes is a git ref at the commit it was made at
 > (recorded as a no-object push), so stock git lists, retires, binds and pushes it as the namespace says.
 >

@@ -6346,6 +6346,11 @@ async fn make_taken(making: MakeTaken, source: Source) -> Result<(), &'static st
   if recorded.is_none() {
     return Err(MATERIALIZE_UNANSWERED);
   }
+  // Made here, so found here by its name too: the alias its name's partition holds for it, where its name hashes to
+  // another partition (`verbs::claim_name_alias`; goal 91's live move).
+  if ended.is_ok() {
+    verbs::claim_name_alias(id).await;
+  }
   ended
 }
 
