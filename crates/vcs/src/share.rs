@@ -221,6 +221,27 @@ fn level_filling<const R: usize>(room: f64, resource: usize, rising: &[Rising<R>
   None
 }
 
+/// An amount this module computed, as whole units for a caller that counts in integers (a byte count): rounded down,
+/// a value that is not a number or not positive reads as zero and one past `u64::MAX` as `u64::MAX`.
+pub fn whole_units(value: f64) -> u64 {
+  if value.is_nan() || value <= 0.0 {
+    return 0;
+  }
+  if value >= u64::MAX as f64 {
+    return u64::MAX;
+  }
+  // The value is finite, positive and below the integer's top (both checked just above).
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+  let whole = value as u64;
+  whole
+}
+
+/// A count in integers (a byte count) as this module's amount: exact below 2^53, the nearest `f64` above, where a
+/// share's last bytes never decide anything.
+pub fn amount_of(units: u64) -> f64 {
+  units as f64
+}
+
 #[cfg(test)]
 mod tests {
   use super::{Claim, divide};

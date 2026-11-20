@@ -211,20 +211,20 @@ impl OsLand {
   pub fn open_target(path: &Path) -> Result<(Self, LandingTarget), TargetRefusal> {
     let (current, key) = walk_target(path)?;
     let (host, _) = OsHost::open_root(Path::new("/")).map_err(TargetRefusal::Unavailable)?;
-    Self::adopt_target(host, current, key).map_err(|(_, refusal)| refusal)
+    Self::adopt_target(host, current, key).map_err(|handed| handed.1)
   }
 
   /// [`OsLand::open_target`] inside an existing host — the base host an overlay volume's slot holds — so the
   /// target and every handle the volume's base names live in one host (a handle is an index into its own
-  /// host's table; another host's same number names another directory). A refusal hands the host back, so
-  /// the volume keeps it.
+  /// host's table; another host's same number names another directory). A refusal hands the host back (boxed, with the
+  /// refusal), so the volume keeps it.
   pub fn open_target_in(
     host: OsHost,
     path: &Path,
-  ) -> Result<(Self, LandingTarget), (OsHost, TargetRefusal)> {
+  ) -> Result<(Self, LandingTarget), Box<(OsHost, TargetRefusal)>> {
     match walk_target(path) {
       Ok((current, key)) => Self::adopt_target(host, current, key),
-      Err(refusal) => Err((host, refusal)),
+      Err(refusal) => Err(Box::new((host, refusal))),
     }
   }
 
@@ -233,10 +233,10 @@ impl OsLand {
     mut host: OsHost,
     current: OwnedFd,
     key: String,
-  ) -> Result<(Self, LandingTarget), (OsHost, TargetRefusal)> {
+  ) -> Result<(Self, LandingTarget), Box<(OsHost, TargetRefusal)>> {
     let dir = match host.adopt_dir(current) {
       Ok(dir) => dir,
-      Err(error) => return Err((host, TargetRefusal::Unavailable(error))),
+      Err(error) => return Err(Box::new((host, TargetRefusal::Unavailable(error)))),
     };
     let target = LandingTarget {
       dir,
@@ -956,6 +956,26 @@ mod tests {
   use super::*;
   use rustix::io::Errno;
 
+  /// An exchange the filesystem lacks named `Unsupported`, and every other errno kept `Unavailable`, each by its own
+  /// errno.
+  fn assert_exchanges_lacking_and_others_kept() {
+    let code = |e: Errno| OsCode::Errno(e.raw_os_error());
+    for lacking in [Errno::INVAL, Errno::NOTSUP] {
+      assert_eq!(
+        exchange_refusal(lacking),
+        HostError::Unsupported(code(lacking)),
+        "{lacking:?}"
+      );
+    }
+    for other in [Errno::INVAL, Errno::IO, Errno::ACCESS] {
+      assert_eq!(
+        refusal(other),
+        HostError::Unavailable(code(other)),
+        "{other:?}"
+      );
+    }
+  }
+
   /// A-539 (the seam names the kinds the engine tells apart). Do: read through the Unix writer's rule the errnos of a
   /// name that exists, a full disk and a spent quota, a verb the filesystem lacks, and an exchange the filesystem lacks
   /// (Linux's `EINVAL`, macOS's `ENOTSUP`). Expect each named as its kind by its own errno: the engine compares no number,
@@ -974,20 +994,7 @@ mod tests {
         "{lacking:?}"
       );
     }
-    for lacking in [Errno::INVAL, Errno::NOTSUP] {
-      assert_eq!(
-        exchange_refusal(lacking),
-        HostError::Unsupported(code(lacking)),
-        "{lacking:?}"
-      );
-    }
-    for other in [Errno::INVAL, Errno::IO, Errno::ACCESS] {
-      assert_eq!(
-        refusal(other),
-        HostError::Unavailable(code(other)),
-        "{other:?}"
-      );
-    }
+    assert_exchanges_lacking_and_others_kept();
     assert_eq!(refusal(Errno::NOENT), HostError::NotFound);
   }
 }
