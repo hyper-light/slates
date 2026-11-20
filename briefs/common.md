@@ -101,7 +101,10 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
   The same goes for kiln, Shards and Hex checkouts, each against its own origin/main.
 - Name the base commit (origin/main's short hash) with every result you report. A result from a stale tree is not a
   result: g227's "red on clean main" list came from a main four hours old, and half of it was already fixed.
-- Delete worktrees whose work has landed, by exact path (`git worktree remove`), so stale trees don't pile up.
+- Delete worktrees whose work has landed, by exact path (`git worktree remove <path>`, one per command), so stale trees
+  don't pile up. Never `rm -r` a directory: kiln's gate holds it for a person's approval even in bypass mode, and you sit
+  in needs_you (w-balance, 07:10). List any other directory to delete in your progress file under "for main to
+  delete"; main removes it.
 
 ## ON ORIGIN/MAIN, REGULARLY (ADA 2026-11-20 ~07:00 PST: "be sure we're also regularly pushing these changes origin/main")
 - Finished work never sits on a branch. Each piece lands on origin/main within about 30 minutes of being green, under the
