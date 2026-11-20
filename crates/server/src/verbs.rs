@@ -4337,6 +4337,7 @@ fn repository_usage_reports(
       first_ns: usage.first_ns,
       last_ns: usage.last_ns,
       longest_intake_step_ns: usage.intake.longest_step_ns,
+      longest_push_phases_ns: crate::git_push::phase_longest(*id).to_vec(),
     })
     .collect()
 }

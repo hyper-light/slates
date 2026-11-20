@@ -2054,6 +2054,9 @@ pub struct RepositoryUsageReport {
   pub last_ns: u64,
   /// The longest one intake step ran, in nanoseconds: how long an intake held its shard at once.
   pub longest_intake_step_ns: u64,
+  /// A git push's longest step of each phase on this shard, in nanoseconds: a run of the body read, the body's end, a
+  /// turn of the pack's checks, and the answer's last step (seal, hooks, verdicts, commit, report). Zeros for others.
+  pub longest_push_phases_ns: Vec<u64>,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last

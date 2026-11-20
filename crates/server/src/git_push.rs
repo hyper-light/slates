@@ -966,13 +966,66 @@ fn prepare(
 /// Counts a step of a push of `repository`'s that began at `began` on the shard's clock and read `bytes_in` of the
 /// client's bytes on the repository's usage row (A-724 piece 1, `slates_vcs::usage`).
 fn charge_step(state: &mut ShardState, repository: RepositoryId, began: u64, bytes_in: u64) {
-  let now = slates_rt::futures::now_ns();
-  state.vcs_usage.stepped(
-    &repository,
-    Work::Intake,
-    (now.saturating_sub(began), bytes_in),
-    now,
+  charge_phase(
+    state,
+    repository,
+    began,
+    bytes_in,
+    if bytes_in > 0 { PHASE_INPUT } else { PHASE_END },
   );
+}
+
+/// Format: a push step's phase in [`PhaseLongest`]: a run of the body read.
+const PHASE_INPUT: usize = 0;
+/// Format: the step that ends the body.
+const PHASE_END: usize = 1;
+/// Format: a turn of the pack's checks (A-719), an answer step that answers `Turned`.
+const PHASE_CHECK: usize = 2;
+/// Format: the answer's last step (seal, hooks' views, verdicts, commit and report), one that answers `Answered`.
+const PHASE_ANSWER: usize = 3;
+
+/// The longest step of each phase of a git push, per repository (A-724's profile: where a push holds its shard at once),
+/// on this shard: [input, end, check turn, answer]. One entry a repository with a push stepped here, so bounded by the
+/// partition's repositories.
+pub(crate) type PhaseLongest = std::collections::BTreeMap<RepositoryId, [u64; 4]>;
+
+std::thread_local! {
+  /// This shard's [`PhaseLongest`].
+  static PHASE_LONGEST: std::cell::RefCell<PhaseLongest> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// `repository`'s longest push step of each phase on this shard ([`PhaseLongest`]): zeros where none ran.
+pub(crate) fn phase_longest(repository: RepositoryId) -> [u64; 4] {
+  PHASE_LONGEST.with(|longest| {
+    longest
+      .try_borrow()
+      .ok()
+      .and_then(|longest| longest.get(&repository).copied())
+      .unwrap_or([0; 4])
+  })
+}
+
+/// Counts a step of phase `phase` (module docs of [`PhaseLongest`]) on the repository's usage row and its phase's
+/// longest.
+fn charge_phase(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  began: u64,
+  bytes_in: u64,
+  phase: usize,
+) {
+  let now = slates_rt::futures::now_ns();
+  let step_ns = now.saturating_sub(began);
+  state
+    .vcs_usage
+    .stepped(&repository, Work::Intake, (step_ns, bytes_in), now);
+  PHASE_LONGEST.with(|longest| {
+    if let Ok(mut longest) = longest.try_borrow_mut()
+      && let Some(slot) = longest.entry(repository).or_insert([0; 4]).get_mut(phase)
+    {
+      *slot = (*slot).max(step_ns);
+    }
+  });
 }
 
 /// Counts a step of a push's answer that began at `began` (A-724 piece 1), and the push as answered when the step
@@ -983,7 +1036,12 @@ fn charge_answer(
   began: u64,
   stepped: &Result<Answering, PushFailed>,
 ) {
-  charge_step(state, repository, began, 0);
+  let phase = if matches!(stepped, Ok(Answering::Answered(_))) {
+    PHASE_ANSWER
+  } else {
+    PHASE_CHECK
+  };
+  charge_phase(state, repository, began, 0, phase);
   if let Ok(Answering::Answered(_)) = stepped {
     state
       .vcs_usage
