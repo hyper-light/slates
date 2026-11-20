@@ -262,22 +262,22 @@ fn next_entry(state: &ShardState, repository: RepositoryId) -> Result<Repository
 }
 
 /// The repository named `name` on this partition, when `principal` owns it: `NotFound` for none, `Forbidden` for
-/// another principal's (module docs, "Rights").
+/// another principal's (module docs, "Rights"). The refusal is boxed: a reply is far larger than a record.
 fn owned_repository(
   state: &ShardState,
   principal: &Principal,
   name: &str,
   verb: &str,
-) -> Result<RepositoryRecord, ReplyBody> {
+) -> Result<RepositoryRecord, Box<ReplyBody>> {
   let record = state
     .db
     .partition()
     .repositories()
     .repository_named(name)
     .cloned()
-    .ok_or_else(|| refused(Refusal::NotFound))?;
+    .ok_or_else(|| Box::new(refused(Refusal::NotFound)))?;
   if &record.owner != principal {
-    return Err(forbidden(verb));
+    return Err(Box::new(forbidden(verb)));
   }
   Ok(record)
 }
@@ -576,7 +576,7 @@ pub(crate) fn create_branch(
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "create_branch") {
     Ok(record) => record,
-    Err(reply) => return reply,
+    Err(reply) => return *reply,
   };
   let Some(source) = state.db.partition().repositories().branch(record.id, from) else {
     return refused(Refusal::NotFound);
@@ -675,7 +675,7 @@ pub(crate) fn bind_branch(
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "bind_branch") {
     Ok(record) => record,
-    Err(reply) => return reply,
+    Err(reply) => return *reply,
   };
   // One entry of the repository's register (A-603), whose guard binds a member of this lineage only.
   let entry = next_entry(state, record.id).map(|mut entry| {
@@ -699,7 +699,7 @@ pub(crate) fn retire_branch(
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "retire_branch") {
     Ok(record) => record,
-    Err(reply) => return reply,
+    Err(reply) => return *reply,
   };
   // One entry of the repository's register (A-603).
   let entry = next_entry(state, record.id).map(|mut entry| {
@@ -714,6 +714,15 @@ pub(crate) fn retire_branch(
   }
 }
 
+/// What [`set_policy`] sets a policy to, as the wire carries it: its rules, its hooks, its hooks-env sections and the
+/// keys trusted to sign its commits.
+pub(crate) type PolicyParts<'a> = (
+  &'a [slates_ipc::protocol::PolicyRule],
+  &'a [slates_ipc::protocol::HookConfig],
+  &'a [slates_ipc::protocol::HooksEnvSection],
+  &'a [Vec<u8>],
+);
+
 /// Sets repository `repository`'s policy whole (§4.17.1 "Policy", A-622): its owner's verb, made from policy version
 /// `read`, the version its owner read: its rules, its hooks, for Subversion its hooks-env (A-648), and for git the keys
 /// trusted to sign its commits (A-644). One entry of the repository's register: `Op::RepositoryPolicySet` takes its next
@@ -725,16 +734,11 @@ pub(crate) fn set_policy(
   state: &mut ShardState,
   principal: &Principal,
   (repository, read): (&str, u64),
-  (rules, hooks, hooks_env, signers): (
-    &[slates_ipc::protocol::PolicyRule],
-    &[slates_ipc::protocol::HookConfig],
-    &[slates_ipc::protocol::HooksEnvSection],
-    &[Vec<u8>],
-  ),
+  (rules, hooks, hooks_env, signers): PolicyParts<'_>,
 ) -> ReplyBody {
   let record = match owned_repository(state, principal, repository, "set_repository_policy") {
     Ok(record) => record,
-    Err(reply) => return reply,
+    Err(reply) => return *reply,
   };
   let Some(version) = read.checked_add(1) else {
     return refused(Refusal::PolicyChanged {
@@ -1084,103 +1088,128 @@ mod tests {
   #[test]
   fn branches_share_their_lineage_and_each_wrong_verb_is_refused_by_its_kind() {
     crate::daemon::audit_on_shard(|state| {
-      let root = green_of(create(state, "linux", "main"));
-      assert_eq!(write(state, root, b"one", 1), 1);
-      // A work based at version 1 holds it, as any reader does, so the root's checkpoint stays at or below it and a
-      // branch can be made there; with no reader the checkpoint follows the head and an older version is refused.
-      let held = ask(
-        state,
-        &owner(),
-        RequestBody::CreateWork {
-          green: root,
-          name: "holder".to_owned(),
-        },
-      );
-      assert!(matches!(held, ReplyBody::WorkCreated { .. }), "{held:?}");
-      assert_eq!(write(state, root, b"two", 2), 2);
-      let repo = repository(state, "linux");
-      let walked = state.greens.lineage_walked(repo);
-      let at_one = green_of(branch(state, ("linux", "topic", "main"), Some(1)));
-      let at_head = green_of(branch(state, ("linux", "head", "main"), None));
-      assert_eq!(
-        state.greens.lineage_walked(repo),
-        walked,
-        "a branch walked the lineage's maps"
-      );
-      assert_eq!(file(state, at_one).as_deref(), Some(b"one".as_slice()));
-      assert_eq!(file(state, at_head).as_deref(), Some(b"two".as_slice()));
-      assert_eq!(file(state, root).as_deref(), Some(b"two".as_slice()));
-      assert_eq!(write(state, at_one, b"ONE", 3), 1);
-      assert_eq!(file(state, at_one).as_deref(), Some(b"ONE".as_slice()));
-      assert_eq!(file(state, root).as_deref(), Some(b"two".as_slice()));
-      let retired = ask(
-        state,
-        &owner(),
-        RequestBody::RetireBranch {
-          repository: "linux".to_owned(),
-          name: "topic".to_owned(),
-        },
-      );
-      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
-      assert_eq!(file(state, at_one).as_deref(), Some(b"ONE".as_slice()));
-      let bound = ask(
-        state,
-        &owner(),
-        RequestBody::BindBranch {
-          repository: "linux".to_owned(),
-          name: "topic".to_owned(),
-          green: at_one,
-        },
-      );
-      assert!(matches!(bound, ReplyBody::Acknowledged), "{bound:?}");
-      assert!(matches!(
-        refusal(create(state, "linux", "main")),
-        Refusal::AlreadyExists { .. }
-      ));
-      assert_eq!(
-        refusal(branch(state, ("linux", "x", "nope"), None)),
-        Refusal::NotFound
-      );
-      assert!(matches!(
-        refusal(branch(state, ("linux", "x", "main"), Some(9))),
-        Refusal::UnknownBase { version: 9, .. }
-      ));
-      assert_eq!(
-        refusal(branch(state, ("linux", "bad\0name", "main"), None)),
-        Refusal::InvalidName
-      );
-      let foreign = ask(
-        state,
-        &stranger(),
-        RequestBody::CreateBranch {
-          repository: "linux".to_owned(),
-          name: "x".to_owned(),
-          from: "main".to_owned(),
-          version: None,
-        },
-      );
-      assert!(matches!(refusal(foreign), Refusal::Forbidden { .. }));
-      let lone = green_of(ask(
-        state,
-        &owner(),
-        RequestBody::CreateGreen {
-          name: "lone".to_owned(),
-          require_evidence: false,
-          base: None,
-        },
-      ));
-      let outside = ask(
-        state,
-        &owner(),
-        RequestBody::BindBranch {
-          repository: "linux".to_owned(),
-          name: "lone".to_owned(),
-          green: lone,
-        },
-      );
-      assert_eq!(refusal(outside), Refusal::NotFound);
+      let at_one = branches_read_their_versions(state);
+      retired_and_bound_again(state, at_one);
+      wrong_verbs_refused_by_kind(state);
       assert_eq!(state.greens.busy_lends(), 0);
     });
+  }
+
+  /// Repository `linux` made, its root written twice while a work holds version 1, and branched at version 1 and at
+  /// its head without a walk: each branch reads its version's bytes and the root its head's. The branch at version 1.
+  fn branches_read_their_versions(state: &mut crate::state::ShardState) -> VolumeId {
+    let root = held_root_written_twice(state);
+    let repo = repository(state, "linux");
+    let walked = state.greens.lineage_walked(repo);
+    let at_one = green_of(branch(state, ("linux", "topic", "main"), Some(1)));
+    let at_head = green_of(branch(state, ("linux", "head", "main"), None));
+    assert_eq!(
+      state.greens.lineage_walked(repo),
+      walked,
+      "a branch walked the lineage's maps"
+    );
+    assert_eq!(file(state, at_one).as_deref(), Some(b"one".as_slice()));
+    assert_eq!(file(state, at_head).as_deref(), Some(b"two".as_slice()));
+    assert_eq!(file(state, root).as_deref(), Some(b"two".as_slice()));
+    assert_eq!(write(state, at_one, b"ONE", 3), 1);
+    assert_eq!(file(state, at_one).as_deref(), Some(b"ONE".as_slice()));
+    assert_eq!(file(state, root).as_deref(), Some(b"two".as_slice()));
+    at_one
+  }
+
+  /// Repository `linux` made and its root written once, a work made at version 1 to hold it, and the root written
+  /// again: the root.
+  fn held_root_written_twice(state: &mut crate::state::ShardState) -> VolumeId {
+    let root = green_of(create(state, "linux", "main"));
+    assert_eq!(write(state, root, b"one", 1), 1);
+    // A work based at version 1 holds it, as any reader does, so the root's checkpoint stays at or below it and a
+    // branch can be made there; with no reader the checkpoint follows the head and an older version is refused.
+    let held = ask(
+      state,
+      &owner(),
+      RequestBody::CreateWork {
+        green: root,
+        name: "holder".to_owned(),
+      },
+    );
+    assert!(matches!(held, ReplyBody::WorkCreated { .. }), "{held:?}");
+    assert_eq!(write(state, root, b"two", 2), 2);
+    root
+  }
+
+  /// Branch `topic`, at `at_one`, retired and bound again: the retired name leaves its green.
+  fn retired_and_bound_again(state: &mut crate::state::ShardState, at_one: VolumeId) {
+    let retired = ask(
+      state,
+      &owner(),
+      RequestBody::RetireBranch {
+        repository: "linux".to_owned(),
+        name: "topic".to_owned(),
+      },
+    );
+    assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+    assert_eq!(file(state, at_one).as_deref(), Some(b"ONE".as_slice()));
+    let bound = ask(
+      state,
+      &owner(),
+      RequestBody::BindBranch {
+        repository: "linux".to_owned(),
+        name: "topic".to_owned(),
+        green: at_one,
+      },
+    );
+    assert!(matches!(bound, ReplyBody::Acknowledged), "{bound:?}");
+  }
+
+  /// Each wrong verb on `linux`, refused by its kind: a taken name, an unknown branch, a version past the head, a name
+  /// with a NUL, another principal, and a bind of a green outside the lineage.
+  fn wrong_verbs_refused_by_kind(state: &mut crate::state::ShardState) {
+    assert!(matches!(
+      refusal(create(state, "linux", "main")),
+      Refusal::AlreadyExists { .. }
+    ));
+    assert_eq!(
+      refusal(branch(state, ("linux", "x", "nope"), None)),
+      Refusal::NotFound
+    );
+    assert!(matches!(
+      refusal(branch(state, ("linux", "x", "main"), Some(9))),
+      Refusal::UnknownBase { version: 9, .. }
+    ));
+    assert_eq!(
+      refusal(branch(state, ("linux", "bad\0name", "main"), None)),
+      Refusal::InvalidName
+    );
+    let foreign = ask(
+      state,
+      &stranger(),
+      RequestBody::CreateBranch {
+        repository: "linux".to_owned(),
+        name: "x".to_owned(),
+        from: "main".to_owned(),
+        version: None,
+      },
+    );
+    assert!(matches!(refusal(foreign), Refusal::Forbidden { .. }));
+    let lone = green_of(ask(
+      state,
+      &owner(),
+      RequestBody::CreateGreen {
+        name: "lone".to_owned(),
+        require_evidence: false,
+        base: None,
+      },
+    ));
+    let outside = ask(
+      state,
+      &owner(),
+      RequestBody::BindBranch {
+        repository: "linux".to_owned(),
+        name: "lone".to_owned(),
+        green: lone,
+      },
+    );
+    assert_eq!(refusal(outside), Refusal::NotFound);
   }
 
   /// The line key `id` is placed and taken over by (A-636 part 2b-2), and whether it is a family id.
@@ -1491,52 +1520,16 @@ mod tests {
   #[test]
   fn a_recovery_rebuilds_every_member_the_way_it_joined_and_fences_what_its_source_cannot_give() {
     crate::daemon::audit_on_shard(|state| {
-      let root = green_of(create(state, "tree", "main"));
-      write(state, root, b"v1", 1);
-      let topic = green_of(branch(state, ("tree", "topic", "main"), Some(1)));
-      write(state, topic, b"topic", 2);
-      let deep = green_of(branch(state, ("tree", "deep", "topic"), None));
-      write(state, deep, b"deep", 3);
-      let retired = ask(
-        state,
-        &owner(),
-        RequestBody::RetireBranch {
-          repository: "tree".to_owned(),
-          name: "deep".to_owned(),
-        },
-      );
-      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
-      for serial in 4..10 {
-        write(state, root, format!("v{serial}").as_bytes(), serial);
-      }
-      let root_id = to_db_volume(root);
-      crate::merge_service::checkpoint_green_when(
-        state,
-        root_id,
-        crate::merge_service::Doubling::Now,
-      );
-      assert!(
-        state.db.partition().green_floor(root_id) <= 1,
-        "the root's checkpoint passed the version its branch was made at"
-      );
-      let mut live = recover(state);
-      for green in [root, topic, deep] {
-        let floor = common_floor(&state.greens, &live, green);
-        let rebuilt = answers(&mut state.greens, green, floor);
-        assert!(rebuilt.is_some(), "{green:?} not rebuilt");
-        assert_eq!(
-          rebuilt,
-          answers(&mut live, green, floor),
-          "{green:?} after the rebuild"
-        );
-      }
+      let members = members_made_past_a_held_checkpoint(state);
+      assert_rebuilt_as_before(state, members);
+      let [root, ..] = members;
       let corrupt = slates_db::op::Op::GreenAdvanced {
-        green: root_id,
+        green: to_db_volume(root),
         increment: vec![0xff; 16],
       };
       state.db.mutate(&mut state.segment, &corrupt, 0).unwrap();
       recover(state);
-      for green in [root, topic, deep] {
+      for green in members {
         let id = to_db_volume(green);
         assert!(!state.greens.contains_key(&id), "{green:?} served");
         assert!(
@@ -1545,6 +1538,55 @@ mod tests {
         );
       }
     });
+  }
+
+  /// Repository `tree`'s root branched at version 1 and written, the branch branched and retired, the root written on
+  /// and its checkpoint forced: it stays at or below version 1. The root, the branch and the branch's branch.
+  fn members_made_past_a_held_checkpoint(state: &mut ShardState) -> [VolumeId; 3] {
+    let root = green_of(create(state, "tree", "main"));
+    write(state, root, b"v1", 1);
+    let topic = green_of(branch(state, ("tree", "topic", "main"), Some(1)));
+    write(state, topic, b"topic", 2);
+    let deep = green_of(branch(state, ("tree", "deep", "topic"), None));
+    write(state, deep, b"deep", 3);
+    let retired = ask(
+      state,
+      &owner(),
+      RequestBody::RetireBranch {
+        repository: "tree".to_owned(),
+        name: "deep".to_owned(),
+      },
+    );
+    assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+    for serial in 4..10 {
+      write(state, root, format!("v{serial}").as_bytes(), serial);
+    }
+    let root_id = to_db_volume(root);
+    crate::merge_service::checkpoint_green_when(
+      state,
+      root_id,
+      crate::merge_service::Doubling::Now,
+    );
+    assert!(
+      state.db.partition().green_floor(root_id) <= 1,
+      "the root's checkpoint passed the version its branch was made at"
+    );
+    [root, topic, deep]
+  }
+
+  /// Every member rebuilt as a recovery does reads as before it: head, identity, every version.
+  fn assert_rebuilt_as_before(state: &mut ShardState, members: [VolumeId; 3]) {
+    let mut live = recover(state);
+    for green in members {
+      let floor = common_floor(&state.greens, &live, green);
+      let rebuilt = answers(&mut state.greens, green, floor);
+      assert!(rebuilt.is_some(), "{green:?} not rebuilt");
+      assert_eq!(
+        rebuilt,
+        answers(&mut live, green, floor),
+        "{green:?} after the rebuild"
+      );
+    }
   }
 
   /// A-622 (§4.17.1 "Policy"). Do: create a git repository; set its policy from version 0 with a rule denying every
@@ -1557,114 +1599,165 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_its_owners_to_set_whole_from_the_version_read() {
     use slates_db::catalog::RepositoryPolicy;
-    use slates_ipc::protocol::{
-      DatabaseRefusal, HookConfig, HookPointName, PolicyEffect, PolicyEntry, PolicyNames,
-      PolicyRight, PolicyRule, PolicyWho,
-    };
     crate::daemon::audit_on_shard(|state| {
       green_of(create(state, "linux", "main"));
-      let rule = |names: PolicyNames, pattern: &str| PolicyRule {
-        names,
-        pattern: pattern.to_owned(),
-        right: PolicyRight::Submit,
-        effect: PolicyEffect::Deny,
-        who: PolicyWho::AnyOf {
-          entries: vec![PolicyEntry::IsNot {
-            principal: slates_ipc::protocol::Principal::Uid { host: 0, uid: 1234 },
-          }],
-        },
-      };
-      let program = std::env::current_exe()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-      let hook = |program: &str| HookConfig {
-        point: HookPointName::GitPreReceive,
-        name: "pre-receive".to_owned(),
-        program: program.to_owned(),
-      };
-      let set = |state: &mut ShardState,
-                 principal: &Principal,
-                 read: u64,
-                 (rules, hooks): (Vec<PolicyRule>, Vec<HookConfig>)| {
-        ask(
+      let first = first_policy_held(state);
+      assert_eq!(
+        refusal(set_linux_policy(
           state,
-          principal,
-          RequestBody::SetRepositoryPolicy {
-            repository: "linux".to_owned(),
-            read,
-            rules,
-            hooks,
-            hooks_env: Vec::new(),
-            signers: Vec::new(),
-          },
-        )
-      };
-      let held = |state: &ShardState| {
-        state
-          .db
-          .partition()
-          .repositories()
-          .repository_named("linux")
-          .map(|record| record.policy.clone())
-          .unwrap()
-      };
-      let main = vec![rule(PolicyNames::Refs, "refs/heads/main")];
-      assert_eq!(
-        set(state, &owner(), 0, (main, vec![hook(&program)])),
-        ReplyBody::Acknowledged
-      );
-      let first = held(state);
-      assert_eq!(first.version, 1);
-      assert_eq!(first.hooks.len(), 1);
-      assert_eq!(
-        first.rules.first().map(|rule| rule.who.clone()),
-        Some(slates_db::catalog::PolicyWho::AnyOf {
-          entries: vec![slates_db::catalog::PolicyEntry::IsNot { principal: owner() }],
-        })
-      );
-      assert_eq!(
-        refusal(set(state, &owner(), 0, (Vec::new(), Vec::new()))),
+          &owner(),
+          0,
+          (Vec::new(), Vec::new())
+        )),
         Refusal::PolicyChanged { current: 1 }
       );
       assert!(matches!(
-        refusal(set(state, &stranger(), 1, (Vec::new(), Vec::new()))),
+        refusal(set_linux_policy(
+          state,
+          &stranger(),
+          1,
+          (Vec::new(), Vec::new())
+        )),
         Refusal::Forbidden { .. }
       ));
-      let branch_rule = vec![
-        rule(PolicyNames::Refs, "refs/tags/*"),
-        rule(PolicyNames::Branches, "main"),
-      ];
+      assert_malformed_policies_refused(state);
       assert_eq!(
-        refusal(set(state, &owner(), 1, (branch_rule, Vec::new()))),
-        Refusal::Database {
-          refusal: DatabaseRefusal::PolicyRuleMalformed { index: 1 }
-        }
+        linux_policy(state),
+        first,
+        "a refused setting changes nothing"
       );
       assert_eq!(
-        refusal(set(
-          state,
-          &owner(),
-          1,
-          (Vec::new(), vec![hook("hooks/pre-receive")])
-        )),
-        Refusal::Database {
-          refusal: DatabaseRefusal::PolicyHookMalformed { index: 0 }
-        }
-      );
-      assert_eq!(held(state), first, "a refused setting changes nothing");
-      assert_eq!(
-        set(state, &owner(), 1, (Vec::new(), Vec::new())),
+        set_linux_policy(state, &owner(), 1, (Vec::new(), Vec::new())),
         ReplyBody::Acknowledged
       );
       assert_eq!(
-        held(state),
+        linux_policy(state),
         RepositoryPolicy {
           version: 2,
           ..RepositoryPolicy::default()
         }
       );
     });
+  }
+
+  /// Repository `linux`'s policy set from version 0 to a rule denying all but its owner the submit of `main` and a
+  /// pre-receive hook: acknowledged, held at version 1 with the rule's principal as the catalog names it. The policy.
+  fn first_policy_held(state: &mut ShardState) -> slates_db::catalog::RepositoryPolicy {
+    use slates_ipc::protocol::PolicyNames;
+    let program = std::env::current_exe()
+      .unwrap()
+      .to_string_lossy()
+      .into_owned();
+    let main = vec![deny_submit_but_owner(PolicyNames::Refs, "refs/heads/main")];
+    assert_eq!(
+      set_linux_policy(state, &owner(), 0, (main, vec![pre_receive(&program)])),
+      ReplyBody::Acknowledged
+    );
+    let first = linux_policy(state);
+    assert_eq!(first.version, 1);
+    assert_eq!(first.hooks.len(), 1);
+    assert_eq!(
+      first.rules.first().map(|rule| rule.who.clone()),
+      Some(slates_db::catalog::PolicyWho::AnyOf {
+        entries: vec![slates_db::catalog::PolicyEntry::IsNot { principal: owner() }],
+      })
+    );
+    first
+  }
+
+  /// A rule denying every principal but the owner the submit of `pattern` among `names`.
+  fn deny_submit_but_owner(
+    names: slates_ipc::protocol::PolicyNames,
+    pattern: &str,
+  ) -> slates_ipc::protocol::PolicyRule {
+    use slates_ipc::protocol::{PolicyEffect, PolicyEntry, PolicyRight, PolicyRule, PolicyWho};
+    PolicyRule {
+      names,
+      pattern: pattern.to_owned(),
+      right: PolicyRight::Submit,
+      effect: PolicyEffect::Deny,
+      who: PolicyWho::AnyOf {
+        entries: vec![PolicyEntry::IsNot {
+          principal: slates_ipc::protocol::Principal::Uid { host: 0, uid: 1234 },
+        }],
+      },
+    }
+  }
+
+  /// A pre-receive hook running `program`.
+  fn pre_receive(program: &str) -> slates_ipc::protocol::HookConfig {
+    slates_ipc::protocol::HookConfig {
+      point: slates_ipc::protocol::HookPointName::GitPreReceive,
+      name: "pre-receive".to_owned(),
+      program: program.to_owned(),
+    }
+  }
+
+  /// Repository `linux`'s policy set by `principal` from version `read` to `rules` and `hooks`: the reply.
+  fn set_linux_policy(
+    state: &mut ShardState,
+    principal: &Principal,
+    read: u64,
+    (rules, hooks): (
+      Vec<slates_ipc::protocol::PolicyRule>,
+      Vec<slates_ipc::protocol::HookConfig>,
+    ),
+  ) -> ReplyBody {
+    ask(
+      state,
+      principal,
+      RequestBody::SetRepositoryPolicy {
+        repository: "linux".to_owned(),
+        read,
+        rules,
+        hooks,
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+      },
+    )
+  }
+
+  /// Repository `linux`'s policy as its record holds it.
+  fn linux_policy(state: &ShardState) -> slates_db::catalog::RepositoryPolicy {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named("linux")
+      .map(|record| record.policy.clone())
+      .unwrap()
+  }
+
+  /// A policy holding a branch rule, which a git repository has not, and one running a relative program: each refused
+  /// `Database`, naming the rule or the hook by index.
+  fn assert_malformed_policies_refused(state: &mut ShardState) {
+    use slates_ipc::protocol::{DatabaseRefusal, PolicyNames};
+    let branch_rule = vec![
+      deny_submit_but_owner(PolicyNames::Refs, "refs/tags/*"),
+      deny_submit_but_owner(PolicyNames::Branches, "main"),
+    ];
+    assert_eq!(
+      refusal(set_linux_policy(
+        state,
+        &owner(),
+        1,
+        (branch_rule, Vec::new())
+      )),
+      Refusal::Database {
+        refusal: DatabaseRefusal::PolicyRuleMalformed { index: 1 }
+      }
+    );
+    assert_eq!(
+      refusal(set_linux_policy(
+        state,
+        &owner(),
+        1,
+        (Vec::new(), vec![pre_receive("hooks/pre-receive")])
+      )),
+      Refusal::Database {
+        refusal: DatabaseRefusal::PolicyHookMalformed { index: 0 }
+      }
+    );
   }
 
   /// A-648 (§4.17.4 item 9). Do: create a Subversion repository; set its policy with a hook at each of the six points
@@ -1849,7 +1942,7 @@ mod tests {
   /// database's guard naming it, since no Mercurial push judges either.
   #[test]
   fn protections_and_trusted_signers_are_a_git_repositorys_policy() {
-    use slates_ipc::protocol::{DatabaseRefusal, PolicyNames, PolicyRight};
+    use slates_ipc::protocol::{PolicyNames, PolicyRight};
     crate::daemon::audit_on_shard(|state| {
       green_of(create(state, "linux", "main"));
       let rules = vec![
@@ -1867,14 +1960,7 @@ mod tests {
       let keys = vec![signer_key(1), signer_key(2), signer_key(1)];
       let set = set_signed(state, ("linux", 0), rules, keys);
       assert_eq!(set, ReplyBody::Acknowledged);
-      let held = |state: &ShardState, name: &str| {
-        let repositories = state.db.partition().repositories();
-        repositories
-          .repository_named(name)
-          .map(|record| record.policy.clone())
-          .unwrap()
-      };
-      let policy = held(state, "linux");
+      let policy = policy_of(state, "linux");
       let rights: Vec<_> = policy.rules.iter().map(|rule| rule.right).collect();
       use slates_db::catalog::PolicyRight as Held;
       assert_eq!(rights, vec![Held::MergeCommit, Held::UnsignedCommit]);
@@ -1882,35 +1968,51 @@ mod tests {
       let malformed = set_signed(state, ("linux", 1), Vec::new(), vec![b"not a key".to_vec()]);
       assert!(matches!(refusal(malformed), Refusal::BadRequest { .. }));
       assert_eq!(
-        held(state, "linux"),
+        policy_of(state, "linux"),
         policy,
         "a refused setting changes nothing"
       );
-      let created = ask(
-        state,
-        &owner(),
-        RequestBody::CreateRepository {
-          name: "hg".to_owned(),
-          tool: VcsTool::Mercurial,
-          format: ObjectFormat::Sha1,
-          default_branch: "default".to_owned(),
-          green: None,
-        },
-      );
-      assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
-      let signed = set_signed(state, ("hg", 0), Vec::new(), vec![signer_key(1)]);
-      assert!(matches!(refusal(signed), Refusal::BadRequest { .. }));
-      let merges = vec![denying(
-        PolicyNames::Branches,
-        "default",
-        PolicyRight::MergeCommit,
-      )];
-      assert_eq!(
-        refusal(set_signed(state, ("hg", 0), merges, Vec::new())),
-        Refusal::Database {
-          refusal: DatabaseRefusal::PolicyRuleMalformed { index: 0 }
-        }
-      );
+      assert_mercurial_refuses_signers_and_protections(state);
     });
+  }
+
+  /// Repository `name`'s policy as its record holds it.
+  fn policy_of(state: &ShardState, name: &str) -> slates_db::catalog::RepositoryPolicy {
+    let repositories = state.db.partition().repositories();
+    repositories
+      .repository_named(name)
+      .map(|record| record.policy.clone())
+      .unwrap()
+  }
+
+  /// A Mercurial repository made, its policy set with a signer and then with a rule denying merge commits: the signer
+  /// refused `BadRequest` and the rule by the database's guard, naming it.
+  fn assert_mercurial_refuses_signers_and_protections(state: &mut ShardState) {
+    use slates_ipc::protocol::{DatabaseRefusal, PolicyNames, PolicyRight};
+    let created = ask(
+      state,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: "hg".to_owned(),
+        tool: VcsTool::Mercurial,
+        format: ObjectFormat::Sha1,
+        default_branch: "default".to_owned(),
+        green: None,
+      },
+    );
+    assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+    let signed = set_signed(state, ("hg", 0), Vec::new(), vec![signer_key(1)]);
+    assert!(matches!(refusal(signed), Refusal::BadRequest { .. }));
+    let merges = vec![denying(
+      PolicyNames::Branches,
+      "default",
+      PolicyRight::MergeCommit,
+    )];
+    assert_eq!(
+      refusal(set_signed(state, ("hg", 0), merges, Vec::new())),
+      Refusal::Database {
+        refusal: DatabaseRefusal::PolicyRuleMalformed { index: 0 }
+      }
+    );
   }
 }

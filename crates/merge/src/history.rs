@@ -20,7 +20,24 @@
 //! **The bound.** A value whose piece list would cost more than its bytes is stored as one chunk instead (compaction):
 //! a version never costs more than a whole copy, which is what every version cost before, and a file edited in many
 //! places is rewritten once its pieces outweigh it. No constant: the rule is the two sizes.
+//!
+//! **A chunk may be a file's block (A-728, step S2 of A-723's content-once plan; D-28, §4.11).** A value stored whole
+//! (a path's first change, the bytes it held before its first recorded change, a checkpoint's restored file, and every
+//! change that shares nothing with the value before it: each push and import replaces files whole) names the file's
+//! own block of [`crate::dims::Blocks`] as its one chunk, holding one holder of it, instead of copying the file's bytes
+//! into a chunk of its own. The history's latest value then is the file's block, and the green holds the file once. When
+//! a later version replaces the file, the map lets the block go and the history's hold keeps it, now as the earlier
+//! version's bytes: nothing is copied either way. Before, the history copied every byte a change added beside the file:
+//! a Subversion import of 1,000 revisions held 234.8 MiB of chunks beside about 585 MB of blocks (A-723).
+//!
+//! **Lifetimes.** The blocks live in the files' arena, which a lineage's greens share and lend ([`crate::dims`], "Arenas
+//! are lent"), while the chunks are the green's own. A lineage member is read and written only while lent, its arenas
+//! then the lineage's, so a block a chunk names is always in the arena at hand; a green made at another's version starts
+//! with no history; a dropped value lets its block go into the same arena; and a retired green gives its chunks' holds
+//! back a chunk a step ([`Chunks::release_step`]). Every function that reads a value's bytes takes the blocks with the
+//! chunks.
 
+use crate::dims::{Block, Blocks};
 use crate::ops_doc::{Op, OpKind};
 
 /// A run of a value's bytes: `len` bytes at `at` within chunk `chunk`.
@@ -37,21 +54,87 @@ struct Piece {
 /// Format: the bytes one piece costs in a value's list, the measure compaction weighs against the value's bytes.
 pub(crate) const PIECE_BYTES: usize = size_of::<Piece>();
 
+/// Where a chunk's bytes are (module docs, "A chunk may be a file's block").
+#[derive(Debug)]
+enum Source {
+  /// Bytes the history owns.
+  Owned(Vec<u8>),
+  /// A file's block, of which the chunk holds one holder, and its length (a block never changes).
+  Block {
+    /// The block.
+    block: Block,
+    /// Its length.
+    len: usize,
+  },
+}
+
+impl Source {
+  /// The chunk's length.
+  fn len(&self) -> usize {
+    match self {
+      Source::Owned(bytes) => bytes.len(),
+      Source::Block { len, .. } => *len,
+    }
+  }
+
+  /// The chunk's bytes.
+  fn bytes<'a>(&'a self, blocks: &'a Blocks) -> &'a [u8] {
+    match self {
+      Source::Owned(bytes) => bytes,
+      Source::Block { block, .. } => blocks.bytes(*block),
+    }
+  }
+
+  /// Gives back what the chunk holds: the block's holder, for a block.
+  fn let_go(self, blocks: &mut Blocks) {
+    if let Source::Block { block, .. } = self {
+      blocks.release(block);
+    }
+  }
+}
+
 /// The arena of immutable chunks a green's history values share (module docs).
 #[derive(Debug, Default)]
 pub(crate) struct Chunks {
-  /// Each slot's bytes and the pieces naming it; `None` once freed.
-  slots: Vec<Option<(Vec<u8>, usize)>>,
+  /// Each slot's source and the pieces naming it; `None` once freed.
+  slots: Vec<Option<(Source, usize)>>,
   /// Freed slots, reused first.
   free: Vec<usize>,
-  /// The bytes the live chunks hold.
+  /// The bytes the live chunks hold, owned or named.
   bytes: usize,
+  /// The bytes of the live chunks that are files' blocks (A-728).
+  named: usize,
 }
 
 impl Chunks {
-  /// The bytes the live chunks hold.
+  /// The bytes the live chunks hold, owned or named.
   pub(crate) fn bytes(&self) -> usize {
     self.bytes
+  }
+
+  /// The bytes the live chunks own: what the history copied (A-728: none for a value stored whole).
+  pub(crate) fn owned_bytes(&self) -> usize {
+    self.bytes.saturating_sub(self.named)
+  }
+
+  /// One chunk of a retired green's history given back: its slot freed and, for a file's block, the block's holder let
+  /// go (module docs, "Lifetimes"). False once no chunk is left. Every value naming the chunks is dropped with the green.
+  pub(crate) fn release_step(&mut self, blocks: &mut Blocks) -> bool {
+    let Some(slot) = self.slots.pop() else {
+      self.free.clear();
+      self.bytes = 0;
+      self.named = 0;
+      return false;
+    };
+    if let Some((source, _)) = slot {
+      source.let_go(blocks);
+    }
+    true
+  }
+
+  /// Whether no chunk is left to give back ([`Chunks::release_step`]).
+  pub(crate) fn is_released(&self) -> bool {
+    self.slots.is_empty()
   }
 
   /// The bytes of the distinct chunks `values` name, counted from the values themselves: the recount the arena's
@@ -66,21 +149,29 @@ impl Chunks {
     seen
       .into_iter()
       .filter_map(|chunk| self.slots.get(chunk).and_then(Option::as_ref))
-      .map(|(bytes, _)| bytes.len())
+      .map(|(source, _)| source.len())
       .sum()
   }
 
   /// Adds a chunk holding `bytes`, named by no piece yet.
   fn add(&mut self, bytes: Vec<u8>) -> usize {
-    let len = bytes.len();
+    self.add_source(Source::Owned(bytes))
+  }
+
+  /// Adds a chunk from `source`, named by no piece yet.
+  fn add_source(&mut self, source: Source) -> usize {
+    let len = source.len();
     self.bytes = self.bytes.saturating_add(len);
+    if matches!(source, Source::Block { .. }) {
+      self.named = self.named.saturating_add(len);
+    }
     if let Some(chunk) = self.free.pop()
       && let Some(slot) = self.slots.get_mut(chunk)
     {
-      *slot = Some((bytes, 0));
+      *slot = Some((source, 0));
       return chunk;
     }
-    self.slots.push(Some((bytes, 0)));
+    self.slots.push(Some((source, 0)));
     self.slots.len().saturating_sub(1)
   }
 
@@ -91,32 +182,43 @@ impl Chunks {
     }
   }
 
-  /// One piece naming `chunk` is gone; the chunk is freed with its last.
-  fn release(&mut self, chunk: usize) {
+  /// One piece naming `chunk` is gone; the chunk is freed with its last, a block's holder let go with it.
+  fn release(&mut self, chunk: usize, blocks: &mut Blocks) {
     let Some(slot) = self.slots.get_mut(chunk) else {
       return;
     };
-    let freed = match slot {
-      Some((bytes, refs)) => {
+    let last = match slot {
+      Some((_, refs)) => {
         *refs = refs.saturating_sub(1);
-        (*refs == 0).then_some(bytes.len())
+        *refs == 0
       }
-      None => None,
+      None => false,
     };
-    if let Some(len) = freed {
-      *slot = None;
+    if !last {
+      return;
+    }
+    if let Some((source, _)) = slot.take() {
+      let len = source.len();
       self.bytes = self.bytes.saturating_sub(len);
+      if matches!(source, Source::Block { .. }) {
+        self.named = self.named.saturating_sub(len);
+      }
+      source.let_go(blocks);
       self.free.push(chunk);
     }
   }
 
   /// The bytes of `piece`, or none if its chunk is gone (never, while a value names it).
-  fn bytes_of(&self, piece: &Piece) -> &[u8] {
+  fn bytes_of<'a>(&'a self, blocks: &'a Blocks, piece: &Piece) -> &'a [u8] {
     self
       .slots
       .get(piece.chunk)
       .and_then(Option::as_ref)
-      .and_then(|(bytes, _)| bytes.get(piece.at..piece.at.saturating_add(piece.len)))
+      .and_then(|(source, _)| {
+        source
+          .bytes(blocks)
+          .get(piece.at..piece.at.saturating_add(piece.len))
+      })
       .unwrap_or_default()
   }
 }
@@ -214,7 +316,23 @@ impl Value {
     }
   }
 
-  /// `bytes` as one new chunk (none for no bytes).
+  /// A file's `block` of `len` bytes as the value's one chunk, the caller's holder of it now the chunk's (module docs,
+  /// "A chunk may be a file's block"): no byte copied. The holder is let go at once for no bytes, a value of none.
+  pub(crate) fn named(chunks: &mut Chunks, blocks: &mut Blocks, block: Block, len: usize) -> Value {
+    if len == 0 {
+      blocks.release(block);
+      return Value::default();
+    }
+    let chunk = chunks.add_source(Source::Block { block, len });
+    chunks.retain(chunk);
+    Value {
+      pieces: vec![Piece { chunk, at: 0, len }],
+      len,
+    }
+  }
+
+  /// `bytes` as one new chunk the history owns (none for no bytes).
+  #[cfg(test)]
   pub(crate) fn whole(chunks: &mut Chunks, bytes: &[u8]) -> Value {
     let len = bytes.len();
     if len == 0 {
@@ -229,17 +347,22 @@ impl Value {
   }
 
   /// The value's bytes, copied out of its chunks.
-  pub(crate) fn materialize(&self, chunks: &Chunks) -> Vec<u8> {
+  pub(crate) fn materialize(&self, chunks: &Chunks, blocks: &Blocks) -> Vec<u8> {
     let mut out = Vec::with_capacity(self.len);
     for piece in &self.pieces {
-      out.extend_from_slice(chunks.bytes_of(piece));
+      out.extend_from_slice(chunks.bytes_of(blocks, piece));
     }
     out
   }
 
   /// The value's bytes in `[from, to)` (clamped to its length), copied out of only the pieces that hold them: what a
   /// paged read of an earlier version takes, without the whole file.
-  pub(crate) fn read(&self, chunks: &Chunks, from: usize, to: usize) -> Vec<u8> {
+  pub(crate) fn read(
+    &self,
+    (chunks, blocks): (&Chunks, &Blocks),
+    from: usize,
+    to: usize,
+  ) -> Vec<u8> {
     let to = to.min(self.len);
     let mut out = Vec::with_capacity(to.saturating_sub(from));
     let mut logical = 0usize;
@@ -250,7 +373,7 @@ impl Value {
       if end <= from || start >= to {
         continue;
       }
-      let run = chunks.bytes_of(piece);
+      let run = chunks.bytes_of(blocks, piece);
       let lo = from.max(start).saturating_sub(start);
       let hi = to.min(end).saturating_sub(start);
       out.extend_from_slice(run.get(lo..hi).unwrap_or_default());
@@ -259,13 +382,13 @@ impl Value {
   }
 
   /// Whether the value's bytes are `bytes`, compared piece by piece without a copy.
-  pub(crate) fn equals(&self, chunks: &Chunks, bytes: &[u8]) -> bool {
+  pub(crate) fn equals(&self, (chunks, blocks): (&Chunks, &Blocks), bytes: &[u8]) -> bool {
     if self.len != bytes.len() {
       return false;
     }
     let mut at = 0usize;
     for piece in &self.pieces {
-      let run = chunks.bytes_of(piece);
+      let run = chunks.bytes_of(blocks, piece);
       let end = at.saturating_add(run.len());
       if run.len() != piece.len || bytes.get(at..end) != Some(run) {
         return false;
@@ -283,7 +406,7 @@ impl Value {
   /// every run neither changed.
   pub(crate) fn applied_equals(
     &self,
-    chunks: &Chunks,
+    (chunks, blocks): (&Chunks, &Blocks),
     (ops, post_state): (&[Op], &[u8]),
     other: &Value,
   ) -> bool {
@@ -312,12 +435,12 @@ impl Value {
         let same = match run {
           Applied::Shared(mine) => {
             (mine.chunk == piece.chunk && mine.at == piece.at)
-              || chunks.bytes_of(&Piece { len: step, ..mine })
-                == chunks.bytes_of(&Piece { len: step, ..piece })
+              || chunks.bytes_of(blocks, &Piece { len: step, ..mine })
+                == chunks.bytes_of(blocks, &Piece { len: step, ..piece })
           }
           Applied::Post { src, .. } => {
             post_state.get(src..src.saturating_add(step))
-              == Some(chunks.bytes_of(&Piece { len: step, ..piece }))
+              == Some(chunks.bytes_of(blocks, &Piece { len: step, ..piece }))
           }
         };
         if !same {
@@ -367,30 +490,35 @@ impl Value {
     Some(runs)
   }
 
-  /// Gives the value's chunks back: each piece's reference released.
-  pub(crate) fn release(self, chunks: &mut Chunks) {
+  /// Gives the value's chunks back: each piece's reference released, a chunk's block let go with its last.
+  pub(crate) fn release(self, chunks: &mut Chunks, blocks: &mut Blocks) {
     for piece in self.pieces {
-      chunks.release(piece.chunk);
+      chunks.release(piece.chunk, blocks);
     }
   }
 
   /// The value `next` that `ops` (a path's accepted ops in this value's coordinates, as the engine's `apply` takes
   /// them) make of this one, sharing every run of this value they keep and copying only the bytes they add (module
-  /// docs). Stored whole when the splice does not reproduce `next` or its pieces would outweigh its bytes.
-  pub(crate) fn spliced(&self, chunks: &mut Chunks, ops: &[Op], next: &[u8]) -> Value {
-    let Some(pending) = self.walk(ops, next.len()) else {
-      return Value::whole(chunks, next);
-    };
-    if pending.len().saturating_mul(PIECE_BYTES) > next.len() {
-      return Value::whole(chunks, next);
+  /// docs). `None` when it is to be stored whole, which the caller does by naming the file's block
+  /// ([`Value::named`]): when the splice shares no run of this value (a whole replace), does not reproduce `next`, or
+  /// its pieces would outweigh its bytes.
+  pub(crate) fn spliced(
+    &self,
+    chunks: &mut Chunks,
+    blocks: &Blocks,
+    ops: &[Op],
+    next: &[u8],
+  ) -> Option<Value> {
+    let pending = self.walk(ops, next.len())?;
+    if pending.len().saturating_mul(PIECE_BYTES) > next.len()
+      || !pending.iter().any(|run| matches!(run, Pending::Shared(_)))
+    {
+      return None;
     }
     let mut added = Vec::new();
     for run in &pending {
       if let Pending::Added { at, len } = run {
-        match next.get(*at..at.saturating_add(*len)) {
-          Some(bytes) => added.extend_from_slice(bytes),
-          None => return Value::whole(chunks, next),
-        }
+        added.extend_from_slice(next.get(*at..at.saturating_add(*len))?);
       }
     }
     let new_chunk = (!added.is_empty()).then(|| chunks.add(added));
@@ -414,11 +542,13 @@ impl Value {
       };
       value.push(chunks, piece);
     }
-    if !value.equals(chunks, next) {
-      value.release(chunks);
-      return Value::whole(chunks, next);
+    if !value.equals((chunks, blocks), next) {
+      // The pieces name this value's chunks, still held, and the new chunk alone: no block is let go here.
+      let mut none = Blocks::default();
+      value.release(chunks, &mut none);
+      return None;
     }
-    value
+    Some(value)
   }
 
   /// Appends `piece`, merged into the last when it continues it in the same chunk, and takes its reference.
@@ -576,13 +706,16 @@ mod tests {
       post in prop::collection::vec(any::<u8>(), 256..512),
     ) {
       let mut chunks = Chunks::default();
+      let blocks = Blocks::default();
       let mut kept = vec![(first.clone(), Value::whole(&mut chunks, &first))];
       for raw in &chain {
         let (bytes, value) = kept.last().unwrap();
         let ops = ops_over(bytes.len() as u64, raw);
         let next = apply(bytes, &ops, &post);
         let before = chunks.bytes();
-        let spliced = value.spliced(&mut chunks, &ops, &next);
+        let spliced = value
+          .spliced(&mut chunks, &blocks, &ops, &next)
+          .unwrap_or_else(|| Value::whole(&mut chunks, &next));
         let added: u64 = ops
           .iter()
           .filter(|op| matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend))
@@ -593,12 +726,13 @@ mod tests {
         prop_assert!(spliced.list_bytes() <= next.len().max(PIECE_BYTES));
         kept.push((next, spliced));
         for (bytes, value) in &kept {
-          prop_assert!(value.equals(&chunks, bytes));
-          prop_assert_eq!(&value.materialize(&chunks), bytes);
+          prop_assert!(value.equals((&chunks, &blocks), bytes));
+          prop_assert_eq!(&value.materialize(&chunks, &blocks), bytes);
         }
       }
+      let mut blocks = blocks;
       for (_, value) in kept {
-        value.release(&mut chunks);
+        value.release(&mut chunks, &mut blocks);
       }
       prop_assert_eq!(chunks.bytes(), 0);
     }
@@ -623,6 +757,7 @@ mod tests {
       post in prop::collection::vec(any::<u8>(), 0..300),
     ) {
       let mut chunks = Chunks::default();
+      let blocks = Blocks::default();
       let mut kept = vec![(first.clone(), Value::whole(&mut chunks, &first), Vec::new())];
       for (n, step) in chain.iter().enumerate() {
         let (bytes, value, _) = kept.last().unwrap();
@@ -631,7 +766,9 @@ mod tests {
         let made = if n == usize::from(whole_at) % chain.len() {
           Value::whole(&mut chunks, &next)
         } else {
-          value.spliced(&mut chunks, &ops, &next)
+          value
+            .spliced(&mut chunks, &blocks, &ops, &next)
+            .unwrap_or_else(|| Value::whole(&mut chunks, &next))
         };
         kept.push((next, made, ops));
       }
@@ -645,7 +782,7 @@ mod tests {
         ops_over(base_bytes.len() as u64, &raw)
       };
       let expected = apply(base_bytes, &ops, &post) == *head_bytes;
-      prop_assert_eq!(base.applied_equals(&chunks, (&ops, &post), head), expected);
+      prop_assert_eq!(base.applied_equals((&chunks, &blocks), (&ops, &post), head), expected);
     }
   }
 
@@ -657,6 +794,7 @@ mod tests {
     const EDIT: u64 = 64;
     const EDITS: usize = 64;
     let mut chunks = Chunks::default();
+    let blocks = Blocks::default();
     let mut bytes: Vec<u8> = (0..FILE).map(|n| (n % 251) as u8).collect();
     let mut values = vec![Value::whole(&mut chunks, &bytes)];
     for n in 0..EDITS {
@@ -664,11 +802,64 @@ mod tests {
       let post = vec![n as u8; EDIT as usize];
       let ops = [op_of(0, at, EDIT, 0)];
       let next = apply(&bytes, &ops, &post);
-      let value = values.last().unwrap().spliced(&mut chunks, &ops, &next);
+      let value = values
+        .last()
+        .unwrap()
+        .spliced(&mut chunks, &blocks, &ops, &next)
+        .unwrap();
       values.push(value);
       bytes = next;
     }
     assert_eq!(chunks.bytes(), FILE + EDITS * EDIT as usize);
-    assert_eq!(values.last().unwrap().materialize(&chunks), bytes);
+    assert_eq!(values.last().unwrap().materialize(&chunks, &blocks), bytes);
+  }
+
+  /// A-728. Do: a file's block named as a value (no copy), a small overwrite spliced over it, then a whole replace of
+  /// it; release the values one by one while the file map lets its block go. Expect: naming copies no byte (the chunks
+  /// own nothing), the splice owns only its added bytes and reads back exactly, a whole replace answers `None` (to be
+  /// named), the block outlives the map's release while a value names it and is freed with the last value.
+  #[test]
+  fn a_value_named_by_a_files_block_copies_nothing_and_keeps_the_block_while_named() {
+    let mut files = crate::dims::Files::default();
+    let first: Vec<u8> = (0..4096u32).map(|n| (n % 251) as u8).collect();
+    files.insert("f", first.clone());
+    let mut chunks = Chunks::default();
+    let block = files.hold_block_of("f").unwrap();
+    let named = Value::named(&mut chunks, files.blocks_mut(), block, first.len());
+    assert_eq!(chunks.owned_bytes(), 0, "naming the block copies nothing");
+    assert_eq!(chunks.bytes(), first.len());
+    let ops = [op_of(0, 100, 8, 0)];
+    let post = vec![7u8; 8];
+    let next = apply(&first, &ops, &post);
+    let spliced = named
+      .spliced(&mut chunks, files.blocks(), &ops, &next)
+      .unwrap();
+    assert_eq!(
+      chunks.owned_bytes(),
+      8,
+      "the splice owns only what it added"
+    );
+    assert_eq!(spliced.materialize(&chunks, files.blocks()), next);
+    let replace = [op_of(4, 0, 0, 0), op_of(3, 0, 16, 0)];
+    let whole = vec![9u8; 16];
+    assert!(
+      spliced
+        .spliced(
+          &mut chunks,
+          files.blocks(),
+          &replace,
+          &apply(&next, &replace, &whole)
+        )
+        .is_none(),
+      "a whole replace is named, never copied"
+    );
+    files.remove("f");
+    assert_eq!(files.blocks().live(), 1, "the history keeps the block");
+    assert_eq!(named.materialize(&chunks, files.blocks()), first);
+    named.release(&mut chunks, files.blocks_mut());
+    assert_eq!(files.blocks().live(), 1, "still named by the splice");
+    spliced.release(&mut chunks, files.blocks_mut());
+    assert_eq!(files.blocks().live(), 0);
+    assert_eq!(chunks.bytes(), 0);
   }
 }

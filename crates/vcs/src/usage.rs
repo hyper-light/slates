@@ -76,6 +76,10 @@ pub struct Usage<P> {
   pub first_ns: u64,
   /// The shard clock's nanoseconds at its latest event.
   pub last_ns: u64,
+  /// The shard clock's nanoseconds spent making its derived values (A-724 piece 4: a git version's fragments).
+  pub derive_ns: u64,
+  /// The bytes of derived values those nanoseconds kept: with `derive_ns`, what making one byte again costs.
+  pub derive_bytes: u64,
   /// The principal summary: at most the ledger's `principal_slots` slots, in no order.
   principals: Vec<PrincipalCount<P>>,
 }
@@ -88,6 +92,8 @@ impl<P> Usage<P> {
       fetch: WorkUsage::default(),
       first_ns: now_ns,
       last_ns: now_ns,
+      derive_ns: 0,
+      derive_bytes: 0,
       principals: Vec::new(),
     }
   }
@@ -199,6 +205,14 @@ impl<R: Ord + Clone, P: Clone + Eq> Ledger<R, P> {
   pub fn answered(&mut self, repository: &R, work: Work, now_ns: u64) {
     let counts = self.row(repository, now_ns).work_mut(work);
     counts.answered = counts.answered.saturating_add(1);
+  }
+
+  /// Making `repository`'s derived values ran `ns` on the shard's clock and kept `bytes` (zero for a turn that kept
+  /// nothing yet), at `now_ns` (A-724 piece 4).
+  pub fn derived(&mut self, repository: &R, (ns, bytes): (u64, u64), now_ns: u64) {
+    let row = self.row(repository, now_ns);
+    row.derive_ns = row.derive_ns.saturating_add(ns);
+    row.derive_bytes = row.derive_bytes.saturating_add(bytes);
   }
 
   /// Drops `repository`'s row: it is gone from this shard.
@@ -368,6 +382,20 @@ mod tests {
     assert_eq!((heavy.count, heavy.overstated), (50, 0));
     assert_eq!((usage.intake.begun, usage.fetch.begun), (50, 50));
     assert_eq!(usage.principals().len(), 2);
+  }
+
+  /// A-724 piece 4: do two turns making a repository's derived values, the second keeping its bytes, expect their time
+  /// and bytes summed on its row, so the cost of a byte made again is their ratio.
+  #[test]
+  fn making_derived_values_is_counted_as_time_and_bytes() {
+    let mut ledger: Ledger<u32, u32> = Ledger::new(1);
+    ledger.derived(&1, (300, 0), 4);
+    ledger.derived(&1, (700, 4096), 9);
+    let row = ledger.usage(&1).unwrap();
+    assert_eq!(
+      (row.derive_ns, row.derive_bytes, row.first_ns, row.last_ns),
+      (1000, 4096, 4, 9)
+    );
   }
 
   /// A-724 piece 1: do events on two repositories, expect each counted on its own row and none on the other's.

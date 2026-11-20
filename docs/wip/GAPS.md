@@ -60,7 +60,12 @@
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's, a green's first submit's, past a copy) and a whole map's release sliced a unit at a time, and the build of
 > the put files in slices of its own (a recovery's remake puts the files a unit each, BUILT 2026-11-20); a branch's first
-> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
+> Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
+> `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
+> read before from the records and after from the green, recorded in the submit's transaction), its copies as rows with
+> their sources, symbolic links as `svn:special` files and `svn:author` owed; Mercurial's changesets of a submitted
+> version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
 > commit is not made, counted); a `.gitmodules` blob's own checks; blob ids read by content from the git
@@ -79,7 +84,8 @@
 > Designed, owed: the snapshot slot sized by its data (8) and a giant repository's index cut across partitions by
 > object id (9).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
-> re-encoded (`Repository::drop_fragments`); the server's trigger owed (4b).
+> re-encoded (`Repository::drop_fragments`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
+> Owed: compression of cold content.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -133,6 +139,10 @@
 > entry's bound in bounded parts across entries (git/git's 607 MiB pack vs a 747 MB segment region); objects already
 > held left out of the pack; S2 (history's latest value = the file's block), S3 (w-git, A-722), S4 (svn texts by identity),
 > S5 (w-hg); the push bound (a streamed window per connection, admission refusal before the body); push_load re-run.
+>
+> **A-728 (2026-11-20, w-engine; A-723's S2):** part 1 BUILT: a green's content history names the file's block for every
+> value stored whole (first change, seed, restore, a whole replace), so a changed file is held once; retire gives the
+> history's holds back a step at a time. OWED: part 2 a splice's added runs in the new block; part 3 svn_scale before/after.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1459,6 +1469,11 @@
 > handed to its transaction's drive a body run at a time (`DavCommit::begin_put`, `put_chunk`, `end_put`; the exchange's
 > `Streamed`), never held: a commit holds the drive's window and the texts it makes, bounded by its room. svn matrix
 > over HTTP 24 of 27 (lock passes; blame, diff and merge wait on w-reaper's reports).
+> **A-681, an abandoned HTTP transaction released (w-interop, 2026-11-20):** each kept transaction records its last
+> step's monotonic instant; one idle past the edge's learned idle bound (the idle phase's RFC 6298 bound, the silence
+> after which the edge judges a client gone) is released at the table's next use, counted
+> (`vcs_store.dav_commits_released`). Before the edge has learned that bound none is released early; the table stays
+> bounded by one a repository and principal.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

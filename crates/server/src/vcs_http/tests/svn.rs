@@ -174,6 +174,9 @@ fn added(
   }
 }
 
+/// A property list: each property's name and value.
+type Properties = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// The tests' repository: revision 1 by alice adds `/trunk/a.txt` (with `svn:eol-style`) and `/trunk/secret/s.txt`.
 struct Repo {
   /// The index.
@@ -181,7 +184,7 @@ struct Repo {
   /// Each revision's tree: each path and whether it is a directory.
   trees: Vec<BTreeMap<String, bool>>,
   /// The property lists, by identity.
-  lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  lists: BTreeMap<ContentIdentity, Properties>,
   /// The texts, by identity.
   texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// Each revision's properties.

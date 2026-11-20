@@ -1274,9 +1274,12 @@ fn hg_unbundle(
   typed_exchange(port, certificate, &sent)
 }
 
+/// A bundle2 part's parameters: each its name and value.
+type PartParameters = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// The parts of the bundle2 `stream`, each its type and parameters, its `output` parts left out unless `outputs`: what
 /// 7.2's server prints while it takes a push, which it captures there over HTTP (`slates_hg::serve::http`'s module doc).
-fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> {
+fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, PartParameters)> {
   let bundle =
     Bundle2::decode(stream, &mut slates_hg::Admission::new(u64::MAX)).expect("a bundle2");
   bundle
