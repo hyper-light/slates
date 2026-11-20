@@ -40,8 +40,10 @@
 //!   A-609 reads it, then the resource's node, `404` without one; a `log-report` answered `200`, `text/xml`, from
 //!   A-613's log walk with `mod_dav_svn`'s receivers (`crate::reads::DavLog`), which the caller streams a slice a reply
 //!   run ([`Report`]): a walk refused before its first byte is answered with its error, `dav_svn__convert_err`'s status
-//!   and the error in `D:error`, and one refused after it ends the connection. Every other report is `501` in
-//!   `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
+//!   and the error in `D:error`, and one refused after it ends the connection. An `update-report` on HTTPv2's `me`
+//!   resource (`!svn/me`, where a stock client sends it) or a node's URL is answered from A-616's drive by A-627's
+//!   writer, streamed the same way ([`super::update`]; checkout, update, switch and export). Every other report is
+//!   `501` in `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
 //! - Every other method: `501`, `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
 //!
 //! **Read access** (`mod_authz_svn`'s questions with HTTP, §4.17.4 item 10). A request whose node's path the
@@ -67,6 +69,7 @@ use super::locking::{
 };
 use super::request::{self, PropertyName, PropfindRequest, Report as Asked, svn_time};
 use super::response::{self, Body, BulkUpdates, Capability, Httpv2, live_prop};
+use super::update::{UpdateWalk, Walked};
 use super::xml::{base64_lines, is_xml_safe, quote};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
 use crate::authz::{PrincipalRules, may_read};
@@ -78,6 +81,11 @@ use crate::report::drive::history as copies;
 /// The special URI's name: where `mod_dav_svn` keeps every resource that is no node's public URL.
 /// Format: `SVNSpecialURI`'s default, `!svn` (`mod_dav_svn.c`).
 pub const SPECIAL: &str = "!svn";
+
+/// HTTPv2's `me` resource beneath the special URI, the target of a stock client's update-report
+/// (`svn_ra_serf__report_resource`).
+/// Format: `mod_dav_svn`'s `me` (`repos.c`).
+const ME: &str = "me";
 
 /// The special resources `mod_dav_svn` knows, of which this part serves `rvr` and `bc`.
 /// Format: `repos.c` `special_subdirs`.
@@ -216,7 +224,7 @@ pub struct Request<'a> {
 pub type Headers = Vec<(&'static str, String)>;
 
 /// The answer to a request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Answer {
   /// Its status, headers and body, whole.
   Whole(HttpAnswer),
@@ -235,10 +243,19 @@ pub enum Answer {
 
 /// A REPORT's answer still to write, the repository lent again for each slice (§4.17.4 item 11: long reads are sliced
 /// under the shard's budget): a `log-report`'s walk.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Report {
-  /// The log's walk.
-  log: DavLog,
+  /// The walk.
+  walk: Walk,
+}
+
+/// The walk a REPORT's answer is: a `log-report`'s or an `update-report`'s.
+#[derive(Debug)]
+enum Walk {
+  /// A `log-report`'s.
+  Log(DavLog),
+  /// An `update-report`'s ([`super::update`]).
+  Update(Box<UpdateWalk>),
 }
 
 /// How far a REPORT's answer is.
@@ -269,13 +286,24 @@ impl Report {
     out: &mut Vec<u8>,
     room: usize,
   ) -> ReportProgress {
-    let progress = self
-      .log
-      .resume(served.index, served.repository, served.rules, out, room);
+    let log = match &mut self.walk {
+      Walk::Log(log) => log,
+      Walk::Update(walk) => {
+        let walked = Walked {
+          index: served.index,
+          repository: served.repository,
+          locks: served.locks,
+          now: served.now,
+          rules: served.rules,
+        };
+        return walk.resume(&walked, out, room);
+      }
+    };
+    let progress = log.resume(served.index, served.repository, served.rules, out, room);
     match progress {
       DavLogProgress::More => ReportProgress::More,
       DavLogProgress::Done => ReportProgress::Done,
-      DavLogProgress::Refused { .. } if self.log.begun() => ReportProgress::Broken,
+      DavLogProgress::Refused { .. } if log.begun() => ReportProgress::Broken,
       DavLogProgress::Refused { code, message } => {
         let status = convert_status(code, LOG_REFUSED_STATUS);
         ReportProgress::Refused(error_answer(status, true, code, &message))
@@ -303,6 +331,8 @@ struct Place {
 enum Resource {
   /// A node's place.
   Node(Place),
+  /// HTTPv2's `me` resource (`!svn/me`), which a stock client sends its update-report to.
+  Me,
   /// A special resource this part does not serve.
   Unserved,
 }
@@ -334,7 +364,7 @@ pub fn answer<R: Repository + ?Sized>(
     "OPTIONS" => Answer::Whole(options(served, request, bounds, room)),
     "PROPFIND" => Answer::Whole(propfind(served, &resource, request, bounds, room)),
     "GET" | "HEAD" => get(served, &resource),
-    "REPORT" => report(served, &resource, request, bounds),
+    "REPORT" => report(served, &resource, request, bounds, room),
     method => Answer::Whole(unserved_method(method)),
   }
 }
@@ -347,6 +377,7 @@ fn resolve<R: ?Sized>(served: &Served<'_, R>, path: &str) -> Result<Resource, Ht
     return Err(bare(HTTP_BAD_REQUEST));
   }
   let place = match segments.split_first() {
+    Some((&first, [me])) if first == SPECIAL && *me == ME => return Ok(Resource::Me),
     Some((&first, rest)) if first == SPECIAL => special(rest)?,
     _ => Some(Place {
       url: String::new(),
@@ -470,7 +501,7 @@ fn options<R: ?Sized>(
     youngest: Some(served.index.youngest()),
     uuid: Some(served.uuid.to_owned()),
     mergeinfo: Some(false),
-    bulk_updates: BulkUpdates::On,
+    bulk_updates: BulkUpdates::Prefer,
     served: SERVED_CAPABILITIES.to_vec(),
   };
   let mut headers = response::options_headers(&facts, asked);
@@ -537,14 +568,34 @@ fn report<R: Repository + ?Sized>(
   resource: &Resource,
   request: &Request<'_>,
   bounds: &Bounds,
+  room: usize,
 ) -> Answer {
-  let Resource::Node(place) = resource else {
+  if matches!(resource, Resource::Unserved) {
     return Answer::Whole(unserved_method("REPORT"));
-  };
+  }
   let asked = match request::report(request.body, bounds) {
     Ok(asked) => asked,
     Err(DavRefusal::UnknownReport { .. }) => return Answer::Whole(unserved_method("REPORT")),
+    // `me` answers an update-report alone: any other body there is a report it does not know.
+    Err(_) if matches!(resource, Resource::Me) => return Answer::Whole(unserved_method("REPORT")),
     Err(refused) => return Answer::Whole(refused_body(&refused)),
+  };
+  if let Asked::Update(update) = &asked {
+    let v2 = match resource {
+      Resource::Me => true,
+      Resource::Node(_) => false,
+      Resource::Unserved => return Answer::Whole(unserved_method("REPORT")),
+    };
+    let youngest = served.index.youngest();
+    return match UpdateWalk::new(update, served.root, youngest, served.uuid, v2, room) {
+      Ok(walk) => Answer::Report(Report {
+        walk: Walk::Update(Box::new(walk)),
+      }),
+      Err(refused) => Answer::Whole(refused),
+    };
+  }
+  let Resource::Node(place) = resource else {
+    return Answer::Whole(unserved_method("REPORT"));
   };
   match node_at(served, place) {
     Ok(Some(_)) => {}
@@ -553,7 +604,9 @@ fn report<R: Repository + ?Sized>(
   }
   match asked {
     Asked::Log(log) => match DavLog::new(&log, &place.path) {
-      Some(log) => Answer::Report(Report { log }),
+      Some(log) => Answer::Report(Report {
+        walk: Walk::Log(log),
+      }),
       None => Answer::Whole(bare(HTTP_BAD_REQUEST)),
     },
     _ => Answer::Whole(unserved_method("REPORT")),
