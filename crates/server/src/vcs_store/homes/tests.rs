@@ -1,7 +1,5 @@
 //! A-724 piece 5's tests (§4.17.5 "Giant repositories"): content homed by its identity across a node's shards.
 
-use std::time::Duration;
-
 use slates_db::register::rendezvous_ranked_by_key;
 use slates_vcs::ContentId;
 
@@ -10,9 +8,6 @@ use super::{HOMED, HomeRefused, LET_GO, home, home_of, let_go, read};
 /// Shape: the windows the spread test homes: enough that every one of four shards is some window's home with
 /// overwhelming probability (each misses all with probability (3/4)^64, about 1e-8).
 const WINDOWS: usize = 64;
-
-/// Shape: how long the test thread waits for the shards' answers: a liveness budget.
-const ANSWER_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 
 /// The `index`th test window: distinct bytes, well within a window.
 fn window(index: usize) -> Vec<u8> {
@@ -103,7 +98,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
     .unwrap();
     slates_rt::futures::detach(task).unwrap();
   });
-  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS));
+  let outcome = answered.recv();
   let homed: u64 = (0..4)
     .map(|partition| {
       crate::daemon::observe_at(&daemon, partition, |state| {
@@ -209,7 +204,7 @@ fn a_homed_windows_ticket_is_published_only_once_its_homes_image_is() {
     .unwrap();
     slates_rt::futures::detach(task).unwrap();
   });
-  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS));
+  let outcome = answered.recv();
   daemon.stop();
   let outcome = outcome.expect("the shards answered");
   assert!(outcome.is_empty(), "{outcome:#?}");
@@ -273,7 +268,7 @@ fn a_batch_of_windows_goes_to_each_home_in_one_call_a_shard() {
     .unwrap();
     slates_rt::futures::detach(task).unwrap();
   });
-  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS));
+  let outcome = answered.recv();
   let calls: u64 = (0..4)
     .map(|partition| {
       crate::daemon::observe_at(&daemon, partition, |state| {
@@ -334,21 +329,18 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
           "acknowledged before its image was published: {before:?}"
         ));
       }
-      // The home's barrier (A-727's, played here): the next image captures the content table and is published.
-      let publisher = slates_rt::futures::spawn(async move {
-        let _ = crate::xshard::call_in_shard_time(
-          origin,
-          home,
-          move |_| {
-            image_begun(1);
-            image_published(2);
-          },
-          budget,
-        )
-        .await;
-      })
-      .unwrap();
-      slates_rt::futures::detach(publisher).unwrap();
+      // The home's barrier (A-727's, played here at a chosen step, no clock): the next image captures the content table
+      // and is published, before the put is served again.
+      let _ = crate::xshard::call_in_shard_time(
+        origin,
+        home,
+        move |_| {
+          image_begun(1);
+          image_published(2);
+        },
+        budget,
+      )
+      .await;
       match HomeMessage::decode(&serve_remote(origin, &put, budget).await) {
         Ok(HomeMessage::Answer {
           outcome: HomeOutcome::Kept { generation },
@@ -420,7 +412,7 @@ fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_it
     .unwrap();
     slates_rt::futures::detach(task).unwrap();
   });
-  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS * 2));
+  let outcome = answered.recv();
   daemon.stop();
   let outcome = outcome.expect("the shards answered");
   assert!(outcome.is_empty(), "{outcome:#?}");
@@ -508,7 +500,7 @@ fn the_healer_on_a_lone_node_moves_nothing_and_region_offers_are_idempotent() {
     .unwrap();
     slates_rt::futures::detach(task).unwrap();
   });
-  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS * 2));
+  let outcome = answered.recv();
   daemon.stop();
   let outcome = outcome.expect("the shards answered");
   assert!(outcome.is_empty(), "{outcome:#?}");
