@@ -52,7 +52,9 @@ jobs:
           "$B" --instance "$inst" bootstrap root >> "$r" 2>&1
           "$B" --instance "$inst" repository create project --tool svn >> "$r" 2>&1
           t0=$(date +%s.%N); "$B" --instance "$inst" repository import project "$RUNNER_TEMP/git-1000.dump" >> "$r" 2>&1; echo "import exit $? $(echo "$(date +%s.%N) - $t0" | bc) s" >> "$r"
-          minted=$(env $exports "$B" --instance "$inst" credential token)
+          minted=$(env $exports "$B" --instance "$inst" credential token 2>&1)
+          echo "credential token: exit $?; exports $(echo "$exports" | wc -w) words; its lines but the token's:" >> "$r"
+          echo "$minted" | grep -v '^token:' | sed 's/^/  /' >> "$r"
           id=$(echo "$minted" | sed -n 's/^id: //p'); token=$(echo "$minted" | sed -n 's/^token: //p')
           timed() { local what=$1; shift; local t0=$(date +%s.%N); "$@" > "$out/$what.txt" 2>&1; local code=$?; echo "$what exit $code $(echo "$(date +%s.%N) - $t0" | bc) s" >> "$r"; }
           for edge in svn http; do
