@@ -22855,6 +22855,14 @@ Goal item 4 of 2026-10-22, the leak A-148 recorded.
   release test as evidence, which a mount's own `FORGET` now settles before the mount ends (2d8eee97). A test needs a file
   kept with no `FORGET` to come: unlinked through the successor while a handle no image counted is open, then the mount
   unmounted while the handle is held (a lazy unmount) and `referenced_bytes` read back to its level before the file.
+  **Built 2026-11-20 (A-739, w-bugs; goal-83 B14), and it found a leak wider than the kept files:** the test
+  (`crates/cli/tests/cli.rs` `a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends`)
+  failed on CI's ubuntu (kernel 7.0) with and without a takeover: the mount ended (`attachments: 0`, nothing
+  `takeover_kept`) and the file's 1 MiB stayed referenced. An ordinary mount's end swept nothing its kernel held
+  (`sweep_attachment` was reached only from `FUSE_DESTROY` and virtio-fs), so a file it held open or looked up,
+  unlinked meanwhile, stayed charged for good. `end_attachment` now sweeps the attachment's references, which ends a
+  takeover holder too; with `a_file_an_ended_mount_held_is_given_back`, both tests red with the old call and green
+  with the sweep (diag-w-bugs-a739-red-2 / -green-1).
 - **Found under load afterwards, fixed by A-154 (next section but two):** a handle released after the last publication
   left its open in the image, and nothing ever gave it back.
 

@@ -55273,3 +55273,22 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   receive:: hook_view` 200 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- vcs_store:: git_push::
   vcs_http::git:: git_hooks::` 91 passed and one hook test past its bound under load (load average 71), passing alone
   (3 of 3); fmt clean.
+
+### A-739 — A FUSE mount's end gives back every reference its kernel held (bug, 2026-11-20, w-bugs for goal 87; found by goal-83 B14's test; §4.5 references, §4.6 FUSE, U10)
+
+- **Found by use.** B14's real-mount test (a file kept for a mount that survived a takeover, the mount lazily
+  unmounted with the uncounted handle held, then closed) failed on CI's ubuntu-latest, kernel 7.0: the mount ended
+  (`slates status`: `attachments: 0`, no `takeover_kept`) and `referenced_bytes` stayed 1,048,576. The same steps with
+  no takeover failed the same way (diag-w-bugs-b14-green-2).
+- **Cause.** `Volume::sweep_attachment` gives back an attachment's references, opens and takeover hold; the FUSE path
+  reached it only through `FUSE_DESTROY`, which Linux sends to fuseblk and virtio-fs mounts alone, and the server's
+  `end_attachment` ended only the takeover holder. A lazily unmounted mount's last `RELEASE` and `FORGET`s can be lost
+  with its connection, so whatever its kernel held stayed charged to the volume for good.
+- **Change.** `verbs::end_attachment` sweeps `RefOwner::Attachment(record.id)`: however an attachment ends, its kernel
+  holds nothing of the volume any more. The counter `recovery.takeover_kept_unreleased` counts a refused sweep too.
+- **Tests.** `crates/cli/tests/cli.rs` `a_file_an_ended_mount_held_is_given_back` (no takeover) and
+  `a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends`: red with the old call
+  (diag-w-bugs-a739-red-2), green with the sweep (-green-1), CI ubuntu-latest; the neighbouring takeover and release
+  tests and the server's `--test fuse_mount` (7/7) pass in both. macOS arm64 (Mac Studio): server `--test
+  attachment_term` 4/4, `--test attach_forms` 9/9.
+- **Applied in the same change to** GAPS (U10's "release at a real mount's end" entry), amendments.tsv.
