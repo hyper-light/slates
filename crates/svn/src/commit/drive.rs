@@ -769,6 +769,9 @@ pub struct Work {
   pub texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists the work made, by identity, each sorted by name.
   pub property_lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  /// The commit's locks: who commits, the tokens it presented and whether it keeps them, which the owner's step judges
+  /// the work again with where its verdict's facts moved (A-655 part 2b; A-698).
+  pub locks: CommitLocks,
 }
 
 /// Where the drive is.
@@ -2088,6 +2091,7 @@ impl Drive {
       revision_properties,
       texts: std::mem::take(&mut self.texts),
       property_lists: std::mem::take(&mut self.property_lists),
+      locks: self.setup.locks.clone(),
     })))
   }
 

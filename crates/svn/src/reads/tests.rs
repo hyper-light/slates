@@ -2639,8 +2639,14 @@ fn lock_read(locks: &LockTable, now: AprTime, command: &[u8]) -> String {
   };
   let command = items(command).remove(0);
   let mut out = Vec::new();
-  let outcome =
-    answer_lock_read(&fixture.index, &fixture.green, (locks, now), &session, &command, &mut out);
+  let outcome = answer_lock_read(
+    &fixture.index,
+    &fixture.green,
+    (locks, now),
+    &session,
+    &command,
+    &mut out,
+  );
   assert!(matches!(outcome, Some(Ok(Outcome::Answered))));
   String::from_utf8(out).unwrap()
 }
@@ -2681,7 +2687,10 @@ fn the_lock_reads_answer_from_the_lock_table_as_svnserve_writes_them() {
     format!("{trivial}( success ( ( {held}) ) ) "),
     format!("{trivial}( success ( ( {held}) ) ) "),
     format!("{trivial}( success ( ( ) ) ) "),
-    format!("( failure ( ( 200004 {}:{refusal} 0: 0 ) ) ) ", refusal.len()),
+    format!(
+      "( failure ( ( 200004 {}:{refusal} 0: 0 ) ) ) ",
+      refusal.len()
+    ),
   ];
   assert_eq!(answers, expected);
 }

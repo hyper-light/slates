@@ -414,7 +414,7 @@
 > of 38 and 60 of 60). Owed: the lender of a Subversion store over A-662's map (the records A-655 part 2b keeps there, a
 > directory's entries from the green, the repository's `svnserve.conf` facts; the DAV site's own `SvnStores`, A-681,
 > waits for the same lender), without which the daemon's site cannot start the tunnel; the accepted work handed to A-655
-> part 2b's owner step (`repository::svn_commit::commit`); the tunnel moved to the shard of the repository its URL names
+> part 2b's owner step (built since, A-698); the tunnel moved to the shard of the repository its URL names
 > (A-651 part 4 moves a connection for a named repository); the daemon's edge (A-684, built); a configured hook run, not
 > refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve`
 > exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a
@@ -453,6 +453,17 @@
 > test runs). Stock git's live `git push` over SSH runs since 2026-11-20 (`git_interop.rs`'s
 > `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`, un-ignored by w-interop, passing; its evidence on g083's
 > stock git line).
+> **A-698 (2026-11-20, g229; commits over ra_svn):** the work A-656's connection accepts lands through A-655 part 2b's
+> step: `repository::svn_commit::commit_work`, which `svn://` and the SSH tunnel share, makes the revision at the
+> owner's instant, judges it again with the commit's locks (`Work::locks`) and lands it; `commit-info` or `close-edit`'s
+> failure answers it (the step's refusals in FSFS's words, its own under the nearest error,
+> `serve::Uncommitted::Refused`); the tunnel lands through its lender (`SvnStores::commit`). Held to the recorded
+> `mkdir` commit byte for byte through the tunnel, and on a real shard. (macOS arm64, Mac Studio, kiln r509: red 52 of
+> 55, green 55 of 55; slates-svn 115 of 115; fmt clean.) Since 2026-11-19 (w-svn) the `svn://` listener lands
+> its signed-in sessions' commits through the same step (`vcs_svn` `land`; a stock `mkdir` commit over the listener,
+> then revision 1, on a two-shard daemon; macOS arm64, this Mac, local: server `vcs_svn::` 11 of 11 with
+> `repository::svn_commit::`, `vcs_ssh` 59 of 59, slates-svn 120 of 120). Owed: the tunnel's production lender in the
+> daemon's SSH site; a configured hook run; stock `svn` over `svn://` end to end (the interop leg).
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -1296,6 +1307,13 @@
 > git/git whole (607 MiB pack) kills the daemon on either edge (shard 0 spins 3,559 ms unsliced; git hangs); cut at
 > v1.0.0 (3.4 MB) it pushes, but every non-shallow clone is refused (`upload-pack: the request needs more room than
 > the server admits`) and `fetch --deepen` reports corruption: 4 of 27 pass. Owed to w-git; re-run when they land.
+> **Stock hg command matrix (w-interop, 2026-11-20):** `ci/interop/hg-matrix.sh` (24 rows, hg's own repository): any
+> real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
+> (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
+> clone pass: 14 of 24 (main 9f51d75, debug, Mac Studio). The matrices' rows count a command that cannot start as failed.
+> **svn:// interop runs (w-interop, 2026-11-20):** `svn_interop.rs`'s svn:// round trip un-ignored: stock svn 1.15.0's
+> checkout, commits, update and log over the daemon's svn:// listener pass (main 4785858, Mac Studio). svn+ssh still
+> closes the tunnel (`E210002`), and the HTTP legs meet `'/project' path not found` (the DAV reads, A-681).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
