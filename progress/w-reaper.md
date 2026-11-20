@@ -9,8 +9,14 @@
   other users). After a merge, `touch` the tree's .rs files: mtime fingerprints reuse stale artifacts otherwise.
   Commits need `git -c commit.gpgsign=false` (kiln signer refuses non-kiln sessions); push via
   git@github.com:hyper-light/slates.git (https has no credentials here).
-- NEXT: piece B: idle seal + purge by aging deadline on the keeper (seal_idle_content/purge_if_idle in daemon.rs),
-  then piece C: delete reap_loop + its tick, test that no reap waits on it, §4.7 says so, LOOP_TASKS -1.
+- Pieces B+C (A-715) LANDED: main f70230cc8 (merged 60e23101a). crate::idle_sweep runs the idle sweep at its own
+  deadline on the keeper (armed by Store::sweep_owed, arena allocation/allocated-bytes change, deferred frees; re-armed
+  while a pass leaves work); daemon::reap_loop deleted -- no reap tick remains. Tests macOS arm64, Mac Studio, local:
+  idle_sweep 2/2 (an idle shard ran 0 passes in 3 intervals), give_back 1/1, purge 2/2, deadlines 10/10, base_hints
+  1/1, idle 5/5, vfs seal 5/5, fmt.
+- QUEUE DONE: 1 (A-475, on main from g255), 2 (A-522..A-570 g255; A-709, A-715 w-reaper), 3 (A-715 deleted the tick).
+- Finding (read, not chased): a start's free-content/recovery give-back (3.2 GB on the Studio) is interrupted by the
+  control shard's 100 ms heartbeat every pass, so it takes ~10 passes (one an interval) -- same pace as the old tick.
 
 ## State found at start
 - On main already (g255): A-475 (dead clients by hang-up), A-522, A-536, A-554, A-570. Queue item 1 DONE on main.
