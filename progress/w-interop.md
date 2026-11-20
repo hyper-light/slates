@@ -165,3 +165,8 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   building (first Windows build is long).
 - r55 release hg push on 4997b707f (A-732 p2 in): killed at 194 s (spin 1080 ms), RSS 13,450 MiB, nothing durable;
   restarted daemon spun again after recovery; matrix 17/24. Reported.
+- Windows: git_interop/svn_interop/cli.rs are #![cfg(unix)] -> 0 tests on jupiter. Proving by use: r57 builds
+  slates.exe + git matrix (v1.0.0 cut) under MSYS bash. Porting the interop tests to Windows = later piece.
+- Revprop row (A-702 p2) BLOCKED: no CLI verb sends SetRepositoryPolicy; proposed `slates repository hooks NAME --hook
+  POINT=PROGRAM` to main; will start it after r57 unless told otherwise.
+- svnrdump spin: w-svn fixing (listener never yields while client drains); re-run row when it lands.
