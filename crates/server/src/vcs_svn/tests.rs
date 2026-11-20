@@ -515,7 +515,7 @@ fn read_items_or_word(stream: &mut ClientStream) -> String {
 /// environment is its repository's hooks-env alone (A-623), so the script names every program by its absolute path.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
-fn hook_script(dir: &std::path::Path, point: &str, body: &str) -> String {
+pub(crate) fn hook_script(dir: &std::path::Path, point: &str, body: &str) -> String {
   use std::os::unix::fs::PermissionsExt;
   let path = dir.join(point);
   std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("the hook written");

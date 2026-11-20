@@ -571,6 +571,31 @@ pub(crate) fn revision_wholly_readable(
     .map_err(|failure| (failure.code, failure.message))
 }
 
+/// `svn_repos_fs_revision_proplist`: revision `revision`'s properties a session reading by `authz` may see (all of
+/// them where it may read the whole revision, its author and date where it may read part, none where nothing), as
+/// `svn_ra_svn__write_proplist` writes them (`replay-range`'s `revprops`, A-703); refused with the error number and words
+/// of a revision the index does not hold.
+pub(crate) fn readable_revision_properties<'value, R: Repository + ?Sized>(
+  index: &Index,
+  repository: &'value R,
+  authz: Option<&PrincipalRules>,
+  revision: Revision,
+) -> Result<Value<'value>, (u32, String)> {
+  if revision > index.youngest() {
+    let failure = Failure::of_index(&IndexRefusal::NoSuchRevision { revision });
+    return Err((failure.code, failure.message));
+  }
+  let access = revision_access_in(index, authz, revision)
+    .map_err(|failure| (failure.code, failure.message))?;
+  let properties = repository
+    .revision_properties(revision)
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|(name, _)| access.shows(name))
+    .collect();
+  Ok(proplist(properties))
+}
+
 /// A refusal as `svnserve` writes it: Subversion's error number and its message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Failure {
@@ -2101,4 +2126,4 @@ pub use log::dav::{DavLog, DavLogProgress};
 pub use stream::{Progress, Stream};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

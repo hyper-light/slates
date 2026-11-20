@@ -44,7 +44,10 @@
 //! beside the others (`super::svn`'s `SvnServices`, A-688): A-656's connection over the channel, the repository found
 //! and judged when its URL comes, its store lent as git's is, and refused as not served where it is not held here.
 
+use std::cell::RefCell;
+
 use slates_db::catalog::{CredentialKind, CredentialRecord, Principal, RepositoryRecord, VcsTool};
+use slates_rt::tcp::TcpStream;
 use slates_ssh::command::Command as Asked;
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 use slates_vfs::clock::Clock;
@@ -114,6 +117,97 @@ pub(crate) struct Stepped {
   pub(crate) next: Next,
 }
 
+/// Whether the connection's client has gone, as a command waits on something of its own within a step: a hook's run
+/// (git's receive-pack, A-683; Subversion's tunnel, A-730), as the HTTP edge's `crate::vcs_http::ClientGone` tells a
+/// service once its request's body has ended (A-665 part 4a). The connection's socket is watched for the client's close
+/// while the step runs and the edge reads nothing else.
+///
+/// An SSH client may still send while it waits: a window adjustment, its channel's EOF or close, a keepalive or a
+/// disconnect, each an encrypted packet this watch cannot read. So it takes the client's bytes rather than peeking at
+/// them, as the HTTP edge's watch peeks (there the client sends nothing once its body has ended): each run as it arrives
+/// (`read_now` once readability says something came; the wait holds no buffer, so a step that drops the watch loses
+/// none of them), kept in `kept`, which the edge hands to its session after the step as it would have read them then.
+/// So the client's end of stream or a reset, behind whatever it sent, ends the wait. Past `room` bytes kept (the one
+/// read a connection holds beside its session, `super::READ_BYTES`), the watch reads no more and asks the kernel's own
+/// record of the connection once (`TcpStream::peer_closed`): left is gone; still there leaves it unknown, and the wait
+/// does not end on it.
+#[derive(Clone, Copy)]
+pub(crate) struct ClientGone<'s> {
+  /// The connection's socket, the client's bytes taken while it is watched, and how many may be kept; none for a caller
+  /// with no client (the tests' commands stepped directly).
+  watched: Option<(&'s TcpStream, &'s RefCell<Vec<u8>>, usize)>,
+}
+
+/// What one look at a watched socket found ([`ClientGone`]).
+enum Looked {
+  /// Its end of stream, or the socket refused (a reset).
+  Gone,
+  /// The client's bytes, kept; or nothing queued after all.
+  Taken,
+  /// The bytes kept reached their room: nothing more is read.
+  Full,
+}
+
+impl<'s> ClientGone<'s> {
+  /// The client of the connection over `stream`, its bytes kept in `kept` up to `room`.
+  pub(crate) fn watching(stream: &'s TcpStream, kept: &'s RefCell<Vec<u8>>, room: usize) -> Self {
+    Self {
+      watched: Some((stream, kept, room)),
+    }
+  }
+
+  /// No client to watch: never gone.
+  #[cfg(test)]
+  pub(crate) fn never() -> Self {
+    Self { watched: None }
+  }
+
+  /// Resolves once the client has gone (the type's doc); never while it is there.
+  pub(crate) async fn gone(self) {
+    let Some((stream, kept, room)) = self.watched else {
+      return core::future::pending().await;
+    };
+    loop {
+      if stream.wait_readable().await.is_err() {
+        return;
+      }
+      match look(stream, kept, room) {
+        Looked::Gone => return,
+        Looked::Taken => {}
+        Looked::Full => {
+          if stream.peer_closed().unwrap_or(true) {
+            return;
+          }
+          // Still there, with bytes this watch may not take: unknown (the type's doc).
+          return core::future::pending().await;
+        }
+      }
+    }
+  }
+}
+
+/// Takes what is queued on `stream` into `kept`, up to `room` bytes kept, without waiting ([`ClientGone`]): no await
+/// runs while `kept` is borrowed.
+fn look(stream: &TcpStream, kept: &RefCell<Vec<u8>>, room: usize) -> Looked {
+  let mut kept = kept.borrow_mut();
+  let held = kept.len();
+  let free = room.saturating_sub(held);
+  if free == 0 {
+    return Looked::Full;
+  }
+  kept.resize(held.saturating_add(free), 0);
+  let read = stream.read_now(kept.get_mut(held..).unwrap_or_default());
+  let taken = match read {
+    Ok(Some(count)) => count,
+    Ok(None) | Err(_) => 0,
+  };
+  kept.truncate(held.saturating_add(taken));
+  match read {
+    Ok(Some(0)) | Err(_) => Looked::Gone,
+    Ok(Some(_)) | Ok(None) => Looked::Taken,
+  }
+}
+
 /// A command an `exec` started, sans-io as each tool's entry point is (Mercurial's `serve::stdio::Stdio`, A-650 part 2;
 /// git's `upload::serve`, A-640 part 2): the client's input held as it arrives, up to the channel's window, until a step
 /// consumes it; its standard error and output held until the channel takes them, error first.
@@ -123,8 +217,9 @@ pub(crate) trait Command {
   fn input(&mut self, run: &[u8]) -> Result<(), Refused>;
   /// The client's input has ended.
   fn input_end(&mut self);
-  /// Serves what it can: what it consumed of its input, and what it waits for now.
-  async fn step(&mut self) -> Result<Stepped, Refused>;
+  /// Serves what it can: what it consumed of its input, and what it waits for now. A step that waits on something of
+  /// its own (a hook's run) ends that wait once `gone` says its client has gone.
+  async fn step(&mut self, gone: ClientGone<'_>) -> Result<Stepped, Refused>;
   /// What it has written and the channel has not taken: standard error, then standard output.
   fn output(&self) -> (&[u8], &[u8]);
   /// The channel took `stderr` bytes of its standard error and `stdout` of its standard output.
@@ -403,11 +498,11 @@ impl<L: StoreLender, H: HgStores, S: ShardLender> Command for ToolCommand<L, H, 
     }
   }
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
+  async fn step(&mut self, gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     match self {
-      ToolCommand::Upload(command) => command.step().await,
-      ToolCommand::Receive(command) => command.step().await,
-      ToolCommand::Mercurial(command) => command.step().await,
+      ToolCommand::Upload(command) => command.step(gone).await,
+      ToolCommand::Receive(command) => command.step(gone).await,
+      ToolCommand::Mercurial(command) => command.step(gone).await,
     }
   }
 
@@ -440,7 +535,7 @@ impl Command for NoCommand {
     match *self {}
   }
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
+  async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     match *self {}
   }
 

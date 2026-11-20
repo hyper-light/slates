@@ -195,7 +195,7 @@ pub(crate) fn advance(state: &mut ShardState, green: DbVolumeId, version: u64) {
 /// [`advance`] for a version a push committed (A-664's live whole builds): a version whose map must be built from the
 /// whole head is built in slices by a task of the shard ([`whole_build`]), since a push carries its own commits and
 /// nothing of its answer needs the map; a step over the change runs here, as [`advance`]'s does. A push to a green whose
-/// build is under way starts it again at the new head.
+/// build is under way leaves it alone: it moves to the newest head at its next slice's boundary.
 pub(crate) fn advance_after_push(state: &mut ShardState, green: DbVolumeId, version: u64) {
   if version == 0 {
     return;
@@ -203,7 +203,11 @@ pub(crate) fn advance_after_push(state: &mut ShardState, green: DbVolumeId, vers
   let Some(repository) = git_repository_of(state, green) else {
     return;
   };
-  if whole_build::building(state, green) || needs_whole(state, (repository, green), version) {
+  // A build under way moves to this version at its next slice's boundary ([`whole_build`], "A push meanwhile").
+  if whole_build::building(state, green) {
+    return;
+  }
+  if needs_whole(state, (repository, green), version) {
     whole_build::start(state, repository, green, version);
     return;
   }
@@ -213,7 +217,7 @@ pub(crate) fn advance_after_push(state: &mut ShardState, green: DbVolumeId, vers
 /// Whether `green`'s step at `version` would build the map from the whole head ([`plan`]'s rule, read over the change
 /// alone, never the head's files): no map of the version before is kept and the branch's source stands for none, or a
 /// copy is named in the change.
-fn needs_whole(
+pub(crate) fn needs_whole(
   state: &ShardState,
   (repository, green): (RepositoryId, DbVolumeId),
   version: u64,

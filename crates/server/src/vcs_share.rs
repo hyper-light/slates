@@ -233,5 +233,7 @@ fn demand_of(
   held.saturating_add(per_intake.saturating_mul(intakes))
 }
 
+pub(crate) mod place;
+
 #[cfg(test)]
 mod tests;

@@ -88,14 +88,29 @@ pub fn winfsp_fsx_success(operations: u64) -> String {
   format!("All operations - {operations} - completed A-OK!")
 }
 
-/// The WinFsp fsx port passed when it exited 0 and printed its success line naming exactly the operations asked for
-/// (`-N`), so a run that stopped short cannot pass.
+/// The WinFsp fsx port passed when it exited 0 and printed its success line with a count of at least the operations
+/// asked for (`-N`). The port prints that line only after its `-N` loop has run every test (`fsx.c` 2079-2106 at
+/// 6ac65cd), and its count also numbers each MAPWRITE's extension of the file (1330-1337), so a whole run counts at least
+/// the operations asked and a run that stopped short prints no such line (A-725).
 pub fn judge_winfsp_fsx(exit_success: bool, output: &str, operations: u64) -> ExerciserVerdict {
-  let line = winfsp_fsx_success(operations);
+  let counted = output.lines().filter_map(winfsp_fsx_counted).max();
   ExerciserVerdict {
-    ok: exit_success && output.lines().any(|candidate| candidate.trim() == line),
+    ok: exit_success && counted.is_some_and(|counted| counted >= operations),
     detail: fsx_detail(output),
   }
+}
+
+/// The count a WinFsp port's success line names (`All operations - N - completed A-OK!`), or `None` for any other line.
+fn winfsp_fsx_counted(line: &str) -> Option<u64> {
+  let count = line
+    .trim()
+    .strip_prefix("All operations - ")?
+    .strip_suffix(" - completed A-OK!")?;
+  count
+    .chars()
+    .all(|c| c.is_ascii_digit())
+    .then(|| count.parse().ok())
+    .flatten()
 }
 
 /// The number of the last operation an fsx `-v` trace shows done: the largest `N` of its `N: OPERATION …` lines
@@ -234,6 +249,26 @@ mod tests {
     let bad =
       "READ BAD DATA: offset = 0x1000, size = 0x2000\nAll operations - 10000 - completed A-OK!x\n";
     assert!(!judge_winfsp_fsx(true, bad, 10_000).ok);
+  }
+
+  /// B3 (A-725): the WinFsp port counts a MAPWRITE's extension of the file as a call of its own (`fstools/src/fsx/fsx.c`
+  /// 1330-1337 at 6ac65cd: `dotruncate`, then `testcalls++`) while its `-N` loop counts tests (2079), so a whole run of
+  /// 10,000 operations ends `All operations - 10770 - completed A-OK!` (CI windows-latest over the drive, diag-w-bugs-b3-10,
+  /// 2026-11-20, the first run of fsx over the drive ever to finish). Do: judge that ending for 10,000 asked. Expect: a
+  /// pass; a count below the operations asked still fails.
+  #[test]
+  fn the_winfsp_ports_count_includes_its_extensions() {
+    let whole = "10769: TRUNCATE DOWN   from 0x40000 (262144) to 0xa558 (42328)\n\
+      10770: TRUNCATE UP     from 0xa558 (42328) to 0xfba8 (64424)\nAll operations - 10770 - completed A-OK!\n";
+    assert!(
+      judge_winfsp_fsx(true, whole, 10_000).ok,
+      "a whole run with its extensions counted"
+    );
+    let short = "All operations - 9999 - completed A-OK!\n";
+    assert!(
+      !judge_winfsp_fsx(true, short, 10_000).ok,
+      "a run short of the operations asked"
+    );
   }
 
   /// A-209: a `-v` trace's last operation is its largest numbered operation line; the port's other lines (its seed,

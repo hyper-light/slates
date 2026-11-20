@@ -37,7 +37,7 @@ use slates_svn::report::exchange::Budget;
 use slates_svn::serve::{Limits, Policy, Sources};
 
 use super::super::site::{
-  Command, Dispatched, GIT_DIE_STATUS, Next, NotYet, Refused, SshSite, ToolSite,
+  ClientGone, Command, Dispatched, GIT_DIE_STATUS, Next, NotYet, Refused, SshSite, ToolSite,
 };
 use super::{EitherCommand, Opening, SvnServices, SvnStores, TunnelBounds};
 use crate::repository::svn_commit::{Committed, Uncommitted as Unlanded};
@@ -662,7 +662,8 @@ fn drive<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
       Next::Input => hand_over(command, runs.next()),
       Next::More => {}
     }
-    let stepped = ready(command.step()).expect("a tunnel ends as svnserve ends, never failed");
+    let stepped = ready(command.step(ClientGone::never()))
+      .expect("a tunnel ends as svnserve ends, never failed");
     consumed += stepped.consumed;
     next = stepped.next;
   }
@@ -1168,7 +1169,7 @@ async fn drive_awaiting<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
       Next::More => {}
     }
     let stepped = command
-      .step()
+      .step(ClientGone::never())
       .await
       .expect("a tunnel ends as svnserve ends, never failed");
     consumed += stepped.consumed;

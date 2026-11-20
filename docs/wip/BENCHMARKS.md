@@ -14960,3 +14960,37 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
   1e84630b1 (the section above: every push ok) and b8e4591, or the end is intermittent. The rejection stands on the
   toys' p99 alone. Reported to main; the run's profile is `~/.cache/w-balance/r100.sample` on adas-mac-studio.local-2.
 
+## Many repositories on one daemon, held to their fair share: no class starved under today's placement; a hot repository 7.6 times slower than spread would allow (A-724 piece 7; main's ruling of 2026-11-20; 2026-11-20)
+
+- **The measure.** Under saturation no push can match its time alone, so a class's p99 is held to its **fair-share
+  ideal** (main's ruling): when its repository would finish under processor sharing of the daemon's shards among the
+  repositories with work, each repository's work its pushes times its class's push alone (`fair_share_ideal` in
+  `crates/cli/bench/multi_repo_load.py`). The ideal is taken twice: each repository confined to one shard (its whole
+  intake on its owner, as today), and spread over as many shards as it has pushes (what intake off the owner shard,
+  A-722, is to allow). Near 1 is fair; well above 1 is starvation.
+- **The command and machine.** `multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 --steps 1,10,100`,
+  and the control `... v0.99 --steps 100` (every repository small). adas-mac-studio.local-2, M3 Ultra, 32 cores, a
+  23-shard daemon; release built from bc2b042e0 (main 2963b7ad5 with the harness), the script at c291fe8be;
+  load 8.8 to 10.3; one run each. v1.5.0 is left out: 19 concurrent pushes of it to one repository end the daemon on
+  main (routed to w-git, A-722's by-use proof).
+
+| Run | Class | Pushes (repositories) | p50 | p99 | p99 / alone | p99 / fair share, one shard | p99 / fair share, spread |
+|---|---|---|---|---|---|---|---|
+| R = 10 | small (v0.99) | 6 (9) | 0.238 s | 0.339 s | 1.6 | 0.78 | 1.56 |
+| | hot (v1.0.0) | 3 (1) | 1.667 s | 1.707 s | 2.2 | 0.75 | 2.24 |
+| R = 100 | small | 67 (99) | 0.831 s | 2.007 s | 9.2 | 0.87 | 2.72 |
+| | hot | 19 (1) | 10.202 s | 10.437 s | 13.7 | 0.72 | 7.61 |
+| R = 100, all small | small | 86 (100) | 0.918 s | 3.115 s | 15.5 | 0.79 | 4.08 |
+
+- **What it says.** Measured against the fair share today's placement allows, no class is starved: every ratio is
+  under one. The 9 to 16 times "alone" figures of the sections above were the daemon saturated, not a repository
+  starved. The gap is the spread column: a hot repository's 19 pushes ran one after another on its owner shard (10.2 s
+  against 1.4 s spread). This is the before figure for A-722's intake off the owner shard.
+- **How it was found** (each step one run, R = 100, the 32-core Studio). The toys sent their whole request in 0.14 s at
+  p99 and waited 4.48 s for the answer, so the wait was the server's. Per-repository lanes on a shard (at most one step
+  of a repository at once, the rest parked in order; branch `agents/w-balance-lanes`, 1b8010400) measured dead even
+  (toys' p99 4.42 s and 4.57 s against 4.55 s) and were rejected. An all-small control showed the same factor with no
+  hot repository. The names' placement was even (one repository a partition at R = 10). Every shard thread ran at 35 to
+  99 percent CPU during the burst (`ps -M`). The `kevent` frames that topped `sample`'s stacks are the runtime's
+  zero-timeout polls before it parks, busy and not idle; an earlier reading of them as idle was wrong.
+

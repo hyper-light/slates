@@ -9611,8 +9611,7 @@ fn judge_submission(
       // A git repository's green keeps the version's map of paths to git's files and its git trees (A-664 part 3,
       // `vcs_store::paths`), and the version becomes git's commit the server makes, recorded with the version in this
       // transaction and admitted to the repository's store (A-664 part 3, `vcs_store::commits`).
-      crate::vcs_store::paths::advance(state, green_id, version);
-      crate::vcs_store::commits::make(state, green_id, version, &policy.authorship);
+      crate::vcs_store::commits::after_submit(state, green_id, version, &policy.authorship);
       // A Subversion repository's green: the version becomes the revision the server makes of it, recorded in this
       // transaction (A-664's Subversion objects, `vcs_store::svn_made`).
       crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship);
@@ -12164,12 +12163,19 @@ pub(crate) fn end_attachment(
   // Its pace goes with it (A-384).
   state.attachment_paces.remove(&record.id);
   crate::merge_service::forget_attachment(state, record.id);
-  // A mount that survived a takeover holds its volume's kept files until it ends, however it ends (U10).
+  // The attachment's kernel can hold nothing of the volume any more, however it ended: every reference and open it
+  // held is given back, and a mount that survived a takeover lets the files kept for it go (U10). An ordinary FUSE
+  // mount ends with no `FUSE_DESTROY` (Linux sends it only to fuseblk and virtio-fs) and its `FORGET`s may be lost
+  // with its connection, so until A-739 a file it held open or looked up, unlinked meanwhile, stayed charged to the
+  // volume for good (CI ubuntu, 2026-11-20: 1 MiB after a lazy unmount and the last close).
   if let Some(&handle) = state.by_id.get(&record.volume)
     && let Ok(slot) = state.volumes.get_mut(handle)
     && slot
       .volume
-      .end_takeover_holder(&mut state.store, record.id)
+      .sweep_attachment(
+        &mut state.store,
+        slates_vfs::ids::RefOwner::Attachment(record.id),
+      )
       .is_err()
   {
     state.count(TAKEOVER_KEPT_UNRELEASED, 1);
@@ -19093,8 +19099,8 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
   }
 }
 
-/// Format: mounts that ended with the files kept for them (U10) refused reclamation: they stay charged to the volume until
-/// its next restart. Zero is the healthy reading.
+/// Format: attachments whose end refused the sweep of their references (A-739) or the reclamation of the files kept for
+/// them (U10): those stay charged to the volume until its next restart. Zero is the healthy reading.
 const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 /// Format: revocations acknowledged while a FUSE mount they fenced was still dropping its kernel's cache, past
 /// the told bound (`told::bound_ns`, AUD-29-84): its requests were refused, but a page its kernel held may have been read

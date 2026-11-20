@@ -1,0 +1,9 @@
+svnrdump-dump: svnrdump dump svn://127.0.0.1:36913/repo -> 0 '* Dumped revision 0.\n* Dumped revision 1.\n* Dumped revision 2.\n* Dumped revision 3.\n* Dumped revision 4.\n* Dumped revision 5.\n* Dumped revision 6.\n* Dumped revision 7.\n* Dumped revision 8.\n* Dumped revision 9.\n* Dumped revision 10.\n* Dumped revision 11.'
+svnsync-initialize: svnsync initialize file:///Users/adalundhe/.cache/w-svn-replay-work/mirror svn://127.0.0.1:36913/repo -> 0 ''
+svnsync-synchronize: svnsync synchronize file:///Users/adalundhe/.cache/w-svn-replay-work/mirror -> 0 ''
+replay-copy: scripted, 1 commands
+replay-copy-no-deltas: scripted, 1 commands
+replay-copy-below-water: scripted, 1 commands
+replay-replace: scripted, 1 commands
+replay-zero: scripted, 1 commands
+replay-range-part: scripted, 1 commands
