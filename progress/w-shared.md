@@ -1,5 +1,38 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 part a1 = b856352cb (main 0831c5a0d; ledger c8e444a18): AdmitWork/WorkAdmitted, verbs::admit_work
+  (forwarded-only, owner_admit), Daemon::work_floor, fleet test a_holders_work_is_admitted_... NEXT: part a2 (holder B
+  serves CreateWork locally behind a TEST-ONLY daemon hook; mints id on B's partition; asks AdmitWork over the forward;
+  base reads from state.merge.replicas; test: id names B, files identical, edit reads back, no-rights refused by A, same
+  name AlreadyExists; amend A-247's rule). Worktree ~/slates-work/g261-a636p2b2.
+
+## A-697 (a) SPLIT: (a1) owner admission across nodes: append RequestBody::AdmitWork { green, work } (forwards_as_write;
+  served only from serve_forward, refused in a local dispatch) -> verbs::owner_admit on G's owner shard (rights from its
+  record, WorkFloorSet, head) -> ReplyBody::WorkAdmitted { id, base }; exactly-once by run_forwarded's completion key.
+  Fleet test (tests/fleet.rs two_node_fleet + green_and_work_on shares): client on B asks AdmitWork -> forwarded to A ->
+  admitted at head, floor recorded on A; resend same id same answer; a principal with no share refused.
+  (a2) B serves CreateWork locally behind a test hook: holder replica is state.merge.replicas (control shard), not
+  state.greens; work_home Need::Admit asked over the forward; base reads from the replica.
+
+## A-697 (a) PLAN (reading done 2026-11-20; nothing written yet):
+  - Today: work_home::gate parks a CreateWork whose green's owner shard is elsewhere ON THIS NODE (create_need -> park ->
+    xshard ask). Across nodes the whole CreateWork is forwarded (forward_lane.rs over fleet::FORWARD_STREAM) and served
+    on the owner (A-247 "A creation forwarded from another node is served on the green's owner").
+  - New (behind a TEST-ONLY daemon hook like Daemon::inject_merge_fault, daemon.rs:3043): on B holding G's replica
+    (state.greens has G), CreateWork is served on B: mint the work id on B's client partition; forward an owner ask to A
+    (new appended RequestBody::AdmitWork { green, work, name } -> ReplyBody::WorkAdmitted { head }, served only as a
+    forward); A checks the principal's rights on G from its record (reuse create_work's admission), records
+    Op::WorkFloorSet { green, work, base: head } (idempotent on resend), answers head; B then records the work on its
+    partition with base = head, files read from B's replica at head (wait if the replica is behind).
+  - Test in crates/server/tests/fleet.rs with two_node_fleet() (L20623): client on B, hook on: work id names B; G's files
+    byte-identical; edit reads back; a no-rights principal refused by A; same name AlreadyExists. Amend A-247 (design
+    ~L22640 + §4.16 status ~L11701) + amendment log.
+
+## NOW: A-697 piece (a) (briefs/g305.md; progress/g305-merge-anywhere.md L377+): owner admits a holder's work by a forwarded
+  verb (rights from owner's record, base held); holder's replica answers base reads; work made on client's partition;
+  TEST-ONLY hook gated like inject_merge_fault; two-node f=1 test (client on B): work id names B, G's files identical,
+  edit reads back, no-rights principal refused by A, same name AlreadyExists; amend A-247 rule (design + amendment log).
+
 ## LANDED 2026-11-20: svn copy-from rows 8ac39d0c0 (main 3e1fba44c). Queue item 3 next: A-697 (a)-(f) then A-658 3c
   (briefs/g305.md; progress/g305-merge-anywhere.md).
 
