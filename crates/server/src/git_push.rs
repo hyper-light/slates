@@ -129,7 +129,9 @@ use crate::repository::push::{
 };
 use crate::state::ShardState;
 use crate::vcs_policy::{Asked, Brings, Compiled, Name, PushRefusal, Right, admit, admit_right};
-use crate::vcs_store::{GitPush, GitRefused, GitStore, SealedPush, Target, green_key, with_room};
+use crate::vcs_store::{
+  GitPush, GitRefused, GitStore, SealTurn, SealedPush, SealingPush, Target, green_key, with_room,
+};
 use crate::verbs::to_wire_volume;
 
 #[cfg(unix)]
@@ -269,11 +271,19 @@ impl crate::git_hooks::PresentView for Unpresented {
 enum Begun {
   /// The answer, written; boxed, as the hooks' state is, since a received push is far larger.
   Answering(Box<Answering>),
-  /// The push sealed, its hooks before the verdicts due.
-  #[cfg(unix)]
-  Hooking(Box<hooks::Hooking>),
-  /// The push sealed, its commands decided a step at a time.
-  Deciding(Box<DecidingPush>),
+  /// The push's seal begun, a turn at a time.
+  Sealing(Box<SealingAnswer>),
+}
+
+/// A push's answer while its objects are sealed and staged a turn at a time (A-722 part 4; `AnswerState::Sealing`), so
+/// a push of git/git's size never runs past its step before its verdicts.
+struct SealingAnswer {
+  /// The repository's record as the answer read it.
+  record: RepositoryRecord,
+  /// The push's seal under way.
+  sealing: SealingPush,
+  /// The push's name (module docs).
+  name: [u8; 32],
 }
 
 /// A push's answer while its commands are decided a step at a time (A-719; `AnswerState::Deciding`):
@@ -298,6 +308,8 @@ struct DecidingPush {
 enum AnswerState {
   /// Not begun.
   Unbegun,
+  /// Its objects being sealed and staged a turn at a time.
+  Sealing(Box<SealingAnswer>),
   /// Its objects sealed in quarantine, its hooks before the verdicts under way.
   #[cfg(unix)]
   Hooking(Box<hooks::Hooking>),
@@ -512,8 +524,6 @@ impl<P> ReceivePack<P> {
     let record = record_of(state, self.repository)?;
     let pack = self.session.take_pack();
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
-    #[cfg(unix)]
-    let hooked = git_hook(&record).is_some();
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       self.give_back(state);
       let answering = self.declined(&mut Declining::hook(hook), out)?;
@@ -524,16 +534,48 @@ impl<P> ReceivePack<P> {
       Prepared::Declined(mut declining) => Ok(Begun::Answering(Box::new(
         self.declined(&mut declining, out)?,
       ))),
-      Prepared::Sealed { sealed, name } => {
-        #[cfg(unix)]
-        if hooked {
-          let hooking = hooks::Hooking::new(record, (sealed, name), checked);
-          return Ok(Begun::Hooking(Box::new(hooking)));
-        }
-        let deciding = self.deciding((record, sealed, name), HookVerdicts::default())?;
-        Ok(Begun::Deciding(Box::new(deciding)))
-      }
+      Prepared::Sealing { sealing, name } => Ok(Begun::Sealing(Box::new(SealingAnswer {
+        record,
+        sealing,
+        name,
+      }))),
     }
+  }
+
+  /// One turn of the push's seal (A-722 part 4), for the shard's step quantum and a unit at least: another turn due, or,
+  /// sealed, its hooks before the verdicts due where a git hook is configured and its verdicts otherwise; every
+  /// command refused when the store refused the seal.
+  fn seal_turn(
+    &mut self,
+    state: &mut ShardState,
+    answer: SealingAnswer,
+  ) -> Result<Sealed, PushFailed> {
+    let SealingAnswer {
+      record,
+      sealing,
+      name,
+    } = answer;
+    let ns = state.config.step_quantum_ns();
+    let sealed = match sealing.turn(state, ns) {
+      Ok(SealTurn::More(sealing)) => {
+        self.answer = AnswerState::Sealing(Box::new(SealingAnswer {
+          record,
+          sealing: *sealing,
+          name,
+        }));
+        return Ok(Sealed::Turned);
+      }
+      Ok(SealTurn::Sealed(sealed)) => sealed,
+      Err(refused) => return Ok(Sealed::Declined(Declining::unadmitted(&refused))),
+    };
+    #[cfg(unix)]
+    if git_hook(&record).is_some() {
+      let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
+      let hooking = hooks::Hooking::new(record, (sealed, name), checked);
+      return Ok(Sealed::Hooking(Box::new(hooking)));
+    }
+    let deciding = self.deciding((record, sealed, name), HookVerdicts::default())?;
+    Ok(Sealed::Deciding(Box::new(deciding)))
   }
 
   /// Every command refused by `declining`, and the report written: what was received.
@@ -655,15 +697,31 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
         let can_present = self.presenter.can_present();
         match self.begin(state, can_present, out)? {
           Begun::Answering(answering) => Ok(*answering),
-          Begun::Hooking(hooking) => self.hooking(state, *hooking, out),
-          Begun::Deciding(decision) => self.decide_step(state, *decision, out),
+          Begun::Sealing(sealing) => self.sealing_step(state, *sealing, out),
         }
       }
+      AnswerState::Sealing(sealing) => self.sealing_step(state, *sealing, out),
       AnswerState::Hooking(hooking) => self.hooking(state, *hooking, out),
       AnswerState::Deciding(decision) => self.decide_step(state, *decision, out),
       AnswerState::Observing(observing) => hooks::observe(self, state, *observing, out),
       AnswerState::Reported(received) => Ok(Answering::Answered(received)),
       AnswerState::Done => Err(PushFailed::Unchecked),
+    }
+  }
+
+  /// One step of the seal ([`Self::seal_turn`]): another step due, every command refused, or the
+  /// hooks before the verdicts or the verdicts begun in the same step.
+  fn sealing_step(
+    &mut self,
+    state: &mut ShardState,
+    sealing: SealingAnswer,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
+    match self.seal_turn(state, sealing)? {
+      Sealed::Turned => Ok(Answering::Turned),
+      Sealed::Declined(mut declining) => self.declined(&mut declining, out),
+      Sealed::Hooking(hooking) => self.hooking(state, *hooking, out),
+      Sealed::Deciding(decision) => self.decide_step(state, *decision, out),
     }
   }
 
@@ -737,10 +795,26 @@ impl<P> ReceivePack<P> {
       }
       AnswerState::Unbegun => match self.begin(state, false, out)? {
         Begun::Answering(answering) => Ok(*answering),
-        Begun::Deciding(decision) => self.decide_step(state, *decision, out),
+        Begun::Sealing(sealing) => self.sealing_step(state, *sealing, out),
       },
+      AnswerState::Sealing(sealing) => self.sealing_step(state, *sealing, out),
       AnswerState::Deciding(decision) => self.decide_step(state, *decision, out),
       AnswerState::Done => Err(PushFailed::Unchecked),
+    }
+  }
+
+  /// One step of the seal ([`Self::seal_turn`]): another step due, every command refused, or the
+  /// verdicts begun in the same step.
+  fn sealing_step(
+    &mut self,
+    state: &mut ShardState,
+    sealing: SealingAnswer,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
+    match self.seal_turn(state, sealing)? {
+      Sealed::Turned => Ok(Answering::Turned),
+      Sealed::Declined(mut declining) => self.declined(&mut declining, out),
+      Sealed::Deciding(decision) => self.decide_step(state, *decision, out),
     }
   }
 
@@ -776,9 +850,41 @@ impl<P> Drop for ReceivePack<P> {
         );
       }
     }
-    #[cfg(unix)]
-    hooks::dropped(core::mem::replace(&mut self.answer, AnswerState::Done));
+    let answer = core::mem::replace(&mut self.answer, AnswerState::Done);
+    // A push dropped while its seal or its decision is under way gives back its sealing push or its sealed push
+    // (A-722 part 4); one dropped mid-hooks gives back what its hooks hold.
+    let held = match answer {
+      AnswerState::Sealing(sealing) => Some(Held::Sealing(sealing.sealing)),
+      AnswerState::Deciding(decision) => Some(Held::Sealed(decision.sealed)),
+      #[cfg(unix)]
+      other => {
+        hooks::dropped(other);
+        None
+      }
+      #[cfg(not(unix))]
+      _ => None,
+    };
+    if let Some(held) = held {
+      let given = crate::state::with_state(|state| match held {
+        Held::Sealing(sealing) => sealing.abandon(state),
+        Held::Sealed(sealed) => sealed.abandon(state),
+      });
+      if given.is_none() {
+        slates_machine::log_line!(
+          "slates-server: a git push dropped mid-seal or mid-decision could not give back its push: the \
+           shard's state was not lent to its drop"
+        );
+      }
+    }
   }
+}
+
+/// What a push dropped mid-answer still holds of the shard.
+enum Held {
+  /// Its seal under way.
+  Sealing(SealingPush),
+  /// Its sealed push, its commands being decided.
+  Sealed(SealedPush),
 }
 
 /// `repository`'s record on this shard's partition.
@@ -918,13 +1024,26 @@ impl HiddenRefs for PolicyHidden {
 enum Prepared {
   /// Every command refused before any verdict.
   Declined(Declining),
-  /// The push's objects sealed in quarantine.
-  Sealed {
-    /// The sealed push.
-    sealed: SealedPush,
+  /// The push's objects' seal begun, a turn at a time (A-722 part 4).
+  Sealing {
+    /// The seal under way.
+    sealing: SealingPush,
     /// The push's name (module docs).
     name: [u8; 32],
   },
+}
+
+/// What a turn of a push's seal left (`ReceivePack::seal_turn`).
+enum Sealed {
+  /// Another turn is due.
+  Turned,
+  /// The store refused the seal: every command refused.
+  Declined(Declining),
+  /// Sealed, its hooks before the verdicts due.
+  #[cfg(unix)]
+  Hooking(Box<hooks::Hooking>),
+  /// Sealed, its commands decided a step at a time.
+  Deciding(Box<DecidingPush>),
 }
 
 /// Prepares `checked`, a push to `record`'s repository (module docs, "Answering", item 2), its
@@ -954,9 +1073,9 @@ fn prepare(
     GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?
   };
   push.keep_pack(pack);
-  match push.seal(state) {
-    Ok(sealed) => Ok(Prepared::Sealed {
-      sealed,
+  match push.sealing(state) {
+    Ok(sealing) => Ok(Prepared::Sealing {
+      sealing,
       name: push_name(record.id, &checked.request),
     }),
     Err(refused) => Ok(Prepared::Declined(Declining::unadmitted(&refused))),

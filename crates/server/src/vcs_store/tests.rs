@@ -1899,3 +1899,52 @@ fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
   });
   assert_eq!(seen, (1, true, true));
 }
+
+/// A-722 part 4 (a push's seal and stage a unit at a time on the owner, `GitPush::sealing`). Do: begin a push of one
+/// commit of [`MANY_FILES`] files; seal it a turn at a time, each turn held to no time at all, counting the turns; land
+/// it. Expect: more turns than the push holds objects; the push landed, its green's head the commit.
+#[test]
+fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "many-sealed", VcsTool::Git);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
+      .map(|n| {
+        (
+          format!("f{n}").into_bytes(),
+          format!("file {n}\n").into_bytes(),
+        )
+      })
+      .collect();
+    let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
+    let tree = tree_of(&objects);
+    let push = begun(state, repository, &objects);
+    let version = state.greens.get(&root).expect("the green's engine").head();
+    let built = work_of(state, (&push, root), (version, None), (commit, tree));
+    let mut sealing = push.sealing(state).expect("sealing");
+    let mut turns = 0usize;
+    let mut sealed = loop {
+      turns += 1;
+      match sealing.turn(state, 0).expect("a turn") {
+        super::SealTurn::More(more) => sealing = *more,
+        super::SealTurn::Sealed(sealed) => break sealed,
+      }
+    };
+    let changes = vec![BranchChange::Update {
+      green: root,
+      work: built,
+    }];
+    let moves = [(Target::Green(root), Some(commit))];
+    appended(state, repository, changes, (&mut sealed, &moves)).expect("appended");
+    sealed.abandon(state);
+    let key = green_key(root);
+    let head = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(content, git)| {
+        let newest = git.repository.versions(key).checked_sub(1)?;
+        git.repository.head(content, key, newest)
+      });
+    (turns > objects.len(), head == Some(commit))
+  });
+  assert_eq!(seen, (true, true));
+}

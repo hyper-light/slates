@@ -55474,6 +55474,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4b — A push is sealed and staged a unit at a time (2026-11-20, w-git for UI goal 93; main's ruling: what a push's landing ran whole held its shard past the watchdog's window at git/git's size)
+- **Change.** `slates_git::store::Staging` (`Repository::sealing`, `staging`, `stage_turn`): the seal and stage cut into
+  units, a turn taking as many as its quantum allows and one at least: a commit's generation number; a held object
+  checked against the index (a quarantine cursor, `Quarantine::object_after`); a new object's position, by type then
+  id from per-type running counts (no sort of the push); its object and position rows inserted into the fork; one table
+  of the fork's tail sealed (`slates_vcs::Index::seal_step`, which leaves exactly what `seal_all` leaves).
+  `Repository::stage` runs the same units to their end, so a push staged in one turn or many leaves the same tables
+  and a store made again from the log equals the live one. The server seals a push a turn at a time
+  (`vcs_store::SealingPush`, `git_push::AnswerState::Sealing`, a turn an answer step at the shard's step quantum), and a
+  replayed record's seal runs the same turns (`git_replay`). A push dropped mid-seal or mid-decision gives back what it
+  holds (found by reading: one dropped while its commands were decided kept its sealed push).
+- **Tests.** `slates-vcs` `tests::a_tail_sealed_a_table_a_step_is_the_tail_sealed_at_once`; `slates-git`
+  `store::tests::a_push_sealed_and_staged_a_unit_a_turn_lands_as_one_staged_whole`; `slates-server`
+  `vcs_store::tests::t_a722_p4_a_pushs_seal_takes_many_turns_and_lands`.
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-vcs --lib` 101 passed; `slates-git --lib -- store::
+  upload:: receive:: hook_view` 203 passed, 4 ignored; `slates-server --lib -- vcs_store:: git_push:: repository::
+  vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 181 passed, 1 ignored; fmt clean. The 3,000-commit push
+  over the daemon's edge 1.5 to 1.9 s and its fetch 2.6 to 2.9 s (three runs, load average 21 to 23; main 1.9 s, 4.1 s).
+- **Owed.** The moves' admission and the landing's whole passes (members' positions, landed runs, holds' release) and
+  a stale restage sliced; the replay's thin-pack resolve on w-balance's resolve-in-turns.
+
 ### A-722 part 4a — A git record's pack is replayed a turn at a time (2026-11-20, w-git for UI goal 93; main's ruling: a large pack record's replay ran in one turn and crash-looped the daemon)
 - **Change.** `vcs_store::git_replay`: a version-2 record carrying a pack is decoded once as its replay begins (names,
   moves and the pack's place in the record kept), then read a chunk at a time (`DaemonConfig::archive_slice_bytes_within`
