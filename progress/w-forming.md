@@ -21,6 +21,10 @@
   rebuilt 00:20 PST -- sweep runs after that use it, behaviour unchanged). Repro loop rp1 (40 runs, unthrottled) beside it.
   Lead: covers_candidates needs member_anchors (fleet.rs deliver loop, ~10760, anchor via learned_members) + an accepted
   pair to the fresh member at its anchor; diagnosis shows fleet.seal.pair_* counters.
+- ~08:40Z: rp1 20/20 PASS (run-7 shape not seen again; run 21 killed). sw48 run 16 FAIL at start: daemon b still in
+  measure(--quick) (pre-banner profile measurement, role/daemon.rs start()) past START_WAIT 30 s; control-shard beats
+  of a gapped 3-5 s = host starvation while rp1 ran beside the throttled sweep. Stopped rp1. sw48 runs 1-21 overlapped
+  rp1 (contaminated); plan: sweep finishes, then 21 clean runs (tag sw48b) -> 48 clean. Then resume the run-7 chase.
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
   test, fix, land (needs a machine that can push). No failure -> report count to slates-7a.
