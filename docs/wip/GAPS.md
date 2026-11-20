@@ -2495,8 +2495,10 @@
 > before its banner (sw48 run 16, rp3 run 3; the fleet had formed and settled each time). The live_chaos start wait now
 > judges the start in its processes' own CPU, as the anchor judges its daemon (A-228): waited while they live and gain
 > CPU, up to 30 s of it, given up after 10 s with none or once they are gone (`wait_answers`, `start_verdict`).
-> Still a fixed wall bound under load: the flow's `FLEET_WAIT` (40 s), which a takeover's register adoption missed at
-> load 31 (probe run pr3 run 3).
+> The flow's fleet waits (`FLEET_WAIT`, 40 s) were a fixed wall bound too, which a takeover's register adoption missed
+> at load 7 to 31 under `taskpolicy -b` (probe runs pr3 run 3, pr4 run 2); since 2026-11-20 each is the window divided by
+> the share of a CPU the test process measures it is given at the window's end (`FleetWait`, `cpu_share`): the window
+> uncontended, about twice it at load 31. A wait whose end is only noted (`copies_kept`) keeps the plain window.
 
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
