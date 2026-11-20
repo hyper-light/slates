@@ -14926,6 +14926,24 @@ and export by landing).
 > sources lent with every call, CRAM-MD5 keys over §4.13's principals, each phase's wait learned (one mechanism for the
 > HTTP, SSH and svn:// edges), and the SSH tunnel's entry point. Windows keeps no listener across a restart
 > (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
+>
+> **Status (2026-11-19, A-695: where an svn:// URL leads, A-656 part 2's second slice).** Built: the listener resolves
+> the client's URL as `svnserve`'s `find_repos` does (`slates_svn::find`, `serve.c` 3884-3955): no `svn://` URL is
+> "Non-svn URL passed to svn server", a path climbing with `..` (decoded first, so `%2E%2E` climbs) "Couldn't determine
+> repository path", and the server's root "No repository found". The repository is the longest run of the path's
+> leading segments that names one, as `svn_repos_find_root_path` walks up (a name may hold a `/`): each candidate is
+> asked of the shard its name's partition is on, every shard once (`vcs_svn::locate`, which the `svn+ssh://` tunnel
+> can call too), and a repository another shard owns moves the connection there whole (the socket's handle, the
+> connection with its answer read, its unread bytes and deadline), where it takes a seat as a new connection would
+> (every shard keeps the listener's seats). On the owner a name no Subversion repository has is "No repository
+> found"; a repository is opened with its UUID, its root URL (the client's URL less the components beneath the
+> repository) and the mechanisms it allows, none yet: a client that has not authenticated is no principal (§4.13), and
+> CRAM-MD5 waits on the keyed contexts of enrolled credentials (A-692), so every repository answers as `svnserve`
+> answers one that allows no one. Proven on a two-shard daemon against stock `svnserve` 1.15.0's recorded `no-access`
+> session, a repository on each shard. Owed: the authenticated session's sources, read each call through the shared
+> Subversion lender (g297's) once a mechanism exists; `svn_uri_canonicalize` before the lookup (a stock client's URL
+> is already canonical); the tunnel's own move to the owner (A-688's site, which finds repositories on its shard
+> alone).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -52410,3 +52428,45 @@ entry), `docs/bugs/2026-11-19-an-appends-new-branches-were-minted-one-volume-id.
   `-p slates-server --lib -- t_a694 repository::push repository::hg_push repository::tests git_push vcs_store::` 55 of
   55, `-p slates-server --test green_checkpoint` 6 of 6, `cargo fmt` (one rewrap of the model test, applied). Main's:
   clippy, `xtask check`, the doc gates and the other platforms.
+
+### A-695 — Where an svn:// URL leads: `svnserve`'s `find_repos`, the longest run of segments naming a repository asked of each shard once, and the connection moved to the repository's owner (2026-11-19, g234, UI goal 93; §4.17.4 piece 7, A-656 part 2's second slice; after A-689)
+Applied in the same change to: §4.17.4's status; GAPS (the A-656 entry); `crates/svn/src/find.rs` and
+`find/tests.rs` (new), `lib.rs`, `report.rs` (`uri_decode_bytes`); `crates/server/src/vcs_svn.rs` (`locate`,
+`Location`, `Located`, the move and the open), `vcs_svn/tests.rs`, `daemon.rs` (the listener's seats kept on every
+shard); `docs/cli.md`.
+
+- **Why.** A-689's listener answered every URL "No repository found": nothing looked a repository up, so no stock
+  client could reach one, and the `svn+ssh://` tunnel (A-688) looked only on its own shard.
+- **The rule.** `slates_svn::find` is `find_repos` with no I/O (`serve.c` 3884-3955, 1.15.0): `skip_scheme_part`
+  (`svn://` or `svn+NAME://`, else `BadUrl`), the authority skipped, the path made a canonical relative path and
+  percent-decoded, a `..` segment `BadPath` (after the decoding), no segment `NoRepository`. Its candidates are the
+  path's leading runs of segments joined by `/`, longest first, as `svn_repos_find_root_path` walks up from the whole
+  path; a repository's name may hold a `/` (only an empty name or a NUL is refused), so the HTTP site's first-segment
+  rule (`SVNParentPath`) would miss what `svnserve -r` finds. The root URL is the client's URL less the components
+  beneath the repository (`svn_path_remove_components`).
+- **Asking the shards.** `vcs_svn::locate` groups the candidates by the shard their names' partitions are on and asks
+  each shard once (`xshard::call_in_shard_time_given_room` within the liveness budget), so a lookup costs at most one
+  question per shard whatever the path's depth; the longest name held as a Subversion repository wins, and a shard that
+  does not answer ends the connection, counted, rather than settle on a shorter name it might be shadowing. The tunnel
+  can call the same function from its shard.
+- **The move.** A repository another shard owns moves the connection there whole, as the HTTP edge moves one: its
+  handle, the connection with its answer read, its unread bytes and its deadline, one spawn on the owner's control
+  channel; its seat here is given back as it leaves, and there it takes a seat as a new connection would (every shard
+  keeps the listener's seats; arrivals waiting are bounded by the seats).
+- **Opened.** On the owner the record and the store are read again (a repository gone meanwhile is "No repository
+  found"; a store not held closes the connection, counted), and the repository is opened with its UUID, also its realm,
+  and the mechanisms it allows: none yet, since a client that has not authenticated is no principal (§4.13) and
+  CRAM-MD5 waits on A-692's keyed contexts, so every repository answers "No access allowed to this repository", as
+  `svnserve` answers one that allows no one.
+- **Tests.** Red first (macOS arm64, Mac Studio, kiln r477, the test alone over main 574185afa): the repository on the
+  listener's partition was answered "No repository found in 'svn://127.0.0.1:50226/svn-1'" where `svnserve` answers
+  "No access allowed to this repository". Green (r508, 2026-11-20 00:10-00:14Z, over main 574185afa):
+  `cargo test --locked -p slates-svn --lib -- find:: report::tests::` 21 of 21 (the candidates and root URLs, the
+  refusals); `-p slates-server --lib -- vcs_svn:: vcs_http::daemon_edge::` 9 of 9, among them a two-shard daemon
+  answering stock `svnserve` 1.15.0's recorded `no-access` session for a repository on the listener's partition, one
+  on the other shard and one there whose name holds a `/`, named through a path beneath it; `-p slates-cli --test cli
+  -- vcs_svn svn_listeners` 2 of 2; `cargo fmt -p slates-svn -p slates-server -- --check` clean once rustfmt's three
+  rewraps were applied as it wrote them.
+- **Owed.** The authenticated session's sources, read each call through the shared Subversion lender (g297's) once a
+  mechanism exists (A-692); the tunnel calling `locate` and moving its SSH connection to the owner, with its test over
+  the SSH site; `svn_uri_canonicalize` before the lookup; the other platforms' runs (main's).

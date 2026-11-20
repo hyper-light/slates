@@ -513,7 +513,12 @@ pub(crate) fn join_fspath(base: &str, relpath: &str) -> String {
 /// `url` decoded as `svn_path_uri_decode` decodes it: each `%` with two hexadecimal digits the byte
 /// they name, and `+` a space past a `?`.
 pub(crate) fn uri_decode(url: &str) -> Vec<u8> {
-  let bytes = url.as_bytes();
+  uri_decode_bytes(url.as_bytes())
+}
+
+/// `bytes` decoded as [`uri_decode`] decodes a URL: a client's URL is bytes, which `svnserve` decodes
+/// as they came (`find_repos`).
+pub(crate) fn uri_decode_bytes(bytes: &[u8]) -> Vec<u8> {
   let mut decoded = Vec::with_capacity(bytes.len());
   let mut query = false;
   let mut at = 0usize;

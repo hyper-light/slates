@@ -1175,8 +1175,9 @@ impl Daemon {
     // The version-control servers' HTTP edge, when the operator asked for one (§4.17.2 "Transports" item 1, A-625 part 3):
     // its listener on the control shard beside the NFS transport, every shard keeping its seats.
     let vcs_http_port = crate::vcs_http::start(&runtime, control, &shards, &config)?;
-    // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-656 part 2): on the control shard too.
-    let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &config)?;
+    // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-689, A-695): on the control shard too,
+    // every shard keeping its seats for the connections that move to their repository's owner.
+    let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
     Ok(Daemon {
       runtime: Some(runtime),
       segment,

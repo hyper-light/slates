@@ -28,23 +28,42 @@
 //! ([`first_rto_ns`]), as the HTTP edge bounds a phase that has not learned yet. Learning each phase's wait, one
 //! mechanism for the HTTP, SSH and svn:// edges, is owed (GAPS, A-656).
 //!
-//! **What is served.** The greeting, `svnserve`'s byte for byte but for `svndiff1`, which slates does not announce, so
-//! no client sends it zlib (§4.17.4 "5. The wire"; A-599's handshake); then the client's answer: its version,
-//! capabilities and client strings judged by A-599's handshake, and its URL answered as `svnserve`'s `find_repos`
-//! answers a URL under a root that holds no repository, "No repository found in '…'" (`SVN_ERR_RA_SVN_REPOS_NOT_FOUND`,
-//! 210005), after which the connection ends, as `svnserve`'s does. No repository is looked up yet. The next piece ports
-//! the rest of `find_repos` (the scheme's check, the URL's canonical form, a path that climbs with `..`), locates a
-//! repository's name on its partition's shard, moves the connection there as the HTTP edge moves one, and lends the
-//! repository's sources there with every call (GAPS, A-656).
+//! **Where a URL leads** (A-695). The greeting is `svnserve`'s byte for byte but for `svndiff1`, which slates does not
+//! announce, so no client sends it zlib (§4.17.4 "5. The wire"; A-599's handshake); the client's answer, its version,
+//! capabilities and client strings, is judged by A-599's handshake; then its URL is resolved as `svnserve`'s
+//! `find_repos` resolves it (`slates_svn::find`): no `svn://` URL, a path climbing with `..` and the server's root are
+//! answered in `svnserve`'s words. Otherwise the repository is found as `svn_repos_find_root_path` finds it, walking up
+//! from the whole path ([`locate`], which the `svn+ssh://` tunnel calls too): the path's leading runs of segments are
+//! the names it could have, longest first, since a name may hold a `/`; each is asked of the shard whose partition its
+//! name routes to (`verbs::owner_of_name`, as `CreateRepository` routes it, D-14), every shard once with all of its
+//! candidates, and the longest held as a Subversion repository is the one. A repository another shard owns
+//! moves the connection there whole, as the HTTP edge moves one ([`migrate`]): the socket's handle, the connection with
+//! its answer read, its unread bytes and its deadline, one spawn on that shard's control channel; its seat here comes
+//! back as it leaves, and there it takes a seat as a new connection would, a free one, the most overdue's, or a wait
+//! bounded by the seats ([`seat_arrival`]). So a repository is found and served on the shard whose partition holds its
+//! record and its store, read with no crossing.
+//!
+//! **Opened.** On the owner, no Subversion repository of the name is "No repository found in '…'" (210005). A
+//! repository whose store the shard does not hold closes the connection, counted. Otherwise the repository is opened
+//! with its UUID (also its realm, `svnserve`'s default), its root URL as `find_repos` derives it, and the mechanisms it
+//! allows: none yet, since a client that has not authenticated is no principal (§4.13), so no repository reads
+//! anonymously, and CRAM-MD5 waits on the keyed contexts of enrolled credentials (A-692). A repository that allows no
+//! one is answered as `svnserve` answers one, "No access allowed to this repository" (170001), and the connection ends.
+//! The authenticated session, each call's sources lent by the repository's store on its owner (the shared Subversion
+//! lender, g297's), follows once a mechanism does (GAPS, A-656).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::task::{Poll, Waker};
 
+use slates_db::catalog::VcsTool;
 use slates_rt::futures::{cancel, detach, now_ns, spawn_child};
 use slates_rt::shard::Kept;
-use slates_rt::tcp::{SocketAddrV4, TcpListener, TcpStream};
+use slates_rt::tcp::{OwnedStream, SocketAddrV4, TcpListener, TcpStream};
 use slates_rt::{RtError, Runtime, ShardId, TaskId, futures};
-use slates_svn::handshake::Unserved;
+use slates_svn::dump::Uuid;
+use slates_svn::find::{Found, find_repository};
+use slates_svn::handshake::{Access, Unserved};
 use slates_svn::index::{ContentIdentity, Revision};
 use slates_svn::report::exchange::Budget;
 use slates_svn::serve::{Connection, Limits, Sources, Turn};
@@ -67,8 +86,25 @@ const OVERDUE: &str = "vcs_svn.overdue";
 const REAPED: &str = "vcs_svn.reaped";
 /// Counter: a reap whose cancellation the runtime refused.
 const NOT_REAPED: &str = "vcs_svn.not_reaped";
-/// Counter: a client's URL answered "No repository found", no repository being looked up yet.
-const NO_REPOSITORY: &str = "vcs_svn.no_repository";
+/// Counter: a client's URL that leads to no repository, answered in `svnserve`'s words: no `svn://` URL, a path that
+/// climbs with `..`, the server's root, or a name no Subversion repository has.
+const UNSERVED: &str = "vcs_svn.unserved";
+/// Counter: a repository that allows no one, answered "No access allowed to this repository".
+const NO_ACCESS: &str = "vcs_svn.no_access";
+/// Counter: a lookup a shard did not answer within the liveness budget: the connection closed, its repository unknown.
+const LOOKUP_UNANSWERED: &str = "vcs_svn.lookup_unanswered";
+/// Counter: a Subversion repository whose store its owner shard does not hold: the connection closed.
+const STORE_MISSING: &str = "vcs_svn.store_missing";
+/// Counter: a shard that could not keep its listener state, so a connection that moves there is lost.
+const NOT_KEPT: &str = "vcs_svn.not_kept";
+/// Counter: a move its target shard's control channel refused: the descriptor dropped with the spawn, so the
+/// connection closed.
+const MOVE_REFUSED: &str = "vcs_svn.move_refused";
+/// Counter: a connection that arrived on a shard keeping no listener state, or whose socket could not be adopted.
+const ARRIVAL_LOST: &str = "vcs_svn.arrival_lost";
+/// Counter: a connection that arrived on a shard whose seats were all taken with as many arrivals already waiting as it
+/// has seats: closed.
+const ARRIVAL_REFUSED: &str = "vcs_svn.arrival_refused";
 /// Counter: a refusal of a client's URL the connection would not write.
 const NOT_REFUSED: &str = "vcs_svn.not_refused";
 
@@ -84,13 +120,25 @@ const SVN_READ_PAGES: usize = 4;
 const READ_BYTES: usize = SVN_READ_PAGES * SVN_PAGE_BYTES;
 
 /// Derived: the nodes a drive holds open in the repository a connection resolves (`Limits::most_open`: the deepest path
-/// it holds, in names, and its root): the root alone, since no repository is looked up yet and no drive runs (the module
-/// doc); the lookup's piece takes the repository's own.
+/// it holds, in names, and its root): the root alone, since no drive runs before a session is authenticated, which none
+/// is yet (the module doc); the authenticated session takes the repository's own.
 const ROOT_ALONE: usize = 1;
 
-/// The repository a connection reads before its URL is resolved: none. No value of it exists, so no connection is
-/// handed sources ([`Connection::receive`] with none), which is all the handshake takes; the lookup's piece hands the
-/// repository's own green and drops this.
+/// Whether a repository lets a client read without authenticating (`svnserve`'s `anon-access`): none does, since every
+/// request is a principal's and a client that has not authenticated is none (§4.13).
+const ANONYMOUS_READS: bool = false;
+
+/// Whether a repository's users may authenticate with CRAM-MD5: not until the keyed contexts of enrolled credentials
+/// are held (A-692), so no mechanism is offered and a repository answers as `svnserve` answers one that allows no one.
+const CRAM_MD5_KEYS: bool = false;
+
+/// Whether `repos-info` announces mergeinfo: every repository keeps it, as an FSFS repository of a format that records
+/// mergeinfo announces it (`svn_repos_has_capability`; the recorded `anonymous` session's `( mergeinfo )`).
+const MERGEINFO_KEPT: bool = true;
+
+/// The repository a connection reads before its session is authenticated: none. No value of it exists, so no connection
+/// is handed sources ([`Connection::receive`] with none), which is all the handshake takes; the authenticated session
+/// is handed its repository's store by the shared Subversion lender and drops this.
 enum Unresolved {}
 
 impl slates_svn::mergeinfo::Contents for Unresolved {
@@ -176,13 +224,18 @@ enum Seating {
   Wait,
 }
 
-/// The listener's state on its shard, shared by it and its connections through a [`Kept`] handle: its seats, and the
-/// listener while it waits for one. Nothing in it is lent across a wait.
+/// A shard's listener state, shared by its connections and, on the listener's shard, the listener, through a [`Kept`]
+/// handle: its seats, who waits for one, and the connections that moved here waiting. Every shard keeps one, so a
+/// connection that moves to a repository's owner is seated there. Nothing in it is lent across a wait.
 struct ListenerState {
   /// One entry for each connection served at once, `Some` while taken.
   seats: RefCell<Vec<Option<Taken>>>,
-  /// The listener's waker while it holds an accepted connection with every seat taken.
-  waiting: RefCell<Option<Waker>>,
+  /// Who waits for a seat: the listener holding an accepted connection, and connections that moved here, each once.
+  waiting: RefCell<Vec<Waker>>,
+  /// The connections that moved here and wait for a seat: at most as many as the shard has seats.
+  arriving: Cell<usize>,
+  /// How many seats there are: the bound on the arrivals waiting.
+  seat_count: usize,
 }
 
 impl ListenerState {
@@ -190,7 +243,9 @@ impl ListenerState {
   fn new(connections: usize) -> ListenerState {
     ListenerState {
       seats: RefCell::new(vec![None; connections]),
-      waiting: RefCell::new(None),
+      waiting: RefCell::new(Vec::new()),
+      arriving: Cell::new(0),
+      seat_count: connections,
     }
   }
 
@@ -204,9 +259,7 @@ impl ListenerState {
     if let Some(free) = seats.iter().position(Option::is_none) {
       return Seating::Free(free);
     }
-    if let Ok(mut waiting) = self.waiting.try_borrow_mut() {
-      *waiting = Some(waker.clone());
-    }
+    self.wait_for_seat(waker);
     let most_overdue = seats
       .iter_mut()
       .flatten()
@@ -266,16 +319,50 @@ impl ListenerState {
     self.wake_listener();
   }
 
-  /// Wakes the listener if it waits for a seat.
+  /// Wakes whoever waits for a seat: each looks again ([`seat_for`]).
   fn wake_listener(&self) {
-    let waker = self
+    let waiting = self
       .waiting
       .try_borrow_mut()
-      .ok()
-      .and_then(|mut waiting| waiting.take());
-    if let Some(waker) = waker {
+      .map(|mut waiting| std::mem::take(&mut *waiting))
+      .unwrap_or_default();
+    for waker in waiting {
       waker.wake();
     }
+  }
+
+  /// Keeps `waker` to be woken when a seat comes back or a connection becomes overdue, once.
+  fn wait_for_seat(&self, waker: &Waker) {
+    if let Ok(mut waiting) = self.waiting.try_borrow_mut()
+      && !waiting.iter().any(|kept| kept.will_wake(waker))
+    {
+      waiting.push(waker.clone());
+    }
+  }
+
+  /// Admits one more connection that moved here to wait for a seat, while fewer than the shard's seats wait.
+  fn admit_arrival(&self) -> bool {
+    let arriving = self.arriving.get();
+    if arriving >= self.seat_count {
+      return false;
+    }
+    self.arriving.set(arriving.saturating_add(1));
+    true
+  }
+
+  /// One connection that waited here for a seat stopped waiting.
+  fn arrival_seated(&self) {
+    self.arriving.set(self.arriving.get().saturating_sub(1));
+  }
+
+  /// A free seat, if one is.
+  fn free_seat(&self) -> Option<usize> {
+    self
+      .seats
+      .try_borrow()
+      .ok()?
+      .iter()
+      .position(Option::is_none)
   }
 }
 
@@ -313,17 +400,32 @@ impl Drop for Seat {
   }
 }
 
-/// Keeps `state` on this shard for the listener's life; refused off a shard's thread.
-fn keep(state: ListenerState) -> Result<Kept<ListenerState>, RtError> {
-  slates_rt::registry::with_current(|context| context.keep(state))
-    .ok_or(RtError::NotOnShardThread)?
+thread_local! {
+  /// This shard's listener state, once kept here ([`keep_here`]): where a connection that moves here is seated.
+  static HERE: Cell<Option<Kept<ListenerState>>> = const { Cell::new(None) };
 }
 
-/// Starts the svn:// listener `config` names, if it names one (the module doc), on the `control` shard. The port it
-/// listens on; none when none is asked for or it did not start, which is logged.
+/// Keeps `state` on this shard for the daemon's life as the shard's listener state (the module doc): called once a
+/// shard, at the daemon's start; refused off a shard's thread.
+fn keep_here(state: ListenerState) -> Result<Kept<ListenerState>, RtError> {
+  let kept = slates_rt::registry::with_current(|context| context.keep(state))
+    .ok_or(RtError::NotOnShardThread)??;
+  HERE.with(|here| here.set(Some(kept)));
+  Ok(kept)
+}
+
+/// This shard's listener state, if one was kept here.
+fn here() -> Option<Kept<ListenerState>> {
+  HERE.with(Cell::get)
+}
+
+/// Starts the svn:// listener `config` names, if it names one (the module doc): every shard of `shards` keeps its
+/// listener state and the `control` shard serves the listener. The port it listens on; none when none is asked for or
+/// it did not start, which is logged.
 pub(crate) fn start(
   runtime: &Runtime,
   control: ShardId,
+  shards: &[ShardId],
   config: &DaemonConfig,
 ) -> Result<Option<u16>, RtError> {
   let Some(address) = config.vcs_svn else {
@@ -353,8 +455,15 @@ pub(crate) fn start(
     Ok(bound) => bound.port(),
     Err(error) => return Ok(not_started(&format!("its address is unread: {error}"))),
   };
+  for shard in shards.iter().copied().filter(|shard| *shard != control) {
+    runtime.spawn_on(shard, async move {
+      if keep_here(ListenerState::new(bounds.connections)).is_err() {
+        crate::fleet::count_refusal(NOT_KEPT);
+      }
+    })?;
+  }
   runtime.spawn_on(control, async move {
-    let Ok(state) = keep(ListenerState::new(bounds.connections)) else {
+    let Ok(state) = keep_here(ListenerState::new(bounds.connections)) else {
       crate::fleet::count_refusal(NOT_STARTED);
       return;
     };
@@ -460,7 +569,7 @@ async fn seat_for(state: Kept<ListenerState>) -> Result<usize, ListenerRefused> 
 }
 
 /// What a connection does after one call of its [`Connection`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Next {
   /// Read more of the client's bytes.
   Read,
@@ -468,47 +577,149 @@ enum Next {
   Consume(usize),
   /// Call again with the same input.
   Again,
+  /// The client's answer was read, its first `consumed` bytes, and its URL leads to `found`: open it where its name
+  /// lives.
+  Locate {
+    /// Where the URL leads.
+    found: Found,
+    /// The bytes the answer took.
+    consumed: usize,
+  },
   /// End the connection.
   End,
 }
 
-/// One connection, seated (the module doc): the greeting, then the client's bytes read and handed to its
-/// [`Connection`] until it ends; each wait on the client marked overdue past `bound_ns` from the greeting, and waited
-/// on.
+/// A connection's state that moves with it to its repository's owner (the module doc): plain data, so it moves whole.
+struct Conversation {
+  /// The connection, its answer read.
+  connection: Connection,
+  /// The client's bytes not yet taken.
+  input: Vec<u8>,
+  /// Its limits.
+  limits: Limits,
+  /// When a wait on the client becomes overdue.
+  deadline_ns: u64,
+}
+
+/// What one step of a conversation leads to ([`step`]).
+enum Stepped {
+  /// It goes on here.
+  Go,
+  /// It ends.
+  End,
+  /// Its repository lives on another shard: it moves there.
+  Elsewhere(Found, Located),
+}
+
+/// One connection, seated (the module doc): the greeting, then the conversation, each wait on the client marked overdue
+/// past `bound_ns` from the greeting, and waited on.
 async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) {
   let mut out = Vec::new();
-  let Ok(mut connection) = Connection::new(limits, &mut out) else {
+  let Ok(connection) = Connection::new(limits, &mut out) else {
     return;
   };
   if stream.write_all(&out).await.is_err() {
     return;
   }
-  let deadline_ns = now_ns().saturating_add(bound_ns);
-  let mut input = Vec::new();
+  let conversation = Conversation {
+    connection,
+    input: Vec::new(),
+    limits,
+    deadline_ns: now_ns().saturating_add(bound_ns),
+  };
+  go_on(stream, conversation, seat).await;
+}
+
+/// Goes on with `conversation` over `stream` until it ends here or moves to the shard its repository's name lives on
+/// ([`migrate`]), its seat here given back as it leaves.
+async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
+  let mut out = Vec::new();
   loop {
-    out.clear();
-    let next = answer(&mut connection, &input, &mut out, limits);
-    if !out.is_empty() && stream.write_all(&out).await.is_err() {
-      return;
+    match step(&stream, &mut conversation, &mut out, &seat).await {
+      Stepped::Go => {}
+      Stepped::End => return,
+      Stepped::Elsewhere(found, located) => {
+        migrate(Moving {
+          stream: stream.into_owned(),
+          conversation,
+          found,
+          located,
+        });
+        return;
+      }
     }
-    match next {
-      Next::Read => {
-        if !read_more(&stream, &mut input, limits, deadline_ns, &seat).await {
-          return;
+  }
+}
+
+/// One call of the conversation's connection and what follows it: its output written, then a read, a consumption, a
+/// repository opened here, or the move to where its name lives.
+async fn step(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  out: &mut Vec<u8>,
+  seat: &Seat,
+) -> Stepped {
+  out.clear();
+  let next = answer(
+    &mut conversation.connection,
+    &conversation.input,
+    out,
+    conversation.limits,
+  );
+  if !out.is_empty() && stream.write_all(out).await.is_err() {
+    return Stepped::End;
+  }
+  match next {
+    Next::Read => {
+      let read = read_more(
+        stream,
+        &mut conversation.input,
+        conversation.limits,
+        conversation.deadline_ns,
+        seat,
+      )
+      .await;
+      if read { Stepped::Go } else { Stepped::End }
+    }
+    Next::Consume(taken) => {
+      conversation
+        .input
+        .drain(..taken.min(conversation.input.len()));
+      Stepped::Go
+    }
+    Next::Again => Stepped::Go,
+    Next::End => Stepped::End,
+    Next::Locate { found, consumed } => {
+      conversation
+        .input
+        .drain(..consumed.min(conversation.input.len()));
+      match locate(&found).await {
+        Location::Found(located) if Some(located.shard) != this_shard() => {
+          Stepped::Elsewhere(found, located)
+        }
+        Location::Found(located) => {
+          opened(
+            stream,
+            &mut conversation.connection,
+            &found,
+            Some(&located),
+            out,
+          )
+          .await
+        }
+        Location::Nowhere => opened(stream, &mut conversation.connection, &found, None, out).await,
+        Location::Unanswered => {
+          crate::fleet::count_refusal(LOOKUP_UNANSWERED);
+          Stepped::End
         }
       }
-      Next::Consume(taken) => {
-        input.drain(..taken.min(input.len()));
-      }
-      Next::Again => {}
-      Next::End => return,
     }
   }
 }
 
 /// What `connection` makes of the client's bytes `input`, its output appended to `out` (the module doc): before a
-/// session is established the handshake asks for more bytes or hands over the client's answer, whose URL no repository
-/// holds yet; any other turn, and any refusal, ends the connection, the refusal's words already in `out`.
+/// session is established the handshake asks for more bytes or hands over the client's answer, whose URL is resolved;
+/// any other turn, and any refusal, ends the connection, the refusal's words already in `out`.
 fn answer(connection: &mut Connection, input: &[u8], out: &mut Vec<u8>, limits: Limits) -> Next {
   let budget = Budget {
     room: limits.item_bytes,
@@ -518,17 +729,330 @@ fn answer(connection: &mut Connection, input: &[u8], out: &mut Vec<u8>, limits: 
     Ok(Turn::NeedMore { .. }) => Next::Read,
     Ok(Turn::Took { consumed }) => Next::Consume(consumed),
     Ok(Turn::Wrote) => Next::Again,
-    Ok(Turn::Opened { open, .. }) => {
-      crate::fleet::count_refusal(NO_REPOSITORY);
-      if connection
-        .refuse(Unserved::NoRepository { url: open.url }, out)
-        .is_err()
-      {
-        crate::fleet::count_refusal(NOT_REFUSED);
+    Ok(Turn::Opened { open, consumed }) => match find_repository(open.url) {
+      Ok(found) => Next::Locate { found, consumed },
+      Err(unserved) => {
+        refuse(connection, unserved, out);
+        Next::End
       }
-      Next::End
-    }
+    },
     Ok(_) | Err(_) => Next::End,
+  }
+}
+
+/// Answers the client's URL with `unserved`, in `svnserve`'s words, appended to `out`; the connection ends.
+fn refuse(connection: &mut Connection, unserved: Unserved<'_>, out: &mut Vec<u8>) {
+  crate::fleet::count_refusal(UNSERVED);
+  if connection.refuse(unserved, out).is_err() {
+    crate::fleet::count_refusal(NOT_REFUSED);
+  }
+}
+
+/// Where the repository a client's URL leads into lives ([`locate`]).
+pub(crate) enum Location {
+  /// Found.
+  Found(Located),
+  /// No candidate names a Subversion repository: "No repository found".
+  Nowhere,
+  /// A shard asked did not answer within the liveness budget, or the caller is on no shard: the repository is unknown.
+  Unanswered,
+}
+
+/// A repository found for a client's URL: where it lives and how much of the URL's path its name takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Located {
+  /// The runtime shard whose partition holds its record and its store.
+  pub(crate) shard: u16,
+  /// Its name.
+  pub(crate) name: String,
+  /// How many of the path's leading segments its name takes ([`Found::root_url`]).
+  pub(crate) depth: usize,
+}
+
+/// Finds where the repository `found` leads into lives, as `svn_repos_find_root_path` finds its root (the module doc,
+/// "Where a URL leads"): every candidate name asked of the shard its name routes to, each shard once with all of its
+/// candidates, the longest name held as a Subversion repository the one. Called by the `svn://` listener and the
+/// `svn+ssh://` tunnel alike, on the shard the connection is on.
+pub(crate) async fn locate(found: &Found) -> Location {
+  let Some((origin, asked)) = crate::state::with_state(|state| {
+    let mut asked: BTreeMap<u16, Vec<(usize, String)>> = BTreeMap::new();
+    for (depth, name) in found.candidates() {
+      let partition = crate::verbs::owner_of_name(&name, state.shards.len());
+      if let Some(shard) = crate::verbs::shard_of_partition(state, partition) {
+        asked.entry(shard).or_default().push((depth, name));
+      }
+    }
+    (state.shard, asked)
+  }) else {
+    return Location::Unanswered;
+  };
+  let mut deepest: Option<Located> = None;
+  for (shard, names) in asked {
+    let held = crate::xshard::call_in_shard_time_given_room(
+      origin,
+      shard,
+      move |state| deepest_held(state, &names),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    match held {
+      None => return Location::Unanswered,
+      Some(Some((depth, name))) if deepest.as_ref().is_none_or(|found| depth > found.depth) => {
+        deepest = Some(Located { shard, name, depth });
+      }
+      Some(_) => {}
+    }
+  }
+  deepest.map_or(Location::Nowhere, Location::Found)
+}
+
+/// The longest of `names`, each with the depth it takes, that this shard holds as a Subversion repository.
+fn deepest_held(
+  state: &mut crate::state::ShardState,
+  names: &[(usize, String)],
+) -> Option<(usize, String)> {
+  let repositories = state.db.partition().repositories();
+  names
+    .iter()
+    .filter(|(_, name)| {
+      repositories
+        .repository_named(name)
+        .is_some_and(|record| record.tool == VcsTool::Subversion)
+    })
+    .max_by_key(|(depth, _)| *depth)
+    .cloned()
+}
+
+/// The runtime shard this task runs on, if any.
+fn this_shard() -> Option<u16> {
+  crate::state::with_state(|state| state.shard)
+}
+
+/// What this shard holds of the repository a name names.
+enum Held {
+  /// A Subversion repository, its store's UUID.
+  Repository(Uuid),
+  /// A Subversion repository whose store this shard does not hold.
+  NoStore,
+  /// No Subversion repository of the name.
+  None,
+}
+
+/// What this shard holds of repository `name` (the module doc, "Opened").
+fn held(name: &str) -> Held {
+  crate::state::with_state(|state| {
+    let Some(id) = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(name)
+      .filter(|record| record.tool == VcsTool::Subversion)
+      .map(|record| record.id)
+    else {
+      return Held::None;
+    };
+    match state.vcs_stores.subversion_records(id) {
+      Some(records) => Held::Repository(records.uuid()),
+      None => Held::NoStore,
+    }
+  })
+  .unwrap_or(Held::None)
+}
+
+/// Answers the client's URL on the shard that owns its repository (the module doc, "Opened"): the repository
+/// `located` names opened with the mechanisms it allows, or, with none located or none held here any more, "No
+/// repository found"; the answer written to `stream`. Whether the conversation goes on, which it does while the
+/// client's mechanism is awaited.
+async fn opened(
+  stream: &TcpStream,
+  connection: &mut Connection,
+  found: &Found,
+  located: Option<&Located>,
+  out: &mut Vec<u8>,
+) -> Stepped {
+  out.clear();
+  let go = match located.map(|located| (located, held(&located.name))) {
+    Some((located, Held::Repository(uuid))) => open(connection, found, located.depth, uuid, out),
+    Some((_, Held::NoStore)) => {
+      crate::fleet::count_refusal(STORE_MISSING);
+      false
+    }
+    Some((_, Held::None)) | None => {
+      refuse(connection, Unserved::NoRepository { url: &found.url }, out);
+      false
+    }
+  };
+  if !out.is_empty() && stream.write_all(out).await.is_err() {
+    return Stepped::End;
+  }
+  if go { Stepped::Go } else { Stepped::End }
+}
+
+/// Opens the repository of UUID `uuid` whose name takes the first `depth` segments of `found`'s path, with the
+/// mechanisms it allows (the module doc, "Opened"), the answer appended to `out`: whether the client's mechanism is
+/// awaited.
+fn open(
+  connection: &mut Connection,
+  found: &Found,
+  depth: usize,
+  uuid: Uuid,
+  out: &mut Vec<u8>,
+) -> bool {
+  let root_url = found.root_url(depth);
+  let repository = slates_svn::handshake::Repository {
+    uuid: uuid.as_bytes(),
+    root_url: &root_url,
+    realm: uuid.as_bytes(),
+    mergeinfo: MERGEINFO_KEPT,
+    anonymous: ANONYMOUS_READS,
+    tunnel_user: None,
+    cram_md5: CRAM_MD5_KEYS,
+  };
+  match connection.open(&repository, out) {
+    Ok(Access::Asked) => true,
+    Ok(Access::Denied) => {
+      crate::fleet::count_refusal(NO_ACCESS);
+      false
+    }
+    Err(_) => false,
+  }
+}
+
+/// A connection on its way to the shard its repository lives on (the module doc): its socket's handle, its
+/// conversation, where its URL leads and where its repository was found. Each part is plain data, so it moves whole.
+struct Moving {
+  /// The socket's handle, its readiness armed on no shard between awaits.
+  stream: OwnedStream,
+  /// The conversation, its answer read.
+  conversation: Conversation,
+  /// Where its URL leads.
+  found: Found,
+  /// Where its repository was found.
+  located: Located,
+}
+
+/// Moves `moving` to its repository's shard: one spawn on that shard's control channel carrying the connection, which
+/// there adopts the socket and is seated and served ([`arrived`]). A spawn the channel refuses dropped the handle with
+/// it, so the connection closed; it is counted, as the HTTP edge counts a refused move.
+fn migrate(moving: Moving) {
+  let shard = moving.located.shard;
+  let arrive = slates_rt::task::SpawnRequest::new(
+    Box::pin(async move {
+      arrived(moving);
+    }),
+    None,
+  );
+  if slates_rt::registry::send_control(shard, slates_rt::control::Control::Spawn(Box::new(arrive)))
+    .is_err()
+  {
+    crate::fleet::count_refusal(MOVE_REFUSED);
+  }
+}
+
+/// A connection arrived on this shard ([`migrate`]): its socket adopted here and its serving a task of this shard's,
+/// which seats it ([`seat_arrival`]) and opens its repository. Lost, and counted, on a shard keeping no listener state
+/// or where the socket cannot be adopted.
+fn arrived(moving: Moving) {
+  let Moving {
+    stream,
+    conversation,
+    found,
+    located,
+  } = moving;
+  let (Some(state), Ok(stream)) = (here(), TcpStream::from_owned(stream)) else {
+    crate::fleet::count_refusal(ARRIVAL_LOST);
+    return;
+  };
+  match futures::spawn(serve_arrival(state, stream, conversation, found, located)) {
+    Ok(task) => {
+      if detach(task).is_err() {
+        crate::fleet::count_refusal(NOT_DETACHED);
+      }
+    }
+    Err(_) => {
+      crate::fleet::count_refusal(SPAWN_REFUSED);
+    }
+  }
+}
+
+/// Seats a connection that moved here, opens its repository and serves it on: its task is the seat's, so a reap here
+/// cancels it.
+async fn serve_arrival(
+  state: Kept<ListenerState>,
+  stream: TcpStream,
+  mut conversation: Conversation,
+  found: Found,
+  located: Located,
+) {
+  let slot = match seat_arrival(state).await {
+    Ok(slot) => slot,
+    Err(ArrivalRefused::Full) => {
+      crate::fleet::count_refusal(ARRIVAL_REFUSED);
+      return;
+    }
+    Err(ArrivalRefused::Gone) => {
+      crate::fleet::count_refusal(ARRIVAL_LOST);
+      return;
+    }
+  };
+  let Some(seat) = Seat::take(state, slot) else {
+    crate::fleet::count_refusal(ARRIVAL_LOST);
+    return;
+  };
+  if let Some(task) = futures::current_task() {
+    let _ = state.with(|state| state.set_task(slot, task));
+  }
+  let mut out = Vec::new();
+  let stepped = opened(
+    &stream,
+    &mut conversation.connection,
+    &found,
+    Some(&located),
+    &mut out,
+  )
+  .await;
+  if matches!(stepped, Stepped::Go) {
+    go_on(stream, conversation, seat).await;
+  }
+}
+
+/// Why a connection that moved here was not seated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrivalRefused {
+  /// Every seat is taken and as many arrivals already wait as the shard has seats.
+  Full,
+  /// The listener state is gone.
+  Gone,
+}
+
+/// A seat for a connection that moved here (the module doc): a free one at once; with every seat taken, as the listener
+/// seats a new connection ([`seat_for`]: the most overdue connection's, or the next to come back), while fewer arrivals
+/// wait than the shard has seats; refused past that.
+async fn seat_arrival(state: Kept<ListenerState>) -> Result<usize, ArrivalRefused> {
+  let free = state
+    .with(ListenerState::free_seat)
+    .ok_or(ArrivalRefused::Gone)?;
+  if let Some(slot) = free {
+    return Ok(slot);
+  }
+  if !state
+    .with(ListenerState::admit_arrival)
+    .ok_or(ArrivalRefused::Gone)?
+  {
+    return Err(ArrivalRefused::Full);
+  }
+  let _waiting = Arriving(state);
+  seat_for(state).await.map_err(|_| ArrivalRefused::Gone)
+}
+
+/// A connection that moved here, counted among the arrivals waiting for a seat for as long as it waits, however its wait
+/// ends: seated, refused, or cancelled with its task.
+struct Arriving(Kept<ListenerState>);
+
+impl Drop for Arriving {
+  fn drop(&mut self) {
+    // Off its shard (the runtime gone) no listener state is left to count it in.
+    let _ = self.0.with(ListenerState::arrival_seated);
   }
 }
 

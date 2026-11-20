@@ -63,9 +63,11 @@ listener serves on IP:PORT`). `svn://` has no encryption, so a daemon that is no
 loopback address alone: any other address is refused as a usage error before anything starts. The anchor
 binds the address once and hands its listener to every daemon it supervises (on Linux and macOS), so a
 daemon's restart never drops the port: a client that connects meanwhile is answered by the next daemon. An
-address the anchor cannot bind ends its start with an error naming it. For now every connection is greeted
-as `svnserve` greets one and its URL is answered "No repository found": serving the daemon's Subversion
-repositories is the next step.
+address the anchor cannot bind ends its start with an error naming it. A URL names a repository by the leading
+part of its path, as `svnserve` finds one (`svn://HOST:PORT/NAME/...`, NAME as `slates repository create NAME
+--tool svn` made it, slashes included), wherever in the daemon it lives; a URL naming none is answered "No
+repository found". For now every
+repository answers "No access allowed to this repository": signing in with a token (CRAM-MD5) is the next step.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 
