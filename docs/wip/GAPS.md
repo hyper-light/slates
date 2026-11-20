@@ -7294,8 +7294,10 @@
 >   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
 >   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
->   own platforms), and `xtask`'s conformance harness's mount waits (`MOUNT_WAIT`, waits on the kernel's mount table and
->   its tracers, owed onto the table's own event as `cli`'s unmount is). `xtask`'s conformance harness since 2026-11-20:
+>   own platforms), and `xtask`'s remaining `MOUNT_WAIT` uses (its tracers' bounds and the NFS attribute cache's
+>   `visible`, waits on other parties' work). Since 2026-11-20 a wait on the kernel's mount table, in the tests and in
+>   `xtask`'s mount, is `process_wait::await_mount_table`: woken by the kernel's own word (macOS `EVFILT_FS`, Linux
+>   `POLLPRI` on `/proc/self/mountinfo`), within the observation budget, never a poll (main's ruling). `xtask`'s conformance harness since 2026-11-20:
 >   its daemon's start and the live create judged by `process_wait::InstanceWait` (the suites' file, included by path:
 >   one judgment), an anchor's stop awaited on its log pipe's end (the kernel's word that every writer left) within
 >   the observation budget, the mount clients' deadlines the product's own; `START_WAIT` (60 s) gone. The observation
