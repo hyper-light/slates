@@ -1582,6 +1582,14 @@
 > byte-identical and the matrix passes 29 of 29 (Mac Studio, debug). Over git/git's last 2,000 commits svnsync passes
 > but `svnrdump dump` (one `replay-range` of the whole history) gets shard 0 spinning 3.6 s and the daemon killed
 > after 53 MB: 28 of 29, owed to w-svn.
+> Since a469a6b85 (the listener yields while its client drains) `svnrdump dump` of that history finishes, 72 MB in 14 s:
+> 29 of 29.
+> **`slates repository policy` (w-interop, 2026-11-20; A-622, A-685's owed words):** the owner reads a repository's
+> policy (`DescribeRepositoryPolicy`, appended; `RepositoryPolicy` reply) and sets it from the version read, each
+> `--hook POINT=PROGRAM` replacing that point's hooks and every other part kept; a stranger's read or set is
+> `Forbidden`, a stale set `PolicyChanged`. By use: a pre-revprop-change hook set this way lets stock svn 1.15 change
+> a revision property over svn://. Found by use: with no hook such a change is taken (`change-rev-prop2`), where
+> svnserve refuses E165006; `svn_interop.rs` holds that test ignored for w-svn.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the

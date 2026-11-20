@@ -766,6 +766,132 @@ pub(crate) fn set_policy(
   }
 }
 
+/// Repository `repository`'s policy read whole by `principal`, its owner alone (§4.17.1 "Policy"; A-622): its version
+/// and every part, in the wire's forms, so a setter changes what it names and keeps the rest (`slates repository
+/// policy`). Refused `NotFound` and `Forbidden` as setting it is, and `BadRequest` for a rule naming a principal the wire
+/// cannot carry, so no client ever sets back a policy it read short.
+pub(crate) fn describe_policy(
+  state: &ShardState,
+  principal: &Principal,
+  repository: &str,
+) -> ReplyBody {
+  let record = match owned_repository(state, principal, repository, "describe_repository_policy") {
+    Ok(record) => record,
+    Err(reply) => return *reply,
+  };
+  let policy = &record.policy;
+  let rules: Option<Vec<slates_ipc::protocol::PolicyRule>> =
+    policy.rules.iter().map(wire_rule).collect();
+  let Some(rules) = rules else {
+    return refused(Refusal::BadRequest {
+      reason: "a rule names a principal the wire cannot carry".to_owned(),
+    });
+  };
+  ReplyBody::RepositoryPolicy {
+    version: policy.version,
+    rules,
+    hooks: policy.hooks.iter().map(wire_hook).collect(),
+    hooks_env: policy
+      .hooks_env
+      .iter()
+      .map(wire_hooks_env_section)
+      .collect(),
+    signers: policy.signers.clone(),
+  }
+}
+
+/// The wire's form of a policy rule (A-622), [`db_rule`]'s inverse; none for a principal the wire cannot carry.
+fn wire_rule(rule: &slates_db::catalog::PolicyRule) -> Option<slates_ipc::protocol::PolicyRule> {
+  use slates_db::catalog::{PolicyEffect, PolicyNames, PolicyRight};
+  use slates_ipc::protocol as wire;
+  Some(wire::PolicyRule {
+    names: match rule.names {
+      PolicyNames::Refs => wire::PolicyNames::Refs,
+      PolicyNames::Branches => wire::PolicyNames::Branches,
+      PolicyNames::Bookmarks => wire::PolicyNames::Bookmarks,
+      PolicyNames::Topics => wire::PolicyNames::Topics,
+      PolicyNames::Paths => wire::PolicyNames::Paths,
+    },
+    pattern: rule.pattern.clone(),
+    right: match rule.right {
+      PolicyRight::Read => wire::PolicyRight::Read,
+      PolicyRight::Submit => wire::PolicyRight::Submit,
+      PolicyRight::Rewrite => wire::PolicyRight::Rewrite,
+      PolicyRight::Delete => wire::PolicyRight::Delete,
+      PolicyRight::MergeCommit => wire::PolicyRight::MergeCommit,
+      PolicyRight::UnsignedCommit => wire::PolicyRight::UnsignedCommit,
+    },
+    effect: match rule.effect {
+      PolicyEffect::Allow => wire::PolicyEffect::Allow,
+      PolicyEffect::Deny => wire::PolicyEffect::Deny,
+    },
+    who: wire_who(&rule.who)?,
+  })
+}
+
+/// The wire's form of the principals a rule speaks to, [`db_who`]'s inverse; none for a principal it cannot carry.
+fn wire_who(who: &slates_db::catalog::PolicyWho) -> Option<slates_ipc::protocol::PolicyWho> {
+  use slates_db::catalog::{PolicyEntry, PolicyWho};
+  use slates_ipc::protocol as wire;
+  Some(match who {
+    PolicyWho::Anyone => wire::PolicyWho::Anyone,
+    PolicyWho::AnyOf { entries } => wire::PolicyWho::AnyOf {
+      entries: entries
+        .iter()
+        .map(|entry| match entry {
+          PolicyEntry::Is { principal } => crate::verbs::to_wire_principal(principal)
+            .map(|principal| wire::PolicyEntry::Is { principal }),
+          PolicyEntry::IsNot { principal } => crate::verbs::to_wire_principal(principal)
+            .map(|principal| wire::PolicyEntry::IsNot { principal }),
+        })
+        .collect::<Option<Vec<_>>>()?,
+    },
+  })
+}
+
+/// The wire's form of a configured hook, [`db_hook`]'s inverse.
+fn wire_hook(hook: &slates_db::catalog::HookConfig) -> slates_ipc::protocol::HookConfig {
+  use slates_db::catalog::HookPointName as Point;
+  use slates_ipc::protocol::HookPointName as Given;
+  slates_ipc::protocol::HookConfig {
+    point: match hook.point {
+      Point::GitPreReceive => Given::GitPreReceive,
+      Point::GitUpdate => Given::GitUpdate,
+      Point::GitPostReceive => Given::GitPostReceive,
+      Point::HgPretxnchangegroup => Given::HgPretxnchangegroup,
+      Point::HgChangegroup => Given::HgChangegroup,
+      Point::SvnPreCommit => Given::SvnPreCommit,
+      Point::SvnPreRevpropChange => Given::SvnPreRevpropChange,
+      Point::SvnPostCommit => Given::SvnPostCommit,
+      Point::SvnStartCommit => Given::SvnStartCommit,
+      Point::SvnPostRevpropChange => Given::SvnPostRevpropChange,
+      Point::SvnPreLock => Given::SvnPreLock,
+      Point::SvnPostLock => Given::SvnPostLock,
+      Point::SvnPreUnlock => Given::SvnPreUnlock,
+      Point::SvnPostUnlock => Given::SvnPostUnlock,
+    },
+    name: hook.name.clone(),
+    program: hook.program.clone(),
+  }
+}
+
+/// The wire's form of a hooks-env section, [`db_hooks_env_section`]'s inverse.
+fn wire_hooks_env_section(
+  section: &slates_db::catalog::HooksEnvSection,
+) -> slates_ipc::protocol::HooksEnvSection {
+  slates_ipc::protocol::HooksEnvSection {
+    name: section.name.clone(),
+    variables: section
+      .variables
+      .iter()
+      .map(|variable| slates_ipc::protocol::HooksEnvVariable {
+        name: variable.name.clone(),
+        value: variable.value.clone(),
+      })
+      .collect(),
+  }
+}
+
 /// The keys a repository's policy trusts to sign its commits, as its record keeps them (A-644): each one A-321's
 /// verifier reads (`TrustedKey::from_wire`), once, in the order given; and none but a git repository's, the one tool
 /// whose push judges a commit's signature.
@@ -2016,5 +2142,77 @@ mod tests {
         refusal: DatabaseRefusal::PolicyRuleMalformed { index: 0 }
       }
     );
+  }
+
+  /// A-622 (`slates repository policy`). Do: make a repository; read its policy as its owner; set a hook from the
+  /// version read; read it again; then read and set it as another principal, and set it again from the stale version.
+  /// Expect: version 0 and no part at first; the hook read back at version 1; the stranger's read and set each
+  /// `Forbidden`, and the stale set `PolicyChanged` with the version now, so a setter never drops what another set.
+  #[test]
+  fn a_repositorys_policy_is_read_and_set_by_its_owner_alone() {
+    use slates_ipc::protocol::{HookConfig, HookPointName};
+    crate::daemon::audit_on_shard(|state| {
+      assert!(matches!(
+        create(state, "policy", "main"),
+        ReplyBody::GreenCreated { .. }
+      ));
+      let describe = |state: &mut ShardState, principal: &Principal| {
+        ask(
+          state,
+          principal,
+          RequestBody::DescribeRepositoryPolicy {
+            repository: "policy".to_owned(),
+          },
+        )
+      };
+      let hook = HookConfig {
+        point: HookPointName::GitPreReceive,
+        name: "pre-receive".to_owned(),
+        program: "/srv/hooks/pre-receive".to_owned(),
+      };
+      let set = |state: &mut ShardState, principal: &Principal, read: u64| {
+        ask(
+          state,
+          principal,
+          RequestBody::SetRepositoryPolicy {
+            repository: "policy".to_owned(),
+            read,
+            rules: Vec::new(),
+            hooks: vec![hook.clone()],
+            hooks_env: Vec::new(),
+            signers: Vec::new(),
+          },
+        )
+      };
+      let first = describe(state, &owner());
+      let made = set(state, &owner(), 0);
+      let after = describe(state, &owner());
+      let foreign_read = refusal(describe(state, &stranger()));
+      let foreign_set = refusal(set(state, &stranger(), 1));
+      let stale = refusal(set(state, &owner(), 0));
+      let empty = |reply: &ReplyBody| {
+        matches!(reply, ReplyBody::RepositoryPolicy { version: 0, rules, hooks, hooks_env, signers }
+          if rules.is_empty() && hooks.is_empty() && hooks_env.is_empty() && signers.is_empty())
+      };
+      let hooked = |reply: &ReplyBody| matches!(reply, ReplyBody::RepositoryPolicy { version: 1, hooks, .. } if hooks == &vec![hook.clone()]);
+      assert_eq!(
+        (
+          empty(&first),
+          made,
+          hooked(&after),
+          matches!(foreign_read, Refusal::Forbidden { .. }),
+          matches!(foreign_set, Refusal::Forbidden { .. }),
+          stale,
+        ),
+        (
+          true,
+          ReplyBody::Acknowledged,
+          true,
+          true,
+          true,
+          Refusal::PolicyChanged { current: 1 },
+        )
+      );
+    });
   }
 }

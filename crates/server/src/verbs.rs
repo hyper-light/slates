@@ -78,7 +78,7 @@ pub(crate) fn to_db_principal(principal: &slates_ipc::protocol::Principal) -> Pr
 
 /// A catalog principal as the wire names it (A-237), host included; `None` for one a client never names (a SID, a
 /// certificate).
-fn to_wire_principal(principal: &Principal) -> Option<slates_ipc::protocol::Principal> {
+pub(crate) fn to_wire_principal(principal: &Principal) -> Option<slates_ipc::protocol::Principal> {
   match principal {
     Principal::Uid { host, uid } => Some(slates_ipc::protocol::Principal::Uid {
       host: host.0,
@@ -2648,7 +2648,8 @@ pub(crate) fn route_gated(
     | RequestBody::BindBranch { repository, .. }
     | RequestBody::RetireBranch { repository, .. }
     | RequestBody::SetRepositoryPolicy { repository, .. }
-    | RequestBody::ImportRepository { repository, .. } => {
+    | RequestBody::ImportRepository { repository, .. }
+    | RequestBody::DescribeRepositoryPolicy { repository } => {
       Some(owner_of_name(repository, state.shards.len()))
     }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
@@ -5223,6 +5224,10 @@ fn dispatch_inner(
     // (A-678, A-652 part 3).
     RequestBody::ImportRepository { repository, path } => {
       crate::repository::import::import_repository(state, principal, (&repository, &path))
+    }
+    // A repository's policy read whole by its owner (A-622; `slates repository policy`).
+    RequestBody::DescribeRepositoryPolicy { repository } => {
+      crate::repository::describe_policy(state, principal, &repository)
     }
     // A version-control credential, on the partition its id routes to (A-625 part 3; `crate::credentials`).
     RequestBody::EnrollCredential {
