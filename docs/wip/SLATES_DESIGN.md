@@ -56477,3 +56477,21 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   inside a record refused `Truncated`; too many, too long).
 - **Applied in the same change to** A-625 part 3's status and decision 3, `docs/wip/platforms.md` gap 2,
   `unsafe-budget.toml`, amendments.tsv.
+
+### A-755 — A live whole entry's build sizes each piece to the quantum left at the seal rate it measures (bug, 2026-11-20, w-forming; found by use: main's performance-gaps-upfront order; amends A-377's "one piece at least"; §4.10 "Live shipping"; CLAUDE.md "Bounded work everywhere")
+
+- **What was measured.** Probes in the live_chaos fresh-member flow (a debug fleet under `taskpolicy -b`, macOS arm64,
+  Mac Studio adas-mac-studio-4) timed each part of a whole build's turn: one piece, a whole archive chunk (a MiB), took
+  87 to 302 ms of the owner shard's CPU against seal quanta of 14 to 784 us. A-377 sealed pieces until the quantum passed,
+  one piece at least, and a piece was always a whole chunk.
+- **The change.** `WholeBuild` keeps the bytes it has sealed and the clock time their seals took; `piece_bytes` sizes each
+  next piece to what that rate seals in the turn's quantum left, at least one archive page (`MAX_BASE_PAGE_BYTES`, so a
+  turn moves the build on and a piece's name and tag stay a small share of it) and at most a chunk. Pieces of any size
+  open as before (`open_body` joins them in order).
+- **Owed (GAPS).** The append that ends a build (223 to 498 ms of CPU a turn in the same runs) and a large delta's
+  shipper append stay one turn.
+- **Tests.** `live_ship::tests::a_whole_builds_piece_is_what_the_measured_rate_seals_in_the_quantum_left`; the fleet test
+  `a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it` now holds the build to at least the
+  content's bytes over a page in turns under the cut quantum (48 for 3 MiB), red before (8 turns); `--test fleet whole`
+  5/5, `--test fleet live` 20/20, `--lib live_ship::` 24/24.
+- **Applied in the same change to** A-377's doc lines in `live_ship.rs`, GAPS (the one-turn walks entry), amendments.tsv.

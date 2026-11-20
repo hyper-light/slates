@@ -2928,7 +2928,13 @@
 >   volume's whole image in one turn, at every whole entry and install image; **the whole entry's half closed
 >   2026-11-18, A-377, g230:** captured in its publication's turn and sealed a piece a turn by a task of the owner
 >   shard, the publications made meanwhile queued behind it, each appended in order as the credit admits it; install
->   images (`refresh_image`) still one turn, owed); and, after A-347's open, the takeover's
+>   images (`refresh_image`) still one turn, owed; **since A-755 (2026-11-20, w-forming) a turn's pieces are sized to the
+>   seal rate measured in the build and the quantum left, a page to an archive chunk** (a turn had sealed a MiB at least
+>   however small its quantum, 87 to 302 ms of CPU against 14 to 784 us quanta, a debug fleet under `taskpolicy -b`);
+>   **still one turn, owed:** the append that ends a build (`append_build`: the sealed body joined and cloned into the
+>   shipper and the volume's whole state, 223 to 498 ms of CPU a turn for 1.8 to 2.5 MB in the same runs), and a
+>   shipper append of a large delta (128 to 331 ms for 1.8 to 2.5 MB; 29 ms for 4.8 KB, so not the payload's size
+>   alone)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
