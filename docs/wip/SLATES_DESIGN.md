@@ -12314,8 +12314,15 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > set's runs grow, and its queue and stacks at their longest (`negotiation::Peak`), never once an entry pushed: a clone
 > of 3,000 commits pushed in one piece, 9,000 objects, is negotiated within 4 KiB (it was refused there, `PastAdmission`).
 > Positions met in no order (a set the store gave piece by piece) cost a run an object, 16 bytes against the 8 the sets
-> charged; one push's order costs a run a kind or less. Owed for git: the walk a step at a time and `upload::Answering`
-> (piece 2b), the server driving it a turn at a time within a request's room (piece 3, reverting A-713's shard room).
+> charged; one push's order costs a run a kind or less. **Piece 2b part 1 BUILT (same day):** the choice of what a pack
+> sends one by one is made a unit at a time (`negotiation::begin`, then `Negotiating::step` until its owner's quantum is
+> spent, at least one unit a step, a commit from the walk's queue or an entry from a tree walk's stack, its place kept:
+> the commit walk, what the client holds, the sent commits' trees, the wants, `include-tag`); `negotiate` is the same
+> stepped to its end, and a sparse walk's frames are held while they live, given back as they are left. Held to the
+> negotiation's oracle and to the whole answer on 1,024 generated requests stepped a unit at a time. Owed for git: the
+> answer stepping it within the owner's quantum (piece 2b part 2: `upload::Answer::write`), what `begin` decides
+> (`ready`, the cut) and `include-tag`'s scan in units too, and the server within a request's room (piece 3, reverting
+> A-713's shard room).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
