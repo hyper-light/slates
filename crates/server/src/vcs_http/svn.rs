@@ -1630,7 +1630,7 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
     )
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
     match &mut self.answered {
       Some(Answered::Whole { body, .. }) => {
         out.append(body);

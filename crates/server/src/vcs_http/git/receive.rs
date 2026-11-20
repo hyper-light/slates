@@ -40,6 +40,10 @@ use crate::git_push::{Answering, PushFailed, ReceivePack, Unpresented};
 use crate::state::ShardState;
 use crate::vcs_http::{ClientGone, Exchange, Failed};
 
+/// Format: git's keepalive under `side-band-64k`: a pkt-line of band 1 alone, no data (`receive-pack.c`'s `"0005\1"`),
+/// which a client's demultiplexer reads and passes over.
+const KEEPALIVE: &[u8] = b"0005\x01";
+
 /// Format: the line git's receive-pack writes before its advertisement to a client asking protocol version 1
 /// (`receive-pack.c`, `cmd_receive_pack`).
 const VERSION_1: &[u8] = b"version 1\n";
@@ -70,12 +74,17 @@ impl ShardLender for ThisShard {
 pub(crate) struct ReceiveServices<L> {
   /// Where the shard's state is lent.
   lender: L,
+  /// How long a push's answer may write nothing before git's keepalive is written (`DaemonConfig::git_keepalive_ns`).
+  keepalive_ns: u64,
 }
 
 impl<L> ReceiveServices<L> {
-  /// receive-pack over the state `lender` lends.
-  pub(crate) fn new(lender: L) -> Self {
-    Self { lender }
+  /// receive-pack over the state `lender` lends, git's keepalive written after `keepalive_ns` of a silent answer.
+  pub(crate) fn new(lender: L, keepalive_ns: u64) -> Self {
+    Self {
+      lender,
+      keepalive_ns,
+    }
   }
 }
 
@@ -104,6 +113,8 @@ impl<L: ShardLender + Clone> GitServices for ReceiveServices<L> {
       advertise: start.advertise,
       given,
       sent: 0,
+      answering: false,
+      keepalive_ns: self.keepalive_ns,
     })
   }
 }
@@ -121,6 +132,12 @@ pub(crate) struct Receive<L> {
   given: Vec<u8>,
   /// How much of it the edge has been given.
   sent: usize,
+  /// Whether the push is still being answered as its reply is given: a push under side-band-64k whose answer wrote
+  /// nothing for its keepalive interval, answered in the reply's turns, git's keepalive written between (A-722: a long push
+  /// answered nothing until its report, and a client's read gave up on the silence, the load-only edge tests).
+  answering: bool,
+  /// How long the answer may write nothing before git's keepalive is written.
+  keepalive_ns: u64,
 }
 
 impl<L: ShardLender> Exchange for Receive<L> {
@@ -138,51 +155,77 @@ impl<L: ShardLender> Exchange for Receive<L> {
   }
 
   async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
-    // The client's going ends a hook's run alone, and no hook runs off unix.
-    #[cfg(not(unix))]
-    let _ = gone;
     if self.advertise {
       return Ok(());
     }
-    let Self {
-      lender,
-      push,
-      given,
-      ..
-    } = self;
+    let Self { lender, push, .. } = self;
     lender
       .lend(|state| push.end(state))
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
       .map_err(failed)?;
+    // A push under side-band-64k is answered here until its answer would have been silent for git's keepalive interval,
+    // then in the reply's turns with the keepalive between (the module doc); one without is answered here whole, as
+    // nothing can be written to it but its report. Either way a refusal before any reply still answers with a status.
+    let silent_until = self
+      .push
+      .side_band()
+      .then(|| slates_rt::futures::now_ns().saturating_add(self.keepalive_ns));
+    self.answering = !self.answer_until(gone, silent_until).await?;
+    Ok(())
+  }
+
+  async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed> {
+    if self.sent >= self.given.len() && self.answering {
+      let silent_until = slates_rt::futures::now_ns().saturating_add(self.keepalive_ns);
+      let answered = self.answer_until(gone, Some(silent_until)).await?;
+      self.answering = !answered;
+      if !answered && self.sent >= self.given.len() {
+        self.given.extend_from_slice(KEEPALIVE);
+      }
+    }
+    let rest = self.given.get(self.sent..).unwrap_or_default();
+    let run = rest.get(..MAX_LEN).unwrap_or(rest);
+    out.extend_from_slice(run);
+    self.sent = self.sent.saturating_add(run.len());
+    Ok(self.answering || self.sent < self.given.len())
+  }
+}
+
+impl<L: ShardLender> Receive<L> {
+  /// Answers the push a step at a time until it is answered (whether it is), or, once `silent_until` passes on the
+  /// shard's clock with nothing new to give, until its next turn (A-722's keepalive): each step takes its repository's
+  /// turn on the shard and keeps it through the yield after, so a repository's pushes share one turn a round (A-724,
+  /// `crate::vcs_share::turns`); a hook runs off the shard, its repository's other pushes taking their turns meanwhile.
+  async fn answer_until(
+    &mut self,
+    gone: ClientGone<'_>,
+    silent_until: Option<u64>,
+  ) -> Result<bool, Failed> {
+    // The client's going ends a hook's run alone, and no hook runs off unix.
+    #[cfg(not(unix))]
+    let _ = gone;
+    let Self {
+      lender,
+      push,
+      given,
+      sent,
+      ..
+    } = self;
     let repository = push.repository();
     loop {
-      // Each step takes its repository's turn on the shard and keeps it through the yield after, so a repository's
-      // pushes share one turn a round (A-724, `crate::vcs_share::turns`).
       let turn = crate::vcs_share::turns::take(repository).await;
       let step = lender
         .lend(|state| push.answer_step(state, given))
         .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
         .map_err(failed)?;
       match step {
-        Answering::Answered(_) => return Ok(()),
+        Answering::Answered(_) => return Ok(true),
         Answering::Turned => {
-          turn.yield_holding().await;
-          // The push's names homed in the region before its record names them (A-724 piece 8c), off the shard's step.
-          if let Some(bytes) = push.take_homing() {
-            let (origin, shards) = lender
-              .lend(|state| (state.shard, state.shards.clone()))
-              .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-            let homed = crate::vcs_store::homes::home_in_region(
-              origin,
-              &shards,
-              bytes,
-              crate::fleet::live_budget(),
-            )
-            .await;
-            lender
-              .lend(|state| push.homed(state, homed))
-              .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+          let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
+          if due || *sent < given.len() && silent_until.is_some() {
+            return Ok(false);
           }
+          turn.yield_holding().await;
         }
         #[cfg(unix)]
         Answering::Hook(call) => {
@@ -196,14 +239,6 @@ impl<L: ShardLender> Exchange for Receive<L> {
         }
       }
     }
-  }
-
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
-    let rest = self.given.get(self.sent..).unwrap_or_default();
-    let run = rest.get(..MAX_LEN).unwrap_or(rest);
-    out.extend_from_slice(run);
-    self.sent = self.sent.saturating_add(run.len());
-    Ok(self.sent < self.given.len())
   }
 }
 

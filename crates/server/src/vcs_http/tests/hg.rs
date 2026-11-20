@@ -590,7 +590,7 @@ fn exchanged<E: Exchange>(mut exchange: E, body: &[u8]) -> (Result<Fields, Faile
   ready(exchange.body_end(ClientGone::never())).unwrap();
   let fields = ready(exchange.reply_fields());
   let mut reply = Vec::new();
-  while ready(exchange.reply(&mut reply)).unwrap() {}
+  while ready(exchange.reply(&mut reply, crate::vcs_http::ClientGone::never())).unwrap() {}
   (fields, reply)
 }
 

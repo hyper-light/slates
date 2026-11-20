@@ -611,7 +611,7 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     Ok(vec![(CONTENT_TYPE.to_vec(), media_type.to_vec())])
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
     match self.answered.take() {
       Some(Made::Whole(_, mut body)) => {
         out.append(&mut body);

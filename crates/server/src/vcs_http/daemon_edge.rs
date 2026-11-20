@@ -161,7 +161,11 @@ pub(crate) type DaemonSite = ToolSites<DaemonGitSite, DaemonHgSite, DaemonSvnSit
 
 /// What makes the daemon's sites on any shard: their challenges name `realm`, each request's route and exchange are
 /// charged to the request's `room`, and each git service admits each request that room.
-fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 'static {
+fn site(
+  realm: String,
+  room: u64,
+  keepalive_ns: u64,
+) -> impl Fn() -> DaemonSite + Clone + Send + 'static {
   move || {
     let git = GitSite::new(
       realm.clone(),
@@ -170,7 +174,7 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       ShardRepositories,
       Halves::new(
         UploadServices::new(ShardStores, room),
-        ReceiveServices::new(ThisShard),
+        ReceiveServices::new(ThisShard, keepalive_ns),
       ),
     )
     .with_lfs(ShardLfs);
@@ -242,7 +246,11 @@ pub(crate) fn start(
       }
     })?;
   }
-  let make = site(format!("slates {}", config.instance), bounds.room);
+  let make = site(
+    format!("slates {}", config.instance),
+    bounds.room,
+    config.git_keepalive_ns,
+  );
   runtime.spawn_on(control, async move {
     let Ok(state) = keep_here(EdgeState::new(bounds, identity)) else {
       crate::fleet::count_refusal(NOT_KEPT);

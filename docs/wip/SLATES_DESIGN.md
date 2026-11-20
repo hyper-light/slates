@@ -55736,6 +55736,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722's keepalive — A long push's answer writes git's keepalive while it is made (2026-11-20, w-git for UI goal 93; main's order: the two load-only edge tests)
+- **Why.** Over the HTTP edge a push's answer was made whole in the exchange's `body_end` and written only after it, so a
+  long push wrote nothing until its report: at a load of 56 to 67 the long-history edge tests' client gave up reading
+  after its 10 s wait. git's receive-pack writes `0005\1` (an empty band-1 packet) every `receive.keepAlive`, 5 s by
+  default, while it processes a pack under side-band-64k.
+- **Change.** `vcs_http::git::receive`: under side-band-64k a push is answered in `body_end` until its answer would have
+  been silent for `DaemonConfig::git_keepalive_ns` (`GIT_KEEPALIVE_NS`, git's 5 s), then in the reply's turns with
+  git's keepalive written whenever as long passes with nothing else to write; `Exchange::reply` is handed the client's
+  going (`ClientGone`) as `body_end` is, so a hook run in the reply's turns ends with its client. A push without
+  side-band is answered whole as before, and a refusal before any reply still answers with a status. The edge tests'
+  long-history requests now ask stock git's capabilities (`report-status-v2 side-band-64k ...`).
+- **Owed.** The silence before the reply begins: the edge's engine writes the status only once the body is read, while
+  git's `http-backend` writes its head before it reads the body, so a long pack's decode after the client's last byte
+  is silent (the two long-history tests still meet their 10 s read wait at a load of 40 to 50). The status written at
+  the head on a streamed route is an `http-edge` change (proposed to main).
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`
+  (a daemon whose interval is none: the answer begins with `0005\1`, its report whole after the keepalives);
+  `slates-server --lib -- vcs_http:: git_push:: vcs_ssh::` 156 passed, the two long-history tests (owed above) and
+  `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit` failing (its commit's texts not
+  made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
+  this Mac, local).
+
 ### A-722 part 4g — A replayed record's moves are admitted an object a turn (bug, 2026-11-20, w-git for UI goal 93; main's report: a restarted daemon recovering git/git's v2.0.0 spun and was killed again)
 - **Found by use.** r110 (w-interop, git v2.0.0): every daemon restarted after the push spun in A-662's recovery of the
   pushed repository (`daemon.rs` `spawn_alone`) and the watchdog killed it again, 7 of 27 steps answered.

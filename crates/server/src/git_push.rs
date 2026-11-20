@@ -356,6 +356,11 @@ impl<P> ReceivePack<P> {
     self.repository
   }
 
+  /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
+  pub(crate) fn side_band(&self) -> bool {
+    self.session.side_band()
+  }
+
   /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what
   /// reading them builds admitted [`crate::vcs_share::room`], its hooks' views shown by `presenter`; writes the
   /// advertisement to `out` when `advertise`. Refused for a repository not here or not git's, a
