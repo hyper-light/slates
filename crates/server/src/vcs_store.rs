@@ -1349,8 +1349,9 @@ pub(crate) struct SealedPush {
 }
 
 /// Whether a git push's record is written as version 3, its names homed in the region first (A-724 piece 8c; main's
-/// ruling of 2026-11-20 (ii)). Records stay version 2 until a takeover test proves the region path: the change that adds
-/// it turns this on. A test turns it on for its own thread ([`write_version_3_for_test`]).
+/// ruling of 2026-11-20 (ii)). On since the takeover test (`crates/cli/tests/v3_takeover.rs`) passed with it: every
+/// acknowledged push on the successor, its names read from their region homes. A unit test turns it on for its own
+/// thread ([`write_version_3_for_test`]); off there by default, so a unit test's push answers with no publication.
 pub(crate) fn write_version_3() -> bool {
   #[cfg(test)]
   {
@@ -1358,7 +1359,7 @@ pub(crate) fn write_version_3() -> bool {
   }
   #[cfg(not(test))]
   {
-    false
+    true
   }
 }
 

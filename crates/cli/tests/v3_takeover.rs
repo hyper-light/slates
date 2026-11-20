@@ -307,7 +307,7 @@ fn stock_git() -> Option<String> {
 
 /// Runs stock git with `args` in `dir`, a bearer `token` on every request: its exit code and both outputs.
 fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
-  let output = Command::new("git")
+  let mut output = Command::new("git")
     .args(["-c", &format!("http.extraHeader=Authorization: Bearer {token}"), "-c", "user.name=t", "-c", "user.email=t@t"])
     .args(["-c", "commit.gpgsign=false", "-c", "protocol.version=0", "-c", "http.sslVerify=false"])
     .args(args)
@@ -316,8 +316,20 @@ fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
     .env_remove("GIT_DIR")
     .env_remove("GIT_WORK_TREE")
     .stdin(Stdio::null())
-    .output()
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
     .unwrap();
+  // Bounded: a command that hangs fails the test at twice the fleet wait, never stalls it.
+  let deadline = Instant::now() + FLEET_WAIT * 2;
+  while output.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      let _ = output.kill();
+      panic!("git {args:?} did not end within {:?}", FLEET_WAIT * 2);
+    }
+    pause();
+  }
+  let output = output.wait_with_output().unwrap();
   (
     output.status.code().unwrap_or(-1),
     String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -478,6 +490,16 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   let positions: Vec<Option<usize>> = acknowledged.iter().map(|id| order.iter().position(|seen| seen == id)).collect();
   assert!(positions.iter().all(Option::is_some), "an acknowledged push missing (NoLoss): {positions:?}");
   assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "pushes out of order (TotalOrder): {positions:?}");
+  // The region homing's and the takeover's own counts, for the record (main's order: land the switch with them).
+  for at in &survivors {
+    let node = &nodes[*at];
+    let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
+    let counted: Vec<&str> = status
+      .lines()
+      .filter(|line| ["homes.", "names_fetched", "names_unfetched", "push_uncommitted", "replayed", "repository_rebuilt"].iter().any(|word| line.contains(word)))
+      .collect();
+    eprintln!("V3TAKEOVER: node {at} counted {counted:?}");
+  }
   drop(nodes);
   drop(scratch);
 }

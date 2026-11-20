@@ -55248,6 +55248,14 @@ Applied in the same change to:
   a credential minted on the owner is unknown to the successor (401) and a survivor's own token names its own account
   (403). Tests: slates-db 18 suites; slates-server `takeover state_log vcs_store:: git_push:: vcs_http::git vcs_ssh::`
   236 of 236.
+- **Record version 3 on (2026-11-20; main's ruling (ii)).** `vcs_store::write_version_3` is true: a push's names are
+  homed in the region at f + 1 before its record names them, and the record holds their BLAKE3 and count. The takeover
+  test passes with it, 4 of 4 runs. One run's counts: the successor replayed 3 records (`vcs_store.replayed`) and read one
+  record's names from a region home (`vcs_store.names_fetched` 1); each survivor homed 2 objects, served 19 region
+  exchanges, and its homing waits published its home shard themselves 11 and 13 times (`published_for_ticket`). The first
+  runs hung: main's refactor of the HTTP answer loop (`answer_until`) had dropped the edge's `take_homing`, so a decision
+  waited for a homing nobody ran. The edge homes again, and a decision whose asked homing is not taken by its next turn
+  now gives the names back and writes version 2 (`vcs_store.homes.homing_untaken`), never waits.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
