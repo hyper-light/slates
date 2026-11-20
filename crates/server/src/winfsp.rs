@@ -243,6 +243,13 @@ struct HeldFlush {
   bound: slates_bridge_core::durable_bound::DurableBound,
 }
 
+/// Derived: how long a drive's primary receiver may be held inside one send before its relief serves in its place
+/// (A-725): one watchdog beat (`crate::daemon::HEARTBEAT_NS`). A send was seen to take at most 481 us on CI's runners
+/// (diag-w-bugs-b3-9, 2026-11-20), so a send held a whole beat is waiting on the drive, and a held one is relieved
+/// within two beats, while the relief costs an idle mount one look a beat.
+const RELIEF_BEAT: std::time::Duration =
+  std::time::Duration::from_nanos(crate::daemon::HEARTBEAT_NS);
+
 /// The bounded held-ledger/image merge, one inode per owner turn. The held map has at most MAX_OPEN_HANDLES entries.
 struct RestoredOpenCounts {
   held: BTreeMap<u64, (u64, u32)>,
@@ -332,7 +339,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       (!pending.rights.write, search),
       sender,
       waker.clone(),
-      MAX_OPEN_HANDLES,
+      (MAX_OPEN_HANDLES, RELIEF_BEAT),
       None,
     ) {
       Ok(thread) => await_mounted(thread).await,
@@ -849,7 +856,7 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
     (!record.rights.write, search),
     sender,
     waker.clone(),
-    MAX_OPEN_HANDLES,
+    (MAX_OPEN_HANDLES, RELIEF_BEAT),
     Some(held),
   ) {
     Ok(thread) => await_mounted(thread).await,

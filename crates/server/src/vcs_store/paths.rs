@@ -213,7 +213,7 @@ pub(crate) fn advance_after_push(state: &mut ShardState, green: DbVolumeId, vers
 /// Whether `green`'s step at `version` would build the map from the whole head ([`plan`]'s rule, read over the change
 /// alone, never the head's files): no map of the version before is kept and the branch's source stands for none, or a
 /// copy is named in the change.
-fn needs_whole(
+pub(crate) fn needs_whole(
   state: &ShardState,
   (repository, green): (RepositoryId, DbVolumeId),
   version: u64,

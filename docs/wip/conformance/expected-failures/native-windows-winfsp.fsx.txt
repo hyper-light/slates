@@ -5,5 +5,6 @@
 # A run that passes while a line is listed fails the gate: strike the line with the fix. The list only shrinks.
 # First review: 2026-11-05, from diagnostics runs 41984660605, 41989365843, 41993895943 and 42053543593 (x86_64 and
 # arm64, every one wedged).
-
-fsx-seed-1-unfinished:10000  BUG (open, A-209): fsx wedges over the drive after a cached write past a hole, a shrink below it, and an extension by the C runtime's _chsize (operations 41 to 43, or 162 to 164, at seed 1; the point moves between runs: 238 on main's bridge, 164, then 43), on x86_64 and arm64. No request reaches the bridge between the shrink's SetFileSize and the bound's kill 300 s later, (2026-11-20: shown to be the single receiver itself, blocked in its send of the shrink's SetInformation answer while WinFsp completes it on that thread, `CcSetFileSizes` waiting on a drive request nobody else can receive; A-198 owes a second receiver). Record docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md, "Open: fsx wedges over the drive".
+# Struck 2026-11-20 (A-725): fsx-seed-1-unfinished:10000, the wedge after a shrink. Its cause was the one receive
+# worker held in its own send of the shrink's answer while WinFsp completed it on that thread; the relief receiver
+# serves meanwhile, and seed 1 now runs whole over the drive (diag-w-bugs-b3-10, windows-latest, 49 s).
