@@ -985,7 +985,6 @@ pub(crate) async fn home_in_region(
   bytes: Vec<u8>,
   budget: slates_cluster::CommitBudget,
 ) -> Result<ContentId, HomeRefused> {
-  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
   let (local, members, f) = crate::state::with_state(|state| {
     (
       state.fleet.host(),
@@ -1006,43 +1005,20 @@ pub(crate) async fn home_in_region(
     .copied()
     .filter(|home| *home != local)
     .collect();
-  // An object past one message goes a part at a time (A-724 piece 8c), every home staging it in order.
-  let past_a_message =
-    u64::try_from(bytes.len()).unwrap_or(u64::MAX) > slates_cluster::homes::PART_BYTES;
-  if !others.is_empty() && past_a_message {
-    kept = kept.saturating_add(put_in_parts(&others, identity, &bytes, budget).await.len());
-  } else if !others.is_empty() {
-    let request = HomeMessage::Put {
-      identity: identity.0,
-      bytes,
-    }
-    .encode();
-    let sessions =
-      crate::fleet::take_sessions("vcs_store.homes.region", |host| others.contains(&host));
-    let outgoing: Vec<_> = sessions
-      .into_iter()
-      .map(|(host, endpoint)| (host, request.clone(), endpoint))
-      .collect();
-    let (replied, _stragglers) = slates_cluster::broadcast(
-      outgoing,
-      HOME_STREAM,
-      slates_transport::connection::Priority::Bulk,
-      budget,
-    )
-    .await;
-    let mut returned = Vec::with_capacity(replied.len());
-    for (host, reply, endpoint) in replied {
-      if let Ok(HomeMessage::Answer {
-        identity: answered,
-        outcome: HomeOutcome::Kept { .. },
-      }) = HomeMessage::decode(&reply.bytes)
-        && answered == identity.0
-      {
-        kept = kept.saturating_add(1);
-      }
-      returned.push((host, endpoint));
-    }
-    crate::fleet::return_sessions(returned);
+  // The other homes reached from the control shard, which holds the record sessions (`crate::fleet::take_sessions`):
+  // on any other shard none is found and every homing there fell short (the three-node A/B, 2026-11-20).
+  if !others.is_empty() {
+    let control = shards.first().copied().unwrap_or(origin);
+    kept = kept.saturating_add(
+      crate::xshard::task_in_shard_time(
+        origin,
+        control,
+        move || put_remote(others, identity, bytes, budget),
+        budget_ns,
+      )
+      .await
+      .unwrap_or(0),
+    );
   }
   let homed = kept >= homes.len() && !homes.is_empty();
   crate::state::with_state(|state| {
@@ -1065,7 +1041,6 @@ pub(crate) async fn read_in_region(
   identity: ContentId,
   budget: slates_cluster::CommitBudget,
 ) -> Option<Vec<u8>> {
-  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
   let budget_ns = budget.max_deadline_ns();
   if let Some(bytes) = read(origin, shards, identity, budget_ns).await
     && ContentId::of(&bytes) == identity
@@ -1086,58 +1061,120 @@ pub(crate) async fn read_in_region(
   if others.is_empty() {
     return None;
   }
-  // A part at a time, each at most one message, so an object of any length reads back (A-724 piece 8c).
-  for home in &others {
+  // From the control shard, which holds the record sessions, a part at a time from each home in turn (A-724 piece 8c).
+  let control = shards.first().copied().unwrap_or(origin);
+  crate::xshard::task_in_shard_time(
+    origin,
+    control,
+    move || read_remote(others, identity, budget),
+    budget_ns,
+  )
+  .await
+  .flatten()
+}
+
+/// One region exchange of `request` with each of `hosts` (A-724 piece 8c): sent over each host's record session, a
+/// session out on another loan waited for until it comes back (`crate::fleet::session_returned`), never skipped, until
+/// every host answered or `budget` is spent: each host's reply. Run on the control shard, which holds the sessions.
+async fn exchange(
+  hosts: &[slates_db::HostId],
+  request: &[u8],
+  budget: slates_cluster::CommitBudget,
+) -> Vec<(slates_db::HostId, Vec<u8>)> {
+  use slates_cluster::homes::HOME_STREAM;
+  let began = slates_rt::futures::now_ns();
+  let spend = budget.max_deadline_ns();
+  let mut left: Vec<slates_db::HostId> = hosts.to_vec();
+  let mut answers = Vec::new();
+  while !left.is_empty() {
+    let sessions =
+      crate::fleet::take_sessions("vcs_store.homes.exchange", |host| left.contains(&host));
+    let outgoing: Vec<_> = sessions
+      .into_iter()
+      .map(|(host, endpoint)| (host, request.to_vec(), endpoint))
+      .collect();
+    if !outgoing.is_empty() {
+      let (replied, _stragglers) = slates_cluster::broadcast(
+        outgoing,
+        HOME_STREAM,
+        slates_transport::connection::Priority::Bulk,
+        budget,
+      )
+      .await;
+      let mut returned = Vec::with_capacity(replied.len());
+      for (host, reply, endpoint) in replied {
+        left.retain(|waiting| *waiting != host);
+        answers.push((host, reply.bytes));
+        returned.push((host, endpoint));
+      }
+      crate::fleet::return_sessions(returned);
+    }
+    let spent = slates_rt::futures::now_ns().saturating_sub(began);
+    if left.is_empty() || spent >= spend {
+      break;
+    }
+    // A session out on another exchange's loan: wait for its return (or its link's change), then look again.
+    if crate::fleet::session_returned(&left, spend.saturating_sub(spent)).await != Some(true) {
+      break;
+    }
+  }
+  answers
+}
+
+/// The object `bytes` named `identity` sent to the other homes `homes` (A-724 piece 8c), whole within one message or a
+/// part at a time past it ([`put_in_parts`]): how many answered kept. Run on the control shard.
+async fn put_remote(
+  homes: Vec<slates_db::HostId>,
+  identity: ContentId,
+  bytes: Vec<u8>,
+  budget: slates_cluster::CommitBudget,
+) -> usize {
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
+  if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PART_BYTES {
+    return put_in_parts(&homes, identity, &bytes, budget).await.len();
+  }
+  let request = HomeMessage::Put {
+    identity: identity.0,
+    bytes,
+  }
+  .encode();
+  exchange(&homes, &request, budget)
+    .await
+    .into_iter()
+    .filter(|(_, reply)| {
+      matches!(
+        HomeMessage::decode(reply),
+        Ok(HomeMessage::Answer { identity: answered, outcome: HomeOutcome::Kept { .. } }) if answered == identity.0
+      )
+    })
+    .count()
+}
+
+/// The object named `identity` read from one of the other homes `homes`, a part at a time from each in turn
+/// ([`read_in_parts`]): the first whole one. Run on the control shard.
+async fn read_remote(
+  homes: Vec<slates_db::HostId>,
+  identity: ContentId,
+  budget: slates_cluster::CommitBudget,
+) -> Option<Vec<u8>> {
+  for home in &homes {
     if let Some(bytes) = read_in_parts(*home, identity, budget).await {
       return Some(bytes);
     }
   }
-  let request = HomeMessage::Read {
-    identity: identity.0,
-  }
-  .encode();
-  let sessions =
-    crate::fleet::take_sessions("vcs_store.homes.region_read", |host| others.contains(&host));
-  let outgoing: Vec<_> = sessions
-    .into_iter()
-    .map(|(host, endpoint)| (host, request.clone(), endpoint))
-    .collect();
-  let (replied, _stragglers) = slates_cluster::broadcast(
-    outgoing,
-    HOME_STREAM,
-    slates_transport::connection::Priority::Bulk,
-    budget,
-  )
-  .await;
-  let mut found = None;
-  let mut returned = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
-    if found.is_none()
-      && let Ok(HomeMessage::Answer {
-        identity: answered,
-        outcome: HomeOutcome::Bytes(bytes),
-      }) = HomeMessage::decode(&reply.bytes)
-      && answered == identity.0
-      && ContentId::of(&bytes) == identity
-    {
-      found = Some(bytes);
-    }
-    returned.push((host, endpoint));
-  }
-  crate::fleet::return_sessions(returned);
-  found
+  None
 }
 
 /// Sends the object `bytes` named `identity` to each of `homes` a part at a time, in order (A-724 piece 8c: an object past
-/// one message), each part to every home still taking it, a home dropped at its first answer other than the part taken:
-/// the homes that answered the last part kept (each only once its image holding it is published).
+/// one message), each part to every home still taking it ([`exchange`]), a home dropped at its first answer other than
+/// the part taken: the homes that answered the last part kept (each only once its image holding it is published).
 async fn put_in_parts(
   homes: &[slates_db::HostId],
   identity: ContentId,
   bytes: &[u8],
   budget: slates_cluster::CommitBudget,
 ) -> Vec<slates_db::HostId> {
-  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome, PART_BYTES};
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
   let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   let part = usize::try_from(PART_BYTES).unwrap_or(usize::MAX).max(1);
   let mut taking: Vec<slates_db::HostId> = homes.to_vec();
@@ -1152,23 +1189,9 @@ async fn put_in_parts(
       bytes: chunk.to_vec(),
     }
     .encode();
-    let sessions =
-      crate::fleet::take_sessions("vcs_store.homes.region_part", |host| taking.contains(&host));
-    let outgoing: Vec<_> = sessions
-      .into_iter()
-      .map(|(host, endpoint)| (host, request.clone(), endpoint))
-      .collect();
-    let (replied, _stragglers) = slates_cluster::broadcast(
-      outgoing,
-      HOME_STREAM,
-      slates_transport::connection::Priority::Bulk,
-      budget,
-    )
-    .await;
     let mut still = Vec::new();
-    let mut returned = Vec::with_capacity(replied.len());
-    for (host, reply, endpoint) in replied {
-      match HomeMessage::decode(&reply.bytes) {
+    for (host, reply) in exchange(&taking, &request, budget).await {
+      match HomeMessage::decode(&reply) {
         Ok(HomeMessage::Answer {
           identity: answered,
           outcome: HomeOutcome::Taken { received },
@@ -1179,9 +1202,7 @@ async fn put_in_parts(
         }) if answered == identity.0 && end == total => kept.push(host),
         _ => {}
       }
-      returned.push((host, endpoint));
     }
-    crate::fleet::return_sessions(returned);
     taking = still;
     if taking.is_empty() {
       break;
@@ -1190,14 +1211,14 @@ async fn put_in_parts(
   kept
 }
 
-/// Reads the object named `identity` back from `home` a part at a time (A-724 piece 8c), answered only when its parts
-/// make its whole length and hash to its identity.
+/// Reads the object named `identity` back from `home` a part at a time (A-724 piece 8c, [`exchange`]), answered only when
+/// its parts make its whole length and hash to its identity.
 async fn read_in_parts(
   home: slates_db::HostId,
   identity: ContentId,
   budget: slates_cluster::CommitBudget,
 ) -> Option<Vec<u8>> {
-  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
   let mut bytes: Vec<u8> = Vec::new();
   loop {
     let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -1206,38 +1227,16 @@ async fn read_in_parts(
       offset,
     }
     .encode();
-    let sessions =
-      crate::fleet::take_sessions("vcs_store.homes.region_read_part", |host| host == home);
-    let outgoing: Vec<_> = sessions
+    let (total, got) = exchange(&[home], &request, budget)
+      .await
       .into_iter()
-      .map(|(host, endpoint)| (host, request.clone(), endpoint))
-      .collect();
-    if outgoing.is_empty() {
-      return None;
-    }
-    let (replied, _stragglers) = slates_cluster::broadcast(
-      outgoing,
-      HOME_STREAM,
-      slates_transport::connection::Priority::Bulk,
-      budget,
-    )
-    .await;
-    let mut part = None;
-    let mut returned = Vec::with_capacity(replied.len());
-    for (host, reply, endpoint) in replied {
-      if let Ok(HomeMessage::Answer {
-        identity: answered,
-        outcome: HomeOutcome::Part { total, bytes: got },
-      }) = HomeMessage::decode(&reply.bytes)
-        && answered == identity.0
-        && !got.is_empty()
-      {
-        part = Some((total, got));
-      }
-      returned.push((host, endpoint));
-    }
-    crate::fleet::return_sessions(returned);
-    let (total, got) = part?;
+      .find_map(|(_, reply)| match HomeMessage::decode(&reply) {
+        Ok(HomeMessage::Answer {
+          identity: answered,
+          outcome: HomeOutcome::Part { total, bytes: got },
+        }) if answered == identity.0 && !got.is_empty() => Some((total, got)),
+        _ => None,
+      })?;
     bytes.extend_from_slice(&got);
     let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if read > total {

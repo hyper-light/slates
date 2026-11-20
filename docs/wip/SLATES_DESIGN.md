@@ -28819,6 +28819,9 @@ Applied in the same change to:
   longer holds answers `ENOENT`; recovery refuses an overlay whose loaded base directory changed after its last
   publication.
 - **Evidence.** See the bug record's verification.
+- **Status (2026-11-20, A-781).** Without a birth time, an untouched entry whose change time (sub-second) and size
+  match what its inode recorded is proven its file and keeps its number across a takeover; only one the disk changed or
+  stamped in whole seconds is renumbered, as before.
 
 ### A-150 — An inode number goes out only under a published reservation (accepted 2026-10-22)
 Applied in the same change to:
@@ -55930,6 +55933,26 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's replay in place — a record's replay reads its pack as a live push does (2026-11-20, w-git for UI goal 93; B2's other side)
+- **Why.** A version-2 record's replay (`vcs_store::git_replay`) read its pack into git's reader whole
+  (`Reader::read`, `finish_with` into `Unpacked`), so every object was held inflated in the reader while each was put in
+  the content store as it was admitted: a v1.5.0 record held its 304.6 MiB of objects twice at its replay's peak.
+- **Change.** The replay reads its record's pack a chunk at a time into a site of its own (`git_replay::Site`: a
+  queue by pack position, the push and the repository read only through the live intake's `Quarantined`, the
+  repository's objects as a thin pack's bases), each chunk's bytes added to the push's own copy of the pack
+  (`Push::extend_pack`) and each object admitted as it resolves where it lies there (`admit_object` with its offset,
+  `Push::keep_read`), its hold given back; the waiting deltas resolve a unit at a time (`Reader::resolve_turn`) and are
+  admitted the same way; `Reader::finish_into` ends the pack. Its names are compared as sets (the replay order fix
+  above), so admitting in its own turns' order is the live push's own. Staging then puts what lands in resolution order,
+  as a live push's does.
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic: a v1.5.0 push, then its repository's store made
+  again from the log, each replay turn 1 ms): the process's peak RSS grew by 189.6 MiB across the replay before (772.6
+  to 962.2 MiB, 2,712 turns) and by 0.1 MiB after (781.8 to 781.9 MiB, 1,921 turns, 2.43 s); the content store's peak
+  is 309.0 MiB either way, what lands. The time before (6.39 s) was taken with every core busy, so the turns and the
+  resident bytes are the comparison.
+- **Tests.** `slates-server --lib -- git vcs_store` 163 passed, the replays of `t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved`
+  and `t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` among them (kiln, adas-mac-studio.local-2).
+
 ### A-722's replay order — a pack record's names compared as sets (2026-11-20, w-git for UI goal 93; found reading B2's replay)
 - **The bug.** A live push admits its pack's objects as they resolve: those read whole, or from a base already read,
   in pack order as the client's bytes arrive; a thin pack's waiting deltas (a REF_DELTA whose base is outside the pack)
@@ -57716,3 +57739,22 @@ Evidence: `cargo test --locked -p slates-server --test session_log` 2 passed, th
 `a_newer_presentation_supersedes_the_older_whose_grant_is_refused` red with the supersede disabled (`Refused(NotFound)`)
 and green with it; `--test presentations` 10 passed; `-p slates-db --test model every_recovery` 2 and `--test
 wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe` 2 (macOS arm64, this Mac, local).
+
+### A-781 — Without a birth time, an unchanged base file keeps its number across a takeover (2026-11-20, w-realtools; Ada's dispatch after the Slates-vs-Sapling comparison; amends A-151)
+- **What it answers.** EdenFS's own record (`eden/fs/docs/InodeStorage.md`): unstable inode numbers broke C++
+  `#pragma once`, which tells a header by its device and inode number. Under A-151, a recovered overlay over a disk that
+  records no birth time (tmpfs, NFS, older filesystems) renumbered every untouched entry at its first listing, in lookup
+  order. So a compiler that read `inc/s.h` before a daemon restart and `sub/../inc/s.h` after it saw two files and
+  included the header twice. Red: `without_birth_times_an_unchanged_base_file_keeps_its_number_and_times_across_a_takeover`
+  (three headers, numbers ...595-597 before, ...600-598 after; times unchanged).
+- **The change.** `Overlay::unprovable` also takes the change time as proof. An entry with no descriptor and no birth
+  time whose listed change time has a sub-second part and equals, with its size, what the inode recorded keeps its
+  number. The kernel stamps the change time when a file is made and at each change to it, so a file made at a freed
+  number later carries a later one. A whole-second stamp proves nothing: the reused file could share its second.
+- **What A-151 rejected stays rejected.** A-151 ruled out the change time *in place of* the birth time, because an
+  in-place edit would renumber the file. Here the change time is only an extra proof when there is no birth time. A
+  file whose change time moved is renumbered as before, so nothing that held under A-151 is weakened.
+- **Tests.** `base_identity`: the red test above, now green; `without_birth_times_a_reused_number_is_still_a_new_entry_after_a_takeover`
+  (the guard: two saves give the number back, and the lookup is a new inode); A-151's renumbering test, now documented
+  as covering whole-second stamps. Real-tool runs over a kernel mount (macOS NFS, Linux FUSE, Windows WinFsp) are owed
+  to main's run requests.

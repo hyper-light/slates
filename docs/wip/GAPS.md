@@ -1,5 +1,10 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **REAL TOOLS ACROSS SNAPSHOTS, EVICTION AND TAKEOVER (w-realtools, 2026-11-20).** A-781 BUILT: without a birth time,
+> an unchanged base file keeps its inode number across a takeover (`#pragma once`). Open: the kernel-mount acceptance
+> runs (a `#pragma once` build, `make`, `cargo build` and `git status` over a mount across a snapshot, a restart and a
+> takeover) on macOS NFS, Linux FUSE and Windows WinFsp.
+
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
 > only a ceiling. **A-777 BUILT:** the idle prefault reserve (A-214) is removed: provisioning p99 unchanged, NFS peak
@@ -2233,6 +2238,12 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **A-780, the svn DAV site's PROPFIND written in place (2026-11-20, w-svn; Ada's MEMORY SIZING rule):** every
+> property's value and element is written into one reused buffer (`dav::site` `write_live`, `push_dead`, the value
+> writers), responses streamed into the body as described; allprop of a 32-file directory at depth 1 makes 445
+> allocations (was 5,691), six properties 487 (was 1,876) (`crates/svn/tests/propfind_allocations.rs`, red on the old
+> writer). Owed: the ~14 a response left (a child's place and href, its property list, the lock discovery), and writing
+> into the connection's own buffer rather than an answer's body (the site's `HttpAnswer`).
 > **A-772, svnsync's replay (2026-11-20, w-svn; main's order after w-interop's matrix r10: 0.54 s a revision of
 > git-2000.dump, 2,511 MiB peak against the 447 MiB dump):** the drive's share measured and fixed by w-perf's per-reader
 > `WindowCache` (b51f908f2): `replay_bench` 328 s to 1.82 s for r1..r2000 (BENCHMARKS), held by
