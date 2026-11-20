@@ -55561,4 +55561,11 @@ control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, 
   slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http:: vcs_ssh:: vcs_svn lfs:: work_home:: identities::
   takeover:: --test-threads=4` 307 of 309, the two others failing alike without this change (`vcs_store::homes`' and
   `vcs_http::daemon_edge`'s long history, each flaky alone, reported); fmt clean.
-- **Owed.** One git record (a large push's pack) is still one turn; a successor's rebuild (`make_whole`) is one step.
+- **A successor's rebuild too** (main's ruling, the same day): `takeover::rebuild_repository` makes the adopted
+  repository's store through `vcs_store::rebuild` (Mercurial's task, or this one), not `make_whole` in one step, since a
+  large repository's adoption would spin the successor's shard past the watchdog, the crash loop on another path. Its
+  test (`vcs_store::paths::tests::t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map`) asserts the
+  store rebuilding and lent to nothing after the takeover's step, then its map made by driving the turns and builds;
+  `cargo test --locked -p slates-server --lib -- takeover:: fleet::state_log_tests vcs_store:: repository:: git_push::
+  vcs_svn lfs:: --test-threads=4` 168 of 168.
+- **Owed.** One git record (a large push's pack) is still one turn (w-git, through the sliced intake).

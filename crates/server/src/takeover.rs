@@ -2624,7 +2624,8 @@ fn held_parts(
 /// Rebuilds a repository taken over on the shard its id routes to (A-636 part 2c-2): keeps the parts of its state logs
 /// held whole by A-636 part 1's rule, each green's log judged by its head here ([`slates_db::repository::whole_parts`]),
 /// records it whole from its adopted record and those parts (`Op::RepositoryRebuilt`), and makes its store from the
-/// log and each member green's map from its adopted head ([`crate::vcs_store::make_whole`]), as a rebuild does. Whether it stands here now: recorded, or recorded
+/// log and each member green's map from its adopted head a step a turn ([`crate::vcs_store::rebuild`]), as a rebuild
+/// does. Whether it stands here now: recorded, or recorded
 /// already; `false` once the database refused it, logged and counted ([`TAKEOVER_REPOSITORY_UNREBUILT`]).
 pub(crate) fn rebuild_repository(
   state: &mut ShardState,
@@ -2660,7 +2661,10 @@ pub(crate) fn rebuild_repository(
     TAKEOVER_REPOSITORY_OPERATION_DROPPED,
     u64::try_from(dropped.len()).unwrap_or(u64::MAX),
   );
-  crate::vcs_store::make_whole(state, &record);
+  // Its store made from the log a step a turn, lent to nothing until it is whole, then each green's map made again in
+  // slices (A-732 and its git and Subversion sibling): a large repository's adoption held in one step would spin the
+  // successor's shard past the watchdog, the crash loop on another path.
+  crate::vcs_store::rebuild(state, record.id);
   state.count(TAKEOVER_REPOSITORY_REBUILT, 1);
   true
 }
