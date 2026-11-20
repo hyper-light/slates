@@ -69,7 +69,7 @@ env $ISSUER "$SLATES" --instance "$INSTANCE" credential key "$(cat "$WORK/key.pu
 ssh-keyscan -p "$SSH" -t ed25519 127.0.0.1 >"$WORK/known_hosts" 2>/dev/null
 [ "$(ssh-keygen -l -E sha256 -f "$WORK/known_hosts" | awk '{print $2}')" = "$FINGERPRINT" ] ||
   { echo "the SSH edge's key is not the one the daemon named"; exit 1; }
-TUNNEL="config:tunnels:ssh=ssh -q -F /dev/null -p $SSH -i $WORK/key -o IdentitiesOnly=yes -o BatchMode=yes \
+TUNNEL="config:tunnels:ssh=ssh -F /dev/null -p $SSH -i $WORK/key -o IdentitiesOnly=yes -o BatchMode=yes \
 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$WORK/known_hosts -o GlobalKnownHostsFile=/dev/null --"
 SVNURL="svn://127.0.0.1:$SVNPORT/project"
 HTTPURL="http://127.0.0.1:$HTTP/project"
@@ -91,7 +91,7 @@ row checkout bash -c "$R checkout -q $URL/trunk $WORK/a"
 row log bash -c "$R log -q $URL"
 row log-verbose bash -c "$R log -v -l 100 $URL/trunk"
 row blame bash -c "cd $WORK/a && f=\$(ls | grep -m1 '\.c$') && $R blame \$f"
-row diff bash -c "$R diff -r PREV:HEAD $URL/trunk"
+row diff bash -c "r=\$($R info --show-item last-changed-revision $URL/trunk) && $R diff -c \$r $URL/trunk"
 row export bash -c "$R export -q $URL/trunk $WORK/exported"
 row update-back bash -c "cd $WORK/a && $R update -q -r PREV && $R update -q"
 row commit-add bash -c "cd $WORK/a && echo matrix >matrix.txt && $R add -q matrix.txt && $R commit -q -m add"
