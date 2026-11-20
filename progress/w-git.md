@@ -177,3 +177,10 @@
   (ClientGone needed for hooks: driver hands it only to body_end); (3) memory per push attribution; (4) store commit
   passes; (5) t_a665 derived deadline; Windows restart spin check. Note: w-balance's t_a724_a_rebuild_reads... is
   load-flaky (passes alone).
+- 2026-11-20 ~11:15: LANDED 4f 061f4956a (propagate a stack step a unit), 4g 6737b04a7 (replay moves admitted an object
+  a turn: r110 restart spin), keepalive 61b178d42 (main 85d66d9cb). Local target DELETED on main's urgent order (Mac
+  disk); NO cargo on this Mac: builds/tests via kiln run with no `on` (CARGO_TARGET_DIR=~/.cache/w-git-target.noindex,
+  CARGO_INCREMENTAL=0). Post-merge confirm run r20 in flight.
+- NEXT: ruling asked on http-edge status-at-head (streamed routes) for the two long-history edge tests; then memory per
+  push (attribution, identical objects stored once, bounded working set); then Repository::commit's O(objects) passes;
+  t_a665 derived deadline. Findings sent: svn ssh test fails after w-svn 28e57ac18.

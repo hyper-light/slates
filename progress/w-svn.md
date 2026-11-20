@@ -239,3 +239,22 @@
   -> (false,1,None); green. Server focused 128/128, svn 569/569. Exporter reads stored texts via svn_view::with_view.
 - NEXT: item 2, exporter `load` rebuild sliced (TextReading: chain a window a step; store a window a step; green a
   copy slice a step; cache = delta's two). Then DeltaV v1 (read w-interop progress first).
+- 2026-11-20: LANDED b1206d96c (svn landing waits on the barrier only when it put texts; red vcs_ssh::svn::tests stock
+  mkdir on main, my filter vcs_ssh::tests::svn had named no module -- sweep with `cargo test -p slates-server --lib svn`).
+  LANDED A-762 507d722b3 + 2cf1b1d35: exporter reads a text a bounded step a call (TextSource::read_step, TextReading).
+  Ledger edits now from ~/slates-work/w-svn-ledger (shared checkout had another agent's staged state).
+- NEXT: DeltaV v1 for pre-1.7 clients (MKACTIVITY/CHECKOUT/MERGE; review piece 14); w-interop piece 5 done, no overlap.
+  Owed: Linux daemon:: run on kiln (r36 never started, no room); 500 MB commit re-measured after w-engine 1b.
+- DeltaV v1 (pre-1.7 / no-v2 serf clients) PLAN, sources in ~/slates-work/g234-svn-src/dav-1.14 (1.14.x mod_dav_svn +
+  ra_serf commit.c): OPTIONS activity-collection-set -> `!svn/act/`; MKACTIVITY act/UUID 201; discover_vcc PROPFIND;
+  checked-in -> `!svn/ver/REV/PATH`; CHECKOUT vcc (body activity-set href) -> 201 Location `!svn/wbl/ACT/REV`;
+  PROPPATCH wbl = revprops; CHECKOUT ver/REV/path -> 201 Location `!svn/wrk/ACT/path` (out-of-date check by rev);
+  PUT/MKCOL/DELETE/COPY/PROPPATCH under wrk == txr; MERGE source=activity href; DELETE act. Map onto DavCommit: an
+  activity = a transaction begun lazily (revprops from the wbl PROPPATCH) and wrk/ACT/path == txr/TXN/path.
+  Part 1 slates-svn sans-io (URIs, CHECKOUT body/answer, activity state), part 2 server site, part 3 by-use (stock
+  svn 1.15 against a no-v2 OPTIONS test hook, on a machine with svn).
+- DeltaV v1 parts, revised: 1 READS -- site.rs serves vcc/default (checked-in -> bln/YOUNGEST), bln/N
+  (baseline-collection -> bc/N/, version-name), ver/N/PATH (a version resource: PROPFIND, GET) as repos.c answers
+  them; 2 WRITES sans-io (dav/activity.rs: URIs, CHECKOUT body, mod_dav's 201 HTML body pinned from httpd 2.4.x
+  mod_dav.h DAV_RESPONSE_BODY_1..5 + "X Y has been created.", Cache-Control no-cache; DavCommit activity + checked-out
+  revisions); 3 server; 4 by-use.
