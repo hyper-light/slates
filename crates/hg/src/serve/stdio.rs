@@ -31,6 +31,11 @@
 //! as 7.2 refuses one where bundle2 is required, `abort:` and its `bundle2required` words on standard error and the
 //! push's result `0` (`pushres`). No request after the push is served before its answer is made.
 //!
+//! **A `pushkey`** (A-758, [`super::keys`]) is landed as a push of one advisory `pushkey` part, through the same
+//! caller and driver: its four arguments read, it waits for its caller as a push taken whole does, with the `force`
+//! heads argument, and its answer is the command's string (`1` or `0`, then any words for the client) rather than a
+//! reply. A namespace no key is moved in is answered `0` with slates' words at once, nothing landed.
+//!
 //! **Differs from 7.2, on purpose.** A request cut short by the end of input is dropped, not served: 7.2 reads a last
 //! line that has no newline and serves it less its last byte. A push's bundle is held within the request's room, where
 //! 7.2 spools it to a temporary file of any size: a chunk past it is answered out of band and ends the session, as a
@@ -43,6 +48,7 @@
 
 use super::Refusal;
 use super::getbundle::Store;
+use super::keys;
 use super::session::{self, BUNDLE2_REQUIRED, Refused, Step, spec_of};
 use crate::Admission;
 use crate::push::Outcome;
@@ -64,6 +70,8 @@ const UNBUNDLE: &[u8] = b"unbundle";
 const HEADS: &[u8] = b"heads";
 /// Format: the command line a push begins with: its name, then the newline that ends a command line.
 const UNBUNDLE_LINE: &[u8] = b"unbundle\n";
+/// Format: the command line a `pushkey` begins with (A-758).
+const PUSHKEY_LINE: &[u8] = b"pushkey\n";
 
 /// Format: what 7.2's `Abort.format` writes before an abort's words on standard error.
 const ABORT: &[u8] = b"abort: ";
@@ -118,9 +126,18 @@ enum Pushing {
   /// Its bundle's chunks are being taken.
   Taking(Push),
   /// Taken whole, it waits for its caller ([`Stdio::take_push`]).
-  Whole(Push),
+  Whole(Push, Asked),
   /// Its caller has it; its answer is not yet made ([`Stdio::pushed`]).
-  Landing,
+  Landing(Asked),
+}
+
+/// Which command a push answers: how its answer is framed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+  /// `unbundle`: the reply, or its refusal, as 7.2 frames each.
+  Unbundle,
+  /// `pushkey` (A-758): the command's string.
+  Pushkey,
 }
 
 /// Input past the channel's window: the carrier let the client send more than the session may hold.
@@ -216,6 +233,9 @@ impl Stdio {
     }
     if self.input.starts_with(UNBUNDLE_LINE) {
       return self.unbundle(store, room);
+    }
+    if self.input.starts_with(PUSHKEY_LINE) {
+      return self.pushkey(room);
     }
     if self.answering.is_some() {
       return self.stream(store, room);
@@ -363,6 +383,49 @@ impl Stdio {
     self.taken(Step::Answered { refused: None }, used)
   }
 
+  /// Serves the `pushkey` at the front of the input (the module doc's `pushkey`): its arguments read within the push's
+  /// room, and the push it is landed as left for its caller, or a namespace no key is moved in answered at once.
+  fn pushkey(&mut self, room: u64) -> Progress {
+    let mut admission = Admission::new(self.push_room.map_or(room, |push| push.max(room)));
+    let line = PUSHKEY_LINE.len();
+    let Some(spec) = spec_of(keys::COMMAND) else {
+      return self.answered_out_of_band(Refused::NotServed, line);
+    };
+    let rest = self.input.get(line..).unwrap_or_default();
+    let (arguments, taken) = match ssh::arguments(rest, spec, &mut admission) {
+      Ok(Read::Done(arguments, taken)) => (arguments, taken),
+      Ok(Read::More { needed }) => return self.more(line.saturating_add(needed)),
+      Err(refusal) => return self.end_refused(Refused::Request(refusal)),
+    };
+    let used = line.saturating_add(taken);
+    let request = match keys::request(&arguments, spec) {
+      Ok(request) => request,
+      Err(refused) => return self.answered_out_of_band(refused, used),
+    };
+    let refusal = match keys::bundle(&request, &mut admission) {
+      Ok(bundle) => {
+        let push = Push {
+          heads: HeadsArgument::Force,
+          bundle,
+          admission,
+        };
+        self.push = Pushing::Whole(push, Asked::Pushkey);
+        return self.taken(Step::Answered { refused: None }, used);
+      }
+      Err(refusal) => refusal,
+    };
+    match keys::refused(refusal, &request, &mut admission) {
+      Ok(answer) => {
+        ssh::respond(&answer, &mut self.stdout);
+        let step = Step::Answered {
+          refused: Some(Refused::Pushkey(refusal)),
+        };
+        self.taken(step, used)
+      }
+      Err(past) => self.answered_out_of_band(Refused::from(past), used),
+    }
+  }
+
   /// Answers `refused` out of band, the session going on past the `used` bytes of its request.
   fn answered_out_of_band(&mut self, refused: Refused, used: usize) -> Progress {
     ssh::respond_error(
@@ -390,7 +453,7 @@ impl Stdio {
       Err(refusal) => return self.end_refused(Refused::Request(refusal)),
     };
     let Some(data) = data else {
-      self.push = Pushing::Whole(push);
+      self.push = Pushing::Whole(push, Asked::Unbundle);
       return self.took(used, true);
     };
     if let Err(past) = push.admission.charge(to_u64(data.len())) {
@@ -412,8 +475,8 @@ impl Stdio {
   /// made ([`Stdio::pushed`]) the session serves nothing more.
   pub fn take_push(&mut self) -> Option<Push> {
     match core::mem::take(&mut self.push) {
-      Pushing::Whole(push) => {
-        self.push = Pushing::Landing;
+      Pushing::Whole(push, asked) => {
+        self.push = Pushing::Landing(asked);
         Some(push)
       }
       other => {
@@ -427,7 +490,17 @@ impl Stdio {
   /// `unbundle` over SSH (the module doc's push), each answer's bytes charged to `admission` first; one that cannot be
   /// made is answered out of band. The session then goes on.
   pub fn pushed(&mut self, outcome: &Outcome, admission: &mut Admission) {
-    self.push = Pushing::None;
+    if let Pushing::Landing(Asked::Pushkey) = core::mem::take(&mut self.push) {
+      match keys::answer(outcome, admission) {
+        Ok(answer) => ssh::respond(&answer, &mut self.stdout),
+        Err(past) => ssh::respond_error(
+          &session::message(&Refused::from(past)),
+          &mut self.stdout,
+          &mut self.stderr,
+        ),
+      }
+      return;
+    }
     let framed = match outcome {
       Outcome::Accepted(reply) | Outcome::Refused(reply) => reply
         .encoded_len()
