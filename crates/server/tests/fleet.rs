@@ -21975,7 +21975,10 @@ fn bench_green(owner: &mut Client, daemon_b: &Daemon, name: &str) -> VolumeId {
   green
 }
 
-/// A work over `green` made through `client` holding one file of `bytes` bytes, written an edit at a time.
+/// A work over `green` made through `client` holding one new file of `bytes` bytes, written an edit at a time. The file
+/// is named after the work, so every submit's increment is `bytes` whatever the green already holds: at one shared path,
+/// each run inserted before the last run's bytes, and its increment held all of them (the first release run's growth,
+/// 2026-11-20, was that).
 fn bench_work(client: &mut Client, green: VolumeId, name: &str, bytes: usize) -> VolumeId {
   let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
     green,
@@ -21989,7 +21992,7 @@ fn bench_work(client: &mut Client, green: VolumeId, name: &str, bytes: usize) ->
     let take = (bytes - written).min(BENCH_EDIT_BYTES);
     let edited = client.call(&RequestBody::Edit {
       work,
-      path: "big".to_owned(),
+      path: name.to_owned(),
       at: u64::try_from(written).unwrap(),
       delete_len: 0,
       bytes: piece[..take].to_vec(),
