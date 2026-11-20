@@ -5146,7 +5146,8 @@ fn dispatch_inner(
       (&repository, read),
       (&rules, &hooks, &hooks_env, &signers),
     ),
-    // A Mercurial repository's directory imported into its store, answered when the import ends (A-678).
+    // A Mercurial repository's directory, or a Subversion dump, imported into its store, answered when the import ends
+    // (A-678, A-652 part 3).
     RequestBody::ImportRepository { repository, path } => {
       crate::repository::import::import_repository(state, principal, (&repository, &path))
     }
