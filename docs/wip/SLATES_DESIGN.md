@@ -13858,9 +13858,16 @@ cooperative slices (§4.3).
 > request, before its answer is made, encodes each version whose fragments are not kept (`Repository::first_unencoded`)
 > a turn at a time under the shard's quantum, yielding between turns, and keeps them as content charged to the shard
 > (`crates/server/src/vcs_store/git_encode.rs`); the answer copies them. A version is encoded once, by the first fetch
-> after its push; one encoding a repository at a time, kept in the map between turns. Owed: the encoding from the push's
-> own intake (git's pack reuse, w-git's streaming intake), the base pack's rebuild, kept fragments across a recovery, and
-> the parts' bytes held between turns charged.
+> after its push; one encoding a repository at a time, kept in the map between turns. **Units a window's work (same day,
+> w-k90-vendor, found by use by w-interop):** a 56 MB push of git/git cut at v2.0.0 spun the shard 3.5 s in one unit of
+> the task that finishes the encoding (an object's whole delta trials and ten level samples), and the daemon died into a
+> restart loop. Each unit is now a window's work at most (`slates_git::store::Encoding`'s module doc): a row read, a
+> window of an object or its base read, a step of a delta search, a level sampled on a window, a window deflated, a
+> window put into the content store (`put_window`). Held by work, not wall time (the 56 MB push's encoding, every unit at
+> most a window and one row, the daemon living; `vcs_store::git_encode::tests::a718_no_unit_...`, ignored, its pack
+> named by `SLATES_ENCODE_PACK`). Owed: the encoding from the push's own intake (git's pack reuse, w-git's streaming
+> intake), the base pack's rebuild, kept fragments across a recovery, the parts' bytes held between turns charged, a pair
+> of trees read whole and the parts' record made in one unit.
 
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
@@ -14568,8 +14575,9 @@ signature verification).
 > over the Mercurial arm), each step over the store lent the shard's room and settled after. The push's name is hashed
 > from its repository and its bundle, so a push sent again makes the same works. Its answer is framed as 7.2 frames
 > `unbundle`'s (`serve::http::pushed`): a bundle2 reply in `application/mercurial-0.1`, uncompressed; `pusherr` in
-> `0.1`; a bundle1 out of band. HTTP's capabilities list `unbundle` and the bundle2 capabilities a push needs as 7.2
-> lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
+> `0.1`; a bundle1 out of band. A `pushkey` command is landed as a push of one advisory `pushkey` part through the same
+> driver and answered `1` or `0` (A-758, `serve::keys`). HTTP's capabilities list `pushkey`, `unbundle` and the bundle2
+> capabilities a push needs as 7.2 lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
 > `pushkey`). Differs from 7.2 on purpose: the `output` parts in which 7.2 captures its own progress words over HTTP
 > (`adding changesets`, `added 1 changesets with 1 changes to 1 files`) are not sent; they are no part a client acts on.
 > Not yet durable: a push's entry records its lines', bookmarks' and phase roots' moves and no record of its revisions,
@@ -56574,8 +56582,15 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   (`measure_the_delta_append_turn`). Tests: `a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once`; the fleet
   test `a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own` (a three-MiB staged write, one publication), red
   before (no build, no hashing turn), at least 48 hashing turns after.
-- **Owed.** Part 3: the body held once, by identity in the content store (A-727) or an arena handle, so the retained
-  entry and the volume's whole state name one copy.
+- **Part 3 (the body held once).** One owner and lends, no `Arc` (R2): the payload moves into the shipper at the
+  append (no clone), `Shipper::keep` names the whole entry the owner keeps as its last whole state, `trim` moves that
+  entry to a kept slot when the retained tail lets it go, and `Shipper::payload_at` lends it from either place.
+  `LiveVolume::whole` is a `WholeState`: `InLog(head)`, lent by the shipper, or `Image(head, bytes)`, an install image
+  made beside the log, which is not an entry. The content store (A-727) was not used: a live log's payload is an
+  in-memory shipping buffer, not durable content. Release, 50 volumes' 2.4 MB whole states held at rest: peak RSS 248.9
+  to 249.0 MB before, 127.7 MB after (`measure_whole_states_held_twice` and `_once`, ignored measurements). Tests:
+  `a_kept_whole_state_is_lent_after_the_retained_tail_lets_it_go`; the fleet `live`, `whole` and `install` tests and the
+  live_chaos fresh-member flow (2/2) send installs from the lent payload.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither

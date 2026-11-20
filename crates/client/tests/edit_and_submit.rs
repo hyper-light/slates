@@ -57,11 +57,9 @@ fn deadlines() -> Deadlines {
 }
 
 fn connect(instance: &str) -> Client {
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(e) => panic!("{e}"),
-    }
+  match Client::connect(instance, deadlines()) {
+    Ok(client) => client,
+    Err(e) => panic!("{e}"),
   }
 }
 

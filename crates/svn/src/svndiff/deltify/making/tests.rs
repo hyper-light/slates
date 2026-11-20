@@ -18,7 +18,7 @@ const ENCODINGS: [(Version, Compression); 3] = [
 
 /// The deltifier's window of `target` against `source`, whole, and its encoding whole.
 fn whole(source: &[u8], target: &[u8], (version, compression): (Version, Compression)) -> Vec<u8> {
-  let room = NonZeroUsize::new(WINDOW_LIMIT as usize).unwrap();
+  let room = NonZeroUsize::new(window_limit()).unwrap();
   let window = if source.is_empty() {
     Window {
       source_offset: 0,
@@ -59,11 +59,17 @@ fn made(
   (making.made().unwrap().bytes(), steps + 1)
 }
 
+/// The window limit as a length.
+fn window_limit() -> usize {
+  usize::try_from(WINDOW_LIMIT).unwrap()
+}
+
 /// Bytes that repeat no 64-byte block: a counter's low bytes, scrambled.
 fn varied(count: usize, seed: u32) -> Vec<u8> {
   (0..count)
     .map(|place| {
-      ((place as u32)
+      (u32::try_from(place & 0xFFFF_FFFF)
+        .unwrap()
         .wrapping_mul(2_654_435_761)
         .wrapping_add(seed)
         >> 13)
@@ -85,14 +91,14 @@ fn edited(source: &[u8], every: usize) -> Vec<u8> {
   );
   let quarter = target.len() / 4;
   target.drain(quarter..(quarter + 300).min(target.len()));
-  target.truncate(WINDOW_LIMIT as usize);
+  target.truncate(window_limit());
   target
 }
 
 /// The texts made by hand: empty and short pieces, no source, equal texts, a common start and end alone, a source
 /// repeated in the target, moved blocks, and a full window edited lightly and heavily.
 fn cases() -> Vec<(Vec<u8>, Vec<u8>)> {
-  let full = varied(WINDOW_LIMIT as usize, 3);
+  let full = varied(window_limit(), 3);
   let mut moved = full[50_000..].to_vec();
   moved.extend_from_slice(&full[..50_000]);
   let mut repeated = varied(4_000, 8);
@@ -100,7 +106,7 @@ fn cases() -> Vec<(Vec<u8>, Vec<u8>)> {
   repeated.extend(repeated.clone());
   vec![
     (Vec::new(), b"new text".to_vec()),
-    (Vec::new(), varied(WINDOW_LIMIT as usize, 1)),
+    (Vec::new(), varied(window_limit(), 1)),
     (b"abc".to_vec(), b"abd".to_vec()),
     (
       b"same prefix, other end".to_vec(),
@@ -146,8 +152,8 @@ const STEP_WORK: usize = 256;
 /// change: the window was made in one call, its units the whole window's.
 #[test]
 fn a_large_texts_window_is_made_with_no_step_past_its_budget() {
-  let source = varied(WINDOW_LIMIT as usize, 11);
-  for target in [edited(&source, 997), varied(WINDOW_LIMIT as usize, 12)] {
+  let source = varied(window_limit(), 11);
+  for target in [edited(&source, 997), varied(window_limit(), 12)] {
     for encoding in ENCODINGS {
       let expected = whole(&source, &target, encoding);
       let mut making =
@@ -187,7 +193,7 @@ fn pieces_it_was_not_made_for_are_refused() {
   assert!(
     WindowMaking::new(
       (0, 0),
-      WINDOW_LIMIT as usize + 1,
+      window_limit() + 1,
       Version::Zero,
       Compression::Stored
     )
@@ -202,10 +208,10 @@ proptest! {
   /// repeat, and edits of the source) under a generated unit, in each encoding. Expect: the whole window's bytes.
   #[test]
   fn a_generated_window_is_the_whole_windows_bytes(
-    source in prop_oneof![
-      proptest::collection::vec(0u8..3, 0..2_000),
-      proptest::collection::vec(any::<u8>(), 0..2_000),
-    ],
+    source in proptest::strategy::Union::new([
+      proptest::collection::vec(0u8..3, 0..2_000).boxed(),
+      proptest::collection::vec(any::<u8>(), 0..2_000).boxed(),
+    ]),
     edits in proptest::collection::vec((any::<usize>(), any::<u8>()), 0..20),
     tail in proptest::collection::vec(0u8..3, 0..300),
     work in 1usize..200,

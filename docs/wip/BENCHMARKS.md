@@ -15226,3 +15226,48 @@ blocks as the sink, the increment setting the path from the held identity, the r
   part 3, is the one left in one step).
 - **Cost:** the paced build (async deriver, merge sort, indexed base) builds a 3,500-file push in 85 ms where the
   one-call form took 66 ms (merge-level probe of the whole build, debug, unbounded pace).
+
+## Mercurial's own repository imported: the record 7.8 times smaller in three steps, the landing still one step (A-727, A-732, S5; UI goal 93; 2026-11-20)
+
+- **Machine:** Mac Studio `adas-mac-studio.local-2` (32 cores, 96 GiB), 2026-11-20 04:26 to 07:57 UTC, shared (other
+  agents' builds), not quiesced.
+- **Builds** (release, `cargo build --locked --release -p slates-cli`, each with one bench-only line printing the
+  import record's length after `writer.finish()` in `vcs_store::hg_import`, not committed):
+  A = b1d001601 (before S5's import half: file texts and manifests whole);
+  B = de381e643 (main with w-hg's 98bcb0002: manifests as delta and base; A-740's task names);
+  C = de49b6bd4 (w-hg's file revisions as one hunk against the previous revision in their log).
+- **Command:** `~/.cache/w-perf/ab.sh 3` (A and B interleaved, the order flipped each round) and
+  `VARIANTS=C ab2.sh 3` after, cap 1,800 s an import (`perl alarm`): a fresh anchor and daemon a run, `slates
+  repository create mercurial --tool hg`, then `slates repository import mercurial ~/.cache/w-perf/hg-src`
+  (Mercurial's own repository). Peak RSS is the largest resident set of the instance's processes other than the anchor
+  (the daemon, through restarts), sampled every 200 ms. Logs and timestamps: `~/.cache/w-perf/ab/20261120T042601/` and
+  `.../20261120T072703/` on the Studio.
+
+| run | exit | wall (s) | peak RSS (KiB) | record (bytes) | spins |
+|---|---|---|---|---|---|
+| A-1 | cap (142) | 1,800.2 | 23,969,952 | 10,049,541,313 | 6 |
+| A-2 | cap (142) | 1,800.2 | 23,886,736 | 10,049,541,313 | 6 |
+| A-3 | cap (142) | 1,800.2 | 23,883,024 | 10,049,541,313 | 8 |
+| B-1 | cap (142) | 1,800.2 | 10,076,352 | 4,657,833,574 | 9 |
+| B-2 | cap (142) | 1,800.2 | 10,079,408 | 4,657,833,574 | 8 |
+| B-3 | cap (142) | 1,800.2 | 10,215,616 | 4,657,833,574 | 8 |
+| C-1 | refused (1) | 502.4 | 11,280,928 | 1,295,268,184 | 3 |
+| C-2 | refused (1) | 161.8 | 10,727,136 | 1,295,268,184 | 1 |
+| C-3 | refused (1) | 154.8 | 10,996,336 | 1,295,268,184 | 1 |
+
+Best of three: A 23,883,024 KiB and a 10.05 GB record; B 10,076,352 KiB (2.4 times less) and 4.66 GB (2.2 times); C
+10,727,136 KiB and 1.30 GB (7.8 times less than A).
+
+What it means: the import's turns run 150 to 250 s every time; the record is what fails. In A and B the landing appends
+the whole record as one entry in one step (`repository/import.rs:235`'s task): the shard spins 1.0 to 1.2 s, the anchor
+restarts the daemon, recovery serves within 100 ms, and the CLI's retry imports again from the start, every cycle
+until the cap. C's record still spins its landing once, then the retry is refused, typed, at the next wall:
+`Unpublished { reason: "record 2 not published, transaction rolled back: the partition's state, 1295269070 bytes
+encoded, does not fit its 746950834-byte snapshot slot" }`. Two walls are left, both the record's: the one-step append
+of a 1.3 GB entry, and the partition snapshot that carries every retained record (A-727: records naming identities,
+their bytes in the content plane). Peak RSS does not follow the record from B to C: it is the import's working set.
+
+### The lend's swap, release (A-727 slice a2)
+`vcs_store::arena_windows::tests::wperf_swap_cost_probe` (bench-only, not committed) in a release test build of B's
+tree on the same Studio: a `ContentStore::lend_in` and `hand_back` pair costs **38.83 ns** over 10,000,000 pairs after
+100,000 to warm (`ChunkStore` 560 bytes, moved by `mem::swap` both ways).

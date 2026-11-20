@@ -9,6 +9,7 @@
 #   SOURCE_REPOSITORY: a local Mercurial repository (a clone of hg's own, say); PUSH_REV (default every head) names
 #   what the first push sends, e.g. PUSH_REV=6.0 for a cut of its history.
 #   HG: the command that runs stock hg 7.2 (default `hg`).
+#   SSH_VERBOSE: when set, ssh runs with -vv, its trace in each SSH row's log.
 #   WORK_DIRECTORY: scratch, made empty first.
 # Exit: 0 when every row passes, 1 otherwise. Never writes outside WORK_DIRECTORY (the anchor's instance aside).
 set -u
@@ -72,7 +73,7 @@ slates.prefix = http://127.0.0.1:$HTTP/
 slates.username = slates
 slates.password = $TOKEN
 [ui]
-ssh = ssh -F /dev/null -i $WORK/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$WORK/known_hosts -o GlobalKnownHostsFile=/dev/null
+ssh = ssh ${SSH_VERBOSE:+-vv} -F /dev/null -i $WORK/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$WORK/known_hosts -o GlobalKnownHostsFile=/dev/null
 [extensions]
 rebase =
 EOF
@@ -91,7 +92,8 @@ row log "${HG[@]}" -R a log -l 1000 --stat -T '{node}\n'
 row log-graph "${HG[@]}" -R a log -G -l 2000 -T '{rev}\n'
 row annotate bash -c "cd a && ${HG[*]} annotate \$(${HG[*]} files 'glob:**.py' | head -1)"
 row diff "${HG[@]}" -R a diff -r 'tip~50' -r tip --stat
-row bookmark-push bash -c "cd a && ${HG[*]} bookmark matrix-bm && ${HG[*]} push -B matrix-bm"
+row bookmark-push bash -c "cd a && ${HG[*]} bookmark matrix-bm && { ${HG[*]} push -B matrix-bm; [ \$? -le 1 ]; } \
+  && ${HG[*]} debugpushkey $URL bookmarks | grep -q '^matrix-bm'"
 row tag-push bash -c "cd a && ${HG[*]} tag matrix-v1 && ${HG[*]} push"
 row branch-push bash -c "cd a && ${HG[*]} branch matrix-branch && echo b >matrix.txt && ${HG[*]} commit -qAm branch \
   && ${HG[*]} push --new-branch -r ."

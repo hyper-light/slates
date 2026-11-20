@@ -136,14 +136,17 @@ pub struct Usage {
   /// Block-cipher blocks encrypted or decrypted: AES-GCM's padded plaintext over 16, and its tag's block. ChaCha20 is a
   /// stream cipher and counts none.
   pub blocks: u64,
+  /// Bytes of packets sealed or opened, each its length field and what it names (RFC 4253 §9's "transmitted data").
+  pub bytes: u64,
 }
 
 impl Usage {
-  /// This usage and one packet more of `blocks` blocks.
-  pub fn after(self, blocks: u64) -> Usage {
+  /// This usage and one packet more of `blocks` blocks and `bytes` bytes.
+  pub fn after(self, blocks: u64, bytes: u64) -> Usage {
     Usage {
       packets: self.packets.saturating_add(1),
       blocks: self.blocks.saturating_add(blocks),
+      bytes: self.bytes.saturating_add(bytes),
     }
   }
 }
@@ -362,7 +365,7 @@ impl Sealer {
   /// The usage after one more packet carrying `payload_len` bytes, what [`Sealer::seal`] would count; none if no packet
   /// can carry it.
   pub fn usage_after(&self, payload_len: usize) -> Option<Usage> {
-    layout(self.cipher(), payload_len).map(|shape| self.usage.after(shape.blocks))
+    layout(self.cipher(), payload_len).map(|shape| self.usage.after(shape.blocks, shape.bytes()))
   }
 
   /// Seals `payload` as the next packet and appends it to `out`.
@@ -382,7 +385,7 @@ impl Sealer {
       out.truncate(start);
       return Err(refusal);
     }
-    self.usage = self.usage.after(shape.blocks);
+    self.usage = self.usage.after(shape.blocks, shape.bytes());
     self.sequence = self.sequence.wrapping_add(1);
     Ok(())
   }
@@ -423,6 +426,13 @@ struct Shape {
   padding: u8,
   /// The block-cipher blocks it costs its key.
   blocks: u64,
+}
+
+impl Shape {
+  /// The packet's bytes: its length field and what it names.
+  fn bytes(&self) -> u64 {
+    to_u64(LENGTH_LEN).saturating_add(u64::from(self.packet_length))
+  }
 }
 
 /// The shape of a packet carrying `payload_len` bytes under `cipher` (none in the clear), or none if it would pass
@@ -639,7 +649,7 @@ impl Opener {
       _ => 0,
     };
     let sequence = self.sequence;
-    self.usage = self.usage.after(blocks);
+    self.usage = self.usage.after(blocks, to_u64(plain_end));
     self.sequence = self.sequence.wrapping_add(1);
     Ok(Opened { sequence, payload })
   }

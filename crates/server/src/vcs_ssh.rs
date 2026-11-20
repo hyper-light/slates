@@ -55,9 +55,10 @@
 //! ends. A refused `exec` is answered as its tool's program refuses: the message on standard error, then its exit
 //! status. One command output run, and one client input run, a turn (§4.3): the task yields after each.
 //!
-//! **The key time** (A-594's row of §4.17.2's tunables): each session's key is replaced by time at the tail of the
-//! lifetimes this edge's authenticated connections lived (RFC 6298's estimator), the hour before any
-//! (`slates_ssh::keylife::key_time_limit_ns`). Only a connection that ended as its client ended it is a sample.
+//! **The key time** (RFC 4253 §9; A-745): each session's key is replaced after a gigabyte of data each way or an hour,
+//! whichever comes first (`slates_ssh::keylife`), and at any client's request; every exchange after the first is
+//! logged with what started it. A-594 had learned the time from earlier connections' lifetimes, which put long
+//! transfers on a rekey every few seconds after one short session.
 //!
 //! **The daemon's edge** ([`daemon_edge`], A-684): `--vcs-ssh ADDRESS` starts it, its listener on the control shard and
 //! an edge state kept on every shard, so a connection moves to its repository's owner; its listener and host key held
@@ -86,7 +87,6 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::task::{Poll, Waker};
 
-use slates_cluster::failover::RunningDuration;
 use slates_db::catalog::Principal;
 use slates_rt::TaskId;
 use slates_rt::error::RtError;
@@ -96,7 +96,7 @@ use slates_rt::tcp::{OwnedStream, TcpListener, TcpStream};
 use slates_ssh::command::Command as Asked;
 use slates_ssh::entropy::SystemEntropy;
 use slates_ssh::hostkey::{ED25519_SEED_LEN, HostKey};
-use slates_ssh::keylife::{UsageCap, key_time_limit_ns};
+use slates_ssh::keylife::{RECOMMENDED_KEY_TIME_NS, UsageCap};
 use slates_ssh::packet::MAX_PACKET_EVERY_PEER_ACCEPTS;
 use slates_ssh::session::{Session, SessionConfig, SessionEvent};
 use slates_ssh::transport::TransportConfig;
@@ -249,7 +249,6 @@ pub(crate) struct EdgeState {
   /// Every phase's learned waits.
   waits: RefCell<PhaseWaits>,
   /// How long the authenticated connections lived.
-  lifetimes: RefCell<RunningDuration>,
   /// The counts.
   counts: Cell<Counts>,
 }
@@ -275,7 +274,6 @@ impl EdgeState {
       waiting: RefCell::new(Vec::new()),
       arriving: Cell::new(0),
       waits: RefCell::new(PhaseWaits::default()),
-      lifetimes: RefCell::new(RunningDuration::new()),
       counts: Cell::new(Counts::default()),
     }
   }
@@ -310,14 +308,10 @@ impl EdgeState {
       .map_or(0, |waits| waits.generation(phase))
   }
 
-  /// Derived: the key time a new session's key is replaced at (the module doc).
+  /// The key time a new session's key is replaced at: RFC 4253 §9's hour (the module doc), whatever earlier sessions
+  /// lived.
   pub(crate) fn key_time_ns(&self) -> u64 {
-    let tail = self
-      .lifetimes
-      .try_borrow()
-      .ok()
-      .and_then(|lifetimes| lifetimes.tail_ns());
-    key_time_limit_ns(tail)
+    RECOMMENDED_KEY_TIME_NS
   }
 
   /// Changes the counts.
@@ -1482,26 +1476,18 @@ impl Drop for Arriving {
   }
 }
 
-/// Counts how a connection ended, and its lifetime when it was proven and ended as its client meant. Called before its
+/// Counts how a connection ended. Called before its
 /// socket closes, so its client cannot see the end before the count.
 fn ended<S: SshSite>(link: &Link<S>, why: Why) {
   if why == Why::Failed {
     crate::fleet::count_refusal(SOCKET_FAILED);
   }
-  let lifetime_ns = now_ns().saturating_sub(link.accepted_ns);
-  let proven = link.tracker.proven();
   let _ = link.state.with(|state| {
     state.count(|counts| match why {
       Why::Failed => counts.failed = counts.failed.saturating_add(1),
       Why::Refused => counts.refused = counts.refused.saturating_add(1),
       Why::Closed => {}
     });
-    if proven
-      && why == Why::Closed
-      && let Ok(mut lifetimes) = state.lifetimes.try_borrow_mut()
-    {
-      lifetimes.on_sample(lifetime_ns);
-    }
   });
 }
 

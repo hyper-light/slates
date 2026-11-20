@@ -214,6 +214,49 @@ impl Reply {
     }
   }
 
+  /// Whether the key of pushkey part `id` moved, as the reply's `reply:pushkey` answering it says; `None` where the
+  /// reply holds none for it (A-758: the `pushkey` command's answer, `crate::serve::keys`).
+  pub fn pushkey_moved(&self, id: u32) -> Option<bool> {
+    let id = id_text(id);
+    let param = |part: &Written, name: &[u8]| {
+      part
+        .params
+        .iter()
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.clone())
+    };
+    self
+      .parts
+      .iter()
+      .filter(|part| part.kind == REPLY_PUSHKEY)
+      .find(|part| param(part, IN_REPLY_TO).as_ref() == Some(&id))
+      .and_then(|part| param(part, b"return"))
+      .map(|moved| moved == number(1))
+  }
+
+  /// The words of the reply's error parts, a line each: an abort's or a race's `message`, else the part's type (A-758:
+  /// what the `pushkey` command answers a refused key with, which its client prints after `remote: `).
+  pub fn error_lines(&self) -> Vec<u8> {
+    let mut lines = Vec::new();
+    for part in &self.parts {
+      let errors = [
+        ERROR_ABORT,
+        ERROR_PUSHRACED,
+        ERROR_PUSHKEY,
+        ERROR_UNSUPPORTED,
+      ];
+      if !errors.contains(&part.kind) {
+        continue;
+      }
+      match part.params.iter().find(|(key, _)| *key == b"message") {
+        Some((_, message)) => lines.extend_from_slice(message),
+        None => lines.extend(part.kind.to_ascii_lowercase()),
+      }
+      lines.push(b'\n');
+    }
+    lines
+  }
+
   /// The written reply's length, for a caller that charges it first.
   pub fn encoded_len(&self) -> Result<u64, EncodeRefusal> {
     self.bundle().encoded_len()

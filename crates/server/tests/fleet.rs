@@ -14046,18 +14046,8 @@ const STAGED_DELTA_BYTES: usize = BUILT_VOLUME_FILES * BURST_VOLUME_FILE_BYTES;
 /// Shape: one `StagePut`'s bytes: under the test client's 4 KiB ring slot with the request's framing.
 const STAGE_PUT_BYTES: usize = 3 << 10;
 
-/// A-757 part 2b (w-forming, 2026-11-20; found by use: a 1.8 to 2.5 MB delta sealed and appended in its publication's
-/// one turn, 128 to 331 ms of a debug owner shard's CPU, 1.39 ms in release for 2.4 MB). Do: three nodes at `f = 1`; on a,
-/// a small live-shipped volume; cut a's seal turns to a page (`Daemon::inject_seal_walk_quantum(Some(0))`); stage three
-/// MiB and write them as one file (`FsWriteStaged`), one publication. Expect the write answered at durability, its delta
-/// sealed and hashed by a build of its own over at least the content's bytes over a page in turns, and a's log durable at
-/// its head with both holders there. Before, the delta was sealed and hashed in the turn that published it.
-#[test]
-fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
-  let _serial = serialize_fleet_tests();
-  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
-  let owner = daemons[0].instance().to_owned();
-  let mut client = Client::connect(&owner);
+/// A volume `client` makes on the owner, written once, set live-shipped, and written again: its id and attachment.
+fn live_shipped_between_small_writes(client: &mut Client) -> (VolumeId, u64) {
   let ReplyBody::Created { id } = client.call(&RequestBody::Create {
     name: "large-delta".to_owned(),
     size: SizeClass::Bounded {
@@ -14069,7 +14059,7 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
   }) else {
     panic!("the volume was created");
   };
-  let attachment = write_attachment(&mut client, id);
+  let attachment = write_attachment(client, id);
   let first = client.call(&RequestBody::FsWrite {
     volume: id,
     attachment,
@@ -14094,6 +14084,11 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
     mode: 0o644,
   });
   assert!(matches!(second, ReplyBody::FsDone { .. }), "{second:?}");
+  (id, attachment)
+}
+
+/// The large content staged on `id`'s staging buffer, a put at a time: the buffer's token.
+fn staged_large_content(client: &mut Client, id: VolumeId) -> u64 {
   let len = u64::try_from(STAGED_DELTA_BYTES).unwrap();
   let ReplyBody::Staged { token } = client.call(&RequestBody::StageBegin { work: id, len }) else {
     panic!("a staging buffer of {len} bytes");
@@ -14110,6 +14105,23 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
     });
     assert!(matches!(put, ReplyBody::StagePutDone { .. }), "{put:?}");
   }
+  token
+}
+
+/// A-757 part 2b (w-forming, 2026-11-20; found by use: a 1.8 to 2.5 MB delta sealed and appended in its publication's
+/// one turn, 128 to 331 ms of a debug owner shard's CPU, 1.39 ms in release for 2.4 MB). Do: three nodes at `f = 1`; on a,
+/// a small live-shipped volume; cut a's seal turns to a page (`Daemon::inject_seal_walk_quantum(Some(0))`); stage three
+/// MiB and write them as one file (`FsWriteStaged`), one publication. Expect the write answered at durability, its delta
+/// sealed and hashed by a build of its own over at least the content's bytes over a page in turns, and a's log durable at
+/// its head with both holders there. Before, the delta was sealed and hashed in the turn that published it.
+#[test]
+fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let (id, attachment) = live_shipped_between_small_writes(&mut client);
+  let token = staged_large_content(&mut client, id);
   let counts = |daemon: &Daemon| {
     [LIVE_DELTA_BUILDS, LIVE_WHOLE_HASH_TURNS].map(|kind| refusal_count(daemon, kind).unwrap())
   };
@@ -21622,6 +21634,34 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
   assert_answered_once_replicated(&answer, settled, replica_after, &works_bytes);
 }
 
+/// After B's restart its work was served again (`served`, the last read `last`) with its edit, replayed over B's
+/// replica, and its submit committed version 2.
+fn assert_served_again_with_its_edit(
+  (served, last): (bool, &HeadBytes),
+  replayed: &Result<Option<u64>, ObserveError>,
+  submitted: &ReplyBody,
+) {
+  assert!(
+    served,
+    "the work was served again after the restart: {last:?}"
+  );
+  assert_eq!(*last, Ok(b"hello world".to_vec()), "with its edit");
+  assert!(
+    matches!(replayed, Ok(Some(count)) if *count >= 1),
+    "replayed over B's replica: {replayed:?}"
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "its submit committed: {submitted:?}"
+  );
+}
+
 /// A-697 part e, A-207 (a work comes back from its log after a restart), A-313 (a holder's replica is rebuilt from the
 /// records it holds): on a settled three-node fleet at `f = 1` whose nodes keep their state across a restart, A owns a
 /// green at version 1 (`f` holding "hello") shared with B, and B, serving works over greens A owns (the test hook),
@@ -21697,25 +21737,7 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
   settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
   let (green, owners_work) = green_and_work_on(daemons[0].instance(), &[&daemons[1]]);
   let mut owner = Client::connect(daemons[0].instance());
-  let edited = owner.call(&RequestBody::Edit {
-    work: owners_work,
-    path: "f".to_owned(),
-    at: 0,
-    delete_len: 0,
-    bytes: b"hello".to_vec(),
-  });
-  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
-  assert!(
-    matches!(
-      submitted,
-      ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }
-    ),
-    "{submitted:?}"
-  );
+  at_version_one(&mut owner, owners_work);
   drop(owner);
   let refs: Vec<&Daemon> = daemons.iter().collect();
   let replicated = poll_until(&refs, PLACEMENT_DEADLINE, || {
@@ -21724,13 +21746,7 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
   assert!(replicated, "B replicates the green at version 1");
   daemons[1].serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
-  let created = holder.call(&RequestBody::CreateWork {
-    green,
-    name: "holders-work".to_owned(),
-  });
-  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
-    panic!("B made the work at base 1: {created:?}");
-  };
+  let work = holders_work_at_base_one(&mut holder, green);
   let edited = holder.call(&RequestBody::Edit {
     work,
     path: "f".to_owned(),
@@ -21768,25 +21784,31 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
   for daemon in daemons {
     daemon.stop();
   }
-  assert!(
-    served,
-    "the work was served again after the restart: {last:?}"
-  );
-  assert_eq!(last, Ok(b"hello world".to_vec()), "with its edit");
-  assert!(
-    matches!(replayed, Ok(Some(count)) if count >= 1),
-    "replayed over B's replica: {replayed:?}"
-  );
+  assert_served_again_with_its_edit((served, &last), &replayed, &submitted);
+}
+
+/// B's work rebased onto version 2, mapped once on B's replica, reading `f` as version 2 holds it and keeping its own
+/// `g`, and A's floor for it risen to 2.
+fn assert_rebased_on_the_replica(
+  rebased: &ReplyBody,
+  rebased_on_replica: u64,
+  (f, g): (&HeadBytes, &HeadBytes),
+  floor_rose: bool,
+) {
   assert!(
     matches!(
-      submitted,
-      ReplyBody::Submitted {
+      rebased,
+      ReplyBody::Rebased {
         version: Some(2),
         ..
       }
     ),
-    "its submit committed: {submitted:?}"
+    "the work rebased onto version 2: {rebased:?}"
   );
+  assert_eq!(rebased_on_replica, 1, "mapped on B's replica");
+  assert_eq!(*f, Ok(b"hello, there".to_vec()), "f as version 2 holds it");
+  assert_eq!(*g, Ok(b"mine".to_vec()), "the work keeps its own file");
+  assert!(floor_rose, "A's floor for the work rose to 2");
 }
 
 /// A-697 (a holder's work rebased over the holder's replica; A-658: a rebase is a pure function of the versions it maps
@@ -21821,37 +21843,21 @@ fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
   assert_eq!(version_of(&first), Some(1), "{first:?}");
   daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let created = holder.call(&RequestBody::CreateWork {
-    green,
-    name: "holders-work".to_owned(),
-  });
-  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
-    panic!("B made the work at base 1: {created:?}");
-  };
+  let work = holders_work_at_base_one(&mut holder, green);
   let wrote = edit(&mut holder, work, "g", 0, b"mine");
   assert!(matches!(
     edit(&mut owner, owners_work, "f", 5, b", there"),
     ReplyBody::Edited
   ));
   let second = owner.call(&RequestBody::submit(owners_work, Vec::new()));
-  let rebased_before = daemon_b
-    .refusals_on_every_shard()
-    .unwrap()
-    .get("merge.work.rebased_on_replica")
-    .copied()
-    .unwrap_or(0);
+  let rebased_before = count_on(&daemon_b, "merge.work.rebased_on_replica").unwrap();
   let both = [&daemon_a, &daemon_b];
   let replica_at_two = poll_until(&both, PLACEMENT_DEADLINE, || {
     Ok(daemon_b.merge_holder_state(green)?.version == Some(2))
   });
   let rebased = holder.call(&RequestBody::Rebase { work });
-  let rebased_on_replica = daemon_b
-    .refusals_on_every_shard()
-    .unwrap()
-    .get("merge.work.rebased_on_replica")
-    .copied()
-    .unwrap_or(0)
-    - rebased_before;
+  let rebased_on_replica =
+    count_on(&daemon_b, "merge.work.rebased_on_replica").unwrap() - rebased_before;
   let f = head_bytes(&mut holder, work, "f");
   let g = head_bytes(&mut holder, work, "g");
   let floor_rose = poll_until(&both, PLACEMENT_DEADLINE, || {
@@ -21863,20 +21869,7 @@ fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
   assert!(matches!(wrote, ReplyBody::Edited), "{wrote:?}");
   assert_eq!(version_of(&second), Some(2), "{second:?}");
   assert!(replica_at_two, "B's replica took version 2");
-  assert!(
-    matches!(
-      rebased,
-      ReplyBody::Rebased {
-        version: Some(2),
-        ..
-      }
-    ),
-    "the work rebased onto version 2: {rebased:?}"
-  );
-  assert_eq!(rebased_on_replica, 1, "mapped on B's replica");
-  assert_eq!(f, Ok(b"hello, there".to_vec()), "f as version 2 holds it");
-  assert_eq!(g, Ok(b"mine".to_vec()), "the work keeps its own file");
-  assert!(floor_rose, "A's floor for the work rose to 2");
+  assert_rebased_on_the_replica(&rebased, rebased_on_replica, (&f, &g), floor_rose);
 }
 
 /// A-697 (a copy a holder's work declares, composed over the holder's replica; A-626): in a two-node `f = 1` fleet, A
@@ -21890,43 +21883,11 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
   let (_ports, _daemon_a, daemon_b, instance_a) = two_node_fleet();
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
-  let edited = owner.call(&RequestBody::Edit {
-    work: owners_work,
-    path: "f".to_owned(),
-    at: 0,
-    delete_len: 0,
-    bytes: b"hello".to_vec(),
-  });
-  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-  let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
-  assert!(
-    matches!(
-      first,
-      ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }
-    ),
-    "{first:?}"
-  );
+  at_version_one(&mut owner, owners_work);
   daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let created = holder.call(&RequestBody::CreateWork {
-    green,
-    name: "holders-work".to_owned(),
-  });
-  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
-    panic!("B made the work at base 1: {created:?}");
-  };
-  let composed = |daemon: &Daemon| {
-    daemon
-      .refusals_on_every_shard()
-      .unwrap()
-      .get("merge.work.composed_on_replica")
-      .copied()
-      .unwrap_or(0)
-  };
-  let before = composed(&daemon_b);
+  let work = holders_work_at_base_one(&mut holder, green);
+  let before = count_on(&daemon_b, "merge.work.composed_on_replica").unwrap();
   let declared = holder.call(&RequestBody::Declare {
     work,
     op: slates_ipc::protocol::WorkOp::Copy {
@@ -21937,13 +21898,10 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
     },
   });
   let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
-  let composed_here = composed(&daemon_b) - before;
+  let composed_here = count_on(&daemon_b, "merge.work.composed_on_replica").unwrap() - before;
   let copied = head_bytes(&mut owner, green, "f2");
   daemon_b.serve_works_on_holders(false).unwrap();
-  assert!(
-    matches!(declared, ReplyBody::Declared { .. }),
-    "{declared:?}"
-  );
+  assert!(matches!(declared, ReplyBody::Declared), "{declared:?}");
   assert!(
     matches!(
       submitted,
@@ -21959,6 +21917,69 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
     "composed on B's replica: {composed_here}"
   );
   assert_eq!(copied, Ok(b"hello".to_vec()), "A's green holds the copy");
+}
+
+/// Whether A (`daemons[0]`) holds no floor of `green` for any of `admitted` within the placement deadline.
+fn floors_released(daemons: &[Daemon], green: VolumeId, admitted: &[VolumeId]) -> bool {
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  poll_until(&refs, PLACEMENT_DEADLINE, || {
+    let floors = daemons[0].work_floors_of(green)?;
+    Ok(
+      admitted
+        .iter()
+        .all(|work| floors.iter().all(|(held, _)| held != work)),
+    )
+  })
+}
+
+/// Each of `daemon`'s partitions loses the next answer its green's owner gives.
+fn lose_every_next_owner_answer(daemon: &Daemon) {
+  for partition in 0..u16::try_from(daemon.shards().len()).unwrap() {
+    daemon.lose_next_owner_answer(partition).unwrap();
+  }
+}
+
+/// The lost creation answered `Overloaded` and A holding its one floor (`admitted`, of `floors_after_loss`); after B's
+/// restart the floor released, B's count moved; and the name made again at a new id.
+fn assert_released_after_the_restart<F: std::fmt::Debug>(
+  lost: &ReplyBody,
+  (admitted, floors_after_loss): (&[VolumeId], &F),
+  (released, released_count): (bool, &Result<Option<u64>, ObserveError>),
+  made: &ReplyBody,
+) {
+  assert!(
+    matches!(
+      lost,
+      ReplyBody::Refused {
+        refusal: Refusal::Overloaded { .. }
+      }
+    ),
+    "the creation's answer was lost: {lost:?}"
+  );
+  assert_eq!(
+    admitted.len(),
+    1,
+    "A recorded the lost creation's floor: {floors_after_loss:?}"
+  );
+  assert_released_and_made_again((released, released_count), admitted, made);
+}
+
+/// After B's restart: A released the floor and B's count moved, and the name was made again at an id none of
+/// `admitted`.
+fn assert_released_and_made_again(
+  (released, released_count): (bool, &Result<Option<u64>, ObserveError>),
+  admitted: &[VolumeId],
+  made: &ReplyBody,
+) {
+  assert!(released, "A released the floor after B's restart");
+  assert!(
+    matches!(released_count, Ok(Some(count)) if *count >= 1),
+    "B released it: {released_count:?}"
+  );
+  assert!(
+    matches!(made, ReplyBody::WorkCreated { id, base: 1 } if !admitted.contains(id)),
+    "the name made again, at a new id: {made:?}"
+  );
 }
 
 /// A-697 part e2 (a holder creation a restart caught waiting for its admission releases the owner's floor before it is
@@ -22036,25 +22057,7 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
   settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
   let (green, owners_work) = green_and_work_on(daemons[0].instance(), &[&daemons[1]]);
   let mut owner = Client::connect(daemons[0].instance());
-  let edited = owner.call(&RequestBody::Edit {
-    work: owners_work,
-    path: "f".to_owned(),
-    at: 0,
-    delete_len: 0,
-    bytes: b"hello".to_vec(),
-  });
-  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
-  assert!(
-    matches!(
-      submitted,
-      ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }
-    ),
-    "{submitted:?}"
-  );
+  at_version_one(&mut owner, owners_work);
   drop(owner);
   let refs: Vec<&Daemon> = daemons.iter().collect();
   let replicated = poll_until(&refs, PLACEMENT_DEADLINE, || {
@@ -22062,9 +22065,7 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
   });
   assert!(replicated, "B replicates the green at version 1");
   daemons[1].serve_works_on_holders(true).unwrap();
-  for partition in 0..u16::try_from(daemons[1].shards().len()).unwrap() {
-    daemons[1].lose_next_owner_answer(partition).unwrap();
-  }
+  lose_every_next_owner_answer(&daemons[1]);
   let floors_before = daemons[0].work_floors_of(green).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
   let lost = holder.call(&RequestBody::CreateWork {
@@ -22090,15 +22091,7 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
       source(1),
     ),
   );
-  let refs: Vec<&Daemon> = daemons.iter().collect();
-  let released = poll_until(&refs, PLACEMENT_DEADLINE, || {
-    let floors = daemons[0].work_floors_of(green)?;
-    Ok(
-      admitted
-        .iter()
-        .all(|work| floors.iter().all(|(held, _)| held != work)),
-    )
-  });
+  let released = floors_released(&daemons, green, &admitted);
   let released_count = daemons[1]
     .refusals_on_every_shard()
     .map(|counts| counts.get("merge.work.admission_released").copied());
@@ -22112,28 +22105,11 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
   for daemon in daemons {
     daemon.stop();
   }
-  assert!(
-    matches!(
-      lost,
-      ReplyBody::Refused {
-        refusal: Refusal::Overloaded { .. }
-      }
-    ),
-    "the creation's answer was lost: {lost:?}"
-  );
-  assert_eq!(
-    admitted.len(),
-    1,
-    "A recorded the lost creation's floor: {floors_after_loss:?}"
-  );
-  assert!(released, "A released the floor after B's restart");
-  assert!(
-    matches!(released_count, Ok(Some(count)) if count >= 1),
-    "B released it: {released_count:?}"
-  );
-  assert!(
-    matches!(&made, ReplyBody::WorkCreated { id, base: 1 } if !admitted.contains(id)),
-    "the name made again, at a new id: {made:?}"
+  assert_released_after_the_restart(
+    &lost,
+    (&admitted, &floors_after_loss),
+    (released, &released_count),
+    &made,
   );
 }
 

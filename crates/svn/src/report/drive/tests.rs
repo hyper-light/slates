@@ -531,10 +531,10 @@ pub(crate) fn big_text_stream(
   let mut stream = encoder.header().to_vec();
   let mut sent = 0usize;
   while sent < to.len() {
-    let target = &to[sent..(sent + WINDOW_LIMIT as usize).min(to.len())];
+    let target = &to[sent..(sent + usize::try_from(WINDOW_LIMIT).unwrap()).min(to.len())];
     let source = from.map_or(&[][..], |from| {
       let view = sent.min(from.len());
-      &from[view..(view + WINDOW_LIMIT as usize).min(from.len())]
+      &from[view..(view + usize::try_from(WINDOW_LIMIT).unwrap()).min(from.len())]
     });
     let mut window = window_of(source, target).unwrap();
     window.source_offset = sent.min(from.map_or(0, <[u8]>::len)) as u64;

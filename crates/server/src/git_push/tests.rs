@@ -1489,7 +1489,10 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
 
 /// One push of `request` driven as an edge drives it (`crate::vcs_http::git::receive`): its answer a step at a time,
 /// yielding after a turn, and the names it asks to home homed in the region off the step (A-724 piece 8c).
-async fn homed_drive(repository: RepositoryId, request: &[u8]) -> Result<super::Received, String> {
+pub(crate) async fn homed_drive(
+  repository: RepositoryId,
+  request: &[u8],
+) -> Result<super::Received, String> {
   use crate::state::with_state;
   let mut push = with_state(|state| {
     ReceivePack::start(
@@ -1703,4 +1706,127 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
     "the update's work was built in {turns} turns for {FLAT_FILES} files"
   );
   assert_eq!(after.past_budget, 0, "{after:?}");
+
+/// A-724 piece 8c (main's ruling (ii): a replay reads a version-3 record's names locally, else from their region homes).
+/// Do: on a node of four shards, with version 3 on, push stock git's `create`; drop the names from the owner's content
+/// store, so only their home shard holds them for the region; make the store again from the log. Expect: the rebuild
+/// reads the names from their home before the record's replay (counted fetched), and the store made again is the live
+/// one.
+#[test]
+fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
+  let daemon = crate::daemon::audit_daemon_of(4);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::write_version_3_for_test(true);
+    let repository = git_repository(state, "fetched");
+    let request = chain()
+      .into_iter()
+      .next()
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .expect("create");
+    let task = slates_rt::futures::spawn(async move {
+      // Every shard's publications, as the daemon's own commit them: the names' home may be another shard.
+      let (origin, shards) =
+        crate::state::with_state(|state| (state.shard, state.shards.clone())).expect("state");
+      let publisher = slates_rt::futures::spawn(async move {
+        for _ in 0..2_000 {
+          for shard in &shards {
+            let _ = crate::xshard::call_in_shard_time(
+              origin,
+              *shard,
+              |_| crate::vcs_store::homes::publication_committed(),
+              crate::daemon::LIVENESS_BUDGET_NS,
+            )
+            .await;
+          }
+          slates_rt::futures::yield_now().await;
+        }
+      })
+      .expect("the publisher");
+      slates_rt::futures::detach(publisher).expect("detached");
+      let answered = homed_drive(repository, &request).await;
+      let _ = sent.send((repository, answered.map(|_| ())));
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (repository, answered) = got
+    .recv_timeout(std::time::Duration::from_nanos(PUSH_WAIT_NS))
+    .expect("answered within the test's bound");
+  answered.expect("the push answered");
+  let (checked, done) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let record = crate::vcs_store::tests::records(state, repository)
+      .pop()
+      .expect("a record");
+    let format = slates_git::object_name::ObjectFormat::Sha1;
+    let (identity, _) = crate::vcs_store::record::Record::decode(&record, format)
+      .expect("decoded")
+      .named
+      .expect("version 3");
+    let home = crate::vcs_store::homes::home_of(&state.shards, &identity).expect("a home");
+    let owner_shard = state.shard;
+    crate::vcs_store::release_names(state, &identity);
+    let main = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repository, "main")
+      .expect("main");
+    let before = state
+      .refusals
+      .get(crate::vcs_store::NAMES_FETCHED)
+      .copied()
+      .unwrap_or(0);
+    let _ = checked.send((home, owner_shard, before, main));
+  });
+  let (home, owner_shard, before, main) = done.recv().expect("checked");
+  assert_ne!(
+    home, owner_shard,
+    "the names' home is the owner shard: the case reads nothing from the region"
+  );
+  let (made, rebuilt) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::rebuild(state, repository);
+    let _ = made.send(());
+  });
+  rebuilt.recv().expect("rebuild begun");
+  let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(PUSH_WAIT_NS);
+  loop {
+    let (polled, poll) = std::sync::mpsc::channel();
+    crate::daemon::observe_first(&daemon, move |state| {
+      let _ = polled.send((
+        state.vcs_stores.unrecovered(repository).is_none()
+          && !state.vcs_stores.rebuilding(repository),
+        state
+          .refusals
+          .get(crate::vcs_store::NAMES_FETCHED)
+          .copied()
+          .unwrap_or(0),
+      ));
+    });
+    let (ready, fetched) = poll.recv().expect("polled");
+    if ready {
+      assert!(
+        fetched > before,
+        "the names were not read from their region home"
+      );
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the rebuild did not end"
+    );
+    std::thread::yield_now();
+  }
+  let (whole, compared) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::vcs_store::tests::assert_made_again_whole(
+      state,
+      repository,
+      &[crate::vcs_store::green_key(main)],
+    );
+    let _ = whole.send(());
+  });
+  compared.recv().expect("compared");
 }
