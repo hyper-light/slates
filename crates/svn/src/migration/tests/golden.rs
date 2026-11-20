@@ -7,13 +7,14 @@
 use std::fmt::Write as _;
 
 use super::support::{
-  History, VECTOR_UUID, created, export, export_all, export_deltas, export_in, history, import,
-  import_whole,
+  ADMISSION, History, VECTOR_UUID, created, export, export_all, export_deltas, export_in, history,
+  import, import_whole,
 };
+use crate::commit::record::Record;
 use crate::dump::Format;
 use crate::index::{Action, ChangedPath, NodeKind};
-use crate::migration::Repository;
 use crate::migration::paths::{compare_paths, relative};
+use crate::migration::{Importer, Importing, MigrationRefusal, Repository};
 
 /// Format 2, every revision whole (`svnadmin dump`).
 const FULL: &[u8] = include_bytes!("../../../fixtures/dump/full.dump");
@@ -272,4 +273,63 @@ fn a_repository_imported_from_its_own_export_is_the_repository_exported() {
     import_whole(&mut again, &export_all(&source).unwrap()).unwrap();
     assert!(history(&again) == history(&source), "{name}");
   }
+}
+
+/// What a record an import hands over names: the UUID, a revision's properties by its number, a revision by the number
+/// it makes.
+fn named(record: &Record) -> String {
+  match record {
+    Record::Created { .. } => "a creation".to_owned(),
+    Record::Uuid(_) => "the UUID".to_owned(),
+    Record::RevisionProperties { revision, .. } => format!("revision {revision}'s properties"),
+    Record::Revision(revision) => format!("revision {}", revision.head + 1),
+  }
+}
+
+/// Imports `dump` whole into a created repository, naming each record it hands over, each committed through the
+/// records' own step but the revision numbered `withheld`, which the caller keeps back. The names, and how it ended.
+fn handed_over(dump: &[u8], withheld: Option<u64>) -> (Vec<String>, Result<(), MigrationRefusal>) {
+  let mut repository = created();
+  let mut importer = Importer::new(ADMISSION);
+  let mut rest = dump;
+  let mut names = Vec::new();
+  loop {
+    let (consumed, record) = match importer.import(&mut repository, rest, true) {
+      Ok(Importing::Commit { consumed, record }) => (consumed, *record),
+      Ok(Importing::Done) => return (names, Ok(())),
+      Ok(Importing::NeedMore { .. }) => return (names, Err(MigrationRefusal::Corrupt)),
+      Err(refusal) => return (names, Err(refusal)),
+    };
+    rest = &rest[consumed..];
+    names.push(named(&record));
+    let kept_back =
+      matches!(&record, Record::Revision(revision) if Some(revision.head + 1) == withheld);
+    if !kept_back {
+      repository.commit_record(record).unwrap();
+    }
+  }
+}
+
+/// A-652 part 3 (an import committed by its caller's step). Do: import `part1.dump` (revisions 0 to 3) whole, the caller
+/// committing each record handed over; then again, the caller keeping revision 2 back. Expect: the records handed over in
+/// the stream's order, the UUID first, then revision 0's properties, then revisions 1 to 3, each once the one before was
+/// committed; and with revision 2 kept back, the import refusing revision 3 as out of its sequence (`E160006`), after
+/// handing over four records.
+#[test]
+fn t_a652_an_import_hands_each_record_over_and_reads_on_once_it_is_committed() {
+  let (names, ended) = handed_over(vector("part1.dump"), None);
+  let wanted = [
+    "the UUID",
+    "revision 0's properties",
+    "revision 1",
+    "revision 2",
+    "revision 3",
+  ];
+  assert_eq!((names, ended), (wanted.map(str::to_owned).to_vec(), Ok(())));
+  let (names, ended) = handed_over(vector("part1.dump"), Some(2));
+  let refused = MigrationRefusal::OutOfSequence {
+    expected: 2,
+    found: 3,
+  };
+  assert_eq!((names.len(), ended), (4, Err(refused)));
 }

@@ -17,7 +17,8 @@ use slates_ipc::protocol::VcsTool;
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 
 use super::{
-  GitHookRan, GitHookRefused, GitHookSite, GitHookView, Presented, ReadRef, ShownPush, Shows, run,
+  GitHookRan, GitHookRefused, GitHookSite, GitHookView, PresentView, Presented, ReadRef, ShownPush,
+  Shows, run,
 };
 use crate::daemon::LIVENESS_BUDGET_NS;
 use crate::repository::push::{BranchAppended, BranchChange};
@@ -60,7 +61,7 @@ const FIRST_DATE: u64 = 1_700_000_000;
 /// Shape: how many bytes of a hook's words the tests keep.
 const CAP: usize = 1 << 16;
 /// Shape: how long a test lets a run take before giving up on it: ten liveness windows.
-const TEST_BOUND_NS: u64 = 10 * LIVENESS_BUDGET_NS;
+pub(crate) const TEST_BOUND_NS: u64 = 10 * LIVENESS_BUDGET_NS;
 /// Shape: the most turns a view's sealing may take here, far past what these packs need a unit of
 /// work a turn.
 const TURNS: u32 = 1 << 20;
@@ -74,15 +75,15 @@ const READ_WINDOW: u64 = 1 << 8;
 /// a count, removed when dropped, even when an assertion fails: where the tests' presenter writes
 /// a view.
 #[derive(Debug)]
-struct ScratchDir {
+pub(crate) struct ScratchDir {
   /// Its canonical path.
-  path: PathBuf,
+  pub(crate) path: PathBuf,
 }
 
 impl ScratchDir {
   /// A fresh, empty one.
   #[allow(clippy::disallowed_methods)] // test code: its own scratch directory, removed with it
-  fn new() -> ScratchDir {
+  pub(crate) fn new() -> ScratchDir {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let binary = std::env::current_exe().expect("the test binary");
     let count = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -131,6 +132,38 @@ fn present(state: &ShardState, view: &GitHookView, root: &Path) {
         }
       }
     }
+  }
+}
+
+/// The tests' presenter (A-665 part 3): each view it shows written whole into a scratch directory
+/// of its own, removed as the view is withdrawn or the presenter dropped.
+#[derive(Debug, Default)]
+pub(crate) struct ScratchPresenter {
+  /// The directories of the views it shows.
+  shown: Vec<ScratchDir>,
+  /// How many views it has shown: the push tests' count that their hooks ran in views.
+  pub(crate) presented: u32,
+  /// How many it has withdrawn.
+  pub(crate) withdrawn: u32,
+}
+
+impl PresentView for ScratchPresenter {
+  fn can_present(&self) -> bool {
+    true
+  }
+
+  fn present(&mut self, state: &ShardState, view: &GitHookView) -> Option<PathBuf> {
+    let dir = ScratchDir::new();
+    present(state, view, &dir.path);
+    let root = dir.path.clone();
+    self.shown.push(dir);
+    self.presented += 1;
+    Some(root)
+  }
+
+  fn withdraw(&mut self, root: &Path) {
+    self.shown.retain(|dir| dir.path != root);
+    self.withdrawn += 1;
   }
 }
 
@@ -396,7 +429,7 @@ fn report_git(new: &str) {
 }
 
 /// A one-shard runtime for a driven run.
-fn runtime() -> LocalRuntime {
+pub(crate) fn runtime() -> LocalRuntime {
   LocalRuntime::new(&RuntimeConfig {
     shards: 1,
     tasks_per_shard: 8,
