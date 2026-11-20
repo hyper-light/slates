@@ -13,7 +13,9 @@
 //! from its outcome, as Mercurial's media type follows from its command's): its status, those fields, chunked to
 //! HTTP/1.1 and framed by the close to HTTP/1.0, `Connection: close` when the connection ends after it. The status is
 //! the route's to decide, at its head or after its body ([`StatusMode`]; main's ruling, 2026-11-19: per route): a
-//! streamed route's is `200`, fixed by the decision, as git's services stream their replies; one decided after the body
+//! streamed route's is `200`, fixed by the decision; a route whose head is all known at the decision
+//! ([`StatusMode::AtHead`], git's smart services; main's ruling of 2026-11-20) has its head written at once, before its
+//! body is read, as git's `http-backend` writes its own; one decided after the body
 //! is the service's to name as its reply begins ([`Connection::reply_status`]), `200` when it names no other: Git LFS's
 //! `201`, `409`, `422`, `413` and `507` once it has read the request (A-629), a WebDAV `PROPFIND`'s `207` or a refusal
 //! its body explains (Subversion's site, A-681). A field a reply cannot carry, a status no reply's content may follow,
@@ -72,8 +74,15 @@ pub enum Next<'a> {
 /// When a served reply's status is decided (the module doc; main's ruling, 2026-11-19: per route).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusMode {
-  /// At the head: `200`, the reply streamed as the service writes it (git's services, Mercurial's commands).
+  /// At the head: `200`, the reply streamed as the service writes it (Mercurial's commands, whose media type the
+  /// service names as its reply begins).
   Streamed,
+  /// At the head, written at once: `200` and the decision's fields sent as soon as the head is judged, before any of
+  /// the body is read, the reply then streamed as the service writes it (git's smart services, as git's `http-backend`
+  /// writes its head before it runs the service; A-722: a long push's pack decoded after the client's last byte kept the
+  /// head unsent past the client's read window). Nothing the service names after the decision can change the head; a
+  /// failure after it ends the connection short of the reply's end, which the client reads as one.
+  AtHead,
   /// After the request's body: the service names it as its reply begins ([`Connection::reply_status`]), `200` when it
   /// names no other (Git LFS, A-629; Subversion's site, A-681).
   AfterBody,
@@ -596,7 +605,7 @@ impl Connection {
       self.refuse_staged(Status::INTERNAL_SERVER_ERROR);
       return;
     }
-    let reply = Reply {
+    let mut reply = Reply {
       fields,
       head_only,
       started: false,
@@ -612,6 +621,21 @@ impl Connection {
       if self.failed() {
         return;
       }
+    }
+    // A head all known at the decision is written now, after any `100 Continue` and before the body is read (the
+    // module doc): the reply then streams from it.
+    if mode == StatusMode::AtHead && !head_only {
+      let mut head = Vec::new();
+      if rendered(request, Status::OK, &reply.fields, &mut head).is_err() {
+        self.refuse_staged(Status::INTERNAL_SERVER_ERROR);
+        return;
+      }
+      self.send(&head);
+      if self.failed() {
+        return;
+      }
+      reply.started = true;
+      reply.fields = Fields::new();
     }
     let gunzip = (request.coding == Coding::Gzip).then(|| Box::new(Gunzip::new()));
     self.state = State::Body {
@@ -761,7 +785,7 @@ impl Connection {
     }
     let taken = match reply.mode {
       StatusMode::AfterBody => carries_content(status) || status.code == NO_CONTENT,
-      StatusMode::Streamed => status == Status::OK,
+      StatusMode::Streamed | StatusMode::AtHead => status == Status::OK,
     };
     if taken {
       reply.status = status;

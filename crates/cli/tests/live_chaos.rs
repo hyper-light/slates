@@ -70,6 +70,8 @@
 mod nfs;
 
 // The fault relay the relayed flows put between the daemons (goal g229, A-277).
+#[path = "support/process_wait.rs"]
+mod process_wait;
 #[path = "support/relay.rs"]
 mod relay;
 
@@ -84,7 +86,8 @@ use slates_client::{Client, ClientError, Deadlines, Intent, ReadAt, Refusal, Vol
 /// Shape: how long a fleet step may take on a box that gives the fleet a whole CPU: the formation wait of the process
 /// flows; a fleet wait divides it by the share of a CPU the box gives now ([`FleetWait`]).
 const FLEET_WAIT: Duration = Duration::from_secs(40);
-/// Shape: how long an anchor may take to start a successor daemon once its daemon was killed.
+/// Shape: the wall bound a start's and a successor's wait had (30 s), now only the horizon [`start_verdict`]'s unit test
+/// looks past: every wait for a daemon is judged in its processes' CPU ([`wait_answers`], `process_wait::InstanceWait`).
 const START_WAIT: Duration = Duration::from_secs(30);
 /// Shape: the CPU a node's processes may spend starting before its daemon must answer: the old wall bound, now counted
 /// in the start's own CPU ([`wait_answers`]). A lone debug daemon's start measured about 13 s on the wall of a loaded
@@ -1177,17 +1180,15 @@ impl Fleet {
     let instance = &self.instances[index];
     let killed = daemon_pid(instance).unwrap();
     send_signal(killed, rustix::process::Signal::KILL);
-    let deadline = Instant::now() + START_WAIT;
+    // While the instance's processes progress (until 2026-11-20 within `START_WAIT`).
+    let mut progress = process_wait::InstanceWait::new();
     loop {
       if let Some(pid) = daemon_pid(instance)
         && pid != killed
       {
         return pid;
       }
-      assert!(
-        Instant::now() < deadline,
-        "the anchor at {instance} started a successor daemon"
-      );
+      progress.check(instance, "the anchor started a successor daemon");
       pause();
     }
   }
@@ -5455,7 +5456,8 @@ fn write_through(owner: &str, volume: &str, barrier: Barrier, name: &str, body: 
       let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
       let mut stream =
         std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
-      stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+      // Read without a timeout: the owner answers while it lives (A-232); until 2026-11-20 each read waited the fleet
+      // wait.
       stream.set_nodelay(true).unwrap();
       let root = nfs::mount(&mut stream, &path, 1);
       let file = nfs::create(&mut stream, &root, name, 2);
