@@ -2878,6 +2878,232 @@ fn judge_healed(
 /// dead.
 const CANDIDATE_PARTITION: Duration = Duration::from_secs(2);
 
+/// Each thread of `pid` (Linux; nothing elsewhere), named `comm:tid`, with its user and system CPU ticks.
+fn thread_ticks(pid: u32) -> BTreeMap<String, u64> {
+  let mut out = BTreeMap::new();
+  let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+    return out;
+  };
+  for task in tasks.flatten() {
+    let path = task.path();
+    let comm = std::fs::read_to_string(path.join("comm"))
+      .unwrap_or_default()
+      .trim()
+      .to_owned();
+    let stat = std::fs::read_to_string(path.join("stat")).unwrap_or_default();
+    if let Some((_, rest)) = stat.rsplit_once(')') {
+      let fields: Vec<&str> = rest.split_whitespace().collect();
+      let tick = |at: usize| {
+        fields
+          .get(at)
+          .and_then(|value| value.parse::<u64>().ok())
+          .unwrap_or(0)
+      };
+      out.insert(
+        format!("{comm}:{}", task.file_name().to_string_lossy()),
+        tick(11) + tick(12),
+      );
+    }
+  }
+  out
+}
+
+/// A-200, a resumed holder's catch-up (BENCHMARKS "A resumed holder's catch-up"): a holder stopped while one volume runs
+/// `SLATES_CATCH_UP_BACKLOG` entries ahead (default 5,000), resumed, and a second volume on the same owner shard written
+/// all through its catch-up. Prints, as `LD-CU` lines: the catch-up's length and the bytes it carried, the installs it
+/// took, the neighbour's write latency against a quiet baseline, and the owner daemon's CPU by thread (Linux).
+#[test]
+fn a_resumed_holders_catch_up_beside_a_busy_volume() {
+  if !gated("catch-up-scale") {
+    return;
+  }
+  let backlog: usize = std::env::var("SLATES_CATCH_UP_BACKLOG")
+    .ok()
+    .and_then(|value| value.parse().ok())
+    .unwrap_or(5_000);
+  let fleet = Fleet::start("cuscale", Supervision::Bare);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let target = fleet.others(owner_index)[0];
+  let holder = fleet.instances[target].clone();
+  let began = Instant::now();
+  let never = AtomicBool::new(false);
+  // Live volumes until two share an owner shard.
+  let mut by_shard: BTreeMap<String, Vec<String>> = BTreeMap::new();
+  let mut pair = None;
+  for at in 0..12 {
+    let id = create_volume(&owner, &format!("cu-{at}"), true, Claim::Dynamic);
+    let stream = Stream {
+      instance: &owner,
+      volume: volume_id_of(&id),
+      began,
+    };
+    let _ = stream.run(0..1, &never);
+    let mut deadline = FleetWait::begin();
+    let shard = loop {
+      let (_, status, _) = run(&owner, &["status"]);
+      let found = status
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains(&format!("live shipping {id}")))
+        .and_then(|line| line.strip_prefix("shard "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_owned);
+      if let Some(shard) = found {
+        break shard;
+      }
+      assert!(deadline.open(), "volume {id} never shipped");
+      pause();
+    };
+    let ids = by_shard.entry(shard).or_default();
+    ids.push(id);
+    if ids.len() == 2 {
+      pair = Some((ids[0].clone(), ids[1].clone()));
+      break;
+    }
+  }
+  let (v1, v2) = pair.expect("two live volumes on one owner shard");
+  eprintln!("LD-CU backlog {backlog} volumes {v1} {v2} by shard {by_shard:?}");
+  let stream1 = Stream {
+    instance: &owner,
+    volume: volume_id_of(&v1),
+    began,
+  };
+  let stream2 = Stream {
+    instance: &owner,
+    volume: volume_id_of(&v2),
+    began,
+  };
+  // V1's state larger than the backlog, so the stopped holder may be sent entries rather than an install.
+  let prefill = backlog * 3 / 2;
+  let filled = stream1.run(1..1 + prefill, &never);
+  eprintln!(
+    "LD-CU prefill {} writes, {} refused",
+    filled.len(),
+    filled.iter().filter(|o| o.refused.is_some()).count()
+  );
+  let stop = AtomicBool::new(false);
+  let quiet = std::thread::scope(|scope| {
+    let writer = scope.spawn(|| stream2.run(1..10_000_000, &stop));
+    sleep(Duration::from_secs(3));
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap()
+  });
+  let quiet_took: Vec<Duration> = quiet
+    .iter()
+    .filter(|o| o.refused.is_none())
+    .map(|o| o.took)
+    .collect();
+  let (q50, q99, _, qmax) = percentiles_us(&quiet_took);
+  eprintln!(
+    "LD-CU quiet v2 n {} p50 {q50:.0} us p99 {q99:.0} us max {qmax:.0} us",
+    quiet_took.len()
+  );
+  fleet.stop(target);
+  let stopped_at = Instant::now();
+  let change_before = counter(&owner, "fleet.live.change_bytes");
+  let ahead = stream1.run(1 + prefill..1 + prefill + backlog, &never);
+  // Only V1 is written while the holder is stopped: its log's change bytes are the backlog the catch-up carries.
+  let backlog_bytes = counter(&owner, "fleet.live.change_bytes").saturating_sub(change_before);
+  eprintln!(
+    "LD-CU ahead {} writes, {backlog_bytes} change bytes, in {:?} with the holder stopped",
+    ahead.len(),
+    stopped_at.elapsed()
+  );
+  let owner_pid = fleet.daemon_pid(owner_index);
+  let ticks_before = thread_ticks(owner_pid);
+  let v1_head = || {
+    live_states(&owner, &v1)
+      .unwrap_or_default()
+      .into_iter()
+      .find(|state| !state.holding)
+      .and_then(|state| state.head)
+  };
+  let held = || {
+    live_states(&holder, &v1)
+      .unwrap_or_default()
+      .into_iter()
+      .find(|state| state.holding)
+      .and_then(|state| state.head)
+  };
+  let behind = v1_head().unwrap_or(0).saturating_sub(held().unwrap_or(0));
+  eprintln!(
+    "LD-CU before resume: owner v1 head {:?}, holder v1 head {:?}, {behind} behind",
+    v1_head(),
+    held()
+  );
+  let installs_before = counter(&holder, "fleet.live.install_taken");
+  let held_before = counter(&holder, "fleet.live.held");
+  fleet.resume(target);
+  let resumed = Instant::now();
+  let stop = AtomicBool::new(false);
+  let (busy, caught) = std::thread::scope(|scope| {
+    let writer = scope.spawn(|| stream2.run(10_000_000..20_000_000, &stop));
+    let mut caught = None;
+    let mut last_sample = resumed;
+    while resumed.elapsed() < Duration::from_secs(90) {
+      let (own, got) = (v1_head(), held());
+      if let (Some(own), Some(got)) = (own, got)
+        && got >= own
+      {
+        caught = Some(resumed.elapsed());
+        break;
+      }
+      if last_sample.elapsed() >= Duration::from_millis(500) {
+        last_sample = Instant::now();
+        eprintln!(
+          "LD-CU-S {} owner {own:?} holder {got:?}",
+          resumed.elapsed().as_millis()
+        );
+      }
+      sleep(Duration::from_millis(20));
+    }
+    stop.store(true, Ordering::Release);
+    (writer.join().unwrap(), caught)
+  });
+  let wall = resumed.elapsed();
+  let ticks_after = thread_ticks(owner_pid);
+  let busy_took: Vec<Duration> = busy
+    .iter()
+    .filter(|o| o.refused.is_none())
+    .map(|o| o.took)
+    .collect();
+  let (b50, b99, _, bmax) = percentiles_us(&busy_took);
+  eprintln!(
+    "LD-CU caught {caught:?} wall {wall:?}; holder took {} install(s) and held {} message(s) meanwhile",
+    counter(&holder, "fleet.live.install_taken").saturating_sub(installs_before),
+    counter(&holder, "fleet.live.held").saturating_sub(held_before)
+  );
+  eprintln!(
+    "LD-CU busy v2 n {} refused {} p50 {b50:.0} us p99 {b99:.0} us max {bmax:.0} us",
+    busy_took.len(),
+    busy.len() - busy_took.len()
+  );
+  let mut deltas: Vec<(u64, String)> = ticks_after
+    .iter()
+    .map(|(name, after)| {
+      (
+        after.saturating_sub(ticks_before.get(name).copied().unwrap_or(0)),
+        name.clone(),
+      )
+    })
+    .collect();
+  deltas.sort_by(|a, b| b.cmp(a));
+  let total: u64 = deltas.iter().map(|(ticks, _)| ticks).sum();
+  eprintln!(
+    "LD-CU cpu owner total {total} ticks over {:.2} s; by thread {:?}",
+    wall.as_secs_f64(),
+    deltas.iter().take(6).collect::<Vec<_>>()
+  );
+  if let Some(caught) = caught {
+    let mib = backlog_bytes as f64 / f64::from(1u32 << 20);
+    eprintln!(
+      "LD-CU per MiB {:.1} ms ({mib:.2} MiB behind)",
+      caught.as_secs_f64() * 1e3 / mib.max(f64::MIN_POSITIVE)
+    );
+  }
+}
+
 /// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and partition each candidate
 /// in turn for [`CANDIDATE_PARTITION`] as `partition` says, the stream running throughout, then end the partition; read
 /// the newest acknowledged writes through every node halfway through each partition and again once it has ended.

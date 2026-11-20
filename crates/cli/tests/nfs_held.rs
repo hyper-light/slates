@@ -31,11 +31,11 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
 #[path = "support/recovered.rs"]
 mod recovered;
 
-/// Shape: how long the daemon may take to come up, and to be replaced after a kill.
-const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the poll interval of the waits.
 const POLL: Duration = Duration::from_millis(20);
 /// Shape: consecutive answered verbs before the daemon counts as settled (the anchor may restart it once at
@@ -97,7 +97,9 @@ fn start_anchor(instance: &str) -> Anchor {
     .spawn()
     .unwrap();
   let anchor = Anchor(child);
-  let started = Instant::now();
+  // Waited for while the anchor's tree lives and gains CPU (`support/process_wait.rs`; until 2026-11-20 twenty seconds,
+  // `START_WAIT`).
+  let mut judged = process_wait::Judged::of(anchor.0.id());
   let mut streak = 0;
   while streak < STABLE_STREAK {
     streak = if run(instance, &["volume", "list"]).0 == 0 {
@@ -105,7 +107,7 @@ fn start_anchor(instance: &str) -> Anchor {
     } else {
       0
     };
-    assert!(started.elapsed() < START_WAIT, "the daemon came up");
+    judged.look("the daemon came up");
     pause();
   }
   let (code, _, error) = run(instance, &["bootstrap", "root"]);
@@ -271,7 +273,7 @@ fn an_nfs_connection_outlives_its_daemons_kill_and_every_request_is_answered() {
     return;
   }
   let instance = format!("nfs-held-{}", std::process::id());
-  let _anchor = start_anchor(&instance);
+  let anchor = start_anchor(&instance);
   let mut held = HeldSession::open(&instance);
   let mut longest_wait = Duration::ZERO;
   // Kills that landed with requests still unsent, so a successor answered requests the dead daemon never read: the
@@ -279,13 +281,23 @@ fn an_nfs_connection_outlives_its_daemons_kill_and_every_request_is_answered() {
   let mut kills_inside_a_burst = 0usize;
   // Each daemon is killed once the anchor has judged it recovered (A-311): a daemon killed sooner is a failed start,
   // and the second in a row is a crash loop the anchor backs off, which this flow does not test.
-  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
+  let mut pid = recovered::await_recovered_while_alive(
+    &instance,
+    &|_| true,
+    POLL,
+    &mut process_wait::Judged::of(anchor.0.id()),
+  );
   for round in 0..KILLS {
     let (waited, inside) = held.kill_inside_a_burst(round, pid);
     longest_wait = longest_wait.max(waited);
     kills_inside_a_burst += usize::from(inside);
     let killed = pid;
-    pid = recovered::await_recovered(&instance, &|next| next != killed, POLL, START_WAIT);
+    pid = recovered::await_recovered_while_alive(
+      &instance,
+      &|next| next != killed,
+      POLL,
+      &mut process_wait::Judged::of(anchor.0.id()),
+    );
   }
   let whole = read_whole(&mut held.stream, &held.file, held.model.len(), held.xid);
   eprintln!(
@@ -333,7 +345,7 @@ impl HeldSession {
     let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
     let port = port.parse::<u16>().unwrap();
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(START_WAIT)).unwrap();
+    // No read timeout: the anchor holds the connection across a restart (A-113), so a read waits while it lives.
     let root = nfs::mount(&mut stream, &path, 1);
     let file = nfs::create(&mut stream, &root, "burst", 2);
     HeldSession {
@@ -418,17 +430,15 @@ impl HeldSession {
   }
 }
 
-/// Waits, bounded by the start wait, for a daemon other than `killed` to answer at `instance`; its pid.
-fn await_new_daemon(instance: &str, killed: u32, round: usize) -> u32 {
-  let started = Instant::now();
+/// Waits for a daemon other than `killed` to answer at `instance`, while the tree under `anchor` lives and gains CPU
+/// (`support/process_wait.rs`; until 2026-11-20 the start wait, twenty seconds); its pid.
+fn await_new_daemon(instance: &str, anchor: u32, killed: u32, round: usize) -> u32 {
+  let mut judged = process_wait::Judged::of(anchor);
   loop {
     if let Some(next) = daemon_pid(instance).filter(|next| *next != killed) {
       return next;
     }
-    assert!(
-      started.elapsed() < START_WAIT,
-      "a new daemon after kill {round}"
-    );
+    judged.look(&format!("a new daemon after kill {round}"));
     pause();
   }
 }
@@ -561,10 +571,15 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
     return;
   }
   let instance = format!("nfs-commit-{}", std::process::id());
-  let _anchor = start_anchor(&instance);
+  let anchor = start_anchor(&instance);
   let mut held = HeldSession::open(&instance);
   // Each daemon is killed once the anchor has judged it recovered (A-311), as in the held-connection flow.
-  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
+  let mut pid = recovered::await_recovered_while_alive(
+    &instance,
+    &|_| true,
+    POLL,
+    &mut process_wait::Judged::of(anchor.0.id()),
+  );
   let mut xid = 10_000u32;
   let mut committed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
   let mut rewrites = 0usize;
@@ -594,7 +609,12 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
     }
     if killed {
       let killed = pid;
-      pid = recovered::await_recovered(&instance, &|next| next != killed, POLL, START_WAIT);
+      pid = recovered::await_recovered_while_alive(
+        &instance,
+        &|next| next != killed,
+        POLL,
+        &mut process_wait::Judged::of(anchor.0.id()),
+      );
     }
   }
   // One more kill: every file is now read from what the restarted daemon recovered.
@@ -603,7 +623,7 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
     .status()
     .unwrap();
   assert!(status.success(), "the final kill");
-  await_new_daemon(&instance, pid, COMMIT_ROUNDS);
+  await_new_daemon(&instance, anchor.0.id(), pid, COMMIT_ROUNDS);
   let mut lost = Vec::new();
   for (index, (file, bytes)) in committed.iter().enumerate() {
     let back = read_whole(&mut held.stream, file, bytes.len(), xid);
@@ -720,10 +740,15 @@ fn an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite() {
     return;
   }
   let instance = format!("nfs-unrewritten-{}", std::process::id());
-  let _anchor = start_anchor(&instance);
+  let anchor = start_anchor(&instance);
   let mut held = HeldSession::open(&instance);
   // Each daemon is killed once the anchor has judged it recovered (A-311), as in the commit oracle.
-  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
+  let mut pid = recovered::await_recovered_while_alive(
+    &instance,
+    &|_| true,
+    POLL,
+    &mut process_wait::Judged::of(anchor.0.id()),
+  );
   let mut xid = 20_000u32;
   let mut written: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
   let mut met_a_successor = 0usize;
@@ -745,7 +770,12 @@ fn an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite() {
       });
     met_a_successor += usize::from(write_verifier != commit_verifier);
     written.push((file, bytes));
-    pid = recovered::await_recovered(&instance, &|next| next != target, POLL, START_WAIT);
+    pid = recovered::await_recovered_while_alive(
+      &instance,
+      &|next| next != target,
+      POLL,
+      &mut process_wait::Judged::of(anchor.0.id()),
+    );
   }
   // One more kill: every file is read from what a restarted daemon recovered.
   let status = Command::new("kill")
@@ -753,7 +783,7 @@ fn an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite() {
     .status()
     .unwrap();
   assert!(status.success(), "the final kill");
-  await_new_daemon(&instance, pid, UNREWRITTEN_FILES);
+  await_new_daemon(&instance, anchor.0.id(), pid, UNREWRITTEN_FILES);
   let mut lost = Vec::new();
   for (index, (file, bytes)) in written.iter().enumerate() {
     let back = read_what_is_there(&mut held.stream, file, bytes.len(), &mut xid);
@@ -847,7 +877,7 @@ fn a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again() {
     return;
   }
   let instance = format!("nfs-held-mkdir-{}", std::process::id());
-  let _anchor = start_anchor(&instance);
+  let anchor = start_anchor(&instance);
   let mut run = MutationRun {
     held: HeldSession::open(&instance),
     first: BTreeMap::new(),
@@ -856,11 +886,16 @@ fn a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again() {
     answered_from_held: 0,
   };
   // Each daemon is killed once the anchor has judged it recovered (A-311), as in the held-connection flow.
-  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
+  let mut pid = recovered::await_recovered_while_alive(
+    &instance,
+    &|_| true,
+    POLL,
+    &mut process_wait::Judged::of(anchor.0.id()),
+  );
   let mut round = 0usize;
   while round < MUTATION_KILLS || (run.answered_from_held == 0 && round < MUTATION_KILLS_MAX) {
     run.kill_inside_a_mkdir_burst(round, pid);
-    pid = await_new_daemon(&instance, pid, round);
+    pid = await_new_daemon(&instance, anchor.0.id(), pid, round);
     // The successor answered the requests it read again before the burst's last reply arrived; its counter says how
     // many it answered from the replies its predecessor held.
     let (restored, answered) = (
@@ -875,11 +910,11 @@ fn a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again() {
     run.answered_from_held += answered;
     // The successor's counters are read as soon as it answers; it is killed in the next round once it has recovered.
     let successor = pid;
-    recovered::await_recovered(
+    recovered::await_recovered_while_alive(
       &instance,
       &|answering| answering == successor,
       POLL,
-      START_WAIT,
+      &mut process_wait::Judged::of(anchor.0.id()),
     );
     round += 1;
   }
@@ -1048,12 +1083,12 @@ const HISTORY_STEPS: usize = 5;
 /// stale write-back had taken back a held connection's states (counted `nfs.writeback_states_restored`).
 fn write_back_history(crash_after: usize) -> (u32, Vec<u8>, u64) {
   let instance = format!("nfs-carry-{}-{crash_after}", std::process::id());
-  let _anchor = start_anchor(&instance);
+  let anchor = start_anchor(&instance);
   let mut owner = HeldSession::open(&instance);
   // The other path: a second connection the anchor holds, writing with the file's handle.
   let (path, port) = owner.export.clone();
   let mut other = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  other.set_read_timeout(Some(START_WAIT)).unwrap();
+  // No read timeout: the anchor holds the connection across a restart (A-113), so a read waits while it lives.
   let _ = nfs::mount(&mut other, &path, 1);
   let original = vec![0x11u8; PAGE];
   assert_eq!(
@@ -1078,7 +1113,7 @@ fn write_back_history(crash_after: usize) -> (u32, Vec<u8>, u64) {
         .status()
         .unwrap();
       assert!(killed.success(), "kill the daemon");
-      pid = await_new_daemon(&instance, pid, crash_after);
+      pid = await_new_daemon(&instance, anchor.0.id(), pid, crash_after);
     }
     match step {
       // The owner's client fetches the page.

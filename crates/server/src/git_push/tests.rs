@@ -805,6 +805,7 @@ fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
 
 /// Shape: the pushes [`t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append`] answers at
 /// once, a step of each in turn.
+#[cfg(unix)]
 const INTERLEAVED: usize = 12;
 
 /// A-722 part 4e (the answer's longest step at 100 concurrent pushes to one repository: a commit staging again whole a
@@ -888,10 +889,10 @@ fn script(point: HookPointName, name: &str, body: &str) -> Script {
   Script { _dir: dir, config }
 }
 
-/// Shape: how long a test waits for a push whose hooks run: a test's bound for each of its three
-/// hooks and one for the push itself.
-#[cfg(unix)]
-const PUSH_WAIT_NS: u64 = 4 * crate::git_hooks::tests::TEST_BOUND_NS;
+/// Shape: how long a test waits for a push whose hooks run: a test's bound (`git_hooks::tests::TEST_BOUND_NS`, ten
+/// liveness budgets) for each of its three hooks and one for the push itself. Every platform: the pushes without hooks
+/// wait by it too.
+const PUSH_WAIT_NS: u64 = 4 * 10 * crate::daemon::LIVENESS_BUDGET_NS;
 
 /// What a push driven with its hooks answered: what the driver wrote, what it received, and how
 /// many views the presenter showed and withdrew; or why the drive stopped.
@@ -997,7 +998,6 @@ fn band_two(answer: &[u8]) -> String {
 }
 
 /// The pack of a request stock git made: its bytes from the pack's magic on.
-#[cfg(unix)]
 fn pack_of(request: &[u8]) -> &[u8] {
   let at = request
     .windows(4)

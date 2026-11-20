@@ -17,6 +17,7 @@ const RECOVERED_KEY: &str = "\"recovered\":";
 
 /// The pid of a daemon of `instance` that the anchor has judged recovered and that `wanted` accepts, asked of
 /// `slates status --json` every `poll` for at most `wait`; the test fails naming what it last saw once `wait` passes.
+#[allow(dead_code)] // each suite that includes this module uses one of the two forms
 pub(crate) fn await_recovered(
   instance: &str,
   wanted: &dyn Fn(u32) -> bool,
@@ -50,6 +51,44 @@ pub(crate) fn await_recovered(
       started.elapsed() < wait,
       "no daemon of {instance} the test wanted was judged recovered within {wait:?} (last: {last})"
     );
+    // The test paces its asks; shipped code parks on its driver (D-9).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(poll);
+  }
+}
+
+/// [`await_recovered`] judged in the CPU of the process tree under `root` (the instance's anchor) rather than a wall
+/// bound (`support/process_wait.rs`): asked while that tree lives and gains CPU, failed once it is gone or stalled. A
+/// loaded box starves an anchor's restart past any wall bound while it keeps running (goal 88's sweep, 2026-11-20).
+#[allow(dead_code)] // each suite that includes this module uses one of the two forms
+pub(crate) fn await_recovered_while_alive(
+  instance: &str,
+  wanted: &dyn Fn(u32) -> bool,
+  poll: Duration,
+  judged: &mut super::process_wait::Judged,
+) -> u32 {
+  loop {
+    let output = Command::new(env!("CARGO_BIN_EXE_slates"))
+      .args(["--instance", instance, "status", "--json"])
+      .output()
+      .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() {
+      let pid = after(&text, PID_KEY).and_then(|rest| {
+        rest
+          .split(|c: char| !c.is_ascii_digit())
+          .next()?
+          .parse::<u32>()
+          .ok()
+      });
+      let recovered = after(&text, RECOVERED_KEY).is_some_and(|rest| rest.starts_with("true"));
+      if let Some(pid) = pid.filter(|pid| recovered && wanted(*pid)) {
+        return pid;
+      }
+    }
+    judged.look(&format!(
+      "a daemon of {instance} the test wanted judged recovered"
+    ));
     // The test paces its asks; shipped code parks on its driver (D-9).
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(poll);
