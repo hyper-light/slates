@@ -3804,8 +3804,8 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.learner.no_session",
     "fleet.plane.announce_lends",
     "fleet.plane.announcements_sent",
-    // The reap tick's events, named by the constants the daemon counts them under, so one added there is not missed
-    // here: the idle purge's freed bytes, what a shard was doing at each tick (A-214: sealing, deferred, busy, idle),
+    // The idle sweep's events (`slates_server::idle_sweep`, A-715), named by the constants the daemon counts them under, so one added there is not missed
+    // here: the idle purge's freed bytes, what a shard was doing at each pass (A-214: sealing, deferred, busy, idle),
     // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
     // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
     // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
@@ -3847,13 +3847,13 @@ fn formation_counter_allowed(line: &str) -> bool {
   .contains(&counter)
 }
 
-/// The formation check ([`formation_counter_allowed`]) knows every reap-tick event the daemon counts: do judge a refusal
-/// line for each counter `slates_server::daemon` exports for its reap ticks, as status prints it. Expect each allowed.
+/// The formation check ([`formation_counter_allowed`]) knows every idle-sweep event the daemon counts: do judge a refusal
+/// line for each counter `slates_server::daemon` exports for its idle sweep, as status prints it. Expect each allowed.
 /// Found on diag-slabs-40 (run 42506866309, Linux) and bug-sweep-27 (run 42515180074, arm64): forming three processes,
 /// one counted `content.give_back.left_for_next_tick` (c2d87528, A-226's give-back making way for other tasks), which
 /// the check did not know, so it failed "only superseded link work may end during formation" with nothing refused.
 #[test]
-fn the_formation_check_allows_every_reap_tick_event() {
+fn the_formation_check_allows_every_idle_sweep_event() {
   use slates_server::daemon::{
     CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
     TICKS_SEALING,
