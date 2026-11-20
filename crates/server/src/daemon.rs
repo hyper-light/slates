@@ -676,7 +676,7 @@ pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 
 /// The status refusal count under which the daemon records a perpetual loop of its own that the control
 /// shard's arena refused — the mount listener's serve loop, the anchor heartbeat — counted, never silent
-/// (banned item 9); a shard's serve and reap loops are a typed initialization failure instead
+/// (banned item 9); a shard's serve loop and idle sweep are a typed initialization failure instead
 /// (`init_shard`), since a shard without them serves nothing.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const LOOP_SPAWN_REFUSED: &str = "daemon.loop_spawn";
@@ -4852,6 +4852,10 @@ async fn init_shard(
     nfs_purge_at: None,
     nfs_purge_owed: false,
     delegation_lapse_at: None,
+    idle_sweep_at: None,
+    idle_sweeper: None,
+    idle_sweep_running: false,
+    idle_sweep_seen: (0, 0),
     placement_rearm_at: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
@@ -4967,12 +4971,13 @@ async fn init_shard(
   let _ = state::with_state_counted(verbs::renew_termed_at_start);
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
-  // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure
+  // A shard whose serve loop or idle sweep the arena refuses serves nothing: a typed initialization failure
   // (surfaced by the boot as `INIT_FAILURES`), never a silently loop-less shard (banned item 9).
   let serve = futures::spawn(serve_loop()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(serve);
-  let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
-  let _ = futures::detach(reap);
+  // The idle sweep (A-715): one pass a sweep's interval after what owes it, none while nothing does.
+  let sweeper = futures::spawn(crate::idle_sweep::sweeper()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(sweeper);
   // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
   let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reaper);
@@ -5037,45 +5042,20 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: the idle seal. Since A-709 base hints are
-/// drained when the shard's hint set reports a watcher ready (`crate::base_hints`). Since
-/// A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
-/// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
-/// claim's deadline (Linux, `crate::held_copy::reclaim_owed`); since A-570 the pressure hold is sampled at the host's
-/// own reports (`crate::pressure`), the NFSv4 purges owed are sent by the reaper at their own deadline
-/// (`crate::nfs::note_purges`), and a declined huge-page placement is re-armed by the keeper a retry window after the
-/// decline. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper
-/// retires it then (`crate::reap`); nor, since A-522, A-536 and A-554, are abandoned staging buffers, status captures,
-/// lapsed write leases, lapsed CLI attachments, grants past their term and the owed audit's resend, which the shard's
-/// keeper takes at their own deadlines (`crate::deadlines`), nor destroys, which the serve loop steps once woken and
-/// the keeper retries at a refused record's deadline. The jobs left here leave a piece at a time for the events or
-/// deadlines that own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the
-/// budget.
-async fn reap_loop() {
-  let cadence = derived!(
-    LIVENESS_BUDGET_NS,
-    "the liveness budget (the anchor's question of the daemon, asked of the daemon's clients)",
-    ["LIVENESS_BUDGET_NS"]
-  )
-  .get();
-  loop {
-    pace(cadence).await;
-    seal_idle_content().await;
-  }
-}
-
-/// The idle sweep of this shard's volumes (A-99), once a reap tick: every volume ages its writes, then the open extents
-/// of files idle a whole tick are sealed in cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in
-/// the shard's step quantum; AES-256-GCM seals at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's
-/// 9–10 here), yielding between slices so the shard keeps serving, until none is left.
-async fn seal_idle_content() {
+/// One pass of the idle sweep of this shard's volumes (A-99; run by `crate::idle_sweep` since A-715, by the reap loop's
+/// tick before): every volume ages its writes, then the open extents of files idle a whole pass are sealed in
+/// cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in the shard's step quantum; AES-256-GCM seals
+/// at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's 9–10 here), yielding between slices so the shard
+/// keeps serving, until none is left. Whether the pass settled the shard: it reached an idle purge that finished, and no
+/// volume owes another pass; otherwise the sweep arms its next.
+pub(crate) async fn seal_idle_content() -> bool {
   let aged = state::with_state(|s| {
     for (_, slot) in s.volumes.iter_mut_all() {
       slot.volume.age_writes();
     }
   });
   if aged.is_none() {
-    return;
+    return true;
   }
   let mut sealed_this_tick = 0u64;
   loop {
@@ -5127,9 +5107,16 @@ async fn seal_idle_content() {
         1,
       );
     });
-    return;
+    return false;
   }
-  purge_if_idle().await;
+  let purged = purge_if_idle().await;
+  let owes = state::with_state(|s| {
+    s.volumes
+      .iter_mut_all()
+      .any(|(_, slot)| slot.volume.sweep_owes())
+  })
+  .unwrap_or(false);
+  purged && !owes
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
@@ -5242,7 +5229,7 @@ async fn probe_give_back(neighbour: bool) {
     let _ = futures::detach(task);
   }
   let before = state::with_state(|s| idle_ticks(s)).unwrap_or(0);
-  purge_if_idle().await;
+  let _settled = purge_if_idle().await;
   let after = state::with_state(|s| idle_ticks(s)).unwrap_or(before);
   GIVE_BACK_PROBE.store(after.saturating_sub(before), Ordering::Release);
 }
@@ -5348,7 +5335,7 @@ fn return_dead_recovery_timed(
 /// refill faults in those of them not resident, a slice of `quantum / page_fault_ns` pages at a time, so a burst after
 /// idle writes onto resident pages: a large write over fresh pages spent 41.5% of the shard faulting them in (CI run
 /// 41986870989). The work stops as soon as a request makes the shard allocate.
-async fn purge_if_idle() {
+async fn purge_if_idle() -> bool {
   loop {
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
@@ -5395,7 +5382,8 @@ async fn purge_if_idle() {
     })
     .flatten();
     if step != Some(true) {
-      return;
+      // Settled once a step found the shard idle and left nothing; a busy shard owes the next pass.
+      return step == Some(false);
     }
     // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
     // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
@@ -5408,7 +5396,7 @@ async fn purge_if_idle() {
       .is_some_and(|(before, after)| after.saturating_sub(before) > 1);
     if others_ran {
       let _ = state::with_state_counted(|s| s.count(GIVE_BACK_LEFT, 1));
-      return;
+      return false;
     }
   }
 }

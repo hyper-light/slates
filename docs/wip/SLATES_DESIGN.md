@@ -5005,6 +5005,16 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-20, A-715: the idle sweep leaves the tick, and the reap loop and its tick are deleted).** The idle
+> sweep (the seal of files idle one to two intervals, the publication of what it moved or a free deferred, the idle
+> purge, recovery give-back and reserve refill) runs a pass at its own deadline on the keeper
+> (`crate::idle_sweep`): armed a liveness budget after the write that stamps a file for the seal, an allocation, a
+> published free or a deferred free, and after a pass that leaves work; a pass that settles the shard arms nothing, so
+> an idle shard is never woken (`an_idle_shard_runs_no_sweep_pass`: no pass in three intervals, where the tick ran
+> one an interval). With it the reap loop, its interval and its sweep are gone: every reap job runs at its own event
+> or deadline (dead clients at their hang-up, A-475; A-522 to A-570's deadlines; base hints at the kernel's report,
+> A-709).
+
 > **Status (2026-11-20, A-709: base hints leave the tick).** Each overlay's watcher descriptor (inotify, a kqueue) is
 > entered in one set of its shard's (`slates_base::HintSet`, an epoll or a kqueue, one-shot, keyed by the volume's
 > generational handle), and one task a shard (`crate::base_hints::watcher`) awaits that set's readability: a report
@@ -12469,6 +12479,13 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-19, A-714, w-svn, found by use: a 5,000-revision Subversion import refused `green_chains` at 1,685).** An
+> entry's objects are the repository's content: the register keeps them as before, but the owner shard charges them to
+> its memory budget as retention with the tool store (`vcs_store::settle_objects`: trued up after each append and at a
+> recovery, given back with the repository; a push's own admission bounds it, a Subversion revision asks
+> `admit_objects` first), never to the partition's merge budget, so a
+> repository's bound is what its shard can hold. This replaces A-662's "charged to the merge budget" below.
+>
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
 > (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each
@@ -54144,6 +54161,25 @@ Applied in the same change to:
   its successor keeps each state log's records only where every log they span holds them whole (part 1's rule, a
   green's log judged by its adopted head), records the repository whole in its database and makes its store from the
   log; the record's commit batched with the names log's part.
+
+### A-715 — The idle sweep at its own deadline; the reap loop and its tick deleted (2026-11-20, w-reaper; the event-driven reaper's last piece; §4.2, §4.7; A-99, A-105, A-117, A-214, A-226, A-709)
+
+- **What was there.** `daemon::reap_loop` paced a liveness window and ran the idle sweep (`seal_idle_content`, then
+  `purge_if_idle`) on every shard at every tick, owed or not; it was the last job on the tick.
+- **Change.** `crate::idle_sweep`: one task a shard (the reap loop's slot, `LOOP_TASKS_PER_SHARD` unchanged) runs a pass
+  when the deadline keeper reaches `idle_sweep_at`. Each state borrow closes by arming it a liveness budget on when the
+  shard owes a pass: a sealing volume's write was stamped (`Store::sweep_owed`, new, set at the stamp), the content
+  arena's allocation count or allocated bytes moved since the last pass, or frees are deferred. A pass that does not
+  settle the shard (a file not yet aged, a publication, a busy arena, a give-back that left slices) arms the next; one
+  that settles arms nothing. The first pass is armed at the shard's start for the recovery give-back. The aging rule
+  (sealed one to two intervals after the last write) and the purge's idle test are unchanged. `reap_loop` deleted.
+- **Tests.** `slates-server` `idle_sweep::tests::an_idle_shard_runs_no_sweep_pass` (no pass in three intervals once
+  settled) and `a_write_on_a_settled_shard_arms_a_pass`; `give_back`, `purge`, `deadlines`, `base_hints`, `idle` lib
+  filters green; `slates-vfs --lib seal` green. macOS arm64, Mac Studio.
+- **Applied in the same change to** §4.7's status, GAPS (the reaper series closed), amendments.tsv.
+- **Owed.** Linux runs of `recovery.rs`'s idle-sweep tests (`a_sealed_files_plaintext_leaves_the_content_object`,
+  `a_deleted_files_plaintext_leaves_the_content_object`, `a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted`,
+  `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it`) (main's).
 
 ### A-636 part 2c-2 — A successor rebuilds a repository taken over whole from its record and the logs it holds (2026-11-20, w-shared for UI goal 93)
 - **Why.** 2c-1 ships a repository's record to its holders and keeps it pending on its successor; nothing yet made the

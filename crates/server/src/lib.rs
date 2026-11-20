@@ -41,6 +41,7 @@ mod content_cipher;
 mod content_holder;
 mod content_pool;
 pub mod content_retention;
+mod idle_sweep;
 pub use consensus_recovery::{RecoveryKey, recovery_proof};
 pub mod daemon;
 pub mod deploy;

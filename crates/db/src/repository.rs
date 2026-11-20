@@ -273,15 +273,7 @@ impl Register {
       .iter()
       .map(|(path, lock)| entry::lock_bytes(path, lock))
       .fold(0, usize::saturating_add);
-    let objects = self
-      .objects
-      .iter()
-      .map(Vec::len)
-      .fold(0, usize::saturating_add);
-    roots
-      .saturating_add(markers)
-      .saturating_add(locks)
-      .saturating_add(objects)
+    roots.saturating_add(markers).saturating_add(locks)
   }
 
   /// The state as a snapshot carries it.
@@ -613,6 +605,16 @@ impl Repositories {
       .get(&repository)
       .into_iter()
       .flat_map(|register| register.objects.iter().map(Vec::as_slice))
+  }
+
+  /// The bytes `repository`'s entries' objects hold (A-662): the repository's content, which its owner shard charges to
+  /// its memory budget as it charges the repository's tool store, so a repository's bound is what its shard can hold,
+  /// never the partition's merge budget.
+  pub fn objects_bytes(&self, repository: RepositoryId) -> usize {
+    self
+      .objects(repository)
+      .map(<[u8]>::len)
+      .fold(0, usize::saturating_add)
   }
 
   /// `repository`'s entry objects at `index` in the order its register received them (A-662): what a recovery replays a
@@ -995,9 +997,10 @@ impl Repositories {
           });
         }
       }
-      // The objects ride with the entry and take no position (A-662), so they never make it an atomic record.
+      // The objects ride with the entry and take no position (A-662), so they never make it an atomic record. They are
+      // the repository's content, charged by its owner shard to its memory budget, never to the merge budget
+      // ([`Repositories::objects_bytes`]).
       if !entry.objects.is_empty() {
-        bytes.added = bytes.added.saturating_add(entry.objects.len());
         register.objects.push(entry.objects.clone());
       }
       let after = register.positions();
