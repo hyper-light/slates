@@ -84,6 +84,27 @@ if [ "$ROUTE" = http ]; then R=sh_ URL=$HTTPURL; else R=sv URL=$SVNURL; fi
 echo "svn $(svn --version --quiet); dump $DUMP; route $ROUTE $URL; svn:// $SVNPORT http $HTTP ssh $SSH"
 
 row import "$SLATES" --instance "$INSTANCE" repository import project "$DUMP"
+# Replay (A-703): stock svnrdump and svnsync over svn://, before any row changes the history. EXPECT_RDUMP and
+# EXPECT_SYNC, when set, are the dumps stock svnserve's answers made of the same history (w-svn's fixtures,
+# crates/svn/fixtures/replay), each compared byte for byte; the mirror takes MIRROR_UUID, and its svn:sync-from-url is
+# set to SYNC_FROM_URL (the fixture's source URL, whose port no other run can share) before it is dumped.
+MIRROR_UUID=${MIRROR_UUID:-00000000-0000-4000-8000-00000000a703}
+export EXPECT_RDUMP="${EXPECT_RDUMP:-}" EXPECT_SYNC="${EXPECT_SYNC:-}" SYNC_FROM_URL="${SYNC_FROM_URL:-}"
+export SVNURL MIRROR_UUID
+row svnrdump-dump bash -c "svnrdump dump --config-dir \$SVN_CONFIG_DIR --non-interactive --no-auth-cache \
+  --username \$TOKEN_ID --password \$TOKEN -q \$SVNURL > $WORK/rdump.dump \
+  && { [ -z \"\$EXPECT_RDUMP\" ] || cmp $WORK/rdump.dump \"\$EXPECT_RDUMP\"; }"
+row svnsync bash -c "svnadmin create $WORK/mirror && svnadmin setuuid $WORK/mirror \$MIRROR_UUID \
+  && printf '#!/bin/sh\\nexit 0\\n' > $WORK/mirror/hooks/pre-revprop-change \
+  && chmod +x $WORK/mirror/hooks/pre-revprop-change \
+  && svnsync initialize --config-dir \$SVN_CONFIG_DIR --non-interactive --no-auth-cache \
+     --source-username \$TOKEN_ID --source-password \$TOKEN file://$WORK/mirror \$SVNURL \
+  && svnsync synchronize --config-dir \$SVN_CONFIG_DIR --non-interactive --no-auth-cache \
+     --source-username \$TOKEN_ID --source-password \$TOKEN file://$WORK/mirror \
+  && { [ -z \"\$SYNC_FROM_URL\" ] || svn propset --config-dir \$SVN_CONFIG_DIR -q --revprop -r0 \
+     svn:sync-from-url \"\$SYNC_FROM_URL\" file://$WORK/mirror; } \
+  && svnadmin dump --quiet $WORK/mirror > $WORK/sync.dump \
+  && { [ -z \"\$EXPECT_SYNC\" ] || cmp $WORK/sync.dump \"\$EXPECT_SYNC\"; }"
 row info bash -c "$R info $URL/trunk"
 row ls bash -c "$R ls $URL/trunk"
 row cat bash -c "f=\$($R ls $URL/trunk | grep -v /\$ | head -1) && $R cat $URL/trunk/\$f"
