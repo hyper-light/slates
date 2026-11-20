@@ -72,26 +72,70 @@ pub fn current_task() -> Option<TaskId> {
   registry::with_current(|ctx| ctx.current_task()).flatten()
 }
 
-/// Spawns a joinable task on the current shard with no parent.
+/// Spawns a joinable task on the current shard with no parent, labelled with where it was spawned (A-740).
+#[track_caller]
 pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-  registry::with_current(|ctx| ctx.spawn_local(boxed(future), None))
+  let label = crate::label::caller();
+  registry::with_current(|ctx| ctx.spawn_labelled(boxed(future), None, label))
     .ok_or(RtError::NotOnShardThread)?
 }
 
 /// Spawns a joinable task on the current shard that the shard runs alone until it ends: no other task is polled
 /// meanwhile, and each of its yields still ends a step (`ShardContext::spawn_alone`). A daemon's shard start, whose
 /// recovery yields between slices while nothing else may yet reach the shard's state, is the use.
+#[track_caller]
 pub fn spawn_alone<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-  registry::with_current(|ctx| ctx.spawn_alone(boxed(future))).ok_or(RtError::NotOnShardThread)?
+  let label = crate::label::caller();
+  registry::with_current(|ctx| ctx.spawn_alone_labelled(boxed(future), label))
+    .ok_or(RtError::NotOnShardThread)?
 }
 
 /// Spawns a joinable child of the current task; a parent's completion cancels and joins it.
+#[track_caller]
 pub fn spawn_child<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+  let label = crate::label::caller();
   registry::with_current(|ctx| {
     let parent = ctx.current_task().map(|t| t.0.slot());
-    ctx.spawn_local(boxed(future), parent)
+    ctx.spawn_labelled(boxed(future), parent, label)
   })
   .ok_or(RtError::NotOnShardThread)?
+}
+
+/// Names the work the current task does from here until the guard drops, such as `"hg_push::land"` (A-740): a shard
+/// found spinning or wedged inside it is reported under this name and the task's poll count, where the spawn site
+/// alone would name only the connection or the helper that spawned the task. The label it had returns when the guard
+/// drops. Outside a task on a shard it labels nothing.
+pub fn doing(name: &'static str) -> Doing {
+  let label = crate::label::intern(crate::label::TaskLabel::Named(name));
+  Doing {
+    previous: registry::with_current(|ctx| {
+      let task = ctx.current_task()?;
+      ctx.relabel(label).map(|previous| (task, previous))
+    })
+    .flatten(),
+  }
+}
+
+/// The guard [`doing`] returns: while it lives the current task carries its name.
+#[derive(Debug)]
+#[must_use = "the task carries the name only while the guard lives"]
+pub struct Doing {
+  /// The task it labelled and the label it had, given back on drop; none outside a task.
+  previous: Option<(TaskId, u32)>,
+}
+
+impl Drop for Doing {
+  /// Gives the label back to the task it was taken from, only while that task is the one being polled: a guard
+  /// dropped elsewhere (its future dropped by a cancellation, outside any poll) relabels no other task.
+  fn drop(&mut self) {
+    if let Some((task, previous)) = self.previous {
+      let _ = registry::with_current(|ctx| {
+        if ctx.current_task() == Some(task) {
+          ctx.relabel(previous);
+        }
+      });
+    }
+  }
 }
 
 /// Requests a task's cancellation (same shard only in this phase).

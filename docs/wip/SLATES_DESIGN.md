@@ -52573,7 +52573,8 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   transaction and made at the build's end from what it staged (BUILT 2026-11-20, `vcs_store::owed`), a whole map's
   release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
-  (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name; its copies and symbolic links owed); Mercurial's manifests by the
+  (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name, its symbolic links `svn:special`
+  files; its copies owed until a work makes one); Mercurial's manifests by the
   same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
@@ -54803,6 +54804,15 @@ Applied in the same change to:
   of nine keep it, others refused `NotAHome`; other bytes under its name `Misnamed`; hostile lengths and kinds). Owed
   (6c-2): the daemon serving the stream (the home shard's `keep_here`, the answer after its image is published), the
   sender's batched calls and the healer's loop at each configuration change.
+- **Piece 6's region half, served (2026-11-20).** The record session dispatches `slates_cluster::homes::HOME_STREAM` to
+  `crate::vcs_store::homes::serve_remote`: a put kept only where the configuration this node knows (`fleet.members()`,
+  its quorum's f) ranks it among the window's homes and the bytes hash to their name, on the node's own home shard for
+  the window, and answered `Kept` only once that shard's image holding it is published (`published`, A-727's barrier);
+  reads and let-goes by identity. Until A-727 a3 calls the barrier's hooks no image holds the content store, so a put
+  from the region answers `Unanswered`, never a `Kept` the image could not back; a put so answered may have kept the
+  window, which the sender's let-go or the healer releases. Test: `vcs_store::homes::tests::a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_its_image_is_published`
+  (the barrier played by hand: no `Kept` before publication, `Kept` after, read back, let go, gone, misnamed refused).
+  Owed: the sender (batched puts to the homes `homes()` names) and the healer's loop at each configuration change.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55421,3 +55431,39 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   t_a664_live_a_parked_submit_waits_at_most_its_bound` (parked once; none answered within an unbounded wait; answered
   overdue past a bound of none; the build's end runs nothing of it). `cargo test --locked -p slates-server --lib --
   vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities:: --test-threads=4` 153 of 153; fmt clean.
+
+### A-740 — A stuck shard's report names the task it was polling (2026-11-20, w-reaper, main's urgent piece; §4.3 tasks, §4.14 `daemon.alive`; A-228, A-232, A-318)
+
+- **Why.** The watchdog's spin line ("shard N is spinning: X ms of CPU without a step") and the anchor's kill line named
+  the shard alone, and three agents were guessing which task spun (hg's whole push at 194 s, svnrdump's replay-range, a
+  forming run's 5.7 s).
+- **Change.** `slates_rt::label`: every task carries a label, interned once into a process-wide table of write-once
+  cells (open addressing over FNV-1a; 4,096 cells; a full table reads "unlabelled", never refuses a spawn). A label is
+  the spawn site, taken by `#[track_caller]` at every spawn entry (`futures::spawn`, `spawn_child`, `spawn_alone`,
+  `SpawnRequest::new`/`with_receipt`, `Runtime::spawn_on`/`spawn_on_with_receipt`/`spawn`, `ShardContext::spawn_local`/
+  `spawn_alone`, the simulator's), so no site goes unlabelled; or the work a task names while it runs
+  (`futures::doing("hg_push::record")`, a guard that gives the old label back, only to the task it took it from). The
+  shard stores the label's index and the task's poll count in one pulse word before each poll (`Pulse::polling`), on the
+  line it already writes each step. The watchdog's wedged, spinning and end lines name it; before it withholds the beat it
+  records it in the anchor's segment (`SUP_STUCK_WRITTEN`…`SUP_STUCK_LABEL`, the writer's pid released last), and the
+  anchor's lapse kill line names it ("its watchdog found shard N stuck in task L, at its poll P"). Named steps now: hg
+  push's unbundle, record, rebase and take; svn's call answer and landing.
+- **Tests.** rt `label::tests` (an index kept, a word given back) and `tests/spin_label.rs` (read from another thread, a
+  spinning task's site label at its third poll, then its named step, then the site again); anchor
+  `a_recorded_stuck_task_is_read_by_the_anchor` (a long label cut at a character boundary); server liveness
+  `a_spinning_shard_stops_the_beat` now names its spin `liveness::spinner` and requires the segment's record to give
+  back that label, the shard and the pid. Red first: with the record not written the test fails ("the watchdog recorded
+  no stuck task"); green, the line reads "shard 1 is spinning: 3198 ms of CPU … in task liveness::spinner, at its
+  poll 1" (macOS arm64, Mac Studio 2).
+- **Applied in the same change to** the watchdog's module docs, amendments.tsv.
+
+### A-664 Subversion objects, symbolic links — A submitted symbolic link is a file of `link ` and its target whose list is `svn:special` (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Change.** `vcs_store::svn_made`: a symbolic link in the green is a file row whose text is `link ` and the target
+  and whose property list is `svn:special` set to `*` alone, in FSFS's form, brought with the revision, as a stock
+  client commits one and svnserve keeps it; a symbolic link with properties of its own, and a special file, stay
+  refused and counted. A copy's row with its source waits for a work that can make a copy (A-626 part 4): no work
+  operation makes one, so no submitted version holds one.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `repository::svn_commit::tests::
+  t_a664_svn_a_submitted_symbolic_link_is_a_special_file` (revision 1 adds `/trunk/l` as a file `link a.txt` with the
+  `svn:special` list, which the records hold). `cargo test --locked -p slates-server --lib -- repository::svn_commit::
+  vcs_svn vcs_store:: identities:: --test-threads=4` 102 of 102; fmt clean.

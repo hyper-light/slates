@@ -798,7 +798,11 @@ async fn step(
   seat: &Seat,
 ) -> Stepped {
   out.clear();
-  let next = answer(conversation, out);
+  let next = {
+    // A-740: a shard stuck answering a call (a replay, a log, an update's drive) names it.
+    let _doing = slates_rt::futures::doing("vcs_svn::answer");
+    answer(conversation, out)
+  };
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
@@ -852,6 +856,7 @@ async fn follow(
     }
     Next::Accepted { work, consumed } => {
       consume(conversation, consumed);
+      let _doing = slates_rt::futures::doing("vcs_svn::land");
       land(stream, conversation, *work, out).await
     }
   };

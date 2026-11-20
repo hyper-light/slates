@@ -135,6 +135,10 @@ pub struct Pulse {
   completed: AtomicU64,
   admission_refused: AtomicU64,
   longest_step_ns: AtomicU64,
+  /// The task the shard is polling, or polled last: its label's index and its polls begun, packed in one word
+  /// ([`crate::label::Polling`], A-740), stored by the shard before each poll, so a watchdog that finds the shard
+  /// spinning or wedged names the task it was in.
+  polling: AtomicU64,
   /// An application loop's own forward-progress count on this shard (the fleet coordinator's period
   /// count), bumped by the shard and read by an observer on any thread — kept on the entry so it
   /// needs no allocation of its own and outlives the shard as the entry does.
@@ -228,6 +232,18 @@ impl Pulse {
     self
       .longest_step_ns
       .store(longest_step_ns, Ordering::Relaxed);
+  }
+
+  /// The owning shard records the task it is about to poll: one plain store (A-740).
+  pub fn record_polling(&self, label: u32, polls: u64) {
+    self
+      .polling
+      .store(crate::label::Polling::pack(label, polls), Ordering::Relaxed);
+  }
+
+  /// The task the shard is polling, or polled last (see [`Pulse::record_polling`]).
+  pub fn polling(&self) -> crate::label::Polling {
+    crate::label::Polling::unpack(self.polling.load(Ordering::Relaxed))
   }
 
   /// The owning shard records its driver-wait count as it enters a wait.

@@ -69,8 +69,9 @@
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
-> principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20), its copies as rows with their
-> sources and symbolic links as `svn:special` files owed; Mercurial's changesets of a submitted
+> principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20; symbolic links as `svn:special`
+> files, `link ` and the target, BUILT 2026-11-20), its copies as rows with their sources owed until a work can make a
+> copy (A-626 part 4); Mercurial's changesets of a submitted
 > version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
@@ -114,7 +115,8 @@
 > Piece 5b's placement policy for A-722's intake off the owner (`vcs_share::place::intake_shard`, two choices by
 > intakes decoding) built, waiting for w-git's A-722 to call it.
 > Piece 6's region half: its rule (`slates_db::identity_homes`: homes and the healer's plan by membership and rank
-> alone); its wire (`slates_cluster::homes`, the door's rule). The daemon's serving and the healer's loop owed.
+> alone); its wire (`slates_cluster::homes`, the door's rule); the daemon serving it (`vcs_store::homes::serve_remote`,
+> acknowledged after the home image, so `Unanswered` until A-727 a3). The sender and the healer's loop owed.
 > Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
@@ -149,8 +151,10 @@
 > a-large-mercurial-import-crash-looped-the-daemon.md`. Part 2 FIXED (found by use, w-interop: a 57,035-revision push
 > over HTTP spun shard 0 at its landing): a push's record is written a part a slice before its landing
 > (`record::Writer::begin_kept`, `hg_push::record_sliced`), again after a re-base, where the landing wrote it whole.
-> Owed: a rebuild's replay (`vcs_store::rebuild`, one step still); the landing's append of an entry as large as its
-> record, and the record's size itself (S5, A-729: identities, no texts); w-perf's and w-interop's by-use reruns.
+> Part 3 FIXED: a Mercurial store's rebuild (`vcs_store::rebuild`, after a commit refused past its store's step)
+> replays its records a step a turn in a task, the store lent to nothing meanwhile (`VcsStores::rebuilding`), its
+> generation moved after. Owed: the landing's append of an entry as large as its record, and the record's size itself
+> (S5, A-729 part 2: identities, no texts); w-perf's and w-interop's by-use reruns.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
