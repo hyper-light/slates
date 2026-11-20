@@ -179,6 +179,7 @@ Op 97 RepositoryPolicySet
 Op 98 IdentitiesSet
 Op 99 CredentialEnrolled
 Op 100 CredentialRevoked
+Op 101 RepositoryRebuilt
 PlacementState 0 Local
 PlacementState 1 Placed
 PolicyEffect 0 Allow

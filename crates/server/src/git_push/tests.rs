@@ -311,19 +311,21 @@ fn started(state: &mut ShardState, repository: RepositoryId) -> (Vec<u8>, Receiv
 }
 
 /// `request` handed to `push` a piece at a time as an edge hands it in, then its end, then its
-/// answer, in one step under a presenter that shows no view: what the driver wrote, and what it
-/// received.
+/// answer, a step at a time while its checks turn (A-719) under a presenter that shows no view:
+/// what the driver wrote, and what it received.
 fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (Vec<u8>, Received) {
   for piece in request.chunks(PIECE) {
     push.input(state, piece).expect("taken");
   }
   push.end(state).expect("ended");
   let mut answer = Vec::new();
-  let step = push.answer_step(state, &mut answer).expect("answered");
-  let Answering::Answered(received) = step else {
-    panic!("no hook runs where no view is shown: {step:?}");
-  };
-  (answer, received)
+  loop {
+    match push.answer_step(state, &mut answer).expect("answered") {
+      Answering::Answered(received) => return (answer, received),
+      Answering::Turned => {}
+      step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
+    }
+  }
 }
 
 /// `request` pushed to `repository` by its owner: what was received.
@@ -713,7 +715,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
       .map_err(|failed| format!("a step failed: {failed:?}"))?;
     match step {
       Answering::Answered(received) => break received,
-      Answering::Sealing => slates_rt::futures::yield_now().await,
+      Answering::Turned => slates_rt::futures::yield_now().await,
       Answering::Hook(call) => {
         let ran = call.run(std::future::pending()).await;
         with_state(|state| push.hook_ran(state, ran, &mut answer))

@@ -6,9 +6,11 @@
 //! **A step at a time.** [`ReceivePack::start`] makes one push's session for a principal and writes the advertisement
 //! when the edge's transport opens with it (SSH; smart HTTP's `info/refs`, whose session then ends);
 //! [`ReceivePack::input`] and [`ReceivePack::end`] hand it the client's bytes as they arrive, a thin pack's bases and
-//! the connectivity check read from the repository's index through A-638's view; `ReceivePack::answer_step` decides
-//! the checked push and writes git's report to the edge's bytes, a step at a time while its hooks run (A-665 part 3):
-//! [`Answering::Sealing`] while a hook's view is sealed a turn at a time, and [`Answering::Hook`] for a hook the edge
+//! its checks read from the repository's index through A-638's view; `ReceivePack::answer_step` makes the pack's checks
+//! a turn at a time (A-719: every object checked as git checks a push, then the connectivity walk, each turn the shard's
+//! step quantum), decides the checked push and writes git's report to the edge's bytes, a step at a time while its
+//! hooks run (A-665 part 3): [`Answering::Turned`] after each turn of the checks or of a hook's view's sealing, and
+//! [`Answering::Hook`] for a hook the edge
 //! runs off the shard's step and hands back through `ReceivePack::hook_ran` (`hooks`, Unix, where the hook driver
 //! runs). Each call is one step on the owner shard; between steps the driver holds only its push's sealed quarantine
 //! and a hook's view, which a push dropped between them gives back, so an edge's task keeps the driver across its own
@@ -111,6 +113,8 @@ use slates_git::receive::{
 };
 use slates_git::refname;
 use slates_git::store::Incoming;
+use slates_git::store::hook_view::Quantum;
+use slates_git::store::learn::Clock;
 use slates_git::store::views::{IndexedObjects, PushedObjects};
 use slates_git::unpack::Object;
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
@@ -198,13 +202,24 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   answer: AnswerState,
 }
 
+/// The shard's clock as the store's and the checks' passes read it: the runtime's monotonic
+/// nanoseconds (§4.3).
+pub(crate) struct ShardClock;
+
+impl Clock for ShardClock {
+  fn now_ns(&mut self) -> u64 {
+    slates_rt::futures::now_ns()
+  }
+}
+
 /// What a step of a push's answer leaves its edge to do (module docs, "A step at a time").
 #[derive(Debug)]
 pub(crate) enum Answering {
   /// The push is answered whole: what was received.
   Answered(Received),
-  /// A hook's view is being sealed a turn at a time: yield the shard, then step again.
-  Sealing,
+  /// A turn of the push's work is done (its checks, A-719, or a hook's view's sealing): yield the
+  /// shard, then step again.
+  Turned,
   /// A hook is to run in its view: run it off the shard's step, then hand what it answered to
   /// `hook_ran`.
   Hook(HookCall),
@@ -374,6 +389,38 @@ impl<P> ReceivePack<P> {
     })
   }
 
+  /// One turn of the pack's checks (A-719), for the shard's step quantum and at least one object,
+  /// its reads lent the room the shard can admit now: whether the push is checked. A push of
+  /// deletes, checked as its request ended, answers so at once. A refusal of the exchange ends the
+  /// push.
+  fn check_turn(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
+    if !self.session.is_checking() {
+      return Ok(self.session.checked().is_some());
+    }
+    let ns = state.config.step_quantum_ns();
+    let Self {
+      repository,
+      session,
+      admission,
+      ..
+    } = self;
+    with_room(state, |state| {
+      let (content, git) = state
+        .vcs_stores
+        .git_ref(*repository)
+        .ok_or(PushFailed::NoStore)?;
+      let indexed = IndexedObjects::new(&git.repository, content, admission.left());
+      let mut clock = ShardClock;
+      let quantum = Quantum {
+        clock: &mut clock,
+        ns,
+      };
+      session
+        .check_turn(&indexed, admission, quantum)
+        .map_err(PushFailed::Exchange)
+    })
+  }
+
   /// The answer's first step (module docs, "Answering"): every command refused while a git hook is
   /// configured that cannot run here (`can_present` false); else the push's objects admitted and
   /// sealed, then its hooks before the verdicts due, or the verdicts at once where no git hook is
@@ -469,6 +516,10 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
     match core::mem::replace(&mut self.answer, AnswerState::Done) {
+      AnswerState::Unbegun if !self.check_turn(state)? => {
+        self.answer = AnswerState::Unbegun;
+        Ok(Answering::Turned)
+      }
       AnswerState::Unbegun => {
         let can_present = self.presenter.can_present();
         match self.begin(state, can_present, out)? {
@@ -517,6 +568,10 @@ impl<P> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
     match core::mem::replace(&mut self.answer, AnswerState::Done) {
+      AnswerState::Unbegun if !self.check_turn(state)? => {
+        self.answer = AnswerState::Unbegun;
+        Ok(Answering::Turned)
+      }
       AnswerState::Unbegun => {
         let Begun::Answering(answering) = self.begin(state, false, out)?;
         Ok(answering)
