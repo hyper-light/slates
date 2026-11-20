@@ -725,7 +725,10 @@ fn common_payload(node: Node, p1: u32, p2: u32, flags: u16, len: u64) -> Vec<u8>
 }
 
 /// A payload's common part, read back: the node, the parents, the flags, the length, and what follows.
-fn read_common(payload: &[u8]) -> Option<(Node, u32, u32, u16, u64, &[u8])> {
+type Common<'p> = (Node, u32, u32, u16, u64, &'p [u8]);
+
+/// A payload's common part, read back ([`Common`]).
+fn read_common(payload: &[u8]) -> Option<Common<'_>> {
   let (node, rest) = payload.split_first_chunk::<NODE_LEN>()?;
   let (p1, rest) = rest.split_first_chunk::<REV_BYTES>()?;
   let (p2, rest) = rest.split_first_chunk::<REV_BYTES>()?;

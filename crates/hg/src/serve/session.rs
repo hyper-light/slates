@@ -354,7 +354,7 @@ pub(crate) fn spec_of(command: &[u8]) -> Option<Spec<'static>> {
   COMMANDS
     .iter()
     .find(|(name, _)| *name == command)
-    .map(|(_, spec)| Spec(*spec))
+    .map(|(_, spec)| Spec(spec))
 }
 
 /// Answers `command`, its arguments read by `spec`, over `transport`: its answer, and the refusal an error answer
@@ -456,7 +456,7 @@ fn advertised(
       _ => None,
     }
   };
-  let line: Vec<(&[u8], Option<&[u8]>)> = names.iter().map(|name| (*name, value(*name))).collect();
+  let line: Vec<(&[u8], Option<&[u8]>)> = names.iter().map(|name| (*name, value(name))).collect();
   let len = line.iter().fold(0_usize, |total, (name, value)| {
     total
       .saturating_add(name.len())
