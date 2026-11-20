@@ -31,3 +31,8 @@ run 27 exit 0 0 skip-lines
 run 28 exit 0 0 skip-lines
 run 29 exit 0 0 skip-lines
 run 30 exit 0 0 skip-lines
+run 31 exit 0 0 skip-lines
+run 32 exit 0 0 skip-lines
+run 33 exit 0 0 skip-lines
+run 34 exit 0 0 skip-lines
+run 35 exit 0 0 skip-lines
