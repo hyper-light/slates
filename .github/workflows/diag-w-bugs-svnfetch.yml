@@ -1,0 +1,78 @@
+name: DIAG w-bugs -- Subversion's fetch measured over svn:// and DAV (not for main)
+
+on:
+  push:
+    branches: ['diag-w-bugs-svnfetch-*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  measure:
+    name: svn fetch on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      RESULTS_BRANCH: ${{ github.ref_name }}-results-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Subversion and the dataset
+        run: |
+          sudo apt-get update && sudo apt-get install -y subversion
+          git clone -q --bare https://github.com/git/git.git "$RUNNER_TEMP/src.git"
+          python3 crates/cli/bench/git_to_svn_dump.py "$RUNNER_TEMP/src.git" master 1000 > "$RUNNER_TEMP/git-1000.dump"
+          ls -l "$RUNNER_TEMP/git-1000.dump"
+      - name: Build (release)
+        run: cargo build --release --locked -p slates-cli
+      - name: Measure, published
+        shell: bash
+        run: |
+          set +e
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          out="$RUNNER_TEMP/out"; mkdir -p "$out" "$RUNNER_TEMP/cfg" "$RUNNER_TEMP/home"
+          r="$out/results.txt"
+          echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD); $(nproc) CPUs; svn $(svn --version --quiet)" > "$out/status.txt"
+          B="$GITHUB_WORKSPACE/target/release/slates"; inst="svnf-$$"; log="$out/anchor.log"
+          "$B" --instance "$inst" anchor --vcs-svn 127.0.0.1:0 --vcs-http 127.0.0.1:0 > /dev/null 2> "$log" &
+          for i in $(seq 1 120); do
+            grep -q "^slates daemon: instance $inst serving on" "$log" && grep -q '^slates anchor: issuer surface: export ' "$log" && break; sleep 1
+          done
+          svnport=$(sed -n 's|^slates daemon: the svn:// listener serves on 127\.0\.0\.1:\([0-9]*\).*|\1|p' "$log" | head -1)
+          httpport=$(sed -n 's|^slates daemon: the version-control HTTP edge serves cleartext on 127\.0\.0\.1:\([0-9]*\).*|\1|p' "$log" | head -1)
+          exports=$(sed -n 's/^slates anchor: issuer surface: export //p' "$log" | head -1)
+          echo "svn:// $svnport, http $httpport" >> "$r"
+          "$B" --instance "$inst" repository create project --tool svn >> "$r" 2>&1
+          t0=$(date +%s.%N); "$B" --instance "$inst" repository import project "$RUNNER_TEMP/git-1000.dump" >> "$r" 2>&1; echo "import exit $? $(echo "$(date +%s.%N) - $t0" | bc) s" >> "$r"
+          minted=$(env $exports "$B" --instance "$inst" credential token)
+          id=$(echo "$minted" | sed -n 's/^id: //p'); token=$(echo "$minted" | sed -n 's/^token: //p')
+          timed() { local what=$1; shift; local t0=$(date +%s.%N); "$@" > "$out/$what.txt" 2>&1; local code=$?; echo "$what exit $code $(echo "$(date +%s.%N) - $t0" | bc) s" >> "$r"; }
+          for edge in svn http; do
+            if [ $edge = svn ]; then url="svn://127.0.0.1:$svnport/project/trunk"; user="$id"; else url="http://127.0.0.1:$httpport/project/trunk"; user="slates"; fi
+            S=(env "HOME=$RUNNER_TEMP/home" LC_ALL=C svn --non-interactive --no-auth-cache --config-dir "$RUNNER_TEMP/cfg" --username "$user" --password "$token")
+            wc="$RUNNER_TEMP/wc-$edge"
+            timed "$edge-checkout" "${S[@]}" checkout "$url" "$wc"
+            youngest=$("${S[@]}" info --show-item revision "$wc" 2>/dev/null)
+            echo "$edge youngest $youngest, files $(find "$wc" -type f -not -path '*/.svn/*' | wc -l)" >> "$r"
+            "${S[@]}" update -q -r $((youngest - 500)) "$wc" > /dev/null 2>&1
+            timed "$edge-update-500" "${S[@]}" update "$wc"
+            echo "== after $edge" >> "$out/diag.txt"; grep 'diag-svnfetch' "$log" | tail -40 >> "$out/diag.txt"
+          done
+          "$B" --instance "$inst" status > "$out/status-slates.txt" 2>&1
+          grep -c 'diag-svnfetch' "$log" >> "$r"
+          echo "ended $(date -u +%FT%TZ)" >> "$out/status.txt"
+          entries=""
+          for f in "$out"/*; do
+            b=$(tail -c 3000000 "$f" | git hash-object -w --stdin)
+            entries="$entries$(printf '100644 blob %s\t%s' "$b" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree)
+          c=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID")
+          git push -q origin "$c:refs/heads/$RESULTS_BRANCH"
