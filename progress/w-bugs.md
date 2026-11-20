@@ -231,3 +231,9 @@
 - Proposed to w-svn (inbox): per-directory-row persistent children maps in the index, listing at O(live children),
   entries with ids (no second resolve), then a cursor for very large directories. Waiting on w-svn's agreement
   before touching index.rs.
+- 2026-11-20 runs 10/11 (macos-latest, 477abbf73): fetches 3-12x slower than run 8 (checkout 25.0 s / 23.2 s vs
+  7.1 / 7.6; update 32.5 / 24.6 vs 2.7 / 3.6). Window steps ~100 us average (4.4 us in run 9), up to 95 ms. Cause:
+  S4 c2 14215b0c3 (w-perf): Repository::text rebuilds the whole text from its skip-delta chain on every call, and
+  the fetches read 1,024 bytes a step. Sent to w-perf's inbox with two shapes that fit the budget (a made-text cache
+  or reader handle; the chain applied in units). Listing measurement landed 477abbf73 (3.84 ms children regardless
+  of live count). Still waiting on w-svn's agreement for the listing index.
