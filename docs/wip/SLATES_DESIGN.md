@@ -15718,6 +15718,12 @@ client's: it asks for mergeinfo, logs with merged revisions, location segments a
 copy and commits the result as any commit. The server never merges file contents (§2 ban 11).
 
 *Branches, tags, stacks, rebases and reviews* (what §4.17.1 leaves to this section).
+- The repository's lineage verbs (`CreateBranch`, `BindBranch`, `RetireBranch`; `slates repository branch`) are refused
+  `Unsupported` by kind on a Subversion repository (2026-11-20, found by reading after A-622's CLI verbs): a green of
+  its own is no branch any Subversion client reaches, and the root's binding is what every path serves. A branch is
+  made as a stock client makes one, by a copy it commits (`svn copy ^/trunk ^/branches/b`). Held by
+  `vcs_svn::tests::a_subversion_repositorys_branch_verbs_are_refused_by_kind` (each verb refused, the repository
+  served after them; before, `CreateBranch` answered `GreenCreated`).
 - A branch or a tag is a directory made by a copy of any path at any revision; Subversion has no other kind. Policy
   protects a path prefix (`/trunk`, `/tags/**`) as §4.17.1's policy protects a green's name pattern: who may commit
   under it, whether a directory under `/tags` may change after the revision that made it, what evidence a commit under

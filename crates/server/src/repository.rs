@@ -579,6 +579,9 @@ pub(crate) fn create_branch(
     Ok(record) => record,
     Err(reply) => return *reply,
   };
+  if let Some(reply) = no_subversion_branch(&record) {
+    return reply;
+  }
   let Some(source) = state.db.partition().repositories().branch(record.id, from) else {
     return refused(Refusal::NotFound);
   };
@@ -678,6 +681,9 @@ pub(crate) fn bind_branch(
     Ok(record) => record,
     Err(reply) => return *reply,
   };
+  if let Some(reply) = no_subversion_branch(&record) {
+    return reply;
+  }
   // One entry of the repository's register (A-603), whose guard binds a member of this lineage only.
   let entry = next_entry(state, record.id).map(|mut entry| {
     entry.names.push(NameChange::Bind {
@@ -692,6 +698,19 @@ pub(crate) fn bind_branch(
   }
 }
 
+/// The refusal of a lineage branch verb on a Subversion repository (§4.17.4: the repository is one green whose version N
+/// is revision N, and a branch is a directory in it, made by a copy a client commits): `Unsupported`, by kind, so no verb
+/// makes a green no Subversion path serves or unbinds the one they serve; none for another tool's repository.
+fn no_subversion_branch(record: &RepositoryRecord) -> Option<ReplyBody> {
+  (record.tool == slates_db::catalog::VcsTool::Subversion).then(|| {
+    refused(Refusal::Unsupported {
+      feature: "a branch of a Subversion repository as a green of its own: Subversion's branches are directories in \
+                its one green, made by a copy (`svn copy`)"
+        .to_owned(),
+    })
+  })
+}
+
 /// `RetireBranch` (module docs): `name` leaves the namespace and its green stays a member. Answered `Acknowledged`.
 pub(crate) fn retire_branch(
   state: &mut ShardState,
@@ -702,6 +721,9 @@ pub(crate) fn retire_branch(
     Ok(record) => record,
     Err(reply) => return *reply,
   };
+  if let Some(reply) = no_subversion_branch(&record) {
+    return reply;
+  }
   // One entry of the repository's register (A-603).
   let entry = next_entry(state, record.id).map(|mut entry| {
     entry.names.push(NameChange::Retire {
