@@ -718,6 +718,31 @@ impl Repository {
       .collect()
   }
 
+  /// A tree's entries' objects, each with the kind its mode names (`040000` a tree, else a blob), a submodule's commit
+  /// left out.
+  fn tree_typed_references(
+    &self,
+    store: &ContentStore,
+    id: &ObjectId,
+    place: &Place,
+  ) -> Result<Vec<(ObjectId, Kind)>, StoreRefused> {
+    let bytes = Repository::bytes_of(store, id, place)?;
+    let malformed = StoreRefused::Malformed { id: *id };
+    let tree =
+      Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
+    tree
+      .entries()
+      .iter()
+      .filter(|entry| entry.kind() != Kind::Commit)
+      .map(|entry| {
+        entry
+          .object_id(self.format)
+          .map(|object| (object, entry.kind()))
+          .ok_or(malformed)
+      })
+      .collect()
+  }
+
   /// The object a tag names.
   fn tag_reference(
     &self,

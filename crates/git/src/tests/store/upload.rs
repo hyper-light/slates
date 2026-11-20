@@ -623,6 +623,45 @@ fn a_parts_wanted_entries_are_marked_over_units_and_read_over_words() {
   repository.release(&mut store).unwrap();
 }
 
+/// A-745 item 4 (module docs, **Slices**: a window's worth of the answer's handles read a unit). Do: push one version
+/// of twelve windows' worth of files, encode it, and answer every third file one by one, a set kept as a bit table
+/// whose runs are four windows' worth; stream it a unit a turn. Expect: read back, exactly the files answered; no unit
+/// of reading the answer read more than a window's worth of its kept units, where the reader had made every run of the
+/// set again each unit (a deepen's plan of 32,000 scattered runs, all 32,000 made each window).
+#[test]
+fn a745_reading_a_scattered_answer_reads_a_window_a_unit_never_the_whole_set() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  // Shape: one unit reads a window's worth of handles, eight bytes each (`store::upload`'s `handles`); every third of
+  // twelve windows' worth of files makes four windows' worth of runs, more than one unit reads.
+  let handles = WINDOW / size_of::<u64>();
+  let (repository, files) = files_in_one_version(format, &mut store, handles * 12);
+  let mut by_position: Vec<(u64, ObjectId)> = files
+    .iter()
+    .map(|file| {
+      (
+        repository.object(&store, &file.id).unwrap().position,
+        file.id,
+      )
+    })
+    .collect();
+  by_position.sort_unstable();
+  let wanted: BTreeSet<ObjectId> = by_position.iter().step_by(3).map(|(_, id)| *id).collect();
+  let positions = positions_of(&repository, &store, &wanted);
+  assert!(positions.runs() >= handles * 4, "{} runs", positions.runs());
+  let answer = Answer::objects(&positions);
+  let (pack, counters) = streamed(&repository, &store, answer, 0);
+  assert_eq!(
+    once(&read_back(format, &pack, &Held::none()).unwrap()),
+    wanted
+  );
+  assert!(
+    counters.objects_read_most <= u64::try_from(handles).unwrap(),
+    "{counters:?}"
+  );
+  repository.release(&mut store).unwrap();
+}
+
 /// A ref whose history a client holds at version 0, then rewritten twice: version 1 a new root over a file `p`,
 /// version 2 that file edited (a reference delta against version 1's in its fragment), version 3 a new root again
 /// keeping version 2's file and adding `q`, so version 1's file is in neither the client's history nor the wanted one.

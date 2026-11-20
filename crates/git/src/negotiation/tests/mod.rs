@@ -302,10 +302,12 @@ impl Graph for TestGraph {
 }
 
 /// A test graph that counts what a walk reads of it: each commit's parents asked, each tag's target, each ref's tip or
-/// tag met (A-745: how much of the graph a step of the negotiation reads).
+/// tag met (A-745: how much of the graph a step of the negotiation reads); and, apart, each row the walk asks of an
+/// object for its kind or its size (a store's index lookups).
 struct Counted<'g> {
   graph: &'g TestGraph,
   reads: std::cell::Cell<u64>,
+  rows: std::cell::Cell<u64>,
 }
 
 impl Counted<'_> {
@@ -330,6 +332,7 @@ impl Graph for Counted<'_> {
     self.graph.id(node)
   }
   fn kind(&self, node: u32) -> Kind {
+    self.rows.set(self.rows.get() + 1);
     self.graph.kind(node)
   }
   fn commit(&self, node: u32) -> Option<CommitRow<u32>> {
@@ -342,10 +345,14 @@ impl Graph for Counted<'_> {
   fn entries(&self, tree: u32) -> impl Iterator<Item = u32> {
     self.graph.entries(tree)
   }
+  fn typed_entries(&self, tree: u32) -> impl Iterator<Item = (u32, Kind)> {
+    self.graph.typed_entries(tree)
+  }
   fn named_entries(&self, tree: u32) -> impl Iterator<Item = (u32, Vec<u8>)> {
     self.graph.named_entries(tree)
   }
   fn size(&self, blob: u32) -> u64 {
+    self.rows.set(self.rows.get() + 1);
     self.graph.size(blob)
   }
   fn target(&self, tag: u32) -> Option<u32> {
@@ -2312,6 +2319,7 @@ fn a745_begin_reads_what_the_request_names_and_each_step_one_unit_of_ready_the_c
     let counted = Counted {
       graph: &graph,
       reads: std::cell::Cell::new(0),
+      rows: std::cell::Cell::new(0),
     };
     let mut admission = Admission::new(u64::MAX);
     let begun = super::begin(&counted, &request, &mut admission);
@@ -2384,4 +2392,72 @@ fn a745_a_deepening_through_a_merge_heavy_history_is_negotiated_within_a_few_kil
     panic!("not a pack")
   };
   assert!(pack.objects.len() > 6_000, "{} objects", pack.objects.len());
+}
+
+/// A-745 (found by use: `git fetch --deepen 100` of git v2.0.0, settled, 31.3 s against `git daemon`'s 4.5 s, its
+/// time in the store's index lookups under the selection's tree walk). Do: a 600-commit history whose root trees share
+/// 200 blobs and add one of their own each, as a real history's trees share most entries; a client shallow at the tip
+/// asks a deepening of 100, and the same with `blob:limit`. Expect: the oracle's answer; the walk asks no row of an
+/// entry for its kind (a tree's entries carry it, as a store reads it from their modes; a few rows for the wants and
+/// haves alone) and none for its size but under `blob:limit`, each entry it meets again skipped, where it had asked a kind and a size of every entry of every tree
+/// it opened (about 100 trees of 200 entries, 40,000 rows).
+#[test]
+fn a745_a_deepening_asks_no_row_of_a_tree_entry_for_its_kind() {
+  const COMMITS: u64 = 600;
+  const SHARED: u64 = 200;
+  let mut graph = TestGraph::default();
+  let shared: Vec<u32> = (0..SHARED).map(|at| graph.new_blob(at)).collect();
+  let mut parent: Option<u32> = None;
+  for at in 0..COMMITS {
+    let own = graph.new_blob(SHARED + at);
+    let mut entries = shared.clone();
+    entries.push(own);
+    let tree = graph.new_tree(&entries);
+    let parents: Vec<u32> = parent.into_iter().collect();
+    parent = Some(graph.new_commit(&parents, tree, at + 1));
+  }
+  let tip_node = parent.unwrap();
+  graph.tips.push(tip_node);
+  let tip = graph.id(tip_node);
+  // Shape: a few rows for the wants and haves (7 measured); under `blob:limit` a size for each blob met once, the 200
+  // shared and the 100 of the deepened commits' own.
+  for (filter, most_rows) in [(None, 16), (Some(Filter::BlobLimit(1024)), SHARED + 116)] {
+    let asks = Asks {
+      wants: vec![tip],
+      haves: vec![tip],
+      shallow: vec![tip],
+      deepen: Some(OwnedDeepen::Depth(100, true)),
+      filter: filter.clone(),
+      done: true,
+      ..Asks::default()
+    };
+    let expected = oracle(&graph, &asks).unwrap();
+    let counted = Counted {
+      graph: &graph,
+      reads: std::cell::Cell::new(0),
+      rows: std::cell::Cell::new(0),
+    };
+    let request = asks.request();
+    let mut admission = Admission::new(u64::MAX);
+    let Ok(super::Begun::Selecting(mut negotiating)) =
+      super::begin(&counted, &request, &mut admission)
+    else {
+      panic!("answered at begin");
+    };
+    counted.rows.set(0);
+    let outcome = loop {
+      if let Some(outcome) = negotiating
+        .step(&counted, &mut admission, &mut || true)
+        .unwrap()
+      {
+        break outcome;
+      }
+    };
+    assert!(
+      outcome.answer == expected.answer,
+      "{filter:?}: the oracle's answer"
+    );
+    let rows = counted.rows.get();
+    assert!(rows <= most_rows, "{filter:?}: {rows} rows asked");
+  }
 }

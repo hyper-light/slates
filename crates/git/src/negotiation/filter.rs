@@ -154,6 +154,16 @@ impl Filter {
     }
   }
 
+  /// Whether the filter judges a blob by its size (`blob:limit`, alone or combined): only then does a walk read a blob's
+  /// size.
+  pub fn needs_size(&self) -> bool {
+    match self {
+      Filter::BlobLimit(_) => true,
+      Filter::Combine(filters) => filters.iter().any(Filter::needs_size),
+      _ => false,
+    }
+  }
+
   /// Whether a tree or blob met `depth` below its commit's root tree can be sent at all: not at or past a depth limit,
   /// and not under a filter that sends only commits or tags. A walk opens no tree whose entries none could be.
   pub fn reaches(&self, depth: u64) -> bool {

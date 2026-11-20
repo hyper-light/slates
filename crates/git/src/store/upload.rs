@@ -173,11 +173,15 @@ pub struct UploadCounters {
   /// Objects past a window no part covered that had a candidate base, sent whole because the request's admission
   /// could not hold their search (module docs, **What it sends** 3); each is counted in `loose_whole` too.
   pub loose_unsearched: u64,
+  /// The most of the answer's kept units (runs, listed positions or table words) one unit of reading its objects read:
+  /// a window's worth at most, however many the answer holds (module docs, **Slices**).
+  pub objects_read_most: u64,
 }
 
 /// Where the stream is (module docs).
 enum Stage {
-  /// Reading the answer's objects into the wanted set, from the one at `next`.
+  /// Reading the answer's objects into the wanted set, from its kept unit `next` (a run, a listed position or a table
+  /// word, as its form keeps them).
   Objects { next: usize },
   /// Gathering run `run`'s version `version`'s objects the filter sends, from position `from` on.
   Gather { run: usize, version: u64, from: u64 },
@@ -509,19 +513,20 @@ impl<A: Answered> Upload<A> {
     }
   }
 
-  /// Reads a window's worth of the answer's runs of objects into the wanted set, a run `size_of::<(u64, u64)>()` bytes
-  /// (A-745: the answer carries its objects as runs, so a clone's few runs are read at once whatever it holds).
+  /// Reads a window's worth of the answer's objects into the wanted set: its kept units from unit `next` on (its runs,
+  /// listed positions or table words, whichever its form keeps), copied as they are kept, so a unit reads its window
+  /// and never the set again (A-745 item 4), and the wanted set ends equal to the answer's, in its form. A unit
+  /// `size_of::<u64>()` bytes at least, so a clone's few runs are read at once whatever it holds.
   fn read_objects(&mut self, cx: &Context<'_>, next: usize) -> Result<Stage, StoreRefused> {
     let handles = handles(cx.store);
-    let runs = self.answer.objects().run_pairs();
-    let end = next.saturating_add(handles).min(runs.len());
-    let window =
-      Positions::from_runs(runs.get(next..end).unwrap_or_default().to_vec()).unwrap_or_default();
-    self.wanted = self.wanted.union(&window);
-    if end < runs.len() {
-      return Ok(Stage::Objects { next: end });
+    let (after, read) = self
+      .wanted
+      .copy_window(self.answer.objects(), next, handles);
+    self.counters.objects_read_most = self.counters.objects_read_most.max(to_u64(read));
+    match after {
+      Some(next) => Ok(Stage::Objects { next }),
+      None => self.gather_from(0),
     }
-    self.gather_from(0)
   }
 
   /// Gathering run `run` from its first version; once every run is gathered, the wanted set made whole and counted.

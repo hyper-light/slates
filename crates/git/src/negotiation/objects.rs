@@ -599,12 +599,14 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
       }
     }
     counters.trees = counters.trees.saturating_add(1);
-    for entry in graph
-      .entries(tree)
-      .filter(|entry| !view.held.contains(*entry))
-    {
-      let kind = graph.kind(entry);
-      let size = if kind == Kind::Blob {
+    let once = matches!(self.opened, Opened::Once(_));
+    let sized = view.filter.is_some_and(Filter::needs_size);
+    for (entry, kind) in graph.typed_entries(tree) {
+      // Met already: held by the client, or chosen (a tree chosen is queued when it is, so opened once it is done).
+      if view.held.contains(entry) || (once && self.objects.contains(entry)) {
+        continue;
+      }
+      let size = if kind == Kind::Blob && sized {
         graph.size(entry)
       } else {
         0

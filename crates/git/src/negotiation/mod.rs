@@ -85,6 +85,11 @@ pub trait Graph {
   /// A tree's entries the store holds: its subtrees and blobs, never a submodule's commit (a gitlink, which no
   /// repository but the submodule's holds).
   fn entries(&self, tree: Self::Node) -> impl Iterator<Item = Self::Node>;
+  /// The same entries, each with its kind: by default each entry's own ([`Graph::kind`]); a store reads them from the
+  /// tree's modes, as git's walk does (`040000` a tree, else a blob), so a walk asks no row of an entry for its kind.
+  fn typed_entries(&self, tree: Self::Node) -> impl Iterator<Item = (Self::Node, Kind)> {
+    self.entries(tree).map(|entry| (entry, self.kind(entry)))
+  }
   /// The same entries, in the tree's order, each with its name: what a sparse filter asks its patterns of (A-640
   /// part 4).
   fn named_entries(&self, tree: Self::Node) -> impl Iterator<Item = (Self::Node, Vec<u8>)>;
