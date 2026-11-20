@@ -1000,32 +1000,39 @@ pub(crate) const TURNS_SHARED: &str = "xshard.turns_shared";
 /// `call_within`'s is, while the task runs to its end on its shard. A call to this shard is the same task, spawned
 /// here: it too runs to its end however long it takes, so dropping it never loses what the future holds mid-way
 /// (§4.3). A wait for the target's answer while it lives is [`task_in_shard_time`].
-pub async fn task_within<T, F>(
+/// The task is labelled with the line that called this (A-740, `slates_rt::futures::spawn_at`), so a shard found stuck
+/// in it names the work, not this helper.
+#[track_caller]
+pub fn task_within<T, F>(
   origin: u16,
   shard: u16,
   start: impl FnOnce() -> F + Send + 'static,
   deadline_ns: u64,
-) -> Option<T>
+) -> impl Future<Output = Option<T>>
 where
   T: Send + 'static,
   F: Future<Output = T> + 'static,
 {
-  within(task_on(origin, shard, start)?, deadline_ns).await
+  let call = task_on(origin, shard, std::panic::Location::caller(), start);
+  async move { within(call?, deadline_ns).await }
 }
 
 /// [`task_within`], awaited while the target is working, up to `budget_ns` of the target's own CPU time
 /// ([`within_shard_time`]).
-pub async fn task_in_shard_time<T, F>(
+/// The task is labelled with the line that called this, as [`task_within`]'s is.
+#[track_caller]
+pub fn task_in_shard_time<T, F>(
   origin: u16,
   shard: u16,
   start: impl FnOnce() -> F + Send + 'static,
   budget_ns: u64,
-) -> Option<T>
+) -> impl Future<Output = Option<T>>
 where
   T: Send + 'static,
   F: Future<Output = T> + 'static,
 {
-  within_shard_time(task_on(origin, shard, start)?, budget_ns).await
+  let call = task_on(origin, shard, std::panic::Location::caller(), start);
+  async move { within_shard_time(call?, budget_ns).await }
 }
 
 /// Sends the task of a [`task_within`] to `shard` and returns the call its result arrives on; `None` when it could not
@@ -1033,6 +1040,7 @@ where
 fn task_on<T, F>(
   origin: u16,
   shard: u16,
+  site: &'static std::panic::Location<'static>,
   start: impl FnOnce() -> F + Send + 'static,
 ) -> Option<CrossShardCall<T>>
 where
@@ -1050,11 +1058,11 @@ where
     // A call to this shard is a task here, carrying its result home like any other: dropped at the deadline in place,
     // the future lost whatever it held mid-way (a live dispatch's borrowed sessions, which were never returned).
     // Dropping `call` forgets the registration.
-    return spawn_carrying_home(origin, id, start).then_some(call);
+    return spawn_carrying_home(origin, id, site, start).then_some(call);
   }
   let task = SpawnRequest::new(
     Box::pin(async move {
-      if !spawn_carrying_home(origin, id, start) {
+      if !spawn_carrying_home(origin, id, site, start) {
         let back = SpawnRequest::new(
           Box::pin(async move {
             deliver(id, Box::new(None::<T>));
@@ -1074,7 +1082,12 @@ where
 /// On the target of a [`task_within`]: spawns the future `start` makes as a task of this shard, which carries its result
 /// home to `origin` as call `id` when it ends. Whether the shard's task arena took it. Kept out of the task that called
 /// it, so that task holds nothing but `Send` values across its own await.
-fn spawn_carrying_home<T, F>(origin: u16, id: u64, start: impl FnOnce() -> F + 'static) -> bool
+fn spawn_carrying_home<T, F>(
+  origin: u16,
+  id: u64,
+  site: &'static std::panic::Location<'static>,
+  start: impl FnOnce() -> F + 'static,
+) -> bool
 where
   T: Send + 'static,
   F: Future<Output = T> + 'static,
@@ -1089,7 +1102,8 @@ where
     );
     send_back(origin, back);
   };
-  slates_rt::futures::spawn(work)
+  // Labelled with the line that asked for the work (A-740), not this one.
+  slates_rt::futures::spawn_at(site, work)
     .and_then(slates_rt::futures::detach)
     .is_ok()
 }
@@ -1542,6 +1556,57 @@ mod tests {
       ran += 1;
     }
     ran
+  }
+
+  /// A-740's labels through the cross-shard task helpers (w-forming, 2026-11-20; found by use: a 2,933 ms poll on a
+  /// fleet member's shard was named `xshard.rs` and `fleet.rs` lines inside these helpers, not the work). Do: on a shard,
+  /// from a task there, make a `task_within` and a `task_in_shard_time` call to that same shard whose future reads the
+  /// task the shard's pulse says it is polling. Expect each named by the line of this test that made the call. Before,
+  /// both were named by the line in `spawn_carrying_home` that spawned them, whatever work they carried.
+  #[test]
+  // The test thread waits off-shard for what the shard's tasks report.
+  #[allow(clippy::disallowed_methods)]
+  fn a_cross_shard_tasks_label_names_the_line_that_asked_for_it() {
+    /// Shape: the calls' deadline and budget: a coordinator period, far past a future that answers at once.
+    const DEADLINE_NS: u64 = crate::daemon::HEARTBEAT_NS;
+    /// Shape: how long the test thread waits for each report.
+    const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    let daemon = crate::daemon::audit_daemon();
+    let (seen, labels) = std::sync::mpsc::sync_channel::<(u32, Option<u32>)>(2);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let home = state.shard;
+      let caller = slates_rt::futures::spawn(async move {
+        let polled = move || {
+          slates_rt::registry::with_entry(home, |entry| entry.pulse.polling().label)
+            .flatten()
+            .and_then(|label| match label {
+              slates_rt::label::TaskLabel::Site(site) if site.file().ends_with("xshard.rs") => {
+                Some(site.line())
+              }
+              _ => None,
+            })
+        };
+        let within_line = line!() + 1;
+        let within = task_within(home, home, move || async move { polled() }, DEADLINE_NS).await;
+        let _ = seen.try_send((within_line, within.flatten()));
+        // The call's line: the one below this binding's, as rustfmt lays it out.
+        let shard_time_line = line!() + 2;
+        let shard_time =
+          task_in_shard_time(home, home, move || async move { polled() }, DEADLINE_NS).await;
+        let _ = seen.try_send((shard_time_line, shard_time.flatten()));
+      })
+      .unwrap();
+      slates_rt::futures::detach(caller).unwrap();
+    });
+    for helper in ["task_within", "task_in_shard_time"] {
+      let (asked_at, named) = labels.recv_timeout(REPORT_WAIT).unwrap();
+      assert_eq!(
+        named,
+        Some(asked_at),
+        "a {helper} task is named by the line that asked for it"
+      );
+    }
+    daemon.stop();
   }
 
   /// §4.3 cancellation safety, the same on every shard (R8). Do: on a shard, from a task there, make a `task_within`
