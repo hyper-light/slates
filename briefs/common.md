@@ -62,3 +62,14 @@ Target: under 30 minutes per piece.
   If the push is rejected because main moved, fetch, merge again and push again until it lands -- never force.
 - Confirm it landed: `git fetch origin && git merge-base --is-ancestor <your commit> origin/main`. Only then report it.
 - Never leave finished work on a branch. A branch that holds done work is not done.
+
+## CLAIMING AN A-NUMBER (main 2026-11-19 ~23:40 PST: three numbers were claimed twice tonight)
+The ledger amendments.tsv on the branch agents/fanout-state is the only authority. A number is yours only once your
+push of its line to that branch succeeds:
+1. Pull the state branch (on this Mac: `git -C ~/.local/state/slates-fanout pull -q --no-rebase origin
+   agents/fanout-state`; on a Studio: in your own state folder).
+2. Append your line with the "next free" number, bump "# next free", commit, and push it to agents/fanout-state AT
+   ONCE, before you write the number anywhere else.
+3. If the push is rejected, pull again (a conflict in the ledger means the number went to someone else), take the
+   new next free number and push again.
+Never put a number in a commit for main that you haven't pushed to the ledger.
