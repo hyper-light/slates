@@ -1278,7 +1278,7 @@ async fn drive<S, M>(
     reply: Vec::new(),
   };
   let exit = loop {
-    let flow = match connection.next() {
+    let flow = match connection.next_step() {
       Next::Write => parts.write(&mut connection).await,
       Next::Read => parts.read(&mut connection).await,
       Next::Decide => parts.decide(&mut connection).await,

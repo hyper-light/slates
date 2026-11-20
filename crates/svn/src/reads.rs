@@ -65,7 +65,9 @@
 
 use crate::authz::{PrincipalRules, may_read};
 use crate::handshake::ClientCapabilities;
-use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
+use crate::index::{
+  ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, PropertyPairs, Revision,
+};
 use crate::lock::{AprTime, LockTable};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
 use crate::ra_svn::{ItemError, Value, write};
@@ -1084,11 +1086,7 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
 
   /// A node's properties and the entry properties `get_props` adds: its committed revision, that revision's date and
   /// author as stored, and the repository's UUID.
-  fn node_properties(
-    &self,
-    path: &str,
-    revision: Revision,
-  ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Failure> {
+  fn node_properties(&self, path: &str, revision: Revision) -> Result<PropertyPairs, Failure> {
     let node = self
       .node(path, revision)?
       .ok_or_else(|| Failure::not_found(path, revision))?;
@@ -1535,11 +1533,14 @@ impl DirectoryRequest {
   /// `svn_ra_svn__parse_tuple(params, "c(?r)bb?l?B")`.
   fn parse(params: &[Value<'_>], base: &str) -> Option<Self> {
     let (path, revision) = path_and_revision(params, base)?;
+    // Format: `"c(?r)bb?l?B"` is path 0, revision 1, want-props 2, want-contents 3, dirent fields 4
+    // and inherited-props 5 (`serve.c` `get_dir`).
     let fields = match params.get(4) {
       None => Fields::all(),
       Some(Value::List(words)) => Fields::of(words)?,
       Some(_) => return None,
     };
+    // Format: `"c(?r)bb?l?B"`'s sixth item, inherited-props.
     let inherited = match params.get(5) {
       None => false,
       some => boolean(some)?,
@@ -1548,6 +1549,7 @@ impl DirectoryRequest {
       path,
       revision,
       properties: boolean(params.get(2))?,
+      // Format: `"c(?r)bb?l?B"`'s want-contents, its fourth item.
       contents: boolean(params.get(3))?,
       fields,
       inherited,
@@ -1719,6 +1721,7 @@ impl MergeinfoRequest {
       paths,
       revision,
       inheritance: MergeinfoInheritance::from_word(word.as_bytes()),
+      // Format: `"l(?r)wb"`'s fourth item, include-descendants (`serve.c` `get_mergeinfo`).
       descendants: boolean(params.get(3))?,
     })
   }

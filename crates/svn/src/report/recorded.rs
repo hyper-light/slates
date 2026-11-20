@@ -413,8 +413,11 @@ struct DriveReader {
   /// The tokens of the nodes open, the innermost last.
   open: Vec<String>,
   /// The delta being read: its base MD5, its chunks and the items they came in.
-  delta: Option<(Option<[u8; 16]>, Vec<u8>, Vec<usize>)>,
+  delta: Option<DeltaRead>,
 }
+
+/// A delta being read: its base MD5, its chunks' bytes so far, and the items they came in.
+type DeltaRead = (Option<[u8; 16]>, Vec<u8>, Vec<usize>);
 
 impl DriveReader {
   /// Reads one command.

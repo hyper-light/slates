@@ -44,6 +44,8 @@
 //!   resource (`!svn/me`, where a stock client sends it) or a node's URL is answered from A-616's drive by A-627's
 //!   writer, streamed the same way ([`super::update`]; checkout, update, switch and export). Every other report is
 //!   `501` in `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
+//! - An HTTPv2 commit's methods (POST to `!svn/me`, PUT, MKCOL, DELETE, COPY and PROPPATCH under `!svn/txr/`, MERGE)
+//!   are the caller's, which holds each transaction between its requests and drives it through [`super::commit`].
 //! - Every other method: `501`, `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
 //!
 //! **Read access** (`mod_authz_svn`'s questions with HTTP, §4.17.4 item 10). A request whose node's path the
@@ -253,7 +255,7 @@ pub struct Report {
 #[derive(Debug)]
 enum Walk {
   /// A `log-report`'s.
-  Log(DavLog),
+  Log(Box<DavLog>),
   /// An `update-report`'s ([`super::update`]).
   Update(Box<UpdateWalk>),
 }
@@ -605,7 +607,7 @@ fn report<R: Repository + ?Sized>(
   match asked {
     Asked::Log(log) => match DavLog::new(&log, &place.path) {
       Some(log) => Answer::Report(Report {
-        walk: Walk::Log(log),
+        walk: Walk::Log(Box::new(log)),
       }),
       None => Answer::Whole(bare(HTTP_BAD_REQUEST)),
     },
@@ -822,7 +824,8 @@ fn rfc1123(date: &str) -> Option<String> {
   let (year, month, day) = super::time::civil_from_days(days)?;
   let (hour, minute, second) = super::time::time_of_day(seconds % super::time::SECONDS_PER_DAY);
   let week = u64::try_from(DAY_NAMES.len()).ok()?;
-  let weekday = DAY_NAMES.get(usize::try_from(days.saturating_add(EPOCH_WEEKDAY) % week).ok()?)?;
+  let weekday =
+    DAY_NAMES.get(usize::try_from(days.saturating_add(EPOCH_WEEKDAY).checked_rem(week)?).ok()?)?;
   let month_name = MONTH_NAMES.get(usize::try_from(month.checked_sub(1)?).ok()?)?;
   Some(format!(
     "{weekday}, {day:02} {month_name} {year} {hour:02}:{minute:02}:{second:02} GMT"

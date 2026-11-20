@@ -108,6 +108,7 @@ impl SegmentsRequest {
       path,
       peg,
       start: optional_revnum(params.get(2))?,
+      // Format: `"c(?r)(?r)(?r)"`'s fourth item, the end revision (`serve.c` `get_location_segments`).
       end: optional_revnum(params.get(3))?,
     })
   }

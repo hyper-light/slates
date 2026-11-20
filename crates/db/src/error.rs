@@ -237,6 +237,7 @@ impl fmt::Display for DbError {
         "{members} live members of its lineage were made from this green"
       ),
       Self::Review(rule) => write!(f, "review: {rule}"),
+      // Shape: a green named by its first 4 bytes, enough to tell one from another in a message.
       Self::Moved { green, read, at } => write!(
         f,
         "green {:02x?} moved from {read}, read by the push, to {at}",

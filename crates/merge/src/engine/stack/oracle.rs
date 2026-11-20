@@ -52,11 +52,14 @@ struct Splice {
   tail: Vec<u8>,
 }
 
-/// One work's edits: for each file it edits (chosen among its base's files), raw splices `(offset, kind, size)`; and
-/// whether it makes a fresh file.
+/// A raw splice as generated: `(offset, kind, size)`.
+type RawSplice = (u8, u8, u8);
+
+/// One work's edits: for each file it edits (chosen among its base's files), raw splices; and whether it makes a fresh
+/// file.
 #[derive(Clone, Debug)]
 struct Spec {
-  edits: Vec<(u8, Vec<(u8, u8, u8)>)>,
+  edits: Vec<(u8, Vec<RawSplice>)>,
   make: bool,
 }
 
@@ -103,7 +106,7 @@ impl Fresh {
 /// The splices `raw` make of a text `len` bytes long: pure kinds, each run fresh, sorted, and each at least one
 /// untouched byte from the one before, so the work puts no two operations at one offset. With `adds`, a file no splice
 /// adds bytes to is left alone, so the work's file never equals one another work made.
-fn splices(len: usize, raw: &[(u8, u8, u8)], fresh: &mut Fresh, adds: bool) -> Vec<Splice> {
+fn splices(len: usize, raw: &[RawSplice], fresh: &mut Fresh, adds: bool) -> Vec<Splice> {
   let mut wanted: Vec<(usize, u8, usize)> = raw
     .iter()
     .map(|(at, kind, size)| {
@@ -606,12 +609,15 @@ impl TreeBase for Files {
   }
 }
 
+/// Each file's bytes, by path.
+type FileBytes = BTreeMap<String, Vec<u8>>;
+
 /// The whole-file model of a work over a tree (module docs), from the tree, the head and the files the work leaves over
 /// the tree: the files after it, or none for a conflict; and how many files it applied and refused.
 fn tree_model(
-  (tree, head): (&BTreeMap<String, Vec<u8>>, &BTreeMap<String, Vec<u8>>),
-  after: &BTreeMap<String, Vec<u8>>,
-) -> (Option<BTreeMap<String, Vec<u8>>>, u64, u64) {
+  (tree, head): (&FileBytes, &FileBytes),
+  after: &FileBytes,
+) -> (Option<FileBytes>, u64, u64) {
   let mut model = head.clone();
   let (mut applied, mut refused) = (0, 0);
   for (path, bytes) in after {

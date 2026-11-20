@@ -15942,7 +15942,8 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 
 > **Status (2026-11-20, A-724 piece 1).** Designed below; piece 1 built: each repository's usage counted on its owner
 > shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
-> order: the learned demand and the shares (piece 2), admission by share (3), the cold trigger (4), intake off the owner
+> order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
+> dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3), the cold trigger (4), intake off the owner
 > shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
 > amends §4.10's content placement), and the many-repository load proof (7).
 
@@ -54447,3 +54448,12 @@ Applied in the same change to:
 - **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
 - **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
   Subversion's intakes and reads counted; the rows in `slates status`.
+- **Piece 2, the division (2026-11-20).** `slates_vcs::share::divide`: a shard's capacity of each resource divided among
+  repositories' claims (a measured demand vector and a weight) by weighted DRF with demands as caps [A: Ghodsi et al.,
+  NSDI 2011]; each pass finds exactly the largest level no resource overflows by walking the claims' breakpoints
+  `δ_i / w_i`, settles the claims that are whole or use a full resource, and goes on (at most one pass a resource).
+  Tests: `share::tests` (an oracle over 500 generated divisions of two resources among up to twelve weighted claims
+  against a serial bisection reference, with capacity, cap, work-conservation and the paper's sharing incentive held;
+  the paper's own 9-CPU, 18-GB example; a monorepo beside a toy; degenerate claims never not-a-number). The oracle's
+  first runs found a resource with no room left that the remaining claims never use stopping them at level zero, fixed.
+  Owed: the demands read from the usage rows and the weights learned (piece 2's other half), feeding admission (3).

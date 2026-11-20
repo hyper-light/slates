@@ -84,3 +84,20 @@ callback answering. The same operations replayed alone through `SetEndOfFile` an
 so the race needs fsx's history, its mapped views among it. Owed to the WinFsp dispatcher's owners. Until it is fixed
 the fsx cell fails, listed as `fsx-seed-1-unfinished:10000` with this reason; every fsx run now has a 300 s bound, so
 the lane ends.
+
+**Shown 2026-11-20 (goal 87, w-bugs; corrects "below the single WinFsp receiver" above): the receive worker is the one
+waiting, inside its own send of the shrink's answer.** On CI's windows-latest (x86_64, main 721f4ff97 plus a
+diagnostics-only log of each operation and each send's start and return, branch `diag-w-bugs-b3-9`, run of
+2026-11-20 07:07Z), fsx seed 1 wedged after operation 45 (`TRUNCATE DOWN` from 249,552 to 56,848). The log's last
+lines are `operate kind 8` (SetInformation) and `send begins kind 8` for the same hint, and no `send returned`: the
+worker's `DeviceIoControl` carrying that answer had not returned about 59 s later, when a debugger's minidump froze
+the daemon and the anchor killed it. Every earlier send returned within 481 µs. A stacks-only minidump of the wedged
+daemon itself hung (`0xC000011E`), as one does when a thread waits in the kernel with its APCs disabled. WinFsp v2.1
+completes an answered request on the thread that sent the answer (`src/sys/volume.c` 1089-1102), and
+SetInformation's end-of-file completion calls `FspFileNodeSetFileInfo` (`src/sys/fileinfo.c` 1407), which calls
+`CcSetFileSizes` (`src/sys/file.c` 1852). So the cache manager's work for the shrink runs on slates' only receiver, and
+whatever drive request it waits for (a paging read or write of the file's last page, by the history's mapped and
+cached state) can be received by no one: the drive stops. It is the mechanism g258 proposed for the delete racing a
+coherent purge (GAPS, 2026-11-18), shown here for fsx. The fix is slates': a receive must never wait for a send's
+completion (a second receiver while a send is in flight, WinFsp's own posture of at least two dispatcher threads, or
+sends made from a thread that does not receive) -- an amendment to A-198's single-receiver journal, owed.

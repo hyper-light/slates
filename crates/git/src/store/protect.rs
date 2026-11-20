@@ -100,6 +100,9 @@ pub enum Unsigned<R> {
   Ssh(R),
 }
 
+/// The first commit a move brings that no trusted key signed, and why.
+pub type UnsignedCommit<R> = (ObjectId, Unsigned<R>);
+
 impl Repository {
   /// Refuses a push of another format, or one not sealed: its commits' generation numbers are not known yet, and a
   /// zero would read as no descendant of anything.
@@ -159,7 +162,7 @@ impl Repository {
     green: u64,
     to: ObjectId,
     signers: &S,
-  ) -> Result<Option<(ObjectId, Unsigned<S::Refused>)>, StoreRefused> {
+  ) -> Result<Option<UnsignedCommit<S::Refused>>, StoreRefused> {
     self.judge_brought(store, push, (green, to), |id, _| {
       let why = self.signature_refused(store, push, &id, signers)?;
       Ok(why.map(|why| (id, why)))

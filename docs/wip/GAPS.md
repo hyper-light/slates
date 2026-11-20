@@ -74,7 +74,8 @@
 >
 > **A-724 piece 1 (2026-11-20, w-balance; many repositories balanced by learned usage, §4.17.5).** BUILT: each
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
-> steps). Owed: learned demand and shares (2), admission by share (3), the cold trigger (4), intake off the owner and
+> steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
+> demands and weights read from the rows (2), admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
 > **A-719 part 2 (2026-11-20, w-git).** BUILT: the pack reader's keeper seam (`unpack::Keep`): each object handed to its
@@ -1424,6 +1425,13 @@
 > working-copy state checked by the ra_svn reporter's own rules (`report::whole_report`); OPTIONS says
 > `SVN-Allow-Bulk-Updates: Prefer`, so stock svn asks send-all. Stock svn 1.15's checkout (2,000 git/git revisions'
 > trunk in 5 s), export and update over HTTP pass; blame and diff ask reports still `501`; commits wait on POST.
+> **A-681 part C, HTTPv2 commits (w-interop, 2026-11-20):** `dav::commit::DavCommit` drives a POST's transaction
+> (`create-txn-with-props`) and its PUT, MKCOL, DELETE, COPY, PROPPATCH and MERGE through the one commit drive
+> (`Drive::edit`, typed), kept on the owner shard between requests (`VcsStores`, one a repository and principal) and
+> landed by `svn_commit::commit_work`; the HTTP edge now serves a `204` with no framing (ra_serf requires it for an
+> updating PUT and a DELETE). Stock svn 1.15's HTTP round trip runs un-ignored and passes; svn matrix over HTTP 23 of
+> 27. Owed: LOCK/UNLOCK and a commit's lock tokens (`If`, `S:lock-token-list`); the reports blame, diff and merge ask
+> (`file-revs`, a diff's, `mergeinfo`); a PUT's body held whole within the room; an abandoned transaction's expiry.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
@@ -3342,6 +3350,12 @@
 > - A second system worker held one resource exclusive and a second one on its own stack.
 >
 > **The mechanism the source gives (a hypothesis that fits every waiter; not proven).**
+> **Shown for fsx's wedge (2026-11-20, goal 87, w-bugs; goal-83 B3):** on CI's windows-latest the receive worker began
+> sending a shrink's SetInformation answer and that `DeviceIoControl` never returned (about 59 s, then the run's end);
+> every earlier send returned within 481 µs and no request was received after it (diagnostics branch
+> `diag-w-bugs-b3-9`; record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`, "Shown
+> 2026-11-20"). SetInformation's completion runs `CcSetFileSizes` on the sender (`fileinfo.c` 1407, `file.c` 1852), so
+> the one receiver waits on the drive it alone receives for. The fix (a receive never waits on a send) is owed.
 > - WinFsp completes an answered IRP inline, on the thread that sent the answer. `FspVolumeTransact`
 >   (`src/sys/volume.c:1089-1102`) calls `FspIopDispatchComplete` for each answer, and the kind's `FSP_LEAVE_IOC`
 >   (`src/sys/driver.h:289-306`) ends in `IoCompleteRequest` (`src/sys/iop.c:321`).

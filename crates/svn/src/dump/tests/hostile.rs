@@ -595,7 +595,7 @@ fn a_node_record_whose_headers_contradict_each_other_or_the_stream_is_refused_by
         &[&node(
           &format!(
             "Node-path: a\nNode-kind: file\nNode-action: change\nText-content-md5: {}\nText-content-length: 1\nContent-length: 1\n",
-            &hex32[1..]
+            hex32.get(1..).unwrap()
           ),
           b"x",
         )],

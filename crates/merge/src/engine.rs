@@ -6018,7 +6018,7 @@ mod tests {
         path: to,
         at: 0,
         len: 0,
-        src: u64::from(from),
+        src: from,
       });
       self
     }
