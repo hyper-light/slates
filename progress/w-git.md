@@ -239,3 +239,12 @@
   E. Record writer names by identity (unchanged); its pack is the push's.
   F. Red: in-flight resident of a v1.5.0 push before its seal <= k*pack + base (diag measured 16.9-34 MiB admission +
      content 14 MiB+ during input today).
+- ~13:20 main's HEAD-after-restart report (Windows v1.0.0, 16/27): diagnosed as harness, not slates — jupiter's
+  git-src HEAD is main, git-matrix.sh creates the repo with --default-branch from the source HEAD, PUSH_REFS pushed
+  master only; stock git answers the same. Main routed the script fix to w-interop.
+- B2 in-flight half WRITTEN (branch agents/w-git-b2, 6c33bc0ca; worktree ~/slates-work/w-git-inflight): Push keeps the
+  client's pack + placed map, Push::bytes reads in place (packed::Recent cache, budget = pack len), staging puts fresh
+  objects (put_placed), hook view from staged contents, record writes push.pack(), session keeps pack_len only.
+  Studio (kiln .local-2, own target): check clean; slates-git --lib 579 passed incl. both b2_ tests; server --lib
+  git_push/vcs_store/git_hooks/vcs_http/git_protect 198 passed (pre-merge). b2 bound test: 4 MiB inflated -> held in
+  store 4,194,304 B before, in place 41,568 B (the pack). v1.5.0 diag before/after running (target-rel, delete after).
