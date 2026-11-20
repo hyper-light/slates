@@ -4323,7 +4323,41 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       slates_ipc::protocol::LearnerReport::default()
     },
     failover: failover_report(state),
+    repositories: repository_usage_reports(state),
   }
+}
+
+/// Each repository's usage row this shard keeps (A-724, `ShardState::vcs_usage`), named by its record, for the shard's
+/// report.
+fn repository_usage_reports(
+  state: &ShardState,
+) -> Vec<slates_ipc::protocol::RepositoryUsageReport> {
+  let repositories = state.db.partition().repositories();
+  state
+    .vcs_usage
+    .rows()
+    .map(|(id, usage)| slates_ipc::protocol::RepositoryUsageReport {
+      name: repositories
+        .repository(*id)
+        .map(|record| record.name.clone())
+        .unwrap_or_default(),
+      intakes_begun: usage.intake.begun,
+      intakes_answered: usage.intake.answered,
+      intake_steps: usage.intake.steps,
+      intake_step_ns: usage.intake.step_ns,
+      intake_bytes_in: usage.intake.bytes_in,
+      fetches_begun: usage.fetch.begun,
+      fetch_step_ns: usage.fetch.step_ns,
+      first_ns: usage.first_ns,
+      last_ns: usage.last_ns,
+      longest_intake_step_ns: usage.intake.longest_step_ns,
+      longest_push_phases_ns: crate::git_push::phase_longest(*id).longest.to_vec(),
+      push_phase_steps: crate::git_push::phase_longest(*id).steps.to_vec(),
+      push_phase_ns: crate::git_push::phase_longest(*id).ns.to_vec(),
+      push_phase_gap_ns: crate::git_push::phase_longest(*id).gap_ns.to_vec(),
+      push_first_gap_ns: crate::git_push::phase_longest(*id).first_gap_ns,
+    })
+    .collect()
 }
 
 /// This shard's failover estimate as the wire carries it (A-363): live on the control shard, which runs the
