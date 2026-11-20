@@ -1,0 +1,51 @@
+name: diag-g227-catchup
+
+# Diagnostics only, never on main (A-200): a resumed holder's catch-up 20,000 entries behind on today's main (A) and on
+# today's main with the catch-up pair's three changes reverted (B), interleaved ABBA on one runner, 4 runs each.
+# Results to diag-results/g227-catchup-1-<leg>.
+on:
+  push:
+    branches: ["diag-g227-catchup-*"]
+
+permissions:
+  contents: write
+
+jobs:
+  measure:
+    name: catch-up (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: arm, os: ubuntu-24.04-arm }
+          - { leg: x86, os: ubuntu-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - name: The runs
+        shell: bash {0}
+        run: |
+          git worktree add -q --detach ../b origin/agents/g227-catchup-baseline
+          TARGET_BASE=$HOME/g227-target bash .github/diag/measure.sh "$PWD" "$PWD/../b" 4 20000 ../results.txt
+          cat ../results.txt
+          exit 0
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/g227-catchup-1-${{ matrix.leg }}"
+          git config user.name "diag-g227"
+          git config user.email "diag-g227@users.noreply.github.com"
+          cp ../results.txt /tmp/results.txt 2>/dev/null || echo "no results" > /tmp/results.txt
+          for f in ../results.txt.build-a ../results.txt.build-b; do [ -f $f ] && tail -40 $f > /tmp/$(basename $f).tail; done
+          git checkout -q --orphan results-only
+          git rm -rq --cached . || true
+          cp /tmp/results.txt results.txt; cp /tmp/*.tail . 2>/dev/null || true
+          git add results.txt *.tail 2>/dev/null || git add results.txt
+          git commit -qm "diag-g227-catchup-1 results, ${{ matrix.leg }}"
+          git push -q origin "HEAD:refs/heads/$branch"
