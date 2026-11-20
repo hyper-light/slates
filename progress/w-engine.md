@@ -94,3 +94,13 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - 1: measured delta at rest on the 1,000-rev import = 0 (committed 646,696,917 both; history folded as it imports).
   Owed: slates status --json prints no retained_bytes.
 - 3: ranked table sent: inbox/w-perf-from-w-engine.md. Biggest: ~850 MiB freed-but-retained malloc pages.
+
+## A-742 LANDED (main's item 1 of 2026-11-20 ~09:30): e064c2dc7, merge 80a7d5788
+- Cause found: the import made/freed 4,188 MiB in 698 blocks >= 1 MiB (encode growth, clones, decode-after-encode,
+  checkpoints, a 179.7 MiB snapshot); macOS malloc kept ~896 MiB as "(empty)" regions. pressure_relief released 0.
+- Fix: slates_mem::large global allocator (>= 64 pages mmap/munmap) + Wire::encoded_len/to_bytes reserve + derive,
+  Db::mutate_owned, Checkpoint::into_encoded exact, chain entries reserve bound, Increment::encoded_len.
+- Measured: 2,417-2,551 -> 1,431-1,495 MB, time same. status --json: retained_bytes, mem.large.*.
+- Item 2: design note inbox/main-from-w-engine-greens-in-pool.md (premise corrected: greens hold files only in the
+  engine; 241.5 MiB = 48.2 MiB current + ~193 MiB history); waiting for main's call before code.
+- Scratch kept: ~/.cache/w-engine-bench/*.sh, *.py (profile tools). Delete when item 2 is decided.
