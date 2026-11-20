@@ -170,3 +170,9 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - 61a74fe35 LANDED P9a: slates_vcs::cut (range_of, bits_for, split_due, child_of) + vcs_share::place::range_partition.
 - NEXT: 9b needs 8c; meanwhile snapshot_room as 2nd resource in vcs_share::room (DRF over memory + snapshot room).
 - b759bddb3 LANDED: vcs_share::room DRF over [memory, snapshot slot room]; Bound::Snapshot; tests 23/23, edges 88/88 (the hg ssh test now passes on main).
+- 0011a4606 LANDED 8c codec slates_vcs::rows. BLOCKER for record.rs v3 switch: A-727 a3 (content durable in image,
+  recovered before records); today HeapWindows rebuilt FROM records -> v3 would lose pushes on restart. Told w-perf.
+- Q3 answered (w-fed-faults, inbox line 37): identity-homed content must NOT use ContentHold (object-scoped releases
+  follow owner epochs: takeover release_certified, retain_object late copies, tombstone forget_object, ledger
+  compaction). Keep it keyed by content id; healer reads membership + rank only.
+- NEXT: P6 fleet half per Q3; then 9b.
