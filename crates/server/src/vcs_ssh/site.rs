@@ -336,9 +336,9 @@ impl<L: StoreLender + Clone, H: HgStores + Clone> Services for ToolServices<L, H
       (Service::Mercurial { hidden }, Some(repository)) if self.hg.holds(repository.id) => {
         Ok(ToolCommand::Mercurial(HgCommand::new(
           self.hg.clone(),
-          repository.id,
+          (repository.id, start.principal.clone()),
           self.room,
-          hidden.then_some(start.principal),
+          hidden,
         )))
       }
       _ => Err(Unserved),
