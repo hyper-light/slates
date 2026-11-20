@@ -761,7 +761,14 @@ impl<P> ReceivePack<P> {
           None => true,
         }
       }
-      waiting @ (Homing::Asked(..) | Homing::Waiting(_)) => {
+      // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the names are given back
+      // and the record is version 2, never a decision waiting for a homing nobody runs.
+      Homing::Asked(_, (identity, _)) => {
+        crate::vcs_store::release_names(state, &identity);
+        crate::vcs_store::homes::count_untaken(state);
+        true
+      }
+      waiting @ Homing::Waiting(_) => {
         decision.homing = waiting;
         false
       }

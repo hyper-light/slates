@@ -171,7 +171,9 @@ fn a_named_run_the_plane_lacks_is_refused_typed() {
 #[test]
 fn a_named_texts_buffer_becomes_the_greens_file_with_no_copy() {
   const TEXT: usize = 4 << 20;
-  let bytes: Vec<u8> = (0..TEXT).map(|at| (at % 241) as u8).collect();
+  let bytes: Vec<u8> = (0..TEXT)
+    .map(|at| u8::try_from(at % 241).unwrap())
+    .collect();
   let mut plane = Plane::default();
   let object = plane.put(bytes.clone());
   let mut work = named_create("big", object);

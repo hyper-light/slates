@@ -6606,9 +6606,10 @@ async fn restore_and_begin(
   Ok(())
 }
 
-/// A live log's rebuild on its owner shard, its payloads opened and applied a slice a turn, each held to the turn's
-/// share of the seal quantum (`config::wrap_slice_ns`, a payload at least: [`crate::live_ship::Rebuilding`]), counted
-/// [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a turn. The archive, and the head the
+/// A live log's rebuild on its owner shard, its payloads opened and applied and its archive's content hashed a slice a
+/// turn, each held to the turn's share of the seal quantum (`config::wrap_slice_ns`, a step at least: a sealed page opened
+/// or hashed, a record applied, a run laid over, a page of content hashed: [`crate::live_ship::Rebuilding`], A-771),
+/// counted [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a turn, its content hashed already. The archive, and the head the
 /// takeover adopted. Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68
 /// to 1.08 s to rebuild 152 to 306 MB of log, past the watchdog's spin window, which ended the successor's process.
 async fn rebuild_in_turns(

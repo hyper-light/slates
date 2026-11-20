@@ -12,7 +12,7 @@ use hyper_seal::keys::WrappingKey;
 use hyper_seal::name::Namer;
 use slates_archive::Archive;
 use slates_archive::format::Chunk;
-use slates_cluster::sealed::{SealedChunk, SealedError, open_chunk, seal_chunk};
+use slates_cluster::sealed::{RawOpening, SealedChunk, SealedError, open_chunk, seal_chunk};
 
 /// Shape: keys the tests may hold at once in the process's locked region (a few per test, tests in parallel).
 const KEYS: usize = 256;
@@ -235,4 +235,102 @@ fn keyed_names_match_within_a_tenant_and_differ_across_tenants() {
     open_chunk(&tenant.lineage, &tenant.namer, &other_record).unwrap(),
     recoded
   );
+}
+
+/// Opens `sealed` a `budget` of bytes a call ([`RawOpening`]): the chunk or the refusal, and the calls it took.
+fn opened_in_steps(
+  tenant: &Tenant,
+  namer: &Namer,
+  sealed: &SealedChunk,
+  budget: usize,
+) -> (Result<Chunk, SealedError>, usize) {
+  let mut opening = match RawOpening::new(&tenant.lineage, sealed.clone()) {
+    Ok(opening) => opening,
+    Err(refusal) => return (Err(refusal), 0),
+  };
+  let mut calls = 0;
+  loop {
+    calls += 1;
+    match opening.advance(namer, budget) {
+      Ok(Some(chunk)) => return (Ok(chunk), calls),
+      Ok(None) => {}
+      Err(refusal) => return (Err(refusal), calls),
+    }
+  }
+}
+
+/// A-771: a raw chunk opened in steps is the chunk opened whole, and a step is held to its budget. Do: seal raw chunks of
+/// lengths around the segment and up to a 1 MiB piece, and open each whole and in steps of 1 byte to everything; then
+/// flip a bit of each segment, cut the last, and open under another tenant's naming. Expect: the same chunk at every
+/// budget; at a budget of one byte a call for each segment and for each byte hashed at most, so no call opens more than a
+/// segment or hashes more than its budget; and each tampered chunk refused in steps exactly when it is refused whole.
+#[test]
+fn a_raw_chunk_opened_in_steps_is_the_chunk_opened_whole() {
+  let tenant = new_tenant();
+  let other = new_tenant();
+  let segment = usize::try_from(SEGMENT).unwrap();
+  for len in [
+    1,
+    segment - 1,
+    segment,
+    segment + 1,
+    5 * segment + 17,
+    1 << 20,
+  ] {
+    let sealed = seal_chunk(&tenant.lineage, &tenant.namer, &chunk(len, 3), SEGMENT).unwrap();
+    let whole = open_chunk(&tenant.lineage, &tenant.namer, &sealed).unwrap();
+    let segments = len.div_ceil(segment).max(1);
+    for budget in [1, 4096, 65_536, usize::MAX] {
+      let (stepped, calls) = opened_in_steps(&tenant, &tenant.namer, &sealed, budget);
+      assert_eq!(
+        stepped.as_ref(),
+        Ok(&whole),
+        "{len} bytes at a budget of {budget}"
+      );
+      if budget == usize::MAX {
+        assert_eq!(calls, 1, "{len} bytes opened in one call");
+      }
+      if budget == 65_536 && len == 1 << 20 {
+        assert!(
+          calls >= 2 * len / budget,
+          "{len} bytes: {calls} calls at {budget}"
+        );
+      }
+    }
+    let (_, calls) = opened_in_steps(&tenant, &tenant.namer, &sealed, 1);
+    assert!(
+      calls >= segments,
+      "{len} bytes: a call at least a segment, {calls} for {segments}"
+    );
+    let header = hyper_seal::stream::HEADER;
+    for at in (header..sealed.bytes.len()).step_by(segment) {
+      let mut flipped = sealed.clone();
+      flipped.bytes[at] ^= 1;
+      assert_eq!(
+        opened_in_steps(&tenant, &tenant.namer, &flipped, 4096)
+          .0
+          .is_err(),
+        open_chunk(&tenant.lineage, &tenant.namer, &flipped).is_err(),
+        "{len} bytes flipped at {at}"
+      );
+      assert!(
+        opened_in_steps(&tenant, &tenant.namer, &flipped, 4096)
+          .0
+          .is_err()
+      );
+    }
+    let mut cut = sealed.clone();
+    cut.bytes.truncate(cut.bytes.len() - 1);
+    assert!(
+      opened_in_steps(&tenant, &tenant.namer, &cut, 4096)
+        .0
+        .is_err(),
+      "{len} bytes cut"
+    );
+    assert_eq!(
+      opened_in_steps(&tenant, &other.namer, &sealed, 4096).0,
+      Err(SealedError::Name),
+      "{len} bytes under another tenant's naming"
+    );
+  }
 }
