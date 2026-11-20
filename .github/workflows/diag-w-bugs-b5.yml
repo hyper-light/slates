@@ -139,7 +139,7 @@ jobs:
             "bootstrap exit $LASTEXITCODE" | Add-Content $log
             $created = (& $bin --instance b5 volume create b5 --bounded 256MiB 2>&1 | Out-String)
             "volume create exit $LASTEXITCODE`n$created" | Add-Content $log
-            $vol = ($created -split "`n" | Where-Object { $_ -match '^id:' } | Select-Object -First 1).Split()[-1].Trim()
+            $vol = ([regex]::Match($created, 'id:\s*([0-9a-f]+)')).Groups[1].Value
             "volume id [$vol]" | Add-Content $log
             $mounted = (& $bin --instance b5 mount $vol S: 2>&1 | Out-String)
             "mount exit $LASTEXITCODE`n$mounted" | Add-Content $log
