@@ -86,9 +86,9 @@ Reading the engine: the verdict does read added bytes (identical-content accepta
 bytes; copies). So I drop section 1's per-op flag for a smaller, exact shape:
 - `Increment { id, base, doc, post_state, named: Vec<NamedRun>, evidence }` as above, but an op's `src` keeps meaning
   an offset into the post-state, now a virtual one: the inline `post_state` bytes first, then each named run in table
-  order (run i spans `[inline_len + sum(len of runs < i), ... + run.len)`). `NamedRun { identity: Identity, offset }`
-  with `Identity { hash: [u8; 32], len: u64 }`; a run's length is its object's `len - offset`... no: a run is
-  `NamedRun { identity, offset, len }`, so a run can be part of an object.
+  order (run i spans `[inline_len + sum(len of runs < i), ... + run.len)`). A run is
+  `NamedRun { identity: Identity, offset: u64, len: u64 }` (part of an object or all of it), with
+  `Identity { hash: [u8; 32], len: u64 }`.
 - Every engine read of added bytes goes through one view, `PostState<'_>` (the inline bytes, the table, and
   `&dyn Objects`), whose `span(src, len)` gives a `Cow` (borrowed inline, read through `Objects` for a named run). The
   verdict reads a named span only where it compares content (an edit landing on identical bytes at the head, an
