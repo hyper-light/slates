@@ -163,3 +163,12 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - NEXT: (a2) arena storage on one shard (windows homed here) for slates-vcs ContentStore: storage seam (heap vs
   arena), arena backed by the shard's vfs ChunkStore (open/write_open/seal/read_extent_into); then (a3) image table
   + recovery + barrier hooks image_begun/image_published; then (b) git v3; S4 slice 2 (svn texts via WithTexts).
+- ~13:00Z rulings: A-727 (a2) = option (i): repository store's OWN chunk arena per home shard behind a storage seam,
+  extents from the anchor content pool under its own owner-tag range (per home; w-balance's holdings read from it),
+  its own image section + recovery; no ripple into git/hg/svn. Rule (B): green = head files (hot); repository store
+  = compressed history (packs as sent, revlog/svndiff deltas) + tool metadata, NEVER inflated file bytes; non-vacuity
+  counter "blob put into the repository store" asserted 0 on a push once S3 lands. S4 slice 2 after (a3): when the
+  head moves the old head's delta must be durable in the repo store before the green folds that version; test fold ->
+  restart -> svn cat -r N.
+- (a2) step 1 (slates-vcs): WindowStorage seam (heap impl default for tests/tools); windows go through it, lists/tables
+  stay in the store's memory; get() lends lists/tables only (git derived/tree.rs:813 gitlink read -> windows()).
