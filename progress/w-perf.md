@@ -142,3 +142,7 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - NEXT: read vfs ChunkStore (crates/vfs/src/content.rs / chunk store) for extent read/write + how the shard image
   (vfs recover.rs to_image / encode_image_into) lists blocks; then write the A-727 design amendment (docs) and land
   it; then (a1).
+- A-727 design LANDED main 41f183ce6 (docs only). Build slices next: (a1) read seam in slates-vcs ContentStore::windows
+  (9 production readers in git/hg/svn/server) -> copy-out read_into / Cow; heap storage behind a seam. Then (a2) arena
+  storage via vfs ChunkStore (open/write_open/seal/read_extent_into/claim_chunk_blocks/adopt_chunk), (a3) image
+  table + recovery before records, (b) git v3, (c) svn, (d) replication. Group commit for image barrier per push.
