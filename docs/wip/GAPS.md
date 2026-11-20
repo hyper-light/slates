@@ -757,8 +757,12 @@
 > driver, held to the hook's learned bound, ended if the client hangs up, the lesson taught to the shard's hook times;
 > where it refused any commit to a repository with a hook configured ("does not run this repository's hooks yet").
 > REPOS is `/<name>` until A-645's read-only FSFS-layout view gives `svnlook` a directory. Windows keeps the refusal
-> (no driver there). Owed: the lock and unlock hooks (part 2), `svn+ssh://` (part 3), the revprop hooks' calls (A-702
-> part 2, w-svn, on this runner), DAV's.
+> (no driver there). **Part 2 (same day):** the lock verbs run pre-lock or pre-unlock for each writable path before it
+> is judged (a refusal that path's answer in `check_hook_result`'s words; pre-lock's standard output the lock's token)
+> and post-lock or post-unlock once over the paths changed after their answers, its failure after `done`, the locks
+> standing (`fs-wrap.c`); `slates_svn::serve`'s lock verb is four calls now (`lock_verb`, `lock_judged`, `locks_landed`,
+> `locks_finished`). Owed: `svn+ssh://` (part 3; the tunnel runs no hook yet, as before), the revprop hooks' calls
+> (A-702 part 2, w-svn, on `vcs_svn::run_hook`), DAV's.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`

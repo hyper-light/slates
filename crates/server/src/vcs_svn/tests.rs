@@ -713,3 +713,220 @@ fn a_commit_over_svn_runs_its_repositorys_commit_hooks_as_svnserve_runs_them() {
   assert!(committed.contains("post said no"), "{committed}");
   assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 1 ) ) ");
 }
+
+/// Stock `svn` 1.15.0's recorded commit of additions and deletions, whose `new.txt` the lock tests' file commit takes its
+/// text delta and checksum from.
+#[cfg(unix)]
+const ADD_DELETE_COMMIT: &[u8] =
+  include_bytes!("../../../svn/fixtures/commit/add-delete.1.client.bin");
+
+/// A commit adding `new.txt` at the session's root ("a new file"), its text delta and checksum as stock `svn` sent them
+/// for that file in [`ADD_DELETE_COMMIT`].
+#[cfg(unix)]
+fn new_file_commit() -> Vec<u8> {
+  let start = b"( apply-textdelta ( 2:c1 ( ) ) ) ";
+  let end = b"( close-file ( 2:c1 ( 32:aff8766b86bae76c1fc4a203ab1b1ec6 ) ) ) ";
+  let from = ADD_DELETE_COMMIT
+    .windows(start.len())
+    .position(|window| window == start)
+    .expect("the recorded file's delta");
+  let to = ADD_DELETE_COMMIT
+    .windows(end.len())
+    .position(|window| window == end)
+    .expect("the recorded file's close")
+    + end.len();
+  let mut commit =
+    b"( commit ( 4:file ( ) false ( ( 7:svn:log 4:file ) ) ) ) ( open-root ( ( ) 2:d0 ) ) \
+( add-file ( 7:new.txt 2:d0 2:c1 ( ) ) ) ( close-dir ( 2:d0 ) ) "
+      .to_vec();
+  commit.extend_from_slice(&ADD_DELETE_COMMIT[from..to]);
+  commit.extend_from_slice(b"( close-edit ( ) ) ");
+  commit
+}
+
+/// Signs in to a fresh Subversion repository on the other shard's partition whose policy runs `hooks`, commits
+/// [`new_file_commit`], then asks `verb` (a lock verb's item): what it answered through its `done` and one item more.
+#[cfg(unix)]
+fn lock_under_hooks(
+  hooks: Vec<(slates_ipc::protocol::HookPointName, String)>,
+  verbs: &[&[u8]],
+) -> Vec<String> {
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-locked-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  set_svn_hooks(&daemon, OTHER, &name, hooks);
+  let root = format!("svn://127.0.0.1:{port}/{name}");
+  let mut signed = sign_in(port, &greeting, &root);
+  signed
+    .stream
+    .set_read_timeout(Some(Duration::from_nanos(10 * PATIENCE_NS)))
+    .expect("the client's wait");
+  let committed = asked(&mut signed.stream, &new_file_commit(), 5);
+  assert!(committed.ends_with(" ) ( ) ) "), "{committed}");
+  verbs
+    .iter()
+    .map(|verb| {
+      let answered = asked(&mut signed.stream, verb, 2);
+      format!("{answered}{}", read_items_or_word(&mut signed.stream))
+    })
+    .collect()
+}
+
+/// A-730 (`hooks.c` `svn_repos__hooks_pre_lock`, `check_hook_result`; `fs-wrap.c` `svn_repos_fs_lock_many`). Do: commit
+/// a file, configure a pre-lock hook that writes to standard error and exits 1, ask `lock-many` for the file, then
+/// `get-lock` of it. Expect: the path refused in `svnserve`'s words, "Lock blocked by pre-lock hook (exit code 1) with
+/// output:" and the hook's standard error (E165001), then `done` and success; and no lock held.
+#[cfg(unix)]
+#[test]
+fn a_pre_lock_hook_that_refuses_refuses_its_path_in_svnserves_words() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let refusing = hook_script(&dir.path, "pre-lock", "echo 'no locks here' >&2\nexit 1");
+  let answers = lock_under_hooks(
+    vec![(HookPointName::SvnPreLock, refusing)],
+    &[b"( lock-many ( ( 4:held ) false ( ( 7:new.txt ( ) ) ) ) ) "],
+  );
+  let words = "Lock blocked by pre-lock hook (exit code 1) with output:\nno locks here\n";
+  let locked = answers.first().expect("the lock's answer");
+  assert!(
+    locked.contains("165001") && locked.contains(&format!("{}:{words}", words.len())),
+    "{locked}"
+  );
+  assert!(locked.ends_with("done ( success ( ) ) "), "{locked}");
+}
+
+/// A-730 (`hooks.c`, as A-623 recorded stock `svnserve` 1.15.0's runs). Do: commit a file; configure a pre-lock hook that
+/// records its arguments and writes a token to standard output, and a post-lock hook that records its arguments and
+/// standard input, writes to standard error and exits 1; ask `lock-many` for the file. Expect: pre-lock given the
+/// repository, the path, the user, the comment and `0` (not stolen); the file locked with the hook's token; then, after
+/// `done`, post-lock's failure (E165008 "Locking succeeded, but post-lock hook failed" over E165001), post-lock given the
+/// repository and the user, the locked path on its standard input.
+#[cfg(unix)]
+#[test]
+fn a_lock_runs_pre_lock_for_its_token_and_post_lock_after_it_as_svnserve_does() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let pre = hook_script(
+    &dir.path,
+    "pre-lock",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args\nprintf 'opaquelocktoken:from-the-hook'"
+    ),
+  );
+  let post = hook_script(
+    &dir.path,
+    "post-lock",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/post.args\n/bin/cat > {at}/post.stdin\n\
+       echo 'post said no' >&2\nexit 1"
+    ),
+  );
+  let answers = lock_under_hooks(
+    vec![
+      (HookPointName::SvnPreLock, pre),
+      (HookPointName::SvnPostLock, post),
+    ],
+    &[b"( lock-many ( ( 4:held ) false ( ( 7:new.txt ( ) ) ) ) ) "],
+  );
+  let locked = answers.first().expect("the lock's answer");
+  let pre_args = recorded_lines(&dir.path, "pre.args");
+  let post_args = recorded_lines(&dir.path, "post.args");
+  assert_eq!(
+    (
+      pre_args.get(1).map(String::as_str),
+      pre_args.get(3).map(String::as_str),
+      pre_args.get(4).map(String::as_str),
+      pre_args.len(),
+      post_args.len(),
+      post_args.first() == pre_args.first(),
+      post_args.get(1) == pre_args.get(2),
+      recorded_lines(&dir.path, "post.stdin"),
+    ),
+    (
+      Some("/new.txt"),
+      Some("held"),
+      Some("0"),
+      5,
+      2,
+      true,
+      true,
+      vec!["/new.txt".to_owned()]
+    ),
+    "pre-lock {pre_args:?}, post-lock {post_args:?}"
+  );
+  assert!(locked.contains("opaquelocktoken:from-the-hook"), "{locked}");
+  assert!(
+    locked.contains("done ( failure ( ( 165008 ") && locked.contains("post said no"),
+    "{locked}"
+  );
+}
+
+/// A-730 (`hooks.c` `svn_repos__hooks_pre_unlock`, `_post_unlock`). Do: commit a file; configure a pre-lock hook that
+/// gives the lock's token, and pre-unlock and post-unlock hooks that record their arguments and standard input and
+/// accept; lock the file, then unlock it with the token. Expect: the unlock answered as `svnserve` answers one path
+/// unlocked (the path, `done`, success); pre-unlock given the repository, the path, the user, the token and `0` (not
+/// broken); post-unlock the repository and the user, the unlocked path on its standard input.
+#[cfg(unix)]
+#[test]
+fn an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let token = hook_script(&dir.path, "pre-lock", "printf 'opaquelocktoken:to-unlock'");
+  let pre = hook_script(
+    &dir.path,
+    "pre-unlock",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args"),
+  );
+  let post = hook_script(
+    &dir.path,
+    "post-unlock",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/post.args\n/bin/cat > {at}/post.stdin"
+    ),
+  );
+  let answers = lock_under_hooks(
+    vec![
+      (HookPointName::SvnPreLock, token),
+      (HookPointName::SvnPreUnlock, pre),
+      (HookPointName::SvnPostUnlock, post),
+    ],
+    &[
+      b"( lock-many ( ( 4:held ) false ( ( 7:new.txt ( ) ) ) ) ) ",
+      b"( unlock-many ( false ( ( 7:new.txt ( 25:opaquelocktoken:to-unlock ) ) ) ) ) ",
+    ],
+  );
+  let unlocked = answers.get(1).expect("the unlock's answer");
+  let pre_args = recorded_lines(&dir.path, "pre.args");
+  assert_eq!(
+    (
+      pre_args.get(1).map(String::as_str),
+      pre_args.get(3).map(String::as_str),
+      pre_args.get(4).map(String::as_str),
+      pre_args.len(),
+      recorded_lines(&dir.path, "post.args").len(),
+      recorded_lines(&dir.path, "post.stdin"),
+    ),
+    (
+      Some("/new.txt"),
+      Some("opaquelocktoken:to-unlock"),
+      Some("0"),
+      5,
+      2,
+      vec!["/new.txt".to_owned()]
+    ),
+    "pre-unlock {pre_args:?}"
+  );
+  assert!(
+    unlocked.contains("( success ( 7:new.txt ) )") && unlocked.ends_with("done ( success ( ) ) "),
+    "{unlocked}"
+  );
+}
