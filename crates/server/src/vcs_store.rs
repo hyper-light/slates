@@ -2285,7 +2285,10 @@ fn record_turn(
     0
   };
   lend(store, vcs_stores, lent);
-  let turned = git_turn_in(vcs_stores, id, bytes, under_way, (deadline_ns, chunk));
+  let turned = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    git_turn_in(lent.stores, id, bytes, under_way, (deadline_ns, chunk))
+  };
   if !settle_in(store, vcs_stores) {
     state.count(CHARGE_SHORT, 1);
   }
@@ -2329,11 +2332,14 @@ fn abandon_git_replay(state: &mut ShardState, id: RepositoryId) {
   let Some(replay) = state.vcs_stores.git_replays.remove(&id) else {
     return;
   };
-  let given = state
-    .vcs_stores
-    .content
-    .as_mut()
-    .map(|content| replay.abandon(content));
+  let given = {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map(|content| replay.abandon(content))
+  };
   if !matches!(given, Some(Ok(()))) {
     state.count(RELEASE_REFUSED, 1);
   }
