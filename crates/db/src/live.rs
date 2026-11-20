@@ -1681,9 +1681,11 @@ impl Shipper {
 
   /// Whether the retained tail still holds every entry after `position` (A-428): a holder installed from a whole state at
   /// `position` then catches up by those entries alone, so [`Shipper::pending`] answers it entries, never a second
-  /// install. The owner owes an install image at its head only for a whole state the tail no longer reaches past.
+  /// install. The owner owes an install image at its head only for a whole state the tail no longer reaches past. Asked
+  /// without building the entries ([`Shipper::fold_reply`]'s sibling): through `entries_after` it cloned every entry a
+  /// lagging holder lacked on each write's sends.
   pub fn retains_after(&self, position: u64) -> bool {
-    !matches!(self.entries_after(Some(position)), Next::Install)
+    self.reaches(Some(position)) != Some(false)
   }
 
   /// The retained entries after `position` (all of them from position 0 when `None`), or an install when the tail no

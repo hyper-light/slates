@@ -8789,6 +8789,40 @@ the resume (GAPS). If it is the stale install answered late, the watch earns its
 catch-up, fixing that may erase the difference. The 4 of 12 x86 runs that never caught up, with the watch on or off,
 are that slow catch-up.
 
+### A resumed holder's catch-up: the retained tail and the reply fold, together (A-200; 2026-11-12, diag-live-durability-84; landed by g227 2026-11-19)
+
+**The flow.** A holder of a live volume stopped while the owner writes 20,000 entries ahead of it, then resumed; a
+neighbour volume on the owner's shard is written all through the catch-up. Catch-up is from the resume until the holder
+is within 50 entries of the owner's head, or none within 90 s. **Runners:** GitHub `ubuntu-latest` (x86_64) and
+`ubuntu-24.04-arm`, 4 CPUs each, release, 4 runs a leg, 24 of 24 passed, 2026-11-12. **Trees:** main 1e9f3287; retain-1
+alone 1d154518; both 42275fe6 (retain-1 with the fold fix merged). The landed change sits on a later main, whose byte
+bounds (`Bounds::of_whole`) and turned whole builds (A-377) these trees predate: its own run of this flow is owed.
+
+| leg | catch-up, each run (s) | installs | neighbour writes | neighbour p50 | p99 | max |
+|---|---|---|---|---|---|---|
+| main, x86 | 3.07 2.81 2.91 3.40 | 5 2 5 1 | 1,118–1,570 | 396–431 µs | 2.9–4.2 ms | 1.56–1.85 s |
+| retain-1 alone, x86 | none none none none | 1 0 1 1 | 345–482 | 201–279 ms | | 0.66–0.75 s |
+| both, x86 | 4.31 6.09 3.95 4.41 | 0 0 0 0 | 10,084–12,409 | 277–314 µs | 1.6–3.3 ms | 0.26–0.40 s |
+| main, arm | 2.17 2.33 2.44 2.20 | 3 3 3 4 | 745–1,051 | 359–484 µs | 3.4–4.6 ms | 1.16–1.47 s |
+| retain-1 alone, arm | none none none none | 0 0 0 1 | 1,588–2,669 | 32–44 ms | | 0.26–0.42 s |
+| both, arm | 9.66 9.76 13.34 9.38 | 0 1 0 0 | 8,958–9,818 | 803–1,053 µs | 3.9–5.3 ms | 0.16–0.22 s |
+
+**Reading.** On main a holder behind the retained tail is installed whole, 1 to 5 times a catch-up, each a 195 to
+219 MB image built on the owner's shard, and the neighbour waits up to 1.85 s behind it. retain-1 alone keeps the
+backlog as entries, but every reply of the lagging holder cloned each entry it lacked, so the owner's shard spent itself
+on those replies: no catch-up in 90 s, and the neighbour's median write 0.2 s on x86. With the fold fix too, the holder
+catches up from entries with no install in 7 of 8 runs, the neighbour writes 8 to 10 times as often, and its worst write
+is 4 to 9 times shorter. The catch-up itself is slower: 1.3 to 2.0 times main's on x86 and about 4 times on arm, where
+it streams 20,000 entries instead of sending one image. Landed for the owner shard's health (the neighbour's tail, no
+whole images on the shard), with the arm catch-up time owed a look.
+
+**Earlier A/Bs, recorded.** diag-73 measured the fold's cost (1.4 ms a reply 1,000 behind, 7.1 ms 5,000 behind; writes
+fell to about 210 a second; 6 of 24 x86 runs never within 50 entries). diag-76 (the flow, main against the fold fix) and
+diag-81 (the neighbour, at 5,000 and 20,000 behind) did not separate, because the stale tail sent most of the backlog as
+installs; diag-82's owner hooks found that tail (215,997 bytes at head 16,526). The record that rejected the fold fix on
+diag-81 (`agents/live-durability-catchup-record`) was withdrawn on 2026-11-19: diag-84 supersedes it, and its "about
+100% of a CPU" reading had counted a window that began before the resume.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
