@@ -74,3 +74,9 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   slates 120.
 - RISK: macos-latest (7 GB) may not compile kiln's lib tests in the slates job either.
 - Goal 01a1fa367d4c NOT marked: its CI run-id clause has no evidence yet. All code merged; local macOS green.
+- 2026-11-20 ~12:10 PST: LANDED kiln 4244a0f9e..08f1a4344: .kiln/ci.yaml lanes on kiln's own machines (slates-linux-x86_64,
+  slates-macos-arm64, slates-linux-arm64 [container], slates-windows-arm64-cross), 32Gi host lanes (26Gi trial stopped in
+  tests), docker pull bounded 600 s. Dispatched kiln ci run 01a1fa885fc5725996c71436c67a995d (jobs filter, sha 08f1a434);
+  push run 01a1fa83bde5 also carries them. Stale trial 01a1f9fb0653 (old base) still holds runners (linux-arm64 leg hung
+  on docker pull) -- cancel needs a person's click (for main).
+- GitHub poller restarted (poll2.sh 715063153). GitHub main CI blocked by run 44784299374 until it times out.
