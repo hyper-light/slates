@@ -148,3 +148,9 @@
   186 us vs NTFS 68 us; x86_64 93 / 44 / 13 us. No 4-5 ms. Closed in bug-claims.
 - Goal 87 B-list now: landed B3 (A-725), B14 (A-739), B16; fixed earlier B4; answered B15; not reproduced B5, B11;
   reading findings B8, B9 (main's). Plus A-717, A-737 found and landed on the way.
+- hangup flake LANDED main 64e5667fa (test fix; reproduced 2/30, fixed 0/30 on CI ubuntu under load).
+- Main's ask (2026-11-20): A-551/A-576/A-498 on Windows via CI, failing-test-first. In flight: diag-w-bugs-win-green-1 /
+  -red-1 (red = CaseSensitiveSearch for every volume): A-551's two drive tests + new A-576 test
+  names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two (branch agents/w-bugs-win, commit
+  "wip: winfsp drive test...") + the workloads suite (A-498 hg byte-identity on stock WinFsp).
+  A-551's drive tests already passed on both arches in b3-11 (22/22 winfsp_semantics).
