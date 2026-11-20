@@ -6,6 +6,8 @@
   kiln run r1 (build live_chaos + 12 runs of the fresh-member flow; needs macos/arm64 disk=60g; target
   ~/.cache/w-forming-target, logs ~/.cache/w-forming-runs/fm1 on whichever Mac takes it) is QUEUED, unplaced:
   4 runners link down, no other macOS runner with cargo. Left queued; it starts by itself.
+- ~23:15: r1 (cpus=8,mem=24g) never placed in ~60 min; stopped. r2 (cpus=3,mem=8g,disk=35g) placed then failed to
+  start ("no room here now"). r3 (same ask) QUEUED ~40 min, first in line, no machine with room. Disk here 6.5 GB.
 - Nothing finished, so nothing to land on main.
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
