@@ -7613,8 +7613,11 @@ pub(crate) struct Rebuilding {
   /// Once every payload is applied: the image's content spans being hashed for its archive, a page a step.
   laying: Option<Laying>,
   /// Each content span hashed, by inode, offset and length: its identity, and its bytes until the archive takes them.
-  hashed: BTreeMap<(u64, u64, u64), ([u8; 32], Option<Vec<u8>>)>,
+  hashed: BTreeMap<(u64, u64, u64), HashedSpan>,
 }
+
+/// A content span's identity once hashed, and its bytes until the archive takes them.
+type HashedSpan = ([u8; 32], Option<Vec<u8>>);
 
 /// A rebuilt image's content spans being hashed for its archive (A-771), in the image's order: the spans its chunked
 /// files' extents and open extents name, as [`node_of`] lays them out; the next one; and the bytes of the one being
