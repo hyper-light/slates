@@ -78,3 +78,19 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
  NEXT P2b: walk resumable under a quantum (Paint::run, mark, open, sparse walk, ready, shallow cut) as a
     negotiation::Negotiating state machine with step(graph, spent); upload::Answering {begin, step}; oracle: sliced
     bytes == serve()'s whole for every upload test; least room a slice needs < whole answer's. Then P3 (server).
+ P2b part 1 LANDED slates main 216c57ad..392c1e9c: negotiation::begin + Negotiating::step (objects::Selecting stages:
+    Commits via Paint::step, Edges, Haves, Choose, Wants, Tags; stacks persist; sparse frames held/released);
+    negotiate = begin stepped to end. a745_a_negotiation_stepped_a_unit_at_a_time_answers_as_one_made_whole (1,024
+    generated). 211 passed merged.
+ NEXT P2b part 2: upload::Answer gains the negotiation pending (owned Asked from fetch::read, sparse::Read), its write
+    taking the owner's quantum check and stepping Negotiating until done, then building the streaming answer as
+    fetch::written does; v0 likewise; servers pass the quantum. Oracle: every upload test's bytes unchanged; a test
+    serving with the quantum spent after every unit == whole. Then P3 (server: request room per slice; red by use).
+    Also owed: begin's ready/cut walks and include-tag's scan in units.
+ P2b part 2 LANDED slates main cf4e9b70..9ebcfbf8: upload::serve_in_turns + Answer::write_within (Choosing state;
+    abandon -> band-3 ABORT appended to head); serve/write unchanged; upload tests' answer_of answers every exchange
+    both ways, same bytes/refusal. Main's lint round boxed Begun::Selecting (9bb1558c2): adapted.
+ NEXT P3 (server): HTTP vcs_http/git/upload.rs Upload and SSH vcs_ssh/git.rs UploadCommand call serve_in_turns and
+    write_within with their quantum (they already step write per turn); admission = the request's room (revert A-713's
+    StoreLender::room); red BY USE first: daemon_edge clone of a long history whose pack is past one request's room,
+    over HTTP and over SSH. Owed after: v0 in turns, begin's ready/cut + include-tag scan in units, rule 4 generation.

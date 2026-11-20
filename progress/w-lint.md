@@ -97,3 +97,21 @@
 3. Closed by main: carry.rs:497's sleep gone; share.rs EPSILON derived (Higham 3.1, share.rs:159-166).
 - Handed off by main: A-742 unsafe budget (81 vs 79) to w-engine, urgent; the red content-once test to w-perf.
   Hourly rounds drop both from "known".
+
+## 2026-11-20 round 1 (main asked: Windows lane at or after 90d405247) -- at fe4c64851..8ebdc1d1a
+- 90d405247 (w-svn's off-unix run_svn_hook, 165006): compiles and is clippy-clean on Windows. Nothing to send back.
+- Fixed and landed: 231ac7d11 cluster/mem/server/bridge-winfsp Windows lane (14); c37ffd11e mem resident + 38
+  literals (anchor, rt, cluster, server, vcs, vfs); fff3ebaa7 git/merge/wire + new svn fsfs_view test (36; it got the
+  crate-level harness allow the 329 other integration tests carry); 0907608c4 db/server/cli/mcp (8); 12f2ed442 hg
+  test (1); 8ebdc1d1a cli winfsp remove_through_drive (1, Windows).
+- Wall at fe4c64851 + fixes: host clean, six cross targets clean, structural/literals/unsafe/fmt clean, Windows
+  (crates, cli, xtask) clean. Unsafe now 80/80 (w-engine's fix landed).
+- Target trimmed after the round (21 GB, CARGO_INCREMENTAL=0); box 100 GB free.
+
+## 2026-11-20 round 2 at 86d9e666c
+- Host: 16 errors in git, svn, server, cli (+ structural: git positions.rs proptest not through slates_test_seeds;
+  + 4 literals in server git_push.rs PhaseSteps) -> fixed in 9bb1558c2 and its merge (main restructured
+  negotiation/objects.rs meanwhile; took main's file; boxed Begun::Selecting). Host workspace clean after.
+- Six cross targets, unsafe (80/80), fmt: clean. structural, literals: clean after the fixes.
+- Windows (jupiter): r11 stopped (pre-fix tree); r14 on the fixed tree in flight -- kiln server timing out on reads.
+- Target trimmed after the round.

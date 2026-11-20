@@ -119,3 +119,12 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   answers (inbox/w-engine-from-w-perf.md).
 - Meanwhile: the log ring's released pages (88 MiB resident past the live tail) given back.
 - main's calls: log decode-after-encode stays (A-420); unsafe gate green at 80.
+
+## Reds fixed (main's FIRST list), landed b004dd29c + f5c9be2b6 (merge cf4e9b703)
+- Retained-history red: real on current main; bisected to my 529144e79 (honest charge; passes at 183604041). Test bound
+  updated to the ruled honest figure (earlier file once + edits, < 2 copies).
+- Sweep red: one report a poll in the test; steps sized to the budget left by measured fixed + per-page cost; segment
+  regions stepped; sweep.past_budget 0 (red 141,612 before), 20/20 runs 4-parallel.
+- Push route now merges on studio-2 in a fresh worktree when main moved without touching my paths (overlap aborts).
+- NEXT: w-perf's seam answer (inbox/w-engine-from-w-perf.md) gates items 3-7; meanwhile the log ring's released pages
+  given back (main: before 3-7 if small), measured before/after.

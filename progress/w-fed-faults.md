@@ -1,19 +1,13 @@
-# RESUME HERE (2026-11-20 ~13:00Z, Mac Studio d1323898; supersedes everything below)
-- LANDED: kiln 30c5929 (A-580 harness), e33c470 (A-708); slates a5140de (fleet.rs:4819 red: test held a's write
-  attachment while b attached, A-414 refuses LeaseHeld by design; a detaches first; 808 s red -> 1.45 s green).
-- A-734 LANDED kiln 0edd8dc (2026-11-20). Was: tested change = worktree ~/slates-work/w-fed-faults-p3 (merge 348845f88 over kiln main
-  4aabdba18) PLUS later test-only edits there (agents.start "try again" retry, isolation "none", on_hosts engine host,
-  hold_to_no_loss live-ship+share). Clean single-commit worktree ~/slates-work/w-fed-faults-a734 (branch
-  agents/w-fed-faults-a734 off 4aabdba18) holds the earlier diff staged: re-apply `git -C p3 diff 4aabdba18` before
-  committing. Land via ship route (land.sh, kiln).
-- PROVEN by use (macOS): cut-off flow PASSES end to end (one fleet, kiln's own bootstrap, live-shipped+shared volume,
-  8/8 served while cut and after heal, fleet re-forms; 35.8 s). Slow-link flow: move over the slow link neither moved nor refused in 900 s (p12-slow.log); diagnosing
-  with move diagnostics (p13-slow.log), worktree ~/slates-work/w-fed-faults-p3.
-- Findings for main: kiln workspaces not live-shipped (decision); kiln shares a workspace only with a move target;
-  "isolated agent doesn't move" refusal has no W7 kind; Slates forward-lane log flood (lane dropped when empty, floor
-  re-crosses the failover delay each forward: 1M lines in one test); one run where fleet-c never served (not reproduced).
-- Ship route: kiln run on b24c5c95... cwd ~/.cache/w-fed-faults-ship (land.sh kiln, land-repo.sh REPO=, state3.sh,
-  inbox.sh, claim.sh).
+# RESUME HERE (2026-11-20 ~13:30Z, Mac Studio d1323898; supersedes everything below)
+- LANDED: kiln 30c5929 (A-580 harness), e33c470 (A-708), 0edd8dc (A-734: one fleet, kiln founds its groups once,
+  link flows on macOS), e3e5d7b (A-734 follow-up: a move's refusal read from the timeline); slates a5140de
+  (fleet.rs:4819 test vs A-414). Both link flows PASS on macOS (cut-off 35.8 s, slow lossy link 43.3 s).
+- Nothing in flight. Owed to main: Linux run of the four signalling flows (run-requests.md); decisions: kiln
+  workspaces live-shipped by default?; shares only to a move's target. Findings: isolated agent's move refusal has no
+  W7 kind; Slates forward-lane log flood (lane dropped when empty re-crosses the failover delay, 1M lines a test); one
+  run's fleet-c never served (not reproduced).
+- Worktree kept: ~/slates-work/w-fed-faults-p3 (scratch). Targets ~/.cache/w-fed-faults-target,
+  ~/.cache/w-fed-faults-slates-target. Ship route: kiln run on b24c5c95... cwd ~/.cache/w-fed-faults-ship.
 
 - Answered w-balance Q3 (inbox 2cf8325).
 - Ship route: kiln run on adas-mac-studio-2.local (b24c5c95...), cwd ~/.cache/w-fed-faults-ship (land.sh, state3.sh,
