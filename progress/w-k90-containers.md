@@ -125,5 +125,5 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 ## W10 code done except the KIND proof (main's). Open: r24 live W9 (adacachy), r30 Windows cargo check (jupiter),
    W9 Windows measurement (person: WinFsp, console session, Docker Desktop). container_live_tests.rs uncommitted.
 
-## STATUS 2026-11-20: nothing blocked on main. Waiting: r24 (live W9 on adacachy, load 74), r33 (Windows cargo check,
+## STATUS 2026-11-20: nothing waits on main. Waiting: r24 (live W9 on adacachy, load 74), r33 (Windows cargo check,
    queued for jupiter). Blocked on a PERSON only: W9 Windows measurement (WinFsp, console-session runner, Docker Desktop).
