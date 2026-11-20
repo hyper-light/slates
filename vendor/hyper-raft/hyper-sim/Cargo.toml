@@ -1,0 +1,14 @@
+[package]
+name = "hyper-sim"
+description = "The deterministic world every simulation here runs in: one seeded generator with a named stream per source, virtual time and each node's clocks, one event queue under the ordered or the free discipline, every choice recorded in a trace that replays the run, and the run-twice check (docs/sim.md, step S-1)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+# std only (docs/sim.md §2: build, not pull).
+
+
+[workspace]
