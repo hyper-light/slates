@@ -22079,6 +22079,68 @@ fn bench_a697_holder_and_local_submit_phases() {
   daemon_b.serve_works_on_holders(false).unwrap();
 }
 
+/// AUD-11, §4.9 (a forwarded write whose acceptance waits for its quorum commit is answered by the commit, not by a
+/// poll; found by A-697's release bench, 2026-11-20: the exchange slept a heartbeat between looks at the completion
+/// window, so a holder's 4 MiB submit took 130 ms against 33 ms of work at the owner). Do: in a two-node `f = 1` fleet,
+/// a client on B edits and submits, three times, a work A owns. Expect: each answered `Submitted`, version 1 to 3, every
+/// one through the owner's resolve of its deferred acceptance (A's attached and answered counters each moved by three),
+/// the best of the three within a heartbeat, which the poll's first sleep alone exceeded.
+#[test]
+fn a_forwarded_submit_is_answered_by_its_commit_not_by_a_poll() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (_green, work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let count = |name: &str| {
+    daemon_a
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let before = (
+    count("merge.acceptance_forward_attached"),
+    count("merge.acceptance_forward_answered"),
+  );
+  let mut client = Client::connect(daemon_b.instance());
+  let mut versions = Vec::new();
+  let mut walls = Vec::new();
+  for round in 0..3u64 {
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: format!("f{round}"),
+      at: 0,
+      delete_len: 0,
+      bytes: b"forwarded".to_vec(),
+    });
+    assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+    let started = Instant::now();
+    let submitted = client.call(&RequestBody::submit(work, Vec::new()));
+    walls.push(started.elapsed());
+    versions.push(match submitted {
+      ReplyBody::Submitted { version, .. } => version,
+      other => panic!("round {round}: {other:?}"),
+    });
+  }
+  let after = (
+    count("merge.acceptance_forward_attached"),
+    count("merge.acceptance_forward_answered"),
+  );
+  eprintln!("forwarded submits answered in {walls:?}");
+  assert_eq!(versions, [Some(1), Some(2), Some(3)]);
+  // The poll slept a heartbeat before its first look, so no answer could come sooner: the best of three must.
+  let best = walls.iter().min().copied().unwrap_or(Duration::MAX);
+  assert!(
+    best < Duration::from_nanos(HEARTBEAT_NS),
+    "answered within a heartbeat of the commit: {walls:?}"
+  );
+  assert_eq!(
+    (after.0 - before.0, after.1 - before.1),
+    (3, 3),
+    "each answered by its version's resolve"
+  );
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the

@@ -191,6 +191,37 @@ impl<T: 'static> Future for CrossShardCall<T> {
   }
 }
 
+/// A one-shot answer this shard awaits from whichever shard meets its event (a forwarded write's deferred completion,
+/// `crate::verbs::await_deferred_completion`): the call, awaited here, judged in `target`'s time, and the id
+/// [`answer_awaited`] completes it by from any shard. Dropping the call forgets the registration, so a late answer is
+/// dropped where it lands.
+pub(crate) fn awaited<T: 'static>(target: u16) -> (CrossShardCall<T>, u64) {
+  let id = register();
+  (
+    CrossShardCall {
+      target,
+      id: Some(id),
+      ready: None,
+      _thread: PhantomData,
+    },
+    id,
+  )
+}
+
+/// Completes `id`, a call [`awaited`] registered on shard `origin`, with `value`: carried there as any result is
+/// ([`send_back`]), so it may be sent from inside a step of `origin` itself.
+pub(crate) fn answer_awaited<T: Send + 'static>(origin: u16, id: u64, value: T) {
+  send_back(
+    origin,
+    SpawnRequest::new(
+      Box::pin(async move {
+        deliver(id, Box::new(Some(value)));
+      }),
+      None,
+    ),
+  );
+}
+
 /// Sends `back`, the task that carries a result home to `origin` (a reply to its client, an awaited call's answer): at
 /// once when `origin`'s control channel has room, else kept by this shard's carrier until it has ([`carry`]), for as
 /// long as `origin` lives (§4.3: backpressure, never a drop). Only an origin gone (its client with it) leaves the result

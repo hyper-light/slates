@@ -1241,47 +1241,37 @@ fn not_shared_with(reply: ReplyBody, requester: &Principal) -> ReplyBody {
   }
 }
 
-/// A cross-node forwarded verb whose acceptance was deferred to a fleet commit (AUD-11): polls the
-/// owner shard's completion window each period until the commit records the reply, within the
-/// liveness budget the exchange runs under. Past the budget the request is refused **retryable**
-/// (`Overloaded` names the owner shard): the acceptance still waits on the owner, and the origin's
-/// retry meets the completion record once the version commits — never a success the quorum has
-/// not committed. An owner whose state refuses the poll answers by what refused it ([`call_owner`], A-564).
+/// A cross-node forwarded verb whose acceptance was deferred to a fleet commit (AUD-11): answered when the commit
+/// records its reply. The exchange registers an awaited call on this (control) shard and attaches it to the deferred
+/// acceptance on the owner shard (`merge_service::await_forwarded`), whose resolve completes it with the reply it records
+/// (`merge_service::resolve_accepted`); a completion recorded already is the answer at once. Within the liveness budget
+/// in the owner's own time; past it, or when the acceptance no longer waits (a restart between), the request is refused
+/// **retryable** (`Overloaded` names the owner shard): the origin's retry meets the completion record once the version
+/// commits, never a success the quorum has not committed. Until 2026-11-20 the exchange slept a heartbeat between looks
+/// at the completion window, so a commit of about 30 ms was answered at about 100 (A-697's release bench: a holder's 4
+/// MiB submit's forward 130 ms against 33 ms of work at the owner).
 async fn await_deferred_completion(
   control: u16,
   shard: u16,
   origin_host: u64,
   id: RequestId,
 ) -> ReplyBody {
-  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
-  loop {
-    // Off a shard no poll can be timed: the reply is given up, as at its deadline.
-    if slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
-      .await
-      .is_err()
-    {
-      return refused(Refusal::Overloaded { shard });
+  let (call, waiter) = crate::xshard::awaited::<ReplyBody>(shard);
+  let attached = call_owner(control, shard, move |s| {
+    crate::merge_service::await_forwarded(s, (origin_host, id), (control, waiter))
+  })
+  .await;
+  match attached {
+    Ok(crate::merge_service::ForwardedAcceptance::Completed(bytes)) => {
+      ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest))
     }
-    let recorded = call_owner(control, shard, move |s| {
-      match s
-        .db
-        .partition()
-        .completion(origin_host, id.client, id.sequence)
-      {
-        Seen::Completed(bytes) => Some(bytes),
-        Seen::Acknowledged | Seen::New | Seen::Awaiting { .. } => None,
-      }
-    })
-    .await;
-    match recorded {
-      Ok(Some(bytes)) => {
-        return ReplyBody::from_bytes(&bytes)
-          .unwrap_or_else(|_| refused(Refusal::DuplicateRequest));
-      }
-      Ok(None) if slates_rt::futures::now_ns() < deadline => {}
-      Ok(None) => return refused(Refusal::Overloaded { shard }),
-      Err(refusal) => return *refusal,
+    Ok(crate::merge_service::ForwardedAcceptance::Gone) => refused(Refusal::Overloaded { shard }),
+    Ok(crate::merge_service::ForwardedAcceptance::Waiting) => {
+      crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS)
+        .await
+        .unwrap_or_else(|| refused(Refusal::Overloaded { shard }))
     }
+    Err(refusal) => *refusal,
   }
 }
 

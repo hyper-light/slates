@@ -3276,7 +3276,64 @@ pub struct AwaitingAcceptance {
   pub origin: u64,
   /// The request id.
   pub id: RequestId,
+  /// For a request forwarded from another node: the forward's exchange waiting on this node's control shard for the
+  /// completion, as (that shard, its awaited call), answered when the version resolves ([`resolve_accepted`],
+  /// [`await_forwarded`]); `None` until the exchange attaches, and for every other request.
+  pub forwarded: Option<(u16, u64)>,
 }
+
+/// What [`await_forwarded`] found of a forwarded request's deferred acceptance.
+pub(crate) enum ForwardedAcceptance {
+  /// Its completion is recorded: these bytes are the reply.
+  Completed(Vec<u8>),
+  /// It waits for its version's commit, and the exchange is now answered when that resolves.
+  Waiting,
+  /// Neither: no completion and no wait (a restart between dropped it), so the exchange answers retryable.
+  Gone,
+}
+
+/// Attaches the forward's exchange, waiting as `waiter` (the control shard and its awaited call), to the deferred
+/// acceptance of `(origin, id)` on this owner shard (AUD-11; A-697's measured forward), or gives its completion when it
+/// is recorded already. Before, the exchange looked at the completion window once a heartbeat, so a commit of 30 ms was
+/// answered at about 100 (the release bench, 2026-11-20).
+pub(crate) fn await_forwarded(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  waiter: (u16, u64),
+) -> ForwardedAcceptance {
+  if let slates_wire::request::Seen::Completed(bytes) =
+    state
+      .db
+      .partition()
+      .completion(origin, id.client, id.sequence)
+  {
+    return ForwardedAcceptance::Completed(bytes);
+  }
+  let Some(key) = state
+    .merge
+    .awaiting_by_request
+    .get(&(origin, id.client, id.sequence))
+    .copied()
+  else {
+    return ForwardedAcceptance::Gone;
+  };
+  let Some(entry) = state.merge.awaiting.get_mut(&key).and_then(|waiting| {
+    waiting
+      .iter_mut()
+      .find(|entry| entry.origin == origin && entry.id == id)
+  }) else {
+    return ForwardedAcceptance::Gone;
+  };
+  entry.forwarded = Some(waiter);
+  state.count(ACCEPTANCE_FORWARD_ATTACHED, 1);
+  ForwardedAcceptance::Waiting
+}
+
+/// Format: a forward's exchange attached to its deferred acceptance, answered when the version resolves
+/// ([`await_forwarded`]), the non-vacuity count of the event-driven forwarded completion.
+pub(crate) const ACCEPTANCE_FORWARD_ATTACHED: &str = "merge.acceptance_forward_attached";
+/// Format: a forward's exchange answered at its version's resolve ([`resolve_accepted`]).
+pub(crate) const ACCEPTANCE_FORWARD_ANSWERED: &str = "merge.acceptance_forward_answered";
 
 /// Registers the acceptance of `version` of `green` as **waiting** for its record to commit at the
 /// quorum (AUD-11): the reply is not written and the completion not recorded until
@@ -3294,7 +3351,12 @@ pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, versio
     .awaiting
     .entry((object, version))
     .or_default()
-    .push(AwaitingAcceptance { route, origin, id });
+    .push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   state
     .merge
     .awaiting_by_request
@@ -3371,7 +3433,12 @@ pub(crate) fn serve_awaiting(
     .awaiting
     .entry((object, version))
     .or_default()
-    .push(AwaitingAcceptance { route, origin, id });
+    .push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   state
     .merge
     .awaiting_by_request
@@ -3396,7 +3463,12 @@ pub(crate) fn join_awaiting(state: &mut ShardState, origin: u64, id: RequestId) 
   if let Some(waiting) = state.merge.awaiting.get_mut(&key)
     && route.is_some()
   {
-    waiting.push(AwaitingAcceptance { route, origin, id });
+    waiting.push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   }
   true
 }
@@ -3495,6 +3567,11 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
         continue;
       }
       state.count(ACCEPTANCE_RESOLVED, 1);
+      // A forward's exchange waiting on its control shard is answered now, with the reply just recorded.
+      if let Some((control, call)) = entry.forwarded {
+        crate::xshard::answer_awaited(control, call, recorded.clone());
+        state.count(ACCEPTANCE_FORWARD_ANSWERED, 1);
+      }
       let Some(route) = entry.route else {
         continue;
       };
