@@ -251,6 +251,12 @@ impl<K> Answer<K> {
     }
   }
 
+  /// The pack's source, for an answer that carries a pack: what it keeps while it writes, such as a stream's counters
+  /// (A-718: which of the store's paths wrote the pack, kept fragments copied or objects encoded afresh).
+  pub fn pack_source(&self) -> Option<&K> {
+    self.pack.as_ref().map(|pack| &pack.source)
+  }
+
   /// Why the exchange was refused, if it was: the answer then carries the words the client is told.
   pub fn refusal(&self) -> Option<&Refusal> {
     self.refusal.as_ref()

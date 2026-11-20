@@ -89,6 +89,12 @@ impl StoreLender for ShardStores {
   ) -> Option<R> {
     crate::state::with_state_counted(|state| lend_on(state, (id, None), step)).flatten()
   }
+
+  /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
+  /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]).
+  async fn encode(&mut self, id: RepositoryId) {
+    super::git_encode::settle_encodings(id).await;
+  }
 }
 
 /// Runs `step` over repository `id`'s git store on `state`'s shard (the module doc): as upload-pack answers a request of
@@ -161,7 +167,7 @@ fn readable_refs(
 /// over its value of CPU, at neutral): the time this machine takes to copy the byte, as the archive's codec policy prices
 /// a byte at neutral (`DaemonConfig::codec`), so a second buys the measured memcpy throughput's bytes
 /// (`DaemonConfig::memcpy_bytes_per_second`, at least one byte).
-fn exchange(config: &DaemonConfig) -> Exchange {
+pub(super) fn exchange(config: &DaemonConfig) -> Exchange {
   Exchange {
     ns: NANOS_PER_SECOND,
     bytes: config.memcpy_bytes_per_second.max(1),
@@ -226,7 +232,7 @@ impl PackSource for ShardPacks {
 }
 
 /// The shard's clock (§4.3), which a turn's quantum is spent on.
-struct ShardClock;
+pub(super) struct ShardClock;
 
 impl Clock for ShardClock {
   fn now_ns(&mut self) -> u64 {
