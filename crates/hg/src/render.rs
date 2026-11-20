@@ -46,6 +46,8 @@ const HEADER: [u8; 4] = [0, 2, 0, 1];
 const ENTRY_BYTES: usize = 64;
 /// Format: the node field's padding after the node.
 const NODE_PADDING: [u8; 12] = [0; 12];
+/// Format: the bits of an index entry's first field the flags take, below the offset (`offset << 16 | flags`).
+const FLAGS_BITS: u32 = 16;
 /// Format: the chunk header of a text stored as it is (`revlog.compress`'s `u`).
 const UNCOMPRESSED: u8 = b'u';
 /// Format: the obsstore's name in a refusal of a marker the index cannot give back.
@@ -268,8 +270,8 @@ impl Entry {
   fn write(&self, out: &mut Vec<u8>) -> Result<(), Refused> {
     let offset_flags = self
       .offset
-      .checked_shl(16)
-      .filter(|shifted| shifted >> 16 == self.offset);
+      .checked_shl(FLAGS_BITS)
+      .filter(|shifted| shifted >> FLAGS_BITS == self.offset);
     let offset_flags = offset_flags.ok_or(Refused::TooLong)? | u64::from(self.flags);
     out.extend_from_slice(&offset_flags.to_be_bytes());
     for length in [self.chunk, self.text] {

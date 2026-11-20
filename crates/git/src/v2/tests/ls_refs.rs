@@ -168,7 +168,10 @@ fn an_answer_line_out_of_its_grammar_is_refused_by_kind() {
       Refusal::Refname { at: 0 },
     ),
     (
-      line(format!("{MAIN} refs/tags/v1 peeled:{}\n", &MAIN[..20])),
+      line(format!(
+        "{MAIN} refs/tags/v1 peeled:{}\n",
+        MAIN.get(..20).unwrap()
+      )),
       Refusal::ObjectId {
         at: 0,
         refusal: HexRefusal::Length { len: 20 },

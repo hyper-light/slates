@@ -457,6 +457,8 @@ fn a_lacked_have_keeps_a_flush_from_ready() {
 /// refused, in an `ERR` line.
 #[test]
 fn a_request_past_the_advertisement_or_its_grammar_is_refused() {
+  /// A request's bytes, and whether a refusal is the one it must meet.
+  type Case = (Vec<u8>, fn(&Refusal) -> bool);
   let fixture = repository();
   let have_first = [
     pkt(format!("want {TIP} side-band-64k\n").as_bytes()),
@@ -466,7 +468,7 @@ fn a_request_past_the_advertisement_or_its_grammar_is_refused() {
   .concat();
   let after_done = [clone_request("side-band-64k"), pkt(b"done\n")].concat();
   let unfinished = pkt(format!("want {TIP} side-band-64k\n").as_bytes());
-  let cases: [(Vec<u8>, fn(&Refusal) -> bool); 5] = [
+  let cases: [Case; 5] = [
     (clone_request("side-band-64k frobnicate"), |refusal| {
       *refusal == Refusal::Capability
     }),

@@ -228,6 +228,7 @@ mod git_push;
 // from its entries' objects; its git stores lent to upload-pack by the HTTP edge's site (A-682). Its push steps are
 // called by git's push driver (A-654), and its Mercurial import (A-675) by no one outside tests until the verb that asks
 // for one (its piece).
+mod vcs_share;
 #[cfg_attr(not(test), allow(dead_code))]
 mod vcs_store;
 // A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). Its caller is

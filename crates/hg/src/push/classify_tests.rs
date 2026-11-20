@@ -673,9 +673,12 @@ fn ended_through_another_branch(lines: &[LineRead], after: &View) -> bool {
   })
 }
 
+/// A changeset made by hand: its parents (earlier indices), its branch, and whether it closes it.
+type ByHand<'b> = ([Option<usize>; 2], &'b [u8], bool);
+
 /// A history made by hand: each changeset's parents (earlier indices), branch and close, the first `old` the view's,
 /// every one of the view's public.
-fn made(changesets: &[([Option<usize>; 2], &[u8], bool)], old: usize) -> (Whole, View) {
+fn made(changesets: &[ByHand<'_>], old: usize) -> (Whole, View) {
   let mut whole = Whole {
     old,
     ..Whole::default()

@@ -697,6 +697,16 @@ mod tests {
     }
   }
 
+  /// Give `files`' hold back a node a step until nothing is left of it.
+  fn release_a_node_a_step(files: &mut Files) {
+    let mut releasing = files.releasing();
+    while files
+      .map
+      .nodes
+      .release_step(&mut releasing, &mut files.blocks)
+    {}
+  }
+
   /// A-534, A-575. Do: put a file, fork the map, change the file in the fork and remove another, then release both
   /// maps a node a step. Expect: each map reads its own bytes, the original's blocks are untouched by the fork's changes
   /// and by the fork's release, and once both are released every node and every block is gone.
@@ -715,20 +725,10 @@ mod tests {
     files.lend(&mut fork);
     assert_eq!(fork.get("a"), Some(b"changed".as_slice()));
     assert_eq!(fork.get("b"), None);
-    let mut releasing = fork.releasing();
-    while fork
-      .map
-      .nodes
-      .release_step(&mut releasing, &mut fork.blocks)
-    {}
+    release_a_node_a_step(&mut fork);
     fork.lend(&mut files);
     assert_eq!(files.get("a"), Some(b"one".as_slice()));
-    let mut releasing = files.releasing();
-    while files
-      .map
-      .nodes
-      .release_step(&mut releasing, &mut files.blocks)
-    {}
+    release_a_node_a_step(&mut files);
     assert_eq!(files.map.nodes.live(), 0, "every node freed");
     assert_eq!(files.blocks.live(), 0, "every block freed");
   }

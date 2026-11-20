@@ -33,7 +33,7 @@ use super::xml::{Element, parse};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
 use crate::commit::drive::{Drive, Due, Edited, Green, Setup, Work};
 use crate::commit::edit::{CopiedFrom, EditCommand};
-use crate::index::{Index, NodeKind, Revision};
+use crate::index::{Index, NodeKind, PropertyPairs, Revision};
 use crate::lock::LockTable;
 
 /// `SVN_ERR_FS_NO_SUCH_TRANSACTION`: a request on a transaction that has ended.
@@ -129,7 +129,7 @@ pub enum Merged {
 pub fn transaction_properties(
   body: &[u8],
   user: Option<&str>,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DavRefusal> {
+) -> Result<PropertyPairs, DavRefusal> {
   let malformed = || DavRefusal::Malformed {
     element: "create-txn",
     text: String::from_utf8_lossy(body).into_owned(),
@@ -748,13 +748,13 @@ pub fn unserved(what: &str) -> HttpAnswer {
   )
 }
 
+/// Property changes in order: each name, and its new value or none for a removal.
+type PropertyChanges = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 /// A PROPPATCH body's changes (`mod_dav.c` `dav_method_proppatch`): each `D:set` property with its value (base64
 /// where `V:encoding` says so) and each `D:remove` property with none, in order, named as Subversion names them (its
 /// own namespace `svn:`, the custom namespace bare).
-fn property_changes(
-  body: &[u8],
-  bounds: &Bounds,
-) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, DavRefusal> {
+fn property_changes(body: &[u8], bounds: &Bounds) -> Result<PropertyChanges, DavRefusal> {
   let malformed = || DavRefusal::Malformed {
     element: "propertyupdate",
     text: String::new(),
@@ -877,50 +877,60 @@ impl Skel {
     let at = bytes.iter().position(|byte| !is_space(*byte))?;
     let bytes = bytes.get(at..)?;
     match bytes.first()? {
-      b'(' => {
-        let mut rest = bytes.get(1..)?;
-        let mut items = Vec::new();
-        loop {
-          let at = rest.iter().position(|byte| !is_space(*byte))?;
-          rest = rest.get(at..)?;
-          if rest.first() == Some(&b')') {
-            return Some((Self::List(items), rest.get(1..)?));
-          }
-          let (item, after) = Self::one(rest)?;
-          items.push(item);
-          rest = after;
-        }
-      }
-      first if first.is_ascii_digit() => {
-        let digits = bytes
-          .iter()
-          .take_while(|byte| byte.is_ascii_digit())
-          .count();
-        let length: usize = std::str::from_utf8(bytes.get(..digits)?)
-          .ok()?
-          .parse()
-          .ok()?;
-        let start = digits.checked_add(1)?;
-        if !is_space(*bytes.get(digits)?) {
-          return None;
-        }
-        let end = start.checked_add(length)?;
-        Some((
-          Self::Atom(bytes.get(start..end)?.to_vec()),
-          bytes.get(end..)?,
-        ))
-      }
-      _ => {
-        let length = bytes
-          .iter()
-          .take_while(|byte| !is_space(**byte) && **byte != b'(' && **byte != b')')
-          .count();
-        Some((
-          Self::Atom(bytes.get(..length)?.to_vec()),
-          bytes.get(length..)?,
-        ))
-      }
+      b'(' => Self::list(bytes.get(1..)?),
+      first if first.is_ascii_digit() => Self::explicit_atom(bytes),
+      _ => Self::implicit_atom(bytes),
     }
+  }
+
+  /// The list whose items start `rest`, just after its `(`, and what follows its `)`.
+  fn list(mut rest: &[u8]) -> Option<(Self, &[u8])> {
+    let mut items = Vec::new();
+    loop {
+      let at = rest.iter().position(|byte| !is_space(*byte))?;
+      rest = rest.get(at..)?;
+      if rest.first() == Some(&b')') {
+        return Some((Self::List(items), rest.get(1..)?));
+      }
+      let (item, after) = Self::one(rest)?;
+      items.push(item);
+      rest = after;
+    }
+  }
+
+  /// The explicit-length atom at the start of `bytes` (its length in digits, a space, then its
+  /// bytes) and what follows it.
+  fn explicit_atom(bytes: &[u8]) -> Option<(Self, &[u8])> {
+    let digits = bytes
+      .iter()
+      .take_while(|byte| byte.is_ascii_digit())
+      .count();
+    let length: usize = std::str::from_utf8(bytes.get(..digits)?)
+      .ok()?
+      .parse()
+      .ok()?;
+    let start = digits.checked_add(1)?;
+    if !is_space(*bytes.get(digits)?) {
+      return None;
+    }
+    let end = start.checked_add(length)?;
+    Some((
+      Self::Atom(bytes.get(start..end)?.to_vec()),
+      bytes.get(end..)?,
+    ))
+  }
+
+  /// The implicit-length atom at the start of `bytes` (up to a space or a parenthesis) and what
+  /// follows it.
+  fn implicit_atom(bytes: &[u8]) -> Option<(Self, &[u8])> {
+    let length = bytes
+      .iter()
+      .take_while(|byte| !is_space(**byte) && **byte != b'(' && **byte != b')')
+      .count();
+    Some((
+      Self::Atom(bytes.get(..length)?.to_vec()),
+      bytes.get(length..)?,
+    ))
   }
 }
 

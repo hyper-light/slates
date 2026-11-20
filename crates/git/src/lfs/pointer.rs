@@ -212,6 +212,7 @@ impl Refusal {
 fn leading_space(bytes: &[u8]) -> Option<usize> {
   let lead = *bytes.first()?;
   let width = match lead.leading_ones() {
+    // Format: a lead byte's leading ones count its sequence's bytes, two to four (RFC 3629 §3).
     2 => 2,
     3 => 3,
     4 => 4,

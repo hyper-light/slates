@@ -6,7 +6,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use super::{ALPN_HTTP_1_1, HttpsSession, ServingIdentity, TlsRefused};
 
 /// A self-signed identity for `localhost`, and its certificate for a client to trust.
-fn identity() -> (ServingIdentity, CertificateDer<'static>) {
+pub(crate) fn identity() -> (ServingIdentity, CertificateDer<'static>) {
   let key = rcgen::KeyPair::generate().unwrap();
   let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
     .unwrap()
@@ -21,7 +21,7 @@ fn identity() -> (ServingIdentity, CertificateDer<'static>) {
 }
 
 /// A client trusting `cert`, offering `alpn`, speaking `versions`, nothing read yet.
-fn client(
+pub(crate) fn client(
   cert: &CertificateDer<'static>,
   alpn: &[&[u8]],
   versions: &[&'static rustls::SupportedProtocolVersion],
@@ -47,9 +47,9 @@ fn client(
 }
 
 /// A client and what it has read: its plaintext, and whether the server's `close_notify` ended it.
-struct Peer {
+pub(crate) struct Peer {
   /// The client's connection.
-  connection: ClientConnection,
+  pub(crate) connection: ClientConnection,
   /// The plaintext it read.
   received: Vec<u8>,
   /// Whether it read the server's `close_notify`.
@@ -83,15 +83,21 @@ impl Peer {
   }
 }
 
+/// What the client has to send, all of it.
+fn client_output(peer: &mut Peer) -> Vec<u8> {
+  let mut to_server = Vec::new();
+  while peer.connection.wants_write() {
+    peer.connection.write_tls(&mut to_server).unwrap();
+  }
+  to_server
+}
+
 /// Moves bytes both ways until neither side has more to send: the client's to the session and the session's to the
 /// client, returning the plaintext the session took.
 fn pump(peer: &mut Peer, session: &mut HttpsSession) -> Result<Vec<u8>, TlsRefused> {
   let mut plaintext = Vec::new();
   loop {
-    let mut to_server = Vec::new();
-    while peer.connection.wants_write() {
-      peer.connection.write_tls(&mut to_server).unwrap();
-    }
+    let to_server = client_output(peer);
     session.receive(&to_server, &mut plaintext)?;
     let mut to_client = Vec::new();
     session.transmit(&mut to_client)?;

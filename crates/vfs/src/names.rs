@@ -251,13 +251,7 @@ mod tests {
       ("\u{3c3}.txt", "\u{3c2}.txt"),
       ("\u{3a3}", "\u{3c2}"),
     ] {
-      assert!(Upcase.same(a, b), "{a:?} {b:?}");
-      assert_eq!(Upcase.hash(a), Upcase.hash(b), "{a:?} {b:?}");
-      assert_eq!(
-        Upcase.compare(a, b),
-        std::cmp::Ordering::Equal,
-        "{a:?} {b:?}"
-      );
+      assert_one_name_under_upcase(a, b);
     }
     assert!(
       !Fold.same("\u{3c3}.txt", "\u{3c2}.txt"),
@@ -269,6 +263,18 @@ mod tests {
     }
     assert_eq!(Upcase.fold("Stra\u{df}e"), "STRA\u{df}E");
     assert!(!Upcase.case_sensitive());
+  }
+
+  /// `a` and `b` are one name under `Upcase`: the same, with one hash, comparing equal.
+  fn assert_one_name_under_upcase(a: &str, b: &str) {
+    use NameEquivalence::Upcase;
+    assert!(Upcase.same(a, b), "{a:?} {b:?}");
+    assert_eq!(Upcase.hash(a), Upcase.hash(b), "{a:?} {b:?}");
+    assert_eq!(
+      Upcase.compare(a, b),
+      std::cmp::Ordering::Equal,
+      "{a:?} {b:?}"
+    );
   }
 
   #[test]

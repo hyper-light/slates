@@ -770,6 +770,9 @@ fn a_request_this_server_cannot_answer_is_refused_out_of_band() {
   }
 }
 
+/// A part as a reply carries it: its type, its `message` parameter, and how many parameters are mandatory.
+type PartSeen<'s> = (&'s [u8], Option<&'s [u8]>, usize);
+
 /// AC-HG.9, A-619 part 3: do ask `getbundle` of a bundle2 client that lists only changegroup version 01. Expect, as 7.2
 /// answers an abort of a bundle2 request, a bundle2 stream of one `ERROR:ABORT` part whose mandatory `message` is 7.2's
 /// "no common changegroup version", and nothing on stderr.
@@ -795,7 +798,7 @@ fn a_bundle2_request_refused_is_answered_with_an_abort_part() {
     )
   );
   let stream = Bundle2::decode(&stdout, &mut room()).unwrap();
-  let parts: Vec<(&[u8], Option<&[u8]>, usize)> = stream
+  let parts: Vec<PartSeen<'_>> = stream
     .top_level()
     .map(|(_, part)| (part.kind, part.param(b"message"), part.mandatory_params))
     .collect();

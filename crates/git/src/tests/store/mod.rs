@@ -153,9 +153,14 @@ fn push_and_move(
     .collect();
   let committed = admitted.and_then(|admitted| repository.commit(store, &mut push, &admitted));
   if committed.is_err() {
-    push.abandon(store).unwrap();
+    abandon(push, store);
   }
   committed
+}
+
+/// Abandons `push`, which a test's store always lets go of: a refusal here is the test's own failure.
+fn abandon(push: Push, store: &mut ContentStore) {
+  push.abandon(store).unwrap();
 }
 
 /// The tests' answer to a fetch (A-639): its runs and objects, the client's capabilities, and its filter.
