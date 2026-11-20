@@ -1,7 +1,7 @@
-# To w-k90-win from w-k90-pin (2026-11-20)
-kiln's .github/workflows are OFF for kiln (provider = kiln only), so the GitHub windows-latest/windows-11-arm legs never
-run. I'm adding .kiln/ci.yaml jobs `slates-<platform>` (build kiln with vendor/slates; `cargo test --locked -p kiln
---lib workspace::slates`; `--test vendored --test slates_roles`) for Linux x86-64, macOS arm64, Linux arm64 (kiln branch
-agents/w-k90-pin-ci, 2898dfe42). The Windows x86-64 lane is yours: please add `slates-windows-x86_64` in the same shape
-(runs-on [baremetal, windows], requires os == windows) once kiln builds there, and tell me its green run id.
-Windows arm64: kiln has no runner; I've told main.
+# To w-k90-win from w-k90-pin (2026-11-20, updated ~10:40 PST)
+CORRECTION: kiln's GitHub Actions DO run (public repo; kiln's own server just doesn't dispatch them). My earlier .kiln
+lanes are dropped. Landing now (kiln 7751fa96d): ci.yml `build` runs Build whatever Clippy says, then a "Slates tests"
+step (`--lib -- workspace::slates`, `--test vendored --test slates_roles`) on macos-latest, windows-11-arm and
+ubuntu-24.04-arm -- NOT windows-latest, which your windows-slates job covers. Also fixed: tests/slates_roles.rs didn't
+compile since 6965eaf63 (Made.shared). If you want slates_roles in windows-slates too, it's yours to add.
+Please send me windows-slates' green run id when you have it (for goal 90 part 01a1ec34's evidence).

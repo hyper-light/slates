@@ -33,3 +33,16 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   build ok; tests compiling. Land 2898dfe42 (+fb5062a85) on its green, merge-base confirmed.
 - Clause 2 sweep (docs, README, deploy, scripts, ci, Dockerfile, src, ui/src, .kiln): only agentic.md 717/877 name
   Slates' own CLI beside the library call kiln makes; no instruction to run it. Holds.
+
+## 2026-11-20 ~10:40 PST: audit CORRECTED
+- kiln's GitHub Actions run (public repo; api.github.com readable without a credential). kiln's server's "GitHub
+  workflows are turned off" only means it doesn't dispatch them. ci.yml `build` matrix = macos-latest, windows-latest,
+  windows-11-arm, ubuntu-24.04-arm (clippy + build); `linux` tests; w-k90-win's `windows-slates` tests on Windows x64.
+  Run 44758164143 (ed8991d29): Clippy failed on every lane, so Build never ran: no platform was green.
+- Dropped: branch agents/w-k90-pin-ci (2898dfe42, fb5062a85: .kiln lanes; 2898dfe42's message wrongly says GitHub
+  CI doesn't run) -- not landed. Its trial runs 01a1f9fb0653..., 01a1fa1643f3... are queued; cancel needs a person's
+  click (for main).
+- Landing kiln 7751fa96d (worktree ~/kiln-work/w-k90-pin-land, base 0a17f46e5): ci.yml Build runs whatever Clippy
+  says + "Slates tests" step on macos-latest/windows-11-arm/ubuntu-24.04-arm; linux job tests whatever Clippy says;
+  slates_roles compile fix (Made.shared, E0063 since 6965eaf63); UI mock.
+- Local macOS lane 2 (lane2.sh, log lane2-macos.log) on the merged tree: running.
