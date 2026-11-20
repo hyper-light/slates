@@ -188,3 +188,14 @@
   Cargo.lock missing xtask's libc so --locked refused) and 111d561a0 (merge stack boxing + named_tests split, svn dav
   site no-op as_deref). recovery.rs's two sleeps (6ea16f4c5) sent to w-sizing (inbox/w-sizing-from-w-lint.md).
 - xtask tests/helm_chart.rs the_render_equals_the_golden fails here; not from these changes; noted, not chased yet.
+
+## 2026-11-20 round 8 at fe7cb5232 (landed 553e3d3ee, main a7df9ccf0)
+- Host: db repository.rs apply_advanced (namespace_changes), vfs tests/pinned_chunks (pinned_extents_read),
+  cli tests/v3_takeover flow test 17/10 (455fe41fb, a wip commit; split into seven helpers, and it was not
+  rustfmt-clean -- fmt --check was failing on main). Literals: cluster credentials wire widths, hg tags radix,
+  git store/learn level count and corpus shape. Tests here: db repository 34, vfs pinned_chunks 2, cluster
+  credentials 3, hg tags 2, v3_takeover 1 under SLATES_TEST_CLI=1 (11 s). Merge conflict with d94410e74 (rustfmt of
+  the same file only): kept the split version.
+- Cross six targets, structural, literals, unsafe, fmt: clean. Still red: server tests/recovery.rs two sleeps,
+  w-sizing's piece (inbox/w-sizing-from-w-lint.md).
+- r35 (Windows) and r36 (Linux) for g226 lost to kiln timeouts; re-run on current main as r37/r38 in the background.
