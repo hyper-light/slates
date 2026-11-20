@@ -1,6 +1,7 @@
 use std::io::{Read, Write as _};
 use std::net::TcpStream as ClientStream;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -13,7 +14,8 @@ use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
 
 use super::{
-  Answer, Bounds, Counts, Decided, EdgeState, Exchange, Failed, Site, admits_cleartext, serve,
+  Answer, Bounds, ClientGone, Counts, Decided, EdgeState, Exchange, Failed, Site, admits_cleartext,
+  serve,
 };
 use crate::daemon::LIVENESS_BUDGET_NS;
 
@@ -111,6 +113,12 @@ const NO_CONTENT: Status = Status {
   reason: "No Content",
 };
 
+/// Shape: a body [`Echo`] answers only once its client has gone, as a git hook runs until its client goes (A-665 part 4),
+/// marking [`SAW_ITS_CLIENT_GO`].
+const WATCHES_ITS_CLIENT: &[u8] = b"watch";
+/// Whether an [`Echo`] of [`WATCHES_ITS_CLIENT`] saw its client go: one test's alone.
+static SAW_ITS_CLIENT_GO: AtomicBool = AtomicBool::new(false);
+
 /// An exchange replying `echo:` and the body it took, in one run; naming its reply's fields, or failing as its reply
 /// begins, for the bodies [`TYPED`] and [`FAILS_AS_IT_BEGINS`].
 #[derive(Default)]
@@ -129,7 +137,11 @@ impl Exchange for Echo {
     Ok(())
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
+    if self.body == WATCHES_ITS_CLIENT {
+      gone.gone().await;
+      SAW_ITS_CLIENT_GO.store(true, Ordering::SeqCst);
+    }
     Ok(())
   }
 
@@ -730,5 +742,32 @@ fn a_status_named_after_the_body_heads_the_reply_and_one_no_reply_may_carry_fail
       String::from_utf8_lossy(refused.as_bytes()),
       true
     )
+  );
+}
+
+/// Whether [`SAW_ITS_CLIENT_GO`] is marked within `for_ns`, looked at every [`TICK_NS`].
+fn marked_within(for_ns: u64) -> bool {
+  let until = Instant::now() + Duration::from_nanos(for_ns);
+  while !SAW_ITS_CLIENT_GO.load(Ordering::SeqCst) && Instant::now() < until {
+    std::thread::sleep(Duration::from_nanos(TICK_NS));
+  }
+  SAW_ITS_CLIENT_GO.load(Ordering::SeqCst)
+}
+
+#[test]
+fn a_service_answering_after_the_body_learns_its_client_has_gone() {
+  let ((while_there, once_gone), _) = served(ONE_SEAT, None, |address| {
+    let mut stream = connect(address);
+    stream
+      .write_all(&post(WATCHES_ITS_CLIENT, true))
+      .expect("the request");
+    let while_there = marked_within(MOMENT_NS);
+    drop(stream);
+    (while_there, marked_within(PATIENCE_NS))
+  });
+  assert_eq!(
+    (while_there, once_gone),
+    (false, true),
+    "the signal is quiet while the client waits for its answer, and resolves once it closes"
   );
 }

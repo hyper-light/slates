@@ -13278,8 +13278,9 @@ engine: the verdict, rebase, position mapping, the register).
 > with each one's words in git's order and `post-receive` reading the moved ref in its view's `packed-refs`, a refusing
 > `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
 > with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
-> and `protected_fixtures` 49 of 49, fmt clean). Owed: the read-only attachment; the
-> edges' signal of a client gone, which ends a hook's run; the hooks' learned times; seals kept as derived data.
+> and `protected_fixtures` 49 of 49, fmt clean). The HTTP edge's signal of a client gone ends a hook's run (A-665 part
+> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended). Owed: the
+> read-only attachment; the SSH edge's signal; the hooks' learned times; seals kept as derived data.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -53888,3 +53889,16 @@ and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `c
   `slates-git` `receive::tests::a_pack_past_its_room_is_refused_in_the_words_of_gits_max_input_size`.
 - **Owed.** The unpack admitting objects into the quarantine a slice at a time (the reader holds them until the pack
   ends, then the quarantine copies them); the whole git/git push and a fresh clone fscked (main's run).
+
+### A-665 part 4a — The HTTP edge tells a hook's run its client has gone (2026-11-20, w-git for UI goal 93; §4.17.2 "Hooks, in git's terms")
+- **Change.** `Exchange::body_end` takes `vcs_http::ClientGone`, the connection's socket watched once the request's
+  body has ended: its end of stream or a reset resolves it; bytes queued there (a pipelined request, a TLS record such as
+  `close_notify`) leave it unknown and are left for the edge, nothing consumed. git's receive-pack hands it to each
+  hook's run (`git_push`'s `HookCall::run`), so a hook whose client went is ended and what it would have judged refused,
+  in place of `pending()`.
+- **Tests.** `vcs_http::tests::serve::a_service_answering_after_the_body_learns_its_client_has_gone`: quiet while the
+  client waits for its answer, resolved once it closes.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_http::tests::
+  vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, the new test named in the output; fmt clean on the changed files.
+- **Owed.** The SSH edge's signal (the channel's close); a TLS client that sends `close_notify` before it closes is not
+  seen gone; the hooks' learned times; the daemon's presenter (A-665 part 4, main's ruling: the read-only view volume).
