@@ -10,8 +10,10 @@
 #[path = "../support/process_wait.rs"]
 mod process_wait;
 
+#[cfg(target_os = "linux")]
+pub(crate) use process_wait::await_exit_of;
 /// The suites' wait judgment, for a test of these harnesses' VMs (`guest_image`'s launcher).
-pub(crate) use process_wait::{Judged, Verdict};
+pub(crate) use process_wait::{InstanceWait, Judged, Verdict};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
