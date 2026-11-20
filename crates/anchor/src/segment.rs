@@ -961,6 +961,20 @@ impl AnchorSegment {
     Ok(Some(parsed))
   }
 
+  /// What of a region is in RAM, and written where the OS says (`slates_mem::resident`, A-744): the kernel's page
+  /// table read, no byte of the segment touched.
+  pub fn region_residency(
+    &self,
+    kind: RegionKind,
+  ) -> Result<slates_mem::resident::Residency, AnchorError> {
+    let range = self.range(self.spec(kind)?)?;
+    Ok(
+      self
+        .object
+        .residency(range.start, range.end.saturating_sub(range.start))?,
+    )
+  }
+
   /// A region's length in bytes.
   pub fn region_len(&self, kind: RegionKind) -> Result<usize, AnchorError> {
     let range = self.range(self.spec(kind)?)?;

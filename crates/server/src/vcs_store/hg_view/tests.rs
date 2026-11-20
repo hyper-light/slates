@@ -49,7 +49,8 @@ fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
       name: name.to_owned(),
       tool,
       format: WireFormat::Sha1,
-      default_branch: "default".to_owned(),
+      // The root's name as the command line spells it (`repository::root_binding`): the first line of `default`.
+      default_branch: "branch:default:0".to_owned(),
       green: None,
     },
   );
@@ -116,5 +117,82 @@ fn t_a680_a_view_is_lent_from_the_store_or_not_at_all() {
       (None, Some(STATES_SERVED), (None, None), None)
     );
     assert_eq!(unmade(state), before.saturating_add(1));
+  });
+}
+
+/// The bookmarks repository `id`'s served view lists, each name with its node.
+fn bookmarks_of(state: &mut ShardState, id: RepositoryId) -> Vec<(Vec<u8>, slates_hg::Node)> {
+  lend_in(state, id, &mut Admission::new(ROOM), |view, _| {
+    view
+      .bookmarks()
+      .map(|(name, node)| (name.to_vec(), node))
+      .collect()
+  })
+  .expect("a view")
+}
+
+/// A-575 with §4.17.1's table (a slates branch is a Mercurial bookmark, names one to one; found by use for git, checked
+/// here for Mercurial). Do: import `states` (bookmarks `one` and `two`), then by the owner's verbs, as the command line
+/// sends them, create branch `topic` from `one`, retire it, and bind it again to its green. Expect `topic` listed as a
+/// bookmark at `one`'s node once created, gone once retired, and back at it once bound; `one` and `two` unmoved.
+#[test]
+fn a_branch_the_owner_creates_retires_and_binds_is_a_bookmark_by_the_same_name() {
+  crate::daemon::audit_on_shard(|state| {
+    let hg = created(state, "hg", VcsTool::Mercurial);
+    let (host, directory) = laid_out(STATES.iter().copied());
+    assert_eq!(begin(state, hg, (Box::new(host), directory)), Ok(()));
+    imported(state, hg);
+    let before = bookmarks_of(state, hg);
+    let one = before
+      .iter()
+      .find(|(name, _)| name.as_slice() == b"one")
+      .map(|(_, node)| *node)
+      .expect("states' bookmark one");
+    let mut ask = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
+    let made = ask(
+      state,
+      RequestBody::CreateBranch {
+        repository: "hg".to_owned(),
+        name: "topic".to_owned(),
+        from: "one".to_owned(),
+        version: None,
+      },
+    );
+    let ReplyBody::GreenCreated { id: green } = made else {
+      panic!("no branch: {made:?}");
+    };
+    let topic = (b"topic".to_vec(), one);
+    let created = bookmarks_of(state, hg);
+    let retired_reply = ask(
+      state,
+      RequestBody::RetireBranch {
+        repository: "hg".to_owned(),
+        name: "topic".to_owned(),
+      },
+    );
+    let retired = bookmarks_of(state, hg);
+    let bound_reply = ask(
+      state,
+      RequestBody::BindBranch {
+        repository: "hg".to_owned(),
+        name: "topic".to_owned(),
+        green,
+      },
+    );
+    let bound = bookmarks_of(state, hg);
+    assert_eq!(
+      (retired_reply, bound_reply),
+      (ReplyBody::Acknowledged, ReplyBody::Acknowledged)
+    );
+    assert_eq!(
+      (
+        created.contains(&topic),
+        retired.iter().any(|(name, _)| name.as_slice() == b"topic"),
+        bound.contains(&topic),
+      ),
+      (true, false, true),
+      "created {created:?}, retired {retired:?}, bound {bound:?}"
+    );
+    assert_eq!(retired, before);
   });
 }

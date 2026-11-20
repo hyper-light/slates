@@ -887,6 +887,72 @@ fn a_lock_runs_pre_lock_for_its_token_and_post_lock_after_it_as_svnserve_does() 
   );
 }
 
+/// §4.17.4 (a Subversion repository is one green; a branch is a directory in it, made by a copy): the lineage's branch
+/// verbs are refused by kind on a Subversion repository, so none makes a green no svn client reaches or unbinds the one
+/// it serves. Do: create a Subversion repository, then ask `CreateBranch` of a branch from its root, `BindBranch` of a
+/// name, and `RetireBranch` of its root; then sign in over svn:// as a stock client does and ask `get-latest-rev`.
+/// Expect: each verb refused `Unsupported` naming Subversion's directories; the repository still served, revision 0
+/// its youngest. Before, `CreateBranch` made a second green, which no Subversion path serves.
+#[test]
+fn a_subversion_repositorys_branch_verbs_are_refused_by_kind() {
+  use slates_ipc::protocol::Refusal;
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let name = name_on("svn-branched-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  let (root, green) = crate::daemon::observe_at(&daemon, OTHER, {
+    let name = name.clone();
+    move |state| {
+      let repositories = state.db.partition().repositories();
+      let record = repositories.repository_named(&name)?;
+      let (root, green) = repositories.branches(record.id, "").next()?;
+      Some((root.to_owned(), green))
+    }
+  })
+  .expect("the repository's root is bound");
+  let verbs = [
+    RequestBody::CreateBranch {
+      repository: name.clone(),
+      name: "feature".to_owned(),
+      from: root.clone(),
+      version: None,
+    },
+    RequestBody::BindBranch {
+      repository: name.clone(),
+      name: "feature".to_owned(),
+      green: crate::verbs::to_wire_volume(green),
+    },
+    RequestBody::RetireBranch {
+      repository: name.clone(),
+      name: root,
+    },
+  ];
+  for verb in verbs {
+    let asked = format!("{verb:?}");
+    let reply = crate::daemon::observe_at(&daemon, OTHER, move |state| {
+      crate::verbs::dispatch(state, 1, &owner(), verb.clone())
+    });
+    assert!(
+      matches!(
+        &reply,
+        ReplyBody::Refused {
+          refusal: Refusal::Unsupported { feature },
+        } if feature.contains("Subversion")
+      ),
+      "{asked}: {reply:?}"
+    );
+  }
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let mut signed = sign_in(port, &greeting, &format!("svn://127.0.0.1:{port}/{name}"));
+  let latest = asked(&mut signed.stream, b"( get-latest-rev ( ) ) ", 2);
+  assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 0 ) ) ");
+}
+
 /// The svn:// listener's turns yield (w-interop's git/git `svnrdump dump`, 2026-11-20: one `replay-range` held shard 0
 /// 3596 ms without a step). Do: sign in, then send 64 `get-latest-rev` commands in one write, so every turn after the
 /// first finds its command already read, and read their 128 answers as fast as they come. Expect: every answer, and no
