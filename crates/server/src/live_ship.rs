@@ -3097,8 +3097,8 @@ fn referenced_bytes(state: &ShardState, id: slates_db::catalog::VolumeId) -> u64
 /// reaches the volume's quota ([`kept_reaches_size`]): 215,997 bytes at head 16,526, so a holder 12 entries behind fell
 /// past the tail and was installed whole, its 195 to 219 MB image built on the owner's shard, 2 to 6 times in each
 /// catch-up (diag-live-durability-81 and -82).
-fn retain_bound(last_whole: usize, referenced: u64) -> usize {
-  last_whole.max(usize::try_from(referenced).unwrap_or(usize::MAX))
+fn retain_bound(last_whole: usize, _referenced: u64) -> usize {
+  last_whole
 }
 
 /// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
@@ -4576,7 +4576,7 @@ fn fold_into(
     let reply = decode_reply(&bytes);
     // Folded, not built: a lagging holder's answer names what it lacks and sends nothing from here (the lanes send
     // from `pending`), so its cost no longer follows its backlog ([`slates_db::live::Shipper::fold_reply`]).
-    if let Some(current) = live.shipper.fold_reply(host, reply) {
+    if let slates_db::live::Next::Fenced(current) = live.shipper.on_reply(host, reply) {
       learn_superseded(state, object.0, current);
       continue;
     }
