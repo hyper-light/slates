@@ -122,3 +122,12 @@
   server 35/35 on the landing tree (merged with A-730's lock hooks; serve.rs conflicts kept both sides).
 - Run request: live svnsync/svnrdump over svn:// against a daemon vs svnsync.dump / svnrdump-dump.dump.
 - NEXT: A-702 part 2 on A-730's hooks (vcs_svn::run_hook with HookPoint::SvnPreRevpropChange).
+
+## A-702 part 2 revprop change through hooks -- LANDED main 0aaed9b3f (commit f5ab439dc)
+- serve::revprops hands Turn::RevisionPropertyHook; revision_property_hooked (160006 / 160049, whole Record),
+  _landed, _finished; listener vcs_svn::revision_property + tunnel SvnCommand::revision_property (A-736 ClientGone);
+  SvnStores::land_locks -> land_record. Tests: svn 5/5, server 3/3 (hook args/stdin, svn:log read back, no hook 165006).
+- Ledger A-702 row updated (fanout-state e19429d).
+- Run request: stock `svn propset --revprop -r1 svn:log` over svn:// and svn+ssh:// with a pre-revprop-change hook.
+- NEXT (main's bug, 2026-11-20): svnrdump replay-range over git/git spins shard 0 (3596 ms). Root cause read: the
+  listener's go_on loop never yields on Turn::Wrote (Next::Again) or pipelined commands; fix = yield_now per turn.
