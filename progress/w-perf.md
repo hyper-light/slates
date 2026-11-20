@@ -73,3 +73,18 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 ## A-718 (main's ruling ~07:35Z; A-717 was w-git's): git deltas computed once and kept; clone streams stored deltas
 - Done when: clone --mirror, blob:none, shallow re-measured vs git daemon on the Studio (cut v1.0.0), memory before
   and after, recorded. Ask w-git: can its sliced intake (A-717) record each pushed object's delta as it arrives?
+- A-718 built: branch agents/w-perf-plan (pushed as agents/w-perf-a718), land worktree ~/slates-work/w-perf-a718-land
+  (agents/w-perf-a718-land, squashed + merged main). Local green before merge: server t_a718+t_a682 6/6, git 2/2, fmt.
+  Re-running server test on merged tree (main changed vcs_store.rs, A-714). Studio A/B (cut v1.0.0): clone-again
+  2.766 -> 0.912 s (stock 0.342), blob:none 1.076 -> 0.558, shallow 0.154 -> 0.118, first clone 2.791 -> 4.293,
+  RSS end 384-388 -> 482-513 MiB. w-git agreed A-718 lands first.
+- svn 5,000 import at b705a24c5 (A-714 in): 3,540 revisions then Unpublished (record profile 803 MB > 747 MB segment
+  region); svn commit after it E160004 green not at youngest (w-svn bug). Sent main + w-svn.
+- QUEUE (main/Ada, ~08:00Z): A-718 land -> A-716 (svn texts once) -> concurrent-push load test (slim protocol client
+  replaying a recorded receive-pack, then hg unbundle, svn commit; 1/10/100/1,000/10,000+; per-push memory,
+  completions, refusals, p50/p99, footprint; sizes derived; RAM only) -> register entry objects named by identity
+  (every tool; seam with w-svn).
+- A-718 LANDED main 156f4437d (checked on origin/main). Merged-tree rerun green (server 6/6, fmt). Main had reversed
+  "A-718 first" after it landed; told main. w-git's store-once intake merges over it.
+- NEXT: A-716 (svn texts held once, keyed by ContentIdentity surviving checkpoint folding; record's text bytes out of
+  the entry). Then the concurrent-push load test. Then entry objects named by identity (every tool).

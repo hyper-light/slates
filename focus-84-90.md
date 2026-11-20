@@ -941,3 +941,42 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   bases, bounded working set, sliced; admission charges the working set, content charged as stored (A-714); w-git
   writes the shared rule into §4.17.1. w-hg: same inside (3). w-svn: cite it on the commit path. w-perf: after A-716,
   a concurrent-push load test (replay client; 1 -> 10,000+ pushes on one daemon), before T4.
+- ~00:45 PST w-hg fixed the two hg-site 503 tests on main 7379a4d8e (3a59b5776): cause was A-687 (a done import waits
+  in the map until it lands; create_hg_from_states stopped at Done), not A-711. Next: (3)+(4) with content once.
+- GOALS MET (main, verified): event-driven reaper (A-709 9b93fd77c, A-715 f70230cc8, reap_loop deleted); A-583 fleet
+  tests; A-503 move test (macOS arm64; Linux run r627 queued, adacachy full). w-reaper sent a stale "reap tick"
+  comment/name sweep (dax_backing, daemon.rs, cli.rs test, nfs_large_write bench).
+- ~00:50 PST w-shared A-636 2c-2 landed c7c18db3e (c8452ee97): successor rebuilds a taken-over repository by keep-whole
+  rule, Op::RepositoryRebuilt (wire 101). Finding: rebuilt store holds no objects (state log parts carry none) -> rides
+  content once (entries name green content by identity; successor holds the family's content); fetching parts a
+  successor doesn't hold stays owed. Next: A-664 holders' maps.
+- ~00:55 PST w-interop landed 78eea35b9 (git matrix tag row; git 26->27/27 expected at v1.0.0); hg 17/24. It was
+  idle-waiting -> REASSIGNED A-681's remaining DAV pieces (DAV routing + update-report; the two svn HTTP rows) from
+  w-svn to w-interop. w-svn: E160004 fix, then A-693 p2 lock.
+- ~01:00 PST w-git A-719 p1 landed 20ffba05f (81c36bd99): push checks (fsck + connectivity) a turn at a time under the
+  step quantum (Answering::Turned). Debug 3,000-commit push: prepare and decide still 0.3-2.7 s in one step -> next
+  parts: streamed store-once intake + §4.17.1 rule, then verdicts sliced. Ruling: w-git's intake does NOT wait on
+  A-718 (w-perf's T4 is behind A-716 + load test); w-perf builds T4 on the new store.
+- ~01:05 PST A-718 (T4) had already landed 156f4437d (w-perf) before the reversal: git/git cut v1.0.0, best of 3:
+  clone-again 2.766 -> 0.912 s (git daemon 0.342); blob:none 1.076 -> 0.558 s; shallow 0.154 -> 0.118 (daemon 0.119);
+  first clone after a push 2.791 -> 4.293 s (one-time encode); RSS 384-388 -> 482-513 MiB. Follow-ups (encode at
+  intake, first-clone cost) rebuilt on w-git's new store later. w-perf now: A-716, then concurrent-push load test.
+- ~01:15 PST A-716 DESIGN RULING (w-perf found the green's history chunks have no content identity; folding drops
+  history): (a) the green's identity table = the ONE byte store for git, hg and svn: hold by path at head (svn) and
+  hold bytes by identity path-less (git/hg intakes); landing op set_from_held(path, identity) reuses chunks (no rehash
+  on VFS write path); survives folding (refcounts), in checkpoint (recovery/replication rebuild), bounded holders.
+  w-perf: slice 1 (engine) NOW (before load test), then load test, then svn slices 2-3 (seam with w-svn's E160004).
+  w-git/w-hg: land streaming + slicing now; switch storage to the table when slice 1 lands; no second store meanwhile.
+- w-interop: A-681 tests on the Studio's warm target (Mac disk 32 GiB free); `git checkout -b x` breach owned (no harm).
+- ~01:20 PST w-hg A-720 p1 landed (56952183f): slates-hg push::intake, a changegroup into an index fork one revision
+  per step (rebuild vs stored base, node check, kept once); working set one revision's texts. RULING for p2: intakes
+  run concurrently even per repository (a fork per push); only the landing verdict is ordered per repository.
+  common.md: name branches with `git branch`/push HEAD:refs/heads/<name>, never checkout -b (two breaches tonight).
+- ~01:30 PST w-hg p2 plan APPROVED: fork per push, concurrent intake; ordered landing rebases the fork by node
+  (renumber rows; reuse stored content; skip revisions already landed; sliced) when the index moved. Added: judge
+  bundle2 check:heads / check:updated-heads at landing against current heads; advertise checkheads=related.
+- ~01:40 PST A-721 LANDED 0cb5120b1 (w-svn, 3169466fe): E160004 wedge fixed: reconcile_unpublished_effects remakes a
+  green whose engine is past its durable head from checkpoint + chain (lone engine / single-member lineage = every svn
+  repo). Owed (GAPS): multi-member lineages (git branches) counted (merge.unpublished.green_ahead_kept) not remade; a
+  submit's vcs_store paths/commits not taken back -> left for use to find (likely at git's region wall). w-perf to
+  confirm by the 5,000-rev import at its next release build. w-svn next: A-693 p2 (svn:// lock).
