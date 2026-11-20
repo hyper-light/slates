@@ -1946,9 +1946,11 @@
 > and two calls, both formats byte for byte). **Part 2 (same day):** a text a window a call, `Text` pieces of
 > `WINDOW_LIMIT` (format 2, one walk: its length and checksums the record's) or one deltified window (format 3, taken
 > up again by `svndiff::deltas_at`); held by `every_export_call_writes_one_changed_path_or_one_window_of_its_text`
-> (largest call 102,400 and 102,413 bytes, the 107 KB text no longer one). Owed (part 3, next): format 3's measuring
-> walk, which its record's header needs first (the svndiff's length is kept nowhere), still one call over the whole
-> text, keeping no window (§4.17.4 item 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> (largest call 102,400 and 102,413 bytes, the 107 KB text no longer one). **Part 3 (same day):** format 3's
+> measuring walk a window a call before the record's call (the step run first on copies, its writes dropped, to learn
+> its delta's texts); held by `a_large_delta_is_measured_and_written_a_window_a_call` (a five-window change: 15 calls,
+> each within a window and `CALL_HEADROOM`, where by count the record's call measured all five). The dump export's
+> calls are bounded by a window now; a call's time against the shard's slice is main's to measure in release. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
