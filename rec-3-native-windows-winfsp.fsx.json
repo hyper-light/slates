@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "suite": "fsx",
+  "transport": "native-windows-winfsp",
+  "host": {
+    "os": "Microsoft Windows [Version 10.0.26100.33828]",
+    "kernel": "Microsoft Windows [Version 10.0.26100.33828]",
+    "arch": "x86_64",
+    "privilege": "root"
+  },
+  "date": "2026-11-20",
+  "command": "cd <mount>/conformance-<pid>/fsx && <scratch>\\tools\\fsx.exe -N 10000 -S 1 -F 262144 -v -P D:\\a\\slates\\slates\\target\\conformance-scratch\\native-windows-winfsp\\fsx-logs fsx.bin",
+  "bound": "10000 operations, seed 1, file length 262144 bytes, 300s a run",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "fsx",
+      "operations": 10000,
+      "seed": 1,
+      "file_length": 262144,
+      "ok": false
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-windows-winfsp.fsx.txt",
+    "blake3": "65eb035e56313fe31f8da91ddeee0e61b6600554cedb75c747e426547635824d",
+    "entries": 1
+  },
+  "duration_ms": 49221,
+  "notes": [
+    "fsx: the WinFsp port, billziss-gh/secfs.test@6ac65cd fstools/src/fsx/fsx.c (APSL 2.0), sha256 440742597d18b69edfea6ca49fd1905fbad4926953e446957e2ed1377ebe584c, with its win/ shims at the same commit, built `cl /nologo /MT /W2 fsx.c win\\getopt.c win\\mman.c win\\random.c ntdll.lib /Fe:fsx.exe /link /subsystem:console` (source unchanged)",
+    "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)",
+    "0 expected failures; 1 unlisted failures (fsx-seed-1:10771); 0 listed now passing; 1 listed absent (fsx-seed-1-unfinished:10000)",
+    "fsx output tail: …8 (130104) to 0x40000 (262144)\n10765: TRUNCATE UP     from 0x1fc38 (130104) to 0x40000 (262144)\n10766: MAPWRITE        0x3ac70 (240752) thru 0x3ffff (262143)\t(0x5390 (21392) bytes)\n10767: READ            0x2f300 (193280) thru 0x346ef (214767)\t(0x53f0 (21488) bytes)\n10768: MAPREAD         0xa570 (42352) thru 0x10c83 (68739)\t(0x6714 (26388) bytes)\n10769: TRUNCATE DOWN   from 0x40000 (262144) to 0xa558 (42328)\n10770: TRUNCATE UP     from 0xa558 (42328) to 0xfba8 (64424)\nAll operations - 10770 - completed A-OK!",
+    "fsx's -P files kept beside the record, each bounded to 1542144 bytes, in native-windows-winfsp.fsx-logs: fsx.bin.fsxgood (0 of 0 bytes), fsx.bin.fsxlog (936892 of 936892 bytes)"
+  ]
+}
