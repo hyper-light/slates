@@ -163,3 +163,15 @@
   origin/main 85d66d9cb (cargo test --locked -p slates-vcs --lib <name>, macOS arm64, this Mac). No note to w-perf.
 - A-752 literals (merge pace.rs RUN, push.rs UNIT_BYTES): w-engine's to derive under R3; rounds report them only.
 - "wip" commits 03f872541, 7113b38e7: not rewritable (main never forced); rule now in the fleet brief.
+
+## 2026-11-20 round 7 at bbc6aa614
+- Host: svn migration/records.rs read_step (13/10) and a test cast -> 001318ae7 (chain_of, decoded_step); svn
+  migration tests 45 pass on base 8ebf8a1c6. Cross targets, structural, literals (now clean: w-engine's A-752
+  derivations landed), unsafe, fmt: clean.
+- Windows: r32 at 32164bf showed the same svn error only (svn lib blocked the rest); re-run on c0958ff35 started in
+  the background (r33).
+- Ada (2026-11-20): don't block on remote/CI runs; run focused unit and integration tests here and merge. Windows lane
+  now runs in the background and its findings are fixed when it ends.
+- Windows r34 at 159f1c8 (r33 lost to a kiln timeout): referenced-content tests from bc6cc7ab1 (vfs tests/referenced.rs
+  unwrap_in_result, slicing, cast; server vcs_store/referenced.rs cast) -> 6e5f6a53a, landed via 2d3f218cb; vfs
+  referenced 6 pass, server referenced 2 pass locally.

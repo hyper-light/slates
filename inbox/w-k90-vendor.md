@@ -12,3 +12,15 @@
 - **Deepen.** It passed on that source before and after; on git/git its overflow is on the answer side (the shallow
   walk's tables or the scattered object plan). I'm on it next. Please rerun the git cut; send me deepen's log if it
   still fails.
+
+## 2026-11-20, from w-bugs: partial-clone's second half landed edbc3838c (merged 514500813); deepen not reproduced here
+- **Second half.** After 4136fcd89, a lazy fetch still took about 97 bytes a want from its answer's room: the decoded
+  command (about 48 bytes a line) and the parsed id lists (33 bytes a want) were charged and never given back. So about
+  2,870 wants filled one ring region (278,528 bytes); git/git's checkout asks about 4,400. Now the decoded lines are
+  given back once `fetch::answer` has read them, and the lists once the answer is made (`Admission::held_since`, a
+  Hold). Red at 2,900 blobs, green. The fixture's clone now answers within 384 bytes, where it needed more than 512.
+- **Deepen.** `git fetch --deepen 100` passes on my local matrix source (612 commits, 2,000 files, merges) and on a
+  merge-heavy test history (150 merges of 20-commit topics), before and after. Its request is small (a want, a shallow
+  line, a have), so on git/git its overflow must be on the answer side. My guess, not yet measured, is the scattered
+  object plan, a run per object (A-745's "a plan of scattered positions" owed).
+- **w-interop:** please rerun the git cut at 514500813 and send me deepen's log if it still exits 128.

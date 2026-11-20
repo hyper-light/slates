@@ -67,3 +67,24 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   Slates step taken back out of `build`. Windows x86-64 = w-k90-win's windows-slates job.
 - Poller: ~/kiln-work/w-k90-pin-logs/poll2.sh 715063153 (first completed, non-cancelled main run containing it).
 - Goal on my kiln stack: 01a1fa367d4c (plan 01a1fa36 step 1): goals_done with commit + run ids per platform + base.
+- 2026-11-20 ~11:35 PST: user: don't block on CI; local tests + merge. Poller stopped. GitHub CI for main is STUCK:
+  run 44784299374 (0a17f46e5) macos-latest Clippy running since 17:46Z (>2h; 7 GB runner); every newer main run
+  (44790740630 ca1a0302e .. 44802263763 cc1ecb625, incl. 44794235390 = 715063153) cancelled while pending.
+  Cancelling it needs a GitHub credential (not here). LANDED kiln cc1ecb625..4244a0f9e: timeout-minutes build 90,
+  slates 120.
+- RISK: macos-latest (7 GB) may not compile kiln's lib tests in the slates job either.
+- Goal 01a1fa367d4c NOT marked: its CI run-id clause has no evidence yet. All code merged; local macOS green.
+- 2026-11-20 ~12:10 PST: LANDED kiln 4244a0f9e..08f1a4344: .kiln/ci.yaml lanes on kiln's own machines (slates-linux-x86_64,
+  slates-macos-arm64, slates-linux-arm64 [container], slates-windows-arm64-cross), 32Gi host lanes (26Gi trial stopped in
+  tests), docker pull bounded 600 s. Dispatched kiln ci run 01a1fa885fc5725996c71436c67a995d (jobs filter, sha 08f1a434);
+  push run 01a1fa83bde5 also carries them. Stale trial 01a1f9fb0653 (old base) still holds runners (linux-arm64 leg hung
+  on docker pull) -- cancel needs a person's click (for main).
+- GitHub poller restarted (poll2.sh 715063153). GitHub main CI blocked by run 44784299374 until it times out.
+- kiln's own main CI has the same pathology: every queued ci.yaml run on main is cancelled by the next push before it
+  gets legs (01a1fa83bde5, my dispatch 01a1fa885fc5, 01a1fa88a1b1 ...). So: ci.runs.local of main commit 08f1a434 under
+  refs of their own (branch agents/w-k90-pin-evidence pushed at 08f1a434; kiln didn't see it, runs.local takes the ref):
+  linux-x86_64 01a1fa8f0de173e39b8af52219ffb700 (leg 01a1fa8f0de8, 451397 running), macos-arm64
+  01a1fa8fe4097372b94f7337ff2b7fd3 (d1323898 running), linux-arm64 01a1fa8ff6d771bc90e709b705554f79 (queued headroom),
+  win-arm64-cross 01a1fa9006fe76bcbc4891519afba25e (b24c running). Dropped dupes: 01a1fa8f420a, 01a1fa8f481d, 01a1fa8f4cfa.
+- Windows x86-64 CI evidence: GitHub windows-slates (w-k90-win; GitHub main CI stuck behind 44784299374) -- jupiter has
+  5 GB free, so no kiln-runner lane there.
