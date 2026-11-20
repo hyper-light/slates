@@ -1554,16 +1554,24 @@ mod tests {
       };
       // The names log moves by each verb's changes and by each record the repository's register keeps (A-724 piece 8c:
       // a version's record rides the names log to the repository's candidates, so a successor replays it).
-      let records =
-        |state: &ShardState| u64::try_from(state.db.partition().repositories().objects(repo).count()).unwrap();
+      let records = |state: &ShardState| {
+        u64::try_from(state.db.partition().repositories().objects(repo).count()).unwrap()
+      };
       let moved = |state: &ShardState, verbs: u64| Some(verbs + records(state));
       let head_of =
         |state: &ShardState, green| state.db.partition().green_head(to_db_volume(green));
-      assert_eq!(names(state), moved(state, 2), "the root joined and its name bound");
+      assert_eq!(
+        names(state),
+        moved(state, 2),
+        "the root joined and its name bound"
+      );
       write(state, root, b"v1", 1);
       let mut serial = 1;
       let root_head = write_until_folded(state, root, &mut serial);
-      assert_eq!((names(state), head_of(state, root)), (moved(state, 2), root_head));
+      assert_eq!(
+        (names(state), head_of(state, root)),
+        (moved(state, 2), root_head)
+      );
       // No reader held version 1, so the root folded it: a branch there is refused before any record.
       assert!(matches!(
         refusal(branch(state, ("tree", "early", "main"), Some(1))),
