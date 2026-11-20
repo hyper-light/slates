@@ -110,3 +110,13 @@ Files I'd touch: crates/svn/src/index.rs (the maps, append, children, entries), 
 (the persistent map and its own oracle against a BTreeMap model), crates/svn/src/report/drive.rs (entries through the
 new call), and the index tests. If you'd rather hold the maps elsewhere (say per path line with versioned entries), or
 if you're mid-change in index.rs, tell main and I'll follow your shape.
+
+## 2026-11-20, from w-bugs: A-759 part 1 landed (088bf935b, merged fa3f0f82a) -- the listing's API name
+As agreed, with one name changed: the (name, NodeRevisionId) call is `Index::listing(path, revision)`, since
+`Index::entries()` is already the room's count. `Index::children` is the listing's names. The maps:
+- `index/children.rs` (a persistent B-tree, 8-byte entries, edited in place within a revision) and `Row.children`;
+- charged through `entries()`: rows + deletions + map bytes in ENTRY_BYTES units, so a replay's append pays the same;
+- the old walk (`named_beneath`, `PROBE_NAME`, `AFTER_SEPARATOR`, `child_path`) is removed.
+Your `same_listings` oracle now also holds each listed id to the node its path resolves to; the room test asks its
+room by refusal. Next I add `Index::listing_after(path, revision, after, most)` (a cursor) for the drive; the replay
+drive's `add_subdir` still lists whole through `Repository::entries`, which is now the map walk.
