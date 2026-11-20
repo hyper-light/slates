@@ -26,9 +26,10 @@ mod process_wait;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's unmount (A-511) to show in
-/// `status` — ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s; a client is asked about once silent for
-/// one budget, so a death shows within two).
+/// Shape: ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s): how long a transient holder that is no slates process (a
+/// sibling test's child between its fork and its `exec`) may keep a mount busy or a pipe's end open, and a container
+/// probe's wait on its map. Until 2026-11-20 also every wait for a daemon's state to show (`wait_for` and its kin), now
+/// judged in the instance's processes' own CPU ([`StartProgress`]).
 const WAIT_FOR: Duration = Duration::from_secs(10);
 /// Shape: the pause between polls of a starting or stopping daemon.
 const POLL_MS: u64 = 20;
@@ -1199,7 +1200,10 @@ fn expect_the_anchors_own_image(
     // Gone between the reap check and the look is the anchor ending, which the next check reaps.
     let verdict = judged.judge();
     assert!(
-      !matches!(verdict, process_wait::Verdict::Stalled),
+      !matches!(
+        verdict,
+        process_wait::Verdict::Stalled | process_wait::Verdict::SpentItsBudget
+      ),
       "the anchor ended after refusing: it stays without gaining CPU ({verdict:?})"
     );
     pause();
@@ -3617,6 +3621,11 @@ struct StartProgress {
   seen: Option<(Vec<u32>, u64)>,
   moved_at: Instant,
   began: Instant,
+  /// Each process's CPU at the last look, nanoseconds; empty before the first.
+  cpu: std::collections::BTreeMap<u32, u64>,
+  /// The CPU the processes spent since the wait began: each one's gain between looks, and a process that came during
+  /// the wait (a successor) all it ran.
+  spent: Duration,
 }
 
 impl StartProgress {
@@ -3626,11 +3635,13 @@ impl StartProgress {
       seen: None,
       moved_at: now,
       began: now,
+      cpu: std::collections::BTreeMap::new(),
+      spent: Duration::ZERO,
     }
   }
 
   /// Ends the test, saying it waited for `what`, once the instance's processes made no progress for
-  /// [`process_wait::STALL`] or none is left.
+  /// [`process_wait::STALL`], spent [`process_wait::CPU_BUDGET`] since the wait began, or none is left.
   fn check(&mut self, instance: &str, what: &str) {
     self.check_all(&[instance], what);
   }
@@ -3647,6 +3658,12 @@ impl StartProgress {
       "waited for {what} at {instance}: {} ({:?} after the wait began; {:?})",
       if self.seen.as_ref().is_none_or(|(pids, _)| pids.is_empty()) {
         "none of its processes is left".to_owned()
+      } else if self.spent_its_budget(instances.len()) {
+        format!(
+          "its processes spent {:?} of CPU without it, the budget {:?} a node",
+          self.spent,
+          process_wait::CPU_BUDGET
+        )
       } else {
         format!(
           "its processes made no progress for {:?}",
@@ -3658,8 +3675,9 @@ impl StartProgress {
     );
   }
 
-  /// Whether a wait on `instance` goes on: some of its processes are left, and they made progress within
-  /// [`process_wait::STALL`].
+  /// Whether a wait on `instance` goes on: some of its processes are left, they made progress within
+  /// [`process_wait::STALL`], and they have not spent [`process_wait::CPU_BUDGET`] since the wait began (as
+  /// `live_chaos` judges its starts: a daemon that runs and never brings the answer about is not waited on forever).
   fn look(&mut self, instance: &str) -> bool {
     self.look_all(&[instance])
   }
@@ -3675,16 +3693,36 @@ impl StartProgress {
       self.seen = None;
       return false;
     }
-    let total = pids
+    let readings: Vec<(u32, slates_machine::process_clock::ProcessCpu)> = pids
       .iter()
-      .filter_map(|pid| slates_machine::process_clock::process_cpu(*pid))
-      .fold(0u64, |sum, cpu| sum.wrapping_add(cpu.progress));
+      .filter_map(|pid| Some((*pid, slates_machine::process_clock::process_cpu(*pid)?)))
+      .collect();
+    let first = self.cpu.is_empty();
+    let mut cpu = std::collections::BTreeMap::new();
+    for (pid, reading) in &readings {
+      let gained = match self.cpu.get(pid) {
+        Some(then) => reading.spent_ns.saturating_sub(*then),
+        None if first => 0,
+        None => reading.spent_ns,
+      };
+      self.spent = self.spent.saturating_add(Duration::from_nanos(gained));
+      cpu.insert(*pid, reading.spent_ns);
+    }
+    self.cpu = cpu;
+    let total = readings
+      .iter()
+      .fold(0u64, |sum, (_, cpu)| sum.wrapping_add(cpu.progress));
     let now = Some((pids, total));
     if now != self.seen {
       self.seen = now;
       self.moved_at = Instant::now();
     }
-    self.moved_at.elapsed() < process_wait::STALL
+    self.moved_at.elapsed() < process_wait::STALL && !self.spent_its_budget(instances.len())
+  }
+
+  /// Whether the processes of `nodes` instances spent [`process_wait::CPU_BUDGET`] each since the wait began.
+  fn spent_its_budget(&self, nodes: usize) -> bool {
+    self.spent >= process_wait::CPU_BUDGET.saturating_mul(u32::try_from(nodes).unwrap_or(u32::MAX))
   }
 }
 
@@ -5762,7 +5800,10 @@ fn wait_exit(child: &mut Child) -> Option<std::process::ExitStatus> {
     if let Ok(Some(status)) = child.try_wait() {
       return Some(status);
     }
-    if judged.judge() == process_wait::Verdict::Stalled {
+    if matches!(
+      judged.judge(),
+      process_wait::Verdict::Stalled | process_wait::Verdict::SpentItsBudget
+    ) {
       return None;
     }
     pause();
@@ -6625,7 +6666,7 @@ fn wait_until_the_mount_has_told_its_kernel_everything(held: &HeldMount) {
 /// - wait for the anchor's successor, and read `f.txt` through the descriptor held from before every takeover (the
 ///   inode's cached pages, no lookup) and by its path.
 ///
-/// Expect the replacement both ways within [`WAIT_FOR`] every cycle, and the successor's takeover round to have
+/// Expect the replacement both ways every cycle, while the daemon progresses, and the successor's takeover round to have
 /// invalidated the root and the file (`fuse.takeover_invalidated`). Before the fix (A-158), a cycle whose kill landed
 /// before the mount's round kept serving the old bytes for as long as the kernel cached them. Linux only, to a kernel
 /// that can resend (6.9+).
@@ -6704,7 +6745,7 @@ fn a_replacement_the_dead_daemon_never_delivered_does_not_outlive_the_takeover()
 /// - wait for the anchor's successor, and stat both names through the mount.
 ///
 /// Expect the successor to bump the kernel's dentry epoch (`fuse.epoch_bumped`), and the old name gone and the new one
-/// there within [`WAIT_FOR`] every cycle. A kernel that cannot bump its dentry epoch (FUSE before 7.44) is reported by
+/// there every cycle, while the daemon progresses. A kernel that cannot bump its dentry epoch (FUSE before 7.44) is reported by
 /// the successor (`fuse.epoch_unsupported`), and the test skips loudly there. Linux only, to a kernel that can resend
 /// (6.9+).
 #[cfg(target_os = "linux")]
@@ -6762,7 +6803,7 @@ fn a_rename_the_dead_daemon_never_delivered_does_not_outlive_the_takeover() {
 }
 
 /// Shape: the files the restart-gap chaos test holds open through the mount: enough that a takeover round names a
-/// dozen inodes besides the root, few enough that every check reads them all within [`WAIT_FOR`].
+/// dozen inodes besides the root, few enough that every check reads them all in a moment.
 #[cfg(target_os = "linux")]
 const CHAOS_FILES: usize = 12;
 /// Shape: the restart-gap chaos test's seeds, fixed so a failure is a sequence that replays, two so one lucky sequence
@@ -8274,18 +8315,19 @@ impl MappedThroughAMount {
       .unwrap()
   }
 
-  /// Whether the map comes to read a whole file of `fill` within [`WAIT_FOR`] ([`MappedThroughAMount::follows_bytes`]).
+  /// Whether the map comes to read a whole file of `fill` ([`MappedThroughAMount::follows_bytes`]).
   fn follows(&mut self, fill: u8) -> bool {
     let whole = vec![fill; self.length];
     self.follows_bytes(&whole)
   }
 
-  /// Whether the map comes to read `expected` within [`WAIT_FOR`]: **as memory alone on Linux**, with no request on
-  /// the mount, since slates tells the kernel of a change when it is made (§4.6); on macOS once the file is `stat`ed,
-  /// because an NFS v3 client cannot be told and revalidates only when asked.
+  /// Whether the map comes to read `expected`, waited for while the instance's processes progress ([`StartProgress`];
+  /// until 2026-11-20 within `WAIT_FOR`): **as memory alone on Linux**, with no request on the mount, since slates
+  /// tells the kernel of a change when it is made (§4.6); on macOS once the file is `stat`ed, because an NFS v3 client
+  /// cannot be told and revalidates only when asked.
   fn follows_bytes(&mut self, expected: &[u8]) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < WAIT_FOR {
+    let mut progress = StartProgress::new();
+    while progress.look(&self.instance) {
       if !cfg!(target_os = "linux") {
         let _ = rustix::fs::fstat(&self.file);
       }
@@ -8312,6 +8354,7 @@ impl MappedThroughAMount {
       .unwrap();
     SecondMount {
       file,
+      instance: self.instance.clone(),
       _point: point,
     }
   }
@@ -8323,6 +8366,8 @@ impl MappedThroughAMount {
 /// documents); its own fields close the file before the mount point unmounts.
 struct SecondMount {
   file: std::fs::File,
+  /// The instance serving it, whose processes a wait on it is judged by.
+  instance: String,
   /// Held for its `Drop`: unmounts.
   _point: MountPoint,
 }
@@ -8347,13 +8392,13 @@ impl SecondMount {
     self.file.sync_data().unwrap();
   }
 
-  /// Whether a read of the whole file through this mount comes to return `expected` within [`WAIT_FOR`] (on macOS
-  /// after a `stat`, as for the map).
+  /// Whether a read of the whole file through this mount comes to return `expected` (on macOS after a `stat`, as for
+  /// the map), waited for as the map is.
   fn follows(&self, expected: &[u8]) -> bool {
     use std::os::unix::fs::FileExt;
     let mut read = vec![0u8; expected.len()];
-    let started = Instant::now();
-    while started.elapsed() < WAIT_FOR {
+    let mut progress = StartProgress::new();
+    while progress.look(&self.instance) {
       if !cfg!(target_os = "linux") {
         let _ = rustix::fs::fstat(&self.file);
       }
@@ -8410,10 +8455,7 @@ fn a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change() {
     "the map's write reached the volume, read through slates itself"
   );
   fixture.replace_through_slates(b'C');
-  assert!(
-    fixture.follows(b'C'),
-    "the replacement reached the map within {WAIT_FOR:?}"
-  );
+  assert!(fixture.follows(b'C'), "the replacement reached the map");
 }
 
 /// How [`MappedThroughAMount`] maps its file.
@@ -8428,8 +8470,8 @@ enum MapAccess {
 /// G-mount (§4.6; the DAX matrix's macOS mount-route cell, `docs/wip/virtiofs.md` §8): a program that maps a file
 /// read-only through a slates mount sees another path's changes. Do: map `map.bin` for reading alone (`PROT_READ`,
 /// `MAP_SHARED`) through a mount, read it, then replace it through another attachment [`MAP_CHANGES`] times with
-/// fills from a fixed-seed generator, reading the map after each. Expect the map to show every replacement within
-/// [`WAIT_FOR`]: on Linux as memory alone, since slates tells the FUSE mount of each change; on macOS after a `stat`,
+/// fills from a fixed-seed generator, reading the map after each. Expect the map to show every replacement while
+/// the daemon progresses: on Linux as memory alone, since slates tells the FUSE mount of each change; on macOS after a `stat`,
 /// since an NFS v3 client revalidates only when asked, and Apple's client then takes the changed file's pages out of
 /// memory (`nfs_vinvalbuf2`'s `UBC_INVALIDATE`), so the next touch of the map reads the new bytes.
 #[test]
@@ -8581,7 +8623,7 @@ impl GeneratedWrite {
 /// [`THREE_WRITER_PAGES`] pages through one mount, open it through a second mount of the same volume, and run
 /// [`THREE_WRITER_STEPS`] generated writes, each one of: bytes through the map, `msync`ed; bytes at an offset through
 /// the second mount, synced; the whole file through the SDK. Expect after every write: slates' own read equals a byte
-/// model at once, and the map and the second mount come to it within [`WAIT_FOR`] — on Linux the map as memory alone,
+/// model at once, and the map and the second mount come to it while the daemon progresses — on Linux the map as memory alone,
 /// so each FUSE mount must be told of the other mount's writes and the SDK's; on macOS after a `stat`, as NFS v3
 /// allows. Each writer must have acted (the non-vacuity count). The file's length never changes: a shrink under a
 /// live map would make touching it a `SIGBUS`.
@@ -8617,11 +8659,11 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
     );
     assert!(
       fixture.follows_bytes(&model),
-      "step {step}, {what}: the map did not come to the model within {WAIT_FOR:?}"
+      "step {step}, {what}: the map did not come to the model"
     );
     assert!(
       second.follows(&model),
-      "step {step}, {what}: the second mount did not come to the model within {WAIT_FOR:?}"
+      "step {step}, {what}: the second mount did not come to the model"
     );
   }
   assert!(
@@ -8744,10 +8786,7 @@ fn stale_whole_file_phase(fixture: &mut MappedThroughAMount) -> Option<String> {
     writeback_counts(&fixture.instance).1 > conflicts_before,
     "the refusal is counted (fuse.writeback_conflicts, the rule's non-vacuity count)"
   );
-  assert!(
-    fixture.follows(b'S'),
-    "the map reads the replacement within {WAIT_FOR:?}"
-  );
+  assert!(fixture.follows(b'S'), "the map reads the replacement");
   fixture.view()[10] = b'M';
   let fresh = fixture.try_sync_map();
   let mut expected = vec![b'S'; length];
@@ -8792,7 +8831,7 @@ fn stale_part_phase(fixture: &mut MappedThroughAMount, second: &SecondMount) -> 
   );
   assert!(
     fixture.follows_bytes(&expected),
-    "the map reads the file as slates holds it within {WAIT_FOR:?}"
+    "the map reads the file as slates holds it"
   );
   None
 }
@@ -8859,7 +8898,7 @@ fn a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_
   expected[page..].fill(b'H');
   assert!(
     fixture.follows_bytes(&expected),
-    "the map reads the other mount's write within {WAIT_FOR:?}, re-fetched from the successor"
+    "the map reads the other mount's write, re-fetched from the successor"
   );
   let stored = page + 10..page + 14;
   fixture.write_through_map(stored.start, b"gggg");
@@ -9285,9 +9324,10 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
     "the file stays referenced while a descriptor holds it"
   );
   drop(second);
-  let deadline = Instant::now() + WAIT_FOR;
+  // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
+  let mut progress = StartProgress::new();
   let mut now = referenced();
-  while now > before && Instant::now() < deadline {
+  while now > before && progress.look(&instance) {
     pause();
     now = referenced();
   }
@@ -9343,9 +9383,10 @@ fn a_file_an_ended_mount_held_is_given_back() {
     .unwrap();
   assert!(lazily.status.success(), "the lazy unmount: {lazily:?}");
   drop(open);
-  let deadline = Instant::now() + WAIT_FOR;
+  // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
+  let mut progress = StartProgress::new();
   let mut now = referenced();
-  while now > before && Instant::now() < deadline {
+  while now > before && progress.look(&instance) {
     pause();
     now = referenced();
   }
@@ -9420,9 +9461,10 @@ fn a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount
     .unwrap();
   assert!(lazily.status.success(), "the lazy unmount: {lazily:?}");
   drop(uncounted);
-  let deadline = Instant::now() + WAIT_FOR;
+  // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
+  let mut progress = StartProgress::new();
   let mut now = referenced();
-  while now > before && Instant::now() < deadline {
+  while now > before && progress.look(&instance) {
     pause();
     now = referenced();
   }
@@ -9476,8 +9518,9 @@ fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_give
   std::fs::write(&path, vec![0x5Au8; HELD_FILE_BYTES]).unwrap();
   #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
   std::fs::remove_file(&path).unwrap();
-  let deadline = Instant::now() + WAIT_FOR;
-  while referenced() > before && Instant::now() < deadline {
+  // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
+  let mut progress = StartProgress::new();
+  while referenced() > before && progress.look(&instance) {
     pause();
   }
   assert_eq!(
@@ -9488,9 +9531,10 @@ fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_give
   let killed = kill_the_daemon(&instance);
   let restarted = await_daemon(&instance, Some(killed), &[]);
   assert_ne!(restarted, killed, "a new daemon serves the mount");
-  let deadline = Instant::now() + WAIT_FOR;
+  // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
+  let mut progress = StartProgress::new();
   let mut now = referenced();
-  while now > before && Instant::now() < deadline {
+  while now > before && progress.look(&instance) {
     pause();
     now = referenced();
   }
@@ -9762,21 +9806,21 @@ impl OnePageJournal {
     }
   }
 
-  /// Sends every request in `batch` without waiting, then collects each reply within [`WAIT_FOR`]: every one the end of
-  /// a write.
+  /// Sends every request in `batch` without waiting, then collects each reply while the instance's processes progress
+  /// ([`StartProgress`]; until 2026-11-20 within `WAIT_FOR`): every one the end of a write.
   fn pipeline(&mut self, batch: &[slates_ipc::protocol::RequestBody]) {
     let sent: Vec<_> = batch
       .iter()
       .map(|body| self.writer.begin(body).unwrap())
       .collect();
-    let started = Instant::now();
+    let mut progress = StartProgress::new();
     for request in sent {
       let reply = loop {
         let spin = self.writer.published_spin_ns();
         if let Some(reply) = self.writer.spin_reply(request, spin).unwrap() {
           break reply;
         }
-        assert!(started.elapsed() < WAIT_FOR, "no reply to {request:?}");
+        progress.check(&self.instance, &format!("a reply to {request:?}"));
       };
       assert!(
         matches!(reply, slates_ipc::protocol::ReplyBody::FsDone { .. }),
@@ -9785,11 +9829,12 @@ impl OnePageJournal {
     }
   }
 
-  /// Whether reading `name` through the mount comes to show `expected` within [`WAIT_FOR`].
+  /// Whether reading `name` through the mount comes to show `expected`, waited for while the instance's processes
+  /// progress ([`StartProgress`]; until 2026-11-20 within `WAIT_FOR`).
   fn comes_to_read(&self, name: &str, expected: &[u8]) -> bool {
-    let started = Instant::now();
+    let mut progress = StartProgress::new();
     while self.read_through_mount(name) != expected {
-      if started.elapsed() >= WAIT_FOR {
+      if !progress.look(&self.instance) {
         return false;
       }
       pause();
@@ -9802,7 +9847,7 @@ impl OnePageJournal {
 /// keeps before the mount's next round, or the kernel serves its cached copy for as long as it holds it (A-141, A-157).
 /// Do: cache `a.bin` through a FUSE mount; send, without waiting, a replacement of `a.bin` and then
 /// [`PIPELINED_REPLACEMENTS`] replacements of `b.bin` through the SDK; collect every reply; read `a.bin` through the
-/// mount. Expect the replacement's bytes within [`WAIT_FOR`], the batch to have appended more records than the journal's
+/// mount. Expect the replacement's bytes while the daemon progresses, the batch to have appended more records than the journal's
 /// one-page floor holds, and no round to have overrun: the journal keeps what the live mount still owes (A-157).
 ///
 /// Until A-157 those records were dropped and the mount overran, told everything (A-141), which failed 2 runs of 33
@@ -9833,7 +9878,7 @@ fn a_change_reaches_the_mount_even_when_more_follow_than_the_journal_keeps() {
   fixture.pipeline(&batch);
   assert!(
     fixture.comes_to_read("a.bin", &[b'Z'; PIPELINED_FILE_BYTES]),
-    "the mount still serves the old bytes after {WAIT_FOR:?}, not the replacement"
+    "the mount still serves the old bytes, not the replacement"
   );
   let floor_records =
     rustix::param::page_size() / std::mem::size_of::<slates_vfs::journal::OpRecord>();
@@ -10112,7 +10157,7 @@ fn unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point() {
       );
       assert!(
         second.follows(&model),
-        "step {step}: after the sync, the second mount did not come to the model within {WAIT_FOR:?}"
+        "step {step}: after the sync, the second mount did not come to the model"
       );
       settled = StoresAtRisk::new(&model);
     }
@@ -10153,7 +10198,7 @@ fn one_generated_write(
   }
   assert!(
     fixture.follows_bytes(model),
-    "step {step}, {write:?}: the map did not come to the model within {WAIT_FOR:?}"
+    "step {step}, {write:?}: the map did not come to the model"
   );
 }
 

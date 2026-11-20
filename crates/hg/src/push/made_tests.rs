@@ -334,7 +334,7 @@ fn an_imports_record_names_its_revisions_by_identity_whatever_their_bytes() {
     );
     record::write_kept(index, store, &logs, u64::MAX).unwrap()
   };
-  let (mut short, mut short_store) = grown(10);
+  let (short, mut short_store) = grown(10);
   let (mut index, mut store) = grown(1_000);
   let named = record::write(&index, &store, u64::MAX).unwrap();
   let short_named = record::write(&short, &short_store, u64::MAX).unwrap();

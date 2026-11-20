@@ -627,6 +627,71 @@ fn checkpoint_changes(
   }
 }
 
+/// The repository windows kept or let go since the last committed publication (A-727 slice a3): each kept put, each
+/// let go removed.
+fn vcs_window_changes(
+  state: &ShardState,
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) {
+  if let Some(windows) = crate::vcs_store::chunk_windows(&state.vcs_stores) {
+    for (handle, piece) in windows.changes() {
+      let key = piece_key(KIND_VCS_WINDOW, [0; 16], handle);
+      match piece {
+        Some(bytes) => put.push(slates_vfs::recover::HeldPiece { key, bytes }),
+        None => removed.push(key),
+      }
+    }
+  }
+}
+
+/// The repository content store's lists and names kept or let go since then (a3b): each kept put, each let go removed.
+fn vcs_node_changes(
+  state: &ShardState,
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) {
+  if let Some(content) = state.vcs_stores.content() {
+    let (lists, names) = content.changes();
+    for (identity, bytes) in lists {
+      let key = vcs_node_key(KIND_VCS_LIST, &identity);
+      match bytes {
+        Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
+          key,
+          bytes: vcs_list_bytes(&identity, bytes),
+        }),
+        None => removed.push(key),
+      }
+    }
+    for (identity, root) in names {
+      let key = vcs_node_key(KIND_VCS_NAME, &identity);
+      match root {
+        Some(root) => put.push(slates_vfs::recover::HeldPiece {
+          key,
+          bytes: vcs_name_bytes(&identity, &root),
+        }),
+        None => removed.push(key),
+      }
+    }
+  }
+}
+
+/// The region holds kept or let go since the last committed publication (A-724 piece 8c): each kept put, each let go
+/// removed.
+fn vcs_region_changes(
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) {
+  for (identity, held) in crate::vcs_store::homes::region_changes() {
+    let key = vcs_node_key(KIND_VCS_REGION_HOLD, &identity);
+    if held {
+      put.push(slates_vfs::recover::HeldPiece {
+        key,
+        bytes: identity.0.to_vec(),
+      });
+    } else {
+      removed.push(key);
+    }
+  }
+}
+
 /// What a delta carries of the held pieces since the last committed publication (A-270): a whole piece whose bytes
 /// differ; of every register its tracked map marked, its head and the positions its acceptor accepted or dropped since
 /// (A-367), or, dropped whole, the head and every position published; and of a live copy, its head, the entries in slots
@@ -665,51 +730,11 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   // dropped removed.
   checkpoint_changes(state, (&mut put, &mut removed));
   // The repository windows kept or let go since the last committed publication (A-727 slice a3).
-  if let Some(windows) = crate::vcs_store::chunk_windows(&state.vcs_stores) {
-    for (handle, piece) in windows.changes() {
-      let key = piece_key(KIND_VCS_WINDOW, [0; 16], handle);
-      match piece {
-        Some(bytes) => put.push(slates_vfs::recover::HeldPiece { key, bytes }),
-        None => removed.push(key),
-      }
-    }
-  }
+  vcs_window_changes(state, (&mut put, &mut removed));
   // The repository content store's lists and names kept or let go since then (a3b).
-  if let Some(content) = state.vcs_stores.content() {
-    let (lists, names) = content.changes();
-    for (identity, bytes) in lists {
-      let key = vcs_node_key(KIND_VCS_LIST, &identity);
-      match bytes {
-        Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
-          key,
-          bytes: vcs_list_bytes(&identity, bytes),
-        }),
-        None => removed.push(key),
-      }
-    }
-    for (identity, root) in names {
-      let key = vcs_node_key(KIND_VCS_NAME, &identity);
-      match root {
-        Some(root) => put.push(slates_vfs::recover::HeldPiece {
-          key,
-          bytes: vcs_name_bytes(&identity, &root),
-        }),
-        None => removed.push(key),
-      }
-    }
-  }
+  vcs_node_changes(state, (&mut put, &mut removed));
   // The region holds kept or let go since then (A-724 piece 8c).
-  for (identity, held) in crate::vcs_store::homes::region_changes() {
-    let key = vcs_node_key(KIND_VCS_REGION_HOLD, &identity);
-    if held {
-      put.push(slates_vfs::recover::HeldPiece {
-        key,
-        bytes: identity.0.to_vec(),
-      });
-    } else {
-      removed.push(key);
-    }
-  }
+  vcs_region_changes((&mut put, &mut removed));
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -1034,7 +1059,7 @@ pub(crate) fn split_held(
       KIND_VCS_LIST => {
         let (identity, bytes) = piece
           .bytes
-          .split_at_checked(32)
+          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
           .ok_or(HeldRefused::UnknownKind(kind))?;
         let identity =
           slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;
@@ -1043,7 +1068,7 @@ pub(crate) fn split_held(
       KIND_VCS_NAME => {
         let (identity, root) = piece
           .bytes
-          .split_at_checked(32)
+          .split_at_checked(slates_vcs::content::IDENTITY_BYTES)
           .ok_or(HeldRefused::UnknownKind(kind))?;
         let identity =
           slates_vcs::ContentId::from_slice(identity).ok_or(HeldRefused::UnknownKind(kind))?;

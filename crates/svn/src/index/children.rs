@@ -186,22 +186,7 @@ fn collect_after(
   out: &mut Vec<(usize, NodeRevisionId)>,
 ) -> Option<()> {
   match store.map_node(handle)? {
-    MapNode::Leaf(entries) => {
-      for &(key, value) in entries {
-        if out.len() >= most {
-          break;
-        }
-        if let Some(after) = after
-          && store.key_name(key)? <= after
-        {
-          continue;
-        }
-        out.push((
-          usize::try_from(key).ok()?,
-          NodeRevisionId(usize::try_from(value).ok()?),
-        ));
-      }
-    }
+    MapNode::Leaf(entries) => collect_leaf(store, entries, after, most, out)?,
     MapNode::Inner(children) => {
       let start = match after {
         Some(after) => child_for(store, children, after)?,
@@ -214,6 +199,31 @@ fn collect_after(
         collect_after(store, child, after, most, out)?;
       }
     }
+  }
+  Some(())
+}
+
+/// A leaf's entries after `after` into `out`, until it holds `most`.
+fn collect_leaf(
+  store: &impl MapRead,
+  entries: &[(u32, u32)],
+  after: Option<&str>,
+  most: usize,
+  out: &mut Vec<(usize, NodeRevisionId)>,
+) -> Option<()> {
+  for &(key, value) in entries {
+    if out.len() >= most {
+      break;
+    }
+    if let Some(after) = after
+      && store.key_name(key)? <= after
+    {
+      continue;
+    }
+    out.push((
+      usize::try_from(key).ok()?,
+      NodeRevisionId(usize::try_from(value).ok()?),
+    ));
   }
   Some(())
 }
@@ -341,6 +351,17 @@ fn removed(store: &mut impl MapWrite, handle: u32, name: &str) -> Option<Removed
       changed => Some((at, changed)),
     },
   };
+  removed_here(store, handle, name, below)
+}
+
+/// The node of `handle`, taken, with the removal applied: a leaf's entry named `name` removed, or an inner node's child
+/// at `below`'s place replaced by what the removal beneath left (dropped when it left nothing).
+fn removed_here(
+  store: &mut impl MapWrite,
+  handle: u32,
+  name: &str,
+  below: Option<(usize, Removed)>,
+) -> Option<Removed> {
   match (taken(store, handle)?, below) {
     (MapNode::Leaf(mut entries), None) => {
       let (place, _) = place_of(store, &entries, name)?;
