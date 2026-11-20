@@ -66,3 +66,9 @@ Studio as soon as it answers kiln again (it hasn't for hours; SSH is refused the
 Shape in inbox/w-svn-from-w-balance.md: `vcs_store::content_ticket(&state)` and `vcs_store::content_durable(origin,
 ticket, budget)`, group commit over the barrier already driven by committed publications. Red test: a crash between a
 put and its entry's append loses nothing named. Then back to v3 at f+1.
+
+### 2026-11-20: the durability barrier LANDED alone: db779baa3 (base 982ea33d5)
+`vcs_store::content_ticket` / `content_durable` (group commit, self-publishing, typed refusals); w-svn told
+(inbox/w-svn-from-w-balance.md). Red test `daemon::tests::t_a727b_...`: with the barrier bypassed, a crash after the
+entry leaves the successor refusing it (replay_refused 1); with it, recovered whole. The release latency measurement
+waits on the Studio (kiln unreachable). Back to v3 at f+1; the takeover question above still stands.
