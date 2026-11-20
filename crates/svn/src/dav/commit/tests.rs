@@ -218,3 +218,38 @@ fn an_if_header_presents_its_lock_tokens_and_no_resource_tag() {
     )
   );
 }
+
+/// A-681 (§4.17.1 "A push's intake": a body is taken as it arrives, never held whole). Do: begin a PUT of a new file
+/// and hand its svndiff to the drive a byte at a time, end it, and MERGE. Expect `201`, and the accepted work holding
+/// the file's text `hello\n`, as the PUT taken whole makes it.
+#[test]
+fn a_puts_body_taken_a_byte_at_a_time_makes_the_text_it_makes_whole() {
+  let repository = empty();
+  let hooks: Hooks<'_> = &passed;
+  let world = World {
+    index: repository.index(),
+    green: &repository,
+    locks: repository.locks(),
+  };
+  let mut commit = DavCommit::begin(setup(&repository), &world, hooks).unwrap();
+  let start = PutStart {
+    base_md5: None,
+    result_md5: Some("b1946ac92492d2347c6235b4d2611184"),
+    version_name: None,
+  };
+  commit.begin_put(&world, hooks, "/a.txt", &start).unwrap();
+  let taken = HELLO_DELTA.iter().all(|byte| {
+    commit
+      .put_chunk(&world, hooks, std::slice::from_ref(byte))
+      .is_ok()
+  });
+  let ended = commit.end_put(&world, hooks).status;
+  let Merged::Accepted(work) = commit.merge(&world, hooks) else {
+    panic!("the MERGE was refused");
+  };
+  let texts: Vec<Vec<u8>> = work.texts.values().cloned().collect();
+  assert_eq!(
+    (taken, ended, texts),
+    (true, 201, vec![b"hello\n".to_vec()])
+  );
+}
