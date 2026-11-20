@@ -38,6 +38,12 @@
 //! shard for the window, never in `ContentHold` (w-fed-faults' answer to Q3), only where the configuration ranks this
 //! node among the window's homes, and acknowledged only once that shard's image holding it is published.
 //!
+//! **The healer** ([`heal_region`]). At each configuration change, and only then (§2 ban 10), the control shard walks the
+//! windows this node holds for the region a turn a period: each is offered to its homes (an offer of a window a home
+//! holds already is idempotent: a home keeps one region hold a window, [`keep_for_region`]), and once every home has
+//! answered `Kept` this node lets its own hold go where it is not one of them (`slates_db::identity_homes::heal`: add
+//! before remove). Its inputs are the configuration and what the homes answered, never an owner's record (Q3).
+//!
 //! **Refused** ([`HomeRefused`]): bytes past a window; a home whose content store refused (its budget); a home that did
 //! not answer within the budget; an answer naming another identity than the bytes' (never in a correct home).
 
@@ -464,6 +470,67 @@ pub(crate) async fn let_go_many(
     .collect()
 }
 
+std::thread_local! {
+  /// The windows this shard keeps for the region (module docs, "From the region"), one hold each however often the
+  /// region offers it: so the healer's offers, sent again at every configuration change, are idempotent. Bounded by the
+  /// windows its content store holds.
+  static REGION_HELD: std::cell::RefCell<std::collections::BTreeSet<ContentId>> =
+    const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Keeps the window `bytes` on this shard for the region (module docs, "From the region"): a window held for the region
+/// already is held no more, only answered; its identity and ticket.
+pub(crate) fn keep_for_region(
+  state: &mut ShardState,
+  bytes: &[u8],
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
+  let identity = ContentId::of(bytes);
+  let held = REGION_HELD.with(|held| held.try_borrow().is_ok_and(|held| held.contains(&identity)));
+  if held
+    && state
+      .vcs_stores
+      .content
+      .as_ref()
+      .is_some_and(|content| content.contains(&identity))
+  {
+    return Ok((identity, ticket_here(state.shard)));
+  }
+  let kept = keep_here(state, bytes)?;
+  REGION_HELD.with(|held| {
+    if let Ok(mut held) = held.try_borrow_mut() {
+      held.insert(kept.0);
+    }
+  });
+  Ok(kept)
+}
+
+/// Lets go this shard's region hold of the window `identity` (module docs, "From the region"): `NotHeld` where the region
+/// holds none here.
+pub(crate) fn let_go_for_region(
+  state: &mut ShardState,
+  identity: &ContentId,
+) -> Result<(), HomeRefused> {
+  let held = REGION_HELD.with(|held| {
+    held
+      .try_borrow_mut()
+      .is_ok_and(|mut held| held.remove(identity))
+  });
+  if !held {
+    return Err(HomeRefused::NotHeld);
+  }
+  let_go_here(state, identity)
+}
+
+/// The windows this shard holds for the region, in identity order: what the healer walks (module docs, "The healer").
+pub(crate) fn region_held_here() -> Vec<ContentId> {
+  REGION_HELD.with(|held| {
+    held
+      .try_borrow()
+      .map(|held| held.iter().copied().collect())
+      .unwrap_or_default()
+  })
+}
+
 /// Counter: home exchanges a member served from the region (module docs, "From the region"). Format: a counter name.
 pub(crate) const REMOTE_SERVED: &str = "vcs_store.homes.remote_served";
 
@@ -493,7 +560,7 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
     HomeMessage::Put { identity, bytes } => {
       let outcome = match admits(&identity, &bytes, (local, &members, f)) {
         Err(refusal) => HomeOutcome::Refused(refusal),
-        Ok(()) => match home(origin, &shards, bytes, budget_ns).await {
+        Ok(()) => match keep_region_at_home(origin, &shards, bytes, budget_ns).await {
           Ok((_, ticket)) if published(origin, ticket, budget_ns).await => HomeOutcome::Kept {
             generation: ticket.generation,
           },
@@ -515,16 +582,194 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
       (identity, outcome)
     }
     HomeMessage::LetGo { identity } => {
-      let outcome = match let_go(origin, &shards, ContentId(identity), budget_ns).await {
-        Ok(()) => HomeOutcome::LetGo,
-        Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
-        Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
-      };
+      let outcome =
+        match let_go_region_at_home(origin, &shards, ContentId(identity), budget_ns).await {
+          Ok(()) => HomeOutcome::LetGo,
+          Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+          Err(_) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+        };
       (identity, outcome)
     }
     HomeMessage::Answer { .. } => return Vec::new(),
   };
   HomeMessage::Answer { identity, outcome }.encode()
+}
+
+/// [`keep_for_region`] on the home shard among `shards` of the window `bytes`, asked from shard `origin`.
+async fn keep_region_at_home(
+  origin: u16,
+  shards: &[u16],
+  bytes: Vec<u8>,
+  budget_ns: u64,
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
+  let identity = ContentId::of(&bytes);
+  let target = home_of(shards, &identity).ok_or(HomeRefused::Unanswered)?;
+  crate::xshard::call_in_shard_time(
+    origin,
+    target,
+    move |state| keep_for_region(state, &bytes),
+    budget_ns,
+  )
+  .await
+  .ok_or(HomeRefused::Unanswered)?
+}
+
+/// [`let_go_for_region`] on the home shard among `shards` of the window `identity`, asked from shard `origin`.
+async fn let_go_region_at_home(
+  origin: u16,
+  shards: &[u16],
+  identity: ContentId,
+  budget_ns: u64,
+) -> Result<(), HomeRefused> {
+  let target = home_of(shards, &identity).ok_or(HomeRefused::Unanswered)?;
+  crate::xshard::call_in_shard_time(
+    origin,
+    target,
+    move |state| let_go_for_region(state, &identity),
+    budget_ns,
+  )
+  .await
+  .ok_or(HomeRefused::Unanswered)?
+}
+
+/// Counter: identities the healer offered to their region homes. Format: a counter name.
+pub(crate) const HEAL_OFFERED: &str = "vcs_store.homes.heal_offered";
+/// Counter: identities this node let go once every region home held them. Format: a counter name.
+pub(crate) const HEAL_RELEASED: &str = "vcs_store.homes.heal_released";
+
+std::thread_local! {
+  /// The control shard's healer pass (module docs, "The healer"): the configuration version it serves and the
+  /// identities still to visit. Bounded by the windows this node holds for the region.
+  static HEALING: std::cell::RefCell<(Option<u64>, std::collections::VecDeque<ContentId>)> =
+    const { std::cell::RefCell::new((None, std::collections::VecDeque::new())) };
+}
+
+/// One period's turn of the region healer on the control shard `origin` (module docs, "The healer"): at a new
+/// configuration version a pass begins over every window this node holds for the region; each identity is offered to
+/// its homes (`slates_db::identity_homes::homes`) by `slates_cluster::homes`'s `Put`, and once every home answered
+/// `Kept` this node lets its own hold go where it is not a home (`slates_db::identity_homes::heal`). A pass runs a turn
+/// a period, stopping when `budget`'s deadline is spent, and nothing runs between configuration changes.
+pub(crate) async fn heal_region(origin: u16, shards: &[u16], budget: slates_cluster::CommitBudget) {
+  let Some((version, local, members, f)) = crate::state::with_state(|state| {
+    (
+      state.fleet.configuration().version,
+      state.fleet.host(),
+      state.fleet.members().to_vec(),
+      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+    )
+  }) else {
+    return;
+  };
+  let begun = HEALING.with(|healing| {
+    healing
+      .try_borrow()
+      .map_or(true, |healing| healing.0 == Some(version))
+  });
+  if !begun {
+    let mut identities = std::collections::VecDeque::new();
+    for shard in shards {
+      let held = crate::xshard::call_in_shard_time(
+        origin,
+        *shard,
+        |_| region_held_here(),
+        budget.max_deadline_ns(),
+      )
+      .await
+      .unwrap_or_default();
+      identities.extend(held);
+    }
+    HEALING.with(|healing| {
+      if let Ok(mut healing) = healing.try_borrow_mut() {
+        *healing = (Some(version), identities);
+      }
+    });
+  }
+  let began = slates_rt::futures::now_ns();
+  let spend = budget.max_deadline_ns();
+  loop {
+    if slates_rt::futures::now_ns().saturating_sub(began) >= spend {
+      return;
+    }
+    let next = HEALING.with(|healing| {
+      healing
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut healing| healing.1.pop_front())
+    });
+    let Some(identity) = next else {
+      return;
+    };
+    heal_one(origin, shards, (local, &members, f), identity, budget).await;
+  }
+}
+
+/// Offers one window to its region homes and lets this node's hold go once every home holds it and this node is not
+/// one ([`heal_region`]).
+async fn heal_one(
+  origin: u16,
+  shards: &[u16],
+  (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
+  identity: ContentId,
+  budget: slates_cluster::CommitBudget,
+) {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
+  let homes = slates_db::identity_homes::homes(&identity.0, members, f);
+  let others: Vec<slates_db::HostId> = homes
+    .iter()
+    .copied()
+    .filter(|home| *home != local)
+    .collect();
+  let mut held: std::collections::BTreeSet<slates_db::HostId> = std::collections::BTreeSet::new();
+  held.insert(local);
+  if !others.is_empty() {
+    let Some(bytes) = read(origin, shards, identity, budget.max_deadline_ns()).await else {
+      return;
+    };
+    let request = HomeMessage::Put {
+      identity: identity.0,
+      bytes,
+    }
+    .encode();
+    let sessions =
+      crate::fleet::take_sessions("vcs_store.homes.heal", |host| others.contains(&host));
+    let outgoing: Vec<(
+      slates_db::HostId,
+      Vec<u8>,
+      slates_transport::endpoint::Endpoint,
+    )> = sessions
+      .into_iter()
+      .map(|(host, endpoint)| (host, request.clone(), endpoint))
+      .collect();
+    let (replied, _stragglers) = slates_cluster::broadcast(
+      outgoing,
+      HOME_STREAM,
+      slates_transport::connection::Priority::Bulk,
+      budget,
+    )
+    .await;
+    let mut returned = Vec::with_capacity(replied.len());
+    for (host, reply, endpoint) in replied {
+      if let Ok(HomeMessage::Answer {
+        identity: answered,
+        outcome: HomeOutcome::Kept { .. },
+      }) = HomeMessage::decode(&reply.bytes)
+        && answered == identity.0
+      {
+        held.insert(host);
+      }
+      returned.push((host, endpoint));
+    }
+    crate::fleet::return_sessions(returned);
+    crate::state::with_state(|state| state.count(HEAL_OFFERED, 1));
+  }
+  let plan = slates_db::identity_homes::heal(&identity.0, members, f, &held);
+  if plan.release.contains(&local)
+    && let_go_region_at_home(origin, shards, identity, budget.max_deadline_ns())
+      .await
+      .is_ok()
+  {
+    crate::state::with_state(|state| state.count(HEAL_RELEASED, 1));
+  }
 }
 
 #[cfg(test)]

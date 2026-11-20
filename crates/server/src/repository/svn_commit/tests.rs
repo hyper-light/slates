@@ -525,6 +525,7 @@ fn t_a655_the_records_are_made_again_from_the_log() {
       .copied()
       .unwrap_or(0);
     crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
     assert_eq!(state.vcs_stores.unrecovered(svn), None);
     assert_eq!(whole(state, (svn, green)), live);
     let count = u64::try_from(logged(state, svn).len()).unwrap();
@@ -746,6 +747,7 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
       .map(|bytes| matches!(Record::decode(bytes), Ok(Record::Locks(_))))
       .collect();
     crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
     (landed, held, kinds.last().copied(), owner_of(state))
   });
   let alice = Some("alice".to_owned());
@@ -820,4 +822,41 @@ fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
 /// `bytes` as the server's own revision names its text, with its real digests.
 fn real_text(bytes: &[u8]) -> Text {
   slates_svn::commit::drive::text_of(bytes).expect("the digests")
+}
+
+/// A-664's Subversion objects (symbolic links, main's ruling: as svnserve keeps them). Do: make a Subversion repository;
+/// submit a work making `/trunk/a.txt` and a symbolic link `/trunk/l` to `a.txt`. Expect: revision 1 adds `/trunk/l`
+/// as a file whose text is `link a.txt` and whose property list is `svn:special` set to `*` alone, which the records
+/// hold.
+#[test]
+fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "linked");
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let link = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Symlink {
+      path: "/trunk/l".to_owned(),
+      target: "a.txt".to_owned(),
+    });
+    let made = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
+    crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made, link]);
+    let special = b"K 11\nsvn:special\nV 1\n*\nEND\n";
+    let records = state
+      .vcs_stores
+      .subversion_records(svn)
+      .expect("the records");
+    let row = records
+      .index()
+      .changes(1)
+      .ok()
+      .and_then(|rows| rows.iter().find(|row| row.path == "/trunk/l").cloned());
+    let seen = row.map(|row| (row.action, row.kind, row.text, row.properties));
+    let expected = (
+      Action::Add,
+      NodeKind::File,
+      Some(real_text(b"link a.txt")),
+      Some(held(special)),
+    );
+    assert_eq!(seen, Some(expected));
+    assert_eq!(records.content(&identity(special)), Some(&special[..]));
+  });
 }

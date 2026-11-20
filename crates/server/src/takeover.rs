@@ -3684,6 +3684,7 @@ mod tests {
       let (departed, local) = (HostId(7), state.fleet.host());
       let repository = ObjectId::family(departed, 0, 9, 9).unwrap();
       let held = slates_db::catalog::RepositoryRecord {
+        index_bits: 0,
         id: slates_db::catalog::RepositoryId {
           bytes: repository.0,
         },

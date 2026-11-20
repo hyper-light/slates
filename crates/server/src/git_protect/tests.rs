@@ -299,6 +299,7 @@ fn protecting() -> RepositoryRecord {
     PolicyRight::UnsignedCommit,
   ];
   RepositoryRecord {
+    index_bits: 0,
     id: RepositoryId { bytes: [0; 16] },
     name: "protected".to_owned(),
     tool: VcsTool::Git,

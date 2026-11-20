@@ -22,11 +22,17 @@
 //! revision are one durable atom, and a recovery replays it with every other record, in log order.
 //!
 //! **Not made, and counted** ([`UNMADE`]), the version standing: a version not the one after the youngest revision, a
-//! copy in the change (A-586: the index names a copy at its destination alone), a symbolic link or a special file (no
-//! Subversion node the step makes yet), a property list the records do not hold, the records' or the budget's refusal.
+//! copy in the change (A-586: the index names a copy at its destination alone), a special file or a symbolic link
+//! with properties of its own (no Subversion node the step makes yet), a property list the records do not hold, the
+//! records' or the budget's refusal.
 //!
-//! **Owed** (GAPS, A-664): a copy as a row with its source; symbolic links as `svn:special` files.
+//! **Symbolic links** become files as Subversion keeps them: the text `link ` and the target, the property list
+//! `svn:special` set to `*` alone, brought with the revision.
+//!
+//! **Owed** (GAPS, A-664): a copy as a row with its source, once a work can make one (A-626 part 4); a symbolic link
+//! with properties of its own (refused, counted).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{RepositoryId, VcsTool, VolumeId as DbVolumeId};
@@ -67,7 +73,7 @@ enum Unmade {
   NotNext,
   /// The change holds a copy.
   Copy,
-  /// A path holds a symbolic link or a special file.
+  /// A path holds a special file, or a symbolic link with properties of its own.
   Special,
   /// A property list the records do not hold, or an index that refused a path.
   Unreadable,
@@ -176,6 +182,10 @@ fn revision_of(
     let at = svn_path(&path);
     let before = before(records.index(), &at, youngest)?;
     let after = after(&engine, records, &path)?;
+    if engine.symlink(&path).is_some() {
+      // A symbolic link's `svn:special` list, brought with the revision as any list a row names.
+      contents.insert(special().1, SPECIAL_LIST.to_vec());
+    }
     if let Some(row) = row_of(&at, before, after, &mut contents)? {
       rows.insert(at, row);
     }
@@ -211,7 +221,7 @@ fn svn_path(path: &str) -> String {
 type Before = Option<(NodeKind, Option<Text>, PropertyList)>;
 
 /// What stands at `path` in the green's head: its kind, a file's bytes, and its property list.
-type After<'g> = Option<(NodeKind, Option<&'g [u8]>, PropertyList)>;
+type After<'g> = Option<(NodeKind, Option<Cow<'g, [u8]>>, PropertyList)>;
 
 /// [`Before`] at `path`.
 fn before(index: &Index, path: &str, youngest: u64) -> Result<Before, Unmade> {
@@ -219,11 +229,19 @@ fn before(index: &Index, path: &str, youngest: u64) -> Result<Before, Unmade> {
   Ok(node.map(|node| (node.kind(), node.text(), node.properties())))
 }
 
-/// [`After`] at `path`: a directory, or a file (a hard link read as its primary); a symbolic link or a special file
-/// refused.
+/// [`After`] at `path`: a directory, a file (a hard link read as its primary), or a symbolic link as Subversion keeps
+/// one, a file of `link ` and its target whose property list is `svn:special` alone ([`special`]); a special file, or a
+/// symbolic link with properties of its own, refused.
 fn after<'g>(engine: &'g Green, records: &SvnRecords, path: &str) -> Result<After<'g>, Unmade> {
-  if engine.special(path).is_some() || engine.symlink(path).is_some() {
+  if engine.special(path).is_some() {
     return Err(Unmade::Special);
+  }
+  if let Some(target) = engine.symlink(path) {
+    if engine.xattr(path, PROPS).is_some() {
+      return Err(Unmade::Special);
+    }
+    let text = [LINK, target.as_bytes()].concat();
+    return Ok(Some((NodeKind::File, Some(Cow::Owned(text)), special().0)));
   }
   let properties = list_of(records, engine.xattr(path, PROPS))?;
   if engine.is_dir(path) {
@@ -233,8 +251,27 @@ fn after<'g>(engine: &'g Green, records: &SvnRecords, path: &str) -> Result<Afte
   Ok(
     engine
       .content(primary)
-      .map(|bytes| (NodeKind::File, Some(bytes), properties)),
+      .map(|bytes| (NodeKind::File, Some(Cow::Borrowed(bytes)), properties)),
   )
+}
+
+/// Format: the text Subversion keeps a symbolic link as, before its target (`subr/subst.c` `create_special_file_from_stream`
+/// reads `link `; `libsvn_wc` writes it for a link it commits).
+const LINK: &[u8] = b"link ";
+
+/// Format: the property list a symbolic link carries alone, `svn:special` set to `*`, in FSFS's form (`hash.c`
+/// `svn_hash_write2`: each name and value as `K`/`V` and its length, then `END`).
+const SPECIAL_LIST: &[u8] = b"K 11\nsvn:special\nV 1\n*\nEND\n";
+
+/// A symbolic link's property list ([`SPECIAL_LIST`]) as a row names it, and its identity, by which the revision
+/// brings its bytes.
+fn special() -> (PropertyList, ContentIdentity) {
+  let identity = *blake3::hash(SPECIAL_LIST).as_bytes();
+  let list = PropertyList::Held {
+    identity,
+    has_mergeinfo: false,
+  };
+  (list, identity)
 }
 
 /// The property list the reserved attribute names, which the records must hold; none without one.
@@ -278,16 +315,16 @@ fn row_of(
     (Some((kind, _, _)), None) => Ok(Some(row(Action::Delete, kind))),
     (None, Some((kind, bytes, properties))) => {
       let made = row(Action::Add, kind);
-      new_node(made, bytes, properties, contents).map(Some)
+      new_node(made, bytes.as_deref(), properties, contents).map(Some)
     }
     (Some((was, _, _)), Some((kind, bytes, properties))) if was != kind => {
       let made = row(Action::Replace, kind);
-      new_node(made, bytes, properties, contents).map(Some)
+      new_node(made, bytes.as_deref(), properties, contents).map(Some)
     }
     (Some((_, text, listed)), Some((kind, bytes, properties))) => {
       let mut changed = row(Action::Modify, kind);
       if let Some(bytes) = bytes {
-        let made = text_of(bytes, contents)?;
+        let made = text_of(&bytes, contents)?;
         if text.map(|text| text.identity) != Some(made.identity) {
           changed.text = Some(made);
         }

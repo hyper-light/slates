@@ -465,6 +465,7 @@ fn record_repository(
     state,
     &Op::RepositoryCreated {
       record: RepositoryRecord {
+        index_bits: 0,
         id: repository,
         name: name.to_owned(),
         tool: db_tool(tool),

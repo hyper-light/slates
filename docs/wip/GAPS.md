@@ -69,8 +69,9 @@
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
-> principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20), its copies as rows with their
-> sources and symbolic links as `svn:special` files owed; Mercurial's changesets of a submitted
+> principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20; symbolic links as `svn:special`
+> files, `link ` and the target, BUILT 2026-11-20), its copies as rows with their sources owed until a work can make a
+> copy (A-626 part 4); Mercurial's changesets of a submitted
 > version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
@@ -106,7 +107,8 @@
 > admission's second resource (`vcs_share::room`, `Bound::Snapshot`). Owed: the slot
 > derived and re-laid at a handoff (8b), the snapshot naming a push's names by identity (8c: the codec `slates_vcs::rows` built; record v3's switch waits
 > for A-727 a3's durable content), a giant repository's index cut
-> across partitions by object id (9: the cut and its placement built, 9a; the record, routing and split owed, 9b).
+> across partitions by object id (9: the cut and its placement, 9a; the cut in the record, its one-bit op and look-up routing, 9b; the rows'
+> routing and the split's moves wait for record v3, after A-727 a3).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
 > (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
@@ -115,7 +117,8 @@
 > intakes decoding) built, waiting for w-git's A-722 to call it.
 > Piece 6's region half: its rule (`slates_db::identity_homes`: homes and the healer's plan by membership and rank
 > alone); its wire (`slates_cluster::homes`, the door's rule); the daemon serving it (`vcs_store::homes::serve_remote`,
-> acknowledged after the home image, so `Unanswered` until A-727 a3). The sender and the healer's loop owed.
+> acknowledged after the home image, so `Unanswered` until A-727 a3); the healer at each configuration change
+> (`heal_region`, region holds idempotent). The transport is complete; it acknowledges once A-727 a3 lands.
 > Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
@@ -207,8 +210,13 @@
 > value stored whole and for a splice's added runs, sealed (runs copied out) only when superseded; a fold to one value
 > names the file whole; retire gives the history's holds back a step at a time; charges unchanged. Part 3 measured: svn
 > 1,000-revision import, history heap 50.3 -> 2.0 MiB, Green::commit 285.1 -> 200.0 MiB. Part 4: the honest charge (a first
-> small edit charges the earlier file whole; reservation = retention). OWED: `slates status --json` prints no
-> `retained_bytes`, so a green's retention charge is not readable from outside.
+> small edit charges the earlier file whole; reservation = retention). (`retained_bytes` now in `slates status
+> --json`, A-742.)
+>
+> **A-742 (2026-11-20, w-engine; main's ruling):** BUILT: large allocations mapped directly and unmapped when freed
+> (`slates_mem::large`), large temporaries cut (`Wire::encoded_len`, `Db::mutate_owned`, `Checkpoint::into_encoded`);
+> svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. OWED: `Record::revision_bytes`'s growth, the
+> log's decode-after-encode copy, the svn commit's retry clone, the anchor content object's 581 MiB split by range.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1575,6 +1583,14 @@
 > byte-identical and the matrix passes 29 of 29 (Mac Studio, debug). Over git/git's last 2,000 commits svnsync passes
 > but `svnrdump dump` (one `replay-range` of the whole history) gets shard 0 spinning 3.6 s and the daemon killed
 > after 53 MB: 28 of 29, owed to w-svn.
+> Since a469a6b85 (the listener yields while its client drains) `svnrdump dump` of that history finishes, 72 MB in 14 s:
+> 29 of 29.
+> **`slates repository policy` (w-interop, 2026-11-20; A-622, A-685's owed words):** the owner reads a repository's
+> policy (`DescribeRepositoryPolicy`, appended; `RepositoryPolicy` reply) and sets it from the version read, each
+> `--hook POINT=PROGRAM` replacing that point's hooks and every other part kept; a stranger's read or set is
+> `Forbidden`, a stale set `PolicyChanged`. By use: a pre-revprop-change hook set this way lets stock svn 1.15 change
+> a revision property over svn://. Found by use: with no hook such a change is taken (`change-rev-prop2`), where
+> svnserve refuses E165006; `svn_interop.rs` holds that test ignored for w-svn.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -2090,8 +2106,10 @@
 > `replay-range` spun shard 0 (3596 ms without a step after 53 MB; the daemon killed, the client E210002) while
 > `svnsync`, a command a revision, passed: the svn:// listener went on to its next turn with no yield where a turn read
 > nothing from the client (a long answer's slices, pipelined commands), and a client draining as fast as it is written
-> never made a write wait. Fixed (w-svn): such a turn yields first, as the HTTP and SSH edges' turns do. No unit test
-> sees a missed yield; the check is the git/git `svnrdump dump` run again (main's).
+> never made a write wait. Fixed (w-svn): a turn that never waited yields first, as the HTTP and SSH edges' turns do.
+> Held by `pipelined_commands_are_answered_one_turn_a_shard_poll` (64 pipelined commands; `vcs_svn.turns_unyielded`,
+> a turn begun in the shard poll of the turn before, 0 on both shards; 67 on the repository's shard without the yield)
+> and the git/git `svnrdump dump` run again (main's).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:

@@ -37,6 +37,7 @@ pub mod budget;
 pub mod dax_object;
 pub mod error;
 pub mod handle;
+pub mod large;
 pub mod lock;
 #[cfg(loom)]
 pub mod loom_bounds;
