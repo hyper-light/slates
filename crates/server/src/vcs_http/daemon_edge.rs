@@ -24,13 +24,13 @@
 //! **What is served.** git's services as the server has them, each from its own half: upload-pack from each
 //! repository's store on its owner shard, lent from A-662's map a step at a time with the refs the principal may read
 //! (`crate::vcs_store::upload::ShardStores`, A-682), each request admitted the edge's room; receive-pack through the
-//! push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3). Git LFS's
-//! locks API ([`ShardLfs`], A-629 part 2c), answered on the repository's owner shard over its locks log
-//! (`crate::lfs::answer`), which is durable as the partition's log is; the batch API and the transfers answer `503` at
-//! their head until the owner shard keeps LFS objects durably (A-581), so no upload is acknowledged that a restart
-//! would forget. Mercurial's commands, a request whose query names one ([`ToolSites`]), from each repository's served
-//! view over its store on the shard the connection moved to, lent for each step (`ServedViews`, A-680 part 2); its
-//! pushes (`unbundle`) landed there by the same lender into the repository's store (A-680 part 2b).
+//! push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3). Git LFS
+//! ([`ShardLfs`]), answered on the repository's owner shard (`crate::lfs::answer`): the locks API over its locks log
+//! (A-629 part 2c), the batch API and the transfers over its store's LFS index, an upload answered once its entry is
+//! durable (A-629 part 3). Mercurial's commands, a request whose query names one ([`ToolSites`]), from each
+//! repository's served view over its store on the shard the connection moved to, lent for each step (`ServedViews`,
+//! A-680 part 2); its pushes (`unbundle`) landed there by the same lender into the repository's store
+//! (A-680 part 2b).
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
 use slates_git::lfs::serve::{Answer as LfsAnswer, Endpoint};
@@ -47,7 +47,7 @@ use super::git::{
 use super::hg::HgSite;
 use super::{Bounds, EdgeState, ToolSites, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
-use crate::lfs::{LfsCall, NoObjects};
+use crate::lfs::LfsCall;
 use crate::vcs_store::hg_view::ServedViews;
 use crate::vcs_store::upload::ShardStores;
 
@@ -123,23 +123,20 @@ impl Repositories for ShardRepositories {
   }
 }
 
-/// Git LFS as the daemon serves it, on the shard its connection reached the repository's owner on (the module doc): the
-/// locks API over the repository's locks log; the batch API and the transfers not until the owner shard keeps LFS
-/// objects durably (A-581).
+/// Git LFS as the daemon serves it, on the shard its connection reached the repository's owner on (the module doc):
+/// every endpoint, the locks API over the repository's locks log and the batch API and the transfers over its store's
+/// LFS index (A-629 part 3).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ShardLfs;
 
 impl LfsService for ShardLfs {
-  fn serves(&self, endpoint: &Endpoint) -> bool {
-    matches!(
-      endpoint,
-      Endpoint::CreateLock | Endpoint::ListLocks | Endpoint::VerifyLocks | Endpoint::Unlock { .. }
-    )
+  fn serves(&self, _endpoint: &Endpoint) -> bool {
+    true
   }
 
   fn answer(&mut self, call: &LfsCall<'_>) -> LfsAnswer {
     // A borrow of the shard's state refused is counted where it is refused; the request fails as the server's.
-    crate::state::with_state_counted(|state| crate::lfs::answer(state, &mut NoObjects, call))
+    crate::state::with_state_counted(|state| crate::lfs::answer(state, call))
       .unwrap_or_else(|| crate::lfs::bare(Status::INTERNAL_SERVER_ERROR))
   }
 }
