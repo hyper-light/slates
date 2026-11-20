@@ -69,6 +69,9 @@
 //! edge onto this engine; the live `git clone`, `git push` and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
+/// The daemon's edge's test helpers, which the SSH edge's tests share (A-745: one long history, pushed and fetched over both).
+#[cfg(test)]
+pub(crate) use daemon_edge::tests as daemon_edge_tests;
 pub(crate) mod git;
 pub(crate) mod hg;
 pub(crate) mod svn;

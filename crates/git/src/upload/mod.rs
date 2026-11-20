@@ -166,6 +166,13 @@ pub trait PackSource {
     out: &mut Vec<u8>,
     room: usize,
   ) -> Result<bool, PackRefused>;
+
+  /// The check a step's work asks between its units (A-745, §4.17.1 "A fetch's answer" rule 3: every slice a turn at a
+  /// time under the shard's step quantum): whether the owner's quantum, begun as this is called, is spent. Never, by
+  /// default: a source with no clock of its owner's has a step do all its work, as [`Answer::write`] does.
+  fn turn(&self) -> impl FnMut() -> bool + 'static {
+    || false
+  }
 }
 
 /// Why upload-pack refused an exchange. Each is answered to the client in words, git's where it has them
