@@ -204,3 +204,8 @@
      -> Push::admit -> Quarantine::admit put windows).
   B4 remove object_bytes/put_object inflated copies (upload/encoding/sparse read the pack). No hold_bytes, no new store.
   Red per step: resident <= k*pack + base, k derived. Worktree ~/slates-work/w-git-packed (from origin/main 86e23c4ef).
+- ~13:20 LANDED memory B1 ea5f0d6da (main a011645e6): store::packed (PackSource seam, read in place, Scratch). Seam note
+  to w-store sent. Builds/tests: kiln run with `on: adas-mac-studio.local-2`, sync false, clone ~/.cache/w-git-clone,
+  worktree ~/.cache/w-git-wt, CARGO_TARGET_DIR=~/.cache/w-git-target.noindex CARGO_INCREMENTAL=0 (kiln once placed a
+  needs-only run on this Mac: never again). NEXT: B2 rows by (pack, offset) + all readers via packed::read; B3
+  quarantine by entry place; B4 drop inflated copies; red: resident <= k*pack + base.

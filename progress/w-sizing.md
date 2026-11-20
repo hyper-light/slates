@@ -27,6 +27,8 @@
   => true give-back on macOS needs arena extents as purgeable entries shared with the anchor by port (design piece).
 - Item 1 A/B: kiln run r1 (queued): ab/run.sh in ~/slates-work/w-sizing-seg (untracked ab/): A = main 6337049f6, B =
   ab/no-prefault.patch (reserve 0); provision_bench + nfs_large_write, release, interleaved x3, /usr/bin/time -l.
+- Sweep list LANDED main 79e0a4723 (GAPS, MEMORY SIZING entry: every site, today -> target).
+- A/B r1 queued for d1323898 (too few idle CPUs at 12:40).
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 
