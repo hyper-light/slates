@@ -504,11 +504,12 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       return Ok(take);
     };
     self.partial.clear();
+    // Counted before its records are charged, so a pack past its room is refused in the words its count decides.
+    self.objects = Some(header.objects);
     let count = usize::try_from(header.objects).unwrap_or(usize::MAX);
     charge_items::<Record>(admission, count)?;
     reserve(&mut self.entries, count)?;
     self.remaining = header.objects;
-    self.objects = Some(header.objects);
     self.stage = self.after_entry();
     Ok(take)
   }

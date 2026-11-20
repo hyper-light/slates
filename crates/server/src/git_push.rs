@@ -283,13 +283,13 @@ pub(crate) enum HookAnswer {}
 
 impl<P> ReceivePack<P> {
   /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what
-  /// reading them builds admitted `room` bytes, the edge's request room, its hooks' views shown by
-  /// `presenter`; writes the advertisement to `out` when `advertise`. Refused for a repository not
-  /// here or not git's, a store not held, or a policy git's matcher cannot read.
+  /// reading them builds admitted [`push_room`], its hooks' views shown by `presenter`; writes the
+  /// advertisement to `out` when `advertise`. Refused for a repository not here or not git's, a
+  /// store not held, or a policy git's matcher cannot read.
   pub(crate) fn start(
     state: &mut ShardState,
     (principal, repository): (&Principal, RepositoryId),
-    (room, advertise): (u64, bool),
+    advertise: bool,
     out: &mut impl Out,
     presenter: P,
   ) -> Result<ReceivePack<P>, PushFailed> {
@@ -326,7 +326,7 @@ impl<P> ReceivePack<P> {
       repository,
       principal: principal.clone(),
       session,
-      admission: Admission::new(room),
+      admission: Admission::new(push_room(state)),
       presenter,
       answer: AnswerState::Unbegun,
     })
@@ -716,6 +716,14 @@ fn prepare(
     }),
     Err(refused) => Ok(Prepared::Declined(Declining::unadmitted(&refused))),
   }
+}
+
+/// Derived: the room a push is admitted (A-704): what the repository's owner shard could admit now, its arena's
+/// capacity and what its pool could still lend (`Store::admittable`), since the pushed objects land in that shard's
+/// store. Never one request's room: a pack longer than a ring region is a push like any other, and one past what the
+/// shard can hold is refused in git's `receive.maxInputSize` words.
+pub(crate) fn push_room(state: &ShardState) -> u64 {
+  state.store.admittable()
 }
 
 /// The first git hook `record`'s policy configures, if any (A-622 part 1: one hook a git point).

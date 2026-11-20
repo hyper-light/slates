@@ -53569,3 +53569,13 @@ shard); `docs/cli.md`.
 - **Owed.** The authenticated session's sources, read each call through the same lender once a mechanism exists
   (A-692); the tunnel calling `locate` and moving its SSH connection to the owner, with its test over
   the SSH site; `svn_uri_canonicalize` before the lookup; the other platforms' runs (main's).
+
+### A-704 — A push is admitted what its repository's shard can hold, never one request's room (bug, 2026-11-20, g309 for UI goal 93; found by A-699's use: stock git 2.50.1 could not push git/git, 324 MiB, into `--vcs-http`; §4.17.2 "A push" item 3)
+- **Change.** `git_push::push_room`: a push's admission is `Store::admittable()` on its owner shard when it starts, for
+  both edges (`ReceiveServices` and the SSH `ReceiveCommand` no longer take the edge's room). A pack refused for its room
+  is answered in git's `receive.maxInputSize` words: band 2 `fatal: pack exceeds maximum allowed size`, the unpack status
+  by the header's count (counted before its records are charged), never `eof before pack header was fully read`.
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_push_whose_pack_is_larger_than_one_ring_region_lands_through_the_daemons_edge`;
+  `slates-git` `receive::tests::a_pack_past_its_room_is_refused_in_the_words_of_gits_max_input_size`.
+- **Owed.** The unpack admitting objects into the quarantine a slice at a time (the reader holds them until the pack
+  ends, then the quarantine copies them); the whole git/git push and a fresh clone fscked (main's run).
