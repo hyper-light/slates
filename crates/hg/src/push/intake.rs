@@ -505,6 +505,172 @@ impl<'g> Intake<'g> {
   }
 }
 
+/// A push's fork re-based onto its repository's index as it is now (A-720 part 2b), when another push landed after the
+/// fork was made: the fork's rows name their parents and links by number, so they hold only over the index they were
+/// forked from. Each revision the push kept is appended again, a row a step, to a fork of the current index, from its
+/// row in the stale fork (its node, parents and link by node, its flags, its length and the content it names: nothing
+/// rebuilt, put or hashed again); one the index holds already (the other push brought it) is passed over, a changeset
+/// among them counted held. Bookkeeping only: the push's verdict is still judged at its landing (D-27).
+pub struct Rebase {
+  /// The stale fork, read from.
+  stale: HgIndex,
+  /// The fork of the index as it is now, appended to.
+  fork: HgIndex,
+  /// The logs to re-append, each from its first kept number in the stale fork.
+  logs: Vec<(LogOf, u32)>,
+  /// The log and the stale number next.
+  at: (usize, u32),
+  /// Whether the log being re-appended has appended a row yet.
+  logged: bool,
+  /// What the push brings over the index as it is now.
+  intaken: Intaken,
+}
+
+impl Rebase {
+  /// Starts re-basing `stale` (what `intaken` names) onto a fork of `index`. Refused, `stale` comes back.
+  pub fn begin(
+    stale: HgIndex,
+    intaken: &Intaken,
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<Self, (Unindexed, HgIndex)> {
+    let fork = match index.fork(store) {
+      Ok(fork) => fork,
+      Err(refused) => return Err((Unindexed::Fork(refused), stale)),
+    };
+    let logs = intaken.logs.clone();
+    let intaken = Intaken {
+      held_changesets: intaken.held_changesets.clone(),
+      passed_over: intaken.passed_over,
+      ..Intaken::default()
+    };
+    Ok(Rebase {
+      stale,
+      fork,
+      logs,
+      at: (0, 0),
+      logged: false,
+      intaken,
+    })
+  }
+
+  /// Re-appends the next row (module docs); the caller gives both forks back on a refusal ([`Rebase::abandon`]).
+  pub fn step(&mut self, store: &mut ContentStore) -> Result<Stepped, Unindexed> {
+    let (at, rev) = self.at;
+    let Some((named, first)) = self.logs.get(at).cloned() else {
+      return Ok(Stepped::Done);
+    };
+    let log = log_named(&named);
+    let rev = rev.max(first);
+    if rev >= self.stale.len(store, log) {
+      self.at = (at.saturating_add(1), 0);
+      self.logged = false;
+      return Ok(Stepped::More);
+    }
+    self.again(log, &named, rev, store)?;
+    self.at = (at, rev.saturating_add(1));
+    Ok(Stepped::More)
+  }
+
+  /// The fork of the index as it is now, holding the push, and what it brings over that index; the stale fork given
+  /// back.
+  pub fn finish(self, store: &mut ContentStore) -> Result<(HgIndex, Intaken), IndexRefused> {
+    let Rebase {
+      stale,
+      fork,
+      intaken,
+      ..
+    } = self;
+    match stale.release(store) {
+      Ok(()) => Ok((fork, intaken)),
+      Err(refused) => Err(fork.release(store).err().unwrap_or(refused)),
+    }
+  }
+
+  /// Gives both forks back.
+  pub fn abandon(self, store: &mut ContentStore) -> Result<(), IndexRefused> {
+    let stale = self.stale.release(store);
+    let fork = self.fork.release(store);
+    stale.and(fork)
+  }
+
+  /// Appends the stale fork's revision `rev` of `log` to the fork, by node; passed over where the fork holds it.
+  fn again(
+    &mut self,
+    log: Log<'_>,
+    named: &LogOf,
+    rev: u32,
+    store: &mut ContentStore,
+  ) -> Result<(), Unindexed> {
+    let kept = crate::import::record::kept(&self.stale, store, log, rev).ok_or(
+      Unindexed::Index(crate::index::Refused::MissingLink { node: NULL_NODE }),
+    )?;
+    let node = kept.node;
+    if self.fork.rev(store, log, &node).is_some() {
+      self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
+      if log == Log::Changelog {
+        self.intaken.held_changesets.push(node);
+      }
+      return Ok(());
+    }
+    if !self.logged {
+      self
+        .intaken
+        .logs
+        .push((named.clone(), self.fork.len(store, log)));
+      self.logged = true;
+    }
+    if log == Log::Changelog {
+      let row = self.stale.changeset(store, rev).ok_or(Unindexed::Index(
+        crate::index::Refused::MissingLink { node },
+      ))?;
+      let branch = row.branch.to_vec();
+      let again = crate::index::NewChangeset {
+        node,
+        p1: kept.p1,
+        p2: kept.p2,
+        flags: kept.flags,
+        len: kept.len,
+        text: row.text,
+        manifest: row.manifest,
+        closed: row.closed,
+        branch: &branch,
+      };
+      self.fork.append_changesets(store, &[again])?;
+      self.intaken.changesets.push(node);
+    } else {
+      let row = self
+        .stale
+        .revision(store, log, rev)
+        .ok_or(Unindexed::Index(crate::index::Refused::MissingLink {
+          node,
+        }))?;
+      let again = crate::index::NewRevision {
+        node,
+        p1: kept.p1,
+        p2: kept.p2,
+        link: kept.link.unwrap_or(NULL_NODE),
+        flags: kept.flags,
+        len: kept.len,
+        bytes: row.bytes,
+        block: row.block,
+      };
+      self.fork.append_revisions(store, log, &[again])?;
+    }
+    self.intaken.kept = self.intaken.kept.saturating_add(1);
+    Ok(())
+  }
+}
+
+/// The index's log `named` names.
+fn log_named(named: &LogOf) -> Log<'_> {
+  match named {
+    LogOf::Changelog => Log::Changelog,
+    LogOf::Manifests => Log::Manifest,
+    LogOf::File(path) => Log::File(path),
+  }
+}
+
 /// The changesets `intaken` brought as their rows in `fork` keep them (A-720 part 2): node, parents, branch and close,
 /// for classifying the push without its texts; each charged to `admission`. `None` where the fork lacks one.
 pub fn read_changesets(

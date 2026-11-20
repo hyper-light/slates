@@ -97,8 +97,10 @@
 > fork a slice at a time within the shard's quantum with a yield between (pushes to one repository taken side by side),
 > then in one step judges it over the view as it is at landing (the race checks there), classifies it from the fork's
 > rows and lands the fork, the record written from it (`record::write_kept`); a connection that ends mid-intake gives
-> its fork back. Owed: part 2b, a fork made from an index another push replaced since is refused (`MOVED`) where it
-> should be re-based by node at landing; part 3, the import's room per repository; S5 (main's convergence plan): file
+> its fork back. Part 2b BUILT: a fork made from an index another push replaced since is re-based by node at
+> landing (`intake::Rebase`: each kept row appended again to a fork of the index as it is, by node, its content reused,
+> a row the index already holds passed over), a slice at a time, then judged and landed; `land` never puts a stale
+> fork in the index's place. Owed: part 3, the import's room per repository; S5 (main's convergence plan): file
 > texts as the work's green files by identity, changelog and manifests as deltas, rows naming content by identity.
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold

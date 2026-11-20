@@ -226,11 +226,11 @@ pub(crate) struct Kept {
   /// The node.
   pub(crate) node: Node,
   /// The first parent's node.
-  p1: Node,
+  pub(crate) p1: Node,
   /// The second parent's node.
-  p2: Node,
+  pub(crate) p2: Node,
   /// The link's node, a manifest's or file revision's.
-  link: Option<Node>,
+  pub(crate) link: Option<Node>,
   /// 7.2's index flags.
   pub(crate) flags: u16,
   /// The text's length, a file revision's block and its markers included.
