@@ -146,3 +146,7 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   (owner clock wall ns at last step); deadline derived = the edge's idle wait bound? Find the edge's per-connection idle
   bound (Bounds) or the liveness/observation budget; sweep on begin/take (bounded scan of the repo's entries) + on a
   timer? Prefer: expire lazily on every table access (begin, take) across the whole table -- bounded by its bound.
+- LANDED (3): 3be8fd765 (merge 67920ccf8; on main, checked). Pre-push run on landing tree green; the final merge's
+  15 server files were pushed before checking (slip, told main); post-hoc run on main 67920ccf8 green (svn 137, server
+  117, svn_interop 5/5). Piece 6 DONE.
+- Next: git + hg matrices on main 67920ccf8 (A-719 p1, 765a19ccc, A-720 p2b landed).
