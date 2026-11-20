@@ -44,7 +44,9 @@
 //! import; and, for a large repository, the record and the bookmarks' works made in slices rather than whole at the
 //! landing, and the snapshot carrying the store's tables, so a recovery replays only the log's suffix.
 
-use slates_db::catalog::{MemberOrigin, Principal, RepositoryId, StateChange, VolumeId as DbVolumeId};
+use slates_db::catalog::{
+  MemberOrigin, Principal, RepositoryId, StateChange, VolumeId as DbVolumeId,
+};
 use slates_hg::import::record::{self, WriteRefused};
 use slates_hg::import::{Clock, Import, ImportRefused, Imported, Progress, Turn};
 use slates_hg::index::HgIndex;
@@ -625,10 +627,7 @@ fn bookmark_greens(
   (root, bookmarks): (DbVolumeId, &[(Vec<u8>, Node)]),
   (held, name, room): Works<'_>,
 ) -> Result<Vec<BranchChange>, Refusal> {
-  let engine = state
-    .greens
-    .get(&root)
-    .ok_or(Refusal::ContentUnavailable)?;
+  let engine = state.greens.get(&root).ok_or(Refusal::ContentUnavailable)?;
   let version = state.db.partition().green_head(root);
   let head = engine
     .xattr(ROOT, HEAD_ATTRIBUTE)
@@ -645,8 +644,14 @@ fn bookmark_greens(
         base: head.as_ref(),
         head: node,
       };
-      let built = tree::work(&moved, &engine, (&Verified::default(), held), admission.left(), &mut admission)
-        .map_err(|refused| work_refused(&refused, room))?;
+      let built = tree::work(
+        &moved,
+        &engine,
+        (&Verified::default(), held),
+        admission.left(),
+        &mut admission,
+      )
+      .map_err(|refused| work_refused(&refused, room))?;
       admission
         .charge(u64::try_from(built.increment.post_state.len()).unwrap_or(u64::MAX))
         .map_err(|_| past_room(room))?;

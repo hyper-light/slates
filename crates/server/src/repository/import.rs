@@ -216,7 +216,11 @@ fn answer(
 /// `reply` once the transaction holding the landing and the completion is durable; the database's refusal when it
 /// cannot be, the partition then rolled back, the shard's effects reconciled with the log and, when the import landed,
 /// its store made again from the log (the module doc).
-fn committed(state: &mut ShardState, (id, landed): (RepositoryId, bool), reply: ReplyBody) -> ReplyBody {
+fn committed(
+  state: &mut ShardState,
+  (id, landed): (RepositoryId, bool),
+  reply: ReplyBody,
+) -> ReplyBody {
   match state.db.commit(&mut state.segment) {
     Ok(_) => reply,
     Err(error) => {

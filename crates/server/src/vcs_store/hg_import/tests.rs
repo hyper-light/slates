@@ -6,19 +6,19 @@ use std::time::{Duration, Instant};
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_hg::Admission;
-use slates_hg::import::{self, Clock, Imported};
 use slates_hg::Node;
+use slates_hg::import::{self, Clock, Imported};
 use slates_ipc::protocol::{ObjectFormat as WireFormat, Refusal, ReplyBody, RequestBody, VcsTool};
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 use slates_vcs::ContentStore;
 
 use super::{
-  ABANDONED, DONE, Finished, ImportFailed, LANDED, LANDING_REFUSED, REFUSED, STARTED, TURNS, Turned,
-  begin, land, run, turn,
+  ABANDONED, DONE, Finished, ImportFailed, LANDED, LANDING_REFUSED, REFUSED, STARTED, TURNS,
+  Turned, begin, land, run, turn,
 };
 use crate::hg_base::HgBase;
-use crate::repository::hg_push::BOOKMARK_TAG;
 use crate::hg_base::tests::{Files, STATES, laid_out};
+use crate::repository::hg_push::BOOKMARK_TAG;
 use crate::state::ShardState;
 use crate::verbs::dispatch;
 
@@ -444,7 +444,10 @@ fn t_a687_an_import_lands_its_record_phase_roots_and_bookmarks_in_one_entry() {
       .collect();
     assert_eq!(wanted.len(), 3);
     assert_eq!(heads_under(state, id, BOOKMARK_TAG), wanted);
-    assert_eq!((count(state, LANDED), count(state, LANDING_REFUSED)), (1, 0));
+    assert_eq!(
+      (count(state, LANDED), count(state, LANDING_REFUSED)),
+      (1, 0)
+    );
   });
 }
 
@@ -477,14 +480,18 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
     let refused = land(state, id);
     assert_eq!(
       refused,
-      Err(ImportFailed::Landing(Refusal::AlreadyExists { existing: taken }))
+      Err(ImportFailed::Landing(Refusal::AlreadyExists {
+        existing: taken
+      }))
     );
     assert_eq!(state.db.partition().repositories().objects(id).count(), 0);
     assert!(roots_of(state, id).is_empty());
     assert!(rows_of(state, id).is_empty());
-    assert_eq!((used(state), state.store.budget.retained()), (held, retained));
+    assert_eq!(
+      (used(state), state.store.budget.retained()),
+      (held, retained)
+    );
     check_settled(state, id);
     assert_eq!(count(state, LANDING_REFUSED), 1);
   });
 }
-

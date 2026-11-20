@@ -1090,7 +1090,10 @@ fn t_a687_every_import_replays_from_its_record_row_for_row() {
 #[test]
 fn t_a687_the_states_record_holds_its_markers_and_history() {
   let (imported, _, bytes) = recorded("states");
-  assert!(imported.changesets > 0 && imported.markers == 2, "{imported:?}");
+  assert!(
+    imported.changesets > 0 && imported.markers == 2,
+    "{imported:?}"
+  );
   let (_, _, replayed) = replayed(&bytes);
   assert_eq!(replayed.unwrap().markers, 2);
 }
@@ -1136,9 +1139,10 @@ fn t_a687_hostile_records_are_refused_by_kind() {
     }),
     (count, |refused| *refused == RecordRefused::Count),
     (trailing, |refused| *refused == RecordRefused::Trailing),
-    (with(FIRST_TEXT, bytes[FIRST_TEXT] ^ 1), |refused| {
-      matches!(refused, RecordRefused::Node { revlog, rev: 0, .. } if &**revlog == b"00changelog")
-    }),
+    (
+      with(FIRST_TEXT, bytes[FIRST_TEXT] ^ 1),
+      |refused| matches!(refused, RecordRefused::Node { revlog, rev: 0, .. } if &**revlog == b"00changelog"),
+    ),
     (markers_only(&[obsstore]), |refused| {
       *refused == RecordRefused::Marker { number: 0 }
     }),
@@ -1196,7 +1200,15 @@ proptest! {
 
 /// One revision of an index as a push's record holds it, with its link's changeset number: node, parents, link, flags,
 /// text.
-type Held = (u32, crate::Node, crate::Node, crate::Node, crate::Node, u16, Vec<u8>);
+type Held = (
+  u32,
+  crate::Node,
+  crate::Node,
+  crate::Node,
+  crate::Node,
+  u16,
+  Vec<u8>,
+);
 
 /// Every revision of `log` in `index`, in its order ([`Held`]).
 fn revisions_of(index: &HgIndex, store: &ContentStore, log: Log<'_>) -> Vec<Held> {
@@ -1214,12 +1226,28 @@ fn revisions_of(index: &HgIndex, store: &ContentStore, log: Log<'_>) -> Vec<Held
       if log == Log::Changelog {
         let row = index.changeset(store, rev).unwrap();
         let text = whole(store, &row.text);
-        (rev, row.node, node_at(row.p1), node_at(row.p2), NULL_NODE, row.flags, text)
+        (
+          rev,
+          row.node,
+          node_at(row.p1),
+          node_at(row.p2),
+          NULL_NODE,
+          row.flags,
+          text,
+        )
       } else {
         let row = index.revision(store, log, rev).unwrap();
         let link = index.changeset(store, row.link).unwrap().node;
         let text = text_of(store, &row);
-        (row.link, row.node, node_at(row.p1), node_at(row.p2), link, row.flags, text)
+        (
+          row.link,
+          row.node,
+          node_at(row.p1),
+          node_at(row.p2),
+          link,
+          row.flags,
+          text,
+        )
       }
     })
     .collect()

@@ -1064,7 +1064,10 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
     }
     assert!(!super::replayed(state, hg, Err(ReplayRefused::Diverged)));
     assert!(!state.vcs_stores.holds(hg));
-    assert_eq!(state.vcs_stores.unrecovered(hg), Some(&ReplayRefused::Diverged));
+    assert_eq!(
+      state.vcs_stores.unrecovered(hg),
+      Some(&ReplayRefused::Diverged)
+    );
     for repository in [git, hg, svn] {
       super::free(state, repository);
       assert!(!state.vcs_stores.holds(repository));

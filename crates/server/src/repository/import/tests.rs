@@ -7,19 +7,19 @@ use slates_db::catalog::{Principal, RepositoryId, Role, VolumeId as DbVolumeId, 
 use slates_hg::import::{ImportRefused, Imported};
 use slates_hg::index::Log;
 use slates_hg::{Admission, Node, PastAdmission};
-use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
-use slates_vcs::ContentStore;
 use slates_ipc::protocol::{
   ImportFault, ObjectFormat as WireFormat, Refusal, ReplyBody, RequestBody, VcsTool,
 };
+use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
+use slates_vcs::ContentStore;
 use slates_vfs::host::{FetchId, HostError};
 use slates_wire::request::RequestId;
 
 use super::{ANSWERED, HELD, Opened, REJOINED, import_with, refusal_of, reply_of};
 use crate::hg_base::tests::{STATES, laid_out};
 use crate::hg_base::{BaseRefused, HgBase};
-use crate::repository::hg_push::{BOOKMARK_TAG, bookmark_name};
 use crate::merge_service::ReplyRoute;
+use crate::repository::hg_push::{BOOKMARK_TAG, bookmark_name};
 use crate::state::ShardState;
 use crate::vcs_store::hg_import::{Finished, ImportFailed};
 use crate::verbs::dispatch;
@@ -488,7 +488,12 @@ fn check_served(served: &Served, imported: &Imported) {
   let mut roots: Vec<(u8, Vec<u8>)> = imported
     .phase_roots
     .iter()
-    .map(|root| (u8::try_from(root.phase.number()).expect("a phase"), root.node.to_vec()))
+    .map(|root| {
+      (
+        u8::try_from(root.phase.number()).expect("a phase"),
+        root.node.to_vec(),
+      )
+    })
     .collect();
   roots.sort();
   let mut held = served.roots.clone();
@@ -528,7 +533,10 @@ fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
   });
   let began = Instant::now();
   while crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.importing(id)) {
-    assert!(began.elapsed() < TASK_WAIT, "still importing after {TASK_WAIT:?}");
+    assert!(
+      began.elapsed() < TASK_WAIT,
+      "still importing after {TASK_WAIT:?}"
+    );
   }
   let (answered, before, after, replayed) = crate::daemon::observe_first(&daemon, move |state| {
     let answered = count(state, ANSWERED);

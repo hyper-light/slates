@@ -423,9 +423,9 @@ fn markers_len(index: &HgIndex, store: &ContentStore) -> Result<u64, u64> {
 
 /// The bytes a content's windows hold.
 fn window_bytes(store: &ContentStore, root: &ContentId) -> u64 {
-  store
-    .windows(root)
-    .fold(0, |bytes, window| bytes.saturating_add(to_u64(window.len())))
+  store.windows(root).fold(0, |bytes, window| {
+    bytes.saturating_add(to_u64(window.len()))
+  })
 }
 
 /// A record writer's refusal naming `radix` and `rev`.
@@ -646,13 +646,19 @@ impl<'a> Reader<'a> {
 }
 
 /// The index with a record's revisions appended (module docs), through the import's own steps, into a fork of `index`
-/// that takes its place once the whole record is in; its texts kept in `store`. Refused, `index` and `store` are as they
-/// were: the fork is released and every hold given back. The one entry point for an import's record and a push's.
+/// that takes its place once the whole record is in; its texts kept in `store`. Refused, `index` holds the rows it held
+/// and every hold the replay took is given back (a fork may have sealed the index's tail into a table, the same rows); an
+/// import's record meeting an index that holds rows is refused before anything is made. The one entry point for an
+/// import's record and a push's.
 pub fn replay(
   bytes: &[u8],
   index: &mut HgIndex,
   store: &mut ContentStore,
 ) -> Result<Replayed, Refused> {
+  let (source, _) = head(&mut Reader { rest: bytes })?;
+  if source == Source::Import && index.rows().rows() != 0 {
+    return Err(Refused::NotEmpty);
+  }
   let mut fork = index
     .fork(store)
     .map_err(|refused| ImportRefused::<Infallible>::Index(refused.into()))?;
@@ -680,10 +686,7 @@ fn replay_into(
   store: &mut ContentStore,
 ) -> Result<Replayed, Refused> {
   let mut reader = Reader { rest: bytes };
-  let (source, room) = head(&mut reader)?;
-  if source == Source::Import && index.rows().rows() != 0 {
-    return Err(Refused::NotEmpty);
-  }
+  let (_, room) = head(&mut reader)?;
   let first = index.len(store, Log::Changelog);
   let mut replayed = Replayed::default();
   for _ in 0..reader.count(GROUP_MIN_BYTES)? {
@@ -756,9 +759,7 @@ fn replay_group(
     Log::Manifest => replayed.manifests = replayed.manifests.saturating_add(revisions),
     Log::File(_) => {
       replayed.file_logs = replayed.file_logs.saturating_add(1);
-      replayed.file_revisions = replayed
-        .file_revisions
-        .saturating_add(u64::from(revisions));
+      replayed.file_revisions = replayed.file_revisions.saturating_add(u64::from(revisions));
     }
   }
   Ok(())
@@ -816,32 +817,32 @@ fn replay_revision(
   held_to_node(radix, (rev, read))?;
   let (bytes, block) = match log {
     Log::File(_) => {
-      let split = filerev::split(read.text).map_err(|refusal| {
-        ImportRefused::<Infallible>::FileRevision {
+      let split =
+        filerev::split(read.text).map_err(|refusal| ImportRefused::<Infallible>::FileRevision {
           revlog: Box::from(radix),
           rev,
           refusal,
-        }
-      })?;
+        })?;
       (split.bytes, split.metadata)
     }
     Log::Changelog | Log::Manifest => (read.text, None),
   };
   let mut held = Held::default();
-  let outcome = keep_revision::<Infallible>(store, &mut held, bytes, block).and_then(|(bytes, block)| {
-    let row = NewRevision {
-      node: read.node,
-      p1: read.p1,
-      p2: read.p2,
-      link: read.link,
-      flags: read.flags,
-      len: to_u64(read.text.len()),
-      bytes,
-      block,
-    };
-    let numbers = index.append_revisions(store, log, &[row])?;
-    settle(index, store, radix, rev, &numbers)
-  });
+  let outcome =
+    keep_revision::<Infallible>(store, &mut held, bytes, block).and_then(|(bytes, block)| {
+      let row = NewRevision {
+        node: read.node,
+        p1: read.p1,
+        p2: read.p2,
+        link: read.link,
+        flags: read.flags,
+        len: to_u64(read.text.len()),
+        bytes,
+        block,
+      };
+      let numbers = index.append_revisions(store, log, &[row])?;
+      settle(index, store, radix, rev, &numbers)
+    });
   Ok(held.give_back(store, outcome)?)
 }
 
