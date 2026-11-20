@@ -120,8 +120,9 @@
 #   blocked in its completion port is woken as Windows wakes an event's waiter (1). 101 → 102.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
-# slates-base (11): rustix marks kevent unsafe because the kernel fills the output list; one
-#   registration and one drain of the macOS/BSD directory watcher (2); the Windows fingerprint
+# slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
+#   zero-timeout call (`hint_set::kevent_now`, 1; 2 -> 1 on 2026-11-19, A-709) shared by the macOS/BSD directory
+#   watcher's registrations and drains and the shard's hint set; the Windows fingerprint
 #   through the stable Win32 file-information calls (2), since the standard library's handle
 #   metadata is unstable on 1.98 (its two zeroed records are now built as literals); and the
 #   Windows contained opens (AUD-29-62, 2026-10-01: 6) — `NtCreateFile` relative to a retained
@@ -410,7 +411,7 @@ slates-rt = 107
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
-slates-base = 11
+slates-base = 10
 slates-vfs = 0
 # 2026-11-18 (+19, §4.15 A-185, landing on Windows, `os_windows.rs` compiled only for Windows; built 2026-10-26 by
 #   another session with 18, the owner check grown by one when it was landed): Win32 and the NT layer have no safe

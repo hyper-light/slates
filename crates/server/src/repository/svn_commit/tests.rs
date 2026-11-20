@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
 use slates_ipc::protocol::{ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_svn::commit::drive::Work;
 use slates_svn::commit::record::Record;
 use slates_svn::commit::revision::{Revision, StepRefusal};
 use slates_svn::commit::{CommitRefusal, ConflictKind};
@@ -14,13 +15,15 @@ use slates_svn::index::{
 };
 use slates_svn::lock::{AprTime, CommitLocks};
 
-use super::{Committed, PROPS, UNSUPPORTED, Uncommitted, commit};
+use super::{Committed, PROPS, UNSUPPORTED, Uncommitted, commit, commit_work};
 use crate::repository::push::AppendRefused;
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
 /// Shape: the date every test revision carries.
 const DATE: &str = "2026-11-19T20:00:00.000000Z";
+/// Shape: [`DATE`]'s instant: microseconds since the epoch.
+const DATE_INSTANT: AprTime = AprTime(1_795_118_400_000_000);
 
 /// The repository's owner.
 fn owner() -> Principal {
@@ -532,4 +535,219 @@ fn t_a655_the_records_are_made_again_from_the_log() {
     let (_, held, charged) = kept(state, svn);
     assert_eq!((count, charged), (4, held));
   });
+}
+
+/// A-698 (`commit_work`: what both ra_svn transports call with the work their connection accepted). Do: land a client's
+/// accepted work adding `/trunk`, by alice, presenting no lock, at [`DATE`]'s instant. Expect: revision 1, dated by that
+/// instant and by alice, as `commit-info` carries them; the green at version 1 holding `/trunk`; the register's second
+/// record the revision the step made.
+#[test]
+fn t_a698_a_clients_accepted_work_lands_through_the_step() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    let work = Work {
+      head: 0,
+      record: RevisionRecord {
+        transaction: "0-1".to_owned(),
+        changes: vec![row("/trunk", Action::Add, NodeKind::Directory)],
+      },
+      lock_entries: Vec::new(),
+      revision_properties: vec![
+        (b"svn:author".to_vec(), b"alice".to_vec()),
+        (b"svn:log".to_vec(), b"a change".to_vec()),
+      ],
+      texts: BTreeMap::new(),
+      property_lists: BTreeMap::new(),
+      locks: CommitLocks {
+        user: Some("alice".to_owned()),
+        ..CommitLocks::default()
+      },
+    };
+    let landed = commit_work(state, (&owner(), svn), work, DATE_INSTANT);
+    let made = revision(
+      0,
+      vec![row("/trunk", Action::Add, NodeKind::Directory)],
+      &[],
+    );
+    let records = logged(state, svn);
+    let second = records.get(1).map(|bytes| Record::decode(bytes));
+    let seen = (
+      landed,
+      green_head(state, green),
+      green_dir(state, green, "trunk"),
+    );
+    assert_eq!(seen, (answered(1), Some(1), true));
+    assert_eq!(second, Some(Ok(Record::Revision(made))));
+  });
+}
+
+/// Shape: the most revisions the folding test lands before it expects a checkpoint: far more than the doubling rule
+/// needs for increments of a few hundred bytes against revision 1's checkpoint, and few enough to run at once.
+const FOLD_WITHIN: u64 = 256;
+
+/// Found by use (w-perf, 2026-11-19: `slates repository import` of git/git's newest 5,000 commits as a dump refused
+/// `TableAtCapacity { table: "green_chains" }` after 1,685 revisions). Do: land revision 1, then revisions changing
+/// `/trunk/a.txt`, one at a time, no reader holding any version. Expect: the repository's green is checkpointed as
+/// they land (its checkpoint floor rises past 0), as the merge service folds every other green's chain by its doubling
+/// rule, so a Subversion repository's chain stays bounded however many revisions it takes. Before the fix no
+/// Subversion landing checkpointed its green, so every revision's increment stayed in the partition's chain until the
+/// cap refused the next.
+#[test]
+fn subversion_revisions_fold_their_greens_chain_as_they_land() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+    let mut head = 1;
+    while state.db.partition().green_floor(green) == 0 && head < FOLD_WITHIN {
+      let bytes = format!("alpha {head}\n").into_bytes();
+      let rows = vec![file("/trunk/a.txt", Action::Modify, &bytes)];
+      let next = revision(head, rows, &[&bytes]);
+      assert_eq!(
+        commit(state, (&owner(), svn), next, None),
+        answered(head + 1)
+      );
+      head += 1;
+    }
+    assert!(
+      state.db.partition().green_floor(green) > 0,
+      "no checkpoint after {head} revisions"
+    );
+  });
+}
+
+/// Shape: the partition's merge budget in the content test: small, so a few revisions' records pass it.
+const SMALL_MERGE_BUDGET: usize = 64 << 10;
+
+/// Shape: each revision's text in the content test: a quarter of [`SMALL_MERGE_BUDGET`].
+const QUARTER_TEXT: usize = SMALL_MERGE_BUDGET / 4;
+
+/// Found by use (w-perf, 2026-11-19: `slates repository import` of git/git's newest 5,000 commits as a dump refused
+/// `TableAtCapacity { table: "green_chains" }` at revision 1,685). Do: on a shard whose partition's merge budget is
+/// [`SMALL_MERGE_BUDGET`], land revision 1, then eight revisions each bringing a text a quarter of that budget. Expect:
+/// every revision lands, the register's objects hold more than the merge budget, and the shard's budget charges them:
+/// a repository's content is bounded by what its owner shard can hold (A-662, `vcs_store::settle_objects`), never by
+/// the merge budget the partition's chains share. Before the fix each revision's record was charged to the merge
+/// budget, so the repository's whole content had to fit in it.
+#[test]
+fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget() {
+  let landed = crate::daemon::audit_on_shard_configured(
+    |state| {
+      let (svn, _green) = subversion(state, "svn");
+      let mut answers = vec![commit(state, (&owner(), svn), first(), None)];
+      for head in 1..9u64 {
+        let bytes = vec![u8::try_from(head).unwrap_or(0); QUARTER_TEXT];
+        let rows = vec![file("/trunk/a.txt", Action::Modify, &bytes)];
+        answers.push(commit(
+          state,
+          (&owner(), svn),
+          revision(head, rows, &[&bytes]),
+          None,
+        ));
+      }
+      let held = state.db.partition().repositories().objects_bytes(svn);
+      let charged = state.vcs_stores.objects_charged(svn);
+      (
+        answers,
+        held > SMALL_MERGE_BUDGET,
+        charged == u64::try_from(held).unwrap_or(0),
+      )
+    },
+    |config| config.caps.green_chain_bytes = SMALL_MERGE_BUDGET,
+  );
+  let expected: Vec<_> = (1..10).map(answered).collect();
+  assert_eq!(landed, (expected, true, true));
+}
+
+/// Found by use (w-perf, 2026-11-19, release b705a24c5: a 5,000-revision import's record 3,560 refused `Unpublished`,
+/// "profile … exceeds its region", then every `svn commit` refused E160004 "The repository's green is not at its
+/// youngest revision"). Do: land revision 1; with the next publication refused before its append, commit revision 2;
+/// then commit revision 2 again. Expect: the first attempt refused, the green's engine still at revision 1, where the
+/// durable chain and the records are; the second attempt lands as revision 2. Before the fix the engine had committed
+/// the version before its record was refused, and kept it: the green moved past the records for good.
+#[test]
+fn a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    let first_landed = commit(state, (&owner(), svn), first(), None);
+    let second = || {
+      let rows = vec![file("/trunk/a.txt", Action::Modify, b"two\n")];
+      revision(1, rows, &[b"two\n"])
+    };
+    state
+      .db
+      .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend));
+    let refused = commit(state, (&owner(), svn), second(), None).is_err();
+    let head_after = green_head(state, green);
+    let again = commit(state, (&owner(), svn), second(), None);
+    (first_landed, refused, head_after, again)
+  });
+  assert_eq!(seen, (answered(1), true, Some(1), answered(2)));
+}
+
+/// The head as the lock guard reads it, over the records' index.
+struct IndexHead<'i>(&'i slates_svn::index::Index);
+
+impl slates_svn::lock::HeadView for IndexHead<'_> {
+  fn youngest(&self) -> u64 {
+    self.0.youngest()
+  }
+
+  fn node(&self, path: &str) -> Option<(NodeKind, u64)> {
+    let node = self.0.node(path, self.0.youngest()).ok()??;
+    Some((node.kind(), node.created_revision()))
+  }
+}
+
+/// A-693 part 2 (a lock verb's entries through the owner's step). Do: land revision 1; judge alice's lock of
+/// `/trunk/a.txt` against the records' table, as the ra_svn connection judges `lock-many`, and land its entries as a
+/// `Record::Locks`; then make the repository's store again from its log. Expect: the step lands the entries; the
+/// records hold alice's lock, the register holds the record as `locks`; the store made again from the log holds the
+/// same lock, so a lock is as durable as a revision.
+#[test]
+fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (svn, _green) = subversion(state, "svn");
+    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+    let records = state.vcs_stores.subversion_records(svn).unwrap();
+    let request = slates_svn::lock::LockRequest {
+      user: Some("alice".to_owned()),
+      comment: Some(b"held".to_vec()),
+      targets: BTreeMap::from([(
+        "/trunk/a.txt".to_owned(),
+        slates_svn::lock::LockTarget::default(),
+      )]),
+      ..slates_svn::lock::LockRequest::default()
+    };
+    let decision = records
+      .locks()
+      .lock(
+        &request,
+        &IndexHead(records.index()),
+        AprTime(1),
+        8,
+        &mut || [7; 16],
+      )
+      .unwrap();
+    let landed = super::record(state, (&owner(), svn), Record::Locks(decision.entries));
+    let owner_of = |state: &ShardState| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .and_then(|records| {
+          records
+            .locks()
+            .get_lock("/trunk/a.txt", AprTime(1))
+            .map(|lock| lock.owner.clone())
+        })
+    };
+    let held = owner_of(state);
+    let kinds: Vec<bool> = logged(state, svn)
+      .iter()
+      .map(|bytes| matches!(Record::decode(bytes), Ok(Record::Locks(_))))
+      .collect();
+    crate::vcs_store::rebuild(state, svn);
+    (landed, held, kinds.last().copied(), owner_of(state))
+  });
+  let alice = Some("alice".to_owned());
+  assert_eq!(seen, (Ok(()), alice.clone(), Some(true), alice));
 }

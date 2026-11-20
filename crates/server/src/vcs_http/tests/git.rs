@@ -638,6 +638,10 @@ impl StoreLender for Lends {
     id == (RepositoryId { bytes: [0; 16] })
   }
 
+  fn room(&mut self, _repository: RepositoryId) -> Option<u64> {
+    Some(ROOM)
+  }
+
   fn lend<R>(
     &mut self,
     (id, _reader): (RepositoryId, &Principal),
@@ -680,7 +684,7 @@ impl Lends {
 /// line; the `ls-refs` answer is the flush alone, since the repository holds no ref.
 #[test]
 fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
-  let mut site = site(Vec::new(), UploadServices::new(Lends::empty(), ROOM));
+  let mut site = site(Vec::new(), UploadServices::new(Lends::empty()));
   let advertise = request(
     "GET",
     UPLOAD_ADVERTISEMENT,
@@ -720,7 +724,7 @@ fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
 /// Expect: served `200`, the answer git's `ERR` line, as `git upload-pack --stateless-rpc` answers it.
 #[test]
 fn a_request_upload_pack_refuses_is_answered_in_gits_words() {
-  let mut site = site(Vec::new(), UploadServices::new(Lends::empty(), ROOM));
+  let mut site = site(Vec::new(), UploadServices::new(Lends::empty()));
   let garbage: &[u8] = b"zzzz";
   let post = request(
     "POST",
@@ -752,7 +756,7 @@ fn a_request_upload_pack_refuses_is_answered_in_gits_words() {
 #[test]
 fn receive_pack_and_an_unheld_store_are_503() {
   let lender = Lends::empty();
-  let mut site = site(Vec::new(), UploadServices::new(lender, ROOM));
+  let mut site = site(Vec::new(), UploadServices::new(lender));
   let receive = request("GET", RECEIVE_ADVERTISEMENT, &[OWNER_BEARER]);
   assert_eq!(
     refusal(&ready(site.answer(&head(&receive), true))).0,

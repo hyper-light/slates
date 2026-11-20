@@ -311,19 +311,21 @@ fn started(state: &mut ShardState, repository: RepositoryId) -> (Vec<u8>, Receiv
 }
 
 /// `request` handed to `push` a piece at a time as an edge hands it in, then its end, then its
-/// answer, in one step under a presenter that shows no view: what the driver wrote, and what it
-/// received.
+/// answer, a step at a time while its checks turn (A-719) under a presenter that shows no view:
+/// what the driver wrote, and what it received.
 fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (Vec<u8>, Received) {
   for piece in request.chunks(PIECE) {
     push.input(state, piece).expect("taken");
   }
   push.end(state).expect("ended");
   let mut answer = Vec::new();
-  let step = push.answer_step(state, &mut answer).expect("answered");
-  let Answering::Answered(received) = step else {
-    panic!("no hook runs where no view is shown: {step:?}");
-  };
-  (answer, received)
+  loop {
+    match push.answer_step(state, &mut answer).expect("answered") {
+      Answering::Answered(received) => return (answer, received),
+      Answering::Turned => {}
+      step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
+    }
+  }
 }
 
 /// `request` pushed to `repository` by its owner: what was received.
@@ -713,7 +715,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
       .map_err(|failed| format!("a step failed: {failed:?}"))?;
     match step {
       Answering::Answered(received) => break received,
-      Answering::Sealing => slates_rt::futures::yield_now().await,
+      Answering::Turned => slates_rt::futures::yield_now().await,
       Answering::Hook(call) => {
         let ran = call.run(std::future::pending()).await;
         with_state(|state| push.hook_ran(state, ran, &mut answer))
@@ -952,4 +954,54 @@ fn t_a665_an_update_hook_refuses_its_own_command_alone() {
   let words = "no refs/heads/other\nerror: hook declined to update refs/heads/other\n";
   assert_eq!(band_two(&answer), words);
   assert_eq!(shown, (2, 2));
+}
+
+/// A-724 piece 1 (§4.17.5 "What a repository costs, counted"). Do: push stock git's fixture pushes into one repository
+/// while a second repository on the same shard is left alone. Expect: the pushed repository's usage row counts every
+/// push begun and answered, every byte the client sent, and steps that took the shard's time, with its owner the one
+/// principal named for all of them; the idle repository has no row.
+#[test]
+fn t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row() {
+  crate::daemon::audit_on_shard(|state| {
+    let pushed_to = git_repository(state, "pushed");
+    let idle = git_repository(state, "idle");
+    let mut sent = 0u64;
+    for (scenario, _) in chain() {
+      let (_, mut push) = started(state, pushed_to);
+      answered(state, &mut push, scenario.request);
+      sent += u64::try_from(scenario.request.len()).unwrap();
+    }
+    let pushes = u64::try_from(chain().len()).unwrap();
+    let usage = state
+      .vcs_usage
+      .usage(&pushed_to)
+      .expect("a row for the pushed repository");
+    assert_eq!(
+      (
+        usage.intake.begun,
+        usage.intake.answered,
+        usage.intake.bytes_in
+      ),
+      (pushes, pushes, sent)
+    );
+    assert!(
+      usage.intake.steps >= pushes,
+      "every push takes steps: {usage:?}"
+    );
+    assert!(
+      usage.intake.step_ns > 0,
+      "the steps took the shard's time: {usage:?}"
+    );
+    assert_eq!(usage.fetch, slates_vcs::WorkUsage::default());
+    let named: Vec<_> = usage
+      .principals()
+      .iter()
+      .map(|slot| (slot.principal.clone(), slot.count, slot.overstated))
+      .collect();
+    assert_eq!(named, vec![(owner(), pushes, 0)]);
+    assert!(
+      state.vcs_usage.usage(&idle).is_none(),
+      "the idle repository was counted"
+    );
+  });
 }

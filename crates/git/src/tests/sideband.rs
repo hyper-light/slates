@@ -79,25 +79,7 @@ fn each_fetch_answers_packfile_section_demultiplexes_to_one_pack_and_its_progres
 #[test]
 fn under_sideband_all_every_data_packet_of_the_answer_is_on_band_one() {
   let packets = packets(FETCH_URIS_RESPONSE);
-  let mut lines = Vec::new();
-  let mut pack = Vec::new();
-  let mut in_pack = false;
-  for packet in &packets {
-    match packet {
-      Packet::Data(data) => {
-        let (band, bytes) = demux(data).unwrap();
-        assert_eq!(band, Band::Data, "{bytes:?}");
-        if in_pack {
-          pack.extend_from_slice(bytes);
-        } else {
-          in_pack = bytes == b"packfile\n";
-          lines.push(bytes.to_vec());
-        }
-      }
-      Packet::Delim | Packet::Flush => {}
-      Packet::ResponseEnd => panic!("a response end in a stateless answer's body"),
-    }
-  }
+  let (lines, pack) = lines_and_pack_all_on_band_one(&packets);
   assert_eq!(
     lines.first().map(Vec::as_slice),
     Some(&b"packfile-uris\n"[..])
@@ -114,6 +96,31 @@ fn under_sideband_all_every_data_packet_of_the_answer_is_on_band_one() {
     1
   );
   assert_eq!(packets.last(), Some(&Packet::Flush));
+}
+
+/// The text lines of a `sideband-all` answer's `packets` through its `packfile` line, and the bytes after it, holding
+/// every data packet to band 1 and no packet to a response end.
+fn lines_and_pack_all_on_band_one(packets: &[Packet<'_>]) -> (Vec<Vec<u8>>, Vec<u8>) {
+  let mut lines = Vec::new();
+  let mut pack = Vec::new();
+  let mut in_pack = false;
+  for packet in packets {
+    match packet {
+      Packet::Data(data) => {
+        let (band, bytes) = demux(data).unwrap();
+        assert_eq!(band, Band::Data, "{bytes:?}");
+        if in_pack {
+          pack.extend_from_slice(bytes);
+        } else {
+          in_pack = bytes == b"packfile\n";
+          lines.push(bytes.to_vec());
+        }
+      }
+      Packet::Delim | Packet::Flush => {}
+      Packet::ResponseEnd => panic!("a response end in a stateless answer's body"),
+    }
+  }
+  (lines, pack)
 }
 
 /// A-582: do write a pack stock git sent, on each band, and bytes at, below and past one packet's capacity, measuring

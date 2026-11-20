@@ -548,6 +548,9 @@ fn a_chooser_past_what_the_client_reads_is_refused() {
   );
 }
 
+/// A request Mercurial would misread: its query, its headers, the room it is admitted, and its refusal.
+type OutOfBand<'r> = (&'r [u8], &'r [(&'r [u8], &'r [u8])], u64, Refused);
+
 /// AC-HG.9, A-650 part 1: do send `known` without its `nodes`, arguments behind an `X-HgArgs-Post` longer than the
 /// body, and `heads` to a request admitted three bytes. Expect each answered `application/hg-error`, its words ended by
 /// a line end, naming its refusal by kind.
@@ -555,7 +558,7 @@ fn a_chooser_past_what_the_client_reads_is_refused() {
 fn requests_mercurial_would_misread_are_answered_out_of_band() {
   let served = cloned();
   let post: [(&[u8], &[u8]); 1] = [(b"X-HgArgs-Post", b"99")];
-  let cases: [(&[u8], &[(&[u8], &[u8])], u64, Refused); 3] = [
+  let cases: [OutOfBand<'_>; 3] = [
     (
       b"cmd=known",
       &[],
@@ -608,9 +611,12 @@ const HTTP_PUSH_REPLY: &[u8] = include_bytes!("../../fixtures/wire/http-push.07.
 const BUNDLE2_REQUIRED_BODY: &[u8] =
   include_bytes!("../../fixtures/wire/http-oob.04.response-body");
 
+/// A bundle2 part read back: its type, its parameters (each key and value), and its payload.
+type ReplyPart = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>);
+
 /// The parts a bundle2 stream holds, each its type, parameters and payload, `output` parts left out when `outputs` is
 /// false.
-fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+fn reply_parts(stream: &[u8], outputs: bool) -> Vec<ReplyPart> {
   let bundle = crate::bundle2::Bundle2::decode(stream, &mut Admission::new(ROOM)).unwrap();
   bundle
     .parts

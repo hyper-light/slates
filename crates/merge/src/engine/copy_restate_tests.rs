@@ -296,7 +296,7 @@ fn refused_typed(windows: &[super::ConflictWindow]) -> bool {
 /// The oracle on one work: rebase on one fixture, submit on a twin; refused alike, or the restated journal, composed
 /// again over the head with the rebased work's files, submitted on a third twin, giving the twin's green.
 fn restate(work: &Work, census: &mut Census) -> Result<(), String> {
-  let (mut rebasing, mut accepting) = (fixture()?, fixture()?);
+  let (rebasing, mut accepting) = (fixture()?, fixture()?);
   let increment = compose(&rebasing, (1, 9), &work.journal, &work.files)?;
   match (rebasing.rebase(&increment), accepting.submit(&increment)) {
     (Rebased::Conflict { windows }, Outcome::Conflict { windows: refused }) if work.refused => {
@@ -379,7 +379,7 @@ fn a_rebase_restates_a_copy_and_the_edit_beneath_it() -> Result<(), String> {
   let green = fixture()?;
   let raw: Raw = ((0, 0, false), vec![(0, 0)]);
   let work = Work::of(&green, &raw);
-  let mut rebasing = fixture()?;
+  let rebasing = fixture()?;
   let increment = compose(&rebasing, (1, 9), &work.journal, &work.files)?;
   let Rebased::Rebased {
     journal, changed, ..

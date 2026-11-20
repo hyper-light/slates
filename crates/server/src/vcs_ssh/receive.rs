@@ -94,7 +94,7 @@ pub(crate) struct ReceiveCommand<S> {
 
 impl<S: ShardLender> ReceiveCommand<S> {
   /// A push of `principal`'s to the repository `repository` named `name`, at protocol `version`, its
-  /// shard's state lent by `lender`; the push's room is the driver's (`crate::git_push::push_room`, A-704).
+  /// shard's state lent by `lender`; the push's room is the driver's (`crate::vcs_share::room`, A-704, A-724).
   pub(crate) fn new(
     lender: S,
     principal: Principal,
@@ -226,7 +226,7 @@ async fn answer_step<S: ShardLender>(
     .map_err(|failed| refused(failed, name))?;
   match answering {
     Answering::Answered(_) => Ok(Next::Exited(0)),
-    Answering::Sealing => Ok(Next::More),
+    Answering::Turned => Ok(Next::More),
     Answering::Hook(call) => {
       let answer = call.run(core::future::pending()).await;
       lent(lender, |state| push.hook_ran(state, answer, &mut *out))?

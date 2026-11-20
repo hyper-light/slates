@@ -41,14 +41,23 @@
 //! whose tree no public read of the engine lists at that version; and a replacement without history that changes a
 //! node's kind, which the engine refuses as `TypeChanged` (GAPS §8f).
 //!
+//! **A client's work** ([`commit_work`], A-698): what both ra_svn transports call with the work their connection
+//! accepted at `close-edit`, `svn://` and `svnserve -t` through the SSH tunnel sharing A-656's connection. The revision
+//! is made of the work at the owner's instant (`Revision::of_work`, its `svn:date`), judged again with the commit's
+//! locks at that instant, and landed; the connection answers `commit-info` with the revision, or `close-edit`'s
+//! failure with the refusal ([`Uncommitted::answered`]): the step's own in FSFS's words, the others in slates' words
+//! under Subversion's nearest error.
+//!
 //! **Owed**: the svn:// connection task's call of the step (A-656 part 2); the lock verbs' entries recorded as the
 //! commits' are; the records' texts read from the green's content rather than held beside it and in the record.
 
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{Principal, RepositoryId, VcsTool, VolumeId as DbVolumeId};
+use slates_ipc::protocol::Refusal;
 use slates_merge::engine::{Green, Increment};
 use slates_merge::ops_doc::{NODE_EXCLUSIVE, Op, OpKind, OpsDoc, REPLACE};
+use slates_svn::commit::drive::Work;
 use slates_svn::commit::record::Record;
 use slates_svn::commit::revision::{Revision, StepRefusal};
 use slates_svn::index::{Action, ChangedPath, CopySource, NodeKind, PropertyList, Text};
@@ -126,6 +135,79 @@ pub(crate) enum Uncommitted {
   Append(AppendRefused),
 }
 
+/// Format: `SVN_ERR_FS_GENERAL`, the filesystem category's start (160,000): the error a refusal of the step's own that
+/// FSFS has no closer error for is answered with (`svn_error_codes.h`).
+const SVN_ERR_FS_GENERAL: u32 = 160_000;
+/// Format: `SVN_ERR_FS_CORRUPT`, the filesystem category's start plus 4 (`svn_error_codes.h`).
+const SVN_ERR_FS_CORRUPT: u32 = 160_004;
+/// Format: `SVN_ERR_UNSUPPORTED_FEATURE`, the miscellaneous category's start (200,000) plus 7 (`svn_error_codes.h`).
+const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
+
+impl Uncommitted {
+  /// The refusal's Subversion error number and words, as a command's failure carries them (a lock verb's whose
+  /// entries the step refused, A-693 part 2).
+  pub(crate) fn failure(&self) -> (u32, String) {
+    match self.answered() {
+      slates_svn::serve::Uncommitted::Step(refusal) => {
+        (refusal.subversion_code(), refusal.message())
+      }
+      slates_svn::serve::Uncommitted::Refused { code, message } => (code, message),
+      slates_svn::serve::Uncommitted::NotServed => (
+        SVN_ERR_UNSUPPORTED_FEATURE,
+        "This server does not make commits yet".to_owned(),
+      ),
+    }
+  }
+
+  /// The refusal as an ra_svn connection answers `close-edit` with it (module docs, "A client's work"): the step's in
+  /// its own words; the others, which no FSFS commit meets, in slates' words under Subversion's nearest error.
+  pub(crate) fn answered(&self) -> slates_svn::serve::Uncommitted {
+    use slates_svn::serve::Uncommitted as Answered;
+    let (code, message) = match self {
+      Uncommitted::Step(refusal) => return Answered::Step(refusal.clone()),
+      Uncommitted::NotHeld => (
+        SVN_ERR_FS_GENERAL,
+        "The repository is not held on this shard".to_owned(),
+      ),
+      Uncommitted::Diverged => (
+        SVN_ERR_FS_CORRUPT,
+        "The repository's green is not at its youngest revision".to_owned(),
+      ),
+      Uncommitted::Unsupported { path } => (
+        SVN_ERR_UNSUPPORTED_FEATURE,
+        format!("This server cannot commit '{path}' yet"),
+      ),
+      Uncommitted::Budget { available } => (
+        SVN_ERR_FS_GENERAL,
+        format!("No room for the commit: {available} bytes available"),
+      ),
+      Uncommitted::Append(refused) => (
+        SVN_ERR_FS_GENERAL,
+        format!("The repository's log refused the commit: {refused:?}"),
+      ),
+    };
+    Answered::Refused { code, message }
+  }
+}
+
+/// A client's accepted `work` (module docs, "A client's work") landed on `repository`'s logs by `principal`: the
+/// revision made of it at the owner's instant `now`, judged again with the commit's locks at `now`.
+pub(crate) fn commit_work(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  work: Work,
+  now: AprTime,
+) -> Result<Committed, Uncommitted> {
+  let locks = work.locks.clone();
+  let revision = Revision::of_work(work, now).map_err(Uncommitted::Step)?;
+  commit(
+    state,
+    (principal, repository),
+    revision,
+    Some((&locks, now)),
+  )
+}
+
 /// The refusal of records that do not hold together.
 fn corrupt() -> Uncommitted {
   Uncommitted::Step(StepRefusal::Corrupt)
@@ -144,7 +226,7 @@ pub(crate) fn record(
     Record::RevisionProperties { properties, .. } => {
       bytes_of(properties.iter(), core::iter::empty::<&Vec<u8>>())
     }
-    Record::Uuid(_) => 0,
+    Record::Uuid(_) | Record::Locks(_) => 0,
     Record::Created { .. } | Record::Revision(_) => return Err(corrupt()),
   };
   if !crate::vcs_store::lend_svn(state, repository, brought) {
@@ -168,6 +250,12 @@ fn record_growth(
     .ok_or(Uncommitted::NotHeld)?;
   match record {
     Record::Uuid(_) => Ok(0),
+    // A lock verb's entries, judged by the lock table as the records apply them (`check_entries`).
+    Record::Locks(entries) => records
+      .locks()
+      .check_entries(entries)
+      .map(|()| 0)
+      .map_err(|refusal| Uncommitted::Step(StepRefusal::Lock(refusal))),
     Record::RevisionProperties {
       revision,
       properties,
@@ -313,6 +401,10 @@ fn land(
   (checked, record): (Checked, Vec<u8>),
 ) -> Result<Committed, Uncommitted> {
   let work = version_of(state, (repository, green), &checked, &record)?;
+  // The record is the repository's content in the partition's register, charged to this shard's memory budget
+  // (`vcs_store::settle_objects`): a revision is admitted only while the shard could hold it.
+  crate::vcs_store::admit_objects(state, record.len())
+    .map_err(|available| Uncommitted::Budget { available })?;
   let growth = grown(&checked);
   crate::vcs_store::reserve_svn(state, repository, growth)
     .map_err(|available| Uncommitted::Budget { available })?;
@@ -321,13 +413,39 @@ fn land(
     ..EntryParts::default()
   };
   let change = BranchChange::Update { green, work };
-  match RepositoryLogs::append(state, principal, repository, vec![change], parts) {
-    Ok(appended) => Ok(applied(state, repository, checked, &appended)),
+  let mut appended = RepositoryLogs::append(
+    state,
+    principal,
+    repository,
+    vec![change.clone()],
+    parts.clone(),
+  );
+  if at_capacity(&appended) {
+    // The chain at the partition's cap, as a push's admission meets it (A-238): checkpoint the green at its floor at
+    // once and append again.
+    crate::merge_service::checkpoint_green_when(state, green, crate::merge_service::Doubling::Now);
+    appended = RepositoryLogs::append(state, principal, repository, vec![change], parts);
+  }
+  match appended {
+    Ok(appended) => {
+      // Fold the green's chain by the merge service's doubling rule as every accepted version does (W3), so a
+      // repository's chain stays bounded however many revisions it takes.
+      crate::merge_service::checkpoint_green(state, green);
+      Ok(applied(state, repository, checked, &appended))
+    }
     Err(refused) => {
       crate::vcs_store::unreserve_svn(state, repository, growth);
       Err(Uncommitted::Append(refused))
     }
   }
+}
+
+/// Whether `appended` was refused for the partition's merge budget (`green_chains` at its cap).
+fn at_capacity<T>(appended: &Result<T, AppendRefused>) -> bool {
+  matches!(
+    appended,
+    Err(AppendRefused::Entry(Refusal::TableAtCapacity { table })) if table == "green_chains"
+  )
 }
 
 /// The records once the entry recorded the revision: applied, as the check made certain; the answer `commit-info`

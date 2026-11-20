@@ -212,6 +212,7 @@ impl Refusal {
 fn leading_space(bytes: &[u8]) -> Option<usize> {
   let lead = *bytes.first()?;
   let width = match lead.leading_ones() {
+    // Format: a lead byte's leading ones count its sequence's bytes, two to four (RFC 3629 §3).
     2 => 2,
     3 => 3,
     4 => 4,
@@ -282,6 +283,9 @@ fn extension_priority(key: &[u8]) -> Option<u8> {
     .then(|| digit.saturating_sub(b'0'))
 }
 
+/// An extension's raw line as the scan gathers it: its name, its value and where its line begins.
+type RawExtension<'a> = (&'a [u8], &'a [u8], usize);
+
 /// The lines' values as the scan gathers them: each key's value and where its line begins, and the extensions' raw
 /// lines by priority.
 #[derive(Default)]
@@ -289,7 +293,7 @@ struct Gathered<'a> {
   /// `version`, `oid` and `size`'s values, with where each line begins.
   values: [Option<(&'a [u8], usize)>; KEYS.len()],
   /// Each extension's name and value, with where its line begins.
-  extensions: [Option<(&'a [u8], &'a [u8], usize)>; MAX_EXTENSIONS],
+  extensions: [Option<RawExtension<'a>>; MAX_EXTENSIONS],
   /// The first pair of extensions of one priority, if any.
   duplicate: Option<u8>,
 }
@@ -428,7 +432,7 @@ fn value_at(line: usize, key: &[u8]) -> u64 {
 
 /// The extensions gathered, each name UTF-8 and each oid `sha256:` and 64 digits.
 fn extensions<'a>(
-  gathered: &[Option<(&'a [u8], &'a [u8], usize)>; MAX_EXTENSIONS],
+  gathered: &[Option<RawExtension<'a>>; MAX_EXTENSIONS],
 ) -> Result<[Option<Extension<'a>>; MAX_EXTENSIONS], Refusal> {
   let mut extensions = [None; MAX_EXTENSIONS];
   for (slot, raw) in extensions.iter_mut().zip(gathered) {

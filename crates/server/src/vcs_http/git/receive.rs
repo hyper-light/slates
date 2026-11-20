@@ -64,7 +64,7 @@ impl ShardLender for ThisShard {
 }
 
 /// git's receive-pack through the push driver on the shard `lender` lends, each push admitted what its shard could
-/// admit (`crate::git_push::push_room`, A-704), never the edge's request room. upload-pack is not its half: it answers `503` for it
+/// admit (`crate::vcs_share::room`, A-704, A-724), never the edge's request room. upload-pack is not its half: it answers `503` for it
 /// ([`super::Halves`] pairs the two).
 #[derive(Clone, Debug)]
 pub(crate) struct ReceiveServices<L> {
@@ -158,7 +158,7 @@ impl<L: ShardLender> Exchange for Receive<L> {
         .map_err(failed)?;
       match step {
         Answering::Answered(_) => return Ok(()),
-        Answering::Sealing => slates_rt::futures::yield_now().await,
+        Answering::Turned => slates_rt::futures::yield_now().await,
         Answering::Hook(call) => {
           let answer = call.run(gone.gone()).await;
           lender

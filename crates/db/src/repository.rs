@@ -145,6 +145,7 @@ impl Register {
   }
 
   /// Every state log's position, in log order.
+  /// Shape: 4, one for each `StateLog` (names, phases, markers, locks).
   fn positions(&self) -> [(StateLog, u64); 4] {
     [
       StateLog::Names,
@@ -162,6 +163,17 @@ impl Register {
       StateLog::Phases => self.phases,
       StateLog::Markers => u64::try_from(self.markers.len()).unwrap_or(u64::MAX),
       StateLog::Locks => self.locks_position,
+    }
+  }
+
+  /// `log` left at `position` by a part a successor applied (A-636 part 2c-2): the markers log's position is the markers
+  /// it holds, so it is never set.
+  fn set_position(&mut self, log: StateLog, position: u64) {
+    match log {
+      StateLog::Names => self.names = position,
+      StateLog::Phases => self.phases = position,
+      StateLog::Markers => {}
+      StateLog::Locks => self.locks_position = position,
     }
   }
 
@@ -262,15 +274,7 @@ impl Register {
       .iter()
       .map(|(path, lock)| entry::lock_bytes(path, lock))
       .fold(0, usize::saturating_add);
-    let objects = self
-      .objects
-      .iter()
-      .map(Vec::len)
-      .fold(0, usize::saturating_add);
-    roots
-      .saturating_add(markers)
-      .saturating_add(locks)
-      .saturating_add(objects)
+    roots.saturating_add(markers).saturating_add(locks)
   }
 
   /// The state as a snapshot carries it.
@@ -604,6 +608,16 @@ impl Repositories {
       .flat_map(|register| register.objects.iter().map(Vec::as_slice))
   }
 
+  /// The bytes `repository`'s entries' objects hold (A-662): the repository's content, which its owner shard charges to
+  /// its memory budget as it charges the repository's tool store, so a repository's bound is what its shard can hold,
+  /// never the partition's merge budget.
+  pub fn objects_bytes(&self, repository: RepositoryId) -> usize {
+    self
+      .objects(repository)
+      .map(<[u8]>::len)
+      .fold(0, usize::saturating_add)
+  }
+
   /// `repository`'s entry objects at `index` in the order its register received them (A-662): what a recovery replays a
   /// record at a time.
   pub fn object_record(&self, repository: RepositoryId, index: usize) -> Option<&[u8]> {
@@ -705,6 +719,7 @@ impl Repositories {
       Op::RepositoryGreenJoined { record } => self.check_joined(record, held),
       Op::RepositoryAdvanced { entry } => entry::check(self, entry, held, head),
       Op::RepositoryPolicySet { repository, policy } => self.check_policy(*repository, policy),
+      Op::RepositoryRebuilt { record, parts } => self.check_rebuilt(record, parts, capacity),
       _ => Ok(()),
     }
   }
@@ -891,6 +906,7 @@ impl Repositories {
         self.log_names(record.repository, vec![LoggedChange::Joined { member }]);
         Ok(StateBytes::default())
       }
+      Op::RepositoryRebuilt { record, parts } => Ok(self.rebuilt(record, parts)),
       // An entry needs its greens' spans, which only the partition knows: `apply_advanced` takes them.
       Op::RepositoryAdvanced { .. } => Err(DbError::Corrupt {
         seq: 0,
@@ -960,23 +976,7 @@ impl Repositories {
       });
     }
     for change in &entry.names {
-      match change {
-        NameChange::Bind { name, green } => self.bind(&BranchRecord {
-          repository: entry.repository,
-          name: name.clone(),
-          green: *green,
-        }),
-        NameChange::Retire { name } => {
-          if let Some(green) = self.branches.remove(&(entry.repository, name.clone())) {
-            self.bound.remove(&green);
-          }
-        }
-        NameChange::Default { branch } => {
-          if let Some(record) = self.records.get_mut(&entry.repository) {
-            record.default_branch = branch.clone();
-          }
-        }
-      }
+      self.name_changed(entry.repository, change);
       namespace.push(LoggedChange::Named {
         change: change.clone(),
       });
@@ -998,9 +998,10 @@ impl Repositories {
           });
         }
       }
-      // The objects ride with the entry and take no position (A-662), so they never make it an atomic record.
+      // The objects ride with the entry and take no position (A-662), so they never make it an atomic record. They are
+      // the repository's content, charged by its owner shard to its memory budget, never to the merge budget
+      // ([`Repositories::objects_bytes`]).
       if !entry.objects.is_empty() {
-        bytes.added = bytes.added.saturating_add(entry.objects.len());
         register.objects.push(entry.objects.clone());
       }
       let after = register.positions();
@@ -1193,6 +1194,14 @@ impl Repositories {
   /// its lineage (A-575): each repository whose names it leaves takes a position on its names log, and its log's
   /// pointers to atomic records go (A-642).
   pub fn green_removed(&mut self, green: VolumeId) {
+    for repository in self.unlink(green) {
+      self.log_names(repository, vec![LoggedChange::Left { green }]);
+    }
+  }
+
+  /// `green` out of the namespace that bound it and the lineage it joined, its log's pointers to atomic records gone:
+  /// what [`Repositories::green_removed`] changes, without the names log's positions. The repositories it left.
+  fn unlink(&mut self, green: VolumeId) -> BTreeSet<RepositoryId> {
     self.fold_atomic(green, u64::MAX);
     let mut changed = BTreeSet::new();
     if let Some(key) = self.bound.remove(&green) {
@@ -1208,9 +1217,161 @@ impl Repositories {
         }
       }
     }
-    for repository in changed {
-      self.log_names(repository, vec![LoggedChange::Left { green }]);
+    changed
+  }
+
+  /// One change of `repository`'s namespace applied, unconditionally: a name bound, a name retired, the default moved.
+  fn name_changed(&mut self, repository: RepositoryId, change: &NameChange) {
+    match change {
+      NameChange::Bind { name, green } => self.bind(&BranchRecord {
+        repository,
+        name: name.clone(),
+        green: *green,
+      }),
+      NameChange::Retire { name } => {
+        if let Some(green) = self.branches.remove(&(repository, name.clone())) {
+          self.bound.remove(&green);
+        }
+      }
+      NameChange::Default { branch } => {
+        if let Some(record) = self.records.get_mut(&repository) {
+          record.default_branch = branch.clone();
+        }
+      }
     }
+  }
+
+  /// The repository `record` names, recorded whole by its successor from the parts of its state logs it kept
+  /// (A-636 part 2c-2; `Op::RepositoryRebuilt`): its record, then each part's changes in log order as they were first
+  /// made, each log left at its last part's position, and each operation that moved a green's log and another kept as
+  /// the atomic record it was. Nothing it applies takes a position a record ships from: every holder holds the parts
+  /// already. What its state and policy hold.
+  fn rebuilt(&mut self, record: &RepositoryRecord, parts: &[StateLogRecord]) -> StateBytes {
+    self.by_name.insert(record.name.clone(), record.id);
+    self.records.insert(record.id, record.clone());
+    let mut register = Register::default();
+    let mut atomic = BTreeSet::new();
+    for part in parts {
+      for change in &part.changes {
+        self.logged_change(record.id, &mut register, change);
+      }
+      register.set_position(part.log, part.to);
+      let moves_a_green = part
+        .spans
+        .iter()
+        .any(|span| matches!(span.log, LogName::Green { .. }));
+      if part.spans.len() > 1 && moves_a_green && atomic.insert(part.identity) {
+        self.keep_atomic(AtomicRecord {
+          spans: part.spans.clone(),
+        });
+      }
+    }
+    let added = register
+      .bytes()
+      .saturating_add(policy::bytes(&record.policy));
+    self.registers.insert(record.id, register);
+    StateBytes { added, released: 0 }
+  }
+
+  /// One change a state log's part carries, applied to `repository` and its `register` as it was first made.
+  fn logged_change(
+    &mut self,
+    repository: RepositoryId,
+    register: &mut Register,
+    change: &LoggedChange,
+  ) {
+    match change {
+      LoggedChange::Joined { member } => self.join(member),
+      LoggedChange::Named { change } => self.name_changed(repository, change),
+      LoggedChange::Left { green } => {
+        self.unlink(*green);
+      }
+      LoggedChange::Changed { change } => {
+        register.apply(change);
+      }
+    }
+  }
+
+  /// [`Repositories::rebuilt`]'s guard: the record as a creation's (its name and id free, its names valid, the
+  /// repositories under `capacity`), its policy whatever it was set to; and each log's parts its own, contiguous from
+  /// the log's start, one change a position, each change of its log, each member and binding a green of the
+  /// repository's family no other repository holds ([`in_family`]).
+  fn check_rebuilt(
+    &self,
+    record: &RepositoryRecord,
+    parts: &[StateLogRecord],
+    capacity: usize,
+  ) -> Result<(), DbError> {
+    let mut created = record.clone();
+    created.policy = RepositoryPolicy::default();
+    self.check_created(&created, capacity)?;
+    let corrupt = DbError::Corrupt {
+      seq: 0,
+      reason: "a rebuilt repository's parts are not its logs whole from their start",
+    };
+    let mut at: BTreeMap<StateLog, u64> = BTreeMap::new();
+    for part in parts {
+      let from = at.entry(part.log).or_insert(0);
+      let moved = u64::try_from(part.changes.len()).unwrap_or(u64::MAX);
+      if part.repository != record.id
+        || part.from != *from
+        || part.to.checked_sub(part.from) != Some(moved)
+        || moved == 0
+        || !part
+          .changes
+          .iter()
+          .all(|change| self.change_fits(record.id, part.log, change))
+      {
+        return Err(corrupt);
+      }
+      *from = part.to;
+    }
+    Ok(())
+  }
+
+  /// Whether `change` belongs on `repository`'s log `log`, its green, if it names one, of the repository's family and
+  /// held by no other repository's namespace or lineage.
+  fn change_fits(&self, repository: RepositoryId, log: StateLog, change: &LoggedChange) -> bool {
+    let free = |green: VolumeId| {
+      in_family(green, repository)
+        && self
+          .members
+          .get(&green)
+          .is_none_or(|member| member.repository == repository)
+        && self
+          .bound
+          .get(&green)
+          .is_none_or(|(owner, _)| *owner == repository)
+    };
+    match change {
+      LoggedChange::Joined { member } => {
+        log == StateLog::Names && member.repository == repository && free(member.green)
+      }
+      LoggedChange::Named { change } => {
+        log == StateLog::Names
+          && match change {
+            NameChange::Bind { green, .. } => free(*green),
+            NameChange::Retire { .. } | NameChange::Default { .. } => true,
+          }
+      }
+      LoggedChange::Left { .. } => log == StateLog::Names,
+      LoggedChange::Changed { change } => state_log_of(change) == log,
+    }
+  }
+
+  /// What [`Repositories::rebuilt`] would charge the merge budget: its parts' state and its policy.
+  pub fn rebuilt_bytes(record: &RepositoryRecord, parts: &[StateLogRecord]) -> usize {
+    let mut register = Register::default();
+    for part in parts {
+      for change in &part.changes {
+        if let LoggedChange::Changed { change } = change {
+          register.apply(change);
+        }
+      }
+    }
+    register
+      .bytes()
+      .saturating_add(policy::bytes(&record.policy))
   }
 
   /// The repositories a snapshot carries, rebuilt with their derived indexes. A binding naming no carried repository,
@@ -1279,6 +1440,93 @@ impl Repositories {
       repositories.restore_atomic(held)?;
     }
     Ok(repositories)
+  }
+}
+
+/// What a successor keeps of a repository's state logs (A-636 part 2c-2, by part 1's rule,
+/// `crate::ledger::logs`): of each log, the parts that continue it from its start, one after another; then every
+/// operation some log it moved does not hold whole is dropped from each state log that holds part of it, with what
+/// follows it there, until every operation kept is whole. A state log holds an operation's span where its part over
+/// those positions names the operation; a green's log holds it where the green's adopted head is at or past the span's
+/// end (`head`), since a green's versions are adopted whole up to its head. The parts kept, by log and then position,
+/// and the operations dropped, in the order found.
+pub fn whole_parts(
+  parts: Vec<StateLogRecord>,
+  head: impl Fn(VolumeId) -> u64,
+) -> (Vec<StateLogRecord>, Vec<[u8; 32]>) {
+  let mut logs = contiguous(parts);
+  let mut dropped = Vec::new();
+  while let Some(identity) = first_not_whole(&logs, &head) {
+    for kept in logs.values_mut() {
+      if let Some(first) = kept.iter().position(|part| part.identity == identity) {
+        kept.truncate(first);
+      }
+    }
+    dropped.push(identity);
+  }
+  (logs.into_values().flatten().collect(), dropped)
+}
+
+/// Each log's parts that continue it from its start, one after another, each moving as many positions as it carries
+/// changes and naming its own span among its operation's.
+fn contiguous(mut parts: Vec<StateLogRecord>) -> BTreeMap<StateLog, Vec<StateLogRecord>> {
+  parts.sort_by_key(|part| (part.log, part.from));
+  let mut logs: BTreeMap<StateLog, Vec<StateLogRecord>> = BTreeMap::new();
+  for part in parts {
+    let kept = logs.entry(part.log).or_default();
+    let at = kept.last().map_or(0, |last| last.to);
+    let own = LogSpan {
+      log: part.log_name(),
+      from: part.from,
+      to: part.to,
+    };
+    let moved = u64::try_from(part.changes.len()).unwrap_or(u64::MAX);
+    if part.from == at
+      && moved > 0
+      && part.to.checked_sub(part.from) == Some(moved)
+      && part.spans.contains(&own)
+    {
+      kept.push(part);
+    }
+  }
+  logs
+}
+
+/// The first operation, in log order, some log it moved does not hold whole.
+fn first_not_whole(
+  logs: &BTreeMap<StateLog, Vec<StateLogRecord>>,
+  head: &impl Fn(VolumeId) -> u64,
+) -> Option<[u8; 32]> {
+  logs
+    .values()
+    .flatten()
+    .find(|part| {
+      !part
+        .spans
+        .iter()
+        .all(|span| span_held(logs, part, span, head))
+    })
+    .map(|part| part.identity)
+}
+
+/// Whether `span`, one of `part`'s operation's, is held: a state log of its repository by a part over exactly those
+/// positions naming the operation, a green's log by the green's head at or past its end.
+fn span_held(
+  logs: &BTreeMap<StateLog, Vec<StateLogRecord>>,
+  part: &StateLogRecord,
+  span: &LogSpan,
+  head: &impl Fn(VolumeId) -> u64,
+) -> bool {
+  match span.log {
+    LogName::Green { green } => head(green) >= span.to,
+    LogName::State { repository, log } => {
+      repository == part.repository
+        && logs.get(&log).is_some_and(|kept| {
+          kept.iter().any(|held| {
+            held.from == span.from && held.to == span.to && held.identity == part.identity
+          })
+        })
+    }
   }
 }
 
@@ -1637,23 +1885,7 @@ mod tests {
       from: root,
       version: 0,
     };
-    let before = partition.to_snapshot(0);
-    for outsider in [stranger, familyless] {
-      let refused = run(&mut partition, &joined(repo, outsider, from_root));
-      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
-      let entry = crate::catalog::RepositoryEntry {
-        repository: repo,
-        joined: vec![MemberRecord {
-          repository: repo,
-          green: outsider,
-          origin: from_root,
-        }],
-        ..crate::catalog::RepositoryEntry::default()
-      };
-      let refused = run(&mut partition, &Op::RepositoryAdvanced { entry });
-      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
-    }
-    assert_eq!(partition.to_snapshot(0), before, "a refused join applied");
+    assert_outsiders_refused_both_ways(&mut partition, repo, [stranger, familyless], from_root);
     run(&mut partition, &joined(repo, successors, from_root)).unwrap();
     assert_eq!(
       (partition.family_counter(), partition.volume_counter()),
@@ -1665,6 +1897,33 @@ mod tests {
       (24, 41)
     );
     assert_eq!(answers(&rebuilt), answers(&partition));
+  }
+
+  /// Each of `outsiders` joining `repo` by a membership record and by an entry: both refused `NotFound`, nothing
+  /// applied.
+  fn assert_outsiders_refused_both_ways(
+    partition: &mut Partition,
+    repo: RepositoryId,
+    outsiders: [VolumeId; 2],
+    origin: MemberOrigin,
+  ) {
+    let before = partition.to_snapshot(0);
+    for outsider in outsiders {
+      let refused = run(partition, &joined(repo, outsider, origin));
+      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
+      let entry = crate::catalog::RepositoryEntry {
+        repository: repo,
+        joined: vec![MemberRecord {
+          repository: repo,
+          green: outsider,
+          origin,
+        }],
+        ..crate::catalog::RepositoryEntry::default()
+      };
+      let refused = run(partition, &Op::RepositoryAdvanced { entry });
+      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
+    }
+    assert_eq!(partition.to_snapshot(0), before, "a refused join applied");
   }
 
   fn joined(repo: RepositoryId, green: VolumeId, origin: MemberOrigin) -> Op {
@@ -1698,77 +1957,17 @@ mod tests {
       (plain, false),
       (foreign, true),
     ] {
-      run(
-        &mut partition,
-        &Op::VolumeCreated {
-          record: volume(id, green),
-        },
-      )
-      .unwrap();
+      create_volume(&mut partition, id, green);
     }
     let record = repository(9, "linux");
     let repo = record.id;
     run(&mut partition, &Op::RepositoryCreated { record }).unwrap();
-    let branch = |from: VolumeId, version: u64| MemberOrigin::Branch { from, version };
     run(&mut partition, &joined(repo, root, MemberOrigin::Root)).unwrap();
     run(&mut partition, &joined(repo, first, branch(root, 7))).unwrap();
     run(&mut partition, &joined(repo, second, branch(root, 3))).unwrap();
     run(&mut partition, &joined(repo, deep, branch(first, 1))).unwrap();
-    let refused = |partition: &mut Partition, op: &Op| run(partition, op).unwrap_err();
-    assert!(matches!(
-      refused(&mut partition, &joined(repo, plain, MemberOrigin::Root)),
-      DbError::NotGreen
-    ));
-    assert!(matches!(
-      refused(&mut partition, &joined(repo, root, branch(first, 0))),
-      DbError::AlreadyExists { .. }
-    ));
-    assert!(matches!(
-      refused(
-        &mut partition,
-        &joined(repository_id(HOME, 8), plain, MemberOrigin::Root)
-      ),
-      DbError::NotFound
-    ));
-    assert!(matches!(
-      refused(&mut partition, &joined(repo, foreign, MemberOrigin::Root)),
-      DbError::NotFound
-    ));
-    let other = repository(10, "other");
-    let other_repo = other.id;
-    run(&mut partition, &Op::RepositoryCreated { record: other }).unwrap();
-    let spare = volume_id(HOME, 7);
-    run(
-      &mut partition,
-      &Op::VolumeCreated {
-        record: volume(spare, true),
-      },
-    )
-    .unwrap();
-    assert!(matches!(
-      refused(&mut partition, &joined(other_repo, spare, branch(root, 0))),
-      DbError::NotFound
-    ));
-    run(
-      &mut partition,
-      &joined(other_repo, spare, MemberOrigin::Root),
-    )
-    .unwrap();
-    let late = volume_id(HOME, 11);
-    run(
-      &mut partition,
-      &Op::VolumeCreated {
-        record: volume(late, true),
-      },
-    )
-    .unwrap();
-    assert!(matches!(
-      refused(
-        &mut partition,
-        &joined(other_repo, late, MemberOrigin::Root)
-      ),
-      DbError::AlreadyExists { .. }
-    ));
+    assert_wrong_joins_refused(&mut partition, repo, [root, first, plain, foreign]);
+    assert_another_lineage_takes_one_root(&mut partition, root);
     assert_eq!(partition.repositories().branch_floor(root), Some(3));
     assert_eq!(partition.repositories().branch_floor(first), Some(1));
     assert_eq!(partition.repositories().branch_floor(second), None);
@@ -1780,21 +1979,110 @@ mod tests {
       .map(|member| member.green)
       .collect();
     assert_eq!(order, vec![root, first, second, deep]);
+    assert_destroys_wait_for_branches(&mut partition, repo, [root, first, second, deep]);
+    assert_disordered_members_are_corrupt(&partition, repo, [root, first]);
+  }
+
+  /// A member made from `from` at `version`.
+  fn branch(from: VolumeId, version: u64) -> MemberOrigin {
+    MemberOrigin::Branch { from, version }
+  }
+
+  /// The refusal `op` meets.
+  fn refused(partition: &mut Partition, op: &Op) -> DbError {
+    run(partition, op).unwrap_err()
+  }
+
+  /// Creates the volume `id`, a green or not.
+  fn create_volume(partition: &mut Partition, id: VolumeId, green: bool) {
+    run(
+      partition,
+      &Op::VolumeCreated {
+        record: volume(id, green),
+      },
+    )
+    .unwrap();
+  }
+
+  /// `repo`'s wrong joins: the plain volume `NotGreen`, the root joining twice `AlreadyExists`, an unknown repository
+  /// and the foreign green `NotFound`.
+  fn assert_wrong_joins_refused(
+    partition: &mut Partition,
+    repo: RepositoryId,
+    [root, first, plain, foreign]: [VolumeId; 4],
+  ) {
+    assert!(matches!(
+      refused(partition, &joined(repo, plain, MemberOrigin::Root)),
+      DbError::NotGreen
+    ));
+    assert!(matches!(
+      refused(partition, &joined(repo, root, branch(first, 0))),
+      DbError::AlreadyExists { .. }
+    ));
+    assert!(matches!(
+      refused(
+        partition,
+        &joined(repository_id(HOME, 8), plain, MemberOrigin::Root)
+      ),
+      DbError::NotFound
+    ));
+    assert!(matches!(
+      refused(partition, &joined(repo, foreign, MemberOrigin::Root)),
+      DbError::NotFound
+    ));
+  }
+
+  /// Another repository's lineage: a branch of the first lineage's `root` is `NotFound`; it takes a root of its own, and
+  /// a second root `AlreadyExists`.
+  fn assert_another_lineage_takes_one_root(partition: &mut Partition, root: VolumeId) {
+    let other = repository(10, "other");
+    let other_repo = other.id;
+    run(partition, &Op::RepositoryCreated { record: other }).unwrap();
+    let spare = volume_id(HOME, 7);
+    create_volume(partition, spare, true);
+    assert!(matches!(
+      refused(partition, &joined(other_repo, spare, branch(root, 0))),
+      DbError::NotFound
+    ));
+    run(partition, &joined(other_repo, spare, MemberOrigin::Root)).unwrap();
+    let late = volume_id(HOME, 11);
+    create_volume(partition, late, true);
+    assert!(matches!(
+      refused(partition, &joined(other_repo, late, MemberOrigin::Root)),
+      DbError::AlreadyExists { .. }
+    ));
+  }
+
+  /// Destroys: a green members were made from refuses `BranchedFrom` until they go, and the root's branch floor moves
+  /// as its branches go; at the end `repo` has no members.
+  fn assert_destroys_wait_for_branches(
+    partition: &mut Partition,
+    repo: RepositoryId,
+    [root, first, second, deep]: [VolumeId; 4],
+  ) {
     assert_eq!(
-      refused(&mut partition, &Op::VolumeDestroyed { id: root }),
+      refused(partition, &Op::VolumeDestroyed { id: root }),
       DbError::BranchedFrom { members: 2 }
     );
     assert_eq!(
-      refused(&mut partition, &Op::VolumeDestroyed { id: first }),
+      refused(partition, &Op::VolumeDestroyed { id: first }),
       DbError::BranchedFrom { members: 1 }
     );
-    run(&mut partition, &Op::VolumeDestroyed { id: deep }).unwrap();
-    run(&mut partition, &Op::VolumeDestroyed { id: first }).unwrap();
+    run(partition, &Op::VolumeDestroyed { id: deep }).unwrap();
+    run(partition, &Op::VolumeDestroyed { id: first }).unwrap();
     assert_eq!(partition.repositories().branch_floor(root), Some(3));
-    run(&mut partition, &Op::VolumeDestroyed { id: second }).unwrap();
+    run(partition, &Op::VolumeDestroyed { id: second }).unwrap();
     assert_eq!(partition.repositories().branch_floor(root), None);
-    run(&mut partition, &Op::VolumeDestroyed { id: root }).unwrap();
+    run(partition, &Op::VolumeDestroyed { id: root }).unwrap();
     assert_eq!(partition.repositories().members_of(repo).count(), 0);
+  }
+
+  /// A snapshot listing `first` before the `root` it was made from is refused `Corrupt`.
+  fn assert_disordered_members_are_corrupt(
+    partition: &Partition,
+    repo: RepositoryId,
+    [root, first]: [VolumeId; 2],
+  ) {
     let mut disordered = partition.to_snapshot(0);
     disordered.repository_members = vec![
       MemberRecord {
@@ -1895,8 +2183,11 @@ mod tests {
     greens: BTreeSet<u8>,
     /// Each lineage's members in the order they joined, by repository serial: each green serial with the member it was
     /// made from and the version, `None` for the root (A-575).
-    lineages: BTreeMap<u8, Vec<(u8, Option<(u8, u8)>)>>,
+    lineages: BTreeMap<u8, Vec<Member>>,
   }
+
+  /// A lineage's member: its green serial, with the member it was made from and the version, `None` for the root.
+  type Member = (u8, Option<(u8, u8)>);
 
   /// What the model answers: the refusal's kind, so the comparison is of rules, not of the existing ids named.
   #[derive(Debug, PartialEq, Eq)]
@@ -2259,6 +2550,51 @@ mod tests {
     assert_eq!(held(&replayed), Some(policy));
   }
 
+  /// Policy settings `repo` refuses: from the stale version 0 (naming version 1), a branch rule in a git repository and
+  /// a relative program (by kind and index), and a repository created already holding a policy (naming version 0).
+  fn assert_bad_policy_settings_refused(partition: &mut Partition, repo: RepositoryId) {
+    let stale = Op::RepositoryPolicySet {
+      repository: repo,
+      policy: rules_policy(1, Vec::new()),
+    };
+    assert_eq!(
+      run(partition, &stale),
+      Err(DbError::PolicyChanged { current: 1 })
+    );
+    let mut branches = ref_rule("main");
+    branches.names = crate::catalog::PolicyNames::Branches;
+    let wrong_kind = Op::RepositoryPolicySet {
+      repository: repo,
+      policy: rules_policy(2, vec![ref_rule("refs/tags/*"), branches]),
+    };
+    assert_eq!(
+      run(partition, &wrong_kind),
+      Err(DbError::PolicyRuleMalformed { index: 1 })
+    );
+    let mut relative = rules_policy(2, Vec::new());
+    relative.hooks.push(crate::catalog::HookConfig {
+      point: crate::catalog::HookPointName::GitUpdate,
+      name: "update".to_owned(),
+      program: "hooks/update".to_owned(),
+    });
+    assert_eq!(
+      run(
+        partition,
+        &Op::RepositoryPolicySet {
+          repository: repo,
+          policy: relative,
+        }
+      ),
+      Err(DbError::PolicyHookMalformed { index: 0 })
+    );
+    let mut holding = repository(10, "holding");
+    holding.policy = rules_policy(1, Vec::new());
+    assert_eq!(
+      run(partition, &Op::RepositoryCreated { record: holding }),
+      Err(DbError::PolicyChanged { current: 0 })
+    );
+  }
+
   /// A-622 (§4.17.1 "Policy"). Do: create a git repository; set its policy from version 0 with a rule and a hook; set
   /// it again from the stale version 0; set one holding a branch rule, which a git repository has not, and one running
   /// a relative program; create a repository already holding a policy; then rebuild the partition from its snapshot,
@@ -2303,46 +2639,7 @@ mod tests {
       names
     );
     let before = answers(&partition);
-    let stale = Op::RepositoryPolicySet {
-      repository: repo,
-      policy: rules_policy(1, Vec::new()),
-    };
-    assert_eq!(
-      run(&mut partition, &stale),
-      Err(DbError::PolicyChanged { current: 1 })
-    );
-    let mut branches = ref_rule("main");
-    branches.names = crate::catalog::PolicyNames::Branches;
-    let wrong_kind = Op::RepositoryPolicySet {
-      repository: repo,
-      policy: rules_policy(2, vec![ref_rule("refs/tags/*"), branches]),
-    };
-    assert_eq!(
-      run(&mut partition, &wrong_kind),
-      Err(DbError::PolicyRuleMalformed { index: 1 })
-    );
-    let mut relative = rules_policy(2, Vec::new());
-    relative.hooks.push(crate::catalog::HookConfig {
-      point: crate::catalog::HookPointName::GitUpdate,
-      name: "update".to_owned(),
-      program: "hooks/update".to_owned(),
-    });
-    assert_eq!(
-      run(
-        &mut partition,
-        &Op::RepositoryPolicySet {
-          repository: repo,
-          policy: relative,
-        }
-      ),
-      Err(DbError::PolicyHookMalformed { index: 0 })
-    );
-    let mut holding = repository(10, "holding");
-    holding.policy = rules_policy(1, Vec::new());
-    assert_eq!(
-      run(&mut partition, &Op::RepositoryCreated { record: holding }),
-      Err(DbError::PolicyChanged { current: 0 })
-    );
+    assert_bad_policy_settings_refused(&mut partition, repo);
     assert_eq!(
       answers(&partition),
       before,
@@ -2428,5 +2725,235 @@ mod tests {
     )
     .unwrap();
     run(&mut rebuilt, &crowded).expect("a destroyed repository gives its policy's bytes back");
+  }
+
+  /// One part of `repository`'s log `log` over `from..to`, of the operation `identity` that moved `spans` too.
+  fn part(
+    repository: RepositoryId,
+    (log, from, identity): (StateLog, u64, u8),
+    others: &[LogSpan],
+    changes: Vec<LoggedChange>,
+  ) -> StateLogRecord {
+    let to = from.saturating_add(u64::try_from(changes.len()).unwrap_or(u64::MAX));
+    let mut spans = vec![LogSpan {
+      log: LogName::State { repository, log },
+      from,
+      to,
+    }];
+    spans.extend_from_slice(others);
+    StateLogRecord {
+      repository,
+      log,
+      from,
+      to,
+      identity: [identity; 32],
+      spans,
+      changes,
+    }
+  }
+
+  /// A taken-over repository's parts: a root joined (1), a name bound with a lock taken (2, on two logs), a version
+  /// of the root pushed with a name bound (3, the root's log at 0..1), a name bound after it (4), a phase root added
+  /// with a marker the markers log never got (5), and a lock part past a gap (6).
+  fn taken_over_parts(repo: RepositoryId, root: VolumeId) -> Vec<StateLogRecord> {
+    let state = |log, from, to| LogSpan {
+      log: LogName::State {
+        repository: repo,
+        log,
+      },
+      from,
+      to,
+    };
+    let bind = |name: &str| LoggedChange::Named {
+      change: NameChange::Bind {
+        name: name.to_owned(),
+        green: root,
+      },
+    };
+    let root_log = LogSpan {
+      log: LogName::Green { green: root },
+      from: 0,
+      to: 1,
+    };
+    let lock = |path: &str| LoggedChange::Changed {
+      change: StateChange::LockTaken {
+        path: path.to_owned(),
+        lock: vec![1],
+      },
+    };
+    let member = MemberRecord {
+      repository: repo,
+      green: root,
+      origin: MemberOrigin::Root,
+    };
+    vec![
+      part(repo, (StateLog::Locks, 2, 6), &[], vec![lock("b")]),
+      part(
+        repo,
+        (StateLog::Names, 0, 1),
+        &[],
+        vec![LoggedChange::Joined { member }],
+      ),
+      part(
+        repo,
+        (StateLog::Names, 1, 2),
+        &[state(StateLog::Locks, 0, 1)],
+        vec![bind("main")],
+      ),
+      part(
+        repo,
+        (StateLog::Locks, 0, 2),
+        &[state(StateLog::Names, 1, 2)],
+        vec![lock("a")],
+      ),
+      part(
+        repo,
+        (StateLog::Names, 2, 3),
+        &[root_log],
+        vec![bind("dev")],
+      ),
+      part(repo, (StateLog::Names, 3, 4), &[], vec![bind("dev")]),
+      part(
+        repo,
+        (StateLog::Phases, 0, 5),
+        &[state(StateLog::Markers, 0, 1)],
+        vec![LoggedChange::Changed {
+          change: StateChange::PhaseRootAdded {
+            phase: 1,
+            node: vec![9],
+          },
+        }],
+      ),
+    ]
+  }
+
+  /// A-636 part 2c-2 (part 1's rule over the parts a successor adopted). Do: keep the parts of a taken-over repository
+  /// whose root's adopted head is 0, then 1. Expect: at head 0, the push of the root's version (3) is dropped with the
+  /// name bound after it (4), the phase root whose marker no log holds (5) is dropped, the lock past a gap (6) is never
+  /// kept, and the root's join (1) and the name bound with its lock (2, held whole on both its logs) are kept; at head
+  /// 1, the push and what follows it are kept too.
+  #[test]
+  fn a_successor_keeps_each_operation_whole_and_drops_what_a_log_lacks() {
+    let (repo, root) = (repository_id(HOME, 9), volume_id(HOME, 1));
+    let kept_of = |head: u64| {
+      let (kept, dropped) = whole_parts(taken_over_parts(repo, root), |_| head);
+      let kept: Vec<(StateLog, u8)> = kept
+        .iter()
+        .map(|part| (part.log, part.identity[0]))
+        .collect();
+      (
+        kept,
+        dropped
+          .iter()
+          .map(|identity| identity[0])
+          .collect::<Vec<u8>>(),
+      )
+    };
+    let whole = [
+      (StateLog::Names, 1),
+      (StateLog::Names, 2),
+      (StateLog::Locks, 2),
+    ];
+    assert_eq!(kept_of(0), (whole.to_vec(), vec![3, 5]));
+    let mut pushed = whole.to_vec();
+    pushed.splice(2..2, [(StateLog::Names, 3), (StateLog::Names, 4)]);
+    assert_eq!(kept_of(1), (pushed, vec![5]));
+  }
+
+  /// A-636 part 2c-2. Do: record a taken-over repository whole from the parts its successor kept, then again; then
+  /// a second repository from its kept parts with a gap, with a part of the first's, binding a stranger's green, and
+  /// binding the first's green, then from them as kept. Expect: the first's membership, binding and lock stand, each
+  /// log at its last part's position, and a snapshot rebuilds the same; recording it again is refused
+  /// `AlreadyExists`; each wrong set of parts is refused `Corrupt` with nothing applied, and the second's own parts
+  /// are recorded.
+  #[test]
+  fn a_rebuilt_repository_is_recorded_whole_as_its_logs_left_it() {
+    let mut partition = Partition::new(caps(), 0);
+    let mut record = repository(9, "linux");
+    record.default_branch = Some("main".to_owned());
+    let (repo, root) = (record.id, volume_id(HOME, 1));
+    let (parts, _) = whole_parts(taken_over_parts(repo, root), |_| 0);
+    let rebuilt = Op::RepositoryRebuilt {
+      record: record.clone(),
+      parts,
+    };
+    run(&mut partition, &rebuilt).unwrap();
+    assert_rebuilt(&partition, repo, root);
+    let again = run(&mut partition, &rebuilt);
+    assert!(
+      matches!(again, Err(DbError::AlreadyExists { .. })),
+      "{again:?}"
+    );
+    let restored = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
+    assert_eq!(answers(&restored), answers(&partition));
+    assert_rebuilt(&restored, repo, root);
+    let other = repository(10, "bsd");
+    let (own, _) = whole_parts(taken_over_parts(other.id, volume_id(HOME, 2)), |_| 0);
+    let before = partition.to_snapshot(0);
+    for (case, parts) in wrong_parts(&own, repo, root) {
+      let record = other.clone();
+      let refused = run(&mut partition, &Op::RepositoryRebuilt { record, parts });
+      assert!(
+        matches!(refused, Err(DbError::Corrupt { .. })),
+        "{case}: {refused:?}"
+      );
+    }
+    assert_eq!(
+      partition.to_snapshot(0),
+      before,
+      "a refused rebuild applied"
+    );
+    let record = other;
+    run(
+      &mut partition,
+      &Op::RepositoryRebuilt { record, parts: own },
+    )
+    .unwrap();
+  }
+
+  /// `own`, a repository's kept parts, made wrong: a gap at its start, a part of `repo`'s, a stranger's green bound,
+  /// and `repo`'s own green `held` bound.
+  fn wrong_parts(
+    own: &[StateLogRecord],
+    repo: RepositoryId,
+    held: VolumeId,
+  ) -> Vec<(&'static str, Vec<StateLogRecord>)> {
+    let bind = |green| {
+      vec![LoggedChange::Named {
+        change: NameChange::Bind {
+          name: "main".to_owned(),
+          green,
+        },
+      }]
+    };
+    let mut gapped = own.to_vec();
+    gapped.remove(0);
+    let mut misowned = own.to_vec();
+    misowned[0].repository = repo;
+    let mut stranger = own.to_vec();
+    stranger[1].changes = bind(family_and_strangers()[2]);
+    let mut taken = own.to_vec();
+    taken[1].changes = bind(held);
+    vec![
+      ("gapped", gapped),
+      ("misowned", misowned),
+      ("stranger", stranger),
+      ("taken", taken),
+    ]
+  }
+
+  /// What [`a_rebuilt_repository_is_recorded_whole_as_its_logs_left_it`] expects of a rebuilt repository.
+  fn assert_rebuilt(partition: &Partition, repo: RepositoryId, root: VolumeId) {
+    let repositories = partition.repositories();
+    assert_eq!(repositories.branch(repo, "main"), Some(root));
+    assert_eq!(
+      repositories.member(root).map(|member| member.repository),
+      Some(repo)
+    );
+    assert_eq!(repositories.lock_on(repo, "a"), Some(&[1u8][..]));
+    let positions: Vec<Option<u64>> = [StateLog::Names, StateLog::Phases, StateLog::Locks]
+      .map(|log| repositories.log_position(repo, log))
+      .to_vec();
+    assert_eq!(positions, vec![Some(2), Some(0), Some(1)]);
   }
 }

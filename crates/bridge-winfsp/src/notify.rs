@@ -777,7 +777,24 @@ mod tests {
     let mut names = OpenNames::searching(NameSearch::CaseInsensitive {
       upcase: ascii_upcase,
     });
-    let key = |path: &str| -> Vec<u16> { path.encode_utf16().map(ascii_upcase).collect() };
+    held_while_either_handle_holds_it(&mut names);
+    renamed_through_the_mount_and_moved(&mut names);
+    let mut exact = OpenNames::new();
+    exact.opened(1, 7, "\\Src\\a.txt");
+    assert_eq!(exact.spelled_at(&key("\\SRC")), None);
+    assert_eq!(
+      exact.spelled_at(&"\\Src".encode_utf16().collect::<Vec<_>>()),
+      None
+    );
+  }
+
+  /// The key a drive that searches without case looks `path` up by.
+  fn key(path: &str) -> Vec<u16> {
+    path.encode_utf16().map(ascii_upcase).collect()
+  }
+
+  /// Two handles hold `\Src\a.txt`: its spellings answer until the last closes; `\SRCS` never.
+  fn held_while_either_handle_holds_it(names: &mut OpenNames) {
     names.opened(1, 7, "\\Src\\a.txt");
     names.opened(2, 7, "\\Src\\a.txt");
     assert_eq!(names.spelled_at(&key("\\SRC")).as_deref(), Some("\\Src"));
@@ -790,6 +807,10 @@ mod tests {
     assert_eq!(names.spelled_at(&key("\\SRC")).as_deref(), Some("\\Src"));
     names.closed(2);
     assert_eq!(names.spelled_at(&key("\\SRC")), None);
+  }
+
+  /// Held again, renamed `\Src` to `\Lib` through the mount, then moved as the durable rename does.
+  fn renamed_through_the_mount_and_moved(names: &mut OpenNames) {
     names.opened(3, 7, "\\Src\\a.txt");
     names.renamed("\\Src", "\\Lib");
     assert_eq!(
@@ -800,12 +821,5 @@ mod tests {
     names.opened(3, 7, "\\Bin\\a.txt");
     assert_eq!(names.spelled_at(&key("\\LIB")), None);
     assert_eq!(names.spelled_at(&key("\\BIN")).as_deref(), Some("\\Bin"));
-    let mut exact = OpenNames::new();
-    exact.opened(1, 7, "\\Src\\a.txt");
-    assert_eq!(exact.spelled_at(&key("\\SRC")), None);
-    assert_eq!(
-      exact.spelled_at(&"\\Src".encode_utf16().collect::<Vec<_>>()),
-      None
-    );
   }
 }

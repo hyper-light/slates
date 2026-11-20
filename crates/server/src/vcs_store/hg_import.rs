@@ -223,7 +223,7 @@ pub(crate) fn room_of(state: &ShardState) -> u64 {
 
 /// Derived: the nanoseconds a turn may spend: the runtime's step quantum (§4.3), as the shard's other long work is cut,
 /// else the configuration's step budget off the runtime.
-fn quantum_of(state: &ShardState) -> u64 {
+pub(crate) fn quantum_of(state: &ShardState) -> u64 {
   slates_rt::futures::step_budget_ns().unwrap_or(state.config.runtime.step_budget_ns)
 }
 
@@ -423,7 +423,9 @@ fn place(
     return Err((ImportFailed::NotEmpty, index));
   }
   let empty = core::mem::replace(&mut store.index, index);
-  Ok(empty.release(content).is_ok())
+  let released = empty.release(content).is_ok();
+  stores.index_changed(id);
+  Ok(released)
 }
 
 /// Puts the index an import's entry carries in repository `id`'s store's place, between the register's guard and the

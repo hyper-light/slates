@@ -52,8 +52,11 @@
 //! token's record keeps (A-692, `crate::credentials::cram_md5_key`), the session's principal the token's, and a user no
 //! live token's record keys is answered as `svnserve` answers a user it has no password for. From there each call is
 //! handed the repository's sources, lent afresh on the owner, with the principal's access: write where the repository's
-//! policy lets it reach the repository at all, nothing where not (`vcs_policy::reaches`). A commit ends the connection
-//! until it is handed to the owner's step (GAPS, A-656).
+//! policy lets it reach the repository at all, nothing where not (`vcs_policy::reaches`). A commit's drive runs over
+//! those sources; a hook it waits for passes where the repository configures none at its point and is refused where one
+//! is (none runs yet); its accepted work lands through the owner's commit step (A-698's
+//! `repository::svn_commit::commit_work`, which the `svn+ssh://` tunnel calls too), and `close-edit` is answered with
+//! `commit-info` or the step's refusal.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -64,17 +67,22 @@ use slates_rt::futures::{cancel, detach, now_ns, spawn_child};
 use slates_rt::shard::Kept;
 use slates_rt::tcp::{OwnedStream, SocketAddrV4, TcpListener, TcpStream};
 use slates_rt::{RtError, Runtime, ShardId, TaskId, futures};
+use slates_svn::commit::drive::{Due, Work};
 use slates_svn::dump::Uuid;
 use slates_svn::find::{Found, find_repository};
 use slates_svn::handshake::Verdict;
 use slates_svn::handshake::{Access, Unserved};
 use slates_svn::index::{ContentIdentity, Revision};
+use slates_svn::lock::AprTime;
+use slates_svn::migration::Repository as SvnRecords;
 use slates_svn::report::exchange::Budget;
-use slates_svn::serve::{Connection, Limits, Policy, Sources, Turn};
+use slates_svn::serve::{CommitStart, Connection, Limits, Made, Policy, Sources, Turn};
 
 use slates_vfs::clock::Clock;
 
 use crate::config::DaemonConfig;
+use crate::repository::svn_commit;
+use crate::vcs_hooks::HookPoint;
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
 use crate::vcs_store::svn_view::lend_in;
@@ -152,6 +160,25 @@ const CHALLENGE_HOST: &std::ffi::CStr = c"slates";
 
 /// Format: nanoseconds in a microsecond, the unit of the challenge's time (`apr_time_now`).
 const NANOS_PER_MICRO: i64 = 1_000;
+
+/// Counter: a lock verb's entries the owner's step refused, answered in each judged path's place.
+const LOCKS_REFUSED: &str = "vcs_svn.locks_refused";
+
+/// Counter: a lock verb whose new token the system's generator could not draw: its landing refused.
+const TOKEN_UNDRAWN: &str = "vcs_svn.token_undrawn";
+
+/// Format: `SVN_ERR_FS_LOCK_OPERATION_FAILED` (`svn_error_codes.h`: the filesystem category's start, 160,000, plus 59).
+const LOCK_OPERATION_FAILED: u32 = 160_059;
+
+/// Counter: an accepted work the owner's commit step refused, answered as `close-edit`'s failure.
+const COMMIT_REFUSED: &str = "vcs_svn.commit_refused";
+
+/// Format: `SVN_ERR_UNSUPPORTED_FEATURE`, the miscellaneous category's start (200,000) plus 7 (`svn_error_codes.h`).
+const UNSUPPORTED_FEATURE: u32 = 200_007;
+
+/// The words a commit is refused with at a point where the repository configures a hook, which the listener does not
+/// run yet, as the `svn+ssh://` tunnel refuses it.
+const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
 
 /// Counter: a CRAM-MD5 response naming no key a token's record holds: answered as `svnserve` answers a user it has
 /// no password for.
@@ -621,6 +648,24 @@ enum Next {
     /// The bytes the response took.
     consumed: usize,
   },
+  /// The client asked for a commit, its first `consumed` bytes: begin it over the repository's sources.
+  CommitAsked(usize),
+  /// The commit's drive waits for `due`'s hook, its first `consumed` bytes taken.
+  Hook {
+    /// The hook.
+    due: Due,
+    /// The bytes taken.
+    consumed: usize,
+  },
+  /// The client asked for a lock verb, its first `consumed` bytes: judge it, land its entries, answer it.
+  LockAsked(usize),
+  /// The commit's drive accepted `work` at `close-edit`, its first `consumed` bytes taken: land it.
+  Accepted {
+    /// The work.
+    work: Box<Work>,
+    /// The bytes taken.
+    consumed: usize,
+  },
   /// End the connection.
   End,
 }
@@ -639,6 +684,8 @@ struct Conversation {
   opened: Option<Opened>,
   /// The principal the client's token proved, once it authenticated.
   principal: Option<Principal>,
+  /// The commits the connection began, which name their transactions.
+  commits: u64,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -676,6 +723,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     deadline_ns: now_ns().saturating_add(bound_ns),
     opened: None,
     principal: None,
+    commits: 0,
   };
   go_on(stream, conversation, seat).await;
 }
@@ -746,6 +794,34 @@ async fn step(
         .drain(..consumed.min(conversation.input.len()));
       keyed(stream, conversation, &user, out).await
     }
+    Next::CommitAsked(consumed) => {
+      conversation
+        .input
+        .drain(..consumed.min(conversation.input.len()));
+      let begun = begin_commit(conversation, out);
+      written(stream, begun, out).await
+    }
+    Next::LockAsked(consumed) => {
+      conversation
+        .input
+        .drain(..consumed.min(conversation.input.len()));
+      let answered = lock(conversation, out);
+      written(stream, answered, out).await
+    }
+    Next::Hook { due, consumed } => {
+      conversation
+        .input
+        .drain(..consumed.min(conversation.input.len()));
+      let answered = answer_hook(conversation, &due, out);
+      written(stream, answered, out).await
+    }
+    Next::Accepted { work, consumed } => {
+      conversation
+        .input
+        .drain(..consumed.min(conversation.input.len()));
+      let landed = land(conversation, *work, out);
+      written(stream, landed, out).await
+    }
     Next::Locate { found, consumed } => {
       conversation
         .input
@@ -786,10 +862,27 @@ fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
     let turn = connection.receive(None::<&Sources<'_, Unresolved>>, input, out, budget);
     return next_of(connection, turn, out);
   };
-  let lent = crate::state::with_state(|state| {
+  let lent = lent_sources(opened, principal, |sources| {
+    let turn = connection.receive(Some(sources), input, out, budget);
+    next_of(connection, turn, out)
+  });
+  lent.unwrap_or_else(|| {
+    crate::fleet::count_refusal(STORE_MISSING);
+    Next::End
+  })
+}
+
+/// Runs `step` over the sources of the repository `opened` names, lent afresh on its owner ([`lend_in`]) with
+/// `principal`'s access; none when the shard holds its records no longer.
+fn lent_sources<T>(
+  opened: &Opened,
+  principal: &Principal,
+  step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
+) -> Option<T> {
+  crate::state::with_state(|state| {
     let authenticated = authenticated_access(state, &opened.name, principal);
     lend_in(state, opened.id, |lent| {
-      let sources = Sources {
+      step(&Sources {
         index: lent.index,
         repository: lent.repository,
         locks: lent.locks,
@@ -800,15 +893,10 @@ fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
           authz: None,
           filesystem: &opened.name,
         },
-      };
-      let turn = connection.receive(Some(&sources), input, out, budget);
-      next_of(connection, turn, out)
+      })
     })
-  });
-  lent.flatten().unwrap_or_else(|| {
-    crate::fleet::count_refusal(STORE_MISSING);
-    Next::End
   })
+  .flatten()
 }
 
 /// What an authenticated `principal` may do in repository `name` (`svnserve`'s `auth-access`): write where the
@@ -863,15 +951,200 @@ fn next_of(
       user: user.to_vec(),
       consumed,
     },
-    Ok(_) | Err(_) => Next::End,
+    Ok(Turn::CommitAsked { consumed }) => Next::CommitAsked(consumed),
+    Ok(Turn::LockAsked { consumed }) => Next::LockAsked(consumed),
+    Ok(Turn::Hook { due, consumed }) => Next::Hook { due, consumed },
+    Ok(Turn::Accepted { work, consumed }) => Next::Accepted { work, consumed },
+    Err(_) => Next::End,
   }
+}
+
+/// Writes `out` to `stream` after a step that `went` on or not: whether the conversation goes on.
+async fn written(stream: &TcpStream, went: bool, out: &[u8]) -> Stepped {
+  if !went || (!out.is_empty() && stream.write_all(out).await.is_err()) {
+    return Stepped::End;
+  }
+  Stepped::Go
+}
+
+/// Begins the commit the client asked for over the repository's sources, its transaction named as the `svn+ssh://`
+/// tunnel names it (the connection's commits counted on the youngest revision), its new content bounded by one item's
+/// room: whether the conversation goes on, the answer in `out`.
+fn begin_commit(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
+  conversation.commits = conversation.commits.saturating_add(1);
+  let (commits, room) = (conversation.commits, conversation.limits.item_bytes);
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return false;
+  };
+  let begun = lent_sources(opened, principal, |sources| {
+    let start = CommitStart {
+      transaction: crate::vcs_ssh::svn::transaction_name(sources.index.youngest(), commits),
+      now: sources.now,
+      room,
+    };
+    connection.commit(start, sources, out)
+  });
+  matches!(begun, Some(Ok(())))
+}
+
+/// Judges the lock verb the client asked for over the repository's sources on its owner, lands the lock entries it
+/// makes through the owner's step (a `Record::Locks`, durable as a revision is; `repository::svn_commit::record`), and
+/// answers it (A-693 part 2; `slates_svn::serve` `locks`): whether the conversation goes on, the answer in `out`. Each
+/// new token is drawn from the system's generator; one it cannot give refuses the landing. The table holds at most as
+/// many locks as one item has bytes.
+fn lock(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
+  let room = conversation.limits.item_bytes;
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return false;
+  };
+  let undrawn = Cell::new(false);
+  let mut draw = || {
+    let mut token = [0u8; slates_svn::lock::UUID_BYTES];
+    if aws_lc_rs::rand::fill(&mut token).is_err() {
+      undrawn.set(true);
+    }
+    token
+  };
+  let judged = lent_sources(opened, principal, |sources| {
+    connection.lock_verb(sources, &mut draw, room, out)
+  });
+  let entries = match judged {
+    Some(Ok(Some(entries))) => entries,
+    Some(Ok(None)) => return true,
+    Some(Err(_)) | None => return false,
+  };
+  let landed = if undrawn.get() {
+    crate::fleet::count_refusal(TOKEN_UNDRAWN);
+    Err((
+      LOCK_OPERATION_FAILED,
+      "No lock token could be drawn".to_owned(),
+    ))
+  } else if entries.is_empty() {
+    Ok(())
+  } else {
+    let id = opened.id;
+    crate::state::with_state(|state| {
+      svn_commit::record(
+        state,
+        (principal, id),
+        slates_svn::commit::record::Record::Locks(entries),
+      )
+    })
+    .unwrap_or(Err(svn_commit::Uncommitted::NotHeld))
+    .map_err(|refused| {
+      crate::fleet::count_refusal(LOCKS_REFUSED);
+      refused.failure()
+    })
+  };
+  connection.locks_landed(landed, out).is_ok()
+}
+
+/// Answers the hook the commit's drive waits for, as the `svn+ssh://` tunnel answers it: passed where the repository's
+/// policy configures none at its point, as `svnserve` answers a point with no hook; refused where one is, since the
+/// listener runs no hook yet and none is ever skipped. A drive the answer lets accept its work lands it ([`land`]).
+fn answer_hook(conversation: &mut Conversation, due: &Due, out: &mut Vec<u8>) -> bool {
+  let point = match due {
+    Due::StartCommit { .. } => HookPoint::SvnStartCommit,
+    Due::PreCommit { .. } => HookPoint::SvnPreCommit,
+  };
+  let Some(opened) = conversation.opened.as_ref() else {
+    return false;
+  };
+  let configured = crate::state::with_state(|state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&opened.name)
+      .is_some_and(|record| {
+        record
+          .policy
+          .hooks
+          .iter()
+          .any(|hook| HookPoint::of(hook.point) == point)
+      })
+  })
+  .unwrap_or(true);
+  let answer = if configured {
+    Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
+  } else {
+    Ok(())
+  };
+  let Conversation {
+    connection,
+    opened,
+    principal,
+    ..
+  } = &mut *conversation;
+  let (Some(opened), Some(principal)) = (opened.as_ref(), principal.as_ref()) else {
+    return false;
+  };
+  let answered = lent_sources(opened, principal, |sources| {
+    connection.answer_hook(answer, sources, out)
+  });
+  match answered {
+    Some(Ok(Turn::Accepted { work, .. })) => land(conversation, *work, out),
+    Some(Ok(_)) => true,
+    Some(Err(_)) | None => false,
+  }
+}
+
+/// Lands the accepted `work` through the owner's commit step (A-698's `repository::svn_commit::commit_work`, which the
+/// `svn+ssh://` tunnel calls too, at the owner's instant) and answers `close-edit` with `commit-info` or with the
+/// step's refusal as its failure: whether the conversation goes on, the answer in `out`.
+fn land(conversation: &mut Conversation, work: Work, out: &mut Vec<u8>) -> bool {
+  let (Some(opened), Some(principal)) = (
+    conversation.opened.as_ref(),
+    conversation.principal.as_ref(),
+  ) else {
+    return false;
+  };
+  let id = opened.id;
+  let landed = crate::state::with_state(|state| {
+    let now = AprTime::from_wall_ns(state.clock.wall_ns());
+    svn_commit::commit_work(state, (principal, id), work, now)
+  });
+  let Some(landed) = landed else {
+    return false;
+  };
+  let answered = match &landed {
+    // A client's work always carries the date the step gave it (`Revision::of_work`).
+    Ok(committed) => conversation.connection.committed(
+      &Made {
+        revision: committed.revision,
+        date: committed.date.as_deref().unwrap_or_default(),
+        author: committed.author.as_deref(),
+        post_commit_error: None,
+      },
+      out,
+    ),
+    Err(refused) => {
+      crate::fleet::count_refusal(COMMIT_REFUSED);
+      conversation
+        .connection
+        .not_committed(&refused.answered(), out)
+    }
+  };
+  answered.is_ok()
 }
 
 /// Challenges the client's CRAM-MD5 (`cram.c` `make_nonce`): a random number, the owner's wall clock in microseconds
 /// and [`CHALLENGE_HOST`], the challenge written to `stream`.
 async fn challenge(stream: &TcpStream, connection: &mut Connection, out: &mut Vec<u8>) -> Stepped {
   out.clear();
-  let mut nonce = [0u8; 8];
+  let mut nonce = [0u8; size_of::<u64>()];
   let micros = crate::state::with_state(|state| state.clock.wall_ns() / NANOS_PER_MICRO);
   let (Ok(()), Some(micros)) = (aws_lc_rs::rand::fill(&mut nonce), micros) else {
     return Stepped::End;

@@ -4,7 +4,8 @@
 //!
 //! The oracle is stock `svnserve -t` 1.15.0, two ways. A commit: the recorded `mkdir` connection
 //! (`crates/svn/fixtures/commit/`, made through `svnserve -t` by its `make-fixtures.py`, each file's SHA-256 in its
-//! `SHA256SUMS`). And scripted sessions, recorded on the Mac Studio (macOS arm64, Homebrew's `svnserve` 1.15.0) at
+//! `SHA256SUMS`), whose every byte the tunnel writes but the user `commit-info` names, its work landed as the owner's
+//! step lands one (A-698). And scripted sessions, recorded on the Mac Studio (macOS arm64, Homebrew's `svnserve` 1.15.0) at
 //! 2026-11-19T22:27:07Z and 22:33:56Z: each client's bytes piped to `svnserve -t --tunnel-user=alice -r ROOT`, ROOT
 //! holding `repo` (`svnadmin create`, `svnadmin setuuid` to [`UUID`], `svnserve.conf` `anon-access = none` and
 //! `auth-access = write`) and `closed` (the same with `auth-access = none`), its standard output, its standard error
@@ -23,7 +24,8 @@ use slates_db::catalog::{
 use slates_ssh::command::Command as Asked;
 use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 use slates_svn::authz;
-use slates_svn::commit::drive::Green;
+use slates_svn::commit::drive::{Green, Work};
+use slates_svn::commit::revision::Revision as RevisionToCommit;
 use slates_svn::dump::Uuid;
 use slates_svn::index::{ContentIdentity, Revision};
 use slates_svn::lock::AprTime;
@@ -38,6 +40,7 @@ use super::super::site::{
   Command, Dispatched, GIT_DIE_STATUS, Next, NotYet, Refused, SshSite, ToolSite,
 };
 use super::{EitherCommand, Opening, SvnServices, SvnStores, TunnelBounds};
+use crate::repository::svn_commit::{Committed, Uncommitted as Unlanded};
 use crate::vcs_http::git::{Located, Repositories};
 
 /// Format: the UUID of the recordings' repository (`make-fixtures.py` `UUID`; the scripted sessions' `setuuid`).
@@ -99,10 +102,15 @@ const MKDIR_SERVER: &[u8] = include_bytes!("../../../../svn/fixtures/commit/mkdi
 const COMMIT_STARTED: usize = 6;
 /// How a client ends the edit it gave up (`editorp.c` 1205).
 const ABORT_EDIT: &[u8] = b"( abort-edit ( ) ) ";
-/// The failure the tunnel answers `close-edit` with until it calls the owner's commit step (slates-svn's
-/// `Uncommitted::NotServed`, 200007).
-const NOT_COMMITTED: &[u8] =
-  b"( failure ( ( 200007 37:This server does not make commits yet 0: 0 ) ) ) ";
+/// The failure `close-edit` is answered with where the owner's step finds no room (`Uncommitted::answered`'s words for
+/// a budget of 0 bytes, `SVN_ERR_FS_GENERAL`).
+const NO_ROOM: &[u8] =
+  b"( failure ( ( 160000 41:No room for the commit: 0 bytes available 0: 0 ) ) ) ";
+/// Shape: the instant stock `svnserve -t` recorded the `mkdir` commit at (its `commit-info`'s date,
+/// 2026-11-19T05:05:32.129962Z): the instant the tests' lender lends and lands at.
+const NOW: AprTime = AprTime(1_795_064_732_129_962);
+/// The `svn:author` stock `svnserve -t` recorded the `mkdir` commit by, as `commit-info` writes it: its tunnel's user.
+const RECORDED_AUTHOR: &[u8] = b"( 5:alice )";
 
 /// The capabilities the scripted clients name, a stock 1.15.0 client's.
 const CAPABILITIES: &str =
@@ -350,16 +358,10 @@ impl Repositories for Held {
   }
 }
 
-/// A Subversion repository as `CreateRepository` leaves one (A-575): the owner's records at revision 0, read as the
-/// connection reads a green, with the count of its lends.
-struct Created {
-  /// The records.
-  records: Records,
-  /// How many times its sources were lent.
-  lends: Cell<u64>,
-}
+/// A Subversion repository's records as the connection reads a green: one version of them, kept for the test's life.
+struct View(&'static Records);
 
-impl Contents for Created {
+impl Contents for View {
   fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
     (directory == "/" && revision == 0).then(Vec::new)
   }
@@ -369,9 +371,9 @@ impl Contents for Created {
   }
 }
 
-impl reads::Repository for Created {
+impl reads::Repository for View {
   fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
-    let properties = self.records.revision_properties(revision)?;
+    let properties = self.0.revision_properties(revision)?;
     Some(
       properties
         .iter()
@@ -381,31 +383,40 @@ impl reads::Repository for Created {
   }
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
-    Green::properties(&self.records, identity)
+    Green::properties(self.0, identity)
   }
 
   fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
-    let text = self.records.content(identity)?;
+    let text = self.0.content(identity)?;
     text.get(usize::try_from(offset).ok()?..)
   }
 }
 
-impl Green for Created {
+impl Green for View {
   fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
-    Green::text(&self.records, identity)
+    Green::text(self.0, identity)
   }
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
-    Green::properties(&self.records, identity)
+    Green::properties(self.0, identity)
   }
 
   fn name_text(&self, text: &[u8]) -> ContentIdentity {
-    Green::name_text(&self.records, text)
+    Green::name_text(self.0, text)
   }
 
   fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
-    Green::name_properties(&self.records, properties)
+    Green::name_properties(self.0, properties)
   }
+}
+
+/// A Subversion repository as `CreateRepository` leaves one (A-575), the owner's records, and what its lender did:
+/// each version of the records kept for the test's life, the current one lent, a landed work making the next.
+struct Created {
+  /// The records lent now.
+  current: Cell<&'static Records>,
+  /// How many works were landed or refused.
+  commits: Cell<u64>,
 }
 
 /// What the recordings' repository's sessions open with (`anon-access = none`, `auth-access = write`): its UUID its
@@ -428,11 +439,14 @@ const POLICY: Policy<'static> = Policy {
   filesystem: REPOSITORY,
 };
 
-/// Lends the store of [`REPOSITORY`] alone: an empty repository's, at the epoch.
+/// Lends the store of [`REPOSITORY`] alone, at [`NOW`], and lands a work as the owner's step does on its records
+/// (`Repository::check_work` with the commit's locks, then `apply`), or refuses every work for want of room.
 #[derive(Clone, Copy)]
 struct Lends {
   /// The repository, kept for the test's life.
   created: &'static Created,
+  /// Whether every work is refused for want of room.
+  full: bool,
 }
 
 impl Lends {
@@ -442,15 +456,42 @@ impl Lends {
     let records = Records::new(uuid, CREATED, RECORDS_ROOM).expect("revision 0's records");
     Lends {
       created: Box::leak(Box::new(Created {
-        records,
-        lends: Cell::new(0),
+        current: Cell::new(Box::leak(Box::new(records))),
+        commits: Cell::new(0),
       })),
+      full: false,
     }
+  }
+
+  /// The records' youngest revision now.
+  fn youngest(self) -> Revision {
+    self.created.current.get().youngest()
   }
 }
 
+/// `work` landed on the next version of `records` at `now`, as the owner's step checks and applies it.
+fn landed(records: &Records, work: Work, now: AprTime) -> Result<(Records, Committed), Unlanded> {
+  let locks = work.locks.clone();
+  let revision = RevisionToCommit::of_work(work, now).map_err(Unlanded::Step)?;
+  let (date, author) = (
+    revision.date().map(str::to_owned),
+    revision.author().map(str::to_owned),
+  );
+  let mut next = records.clone();
+  let checked = next
+    .check_work(revision, &locks, now)
+    .map_err(Unlanded::Step)?;
+  let number = next.apply(checked).map_err(Unlanded::Step)?;
+  let committed = Committed {
+    revision: number,
+    date,
+    author,
+  };
+  Ok((next, committed))
+}
+
 impl SvnStores for Lends {
-  type Green = Created;
+  type Green = View;
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HELD
@@ -460,21 +501,57 @@ impl SvnStores for Lends {
     self.holds(id).then(|| step(&OPENING))
   }
 
-  fn lend<T>(
+  fn commit(
     &mut self,
     id: RepositoryId,
-    step: impl FnOnce(&Sources<'_, Created>) -> T,
-  ) -> Option<T> {
+    _principal: &Principal,
+    work: Work,
+  ) -> Option<Result<Committed, Unlanded>> {
     if !self.holds(id) {
       return None;
     }
     let created = self.created;
-    created.lends.set(created.lends.get() + 1);
+    created.commits.set(created.commits.get() + 1);
+    if self.full {
+      return Some(Err(Unlanded::Budget { available: 0 }));
+    }
+    Some(
+      landed(created.current.get(), work, NOW).map(|(next, committed)| {
+        created.current.set(Box::leak(Box::new(next)));
+        committed
+      }),
+    )
+  }
+
+  fn land_locks(
+    &mut self,
+    id: RepositoryId,
+    _principal: &Principal,
+    entries: Vec<slates_svn::lock::LockEntry>,
+  ) -> Option<Result<(), Unlanded>> {
+    if !self.holds(id) {
+      return None;
+    }
+    let mut next = self.created.current.get().clone();
+    Some(match next.apply_lock_entries(&entries) {
+      Ok(()) => {
+        self.created.current.set(Box::leak(Box::new(next)));
+        Ok(())
+      }
+      Err(refusal) => Err(Unlanded::Step(refusal)),
+    })
+  }
+
+  fn lend<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Sources<'_, View>) -> T) -> Option<T> {
+    if !self.holds(id) {
+      return None;
+    }
+    let records = self.created.current.get();
     Some(step(&Sources {
-      index: created.records.index(),
-      repository: created,
-      locks: created.records.locks(),
-      now: AprTime(0),
+      index: records.index(),
+      repository: &View(records),
+      locks: records.locks(),
+      now: NOW,
       policy: POLICY,
     }))
   }
@@ -483,13 +560,18 @@ impl SvnStores for Lends {
 /// The SSH site with Subversion's tunnel beside services that serve nothing yet.
 type TunnelSite<K> = ToolSite<K, Held, SvnServices<NotYet, Held, Lends>>;
 
-/// The site with Subversion's tunnel over [`Held`]'s repositories and a fresh [`Lends`], `keys` its lookup and
-/// `owner` the repositories' owner, every other service not served; and the lender, to read its count.
-fn site<K>(keys: K, owner: Principal) -> (TunnelSite<K>, Lends) {
+/// The site with Subversion's tunnel over [`Held`]'s repositories and `lends`, `keys` its lookup and `owner` the
+/// repositories' owner, every other service not served.
+fn site_over<K>(keys: K, owner: Principal, lends: Lends) -> TunnelSite<K> {
   let held = Held { owner };
-  let lends = Lends::created();
   let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
-  (ToolSite::new(keys, held, services), lends)
+  ToolSite::new(keys, held, services)
+}
+
+/// [`site_over`] a fresh repository; and its lender, to read what it did.
+fn site<K>(keys: K, owner: Principal) -> (TunnelSite<K>, Lends) {
+  let lends = Lends::created();
+  (site_over(keys, owner, lends), lends)
 }
 
 /// The site the edge's tests serve a tunnel through: [`site`]'s, its key holders `keys`, which the edge sends with a
@@ -701,24 +783,52 @@ fn the_scripted_sessions_are_the_recorded_ones() {
   assert_eq!(written, expected);
 }
 
-/// A-688 (§4.17.4 "svn+ssh"; A-656's commit; A-655 part 2b owed). Do: as the repository's owner, dispatch `svnserve -t`
-/// through the site and hand its tunnel the recorded `mkdir` connection's client bytes, split inside an item, then
-/// `abort-edit`, as a client ends the edit it gave up, then end the input. Expect: stock `svnserve -t`'s bytes item for
-/// item through the commit's start (the greeting less `svndiff1`, the `EXTERNAL` request and its success, `repos-info`,
-/// the commit's trivial auth request and its success), then `close-edit` refused 200007, as the tunnel refuses every
-/// work until it calls the owner's commit step; nothing on standard error and exit 0, as `svnserve -t` ends a session
-/// left between commands; every byte consumed; and the repository's store lent.
+/// `bytes` with the first `from` in them made `to`.
+fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+  match bytes.windows(from.len()).position(|window| window == from) {
+    Some(at) => [&bytes[..at], to, &bytes[at + from.len()..]].concat(),
+    None => bytes.to_vec(),
+  }
+}
+
+/// A-698 (A-655 part 2b's owner step behind A-656's connection; §4.17.4 items 3.2 to 3.5). Do: as the repository's
+/// owner, dispatch `svnserve -t` through the site and hand its tunnel the recorded `mkdir` connection's client bytes,
+/// split inside an item, then end the input. Expect: stock `svnserve -t`'s every byte, its greeting less `svndiff1`
+/// and its `commit-info` naming the tunnel's user, the principal the key proved, where the recording named `alice`:
+/// revision 1, dated as the step landed it; nothing on standard error and exit 0, as `svnserve -t` ended it; every
+/// byte consumed; the work landed once and the repository at revision 1.
 #[test]
-fn a_stock_commit_is_answered_as_svnserve_t_answers_it_until_the_owners_step() {
+fn a_stock_commit_lands_through_the_owners_step_as_svnserve_t_answered_it() {
   let (mut site, lends) = site(NoKeys, principal(OWNER));
   let (head, tail) = MKDIR_CLIENT.split_at(SPLIT);
-  let ended = tunnel(&mut site, &principal(OWNER), &[head, tail, ABORT_EDIT]);
+  let ended = tunnel(&mut site, &principal(OWNER), &[head, tail]);
+  let named = crate::lfs::owner_name(&principal(OWNER));
+  let author = format!("( {}:{named} )", named.len());
+  let stock = replaced(MKDIR_SERVER, RECORDED_AUTHOR, author.as_bytes());
+  let answered = Answered::of(&as_slates_writes(&stock), "", 0);
+  assert_eq!(ended, (answered, MKDIR_CLIENT.len()));
+  assert_eq!((lends.created.commits.get(), lends.youngest()), (1, 1));
+}
+
+/// A-698 (the step's refusal as `close-edit`'s failure; `editorp.c` 1149-1208). Do: through a lender whose step finds
+/// no room, hand the tunnel the recorded `mkdir` connection's client bytes, then `abort-edit`, as a client ends the
+/// edit it gave up, then end the input. Expect: stock `svnserve -t`'s bytes item for item through the commit's start,
+/// then `close-edit` refused in the step's words (160000, no room); nothing on standard error and exit 0; every byte
+/// consumed; the work refused once and the repository still at revision 0.
+#[test]
+fn a_work_the_owners_step_refuses_is_answered_as_close_edits_failure() {
+  let lends = Lends {
+    full: true,
+    ..Lends::created()
+  };
+  let mut site = site_over(NoKeys, principal(OWNER), lends);
+  let ended = tunnel(&mut site, &principal(OWNER), &[MKDIR_CLIENT, ABORT_EDIT]);
   let stock = items(MKDIR_SERVER);
   let started = as_slates_writes(&stock[..COMMIT_STARTED].concat());
   let consumed = MKDIR_CLIENT.len() + ABORT_EDIT.len();
-  let answered = Answered::of(&[started, NOT_COMMITTED.to_vec()].concat(), "", 0);
+  let answered = Answered::of(&[started, NO_ROOM.to_vec()].concat(), "", 0);
   assert_eq!(ended, (answered, consumed));
-  assert!(lends.created.lends.get() > 0);
+  assert_eq!((lends.created.commits.get(), lends.youngest()), (1, 0));
 }
 
 /// A-688 (`find_repos`: the repository is the longest run of the URL's leading segments that names one). Do: run the
@@ -885,4 +995,124 @@ fn the_tunnel_is_served_beside_the_other_services() {
     })
   );
   assert!(matches!(ran, Dispatched::Run(EitherCommand::Tunnel(_))));
+}
+
+/// Shape: the room the daemon's site is built with here: past anything the recorded session holds.
+const DAEMON_ROOM: u64 = 1 << 20;
+
+/// `bytes` with each `from` replaced by `to`.
+fn replaced_all(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+  let mut out = Vec::new();
+  let mut rest = bytes;
+  while let Some(at) = rest.windows(from.len()).position(|window| window == from) {
+    out.extend_from_slice(&rest[..at]);
+    out.extend_from_slice(to);
+    rest = &rest[at + from.len()..];
+  }
+  out.extend_from_slice(rest);
+  out
+}
+
+/// `commit-info`'s 27-byte date in `bytes` (after `( 1 ( 27:`) replaced by `date`.
+fn dated(bytes: &[u8], date: &[u8]) -> Vec<u8> {
+  let mark = b"( 1 ( 27:";
+  match bytes.windows(mark.len()).position(|window| window == mark) {
+    Some(at) => {
+      let start = at + mark.len();
+      [
+        &bytes[..start],
+        date,
+        &bytes[(start + 27).min(bytes.len())..],
+      ]
+      .concat()
+    }
+    None => bytes.to_vec(),
+  }
+}
+
+/// The 36-byte UUID the realm names in a tunnel's output (`( EXTERNAL ) 36:`).
+fn realm_of(bytes: &[u8]) -> Vec<u8> {
+  let mark = b"( EXTERNAL ) 36:";
+  bytes
+    .windows(mark.len())
+    .position(|window| window == mark)
+    .and_then(|at| bytes.get(at + mark.len()..at + mark.len() + 36))
+    .unwrap_or_default()
+    .to_vec()
+}
+
+/// A-688 in the daemon (§4.17.4 piece 7; the tunnel's lender over A-662's map, A-698's step). Do: on a daemon's shard,
+/// create the Subversion repository the recorded `mkdir` session names as its owner; then, from a task there, dispatch
+/// `svnserve -t` through the daemon's SSH site (its services over its lenders) and hand it stock `svn` 1.15.0's
+/// recorded `mkdir` connection. Expect: stock `svnserve -t`'s every byte, its greeting less `svndiff1`, the
+/// repository's own UUID where the recording named its own, and `commit-info` naming the owner and the step's date:
+/// revision 1; nothing on standard error and exit 0; every byte consumed; the repository's records at revision 1.
+/// Before this the daemon's site refused `svnserve -t` as not served.
+#[test]
+fn the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit() {
+  let daemon = crate::daemon::audit_daemon();
+  let id = crate::daemon::observe_first(&daemon, |state| {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &principal(OWNER),
+      slates_ipc::protocol::RequestBody::CreateRepository {
+        name: REPOSITORY.to_owned(),
+        tool: slates_ipc::protocol::VcsTool::Subversion,
+        format: slates_ipc::protocol::ObjectFormat::Sha1,
+        default_branch: "trunk".to_owned(),
+        green: None,
+      },
+    );
+    assert!(
+      !matches!(created, slates_ipc::protocol::ReplyBody::Refused { .. }),
+      "{created:?}"
+    );
+    let record = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(REPOSITORY)
+      .cloned();
+    record.expect("the repository").id
+  });
+  let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+      let _ = sent.send(tunnel(&mut site, &principal(OWNER), &[MKDIR_CLIENT]));
+    })
+    .expect("the tunnel's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (answered, consumed) = outcome
+    .recv_timeout(std::time::Duration::from_secs(60))
+    .expect("the tunnel ended");
+  let youngest = crate::daemon::observe_first(&daemon, move |state| {
+    state
+      .vcs_stores
+      .subversion_records(id)
+      .map(|records| records.youngest())
+  });
+  daemon.stop();
+  let uuid = realm_of(&answered.out);
+  let named = crate::lfs::owner_name(&principal(OWNER));
+  let author = format!("( {}:{named} )", named.len());
+  let stock = replaced(MKDIR_SERVER, RECORDED_AUTHOR, author.as_bytes());
+  let mark = b"( 1 ( 27:";
+  let date = answered
+    .out
+    .windows(mark.len())
+    .position(|window| window == mark)
+    .and_then(|at| answered.out.get(at + mark.len()..at + mark.len() + 27))
+    .unwrap_or_default()
+    .to_vec();
+  let expected = dated(
+    &replaced_all(&as_slates_writes(&stock), UUID.as_bytes(), &uuid),
+    &date,
+  );
+  assert_eq!(
+    (answered, consumed, youngest),
+    (Answered::of(&expected, "", 0), MKDIR_CLIENT.len(), Some(1))
+  );
 }

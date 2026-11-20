@@ -37,7 +37,7 @@
 //! does not answer a string is refused (7.2 asserts).
 
 use super::getbundle::{Asked, Store, getbundle};
-use super::{Refusal, discovery, lookup, pull};
+use super::{Refusal, discovery, lookup, pull, stream};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::decimal::Decimal;
 use crate::ssh::{self, Read};
@@ -133,6 +133,11 @@ const HTTP_MEDIA_TYPES: &[u8] = b"0.1rx,0.1tx,0.2tx";
 /// `bundle2required`: the message, then the hint in parentheses, each line ended).
 pub(super) const BUNDLE2_REQUIRED: &[u8] = b"incompatible Mercurial client; bundle2 required\n\
   (see https://www.mercurial-scm.org/wiki/IncompatibleClient)\n";
+
+/// Format: the capability naming the requirements a stream clone's client needs (7.2's `streamreqs`), listed while a
+/// stream is served ([`super::getbundle::Store::streams`]; stream clones part 2), its value
+/// [`crate::render::STREAM_REQUIREMENTS`]; never `stream`, which 7.2 lists only for a store of `revlogv1` alone.
+const STREAMREQS: &[u8] = b"streamreqs";
 
 /// Format: `protocaps`' answer.
 const OK: &[u8] = b"OK";
@@ -300,7 +305,7 @@ fn answer(
         Some(refused)
       }
     },
-    Answer::Stream { stream, .. } => {
+    Answer::Stream { stream, .. } | Answer::Legacy(stream) => {
       stdout.extend_from_slice(&stream);
       refused
     }
@@ -339,6 +344,8 @@ pub(crate) enum Answer {
   },
   /// An error out of band (`ooberror`): its words.
   OutOfBand(Vec<u8>),
+  /// A raw stream 7.2 sends as it is (`streamreslegacy`): `stream_out`'s, over HTTP as `application/mercurial-0.1`.
+  Legacy(Vec<u8>),
 }
 
 /// The argument spec 7.2 reads `command`'s arguments by (`wireprotov1server.commands`), `None` for a name its table
@@ -347,7 +354,7 @@ pub(crate) fn spec_of(command: &[u8]) -> Option<Spec<'static>> {
   COMMANDS
     .iter()
     .find(|(name, _)| *name == command)
-    .map(|(_, spec)| Spec(*spec))
+    .map(|(_, spec)| Spec(spec))
 }
 
 /// Answers `command`, its arguments read by `spec`, over `transport`: its answer, and the refusal an error answer
@@ -362,6 +369,16 @@ pub(crate) fn dispatch(
 ) -> (Answer, Option<Refused>) {
   if command == b"getbundle" {
     return getbundle_answer(store, transport, arguments, admission);
+  }
+  if command == b"stream_out" {
+    let mut stream = Vec::new();
+    return match stream::stream_out(store, admission, &mut stream) {
+      Ok(()) => (Answer::Legacy(stream), None),
+      Err(refusal) => {
+        let refused = Refused::Serve(refusal);
+        (Answer::OutOfBand(message(&refused)), Some(refused))
+      }
+    };
   }
   let mut value = Vec::new();
   let answered = if command == b"batch" {
@@ -395,10 +412,10 @@ fn string_answer<'a>(
     b"branchmap" => discovery::branchmap(store, admission, out)?,
     b"listkeys" => pull::listkeys(store, need(b"namespace")?, admission, out)?,
     b"lookup" => lookup::lookup(store, need(b"key")?, admission, out)?,
-    b"capabilities" => advertised(transport, admission, out)?,
+    b"capabilities" => advertised((transport, store.streams()), admission, out)?,
     b"hello" => {
       let mut line = Vec::new();
-      advertised(transport, admission, &mut line)?;
+      advertised((transport, store.streams()), admission, &mut line)?;
       capabilities::encode_hello(&line, out);
     }
     b"protocaps" => out.extend_from_slice(OK),
@@ -410,14 +427,19 @@ fn string_answer<'a>(
 /// Writes the capabilities line of what is served over `transport`: over SSH [`SERVED`]; over HTTP [`SERVED_HTTP`],
 /// `httpheader`'s value the transport's; over either, `bundle2`'s value the quoted blob of [`BUNDLE2_SERVED`].
 fn advertised(
-  transport: Transport,
+  (transport, streams): (Transport, bool),
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refused> {
-  let (names, header_line): (&[&[u8]], u64) = match transport {
+  let (served, header_line): (&[&[u8]], u64) = match transport {
     Transport::Ssh => (SERVED.as_slice(), 0),
     Transport::Http { header_line } => (SERVED_HTTP.as_slice(), header_line),
   };
+  let mut names = served.to_vec();
+  if streams {
+    names.push(STREAMREQS);
+    names.sort_unstable();
+  }
   let mut blob = Vec::new();
   capabilities::encode_bundle2(&BUNDLE2_SERVED, &mut blob);
   let mut quoted = Vec::new();
@@ -430,10 +452,11 @@ fn advertised(
       b"httpheader" => Some(header_line.as_bytes()),
       b"httpmediatype" => Some(HTTP_MEDIA_TYPES),
       b"unbundle" => Some(UNBUNDLE_FORMATS),
+      STREAMREQS => Some(crate::render::STREAM_REQUIREMENTS),
       _ => None,
     }
   };
-  let line: Vec<(&[u8], Option<&[u8]>)> = names.iter().map(|name| (*name, value(*name))).collect();
+  let line: Vec<(&[u8], Option<&[u8]>)> = names.iter().map(|name| (*name, value(name))).collect();
   let len = line.iter().fold(0_usize, |total, (name, value)| {
     total
       .saturating_add(name.len())

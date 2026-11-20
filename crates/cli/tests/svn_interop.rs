@@ -703,11 +703,9 @@ fn http_leg(session: &str) -> Option<Leg> {
 /// and the token as the user and password `svn` answers CRAM-MD5 with, as A-692 proves a token's principal (the token's
 /// record keeps its CRAM-MD5 keyed contexts; `slates_server::credentials::cram_md5_key`). Expect: every step as
 /// against `svnserve` ([`stock_svn_sessions_hold_against_stock_svnserve`]). Skips loudly without stock Subversion
-/// 1.15. Ignored until it can pass: the listener (A-689, g234) answers every URL "No repository found" until its next
-/// slice looks the repository up, lends its sources, asks `cram_md5_key` for a client's key and calls A-655 part 2b's
-/// commit step.
+/// 1.15. Its waits, as they ended: the listener (A-689) answered every URL "No repository found" until A-695 looked the
+/// repository up, and its commits landed through the owner's step since 7bedc3a88.
 #[test]
-#[ignore = "waits on A-689 and its repository lookup (g234)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   if !stock_svn() {
     eprintln!("skipping stock svn over svn://: no stock Subversion 1.15 here (svn on the PATH)");
@@ -730,11 +728,10 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
 /// URL's first segment, as `SVNParentPath` serves one). Do: start an anchor with its HTTP edge on loopback
 /// (`--vcs-http 127.0.0.1:0`); make the repository and a token; run the round trip as stock `svn` 1.15 at
 /// `http://127.0.0.1:PORT/project`, the token as Basic's password. Expect: every step as against `svnserve`. Skips
-/// loudly without stock Subversion 1.15. Ignored until it can pass: the edge serves no Subversion site until A-681
-/// (g297: its reads, then its commits). serf sends Basic credentials only after a Basic challenge, which the loopback
-/// edge offers first, and takes, since A-686 (g258).
+/// loudly without stock Subversion 1.15. Its waits, as they ended: the edge's Subversion site (A-681's reads, then the
+/// daemon's routing), the update-report, and HTTPv2's commits with the edge's `204` (A-681 part C); serf sends Basic
+/// credentials only after a Basic challenge, which the loopback edge offers first, and takes, since A-686 (g258).
 #[test]
-#[ignore = "waits on A-681's reads and commits (g297)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_the_vcs_http_edge() {
   if !stock_svn() {
     eprintln!("skipping stock svn over HTTP: no stock Subversion 1.15 here (svn on the PATH)");
@@ -748,11 +745,11 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_the_vcs_http_edge() {
 
 /// §4.17.4 item 14's lock session over `http://` (item 7's locks: `LOCK`, `UNLOCK` and the lock discovery `svn`
 /// reads). Do: start the HTTP leg as the HTTP round trip does; run the lock session. Expect: every step as against
-/// `svnserve`. Skips loudly without stock Subversion 1.15. Ignored until it can pass: A-681 (g297) serves `LOCK` and
-/// `UNLOCK` in a part after its reads and commits (A-627 built their bodies over A-602's lock table). The edge's Basic,
-/// offered first and taken on loopback, is built (A-686, g258).
+/// `svnserve`. Skips loudly without stock Subversion 1.15. Its waits, as they ended: A-681's commits, then its `LOCK`
+/// and `UNLOCK` over A-627's bodies and A-602's lock table, landed as A-693 part 2's `Record::Locks`, with a commit's
+/// lock tokens (the `If` header, the MERGE's `S:lock-token-list`); the edge's Basic, offered first and taken on loopback
+/// (A-686, g258).
 #[test]
-#[ignore = "waits on A-681's commits, LOCK and UNLOCK (g297)"]
 fn stock_svn_locks_and_unlocks_over_the_vcs_http_edge() {
   if !stock_svn() {
     eprintln!(
@@ -794,10 +791,9 @@ fn ssh_key(scratch: &Scratch) -> Option<(String, String)> {
 /// 127.0.0.1:0`); make the repository and enroll the key (`slates credential key`); run the round trip as stock `svn`
 /// 1.15 at `svn+ssh://slates@127.0.0.1/project`, its `ssh` tunnel OpenSSH holding that key alone at the edge's port,
 /// reading no user's configuration and keeping no host key. Expect: every step as against `svnserve`. Skips loudly
-/// without stock Subversion 1.15, `ssh` or `ssh-keygen`. Ignored until it can pass: no daemon starts the SSH edge until
-/// A-684 (g299), whose port line [`VCS_SSH_LINE`] assumes; the edge runs no `svnserve -t` until A-688 (g229).
+/// without stock Subversion 1.15, `ssh` or `ssh-keygen`. Its waits, as they ended: the daemon's SSH edge (A-684), and
+/// `svnserve -t` on it over its shard's records, committing through the owner's step (fc79d36ae).
 #[test]
-#[ignore = "waits on A-684 (g299) and A-688 (g229)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh() {
   if !stock_svn() || !openssh() {
     eprintln!(

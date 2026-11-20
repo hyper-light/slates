@@ -2900,9 +2900,19 @@ impl Volume {
     }
     self.rebuild_entries(store, &snap.inodes, &Kinds::Map(&kinds), &dirs, &held)?;
     self.restore_identities(store, &snap.inodes)?;
-    // A clone's snapshot rebuilds its directories privately; a record the live snapshot shared with the origin
-    // (born at or before the origin epoch) is this snapshot's own copy now, born with it, so the snapshot's drop
-    // frees it rather than leaving it to the origin (A-64).
+    self.own_records_shared_with_the_origin(store, snap, epoch)?;
+    Self::tree_entries(store, snap, &dirs, &held)
+  }
+
+  /// A clone's snapshot rebuilds its directories privately; a record the live snapshot shared with the origin
+  /// (born at or before the origin epoch) is this snapshot's own copy now, born with it at `epoch`, so the snapshot's
+  /// drop frees it rather than leaving it to the origin (A-64).
+  fn own_records_shared_with_the_origin(
+    &self,
+    store: &mut Store,
+    snap: &SnapshotImage,
+    epoch: Epoch,
+  ) -> Result<(), VfsError> {
     if let Some(origin) = self.origin_epoch {
       for image_inode in snap.inodes.iter().filter(|i| Epoch(i.born) <= origin) {
         let handle = trie::get(&store.tries, self.inode_root, InodeNo(image_inode.no))
@@ -2910,16 +2920,25 @@ impl Volume {
         store.inodes.get_mut(handle)?.born = epoch;
       }
     }
-    // The tree's entries (§4.2's namespace dimension, A-549), by the rule the live count keeps: each name its own
-    // directories' images carry that names a child, and each live entry of a directory it shares with the head, whose
-    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which the caller sets the head's count
-    // back over.
+    Ok(())
+  }
+
+  /// The entries a rebuilt snapshot tree holds (§4.2's namespace dimension, A-549), by the rule the live count keeps:
+  /// each name its own directories' images carry that names a child, and each live entry of a directory it shares
+  /// with the head (`held`, its node in `dirs`). Not what `rebuild_entries` counted through `dir_insert`, which the
+  /// caller sets the head's count back over.
+  fn tree_entries(
+    store: &Store,
+    snap: &SnapshotImage,
+    dirs: &BTreeMap<u64, Handle<DirNode>>,
+    held: &BTreeSet<u64>,
+  ) -> Result<u64, VfsError> {
     let mut entries = snap
       .inodes
       .iter()
       .map(named_entries)
       .fold(0, u64::saturating_add);
-    for number in &held {
+    for number in held {
       let node = *dirs.get(number).ok_or(VfsError::RecoveryIncomplete)?;
       let live = store.dirs.get(node)?.live_len(&store.blocks);
       entries = entries.saturating_add(u64::try_from(live).unwrap_or(u64::MAX));

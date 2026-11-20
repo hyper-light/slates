@@ -39,7 +39,9 @@
 //! `/name/?cmd=...`. No other spelling is tried.
 //!
 //! **Bounds.** A request's exchange holds its arguments (its query and `X-Hg` fields, copied from the head), its body
-//! and its answer, each charged to the request's room before it is held; a body past the room is `413`.
+//! and its answer, each charged to the request's room before it is held; a body past the room is `413`. A push is
+//! admitted what its repository's shard can hold instead (`HgStores::push_room`, A-711, as A-704 admits git's), and one
+//! past it is answered in Mercurial's words (`pusherr`), never `413`.
 //!
 //! **Compression** ([`Fastest`]). §4.17.3's estimator (the connection's delivery rate, and this repository's
 //! compression speed and ratio per engine and level) is owed; until it lands a stream takes the design's first value,
@@ -126,12 +128,18 @@ pub(crate) trait HgStores {
   /// Lands a push on repository `id` (the module doc's push): `pushing`'s principal, `heads` argument and bundle,
   /// everything it builds charged to `room`; what it came to, none when the store is not lent here or no view of it
   /// could be made.
-  fn push(
+  async fn push(
     &mut self,
     id: RepositoryId,
     pushing: Pushing<'_>,
     room: &mut Admission,
   ) -> Option<Outcome>;
+  /// The room a push is admitted (A-711): what the repository's owner shard could admit now (the daemon's,
+  /// `crate::vcs_share::room`, as A-704 and A-724 admit a git push), never one request's room; `None` where the lender
+  /// names none, and the edge's request room bounds it.
+  fn push_room(&self, _repository: RepositoryId) -> Option<u64> {
+    None
+  }
 }
 
 /// The design's first value for a stream's compression (§4.17.3 "Learned tunables": "each named engine at its fastest
@@ -242,7 +250,11 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
       return refused_with(Status::SERVICE_UNAVAILABLE, Fields::new(), true);
     }
     let pusher = routed.unbundle.then_some(principal);
-    match HgExchange::new(self.stores.clone(), (repository, pusher), head, self.room) {
+    let room = match pusher {
+      Some(_) => self.stores.push_room(repository.id).unwrap_or(self.room),
+      None => self.room,
+    };
+    match HgExchange::new(self.stores.clone(), (repository, pusher), head, room) {
       Some(exchange) => Decided {
         answer: Answer::Serve {
           fields: Fields::new(),
@@ -430,6 +442,9 @@ pub(crate) struct HgExchange<S> {
   room: Admission,
   /// The answer's media type and body, once made.
   answered: Option<(&'static [u8], Vec<u8>)>,
+  /// Whether a push's body ran past its room: its bytes let go as they arrive, and the push refused in Mercurial's
+  /// words once the body has ended (A-711).
+  past_room: bool,
 }
 
 impl<S> HgExchange<S> {
@@ -473,16 +488,25 @@ impl<S> HgExchange<S> {
       body: Vec::new(),
       room: admission,
       answered: None,
+      past_room: false,
     })
   }
 }
 
 impl<S: HgStores> Exchange for HgExchange<S> {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
-    self
-      .room
-      .charge(to_u64(run.len()))
-      .map_err(|_| Failed(Status::CONTENT_TOO_LARGE))?;
+    if self.past_room {
+      return Ok(());
+    }
+    if self.room.charge(to_u64(run.len())).is_err() {
+      if self.pusher.is_none() {
+        return Err(Failed(Status::CONTENT_TOO_LARGE));
+      }
+      // A push past what its shard can hold is answered in Mercurial's words, as 7.2's client reads a refusal.
+      self.past_room = true;
+      self.body = Vec::new();
+      return Ok(());
+    }
     self.body.extend_from_slice(run);
     Ok(())
   }
@@ -500,8 +524,15 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     };
     let mut admission = self.room;
     let id = self.repository.id;
+    if self.past_room {
+      let answered = hg_http::pushed(&Outcome::Unprocessed(PAST_ROOM.to_vec()), &mut admission);
+      self.answered = Some((answered.media_type, answered.body));
+      return Ok(());
+    }
     let answered = match &self.pusher {
-      Some(principal) => answered_push(&mut self.stores, (id, principal), &request, &mut admission),
+      Some(principal) => {
+        answered_push(&mut self.stores, (id, principal), &request, &mut admission).await
+      }
       None => self.stores.lend(id, &mut admission, |store, room| {
         hg_http::answer(store, &request, header_line(), &mut Fastest, room)
       }),
@@ -527,10 +558,13 @@ impl<S: HgStores> Exchange for HgExchange<S> {
   }
 }
 
+/// Slates' words for a push past what its repository's shard can hold (A-711).
+const PAST_ROOM: &[u8] = b"push refused: its bundle is larger than its repository's shard can hold";
+
 /// The answer to an `unbundle` by `principal` on repository `id` (the module doc's push): its `heads` and bundle read
 /// from `request`, the push landed through `stores`, and what it came to framed as 7.2 frames it; none when the store is
 /// not lent.
-fn answered_push<S: HgStores>(
+async fn answered_push<S: HgStores>(
   stores: &mut S,
   (id, principal): (RepositoryId, &Principal),
   request: &hg_wire::Request<'_>,
@@ -540,7 +574,9 @@ fn answered_push<S: HgStores>(
     Ok(read) => read,
     Err(answered) => return Some(answered),
   };
-  let outcome = stores.push(id, (principal, &heads, bundle), admission)?;
+  let outcome = stores
+    .push(id, (principal, &heads, bundle), admission)
+    .await?;
   Some(hg_http::pushed(&outcome, admission))
 }
 

@@ -401,6 +401,33 @@ impl Store for Indexed<'_> {
         .flat_map(|markers| markers.iter())
     })
   }
+
+  /// A stream is served unless a secret root the changelog holds makes a changeset secret (7.2's
+  /// `allowservergeneration` over `phases.hassecret`); hidden changesets are streamed, as 7.2 streams them.
+  fn streams(&self) -> bool {
+    !self.state.roots.iter().any(|root| {
+      root.phase == Phase::Secret
+        && self
+          .index
+          .rev(self.store, Log::Changelog, &root.node)
+          .is_some()
+    })
+  }
+
+  fn stream_files(
+    &self,
+    room: &mut Admission,
+  ) -> Result<Option<Vec<crate::render::File>>, Refusal> {
+    if !self.streams() {
+      return Ok(None);
+    }
+    crate::render::revlogs(self.index, self.store, room)
+      .map(Some)
+      .map_err(|refused| match refused {
+        crate::render::Refused::Past(past) => Refusal::PastAdmission(past),
+        _ => Refusal::Store { what: "a revlog" },
+      })
+  }
 }
 
 /// The refusal of a marker the store cannot read.
@@ -627,13 +654,16 @@ fn count_into(census: &mut Census, this: &Walked) {
   *count = count.saturating_add(1);
 }
 
+/// The view's tail, the changesets left out (each with its number), and the census.
+type Filtered = (Vec<Kept>, Vec<(u32, LeftOut)>, Census);
+
 /// The view's tail, the changesets left out, and the census, from the walked changesets once the walk back has
 /// revealed what it reaches: what is neither hidden nor secret is served. Both lists are charged before they are made.
 fn filter(
   mut walked: Vec<Walked>,
   (first, len): (u32, u32),
   room: &mut Admission,
-) -> Result<(Vec<Kept>, Vec<(u32, LeftOut)>, Census), Refusal> {
+) -> Result<Filtered, Refusal> {
   reveal(&mut walked, first);
   let left = walked
     .iter()

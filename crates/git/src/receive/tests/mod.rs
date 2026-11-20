@@ -120,6 +120,39 @@ fn unbounded() -> Admission {
   Admission::new(u64::MAX)
 }
 
+/// A clock one nanosecond on at each reading, so a quantum of none ends each turn after its first
+/// unit of work.
+struct Ticking(u64);
+
+impl crate::store::learn::Clock for Ticking {
+  fn now_ns(&mut self) -> u64 {
+    self.0 = self.0.saturating_add(1);
+    self.0
+  }
+}
+
+/// Makes `session`'s pack's checks against `repository` a unit of work a turn until the push is
+/// checked or refused (A-719): the turns taken, and the last turn's outcome.
+fn checked_in_turns<H: HiddenRefs, R: Repository + ?Sized>(
+  session: &mut super::Session<'_, H>,
+  repository: &R,
+) -> (usize, Result<bool, Refusal>) {
+  let mut clock = Ticking(0);
+  let mut turns = 0;
+  while session.is_checking() {
+    turns += 1;
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 0,
+    };
+    let turned = session.check_turn(repository, &mut unbounded(), quantum);
+    if !matches!(turned, Ok(false)) {
+      return (turns, turned);
+    }
+  }
+  (turns, Ok(session.checked().is_some()))
+}
+
 /// A repository a test holds: each object by name.
 #[derive(Default)]
 struct Repo {
@@ -136,7 +169,7 @@ impl Repo {
       .into_iter()
       .map(|object| (object.id, object.kind, object.content))
       .collect();
-    objects.sort_by(|a, b| a.0.cmp(&b.0));
+    objects.sort_by_key(|a| a.0);
     Self { objects }
   }
 
@@ -144,7 +177,7 @@ impl Repo {
   fn with(&mut self, kind: Kind, content: &[u8]) -> ObjectId {
     let id = name_of(ObjectFormat::Sha1, kind, content).unwrap();
     self.objects.push((id, kind, content.to_vec()));
-    self.objects.sort_by(|a, b| a.0.cmp(&b.0));
+    self.objects.sort_by_key(|a| a.0);
     id
   }
 }

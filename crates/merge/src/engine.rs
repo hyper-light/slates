@@ -690,6 +690,9 @@ pub struct Green {
   identity_dirty: BTreeSet<IdentityKey>,
   /// The current files (persistent, [`crate::dims`]).
   content: Files,
+  /// The texts held by content identity (A-716, [`crate::held`]): blocks of `content`'s arena, shared with the files
+  /// that name them and kept while held whatever the files do.
+  held: crate::held::Held,
   content_history: ContentHistory,
   /// The chunks the content history's values share (`crate::history`).
   chunks: crate::history::Chunks,
@@ -1532,6 +1535,93 @@ impl Green {
   /// An empty green volume at version 0.
   pub fn new() -> Green {
     Green::default()
+  }
+
+  /// Sets the most texts the green may hold by identity ([`crate::held`]), its owner's to derive; zero until set, so
+  /// every hold is refused until the owner says what the green may hold. Entries held past a smaller room stay.
+  pub fn set_held_room(&mut self, entries: usize) {
+    self.held.room = entries;
+  }
+
+  /// Holds the head's file at `path` under `identity` (A-716; [`crate::held`]): one more holder of the block the file
+  /// holds, so no byte is copied, or of the block the identity already holds. The caller names the file's bytes by
+  /// `identity`; the engine does not hash them. Refused typed, nothing held: no file at `path`, the table at its room,
+  /// or the identity's holders at the most a count holds.
+  ///
+  /// # Errors
+  /// [`crate::held::HeldRefused`].
+  pub fn hold_path(
+    &mut self,
+    identity: crate::held::Identity,
+    path: &str,
+  ) -> Result<(), crate::held::HeldRefused> {
+    if !self.content.contains_key(path) {
+      return Err(crate::held::HeldRefused::NoFile);
+    }
+    if self.held.hold_again(&identity)? {
+      return Ok(());
+    }
+    self.held.room_for_one()?;
+    let block = self
+      .content
+      .hold_block_of(path)
+      .ok_or(crate::held::HeldRefused::NoFile)?;
+    self
+      .held
+      .entries
+      .insert(identity, crate::held::Entry { block, holders: 1 });
+    Ok(())
+  }
+
+  /// Holds `bytes` under `identity` with no path naming them (A-716; [`crate::held`]): an intake's object before any
+  /// tree names it. Kept once: an identity already held gains a holder and its block stays. Refused typed, nothing held:
+  /// the table at its room, or the identity's holders at the most a count holds.
+  ///
+  /// # Errors
+  /// [`crate::held::HeldRefused`].
+  pub fn hold_bytes(
+    &mut self,
+    identity: crate::held::Identity,
+    bytes: &[u8],
+  ) -> Result<(), crate::held::HeldRefused> {
+    if self.held.hold_again(&identity)? {
+      return Ok(());
+    }
+    self.held.room_for_one()?;
+    let block = self.content.add_unnamed_block(bytes.to_vec());
+    self
+      .held
+      .entries
+      .insert(identity, crate::held::Entry { block, holders: 1 });
+    Ok(())
+  }
+
+  /// The bytes held under `identity`, if held.
+  pub fn held(&self, identity: &crate::held::Identity) -> Option<&[u8]> {
+    self
+      .held
+      .entries
+      .get(identity)
+      .map(|entry| self.content.block_bytes(entry.block))
+  }
+
+  /// How many identities the green holds.
+  pub fn held_count(&self) -> usize {
+    self.held.entries.len()
+  }
+
+  /// One holder of `identity` fewer; its block is let go with its last holder (and freed once no file names it).
+  ///
+  /// # Errors
+  /// [`crate::held::HeldRefused::NotHeld`] when `identity` is not held.
+  pub fn release_held(
+    &mut self,
+    identity: &crate::held::Identity,
+  ) -> Result<(), crate::held::HeldRefused> {
+    if let Some(block) = self.held.release(identity)? {
+      self.content.release_block(block);
+    }
+    Ok(())
   }
 
   /// A green whose version 0 is `origin` — the state captured from a complete immutable base
@@ -5852,6 +5942,8 @@ mod compute_tests;
 #[cfg(test)]
 mod computed_wire_tests;
 #[cfg(test)]
+mod held_tests;
+#[cfg(test)]
 mod judge_tests;
 #[cfg(test)]
 mod node_exclusive_tests;
@@ -5926,7 +6018,7 @@ mod tests {
         path: to,
         at: 0,
         len: 0,
-        src: u64::from(from),
+        src: from,
       });
       self
     }

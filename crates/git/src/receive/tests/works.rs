@@ -109,7 +109,6 @@ impl Served {
     };
     let objects = PushedObjects::new(&repository, &store, &push);
     let built = work::build(&first, &green, &objects, ROOM).unwrap();
-    drop(objects);
     let verdict = green.submit(&built.increment);
     assert!(
       matches!(verdict, Verdict::Accepted { version: 1 }),
@@ -244,6 +243,7 @@ fn pushed(served: &mut Served, bytes: &[u8], logs: &mut Logs) -> Received {
   let mut session = Session::new(&ADVERTISED, &NoneHidden);
   let indexed = IndexedObjects::new(&served.repository, &served.store, ROOM);
   assert_eq!(session.input(bytes, &indexed, &mut unbounded()), Ok(true));
+  assert_eq!(super::checked_in_turns(&mut session, &indexed).1, Ok(true));
   drop(indexed);
   let mut quarantine = Push::new(ObjectFormat::Sha1);
   for object in session.checked().unwrap().objects() {

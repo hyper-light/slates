@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::index::{Action, ChangedPath, NodeKind, PropertyList};
-use crate::lock::LockToken;
+use crate::lock::{CommitLocks, LockToken};
 use crate::migration::properties::decode;
 
 /// The owner's instant the tests date a revision at: 2026-11-19T07:26:35.123456Z, in microseconds since the epoch.
@@ -57,6 +57,7 @@ fn work() -> Work {
       LIST_IDENTITY,
       vec![(b"svn:eol-style".to_vec(), b"native".to_vec())],
     )]),
+    locks: CommitLocks::default(),
   }
 }
 

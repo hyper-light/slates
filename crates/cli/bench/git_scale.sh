@@ -14,7 +14,8 @@
 # The steps, each timed on the wall clock and bounded (`alarm`), a failure recorded and the run going on:
 # 1. push: every branch and tag of SOURCE pushed in one push, the repository's first;
 # 2. clone: `git clone --mirror`; on the first run of each server the clone is checked: `git fsck --full` and its refs
-#    and every object id (`git rev-list --all --objects`, ids sorted) equal SOURCE's;
+#    and every object id (`git rev-list --all --objects`, ids sorted) equal SOURCE's; then a second mirror clone
+#    (`clone-again`), what every later clone meets once the server kept what the first made;
 # 3. incremental: one commit (one new file) made on SOURCE's default branch in a scratch copy and pushed, then fetched
 #    into the mirror clone, which must then name it;
 # 4. shallow: `git clone --bare --depth 1`;
@@ -81,7 +82,7 @@ DEFAULT=$(g -C "$SOURCE" symbolic-ref --short HEAD)
 echo "dataset: $SOURCE at $(g -C "$SOURCE" rev-parse HEAD) ($DEFAULT); $(g -C "$SOURCE" for-each-ref refs/heads | wc -l | tr -d ' ') branches, $(g -C "$SOURCE" for-each-ref refs/tags | wc -l | tr -d ' ') tags, $(g -C "$SOURCE" rev-list --all --count) commits"
 g -C "$SOURCE" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sort > "$WORK/source.refs"
 g -C "$SOURCE" rev-list --all --objects | cut -d' ' -f1 | sort > "$WORK/source.objects"
-echo "objects: $(wc -l < "$WORK/source.objects" | tr -d ' '); git: $(git --version); slates: $("$SLATES" --version 2> /dev/null || echo none)"
+echo "objects: $(wc -l < "$WORK/source.objects" | tr -d ' '); git: $(git --version); slates: $("$SLATES" version 2> /dev/null || echo none)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
 ANCHOR="" DAEMON="" STOCK=""
@@ -94,7 +95,8 @@ stop_servers() {
   if [ -n "$STOCK" ]; then kill "$STOCK" 2> /dev/null || true; wait "$STOCK" 2> /dev/null || true; fi
   ANCHOR="" DAEMON="" STOCK=""
 }
-trap 'stop_servers; rm -rf "$WORK"' EXIT
+# KEEP_LOGS in the environment names a directory the servers' logs and each step's output are copied into at the end.
+trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
 
 # The value of the first line of FILE matching the sed expression, or nothing.
 first() { sed -n "$2" "$1" | head -1; }
@@ -173,6 +175,9 @@ steps() {
   [ "$server" = slates ] && echo "slates daemon rss after push: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   timed "$server clone $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$mirror"
   [ "$run" = 1 ] && check "$mirror" "$server"
+  # A second clone: what every clone after the first meets, once a server has kept what the first one made (A-718).
+  timed "$server clone-again $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$WORK/$server-again-$run"
+  rm -rf "$WORK/$server-again-$run"
   g clone -q --bare "$SOURCE" "$scratch"
   blob=$(echo "one more commit, $server run $run" | g -C "$scratch" hash-object -w --stdin)
   GIT_INDEX_FILE="$WORK/index" g -C "$scratch" read-tree HEAD
@@ -212,7 +217,7 @@ for run in $(seq 1 "$RUNS"); do
 done
 
 echo "== results (seconds; every run shown)"
-for step in push clone incremental-push incremental-fetch shallow partial; do
+for step in push clone clone-again incremental-push incremental-fetch shallow partial; do
   for server in $SERVERS; do
     printf '%-18s %-6s' "$step" "$server"
     grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }

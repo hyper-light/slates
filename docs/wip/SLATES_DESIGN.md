@@ -5005,6 +5005,24 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-20, A-715: the idle sweep leaves the tick, and the reap loop and its tick are deleted).** The idle
+> sweep (the seal of files idle one to two intervals, the publication of what it moved or a free deferred, the idle
+> purge, recovery give-back and reserve refill) runs a pass at its own deadline on the keeper
+> (`crate::idle_sweep`): armed a liveness budget after the write that stamps a file for the seal, an allocation, a
+> published free or a deferred free, and after a pass that leaves work; a pass that settles the shard arms nothing, so
+> an idle shard is never woken (`an_idle_shard_runs_no_sweep_pass`: no pass in three intervals, where the tick ran
+> one an interval). With it the reap loop, its interval and its sweep are gone: every reap job runs at its own event
+> or deadline (dead clients at their hang-up, A-475; A-522 to A-570's deadlines; base hints at the kernel's report,
+> A-709).
+
+> **Status (2026-11-20, A-709: base hints leave the tick).** Each overlay's watcher descriptor (inotify, a kqueue) is
+> entered in one set of its shard's (`slates_base::HintSet`, an epoll or a kqueue, one-shot, keyed by the volume's
+> generational handle), and one task a shard (`crate::base_hints::watcher`) awaits that set's readability: a report
+> drains the ready volumes' hints, re-arms their watchers and sends the recalls they asked for, so an outsider's edit
+> reaches the shard at the kernel's report (10 ms in the unit test, macOS arm64) where it waited up to a window. A
+> volume whose host a landing has lent out is owed and drained when a state borrow finds it back. A delegation nobody
+> returned lapses at its own deadline on the keeper (`delegation::arm_lapse`). Left on the tick: the idle seal.
+
 > **Status (2026-11-19, A-570: the pressure hold leaves the tick).** The pressure hold's sampler (`crate::pressure`, a
 > task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
 > them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
@@ -12026,8 +12044,15 @@ decides the details.
 > register at the position it leaves the log at, in order, committed at `f + 1`, and a holder keeps it only where it
 > continues its copy of the log, so every holder's copy is a prefix and a successor can rebuild the repository's state
 > from it and keep or drop each operation whole. A repository's greens are of its family (A-636 part 2b-2), so every
-> log of a repository, its greens' included, is placed on one set of holders and follows one successor. Owed: the
-> server's takeover by this rule (2c); and the repository policy's check before the verdict (A-622's next part).
+> log of a repository, its greens' included, is placed on one set of holders and follows one successor; and its record
+> (name, tool, format, owner, policy) is its own register, shipped as its catalog is a volume's and adopted by its
+> successor (A-636 part 2c-1). The successor rebuilds the repository by this rule (A-636 part 2c-2): once its record,
+> every register of its family and its greens are adopted, it keeps each state log's parts it holds only where every
+> log their operation moved holds them whole, a green's log judged by its adopted head, records the repository whole
+> from them (`Op::RepositoryRebuilt`) and makes its store from the log. Owed: the parts of a state log a successor
+> does not hold fetched from its holders; the store's objects rebuilt by content identity once entries and stores
+> name content held once in the family's pool (a state log's part carries none, so a rebuilt store holds none yet);
+> and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12148,6 +12173,28 @@ is one more version, and the chain itself is never rewritten.
 > (§4.10).
 
 **A push is a work.**
+
+**A push's intake (the rule for every tool's push and commit; A-719, main's ruling 2026-11-20).** Ada's target is tens
+of thousands of concurrent large pushes on one server, many of them to one repository, so an intake is held to four
+rules, which git's, Mercurial's and Subversion's intakes cite:
+1. *Its working set is bounded whatever its size.* Its objects are decoded as they arrive and each is stored once, in
+   the repository's one byte store, as it resolves; a delta is resolved against a base already stored (an offset
+   delta's lies earlier in the pack, a thin pack's reference delta's in the repository). Nothing holds the whole pack,
+   or every object verified in memory: at once an intake holds the entry being read, a delta with its base and its
+   target, the deltas still waiting for their bases, and tables of a few words an object.
+2. *Admission charges that working set.* The content a push adds is charged as it is stored (A-714's retention), and a
+   push past the shard's room is refused typed, never by one request's room (A-704, A-713).
+3. *Every pass runs a turn at a time* under the shard's step quantum (§4.3): reading, the checks, the store's admission
+   and the verdicts. No step of a push is longer than its quantum by more than one unit of work.
+4. *Intakes run concurrently, one repository's too.* Each push has its own working set (or its own fork); only its
+   landing, the verdict against the head and the ref's move, is ordered per repository, as Subversion's revision
+   assignment is the only ordered step of a commit.
+
+> **Status (2026-11-20, A-719 parts 1 and 2).** Rule 3's checks are built for git (part 1: `slates_git::receive::Checking`);
+> rule 1's reader seam is built (part 2: `slates_git::unpack::Keep`, each object handed to its keeper as it resolves,
+> with the hold its bytes took, and a delta's base read back from it). Owed: git's intake keeping into the repository's
+> store as it reads (part 3), on w-perf's byte table once it lands; admission by the working set; the store's
+> admission and the verdicts a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -12455,6 +12502,28 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-20, A-716 slice 1a: a text held once, by content identity).** A green holds texts by identity in a
+> table of its file blocks (`crates/merge/src/held.rs`; `Green::hold_path`, `hold_bytes`, `held`, `release_held`,
+> `set_held_room`): by path, the head file's own block with one more holder, so no byte is copied; or by bytes, a block
+> no path names, for an intake that streams objects before any tree. A held text outlives its file's change and
+> removal, and is let go with its last holder. The table's room is its owner's to derive (zero until set), every hold
+> past it refused typed. It replaces the copies each tool keeps of the green's bytes (A-64: a Subversion text was held
+> three times, the records' copy alone 1.37 times the dump; BENCHMARKS.md). Owed: a green op setting a path from a held
+> identity (slice 1b), the table in the checkpoint (1c), Subversion's records reading through it (2, 3), git's and
+> Mercurial's intakes holding by bytes (w-git, w-hg).
+
+> **Status (2026-11-19, A-714, w-svn, found by use: a 5,000-revision Subversion import refused `green_chains` at 1,685).** An
+> entry's objects are the repository's content: the register keeps them as before, but the owner shard charges them to
+> its memory budget as retention with the tool store (`vcs_store::settle_objects`: trued up after each append and at a
+> recovery, given back with the repository; a push's own admission bounds it, a Subversion revision asks
+> `admit_objects` first), never to the partition's merge budget, so a
+> repository's bound is what its shard can hold. This replaces A-662's "charged to the merge budget" below.
+>
+> **Status (2026-11-19, A-721, w-svn).** A refused publication takes back the verb's record; a green whose engine had
+> already committed the version is made again from its durable checkpoint and chain in the same reconciliation
+> (`verbs::remake_greens_ahead`), so the engine never answers a version no log holds. Lone engines and single-member
+> lineages; a lineage of several members is counted and owed.
+>
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
 > (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each
@@ -12569,7 +12638,9 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
    every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
    operation's identity and spans (A-636 part 2b); and a repository's greens minted in its family, placed and taken
-   over as it is (A-636 part 2b-2); owed: the server's takeover by the rule (2c).
+   over as it is (A-636 part 2b-2); and its record shipped as its own register and adopted by its successor (A-636 part
+   2c-1); and rebuilt by its successor by the rule (A-636 part 2c-2); owed: the store's objects rebuilt by content
+   identity from the family's pool, and a log's parts the successor lacks fetched from its holders.
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -13546,6 +13617,16 @@ cooperative slices (§4.3).
    answer's path (each D(k) was computed at admission). A fetch that comes before a fragment exists sends those objects
    from the compressed forms the push brought them in.
 
+> **Status (2026-11-20, A-718: item 8's fragments, encoded before a fetch's answer).** No step encoded a pushed version,
+> so every clone searched every object for deltas again: on the Mac Studio a clone of git/git cut at v1.0.0 took 2.816 s
+> against `git daemon`'s 0.300 s, about 72% of the daemon's CPU in `deltas::Search::step` (BENCHMARKS.md). Now a fetch's
+> request, before its answer is made, encodes each version whose fragments are not kept (`Repository::first_unencoded`)
+> a turn at a time under the shard's quantum, yielding between turns, and keeps them as content charged to the shard
+> (`crates/server/src/vcs_store/git_encode.rs`); the answer copies them. A version is encoded once, by the first fetch
+> after its push; one encoding a repository at a time, kept in the map between turns. Owed: the encoding from the push's
+> own intake (git's pack reuse, w-git's streaming intake), the base pack's rebuild, kept fragments across a recovery, and
+> the parts' bytes held between turns charged.
+
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
 create or update a reference named "refs/for/master", but may create or update a pull request" [B: config
@@ -14040,6 +14121,8 @@ signature verification).
 > register's first entry, with the phase roots and bookmarks it answers, and a recovery); until then an import is not
 > served.
 >
+> **Status (2026-11-20, A-710):** the command line asks it: `slates repository import NAME PATH` (PATH absolute).
+>
 > **Status (2026-11-19, A-678: the import verb).** A client asks the daemon to import a Mercurial repository's directory
 > with `ImportRepository { repository, path }`, served on the partition the repository's name hashes to and for its
 > owner alone: the directory is opened as a base is (read-only, never through a link), A-675's import started, and the
@@ -14443,6 +14526,11 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
    advertise it while it is held. Whether an artefact stays is learned (the table below).
 
 **Push.** Each step names what it refuses; nothing takes effect before step 6.
+Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
+working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
+push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
+landing; a fork another push made stale is re-based by node first (part 2b), bookkeeping that leaves the verdict to the
+landing (D-27).
 1. **Intake.** The bundle (bundle2; bundle1 only where the policy allows legacy clients, as 7.2's `server.bundle1`
    does) is read in slices within the shard's budget per step, every length checked against the request's admission
    (A-16) before anything is held. A mandatory part or parameter slates does not know is refused, as bundle2 requires
@@ -14532,7 +14620,8 @@ is offered only when it holds nothing the principal may not read. The same rende
 admission hooks see and what an export lands (§4.15).
 Status (A-706, stream clones part 1): `slates_hg::render` renders the index whole into those files, each revision a full
 text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
-deltas, the rendering appended as versions commit, `stream_out` and `stream2` are later parts.
+deltas, the rendering appended as versions commit and `stream2` are later parts; `stream_out` (A-712) sends the
+rendered revlogs as 7.2's version 1 stream, refused `1\n` while a changeset is secret.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
@@ -15218,12 +15307,21 @@ and export by landing).
 > **Status (2026-11-19, A-693 part 1: ra_svn's lock reads).** `get-lock` and `get-locks` are answered from the
 > repository's lock table at the call's instant (`slates_svn::reads::answer_lock_read`, `serve.c` 3366-3446): a held
 > lock as `write_lock` writes it, an expired one and one on an unreadable path left out, a depth `get_locks` refuses in
-> its words. Owed: `lock`, `lock-many`, `unlock`, `unlock-many` through the owner's step.
+> its words. Part 2 (2026-11-19): `lock`, `lock-many`, `unlock` and `unlock-many` judged against the table
+> (`slates_svn::serve::locks`), their entries landed through the owner's step as a `Record::Locks`, then answered as
+> `svnserve` answers them, over `svn://` and `svn+ssh://`. Owed: the pre-lock and post-lock hooks.
+>
+> **Status (2026-11-19, A-702 part 1).** `change-rev-prop` and `change-rev-prop2` are answered as `svnserve` answers a
+> repository with no pre-revprop-change hook ("Repository has not been enabled to accept revision propchanges",
+> 165006), after its checks in its order (`slates_svn::serve::revprops`). The change itself waits on ra_svn running a
+> repository's hooks.
 >
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
 > token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's
-> principal writing where the repository's policy reaches it. Owed: commits through the owner's step (A-698).
+> principal writing where the repository's policy reaches it. Since A-698 a signed-in session's commit drive runs over
+> those sources and its accepted work lands through `repository::svn_commit::commit_work`, `close-edit` answered with
+> `commit-info` or the step's refusal; a configured hook refuses the commit (none runs yet).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -15450,6 +15548,20 @@ for Subversion.)
 > work handed to the owner's commit step (`repository::svn_commit::commit`); the daemon's edge (A-684); a configured
 > hook run rather than refused; CRAM-MD5 through the tunnel; a client that leaves during a refused edit's drop ends
 > E210002 where `svnserve` exits 0; `svn checkout svn+ssh://` with a stock client against a daemon (main's run).
+
+> **Status (2026-11-20, A-698: ra_svn commits land through the owner's step).** The work an ra_svn connection accepts at
+> `close-edit` lands through A-655 part 2b's step: `repository::svn_commit::commit_work`, the one entry both transports
+> call (`svn://` and `svnserve -t` through the SSH tunnel share A-656's connection), makes the revision of the work at
+> the owner's instant, judges it again with the commit's locks (`Work::locks`, carried out of the drive) and lands it;
+> the connection answers `commit-info` (the revision, its date, its author) or `close-edit`'s failure, the step's
+> refusals in FSFS's words and its own (the store not held, the budget, the log) in slates' words under Subversion's
+> nearest error (`serve::Uncommitted::Refused`). The tunnel lands a work through its lender (`SvnStores::commit`). Held
+> to stock `svnserve -t`: the recorded `mkdir` commit answered byte for byte, its `commit-info` naming the principal the
+> key proved where the recording named `alice`; and on a real shard, a client's work landed as the green's version 1
+> with its record. (macOS arm64, Mac Studio, kiln r509: `--lib -- vcs_ssh:: repository::svn_commit::` red 52 of 55, the
+> three new tests failing with the step stubbed back to today's refusal, green 55 of 55; slates-svn `commit:: serve::
+> migration::` 115 of 115; fmt clean.) Owed: the production lender that lends and commits on the owner shard (g297's);
+> `svn://` calling `commit_work` once its lookup opens a repository (g234's); a configured hook run.
 
 - **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
@@ -15826,6 +15938,129 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 14. Review: held commits, the branch form's server-side merge, stacks of held commits.
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
+
+#### 4.17.5 Many repositories on one server, balanced by learned usage (A-724)
+
+> **Status (2026-11-20, A-724 piece 1).** Designed below; piece 1 built: each repository's usage counted on its owner
+> shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
+> order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
+> dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3; its room built, below), the cold trigger (4; its choice and git's drop built:
+> `slates_vcs::cold::choose`, `Repository::kept_fragments`/`drop_fragments`; the server's trigger owed), intake off the owner
+> shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
+> amends §4.10's content placement), the many-repository load proof (7), the snapshot sized by its data (8) and a
+> giant repository's index across partitions (9), both designed below.
+
+> **Status (2026-11-20, A-724 piece 3a: one room for every admission).** `crate::vcs_share::room` (`slates-server`) is
+> the one room a version-control work is admitted on its owner shard: git's push as it starts, git's fetch, Mercurial's
+> push. It replaces A-704's `git_push::push_room`. A repository alone in taking new room gets all the shard can admit
+> (the fast path, counted `vcs_share.fast`); while others have intakes under way (each push counted live by a guard
+> until it drops), the contested room (what the shard can admit plus what those repositories hold) is divided by
+> `share::divide`, the asker claiming all of it and each other claiming what it holds plus its answered intakes' mean
+> bytes for each intake under way, and the asker's room is its grant less what it holds (`vcs_share.narrowed` when it
+> binds). Owed: A-722's reservation checking this room and its typed refusal carrying the bound, with git's, Mercurial's
+> and Subversion's words for a share (the seam proposed to w-git); Mercurial's and Subversion's intakes counted live;
+> backpressure before refusal; a fetch's room as a claim of its own.
+
+**Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
+several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
+agents and clients actually do (Ada, 2026-11-20). No repository has a fixed share: every share is a stated formula
+over measured inputs, logged with them (D-11), and learned online (§4.17.1 "Every tunable is learned online").
+
+**What a repository costs, counted** (piece 1). Each owner shard keeps one row a repository it owns, touched only by its
+own steps (no lock, no atomic on the path): for its intakes (pushes, commits) and its fetches (fetches, clones), the
+works begun and answered, the shard steps they took, the shard clock's time those steps ran and the bytes the clients
+sent; its first and latest activity; and its principals in a Space-Saving summary [A: Metwally et al., ICDT 2005] of
+`clients_per_shard` slots, so any principal with more than one client seat's share of the repository's work is named
+with bounded error, at bounded cost. A row is dropped with its repository. Its bytes are A-662's and A-714's charges,
+read where they are kept.
+
+**Hot, warm and cold.** A repository's bytes are *hot* (its heads' trees, its works under way, its live intakes),
+*warm* (recent history, as much as its memory share holds) or *cold* (the rest, and every index that can be rebuilt).
+RAM only (R1): there is no disk tier, so cold means compressed, held only on peers, or both.
+
+**Learned demand** (piece 2). For each repository and each principal: decayed rates of works and bytes, their decay set
+by the repository's own measured inter-arrival times; and its working set as a miss-ratio curve built by spatially
+sampled reuse distances [A: Waldspurger et al., "Efficient MRC Construction with SHARDS", FAST 2015], its sampling rate
+derived from the row's memory. A first value is the first work's own size at the rate this machine was just measured
+to do that work, never a literal.
+
+**Shares** (piece 2). Memory: the shard's admittable room (§4.2) split by marginal utility over the repositories' curves
+[A: Qureshi and Patt, "Utility-Based Cache Partitioning", MICRO 2006; A: Beckmann and Sanchez, "Talus", HPCA 2015],
+above a floor of the room over the repositories served now (A-188's share), so a small repository always fits. CPU:
+the shard's step quanta (§4.3) by weighted fair queuing among repositories with runnable work, memory and CPU together
+by dominant-resource fairness [A: Ghodsi et al., NSDI 2011], each weight its learned demand capped at its measured use.
+Every share is work-conserving: room a repository leaves unused is lent, and taken back first from the borrower's own
+cold bytes. Shares are published to the shard's siblings as an immutable snapshot at the learning cadence (D-8), never
+asked for per request.
+
+**Admission and backpressure** (piece 3). A work is admitted against its repository's share, else the room nobody's
+share is using. A work within the floor passes on one counter check (R9's fast path, counted). Past it, the reader is
+paused (the TCP window, the ring's credit) while the projected drain fits the client's deadline; past that, a typed,
+retryable `ShareExceeded { repository, asked, share }` in each tool's words (git's `receive.maxInputSize` line and
+`ERR`, Mercurial's `pusherr`, Subversion's error code). Never an out-of-memory end, and a hot repository never takes
+another's floor.
+
+**The cold trigger** (piece 4). §4.11's cost model, with `value_of_byte` raised by the repository's overrun of its memory
+share, chooses in cost order: drop derived values and caches (pack fragments, reach sets, A-718's deltas: rebuild cost
+times predicted reads against their bytes); compress cold content; hold cold content only at its f+1 holders (§4.10),
+fetched by identity when read.
+
+**Giant repositories** (pieces 5, 6). Load never moves ownership (§4.10). The owner keeps the repository's register (its
+refs and the ordered landing, §4.17.1 intake rule 4), its indexes' tails and fences and its hot set; everything else
+spreads. An intake's decoding, hashing and checks run on the shard its connection arrived at, and only its landing on
+the owner, so one hot repository uses every core. Content is homed by its identity: rendezvous over the content id
+across a node's shards (N=1) and across the region's members (a fleet), one rule (R8). Index tables are content
+(A-581), so a monorepo's cold runs live where their identities home. Nothing is looked up in a catalog (§2 ban 12):
+an id routes to its home.
+
+**The partition's snapshot, sized by its data** (piece 8; main's input from w-perf, 2026-11-20). A partition's
+snapshot is one canonical encoding of all its state in one of two slots of the anchor segment (§4.4, §4.8), each slot
+derived once at boot as twice the measured table bytes (`snapshot_bytes_per_partition`, `crates/server/src/config.rs`)
+and fixed by the segment's geometry: 746,962,928 bytes on the Studio. Every record a partition keeps sums into it. Once
+w-perf's change moves repository bytes out of records into the shard's content arena (records naming identities), the
+snapshot still grows by about 41 bytes a new object: git/git's 424,851 objects about 17 MiB, the Linux kernel's about
+10 million about 410 MiB (58% of a slot), and Google's monorepo, about a billion files in 35 million commits
+[A: Potvin and Levenberg, "Why Google Stores Billions of Lines of Code in a Single Repository", CACM 2016], at least
+41 GB, 55 slots. So two changes, each its own part of the piece:
+1. *What the slot holds.* A repository's object index already seals its rows into immutable sorted tables that are
+   content, at most one window each (A-581). The snapshot names a repository's sealed runs by their fences and root
+   identities, never their rows; the tables are kept where the content they index is kept, and recovered with it. At
+   about 41 bytes a row a window holds about `window / 41` rows, so the snapshot's cost an object falls by that factor
+   (the unsealed tail is bounded by one table). The Linux kernel's index then costs the snapshot about 0.4 MB at a
+   window of sixteen 4 KiB pages (D-6's chunk, 64 KiB), Google's about 40 MB.
+2. *The slot's size.* Derived at every snapshot from the data and the machine (D-11), never fixed: the slot needed is
+   the encoded state's measured size times the headroom its measured growth over one re-lay of the segment takes, and
+   bounded by the partition's share of the machine's memory (§4.2), every input logged. When the next snapshot would
+   pass the slot, the anchor lays out a larger segment generation and moves to it at its next planned handoff (§4.4's
+   handoff, the one path a restart already takes); until then the partition's growth is admitted against the slot's room
+   left, past it refused typed and retryable (`SnapshotRoom`), never written past.
+
+**A giant repository's metadata across partitions** (piece 9). The repository's record, its greens' register and the
+ordered landing stay on its owner partition (§4.17.1 intake rule 4); its object index does not have to. The index is
+cut by the leading bits of the tool's object id into `2^b` ranges: range `r` of repository `R` is held by the partition
+rendezvous ranks first for the key `(R's family, r)` across the region's partitions (A-636 part 2b-2's family key with
+the range beside it), so a look-up routes by id in one hop and nothing is looked up in a catalog (§2 ban 12). `b` is one
+small integer in the repository's record, versioned with it, so every reader at a register position sees one cut.
+- *b derived.* The least `b` at which each range's index fits its partition's index share: `b = ⌈log2(index bytes /
+  the partition's index room)⌉`, its inputs (the index's measured bytes, the partition's measured room) logged. git/git
+  and the Linux kernel are `b = 0`: one partition, the fast path, nothing routed (R9).
+- *A split.* `b` grows by one when a range passes its room: each range's rows divide by the next bit, the new range's
+  owner takes its half (its tables are content: moved by identity, add before remove, §4.10), and the record's next
+  version names the new `b`. A shrink is the reverse. Extendible hashing's directory doubling, kept as one integer
+  [A: Fagin, Nievergelt, Pippenger and Strong, TODS 1979]; Bigtable's tablets split by key range the same way
+  [A: Chang et al., OSDI 2006].
+- *A push.* Its intake routes each object's row to its range's owner, which keeps it in the push's quarantine there as a
+  sealed table, content no index names yet. The landing record on the owner names each range's new tables by identity,
+  and commits them all as one step of the owner's register: no consensus and no second phase (§2 ban 10), since an
+  unnamed table is released as an abandoned push's objects are (§4.17.1 item 4).
+- *Laptop degenerate.* One node's partitions are the region; `b = 0` until one partition's room is passed, then the
+  same split across that node's partitions (R8).
+
+**Laptop degenerate.** One node, f = 0: the same rows, the same formulas; with one repository its share is the whole room.
+
+**Proof** (piece 7). w-perf's `push_load.py` over many repositories of Zipf-distributed sizes and activity, toy to
+giant: per class p50 and p99 latency, resident memory and refusals per repository; no starvation means a small
+repository's p99 stays within a derived bound of its p99 alone.
 
 ---
 
@@ -41926,8 +42161,10 @@ takes the target it expects).
   Last, c lands the clone into the captured tree with an outsider's edit to `/kept`. Its plan must be the agent's
   changes since the capture alone, and the landing must write `/changed` as b left it and `/made` as c did, the
   outsider's file kept.
-- **Not run here.** Integration tests are main's to compile and run. Nothing new in the server's library needed a
-  helper.
+- **Run.** Compiled and passed unchanged, with A-583's two fleet tests, on macOS arm64, local, over 3fee2f575
+  (2026-11-19, w-fed-a503): `cargo test --locked -p slates-server --test fleet -- --exact <name>`, 1 passed (22.5 s);
+  A-583's two, 2 passed (27.2 s); `cargo fmt -p slates-server -- --check` clean. No code fix was needed; the Linux
+  x86_64 lane is owed. Nothing new in the server's library needed a helper.
 
 ### A-555, third piece — A FUSE request that meets a pending base is kept off the device and dispatched again when its fetch lands (2026-11-19, goal g268, UI goal 90; §4.15 "An S3 base", §4.6 "Linux (own /dev/fuse driver)"; A-555; Linux-only, written and filed for main's build)
 Applied in the same change to: `crates/bridge-fuse` (`channel`: `dispatch_kept` beside `dispatch_ready`, both through
@@ -52199,7 +52436,10 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   verdict when its post-state is one git cannot hold; a whole build and a whole map's release sliced a unit at a time
   (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
   source's head is the version it was made at (BUILT 2026-11-20, `paths::branch_before`: the branch's version 0 is that
-  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (A-636's fleet half); a copy made through a work
+  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (BUILT 2026-11-20 through A-636 part 2c-2: a successor's
+  rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
+  recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
+  `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
   by the same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
@@ -54004,3 +54244,387 @@ Applied in the same change to: A-508's owed line (status), GAPS (A-272 (ii)'s A-
   vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, both tests named in the output; fmt clean on the changed files.
 - **Owed.** Forgetting a removed repository's hooks (the table drops them only as one of its hooks runs); Subversion's
   and Mercurial's callers reading and teaching the same table; the daemon's presenter (A-665 part 4).
+
+### A-698 — Commits over ra_svn: the work A-656's connection accepts lands through A-655 part 2b's owner step, for `svn://` and the svn+ssh tunnel alike (2026-11-20, g229, UI goal 93; §4.17.4 items 3.2 to 3.5 and pieces 7 and 12; after A-688, A-656 and A-655 part 2b)
+Applied in the same change to:
+- §4.17.4's status under "The wire" (svn+ssh), after A-688's; GAPS (the §4.17 entry: A-698's line after A-688's,
+  whose owed item it closes);
+- `crates/svn` (`commit::drive::Work::locks`; `serve::Uncommitted::Refused`); `crates/server`
+  (`repository::svn_commit::commit_work` and `Uncommitted::answered`; `vcs_ssh::svn`: `SvnStores::commit`, the
+  accepted work landed and answered; their tests).
+- **The entry** (`commit_work`). A client's accepted work becomes the revision the step commits at the owner's instant
+  (`Revision::of_work`, which gives it its `svn:date`), judged again with the commit's locks at that instant (who
+  commits, the tokens it presented, whether it keeps them: `Work::locks`, which the drive now carries out with the
+  work, since a work whose head moved is merged again and its locks verified as the table stands, as FSFS's commit
+  does), then checked, made the green's next version and appended with its record (A-655 part 2b). `svn://` and the
+  SSH tunnel call it alike: they share A-656's connection.
+- **The answer.** A landed work: `close-edit`'s success, the trivial auth request and `commit-info` (`serve.c`
+  1555-1577), its revision, date and author, no post-commit words (no hook runs yet). A refused one: `close-edit`'s
+  failure, then the client's commands dropped until its `abort-edit` (`editorp.c` 1149-1208): the step's refusals in
+  their own FSFS words (`StepRefusal`); the others, which no FSFS commit meets, in slates' words under the nearest
+  error: the store not held here and the shard's budget and the log's refusal as `SVN_ERR_FS_GENERAL` (160000), a
+  green not at its youngest revision as `SVN_ERR_FS_CORRUPT` (160004), a row the step cannot declare yet as
+  `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
+- **The tunnel.** Its lender lands the work (`SvnStores::commit`): the production lender does so on the owner shard
+  through `commit_work` (g297's, with the lending); the tests' lender through the records' own check and apply. A
+  repository configuring a hook at a point the drive waits on still refuses the commit there, now in words saying the
+  tunnel runs no hook yet.
+- **Tests.** `vcs_ssh::svn::tests::a_stock_commit_lands_through_the_owners_step_as_svnserve_t_answered_it` (the
+  recorded `mkdir` connection, split inside an item, answered byte for byte as stock `svnserve -t` answered it but the
+  author `commit-info` names, the principal the key proved; exit 0; the work landed once, the repository at revision
+  1); `a_work_the_owners_step_refuses_is_answered_as_close_edits_failure` (a step with no room: `close-edit` refused
+  160000 in slates' words, `abort-edit`, exit 0, revision 0); `repository::svn_commit::tests::
+  t_a698_a_clients_accepted_work_lands_through_the_step` (on a real shard: revision 1 dated by the instant and by the
+  work's author, the green at version 1 holding `/trunk`, the register's second record the revision made).
+- **Runs.** macOS arm64, the Mac Studio, kiln r509, 2026-11-20 (00:11 to 00:19Z, load 12 to 17), over main
+  `8c7965bf4` with the change (`ba264d42c`): `cargo fmt -p slates-server -p slates-svn -- --check` clean; red, a scratch
+  copy whose `commit_work` refuses `NotHeld` and whose tunnel refuses every work 200007 as before, `cargo test --locked
+  -p slates-server --lib -- vcs_ssh:: repository::svn_commit:: --test-threads=4` 52 passed, 3 failed (the three
+  above); green 55 of 55; `cargo test --locked -p slates-svn --lib -- commit:: serve:: migration::` 115 of 115. No
+  integration target commits through ra_svn yet: the daemon starts no SSH edge (A-684) and `svn://` opens no
+  repository (g234's lookup).
+- **Owed.** The production lender (g297's); `svn://`'s call once its lookup opens a repository (g234's); a configured
+  hook run, and post-commit's words; the other platforms' runs and the red-checks (main's).
+
+### A-713 — A fetch is admitted what its repository's shard can serve, never one request's room (bug, 2026-11-20, w-git for UI goal 93; found by use by w-interop: with git/git cut at v1.0.0, 2,930 commits in a 3.4 MB pack, the push landed and every clone, over HTTP, over SSH and with `--filter=blob:none`, was refused `upload-pack: the request needs more room than the server admits`; §4.17.2 "A fetch")
+- **Change.** `vcs_http::git::upload::StoreLender::room`: what the shard the stores live on could admit now
+  (`Store::admittable`, as `git_push::push_room` admits a push, A-704). The HTTP site's `Upload` and the SSH site's
+  `UploadCommand` admit each request that room, taken as the request begins, in place of the edge's request room: a
+  long history's walk and its pack's list of objects (eight bytes an object) passed one ring region.
+- **Tests.** `vcs_http::daemon_edge::tests::a_long_history_pushed_over_the_daemons_edge_is_fetched_whole_over_it` (a
+  line of 3,000 commits pushed through the daemon's edge, then fetched as `git clone` asks: red first, the fetch answered
+  `ERR aborting due to possible repository corruption on the remote side.` from the pack's `PastAdmission { asked:
+  72000, left: 38194 }`; green, its pack holds every object pushed). Its client now waits ten liveness windows, as a
+  stock client waits for as long as its server works.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib --
+  vcs_http::git:: vcs_http::daemon_edge:: vcs_ssh:: vcs_store::upload::` 91 passed with the new test named, 2 failed
+  (the Mercurial site's `a_mercurial_repositorys_store_is_served_over_the_daemons_edge` and
+  `stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic`, `503`, failing alike on main
+  bc2803d66, reported); fmt clean on the changed files.
+- **Owed.** upload-pack's answer made in slices (its negotiation and the pack's plan run in one step: a 1,200-commit
+  fetch's ran past a liveness window in a debug build); the git-matrix clone rows by use (main's).
+
+### A-709 — Base hints drained at the kernel's report, one hint set a shard; a delegation lapses at its own deadline (2026-11-20, w-reaper; the event-driven reaper's piece 6; §4.5, §4.7, §4.15; RFC 8881 §10.2; A-122, A-570)
+
+- **What was there.** The reap loop's tick drained every overlay volume's watcher once a liveness window
+  (`daemon::process_base_hints`), then ran `delegation::drain`, whether any watcher had hints or not; an outsider's edit
+  beneath a delegation waited up to a window, and a delegation nobody returned was revoked at the next tick.
+- **Change.** `slates_base::HintSet`: an epoll (`EPOLLIN | EPOLLONESHOT`) or a kqueue (`EVFILT_READ`, `EV_ONESHOT`) of
+  the shard's, each overlay's watcher descriptor entered under its volume's handle (index, generation), so a destroyed
+  volume is a stale handle and a closed watcher leaves the set with its descriptor. `crate::base_hints::watcher`, one
+  task a shard (`LOOP_TASKS_PER_SHARD` 8 -> 9), awaits the set and drains the ready volumes; a volume made, cloned or
+  recovered is entered as it joins the table; a lent-out host is owed until a borrow finds it back. `delegation::drain`
+  arms the deadline keeper at the earliest unreturned recall's lapse (`earliest_recall_ns`). The macOS watcher's kevent
+  calls folded into one (slates-base unsafe 11 -> 10). Windows keeps no watcher: its arms are no-ops (main's build).
+- **Tests.** `slates-server` `base_hints::tests::an_outsiders_edit_is_drained_at_the_kernels_report_without_a_tick`
+  (drained 10 ms after the write, bound half a window); `slates-base` `hint_set::tests` (2);
+  `slates-bridge-nfs` `the_earliest_unreturned_recall_names_when_its_revocation_falls_due`. macOS arm64, Mac Studio.
+- **Applied in the same change to** §4.7's status, GAPS (the reaper series), amendments.tsv.
+- **Owed.** The Linux epoll arm built and run (main's); the idle seal with its purge, then the tick's deletion.
+
+### A-636 part 2c-1 — A repository's record is its own register: shipped to its family's candidates at each change and adopted by its successor (2026-11-20, w-shared for UI goal 93)
+- **Why.** 2c's successor rebuilds a repository from what it holds as a holder, and nothing shipped a repository's own
+  record (its name, tool, object format, owner and policy): the state logs carry its namespace and state, the greens'
+  logs their versions, but no holder could make the repository they belong to. Split from 2c (main, 2026-11-20): 2c-1
+  ships and adopts the record; 2c-2 rebuilds the repository from it and its logs by part 1's rule.
+- **Change.** The record is the value of the repository's own register (its id in the own class, which nothing else
+  used), class byte `REPOSITORY_CLASS` = 6 (`crate::catalog::repository_value`, `repository_of`), a single value a holder
+  keeps at its newest. Its sequence is one past its policy's version plus its names log's position
+  (`repository_sequence`): after its creation a record changes only by a policy setting or a default branch moved,
+  which moves the names log, so one sequence never names two values and each change ships as a newer record. The owner
+  ships it as a volume's catalog ships (`fleet::owed_repositories`, through `owed_record` and the record plane's
+  rounds), to its family's candidates (A-636 part 2b-2); a repository lost to a successor ships nothing. A successor's
+  adoption reads it by its class (`takeover::adopt_own`) and keeps it as a pending repository with the sequence adopted
+  (`ShardState::pending_repositories`, counted `fleet.takeover.repository_adopted`), never as a volume or a green.
+- **The cost.** One more register commit per names change or policy setting, beside the names log's own part; batched
+  with it later (owed).
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20: `cargo test --locked -p slates-server --lib -- fleet::state_log_tests
+  takeover:: state_log mirror:: repository::tests --test-threads=4` 33 of 33; fmt clean). `slates-server` `fleet::state_log_tests::an_owners_repository_record_is_owed_to_its_familys_candidates_at_each_change`
+  (owed at 5 to the family's candidates, held by both, owed again at 6 after a retire);
+  `takeover::tests::a_repositorys_record_is_adopted_as_its_own_never_as_a_volume_or_a_green` (kept pending with its
+  sequence, counted once; a cut-short value and one of another class kept as none).
+- **Owed.** The rebuild (2c-2): once a repository's record and its four state logs are adopted and its greens rebuilt,
+  its successor keeps each state log's records only where every log they span holds them whole (part 1's rule, a
+  green's log judged by its adopted head), records the repository whole in its database and makes its store from the
+  log; the record's commit batched with the names log's part.
+
+### A-715 — The idle sweep at its own deadline; the reap loop and its tick deleted (2026-11-20, w-reaper; the event-driven reaper's last piece; §4.2, §4.7; A-99, A-105, A-117, A-214, A-226, A-709)
+
+- **What was there.** `daemon::reap_loop` paced a liveness window and ran the idle sweep (`seal_idle_content`, then
+  `purge_if_idle`) on every shard at every tick, owed or not; it was the last job on the tick.
+- **Change.** `crate::idle_sweep`: one task a shard (the reap loop's slot, `LOOP_TASKS_PER_SHARD` unchanged) runs a pass
+  when the deadline keeper reaches `idle_sweep_at`. Each state borrow closes by arming it a liveness budget on when the
+  shard owes a pass: a sealing volume's write was stamped (`Store::sweep_owed`, new, set at the stamp), the content
+  arena's allocation count or allocated bytes moved since the last pass, or frees are deferred. A pass that does not
+  settle the shard (a file not yet aged, a publication, a busy arena, a give-back that left slices) arms the next; one
+  that settles arms nothing. The first pass is armed at the shard's start for the recovery give-back. The aging rule
+  (sealed one to two intervals after the last write) and the purge's idle test are unchanged. `reap_loop` deleted.
+- **Tests.** `slates-server` `idle_sweep::tests::an_idle_shard_runs_no_sweep_pass` (no pass in three intervals once
+  settled) and `a_write_on_a_settled_shard_arms_a_pass`; `give_back`, `purge`, `deadlines`, `base_hints`, `idle` lib
+  filters green; `slates-vfs --lib seal` green. macOS arm64, Mac Studio.
+- **Applied in the same change to** §4.7's status, GAPS (the reaper series closed), amendments.tsv.
+- **Owed.** Linux runs of `recovery.rs`'s idle-sweep tests (`a_sealed_files_plaintext_leaves_the_content_object`,
+  `a_deleted_files_plaintext_leaves_the_content_object`, `a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted`,
+  `a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it`) (main's).
+
+### A-636 part 2c-2 — A successor rebuilds a repository taken over whole from its record and the logs it holds (2026-11-20, w-shared for UI goal 93)
+- **Why.** 2c-1 ships a repository's record to its holders and keeps it pending on its successor; nothing yet made the
+  repository again there, so a repository whose owner left had no record, namespace or state on any surviving node.
+- **Change.** The rule (A-636 part 1's, over parts): `slates_db::repository::whole_parts` keeps each state log's parts
+  that continue it from its start, then drops every operation some log it moved does not hold whole, with what follows
+  it in each state log, until every operation kept is whole; a state log holds an operation's span where its part over
+  those positions names the operation, a green's log where the green's head is at or past the span's end. The record:
+  `Op::RepositoryRebuilt { record, parts }` (appended, wire order published), guarded as a creation (name and id free,
+  under capacity; its policy whatever it was set to), each log's parts its own and contiguous from its start, each
+  change of its log, each green it names of its family and held by no other repository; applied as each part's changes
+  were first made, each log left at its last part's position, each operation that moved a green's log and another kept
+  as its atomic record, taking no position a record ships from; its state and policy charged to the merge budget. The
+  server: `takeover::repositories_ready` (the record adopted, no register of its family still learned by any round,
+  none of its greens still materializing; its parts read from this node's acceptors), then
+  `takeover::rebuild_repository` on the shard its id routes to, called each period after the greens'
+  materialization (`fleet::rebuild_adopted_repositories`): the parts kept by the rule with that shard's green heads,
+  the op recorded, the store made from the log (`vcs_store::make_from_log`); counted
+  `fleet.takeover.repository_rebuilt`, `repository_operation_dropped`, `repository_unrebuilt` (a refusal, logged, not
+  attempted again).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-db`
+  `repository::tests::a_successor_keeps_each_operation_whole_and_drops_what_a_log_lacks` (a push past the green's head
+  dropped with the name after it, an operation whose other log lacks it dropped, a part past a gap never kept; at the
+  head, kept) and `a_rebuilt_repository_is_recorded_whole_as_its_logs_left_it` (membership, binding, lock and
+  positions, kept by a snapshot; a second record `AlreadyExists`; gapped, misowned, stranger's and taken parts
+  `Corrupt`, nothing applied): `cargo test --locked -p slates-db --lib -- repository::` 29 of 29; `wire_order` 2 of 2.
+  `slates-server` `fleet::state_log_tests::a_successor_rebuilds_a_repository_whole_from_the_logs_it_holds` (a names
+  log held as shipped, the record adopted: rebuilt with `main` alone, the push dropped, its store made; again, standing):
+  `cargo test --locked -p slates-server --lib -- fleet::state_log_tests takeover:: state_log mirror:: repository::tests
+  --test-threads=4` 34 of 34. fmt clean.
+- **Owed.** A state log's parts the successor does not hold, fetched from its holders before the rule runs (as a green's
+  missing records are, A-364); the store's objects (`RepositoryEntry::objects`; no part carries them, so a rebuilt
+  store holds none yet) rebuilt by content identity once entries and the tools' stores name content held once in the
+  green family's pool, which the successor holds by A-636's placement (Ada's ruling 2026-11-20: content held once for
+  every tool; no separate shipping); the gate's fleet run (a repository's owner killed, its successor
+  serving it), main's.
+
+### A-719 part 1 — A push's checks are made a turn at a time (bug, 2026-11-20, w-git for UI goal 93; found by use by w-interop: stock git's push of git/git, all refs, a 607 MiB pack, over HTTP and over SSH: about four minutes in its shard ran 3,559 ms of CPU without a step, the anchor restarted the daemon, and git hung on `unable to rewind rpc post data`; §4.17.2 "A push" items 4 and 5; §4.3)
+- **Found.** A 3,000-commit push through the daemon's edge (debug build) ran its whole pack's checks in the step that
+  took the pack's last bytes (every object fsck'd, then the connectivity walk's two passes and propagation: 180 to
+  970 ms), then one answer step admitting every object to the quarantine and deciding every command (525 ms to 2.7 s);
+  the shard's longest step was the push's. Each scales with the pack.
+- **Change (part 1).** `slates_git::receive::Checking`: the checks made a turn at a time, each turn for its quantum and
+  at least one unit (an object fsck'd; the objects indexed; an object of either pass of the walk, `connect::Walk`; the
+  propagation). `check` runs the same machine whole. A session whose pack has ended holds it (`Session::is_checking`)
+  until `Session::check_turn` has made every check; `ReceivePack::answer_step` makes one turn a step under the shard's
+  step quantum (`DaemonConfig::step_quantum_ns`, `git_push::ShardClock`) and answers `Answering::Turned` (renamed from
+  `Sealing`: a turn of the push's work, its checks' or a hook's view's sealing), on which both edges yield and step
+  again.
+- **Tests.** `slates-git` `receive::tests::session::a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole`
+  (each captured push's checks made a unit a turn: at least a turn an object, answered as the push held whole); the
+  session tests and part 2's works test now make the checks before reading the checked push.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- receive::
+  protected_fixtures` 51 of 51 with the new test named; `cargo test --locked -p slates-server --lib -- git_push::
+  git_hooks:: vcs_http::git:: vcs_http::daemon_edge::tests::a_ vcs_ssh::tests::receive vcs_ssh::receive` 42 passed, 1
+  failed (the Mercurial site's `a_mercurial_repositorys_store_is_served_over_the_daemons_edge`, failing alike on main);
+  fmt clean.
+- **Owed (A-719's next parts, main's ruling 2026-11-20, the rule for every tool's push, §4.17.1).** A push's working
+  set is bounded whatever its size: the intake streamed, each object decoded as it arrives and stored once in the
+  content store, deltas resolved against bases already stored (an offset delta's in the pack, a thin pack's reference
+  delta's in the repository), no whole pack held; admission charging that working set and the content charged as it is
+  stored (A-714's retention), refused typed at the shard's room; the quarantine's admission and the verdicts made a turn
+  at a time; the by-use proof over w-interop's v2.0.0 cut and whole git/git.
+
+### A-664 holders' maps — A successor's rebuilt repository holds each green's map and trees (2026-11-20, w-shared for UI goal 93)
+- **Why.** A-664 part 3 keeps each git green's map of paths and its head's trees on the owner, made again by a recovery
+  and a rebuild; a successor that rebuilt a repository it took over (A-636 part 2c-2) made its store and no map, so its
+  greens' next versions could not derive their commits from the head they adopted.
+- **Change.** `vcs_store::make_whole`: the store made from the log, then each member green's map and trees from its
+  head (`paths::remake`), in one step; `vcs_store::rebuild` and `takeover::rebuild_repository` both call it. The maps
+  are derived from the greens' own content, so they need nothing shipped beside the logs.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::paths::tests::t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map` (two versions of a
+  file, the repository's record and store dropped leaving its green, rebuilt from its record and names log as a
+  successor does: the head's map equal to its model, remade once; the next version derived from it): `cargo test
+  --locked -p slates-server --lib -- vcs_store::paths:: vcs_store::commits:: fleet::state_log_tests takeover::
+  --test-threads=4` 34 of 34; fmt clean.
+- **Owed.** The fleet gate by use (a git repository's owner killed, its successor answering a stock clone and taking the
+  next submit), main's.
+
+### A-719 part 2 — A pack is read into a keeper, its working set bounded whatever its size (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" item 3)
+- **Change.** `slates_git::unpack::Keep`: the reader hands its keeper each object as it resolves, with the hold
+  (`Admission::hold`) its bytes took, and reads a delta's base back from it; it keeps only what names each object
+  (`Reader::read_into`, `Reader::finish_into`, answering each object's place, `Placed`, in pack order). A keeper that
+  stores objects elsewhere gives each hold back, so the reader's admission bounds its working set (the entry being read,
+  a delta with its base and its target, the deltas waiting for their bases, its tables), not the pack. `Held`, the
+  reader's own keeper, keeps every object and its charge, so `Reader::read`, `Reader::finish`, `finish_with` and
+  `read_whole` answer and charge as before. The rule it serves is written into §4.17.1 ("A push's intake").
+- **Tests.** `slates-git` `unpack::tests::a_pack_read_into_a_keeper_that_stores_elsewhere_holds_a_bounded_working_set`
+  (the 300-deep chain read into a keeper that stores elsewhere, fed in pieces of 61 bytes, under an admission of its
+  tables and eight versions, which cannot hold a third of its targets: every object as the pack read whole makes it;
+  read into memory under the same admission, refused).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- unpack:: receive::
+  protected_fixtures store:: upload::` 224 passed, 4 ignored, the new test named; fmt clean.
+- **Owed.** Part 3: git's intake keeping into the repository's store as the pack is read (the session and the push
+  driver over a store keeper, the checks reading objects back from it), on w-perf's byte table once it lands.
+
+### A-664 sliced whole builds, part 1 — A recovery's remake of a green's map steps a file a unit (2026-11-20, w-shared for UI goal 93)
+- **Why.** A recovery made each git green's map and trees again from its head in one unit of its slices
+  (`crate::recovery_slices`): putting every file of the head, hashing each as git's blob, then building the map and
+  trees. A green of many files is one unit as long as its build, so the watchdog, which judges a shard that runs a
+  liveness window of CPU without a step, could end a daemon restarting over a large repository.
+- **Change.** `paths::remake_green_sliced`, which `vcs_store::recover` calls for each member green: the head's files
+  put one a unit of the recovery's slices (`put_sliced`), then the map and trees built of them and kept as
+  `remake_green` keeps them (`Plan::Put`, through `made_holding`, which gives the put files' holds back with the
+  step's own, past a refusal too). A recovery runs alone on its shard, so nothing reads the green or its store between
+  units. `remake_green` stays for a rebuild and a successor's (both run inside one step of a verb or a period).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::paths::tests::t_a664_sliced_a_recoverys_whole_build_steps_a_file_a_unit` (six files, the map given back,
+  remade in slices whose least is a nanosecond: polled more than once, six units, the map equal to its model, remade
+  once): `cargo test --locked -p slates-server --lib -- vcs_store::paths:: vcs_store::commits:: vcs_store::tests
+  --test-threads=4` 26 of 26; fmt clean.
+- **Owed.** The map's and trees' build of the put files in slices of their own (one unit now); the live whole builds
+  (a push's, a green's first submit's, one past a copy), whose version's made commit needs the trees in the version's
+  own transaction; a whole map's release (`ContentStore::release`'s cascade) a unit at a time; recovery's timing over a
+  large repository (main's).
+
+### A-724 — Many repositories on one server, balanced by learned usage; piece 1: each repository's usage counted on its owner shard (2026-11-20, w-balance; Ada's goal of 2026-11-20; §4.17.5, §4.17.1 "Every tunable is learned online", D-11, D-28)
+- **Why.** One server must serve toy repositories and several Google- or Meta-size monorepos at once, dividing memory,
+  CPU, admission and placement by what agents and clients do, never by fixed shares. w-perf measured 100 concurrent
+  pushes into 100 repositories holding 28 GB, nothing dividing it (release 7b46fbdcd, Mac Studio).
+- **Design.** §4.17.5, new: costs hot, warm and cold; learned demand (decayed rates, SHARDS miss-ratio curves); shares
+  by utility-based partitioning and dominant-resource fairness, work-conserving; admission by share with backpressure
+  and a typed refusal; §4.11's cost model as the cold trigger; a giant repository's intake and content spread by
+  identity while its ownership stays. Evidence: Metwally ICDT 2005, Waldspurger FAST 2015, Qureshi MICRO 2006, Beckmann
+  HPCA 2015, Ghodsi NSDI 2011 (all A).
+- **Change (piece 1).** `slates_vcs::usage`: a `Ledger` of one `Usage` row a repository (intakes and fetches begun,
+  answered, steps, step time, bytes in; first and latest activity; principals in a Space-Saving summary of `k` slots).
+  The server keeps one on each shard (`ShardState::vcs_usage`, `k` = `clients_per_shard`); git's `ReceivePack` counts
+  a push as it starts, each input, end and answer step with its time, and the push answered; `vcs_store::upload::lend_on`
+  counts a fetch request and every lent step; `vcs_store::free` drops the row.
+- **Tests.** `slates-vcs` `usage::tests` (an oracle over 300 generated histories: rows equal an exact model, rows
+  dropped with their repository, and the summary within Space-Saving's bounds, every principal past `begun / k` named;
+  a heavy principal named exactly; rows apart); `slates-server`
+  `git_push::tests::t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row` (stock git's fixture pushes counted
+  on the pushed repository's row, bytes exact, its owner named for each; an idle repository has none).
+- **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
+- **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
+  Subversion's intakes and reads counted; the rows in `slates status`.
+- **Piece 2, the division (2026-11-20).** `slates_vcs::share::divide`: a shard's capacity of each resource divided among
+  repositories' claims (a measured demand vector and a weight) by weighted DRF with demands as caps [A: Ghodsi et al.,
+  NSDI 2011]; each pass finds exactly the largest level no resource overflows by walking the claims' breakpoints
+  `δ_i / w_i`, settles the claims that are whole or use a full resource, and goes on (at most one pass a resource).
+  Tests: `share::tests` (an oracle over 500 generated divisions of two resources among up to twelve weighted claims
+  against a serial bisection reference, with capacity, cap, work-conservation and the paper's sharing incentive held;
+  the paper's own 9-CPU, 18-GB example; a monorepo beside a toy; degenerate claims never not-a-number). The oracle's
+  first runs found a resource with no room left that the remaining claims never use stopping them at level zero, fixed.
+  Owed: the demands read from the usage rows and the weights learned (piece 2's other half), feeding admission (3).
+- **Piece 3a, one room (2026-11-20).** `crate::vcs_share::room` replaces `git_push::push_room` at every caller (git's
+  push, git's fetch over HTTP and SSH through `StoreLender::room`, which now names the repository, and Mercurial's
+  `HgStores::push_room`); a `vcs_share::Live` guard counts a push live from `ReceivePack::start` until it drops. Tests:
+  `slates-server` `vcs_share::tests` (alone: all the shard admits by the fast path; beside a monorepo with no history:
+  an equal half, bound by the share; once the monorepo's intakes are known small: all but that; a real push live from
+  its start to its drop), with `git_push::` and `vcs_store::upload::` 16 of 16 and `vcs_http::git:: vcs_http::hg
+  vcs_ssh::` 84 of 85; the one failure, `vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it`
+  ("a step that waits"), fails alike on main b0655e8a3 and is reported.
+
+### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
+
+Applied in the same change to: `crates/git` (`receive::Session::take_pack`: the pack's bytes kept as they arrive,
+charged to the session's admission); `crates/server` (`vcs_store/record.rs`, version 2; `vcs_store.rs`'s replay of a
+version-2 record through git's own reader, `StoreBases`, `ReplayRefused::Pack`, `GitPush::keep_pack`; `slates_git::pack::of_whole`; `git_push.rs`'s
+`prepare`); §4.17.1's status; GAPS (§4.17); BENCHMARKS.md's concurrent-push entry, which measured the cost.
+
+- **The end state** (main's convergence plan, approved 2026-11-20). One copy of every file byte, in the greens' files,
+  deduplicated by identity (§4.11; §4.17.1 row "Objects"); each tool's own objects an index by the tool's id over
+  content identities, small; a push a work whose post-state carries what it brings, judged by §4.16's verdict, durable
+  when its merge record commits (§4.17 "Role"); fragments and packs derived and charged to the shard. A repository then
+  costs about one to two times its compressed pack. Today it costs far more: one 3.43 MB push of git/git cut at v1.0.0
+  kept 229 MiB (the store's inflated objects 69.1 MiB, the register entry's copy 63.5 MiB, the arena grown for them
+  63.7 MiB), and a Subversion text was held four times (BENCHMARKS.md).
+- **The push bound.** A push streams: per connection the server holds the window it is decoding (one ring region's
+  worth, derived) and a delta's base, and the rest of the pack waits in the client's socket, so TCP's flow control is
+  the backpressure, never the server's memory. Admission charges each push's window and post-state to its owner
+  shard's budget, and a push past it is refused typed before its body is read (git's `unpacker error`, HTTP 503 with a
+  retry), never by running out of memory. A work is cheap to make (R9), so ten thousand concurrent pushes cost ten
+  thousand windows plus what they bring, once.
+- **The steps.** S1 (w-perf, this entry): a register entry holds no inflated copy. S2 (w-perf): the content history's
+  latest value names the file's block, so a green holds a changed file once; A-716's identity table stays as the
+  green's identity -> block index, and its hold by bytes goes once S3 and S5 land bytes as work operations. S3 (w-git,
+  A-722): git's streaming intake lands blobs as the push work's file operations and keeps the store as an index with
+  the client's deltas. S4 (w-svn and w-perf, A-716 slices 2 and 3): Subversion's records name texts by identity. S5
+  (w-hg): Mercurial's filelog texts as green files by identity, its changelogs and manifests as deltas in its index.
+- **What remains duplicated, said plainly.** A head version's blobs exist raw in the green (what a checkout mounts) and
+  compressed in the recorded pack (what a recovery replays): the hot and cold copies §4.11's cost model would choose
+  between, kept until S3's index reads the pack in place.
+- **S1, built.** A git push's record (version 2) names each object the repository lacked by its type, content identity
+  and length (41 bytes), then holds the push's pack as the client sent it, compressed and with its deltas; only the
+  first append of a push that brings objects carries it. The receive session keeps the pack's bytes as they arrive,
+  charged to its admission (`Session::take_pack`). A replay reads the objects back through git's own reader, a
+  reference delta's base from the pack or the store, admits each as a live push does, and refuses a pack whose objects
+  are not the names, in order (`Diverged`), or one git's reader refuses (`Pack`). Objects no client sent as a pack (the
+  server's own commits, A-664 part 3) are recorded as a pack of whole objects, deflated
+  (`slates_git::pack::of_whole`), so every record is a pack and a replay has one path. Version-1 records, each object inflated, are still read: a segment
+  holds entries written by them. For the measured push the entry goes from 63.5 MiB to about the pack's 3.4 MB.
+- **Owed.** A pack past an entry's bound recorded in bounded parts across entries (git/git's whole pack is 607 MiB
+  against the Studio's 746,962,928-byte segment region, the wall a 5,000-revision Subversion import met at revision
+  3,540); the objects the repository already holds left out of the recorded pack; the push_load re-run at N = 1, 10 and
+  100 once S1 and S3 are in, against today's 229 MiB a push.
+- **Pieces 8 and 9, designed (2026-11-20, main's input from w-perf).** §4.17.5 "The partition's snapshot, sized by its
+  data" and "A giant repository's metadata across partitions": a slot of 746,962,928 bytes fixed at boot holds every
+  record of its partition, and about 41 bytes an object puts the Linux kernel at 58% of it and Google's monorepo
+  (Potvin and Levenberg, CACM 2016) at 55 slots. The snapshot names a repository's sealed index tables by identity, not
+  their rows; the slot is derived at each snapshot and grown by a re-laid segment at a handoff, refused typed before it
+  is passed; an index is cut into `2^b` ranges by object id, each range held where rendezvous over `(family, range)`
+  ranks first, `b` one integer in the repository's record, a push's rows committed by the owner's one landing record.
+  Nothing built yet.
+
+### A-727 — Repository bytes leave the partition snapshot: the version-control content store in the shard's chunk arena, its table in the shard image, records naming identities (2026-11-20, w-perf for UI goal 93; main's ruling, option 2; §4.17.1 "Objects" and "Durability and residency", §4.8 "Recovery", §4.10, A-64, A-99, A-662, A-716, A-723)
+
+Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (d) below build it.
+
+- **Why.** The wall a 5,000-revision Subversion import met at revision 3,540 (`Unpublished { ... profile of 803,344,210
+  bytes exceeds its 746,962,928-byte region }`) is the partition's snapshot, not an entry: `slates_db`'s `snapshot`
+  publishes the whole partition (`Partition::to_snapshot`) into one anchor slot region, and the register keeps every
+  repository entry's record bytes, so the snapshot is the sum of every retained record. Splitting a pack across
+  entries leaves that sum as it is (A-723's owed "bounded parts" was withdrawn for it). git/git's whole pack, 607 MiB as
+  A-723's version 2 records it, would sit near the slot alone.
+- **Where the bytes go.** `slates_vcs::ContentStore` keeps its windows, today process heap, as sealed chunks of the
+  owner shard's chunk store (`slates_vfs::content::ChunkStore`) in that shard's arena range of the anchor's content
+  object (A-64): written there once, immutable once sealed (D-6), sealed under the shard's cipher where it seals (A-99),
+  surviving a daemon restart because the anchor holds the object. Its windows are already cut at the content plane's
+  chunk window and named by plain BLAKE3, as a volume's sealed chunks are, so a repository's window and a green's file
+  chunk of the same bytes can be one block; A-716's table (`crates/merge/src/held.rs`) stays the green's identity ->
+  block index over the same arena.
+- **What a record holds.** Identities only. git's record version 3: the moves, each new object's name (type, identity,
+  length: 41 bytes), and the pack's root identity (the pack put as content, its windows under a list); A-723's version 2
+  (the pack's bytes) and version 1 (objects inflated) stay readable. Subversion's records name their texts (A-716's
+  slices 2 and 3, with w-svn); Mercurial's its texts (w-hg's S5). The partition's snapshot then carries metadata: about
+  41 bytes a new object (git/git, 424,851 objects: about 17 MiB; the Linux kernel's ~10 million: about 410 MiB, near a
+  slot), which w-balance derives and spreads (§4.17.5).
+- **Order: content, then image, then entry, by group commit.** A push's content is written into the arena as it
+  streams, charged by admission. Before an entry naming it commits, the owner shard's image (A-64's barrier: 0.11 to
+  0.16 ms at 256 MiB) lists the content's chunks, so no durable record ever names content no durable image holds. One
+  publication covers every push whose content was written before it: entries wait on the next barrier and never each
+  start one, so ten thousand concurrent pushes share barriers (main's requirement; measured at load by
+  `push_load.py`).
+- **Recovery.** The shard images first (their content tables restore each `ContentStore`'s entries over the chunks
+  the arena still holds, through `ChunkStore::claim_chunk_blocks` and `adopt_chunk`, as volumes' chunks are), then
+  the partition's snapshot and log, whose records find their content by identity. A record naming content no image
+  holds is refused typed (the order above never makes one).
+- **Replication.** Content ships as content (§4.10: by identity, deduplicated at the holder) before the record that
+  names it, so a holder replaying a record holds what it names.
+- **The read seam (slice a1).** A sealed chunk is read by copying it out (and decrypting it where sealed under a
+  cipher), so `ContentStore::windows` cannot keep lending `&[u8]` slices of its own storage. Its nine readers in the
+  tools' stores and the server read through a copy-out (`read_into`, or a `Cow` that borrows where the storage can
+  lend). Slices: (a1) the content store's storage behind a seam and its readers over the copy-out, the heap storage
+  kept for tests and tools; (a2) the arena storage over the shard's chunk store, with A-64's rule that a block the
+  committed image names is not reused before a newer image commits; (a3) the content table in the shard image and its
+  recovery before the records; (b) git's record version 3; (c) Subversion's texts with A-716's slices; (d) replication's
+  content-before-record order, held by the two-node test.
+- **Piece 4a, what an overrun drops first (2026-11-20).** `slates_vcs::cold::choose`: §4.11's cost model over a
+  repository's rebuildable values (bytes, measured rebuild time, expected reads): a value is dropped when its bytes'
+  worth at the repository's pressure passes its rebuilds' cost, highest saving a byte first, until the overrun is
+  covered (Dantzig 1957's greedy order). `slates_git::store::Repository::kept_fragments` lists each version's kept
+  fragments with the bytes dropping them gives back (content and entries' charge), and `drop_fragments` lets them go, the
+  next fetch encoding the version again (A-718). Tests: `slates-vcs` `cold::tests` (an oracle over 500 generated choices
+  against a serial reference: positive savings, a prefix of the order, the overrun covered by the shortest such prefix;
+  pressure letting a costly cache go); `slates-git` `store::tests::fragments::a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same`
+  (the bytes given back exact, the version re-encoded to the same fragments, the pack read back whole). Owed (4b): the
+  server's trigger (a repository whose grant `vcs_share::room` finds below what it holds drops by this choice, its
+  reads from its usage row, its rebuild times measured), then compression of cold content.

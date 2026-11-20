@@ -82,7 +82,7 @@ use super::{CommitRefusal, check_out_of_date, verdict};
 use crate::authz::{Access, Authz, Principal, PrincipalRules, RepositoryPath};
 use crate::index::{
   Action, ChangedPath, ContentIdentity, CopySource, Index, IndexRefusal, NodeKind, PropertyList,
-  Revision, RevisionRecord, Text,
+  PropertyPairs, Revision, RevisionRecord, Text,
 };
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockRefusal, LockTable};
 use crate::mergeinfo::{Mergeinfo, MergeinfoRefusal};
@@ -689,6 +689,23 @@ impl From<SvndiffError> for Stop {
   }
 }
 
+/// What one command a caller made itself came to ([`Drive::edit`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Edited {
+  /// Taken; the drive goes on.
+  Taken,
+  /// `abort-edit` taken: the drive is over.
+  Aborted,
+  /// `close-edit`'s verdict accepted the work: the caller commits it.
+  Accepted(Box<Work>),
+  /// A hook is due: answer it with [`Drive::resume_edit`].
+  Hook(Due),
+  /// Refused, with `svnserve`'s errors, outermost first: the drive is over.
+  Refused(Vec<(u32, String)>),
+  /// The drive was over already, or the command could not be read: nothing more is taken.
+  Closed,
+}
+
 /// What the drive made of one item.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
@@ -747,7 +764,7 @@ pub struct Pending<'drive> {
   /// The texts it made, by identity.
   pub texts: &'drive BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists it made, by identity, each sorted by name.
-  pub property_lists: &'drive BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  pub property_lists: &'drive BTreeMap<ContentIdentity, PropertyPairs>,
 }
 
 /// An accepted work: what the caller commits.
@@ -768,7 +785,10 @@ pub struct Work {
   /// The texts the work made, by identity.
   pub texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists the work made, by identity, each sorted by name.
-  pub property_lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  pub property_lists: BTreeMap<ContentIdentity, PropertyPairs>,
+  /// The commit's locks: who commits, the tokens it presented and whether it keeps them, which the owner's step judges
+  /// the work again with where its verdict's facts moved (A-655 part 2b; A-698).
+  pub locks: CommitLocks,
 }
 
 /// Where the drive is.
@@ -835,7 +855,7 @@ struct File {
   /// Its full path.
   path: String,
   /// Its text delta, while one is open.
-  delta: Option<Delta>,
+  delta: Option<Box<Delta>>,
   /// Whether its write was checked (`checked_write`): from the start for one the drive added.
   checked: bool,
 }
@@ -940,7 +960,7 @@ fn presented_locks(
 /// `lookup_access` for a write (`serve.c` 760-791): the session's level from `svnserve.conf`, then the rules, at
 /// `path` or, for none, anywhere in the repository (`svn_repos_authz_check_access` with no path), then a name when
 /// one is needed.
-fn may_write(session: &Session<'_>, path: Option<&str>, needs_username: bool) -> bool {
+pub(crate) fn may_write(session: &Session<'_>, path: Option<&str>, needs_username: bool) -> bool {
   let level = if session.user.is_some() {
     session.authenticated
   } else {
@@ -1251,7 +1271,7 @@ pub struct Drive {
   /// The texts the work made.
   texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists the work made.
-  property_lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  property_lists: BTreeMap<ContentIdentity, PropertyPairs>,
   /// The bytes held: the work's texts and property lists, and its open deltas'.
   held: usize,
   /// The kinds of the nodes the drive deleted and then replaced, by path, for a deletion of the replacement.
@@ -1349,6 +1369,102 @@ impl Drive {
       }),
     };
     self.answer(outcome, out)
+  }
+
+  /// Presents `token` for the repository path `path` while the drive runs (A-681: an HTTP client presents a lock's token
+  /// with each request that changes the path, in its `If` header, and every token again in its MERGE's
+  /// `S:lock-token-list`), as ra_svn's `commit` presents its tokens at the start: a later call meeting the path's lock,
+  /// and the verdict, judge it with this token.
+  pub fn present_lock(&mut self, path: String, token: String) {
+    self.setup.locks.presented.insert(path, token);
+  }
+
+  /// Whether the commit keeps the locks it presented (`X-SVN-Options: keep-locks`, ra_svn's `keep-locks`), decided
+  /// before `close-edit`.
+  pub fn keep_locks(&mut self, keep: bool) {
+    self.setup.locks.keep = keep;
+  }
+
+  /// Takes one editor command a caller made itself (A-681: the HTTP site's commits, which arrive as requests, not as
+  /// ra_svn items), answering what it made typed, with no ra_svn bytes: a refusal comes back as `svnserve`'s errors,
+  /// outermost first ([`Drive::errors`]), and ends the drive, as the early-error rule leaves nothing after it.
+  pub fn edit<G: Green + ?Sized>(
+    &mut self,
+    index: &Index,
+    green: &G,
+    locks: &LockTable,
+    command: &EditCommand<'_>,
+  ) -> Edited {
+    if self.phase != Phase::Driving {
+      self.phase = Phase::Done;
+      return Edited::Closed;
+    }
+    let world = World {
+      index,
+      green,
+      locks,
+    };
+    let outcome = self.run(&world, command);
+    self.edited(outcome)
+  }
+
+  /// Takes the answer of the hook the last [`Drive::edit`] waits for, as [`Drive::resume`] takes it, answering typed.
+  pub fn resume_edit<G: Green + ?Sized>(
+    &mut self,
+    index: &Index,
+    green: &G,
+    locks: &LockTable,
+    answer: Result<(), Vec<(u32, String)>>,
+  ) -> Edited {
+    let Phase::Waiting(pause) = self.phase else {
+      self.phase = Phase::Done;
+      return Edited::Closed;
+    };
+    self.phase = Phase::Driving;
+    if let Err(errors) = answer {
+      self.phase = Phase::Done;
+      return Edited::Refused(errors);
+    }
+    let outcome = match pause {
+      Pause::OpenRoot => self.make_root(),
+      Pause::CloseEdit => self.judge(&World {
+        index,
+        green,
+        locks,
+      }),
+    };
+    self.edited(outcome)
+  }
+
+  /// What a command's outcome made, typed ([`Drive::edit`]).
+  fn edited(&mut self, outcome: Result<Outcome, Stop>) -> Edited {
+    match outcome {
+      Ok(Outcome::Taken) => Edited::Taken,
+      Ok(Outcome::Aborted) => {
+        self.phase = Phase::Done;
+        Edited::Aborted
+      }
+      Ok(Outcome::Accepted(work)) => {
+        self.phase = Phase::Done;
+        Edited::Accepted(work)
+      }
+      Ok(Outcome::Hook(due)) => {
+        self.phase = Phase::Waiting(match due {
+          Due::StartCommit { .. } => Pause::OpenRoot,
+          Due::PreCommit { .. } => Pause::CloseEdit,
+        });
+        Edited::Hook(due)
+      }
+      Err(Stop::Close) => {
+        self.phase = Phase::Done;
+        Edited::Closed
+      }
+      Err(Stop::Refused(refusal)) => {
+        let errors = self.errors(&refusal);
+        self.phase = Phase::Done;
+        Edited::Refused(errors)
+      }
+    }
   }
 
   /// The transaction as a hook reads it while its command waits ([`Step::Hook`]): its name, base, revision properties,
@@ -1450,15 +1566,10 @@ impl Drive {
         "Invalid control character '0x{byte:02x}' in path '{}'",
         escaped(path)
       ),
-      DriveRefusal::NotRegular { name } => format!(
-        "Storage of non-regular property '{name}' is disallowed through the repository interface, and could \
-         indicate a bug in your client"
-      ),
-      DriveRefusal::NotUtf8 { name } => {
-        format!("Cannot accept '{name}' property because it is not encoded in UTF-8")
-      }
-      DriveRefusal::NonLf { .. } => "Invalid property value".to_owned(),
-      DriveRefusal::BadDate => "Wrong or unexpected property value".to_owned(),
+      DriveRefusal::NotRegular { .. }
+      | DriveRefusal::NotUtf8 { .. }
+      | DriveRefusal::NonLf { .. }
+      | DriveRefusal::BadDate => property_message(refusal),
       DriveRefusal::MergeinfoTerminator { path } => format!(
         "Commit rejected because mergeinfo on '{path}' contains unexpected string terminator"
       ),
@@ -1477,17 +1588,7 @@ impl Drive {
   /// another (`marshal.c` `svn_ra_svn__write_cmd_failure` writes each).
   pub fn errors(&self, refusal: &DriveRefusal) -> Vec<(u32, String)> {
     match refusal {
-      DriveRefusal::NonLf { name } => vec![
-        (SVN_ERR_BAD_PROPERTY_VALUE, self.message(refusal)),
-        (
-          SVN_ERR_BAD_PROPERTY_VALUE_EOL,
-          format!("Cannot accept non-LF line endings in '{name}' property"),
-        ),
-      ],
-      DriveRefusal::BadDate => vec![
-        (SVN_ERR_BAD_PROPERTY_VALUE, self.message(refusal)),
-        (SVN_ERR_BAD_DATE, "Bogus date".to_owned()),
-      ],
+      DriveRefusal::NonLf { .. } | DriveRefusal::BadDate => property_errors(refusal),
       other => vec![(other.subversion_code(), self.message(other))],
     }
   }
@@ -1943,7 +2044,7 @@ impl Drive {
       digests: Digests::new()?,
     };
     if let Some(Baton::File(file)) = self.tokens.get_mut(token) {
-      file.delta = Some(delta);
+      file.delta = Some(Box::new(delta));
     }
     Ok(Outcome::Taken)
   }
@@ -2088,6 +2189,7 @@ impl Drive {
       revision_properties,
       texts: std::mem::take(&mut self.texts),
       property_lists: std::mem::take(&mut self.property_lists),
+      locks: self.setup.locks.clone(),
     })))
   }
 
@@ -2126,7 +2228,7 @@ impl Drive {
     &self,
     green: &G,
     properties: PropertyList,
-  ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DriveRefusal> {
+  ) -> Result<PropertyPairs, DriveRefusal> {
     let PropertyList::Held { identity, .. } = properties else {
       return Ok(Vec::new());
     };
@@ -2536,6 +2638,52 @@ fn validate_prop(name: &[u8], value: Option<&[u8]>) -> Result<(), DriveRefusal> 
   Ok(())
 }
 
+/// `svn_repos__validate_prop`'s refusal of revision property `name` set to `value` (none deletes it), as `svnserve`
+/// writes it, outermost first: what a revision property's change meets before its hook (`svn_repos_fs_change_rev_prop4`,
+/// A-702); none where the property validates.
+pub(crate) fn revision_property_errors(
+  name: &[u8],
+  value: Option<&[u8]>,
+) -> Option<Vec<(u32, String)>> {
+  validate_prop(name, value)
+    .err()
+    .map(|refusal| property_errors(&refusal))
+}
+
+/// The errors `svnserve` writes for a property `validate_prop` refused, outermost first: one, or Subversion's chain.
+fn property_errors(refusal: &DriveRefusal) -> Vec<(u32, String)> {
+  match refusal {
+    DriveRefusal::NonLf { name } => vec![
+      (SVN_ERR_BAD_PROPERTY_VALUE, property_message(refusal)),
+      (
+        SVN_ERR_BAD_PROPERTY_VALUE_EOL,
+        format!("Cannot accept non-LF line endings in '{name}' property"),
+      ),
+    ],
+    DriveRefusal::BadDate => vec![
+      (SVN_ERR_BAD_PROPERTY_VALUE, property_message(refusal)),
+      (SVN_ERR_BAD_DATE, "Bogus date".to_owned()),
+    ],
+    other => vec![(other.subversion_code(), property_message(other))],
+  }
+}
+
+/// The words of a property `validate_prop` refused (`fs-wrap.c` 202-263).
+fn property_message(refusal: &DriveRefusal) -> String {
+  match refusal {
+    DriveRefusal::NotRegular { name } => format!(
+      "Storage of non-regular property '{name}' is disallowed through the repository interface, and could indicate \
+       a bug in your client"
+    ),
+    DriveRefusal::NotUtf8 { name } => {
+      format!("Cannot accept '{name}' property because it is not encoded in UTF-8")
+    }
+    DriveRefusal::NonLf { .. } => "Invalid property value".to_owned(),
+    DriveRefusal::BadDate => "Wrong or unexpected property value".to_owned(),
+    other => format!("{other:?}"),
+  }
+}
+
 /// `verify_mergeinfo` (`fs-wrap.c` 297-324): no NUL, then A-605's parser.
 fn verify_mergeinfo(path: &str, value: &[u8]) -> Result<(), DriveRefusal> {
   if value.contains(&NUL) {
@@ -2587,7 +2735,18 @@ fn strtoul(text: &[u8]) -> (i64, &[u8]) {
 }
 
 /// The seconds since 1970 `apr_time_exp_get` computes for a date, or `None` for a month outside the year.
-fn epoch_seconds([year, month, day]: [i64; 3], [hour, minute, second]: [i64; 3]) -> Option<i64> {
+fn epoch_seconds(date: [i64; 3], [hour, minute, second]: [i64; 3]) -> Option<i64> {
+  epoch_days(date)?
+    .checked_mul(HOURS_PER_DAY)?
+    .checked_add(hour)?
+    .checked_mul(SIXTY)?
+    .checked_add(minute)?
+    .checked_mul(SIXTY)?
+    .checked_add(second)
+}
+
+/// The days since 1970 `apr_time_exp_get` computes for a date, or `None` for a month outside the year.
+fn epoch_days([year, month, day]: [i64; 3]) -> Option<i64> {
   let month = month.checked_sub(1)?;
   let offset = *DAY_OFFSET.get(usize::try_from(month).ok()?)?;
   let mut year = year.checked_sub(TM_YEAR_BASE)?;
@@ -2595,7 +2754,7 @@ fn epoch_seconds([year, month, day]: [i64; 3], [hour, minute, second]: [i64; 3])
     year = year.checked_sub(1)?;
   }
   let centuries = year.checked_div(CENTURY)?;
-  let days = year
+  year
     .checked_mul(DAYS_PER_YEAR)?
     .checked_add(year.checked_div(LEAP_EVERY)?)?
     .checked_sub(centuries)?
@@ -2607,14 +2766,7 @@ fn epoch_seconds([year, month, day]: [i64; 3], [hour, minute, second]: [i64; 3])
     .checked_add(offset)?
     .checked_add(day)?
     .checked_sub(1)?
-    .checked_sub(EPOCH_DAYS)?;
-  days
-    .checked_mul(HOURS_PER_DAY)?
-    .checked_add(hour)?
-    .checked_mul(SIXTY)?
-    .checked_add(minute)?
-    .checked_mul(SIXTY)?
-    .checked_add(second)
+    .checked_sub(EPOCH_DAYS)
 }
 
 /// Writes a failure with every error of its chain, outermost first, each with a release build's empty file and zero

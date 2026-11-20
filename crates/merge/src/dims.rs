@@ -323,6 +323,29 @@ impl Files {
       .map(|(path, block)| (path, self.blocks.bytes(*block)))
   }
 
+  /// The block `path`'s file holds, given one more holder: what a held text shares with the file (A-716, the green's
+  /// identity table), so holding a file's text copies no byte. None for no file at `path`.
+  pub(crate) fn hold_block_of(&mut self, path: impl AsRef<[u8]>) -> Option<Block> {
+    let block = *self.map.get(path)?;
+    self.blocks.hold(block);
+    Some(block)
+  }
+
+  /// A new block holding `bytes`, with one holder and named by no path (A-716: a text held before any file names it).
+  pub(crate) fn add_unnamed_block(&mut self, bytes: Vec<u8>) -> Block {
+    self.blocks.add(bytes)
+  }
+
+  /// A held block's bytes; none for a block that is gone (never, while the table holds it).
+  pub(crate) fn block_bytes(&self, block: Block) -> &[u8] {
+    self.blocks.bytes(block)
+  }
+
+  /// One holder of a held block fewer; the block is freed with its last.
+  pub(crate) fn release_block(&mut self, block: Block) {
+    self.blocks.release(block);
+  }
+
   /// [`Dim::fork`]: the blocks stay with the arena.
   pub(crate) fn fork(&mut self) -> Files {
     Files {
@@ -674,6 +697,16 @@ mod tests {
     }
   }
 
+  /// Give `files`' hold back a node a step until nothing is left of it.
+  fn release_a_node_a_step(files: &mut Files) {
+    let mut releasing = files.releasing();
+    while files
+      .map
+      .nodes
+      .release_step(&mut releasing, &mut files.blocks)
+    {}
+  }
+
   /// A-534, A-575. Do: put a file, fork the map, change the file in the fork and remove another, then release both
   /// maps a node a step. Expect: each map reads its own bytes, the original's blocks are untouched by the fork's changes
   /// and by the fork's release, and once both are released every node and every block is gone.
@@ -692,20 +725,10 @@ mod tests {
     files.lend(&mut fork);
     assert_eq!(fork.get("a"), Some(b"changed".as_slice()));
     assert_eq!(fork.get("b"), None);
-    let mut releasing = fork.releasing();
-    while fork
-      .map
-      .nodes
-      .release_step(&mut releasing, &mut fork.blocks)
-    {}
+    release_a_node_a_step(&mut fork);
     fork.lend(&mut files);
     assert_eq!(files.get("a"), Some(b"one".as_slice()));
-    let mut releasing = files.releasing();
-    while files
-      .map
-      .nodes
-      .release_step(&mut releasing, &mut files.blocks)
-    {}
+    release_a_node_a_step(&mut files);
     assert_eq!(files.map.nodes.live(), 0, "every node freed");
     assert_eq!(files.blocks.live(), 0, "every block freed");
   }

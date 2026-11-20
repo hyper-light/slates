@@ -68,7 +68,7 @@ impl RepositoryFiles for Dot {
     let at = |value: u64| usize::try_from(value).unwrap().min(bytes.len());
     let range = &bytes[at(offset)..at(offset.saturating_add(len))];
     room
-      .charge(u64::try_from(range.len()).unwrap())
+      .charge(crate::read::to_u64(range.len()))
       .map_err(FileRefused::PastAdmission)?;
     Ok(Some(range.to_vec()))
   }
@@ -373,13 +373,10 @@ fn long_text(len: usize, salt: u8) -> Vec<u8> {
     .collect()
 }
 
-/// A-680 part 1: do lend, from a store whose window is 4,096 bytes, a changeset text of 10,000 bytes, a manifest text
-/// of 8,200, a file revision with a metadata block (its bytes 5,000 long) and a short one without, first the
-/// changeset's with a room a byte short. Expect the short room refused before anything is copied; then the long texts
-/// and the framed one copied exactly (the block between its markers, then the bytes) and the short one lent in place,
-/// each with its position, parents and link, and nothing for a node no log holds.
-#[test]
-fn texts_longer_than_a_window_are_copied_within_the_room() {
+/// The index and store [`texts_longer_than_a_window_are_copied_within_the_room`] lends from: a changeset text of
+/// 10,000 bytes (node 1), a manifest text of 8,200 (node 2), a file revision of `f` with a metadata block (node 3) and a
+/// short one of `g` without (node 4); with the changeset's, the manifest's and the framed file's texts.
+fn long_texts_indexed() -> (HgIndex, ContentStore, [Vec<u8>; 3]) {
   let mut store = store();
   let mut index = HgIndex::new();
   let changeset = long_text(10_000, 1);
@@ -435,6 +432,18 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
       .append_revisions(&mut store, log, &[revision])
       .unwrap();
   }
+  (index, store, [changeset, manifest, framed])
+}
+
+/// A-680 part 1: do lend, from a store whose window is 4,096 bytes, a changeset text of 10,000 bytes, a manifest text
+/// of 8,200, a file revision with a metadata block (its bytes 5,000 long) and a short one without, first the
+/// changeset's with a room a byte short. Expect the short room refused before anything is copied; then the long texts
+/// and the framed one copied exactly (the block between its markers, then the bytes) and the short one lent in place,
+/// each with its position, parents and link, and nothing for a node no log holds.
+#[test]
+fn texts_longer_than_a_window_are_copied_within_the_room() {
+  let (node, manifest_node, f_node, g_node) = ([1; 20], [2; 20], [3; 20], [4; 20]);
+  let (index, store, [changeset, manifest, framed]) = long_texts_indexed();
   let no_state = State {
     roots: &[],
     bookmarks: &[],
@@ -450,18 +459,8 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     })
   );
   assert_eq!(view.lends(), Lends::default());
-  let lent = view.changeset_text(0, &mut room()).unwrap().unwrap();
-  assert!(matches!(&lent, Cow::Owned(text) if *text == changeset));
-  let logged = view.manifest(&manifest_node, &mut room()).unwrap().unwrap();
-  assert!(matches!(&logged.text, Cow::Owned(text) if *text == manifest));
-  assert_eq!(
-    (logged.position, logged.parents, logged.link),
-    (0, [NULL_NODE; 2], node)
-  );
-  let logged = view.file(b"f", &f_node, &mut room()).unwrap().unwrap();
-  assert!(matches!(&logged.text, Cow::Owned(text) if *text == framed));
-  let logged = view.file(b"g", &g_node, &mut room()).unwrap().unwrap();
-  assert!(matches!(logged.text, Cow::Borrowed(b"g\n")));
+  long_texts_are_copied(&view, [node, manifest_node], [changeset, manifest]);
+  file_texts_are_lent(&view, [f_node, g_node], &framed);
   assert_eq!(
     view.lends(),
     Lends {
@@ -471,6 +470,30 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
   );
   assert_eq!(view.file(b"g", &f_node, &mut room()), Ok(None));
   assert_eq!(view.manifest(&[9; 20], &mut room()), Ok(None));
+}
+
+/// The changeset's and the manifest's long texts of [`long_texts_indexed`] (`nodes` their nodes, `texts` their texts)
+/// lent from `view` copied exactly, the manifest's with its position, parents and link.
+fn long_texts_are_copied(view: &Indexed<'_>, nodes: [Node; 2], texts: [Vec<u8>; 2]) {
+  let [node, manifest_node] = nodes;
+  let [changeset, manifest] = texts;
+  let lent = view.changeset_text(0, &mut room()).unwrap().unwrap();
+  assert!(matches!(&lent, Cow::Owned(text) if *text == changeset));
+  let logged = view.manifest(&manifest_node, &mut room()).unwrap().unwrap();
+  assert!(matches!(&logged.text, Cow::Owned(text) if *text == manifest));
+  assert_eq!(
+    (logged.position, logged.parents, logged.link),
+    (0, [NULL_NODE; 2], node)
+  );
+}
+
+/// The file revisions of [`long_texts_indexed`] (`nodes` `f`'s and `g`'s) lent from `view`: `f`'s framed text
+/// (`framed`) copied exactly, `g`'s short one lent in place.
+fn file_texts_are_lent(view: &Indexed<'_>, [f_node, g_node]: [Node; 2], framed: &[u8]) {
+  let logged = view.file(b"f", &f_node, &mut room()).unwrap().unwrap();
+  assert!(matches!(&logged.text, Cow::Owned(text) if *text == framed));
+  let logged = view.file(b"g", &g_node, &mut room()).unwrap().unwrap();
+  assert!(matches!(logged.text, Cow::Borrowed(b"g\n")));
 }
 
 /// What a generated changeset is: its parents (earlier revisions), the phase root at it, the marker naming it as a
@@ -1023,4 +1046,79 @@ fn a_view_past_its_room_is_refused() {
       "{room}"
     );
   }
+}
+
+/// A `stream_out` answer read back: its first line, then each file's name and bytes.
+type Streamed = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// The files a `stream_out` answer sends, read back: its first line, then each name and bytes.
+fn streamed(answer: &[u8]) -> Streamed {
+  let mut rest = answer;
+  let line = |rest: &mut &[u8]| {
+    let end = rest.iter().position(|byte| *byte == b'\n').unwrap();
+    let head = rest[..end].to_vec();
+    *rest = &rest[end + 1..];
+    head
+  };
+  let status = line(&mut rest);
+  let counts = String::from_utf8(line(&mut rest)).unwrap();
+  let (files, total) = counts.split_once(' ').unwrap();
+  let (files, total): (usize, usize) = (files.parse().unwrap(), total.parse().unwrap());
+  let mut sent = Vec::new();
+  for _ in 0..files {
+    let head = line(&mut rest);
+    let nul = head.iter().position(|byte| *byte == 0).unwrap();
+    let size: usize = std::str::from_utf8(&head[nul + 1..])
+      .unwrap()
+      .parse()
+      .unwrap();
+    let (bytes, tail) = rest.split_at(size);
+    sent.push((head[..nul].to_vec(), bytes.to_vec()));
+    rest = tail;
+  }
+  assert!(rest.is_empty(), "bytes after the last file");
+  assert_eq!(
+    sent.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
+    total
+  );
+  (status, sent)
+}
+
+/// Stream clones part 2 (A-712; 7.2's `generatev1wireproto`): do ask `stream_out` of the `states` repository, which
+/// holds a secret changeset, and of the same repository with its secret root dropped. Expect the first answered `1\n`
+/// and listing no `streamreqs`; the second `0\n`, then every non-empty revlog of `render::revlogs` in its order, each
+/// named by its store path and holding its bytes, and the capabilities listing `streamreqs` with the rendered store's
+/// requirements.
+#[test]
+fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
+  use super::super::stream::stream_out;
+  let (imported, store) = imported("states");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let mut answer = Vec::new();
+  stream_out(&view, &mut room(), &mut answer).unwrap();
+  assert_eq!(answer, b"1\n");
+  assert!(!view.streams());
+  let public: Vec<PhaseHead> = imported
+    .phase_roots
+    .iter()
+    .filter(|root| root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  let state = State {
+    roots: &public,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let mut answer = Vec::new();
+  stream_out(&view, &mut room(), &mut answer).unwrap();
+  let (status, sent) = streamed(&answer);
+  assert_eq!(status, b"0");
+  let expected: Vec<(Vec<u8>, Vec<u8>)> =
+    crate::render::revlogs(&imported.index, &store, &mut room())
+      .unwrap()
+      .into_iter()
+      .filter(|(_, bytes)| !bytes.is_empty())
+      .collect();
+  assert_eq!(sent, expected);
+  assert!(sent.iter().any(|(name, _)| name == b"00changelog.i"));
 }

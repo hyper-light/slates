@@ -29,6 +29,21 @@
 //! before its first byte is answered with its error, as `mod_dav` answers one, and one refused after it ends the
 //! connection (a refusal within those first slices after the first byte is `500`, nothing sent).
 //!
+//! **Commits** (A-681 part C, `slates_svn::dav::commit`). A POST to `!svn/me` begins a transaction over the
+//! repository's records, named `REV-SEQ` and kept on the owner shard between its requests (`VcsStores`, one a
+//! repository and principal, a new POST replacing the older); PUT, MKCOL, DELETE and PROPPATCH under `!svn/txr/NAME/`,
+//! a COPY whose `Destination` is there, and a DELETE of `!svn/txn/NAME` each drive it a step; a MERGE naming it closes
+//! it, the accepted work landed through the owner's commit step (`repository::svn_commit::commit_work`) and answered
+//! with the new revision. A hook the repository configures at start-commit or pre-commit refuses the commit, as the
+//! svn+ssh tunnel refuses it, until hooks run. A commit presents its lock tokens as a stock client sends them: each
+//! request's `If` header, then the MERGE's `S:lock-token-list` with `X-SVN-Options: keep-locks` deciding whether the
+//! verdict releases them. An abandoned transaction is kept until its principal begins another.
+//!
+//! **Locks** (A-681, over A-627's `slates_svn::dav::locking` and A-602's lock table): a LOCK or an UNLOCK of a public
+//! path is read, judged by the repository's lock table at the owner's instant with a token drawn from the system's
+//! generator, its entries landed through the owner's step as A-693 part 2's `Record::Locks` (durable as a revision
+//! is), and answered as `mod_dav_svn` answers it; a landing the step refuses is answered as a commit's refusal.
+//!
 //! **Names.** A repository is the one named by the URL's first path segment, decoded; the rest of the path is below
 //! its root (`/repo/!svn/rvr/5/trunk` is `repo`'s `/!svn/rvr/5/trunk`). A repository whose name holds a slash cannot be
 //! reached over HTTP: `SVNParentPath`'s rule, which a name routed to its partition by its hash cannot widen to a
@@ -40,6 +55,8 @@
 //! bytes, and as many elements, nesting levels and attributes as parsed elements fit in the room, so the parsed body
 //! holds at most the room again. An answer is written within the room; one past it is `500`.
 
+use crate::repository::svn_commit::{Committed, Uncommitted};
+use crate::vcs_hooks::HookPoint;
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_http::Admission;
 use slates_http::head::{Head, Target};
@@ -49,14 +66,26 @@ use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential;
 use slates_rt::futures::yield_now;
 use slates_svn::authz::PrincipalRules;
+use slates_svn::commit::drive::Due;
+use slates_svn::commit::drive::{Setup, Work};
 use slates_svn::dav::Bounds as XmlBounds;
+use slates_svn::dav::commit::{
+  self as commit, DavCommit, Hooks, Merged, Put, World as CommitWorld,
+};
+use slates_svn::dav::locking::{self, HttpAnswer, LockHttp, UnlockHttp};
+use slates_svn::dav::response::MergeResponse;
 use slates_svn::dav::site::{
   self, Answer as SiteAnswer, Headers, Report, ReportProgress, Request, Served,
 };
 use slates_svn::dav::xml::Element;
+use slates_svn::index::NodeKind;
 use slates_svn::index::{Index, Text};
+use slates_svn::lock::CommitLocks;
 use slates_svn::lock::{AprTime, LockTable};
+use slates_svn::lock::{HeadView, LockEntry, UUID_BYTES};
+use slates_svn::migration::Repository as SvnRecords;
 use slates_svn::reads::Repository;
+use std::collections::BTreeMap;
 
 use super::git::{Authenticator, Located, Repositories, Unproven};
 use super::{Answer, ClientGone, Decided, Exchange, Failed, Site};
@@ -128,6 +157,63 @@ pub(crate) trait SvnStores {
     principal: &Principal,
     step: impl FnOnce(&Lent<'_, Self::Repository>) -> T,
   ) -> Option<T>;
+
+  /// Begins an HTTP commit in repository `id` for `principal` (A-681 part C): the transaction named, the setup
+  /// `setup_of` makes from its name and the owner's instant, the commit begun over the records with `hooks`, and kept;
+  /// its name, or the POST's refusal. None where this lender serves no commits or does not hold `id`'s records.
+  fn begin_commit(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    setup_of: impl FnOnce(String, AprTime) -> Setup,
+    hooks: Hooks<'_>,
+  ) -> Option<Result<String, HttpAnswer>> {
+    let _unserved = (id, principal, setup_of, hooks);
+    None
+  }
+
+  /// Runs `step` on repository `id`'s transaction `name`, which `principal` made, over the records, keeping it unless
+  /// it ended: none where this lender serves no commits or does not hold `id`'s records, `Some(None)` where no such
+  /// transaction is open for `principal`.
+  fn on_commit<T>(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    name: &str,
+    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnRecords>) -> T,
+  ) -> Option<Option<T>> {
+    let _unserved = (id, principal, name, step);
+    None
+  }
+
+  /// Judges a lock verb over repository `id`'s lock table and lands the entries it makes through the owner's step
+  /// (A-681; `Record::Locks`, durable as a revision is, A-693 part 2): `judge` has the records lent with a fresh token's
+  /// draw, and gives the entries and the answer; a landing the step refuses is its refusal. None where this lender
+  /// serves no locks.
+  fn lock_verb(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    judge: impl FnOnce(
+      &Lent<'_, SvnRecords>,
+      &mut dyn FnMut() -> [u8; UUID_BYTES],
+    ) -> (Vec<LockEntry>, HttpAnswer),
+  ) -> Option<Result<HttpAnswer, Uncommitted>> {
+    let _unserved = (id, principal, judge);
+    None
+  }
+
+  /// Lands an accepted `work` on repository `id`'s logs by `principal` through the owner's commit step
+  /// (`crate::repository::svn_commit::commit_work`): none where this lender serves no commits.
+  fn land(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    work: Work,
+  ) -> Option<Result<Committed, Uncommitted>> {
+    let _unserved = (id, principal, work);
+    None
+  }
 }
 
 /// What a routed head names: its repository, and the path below its root.
@@ -272,6 +358,25 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> Site for SvnSite<A
   async fn decide(&mut self, head: &Head<'_>, _secure: bool) -> Decided<Self::Exchange> {
     self.answer(head).await
   }
+}
+
+/// Format: the methods git's and Mercurial's clients send (git's smart HTTP and Git LFS: GET, HEAD and POST; hg's wire
+/// protocol: GET and POST), which a Subversion request needs its special segment to be told by.
+const SHARED_METHODS: [&[u8]; 3] = [b"GET", b"HEAD", b"POST"];
+
+/// Whether `head` is Subversion's (A-681; the daemon's `ToolSites` routes it here): a method no other tool's client sends
+/// (OPTIONS, PROPFIND, REPORT, MERGE, PUT, ...), or a path with the special URI's segment ([`site::SPECIAL`]), as stock
+/// svn's GETs and HTTPv2 POSTs name `!svn/...`. The segment is compared as sent: svn writes it unescaped.
+pub(crate) fn dav_request(head: &Head<'_>) -> bool {
+  if !SHARED_METHODS.contains(&head.method) {
+    return true;
+  }
+  let Target::Path { path, .. } = head.target else {
+    return false;
+  };
+  path
+    .split(|byte| *byte == b'/')
+    .any(|segment| segment == site::SPECIAL.as_bytes())
 }
 
 /// Routes `head` (the module doc's names): its repository's name and the path below its root, read within `room`;
@@ -434,6 +539,36 @@ pub(crate) struct SvnExchange<S> {
   request_room: u64,
   /// The answer, once made.
   answered: Option<Answered>,
+  /// The repository's name, the green's name a commit's messages name.
+  name: String,
+  /// The HTTPv2 commit headers the request sent ([`CommitHeaders`]).
+  commit_headers: CommitHeaders,
+  /// Whether the repository configures each commit hook (start-commit, pre-commit), which this site does not run yet:
+  /// a commit meeting one is refused, as the svn+ssh tunnel refuses it.
+  hooked: (bool, bool),
+}
+
+/// The headers an HTTPv2 commit's requests carry (`libsvn_ra_serf/commit.c`), copied from the head.
+#[derive(Clone, Debug, Default)]
+struct CommitHeaders {
+  /// `X-SVN-Version-Name`: an opened node's base revision.
+  version_name: Option<u64>,
+  /// `X-SVN-Base-Fulltext-MD5`.
+  base_md5: Option<String>,
+  /// `X-SVN-Result-Fulltext-MD5`.
+  result_md5: Option<String>,
+  /// `Destination`: a COPY's target URL.
+  destination: Option<String>,
+  /// `X-SVN-Version-Name` as sent, which a LOCK reads itself.
+  version_text: Option<String>,
+  /// `If`: the lock tokens a request presents.
+  presented: Option<String>,
+  /// `X-SVN-Options`: `lock-steal`, `lock-break`, `keep-locks`.
+  options: Option<String>,
+  /// `Timeout`: a LOCK's.
+  timeout: Option<String>,
+  /// `Lock-Token`: an UNLOCK's.
+  lock_token: Option<String>,
 }
 
 impl<S> SvnExchange<S> {
@@ -456,8 +591,48 @@ impl<S> SvnExchange<S> {
       .saturating_add(to_u64(asked.routed.name.len()))
       .saturating_add(to_u64(method.len()))
       .saturating_add(to_u64(depth.as_ref().map_or(0, String::len)));
+    let text = |name: &[u8]| match asked.head.field(name) {
+      Ok(Some(value)) => String::from_utf8(value.to_vec()).ok(),
+      _ => None,
+    };
+    let commit_headers = CommitHeaders {
+      version_name: text(b"X-SVN-Version-Name").and_then(|value| value.trim().parse().ok()),
+      base_md5: text(b"X-SVN-Base-Fulltext-MD5"),
+      result_md5: text(b"X-SVN-Result-Fulltext-MD5"),
+      destination: text(b"Destination"),
+      version_text: text(b"X-SVN-Version-Name"),
+      presented: text(b"If"),
+      options: text(b"X-SVN-Options"),
+      timeout: text(b"Timeout"),
+      lock_token: text(b"Lock-Token"),
+    };
+    let held = [
+      &commit_headers.destination,
+      &commit_headers.version_text,
+      &commit_headers.presented,
+      &commit_headers.options,
+      &commit_headers.timeout,
+      &commit_headers.lock_token,
+    ]
+    .into_iter()
+    .flatten()
+    .fold(held, |held, value| held.saturating_add(to_u64(value.len())));
     admission.charge(held).ok()?;
+    let hooked_at = |point: HookPoint| {
+      repository
+        .policy
+        .hooks
+        .iter()
+        .any(|hook| HookPoint::of(hook.point) == point)
+    };
+    let hooked = (
+      hooked_at(HookPoint::SvnStartCommit),
+      hooked_at(HookPoint::SvnPreCommit),
+    );
     Some(Self {
+      name: asked.routed.name.clone(),
+      commit_headers,
+      hooked,
       stores,
       repository: repository.id,
       root: format!("/{}", asked.routed.name),
@@ -473,15 +648,463 @@ impl<S> SvnExchange<S> {
   }
 }
 
+/// Format: `X-SVN-Options`' word asking a commit to keep the locks it presented (`SVN_DAV_OPTION_KEEP_LOCKS`).
+const KEEP_LOCKS: &str = "keep-locks";
+/// Format: `SVN_ERR_FS_GENERAL`, the error a lock answer that cannot be written is refused with.
+const LOCK_UNWRITABLE: u32 = 160_000;
+/// Format: `SVN_ERR_UNSUPPORTED_FEATURE`, the error a commit meeting a configured hook is refused with.
+const UNSUPPORTED_FEATURE: u32 = 200_007;
+/// The words a commit is refused with at a point where the repository configures a hook, which this site does not run
+/// yet, as the svn+ssh tunnel words it.
+const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
+
+impl<S: SvnStores> SvnExchange<S> {
+  /// The answer to an HTTPv2 commit's request (A-681 part C; `slates_svn::dav::commit`): a POST to `!svn/me`, a
+  /// request on a transaction's root (`!svn/txr/NAME/...`) or on the transaction itself (`!svn/txn/NAME`), a COPY
+  /// whose destination is in a transaction, or a MERGE; none for every other request, which the read side answers.
+  fn commit_side(&mut self) -> Option<HttpAnswer> {
+    let path = self.path.clone();
+    let segments: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
+    let special = |segment: &str| segment == site::SPECIAL;
+    let method = self.method.clone();
+    Some(match (method.as_str(), segments.as_slice()) {
+      ("POST", [first, "me"]) if special(first) => self.post(),
+      ("DELETE", [first, "txn", name]) if special(first) => {
+        self.on_transaction(name, |commit, world, hooks| commit.abort(world, hooks))
+      }
+      (_, [first, "txn", _]) if special(first) => commit::unserved("This request on a transaction"),
+      ("COPY", [first, "rvr" | "bc", revision, source @ ..]) if special(first) => {
+        self.copy(revision, &format!("/{}", source.join("/")))
+      }
+      (method, [first, "txr", name, rest @ ..]) if special(first) => {
+        self.on_transaction_root(method, name, &format!("/{}", rest.join("/")))
+      }
+      ("MERGE", _) => self.merge(),
+      ("LOCK", _) => self.lock(),
+      ("UNLOCK", _) => self.unlock(),
+      _ => return None,
+    })
+  }
+
+  /// The hook answer this repository gives (`hooked`): passed where none is configured at the hook's point.
+  fn hooks(&self) -> impl Fn(&Due) -> Result<(), Vec<(u32, String)>> + use<S> {
+    let (start, pre) = self.hooked;
+    move |due: &Due| {
+      let hooked = match due {
+        Due::StartCommit { .. } => start,
+        Due::PreCommit { .. } => pre,
+      };
+      if hooked {
+        Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
+      } else {
+        Ok(())
+      }
+    }
+  }
+
+  /// A POST making a transaction: its revision properties from the body's skel, the principal its author.
+  fn post(&mut self) -> HttpAnswer {
+    let user = crate::lfs::owner_name(&self.principal);
+    let properties = match commit::transaction_properties(&self.body, Some(&user)) {
+      Ok(properties) => properties,
+      Err(_) => return commit::unserved("A POST whose body is no create-txn skel"),
+    };
+    let (root, name, room) = (
+      self.root.clone(),
+      self.name.clone(),
+      to_usize(self.request_room),
+    );
+    let setup_of = move |transaction: String, now: AprTime| Setup {
+      base_path: String::from("/"),
+      repository_url: root,
+      filesystem: name,
+      transaction,
+      locks: CommitLocks {
+        user: Some(user),
+        presented: BTreeMap::new(),
+        keep: false,
+      },
+      now,
+      room,
+      rules: None,
+      revision_properties: properties,
+    };
+    let hooks = self.hooks();
+    match self
+      .stores
+      .begin_commit(self.repository, &self.principal, setup_of, &hooks)
+    {
+      Some(Ok(transaction)) => commit::created(&transaction),
+      Some(Err(refused)) => refused,
+      None => commit::unserved("Commits"),
+    }
+  }
+
+  /// `step` on transaction `name`: `404` where no such transaction is open for the principal.
+  fn on_transaction(
+    &mut self,
+    name: &str,
+    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnRecords>, Hooks<'_>) -> HttpAnswer,
+  ) -> HttpAnswer {
+    let hooks = self.hooks();
+    match self
+      .stores
+      .on_commit(self.repository, &self.principal, name, |commit, world| {
+        step(commit, world, &hooks)
+      }) {
+      Some(Some(answer)) => answer,
+      Some(None) => commit::no_such_transaction(name),
+      None => commit::unserved("Commits"),
+    }
+  }
+
+  /// A request on transaction `name`'s root at `path`: PUT, MKCOL, DELETE or PROPPATCH.
+  fn on_transaction_root(&mut self, method: &str, name: &str, path: &str) -> HttpAnswer {
+    let headers = self.commit_headers.clone();
+    let body = std::mem::take(&mut self.body);
+    let bounds = xml_bounds(self.request_room);
+    let method = method.to_owned();
+    self.on_transaction(name, |commit, world, hooks| {
+      for token in DavCommit::if_tokens(headers.presented.as_deref().unwrap_or_default()) {
+        commit.present(path, token);
+      }
+      transaction_root_step(
+        commit,
+        (world, hooks),
+        (&method, path),
+        (&headers, &body, &bounds),
+      )
+    })
+  }
+
+  /// A COPY of the repository path `source` in `revision` to its `Destination` in a transaction.
+  fn copy(&mut self, revision: &str, source: &str) -> HttpAnswer {
+    let Ok(revision) = revision.parse::<u64>() else {
+      return commit::unserved("A COPY from a revision that is no number");
+    };
+    let destination = self
+      .commit_headers
+      .destination
+      .as_deref()
+      .and_then(|destination| below_root(destination, &self.root));
+    let Some(destination) = destination else {
+      return commit::unserved("A COPY whose Destination is outside this repository");
+    };
+    let segments: Vec<&str> = destination
+      .split('/')
+      .filter(|name| !name.is_empty())
+      .collect();
+    let [first, "txr", name, rest @ ..] = segments.as_slice() else {
+      return commit::unserved("A COPY whose Destination is no transaction's");
+    };
+    if *first != site::SPECIAL {
+      return commit::unserved("A COPY whose Destination is no transaction's");
+    }
+    let target = format!("/{}", rest.join("/"));
+    self.on_transaction(name, |commit, world, hooks| {
+      commit.copy(world, hooks, (source, revision), &target)
+    })
+  }
+
+  /// A MERGE of the transaction its body names: closed, judged, landed through the owner's step, answered with the new
+  /// revision (`merge.c` `dav_svn__merge_response`).
+  fn merge(&mut self) -> HttpAnswer {
+    let bounds = xml_bounds(self.request_room);
+    let Ok(request) = slates_svn::dav::request::merge(&self.body, &bounds) else {
+      return commit::unserved("A MERGE whose body cannot be read");
+    };
+    let Some(source) = below_root(&request.source, &self.root) else {
+      return commit::unserved("A MERGE of something outside this repository");
+    };
+    let segments: Vec<&str> = source.split('/').filter(|name| !name.is_empty()).collect();
+    let [first, "txn", name] = segments.as_slice() else {
+      return commit::unserved("A MERGE of an activity");
+    };
+    if *first != site::SPECIAL {
+      return commit::unserved("A MERGE of an activity");
+    }
+    let name = (*name).to_owned();
+    let hooks = self.hooks();
+    let target = self.path.clone();
+    let keep = self
+      .commit_headers
+      .options
+      .as_deref()
+      .is_some_and(|options| options.contains(KEEP_LOCKS));
+    let tokens = request.lock_tokens;
+    let merged = self
+      .stores
+      .on_commit(self.repository, &self.principal, &name, |commit, world| {
+        for (path, token) in &tokens {
+          commit.present(&format!("{}/{path}", target.trim_end_matches('/')), token);
+        }
+        commit.keep_locks(keep);
+        commit.merge(world, &hooks)
+      });
+    let work = match merged {
+      Some(Some(Merged::Accepted(work))) => work,
+      Some(Some(Merged::Refused(refused))) => return refused,
+      Some(None) => return commit::no_such_transaction(&name),
+      None => return commit::unserved("Commits"),
+    };
+    match self.stores.land(self.repository, &self.principal, *work) {
+      Some(Ok(committed)) => merged_answer(&self.root, &committed, to_usize(self.request_room)),
+      Some(Err(uncommitted)) => not_committed(&uncommitted),
+      None => commit::unserved("Commits"),
+    }
+  }
+}
+
+impl<S: SvnStores> SvnExchange<S> {
+  /// A LOCK of the public path the request names (`slates_svn::dav::locking`, A-627): read, judged by the lock table
+  /// at the owner's instant with a fresh token, its entries landed through the owner's step, and answered as
+  /// `mod_dav_svn` answers it.
+  fn lock(&mut self) -> HttpAnswer {
+    let user = crate::lfs::owner_name(&self.principal);
+    let path = public_path(&self.path);
+    let headers = self.commit_headers.clone();
+    let body = std::mem::take(&mut self.body);
+    let bounds = xml_bounds(self.request_room);
+    let (filesystem, room, depth) = (
+      self.name.clone(),
+      to_usize(self.request_room),
+      self.depth.clone(),
+    );
+    let judged = self
+      .stores
+      .lock_verb(self.repository, &self.principal, |lent, draw| {
+        let asked = LockHttp {
+          path: &path,
+          user: Some(&user),
+          body: &body,
+          depth: depth.as_deref(),
+          timeout: headers.timeout.as_deref(),
+          options: headers.options.as_deref(),
+          version_name: headers.version_text.as_deref(),
+        };
+        let head = IndexHead(lent.index);
+        let plan = match locking::lock_request(&asked, &head, lent.now, &bounds) {
+          Ok(plan) => plan,
+          Err(refused) => return (Vec::new(), refused.answer()),
+        };
+        let decision = match lent
+          .locks
+          .lock(&plan.request, &head, lent.now, room, &mut || draw())
+        {
+          Ok(decision) => decision,
+          Err(refused) => {
+            return (
+              Vec::new(),
+              answer_or_unwritable(locking::lock_answer(
+                &plan,
+                Err(&refused),
+                lent.now,
+                &filesystem,
+              )),
+            );
+          }
+        };
+        let decided = decision
+          .answers
+          .iter()
+          .find(|(named, _)| *named == path)
+          .map(|(_, answer)| answer.as_ref());
+        match decided {
+          Some(decided) => {
+            let answer =
+              answer_or_unwritable(locking::lock_answer(&plan, decided, lent.now, &filesystem));
+            (
+              if decided.is_ok() {
+                decision.entries
+              } else {
+                Vec::new()
+              },
+              answer,
+            )
+          }
+          None => (
+            Vec::new(),
+            commit::unserved("A LOCK the table did not answer"),
+          ),
+        }
+      });
+    landed(judged)
+  }
+
+  /// An UNLOCK of the public path the request names, judged and landed as [`Self::lock`] is.
+  fn unlock(&mut self) -> HttpAnswer {
+    let user = crate::lfs::owner_name(&self.principal);
+    let path = public_path(&self.path);
+    let headers = self.commit_headers.clone();
+    let filesystem = self.name.clone();
+    let judged = self
+      .stores
+      .lock_verb(self.repository, &self.principal, |lent, _| {
+        let asked = UnlockHttp {
+          path: &path,
+          user: Some(&user),
+          lock_token: headers.lock_token.as_deref(),
+          options: headers.options.as_deref(),
+        };
+        let request = match locking::unlock_request(&asked, lent.locks, lent.now) {
+          Ok(request) => request,
+          Err(refused) => return (Vec::new(), refused.answer()),
+        };
+        match lent.locks.unlock(&request, lent.now) {
+          Err(refused) => (
+            Vec::new(),
+            locking::unlock_answer(&request, Err(&refused), &filesystem),
+          ),
+          Ok(decision) => {
+            let decided = decision
+              .answers
+              .iter()
+              .find(|(named, _)| *named == path)
+              .map(|(_, answer)| answer.as_ref().map(|()| ()));
+            match decided {
+              Some(decided) => {
+                let answer = locking::unlock_answer(&request, decided, &filesystem);
+                (
+                  if decided.is_ok() {
+                    decision.entries
+                  } else {
+                    Vec::new()
+                  },
+                  answer,
+                )
+              }
+              None => (
+                Vec::new(),
+                commit::unserved("An UNLOCK the table did not answer"),
+              ),
+            }
+          }
+        }
+      });
+    landed(judged)
+  }
+}
+
+/// A lock verb's answer once its entries landed: the step's refusal answered as a commit's is.
+fn landed(judged: Option<Result<HttpAnswer, Uncommitted>>) -> HttpAnswer {
+  match judged {
+    Some(Ok(answer)) => answer,
+    Some(Err(uncommitted)) => not_committed(&uncommitted),
+    None => commit::unserved("Locks"),
+  }
+}
+
+/// An answer the lock writers could write; one holding a value no header can carry is `500`, as httpd refuses it.
+fn answer_or_unwritable(written: Result<HttpAnswer, slates_svn::dav::DavRefusal>) -> HttpAnswer {
+  written
+    .unwrap_or_else(|_| commit::refusal(LOCK_UNWRITABLE, "The lock's answer could not be written"))
+}
+
+/// A public URL's repository path, canonical: `/` for the root, no slash at the end.
+fn public_path(path: &str) -> String {
+  let names: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
+  format!("/{}", names.join("/"))
+}
+
+/// The head as the lock guard reads it: the index's youngest revision and its nodes (as `slates_svn::serve`'s lock
+/// verbs read it).
+struct IndexHead<'i>(&'i Index);
+
+impl HeadView for IndexHead<'_> {
+  fn youngest(&self) -> u64 {
+    self.0.youngest()
+  }
+
+  fn node(&self, path: &str) -> Option<(NodeKind, u64)> {
+    let node = self.0.node(path, self.0.youngest()).ok()??;
+    Some((node.kind(), node.created_revision()))
+  }
+}
+
+/// One request on a transaction's root (a PUT, MKCOL, DELETE or PROPPATCH at `path`), its headers' tokens presented.
+fn transaction_root_step(
+  commit: &mut DavCommit,
+  (world, hooks): (&CommitWorld<'_, SvnRecords>, Hooks<'_>),
+  (method, path): (&str, &str),
+  (headers, body, bounds): (&CommitHeaders, &[u8], &XmlBounds),
+) -> HttpAnswer {
+  match method {
+    "PUT" => {
+      let put = Put {
+        body,
+        base_md5: headers.base_md5.as_deref(),
+        result_md5: headers.result_md5.as_deref(),
+        version_name: headers.version_name,
+      };
+      commit.put(world, hooks, path, &put)
+    }
+    "MKCOL" => commit.mkcol(world, hooks, path),
+    "DELETE" => commit.delete(world, hooks, path, headers.version_name),
+    "PROPPATCH" => commit.proppatch(world, hooks, (path, headers.version_name), (body, bounds)),
+    _ => commit::unserved("This method on a transaction"),
+  }
+}
+
+/// The path of `location`, a URL or a path, below the repository root `root`, decoded; none outside it.
+fn below_root(location: &str, root: &str) -> Option<String> {
+  let path = match location.split_once("://") {
+    Some((_, rest)) => rest.find('/').and_then(|at| rest.get(at..)).unwrap_or("/"),
+    None => location,
+  };
+  let mut decoded = Vec::with_capacity(path.len());
+  percent::decode_into(path.as_bytes(), Plus::Plus, &mut decoded).ok()?;
+  let decoded = String::from_utf8(decoded).ok()?;
+  let rest = decoded.strip_prefix(root)?;
+  (rest.is_empty() || rest.starts_with('/')).then(|| rest.to_owned())
+}
+
+/// The MERGE's answer for `committed` (`dav_svn__merge_response`), `200` with the new baseline's facts.
+fn merged_answer(root: &str, committed: &Committed, room: usize) -> HttpAnswer {
+  let response = MergeResponse {
+    vcc: format!("{root}/{}/vcc/default", site::SPECIAL),
+    revision: committed.revision,
+    date: committed.date.clone(),
+    author: committed.author.clone(),
+    post_commit_error: None,
+  };
+  match slates_svn::dav::response::merge(&response, room) {
+    Ok(body) => HttpAnswer {
+      status: Status::OK.code,
+      headers: vec![("Content-Type", String::from("text/xml; charset=\"utf-8\""))],
+      body,
+    },
+    Err(_) => commit::unserved("A MERGE answer past the room"),
+  }
+}
+
+/// The MERGE's answer where the owner's step did not commit the work: its Subversion error, `409` for one out of
+/// date, else as `dav_svn__convert_err` answers it.
+fn not_committed(uncommitted: &Uncommitted) -> HttpAnswer {
+  let (code, message) = match uncommitted.answered() {
+    slates_svn::serve::Uncommitted::Step(refusal) => (refusal.subversion_code(), refusal.message()),
+    slates_svn::serve::Uncommitted::NotServed => (
+      UNSUPPORTED_FEATURE,
+      String::from("This server does not make commits yet"),
+    ),
+    slates_svn::serve::Uncommitted::Refused { code, message } => (code, message),
+  };
+  commit::refusal(code, &message)
+}
+
 /// The status a site's answer names, by its code (RFC 9110 §15, RFC 4918 §11.1); a code this site never answers is
 /// `500`.
 fn status_of(code: u16) -> Status {
   [
     Status::OK,
+    Status::CREATED,
+    Status::NO_CONTENT,
     Status::MULTI_STATUS,
     Status::BAD_REQUEST,
     Status::FORBIDDEN,
     Status::NOT_FOUND,
+    Status::CONFLICT,
+    Status::PRECONDITION_FAILED,
+    Status::LOCKED,
     Status::CONTENT_TOO_LARGE,
     Status::NOT_IMPLEMENTED,
   ]
@@ -501,6 +1124,14 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
   }
 
   async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
+    if let Some(answer) = self.commit_side() {
+      self.answered = Some(Answered::Whole {
+        status: status_of(answer.status),
+        headers: answer.headers,
+        body: answer.body,
+      });
+      return Ok(());
+    }
     let request = Request {
       method: &self.method,
       path: &self.path,

@@ -57,6 +57,7 @@ pub mod check;
 pub mod classify;
 pub mod commit;
 pub mod held;
+pub mod intake;
 pub mod reply;
 pub mod tree;
 pub mod verify;
@@ -116,9 +117,12 @@ enum Handler {
   Output,
 }
 
+/// A part type a push's handler takes, the parameters it names, and its handler.
+type HandlerEntry = (&'static [u8], &'static [&'static [u8]], Handler);
+
 /// Format: the part types a push's handlers take, as 7.2 registers them (lower case), with the parameters each handler
 /// names (`@parthandler`, `bundle2_part_handlers.py`); every other type has no handler in a push (module docs).
-const HANDLERS: [(&[u8], &[&[u8]], Handler); 12] = [
+const HANDLERS: [HandlerEntry; 12] = [
   (b"replycaps", &[], Handler::ReplyCaps),
   (b"check:heads", &[], Handler::CheckHeads),
   (b"check:updated-heads", &[], Handler::CheckUpdatedHeads),
@@ -655,11 +659,11 @@ fn pushkey_of(part: &Part<'_>, admission: &mut Admission) -> Result<PushkeyAsk, 
   })
 }
 
+/// A push variable: its name as the push's hooks see it, and its value.
+type Pushvar = (Vec<u8>, Vec<u8>);
+
 /// A `pushvars` part's variables: its advisory parameters, each key upper-cased behind `USERVAR_` (`bundle2getvars`).
-fn pushvars_of(
-  part: &Part<'_>,
-  admission: &mut Admission,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Refusal> {
+fn pushvars_of(part: &Part<'_>, admission: &mut Admission) -> Result<Vec<Pushvar>, Refusal> {
   let advisory = part.advisory();
   let bytes = advisory.iter().fold(0_u64, |total, param| {
     total
@@ -667,7 +671,7 @@ fn pushvars_of(
       .saturating_add(to_u64(param.key.len()))
       .saturating_add(to_u64(param.value.len()))
   });
-  admission.charge_items::<(Vec<u8>, Vec<u8>)>(advisory.len())?;
+  admission.charge_items::<Pushvar>(advisory.len())?;
   admission.charge(bytes)?;
   Ok(
     advisory

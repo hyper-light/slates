@@ -44,6 +44,7 @@ use slates_git::receive::HiddenRefs;
 use slates_git::store::NamedRef;
 use slates_git::store::learn::{Clock, Exchange};
 use slates_git::upload::{Fragments, PackPlan, PackRefused, PackSource, Served, Streamed};
+use slates_vcs::Work;
 
 use crate::config::DaemonConfig;
 use crate::git_push::{PolicyHidden, ref_of};
@@ -69,6 +70,12 @@ impl StoreLender for ShardStores {
     crate::state::with_state_counted(|state| lendable(state, id).is_some()).unwrap_or(false)
   }
 
+  /// Derived: the room repository `id`'s works are admitted on this shard (`crate::vcs_share::room`, A-724), as a
+  /// push's.
+  fn room(&mut self, id: RepositoryId) -> Option<u64> {
+    crate::state::with_state_counted(|state| crate::vcs_share::room(state, id).bytes)
+  }
+
   fn lend<R>(
     &mut self,
     (id, reader): (RepositoryId, &Principal),
@@ -84,6 +91,12 @@ impl StoreLender for ShardStores {
   ) -> Option<R> {
     crate::state::with_state_counted(|state| lend_on(state, (id, None), step)).flatten()
   }
+
+  /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
+  /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]).
+  async fn encode(&mut self, id: RepositoryId) {
+    super::git_encode::settle_encodings(id).await;
+  }
 }
 
 /// Runs `step` over repository `id`'s git store on `state`'s shard (the module doc): as upload-pack answers a request of
@@ -91,6 +104,28 @@ impl StoreLender for ShardStores {
 /// read. None when the store is not lendable here ([`lendable`]), or the repository's policy cannot be read for a
 /// reader (A-622's guard keeps such rules out: a damaged record is never read without its policy).
 pub(crate) fn lend_on<R>(
+  state: &mut ShardState,
+  (id, reader): (RepositoryId, Option<&Principal>),
+  step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
+) -> Option<R> {
+  let began = slates_rt::futures::now_ns();
+  let lent = lend_uncounted(state, (id, reader), step);
+  // A-724 piece 1: a request's step (one with a reader) begins a fetch on the repository's usage row; every step that
+  // was lent is counted with its time. Owed: a fetch's answered count, at the pack's last step.
+  if lent.is_some() {
+    let now = slates_rt::futures::now_ns();
+    if let Some(reader) = reader {
+      state.vcs_usage.begun(&id, reader, Work::Fetch, began);
+    }
+    state
+      .vcs_usage
+      .stepped(&id, Work::Fetch, (now.saturating_sub(began), 0), now);
+  }
+  lent
+}
+
+/// [`lend_on`]'s step, uncounted.
+fn lend_uncounted<R>(
   state: &mut ShardState,
   (id, reader): (RepositoryId, Option<&Principal>),
   step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
@@ -156,7 +191,7 @@ fn readable_refs(
 /// over its value of CPU, at neutral): the time this machine takes to copy the byte, as the archive's codec policy prices
 /// a byte at neutral (`DaemonConfig::codec`), so a second buys the measured memcpy throughput's bytes
 /// (`DaemonConfig::memcpy_bytes_per_second`, at least one byte).
-fn exchange(config: &DaemonConfig) -> Exchange {
+pub(super) fn exchange(config: &DaemonConfig) -> Exchange {
   Exchange {
     ns: NANOS_PER_SECOND,
     bytes: config.memcpy_bytes_per_second.max(1),
@@ -221,7 +256,7 @@ impl PackSource for ShardPacks {
 }
 
 /// The shard's clock (§4.3), which a turn's quantum is spent on.
-struct ShardClock;
+pub(super) struct ShardClock;
 
 impl Clock for ShardClock {
   fn now_ns(&mut self) -> u64 {

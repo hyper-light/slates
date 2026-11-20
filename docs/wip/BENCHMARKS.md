@@ -14668,3 +14668,163 @@ an order of magnitude is worth chasing; the one-commit steps are already 0.15 to
 round trips. Subversion's load costs 0.16 s a revision (it flushes each), and its one-file commit 3.7 s, most of it the
 client walking a 4,872-file working copy. Owed against §4.17.1's method: git-http-backend and Gitaly, mod_dav_svn, the
 Linux kernel as the dataset, the server's CPU and peak memory, and N concurrent clients.
+
+## Slates against svnserve over svn://, and what stops git's and Mercurial's whole histories (A-699; UI goal 93; 2026-11-20)
+
+- **Machine and builds:** the Mac Studio of the stock entry above, 2026-11-20 ~06:10 UTC, load average 19.16 at the
+  start and 34.04 at the end (agents' builds; not quiesced). slates: release build of main bc2803d66 (`slates anchor
+  --vcs-svn 127.0.0.1:0`, 23 shards derived, a minted token as CRAM-MD5's credentials).
+- **Data:** git/git's newest 1,000 first-parent commits to f7de81456940 as a dump (`git_to_svn_dump.py src.git master
+  1000`, 223 MiB). Both servers hold the same 1,000 revisions: each first checkout's 4,872 files' blob ids equal git's
+  tree, and each log names 1,000 revisions.
+- **Command:** `KEEP_LOGS=DIR SERVERS="stock slates" SLATES=slates crates/cli/bench/svn_scale.sh git-1000.dump src.git
+  master WORK 3 1800`, runs interleaved, stock first.
+
+| svn:// | stock 1 | 2 | 3 | best | slates 1 | 2 | 3 | best |
+|---|---|---|---|---|---|---|---|---|
+| fill (`svnadmin load`, once / `slates repository import`) | 62.817 | | | 62.817 | 1.874 | 1.958 | 1.878 | 1.874 |
+| checkout of trunk | 4.904 | 4.989 | 6.354 | 4.904 | 5.089 | 5.238 | 5.454 | 5.089 |
+| `log -q`, whole history | 0.140 | 0.227 | 0.197 | 0.140 | 0.071 | 0.083 | 0.062 | 0.062 |
+| one-file commit | 4.376 | 5.033 | 5.008 | 4.376 | 4.020 | 3.698 | 4.226 | 3.698 |
+| update to it | 1.009 | 0.993 | 0.985 | 0.985 | 1.022 | 0.986 | 0.990 | 0.986 |
+
+The import fills the repository 33 times as fast as stock's load, and `log` is 2.3 times as fast. Checkout, commit and
+update are even, within this loaded box's noise. Those three are client-bound: the client walks and writes a
+4,872-file working copy. The daemon held 2,561 to 2,582 MiB after each import. (The run's update-across step reached
+r0, which holds no trunk, so it is left out. The harness now takes a short history back to r1.)
+
+What stops the larger datasets (each found by use, reported to its owner, and owed before slates' numbers on it):
+- git/git whole push (main 9f0851ea0, A-704 in): shard 10 spins 1,046 ms without a step, the watchdog kills the
+  daemon, and git hangs after "unable to rewind rpc post data" (w-git).
+- Mercurial's repository (57,036 changesets) whole push: 413 at the edge's 278,528 B room (main 9f0851ea0). After
+  A-711 (main bc2803d66) the 413 is gone, but shard 10 spins 1,152 ms, the daemon is killed, and hg aborts after 7.6 s.
+  `slates repository import` of the same repository is refused `PastRoom { room: 278528 }` (w-hg).
+- Subversion 5,000-revision dump: the import stops at 1,685 revisions, `TableAtCapacity { table: "green_chains" }`,
+  with the daemon at 3,390 MiB (main 9ea6e1311; w-svn).
+
+## Where the svn server's time and memory go, ranked (A-699 piece 3; UI goal 93; 2026-11-20)
+
+Mac Studio (as above), release main bc2803d66, git/git's newest 250 and 1,000 first-parent commits as dumps (85 and
+223 MiB). Time: `/usr/bin/time -p` on the client and the server process's CPU before and after (`ps -o time`;
+`svnserve -T`, one process). Memory: `footprint`, and the live heap by allocation stack (`MallocStackLogging=1` on the
+anchor, which the daemon inherits; `malloc_history PID -allBySize` after the import). `slates status` has no memory
+counters.
+
+**Time: checkout, commit and update are client-bound.** A 1,000-revision trunk checkout (4,872 files) takes about
+4.2 s of wall time against either server: the client spends 0.48 s in user time and 2.78 s in the kernel writing its
+working copy. The server's share is 0.12 s of slates CPU against 0.56 s of `svnserve` CPU, 4.7 times less. A whole
+`log -q` costs neither server measurable CPU (0.00 against 0.02 s). Ten times at the client's wall clock is out of
+reach on these operations; the server's share is what slates is measured on there.
+
+**Memory: footprint after the import.** 250 revisions: about 920 MB. 500: about 2,060 MB. 1,000: about 2,430 MB
+(MALLOC_LARGE 867, MALLOC_SMALL 842, VM_ALLOCATE 585, MALLOC_REALLOC 136 MB). Live heap by stack, 250 to 1,000
+revisions:
+
+| Holder | 250 | 1,000 | Shape |
+|---|---|---|---|
+| svn records' texts (`Repository.contents`, allocated in `Importer::import`) | 120.1 MiB | 305.6 MiB | 1.37x the dump; every text whole |
+| register's repository records (`Repositories::apply_advanced`) | 86.5 MiB | 244.7 MiB | ~245 KB a revision |
+| merge engine, svn commits (`Green::commit`) | 67.1 MiB | 234.8 MiB | ~235 KB a revision |
+| merge history (`Value::whole`) | 51.9 MiB | 50.3 MiB | flat |
+| green checkpoint (`apply_green_checkpoint`, 2 allocations) | 46.8 MiB | 46.5 MiB | flat |
+| `Partition::apply_repository` | 39.7 MiB | 45.2 MiB | flat |
+
+Virtual only (reserved, not dirty): the timer wheels, 898 MiB (39 MiB a shard); the segment's and content pool's maps.
+The content pool's dirty pages are the files the greens hold: 222 MB at 250 revisions and 585 MB at 1,000.
+
+Ranked plan, each owed:
+- M1, the register's ~245 KB a revision. Linear, not quadratic; it is data for w-svn's charging of a repository's
+  content to its shard, and needs no separate fix.
+- M2, every svn text held twice: whole in the svn records (`crates/svn/src/migration/records.rs`, `contents`) and
+  again as the green's files in the content pool. One store would save about 1.4 times the dump's bytes. Main's ruling
+  is owed.
+- M3, the merge engine's ~235 KB a revision under `Green::commit`, likely retention of work already durable.
+- M4, the green checkpoint's whole-green copy (47 MiB in two allocations).
+- M5, fixed per daemon: the timer wheels' 898 MiB reservation, the segment's 43 MiB unit set, 47 MiB of thread stacks.
+
+## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
+
+- **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
+  end (shared; not quiesced). slates: release build of main 82d3538b0 (A-713's clone room in).
+- **Data:** git/git cut at v1.0.0 (`git push cut.git 'v1.0.0^{commit}:refs/heads/master' refs/tags/v1.0.0`): 2,930
+  commits, 12,233 objects, a 3.46 MiB pack. Both servers' first mirror clones: `fsck --full` clean, refs (2) and object
+  ids (12,233) identical to the source.
+- **Command:** `KEEP_LOGS=DIR SERVERS="stock slates" crates/cli/bench/git_scale.sh slates cut-1.0.git WORK 3 900`,
+  interleaved, stock first.
+
+| git | stock 1 | 2 | 3 | best | slates 1 | 2 | 3 | best |
+|---|---|---|---|---|---|---|---|---|
+| push, both refs | 0.368 | 0.319 | 0.310 | 0.310 | 0.665 | 1.369 | 0.689 | 0.665 |
+| clone `--mirror` | 0.321 | 0.305 | 0.300 | 0.300 | 2.983 | 2.853 | 2.816 | 2.816 |
+| one-commit push | 0.080 | 0.088 | 0.099 | 0.080 | 0.058 | 0.089 | 0.060 | 0.058 |
+| fetch of it | 0.068 | 0.085 | 0.082 | 0.068 | 0.080 | 0.083 | 0.087 | 0.080 |
+| clone `--depth 1` | 0.115 | 0.144 | 0.111 | 0.111 | 0.165 | 0.171 | 0.160 | 0.160 |
+| clone `--filter=blob:none` | 0.180 | 0.195 | 0.189 | 0.180 | 1.120 | 1.136 | 1.092 | 1.092 |
+
+The daemon held 383 to 395 MiB.
+
+Where a clone's time goes (macOS `sample PID 4 1` on the daemon during one clone): the clone took 3.51 s at the client
+and 5.15 s of the daemon's CPU; of the daemon's samples on CPU, about 72% (1,522 of about 2,100) are in
+`slates_git::store::deltas::Search::step`. Every clone searches the whole store for deltas again, where `git daemon`
+sends the deltas its pack already holds. T4, owed and first for git's time: keep and reuse deltas (the pushed pack's
+bases, or the search's result at the repository's version), so a clone streams deltas it already has.
+
+## A pushed version's fragments encoded once, before a fetch: a second clone 3.0 times as fast, the first 1.5 times as slow (A-718; UI goal 93; 2026-11-20)
+
+- **Machine:** Mac Studio (as above), 2026-11-20 ~07:30 UTC, load average 6.6 to 10.0 (shared; not quiesced).
+- **Builds:** after: release of branch agents/w-perf-a718 at 6ab6d6662 (A-718 over main b705a24c5); before: release of
+  main b705a24c5. Run one after the other, each interleaved with stock `git daemon`.
+- **Data and command:** git/git cut at v1.0.0 (2,930 commits, 12,233 objects, a 3.46 MiB pack); `KEEP_LOGS=DIR
+  SERVERS="stock slates" crates/cli/bench/git_scale.sh slates cut-1.0.git WORK 3 900`, the harness now cloning a second
+  time (`clone-again`), as every clone after the first meets. Both builds' first clones: `fsck --full` clean, refs (2)
+  and object ids (12,233) identical to the source.
+
+Best of three, seconds (every run in the logs: `~/.cache/w-perf/logs/git-cut10-{a718,before}.log` on the Studio):
+
+| git | stock | slates before | slates after |
+|---|---|---|---|
+| push, both refs | 0.346 / 0.351 | 0.672 | 0.684 |
+| first clone `--mirror` | 0.356 / 0.318 | 2.791 | 4.293 |
+| second clone `--mirror` | 0.312 / 0.342 | 2.766 | 0.912 |
+| one-commit push | 0.086 / 0.070 | 0.051 | 0.050 |
+| fetch of it | 0.074 / 0.073 | 0.068 | 0.071 |
+| clone `--depth 1` | 0.115 / 0.119 | 0.154 | 0.118 |
+| clone `--filter=blob:none` | 0.190 / 0.222 | 1.076 | 0.558 |
+
+(Stock's two figures are its runs beside each build.) The daemon's resident set after the push: 383 to 389 MiB both;
+at the end of a run: 384 to 388 MiB before, 482 to 513 MiB after, the kept fragments and the content store's arena
+grown for them.
+
+What it means: every clone after the first is 3.0 times as fast, a partial clone 1.9 times, and a shallow one even
+with `git daemon`. The first clone after a push now pays the version's whole encoding, 4.293 s against the old search's
+2.791 s, since the encoding tries the learned window's candidates for every object where the old stream searched only
+what no part covered. A second clone is still 2.7 times `git daemon`'s. Owed, measured next: where the first clone's
+encoding and the second clone's 0.91 s go; the encoding moved to the push's own intake (the deltas the client sent kept,
+git's pack reuse; w-git's streaming intake), so no fetch pays it; and the arena's 100 to 125 MiB more for a 3.5 MiB pack.
+
+## Concurrent large pushes into one daemon: every push keeps about 67 times its pack, so 1,000 cannot fit (UI goal 93; Ada's tens-of-thousands requirement; 2026-11-20)
+
+- **Machine and build:** Mac Studio (as above), 2026-11-20 ~09:30 UTC, load average 5.1 to 7.1. slates: release build
+  of main 7b46fbdcd (`slates anchor --vcs-http 127.0.0.1:0`, 23 shards derived).
+- **The client:** `crates/cli/bench/push_load.py SLATES cut-1.0.git 'v1.0.0^{commit}' --max 100`. It is a slim
+  smart-HTTP client, since stock git cannot run thousands of pushes on one box. It makes git's receive-pack request
+  once in memory: a create of `refs/heads/main` with `report-status`, then a pack from `git pack-objects --revs
+  --stdout` (3,434,551 bytes, 12,232 objects of git/git cut at v1.0.0). It sends N of them at once, each to its own
+  fresh repository, and reads every answer whole. The steps are powers of ten up to the client's open-file room, less a
+  tenth (derived from the machine; 221,184 here, capped at 100 for this run).
+
+| N | ok | wall | p50 | p99 | daemon RSS before → peak | per push |
+|---|---|---|---|---|---|---|
+| 1 | 1/1 | 0.792 s | 0.789 s | 0.789 s | 85 → 386 MiB | 300.8 MiB |
+| 10 | 10/10 | 0.955 s | 0.919 s | 0.952 s | 386 → 3,285 MiB | 289.9 MiB |
+| 100 | 100/100 | 4.795 s | 2.825 s | 4.790 s | 3,286 → 28,164 MiB | 248.8 MiB |
+
+None of it goes back once a push completes (each step starts at the last one's peak), so 1,000 pushes would need about
+250 GB, past the box's 96 GiB; the 1,000 and 10,000 steps were not run on the shared machine.
+
+Where one push's 229 MiB goes (`MallocStackLogging=1`, `malloc_history -allBySize`, `footprint` before and after):
+69.1 MiB in `slates_vcs::ContentStore::put_object` (every object kept inflated and whole: about 20 times the pack);
+63.5 MiB in `slates_db::Partition::apply_repository` (the register entry's copy of the push's objects); 63.7 MiB of
+the content store's arena regions grown for them. Owed, and what the next run measures: the intake keeping the
+client's deltas compressed and naming blobs in the green's identity table (w-git's streaming intake; A-716 slice 1a's
+`Green::hold_bytes`), and the register entries naming objects by identity rather than holding them.

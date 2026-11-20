@@ -627,14 +627,15 @@ fn the_repositorys_state_is_charged_to_the_merge_budget_and_given_back_with_it()
 }
 
 /// A-662 (§4.17.1 "Durability and residency": a push's objects held as a version holds its files' contents). Do: append
-/// two pushes, each a version of the root and its objects; then one whose objects pass the merge budget; rebuild the
-/// partition from its snapshot; destroy the repository and make another. Expect: the objects read back in the order
-/// the register received them; a push of one green and its objects is no atomic record, since the objects take no
-/// position; the one past the budget is refused `Capacity` with nothing kept; the rebuilt partition reads the same
-/// objects and charges them; the destroy gives their bytes back, so objects as large fit the next repository.
+/// two pushes, each a version of the root and its objects; then one whose objects alone pass the merge budget; rebuild
+/// the partition from its snapshot; destroy the repository. Expect: the objects read back in the order the register
+/// received them, and their bytes counted (`Repositories::objects_bytes`); a push of one green and its objects is no
+/// atomic record, since the objects take no position; the one past the merge budget is kept, since objects are the
+/// repository's content, charged by its owner shard to its memory budget, never the merge budget the partition's
+/// chains share (found by use: a Subversion import of 5,000 revisions refused `green_chains` at 1,685); the rebuilt
+/// partition reads the same objects; the destroy drops them.
 #[test]
-fn a_pushs_objects_are_kept_in_order_charged_carried_by_a_snapshot_and_given_back_with_the_repository()
- {
+fn a_pushs_objects_are_kept_in_order_carried_by_a_snapshot_and_never_charged_to_the_merge_budget() {
   let budget = caps(256);
   let (mut partition, repo, [a, ..]) = three_branches(budget);
   for (at_version, byte) in [(1, 7u8), (2, 8)] {
@@ -654,26 +655,17 @@ fn a_pushs_objects_are_kept_in_order_charged_carried_by_a_snapshot_and_given_bac
     partition.repositories().object_record(repo, 1),
     Some(&[8u8; 50][..])
   );
-  let before = partition.to_snapshot(0);
-  let full = Err(DbError::Capacity {
-    table: "green_chains",
-  });
   let mut large = at(repo);
   large.versions = vec![version(a, 3, &[9; 10])];
-  large.objects = vec![9; 150];
-  assert_eq!(advance(&mut partition, large.clone()), full);
-  assert_eq!(partition.to_snapshot(0), before);
-  let mut rebuilt = Partition::from_snapshot(&before, budget, 0).unwrap();
+  large.objects = vec![9; 300];
+  advance(&mut partition, large).unwrap();
+  assert_eq!(partition.repositories().objects_bytes(repo), 400);
+  let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), budget, 0).unwrap();
   assert!(
     rebuilt
       .repositories()
       .objects(repo)
       .eq(partition.repositories().objects(repo))
-  );
-  assert_eq!(
-    advance(&mut rebuilt, large),
-    full,
-    "a rebuilt partition charges the objects it carries"
   );
   run(
     &mut partition,
@@ -681,11 +673,6 @@ fn a_pushs_objects_are_kept_in_order_charged_carried_by_a_snapshot_and_given_bac
   )
   .unwrap();
   assert_eq!(partition.repositories().objects(repo).count(), 0);
-  second_repository_with_root(&mut partition, green(6));
-  let mut again = at(repository_id(10));
-  again.objects = vec![9; 150];
-  again.state = vec![marker(&[1; 10])];
-  advance(&mut partition, again).unwrap();
 }
 
 /// A-642 (no global reference: each green and each state log at its own position). Do: append to one green alone, to
@@ -1119,8 +1106,11 @@ struct Model {
   /// The locks, by path.
   locks: BTreeMap<String, Vec<u8>>,
   /// The atomic records kept, by key, each with the positions of greens' logs that point to it.
-  records: BTreeMap<(LogName, u64), (AtomicRecord, BTreeSet<(u8, u64)>)>,
+  records: BTreeMap<(LogName, u64), KeptRecord>,
 }
+
+/// An atomic record the model keeps, with the positions `(green, position)` of greens' logs that point to it.
+type KeptRecord = (AtomicRecord, BTreeSet<(u8, u64)>);
 
 impl Model {
   fn is_member(&self, volume: u8) -> bool {
@@ -2038,28 +2028,9 @@ fn spanned(record: &crate::catalog::StateLogRecord) -> (StateLog, u64, u64, usiz
 /// two operations naming one identity.
 #[test]
 fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
-  use crate::catalog::LoggedChange;
   let (mut partition, repo, [a, b, c, ..]) = three_branches(caps(ROOMY));
   let first = partition.take_state_log_records();
-  assert_eq!(
-    first.iter().map(spanned).collect::<Vec<_>>(),
-    vec![(StateLog::Names, 0, 6, 6)]
-  );
-  assert_eq!(
-    first[0].spans,
-    vec![span(state_log(repo, StateLog::Names), 0, 6)]
-  );
-  assert!(matches!(
-    first[0].changes.as_slice(),
-    [
-      LoggedChange::Joined { .. },
-      _,
-      _,
-      LoggedChange::Named { .. },
-      _,
-      _
-    ]
-  ));
+  assert_the_create_records_its_joins_then_its_binds(&first, repo);
   let mut push = at(repo);
   push.versions = vec![version(a, 1, b"a1"), version(b, 1, b"b1")];
   push.names = vec![retire("other")];
@@ -2113,6 +2084,33 @@ fn each_operation_records_what_it_moved_of_each_state_log_named_alike() {
     vec![(StateLog::Locks, 1, 2, 1)]
   );
   assert!(identities.insert(released[0].identity));
+}
+
+/// The create's records: one of the names log, positions 0 to 6, its three joins then its three binds.
+fn assert_the_create_records_its_joins_then_its_binds(
+  first: &[crate::catalog::StateLogRecord],
+  repo: RepositoryId,
+) {
+  use crate::catalog::LoggedChange;
+  assert_eq!(
+    first.iter().map(spanned).collect::<Vec<_>>(),
+    vec![(StateLog::Names, 0, 6, 6)]
+  );
+  assert_eq!(
+    first[0].spans,
+    vec![span(state_log(repo, StateLog::Names), 0, 6)]
+  );
+  assert!(matches!(
+    first[0].changes.as_slice(),
+    [
+      LoggedChange::Joined { .. },
+      _,
+      _,
+      LoggedChange::Named { .. },
+      _,
+      _
+    ]
+  ));
 }
 
 /// The push of [`each_operation_records_what_it_moved_of_each_state_log_named_alike`]: one record of each state log it

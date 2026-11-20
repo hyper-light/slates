@@ -5,15 +5,15 @@ use flate2::{Compress, Compression, FlushCompress};
 use proptest::prelude::*;
 
 use super::{
-  Chain, IndexMismatch, Locate, NoIndex, Outside, Reader, Refusal, Unpacked, check_index,
-  read_whole,
+  Chain, IndexMismatch, Keep, Locate, NoIndex, NoObjects, Object, Outside, Reader, Refusal,
+  Unpacked, check_index, read_whole,
 };
 use crate::delta::{self, Sizes};
 use crate::entry::{self, Header, Representation};
 use crate::object_name::{Kind, ObjectFormat, ObjectId, name_of};
 use crate::pack::{self, idx::Idx};
 use crate::pack_fixtures::{Pack, every_pack};
-use crate::{Admission, PastAdmission};
+use crate::{Admission, Hold, PastAdmission};
 
 /// `n` as a `u64`.
 fn wide(n: usize) -> u64 {
@@ -163,9 +163,12 @@ fn blob_id(format: ObjectFormat, content: &[u8]) -> ObjectId {
   name_of(format, Kind::Blob, content).unwrap()
 }
 
+/// What an object of a pack must read as: where it begins, its type, its content and its delta chain.
+type Expected = (u64, Kind, Vec<u8>, Option<Chain>);
+
 /// The small pack every cut and every bit flip is tried on, in `format`, with what its five objects must read as: a
 /// blob, a commit and a tag stored whole, an offset delta on the blob, and a reference delta on that delta.
-fn small_pack(format: ObjectFormat) -> (Vec<u8>, Vec<(u64, Kind, Vec<u8>, Option<Chain>)>) {
+fn small_pack(format: ObjectFormat) -> (Vec<u8>, Vec<Expected>) {
   let blob: &[u8] = b"hello world\n";
   let edited: &[u8] = b"hello there world\n";
   let edited_again: &[u8] = b"hello there, world!\n";
@@ -800,6 +803,97 @@ fn a_chain_as_deep_as_the_admission_holds_resolves_and_no_deeper() {
   let charged = u64::MAX - measure.left();
   let short = &mut Admission::new(charged - targets / 2);
   let refused = read_whole(&bytes, format, &NoIndex, short).unwrap_err();
+  assert!(past_admission(&refused), "{refused:?}");
+}
+
+/// A keeper that stores each object outside the reader's admission and gives every hold back, as a push's intake stores
+/// objects in its repository's store (A-719 part 2).
+#[derive(Default)]
+struct Elsewhere {
+  /// The objects kept, by position.
+  objects: std::collections::BTreeMap<usize, Object>,
+}
+
+impl Keep for Elsewhere {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: Object,
+    hold: Hold,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    self.objects.insert(at, object);
+    admission.release(hold);
+    Ok(())
+  }
+
+  fn content(&self, at: usize, id: &ObjectId) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self
+      .objects
+      .get(&at)
+      .filter(|object| object.id == *id)
+      .map(|object| std::borrow::Cow::Borrowed(object.content.as_slice()))
+  }
+
+  fn release(&mut self, hold: Hold, admission: &mut Admission) {
+    admission.release(hold);
+  }
+}
+
+/// A-719 part 2 (§4.17.1: a push's working set bounded whatever its size). Do: write the 300-deep chain of
+/// [`a_chain_as_deep_as_the_admission_holds_resolves_and_no_deeper`] and read it into a keeper that stores each object
+/// elsewhere, fed in pieces of 61 bytes, under an admission of the reader's tables (256 bytes an object) and eight
+/// versions' bytes, which cannot hold a third of its targets; then read it whole into memory under the same admission. Expect: kept whole
+/// in the keeper, every object as the pack read whole without bound makes it, the last 300 deep, and each placed in
+/// pack order with its name; read into memory, refused past its admission.
+#[test]
+fn a_pack_read_into_a_keeper_that_stores_elsewhere_holds_a_bounded_working_set() {
+  let format = ObjectFormat::Sha1;
+  let versions: Vec<Vec<u8>> = (0..=300)
+    .map(|version| {
+      format!(
+        "version {version}\n{}\n",
+        "of a file kept as a chain of deltas ".repeat(28)
+      )
+      .into_bytes()
+    })
+    .collect();
+  let mut builder = Builder::new(format);
+  let mut previous = builder.put(Representation::Whole(Kind::Blob), &versions[0]);
+  for pair in versions.windows(2) {
+    let ofs = Representation::OfsDelta { base: previous };
+    previous = builder.put(ofs, &delta_between(&pair[0], &pair[1]));
+  }
+  let bytes = builder.finish();
+  let whole = read_whole(&bytes, format, &NoIndex, &mut unbounded()).unwrap();
+  let room = wide(versions.len() * 256 + 8 * versions[300].len());
+  let mut keeper = Elsewhere::default();
+  let mut admission = Admission::new(room);
+  let mut reader = Reader::new(format, &NoIndex);
+  for piece in bytes.chunks(61) {
+    assert_eq!(
+      reader.read_into(piece, &mut admission, &mut keeper),
+      Ok(piece.len())
+    );
+  }
+  let kept = reader
+    .finish_into(&NoObjects, &mut admission, &mut keeper)
+    .unwrap();
+  let placed: Vec<(ObjectId, u64)> = kept
+    .objects
+    .iter()
+    .map(|placed| (placed.id, placed.offset))
+    .collect();
+  let read: Vec<(ObjectId, u64)> = whole
+    .objects
+    .iter()
+    .map(|object| (object.id, object.offset))
+    .collect();
+  assert_eq!(placed, read);
+  let stored: Vec<Object> = keeper.objects.into_values().collect();
+  assert_eq!(stored, whole.objects);
+  assert_eq!(kept.objects[300].chain.map(|chain| chain.depth), Some(300));
+  let refused = read_whole(&bytes, format, &NoIndex, &mut Admission::new(room)).unwrap_err();
   assert!(past_admission(&refused), "{refused:?}");
 }
 

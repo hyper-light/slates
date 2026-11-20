@@ -1110,6 +1110,11 @@ impl FileState {
     self.delegations.recall(fh, actor, conflict, now_ns)
   }
 
+  /// When the earliest recall still unreturned began (`Delegations::earliest_recall_ns`).
+  pub fn earliest_recall_ns(&self) -> Option<u64> {
+    self.delegations.earliest_recall_ns()
+  }
+
   /// Revokes every delegation not returned within `lease_ns` of its recall; journaled. Their `other`s and holders.
   pub fn revoke_lapsed(&mut self, now_ns: u64, lease_ns: u64, quiet_ns: u64) -> Vec<(Other, u64)> {
     let revoked = self.delegations.revoke_lapsed(now_ns, lease_ns, quiet_ns);

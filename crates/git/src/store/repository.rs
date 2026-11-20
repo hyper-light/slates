@@ -907,7 +907,7 @@ impl Repository {
     store: &ContentStore,
     push: &Push,
     to: ObjectId,
-  ) -> Result<(Positions, Members, Option<(u64, usize)>), StoreRefused> {
+  ) -> Result<RemadeSet, StoreRefused> {
     let (base, from) = match self.base(store, push, to)? {
       Some(green) => {
         self.count(|counters| counters.bases_found = counters.bases_found.saturating_add(1));
@@ -1121,11 +1121,7 @@ impl Repository {
 
   /// For each object a move's walk found new, the green and version that brought it: the first move in order whose D(k)
   /// holds it; an object no move's holds is the first move's.
-  fn brought_by(
-    &self,
-    moves: &[Move],
-    first: &Move,
-  ) -> (BTreeMap<ObjectId, (u64, u64)>, (u64, u64)) {
+  fn brought_by(&self, moves: &[Move], first: &Move) -> BroughtBy {
     let version_of = |green: u64| {
       self.chains.get(&green).map_or(0, |chain| {
         u64::try_from(chain.versions.len()).unwrap_or(u64::MAX)
@@ -1164,7 +1160,7 @@ impl Repository {
     push: &Push,
     fresh: &[(ObjectId, Kind, ContentId, u64)],
     positions: &BTreeMap<ObjectId, u64>,
-    (by, otherwise): &(BTreeMap<ObjectId, (u64, u64)>, (u64, u64)),
+    (by, otherwise): &BroughtBy,
   ) -> Result<Vec<OwnedRow>, StoreRefused> {
     let mut owned = Vec::with_capacity(fresh.len().saturating_mul(2));
     for (id, kind, content, len) in fresh {
@@ -1247,7 +1243,7 @@ impl Repository {
     store: &ContentStore,
     moves: &[Move],
     positions: &BTreeMap<ObjectId, u64>,
-  ) -> Result<(Vec<Planned>, BTreeMap<u64, BTreeSet<u64>>), StoreRefused> {
+  ) -> Result<(Vec<Planned>, HeadMap), StoreRefused> {
     let mut planned = Vec::with_capacity(moves.len());
     let mut heads = self.heads.clone();
     for movement in moves {
@@ -1541,6 +1537,17 @@ fn footprint(
   chains.saturating_add(bytes(entries, HEAD_BYTES))
 }
 
+/// A remade reached set: its positions, its members, and the green and version of the base set it
+/// grew from, when one was found.
+type RemadeSet = (Positions, Members, Option<(u64, usize)>);
+
+/// For each object a move found new, the green and version that brought it; and the pair for an
+/// object no move holds.
+type BroughtBy = (BTreeMap<ObjectId, (u64, u64)>, (u64, u64));
+
+/// For each commit some green's head names, by its position, those greens.
+type HeadMap = BTreeMap<u64, BTreeSet<u64>>;
+
 /// A tree's entries that are objects of this repository: name, whether a subtree, id.
 pub(super) type TreeEntries = BTreeMap<Vec<u8>, (bool, ObjectId)>;
 
@@ -1723,6 +1730,73 @@ impl Repository {
   ) -> Result<(), StoreRefused> {
     let encoding = Encoding::fragments(self, store, green, version)?;
     encoding.finish(self, store, clock, exchange)
+  }
+
+  /// The first version whose fragments are not kept yet, by green and then version (A-718; §4.17.2
+  /// "A push" item 8): what the owner encodes next, so each version a push made is encoded once and
+  /// every fetch after copies its fragments rather than searching its objects for deltas again.
+  /// None once every version's fragments are kept.
+  pub fn first_unencoded(&self) -> Option<(u64, usize)> {
+    self.chains.iter().find_map(|(green, chain)| {
+      chain
+        .versions
+        .iter()
+        .position(|version| version.fragments.is_none())
+        .map(|version| (*green, version))
+    })
+  }
+
+  /// Every version whose fragments are kept, by green and then version, with the bytes dropping
+  /// them gives back: their content and what their entries are charged (A-724 piece 4): what a repository over its memory share may drop, since a version
+  /// whose fragments are gone is encoded again by the next fetch (A-718), as after a recovery.
+  pub fn kept_fragments(&self, store: &ContentStore) -> Vec<((u64, usize), u64)> {
+    self
+      .chains
+      .iter()
+      .flat_map(|(green, chain)| {
+        chain
+          .versions
+          .iter()
+          .enumerate()
+          .filter_map(move |(version, record)| {
+            let fragments = record.fragments.as_ref()?;
+            let bytes = [&fragments.objects, &fragments.blobs]
+              .into_iter()
+              .map(|kept| {
+                let content = store
+                  .get(&kept.content)
+                  .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                let runs = kept.positions.runs().saturating_add(kept.references.runs());
+                content
+                  .saturating_add(bytes(
+                    kept.placed.len(),
+                    PLACED_BYTES.saturating_add(ORDER_BYTES),
+                  ))
+                  .saturating_add(bytes(runs, RUN_BYTES))
+              })
+              .fold(0u64, u64::saturating_add);
+            Some(((*green, version), bytes))
+          })
+      })
+      .collect()
+  }
+
+  /// Drops `green`'s version `version`'s kept fragments (A-724 piece 4): their content let go and
+  /// the store's charge trued up, so the next fetch encodes the version again (A-718). Whether
+  /// fragments were kept to drop.
+  pub fn drop_fragments(
+    &mut self,
+    store: &mut ContentStore,
+    (green, version): (u64, usize),
+  ) -> Result<bool, StoreRefused> {
+    let Some(fragments) = fragments_slot(&mut self.chains, green, version).and_then(Option::take)
+    else {
+      return Ok(false);
+    };
+    store.release(&fragments.objects.content)?;
+    store.release(&fragments.blobs.content)?;
+    self.recharge(store)?;
+    Ok(true)
   }
 
   /// What `green`'s version `version` brought, still to encode as its fragments; `None` once they

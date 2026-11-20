@@ -145,6 +145,7 @@ impl LogRequest {
     let (limit, merged, revprops) = match params.len() {
       COMPAT_ITEMS => (0, false, Revprops::Named(compat_revprops())),
       LIMIT_ITEMS => (
+        // Format: `"l(?r)(?r)bb?n?Bwl"`'s sixth item, the limit.
         revnum_count(params.get(5))?,
         false,
         Revprops::Named(compat_revprops()),
@@ -156,6 +157,7 @@ impl LogRequest {
       paths,
       start: optional_revnum(params.get(1))?,
       end: optional_revnum(params.get(2))?,
+      // Format: `"l(?r)(?r)bb?n?Bwl"`'s changed-paths (3) and strict-node (4).
       changed_paths: boolean(params.get(3))?,
       strict: boolean(params.get(4))?,
       limit: if limit > LIMIT_CEILING { 0 } else { limit },
@@ -167,11 +169,14 @@ impl LogRequest {
   /// The items after `strict-node` in a whole request: the limit, whether merged revisions are included, the word and
   /// its names.
   fn whole_tail(params: &[Value<'_>]) -> Option<(u64, bool, Revprops)> {
+    // Format: `"l(?r)(?r)bb?n?Bwl"` from its sixth item: limit 5, include-merged-revisions 6, the
+    // revision-property word 7 and its names 8 (`serve.c` `log_cmd`).
     let limit = revnum_count(params.get(5))?;
     let merged = boolean(params.get(6))?;
     let Some(Value::Word(word)) = params.get(7) else {
       return None;
     };
+    // Format: `"l(?r)(?r)bb?n?Bwl"`'s ninth item, the revision-property names.
     let Some(Value::List(names)) = params.get(8) else {
       return None;
     };

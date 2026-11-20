@@ -11,8 +11,14 @@
 //! no locked policy.
 //!
 //! Every register value this daemon writes leads with a **class byte** ([`HEAD_CLASS`], [`MERGE_CLASS`],
-//! [`CATALOG_CLASS`], [`TOMBSTONE_CLASS`], [`STATE_LOG_CLASS`]), so a holder or a successor reads a record's class from
-//! the record, never by trying decoders in turn.
+//! [`CATALOG_CLASS`], [`TOMBSTONE_CLASS`], [`STATE_LOG_CLASS`], [`REPOSITORY_CLASS`]), so a holder or a successor reads a
+//! record's class from the record, never by trying decoders in turn.
+//!
+//! **A repository's record** (A-636 part 2c-1) is its own register's value, as a volume's catalog is its catalog
+//! register's: its name, tool, object format, default branch at creation, owner and policy ([`repository_value`]),
+//! placed and taken over by its family (`slates_db::register::ObjectId::line_key`, A-636 part 2b-2), at the sequence
+//! [`repository_sequence`] names, which every policy setting and every move of its names log raises. A successor rebuilds
+//! the repository from it and its four state logs (part 2c-2).
 
 use slates_db::catalog::{AccessEntry, NamePolicy, Principal, SizeClass, VolumeRecord};
 use slates_wire::Wire;
@@ -27,6 +33,39 @@ pub const CATALOG_CLASS: u8 = 3;
 pub const TOMBSTONE_CLASS: u8 = 4;
 /// Format: the class byte of a repository's state log's record (`crate::state_log`, A-636 part 2b).
 pub const STATE_LOG_CLASS: u8 = 5;
+/// Format: the class byte of a repository's own register's value, its record ([`repository_value`], A-636 part 2c-1).
+pub const REPOSITORY_CLASS: u8 = 6;
+
+/// A repository's record as its own register's value (A-636 part 2c-1): its class byte, then the record's encoding.
+pub(crate) fn repository_value(record: &slates_db::catalog::RepositoryRecord) -> Vec<u8> {
+  let mut body = Vec::new();
+  record.encode(&mut body);
+  tagged(REPOSITORY_CLASS, body)
+}
+
+/// The repository's record a register value holds, or `None` for a value of another class or one that does not decode
+/// whole.
+pub(crate) fn repository_of(bytes: &[u8]) -> Option<slates_db::catalog::RepositoryRecord> {
+  let mut body = untagged(REPOSITORY_CLASS, bytes)?;
+  let record = slates_db::catalog::RepositoryRecord::decode(&mut body).ok()?;
+  body.is_empty().then_some(record)
+}
+
+/// The sequence a repository's own register holds `record` at (A-636 part 2c-1), `names` its names log's position: one
+/// past the sum of its policy's version and that position. A repository's record changes after its creation only by a
+/// policy setting, which raises the version, or a default branch moved, which moves the names log, so each change ships
+/// as a newer record a takeover adopts, and one sequence never names two values. Its first record is at 1 past the
+/// names its creation bound.
+pub(crate) fn repository_sequence(
+  record: &slates_db::catalog::RepositoryRecord,
+  names: u64,
+) -> u64 {
+  record
+    .policy
+    .version
+    .saturating_add(names)
+    .saturating_add(1)
+}
 
 /// Whether a register value of this class is a **single value** a holder keeps only at its newest position
 /// (a head, a catalog, a tombstone: phase one adopts only the highest), as opposed to a **ledger** it keeps

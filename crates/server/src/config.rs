@@ -78,10 +78,10 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// asynchronous one is bounded by its ring's credit, which the ring's slots cap), and the watch
 /// on its hang-up for its whole seat (A-475, `crate::reap::watch`).
 const TASKS_PER_CLIENT: usize = 3;
-/// Shape: the shard's own perpetual tasks: the server loop, the reap loop, the client reaper
-/// (A-475), the deadline keeper (A-522), the pressure sampler (A-570), the control loop and the
-/// heartbeat, plus a spare for a shutdown message.
-const LOOP_TASKS_PER_SHARD: usize = 8;
+/// Shape: the shard's own perpetual tasks: the server loop, the idle sweep (A-715), the client reaper
+/// (A-475), the deadline keeper (A-522), the pressure sampler (A-570), the hint watcher (A-709),
+/// the control loop and the heartbeat, plus a spare for a shutdown message.
+const LOOP_TASKS_PER_SHARD: usize = 9;
 /// Shape: the fleet's perpetual tasks per peer on the control shard: the probe loop and the record
 /// link (`fleet::probe_peer`, `fleet::establish_record_link`).
 const FLEET_LOOPS_PER_PEER: usize = 2;

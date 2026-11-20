@@ -378,6 +378,7 @@ impl Supervisor {
       vcs_http_listener: None,
       #[cfg(unix)]
       vcs_ssh_listener: None,
+      #[cfg(unix)]
       vcs_svn_listener: None,
       #[cfg(unix)]
       devices: None,

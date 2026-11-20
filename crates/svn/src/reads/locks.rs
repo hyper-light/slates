@@ -14,7 +14,8 @@ use super::{Failure, Outcome, Reads, Repository, full_path};
 use crate::lock::{AprTime, Depth, Lock, LockTable};
 use crate::ra_svn::{ItemError, Value};
 
-/// `SVN_ERR_INCORRECT_PARAMS` (`svn_error_codes.h`: `SVN_ERR_MISC_CATEGORY_START` + 4).
+/// `SVN_ERR_INCORRECT_PARAMS`.
+/// Format: the miscellaneous category's start, 200,000, plus 4 (`svn_error_codes.h`).
 const SVN_ERR_INCORRECT_PARAMS: u32 = 200_004;
 
 /// `get_locks`' refusal of a depth it does not take, in its words.
@@ -93,6 +94,15 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       .collect();
     self.success(vec![Value::List(written)])
   }
+}
+
+/// `lock` as `write_lock` writes it, handed to `with` as one value (A-693 part 2's lock verbs answer with it).
+pub(crate) fn with_lock_value<T>(lock: &Lock, with: impl FnOnce(Value<'_>) -> T) -> T {
+  let dates = (
+    super::format_time(lock.created.0),
+    lock.expires.map(|at| super::format_time(at.0)),
+  );
+  with(lock_value(lock, &dates))
 }
 
 /// One lock as `write_lock` writes it: `( path token owner ( [comment] ) created ( [expires] ) )`.
