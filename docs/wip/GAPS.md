@@ -3217,7 +3217,8 @@
 >   3.0 ms is still one turn). **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
 >   content, in steps of a page (before, debug: a whole entry's open 56 to 59 ms of one turn, the archive's hashing 93 to
 >   99 ms of another). **A-775 (2026-11-20):** a taken-over volume given up while its log's holder (or its catalog's or
->   content's cohort) was away is judged afresh once that member is heard alive at a later incarnation; before, the
+>   content's cohort) was away, or a green given up while the holder of its inputs was, is judged afresh once that member is
+>   heard alive at a later incarnation; before, the
 >   give-up was final until a new configuration (live_chaos fresh-member: `NotRecovered` for good after a 3 s pause));
 >   and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn

@@ -1136,10 +1136,10 @@ pub struct ShardState {
   /// holder leaves unanswered while set, as a holder cut off from one successor alone is to it: the council never
   /// retires it, since every other member hears it (`Daemon::inject_takeover_silence`). Empty in production.
   pub injected_takeover_silence: std::collections::BTreeSet<slates_db::HostId>,
-  /// Test support: the successors whose live phase-one reports and log fetches this node, as a holder, leaves
-  /// unanswered (`Daemon::inject_live_silence`; counted `fleet.live.silenced_by_fault`), as a holder paused or cut off
-  /// from them alone would; empty in production.
-  pub injected_live_silence: std::collections::BTreeSet<slates_db::HostId>,
+  /// Test support: the successors whose live phase-one reports, log fetches and content requests this node, as a holder,
+  /// leaves unanswered (`Daemon::inject_holder_silence`; counted `fleet.holder.silenced_by_fault`), as a holder paused or
+  /// cut off from them alone would; empty in production.
+  pub injected_holder_silence: std::collections::BTreeSet<slates_db::HostId>,
   /// Test support (never reachable from the wire): while set, this node, as a successor, sends no confirmation of a
   /// takeover share it has finished, as a confirmation late to commit leaves the share owed while other members confirm
   /// theirs (`Daemon::inject_confirmation_withheld`, A-353). `false` in production.
@@ -1355,11 +1355,12 @@ pub struct ShardState {
   /// `fleet::materialize_pending` bounds. Empty once every takeover serves or is given up on. A verb held for one waits
   /// for its end, woken when its entry is removed ([`PendingMaterializations`], A-548).
   pub pending_materializations: PendingMaterializations,
-  /// Taken-over volumes given up on while they waited on members of their takeover's cohorts (their live log's holders,
-  /// their catalog's or content's): each with its pending record and the incarnation each of those members was heard at
-  /// then, so one heard again since (alive at a later incarnation, back from a pause or a partition) has it judged
-  /// afresh (`fleet::judge_given_up_afresh`). Bounded by the volumes given up on, each kept until it is.
-  pub given_up_volumes: BTreeMap<ObjectId, GivenUpVolume>,
+  /// Taken-over volumes and greens given up on while they waited on members of their takeover (a volume's cohorts: its
+  /// live log's holders, its catalog's or content's; a green's sources, the survivors that hold its inputs): each with its
+  /// pending record and the incarnation each of those members was heard at then, so one heard again since (alive at a
+  /// later incarnation, back from a pause or a partition) has it judged afresh (`fleet::judge_given_up_afresh`, A-775).
+  /// Bounded by the objects given up on, each kept until it is.
+  pub given_up_taken_over: BTreeMap<ObjectId, GivenUpTakenOver>,
   /// On a taken-over volume's owner shard, its materialization made in turns of this shard's clock by a task of its own
   /// (g251, `fleet::make_taken`; a live log's or a placed seal's): running, with the turns it has taken, or ended, until
   /// the control shard's next attempt reads the end and forgets it. A later attempt joins a running one and never
@@ -1961,16 +1962,26 @@ impl PendingVolume {
   }
 }
 
-/// A taken-over volume given up on while it waited on its cohorts' members ([`ShardState::given_up_volumes`]).
+/// A taken-over volume or green given up on while it waited on members of its takeover
+/// ([`ShardState::given_up_taken_over`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GivenUpVolume {
+pub struct GivenUpTakenOver {
   /// Its pending record when it was given up on.
-  pub pending: PendingVolume,
+  pub pending: GivenUpRecord,
   /// Its adopted catalog register then, with the record's sequence (`ShardState::pending_catalogs`), which a give-up lets
   /// go: what its materialization waits for when it is judged afresh.
   pub catalog: Option<(u64, crate::catalog::CatalogValue)>,
-  /// Each member of its cohorts and the incarnation it was heard at then (zero for one not heard at all).
+  /// Each member it waited on and the incarnation it was heard at then (zero for one not heard at all).
   pub heard: Vec<(slates_db::register::HostId, u64)>,
+}
+
+/// A given-up object's pending record, by its kind ([`GivenUpTakenOver`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GivenUpRecord {
+  /// A volume's.
+  Volume(PendingVolume),
+  /// A green's.
+  Green(PendingGreen),
 }
 
 /// Whether a still-paging takeover round, read at `advances` page advances (`takeover::rounds_still_paging`), advanced

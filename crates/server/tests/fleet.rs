@@ -14496,7 +14496,7 @@ fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is
   };
   // The holder leaves the successor's live asks unanswered from the start: nothing asks before the takeover.
   let silent = daemons[other + 1]
-    .inject_live_silence(&[hosts[at + 1]])
+    .inject_holder_silence(&[hosts[at + 1]])
     .is_ok();
   daemons.remove(0).stop();
   let observed: Vec<&Daemon> = daemons.iter().collect();
@@ -14519,7 +14519,7 @@ fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is
       || promise_wait_periods(&observed).saturating_mul(4),
       || Ok(summed_count(&daemons[at], "fleet.materialize.given_up") > 0),
     );
-  let back = daemons[other].inject_live_silence(&[]).is_ok()
+  let back = daemons[other].inject_holder_silence(&[]).is_ok()
     && daemons[at].inject_probe_deafness(&[]).is_ok();
   let instance = daemons[at].instance().to_owned();
   let served = back && poll_status_answers(&observed, &instance, id);
@@ -14531,7 +14531,7 @@ fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is
     counted("fleet.materialize.judged_afresh"),
     count_of(
       &summed_counters(&daemons[other]),
-      "fleet.live.silenced_by_fault",
+      "fleet.holder.silenced_by_fault",
     ),
   );
   for daemon in daemons {
@@ -28520,6 +28520,134 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
     successor_chain,
     Ok(owner_chain),
     "the successor's chain carries the owner's increment identities, in order"
+  );
+  assert_eq!(
+    served,
+    TakenOverGreenView {
+      head: Ok(3),
+      at_one: Ok(b"hello".to_vec()),
+      at_head: Ok(b"hello world!".to_vec()),
+    },
+    "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
+/// A-775 for greens (§4.16 "Green owner loss in a fleet"; main's piece, 2026-11-20): a taken-over green given up while
+/// the only other holder of the inputs it lacked was away is served once that holder is heard again. Do: three nodes at
+/// `f = 1`; on a, a green advanced to version 2 on both holders, then to 3 on a and the other holder alone (the
+/// successor refusing content puts, as in `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green`);
+/// the other holder leaves the successor's content requests unanswered (`Daemon::inject_holder_silence`); a dies; once
+/// the successor first waits on the inputs, it no longer hears the other holder on the probe plane; once it has given
+/// the green up, the holder answers and is heard again. Expect the green given up, judged afresh, placed at version 3 and
+/// served with the owner's head bytes. Before, a given-up green was final until a new configuration.
+#[test]
+fn a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_is_heard_again() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "green-heard-again", &daemons);
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  let other_host = hosts[1 + other_index];
+  commit_version(&mut client, work, (0, "hello"), 1);
+  commit_version(&mut client, work, (5, " world"), 2);
+  let (both_at_two, unowned) = holders_before_owner_death_at(&daemons, green, 2);
+  daemons[1 + successor_index]
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+      refuse_records: false,
+      refuse_work_catalogs: false,
+    })
+    .expect("the successor's refusal of content puts installs");
+  commit_version(&mut client, work, (11, "!"), 3);
+  let other_at_three = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      daemons[1 + other_index]
+        .merge_holder_state(green)
+        .map(|state| state.version == Some(3))
+    },
+  );
+  let successor_at_death = daemons[1 + successor_index].merge_holder_state(green);
+  let silent = daemons[1 + other_index]
+    .inject_holder_silence(&[successor_host])
+    .is_ok();
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let counted = |daemon: &Daemon, name: &str| {
+    daemon
+      .refusals_on_every_shard()
+      .map(|counted| counted.get(name).copied().unwrap_or(0))
+  };
+  let waits_inputs = silent
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&survivors),
+      || Ok(counted(&daemons[successor_index], "merge.takeover_waits_inputs")? > 0),
+    );
+  let away = waits_inputs
+    && daemons[successor_index]
+      .inject_probe_deafness(&[other_host])
+      .is_ok();
+  let given_up = away
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || promise_wait_periods(&survivors).saturating_mul(4),
+      || Ok(counted(&daemons[successor_index], "merge.takeover_given_up")? > 0),
+    );
+  let back = daemons[other_index].inject_holder_silence(&[]).is_ok()
+    && daemons[successor_index].inject_probe_deafness(&[]).is_ok();
+  let placed = back
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&survivors).saturating_mul(2),
+      || daemons[successor_index].merge_record_placed(green, 3),
+    );
+  let judged = counted(&daemons[successor_index], "merge.takeover_judged_afresh");
+  let silenced = counted(&daemons[other_index], "fleet.holder.silenced_by_fault");
+  let served = observe_taken_over_green(&daemons[successor_index], green);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a green given up while its inputs' holder was away: waited on inputs {waits_inputs}, given up {given_up}, \
+     silenced {silenced:?}, back {back}, judged afresh {judged:?}, placed {placed}, served {served:?}"
+  );
+  expect_the_successor_one_version_behind(
+    (both_at_two, unowned),
+    other_at_three,
+    successor_at_death.map(|state| state.version),
+  );
+  assert!(
+    given_up && silenced.as_ref().is_ok_and(|silenced| *silenced > 0),
+    "the successor gave the green up while the holder of its inputs was away ({silenced:?} answers withheld)"
+  );
+  assert!(placed, "the successor placed the green at version 3 once the holder was heard again");
+  assert!(
+    judged.as_ref().is_ok_and(|judged| *judged >= 1),
+    "the successor judged the green afresh ({judged:?})"
   );
   assert_eq!(
     served,

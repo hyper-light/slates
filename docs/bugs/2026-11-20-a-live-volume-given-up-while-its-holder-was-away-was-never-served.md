@@ -41,5 +41,7 @@ meanwhile is not taken up. Bounded as the takeover round's own fresh judgement (
 member's later incarnation. After: given up after 23 attempts, judged afresh once, served, all 24 files read back
 (8.25 s).
 
-**Siblings, not changed.** A taken-over green given up on (`materialize_pending_greens`) is still final until a new
-configuration; its waits on inputs a returning holder could serve would want the same rule.
+**Siblings.** A taken-over green given up on (`materialize_pending_greens`) was final the same way; since the same day
+one given up on its inputs or its catalog is kept and judged afresh once one of its sources is heard again
+(`a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_is_heard_again`: red, given up after 25
+attempts and `NotRecovered`; after, placed at version 3 and served).

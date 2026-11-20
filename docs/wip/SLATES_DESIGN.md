@@ -57723,6 +57723,14 @@ volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardSt
   main: given up after 23 attempts waiting on its live, unserved through the serve deadline; after: judged afresh once,
   served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
   fleet tests unchanged.
+- **Greens too (2026-11-20, main's next piece).** A taken-over green given up while it waited on its inputs or its
+  catalog register is kept the same way, the members it waits on being its sources (the survivors that reported its
+  adopted version, which hold the inputs it lacks), and judged afresh once one is heard again (`merge.takeover_judged_afresh`).
+  One record for both kinds (`ShardState::given_up_taken_over`, `GivenUpRecord`); the injection became
+  `Daemon::inject_holder_silence`, which also leaves the asker's content requests unanswered. Test:
+  `fleet` `a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_is_heard_again` (red with greens
+  never kept: given up after 25 attempts waiting on its inputs, `NotRecovered` once the holder was back; after: judged
+  afresh once, placed at version 3, served with the owner's bytes, 8.06 s).
 
 ### §4.8 amended — A dispatch's stragglers are waited for by their own reports' wakes, never a tick or a poll interval at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family two of three)
 Applied in the same change to: §4.8 "Lookup" (a location round's stragglers), GAPS (the sweep's line),
