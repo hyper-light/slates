@@ -128,8 +128,8 @@ fn two_works_declaring_the_same_change_are_two_increments() {
   assert_eq!(client.submit(a).unwrap(), Submitted::Accepted(2));
   assert_eq!(
     client.submit(b).unwrap(),
-    Submitted::Accepted(3),
-    "B's identical overlap is its own increment, accepted as its own version"
+    Submitted::Identical(3),
+    "B's identical overlap is its own increment, accepted as its own version, changing nothing (A-782)"
   );
   assert_eq!(client.versions(green).unwrap(), 3);
   drop(client);

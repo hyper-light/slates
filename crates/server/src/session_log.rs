@@ -52,7 +52,8 @@ fn mark_of(work: &WorkState) -> WorkMark {
     };
   }
   match work.accepted {
-    Some(version) if version == work.base_version => WorkMark::Accepted { version },
+    Some((version, true)) if version == work.base_version => WorkMark::Identical { version },
+    Some((version, false)) if version == work.base_version => WorkMark::Accepted { version },
     _ => WorkMark::Open,
   }
 }

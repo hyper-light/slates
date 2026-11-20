@@ -5184,6 +5184,9 @@ pub enum ReplyBody {
     conflicts_elided: u32,
     /// The verdict the windows are of, kept with the work for `Conflicts`; 0 when there is none.
     verdict: u64,
+    /// Whether the accepted increment changed nothing: every operation was already at the head (D-27's identical
+    /// verdict, A-782). `false` on a conflict. Appended.
+    identical: bool,
   },
   /// A work volume was rebased onto its green's head (§4.16). The green is unchanged.
   Rebased {
@@ -5602,6 +5605,8 @@ pub enum ReplyBody {
     conflicts_elided: u32,
     /// The conflicting verdict the work keeps, by which `Conflicts` reads it; 0 when none is kept (A-267).
     verdict: u64,
+    /// Whether the accepted increment changed nothing, as `Submitted` says it (A-782). Appended.
+    identical: bool,
   },
   /// A volume's trusted signers were set (A-321). Appended.
   SignersSet,
@@ -5810,6 +5815,11 @@ pub enum WorkMark {
     windows: u32,
     /// Its first window: the file and range that collided.
     first: Option<MergeWindow>,
+  },
+  /// Accepted as this green version and changed nothing: every operation was already at the head (A-782). Appended.
+  Identical {
+    /// The version it committed.
+    version: u64,
   },
 }
 

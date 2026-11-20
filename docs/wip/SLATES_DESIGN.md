@@ -11123,9 +11123,16 @@ numbers conflict, and the same node made twice converges.
 > submission ended (open, accepted as a version, or collided where), and the landings awaiting a grant (§4.15), the
 > collided works and those landings named first. A read (`RequestBody::SessionLog`), a scatter over the shards like
 > `grants`, each shard reading its works and its partition's waiting-landing index, never the landing history; it
-> shows a pending grant and never makes one (R10). Owed: an identical submission told from an accepted one (the engine
-> commits an identical increment as a version, so telling it apart needs the submit's reply to say so), the MCP tool
-> and the SDKs' read.
+> shows a pending grant and never makes one (R10). Owed: the MCP tool and the SDKs' read.
+
+> **Status (2026-11-20, A-782: identical told from accepted).** D-27's verdict is accept, identical or conflict, and the
+> submit now says which: an accepted increment whose verdict left no effect (every operation already at the head: pass
+> two's identical spans, an identical create, a remove of what is gone, an identical mode or attribute) is
+> `Outcome::Identical`, committed as its version as an accept is, so the chain, its replay and a retry are unchanged. The
+> reply's `identical` is read from the green's change index (`Green::changed_nothing_at`), so a first answer, a
+> deferred one and a resend agree. The client answers `Submitted::Identical`, the API `MergeOutcome::Identical`, MCP, the
+> CLI and both SDKs `identical: true`, and the session log marks the work `identical`. A write of the head's own bytes
+> with nothing intervening is still an accept with an effect (the engine applies it), so it answers `Accepted`.
 
 > **Status (2026-09-20, A-26).** Origin format 2 captures IPC kind, owner, group and four
 > timestamps; modes remain independent. `Mknod` carries fixed canonical metadata in the
@@ -57520,6 +57527,13 @@ two owners); the lint wall; each `unsafe` with its SAFETY line. Counted at Mantl
 the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Arc`, `Mutex`, `RwLock` or `Rc` (chunk
 30, engine 22, disk 1, block 1), 72 `unsafe` sites (block 32, disk 21, engine 19).
 
+> **Status (2026-11-20, piece 2a: the log's substrate vendored).** `hyper-block`, `hyper-log` and `hyper-sim` are in
+> `vendor/hyper-raft/` at hyper-raft `5e40eb9` (mantle `87ab09e1`'s copies), `hyper-block` without its device issuer
+> and so without `hyper-rt` (two local changes, `vendor/hyper-raft/README.md`); no slates crate links them until
+> `slates-store` (piece 3) does, with R1's table. Owed (2b): the engine, chunk and disk crates, which need the issuer and
+> `hyper-rt`'s cross-thread channel, whose ring is `unsafe impl Send`/`Sync` (CLAUDE.md §3 forbids it): a decision for
+> main between porting a safe channel into `slates-rt` and driving `ShardDb` inline with no worker pool.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -57787,3 +57801,21 @@ wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe
   (the guard: two saves give the number back, and the lookup is a new inode); A-151's renumbering test, now documented
   as covering whole-second stamps. Real-tool runs over a kernel mount (macOS NFS, Linux FUSE, Windows WinFsp) are owed
   to main's run requests.
+
+### A-782 — Identical is told from accepted: one typed outcome from the engine to every surface (2026-11-20, w-sessionlog; main's order 15:20 PST, item 2; D-27, §4.16; A-773)
+The engine committed an identical increment as a version and answered `Accepted`, so nothing told "already there" from
+"changed". `Outcome::Identical { version }` (appended) is the accept whose verdict left no effect; the server commits it
+exactly as an accept (holders' replay checks take either), and `accepted_reply` reads `identical` (appended to
+`Submitted` and `SubmittedSigned`) from the green's change index, `Green::changed_nothing_at`, which answers only above
+the folded floor. One new outcome, no second path: the compiler found every match, constructor and pattern (API,
+MCP, CLI, both SDKs, the client, the server, the tests); tests whose case was identical by construction now expect
+`Identical`, and oracles take either as committed. The session log's `WorkMark::Identical` (appended) shows it.
+Applied in the same change to: §4.16 (a status line), GAPS (A-773's owed item closed), `docs/cli.md`, `crates/merge`,
+`crates/ipc` (tags published), `crates/server`, `crates/client`, `crates/api`, `crates/mcp`, `crates/cli`,
+`crates/sdk-node` (`index.d.ts`), `crates/sdk-python`.
+Evidence: `cargo test --locked -p slates-server --test session_log an_identical_submission_is_told_from_an_accepted_one`
+red with the engine's identical check disabled (`Accepted(3)` for `Identical(3)`), green with it; `-p slates-merge` all
+passed; `-p slates-server --test session_log` 3, `presentations` 10, `mounted_work` 1, `merge_load` 5,
+`works_off_owner` 15, `verdict_pages` 5, `green_checkpoint` 6; `-p slates-client --test merge_identity` 1, `--lib
+session_log` 1; `-p slates-api --lib` 104; `-p slates-mcp --lib` 19; `-p slates-cli --bin slates log_view` 2; `-p
+slates-ipc --test wire_order` 2; `cargo check --workspace --tests --examples` clean (macOS arm64, this Mac, local).

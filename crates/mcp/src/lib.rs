@@ -522,7 +522,13 @@ impl McpServer {
         .submit_with_evidence(work, &evidence)
         .map_err(refusal)?
       {
-        Submitted::Accepted(version) => json!({ "accepted": true, "version": version }),
+        Submitted::Accepted(version) => {
+          json!({ "accepted": true, "identical": false, "version": version })
+        }
+        // Accepted, changing nothing (A-782): every operation was already at the head.
+        Submitted::Identical(version) => {
+          json!({ "accepted": true, "identical": true, "version": version })
+        }
         Submitted::Conflict(windows) => {
           json!({ "accepted": false, "conflicts": windows_json(&windows) })
         }

@@ -1425,10 +1425,11 @@ pub struct WorkState {
   /// number is bounded by the journal the merge budget charges; a restart forgets it, and a read of it is then refused
   /// `VerdictReplaced`.
   pub verdict: Option<KeptVerdict>,
-  /// The green version the work's last accepted submission made (A-773, the session log's mark): the work stands on it
-  /// while `base_version` equals it, and a rebase that moves the work past it leaves the work open again. Kept in RAM
+  /// The green version the work's last accepted submission made, and whether it changed nothing (A-773, A-782: the
+  /// session log's mark): the work stands on it while `base_version` equals it, and a rebase that moves the work past it
+  /// leaves the work open again. Kept in RAM
   /// with the work, as its verdict is; a restart forgets it.
-  pub accepted: Option<u64>,
+  pub accepted: Option<(u64, bool)>,
 }
 
 /// A work's kept conflicting verdict (§4.16, A-267): its id, which the `Submitted` or `Rebased` reply named, and every
