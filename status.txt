@@ -1,1 +1,3 @@
 started 2026-11-20T11:57:41Z at bf039409154e023fe6030236f82daa26e304b82f
+every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows exit 101 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.95s
+ended 2026-11-20T12:01:24Z
