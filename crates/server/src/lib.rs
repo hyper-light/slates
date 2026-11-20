@@ -192,11 +192,12 @@ pub mod credentials;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod svn_hooks;
-// git's hooks as the server runs them (A-665 part 2): the read-only bare repository a hook runs
-// in, opened on the owner shard over the repository's store, sealed there in slices and handed to
-// the hook driver with receive-pack's variables; Unix alone with the driver. No caller outside
-// tests until git's push driver (`git_push`, A-654) runs its hooks in a view presented at a path
-// (part 3).
+// git's hooks as the server runs them (A-665 parts 2 and 3): the read-only bare repository a hook
+// runs in, opened on the owner shard over the repository's store, sealed there in slices, shown at
+// a path by a presenter and handed to the hook driver with receive-pack's variables; Unix alone
+// with the driver. git's push driver (`git_push`) calls it; the daemon's presenter shows no view
+// until the read-only attachment lands, so the reads a presentation serves have no caller outside
+// tests.
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod git_hooks;

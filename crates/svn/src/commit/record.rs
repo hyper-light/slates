@@ -8,12 +8,17 @@
 //! ([`Revision`]: the youngest revision it was committed on, the transaction's name and its changed-path rows, the
 //! revision properties, the texts and property lists the repository did not hold yet, the lock entries), held by the
 //! entry that moves the repository's green to it. Node-revisions, histories, copy roots and mergeinfo counts are the
-//! index's, which the replay's check and apply compute again from the rows; none is recorded.
+//! index's, which the replay's check and apply compute again from the rows; none is recorded. Beside them, what an
+//! import sets that no revision carries (A-652 part 3), each in an entry that moves no green: [`Record::Uuid`], the
+//! repository named by its stream's UUID record (`svn_fs_set_uuid`, `load-fs-vtable.c` `uuid_record`); and
+//! [`Record::RevisionProperties`], a revision's properties set whole (`svn_fs_change_rev_prop2` for each difference),
+//! as an import sets revision 0's to its stream's (`close_revision`).
 //!
 //! **The encoding**, little-endian as a green's chain entry and A-662's git record are: the magic, the version and a
 //! kind byte; a creation's UUID, its 36 bytes, and its date; a revision's head, its transaction, its rows, its
 //! properties, its contents and its lock entries, each list as a count and its items, each string as a length and its
-//! bytes, each optional part after a byte that marks it present or absent. A row is its path, its action, its kind,
+//! bytes, each optional part after a byte that marks it present or absent; a UUID's 36 bytes; a revision's number and
+//! its properties, written as a revision's are. A row is its path, its action, its kind,
 //! its copy source, its text (identity, MD5, SHA-1, size), its property list (none, empty, or held by identity with its
 //! mergeinfo mark) and its mergeinfo mark. A lock entry is a tag, then a set lock whole (path, token, owner, comment,
 //! the DAV comment's mark, creation and expiry) or a removal (path, token).
@@ -49,6 +54,12 @@ const CREATED: u8 = 0;
 
 /// Format: the kind byte of a revision.
 const REVISION: u8 = 1;
+
+/// Format: the kind byte of the repository's UUID set (A-652 part 3).
+const UUID_SET: u8 = 2;
+
+/// Format: the kind byte of a revision's properties set whole (A-652 part 3).
+const PROPERTIES_SET: u8 = 3;
 
 /// Format: the byte that marks an optional part absent, and a mark unset.
 const ABSENT: u8 = 0;
@@ -114,6 +125,17 @@ pub enum Record {
   },
   /// One revision committed through the step.
   Revision(Revision),
+  /// The repository named by another UUID (`svn_fs_set_uuid`), as an import names a repository that holds no revision
+  /// but 0 by its stream's UUID record (A-652 part 3).
+  Uuid(Uuid),
+  /// A revision's properties set whole (`svn_fs_change_rev_prop2` for each difference), as an import sets revision 0's
+  /// to its stream's (A-652 part 3).
+  RevisionProperties {
+    /// The revision.
+    revision: u64,
+    /// Its properties, whole.
+    properties: Properties,
+  },
 }
 
 /// Why bytes were refused as a record. A refused record replays nothing.
@@ -160,6 +182,20 @@ impl Record {
         out
       }
       Self::Revision(revision) => Self::revision_bytes(revision),
+      Self::Uuid(uuid) => {
+        let mut out = header(UUID_SET);
+        out.extend_from_slice(uuid.as_bytes());
+        out
+      }
+      Self::RevisionProperties {
+        revision,
+        properties,
+      } => {
+        let mut out = header(PROPERTIES_SET);
+        put_long(&mut out, *revision);
+        put_properties(&mut out, properties);
+        out
+      }
     }
   }
 
@@ -187,6 +223,11 @@ impl Record {
     let record = match reader.byte()? {
       CREATED => created(&mut reader)?,
       REVISION => Self::Revision(revision(&mut reader)?),
+      UUID_SET => Self::Uuid(uuid(&mut reader)?),
+      PROPERTIES_SET => Self::RevisionProperties {
+        revision: reader.long()?,
+        properties: properties(&mut reader)?,
+      },
       byte => return Err(RecordRefused::Tag { byte }),
     };
     if !reader.rest.is_empty() {
@@ -248,11 +289,7 @@ fn put_revision(out: &mut Vec<u8>, revision: &Revision) {
   for row in &revision.record.changes {
     put_row(out, row);
   }
-  put_count(out, revision.properties.len());
-  for (name, value) in &revision.properties {
-    put_bytes(out, name);
-    put_bytes(out, value);
-  }
+  put_properties(out, &revision.properties);
   put_count(out, revision.contents.len());
   for (identity, bytes) in &revision.contents {
     out.extend_from_slice(identity);
@@ -261,6 +298,15 @@ fn put_revision(out: &mut Vec<u8>, revision: &Revision) {
   put_count(out, revision.lock_entries.len());
   for entry in &revision.lock_entries {
     put_lock_entry(out, entry);
+  }
+}
+
+/// Appends a revision's properties: their count, then each name and value.
+fn put_properties(out: &mut Vec<u8>, properties: &Properties) {
+  put_count(out, properties.len());
+  for (name, value) in properties {
+    put_bytes(out, name);
+    put_bytes(out, value);
   }
 }
 
@@ -407,9 +453,14 @@ impl<'b> Reader<'b> {
 
 /// A creation's record, after its kind.
 fn created(reader: &mut Reader<'_>) -> Result<Record, RecordRefused> {
-  let uuid = Uuid::parse(reader.take(UUID_BYTES)?).ok_or(RecordRefused::Uuid)?;
+  let uuid = uuid(reader)?;
   let date = reader.bytes()?;
   Ok(Record::Created { uuid, date })
+}
+
+/// A UUID in RFC 4122's form.
+fn uuid(reader: &mut Reader<'_>) -> Result<Uuid, RecordRefused> {
+  Uuid::parse(reader.take(UUID_BYTES)?).ok_or(RecordRefused::Uuid)
 }
 
 /// A revision's record, after its kind.

@@ -7,6 +7,10 @@
 //! judges a [`RevisionToCommit`] against the records and changes nothing, so its owner checks a revision before its log
 //! records it; [`Repository::apply`] commits what was checked, so the owner applies it after, and a recovery that
 //! checks and applies the logged revision again reaches the same records ([`Repository::commit`] is the two at once).
+//! Beside revisions, an import sets the repository's UUID and revision 0's properties (A-652 part 3), each a record of
+//! its own the owner logs before it applies it ([`Repository::check_revision_properties`], then
+//! [`Repository::set_revision_properties`]; [`Repository::set_uuid`]); [`Repository::commit_record`] commits any of
+//! them as its step does.
 //! Checked, in order: the revision's head is the youngest ("Transaction out of date" otherwise, as FSFS's
 //! `commit_body` answers a transaction whose base moved, `transaction.c` 3784-3786; the owner's step judges a moved work
 //! again by position before it comes here, as `svn_fs_fs__commit_txn` merges again); its lock entries apply; every
@@ -22,6 +26,7 @@ use super::MigrationRefusal;
 use super::paths::{ROOT, ancestors_deepest_first, beneath};
 use super::properties::{decode, encode, entries, mergeinfo};
 use crate::commit::drive::Green;
+use crate::commit::record::Record;
 use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
 use crate::commit::{CommitRefusal, verdict};
 use crate::dump::{Md5, Sha1, Uuid};
@@ -163,35 +168,92 @@ impl Repository {
     self.held
   }
 
-  /// Names the repository by `uuid`.
-  pub(super) fn set_uuid(&mut self, uuid: Uuid) {
+  /// Names the repository by `uuid` (`svn_fs_set_uuid`), as an import names a repository that holds no revision but 0
+  /// by its stream's UUID record (A-652 part 3).
+  pub fn set_uuid(&mut self, uuid: Uuid) {
     self.uuid = uuid;
   }
 
-  /// Sets revision 0's properties to exactly `properties`, as `svnadmin load` sets them in an empty repository
-  /// (`load-fs-vtable.c` `close_revision`: every difference from the stream's applied).
-  pub(super) fn set_revision_zero(
+  /// The check of [`Repository::set_revision_properties`], which changes nothing: the bytes the records would hold
+  /// more once `revision`'s properties are `properties`, none where they would hold fewer.
+  ///
+  /// # Errors
+  /// [`StepRefusal::Corrupt`] for a revision the records do not hold; [`StepRefusal::Room`] past the room.
+  pub fn check_revision_properties(
+    &self,
+    revision: Revision,
+    properties: &Properties,
+  ) -> Result<u64, StepRefusal> {
+    let held = self.held_with_properties(revision, properties)?;
+    Ok(held.saturating_sub(self.held))
+  }
+
+  /// Sets `revision`'s properties to exactly `properties` (`svn_fs_change_rev_prop2` for each difference), as
+  /// `svnadmin load` sets revision 0's in an empty repository (`load-fs-vtable.c` `close_revision`) and an import
+  /// does (A-652 part 3).
+  ///
+  /// # Errors
+  /// Each refusal of [`Repository::check_revision_properties`]'s; refused, nothing changes.
+  pub fn set_revision_properties(
     &mut self,
+    revision: Revision,
     properties: Properties,
-  ) -> Result<(), MigrationRefusal> {
-    let old = self
-      .revision_properties
-      .first()
-      .map(properties_bytes)
-      .transpose()?
-      .unwrap_or(0);
-    let held = self
-      .held
-      .checked_sub(old)
-      .and_then(|rest| rest.checked_add(properties_bytes(&properties).ok()?))
-      .ok_or(MigrationRefusal::Corrupt)?;
-    check_room(held, self.room)?;
-    match self.revision_properties.first_mut() {
-      Some(zero) => *zero = properties,
-      None => self.revision_properties.push(properties),
-    }
+  ) -> Result<(), StepRefusal> {
+    let held = self.held_with_properties(revision, &properties)?;
+    let slot = usize::try_from(revision)
+      .ok()
+      .and_then(|position| self.revision_properties.get_mut(position))
+      .ok_or(StepRefusal::Corrupt)?;
+    *slot = properties;
     self.held = held;
     Ok(())
+  }
+
+  /// The bytes the records would hold with `revision`'s properties replaced by `properties`, refused for a revision
+  /// they do not hold and past the room.
+  fn held_with_properties(
+    &self,
+    revision: Revision,
+    properties: &Properties,
+  ) -> Result<u64, StepRefusal> {
+    let old = self
+      .revision_properties(revision)
+      .ok_or(StepRefusal::Corrupt)?;
+    let corrupt = |_| StepRefusal::Corrupt;
+    let held = self
+      .held
+      .checked_sub(properties_bytes(old).map_err(corrupt)?)
+      .and_then(|rest| rest.checked_add(properties_bytes(properties).ok()?))
+      .ok_or(StepRefusal::Corrupt)?;
+    if held > self.room.bytes {
+      return Err(StepRefusal::Room {
+        needed: held,
+        room: self.room.bytes,
+      });
+    }
+    Ok(held)
+  }
+
+  /// Commits `record` as the commit step commits it (A-652 part 3): a revision checked and applied
+  /// ([`Repository::commit`]), the UUID set, a revision's properties set whole. A creation is refused: a repository is
+  /// made by its creation's record once ([`Repository::new`]). What a caller that holds the records alone commits an
+  /// import's records through, and what a recovery replays every record after the creation's through.
+  ///
+  /// # Errors
+  /// [`StepRefusal::Corrupt`] for a creation; each refusal of the record's own step; refused, nothing changes.
+  pub fn commit_record(&mut self, record: Record) -> Result<(), StepRefusal> {
+    match record {
+      Record::Created { .. } => Err(StepRefusal::Corrupt),
+      Record::Uuid(uuid) => {
+        self.set_uuid(uuid);
+        Ok(())
+      }
+      Record::RevisionProperties {
+        revision,
+        properties,
+      } => self.set_revision_properties(revision, properties),
+      Record::Revision(revision) => self.commit(revision).map(drop),
+    }
   }
 
   /// A transaction on the youngest revision, named as FSFS names it: the base, a `-`, and the repository's count of
