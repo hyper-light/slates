@@ -77,3 +77,8 @@
 - A-719 part 3 LANDED main baf0fd76a (3105843fe + merges). Worktrees: w-git-land (landed, clean); w-git-pushspin
   removed. Target trimmed to 20G (incremental + stale .rcgu.o). Reported: hg ssh push test fails on clean main.
   NEXT: verdicts + seal sliced (A-719 part 4), then S3 (A-722) on main/w-balance's vcs_share::room seam.
+- Measured append (9k objects debug): commit 159ms, moves admit 54ms, seal 26ms, verdict 2ms. Main APPROVED folding
+  into A-722: done = index rows staged in slices as objects land (append only makes visible), moves' admission + seal
+  sliced, landing O(changes), push on vcs_share::room seam. Proof: w-interop v2.0.0 cut (36,430 commits, 56MB) then
+  git/git, no watchdog kill, RSS per push. Design note (~20 lines) to main after the read (Explore agent surveying
+  merge push/work + git store APIs). Worktree ~/slates-work/w-git-land at origin/main 2fb7d49b3 (clean).
