@@ -1,2 +1,3 @@
 started 2026-11-20T08:39:35Z at 345fac9d2d625f4fba7c311af49320d373ee7e7e
 build exit 0
+fsx exit 1
