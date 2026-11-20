@@ -159,3 +159,13 @@
 - BY-USE PROOF in progress: release build on adas-mac-studio.local-2 (kiln run r2, target ~/.cache/w-git-target.noindex,
   CARGO_INCREMENTAL=0) of main d435c91b7 (has w-balance 032617278). Then: python3 crates/cli/bench/multi_repo_load.py
   <slates> ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0 --steps 100 --per-repository-cap 10, then without cap (19).
+- 2a49cf8a2 LANDED 4b race fix (staging forks + reads base at its first unit). ffa5be0f6 LANDED A-753 (creates made from
+  the green holding the commit; resent objects read from index in connectivity; cap checkpoints members).
+- BY-USE (Studio .local-2, release; harness logs ~/.cache/w-git-runs/, daemon logs ~/.cache/w-balance/daemon-logs/):
+  (a) multi_repo_load R=100 cap10 77/77 ok longest 72.8ms peak 4046MiB; (b) uncapped 86/86 longest 76.5ms 4390MiB;
+  (c) one repo N=19 19/19 1337-1607MiB; (d) N=100 80/100 (green_chains cap) -> A-753; rerun r19 after fix pending.
+  Studio clone ~/.cache/w-git-clone has DIAG commit merged in: next time use a fresh worktree from origin/main there.
+- NEXT (main's order): (1) N=100 rerun; (2) name the 72-76ms longest step (answer phase) -> 4e store commit passes if
+  so; (3) memory per push attribution, identical objects stored once, bounded per-push working set; then two
+  load-only tests (daemon_edge long-history push, t_a665 update hook), Windows restart spin; record (a)-(d) BENCHMARKS.
+- Local target is now ~/.cache/w-git-local-target.noindex, build with CARGO_INCREMENTAL=0.
