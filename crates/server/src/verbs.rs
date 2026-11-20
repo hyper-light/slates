@@ -9595,6 +9595,68 @@ fn settle_submit(
   reply
 }
 
+/// The green's verdict on `inc`: a holder's computed verdict taken by position (A-697 part c), or one judged here; the
+/// reason where a computed verdict does not read back or is not taken. `None` for a green this shard does not hold.
+fn verdict_of(
+  state: &mut ShardState,
+  green_id: DbVolumeId,
+  sealed: &crate::work_home::SealedWork,
+  inc: &slates_merge::engine::Increment,
+) -> Option<Result<Judged, String>> {
+  let mut engine = state.greens.get_mut(&green_id)?;
+  Some(match &sealed.computed {
+    None => Ok(engine.submit_resolved(inc)),
+    Some(form) => engine
+      .computed_from(inc, form)
+      .map_err(|error| format!("the verdict's form does not read back: {error:?}"))
+      .and_then(|computed| {
+        engine
+          .submit_computed(inc, computed)
+          .map_err(|refusal| format!("the verdict is not taken by position: {refusal:?}"))
+      }),
+  })
+}
+
+/// A green's verdict on an increment and what it applied ([`slates_merge::engine`]'s `submit_resolved`).
+type Judged = (
+  slates_merge::engine::Outcome,
+  Option<Vec<slates_merge::chain_entry::Applied>>,
+);
+
+/// Secures `secured` bytes of `green_id`'s retention for the merge: folds what the retention budget allows first, leaving
+/// that room (never a live reader's version), then secures it, the first refusal reported. The bytes available where
+/// it cannot.
+fn secure_retention(state: &mut ShardState, green_id: DbVolumeId, secured: u64) -> Result<(), u64> {
+  let room = usize::try_from(secured).unwrap_or(usize::MAX);
+  crate::merge_service::settle_green_retention_leaving(state, green_id, room)?;
+  crate::merge_service::secure_green_retention(state, green_id, secured)
+    .inspect_err(|available| report_first_budget_refusal(state, "retention", secured, *available))
+}
+
+/// What answers a submit once its increment and signature are judged, before it merges: an asked merge's verdict for
+/// its approver (`approval_answer`), or a required signature that did not verify (`refused_unsigned`).
+fn answered_before_merging(
+  state: &mut ShardState,
+  (mode, approval): (slates_db::catalog::WriteMode, Approval),
+  (work, green, inc): (DbVolumeId, DbVolumeId, &slates_merge::engine::Increment),
+  signed: &JudgedSignature,
+) -> Option<ReplyBody> {
+  approval_answer(mode, approval, (work, green, inc), signed)
+    .or_else(|| refused_unsigned(state, signed))
+}
+
+/// What refuses a submit before its increment is built: the write policy's refusal before the seal, and, for a green of
+/// a repository, a submit whose message or session's identity its tool's commit (A-664) cannot carry.
+fn refused_before_building(
+  state: &mut ShardState,
+  (mode, by): (slates_db::catalog::WriteMode, DbVolumeId),
+  (green_id, evidence): (DbVolumeId, &[[u8; 32]]),
+  authorship: &slates_ipc::protocol::Authorship,
+) -> Option<ReplyBody> {
+  refused_before_the_seal(state, (mode, by), green_id, evidence)
+    .or_else(|| crate::identities::refused_for_its_commit(state, green_id, authorship))
+}
+
 /// The owner's half of a submit (§4.16, A-247): judges a work's sealed increment against the green and commits it, as
 /// the single serialized step of the green. Runs in the transaction of the verb that asked, whether on this shard or
 /// through [`owner_judge`]. The work's own reset is the caller's to settle.
@@ -9614,13 +9676,8 @@ fn judge_submission(
     (policy.work_mode, sealed.work),
     (merge_mode_of(state, green_id), green_id),
   );
-  if let Some(refusal) = refused_before_the_seal(state, (mode, by), green_id, &evidence) {
-    return refusal;
-  }
-  // A green of a repository makes its tool's commit of the work (A-664): the submit carries a message and its session's
-  // identity in the repository's tool, refused here, before the increment is built.
   if let Some(refusal) =
-    crate::identities::refused_for_its_commit(state, green_id, &policy.authorship)
+    refused_before_building(state, (mode, by), (green_id, &evidence), &policy.authorship)
   {
     return refusal;
   }
@@ -9640,16 +9697,13 @@ fn judge_submission(
   // with the verdict, so the approver sees it and a signer learns the statement from a held submit, whatever the
   // requirement; a volume that requires signed merges refuses one that did not verify when it would merge, here.
   let signed = judge_signature(state, (sealed.work, green_id), &inc, &policy);
-  if let Some(answer) = approval_answer(
-    mode,
-    policy.approval,
+  if let Some(answer) = answered_before_merging(
+    state,
+    (mode, policy.approval),
     (sealed.work, green_id, &inc),
     &signed,
   ) {
     return answer;
-  }
-  if let Some(refusal) = refused_unsigned(state, &signed) {
-    return refusal;
   }
   // The increment is recorded durably so a restart replays it (§4.8, §4.16). Guard-then-apply: the
   // chain must be able to hold it *before* the verdict commits, so an accepted increment is always
@@ -9693,33 +9747,13 @@ fn judge_submission(
   // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
   // reader's version).
-  let room = usize::try_from(secured).unwrap_or(usize::MAX);
-  if let Err(available) =
-    crate::merge_service::settle_green_retention_leaving(state, green_id, room)
-  {
-    return refused(Refusal::BudgetExceeded { available });
-  }
-  if let Err(available) = crate::merge_service::secure_green_retention(state, green_id, secured) {
-    report_first_budget_refusal(state, "retention", secured, available);
+  if let Err(available) = secure_retention(state, green_id, secured) {
     return refused(Refusal::BudgetExceeded { available });
   }
   let verdict_start = state.clock.monotonic_ns();
   // A verdict a holder computed (A-697 part c) is taken by position; any other is judged here.
-  let judged = {
-    let Some(mut engine) = state.greens.get_mut(&green_id) else {
-      return refused(Refusal::NotFound);
-    };
-    match &sealed.computed {
-      None => Ok(engine.submit_resolved(&inc)),
-      Some(form) => engine
-        .computed_from(&inc, form)
-        .map_err(|error| format!("the verdict's form does not read back: {error:?}"))
-        .and_then(|computed| {
-          engine
-            .submit_computed(&inc, computed)
-            .map_err(|refusal| format!("the verdict is not taken by position: {refusal:?}"))
-        }),
-    }
+  let Some(judged) = verdict_of(state, green_id, sealed, &inc) else {
+    return refused(Refusal::NotFound);
   };
   let (outcome, applied) = match judged {
     Ok(judged) => judged,

@@ -20856,6 +20856,18 @@ fn assert_the_name_held_and_the_unshared_refused(
 /// What [`head_bytes`] reads.
 type HeadBytes = Result<Vec<u8>, Box<ReplyBody>>;
 
+/// The work B's client makes over `green`, named `holders-work`, admitted at base 1: its id.
+fn holders_work_at_base_one(holder: &mut Client, green: VolumeId) -> VolumeId {
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  work
+}
+
 /// `owner` edits `owners_work`, `f` holding "hello", and submits it: the green at version 1.
 fn at_version_one(owner: &mut Client, owners_work: VolumeId) {
   let edited = owner.call(&RequestBody::Edit {
@@ -21077,13 +21089,7 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
   at_version_one(&mut owner, owners_work);
   daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let created = holder.call(&RequestBody::CreateWork {
-    green,
-    name: "holders-work".to_owned(),
-  });
-  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
-    panic!("B made the work at base 1: {created:?}");
-  };
+  let work = holders_work_at_base_one(&mut holder, green);
   let admitted_floor = daemon_a.work_floor(green, work);
   let drop = RequestBody::MoveWorkFloor {
     green,
@@ -21138,34 +21144,10 @@ fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_posi
   let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
-  let edited = owner.call(&RequestBody::Edit {
-    work: owners_work,
-    path: "f".to_owned(),
-    at: 0,
-    delete_len: 0,
-    bytes: b"hello".to_vec(),
-  });
-  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
-  assert!(
-    matches!(
-      submitted,
-      ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }
-    ),
-    "{submitted:?}"
-  );
+  at_version_one(&mut owner, owners_work);
   daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let created = holder.call(&RequestBody::CreateWork {
-    green,
-    name: "holders-work".to_owned(),
-  });
-  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
-    panic!("B made the work at base 1: {created:?}");
-  };
+  let work = holders_work_at_base_one(&mut holder, green);
   let count = |daemon: &Daemon, name: &str| {
     daemon
       .refusals_on_every_shard()
