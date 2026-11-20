@@ -207,10 +207,10 @@ mod tests {
   /// Shape: the share of the daemon's capacity the host's available memory falls by: an eighth, as the recovery
   /// suite's later drop.
   const FALL_PARTS: u64 = 8;
-  /// Shape: how long the test waits for the first sample to fix the baseline: a window and a half, past the reap loop's
-  /// first look a window into the start.
+  /// Shape: how long the test waits for the first sample to fix the baseline: a window and a half (the sampler samples
+  /// at its start; the bound allows a slow start on a loaded host).
   const BASELINE_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2 * 3;
-  /// Shape: how long the test looks for the hold after the fall: half a window, short of a tick a window on.
+  /// Shape: how long the test looks for the hold after the fall: half a window, short of the window the reap loop's tick sampled at until A-570.
   const HELD_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
   /// Shape: the pause between the test's looks.
   const LOOK_PAUSE_NS: u64 = 1_000_000;

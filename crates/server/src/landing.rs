@@ -4939,9 +4939,6 @@ mod owed_audit_tests {
 
   use crate::daemon::LIVENESS_BUDGET_NS;
 
-  /// Shape: how long the test lets its daemon run before the record is owed: past the reap loop's first look, a window
-  /// after its start, by a tenth of a window, and short of its second.
-  const PAST_THE_FIRST_LOOK_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 10;
   /// Shape: how long past a window after the send the test waits for the batch to be sent again: half a window.
   const RESENT_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
   /// Shape: the pause between the test's looks at the shard's count, short beside half a window.
@@ -4949,7 +4946,7 @@ mod owed_audit_tests {
   /// Shape: the partition the record is owed from: the second shard's, so the control partition is another shard's.
   const OWING: usize = 1;
 
-  /// A-554 (the owed audit off the tick; A-265's resend). Do: on a two-shard daemon past the reap loop's first look,
+  /// A-554 (the owed audit off the tick; A-265's resend). Do: on a two-shard daemon,
   /// with the second shard's acknowledgements withheld so its batch stays owed as if each were lost, owe the control
   /// partition one audit record there and send it as a verb's transaction does; watch the shard's resends. Expect: the
   /// batch sent again no sooner than a window after its send, when its acknowledgement could still be on its way, and
@@ -4959,9 +4956,6 @@ mod owed_audit_tests {
   #[test]
   fn an_unacknowledged_audit_batch_is_sent_again_a_window_after_its_send() {
     let daemon = crate::daemon::audit_daemon_of(2);
-    // The harness waits out the reap loop's first look; the daemon under test runs on.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
     let sent = Instant::now();
     crate::daemon::observe_at(&daemon, OWING, |state| {
       state.landing.acknowledgement_withheld = true;
