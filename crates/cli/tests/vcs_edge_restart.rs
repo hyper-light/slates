@@ -17,17 +17,19 @@
   clippy::indexing_slicing
 )]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 use std::io::{BufRead, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Shape: the shards of the test's daemon, as `tests/cli.rs` starts one.
 const SHARDS: &str = "2";
 
-/// Shape: how long a daemon gets to serve after a start or a restart, and a read gets its first bytes: a guard against
-/// a server that never answers, far above what a start takes on any development machine, never a measure of one.
-const PATIENCE: Duration = Duration::from_secs(120);
+/// Shape: the pause between looks at the anchor's process tree while a line is awaited.
+const POLL: Duration = Duration::from_millis(20);
 
 /// Format: the start of the line a daemon prints once it serves (`crates/api/src/role/daemon.rs`); its instance
 /// follows.
@@ -119,11 +121,18 @@ fn forward_lines(child: &mut Child) -> Receiver<String> {
   lines
 }
 
-/// The next line the anchor forwards, within [`PATIENCE`]; fails the test on the anchor's crash-loop line.
-fn next_line(lines: &Receiver<String>) -> String {
-  let line = lines
-    .recv_timeout(PATIENCE)
-    .expect("the anchor said what its daemon did within the patience");
+/// The next line the anchor forwards, waited for while the anchor's process tree gains CPU ([`process_wait::Judged`];
+/// until 2026-11-20 within `PATIENCE`, 120 s of the wall); fails the test on the anchor's crash-loop line.
+fn next_line(lines: &Receiver<String>, judged: &mut process_wait::Judged) -> String {
+  let line = loop {
+    match lines.recv_timeout(POLL) {
+      Ok(line) => break line,
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        judged.look("the anchor said what its daemon did")
+      }
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the anchor's lines ended"),
+    }
+  };
   assert!(
     !line.starts_with(CRASH_LOOP_LINE),
     "the daemon never served: {line}"
@@ -142,10 +151,14 @@ fn port_on(line: &str, index: usize) -> Option<u16> {
 }
 
 /// Reads the anchor's lines until its daemon serves: the port each edge named, in [`EDGES`]' order.
-fn ports_until_served(lines: &Receiver<String>, serving: &str) -> [Option<u16>; 3] {
+fn ports_until_served(
+  lines: &Receiver<String>,
+  judged: &mut process_wait::Judged,
+  serving: &str,
+) -> [Option<u16>; 3] {
   let mut ports = [None; 3];
   loop {
-    let line = next_line(lines);
+    let line = next_line(lines, judged);
     for (index, port) in ports.iter_mut().enumerate() {
       *port = port_on(&line, index).or(*port);
     }
@@ -156,10 +169,11 @@ fn ports_until_served(lines: &Receiver<String>, serving: &str) -> [Option<u16>; 
 }
 
 /// Connects to loopback `port`, sends `ask`'s request, and reads until the answer is as long as `ask`'s expected start
-/// or the server closes, within [`PATIENCE`]: the bytes read, or why there were none.
+/// or the server closes: the bytes read, or why there were none. Read without a timeout: the daemon answers while it
+/// lives, and across a restart the anchor holds the listener for its successor (A-232, A-468); until 2026-11-20 each
+/// read waited `PATIENCE`.
 fn first_answer(port: u16, ask: Ask) -> std::io::Result<Vec<u8>> {
   let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
-  stream.set_read_timeout(Some(PATIENCE))?;
   stream.write_all(ask.request())?;
   let mut answer = Vec::new();
   let mut chunk = [0u8; 256];
@@ -254,22 +268,21 @@ fn a_daemon_restart_keeps_every_version_control_listeners_port() {
     .spawn()
     .unwrap();
   let lines = forward_lines(&mut child);
+  let mut judged = process_wait::Judged::of(child.id());
   let _anchor = Anchor { child };
   let serving = format!("{SERVING_LINE}{instance} serving on ");
-  let ports =
-    ports_until_served(&lines, &serving).map(|port| port.expect("each listener named its port"));
+  let ports = ports_until_served(&lines, &mut judged, &serving)
+    .map(|port| port.expect("each listener named its port"));
   assert_each_listener_answers(&ports);
   let killed = daemon_pid(&instance).expect("the daemon's pid");
   kill(killed);
   // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
-  let started = Instant::now();
   let mut successor = None;
   let mut while_restarting = Vec::new();
   let mut again = [None; 3];
   let mut served = false;
   while successor.is_none() || !served {
-    assert!(started.elapsed() < PATIENCE * 2, "the daemon served again");
-    let line = next_line(&lines);
+    let line = next_line(&lines, &mut judged);
     if successor.is_none()
       && let Some(after) = line.split(RESTARTED_AS).nth(1)
     {

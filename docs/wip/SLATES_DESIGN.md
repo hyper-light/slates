@@ -55744,6 +55744,21 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722's head at once — A git service's reply head is written before its body is read (2026-11-20, w-git for UI goal 93; main's ruling)
+- **Why.** The edge's engine wrote a reply's status and headers only once the service's reply began, after the whole
+  request body was read. A long push's pack is decoded as its body is read, so after the client's last byte the
+  connection was silent until the push was answered, and the long-history edge tests' client gave up reading at a load
+  of 40 to 67. git's `http-backend` writes its head (`200`, the result's media type, chunked) before it runs the
+  service.
+- **Change.** `slates_http_edge::connection::StatusMode::AtHead`: a route whose head is all known at its decision has
+  `200` and the decision's fields written at once, after any `100 Continue` and before any of its body is read; the
+  reply then streams from it, and a failure after it ends the connection short of the reply's end, as a cut git answer
+  does. git's smart services (`vcs_http::git`, upload-pack's and receive-pack's results and advertisements) take it.
+  Mercurial's commands stay `Streamed` (their media type is named as the reply begins) and Subversion's site `AfterBody`;
+  w-hg and w-svn were told.
+- **Tests.** `slates-http-edge` `connection::tests::an_at_head_routes_reply_head_is_written_before_its_body_is_read` (red
+  with the head written at the reply: no head before the body's end).
+
 ### A-722's keepalive — A long push's answer writes git's keepalive while it is made (2026-11-20, w-git for UI goal 93; main's order: the two load-only edge tests)
 - **Why.** Over the HTTP edge a push's answer was made whole in the exchange's `body_end` and written only after it, so a
   long push wrote nothing until its report: at a load of 56 to 67 the long-history edge tests' client gave up reading
@@ -55755,10 +55770,7 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   going (`ClientGone`) as `body_end` is, so a hook run in the reply's turns ends with its client. A push without
   side-band is answered whole as before, and a refusal before any reply still answers with a status. The edge tests'
   long-history requests now ask stock git's capabilities (`report-status-v2 side-band-64k ...`).
-- **Owed.** The silence before the reply begins: the edge's engine writes the status only once the body is read, while
-  git's `http-backend` writes its head before it reads the body, so a long pack's decode after the client's last byte
-  is silent (the two long-history tests still meet their 10 s read wait at a load of 40 to 50). The status written at
-  the head on a streamed route is an `http-edge` change (proposed to main).
+- **The silence before the reply begins** is A-722's head at once (the section above).
 - **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`
   (a daemon whose interval is none: the answer begins with `0005\1`, its report whole after the keepalives);
   `slates-server --lib -- vcs_http:: git_push:: vcs_ssh::` 156 passed, the two long-history tests (owed above) and
