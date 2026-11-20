@@ -6638,7 +6638,12 @@
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
 >   waited each time), and within the caller's restart bound only where a live anchor holds the rendezvous
 >   (`a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served`,
->   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Windows since A-447 (2026-11-18, g251): the
+>   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). A macOS claim made in a replaced daemon's
+>   object since A-735 (2026-11-20, w-forming, found by use): a daemon holding its own rendezvous makes the object again
+>   at its start, so a claim made in its dead predecessor's object waited for good on the owner's name the successor held
+>   (a replaced fleet member's `volume list` hung 30+ minutes, every claim slot of the live object free); each look now
+>   reads its own slot in the object under the name and ends `DaemonUnavailable` when it is another
+>   (`a_claim_on_a_rendezvous_made_again_by_a_new_owner_ends`). Windows since A-447 (2026-11-18, g251): the
 >   daemon writes its process id and creation time into the bootstrap header (layout `SLB3`), and a claim with no live
 >   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
 >   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a

@@ -5444,6 +5444,15 @@ drops.
 > `Deadlines::reconnect_ns` remains only for the waits on a fleet owner's takeover (a request refused for now held for
 > its resend, the pause between resends, `call_through_transient`), whose own bound, the failover delay, is owed in GAPS.
 
+> **Status (2026-11-20, A-735): a macOS claim made in a replaced daemon's bootstrap object ends.** A daemon that holds
+> its own rendezvous makes the object again at its start (the create unlinks a dead predecessor's), and takes the
+> owner's bootstrap name a claim's life is judged by. A client that opened the predecessor's object (before the
+> successor's start, or between its taking the name and making the object) waited for good on a slot no daemon reads.
+> Each look on the claim's owner now also reads its own slot in the object under the name: a slot that does not name
+> this client by its pid and start (A-522; only the claimant writes them) means the object was made again, and the
+> claim is taken back and refused `DaemonUnavailable`, which a reconnect claims again. An anchor's object outlives its
+> daemon's restarts, so a claim under one keeps waiting (A-114, A-468).
+
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
 = ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = F, R9's provisioning floor, 50 µs
@@ -55123,3 +55132,23 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Residual.** A relief itself held in a send is relieved by no one (two completions each waiting on the drive at
   once); the relief's receive may run its transaction timeout (1 s) before it hands the state back.
 - **Applied in the same change to** GAPS (the delete/purge hang entry), the fsx bug record, amendments.tsv.
+
+### A-735 — A macOS claim made in a replaced daemon's bootstrap object ends (bug, 2026-11-20, w-forming; found by use: main's forming sweep, live_chaos `a_member_that_never_held_the_log_never_stands_in_for_its_holder` under `taskpolicy -b`, run 25; amends A-443's macOS look; §4.7 "Rendezvous")
+
+- **What happened.** The flow replaced fleet member `a` with a fresh daemon and asked it `volume list` while it started.
+  The client hung 30+ minutes in `Claim::wait` against a daemon serving with both shards parked: read at the hang, the
+  bootstrap object under the instance's name (its start stamp the fresh daemon's) had all 64 claim slots free and no
+  slot naming either hung client's pid.
+- **Cause.** A daemon run alone takes the owner's bootstrap name (`take_ownership`), then makes the object again
+  (`owned_object`; `SharedObject::create` unlinks the dead predecessor's). A client that opened the predecessor's object,
+  still published since a killed daemon never takes its stamp back, claimed a slot there; its look asked only whether the
+  owner's name was held, and the successor held it, so the claim was due for good.
+- **The fix.** `Claim::look` (macOS) also asks `made_again`: the object now under the name is opened and the claim's slot
+  read; a pid or start other than this process's (A-522's fields, written only by the claimant) means the object was made
+  again, and the claim is taken back and refused `DaemonUnavailable`. No object under the name yet reads not made again,
+  so the next look asks again. An anchor's object outlives its daemon's restarts, so its claims keep waiting.
+- **Tests.** `slates-ipc` `rendezvous::platform::tests::a_claim_on_a_rendezvous_made_again_by_a_new_owner_ends`: red
+  before (still due 2.000 s after the object was made again), refused 178 µs after it with the fix. macOS arm64, Mac
+  Studio (adas-mac-studio-4), local: `cargo test --locked -p slates-ipc --lib rendezvous::` 16 of 16,
+  `--test rendezvous` 14 of 14, fmt clean.
+- **Applied in the same change to.** §4.7's A-468 status (a status line), GAPS (the rendezvous waits entry).
