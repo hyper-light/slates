@@ -319,6 +319,7 @@ impl Streaming {
     self.stage = match stage {
       Stage::Counting(log, rev) => self.count(index, store, (log, rev))?,
       Stage::Head => {
+        // Format: `0\n`, then the two counts, a space between and a newline after: two decimals and four bytes.
         admission.charge(DECIMAL_BYTES.saturating_mul(2).saturating_add(4))?;
         out.extend_from_slice(b"0\n");
         out.extend_from_slice(crate::decimal::Decimal::unsigned(self.counted.0).as_bytes());

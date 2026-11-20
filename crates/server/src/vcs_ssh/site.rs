@@ -447,6 +447,7 @@ where
           self.lender.clone(),
           (repository.id, start.principal.clone()),
           version,
+          self.room,
         )))
       }
       (Service::GitReceivePack, Some(repository)) => {

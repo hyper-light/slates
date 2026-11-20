@@ -1942,6 +1942,39 @@ fn a745_a_long_history_pushed_in_one_piece_is_negotiated_within_a_few_kilobytes(
   );
 }
 
+/// A-745 (§4.17.1 "A fetch's answer", rule 1). Do: make a straight history of 3,000 commits whose push gave each commit,
+/// then its tree, then its blob, positions in turn (so the commits alone are every third position, 3,000 runs), and
+/// clone it within 8 KiB. Expect: the pack's 9,000 objects chosen, one run: the walk keeps each set of commits (wanted,
+/// taken, sent) in a bit table across their span, about 1.1 KiB each, where runs would cost 16 bytes a commit (48 KB a
+/// set) and the walk's sets had charged 8 bytes and more an object.
+#[test]
+fn a745_a_long_history_pushed_interleaved_is_negotiated_within_a_few_kilobytes() {
+  const COMMITS: usize = 3_000;
+  let mut graph = TestGraph::default();
+  let mut head = None;
+  for n in 0..COMMITS {
+    let commit_at = graph.objects.len();
+    let tree_at = u32::try_from(commit_at + 1).unwrap();
+    let parents: Vec<u32> = head.into_iter().collect();
+    let commit = graph.new_commit(&parents, tree_at, u64::try_from(n).unwrap());
+    let blob_at = u32::try_from(commit_at + 2).unwrap();
+    assert_eq!(graph.new_tree(&[blob_at]), tree_at);
+    assert_eq!(graph.new_blob(u64::try_from(n).unwrap() + 1), blob_at);
+    head = Some(commit);
+  }
+  let asks = Asks {
+    wants: vec![graph.id(head.unwrap())],
+    done: true,
+    ..Asks::default()
+  };
+  let outcome = negotiate(&graph, &asks.request(), &mut Admission::new(8192)).unwrap();
+  let Answer::Pack(pack) = outcome.answer else {
+    panic!("{:?}", outcome.answer)
+  };
+  assert_eq!(pack.objects.len(), u64::try_from(3 * COMMITS).unwrap());
+  assert_eq!(pack.objects.runs(), 1);
+}
+
 /// A-615 part 2 (`list-objects-filter.c` `filter_trees_depth`: a tree met again shallower is walked again, "minimum
 /// depth if an object is located at multiple depths"): do fetch two unrelated commits under `tree:4`, the first holding
 /// a tree `x` at depth 2 and the second at depth 1, `x` holding a tree that holds a blob. Expect: the blob, at depth 4
@@ -2090,4 +2123,48 @@ fn a_sparse_filter_without_its_patterns_or_combined_is_refused() {
     sparse_clone(&graph, commit, &combined, Some(b"*\n")),
     Err(Refusal::Filter(filter::Refusal::SparseCombined))
   );
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// A-745 (a walk's set in whichever of runs or a bit table is smaller). Do: insert positions drawn dense, sparse or
+  /// every third into a set and an ordered set beside it, asking after each what each holds. Expect: the same answer to
+  /// "was it new" and to membership at every drawn position, the same least position at or after each, the same members
+  /// in order, the same runs once given up; and what the set charged no more than the smaller form costs, a word
+  /// either way.
+  #[test]
+  fn a745_a_walks_set_holds_what_an_ordered_set_holds_in_its_smaller_form(
+    step in proptest::strategy::Union::new([Just(1u64).boxed(), Just(3u64).boxed(), (1u64..400).boxed()]),
+    drawn in proptest::collection::vec(0u64..600, 0..400),
+  ) {
+    let mut held = super::Held::default();
+    let mut model = BTreeSet::new();
+    let mut admission = Admission::new(u64::MAX);
+    let mut most = 0;
+    for at in &drawn {
+      let position = at * step;
+      prop_assert_eq!(held.insert(position, &mut admission).unwrap(), model.insert(position));
+      let run_bytes = 16 * crate::to_u64(Positions::of(model.iter().copied().collect()).runs());
+      let (first, last) = (model.first().copied().unwrap_or(0), model.last().copied().unwrap_or(0));
+      let bit_bytes = (last / 64 - first / 64 + 1) * 8;
+      let bytes = held.bytes();
+      prop_assert!(
+        bytes <= run_bytes.min(bit_bytes) || bytes <= bit_bytes,
+        "costs {} with runs {} and bits {}",
+        bytes,
+        run_bytes,
+        bit_bytes
+      );
+      most = most.max(bytes);
+    }
+    prop_assert_eq!(u64::MAX - admission.left(), most, "charged its most, once");
+    for at in &drawn {
+      let position = at * step;
+      prop_assert!(held.contains(position));
+      prop_assert_eq!(held.next_from(position + 1), model.range(position + 1..).next().copied());
+    }
+    prop_assert_eq!(held.iter().collect::<Vec<_>>(), model.iter().copied().collect::<Vec<_>>());
+    prop_assert_eq!(held.into_positions(), Positions::of(model.into_iter().collect()));
+  }
 }

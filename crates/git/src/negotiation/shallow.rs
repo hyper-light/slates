@@ -253,10 +253,7 @@ fn by_rev_list<S: Graph>(
   let old =
     |commit| since.is_some_and(|time| graph.commit(commit).is_some_and(|row| row.date < time));
   paint.run(graph, &BTreeSet::new(), old, admission, counters)?;
-  let selected = paint.chosen();
-  admission
-    .charge_items::<(u64, u64)>(selected.runs())
-    .map_err(Refusal::PastAdmission)?;
+  let selected = paint.chosen(admission)?;
   if selected.is_empty() {
     return Err(Refusal::NothingSelected);
   }
@@ -268,7 +265,7 @@ fn by_rev_list<S: Graph>(
     charge::<(S::Node, S::Node)>(admission)?;
     if graph
       .parents(commit)
-      .any(|parent| !selected.contains(parent.into()))
+      .any(|parent| !selected.contains(parent))
     {
       shallow.insert(commit);
     } else {
