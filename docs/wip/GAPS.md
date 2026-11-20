@@ -1456,6 +1456,10 @@
 > and the lock table, their entries landed as `Record::Locks` (`SvnStores::lock_verb`); a commit presents its tokens
 > (`If`, the MERGE's `S:lock-token-list`, `keep-locks`; `Drive::present_lock`). Stock svn 1.15's HTTP lock session
 > runs un-ignored and passes (`svn_interop.rs` 5 of 5, none ignored).
+> **A-681, a PUT's body streamed (w-interop, 2026-11-20; §4.17.1 "A push's intake"):** a PUT under `!svn/txr/` is
+> handed to its transaction's drive a body run at a time (`DavCommit::begin_put`, `put_chunk`, `end_put`; the exchange's
+> `Streamed`), never held: a commit holds the drive's window and the texts it makes, bounded by its room. svn matrix
+> over HTTP 24 of 27 (lock passes; blame, diff and merge wait on w-reaper's reports).
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
