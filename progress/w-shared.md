@@ -1,5 +1,8 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## QUEUE (main 2026-11-20): git/svn sliced rebuild (NOW) -> A-626 part 4 myself (the WorkOp that makes a copy; engine
+  CopyTree parts 1-3 on main; read GAPS' A-626 entry) -> svn_made copy-from rows -> A-697 (a)-(f) -> A-658 3c.
+
 ## NOW (main 2026-11-20): git/svn sliced rebuild, sibling of w-hg's A-732 part 3 (main 0f756ec77, VcsStores::rebuilding):
   vcs_store::rebuild/make_whole for git and svn as a task replaying a record a turn; failing test first (a rebuild of a
   many-object store on a running daemon advances a step a turn). Then A-697, A-658 3c. Reported homes test flaky (w-balance).

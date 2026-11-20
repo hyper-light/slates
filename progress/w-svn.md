@@ -136,3 +136,7 @@
 - vcs_svn follow(): Next::Again and Next::Consume yield_now before the next turn (SSH edge already yields a step).
   Listener tests 12/12 on the landed tree. No unit test sees a missed yield; run request: git/git svnrdump dump.
 - NEXT: A-652 export half + lock-expiry by use (g268), then DeltaV v1, review piece 14.
+- Follow-up LANDED main 1fc450f1a (commit aa3a60af1): counter vcs_svn.turns_unyielded (polls_so_far unchanged
+  between turns) + test pipelined_commands_are_answered_one_turn_a_shard_poll (64 pipelined, count 0 both shards).
+  Red [1,68] on a469a6b85's parent, [1,2] on a469a6b85 (handshake turns), so the yield moved to go_on after any turn
+  whose run did not move the shard's polls: red [1,67] without, green 13/13 with.
