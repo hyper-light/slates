@@ -52,7 +52,7 @@ mod reference {
 
   fn index(source: &[u8]) -> BTreeMap<u64, usize> {
     let mut blocks = BTreeMap::new();
-    for (at, block) in source.chunks_exact(COPY_BYTES).enumerate() {
+    for (at, block) in source.as_chunks::<COPY_BYTES>().0.iter().enumerate() {
       blocks
         .entry(hash(block))
         .or_insert(at.saturating_mul(COPY_BYTES));

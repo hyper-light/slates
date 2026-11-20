@@ -11,6 +11,11 @@ use flate2::write::ZlibEncoder;
 use super::super::ReadRefused;
 use super::{ADLER_LEN, BLOCK_MAX, Source, adler_at, adler32, fill, stream_len};
 
+/// `at` as an index: past every slice when it does not fit, so slicing there fails the test.
+fn to_usize(at: u64) -> usize {
+  usize::try_from(at).unwrap_or(usize::MAX)
+}
+
 /// An object's bytes in memory, and its Adler-32 when `known`.
 struct Bytes<'a> {
   bytes: &'a [u8],
@@ -19,7 +24,7 @@ struct Bytes<'a> {
 
 impl Source for Bytes<'_> {
   fn data(&mut self, from: u64, to: u64, out: &mut Vec<u8>) -> Result<(), ReadRefused> {
-    let (from, to) = (usize::try_from(from).unwrap(), usize::try_from(to).unwrap());
+    let (from, to) = (to_usize(from), to_usize(to));
     out.extend_from_slice(&self.bytes[from..to]);
     Ok(())
   }

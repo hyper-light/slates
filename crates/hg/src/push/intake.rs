@@ -191,12 +191,13 @@ impl<'g> Intake<'g> {
     }
   }
 
-  /// The fork and what was brought, once every unit is taken; the intake itself while there is more.
-  pub fn finish(self) -> Result<(HgIndex, Intaken), Self> {
+  /// The fork and what was brought, once every unit is taken; the intake itself (boxed: it is large) while there is
+  /// more.
+  pub fn finish(self) -> Result<(HgIndex, Intaken), Box<Self>> {
     if self.stage == Stage::Done {
       Ok((self.fork, self.intaken))
     } else {
-      Err(self)
+      Err(Box::new(self))
     }
   }
 

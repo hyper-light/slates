@@ -726,7 +726,8 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     };
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
-      Err((host, refusal)) => {
+      Err(handed) => {
+        let (host, refusal) = *handed;
         slot.host = Some(BaseHost::Disk(host));
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return refused(target_refusal(&refusal, &prepared.target));
@@ -1736,7 +1737,8 @@ fn begin_granted(
     };
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
-      Err((host, refusal)) => {
+      Err(handed) => {
+        let (host, refusal) = *handed;
         slot.host = Some(BaseHost::Disk(host));
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return not_run(

@@ -14,8 +14,10 @@
 //! - `commit`: A-655's entry point and drive (**A commit**, below);
 //! - `lock`, `lock-many`, `unlock` and `unlock-many` (A-693 part 2, [`locks`]): judged against the
 //!   lock table, their entries landed by the caller through the owner's step, then answered;
-//! - every other command of `svnserve`'s set, until its piece lands (`replay`, `replay-range`,
-//!   `change-rev-prop`): answered as a command `svnserve`
+//! - `change-rev-prop` and `change-rev-prop2` (A-702, [`revprops`]): answered as `svnserve`
+//!   answers a repository with no pre-revprop-change hook, after its checks;
+//! - every other command of `svnserve`'s set, until its piece lands (`replay`, `replay-range`):
+//!   answered as a command `svnserve`
 //!   does not know, "Unknown editor command '…'" (210001), which a stock client reads as a server
 //!   without it, and counted
 //!   ([`Turn::Unserved`]); the connection goes on;
@@ -81,6 +83,7 @@
 //! No I/O, no clock, no randomness, no panic.
 
 mod locks;
+mod revprops;
 #[cfg(test)]
 mod tests;
 
@@ -550,6 +553,11 @@ enum Interrupted {
   },
   /// A lock verb (A-693 part 2): its item.
   Lock {
+    /// The item.
+    command: Vec<u8>,
+  },
+  /// A revision property's change (A-702): its item.
+  RevisionProperty {
     /// The item.
     command: Vec<u8>,
   },
@@ -1192,6 +1200,16 @@ impl Connection {
     if locks::is_lock_verb(name) {
       return Ok(Answered::LockAsked);
     }
+    if revprops::is_revision_property_change(name) {
+      let changed =
+        self.change_revision_property(established, sources, (name, params, item), false, out)?;
+      return Ok(match changed {
+        revprops::Changed::Answered => Answered::Here,
+        revprops::Changed::Authenticating(server, interrupted) => {
+          Answered::Authenticating(server, interrupted)
+        }
+      });
+    }
     let Some(kind) = RequestKind::of(name) else {
       ReportFailure::UnknownCommand {
         name: name.to_owned(),
@@ -1345,6 +1363,13 @@ impl Connection {
       Interrupted::Lock { command } => {
         self.phase = Phase::LockAsked(established, command, true);
         return Ok(Turn::LockAsked { consumed: 0 });
+      }
+      Interrupted::RevisionProperty { command } => {
+        let value = self.whole_item(&command)?;
+        let (name, params) = command_of(&value).ok_or(Refused::Malformed)?;
+        let asked = (name, params, command.as_slice());
+        self.change_revision_property(&mut established, sources, asked, true, out)?;
+        self.phase = Phase::Commands(established);
       }
       Interrupted::Commit { command, start } => {
         self.begin_commit(established, command, start, true, &sources.policy, out)?;

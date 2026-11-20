@@ -1391,7 +1391,7 @@ impl Taking<'_> {
         generation: self.generation,
       }),
       Err(intake) => {
-        self.intake = Some(intake);
+        self.intake = Some(*intake);
         None
       }
     }

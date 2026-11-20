@@ -202,13 +202,19 @@ fn strings_resolve_their_escapes_and_are_owned_within_their_length() {
   assert_eq!(strings[0].as_str(), Some("plain"));
   assert_eq!(strings[1].as_str(), None);
   assert!(strings[1].is("a\u{e9}\u{1f600}\n\""));
-  let len = strings[1].decoded_len() as u64;
+  owned_within_its_length(&strings[1], &texts[1]);
+}
+
+/// Holds the escaped string of `strings_resolve_their_escapes_and_are_owned_within_their_length` to its decoded length:
+/// owned within exactly that, and refused one byte short of it with the room untouched.
+fn owned_within_its_length(string: &super::JsonStr<'_>, text: &str) {
+  let len = string.decoded_len() as u64;
   assert_eq!(len, 9);
   let mut exact = Admission::new(len);
-  assert_eq!(strings[1].owned(&mut exact).unwrap(), texts[1]);
+  assert_eq!(string.owned(&mut exact).unwrap(), text);
   assert_eq!(exact.left(), 0);
   let mut short = Admission::new(len - 1);
-  assert!(strings[1].owned(&mut short).is_err());
+  assert!(string.owned(&mut short).is_err());
   assert_eq!(short.left(), len - 1);
 }
 
@@ -249,28 +255,42 @@ fn numbers_are_written_in_decimal() {
   );
 }
 
+/// Shape: the kinds of scalar `json_text` chooses among, one each: `true`, `null`, an integer, a fraction, a string.
+const JSON_SCALAR_KINDS: u8 = 5;
+
 /// A JSON value's text from a strategy of scalars and containers, numbers kept within f64's range so serde_json reads
-/// every one.
+/// every one. Each choice is a selector over parts made for every kind (no `prop_oneof!`, whose strategy is
+/// reference-counted, R2).
 fn json_text() -> impl Strategy<Value = String> {
-  let scalar = prop_oneof![
-    Just("true".to_string()),
-    Just("null".to_string()),
-    (-1_000_000i64..1_000_000).prop_map(|value| value.to_string()),
-    (-1_000i32..1_000, 0u8..100).prop_map(|(whole, fraction)| format!("{whole}.{fraction}")),
-    "[a-z\u{e9}\u{1f600} ]{0,6}".prop_map(|text| format!("{text:?}")),
-  ];
+  let scalar = (
+    0..JSON_SCALAR_KINDS,
+    -1_000_000i64..1_000_000,
+    (-1_000i32..1_000, 0u8..100),
+    "[a-z\u{e9}\u{1f600} ]{0,6}",
+  )
+    .prop_map(|(kind, integer, (whole, fraction), text)| match kind {
+      0 => "true".to_string(),
+      1 => "null".to_string(),
+      2 => integer.to_string(),
+      3 => format!("{whole}.{fraction}"),
+      _ => format!("{text:?}"),
+    });
   scalar.prop_recursive(4, 24, 4, |inner| {
-    prop_oneof![
-      proptest::collection::vec(inner.clone(), 0..4)
-        .prop_map(|items| format!("[{}]", items.join(","))),
-      proptest::collection::vec(("[a-z]{0,3}", inner), 0..4).prop_map(|pairs| {
+    (
+      any::<bool>(),
+      proptest::collection::vec(inner.clone(), 0..4),
+      proptest::collection::vec(("[a-z]{0,3}", inner), 0..4),
+    )
+      .prop_map(|(array, items, pairs)| {
+        if array {
+          return format!("[{}]", items.join(","));
+        }
         let fields: Vec<String> = pairs
           .into_iter()
           .map(|(key, value)| format!("{key:?}: {value}"))
           .collect();
         format!("{{{}}}", fields.join(", "))
-      }),
-    ]
+      })
   })
 }
 

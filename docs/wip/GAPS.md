@@ -75,7 +75,8 @@
 > **A-724 piece 1 (2026-11-20, w-balance; many repositories balanced by learned usage, §4.17.5).** BUILT: each
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
-> demands and weights read from the rows (2), admission by share (3), the cold trigger (4), intake off the owner and
+> one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
+> Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
 > **A-719 part 2 (2026-11-20, w-git).** BUILT: the pack reader's keeper seam (`unpack::Keep`): each object handed to its
@@ -114,6 +115,12 @@
 > PastRoom { room: 278528 }` for the same repository), the unbundle's processing in slices, and w-perf's whole push.
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
+>
+> **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
+> name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
+> entry's bound in bounded parts across entries (git/git's 607 MiB pack vs a 747 MB segment region); objects already
+> held left out of the pack; S2 (history's latest value = the file's block), S3 (w-git, A-722), S4 (svn texts by identity),
+> S5 (w-hg); the push bound (a streamed window per connection, admission refusal before the body); push_load re-run.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1432,6 +1439,10 @@
 > updating PUT and a DELETE). Stock svn 1.15's HTTP round trip runs un-ignored and passes; svn matrix over HTTP 23 of
 > 27. Owed: LOCK/UNLOCK and a commit's lock tokens (`If`, `S:lock-token-list`); the reports blame, diff and merge ask
 > (`file-revs`, a diff's, `mergeinfo`); a PUT's body held whole within the room; an abandoned transaction's expiry.
+> **A-681, HTTP locks (w-interop, 2026-11-20):** LOCK and UNLOCK of a public path over A-627's readers and writers
+> and the lock table, their entries landed as `Record::Locks` (`SvnStores::lock_verb`); a commit presents its tokens
+> (`If`, the MERGE's `S:lock-token-list`, `keep-locks`; `Drive::present_lock`). Stock svn 1.15's HTTP lock session
+> runs un-ignored and passes (`svn_interop.rs` 5 of 5, none ignored).
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
@@ -1909,6 +1920,11 @@
 > answered as `svnserve` answers them: stock `svn`'s recorded `lock-bob` and `lock-a` sessions byte for byte. macOS
 > arm64, this Mac, local: slates-svn 239 of 239, server `vcs_svn::` `vcs_ssh::svn::` `repository::svn_commit::`.
 > Owed: the pre-lock and post-lock hooks; a lock's expiry set by a client (ra_svn names none).
+> A-702 part 1, 2026-11-19 (w-svn): `change-rev-prop` and `change-rev-prop2` answered as `svnserve` answers a
+> repository with no pre-revprop-change hook (165006), after its checks in its order (the previous-value refusal,
+> write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
+> revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
+> its `Record::RevisionProperties` through the owner's step, post-revprop-change.
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:

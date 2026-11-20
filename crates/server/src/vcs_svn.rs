@@ -1144,7 +1144,7 @@ fn land(conversation: &mut Conversation, work: Work, out: &mut Vec<u8>) -> bool 
 /// and [`CHALLENGE_HOST`], the challenge written to `stream`.
 async fn challenge(stream: &TcpStream, connection: &mut Connection, out: &mut Vec<u8>) -> Stepped {
   out.clear();
-  let mut nonce = [0u8; 8];
+  let mut nonce = [0u8; size_of::<u64>()];
   let micros = crate::state::with_state(|state| state.clock.wall_ns() / NANOS_PER_MICRO);
   let (Ok(()), Some(micros)) = (aws_lc_rs::rand::fill(&mut nonce), micros) else {
     return Stepped::End;

@@ -35,9 +35,14 @@
 //! a COPY whose `Destination` is there, and a DELETE of `!svn/txn/NAME` each drive it a step; a MERGE naming it closes
 //! it, the accepted work landed through the owner's commit step (`repository::svn_commit::commit_work`) and answered
 //! with the new revision. A hook the repository configures at start-commit or pre-commit refuses the commit, as the
-//! svn+ssh tunnel refuses it, until hooks run. Not yet: the lock tokens a commit presents (an `If` header, the MERGE's
-//! `S:lock-token-list`), so a commit under one's own lock is refused as under another's; an abandoned transaction is
-//! kept until its principal begins another.
+//! svn+ssh tunnel refuses it, until hooks run. A commit presents its lock tokens as a stock client sends them: each
+//! request's `If` header, then the MERGE's `S:lock-token-list` with `X-SVN-Options: keep-locks` deciding whether the
+//! verdict releases them. An abandoned transaction is kept until its principal begins another.
+//!
+//! **Locks** (A-681, over A-627's `slates_svn::dav::locking` and A-602's lock table): a LOCK or an UNLOCK of a public
+//! path is read, judged by the repository's lock table at the owner's instant with a token drawn from the system's
+//! generator, its entries landed through the owner's step as A-693 part 2's `Record::Locks` (durable as a revision
+//! is), and answered as `mod_dav_svn` answers it; a landing the step refuses is answered as a commit's refusal.
 //!
 //! **Names.** A repository is the one named by the URL's first path segment, decoded; the rest of the path is below
 //! its root (`/repo/!svn/rvr/5/trunk` is `repo`'s `/!svn/rvr/5/trunk`). A repository whose name holds a slash cannot be
