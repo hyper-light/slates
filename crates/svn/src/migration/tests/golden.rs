@@ -7,8 +7,8 @@
 use std::fmt::Write as _;
 
 use super::support::{
-  ADMISSION, History, VECTOR_UUID, created, export, export_all, export_deltas, export_in, history,
-  import, import_whole,
+  ADMISSION, CALL_HEADROOM, History, VECTOR_UUID, created, export, export_all, export_deltas,
+  export_in, history, import, import_whole,
 };
 use crate::commit::record::Record;
 use crate::dump::Format;
@@ -226,12 +226,6 @@ fn a_history_exported_in_parts_imports_to_the_history_exported_whole() {
   import_whole(&mut joined, &[first, second].concat()).unwrap();
   assert!(history(&joined) == history(&source));
 }
-
-/// Shape: what one export call may append past a window of text: a window's svndiff framing, or a record's headers and
-/// property section, which in the fixture history are each far below a page. Measured 2026-11-20 (debug, this
-/// MacBook): the largest call 102,400 bytes in format 2 (a text's piece) and 102,413 in format 3 (a window and its 13
-/// bytes of framing); before this piece, a call wrote a revision's 107 KB text whole.
-const CALL_HEADROOM: usize = 4096;
 
 /// A-652 (the export's units): do export the whole history stock `svnadmin` dumped, in each format, a call at a time.
 /// Expect every revision written over at least its changed paths' count and two more calls (its revision record, then
