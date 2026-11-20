@@ -223,6 +223,15 @@ pub enum Uncommitted {
   /// (A-655 part 2b): `SVN_ERR_UNSUPPORTED_FEATURE` (200007), "This server does not make commits
   /// yet".
   NotServed,
+  /// The owner's step refused the work for a reason of its own, which no FSFS commit meets (the
+  /// repository's store not held on the shard, the shard's budget, its log's append; A-698): the
+  /// Subversion error and the words it is answered with.
+  Refused {
+    /// The error's number.
+    code: u32,
+    /// Its words.
+    message: String,
+  },
 }
 
 /// What one call of [`Connection::receive`] made of the client's bytes, and what the caller does
@@ -907,6 +916,7 @@ impl Connection {
     let errors = match failure {
       Uncommitted::Step(refusal) => vec![(refusal.subversion_code(), refusal.message())],
       Uncommitted::NotServed => vec![(SVN_ERR_UNSUPPORTED_FEATURE, NOT_SERVED.to_owned())],
+      Uncommitted::Refused { code, message } => vec![(*code, message.clone())],
     };
     write_failure(&errors, out)?;
     self.phase = Phase::Dropping(established);
