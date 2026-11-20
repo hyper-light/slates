@@ -1603,6 +1603,18 @@ impl Partition {
         |id| self.held(id),
         |green| self.green_head(green),
       ),
+      // A repository recorded whole by its successor (A-636 part 2c-2): `crate::repository`; its state and policy fit the
+      // merge byte budget.
+      Op::RepositoryRebuilt { record, parts } => {
+        self.repositories.check(
+          op,
+          self.caps.volumes,
+          |id| self.held(id),
+          |green| self.green_head(green),
+        )?;
+        let added = crate::repository::Repositories::rebuilt_bytes(record, parts);
+        self.merge_bytes_fit(0, added)
+      }
       // An entry of a repository's register (A-603): its rules, then its versions' chain entries and the state it adds
       // within the merge budget, less the state it removes.
       Op::RepositoryAdvanced { entry } => self.check_entry(entry, &[]),
@@ -2192,7 +2204,7 @@ impl Partition {
         self.carried.insert(*volume, (carried.clone(), *mark));
         Ok(())
       }
-      Op::RepositoryCreated { record } => {
+      Op::RepositoryCreated { record } | Op::RepositoryRebuilt { record, .. } => {
         self.minted(record.id.bytes);
         self.apply_repository(op)
       }

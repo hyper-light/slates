@@ -14768,3 +14768,36 @@ and 5.15 s of the daemon's CPU; of the daemon's samples on CPU, about 72% (1,522
 `slates_git::store::deltas::Search::step`. Every clone searches the whole store for deltas again, where `git daemon`
 sends the deltas its pack already holds. T4, owed and first for git's time: keep and reuse deltas (the pushed pack's
 bases, or the search's result at the repository's version), so a clone streams deltas it already has.
+
+## A pushed version's fragments encoded once, before a fetch: a second clone 3.0 times as fast, the first 1.5 times as slow (A-718; UI goal 93; 2026-11-20)
+
+- **Machine:** Mac Studio (as above), 2026-11-20 ~07:30 UTC, load average 6.6 to 10.0 (shared; not quiesced).
+- **Builds:** after: release of branch agents/w-perf-a718 at 6ab6d6662 (A-718 over main b705a24c5); before: release of
+  main b705a24c5. Run one after the other, each interleaved with stock `git daemon`.
+- **Data and command:** git/git cut at v1.0.0 (2,930 commits, 12,233 objects, a 3.46 MiB pack); `KEEP_LOGS=DIR
+  SERVERS="stock slates" crates/cli/bench/git_scale.sh slates cut-1.0.git WORK 3 900`, the harness now cloning a second
+  time (`clone-again`), as every clone after the first meets. Both builds' first clones: `fsck --full` clean, refs (2)
+  and object ids (12,233) identical to the source.
+
+Best of three, seconds (every run in the logs: `~/.cache/w-perf/logs/git-cut10-{a718,before}.log` on the Studio):
+
+| git | stock | slates before | slates after |
+|---|---|---|---|
+| push, both refs | 0.346 / 0.351 | 0.672 | 0.684 |
+| first clone `--mirror` | 0.356 / 0.318 | 2.791 | 4.293 |
+| second clone `--mirror` | 0.312 / 0.342 | 2.766 | 0.912 |
+| one-commit push | 0.086 / 0.070 | 0.051 | 0.050 |
+| fetch of it | 0.074 / 0.073 | 0.068 | 0.071 |
+| clone `--depth 1` | 0.115 / 0.119 | 0.154 | 0.118 |
+| clone `--filter=blob:none` | 0.190 / 0.222 | 1.076 | 0.558 |
+
+(Stock's two figures are its runs beside each build.) The daemon's resident set after the push: 383 to 389 MiB both;
+at the end of a run: 384 to 388 MiB before, 482 to 513 MiB after, the kept fragments and the content store's arena
+grown for them.
+
+What it means: every clone after the first is 3.0 times as fast, a partial clone 1.9 times, and a shallow one even
+with `git daemon`. The first clone after a push now pays the version's whole encoding, 4.293 s against the old search's
+2.791 s, since the encoding tries the learned window's candidates for every object where the old stream searched only
+what no part covered. A second clone is still 2.7 times `git daemon`'s. Owed, measured next: where the first clone's
+encoding and the second clone's 0.91 s go; the encoding moved to the push's own intake (the deltas the client sent kept,
+git's pack reuse; w-git's streaming intake), so no fetch pays it; and the arena's 100 to 125 MiB more for a 3.5 MiB pack.

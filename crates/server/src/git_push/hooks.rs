@@ -360,7 +360,7 @@ pub(super) fn before<P: PresentView>(
     {
       Turn::Sealing => {
         push.answer = AnswerState::Hooking(Box::new(hooking));
-        return Ok(Answering::Sealing);
+        return Ok(Answering::Turned);
       }
       Turn::Shown(presented) => {
         if let Some(input) = input_before(&hooking.hooks) {
@@ -521,7 +521,7 @@ pub(super) fn observe<P: PresentView>(
   {
     Turn::Sealing => {
       push.answer = AnswerState::Observing(Box::new(observing));
-      Ok(Answering::Sealing)
+      Ok(Answering::Turned)
     }
     Turn::Shown(presented) => {
       let view = CommittedView(observing.hooks.views);

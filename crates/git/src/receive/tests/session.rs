@@ -2,8 +2,8 @@
 //! push held whole, with the push waiting checked between its reading and its verdicts.
 
 use super::{
-  ADVERTISED, HIDDEN, Repo, Scenario, advertisement, answer_to, git_policy, named, received, refs,
-  scenario, scenarios, unbounded,
+  ADVERTISED, HIDDEN, Repo, Scenario, advertisement, answer_to, checked_in_turns, git_policy,
+  named, received, refs, scenario, scenarios, unbounded,
 };
 use crate::pktline;
 use crate::receive::{
@@ -38,6 +38,9 @@ fn fed_in_pieces(bytes: &[u8], piece: usize, repository: &Repo) -> Answered {
   if checked == Ok(false) {
     checked = session.end(repository, &mut unbounded());
   }
+  if checked == Ok(true) {
+    checked = checked_in_turns(&mut session, repository).1;
+  }
   let result = checked.and_then(|_| {
     let mut policy = git_policy(repository);
     session.answer(&mut policy, &mut written, &mut unbounded())
@@ -63,6 +66,7 @@ fn assert_checked_as_the_last_piece_arrives(scenario: &Scenario, piece: usize, w
     assert_eq!(checked, Ok(false), "{label}");
   }
   assert_eq!(session.input(last, &repository, &mut unbounded()), Ok(true));
+  assert_eq!(checked_in_turns(&mut session, &repository).1, Ok(true));
   let pushed = match received(scenario, &repository).unpacked {
     Some(Ok(unpacked)) => unpacked.objects.len(),
     _ => 0,
@@ -172,6 +176,7 @@ fn assert_bytes_after_are_not_read(scenario: &Scenario, after: &[u8]) {
   assert_eq!(checked, Ok(true), "{}", scenario.name);
   let more = session.input(after, &repository, &mut unbounded());
   assert_eq!(more, Ok(false), "{}", scenario.name);
+  assert_eq!(checked_in_turns(&mut session, &repository).1, Ok(true));
   let mut written = Vec::new();
   let mut policy = git_policy(&repository);
   let answered = session.answer(&mut policy, &mut written, &mut unbounded());
@@ -227,6 +232,7 @@ fn a_checked_push_waits_for_its_verdicts_holding_nothing_of_the_callers() {
     Ok(true)
   );
   assert_eq!(session.end(&first, &mut unbounded()), Ok(false));
+  assert_eq!(checked_in_turns(&mut session, &first).1, Ok(true));
   drop(first);
   let checked = session.checked().unwrap();
   assert!(!checked.objects().is_empty());
@@ -275,6 +281,7 @@ fn a_session_owning_its_parts_is_kept_by_its_caller_across_calls() {
     }
   }
   assert_eq!(checked, Ok(true));
+  assert_eq!(checked_in_turns(&mut kept.session, &repository).1, Ok(true));
   let mut written = Vec::new();
   let mut policy = git_policy(&repository);
   let answered = kept
@@ -297,6 +304,7 @@ fn a_held_report_and_its_end_are_the_answer_written_whole() {
     if checked == Ok(false) {
       let _ = session.end(&repository, &mut unbounded());
     }
+    let _ = checked_in_turns(&mut session, &repository);
     let mut policy = git_policy(&repository);
     let mut written = Vec::new();
     if let Ok(Some(received)) = session.decide(&mut policy, &mut unbounded()) {
@@ -337,4 +345,45 @@ fn a_hooks_words_go_to_band_two_in_gits_pieces_only_when_multiplexed() {
   let mut none = Vec::new();
   write_hook_words(&Requested::default(), &words, &mut none);
   assert!(none.is_empty());
+}
+
+/// The objects `scenario`'s pack brings once read whole, none when it brings no pack or is refused.
+fn objects_of(scenario: &Scenario, repository: &Repo) -> usize {
+  match received(scenario, repository).unpacked {
+    Some(Ok(unpacked)) => unpacked.objects.len(),
+    _ => 0,
+  }
+}
+
+/// A-719 (found by use: stock git's push of git/git, 607 MiB, ran its pack's checks in the step
+/// that took the pack's last bytes, and its shard ran past the watchdog's window). Do: feed a
+/// session each captured push whole, end its input if that did not read it whole, then make its
+/// checks in turns that each end after one unit of work, and answer it. Expect: read whole, its
+/// checks not yet made, when its pack ended; at least one turn an object it brought (each object is
+/// read by fsck and by both passes of the walk); answered, and its bytes written, as the push held
+/// whole is.
+#[test]
+fn a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole() {
+  for scenario in scenarios() {
+    let repository = Repo::from_pack(scenario.before_pack);
+    let whole = received(&scenario, &repository);
+    let mut session = Session::new(&ADVERTISED, &HIDDEN);
+    let mut read = session.input(scenario.request, &repository, &mut unbounded());
+    if read == Ok(false) {
+      read = session.end(&repository, &mut unbounded());
+    }
+    let (packed, objects) = (session.is_checking(), objects_of(&scenario, &repository));
+    let (turns, checked) = checked_in_turns(&mut session, &repository);
+    assert_eq!((read, checked), (Ok(true), Ok(true)), "{}", scenario.name);
+    assert!(
+      !packed || turns >= objects,
+      "{}: {turns} turns, {objects} objects",
+      scenario.name
+    );
+    let mut written = Vec::new();
+    let mut policy = git_policy(&repository);
+    let answered = session.answer(&mut policy, &mut written, &mut unbounded());
+    assert_eq!(answered, Ok(Some(whole.clone())), "{}", scenario.name);
+    assert_eq!(written, answer_to(&whole), "{}", scenario.name);
+  }
 }

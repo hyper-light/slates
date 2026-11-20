@@ -64,6 +64,7 @@
 //! packet not yet whole is held up to git's 65520 bytes.
 
 mod advertisement;
+mod checking;
 mod connect;
 pub mod fsck;
 pub mod protected;
@@ -73,6 +74,7 @@ mod session;
 pub mod works;
 
 pub use advertisement::{Advertised, write_advertisement};
+pub use checking::Checking;
 pub use connect::{Connected, connectivity};
 pub use report::{message, write_hook_words, write_report, write_report_end, write_report_held};
 pub use request::{Command, Request, RequestReader, Requested};
@@ -414,15 +416,16 @@ where
   let unpacked = request.wants_pack().then(|| {
     let mut pack = unpack::Reader::new(advertised.format, &NO_INDEX);
     let read = pack.read(bytes.get(took..).unwrap_or_default(), admission);
-    checked_pack(pack, read.map(|_| ()), repository, admission)
+    finished_pack(pack, read.map(|_| ()), repository, admission)
   });
   let checked = check(request, unpacked, repository, hidden, admission)?;
   decide(checked, judge, admission)
 }
 
 /// The pack's outcome once its bytes have ended or been refused (`read`): finished with its bases
-/// from `repository`, then every object checked; or refused, with the objects its header counted.
-fn checked_pack<R: Repository + ?Sized>(
+/// from `repository`; or refused, with the objects its header counted. Its objects are checked by
+/// [`check`] (or [`Checking`] a turn at a time).
+fn finished_pack<R: Repository + ?Sized>(
   reader: unpack::Reader<'_, NoIndex>,
   read: Result<(), unpack::Refusal>,
   repository: &R,
@@ -431,14 +434,9 @@ fn checked_pack<R: Repository + ?Sized>(
   let objects = reader.objects();
   let refused = |why| PackRefused { objects, why };
   read.map_err(|refusal| refused(PackRefusal::Unpack(refusal)))?;
-  let format = reader.format();
-  let unpacked = reader
+  reader
     .finish_with(&Bases(repository), admission)
-    .map_err(|refusal| refused(PackRefusal::Unpack(refusal)))?;
-  if let Some((id, finding)) = fsck::first_refusal(&unpacked.objects, format) {
-    return Err(refused(PackRefusal::Fsck { id, finding }));
-  }
-  Ok(unpacked)
+    .map_err(|refusal| refused(PackRefusal::Unpack(refusal)))
 }
 
 /// A push read and checked, before any verdict: its request, its pack's objects or why the pack was
@@ -467,9 +465,10 @@ impl Checked {
   }
 }
 
-/// Checks a read push: every command `unpacker error` after a refused pack; otherwise each new
-/// tip's connectivity against `repository`, then each ref against `hidden`. The tables made on the
-/// way are charged to `admission` before they are made.
+/// Checks a read push: every command `unpacker error` after a refused pack, or after an object
+/// git's checks refuse (git's `transfer.fsckObjects`); otherwise each new tip's connectivity against
+/// `repository`, then each ref against `hidden`. The tables made on the way are charged to
+/// `admission` before they are made. The checks run whole: [`Checking`] makes them a turn at a time.
 pub fn check<R, H>(
   request: Request,
   unpacked: Option<Result<Unpacked, PackRefused>>,
@@ -481,37 +480,7 @@ where
   R: Repository + ?Sized,
   H: HiddenRefs + ?Sized,
 {
-  let count = request.commands.len();
-  let mut early = charged_vec(count, admission)?;
-  let objects = match &unpacked {
-    Some(Ok(unpacked)) => unpacked.objects.as_slice(),
-    Some(Err(_)) => {
-      early.extend((0..count).map(|_| Some(refused(UNPACKER_ERROR, None))));
-      return Ok(Checked {
-        request,
-        unpacked,
-        early,
-        by_id: Vec::new(),
-      });
-    }
-    None => &[],
-  };
-  let pushed = Pushed::new(objects, admission)?;
-  let connected = connectivity(&request, &pushed, repository, admission)?;
-  early.extend(
-    request
-      .commands
-      .iter()
-      .zip(&connected)
-      .map(|(command, connected)| early_refusal(command, *connected, hidden)),
-  );
-  let by_id = pushed.by_id;
-  Ok(Checked {
-    request,
-    unpacked,
-    early,
-    by_id,
-  })
+  Checking::new(request, unpacked).checked(repository, hidden, admission)
 }
 
 /// Decides a checked push: each command no check refused has `judge`'s verdict and then its append,

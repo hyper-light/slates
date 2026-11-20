@@ -23,6 +23,8 @@ use super::{Pushed, Refusal, Repository, Request, reserve};
 use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::objects::{self, ObjectRefused, commit::Commit, tag::Tag, tree::Tree};
+use crate::store::hook_view::Quantum;
+use crate::store::learn::Clock;
 use crate::unpack::Object;
 
 /// Whether a command's new tip is connected; worse states order later.
@@ -52,48 +54,152 @@ enum Mark {
 
 /// Each command's connectivity, in order: a delete is `Complete`; a new tip pushed has its walk's
 /// state; a new tip not pushed is `Complete` when the repository holds it and `Missing` otherwise.
+/// The walk run whole ([`Walk`], one turn with no end to its quantum).
 pub fn connectivity<R: Repository + ?Sized>(
   request: &Request,
   pushed: &Pushed<'_>,
   repository: &R,
   admission: &mut Admission,
 ) -> Result<Vec<Connected>, Refusal> {
-  let states = states(request, pushed, repository, admission)?;
-  let mut connected = Vec::new();
-  reserve(&mut connected, request.commands.len())?;
-  for command in &request.commands {
-    let state = match pushed.position(&command.new) {
-      _ if command.is_delete() => Connected::Complete,
-      Some(at) => states.get(at).copied().unwrap_or(Connected::Missing),
-      None if repository.holds(&command.new) => Connected::Complete,
-      None => Connected::Missing,
-    };
-    connected.push(state);
-  }
-  Ok(connected)
+  let mut walk = Walk::new(request, pushed, admission)?;
+  let mut stopped = Stopped;
+  while !walk.turn(
+    (request, pushed, repository),
+    admission,
+    unbounded(&mut stopped),
+  )? {}
+  walk.connected(request, pushed, repository)
 }
 
-/// Each pushed object's state: its own edges out of the pack judged, then the worst of everything
-/// it reaches.
-fn states<R: Repository + ?Sized>(
-  request: &Request,
-  pushed: &Pushed<'_>,
-  repository: &R,
-  admission: &mut Admission,
-) -> Result<Vec<Connected>, Refusal> {
-  let objects = pushed.objects();
-  let count = objects.len();
-  admission
-    .charge_items::<Connected>(count)
-    .map_err(Refusal::PastAdmission)?;
-  let mut states = Vec::new();
-  reserve(&mut states, count)?;
-  states.resize(count, Connected::Complete);
-  let shallow = sorted(&request.shallow, admission)?;
-  let mut inside = 0usize;
-  for (at, object) in objects.iter().enumerate() {
-    let shallow_commit = shallow.binary_search(&object.id).is_ok();
+/// A quantum over `stopped` with no end: a whole walk in one turn.
+pub(crate) fn unbounded(stopped: &mut Stopped) -> Quantum<'_> {
+  Quantum {
+    clock: stopped,
+    ns: u64::MAX,
+  }
+}
+
+/// A clock that never moves: a quantum over it never ends.
+#[derive(Debug, Default)]
+pub(crate) struct Stopped;
+
+impl Clock for Stopped {
+  fn now_ns(&mut self) -> u64 {
+    0
+  }
+}
+
+/// Where a walk stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+  /// Each object's own edges out of the pack judged, and the edges among the pushed objects counted.
+  States,
+  /// The edges among the pushed objects kept, each object's run of targets.
+  Edges,
+  /// The worst state carried back over the edges.
+  Propagate,
+  /// Every object's state is final.
+  Done,
+}
+
+/// The connectivity check made a turn at a time (A-719; the module docs): every pushed object read
+/// once a pass in pack order, each turn for its quantum and at least one object, then the states
+/// carried back over the edges. Its tables are charged to the admission before they are made, as
+/// the whole check charges them.
+#[derive(Debug)]
+pub(crate) struct Walk {
+  /// The commits the client called shallow, sorted.
+  shallow: Vec<ObjectId>,
+  /// Each pushed object's state, in pack order.
+  states: Vec<Connected>,
+  /// The edges among the pushed objects, counted by the first pass.
+  inside: usize,
+  /// Each object's run of targets: its bounds, one more than the objects.
+  offsets: Vec<usize>,
+  /// The targets, by position.
+  targets: Vec<usize>,
+  /// The pass under way.
+  pass: Pass,
+  /// The next object of the pass.
+  at: usize,
+}
+
+impl Walk {
+  /// A walk of `pushed`, the objects `request`'s pack brought, its state table and the sorted
+  /// shallow commits charged to `admission` first.
+  pub(crate) fn new(
+    request: &Request,
+    pushed: &Pushed<'_>,
+    admission: &mut Admission,
+  ) -> Result<Walk, Refusal> {
+    let count = pushed.objects().len();
+    admission
+      .charge_items::<Connected>(count)
+      .map_err(Refusal::PastAdmission)?;
+    let mut states = Vec::new();
+    reserve(&mut states, count)?;
+    states.resize(count, Connected::Complete);
+    Ok(Walk {
+      shallow: sorted(&request.shallow, admission)?,
+      states,
+      inside: 0,
+      offsets: Vec::new(),
+      targets: Vec::new(),
+      pass: Pass::States,
+      at: 0,
+    })
+  }
+
+  /// One turn of the walk over `request`'s `pushed` objects and `repository`, for `quantum` and at
+  /// least one unit of work: whether the walk is done.
+  pub(crate) fn turn<R: Repository + ?Sized>(
+    &mut self,
+    (request, pushed, repository): (&Request, &Pushed<'_>, &R),
+    admission: &mut Admission,
+    quantum: Quantum<'_>,
+  ) -> Result<bool, Refusal> {
+    let Quantum { clock, ns } = quantum;
+    let begun = clock.now_ns();
+    while self.pass != Pass::Done {
+      self.unit((request, pushed, repository), admission)?;
+      if clock.now_ns().saturating_sub(begun) >= ns {
+        break;
+      }
+    }
+    Ok(self.pass == Pass::Done)
+  }
+
+  /// One unit of the walk: one object of a pass, a pass's end, or the propagation whole.
+  fn unit<R: Repository + ?Sized>(
+    &mut self,
+    (request, pushed, repository): (&Request, &Pushed<'_>, &R),
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    let object = pushed.objects().get(self.at);
+    match (self.pass, object) {
+      (Pass::States, Some(object)) => self.judge(object, (request, pushed, repository))?,
+      (Pass::States, None) => self.begin_edges(pushed.objects().len(), admission)?,
+      (Pass::Edges, Some(object)) => self.keep_edges(object, request.format, pushed)?,
+      (Pass::Edges, None) => self.pass = Pass::Propagate,
+      (Pass::Propagate, _) => {
+        propagate(&mut self.states, &self.offsets, &self.targets, admission)?;
+        self.pass = Pass::Done;
+      }
+      (Pass::Done, _) => {}
+    }
+    Ok(())
+  }
+
+  /// The first pass's object: its own edges out of the pack judged, those among the pushed objects
+  /// counted.
+  fn judge<R: Repository + ?Sized>(
+    &mut self,
+    object: &Object,
+    (request, pushed, repository): (&Request, &Pushed<'_>, &R),
+  ) -> Result<(), Refusal> {
+    let shallow_commit = self.shallow.binary_search(&object.id).is_ok();
     let mut state = Connected::Complete;
+    let mut inside = self.inside;
     let read = for_each_edge(object, request.format, &mut |target, parent| {
       if pushed.position(&target).is_some() {
         inside = inside.saturating_add(1);
@@ -105,13 +211,70 @@ fn states<R: Repository + ?Sized>(
         });
       }
     })?;
-    if let Some(slot) = states.get_mut(at) {
+    self.inside = inside;
+    if let Some(slot) = self.states.get_mut(self.at) {
       *slot = if read { state } else { Connected::Missing };
     }
+    self.at = self.at.saturating_add(1);
+    Ok(())
   }
-  let (offsets, targets) = edges(pushed, request.format, inside, admission)?;
-  propagate(&mut states, &offsets, &targets, admission)?;
-  Ok(states)
+
+  /// The second pass begun: its tables, for `count` objects and the edges the first counted,
+  /// charged before they are made.
+  fn begin_edges(&mut self, count: usize, admission: &mut Admission) -> Result<(), Refusal> {
+    let bounds = count.saturating_add(1);
+    admission
+      .charge_items::<usize>(bounds.saturating_add(self.inside))
+      .map_err(Refusal::PastAdmission)?;
+    reserve(&mut self.offsets, bounds)?;
+    reserve(&mut self.targets, self.inside)?;
+    self.offsets.push(0);
+    self.pass = Pass::Edges;
+    self.at = 0;
+    Ok(())
+  }
+
+  /// The second pass's object: its run of targets among the pushed objects kept.
+  fn keep_edges(
+    &mut self,
+    object: &Object,
+    format: ObjectFormat,
+    pushed: &Pushed<'_>,
+  ) -> Result<(), Refusal> {
+    let targets = &mut self.targets;
+    for_each_edge(object, format, &mut |target, _| {
+      if let Some(at) = pushed.position(&target)
+        && targets.len() < targets.capacity()
+      {
+        targets.push(at);
+      }
+    })?;
+    self.offsets.push(self.targets.len());
+    self.at = self.at.saturating_add(1);
+    Ok(())
+  }
+
+  /// Each command's connectivity once the walk is done ([`connectivity`]'s answer), charged a
+  /// state a command.
+  pub(crate) fn connected<R: Repository + ?Sized>(
+    &self,
+    request: &Request,
+    pushed: &Pushed<'_>,
+    repository: &R,
+  ) -> Result<Vec<Connected>, Refusal> {
+    let mut connected = Vec::new();
+    reserve(&mut connected, request.commands.len())?;
+    for command in &request.commands {
+      let state = match pushed.position(&command.new) {
+        _ if command.is_delete() => Connected::Complete,
+        Some(at) => self.states.get(at).copied().unwrap_or(Connected::Missing),
+        None if repository.holds(&command.new) => Connected::Complete,
+        None => Connected::Missing,
+      };
+      connected.push(state);
+    }
+    Ok(connected)
+  }
 }
 
 /// A sorted copy of `ids`, charged first.
@@ -124,37 +287,6 @@ fn sorted(ids: &[ObjectId], admission: &mut Admission) -> Result<Vec<ObjectId>, 
   sorted.extend_from_slice(ids);
   sorted.sort_unstable();
   Ok(sorted)
-}
-
-/// The edges among the pushed objects, `inside` of them, as each object's run of targets: the runs'
-/// bounds (one more than the objects) and the targets, by position, charged before they are made.
-fn edges(
-  pushed: &Pushed<'_>,
-  format: ObjectFormat,
-  inside: usize,
-  admission: &mut Admission,
-) -> Result<(Vec<usize>, Vec<usize>), Refusal> {
-  let objects = pushed.objects();
-  let bounds = objects.len().saturating_add(1);
-  admission
-    .charge_items::<usize>(bounds.saturating_add(inside))
-    .map_err(Refusal::PastAdmission)?;
-  let mut offsets = Vec::new();
-  reserve(&mut offsets, bounds)?;
-  let mut targets = Vec::new();
-  reserve(&mut targets, inside)?;
-  offsets.push(0);
-  for object in objects {
-    for_each_edge(object, format, &mut |target, _| {
-      if let Some(at) = pushed.position(&target)
-        && targets.len() < targets.capacity()
-      {
-        targets.push(at);
-      }
-    })?;
-    offsets.push(targets.len());
-  }
-  Ok((offsets, targets))
 }
 
 /// Hands each object `object` names to `each`, with whether it is a commit's parent: whether the
