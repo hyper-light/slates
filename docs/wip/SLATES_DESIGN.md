@@ -57680,6 +57680,25 @@ volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardSt
   served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
   fleet tests unchanged.
 
+### §4.8 amended — A dispatch's stragglers are waited for by their own reports' wakes, never a tick or a poll interval at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family two of three)
+Applied in the same change to: §4.8 "Lookup" (a location round's stragglers), GAPS (the sweep's line),
+`crates/cluster/src/lib.rs` (`Stragglers::reported`, `waits`, `settle`, the collector kept), `crates/cluster/tests/live.rs`,
+`crates/server/src/owner_location.rs` (`ask`).
+- **What was there.** A dispatch's reply channel already wakes its collector, the task that dispatched, at every send
+  (`ReplyTx::send`), but the waits for its stragglers did not use it: `Stragglers::settle`, which a live lane runs
+  before its task ends, looked once a timer tick; a location round's straggler loop looked once a poll interval (a
+  tenth of a period, 10 ms), so a report landing just after a look waited out the rest of it.
+- **Change.** `Stragglers` keeps its collector's task, read where the dispatch made it. `Stragglers::reported(left)` waits
+  until a straggler may have reported: in the collector, until its next send wakes it (`futures::idle` within `left`);
+  in any other task, which the sends do not wake, one timer tick, as before. `settle` and the location round wait so;
+  the round stops once its span is spent. `Stragglers::waits` counts the waits each way, the test's non-vacuity count.
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20). `slates-cluster --test live
+  a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back` now holds the settle to its reports' wakes (woken
+  at least once, ticked never) as well as every session back; `slates-cluster --lib` 247 of 247. The server's
+  `owner_location` lib tests, fmt and the red (the collector's wake disabled: the lane test must fail on its ticks) ran
+  on a kiln runner, this Mac being at 7 GiB free; their results are in the landing's commit.
+
+
 ### A-779 — A newer presentation of a volume into a target supersedes the older, whose grant is refused by kind (2026-11-20, w-sessionlog; main's ruling 15:20 PST; §4.15 steps 2–3; AUD-29-07, A-773, R3, R10)
 Until A-779 only the same client's re-presentation replaced its earlier one, in the shard's memory alone: the earlier
 record still read `AwaitingGrant` (so the session log listed it), and another client's re-presentation left it

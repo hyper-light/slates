@@ -43,6 +43,15 @@
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
 > - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
 >   the reserve's per-pass run list removed with the reserve (A-777).
+> - The anchor segment (45.9 GB mapped on the big Studio, 23 shards): each partition's log ring is `table_bytes` and each
+>   of its two snapshot slots twice that, a share of `reserve_per_shard` (`config.rs`), where `Geometry`'s own docs say
+>   "recovery budget x measured replay throughput" and "the measured partition state size x the growth headroom"
+>   (drift; no replay rate is measured). Address space only (backed where written). -> With the content extents
+>   proposal (main's inbox): sized from the measured state, grown by new regions.
+> - Allocations per NFS request (by reading, `bridge-nfs`): each procedure builds its results in a fresh `XdrWriter`
+>   (31 in `procedures.rs`, 15 in `multi.rs`, the v4 compound), and `reply_record` frames them into a second `Vec`,
+>   copying the results once (a READ's data). Some replies are kept (`nfs_replay::record`, `hold_reply`). -> Write into
+>   the connection's own buffer behind a reserved header; keep a reply by moving that buffer out only when it is kept.
 >
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
@@ -2224,6 +2233,11 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **A-772, svnsync's replay (2026-11-20, w-svn; main's order after w-interop's matrix r10: 0.54 s a revision of
+> git-2000.dump, 2,511 MiB peak against the 447 MiB dump):** the drive's share measured and fixed by w-perf's per-reader
+> `WindowCache` (b51f908f2): `replay_bench` 328 s to 1.82 s for r1..r2000 (BENCHMARKS), held by
+> `a_replay_makes_each_delta_window_a_bounded_number_of_times`. Owed: the server's per-turn cost (~960 one-step turns a
+> revision) and the peak against the dump, measured through the daemon's SSH site next.
 > **A-766, DeltaV v1 (2026-11-20, w-svn; clients without HTTPv2: svn before 1.7, and 1.7+ where OPTIONS has no v2
 > headers):** part 1 BUILT, the read side as `mod_dav_svn` 1.14.x answers it: `!svn/vcc/default` (its `checked-in` the
 > youngest baseline; the v1 update-report's target, its hrefs version resources), `!svn/bln/REV` (`D:baseline`, its
@@ -4997,8 +5011,8 @@
 > that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
-> pace between looks). Owed from that sweep, each with its own wake: a broadcast's stragglers (`owner_location.rs`), a
-> FUSE mount helper's exit (`fuse.rs`); the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
+> pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
+> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
