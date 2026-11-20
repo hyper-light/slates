@@ -1245,6 +1245,8 @@
 > Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one waits on the pushes
 > over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
 > (A-679, built) reads as the HTTP site does (A-680).
+> Stock hg 7.2's clone over the SSH edge runs (w-interop, 2026-11-20): `stock_hg_clones_over_the_ssh_edge`, an empty
+> repository cloned and pulled, host key checked strictly (macOS arm64, Mac Studio, kiln r3: 1 of 1, fmt clean).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
