@@ -11,6 +11,8 @@
 //! UUID. Every revision, an import's or a client's, is committed by one step ([`Repository::check`], then
 //! [`Repository::apply`]; A-655). A repository
 //! `CreateRepository` made (A-575) starts as [`Repository::new`] leaves one: revision 0, an empty root, `svn:date`.
+//! The records are the read source the server's front ends read a repository through (A-681:
+//! `crate::reads::Repository` and `crate::mergeinfo::Contents`), a directory's entries from the index's listing.
 //!
 //! **Import** ([`Importer`]) reads a dump through A-593's reader as its bytes arrive and makes each revision as FSFS
 //! makes it through `load-fs-vtable.c`: a transaction on the youngest revision, each record's action applied to it
