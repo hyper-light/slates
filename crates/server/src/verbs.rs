@@ -8811,6 +8811,28 @@ fn edit(
   ReplyBody::Edited
 }
 
+/// [`edit`] for a mounted work's declaration (A-774, `crate::mounted_work`): the splice `(at, delete_len)` with `bytes`.
+pub(crate) fn edit_op(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  path: &str,
+  (at, delete_len): (u64, u64),
+  bytes: &[u8],
+) -> ReplyBody {
+  edit(state, principal, work, path, at, delete_len, bytes)
+}
+
+/// [`declare`] for a mounted work's declaration (A-774, `crate::mounted_work`).
+pub(crate) fn declare_op(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  op: WorkOp,
+) -> ReplyBody {
+  declare(state, principal, work, op)
+}
+
 /// Records a change to `work` in its log, in the verb's transaction (A-207; D-18: an acknowledged change survives a
 /// daemon restart; `crate::work_log`), after charging the `added` bytes it brings: refused, with nothing changed, when
 /// the partition's merge budget cannot hold the entry or the budget cannot cover the bytes.
@@ -9761,6 +9783,10 @@ fn submit(
       Ok((record, green)) => (record.id, green),
       Err(refusal) => return refused(refusal),
     };
+  // A mounted work's journal is its changeset: what its mount changed is declared first (A-774).
+  if let Err(refusal) = crate::mounted_work::declare_mount(state, principal, work) {
+    return refused(refusal);
+  }
   let reply = match state.work_home.verdict.take() {
     Some(reply) => {
       // The owner's verdict on a submit the work recorded as pending (A-247): settled here, in this transaction.
@@ -11806,6 +11832,14 @@ fn attach(
   if matches!(record.policy.role, Role::Green { .. }) {
     return crate::merge_service::attach_green(state, client_id, principal, &record, intent, &form);
   }
+  // A work mounts like any volume (A-774): its slot is made here, so every bridge (FUSE, NFS, WinFsp) serves it.
+  if matches!(record.policy.role, Role::Work { .. })
+    && !crate::mounted_work::ensure_slot(state, record.id)
+  {
+    return refused(Refusal::Unsupported {
+      feature: "a mount of a work whose green's base this shard cannot read".to_owned(),
+    });
+  }
   let rights = rights_of(&record, principal);
   if !permits(rights, intent) {
     return forbidden("attach");
@@ -13805,7 +13839,7 @@ fn record_unrecovered_destroy(
 /// teardown): its byte reservation, a bounded claim's inode allowance or a dynamic volume's version
 /// hold (so the version slab is never over-offered; A-342), its records' metadata reservation, and the
 /// growth a dynamic volume acquired from the shard budget as it wrote.
-fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
+pub(crate) fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
   // The volume's hold on its seal key goes with it (A-208); its sealed chunks hold the key while any of them lives.
   if !crate::content_cipher::release_seal_key(&mut state.store, slot.volume.seal_key()) {
     state.count(crate::content_cipher::KEY_RELEASE_REFUSED, 1);

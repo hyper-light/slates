@@ -11195,6 +11195,18 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > linearizable and the fast-path counter equal to the oracle's disjoint count
 > (`crates/merge/tests/shuttle_green.rs`).
 
+> **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
+> (`crates/server/src/mounted_work.rs`; GAP-A9-14): a work's first attach or mount makes a slot under its own id
+> holding its files over its base, served by every bridge, and snapshotted as the mount's base; a submit first
+> declares what the mount changed since that base (the deriver names the touched paths, each file declared as the one
+> splice between the work's bytes and the mount's, so an editor's temp-and-rename save is the span it changed), then
+> runs as any submit. `land` of a green lands its head through a store-backed view under the green's id, presented
+> and granted as any volume's landing (R10). By use (`crates/server/tests/mounted_work.rs`): ten editors on ten
+> mounted works over one green, saving by temp file and rename over the daemon's NFS, submit with no declaration:
+> accepted, identical and conflict as the edits call for; a grant lands the head, equal to the oracle. Owed: the
+> mount's seed copies the work's files (copy-on-write base, w-work-cow), the slot and unsubmitted mount writes do not
+> survive a restart, a mount is not refreshed when its work's base moves, several spans a file (D-O17, w-rewrite-ops).
+
 > **Status (2026-09-13).** The pure core is a green-volume *service* (`crates/server/src/merge_service.rs`;
 > GAP-A9-14): every verb enforces the catalog role — an edit, declaration, write attachment, snapshot or
 > resize of a green refuses `ReadOnlyVolume`, a work verb on a plain volume `NotWork`, a green verb on a

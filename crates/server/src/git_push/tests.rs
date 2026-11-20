@@ -906,15 +906,21 @@ fn script(point: HookPointName, name: &str, body: &str) -> Script {
   Script { _dir: dir, config }
 }
 
-/// Shape: how long a test waits for a push whose hooks run: a test's bound (`git_hooks::tests::TEST_BOUND_NS`, ten
-/// liveness budgets) for each of its three hooks and one for the push itself. Unix alone, as its one reader is.
-#[cfg(unix)]
-const PUSH_WAIT_NS: u64 = 4 * 10 * crate::daemon::LIVENESS_BUDGET_NS;
-
 /// What a push driven with its hooks answered: what the driver wrote, what it received, and how
 /// many views the presenter showed and withdrew; or why the drive stopped.
 #[cfg(unix)]
 type Driven = Result<(Vec<u8>, Received, (u32, u32)), String>;
+
+/// What the driver of a push with its hooks tells its test as it goes: each step it took or hook it ran, then the end.
+/// The test's deadline is derived from these (the push's own answer): a test's bound for each, so a push of more steps
+/// is waited for longer and one that stops is given up on one bound after its last.
+#[cfg(unix)]
+enum Progress {
+  /// A step of the push taken, or one of its hooks run.
+  Went,
+  /// The push answered, or its drive stopped.
+  Done(Driven),
+}
 
 /// `request` pushed to `repository` by its owner as the HTTP edge pushes one
 /// (`vcs_http::git::receive`): a task on the daemon's shard drives the push a step at a time, the
@@ -929,20 +935,44 @@ fn pushed_with_hooks(daemon: &crate::Daemon, repository: RepositoryId, request: 
       slates_rt::futures::spawn(drive(repository, request, sent)).expect("the push's task");
     slates_rt::futures::detach(task).expect("the task detached");
   });
-  got
-    .recv_timeout(std::time::Duration::from_nanos(PUSH_WAIT_NS))
-    .unwrap_or_else(|_| Err("the push did not answer within the test's bound".to_owned()))
+  // Each step or hook within a test's bound (`git_hooks::tests::TEST_BOUND_NS`, ten liveness budgets) of the last: the
+  // deadline the push's own steps make, never a fixed whole.
+  let bound = std::time::Duration::from_nanos(crate::git_hooks::tests::TEST_BOUND_NS);
+  let mut went = 0u64;
+  loop {
+    match got.recv_timeout(bound) {
+      Ok(Progress::Went) => went += 1,
+      Ok(Progress::Done(driven)) => return driven,
+      Err(_) => {
+        return Err(format!(
+          "the push went no further within the test's bound after {went} steps"
+        ));
+      }
+    }
+  }
 }
 
-/// Drives the push of [`pushed_with_hooks`] and sends what it answered on `sent`.
+/// Drives the push of [`pushed_with_hooks`], telling `sent` of each step, then what it answered.
 #[cfg(unix)]
-async fn drive(repository: RepositoryId, request: Vec<u8>, sent: std::sync::mpsc::Sender<Driven>) {
-  let _ = sent.send(driven(repository, &request).await);
+async fn drive(
+  repository: RepositoryId,
+  request: Vec<u8>,
+  sent: std::sync::mpsc::Sender<Progress>,
+) {
+  let driven = driven(repository, &request, &sent).await;
+  let _ = sent.send(Progress::Done(driven));
 }
 
-/// The push of [`pushed_with_hooks`], driven.
+/// The push of [`pushed_with_hooks`], driven, `progress` told of each step and hook.
 #[cfg(unix)]
-async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
+async fn driven(
+  repository: RepositoryId,
+  request: &[u8],
+  progress: &std::sync::mpsc::Sender<Progress>,
+) -> Driven {
+  let went = || {
+    let _ = progress.send(Progress::Went);
+  };
   use crate::state::with_state;
   let presenter = crate::git_hooks::tests::ScratchPresenter::default();
   let mut push = with_state(|state| {
@@ -960,6 +990,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
     with_state(|state| push.input(state, piece))
       .ok_or("no state for the request")?
       .map_err(|failed| format!("not taken: {failed:?}"))?;
+    went();
   }
   with_state(|state| push.end(state))
     .ok_or("no state for the end")?
@@ -969,6 +1000,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
     let step = with_state(|state| push.answer_step(state, &mut answer))
       .ok_or("no state for a step")?
       .map_err(|failed| format!("a step failed: {failed:?}"))?;
+    went();
     match step {
       Answering::Answered(received) => break *received,
       Answering::Turned => slates_rt::futures::yield_now().await,
@@ -977,6 +1009,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
         with_state(|state| push.hook_ran(state, ran, &mut answer))
           .ok_or("no state for the hook's answer")?
           .map_err(|failed| format!("its answer not taken: {failed:?}"))?;
+        went();
       }
     }
   };
