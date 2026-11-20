@@ -111,3 +111,14 @@
 - jupiter: no NASM -> server builds need AWS_LC_SYS_PREBUILT_NASM=1 there (check builds only).
 - Slips this stretch: a retry loop with a `git reset --soft` fallback (never ran); noted.
 - Next: B14 (takeover-kept files at a real Linux mount's end, test gap), then the upcase table, then bug-claims open.
+- A-737 (claimed; Windows' own upcase table) on branch agents/w-bugs-a737 (wip bfdc82eed, worktree ~/slates-work/w-bugs-a725
+  which also carries B14's wip test commit -- land each from its net diff). Windows' table dumped on CI x64 build 26100
+  + arm64 build 26200 (identical, 973 mapped, no many-to-one: final sigma kept apart; diag-w-bugs-upcase-1). vfs
+  upcase/names 9/9, bridge-winfsp normalized 7/7 on Mac. Windows check run: diag-w-bugs-lib-737 (pending).
+  Slip: a sed renaming A-726->A-737 hit another agent's A-726 refs in crates/svn + cli test; restored from HEAD by
+  `git show HEAD:path > path` before any commit.
+- B14: new test a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends FAILS in green too
+  (CI ubuntu kernel 7.0: 1,048,576 B stay referenced after lazy unmount + close; red arm the same). Hypothesis: an
+  ordinary FUSE mount's end (no FUSE_DESTROY) never sweeps the attachment's restored lookup references
+  (end_attachment only ends the takeover holder; sweep_attachment only from FUSE_DESTROY). diag-w-bugs-b14-green-2:
+  status at the end + the same without a takeover.
