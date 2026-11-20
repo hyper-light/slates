@@ -12653,6 +12653,23 @@ engine: the verdict, rebase, position mapping, the register).
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
+> **Status (2026-11-19, A-684: the daemon starts the SSH edge).** `slates anchor|daemon --vcs-ssh ADDRESS` (a library
+> starter's `StartSpec::vcs_ssh`, contract 56) starts A-651's edge in the daemon beside the HTTP edge: its listener and
+> connection tasks on the control shard under the shard's seats, an edge state kept on every shard so a connection moves
+> to its repository's owner (A-651 part 4), keys proved by the credential record (A-651 part 3), and the services as
+> the server has them: git's upload-pack from each repository's store through A-682's lender (`ShardStores`) and
+> Mercurial's `serve --stdio` from its served view (`ServedViews`, A-679), and git's receive-pack through the push
+> driver on the owner shard since A-683 (`ThisShard` lending its state); Subversion's tunnel (A-688's `SvnServices`,
+> which awaits a lender of its stores) refused as not served. Any IPv4 address is taken: SSH encrypts every connection. The host key, on main's ruling: a fleet node presents its own
+> key from its plan when the key is Ed25519, the edge's one host key algorithm, and starts no SSH edge otherwise,
+> logged; any other anchor makes an Ed25519 key from the system's generator at its start and keeps its seed in the
+> segment's supervision block, on the page it locks (`SUP_SSH_HOST_SEED`), beside the listener it binds once and hands
+> over (`ENV_VCS_SSH`), so a daemon restart keeps the port and the key a client pinned; a daemon run alone makes its own
+> for its life. It adopts a held listener by the rule the HTTP edge's and svn:// listener's share
+> (`daemon::held_or_bound_listener`). The daemon's log names the
+> address and the key's OpenSSH fingerprint before it says it serves. The other services and main's live OpenSSH
+> interop are owed.
+>
 > **Status (2026-11-19, A-651 part 4: the SSH edge serves a repository from its owner shard).** An `exec` that names a
 > repository another shard's partition holds moves its connection there, as the HTTP edge moves one once a head names
 > its repository (main's ruling, A-625 part 3): the site locates the repository by its name's route (D-14), and the
@@ -12663,7 +12680,7 @@ engine: the verdict, rebase, position mapping, the register).
 > repository's record, policy and store are read with no crossing. Each shard keeps its own edge state, and only the
 > listener's holds the host key. Subversion's tunnel names its repository in its greeting, not its `exec`, so it is
 > served where it was accepted until its own move (A-688). Keeping an edge state on every shard as the daemon starts
-> the edge is A-684's.
+> the edge is A-684's (built).
 >
 > **Status (2026-11-19, A-651 part 3: the SSH edge proves a key by the credential record).** A key the session cannot
 > answer for at once waits for the record: the edge's key holders (`RecordKeys`, which replaced `NoKeyRecord`) answer
@@ -12674,7 +12691,8 @@ engine: the verdict, rebase, position mapping, the register).
 > record proves its principal only when it is an SSH key of the same bytes, live on the wall clock. As the HTTP edge
 > asks, a consumer's key proves the consumer only while it is enrolled and not revoked (§4.13). Anything else is nobody,
 > a lookup the record could not answer included, each counted by its reason. The user name plays no part. The daemon
-> starting the edge, the stores and main's live OpenSSH `git clone` with an enrolled key are owed.
+> starting the edge, the stores and main's live OpenSSH `git clone` with an enrolled key are owed (the daemon's start,
+> closed by A-684).
 >
 > **Status (2026-11-19, A-651 part 2: git's upload-pack behind the SSH edge).** `crates/server`'s `vcs_ssh::git` runs
 > A-640's one entry point over an SSH session's standard input and output, the store lent a step at a time by the HTTP
@@ -12702,7 +12720,7 @@ engine: the verdict, rebase, position mapping, the register).
 > connection with every seat taken, since an SSH connection waits on people (a key's passphrase after `PK_OK`, a host
 > key's confirmation) and on a push's compression. The key time is fed by authenticated connections' lifetimes. The
 > daemon starting the edge, the stores and the live OpenSSH `git clone` are owed (the key record, closed by A-651
-> part 3).
+> part 3; the daemon's start, by A-684).
 >
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
@@ -12913,7 +12931,10 @@ engine: the verdict, rebase, position mapping, the register).
 > the store keeps the sets as the values alone: its commit puts each version's sets, as its admission walked them, as
 > the version's value, held by the version's record, and it serves every version's D(k) and reached set from it
 > (`Repository::brought`, `Repository::reached`), an older version's reached set as well as the newest's; the chains'
-> copies are gone. A value names its sets' bytes as an object of any length (format 2), so no set is too large to keep.
+> copies are gone. Since A-647 part 4 each set is a tree of derived nodes over fixed blocks of positions, shaped by the
+> store's window (format 3): a block's runs kept relative to it and a range the set holds whole one node a level, so
+> the same set is the same root on every tier, no set is too large to keep, and a version's value adds to the store
+> only the nodes on the paths to the blocks its D(k) touches, never its reached set again.
 >
 > **Status (2026-11-19, A-664 part 2: a version's trees and commit as derived data, piece 13's first part).**
 > `crates/git` (`derived`) makes the git objects of a version the server turns into git's (§4.17.1 "A push is a work"
@@ -13279,7 +13300,8 @@ engine: the verdict, rebase, position mapping, the register).
 > 2.50.1's `create` push, sent over a real SSH session to the production site on an audit daemon's shard, is answered
 > with git's bytes, and `main` holds its tree. A connection reaches the repository's owner shard by A-651 part 4's move
 > before the command is made there. Owed: a push over a moved connection (a two-shard daemon, as the HTTP site's push
-> test runs), and a live `git push` over SSH with stock git's binary (main's run).
+> test runs), and a live `git push` over SSH with stock git's binary (main's run: `git_interop.rs`'s
+> `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`, its ignore lifted).
 
 > **Status (2026-11-19, A-640 part 4, first slice: a sparse filter's pattern list).** `crates/git`
 > (`negotiation::sparse`) reads the blob a `sparse:oid=<blob-ish>` filter names as git's `dir.c` reads it (the 100 MiB
@@ -14111,6 +14133,19 @@ signature verification).
 > as recorded from stock 7.2 (research §27). In the daemon the lender is `ServedViews` (A-680 part 2a, above); the
 > edge serves `hg` in tests alone until the daemon starts it with that lender (A-684's `--vcs-ssh <addr>`), and serves
 > reads alone: the session's `unbundle` waits for its piece.
+>
+> **Status (2026-11-19, A-691: `listkeys phases` lists the stored draft roots, a hidden one among them).**
+> `serve::Repository::draft_roots` answers the register's draft roots whose phase is still draft, read past the served
+> filter as 7.2's `listphases` reads them from the unfiltered changelog (`phases.py` 1049-1058), and `listkeys phases`
+> answers them: `serve::indexed::Indexed` takes them where its forward walk holds every changeset's phase from the
+> lowest root on, before the filter keeps what it serves. Before, the roots were computed over the served view, so a
+> draft root an amend hid was left out. Reproduced by use first (Mac Studio, stock 7.2 from PyPI, 2026-11-19):
+> `fixtures/state`'s `amended-root`, whose draft root was amended under evolution, answers `hg debugpushkey` of
+> `phases`, locally and over `hg serve`, with the hidden draft root and its successor, where slates' view answered the
+> successor alone. Proven on macOS arm64 (Mac Studio, kiln r411 red and r421 green, 2026-11-19; the other platforms
+> owed): `slates-hg --lib serve:: push::` 91 passed and 0 failed, `slates-server --lib repository::hg_push
+> vcs_http::tests::hg` 13 passed and 0 failed, fmt clean
+> (`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`).
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -45294,8 +45329,9 @@ anonymous share reads `is_multiple_of`; the case checker's revision lookup retur
     an index whose rows never change, a fill that walks up to the nearest kept ancestors and derives down a unit a
     step, and a version's map of paths to contents as its first type (part 1); A-614's D(k) and reached sets as a type,
     the store's outputs unchanged (part 2), then served from the values alone, the chains' copies dropped, every
-    version's sets answerable (part 3). A version's git trees and commit as types, the commit the server makes (A-664
-    part 2). Owed: A-553's and A-588's stores as types.)
+    version's sets answerable (part 3), each set kept as a tree of nodes over fixed blocks of positions, so a version's
+    value stores what it brought, never its reached set again (part 4). A version's git trees and commit as types, the
+    commit the server makes (A-664 part 2). Owed: A-553's and A-588's stores as types.)
   - **Merges computed anywhere, committed by position.** The verdict's work, rebasing a change over what landed since
     its base, is pure over immutable versions, so any node computes it. The owner only checks that the green is still
     at the position the result was computed against, and appends it (A-642's rule). A moved green costs only the
@@ -52888,6 +52924,193 @@ Applied in the same change to:
   served repository a reflog form names nothing, `@{0}` alone names `HEAD`'s commit, `@{1}` dies of an empty log,
   `@{upstream}` and `@{push}` die in git's words); `sparse:oid` within `combine:`.
 
+### A-684 — The daemon starts the SSH edge: `--vcs-ssh ADDRESS`, the anchor holding its listener and its Ed25519 host key across daemon restarts, a fleet node presenting its own key, and the daemon's log naming the address and the key's fingerprint (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 2; A-651's owed start; A-625 part 3 continued's two pieces for HTTP, mirrored)
+Applied in the same change to: §4.17.2's status (A-684's block; the daemon's start closed in A-651's and A-651 part 3's);
+GAPS (the §4.17 entry: A-684's line, A-651's owed lists, the stock-hg tests' waits); `crates/anchor`
+(`layout::SUP_SSH_HOST_PRESENT`, `SUP_SSH_HOST_SEED`, `SSH_HOST_SEED_BYTES`, both declared in the segment's layout,
+AUD-29-09; `AnchorSegment::publish_ssh_host_seed` and `ssh_host_seed`; `ENV_VCS_SSH`, `Supervisor::hold_vcs_ssh_listener` and its handover at each start); `crates/server`
+(`config::VcsSshConfig`, `DaemonConfig::vcs_ssh`, `EdgeIdentity::ed25519_seed`; `vcs_ssh::daemon_edge`, new, and its
+tests, the start keeping an edge state on every shard as A-651 part 4 asks; `daemon::VcsSshEdge`, `Daemon::vcs_ssh`,
+`bind_vcs_ssh_listener`, and the doc of `held_or_bound_listener`, A-689's one rule for a held listener, which the SSH
+edge adopts by too; `vcs_http`'s `bounds_of` and `ShardRepositories` shared with the SSH edge); `crates/api` (`ProcessOptions::vcs_ssh`, `role::vcs_ssh_address`, the
+roles' grammar and arguments, the anchor role's `publish_ssh_host_key` and `hold_vcs_ssh_listener`, the daemon role's
+configuration and log line; `StartSpec::vcs_ssh`; `CONTRACT` 56, after A-689's 54 and A-652 part 3's 55); `crates/cli` (the grammar and usage; `tests/cli.rs`:
+an SSH host key reader and the restart test, and the doc of g083's `VCS_SSH_LINE`); `docs/cli.md`, `docs/library.md`,
+`README.md`.
+- **What.** A-651 built the SSH edge and left its start owed: nothing ran it outside tests. `--vcs-ssh ADDRESS` on the
+  anchor's and the daemon's grammar, and a library starter's `StartSpec::vcs_ssh`, now start it in the daemon beside the
+  HTTP edge: A-651's listener and connection tasks on the control shard under the shard's seats, an edge state kept on
+  every other shard (`EdgeState::arrivals`, no host key) so an `exec` naming a repository another shard holds moves its
+  connection there (A-651 part 4), the site proving keys by the credential record (A-651 part 3's `RecordKeys`) and
+  locating repositories by their names' routes (`ShardRepositories`), and the services as the server has them
+  (`ToolServices` over the HTTP edge's lenders, on main's word as A-682 and A-679 landed: git's upload-pack from each
+  repository's store, `ShardStores`, and Mercurial's `serve --stdio` from its served view, `ServedViews`, on its owner
+  shard, each request admitted the edge's room; receive-pack (A-683) and Subversion's tunnel refused as not served, in
+  their tools' own words: A-688's `SvnServices` waits for a lender of Subversion's stores over A-662's map).
+- **Decisions.** (1) Any IPv4 address, on a fleet node or not: SSH encrypts every connection and proves the server by
+  its host key before a client sends anything of its own (RFC 4253 §7-§8), and a client proves itself by a signature,
+  never a secret sent (RFC 4252 §7), so no address leaves anything in the clear, as `--vcs-http`'s off loopback would. A
+  privileged port is refused by the system where it is privileged, which ends the anchor's start by name (R10). (2) The
+  host key, on main's ruling: a fleet node presents the node's own key, from the identity its plan hands in, as the
+  HTTP edge's TLS presents the node's certificate, when that key is Ed25519 (a PKCS#8 document, RFC 8410 §7, read by
+  AWS-LC), the one host key algorithm the edge has (`ssh-ed25519`, RFC 8709; §4.17.2). A node whose key is of another
+  algorithm (the P-256 keys `rcgen` mints by default, the kind lane's among them) starts no SSH edge, logged, rather
+  than present a key that is not the node's. (3) Any other anchor makes an Ed25519 key from the system's generator at
+  its start and publishes its seed in the segment's supervision block before any daemon starts, as it publishes the
+  launcher's secret: `SUP_SSH_HOST_SEED`, the cache line after the launcher secret, on the page the anchor locks for the
+  sealing root, in a process excluded from core dumps. Every daemon reads it there, so a restart keeps the key a
+  client's `known_hosts` pinned, and the key lives as long as the anchor, as the RAM the edge serves does. No
+  environment variable carries it, since every child would inherit one. (4) A daemon run alone, which no anchor
+  outlives, makes its own for its own life, as it binds its own listener; so does one under an anchor that published
+  none (an older anchor). (5) The anchor binds the listener once with the edge's own backlog (`bind_vcs_ssh_listener`,
+  the HTTP edge's bounds) and hands it over (`ENV_VCS_SSH`), as the HTTP edge's; the daemon adopts it by the one rule
+  A-689 made shared (`daemon::held_or_bound_listener`, which this piece had made the same way and dropped at the
+  merge), so a listener held elsewhere is refused for every edge. (6) The daemon's line names the address and the key's fingerprint as OpenSSH prints one
+  (`SHA256:` and the blob's hash in base64 without padding), before the line that says it serves, so a person compares
+  it with what `ssh` shows on first contact; it begins with the words g083's stock-hg test reads (`VCS_SSH_LINE`), its
+  port's digits first. (7) Each reason the edge cannot start (a node key that is not Ed25519, an unread segment, a
+  generator that refused, an address that does not bind, a held listener elsewhere) leaves the daemon serving
+  everything else, logged, as the HTTP edge's does.
+- **Tests.** macOS arm64 (Mac Studio, `cargo test --locked`, debug; `cargo fmt --check` clean for `slates-anchor`,
+  `-api`, `-cli` and `-server`). Red first (kiln r302, 2026-11-19 22:42-22:59Z, over stubs: the anchor published no
+  key and handed no SSH listener over, the roles and the command refused `--vcs-ssh`, a starter's anchor was not asked
+  for it, the daemon started no edge and always drew its key): the anchor's child exited 2, no descriptor handed over;
+  `UnknownFlag("--vcs-ssh")` in the role's and the command's grammar, and `None` in the starter's role; the five
+  `vcs_ssh::daemon_edge` tests failing, the drawn key where the node's and the anchor's were expected and no edge on
+  the three daemons; the CLI test's anchor ending at the unknown flag; their 13 neighbours passing. The seed's test
+  failed at its first read, `LayoutRefused { offset: 4480, len: 8, reason: NotAWord }`, and the first green run met
+  it too (with the three daemon tests and the CLI test it starved): the segment declares its words and racy spans
+  (AUD-29-09), and the seed's were undeclared; they are declared now. Green before the merges with main (c1810019a, r365,
+  23:07-23:12Z; 80e8038a7 over main 0462bd922, r382, 23:12-23:20Z), and on the tree this commit lands as, over main
+  2c3fa2bcc with A-689 and A-682 (r445, 23:46-23:51Z): `-p slates-anchor --test anchor -- the_supervised_child_inherits
+  ssh_host_seed` 4 of 4; `-p slates-server --lib -- vcs_ssh::daemon_edge vcs_http::daemon_edge` 11 of 11 (a daemon over
+  a played anchor's segment presenting the anchor's key, its signature over the exchange checked by slates-ssh's RFC
+  client; a lone daemon its own key on two connections; an Ed25519 node identity's own key; a P-256 identity starting
+  no edge while the daemon serves; the HTTP edge's six over the shared adoption rule); `-p slates-api --lib --
+  role::tests start::tests contract_history` 10 of 10; `-p slates-cli --bin slates -- the_grammar` 15 of 15; `-p
+  slates-cli --test cli -- vcs_` 5 of 5 (g083's stock-hg SSH test ignored): the anchor's daemon named `127.0.0.1:62967
+  with the ED25519 host key SHA256:vg+qbVEBJ5vQY284R+Ciy61q1vRy3EclQoFRXjc7BsQ`, its edge presented that key, an exchange
+  begun while the killed daemon's successor started was answered by it with the same key at the same port, and the
+  successor named both again.
+- **Owed.** The other services wired into the daemon's site (A-683's receive-pack; A-688's tunnel, once its stores'
+  lender lands); a test of
+  the daemon's own SSH site running upload-pack and `serve --stdio` for an enrolled key (A-682's and A-679's tests run
+  its services alone); host keys in a fleet node's other key algorithms (ECDSA, RFC 5656;
+  RSA, RFC 8332), so a node with a P-256 identity presents its own key; Windows keeps no listener across a restart
+  (`docs/wip/platforms.md`, gap 2), though it keeps the key; main's live OpenSSH 10.2 interop against `--vcs-ssh`
+  (`ssh-keyscan`, a stock `git clone ssh://` and `hg clone ssh://` with an enrolled key) and the other platforms'
+  runs.
+
+### A-691 — `listkeys phases` lists the stored draft roots still draft, read past the served filter as 7.2's `listphases` reads them (2026-11-19, g083 for UI goal 93 (kiln 51cef9f7); found by g303 reading `serve/pull.rs`; §4.17.3 "Pull and clone" item 1; A-619, A-680 part 1, A-690)
+Applied in the same change to: §4.17.3 (its status), `crates/hg` (`serve::Repository::draft_roots`, `serve::indexed`'s
+`still_draft` and module doc, `serve::pull`'s `listkeys phases`, the test repositories' roots, `serve/indexed_tests.rs`,
+`tests/fixtures.rs`), `crates/hg/fixtures/state` (`amended-root`), `crates/server` (the hg push tests' view, the HTTP
+tests' empty store and the SSH tests' probed repository), GAPS (a fixed entry),
+`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`.
+- **What was wrong.** `listkeys phases` answered the draft roots computed over the served view; 7.2 answers the stored
+  draft roots read from the unfiltered changelog, each kept where its phase is at most draft (`phases.py` 1049-1058,
+  `listphases`; `pushkey.py` 27-32), so a draft root an amend hid is listed in 7.2 and was not here. A-619's oracle
+  computed the roots as the implementation did, over histories that hide nothing, so it could not see the difference.
+- **The decision.** A `Repository` answers its stored draft roots still draft (`draft_roots`). The served view takes
+  them from the register's roots where its forward walk holds each changeset's phase, before the filter keeps what it
+  serves, so a hidden one is among them and one a root of a higher phase raised is not; a root whose node the changelog
+  lacks was dropped before, as `_readroots` drops it (195-229). No second rule: every test repository states its own
+  roots, and each hides nothing, so they are its draft changesets with no draft parent.
+- **Reproduced by use first** (Mac Studio, macOS arm64, stock Mercurial 7.2 from PyPI through uv, 2026-11-19).
+  `make-state-fixtures.sh . amended-root` makes a public root, a draft root on it amended under evolution (a marker
+  hides the old changeset) and another draft made secret afterwards; `make-served-fixtures.sh . amended-root` records
+  7.2's served answers. The repository rebuilt from those files stores the draft roots `4226264b` (hidden) and
+  `d57c1eb0` and the secret root `d6b2f99b`; `hg debugpushkey <repository> phases`, and under `hg serve`
+  `hg debugpushkey http://127.0.0.1:58762/ phases`, answer `4226264b… 1` and `d57c1eb0… 1`. 7.2 took the secret one
+  out of the draft roots when it was made secret, so the view's generated model covers a stored draft root a higher
+  root raised.
+- **Tests (macOS arm64, Mac Studio, rustc 1.98.1).** Red: kiln r411 over c396a7391 (the fixture and the golden
+  alone): `cargo test --locked -p slates-hg --lib serve::` 53 passed and 1 failed, the golden, at `listkeys phases`
+  (`d57c1eb0` alone answered). Green: kiln r421 over 2f9bd0664: `cargo test --locked -p slates-hg --lib -- serve::
+  push::` 91 passed and 0 failed; `cargo test --locked -p slates-server --lib -- repository::hg_push
+  vcs_http::tests::hg --test-threads=4` 13 passed and 0 failed; `cargo fmt -p slates-hg -p slates-server -- --check`
+  clean; slates-hg and slates-server compiled afresh. The golden holds `amended-root`'s two served changesets, the
+  hidden and the secret one left out, `heads`, `branchmap` and `listkeys` of `bookmarks` and `phases` to stock 7.2's;
+  the view's model states `listphases` literally over generated histories (roots of every phase, rewrites and prunes),
+  and a named test lists a hidden draft root and leaves out one under a secret root.
+- **Owed.** The other platforms' runs, and the red-checks (main's).
+
+### A-647 part 4 — A version's reach sets kept as trees of nodes over fixed blocks of positions, so its value adds what it brought, never its reached set again (format 3) (2026-11-19, g294 from g302's draft, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 3)
+
+- **Why.** Part 3's owed line: "A value's reached set sharing its parent's runs by identity (a set kept as a tree of
+  nodes a version extends, so a fast-forward's value costs its D(k))". Format 2 kept each version's sets as one sorted
+  sequence of runs, which the content store cuts into windows at fixed offsets and keeps once each
+  (`ContentStore::put_object`). So a version that appends a run past every run it reached (a branch pushed by turns)
+  adds only the first window, the last and the lists above them, but a version whose D(k) falls below its newest run (a
+  merge of an older root) moves every window after it and stores its reached set again from there (g302's finding, by
+  reading `crates/vcs/src/content.rs`; measured in the red below).
+- **Format 3** (`slates-git reach sets 3 ` and the window, eight bytes, big-endian: the trees' shape is the window's, so
+  the window is part of the type's name). Each set is a tree of derived nodes over fixed blocks of positions
+  (`Shape`, derived from the store's window through the store's own encoding of a derived node, `encode_derived`): a
+  block is two positions for each run a leaf of one window holds, so a block whose positions are each a run of their
+  own fits one leaf, and an inner node names as many children as one window holds. A leaf holds its block's runs, each
+  relative to the block, so two blocks of the same runs are one node by identity; an inner node of level `l` names the
+  children of its range that hold any of the set, its payload a tag, its level and a bit for each child slot; a range
+  the set holds whole is one node a level, whatever its place, so a run over many blocks costs a node a level. The
+  root's level is the least whose range covers the set's last block, so a set has one tree. A value is a derived node
+  naming the reached set's root and then D(k)'s, each left out when empty, its payload a tag, a byte saying which it
+  names, and the shape (a block's positions and an inner node's children, eight bytes each, little-endian), so a value
+  reads alone whatever window made it. Every other form is refused by kind, a child of another level than the one below
+  its parent too.
+- **What a version stores.** The tree is a function of the set and the window alone, never of the history that made
+  it, so the same set is the same root on every tier. It is built whole from the set's runs at each commit, hashing as
+  much as format 2 did, and the store keeps a node once whoever puts it, so a version's value adds only the nodes no
+  earlier set had: the leaves of the blocks its D(k) touches and the inner nodes above them, in both trees, and its own
+  node. `StoreCounters::value_bytes` counts what the commits' values added to the content store.
+- **Rejected.** A-647 part 1's path map (a 16-way hash trie) as the sets' tree: its least branch, sixteen names, passes
+  the 256-byte window the server's store-level tests keep content in (chosen there so blobs span windows); the radix
+  tree's fanout is the most one window holds, at least two.
+- **Tests** (`crates/git/src/tests/store/reach.rs`; macOS arm64, Mac Studio d1323898, debug, 2026-11-19; Linux and
+  Windows owed to main).
+  - New: `t_a647_p4_a_version_stores_what_it_adds_not_what_it_reaches`. In a store of a 256-byte window (blocks of 30
+    positions, 7 children a node), 400 roots on refs 2 and 3 by turns; ref 1 made at a root of its own, pushed 400
+    times by turns with ref 3 (each version a run past every run it reached), then merged with ref 2's 400 roots, newest
+    first (each version a run below every run it reached). Each of ref 1's 801 versions is held to a window for each
+    node on the paths from its two trees' roots down to the blocks its D(k) touches, and one for its value's node; each
+    still answers its D(k) (its push's three objects, a merge's six) and its reached set (the one before grown by D(k));
+    and the newest reached set, 801 runs, kept as one sorted sequence (12,816 bytes) passes every version's bound.
+    Format 3's hostile values: a sound value of two leaves under a node of level 1 read back, then the value's node
+    broken seven ways, a leaf six ways and an inner node six ways, each refused.
+  - Red first (c44d98d8, branch `agents/g294-a647p4-red`, not for main: g302's red bbd4bad12 with its final storage
+    test, never run before; over main 0462bd92): format 2 under the new test, `cargo test --locked -p slates-git --lib
+    -- t_a647` (kiln r383): 6 passed and the new test failed, 15 versions past their bound, the most a merge added
+    7,740 bytes against a bound of 4,352 (a turn 1,260), 1,077,340 bytes in all.
+  - Green (64494654: g302's green 1067842cb, written whole and never compiled, brought onto main 0462bd92 with main's
+    path-map fields of `GitStore` kept; it built at once): `cargo test --locked -p slates-git --lib -- store served
+    protected receive object_info upload`, every module that builds a store, 208 passed, 4 ignored (main's), in 2.98 s
+    (kiln r402); the census with `--nocapture` (r404): no version past its bound, the most a turn added 466 bytes and a
+    merge 938, 378,007 bytes in all; `cargo test --locked -p slates-server --lib -- vcs_store vcs_http::git
+    vcs_ssh::git repository::push --test-threads=4` 46 passed (r404: the store 24, git's HTTP service 12, its SSH
+    service 6, the pushes 4); `cargo fmt -p slates-git -p slates-server -- --check` clean, no warning; the integration
+    test of a daemon making a git repository's store with its window, `cargo test --locked -p slates-cli --test cli --
+    a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge` (r413): 1 passed, in 4.68 s.
+  - As it lands, over main 2b86aaaa (gate copy 4f82e130, kiln r514; main's A-682 serving upload-pack from each
+    repository's store, A-694, A-629 part 2c, A-688, A-684's SSH edge in the daemon, git's push hooks, the store's
+    search by prefix and stock git's interop tests in): stock git
+    2.50.1 clones, pushes and fetches over a real daemon's HTTP edge through the store, every step as against git's own
+    server (`cargo test --locked -p slates-cli --test git_interop --
+    stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_a_bearer_token`, and its stock-git control: 2
+    passed); slates-git's filters 218 passed, 4 ignored (main's), the census as before; slates-server's, with all of
+    `vcs_ssh` (A-684's daemon tests among them), 110 passed, no warning; fmt clean.
+- **Owed.** A node's size against what a version adds: a leaf of one window holds about a sixteenth of the window in
+  runs and an inner node names about a thirty-second of it in children, so with a large window (macOS's 256 KiB) a
+  version on a large repository may add up to a window a node on its paths; a derived node smaller than the window
+  (fewer bytes a version, more nodes a read) is a measurement owed, not a guess. `Sets::read` expands what the nodes
+  name with no cap past the set itself, trusting server-made nodes (a client cannot forge one, identities being
+  keyed); a cap is owed if values ever cross a trust boundary. Dropping values no version needs (A-647); A-553's and
+  A-588's stores as types.
+- **Applied in the same change to:** `crates/git/src/store/reach.rs` (format 3: `Shape`, the trees' `Builder`,
+  `Sets::read`, `Sets::put`, `shape_of`, `ReachSets::declare` with the window), `store/repository.rs`
+  (`StoreCounters::value_bytes`, `put_values` by the store's shape), `store/mod.rs` (the module's docs); the tests in
+  `crates/git/src/tests/store/reach.rs` (the storage test, format 3's hostile values, the type declared with the
+  window); `crates/server/src/vcs_store.rs` (`GitStore::new` takes the content store's window) and its tests;
+  §4.17.2's status; A-645's entry; GAPS' A-645 line.
+
 ### A-683 — git's receive-pack on the SSH edge (2026-11-19, g302, UI goal 93; §4.17.2 "A push" items 1 to 7 and "Transports" item 2; A-651, A-654 parts 2 and 3, A-662)
 
 - **What was there.** A-654 part 2's driver (`git_push::ReceivePack`: `start`, `input`, `end`, `answer`, each one step
@@ -52955,21 +53178,25 @@ Applied in the same change to:
   A-682 lends upload-pack's stores (`ShardStores`, now the receive test's store lender too, and its own SSH session test
   building the services with `ThisShard`), with `vcs_store::upload` added to the filters (2ce314437, r454), 92 of 92;
   over be892650b, whose A-679 serves Mercurial's `serve --stdio` from the same services (three lenders now; its start
-  test names receive-pack's command, which r482 found left out, E0004) (4e16156e7, r492), 106 of 106; and the landed
-  tree, over 0b0c8e12e, whose A-665 part 3 answers a push a step at a time with hooks run off the shard's step and A-688
-  serves Subversion's tunnel beside the services (0264fa090, tree 4fb3a87f7, r512), 119 of 119. No integration target
-  reaches either edge's receive-pack: the daemon does not start the SSH edge yet (A-684), and the HTTP site's push test
-  is a lib test.
+  test names receive-pack's command, which r482 found left out, E0004) (4e16156e7, r492), 106 of 106; over 0b0c8e12e,
+  whose A-665 part 3 answers a push a step at a time with hooks run off the shard's step and A-688 serves Subversion's
+  tunnel beside the services (0264fa090, r512), 119 of 119; and the landed tree, over 20ae700a7, whose A-684 starts the
+  daemon's SSH edge, its site now serving receive-pack with `ThisShard` (a61f5282e, tree e58212107, r530), 124 of 124,
+  A-684's daemon-edge tests among them. No integration target runs either edge's receive-pack yet: the HTTP site's push
+  test is a lib test, and `crates/cli/tests/git_interop.rs`'s `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`
+  (stock git over OpenSSH to the daemon's SSH edge, A-684's) is ignored, waiting on A-684 and this piece; lifting its
+  ignore and running it is main's.
 - **Owed.** A push over a connection A-651 part 4 moved to its repository's owner shard (it landed beside this piece,
   and its own tests move connections running other commands): a two-shard daemon, as the HTTP site's push test runs;
   main's live stock `git push` over SSH; every item A-654 part 2 owes (the hooks, older bases, the policy's principals
   other than the owner at the append, push options, review requests).
 - **Applied in the same change to:** `crates/server/src/vcs_ssh/receive.rs` (new), `vcs_ssh/site.rs` (`ToolServices`
   with its shard lender beside A-682's and A-679's lenders, `ToolCommand`'s receive-pack, the module docs' step 3),
-  `vcs_ssh.rs` (the module and its owed list), `vcs_ssh/tests/receive.rs` (new), `vcs_ssh/tests/serve.rs` (its child),
+  `vcs_ssh.rs` (the module, the daemon's edge's note and the owed list), `vcs_ssh/daemon_edge.rs` (A-684's daemon site
+  serving receive-pack with `ThisShard`), `vcs_ssh/tests/receive.rs` (new), `vcs_ssh/tests/serve.rs` (its child),
   `vcs_ssh/tests/git.rs` (the services' test), `vcs_http/git.rs` (`ShardLender` re-exported), `vcs_http/git/receive.rs`
   (the trait's doc names its SSH caller), `git_push.rs` (its tests crate-visible; its callers), `git_push/tests.rs` (the
   fixtures crate-visible), `lib.rs` (the modules' notes), `vcs_store/upload/tests.rs` (A-682's SSH session) and
   `vcs_ssh/tests/hg.rs` (A-679's site and its start test, which names receive-pack's command too) building the services
-  with `ThisShard`; §4.17.2's status (A-654 part 2's and part 3's owed calls, A-683's status); GAPS (A-654's entry, the
-  A-683 entry).
+  with `ThisShard`; §4.17.2's status (A-654 part 2's and part 3's owed calls, A-651's, A-679's and A-684's lines on
+  receive-pack, A-683's status); GAPS (A-654's and A-684's entries, the A-683 entry).
