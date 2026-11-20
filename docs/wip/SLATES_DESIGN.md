@@ -12174,6 +12174,28 @@ is one more version, and the chain itself is never rewritten.
 
 **A push is a work.**
 
+**A push's intake (the rule for every tool's push and commit; A-719, main's ruling 2026-11-20).** Ada's target is tens
+of thousands of concurrent large pushes on one server, many of them to one repository, so an intake is held to four
+rules, which git's, Mercurial's and Subversion's intakes cite:
+1. *Its working set is bounded whatever its size.* Its objects are decoded as they arrive and each is stored once, in
+   the repository's one byte store, as it resolves; a delta is resolved against a base already stored (an offset
+   delta's lies earlier in the pack, a thin pack's reference delta's in the repository). Nothing holds the whole pack,
+   or every object verified in memory: at once an intake holds the entry being read, a delta with its base and its
+   target, the deltas still waiting for their bases, and tables of a few words an object.
+2. *Admission charges that working set.* The content a push adds is charged as it is stored (A-714's retention), and a
+   push past the shard's room is refused typed, never by one request's room (A-704, A-713).
+3. *Every pass runs a turn at a time* under the shard's step quantum (§4.3): reading, the checks, the store's admission
+   and the verdicts. No step of a push is longer than its quantum by more than one unit of work.
+4. *Intakes run concurrently, one repository's too.* Each push has its own working set (or its own fork); only its
+   landing, the verdict against the head and the ref's move, is ordered per repository, as Subversion's revision
+   assignment is the only ordered step of a commit.
+
+> **Status (2026-11-20, A-719 parts 1 and 2).** Rule 3's checks are built for git (part 1: `slates_git::receive::Checking`);
+> rule 1's reader seam is built (part 2: `slates_git::unpack::Keep`, each object handed to its keeper as it resolves,
+> with the hold its bytes took, and a delta's base read back from it). Owed: git's intake keeping into the repository's
+> store as it reads (part 3), on w-perf's byte table once it lands; admission by the working set; the store's
+> admission and the verdicts a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
+
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
 > the tool named them by, read through `PushObjects` (tree entries, a blob's length, a blob's bytes; a store implements
@@ -12480,12 +12502,27 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-20, A-716 slice 1a: a text held once, by content identity).** A green holds texts by identity in a
+> table of its file blocks (`crates/merge/src/held.rs`; `Green::hold_path`, `hold_bytes`, `held`, `release_held`,
+> `set_held_room`): by path, the head file's own block with one more holder, so no byte is copied; or by bytes, a block
+> no path names, for an intake that streams objects before any tree. A held text outlives its file's change and
+> removal, and is let go with its last holder. The table's room is its owner's to derive (zero until set), every hold
+> past it refused typed. It replaces the copies each tool keeps of the green's bytes (A-64: a Subversion text was held
+> three times, the records' copy alone 1.37 times the dump; BENCHMARKS.md). Owed: a green op setting a path from a held
+> identity (slice 1b), the table in the checkpoint (1c), Subversion's records reading through it (2, 3), git's and
+> Mercurial's intakes holding by bytes (w-git, w-hg).
+
 > **Status (2026-11-19, A-714, w-svn, found by use: a 5,000-revision Subversion import refused `green_chains` at 1,685).** An
 > entry's objects are the repository's content: the register keeps them as before, but the owner shard charges them to
 > its memory budget as retention with the tool store (`vcs_store::settle_objects`: trued up after each append and at a
 > recovery, given back with the repository; a push's own admission bounds it, a Subversion revision asks
 > `admit_objects` first), never to the partition's merge budget, so a
 > repository's bound is what its shard can hold. This replaces A-662's "charged to the merge budget" below.
+>
+> **Status (2026-11-19, A-721, w-svn).** A refused publication takes back the verb's record; a green whose engine had
+> already committed the version is made again from its durable checkpoint and chain in the same reconciliation
+> (`verbs::remake_greens_ahead`), so the engine never answers a version no log holds. Lone engines and single-member
+> lineages; a lineage of several members is counted and owed.
 >
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
@@ -52268,7 +52305,9 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   verdict when its post-state is one git cannot hold; a whole build and a whole map's release sliced a unit at a time
   (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
   source's head is the version it was made at (BUILT 2026-11-20, `paths::branch_before`: the branch's version 0 is that
-  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (A-636's fleet half); a copy made through a work
+  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (BUILT 2026-11-20 through A-636 part 2c-2: a successor's
+  rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a copy
+  made through a work
   driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
   by the same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
@@ -54258,3 +54297,36 @@ Applied in the same change to:
   delta's in the repository), no whole pack held; admission charging that working set and the content charged as it is
   stored (A-714's retention), refused typed at the shard's room; the quarantine's admission and the verdicts made a turn
   at a time; the by-use proof over w-interop's v2.0.0 cut and whole git/git.
+
+### A-664 holders' maps — A successor's rebuilt repository holds each green's map and trees (2026-11-20, w-shared for UI goal 93)
+- **Why.** A-664 part 3 keeps each git green's map of paths and its head's trees on the owner, made again by a recovery
+  and a rebuild; a successor that rebuilt a repository it took over (A-636 part 2c-2) made its store and no map, so its
+  greens' next versions could not derive their commits from the head they adopted.
+- **Change.** `vcs_store::make_whole`: the store made from the log, then each member green's map and trees from its
+  head (`paths::remake`), in one step; `vcs_store::rebuild` and `takeover::rebuild_repository` both call it. The maps
+  are derived from the greens' own content, so they need nothing shipped beside the logs.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::paths::tests::t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map` (two versions of a
+  file, the repository's record and store dropped leaving its green, rebuilt from its record and names log as a
+  successor does: the head's map equal to its model, remade once; the next version derived from it): `cargo test
+  --locked -p slates-server --lib -- vcs_store::paths:: vcs_store::commits:: fleet::state_log_tests takeover::
+  --test-threads=4` 34 of 34; fmt clean.
+- **Owed.** The fleet gate by use (a git repository's owner killed, its successor answering a stock clone and taking the
+  next submit), main's.
+
+### A-719 part 2 — A pack is read into a keeper, its working set bounded whatever its size (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" item 3)
+- **Change.** `slates_git::unpack::Keep`: the reader hands its keeper each object as it resolves, with the hold
+  (`Admission::hold`) its bytes took, and reads a delta's base back from it; it keeps only what names each object
+  (`Reader::read_into`, `Reader::finish_into`, answering each object's place, `Placed`, in pack order). A keeper that
+  stores objects elsewhere gives each hold back, so the reader's admission bounds its working set (the entry being read,
+  a delta with its base and its target, the deltas waiting for their bases, its tables), not the pack. `Held`, the
+  reader's own keeper, keeps every object and its charge, so `Reader::read`, `Reader::finish`, `finish_with` and
+  `read_whole` answer and charge as before. The rule it serves is written into §4.17.1 ("A push's intake").
+- **Tests.** `slates-git` `unpack::tests::a_pack_read_into_a_keeper_that_stores_elsewhere_holds_a_bounded_working_set`
+  (the 300-deep chain read into a keeper that stores elsewhere, fed in pieces of 61 bytes, under an admission of its
+  tables and eight versions, which cannot hold a third of its targets: every object as the pack read whole makes it;
+  read into memory under the same admission, refused).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- unpack:: receive::
+  protected_fixtures store:: upload::` 224 passed, 4 ignored, the new test named; fmt clean.
+- **Owed.** Part 3: git's intake keeping into the repository's store as the pack is read (the session and the push
+  driver over a store keeper, the checks reading objects back from it), on w-perf's byte table once it lands.

@@ -64,7 +64,8 @@
 //! **Owed** (GAPS, the §4.17 entry): Mercurial's pushes (`unbundle`) through the push driver (A-680 part 2b);
 //! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
 //! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
-//! `501` until then; Subversion's site composed into the daemon's beside git's and Mercurial's ([`ToolSites`]); the MCP
+//! `501` until then (the site is composed into the daemon's beside git's and Mercurial's since A-681's routing,
+//! [`ToolSites`], its reads served there); the MCP
 //! edge onto this engine; the live `git clone`, `git push` and `hg clone` over HTTPS (main's runs).
 
 mod daemon_edge;
@@ -343,38 +344,44 @@ impl<E> Decided<E> {
   }
 }
 
-/// The daemon's sites on one edge (A-680 part 2): Mercurial's decides a wire request, whose query names a command
-/// ([`hg::wire_request`]), and git's every other request, so each tool's clients reach their repositories at one address.
-/// A repository of the other tool is answered as one that does not exist, by the site that was asked.
-pub(crate) struct ToolSites<G, H> {
+/// The daemon's sites on one edge (A-680 part 2, A-681): Mercurial's decides a wire request, whose query names a command
+/// ([`hg::wire_request`]); Subversion's a request of a method no other client sends or naming its special segment
+/// ([`svn::dav_request`]); and git's every other request, so each tool's clients reach their repositories at one
+/// address. A repository of another tool is answered as one that does not exist, by the site that was asked.
+pub(crate) struct ToolSites<G, H, S> {
   /// git's site.
   git: G,
   /// Mercurial's site.
   hg: H,
+  /// Subversion's site.
+  svn: S,
   /// The room a request's query is read within to tell a Mercurial request: the edge's request room.
   room: u64,
 }
 
-impl<G, H> ToolSites<G, H> {
-  /// git's site `git` and Mercurial's `hg` on one edge, a query read within `room`.
-  pub(crate) fn new(git: G, hg: H, room: u64) -> Self {
-    Self { git, hg, room }
+impl<G, H, S> ToolSites<G, H, S> {
+  /// git's site `git`, Mercurial's `hg` and Subversion's `svn` on one edge, a query read within `room`.
+  pub(crate) fn new(git: G, hg: H, svn: S, room: u64) -> Self {
+    Self { git, hg, svn, room }
   }
 }
 
 /// The exchange of a request one of [`ToolSites`]' sites serves.
-pub(crate) enum ToolExchange<G, H> {
+pub(crate) enum ToolExchange<G, H, S> {
   /// git's.
   Git(G),
   /// Mercurial's.
   Hg(H),
+  /// Subversion's.
+  Svn(S),
 }
 
-impl<G: Exchange, H: Exchange> Exchange for ToolExchange<G, H> {
+impl<G: Exchange, H: Exchange, S: Exchange> Exchange for ToolExchange<G, H, S> {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     match self {
       Self::Git(exchange) => exchange.body(run).await,
       Self::Hg(exchange) => exchange.body(run).await,
+      Self::Svn(exchange) => exchange.body(run).await,
     }
   }
 
@@ -382,6 +389,7 @@ impl<G: Exchange, H: Exchange> Exchange for ToolExchange<G, H> {
     match self {
       Self::Git(exchange) => exchange.body_end(gone).await,
       Self::Hg(exchange) => exchange.body_end(gone).await,
+      Self::Svn(exchange) => exchange.body_end(gone).await,
     }
   }
 
@@ -389,6 +397,7 @@ impl<G: Exchange, H: Exchange> Exchange for ToolExchange<G, H> {
     match self {
       Self::Git(exchange) => exchange.reply_fields().await,
       Self::Hg(exchange) => exchange.reply_fields().await,
+      Self::Svn(exchange) => exchange.reply_fields().await,
     }
   }
 
@@ -396,6 +405,7 @@ impl<G: Exchange, H: Exchange> Exchange for ToolExchange<G, H> {
     match self {
       Self::Git(exchange) => exchange.reply_status(),
       Self::Hg(exchange) => exchange.reply_status(),
+      Self::Svn(exchange) => exchange.reply_status(),
     }
   }
 
@@ -403,16 +413,19 @@ impl<G: Exchange, H: Exchange> Exchange for ToolExchange<G, H> {
     match self {
       Self::Git(exchange) => exchange.reply(out).await,
       Self::Hg(exchange) => exchange.reply(out).await,
+      Self::Svn(exchange) => exchange.reply(out).await,
     }
   }
 }
 
-impl<G: Site, H: Site> Site for ToolSites<G, H> {
-  type Exchange = ToolExchange<G::Exchange, H::Exchange>;
+impl<G: Site, H: Site, S: Site> Site for ToolSites<G, H, S> {
+  type Exchange = ToolExchange<G::Exchange, H::Exchange, S::Exchange>;
 
   async fn decide(&mut self, head: &Head<'_>, secure: bool) -> Decided<Self::Exchange> {
     if hg::wire_request(head, self.room) {
       self.hg.decide(head, secure).await.map(ToolExchange::Hg)
+    } else if svn::dav_request(head) {
+      self.svn.decide(head, secure).await.map(ToolExchange::Svn)
     } else {
       self.git.decide(head, secure).await.map(ToolExchange::Git)
     }

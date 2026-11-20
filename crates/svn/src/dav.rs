@@ -59,6 +59,7 @@ pub mod request;
 pub mod response;
 pub mod site;
 mod time;
+pub mod update;
 pub mod xml;
 
 /// The `DAV:` namespace (RFC 4918).

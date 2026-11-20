@@ -1563,8 +1563,15 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
     return;
   };
-  make_from_log(state, &record);
-  // Each green's map of its head, made again as the live store holds it (A-664 part 3).
-  paths::remake(state, id);
+  make_whole(state, &record);
   state.count(REBUILT, 1);
+}
+
+/// Makes `record`'s store from the log ([`make_from_log`]) and each member green's map and trees from its head, as the
+/// live store holds them (A-664 part 3, [`paths::remake`]), in one step: what a rebuild holds, and what a successor holds
+/// of a repository it took over once it rebuilt it from its record and logs (A-636 part 2c-2), its greens' heads the
+/// adopted ones (A-664's holders' maps).
+pub(crate) fn make_whole(state: &mut ShardState, record: &RepositoryRecord) {
+  make_from_log(state, record);
+  paths::remake(state, record.id);
 }

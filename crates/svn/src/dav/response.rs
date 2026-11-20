@@ -59,6 +59,11 @@ impl Body {
     self.room.saturating_sub(self.bytes.len())
   }
 
+  /// The bytes so far, taken out: the body is empty again and may hold its room anew (a streamed answer's slice).
+  pub fn drain(&mut self) -> Vec<u8> {
+    std::mem::take(&mut self.bytes)
+  }
+
   /// The bytes written.
   pub fn into_bytes(self) -> Vec<u8> {
     self.bytes

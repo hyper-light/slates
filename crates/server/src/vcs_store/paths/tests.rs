@@ -460,6 +460,73 @@ fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
   assert_eq!(counts, (1, 1, 2));
 }
 
+/// A-664's holders' maps (A-636 part 2c-2: a successor rebuilds a repository it took over). Do: submit two versions of
+/// a file to a git repository's root green; drop the repository's record and its store, leaving the green, its engine
+/// and its membership, as a successor holding the green finds them; rebuild it from its record and its names log
+/// (`main` bound to the root) as the successor does; then submit a third version. Expect: rebuilt; the root's map of
+/// its head equal to its model, remade once; the third version's derived from it.
+#[test]
+fn t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map() {
+  let counts = crate::daemon::audit_on_shard(|state| {
+    let at = git_repository(state, "taken");
+    let mut model = Model::new();
+    version(state, at.1, 1, vec![create("/f", b"one")]);
+    let second = version(state, at.1, 2, vec![Op::Edit("/f", 0, 3, b"two")]);
+    let repositories = state.db.partition().repositories();
+    let record = repositories.repository(at.0).cloned().expect("the record");
+    let dropped = slates_db::op::Op::RepositoryDestroyed { repository: at.0 };
+    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    state
+      .db
+      .mutate(&mut state.segment, &dropped, now)
+      .expect("dropped");
+    crate::vcs_store::free(state, at.0);
+    assert!(crate::takeover::rebuild_repository(
+      state,
+      record,
+      vec![main_bound(at)]
+    ));
+    set(&mut model, "f", FileClass::File, b"two");
+    assert_kept(state, at, second, &model);
+    let third = version(state, at.1, 3, vec![create("/g", b"three")]);
+    set(&mut model, "g", FileClass::File, b"three");
+    assert_kept(state, at, third, &model);
+    (
+      count(state, BUILT),
+      count(state, REMADE),
+      count(state, DERIVED),
+    )
+  });
+  assert_eq!(counts, (1, 1, 2));
+}
+
+/// The names log's part binding `main` to the root green, as a successor holds it.
+fn main_bound((repository, root): (RepositoryId, VolumeId)) -> slates_db::catalog::StateLogRecord {
+  use slates_db::catalog::{LogName, LogSpan, LoggedChange, NameChange, StateLog};
+  let log = LogName::State {
+    repository,
+    log: StateLog::Names,
+  };
+  slates_db::catalog::StateLogRecord {
+    repository,
+    log: StateLog::Names,
+    from: 0,
+    to: 1,
+    identity: [1; 32],
+    spans: vec![LogSpan {
+      log,
+      from: 0,
+      to: 1,
+    }],
+    changes: vec![LoggedChange::Named {
+      change: NameChange::Bind {
+        name: "main".to_owned(),
+        green: to_db_volume(root),
+      },
+    }],
+  }
+}
+
 /// A-664 part 3 (a branch's first map from its source's: the branch's version 0 is its source's version it was made
 /// at). Do: submit a file to a git repository's root green, branch it at its head, then submit two versions to the
 /// branch; branch the root again, move the root on, then submit to the second branch. Expect: the first branch's first
