@@ -778,7 +778,7 @@ fn stock_hg_sees_the_bookmarks_the_cli_makes_retires_and_binds() {
     "r",
     "topic",
     "--from",
-    "default",
+    "branch:default:0",
   ]);
   let green = value_of(&made, "id");
   let after_create = bookmarks();
