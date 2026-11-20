@@ -69,6 +69,7 @@ export GIT_SSH_COMMAND="ssh -F /dev/null -i $WORK/key -o IdentitiesOnly=yes -o B
 echo "git $(git --version); source $SOURCE $(git -C "$SOURCE" rev-list --all --count) commits; http $HTTP ssh $SSH"
 
 row push-all git -C "$SOURCE" push "$URL" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+row push-all-ssh git -C "$SOURCE" push "$SSHURL" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
 row ls-remote git ls-remote "$URL"
 row clone git clone -q "$URL" a
 row fsck git -C a fsck --no-progress
