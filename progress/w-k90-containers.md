@@ -112,3 +112,10 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 ## NEXT: W10 (b) the pod start: lineage `isolation: {"kind":"pod"}`/engine? -> hold at home (Ask::Hold via ask_runner) ->
    [slates_fleet.nodes] host/port -> objects -> make -> create agent_pod with a one-time token -> on the pod runner's
    connect open the session there (cwd = folder; review/drift/landing asked of the home by session id) ; (c) reaper.
+
+## LANDED 2026-11-20: 5c5adfae9 k8s::agent::AgentPods; b07098718 K8s::start_agent (+[kubernetes] agents_image);
+   75757b07d agents.start isolation "pod" + reaper. W10 code path complete; KIND proof is main's.
+- Reported: k8s::tests::w02_r06_kilns_k8s_jobs_get_v1s_pods_on_a_k8s_pool fails on main since aa98b33d6 (not mine).
+- r24 (live W9 test on adacachy, rootful docker 29.9.0 only) queued; container_live_tests.rs still UNCOMMITTED
+  (+ workspace/mod.rs line) -> commit after r24 reports.
+## NEXT: Windows items (jupiter unblocked): W9 measurement (Docker Desktop WSL2 9P reaching a WinFsp drive) / W5-ish.
