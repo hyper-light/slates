@@ -86,8 +86,17 @@ every profile name a run leaves behind here; no other admin steps or installs.
 - BLOCKER for the jupiter drive: no Python 3 there; the drive's runner_env -> stub_host_env -> stub_python errors on Windows.
   w-k90-win asked main for Ada's word on Python. Goal on my stack: 01a1fa3695247602901e94e021bfa56e.
 
+## 2026-11-20 ~13:00 PST: jupiter drive running
+- r21 (jupiter): `cargo test --no-run -p kiln --test slates_e2e` at cc1ecb625 built in 69 min; Shards packed with no
+  download (shards.exe 37 MB, shards-vm.exe, shards-net.exe). C: 185 GB free after.
+- Python: NOT missing. Python 3.13.17 is at C:\Users\corph\AppData\Local\Programs\Python\Python313 since 2026-10-21,
+  just not on MSYS bash's PATH; my run prepends it to PATH (no install).
+- r26 (jupiter): SLATES_E2E=1 VM_E2E=1 microvm:: at cc1ecb625, log C:\Users\corph\w-k90-whp\drive-cc1ecb625.log
+  (cargo rebuilt the kiln crate first: env differed from r21's).
+
 ## AppContainer profiles left on jupiter by my runs
-- (none yet: no guest run on jupiter so far)
+- Baseline before r26 (HKCU ...\AppContainer\Mappings monikers, C:\Users\corph\w-k90-whp\appcontainers-before.txt):
+  164 profiles, 2 of them Shards' and not mine: shards.pipes-s0.41940.0, shards.pipes-s0.48268.0.
 
 ## For main to delete
 - (none)
