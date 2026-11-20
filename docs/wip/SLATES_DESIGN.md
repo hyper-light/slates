@@ -55718,6 +55718,21 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4g — A replayed record's moves are admitted an object a turn (bug, 2026-11-20, w-git for UI goal 93; main's report: a restarted daemon recovering git/git's v2.0.0 spun and was killed again)
+- **Found by use.** r110 (w-interop, git v2.0.0): every daemon restarted after the push spun in A-662's recovery of the
+  pushed repository (`daemon.rs` `spawn_alone`) and the watchdog killed it again, 7 of 27 steps answered.
+- **Cause.** Since parts 4a, 4b and 4d a record's pack is read, its objects admitted, its deltas resolved and the push
+  sealed a unit a turn; but the replay's end admitted its moves whole (`admit_moves`, `Repository::admit` to its end):
+  a create's walk of every object the push brought, every tree parsed, in one turn.
+- **Change.** `git_replay`'s `Stage::Moving`: each recorded move admitted by `slates_git::store::Admitting` (A-722 part
+  4c) a unit a turn, a delete at once; the commit then takes the admitted moves. Swept: Mercurial's recovery replays a
+  revision a unit (A-732); Subversion's replays each revision's record whole (`commit_record`), reported to main for its
+  owner. Owed: the landing's own whole passes (`Repository::commit`).
+- **Tests.** `slates-server` `vcs_store::tests::t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn` (a
+  66-object record rebuilt at a quantum of none: red, 66 objects walked in one turn; now one at most);
+  `slates-server --lib -- vcs_store:: git_push::tests::t_a722 git_push::tests::t_a753` 94 passed; fmt clean (macOS
+  arm64, this Mac, local).
+
 ### A-722 part 4f — A push's connectivity propagation a step of its stack a unit (2026-11-20, w-git for UI goal 93; the check's 57.9 ms at 100 concurrent pushes)
 - **Change.** `slates_git::receive::connect`'s walk carries the worst state back over the edges with its explicit stack
   kept between turns (`Walk::propagation_unit`): a unit is one edge followed, one object finished, or the next root
