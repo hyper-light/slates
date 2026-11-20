@@ -1653,6 +1653,78 @@ fn a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_t
   );
 }
 
+/// A-757 part 5 (w-forming, 2026-11-20; found by use: the record period sealed a 3 MiB volume's install image in one
+/// turn, 183 to 264 ms of a debug owner shard's CPU under `taskpolicy -b`): a candidate behind the retained tail of a
+/// volume larger than one seal piece is installed from an image sealed in turns of its own. Do fill a live volume's file
+/// to three MiB with stable NFS writes of 32 KiB, stop one candidate's process, overwrite the file again (more than its
+/// whole state, so the candidate falls behind the retained tail), resume it, and write a little more. Expect the paused
+/// candidate to catch up, an install image made, built over at least two turns (`fleet.live.image_build_turns`), and no
+/// write refused. Before, the image was sealed in the one turn that owed it.
+#[test]
+fn a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns() {
+  /// Shape: each write's bytes, half a seal page, so every write ships as one small delta.
+  const WRITE_BYTES: usize = 32 << 10;
+  /// Shape: the writes that fill the file to three MiB, then overwrite it a quarter again while the candidate is stopped.
+  const FILL_WRITES: u64 = 96;
+  /// Shape: see [`FILL_WRITES`].
+  const PAUSED_WRITES: u64 = 120;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping large-image flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-image-turns");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let paused_index = (owner_index + 1) % fleet.instances.len();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let (mut live, file, id) = stable_session(owner, "image-turns", true);
+  let data = vec![0x6b_u8; WRITE_BYTES];
+  let mut xid = 100;
+  let step = u64::try_from(WRITE_BYTES).unwrap();
+  let mut write_at = |live: &mut std::net::TcpStream, index: u64| {
+    xid += 1;
+    let status = nfs::write_at_status(live, &file, (index % FILL_WRITES) * step, &data, xid);
+    assert_eq!(status, 0, "the write at {index} was answered");
+  };
+  for index in 0..FILL_WRITES {
+    write_at(&mut live, index);
+  }
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::STOP);
+  for index in 0..PAUSED_WRITES {
+    write_at(&mut live, index);
+  }
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::CONT);
+  for index in 0..4 {
+    write_at(&mut live, index);
+  }
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  let counters = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live image in turns: {counters:?}; then {shipping:?} {held:?}");
+  let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+  assert!(
+    caught_up,
+    "the paused candidate caught up: {shipping:?} {held:?}"
+  );
+  assert!(
+    of("install_image") >= 1,
+    "the paused candidate fell behind the retained tail and was installed: {counters:?}"
+  );
+  assert!(
+    of("image_builds") >= 1 && of("image_build_turns") >= 2,
+    "the install image was sealed in turns of its own: {counters:?}"
+  );
+  assert_eq!(of("refused"), 0, "no write was refused: {counters:?}");
+}
+
 /// A-200, AC-8.9: a candidate's copy of a live log stays within its bound however long the writer runs. Do make stable
 /// NFS writes to a live volume bounded at 1 MiB until the changes shipped are three times its size. Expect every write
 /// answered, no candidate refusing an entry for its bound, and whole records shipped as the changes grow: a candidate

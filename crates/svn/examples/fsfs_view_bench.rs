@@ -53,7 +53,9 @@ fn dump(revisions: u64, size: usize) -> Vec<u8> {
   ));
   for revision in 1..=revisions {
     let at = usize::try_from(revision).unwrap() % lines;
-    text[at] = format!("r{revision:062}");
+    if let Some(line) = text.get_mut(at) {
+      *line = format!("r{revision:062}");
+    }
     let body: String = text.iter().map(|l| format!("{l}\n")).collect();
     let props = props(&format!("r{revision}"));
     out.push_str(&format!(
@@ -80,7 +82,7 @@ fn imported(dump: &[u8]) -> Repository {
       Importing::Done => return repository,
       Importing::NeedMore { .. } => panic!("the whole dump was given"),
       Importing::Commit { consumed, record } => {
-        rest = &rest[consumed..];
+        rest = rest.get(consumed..).unwrap_or_default();
         repository.commit_record(*record).unwrap();
       }
     }

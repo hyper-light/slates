@@ -707,10 +707,13 @@ enum Staged {
   Whole(Vec<u8>),
 }
 
+/// An object being staged from the region a part at a time: its length and the bytes received, in order.
+type RegionStaging = (u64, Vec<u8>);
+
 std::thread_local! {
   /// The objects put from the region a part at a time and not yet whole, on this serving shard (A-724 piece 8c): each its
   /// length and the bytes received, in order. Bounded: their bytes together never pass what the shard can admit.
-  static STAGING: std::cell::RefCell<std::collections::BTreeMap<[u8; 32], (u64, Vec<u8>)>> =
+  static STAGING: std::cell::RefCell<std::collections::BTreeMap<[u8; 32], RegionStaging>> =
     const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
   /// The object a region read takes a part at a time on this serving shard, read whole at its first part and let go at its
   /// last ([`read_part`]): one object.
@@ -952,6 +955,21 @@ pub(crate) const HOMED_SHORT: &str = "vcs_store.homes.homed_short";
 /// the caller records the names inline instead (version 2). Asked from shard `origin`; at most one window
 /// (an object of any length a home keeps whole, cut at its own windows; one region message carries at most
 /// `slates_archive::format::MAX_CHUNK_BYTES` until an object past that is sent in parts).
+/// This node, one of the object's homes, keeps `bytes`: 1 once its image holding them is durable within `budget_ns`,
+/// else 0.
+async fn kept_here(
+  origin: u16,
+  shards: &[u16],
+  bytes: &[u8],
+  budget_ns: u64,
+) -> Result<usize, HomeRefused> {
+  let (_, ticket) = keep_region_at_home(origin, shards, bytes.to_vec(), budget_ns).await?;
+  let durable = super::durable::content_durable(origin, ticket, budget_ns)
+    .await
+    .is_ok();
+  Ok(usize::from(durable))
+}
+
 pub(crate) async fn home_in_region(
   origin: u16,
   shards: &[u16],
@@ -972,13 +990,7 @@ pub(crate) async fn home_in_region(
   let budget_ns = budget.max_deadline_ns();
   let mut kept = 0usize;
   if homes.contains(&local) {
-    let (_, ticket) = keep_region_at_home(origin, shards, bytes.clone(), budget_ns).await?;
-    if super::durable::content_durable(origin, ticket, budget_ns)
-      .await
-      .is_ok()
-    {
-      kept = kept.saturating_add(1);
-    }
+    kept = kept_here(origin, shards, &bytes, budget_ns).await?;
   }
   let others: Vec<slates_db::HostId> = homes
     .iter()
@@ -1299,6 +1311,25 @@ pub(crate) async fn heal_region(origin: u16, shards: &[u16], budget: slates_clus
   }
 }
 
+/// Lets this node's hold of `identity` go (counted) when the heal plan for the homes that hold it (`held`) releases it.
+async fn release_if_healed(
+  origin: u16,
+  shards: &[u16],
+  (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
+  identity: ContentId,
+  budget: slates_cluster::CommitBudget,
+  held: &std::collections::BTreeSet<slates_db::HostId>,
+) {
+  let plan = slates_db::identity_homes::heal(&identity.0, members, f, held);
+  if plan.release.contains(&local)
+    && let_go_region_at_home(origin, shards, identity, budget.max_deadline_ns())
+      .await
+      .is_ok()
+  {
+    crate::state::with_state(|state| state.count(HEAL_RELEASED, 1));
+  }
+}
+
 /// Offers one window to its region homes and lets this node's hold go once every home holds it and this node is not
 /// one ([`heal_region`]).
 async fn heal_one(
@@ -1325,14 +1356,7 @@ async fn heal_one(
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > slates_cluster::homes::PART_BYTES {
       held.extend(put_in_parts(&others, identity, &bytes, budget).await);
       crate::state::with_state(|state| state.count(HEAL_OFFERED, 1));
-      let plan = slates_db::identity_homes::heal(&identity.0, members, f, &held);
-      if plan.release.contains(&local)
-        && let_go_region_at_home(origin, shards, identity, budget.max_deadline_ns())
-          .await
-          .is_ok()
-      {
-        crate::state::with_state(|state| state.count(HEAL_RELEASED, 1));
-      }
+      release_if_healed(origin, shards, (local, members, f), identity, budget, &held).await;
       return;
     }
     let request = HomeMessage::Put {
@@ -1372,14 +1396,7 @@ async fn heal_one(
     crate::fleet::return_sessions(returned);
     crate::state::with_state(|state| state.count(HEAL_OFFERED, 1));
   }
-  let plan = slates_db::identity_homes::heal(&identity.0, members, f, &held);
-  if plan.release.contains(&local)
-    && let_go_region_at_home(origin, shards, identity, budget.max_deadline_ns())
-      .await
-      .is_ok()
-  {
-    crate::state::with_state(|state| state.count(HEAL_RELEASED, 1));
-  }
+  release_if_healed(origin, shards, (local, members, f), identity, budget, &held).await;
 }
 
 #[cfg(test)]

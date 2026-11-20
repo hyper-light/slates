@@ -56712,6 +56712,17 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   41 ns given the identity; each 64 KiB slice 27 / 34 us (`measure_the_holders_take_turn`). Tests:
   `a_holder_hashing_an_entry_in_slices_admits_what_the_hashing_guard_admits`; the fleet large-delta test holds the
   holders to at least a page a turn under the cut quantum, red before (0 turns).
+- **Part 5 (install images).** The record-plane coordinator's longest polls (185 to 312 ms of CPU, debug under
+  `taskpolicy -b`) were `refresh_image` sealing a 3 MiB volume's whole image in the record period's one turn. A sealed
+  image of more than one piece (`sealed_in_pieces`) is now an `ImageBuild`: the plain body captured at the shipper's head
+  in the turn that owed it (A-377's memcpy a byte), sealed a piece a turn at the measured rate (`piece_bytes`) by a task
+  of the shard (counted `fleet.live.image_builds`, `fleet.live.image_build_turns`), and made the install image
+  (`install_image`, the old tail of `refresh_image`) only if the head is still the one it was captured at; a moved head,
+  a fence or an owed whole record drops it (`fleet.live.image_stale`) and the image stays owed. While one builds, no
+  other is begun and installs wait, as they did for an owed image. Test: `slates-cli` live_fleet
+  `a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns` (a 3 MiB file, a candidate
+  stopped while it is overwritten, then resumed), red before (the image made in one turn), 65 turns after with one stale
+  build dropped and made again.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
 
