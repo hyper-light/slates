@@ -1,0 +1,6 @@
+started 2026-11-20T15:24:05Z at 0ed395440a7551edd3d3c3d56c29554cde46efb0; 7.0.0-1020-azure
+ipc issuer_route exit 0 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.00s
+issuer_surface exit 0 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s skips 0
+git_interop exit 0 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.82s skips 0
+svn_interop exit 0 test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s skips 7
+ended 2026-11-20T15:26:21Z

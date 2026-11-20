@@ -1,0 +1,68 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded arrayvec v0.7.8
+  Downloaded cfg-if v1.0.4
+  Downloaded bitflags v2.13.1
+  Downloaded cc v1.4.5
+  Downloaded errno v0.3.14
+  Downloaded itoa v1.0.18
+  Downloaded cpufeatures v0.3.1
+  Downloaded constant_time_eq v0.4.2
+  Downloaded quote v1.0.47
+  Downloaded jobserver v0.1.35
+  Downloaded shlex v2.0.1
+  Downloaded zmij v1.0.23
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded proc-macro2 v1.0.107
+  Downloaded unicode-ident v1.0.24
+  Downloaded serde_derive v1.0.229
+  Downloaded memmap2 v0.9.11
+  Downloaded serde_core v1.0.229
+  Downloaded serde v1.0.229
+  Downloaded memchr v2.8.3
+  Downloaded blake3 v1.8.7
+  Downloaded serde_json v1.0.151
+  Downloaded syn v3.0.5
+  Downloaded syn v2.0.119
+  Downloaded rustix v1.1.4
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling serde_core v1.0.229
+   Compiling cc v1.4.5
+   Compiling libc v0.2.189
+   Compiling zmij v1.0.23
+   Compiling rustix v1.1.4
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling syn v3.0.5
+   Compiling blake3 v1.8.7
+   Compiling itoa v1.0.18
+   Compiling cfg-if v1.0.4
+   Compiling constant_time_eq v0.4.2
+   Compiling linux-raw-sys v0.12.1
+   Compiling memchr v2.8.3
+   Compiling serde_derive v1.0.229
+   Compiling bitflags v2.13.1
+   Compiling cpufeatures v0.3.1
+   Compiling arrayvec v0.7.8
+   Compiling memmap2 v0.9.11
+   Compiling syn v2.0.119
+   Compiling slates-wire-derive v0.1.0 (/home/runner/work/slates/slates/crates/wire-derive)
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling slates-ipc v0.1.0 (/home/runner/work/slates/slates/crates/ipc)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.30s
+     Running unittests src/lib.rs (target/debug/deps/slates_ipc-5606c34f584d3d54)
+
+running 2 tests
+test issuer_route::tests::a_printed_secret_reads_back_and_compares_whole ... ok
+test issuer_route::tests::a_claim_with_the_printed_secret_gets_the_segment_and_another_does_not ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.00s
+

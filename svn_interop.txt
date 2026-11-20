@@ -1,0 +1,34 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling slates-cli v0.1.0 (/home/runner/work/slates/slates/crates/cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running tests/svn_interop.rs (target/debug/deps/svn_interop-e458fc19a9c2024b)
+
+running 8 tests
+test a_large_commit_measured ... ignored, a measurement: cargo test --release -p slates-cli --test svn_interop -- --ignored a_large_commit_measured --nocapture
+test a_repository_policys_hook_lets_stock_svn_change_a_revision_property ... skipping the revision property tests: no stock Subversion 1.15 here (svn on the PATH)
+ok
+test a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it ... skipping the revision property tests: no stock Subversion 1.15 here (svn on the PATH)
+ok
+test stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol ... skipping stock svn over svn://: no stock Subversion 1.15 here (svn on the PATH)
+ok
+test stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh ... skipping stock svn over svn+ssh: no stock Subversion 1.15 or OpenSSH here (svn, ssh on the PATH)
+ok
+test stock_svn_checks_out_commits_updates_and_logs_over_the_vcs_http_edge ... skipping stock svn over HTTP: no stock Subversion 1.15 here (svn on the PATH)
+ok
+test stock_svn_locks_and_unlocks_over_the_vcs_http_edge ... skipping stock svn's locks over HTTP: no stock Subversion 1.15 here (svn on the PATH)
+ok
+test stock_svn_sessions_hold_against_stock_svnserve ... skipping the control's sessions: no stock Subversion 1.15 here (svn, svnadmin and svnserve on the PATH)
+ok
+
+test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
