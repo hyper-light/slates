@@ -1,0 +1,11 @@
+== after svn
+diag-svnfetch svn:// conversation: slices 13697 (past the quantum 13692), longest slice_ns 2763875, most a slice 99424 bytes, turns 13697, bytes 250, most a turn 119, room 278528, quantum_ns 3687, long_steps +13761, longest_step_ns 969923125
+diag-svnfetch svn:// conversation: slices 4229 (past the quantum 4221), longest slice_ns 4681083, most a slice 25959 bytes, turns 4229, bytes 251, most a turn 119, room 278528, quantum_ns 3692, long_steps +4252, longest_step_ns 969923125
+diag-svnfetch svn:// conversation: slices 3896 (past the quantum 3885), longest slice_ns 3190042, most a slice 45621 bytes, turns 3896, bytes 250, most a turn 119, room 278528, quantum_ns 3692, long_steps +3909, longest_step_ns 969923125
+== after http
+diag-svnfetch svn:// conversation: slices 13697 (past the quantum 13692), longest slice_ns 2763875, most a slice 99424 bytes, turns 13697, bytes 250, most a turn 119, room 278528, quantum_ns 3687, long_steps +13761, longest_step_ns 969923125
+diag-svnfetch svn:// conversation: slices 4229 (past the quantum 4221), longest slice_ns 4681083, most a slice 25959 bytes, turns 4229, bytes 251, most a turn 119, room 278528, quantum_ns 3692, long_steps +4252, longest_step_ns 969923125
+diag-svnfetch svn:// conversation: slices 3896 (past the quantum 3885), longest slice_ns 3190042, most a slice 45621 bytes, turns 3896, bytes 250, most a turn 119, room 278528, quantum_ns 3692, long_steps +3909, longest_step_ns 969923125
+diag-svnfetch dav report run: wrote 19, most a run 136865, slice_ns 1541, longest slice_ns so far 3806250, runs past the quantum so far 16182, room 278528, done true, quantum_ns 3692, shard long_steps 60309, longest_step_ns 969923125
+diag-svnfetch dav report run: wrote 19, most a run 136865, slice_ns 1291, longest slice_ns so far 4942916, runs past the quantum so far 21396, room 278528, done true, quantum_ns 3692, shard long_steps 65574, longest_step_ns 969923125
+diag-svnfetch dav report run: wrote 19, most a run 136865, slice_ns 2500, longest slice_ns so far 6484375, runs past the quantum so far 27333, room 278528, done true, quantum_ns 3692, shard long_steps 71590, longest_step_ns 969923125

@@ -1,0 +1,4 @@
+diff: /Users/runner/work/_temp/wc-http/subprojects/git-gui: Directory loop detected
+diff: /Users/runner/work/_temp/wc-local/subprojects/git-gui: Directory loop detected
+diff: /Users/runner/work/_temp/wc-http/subprojects/gitk: Directory loop detected
+diff: /Users/runner/work/_temp/wc-local/subprojects/gitk: Directory loop detected
