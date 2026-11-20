@@ -12406,8 +12406,14 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > the acknowledgments) written once both are known, the pack begun from the choice. Every v0 test's exchange is answered
 > both ways and held to the same bytes, refusal and counters (git's stateless exchanges, the cut-and-flip property);
 > made, a v0 answer has decided nothing, and a pack's takes more than one step. Before it, `serve_in_turns` answered v0
-> whole as the answer was made. Owed for git: a plan of scattered positions (16 bytes a run); the live `git clone` rows
-> of the matrix (main's).
+> whole as the answer was made. **Scattered plans bounded BUILT (same day):** `Positions` keeps whichever of three forms
+> costs least (Roaring's choice per container): runs, 16 bytes a run; a sorted list, 8 bytes a position; or a bit table
+> over its span, 8 bytes a 64; chosen as a set is made whole (`of`, a union, an intersection, a difference, a decoded
+> set), an insert keeping its form, equality by what a set holds, and its encoding its runs whatever its form, so what is
+> kept as content is unchanged. The negotiation's bit table is handed to the plan as it is (it had been turned back into
+> a run a position). So a plan costs at most 8 bytes an object, the handle it replaced: 3,000 positions every third
+> apart, 1,128 bytes where their runs cost 48,000 (`positions::tests`, an oracle against an ordered set over every
+> operation and form). Owed for git: the live `git clone` rows of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the

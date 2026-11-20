@@ -69,7 +69,8 @@ impl Judged {
   }
 
   /// One look: returns while the tree lives and has gained CPU within [`STALL`]; fails the test naming `what` once it is
-  /// gone or stalled.
+  /// gone or stalled. A test's alone: `xtask`, which includes this file, judges with [`Judged::judge`].
+  #[cfg(test)]
   pub(crate) fn look(&mut self, what: &str) {
     match self.judge() {
       Verdict::Waiting { .. } => {}
@@ -221,13 +222,15 @@ impl InstanceWait {
   }
 }
 
-/// The pids of `instance`'s processes: its anchor and its daemon run as `slates --instance NAME anchor|daemon …`.
+/// The pids of `instance`'s processes: its anchor and its daemon run as `slates --instance NAME anchor|daemon …`. None
+/// where `pgrep` cannot run, which a wait judges as none left and fails, naming it.
 pub(crate) fn instance_processes(instance: &str) -> Vec<u32> {
-  let out = Command::new("pgrep")
+  let stdout = Command::new("pgrep")
     .args(["-f", "--", &format!("--instance {instance} ")])
     .output()
-    .unwrap();
-  let mut pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+    .map(|out| out.stdout)
+    .unwrap_or_default();
+  let mut pids: Vec<u32> = String::from_utf8_lossy(&stdout)
     .split_whitespace()
     .filter_map(|pid| pid.parse().ok())
     .collect();
@@ -363,6 +366,32 @@ impl MountTableWord {
   fn wait(&mut self, _left: Duration) -> bool {
     false
   }
+}
+
+/// Waits until process `pid`, not this process's child, has exited, on the kernel's own word: a pidfd for it, which
+/// polls readable once the process exits [B: man 2 pidfd_open], within [`MOUNT_TABLE_WAIT`] (the observation budget; the
+/// exit is the kernel's work, main's ruling of 2026-11-20), never a poll of `/proc`. Whether it exited: `true` too where
+/// the process is already gone when asked (no pidfd to open). Linux only: a test of a process that a parent-death signal
+/// ends (`pmem`'s VMM).
+#[cfg(target_os = "linux")]
+pub(crate) fn await_exit_of(pid: u32) -> bool {
+  let Some(pid) = i32::try_from(pid)
+    .ok()
+    .and_then(rustix::process::Pid::from_raw)
+  else {
+    return true;
+  };
+  let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) else {
+    return true;
+  };
+  let Ok(timeout) = rustix::time::Timespec::try_from(MOUNT_TABLE_WAIT) else {
+    return false;
+  };
+  let mut fds = [rustix::event::PollFd::new(
+    &pidfd,
+    rustix::event::PollFlags::IN,
+  )];
+  rustix::event::poll(&mut fds, Some(&timeout)).is_ok_and(|ready| ready > 0)
 }
 
 /// [`Judged::look`]'s rule, apart from the clocks it reads: the tree's CPU at the last progress (`then`) and now, how

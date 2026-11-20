@@ -138,7 +138,7 @@ impl Repository for History {
       .values()
       .find(|(held, _)| held == node)
       .ok_or(Refusal::Store { what: "tags" })?;
-    admission.charge(u64::try_from(text.len()).unwrap())?;
+    admission.charge(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
     Ok(text.clone())
   }
 }

@@ -2982,6 +2982,24 @@ fn takeover_text(report: &slates_client::TakeoverReport) -> String {
 /// Format: nanoseconds in a millisecond, for a status line printed in milliseconds.
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
 
+/// The daemon's memory by kind (§4.14), read in its own process with nothing suspended: what to read instead of
+/// suspending the daemon with `vmmap` or `heap`, which past the anchor's window gets it killed (A-232).
+fn memory_lines(report: &DaemonReport, out: &mut String) {
+  for kind in &report.memory {
+    out.push_str(&format!(
+      "memory: {} mappings={} reserved_bytes={} resident_bytes={} modified_bytes={} measured={}\n",
+      kind.kind,
+      kind.mappings,
+      kind.reserved_bytes,
+      kind.resident_bytes,
+      kind
+        .modified_bytes
+        .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+      kind.measured
+    ));
+  }
+}
+
 /// The daemon's status: the daemon's lines, its place in the fleet (a laptop: `f` 0, itself the one
 /// member, no peers probed), then one block per shard with its health signals and its telemetry drain.
 fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
@@ -3017,21 +3035,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&format!("anchor: {}\n", report.anchor));
   // Whether the anchor has judged this daemon recovered (A-311): until then its exit counts toward a crash loop.
   out.push_str(&format!("recovered: {}\n", report.recovered));
-  // The daemon's memory by kind (§4.14), read in its own process with nothing suspended: what to read instead of
-  // suspending the daemon with `vmmap` or `heap`, which past the anchor's window gets it killed (A-232).
-  for kind in &report.memory {
-    out.push_str(&format!(
-      "memory: {} mappings={} reserved_bytes={} resident_bytes={} modified_bytes={} measured={}\n",
-      kind.kind,
-      kind.mappings,
-      kind.reserved_bytes,
-      kind.resident_bytes,
-      kind
-        .modified_bytes
-        .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
-      kind.measured
-    ));
-  }
+  memory_lines(report, &mut out);
   let root: String = report
     .seal
     .root_id

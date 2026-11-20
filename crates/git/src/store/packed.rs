@@ -51,8 +51,8 @@ impl PackSource for ContentStore {
     if offset >= len {
       return None;
     }
-    let within = usize::try_from(offset % window).ok()?;
-    match self.window_at(pack, len, offset / window)? {
+    let within = usize::try_from(offset.checked_rem(window)?).ok()?;
+    match self.window_at(pack, len, offset.checked_div(window)?)? {
       Cow::Borrowed(lent) => lent.get(within..).map(Cow::Borrowed),
       Cow::Owned(copied) => copied.get(within..).map(|rest| Cow::Owned(rest.to_vec())),
     }
