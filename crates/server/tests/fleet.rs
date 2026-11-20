@@ -21913,6 +21913,155 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
   );
 }
 
+/// Shape: the bytes one bench edit carries: under the test client's request slot (4 KiB) with the request's own fields.
+const BENCH_EDIT_BYTES: usize = 3800;
+
+/// The phase counters the A-697 bench reads (`merge_service::SUBMIT_JUDGE` and its siblings, `work_home::SUBMIT_COMPOSE`
+/// and its): each pair's count and its sum.
+const BENCH_PHASES: [(&str, &str, &str); 9] = [
+  ("compose", "merge.submit.compose", "merge.submit.compose_ns"),
+  ("compute", "merge.submit.compute", "merge.submit.compute_ns"),
+  ("forward", "merge.submit.forward", "merge.submit.forward_ns"),
+  ("judge", "merge.submit.judge", "merge.submit.judge_ns"),
+  ("append", "merge.submit.append", "merge.submit.append_ns"),
+  ("place", "merge.submit.place", "merge.submit.place_ns"),
+  (
+    "recompute",
+    "merge.submit.recompute",
+    "merge.submit.recompute_ns",
+  ),
+  ("settle", "merge.submit.settle", "merge.submit.settle_ns"),
+  (
+    "shipments",
+    "merge.submit.shipped_versions",
+    "merge.submit.shipments",
+  ),
+];
+
+/// Every counter of both daemons, summed by name.
+fn bench_counters(daemons: [&Daemon; 2]) -> std::collections::BTreeMap<&'static str, u64> {
+  let mut summed = std::collections::BTreeMap::new();
+  for daemon in daemons {
+    for (name, count) in daemon.refusals_on_every_shard().unwrap() {
+      *summed.entry(name).or_insert(0u64) += count;
+    }
+  }
+  summed
+}
+
+/// A work over `green` made through `client` holding one file of `bytes` bytes, written an edit at a time.
+fn bench_work(client: &mut Client, green: VolumeId, name: &str, bytes: usize) -> VolumeId {
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: name.to_owned(),
+  }) else {
+    panic!("the bench's work");
+  };
+  let piece = vec![0x5a; BENCH_EDIT_BYTES];
+  let mut written = 0usize;
+  while written < bytes {
+    let take = (bytes - written).min(BENCH_EDIT_BYTES);
+    let edited = client.call(&RequestBody::Edit {
+      work,
+      path: "big".to_owned(),
+      at: u64::try_from(written).unwrap(),
+      delete_len: 0,
+      bytes: piece[..take].to_vec(),
+    });
+    assert!(matches!(edited, ReplyBody::Edited), "{written}: {edited:?}");
+    written += take;
+  }
+  work
+}
+
+/// A-697's measured breakdown (main's ruling of 2026-11-20: the by-reference forward is measured before and after,
+/// release, best of N with every N shown). Ignored: a benchmark, run by its recorded command, never by the suite. Do: in
+/// a two-node `f = 1` fleet, A owning a green at version 1 and B serving works over greens A owns (the test hook), for
+/// each size in `SLATES_A697_BENCH_MIB` (comma-separated MiB, default 4) and `SLATES_A697_BENCH_RUNS` runs (default 3):
+/// a work on B (the holder) and one on A (local) each write a file of that size and submit. Prints, a line a submit, its
+/// wall time and every phase's count and milliseconds (both daemons' counters, the submit's own delta), and asserts
+/// each submit accepted.
+#[test]
+#[ignore = "a benchmark: run by its recorded command (docs/wip/BENCHMARKS.md, A-697)"]
+fn bench_a697_holder_and_local_submit_phases() {
+  let _serial = serialize_fleet_tests();
+  let sizes: Vec<usize> = std::env::var("SLATES_A697_BENCH_MIB")
+    .unwrap_or_else(|_| "4".to_owned())
+    .split(',')
+    .map(|mib| mib.trim().parse::<usize>().unwrap() << 20)
+    .collect();
+  let runs: usize = std::env::var("SLATES_A697_BENCH_RUNS")
+    .ok()
+    .and_then(|runs| runs.parse().ok())
+    .unwrap_or(3);
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      first,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{first:?}"
+  );
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  for bytes in sizes {
+    for run in 0..runs {
+      for (kind, client) in [("holder", &mut holder), ("local", &mut owner)] {
+        let work = bench_work(client, green, &format!("bench-{kind}-{bytes}-{run}"), bytes);
+        let before = bench_counters([&daemon_a, &daemon_b]);
+        let started = Instant::now();
+        let submitted = client.call(&RequestBody::submit(work, Vec::new()));
+        let wall = started.elapsed();
+        let after = bench_counters([&daemon_a, &daemon_b]);
+        assert!(
+          matches!(
+            submitted,
+            ReplyBody::Submitted {
+              version: Some(_),
+              ..
+            }
+          ),
+          "{kind} {bytes} run {run}: {submitted:?}"
+        );
+        let delta = |name: &str| {
+          after.get(name).copied().unwrap_or(0) - before.get(name).copied().unwrap_or(0)
+        };
+        let phases: Vec<String> = BENCH_PHASES
+          .iter()
+          .map(|(label, count, sum)| {
+            if *label == "shipments" {
+              format!("{label}={}/{}", delta(sum), delta(count))
+            } else {
+              format!("{label}={:.1}ms/{}", delta(sum) as f64 / 1e6, delta(count))
+            }
+          })
+          .collect();
+        println!(
+          "A697-BENCH size_mib={} kind={kind} run={run} wall_ms={:.1} {}",
+          bytes >> 20,
+          wall.as_secs_f64() * 1e3,
+          phases.join(" ")
+        );
+      }
+    }
+  }
+  daemon_b.serve_works_on_holders(false).unwrap();
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the

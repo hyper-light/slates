@@ -2033,6 +2033,40 @@ pub struct PendingMergeRecord {
   /// these, so inputs larger than one shipment cross in several; a target not here is sent the inputs from their
   /// first chunk. Bounded by the candidates times the inputs' chunks; a target leaves once it holds the inputs.
   pub lacking: BTreeMap<HostId, Vec<[u8; 32]>>,
+  /// When it was enqueued, on the host's monotonic clock: what [`SUBMIT_PLACE`] times its placement from.
+  pub enqueued_ns: u64,
+  /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
+  /// cross in several, one a record-plane pass.
+  pub shipments: u64,
+}
+
+/// Counter pairs (how many were timed, and their nanoseconds or their count) of a submit's phases (A-697's measured
+/// breakdown, main's ruling of 2026-11-20: the by-reference forward is measured before and after, phase by phase). A
+/// mean is the second over the first. On the green's owner: the verdict ([`SUBMIT_JUDGE`]), the chain's append
+/// ([`SUBMIT_APPEND`]), the version's placement at the quorum from its enqueue ([`SUBMIT_PLACE`]) and the shipments its
+/// inputs took ([`SUBMIT_SHIPMENTS`]); on a holder, the recomputation of a version into its replica
+/// ([`SUBMIT_RECOMPUTE`]); and on a holder node submitting its own work (`crate::work_home`), the composition, the
+/// verdict computed on its replica, the forward to the owner and the wait for its replica to hold the version.
+pub(crate) const SUBMIT_JUDGE: (&str, &str) = ("merge.submit.judge", "merge.submit.judge_ns");
+/// See [`SUBMIT_JUDGE`]: the version's increment and verdict appended to the green's chain.
+pub(crate) const SUBMIT_APPEND: (&str, &str) = ("merge.submit.append", "merge.submit.append_ns");
+/// See [`SUBMIT_JUDGE`]: from the version's enqueue to its record placed at the quorum, its inputs shipped first.
+pub(crate) const SUBMIT_PLACE: (&str, &str) = ("merge.submit.place", "merge.submit.place_ns");
+/// See [`SUBMIT_JUDGE`]: the versions placed, and the input shipments they took in all.
+pub(crate) const SUBMIT_SHIPMENTS: (&str, &str) =
+  ("merge.submit.shipped_versions", "merge.submit.shipments");
+/// See [`SUBMIT_JUDGE`]: a holder's recomputation of a version into its replica.
+pub(crate) const SUBMIT_RECOMPUTE: (&str, &str) =
+  ("merge.submit.recompute", "merge.submit.recompute_ns");
+
+/// Counts one timed phase of `amount` ([`SUBMIT_JUDGE`] and its siblings).
+pub(crate) fn count_phase(
+  state: &mut ShardState,
+  (count, sum): (&'static str, &'static str),
+  amount: u64,
+) {
+  state.count(count, 1);
+  state.count(sum, amount);
 }
 
 /// Faults a test injects on a holder (never reachable from the wire): refuse every content put
@@ -2337,6 +2371,8 @@ pub(crate) fn insert_pending(
       first_period: stamped,
       work,
       lacking: BTreeMap::new(),
+      enqueued_ns: slates_machine::clock::monotonic_ns(),
+      shipments: 0,
     },
   );
   nudge_record_plane(state);
@@ -2654,6 +2690,20 @@ fn ship_version(
     value,
   };
   let shipments = cut_shipments(state, (object, version), groups);
+  let carrying = shipments
+    .iter()
+    .filter(|(_, inputs)| inputs.is_some())
+    .count();
+  if let Some(pending) = state
+    .merge
+    .pending
+    .get_mut(&object)
+    .and_then(|pending_green| pending_green.records.get_mut(&version))
+  {
+    pending.shipments = pending
+      .shipments
+      .saturating_add(u64::try_from(carrying).unwrap_or(u64::MAX));
+  }
   for (targets, inputs) in shipments {
     if let Some(inputs) = &inputs {
       state.count(INPUTS_UNPLACED, 1);
@@ -3086,11 +3136,20 @@ fn record_merge_acks_in(
     .pending
     .get(&object)
     .and_then(|pending_green| pending_green.records.get(&version))
-    .map(|pending| (pending.record.placed(quorum), pending.first_period));
+    .map(|pending| {
+      (
+        pending.record.placed(quorum),
+        pending.first_period,
+        (pending.enqueued_ns, pending.shipments),
+      )
+    });
   record_merge_acks(state, local, object, version, placement, quorum);
-  if let Some((false, first)) = before
+  if let Some((false, first, (enqueued_ns, shipments))) = before
     && placed_version(state, object).is_some_and(|placed| placed >= version)
   {
+    let now = slates_machine::clock::monotonic_ns();
+    count_phase(state, SUBMIT_PLACE, now.saturating_sub(enqueued_ns));
+    count_phase(state, SUBMIT_SHIPMENTS, shipments);
     let waited = period.saturating_sub(first.unwrap_or(period));
     let counter = if waited == 0 {
       PLACED_WITHIN_PERIOD
@@ -3788,7 +3847,14 @@ fn recompute(
     };
     let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
     let mut replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
-    match replica.submit(&increment) {
+    let started = slates_machine::clock::monotonic_ns();
+    let outcome = replica.submit(&increment);
+    count_phase(
+      state,
+      SUBMIT_RECOMPUTE,
+      slates_machine::clock::monotonic_ns().saturating_sub(started),
+    );
+    match outcome {
       Outcome::Accepted { version } if version == value.version => {}
       // The owner accepted it; a holder that computes anything else has diverged.
       _ => return Err(RECOMPUTE_MISMATCH),
@@ -3991,6 +4057,8 @@ mod tests {
       first_period: None,
       work: None,
       lacking: BTreeMap::new(),
+      enqueued_ns: 0,
+      shipments: 0,
     };
     assert!(carries_inputs(&pending, &[second, third]));
     assert!(!carries_inputs(&pending, &[second]));
@@ -4092,6 +4160,8 @@ mod tests {
             first_period: None,
             work: None,
             lacking: BTreeMap::new(),
+            enqueued_ns: 0,
+            shipments: 0,
           },
         );
       }
@@ -4534,6 +4604,8 @@ mod tests {
           first_period: None,
           work: None,
           lacking: BTreeMap::new(),
+          enqueued_ns: 0,
+          shipments: 0,
         },
       );
       let ack = |holder, sequence, manifest| {

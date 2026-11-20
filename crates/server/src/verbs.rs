@@ -9712,10 +9712,16 @@ fn judge_submission(
   if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
     state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
   }
+  let compose_start = state.clock.monotonic_ns();
   let (green_id, inc) = match build_increment(state, sealed, evidence) {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
+  // Composed here, not on the work's shard (A-697's measured breakdown: the compose phase wherever it runs).
+  if sealed.composed.is_none() {
+    let composed_ns = state.clock.monotonic_ns().saturating_sub(compose_start);
+    crate::merge_service::count_phase(state, crate::work_home::SUBMIT_COMPOSE, composed_ns);
+  }
   // Signed work (A-321): the signature is judged over the merge's statement, once the increment it names is built. It
   // permits nothing — the modes above did — and is recorded with the version as its provenance. An asked merge answers
   // with the verdict, so the approver sees it and a signer learns the statement from a held submit, whatever the
@@ -9793,6 +9799,11 @@ fn judge_submission(
   // opened within the `shard.op` span of the submit that caused it (set in `run_recorded`). The label
   // is content-free — accepted (1) or conflict (0). It never carries a path, a name or bytes.
   let verdict_end = state.clock.monotonic_ns();
+  crate::merge_service::count_phase(
+    state,
+    crate::merge_service::SUBMIT_JUDGE,
+    verdict_end.saturating_sub(verdict_start),
+  );
   let accepted = u32::from(matches!(
     &outcome,
     slates_merge::engine::Outcome::Accepted { .. }
@@ -9822,6 +9833,7 @@ fn judge_submission(
       // segment-full failure refuses like any other verb. A resubmit the engine answered from its
       // idempotent accept names a version the chain already holds: nothing is appended twice.
       // The durable head is the checkpoint's version and the increments after it (W3).
+      let append_start = state.clock.monotonic_ns();
       if let Err(refusal) = record_accepted(
         state,
         (green_id, sealed.work),
@@ -9831,6 +9843,8 @@ fn judge_submission(
       ) {
         return refused(refusal);
       }
+      let appended = state.clock.monotonic_ns().saturating_sub(append_start);
+      crate::merge_service::count_phase(state, crate::merge_service::SUBMIT_APPEND, appended);
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
       let completion = crate::merge_service::SubmitCompletion::of_current(state, sealed.work);
