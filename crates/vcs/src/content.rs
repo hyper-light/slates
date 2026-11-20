@@ -144,6 +144,75 @@ pub enum ContentRefused {
     /// The table named.
     identity: ContentId,
   },
+  /// The storage the windows are kept in ([`WindowStorage`], A-727) refused to keep a window: its room, or the arena
+  /// under it.
+  Storage,
+}
+
+/// A window kept by a [`WindowStorage`]: the handle the storage names it by, opaque to the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StoredWindow(pub u64);
+
+/// Where a content store keeps its windows' bytes (A-727: repository bytes leave the partition snapshot). The store
+/// keeps every window through it and its own metadata (lists, tables, derived nodes) in its own memory. The daemon's
+/// storage keeps each window as a sealed chunk of the shard's repository arena in the anchor's content object, durable
+/// there and read by copying it out (decrypted where the shard seals, A-99); [`HeapWindows`] keeps them in the
+/// process's memory, for tests and tools.
+pub trait WindowStorage: std::fmt::Debug {
+  /// Keeps `bytes`, at most one window: the handle to read and release them by.
+  ///
+  /// # Errors
+  /// [`ContentRefused::Storage`] when the storage cannot keep them; nothing is kept.
+  fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused>;
+  /// The bytes kept under `window`: borrowed where the storage can lend them, copied out where it cannot.
+  fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>>;
+  /// Lets the bytes kept under `window` go.
+  fn release(&mut self, window: StoredWindow);
+}
+
+/// The windows kept in the process's memory: the storage of a store made with [`ContentStore::new`], for tests and
+/// tools; the daemon gives its store the shard's repository arena instead ([`ContentStore::with_storage`]).
+#[derive(Debug, Default)]
+pub struct HeapWindows {
+  /// Each window's bytes, by handle.
+  slots: BTreeMap<StoredWindow, Box<[u8]>>,
+  /// The next handle.
+  next: u64,
+}
+
+impl WindowStorage for HeapWindows {
+  fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused> {
+    let window = StoredWindow(self.next);
+    self.next = self
+      .next
+      .checked_add(1)
+      .ok_or(ContentRefused::CountExhausted)?;
+    self.slots.insert(window, Box::from(bytes));
+    Ok(window)
+  }
+
+  fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>> {
+    self.slots.get(&window).map(|bytes| Cow::Borrowed(&**bytes))
+  }
+
+  fn release(&mut self, window: StoredWindow) {
+    self.slots.remove(&window);
+  }
+}
+
+/// Where a held content's bytes are: in the store's own memory (its lists, tables and derived nodes), or kept by its
+/// window storage (its windows).
+#[derive(Debug)]
+enum Kept {
+  /// In the store's memory.
+  Here(Box<[u8]>),
+  /// Kept by the window storage.
+  Stored {
+    /// The storage's handle.
+    window: StoredWindow,
+    /// The window's length.
+    len: usize,
+  },
 }
 
 /// What the store has done, for the tests' non-vacuity checks and the owner's accounting.
@@ -173,15 +242,35 @@ pub struct Stored {
 /// One content: its bytes, its form and its holders.
 #[derive(Debug)]
 struct Held {
-  bytes: Box<[u8]>,
+  kept: Kept,
   form: Form,
   holders: u64,
+}
+
+impl Held {
+  /// The bytes kept in the store's own memory: a list's, a table's or a derived node's; none for a window.
+  fn here(&self) -> Option<&[u8]> {
+    match &self.kept {
+      Kept::Here(bytes) => Some(bytes),
+      Kept::Stored { .. } => None,
+    }
+  }
+
+  /// Its length in bytes.
+  fn len(&self) -> usize {
+    match &self.kept {
+      Kept::Here(bytes) => bytes.len(),
+      Kept::Stored { len, .. } => *len,
+    }
+  }
 }
 
 /// The content store (module docs).
 #[derive(Debug)]
 pub struct ContentStore {
   entries: BTreeMap<ContentId, Held>,
+  /// Where the windows' bytes are kept (A-727).
+  storage: Box<dyn WindowStorage>,
   /// The longest content the store holds: the content plane's window.
   window: NonZeroUsize,
   /// The identities one list names at most: the window over an identity's bytes, at least two.
@@ -306,6 +395,14 @@ impl<'b> Tree<'b> {
   }
 }
 
+/// The storage handle of a held window, none for content in the store's memory.
+fn held_window(held: &Held) -> Option<StoredWindow> {
+  match held.kept {
+    Kept::Stored { window, .. } => Some(window),
+    Kept::Here(_) => None,
+  }
+}
+
 /// What giving back a content's last count frees: its bytes and its form, or nothing while other holders remain.
 type Released = Option<(Box<[u8]>, Form)>;
 
@@ -325,6 +422,7 @@ impl ContentStore {
     let window = NonZeroUsize::new(window).ok_or_else(too_small)?;
     Ok(ContentStore {
       entries: BTreeMap::new(),
+      storage: Box::new(HeapWindows::default()),
       window,
       fanout,
       budget,
@@ -420,10 +518,18 @@ impl ContentStore {
       .content_bytes
       .checked_add(width(bytes.len())?)
       .ok_or(ContentRefused::CountExhausted)?;
+    let kept = if form == Form::Window {
+      Kept::Stored {
+        window: self.storage.put(bytes)?,
+        len: bytes.len(),
+      }
+    } else {
+      Kept::Here(Box::from(bytes))
+    };
     self.entries.insert(
       identity,
       Held {
-        bytes: Box::from(bytes),
+        kept,
         form,
         holders: 1,
       },
@@ -636,7 +742,7 @@ impl ContentStore {
       .entries
       .get(identity)
       .filter(|held| held.form == Form::Derived)?;
-    DerivedNode::open(&held.bytes)
+    DerivedNode::open(held.here()?)
   }
 
   /// Gives back one holder's count of `identity`; the content's bytes when that was its last holder, which frees it. A
@@ -673,10 +779,22 @@ impl ContentStore {
     let Some(freed) = self.entries.remove(identity) else {
       return Err(ContentRefused::NotHeld);
     };
-    let len = width(freed.bytes.len())?;
+    let len = width(freed.len())?;
     self.content_bytes = self.content_bytes.saturating_sub(len);
     self.counters.freed = self.counters.freed.saturating_add(1);
-    Ok(Some((freed.bytes, freed.form)))
+    let bytes = match freed.kept {
+      Kept::Here(bytes) => bytes,
+      Kept::Stored { window, .. } => {
+        let bytes = self
+          .storage
+          .read(window)
+          .map(|read| Box::from(&*read))
+          .unwrap_or_default();
+        self.storage.release(window);
+        bytes
+      }
+    };
+    Ok(Some((bytes, freed.form)))
   }
 
   /// The bytes of the content `identity` names: a window's, a list's identities, or a table's. Lists and tables are the
@@ -684,7 +802,40 @@ impl ContentStore {
   /// [`ContentStore::windows`] and [`ContentStore::window_at`], which answer a `Cow` (A-727: a window kept as a sealed
   /// chunk of the shard's arena is copied out to be read).
   pub fn get(&self, identity: &ContentId) -> Option<&[u8]> {
-    self.entries.get(identity).map(|held| &*held.bytes)
+    self.entries.get(identity).and_then(Held::here)
+  }
+
+  /// The bytes of the content `identity` names, whatever its form: a window's from the window storage (borrowed where
+  /// it lends them, copied out where it cannot, A-727), a list's, table's or derived node's from the store's memory.
+  pub fn bytes_of(&self, identity: &ContentId) -> Option<Cow<'_, [u8]>> {
+    let held = self.entries.get(identity)?;
+    match &held.kept {
+      Kept::Here(bytes) => Some(Cow::Borrowed(bytes)),
+      Kept::Stored { window, .. } => self.storage.read(*window),
+    }
+  }
+
+  /// A store whose windows are kept by `storage` (A-727: the daemon's shard repository arena), otherwise as
+  /// [`ContentStore::new`] makes one.
+  ///
+  /// # Errors
+  /// As [`ContentStore::new`].
+  pub fn with_storage(
+    budget: u64,
+    window: usize,
+    storage: Box<dyn WindowStorage>,
+  ) -> Result<ContentStore, ContentRefused> {
+    let mut store = ContentStore::new(budget, window)?;
+    store.storage = storage;
+    Ok(store)
+  }
+
+  /// The length in bytes of the content `identity` names, whatever its form, read without its bytes.
+  pub fn len_of(&self, identity: &ContentId) -> Option<u64> {
+    self
+      .entries
+      .get(identity)
+      .and_then(|held| u64::try_from(held.len()).ok())
   }
 
   /// The form of the content `identity` names.
@@ -730,13 +881,16 @@ impl ContentStore {
         .filter(|held| held.form == Form::List)?;
       let from = usize::try_from(child).ok()?.checked_mul(IDENTITY_BYTES)?;
       let to = from.checked_add(IDENTITY_BYTES)?;
-      identity = list.bytes.get(from..to).and_then(ContentId::from_slice)?;
+      identity = list.here()?.get(from..to).and_then(ContentId::from_slice)?;
     }
-    self
+    let held = self
       .entries
       .get(&identity)
-      .filter(|held| held.form == Form::Window)
-      .map(|held| Cow::Borrowed(&*held.bytes))
+      .filter(|held| held.form == Form::Window)?;
+    match held_window(held) {
+      Some(window) => self.storage.read(window),
+      None => held.here().map(Cow::Borrowed),
+    }
   }
 
   /// An object's bytes, read whole from its root, or `None` when the store does not hold its tree whole.
@@ -924,9 +1078,12 @@ impl<'s> Iterator for Windows<'s> {
       let identity = self.next_identity()?;
       let held = self.store.entries.get(&identity)?;
       if held.form != Form::List {
-        return Some(Cow::Borrowed(&*held.bytes));
+        return match &held.kept {
+          Kept::Here(bytes) => Some(Cow::Borrowed(bytes)),
+          Kept::Stored { window, .. } => self.store.storage.read(*window),
+        };
       }
-      self.stack.push((&*held.bytes, 0));
+      self.stack.push((held.here()?, 0));
     }
   }
 }
@@ -965,7 +1122,7 @@ mod tests {
     let first = put_three_times(&mut store, bytes);
     assert_eq!(store.release(&first).unwrap(), None);
     assert_eq!(store.release(&first).unwrap(), None);
-    assert_eq!(store.get(&first), Some(bytes));
+    assert_eq!(store.bytes_of(&first).as_deref(), Some(bytes));
     assert_eq!(store.release(&first).unwrap().as_deref(), Some(bytes));
     assert!(!store.contains(&first));
     assert_eq!(store.used(), 5);
@@ -994,7 +1151,7 @@ mod tests {
   fn a_put_or_a_charge_past_the_budget_is_refused_and_changes_nothing() {
     let (mut store, eight) = full_store();
     store.set_budget(4);
-    assert_eq!(store.get(&eight), Some(&b"12345678"[..]));
+    assert_eq!(store.bytes_of(&eight).as_deref(), Some(&b"12345678"[..]));
     assert_eq!(
       store.put(b"x"),
       Err(ContentRefused::OverBudget { need: 1, room: 0 })
@@ -1037,7 +1194,7 @@ mod tests {
     assert!(
       store
         .identities()
-        .all(|id| store.get(id).unwrap().len() <= NARROW)
+        .all(|id| store.bytes_of(id).unwrap().len() <= NARROW)
     );
     let len = u64::try_from(bytes.len()).unwrap();
     assert_eq!(store.object_bytes(&root, len).as_deref(), Some(bytes));
@@ -1064,7 +1221,10 @@ mod tests {
     assert_eq!(store.holders(&ContentId::of(fourth)), 2);
     store.release(&root).unwrap();
     assert_eq!(store.len(), 1);
-    assert_eq!(store.get(&ContentId::of(fourth)), Some(fourth));
+    assert_eq!(
+      store.bytes_of(&ContentId::of(fourth)).as_deref(),
+      Some(fourth)
+    );
     store.release(&ContentId::of(fourth)).unwrap();
     assert!(store.is_empty() && store.used() == 0);
   }
@@ -1198,5 +1358,65 @@ mod tests {
       let never = ContentId::of(b"never kept");
       assert_eq!(store.window_at(&never, 10, 0), None);
     }
+  }
+  /// A storage that never lends: every read is a copy, as the daemon's arena storage reads a sealed chunk (A-727).
+  #[derive(Debug, Default)]
+  struct CopyingWindows {
+    inner: HeapWindows,
+  }
+
+  impl WindowStorage for CopyingWindows {
+    fn put(&mut self, bytes: &[u8]) -> Result<StoredWindow, ContentRefused> {
+      self.inner.put(bytes)
+    }
+
+    fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>> {
+      self
+        .inner
+        .read(window)
+        .map(|bytes| Cow::Owned(bytes.into_owned()))
+    }
+
+    fn release(&mut self, window: StoredWindow) {
+      self.inner.release(window);
+    }
+  }
+
+  /// A-727 slice a2 (the window storage seam). Do: in a store whose storage copies every read out, put an object of
+  /// five windows twice and a one-window object, read both back whole and window by window, then release the long
+  /// object's two holds. Expect: the second put answered by the first's root; the lists in the store's own memory, lent
+  /// by `get`, the windows not; every window read copied out (`Cow::Owned`) and equal to the bytes put; and the long
+  /// object gone with its last hold while the short one stays readable.
+  #[test]
+  fn windows_kept_by_a_storage_that_copies_out_read_and_free_as_the_heap_store_does() {
+    let mut store =
+      ContentStore::with_storage(1 << 20, NARROW, Box::new(CopyingWindows::default())).unwrap();
+    let long: Vec<u8> = (0..5 * NARROW)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let root = store.put_object(&long).unwrap();
+    assert_eq!(store.put_object(&long).unwrap(), root);
+    let short = store.put_object(b"short").unwrap();
+    let len = u64::try_from(long.len()).unwrap();
+    assert_eq!(store.object_bytes(&root, len), Some(long.clone()));
+    assert!(
+      store
+        .windows(&root)
+        .all(|window| matches!(window, Cow::Owned(_)))
+    );
+    assert!(
+      store.get(&root).is_some(),
+      "the long object's root is a list, lent from the store's memory"
+    );
+    assert!(
+      store.get(&short).is_none(),
+      "a window is kept by the storage, not lent by get"
+    );
+    assert_eq!(store.bytes_of(&short).as_deref(), Some(&b"short"[..]));
+    store.release(&root).unwrap();
+    assert_eq!(store.object_bytes(&root, len), Some(long));
+    store.release(&root).unwrap();
+    assert_eq!(store.object_bytes(&root, len), None);
+    assert_eq!(store.bytes_of(&short).as_deref(), Some(&b"short"[..]));
   }
 }

@@ -28,8 +28,8 @@ use slates_svn::lock::{AprTime, LockEntry, UUID_BYTES};
 use slates_svn::migration::Repository as SvnRecords;
 use slates_vfs::clock::Clock;
 
-use slates_svn::commit::drive::{Setup, Work};
-use slates_svn::dav::commit::{DavCommit, Hooks, World as CommitWorld};
+use slates_svn::commit::drive::{Due, Setup, Work};
+use slates_svn::dav::commit::{DavCommit, World as CommitWorld};
 use slates_svn::dav::locking::HttpAnswer;
 use slates_svn::serve::{Policy, Sources};
 
@@ -67,8 +67,7 @@ impl SvnStores for ServedRecords {
     id: RepositoryId,
     principal: &Principal,
     setup_of: impl FnOnce(String, AprTime) -> Setup,
-    hooks: Hooks<'_>,
-  ) -> Option<Result<String, HttpAnswer>> {
+  ) -> Option<Result<(String, Option<Due>), HttpAnswer>> {
     crate::state::with_state(|state| {
       let now = AprTime::from_wall_ns(state.clock.wall_ns());
       let youngest = state.vcs_stores.subversion_records(id)?.index().youngest();
@@ -79,14 +78,14 @@ impl SvnStores for ServedRecords {
         green: records,
         locks: records.locks(),
       };
-      let begun = DavCommit::begin(setup_of(name.clone(), now), &world, hooks);
-      Some(begun.map(|commit| {
+      let begun = DavCommit::begin_hooked(setup_of(name.clone(), now), &world);
+      Some(begun.map(|(commit, due)| {
         let key = principal.key();
         let now_ns = state.clock.monotonic_ns();
         state
           .vcs_stores
           .begin_dav_commit(id, &key, name.clone(), (commit, now_ns));
-        name
+        (name, due)
       }))
     })
     .flatten()

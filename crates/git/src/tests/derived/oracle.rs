@@ -686,11 +686,11 @@ fn same_bytes(first: &ContentStore, second: &ContentStore, root: ContentId) {
       continue;
     }
     assert_eq!(
-      first.get(&id),
-      second.get(&id),
+      first.bytes_of(&id),
+      second.bytes_of(&id),
       "the same bytes under one identity"
     );
-    assert!(first.get(&id).is_some(), "a node's names are held");
+    assert!(first.bytes_of(&id).is_some(), "a node's names are held");
     if let Some(node) = first.derived(&id) {
       pending.extend(node.names());
     }

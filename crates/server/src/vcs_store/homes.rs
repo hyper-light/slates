@@ -205,8 +205,8 @@ pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<
     .vcs_stores
     .content
     .as_ref()
-    .and_then(|content| content.get(identity))
-    .map(<[u8]>::to_vec)?;
+    .and_then(|content| content.bytes_of(identity))
+    .map(std::borrow::Cow::into_owned)?;
   state.count(READ, 1);
   Some(bytes)
 }

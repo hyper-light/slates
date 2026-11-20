@@ -331,7 +331,7 @@ impl HookView {
     }
     let mut counters = ViewCounters::default();
     let refs = PackedRefs::of(repository, store, snapshot.refs, admission)?;
-    let cover = units::choose(repository, store, admission, &mut counters)?;
+    let cover = units::choose(repository, admission, &mut counters)?;
     let mut units = units::build(repository, store, &cover, push, admission, &mut counters)?;
     units.sort_by_key(|unit| unit.name);
     // One name is one pack: a name hashes everything a pack is made from, so two packs of one
