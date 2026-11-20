@@ -15,7 +15,12 @@
   the fleet wait". Log ~/.cache/w-forming-runs/fm1/run-7.log (this Mac). Out of my goal's scope -> reported to main.
 - fm1 done: 11/12 PASS; formation reached every candidate in 12/12 (load ~3/14 cores, not one-CPU). Next fm2: 12 runs under taskpolicy -b.
 - fm2 (taskpolicy -b) 12/12 PASS. Formation reached every candidate 24/24 on current main (a6764af1e); no forming shape reproduced, nothing to fix. 48-run sweep is main's. Only failure: fm1 run 7 holder-move stall (reported). Built binary kept: ~/.cache/w-forming-target/debug/deps/live_chaos-7bc0fbed7b2dcb5e; loop ~/.cache/w-forming-scripts/loop.sh.
-- Nothing finished, so nothing to land on main. Queue done; waiting on main.
+- 2026-11-20 ~08:20Z main's two new items: (1) 48-run sweep under taskpolicy -b on current main (branch merged
+  90d380aea), loop tag sw48, bg task output brsl8komz; (2) chase run 7 (holder move onto the fresh member stalls,
+  "covers candidates false"). Added diagnosis(...) to settled_holders' assert (live_chaos.rs ~4881; repro aid, test-only,
+  rebuilt 00:20 PST -- sweep runs after that use it, behaviour unchanged). Repro loop rp1 (40 runs, unthrottled) beside it.
+  Lead: covers_candidates needs member_anchors (fleet.rs deliver loop, ~10760, anchor via learned_members) + an accepted
+  pair to the fresh member at its anchor; diagnosis shows fleet.seal.pair_* counters.
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
   test, fix, land (needs a machine that can push). No failure -> report count to slates-7a.
