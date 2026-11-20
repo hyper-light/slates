@@ -1101,6 +1101,61 @@ fn a_moved_green_judges_again_only_the_increment_since_the_position() {
   assert!(both.is_some_and(|(held, _)| held.applied().len() == COLD_FILES + 1));
 }
 
+/// A-658 part 3b, A-697 part c (the owner commits a verdict a holder computed, through its wire form). Do: compute, on a
+/// copy at version 50, the work of the test above; land version 51 on the owner and on a serial green; hand the owner the
+/// verdict through its wire form (`encode`, `computed_from`) to `submit_computed`, and submit the work serially; hand
+/// the owner the same verdict again. Expect: both accepted as version 52, recording the same, and reading alike; the
+/// second answered version 52 from the owner's record, nothing committed.
+#[test]
+fn a_verdict_computed_on_a_copy_commits_through_its_wire_form_as_the_serial_submit() {
+  let (copy, mut owner, mut serial) = (hot_green(), hot_green(), hot_green());
+  let mut edits = vec![("hot".to_owned(), 1000, &b"workwork"[..])];
+  edits.extend((0..COLD_FILES).map(|cold| (format!("c{cold:03}"), 0, &b"WARM"[..])));
+  let job = overwrites(0, 1000, &edits);
+  let form = copy
+    .compute(&job)
+    .expect("computed at version 50")
+    .encode(&job);
+  let moving = [("hot".to_owned(), 2000, &b"newnewne"[..])];
+  for green in [&mut owner, &mut serial] {
+    let landed = green.submit(&overwrites(HOT_VERSIONS, 1001, &moving));
+    assert_eq!(
+      landed,
+      Outcome::Accepted {
+        version: HOT_VERSIONS + 1
+      }
+    );
+  }
+  let computed = owner.computed_from(&job, &form).expect("read back");
+  let by_position = owner
+    .submit_computed(&job, computed)
+    .expect("taken by position");
+  let serially = serial.submit_resolved(&job);
+  assert_eq!(
+    by_position.0,
+    Outcome::Accepted {
+      version: HOT_VERSIONS + 2
+    }
+  );
+  assert_eq!(
+    by_position, serially,
+    "the same outcome and the same record"
+  );
+  assert_eq!(seen(&mut owner), seen(&mut serial), "the greens read alike");
+  let again = owner.computed_from(&job, &form).expect("read back again");
+  let before = seen(&mut owner);
+  assert_eq!(
+    owner.submit_computed(&job, again),
+    Ok((
+      Outcome::Accepted {
+        version: HOT_VERSIONS + 2
+      },
+      None
+    ))
+  );
+  assert_eq!(seen(&mut owner), before, "nothing committed again");
+}
+
 /// A-658 (the owner's typed refusals). Do: hand the owner, at version 1, a verdict computed for another increment, one
 /// computed on a green at version 2, and one from a green that had accepted, as version 2, an increment the owner
 /// never accepted. Expect: `OtherWork`; `Ahead` naming both heads; `NotRecorded` naming the version; the owner reads

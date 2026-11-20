@@ -480,6 +480,7 @@ RequestBody 91 DescribeRepositoryPolicy
 RequestBody 92 ExportDump
 RequestBody 93 AdmitWork
 RequestBody 94 MoveWorkFloor
+RequestBody 95 SubmitComputed
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

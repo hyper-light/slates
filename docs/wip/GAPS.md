@@ -4671,8 +4671,10 @@
 > Progress (A-697, 2026-11-20): part a1 built, the owner's admission of another node's work by a forwarded
 > `AdmitWork` (rights from the green's record, the floor at the head, answered once); part a2 built behind a test hook
 > (a holder makes the work on its client's partition, admitted over the fleet, its base read from its replica); part b
-> built (the holder moves and drops the work's floor at the owner, `MoveWorkFloor`, monotone); parts c to f and the
-> routing flip are open.
+> built (the holder moves and drops the work's floor at the owner, `MoveWorkFloor`, monotone); part c built (a
+> holder's submit committed by the verdict its replica computed, taken by position at the owner, `SubmitComputed`);
+> parts d to f, a holder work's rebase and copies, an increment too large for the forward lane, and the routing flip
+> are open.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's

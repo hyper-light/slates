@@ -21106,6 +21106,98 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
   );
 }
 
+/// A-697 part c, A-658 part 3b (a verdict computed anywhere, committed by position): in a two-node `f = 1` fleet, B
+/// serves works over greens A owns (the test hook), and makes a work over A's green at version 1 (`f` holding "hello").
+/// Do: the work edits `f` and submits; then a client of A reads the green, and B's client the work. Expect: answered
+/// `Submitted` at version 2, the verdict computed on B's replica (B's counter) and taken by position at A (A's counter),
+/// nothing judged at A from the work's journal; A's green reads "hello world"; B's work, now based on version 2, reads
+/// the same; and A's floor for the work rises to 2, told by B.
+#[test]
+fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_position_at_the_owner()
+{
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  let count = |daemon: &Daemon, name: &str| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let computed_before = count(&daemon_b, "merge.work.computed_on_holder");
+  let taken_before = count(&daemon_a, "merge.verdict.taken_by_position");
+  let edited = holder.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 5,
+    delete_len: 0,
+    bytes: b" world".to_vec(),
+  });
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  let computed = count(&daemon_b, "merge.work.computed_on_holder") - computed_before;
+  let taken = count(&daemon_a, "merge.verdict.taken_by_position") - taken_before;
+  let greens_bytes = head_bytes(&mut owner, green, "f");
+  let works_bytes = head_bytes(&mut holder, work, "f");
+  let both = [&daemon_a, &daemon_b];
+  let floor_rose = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a
+      .work_floor(green, work)
+      .map(|floor| floor == Some(2))
+  });
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "B's work committed as version 2: {submitted:?}"
+  );
+  assert_eq!(computed, 1, "the verdict was computed on B's replica");
+  assert_eq!(taken, 1, "and taken by position at A");
+  assert_eq!(
+    greens_bytes,
+    Ok(b"hello world".to_vec()),
+    "A's green holds the version"
+  );
+  assert_eq!(works_bytes, greens_bytes, "B's work, based on it, reads it");
+  assert!(floor_rose, "A's floor for the work rose to its new base");
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
