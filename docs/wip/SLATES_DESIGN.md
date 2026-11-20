@@ -55723,3 +55723,25 @@ at its exact length); `crates/mcp` (a shard's `content_ranges`); §4.2's status;
   `vcs_store::svn_import`; `slates-svn --lib commit::record` (every shape reserved at its exact length);
   `slates-mcp --test mcp` (each shard's content ranges, none past its bytes); `cargo xtask unsafe` ok (slates-mem
   80 of 80); fmt clean.
+
+### A-626 part 4, the work verb on every surface — `copy` on the CLI, both SDKs and MCP, each held to the wire's operations by an exhaustive match (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** A verb is done when every surface has it (R10: a copy is no grant verb, so the SDKs and MCP carry it too).
+  The surfaces named the wire's work operations by name, with no exhaustive match, which is how `WorkOp::Copy` reached
+  the wire with no surface having it and no build saying so.
+- **Change.** The CLI's `copy WORK FROM TO [--version N] [--replace] [--json]`; the Python SDK's `copy(work, from, to,
+  version=None, replace=False)` on `Client` and `AsyncClient`; the Node SDK's `copy(work, from, to, version?,
+  replace?)` on `Client` and `AsyncClient` (`beginSpinCopy`), typed in `index.d.ts`; MCP's `copy{from,to,version?,
+  replace?}` kind of `slates.merge.declare`, in its schema. MCP (`slates_mcp::work_op_kind`) and both SDKs
+  (`work_op_method`, exported as `work_op_methods()` / `workOpMethods()`) name each `WorkOp` by an exhaustive match, so
+  an operation appended to the wire breaks their builds until each decides whether and how to offer it (`Mknod`, a
+  declaring host's metadata, is offered on none of them); the SDKs' tests hold every listed method to both clients.
+- **Tests, by use against a real daemon** (macOS arm64, this Mac, local, own target, 2026-11-20). CLI:
+  `the_verbs_emit_json_with_the_json_flag` with `SLATES_TEST_CLI=1` (`merge_copy`: `/c/x.txt` lands, `copy WORK /c /e`
+  lands, `read GREEN /e/x.txt` streams it), and the argument parser's test; MCP: `cargo test -p slates-mcp --test mcp`
+  (`assert_copy_declared_and_read_back`, the in-process daemon); Python: `python -m unittest
+  crates/sdk-python/tests/test_sdk.py` with `SLATES_DAEMON` (4 of 4: the copy round trip read back by the CLI, and
+  every offered method on both clients), the extension built by `maturin develop`; Node: `node --test
+  tests/sdk.test.mjs tests/sdk_async.test.mjs` with `SLATES_NODE_ADDON` (the crate's cdylib) and `SLATES_DAEMON`, 9 of 9.
+- **Found by use** (reported, next piece): a copy of a tree holding a hard link is refused as a `TypeChanged` conflict at
+  its destination (A-586's "does not yet copy" case answering the wrong kind); the surfaces' tests copy a tree without
+  one.

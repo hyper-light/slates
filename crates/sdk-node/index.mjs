@@ -1,7 +1,7 @@
 // The ESM entry for the slates Node SDK: the synchronous `Client` from the native addon, and the
 // async-primary `AsyncClient` (from async.mjs, which loads the same addon). A refused operation
 // crosses as a plain JS `Error` carrying the refusal's text (the Node SDK has no custom error class).
-//   import { Client, AsyncClient, execCommand, apparmorProfile } from '@hyper-light/slates'
+//   import { Client, AsyncClient, execCommand, apparmorProfile, workOpMethods } from '@hyper-light/slates'
 import { createRequire } from 'node:module'
 import { AsyncClient } from './async.mjs'
 
@@ -12,5 +12,7 @@ export const Client = addon.Client
 // The chosen-path launcher's command and slates' AppArmor profile (A-370).
 export const execCommand = addon.execCommand
 export const apparmorProfile = addon.apparmorProfile
+// The client methods that declare a work's operations, one an operation the SDK offers (A-626 part 4).
+export const workOpMethods = addon.workOpMethods
 export { AsyncClient }
 export default addon
