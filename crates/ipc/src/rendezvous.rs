@@ -4152,6 +4152,25 @@ pub mod platform {
     }
   }
 
+  /// The header's image a claim reads the process marks from (A-447, A-468): the bytes from the daemon's process id to
+  /// the end of the anchor's creation time, copied to their own offsets in a header-sized image, the rest left zero.
+  /// The header's other bytes hold declared words (the doorbell, the claim's mark, the start stamp), which a plain copy
+  /// may not touch (`LayoutRefusal::TouchesWord`): a copy of the whole header refused every Windows client's connect
+  /// (found by use on CI's windows-latest, 2026-11-20). [`ProcessMark::daemon_of`] and [`ProcessMark::anchor_of`] read
+  /// the marks alone.
+  #[cfg(any(windows, test))]
+  fn marks_image(object: &SharedObject) -> Result<[u8; HEADER_BYTES], IpcError> {
+    let marks_end = AT_ANCHOR_CREATED.saturating_add(size_of::<u64>());
+    let mut header = [0u8; HEADER_BYTES];
+    let marks = header
+      .get_mut(AT_DAEMON_PID..marks_end)
+      .ok_or(IpcError::Layout {
+        reason: "the process marks lie past the bootstrap header",
+      })?;
+    object.read(AT_DAEMON_PID, marks)?;
+    Ok(header)
+  }
+
   /// This process's mark (Windows), written into the header before the daemon publishes it.
   #[cfg(windows)]
   fn own_mark() -> Result<ProcessMark, IpcError> {
@@ -4193,8 +4212,7 @@ pub mod platform {
   /// refused typed: every daemon of this layout writes one before it publishes.
   #[cfg(windows)]
   fn unanswered_end(object: &SharedObject) -> Result<Ends, IpcError> {
-    let mut header = [0u8; HEADER_BYTES];
-    object.read(0, &mut header)?;
+    let header = marks_image(object)?;
     if let Some(anchor) = ProcessMark::anchor_of(&header) {
       let watch = crate::exit_watch::ExitWatch::on_created(anchor.pid, anchor.created)?;
       if !watch.exited() {
@@ -4246,8 +4264,7 @@ pub mod platform {
         });
       }
     }
-    let mut header = [0u8; HEADER_BYTES];
-    object.read(0, &mut header)?;
+    let header = marks_image(&object)?;
     if mark_lives(ProcessMark::anchor_of(&header))? {
       return Ok(true);
     }
@@ -4911,6 +4928,41 @@ pub mod platform {
       assert_eq!(ProcessMark::daemon_of(&header), Some(daemon));
       assert_eq!(ProcessMark::anchor_of(&header), Some(anchor));
       assert_eq!(MAGIC.to_le_bytes(), *b"SLB5");
+    }
+
+    /// A-447, A-468 (a real bootstrap object; found by use: goal-83 B3's probe on CI's windows-latest, 2026-11-20).
+    /// Do: write a daemon's mark and an anchor's into a bootstrap object laid out as every daemon lays it out, publish
+    /// its start stamp, and read the marks back as a Windows claim reads them. Expect: both marks whole. Before, the
+    /// claim copied the whole 64-byte header, whose declared words (the doorbell, the claim's mark, the start stamp) a
+    /// copy may not touch, so every Windows client's connect was refused `TouchesWord` and no client reached a daemon.
+    #[test]
+    fn a_claim_reads_the_process_marks_of_a_published_bootstrap_object() {
+      let name = instance("marks");
+      let mut object =
+        SharedObject::create(&rendezvous_name(&name), OBJECT_BYTES, bootstrap_words()).unwrap();
+      let daemon = ProcessMark {
+        pid: 0x0403_0201,
+        created: 0x1817_1615_1413_1211,
+      };
+      let anchor = ProcessMark {
+        pid: 0x0807_0605,
+        created: 0x2827_2625_2423_2221,
+      };
+      for (mark, pid_at, created_at) in [
+        (daemon, AT_DAEMON_PID, AT_DAEMON_CREATED),
+        (anchor, AT_ANCHOR_PID, AT_ANCHOR_CREATED),
+      ] {
+        let (pid, created) = mark.bytes();
+        object.write(pid_at, &pid).unwrap();
+        object.write(created_at, &created).unwrap();
+      }
+      object
+        .atomic_u64(AT_GENERATION)
+        .unwrap()
+        .store(1, Ordering::Release);
+      let header = marks_image(&object).unwrap();
+      assert_eq!(ProcessMark::daemon_of(&header), Some(daemon));
+      assert_eq!(ProcessMark::anchor_of(&header), Some(anchor));
     }
 
     /// A-447, A-468 (hostile images). Do: read the marks of an image with none written, of one whose daemon's process

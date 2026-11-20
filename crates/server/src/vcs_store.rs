@@ -146,6 +146,9 @@ pub(crate) struct VcsStores {
   unrecovered: BTreeMap<RepositoryId, ReplayRefused>,
   /// What the content store holds of the shard's budget, charged as retention.
   charged: u64,
+  /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
+  /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
+  objects_charged: BTreeMap<RepositoryId, u64>,
   /// Each Mercurial repository's import under way, between its turns ([`hg_import`]): one a repository, so bounded by
   /// the partition's repositories.
   imports: BTreeMap<RepositoryId, hg_import::Importing>,
@@ -471,13 +474,15 @@ const GREEN_KEY_START: usize = size_of::<u64>();
 /// Format: the bytes of a green's key: the partition's two and the counter's six.
 const GREEN_KEY_BYTES: usize = size_of::<u64>();
 
-/// Makes `record`'s store on its owner shard, beside its record (module docs): empty, so it charges nothing yet. A
-/// store held already is kept.
+/// Makes `record`'s store on its owner shard, beside its record (module docs): empty, so it charges nothing yet but
+/// the objects its entries hold in the partition's register, which a recovery finds there ([`settle_objects`]). A store
+/// held already is kept.
 pub(crate) fn make(state: &mut ShardState, record: &RepositoryRecord) {
   let window = state.store.content.chunk_bytes();
   if made(&mut state.vcs_stores, record, window).is_err() {
     state.count(STORE_UNMADE, 1);
   }
+  settle_objects(state, record.id);
 }
 
 /// [`make`]'s step over the stores, the content store made at the first repository with the content plane's `window`.
@@ -515,11 +520,59 @@ struct Unmade;
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   hg_import::abandon(state, id);
   svn_import::abandon(state, id);
+  if let Some(charged) = state.vcs_stores.objects_charged.remove(&id) {
+    state.store.budget.credit_retention(charged);
+  }
   state.vcs_stores.unrecovered.remove(&id);
   if !release_charged(state, id) {
     state.count(RELEASE_REFUSED, 1);
   }
   settle(state);
+}
+
+/// Trues the shard's charge for repository `id`'s entries' objects up to what the partition's register holds of them
+/// (A-662; `Repositories::objects_bytes`): the repository's content is charged to its owner shard's memory budget, as
+/// its tool store is, so a repository's bound is what its shard can hold, never the partition's merge budget. A charge
+/// the budget would not take is counted ([`CHARGE_SHORT`]) and kept as charged, as the store's own true-up keeps it.
+pub(crate) fn settle_objects(state: &mut ShardState, id: RepositoryId) {
+  let held =
+    u64::try_from(state.db.partition().repositories().objects_bytes(id)).unwrap_or(u64::MAX);
+  let charged = state
+    .vcs_stores
+    .objects_charged
+    .get(&id)
+    .copied()
+    .unwrap_or(0);
+  if held > charged {
+    if state.store.budget.charge_retention(held - charged).is_err() {
+      state.count(CHARGE_SHORT, 1);
+    }
+  } else {
+    state.store.budget.credit_retention(charged - held);
+  }
+  if held == 0 {
+    state.vcs_stores.objects_charged.remove(&id);
+  } else {
+    state.vcs_stores.objects_charged.insert(id, held);
+  }
+}
+
+impl VcsStores {
+  /// What repository `id`'s entries' objects hold of the shard's budget ([`settle_objects`]).
+  #[cfg(test)]
+  pub(crate) fn objects_charged(&self, id: RepositoryId) -> u64 {
+    self.objects_charged.get(&id).copied().unwrap_or(0)
+  }
+}
+
+/// Whether the shard's budget could admit `bytes` more of a repository's entries' objects now ([`settle_objects`]):
+/// what an append asks before its entry is judged; the bytes it could admit otherwise.
+pub(crate) fn admit_objects(state: &ShardState, bytes: usize) -> Result<(), u64> {
+  let room = state.store.admittable();
+  if u64::try_from(bytes).unwrap_or(u64::MAX) > room {
+    return Err(room);
+  }
+  Ok(())
 }
 
 /// [`release`], the Subversion records' charge given back to the shard's budget first (A-655 part 2b).

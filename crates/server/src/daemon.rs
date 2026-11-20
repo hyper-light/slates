@@ -676,7 +676,7 @@ pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 
 /// The status refusal count under which the daemon records a perpetual loop of its own that the control
 /// shard's arena refused — the mount listener's serve loop, the anchor heartbeat — counted, never silent
-/// (banned item 9); a shard's serve and reap loops are a typed initialization failure instead
+/// (banned item 9); a shard's serve loop and idle sweep are a typed initialization failure instead
 /// (`init_shard`), since a shard without them serves nothing.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const LOOP_SPAWN_REFUSED: &str = "daemon.loop_spawn";
@@ -4732,6 +4732,7 @@ async fn init_shard(
     reaper_task: None,
     capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
     deadline_task: None,
+    base_hints: crate::base_hints::BaseHints::default(),
     deadline_armed: None,
     destroy_retry_at: None,
     scatters: std::collections::BTreeMap::new(),
@@ -4850,6 +4851,11 @@ async fn init_shard(
     nfs_purges_refused: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
+    delegation_lapse_at: None,
+    idle_sweep_at: None,
+    idle_sweeper: None,
+    idle_sweep_running: false,
+    idle_sweep_seen: (0, 0),
     placement_rearm_at: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
@@ -4895,6 +4901,7 @@ async fn init_shard(
     vcs_stores: crate::vcs_store::VcsStores::default(),
     hook_times: crate::vcs_hooks::HookTimesTable::default(),
     pending_green_materializations: std::collections::BTreeMap::new(),
+    pending_repositories: std::collections::BTreeMap::new(),
   };
   // The mounts a predecessor kept that this partition's catalog names, recorded as this daemon's own before anything
   // below reacquires a base or resumes a landing (A-227); then this shard's learning ends, and the process's crossing
@@ -4964,18 +4971,22 @@ async fn init_shard(
   let _ = state::with_state_counted(verbs::renew_termed_at_start);
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
-  // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure
+  // A shard whose serve loop or idle sweep the arena refuses serves nothing: a typed initialization failure
   // (surfaced by the boot as `INIT_FAILURES`), never a silently loop-less shard (banned item 9).
   let serve = futures::spawn(serve_loop()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(serve);
-  let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
-  let _ = futures::detach(reap);
+  // The idle sweep (A-715): one pass a sweep's interval after what owes it, none while nothing does.
+  let sweeper = futures::spawn(crate::idle_sweep::sweeper()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(sweeper);
   // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
   let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reaper);
   // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
   let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(keeper);
+  // The hint watcher (A-709): drains each overlay's base hints when the shard's set reports its watcher ready.
+  let hints = futures::spawn(crate::base_hints::watcher()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(hints);
   // The pressure hold's sampler (A-570): on the control shard it samples at its start and at each report of the host's
   // memory pressure; elsewhere it ends at once.
   let sampler = futures::spawn(crate::pressure::sampler()).map_err(ServerError::Runtime)?;
@@ -5031,104 +5042,20 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: base hints and the idle seal. Since
-/// A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
-/// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
-/// claim's deadline (Linux, `crate::held_copy::reclaim_owed`); since A-570 the pressure hold is sampled at the host's
-/// own reports (`crate::pressure`), the NFSv4 purges owed are sent by the reaper at their own deadline
-/// (`crate::nfs::note_purges`), and a declined huge-page placement is re-armed by the keeper a retry window after the
-/// decline. Dead clients are no longer its: since A-475 each client's watch reports its hang-up and the shard's reaper
-/// retires it then (`crate::reap`); nor, since A-522, A-536 and A-554, are abandoned staging buffers, status captures,
-/// lapsed write leases, lapsed CLI attachments, grants past their term and the owed audit's resend, which the shard's
-/// keeper takes at their own deadlines (`crate::deadlines`), nor destroys, which the serve loop steps once woken and
-/// the keeper retries at a refused record's deadline. The jobs left here leave a piece at a time for the events or
-/// deadlines that own them, and then the loop and its tick go (the reaper series, GAPS). Derived: the cadence is the
-/// budget.
-async fn reap_loop() {
-  let cadence = derived!(
-    LIVENESS_BUDGET_NS,
-    "the liveness budget (the anchor's question of the daemon, asked of the daemon's clients)",
-    ["LIVENESS_BUDGET_NS"]
-  )
-  .get();
-  loop {
-    pace(cadence).await;
-    state::with_state(|s| {
-      process_base_hints(s);
-      // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
-      crate::delegation::drain(s);
-    });
-    seal_idle_content().await;
-  }
-}
-
-/// Counter: overlay volumes whose watcher hints the reap tick could not process (the host refused a re-check); the
-/// hints are taken again at the next tick's listing, so none is lost, but a refusal is never silent.
-const BASE_HINTS_REFUSED: &str = "base.hints_refused";
-/// Counter: watcher hints the reap tick drained, over every overlay volume (the drain's non-vacuity counter).
-const BASE_HINTS_DRAINED: &str = "base.hints_drained";
-/// Counter: delegation recalls an outsider's edit beneath an untouched base entry asked for (A-122).
-const OUTSIDE_RECALLS: &str = "nfs4.recall.outside_asked";
-
-/// Drains every overlay volume's watcher hints, once a reap tick (§4.5, §4.15; RFC 8881 §10.2): a changed base
-/// directory has its listing invalidated, its witnessed entries re-checked for drift, and every delegation held on an
-/// untouched entry in it asked to be recalled, so an outsider's edit reaches a delegation holder within a tick and a
-/// round trip. Before 2026-10-08 hints were drained only by `status` and the FUSE coherence path, so over NFS a client
-/// holding a read delegation kept serving its cached bytes after an outsider changed the file.
-///
-/// Derived: the cadence is the reap loop's (the liveness budget), which already wakes the shard, so draining adds one
-/// non-blocking read of each watcher per tick and no wakeup. A client without a delegation sees an outsider's edit only
-/// after its attribute cache times out (`acregmin`, 3 s by default on Linux, nfs(5)), so the tick bounds the delegated
-/// client inside that. Rejected for now: a task per volume awaiting its watcher's descriptor, whose descriptor a
-/// destroy closes while the task may still be waiting on it.
-fn process_base_hints(s: &mut ShardState) {
-  let mut refused = 0u64;
-  let mut drained = 0u64;
-  let recalls_before = s.store.recall_gate.outside_recalls();
-  for (_, slot) in s.volumes.iter_mut_all() {
-    let Some(host) = slot.host.as_mut() else {
-      continue;
-    };
-    let seq_before = slot.volume.base_plane().map_or(0, |plane| plane.hint_seq());
-    if slot
-      .volume
-      .with_host(host)
-      .process_hints(&mut s.store)
-      .is_err()
-    {
-      refused = refused.saturating_add(1);
-    }
-    let seq_after = slot.volume.base_plane().map_or(0, |plane| plane.hint_seq());
-    drained = drained.saturating_add(seq_after.saturating_sub(seq_before));
-  }
-  let asked = s
-    .store
-    .recall_gate
-    .outside_recalls()
-    .saturating_sub(recalls_before);
-  if refused > 0 {
-    s.count(BASE_HINTS_REFUSED, refused);
-  }
-  if drained > 0 {
-    s.count(BASE_HINTS_DRAINED, drained);
-  }
-  if asked > 0 {
-    s.count(OUTSIDE_RECALLS, asked);
-  }
-}
-
-/// The idle sweep of this shard's volumes (A-99), once a reap tick: every volume ages its writes, then the open extents
-/// of files idle a whole tick are sealed in cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in
-/// the shard's step quantum; AES-256-GCM seals at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's
-/// 9–10 here), yielding between slices so the shard keeps serving, until none is left.
-async fn seal_idle_content() {
+/// One pass of the idle sweep of this shard's volumes (A-99; run by `crate::idle_sweep` since A-715, by the reap loop's
+/// tick before): every volume ages its writes, then the open extents of files idle a whole pass are sealed in
+/// cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in the shard's step quantum; AES-256-GCM seals
+/// at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's 9–10 here), yielding between slices so the shard
+/// keeps serving, until none is left. Whether the pass settled the shard: it reached an idle purge that finished, and no
+/// volume owes another pass; otherwise the sweep arms its next.
+pub(crate) async fn seal_idle_content() -> bool {
   let aged = state::with_state(|s| {
     for (_, slot) in s.volumes.iter_mut_all() {
       slot.volume.age_writes();
     }
   });
   if aged.is_none() {
-    return;
+    return true;
   }
   let mut sealed_this_tick = 0u64;
   loop {
@@ -5180,9 +5107,16 @@ async fn seal_idle_content() {
         1,
       );
     });
-    return;
+    return false;
   }
-  purge_if_idle().await;
+  let purged = purge_if_idle().await;
+  let owes = state::with_state(|s| {
+    s.volumes
+      .iter_mut_all()
+      .any(|(_, slot)| slot.volume.sweep_owes())
+  })
+  .unwrap_or(false);
+  purged && !owes
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
@@ -5295,7 +5229,7 @@ async fn probe_give_back(neighbour: bool) {
     let _ = futures::detach(task);
   }
   let before = state::with_state(|s| idle_ticks(s)).unwrap_or(0);
-  purge_if_idle().await;
+  let _settled = purge_if_idle().await;
   let after = state::with_state(|s| idle_ticks(s)).unwrap_or(before);
   GIVE_BACK_PROBE.store(after.saturating_sub(before), Ordering::Release);
 }
@@ -5401,7 +5335,7 @@ fn return_dead_recovery_timed(
 /// refill faults in those of them not resident, a slice of `quantum / page_fault_ns` pages at a time, so a burst after
 /// idle writes onto resident pages: a large write over fresh pages spent 41.5% of the shard faulting them in (CI run
 /// 41986870989). The work stops as soon as a request makes the shard allocate.
-async fn purge_if_idle() {
+async fn purge_if_idle() -> bool {
   loop {
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
@@ -5448,7 +5382,8 @@ async fn purge_if_idle() {
     })
     .flatten();
     if step != Some(true) {
-      return;
+      // Settled once a step found the shard idle and left nothing; a busy shard owes the next pass.
+      return step == Some(false);
     }
     // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
     // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
@@ -5461,7 +5396,7 @@ async fn purge_if_idle() {
       .is_some_and(|(before, after)| after.saturating_sub(before) > 1);
     if others_ran {
       let _ = state::with_state_counted(|s| s.count(GIVE_BACK_LEFT, 1));
-      return;
+      return false;
     }
   }
 }

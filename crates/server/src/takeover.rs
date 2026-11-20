@@ -239,6 +239,11 @@ const TAKEOVER_ADOPTED: &str = "fleet.takeover.adopted";
 /// Format: a counter name in the daemon's status report.
 pub(crate) const TAKEOVER_STATE_LOG_ADOPTED: &str = "fleet.takeover.state_log_adopted";
 
+/// Counter: a repository's own register adopted by this successor, its record kept for the repository's rebuild from
+/// it and its state logs (A-636 part 2c-1; the rebuild is part 2c-2). Format: a counter name in the daemon's status
+/// report.
+pub(crate) const TAKEOVER_REPOSITORY_ADOPTED: &str = "fleet.takeover.repository_adopted";
+
 /// Counter: a takeover round started over, under a newer configuration or above a fence a holder reported
 /// ([`begin_round`]); the objects it adopted stay adopted, and their copies do not raise its epoch (A-353).
 /// Format: a counter name in the daemon's status report.
@@ -2479,7 +2484,8 @@ fn adopt_catalog(state: &mut ShardState, object: ObjectId, record: &Record) {
 }
 
 /// An object's own register adopted, by its value's class: a destroyed volume's tombstone, a volume's head (its
-/// materialization queued from where its departed owner placed it), or a green's merge record (its rebuild queued).
+/// materialization queued from where its departed owner placed it), a repository's record (kept for its rebuild, A-636
+/// part 2c-1), or a green's merge record (its rebuild queued).
 fn adopt_own(
   state: &mut ShardState,
   (departed, object, record): (HostId, ObjectId, &Record),
@@ -2509,6 +2515,13 @@ fn adopt_own(
     let mut pending = crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts);
     pending.registers_short = registers_short;
     state.pending_materializations.insert(object, pending);
+  } else if let Some(repository) = crate::catalog::repository_of(&record.value) {
+    // A repository's record (A-636 part 2c-1): kept for its rebuild from it and its state logs (part 2c-2), never
+    // queued as a volume or a green.
+    state
+      .pending_repositories
+      .insert(object, (record.sequence, repository));
+    state.count(TAKEOVER_REPOSITORY_ADOPTED, 1);
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
@@ -3535,6 +3548,77 @@ mod tests {
         local,
       );
       assert!(state.pending_materializations.contains_key(&repository));
+    });
+  }
+
+  /// A-636 part 2c-1. Do: on a successor's shard, adopt a departed owner's repository's own register holding its record,
+  /// at sequence 5; then adopt another object's own register whose value is a repository's record cut short, and one
+  /// whose value is a record behind a state log's class byte. Expect: the repository kept as a pending repository with
+  /// the sequence and the record adopted, counted once; nothing queued to be materialized or rebuilt for it (no volume,
+  /// green or tombstone); the cut-short and misclassed values kept as no repository.
+  #[test]
+  fn a_repositorys_record_is_adopted_as_its_own_never_as_a_volume_or_a_green() {
+    crate::daemon::audit_on_shard(|state| {
+      let (departed, local) = (HostId(7), state.fleet.host());
+      let repository = ObjectId::family(departed, 0, 9, 9).unwrap();
+      let held = slates_db::catalog::RepositoryRecord {
+        id: slates_db::catalog::RepositoryId {
+          bytes: repository.0,
+        },
+        name: "linux".to_owned(),
+        tool: slates_db::catalog::VcsTool::Git,
+        format: slates_db::catalog::ObjectFormat::Sha1,
+        default_branch: Some("main".to_owned()),
+        owner: slates_db::catalog::Principal::Certificate { hash: [7; 32] },
+        policy: slates_db::catalog::RepositoryPolicy::default(),
+      };
+      let value = crate::catalog::repository_value(&held);
+      let record = |object: ObjectId, value: Vec<u8>| Record {
+        owner: local,
+        object,
+        sequence: 5,
+        epoch: HostEpoch(2),
+        generation: 0,
+        value,
+      };
+      record_adoption(
+        state,
+        departed,
+        repository,
+        &record(repository, value.clone()),
+        Placement::of(&[local]),
+        local,
+      );
+      assert_eq!(
+        state.pending_repositories.get(&repository),
+        Some(&(5, held.clone()))
+      );
+      assert!(!state.pending_materializations.contains_key(&repository));
+      assert!(
+        !state
+          .pending_green_materializations
+          .contains_key(&repository)
+      );
+      assert!(!state.pending_tombstones.contains_key(&repository));
+      let short = value.get(..value.len().saturating_sub(1)).unwrap().to_vec();
+      let mut misclassed = value;
+      misclassed[0] = crate::catalog::STATE_LOG_CLASS;
+      for (serial, value) in [(10, short), (11, misclassed)] {
+        let other = ObjectId::family(departed, 0, 9, serial).unwrap();
+        record_adoption(
+          state,
+          departed,
+          other,
+          &record(other, value),
+          Placement::of(&[local]),
+          local,
+        );
+        assert!(!state.pending_repositories.contains_key(&other), "{serial}");
+      }
+      assert_eq!(
+        state.refusals.get(TAKEOVER_REPOSITORY_ADOPTED).copied(),
+        Some(1)
+      );
     });
   }
 

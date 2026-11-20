@@ -492,6 +492,15 @@
 > `svn_view::TunnelRecords`, commits through `commit_work`): stock `svn`'s recorded `mkdir` over the daemon's site
 > answered as `svnserve -t` answered it, revision 1 landed (macOS arm64, this Mac, local: `vcs_ssh::svn::`
 > `vcs_ssh::daemon_edge` 16 of 16). Owed: the tunnel's move to the repository's owner shard; live `svn+ssh://`.
+> Fixed 2026-11-19 (w-svn; the import's `green_chains` refusal, second cause): a repository entry's objects (each
+> revision's record, each push's objects) were charged to the partition's merge budget, so a repository's content had
+> to fit the budget every green's chain shares; they are now charged to the owner shard's memory budget per repository
+> (`vcs_store::settle_objects`). Test `a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget`;
+> macOS arm64, this Mac, local (A-714). Owed: content held once (A-64): the register and the tool store each hold it,
+> both charged honestly (w-perf: 2.57 GB held after a 223 MiB import, main bc2803d66). A Subversion text is held three
+> times: the svn records' `Repository.contents`, the green's content pool (A-716, w-perf: the records name the green's
+> content by identity) and the register's entry objects, each revision's record with its texts (~245 KB a revision
+> under `apply_advanced`, w-perf); A-716's record without text bytes takes the third with it.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -581,8 +590,10 @@
 > repository, its state logs and its greens have one set of holders and one successor with nothing stored per green; a
 > green joins only its repository's family (`repository::in_family`); a lone green is a family of its own, which an
 > adopting repository joins. Owed: a green minted under no family (an older build's) cannot be adopted (refused
-> `Unsupported`); a repository made by an older build, whose id is of no family, can join no new green; the successor
-> adopting a repository's logs by the rule (2c).
+> `Unsupported`); a repository made by an older build, whose id is of no family, can join no new green.
+> **A-636 part 2c-1 (2026-11-20, w-shared):** a repository's record is its own register (`REPOSITORY_CLASS`), shipped
+> to its family's candidates at each policy setting or names change and adopted by its successor as a pending
+> repository. Owed: the successor's rebuild of the repository from its record and its logs by part 1's rule (2c-2).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -1347,6 +1358,8 @@
 > export, update, commits, properties, server-side copies, switch, merge, delete and revert pass; `lock` is refused
 > (`Server doesn't support the lock command`), HTTP meets `path not found` (A-681) and the SSH edge answers
 > `svnserve -t is not served yet`: 22 of 27 (main 4785858, debug, Mac Studio).
+> Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
+> (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
@@ -1381,8 +1394,10 @@
 > `check:phases` (one position for every phase) measured under concurrent pushes before it is kept; (6) the changesets
 > the server makes, and rebase on push; (7) markers and topics; (8) access and hooks; (9) the revlog view (rendered
 > since A-706, `render::render`: split revlog v1 generaldelta revlogs of full texts, fncache, phaseroots, bookmarks,
-> obsstore; stock 7.2 `hg verify` passes on the rendered `dot` and `states` fixtures; owed: deltas and compression,
-> rendering in slices as versions commit; then `stream_out`, `stream2`, inline clone bundles, the hooks' repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
+> obsstore; stock 7.2 `hg verify` passes on the rendered `dot` and `states` fixtures; `stream_out` sends its revlogs
+> since A-712, `streamreqs` listed while no changeset is secret; owed: deltas and compression, rendering in slices as
+> versions commit, a stock `hg clone --stream` over the daemon's edge, `stream2`, inline clone bundles, the hooks'
+> repository); (10) narrow, ellipsis and remotefilelog; (11) largefiles and
 > lfs; (12) hgweb and annotate by linelog; (13) main's runs: 7.2's own suite through a shim, the differential run
 > against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
@@ -6322,8 +6337,12 @@
 > watcher), and the idle seal with its purge (aging buckets: each file's last write sets the instant it turns idle, the
 > keeper sleeps to the earliest); then the reap loop and its tick are deleted, no interval and no sweep, and §4.7 says
 > so.
-> Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
-> series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
+> **Since A-709 (piece 6)** base hints are drained at the kernel's report: one hint set a shard (epoll or kqueue, keyed
+> by the volume's generational handle) awaited by one task, and a delegation nobody returned lapses at its own deadline
+> on the keeper. Left on the tick: the idle seal with its purge, then the tick's deletion.
+> **Since A-715 (the series' last piece)** the idle sweep runs a pass at its own deadline, armed by the write,
+> allocation or free that owes it, and an idle shard runs none; the reap loop and its tick are deleted. Closed.
+> Still on `W` itself (class D): nothing of the reaper's since A-715 deleted the reap loop's tick (`reap_loop`). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
 > the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
@@ -6411,7 +6430,11 @@
 >   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
 >   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a
 >   process handle keeps no object the process named, so neither the bootstrap name nor the owner's token outlives the
->   daemon and no successor's takeover is refused (A-176). The macOS region fetch since A-452 (2026-11-18, g251): it
+>   daemon and no successor's takeover is refused (A-176). That claim read the marks by copying the whole 64-byte header,
+  whose declared words (doorbell, claim mark, start stamp) a copy may not touch, so from 28c4f3839 every Windows
+  client's connect was refused `TouchesWord` (exit 4) and no WinFsp suite ran; since A-717 (2026-11-20, w-bugs) it
+  copies the marks' bytes alone (`a_claim_reads_the_process_marks_of_a_published_bootstrap_object`;
+  `docs/bugs/2026-11-20-every-windows-client-connect-was-refused-touchesword.md`). The macOS region fetch since A-452 (2026-11-18, g251): it
 >   waited a fixed second to send and again to receive, so an owner alive and slow to answer was reported gone and one
 >   that went away was reported keeping nothing; now neither has a timeout, a dead owner's port refuses the send and the
 >   kernel's send-once notification ends the receive (`a_fetch_answered_past_the_claim_wait_is_served`,

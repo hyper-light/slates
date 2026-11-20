@@ -35,6 +35,13 @@ impl BaseHost {
     }
   }
 
+  /// The descriptor of the host directory's watcher, for the shard's hint set (A-709, `crate::HintSet`); `None` for an
+  /// S3 base, whose objects no watcher reports, and for a host the kernel gave no watcher.
+  #[cfg(unix)]
+  pub fn hint_source(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    self.as_disk().and_then(OsHost::hint_source)
+  }
+
   /// The S3 host, when the base is an S3 base's objects.
   pub fn as_s3_mut(&mut self) -> Option<&mut S3Host> {
     match self {

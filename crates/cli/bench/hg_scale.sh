@@ -104,7 +104,7 @@ listing() {
 
 echo "dataset: $SOURCE at $(h -R "$SOURCE" log -r tip -T '{rev}:{node}'); $(h -R "$SOURCE" log -r 'all()' -T x | wc -c | tr -d ' ') changesets, $(h -R "$SOURCE" tags -T x | wc -c | tr -d ' ') tags, $(h -R "$SOURCE" bookmarks -T x | wc -c | tr -d ' ') bookmarks, $(h -R "$SOURCE" heads -T x | wc -c | tr -d ' ') heads"
 listing "$SOURCE" "$WORK/source"
-echo "hg: $(h --version | head -1); slates: $("$SLATES" --version 2> /dev/null || echo none); store: $(du -sh "$SOURCE/.hg/store" | cut -f1)"
+echo "hg: $(h --version | head -1); slates: $("$SLATES" version 2> /dev/null || echo none); store: $(du -sh "$SOURCE/.hg/store" | cut -f1)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
 # The daemon's resident set in MiB, or "-" where it is gone.
@@ -153,7 +153,8 @@ start_slates() {
   AUTH=(--config "auth.slates.prefix=http://127.0.0.1:$port/" --config auth.slates.username=slates
     --config "auth.slates.password=$token")
 }
-trap 'stop_servers; rm -rf "$WORK"' EXIT
+# KEEP_LOGS in the environment names a directory the servers' logs and each step's output are copied into at the end.
+trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
 
 # Starts `hg serve` over a fresh empty repository for run $1: sets URL and STOCK.
 start_stock() {
