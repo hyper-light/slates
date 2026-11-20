@@ -14,7 +14,8 @@
   ("covers candidates false", head 1410 durable 1409); panic live_chaos.rs:4879 "the owner's holders settled within
   the fleet wait". Log ~/.cache/w-forming-runs/fm1/run-7.log (this Mac). Out of my goal's scope -> reported to main.
 - fm1 done: 11/12 PASS; formation reached every candidate in 12/12 (load ~3/14 cores, not one-CPU). Next fm2: 12 runs under taskpolicy -b.
-- Nothing finished, so nothing to land on main.
+- fm2 (taskpolicy -b) 12/12 PASS. Formation reached every candidate 24/24 on current main (a6764af1e); no forming shape reproduced, nothing to fix. 48-run sweep is main's. Only failure: fm1 run 7 holder-move stall (reported). Built binary kept: ~/.cache/w-forming-target/debug/deps/live_chaos-7bc0fbed7b2dcb5e; loop ~/.cache/w-forming-scripts/loop.sh.
+- Nothing finished, so nothing to land on main. Queue done; waiting on main.
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
   test, fix, land (needs a machine that can push). No failure -> report count to slates-7a.

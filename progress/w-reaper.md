@@ -8,7 +8,10 @@
   locking.rs, site.rs method match, commit.rs, server vcs_http/svn.rs, vcs_store/svn_view.rs). Stock svn 1.15 lives on
   Studio-1 d1323898 /opt/homebrew/bin; run e2e there via kiln run (on d1323898, PATH=/opt/homebrew/bin:$PATH,
   CARGO_TARGET_DIR=~/.cache/w-reaper-target). svn sources (1.15.0) fetched to ~/slates-work/svn-src.
-  NEXT: part 2 mergeinfo-report + OPTIONS SVN-Repository-MergeInfo: yes (svn blame -g, svn merge); then piece (2) hooks.
+  A-726 PART 2 LANDED: main 4511d1d (merged eae99ac): dav/report_mergeinfo.rs, reads::repository_mergeinfo, OPTIONS
+  mergeinfo yes. Stock svn merge/blame -g/mergeinfo over HTTP == svnserve (svn_http_reports 2/2 on Studio-1).
+  NEXT: piece (2) pre-lock/post-lock hooks (A-693 part 2 left them owed; w-svn landed lock verbs 576a8a860), run as the
+  other svn hooks run (A-623 environment rules).
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
