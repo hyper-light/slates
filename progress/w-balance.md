@@ -165,3 +165,7 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - NEXT: P8b slot derived at each snapshot + re-laid segment at handoff (anchor geometry: check owners first),
   vcs_share::room reading snapshot_room as a 2nd resource, P8c (snapshot names sealed index tables, with A-727),
   P9 (index cut across partitions by object id).
+- 8c seam proposed to w-perf (inbox/w-perf-w-balance-homes.md + agents_send): record v3 names object rows as one content
+  by identity (put_object), w-perf owns record.rs; offered names.rs helper. Waiting reply.
+- 61a74fe35 LANDED P9a: slates_vcs::cut (range_of, bits_for, split_due, child_of) + vcs_share::place::range_partition.
+- NEXT: 9b needs 8c; meanwhile snapshot_room as 2nd resource in vcs_share::room (DRF over memory + snapshot room).
