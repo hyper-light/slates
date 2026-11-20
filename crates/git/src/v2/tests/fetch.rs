@@ -333,11 +333,20 @@ fn a_response_without_its_pack_is_refused() {
 /// own client would refuse it; each bad band `Band`; the unmultiplexed progress refused, read and written.
 #[test]
 fn bands_are_read_where_the_response_carries_them() {
-  let banded = |text: &[u8]| {
-    let mut data = vec![1u8];
-    data.extend_from_slice(text);
-    data
-  };
+  progress_is_read_anywhere_it_may_come_and_written_back();
+  an_error_ends_the_response_and_an_empty_name_is_no_section();
+  bad_bands_and_unmultiplexed_progress_are_refused();
+}
+
+/// `text` on band 1.
+fn banded(text: &[u8]) -> Vec<u8> {
+  let mut data = vec![1u8];
+  data.extend_from_slice(text);
+  data
+}
+
+/// Progress read anywhere it may come in a multiplexed response, and the response written back as it came.
+fn progress_is_read_anywhere_it_may_come_and_written_back() {
   let shallow = banded(format!("shallow {MAIN}\n").as_bytes());
   let header_line = banded(b"shallow-info\n");
   let packfile = banded(b"packfile\n");
@@ -363,7 +372,12 @@ fn bands_are_read_where_the_response_carries_them() {
   let mut out = Vec::new();
   encode_response(&events, ObjectFormat::Sha1, true, &mut out).unwrap();
   assert_eq!(out, progressive);
+}
 
+/// The error ending the response and anything after it `AfterError`; an empty band-1 packet where a section's name must
+/// stand `UnknownSection`.
+fn an_error_ends_the_response_and_an_empty_name_is_no_section() {
+  let packfile = banded(b"packfile\n");
   let fatal = wire(&[Packet::Data(b"\x03upload-pack: not our ref")]);
   let events = decode_response(&fatal, ObjectFormat::Sha1, true, &mut room()).unwrap();
   assert_eq!(events, [Event::Error(b"upload-pack: not our ref")]);
@@ -381,6 +395,11 @@ fn bands_are_read_where_the_response_carries_them() {
     decode_response(&keepalive, ObjectFormat::Sha1, true, &mut room()),
     Err(Refusal::UnknownSection { at: 0 })
   );
+}
+
+/// Bands 0 and 4 and no band in the packfile each `Band`; progress outside the packfile of a response that is not
+/// multiplexed refused, read and written.
+fn bad_bands_and_unmultiplexed_progress_are_refused() {
   for (data, refusal) in [
     (&b"\x00PACK"[..], sideband::Refusal::UnknownBand { byte: 0 }),
     (b"\x04PACK", sideband::Refusal::UnknownBand { byte: 4 }),

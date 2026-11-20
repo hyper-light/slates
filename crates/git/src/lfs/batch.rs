@@ -499,6 +499,7 @@ const ERROR_CODES: [(ErrorCode, u64); 4] = [
   (ErrorCode::NotFound, 404),
   (ErrorCode::HashAlgo, 409),
   (ErrorCode::Removed, 410),
+  // Format: 422, the request's oid or size refused (batch.md).
   (ErrorCode::Validation, 422),
 ];
 

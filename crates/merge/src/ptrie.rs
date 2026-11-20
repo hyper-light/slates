@@ -1134,6 +1134,9 @@ mod tests {
     count
   }
 
+  /// A map of the oracle's and the ordered map it is held to.
+  type Modeled = (Ptrie<u32>, BTreeMap<Vec<u8>, u32>);
+
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(400), ..ProptestConfig::default() }))]
 
@@ -1149,7 +1152,7 @@ mod tests {
     ) {
       let mut nodes: Nodes<u32> = Nodes::default();
       let mut counted = Counted::default();
-      let mut maps: Vec<Option<(Ptrie<u32>, BTreeMap<Vec<u8>, u32>)>> = (0..MAPS).map(|_| None).collect();
+      let mut maps: Vec<Option<Modeled>> = (0..MAPS).map(|_| None).collect();
       maps[0] = Some((Ptrie::new(), BTreeMap::new()));
       for step in &steps {
         match step.clone() {
@@ -1261,56 +1264,69 @@ mod tests {
   fn a_release_a_node_a_step_frees_what_its_map_alone_held() {
     let mut nodes: Nodes<u32> = Nodes::default();
     let mut counted = Counted::default();
-    let mut map: Ptrie<u32> = Ptrie::new();
-    for n in 0..500u32 {
-      counted.put(n);
-      map.insert(
-        &mut nodes,
-        format!("d{}/f{n}", n % 7).as_bytes(),
-        n,
-        &mut counted,
-      );
-    }
+    let mut map = filled_counted(&mut nodes, &mut counted);
     let alone = nodes.live();
     let mut fork = map.fork(&mut nodes);
-    for n in (0..500u32).step_by(10) {
-      let value = n + 1_000;
-      counted.put(value);
-      if let Some(replaced) = fork.insert(
-        &mut nodes,
-        format!("d{}/f{n}", n % 7).as_bytes(),
-        value,
-        &mut counted,
-      ) {
-        counted.freed(replaced);
-      }
-    }
-    let step = |nodes: &mut Nodes<u32>, releasing: &mut Releasing, counted: &mut Counted| {
-      let before = nodes.live();
-      let more = nodes.release_step(releasing, counted);
-      assert!(
-        before - nodes.live() <= 1,
-        "a step freed more than one node"
-      );
-      more
-    };
-    let mut releasing = fork.releasing();
-    while step(&mut nodes, &mut releasing, &mut counted) {}
+    change_a_tenth(&mut fork, &mut nodes, &mut counted);
+    release_a_step_at_a_time(&mut fork, &mut nodes, &mut counted);
     assert_eq!(
       nodes.live(),
       alone,
       "the fork's release freed other than what it alone held"
     );
     for n in 0..500u32 {
-      assert_eq!(
-        map.get(&nodes, format!("d{}/f{n}", n % 7).as_bytes()),
-        Some(&n)
-      );
+      assert_eq!(map.get(&nodes, release_key(n).as_bytes()), Some(&n));
     }
-    let mut releasing = map.releasing();
-    while step(&mut nodes, &mut releasing, &mut counted) {}
+    release_a_step_at_a_time(&mut map, &mut nodes, &mut counted);
     assert_eq!(nodes.live(), 0);
     assert_eq!(nodes.missing(), 0);
+    every_hold_freed(&counted);
+  }
+
+  /// The release test's key for `n`.
+  fn release_key(n: u32) -> String {
+    format!("d{}/f{n}", n % 7)
+  }
+
+  /// The release test's map: five hundred keys, each holding its own number, every hold counted.
+  fn filled_counted(nodes: &mut Nodes<u32>, counted: &mut Counted) -> Ptrie<u32> {
+    let mut map: Ptrie<u32> = Ptrie::new();
+    for n in 0..500u32 {
+      counted.put(n);
+      map.insert(nodes, release_key(n).as_bytes(), n, counted);
+    }
+    map
+  }
+
+  /// Change every tenth key of `fork` to a value of its own.
+  fn change_a_tenth(fork: &mut Ptrie<u32>, nodes: &mut Nodes<u32>, counted: &mut Counted) {
+    for n in (0..500u32).step_by(10) {
+      let value = n + 1_000;
+      counted.put(value);
+      if let Some(replaced) = fork.insert(nodes, release_key(n).as_bytes(), value, counted) {
+        counted.freed(replaced);
+      }
+    }
+  }
+
+  /// Give `map`'s hold back a step at a time, each step freeing at most one node.
+  fn release_a_step_at_a_time(map: &mut Ptrie<u32>, nodes: &mut Nodes<u32>, counted: &mut Counted) {
+    let mut releasing = map.releasing();
+    loop {
+      let before = nodes.live();
+      let more = nodes.release_step(&mut releasing, counted);
+      assert!(
+        before - nodes.live() <= 1,
+        "a step freed more than one node"
+      );
+      if !more {
+        break;
+      }
+    }
+  }
+
+  /// Every value counted was freed as often as it was held.
+  fn every_hold_freed(counted: &Counted) {
     for (value, held) in &counted.holds {
       assert_eq!(
         *held, 0,
@@ -1389,6 +1405,17 @@ mod tests {
   /// `trunk/` and two under `tags/`, then cut `trunk/` from the fork. Expect: the cut holds the ten thousand values,
   /// visits no node, copies no more nodes than the prefix has bytes, and leaves the fork with the two keys under `tags/`;
   /// the original still reads every key; and once the cut is given back and both maps released, no node is left.
+  /// What the cut test expects once `fork`'s `trunk/` was cut: the fork holds the two keys under `tags/` and cuts
+  /// nothing more there, and `map` still reads every key.
+  fn after_the_cut(nodes: &mut Nodes<u32>, fork: &mut Ptrie<u32>, map: &Ptrie<u32>) {
+    assert_eq!(fork.len(nodes), 2);
+    assert_eq!(fork.get(nodes, b"trunk/dir3/file3"), None);
+    assert_eq!(fork.get(nodes, b"tags/b"), Some(&2));
+    assert_eq!(map.len(nodes), 10_002);
+    assert_eq!(map.get(nodes, b"trunk/dir3/file3"), Some(&3));
+    assert!(fork.cut(nodes, b"trunk/", &mut Plain).is_none());
+  }
+
   #[test]
   fn a_cut_takes_a_prefix_away_and_walks_nothing() {
     let mut nodes: Nodes<u32> = Nodes::default();
@@ -1411,12 +1438,7 @@ mod tests {
       "the cut copied {} nodes",
       nodes.copied() - copied
     );
-    assert_eq!(fork.len(&nodes), 2);
-    assert_eq!(fork.get(&nodes, b"trunk/dir3/file3"), None);
-    assert_eq!(fork.get(&nodes, b"tags/b"), Some(&2));
-    assert_eq!(map.len(&nodes), 10_002);
-    assert_eq!(map.get(&nodes, b"trunk/dir3/file3"), Some(&3));
-    assert!(fork.cut(&mut nodes, b"trunk/", &mut Plain).is_none());
+    after_the_cut(&mut nodes, &mut fork, &map);
     Ptrie::drop_subtree(&mut nodes, cut, &mut Plain);
     fork.release(&mut nodes, &mut Plain);
     map.release(&mut nodes, &mut Plain);

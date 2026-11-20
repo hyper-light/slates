@@ -359,6 +359,24 @@ fn the_empty_document_round_trips() {
 /// each; A-646 added the node count).
 const HEADER_BYTES: usize = 4 + 4 + 8 + 8 + 8;
 
+/// `good` with a wrong magic refused `BadMagic`; with a wrong version, version 1's or version 2's, `BadVersion`.
+fn wrong_magic_and_versions_refuse(good: &[u8]) {
+  let mut bad_magic = good.to_vec();
+  bad_magic[0] ^= 0xff;
+  assert_eq!(OpsDoc::decode(&bad_magic), Err(DocDecodeError::BadMagic));
+  let mut bad_version = good.to_vec();
+  bad_version[4] ^= 0xff;
+  assert_eq!(
+    OpsDoc::decode(&bad_version),
+    Err(DocDecodeError::BadVersion)
+  );
+  for version in [1u32, 2] {
+    let mut old = good.to_vec();
+    old[4..8].copy_from_slice(&version.to_le_bytes());
+    assert_eq!(OpsDoc::decode(&old), Err(DocDecodeError::BadVersion));
+  }
+}
+
 /// Hostile inputs decode to a typed refusal, never a panic (§4.8 — a torn or corrupt db entry).
 #[test]
 fn hostile_documents_refuse_by_type() {
@@ -369,20 +387,7 @@ fn hostile_documents_refuse_by_type() {
   assert_eq!(OpsDoc::decode(&[1, 2, 3]), Err(DocDecodeError::Truncated));
 
   // A wrong magic and a wrong version are named; version 1 and 2 documents among them (A-621, A-646).
-  let mut bad_magic = good.clone();
-  bad_magic[0] ^= 0xff;
-  assert_eq!(OpsDoc::decode(&bad_magic), Err(DocDecodeError::BadMagic));
-  let mut bad_version = good.clone();
-  bad_version[4] ^= 0xff;
-  assert_eq!(
-    OpsDoc::decode(&bad_version),
-    Err(DocDecodeError::BadVersion)
-  );
-  for version in [1u32, 2] {
-    let mut old = good.clone();
-    old[4..8].copy_from_slice(&version.to_le_bytes());
-    assert_eq!(OpsDoc::decode(&old), Err(DocDecodeError::BadVersion));
-  }
+  wrong_magic_and_versions_refuse(&good);
 
   // A truncated tail (drop the last op's bytes) is truncated, not a panic.
   assert_eq!(

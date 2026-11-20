@@ -94,7 +94,7 @@ pub(crate) struct ReceiveCommand<S> {
 
 impl<S: ShardLender> ReceiveCommand<S> {
   /// A push of `principal`'s to the repository `repository` named `name`, at protocol `version`, its
-  /// shard's state lent by `lender`; the push's room is the driver's (`crate::git_push::push_room`, A-704).
+  /// shard's state lent by `lender`; the push's room is the driver's (`crate::vcs_share::room`, A-704, A-724).
   pub(crate) fn new(
     lender: S,
     principal: Principal,

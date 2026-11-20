@@ -87,7 +87,7 @@ pub use derived::{
 };
 pub use index::{Batch, Index, IndexCounters, IndexRefused, Inserted, NewRow};
 pub use rule::Compaction;
-pub use share::{Claim, Granted, divide};
+pub use share::{Claim, Granted, amount_of, divide, whole_units};
 pub use table::{RowRef, TableRefused, TableView};
 pub use usage::{Ledger, PrincipalCount, Usage, Work, WorkUsage};
 

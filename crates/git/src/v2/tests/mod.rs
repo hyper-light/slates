@@ -236,31 +236,53 @@ pub(crate) fn decode_then_encode(message: Message, bytes: &[u8]) -> Result<Vec<u
   match message {
     Message::Advertisement => {
       let read = advertisement::decode(bytes, &mut room())?;
-      advertisement::encode(&read, &mut out).expect("a decoded advertisement encodes");
+      encoded(
+        advertisement::encode(&read, &mut out),
+        "a decoded advertisement encodes",
+      );
     }
     Message::Request => {
       let read = request::decode(bytes, &mut room())?;
-      request::encode(&read, &mut out).expect("a decoded request encodes");
+      encoded(
+        request::encode(&read, &mut out),
+        "a decoded request encodes",
+      );
     }
     Message::LsRefsAnswer => {
       let read = ls_refs::decode_answer(bytes, format, &mut room())?;
-      ls_refs::encode_answer(&read, format, &mut out).expect("a decoded answer encodes");
+      encoded(
+        ls_refs::encode_answer(&read, format, &mut out),
+        "a decoded answer encodes",
+      );
     }
     Message::FetchResponse(multiplexed) => {
       let read = fetch::decode_response(bytes, format, multiplexed, &mut room())?;
-      fetch::encode_response(&read, format, multiplexed, &mut out)
-        .expect("a decoded response encodes");
+      encoded(
+        fetch::encode_response(&read, format, multiplexed, &mut out),
+        "a decoded response encodes",
+      );
     }
     Message::ObjectInfoAnswer(format) => {
       let read = object_info::decode_answer(bytes, format, &mut room())?;
-      object_info::encode_answer(&read, format, &mut out).expect("a decoded answer encodes");
+      encoded(
+        object_info::encode_answer(&read, format, &mut out),
+        "a decoded answer encodes",
+      );
     }
     Message::BundleUriAnswer => {
       let read = bundle_uri::decode_answer(bytes, &mut room())?;
-      bundle_uri::encode_answer(&read, &mut out).expect("a decoded answer encodes");
+      encoded(
+        bundle_uri::encode_answer(&read, &mut out),
+        "a decoded answer encodes",
+      );
     }
   }
   Ok(out)
+}
+
+/// Holds an encode of what a decode accepted to succeeding, as it always does: a refusal is the test's own failure.
+fn encoded(encode: Result<(), Refusal>, what: &str) {
+  encode.expect(what);
 }
 
 /// `bytes`, a pkt-line stream, with its length digits in lower case: what an encode of it writes, since part 1 reads
@@ -515,19 +537,29 @@ const FRAGMENTS: [&[u8]; 34] = [
   b"\x01",
 ];
 
-/// A packet of an arbitrary message: a special packet, or a data packet of fragments.
+/// Shape: the kinds of packet `any_packet` chooses among, one each: a special packet, fragments, any bytes.
+const PACKET_KINDS: u8 = 3;
+
+/// A packet of an arbitrary message: a special packet, or a data packet of fragments, chosen by a selector over parts
+/// made for every kind (no `prop_oneof!`, whose strategy is reference-counted, R2).
 fn any_packet() -> impl Strategy<Value = (u8, Vec<u8>)> {
-  prop_oneof![
-    (1u8..4, Just(Vec::new())),
-    (
-      Just(0u8),
-      proptest::collection::vec(0..FRAGMENTS.len(), 1..6).prop_map(|chosen| chosen
-        .iter()
-        .flat_map(|index| FRAGMENTS[*index].iter().copied())
-        .collect())
-    ),
-    (Just(0u8), proptest::collection::vec(any::<u8>(), 0..40)),
-  ]
+  (
+    0..PACKET_KINDS,
+    1u8..4,
+    proptest::collection::vec(0..FRAGMENTS.len(), 1..6),
+    proptest::collection::vec(any::<u8>(), 0..40),
+  )
+    .prop_map(|(kind, special, chosen, bytes)| match kind {
+      0 => (special, Vec::new()),
+      1 => (
+        0,
+        chosen
+          .iter()
+          .flat_map(|index| FRAGMENTS[*index].iter().copied())
+          .collect(),
+      ),
+      _ => (0, bytes),
+    })
 }
 
 /// A `fetch` argument of every kind, its values drawn from `id` and `number`.

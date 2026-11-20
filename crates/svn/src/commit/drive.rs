@@ -1552,15 +1552,10 @@ impl Drive {
         "Invalid control character '0x{byte:02x}' in path '{}'",
         escaped(path)
       ),
-      DriveRefusal::NotRegular { name } => format!(
-        "Storage of non-regular property '{name}' is disallowed through the repository interface, and could \
-         indicate a bug in your client"
-      ),
-      DriveRefusal::NotUtf8 { name } => {
-        format!("Cannot accept '{name}' property because it is not encoded in UTF-8")
-      }
-      DriveRefusal::NonLf { .. } => "Invalid property value".to_owned(),
-      DriveRefusal::BadDate => "Wrong or unexpected property value".to_owned(),
+      DriveRefusal::NotRegular { .. }
+      | DriveRefusal::NotUtf8 { .. }
+      | DriveRefusal::NonLf { .. }
+      | DriveRefusal::BadDate => property_message(refusal),
       DriveRefusal::MergeinfoTerminator { path } => format!(
         "Commit rejected because mergeinfo on '{path}' contains unexpected string terminator"
       ),
@@ -1579,17 +1574,7 @@ impl Drive {
   /// another (`marshal.c` `svn_ra_svn__write_cmd_failure` writes each).
   pub fn errors(&self, refusal: &DriveRefusal) -> Vec<(u32, String)> {
     match refusal {
-      DriveRefusal::NonLf { name } => vec![
-        (SVN_ERR_BAD_PROPERTY_VALUE, self.message(refusal)),
-        (
-          SVN_ERR_BAD_PROPERTY_VALUE_EOL,
-          format!("Cannot accept non-LF line endings in '{name}' property"),
-        ),
-      ],
-      DriveRefusal::BadDate => vec![
-        (SVN_ERR_BAD_PROPERTY_VALUE, self.message(refusal)),
-        (SVN_ERR_BAD_DATE, "Bogus date".to_owned()),
-      ],
+      DriveRefusal::NonLf { .. } | DriveRefusal::BadDate => property_errors(refusal),
       other => vec![(other.subversion_code(), self.message(other))],
     }
   }
@@ -2637,6 +2622,52 @@ fn validate_prop(name: &[u8], value: Option<&[u8]>) -> Result<(), DriveRefusal> 
     return Err(DriveRefusal::BadDate);
   }
   Ok(())
+}
+
+/// `svn_repos__validate_prop`'s refusal of revision property `name` set to `value` (none deletes it), as `svnserve`
+/// writes it, outermost first: what a revision property's change meets before its hook (`svn_repos_fs_change_rev_prop4`,
+/// A-702); none where the property validates.
+pub(crate) fn revision_property_errors(
+  name: &[u8],
+  value: Option<&[u8]>,
+) -> Option<Vec<(u32, String)>> {
+  validate_prop(name, value)
+    .err()
+    .map(|refusal| property_errors(&refusal))
+}
+
+/// The errors `svnserve` writes for a property `validate_prop` refused, outermost first: one, or Subversion's chain.
+fn property_errors(refusal: &DriveRefusal) -> Vec<(u32, String)> {
+  match refusal {
+    DriveRefusal::NonLf { name } => vec![
+      (SVN_ERR_BAD_PROPERTY_VALUE, property_message(refusal)),
+      (
+        SVN_ERR_BAD_PROPERTY_VALUE_EOL,
+        format!("Cannot accept non-LF line endings in '{name}' property"),
+      ),
+    ],
+    DriveRefusal::BadDate => vec![
+      (SVN_ERR_BAD_PROPERTY_VALUE, property_message(refusal)),
+      (SVN_ERR_BAD_DATE, "Bogus date".to_owned()),
+    ],
+    other => vec![(other.subversion_code(), property_message(other))],
+  }
+}
+
+/// The words of a property `validate_prop` refused (`fs-wrap.c` 202-263).
+fn property_message(refusal: &DriveRefusal) -> String {
+  match refusal {
+    DriveRefusal::NotRegular { name } => format!(
+      "Storage of non-regular property '{name}' is disallowed through the repository interface, and could indicate \
+       a bug in your client"
+    ),
+    DriveRefusal::NotUtf8 { name } => {
+      format!("Cannot accept '{name}' property because it is not encoded in UTF-8")
+    }
+    DriveRefusal::NonLf { .. } => "Invalid property value".to_owned(),
+    DriveRefusal::BadDate => "Wrong or unexpected property value".to_owned(),
+    other => format!("{other:?}"),
+  }
 }
 
 /// `verify_mergeinfo` (`fs-wrap.c` 297-324): no NUL, then A-605's parser.

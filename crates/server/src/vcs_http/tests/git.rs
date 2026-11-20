@@ -638,7 +638,7 @@ impl StoreLender for Lends {
     id == (RepositoryId { bytes: [0; 16] })
   }
 
-  fn room(&mut self) -> Option<u64> {
+  fn room(&mut self, _repository: RepositoryId) -> Option<u64> {
     Some(ROOM)
   }
 

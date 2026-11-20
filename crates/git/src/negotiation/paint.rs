@@ -20,6 +20,7 @@ pub(super) const WANT: u8 = 1;
 pub(super) const HAVE: u8 = 2;
 
 /// Paint: taken from the queue, its paint passed on.
+/// Shape: the third paint bit, after `WANT` and `HAVE`.
 const TAKEN: u8 = 4;
 
 /// The walk's paint and queue.

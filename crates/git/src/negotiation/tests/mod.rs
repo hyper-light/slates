@@ -13,8 +13,8 @@ use super::{
   Acknowledgments, Answer, CommitRow, Deepen, Filter, Graph, INFINITE_DEPTH, Pack, Patterns,
   Refusal, Request, Run, ShallowInfo, filter, negotiate,
 };
-use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
+use crate::{Admission, to_u64};
 
 /// The index of `node`.
 fn at(node: u32) -> usize {
@@ -251,13 +251,12 @@ impl Graph for TestGraph {
       .greens
       .iter()
       .enumerate()
-      .filter_map(move |(green, chain)| {
-        (chain.heads.last() == Some(&head)).then(|| {
-          (
-            u32::try_from(green).unwrap(),
-            u64::try_from(chain.heads.len()).unwrap(),
-          )
-        })
+      .filter(move |(_, chain)| chain.heads.last() == Some(&head))
+      .map(|(green, chain)| {
+        (
+          u32::try_from(green).unwrap(),
+          u64::try_from(chain.heads.len()).unwrap(),
+        )
       })
   }
 
@@ -505,7 +504,7 @@ fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
     .copied()
     .filter(|want| !one_round.contains(want))
     .collect();
-  let answered = u64::try_from(one_round.len()).unwrap();
+  let answered = to_u64(one_round.len());
   let acknowledgments = if asks.done {
     None
   } else {
@@ -1141,7 +1140,7 @@ fn build(plan: &Plan) -> (TestGraph, Asks) {
   asks.deepen = build_deepen(&graph, plan, &commits);
   asks.filter = build_filter(plan);
   asks.sparse = build_sparse(plan, asks.filter.as_ref());
-  if plan.mode % 3 == 0 {
+  if plan.mode.is_multiple_of(3) {
     one_round_friendly(&graph, plan, &greens.current, &greens.chains, &mut asks);
   }
   (graph, asks)
@@ -1311,7 +1310,7 @@ fn build_deepen(graph: &TestGraph, plan: &Plan, commits: &[u32]) -> Option<Owned
     0..=3 => None,
     4 => Some(OwnedDeepen::Depth(u32::from(plan.depth % 4), false)),
     5 => {
-      let depth = if plan.depth % 5 == 0 {
+      let depth = if plan.depth.is_multiple_of(5) {
         INFINITE_DEPTH
       } else {
         u32::from(plan.depth % 4) + 1
@@ -1320,7 +1319,10 @@ fn build_deepen(graph: &TestGraph, plan: &Plan, commits: &[u32]) -> Option<Owned
     }
     6 => Some(OwnedDeepen::Cut(Some(u64::from(plan.since)), vec![])),
     _ => {
-      let since = (plan.since % 2 == 0).then_some(u64::from(plan.since));
+      let since = plan
+        .since
+        .is_multiple_of(2)
+        .then_some(u64::from(plan.since));
       Some(OwnedDeepen::Cut(
         since,
         vec![graph.id(pick(commits, plan.depth))],
@@ -1377,7 +1379,7 @@ fn build_filter(plan: &Plan) -> Option<Filter> {
       Filter::BlobLimit(value),
       Filter::TreeDepth(value % 3 + 1),
     ])),
-    _ if plan.filter_value % 5 == 0 => Some(Filter::Combine(vec![
+    _ if plan.filter_value.is_multiple_of(5) => Some(Filter::Combine(vec![
       Filter::BlobNone,
       Filter::SparseOid(b"main:.sparse".to_vec()),
     ])),
@@ -1627,8 +1629,8 @@ fn check_carried(plan: &Plan, census: &mut Census) -> Result<(), TestCaseError> 
       union.extend(graph.brought_set(run.green, version));
     }
     let heads = &graph.greens[at(run.green)].heads;
-    let head = heads[usize::try_from(run.through).unwrap() - 1];
-    let had = heads[usize::try_from(run.after).unwrap() - 1];
+    let head = heads[usize::try_from(run.through)? - 1];
+    let had = heads[usize::try_from(run.after)? - 1];
     let exact: BTreeSet<u32> = graph
       .reach([head])
       .difference(&graph.reach([had]))

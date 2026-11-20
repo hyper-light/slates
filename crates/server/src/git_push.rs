@@ -197,6 +197,8 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   session: Session<'static, PolicyHidden>,
   /// The push's room: its request and pack, and what reading and answering them builds.
   admission: Admission,
+  /// The push counted live among its repository's intakes until it drops (A-724, `crate::vcs_share`).
+  _live: crate::vcs_share::Live,
   /// What shows a hook's view at a path a hook runs in.
   presenter: P,
   /// Where its answer stands between the edge's steps (module docs, "A step at a time").
@@ -299,7 +301,7 @@ pub(crate) enum HookAnswer {}
 
 impl<P> ReceivePack<P> {
   /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what
-  /// reading them builds admitted [`push_room`], its hooks' views shown by `presenter`; writes the
+  /// reading them builds admitted [`crate::vcs_share::room`], its hooks' views shown by `presenter`; writes the
   /// advertisement to `out` when `advertise`. Refused for a repository not here or not git's, a
   /// store not held, or a policy git's matcher cannot read.
   pub(crate) fn start(
@@ -349,7 +351,8 @@ impl<P> ReceivePack<P> {
       repository,
       principal: principal.clone(),
       session,
-      admission: Admission::new(push_room(state)),
+      admission: Admission::new(crate::vcs_share::room(state, repository).bytes),
+      _live: crate::vcs_share::Live::begin(repository),
       presenter,
       answer: AnswerState::Unbegun,
     })
@@ -447,6 +450,7 @@ impl<P> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Begun, PushFailed> {
     let record = record_of(state, self.repository)?;
+    let pack = self.session.take_pack();
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     #[cfg(unix)]
     let hooked = git_hook(&record).is_some();
@@ -454,7 +458,7 @@ impl<P> ReceivePack<P> {
       let answering = self.declined(&mut Declining::hook(hook), out)?;
       return Ok(Begun::Answering(answering));
     }
-    match prepare(state, &record, checked)? {
+    match prepare(state, &record, checked, pack)? {
       Prepared::Declined(mut declining) => {
         Ok(Begun::Answering(self.declined(&mut declining, out)?))
       }
@@ -794,8 +798,10 @@ fn prepare(
   state: &mut ShardState,
   record: &RepositoryRecord,
   checked: &Checked,
+  pack: Vec<u8>,
 ) -> Result<Prepared, PushFailed> {
   let mut push = GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?;
+  push.keep_pack(pack);
   let judged = checked.early.iter().any(Option::is_none);
   let objects = if judged { checked.objects() } else { &[] };
   let incoming: Vec<Incoming<'_>> = objects.iter().map(incoming_of).collect();
@@ -838,14 +844,6 @@ fn charge_answer(
       .vcs_usage
       .answered(&repository, Work::Intake, slates_rt::futures::now_ns());
   }
-}
-
-/// Derived: the room a push is admitted (A-704): what the repository's owner shard could admit now, its arena's
-/// capacity and what its pool could still lend (`Store::admittable`), since the pushed objects land in that shard's
-/// store. Never one request's room: a pack longer than a ring region is a push like any other, and one past what the
-/// shard can hold is refused in git's `receive.maxInputSize` words.
-pub(crate) fn push_room(state: &ShardState) -> u64 {
-  state.store.admittable()
 }
 
 /// The first git hook `record`'s policy configures, if any (A-622 part 1: one hook a git point).

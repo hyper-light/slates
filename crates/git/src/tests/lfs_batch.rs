@@ -332,11 +332,13 @@ fn at(body: &str, needle: &str) -> u64 {
 /// transfer; and a body cut short. Expect each refused by its kind at the byte where its value begins.
 #[test]
 fn every_malformed_request_is_refused_by_kind() {
+  /// A malformed request, the text where it is refused, and its refusal from where that text begins.
+  type Case<'a> = (String, &'a str, fn(u64) -> Refusal);
   let oid = EXAMPLE_OID;
   let with = |objects: &str| format!("{{\"operation\":\"download\",\"objects\":[{objects}]}}");
   let one = |size: &str| with(&format!("{{\"oid\":\"{oid}\",\"size\":{size}}}"));
   let empty = "{\"operation\":\"download\",\"objects\":[]";
-  let cases: [(String, &str, fn(u64) -> Refusal); 24] = [
+  let cases: [Case<'_>; 24] = [
     ("[]".to_string(), "[", |at| Refusal::Type {
       field: Field::Body,
       at,
@@ -379,7 +381,10 @@ fn every_malformed_request_is_refused_by_kind() {
       |at| Refusal::Oid { at },
     ),
     (
-      with(&format!("{{\"oid\":\"{}\",\"size\":1}}", &oid[..63])),
+      with(&format!(
+        "{{\"oid\":\"{}\",\"size\":1}}",
+        oid.get(..63).unwrap()
+      )),
       "\"a9",
       |at| Refusal::Oid { at },
     ),

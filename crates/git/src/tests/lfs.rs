@@ -113,7 +113,7 @@ fn an_oid_is_64_lower_case_hexadecimal_digits_both_ways() {
   assert_eq!(Oid::from_hex(&EXAMPLE_OID.as_bytes()[..63]), None);
   assert_eq!(Oid::from_hex(format!("{EXAMPLE_OID}0").as_bytes()), None);
   assert_eq!(
-    Oid::from_hex(format!("{}g", &EXAMPLE_OID[..63]).as_bytes()),
+    Oid::from_hex(format!("{}g", EXAMPLE_OID.get(..63).unwrap()).as_bytes()),
     None
   );
 }

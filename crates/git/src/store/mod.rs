@@ -80,7 +80,7 @@
 
 mod deltas;
 mod encoding;
-mod fragment;
+pub(crate) mod fragment;
 pub mod hook_view;
 pub mod learn;
 mod naming;

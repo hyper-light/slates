@@ -34,7 +34,22 @@ fn every_fixture_is_the_bytes_its_sum_names_and_the_object_its_id_names() {
     goldens.len() + 2,
     "every object, the manifest and the version line"
   );
-  for (path, sum) in &sums {
+  each_file_is_the_bytes_its_sum_names(&sums);
+  each_object_has_its_sum_and_is_named_its_id(&sums, &goldens);
+  assert_eq!(GIT_VERSION, "git version 2.50.1 (Apple Git-155)\n");
+  let in_format = |format| {
+    goldens
+      .iter()
+      .filter(|golden| golden.format == format)
+      .count()
+  };
+  assert_eq!(in_format(ObjectFormat::Sha256), 90);
+  assert_eq!(in_format(ObjectFormat::Sha1), 90 + 180);
+}
+
+/// Each file `SHA256SUMS` lists, the manifest and git's version line included, hashed to the sum listed for it.
+fn each_file_is_the_bytes_its_sum_names(sums: &[(&str, &str)]) {
+  for (path, sum) in sums {
     let bytes = match *path {
       "manifest.txt" => MANIFEST.as_bytes(),
       "git-version.txt" => GIT_VERSION.as_bytes(),
@@ -42,7 +57,11 @@ fn every_fixture_is_the_bytes_its_sum_names_and_the_object_its_id_names() {
     };
     assert_eq!(sha256(bytes), *sum, "{path}");
   }
-  for golden in &goldens {
+}
+
+/// Each object listed in `sums`, and named from its type and bytes the id stock git gave it.
+fn each_object_has_its_sum_and_is_named_its_id(sums: &[(&str, &str)], goldens: &[Golden]) {
+  for golden in goldens {
     let path = format!("{}/{}", golden.format.name(), golden.name);
     assert!(
       sums.iter().any(|(listed, _)| *listed == path),
@@ -54,15 +73,6 @@ fn every_fixture_is_the_bytes_its_sum_names_and_the_object_its_id_names() {
       "{path}"
     );
   }
-  assert_eq!(GIT_VERSION, "git version 2.50.1 (Apple Git-155)\n");
-  let in_format = |format| {
-    goldens
-      .iter()
-      .filter(|golden| golden.format == format)
-      .count()
-  };
-  assert_eq!(in_format(ObjectFormat::Sha256), 90);
-  assert_eq!(in_format(ObjectFormat::Sha1), 90 + 180);
 }
 
 /// The fsck message the manifest's verdict `column` (`git fsck`'s or `--strict`'s) names first, when it names one.
@@ -79,9 +89,14 @@ fn parse_and_write(golden: &Golden) -> Result<Vec<u8>, ObjectRefused> {
     Kind::Tree => Tree::parse(golden.bytes, golden.format, &mut ample())?.write(&mut out),
     Kind::Commit => Commit::parse(golden.bytes, &mut ample())?.write(&mut out),
     Kind::Tag => Tag::parse(golden.bytes, &mut ample())?.write(&mut out),
-    Kind::Blob => panic!("no blob is a fixture of this piece"),
+    Kind::Blob => no_blob(),
   }
   Ok(out)
+}
+
+/// A blob met where only trees, commits and tags are fixtures: the test's own failure.
+fn no_blob() -> ! {
+  panic!("no blob is a fixture of this piece")
 }
 
 /// A-590 (git's tree walk, `decode_tree_entry`; `verify_headers`). Do: parse every object by its type and write it
@@ -92,49 +107,69 @@ fn parse_and_write(golden: &Golden) -> Result<Vec<u8>, ObjectRefused> {
 fn every_object_git_reads_is_read_and_written_back_byte_for_byte() {
   let mut refused = 0;
   for golden in goldens() {
-    let unreadable = match golden.kind {
-      Kind::Tree => golden.fsck.contains("error:badTree"),
-      _ => matches!(
-        first_named(golden.fsck),
-        Some(FsckId::NulInHeader | FsckId::UnterminatedHeader)
-      ),
-    };
-    match parse_and_write(&golden) {
-      Ok(written) => {
-        assert!(
-          !unreadable,
-          "{} {}: git cannot read it",
-          golden.format.name(),
-          golden.name
-        );
-        assert_eq!(
-          written,
-          golden.bytes,
-          "{} {}",
-          golden.format.name(),
-          golden.name
-        );
-      }
-      Err(ObjectRefused { refusal, at }) => {
-        refused += 1;
-        assert!(
-          unreadable,
-          "{} {}: refused {refusal:?}",
-          golden.format.name(),
-          golden.name
-        );
-        let expected = match golden.kind {
-          Kind::Tree => FsckId::BadTree,
-          _ => first_named(golden.fsck).unwrap(),
-        };
-        assert_eq!(refusal.fsck_id(), Some(expected), "{}", golden.name);
-        assert!(at <= golden.bytes.len());
-        assert!(!matches!(refusal, Refusal::PastAdmission(_)));
-      }
+    if !read_as_git_reads(&golden) {
+      refused += 1;
     }
   }
   // Four trees and three commits or tags in each format.
   assert_eq!(refused, 14);
+}
+
+/// Holds `golden` to being read as git reads it: written back byte for byte when git can read it, refused with git's
+/// reason otherwise. Whether it was read.
+fn read_as_git_reads(golden: &Golden) -> bool {
+  let unreadable = git_cannot_read(golden);
+  match parse_and_write(golden) {
+    Ok(written) => {
+      assert!(
+        !unreadable,
+        "{} {}: git cannot read it",
+        golden.format.name(),
+        golden.name
+      );
+      assert_eq!(
+        written,
+        golden.bytes,
+        "{} {}",
+        golden.format.name(),
+        golden.name
+      );
+      true
+    }
+    Err(ObjectRefused { refusal, at }) => {
+      assert!(
+        unreadable,
+        "{} {}: refused {refusal:?}",
+        golden.format.name(),
+        golden.name
+      );
+      refused_for_gits_reason(golden, &refusal, at);
+      false
+    }
+  }
+}
+
+/// Whether git cannot read `golden`: a tree whose walk git reports `badTree` of, or a commit or tag whose headers git
+/// reports `nulInHeader` or `unterminatedHeader` of.
+fn git_cannot_read(golden: &Golden) -> bool {
+  match golden.kind {
+    Kind::Tree => golden.fsck.contains("error:badTree"),
+    _ => matches!(
+      first_named(golden.fsck),
+      Some(FsckId::NulInHeader | FsckId::UnterminatedHeader)
+    ),
+  }
+}
+
+/// Holds a refusal of `golden` at `at` to git's reason, within its bytes, and never for want of room.
+fn refused_for_gits_reason(golden: &Golden, refusal: &Refusal, at: usize) {
+  let expected = match golden.kind {
+    Kind::Tree => FsckId::BadTree,
+    _ => first_named(golden.fsck).unwrap(),
+  };
+  assert_eq!(refusal.fsck_id(), Some(expected), "{}", golden.name);
+  assert!(at <= golden.bytes.len());
+  assert!(!matches!(refusal, Refusal::PastAdmission(_)));
 }
 
 /// A-590 (fsck.c, every check at its default severity; git 2.50.1's `git fsck`, `git fsck --strict` and
@@ -148,42 +183,57 @@ fn every_object_is_judged_as_stock_git_judges_it_under_both_strictnesses() {
   let mut divergences = Vec::new();
   for golden in goldens() {
     let named = format!("{} {}", golden.format.name(), golden.name);
-    for (strictness, column) in [
-      (Strictness::Default, golden.fsck),
-      (Strictness::Strict, golden.strict),
-    ] {
-      let report = check(&golden, strictness);
-      if column == "unparsed" {
-        let (_, reason) = golden.hash_object.split_once(':').unwrap();
-        assert_eq!(
-          report.refusal(),
-          FsckId::from_name(reason),
-          "{named} under {strictness:?}"
-        );
-      } else {
-        assert_eq!(said(&report), column, "{named} under {strictness:?}");
-      }
-    }
-    let strict = check(&golden, Strictness::Strict);
-    let first = strict.reported().next().map(|(id, _)| id.name());
-    match golden.hash_object.split_once(':') {
-      Some(("refused", printed)) => assert_eq!(first, Some(printed), "{named}"),
-      None => assert_eq!((golden.hash_object, first), ("ok", None), "{named}"),
-      Some(("ok", printed)) => {
-        assert_eq!(
-          strict.refusal().map(FsckId::name),
-          Some(printed),
-          "{named}: slates refuses it"
-        );
-        divergences.push(golden.name);
-      }
-      Some(other) => panic!("{named}: hash-object said {other:?}"),
+    judged_as_git_fsck_judges(&golden, &named);
+    if judged_as_hash_object_judges(&golden, &named) {
+      divergences.push(golden.name);
     }
   }
   assert_eq!(
     divergences, ["bad-tag-tagger-extra-header"; 2],
     "the one divergence, once in each format"
   );
+}
+
+/// Holds `golden`'s report under each strictness to what `git fsck` and `git fsck --strict` printed, or, where git
+/// could not parse it, to the reason `git hash-object` gave.
+fn judged_as_git_fsck_judges(golden: &Golden, named: &str) {
+  for (strictness, column) in [
+    (Strictness::Default, golden.fsck),
+    (Strictness::Strict, golden.strict),
+  ] {
+    let report = check(golden, strictness);
+    if column == "unparsed" {
+      let (_, reason) = golden.hash_object.split_once(':').unwrap();
+      assert_eq!(
+        report.refusal(),
+        FsckId::from_name(reason),
+        "{named} under {strictness:?}"
+      );
+    } else {
+      assert_eq!(said(&report), column, "{named} under {strictness:?}");
+    }
+  }
+}
+
+/// Holds `golden`'s strict report to what `git hash-object` did: its first finding first when git refused it, clean
+/// when git wrote it. Whether it is the place slates refuses what git accepts.
+fn judged_as_hash_object_judges(golden: &Golden, named: &str) -> bool {
+  let strict = check(golden, Strictness::Strict);
+  let first = strict.reported().next().map(|(id, _)| id.name());
+  match golden.hash_object.split_once(':') {
+    Some(("refused", printed)) => assert_eq!(first, Some(printed), "{named}"),
+    None => assert_eq!((golden.hash_object, first), ("ok", None), "{named}"),
+    Some(("ok", printed)) => {
+      assert_eq!(
+        strict.refusal().map(FsckId::name),
+        Some(printed),
+        "{named}: slates refuses it"
+      );
+      return true;
+    }
+    Some(other) => panic!("{named}: hash-object said {other:?}"),
+  }
+  false
 }
 
 /// A-590. Do: read what each fixture's name says it is (`ok-` clean, `warn-` and `info-` kept with warnings, `bad-`
