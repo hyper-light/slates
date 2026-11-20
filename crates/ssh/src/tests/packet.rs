@@ -5,7 +5,7 @@ use proptest::prelude::*;
 
 use crate::packet::{
   AES_BLOCK_LEN, CLEAR_ALIGNMENT, Cipher, LENGTH_LEN, MAX_PACKET_EVERY_PEER_ACCEPTS, MIN_PADDING,
-  Opener, PacketRefusal, SealRefusal, Sealer, TAG_LEN, Usage,
+  Opener, PacketRefusal, SealRefusal, Sealer, TAG_LEN,
 };
 use crate::support::{Scripted, Seeded, hex};
 

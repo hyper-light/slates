@@ -96,6 +96,7 @@ pub(crate) fn request<'a>(
     namespace: need(namespace, 0)?,
     key: need(key, 1)?,
     old: need(old, 2)?,
+    // Format: each parameter by its index in pushkey's order (namespace, key, old, new).
     new: need(new, 3)?,
   })
 }

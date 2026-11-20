@@ -329,6 +329,28 @@ fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (
   }
 }
 
+/// `request` pushed to `repository` by its owner, handed in 64 KiB pieces (a pack of many megabytes): what was received.
+pub(crate) fn pushed_large(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  request: &[u8],
+) -> Received {
+  let (_, mut push) = started(state, repository);
+  for piece in request.chunks(1 << 16) {
+    push.input(state, piece).expect("taken");
+  }
+  push.end(state).expect("ended");
+  let mut answer = Vec::new();
+  loop {
+    match push.answer_step(state, &mut answer).expect("answered") {
+      Answering::Answered(received) => return *received,
+      Answering::Turned => {}
+      #[cfg(unix)]
+      step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
+    }
+  }
+}
+
 /// `request` pushed to `repository` by its owner: what was received.
 fn pushed(state: &mut ShardState, repository: RepositoryId, request: &[u8]) -> Received {
   let (_, mut push) = started(state, repository);
