@@ -144,6 +144,13 @@ pub trait Judge {
   /// Whether `command` may apply, moving nothing: what its append takes, or why not.
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Self::Accepted, Declined>;
 
+  /// A turn of what `command` needs before its verdict (A-722 part 4c: a move's admission walks every object it brings,
+  /// which at git/git's size outlasts a step): whether it is ready, so this step judges it; not ready, the step ends
+  /// with the command undecided and the next step asks again. A judge that needs nothing first is ready at once.
+  fn ready(&mut self, _command: &Command, _pushed: &Pushed<'_>) -> bool {
+    true
+  }
+
   /// Appends one accepted command's entry to its ref's own log, on its own (a push without
   /// `atomic`): what report-status-v2 reports of it (nothing for a plain update), or why not
   /// ([`FAILED_TO_UPDATE`] when the ref moved since its verdict read it).
@@ -695,6 +702,13 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
   judge: &mut J,
 ) {
   let at = deciding.at;
+  let unrefused = deciding.early.get(at).is_some_and(Option::is_none);
+  if unrefused
+    && let Some(command) = deciding.request.commands.get(at)
+    && !judge.ready(command, pushed)
+  {
+    return;
+  }
   let early = deciding.early.get_mut(at).and_then(Option::take);
   let outcome = match (early, deciding.request.commands.get(at)) {
     (Some(refusal), _) => refusal,
@@ -733,6 +747,10 @@ fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
   }
   if let Some(command) = deciding.request.commands.get(deciding.at) {
     let at = deciding.at;
+    if !judge.ready(command, pushed) {
+      deciding.done = false;
+      return Ok(());
+    }
     match verdict(command, pushed, judge) {
       Ok(verdict) => {
         deciding.accepted.push((at, verdict));

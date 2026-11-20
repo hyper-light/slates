@@ -98,6 +98,7 @@ pub use naming::{COLLISION_WORDS, GitNaming, NameRefused, kind_of};
 pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
 pub use repository::abbrev::Abbrev;
+pub use repository::admitting::Admitting;
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
 pub use repository::protect::{Change, CommitSigners, Unsigned, UnsignedCommit};
 pub use repository::reach::{ReachRefused, ReachSets, Sets};
