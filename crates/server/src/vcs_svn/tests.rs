@@ -869,6 +869,124 @@ fn a_lock_runs_pre_lock_for_its_token_and_post_lock_after_it_as_svnserve_does() 
   );
 }
 
+/// The svn:// listener's turns yield (w-interop's git/git `svnrdump dump`, 2026-11-20: one `replay-range` held shard 0
+/// 3596 ms without a step). Do: sign in, then send 64 `get-latest-rev` commands in one write, so every turn after the
+/// first finds its command already read, and read their 128 answers as fast as they come. Expect: every answer, and no
+/// turn begun in the same shard poll as the turn before it (`TURNS_UNYIELDED` 0 on every shard). Red before the yield
+/// (a469a6b85's parent): 63 or so, one for each pipelined command after the first.
+#[test]
+fn pipelined_commands_are_answered_one_turn_a_shard_poll() {
+  const COMMANDS: usize = 64;
+  let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
+  let refusal_at = NO_ACCESS_SERVER
+    .windows(REFUSAL_START.len())
+    .position(|window| window == REFUSAL_START)
+    .expect("the recorded server refused");
+  let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
+  let name = name_on("svn-pipelined-", OTHER);
+  create_svn(&daemon, OTHER, &name);
+  let mut signed = sign_in(port, &greeting, &format!("svn://127.0.0.1:{port}/{name}"));
+  let answers = asked(
+    &mut signed.stream,
+    &b"( get-latest-rev ( ) ) ".repeat(COMMANDS),
+    2 * COMMANDS,
+  );
+  assert_eq!(
+    answers,
+    "( success ( ( ) 0: ) ) ( success ( 0 ) ) ".repeat(COMMANDS)
+  );
+  let unyielded: Vec<u64> = [LISTENER, OTHER]
+    .into_iter()
+    .map(|partition| {
+      crate::daemon::observe_at(&daemon, partition, |state| {
+        state
+          .refusals
+          .get(super::TURNS_UNYIELDED)
+          .copied()
+          .unwrap_or(0)
+      })
+    })
+    .collect();
+  assert_eq!(unyielded, vec![0, 0]);
+}
+
+/// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`; `hooks.c` `svn_repos__hooks_pre_revprop_change`,
+/// `_post_revprop_change`). Do: commit a file with log `file`; configure a pre-revprop-change hook that records its
+/// arguments and standard input and allows, and a post-revprop-change hook that records its standard input; change
+/// revision 1's `svn:log` to `new`, then ask `rev-proplist` of revision 1. Expect: the change's success; pre-revprop-change
+/// given the repository, `1`, the user, `svn:log` and `M`, the new value on its standard input; post-revprop-change the
+/// old value `file` on its; and the revision's `svn:log` now `new`. Before A-702 part 2 every change was refused 165006.
+#[cfg(unix)]
+#[test]
+fn a_revision_property_change_runs_its_hooks_and_lands_as_svnserve_does() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let pre = hook_script(
+    &dir.path,
+    "pre-revprop-change",
+    &format!(
+      "for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args\n/bin/cat > {at}/pre.stdin"
+    ),
+  );
+  let post = hook_script(
+    &dir.path,
+    "post-revprop-change",
+    &format!("/bin/cat > {at}/post.stdin"),
+  );
+  let answers = lock_under_hooks(
+    vec![
+      (HookPointName::SvnPreRevpropChange, pre),
+      (HookPointName::SvnPostRevpropChange, post),
+    ],
+    &[
+      b"( change-rev-prop ( 1 7:svn:log 3:new ) ) ",
+      b"( rev-proplist ( 1 ) ) ",
+    ],
+  );
+  let pre_args = recorded_lines(&dir.path, "pre.args");
+  assert_eq!(
+    (
+      answers
+        .first()
+        .is_some_and(|changed| changed.ends_with("( success ( ) ") && !changed.contains("failure")),
+      pre_args.get(1).map(String::as_str),
+      pre_args.get(3).map(String::as_str),
+      pre_args.get(4).map(String::as_str),
+      recorded_lines(&dir.path, "pre.stdin"),
+      recorded_lines(&dir.path, "post.stdin"),
+    ),
+    (
+      true,
+      Some("1"),
+      Some("svn:log"),
+      Some("M"),
+      vec!["new".to_owned()],
+      vec!["file".to_owned()],
+    ),
+    "pre-revprop-change {pre_args:?}"
+  );
+  let listed = answers.get(1).expect("the list's answer");
+  assert!(listed.contains("7:svn:log 3:new"), "{listed}");
+}
+
+/// A-702 part 2 (`hooks.c` `svn_repos__hooks_pre_revprop_change`). Do: commit a file with no hook configured, change
+/// revision 1's `svn:log`. Expect: the trivial authentication request, then 165006 "Repository has not been enabled to
+/// accept revision propchanges", as `svnserve` answers a repository with no pre-revprop-change hook.
+#[cfg(unix)]
+#[test]
+fn a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it() {
+  let answers = lock_under_hooks(Vec::new(), &[b"( change-rev-prop ( 1 7:svn:log 3:new ) ) "]);
+  let changed = answers.first().expect("the change's answer");
+  assert!(
+    changed.contains("( success ( ( ) 0: ) ) ( failure ( ( 165006 ")
+      && changed.contains("ask the administrator to create a pre-revprop-change hook"),
+    "{changed}"
+  );
+}
+
 /// A-730 (`hooks.c` `svn_repos__hooks_pre_unlock`, `_post_unlock`). Do: commit a file; configure a pre-lock hook that
 /// gives the lock's token, and pre-unlock and post-unlock hooks that record their arguments and standard input and
 /// accept; lock the file, then unlock it with the token. Expect: the unlock answered as `svnserve` answers one path

@@ -1848,6 +1848,16 @@ async fn serve_peer_records(
             crate::moves::serve_move_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          // A window homed by its identity (A-724 piece 6, `slates_cluster::homes`): kept on this node's home shard
+          // for it, apart from the content plane's holds, and answered once its image is published.
+          slates_cluster::homes::HOME_STREAM => {
+            crate::vcs_store::homes::serve_remote(
+              control,
+              &request,
+              crate::daemon::LIVENESS_BUDGET_NS,
+            )
+            .await
+          }
           stream if is_content_stream(stream) => {
             let reply = state::with_state(|s| {
               let peer_host = s
@@ -10653,6 +10663,9 @@ async fn follow_configuration(
   // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
   // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
   fan_configs_to_shards(origin, shards);
+  // Windows homed by identity in the region (A-724 piece 6): at a new configuration, offered to their homes and let go
+  // here once every home holds them, a turn a period (`vcs_store::homes::heal_region`).
+  crate::vcs_store::homes::heal_region(origin, shards, budget).await;
   // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
   // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
   crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;

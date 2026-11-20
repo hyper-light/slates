@@ -52,6 +52,12 @@ const EXIT_UNAVAILABLE: u8 = 3;
 /// (A-232), so it is the server's one constant.
 const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
 
+/// Every allocation of the anchor, the daemon and the client: a large one mapped directly and unmapped when freed, so
+/// a freed large buffer returns to the OS at once (`slates_mem::large`, A-742); the rest the system's. An
+/// embedding host that serves the roles from its own executable installs it the same way.
+#[global_allocator]
+static ALLOCATOR: slates_mem::large::LargeMapped = slates_mem::large::LargeMapped;
+
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
   // The daemon's WinFsp purge client, a role only a daemon starts (no daemon thread opens its own volume, §4.6), served

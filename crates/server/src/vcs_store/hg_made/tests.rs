@@ -150,7 +150,7 @@ fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
     let second = head_of(state, green).expect("the second submit made a changeset");
     assert_eq!(parent_of(state, repository, &second), Some(pushed));
     assert_eq!(state.refusals.get(MADE).copied(), Some(2));
-    crate::vcs_store::rebuild(state, repository);
+    crate::vcs_store::rebuild_whole(state, repository);
     assert_eq!(
       head_of(state, green),
       Some(second),

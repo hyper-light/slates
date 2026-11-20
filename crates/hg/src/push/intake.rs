@@ -647,6 +647,17 @@ impl Rebase {
         .ok_or(Unindexed::Index(crate::index::Refused::MissingLink {
           node,
         }))?;
+      // A manifest kept as a delta against the stale fork's previous one (A-729) is appended again by its text, which
+      // the fork keeps as its own delta against its previous one.
+      let rebuilt = if row.base == crate::index::NONE {
+        None
+      } else {
+        let text = self
+          .stale
+          .revision_text(store, log, rev)
+          .ok_or(Unindexed::Index(crate::index::Refused::Unread { rev }))?;
+        Some(store.put_object(&text)?)
+      };
       let again = crate::index::NewRevision {
         node,
         p1: kept.p1,
@@ -654,10 +665,14 @@ impl Rebase {
         link: kept.link.unwrap_or(NULL_NODE),
         flags: kept.flags,
         len: kept.len,
-        bytes: row.bytes,
+        bytes: rebuilt.unwrap_or(row.bytes),
         block: row.block,
       };
-      self.fork.append_revisions(store, log, &[again])?;
+      let appended = self.fork.append_revisions(store, log, &[again]);
+      if let Some(put) = rebuilt {
+        store.release(&put)?;
+      }
+      appended?;
     }
     self.intaken.kept = self.intaken.kept.saturating_add(1);
     Ok(())

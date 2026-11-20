@@ -3996,6 +3996,39 @@ fn release_part_back(state: &mut ShardState, request: u64, part: &ReplyBody) {
   }
 }
 
+/// Counter: blocks the large-allocation path mapped (`slates_mem::large`, A-742). Format: a counter name in the
+/// status report, on the control shard alone (the path is the process's).
+pub(crate) const LARGE_MAPPED: &str = "mem.large.mapped";
+/// Counter: blocks the large-allocation path unmapped, each given back to the OS. Format: a counter name.
+pub(crate) const LARGE_UNMAPPED: &str = "mem.large.unmapped";
+/// Counter: bytes the large-allocation path holds mapped now. Format: a counter name.
+pub(crate) const LARGE_MAPPED_BYTES: &str = "mem.large.mapped_bytes";
+/// Counter: bytes the large-allocation path gave back to the OS. Format: a counter name.
+pub(crate) const LARGE_RETURNED_BYTES: &str = "mem.large.returned_bytes";
+/// Counter: mappings the OS refused the large-allocation path. Format: a counter name.
+pub(crate) const LARGE_REFUSED: &str = "mem.large.refused";
+
+/// The large-allocation path's give-back counters (`slates_mem::large`), reported by the control shard alone so the
+/// process's figures appear once; none elsewhere, and none that are zero.
+fn large_counts(state: &ShardState) -> impl Iterator<Item = RefusalCount> {
+  let stats = slates_mem::large::stats();
+  let rows = [
+    (LARGE_MAPPED, stats.mapped),
+    (LARGE_UNMAPPED, stats.unmapped),
+    (LARGE_MAPPED_BYTES, stats.mapped_bytes),
+    (LARGE_RETURNED_BYTES, stats.returned_bytes),
+    (LARGE_REFUSED, stats.refused),
+  ];
+  let control = is_control_shard(state);
+  rows
+    .into_iter()
+    .filter(move |(_, count)| control && *count > 0)
+    .map(|(kind, count)| RefusalCount {
+      kind: kind.to_owned(),
+      count,
+    })
+}
+
 /// Gathers one shard's part of a status; the last part delivers the whole. A report `shard` did not serve is settled
 /// refused ([`settle_unserved`]): before A-557 it was skipped, and the status answered without that shard.
 fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
@@ -4206,6 +4239,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
           count,
         }),
       )
+      .chain(large_counts(state))
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -10078,6 +10112,7 @@ pub(crate) fn owner_judge(
         evidence,
         policy,
       },
+      parked_ns: state.clock.monotonic_ns(),
     };
     return crate::vcs_store::paths::whole_build::park(state, green, parked)
       .err()
@@ -10115,6 +10150,9 @@ pub(crate) struct ParkedSubmit {
   route: Option<crate::merge_service::ReplyRoute>,
   /// What runs it again.
   kind: ParkedKind,
+  /// When it parked, on the shard's monotonic clock: it waits at most the node's failover delay
+  /// (`crate::vcs_store::paths::whole_build`, "Bounds").
+  parked_ns: u64,
 }
 
 impl ParkedSubmit {
@@ -10122,6 +10160,22 @@ impl ParkedSubmit {
   pub(crate) fn key(&self) -> (u64, u32, u32) {
     (self.origin, self.id.client, self.id.sequence)
   }
+
+  /// Whether it has waited past `bound_ns` at `now_ns`.
+  pub(crate) fn overdue(&self, now_ns: u64, bound_ns: u64) -> bool {
+    now_ns.saturating_sub(self.parked_ns) > bound_ns
+  }
+}
+
+/// Answers a parked submit that waited past its bound `Overloaded`, unrecorded, so its retry runs (as a forward that
+/// never started is answered); nothing of it ran. Whether the answer was handed on.
+pub(crate) fn answer_overdue(state: &ShardState, parked: ParkedSubmit) -> bool {
+  let ParkedSubmit {
+    origin, id, route, ..
+  } = parked;
+  let shard = state.shard;
+  route
+    .is_some_and(|route| answered_on(route, (origin, id), refused(Refusal::Overloaded { shard })))
 }
 
 /// What a parked submit runs again: the owner's step of a submit asked from a work's shard ([`owner_judge`]), or the
@@ -10164,6 +10218,7 @@ fn park_submit(state: &mut ShardState, green: DbVolumeId, kind: ParkedKind) -> R
     id,
     route: state.reply_route,
     kind,
+    parked_ns: state.clock.monotonic_ns(),
   };
   match crate::vcs_store::paths::whole_build::park(state, green, parked) {
     Ok(()) => {
@@ -10183,6 +10238,7 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
       id,
       route,
       kind,
+      ..
     } = submit;
     let reply = match kind {
       ParkedKind::Owner {
