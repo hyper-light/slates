@@ -72,3 +72,32 @@ put and its entry's append loses nothing named. Then back to v3 at f+1.
 (inbox/w-svn-from-w-balance.md). Red test `daemon::tests::t_a727b_...`: with the barrier bypassed, a crash after the
 entry leaves the successor refusing it (replay_refused 1); with it, recovered whole. The release latency measurement
 waits on the Studio (kiln unreachable). Back to v3 at f+1; the takeover question above still stands.
+
+### 2026-11-20 ~10:30: status for the UI (what is complete, what is not)
+COMPLETE, on main (please mark these steps done):
+- A-727 slice b, the content plane's durability barrier: db779baa3 (`vcs_store::content_ticket` / `content_durable`,
+  red crash test `daemon::tests::t_a727b_...`). w-svn has the interface and the commit.
+- A-724 piece 3c, per-repository turns: 3283dd758, proof recorded in BENCHMARKS (369102a32).
+- A-724 piece 8c's parts so far: v3 codec 09427301d, `home_in_region` c42b938f2, writer 7317f6cce (gated off), region
+  fetch 36c6ed55d, self-publishing barrier 6e9d2eeaf.
+NOT COMPLETE (keep open):
+- v3 at f+1: the gate stays off until a takeover test passes, which waits on your answer above (do a departed owner's
+  push records reach a successor?).
+- The release latency A/B (v2 against v3, which also measures the barrier's cost). First runs were invalid: one compared
+  v2 with v2 (cargo reused the build), and the second ran under memory pressure on the Studio (load 34, 595 MB free).
+  Locally, through the real HTTP edge, the v3 build homes its names (`homed_in_region` 1, `published_for_ticket` 1). A
+  clean run is going now (r71), waiting for load < 8 and memory pressure to clear.
+- Run 31 (co-location): stopped by memory pressure on the Studio; re-run after the A/B.
+
+### 2026-11-20 ~11:40: the put in parts LANDED (359da2388); the takeover test next
+- 359da2388: an object of any length is homed and read in bounded parts (appended `PutPart`/`ReadPart`, `Taken`/`Part`;
+  a part at most the chunk cap), by `home_in_region`, `read_in_region` and the healer. A home's region holds now ride its
+  shard image (piece kind 14), so a home's restart no longer frees them. Red:
+  `daemon::tests::t_a724_an_object_past_a_region_message_is_homed_in_parts_and_read_back_after_a_restart` (2.5 messages
+  in three parts, the daemon stopped, the successor reads it whole; with the region holds' restore disabled it answers
+  NotHeld).
+- f35a6ca31: w-git's flaky test fixed (event waits; 5/5 under load).
+- The A/B and run 31 are queued by the balancer (r74, macOS, 12 cores, 24 GB), not on Studio-2.
+- Next, the takeover test (NoLoss, StaleNeverCommits, TotalOrder) in crates/server/tests/fleet.rs. It needs the git
+  HTTP edge on the in-process fleet daemons, a token for the owner, and a raw receive-pack client; none exist there
+  today. The switch flips in the same commit that adds the passing test. ETA: this afternoon.

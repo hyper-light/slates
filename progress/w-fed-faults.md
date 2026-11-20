@@ -3,8 +3,11 @@
   live-shipped + shared with every member at making; isolated move refused [kind: isolated]); slates a5140de.
 - PROVEN on macOS with kiln alone: killed flow (owner's runner stopped, mounts gone, instance SIGKILLed; survivors
   served 8/8), cut-off flow, slow-link flow (refused by kind unplaced).
-- IN FLIGHT: kiln run r23 on adacachy (linux/amd64): the four signalling flows over the A-750 code (synced from
-  worktree ~/slates-work/w-fed-faults-a750, same code as ed8991d). On its end: fix what fails, land, report.
+- IN FLIGHT (after the Studio's 10:35 PST reboot): the four signalling flows on adacachy as a systemd user unit,
+  `w-fed-faults-linux.service` (survives kiln runner restarts, which killed r23-r37), base 715063153, script
+  w-fed-faults-linux-flows.sh in the synced clone ~/.kiln/reach/d1323898.../w-fed-faults-kiln-clone-323fa02d14, output
+  linux-flows.out there. Poll: `kiln run --on 451397fcc585f7f7cb9aaf00e42064bb --no-sync -- 'systemctl --user
+  is-active w-fed-faults-linux; cat <dir>/linux-flows.out'`. On its end: fix what fails, land, report with the base.
 - Forward-lane log flood: g226's (main's word).
 
 - Answered w-balance Q3 (inbox 2cf8325).
