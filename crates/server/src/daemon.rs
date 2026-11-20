@@ -7507,6 +7507,8 @@ mod tests {
     first.publish_every_shard().unwrap();
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
+    // The successor's own shard: shard ids are the process's, and another test's daemon may take the first's.
+    let shard = second.shards.first().copied();
     // A loaded host may finish the repositories' replay after the start returns: read until every window is held
     // again (a restored window is held by no one until its record's replay puts it), bounded.
     let read = || {
@@ -7520,17 +7522,20 @@ mod tests {
           );
           (windows(state), counts.0, counts.1, counts.2)
         })
-        .unwrap()
+        .ok()
     };
+    // A shard still starting refuses the submission (`ShardGone`): read again, as for a replay still under way.
     let mut seen = read();
     for _ in 0..600 {
-      if seen.0.len() == before.len() && seen.0.iter().all(|(_, holders, _)| *holders > 0) {
+      if seen.as_ref().is_some_and(|seen| {
+        seen.0.len() == before.len() && seen.0.iter().all(|(_, holders, _)| *holders > 0)
+      }) {
         break;
       }
       std::thread::sleep(std::time::Duration::from_millis(50));
       seen = read();
     }
-    let (after, restored, unrestored, unheld) = seen;
+    let (after, restored, unrestored, unheld) = seen.expect("the successor answered");
     second.stop();
     assert!(!before.is_empty(), "the pushes kept windows");
     assert_eq!(
