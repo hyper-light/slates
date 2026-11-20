@@ -125,13 +125,15 @@ mod tests {
   /// Shape: a budget no test meets.
   const BUDGET: u64 = 1 << 30;
 
+  /// Any kind alike. The union is built as `prop_oneof!` builds one of more than ten arms, from boxed strategies: its
+  /// shorter forms hold their arms in `Arc`s (R2).
   fn kind_strategy() -> impl Strategy<Value = Kind> {
-    prop_oneof![
-      Just(Kind::Commit),
-      Just(Kind::Tree),
-      Just(Kind::Blob),
-      Just(Kind::Tag)
-    ]
+    proptest::strategy::Union::new([
+      Just(Kind::Commit).boxed(),
+      Just(Kind::Tree).boxed(),
+      Just(Kind::Blob).boxed(),
+      Just(Kind::Tag).boxed(),
+    ])
   }
 
   proptest! {

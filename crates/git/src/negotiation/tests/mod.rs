@@ -2126,6 +2126,8 @@ fn a_sparse_filter_without_its_patterns_or_combined_is_refused() {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
   /// A-745 (a walk's set in whichever of runs or a bit table is smaller). Do: insert positions drawn dense, sparse or
   /// every third into a set and an ordered set beside it, asking after each what each holds. Expect: the same answer to
   /// "was it new" and to membership at every drawn position, the same least position at or after each, the same members
@@ -2133,7 +2135,7 @@ proptest! {
   /// either way.
   #[test]
   fn a745_a_walks_set_holds_what_an_ordered_set_holds_in_its_smaller_form(
-    step in prop_oneof![Just(1u64), Just(3u64), 1u64..400],
+    step in proptest::strategy::Union::new([Just(1u64).boxed(), Just(3u64).boxed(), (1u64..400).boxed()]),
     drawn in proptest::collection::vec(0u64..600, 0..400),
   ) {
     let mut held = super::Held::default();

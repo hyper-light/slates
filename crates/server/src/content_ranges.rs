@@ -204,7 +204,7 @@ fn advance(state: &mut ShardState) {
     let fixed = state.content_sweep.ns_fixed;
     let pages = match state.content_sweep.ns_per_page {
       0 => 1,
-      cost => usize::try_from(left.saturating_sub(fixed) / cost)
+      cost => usize::try_from(left.saturating_sub(fixed).checked_div(cost).unwrap_or(0))
         .unwrap_or(usize::MAX)
         .clamp(1, most),
     };
@@ -222,7 +222,11 @@ fn advance(state: &mut ShardState) {
       0 => took,
       seen => seen.min(took),
     };
-    sweep.ns_per_page = (took.saturating_sub(sweep.ns_fixed) / walked).max(1);
+    sweep.ns_per_page = took
+      .saturating_sub(sweep.ns_fixed)
+      .checked_div(walked)
+      .unwrap_or(0)
+      .max(1);
     if let (Some(found), Some(sum)) = (found, sweep.partial.get_mut(target.range())) {
       *sum = if sum.bytes == 0 && sum.modified.is_none() {
         found
