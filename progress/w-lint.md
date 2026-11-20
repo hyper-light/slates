@@ -42,3 +42,12 @@
 - Waiting on main: 3 server test errors need an in-place #[allow] with reason (carry.rs:497 test sleep; deploy.rs:1238,
   1245 rustls Arc in tests). Part B replaced test sleeps in vcs_* tests with park_timeout loops to pass the lint:
   main should judge that (part A declined the same dodge).
+
+## 2026-11-20 round 0 CLOSED at 45e6cf9aa
+- Landed since last entry: 495fc59dc api (17); 4e204e83f merge/git/mcp/client (7); 66fe990d3 svn compile break
+  (A-726 test vs svndiff Cow) + 1 lint; ffecc5bcc cli tests (6); 45e6cf9aa server A-719 part 3 (2).
+- Wall at 45e6cf9aa: 6 cross targets clean; structural, unsafe, fmt clean; host clippy fails only on 3 server test
+  errors (carry.rs:497 sleep; deploy.rs:1238, 1245 rustls Arc) that need an in-place #[allow] with reason -- main's
+  call; literals fails only on vcs/src/share.rs:130 (EPSILON * 64.0, 4bbf7f4ba) -- needs its author's derivation.
+- Totals round 0: 583 errors fixed (549 clippy, 34 literals), 2 compile breaks, 36 commits (all unsigned, Ada's OK).
+- Next: hourly rounds (fetch, ff ~/slates-work/w-lint, same commands, fix and land). One target dir only.
