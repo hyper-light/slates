@@ -13775,6 +13775,8 @@ const BUILT_PIECES: u64 = (BUILT_VOLUME_FILES * BURST_VOLUME_FILE_BYTES) as u64
 const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
 /// Format: see [`LIVE_WHOLE_BUILDS`].
 const LIVE_WHOLE_BUILD_TURNS: &str = "fleet.live.whole_build_turns";
+/// Format: the turns a whole build hashed its entry's identity in (A-757 part 2).
+const LIVE_WHOLE_HASH_TURNS: &str = "fleet.live.whole_hash_turns";
 /// Format: see [`LIVE_WHOLE_BUILDS`].
 const LIVE_QUEUED: &str = "fleet.live.queued";
 
@@ -13844,8 +13846,13 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
   let (id, attachment) = volume_of_mebibytes(&mut client);
   daemons[0].inject_seal_walk_quantum(Some(0)).unwrap();
   let counts = |daemon: &Daemon| {
-    [LIVE_WHOLE_BUILDS, LIVE_WHOLE_BUILD_TURNS, LIVE_QUEUED]
-      .map(|kind| refusal_count(daemon, kind).unwrap())
+    [
+      LIVE_WHOLE_BUILDS,
+      LIVE_WHOLE_BUILD_TURNS,
+      LIVE_QUEUED,
+      LIVE_WHOLE_HASH_TURNS,
+    ]
+    .map(|kind| refusal_count(daemon, kind).unwrap())
   };
   let before = counts(&daemons[0]);
   let shipped = client.call(&RequestBody::LiveShip {
@@ -13901,10 +13908,11 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
   for daemon in daemons {
     daemon.stop();
   }
-  let [builds, turns, queued] = [0, 1, 2].map(|kind| after[kind].saturating_sub(before[kind]));
+  let [builds, turns, queued, hash_turns] =
+    [0, 1, 2, 3].map(|kind| after[kind].saturating_sub(before[kind]));
   eprintln!(
     "whole entry in turns: shipped {shipped:?}, first write {first:?}, {} of {BUILT_WRITERS} writes during it answered; \
-     builds {builds}, turns {turns}, queued {queued}; a's log {line:?}, settled {settled}; a's counters \
+     builds {builds}, turns {turns}, queued {queued}, hash turns {hash_turns}; a's log {line:?}, settled {settled}; a's counters \
      {owner_counters:?}",
     during
       .iter()
@@ -13929,6 +13937,11 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
   assert!(
     queued >= 1,
     "publications were queued behind the whole entry: {queued}"
+  );
+  assert!(
+    hash_turns >= BUILT_PIECES,
+    "the whole entry's identity was hashed a page a turn under the cut quantum (A-757 part 2): {hash_turns} turns for \
+     at least {BUILT_PIECES} pages; before, in the one turn that appended it"
   );
   assert!(
     settled,
