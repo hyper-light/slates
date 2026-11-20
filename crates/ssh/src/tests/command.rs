@@ -50,11 +50,14 @@ fn line(program: &[u8], argument: &[u8]) -> Vec<u8> {
   command
 }
 
+/// A git command case: the program, the path, and the command the program names.
+type CommandCase = (&'static [u8], &'static [u8], fn(Vec<u8>) -> Command);
+
 /// A-633 (gitprotocol-pack over SSH; `connect.c` builds `prog SP sq_quote(path)`): do parse git's two programs with
 /// paths git quoted, one holding a quote and an exclamation mark. Expect each path back exactly.
 #[test]
 fn git_commands_read_git_quoting() {
-  let cases: [(&[u8], &[u8], fn(Vec<u8>) -> Command); 3] = [
+  let cases: [CommandCase; 3] = [
     (b"git-upload-pack", b"/srv/git/slates.git", |path| {
       Command::GitUploadPack { path }
     }),

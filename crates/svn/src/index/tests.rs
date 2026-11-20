@@ -2105,7 +2105,7 @@ fn same_listings(
   revision: Revision,
   census: &mut Census,
 ) -> Result<(), String> {
-  let tree = &fs.trees[usize::try_from(revision).unwrap()];
+  let tree = &fs.trees[usize::try_from(revision).map_err(|error| error.to_string())?];
   for (path, &label) in tree {
     let listed = index
       .children(path, revision)

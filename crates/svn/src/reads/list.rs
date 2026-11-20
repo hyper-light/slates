@@ -161,11 +161,14 @@ impl ListRequest {
     let Some(Value::Word(word)) = params.get(2) else {
       return None;
     };
+    // Format: `"c(?r)w?l?l"` is path 0, revision 1, depth 2, dirent fields 3 and patterns 4
+    // (`serve.c` `list`).
     let fields = match params.get(3) {
       None => DirentFields::all(),
       Some(Value::List(words)) => DirentFields::of(words)?,
       Some(_) => return None,
     };
+    // Format: `"c(?r)w?l?l"`'s fifth item, the patterns.
     let patterns = match params.get(4) {
       None => None,
       Some(Value::List(items)) => Some(patterns_of(items)?),

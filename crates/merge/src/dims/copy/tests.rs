@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
+use proptest::strategy::Union;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
 use super::*;
@@ -246,20 +247,36 @@ fn a_copy_of_the_root_brings_every_key_and_gives_the_roots_own_to_the_destinatio
     "the root's copy walked a map"
   );
   assert_eq!(files.blocks.live(), blocks, "a file's bytes were copied");
+  root_copy_reads_as_the_reference(
+    (&modes, &files, &attributes),
+    &mode_model,
+    &file_model,
+    &attribute_model,
+  );
+}
+
+/// The root copy's maps each equal to its reference, the root's own mode and attributes at `snap`'s own key and never
+/// at a key ending in the separator.
+fn root_copy_reads_as_the_reference(
+  (modes, files, attributes): (&Dim<u32>, &Files, &Xattrs),
+  mode_model: &BTreeMap<String, u32>,
+  file_model: &BTreeMap<String, Vec<u8>>,
+  attribute_model: &BTreeMap<(String, String), Vec<u8>>,
+) {
   let walked: BTreeMap<String, u32> = modes.iter().map(|(key, value)| (key, *value)).collect();
-  assert_eq!(walked, mode_model);
+  assert_eq!(&walked, mode_model);
   assert_eq!(walked.get("snap"), Some(&1));
   assert!(!walked.contains_key("snap/"));
   let walked: BTreeMap<String, Vec<u8>> = files
     .iter()
     .map(|(key, bytes)| (key, bytes.to_vec()))
     .collect();
-  assert_eq!(walked, file_model);
+  assert_eq!(&walked, file_model);
   let walked: BTreeMap<(String, String), Vec<u8>> = attributes
     .iter()
     .map(|(key, value)| (key, value.clone()))
     .collect();
-  assert_eq!(walked, attribute_model);
+  assert_eq!(&walked, attribute_model);
   assert_eq!(attributes.get("snap", "p"), Some(&vec![1]));
   assert_eq!(attributes.get("snap/a/b", "p"), Some(&vec![3]));
   assert!(attributes.of("snap/").next().is_none());
@@ -288,6 +305,19 @@ fn a_cut_takes_a_paths_tree_away_and_leaves_its_neighbours() {
     visited,
     "a cut walked a map"
   );
+  left_after_the_cut(&modes, &files, &attributes);
+  modes.cut_tree("");
+  files.cut_tree("");
+  attributes.cut_tree("");
+  assert_eq!(
+    (modes.len(), files.map.len(), attributes.map.len()),
+    (0, 0, 0)
+  );
+  assert_eq!(files.blocks.live(), 0);
+}
+
+/// What the cut of `a` leaves in each map: `ab` and `b` as they were, and only the blocks of their files.
+fn left_after_the_cut(modes: &Dim<u32>, files: &Files, attributes: &Xattrs) {
   let left: Vec<String> = modes.keys().collect();
   assert_eq!(left, ["ab", "b"]);
   let left: Vec<String> = files.keys().collect();
@@ -303,14 +333,6 @@ fn a_cut_takes_a_paths_tree_away_and_leaves_its_neighbours() {
   );
   assert!(!modes.holds_tree("a") && !files.holds_tree("a") && !attributes.holds_tree("a"));
   assert!(modes.holds_tree("ab") && files.holds_tree("") && attributes.holds_tree("b"));
-  modes.cut_tree("");
-  files.cut_tree("");
-  attributes.cut_tree("");
-  assert_eq!(
-    (modes.len(), files.map.len(), attributes.map.len()),
-    (0, 0, 0)
-  );
-  assert_eq!(files.blocks.live(), 0);
 }
 
 /// Every path the generated histories name: up to three names deep over three names, one holding a NUL, so a copy
@@ -344,14 +366,28 @@ enum Step {
   Fork,
 }
 
-/// Any step, copies and puts the most often.
+/// Any step, copies and puts the most often. The union is built as `prop_oneof!` builds one of more than ten arms,
+/// from boxed strategies: its shorter forms hold their arms in `Arc`s (R2).
 fn step() -> impl Strategy<Value = Step> {
-  prop_oneof![
-    3 => (any::<usize>(), any::<u8>()).prop_map(|(path, value)| Step::Put { path, value }),
-    1 => any::<usize>().prop_map(|path| Step::Take { path }),
-    3 => (any::<usize>(), any::<usize>()).prop_map(|(from, to)| Step::Copy { from, to }),
-    1 => Just(Step::Fork),
-  ]
+  Union::new_weighted(vec![
+    (
+      3,
+      (any::<usize>(), any::<u8>())
+        .prop_map(|(path, value)| Step::Put { path, value })
+        .boxed(),
+    ),
+    (
+      1,
+      any::<usize>().prop_map(|path| Step::Take { path }).boxed(),
+    ),
+    (
+      3,
+      (any::<usize>(), any::<usize>())
+        .prop_map(|(from, to)| Step::Copy { from, to })
+        .boxed(),
+    ),
+    (1, Just(Step::Fork).boxed()),
+  ])
 }
 
 /// What the generated histories met, so the oracle can show it compared real copies.

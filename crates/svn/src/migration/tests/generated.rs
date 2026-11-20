@@ -237,8 +237,8 @@ impl Model {
     let Some(path) = self.untouched(None, false, step.first) else {
       return;
     };
-    if step.name % 2 == 0 {
-      let kind = if step.bytes.len() % 2 == 0 {
+    if step.name.is_multiple_of(2) {
+      let kind = if step.bytes.len().is_multiple_of(2) {
         NodeKind::File
       } else {
         NodeKind::Directory

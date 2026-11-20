@@ -696,8 +696,9 @@ fn a_service_names_its_reply_fields_once_and_a_failure_there_is_the_status() {
 /// A-629 part 2c (main's ruling, 2026-11-19: a route decides its status at its head or after its body). Do: on one
 /// connection send a proven POST to a route deciding its status after the body, whose exchange names `201`; on a second,
 /// one whose exchange names `204`; on a third, a POST naming `201` to a streamed route. Expect: the first reply's head
-/// carrying `201`, the reply whole; the second and the third answered `500` in stages, nothing of a reply sent, and each
-/// connection ended cleanly.
+/// carrying `201`, the reply whole; the second's head `204` alone, no framing field and nothing after it (A-681: a
+/// WebDAV `DELETE`'s answer); the third answered `500` in stages, nothing of a reply sent, the connection ended
+/// cleanly.
 #[test]
 fn a_status_named_after_the_body_heads_the_reply_and_one_no_reply_may_carry_fails_it() {
   let ((created, empty, streamed), _) = served(TWO_SEATS, None, |address| {
@@ -711,7 +712,7 @@ fn a_status_named_after_the_body_heads_the_reply_and_one_no_reply_may_carry_fail
     stream
       .write_all(&post_to("/after", NAMES_NO_CONTENT, true))
       .expect("the request naming 204");
-    let empty = read_to_end(&mut stream);
+    let empty = read_until(&mut stream, b"\r\n\r\n");
     drop(stream);
     let mut stream = connect(address);
     stream
@@ -730,15 +731,13 @@ fn a_status_named_after_the_body_heads_the_reply_and_one_no_reply_may_carry_fail
   assert_eq!(
     (
       String::from_utf8_lossy(&created),
-      String::from_utf8_lossy(&empty.0),
-      empty.1,
+      String::from_utf8_lossy(&empty),
       String::from_utf8_lossy(&streamed.0),
       streamed.1
     ),
     (
       String::from_utf8_lossy(&whole),
-      String::from_utf8_lossy(refused.as_bytes()),
-      true,
+      String::from_utf8_lossy(b"HTTP/1.1 204 No Content\r\n\r\n"),
       String::from_utf8_lossy(refused.as_bytes()),
       true
     )
