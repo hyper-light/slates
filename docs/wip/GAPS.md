@@ -1409,6 +1409,11 @@
 > (`ToolSites`, a request Subversion's by a method no other client sends or its `!svn` segment, `svn::dav_request`;
 > `DaemonSvnSite` over `ServedRecords`): stock svn 1.15's `info`, `ls`, `cat`, `log` and `log -v` over HTTP pass (svn
 > matrix, ROUTE=http, Mac Studio); checkout, update, diff and export wait on the update-report, commits on POST.
+> **A-681, the update-report (w-interop, 2026-11-20):** `dav::update` answers an update-report on `!svn/me` (or a
+> node's URL) from A-616's drive through A-627's writer, streamed a slice at a time (`Drive::take_written`), its
+> working-copy state checked by the ra_svn reporter's own rules (`report::whole_report`); OPTIONS says
+> `SVN-Allow-Bulk-Updates: Prefer`, so stock svn asks send-all. Stock svn 1.15's checkout (2,000 git/git revisions'
+> trunk in 5 s), export and update over HTTP pass; blame and diff ask reports still `501`; commits wait on POST.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

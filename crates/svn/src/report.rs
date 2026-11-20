@@ -1073,6 +1073,184 @@ impl Reporter {
   }
 }
 
+/// A report's command as a client sends it whole in one request (A-681: `mod_dav_svn`'s update-report,
+/// `reports/update.c`), which `svn_repos_begin_report3` begins: what [`Reporter::begin`] reads from
+/// ra_svn's command, each path already a repository path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WholeCommand {
+  /// `update` or `switch` (`switch` when the report names a destination).
+  pub kind: RequestKind,
+  /// The repository path of the working copy's anchor (`src-path`).
+  pub anchor: String,
+  /// The anchor-relative target (`update-target`), `""` for none.
+  pub operand: String,
+  /// The repository path a switch brings the target to (`dst-path`); none for an update.
+  pub switch_path: Option<String>,
+  /// The revision the drive brings the target to.
+  pub target_revision: Revision,
+  /// The depth the command asked for.
+  pub depth: Depth,
+  /// Whether file texts are sent.
+  pub text_deltas: bool,
+  /// Whether an added file names what it was copied from.
+  pub send_copyfrom_args: bool,
+  /// Whether two nodes of one kind are related whatever their history.
+  pub ignore_ancestry: bool,
+}
+
+/// One item of a whole report's working-copy state, its path relative to the command's target as
+/// `svn_repos_set_path3` takes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WholeItem {
+  /// `svn_repos_set_path3`: a path at a revision.
+  Set {
+    /// The path.
+    path: String,
+    /// The revision.
+    revision: Revision,
+    /// Its depth in the working copy.
+    depth: Depth,
+    /// Whether the working copy holds none of its entries yet.
+    start_empty: bool,
+    /// The lock token the working copy holds for it.
+    lock_token: Option<Vec<u8>>,
+  },
+  /// `svn_repos_link_path3`: a path switched to the repository path `link_path`.
+  Link {
+    /// The path.
+    path: String,
+    /// The repository path it is switched to.
+    link_path: String,
+    /// The revision.
+    revision: Revision,
+    /// Its depth in the working copy.
+    depth: Depth,
+    /// Whether the working copy holds none of its entries yet.
+    start_empty: bool,
+    /// The lock token the working copy holds for it.
+    lock_token: Option<Vec<u8>>,
+  },
+  /// `svn_repos_delete_path`: a path the working copy lacks.
+  Delete {
+    /// The path.
+    path: String,
+  },
+}
+
+/// Why a whole report was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WholeRefusal {
+  /// As a ra_svn report is refused (`svn_repos_finish_report` and its calls).
+  Failed(ReportFailure),
+  /// Its paths are past the room it is held within.
+  TooLarge,
+}
+
+/// The finished report of `command` and its `items`, checked as ra_svn's report is checked
+/// ([`Reporter`]'s `set-path`, `link-path`, `delete-path` and `finish-report`), its paths held
+/// within `room` bytes.
+///
+/// # Errors
+/// [`WholeRefusal::Failed`] with the report's first refusal; [`WholeRefusal::TooLarge`] past `room`.
+pub fn whole_report(
+  command: WholeCommand,
+  items: Vec<WholeItem>,
+  room: usize,
+) -> Result<Report, WholeRefusal> {
+  if command.depth == Depth::Exclude {
+    return Err(WholeRefusal::Failed(ReportFailure::RequestDepthExclude));
+  }
+  let anchor = canonical_fspath(&command.anchor);
+  let operand = canonical_relpath(&command.operand);
+  let target_path = command
+    .switch_path
+    .as_deref()
+    .map_or_else(|| join_fspath(&anchor, &operand), canonical_fspath);
+  let mut reporter = Reporter {
+    kind: command.kind,
+    anchor,
+    operand,
+    target_path,
+    target_revision: command.target_revision,
+    requested_depth: command.depth,
+    text_deltas: command.text_deltas,
+    send_copyfrom_args: command.send_copyfrom_args,
+    ignore_ancestry: command.ignore_ancestry,
+    root_url: Vec::new(),
+    paths: Vec::new(),
+    kept: None,
+    held: 0,
+    room,
+    parser: Parser::new(report_bounds(room)),
+    done: false,
+  };
+  for item in items {
+    reporter
+      .whole_item(item)
+      .map_err(|_| WholeRefusal::TooLarge)?;
+  }
+  match reporter.kept.take() {
+    Some(failure) => Err(WholeRefusal::Failed(failure)),
+    None => reporter.top_level().map_err(WholeRefusal::Failed),
+  }
+}
+
+impl Reporter {
+  /// One item of a whole report, recorded as its ra_svn command records it.
+  fn whole_item(&mut self, item: WholeItem) -> Result<(), Refused> {
+    let (path, link_path, revision, depth, start_empty, lock_token) = match item {
+      WholeItem::Delete { path } => {
+        return self.record(PathInfo {
+          path: join_relpath(&self.operand, &canonical_relpath(&path)),
+          link_path: None,
+          revision: None,
+          depth: Depth::Infinity,
+          start_empty: false,
+          lock_token: None,
+        });
+      }
+      WholeItem::Set {
+        path,
+        revision,
+        depth,
+        start_empty,
+        lock_token,
+      } => (path, None, revision, depth, start_empty, lock_token),
+      WholeItem::Link {
+        path,
+        link_path,
+        revision,
+        depth,
+        start_empty,
+        lock_token,
+      } => (
+        path,
+        Some(link_path),
+        revision,
+        depth,
+        start_empty,
+        lock_token,
+      ),
+    };
+    let refusal = match (&link_path, depth) {
+      (Some(_), Depth::Exclude) => Some(ReportFailure::ExcludeLink),
+      (_, Depth::Unknown) => Some(ReportFailure::UnsupportedDepth),
+      _ => None,
+    };
+    if let Some(failure) = refusal {
+      return self.keep(failure);
+    }
+    self.record(PathInfo {
+      path: join_relpath(&self.operand, &canonical_relpath(&path)),
+      link_path: link_path.as_deref().map(canonical_fspath),
+      revision: Some(revision),
+      depth,
+      start_empty,
+      lock_token,
+    })
+  }
+}
+
 /// The bounds a report command is read within: the caller's bytes, the longest word, the deepest
 /// list a report command holds, and the count the bytes pay for parsed.
 fn report_bounds(item_bytes: usize) -> Bounds {
