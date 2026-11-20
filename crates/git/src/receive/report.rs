@@ -13,10 +13,10 @@ use super::{
   Declined, Outcome, PackRefusal, PackRefused, Received, Refusal, Reported, Requested, unpack_words,
 };
 use crate::object_name::ObjectId;
-use crate::{delta, entry, unpack};
 use crate::out::Out;
 use crate::pktline::{self, Packet};
 use crate::sideband::{self, Band};
+use crate::{delta, entry, unpack};
 
 /// Format: `report_message`'s buffer, the most bytes an `rp_error` line takes, its LF included.
 const MESSAGE_MAX: usize = 4096;

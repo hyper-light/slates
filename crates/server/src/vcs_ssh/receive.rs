@@ -129,13 +129,7 @@ impl<S: ShardLender> ReceiveCommand<S> {
       ..
     } = self;
     let started = lent(lender, |state| {
-      ReceivePack::start(
-        state,
-        (&*principal, *repository),
-        true,
-        out,
-        Unpresented,
-      )
+      ReceivePack::start(state, (&*principal, *repository), true, out, Unpresented)
     })?;
     self.push = Some(started.map_err(|failed| refused(failed, &self.name))?);
     Ok(Stepped {

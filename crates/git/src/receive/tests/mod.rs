@@ -1163,7 +1163,10 @@ fn a_pack_past_its_room_is_refused_in_the_words_of_gits_max_input_size() {
   }
   pktline::write(Packet::Flush, &mut expected).unwrap();
   assert_eq!(
-    (String::from_utf8_lossy(&report), String::from_utf8_lossy(&text)),
+    (
+      String::from_utf8_lossy(&report),
+      String::from_utf8_lossy(&text)
+    ),
     (
       String::from_utf8_lossy(&expected),
       "fatal: pack exceeds maximum allowed size\n".into()
