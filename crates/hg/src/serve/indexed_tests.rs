@@ -1024,3 +1024,75 @@ fn a_view_past_its_room_is_refused() {
     );
   }
 }
+
+/// The files a `stream_out` answer sends, read back: its first line, then each name and bytes.
+fn streamed(answer: &[u8]) -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
+  let mut rest = answer;
+  let line = |rest: &mut &[u8]| {
+    let end = rest.iter().position(|byte| *byte == b'\n').unwrap();
+    let head = rest[..end].to_vec();
+    *rest = &rest[end + 1..];
+    head
+  };
+  let status = line(&mut rest);
+  let counts = String::from_utf8(line(&mut rest)).unwrap();
+  let (files, total) = counts.split_once(' ').unwrap();
+  let (files, total): (usize, usize) = (files.parse().unwrap(), total.parse().unwrap());
+  let mut sent = Vec::new();
+  for _ in 0..files {
+    let head = line(&mut rest);
+    let nul = head.iter().position(|byte| *byte == 0).unwrap();
+    let size: usize = std::str::from_utf8(&head[nul + 1..])
+      .unwrap()
+      .parse()
+      .unwrap();
+    let (bytes, tail) = rest.split_at(size);
+    sent.push((head[..nul].to_vec(), bytes.to_vec()));
+    rest = tail;
+  }
+  assert!(rest.is_empty(), "bytes after the last file");
+  assert_eq!(
+    sent.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
+    total
+  );
+  (status, sent)
+}
+
+/// Stream clones part 2 (A-707; 7.2's `generatev1wireproto`): do ask `stream_out` of the `states` repository, which
+/// holds a secret changeset, and of the same repository with its secret root dropped. Expect the first answered `1\n`
+/// and listing no `streamreqs`; the second `0\n`, then every non-empty revlog of `render::revlogs` in its order, each
+/// named by its store path and holding its bytes, and the capabilities listing `streamreqs` with the rendered store's
+/// requirements.
+#[test]
+fn stream_out_sends_the_rendered_revlogs_unless_a_changeset_is_secret() {
+  use super::super::stream::stream_out;
+  let (imported, store) = imported("states");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let mut answer = Vec::new();
+  stream_out(&view, &mut room(), &mut answer).unwrap();
+  assert_eq!(answer, b"1\n");
+  assert!(!view.streams());
+  let public: Vec<PhaseHead> = imported
+    .phase_roots
+    .iter()
+    .filter(|root| root.phase != Phase::Secret)
+    .copied()
+    .collect();
+  let state = State {
+    roots: &public,
+    ..state_of(&imported)
+  };
+  let view = Indexed::new(&imported.index, &store, state, &mut room()).unwrap();
+  let mut answer = Vec::new();
+  stream_out(&view, &mut room(), &mut answer).unwrap();
+  let (status, sent) = streamed(&answer);
+  assert_eq!(status, b"0");
+  let expected: Vec<(Vec<u8>, Vec<u8>)> =
+    crate::render::revlogs(&imported.index, &store, &mut room())
+      .unwrap()
+      .into_iter()
+      .filter(|(_, bytes)| !bytes.is_empty())
+      .collect();
+  assert_eq!(sent, expected);
+  assert!(sent.iter().any(|(name, _)| name == b"00changelog.i"));
+}

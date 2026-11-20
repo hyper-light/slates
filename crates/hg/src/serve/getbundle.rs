@@ -85,6 +85,22 @@ pub trait Store: Repository {
 
   /// The repository's obsolescence markers, in any order.
   fn markers(&self) -> impl Iterator<Item = Marker<'_>>;
+
+  /// Whether a stream clone is served (stream clones part 2): a view over a repository's index that holds no secret
+  /// changeset, as 7.2's `allowservergeneration` refuses a store with one. None by default.
+  fn streams(&self) -> bool {
+    false
+  }
+
+  /// The revlogs a stream clone sends ([`crate::render::revlogs`]), charged to `room`; `None` where none is served
+  /// ([`Store::streams`]).
+  fn stream_files(
+    &self,
+    room: &mut Admission,
+  ) -> Result<Option<Vec<crate::render::File>>, Refusal> {
+    let _ = room;
+    Ok(None)
+  }
 }
 
 /// A manifest or file revision as its log keeps it.
