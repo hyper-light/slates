@@ -89,3 +89,14 @@
 - LANDED docs main 06bafe27a: bug record "Shown 2026-11-20" (corrects "below the single receiver"), GAPS hang entry,
   expected-failure line's reason.
 - NEXT (owed, A-198 amendment): a receive never waits on a send. Design pending; Windows-only, CI-iterated.
+- 2026-11-20 main: B3's fix is mine; jupiter (no WinFsp; Windows toolchain, 32 cores) takes Windows compiles/unit
+  tests, target C:\Users\corph\.cache\w-bugs-target; drive runs stay on CI diag. After B3: B14, then bug-claims open.
+- B3 DESIGN (relief receiver): P (primary) and R (relief), each its own capture region (held section + one
+  capture::BYTES). Station (DLL op state, PrivateOpens, confirming, may-link set moved out of thread_local, working
+  packet) is MOVED, never shared: P parks it in an AtomicPtr slot before each send and swaps it back after; R looks
+  every beat (100 ms): if P is in the same send (odd send generation unchanged) R swaps the station out, serves its
+  own region until P sets reclaim, then hands it back (back slot + unpark). One operating thread at a time (A-198,
+  DLL single caller, REQUEST_BOUND and one outstanding confirmation unchanged). Recovery settles both regions;
+  settle_pending gets the saved open from either. Failing test first: pure relief module over generic Port/Station,
+  model driver whose kind-8 send blocks until a nested request is answered (red with today's single receiver).
+  Residual: R stuck in its own send is not relieved (bound 2).
