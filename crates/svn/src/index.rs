@@ -54,7 +54,10 @@
 //! addition without history, leaves nothing at the path; a copy gives the node at the same place beneath the copy's
 //! source, in the source's revision. So a file beneath a branch is its trunk node-revision, created on trunk, until it
 //! changes on the branch, as FSFS shares it. The node relation follows (`svn_fs.h`'s three answers): the same
-//! node-revision is unchanged, the same node identity a common ancestor, anything else unrelated.
+//! node-revision is unchanged, the same node identity a common ancestor, anything else unrelated. A directory's
+//! listing (`Index::children`, A-681: the index holds none, as FSFS holds a directory's entries) is every name the
+//! index named directly beneath it or beneath a copy's source that what stands beneath it comes from, each kept where
+//! its own path reads as a node; the oracle holds every directory of every generated revision to the naive tree's.
 //!
 //! Every record is checked whole before anything changes, and a refused record leaves the index as it was: a path out
 //! of Subversion's canonical form; two rows for one path; a row naming a path its own revision leaves absent or present

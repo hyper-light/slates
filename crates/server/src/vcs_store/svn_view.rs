@@ -21,6 +21,7 @@
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_svn::lock::AprTime;
 use slates_svn::migration::Repository as SvnRecords;
+use slates_vfs::clock::Clock;
 
 use crate::state::ShardState;
 use crate::vcs_http::svn::{Lent, SvnStores};
@@ -50,7 +51,7 @@ impl SvnStores for ServedRecords {
 /// Runs `step` over repository `id`'s records in `state` as they stand, with the owner's instant (module docs); none
 /// when `state` holds none.
 pub(crate) fn lend_in<T>(
-  state: &ShardState,
+  state: &mut ShardState,
   id: RepositoryId,
   step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
 ) -> Option<T> {

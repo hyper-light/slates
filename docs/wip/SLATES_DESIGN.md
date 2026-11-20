@@ -14850,6 +14850,19 @@ and export by landing).
 > negative `S:limit` is refused (`svn_repos_get_logs5` would read it as two limits); revision properties are written in
 > the green's order where `mod_dav_svn` walks an APR hash.
 >
+> **Status (2026-11-19, A-681, the lender).** Built: a Subversion repository's records (A-655 part 2b's
+> `slates_svn::migration::Repository` in A-662's map) are the read source both front ends read a repository through
+> on its owner shard: `reads::Repository` and `mergeinfo::Contents` over the records (a revision's properties, a
+> property list decoded in place, a text from an offset), a directory's entries from the index's new listing
+> (`Index::children`: the names the index named beneath the directory and beneath each copy's source what stands
+> beneath it comes from, each kept where its own path reads as a node), and `slates-server`'s
+> `vcs_store::svn_view::ServedRecords`, the DAV site's lender, whose `lend_in` the svn:// listener's connection takes
+> its sources from (A-689). Held to the index's oracle (every directory of every generated revision listed as the
+> naive tree holds it, listings through copies counted) and to a repository committed through the owner's step on a
+> daemon's shard, read back through the lender by a depth-1 PROPFIND, a GET and a `log-report`. Owed: the site routed
+> into the daemon's `ToolSites`; a repository's authorization file and a principal's Subversion user, which no
+> record names yet, so the lender gives no read rules (every path the policy lets the principal read).
+>
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
 > `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
