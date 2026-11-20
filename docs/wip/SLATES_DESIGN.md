@@ -12360,9 +12360,19 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > the answer is lent from it (`lend_held`), and the last hold's release gives the fork back. By use, a push and a new tag
 > landing after a fetch's first step: the held answer's pack is the start generation's objects in its order (each by
 > id, so byte for byte; the zlib level each is deflated at is the stream's own timed choice, §4.11). Before it, the
-> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. Owed for git: protocol v0's fetch
-> in turns, `begin`'s `ready` and cut and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a
-> run); the live `git clone` rows of the matrix (main's).
+> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. **`begin`'s walks in turns BUILT
+> (same day):** `negotiation::begin` does only what the request names (its wants, haves and shallow lines, the one-round
+> runs, `deepen-not`'s names) and answers at once only where no search could make the server ready (`wait-for-done`,
+> no common have); `ready`'s search (`ready::Readying`: a parent of the path's top a unit, its place an index into the
+> parents), the cut (`shallow::Cutting`: a commit of `deepen`'s breadth-first walk, a ref's tip of `deepen-relative`'s
+> search, a commit painted or judged of `deepen-since`/`deepen-not`'s) and `include-tag` (a run's version joined to what
+> the runs carry as runs of positions, `Graph::brought_set`; then a tag a unit, `Graph::tags_from` keeping its place by
+> the ref's index) are `Negotiating::step`'s, before the choice. The sections before the pack wait for them: the answer
+> writes nothing until they are decided (`upload::fetch::Before`), the acknowledgments alone when not ready, a refusal
+> before them answered as one refused whole. By test: over 2,000 commits and 500 tags, `begin` read 3,499 parents of
+> the graph on main (the whole search and cut), at most 4 now, and each step at most 2, the answer the one made whole.
+> Owed for git: protocol v0's fetch in turns, a plan of scattered positions (16 bytes a run); the live `git clone` rows
+> of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
@@ -12396,9 +12406,30 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > version (`Drive::with_encoding`, svn://'s `editor::encoding_of`). By test: `/trunk/big.txt` (6,000 lines) driven a
 > step a call, edited and added, in version 0 and version 2 with LZ4: before, 4 steps of 2.8-3.0 ms each run (debug);
 > now none past 500 us, and its stream is the whole-window path's byte for byte. The recorded svnserve sessions are
-> unchanged. Owed: the replay drive (`report::drive::replay`, svn://'s `replay`/`replay-range` and the dump exporter's
-> source) and `get-file-revs` (`reads::file_revs`) still make a window whole; the dump exporter's format 3 adopts the
-> maker (w-svn).
+> unchanged. **The replay drive and `get-file-revs` BUILT (same day, A-751 part 3).** Both make every window through
+> the same step (`report::drive::window_unit`, which hands each piece to its caller's sink). The replay drive
+> (`report::drive::replay`, svn://'s `replay` and `replay-range`) gives a window's pieces as the update drive does, a
+> step at a time (`Replay::next_within`). Its svn:// turn ends at the first step past the budget's quantum, as the
+> report exchange's does, where it was one whole call a step. `get-file-revs` (`reads::file_revs`) sends a revision as
+> its tuple, or its DAV element's head (`dav::listing::file_rev_head`), then its delta a step at a time: a string a
+> write over svn://, streamed base64 over DAV. It holds a window's two pieces at most, where it held both texts whole
+> and made the revision whole in one step. `Stream::resume` and the DAV file-revs report take the budget, so a slice
+> stops at its quantum. By test, `big.txt` (6,000 lines; added at r5, edited at r6), a step a call, a step over budget
+> timed again from its state before (a preemption under the suite's load reached 3.6 ms, past a whole window's 3.0 ms):
+> the replay of r6 and r5 and `get-file-revs` 5:6 over svn:// (svndiff 0 and 2) and DAV made no step past 500 us, where
+> whole-window steps made several of about 3 ms. Their deltas are the whole-window path's byte for byte, and the
+> recorded svnserve sessions (replay, `get-file-revs`, svndiff 0) are unchanged. The dump exporter computes its own
+> windows (`migration::export`, `deltas_at`); its format 3 adopting the maker is w-svn's.
+> **The tests hold units, not time (same day, A-751, main's red from w-perf).** The four window tests timed each step
+> against 500 us in a debug build, and failed on main under w-perf's load. They now hold each step to its own unit
+> count, which contention cannot change. The maker counts the units its steps take (`WindowMaking::units_taken`), and a
+> step takes at most those it was given plus one block's look-up (`svndiff::STEP_OVERRUN`). A window step of the drives
+> and of `get-file-revs` takes at most `report::drive::WINDOW_STEP_UNITS` (1,088): bytes read or sent, or the maker's
+> units. Red with whole-window steps: 205,172 units in a step, and 329,608 in the maker's own test. The bound found a
+> hole: a failed block look-up went back to the walk's top unchecked, so a run of misses could fill one step; the walk
+> now checks its units there. Time stays the by-use signal, read in release: the diagnostics runs' past-budget counters,
+> and `window_step_times` (`--ignored`, release). On an M-series Mac, `big.txt` r5 to r6 took 1,310 calls; 5 were past
+> 5 us, the longest 54 us.
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -13829,9 +13860,16 @@ cooperative slices (§4.3).
 > request, before its answer is made, encodes each version whose fragments are not kept (`Repository::first_unencoded`)
 > a turn at a time under the shard's quantum, yielding between turns, and keeps them as content charged to the shard
 > (`crates/server/src/vcs_store/git_encode.rs`); the answer copies them. A version is encoded once, by the first fetch
-> after its push; one encoding a repository at a time, kept in the map between turns. Owed: the encoding from the push's
-> own intake (git's pack reuse, w-git's streaming intake), the base pack's rebuild, kept fragments across a recovery, and
-> the parts' bytes held between turns charged.
+> after its push; one encoding a repository at a time, kept in the map between turns. **Units a window's work (same day,
+> w-k90-vendor, found by use by w-interop):** a 56 MB push of git/git cut at v2.0.0 spun the shard 3.5 s in one unit of
+> the task that finishes the encoding (an object's whole delta trials and ten level samples), and the daemon died into a
+> restart loop. Each unit is now a window's work at most (`slates_git::store::Encoding`'s module doc): a row read, a
+> window of an object or its base read, a step of a delta search, a level sampled on a window, a window deflated, a
+> window put into the content store (`put_window`). Held by work, not wall time (the 56 MB push's encoding, every unit at
+> most a window and one row, the daemon living; `vcs_store::git_encode::tests::a718_no_unit_...`, ignored, its pack
+> named by `SLATES_ENCODE_PACK`). Owed: the encoding from the push's own intake (git's pack reuse, w-git's streaming
+> intake), the base pack's rebuild, kept fragments across a recovery, the parts' bytes held between turns charged, a pair
+> of trees read whole and the parts' record made in one unit.
 
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
@@ -14539,8 +14577,9 @@ signature verification).
 > over the Mercurial arm), each step over the store lent the shard's room and settled after. The push's name is hashed
 > from its repository and its bundle, so a push sent again makes the same works. Its answer is framed as 7.2 frames
 > `unbundle`'s (`serve::http::pushed`): a bundle2 reply in `application/mercurial-0.1`, uncompressed; `pusherr` in
-> `0.1`; a bundle1 out of band. HTTP's capabilities list `unbundle` and the bundle2 capabilities a push needs as 7.2
-> lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
+> `0.1`; a bundle1 out of band. A `pushkey` command is landed as a push of one advisory `pushkey` part through the same
+> driver and answered `1` or `0` (A-758, `serve::keys`). HTTP's capabilities list `pushkey`, `unbundle` and the bundle2
+> capabilities a push needs as 7.2 lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
 > `pushkey`). Differs from 7.2 on purpose: the `output` parts in which 7.2 captures its own progress words over HTTP
 > (`adding changesets`, `added 1 changesets with 1 changes to 1 files`) are not sent; they are no part a client acts on.
 > Not yet durable: a push's entry records its lines', bookmarks' and phase roots' moves and no record of its revisions,
@@ -55664,6 +55703,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-753 — A branch created at a commit another branch holds is made from it, and a resent object is read from the index (bug, 2026-11-20, w-git for UI goal 93; found by use in A-722's proof)
+- **Found by use.** A-722's proof on the 32-core Studio (release, git/git): 100 concurrent v1.5.0 pushes to one
+  repository, each creating its own branch, answered 80 `ok` and 20 `ng refs/heads/pN failed to update ref`, twice; a
+  diagnostic build (branch agents/w-git-diag, never main) logged each as the append refused
+  `TableAtCapacity { table: "green_chains" }`.
+- **Causes.** (1) A create was made at the green its new value's first parent heads, else the default branch's head:
+  with neither, each branch made the whole tree again as its own work, and a hundred branches at one commit held it a
+  hundred times in the partition's chains (a checkpoint costs the chains what its increments did, so folding frees
+  nothing). (2) Found by the test: a push resending objects the repository indexes was refused `missing necessary
+  objects`, since the connectivity check read each pack object from the quarantine, which passes over what the index
+  holds. (3) At the chains' cap a push checkpointed only the greens it updated, so an entry of creates alone could free
+  nothing.
+- **Change.** `receive::works::Greens::holding_head`: a create is made first at the green whose head is its new value,
+  its work empty (`ShardGreens::holding`); `git_push::intake::Quarantined` reads an object the quarantine passed over
+  from the index (`Repository::stored`); `repository::push::admit` at the cap checkpoints the repository's other members
+  too.
+- **Tests.** `slates-server` `git_push::tests::t_a753_a_repository_takes_branch_creates_past_its_chain_budget` (24
+  creates under a 64 KiB chain budget, each resending its pack; red on main: every create after the first refused).
+  `slates-server --lib -- vcs_store:: git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks::
+  git_protect` 199 passed; `slates-git --lib -- receive::` 46 passed; fmt clean (macOS arm64, this Mac, local).
+
 ### A-722 part 4b's race — A staging a landing overtakes is staged again, whatever step it was in (bug, 2026-11-20, w-git; found by reading after the 100-push run)
 - **Cause.** Part 4b made the stage's fork at its rows' step and read the next position at its positions' step, so a
   push that landed during the staging's earlier turns could leave a stage that looked current (its fork made after
@@ -56369,9 +56429,8 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   install so (the work answered `Unpublished` for good; the test's first run, by use).
 - **Counters.** `merge.work.replay_awaits_replica`, `merge.work.replayed_on_replica` (the test's non-vacuity count),
   `merge.work.replay_ask_unhanded`.
-- **Owed.** A creation a restart caught waiting for the owner's admission is dropped here (`drop_pending_creations`),
-  and the floor the owner may have recorded for it stays there, since the pending record does not name the green: it
-  keeps more history, not less. Recovering a holder's pending submit is the existing path: the work's next verb runs it
+- **Owed (closed the same day, part e2 below).** A creation a restart caught waiting for the owner's admission was
+  dropped here (`drop_pending_creations`), and the floor the owner may have recorded for it stayed there. Recovering a holder's pending submit is the existing path: the work's next verb runs it
   again under its key, and the owner's completion record answers it.
 - **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
   a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_restart` (three nodes at `f = 1` keeping
@@ -56449,6 +56508,113 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   inside a record refused `Truncated`; too many, too long).
 - **Applied in the same change to** A-625 part 3's status and decision 3, `docs/wip/platforms.md` gap 2,
   `unsafe-budget.toml`, amendments.tsv.
+
+### A-755 — A live whole entry's build sizes each piece to the quantum left at the seal rate it measures (bug, 2026-11-20, w-forming; found by use: main's performance-gaps-upfront order; amends A-377's "one piece at least"; §4.10 "Live shipping"; CLAUDE.md "Bounded work everywhere")
+
+- **What was measured.** Probes in the live_chaos fresh-member flow (a debug fleet under `taskpolicy -b`, macOS arm64,
+  Mac Studio adas-mac-studio-4) timed each part of a whole build's turn: one piece, a whole archive chunk (a MiB), took
+  87 to 302 ms of the owner shard's CPU against seal quanta of 14 to 784 us. A-377 sealed pieces until the quantum passed,
+  one piece at least, and a piece was always a whole chunk.
+- **The change.** `WholeBuild` keeps the bytes it has sealed and the clock time their seals took; `piece_bytes` sizes each
+  next piece to what that rate seals in the turn's quantum left, at least one archive page (`MAX_BASE_PAGE_BYTES`, so a
+  turn moves the build on and a piece's name and tag stay a small share of it) and at most a chunk. Pieces of any size
+  open as before (`open_body` joins them in order).
+- **Owed (GAPS).** The append that ends a build (223 to 498 ms of CPU a turn in the same runs) and a large delta's
+  shipper append stay one turn.
+- **Tests.** `live_ship::tests::a_whole_builds_piece_is_what_the_measured_rate_seals_in_the_quantum_left`; the fleet test
+  `a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it` now holds the build to at least the
+  content's bytes over a page in turns under the cut quantum (48 for 3 MiB), red before (8 turns); `--test fleet whole`
+  5/5, `--test fleet live` 20/20, `--lib live_ship::` 24/24.
+- **Applied in the same change to** A-377's doc lines in `live_ship.rs`, GAPS (the one-turn walks entry), amendments.tsv.
+
+### A-697 part e2 — A holder creation a restart caught waiting for its admission releases the owner's floor before it is dropped (2026-11-20, w-shared for UI goal 93; main's order: performance gaps up front, held history the same waste as A-742's)
+Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's step two), `crates/db/src/catalog.rs`
+(`PendingCreationRecord::green`), `crates/db/tests/alias.rs`, `crates/server/src/work_home.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/verbs.rs`, `crates/server/tests/fleet.rs`.
+- **What was there.** A restart drops every creation it catches waiting for its green's owner (`drop_pending_creations`):
+  its name and id go back, and the client's resend makes the work afresh. For a holder's creation (part a2) the owner
+  may already have admitted it and recorded its floor, which then held the green's history at that version for a work
+  never made, for good.
+- **Change.** The pending record names its green (`PendingCreationRecord::green`; a field of a record, so the log's
+  schema hash moves as an appended variant would move it, `record.rs`). At recovery a pending creation over a green
+  another node owns is not dropped (`work_home::hold_for_release`): its record stays, holding its name and id, and its
+  resend is answered retryable. Its release is asked as clients are let in (`verbs::ask_owners_to_replay` →
+  `work_home::release_admissions`) and again at each resend: `MoveWorkFloor` with no base, from the control shard, which
+  the owner applies monotonically (a floor never recorded stays none). On `WorkFloorMoved` the creation is settled, its
+  name and id given back, and the next resend makes the work afresh. One release is out at a time a creation; one
+  unanswered is asked again at the next resend or the next start (no timer, A-533's pattern), and the record survives
+  a restart between, so the release is never lost.
+- **Counters.** `merge.work.admission_held_for_release`, `merge.work.admission_released` (the test's non-vacuity count),
+  `merge.work.admission_release_unanswered`.
+- **Test seam.** `Daemon::lose_next_owner_answer` now loses an admission over the fleet too (`admit_over_fleet`), as it
+  loses one between shards; `Daemon::work_floors_of` lists a green's floors at its owner.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner` (three nodes at `f = 1` keeping their state; B
+  loses a creation's admission answer after A recorded the work's floor, restarts over its own segment: A's floor for
+  that work released, B's counter moved, the name made again at a new id). Red with the creation dropped as before: A's
+  floor never released (the poll gave up). Fleet `a_holder` 23 of 23; `slates-server --lib work_home verbs::
+  takeover::`, `slates-db --lib` and `--test alias`; fmt clean.
+
+### A-757 — The live append turn bounded (2026-11-20, w-forming; main's order: a measured gap fixed up front; §4.10 "Live shipping"; A-377, A-755; CLAUDE.md "Bounded work everywhere")
+
+- **What was measured.** The turn that appends a live entry hashed its whole payload three times, each over a fresh
+  copy of the canonical bytes (`db::live::Shipper::append_unchecked`'s head, then `live_ship::append_entry`'s two
+  `entry.head()`), and cloned the entry into the retained tail: 223 to 498 ms of the owner shard's CPU for a whole
+  entry's append and 128 to 331 ms for a 1.8 to 2.5 MB delta in a debug fleet under `taskpolicy -b`; 3.1 to 4.6 ms for
+  2.4 MB in release, against seal quanta of 14 to 784 us.
+- **Part 1 (this change).** `Entry::identity` hashes the canonical bytes as the fields stream, with no copy (equal to
+  `blake3(encode())` byte for byte); `Shipper::append_kept` and `append_checkpoint_kept` keep the entry in the retained
+  tail without a clone and return the head hashed once; `live_ship::append_entry` reads that head. Release, 2.4 MB,
+  best and median of 9: a delta 3.63 / 4.59 ms before, 1.39 / 1.63 ms after; a whole state 3.06 / 3.42 ms before,
+  0.94 / 0.97 ms after (`slates-db --test live measure_the_live_append_turn`, ignored, a measurement).
+- **Part 2 (whole builds).** `db::live::EntryHasher`, seeded by `Shipper::entry_hasher` with the next entry's place in
+  the chain and its payload's length, is fed the payload a slice at a time; `Shipper::append_checkpoint_hashed` appends
+  with its identity, refused `Behind` when the chain moved since it was seeded or it was fed other than the payload.
+  `live_ship::hash_whole_turn` joins a whole build's sealed body once its last piece is sealed, seeds the hasher, and
+  feeds it slices sized to the quantum left at the rate it measures (`piece_bytes`, a page to an archive chunk) across
+  the build's turns; `append_ready` appends the build only once it is hashed. The queue's credit keeps the build's size
+  while it hashes. Release, 2.4 MB, best and median of 9: the append turn 0.92 / 0.94 ms before, 0.46 us after, each
+  64 KiB hashing turn 27 to 32 us; peak RSS 8.80 to 8.85 MB both (`measure_the_whole_append_turn_hashed_at_once` and
+  `_in_slices`, ignored measurements). Tests: `a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once`; the
+  fleet sealed-in-turns test holds the hashing to at least a page a turn under the cut quantum (48 turns for 3 MiB),
+  red before (0 turns: hashed in the append's turn).
+- **Part 2b (large deltas).** A delta over one archive page (`built_in_turns`), sealed or in the clear, is built in turns
+  of its own as a whole state is: the build carries `whole` and `clear`, seals its pieces when this node seals, hashes
+  in slices, waits for the delta credit (`Shipper::admits_delta`) and appends with `Shipper::append_hashed`; a whole
+  state keeps A-377's rule. Release, 2.4 MB, best and median of 9, three runs: the append turn 0.92 to 1.77 / 0.94 to
+  2.32 ms before, 0.42 to 0.88 / 0.46 to 1.46 us after; each 64 KiB hashing turn 27 to 54 / 30 to 68 us
+  (`measure_the_delta_append_turn`). Tests: `a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once`; the fleet
+  test `a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own` (a three-MiB staged write, one publication), red
+  before (no build, no hashing turn), at least 48 hashing turns after.
+- **Part 3 (the body held once).** One owner and lends, no `Arc` (R2): the payload moves into the shipper at the
+  append (no clone), `Shipper::keep` names the whole entry the owner keeps as its last whole state, `trim` moves that
+  entry to a kept slot when the retained tail lets it go, and `Shipper::payload_at` lends it from either place.
+  `LiveVolume::whole` is a `WholeState`: `InLog(head)`, lent by the shipper, or `Image(head, bytes)`, an install image
+  made beside the log, which is not an entry. The content store (A-727) was not used: a live log's payload is an
+  in-memory shipping buffer, not durable content. Release, 50 volumes' 2.4 MB whole states held at rest: peak RSS 248.9
+  to 249.0 MB before, 127.7 MB after (`measure_whole_states_held_twice` and `_once`, ignored measurements). Tests:
+  `a_kept_whole_state_is_lent_after_the_retained_tail_lets_it_go`; the fleet `live`, `whole` and `install` tests and the
+  live_chaos fresh-member flow (2/2) send installs from the lent payload.
+- **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
+  `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
+- **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
+  `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
+
+### A-756 — A volume made on a node by materialization is found there by its name: it claims its name's alias (bug, 2026-11-20, w-fed-move, kiln goal 91; found by use: kiln's live move of an agent's captured clone, its mount refused `NOENT` on the new owner in four runs of five; §4.8 "Lookup", §4.10 "Ownership follows the writer"; A-236, A-291)
+- **Why.** A clone named for another partition than its origin's lives beside its origin and is found by name only
+  through the alias its name's partition holds (A-236). A planned move releases the old owner's alias with its copy
+  (`moves::release`), and the new owner materializes the volume in the partition its id names (`fleet::make_taken`)
+  without one, so a `MNT` of the name, routed to the name's partition (`nfs::routed`), found nothing there unless the
+  name happened to hash to the clone's partition. A takeover's successor had the same gap.
+- **Change.** `verbs::claim_name_alias`: once `make_taken` has made a volume, where its name hashes to another
+  partition, the name's shard reserves and confirms the alias for it (the clone's own two steps, `Op::NameAliasReserved`
+  then `Op::NameAliasConfirmed`): nothing when it already names the volume confirmed, refused when the name or its
+  alias is another volume's; a claim not taken is counted `names.alias_step_untaken` and left to recovery's
+  reconciliation, as an alias step is.
+- **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
+  a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
+  captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
+  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.
 
 ### A-754 — The Linux issuer surface: the anchor prints an issuer route and its secret, and a separate process that presents the secret is handed the segment (2026-11-20, w-reaper, main's ruling; §4.13 "Grants", A-299; closes the Linux issuer surface owed since 2026-09-13)
 

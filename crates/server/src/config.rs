@@ -412,6 +412,11 @@ pub struct DaemonConfig {
   /// Measured: the machine's BLAKE3 throughput, bytes per second, which sizes an archive-walk slice against
   /// the shard's live step quantum ([`DaemonConfig::archive_slice_bytes`]).
   pub blake3_bytes_per_second: u64,
+  /// Measured: the machine's MD5 and SHA-1 throughput together, bytes per second, through aws-lc-rs as Subversion's dump
+  /// writer digests a text it writes (`slates_svn::dump::digest`), which sizes a dump export's whole-text piece against
+  /// the shard's live step quantum ([`DaemonConfig::svn_text_piece_bytes`]). Measured here, since the boot profile's
+  /// crate builds where aws-lc-rs cannot.
+  pub svn_digest_bytes_per_second: u64,
   /// Measured: the machine's memcpy throughput at the largest copy size the boot profile measured, bytes per
   /// second. A §4.6 L2 shift is a block copy, so this is what sizes its slice against the shard's live step
   /// quantum ([`DaemonConfig::copy_slice_bytes`]) — the hash rate would be the wrong question for it.
@@ -921,6 +926,14 @@ impl DaemonConfig {
       ["hash.blake3_bytes_per_second", "rt.step_budget_ns"]
     );
     derivations.push(note("archive_slice_bytes", &archive_slice_bytes));
+    let svn_digest_bytes_per_second = svn_digest_rate(runtime.step_budget_ns);
+    // The boot value, for the record: an export sizes each piece by the live quantum, as an archive's slice is.
+    let svn_text_piece_bytes: Derived<u64> = derived!(
+      copy_bound_bytes(svn_digest_bytes_per_second, runtime.step_budget_ns),
+      "svn_digest_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000",
+      ["svn.digest_bytes_per_second", "rt.step_budget_ns"]
+    );
+    derivations.push(note("svn_text_piece_bytes", &svn_text_piece_bytes));
     // A §4.6 L2 shift copies a content block, so its slice is sized by the measured copy rate rather than the
     // hash rate; the largest measured copy size is the one a whole-block copy behaves like.
     let memcpy_bytes_per_second: Derived<u64> = derived!(
@@ -1207,6 +1220,7 @@ impl DaemonConfig {
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,
       blake3_bytes_per_second: profile.hash.blake3_bytes_per_second,
+      svn_digest_bytes_per_second,
       memcpy_bytes_per_second: memcpy_bytes_per_second.get(),
       page_fault_ns: page_fault_ns.get(),
       codec,
@@ -1524,6 +1538,44 @@ fn guest_credits(
   credits
 }
 
+/// The bytes work at `bytes_per_second` may take within a copy slice of `quantum_ns`: half the quantum
+/// (`COPY_SLICE_PERMILLE`), the slice `crate::image::sliced` judges each unit of an export by.
+fn copy_bound_bytes(bytes_per_second: u64, quantum_ns: u64) -> u64 {
+  (bytes_per_second.saturating_mul(quantum_ns) / NANOS_PER_SECOND)
+    .saturating_mul(COPY_SLICE_PERMILLE)
+    / PERMILLE
+}
+
+/// Measures the machine's MD5 and SHA-1 throughput together, bytes per second, as Subversion's dump writer digests a
+/// text (aws-lc-rs's legacy digests): one Subversion window's bytes (`SVN_DELTA_WINDOW_SIZE`, the most a delta window
+/// makes) digested by both, within a step budget of `step_budget_ns`. Zero where the digests cannot be made, which no
+/// build of aws-lc-rs answers; an export then writes a byte a piece.
+fn svn_digest_rate(step_budget_ns: u64) -> u64 {
+  use aws_lc_rs::digest::{Context, MD5_FOR_LEGACY_USE_ONLY, SHA1_FOR_LEGACY_USE_ONLY};
+  let len = usize::try_from(slates_svn::svndiff::WINDOW_LIMIT).unwrap_or(0);
+  let buffer: Vec<u8> = (0..len)
+    .map(|at| u8::try_from(at.checked_rem(usize::from(u8::MAX)).unwrap_or(0)).unwrap_or(0))
+    .collect();
+  let measured = slates_machine::bench::measure(
+    || {
+      if let (Ok(mut md5), Ok(mut sha1)) = (
+        Context::try_new(&MD5_FOR_LEGACY_USE_ONLY),
+        Context::try_new(&SHA1_FOR_LEGACY_USE_ONLY),
+      ) {
+        md5.update(&buffer);
+        sha1.update(&buffer);
+        std::hint::black_box((md5.finish(), sha1.finish()));
+      }
+    },
+    std::time::Duration::from_nanos(step_budget_ns),
+  );
+  let bytes = u64::try_from(buffer.len()).unwrap_or(0);
+  bytes
+    .saturating_mul(NANOS_PER_SECOND)
+    .checked_div(measured.median_ns())
+    .unwrap_or(0)
+}
+
 /// The bytes one archive-walk slice may hash within `quantum_ns`: half the quantum at `blake3_bytes_per_second`,
 /// so a seal (§4.10) is archived in bounded slices (§4.3) that never take the whole step from the clients.
 fn archive_slice_bytes(blake3_bytes_per_second: u64, quantum_ns: u64) -> u64 {
@@ -1589,6 +1641,13 @@ impl DaemonConfig {
   /// machine's measured BLAKE3 throughput.
   pub fn archive_slice_bytes(&self) -> u64 {
     self.archive_slice_bytes_within(self.step_quantum_ns())
+  }
+
+  /// The bytes of a whole text one dump export call writes on the calling shard now (A-652, `Exporter::with_text_piece`):
+  /// what the dump's writer digests within the copy slice its units are judged by, at the machine's measured MD5 and
+  /// SHA-1 throughput; at least one.
+  pub fn svn_text_piece_bytes(&self) -> u64 {
+    copy_bound_bytes(self.svn_digest_bytes_per_second, self.step_quantum_ns()).max(1)
   }
 
   /// [`DaemonConfig::archive_slice_bytes`] for a turn of `quantum_ns` (a git record's replay, whose quantum a test may

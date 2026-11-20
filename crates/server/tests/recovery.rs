@@ -43,8 +43,6 @@ use common::nfs::{create, fsstat, lookup, mount, read, write};
 /// Shape: shards per test daemon: two, so the volume can live on a shard other than the control
 /// shard that accepts the NFS connection, and the cross-shard bridge route is on the recovery path.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the bytes written before the snapshot — what the snapshot freezes.
 const BEFORE: &[u8] = b"the bytes the snapshot froze: alpha bravo charlie delta echo foxtrot\n";
 /// Shape: the bytes written over the same file after the snapshot — the diverged head. Longer than
@@ -67,19 +65,10 @@ fn deadlines() -> Deadlines {
   .get()
 }
 
+/// A client of `instance`, whose daemon started before this: the claim waits while the rendezvous's holder lives
+/// (A-468), so a refusal is the test's failure, never a wait (until 2026-11-20 a five-second retry, `START_WAIT`).
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::hint::spin_loop();
-      }
-      Err(e) => panic!("{e}"),
-    }
-  }
+  Client::connect(instance, deadlines()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn scratch(name: &str) -> CreateSpec {
@@ -529,13 +518,11 @@ fn clone_name_history(shards: u16) -> CloneNameSeen {
     Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
   );
   client.destroy(clone).unwrap();
-  let started = Instant::now();
   let created_after_destroy = loop {
     match client.create(&scratch(&name)) {
       Ok(_) => break true,
-      Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
+      // The destroy's slices run while the daemon lives (A-232's rule; until 2026-11-20 five seconds, `START_WAIT`).
+      Err(ClientError::Refused(Refusal::AlreadyExists { .. })) => {
         #[allow(clippy::disallowed_methods)] // a test waiting out the destroy's slices
         std::thread::sleep(Duration::from_millis(10));
       }
@@ -594,15 +581,13 @@ struct ImageNameSeen {
   names_free_after_destroy: bool,
 }
 
-/// Creates `name` once its holder's destroy has run, within the start wait: whether the name came free.
+/// Creates `name` once its holder's destroy has run, while the daemon lives: whether the name came free.
 fn created_once_free(client: &mut Client, name: &str) -> bool {
-  let started = Instant::now();
   loop {
     match client.create(&scratch(name)) {
       Ok(_) => return true,
-      Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
+      // The destroy's slices run while the daemon lives (A-232's rule; until 2026-11-20 five seconds, `START_WAIT`).
+      Err(ClientError::Refused(Refusal::AlreadyExists { .. })) => {
         #[allow(clippy::disallowed_methods)] // a test waiting out the destroy's slices
         std::thread::sleep(Duration::from_millis(10));
       }
@@ -2959,7 +2944,7 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
     refused => panic!("shard 1 must be refused while shard 0 holds the pool: {refused:?}"),
   }
   client.destroy(large).unwrap();
-  let started = Instant::now();
+  // Waited while the daemon lives (A-232's rule; until 2026-11-20 five seconds, `START_WAIT`).
   let admitted = loop {
     // The destroy completes in slices, and each mutating verb on shard 0 publishes; a create on shard 0 is one such
     // verb, so the extents return at the latest after it.
@@ -2969,7 +2954,9 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
     }
     match client.create(&other) {
       Ok(id) => break id,
-      Err(_) if started.elapsed() < START_WAIT => std::hint::spin_loop(),
+      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BudgetExceeded { .. })) => {
+        std::hint::spin_loop();
+      }
       Err(e) => panic!("shard 1 is admitted once the pool returns: {e}"),
     }
   };
@@ -3232,9 +3219,10 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_role() {
     return;
   };
   let quiet = Duration::from_nanos(2 * slates_server::daemon::HEARTBEAT_NS);
-  let started = Instant::now();
+  // Watched until the beat stops, while the daemon lives: the test that runs this role bounds the role's own life
+  // (until 2026-11-20 five seconds, `START_WAIT`).
   let mut stopped = false;
-  while started.elapsed() < START_WAIT {
+  while !stopped {
     let before = daemon.segment().supervision().unwrap().heartbeat_ns();
     // The role reads the beat the anchor reads, from its own mapping of the same segment.
     #[allow(clippy::disallowed_methods)]
@@ -3253,8 +3241,7 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_role() {
 }
 
 /// Boot (A-100): do start a daemon whose second shard spends two liveness windows on the CPU in its start, and stop the
-/// daemon at once, while its control loop still waits on that shard; expect the stop to finish within the client's
-/// start wait. (The heartbeat kept joinable until the boot was accepted hung `Daemon::stop` in
+/// daemon at once, while its control loop still waits on that shard; expect the stop to finish. (The heartbeat kept joinable until the boot was accepted hung `Daemon::stop` in
 /// `an_acknowledged_replica_survives_a_warm_daemon_restart`, every run, and that test is its reproducer; this one passes
 /// with either design and covers a stop during a long start.)
 #[test]
@@ -3275,7 +3262,9 @@ fn a_daemon_stopped_while_its_boot_waits_on_a_shard_stops() {
     let _ = stopped.send(());
   });
   assert!(
-    done.recv_timeout(START_WAIT).is_ok(),
+    // The stop's end, waited for: a stop that never ends hangs the suite, which its own bound ends (until 2026-11-20
+    // five seconds, `START_WAIT`).
+    done.recv().is_ok(),
     "the daemon stopped while its boot was waiting on a shard"
   );
   stopper.join().unwrap();
@@ -3674,11 +3663,7 @@ fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
       .copied()
       .unwrap_or(0)
   };
-  let started = Instant::now();
-  while cfg!(any(target_os = "linux", target_os = "macos"))
-    && returned() <= before
-    && started.elapsed() < START_WAIT
-  {
+  while cfg!(any(target_os = "linux", target_os = "macos")) && returned() <= before {
     std::thread::yield_now();
   }
   returned()
@@ -3737,8 +3722,7 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
       .unwrap();
   }
   // The content counters ride the daemon's status, beside the shard's own map.
-  let started = Instant::now();
-  while counter(&mut client, "content.trimmed_bytes") == 0 && started.elapsed() < START_WAIT {
+  while counter(&mut client, "content.trimmed_bytes") == 0 {
     std::thread::yield_now();
   }
   let trimmed = counter(&mut client, "content.trimmed_bytes");
@@ -4011,16 +3995,15 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   // pass to see no allocation, the next to purge), so the count is watched until it covers most of the file or the
   // bound passes.
   let file = u64::try_from(body.len()).unwrap();
-  let started = Instant::now();
   let mut given_back = purged().saturating_sub(purged_before);
-  while given_back < file / 2 && started.elapsed() < START_WAIT {
+  while given_back < file / 2 {
     std::thread::yield_now();
     given_back = purged().saturating_sub(purged_before);
   }
   #[cfg(target_os = "linux")]
   let mut released = allocated_in_content(&content);
   #[cfg(target_os = "linux")]
-  while written.saturating_sub(released) < file / 2 && started.elapsed() < START_WAIT {
+  while written.saturating_sub(released) < file / 2 {
     std::thread::yield_now();
     released = allocated_in_content(&content);
   }
@@ -4084,7 +4067,7 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
   client.fs_remove((volume, attachment), "gone").unwrap();
   let started = Instant::now();
   let mut left = occurrences_in_content(&content, MARKER);
-  while left > 0 && started.elapsed() < START_WAIT {
+  while left > 0 {
     std::thread::yield_now();
     left = occurrences_in_content(&content, MARKER);
   }
@@ -4150,13 +4133,13 @@ fn a_sealed_files_plaintext_leaves_the_content_object() {
   let content = format!("slates-con-{tag}");
   let written = occurrences_in_content(&content, MARKER);
   let started = Instant::now();
-  while counter(&mut client, "content.sealed") == 0 && started.elapsed() < START_WAIT {
+  while counter(&mut client, "content.sealed") == 0 {
     std::hint::spin_loop();
   }
   let sealed = counter(&mut client, "content.sealed");
   let scrub_started = Instant::now();
   let mut left = occurrences_in_content(&content, MARKER);
-  while left > 0 && scrub_started.elapsed() < START_WAIT {
+  while left > 0 {
     std::thread::yield_now();
     left = occurrences_in_content(&content, MARKER);
   }
@@ -4205,8 +4188,7 @@ fn an_idle_small_file_is_sealed_by_the_daemons_sweep() {
     0,
     "a small write seals nothing itself"
   );
-  let started = Instant::now();
-  while counter(&mut client, "content.sealed") == 0 && started.elapsed() < START_WAIT {
+  while counter(&mut client, "content.sealed") == 0 {
     std::hint::spin_loop();
   }
   assert!(
@@ -5567,14 +5549,13 @@ fn close_held(session: &mut common::nfs4::Session, fh: &[u8], stateid: &[u8]) ->
     .map(|_| ())
 }
 
-/// The bytes the volume `id` references, read until `settled` holds of them or the restart oracle's wait passes:
+/// The bytes the volume `id` references, read until `settled` holds of them, while the daemon lives:
 /// a hold's release reaches the volume as the call that ends it is served, a lapsed client's as its purge is.
 fn referenced_until(client: &mut Client, id: VolumeId, settled: impl Fn(u64) -> bool) -> u64 {
-  let started = Instant::now();
   loop {
     let referenced = client.status(id).unwrap().referenced_bytes;
     // Each status is a round trip to the daemon, which paces the loop.
-    if settled(referenced) || started.elapsed() >= START_WAIT {
+    if settled(referenced) {
       return referenced;
     }
   }

@@ -925,6 +925,21 @@ fn is_forwardable_read(body: &RequestBody) -> bool {
   body.forwards_as_read()
 }
 
+/// The shard of this node that owns `volume`, a forwarded verb's: refused `HomedElsewhere` where this node has learned
+/// another home, `NotFound` where no shard of it holds the volume's partition, or by the state's refusal.
+fn forwarded_to(volume: VolumeId, control: u16) -> Result<u16, Box<ReplyBody>> {
+  if let Some(region) = forward_redirect(volume) {
+    return Err(Box::new(refused(Refusal::HomedElsewhere { region })));
+  }
+  let owner = owner_of(volume);
+  match crate::state::try_with_state(|s| shard_of_partition(s, owner)) {
+    Ok(Some(shard)) => Ok(shard),
+    // No shard of this node holds the partition the id names: no such volume here.
+    Ok(None) => Err(Box::new(refused(Refusal::NotFound))),
+    Err(access) => Err(Box::new(refusal_of_access(&access, control))),
+  }
+}
+
 /// Whether a verb is a **write** to an existing volume that is safe to forward to that volume's owner: a
 /// volume-scoped mutation ([`volume_of`] names the volume, [`mutates_shard_image`] changes it). Forwarded
 /// under a completion record keyed by the origin's request id, so a retried forward is exactly-once (§4.8
@@ -932,6 +947,18 @@ fn is_forwardable_read(body: &RequestBody) -> bool {
 /// not one of these — it is placed by the local partitioning, not a home redirect.
 fn is_forwardable_write(body: &RequestBody) -> bool {
   body.forwards_as_write()
+}
+
+/// Whether `body`, forwarded by `origin`, is no node's verb about a work (A-697), or is one about a work whose id's
+/// creator is the member this node has learned for `origin`'s anchor.
+fn node_verb_is_its_members(body: &RequestBody, origin: HostId) -> bool {
+  let Some(work) = node_verb_work(body) else {
+    return true;
+  };
+  crate::state::try_with_state(|s| {
+    crate::member_task::anchor_of(s, ObjectId(work.bytes).creator()) == Some(origin)
+  })
+  .unwrap_or(false)
 }
 
 /// Serves a verb forwarded from another node over the fleet transport (§4.8 "Lookup"): decodes the
@@ -970,12 +997,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   // A node's verb about one of its works (A-697) is the work's own member's alone: the id's creator must be the member
   // this node has learned for the link's authenticated anchor (fleet certificates bind member ids). Any other member is
   // refused, however its principal reads.
-  if let Some(work) = node_verb_work(&body)
-    && !crate::state::try_with_state(|s| {
-      crate::member_task::anchor_of(s, ObjectId(work.bytes).creator()) == Some(origin)
-    })
-    .unwrap_or(false)
-  {
+  if !node_verb_is_its_members(&body, origin) {
     return encode_body(&refused(Refusal::Forbidden {
       verb: "a node's verb about another member's work".to_owned(),
     }));
@@ -994,16 +1016,9 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   // A remembered route is only a hint. If this node has learned a different owner or home,
   // refuse before dispatch (and before recording a forwarded completion), so the client can
   // refresh its hint and retry its original request id without a speculative second write.
-  let redirect = forward_redirect(volume);
-  if let Some(region) = redirect {
-    return encode_body(&refused(Refusal::HomedElsewhere { region }));
-  }
-  let owner = owner_of(volume);
-  let shard = match crate::state::try_with_state(|s| shard_of_partition(s, owner)) {
-    Ok(Some(shard)) => shard,
-    // No shard of this node holds the partition the id names: no such volume here.
-    Ok(None) => return encode_body(&refused(Refusal::NotFound)),
-    Err(access) => return encode_body(&refusal_of_access(&access, control)),
+  let shard = match forwarded_to(volume, control) {
+    Ok(shard) => shard,
+    Err(refusal) => return encode_body(&refusal),
   };
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
@@ -1017,23 +1032,13 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       Err(reply) => *reply,
     }
   } else if is_forwardable_write(&body) {
-    let forwarded = call_owner(control, shard, move |s| {
-      // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
-      if let Some(refusal) = forwarded_before_made(s, volume) {
-        return (Some(refusal), None);
-      }
-      if let Some(up_to) = ack_up_to {
-        prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
-      }
-      // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
-      let reply = run_forwarded(s, origin_host, id, 0, &principal, body, None);
-      (reply, s.told_owed.take())
-    })
-    .await;
-    match forwarded {
-      Ok(forwarded) => answer_forwarded_write(forwarded, (control, shard), origin_host, id).await,
-      Err(refusal) => *refusal,
-    }
+    forwarded_write(
+      (control, shard),
+      (origin_host, id),
+      (principal, body, volume),
+      (ack_up_to, ack_owed),
+    )
+    .await
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
@@ -1125,6 +1130,34 @@ fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<Rep
   }
   state.count(FORWARD_BEFORE_MADE, 1);
   Some(refused(Refusal::Overloaded { shard: state.shard }))
+}
+
+/// A forwarded write run on its owner `shard` under the origin's request id (§4.8 "Lookup"): refused before any
+/// completion is recorded while the volume is not made here yet; the origin's acknowledged completions pruned first;
+/// answered as [`answer_forwarded_write`] answers it.
+async fn forwarded_write(
+  (control, shard): (u16, u16),
+  (origin_host, id): (u64, RequestId),
+  (principal, body, volume): (Principal, RequestBody, VolumeId),
+  (ack_up_to, ack_owed): (Option<u32>, Vec<u32>),
+) -> ReplyBody {
+  let forwarded = call_owner(control, shard, move |s| {
+    // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
+    if let Some(refusal) = forwarded_before_made(s, volume) {
+      return (Some(refusal), None);
+    }
+    if let Some(up_to) = ack_up_to {
+      prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
+    }
+    // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
+    let reply = run_forwarded(s, origin_host, id, 0, &principal, body, None);
+    (reply, s.told_owed.take())
+  })
+  .await;
+  match forwarded {
+    Ok(forwarded) => answer_forwarded_write(forwarded, (control, shard), origin_host, id).await,
+    Err(refusal) => *refusal,
+  }
 }
 
 /// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
@@ -11017,6 +11050,86 @@ fn clone_as(
   }
 }
 
+/// Claims the alias the name's partition holds for `id`, a volume this partition began serving without making it here:
+/// moved here (its adoption) or taken over (the successor's materialization), both `fleet::make_taken` (goal 91's live
+/// move). A clone named for another partition than its origin's is found by name only through that alias (A-236), and
+/// the node it came from released its own (`moves::release`), so without one here a `MNT` of its name, routed to the
+/// name's partition (`nfs::routed`), finds nothing and the kernel's mount is refused `NOENT`. Nothing when the name
+/// hashes here. The claim is the clone's own two steps, reserved then confirmed, on the name's shard; one not taken
+/// (the name held by another volume, or the shard not answering) is counted and left as it is.
+pub(crate) async fn claim_name_alias(id: DbVolumeId) {
+  let claim = crate::state::with_state(|s| {
+    let name = s.db.partition().volume(id)?.name.clone();
+    let name_partition = owner_of_name(&name, s.shards.len());
+    if name_partition == s.partition {
+      return None;
+    }
+    Some((s.shard, shard_of_partition(s, name_partition)?, name))
+  })
+  .flatten();
+  let Some((this, name_shard, name)) = claim else {
+    return;
+  };
+  let claimed = crate::xshard::call_in_shard_time(
+    this,
+    name_shard,
+    move |s| claim_alias(s, &name, id),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await;
+  if !matches!(claimed, Some(Ok(()))) {
+    let _ = crate::state::with_state(|s| s.count(ALIAS_STEP_UNTAKEN, 1));
+  }
+}
+
+/// [`claim_name_alias`]'s steps on the name's partition: nothing when its alias already names `id` confirmed, the
+/// confirmation when it names `id` reserved, else the reservation and its confirmation; refused when the name is
+/// another volume's here, or another volume's alias.
+fn claim_alias(state: &mut ShardState, name: &str, id: DbVolumeId) -> Result<(), Refusal> {
+  let partition = state.db.partition();
+  if let Some(existing) = partition.volume_by_name(name) {
+    return Err(Refusal::AlreadyExists {
+      existing: to_wire_volume(existing.id),
+    });
+  }
+  match partition
+    .name_alias(name)
+    .map(|alias| (alias.volume, alias.confirmed))
+  {
+    Some((volume, true)) if volume == id => return Ok(()),
+    Some((volume, false)) if volume == id => {
+      return alias_step(
+        state,
+        &Op::NameAliasConfirmed {
+          name: name.to_owned(),
+        },
+      );
+    }
+    Some((volume, _)) => {
+      return Err(Refusal::AlreadyExists {
+        existing: to_wire_volume(volume),
+      });
+    }
+    None => {}
+  }
+  alias_step(
+    state,
+    &Op::NameAliasReserved {
+      record: slates_db::catalog::NameAliasRecord {
+        name: name.to_owned(),
+        volume: id,
+        confirmed: false,
+      },
+    },
+  )?;
+  alias_step(
+    state,
+    &Op::NameAliasConfirmed {
+      name: name.to_owned(),
+    },
+  )
+}
+
 /// Releases the alias the name's partition holds for `id`, a volume of this partition destroyed under `name` (A-236,
 /// `slates_db::alias::DESTROY_STEPS`). Nothing when the name hashes here, which holds no alias for it. The release is a
 /// message to the name's shard, which takes it only while its alias still names `id`; one not taken (refused,
@@ -18230,6 +18343,8 @@ const WORK_REBUILD_ASK_REFUSED: &str = "merge.work_rebuild_ask_refused";
 /// this shard holds is replayed here. Each message waits for room on its target's channel while that shard lives
 /// (`xshard::run_on_waiting`), so one is lost only with its shard, counted.
 pub(crate) fn ask_owners_to_replay(state: &mut ShardState) {
+  // The holder creations a restart held for their release at the green's owner ask for it now too (A-697 part e2).
+  crate::work_home::release_admissions(state);
   let here = state.shard;
   for unbuilt in state.work_home.unbuilt.clone() {
     let entries = state.db.partition().work_log(unbuilt.work).to_vec();

@@ -359,11 +359,6 @@ impl Tracker {
     }
   }
 
-  /// Whether the connection's key proved a principal.
-  pub(crate) fn proven(&self) -> bool {
-    self.proven
-  }
-
   /// A completed wait in `phase`: a sample once the connection is proven, kept as the phase's longest before.
   fn learn(&mut self, phase: Phase, waited_ns: u64, waits: &mut PhaseWaits) {
     if self.proven {

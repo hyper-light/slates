@@ -288,7 +288,11 @@ fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
     let alpha = state
       .vcs_stores
       .subversion_records(svn)
-      .and_then(|records| records.content(&identity(b"alpha\n")).map(<[u8]>::to_vec));
+      .and_then(|records| {
+        records
+          .text(&identity(b"alpha\n"))
+          .map(std::borrow::Cow::into_owned)
+      });
     assert_eq!(alpha, Some(b"alpha\n".to_vec()));
     let (youngest, held, charged) = kept(state, svn);
     assert_eq!((youngest, charged), (1, held));
@@ -865,7 +869,10 @@ fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
       Some(held(special)),
     );
     assert_eq!(seen, Some(expected));
-    assert_eq!(records.content(&identity(special)), Some(&special[..]));
+    assert_eq!(
+      records.text(&identity(special)).as_deref(),
+      Some(&special[..])
+    );
   });
 }
 
@@ -954,11 +961,8 @@ fn read_held(
   state: &mut ShardState,
   hold: &crate::vcs_store::svn_view::SvnHold,
 ) -> Option<(u64, Option<Vec<u8>>)> {
-  use slates_svn::reads::Repository as _;
   crate::vcs_store::svn_view::lend_held_in(state, hold, |lent| {
-    let text = lent
-      .repository
-      .text(&identity(b"alpha\n"), 0)
+    let text = slates_svn::reads::Repository::text(lent.repository, &identity(b"alpha\n"), 0)
       .map(std::borrow::Cow::into_owned);
     (lent.index.youngest(), text)
   })
@@ -1009,6 +1013,30 @@ fn t_a745_a_fetchs_hold_reads_the_records_it_began_on_across_a_rebuild() {
   });
 }
 
+/// `svn`'s head texts read through its sources' text source: the replacing text borrowed from `green`, an earlier one
+/// still read from the records.
+fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId, DbVolumeId)) {
+  let engine = state.greens.get(&green).expect("the green");
+  let records = state
+    .vcs_stores
+    .subversion_records(svn)
+    .expect("the records");
+  let texts = crate::vcs_store::svn_texts::HeadTexts {
+    green: Some(&engine),
+    records,
+  };
+  use slates_svn::migration::TextSource;
+  assert!(matches!(
+    texts.text(&identity(b"gamma\n")),
+    Some(std::borrow::Cow::Borrowed(b"gamma\n"))
+  ));
+  assert_eq!(
+    texts.text(&identity(b"alpha\n")).as_deref(),
+    Some(&b"alpha\n"[..]),
+    "an earlier text is read from the records"
+  );
+}
+
 /// S4 slice 2 c1 (the head's texts held by the green, `vcs_store::svn_texts`). Do: commit revision 1 (`/trunk/a.txt`,
 /// `/trunk/sub/b.txt`); 2, `branched` (a copy of `/trunk` with `a.txt` changed beneath it and `sub` deleted); 3,
 /// deleting `/trunk`; 4, replacing `/branches/b/a.txt` by another text; reading each text through the sources' text
@@ -1049,25 +1077,7 @@ fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
     );
     assert_eq!(commit(state, (&owner(), svn), replacing, None), answered(4));
     assert_eq!(held(state), (1, vec![false, false, false, true, false]));
-    let engine = state.greens.get(&green).expect("the green");
-    let records = state
-      .vcs_stores
-      .subversion_records(svn)
-      .expect("the records");
-    let texts = crate::vcs_store::svn_texts::HeadTexts {
-      green: Some(&engine),
-      records,
-    };
-    use slates_svn::migration::TextSource;
-    assert!(matches!(
-      texts.text(&identity(b"gamma\n")),
-      Some(std::borrow::Cow::Borrowed(b"gamma\n"))
-    ));
-    assert_eq!(
-      texts.text(&identity(b"alpha\n")).as_deref(),
-      Some(&b"alpha\n"[..]),
-      "an earlier text is read from the records"
-    );
+    assert_read_through_the_green(state, (svn, green));
   });
 }
 

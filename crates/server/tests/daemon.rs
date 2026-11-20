@@ -215,6 +215,145 @@ fn daemon(name: &str) -> (Daemon, String) {
   (daemon, instance)
 }
 
+/// Shape: the stop watch's install budget before 2026-11-20: the observe budget, ten liveness windows, at which a control
+/// shard still busy with recovered work refused the install and the daemon stopped itself (w-interop's restart loop).
+const OLD_STOP_WATCH_BUDGET_NS: u64 = slates_server::daemon::OBSERVE_BUDGET_NS;
+
+/// Set once the test gives the stop watch its reason ([`a_stop_watch_asked_of_a_busy_control_shard_is_installed_and_waits_for_a_reason`]).
+static STOP_REASON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once the stop watch's wait returned.
+static STOP_WATCH_RETURNED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+/// Set once the busy work holding the control shard alone has ended.
+static BUSY_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the busy work holds the control shard: the old install budget held to this build's cost (the CPU an
+/// observation gave a busy shard before calling it one that would never answer, `observe::held_to_this_build`), and a
+/// liveness window more, so the old install is refused while the shard is still busy.
+fn busy_span_ns() -> u64 {
+  slates_machine::build_cost::build_cost()
+    .map_or(OLD_STOP_WATCH_BUDGET_NS, |cost| {
+      cost.scale(OLD_STOP_WATCH_BUDGET_NS)
+    })
+    .saturating_add(slates_server::daemon::LIVENESS_BUDGET_NS)
+}
+
+/// Holds `daemon`'s control shard alone with busy work for `span_ns`, a heartbeat's spin at a time between yields (each
+/// yield a step, as recovered work slices), and raises `ended` when the work ends. Returns once the shard took the work.
+fn hold_control_alone(
+  daemon: &Daemon,
+  span_ns: u64,
+  ended: &'static std::sync::atomic::AtomicBool,
+) {
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |_| {
+      let busy = slates_rt::futures::spawn_alone(async move {
+        let end = slates_rt::futures::now_ns().saturating_add(span_ns);
+        while slates_rt::futures::now_ns() < end {
+          let slice_end =
+            slates_rt::futures::now_ns().saturating_add(slates_server::daemon::HEARTBEAT_NS);
+          while slates_rt::futures::now_ns() < slice_end {
+            std::hint::spin_loop();
+          }
+          slates_rt::futures::yield_now().await;
+        }
+        ended.store(true, std::sync::atomic::Ordering::Release);
+      });
+      busy.and_then(slates_rt::futures::detach).is_ok()
+    })
+    .map(|spawned| assert!(spawned, "the busy work was spawned alone"))
+    .expect("the control shard took the busy work");
+}
+
+/// Set once the busy work of [`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`] has ended.
+static OBSERVED_BUSY_ENDED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+/// R3 and A-232 (2026-11-20, main's ruling after w-interop's restart loop): a default observation waits while its shard
+/// lives, however long the shard is busy. Do: hold the control shard alone with busy work for [`busy_span_ns`] (the old
+/// observe budget at this build's cost and a window more); meanwhile ask the control shard's counters, a default
+/// observation (`Daemon::fleet_refusals`). Expect them answered, after the work ended. Before, a default observation had
+/// the observe budget, ten liveness windows, and a shard that stepped busy past that budget's CPU without reaching the
+/// question ended it with a deadline: the hazard that refused the stop watch and stopped the daemon.
+#[test]
+fn a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs() {
+  use std::sync::atomic::Ordering;
+  let (daemon, _instance) = daemon("observe-busy");
+  let span_ns = busy_span_ns();
+  hold_control_alone(&daemon, span_ns, &OBSERVED_BUSY_ENDED);
+  let began = Instant::now();
+  let answered = daemon.fleet_refusals();
+  let waited = began.elapsed();
+  let after_the_work = OBSERVED_BUSY_ENDED.load(Ordering::Acquire);
+  drop(daemon);
+  eprintln!(
+    "the control shard was busy {:?}; the observation waited {waited:?} and ended {}",
+    Duration::from_nanos(span_ns),
+    if answered.is_ok() {
+      "answered"
+    } else {
+      "refused"
+    }
+  );
+  assert!(
+    answered.is_ok(),
+    "the observation was answered, not refused while the shard worked: {:?}",
+    answered.err()
+  );
+  assert!(
+    after_the_work,
+    "it was answered once the work let the shard reach it"
+  );
+}
+
+/// A daemon never stops itself because its control shard is busy (w-interop's git matrix, 2026-11-20: a restart's
+/// recovered encode work held the control shard 36 s, the stop watch's install was refused at its 10 s budget, the daemon
+/// logged "the stop watch could not be installed ... stopping" and exited 0, and its anchor restarted it into the same
+/// work, 78 times). Do: hold the control shard alone with busy work, a heartbeat's spin at a time between yields (each
+/// yield a step, as recovered work slices), for [`busy_span_ns`]; meanwhile wait for a reason to stop; once the work ends,
+/// look again two heartbeats later, then give the watch its reason. Expect the watch still waiting after the work (taken
+/// in, not refused), and its wait to end once given its reason. Before, the watch was installed by an observation the
+/// busy shard could not answer within its budget, and its refusal ended the wait while the shard was still busy, which
+/// the daemon's role took as its reason to stop.
+#[test]
+fn a_stop_watch_asked_of_a_busy_control_shard_is_installed_and_waits_for_a_reason() {
+  use std::sync::atomic::Ordering;
+  let (daemon, _instance) = daemon("stop-watch-busy");
+  let span_ns = busy_span_ns();
+  hold_control_alone(&daemon, span_ns, &BUSY_ENDED);
+  let giver = std::thread::spawn(|| {
+    while !BUSY_ENDED.load(Ordering::Acquire) {
+      #[allow(clippy::disallowed_methods)] // a test watches the busy work's end on the wall
+      std::thread::sleep(Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS));
+    }
+    #[allow(clippy::disallowed_methods)] // two of the watch's heartbeats
+    std::thread::sleep(Duration::from_nanos(
+      2 * slates_server::daemon::HEARTBEAT_NS,
+    ));
+    let waiting_after_busy = !STOP_WATCH_RETURNED.load(Ordering::Acquire);
+    STOP_REASON.store(true, Ordering::Release);
+    waiting_after_busy
+  });
+  let began = Instant::now();
+  daemon.wait_for_stop(|| STOP_REASON.load(Ordering::Acquire));
+  STOP_WATCH_RETURNED.store(true, Ordering::Release);
+  let waited = began.elapsed();
+  let waiting_after_busy = giver.join().unwrap();
+  drop(daemon);
+  eprintln!(
+    "the control shard was busy {:?}; the watch waited {waited:?}, still waiting after the work: {waiting_after_busy}",
+    Duration::from_nanos(span_ns)
+  );
+  assert!(
+    waiting_after_busy,
+    "the watch was taken in and waited past the busy work, not refused while it ran (waited {waited:?})"
+  );
+  assert!(
+    waited >= Duration::from_nanos(span_ns),
+    "the watch ended at its reason, after the work"
+  );
+}
+
 /// §2.6 boot step 2 (A-312). Do: start a daemon of [`TEST_SHARDS`] shards and ask how often its start beat. Expect at least
 /// once for every ordered pair of its shards (the runtime's pair rings, the start's work that grows fastest) and once for
 /// each shard, before its watchdog took the beat over. A start beats as it goes, so the anchor, which kills a start whose

@@ -798,3 +798,243 @@ fn stock_hg_sees_the_bookmarks_the_cli_makes_retires_and_binds() {
     "created: {after_create}; retired: {after_retire}; bound: {after_bind}"
   );
 }
+
+/// A-657 (`hg push -B`: a bookmark exported to the server, which keeps it in the repository's namespace). Do: over the
+/// HTTP edge, push a first changeset as stock hg 7.2; make bookmark `pushed-bm` at it and push it (`hg push -B
+/// pushed-bm`, answered "no changes found" and "exporting bookmark", exit 1 for no changesets, as hg answers any
+/// server); list a fresh clone's bookmarks. Expect `pushed-bm` at the pushed changeset. Skips loudly without stock hg
+/// 7.2 ([`STOCK_HG`]) and where the platform names no issuer surface ([`issuer_of`]).
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_pushes_a_bookmark_and_a_clone_sees_it() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's bookmark push: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-pushed-bm-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's bookmark push") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let url = format!("{prefix}r");
+  let scratch = Scratch::new("hg-pushed-bm");
+  let local = format!("{}/local", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(
+    &hg,
+    &local,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  hg_ok(&hg, &local, &with_config(&["push", &url], &config));
+  let pushed = hg_nodes(&hg, &local).into_iter().next().unwrap_or_default();
+  hg_ok(&hg, &local, &["bookmark", "pushed-bm"]);
+  let (code, out, err) = hg_in(
+    &hg,
+    &local,
+    &with_config(&["push", "-B", "pushed-bm", &url], &config),
+  );
+  let copy = format!("{}/copy", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", "-U", &url, &copy], &config),
+  );
+  let listed = hg_ok(
+    &hg,
+    &copy,
+    &["bookmarks", "--template", "{bookmark} {node}\\n"],
+  );
+  assert_eq!(
+    (code <= 1, listed.contains(&format!("pushed-bm {pushed}"))),
+    (true, true),
+    "push -B: {code} {out}{err}; the clone's bookmarks: {listed}"
+  );
+}
+
+/// Stock hg's listkeys and pushkey legs through slates at `url`, `config` its `--config` words: a changeset pushed and
+/// bookmark `pushed-bm` exported at it (`push -B`); the bookmark dropped from the working copy and `hg incoming -B`
+/// asked; a local bookmark made and `hg outgoing -B` asked; `hg debugpushkey` listing the `namespaces`, `bookmarks` and
+/// `phases` keys, then moving bookmark `moved-bm` by the `pushkey` command: made from nothing, refused from a value it
+/// does not hold, deleted from the one it holds; and a key of a namespace slates does not serve. Fails the test unless
+/// each answers as stock hg answers a stock server: the incoming and outgoing bookmarks named, every listing holding
+/// the server's keys, `True` for each move that holds and `False` for each that does not.
+#[allow(clippy::disallowed_methods)]
+fn pushkey_legs(hg: &[String], scratch: &str, url: &str, config: &[String]) {
+  let local = format!("{scratch}/local");
+  hg_ok(hg, scratch, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(hg, &local, &["commit", "--addremove", "--message", "first"]);
+  hg_ok(hg, &local, &with_config(&["push", url], config));
+  let node = hg_nodes(hg, &local).into_iter().next().unwrap_or_default();
+  hg_ok(hg, &local, &["bookmark", "pushed-bm"]);
+  let (code, out, err) = hg_in(
+    hg,
+    &local,
+    &with_config(&["push", "-B", "pushed-bm", url], config),
+  );
+  assert!(code <= 1, "push -B: {code} {out}{err}");
+  hg_ok(hg, &local, &["bookmark", "--delete", "pushed-bm"]);
+  let incoming = hg_in(hg, &local, &with_config(&["incoming", "-B", url], config));
+  hg_ok(hg, &local, &["bookmark", "local-bm"]);
+  let outgoing = hg_in(hg, &local, &with_config(&["outgoing", "-B", url], config));
+  let keys = |space: &str| {
+    hg_in(
+      hg,
+      &local,
+      &with_config(&["debugpushkey", url, space], config),
+    )
+  };
+  let push = |key: &str, old: &str, new: &str| {
+    let (code, out, err) = hg_in(
+      hg,
+      &local,
+      &with_config(&["debugpushkey", url, "bookmarks", key, old, new], config),
+    );
+    format!(
+      "{code} {}{}",
+      out.trim(),
+      if err.is_empty() { "" } else { " (stderr)" }
+    )
+  };
+  let namespaces = keys("namespaces");
+  let bookmarks = keys("bookmarks");
+  let phases = keys("phases");
+  let made = push("moved-bm", "", &node);
+  let after_made = keys("bookmarks").1;
+  let stale = push("moved-bm", "0000000000000000000000000000000000000001", "");
+  let deleted = push("moved-bm", &node, "");
+  let after_deleted = keys("bookmarks").1;
+  let (foreign_code, foreign_out, _) = hg_in(
+    hg,
+    &local,
+    &with_config(&["debugpushkey", url, "nonesuch", "k", "", "v"], config),
+  );
+  let short = node.get(..12).unwrap_or_default();
+  assert_eq!(
+    (
+      (
+        incoming.0,
+        incoming
+          .1
+          .lines()
+          .any(|line| line.contains("pushed-bm") && line.contains(short))
+      ),
+      (outgoing.0, outgoing.1.contains("local-bm")),
+      ["bookmarks", "namespaces", "phases"].map(|name| namespaces.1.contains(&format!("{name}\t"))),
+      bookmarks.1.contains(&format!("pushed-bm\t{node}")),
+      phases.1.contains("publishing\tTrue"),
+      (
+        made.as_str(),
+        after_made.contains(&format!("moved-bm\t{node}"))
+      ),
+      stale.as_str(),
+      (deleted.as_str(), after_deleted.contains("moved-bm")),
+      (foreign_code, foreign_out.trim()),
+    ),
+    (
+      (0, true),
+      (0, true),
+      [true; 3],
+      true,
+      true,
+      ("0 True", true),
+      "1 False",
+      ("0 True", false),
+      (
+        1,
+        "remote: pushkey: no key of namespace 'nonesuch' is moved by this server\nFalse"
+      ),
+    ),
+    "incoming -B: {incoming:?}; outgoing -B: {outgoing:?}; namespaces: {namespaces:?}; bookmarks: {bookmarks:?}; \
+     phases: {phases:?}; after the move: {after_made}; after the delete: {after_deleted}"
+  );
+}
+
+/// A-758 (`listkeys` and `pushkey`, 7.2's `wireprotov1server`, served over the HTTP edge). Do: over `--vcs-http`, run
+/// [`pushkey_legs`] as stock hg 7.2. Expect each leg answered as a stock server answers it. Skips loudly without stock
+/// hg 7.2 ([`STOCK_HG`]) and where the platform names no issuer surface ([`issuer_of`]).
+#[test]
+fn stock_hg_lists_and_moves_keys_over_the_vcs_http_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's listkeys and pushkey over HTTP: no Mercurial 7.2 here (set {STOCK_HG} to the command that \
+       runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-keys-http-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's listkeys and pushkey over HTTP") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-keys-http");
+  pushkey_legs(&hg, &scratch.path, &format!("{prefix}r"), &config);
+}
+
+/// A-758 (`listkeys` and `pushkey` over `hg serve --stdio`, the SSH edge). Do: over `--vcs-ssh`, a fresh key enrolled
+/// for the repository's owner, run [`pushkey_legs`] as stock hg 7.2. Expect each leg answered as a stock server
+/// answers it. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`, and where the platform names no
+/// issuer surface ([`issuer_of`]).
+#[test]
+fn stock_hg_lists_and_moves_keys_over_the_ssh_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's listkeys and pushkey over SSH: no Mercurial 7.2 here (set {STOCK_HG} to the command that \
+       runs it)"
+    );
+    return;
+  };
+  let scratch = Scratch::new("hg-keys-ssh");
+  let Some((key, public)) = fresh_key(&scratch) else {
+    eprintln!("skipping stock hg's listkeys and pushkey over SSH: no ssh-keygen here");
+    return;
+  };
+  let instance = format!("hg-keys-ssh-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (port, fingerprint) = started
+    .lines
+    .iter()
+    .find_map(|line| ssh_edge_of(line))
+    .expect("the daemon named its SSH edge's port and host key");
+  let Some(issuer) = issuer_of(&started, "stock hg's listkeys and pushkey over SSH") else {
+    return;
+  };
+  let known_hosts = known_hosts(&scratch, port, &fingerprint);
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let config = vec!["--config".to_owned(), ssh_command(&key, &known_hosts)];
+  pushkey_legs(
+    &hg,
+    &scratch.path,
+    &format!("ssh://{HG_USER}@127.0.0.1:{port}/r"),
+    &config,
+  );
+}

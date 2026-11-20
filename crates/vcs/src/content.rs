@@ -17,6 +17,14 @@
 //! ([`ContentStore::put_object`]); a list holds each identity it names once for each time it names it. An object of at
 //! most one window is that window, so its root is the plain BLAKE3 of its bytes.
 //!
+//! **The identity rule** (main's ruling, 2026-11-20; R8: a fleet never needs uniform page sizes). An object's identity,
+//! what a put answers and every caller names it by, is the plain BLAKE3 of its bytes, whatever window cut it: the window
+//! is sixteen of this node's base pages, 256 KiB on macOS arm64 and 64 KiB on 4 KiB Linux, so a root differs between
+//! nodes and must never cross one. The store keeps a node-local name from the identity of each object longer than a
+//! window to its root ([`ContentStore::put_object`], [`ContentStore::finish_object`]), every read, hold and release by an
+//! identity resolves it, and a freed root takes its name with it. A record, an entry, a homed window and a dedup key name
+//! the identity; each node maps it to its own tree.
+//!
 //! **Identities by form** ([`Form`]). A window is named by the plain BLAKE3 of its bytes, as a volume's sealed chunk
 //! and an archive's chunk are (§4.11). A list and an index's table ([`crate::table`]) are named by BLAKE3 in its
 //! key-derivation mode under a context of their own [B: the `blake3` crate's `derive_key`, "a hardcoded, globally
@@ -300,10 +308,34 @@ impl Held {
   }
 }
 
+/// An object being put a window at a time ([`ContentStore::begin_object`]): the bytes short of a window, and the
+/// identities of the windows (later, of the lists) kept so far, each holding one count.
+#[derive(Debug, Default)]
+pub struct Writing {
+  /// The bytes of the window being filled.
+  pending: Vec<u8>,
+  /// The BLAKE3 of the object's bytes so far: its identity once finished.
+  hasher: blake3::Hasher,
+  /// The identities kept so far, in order.
+  windows: Vec<ContentId>,
+}
+
+impl Writing {
+  /// The windows kept so far.
+  pub fn windows_kept(&self) -> usize {
+    self.windows.len()
+  }
+}
+
 /// The content store (module docs).
 #[derive(Debug)]
 pub struct ContentStore {
   entries: BTreeMap<ContentId, Held>,
+  /// The identity rule (main's ruling, 2026-11-20; R8): each object longer than a window by its identity, the BLAKE3 of
+  /// its bytes, to the root of the tree this store cut it into, a node-local detail; and back.
+  objects: BTreeMap<ContentId, ContentId>,
+  /// [`ContentStore::objects`] inverted: a root to the identity of the object it roots.
+  rooted: BTreeMap<ContentId, ContentId>,
   /// Where the windows' bytes are kept (A-727).
   storage: Box<dyn WindowStorage>,
   /// The longest content the store holds: the content plane's window.
@@ -457,6 +489,8 @@ impl ContentStore {
     let window = NonZeroUsize::new(window).ok_or_else(too_small)?;
     Ok(ContentStore {
       entries: BTreeMap::new(),
+      objects: BTreeMap::new(),
+      rooted: BTreeMap::new(),
       storage: Box::new(HeapWindows::default()),
       window,
       fanout,
@@ -582,6 +616,19 @@ impl ContentStore {
   /// The root identity an object of `bytes` is held under: the plain BLAKE3 of an object of at most one window, else
   /// its top list's (module docs). Nothing is stored.
   pub fn object_id(&self, bytes: &[u8]) -> ContentId {
+    ContentId::of(bytes)
+  }
+
+  /// The node an object's identity names in this store, its root (module docs, "The identity rule"): what a record
+  /// written before the rule named an object longer than a window by, so a replay of one can tell it is the same
+  /// object. Node-local: never sent or recorded.
+  pub fn root_of(&self, identity: &ContentId) -> ContentId {
+    self.resolve(identity)
+  }
+
+  /// The root this store would cut `bytes` into ([`ContentStore::root_of`] for bytes not held): what a version-1 git
+  /// record, written before the identity rule, named an object longer than a window by.
+  pub fn root_id(&self, bytes: &[u8]) -> ContentId {
     if bytes.len() <= self.window.get() {
       return ContentId::of(bytes);
     }
@@ -590,10 +637,31 @@ impl ContentStore {
       .map_or_else(|| ContentId::of(bytes), |root| root.identity)
   }
 
+  /// `identity`, the BLAKE3 of an object's bytes, named for `root`, the tree this store keeps it as (module docs, "The
+  /// identity rule"): a root that is the identity itself (an object of at most one window) needs no name. The identity.
+  fn named_object(&mut self, identity: ContentId, root: ContentId) -> ContentId {
+    if identity != root {
+      self.objects.insert(identity, root);
+      self.rooted.insert(root, identity);
+    }
+    identity
+  }
+
+  /// The node an identity names in this store: an object's root for an object longer than a window, else itself.
+  fn resolve(&self, identity: &ContentId) -> ContentId {
+    *self.objects.get(identity).unwrap_or(identity)
+  }
+
   /// Keeps an object's raw bytes as its windows and the lists naming them (module docs), every node the store holds
   /// already held once more instead of stored again; the root, held once more by the caller. The whole tree is admitted
   /// before any of it is kept: refused, nothing changed.
   pub fn put_object(&mut self, bytes: &[u8]) -> Result<ContentId, ContentRefused> {
+    let root = self.put_object_root(bytes)?;
+    Ok(self.named_object(ContentId::of(bytes), root))
+  }
+
+  /// [`ContentStore::put_object`]'s tree: its root.
+  fn put_object_root(&mut self, bytes: &[u8]) -> Result<ContentId, ContentRefused> {
     if bytes.len() <= self.window.get() {
       return self.put(bytes);
     }
@@ -604,6 +672,96 @@ impl ContentStore {
     self.admit(need, 0)?;
     self.keep_tree(&tree, top)?;
     Ok(root)
+  }
+
+  /// Starts an object put a window at a time ([`ContentStore::put_window`], [`ContentStore::finish_object`]): what an
+  /// intake streams, its bytes arriving in pieces it never holds whole (§4.17.1 "A push's intake", rule 1; Subversion's
+  /// commit texts, A-727 slice c). The same object [`ContentStore::put_object`] keeps, the same root, its windows kept as
+  /// each fills.
+  pub fn begin_object(&self) -> Writing {
+    Writing::default()
+  }
+
+  /// Takes `bytes`, the object's next piece of any length: every window it fills is kept at once (one holder, which the
+  /// list naming it takes over), the rest held for the next piece, so the writer holds less than a window. Refused (the
+  /// budget, the storage), what the object kept so far stays held by `writing`, for [`ContentStore::abandon_object`].
+  ///
+  /// # Errors
+  /// [`ContentStore::put`]'s.
+  pub fn put_window(&mut self, writing: &mut Writing, bytes: &[u8]) -> Result<(), ContentRefused> {
+    let window = self.window.get();
+    writing.hasher.update(bytes);
+    let mut rest = bytes;
+    while !rest.is_empty() {
+      let room = window.saturating_sub(writing.pending.len());
+      let (taken, left) = rest.split_at(room.min(rest.len()));
+      writing.pending.extend_from_slice(taken);
+      rest = left;
+      if writing.pending.len() == window {
+        let identity = self.put(&writing.pending)?;
+        writing.windows.push(identity);
+        writing.pending.clear();
+      }
+    }
+    Ok(())
+  }
+
+  /// Ends the object: its last window kept, then the lists naming its windows, `fanout` a list, level by level, as
+  /// [`ContentStore::put_object`] plans them; the root, held once more by the caller. A list the store holds already is
+  /// held once more and gives back the holds its pieces took, as `put_object` holds a node found held.
+  ///
+  /// # Errors
+  /// [`ContentStore::put`]'s; refused, what was kept stays held by `writing`'s identities, which the caller abandons.
+  pub fn finish_object(&mut self, writing: &mut Writing) -> Result<ContentId, ContentRefused> {
+    let identity = ContentId(*writing.hasher.finalize().as_bytes());
+    let root = self.finish_root(writing)?;
+    Ok(self.named_object(identity, root))
+  }
+
+  /// [`ContentStore::finish_object`]'s tree: its root.
+  fn finish_root(&mut self, writing: &mut Writing) -> Result<ContentId, ContentRefused> {
+    if !writing.pending.is_empty() || writing.windows.is_empty() {
+      let identity = self.put(&writing.pending)?;
+      writing.windows.push(identity);
+      writing.pending.clear();
+    }
+    let mut level = std::mem::take(&mut writing.windows);
+    while level.len() > 1 {
+      let mut above = Vec::with_capacity(level.len().div_ceil(self.fanout.get()));
+      for (at, group) in level.chunks(self.fanout.get()).enumerate() {
+        let mut bytes = Vec::with_capacity(group.len().saturating_mul(IDENTITY_BYTES));
+        for identity in group {
+          bytes.extend_from_slice(&identity.0);
+        }
+        let stored = match self.keep(Form::List, &bytes) {
+          Ok(stored) => stored,
+          Err(refused) => {
+            // The lists made so far hold their pieces; the pieces no list names yet hold themselves.
+            let unlisted = level
+              .get(at.saturating_mul(self.fanout.get())..)
+              .unwrap_or_default();
+            above.extend_from_slice(unlisted);
+            writing.windows = above;
+            return Err(refused);
+          }
+        };
+        if !stored.fresh {
+          for identity in group {
+            self.release(identity)?;
+          }
+        }
+        above.push(stored.identity);
+      }
+      level = above;
+    }
+    level.pop().ok_or(ContentRefused::NotHeld)
+  }
+
+  /// Gives back what an unfinished object kept: its windows' and lists' holds, its pending bytes dropped.
+  pub fn abandon_object(&mut self, writing: Writing) {
+    for identity in &writing.windows {
+      let _ = self.release(identity);
+    }
   }
 
   /// The bytes of the nodes of `tree` that the store holds none of, reached from the root through new nodes alone, each
@@ -707,6 +865,7 @@ impl ContentStore {
 
   /// Counts one more holder of the content `identity` names.
   pub fn hold(&mut self, identity: &ContentId) -> Result<(), ContentRefused> {
+    let identity = &self.resolve(identity);
     let held = self
       .entries
       .get_mut(identity)
@@ -761,7 +920,10 @@ impl ContentStore {
       *count = count.checked_add(1).ok_or(ContentRefused::CountExhausted)?;
     }
     for (name, times) in &times {
-      let held = self.entries.get(name).ok_or(ContentRefused::NotHeld)?;
+      let held = self
+        .entries
+        .get(&self.resolve(name))
+        .ok_or(ContentRefused::NotHeld)?;
       if held.form == Form::Table {
         return Err(ContentRefused::NotNameable { identity: *name });
       }
@@ -775,6 +937,7 @@ impl ContentStore {
 
   /// The derived node `identity` names, read in place; `None` when the store holds no derived node of it.
   pub fn derived(&self, identity: &ContentId) -> Option<DerivedNode<'_>> {
+    let identity = &self.resolve(identity);
     let held = self
       .entries
       .get(identity)
@@ -787,6 +950,7 @@ impl ContentStore {
   /// what it names, until nothing more is freed; past a refusal there the rest is given back still, and the first
   /// refusal is the answer. The cascade is one call, as long as what it frees (slicing it is owed with A-581's).
   pub fn release(&mut self, identity: &ContentId) -> Result<Option<Box<[u8]>>, ContentRefused> {
+    let identity = &self.resolve(identity);
     let Some((bytes, form)) = self.release_one(identity)? else {
       return Ok(None);
     };
@@ -794,6 +958,8 @@ impl ContentStore {
     given_back(form, &bytes, &mut named);
     let mut first = Ok(());
     while let Some(next) = named.pop() {
+      // A derived node names an object by its identity; a list names its own windows and lists.
+      let next = self.resolve(&next);
       match self.release_one(&next) {
         Ok(Some((freed, form))) => given_back(form, &freed, &mut named),
         Ok(None) => {}
@@ -816,6 +982,10 @@ impl ContentStore {
     let Some(freed) = self.entries.remove(identity) else {
       return Err(ContentRefused::NotHeld);
     };
+    // A freed root takes its object's name with it (module docs, "The identity rule").
+    if let Some(named) = self.rooted.remove(identity) {
+      self.objects.remove(&named);
+    }
     let len = width(freed.len())?;
     self.content_bytes = self.content_bytes.saturating_sub(len);
     self.counters.freed = self.counters.freed.saturating_add(1);
@@ -839,12 +1009,14 @@ impl ContentStore {
   /// [`ContentStore::windows`] and [`ContentStore::window_at`], which answer a `Cow` (A-727: a window kept as a sealed
   /// chunk of the shard's arena is copied out to be read).
   pub fn get(&self, identity: &ContentId) -> Option<&[u8]> {
+    let identity = &self.resolve(identity);
     self.entries.get(identity).and_then(Held::here)
   }
 
   /// The bytes of the content `identity` names, whatever its form: a window's from the window storage (borrowed where
   /// it lends them, copied out where it cannot, A-727), a list's, table's or derived node's from the store's memory.
   pub fn bytes_of(&self, identity: &ContentId) -> Option<Cow<'_, [u8]>> {
+    let identity = &self.resolve(identity);
     let held = self.entries.get(identity)?;
     match &held.kept {
       Kept::Here(bytes) => Some(Cow::Borrowed(bytes)),
@@ -932,6 +1104,7 @@ impl ContentStore {
 
   /// The length in bytes of the content `identity` names, whatever its form, read without its bytes.
   pub fn len_of(&self, identity: &ContentId) -> Option<u64> {
+    let identity = &self.resolve(identity);
     self
       .entries
       .get(identity)
@@ -940,12 +1113,14 @@ impl ContentStore {
 
   /// The form of the content `identity` names.
   pub fn form(&self, identity: &ContentId) -> Option<Form> {
+    let identity = &self.resolve(identity);
     self.entries.get(identity).map(|held| held.form)
   }
 
   /// An object's windows in order, read from its root ([`ContentStore::put_object`]). A tree the store no longer holds
   /// whole ends the walk early, so a reader holds the object's length (its row's) against what it read.
   pub fn windows(&self, root: &ContentId) -> Windows<'_> {
+    let root = &self.resolve(root);
     Windows {
       store: self,
       stack: Vec::new(),
@@ -959,6 +1134,7 @@ impl ContentStore {
   /// A reader that resumes at a window reads the lists above it alone, never the windows before it. `None` past the
   /// object's last window, or where the store does not hold the path down whole.
   pub fn window_at(&self, root: &ContentId, len: u64, index: u64) -> Option<Cow<'_, [u8]>> {
+    let root = &self.resolve(root);
     let window = u64::try_from(self.window.get()).ok()?;
     let fanout = u64::try_from(self.fanout.get()).ok()?;
     let windows = len.div_ceil(window).max(1);
@@ -1011,11 +1187,13 @@ impl ContentStore {
 
   /// Whether the store holds the content `identity` names.
   pub fn contains(&self, identity: &ContentId) -> bool {
+    let identity = &self.resolve(identity);
     self.entries.contains_key(identity)
   }
 
   /// The holders of the content `identity` names: zero when the store holds none.
   pub fn holders(&self, identity: &ContentId) -> u64 {
+    let identity = &self.resolve(identity);
     self.entries.get(identity).map_or(0, |held| held.holders)
   }
 
@@ -1298,7 +1476,8 @@ mod tests {
   fn put_six_windows(store: &mut ContentStore, bytes: &[u8]) -> ContentId {
     let root = store.put_object(bytes).unwrap();
     assert_eq!(root, store.object_id(bytes));
-    assert_ne!(root, ContentId::of(bytes));
+    // The identity rule: the object's identity is the BLAKE3 of its bytes; its root, a list, is the store's own.
+    assert_eq!(root, ContentId::of(bytes));
     assert_eq!(store.form(&root), Some(Form::List));
     let windows: Vec<&[u8]> = bytes.chunks(NARROW).collect();
     assert_eq!(store.holders(&ContentId::of(windows[0])), 2);
@@ -1650,6 +1829,107 @@ mod tests {
       named,
       Some(vec![fresh]),
       "only the new window is named, by its identity"
+    );
+  }
+
+  /// Every identity `store` holds, with its holders and its form.
+  fn held(store: &ContentStore) -> Vec<(ContentId, u64, Option<Form>)> {
+    store
+      .identities()
+      .map(|identity| (*identity, store.holders(identity), store.form(identity)))
+      .collect()
+  }
+
+  /// A-727 slice c (an object put a window at a time: §4.17.1 "A push's intake", rule 1). Do: for objects of 0, 1, a
+  /// window less one, a window, a window and one, and seven windows and five bytes, put each into one store whole
+  /// (`put_object`) and into another a piece at a time (pieces of 1, 3 and 61 bytes, and whole), each twice. Expect the
+  /// same root, the same contents with the same holders and forms, the same bytes used, the object's bytes read back;
+  /// and an object abandoned part-way leaves its store as it was.
+  #[test]
+  fn an_object_put_a_window_at_a_time_is_the_object_put_whole() {
+    let bytes: Vec<u8> = (0..7 * NARROW + 5)
+      .map(|at| u8::try_from(at * 7 % 251).unwrap())
+      .collect();
+    for len in [0, 1, NARROW - 1, NARROW, NARROW + 1, bytes.len()] {
+      let object = &bytes[..len];
+      for piece in [1, 3, 61, len.max(1)] {
+        assert_put_by_pieces_is_put_whole(object, piece);
+      }
+    }
+    let mut store = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut writing = store.begin_object();
+    store
+      .put_window(&mut writing, &bytes[..3 * NARROW + 2])
+      .unwrap();
+    assert_eq!(writing.windows_kept(), 3);
+    store.abandon_object(writing);
+    assert_eq!((store.len(), store.used()), (0, 0));
+  }
+
+  /// The identity rule (main's ruling, 2026-11-20; R8): an object's identity is a pure function of its bytes, plain
+  /// BLAKE3, whatever window the store cuts it at (a node's window is `16 x` its base page). Do: put the same object of
+  /// 40 windows of the narrower store, its bytes streamed in odd pieces too, into a store of a 64-byte window and one of
+  /// a 256-byte window; read it back by the identity each answered; release it. Expect: both answers, `object_id`'s and
+  /// the streamed put's, the BLAKE3 of the bytes; each store reading the object whole by it and holding it twice (put
+  /// and streamed); released twice, gone from both.
+  #[test]
+  fn an_objects_identity_is_the_blake3_of_its_bytes_whatever_the_stores_window() {
+    let bytes: Vec<u8> = (0..40 * 64)
+      .map(|at| u8::try_from(at * 7 % 251).unwrap())
+      .collect();
+    let pure = ContentId::of(&bytes);
+    for window in [64, 256] {
+      let mut store = ContentStore::new(1 << 20, window).unwrap();
+      assert_eq!(store.object_id(&bytes), pure, "window {window}");
+      assert_eq!(store.put_object(&bytes).unwrap(), pure, "window {window}");
+      let mut writing = store.begin_object();
+      for piece in bytes.chunks(37) {
+        store.put_window(&mut writing, piece).unwrap();
+      }
+      assert_eq!(
+        store.finish_object(&mut writing).unwrap(),
+        pure,
+        "window {window}"
+      );
+      let len = u64::try_from(bytes.len()).unwrap();
+      assert_eq!(store.object_bytes(&pure, len), Some(bytes.clone()));
+      assert_eq!(store.holders(&pure), 2);
+      store.release(&pure).unwrap();
+      store.release(&pure).unwrap();
+      assert_eq!(store.object_bytes(&pure, len), None);
+      assert_eq!(store.len(), 0, "window {window}: nothing left");
+    }
+  }
+
+  /// `object` put into one store whole and into another `piece` bytes at a time, twice each: the same root, the same
+  /// contents and bytes used, and the object read back.
+  fn assert_put_by_pieces_is_put_whole(object: &[u8], piece: usize) {
+    let len = object.len();
+    let mut whole = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut streamed = ContentStore::new(1 << 20, NARROW).unwrap();
+    let mut roots = Vec::new();
+    for _ in 0..2 {
+      let root = whole.put_object(object).unwrap();
+      let mut writing = streamed.begin_object();
+      for part in object.chunks(piece) {
+        streamed.put_window(&mut writing, part).unwrap();
+      }
+      let made = streamed.finish_object(&mut writing).unwrap();
+      roots.push((root, made));
+    }
+    assert!(
+      roots.iter().all(|(root, made)| root == made),
+      "{len} by {piece}"
+    );
+    assert_eq!(held(&whole), held(&streamed), "{len} by {piece}");
+    assert_eq!(whole.used(), streamed.used(), "{len} by {piece}");
+    let (root, _) = roots[0];
+    assert_eq!(
+      streamed
+        .object_bytes(&root, u64::try_from(len).unwrap())
+        .as_deref(),
+      Some(object),
+      "{len} by {piece}"
     );
   }
 }

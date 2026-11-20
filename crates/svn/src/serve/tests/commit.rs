@@ -123,6 +123,26 @@ impl Built {
     }
   }
 
+  /// What lies beneath `source` in its revision, copied beneath `to` in `tree`.
+  fn copy_beneath(
+    &self,
+    tree: &mut BTreeMap<String, NodeKind>,
+    source: &crate::index::CopySource,
+    to: &str,
+  ) {
+    let before = &self.trees[usize::try_from(source.revision).unwrap()];
+    for (path, kind) in before {
+      if path != &source.path && at_or_beneath(path, &source.path) {
+        let rest = if source.path == "/" {
+          path.as_str()
+        } else {
+          path.get(source.path.len()..).unwrap()
+        };
+        tree.insert(format!("{to}{rest}"), *kind);
+      }
+    }
+  }
+
   /// The next revision, made of `work` at `date`: its rows applied in path order, a deletion or a
   /// replacement taking the path's subtree, an addition or a replacement by a copy bringing its
   /// source's.
@@ -137,17 +157,7 @@ impl Built {
       if matches!(row.action, Action::Add | Action::Replace) {
         tree.insert(row.path.clone(), row.kind);
         if let Some(source) = &row.copy_from {
-          let before = &self.trees[usize::try_from(source.revision).unwrap()];
-          for (path, kind) in before {
-            if path != &source.path && at_or_beneath(path, &source.path) {
-              let rest = if source.path == "/" {
-                path.as_str()
-              } else {
-                path.get(source.path.len()..).unwrap()
-              };
-              tree.insert(format!("{}{rest}", row.path), *kind);
-            }
-          }
+          self.copy_beneath(&mut tree, source, &row.path);
         }
       }
     }

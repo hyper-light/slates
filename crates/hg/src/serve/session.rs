@@ -7,24 +7,25 @@
 //! stdout and the message then `\n-\n` on stderr). An empty line ends the session. A name 7.2's table lacks is
 //! answered with an empty string and no argument read, as 7.2 answers it. A push's `unbundle` is taken by the session's
 //! carrier before this step, since its bundle follows its request (over SSH [`super::stdio`], over HTTP
-//! `super::http::unbundle_request`). A command 7.2 serves and this server does not (`pushkey`, stream clones,
-//! clone bundles, `debugwireargs`) has its arguments read, so the session stays in step, and is answered with an
+//! `super::http::unbundle_request`); so is a `pushkey`, which lands through the same driver (A-758, [`super::keys`]). A
+//! command 7.2 serves and this server does not (clone bundles, `debugwireargs`) has its arguments read, so the session stays in step, and is answered with an
 //! out-of-band error. `batch` runs each call of a command that answers a string and joins
 //! the escaped answers with `;`. A `getbundle` refused where the client asked for bundle2 is answered as 7.2 answers an
 //! abort there: a bundle2 stream of one `ERROR:ABORT` part with the message; a bundle1 request is answered out of band.
 //!
 //! **What is advertised.** `hello` and `capabilities` list what is served, sorted as 7.2 sorts them: `batch`,
-//! `branchmap`, `bundle2`, `getbundle`, `known`, `lookup` (`super::lookup`, as 7.2 always lists it), `protocaps` and
-//! `unbundle`. A 7.2 client asks the same `getbundle` of
-//! it as of a stock server (`exchange._pullbundle2` reads `phases`, `bookmarks`, `listkeys` and `obsmarkers` from it);
-//! it lacks `pushkey` and stream clones, which later
-//! pieces serve. Pushes are served over both transports (over HTTP A-680 part 2b, `super::http::pushed`; over SSH
+//! `branchmap`, `bundle2`, `getbundle`, `known`, `lookup` (`super::lookup`, as 7.2 always lists it), `protocaps`,
+//! `pushkey` and `unbundle`. A 7.2 client asks the same `getbundle` of
+//! it as of a stock server (`exchange._pullbundle2` reads `phases`, `bookmarks`, `listkeys` and `obsmarkers` from it).
+//! `pushkey` is listed since its command is served (A-758), and a 7.2 client asks `listkeys` of no server that does not
+//! list it (`wireprotov1peer.listkeys` answers `{}` without asking): `hg incoming -B`, `hg outgoing -B` and `hg
+//! debugpushkey` saw no bookmark here before it was. Pushes are served over both transports (over HTTP A-680 part 2b, `super::http::pushed`; over SSH
 //! A-696, `super::stdio`), so `unbundle` is listed with 7.2's value and `bundle2` holds, beside the parts a `getbundle`
 //! answer carries, what a push needs, as 7.2 lists them: `changegroup=01,02,03` (the versions a push is taken in),
 //! `checkheads=related` (decided: the verdict is per line, so a client checks only the heads it moves),
 //! `error=abort,unsupportedcontent,pushraced,pushkey` and `pushkey`. A 7.2 client reads these to build its bundle, so a
-//! stock client sends this server the bundle it sends a stock server (A-696's golden). No `pushkey` command is listed: a
-//! 7.2 client that reads `bookmarks` and `phases=heads` moves both in its bundle and never calls it.
+//! stock client sends this server the bundle it sends a stock server (A-696's golden); one that reads `bookmarks` and
+//! `phases=heads` moves both in its bundle, and calls the `pushkey` command only for `hg debugpushkey`.
 //!
 //! **Shared with HTTP** (A-650 part 1). [`dispatch`] answers a command whatever carries it, giving 7.2's three kinds
 //! of answer (a string, a stream, an error out of band) for its transport to frame. The transport decides what
@@ -70,8 +71,8 @@ const COMMANDS: [(&[u8], &[u8]); 21] = [
 ];
 
 /// Format: the capabilities advertised over SSH, sorted as `capabilities` sorts them; `bundle2`'s value is made from
-/// [`BUNDLE2_SERVED`], and `unbundle` is listed since pushes are served over SSH (A-696).
-const SERVED: [&[u8]; 8] = [
+/// [`BUNDLE2_SERVED`], and `pushkey` and `unbundle` are listed since pushes are served over SSH (A-696, A-758).
+const SERVED: [&[u8]; 9] = [
   b"batch",
   b"branchmap",
   b"bundle2",
@@ -79,6 +80,7 @@ const SERVED: [&[u8]; 8] = [
   b"known",
   b"lookup",
   b"protocaps",
+  b"pushkey",
   b"unbundle",
 ];
 
@@ -102,8 +104,9 @@ const BUNDLE2_SERVED: [(&[u8], &[&[u8]]); 9] = [
 
 /// Format: the capabilities advertised over HTTP, sorted as `capabilities` sorts them: SSH's but `protocaps` (an HTTP
 /// client says what it reads in `X-HgProto`), what 7.2's `httpv1protocolhandler.addcapabilities` adds beside `batch`
-/// (`compression`, `httpheader` and `httpmediatype`), and `unbundle`, since pushes are served over HTTP (A-680 part 2b).
-const SERVED_HTTP: [&[u8]; 10] = [
+/// (`compression`, `httpheader` and `httpmediatype`), and `pushkey` and `unbundle`, since pushes are served over HTTP
+/// (A-680 part 2b, A-758).
+const SERVED_HTTP: [&[u8]; 11] = [
   b"batch",
   b"branchmap",
   b"bundle2",
@@ -113,6 +116,7 @@ const SERVED_HTTP: [&[u8]; 10] = [
   b"httpmediatype",
   b"known",
   b"lookup",
+  b"pushkey",
   b"unbundle",
 ];
 
@@ -205,6 +209,8 @@ pub enum Refused {
   /// A push refused (A-680 part 2b, [`super::http::pushed`]): its words travel in its own answer, the error part of its
   /// reply or 7.2's `pusherr`.
   Push,
+  /// A `pushkey` refused before anything was landed (A-758, [`super::keys`]): its words travel in its answer.
+  Pushkey(super::keys::Refusal),
 }
 
 impl From<Refusal> for Refused {
@@ -721,6 +727,7 @@ pub(super) fn message(refused: &Refused) -> Vec<u8> {
       format!("a request of {needed} bytes is past the channel's window of {capacity}")
     }
     Refused::Push => "push refused".to_owned(),
+    Refused::Pushkey(refusal) => format!("pushkey refused: {refusal:?}"),
   };
   words.into_bytes()
 }

@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Counters, Graph, Refusal, charge};
+use super::{Counters, Graph, Peak, Refusal, charge};
 use crate::Admission;
 use crate::object_name::{Kind, ObjectId};
 
@@ -68,7 +68,7 @@ pub(super) fn generation<S: Graph>(graph: &S, node: S::Node) -> u64 {
 }
 
 /// Whether the server is ready: there is a common have, and every want, but those `answered` by a run of versions,
-/// reaches a commit the client has.
+/// reaches a commit the client has. The search done whole ([`Readying`] stepped to its end).
 pub(super) fn is_ready<S: Graph>(
   graph: &S,
   wants: &[S::Node],
@@ -77,29 +77,12 @@ pub(super) fn is_ready<S: Graph>(
   admission: &mut Admission,
   counters: &mut Counters,
 ) -> Result<bool, Refusal> {
-  if common.is_empty() {
-    return Ok(false);
-  }
-  let they_have = they_have(graph, common, admission)?;
-  let floor = they_have
-    .iter()
-    .map(|node| generation(graph, *node))
-    .min()
-    .unwrap_or(u64::MAX);
-  let mut search = Search {
-    they_have: &they_have,
-    floor,
-    known: BTreeMap::new(),
-  };
-  for want in wants.iter().filter(|want| !answered.contains(want)) {
-    let Some(commit) = peel(graph, *want).filter(|node| graph.commit(*node).is_some()) else {
-      continue;
-    };
-    if !search.reaches(graph, commit, admission, counters)? {
-      return Ok(false);
+  let mut readying = Readying::begin(graph, common, admission)?;
+  loop {
+    if let Some(ready) = readying.unit(graph, wants, answered, admission, counters)? {
+      return Ok(ready);
     }
   }
-  Ok(true)
 }
 
 /// The commits the client has as git marks them `THEY_HAVE`: each common have that is a commit, and its parents.
@@ -119,58 +102,131 @@ fn they_have<S: Graph>(
   Ok(they_have)
 }
 
-/// The search for a commit the client has, below each want, remembering across wants what each commit it finished
-/// reaches.
-struct Search<'h, N> {
+/// The search for a commit the client has, below each want in turn, a unit at a time (A-745, §4.17.1 "A fetch's
+/// answer" rule 3: the walk keeps its place across steps, each lent the graph anew): each unit a parent of the commit
+/// on top of the search's path, or the next want begun. It remembers across wants what each commit it finished reaches.
+pub(super) struct Readying<N> {
+  /// Whether there is no common have, so no readiness.
+  none_common: bool,
   /// The commits the client has.
-  they_have: &'h BTreeSet<N>,
+  they_have: BTreeSet<N>,
   /// The least generation among them: a commit below it reaches none.
   floor: u64,
   /// What each commit the search met reaches: `true` once a path from it met a commit the client has, `false` while it
   /// is searched and once it is searched whole.
   known: BTreeMap<N, bool>,
+  /// The want searched next, by its index among the wants.
+  at: usize,
+  /// The path from the want being searched, depth first: each commit with the index of its parent taken next.
+  path: Vec<(N, usize)>,
+  /// That path's cost: its deepest.
+  path_peak: Peak,
 }
 
-impl<N: Copy + Ord> Search<'_, N> {
-  /// Whether `start` reaches a commit the client has, searched depth first without recursion, the path's commits all
-  /// marked as reaching the moment one is found.
-  fn reaches<S: Graph<Node = N>>(
+impl<N: Copy + Ord> Readying<N> {
+  /// The search over the client's `common` haves, begun: what the client has marked (bounded by the haves the request
+  /// sent and their parents).
+  pub(super) fn begin<S: Graph<Node = N>>(
+    graph: &S,
+    common: &[N],
+    admission: &mut Admission,
+  ) -> Result<Readying<N>, Refusal> {
+    let none_common = common.is_empty();
+    let they_have = if none_common {
+      BTreeSet::new()
+    } else {
+      they_have(graph, common, admission)?
+    };
+    let floor = they_have
+      .iter()
+      .map(|node| generation(graph, *node))
+      .min()
+      .unwrap_or(u64::MAX);
+    Ok(Readying {
+      none_common,
+      they_have,
+      floor,
+      known: BTreeMap::new(),
+      at: 0,
+      path: Vec::new(),
+      path_peak: Peak::default(),
+    })
+  }
+
+  /// One unit of the search over `wants`, but those `answered` by a run: whether the server is ready once it is
+  /// decided, `None` while it is not.
+  pub(super) fn unit<S: Graph<Node = N>>(
     &mut self,
     graph: &S,
-    start: N,
+    wants: &[N],
+    answered: &[N],
     admission: &mut Admission,
     counters: &mut Counters,
-  ) -> Result<bool, Refusal> {
-    if self.they_have.contains(&start) {
-      return Ok(true);
+  ) -> Result<Option<bool>, Refusal> {
+    if self.none_common {
+      return Ok(Some(false));
     }
-    if let Some(known) = self.known.get(&start) {
-      return Ok(*known);
+    let Some((node, next)) = self.path.last().copied() else {
+      return self.next_want(graph, wants, answered, admission, counters);
+    };
+    let Some(parent) = graph.parents(node).nth(next) else {
+      self.path.pop();
+      // The want's search ended without meeting a commit the client has.
+      return Ok(self.path.is_empty().then_some(false));
+    };
+    if let Some(top) = self.path.last_mut() {
+      top.1 = next.saturating_add(1);
     }
-    self.visit(start, admission, counters)?;
-    let mut path = vec![(start, graph.parents(start))];
-    while let Some((_, parents)) = path.last_mut() {
-      let Some(parent) = parents.next() else {
-        path.pop();
+    if self.they_have.contains(&parent) || self.known.get(&parent) == Some(&true) {
+      for (node, _) in self.path.drain(..) {
+        self.known.insert(node, true);
+      }
+      return Ok(None);
+    }
+    if self.known.contains_key(&parent) || generation(graph, parent) < self.floor {
+      return Ok(None);
+    }
+    self.visit(parent, admission, counters)?;
+    self.path.push((parent, 0));
+    self
+      .path_peak
+      .reach::<(N, usize)>(self.path.len(), admission)?;
+    Ok(None)
+  }
+
+  /// Begins the next want's search: ready once none is left; not ready at a want known not to reach.
+  fn next_want<S: Graph<Node = N>>(
+    &mut self,
+    graph: &S,
+    wants: &[N],
+    answered: &[N],
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<Option<bool>, Refusal> {
+    while let Some(want) = wants.get(self.at).copied() {
+      self.at = self.at.saturating_add(1);
+      if answered.contains(&want) {
+        continue;
+      }
+      let Some(start) = peel(graph, want).filter(|node| graph.commit(*node).is_some()) else {
         continue;
       };
-      if self.they_have.contains(&parent) || self.known.get(&parent) == Some(&true) {
-        for (node, _) in &path {
-          self.known.insert(*node, true);
-        }
-        return Ok(true);
-      }
-      if self.known.contains_key(&parent) || generation(graph, parent) < self.floor {
+      if self.they_have.contains(&start) {
         continue;
       }
-      self.visit(parent, admission, counters)?;
-      let frame = (parent, graph.parents(parent));
-      admission
-        .charge(crate::to_u64(core::mem::size_of_val(&frame)))
-        .map_err(Refusal::PastAdmission)?;
-      path.push(frame);
+      match self.known.get(&start) {
+        Some(true) => continue,
+        Some(false) => return Ok(Some(false)),
+        None => {}
+      }
+      self.visit(start, admission, counters)?;
+      self.path.push((start, 0));
+      self
+        .path_peak
+        .reach::<(N, usize)>(self.path.len(), admission)?;
+      return Ok(None);
     }
-    Ok(false)
+    Ok(Some(true))
   }
 
   /// Marks `node` as searched, not yet known to reach.

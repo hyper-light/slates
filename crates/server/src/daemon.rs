@@ -54,7 +54,14 @@ const SLEEP_REFUSED: &str = "runtime.sleep_refused";
 /// `daemon.alive`): the liveness window over the election margin, `W / ELECTION_MARGIN` (A-129 item 1, the leader beats
 /// ten times per election timeout, and item 2, the death-confirmation window is the election timeout; A-359), so nine
 /// beats fit inside a window. 100 ms.
-pub const HEARTBEAT_NS: u64 = LIVENESS_BUDGET_NS / slates_cluster::timing::ELECTION_MARGIN;
+pub const HEARTBEAT_NS: u64 = heartbeat_of(LIVENESS_BUDGET_NS);
+
+/// The heartbeat's rule over a liveness window of `liveness_budget_ns`: `W / ELECTION_MARGIN`, so nine beats fit inside
+/// the window ([`HEARTBEAT_NS`] at the daemon's own window). Shared by every beat that shows a peer it is alive within
+/// that peer's patience: the anchor's, and a quiet MCP listen stream's keep-alive (`slates_mcp::http`).
+pub const fn heartbeat_of(liveness_budget_ns: u64) -> u64 {
+  liveness_budget_ns / slates_cluster::timing::ELECTION_MARGIN
+}
 /// Derived: the liveness window `W` (A-228, A-359): how long a daemon, a shard or a peer may show no progress before it
 /// is judged stuck or silent and its recovery begins. It is the recovery budget `T`
 /// (`slates_db::replay::RECOVERY_BUDGET_NS`, ratified, GAPS §5): the verdict starts a recovery that costs `T`, so
@@ -205,6 +212,16 @@ impl SegmentSource {
       }
     }
   }
+
+  /// The rendezvous a daemon started over this source adopts (A-114): the one the anchor across the spawn named in the
+  /// environment, the one held beside a handoff, or none for a daemon that makes its own.
+  fn adoption(&self) -> Result<Option<Adoption>, ServerError> {
+    Ok(match self {
+      SegmentSource::Create { .. } => None,
+      SegmentSource::FromEnv => Adoption::from_env()?,
+      SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
+    })
+  }
 }
 
 /// A held register record as a holder keeps it ([`Daemon::fleet_held_record`]).
@@ -243,6 +260,8 @@ pub struct RecordDialReport {
 
 /// The daemon.
 pub struct Daemon {
+  /// Where [`Self::wait_for_stop`] hands the control shard its watch, taken in at the next heartbeat.
+  stop_watch_send: std::sync::mpsc::SyncSender<StopWatch>,
   runtime: Option<Runtime>,
   segment: AnchorSegment,
   doorbell: Option<DoorbellThread>,
@@ -909,6 +928,22 @@ impl Daemon {
     Self::start_with_fleet(profile, config, source, None)
   }
 
+  /// The observability gate (§2.6, §4.14): refused, naming what is missing, unless every chokepoint span has
+  /// registered its emitter.
+  fn chokepoints_ready() -> Result<(), ServerError> {
+    let chokepoints = registered_chokepoints();
+    if chokepoints.is_ready() {
+      return Ok(());
+    }
+    Err(ServerError::ChokepointsUnregistered {
+      missing: chokepoints
+        .missing()
+        .into_iter()
+        .map(Chokepoint::name)
+        .collect(),
+    })
+  }
+
   /// Like [`start`](Daemon::start) but **joins a fleet** (§4.8, boot step 6): `fleet_transport` — this
   /// node's fleet TLS identity, its advertised accept socket, and its peers — drives the control shard's
   /// membership loop, which probes the peers, serves their probes, and folds the converged view into the
@@ -926,16 +961,7 @@ impl Daemon {
     // span has registered its emitter, so a daemon never serves with a silently missing span source.
     // Fail-closed and checked before any resource is acquired — an incomplete roster stops the boot
     // here, naming what is missing, rather than serving blind.
-    let chokepoints = registered_chokepoints();
-    if !chokepoints.is_ready() {
-      return Err(ServerError::ChokepointsUnregistered {
-        missing: chokepoints
-          .missing()
-          .into_iter()
-          .map(Chokepoint::name)
-          .collect(),
-      });
-    }
+    Self::chokepoints_ready()?;
     // This daemon's own mounts (A-227), recorded as each is made, so no daemon thread opens a path on one; room for one
     // a live attachment the shards can hold, the bound the anchor's device holds take.
     slates_base::own_mounts::install(config.held_device_bound()).map_err(|error| {
@@ -946,11 +972,7 @@ impl Daemon {
     let supervision = source.supervision();
     // The rendezvous comes from wherever the segment does (A-114): an anchor across the spawn names both in the
     // environment, an anchor in this process hands both over, and a daemon with no anchor makes its own.
-    let adoption = match &source {
-      SegmentSource::Create { .. } => None,
-      SegmentSource::FromEnv => Adoption::from_env()?,
-      SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
-    };
+    let adoption = source.adoption()?;
     // The owner first (A-254, the rule of A-176 and A-178): a second daemon of a live instance is refused here, having
     // created nothing. On macOS a segment's creation unlinks any holder of its name and its drop unlinks the name again,
     // so a refused start that had created one took the live daemon's name with it. Every Linux rendezvous is sealed
@@ -1094,6 +1116,11 @@ impl Daemon {
       crate::watchdog::own_window_ns,
       HEARTBEAT_NS,
     );
+    // The process thread's stop watch reaches the control shard over this channel, not as a question the shard must
+    // answer: a shard busy with recovered work answers late, and a watch refused for it stopped the daemon, whose anchor
+    // restarted it into the same work (w-interop's restart loop, 2026-11-20). One slot: one process thread waits.
+    let (stop_watch_send, stop_watch_install) = std::sync::mpsc::sync_channel::<StopWatch>(1);
+    let mut stop_watch_install = Some(stop_watch_install);
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();
@@ -1101,8 +1128,15 @@ impl Daemon {
       let partition = u16::try_from(index).unwrap_or(u16::MAX);
       let all: Vec<u16> = shards.iter().map(|s| s.0).collect();
       let retained = retained.clone();
+      // The stop watch's channel goes to the control shard, in its state before anything runs on the shard.
+      let stop_watch = if index == 0 {
+        stop_watch_install.take()
+      } else {
+        None
+      };
       #[cfg(unix)]
       let holds = ShardHolds {
+        stop_watch,
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
@@ -1110,6 +1144,7 @@ impl Daemon {
       };
       #[cfg(windows)]
       let holds = ShardHolds {
+        stop_watch,
         winfsp: inherited_winfsp.next().unwrap_or_default(),
         channel: if index == 0 {
           windows_channel.take()
@@ -1256,6 +1291,7 @@ impl Daemon {
     // every shard keeping its seats for the connections that move to their repository's owner.
     let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
     Ok(Daemon {
+      stop_watch_send,
       runtime: Some(runtime),
       segment,
       doorbell,
@@ -1333,8 +1369,12 @@ impl Daemon {
     self.pending(target, budget_ns, move || state::try_with_state(question))
   }
 
-  /// Runs `question` on this daemon's shard at `target` and returns its answer within
-  /// [`OBSERVE_BUDGET_NS`] ([`Self::observation`]). That budget is **generous on purpose**: under noisy,
+  /// Runs `question` on this daemon's shard at `target` and returns its answer once the shard runs it, while the shard
+  /// lives (A-232's rule; `Observation::patient`, looked at every liveness window): however long the shard is busy,
+  /// starved or held alone by other work, only its going ends the wait, and a stuck shard is its watchdog's to end. Until
+  /// 2026-11-20 the answer was waited for within [`OBSERVE_BUDGET_NS`], ten liveness windows, and a control shard held
+  /// alone by recovered work past that budget's CPU refused every default observation, the stop watch's install among
+  /// them (w-interop's restart loop). That budget was **generous on purpose**: under noisy,
   /// heavy CPU load a live shard can be starved of the scheduler for several seconds before it services
   /// this one-shot question, and a tight budget would end the observation with a deadline where the
   /// shard was merely slow — so a slow shard answers, and only a wedged one ends the observation, with
@@ -1351,7 +1391,7 @@ impl Daemon {
     Q: FnOnce(&mut ShardState) -> T + Clone + Send + 'static,
   {
     self
-      .observation(target, OBSERVE_BUDGET_NS, question)?
+      .pending_patient(target, move || state::try_with_state(question))?
       .wait()
   }
 
@@ -1363,7 +1403,7 @@ impl Daemon {
     Q: FnOnce(&slates_rt::shard::ShardContext) -> T + Clone + Send + 'static,
   {
     self
-      .pending(target, OBSERVE_BUDGET_NS, move || {
+      .pending_patient(target, move || {
         registry::with_current(question).ok_or(StateAccess::Absent)
       })?
       .wait()
@@ -1403,6 +1443,26 @@ impl Daemon {
   /// The observation core: a question in the unified form (it answers, or names why the shard's state
   /// was out of reach), pinned to the registration holding the shard at `target`, with the refusals
   /// decidable before a submission decided here.
+  /// The observation of `question` at `target` that waits while the shard lives (`Observation::patient`), looking every
+  /// liveness window: the default observations' form ([`Self::observe`]).
+  fn pending_patient<T, Q>(
+    &self,
+    target: Option<ShardId>,
+    question: Q,
+  ) -> Result<Observation<T, Q>, ObserveError>
+  where
+    T: Send + 'static,
+    Q: FnOnce() -> Result<T, StateAccess> + Clone + Send + 'static,
+  {
+    let shard = target.ok_or(ObserveError::NoTarget)?;
+    let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
+    let holder = runtime.holder_of(shard).ok_or(ObserveError::ShardGone {
+      shard: shard.0,
+      stage: ObserveStage::Submission,
+    })?;
+    Ok(Observation::patient(holder, LIVENESS_BUDGET_NS, question))
+  }
+
   fn pending<T, Q>(
     &self,
     target: Option<ShardId>,
@@ -2128,22 +2188,25 @@ impl Daemon {
   /// returning true (the caller's own reasons: a signal, a gone parent). Both are asked at the control shard's
   /// heartbeat, which beats at this cadence anyway, so the waiting thread wakes for nothing else. Before 2026-10-10 the
   /// daemon process's thread polled the same three questions every heartbeat on its own, ten wakeups a second at rest
-  /// (BENCHMARKS). Returns once a reason holds, or when the control shard's state ends (its watch dropped); the caller
-  /// asks which reason it was. A refusal to install the watch is the control shard's typed refusal.
-  pub fn wait_for_stop(
-    &self,
-    also: impl Fn() -> bool + Clone + Send + 'static,
-  ) -> Result<(), ObserveError> {
+  /// (BENCHMARKS). Returns once a reason holds, or when the control shard's state ends (its watch dropped).
+  ///
+  /// The watch is handed to the control shard over the channel its start received, and taken in at its next heartbeat:
+  /// nothing here waits on the shard's work, so a shard busy with recovered work cannot refuse it. Until 2026-11-20 the
+  /// watch was installed by an observation under the observe budget (ten liveness windows, a fixed 10,000 ms), and a
+  /// control shard whose recovered encoding held it past that refused the install; the daemon stopped itself, exited 0,
+  /// and its anchor restarted it into the same work, 78 times in w-interop's git matrix, its clients waiting meanwhile.
+  pub fn wait_for_stop(&self, also: impl Fn() -> bool + Send + 'static) {
     let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
-    self.observe(self.shards.first().copied(), move |s| {
-      s.stop_watch = Some(StopWatch {
-        also: Box::new(also.clone()),
-        wake: wake.clone(),
-      });
-    })?;
+    let watch = StopWatch {
+      also: Box::new(also),
+      wake,
+    };
+    // A send refused means the control shard's state, and the channel with it, is gone: the daemon is stopping.
+    if self.stop_watch_send.send(watch).is_err() {
+      return;
+    }
     // Either a reason was sent, or the watch's sender went with the control shard's state: both end the wait.
     let _reason_or_gone = woken.recv();
-    Ok(())
   }
 
   /// Hands off every consensus leadership this daemon holds before it stops (thesis §3.10;
@@ -3111,6 +3174,30 @@ impl Daemon {
     fault: crate::merge_service::MergeFault,
   ) -> Result<(), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
+  }
+
+  /// Every floor `green`'s owner partition keeps for its works, as (work, base) (A-247; A-697: a holder's works among
+  /// them, whose ids name the holder), for a test. The typed refusal when the shard could not be observed.
+  pub fn work_floors_of(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<Vec<(slates_ipc::protocol::VolumeId, u64)>, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db
+        .partition()
+        .work_floors()
+        .filter(|floor| floor.green.bytes == green.bytes)
+        .map(|floor| {
+          (
+            slates_ipc::protocol::VolumeId {
+              bytes: floor.work.bytes,
+            },
+            floor.base,
+          )
+        })
+        .collect()
+    })
   }
 
   /// Test support (A-697, until its last piece puts the rule in its place; never reachable from the wire): with `on`,
@@ -4364,6 +4451,8 @@ fn shard_arena(
 #[cfg(unix)]
 #[derive(Debug, Default)]
 struct ShardHolds {
+  /// Where the process thread's stop watch arrives (the control shard's alone; [`StopWatch`]).
+  stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
   /// The held devices.
   devices: Vec<crate::fuse_hold::HeldDevice>,
   /// The held writable copies.
@@ -4377,6 +4466,8 @@ struct ShardHolds {
 /// control shard's alone), and its Shards streams' resync ends (A-433) and DAX sections (A-448).
 #[cfg(windows)]
 struct ShardHolds {
+  /// Where the process thread's stop watch arrives (the control shard's alone; [`StopWatch`]).
+  stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
   /// The held WinFsp mounts.
   winfsp: Vec<crate::winfsp::InheritedMount>,
   /// The hold channel's daemon end: the control shard installs it.
@@ -4543,6 +4634,7 @@ async fn init_shard(
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
   #[cfg(windows)]
   let ShardHolds {
+    stop_watch: stop_watch_install,
     winfsp: inherited_winfsp,
     channel: windows_channel,
     resync: inherited_resync,
@@ -4550,6 +4642,8 @@ async fn init_shard(
   } = holds;
   #[cfg(unix)]
   let inherited_dax = holds.dax;
+  #[cfg(unix)]
+  let stop_watch_install = holds.stop_watch;
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
   // failure, as a refused serve loop is below.
@@ -4936,6 +5030,7 @@ async fn init_shard(
     pressure_task: None,
     pressure_asked: false,
     stop_watch: None,
+    stop_watch_install,
     nfs_purges_refused: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
@@ -6135,12 +6230,15 @@ async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
       origin,
       shard.0,
       |s| {
-        let names: Vec<String> = s
-          .db
-          .partition()
-          .pending_creations()
-          .map(|pending| pending.name.clone())
-          .collect();
+        let pendings: Vec<slates_db::catalog::PendingCreationRecord> =
+          s.db.partition().pending_creations().cloned().collect();
+        let mut names = Vec::new();
+        for pending in pendings {
+          // A holder's creation is released at its green's owner before it is dropped (A-697 part e2).
+          if !crate::work_home::hold_for_release(s, &pending) {
+            names.push(pending.name);
+          }
+        }
         for name in names {
           s.db.begin();
           let settled = crate::verbs::settle_creation(s, &name);
@@ -6734,6 +6832,15 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
       Err(_) => (false, None),
     };
     state::with_state(|s| {
+      // A watch the process thread sent since the last beat is taken in now ([`Daemon::wait_for_stop`]).
+      if s.stop_watch.is_none()
+        && let Some(watch) = s
+          .stop_watch_install
+          .as_ref()
+          .and_then(|install| install.try_recv().ok())
+      {
+        s.stop_watch = Some(watch);
+      }
       if let Some(watch) = s.stop_watch.as_ref()
         && (requested || (watch.also)())
       {
@@ -7552,6 +7659,104 @@ mod tests {
         "restarting cannot grant a second vote in the same term"
       );
     }
+  }
+
+  /// A-727 slice b (the content plane's durability barrier; main's order of 2026-11-20). Do: on a daemon over a retained
+  /// anchor segment, with version 3 on, push the fixtures' `create`: its record names its names by identity, appended only
+  /// once the names are durable (`vcs_store::content_durable`, through the homing); then stop the daemon without
+  /// publishing anything more, as a crash between the push and anything after it, and start a successor over the same
+  /// segment. Expect: the successor replays the record whole from the content its image holds: the repository recovered,
+  /// `main` at the pushed commit, no replay refused and no names missing, the record version 3. Without the barrier (the
+  /// entry appended right after the names were put) the names are in no image and the replay is refused `Names`.
+  #[test]
+  fn t_a727b_a_crash_after_an_entry_naming_content_by_identity_loses_nothing_it_names() {
+    use slates_anchor::AnchorSegment;
+    let profile = test_profile();
+    let instance = format!("a727b-barrier-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    first
+      .observe(shard, move |state| {
+        crate::vcs_store::write_version_3_for_test(true);
+        let repository = crate::git_push::tests::git_repository(state, "barrier");
+        let request = crate::git_push::tests::chain()
+          .into_iter()
+          .next()
+          .map(|(scenario, _)| scenario.request.to_vec())
+          .unwrap();
+        let task = slates_rt::futures::spawn(async move {
+          let answered = crate::git_push::tests::homed_drive(repository, &request).await;
+          let _ = sent.send((repository, answered.map(|_| ())));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let (repository, answered) = got
+      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
+      .expect("the push answered");
+    answered.expect("the push homed its names and answered");
+    // The crash: nothing more published.
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let read = || {
+      second
+        .observe(shard, move |state| {
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          let recovered = state.vcs_stores.unrecovered(repository).is_none()
+            && !state.vcs_stores.rebuilding(repository)
+            && state.vcs_stores.holds(repository);
+          let main = state
+            .db
+            .partition()
+            .repositories()
+            .branch(repository, "main");
+          let versions: Vec<u32> = crate::vcs_store::tests::records(state, repository)
+            .iter()
+            .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
+            .collect();
+          (
+            recovered,
+            main.is_some(),
+            count(crate::vcs_store::REPLAY_REFUSED),
+            count(crate::vcs_store::NAMES_UNFETCHED),
+            versions,
+          )
+        })
+        .ok()
+    };
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    let mut seen = read();
+    while std::time::Instant::now() < deadline
+      && !seen
+        .as_ref()
+        .is_some_and(|seen| seen.0 || seen.2 > 0 || seen.3 > 0)
+    {
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+      seen = read();
+    }
+    second.stop();
+    drop(segment);
+    assert_eq!(seen, Some((true, true, 0, 0, vec![3])));
   }
 
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a

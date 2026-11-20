@@ -1935,6 +1935,13 @@ mod share {
       },
       ..WSAPROTOCOL_INFOW::default()
     };
+    read_tail(&mut reader, &mut record)?;
+    Some(record)
+  }
+
+  /// The record's fields after its protocol chain's length, read into `record` in order: the chain's entries, the nine
+  /// signed fields, the message size and reserved word, and the protocol's name.
+  fn read_tail(reader: &mut Reader<'_>, record: &mut WSAPROTOCOL_INFOW) -> Option<()> {
     for entry in &mut record.ProtocolChain.ChainEntries {
       *entry = reader.word()?;
     }
@@ -1956,7 +1963,7 @@ mod share {
     for unit in &mut record.szProtocol {
       *unit = reader.half()?;
     }
-    Some(record)
+    Some(())
   }
 
   #[cfg(test)]

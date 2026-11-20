@@ -867,14 +867,14 @@ impl<'b> Building<'b> {
   }
 
   /// `text`'s bytes: brought by the revision, or held by the records.
-  fn text_bytes(&self, text: &Text) -> Result<&'b [u8], Uncommitted> {
+  fn text_bytes(&self, text: &Text) -> Result<std::borrow::Cow<'b, [u8]>, Uncommitted> {
     let checked: &'b Checked = self.checked;
     let records: &'b Repository = self.records;
     checked
       .fresh()
       .get(&text.identity)
-      .map(Vec::as_slice)
-      .or_else(|| records.content(&text.identity))
+      .map(|bytes| std::borrow::Cow::Borrowed(bytes.as_slice()))
+      .or_else(|| records.text(&text.identity))
       .ok_or_else(corrupt)
   }
 
@@ -897,7 +897,7 @@ impl<'b> Building<'b> {
     }
     let src = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
     let len = u64::try_from(bytes.len()).map_err(|_| corrupt())?;
-    self.post.extend_from_slice(bytes);
+    self.post.extend_from_slice(&bytes);
     self.op_at(OpKind::Insert, path, (0, len, src), 0);
     Ok(())
   }

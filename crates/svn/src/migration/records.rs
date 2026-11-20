@@ -17,6 +17,13 @@
 //! text and property list its rows name is held by the records or brought by the revision; its properties and new
 //! contents fit the room; the index takes its rows ([`Index::plan`]). A refused revision changes nothing.
 //!
+//! **Texts** (S4 slice 2 c2, A-727 (c); rule (B): the repository's history compressed, never its texts whole). Each
+//! text is kept once, when the revision that brings it is applied, as an svndiff of version 2 (LZ4 sections, FSFS
+//! 1.10's form) against the text of its node's skip-delta predecessor (FSFS's `choose_delta_base`: the predecessor
+//! whose count is the node's with its lowest set bit cleared), a node's first version against nothing. A read makes the
+//! text from its chain of bases, at most `log2` of the node's predecessors deltas applied ([`Repository::text`]); nothing
+//! is deltified again later. Property lists are kept whole and read in place ([`Repository::content`]).
+//!
 //! A repository is also the drive's [`Green`] (A-617): it reads the texts and property lists it holds and names new
 //! ones as it keeps them, so a client's drive and its commit run over one set of records.
 
@@ -38,6 +45,7 @@ use crate::index::{
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockTable};
 use crate::mergeinfo::Contents;
 use crate::reads::Repository as ReadSource;
+use crate::svndiff;
 
 /// A node's or a revision's properties: names to values, sorted by name, every byte kept.
 pub type Properties = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -74,8 +82,11 @@ pub struct Repository {
   index: Index,
   /// Each revision's properties, by revision.
   revision_properties: Vec<Properties>,
-  /// Every text and property list a node-revision names, by content identity.
+  /// Every property list a node-revision names, by content identity, whole (FSFS's form, read in place).
   contents: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// Every text a node-revision names, by content identity, as a delta against its skip-delta predecessor's text
+  /// (S4 slice 2 c2, module docs "Texts").
+  texts: BTreeMap<ContentIdentity, KeptText>,
   /// The locks (A-602).
   locks: LockTable,
   /// The transactions begun, which numbers the next one (FSFS's `txn-current`).
@@ -101,6 +112,7 @@ impl Repository {
       index: Index::new(),
       revision_properties: vec![properties],
       contents: BTreeMap::new(),
+      texts: BTreeMap::new(),
       locks: LockTable::new(),
       transactions: 0,
       room,
@@ -135,9 +147,148 @@ impl Repository {
       .and_then(|position| self.revision_properties.get(position))
   }
 
-  /// The bytes held under `identity`: a text, or a property list in FSFS's form.
+  /// The property list held under `identity`, in FSFS's form, read in place. A text is read by [`Repository::text`].
   pub fn content(&self, identity: &ContentIdentity) -> Option<&[u8]> {
     self.contents.get(identity).map(Vec::as_slice)
+  }
+
+  /// Whether the records hold a text or a property list under `identity`.
+  pub fn holds(&self, identity: &ContentIdentity) -> bool {
+    self.contents.contains_key(identity) || self.texts.contains_key(identity)
+  }
+
+  /// Whether the records hold `identity` as the kind a row names it as: a text (kept as a delta, or bytes a property
+  /// list holds too) or a property list (whole, read in place). The same bytes may be both.
+  fn holds_as(&self, identity: &ContentIdentity, as_text: bool) -> bool {
+    if as_text {
+      self.holds(identity)
+    } else {
+      self.contents.contains_key(identity)
+    }
+  }
+
+  /// The text held under `identity`, made from its delta and its base's, the base's from its own, down its chain of
+  /// skip-delta predecessors (module docs, "Texts": at most `log2` of its node's predecessors deltas applied); none
+  /// when the records hold no such text, or its chain does not hold together.
+  pub fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
+    if !self.texts.contains_key(identity) {
+      // A text whose bytes are a property list's too is that list's bytes.
+      return self
+        .contents
+        .get(identity)
+        .map(|bytes| Cow::Borrowed(bytes.as_slice()));
+    }
+    let mut chain = Vec::new();
+    let mut at = *identity;
+    loop {
+      let kept = self.texts.get(&at)?;
+      chain.push(kept);
+      match kept.base {
+        Some(base) if chain.len() <= MAX_CHAIN => at = base,
+        Some(_) => return None,
+        None => break,
+      }
+    }
+    let mut bytes = Vec::new();
+    for kept in chain.iter().rev() {
+      let (_, windows) = svndiff::decode_all(&kept.delta).ok()?;
+      bytes = svndiff::apply_all(&bytes, &windows).ok()?;
+    }
+    Some(Cow::Owned(bytes))
+  }
+
+  /// How many deltas reading the text held under `identity` applies ([`Repository::text`]); none when not held.
+  pub fn text_chain(&self, identity: &ContentIdentity) -> Option<usize> {
+    let mut at = *identity;
+    let mut applied = 0usize;
+    loop {
+      let kept = self.texts.get(&at)?;
+      applied = applied.saturating_add(1);
+      match kept.base {
+        Some(base) if applied <= MAX_CHAIN => at = base,
+        Some(_) => return None,
+        None => return Some(applied),
+      }
+    }
+  }
+
+  /// The bytes the texts' deltas hold.
+  pub fn text_bytes(&self) -> u64 {
+    self
+      .texts
+      .values()
+      .map(|kept| u64::try_from(kept.delta.len()).unwrap_or(u64::MAX))
+      .fold(0, u64::saturating_add)
+  }
+
+  /// Keeps the texts `fresh` brings that the rows of `revision` name (module docs, "Texts"): each as a delta against
+  /// the text of its node's skip-delta predecessor, a first version against nothing; property lists whole. What the
+  /// texts' deltas take less than their bytes did.
+  fn keep_fresh(
+    &mut self,
+    revision: Revision,
+    changes: &[ChangedPath],
+    fresh: BTreeMap<ContentIdentity, Vec<u8>>,
+  ) -> Result<u64, StepRefusal> {
+    let mut saved = 0u64;
+    for change in changes {
+      let Some(text) = change.text else {
+        continue;
+      };
+      if self.texts.contains_key(&text.identity) {
+        continue;
+      }
+      let Some(bytes) = fresh.get(&text.identity) else {
+        continue;
+      };
+      let bytes = bytes.clone();
+      let base = self.skip_base(&change.path, revision, &text.identity);
+      let base_bytes = match base {
+        Some(base) => self.text(&base).ok_or(StepRefusal::Corrupt)?.into_owned(),
+        None => Vec::new(),
+      };
+      let delta = encode_delta(&base_bytes, &bytes).ok_or(StepRefusal::Corrupt)?;
+      saved = saved.saturating_add(
+        u64::try_from(bytes.len())
+          .unwrap_or(u64::MAX)
+          .saturating_sub(u64::try_from(delta.len()).unwrap_or(u64::MAX)),
+      );
+      self.texts.insert(text.identity, KeptText { base, delta });
+    }
+    // The property lists the rows name, kept whole; a text's bytes are in its delta alone.
+    let lists: BTreeSet<ContentIdentity> = changes
+      .iter()
+      .filter_map(|change| match change.properties {
+        Some(PropertyList::Held { identity, .. }) => Some(identity),
+        _ => None,
+      })
+      .collect();
+    for (identity, bytes) in fresh {
+      if lists.contains(&identity) {
+        self.contents.insert(identity, bytes);
+      }
+    }
+    Ok(saved)
+  }
+
+  /// The text of the skip-delta predecessor of the node at `path` in `revision` (FSFS's rule, `fs_fs.c`
+  /// `choose_delta_base`: the predecessor whose count is the node's with its lowest set bit cleared); none for a node with
+  /// no predecessor, one whose base holds no text the records keep, or the text itself.
+  fn skip_base(
+    &self,
+    path: &str,
+    revision: Revision,
+    identity: &ContentIdentity,
+  ) -> Option<ContentIdentity> {
+    let node = self.index.node(path, revision).ok().flatten()?;
+    let count = node.predecessor_count();
+    let target = count & count.saturating_sub(1);
+    let mut at = node;
+    for _ in 0..count.saturating_sub(target) {
+      at = self.index.node_revision(at.predecessor()?).ok()?;
+    }
+    let base = at.text()?.identity;
+    (base != *identity && self.texts.contains_key(&base)).then_some(base)
   }
 
   /// The properties a node's property list holds.
@@ -359,9 +510,14 @@ impl Repository {
       .locks
       .apply_all(&lock_entries)
       .map_err(StepRefusal::Lock)?;
-    self.contents.extend(fresh);
+    let changes = self
+      .index
+      .changes(revision)
+      .map(<[ChangedPath]>::to_vec)
+      .unwrap_or_default();
+    let saved = self.keep_fresh(revision, &changes, fresh)?;
     self.revision_properties.push(properties);
-    self.held = held;
+    self.held = held.saturating_sub(saved);
     Ok(revision)
   }
 
@@ -449,11 +605,18 @@ impl Repository {
     mut brought: BTreeMap<ContentIdentity, Vec<u8>>,
   ) -> Result<BTreeMap<ContentIdentity, Vec<u8>>, StepRefusal> {
     let mut fresh = BTreeMap::new();
-    for identity in named(changes) {
-      if self.contents.contains_key(&identity) {
+    for (identity, as_text) in named_as(changes) {
+      if self.holds_as(&identity, as_text) || fresh.contains_key(&identity) {
         continue;
       }
-      let bytes = brought.remove(&identity).ok_or(StepRefusal::Corrupt)?;
+      // A property list whose bytes the records hold as a text is those bytes: no client brings what is held.
+      let bytes = match brought.remove(&identity) {
+        Some(bytes) => bytes,
+        None => self
+          .text(&identity)
+          .ok_or(StepRefusal::Corrupt)?
+          .into_owned(),
+      };
       fresh.insert(identity, bytes);
     }
     Ok(fresh)
@@ -481,6 +644,35 @@ impl Repository {
     }
     Ok(held)
   }
+}
+
+/// A text the records keep (module docs, "Texts"): the text it was made against, none for a first version, and the
+/// svndiff (version 2, LZ4 sections) that makes it from that text.
+#[derive(Clone, Debug)]
+struct KeptText {
+  /// The skip-delta predecessor's text the delta is against.
+  base: Option<ContentIdentity>,
+  /// The delta's bytes.
+  delta: Vec<u8>,
+}
+
+/// The most deltas one read applies: a node's predecessor count is a `u64`, and the skip-delta rule halves the distance
+/// to the first version at every step (module docs, "Texts"), so a chain longer than this does not hold together.
+/// Derived: a `u64`'s 64 halvings, and the first version.
+const MAX_CHAIN: usize = 65;
+
+/// `target` as an svndiff of version 2 against `source`, each window's sections LZ4 blocks where that is shorter, as
+/// FSFS 1.10 and later write a representation; none if the encoder refuses a window it made, which it never does.
+fn encode_delta(source: &[u8], target: &[u8]) -> Option<Vec<u8>> {
+  let room = std::num::NonZeroUsize::new(usize::try_from(svndiff::WINDOW_LIMIT).ok()?)?;
+  let mut encoder = svndiff::Encoder::new(svndiff::Version::Two);
+  let mut out = encoder.header().to_vec();
+  for window in svndiff::deltas(source, target, room).ok()? {
+    encoder
+      .window(&window, svndiff::Compression::Lz4, &mut out)
+      .ok()?;
+  }
+  Some(out)
 }
 
 /// A revision the commit step checked against a repository ([`Repository::check`]): what [`Repository::apply`]
@@ -563,15 +755,16 @@ pub fn before(changes: &BTreeMap<&str, &ChangedPath>, path: &str) -> Before {
   Before::Head
 }
 
-/// Every text and property list `changes` name, by content identity, each once.
-fn named(changes: &[ChangedPath]) -> BTreeSet<ContentIdentity> {
+/// The texts and property lists `changes` name, each with whether a row names it as a text, in identity order; the
+/// same bytes named as both come twice.
+fn named_as(changes: &[ChangedPath]) -> BTreeSet<(ContentIdentity, bool)> {
   let mut named = BTreeSet::new();
   for change in changes {
     if let Some(text) = change.text {
-      named.insert(text.identity);
+      named.insert((text.identity, true));
     }
     if let Some(PropertyList::Held { identity, .. }) = change.properties {
-      named.insert(identity);
+      named.insert((identity, false));
     }
   }
   named
@@ -630,7 +823,7 @@ pub trait TextSource {
 /// is the bytes held under its identity.
 impl TextSource for Repository {
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
-    self.content(identity).map(Cow::Borrowed)
+    Repository::text(self, identity)
   }
 }
 
@@ -966,17 +1159,25 @@ impl Transaction {
     Ok(())
   }
 
-  /// The bytes held under `identity`, by the transaction or the repository.
+  /// The bytes held under `identity`, by the transaction or the repository: a property list in place, a text the
+  /// repository keeps made from its delta.
   pub(super) fn content<'a>(
     &'a self,
     repository: &'a Repository,
     identity: &ContentIdentity,
-  ) -> Option<&'a [u8]> {
-    self
-      .pending
-      .get(identity)
-      .map(Vec::as_slice)
-      .or_else(|| repository.content(identity))
+  ) -> Option<Cow<'a, [u8]>> {
+    if let Some(bytes) = self.pending.get(identity) {
+      return Some(Cow::Borrowed(bytes));
+    }
+    if let Some(bytes) = repository.content(identity) {
+      return Some(Cow::Borrowed(bytes));
+    }
+    repository.text(identity)
+  }
+
+  /// Whether the transaction or the repository holds `identity`.
+  fn holds(&self, repository: &Repository, identity: &ContentIdentity) -> bool {
+    self.pending.contains_key(identity) || repository.holds(identity)
   }
 
   /// Holds `bytes` under their content identity, once; refused when the repository's room cannot take them.
@@ -986,7 +1187,7 @@ impl Transaction {
     bytes: Vec<u8>,
   ) -> Result<ContentIdentity, MigrationRefusal> {
     let identity = *blake3::hash(&bytes).as_bytes();
-    if self.content(repository, &identity).is_some() {
+    if self.holds(repository, &identity) {
       return Ok(identity);
     }
     let size = u64::try_from(bytes.len()).map_err(|_| MigrationRefusal::Corrupt)?;
@@ -1059,7 +1260,7 @@ impl Transaction {
     };
     let properties = self
       .content(repository, &identity)
-      .and_then(decode)
+      .and_then(|bytes| decode(&bytes))
       .ok_or(MigrationRefusal::Corrupt)?;
     Ok(mergeinfo(&properties).map(<[u8]>::to_vec))
   }
@@ -1071,12 +1272,17 @@ impl Transaction {
     changes: &[ChangedPath],
   ) -> Result<Vec<(ContentIdentity, Vec<u8>)>, MigrationRefusal> {
     let mut fresh = Vec::new();
-    for identity in named(changes) {
-      if repository.content(&identity).is_none() {
-        let bytes = self
-          .pending
-          .remove(&identity)
-          .ok_or(MigrationRefusal::Corrupt)?;
+    for (identity, as_text) in named_as(changes) {
+      if !repository.holds_as(&identity, as_text)
+        && !fresh.iter().any(|(held, _)| *held == identity)
+      {
+        let bytes = match self.pending.remove(&identity) {
+          Some(bytes) => bytes,
+          None => repository
+            .text(&identity)
+            .ok_or(MigrationRefusal::Corrupt)?
+            .into_owned(),
+        };
         fresh.push((identity, bytes));
       }
     }

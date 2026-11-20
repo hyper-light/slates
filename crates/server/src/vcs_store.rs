@@ -99,6 +99,10 @@ use crate::state::ShardState;
 
 pub(crate) mod arena_windows;
 pub(crate) mod commits;
+pub(crate) mod durable;
+#[allow(unused_imports)]
+// Owed callers: w-svn's landing (A-727 slice b); `BarrierRefused` and `ContentTicket` name its terms.
+pub(crate) use durable::{BarrierRefused, ContentTicket, content_durable, content_ticket};
 pub(crate) mod git_encode;
 pub(crate) mod git_replay;
 pub(crate) mod hg_import;
@@ -399,6 +403,9 @@ pub(crate) enum ReplayRefused {
   Pack(slates_git::unpack::Refusal),
   /// An owed commit's record's bytes (A-664's live whole builds, part 2).
   Owed(owed::OwedRefused),
+  /// A version-3 git record's names (A-724 piece 8c) not read: the store holds no content of their identity whole (not
+  /// yet fetched from their region homes), or its rows are refused.
+  Names(record_names::NamesRefused),
 }
 
 /// The repository's objects as the bases a replayed pack's reference deltas may name (A-723), read through the index view
@@ -1302,9 +1309,82 @@ pub(crate) struct SealedPush {
   /// Moves admitted a turn at a time before their append (A-722 part 4c, `git_push`'s judge), each taken by its append
   /// while its green's head is still the one it was admitted from.
   prepared: Vec<Move>,
+  /// The names homed in the region at `f + 1` before the record (A-724 piece 8c): their content's identity and count, so
+  /// the record is written as version 3 if they are still the names it would write; none for version 2.
+  named: Option<(slates_vcs::ContentId, u64)>,
+}
+
+/// Whether a git push's record is written as version 3, its names homed in the region first (A-724 piece 8c; main's
+/// ruling of 2026-11-20 (ii)). Records stay version 2 until a takeover test proves the region path: the change that adds
+/// it turns this on. A test turns it on for its own thread ([`write_version_3_for_test`]).
+pub(crate) fn write_version_3() -> bool {
+  #[cfg(test)]
+  {
+    WRITE_VERSION_3_FOR_TEST.with(std::cell::Cell::get)
+  }
+  #[cfg(not(test))]
+  {
+    false
+  }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  /// [`write_version_3`] as a test on this thread asks.
+  static WRITE_VERSION_3_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Puts a push's names' rows `bytes` into the shard's content store as one content, held for its record (A-724 piece
+/// 8c), lent the room the shard can admit for the step and settled after: its identity; none where refused.
+pub(crate) fn put_names(state: &mut ShardState, bytes: &[u8]) -> Option<slates_vcs::ContentId> {
+  let need = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  lend(&mut state.store, &mut state.vcs_stores, need);
+  let put = {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map(|content| slates_vcs::rows::put(content, bytes))
+  };
+  settle(state);
+  put.and_then(Result::ok)
+}
+
+/// Gives back the hold [`put_names`] took of the names `identity`, where no record names them (their homing fell short).
+pub(crate) fn release_names(state: &mut ShardState, identity: &slates_vcs::ContentId) {
+  {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    if let Some(content) = lent.stores.content.as_mut() {
+      let _ = content.release(identity);
+    }
+  }
+  settle(state);
+}
+
+/// Turns [`write_version_3`] on or off for the calling thread (a test's shard).
+#[cfg(test)]
+pub(crate) fn write_version_3_for_test(on: bool) {
+  WRITE_VERSION_3_FOR_TEST.with(|cell| cell.set(on));
 }
 
 impl SealedPush {
+  /// The rows of the names the record would write now (A-724 piece 8c): each object the repository lacks, as
+  /// `record::RecordWriter::names_of` names it, encoded (`record_names::encode_names`), and their count.
+  pub(crate) fn names_now(&self, stores: &VcsStores) -> Result<(Vec<u8>, u64), GitRefused> {
+    let (content, store) = stores.git_ref(self.repository).ok_or(GitRefused::NoStore)?;
+    let names = self.objects.names_of(lacks(content, store));
+    let count = u64::try_from(names.len()).unwrap_or(u64::MAX);
+    let bytes = record_names::encode_names(&names).map_err(|_| GitRefused::NoStore)?;
+    Ok((bytes, count))
+  }
+
+  /// The names homed in the region at `f + 1` under `named` (their identity and count): the record is version 3 while
+  /// they are still its names.
+  pub(crate) fn homed_as(&mut self, named: (slates_vcs::ContentId, u64)) {
+    self.named = Some(named);
+  }
+
   /// The repository it is a push to.
   pub(crate) fn repository(&self) -> RepositoryId {
     self.repository
@@ -1322,6 +1402,24 @@ impl SealedPush {
   /// written now, as the append commits ([`record_of`]).
   pub(crate) fn record(&self, stores: &VcsStores) -> Result<Vec<u8>, GitRefused> {
     let (content, store) = stores.git_ref(self.repository).ok_or(GitRefused::NoStore)?;
+    // Version 3 only while the names it would write are the ones homed (A-724 piece 8c): another push may have committed
+    // one of its objects since, and then the names are written inline, version 2, which is always whole. The homed
+    // content is then held by no record and freed by the next restart's `release_unheld`.
+    if let Some((identity, count)) = self.named
+      && let Ok((bytes, now)) = self.names_now(stores)
+      && now == count
+      && slates_vcs::ContentId::of(&bytes) == identity
+    {
+      return self
+        .objects
+        .finish_named(
+          (content, store.repository.format()),
+          lacks(content, store),
+          (self.push.deepest(), &self.keyed),
+          (identity, count),
+        )
+        .map_err(unwritten);
+    }
     record_of(
       content,
       store,
@@ -1574,6 +1672,7 @@ impl SealingPush {
         keyed: Vec::new(),
         objects: self.push.record,
         prepared: Vec::new(),
+        named: None,
       }))),
       Err(refused) => {
         self.abandon(state);
@@ -1870,6 +1969,17 @@ fn replay_push(
   record: &Record<'_>,
 ) -> Result<u64, ReplayRefused> {
   push.carried(record.deepest);
+  // A version-3 record's names (A-724 piece 8c): read by their identity before anything is admitted, and held for the
+  // record when nothing holds them (a3: a window restored from the shard image is held for no one until a record holds
+  // it again; one fetched from its region homes is held by its fetch).
+  if let Some((identity, count)) = record.named {
+    record_names::names_from_content(content, &identity, count).map_err(ReplayRefused::Names)?;
+    if content.holders(&identity) == 0 {
+      content
+        .hold(&identity)
+        .map_err(|refused| ReplayRefused::Git(GitRefused::Object(PushRefused::Content(refused))))?;
+    }
+  }
   let mut remade = RecordWriter::default();
   replay_objects(content, store, (&mut *push, &mut remade), record)?;
   if !recorded_alike(content, store, &remade, record) {
@@ -1889,6 +1999,10 @@ fn recorded_alike(
   remade: &RecordWriter,
   record: &Record<'_>,
 ) -> bool {
+  if let Some((identity, count)) = record.named {
+    return record_names::names_from_content(content, &identity, count)
+      .is_ok_and(|names| names_alike(content, store, remade, &names));
+  }
   if record.objects.is_empty() {
     return names_alike(content, store, remade, &record.names);
   }
@@ -1899,7 +2013,35 @@ fn recorded_alike(
     let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
     (object.kind, object.identity, len)
   });
-  admitted.eq(recorded)
+  alike(content, admitted, recorded)
+}
+
+/// Whether `made`, what the replay's admission records, is `named`, a record's, object by object ([`same_name`]).
+fn alike(
+  content: &ContentStore,
+  made: impl Iterator<Item = (slates_git::object_name::Kind, slates_vcs::ContentId, u64)>,
+  named: impl Iterator<Item = (slates_git::object_name::Kind, slates_vcs::ContentId, u64)>,
+) -> bool {
+  let mut named = named;
+  for made in made {
+    match named.next() {
+      Some(named) if same_name(content, made, named) => {}
+      _ => return false,
+    }
+  }
+  named.next().is_none()
+}
+
+/// Whether an object the replay admitted, by its identity, is the one a record named: the same kind and length, and
+/// the same identity, or (a record written before the identity rule) this node's root of it.
+fn same_name(
+  content: &ContentStore,
+  made: (slates_git::object_name::Kind, slates_vcs::ContentId, u64),
+  named: (slates_git::object_name::Kind, slates_vcs::ContentId, u64),
+) -> bool {
+  made.0 == named.0
+    && made.2 == named.2
+    && (made.1 == named.1 || content.root_of(&made.1) == named.1)
 }
 
 /// Whether the objects the replay's admission would record now are `names`, a version-2 record's, in order
@@ -1910,10 +2052,10 @@ fn names_alike(
   remade: &RecordWriter,
   names: &[(slates_git::object_name::Kind, slates_vcs::ContentId, u64)],
 ) -> bool {
-  remade
+  let made = remade
     .lacked(lacks(content, store))
-    .map(|noted| (noted.kind, noted.identity, noted.len))
-    .eq(names.iter().copied())
+    .map(|noted| (noted.kind, noted.identity, noted.len));
+  alike(content, made, names.iter().copied())
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.
@@ -1927,7 +2069,10 @@ fn replay_objects(
     return replay_pack(content, store, (push, remade), record);
   }
   for object in &record.objects {
-    if content.object_id(object.content) != object.identity {
+    // A record written before the identity rule names an object past one window by this node's root of it.
+    if content.object_id(object.content) != object.identity
+      && content.root_id(object.content) != object.identity
+    {
       return Err(ReplayRefused::Identity);
     }
     let incoming = Incoming {
@@ -2432,6 +2577,16 @@ async fn recover_repository(
     index = index.saturating_add(1);
     slices.unit_done().await;
   }
+  remake_greens(state, record, slices).await;
+}
+
+/// Each of `record`'s greens' map of its head made again as the live store holds it (A-664 part 3), and a Subversion
+/// green's head texts held again (S4 c1), a green a unit of the recovery's slices.
+async fn remake_greens(
+  state: &mut ShardState,
+  record: &RepositoryRecord,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
   // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
   let greens: Vec<DbVolumeId> = state
     .db
@@ -2505,10 +2660,60 @@ fn rebuild_sliced(state: &mut ShardState, id: RepositoryId) {
 }
 
 /// Repository `id`'s rebuild of `generation` driven a turn at a time, a yield between, until it ends or is replaced.
+/// Before a version-3 record's replay begins, its names are read from the region where this node does not hold them
+/// (A-724 piece 8c; [`names_to_fetch`]): put into the content store, so the replay finds them held.
 async fn rebuild_turns(id: RepositoryId, generation: u64) {
-  while crate::state::with_state(|state| rebuild_turn(state, id, generation)) == Some(true) {
+  loop {
+    if let Some(Some((origin, shards, identity))) =
+      crate::state::with_state(|state| names_to_fetch(state, id, generation))
+    {
+      let fetched =
+        homes::read_in_region(origin, &shards, identity, crate::fleet::live_budget()).await;
+      crate::state::with_state(|state| match fetched {
+        Some(bytes) if put_names(state, &bytes) == Some(identity) => state.count(NAMES_FETCHED, 1),
+        _ => state.count(NAMES_UNFETCHED, 1),
+      });
+    }
+    if crate::state::with_state(|state| rebuild_turn(state, id, generation)) != Some(true) {
+      return;
+    }
     slates_rt::futures::yield_now().await;
   }
+}
+
+/// Counter: a version-3 record's names read from their region homes before its replay (A-724 piece 8c). Format: a
+/// counter name.
+pub(crate) const NAMES_FETCHED: &str = "vcs_store.names_fetched";
+/// Counter: a version-3 record's names no region home answered; its replay is refused `Names`. Format: a counter name.
+pub(crate) const NAMES_UNFETCHED: &str = "vcs_store.names_unfetched";
+
+/// The names repository `id`'s rebuild of `generation` must read from the region before its next record's replay
+/// begins (A-724 piece 8c): that record's names' identity when it is version 3 and this node's content store does not
+/// hold them, with the shard asking and the node's shards; none otherwise (a replay under way, a version-2 record).
+fn names_to_fetch(
+  state: &ShardState,
+  id: RepositoryId,
+  generation: u64,
+) -> Option<(u16, Vec<u16>, slates_vcs::ContentId)> {
+  let (current, index) = state.vcs_stores.rebuild_turns.get(&id).copied()?;
+  if current != generation || state.vcs_stores.git_replays.contains_key(&id) {
+    return None;
+  }
+  let Some(RepositoryStore::Git(git)) = state.vcs_stores.entries.get(&id) else {
+    return None;
+  };
+  let bytes = state
+    .db
+    .partition()
+    .repositories()
+    .object_record(id, index)?;
+  let (identity, _) = Record::decode(bytes, git.repository.format()).ok()?.named?;
+  let held = state
+    .vcs_stores
+    .content
+    .as_ref()
+    .is_some_and(|content| content.contains(&identity));
+  (!held).then(|| (state.shard, state.shards.clone(), identity))
 }
 
 /// One turn of repository `id`'s rebuild of `generation`: its next record replayed, or, past the last or at a refusal,

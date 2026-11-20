@@ -1194,6 +1194,9 @@ pub struct ShardState {
   /// The process thread's wait for a reason to stop (`Daemon::wait_for_stop`), asked at each heartbeat on the control
   /// shard; `None` until a process installs it (and on every other shard).
   pub(crate) stop_watch: Option<crate::daemon::StopWatch>,
+  /// Where the process thread's stop watch arrives (the control shard's, from its start; `None` on every other shard):
+  /// taken in at the heartbeat ([`crate::daemon::StopWatch`]), so installing it never waits on this shard's work.
+  pub(crate) stop_watch_install: Option<std::sync::mpsc::Receiver<crate::daemon::StopWatch>>,
   /// Test support: this shard refuses every NFSv4 purge sent to it (`Daemon::inject_nfs_purge_refusal`), as an owner
   /// that cannot make the drop durable does, so a test can leave a purge owed across a restart.
   pub(crate) nfs_purges_refused: bool,

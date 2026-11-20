@@ -1,8 +1,6 @@
 //! How much and how long a key serves (A-594; RFC 4344 §3; RFC 4253 §9).
 
-use crate::keylife::{
-  KeyLimits, RECOMMENDED_KEY_TIME_NS, UsageCap, block_cipher_bound, key_time_limit_ns,
-};
+use crate::keylife::{KeyLimits, REKEY_BYTES, UsageCap, block_cipher_bound};
 use crate::packet::{Cipher, Usage};
 
 /// A-594 (RFC 4344 §3.2, "SHOULD NOT encrypt more than 2**(L/4) blocks"): do derive the bound for AES's 128-bit block
@@ -21,14 +19,16 @@ fn each_cipher_has_its_own_limits() {
     KeyLimits::for_cipher(Cipher::Aes256Gcm),
     KeyLimits {
       packets: 1 << 32,
-      blocks: 1 << 32
+      blocks: 1 << 32,
+      bytes: REKEY_BYTES,
     }
   );
   assert_eq!(
     KeyLimits::for_cipher(Cipher::ChaCha20Poly1305),
     KeyLimits {
       packets: 1 << 32,
-      blocks: u64::MAX
+      blocks: u64::MAX,
+      bytes: REKEY_BYTES,
     }
   );
 }
@@ -45,7 +45,8 @@ fn a_cap_only_lowers_the_limits() {
     }),
     KeyLimits {
       packets: 8,
-      blocks: 1 << 32
+      blocks: 1 << 32,
+      bytes: REKEY_BYTES,
     }
   );
   assert_eq!(
@@ -64,41 +65,57 @@ fn a_key_is_due_at_half_and_exceeded_past_its_limit() {
   let limits = KeyLimits {
     packets: 8,
     blocks: 100,
+    bytes: u64::MAX,
   };
   assert!(!limits.due(Usage {
     packets: 3,
-    blocks: 49
+    blocks: 49,
+    bytes: 0
   }));
   assert!(limits.due(Usage {
     packets: 4,
-    blocks: 0
+    blocks: 0,
+    bytes: 0
   }));
   assert!(limits.due(Usage {
     packets: 0,
-    blocks: 50
+    blocks: 50,
+    bytes: 0
   }));
   assert!(!limits.exceeded_by(Usage {
     packets: 8,
-    blocks: 100
+    blocks: 100,
+    bytes: 0
   }));
   assert!(limits.exceeded_by(Usage {
     packets: 9,
-    blocks: 0
+    blocks: 0,
+    bytes: 0
   }));
   assert!(limits.exceeded_by(Usage {
     packets: 0,
-    blocks: 101
+    blocks: 101,
+    bytes: 0
   }));
 }
 
-/// A-594 (RFC 4253 §9, "after each hour of connection time"): do take the key time with nothing measured, with a
-/// measured tail of ten seconds, and with one of two hours. Expect the hour, ten seconds, and the hour again.
+/// A-745 (RFC 4253 §9, "after each gigabyte of transmitted data"): do test a key's usage just below a gigabyte of
+/// packets and at it, its packets and blocks far from their limits. Expect the rekey due at the gigabyte alone, and the
+/// key never exceeded by data: the gigabyte is a rekey point, not a limit.
 #[test]
-fn the_key_time_is_the_learned_tail_within_the_hour() {
-  assert_eq!(key_time_limit_ns(None), RECOMMENDED_KEY_TIME_NS);
-  assert_eq!(key_time_limit_ns(Some(10_000_000_000)), 10_000_000_000);
+fn a_key_is_due_after_a_gigabyte_of_data() {
+  let limits = KeyLimits::for_cipher(Cipher::ChaCha20Poly1305);
+  let below = Usage {
+    packets: 1,
+    blocks: 0,
+    bytes: REKEY_BYTES - 1,
+  };
+  let at = Usage {
+    bytes: REKEY_BYTES,
+    ..below
+  };
   assert_eq!(
-    key_time_limit_ns(Some(2 * RECOMMENDED_KEY_TIME_NS)),
-    RECOMMENDED_KEY_TIME_NS
+    (limits.due(below), limits.due(at), limits.exceeded_by(at)),
+    (false, true, false)
   );
 }

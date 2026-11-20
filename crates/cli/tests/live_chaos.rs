@@ -81,7 +81,8 @@ use std::time::{Duration, Instant};
 use relay::{Draws, PathRule, Relay, RelayedNode};
 use slates_client::{Client, ClientError, Deadlines, Intent, ReadAt, Refusal, VolumeId};
 
-/// Shape: how long a fleet step may take on a loaded box: the formation wait of the process flows.
+/// Shape: how long a fleet step may take on a box that gives the fleet a whole CPU: the formation wait of the process
+/// flows; a fleet wait divides it by the share of a CPU the box gives now ([`FleetWait`]).
 const FLEET_WAIT: Duration = Duration::from_secs(40);
 /// Shape: how long an anchor may take to start a successor daemon once its daemon was killed.
 const START_WAIT: Duration = Duration::from_secs(30);
@@ -665,14 +666,14 @@ fn wait_neighbourhood_settled(instances: &[String]) {
 /// fleet suite and judges those waits the same way, `poll_until`).
 struct FrozenWindow {
   last: Option<String>,
-  since: Instant,
+  since: FleetWait,
 }
 
 impl FrozenWindow {
   fn new() -> FrozenWindow {
     FrozenWindow {
       last: None,
-      since: Instant::now(),
+      since: FleetWait::begin(),
     }
   }
 
@@ -680,9 +681,9 @@ impl FrozenWindow {
   fn moving(&mut self, now: &str) -> bool {
     if self.last.as_deref() != Some(now) {
       self.last = Some(now.to_owned());
-      self.since = Instant::now();
+      self.since = FleetWait::begin();
     }
-    self.since.elapsed() < FLEET_WAIT
+    self.since.open()
   }
 }
 
@@ -929,10 +930,10 @@ fn counter(instance: &str, kind: &str) -> u64 {
 
 /// Runs `args` on `instance` until it is not refused for an unready consensus, within the fleet wait.
 fn run_ready(instance: &str, args: &[&str]) -> String {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   loop {
     let (code, out, err) = run(instance, args);
-    if code == 1 && err.contains("ConsensusNotInitialized") && Instant::now() < deadline {
+    if code == 1 && err.contains("ConsensusNotInitialized") && deadline.open() {
       pause();
       continue;
     }
@@ -1360,8 +1361,8 @@ struct Stream<'a> {
 impl Stream<'_> {
   /// Connects and attaches for writing, retrying within the fleet wait (a node just succeeded or taking over).
   fn attach(&self) -> Option<(Client, u64)> {
-    let deadline = Instant::now() + FLEET_WAIT;
-    while Instant::now() < deadline {
+    let mut deadline = FleetWait::begin();
+    while deadline.open() {
       if let Ok(mut client) = Client::connect(self.instance, deadlines())
         && let Ok(attached) = client.attach(self.volume, None, Intent::Write)
       {
@@ -1586,8 +1587,8 @@ impl SamplerHolds {
   /// Takes `node` out of the sampling, and returns once its thread has no `status` call in flight (within the fleet wait).
   fn hold(&self, node: usize) {
     self.wanted[node].store(true, Ordering::Release);
-    let deadline = Instant::now() + FLEET_WAIT;
-    while !self.idle[node].load(Ordering::Acquire) && Instant::now() < deadline {
+    let mut deadline = FleetWait::begin();
+    while !self.idle[node].load(Ordering::Acquire) && deadline.open() {
       pause();
     }
   }
@@ -1706,7 +1707,7 @@ fn no_loss(reader: &str, volume: &str, outcomes: &[Outcome]) -> Vec<String> {
 /// Convergence: waits until the owner's log is durable at its head with nothing owed and every candidate holds that
 /// head (same epoch, position and identity), within the fleet wait. What each reported last, and whether it converged.
 fn converged(owner: &str, candidates: &[&str], volume: &str) -> (bool, String) {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   loop {
     let shipping = live_states(owner, volume)
       .unwrap_or_default()
@@ -1731,7 +1732,7 @@ fn converged(owner: &str, candidates: &[&str], volume: &str) -> (bool, String) {
           })
         })
     });
-    if whole || Instant::now() >= deadline {
+    if whole || !deadline.open() {
       let mut line = format!("owner {shipping:?}; candidates {held:?}");
       if !whole {
         for instance in std::iter::once(&owner).chain(candidates) {
@@ -1946,12 +1947,12 @@ fn write_answered_within(
       }
       .run(file..file + 1, &AtomicBool::new(false))
     });
-    let waited = Instant::now();
+    let mut waited_fleet = FleetWait::begin();
     while !writer.is_finished() {
-      if waited.elapsed() > FLEET_WAIT {
+      if !waited_fleet.open() {
         let instances = DIAGNOSED.with(|instances| instances.borrow().clone());
         eprintln!(
-          "chaos: a write on {instance} was never answered within {FLEET_WAIT:?}:\n{}",
+          "chaos: a write on {instance} was never answered within its fleet wait:\n{}",
           diagnosis(&instances, volume)
         );
         for node in &instances {
@@ -1961,7 +1962,7 @@ fn write_answered_within(
         }
         let outcome = writer.join().unwrap();
         panic!(
-          "a write on {instance} was never answered within {FLEET_WAIT:?} (the fleet's state is printed above): \
+          "a write on {instance} was never answered within its fleet wait (the fleet's state is printed above): \
            {outcome:?}"
         );
       }
@@ -1980,13 +1981,13 @@ fn first_write_through(
   files: std::ops::Range<usize>,
   began: &Instant,
 ) -> (Option<u64>, Vec<Outcome>) {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   let mut written = Vec::new();
   for file in files {
     let outcome = write_answered_within(successor, volume, file, began);
     let acknowledged = outcome.iter().any(|outcome| outcome.refused.is_none());
     written.extend(outcome);
-    if acknowledged || Instant::now() >= deadline {
+    if acknowledged || !deadline.open() {
       break;
     }
     pause();
@@ -2030,6 +2031,8 @@ fn read_through(
     let reads = scope.spawn(|| read_each(instance, volume, files, began));
     let waited = Instant::now();
     let mut healed = None;
+    // A fleet wait begun once the bound passed ([`FleetWait`]).
+    let mut past_bound: Option<FleetWait> = None;
     while !reads.is_finished() {
       if heal
         && healed.is_none()
@@ -2040,7 +2043,7 @@ fn read_through(
         relay.heal();
         healed = Some(began.elapsed());
       }
-      if waited.elapsed() >= bound.saturating_add(FLEET_WAIT) {
+      if waited.elapsed() >= bound && !past_bound.get_or_insert_with(FleetWait::begin).open() {
         eprintln!(
           "chaos: reads through {instance} unanswered a fleet wait past {bound:?}; killing its daemon"
         );
@@ -2401,11 +2404,11 @@ fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds, &NewestAcknowledged
     drop(stop);
     // A write the daemon never answers would hang the join for good (one run hung 20 minutes, 2026-11-06): past the
     // fleet wait, the fleet is shown whole and its daemons killed, so the client is told and the flow fails.
-    let stopped = Instant::now();
+    let mut stopped_fleet = FleetWait::begin();
     while !streamer.is_finished() {
-      if stopped.elapsed() > FLEET_WAIT {
+      if !stopped_fleet.open() {
         eprintln!(
-          "chaos: a write on {owner} was never answered within {FLEET_WAIT:?} of the stream's stop:\n{}",
+          "chaos: a write on {owner} was never answered within a fleet wait of the stream's stop:\n{}",
           diagnosis(instances, volume)
         );
         UNANSWERED.with(|unanswered| unanswered.set(true));
@@ -2454,9 +2457,9 @@ fn owned_durable(owner: &str, volume: &str) -> Option<u64> {
 /// the stall guard: a write the daemon never answers fails the flow with the fleet printed.
 fn until_durable(owner: &str, volume: &str, target: u64) {
   let from = owned_durable(owner, volume);
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   while owned_durable(owner, volume).unwrap_or(0) < target {
-    if Instant::now() >= deadline {
+    if !deadline.open() {
       let instances = DIAGNOSED.with(|instances| instances.borrow().clone());
       panic!(
         "the stream made {owner}'s log durable at {target} (from {from:?}, now {:?}):\n{}",
@@ -2580,6 +2583,101 @@ thread_local! {
   static UNANSWERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
   /// The instances of the fleet a flow on this thread runs, for a failed wait's diagnosis.
   static DIAGNOSED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Shape: the CPU a fleet wait's share probe runs on this thread to measure the share of a CPU this process is given
+/// ([`cpu_share`]): two step budgets of a debug build's tick, long enough that the clock's granularity (a microsecond)
+/// is a part in twenty thousand, short beside the 40 s it judges.
+const SHARE_PROBE: Duration = Duration::from_millis(20);
+
+/// A wait for the fleet to reach a state, judged by the share of a CPU the box gives the fleet's processes now: the
+/// wall window [`FLEET_WAIT`] divided by that share, measured at each window's end by this process ([`cpu_share`]),
+/// which runs under the same scheduling policy as the daemons it started (a loaded box, or all of them held to the
+/// efficiency cores by `taskpolicy -b`). Uncontended the share is one and the wait is the window; at load 31 on 14 CPUs
+/// it is about half and the wait about twice the window. Until 2026-11-20 every fleet wait was the 40 s window alone, and
+/// a takeover's register adoption missed it under `taskpolicy -b` at load 7 to 31 (w-forming's pr3 run 3, pr4 run 2).
+struct FleetWait {
+  began: Instant,
+  window: Duration,
+  /// Where the wait was begun, for the line an extension logs.
+  site: &'static std::panic::Location<'static>,
+}
+
+impl FleetWait {
+  #[track_caller]
+  fn begin() -> FleetWait {
+    FleetWait {
+      began: Instant::now(),
+      window: FLEET_WAIT,
+      site: std::panic::Location::caller(),
+    }
+  }
+
+  /// Whether the wait goes on.
+  fn open(&mut self) -> bool {
+    let waited = self.began.elapsed();
+    if waited < self.window {
+      return true;
+    }
+    let share = cpu_share();
+    let allowed = fleet_wait_allowed(share);
+    if waited >= allowed {
+      return false;
+    }
+    eprintln!(
+      "chaos: the fleet wait begun at {} went past {:?}: this process is given {share:.2} of a CPU, so it waits \
+       {allowed:?}",
+      self.site, self.window
+    );
+    self.window = allowed;
+    true
+  }
+}
+
+/// [`FleetWait`]'s bound given the share of a CPU measured at a window's end: the window divided by the share, the
+/// window itself at a share of one or more.
+fn fleet_wait_allowed(share: f64) -> Duration {
+  if share >= 1.0 || share <= 0.0 || !share.is_finite() {
+    return FLEET_WAIT;
+  }
+  FLEET_WAIT.div_f64(share)
+}
+
+/// The share of a CPU this thread is given now: [`SHARE_PROBE`] of its own CPU spun, over the wall time that took.
+fn cpu_share() -> f64 {
+  let thread_cpu = || {
+    let mut time = libc::timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+    };
+    // SAFETY: `time` is this frame's own value, which the call fills; the status is checked before it is read.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut time) };
+    (status == 0).then(|| {
+      Duration::new(
+        u64::try_from(time.tv_sec).unwrap_or(0),
+        u32::try_from(time.tv_nsec).unwrap_or(0),
+      )
+    })
+  };
+  let (Some(cpu_began), wall_began) = (thread_cpu(), Instant::now()) else {
+    return 1.0;
+  };
+  while thread_cpu().is_some_and(|now| now.saturating_sub(cpu_began) < SHARE_PROBE) {
+    std::hint::spin_loop();
+  }
+  SHARE_PROBE.as_secs_f64() / wall_began.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)
+}
+
+/// [`fleet_wait_allowed`] (w-forming, 2026-11-20; found by use: a takeover's register adoption missed the 40 s wall
+/// window under `taskpolicy -b` at load 7 to 31). Do: bound a wait for a process given a whole CPU, half of one, a
+/// tenth, and no reading. Expect: the window, twice it, ten times it, and the window.
+#[test]
+fn a_fleet_wait_is_the_window_over_the_share_of_a_cpu_the_box_gives() {
+  assert_eq!(fleet_wait_allowed(1.0), FLEET_WAIT);
+  assert_eq!(fleet_wait_allowed(0.5), FLEET_WAIT * 2);
+  assert_eq!(fleet_wait_allowed(0.1), FLEET_WAIT * 10);
+  assert_eq!(fleet_wait_allowed(0.0), FLEET_WAIT);
+  assert_eq!(fleet_wait_allowed(f64::NAN), FLEET_WAIT);
 }
 
 // ── Flows ────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -2709,13 +2807,14 @@ fn wait_serving<'a>(
   outcomes: &[Outcome],
 ) -> Option<(&'a str, Duration)> {
   let began = Instant::now();
+  let mut began_fleet = FleetWait::begin();
   let id = volume_id_of(volume);
   let acknowledged: Vec<usize> = outcomes
     .iter()
     .filter(|outcome| outcome.refused.is_none())
     .map(|outcome| outcome.file)
     .collect();
-  while began.elapsed() < FLEET_WAIT {
+  while began_fleet.open() {
     for survivor in survivors {
       let Ok(mut client) = Client::connect(survivor, deadlines()) else {
         continue;
@@ -3035,7 +3134,8 @@ fn writes_stream_through_random_candidate_stalls() {
 /// The survivor among `survivors` that ships `volume` (has taken it over), once one does, within the fleet wait.
 fn wait_taken_over<'a>(survivors: &[&'a str], volume: &str) -> Option<(&'a str, Duration)> {
   let began = Instant::now();
-  while began.elapsed() < FLEET_WAIT {
+  let mut began_fleet = FleetWait::begin();
+  while began_fleet.open() {
     if let Some(successor) = survivors
       .iter()
       .find(|survivor| took_over(survivor, volume))
@@ -3111,7 +3211,7 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
       for index in fleet.others(owner_index) {
         fleet.resume(index);
       }
-      let code = destroy.wait_timeout_or_kill(FLEET_WAIT).unwrap_or(-1);
+      let code = destroy.wait_in_fleet_time_or_kill().unwrap_or(-1);
       let mut err = String::new();
       {
         use std::io::Read;
@@ -3160,7 +3260,7 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
   let (heads, disagreements) = agreement(&samples);
   verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
   verdict.check("Agreement", disagreements);
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   let kept = loop {
     let kept: Vec<(String, Vec<LiveState>)> = fleet
       .instances
@@ -3173,7 +3273,7 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
       })
       .filter(|(_, states)| !states.is_empty())
       .collect();
-    if kept.is_empty() || Instant::now() >= deadline {
+    if kept.is_empty() || !deadline.open() {
       break kept;
     }
     pause();
@@ -3266,9 +3366,9 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
         let _ = stdin.write_all(&chaos_body(round));
       }
       // The write parks once it reaches the owner; kill its client while it waits.
-      let parked = Instant::now();
+      let mut parked_fleet = FleetWait::begin();
       while counter(&owner, "fleet.live.awaited") <= u64::try_from(round).unwrap()
-        && parked.elapsed() < FLEET_WAIT
+        && parked_fleet.open()
       {
         pause();
       }
@@ -3403,8 +3503,8 @@ fn a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover
     }
     // The client's write has left it once the owner holds it parked, waiting for its stopped candidates: the owner's own
     // count of the writes it awaits moves. Killed then, the client is between "sent" and "answered".
-    let parked = Instant::now();
-    while counter(&owner, "fleet.live.awaited") <= awaited_before && parked.elapsed() < FLEET_WAIT {
+    let mut parked_fleet = FleetWait::begin();
+    while counter(&owner, "fleet.live.awaited") <= awaited_before && parked_fleet.open() {
       pause();
     }
     let reached = counter(&owner, "fleet.live.awaited") > awaited_before;
@@ -3640,7 +3740,7 @@ fn destroy_across_the_loss(
   let code = match before_the_loss {
     Some(code) => code.unwrap_or(-1),
     // Its daemon is gone: the client is told so, or is killed here.
-    None => destroy.wait_timeout_or_kill(FLEET_WAIT).unwrap_or(-1),
+    None => destroy.wait_in_fleet_time_or_kill().unwrap_or(-1),
   };
   let mut stderr = String::new();
   {
@@ -3775,19 +3875,20 @@ fn a_plain_volumes_destroy_then_its_owners_loss() {
   }
 }
 
-/// Waits for a child within a bound, killing it past the bound: its exit code (`None`: killed or signalled).
+/// Waits for a child while its fleet wait goes on ([`FleetWait`]), killing it after: its exit code (`None`: killed or
+/// signalled).
 trait WaitOrKill {
-  fn wait_timeout_or_kill(&mut self, bound: Duration) -> Option<i32>;
+  fn wait_in_fleet_time_or_kill(&mut self) -> Option<i32>;
 }
 
 impl WaitOrKill for Child {
-  fn wait_timeout_or_kill(&mut self, bound: Duration) -> Option<i32> {
-    let began = Instant::now();
+  fn wait_in_fleet_time_or_kill(&mut self) -> Option<i32> {
+    let mut wait = FleetWait::begin();
     loop {
       if let Some(status) = self.try_wait().unwrap() {
         return status.code();
       }
-      if began.elapsed() > bound {
+      if !wait.open() {
         let _ = self.kill();
         let _ = self.wait();
         return None;
@@ -4105,12 +4206,12 @@ fn clients_cut_off_mid_merge_leave_the_green_whole_across_a_takeover() {
     },
   );
   fleet.kill_node(owner_index);
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   let taken = loop {
     let served = candidates
       .iter()
       .find(|candidate| green_head(candidate, &green) == Some(head));
-    if served.is_some() || Instant::now() >= deadline {
+    if served.is_some() || !deadline.open() {
       break served.cloned();
     }
     pause();
@@ -4163,7 +4264,7 @@ fn a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet() {
     "rejoins: successor daemon {successor} answered after {:?}",
     began.elapsed()
   );
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   loop {
     let views: Vec<_> = fleet
       .instances
@@ -4178,7 +4279,7 @@ fn a_candidates_daemon_succeeded_under_its_anchor_rejoins_the_fleet() {
     if formed {
       break;
     }
-    if Instant::now() >= deadline {
+    if !deadline.open() {
       for instance in &fleet.instances {
         let (_, out, _) = run(instance, &["status"]);
         let lines: Vec<&str> = out
@@ -4220,7 +4321,7 @@ fn wait_settled_after_destroy(
   outcomes: &[Outcome],
   live: bool,
 ) -> (Option<Settled>, Vec<SurvivorView>) {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   loop {
     let views = survivor_views(survivors, volume);
     // Destroyed: nobody lists it, nobody serves it, and every answer is NotFound or OwnerUnreachable (a destroyed
@@ -4243,7 +4344,7 @@ fn wait_settled_after_destroy(
     {
       return (Some(Settled::Served(view.instance.clone())), views);
     }
-    if Instant::now() >= deadline {
+    if !deadline.open() {
       return (None, views);
     }
     pause();
@@ -4381,6 +4482,7 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
   let last_look = live_states(&owner, &volume).unwrap_or_default();
   fleet.kill_node(owner_index);
   let began = Instant::now();
+  let mut began_fleet = FleetWait::begin();
   // The successor is the survivor that took the volume over and serves the three files: every survivor serves them once
   // it forwards to the successor, so the first to serve them may be a forwarder, which ships nothing and so shows no head
   // after a write through it (the integrator's run on bfc34cace judged a forwarder so).
@@ -4395,7 +4497,7 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
           })
         })
     });
-    if whole.is_some() || began.elapsed() > FLEET_WAIT {
+    if whole.is_some() || !began_fleet.open() {
       break whole.map(|survivor| ((*survivor).to_owned(), began.elapsed()));
     }
     pause();
@@ -4613,7 +4715,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
   ));
   // The moment a survivor has adopted the registers, the holder with the log is stopped, so the live log's phase one
   // runs without it.
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   let adopted_by = loop {
     if let Some(survivor) = survivors.iter().find(|survivor| {
       counter(survivor, "fleet.takeover.adopted") > 0
@@ -4625,7 +4727,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     }) {
       break Some(*survivor);
     }
-    if Instant::now() >= deadline {
+    if !deadline.open() {
       break None;
     }
     pause();
@@ -5006,6 +5108,8 @@ fn judge_served<'a>(
 /// The members of `instances` that still hold a copy of `volume`'s log at the end of the fleet wait: none once each has let
 /// its copy go.
 fn copies_kept(instances: &[&str], volume: &str) -> Vec<String> {
+  // The plain window, not a [`FleetWait`]: a copy still kept at its end is noted, not failed, so a passing run reaches
+  // the end and must not wait an extension for it.
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
     let kept: Vec<String> = instances
@@ -5028,7 +5132,7 @@ fn copies_kept(instances: &[&str], volume: &str) -> Vec<String> {
 /// The nodes holding `volume`'s log whose acknowledgements the owner at `owner_index` counts, once it reports two and no
 /// holder transition in flight and each holds the owner's durable position, within the fleet wait.
 fn settled_holders(fleet: &Fleet, owner_index: usize, volume: &str) -> Vec<usize> {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   loop {
     let owner = live_states(&fleet.instances[owner_index], volume)
       .unwrap_or_default()
@@ -5058,7 +5162,7 @@ fn settled_holders(fleet: &Fleet, owner_index: usize, volume: &str) -> Vec<usize
       }
     }
     assert!(
-      Instant::now() < deadline,
+      deadline.open(),
       "the owner's holders settled within the fleet wait: {owner:?}"
     );
     pause();
@@ -5067,14 +5171,14 @@ fn settled_holders(fleet: &Fleet, owner_index: usize, volume: &str) -> Vec<usize
 
 /// The nodes of `fleet` holding a copy of `volume`'s log, once at least `count` do, within the fleet wait.
 fn wait_holders(fleet: &Fleet, volume: &str, count: usize) -> Vec<usize> {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut deadline = FleetWait::begin();
   loop {
     let holders = holders_of(fleet, volume);
     if holders.len() >= count {
       return holders;
     }
     assert!(
-      Instant::now() < deadline,
+      deadline.open(),
       "{count} nodes hold the volume's log within the fleet wait: {holders:?}"
     );
     pause();
@@ -5143,7 +5247,8 @@ fn wait_reads<'a>(
   body: &[u8],
 ) -> Option<(&'a str, Duration)> {
   let began = Instant::now();
-  while began.elapsed() < FLEET_WAIT {
+  let mut began_fleet = FleetWait::begin();
+  while began_fleet.open() {
     for survivor in survivors {
       if let Ok(mut client) = Client::connect(survivor, deadlines())
         && client
@@ -5169,9 +5274,9 @@ fn answered_within(
 ) -> Result<(), String> {
   std::thread::scope(|scope| {
     let writer = scope.spawn(writes);
-    let began = Instant::now();
+    let mut began_fleet = FleetWait::begin();
     while !writer.is_finished() {
-      if began.elapsed() > FLEET_WAIT {
+      if !began_fleet.open() {
         let state = diagnosis(instances, volume);
         for instance in instances {
           if let Some(pid) = daemon_pid(instance) {
@@ -6407,7 +6512,8 @@ fn wait_taken_over_again<'a>(
   (fence, counted): (u64, &[u64]),
 ) -> Option<(&'a str, Duration)> {
   let began = Instant::now();
-  while began.elapsed() < FLEET_WAIT {
+  let mut began_fleet = FleetWait::begin();
+  while began_fleet.open() {
     if let Some((successor, _)) = survivors.iter().zip(counted).find(|(survivor, before)| {
       counter(survivor, "fleet.live.taken_over") > **before
         || serving_epoch(survivor, volume) > fence

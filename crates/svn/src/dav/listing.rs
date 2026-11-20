@@ -290,9 +290,11 @@ pub(crate) const FILE_REVS_START: &str = "<?xml version=\"1.0\" encoding=\"utf-8
 /// Format: `dav_svn__file_revs_report`'s last write (Subversion 1.15.0).
 pub(crate) const FILE_REVS_END: &str = "</S:file-revs-report>\n";
 
-/// One revision's `S:file-rev` element, as `file_rev_handler` and `delta_window_handler` write it (`file-revs.c`), its
-/// delta written in `version`.
-pub(crate) fn file_rev_element(file_rev: &FileRev, version: Version) -> Result<String, DavRefusal> {
+/// `S:file-rev`'s start, as `mod_dav_svn`'s `file_rev_handler` writes it before its delta: the element's open tag, its
+/// revision properties, its property changes, and `S:merged-revision` where merged; its delta (between [`TXDELTA_START`]
+/// and [`TXDELTA_END`]) or its close ([`FILE_REV_END`]) follow. A-751: the file-revs walk writes the delta a piece at a
+/// time between them.
+pub(crate) fn file_rev_head(file_rev: &FileRev) -> String {
   let mut element = format!(
     "<S:file-rev path=\"{}\" rev=\"{}\">\n",
     quote(&file_rev.path, true),
@@ -310,6 +312,24 @@ pub(crate) fn file_rev_element(file_rev: &FileRev, version: Version) -> Result<S
   if file_rev.merged {
     element.push_str("<S:merged-revision/>");
   }
+  element
+}
+
+/// A file revision's delta's start, after [`file_rev_head`].
+/// Format: `file-revs.c` `file_rev_handler`, `<S:txdelta>`.
+pub(crate) const TXDELTA_START: &[u8] = b"<S:txdelta>";
+
+/// A file revision's delta's end and the element's close.
+/// Format: `file-revs.c` `delta_close`, `</S:txdelta>` then `end_file_rev`'s `</S:file-rev>`.
+pub(crate) const TXDELTA_END: &[u8] = b"</S:txdelta></S:file-rev>\n";
+
+/// A file revision's close where its text is unchanged.
+/// Format: `file-revs.c` `end_file_rev`, `</S:file-rev>`.
+pub(crate) const FILE_REV_END: &[u8] = b"</S:file-rev>\n";
+
+/// One `S:file-rev`: [`file_rev_head`], then its delta in base64 where it changed, the svndiff encoded in `version`.
+pub(crate) fn file_rev_element(file_rev: &FileRev, version: Version) -> Result<String, DavRefusal> {
+  let mut element = file_rev_head(file_rev);
   match &file_rev.delta {
     Some(windows) => element.push_str(&format!(
       "<S:txdelta>{}</S:txdelta></S:file-rev>\n",

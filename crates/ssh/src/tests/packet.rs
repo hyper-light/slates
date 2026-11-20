@@ -5,7 +5,7 @@ use proptest::prelude::*;
 
 use crate::packet::{
   AES_BLOCK_LEN, CLEAR_ALIGNMENT, Cipher, LENGTH_LEN, MAX_PACKET_EVERY_PEER_ACCEPTS, MIN_PADDING,
-  Opener, PacketRefusal, SealRefusal, Sealer, TAG_LEN, Usage,
+  Opener, PacketRefusal, SealRefusal, Sealer, TAG_LEN,
 };
 use crate::support::{Scripted, Seeded, hex};
 
@@ -93,13 +93,7 @@ fn chacha_seals_and_opens_the_drafts_worked_packet() {
     .unwrap();
   assert_eq!(out, hex(DRAFT_WIRE));
   assert_eq!(sealer.sequence(), 8);
-  assert_eq!(
-    sealer.usage(),
-    Usage {
-      packets: 1,
-      blocks: 0
-    }
-  );
+  assert_eq!((sealer.usage().packets, sealer.usage().blocks), (1, 0));
   let mut opener = Opener::new(Cipher::ChaCha20Poly1305, &key, &[]).unwrap();
   opener.set_sequence(7);
   assert_eq!(
@@ -230,13 +224,7 @@ fn clear_packets_align_their_length_too() {
       Ok(payload)
     );
   }
-  assert_eq!(
-    sealer.usage(),
-    Usage {
-      packets: 7,
-      blocks: 0
-    }
-  );
+  assert_eq!((sealer.usage().packets, sealer.usage().blocks), (7, 0));
 }
 
 /// A-594 hostile: do frame lengths a client could send in the clear: too short to hold a payload, unaligned, `u32::MAX`,
