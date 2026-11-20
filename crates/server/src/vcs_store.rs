@@ -113,6 +113,7 @@ pub(crate) mod record;
 pub(crate) mod record_names;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
+pub(crate) mod svn_texts;
 pub(crate) mod svn_view;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
@@ -192,6 +193,10 @@ pub(crate) struct VcsStores {
   /// The git records whose replay is under way a turn at a time (A-722 part 4, [`git_replay`]): at most one a
   /// repository, the record its rebuild or recovery replays now; bounded by the partition's repositories.
   git_replays: BTreeMap<RepositoryId, Box<git_replay::GitReplay>>,
+  /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
+  /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
+  /// bounded by the fetches the shard's edges seat.
+  git_forks: BTreeMap<RepositoryId, Vec<upload::GitFork>>,
   /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
   /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
   objects_charged: BTreeMap<RepositoryId, u64>,
@@ -2437,6 +2442,10 @@ async fn recover_repository(
     .collect();
   for green in greens {
     paths::remake_green_sliced(state, green, slices).await;
+    // A Subversion green made again holds none of its head's texts (S4 c1): every one held again, in byte order.
+    if record.tool == VcsTool::Subversion {
+      svn_texts::rehold_head(state, record.id, green);
+    }
     slices.unit_done().await;
   }
   paths::whole_build::resume_owed(state, record.id);

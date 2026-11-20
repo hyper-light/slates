@@ -437,6 +437,20 @@ struct NoGit;
 impl StoreLender for NoGit {
   type Packs = NoPacks;
 
+  type Hold = (RepositoryId, Principal);
+
+  fn hold(&mut self, id: RepositoryId, reader: &Principal) -> Option<(RepositoryId, Principal)> {
+    self.holds(id).then(|| (id, reader.clone()))
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    (id, reader): &(RepositoryId, Principal),
+    step: impl FnOnce(&slates_git::upload::Served<'_>, &mut NoPacks) -> R,
+  ) -> Option<R> {
+    self.lend((*id, reader), step)
+  }
+
   fn holds(&self, _id: RepositoryId) -> bool {
     false
   }

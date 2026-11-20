@@ -1367,6 +1367,62 @@ impl Repository {
     )))
   }
 
+  /// A fork of the repository as it stands now (A-745, §4.17.1 "A fetch's answer" rule 4: a fetch reads the index as it
+  /// stood when it began): the index forked (its rows as they stand, their tables shared), its versions, base packs,
+  /// heads and landings copied, and every content they name held once more, so whatever lands, is re-based or rebuilt
+  /// in the repository meanwhile, the fork reads as this generation did, until [`Repository::release`] gives back what
+  /// it holds. Its records charge the store as the repository's do. Refused, everything it took is given back.
+  pub fn fork(&mut self, store: &mut ContentStore) -> Result<Repository, StoreRefused> {
+    let charge = self.charged.saturating_add(self.landings_charged);
+    store.charge(charge).map_err(StoreRefused::from)?;
+    let index = match self.index.fork(store) {
+      Ok(index) => index,
+      Err(refused) => {
+        let _ = store.discharge(charge);
+        return Err(StoreRefused::from(refused));
+      }
+    };
+    let named: Vec<ContentId> = self
+      .chains
+      .values()
+      .flat_map(|chain| {
+        chain
+          .kept()
+          .map(|kept| kept.content)
+          .chain(chain.versions.iter().map(|version| version.value))
+      })
+      .collect();
+    if let Err(refused) = hold_all(store, &named) {
+      let _ = index.release(store);
+      let _ = store.discharge(charge);
+      return Err(refused);
+    }
+    Ok(Repository {
+      format: self.format,
+      index,
+      next_position: self.next_position,
+      chains: self.chains.clone(),
+      heads: self.heads.clone(),
+      charged: self.charged,
+      landings: self.landings.clone(),
+      landings_charged: self.landings_charged,
+      counters: Cell::new(StoreCounters::default()),
+      window: self.window.clone(),
+      levels: self.levels.clone(),
+      depth: self.depth,
+    })
+  }
+
+  /// Where the repository stands (A-745 rule 4): the positions it has given and the versions its greens have, both only
+  /// ever growing, so every landing moves it and two moments with the same stamp read the same objects, refs' heads and
+  /// versions. A fork taken at a stamp serves every fetch that begins at it.
+  pub fn stamp(&self) -> (u64, u64) {
+    let versions = self.chains.values().fold(0_u64, |count, chain| {
+      count.saturating_add(u64::try_from(chain.versions.len()).unwrap_or(u64::MAX))
+    });
+    (self.next_position, versions)
+  }
+
   /// Gives back everything the repository holds: its rows' holds, their tables, its versions' values and their charge.
   /// It goes on past a refusal and answers the first.
   pub fn release(self, store: &mut ContentStore) -> Result<(), StoreRefused> {
@@ -1420,6 +1476,17 @@ fn put_values(
     }
   }
   Ok(values)
+}
+
+/// Holds every one of `ids` in `store`; refused one, gives back those it held and answers the refusal.
+fn hold_all(store: &mut ContentStore, ids: &[ContentId]) -> Result<(), StoreRefused> {
+  for (at, id) in ids.iter().enumerate() {
+    if let Err(refused) = store.hold(id) {
+      let _ = give_back(store, ids.get(..at).unwrap_or_default());
+      return Err(StoreRefused::from(refused));
+    }
+  }
+  Ok(())
 }
 
 /// Gives back one hold of each of `values`; past a refusal the rest still, and the first refusal is the answer.

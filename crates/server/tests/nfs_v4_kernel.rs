@@ -35,8 +35,6 @@ use common::nfs::{lookup, mount, read};
 const ENV_OPT_IN: &str = "SLATES_TEST_NFS4_KERNEL";
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
-/// Shape: how long the client waits for the daemon's rendezvous.
-const CREDIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why the test cannot run here, or `None` when it can.
 fn skip_reason() -> Option<String> {
@@ -124,16 +122,9 @@ fn daemon_with_volume(tag: &str, name: &str) -> Daemon {
   )
   .unwrap();
   daemon.bootstrap(true).unwrap();
-  let started = std::time::Instant::now();
-  let connected = loop {
-    match connect(&instance) {
-      Ok(connected) => break connected,
-      Err(slates_ipc::IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-        std::hint::spin_loop();
-      }
-      Err(error) => panic!("{error}"),
-    }
-  };
+  // The claim waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait
+  // (A-571's rule; until 2026-11-20 a five-second retry, `CREDIT_WAIT`).
+  let connected = connect(&instance).unwrap_or_else(|error| panic!("{error}"));
   let client = connected.region.client_id();
   let mut end = ClientEnd::connected(connected);
   let body = RequestBody::Create {

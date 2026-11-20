@@ -394,7 +394,8 @@ impl Exchange {
         Ok(Turn::Took { consumed })
       }
       Progress::Finished { report, consumed } => {
-        let drive = Drive::new(*report, &self.uuid);
+        let (version, compression) = super::editor::encoding_of(&self.capabilities);
+        let drive = Drive::new(*report, &self.uuid).with_encoding(version, compression);
         let writer = EditorWriter::new(&self.capabilities, self.most_open);
         self.phase = Phase::Driving(Box::new(drive), writer);
         Ok(Turn::Took { consumed })

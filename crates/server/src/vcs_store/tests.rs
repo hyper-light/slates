@@ -1793,7 +1793,8 @@ fn an_http_commit_idle_past_the_edges_idle_bound_is_released() {
     rules: None,
     revision_properties: Vec::new(),
   };
-  let commit = DavCommit::begin(setup, &world, &|_| Ok(())).unwrap();
+  let texts = Box::new(slates_svn::commit::drive::HeldTexts::new());
+  let commit = DavCommit::begin(setup, &world, &|_| Ok(()), texts).unwrap();
   let id = RepositoryId { bytes: [6; 16] };
   let mut stores = super::VcsStores::default();
   stores.begin_dav_commit(id, b"alice", String::from("0-1"), (commit, 1_000));

@@ -228,11 +228,7 @@ impl EditorWriter {
   /// A writer for a client that announced `capabilities`, holding at most `most_open` nodes open at
   /// once (the caller's bound: the depth its drive reaches).
   pub fn new(capabilities: &ClientCapabilities, most_open: usize) -> Self {
-    let (version, compression) = if capabilities.accepts_svndiff2 {
-      (Version::Two, Compression::Lz4)
-    } else {
-      (Version::Zero, Compression::Stored)
-    };
+    let (version, compression) = encoding_of(capabilities);
     Self {
       version,
       compression,
@@ -278,6 +274,7 @@ impl EditorWriter {
       Call::ChangeProperty { name, value } => self.change_property(name, value, out),
       Call::ApplyTextDelta { base_md5 } => self.apply_text_delta(base_md5, out),
       Call::Window(window) => self.window(window, out),
+      Call::DeltaPiece { write, at, bytes } => self.delta_piece((write, at, bytes), out),
       Call::TextDeltaEnd => self.text_delta_end(out),
       Call::CloseFile { md5 } => self.close_file(&md5, out),
       Call::CloseDirectory => self.close_directory(out),
@@ -470,6 +467,39 @@ impl EditorWriter {
     Ok(())
   }
 
+  /// A piece of the open delta's svndiff stream, already encoded (A-751): a write's first piece
+  /// opens its `textdelta-chunk` and its string's head (the write's whole length), its last ends
+  /// them, so a write's pieces are the one chunk `svnserve` sends for it. The stream's header came
+  /// with the first window's first write.
+  fn delta_piece(
+    &mut self,
+    (write, at, bytes): (usize, usize, &[u8]),
+    out: &mut Vec<u8>,
+  ) -> Result<(), EditorRefused> {
+    let (Phase::Rooted, Some(file), Some(delta)) =
+      (self.phase, self.open.last(), self.delta.as_mut())
+    else {
+      return Err(EditorRefused::OutOfOrder);
+    };
+    let end = at.checked_add(bytes.len()).filter(|end| *end <= write);
+    if file.kind != NodeKind::File || end.is_none() {
+      return Err(EditorRefused::OutOfOrder);
+    }
+    if at == 0 {
+      out.extend_from_slice(TEXTDELTA_CHUNK);
+      string(file.token.as_bytes(), out)?;
+      let length = u64::try_from(write).map_err(|_| EditorRefused::OutOfOrder)?;
+      ra_svn::write_string_head(length, out);
+    }
+    out.extend_from_slice(bytes);
+    if end == Some(write) {
+      out.push(ra_svn::ITEM_END);
+      out.extend_from_slice(END_COMMAND);
+    }
+    delta.header_written = true;
+    Ok(())
+  }
+
   /// The end of the open delta: the stream's header if no window brought it, then `textdelta-end`.
   fn text_delta_end(&mut self, out: &mut Vec<u8>) -> Result<(), EditorRefused> {
     let (Phase::Rooted, Some(file), Some(delta)) = (self.phase, self.open.last(), &self.delta)
@@ -602,6 +632,16 @@ fn optional_revision(revision: Option<Revision>, out: &mut Vec<u8>) -> Result<()
   }
   out.extend_from_slice(END_LIST);
   Ok(())
+}
+
+/// The svndiff version and compression a client that announced `capabilities` is sent (module documentation, "The
+/// svndiff version"): the drive encodes its deltas in it (A-751) and this writer frames them.
+pub(crate) fn encoding_of(capabilities: &ClientCapabilities) -> (Version, Compression) {
+  if capabilities.accepts_svndiff2 {
+    (Version::Two, Compression::Lz4)
+  } else {
+    (Version::Zero, Compression::Stored)
+  }
 }
 
 /// Appends one `textdelta-chunk` of the file named `token`.

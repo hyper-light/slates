@@ -15013,6 +15013,10 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
 - **Why it lost.** The toys grew slower, not faster, so their wait was not the owner shard's CPU taken by the hot
   repository's steps. Rejected. The cause of the toys' p99 is to be found by profiling the R = 100 step (owed, A-724),
   not guessed.
+- **Replaced (2026-11-20).** The profile found the cause later: per-push turns (a repository with three pushes took
+  three turns a round). Yielding re-polled the waiting steps, so it lost; a turn held through the yield, the other
+  pushes parked and never polled, replaced it (3283dd758, `crate::vcs_share::turns`; "A shard's turns by repository"
+  below). The branch's other change, share's tolerance from Higham's bound, landed apart (9e9cfbd58). Branch deleted.
 - **Corrected (2026-11-20, a later run).** This section first said the daemon ended because waiting steps re-polled by
   yielding. A run of main itself (release from b8e4591, no fair turns, the same command at R = 100, load 10.0) ended the
   daemon the same way: the hot repository's 19 pushes 10 connections reset and 9 empty answers; the toys' p99 16.5 times
@@ -15049,7 +15053,11 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
 - **How it was found** (each step one run, R = 100, the 32-core Studio). The toys sent their whole request in 0.14 s at
   p99 and waited 4.48 s for the answer, so the wait was the server's. Per-repository lanes on a shard (at most one step
   of a repository at once, the rest parked in order; branch `agents/w-balance-lanes`, 1b8010400) measured dead even
-  (toys' p99 4.42 s and 4.57 s against 4.55 s) and were rejected. An all-small control showed the same factor with no
+  (toys' p99 4.42 s and 4.57 s against 4.55 s) and were rejected. They held the lane only inside a step, which runs in one poll, and gave
+  it back before the yield, so a sibling almost never found it held; 3283dd758 holds the turn through the yield and
+  replaced them (the section below). The branch's harness split (fc704f148, connect, send, answer) is on main in its
+  grown form, as are `agents/w-balance-load`'s two first drafts of the harness (1e84630b1, 7614bfe87; landed grown as
+  489398c9a and after). Branches deleted. An all-small control showed the same factor with no
   hot repository. The names' placement was even (one repository a partition at R = 10). Every shard thread ran at 35 to
   99 percent CPU during the burst (`ps -M`). The `kevent` frames that topped `sample`'s stacks are the runtime's
   zero-timeout polls before it parks, busy and not idle; an earlier reading of them as idle was wrong.
@@ -15134,3 +15142,50 @@ The commit is refused by one request's room (the listener's `Limits::item_bytes`
 §4.17.1's rule 2 refuses only past the shard's room; and below that room the commit's work holds every new text whole
 (`commit::drive::Work::texts`, by reading), where rule 1 bounds the working set whatever the text's size. Neither rule
 holds for Subversion's intake yet (GAPS).
+
+## A push's compose over a flat tree: the deriver's replay was quadratic in the head's files (A-752 part 1; main's order of 2026-11-20; 2026-11-20)
+
+w-git measured one command bringing 3,502 objects over a flat 3,500-file tree (debug): the work build 374-642 ms in
+one step. Most of it was `compose_volume_planned`'s replay, which looked each path up by scanning every entity (live
+entity, base length, consumed origin, unlinked base file): O(files^2). The replay now keeps an index (path -> live
+entity, origins, unlinked base files, base lengths): O(files log files). Same entities out; all merge tests pass.
+
+| flat head files (debug, Mac Studio) | compose before | compose after | build before | build after |
+|---|---|---|---|---|
+| 875   | 11.7 ms  | 6.9 ms  |  -     |  -     |
+| 1,750 | 37.7 ms  | 12.7 ms |  -     |  -     |
+| 3,500 | 129.4 ms | 28.1 ms | 149 ms | 50 ms  |
+| 7,000 | 457.7 ms | 57.9 ms | 502 ms | 102 ms |
+
+Still one step each: the build and the entry apply are sliced under the step quantum next (A-752 parts 2-3).
+
+## A shard's turns by repository: the small repositories' wait halved; what is left is where repositories sit (A-724 piece 3c; 2026-11-20)
+
+- **The change:** 3283dd758 (`crate::vcs_share::turns`): before each step of its answer a push takes its repository's
+  turn on the shard and keeps it through the yield after, the repository's other pushes parked in order, so each
+  repository with work takes one turn a round. Before it the shard was fair per push: on shard 7, r2's three pushes and
+  three one-push small repositories, each small push got about a tenth of the shard (2.45 s of r2's steps beside 0.24 s
+  of its own in a 2.67 s span; `on shard 7: r2 (3 pushes, ...)`, the harness's shard-mates line).
+- **The command:** `multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0 --steps 100
+  --per-repository-cap N`. adas-mac-studio.local-2, M3 Ultra, 32 cores, 23 shards. Before: main 3f4996b5f (runs 27
+  and 28); after: main 1e992537f (run 30: cap 3, cap 10, cap 3 again). Load 3 to 10 with three other agents' idle
+  daemons; one run each.
+
+| R = 100 | cap 3 before | cap 3 after (twice) | cap 10 before | cap 10 after |
+|---|---|---|---|---|
+| slowest one-push small repository's server span | 2.67 s | 1.45 s, 1.43 s | 5.66 s | 1.74 s |
+| small class p99 / fair share | 3.00 | 2.45, 2.00 | 4.39 | 2.09 |
+| medium class p99 / fair share | 1.08 | 2.32, 2.18 | 0.62 | 1.66 |
+| hot class (v1.5.0) p99 / fair share | 0.72 | 1.45, 1.45 | 0.67 | 1.53 |
+| the step's wall | 10.9 s | 20.1 s, 20.3 s | 31.6 s | 70.8 s |
+| daemon | alive | alive | alive | alive, 10 of 10 ok |
+
+- **What it says.** The small repositories' wait halves at cap 3 and falls by two thirds at cap 10: a repository's many
+  pushes no longer take a turn each. The medium and hot repositories, whose several pushes each took a turn before, now
+  share one, so their pushes take longer and the step's wall doubles: before they held more than the fair share (under
+  1), now they are above it. The fair share's ideal gives each repository a core of its own while there are cores
+  (`fair_share_ideal`, one shard a repository); the daemon places a repository on its owner's shard by its name, so
+  repositories with work share shards while others idle. The small repository on shard 7 now waits about one turn a
+  round for each repository with work beside it. What is left of every class's gap is where repositories sit, measured
+  next (the busiest repository's shard mates).
+
