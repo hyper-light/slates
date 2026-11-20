@@ -221,3 +221,40 @@ fn a_framed_sample_survives_a_full_frame_round_trip() {
   assert!(frame.header.flags.contains(Flags::END_OF_STREAM));
   assert_eq!(Sample::from_bytes(&frame.body).unwrap(), sample());
 }
+
+/// A-742. Do: for the frozen sample and variants of it (an absent fingerprint, no verdicts, a long name and many
+/// verdicts of every kind), and for byte vectors and nested options, compare `encoded_len` with the encoding. Expect:
+/// equal every time, and `to_bytes` to allocate exactly that (its capacity is the length: reserved once, never grown).
+#[test]
+fn encoded_len_is_the_encodings_length_and_to_bytes_reserves_it_once() {
+  let mut variants = vec![sample()];
+  let mut bare = sample();
+  bare.fingerprint = None;
+  bare.verdicts.clear();
+  variants.push(bare);
+  let mut long = sample();
+  long.name = "n".repeat(70_000);
+  long.verdicts = (0..1_000u32)
+    .map(|n| match n % 3 {
+      0 => Verdict::Apply,
+      1 => Verdict::Skip {
+        reason: "r".repeat(usize::try_from(n).unwrap()),
+      },
+      _ => Verdict::Conflict {
+        at: u64::from(n),
+        len: n,
+      },
+    })
+    .collect();
+  variants.push(long);
+  for value in &variants {
+    let bytes = value.to_bytes();
+    assert_eq!(value.encoded_len(), bytes.len());
+    assert_eq!(bytes.capacity(), bytes.len(), "reserved once, never grown");
+  }
+  let payload: Vec<u8> = (0..1_048_576u32).map(|n| n as u8).collect();
+  let nested: Option<Vec<Option<Vec<u8>>>> =
+    Some(vec![Some(payload.clone()), None, Some(Vec::new())]);
+  assert_eq!(payload.encoded_len(), payload.to_bytes().len());
+  assert_eq!(nested.encoded_len(), nested.to_bytes().len());
+}

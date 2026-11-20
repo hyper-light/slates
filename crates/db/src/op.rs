@@ -759,6 +759,14 @@ pub enum Op {
     /// The kept parts, by log and then position.
     parts: Vec<crate::catalog::StateLogRecord>,
   },
+  /// A repository's index cut moved one bit (A-724 piece 9, §4.17.5): `bits` is its record's `index_bits` one more or
+  /// one fewer than now, at most an id's 32 leading bits a range names. Appended.
+  RepositoryIndexCut {
+    /// The repository.
+    repository: RepositoryId,
+    /// The cut's bits after the change.
+    bits: u8,
+  },
 }
 
 impl Op {
@@ -800,6 +808,7 @@ impl Op {
       Op::ReviewClosed { .. } => "review_closed",
       Op::RepositoryAdvanced { .. } => "repository_advanced",
       Op::RepositoryPolicySet { .. } => "repository_policy_set",
+      Op::RepositoryIndexCut { .. } => "repository_index_cut",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",

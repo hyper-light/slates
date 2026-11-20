@@ -1365,6 +1365,15 @@ writers to the admitted volume must still be able to consume its remaining entit
 the invariant independently at every holder. Acceptance is observable competing-allocation,
 pressure, fragmentation, restart and open/close behavior, not assertions on quota fields.
 
+> **Status (2026-11-20, A-742: freed memory returns to the OS, never by allocator luck; main's ruling).** The `slates`
+> binary's global allocator maps every allocation of at least 64 pages directly and unmaps it when freed
+> (`slates_mem::large`); the rest are the system allocator's. Large temporaries are made fewer and once: `Wire::to_bytes`
+> reserves `Wire::encoded_len` (exact for every derived type), `Db::mutate_owned` moves an operation into its record,
+> `Checkpoint::into_encoded` writes in place into a buffer sized exactly, a chain entry reserves its bound. A
+> 1,000-revision Subversion import ends at 1,431 to 1,495 MB of footprint against 2,417 to 2,551 MB, at once and steady,
+> in the same time (BENCHMARKS.md). `slates status --json` prints each shard's `retained_bytes` and `retained_versions`,
+> and the control shard's `mem.large.*` give-back counters.
+
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
 **Data model.**
@@ -52574,7 +52583,8 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   transaction and made at the build's end from what it staged (BUILT 2026-11-20, `vcs_store::owed`), a whole map's
   release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
-  (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name; its copies and symbolic links owed); Mercurial's manifests by the
+  (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name, its symbolic links `svn:special`
+  files; its copies owed until a work makes one); Mercurial's manifests by the
   same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
@@ -54794,6 +54804,46 @@ Applied in the same change to:
   a join moving only the newcomer in and a departure only the leaver out; the healer adding before it removes; no owner
   event an input). Owed: the transport (a window shipped to a remote home's shard by identity, held there outside
   `ContentHold`), the healer's loop over held identities, and the successor's rebuild fetching from homes (w-shared).
+- **Piece 6's region half, its wire (2026-11-20, main's ruling: built as proposed).** `slates_cluster::homes`: the home
+  exchanges' own messages on their own stream (`HOME_STREAM`, 30), never `ContentHold`: `Put` (an identity and its
+  window), `Read`, `LetGo`, and the member's `Answer` (kept with the image generation it is durable from, its bytes, let
+  go, or refused by kind: not a home, misnamed, not held, no room, unanswered). The door's rule, `admits`: a member keeps
+  a window only if the configuration it knows ranks it among the window's homes and the bytes hash to the identity they
+  came under. A window's bytes are capped at the archive format's chunk cap before they are copied. Tests:
+  `homes::tests` (300 generated messages round-trip; every cut refused; flips never panic; exactly a window's two homes
+  of nine keep it, others refused `NotAHome`; other bytes under its name `Misnamed`; hostile lengths and kinds). Owed
+  (6c-2): the daemon serving the stream (the home shard's `keep_here`, the answer after its image is published), the
+  sender's batched calls and the healer's loop at each configuration change.
+- **Piece 6's region half, served (2026-11-20).** The record session dispatches `slates_cluster::homes::HOME_STREAM` to
+  `crate::vcs_store::homes::serve_remote`: a put kept only where the configuration this node knows (`fleet.members()`,
+  its quorum's f) ranks it among the window's homes and the bytes hash to their name, on the node's own home shard for
+  the window, and answered `Kept` only once that shard's image holding it is published (`published`, A-727's barrier);
+  reads and let-goes by identity. Until A-727 a3 calls the barrier's hooks no image holds the content store, so a put
+  from the region answers `Unanswered`, never a `Kept` the image could not back; a put so answered may have kept the
+  window, which the sender's let-go or the healer releases. Test: `vcs_store::homes::tests::a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_its_image_is_published`
+  (the barrier played by hand: no `Kept` before publication, `Kept` after, read back, let go, gone, misnamed refused).
+  Owed: the sender (batched puts to the homes `homes()` names) and the healer's loop at each configuration change.
+- **Piece 6's region half, the sender and the healer (2026-11-20; the transport done).** A home keeps one region hold
+  a window however often the region offers it (`keep_for_region`, `let_go_for_region`), so offers are idempotent. The
+  healer (`vcs_store::homes::heal_region`), called from the control shard's `follow_configuration` every period, begins
+  a pass only at a new configuration version (never on a write's path, §2 ban 10): it walks the windows this node holds
+  for the region, a turn a period within the round budget, offers each to its homes (`homes()`, a `Put` broadcast on
+  `HOME_STREAM` over the record sessions), and lets this node's hold go once `heal()` finds every home holding it and
+  this node not among them (add before remove), counted (`vcs_store.homes.heal_offered`, `heal_released`). Tests:
+  `vcs_store::homes::tests` 6 of 6 (region offers idempotent; a lone node's healer moves nothing; the region put
+  acknowledged only after its image) and `fleet::` 33 of 33. A region home answers `Kept` only once A-727 a3 drives its
+  image barrier, so until then the healer offers and keeps its own copy (no release without every home's `Kept`).
+- **Piece 9b, the cut in the record and look-ups routed by it (2026-11-20).** `RepositoryRecord::index_bits` (appended,
+  zero at creation, the whole index on the owner) moves one bit at a time by `Op::RepositoryIndexCut` (appended, `Op`
+  102), its guard refusing any other step or a cut past 32 bits `DbError::IndexCutStep { current }` (the wire's
+  `DatabaseRefusal::IndexCutStep`, 13); a partition's snapshot carries it. `crate::vcs_share::place::index_partition`
+  names the partition holding an object's index row from the record and the id alone (the owner's at a cut of zero,
+  else the range's by `range_partition`), and `index_cut_step` moves a cut one bit toward `bits_for` of the index's
+  bytes. Nothing moves a live cut yet: until a push's rows are routed to their ranges (with record v3, after A-727 a3),
+  a cut above zero would send look-ups to partitions holding no rows. Tests: `repository::tests::a_repositorys_index_cut_moves_one_bit_at_a_time_and_is_kept_by_its_snapshot`
+  and `place::tests::a_repositorys_index_rows_route_by_its_cut_and_the_cut_steps_one_bit_at_a_time`; slates-db `--lib`
+  180 of 180, `--test model` 26 of 26, both `wire_order` goldens; slates-server `repository:: takeover:: vcs_ssh::
+  vcs_http:: git_protect:: lfs:: vcs_policy:: vcs_share::` 236 of 236.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55412,6 +55462,107 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   t_a664_live_a_parked_submit_waits_at_most_its_bound` (parked once; none answered within an unbounded wait; answered
   overdue past a bound of none; the build's end runs nothing of it). `cargo test --locked -p slates-server --lib --
   vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities:: --test-threads=4` 153 of 153; fmt clean.
+
+### A-740 — A stuck shard's report names the task it was polling (2026-11-20, w-reaper, main's urgent piece; §4.3 tasks, §4.14 `daemon.alive`; A-228, A-232, A-318)
+
+- **Why.** The watchdog's spin line ("shard N is spinning: X ms of CPU without a step") and the anchor's kill line named
+  the shard alone, and three agents were guessing which task spun (hg's whole push at 194 s, svnrdump's replay-range, a
+  forming run's 5.7 s).
+- **Change.** `slates_rt::label`: every task carries a label, interned once into a process-wide table of write-once
+  cells (open addressing over FNV-1a; 4,096 cells; a full table reads "unlabelled", never refuses a spawn). A label is
+  the spawn site, taken by `#[track_caller]` at every spawn entry (`futures::spawn`, `spawn_child`, `spawn_alone`,
+  `SpawnRequest::new`/`with_receipt`, `Runtime::spawn_on`/`spawn_on_with_receipt`/`spawn`, `ShardContext::spawn_local`/
+  `spawn_alone`, the simulator's), so no site goes unlabelled; or the work a task names while it runs
+  (`futures::doing("hg_push::record")`, a guard that gives the old label back, only to the task it took it from). The
+  shard stores the label's index and the task's poll count in one pulse word before each poll (`Pulse::polling`), on the
+  line it already writes each step. The watchdog's wedged, spinning and end lines name it; before it withholds the beat it
+  records it in the anchor's segment (`SUP_STUCK_WRITTEN`…`SUP_STUCK_LABEL`, the writer's pid released last), and the
+  anchor's lapse kill line names it ("its watchdog found shard N stuck in task L, at its poll P"). Named steps now: hg
+  push's unbundle, record, rebase and take; svn's call answer and landing.
+- **Tests.** rt `label::tests` (an index kept, a word given back) and `tests/spin_label.rs` (read from another thread, a
+  spinning task's site label at its third poll, then its named step, then the site again); anchor
+  `a_recorded_stuck_task_is_read_by_the_anchor` (a long label cut at a character boundary); server liveness
+  `a_spinning_shard_stops_the_beat` now names its spin `liveness::spinner` and requires the segment's record to give
+  back that label, the shard and the pid. Red first: with the record not written the test fails ("the watchdog recorded
+  no stuck task"); green, the line reads "shard 1 is spinning: 3198 ms of CPU … in task liveness::spinner, at its
+  poll 1" (macOS arm64, Mac Studio 2).
+- **Applied in the same change to** the watchdog's module docs, amendments.tsv.
+
+### A-664 Subversion objects, symbolic links — A submitted symbolic link is a file of `link ` and its target whose list is `svn:special` (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Change.** `vcs_store::svn_made`: a symbolic link in the green is a file row whose text is `link ` and the target
+  and whose property list is `svn:special` set to `*` alone, in FSFS's form, brought with the revision, as a stock
+  client commits one and svnserve keeps it; a symbolic link with properties of its own, and a special file, stay
+  refused and counted. A copy's row with its source waits for a work that can make a copy (A-626 part 4): no work
+  operation makes one, so no submitted version holds one.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `repository::svn_commit::tests::
+  t_a664_svn_a_submitted_symbolic_link_is_a_special_file` (revision 1 adds `/trunk/l` as a file `link a.txt` with the
+  `svn:special` list, which the records hold). `cargo test --locked -p slates-server --lib -- repository::svn_commit::
+  vcs_svn vcs_store:: identities:: --test-threads=4` 102 of 102; fmt clean.
+
+
+
+### A-742 — Freed memory returns to the OS, never by allocator luck: large allocations mapped directly, large temporaries made fewer and once (2026-11-20, w-engine; main's ruling; §4.2, D-12; A-723, A-728)
+
+Applied in the same change to: `crates/mem` (`large.rs`, the global allocator, its counters; `unsafe-budget.toml` +16);
+`crates/cli` (`main.rs` installs it); `crates/wire` and `crates/wire-derive` (`Wire::encoded_len`, `encoded_len_slice`,
+`to_bytes` reserving it, generated for every struct and enum); `crates/db` (`Db::mutate_owned`); `crates/merge`
+(`Checkpoint::into_encoded` and its exact length, `Increment::encoded_len`, `chain_entry::encode` reserving its bound);
+`crates/server` (`repository::push::record_all` and `merge_service::checkpoint_green_when` give their operations up; the
+control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, `retained_versions` in the status JSON);
+§4.2's status; GAPS; BENCHMARKS.md.
+
+- **What held the memory.** A 1,000-revision import of git/git (223 MiB) left the daemon at 2.4 to 2.6 GB. `vmmap` named
+  about 896 MiB of it system-allocator regions holding no live allocation (`MALLOC_LARGE (empty)` 712.6 MiB, `MALLOC_REALLOC
+  (empty)` 135.9, `MALLOC_SMALL (empty)` 47.0). Every allocation and free of the import, read from `malloc_history
+  -allEvents` under full stack logging (a diagnostic build whose liveness window let the tool suspend the daemon), showed
+  4,188 MiB made and freed in 698 blocks of a MiB or more: register entries encoded by doubling, decoded back, cloned
+  into the log entry; checkpoints cloned, encoded by doubling, cloned again; chain entries and increments encoded twice;
+  one 179.7 MiB partition snapshot. The system allocator kept the freed blocks and gave them back on its own schedule
+  (in some runs a part five seconds later, in others none); `malloc_zone_pressure_relief` released 0 bytes.
+- **The rule.** An allocation of at least `FLOOR_PAGES` (64) pages whose alignment a page satisfies is a fresh anonymous
+  mapping and its free unmaps it: freed large memory returns to the OS when it is freed, by construction. The layout
+  decides the path, so an allocation and its free agree; a reallocation across the floor moves the block. The floor
+  bounds page rounding to one page in 64.
+- **Fewer, sized temporaries.** `Wire::encoded_len` is exact for the primitives and every derived type (a hand-written
+  encoder says 0, a hint only), and `to_bytes` reserves it: an encode is one allocation, never grown. `Db::mutate_owned`
+  moves an operation into its log entry or transaction instead of copying it; `mutate` copies and calls it. A
+  checkpoint given up is canonicalized in place and written into a buffer of its exact length; a chain entry reserves
+  its bound; a push sizes an entry by `Increment::encoded_len` instead of encoding the increment.
+- **Measured** (BENCHMARKS.md): footprint after the import 1,431 / 1,486 / 1,495 MB against 2,417 / 2,551 / 2,423 MB
+  (main de9591c70), unchanged five seconds later; the import 1.77 / 1.78 / 1.69 s against 1.74 / 1.83 / 1.73 s. The
+  allocator alone, before the temporaries were cut, ended at 1,562 to 1,645 MB but took the import to 2.04 to 2.87 s, every
+  large temporary then fresh zero-filled pages.
+- **Tests.** macOS arm64, Mac Studio, local: `slates-mem --lib large` (a block mapped, grown, moved below the floor and
+  returned; zeroed blocks on both paths); `slates-wire --test golden` (`encoded_len` is the encoding's length for every
+  sample, and `to_bytes` reserves it once), `--lib`, `--test compile_fail`; `slates-db --lib replay`, `--test model`;
+  `slates-merge --lib` 223, `--test engine` (an increment's `encoded_len`), `--test checkpoint` (a checkpoint given up
+  encodes the same bytes into a buffer of their exact length, over generated greens and the golden vector),
+  `chain_replay`; `slates-server --lib` `git_push::`, `vcs_store::svn_import`, `svn_commit`, `merge_service`,
+  `repository::push`, `--test green_retention`, `green_checkpoint`; `slates-mcp --test mcp` (each shard's retained bytes
+  and versions, retained within committed); fmt clean.
+- **Owed.** `Record::revision_bytes` (Subversion) and the register entry's decode-after-encode check still make
+  revision-sized temporaries; the svn commit still clones its entry parts for a retry at the chain's cap; an embedding
+  host must install the allocator itself; the anchor content object's 581 MiB is not yet split by range.
+
+### A-732's sibling for git and Subversion — A store made again from the log replays a record a turn, lent to nothing until it is whole (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** `vcs_store::rebuild` made a git or Subversion repository's store again in one step, every record replayed
+  and every map made at once; a large repository's rebuild held its shard past the watchdog's window, which
+  crash-looped the daemon when a recovery met it, as Mercurial's import did (A-732, whose part 3 sliced Mercurial's).
+- **Change.** `rebuild` of a git or Subversion repository (`rebuild_sliced`): the store freed and made empty, marked
+  rebuilding with a generation (`VcsStores::rebuild_turns`), and a task replays its records a record a turn
+  (`rebuild_turn`, a yield between); while it runs the store is lent to nothing (`VcsStores::git`, `git_ref`, `store`,
+  `subversion`, `subversion_records` answer none), and a rebuild started again ends the one before. At its end the store
+  is lent again and each git green's map is made again in slices by its build (`paths::whole_build::start_remade`,
+  counted `REMADE`), whose end makes any commit owed; submits to it are parked meanwhile. `rebuild_whole` stays for the
+  tests that read a store made at once.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::tests::
+  t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn` (red first: the store made whole at once and lent;
+  green: rebuilding and lent to nothing, its five records replayed one a turn, then lent again and its map made again).
+  The tests that make a store again drive its turns and builds to their end (`settle_rebuild`). `cargo test --locked -p
+  slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http:: vcs_ssh:: vcs_svn lfs:: work_home:: identities::
+  takeover:: --test-threads=4` 307 of 309, the two others failing alike without this change (`vcs_store::homes`' and
+  `vcs_http::daemon_edge`'s long history, each flaky alone, reported); fmt clean.
+- **Owed.** One git record (a large push's pack) is still one turn; a successor's rebuild (`make_whole`) is one step.
 
 ### A-741 — A SETXATTR's form is the request's own: one sized before INIT was answered is short on a connection that kept the extended form (bug, 2026-11-20, w-k90-vendor, kiln goal 90; found by use: kiln's macOS microVM g266 drive refused a run's every write `EACCES`, intermittently; amends A-378 and A-587; §4.6)
 - **Why.** Linux sizes a `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c`

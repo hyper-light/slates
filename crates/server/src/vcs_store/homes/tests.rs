@@ -1,7 +1,5 @@
 //! A-724 piece 5's tests (§4.17.5 "Giant repositories"): content homed by its identity across a node's shards.
 
-use std::time::Duration;
-
 use slates_db::register::rendezvous_ranked_by_key;
 use slates_vcs::ContentId;
 
@@ -10,9 +8,6 @@ use super::{HOMED, HomeRefused, LET_GO, home, home_of, let_go, read};
 /// Shape: the windows the spread test homes: enough that every one of four shards is some window's home with
 /// overwhelming probability (each misses all with probability (3/4)^64, about 1e-8).
 const WINDOWS: usize = 64;
-
-/// Shape: how long the test thread waits for the shards' answers: a liveness budget.
-const ANSWER_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 
 /// The `index`th test window: distinct bytes, well within a window.
 fn window(index: usize) -> Vec<u8> {
@@ -103,7 +98,7 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
     .unwrap();
     slates_rt::futures::detach(task).unwrap();
   });
-  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS));
+  let outcome = answered.recv();
   let homed: u64 = (0..4)
     .map(|partition| {
       crate::daemon::observe_at(&daemon, partition, |state| {
@@ -209,7 +204,7 @@ fn a_homed_windows_ticket_is_published_only_once_its_homes_image_is() {
     .unwrap();
     slates_rt::futures::detach(task).unwrap();
   });
-  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS));
+  let outcome = answered.recv();
   daemon.stop();
   let outcome = outcome.expect("the shards answered");
   assert!(outcome.is_empty(), "{outcome:#?}");
@@ -273,7 +268,7 @@ fn a_batch_of_windows_goes_to_each_home_in_one_call_a_shard() {
     .unwrap();
     slates_rt::futures::detach(task).unwrap();
   });
-  let outcome = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS));
+  let outcome = answered.recv();
   let calls: u64 = (0..4)
     .map(|partition| {
       crate::daemon::observe_at(&daemon, partition, |state| {
@@ -292,4 +287,221 @@ fn a_batch_of_windows_goes_to_each_home_in_one_call_a_shard() {
     calls < 259,
     "a batch made a call a window or more: {calls} calls"
   );
+}
+
+/// A-724 piece 6's region half (main's ruling: a home acknowledges only once its image holds the window). Do: on a
+/// two-shard daemon, the region's one member at f = 0 (so every window's home), serve a put from the region before the
+/// home shard has published the image that holds it, then while that image is published; read it back; let it go; read
+/// again; and put bytes under another name. Expect: no `Kept` before the image is published (`Unanswered` at the short
+/// wait); `Kept` with the ticket's generation once it is; the bytes read back; one `LetGo` freeing the region's one hold (two puts
+/// hold it once) and a second `NotHeld`; then the read `NotHeld`; and `Misnamed`.
+#[test]
+fn a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_its_image_is_published()
+ {
+  use super::{home_of, image_begun, image_published, serve_remote};
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
+  let daemon = crate::daemon::audit_daemon_of(2);
+  let (sent, answered) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let origin = state.shard;
+    let shards = state.shards.clone();
+    let task = slates_rt::futures::spawn(async move {
+      let budget = crate::daemon::LIVENESS_BUDGET_NS;
+      let short = budget / 50;
+      let mut outcome: Vec<String> = Vec::new();
+      let bytes = window(7);
+      let identity = ContentId::of(&bytes).0;
+      let home = home_of(&shards, &ContentId(identity)).unwrap();
+      let put = HomeMessage::Put {
+        identity,
+        bytes: bytes.clone(),
+      }
+      .encode();
+      let before = HomeMessage::decode(&serve_remote(origin, &put, short).await);
+      if !matches!(
+        before,
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Refused(HomeRefusal::Unanswered),
+          ..
+        })
+      ) {
+        outcome.push(format!(
+          "acknowledged before its image was published: {before:?}"
+        ));
+      }
+      // The home's barrier (A-727's, played here at a chosen step, no clock): the next image captures the content table
+      // and is published, before the put is served again.
+      let _ = crate::xshard::call_in_shard_time(
+        origin,
+        home,
+        move |_| {
+          image_begun(1);
+          image_published(2);
+        },
+        budget,
+      )
+      .await;
+      match HomeMessage::decode(&serve_remote(origin, &put, budget).await) {
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Kept { generation },
+          ..
+        }) if generation <= 2 => {}
+        other => outcome.push(format!("not kept once published: {other:?}")),
+      }
+      let read = HomeMessage::Read { identity }.encode();
+      match HomeMessage::decode(&serve_remote(origin, &read, budget).await) {
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Bytes(got),
+          ..
+        }) if got == bytes => {}
+        other => outcome.push(format!("not read back: {other:?}")),
+      }
+      // The region holds a window once however often it was put (the healer's offers are idempotent): one let-go
+      // frees it, and a second finds it no longer held for the region.
+      let answer = HomeMessage::decode(
+        &serve_remote(origin, &HomeMessage::LetGo { identity }.encode(), budget).await,
+      );
+      if !matches!(
+        answer,
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::LetGo,
+          ..
+        })
+      ) {
+        outcome.push(format!("not let go: {answer:?}"));
+      }
+      let again = HomeMessage::decode(
+        &serve_remote(origin, &HomeMessage::LetGo { identity }.encode(), budget).await,
+      );
+      if !matches!(
+        again,
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Refused(HomeRefusal::NotHeld),
+          ..
+        })
+      ) {
+        outcome.push(format!("a second region let-go found a hold: {again:?}"));
+      }
+      let gone = HomeMessage::decode(&serve_remote(origin, &read, budget).await);
+      if !matches!(
+        gone,
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Refused(HomeRefusal::NotHeld),
+          ..
+        })
+      ) {
+        outcome.push(format!("read after its last let-go: {gone:?}"));
+      }
+      let misnamed = HomeMessage::Put {
+        identity,
+        bytes: b"other bytes".to_vec(),
+      }
+      .encode();
+      let refused = HomeMessage::decode(&serve_remote(origin, &misnamed, budget).await);
+      if !matches!(
+        refused,
+        Ok(HomeMessage::Answer {
+          outcome: HomeOutcome::Refused(HomeRefusal::Misnamed),
+          ..
+        })
+      ) {
+        outcome.push(format!("misnamed bytes kept: {refused:?}"));
+      }
+      let _ = sent.send(outcome);
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let outcome = answered.recv();
+  daemon.stop();
+  let outcome = outcome.expect("the shards answered");
+  assert!(outcome.is_empty(), "{outcome:#?}");
+}
+
+/// A-724 piece 6's healer, on one node. Do: hold windows for the region on a two-shard daemon whose region is this node
+/// alone (f = 0), offering each twice, then run the healer's turn at the configuration. Expect: a region offer of a
+/// window held already adds no hold; the healer finds every window homed here, offers nothing and lets nothing go
+/// (laptop ≡ fleet: the same pass, nothing to move); one region let-go then frees each.
+#[test]
+fn the_healer_on_a_lone_node_moves_nothing_and_region_offers_are_idempotent() {
+  use super::{
+    HEAL_OFFERED, HEAL_RELEASED, heal_region, home_of, keep_for_region, let_go_for_region,
+  };
+  let daemon = crate::daemon::audit_daemon_of(2);
+  let (sent, answered) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let origin = state.shard;
+    let shards = state.shards.clone();
+    let task = slates_rt::futures::spawn(async move {
+      let budget = crate::daemon::LIVENESS_BUDGET_NS;
+      let mut outcome: Vec<String> = Vec::new();
+      for index in 0..8 {
+        let bytes = window(index);
+        let home = home_of(&shards, &ContentId::of(&bytes)).unwrap();
+        let kept = crate::xshard::call_in_shard_time(
+          origin,
+          home,
+          move |state| {
+            let first = keep_for_region(state, &bytes).is_ok();
+            let second = keep_for_region(state, &bytes).is_ok();
+            let identity = ContentId::of(&bytes);
+            let holders = state
+              .vcs_stores
+              .content
+              .as_ref()
+              .map_or(0, |content| content.holders(&identity));
+            (first && second, holders)
+          },
+          budget,
+        )
+        .await;
+        if kept != Some((true, 1)) {
+          outcome.push(format!(
+            "window {index}: region offers not idempotent: {kept:?}"
+          ));
+        }
+      }
+      heal_region(origin, &shards, crate::fleet::live_budget()).await;
+      let counted = crate::state::with_state(|state| {
+        (
+          state.refusals.get(HEAL_OFFERED).copied().unwrap_or(0),
+          state.refusals.get(HEAL_RELEASED).copied().unwrap_or(0),
+        )
+      });
+      if counted != Some((0, 0)) {
+        outcome.push(format!("a lone node's healer moved something: {counted:?}"));
+      }
+      for index in 0..8 {
+        let identity = ContentId::of(&window(index));
+        let home = home_of(&shards, &identity).unwrap();
+        let freed = crate::xshard::call_in_shard_time(
+          origin,
+          home,
+          move |state| {
+            let first = let_go_for_region(state, &identity).is_ok();
+            let gone = !state
+              .vcs_stores
+              .content
+              .as_ref()
+              .is_some_and(|content| content.contains(&identity));
+            (first, gone)
+          },
+          budget,
+        )
+        .await;
+        if freed != Some((true, true)) {
+          outcome.push(format!(
+            "window {index} not freed by one region let-go: {freed:?}"
+          ));
+        }
+      }
+      let _ = sent.send(outcome);
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let outcome = answered.recv();
+  daemon.stop();
+  let outcome = outcome.expect("the shards answered");
+  assert!(outcome.is_empty(), "{outcome:#?}");
 }

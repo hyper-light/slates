@@ -108,6 +108,9 @@ struct Build {
   /// Whether the green's map of `version` is kept already (a recovery made it again, and a commit is owed of it): the
   /// build then puts nothing and keeps nothing, and its end makes the owed commit alone.
   kept: bool,
+  /// Whether it makes a map again after a store was made again from the log (`super::super::rebuild`): counted
+  /// `paths::REMADE` at its end, as a recovery's remake is, not `paths::BUILT`.
+  remade: bool,
 }
 
 /// Whether `green`'s map is being built whole: a submit to it is parked ([`park`]).
@@ -155,9 +158,24 @@ pub(crate) fn start(
     parked,
     task,
     kept,
+    remade: false,
   };
   state.vcs_stores.whole_builds.0.insert(green, build);
   state.count(BEGUN, 1);
+}
+
+/// [`start`] for a map made again after `repository`'s store was made again from the log (`super::super::rebuild`):
+/// counted as a remake at its end.
+pub(crate) fn start_remade(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  green: DbVolumeId,
+  version: u64,
+) {
+  start(state, repository, green, version);
+  if let Some(build) = state.vcs_stores.whole_builds.0.get_mut(&green) {
+    build.remade = true;
+  }
 }
 
 /// The version of `green`'s map the store keeps, if any.
@@ -369,6 +387,7 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
     held,
     parked,
     kept,
+    remade,
     ..
   } = build;
   if !kept {
@@ -384,7 +403,7 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
     if !super::super::settle_in(&mut state.store, &mut state.vcs_stores) {
       state.count(super::super::CHARGE_SHORT, 1);
     }
-    count(state, answer, BUILT);
+    count(state, answer, if remade { super::REMADE } else { BUILT });
   }
   // The commit a submit owes of this version, made from what it staged, before the submits parked behind it run, so
   // each names it as its parent (A-664's live whole builds, part 2).

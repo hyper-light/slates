@@ -301,14 +301,20 @@ pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, d
   let op = Op::GreenCheckpointed {
     green,
     version: floor,
-    checkpoint: checkpoint.encode(),
+    checkpoint: checkpoint.into_encoded(),
   };
   let now = state.clock.monotonic_ns();
   let recorded = state
     .db
     .partition()
     .check(&op, now)
-    .and_then(|()| state.db.mutate(&mut state.segment, &op, now).map(|_| ()));
+    // Moved into the record, never copied: the checkpoint is the green's whole changed state (A-742).
+    .and_then(|()| {
+      state
+        .db
+        .mutate_owned(&mut state.segment, op, now)
+        .map(|_| ())
+    });
   match recorded {
     Ok(()) => state.count(CHECKPOINT_TAKEN, 1),
     Err(_) => state.count(CHECKPOINT_REFUSED, 1),

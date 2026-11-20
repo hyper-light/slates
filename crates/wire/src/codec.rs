@@ -36,9 +36,24 @@ pub trait Wire: Sized {
     Ok(values)
   }
 
-  /// The whole encoding as bytes.
+  /// The encoding's length in bytes, exactly, where the type knows it (the primitives here and every derived type), so
+  /// [`Wire::to_bytes`] reserves it once; zero for a type that does not say (a hand-written encoder), which is a hint
+  /// only (A-742: a 1,000-revision import grew 702 MiB of register entries by doubling, each step a copy).
+  fn encoded_len(&self) -> usize {
+    0
+  }
+
+  /// [`Wire::encoded_len`] of elements [`Wire::encode_slice`] writes.
+  fn encoded_len_slice(values: &[Self]) -> usize {
+    values
+      .iter()
+      .map(Wire::encoded_len)
+      .fold(0, usize::saturating_add)
+  }
+
+  /// The whole encoding as bytes, reserved once at [`Wire::encoded_len`].
   fn to_bytes(&self) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(self.encoded_len());
     self.encode(&mut out);
     out
   }
@@ -86,6 +101,9 @@ macro_rules! integer {
       fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_le_bytes());
       }
+      fn encoded_len(&self) -> usize {
+        std::mem::size_of::<$t>()
+      }
       fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
         let bytes = take(input, std::mem::size_of::<$t>())?;
         let mut word = [0u8; std::mem::size_of::<$t>()];
@@ -113,6 +131,12 @@ impl Wire for u8 {
     BYTE_ENCODINGS.set(BYTE_ENCODINGS.get() + 1);
     out.push(*self);
   }
+  fn encoded_len(&self) -> usize {
+    1
+  }
+  fn encoded_len_slice(values: &[Self]) -> usize {
+    values.len()
+  }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     #[cfg(test)]
     BYTE_DECODINGS.set(BYTE_DECODINGS.get() + 1);
@@ -135,6 +159,9 @@ impl Wire for bool {
   fn encode(&self, out: &mut Vec<u8>) {
     out.push(u8::from(*self));
   }
+  fn encoded_len(&self) -> usize {
+    1
+  }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     match u8::decode(input)? {
       0 => Ok(false),
@@ -156,6 +183,9 @@ impl Wire for f64 {
       *self
     };
     out.extend_from_slice(&canonical.to_bits().to_le_bytes());
+  }
+  fn encoded_len(&self) -> usize {
+    size_of::<u64>()
   }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     let bits = u64::decode(input)?;
@@ -181,6 +211,9 @@ impl Wire for String {
     len_prefix(self.len(), out);
     out.extend_from_slice(self.as_bytes());
   }
+  fn encoded_len(&self) -> usize {
+    size_of::<u32>().saturating_add(self.len())
+  }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     let len = take_len(input)?;
     let bytes = take(input, len)?;
@@ -196,6 +229,9 @@ impl<T: Wire> Wire for Vec<T> {
   fn encode(&self, out: &mut Vec<u8>) {
     len_prefix(self.len(), out);
     T::encode_slice(self, out);
+  }
+  fn encoded_len(&self) -> usize {
+    size_of::<u32>().saturating_add(T::encoded_len_slice(self))
   }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     let len = take_len(input)?;
@@ -219,6 +255,9 @@ impl<T: Wire> Wire for Option<T> {
         v.encode(out);
       }
     }
+  }
+  fn encoded_len(&self) -> usize {
+    1usize.saturating_add(self.as_ref().map_or(0, Wire::encoded_len))
   }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     match u8::decode(input)? {
@@ -256,6 +295,9 @@ impl<T: Wire> Wire for Box<T> {
   fn encode(&self, out: &mut Vec<u8>) {
     T::encode(self, out);
   }
+  fn encoded_len(&self) -> usize {
+    T::encoded_len(self)
+  }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     T::decode(input).map(Box::new)
   }
@@ -266,6 +308,9 @@ impl<const N: usize> Wire for [u8; N] {
   const SCHEMA_HASH: u64 = crate::schema::mix(crate::schema::fnv64("[u8;N]"), &[N as u64]);
   fn encode(&self, out: &mut Vec<u8>) {
     out.extend_from_slice(self);
+  }
+  fn encoded_len(&self) -> usize {
+    N
   }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     let bytes = take(input, N)?;

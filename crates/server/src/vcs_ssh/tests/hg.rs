@@ -432,6 +432,7 @@ impl StoreLender for NoGit {
 /// The Mercurial repository `id`, [`HOLDER`]'s, with no rules.
 fn record(id: RepositoryId, name: &str) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id,
     name: name.to_owned(),
     tool: VcsTool::Mercurial,

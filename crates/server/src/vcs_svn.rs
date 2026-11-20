@@ -163,6 +163,9 @@ const NANOS_PER_MICRO: i64 = 1_000;
 
 /// Counter: a lock verb's entries the owner's step refused, answered in each judged path's place.
 const LOCKS_REFUSED: &str = "vcs_svn.locks_refused";
+/// Counter: a conversation's turn begun in the same poll of its shard as the turn before it, no other task run between
+/// them ([`go_on`]): a bug signal, a long answer or pipelined commands holding the shard (the git/git `svnrdump` spin).
+pub(crate) const TURNS_UNYIELDED: &str = "vcs_svn.turns_unyielded";
 
 /// Counter: a lock verb whose new token the system's generator could not draw: its landing refused.
 const TOKEN_UNDRAWN: &str = "vcs_svn.token_undrawn";
@@ -754,8 +757,23 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
 /// ([`migrate`]), its seat here given back as it leaves.
 async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
   let mut out = Vec::new();
+  let mut last_poll = None;
   loop {
-    match step(&stream, &mut conversation, &mut out, &seat).await {
+    // The shard's polls so far: unchanged since the last turn began, this turn follows it with nothing run between.
+    let poll = futures::polls_so_far();
+    if poll.is_some() && poll == last_poll {
+      let _ = crate::state::with_state(|state| state.count(TURNS_UNYIELDED, 1));
+    }
+    last_poll = poll;
+    let went = step(&stream, &mut conversation, &mut out, &seat).await;
+    // A turn that never waited yields before the next: a long answer (a replay-range over a whole history, a checkout)
+    // or commands pipelined in one read are many turns with no wait between, and a client that drains the socket as
+    // fast as it is written never makes a write wait either, so without the yield the shard never steps (git/git's
+    // last 2,000 commits through `svnrdump dump`: "shard 0 is spinning: 3596 ms" after 53 MB).
+    if matches!(went, Stepped::Go) && futures::polls_so_far() == poll {
+      futures::yield_now().await;
+    }
+    match went {
       Stepped::Go => {}
       Stepped::End => return,
       Stepped::Elsewhere(found, located) => {
@@ -780,7 +798,11 @@ async fn step(
   seat: &Seat,
 ) -> Stepped {
   out.clear();
-  let next = answer(conversation, out);
+  let next = {
+    // A-740: a shard stuck answering a call (a replay, a log, an update's drive) names it.
+    let _doing = slates_rt::futures::doing("vcs_svn::answer");
+    answer(conversation, out)
+  };
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
@@ -834,6 +856,7 @@ async fn follow(
     }
     Next::Accepted { work, consumed } => {
       consume(conversation, consumed);
+      let _doing = slates_rt::futures::doing("vcs_svn::land");
       land(stream, conversation, *work, out).await
     }
   };
