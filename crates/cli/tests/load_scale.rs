@@ -31,12 +31,12 @@
 )]
 #![cfg(unix)]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Shape: how long each fleet phase gets (to answer, to form, to serve a forwarded verb): the three-node CLI flow's
-/// 40 s a phase, doubled for five or more nodes booting on one machine.
-const FLEET_WAIT: Duration = Duration::from_secs(80);
 /// Shape: the pause between polls.
 const POLL_MS: u64 = 50;
 /// Shape: the fleet's TLS name, carried by every certificate the test mints.
@@ -103,17 +103,18 @@ fn pause() {
   std::thread::sleep(Duration::from_millis(POLL_MS));
 }
 
-/// Retries `verb` until it succeeds or the phase's wait is spent: its stdout.
+/// Retries `verb` until it succeeds, while `instance`'s processes progress ([`process_wait::InstanceWait`]; until
+/// 2026-11-20 within the phase's wait, `FLEET_WAIT`, 80 s of the wall): its stdout.
 fn eventually(instance: &str, args: &[&str]) -> String {
-  let started = Instant::now();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, out, err) = run(instance, args);
     if code == 0 {
       return out;
     }
-    assert!(
-      started.elapsed() < FLEET_WAIT,
-      "slates {args:?} at {instance} never answered: {code} {out}{err}"
+    progress.check(
+      instance,
+      &format!("slates {args:?} answered (last: {code} {out}{err})"),
     );
     pause();
   }
@@ -231,7 +232,8 @@ fn anchor(instance: &str, manifest: &str, node: &str) -> Anchor {
 
 /// The pid of `anchor`'s daemon (its one child), once it has one.
 fn daemon_pid(anchor: &Anchor) -> u32 {
-  let started = Instant::now();
+  // While the anchor's tree gains CPU (until 2026-11-20 within the phase's wait).
+  let mut judged = process_wait::Judged::of(anchor.child.id());
   loop {
     let children = Command::new("pgrep")
       .args(["-P", &anchor.child.id().to_string()])
@@ -243,10 +245,7 @@ fn daemon_pid(anchor: &Anchor) -> u32 {
     {
       return pid.parse().unwrap();
     }
-    assert!(
-      started.elapsed() < FLEET_WAIT,
-      "the anchor never started its daemon"
-    );
+    judged.look("the anchor started its daemon");
     pause();
   }
 }

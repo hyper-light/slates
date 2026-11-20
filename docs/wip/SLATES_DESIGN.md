@@ -14654,7 +14654,12 @@ markers and topics, which git has no counterpart for, are decided here.
    closed heads.
 2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. The owner's branch
    verbs name it as Mercurial does (`topic`), spelled `bookmark:topic:` in the namespace; a line's or bookmark's
-   namespace spelling passes as it is (A-575, `hg_push::owner_name`). A bookmark moves only
+   namespace spelling passes as it is (A-575, `hg_push::owner_name`). The name a branch is made *from* is resolved as
+   Mercurial resolves a name (main's ruling of 2026-11-20; 7.2's `revsymbol`): a revision number or node, then a
+   bookmark, a global tag (the `.hgtags` of the view's heads, folded as 7.2 folds them), then a branch's tip-most open
+   head, so `--from default` is the line heading `default`'s tip; the branch is made from the green that heads that
+   changeset (the bookmark named, else the line, else another bookmark). A changeset no green heads (a tag inside a
+   line's history) is refused `Unsupported` until a branch can be made at a changeset below a head. A bookmark moves only
    when a push names it (the `bookmarks` part or a `bookmarks` pushkey), and every move is a compare and swap on the old
    value the client sent (a pushkey "should succeed iff value was old" [C: `pushkey.py`]; `check:bookmarks` [B:
    `internals.bundle2`]), so the head operation decides it as it decides a git ref. A deletion retires the green.
@@ -56035,8 +56040,31 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   hook_driver, vcs_hooks 227 of 228, the one failure `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_
   lands_a_stock_commit` ("The commit's texts were not made durable: Unanswered"), which fails alike on main 359da238
   without this change.
-- **Owed.** P3's presenter (the view a hook runs in, under the root mount, once the vfs's referenced file is agreed with
-  w-perf, main's ruling 2), P4, the root mount's publication (A-645 (a)).
+- **Part 3, its third piece (2026-11-20, main's ruling 2): a read-only file of content-store references, the vfs side.**
+  `slates_vfs::referenced`: a file kind (`Body::Referenced`) whose content is an ordered list of pieces, each a whole
+  content-store object by identity and length (`Piece::Content`) or a few bytes the presenter made (`Piece::Made`: an
+  FSFS header, an entry list, a trailer); its length is the pieces' sum, set at creation, so a stat reads nothing. A
+  read (`Volume::read_referenced`) takes the store's run at each offset through a seam (`ReferencedContent::run_at`) and
+  copies it into the caller's buffer, so no object is assembled; the plain read, lent no store, serves made bytes and
+  refuses content `ReferenceUnresolved` (EIO), never zeros. `Volume::create_referenced` holds every identity through a
+  second seam (`ReferencedHolds`, so a read borrows the store shared) before the file exists, and the volume's ledger
+  keeps the holds until `Volume::release_references`; a destroy or a clone before that is refused `ReferencesHeld`
+  (EBUSY), and a refused hold or create gives back what it took. Every write, truncate, allocation and edit is refused
+  `EROFS`. A recovery image carries the pieces (`BodyImage::Referenced`, appended), and a recovered volume owes its holds
+  to its successor's store (`Volume::hold_owed_references`). The non-vacuity counters `ReferencedCounts` (`bytes_read`,
+  `bytes_copied`, a run the store copied rather than lent) hold a view of 64 texts read whole at zero bytes copied and
+  its whole length read, and the same view over a store that only copies at every content byte. The server's seam
+  (`vcs_store::referenced`, `Lent` and `Holding`) reads through `ContentStore::window_at`, which resolves the identity
+  (9010c5630), and holds and releases through `hold` and `release`. The store keeps no object's length, so the length
+  is the record's; the seam refuses one the store can tell is wrong (a one-window object's other length, a tree's of
+  one window or less). Deviation from the proposal to w-perf, which w-perf reviews and amends: the holds belong to the
+  volume, not the inode, since an inode is copied on write and kept by snapshots, and a piece shows a whole object,
+  since a prefix's length would find another tree. Red first: the tests did not compile against main 051bf8f4, where the
+  API did not exist. macOS arm64, merged main 051bf8f4: `slates-vfs --test referenced` 6 of 6, `--lib`, `--test recover`,
+  `--test image`, `--test special` 167 of 167; `slates-server --lib vcs_store::referenced` 2 of 2; `slates-api --lib
+  volume_core` 3 of 3.
+- **Owed.** P3's presenter (the view a hook runs in, under the root mount, made of referenced files), P4, the root mount's
+  publication (A-645 (a)), and the presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -56930,3 +56958,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
 - Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read; red before) and
   `a_stored_text_is_read_a_store_window_a_step`.
 - **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.
+
+### A-763 — A live write ships the bytes it changed (2026-11-20, w-forming; main's order, item 1; found by use: 32 KiB NFS writes to a 3 MiB live file shipped about 245 KB of delta each, 54 MB over 221 appends; §4.10 "Live shipping"; A-126, A-200)
+
+- **Cause.** A live delta's content runs (`live_ship::content_runs`) carried every extent of each patched file's image,
+  and a patch's image carries every extent in the windows its writes touched (A-126's `Dirty::windows`, the write's
+  window and the open extent's): a page written into a 3 MiB file shipped about 313 KB.
+- **The change.** The volume keeps the byte ranges each publication's writes changed (`Dirty::writes`, from the old end
+  of the file when a write grows it, since the zeros it opens are new; cleared into `Dirty::published_writes` at
+  `mark_published`, read through `Volume::published_writes`); a patched file's runs are those ranges clipped to its
+  extents (`clipped_to_writes`), a file changed otherwise ships its extents as before. A successor's rebuild overlays
+  the runs by byte range per inode (`overlay_run`: the later bytes over the earlier, the rest kept) and reads each
+  extent from them (`run_bytes`, refused where a byte is missing, as before), so a window's unwritten bytes come from the
+  entries before it. The delta record's format is unchanged.
+- **Tests.** `slates-cli` live_fleet `a_live_write_ships_the_bytes_it_changed_not_its_window` (64 page writes spread over
+  a 3 MiB live file, the delta bytes held within the bytes written and a page a publication): red before (20,063,216
+  bytes shipped for 262,144 written in 64 appends), 309,760 after (bytes, not time: the same in a release build).
+  `live_ship::tests::overlaid_runs_read_back_the_latest_bytes_and_refuse_a_gap` (a byte-array oracle) and
+  `a_patched_files_spans_are_clipped_to_its_writes`; the takeover flows that serve written volumes from a successor's
+  rebuild (live_fleet's warm-restart, no-copy and stopped-successor takeovers; the live_chaos fresh-member flow).

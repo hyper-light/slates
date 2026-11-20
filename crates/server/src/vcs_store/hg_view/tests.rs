@@ -299,3 +299,101 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
     assert_eq!(body, whole.body);
   });
 }
+
+/// A-575 (main's ruling of 2026-11-20: `--from` follows Mercurial's own name lookup, a bookmark, then a tag, then a
+/// branch). Do: push a changeset to a Mercurial repository and branch `mark` from `default` at it; push two more, the
+/// second adding `.hgtags` with `v1` at the first changeset and `mid` at the second; then branch from `default`, from
+/// `tip`, from `v1`, from `mid` and from `nope`. Expect `default` and `tip` the line's head (the third changeset), as
+/// Mercurial resolves a branch's name to its tip-most head; `v1` the first changeset, made from `mark`, the bookmark that
+/// heads it; `mid` refused `Unsupported`, since no line or bookmark heads it; and `nope` `NotFound`.
+#[test]
+fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
+  use slates_ipc::protocol::Refusal;
+  crate::daemon::audit_on_shard(|state| {
+    let hg = created(state, "hg", VcsTool::Mercurial);
+    let first = crate::repository::hg_push::tests::history_of(&[
+      ("base", "a", b"a\n", None, "default"),
+      ("second", "b", b"b\n", Some(0), "default"),
+    ]);
+    let tags = format!(
+      "{} v1\n{} mid\n",
+      crate::verbs::hex_of(&first[0].node),
+      crate::verbs::hex_of(&first[1].node)
+    );
+    let tags: &'static [u8] = Box::leak(tags.into_bytes().into_boxed_slice());
+    let made = crate::repository::hg_push::tests::history_of(&[
+      ("base", "a", b"a\n", None, "default"),
+      ("second", "b", b"b\n", Some(0), "default"),
+      ("Added tags", ".hgtags", tags, Some(1), "default"),
+    ]);
+    let branch = |state: &mut ShardState, name: &str, from: &str| {
+      dispatch(
+        state,
+        1,
+        &owner(),
+        RequestBody::CreateBranch {
+          repository: "hg".to_owned(),
+          name: name.to_owned(),
+          from: from.to_owned(),
+          version: None,
+        },
+      )
+    };
+    pushed(state, hg, &made, &[0]);
+    let mark = branch(state, "mark", "default");
+    assert!(matches!(mark, ReplyBody::GreenCreated { .. }), "{mark:?}");
+    pushed(state, hg, &made, &[1, 2]);
+    let replies: Vec<ReplyBody> = [
+      ("from-default", "default"),
+      ("from-tip", "tip"),
+      ("from-v1", "v1"),
+    ]
+    .iter()
+    .map(|(name, from)| branch(state, name, from))
+    .collect();
+    assert!(
+      replies
+        .iter()
+        .all(|reply| matches!(reply, ReplyBody::GreenCreated { .. })),
+      "{replies:?}"
+    );
+    let marks = bookmarks_of(state, hg);
+    let at = |name: &[u8]| {
+      marks
+        .iter()
+        .find(|(held, _)| held.as_slice() == name)
+        .map(|(_, node)| *node)
+    };
+    assert_eq!(
+      (
+        at(b"mark"),
+        at(b"from-default"),
+        at(b"from-tip"),
+        at(b"from-v1")
+      ),
+      (
+        Some(made[0].node),
+        Some(made[2].node),
+        Some(made[2].node),
+        Some(made[0].node)
+      ),
+      "{marks:?}"
+    );
+    let mid = branch(state, "from-mid", "mid");
+    assert!(
+      matches!(
+        &mid,
+        ReplyBody::Refused {
+          refusal: Refusal::Unsupported { .. }
+        }
+      ),
+      "{mid:?}"
+    );
+    assert_eq!(
+      branch(state, "from-nope", "nope"),
+      ReplyBody::Refused {
+        refusal: Refusal::NotFound
+      }
+    );
+  });
+}
