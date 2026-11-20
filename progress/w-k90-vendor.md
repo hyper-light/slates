@@ -55,3 +55,11 @@ Feedback: tool installs on Ada's machines (even user-scoped Python on jupiter) n
    5a294413c..81174ac49. Drive: 3/3 first-run failures before, 6/6 passes after (same pin, same bridge sources).
    Note: claimed A-737 then A-740 by mistake (both taken); A-741 is mine (registry fixed by a remote union rewrite).
 Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word about WinFsp on jupiter (target kept there).
+8. Goal "slates_e2e bare_metal tests run on Windows too": LANDED kiln main 4aabdba18..7e542f29c (1d0657923, a321a8189 +
+   merge). bare_metal was already any(unix, windows) (b7720ebca) and skips loudly without WinFsp ("cannot mount here:
+   WinFsp is not installed ... install WinFsp from winfsp.dev"; SLATES_E2E=1 makes it a failure, by design). Ported:
+   stand_in (4 tests, no mount) off cfg(unix), its Python via vm_e2e::stub_python on Windows; the stand-in itself used
+   os.uname (Unix-only) for its WHERE line -> platform.system, which the bare-metal drive's Windows run also needed.
+   jupiter (kiln 81174ac49 + branch): stand_in 4/4 (4 failed before, AttributeError), bare_metal 2 skipped loudly;
+   macOS stand_in 4/4. Once WinFsp is installed on jupiter: SLATES_E2E=1 slates_e2e bare_metal:: (Python Launcher on
+   PATH), no code change; target C:\Users\corph\.cache\w-k90-vendor-target kept.
