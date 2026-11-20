@@ -13567,6 +13567,16 @@ cooperative slices (§4.3).
    answer's path (each D(k) was computed at admission). A fetch that comes before a fragment exists sends those objects
    from the compressed forms the push brought them in.
 
+> **Status (2026-11-20, A-718: item 8's fragments, encoded before a fetch's answer).** No step encoded a pushed version,
+> so every clone searched every object for deltas again: on the Mac Studio a clone of git/git cut at v1.0.0 took 2.816 s
+> against `git daemon`'s 0.300 s, about 72% of the daemon's CPU in `deltas::Search::step` (BENCHMARKS.md). Now a fetch's
+> request, before its answer is made, encodes each version whose fragments are not kept (`Repository::first_unencoded`)
+> a turn at a time under the shard's quantum, yielding between turns, and keeps them as content charged to the shard
+> (`crates/server/src/vcs_store/git_encode.rs`); the answer copies them. A version is encoded once, by the first fetch
+> after its push; one encoding a repository at a time, kept in the map between turns. Owed: the encoding from the push's
+> own intake (git's pack reuse, w-git's streaming intake), the base pack's rebuild, kept fragments across a recovery, and
+> the parts' bytes held between turns charged.
+
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
 create or update a reference named "refs/for/master", but may create or update a pull request" [B: config
