@@ -15238,6 +15238,25 @@ blocks as the sink, the increment setting the path from the held identity, the r
   made again whole by the commit (A-722 part 4e moves it into the judge's turns).
 
 
+## A push's work built over turns: the build no longer one step (A-752 part 2; main's order of 2026-11-20; 2026-11-20)
+
+- **Machine, build, command:** Mac Studio (M-series), debug, `cargo test -p slates-server --lib t_a752` on the audit
+  daemon (its step quantum about 3 us, so a turn's budget about 1.5 to 2.6 us): a flat 1,500-file tree created, then a
+  commit changing every file, each pushed by a task on the shard a step at a time.
+- **Before** (main ca204fc87, part 1 only): the work built inside the verdict's one step; w-git's 3,500-file measure
+  374 to 642 ms in that step.
+- **After:**
+
+| push (1,500 files, debug) | build turns | past budget | longest build turn | longest unit | longest opening |
+|---|---|---|---|---|---|
+| create | 158,681 | 0 | 1.13 ms | 1.12 ms (a tree's listing) | 0.43 ms |
+| update | 163,182 | 0 | 1.13 ms | 1.12 ms | 0.43 ms |
+
+  The update's longest step of its whole answer is 92 ms, the create's 37 ms: outside the build turns (the entry apply,
+  part 3, is the one left in one step).
+- **Cost:** the paced build (async deriver, merge sort, indexed base) builds a 3,500-file push in 85 ms where the
+  one-call form took 66 ms (merge-level probe of the whole build, debug, unbounded pace).
+
 ## Mercurial's own repository imported: the record 7.8 times smaller in three steps, the landing still one step (A-727, A-732, S5; UI goal 93; 2026-11-20)
 
 - **Machine:** Mac Studio `adas-mac-studio.local-2` (32 cores, 96 GiB), 2026-11-20 04:26 to 07:57 UTC, shared (other

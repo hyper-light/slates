@@ -21,6 +21,7 @@
 //! there, and a `Link` names a record. Until version 3 a link named a path, which the engine read at the head, so a
 //! link followed whatever stood at its target's path; the node a work saw is the one it linked to.
 
+use crate::pace::Ticks;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -205,10 +206,11 @@ impl PathTable {
   /// Sorts the paths and returns, for each old index, its new index (so the ops can be
   /// remapped). Called by [`OpsDoc::canonicalize`]. The index map holds the paths in the canonical order already, so the
   /// sort is one pass over it, each path moved, none copied.
-  fn sort_and_remap(&mut self) -> Vec<u64> {
+  async fn sort_and_remap(&mut self, pace: &Ticks) -> Vec<u64> {
     let mut old_paths = std::mem::take(&mut self.paths);
     let mut remap = vec![u64::MAX; old_paths.len()];
     for (rank, index) in (0u64..).zip(self.index.values_mut()) {
+      pace.tick().await;
       let old = usize::try_from(*index).unwrap_or(usize::MAX);
       if let Some(slot) = remap.get_mut(old) {
         *slot = rank;
@@ -317,12 +319,13 @@ impl NodeTable {
   /// Moves each node's path through `paths` (the path table's remap), puts the table in canonical order, and returns,
   /// for each old index, its new index (so the links can be remapped). A path the remap does not know becomes
   /// `u64::MAX`, which names none.
-  fn sort_and_remap(&mut self, paths: &[u64]) -> Vec<u64> {
+  async fn sort_and_remap(&mut self, paths: &[u64], pace: &Ticks) -> Vec<u64> {
     let old = std::mem::take(&mut self.nodes);
     self.index.clear();
     let mut remap = vec![u64::MAX; old.len()];
     let mut by_node: BTreeMap<NodeRef, Vec<usize>> = BTreeMap::new();
     for (position, node) in old.iter().enumerate() {
+      pace.tick().await;
       let path = usize::try_from(node.path)
         .ok()
         .and_then(|index| paths.get(index))
@@ -337,6 +340,7 @@ impl NodeTable {
         .push(position);
     }
     for (node, positions) in by_node {
+      pace.tick().await;
       let rank = self.intern(node);
       for position in positions {
         if let Some(slot) = remap.get_mut(position) {
@@ -345,6 +349,32 @@ impl NodeTable {
       }
     }
     remap
+  }
+}
+
+/// `op`'s path indices moved through `paths` (the path table's remap) and its node index through `nodes`; one the
+/// remap does not know becomes `u64::MAX`, which names none.
+fn remap_op(op: &mut Op, paths: &[u64], nodes: &[u64]) {
+  let moved = |index: u64, through: &[u64]| {
+    usize::try_from(index)
+      .ok()
+      .and_then(|index| through.get(index))
+      .map_or(u64::MAX, |index| *index)
+  };
+  if matches!(op.kind, OpKind::Rename | OpKind::Symlink | OpKind::Copy) {
+    op.src = moved(op.src, paths);
+  }
+  if op.kind == OpKind::Link {
+    op.src = moved(op.src, nodes);
+  }
+  if matches!(op.kind, OpKind::SetXattr | OpKind::RemoveXattr) {
+    op.at = moved(op.at, paths);
+  }
+  if let Some(new) = usize::try_from(op.path)
+    .ok()
+    .and_then(|index| paths.get(index))
+  {
+    op.path = *new;
   }
 }
 
@@ -380,40 +410,26 @@ impl OpsDoc {
   /// Puts the operations into canonical order: by path index, then offset, then kind. Called
   /// before encoding so the identity is independent of the order operations were added.
   pub fn canonicalize(&mut self) {
-    let remap = self.paths.sort_and_remap();
-    let nodes = self.nodes.sort_and_remap(&remap);
+    crate::pace::finish(self.canonicalize_paced(&Ticks));
+  }
+
+  /// [`OpsDoc::canonicalize`] a unit at a time under `pace` (A-752): a path, a node or an operation a unit, the
+  /// operations' sort a paced merge sort.
+  pub(crate) async fn canonicalize_paced(&mut self, pace: &Ticks) {
+    let remap = self.paths.sort_and_remap(pace).await;
+    let nodes = self.nodes.sort_and_remap(&remap, pace).await;
     for op in &mut self.ops {
-      if matches!(op.kind, OpKind::Rename | OpKind::Symlink | OpKind::Copy) {
-        op.src = usize::try_from(op.src)
-          .ok()
-          .and_then(|index| remap.get(index))
-          .map_or(u64::MAX, |index| *index);
-      }
-      if op.kind == OpKind::Link {
-        op.src = usize::try_from(op.src)
-          .ok()
-          .and_then(|index| nodes.get(index))
-          .map_or(u64::MAX, |index| *index);
-      }
-      if matches!(op.kind, OpKind::SetXattr | OpKind::RemoveXattr) {
-        op.at = usize::try_from(op.at)
-          .ok()
-          .and_then(|index| remap.get(index))
-          .map_or(u64::MAX, |index| *index);
-      }
-      if let Some(new) = usize::try_from(op.path)
-        .ok()
-        .and_then(|index| remap.get(index))
-      {
-        op.path = *new;
-      }
+      pace.tick().await;
+      remap_op(op, &remap, &nodes);
     }
-    self.ops.sort_by(|a, b| {
+    let ops = std::mem::take(&mut self.ops);
+    self.ops = crate::pace::sort_by(ops, pace, |a, b| {
       a.path
         .cmp(&b.path)
         .then(a.at.cmp(&b.at))
         .then(a.kind.to_wire().cmp(&b.kind.to_wire()))
-    });
+    })
+    .await;
   }
 
   /// The canonical byte encoding: the header (magic and version, `u32` each; path, node and op counts, `u64` each), then
@@ -423,32 +439,48 @@ impl OpsDoc {
   /// conversion to 64 bits cannot fail on the targets slates builds for.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&MAGIC.to_le_bytes());
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    for count in [
-      self.paths.paths().len(),
-      self.nodes.nodes().len(),
-      self.ops.len(),
-    ] {
-      out.extend_from_slice(&u64::try_from(count).unwrap_or(u64::MAX).to_le_bytes());
-    }
-    for path in self.paths.paths() {
-      out.extend_from_slice(&u32::try_from(path.len()).unwrap_or(u32::MAX).to_le_bytes());
-      out.extend_from_slice(path.as_bytes());
-    }
-    for node in self.nodes.nodes() {
-      out.push(node.origin.to_wire());
-      out.extend_from_slice(&node.path.to_le_bytes());
-    }
-    for op in &self.ops {
-      out.push(op.kind.to_wire());
-      out.push(op.flags);
-      out.extend_from_slice(&op.path.to_le_bytes());
-      out.extend_from_slice(&op.at.to_le_bytes());
-      out.extend_from_slice(&op.len.to_le_bytes());
-      out.extend_from_slice(&op.src.to_le_bytes());
+    let mut piece = 0usize;
+    while self.encode_piece(piece, &mut out) {
+      piece = piece.saturating_add(1);
     }
     out
+  }
+
+  /// The `piece`th piece of [`OpsDoc::encode`]'s bytes appended to `out` (A-752: an identity hashed a piece a unit):
+  /// the header first, then a path, a node or an operation a piece, in the encoding's order; `false`, nothing appended,
+  /// past the last. The pieces in order are the encoding.
+  pub fn encode_piece(&self, piece: usize, out: &mut Vec<u8>) -> bool {
+    let (paths, nodes, ops) = (self.paths.paths(), self.nodes.nodes(), &self.ops);
+    let Some(index) = piece.checked_sub(1) else {
+      out.extend_from_slice(&MAGIC.to_le_bytes());
+      out.extend_from_slice(&VERSION.to_le_bytes());
+      for count in [paths.len(), nodes.len(), ops.len()] {
+        out.extend_from_slice(&u64::try_from(count).unwrap_or(u64::MAX).to_le_bytes());
+      }
+      return true;
+    };
+    if let Some(path) = paths.get(index) {
+      out.extend_from_slice(&u32::try_from(path.len()).unwrap_or(u32::MAX).to_le_bytes());
+      out.extend_from_slice(path.as_bytes());
+      return true;
+    }
+    let index = index.saturating_sub(paths.len());
+    if let Some(node) = nodes.get(index) {
+      out.push(node.origin.to_wire());
+      out.extend_from_slice(&node.path.to_le_bytes());
+      return true;
+    }
+    let index = index.saturating_sub(nodes.len());
+    let Some(op) = ops.get(index) else {
+      return false;
+    };
+    out.push(op.kind.to_wire());
+    out.push(op.flags);
+    out.extend_from_slice(&op.path.to_le_bytes());
+    out.extend_from_slice(&op.at.to_le_bytes());
+    out.extend_from_slice(&op.len.to_le_bytes());
+    out.extend_from_slice(&op.src.to_le_bytes());
+    true
   }
 
   /// The increment identity's ops-document half: the BLAKE3 of the canonical encoding. The same

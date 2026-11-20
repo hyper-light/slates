@@ -43,6 +43,7 @@ pub mod increment;
 pub mod map;
 pub mod ops_doc;
 pub mod origin;
+pub mod pace;
 pub mod ptrie;
 pub mod push;
 pub mod range;

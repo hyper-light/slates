@@ -462,6 +462,7 @@ fn admitted<P>(
     hooks: &mut HookVerdicts::default(),
     admitting: &mut None,
     restaging: &mut None,
+    preparing: &mut None,
   };
   judge.admitted(command).is_ok()
 }

@@ -303,6 +303,8 @@ struct DecidingPush {
   admitting: Option<slates_git::store::Admitting>,
   /// The push's stage made again a turn at a time where a landing overtook it (A-722 part 4e).
   restaging: Option<slates_git::store::Staging>,
+  /// The command under way's work, built a unit at a time over the turns before its verdict (A-752).
+  preparing: Option<slates_git::receive::works::Preparing>,
   /// The push's names homed in the region before its record names them (A-724 piece 8c, [`Homing`]).
   homing: Homing,
   /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
@@ -660,6 +662,7 @@ impl<P> ReceivePack<P> {
       deciding,
       admitting: None,
       restaging: None,
+      preparing: None,
       homing: if crate::vcs_store::write_version_3() {
         Homing::Due
       } else {
@@ -692,6 +695,7 @@ impl<P> ReceivePack<P> {
         deciding,
         admitting,
         restaging,
+        preparing,
         ..
       } = &mut decision;
       let mut judge = ServerJudge {
@@ -703,6 +707,7 @@ impl<P> ReceivePack<P> {
         hooks: verdicts,
         admitting,
         restaging,
+        preparing,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -1507,6 +1512,51 @@ impl HookVerdicts {
 /// One accepted command as A-635 appends it: its change, and A-662's store move.
 type Planned = (BranchChange, StoreMove);
 
+/// The turns pushes' work builds took on this shard (A-752; status `push.build.*`): each turn of a command's build
+/// before its verdict, timed on the shard's clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PushTurns {
+  /// The build turns taken.
+  pub(crate) turns: u64,
+  /// The turns that ran past their budget by more than their build's longest unit and the scheduler's own overrun: the
+  /// pacing's failure, zero in every correct use.
+  pub(crate) past_budget: u64,
+  /// The longest turn, nanoseconds.
+  pub(crate) longest_ns: u64,
+  /// The longest unit of any build, nanoseconds.
+  pub(crate) longest_unit_ns: u64,
+  /// The longest opening of a turn, nanoseconds: what it did before its first unit (the admission's turn, the views).
+  pub(crate) longest_opening_ns: u64,
+}
+
+impl PushTurns {
+  /// A turn that took `took` nanoseconds against `budget`: its opening, its build's longest unit so far and its tail.
+  fn counted(&mut self, took: u64, (budget, (opening, unit, tail)): (u64, (u64, u64, u64))) {
+    self.turns = self.turns.saturating_add(1);
+    self.longest_ns = self.longest_ns.max(took);
+    self.longest_unit_ns = self.longest_unit_ns.max(unit);
+    self.longest_opening_ns = self.longest_opening_ns.max(opening);
+    let unit = opening.saturating_add(unit).saturating_add(tail);
+    let noise =
+      slates_rt::registry::with_current(|context| context.counters().scheduler_overrun_ns)
+        .unwrap_or(0);
+    if took.saturating_sub(budget) > unit.saturating_add(noise) {
+      self.past_budget = self.past_budget.saturating_add(1);
+    }
+  }
+
+  /// Its status rows.
+  pub(crate) fn rows(&self) -> [(&'static str, u64); 5] {
+    [
+      ("push.build.turns", self.turns),
+      ("push.build.past_budget", self.past_budget),
+      ("push.build.longest_ns", self.longest_ns),
+      ("push.build.longest_unit_ns", self.longest_unit_ns),
+      ("push.build.longest_opening_ns", self.longest_opening_ns),
+    ]
+  }
+}
+
 /// receive-pack's judge on the owner shard (module docs, "Answering", items 3 to 5).
 struct ServerJudge<'j> {
   /// The shard's state: its greens, its records and the repository's store.
@@ -1525,6 +1575,8 @@ struct ServerJudge<'j> {
   admitting: &'j mut Option<slates_git::store::Admitting>,
   /// The push's stage made again a turn at a time where a landing overtook it (A-722 part 4e).
   restaging: &'j mut Option<slates_git::store::Staging>,
+  /// The command under way's work, built a unit at a time before its verdict (A-752).
+  preparing: &'j mut Option<slates_git::receive::works::Preparing>,
 }
 
 impl Judge for ServerJudge<'_> {
@@ -1532,7 +1584,7 @@ impl Judge for ServerJudge<'_> {
 
   /// A turn of the admission of `command`'s move (A-722 part 4c), for the shard's step quantum and a unit at least: the
   /// walk of what it brings, which its append then takes whole ([`SealedPush::admit`]). A delete needs none.
-  fn ready(&mut self, command: &Command, _pushed: &Pushed<'_>) -> bool {
+  fn ready(&mut self, command: &Command, pushed: &Pushed<'_>) -> bool {
     let ns = self.state.config.step_quantum_ns();
     // A stage another push's landing overtook is made again first, a turn at a time, so the append's commit adopts it
     // rather than staging the push again whole in its step (A-722 part 4e).
@@ -1550,9 +1602,11 @@ impl Judge for ServerJudge<'_> {
       };
       born(state, (repository, &command.name), store).unwrap_or_else(|| unheld_key(repository))
     };
+    let began = slates_rt::futures::now_ns();
     self
       .push
       .admission_turn(self.state, (green, command.new), (self.admitting, ns))
+      && self.build_turn(command, pushed, began)
   }
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
@@ -1639,6 +1693,7 @@ impl ServerJudge<'_> {
       push,
       record,
       name,
+      preparing,
       ..
     } = self;
     with_room(state, |state| {
@@ -1655,8 +1710,66 @@ impl ServerJudge<'_> {
         store,
         indexed: &indexed,
       };
-      Verdicts::new(&greens, &indexed, &objects, *name, room).judge(command, pushed)
+      Verdicts::new(&greens, &indexed, &objects, *name, room)
+        .prepared(preparing.take())
+        .judge(command, pushed)
     })
+  }
+
+  /// A turn of `command`'s work build (A-752), begun at `began` on the shard's clock: units until half the step quantum
+  /// is spent, the build kept for the next turn. Whether it is built (or needs none), so this step judges it. The turn
+  /// is counted ([`PushTurns`]): one that ran past its budget by more than its longest unit and the scheduler's own
+  /// overrun is past budget.
+  fn build_turn(&mut self, command: &Command, pushed: &Pushed<'_>, began: u64) -> bool {
+    let Self {
+      state,
+      push,
+      record,
+      name,
+      preparing,
+      ..
+    } = self;
+    let budget = state.config.step_quantum_ns() / 2;
+    let deadline = began.saturating_add(budget);
+    let built = with_room(state, |state| {
+      let Some(store) = state.vcs_stores.git_ref(record.id) else {
+        return Ok::<bool, Declined>(true);
+      };
+      let (content, git) = store;
+      let room = state.store.admittable();
+      let indexed = IndexedObjects::new(&git.repository, content, room);
+      let objects = PushedObjects::new(&git.repository, content, push.quarantine());
+      let greens = ShardGreens {
+        state,
+        record,
+        store,
+        indexed: &indexed,
+      };
+      let built = Verdicts::new(&greens, &indexed, &objects, *name, room).prepare(
+        command,
+        pushed,
+        preparing,
+        (slates_rt::futures::now_ns, began, deadline),
+      );
+      Ok(built)
+    })
+    .unwrap_or(true);
+    let ended = slates_rt::futures::now_ns();
+    // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
+    // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those
+    // three and the units before its deadline, measured on one clock.
+    let (unit, opening, asked_at) = preparing.as_ref().map_or((0, 0, began), |prepared| {
+      (
+        prepared.longest_unit_ns(),
+        prepared.opening_ns(),
+        prepared.asked_at_ns(),
+      )
+    });
+    let tail = ended.saturating_sub(asked_at.max(began));
+    state
+      .push_turns
+      .counted(ended.saturating_sub(began), (budget, (opening, unit, tail)));
+    built
   }
 
   /// `entry`, the `at`th of those appended together, as A-635's change and A-662's store move (module docs,
