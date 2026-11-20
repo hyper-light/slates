@@ -252,7 +252,7 @@ fn encoded_len_is_the_encodings_length_and_to_bytes_reserves_it_once() {
     assert_eq!(value.encoded_len(), bytes.len());
     assert_eq!(bytes.capacity(), bytes.len(), "reserved once, never grown");
   }
-  let payload: Vec<u8> = (0..1_048_576u32).map(|n| n as u8).collect();
+  let payload: Vec<u8> = (0..1_048_576u32).map(|n| n.to_le_bytes()[0]).collect();
   let nested: Option<Vec<Option<Vec<u8>>>> =
     Some(vec![Some(payload.clone()), None, Some(Vec::new())]);
   assert_eq!(payload.encoded_len(), payload.to_bytes().len());
