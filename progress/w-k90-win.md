@@ -23,3 +23,15 @@
   pinned + MountUseMountmgrFromFSD, Python, `SLATES_E2E=1 cargo test -p kiln --test slates_e2e`, `--lib -- workspace::`,
   annotations) + `build` matrix reports clippy/build errors as annotations; docs/agentic.md W line.
 - WATCH: GitHub run 44782069370 (842cc2c2f). Next: read its annotations; fix Windows compile/test failures in kiln.
+
+## 2026-11-20 ~10:00 PST: WinFsp installed on jupiter (Ada's word via main, "Yes, install WinFsp on jupiter")
+- Installed WinFsp **2.1.25156** (winfsp-2.1.25156.msi, release v2.1), NOT the latest v2.2 (2026-11-19): Slates'
+  receiver accepts only the 2.1 DLL (vendor/slates/crates/bridge-winfsp/src/dll_version.rs; Slates CI pins it, A-206).
+  SHA-256 073a70e0...db9f7a = GitHub's published digest = Slates' pin; Authenticode Valid (CN=NAVIMATICS LLC).
+  msiexec /qn exit 0 from kiln run r8 (runner already elevated: Jupiter\corph, session 0) -> NO UAC prompt.
+  winfsp-x64.dll FileVersion 2.1.25156.ddca7bd; WinFsp.Launcher RUNNING; set MountUseMountmgrFromFSD=1 (as Slates CI).
+  My files: C:\Users\corph\w-k90-win\ (msi, install log, script).
+- Verify-by-use BLOCKED on disk: C: 5 GB free; no slates daemon binary on jupiter (only other agents' test exes); a
+  slates-server + kiln build won't fit. Asked main for space.
+- GitHub: run 44782069370 cancelled by newer pushes; run 44784299374 (0a17f46e5) carries `windows (Slates tests)`
+  job 136462100187 and windows-latest build 136462100146 -- watching.
