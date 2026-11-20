@@ -3472,3 +3472,107 @@ fn live_append(shipper: &mut Shipper, payload: &[u8], whole: bool) -> Head {
   }
   newest
 }
+
+/// A-757 part 2 (w-forming, 2026-11-20): a whole state's identity hashed a slice at a time across an owner's turns is
+/// the identity the shipper computes in one, and a hasher of a place the chain has left is refused. Do: on two equal
+/// shippers, append a whole state of a few hundred KiB, one at once and one fed to an [`slates_db::live::EntryHasher`]
+/// in 4 KiB slices; then seed a hasher, append a delta, and offer it; and offer one fed short. Expect: equal heads; the
+/// stale hasher refused `Behind` at the delta's head; the short one refused `Behind`.
+#[test]
+fn a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once() {
+  const WHOLE: usize = 300_000;
+  const SLICE: usize = 4096;
+  let payload: Vec<u8> = (0..WHOLE)
+    .map(|at| u8::try_from(at % 253).unwrap())
+    .collect();
+  let mut at_once = shipper_bounded_by_whole(WHOLE * 4);
+  let mut in_slices = shipper_bounded_by_whole(WHOLE * 4);
+  let first = at_once.append_kept(vec![1, 2, 3]).unwrap();
+  assert_eq!(in_slices.append_kept(vec![1, 2, 3]).unwrap(), first);
+  let expected = at_once.append_checkpoint_kept(payload.clone()).unwrap();
+  let mut hasher = in_slices.entry_hasher(payload.len()).unwrap();
+  for slice in payload.chunks(SLICE) {
+    hasher.feed(slice);
+  }
+  assert_eq!(hasher.fed(), hasher.length());
+  assert_eq!(
+    in_slices
+      .append_checkpoint_hashed(payload.clone(), hasher)
+      .unwrap(),
+    expected
+  );
+  let mut stale = in_slices.entry_hasher(payload.len()).unwrap();
+  stale.feed(&payload);
+  let moved = in_slices.append_kept(vec![9]).unwrap();
+  assert_eq!(
+    in_slices.append_checkpoint_hashed(payload.clone(), stale),
+    Err(LiveError::Behind { head: Some(moved) })
+  );
+  let mut short = in_slices.entry_hasher(payload.len()).unwrap();
+  short.feed(&payload[..SLICE]);
+  assert_eq!(
+    in_slices.append_checkpoint_hashed(payload, short),
+    Err(LiveError::Behind { head: Some(moved) })
+  );
+}
+
+/// Shape: the slice a hashing turn feeds in the A/B: one archive page, the floor a whole build's turn hashes.
+const MEASURED_SLICE_BYTES: usize = 64 << 10;
+
+/// A measurement (w-forming's A/B for A-757 part 2; run alone in release with `--ignored --nocapture --exact`, under
+/// `/usr/bin/time -l` for its peak RSS): the append turn of a [`MEASURED_APPEND_BYTES`] whole state with its identity
+/// hashed in that turn, best and median of [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_whole_append_turn_hashed_at_once() {
+  let mut turns = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let began = std::time::Instant::now();
+    let head = shipper.append_checkpoint_kept(payload).unwrap();
+    shipper.mark_checkpoint(head);
+    turns.push(began.elapsed());
+  }
+  turns.sort_unstable();
+  println!(
+    "WHOLE_APPEND_TURN path=at_once bytes={MEASURED_APPEND_BYTES} append_turn best={:?} median={:?}",
+    turns[0],
+    turns[MEASURED_APPENDS / 2]
+  );
+}
+
+/// The same whole state with its identity fed [`MEASURED_SLICE_BYTES`] a turn before the append (A-757 part 2): the
+/// longest hashing turn and the append turn, best and median of [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_whole_append_turn_hashed_in_slices() {
+  let mut turns = Vec::new();
+  let mut slices = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let mut hasher = shipper.entry_hasher(payload.len()).unwrap();
+    let mut longest = std::time::Duration::ZERO;
+    for slice in payload.chunks(MEASURED_SLICE_BYTES) {
+      let began = std::time::Instant::now();
+      hasher.feed(slice);
+      longest = longest.max(began.elapsed());
+    }
+    slices.push(longest);
+    let began = std::time::Instant::now();
+    let head = shipper.append_checkpoint_hashed(payload, hasher).unwrap();
+    shipper.mark_checkpoint(head);
+    turns.push(began.elapsed());
+  }
+  turns.sort_unstable();
+  slices.sort_unstable();
+  println!(
+    "WHOLE_APPEND_TURN path=in_slices bytes={MEASURED_APPEND_BYTES} append_turn best={:?} median={:?}; longest \
+     {MEASURED_SLICE_BYTES}-byte hashing turn best={:?} median={:?}",
+    turns[0],
+    turns[MEASURED_APPENDS / 2],
+    slices[0],
+    slices[MEASURED_APPENDS / 2]
+  );
+}

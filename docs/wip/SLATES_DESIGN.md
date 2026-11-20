@@ -56555,9 +56555,20 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   tail without a clone and return the head hashed once; `live_ship::append_entry` reads that head. Release, 2.4 MB,
   best and median of 9: a delta 3.63 / 4.59 ms before, 1.39 / 1.63 ms after; a whole state 3.06 / 3.42 ms before,
   0.94 / 0.97 ms after (`slates-db --test live measure_the_live_append_turn`, ignored, a measurement).
-- **Owed.** Part 2: the remaining hash in quantum slices across turns (a whole build's after sealing; a large delta's as
-  a build of its own). Part 3: the body held once, by identity in the content store (A-727) or an arena handle, so the
-  retained entry and the volume's whole state name one copy.
+- **Part 2 (whole builds).** `db::live::EntryHasher`, seeded by `Shipper::entry_hasher` with the next entry's place in
+  the chain and its payload's length, is fed the payload a slice at a time; `Shipper::append_checkpoint_hashed` appends
+  with its identity, refused `Behind` when the chain moved since it was seeded or it was fed other than the payload.
+  `live_ship::hash_whole_turn` joins a whole build's sealed body once its last piece is sealed, seeds the hasher, and
+  feeds it slices sized to the quantum left at the rate it measures (`piece_bytes`, a page to an archive chunk) across
+  the build's turns; `append_ready` appends the build only once it is hashed. The queue's credit keeps the build's size
+  while it hashes. Release, 2.4 MB, best and median of 9: the append turn 0.92 / 0.94 ms before, 0.46 us after, each
+  64 KiB hashing turn 27 to 32 us; peak RSS 8.80 to 8.85 MB both (`measure_the_whole_append_turn_hashed_at_once` and
+  `_in_slices`, ignored measurements). Tests: `a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once`; the
+  fleet sealed-in-turns test holds the hashing to at least a page a turn under the cut quantum (48 turns for 3 MiB),
+  red before (0 turns: hashed in the append's turn).
+- **Owed.** Part 2b: a large delta, sealed and hashed in its publication's turn, as a build of its own. Part 3: the body
+  held once, by identity in the content store (A-727) or an arena handle, so the retained entry and the volume's whole
+  state name one copy.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
