@@ -140,3 +140,7 @@
   many-object pack record takes many turns; (b) slice the seal+stage pass and moves' admission; (c) remaining O(objects)
   in commit; (d) sliced restage on stale. Then concurrency proof 19/100, arrival-shard decode (w-balance seam),
   t_a665 derived deadline, ruling B.
+- A-722 part 4a LANDED cafd1058f (~04:30): vcs_store::git_replay (record decoded once, pack read in chunks
+  archive_slice_bytes_within(ns), objects admitted one a unit, deadline = step quantum; record_turn in rebuild turns
+  and recovery units; Lent guard per turn since A-727 a2). Next 4b: slice seal+stage pass and moves' admission (live
+  GitPush::seal + admit), then landing's O(objects) passes, stale restage; thin-pack resolve waits on w-balance's slicing.
