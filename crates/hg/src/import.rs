@@ -564,6 +564,8 @@ pub struct Import {
   named: Vec<bool>,
   /// The room the requirements and the listing left.
   room: Admission,
+  /// The room it was started with.
+  initial: u64,
   /// What the import has taken: the index and its counts.
   imported: Imported,
   /// Where it stands.
@@ -622,6 +624,7 @@ impl Import {
     files: &mut F,
     room: Admission,
   ) -> Result<Import, ImportRefused<F::Refused>> {
+    let initial = room.left();
     let mut walk = room;
     let shape = read_shape(files, &mut walk)?;
     let listed = list_file_logs(files, shape, &mut walk)?;
@@ -632,6 +635,7 @@ impl Import {
       listed,
       named,
       room: walk,
+      initial,
       imported: Imported::default(),
       stage: Stage::Open(Which::Changelog),
       turns: 0,
@@ -658,6 +662,25 @@ impl Import {
       if turn.clock.now_ns().saturating_sub(start) >= turn.quantum_ns {
         return Ok(Progress::More);
       }
+    }
+  }
+
+  /// What the import holds between turns, of the room it was started with (A-720 part 3): the requirements and the
+  /// listing, and while a log is read, what opening its revlog took and the text it keeps for the next revision. Its
+  /// owner charges its shard this, trued up after each turn, since the room itself is only a bound.
+  pub fn holding(&self) -> u64 {
+    match &self.stage {
+      Stage::Log(log) => {
+        let cached = log
+          .cached
+          .as_ref()
+          .map_or(0, |(_, text)| crate::read::to_u64(text.len()));
+        self
+          .initial
+          .saturating_sub(log.room.left())
+          .saturating_add(cached)
+      }
+      _ => self.initial.saturating_sub(self.room.left()),
     }
   }
 
