@@ -1291,6 +1291,10 @@
 > git/git whole (607 MiB pack) kills the daemon on either edge (shard 0 spins 3,559 ms unsliced; git hangs); cut at
 > v1.0.0 (3.4 MB) it pushes, but every non-shallow clone is refused (`upload-pack: the request needs more room than
 > the server admits`) and `fetch --deepen` reports corruption: 4 of 27 pass. Owed to w-git; re-run when they land.
+> **Stock hg command matrix (w-interop, 2026-11-20):** `ci/interop/hg-matrix.sh` (24 rows, hg's own repository): any
+> real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
+> (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
+> clone pass: 14 of 24 (main 9f51d75, debug, Mac Studio). The matrices' rows count a command that cannot start as failed.
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
