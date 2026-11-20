@@ -131,3 +131,14 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 ## 2026-11-20: Windows `cargo check -p kiln --bins --tests` at 2b5a3d559 PASSED on jupiter (r33). r24 failed on adacachy /tmp full (my TMPDIR mistake) -> r36 queued with TMPDIR under ~/.cache.
 
 ## RULE (Ada 2026-11-20, common.md): fetch + merge origin/main at each piece start, before each reported test run, every 30 min; name the base (origin/main short hash) with every result; delete landed worktrees by exact path.
+
+## 2026-11-20 ~08:xx live W9 (main: drive it): r24/r36 crawled on adacachy (load ~70, rootful docker -> would only skip)
+   -> stopped. Live run on main's MacBook (e30189ea) with Docker Desktop 29.3.1 (started by me, quit after): binaries
+   built here (base ed8991d29), served to it over LAN (python http.server on 192.168.1.82:18497, my task), run from
+   ~/.cache/w-k90-containers-live there.
+- r52 RED: "this process keeps no workspaces" (test lacked slates::init) -> test fixed (state under ~/.cache = /Users share).
+- r54 RED (real bug): container ran on the bind, read+wrote the volume, went; then the mount stayed BUSY, held by
+  com.apple.Virtualization.VirtualMachine (Docker Desktop's share). Cleaned up by hand (quit Docker, umount -f, anchor gone).
+- Fix (uncommitted): slates::remove_after_container (let go of a busy mount once container+bind are gone), used by
+  workspace::container end + workspace::release for container sessions + the live test; unit test w9_a_containers_busy_...
+  11/11 local; bins check clean. r61 = green attempt.
