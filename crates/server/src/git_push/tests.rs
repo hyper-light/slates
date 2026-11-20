@@ -1144,3 +1144,51 @@ fn t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row() {
     );
   });
 }
+
+/// Shape: the branches of [`t_a719_a_push_is_decided_a_command_a_step`]: enough that a decision made whole is told
+/// from one made a command a step.
+const BRANCHES: usize = 40;
+
+/// A-719 (found by use: stock git's push of git/git, 1,027 refs, ran its whole decision in one step and spun its
+/// shard). Do: push stock git's `create` pack with [`BRANCHES`] creates of branches at its commit, then answer it a step
+/// at a time. Expect: every branch created `ok`; and once the push is checked, at least a step a command while it is
+/// decided, so no step judges and appends more than one command.
+#[cfg(unix)]
+#[test]
+fn t_a719_a_push_is_decided_a_command_a_step() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "many");
+    let (_, mut push) = started(state, repository);
+    let names: Vec<Vec<u8>> = (0..BRANCHES)
+      .map(|branch| format!("refs/heads/b{branch}").into_bytes())
+      .collect();
+    let commands: Vec<(&str, &str, &[u8])> = names
+      .iter()
+      .map(|name| ("", FIRST, name.as_slice()))
+      .collect();
+    let create = scenario!("create");
+    let request = request(&commands, CAPABILITIES, pack_of(create.request));
+    for piece in request.chunks(PIECE) {
+      push.input(state, piece).expect("taken");
+    }
+    push.end(state).expect("ended");
+    let mut answer = Vec::new();
+    let mut deciding = 0;
+    let received = loop {
+      let was_deciding = matches!(push.answer, super::AnswerState::Deciding(_));
+      match push.answer_step(state, &mut answer).expect("answered") {
+        Answering::Answered(received) => break received,
+        Answering::Turned => deciding += usize::from(was_deciding),
+        Answering::Hook(_) => panic!("no hook is configured"),
+      }
+    };
+    let reasons = reasons(&received);
+    assert_eq!(reasons.len(), BRANCHES);
+    assert!(reasons.iter().all(|reason| reason == b"ok"), "{reasons:?}");
+    // The first command is decided in the step that seals the push, the last in the step that answers it.
+    assert!(
+      deciding + 2 >= BRANCHES,
+      "{deciding} decision steps for {BRANCHES} commands"
+    );
+  });
+}

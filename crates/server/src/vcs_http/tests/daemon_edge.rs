@@ -770,9 +770,17 @@ const LONG_HISTORY: usize = 3_000;
 /// Stock git's request creating `main` at the last of `commits` commits in one line, each changing the one file, and that
 /// commit: three objects a commit.
 fn long_history(commits: usize) -> (Vec<u8>, ObjectId) {
+  let (request, made) = long_history_refs(commits, 0);
+  (request, made.last().copied().expect("a commit"))
+}
+
+/// [`long_history`]'s line of `commits` commits, the request creating `main` at its last and `branches` more branches
+/// `b0`, `b1`, ... at commits spread along it, and every commit made, oldest first.
+fn long_history_refs(commits: usize, branches: usize) -> (Vec<u8>, Vec<ObjectId>) {
   use slates_git::object_name::Kind;
   let mut objects: Vec<(Kind, Vec<u8>)> = Vec::new();
   let mut parent: Option<ObjectId> = None;
+  let mut made = Vec::new();
   for at in 0..commits {
     let blob = format!("line {at}\n").into_bytes();
     let mut tree = b"100644 file\0".to_vec();
@@ -785,6 +793,7 @@ fn long_history(commits: usize) -> (Vec<u8>, ObjectId) {
     )
     .into_bytes();
     parent = Some(git_name(Kind::Commit, &commit));
+    made.extend(parent);
     objects.extend([
       (Kind::Commit, commit),
       (Kind::Tree, tree),
@@ -799,9 +808,40 @@ fn long_history(commits: usize) -> (Vec<u8>, ObjectId) {
   let mut request = Vec::new();
   let line = format!("{ZERO} {last} refs/heads/main\0 report-status");
   pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  for branch in 0..branches {
+    let at = made[branch * commits / branches.max(1)];
+    let line = format!("{ZERO} {at} refs/heads/b{branch}");
+    pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("a command");
+  }
   pktline::write(Packet::Flush, &mut request).expect("the flush");
   request.extend_from_slice(&stored_pack(&listed));
-  (request, last)
+  (request, made)
+}
+
+/// Shape: the branches [`a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemons_edge`] creates beside
+/// `main`: a hundred, each one command of the push's decision.
+const MANY_BRANCHES: usize = 100;
+
+/// A-719 (found by use, 2026-11-20: stock git's push of git/git, 1,027 refs, into a release slates spun its shard,
+/// 1,046 ms of CPU without a step, and the anchor killed the daemon). Do: push through the daemon's edge a line of
+/// [`LONG_HISTORY`] commits with `main` at its last and [`MANY_BRANCHES`] branches along it, as stock git posts them.
+/// Expect: the push `200`, every ref reported `ok`, the daemon's watchdog never finding its shard stuck (it ends the
+/// test's process when it does). A step's own length by the wall clock is no test here: on a loaded host it measures
+/// the host; `git_push::tests::t_a719_a_push_is_decided_a_command_a_step` holds the decision to a command a step.
+#[test]
+fn a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (request, _) = long_history_refs(LONG_HISTORY, MANY_BRANCHES);
+  let created = pushed((port, &certificate), &name, &request);
+  daemon.stop();
+  let report = String::from_utf8_lossy(&created.1).into_owned();
+  let landed = report.matches("ok refs/heads/").count();
+  assert_eq!((created.0, landed), (200, MANY_BRANCHES + 1), "{report}");
 }
 
 /// A v2 `fetch` of `want` with `done` and no progress, as `git clone` asks for a branch's commit.
