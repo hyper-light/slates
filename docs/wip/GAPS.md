@@ -1346,6 +1346,9 @@
 > git/git whole (607 MiB pack) kills the daemon on either edge (shard 0 spins 3,559 ms unsliced; git hangs); cut at
 > v1.0.0 (3.4 MB) it pushes, but every non-shallow clone is refused (`upload-pack: the request needs more room than
 > the server admits`) and `fetch --deepen` reports corruption: 4 of 27 pass. Owed to w-git; re-run when they land.
+> Since A-713 (fetch admission) the v1.0.0 cut passes 26 of 27 (clone, deepen and partial clone among them; the 27th
+> the script's tag row, since fixed); cut at v2.0.0 (56 MB) the push still spins shard 0 and the daemon is killed
+> (main 168ddfa, debug, Mac Studio). hg after A-711 and A-696: 17 of 24, its pushes of hg's history spinning alike.
 > **Stock hg command matrix (w-interop, 2026-11-20):** `ci/interop/hg-matrix.sh` (24 rows, hg's own repository): any
 > real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
 > (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
