@@ -587,6 +587,10 @@
 > **A-636 part 2c-1 (2026-11-20, w-shared):** a repository's record is its own register (`REPOSITORY_CLASS`), shipped
 > to its family's candidates at each policy setting or names change and adopted by its successor as a pending
 > repository. Owed: the successor's rebuild of the repository from its record and its logs by part 1's rule (2c-2).
+> **A-636 part 2c-2 (2026-11-20, w-shared):** the successor rebuilds a repository taken over once its record, its
+> family's registers and its greens are adopted: each operation kept only where every log it moved holds it whole
+> (`repository::whole_parts`), the repository recorded whole (`Op::RepositoryRebuilt`) and its store made. Owed: a
+> log's parts the successor lacks fetched from its holders; the tool store's objects shipped (no part carries them).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -6426,7 +6430,11 @@
 >   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
 >   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a
 >   process handle keeps no object the process named, so neither the bootstrap name nor the owner's token outlives the
->   daemon and no successor's takeover is refused (A-176). The macOS region fetch since A-452 (2026-11-18, g251): it
+>   daemon and no successor's takeover is refused (A-176). That claim read the marks by copying the whole 64-byte header,
+  whose declared words (doorbell, claim mark, start stamp) a copy may not touch, so from 28c4f3839 every Windows
+  client's connect was refused `TouchesWord` (exit 4) and no WinFsp suite ran; since A-717 (2026-11-20, w-bugs) it
+  copies the marks' bytes alone (`a_claim_reads_the_process_marks_of_a_published_bootstrap_object`;
+  `docs/bugs/2026-11-20-every-windows-client-connect-was-refused-touchesword.md`). The macOS region fetch since A-452 (2026-11-18, g251): it
 >   waited a fixed second to send and again to receive, so an owner alive and slow to answer was reported gone and one
 >   that went away was reported keeping nothing; now neither has a timeout, a dead owner's port refuses the send and the
 >   kernel's send-once notification ends the receive (`a_fetch_answered_past_the_claim_wait_is_served`,
