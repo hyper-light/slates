@@ -158,7 +158,7 @@ impl<L: ShardLender> Exchange for Receive<L> {
         .map_err(failed)?;
       match step {
         Answering::Answered(_) => return Ok(()),
-        Answering::Sealing => slates_rt::futures::yield_now().await,
+        Answering::Turned => slates_rt::futures::yield_now().await,
         Answering::Hook(call) => {
           let answer = call.run(gone.gone()).await;
           lender

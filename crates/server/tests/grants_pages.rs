@@ -211,9 +211,9 @@ fn a_used_up_grant_leaves_the_table_and_its_history_stays_in_the_audit() {
   daemon.stop();
 }
 
-/// Shape: an expiring grant's term: one millisecond, so it is past its term by the next reap tick.
+/// Shape: an expiring grant's term: one millisecond, so it is past its term when the deadline keeper wakes for it.
 const SHORT_TERM_NS: u64 = 1_000_000;
-/// Shape: how long the reap ticks may take to end an expired grant (the reaper runs at a cadence of well under a second).
+/// Shape: how long the deadline keeper may take to end an expired grant (it ends one at the first instant past its term, A-554).
 const EXPIRY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// §4.15 (A-266). Do: present a landing and approve it with a single-use grant whose term is one millisecond; wait

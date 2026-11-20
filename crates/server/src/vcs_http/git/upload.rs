@@ -58,6 +58,11 @@ pub(crate) trait StoreLender {
     id: RepositoryId,
     step: impl FnOnce(&Served<'_>, &mut Self::Packs) -> R,
   ) -> Option<R>;
+
+  /// Makes repository `id`'s store ready for a fetch's answer before it is made (A-718): the shard's lender encodes every
+  /// version not yet encoded as its fragments, a turn at a time, yielding between turns, so the answer copies them. A
+  /// lender whose store needs nothing made does nothing.
+  async fn encode(&mut self, _id: RepositoryId) {}
 }
 
 /// git's services with upload-pack served from the stores `lender` lends, each request admitted the room its stores'
@@ -142,6 +147,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     let asked = if *advertise {
       Asked::Advertise
     } else {
+      lender.encode(*repository).await;
       Asked::Request(request.as_slice())
     };
     let made = lender

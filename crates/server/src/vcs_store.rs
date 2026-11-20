@@ -97,6 +97,7 @@ use slates_vfs::volume::Store;
 use crate::state::ShardState;
 
 pub(crate) mod commits;
+pub(crate) mod git_encode;
 pub(crate) mod hg_import;
 pub(crate) mod hg_view;
 pub(crate) mod lfs_record;
@@ -158,6 +159,9 @@ pub(crate) struct VcsStores {
   /// The request each import's end answers, by repository (A-678; `crate::repository::import`): one an import, so
   /// bounded as the imports are.
   answers: BTreeMap<RepositoryId, crate::repository::import::Answer>,
+  /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
+  /// repository, so bounded by the partition's repositories.
+  encodings: git_encode::Encodings,
 }
 
 /// One repository's store, by its tool (module docs).
@@ -519,6 +523,7 @@ struct Unmade;
 /// counted, and the rest is given back.
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   hg_import::abandon(state, id);
+  git_encode::abandon(state, id);
   svn_import::abandon(state, id);
   if let Some(charged) = state.vcs_stores.objects_charged.remove(&id) {
     state.store.budget.credit_retention(charged);

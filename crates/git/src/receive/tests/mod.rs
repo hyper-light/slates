@@ -120,6 +120,39 @@ fn unbounded() -> Admission {
   Admission::new(u64::MAX)
 }
 
+/// A clock one nanosecond on at each reading, so a quantum of none ends each turn after its first
+/// unit of work.
+struct Ticking(u64);
+
+impl crate::store::learn::Clock for Ticking {
+  fn now_ns(&mut self) -> u64 {
+    self.0 = self.0.saturating_add(1);
+    self.0
+  }
+}
+
+/// Makes `session`'s pack's checks against `repository` a unit of work a turn until the push is
+/// checked or refused (A-719): the turns taken, and the last turn's outcome.
+fn checked_in_turns<H: HiddenRefs, R: Repository + ?Sized>(
+  session: &mut super::Session<'_, H>,
+  repository: &R,
+) -> (usize, Result<bool, Refusal>) {
+  let mut clock = Ticking(0);
+  let mut turns = 0;
+  while session.is_checking() {
+    turns += 1;
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 0,
+    };
+    let turned = session.check_turn(repository, &mut unbounded(), quantum);
+    if !matches!(turned, Ok(false)) {
+      return (turns, turned);
+    }
+  }
+  (turns, Ok(session.checked().is_some()))
+}
+
 /// A repository a test holds: each object by name.
 #[derive(Default)]
 struct Repo {

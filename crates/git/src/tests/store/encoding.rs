@@ -173,3 +173,25 @@ fn a_base_pack_is_made_an_object_a_unit_as_one_pass_makes_it() {
   turned.release(&mut store_turned).unwrap();
   whole.release(&mut store_whole).unwrap();
 }
+
+/// A-718 (§4.17.2 "A push" item 8: a version's fragments encoded once, off the answer's path). Do: ask a repository
+/// whose green 1 has two versions for its first unencoded version, encode it, ask again, encode that, and ask again.
+/// Expect: green 1's first version, then the version after it, then none: each version is offered once, in order, until
+/// every one's fragments are kept.
+#[test]
+fn every_version_is_offered_for_encoding_once_in_order_until_all_are_kept() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = two_versions(format, &mut store);
+  let (green, first) = repository.first_unencoded().unwrap();
+  assert_eq!(green, 1);
+  repository
+    .encode_fragments(&mut store, (green, first), &mut Ticks(0), EXCHANGE)
+    .unwrap();
+  assert_eq!(repository.first_unencoded(), Some((1, first + 1)));
+  repository
+    .encode_fragments(&mut store, (1, first + 1), &mut Ticks(0), EXCHANGE)
+    .unwrap();
+  assert_eq!(repository.first_unencoded(), None);
+  repository.release(&mut store).unwrap();
+}
