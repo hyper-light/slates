@@ -399,6 +399,9 @@ pub(crate) enum ReplayRefused {
   Pack(slates_git::unpack::Refusal),
   /// An owed commit's record's bytes (A-664's live whole builds, part 2).
   Owed(owed::OwedRefused),
+  /// A version-3 git record's names (A-724 piece 8c) not read: the store holds no content of their identity whole (not
+  /// yet fetched from their region homes), or its rows are refused.
+  Names(record_names::NamesRefused),
 }
 
 /// The repository's objects as the bases a replayed pack's reference deltas may name (A-723), read through the index view
@@ -1870,6 +1873,17 @@ fn replay_push(
   record: &Record<'_>,
 ) -> Result<u64, ReplayRefused> {
   push.carried(record.deepest);
+  // A version-3 record's names (A-724 piece 8c): read by their identity before anything is admitted, and held for the
+  // record when nothing holds them (a3: a window restored from the shard image is held for no one until a record holds
+  // it again; one fetched from its region homes is held by its fetch).
+  if let Some((identity, count)) = record.named {
+    record_names::names_from_content(content, &identity, count).map_err(ReplayRefused::Names)?;
+    if content.holders(&identity) == 0 {
+      content
+        .hold(&identity)
+        .map_err(|refused| ReplayRefused::Git(GitRefused::Object(PushRefused::Content(refused))))?;
+    }
+  }
   let mut remade = RecordWriter::default();
   replay_objects(content, store, (&mut *push, &mut remade), record)?;
   if !recorded_alike(content, store, &remade, record) {
@@ -1889,6 +1903,10 @@ fn recorded_alike(
   remade: &RecordWriter,
   record: &Record<'_>,
 ) -> bool {
+  if let Some((identity, count)) = record.named {
+    return record_names::names_from_content(content, &identity, count)
+      .is_ok_and(|names| names_alike(content, store, remade, &names));
+  }
   if record.objects.is_empty() {
     return names_alike(content, store, remade, &record.names);
   }
