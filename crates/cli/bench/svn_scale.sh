@@ -198,7 +198,8 @@ steps() {
   else
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
   fi
-  s update -q -r "$((youngest - UPDATE_SPAN))" "$copy"
+  # A history shorter than the span is taken back to its first revision (r1; r0 holds no trunk).
+  s update -q -r "$((youngest > UPDATE_SPAN ? youngest - UPDATE_SPAN : 1))" "$copy"
   timed "$server update-$UPDATE_SPAN $run" "${S[@]}" ${AUTH[@]+"${AUTH[@]}"} update -q "$copy"
   rm -rf "$copy" "$other"
 }
