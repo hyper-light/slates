@@ -12218,9 +12218,11 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 
 > **Status (2026-11-20, A-719 parts 1 and 2).** Rule 3's checks are built for git (part 1: `slates_git::receive::Checking`);
 > rule 1's reader seam is built (part 2: `slates_git::unpack::Keep`, each object handed to its keeper as it resolves,
-> with the hold its bytes took, and a delta's base read back from it). Owed: git's intake keeping into the repository's
-> store as it reads (part 3), on w-perf's byte table once it lands; admission by the working set; the store's
-> admission and the verdicts a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
+> with the hold its bytes took, and a delta's base read back from it); git's intake keeps into the repository's
+> quarantine as it reads (part 3: `git_push::intake`, each object fsck'd as it is kept and admitted after the session's
+> call, the checks reading commits and trees back from the store, the push holding none of their bytes). Owed: the
+> convergence plan's S3 (A-722: blobs as the push work's file ops, the git store an index); admission by the working
+> set; the verdicts and the seal a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -15248,8 +15250,11 @@ and export by landing).
 > `get-locations.c` writes it. Held to the fixture repository (each revision's delta replayed to the text the site's GET
 > serves there; a directory refused; a file traced back across its copy) and to stock svn 1.15 against `svnserve -t`
 > over one history: seven commands, every answer byte for byte the same but for the author. Departures: deltas in
-> svndiff 0, as the update-report writes them; locations in the trace's order, where `mod_dav_svn` walks a hash. Owed:
-> the `mergeinfo-report` (`svn blame -g`, `svn merge`).
+> svndiff 0, as the update-report writes them; locations in the trace's order, where `mod_dav_svn` walks a hash.
+> **Part 2:** the `mergeinfo-report`, the svn:// catalog (`svn_repos_fs_get_mergeinfo2`) written as `mergeinfo.c`
+> writes it (each path relative to the resource's), and OPTIONS now answers `SVN-Repository-MergeInfo: yes` and lists
+> `mergeinfo`, so stock `svn merge`, `svn blame -g` and `svn mergeinfo` work through the edge, each held to `svnserve
+> -t`'s answers. Owed: a catalog with descendants is written whole within the reply's room, refused past it.
 >
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
@@ -54775,7 +54780,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `stock_svn_blames_and_diffs_over_the_vcs_http_edge_as_against_svnserve` (stock svn 1.15.0 on the Mac Studio: `blame`,
   `blame -r 2`, `diff -r 1:3`, `diff -c 2`, `diff --summarize`, a two-peg diff, `cat -r 1`, each equal to `svnserve -t`'s).
 - **Applied in the same change to** §4.17.4's status, GAPS (A-681's owed reports), amendments.tsv.
-- **Owed.** Part 2: the `mergeinfo-report` and `SVN-Repository-MergeInfo: yes` (`svn blame -g`, `svn merge`). Deltas in
+- **Part 2 (same day).** `dav::report_mergeinfo` answers the `mergeinfo-report` from the svn:// catalog
+  (`reads::repository_mergeinfo`, the `get-mergeinfo` walk opened to the site), and the site's OPTIONS answers
+  `SVN-Repository-MergeInfo: yes` and lists `mergeinfo`. Tests: `dav::report_mergeinfo::tests` (a directory's own, a file's
+  inherited, none before it was set, a revision past the youngest `404`), the OPTIONS test now holding `yes`; `slates-cli`
+  `svn_http_reports` `stock_svn_blames_merged_revisions_over_the_vcs_http_edge_as_against_svnserve` (`svn merge
+  ^/branch`'s report, `svn blame -g`, `svn mergeinfo`, `propget svn:mergeinfo`, each equal to `svnserve -t`'s).
+- **Owed.** A mergeinfo catalog with descendants streamed (written whole within the reply's room now). Deltas in
   the svndiff version `Accept-Encoding` prefers. The interop harness copied into `svn_http_reports.rs` folded into one
   module with `svn_interop.rs` once that file's pieces land.
 - **Piece 6, §4.10 amended (2026-11-20, main's ruling).** §4.10 "Content homed by identity": the owner keeps its
@@ -54784,3 +54795,29 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   record naming it. Agreed: w-shared (the ranking keyed by content id; a successor's rebuild fetches from homes), main
   (a move leaves cold content at its homes; no coordination call). Owed: w-fed-faults' answer on fault paths, then the
   region's half.
+
+### A-719 part 3 — git's push is read straight into its quarantine (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" items 3 to 5)
+- **Change (slates-git).** The receive session reads a pack into a site the caller gives it (`Session::input_into`,
+  `end_into`, `check_turn_with`, `decide_with`, `answer_with`): the pack reader's keeper and the repository its thin
+  bases come from; `Session::input` and the rest read into the session's own memory (`Held`) as before. Each object is
+  checked as git checks a push as it is kept (its bytes in hand). `Checked` and `Received` hold each object's place
+  (`unpack::Kept`), not its bytes; `Pushed` reads bytes through `unpack::Contents` where the caller lends them, and
+  `works::Verdicts` reads a pushed commit or tag from its quarantine view (`works::PushedBytes`, `PushedObjects`).
+- **Change (slates-server).** `git_push::intake`: each session call reads the repository's index and the quarantine
+  read only and queues each object as it resolves, with its hold; the driver then admits the queue to the push's
+  quarantine (`GitPush`, held from the push's start) and gives the holds back, so a push holds what one call resolved,
+  never its pack. The checks read commits and trees back from the store (a one-window object lent with no copy); the
+  answer seals the quarantine (`prepare` admits nothing now); a hook that cannot run, a store's refusal, or a push
+  dropped between steps gives the quarantine back.
+- **Found on the way.** `a_long_history_pushed_over_the_daemons_edge_is_fetched_whole_over_it` failed once under load
+  (main's report): its client waited past ten liveness windows on the push's answer, about twelve thousand quantum-sized
+  turns of the checks with the edge yielding between them, then one unsliced step sealing and deciding. Checking each
+  object as it is kept removed a third of the turns (debug build, load average 34: the answer 3.1 s, its steps 1.1 s).
+  Owed: the verdicts and the seal a turn at a time; the walk's two passes read each commit and tree twice.
+- **Tests.** `slates-server` `git_push::tests::t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes`
+  (a push of a mebibyte file: once its bytes are taken, the file in the quarantine and the push's admission holding
+  under a sixteenth of it; `main` created); the session, connectivity, protected-branch and works tests read the kept
+  objects through the session's keeper.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib` 553 passed, 4 ignored;
+  `cargo test --locked -p slates-server --lib -- git_push:: git_hooks:: git_protect vcs_http::git::
+  vcs_http::daemon_edge:: vcs_ssh:: vcs_store::` 152 of 152 before the new test, which then passed alone; fmt clean.

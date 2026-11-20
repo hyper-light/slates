@@ -12,9 +12,10 @@ use super::{
   UNPACKER_ERROR, charged_vec, early_refusal, refused,
 };
 use crate::Admission;
+use crate::object_name::Kind;
 use crate::object_name::ObjectId;
 use crate::store::hook_view::Quantum;
-use crate::unpack::Unpacked;
+use crate::unpack::{Contents, Kept};
 
 /// Where a push's checks stand.
 #[derive(Debug)]
@@ -47,15 +48,15 @@ enum Stage {
 pub struct Checking {
   /// The request.
   request: Request,
-  /// The pack's objects, or why it was refused; `None` when no pack was due.
-  unpacked: Option<Result<Unpacked, PackRefused>>,
+  /// The pack's objects' places, or why it was refused; `None` when no pack was due.
+  unpacked: Option<Result<Kept, PackRefused>>,
   /// Where the checks stand.
   stage: Stage,
 }
 
 impl Checking {
   /// The checks of `request` and its pack, `unpacked` (none when no pack was due), not yet begun.
-  pub fn new(request: Request, unpacked: Option<Result<Unpacked, PackRefused>>) -> Checking {
+  pub fn new(request: Request, unpacked: Option<Result<Kept, PackRefused>>) -> Checking {
     let stage = match &unpacked {
       Some(Ok(_)) => Stage::Fsck { at: 0 },
       Some(Err(_)) => Stage::Refused,
@@ -69,16 +70,27 @@ impl Checking {
     }
   }
 
+  /// The checks of `request` and its pack, `unpacked`, whose every object was checked as git checks
+  /// a push as it was kept (the session's, A-719 part 3): the connectivity walk alone to make.
+  pub fn fscked(request: Request, unpacked: Option<Result<Kept, PackRefused>>) -> Checking {
+    let mut checking = Checking::new(request, unpacked);
+    if let (Stage::Fsck { at }, Some(Ok(kept))) = (&mut checking.stage, &checking.unpacked) {
+      *at = kept.objects.len();
+    }
+    checking
+  }
+
   /// Whether every check is made.
   pub fn is_done(&self) -> bool {
     matches!(self.stage, Stage::Connected { .. } | Stage::Refused)
   }
 
-  /// One turn of the checks against `repository`, for `quantum` and at least one unit of work, the
-  /// tables they make charged to `admission` first: whether every check is made.
-  pub fn turn<R: Repository + ?Sized>(
+  /// One turn of the checks against `repository`, the objects' bytes read from `contents`, for
+  /// `quantum` and at least one unit of work, the tables they make charged to `admission` first:
+  /// whether every check is made.
+  pub fn turn<R: Repository + ?Sized, C: Contents>(
     &mut self,
-    repository: &R,
+    (repository, contents): (&R, &C),
     admission: &mut Admission,
     quantum: Quantum<'_>,
   ) -> Result<bool, Refusal> {
@@ -90,7 +102,7 @@ impl Checking {
         clock: &mut *clock,
         ns: ns.saturating_sub(spent),
       };
-      self.unit(repository, admission, left)?;
+      self.unit((repository, contents), admission, left)?;
       if clock.now_ns().saturating_sub(begun) >= ns {
         break;
       }
@@ -100,9 +112,9 @@ impl Checking {
 
   /// One unit of the checks: one object checked as git checks a push, the objects indexed, or a
   /// turn of the walk for what is `left` of the quantum.
-  fn unit<R: Repository + ?Sized>(
+  fn unit<R: Repository + ?Sized, C: Contents>(
     &mut self,
-    repository: &R,
+    (repository, contents): (&R, &C),
     admission: &mut Admission,
     left: Quantum<'_>,
   ) -> Result<(), Refusal> {
@@ -115,9 +127,10 @@ impl Checking {
       Some(Ok(unpacked)) => unpacked.objects.as_slice(),
       _ => &[],
     };
+    let contents: &dyn Contents = contents;
     match stage {
       Stage::Fsck { at } => match objects.get(*at) {
-        Some(object) => match fsck::refusal(object, request.format) {
+        Some(object) => match fsck_one(object, *at, (contents, request.format)) {
           Some(finding) => {
             let counted = u32::try_from(objects.len()).ok();
             *unpacked = Some(Err(PackRefused {
@@ -132,7 +145,7 @@ impl Checking {
           None => *at = at.saturating_add(1),
         },
         None => {
-          let pushed = Pushed::new(objects, admission)?;
+          let pushed = Pushed::new(objects, Some(contents), admission)?;
           let walk = Walk::new(request, &pushed, admission)?;
           *stage = Stage::Walk {
             by_id: pushed.by_id,
@@ -144,6 +157,7 @@ impl Checking {
         let pushed = Pushed {
           objects,
           by_id: core::mem::take(by_id),
+          contents: Some(contents),
         };
         let done = walk.turn((request, &pushed, repository), admission, left);
         let connected = match done {
@@ -166,18 +180,19 @@ impl Checking {
 
   /// The checked push, every check made first in one turn with no end ([`super::check`]'s), each
   /// command's early refusal against `hidden` and the outcomes' table charged to `admission`.
-  pub fn checked<R, H>(
+  pub fn checked<R, C, H>(
     mut self,
-    repository: &R,
+    (repository, contents): (&R, &C),
     hidden: &H,
     admission: &mut Admission,
   ) -> Result<Checked, Refusal>
   where
     R: Repository + ?Sized,
+    C: Contents,
     H: HiddenRefs + ?Sized,
   {
     let mut stopped = Stopped;
-    while !self.turn(repository, admission, unbounded(&mut stopped))? {}
+    while !self.turn((repository, contents), admission, unbounded(&mut stopped))? {}
     let count = self.request.commands.len();
     let mut early = charged_vec(count, admission)?;
     let by_id = match self.stage {
@@ -203,5 +218,22 @@ impl Checking {
       early,
       by_id,
     })
+  }
+}
+
+/// What a push's check finds against the object `placed` at position `at`, its bytes read from
+/// `contents`: a blob passes unread (its checks are A-590's to give, `fsck`'s module docs); one whose
+/// bytes are not lent is refused as git refuses an object it cannot read.
+fn fsck_one(
+  placed: &crate::unpack::Placed,
+  at: usize,
+  (contents, format): (&dyn Contents, crate::object_name::ObjectFormat),
+) -> Option<crate::objects::FsckId> {
+  if placed.kind == Kind::Blob {
+    return None;
+  }
+  match contents.content(at, &placed.id) {
+    Some(content) => fsck::refusal_of(placed.kind, &content, format),
+    None => Some(crate::objects::FsckId::BadObjectSha1),
   }
 }
