@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::MigrationRefusal;
 use super::paths::{ROOT, ancestors_deepest_first, beneath};
-use super::properties::{decode, encode, entries, mergeinfo};
+use super::properties::{MERGEINFO, decode, encode, entries, mergeinfo};
 use crate::commit::drive::Green;
 use crate::commit::record::Record;
 use crate::commit::revision::{Revision as RevisionToCommit, StepRefusal};
@@ -35,6 +35,8 @@ use crate::index::{
   Revision, RevisionRecord, Text,
 };
 use crate::lock::{AprTime, CommitLocks, LockEntry, LockTable};
+use crate::mergeinfo::Contents;
+use crate::reads::Repository as ReadSource;
 
 /// A node's or a revision's properties: names to values, sorted by name, every byte kept.
 pub type Properties = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -571,6 +573,47 @@ fn named(changes: &[ChangedPath]) -> BTreeSet<ContentIdentity> {
     }
   }
   named
+}
+
+/// The records as the read commands, the report drive and the DAV site read a repository (A-681; the svn:// listener's
+/// connection too, A-689): a directory's entries from the index ([`Index::children`]); a property list's `svn:mergeinfo`
+/// from the list held under its identity.
+impl Contents for Repository {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    self.index.children(directory, revision).ok().flatten()
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self
+      .content(properties)
+      .and_then(entries)?
+      .into_iter()
+      .find(|(name, _)| *name == MERGEINFO)
+      .map(|(_, value)| value)
+  }
+}
+
+/// The records as a read source (A-681): a revision's properties as held; a property list decoded in place from the
+/// bytes held under its identity, FSFS's form; a text from an offset to its end, held in one piece.
+impl ReadSource for Repository {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    let properties = Repository::revision_properties(self, revision)?;
+    Some(
+      properties
+        .iter()
+        .map(|(name, value)| (name.as_slice(), value.as_slice()))
+        .collect(),
+    )
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    self.content(identity).and_then(entries)
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    let text = self.content(identity)?;
+    text.get(usize::try_from(offset).ok()?..)
+  }
 }
 
 impl Green for Repository {
