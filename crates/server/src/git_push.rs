@@ -367,12 +367,15 @@ impl<P> ReceivePack<P> {
         .map_err(PushFailed::Exchange)?;
     }
     // A-724 piece 1: the push is counted on its repository's row as it begins.
-    state.vcs_usage.begun(
-      &repository,
-      principal,
-      Work::Intake,
-      slates_rt::futures::now_ns(),
-    );
+    let begun = slates_rt::futures::now_ns();
+    state
+      .vcs_usage
+      .begun(&repository, principal, Work::Intake, begun);
+    PHASE_LONGEST.with(|longest| {
+      if let Ok(mut longest) = longest.try_borrow_mut() {
+        longest.entry(repository).or_default().begun_at = Some(begun);
+      }
+    });
     Ok(ReceivePack {
       repository,
       principal: principal.clone(),
@@ -472,6 +475,21 @@ impl<P> ReceivePack<P> {
   /// deletes, checked as its request ended, answers so at once. A refusal of the exchange ends the
   /// push.
   fn check_turn(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
+    // The pack's waiting deltas resolve a turn at a time first (A-724's starvation fix: resolved whole in the last input
+    // step, git/git v1.5.0's held its shard 1.4 s, starving the small repositories there), what each turn resolves
+    // admitted to the quarantine as an input's is.
+    if self.session.is_resolving() {
+      let ns = state.config.step_quantum_ns();
+      self.intake(state, |session, site, admission| {
+        let mut clock = ShardClock;
+        let quantum = Quantum {
+          clock: &mut clock,
+          ns,
+        };
+        session.resolve_turn_into(site, admission, quantum)
+      })?;
+      return Ok(false);
+    }
     if !self.session.is_checking() {
       return Ok(self.session.checked().is_some());
     }
@@ -1085,13 +1103,106 @@ fn prepare(
 /// Counts a step of a push of `repository`'s that began at `began` on the shard's clock and read `bytes_in` of the
 /// client's bytes on the repository's usage row (A-724 piece 1, `slates_vcs::usage`).
 fn charge_step(state: &mut ShardState, repository: RepositoryId, began: u64, bytes_in: u64) {
-  let now = slates_rt::futures::now_ns();
-  state.vcs_usage.stepped(
-    &repository,
-    Work::Intake,
-    (now.saturating_sub(began), bytes_in),
-    now,
+  charge_phase(
+    state,
+    repository,
+    began,
+    bytes_in,
+    if bytes_in > 0 { PHASE_INPUT } else { PHASE_END },
   );
+}
+
+/// Format: a push step's phase in [`PhaseLongest`]: a run of the body read.
+const PHASE_INPUT: usize = 0;
+/// Format: the step that ends the body.
+const PHASE_END: usize = 1;
+/// Format: a turn of the pack's checks (A-719), an answer step that answers `Turned`.
+const PHASE_CHECK: usize = 2;
+/// Format: the answer's last step (seal, hooks' views, verdicts, commit and report), one that answers `Answered`.
+const PHASE_ANSWER: usize = 3;
+
+/// Each phase's steps of a git push on this shard, per repository (A-724's profile: where a push holds its shard, and
+/// how long it waits between its steps): indexed by phase [input, end, check turn, answer].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PhaseSteps {
+  /// The longest step of each phase, nanoseconds.
+  pub(crate) longest: [u64; 4],
+  /// Steps of each phase.
+  pub(crate) steps: [u64; 4],
+  /// The nanoseconds those steps ran.
+  pub(crate) ns: [u64; 4],
+  /// The nanoseconds from the repository's previous push step's end to each step's start, summed by the step's phase:
+  /// before a check turn or an answer step, the time the push waited for its shard (it was ready); before an input step,
+  /// that and the client's bytes.
+  pub(crate) gap_ns: [u64; 4],
+  /// The nanoseconds from each push's beginning (its session made, `vcs_usage`'s `begun`) to its first step.
+  pub(crate) first_gap_ns: u64,
+  /// The shard clock at the repository's latest push step's end; zero before its first.
+  last_end: u64,
+  /// The shard clock at a push's beginning while its first step is still to come.
+  begun_at: Option<u64>,
+}
+
+/// [`PhaseSteps`] by repository on this shard: one entry a repository with a push stepped here, so bounded by the
+/// partition's repositories.
+pub(crate) type PhaseLongest = std::collections::BTreeMap<RepositoryId, PhaseSteps>;
+
+std::thread_local! {
+  /// This shard's [`PhaseLongest`].
+  static PHASE_LONGEST: std::cell::RefCell<PhaseLongest> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// `repository`'s push steps by phase on this shard ([`PhaseSteps`]): zeros where none ran.
+pub(crate) fn phase_longest(repository: RepositoryId) -> PhaseSteps {
+  PHASE_LONGEST.with(|longest| {
+    longest
+      .try_borrow()
+      .ok()
+      .and_then(|longest| longest.get(&repository).copied())
+      .unwrap_or_default()
+  })
+}
+
+/// Counts a step of phase `phase` ([`PhaseSteps`]) on the repository's usage row and its phase's steps.
+fn charge_phase(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  began: u64,
+  bytes_in: u64,
+  phase: usize,
+) {
+  let now = slates_rt::futures::now_ns();
+  let step_ns = now.saturating_sub(began);
+  state
+    .vcs_usage
+    .stepped(&repository, Work::Intake, (step_ns, bytes_in), now);
+  PHASE_LONGEST.with(|longest| {
+    if let Ok(mut longest) = longest.try_borrow_mut() {
+      let entry = longest.entry(repository).or_default();
+      let gap = match entry.begun_at.take() {
+        Some(begun) => {
+          entry.first_gap_ns = entry
+            .first_gap_ns
+            .saturating_add(began.saturating_sub(begun));
+          0
+        }
+        None if entry.last_end == 0 => 0,
+        None => began.saturating_sub(entry.last_end),
+      };
+      entry.last_end = now;
+      if let (Some(most), Some(steps), Some(ns), Some(gaps)) = (
+        entry.longest.get_mut(phase),
+        entry.steps.get_mut(phase),
+        entry.ns.get_mut(phase),
+        entry.gap_ns.get_mut(phase),
+      ) {
+        *most = (*most).max(step_ns);
+        *steps = steps.saturating_add(1);
+        *ns = ns.saturating_add(step_ns);
+        *gaps = gaps.saturating_add(gap);
+      }
+    }
+  });
 }
 
 /// Counts a step of a push's answer that began at `began` (A-724 piece 1), and the push as answered when the step
@@ -1102,7 +1213,12 @@ fn charge_answer(
   began: u64,
   stepped: &Result<Answering, PushFailed>,
 ) {
-  charge_step(state, repository, began, 0);
+  let phase = if matches!(stepped, Ok(Answering::Answered(_))) {
+    PHASE_ANSWER
+  } else {
+    PHASE_CHECK
+  };
+  charge_phase(state, repository, began, 0, phase);
   if let Ok(Answering::Answered(_)) = stepped {
     state
       .vcs_usage
