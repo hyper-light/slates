@@ -26,6 +26,8 @@
 #   PUSH_CHUNK  when set, the first push is made as one push of each PUSH_CHUNK-th revision in turn (`-r REV -f`, its
 #           ancestors with it) and a last push of the rest, timed together, for a server that refuses the whole history
 #           in one request; recorded as "push-chunked"
+#   SLATES_FILL  "import" fills slates' repository by `slates repository import project SOURCE` (A-710) in place of
+#           the first push, timed as "import"; stock's is pushed as ever
 #   HG      the `hg` executable (Mercurial 7.2 here: the `hg` of `uvx --from mercurial==7.2`'s environment)
 #   SOURCE  a clone of the dataset (`hg clone -U https://www.mercurial-scm.org/repo/hg`)
 #   WORK    a scratch directory, made empty here and removed at the end
@@ -40,6 +42,7 @@ RUNS=${4:-3}
 BOUND=${5:-1800}
 SERVERS=${SERVERS:-stock}
 PUSH_CHUNK=${PUSH_CHUNK:-0}
+SLATES_FILL=${SLATES_FILL:-push}
 SLATES=${SLATES:-slates}
 
 rm -rf "$WORK"
@@ -143,6 +146,7 @@ start_slates() {
   done
   "$SLATES" --instance "$instance" bootstrap root > /dev/null
   "$SLATES" --instance "$instance" repository create project --tool hg > /dev/null
+  IMPORT=("$SLATES" --instance "$instance" repository import project "$SOURCE")
   # shellcheck disable=SC2086 # the surface's NAME=VALUE pairs are words
   token=$(env $exports "$SLATES" --instance "$instance" credential token | sed -n 's/^token: //p')
   URL="http://127.0.0.1:$port/project"
@@ -188,7 +192,9 @@ check() {
 # Runs the steps against the server started for run $2 ($1 its name).
 steps() {
   local server=$1 run=$2 clone="$WORK/$1-clone-$2" scratch="$WORK/$1-scratch-$2" new
-  if [ "$PUSH_CHUNK" -gt 0 ]; then
+  if [ "$server" = slates ] && [ "$SLATES_FILL" = import ]; then
+    timed "$server import $run" "${IMPORT[@]}"
+  elif [ "$PUSH_CHUNK" -gt 0 ]; then
     push_chunked "$server push-chunked $run"
   else
     timed "$server push $run" "${H[@]}" ${AUTH[@]+"${AUTH[@]}"} -R "$SOURCE" push -q "$URL"
@@ -231,7 +237,7 @@ for run in $(seq 1 "$RUNS"); do
 done
 
 echo "== results (seconds; every run shown)"
-for step in push push-chunked clone incremental-push incremental-pull stream; do
+for step in push push-chunked import clone incremental-push incremental-pull stream; do
   for server in $SERVERS; do
   printf '%-18s %-6s' "$step" "$server"
   grep "^$server $step " "$RESULTS" | awk '{ printf " %s%s", $4, ($5 == "ok" ? "" : "(" $5 ")") }
