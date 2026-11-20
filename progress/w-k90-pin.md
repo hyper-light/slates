@@ -67,3 +67,10 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   Slates step taken back out of `build`. Windows x86-64 = w-k90-win's windows-slates job.
 - Poller: ~/kiln-work/w-k90-pin-logs/poll2.sh 715063153 (first completed, non-cancelled main run containing it).
 - Goal on my kiln stack: 01a1fa367d4c (plan 01a1fa36 step 1): goals_done with commit + run ids per platform + base.
+- 2026-11-20 ~11:35 PST: user: don't block on CI; local tests + merge. Poller stopped. GitHub CI for main is STUCK:
+  run 44784299374 (0a17f46e5) macos-latest Clippy running since 17:46Z (>2h; 7 GB runner); every newer main run
+  (44790740630 ca1a0302e .. 44802263763 cc1ecb625, incl. 44794235390 = 715063153) cancelled while pending.
+  Cancelling it needs a GitHub credential (not here). LANDED kiln cc1ecb625..4244a0f9e: timeout-minutes build 90,
+  slates 120.
+- RISK: macos-latest (7 GB) may not compile kiln's lib tests in the slates job either.
+- Goal 01a1fa367d4c NOT marked: its CI run-id clause has no evidence yet. All code merged; local macOS green.
