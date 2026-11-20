@@ -1025,7 +1025,11 @@
 > `push::read_bundle`; `prepare`, the policy, a gate refusing every push while a Mercurial hook is configured, the
 > landing), its revisions kept in a fork of the index in the repository's store in A-662's map (`hg_push::land` over
 > the Mercurial arm, `Objects` gone), its answer framed as 7.2 frames `unbundle`'s (`serve::http::pushed`); HTTP's
-> capabilities list `unbundle` and a push's bundle2 capabilities. {{RUN-GAPS}}
+> capabilities list `unbundle` and a push's bundle2 capabilities. Red first (the edge's push test over main without the fix:
+> `200` `application/hg-error`, kiln r467); `slates-hg --lib push:: serve::` 93 of 93, `slates-server --lib` filtered 64
+> of 64 and fmt clean on macOS arm64 (Mac Studio, kiln r467 and r480, 2026-11-19): stock 7.2's own HTTP push over a
+> two-shard daemon's TLS edge answered with 7.2's reply but its progress words, `heads` the pushed changeset after it;
+> the other platforms owed.
 > **Open (A-680 part 2b): a push's revisions are not durable.** Its entry records its moves and phase roots and no
 > record of its revisions, and a recovery replays no Mercurial record, so after a restart the store lacks what pushes
 > brought while the register keeps their moves: `heads` answered from a store that no longer holds them. A-687 makes

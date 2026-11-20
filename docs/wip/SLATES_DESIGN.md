@@ -13996,8 +13996,16 @@ signature verification).
 > (`adding changesets`, `added 1 changesets with 1 changes to 1 files`) are not sent; they are no part a client acts on.
 > Not yet durable: a push's entry records its lines', bookmarks' and phase roots' moves and no record of its revisions,
 > so a restart's store lacks them while the register keeps their moves (A-687 makes Mercurial's record kind; A-680 part
-> 2c records pushes with it). Proven on macOS arm64 (Mac Studio, kiln r467, 2026-11-19; the other platforms owed):
-> {{RUN-STATUS}}
+> 2c records pushes with it). Proven on macOS arm64 (Mac Studio, kiln r467 and r480, 2026-11-19; the other platforms
+> owed):
+> red first, the edge's push test over main without the fix failing, its first push answered `200`
+> `application/hg-error` `command not served here` (kiln r467 over 10df7becc); then `slates-hg --lib push:: serve::` 93
+> of 93 (r467), `slates-server --lib` filtered to `vcs_http::`, `vcs_store::hg_view` and `repository::hg_push` 64 of 64
+> (r480), fmt clean: a two-shard daemon's edge, over TLS with stock hg's fields and a bearer token, takes the captured
+> server's history and then the very bundle stock 7.2 pushed to it over HTTP, answers 7.2's own reply but its progress
+> words, then `heads` the pushed changeset and `listkeys phases` 7.2's own answer byte for byte; the driver lands stock
+> `push-plain` over the real served view, answered byte for byte as 7.2 answered it, and refuses a hooked repository's
+> push naming its hook with nothing recorded; the bundles 7.2 does not read are answered in its words.
 
 **Role.** Stock Mercurial clients clone, pull and push repositories that slates holds, over Mercurial's HTTP and SSH
 protocols, and browse them through hgweb's URLs, as they would a repository served by `hg serve`. Each branch head and
@@ -51891,7 +51899,26 @@ alone), GAPS (the §4.17.3 entry).
   recovery replays no Mercurial record (A-662's arm refuses one `Owed`), so after a restart the store lacks what pushes
   brought while the register keeps their moves. A-687 makes Mercurial's record kind (the import's); recording each
   push's objects with it is A-680 part 2c, never a second kind.
-- **Tests** (macOS arm64, Mac Studio, kiln r467, 2026-11-19, rustc 1.98.1). {{RUN-TESTS}}
+- **Tests** (macOS arm64, Mac Studio, kiln r467 and r480, 2026-11-19, rustc 1.98.1). Red first: kiln r467 over 10df7becc (main f1fbd2c44 with the edge's
+  test and the test helpers' visibility alone): `cargo test --locked -p slates-server --lib -- a_stock_mercurial_push
+  --test-threads=4` 0 passed and 1 failed, the history's push answered `(200, "application/hg-error", "command not
+  served here\n")`. Green: r467 over c9975fb8e, `cargo test --locked -p slates-hg --lib -- push:: serve::` 93 passed
+  and 0 failed (the four new among them), `cargo fmt -p slates-hg -p slates-server -- --check` clean; its server arm did
+  not compile (the push's `Outcome` met `vcs_hooks::Outcome` among `hg_push`'s unix imports), so it is `PushOutcome`
+  there; r480 over bd10c37e0, `cargo test --locked -p slates-server --lib -- vcs_http:: vcs_store::hg_view
+  repository::hg_push --test-threads=4` 64 passed and 0 failed, fmt clean.
+  `a_stock_mercurial_push_over_the_daemons_edge_lands_on_its_repositorys_shard`: a two-shard daemon over TLS takes, with
+  stock hg's fields, the captured server's history (`base`, `second`, `third` rebuilt to 7.2's nodes, `main` at `base`;
+  an empty reply) and then the very bundle stock 7.2 pushed to that server (`crates/hg/fixtures/wire`'s `http-push`),
+  answering 7.2's reply part for part but its two `output` parts, `heads` then `fourth` alone and `listkeys phases`
+  7.2's own answer byte for byte. `a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits`: stock
+  `push-plain` through the driver over the real served view answered byte for byte as 7.2 answered it, its changeset in
+  the store's index; a repository configuring a `pretxnchangegroup` hook refused naming it, its green unmoved and its
+  index without the changeset. slates-hg: stock 7.2's HTTP push bundle read part by part; 7.2's own replies to an
+  unknown mandatory part and parameter byte for byte; every header 7.2 does not read answered in its words; a reply, a
+  `pusherr` and a bundle1 framed over HTTP (the last 7.2's `bundle2required` answer byte for byte); arguments and
+  framings past the room out of band. A-657's pushes now land through the store's arm. The stock-hg CLI round trip
+  stays ignored until A-686.
 - **Owed.** A-680 part 2c (each push's record with A-687's kind, and its replay); the SSH edge's pushes (A-679's loop
   calls the same driver); the bundle read in slices; the stock-hg round trip over the edge once A-686 lands; the other
   platforms' runs (main's).
