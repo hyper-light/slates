@@ -10,8 +10,14 @@
   CARGO_TARGET_DIR=~/.cache/w-reaper-target). svn sources (1.15.0) fetched to ~/slates-work/svn-src.
   A-726 PART 2 LANDED: main 4511d1d (merged eae99ac): dav/report_mergeinfo.rs, reads::repository_mergeinfo, OPTIONS
   mergeinfo yes. Stock svn merge/blame -g/mergeinfo over HTTP == svnserve (svn_http_reports 2/2 on Studio-1).
-  NEXT: piece (2) pre-lock/post-lock hooks (A-693 part 2 left them owed; w-svn landed lock verbs 576a8a860), run as the
-  other svn hooks run (A-623 environment rules).
+  PIECE (2) BLOCKED (reported to main 2026-11-20): pre-lock/post-lock cannot "run as the other svn hooks run" -- no
+  svn hook runs on any route: svn://, svn+ssh:// and HTTP refuse a configured start/pre-commit hook ("This server does
+  not run this repository's hooks yet"; vcs_svn.rs 1095, vcs_ssh/svn.rs 679, vcs_http/svn.rs 736). svn_hooks::run
+  (A-661 part 1 glue) has no caller; A-661 part 2 (the calls) never landed. Running any hook needs a presented
+  read-only view of the repository (hook_driver Launch::view_root; git_hooks PresentView "the read-only attachment the
+  mount edges serve, owed") -- git's and hg's run_hooks have no production caller either. Also no CLI/client verb
+  sends SetRepositoryPolicy, so no user can configure a hook: the lock verbs ignoring a configured pre-lock (svn
+  locks granted where commits are refused) is a reading finding, not reproducible by use. Waiting for main's next piece.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
