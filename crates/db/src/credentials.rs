@@ -51,6 +51,7 @@ fn record_bytes(record: &CredentialRecord) -> usize {
 }
 
 /// The first half of a credential's id, as `DbError::AlreadyExists` names the record it met.
+/// Shape: 16 bytes, half of the 32-byte id.
 fn named(id: &[u8; 32]) -> [u8; 16] {
   id.first_chunk::<16>().copied().unwrap_or_default()
 }
