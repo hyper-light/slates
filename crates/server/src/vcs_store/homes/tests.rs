@@ -651,12 +651,14 @@ fn an_object_longer_than_a_window_is_homed_and_read_back_by_its_blake3() {
   crate::daemon::observe_first(&daemon, move |state| {
     let origin = state.shard;
     let shards = state.shards.clone();
-    let window = usize::try_from(state.store.content.chunk_bytes()).unwrap();
+    let window = state.store.content.chunk_bytes();
     let task = slates_rt::futures::spawn(async move {
       let budget = crate::daemon::LIVENESS_BUDGET_NS;
       let full = slates_cluster::CommitBudget::hard(budget, (budget / 100).max(1));
       let mut outcome: Vec<String> = Vec::new();
-      let bytes: Vec<u8> = (0..window * 3 + 17).map(|at| (at % 251) as u8).collect();
+      let bytes: Vec<u8> = (0..window * 3 + 17)
+        .map(|at| u8::try_from(at % 251).unwrap_or(0))
+        .collect();
       let identity = ContentId::of(&bytes);
       match home_in_region(origin, &shards, bytes.clone(), full).await {
         Ok(homed) if homed == identity => {}
