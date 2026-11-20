@@ -55026,3 +55026,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   and the seal (26 ms); the walk's propagation. A-722 stages the index rows a slice at a time as objects land, so the
   append only makes them visible, and slices the moves' admission and the seal. git/git by use (w-perf's
   `git_scale.sh`) after it.
+
+### A-722 part 1 — A repository's index adopts a fork whole (2026-11-20, w-git for UI goal 93; main's ruling on A-722's design, points 1 and 5; §4.17.1 "A push's intake", rules 1 and 4)
+- **The design (A-722, approved 2026-11-20).** A push stages its index rows in its own fork of the repository's index
+  as its objects land (concurrent pushes each their own fork), positions taken as each object arrives with readers
+  tolerating holes (no compaction at landing); commit rows and generation numbers in a sliced pass after the pack; the
+  moves' admission sliced before the append; the landing (the register append, ordered per repository) adopts the
+  fork's runs in O(runs) with the staged values, O(changes); a fork the parent outran is re-based in slices first;
+  admission the push's window and post-state on `vcs_share::room`. Then (ruling B) the index resolves an id to its
+  place in the stored pack and readers decode in place; head files come from the green.
+- **Change (this part).** `slates_vcs::Index::adopt`: a parent takes in a fork of itself whole, the fork's tail sealed
+  into tables of its own, its holds on the runs it took from the parent given back, and its own runs added as the
+  parent's newest: no row copied, no table written but the tail's. A fork records the runs it took and its parent's
+  count of rows taken in (`Index::fork`); a parent that took in rows since is refused `AdoptRefused::Stale` and an index
+  made by no fork `NotAFork`, the fork handed back whole.
+- **Tests.** `slates-vcs` `tests::a_parent_adopts_its_forks_rows_and_refuses_a_stale_fork`.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-vcs --lib` 92 of 92; fmt clean.
+- **Owed.** The rest of A-722 above.

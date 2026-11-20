@@ -11,7 +11,8 @@ use crate::arrival::{
 };
 use crate::content::{ContentId, ContentRefused, ContentStore, Form, IDENTITY_BYTES};
 use crate::index::{
-  Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, NewRow, TAIL_SLOT_BYTES,
+  AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, NewRow,
+  TAIL_SLOT_BYTES,
 };
 use crate::table::{RowRef, encode_body};
 
@@ -471,6 +472,43 @@ fn a_fork_holds_every_table_once_more_and_copies_no_row() {
   assert!(!store.contains(&ContentId::of(b"parent bytes")));
   assert!(fork.tables().all(|table| store.holders(&table) == 1));
   fork.release(&mut store).unwrap();
+  assert_empty(&store);
+}
+
+/// A-722 (a push's rows staged in its own fork, then made the repository's as the push lands). Do: fork a repository
+/// of three runs, insert three rows into the fork (two sealed into a run, one left in its tail) and adopt it; then fork
+/// again, insert a row into the parent, and adopt the second fork; and adopt an index made by no fork. Expect: the first
+/// adoption takes every row the fork held, writing only its tail's table and copying no row, each parent table held
+/// once again, the parent reading its rows and the fork's; the second handed back stale, unchanged, and the third as no
+/// fork; the store empty once all are released.
+#[test]
+fn a_parent_adopts_its_forks_rows_and_refuses_a_stale_fork() {
+  let mut store = store();
+  let (mut parent, mut fork, _) = parent_and_fork(&mut store);
+  let tables_before = parent.run_tables().len();
+  for name in [&b"push a"[..], b"push b"] {
+    insert_named(&mut fork, &mut store, name, name);
+  }
+  fork.seal_all(&mut store).unwrap();
+  insert_named(&mut fork, &mut store, b"push c", b"push c");
+  let expected = read(&fork, &store);
+  parent.adopt(&mut store, fork).unwrap();
+  assert_eq!(read(&parent, &store), expected);
+  assert_eq!(parent.run_tables().len(), tables_before + 2);
+  assert!(parent.tables().all(|table| store.holders(&table) == 1));
+  let stale = parent.fork(&mut store).unwrap();
+  insert_named(&mut parent, &mut store, b"landed first", b"landed first");
+  let before = read(&parent, &store);
+  let Err(AdoptRefused::Stale(stale)) = parent.adopt(&mut store, stale) else {
+    panic!("a stale fork adopted");
+  };
+  assert_eq!(read(&parent, &store), before);
+  let Err(AdoptRefused::NotAFork(alone)) = parent.adopt(&mut store, Index::new()) else {
+    panic!("an index of no fork adopted");
+  };
+  stale.release(&mut store).unwrap();
+  alone.release(&mut store).unwrap();
+  parent.release(&mut store).unwrap();
   assert_empty(&store);
 }
 
