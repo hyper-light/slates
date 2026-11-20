@@ -180,8 +180,13 @@
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
 > lands ignored. Piece 1 BUILT: `getbundle::Answering`, the answer a slice at a time, a clone of every head walked by
 > its links (the request holds ranges and a place), its least room a slice less than the whole answer's (test), the
-> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Owed: the server driving it
-> a turn at a time over HTTP and SSH (piece 2, which turns the red green); the stream clone's; w-interop's matrix rerun.
+> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Piece 2a BUILT (HTTP): the
+> edge begins a `getbundle` (`serve::http::begin`) and makes its body a turn at a time (`HgExchange::turn`): the view
+> lent for the turn alone, the shard's room (`vcs_share::room`) and step quantum (`HgStores::fetch_turn`), the stream
+> compressed as it is made (`compression::StreamCompressor`, each slice's engine bound charged first); a step past a
+> turn's room after others waits for the next turn's. The red is GREEN: the clone of a file twice a request's room is
+> answered whole. Owed: SSH (piece 2b); a hold on the index generation a fetch began on (rule 4: a push landing
+> mid-clone is read by the clone's later turns); the stream clone's; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

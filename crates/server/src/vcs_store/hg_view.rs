@@ -92,6 +92,15 @@ impl HgStores for ServedViews {
   fn push_room(&self, id: RepositoryId) -> Option<u64> {
     crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes)
   }
+
+  fn fetch_turn(&self, id: RepositoryId) -> Option<(u64, u64)> {
+    crate::state::with_state(|state| {
+      (
+        crate::vcs_share::room(state, id).bytes,
+        crate::vcs_store::hg_import::quantum_of(state),
+      )
+    })
+  }
 }
 
 /// [`held`], for the tests.
