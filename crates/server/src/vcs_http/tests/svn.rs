@@ -29,7 +29,7 @@ use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
 use slates_svn::dav::site::{self, Answer as SiteAnswer, ReportProgress};
 
 use super::{Lent, SvnExchange, SvnSite, SvnStores, served_of, xml_bounds};
-use crate::vcs_http::{Answer, Bounds, Decided, EdgeState, Exchange, Fields, serve};
+use crate::vcs_http::{Answer, Bounds, ClientGone, Decided, EdgeState, Exchange, Fields, serve};
 use crate::vcs_store::svn_view::ServedRecords;
 
 /// Shape: room enough for every request these tests send.
@@ -690,7 +690,7 @@ fn exchanged(
   if !body.is_empty() {
     ready(exchange.body(body)).unwrap();
   }
-  ready(exchange.body_end()).unwrap();
+  ready(exchange.body_end(ClientGone::never())).unwrap();
   let status = exchange.reply_status().code;
   let fields = ready(exchange.reply_fields()).unwrap();
   let (mut reply, mut runs) = (Vec::new(), 1);

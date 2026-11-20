@@ -891,6 +891,10 @@
 > presenter, a read-only attachment the mount edges serve (a read-only volume whose base-plane host reads the
 > repository's content store, under the root mount): until it lands a push whose repository configures a git hook is
 > refused `hook not run`, as before; the edges' signal of a client gone; the hooks' learned times; the SSH channel's call.
+> **A-665 part 4a (2026-11-20, w-git):** the HTTP edge's signal of a client gone (`vcs_http::ClientGone`, the socket's
+> close after the body) ends a hook's run. Owed: the SSH edge's; a TLS `close_notify` ahead of the close is not seen.
+> **A-665 part 4b (2026-11-20, w-git):** git's hooks held to the bound each learned on the owner shard
+> (`vcs_hooks::HookTimesTable`, A-622's table). Owed: a removed repository's entries forgotten; svn's and hg's callers.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
