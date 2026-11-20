@@ -935,3 +935,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   Unpublished{record 3560: segment profile 803,344,210 B > 746,962,928-byte region}; RSS 5,331 MiB. BUG BY USE -> w-svn
   TOP (before lock): after the refusal every svn commit E160004 (green ahead of records; repository wedged) -> green
   advance + record one atom, failing test first. Region wall -> A-716 + entry objects (w-perf, A-716 now).
+- ~00:30 PST ADA: "an individual slates server must be able to handle tens of thousands of concurrent large pushes.
+  For git - I would argue part of the reason we're crashing is the triplicate storage." -> content once moved INTO the
+  push fixes (not after): w-git A-719 = streaming intake, each object stored once on arrival, deltas against stored
+  bases, bounded working set, sliced; admission charges the working set, content charged as stored (A-714); w-git
+  writes the shared rule into §4.17.1. w-hg: same inside (3). w-svn: cite it on the commit path. w-perf: after A-716,
+  a concurrent-push load test (replay client; 1 -> 10,000+ pushes on one daemon), before T4.

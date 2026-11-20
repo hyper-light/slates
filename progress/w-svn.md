@@ -76,3 +76,14 @@
   61/61 after merge, db 29/29, fmt clean. A-716 (w-perf) takes svn texts held once.
 - Ledger rule now: A-number is mine only after pushing its line on agents/fanout-state (next free A-720).
 - NEXT: A-693 part 2 (svn:// lock verbs; interop E170003), then DAV pieces (g297 brief: the two HTTP rows, A-681).
+
+## A-693 part 2 PARKED (main: the wedge bug first) -- branch agents/w-svn-a693p2-wip (pushed), worktree w-svn-a714
+- Written, unbuilt: commit/record.rs Record::Locks (tag 4) + records.rs commit_record applies it; svn_commit record
+  step handles Locks (check_entries); serve/locks.rs (lock_verb/locks_landed, Pending, words, read, answer);
+  reads/locks.rs with_lock_value; may_write, full_path, lock_error_message made pub(crate).
+- TODO: serve.rs: `mod locks;`, Phase::LockAsked/Locking (+Debug, waiting, session, receive out-of-turn, established
+  arms), Turn::LockAsked, Answered::LockAsked in elsewhere/command; vcs_svn Next::LockAsked -> lock_verb + record +
+  locks_landed; tunnel: answer LockAsked as unserved (210001); tests vs commit/lock-bob session.
+
+## NOW: wedge bug (main): green advanced but svn record rolled back ("record 3560 not published ... profile exceeds
+## region"), then every commit E160004 Diverged. Fix: one atom. Worktree ~/slates-work/w-svn-atom from origin/main.
