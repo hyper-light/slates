@@ -1311,6 +1311,9 @@
 > real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
 > (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
 > clone pass: 14 of 24 (main 9f51d75, debug, Mac Studio). The matrices' rows count a command that cannot start as failed.
+> **svn:// interop runs (w-interop, 2026-11-20):** `svn_interop.rs`'s svn:// round trip un-ignored: stock svn 1.15.0's
+> checkout, commits, update and log over the daemon's svn:// listener pass (main 4785858, Mac Studio). svn+ssh still
+> closes the tunnel (`E210002`), and the HTTP legs meet `'/project' path not found` (the DAV reads, A-681).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
