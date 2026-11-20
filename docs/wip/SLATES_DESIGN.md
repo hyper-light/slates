@@ -15832,6 +15832,20 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > and UNLOCK, DAV's wiring A-661's next part once g298's serving lands. Tested on Linux x86_64 (adacachy, 2026-11-19):
 > the server's lib tests 630 passed beside main's 624, the glue's five new and nothing failing that main's tree passed;
 > each of its four choices broken in a copy failed only its own tests. The macOS run is owed.
+>
+> **Status (2026-11-20, A-730 part 1: the `svn://` listener runs the commit hooks).** Built: start-commit at
+> `open-root` (REPOS, the user, the client's `mergeinfo` capability, the transaction), pre-commit at `close-edit` (REPOS
+> and the transaction; on standard input the presented lock tokens, each path as the client sent it, relative to the
+> commit's base) and post-commit once the revision stands (REPOS, the revision, the transaction), each the hook the
+> repository's policy configures, run by `svn_hooks::run` (A-622's driver with A-623's rules), held to the bound its
+> runs taught the shard (taught again as each run ends) and ended if the client hangs up (`vcs_http::ClientGone`). A
+> start-commit or pre-commit that refuses refuses the command in `check_hook_result`'s words; post-commit's failure is
+> `commit-info`'s `post-commit-err`, the commit standing; a client that left before its hook ended ends the
+> conversation. REPOS is `/<repository name>`, `SVNParentPath`'s layout, until A-645's read-only FSFS-layout view gives
+> stock `svnlook` a directory. Windows, with no driver, still refuses a commit at a configured point. Held to the
+> listener's tests: a refusing start-commit answered in `svnserve`'s words with no revision made; accepting start- and
+> pre-commit given `svnserve`'s arguments and standard input; a failing post-commit's words in `commit-info`. Owed: the
+> lock hooks, `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -54870,3 +54884,24 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   pushed: piece 3's memory share does not schedule CPU, so the shard's step quanta scheduled fairly by repository is next.
   R = 1,000 waits on one copy a byte (A-723, A-727). A push of git/git v2.0.0 ends the daemon (reported).
 
+
+### A-730 — ra_svn runs a repository's hooks (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 9; A-661 part 2, A-622, A-623, A-648)
+
+- **What was there.** A-661 part 1 built the glue (`svn_hooks::run`) and the commit drive's pauses (A-655), but nothing
+  called it: the `svn://` listener, the `svn+ssh://` tunnel and the DAV site refused any commit to a repository with a
+  hook configured at start-commit or pre-commit ("This server does not run this repository's hooks yet"), never ran
+  post-commit, and ignored the lock hooks.
+- **Part 1 (this change): the `svn://` listener's commit hooks.** `vcs_svn::run_hook` reads the repository's policy on
+  its owner shard, builds the point's input with its hooks-env and REPOS (`/<name>`), runs `svn_hooks::run` held to
+  the hook's learned bound and ended on the client's hang-up, and teaches the shard's hook times. `answer_hook` runs
+  start-commit (the user, `mergeinfo` where the client announced it, the transaction) and pre-commit (the transaction,
+  the presented lock tokens from the drive's `Pending::lock_tokens`, each path relative to the commit's base) and
+  resumes the drive with the verdict; `land` runs post-commit after the append and writes its failure as
+  `post-commit-err`. Windows keeps the refusal at a configured point.
+- **Tests.** `slates-server` `vcs_svn::tests::a_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`
+  and `a_commit_over_svn_runs_its_repositorys_commit_hooks_as_svnserve_runs_them` (shell-script hooks through
+  `SetRepositoryPolicy`; stock `svn`'s recorded commit; red before: the not-run refusal, no hook run); `slates-svn`
+  `commit::drive::tests::pre_commits_lock_tokens_name_each_path_as_the_client_sent_it`. macOS arm64, Mac Studio.
+- **Applied in the same change to** §4.17.4 item 9's status, GAPS (A-661's line), amendments.tsv.
+- **Owed.** Part 2: pre-lock (its token the lock's) and post-lock, pre- and post-unlock around A-602's check. Part 3:
+  the `svn+ssh://` tunnel. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
