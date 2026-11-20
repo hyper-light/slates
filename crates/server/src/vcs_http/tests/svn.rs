@@ -29,8 +29,8 @@ use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
 use slates_svn::dav::site::{self, Answer as SiteAnswer, ReportProgress};
 
 use super::{Lent, SvnExchange, SvnSite, SvnStores, served_of, xml_bounds};
-use crate::vcs_store::svn_view::ServedRecords;
 use crate::vcs_http::{Answer, Bounds, Decided, EdgeState, Exchange, Fields, serve};
+use crate::vcs_store::svn_view::ServedRecords;
 
 /// Shape: room enough for every request these tests send.
 const ROOM: u64 = 1 << 20;
@@ -538,7 +538,10 @@ fn committed_repository(state: &mut crate::state::ShardState) -> RepositoryId {
     "{reply:?}"
   );
   let repositories = state.db.partition().repositories();
-  let id = repositories.repository_named(COMMITTED).expect("the record").id;
+  let id = repositories
+    .repository_named(COMMITTED)
+    .expect("the record")
+    .id;
   let (a, b): (&[u8], &[u8]) = (b"alpha\n", b"beta\n");
   let revision = slates_svn::commit::revision::Revision {
     head: 0,
@@ -573,7 +576,10 @@ fn committed_repository(state: &mut crate::state::ShardState) -> RepositoryId {
 /// `log-report` of every revision.
 fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, Vec<u8>) {
   let mut stores = ServedRecords;
-  let held = (stores.holds(id), stores.holds(RepositoryId { bytes: [9; 16] }));
+  let held = (
+    stores.holds(id),
+    stores.holds(RepositoryId { bytes: [9; 16] }),
+  );
   let (owner, root) = (daemon_owner(), format!("/{COMMITTED}"));
   let (bounds, room) = (xml_bounds(ROOM), usize::try_from(ROOM).unwrap());
   let mut answer = |method: &str, path: &str, depth: Option<&str>, body: &[u8]| {
@@ -639,9 +645,16 @@ fn the_daemons_lender_serves_a_repositorys_committed_records() {
   let read = outcome.recv_timeout(PATIENCE);
   daemon.stop();
   let (held, other, listing, text, log) = read.expect("the lender's task answered");
-  let (listing, log) = (String::from_utf8(listing).unwrap(), String::from_utf8(log).unwrap());
-  let listed = ["/committed/trunk/", "/committed/trunk/a.txt", "/committed/trunk/sub/"]
-    .map(|href| listing.contains(&format!("<D:href>{href}</D:href>")));
+  let (listing, log) = (
+    String::from_utf8(listing).unwrap(),
+    String::from_utf8(log).unwrap(),
+  );
+  let listed = [
+    "/committed/trunk/",
+    "/committed/trunk/a.txt",
+    "/committed/trunk/sub/",
+  ]
+  .map(|href| listing.contains(&format!("<D:href>{href}</D:href>")));
   let logged = [
     "<D:version-name>1</D:version-name>",
     "<D:creator-displayname>alice</D:creator-displayname>",

@@ -2110,13 +2110,23 @@ fn same_listings(
     let listed = index
       .children(path, revision)
       .map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))?;
-    let expected = (fs.nodes[label].kind == NodeKind::Directory)
-      .then(|| tree.keys().filter_map(|other| child_name(path, other)).collect::<Vec<_>>());
+    let expected = (fs.nodes[label].kind == NodeKind::Directory).then(|| {
+      tree
+        .keys()
+        .filter_map(|other| child_name(path, other))
+        .collect::<Vec<_>>()
+    });
     if listed != expected {
-      return Err(format!("{path}@{revision}: listed {listed:?}, naive {expected:?}"));
+      return Err(format!(
+        "{path}@{revision}: listed {listed:?}, naive {expected:?}"
+      ));
     }
     let through_copy = listed.iter().flatten().any(|name| {
-      let child = if path == "/" { format!("/{name}") } else { format!("{path}/{name}") };
+      let child = if path == "/" {
+        format!("/{name}")
+      } else {
+        format!("{path}/{name}")
+      };
       index.history(&child).is_ok_and(<[HistoryEntry]>::is_empty)
     });
     census.listed_through_copies += usize::from(through_copy);

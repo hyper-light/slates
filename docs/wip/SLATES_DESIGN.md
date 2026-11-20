@@ -52330,3 +52330,41 @@ the crate; `dav/locking.rs`'s `convert_status` with `dav_svn__convert_err`'s who
   inherited-props, get-locks, list, file-revs), then the update-report through A-627's drive for `svn checkout`, with
   the site composed into the daemon's edge (main's ask: git's site alone answers today, so a stock client of another
   tool meets `404`); part 2, the write side; main's runs (clippy, `xtask`, the other platforms, red-checks).
+
+### A-681, the lender — A Subversion repository's records lent as the read source on their owner shard: the records as `reads::Repository` and `mergeinfo::Contents`, a directory's entries from the index's new listing, and the daemon's `ServedRecords` (2026-11-19, g297, UI goal 93 (kiln 51cef9f7); §4.17.4 item 5 "HTTP", item 10 and pieces 7 and 13; A-655 part 2b, A-662, A-553; for A-689's svn:// listener too)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`index.rs`'s
+`Index::children` and its oracle in `index/tests.rs`; `migration/records.rs`'s `Contents` and `reads::Repository`
+for the records; the index's and the records' module documentation); `crates/server` (`vcs_store/svn_view.rs`, new;
+`vcs_http/svn.rs` without its placeholder stores, `vcs_http.rs`'s `svn` opened to the crate; the site's tests).
+
+- **The listing** (`Index::children`). FSFS keeps a directory's entries; the index keeps none, only each path's
+  history and shape lists (A-553). A directory's entries in a revision are the names the index named directly beneath
+  it, and beneath each copy's source that what stands beneath it comes from, down the chain `shape_above` decides for
+  a name with no history of its own (each source's revision before its copy's, so the chain ends); each name is kept
+  where its own path resolves to a node there. One run of the path map from the directory's path on gives its named
+  children, each child's subtree passed at once by starting after it (`AFTER_SEPARATOR`, the character after `/`), so
+  a listing reads names, never descendants. `None` where nothing, or a file, stands.
+- **The read source** (`migration::Repository`): a revision's properties as held; a property list decoded in place
+  from the bytes held under its identity (FSFS's form, the records' own decoder); a text from an offset to its end,
+  held in one piece; `svn:mergeinfo` from a list; a directory's entries from the listing.
+- **The lender** (`vcs_store::svn_view`): `ServedRecords` lends the DAV site a repository's records on this shard as
+  they stand, with its UUID as text and the owner's wall clock as the instant locks are judged at; `lend_in` is the
+  same over a shard state a caller already holds, for the svn:// listener's connection (A-689; main's ruling: one
+  lender). A repository whose records this shard does not hold is not lent (`503`). No read rules are given: no
+  record names a repository's authorization file or a principal's Subversion user yet, so a principal reads every
+  path the repository's policy lets it read, as `svnserve` reads every path without an `authz-db`. The placeholder
+  stores (`NoSvnStores`) are gone.
+- **Tests and the run.** The index's oracle now lists every directory of every generated revision and holds it equal
+  to the naive tree's, a file's and an absent path's listing none, and its census requires listings that reach a name
+  only through a copy's source (`listed_through_copies`). `the_daemons_lender_serves_a_repositorys_committed_records`
+  makes a Subversion repository on a daemon's shard, commits revision 1 through the owner's step (A-655 part 2b), and
+  reads it from a task on that shard through `ServedRecords`: held (another repository not), the trunk listed with its
+  two children by a PROPFIND at depth 1, a file's text by GET, and the log of every revision by REPORT. macOS arm64,
+  Mac Studio, 2026-11-19/20: kiln r470 (23:58-00:00Z, over main 9ca6e3883) `cargo test --locked -p slates-svn --lib
+  -- index:: migration:: reads:: dav::` 177 of 177 (the server's build refused
+  `HostClock::wall_ns` without its trait in scope: fixed); kiln r479 (00:01-00:04Z) on the fixed tree (crates byte for
+  byte this change's after `cargo fmt`, tree `f7ff212d`): the same 177 of 177, `cargo test --locked -p slates-server
+  --lib -- vcs_http::svn:: --test-threads=4` 6 of 6, `cargo fmt -p slates-svn -p slates-server -- --check` clean.
+- **Owed.** The site in the daemon's `ToolSites` (the next slice); the update-report; a home for a repository's
+  authorization file and a principal's Subversion user; main's runs (clippy, `xtask`, the other platforms,
+  red-checks).
