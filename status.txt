@@ -6,3 +6,8 @@ run 2 exit 0 0 skip-lines
 run 3 exit 0 0 skip-lines
 run 4 exit 0 0 skip-lines
 run 5 exit 0 0 skip-lines
+run 6 exit 0 0 skip-lines
+run 7 exit 0 0 skip-lines
+run 8 exit 0 0 skip-lines
+run 9 exit 0 0 skip-lines
+run 10 exit 0 0 skip-lines
