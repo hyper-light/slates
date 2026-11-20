@@ -93,20 +93,21 @@ jobs:
           echo "cdb: ${cdb:-none}" >> "$out/status.txt"
           cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep > "$out/fsx.txt" 2>&1 &
           xt=$!
-          for round in 1 2 3; do
-            sleep 90
-            {
-              echo "==== round $round at $(date -u +%T)"
-              tasklist //v //fi "IMAGENAME eq slates.exe"
-              tasklist //v //fi "IMAGENAME eq fsx.exe"
-            } >> "$out/stacks.txt" 2>&1
+          # Wait until fsx runs, then 60 s more, so every snapshot falls inside the wedge (op 45 comes within seconds).
+          for n in $(seq 1 120); do tasklist //fi "IMAGENAME eq fsx.exe" | grep -q fsx.exe && break; sleep 5; done
+          echo "fsx seen at $(date -u +%T)" >> "$out/status.txt"
+          sleep 60
+          syms="srv*c:\\symbols*https://msdl.microsoft.com/download/symbols;$(cygpath -w "$GITHUB_WORKSPACE/target/debug");$(cygpath -w "$GITHUB_WORKSPACE/target/debug/deps")"
+          for round in 1 2; do
+            echo "==== round $round at $(date -u +%T)" >> "$out/stacks.txt"
             for img in slates.exe fsx.exe; do
-              for pid in $(tasklist //fo csv //nh //fi "IMAGENAME eq $img" | tr -d '"\r' | cut -d, -f2); do
+              for pid in $(tasklist //fo csv //nh //fi "IMAGENAME eq $img" | tr -d '"\r' | cut -d, -f2 | grep -E '^[0-9]+$'); do
                 echo "==== $img pid $pid round $round" >> "$out/stacks.txt"
-                [ -n "$cdb" ] && timeout 120 "$cdb" -pv -p "$pid" -c ".symfix c:\\symbols; .reload; ~*kn 40; qd" >> "$out/stacks.txt" 2>&1
+                [ -n "$cdb" ] && timeout 150 "$cdb" -pv -p "$pid" -y "$syms" -c "~*kn 50; qd" >> "$out/stacks.txt" 2>&1
               done
             done
             "$RUNNER_TEMP/publish.sh"
+            sleep 30
           done
           wait $xt
           echo "fsx exit $?" >> "$out/status.txt"
