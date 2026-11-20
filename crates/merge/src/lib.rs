@@ -36,6 +36,7 @@ pub mod checkpoint;
 pub mod derive;
 mod dims;
 pub mod engine;
+pub mod held;
 mod history;
 mod identity;
 pub mod increment;
