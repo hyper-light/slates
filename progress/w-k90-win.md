@@ -48,3 +48,19 @@
 - jupiter has NO Python 3: slates_e2e bare_metal drives skip without it (NO_PYTHON, even with SLATES_E2E=1). Python is
   an install -> asked main for Ada's word. GitHub windows-latest has Python (job `windows (Slates tests)`).
 - w-k90-pin added `slates` job (715063153) on ubuntu/macos/windows-11-arm; mine (`windows (Slates tests)`) is windows-latest.
+
+## 2026-11-20 ~12:30 PST: by-use on jupiter -- RED in Slates' channel on Windows (before any mount)
+- r19 (jupiter, kiln main da441f112): kiln.exe built (12m21s); `KILN_TEST_KILN=...\kiln.exe cargo test -p kiln --lib --
+  workspace::bare_metal_tests` (lib tests built 29m) FAILED: "Slates' anchor ended before its instance answered: the host
+  refused: the channel's shared memory refused: shared layout refused at 0 for 64 bytes: TouchesWord".
+- r24 RUST_BACKTRACE=1: from kiln::workspace::slates::up_or_started <- ensure_up <- make_as <- workspace::prepare, i.e. the
+  first attach to a fresh instance (kilntest<pid>), no mount yet. Anchor log: daemon started, 2 shards, served normally.
+- Reading: "host refused" = the daemon's refusal relayed at rendezvous; 64 bytes at 0 matches slates-ipc
+  ClientRegion::create's fixed-header write (region.rs:303, FIXED_HEADER_BYTES=64) -> on Windows something declares a
+  word in [0,64) or the check misfires. Not found by reading (REGION_WORDS start at 64; Layout::touches looks right).
+- Slates CI gives no Windows evidence (every main run cancelled by newer pushes).
+- NEXT: r25 on jupiter: slates main clone C:\Users\corph\w-k90-win\slates, `cargo test -p slates-ipc --lib -- region
+  endpoint` (same one target). Red there -> Slates bug: fix in slates (failing test first), then w-k90-pin re-pins.
+- kiln server dropping runs often (r13, r22, r25/r26 lost).
+- GitHub run 44784299374: windows-latest clippy job 136462100146 failed (fixed by da441f112); slates_e2e step failed
+  (expected: kiln lib didn't compile on Windows then).
