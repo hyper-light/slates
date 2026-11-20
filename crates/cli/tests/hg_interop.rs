@@ -709,7 +709,9 @@ fn stock_hg_clones_over_the_ssh_edge() {
 
 /// A-575 and A-654 (`slates repository branch create|retire|bind` in a Mercurial repository, where a plain name is a
 /// bookmark; 62fb88997). Do: over the HTTP edge, push a first changeset to `default` as stock hg 7.2; make `topic` from
-/// `default` with the CLI and list a fresh clone's bookmarks; retire `topic` and list another fresh clone's; bind `topic`
+/// `default`'s first line with the CLI (`--from branch:default:0`, the namespace's spelling of a named branch's line:
+/// a plain name there is a bookmark, so `--from default` names a bookmark `default`, which is refused `NotFound`) and
+/// list a fresh clone's bookmarks; retire `topic` and list another fresh clone's; bind `topic`
 /// again to the green the create printed and list a third's. Expect `topic` at the pushed changeset after the create,
 /// gone after the retire, and back at the same changeset after the bind: stock hg sees the namespace the CLI changes.
 /// Skips loudly without stock hg 7.2 ([`STOCK_HG`]) and where the platform names no issuer surface ([`issuer_of`]).
