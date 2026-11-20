@@ -631,6 +631,8 @@ pub(crate) fn create_branch(
     engine.set_rejected_budget(budget);
   }
   crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new(), (None, None));
+  // Git's site serves every name the namespace binds (A-743): the new branch's ref, at the commit it was made at.
+  crate::vcs_store::commits::branch_made(state, id);
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
   }
