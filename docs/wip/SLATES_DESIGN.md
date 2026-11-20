@@ -57088,10 +57088,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
 - **Measured.** `named_tests::a_named_text_is_read_a_slice_a_step_then_lands_whole`: a 4 MiB text read in 64 steps of
   at most 64 KiB, refused `ContentUnread` before, accepted after with the green's file the text's bytes; its encoding
   under 4 KiB (the names), decoded with its run unread again.
-- **Owed, named.** Part 2: the commit building the green's file blocks a slice a unit off the green and publishing in
-  one step (today `Green::commit` copies the file's bytes in one call); the server's `Objects` over vcs_store's plane
-  and the landing's turns (w-svn's `svn.land.*` counters); replay reading a chain entry's runs before
-  `apply_recorded`; items 3-7 then name the plane's object from the green's block with no copy.
+- **Part 2, held once and landed in turns** (main's piece; Ada's sizing rule: a landing's memory bounded by a slice
+  beside the file, never the file twice). A run is read into a buffer of its own (`named::Read`, one a run, reserved at
+  its length, pages made as written), never onto the post-state; the engine reads every added byte through one view
+  (`named::Post`: the inline bytes, then the runs). `Green::judge_named` moves the runs' buffers into the verdict held
+  (`Green::judge` copies them, so no caller loses bytes), and the commit makes each file whose bytes are exactly one
+  run's, made by no other file, of that buffer, moved (`take_whole_runs`): the text is the green's file with no copy.
+  A created file's bytes are made at the commit, not in the verdict (`merge_create` builds them only to compare with
+  a file standing there). The server reads a run from vcs_store's content plane (`vcs_store::named_objects::
+  PlaneObjects`: identity -> the node-local root, `ContentStore::window_range_in` reading a window's range straight
+  into the run's buffer, so a read copies its own bytes); a recovery's replay, which holds the shard read-only, reads
+  with the shard's chunk store given in place of a lent one (`WindowStorage::read_range_in`'s `kept_in`), the entry
+  kept a copy slice a step until its runs are read (`GreenReplayPhase::Chain::reading`; a missing object fences
+  `ContentMissing`). Measured (`t_a760_a_large_named_text_lands_a_slice_a_turn_held_once`, debug): an 8 MiB text read
+  in 149 turns of a 56,656-byte copy slice, no turn reading more; the committed file the read buffer itself.
+- **Owed, named.** w-svn's landing driving the turns (`svn.land.*`); a splice of part of a run still copies the file at
+  the commit; items 3-7 then name the plane's object from the green's block, so the text is held once in all.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
 

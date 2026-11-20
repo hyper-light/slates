@@ -163,3 +163,87 @@ fn a_named_run_the_plane_lacks_is_refused_typed() {
   );
   assert!(work.post_state.is_empty());
 }
+
+/// A-760 part 2 (Ada's sizing rule: a landing holds a large text once, beside the plane). Do: name a 4 MiB text a work
+/// creates, read it, judge it with `judge_named` and commit the verdict. Expect: accepted as version 1, the green's file
+/// the text's bytes, made of the very buffer the run was read into (the same allocation: no copy, the work left holding
+/// none), and a verdict that never built the file (the work's own buffer is the only one made).
+#[test]
+fn a_named_texts_buffer_becomes_the_greens_file_with_no_copy() {
+  const TEXT: usize = 4 << 20;
+  let bytes: Vec<u8> = (0..TEXT).map(|at| (at % 241) as u8).collect();
+  let mut plane = Plane::default();
+  let object = plane.put(bytes.clone());
+  let mut work = named_create("big", object);
+  while !work.read_step(&plane, 1 << 20).unwrap() {}
+  let buffer = work.post().runs[0].as_ptr();
+  let mut green = Green::new();
+  let judged = match green.judge_named(&mut work) {
+    super::Judgment::Accepted(judged) => judged,
+    other => panic!("not accepted: {other:?}"),
+  };
+  assert!(
+    work.post().runs.iter().all(Vec::is_empty),
+    "the work kept its bytes"
+  );
+  assert_eq!(
+    green.commit_judged(judged).map(|(version, _)| version),
+    Ok(1)
+  );
+  let file = green.content("big").unwrap();
+  assert_eq!(file, bytes.as_slice());
+  assert_eq!(file.as_ptr(), buffer, "the file is not the run's buffer");
+}
+
+/// A-760 part 2. Do: create two files from one named run (the same text twice) and commit. Expect: both files the text's
+/// bytes: a run two files make is copied for them, never moved out from under the other.
+#[test]
+fn a_run_two_files_make_is_copied_never_moved_twice() {
+  let bytes = b"the same text".to_vec();
+  let mut plane = Plane::default();
+  let object = plane.put(bytes.clone());
+  let journal = vec![
+    VolumeOp::Create {
+      path: "a".to_owned(),
+    },
+    VolumeOp::Extend {
+      path: "a".to_owned(),
+      at: 0,
+      len: object.len,
+    },
+    VolumeOp::Create {
+      path: "b".to_owned(),
+    },
+    VolumeOp::Extend {
+      path: "b".to_owned(),
+      at: 0,
+      len: object.len,
+    },
+  ];
+  let (mut doc, _) = compose_volume_planned(&Base::of_files(Vec::new()), &journal).unwrap();
+  // Both files' runs read from the one named run: each adding op's source is its offset.
+  for op in &mut doc.ops {
+    op.src = 0;
+  }
+  let mut work = Increment {
+    id: [3; 32],
+    base: 0,
+    doc,
+    post_state: Vec::new(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  work.push_named(NamedRun {
+    identity: object,
+    offset: 0,
+    len: object.len,
+  });
+  while !work.read_step(&plane, 4).unwrap() {}
+  let mut green = Green::new();
+  let super::Judgment::Accepted(judged) = green.judge_named(&mut work) else {
+    panic!("not accepted");
+  };
+  green.commit_judged(judged).unwrap();
+  assert_eq!(green.content("a"), Some(bytes.as_slice()));
+  assert_eq!(green.content("b"), Some(bytes.as_slice()));
+}

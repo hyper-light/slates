@@ -109,6 +109,7 @@ pub(crate) mod hg_made;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
 pub(crate) mod lfs_record;
+pub(crate) mod named_objects;
 pub(crate) mod owed;
 pub(crate) mod paths;
 pub(crate) mod record;
