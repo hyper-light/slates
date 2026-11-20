@@ -18,16 +18,20 @@
 //! The push is checked as git's receive-pack would answer it: once the request is whole when it
 //! holds only deletes (no pack follows them), once the pack's trailer is read otherwise, and at the
 //! client's end of input when the pack is cut short (a short pack, answered `unpack <words>`). A
+//! pack's checks are made a turn at a time ([`Session::check_turn`], A-719): every object checked
+//! as git checks a push, then the connectivity walk, each turn for the caller's quantum, so no step
+//! of a large push runs past its shard's window. A
 //! request cut short is refused, as receive-pack dies on it; a refusal ends the session with
 //! nothing written. Bytes after the push's end are not the push's: the session takes none of them.
 
 use super::{
-  Advertised, Checked, HiddenRefs, Judge, NO_INDEX, Received, Refusal, Repository, Request,
-  RequestReader, check, checked_pack, decide, visible, write_advertisement, write_report,
+  Advertised, Checked, Checking, HiddenRefs, Judge, NO_INDEX, Received, Refusal, Repository,
+  Request, RequestReader, check, decide, finished_pack, visible, write_advertisement, write_report,
 };
 use crate::Admission;
 use crate::object_name::ObjectId;
 use crate::out::Out;
+use crate::store::hook_view::Quantum;
 use crate::unpack::{self, NoIndex};
 
 /// What a session reads or does next.
@@ -41,6 +45,8 @@ enum State<'s> {
     /// The pack as its bytes arrive.
     reader: unpack::Reader<'static, NoIndex>,
   },
+  /// The push, read whole, its checks made a turn at a time ([`Session::check_turn`], A-719).
+  Checking(Checking),
   /// The push, read and checked, waiting for its verdicts.
   Checked(Checked),
   /// Nothing: the push is answered, or was refused.
@@ -73,9 +79,10 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     write_advertisement(&visible(refs, &self.hidden), &self.advertised, out)
   }
 
-  /// Takes the client's next bytes, a thin pack's bases and the connectivity check read from
-  /// `repository`: whether the push is now checked ([`Session::checked`]). Once checked, and once
-  /// done, it takes no more. A refusal ends the session.
+  /// Takes the client's next bytes, a thin pack's bases and a push of deletes' checks read from
+  /// `repository`: whether the push is now read whole, checked or with its pack's checks to make
+  /// ([`Session::check_turn`]). Once read whole, and once done, it takes no more. A refusal ends the
+  /// session.
   pub fn input<R: Repository + ?Sized>(
     &mut self,
     bytes: &[u8],
@@ -125,8 +132,9 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     self.check_pack(read, repository, admission)
   }
 
-  /// The client's bytes have ended: whether the push is now checked. A request cut short is
-  /// refused, ending the session; a pack cut short is checked as git answers a short pack.
+  /// The client's bytes have ended: whether the push is now read whole, checked or with its pack's
+  /// checks to make. A request cut short is refused, ending the session; a pack cut short is
+  /// checked as git answers a short pack.
   pub fn end<R: Repository + ?Sized>(
     &mut self,
     repository: &R,
@@ -146,7 +154,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
         }
         checked
       }
-      State::Checked(_) | State::Done => Ok(false),
+      State::Checking(_) | State::Checked(_) | State::Done => Ok(false),
     }
   }
 
@@ -194,7 +202,7 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     matches!(self.state, State::Done)
   }
 
-  /// Checks the push whose pack has ended or been refused (`read`).
+  /// Finishes the pack that has ended or been refused (`read`), its checks to make a turn at a time.
   fn check_pack<R: Repository + ?Sized>(
     &mut self,
     read: Result<(), unpack::Refusal>,
@@ -204,9 +212,45 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     let State::Pack { request, reader } = core::mem::replace(&mut self.state, State::Done) else {
       return Ok(false);
     };
-    let unpacked = checked_pack(reader, read, repository, admission);
-    let checked = check(request, Some(unpacked), repository, &self.hidden, admission)?;
-    self.state = State::Checked(checked);
+    let unpacked = finished_pack(reader, read, repository, admission);
+    self.state = State::Checking(Checking::new(request, Some(unpacked)));
+    Ok(true)
+  }
+
+  /// Whether the pack's checks are still to make.
+  pub fn is_checking(&self) -> bool {
+    matches!(self.state, State::Checking(_))
+  }
+
+  /// One turn of the pack's checks against `repository`, for `quantum` and at least one unit of
+  /// work (A-719): whether the push is now checked ([`Session::checked`]). A push already checked
+  /// answers so at once; one with no checks under way, `false`. A refusal ends the session.
+  pub fn check_turn<R: Repository + ?Sized>(
+    &mut self,
+    repository: &R,
+    admission: &mut Admission,
+    quantum: Quantum<'_>,
+  ) -> Result<bool, Refusal> {
+    let checking = match &mut self.state {
+      State::Checking(checking) => checking,
+      State::Checked(_) => return Ok(true),
+      _ => return Ok(false),
+    };
+    let turned = checking.turn(repository, admission, quantum);
+    let done = match turned {
+      Ok(done) => done,
+      Err(refusal) => {
+        self.state = State::Done;
+        return Err(refusal);
+      }
+    };
+    if !done {
+      return Ok(false);
+    }
+    let State::Checking(checking) = core::mem::replace(&mut self.state, State::Done) else {
+      return Ok(false);
+    };
+    self.state = State::Checked(checking.checked(repository, &self.hidden, admission)?);
     Ok(true)
   }
 }

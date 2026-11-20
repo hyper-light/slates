@@ -61,9 +61,9 @@ use slates_git::store::hook_view::{
   HookView, Listed, Node, Pushed, Quantum, ReadRefused, Seal, SealRefused, Sealing, ShownRef,
   Snapshot, ViewRefused,
 };
-use slates_git::store::learn::Clock;
 use slates_vcs::{ContentRefused, ContentStore};
 
+use crate::git_push::ShardClock;
 use crate::hook_driver::Launch;
 use crate::state::ShardState;
 use crate::vcs_hooks::{EnvValue, HookInput, HookPoint, Lesson, Outcome};
@@ -169,15 +169,6 @@ pub(crate) enum GitHookRefused {
     /// Where the view shows the push.
     shows: Shows,
   },
-}
-
-/// The shard's clock as the store's passes read it: the runtime's monotonic nanoseconds (§4.3).
-struct ShardClock;
-
-impl Clock for ShardClock {
-  fn now_ns(&mut self) -> u64 {
-    slates_rt::futures::now_ns()
-  }
 }
 
 /// A hook's read-only bare repository on the repository's owner shard (the module docs).

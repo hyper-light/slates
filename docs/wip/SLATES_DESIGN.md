@@ -54083,3 +54083,30 @@ Applied in the same change to:
   bc2803d66, reported); fmt clean on the changed files.
 - **Owed.** upload-pack's answer made in slices (its negotiation and the pack's plan run in one step: a 1,200-commit
   fetch's ran past a liveness window in a debug build); the git-matrix clone rows by use (main's).
+
+### A-719 part 1 — A push's checks are made a turn at a time (bug, 2026-11-20, w-git for UI goal 93; found by use by w-interop: stock git's push of git/git, all refs, a 607 MiB pack, over HTTP and over SSH: about four minutes in its shard ran 3,559 ms of CPU without a step, the anchor restarted the daemon, and git hung on `unable to rewind rpc post data`; §4.17.2 "A push" items 4 and 5; §4.3)
+- **Found.** A 3,000-commit push through the daemon's edge (debug build) ran its whole pack's checks in the step that
+  took the pack's last bytes (every object fsck'd, then the connectivity walk's two passes and propagation: 180 to
+  970 ms), then one answer step admitting every object to the quarantine and deciding every command (525 ms to 2.7 s);
+  the shard's longest step was the push's. Each scales with the pack.
+- **Change (part 1).** `slates_git::receive::Checking`: the checks made a turn at a time, each turn for its quantum and
+  at least one unit (an object fsck'd; the objects indexed; an object of either pass of the walk, `connect::Walk`; the
+  propagation). `check` runs the same machine whole. A session whose pack has ended holds it (`Session::is_checking`)
+  until `Session::check_turn` has made every check; `ReceivePack::answer_step` makes one turn a step under the shard's
+  step quantum (`DaemonConfig::step_quantum_ns`, `git_push::ShardClock`) and answers `Answering::Turned` (renamed from
+  `Sealing`: a turn of the push's work, its checks' or a hook's view's sealing), on which both edges yield and step
+  again.
+- **Tests.** `slates-git` `receive::tests::session::a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole`
+  (each captured push's checks made a unit a turn: at least a turn an object, answered as the push held whole); the
+  session tests and part 2's works test now make the checks before reading the checked push.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- receive::
+  protected_fixtures` 51 of 51 with the new test named; `cargo test --locked -p slates-server --lib -- git_push::
+  git_hooks:: vcs_http::git:: vcs_http::daemon_edge::tests::a_ vcs_ssh::tests::receive vcs_ssh::receive` 42 passed, 1
+  failed (the Mercurial site's `a_mercurial_repositorys_store_is_served_over_the_daemons_edge`, failing alike on main);
+  fmt clean.
+- **Owed (A-719's next parts, main's ruling 2026-11-20, the rule for every tool's push, §4.17.1).** A push's working
+  set is bounded whatever its size: the intake streamed, each object decoded as it arrives and stored once in the
+  content store, deltas resolved against bases already stored (an offset delta's in the pack, a thin pack's reference
+  delta's in the repository), no whole pack held; admission charging that working set and the content charged as it is
+  stored (A-714's retention), refused typed at the shard's room; the quarantine's admission and the verdicts made a turn
+  at a time; the by-use proof over w-interop's v2.0.0 cut and whole git/git.
