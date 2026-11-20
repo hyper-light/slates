@@ -68,3 +68,9 @@
   Checked/Received.unpacked = Kept, Session input_into/end_into/check_turn_with/decide_with/answer_with + kept(),
   works::PushedBytes (PushedObjects impl). slates-git --lib all green. Next: server git_push queue keeper.
   Land: fresh worktree from origin/main + cherry-pick -n + real message (wip must not reach main).
+- Part 3 squashed as 3105843fe on agents/w-git-a719p3-land (worktree ~/slates-work/w-git-land), merged origin/main
+  (conflicts with A-723 S1 session pack retention + A-724 vcs_share room/Live: both kept; prepare keeps the pack on the
+  sealed push). Merged tree: git 159/159; server focused 153 pass, my t_a719 bound fixed for A-723's kept pack (passes),
+  vcs_ssh::tests::hg::stock_7_2s_push_over_ssh fails "a step that waits" -> checking on clean origin/main (worktree
+  w-git-maincheck, log msgs/w-git-maincheck-hg.log). Merge commit not yet made (changes staged in w-git-land).
+- main/w-balance seam for A-722 accepted: vcs_share::room(state, repo) -> Room{bytes,bound}; keep vcs_share::Live.
