@@ -180,3 +180,7 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - P6 transport PROPOSED to goal-91 + w-shared (inbox goal91-...md, bottom): HomeContent/HomeRead/HomeLetGo request kinds
   keyed by content id, authority = configuration's homes(), ack after home image; healer per config change. Waiting.
 - NEXT: 9b (repository record's b; range rows routing) while waiting; 8c v3 switch after A-727 a3.
+- Main ruled: build P6 transport myself. 599294892 slates_cluster::homes (HomeMessage Put/Read/LetGo/Answer,
+  HOME_STREAM=30, admits). c77324051 serve_remote + fleet.rs dispatch arm; acks only after published() (Unanswered
+  until A-727 a3 calls image_begun/image_published).
+- NEXT: P6 sender + healer loop (6c-3); 9b; record v3 after a3.
