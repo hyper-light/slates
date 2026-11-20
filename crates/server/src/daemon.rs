@@ -7847,11 +7847,14 @@ mod tests {
         .ok()
     };
     let mut seen = observe();
-    for _ in 0..600 {
+    // Derived: 600 looks 50 ms apart, the wait the successor is given to answer with the blob read back.
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
       if seen.as_ref().is_some_and(|seen| seen.0.is_some()) {
         break;
       }
-      std::thread::sleep(std::time::Duration::from_millis(50));
+      std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
       seen = observe();
     }
     second.stop();

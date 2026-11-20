@@ -9704,6 +9704,25 @@ fn refused_before_building(
     .or_else(|| crate::identities::refused_for_its_commit(state, green_id, authorship))
 }
 
+/// `sealed`'s increment built on this shard: a copy composed here counted, and the compose phase timed where the work's
+/// shard did not compose it (A-697's measured breakdown: the compose phase wherever it runs).
+fn composed_here(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
+  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
+    state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
+  }
+  let compose_start = state.clock.monotonic_ns();
+  let built = build_increment(state, sealed, evidence)?;
+  if sealed.composed.is_none() {
+    let composed_ns = state.clock.monotonic_ns().saturating_sub(compose_start);
+    crate::merge_service::count_phase(state, crate::work_home::SUBMIT_COMPOSE, composed_ns);
+  }
+  Ok(built)
+}
+
 /// The owner's half of a submit (§4.16, A-247): judges a work's sealed increment against the green and commits it, as
 /// the single serialized step of the green. Runs in the transaction of the verb that asked, whether on this shard or
 /// through [`owner_judge`]. The work's own reset is the caller's to settle.
@@ -9732,19 +9751,10 @@ fn judge_submission(
   // this verb, on the single-threaded owner shard — every declared operation before it is in the
   // increment, and a write that arrives after it is a later verb that lands in the next increment,
   // never this one.
-  if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
-    state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
-  }
-  let compose_start = state.clock.monotonic_ns();
-  let (green_id, inc) = match build_increment(state, sealed, evidence) {
+  let (green_id, inc) = match composed_here(state, sealed, evidence) {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
-  // Composed here, not on the work's shard (A-697's measured breakdown: the compose phase wherever it runs).
-  if sealed.composed.is_none() {
-    let composed_ns = state.clock.monotonic_ns().saturating_sub(compose_start);
-    crate::merge_service::count_phase(state, crate::work_home::SUBMIT_COMPOSE, composed_ns);
-  }
   // Signed work (A-321): the signature is judged over the merge's statement, once the increment it names is built. It
   // permits nothing — the modes above did — and is recorded with the version as its provenance. An asked merge answers
   // with the verdict, so the approver sees it and a signer learns the statement from a held submit, whatever the
