@@ -126,6 +126,7 @@ fn revision(head: u64, rows: Vec<ChangedPath>, contents: &[&[u8]]) -> Revision {
       .iter()
       .map(|bytes| (identity(bytes), bytes.to_vec()))
       .collect(),
+    stored: BTreeMap::new(),
     lock_entries: Vec::new(),
   }
 }
@@ -568,8 +569,7 @@ fn t_a698_a_clients_accepted_work_lands_through_the_step() {
         ..CommitLocks::default()
       },
     };
-    let texts = slates_svn::commit::drive::HeldTexts::new();
-    let landed = commit_work(state, (&owner(), svn), work, DATE_INSTANT, &texts);
+    let landed = commit_work(state, (&owner(), svn), work, DATE_INSTANT);
     let made = revision(
       0,
       vec![row("/trunk", Action::Add, NodeKind::Directory)],
@@ -1022,6 +1022,7 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
     .subversion_records(svn)
     .expect("the records");
   let texts = crate::vcs_store::svn_texts::HeadTexts {
+    store: None,
     green: Some(&engine),
     records,
   };

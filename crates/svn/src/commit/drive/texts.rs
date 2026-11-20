@@ -58,6 +58,10 @@ pub trait TextSink {
 
   /// A text this sink sealed, read back: a later delta of the same commit may name it as its base.
   fn sealed(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>>;
+
+  /// At most `len` bytes of the sealed text `identity` from `offset`, fewer at its end, none past it: what a landing
+  /// copying a sealed text into the repository's store reads a slice at a time, never the whole.
+  fn sealed_piece(&self, identity: &ContentIdentity, offset: u64, len: usize) -> Option<Vec<u8>>;
 }
 
 /// A sink in memory (the module documentation): staged texts by number, sealed ones by identity.
@@ -128,6 +132,14 @@ impl TextSink for HeldTexts {
 
   fn sealed(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     self.sealed.borrow().get(identity).cloned().map(Cow::Owned)
+  }
+
+  fn sealed_piece(&self, identity: &ContentIdentity, offset: u64, len: usize) -> Option<Vec<u8>> {
+    let sealed = self.sealed.borrow();
+    let bytes = sealed.get(identity)?;
+    let start = usize::try_from(offset).ok()?;
+    let rest = bytes.get(start..)?;
+    Some(rest.get(..len).unwrap_or(rest).to_vec())
   }
 }
 

@@ -58,6 +58,7 @@
 
 use crate::repository::svn_commit::{Committed, Uncommitted};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
+use crate::vcs_store::svn_texts::SvnView;
 use crate::vcs_svn::{HookSite, Hooked, MERGEINFO, run_hook};
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_http::Admission;
@@ -85,7 +86,6 @@ use slates_svn::index::{Index, Text};
 use slates_svn::lock::CommitLocks;
 use slates_svn::lock::{AprTime, LockTable};
 use slates_svn::lock::{HeadView, LockEntry, UUID_BYTES};
-use slates_svn::migration::Repository as SvnRecords;
 use slates_svn::reads::Repository;
 use std::collections::BTreeMap;
 
@@ -148,8 +148,9 @@ pub(crate) struct Lent<'a, R: ?Sized> {
 /// shard with its record), afresh for each step, as git's and Mercurial's sites lend theirs, so a shard's state is never
 /// held across a wait.
 pub(crate) trait SvnStores {
-  /// The green a repository's requests are answered from.
-  type Repository: Repository + ?Sized;
+  /// The green a repository's requests are answered from, lent for one step (a view over the records and where their
+  /// texts are read, `crate::vcs_store::svn_texts::SvnView`).
+  type Repository<'a>: Repository + ?Sized;
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
   /// A fetch's hold on the generation of a repository's records it began on (A-749, §4.17.1 "A fetch's answer" rule 4),
@@ -163,7 +164,7 @@ pub(crate) trait SvnStores {
     &mut self,
     hold: &Self::Hold,
     principal: &Principal,
-    step: impl FnOnce(&Lent<'_, Self::Repository>) -> T,
+    step: impl FnOnce(&Lent<'_, Self::Repository<'_>>) -> T,
   ) -> Option<T>;
   /// The time each slice of a fetch's answer may run (A-749, §4.17.1 "A fetch's answer" rule 3): the shard's step
   /// quantum; `None` where the lender names none, and a slice is as many steps as its room.
@@ -175,7 +176,7 @@ pub(crate) trait SvnStores {
     &mut self,
     id: RepositoryId,
     principal: &Principal,
-    step: impl FnOnce(&Lent<'_, Self::Repository>) -> T,
+    step: impl FnOnce(&Lent<'_, Self::Repository<'_>>) -> T,
   ) -> Option<T>;
 
   /// Begins an HTTP commit in repository `id` for `principal` (A-681 part C): the transaction named, the setup
@@ -201,7 +202,7 @@ pub(crate) trait SvnStores {
     id: RepositoryId,
     principal: &Principal,
     name: &str,
-    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnRecords>) -> T,
+    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnView<'_>>) -> T,
   ) -> Option<Option<T>> {
     let _unserved = (id, principal, name, step);
     None
@@ -216,7 +217,7 @@ pub(crate) trait SvnStores {
     id: RepositoryId,
     principal: &Principal,
     judge: impl FnOnce(
-      &Lent<'_, SvnRecords>,
+      &Lent<'_, SvnView<'_>>,
       &mut dyn FnMut() -> [u8; UUID_BYTES],
     ) -> (Vec<LockEntry>, HttpAnswer),
   ) -> Option<Result<HttpAnswer, Uncommitted>> {
@@ -226,7 +227,7 @@ pub(crate) trait SvnStores {
 
   /// Lands an accepted `work` on repository `id`'s logs by `principal` through the owner's commit step
   /// (`crate::repository::svn_commit::commit_work`): none where this lender serves no commits.
-  fn land(
+  async fn land(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
@@ -891,7 +892,7 @@ impl<S: SvnStores> SvnExchange<S> {
   fn on_transaction(
     &mut self,
     name: &str,
-    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnRecords>, Hooks<'_>) -> HttpAnswer,
+    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnView<'_>>, Hooks<'_>) -> HttpAnswer,
   ) -> HttpAnswer {
     let hooks = self.hooks();
     match self
@@ -1036,7 +1037,8 @@ impl<S: SvnStores> SvnExchange<S> {
     let landing = slates_rt::futures::doing("vcs_http::svn::land");
     let landed = self
       .stores
-      .land(self.repository, &self.principal, *work, &*texts);
+      .land(self.repository, &self.principal, *work, &*texts)
+      .await;
     drop(landing);
     match landed {
       Some(Ok(committed)) => {
@@ -1450,7 +1452,7 @@ impl HeadView for IndexHead<'_> {
 /// presented.
 fn transaction_root_step(
   commit: &mut DavCommit,
-  (world, hooks): (&CommitWorld<'_, SvnRecords>, Hooks<'_>),
+  (world, hooks): (&CommitWorld<'_, SvnView<'_>>, Hooks<'_>),
   (method, path): (&str, &str),
   (headers, body, bounds): (&CommitHeaders, &[u8], &XmlBounds),
 ) -> HttpAnswer {

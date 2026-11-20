@@ -15313,3 +15313,128 @@ their bytes in the content plane). Peak RSS does not follow the record from B to
 `vcs_store::arena_windows::tests::wperf_swap_cost_probe` (bench-only, not committed) in a release test build of B's
 tree on the same Studio: a `ContentStore::lend_in` and `hand_back` pair costs **38.83 ns** over 10,000,000 pairs after
 100,000 to warm (`ChunkStore` 560 bytes, moved by `mem::swap` both ways).
+
+## A lone client after W1 and A-400: quiet back to before W1, loaded better on Linux and still slower on the Mac, and ~10 µs gained since A-400 (g222; the supervisor's condition 3; 2026-11-20)
+
+**What it is.** The single-client edit and merge across the landings that moved it: `8dff8fcad` (before W1 and
+A-296), `379dfe750` (W1 and A-296, just before A-400), `f2081a3c8` (A-400 landed: a work on its client's shard) and
+`a5233e228` (main). A-400 was the fix the supervisor approved on 2026-11-20 for W1's lone-client regression (a client's
+work on its name's shard, two hops per submit); it had landed on 2026-11-18 (goals 231 and 257), measured at 1,000
+clients only. Nothing was built for this record.
+
+**Command.** `edit_merge_bench` built release (`--locked`) from each arm's `git archive` extract, rotated each round
+(forward, reversed, 3-1-4-2), 3 rounds: loaded `--loaded-only --spinners-per-core 2 --files 10 --form accept --form
+conflict`, then quiet `--quiet-only --files 10 --files 1000 --form accept --form conflict`. Each invocation is 3 runs;
+the figure is the invocation's median and the brackets every run. Linux: CI's `ubuntu-24.04-arm` (4 CPUs), branch
+`diag-measurer-g222-1`, run 44787483724, loaded inside `systemd-run --user --scope -p AllowedCPUs=0-1 -p
+MemoryMax=256M` with a sibling `dd conv=fsync` writer (A-224's lane), load average 3.7 to 12.6. Mac: adas-mac-studio-3.local
+(Apple M4 Max, 14 CPUs, macOS 26.2), `~/.cache/g222-scripts/studio-ab.sh`, load 9 to 10 loaded (the box shared). The
+32-CPU Studio was refused for the run (load 41, 354 MB of 103 GB free). Every run answered as the model said and exited 0.
+
+Linux arm64, µs (p50 and p99) and ms (loaded p99):
+
+| arm | quiet accept p50 | quiet accept p99 | quiet conflict p50 | loaded accept p99 ms | loaded conflict p99 ms |
+|---|---|---|---|---|---|
+| before W1 | 18.2 / 18.7 / 17.9 | 43.6 / 40.5 / 38.8 | 15.0 / 14.9 / 15.6 | 21.0 / 21.0 / 21.0 | 21.0 / 21.3 / 22.9 |
+| before A-400 | 54.6 / 51.6 / 51.1 | 87.4 / 96.6 / 95.2 | 48.9 / 49.0 / 47.9 | 13.1 / 14.0 / 13.0 | 11.7 / 11.5 / 13.8 |
+| A-400 | 21.1 / 21.0 / 20.2 | 41.9 / 47.8 / 49.9 | 17.6 / 18.2 / 17.3 | 8.0 / 4.0 / 8.0 | 1.9 / 4.0 / 6.0 |
+| main | 30.7 / 34.8 / 35.1 | 65.7 / 66.8 / 72.0 | 27.0 / 28.4 / 27.6 | 6.8 / 4.6 / 7.0 | 2.9 / 6.0 / 2.1 |
+
+Mac (M4 Max, 14 CPUs), same columns:
+
+| arm | quiet accept p50 | quiet accept p99 | quiet conflict p50 | loaded accept p99 ms | loaded conflict p99 ms |
+|---|---|---|---|---|---|
+| before W1 | 54.3 / 48.5 / 47.8 | 93.5 / 86.6 / 86.3 | 57.5 / 45.0 / 50.5 | 7.8 / 9.1 / 10.3 | 8.9 / 11.0 / 9.8 |
+| before A-400 | 155.8 / 155.0 / 155.3 | 221.8 / 222.5 / 225.3 | 150.4 / 151.5 / 151.6 | 20.2 / 24.6 / 17.2 | 21.7 / 21.6 / 18.5 |
+| A-400 | 41.9 / 43.3 / 40.2 | 91.6 / 105.0 / 86.0 | 36.1 / 36.7 / 35.5 | 13.5 / 14.6 / 13.8 | 17.6 / 14.3 / 14.4 |
+| main | 45.4 / 48.3 / 44.5 | 98.8 / 118.5 / 92.3 | 38.9 / 40.8 / 39.1 | 20.2 / 16.8 / 9.9 | 16.3 / 18.0 / 13.1 |
+
+Every run (Linux, loaded accept p99 ms): before W1 [23.9, 17.2, 21.0] [21.1, 21.0, 17.0] [21.0, 23.9, 20.0]; before
+A-400 [13.1, 11.0, 14.0] [14.0, 15.0, 14.0] [13.0, 12.3, 14.0]; A-400 [5.1, 8.0, 9.0] [3.3, 4.0, 6.1] [8.0, 6.0, 9.0];
+main [8.0, 6.8, 5.0] [6.0, 4.6, 4.0] [3.0, 7.0, 8.0]. Mac loaded accept p50 µs: before W1 95.5 / 97.6 / 110.2,
+before A-400 630.5 / 812.5 / 374.6, A-400 265.5 / 293.8 / 177.4, main 398.2 / 297.0 / 147.9. The rest of every run is
+in the logs (the CI artifact `measurer-arms-logs-ubuntu-24.04-arm`; `~/.cache/g222-studio-ab/logs` on the Mac).
+
+**What it means.**
+- A-400 undid W1's lone-client regression quiet on both platforms (Linux accept p50 51–55 → 20–21 µs, before W1 18;
+  the Mac 155 → 40–43, before W1 48–54) and loaded on Linux, where main's p99 is now three times lower than before W1
+  (21.0 → 4.6–7.0 ms). On the shared Mac, loaded, main is still slower than before W1 (accept p50 148–398 against
+  95–110 µs; p99 9.9–20.2 against 7.8–10.3 ms): what is left is the submit's ask to the green's owner (the verb
+  parked, the batched ask, the answer, the resume), the one hop a lone client still makes.
+- **New: about 10 µs on every quiet lone submit since A-400.** Linux accept p50 20–21 → 31–35 µs, conflict 17–18 →
+  27–28, p99 42–50 → 66–72; the Mac 40–43 → 45–48. It lies in the 309 first-parent commits `f2081a3c8..a5233e228`;
+  the bisect is next (g222).
+- The goal's bound is not met by any arm: the loaded p99 is milliseconds on both platforms, before W1 too.
+
+## A holder's submit and a local one, phase by phase, release: the forward's first wait was a heartbeat (A-697; main's ruling of 2026-11-20; 2026-11-20)
+
+The by-reference forward's before (main's ruling: measure before building, release, best of N with every N shown).
+Command, on the Mac Studio `d1323898` (Apple M3 Ultra, 32 cores, 96 GB, 8 to 17 GB free, load averages 5 to 13),
+rustc 1.98.1, release, tree `04966bc` (main `e261100c1` and the phase timers): `SLATES_A697_BENCH_FRESH=1
+SLATES_A697_BENCH_MIB=4,64 SLATES_A697_BENCH_RUNS=6 cargo test --release -p slates-server --test fleet bench_a697 --
+--ignored --nocapture --test-threads=1`. Two nodes at `f = 1` in one process; A owns the green, B serves works over it
+(A-697's test hook); a work on B (holder) and one on A (local) each write one new file and submit; a green of its own
+for each run (`FRESH`). Wall time of the submit as its client sees it; every phase is the submit's own counter delta
+over both daemons (`merge.submit.*`).
+
+| Size | Kind | Wall, ms, runs 0 to 5 | Best |
+|---|---|---|---|
+| 4 MiB | holder | 138.0, 145.5, 137.5, 132.7, 136.2, 136.1 | 132.7 |
+| 4 MiB | local | 37.9, 37.7, 35.3, 37.7, 38.2, 37.3 | 35.3 |
+| 64 MiB | holder | 962.2, 944.8, 1568.5, 996.8, 1100.6, 1178.2 | 944.8 |
+| 64 MiB | local | 646.7, 625.2, 636.7, 629.6, 875.8, 628.8 | 625.2 |
+
+Phases, typical (ms): 64 MiB local: compose 140 to 205, judge 25 to 79, append 147 to 178, place 223 to 331 (one
+input shipment), the holder's recompute 21 to 45. 64 MiB holder: compose 153 to 166, the forward to the owner and back
+778 to 1390, inside which the owner's judge 11 to 12, append 85 to 153, place 275 to 326 (three shipments: the inputs
+shipped back to B, which composed them). 4 MiB holder: forward 128 to 141 against the owner's judge, append and place
+of about 33.
+
+- **What it found.** The holder's forward cost about 97 ms over the owner's work at 4 MiB and about 400 at 64 MiB:
+  about 80 ms fixed, then about 5 ms a MiB. The fixed part was the forward's wait for its deferred completion: it slept
+  a heartbeat (100 ms) before its first look at the owner's completion window, then looked once a heartbeat
+  (`verbs::await_deferred_completion`), so every forwarded submit at `f >= 1` was answered at about 100 ms, whatever
+  its commit took. Fixed the same day (the next section).
+- **Corrected on record.** The first release run (tree `3c68e3c`, one shared green) showed every phase growing run to
+  run (append 5 to 44 ms at 4 MiB, 130 to 556 ms at 64 MiB), first reported to main as a cost growing with a green's
+  history. It was the bench: every run inserted its bytes at offset 0 of one shared path, so each version's file held
+  every earlier run's bytes and each increment was larger than the last. A green of its own a run is flat on every
+  phase; the bench now writes a new file a submit (`4e9284ac0`).
+- **Unexplained, owed.** The shared-green run exited 4 at its 64 MiB local run 4, the host under memory pressure
+  (`kern.memorystatus_vm_pressure_level` pressed), with no panic line: owed an explanation before the next table.
+- **Owed.** The same table after the by-reference forward, and the forward lane's throughput (about 200 MB/s on
+  loopback), which main ruled a gap to fix in the same series.
+
+## A forwarded submit answered by its commit, not by a heartbeat poll (A-697 series; AUD-11; 2026-11-20)
+
+`a_forwarded_submit_is_answered_by_its_commit_not_by_a_poll` (`crates/server/tests/fleet.rs`, two nodes at `f = 1`, a
+client on B submitting a work A owns, three times; macOS arm64, this Mac, debug, local): answered in 20.7, 4.4 and 4.9
+ms. With the waiter never attached (the red), each waited out the liveness budget: 1.018, 1.022 and 1.023 s; before the
+fix the first look alone came a heartbeat (100 ms) after the exchange began. The release bench's rerun is owed with the
+by-reference forward's.
+
+## The FSFS view's texts as their stored deltas: 128 and 460 times fewer bytes, reads 8 and 27 times faster (A-645 P3 ruling 3; 2026-11-20)
+
+The A/B main asked for: the hook view's revision files with every text whole (P1, FSFS format 6, `PLAIN`) against every
+text its stored delta (P3, FSFS format 8, `DELTA` over the svn records' svndiff-2 against the skip-delta base, read in
+place). Command: `cargo run --release -p slates-svn --example fsfs_view_bench -- 1000 SIZE` (a repository whose one
+file of SIZE bytes changes a line in each of 1,000 revisions; the whole view laid out, then every revision file read
+through once), the P1 binary built at main 306214c5 and the P3 one at w-reaper's tree over main 45b22689, run
+interleaved under `/usr/bin/time -l`; `... -- 1000 SIZE baseline` stops after the import, so a run's peak RSS less the
+baseline's is the view's own. Mac Studio 2 (macOS arm64, 14 cores), load 8.7 at the start, 2026-11-20 10:28 PST; all
+five runs a side shown.
+
+| SIZE | | view bytes | layout ms | read ms | peak RSS KiB (baseline) |
+|---|---|---|---|---|---|
+| 64 KiB | P1 | 66,002,863 | 4.4, 4.5, 4.4, 4.5, 4.4 | 37.2, 37.4, 35.5, 36.9, 37.5 | 71,568, 71,856, 71,792, 71,664, 71,200 |
+| 64 KiB | P3 | 516,724 | 4.7, 4.6, 4.4, 4.9, 4.8 | 4.5, 4.3, 4.3, 4.7, 4.4 | 71,504, 72,000, 72,048, 72,000, 72,016 |
+| 64 KiB | baseline | | | | 70,288, 70,720, 70,256, 70,208, 70,288 |
+| 256 KiB | P1 | 262,621,861 | 4.7, 4.8, 4.7, 4.7, 4.4 | 121.4, 116.3, 118.4, 113.6, 106.5 | 266,400, 266,048, 266,176, 267,568, 265,200 |
+| 256 KiB | P3 | 571,363 | 5.1, 4.9, 4.9, 4.9, 4.4 | 4.7, 4.4, 4.2, 4.0, 4.0 | 266,432, 397,072, 265,904, 265,888, 264,288 |
+| 256 KiB | baseline | | | | 265,200, 265,072, 266,800, 266,240, 265,072 |
+
+The view's bytes fall 128 and 460 times and its full read 8 and 27 times, since P1 makes every text from its delta chain
+to write it whole and P3 hands the stored delta through. Layout is about 0.3 ms slower in P3 (the map from a text to its
+first representation, which a delta names its base by). Both stream, so the view's own memory is a megabyte or two over
+the import either way; one P3 run (256 KiB, round 2) peaked 132 MB over its baseline, unexplained, the other four within
+a megabyte. Kept: P3. Rejected: P1's whole texts.

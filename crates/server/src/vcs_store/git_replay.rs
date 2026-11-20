@@ -8,7 +8,8 @@
 //! objects are in, the names the admission would record are compared with the record's; the push is sealed and staged
 //! a unit at a time as a live push is (`slates_git::store::Staging`); then the moves and the commit follow, as
 //! [`super::replay_push`] runs them. A pack's waiting deltas resolve a delta a unit (`Reader::resolve_turn_with`, w-balance's
-//! resolution in turns). Owed their own slices: the moves' admission and the landing's whole passes.
+//! resolution in turns), and the record's moves are admitted an object a unit (A-722 part 4g). Owed its own slices: the
+//! landing's whole passes (`Repository::commit`).
 //!
 //! **Not stepped.** An owed commit's record, an LFS record and a record carrying no pack replay whole in their turn,
 //! as before: none holds a pack's objects.
@@ -17,14 +18,14 @@
 
 use slates_git::Admission;
 use slates_git::object_name::{Kind, ObjectFormat};
-use slates_git::store::{Incoming, Push, PushRefused};
+use slates_git::store::{Admitting, Incoming, Move, Push, PushRefused};
 use slates_git::unpack::{NoIndex, Object, Reader};
 use slates_vcs::{ContentId, ContentStore};
 
 use super::record::{Record, RecordWriter, RecordedMove};
 use super::{
-  GitRefused, GitStore, NO_INDEX, ReplayRefused, StoreBases, admit_moves, admit_object,
-  commit_moves, names_alike,
+  GitRefused, GitStore, NO_INDEX, ReplayRefused, StoreBases, admit_object, commit_moves,
+  names_alike,
 };
 
 /// A clock read as no time at all: a staging turn under it takes one unit (`Repository::stage_turn` with a quantum of
@@ -64,6 +65,9 @@ impl core::fmt::Debug for GitReplay {
       Stage::Admitting { objects, next } => format!("admitting {next} of {}", objects.len()),
       Stage::Sealing { .. } => "sealing".to_owned(),
       Stage::Resolving { .. } => "resolving".to_owned(),
+      Stage::Moving { admitted, .. } => {
+        format!("moving {} of {}", admitted.len(), self.moves.len())
+      }
     };
     f.debug_struct("GitReplay")
       .field("names", &self.names.len())
@@ -75,6 +79,14 @@ impl core::fmt::Debug for GitReplay {
 
 /// A replay's stage.
 enum Stage {
+  /// The record's moves admitted an object a unit (A-722 part 4g: a replay's end admitted them whole, a walk of every
+  /// object a push brought in one turn, and a restarted daemon recovering git/git's v2.0.0 spun past the watchdog).
+  Moving {
+    /// The moves admitted so far, in the record's order.
+    admitted: Vec<Move>,
+    /// The admission of the next under way.
+    admitting: Option<Box<Admitting>>,
+  },
   /// The pack whole, its waiting deltas resolved a delta a unit (`Reader::resolve_turn_with`).
   Resolving {
     /// Git's reader of the pack (boxed, as reading's is).
@@ -183,8 +195,8 @@ impl GitReplay {
     }
     loop {
       match self.unit((content, store), bytes, turn.chunk) {
-        Ok(false) => {}
-        Ok(true) => return self.finish(content, store).map(Stepped::Done),
+        Ok(None) => {}
+        Ok(Some(moves)) => return self.finish(content, store, moves).map(Stepped::Done),
         Err(refused) => return Err(self.abandon(content).err().unwrap_or(refused)),
       }
       if now() >= turn.deadline_ns {
@@ -200,7 +212,7 @@ impl GitReplay {
     (content, store): (&mut ContentStore, &mut GitStore),
     bytes: &[u8],
     chunk: usize,
-  ) -> Result<bool, ReplayRefused> {
+  ) -> Result<Option<Vec<Move>>, ReplayRefused> {
     let stage = core::mem::replace(
       &mut self.stage,
       Stage::Admitting {
@@ -221,7 +233,7 @@ impl GitReplay {
           .read(piece, &mut admission)
           .map_err(ReplayRefused::Pack)?;
         if reader.is_whole() {
-          (Stage::Resolving { reader, admission }, false)
+          (Stage::Resolving { reader, admission }, None)
         } else if piece.is_empty() || took == 0 {
           // No more to give it: ended, a pack cut short refused by its end.
           let bases = StoreBases(slates_git::store::views::IndexedObjects::new(
@@ -237,7 +249,7 @@ impl GitReplay {
               objects: unpacked.objects,
               next: 0,
             },
-            false,
+            None,
           )
         } else {
           let read = read.saturating_add(took);
@@ -247,7 +259,7 @@ impl GitReplay {
               admission,
               read,
             },
-            false,
+            None,
           )
         }
       }
@@ -266,7 +278,7 @@ impl GitReplay {
               objects,
               next: next.saturating_add(1),
             },
-            false,
+            None,
           )
         }
         None => {
@@ -281,7 +293,7 @@ impl GitReplay {
             Stage::Sealing {
               staging: Box::new(staging),
             },
-            false,
+            None,
           )
         }
       },
@@ -305,7 +317,7 @@ impl GitReplay {
         if !resolved {
           return {
             self.stage = Stage::Resolving { reader, admission };
-            Ok(false)
+            Ok(None)
           };
         }
         let unpacked = reader
@@ -316,7 +328,7 @@ impl GitReplay {
             objects: unpacked.objects,
             next: 0,
           },
-          false,
+          None,
         )
       }
       Stage::Sealing { mut staging } => {
@@ -325,11 +337,44 @@ impl GitReplay {
           clock: &mut still,
           ns: 0,
         };
-        let done = store
+        let staged = store
           .repository
           .stage_turn(content, &mut self.push, &mut staging, quantum)
           .map_err(|refused| ReplayRefused::Git(GitRefused::Store(refused)))?;
-        (Stage::Sealing { staging }, done)
+        if staged {
+          (
+            Stage::Moving {
+              admitted: Vec::new(),
+              admitting: None,
+            },
+            None,
+          )
+        } else {
+          (Stage::Sealing { staging }, None)
+        }
+      }
+      Stage::Moving {
+        mut admitted,
+        admitting,
+      } => {
+        let admitting = self.move_unit(&*content, &*store, &mut admitted, admitting)?;
+        if admitting.is_none() && admitted.len() >= self.moves.len() {
+          (
+            Stage::Admitting {
+              objects: Vec::new(),
+              next: 0,
+            },
+            Some(admitted),
+          )
+        } else {
+          (
+            Stage::Moving {
+              admitted,
+              admitting,
+            },
+            None,
+          )
+        }
       }
     };
     self.stage = stage;
@@ -342,8 +387,9 @@ impl GitReplay {
     mut self: Box<Self>,
     content: &mut ContentStore,
     store: &mut GitStore,
+    moves: Vec<Move>,
   ) -> Result<u64, ReplayRefused> {
-    let ended = self.end(content, store);
+    let ended = self.end(content, store, &moves);
     // A committed push holds nothing, so this gives back only what a refused end held.
     let given = self.abandon(content);
     let unkept = ended?;
@@ -351,14 +397,62 @@ impl GitReplay {
     Ok(unkept)
   }
 
-  /// [`GitReplay::finish`]'s steps.
+  /// One unit of the moves' admission: a unit of the admission under way, the move it admitted kept; or the next
+  /// recorded move's admission begun (a delete admitted at once). The admission under way after it.
+  fn move_unit(
+    &self,
+    content: &ContentStore,
+    store: &GitStore,
+    admitted: &mut Vec<Move>,
+    admitting: Option<Box<Admitting>>,
+  ) -> Result<Option<Box<Admitting>>, ReplayRefused> {
+    let refused = |refused| ReplayRefused::Git(GitRefused::Store(refused));
+    if let Some(mut under_way) = admitting {
+      let mut still = Still;
+      let quantum = slates_git::store::hook_view::Quantum {
+        clock: &mut still,
+        ns: 0,
+      };
+      if !store
+        .repository
+        .admit_turn(content, &self.push, &mut under_way, quantum)
+        .map_err(refused)?
+      {
+        return Ok(Some(under_way));
+      }
+      if let Some(admission) = under_way.admitted() {
+        admitted.push(admission);
+      }
+      return Ok(None);
+    }
+    let Some(&(green, _, head)) = self.moves.get(admitted.len()) else {
+      return Ok(None);
+    };
+    match head {
+      Some(to) => store
+        .repository
+        .admitting(content, &self.push, green, to)
+        .map(|begun| Some(Box::new(begun)))
+        .map_err(refused),
+      None => {
+        let deleted = store
+          .repository
+          .admit(content, &self.push, green, None)
+          .map_err(refused)?;
+        admitted.push(deleted);
+        Ok(None)
+      }
+    }
+  }
+
+  /// [`GitReplay::finish`]'s steps: the moves admitted ([`Stage::Moving`]) committed.
   fn end(
     &mut self,
     content: &mut ContentStore,
     store: &mut GitStore,
+    moves: &[Move],
   ) -> Result<u64, ReplayRefused> {
-    let moves = admit_moves(content, store, &self.push, &self.moves).map_err(ReplayRefused::Git)?;
-    commit_moves(content, store, &mut self.push, (&moves, &self.moves)).map_err(ReplayRefused::Git)
+    commit_moves(content, store, &mut self.push, (moves, &self.moves)).map_err(ReplayRefused::Git)
   }
 
   /// Gives back what the replay's push holds.

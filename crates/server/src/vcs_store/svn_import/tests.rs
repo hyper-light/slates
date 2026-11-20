@@ -122,7 +122,11 @@ pub(crate) fn imported(
 fn exported(records: &Repository, first: u64, last: u64) -> Vec<u8> {
   let mut exporter = Exporter::new(records, first, last, Format::Two).expect("a range held");
   let mut out = Vec::new();
-  while exporter.export(records, &mut out).expect("exported") != Exporting::Done {}
+  while exporter
+    .export(records, records, &mut out)
+    .expect("exported")
+    != Exporting::Done
+  {}
   out
 }
 

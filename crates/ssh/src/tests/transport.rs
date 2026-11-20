@@ -611,6 +611,7 @@ fn the_server_rekeys_at_half_its_keys_limit() {
   config.usage_cap = UsageCap {
     packets: Some(8),
     blocks: None,
+    bytes: None,
   };
   let mut session = Session::serving(config, ClientOptions::openssh_like(GCM, true));
   assert_eq!(session.server.key_usage().sent.packets, 1);
@@ -626,6 +627,44 @@ fn the_server_rekeys_at_half_its_keys_limit() {
   assert_eq!(session.last_received(), &[94, 4]);
 }
 
+/// A-745 (RFC 4253 §9, "after each gigabyte of transmitted data"; main's question: the rekey log read "0 blocks sealed"
+/// on every rekey). Do: serve under ChaCha20-Poly1305, a stream cipher whose key counts no blocks, with the data a key
+/// serves capped at 64 KiB, and send data until the server stops taking it. Expect the server's own exchange begun by
+/// its key's usage (`RekeyTrigger::KeyUsage`) once it has sealed the cap's bytes, its blocks still none: the gigabyte is
+/// counted in bytes, never in blocks; then the exchange finished and the data going on.
+#[test]
+fn the_server_rekeys_after_its_keys_data_under_a_stream_cipher() {
+  let cap: u64 = 1 << 16;
+  let mut config = config();
+  config.usage_cap = UsageCap {
+    packets: None,
+    blocks: None,
+    bytes: Some(cap),
+  };
+  let mut session = Session::serving(config, ClientOptions::openssh_like(CHACHA, true));
+  let message = [[94_u8].as_slice(), &[7_u8; 1 << 12]].concat();
+  let mut sent = 0u32;
+  loop {
+    match session.server.send(&message, 0) {
+      Ok(()) => sent += 1,
+      Err(SendRefusal::Rekeying) => break,
+      Err(refused) => panic!("{refused:?} after {sent} messages"),
+    }
+    // The client reads as it goes, so the server's output never fills.
+    let out = session.server.pending_output().to_vec();
+    session.server.consume_output(out.len());
+    session.client.feed(&out);
+    assert!(sent < 1_000, "the server never rekeyed");
+  }
+  let rekeyed = session.server.take_rekey().expect("an exchange begun");
+  assert_eq!(rekeyed.trigger, crate::transport::RekeyTrigger::KeyUsage);
+  assert!(rekeyed.sealed.bytes >= cap, "{rekeyed:?}");
+  assert_eq!(rekeyed.sealed.blocks, 0);
+  session.pump().unwrap();
+  assert!(matches!(session.events.last(), Some(Event::Rekeyed(_))));
+  session.server.send(&[94, 1], 0).unwrap();
+}
+
 /// A-594 hostile (RFC 4344 §3.1): do serve under a cap of 8 packets a key to a client that ignores the server's KEXINIT
 /// and keeps sending. Expect its messages taken up to the cap, and the ninth refused as the client's key exhausted.
 #[test]
@@ -634,6 +673,7 @@ fn a_client_that_never_rekeys_exhausts_its_key() {
   config.usage_cap = UsageCap {
     packets: Some(8),
     blocks: None,
+    bytes: None,
   };
   let mut options = ClientOptions::openssh_like(CHACHA, true);
   options.answer_kexinit = false;

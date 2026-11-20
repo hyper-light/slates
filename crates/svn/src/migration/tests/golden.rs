@@ -249,7 +249,7 @@ fn every_export_call_writes_one_changed_path_or_one_window_of_its_text() {
     let mut largest = 0;
     loop {
       let before = out.len();
-      let Exporting::Wrote(revision) = exporter.export(&source, &mut out).unwrap() else {
+      let Exporting::Wrote(revision) = exporter.export(&source, &source, &mut out).unwrap() else {
         break;
       };
       largest = largest.max(out.len() - before);
@@ -463,7 +463,7 @@ fn a_whole_text_is_written_in_the_pieces_its_caller_sizes() {
   let mut largest = 0;
   loop {
     let before = out.len();
-    if exporter.export(&source, &mut out).unwrap() == Exporting::Done {
+    if exporter.export(&source, &source, &mut out).unwrap() == Exporting::Done {
       break;
     }
     largest = largest.max(out.len() - before);

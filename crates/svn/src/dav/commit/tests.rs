@@ -147,7 +147,7 @@ fn a_commit_over_http_adds_a_directory_and_a_file_and_lands_as_revision_one() {
     .iter()
     .find(|(name, _)| name.as_slice() == b"svn:log")
     .map(|(_, value)| value.clone());
-  let committed = repository.commit(RevisionToCommit::of_work(*work, NOW, &*sink).unwrap());
+  let committed = repository.commit(RevisionToCommit::of_work(*work, NOW).unwrap());
   assert_eq!(
     (
       made,

@@ -2223,3 +2223,49 @@ fn t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build() {
   });
   assert_eq!(seen, (true, 1, true, 1, true));
 }
+
+/// The objects repository `id`'s store's walks have visited so far, read while a rebuild lends the store to nothing.
+fn walked(state: &ShardState, id: RepositoryId) -> u64 {
+  match state.vcs_stores.entries.get(&id) {
+    Some(super::RepositoryStore::Git(git)) => git.repository.counters().walked,
+    _ => 0,
+  }
+}
+
+/// A-722 part 4g (main's report of 2026-11-20: after a restart, a daemon recovering a repository pushed git/git's v2.0.0
+/// spun past the watchdog's window and was killed again, a crash loop). Do: push one commit of [`MANY_FILES`] files;
+/// make the store again from the log, each turn held to no time at all, reading after each turn how many objects the
+/// store's walks visited. Expect: the record replayed; the move's admission walking every object the push brought, and
+/// no turn walking more than one of them. Red before the change: the replay's end admitted the move whole, its walk in
+/// one turn.
+#[test]
+fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
+  let (most, total, objects) = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "admitted-in-turns", VcsTool::Git);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
+      .map(|n| {
+        (
+          format!("f{n}").into_bytes(),
+          format!("file {n}\n").into_bytes(),
+        )
+      })
+      .collect();
+    let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
+    let tree = tree_of(&objects);
+    push_through(state, (repository, root), &objects, (None, commit, tree));
+    super::rebuild(state, repository);
+    let (mut most, mut before, begun) =
+      (0u64, walked(state, repository), walked(state, repository));
+    while super::rebuild_turn_once_within(state, repository, 0) {
+      let now = walked(state, repository);
+      most = most.max(now.saturating_sub(before));
+      before = now;
+    }
+    (most, before.saturating_sub(begun), objects.len())
+  });
+  assert!(
+    total >= u64::try_from(objects).unwrap(),
+    "walked {total} of {objects}"
+  );
+  assert_eq!(most, 1, "the most objects one turn walked");
+}

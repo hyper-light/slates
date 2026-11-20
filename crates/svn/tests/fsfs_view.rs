@@ -134,6 +134,7 @@ fn a_budget_slices_the_layout_by_revision_and_every_header_names_its_own_place()
   let (whole, one) = laid_out(&repository, usize::MAX);
   assert_eq!(one, 1);
   assert_eq!(calls as u64, youngest + 1, "a revision a call");
+  let mut deltas = 0;
   for revision in 0..=youngest {
     let bytes = revision_bytes(&sliced, &repository, revision);
     assert_eq!(
@@ -144,7 +145,18 @@ fn a_budget_slices_the_layout_by_revision_and_every_header_names_its_own_place()
     assert_eq!(sliced.revision_length(revision), Some(bytes.len() as u64));
     assert_the_trailer_names_the_root_and_the_changes(&bytes, revision);
     assert_every_header_names_its_own_place(&bytes, revision);
+    deltas += find_all(&bytes, b"\nDELTA");
   }
+  // Ruling 3 (A-645 P3): a text is its stored delta, never made whole; the golden history's texts are many.
+  assert!(deltas > 0, "the view wrote no DELTA representation");
+}
+
+/// How many times `needle` occurs in `haystack`.
+fn find_all(haystack: &[u8], needle: &[u8]) -> usize {
+  haystack
+    .windows(needle.len())
+    .filter(|window| *window == needle)
+    .count()
 }
 
 /// Revision `revision`'s file `bytes`: its trailer names the root's header (an ID naming this revision and offset, its

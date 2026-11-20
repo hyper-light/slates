@@ -87,6 +87,11 @@ pub struct Repository {
   /// Every text a node-revision names, by content identity, as a delta against its skip-delta predecessor's text
   /// (S4 slice 2 c2, module docs "Texts").
   texts: BTreeMap<ContentIdentity, KeptText>,
+  /// Every text a commit brought through its sink (§4.17.1 "A push's intake"; main's ruling of 2026-11-20 on c2 and
+  /// (B)), by content identity, with its length: held once in the repository's content store, read through the lent
+  /// [`TextSource`], never copied or deltified here. A later version's background job deltifies one its node moved past
+  /// (w-perf's, [`Repository::supersede`]).
+  stored: BTreeMap<ContentIdentity, u64>,
   /// The locks (A-602).
   locks: LockTable,
   /// The transactions begun, which numbers the next one (FSFS's `txn-current`).
@@ -113,6 +118,7 @@ impl Repository {
       revision_properties: vec![properties],
       contents: BTreeMap::new(),
       texts: BTreeMap::new(),
+      stored: BTreeMap::new(),
       locks: LockTable::new(),
       transactions: 0,
       room,
@@ -154,7 +160,36 @@ impl Repository {
 
   /// Whether the records hold a text or a property list under `identity`.
   pub fn holds(&self, identity: &ContentIdentity) -> bool {
-    self.contents.contains_key(identity) || self.texts.contains_key(identity)
+    self.contents.contains_key(identity)
+      || self.texts.contains_key(identity)
+      || self.stored.contains_key(identity)
+  }
+
+  /// The length of a text held in the content store, none for a text the records do not keep as stored.
+  pub fn stored_len(&self, identity: &ContentIdentity) -> Option<u64> {
+    self.stored.get(identity).copied()
+  }
+
+  /// The texts held in the content store, each with its length ([`Repository`]'s `stored`).
+  pub fn stored_texts(&self) -> impl Iterator<Item = (&ContentIdentity, u64)> + '_ {
+    self.stored.iter().map(|(identity, len)| (identity, *len))
+  }
+
+  /// The skip-delta base a stored text would be deltified against now that its node moved past it: the text of its
+  /// node's skip-delta predecessor (module docs, "Texts"), none for a first version or a text no row of the records
+  /// names. What w-perf's background job deltifies a superseded stored text against.
+  pub fn supersede(&self, identity: &ContentIdentity) -> Option<ContentIdentity> {
+    if !self.stored.contains_key(identity) {
+      return None;
+    }
+    let youngest = self.youngest();
+    (1..=youngest).find_map(|revision| {
+      let changes = self.index.changes(revision).ok()?;
+      let change = changes
+        .iter()
+        .find(|change| change.text.is_some_and(|text| text.identity == *identity))?;
+      self.skip_base(&change.path, revision, identity)
+    })
   }
 
   /// Whether the records hold `identity` as the kind a row names it as: a text (kept as a delta, or bytes a property
@@ -210,6 +245,14 @@ impl Repository {
         None => return Some(applied),
       }
     }
+  }
+
+  /// The delta text `identity` is kept as and the text it is against (S4 c2: an svndiff of version 2 against its
+  /// skip-delta base, none for a first version): what an FSFS view names as a `DELTA` representation (A-645 P3). None
+  /// for a text the records keep whole, its bytes a property list's too.
+  pub fn text_delta(&self, identity: &ContentIdentity) -> Option<(Option<ContentIdentity>, &[u8])> {
+    let kept = self.texts.get(identity)?;
+    Some((kept.base, kept.delta.as_slice()))
   }
 
   /// The bytes the texts' deltas hold.
@@ -444,6 +487,8 @@ impl Repository {
       },
       properties,
       contents: fresh.into_iter().collect(),
+      // An import's texts arrive whole: kept by the records (`KeptText`) until imports stream too.
+      stored: BTreeMap::new(),
       lock_entries: Vec::new(),
     })
   }
@@ -468,13 +513,23 @@ impl Repository {
       .locks
       .check_entries(&revision.lock_entries)
       .map_err(StepRefusal::Lock)?;
-    let fresh = self.fresh(&revision.record.changes, revision.contents)?;
+    let fresh = self.fresh(
+      &revision.record.changes,
+      revision.contents,
+      &revision.stored,
+    )?;
     self.grown(&revision.properties, &fresh)?;
+    let stored = revision
+      .stored
+      .into_iter()
+      .filter(|(identity, _)| !self.holds(identity))
+      .collect();
     let planned = self.index.plan(revision.record, self.room.entries)?;
     Ok(Checked {
       planned,
       properties: revision.properties,
       fresh,
+      stored,
       lock_entries: revision.lock_entries,
     })
   }
@@ -490,6 +545,7 @@ impl Repository {
       planned,
       properties,
       fresh,
+      stored,
       lock_entries,
     } = checked;
     let youngest = self.youngest();
@@ -516,6 +572,9 @@ impl Repository {
       .map(<[ChangedPath]>::to_vec)
       .unwrap_or_default();
     let saved = self.keep_fresh(revision, &changes, fresh)?;
+    for (identity, len) in stored {
+      self.stored.entry(identity).or_insert(len);
+    }
     self.revision_properties.push(properties);
     self.held = held.saturating_sub(saved);
     Ok(revision)
@@ -603,10 +662,15 @@ impl Repository {
     &self,
     changes: &[ChangedPath],
     mut brought: BTreeMap<ContentIdentity, Vec<u8>>,
+    stored: &BTreeMap<ContentIdentity, u64>,
   ) -> Result<BTreeMap<ContentIdentity, Vec<u8>>, StepRefusal> {
     let mut fresh = BTreeMap::new();
     for (identity, as_text) in named_as(changes) {
       if self.holds_as(&identity, as_text) || fresh.contains_key(&identity) {
+        continue;
+      }
+      // A text its commit stored in the content store: the records name it, and hold none of its bytes.
+      if as_text && stored.contains_key(&identity) {
         continue;
       }
       // A property list whose bytes the records hold as a text is those bytes: no client brings what is held.
@@ -685,6 +749,8 @@ pub struct Checked {
   properties: Properties,
   /// The texts and property lists its rows name that the repository does not hold.
   fresh: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts its rows name that its commit stored in the content store and the repository does not hold yet.
+  stored: BTreeMap<ContentIdentity, u64>,
   /// Its lock entries.
   lock_entries: Vec<LockEntry>,
 }

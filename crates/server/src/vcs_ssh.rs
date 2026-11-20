@@ -857,14 +857,16 @@ impl<S: SshSite> Link<S> {
     if let Some(rekeyed) = self.session.take_rekey() {
       // A-745 (main's order): every key exchange after the first is logged with what started it.
       slates_machine::log_line!(
-        "slates-server: SSH key exchange begun by {:?} after {} ms of its key, {} packets and {} blocks sealed, {} \
-         packets and {} blocks opened, the key time {} ms",
+        "slates-server: SSH key exchange begun by {:?} after {} ms of its key, {} packets, {} blocks and {} bytes \
+         sealed, {} packets, {} blocks and {} bytes opened, the key time {} ms",
         rekeyed.trigger,
         rekeyed.served_ns / NS_PER_MS,
         rekeyed.sealed.packets,
         rekeyed.sealed.blocks,
+        rekeyed.sealed.bytes,
         rekeyed.opened.packets,
         rekeyed.opened.blocks,
+        rekeyed.opened.bytes,
         rekeyed.key_time_ns / NS_PER_MS
       );
     }

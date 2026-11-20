@@ -65,6 +65,8 @@ pub struct UsageCap {
   pub packets: Option<u64>,
   /// The most blocks, when lower than the cipher's.
   pub blocks: Option<u64>,
+  /// The bytes after which a re-exchange is due, when fewer than RFC 4253 §9's gigabyte ([`REKEY_BYTES`]).
+  pub bytes: Option<u64>,
 }
 
 /// RFC 4344 §3.2's bound for a block cipher of `block_bits` bits: 2^(L/4) blocks.
@@ -100,7 +102,7 @@ impl KeyLimits {
       blocks: cap
         .blocks
         .map_or(self.blocks, |blocks| blocks.min(self.blocks)),
-      bytes: self.bytes,
+      bytes: cap.bytes.map_or(self.bytes, |bytes| bytes.min(self.bytes)),
     }
   }
 
