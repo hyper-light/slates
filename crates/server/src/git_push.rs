@@ -460,6 +460,21 @@ impl<P> ReceivePack<P> {
   /// deletes, checked as its request ended, answers so at once. A refusal of the exchange ends the
   /// push.
   fn check_turn(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
+    // The pack's waiting deltas resolve a turn at a time first (A-724's starvation fix: resolved whole in the last input
+    // step, git/git v1.5.0's held its shard 1.4 s, starving the small repositories there), what each turn resolves
+    // admitted to the quarantine as an input's is.
+    if self.session.is_resolving() {
+      let ns = state.config.step_quantum_ns();
+      self.intake(state, |session, site, admission| {
+        let mut clock = ShardClock;
+        let quantum = Quantum {
+          clock: &mut clock,
+          ns,
+        };
+        session.resolve_turn_into(site, admission, quantum)
+      })?;
+      return Ok(false);
+    }
     if !self.session.is_checking() {
       return Ok(self.session.checked().is_some());
     }

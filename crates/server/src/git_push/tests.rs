@@ -1198,3 +1198,40 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
     );
   });
 }
+
+/// A-724's starvation fix (found by use: a push's last input step resolved every delta waiting on a base in one poll,
+/// 1,435.7 ms for git/git v1.5.0 on the 32-core Studio, and the small repositories sharing its shard waited behind it).
+/// Do: push stock git's `create`, then hand the driver `update`'s request (a thin pack whose deltas wait on bases in the
+/// repository) whole, end it, and answer it a step at a time. Expect: once its bytes are in, the push is still resolving
+/// its deltas (no input step resolved them), and its answer, made over turns, is the one git's own server gave.
+#[test]
+fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_step() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "deferred");
+    let mut chained = chain().into_iter();
+    let (create, _) = chained.next().unwrap();
+    let (_, mut push) = started(state, repository);
+    answered(state, &mut push, create.request);
+    let (update, _) = chained.next().unwrap();
+    let (_, mut push) = started(state, repository);
+    push.input(state, update.request).expect("taken");
+    push.end(state).expect("ended");
+    assert!(
+      push.session.is_resolving(),
+      "the thin pack's deltas were resolved inside an input step"
+    );
+    let mut answer = Vec::new();
+    let mut turns = 0;
+    let received = loop {
+      turns += 1;
+      match push.answer_step(state, &mut answer).expect("answered") {
+        Answering::Answered(received) => break received,
+        Answering::Turned => {}
+        step @ Answering::Hook(_) => panic!("no hook runs here: {step:?}"),
+      }
+    };
+    assert!(turns >= 2, "resolved and checked in one step");
+    assert_eq!(answer, gits_report(&update), "{}", update.name);
+    assert!(reasons(&received).iter().all(|reason| reason == b"ok"));
+  });
+}

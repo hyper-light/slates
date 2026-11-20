@@ -528,7 +528,7 @@ enum Base {
 }
 
 /// A waiting delta's base, as the table of waiting deltas sorts it.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
   /// The entry at this position.
   Entry(usize),
@@ -560,6 +560,32 @@ pub struct Reader<'index, L: Locate + ?Sized = NoIndex> {
   entries: Vec<Record>,
   /// The keeper of a pack read whole into memory ([`Reader::read`]).
   held: Held,
+  /// The waiting deltas' resolution under way between turns ([`Reader::resolve_turn`]), once the pack is whole.
+  resolving: Option<Resolving>,
+}
+
+/// A clock that never moves: a turn under it is never spent, so it resolves to the end ([`Reader::finish_into`]).
+struct Unhurried;
+
+impl crate::store::learn::Clock for Unhurried {
+  fn now_ns(&mut self) -> u64 {
+    0
+  }
+}
+
+/// The waiting deltas' resolution between its turns (A-724's starvation fix): their table by base, the deltas resolved
+/// whose own children are still to look for, the next entry whose children are, and whether the deltas on bases outside
+/// the pack are done. So a pack whose deltas all wait for a late base resolves them a turn at a time, never in one poll.
+#[derive(Debug, Default)]
+struct Resolving {
+  /// The waiting deltas, by their base's key, sorted.
+  waiting: Vec<(Key, usize)>,
+  /// Deltas resolved whose children are still to look for.
+  stack: Vec<usize>,
+  /// The next entry, in pack order, whose children are looked for.
+  next: usize,
+  /// Whether the deltas on bases outside the pack are resolved.
+  outside: bool,
 }
 
 impl<'index, L: Locate + ?Sized> Reader<'index, L> {
@@ -577,6 +603,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       objects: None,
       entries: Vec::new(),
       held: Held::default(),
+      resolving: None,
     }
   }
 
@@ -670,7 +697,17 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     let Stage::Done(checksum) = self.stage else {
       return Err(Refusal::Truncated { at: self.at });
     };
-    self.resolve_waiting(admission, keep)?;
+    // Whatever turns were not taken are taken now, to the end: one resolution path, turned or whole.
+    let mut never = Unhurried;
+    loop {
+      let whole = crate::store::hook_view::Quantum {
+        clock: &mut never,
+        ns: u64::MAX,
+      };
+      if self.resolve_turn(admission, keep, whole)? {
+        break;
+      }
+    }
     let count = self.entries.len();
     charge_items::<Placed>(admission, count)?;
     let mut objects = Vec::new();
@@ -1037,40 +1074,97 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     Ok(take)
   }
 
-  /// Resolves the waiting deltas into `keep`, each once its base is: their table sorted by base, then every entry's
-  /// children found in it by the entry's position and by its name, newly resolved ones on a stack; then those whose base
-  /// no object of the pack is, from `outside`. A delta still waiting after is refused.
-  fn resolve_waiting<K: Keep + Outside + ?Sized>(
+  /// One turn of resolving the waiting deltas into `keep` (A-724's starvation fix), for `quantum` and at least one unit:
+  /// whether every one is resolved. Each unit looks for the children of one entry or of one delta just resolved (their
+  /// table sorted by base, by the entry's position and by its name), or resolves the deltas on bases outside the pack
+  /// from `keep`'s outside; a delta still waiting at the end is refused. Refused unless the pack is whole. A turn that
+  /// stops keeps where it stopped, and the next goes on from there.
+  pub fn resolve_turn<K: Keep + Outside + ?Sized>(
     &mut self,
     admission: &mut Admission,
     keep: &mut K,
-  ) -> Result<(), Refusal> {
-    let count = self
-      .entries
-      .iter()
-      .filter(|record| matches!(record.state, State::Waiting(_)))
-      .count();
-    if count == 0 {
-      return Ok(());
+    quantum: crate::store::hook_view::Quantum<'_>,
+  ) -> Result<bool, Refusal> {
+    if !matches!(self.stage, Stage::Done(_)) {
+      return Err(Refusal::Truncated { at: self.at });
     }
-    let waiting = self.waiting_table(count, admission)?;
-    charge_items::<usize>(admission, count)?;
-    let mut stack = Vec::new();
-    reserve(&mut stack, count)?;
-    for entry in 0..self.entries.len() {
-      self.resolve_children(entry, &waiting, &mut stack, (admission, &mut *keep))?;
-      while let Some(child) = stack.pop() {
-        self.resolve_children(child, &waiting, &mut stack, (admission, &mut *keep))?;
+    let mut resolving = match self.resolving.take() {
+      Some(resolving) => resolving,
+      None => {
+        let count = self
+          .entries
+          .iter()
+          .filter(|record| matches!(record.state, State::Waiting(_)))
+          .count();
+        if count == 0 {
+          self.resolving = Some(Resolving {
+            next: self.entries.len(),
+            outside: true,
+            ..Resolving::default()
+          });
+          return Ok(true);
+        }
+        let waiting = self.waiting_table(count, admission)?;
+        charge_items::<usize>(admission, count)?;
+        let mut stack = Vec::new();
+        reserve(&mut stack, count)?;
+        Resolving {
+          waiting,
+          stack,
+          next: 0,
+          outside: false,
+        }
       }
+    };
+    let began = quantum.clock.now_ns();
+    let mut units = 0u64;
+    let done = loop {
+      if units > 0 && quantum.clock.now_ns().saturating_sub(began) >= quantum.ns {
+        break false;
+      }
+      units = units.saturating_add(1);
+      if let Some(child) = resolving.stack.pop() {
+        self.resolve_children(
+          child,
+          &resolving.waiting,
+          &mut resolving.stack,
+          (admission, &mut *keep),
+        )?;
+        continue;
+      }
+      if resolving.next < self.entries.len() {
+        let entry = resolving.next;
+        resolving.next = resolving.next.saturating_add(1);
+        self.resolve_children(
+          entry,
+          &resolving.waiting,
+          &mut resolving.stack,
+          (admission, &mut *keep),
+        )?;
+        continue;
+      }
+      if !resolving.outside {
+        resolving.outside = true;
+        self.resolve_outside(
+          &resolving.waiting,
+          &mut resolving.stack,
+          (admission, &mut *keep),
+        )?;
+        continue;
+      }
+      break true;
+    };
+    self.resolving = Some(resolving);
+    if !done {
+      return Ok(false);
     }
-    self.resolve_outside(&waiting, &mut stack, (admission, keep))?;
     let first = self
       .entries
       .iter()
       .position(|record| matches!(record.state, State::Waiting(_)));
     match first {
       Some(first) => Err(self.unresolved(first)),
-      None => Ok(()),
+      None => Ok(true),
     }
   }
 

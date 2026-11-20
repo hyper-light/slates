@@ -5,8 +5,8 @@ use flate2::{Compress, Compression, FlushCompress};
 use proptest::prelude::*;
 
 use super::{
-  Chain, Contents, IndexMismatch, Keep, Locate, NoIndex, Object, Outside, Reader, Refusal,
-  Unpacked, check_index, read_whole,
+  Beside, Chain, Contents, IndexMismatch, Keep, Locate, NoIndex, NoObjects, Object, Outside,
+  Reader, Refusal, Unpacked, check_index, read_whole,
 };
 use crate::delta::{self, Sizes};
 use crate::entry::{self, Header, Representation};
@@ -1062,4 +1062,95 @@ proptest! {
     prop_assert_eq!(&through, &unpacked);
     prop_assert_eq!(fed_in_chunks(&bytes, format, &NoIndex, chunk).unwrap(), unpacked);
   }
+}
+
+/// A clock that moves a nanosecond each time it is read, so a turn of one nanosecond is spent after its first unit of
+/// work.
+struct Ticking(u64);
+
+impl crate::store::learn::Clock for Ticking {
+  fn now_ns(&mut self) -> u64 {
+    self.0 += 1;
+    self.0
+  }
+}
+
+/// A-724's starvation fix (found by use: a push's last input step resolved every delta waiting on a late base in one
+/// poll, 1,435.7 ms for git/git v1.5.0 on the 32-core Studio, starving the small repositories on its shard and ending
+/// the daemon at ten such pushes). Do: read whole a pack of 64 reference deltas whose base comes last, then resolve its
+/// waiting deltas with a turn of one nanosecond on a clock that ticks each read. Expect: many turns, each resolving at
+/// least one delta and returning; every delta resolved at the end, each object as reading the pack whole in one call
+/// makes it; and the pack then finished with nothing left to resolve.
+#[test]
+fn deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time() {
+  let format = ObjectFormat::Sha256;
+  let base = b"a base every delta waits for, and it comes last\n".repeat(4);
+  let id = blob_id(format, &base);
+  let mut builder = Builder::new(format);
+  for n in 0..64u32 {
+    let target = [base.as_slice(), format!("edit {n}\n").as_bytes()].concat();
+    builder.put(
+      Representation::RefDelta { base: id },
+      &delta_between(&base, &target),
+    );
+  }
+  builder.put(Representation::Whole(Kind::Blob), &base);
+  let bytes = builder.finish();
+  let index = Placed(vec![]);
+  let whole = read_whole(&bytes, format, &index, &mut unbounded()).unwrap();
+  let mut reader = Reader::new(format, &index);
+  let mut admission = unbounded();
+  let mut held = super::Held::default();
+  reader
+    .read_into(
+      &bytes,
+      &mut admission,
+      &mut Beside {
+        outside: &NoObjects,
+        held: &mut held,
+      },
+    )
+    .unwrap();
+  assert!(reader.is_whole());
+  let mut clock = Ticking(0);
+  let mut turns = 0u32;
+  loop {
+    turns += 1;
+    assert!(turns <= 1_000, "the resolution never ended");
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 1,
+    };
+    let done = reader
+      .resolve_turn(
+        &mut admission,
+        &mut Beside {
+          outside: &NoObjects,
+          held: &mut held,
+        },
+        quantum,
+      )
+      .unwrap();
+    if done {
+      break;
+    }
+  }
+  assert!(
+    turns >= 32,
+    "64 waiting deltas resolved in {turns} turns of one nanosecond"
+  );
+  for (at, object) in whole.objects.iter().enumerate() {
+    let kept = held.take(at).expect("each object kept");
+    assert_eq!(kept.content, object.content, "object {at}");
+  }
+  let kept = reader
+    .finish_into(
+      &mut admission,
+      &mut Beside {
+        outside: &NoObjects,
+        held: &mut held,
+      },
+    )
+    .unwrap();
+  assert_eq!(kept.objects.len(), 65);
 }
