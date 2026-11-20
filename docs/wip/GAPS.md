@@ -84,6 +84,10 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
+> admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
+> admission and the landing's whole passes sliced; a stale restage sliced.
+>
 > **A-743 (2026-11-20, w-git).** BUILT: a branch `CreateBranch` makes is a git ref at the commit it was made at
 > (recorded as a no-object push), so stock git lists, retires, binds and pushes it as the namespace says.
 >
@@ -1919,7 +1923,13 @@
 > new volume holding `DUMP_FILE`, walked twice a revision a unit (measured, then written a copy slice at a time, both
 > hashed, a differing second walk refused), the caller landing the volume under a grant; landed by w-svn from g268's
 > work, with a fix found by its own test: two exports side by side minted one volume id at their walks' end, the
-> second refused `AlreadyExists` at its record, so the id is minted in the publishing atom now. **Owed, measured
+> second refused `AlreadyExists` at its record, so the id is minted in the publishing atom now. The sibling sweep (main,
+> same day): every id minted before the record that holds it could repeat, since `verbs::fresh_volume_id_at` named
+> the database's next sequence unreserved: an image's identity at its plan, an archive export's and an archive
+> import's volume at admission, a name alias's. Each mint is now the shard's alone (`ShardState::volume_ids_minted`,
+> held to the counter's bound); held by `image::tests::two_imports_admitted_side_by_side_mint_distinct_volume_ids`
+> (red: one id twice). Minting inside the recording transaction was not the structural form: an image's identity
+> holds its id before its volume is recorded. **Owed, measured
 > 2026-11-20 (debug, this MacBook):** a unit is one revision whole, the exporter writing a revision or nothing
 > (`migration::export`), so a revision's texts are staged whole and its unit is unbounded: against a 14 µs copy-slice
 > budget, a 195-byte revision took 60 µs and one with a 107 KB text 2.4 ms, `image.units_past_budget` 87 over the
@@ -1944,7 +1954,10 @@
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). A-586 (2026-11-19, g295): the engine's `Copy` (`OpKind` 16), built: recorded once at its
 > destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
-> key, the identity one entry a copy, hard links refused by kind, the root a source and never a destination, a branch
+> key, the identity one entry a copy, hard links refused by kind (BUILT 2026-11-20, w-shared, main's ruling: a copied
+> tree's links share the copy's nodes, a link naming a node outside it gets a node of its own, `Green::copy_link_effects`;
+> refused only where that outside node changed after the copy's version, still as `TypeChanged`, owed its own typed
+> refusal), the root a source and never a destination, a branch
 > made before a copy cutting it, a review comment on a copied file moving with it (A-596); held to a reference green
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain

@@ -45,7 +45,9 @@ impl Residency {
 /// unmapped one is the OS's refusal, never undefined behaviour.
 pub fn of_range(base: *const u8, len: usize, page: usize) -> Result<Residency, MemError> {
   let page = page.max(1);
-  let start = (base as usize) / page * page;
+  let address = base as usize;
+  // The page holding `base`: its address less its offset into the page.
+  let start = address.saturating_sub(address.checked_rem(page).unwrap_or(0));
   let end = (base as usize).saturating_add(len);
   let pages = end.saturating_sub(start).div_ceil(page);
   let mut found = Residency {

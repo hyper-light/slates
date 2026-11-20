@@ -15017,6 +15017,14 @@ and export by landing).
 > one, a copy from a version its source changed after, and Subversion's replace with history (a copy onto a path its
 > own increment removes), each in the A-586 entry.
 >
+> **Status (2026-11-20, A-586's hard link in a copied tree; main's ruling).** Built: a copy of a tree holding hard links.
+> The rule, a snapshot's: names in the copied tree that share a node keep sharing one new node in the copy (a copied
+> link names its node's copy); a name whose node lies outside the copied tree gets a node of its own in the copy,
+> holding that node's bytes, mode or IPC node, its bytes named by the content they hold. Derived at the commit from the
+> head before the copies land (`Green::copy_link_effects`), as a node's moves are, so a replay and a checkpoint hold the
+> same; a copy whose outside nodes changed after its version is refused. Owed: that refusal and A-586's other "does not
+> yet copy" cases answering their own typed refusals, not `TypeChanged`.
+>
 > **Status (2026-11-19, A-626 part 1).** Built: the engine's replace with history (`REPLACE`, a flag on `Copy`: the
 > destination's tree taken away key by key at the copy's version, judged as a removal against the base) and copies
 > nested in one increment, a second copy into a new branch and a move inside one (a copy and a removal) among them, so
@@ -54989,6 +54997,15 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   committed image names is not reused before a newer image commits; (a3) the content table in the shard image and its
   recovery before the records; (b) git's record version 3; (c) Subversion's texts with A-716's slices; (d) replication's
   content-before-record order, held by the two-node test.
+- **Slice a2, landed (2026-11-20; main's ruling (ii)).** The windows are chunks of the volume store's own chunk store
+  (`vcs_store::arena_windows::ChunkWindows`), one arena and one budget (A-64): a second arena over the same pool was
+  tried first and found nothing to claim. The chunk store is lent to the content store per step by a swap
+  (`WindowStorage::lend_in`/`hand_back`, `ChunkStore::empty` the placeholder) under a guard (`vcs_store::Lent`, and
+  `lent_state` for a step over the whole state), so readers keep `&ContentStore` and nothing is unsafe; a lend inside
+  a lend takes nothing; outside one a read answers none and a put is refused `ContentRefused::Storage`, typed, and a
+  release frees its chunk at the next lend. A put the arena has no block for grows it from its pool, the lend's end
+  extending the shard budget by the growth. The swap moves a `ChunkStore` (560 bytes); its release cost is measured with the slice's by-use run.
+  Tests (merged with main, local, own target): `slates-server` lib 947 of 947 run (`content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`, A-744's, skipped: it spins a debug shard past its window here, alone too, and touches no repository code), `arena_windows::tests` 2 of 2; `slates-vcs` 100, `slates-hg` 356, `slates-git` 557. Slice a2 step 1's three red `slates-vcs` tests read windows through `get()`, which lends only content held Here; they read through `bytes_of`/`len_of` now.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
@@ -55457,6 +55474,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4a — A git record's pack is replayed a turn at a time (2026-11-20, w-git for UI goal 93; main's ruling: a large pack record's replay ran in one turn and crash-looped the daemon)
+- **Change.** `vcs_store::git_replay`: a version-2 record carrying a pack is decoded once as its replay begins (names,
+  moves and the pack's place in the record kept), then read a chunk at a time (`DaemonConfig::archive_slice_bytes_within`
+  of the turn) and its objects admitted one at a time, each turn held to the shard's step quantum and taking one unit
+  at least; the names compared, the seal, the moves and the commit at its end. A rebuild's turn and a recovery's unit
+  step it (`record_turn`); a replay under way is kept on the stores and given back if its rebuild is replaced. Owed,
+  sliced in turn: a thin pack's resolve of outside bases (`Reader::finish_with`, after w-balance's receive resolve
+  slicing lands), the seal's staging pass, the moves' admission and the landing's whole passes.
+- **Tests.** `slates-server` `vcs_store::tests::t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns`
+  (one record of 66 objects; red before: replayed in one turn); `t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn`
+  now a turn a record at least.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge` 165 passed, 1 ignored; fmt clean.
+
 ### A-743 — Every name the namespace binds is a ref git's site serves (bug, 2026-11-20, w-git for UI goal 93; main's ruling; found by use by w-interop)
 - **Found by use.** Stock git 2.50.1 over the HTTP edge: a branch made with `slates repository branch create project
   topic --from main` never showed in `git ls-remote --heads`. The advertisement listed each bound name whose green held a
@@ -55825,3 +55856,27 @@ shared with the export's).
 - **Owed.** The CLI's and the SDKs' words for the import and the export; the export's volume landed by `slates land`
   as any volume is (no new verb needed); main's runs (clippy, `xtask check`, the doc gate, Linux and Windows builds,
   the mutation red-checks).
+
+### A-586's hard link in a copied tree — Names sharing a node share the copy's node; a name whose node lies outside gets one of its own (2026-11-20, w-shared for UI goal 93; main's ruling; found by use through MCP)
+- **Why.** A copy of a tree holding a hard link was refused (A-586: "does not yet copy"), and answered as a `TypeChanged`
+  conflict at the destination. An agent's workspace holds hard links routinely (`git clone --local` links its objects),
+  so the copy verb on every surface met it: MCP's by-use test did.
+- **The rule** (amended into A-586's status in §4.16 and `slates-merge`'s `engine/copy.rs` docs), as for a snapshot:
+  names in the copied tree that share a node keep sharing one new node in the copy; a name whose node also has a name
+  outside the copied tree, or lies outside it, gets a node of its own in the copy, holding the node's bytes, mode or IPC
+  node, its bytes named by the content they hold, never copied by the outside node.
+- **Change.** `Green::copy_link_effects`, called by `Green::commit` beside `node_moves`: for each copy, every hard link in
+  its source's tree becomes `Effect::Hardlink` naming its node's copy, or `RemoveHardlink` and the outside node's
+  `Special`, or its `Mode` and `SetContent` (`ContentSource::Copied`), applied after the graft; derived from the head,
+  never recorded, so a replay and a checkpoint hold the same. The verdict accepts a source holding hard links, refusing
+  only one whose outside nodes changed after the copy's version (`Green::outside_link_moved`): the head would not hold
+  what they held then.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-merge` `engine::copy_tests::
+  a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns_one` (an inside link names the copy's
+  node; an outside one is a file of its own with the node's bytes and mode; identity equal to its recount; a replayed
+  replica and a restored checkpoint read and hash alike); `a_copy_is_refused_typed_and_changes_nothing` (the refusal
+  now a copy from before its outside node changed); `cargo test --locked -p slates-merge --lib -- copy engine::` 163 of
+  163. `slates-server` `vcs_store::paths::tests::t_a626_p4_a_work_copies_a_tree_holding_a_hard_link` (red before: the
+  server's repro, refused `TypeChanged`), `-- t_a626_p4 vcs_store::paths:: vcs_store::commits::` 20 of 20; fmt clean.
+- **Owed.** The refusal kept, and A-586's other "does not yet copy" cases, answering their own typed refusals rather than
+  `TypeChanged` (next); a copy from before an outside node changed, read from its history.

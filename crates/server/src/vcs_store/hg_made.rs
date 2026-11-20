@@ -170,14 +170,16 @@ fn made(
     .or_else(|| named_head(state, green))
     .unwrap_or(slates_hg::NULL_NODE);
   let room = crate::vcs_share::room(state, repository).bytes;
-  let verified = changeset_of(
-    state,
-    room,
-    (repository, green),
-    (before, version),
-    parent,
-    (user, message, seconds),
-  )?;
+  let verified = super::lent_state(state, |state| {
+    changeset_of(
+      state,
+      room,
+      (repository, green),
+      (before, version),
+      parent,
+      (user, message, seconds),
+    )
+  })?;
   let Some(verified) = verified else {
     return Ok(false);
   };
