@@ -38028,6 +38028,8 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 - **Owed.** The lineage model's mirror of the rule and its own oracle (a live owner's copy let go only while a record at
   least as new is on `f + 1` members), main's to compile and run beyond its default cases; the content release signal
   (a successor confirms once its adopted content is re-placed, a settle certifies content too); the Lineage.tla text.
+  (Status 2026-11-19: the mirror and its oracle are built, A-707; the content release signal is A-529, A-538 and A-546;
+  the text is A-518.)
 
 ### A-502 — The owner feeds a turn's changes to each replica's shard in one message after the turn's replies, and each replica acknowledges a turn once (2026-11-18, goal 87 via g083; A-273; §4.16 "Rebase off the owner"; A-457, A-465, A-473)
 
@@ -53948,3 +53950,27 @@ and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `c
   their snapshot); `slates-server` `repository::tests::a_repository_and_every_green_made_for_it_share_one_line` (a
   repository, its root and branches on one line; an adopted lone green's repository on its own).
 - **Owed.** The server's takeover adopting a repository's logs and records whole (2c).
+
+### A-707 — The lineage model judges a live owner's settled-away copy and the narrowed round (2026-11-19, UI goal 84 (kiln d9f7a795, w-unresolved); §4.8 "Promotion and takeover"; A-508's and A-556's owed model mirror; A-272 (ii), A-309)
+
+`crates/db/tests/lineage_model.rs`, the executable counterpart of `docs/wip/models/Lineage.tla`, ran neither rule the
+server has run since A-508 and A-556: its live branch let a copy go only on a confirmation, and its round waited on
+every recovery cohort.
+- **The settle rule.** A copy routed to its live writer with no confirmation to judge, held outside all of that owner's
+  neighbourhoods, goes where `RegionalConfiguration::settled_away` holds, and is kept and counted otherwise, as
+  `takeover::settle_away` does.
+- **Its oracle.** Such a release has no adoption to make the copy stale, so A-309's oracle cannot judge it. It is held
+  to the guarantee the rule rests on, `Lineage.tla`'s `SettleKeepsFPlusOne`: where the copy's record was placed, `f + 1`
+  other members hold a record at least as new (a later adoption, or the same adoption at that sequence or after).
+- **The narrowed wait.** The round judges readiness on `readiness_cohorts` and `readiness_current_cohorts`, as the
+  server's round does, so A-556's narrowing is judged by A-309's oracle on every generated history.
+- **Non-vacuity.** Two new verdicts, `reclaimed_settled_away` and `kept_outside`, must each be reached over the fixed
+  seeds.
+
+Applied in the same change to: A-508's owed line (status), GAPS (A-272 (ii)'s A-508 line), the model's module doc.
+
+- **Evidence.** macOS arm64, this Mac, local, 2026-11-19: `cargo test --locked -p slates-db --test lineage_model` 4 of
+  4. Over the 400 fixed seeds: `reclaimed_settled_away` 72, `kept_outside` 2,526, `reclaimed_confirmed` 114,
+  `reclaimed_unasked` 2, `adopted` 764 (242 past tolerance), `completed` 638, no violation. `cargo fmt -p slates-db --
+  --check` clean.
+- **Owed (main's).** The model beyond its default cases (`PROPTEST_CASES`); clippy for the test target.
