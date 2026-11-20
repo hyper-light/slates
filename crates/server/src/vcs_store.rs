@@ -2009,7 +2009,35 @@ fn recorded_alike(
     let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
     (object.kind, object.identity, len)
   });
-  admitted.eq(recorded)
+  alike(content, admitted, recorded)
+}
+
+/// Whether `made`, what the replay's admission records, is `named`, a record's, object by object ([`same_name`]).
+fn alike(
+  content: &ContentStore,
+  made: impl Iterator<Item = (slates_git::object_name::Kind, slates_vcs::ContentId, u64)>,
+  named: impl Iterator<Item = (slates_git::object_name::Kind, slates_vcs::ContentId, u64)>,
+) -> bool {
+  let mut named = named;
+  for made in made {
+    match named.next() {
+      Some(named) if same_name(content, made, named) => {}
+      _ => return false,
+    }
+  }
+  named.next().is_none()
+}
+
+/// Whether an object the replay admitted, by its identity, is the one a record named: the same kind and length, and
+/// the same identity, or (a record written before the identity rule) this node's root of it.
+fn same_name(
+  content: &ContentStore,
+  made: (slates_git::object_name::Kind, slates_vcs::ContentId, u64),
+  named: (slates_git::object_name::Kind, slates_vcs::ContentId, u64),
+) -> bool {
+  made.0 == named.0
+    && made.2 == named.2
+    && (made.1 == named.1 || content.root_of(&made.1) == named.1)
 }
 
 /// Whether the objects the replay's admission would record now are `names`, a version-2 record's, in order
@@ -2020,10 +2048,10 @@ fn names_alike(
   remade: &RecordWriter,
   names: &[(slates_git::object_name::Kind, slates_vcs::ContentId, u64)],
 ) -> bool {
-  remade
+  let made = remade
     .lacked(lacks(content, store))
-    .map(|noted| (noted.kind, noted.identity, noted.len))
-    .eq(names.iter().copied())
+    .map(|noted| (noted.kind, noted.identity, noted.len));
+  alike(content, made, names.iter().copied())
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.
@@ -2037,7 +2065,10 @@ fn replay_objects(
     return replay_pack(content, store, (push, remade), record);
   }
   for object in &record.objects {
-    if content.object_id(object.content) != object.identity {
+    // A record written before the identity rule names an object past one window by this node's root of it.
+    if content.object_id(object.content) != object.identity
+      && content.root_id(object.content) != object.identity
+    {
       return Err(ReplayRefused::Identity);
     }
     let incoming = Incoming {

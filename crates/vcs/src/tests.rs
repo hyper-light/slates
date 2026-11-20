@@ -837,8 +837,8 @@ const PUSHES: usize = 3;
 
 /// The oracle's statement of an object's layout (§4.17.1 "Objects" item 1, D-6), written apart from the store's: one
 /// window of at most a window's bytes; else its windows cut at `0, w, 2w, …` and named by plain BLAKE3, under lists of
-/// at most `w / 32` identities named in the list form, a level at a time, up to one root. The root, and every node
-/// with its bytes.
+/// at most `w / 32` identities named in the list form, a level at a time, up to one root. The object's identity (the
+/// BLAKE3 of its bytes, the identity rule), and every node with its bytes.
 fn layout(bytes: &[u8]) -> (ContentId, BTreeMap<ContentId, Vec<u8>>) {
   let mut nodes = BTreeMap::new();
   if bytes.len() <= WINDOW {
@@ -863,7 +863,8 @@ fn layout(bytes: &[u8]) -> (ContentId, BTreeMap<ContentId, Vec<u8>>) {
       })
       .collect();
   }
-  (level[0], nodes)
+  // The identity rule: the object is named by the BLAKE3 of its bytes; its windows and lists are the store's nodes.
+  (ContentId::of(bytes), nodes)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1019,6 +1020,15 @@ struct Model {
 impl Model {
   /// Every content the model names, with its bytes: each named object's whole tree.
   fn named(&self) -> BTreeMap<ContentId, Vec<u8>> {
+    self
+      .objects()
+      .iter()
+      .flat_map(|root| self.layouts[root].clone())
+      .collect()
+  }
+
+  /// The objects something names, by their identities (the identity rule: the BLAKE3 of each object's bytes).
+  fn objects(&self) -> BTreeSet<ContentId> {
     let mut roots = BTreeSet::new();
     for push in &self.pushes {
       roots.extend(push.values().map(|(_, bytes)| layout(bytes).0));
@@ -1029,9 +1039,6 @@ impl Model {
       }
     }
     roots
-      .iter()
-      .flat_map(|root| self.layouts[root].clone())
-      .collect()
   }
 }
 
@@ -1142,7 +1149,8 @@ fn commit(real: &mut Real, model: &mut Model, push: usize, index: usize) {
 
 fn insert(real: &mut Real, model: &mut Model, index: usize, key: u8, blob: usize, payload: u8) {
   let root = layout(&model.blobs[blob]).0;
-  let held = model.named().contains_key(&root);
+  // Held as an object named by its identity, or as a node of one (a short object equal to a long one's window).
+  let held = model.objects().contains(&root) || model.named().contains_key(&root);
   let (Some(real_index), Some(model_index)) =
     (real.indexes[index].as_mut(), model.indexes[index].as_mut())
   else {
