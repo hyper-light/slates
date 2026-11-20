@@ -759,8 +759,10 @@
 > is judged (a refusal that path's answer in `check_hook_result`'s words; pre-lock's standard output the lock's token)
 > and post-lock or post-unlock once over the paths changed after their answers, its failure after `done`, the locks
 > standing (`fs-wrap.c`); `slates_svn::serve`'s lock verb is four calls now (`lock_verb`, `lock_judged`, `locks_landed`,
-> `locks_finished`). Owed: `svn+ssh://` (part 3; the tunnel runs no hook yet, as before), the revprop hooks' calls
-> (A-702 part 2, w-svn, on `vcs_svn::run_hook`), DAV's.
+> `locks_finished`). **Part 3 (same day):** the `svn+ssh://` tunnel runs the same hooks through the same runner
+> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). Owed: the tunnel's signal of its client
+> gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); the revprop hooks'
+> calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`

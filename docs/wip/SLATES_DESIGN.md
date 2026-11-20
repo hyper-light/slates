@@ -15861,7 +15861,9 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > out the post-hook, `locks_finished` ends it), so the connection task runs each hook between them. Held to the
 > listener's tests: a refusing pre-lock answered in `svnserve`'s words with no lock held; pre-lock's arguments and
 > token, post-lock's arguments, standard input and failure after `done`; pre- and post-unlock's arguments and standard
-> input. Owed: `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
+> input. **Part 3:** the `svn+ssh://` tunnel (`svnserve -t`) runs them the same way through the same runner, the
+> repository's policy its record's; no signal of the client gone reaches the SSH edge yet, so a run there ends at its
+> learned bound or by itself. Owed: that signal, the revprop hooks' calls (A-702 part 2) and DAV's.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -54948,4 +54950,11 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   its_path_in_svnserves_words`, `a_lock_runs_pre_lock_for_its_token_and_post_lock_after_it_as_svnserve_does`,
   `an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` (a file committed from stock `svn`'s recorded delta);
   `slates-svn` `serve::` and `commit::` (stock `svnserve`'s recorded lock sessions replayed through the four calls).
-- **Owed.** Part 3: the `svn+ssh://` tunnel. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
+- **Part 3 (same day): the `svn+ssh://` tunnel.** `vcs_svn::run_hook` takes a `HookSite`: the listener's connection
+  (its repository's policy read on the owner shard, `ClientGone` its hang-up) or the tunnel's repository policy (no
+  hang-up signal on the SSH edge yet). The tunnel's steps await its hooks: start-commit and pre-commit, post-commit,
+  and the lock verbs' through `vcs_svn::pre_lock_hooks` and `post_lock_hook`. Tests:
+  `vcs_ssh::svn::tests::a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`,
+  `a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them` (the tunnel driven on a runtime of its own).
+- **Owed.** The SSH edge's signal of the client gone, for a hook's run. The revprop hooks' calls with A-702 part 2
+  (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
