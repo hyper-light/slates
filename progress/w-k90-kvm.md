@@ -36,3 +36,19 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
 
 ## For main to delete
 - adacachy ~/.cache/w-k90-kvm/clone (broken partial clone, mine)
+
+## 2026-11-20 ~10:00-11:10 PST: KVM ROOT CAUSE + fixes (big Studio rebooted 10:35; resumed)
+- ROOT CAUSE (r50 diag, adacachy, ed8991d29 + log patch): Hex refused the member: "its command never started (status
+  128): the volume at /tmp/.tmpKZErig/ask/project: a volume may not be at or under /tmp, a domain's own scratch".
+  The drive's tempdir is /tmp on Linux (/var/folders on macOS, hence HVF passed). The image itself is fine on KVM
+  (`shards run` of the stand-in image: python3 + /opt/vm-stub/stub -> WROTE, STUB_DONE, rc 0, 23 s).
+- Defect (b): kiln said exit -1 with no words (hexvm end_of drops Hex's refusal), and the drive's Watch::ended waited
+  for a word newer than its first look though kiln had already said "so kiln stopped starting it again" -> 35 min hang.
+- Fix on branch agents/w-k90-kvm-g90 (kiln a8156f377 = wip 182960104 + merge of main 715063153):
+  slates_e2e microvm drives' folders under CARGO_TARGET_TMPDIR; hexvm `refusal_said` (a refused end says why on the
+  member's stderr -> session error); session::STOPPED_STARTING shared const; vm_e2e Watch::ended refuses at once on it.
+  Tests: vm_harnesses s35_a_wait_refuses_at_once... (new case), hexvm g90_a_refused_members_end_says_why_on_its_stderr.
+- Red: local (this Studio) vm_harnesses with the rule hunk held out (running). Green: KVM run r3 (adacachy,
+  ~/.cache/w-k90-kvm/wt3 at a8156f377, logs ~/.cache/w-k90-kvm/logs/r5-a8156f377*).
+- Slip: I ran `git switch` once (to a new branch at the same commit, no file change). No more.
+- for main to delete (adacachy): ~/.cache/w-k90-kvm/wt (r2/r3 scratch, diag patch applied), ~/.cache/w-k90-kvm/clone.
