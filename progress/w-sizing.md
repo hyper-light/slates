@@ -62,6 +62,17 @@
 - A-778 LANDED main 779840fba: daemon removes the anchor's segment/content names when the anchor is gone
   (slates_mem::unlink_handoff); red->green cli test on the big Studio; bug record docs/bugs/2026-11-20-a-killed-anchor-...
 - Worktree now ~/slates-work/w-sizing-a778 (landed, removable). Branch agents/w-sizing-noprefault kept for r7 (Linux A/B).
+- 15:20 ruling (main): content as extents made on demand, YES; macOS first behind the pool API; conditions (a)
+  provisioning untouched (made ahead), (b) Linux/Windows measured first (g226 takes it), (c) bounded counts, (d)
+  recovery across processes. Branch agents/w-sizing-noprefault deleted (landed as A-777; its A/B was r6). Local target
+  deleted (2.5 GB). g226's status residency read 0 MiB with a 256 MiB burst on macOS (sweep defect; mincore on a fresh
+  view does report the object, probed) -- tell g226.
+- Extents piece 1 (macOS), branch agents/w-sizing-extents, worktree ~/slates-work/w-sizing-a778:
+  red 961112d0e (recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone; measure = anchor's content
+  object residency + process RSS). RED on adas-macbook-pro-2 (quiet): before 63 MiB, with burst 1,621, after destroy
+  1,622 (content object 259 MiB kept, RSS 1,362 kept). Fix d0f3199f9: slates_mem::extent_handoff/make_extent; pool
+  makes own slice's extents at start, maps by name, release unlinks + remakes empty; daemon unlinks every extent name
+  when the anchor is gone. mem shared:: 6/6 local. Green run r22 queued.
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 
