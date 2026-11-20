@@ -90,7 +90,7 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    end/reaper: delete pod, claim, PV; release at home.
 
 ## W10 cluster piece LANDED 2026-11-20 kiln main 8c501c906 (kubeapi PV/claim verbs, k8s::volume::{make,unmake}, chart rbac.agentPods).
-## ANSWERED by main 2026-11-20 (was "blocked on main", asked ~00:4x PST; both built since: 82e81809f, 3a7e4116c..75757b07d):
+## ANSWERED by main 2026-11-20 (asked ~00:4x PST; both built since: 82e81809f, 3a7e4116c..75757b07d):
 - W10 pod start: ANSWERED -- ephemeral one-session runner in the pod (built: 3a7e4116c, 5c5adfae9, b07098718, 75757b07d).
 - W9 harness sign-in in a container: ANSWERED -- credential grant by name (built: 82e81809f).
 ## Owed by others: live container start + Runners page browser check (main); Docker Desktop share key (needs a Mac with
