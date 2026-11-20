@@ -32,72 +32,88 @@ pub(super) const INITIAL: State = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032
 /// 4294967296 times abs(sin(i)), i in radians), as the RFC lists it.
 const SINES: [[u32; BLOCK_WORDS]; 4] = [
   [
+    // Format: T[1] to T[4].
     0xd76a_a478,
     0xe8c7_b756,
     0x2420_70db,
     0xc1bd_ceee,
+    // Format: T[5] to T[8].
     0xf57c_0faf,
     0x4787_c62a,
     0xa830_4613,
     0xfd46_9501,
+    // Format: T[9] to T[12].
     0x6980_98d8,
     0x8b44_f7af,
     0xffff_5bb1,
     0x895c_d7be,
+    // Format: T[13] to T[16].
     0x6b90_1122,
     0xfd98_7193,
     0xa679_438e,
     0x49b4_0821,
   ],
   [
+    // Format: T[17] to T[20].
     0xf61e_2562,
     0xc040_b340,
     0x265e_5a51,
     0xe9b6_c7aa,
+    // Format: T[21] to T[24].
     0xd62f_105d,
     0x0244_1453,
     0xd8a1_e681,
     0xe7d3_fbc8,
+    // Format: T[25] to T[28].
     0x21e1_cde6,
     0xc337_07d6,
     0xf4d5_0d87,
     0x455a_14ed,
+    // Format: T[29] to T[32].
     0xa9e3_e905,
     0xfcef_a3f8,
     0x676f_02d9,
     0x8d2a_4c8a,
   ],
   [
+    // Format: T[33] to T[36].
     0xfffa_3942,
     0x8771_f681,
     0x6d9d_6122,
     0xfde5_380c,
+    // Format: T[37] to T[40].
     0xa4be_ea44,
     0x4bde_cfa9,
     0xf6bb_4b60,
     0xbebf_bc70,
+    // Format: T[41] to T[44].
     0x289b_7ec6,
     0xeaa1_27fa,
     0xd4ef_3085,
     0x0488_1d05,
+    // Format: T[45] to T[48].
     0xd9d4_d039,
     0xe6db_99e5,
     0x1fa2_7cf8,
     0xc4ac_5665,
   ],
   [
+    // Format: T[49] to T[52].
     0xf429_2244,
     0x432a_ff97,
     0xab94_23a7,
     0xfc93_a039,
+    // Format: T[53] to T[56].
     0x655b_59c3,
     0x8f0c_cc92,
     0xffef_f47d,
     0x8584_5dd1,
+    // Format: T[57] to T[60].
     0x6fa8_7e4f,
     0xfe2c_e6e0,
     0xa301_4314,
     0x4e08_11a1,
+    // Format: T[61] to T[64].
     0xf753_7e82,
     0xbd3a_f235,
     0x2ad7_d2bb,
@@ -110,6 +126,7 @@ const SINES: [[u32; BLOCK_WORDS]; 4] = [
 const ROTATIONS: [[u32; 4]; 4] = [
   [7, 12, 17, 22],
   [5, 9, 14, 20],
+  // Format: S31 to S34, then S41 to S44.
   [4, 11, 16, 23],
   [6, 10, 15, 21],
 ];

@@ -74,6 +74,8 @@ impl FileRequest {
   /// `svn_ra_svn__parse_tuple(params, "c(?r)bb?B")`: a fifth item, when present, must be a boolean.
   fn parse(params: &[Value<'_>], base: &str) -> Option<Self> {
     let (path, revision) = path_and_revision(params, base)?;
+    // Format: `"c(?r)bb?B"` is path 0, revision 1, props 2, contents 3 and inherited-props 4
+    // (`serve.c` `get_file`).
     let inherited = match params.get(4) {
       None => false,
       some => boolean(some)?,
@@ -81,6 +83,7 @@ impl FileRequest {
     Some(Self {
       path,
       revision,
+      // Format: `"c(?r)bb?B"`'s want-props (2) and want-contents (3).
       properties: boolean(params.get(2))?,
       contents: boolean(params.get(3))?,
       inherited,

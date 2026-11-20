@@ -24,7 +24,7 @@ use crate::out::Out;
 use crate::{Admission, PastAdmission, to_u64};
 
 /// Format: the bytes RFC 8259 §2 allows between tokens: space, horizontal tab, line feed, carriage return.
-const WHITESPACE: [u8; 4] = [b' ', b'\t', b'\n', b'\r'];
+const WHITESPACE: [u8; 4] = *b" \t\n\r";
 
 /// Format: the first code point that needs no escape in a string (RFC 8259 §7: "the control characters (U+0000
 /// through U+001F)" must be escaped).
@@ -402,7 +402,7 @@ fn escape_end(input: &[u8], at: usize) -> Result<(usize, char), Refusal> {
       .map(|named| (after, named))
       .ok_or(refused);
   }
-  for (offset, expected) in [b'\\', b'u'].iter().enumerate() {
+  for (offset, expected) in b"\\u".iter().enumerate() {
     let here = after.saturating_add(offset);
     match input.get(here) {
       None => return Err(Refusal::Truncated { at: to_u64(here) }),
@@ -836,10 +836,7 @@ pub fn put_u64(out: &mut impl Out, value: u64) {
   let mut digits = [0u8; U64_DIGITS];
   let mut start = digits.len();
   let mut left = value;
-  loop {
-    let Some(next) = start.checked_sub(1) else {
-      break;
-    };
+  while let Some(next) = start.checked_sub(1) {
     start = next;
     if let Some(slot) = digits.get_mut(start) {
       let digit = left.checked_rem(DECIMAL).unwrap_or(0);

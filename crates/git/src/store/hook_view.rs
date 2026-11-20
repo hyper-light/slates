@@ -333,7 +333,7 @@ impl HookView {
     let refs = PackedRefs::of(repository, store, snapshot.refs, admission)?;
     let cover = units::choose(repository, store, admission, &mut counters)?;
     let mut units = units::build(repository, store, &cover, push, admission, &mut counters)?;
-    units.sort_by(|left, right| left.name.cmp(&right.name));
+    units.sort_by_key(|unit| unit.name);
     // One name is one pack: a name hashes everything a pack is made from, so two packs of one
     // name are one pack's bytes, and a directory lists a name once.
     units.dedup_by(|later, earlier| later.name == earlier.name);

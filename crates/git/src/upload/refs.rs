@@ -184,7 +184,7 @@ fn covering<'a>(
     prefixes.push(b"");
   }
   prefixes.sort_unstable();
-  prefixes.dedup_by(|later, kept| later.starts_with(*kept));
+  prefixes.dedup_by(|later, kept| later.starts_with(kept));
   Ok(prefixes)
 }
 

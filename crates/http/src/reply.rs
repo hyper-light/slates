@@ -29,6 +29,16 @@ impl Status {
     code: 200,
     reason: "OK",
   };
+  /// Format: `201 Created` (RFC 9110 §15.3.2), a resource made by the request (a WebDAV PUT, MKCOL or COPY).
+  pub const CREATED: Status = Status {
+    code: 201,
+    reason: "Created",
+  };
+  /// Format: `204 No Content` (RFC 9110 §15.3.5), a request done with no body to answer (a WebDAV DELETE).
+  pub const NO_CONTENT: Status = Status {
+    code: 204,
+    reason: "No Content",
+  };
   /// Format: `207 Multi-Status` (RFC 4918 §11.1), a WebDAV answer holding a status for each resource it names.
   pub const MULTI_STATUS: Status = Status {
     code: 207,
@@ -53,6 +63,21 @@ impl Status {
   pub const NOT_FOUND: Status = Status {
     code: 404,
     reason: "Not Found",
+  };
+  /// Format: `409 Conflict` (RFC 9110 §15.5.10), a Subversion commit out of date or in conflict.
+  pub const CONFLICT: Status = Status {
+    code: 409,
+    reason: "Conflict",
+  };
+  /// Format: `412 Precondition Failed` (RFC 9110 §15.5.13), a WebDAV lock's condition unmet.
+  pub const PRECONDITION_FAILED: Status = Status {
+    code: 412,
+    reason: "Precondition Failed",
+  };
+  /// Format: `423 Locked` (RFC 4918 §11.3), a path another's lock holds.
+  pub const LOCKED: Status = Status {
+    code: 423,
+    reason: "Locked",
   };
   /// Format: `405 Method Not Allowed` (RFC 9110 §15.5.6), which carries `Allow`.
   pub const METHOD_NOT_ALLOWED: Status = Status {
@@ -121,6 +146,10 @@ pub enum Body {
   /// No framing field: the body ends when the connection does (RFC 9112 §6.3 item 8), the framing an HTTP/1.0 client
   /// reads. `Connection: close` is written whatever the caller asked.
   UntilClose,
+  /// No content and no framing field: a `204` (RFC 9110 §8.6, "A server MUST NOT send a Content-Length header field in
+  /// any response with a status code of 1xx (Informational) or 204 (No Content)"; RFC 9112 §6.1, the same for
+  /// `Transfer-Encoding`), whose end is its head's.
+  Empty,
 }
 
 /// A field a reply could not carry: its name is no token, or its value holds a control byte other than HTAB.
@@ -202,7 +231,7 @@ fn framing(body: Body, close: bool, out: &mut Vec<u8>) {
   match body {
     Body::Length(length) => field(CONTENT_LENGTH, length.to_string().as_bytes(), out),
     Body::Chunked => field(TRANSFER_ENCODING, CHUNKED, out),
-    Body::UntilClose => {}
+    Body::UntilClose | Body::Empty => {}
   }
   if close || body == Body::UntilClose {
     field(CONNECTION, CLOSE, out);

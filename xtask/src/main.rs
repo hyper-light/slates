@@ -294,39 +294,74 @@ fn is_out_of_line_test_module(path: &Path) -> bool {
     .any(|candidate| {
       std::fs::read_to_string(candidate).is_ok_and(|source| declared_under_cfg_test(&source, &name))
     })
+    || is_test_module_by_path(path, &file_name.to_string_lossy())
+}
+
+/// Whether a file beside `path` declares it, by `#[path = "<file_name>"]`, as a module under `#[cfg(test)]`
+/// (`#[cfg(test)] #[path = "getbundle_tests.rs"] mod tests;` in `crates/hg/src/serve/getbundle.rs`): a module's
+/// `#[path]` is read from the directory of the file declaring it. Until 2026-11-20 only a file named for its module was
+/// seen, and hg's seven `*_tests.rs` files read as 125 tuning literals.
+fn is_test_module_by_path(path: &Path, file_name: &str) -> bool {
+  let Some(Ok(siblings)) = path.parent().map(std::fs::read_dir) else {
+    return false;
+  };
+  siblings
+    .filter_map(Result::ok)
+    .map(|entry| entry.path())
+    .filter(|candidate| {
+      candidate.as_path() != path && candidate.extension().is_some_and(|ext| ext == "rs")
+    })
+    .any(|candidate| {
+      std::fs::read_to_string(&candidate)
+        .is_ok_and(|source| declared_by_path_under_cfg_test(&source, file_name))
+    })
 }
 
 /// Whether `source` declares the module `name` out of line (`mod name;`, any visibility) under a `#[cfg(...)]` that
 /// names `test` and not `not(test)`, with only attributes, comments and blank lines between: the same lexical reading
 /// [`lines_with_test_flag`] gives an inline test module.
 fn declared_under_cfg_test(source: &str, name: &str) -> bool {
+  out_of_line_cfg_test_modules(source).any(|(_, module)| module == name)
+}
+
+/// Whether `source` declares a module out of line under `#[cfg(test)]` (read as [`declared_under_cfg_test`] reads it)
+/// whose `#[path = "..."]` is `file_name`.
+fn declared_by_path_under_cfg_test(source: &str, file_name: &str) -> bool {
+  out_of_line_cfg_test_modules(source).any(|(path, _)| path == Some(file_name))
+}
+
+/// The modules `source` declares out of line under a `#[cfg(...)]` naming `test` and not `not(test)`, each with the
+/// `#[path = "..."]` among its attributes, if any.
+fn out_of_line_cfg_test_modules(source: &str) -> impl Iterator<Item = (Option<&str>, &str)> {
   let mut armed = false;
-  for line in source.lines() {
+  let mut path_attr = None;
+  source.lines().filter_map(move |line| {
     let trimmed = line.trim_start();
     if trimmed.starts_with("#[cfg(") {
       armed = trimmed.contains("test") && !trimmed.contains("not(test");
-      continue;
+      return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("#[path") {
+      path_attr = rest.split('"').nth(1);
+      return None;
     }
     if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
-      continue;
+      return None;
     }
-    if armed {
-      let declared = trimmed
-        .trim_start_matches("pub(crate) ")
-        .trim_start_matches("pub(super) ")
-        .trim_start_matches("pub ");
-      if declared
-        .strip_prefix("mod ")
-        .and_then(|rest| rest.strip_suffix(';'))
-        .map(str::trim)
-        == Some(name)
-      {
-        return true;
-      }
-    }
+    let declared = trimmed
+      .trim_start_matches("pub(crate) ")
+      .trim_start_matches("pub(super) ")
+      .trim_start_matches("pub ");
+    let module = declared
+      .strip_prefix("mod ")
+      .and_then(|rest| rest.strip_suffix(';'))
+      .map(str::trim)
+      .filter(|_| armed)
+      .map(|module| (path_attr, module));
     armed = false;
-  }
-  false
+    path_attr = None;
+    module
+  })
 }
 
 /// Splits a source file into lines, marking the ones inside a `#[cfg(test)]` module.
@@ -1031,7 +1066,31 @@ mod structural {
 
   #[cfg(test)]
   mod out_of_line_test_modules {
-    use crate::declared_under_cfg_test;
+    use crate::{declared_by_path_under_cfg_test, declared_under_cfg_test};
+
+    /// 2026-11-20 (R3). Do: read declaring files that put a module under `#[cfg(test)]` with a `#[path]` naming a file,
+    /// before or after the `cfg`, and files whose `#[path]` module is not under `cfg(test)` or names another file.
+    /// Expect: only the first two declare that file a test module.
+    #[test]
+    fn a_module_whose_path_names_the_file_under_cfg_test_is_test_code() {
+      let file = "getbundle_tests.rs";
+      assert!(declared_by_path_under_cfg_test(
+        "#[cfg(test)]\n#[path = \"getbundle_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+      assert!(declared_by_path_under_cfg_test(
+        "#[path = \"getbundle_tests.rs\"]\n#[cfg(test)]\nmod tests;\n",
+        file
+      ));
+      assert!(!declared_by_path_under_cfg_test(
+        "#[path = \"getbundle_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+      assert!(!declared_by_path_under_cfg_test(
+        "#[cfg(test)]\n#[path = \"other_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+    }
 
     /// 2026-11-19 (R3, A-500). Do: read declaring files that put `tests` under `#[cfg(test)]` out of line, with an
     /// attribute between and with a visibility, and files that declare it plainly, under `cfg(not(test))`, after a
