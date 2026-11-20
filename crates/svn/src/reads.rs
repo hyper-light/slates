@@ -409,8 +409,9 @@ pub trait Repository: Contents {
 
   /// The bytes of the text held as `identity` from `offset`: a run of at least one byte, as long as the green holds it
   /// in one piece (§4.17.4 item 11: a read streams from chunks, nothing is assembled whole), or none at the text's end;
-  /// `None` when the green does not hold the text.
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]>;
+  /// `None` when the green does not hold the text. Borrowed where the source holds the bytes, owned where it must copy
+  /// them (a text read through a lent [`crate::migration::TextSource`]).
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>>;
 }
 
 /// What the handler made of a command.

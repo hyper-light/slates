@@ -1920,6 +1920,13 @@
 > write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
 > revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
 > its `Record::RevisionProperties` through the owner's step, post-revprop-change.
+> S4 slice 1 (with A-716), 2026-11-19 (w-svn): every Subversion text is read through a source its reader is lent:
+> `migration::TextSource` (`text(identity) -> Cow`), `reads::Repository::text` and `commit::drive::Green::text`
+> answering `Cow`, and `migration::WithTexts`, the records with their texts read from any lent source (test
+> `a_view_reads_texts_from_its_lent_source_alone`). The records still serve their own texts through it. Owed (slice 2,
+> w-perf): the lenders lend the green's content index as the source, the records keep each text's identity and
+> place without its bytes, the importer's delta base, the export and `svn_commit`'s lookups read through the source,
+> and a rebuild re-holds the texts.
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:

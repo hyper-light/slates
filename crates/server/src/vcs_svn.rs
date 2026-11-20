@@ -212,13 +212,13 @@ impl slates_svn::reads::Repository for Unresolved {
     match *self {}
   }
 
-  fn text(&self, _identity: &ContentIdentity, _offset: u64) -> Option<&[u8]> {
+  fn text(&self, _identity: &ContentIdentity, _offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     match *self {}
   }
 }
 
 impl slates_svn::commit::drive::Green for Unresolved {
-  fn text(&self, _identity: &ContentIdentity) -> Option<&[u8]> {
+  fn text(&self, _identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
     match *self {}
   }
 
