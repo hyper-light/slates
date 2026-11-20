@@ -1988,6 +1988,52 @@ mod log;
 mod segments;
 mod stream;
 
+pub use file_revs::DavFileRevs;
+
+/// Where the node at `path` in `peg` stood in each of `revisions`, as `svn_repos_trace_node_locations` traces it, read
+/// from `index` and `repository` with each path judged by `rules` (none: every path readable): the `get-locations`
+/// report's walk over HTTP (`reports/get-locations.c`; A-726), the svn:// command's own (`get-locations`). Each found
+/// location as its revision and its path, in the trace's order; or Subversion's error number and message.
+///
+/// # Errors
+/// The trace's refusal: a revision past the youngest, an unreadable path, a path missing in the peg revision.
+pub fn trace_node_locations<R: Repository + ?Sized>(
+  index: &Index,
+  repository: &R,
+  rules: Option<&PrincipalRules>,
+  (path, peg): (&str, Revision),
+  revisions: &[Option<Revision>],
+) -> Result<Vec<(Revision, String)>, (u32, String)> {
+  let mut out = Vec::new();
+  let reads = Reads {
+    index,
+    repository,
+    base: ROOT,
+    uuid: "",
+    authz: rules,
+    authentication: Authentication::Settled,
+    out: &mut out,
+  };
+  let signed = |revision: Revision| i64::try_from(revision).unwrap_or(i64::MAX);
+  let peg = signed(peg);
+  let revisions = revisions
+    .iter()
+    .map(|revision| revision.map_or(INVALID_REVISION, signed))
+    .collect();
+  reads
+    .trace_locations(path, peg, revisions)
+    .map_err(|failure| (failure.code, failure.message))
+}
+
+/// `relative`, a report's `S:path`, joined to `target`, the repository path of the resource the report names, as
+/// `svn_fspath__join` joins them.
+pub fn full_path_of(target: &str, relative: &str) -> String {
+  full_path(target, relative.as_bytes())
+}
+
+/// `SVN_INVALID_REVNUM`: a location revision the body wrote negative.
+/// Format: `svn_types.h`, -1.
+const INVALID_REVISION: i64 = -1;
 pub use log::dav::{DavLog, DavLogProgress};
 pub use stream::{Progress, Stream};
 

@@ -42,8 +42,10 @@
 //!   run ([`Report`]): a walk refused before its first byte is answered with its error, `dav_svn__convert_err`'s status
 //!   and the error in `D:error`, and one refused after it ends the connection. An `update-report` on HTTPv2's `me`
 //!   resource (`!svn/me`, where a stock client sends it) or a node's URL is answered from A-616's drive by A-627's
-//!   writer, streamed the same way ([`super::update`]; checkout, update, switch and export). Every other report is
-//!   `501` in `mod_dav_svn`'s words for one it does not know ("The requested report is unknown"), until it is served.
+//!   writer, streamed the same way ([`super::update`]; checkout, update, switch and export). A `file-revs-report`
+//!   (`svn blame`) is streamed the same way ([`super::report_file_revs`]) and `get-locations` answered whole
+//!   ([`super::report_locations`]; A-726). Every other report is `501` in `mod_dav_svn`'s words for one it does not
+//!   know ("The requested report is unknown"), until it is served.
 //! - An HTTPv2 commit's methods (POST to `!svn/me`, PUT, MKCOL, DELETE, COPY and PROPPATCH under `!svn/txr/`, MERGE)
 //!   are the caller's, which holds each transaction between its requests and drives it through [`super::commit`].
 //! - Every other method: `501`, `SVN_ERR_UNSUPPORTED_FEATURE` (200007).
@@ -251,11 +253,13 @@ pub struct Report {
   walk: Walk,
 }
 
-/// The walk a REPORT's answer is: a `log-report`'s or an `update-report`'s.
+/// The walk a REPORT's answer is: a `log-report`'s, a `file-revs-report`'s or an `update-report`'s.
 #[derive(Debug)]
 enum Walk {
   /// A `log-report`'s.
   Log(Box<DavLog>),
+  /// A `file-revs-report`'s (`svn blame`; A-726), boxed beside the update.
+  FileRevs(Box<super::report_file_revs::FileRevsWalk>),
   /// An `update-report`'s ([`super::update`]).
   Update(Box<UpdateWalk>),
 }
@@ -290,6 +294,7 @@ impl Report {
   ) -> ReportProgress {
     let log = match &mut self.walk {
       Walk::Log(log) => log,
+      Walk::FileRevs(revisions) => return revisions.resume(served, out, room),
       Walk::Update(walk) => {
         let walked = Walked {
           index: served.index,
@@ -611,6 +616,17 @@ fn report<R: Repository + ?Sized>(
       }),
       None => Answer::Whole(bare(HTTP_BAD_REQUEST)),
     },
+    Asked::GetLocations(locations) => Answer::Whole(super::report_locations::answer(
+      served,
+      &locations,
+      &place.path,
+    )),
+    Asked::FileRevs(revisions) => Answer::Report(Report {
+      walk: Walk::FileRevs(Box::new(super::report_file_revs::FileRevsWalk::new(
+        &revisions,
+        &place.path,
+      ))),
+    }),
     _ => Answer::Whole(unserved_method("REPORT")),
   }
 }

@@ -84,7 +84,8 @@
 > Designed, owed: the snapshot slot sized by its data (8) and a giant repository's index cut across partitions by
 > object id (9).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
-> re-encoded (`Repository::drop_fragments`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
+> re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
+> (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
 > Owed: compression of cold content.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
@@ -1476,6 +1477,14 @@
 > bounded by one a repository and principal.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
+> **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
+> `get-locations` report (a URL's peg traced back: `svn blame -r N URL`, `svn cat -r N URL`) served through the DAV
+> site (`dav::report_file_revs`, `dav::report_locations`; the svn:// walks with `mod_dav_svn`'s writers); `svn diff`
+> needed nothing new (the update-report's diff form). Stock svn 1.15's `blame`, `blame -r 2`, `diff -r 1:3`, `diff -c
+> 2`, `diff --summarize`, a two-peg URL diff and `cat -r 1` over HTTP match `svnserve -t`'s byte for byte but for the
+> author (`tests/svn_http_reports.rs`). Owed: part 2, the `mergeinfo-report` and OPTIONS' `SVN-Repository-MergeInfo:
+> yes` (`svn blame -g` is refused by the client until then, and `svn merge`); deltas in svndiff 0 whatever
+> `Accept-Encoding` prefers; the copied interop harness folded into one module with `tests/svn_interop.rs`.
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
