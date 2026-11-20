@@ -330,6 +330,12 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
     self.transport.set_key_time_ns(key_time_ns);
   }
 
+  /// The last key exchange after the first that began since this was last asked, with what started it (A-745): its
+  /// caller logs each.
+  pub fn take_rekey(&mut self) -> Option<crate::transport::Rekeyed> {
+    self.transport.take_rekey()
+  }
+
   /// Whether the connection is closed.
   pub fn is_closed(&self) -> bool {
     self.transport.is_closed()
@@ -475,9 +481,14 @@ impl<E: Entropy, H: KeyHolders> Session<E, H> {
   }
 
   /// Whether reading must wait for the caller. A closed transport still gives up the event it last raised, such as the
-  /// client's disconnect, so it is checked after the transport's event is taken.
+  /// client's disconnect, so it is checked after the transport's event is taken. A full outbox holds input back only
+  /// while the outbox can drain without it: during a key exchange the outbox drains only once the client's half of the
+  /// exchange is read, so input is read on (RFC 4253 §9; A-745, found by use: an SSH clone stopped at 0% CPU on both
+  /// sides). What the client sends meanwhile is still bounded: the channel's window bounds its data.
   fn blocked(&self) -> bool {
-    self.pending.is_some() || self.deferred.is_some() || self.outbox_bytes >= self.outbox_cap
+    self.pending.is_some()
+      || self.deferred.is_some()
+      || (self.outbox_bytes >= self.outbox_cap && !self.transport.is_rekeying())
   }
 
   /// Takes and handles the transport's waiting event; whether there was one.
