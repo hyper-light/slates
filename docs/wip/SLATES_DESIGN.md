@@ -11555,7 +11555,16 @@ splits; a truncate cancels operations beyond the new length; a rename maps the p
 operations; a create followed by an unlink cancels; a whole-file rewrite (truncate to zero and
 write, or write-and-rename) composes to one `Delete` of the base length and one `Insert` of the
 new bytes. Composition of declared operations is arithmetic on facts; comparing file states to
-reconstruct operations is inference and does not exist in slates. The same journal yields the
+reconstruct operations is inference and does not exist in slates. One step at the seal reads bytes, and it is not
+that inference (A-776, D-O17): a path whose composed ops are exactly a replacement of its whole base content (any route:
+truncate and write, a rewrite in place, write-and-rename, an SDK `edit` of the whole file) is recovered as the edit the
+writer made, the minimal token-grain ranges in which the file it wrote differs from the base it was given
+(`slates_merge::refine`: a trim of the common prefix and suffix, Myers' linear-space search over tokens, and, when Myers
+alone runs out of its budget, anchors on tokens unique to both files with Myers between them; the cost bounded linear
+in the file). It compares the writer's own two states, never a third: no other agent's bytes are read and nothing is
+merged, the ranges are judged by the same verdict, two edits to one token still conflict, and applying them to the
+base yields the writer's file byte for byte (the property test). A path with namespace ops, node-exclusive flags, or a
+base the sealing shard cannot read keeps its whole replacement. The same journal yields the
 same ops document on every platform (its identity is the test). Paths under the work volume's
 excluded subtrees are left out; the filter id is part of the increment identity. The composition
 needs every record since the base: when the journal's retention has dropped any of them, the
@@ -17375,7 +17384,8 @@ committed across hosts, holder recomputation on other nodes, submission across h
   increment has a new identity; conflicts leave the work volume unchanged (catches: rebase
   corruption).
 - AC-6.10 The deriver never diffs: an architecture test proves no code path compares file
-  states to produce operations; whole-file tool rewrites produce one delete plus one insert
+  states to produce operations; whole-file tool rewrites compose to one delete plus one insert, which the seal
+  recovers as the writer's own token-grain edit against its base (A-776; never a third state, never a merge)
   (catches: the banned inference returning).
 - AC-6.11 Merge-path latency: verdict p99 and seal-to-reply p99 on the reference laptop are
   recorded and ratcheted; the fast path stays within one ring round trip plus the seal
@@ -17420,7 +17430,9 @@ recorded; the merge oracle runs in CI with shrinking.
 
 **Risks and fallbacks.** Whole-file rewrites by tools inflate the conflict rate on shared files:
 measured by source, mitigated by `edit` in the skills and by streaming; a high measured rate
-reopens the ergonomics (D-O17). The size budget for increments is derived from measured cost;
+reopens the ergonomics (D-O17). Since A-776 (2026-11-20) the seal recovers a whole-file rewrite as the edit it was: on
+the A/B's corpus no pair of rewrites of different lines or tokens, or a formatter pass beside an edit, conflicts, and
+every pair editing one token still does. The size budget for increments is derived from measured cost;
 if real increments routinely exceed it, the SDK's per-path split is the fallback.
 
 **A-9 required acceptance and regression cases (open; 2026-09-05).**
@@ -57521,6 +57533,44 @@ Evidence: `cargo test --locked -p slates-server --test session_log` 1 passed (tw
 one waiting landing: exactly two named; the landing gone once granted and run); `-p slates-db --test model
 every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
 `args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
+
+### A-776 — A whole-file rewrite is judged as the edit it was (2026-11-20, w-rewrite-ops; main's brief on the Slates-vs-Sapling comparison, gap D-O17; §4.16 "Composition at seal", AC-6.10, D-27)
+
+- **The gap.** An editor saves by writing a temporary file and renaming it over the original; formatters and codemods
+  write the whole file. The deriver composes every route into one `Delete` of the base length and one `Insert`, so a
+  one-token change judged beside any concurrent edit of the file was an `Overlap` conflict over the whole file. Ordinary
+  tools could not merge as precisely as SDK `edit`s.
+- **The change.** At the seal (`compose_increment` in `crates/server/src/verbs.rs`, shared by submit and rebase), a path
+  whose ops are exactly a whole-base replacement is rewritten by `slates_merge::refine::refine_rewrites` into the
+  canonical ops of the ranges the writer changed, at token grain (runs of word bytes, runs of blanks, every other byte
+  alone), and the post-state is relaid compactly. The increment's identity covers the refined document.
+- **Why this is not the banned inference (D-27, CLAUDE.md §2 item 11).** It compares two states of one writer, the base
+  it was handed and the file it wrote; no third state is read and nothing is merged. The result is a set of declared
+  ranges the verdict judges unchanged, and its application to the base is the writer's file byte for byte.
+  AC-6.10's "one delete plus one insert" now describes the composition before the seal's recovery.
+- **The shape, settled by A/B** (`crates/merge/examples/rewrite_ab.rs`, BENCHMARKS "Whole-file rewrites recovered"):
+  1,920 rewrite pairs over the merge crate's own sources (462 KiB), four workloads, judged by the real green. Token grain
+  is the only arm with no false conflict on different lines, different tokens of one line, or a formatter pass beside
+  an edit, and no silent merge when both change one token. Byte grain accepted all 240 one-token clashes (a word neither
+  wrote). Line grain (and so patience and histogram, which anchor on lines) conflicted all 240 same-line pairs. Myers
+  alone kept 148 of 240 formatter passes whole at its budget, so the search anchors on unique tokens when Myers alone
+  runs out: 0 of 240.
+- **Bounds.** The trim allocates nothing. The units of the differing middle (4 bytes each) and, when anchoring, a
+  table of distinct units are scratch dropped with the submit: measured 2.6 bytes of scratch a file byte on the corpus,
+  5.3 at most in the tests. Search steps are charged against budgets linear in the middle's units; a gap past them is
+  kept as one range. Cost a save (M3 Ultra, release): median 0.48 µs/KiB, p99 51 µs/KiB (a formatter pass over a
+  275 KiB file). `git diff --no-index` of that same pass takes 10 to 40 ms a process at line grain.
+- **Applied in the same change to:** §4.16 "Composition at seal"; AC-6.10; Phase 6 "Risks and fallbacks"; GAPS D-O17;
+  BENCHMARKS; `crates/merge/src/refine.rs` (new), `crates/server/src/verbs.rs`, `crates/server/src/work_files.rs`.
+- **Tests.** Red first: `two_whole_file_rewrites_of_different_lines_merge_as_their_edits`
+  (`crates/server/tests/green_post_state.rs`) failed with the seal's recovery disabled. The editor's save was
+  `Conflict([MergeWindow { path: "f", at: 0, len: 7580, .. }])`. Green with it: `cargo test --locked -p slates-server
+  --test green_post_state` 6 passed; `cargo test --locked -p slates-merge --lib refine` 8 passed (the reproduction
+  property at three grains and anchored; one token; a re-indent anchored and only blanks with scratch bounded; the
+  budget's fallback counted; different lines, different tokens and a formatter beside an edit accepted through the real
+  green; one token clashing still a conflict; unknown bytes keep the replacement). macOS arm64, this Mac, local.
+- **Owed (main's, §8):** clippy over the new module; the Linux and Windows runs of the two filters above. A mounted Work
+  reaches the seal through w-work-mount's journal (A-774), which this serves unchanged.
 
 ### A-775 — A taken-over volume given up while its cohorts' members were away is judged afresh once one is heard again (2026-11-20, w-forming; main's order, item (b): the takeover stall with no survivor serving; §4.8 "Promotion and takeover", §4.10; the 2026-11-18 bound, A-304's fresh judgement)
 Applied in the same change to: §4.8's promise-wait paragraph (by this entry: a given-up volume is also judged afresh

@@ -9178,7 +9178,7 @@ pub(crate) fn compose_increment(
   journal: &[VolumeOp],
   evidence: Vec<[u8; 32]>,
 ) -> Result<slates_merge::engine::Increment, Refusal> {
-  let (doc, plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
+  let (mut doc, mut plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
     Ok(planned) => planned,
     Err(e) => {
       return Err(Refusal::BadRequest {
@@ -9186,6 +9186,21 @@ pub(crate) fn compose_increment(
       });
     }
   };
+  // A file the work replaced whole (an editor's write-and-rename, a formatter's or a codemod's rewrite) is judged as
+  // the edit it was, not a replacement of the file (D-O17, A-776; `slates_merge::refine`): the base bytes it was given
+  // and the bytes it wrote, both already held here, give the ranges it changed. A base this shard cannot read (a work
+  // off the green's shard whose base the owner did not send, A-247) keeps the replacement. The refiner's scratch is
+  // sized by the files it compares and dropped with this submit, so nothing stays resident between submits.
+  slates_merge::refine::refine_rewrites(
+    &mut doc,
+    &mut plan,
+    &mut slates_merge::refine::Refiner::new(),
+    &mut |path| {
+      let before = files_base.file(path).ok().flatten()?;
+      let after = files.get(files_base, path).ok().flatten()?;
+      Some((before, after))
+    },
+  );
   let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal);
   // The identity names the work and its base before the post-state and the document (§4.16 data model:
   // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
