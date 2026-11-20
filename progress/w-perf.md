@@ -153,3 +153,13 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   push/held.rs, render.rs, serve/indexed.rs (copied generic over AsRef, framed chains Cow MARKER, lend counts borrow);
   server commits.rs, record.rs; vcs blame.rs; tests oracle.rs, hg tests/import.rs, vcs content tests. Compiles.
   Focused tests running (vcs content/derived, git store/derived/upload, hg serve/import/push/render, server vcs_store/git_push).
+- A-727 a1 LANDED main f8c9c95cd (windows/window_at -> Cow; readers moved; fixed w-git's intake.rs on merge). Tests
+  local on landed tree: server 63/63; earlier vcs 51, git 167, hg 111.
+- Seam with w-balance (Studio-2, kiln id 01a1f7b42ec27702a195501719d3f919; reach by agents_send): agreed. Its
+  HomeTicket + homes::image_begun(g)/image_published(g)/published(origin,ticket,budget) on main 93c0e64cc. Windows
+  live on identity-home shards (homes.rs); owner image carries non-home rows {identity,len,home}. Batch forms after a3.
+- By-use at f8c9c95cd: push_load N=1/10/100 = 205.9/165.9/40.2 MiB a push (was 300.8/289.9/248.8), all ok.
+  hg import of Mercurial repo: crash loop (shard 9 spins >1 s at every restart, 11 restarts) -> w-hg + main.
+- NEXT: (a2) arena storage on one shard (windows homed here) for slates-vcs ContentStore: storage seam (heap vs
+  arena), arena backed by the shard's vfs ChunkStore (open/write_open/seal/read_extent_into); then (a3) image table
+  + recovery + barrier hooks image_begun/image_published; then (b) git v3; S4 slice 2 (svn texts via WithTexts).
