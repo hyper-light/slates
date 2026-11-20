@@ -1002,3 +1002,18 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   before body; 10,000 x 256 KiB = 2.5 GiB.
 - w-git A-719 p2 landed 183150ab8 (569868917): unpack::Keep (objects handed to a keeper as resolved; bounded working
   set); §4.17.1 "A push's intake" rule written. Next p3: keep into quarantine as read; admit_all goes.
+- ~02:45-03:00 PST DISK CLEANUP (Ada): big Studio freed 99 GB (my stale targets; 1.2 TiB free); Studio-4 freed 129 GB
+  (stale unused reach copies; 129 GiB free, was 6.5); Studio-2 freed 72 GB (123 GiB free, was 18); this Mac freed 11 GB
+  (moved agents' targets) + 44 GB stale reach copies (80 GiB free, was 23). Studio-3 (adas-mac-studio.local) offline.
+  Rule: only stale (>12 h), unused (no open file, no process naming it) cargo targets / kiln reach copies.
+- ADA: "stay on top of the agents ... unblock them when they claim they're blocked and just pause (unsigned commits are
+  fine) ... every five or so minutes is fine" -> cron 8ae7afe6 (2-59/5 * * * *) supervisor check; common.md: never
+  pause on a clearable blocker, unsigned commits fine, disk hygiene. First pass unblocked: w-balance (go P2b+P3, one
+  admission path with w-git's A-722), w-bugs (build B3 itself; jupiter takes kiln work again), w-fed-faults (don't idle
+  on the Linux queue), w-reaper (new: svn HTTP blame/diff/mergeinfo reports, then pre/post-lock hooks), w-k90-containers
+  (build PV/claim/pod builders while 5b-i reruns), w-k90-vendor (item 4 Windows run on jupiter now).
+- LANDED: w-hg A-720 p2a 49439c77e (concurrent hg pushes per repository, fork per push); w-svn A-693 p2 576a8a860
+  (svn:// lock verbs); w-shared A-664 sliced whole builds p1 469436cce (+ ruling (a) for p2); w-balance A-724 P1
+  8c1feae15 (usage per repository, §4.17.5) + P2 4bbf7f4ba (share division, weighted DRF); w-interop A-681 B 7f81be683
+  (update-report) + C d858d1904 (HTTPv2 commits): SVN OVER HTTP PROVEN, matrix HTTP 23/27, svn:// 26/27. w-perf A-716
+  1a 5efce021a (held.rs). w-interop next: HTTP locks, streamed PUT, abandoned txn deadline.

@@ -54,3 +54,17 @@
   Main: no hold_bytes, no new store; keeping client deltas compressed in the EXISTING ContentStore is OK; convergence
   plan from w-perf decides blobs later. Next: part 3 = session/driver keep straight into the quarantine as the pack is
   read (removes reader + Checked in-RAM copies; admit_all gone), checks reading objects back from the store.
+- S3 claimed A-722 (ledger c112181). Plan sent to main: (1) A-719 part 3 now, (2) verdicts+seal sliced, (3) S3 after
+  w-perf's S2 (blob-before-tree: keep compressed entry in index charged to window, typed refusal past it).
+- PART 3 DESIGN (in progress, worktree w-git-pushspin, branch agents/w-git-pushspin):
+  slates-git: unpack: split `Contents` (content(at,id)) out of `Keep`; receive: `Pushed{objects:&[Placed], by_id,
+  contents:&dyn Contents}`, object() -> (Kind, Cow); Checked/Received.unpacked = Option<Result<Kept,PackRefused>>;
+  check()/decide() take contents; Checking fsck + Walk read via contents; Session takes a combined site
+  (Keep+Contents+Repository) in *_into variants, old methods use session's own Held; receive() uses Held.
+  server: git_push keeper over (&mut ContentStore, &GitStore, &mut GitPush) implementing Keep+Contents+Repository
+  (+Outside via Bases); GitPush held from pack start; prepare = seal only; abandon when all refused.
+- Part 3 slates-git side done (local wip commit on agents/w-git-pushspin, not pushed): Contents/Keep split,
+  finish_into(K: Keep+Outside), Unpacked::into_kept, Pushed{objects:&[Placed],contents:Option<&dyn Contents>},
+  Checked/Received.unpacked = Kept, Session input_into/end_into/check_turn_with/decide_with/answer_with + kept(),
+  works::PushedBytes (PushedObjects impl). slates-git --lib all green. Next: server git_push queue keeper.
+  Land: fresh worktree from origin/main + cherry-pick -n + real message (wip must not reach main).

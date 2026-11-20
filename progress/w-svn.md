@@ -94,3 +94,11 @@
   red then green; local 10/10 + 21/21, rechecked after the final merge.
 - DAV pieces (A-681 rows) moved to w-interop by main. NEXT: A-693 part 2 from agents/w-svn-a693p2-wip (worktree
   ~/slates-work/w-svn-a714).
+
+## A-693 part 2 lock verbs -- LANDED main 576a8a860 (commit 64b6f79c3, verified on origin/main)
+- serve::locks (lock_verb / locks_landed; auth-for-one-command via Interrupted::Lock), Record::Locks (kind 4),
+  svn:// listener + tunnel (SvnStores::land_locks, TunnelRecords). Tests: lock-bob and lock-a byte for byte; server
+  landing+rebuild test; listener lock test. Local: svn 239/239 -> 164/164 merged, server 21/21, 32/32, 16/16 landed.
+- Disk fell to 17 GiB: deleted my target (now 59 GiB free).
+- NEXT (main): S4 with w-perf -- svn records name texts by identity, read from the green's content-identity index
+  (held.rs hold_path); agree the seam with w-perf. Queue after: A-702 revprops / replay (g302 brief), A-652 export.

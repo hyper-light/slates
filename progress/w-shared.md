@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## MAIN RULING 2026-11-20: A-664 live whole builds = (a): defer the made commit until the sliced build ends; later submits to
+  that green PARKED (woken by the build's completion, never polled); each slice yields under the step budget. Do after item 4.
+## NOW: item 4 svn first: failing test t_a664_svn_a_submitted_version_is_the_revision_the_server_makes (svn_commit/tests.rs)
+  RED (submit -> version 1, records youngest 0). Fix: a server-made svn revision from the submit's change, landed in the
+  submit's transaction without moving the green. Uncommitted in ~/slates-work/g261-a636p2b2.
+
 ## LANDED 2026-11-20: A-664 sliced whole builds part 1 (recovery's remake a file a unit) = ba7c04d7b, main 469436cce. Asked
   main for a ruling on the live whole builds (the made commit needs trees in the version's transaction). NOW: queue 4, A-664
   hg and svn server-made objects, unless main rules otherwise.
