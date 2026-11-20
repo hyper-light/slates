@@ -6853,3 +6853,8 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   failing test first; if none does, the GAPS entry gets struck with this run's numbers.
 - 2026-11-20 w-shared sweep family 1, lent record sessions woken by their return (main 86e23c4ef): clippy + xtask (server fleet session_returned/SessionChange/sessions_changed, forward_lane drive_turn, live_ship borrow_session, owner_location wait_for_returning_sessions, campaign wait, state session_waiters/session_woken); Linux run of `cargo test -p slates-server --test fleet a_forward_waiting_for_its_lent_session_is_woken_by_its_return` (red: fleet.session_wait.returned not moved by 3) and `--test fleet -- session hold_record location campaign`.
 - 2026-11-20 w-git keepalive while the pack is read (main ab049942c, eea6b39f6): rerun in DEBUG at load 50-60 (60 PID burners on adas-mac-studio.local-2): `cargo test --locked -p slates-server --lib -- vcs_http::daemon_edge::tests::a_long_history vcs_http::daemon_edge::tests::a_push_of_a_long vcs_http::daemon_edge::tests::a_partial_clones_lazy`, 3+ runs; red = `the answer ended inside a line ... WouldBlock` at daemon_edge.rs line_of (7/9 failed before)
+
+## 2026-11-20, w-svn: a hook test flaky under load (main to reproduce; not chased)
+- `cargo test -p slates-server --lib svn` (macOS arm64, this Mac, loaded, base 514500813 + A-766 part 1): 83/84,
+  `vcs_svn::tests::an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` failed at tests.rs:1180 (the pre-unlock
+  hook's recorded args); alone 3/3 green. Red would be the same assertion failing in a loaded full run.
