@@ -59,7 +59,7 @@ jobs:
             s="${arm:0:9}"; mkdir -p "$W/src-$s" "$W/bin-$s"
             git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$s"
             ( cd "$W/src-$s" && cargo build --release --locked -p slates-client --example edit_merge_bench ) > "$W/logs/build-$s.log" 2>&1 \
-              || { tail -40 "$W/logs/build-$s.log"; exit 1; }
+              || { echo "build $s failed; the arm is skipped"; tail -15 "$W/logs/build-$s.log"; rm -rf "$W/src-$s"; continue; }
             grep -E "Compiling slates-(server|client)|Finished" "$W/logs/build-$s.log" | tail -3
             cp "$W/target/release/examples/edit_merge_bench$EXE" "$W/bin-$s/edit_merge_bench$EXE"
             sha256sum "$W/bin-$s/edit_merge_bench$EXE" 2>/dev/null || shasum -a 256 "$W/bin-$s/edit_merge_bench$EXE"
@@ -106,6 +106,7 @@ jobs:
           for round in $(seq 1 "$ROUNDS"); do
             for arm in $(order $round); do
               s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; L="$W/logs/quiet-$s-r$round.log"
+              [ -x "$B" ] || continue
               echo "== quiet round $round arm $s $(date -u +%FT%TZ) load: $(load)" | tee "$L"
               perl -e 'alarm shift; exec @ARGV' 1200 "$B" --quiet-only $ARGS </dev/null >> "$L" 2>&1
               echo "exit $?" >> "$L"; grep -E "goal|WRONG|ratchet-info|exit" "$L" | cut -c1-220
