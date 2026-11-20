@@ -30,7 +30,7 @@
 #   WORK    a scratch directory, made empty here and removed at the end
 #   RUNS    the runs of each server (default 3)
 #   BOUND   the seconds any one step may take before it is killed and recorded as such (default 1800)
-set -euo pipefail
+set -uo pipefail
 
 SLATES=$1
 SOURCE=$(cd "$2" && pwd)
@@ -39,19 +39,19 @@ RUNS=${4:-3}
 BOUND=${5:-1800}
 
 rm -rf "$WORK"
-mkdir -p "$WORK/home"
-WORK=$(cd "$WORK" && pwd)
+mkdir -p "$WORK/home" || exit 1
+WORK=$(cd "$WORK" && pwd) || exit 1
 RESULTS="$WORK/results.txt"
 : > "$RESULTS"
 
 export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.com
 unset GIT_ASKPASS SSH_ASKPASS GIT_DIR GIT_WORK_TREE GIT_PROTOCOL GIT_CONFIG_PARAMETERS
 
-# Stock git, outside every configuration file and user, never prompting, in C's words.
-g() {
-  HOME="$WORK/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_TERMINAL_PROMPT=0 \
-    LC_ALL=C git "$@"
-}
+# Stock git, outside every configuration file and user, never prompting, in C's words: a command (`env` then `git`),
+# so a bounded step can exec it.
+G=(env "HOME=$WORK/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_TERMINAL_PROMPT=0
+  LC_ALL=C git)
+g() { "${G[@]}" "$@"; }
 
 # The wall clock, in seconds with milliseconds.
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
@@ -141,10 +141,14 @@ start_stock() {
   echo "stock run $1: git daemon on 127.0.0.1:$port"
 }
 
-# Checks clone $1 of server $2 against SOURCE: fsck, then refs and object ids.
+# Checks clone $1 of server $2 against SOURCE: fsck, then refs and object ids; a clone that is not there is recorded.
 check() {
   local mirror=$1 server=$2
-  timed "$server fsck" g -C "$mirror" fsck --full
+  if [ ! -d "$mirror" ]; then
+    echo "$server check skipped: no clone" | tee -a "$RESULTS"
+    return 0
+  fi
+  timed "$server fsck" "${G[@]}" -C "$mirror" fsck --full
   g -C "$mirror" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sort > "$WORK/$server.refs"
   g -C "$mirror" rev-list --all --objects | cut -d' ' -f1 | sort > "$WORK/$server.objects"
   for kind in refs objects; do
@@ -161,10 +165,10 @@ check() {
 # Runs the steps against the server started for run $2 ($1 its name).
 steps() {
   local server=$1 run=$2 mirror="$WORK/$1-mirror-$2" scratch="$WORK/$1-scratch-$2.git" blob tree new
-  timed "$server push $run" g ${AUTH[@]+"${AUTH[@]}"} -C "$SOURCE" push -q "$URL" 'refs/heads/*:refs/heads/*' \
+  timed "$server push $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$SOURCE" push -q "$URL" 'refs/heads/*:refs/heads/*' \
     'refs/tags/*:refs/tags/*'
   [ "$server" = slates ] && echo "slates daemon rss after push: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
-  timed "$server clone $run" g ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$mirror"
+  timed "$server clone $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --mirror "$URL" "$mirror"
   [ "$run" = 1 ] && check "$mirror" "$server"
   g clone -q --bare "$SOURCE" "$scratch"
   blob=$(echo "one more commit, $server run $run" | g -C "$scratch" hash-object -w --stdin)
@@ -173,15 +177,15 @@ steps() {
   tree=$(GIT_INDEX_FILE="$WORK/index" g -C "$scratch" write-tree)
   rm -f "$WORK/index"
   new=$(g -C "$scratch" commit-tree "$tree" -p HEAD -m "one more commit")
-  timed "$server incremental-push $run" g ${AUTH[@]+"${AUTH[@]}"} -C "$scratch" push -q "$URL" "$new:refs/heads/$DEFAULT"
-  timed "$server incremental-fetch $run" g ${AUTH[@]+"${AUTH[@]}"} -C "$mirror" fetch -q
+  timed "$server incremental-push $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$scratch" push -q "$URL" "$new:refs/heads/$DEFAULT"
+  timed "$server incremental-fetch $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} -C "$mirror" fetch -q
   if [ "$(g -C "$mirror" rev-parse "refs/heads/$DEFAULT" 2> /dev/null)" = "$new" ]; then
     echo "$server incremental check fetched" | tee -a "$RESULTS"
   else
     echo "$server incremental check MISSED" | tee -a "$RESULTS"
   fi
-  timed "$server shallow $run" g ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --depth 1 "$URL" "$WORK/$server-shallow-$run"
-  timed "$server partial $run" g ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --filter=blob:none "$URL" "$WORK/$server-partial-$run"
+  timed "$server shallow $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --depth 1 "$URL" "$WORK/$server-shallow-$run"
+  timed "$server partial $run" "${G[@]}" ${AUTH[@]+"${AUTH[@]}"} clone -q --bare --filter=blob:none "$URL" "$WORK/$server-partial-$run"
   [ "$server" = slates ] && echo "slates daemon rss at the end: $(rss_of "$DAEMON") MiB" | tee -a "$RESULTS"
   rm -rf "$mirror" "$scratch" "$WORK/$server-shallow-$run" "$WORK/$server-partial-$run"
 }
