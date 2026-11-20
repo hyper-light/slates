@@ -2615,10 +2615,60 @@ fn rebuild_sliced(state: &mut ShardState, id: RepositoryId) {
 }
 
 /// Repository `id`'s rebuild of `generation` driven a turn at a time, a yield between, until it ends or is replaced.
+/// Before a version-3 record's replay begins, its names are read from the region where this node does not hold them
+/// (A-724 piece 8c; [`names_to_fetch`]): put into the content store, so the replay finds them held.
 async fn rebuild_turns(id: RepositoryId, generation: u64) {
-  while crate::state::with_state(|state| rebuild_turn(state, id, generation)) == Some(true) {
+  loop {
+    if let Some(Some((origin, shards, identity))) =
+      crate::state::with_state(|state| names_to_fetch(state, id, generation))
+    {
+      let fetched =
+        homes::read_in_region(origin, &shards, identity, crate::fleet::live_budget()).await;
+      crate::state::with_state(|state| match fetched {
+        Some(bytes) if put_names(state, &bytes) == Some(identity) => state.count(NAMES_FETCHED, 1),
+        _ => state.count(NAMES_UNFETCHED, 1),
+      });
+    }
+    if crate::state::with_state(|state| rebuild_turn(state, id, generation)) != Some(true) {
+      return;
+    }
     slates_rt::futures::yield_now().await;
   }
+}
+
+/// Counter: a version-3 record's names read from their region homes before its replay (A-724 piece 8c). Format: a
+/// counter name.
+pub(crate) const NAMES_FETCHED: &str = "vcs_store.names_fetched";
+/// Counter: a version-3 record's names no region home answered; its replay is refused `Names`. Format: a counter name.
+pub(crate) const NAMES_UNFETCHED: &str = "vcs_store.names_unfetched";
+
+/// The names repository `id`'s rebuild of `generation` must read from the region before its next record's replay
+/// begins (A-724 piece 8c): that record's names' identity when it is version 3 and this node's content store does not
+/// hold them, with the shard asking and the node's shards; none otherwise (a replay under way, a version-2 record).
+fn names_to_fetch(
+  state: &ShardState,
+  id: RepositoryId,
+  generation: u64,
+) -> Option<(u16, Vec<u16>, slates_vcs::ContentId)> {
+  let (current, index) = state.vcs_stores.rebuild_turns.get(&id).copied()?;
+  if current != generation || state.vcs_stores.git_replays.contains_key(&id) {
+    return None;
+  }
+  let Some(RepositoryStore::Git(git)) = state.vcs_stores.entries.get(&id) else {
+    return None;
+  };
+  let bytes = state
+    .db
+    .partition()
+    .repositories()
+    .object_record(id, index)?;
+  let (identity, _) = Record::decode(bytes, git.repository.format()).ok()?.named?;
+  let held = state
+    .vcs_stores
+    .content
+    .as_ref()
+    .is_some_and(|content| content.contains(&identity));
+  (!held).then(|| (state.shard, state.shards.clone(), identity))
 }
 
 /// One turn of repository `id`'s rebuild of `generation`: its next record replayed, or, past the last or at a refusal,
