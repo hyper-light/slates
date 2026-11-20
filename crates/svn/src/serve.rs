@@ -85,6 +85,7 @@
 
 mod locks;
 pub use locks::{LockHookCall, PreHooked};
+pub use revprops::{RevisionPropertyAction, RevisionPropertyCall};
 mod replays;
 mod revprops;
 #[cfg(test)]
@@ -324,6 +325,15 @@ pub enum Turn<'a> {
   /// ([`Connection::lock_verb`]), lands its entries, and reports their landing
   /// ([`Connection::locks_landed`]).
   LockAsked {
+    /// The bytes taken.
+    consumed: usize,
+  },
+  /// The client asked for a revision property change, `consumed` bytes, which passed its checks (A-702 part 2): the
+  /// caller runs pre-revprop-change with `call` and goes on with its verdict
+  /// ([`Connection::revision_property_hooked`]).
+  RevisionPropertyHook {
+    /// The pre-hook's call.
+    call: Box<RevisionPropertyCall>,
     /// The bytes taken.
     consumed: usize,
   },
@@ -603,6 +613,9 @@ enum Phase {
   /// A lock verb's paths are answered, its post-hook with the caller: its verdict is awaited
   /// ([`Connection::locks_finished`]; A-730).
   LockFinishing(Box<Established>, Box<locks::Pending>),
+  /// A revision property change passed its checks, its hooks or record with the caller (A-702 part 2;
+  /// [`Connection::revision_property_hooked`]).
+  RevisionProperty(Box<Established>, Box<revprops::Pending>),
   /// A replay's answer has more to write (A-703).
   Replaying(Box<Established>, Box<replays::Replaying>),
   /// The connection has ended.
@@ -628,6 +641,7 @@ impl std::fmt::Debug for Phase {
       Self::LockHooking(..) => "LockHooking",
       Self::Locking(..) => "Locking",
       Self::LockFinishing(..) => "LockFinishing",
+      Self::RevisionProperty(..) => "RevisionProperty",
       Self::Replaying(..) => "Replaying",
       Self::Ended => "Ended",
     })
@@ -676,7 +690,8 @@ impl Connection {
       | Phase::LockAsked(..)
       | Phase::LockHooking(..)
       | Phase::Locking(..)
-      | Phase::LockFinishing(..) => Waiting::Writing,
+      | Phase::LockFinishing(..)
+      | Phase::RevisionProperty(..) => Waiting::Writing,
       Phase::Reporting(_, exchange) => match exchange.awaiting() {
         Awaiting::Report => Waiting::Report,
         Awaiting::Drive => Waiting::Writing,
@@ -705,7 +720,8 @@ impl Connection {
       | Phase::LockAsked(established, _, _)
       | Phase::LockHooking(established, _)
       | Phase::Locking(established, _)
-      | Phase::LockFinishing(established, _) => Some(&established.session),
+      | Phase::LockFinishing(established, _)
+      | Phase::RevisionProperty(established, _) => Some(&established.session),
       Phase::Handshake(_) | Phase::Ended => None,
     }
   }
@@ -736,6 +752,7 @@ impl Connection {
         | Phase::LockHooking(..)
         | Phase::Locking(..)
         | Phase::LockFinishing(..)
+        | Phase::RevisionProperty(..)
         | Phase::Ended
     ) {
       return Err(Refused::OutOfTurn);
@@ -1036,6 +1053,7 @@ impl Connection {
       | Phase::LockHooking(..)
       | Phase::Locking(..)
       | Phase::LockFinishing(..)
+      | Phase::RevisionProperty(..)
       | Phase::Ended => Err(Refused::OutOfTurn),
     }
   }
@@ -1195,6 +1213,11 @@ impl Connection {
             self.phase = Phase::Replaying(established, replaying);
             Turn::Took { consumed }
           }
+          Answered::RevisionProperty(pending) => {
+            let call = Box::new(pending.call());
+            self.phase = Phase::RevisionProperty(established, pending);
+            Turn::RevisionPropertyHook { call, consumed }
+          }
           Answered::Unserved => {
             self.phase = Phase::Commands(established);
             Turn::Unserved {
@@ -1219,7 +1242,7 @@ impl Connection {
     out: &mut Vec<u8>,
   ) -> Result<Answered, Refused>
   where
-    R: ?Sized,
+    R: reads::Repository + ?Sized,
   {
     if name == REPARENT {
       reparent(established, params, out)?;
@@ -1241,6 +1264,7 @@ impl Connection {
         self.change_revision_property(established, sources, (name, params, item), false, out)?;
       return Ok(match changed {
         revprops::Changed::Answered => Answered::Here,
+        revprops::Changed::Hooking(pending) => Answered::RevisionProperty(pending),
         revprops::Changed::Authenticating(server, interrupted) => {
           Answered::Authenticating(server, interrupted)
         }
@@ -1404,8 +1428,16 @@ impl Connection {
         let value = self.whole_item(&command)?;
         let (name, params) = command_of(&value).ok_or(Refused::Malformed)?;
         let asked = (name, params, command.as_slice());
-        self.change_revision_property(&mut established, sources, asked, true, out)?;
-        self.phase = Phase::Commands(established);
+        match self.change_revision_property(&mut established, sources, asked, true, out)? {
+          revprops::Changed::Hooking(pending) => {
+            let call = Box::new(pending.call());
+            self.phase = Phase::RevisionProperty(established, pending);
+            return Ok(Turn::RevisionPropertyHook { call, consumed: 0 });
+          }
+          revprops::Changed::Answered | revprops::Changed::Authenticating(..) => {
+            self.phase = Phase::Commands(established);
+          }
+        }
       }
       Interrupted::Commit { command, start } => {
         self.begin_commit(established, command, start, true, &sources.policy, out)?;
@@ -1712,6 +1744,8 @@ enum Answered {
   LockAsked,
   /// A replay: its answer goes on at the next call.
   Replaying(Box<replays::Replaying>),
+  /// A revision property change past its checks: its pre-hook is the caller's to run.
+  RevisionProperty(Box<revprops::Pending>),
   /// As a command not served yet.
   Unserved,
 }

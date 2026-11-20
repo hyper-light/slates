@@ -707,3 +707,44 @@ fn t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build() {
   });
   assert_eq!(seen, (0, true, 1, true));
 }
+
+/// A-664's live whole builds (a parked submit's wait bounded by the node's failover delay; main's ruling). Do: push a
+/// commit of three files to a git repository's root green, its map left to its build; submit a work while the build
+/// runs, parked; answer the overdue at an instant within an unbounded wait, then past a bound of none; drive the build to
+/// its end. Expect: parked once; nothing answered within the wait; answered overdue past it, once; the build ends with
+/// the green still at the pushed version, since nothing of the submit ran (its retry runs it again).
+#[test]
+fn t_a664_live_a_parked_submit_waits_at_most_its_bound() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, green) = git_repository(state, "overdue");
+    let root = to_db_volume(green);
+    pushed_three(state, (repository, root));
+    let ask = crate::vcs_store::paths::tests::ask;
+    let made = ask(
+      state,
+      slates_ipc::protocol::RequestBody::CreateWork {
+        green,
+        name: "work-overdue".to_owned(),
+      },
+    );
+    let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+      return (0, 0, 0, None);
+    };
+    recorded_submit(state, crate::identities::authored(work, "too late"));
+    let overdue = crate::vcs_store::paths::whole_build::OVERDUE;
+    let now = slates_rt::futures::now_ns();
+    crate::vcs_store::paths::whole_build::answer_overdue_at(state, (now, u64::MAX));
+    let within = count(state, overdue);
+    crate::vcs_store::paths::whole_build::answer_overdue_at(state, (u64::MAX, 0));
+    let past = count(state, overdue);
+    crate::vcs_store::paths::whole_build::settle(state);
+    let head = state.greens.get(&root).map(|engine| engine.head());
+    (
+      count(state, crate::vcs_store::paths::whole_build::PARKED),
+      within,
+      past,
+      head,
+    )
+  });
+  assert_eq!(seen, (1, 0, 1, Some(1)));
+}
