@@ -132,3 +132,12 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
 - Piece 1 LANDED kiln main fa96bcc47; macOS HVF drive at 81174ac49: 2 of 2 (g266, g90). Goal met (main).
 - Piece 2 (resync end) LANDED kiln main 522ba54b3; HVF g90 proves it; Shards D288 (branch
   agents/w-k90-microvm-resync-d288) and Hex patch 0003 carried by kiln until their owners merge. KVM proof owed.
+
+## 2026-11-20 FINAL (w-k90-microvm): COMPLETE for my part; signal to main to mark in the UI
+- MARK COMPLETE: goal 90 queue item 1, "kiln's macOS microVM drive green again at main (r134, A-587)": kiln main
+  fa96bcc47 (re-vendor at Slates 38ed3dfd8), HVF drive 2 of 2 at 81174ac49 (base origin/main 81174ac49).
+- MARK COMPLETE: goal 90 queue item 2, "kiln's SlatesVolumes keeps slates' resync end": kiln main 522ba54b3
+  (b3e781328), HVF g90 passed (daemon killed, successor served the share). Its KVM run is w-k90-kvm's; Shards D288
+  (agents/w-k90-microvm-resync-d288, b9006561b) waits on Shards' coordinator (R15), carried by kiln meanwhile.
+- NOT mine any more: item 3's KVM proof (w-k90-kvm, handoff above); WHP BLOCKED (jupiter).
+- Nothing unpushed; worktrees of landed work removed. Verified at kiln origin/main 0a17f46e5.
