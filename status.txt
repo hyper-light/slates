@@ -1,0 +1,15 @@
+started 2026-11-20T11:37:50Z at 7663476abbe3ece4a6fb2fabddb6bee1612ce577; 7.0.0-1020-azure; 4 cpus; load 0.41 0.37 0.18
+build exit 0
+fsx plain exit 0 169s load 3.05 2.43 1.42
+conformance: native-linux-fuse × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-20; Ubuntu 26.04.1 LTS)
+fsx live exit 0 29s load 3.38 2.55 1.49
+conformance: native-linux-fuse × fsx: RAN(10000 operations, seed 1, file length 262144: passed; 2026-11-20; Ubuntu 26.04.1 LTS)
+fsstress plain exit 0 3s load 3.38 2.55 1.49
+conformance: native-linux-fuse × fsstress: RAN(500 operations × 4 processes, seed 1, 2000 logged: passed; 2026-11-20; Ubuntu 26.04.1 LTS)
+fsstress live exit 0 13s load 3.50 2.62 1.53
+conformance: native-linux-fuse × fsstress: RAN(500 operations × 4 processes, seed 1, 2000 logged: passed; 2026-11-20; Ubuntu 26.04.1 LTS)
+compare exit 0
+compare: record native-linux-fuse.fsstress.json: the same outcome
+compare: record native-linux-fuse.fsx.json: the same outcome
+compare: the live-shipped run conforms exactly as the plain one does
+ended 2026-11-20T11:48:26Z

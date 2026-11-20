@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "suite": "fsx",
+  "transport": "native-linux-fuse",
+  "host": {
+    "os": "Ubuntu 26.04.1 LTS",
+    "kernel": "Linux 7.0.0-1020-azure",
+    "arch": "x86_64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-11-20",
+  "command": "cd <mount>/conformance-<pid>/fsx && <scratch>/tools/fsx -N 10000 -S 1 -l 262144 -q -P <scratch>/fsx-logs fsx.bin",
+  "bound": "10000 operations, seed 1, file length 262144 bytes, 300s a run",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "fsx",
+      "operations": 10000,
+      "seed": 1,
+      "file_length": 262144,
+      "ok": true
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-linux-fuse.fsx.txt",
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "entries": 0
+  },
+  "duration_ms": 29208,
+  "notes": [
+    "fsx: freebsd/freebsd-src@42c6944 tools/regression/fsx/fsx.c (APSL 2.0), sha256 b064208bec8519e80038ee1da8cb9c0f7c512a3242bbf4c06809a88ce15ae019, built `cc -O2 -w -include time.h -include stdint.h` (source unchanged)",
+    "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)",
+    "0 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
+    "live-shipped (A-200) on an f = 1 fleet, the owner and 2 candidate anchors, mounted through node a: the owner's log Some(LiveLine { head: \"4436\", durable: \"4436\", owed: \"false\" }), the candidates holding [Some(LiveLine { head: \"4436\", durable: \"none\", owed: \"false\" }), Some(LiveLine { head: \"4436\", durable: \"none\", owed: \"false\" })]; durable at its head and held by both candidates; the fleet.live counters: conf-fsx-a-10853 {\"appended\": 4437, \"batched\": 740, \"batches\": 344, \"change_bytes\": 338080110, \"durable\": 3915, \"held_back.placement\": 3, \"held_back.whole\": 1229, \"hold.answer\": 3013, \"hold.declined\": 7929, \"hold.dispatches\": 5821, \"hold.exchange\": 8027, \"holders_recorded\": 1, \"hop.build\": 3088, \"hop.build_ns\": 4005909118, \"hop.exchange\": 3088, \"hop.exchange_ns\": 9770524542, \"hop.lane\": 3088, \"hop.lane_ns\": 109994110, \"hop.round\": 3088, \"hop.round_ns\": 15506151973, \"hop.to_control\": 3088, \"hop.to_control_ns\": 1507896066, \"hop.to_owner\": 3088, \"hop.to_owner_ns\": 111828137, \"install_built\": 1378, \"install_image\": 73, \"no_session\": 11, \"period_slices\": 732, \"periods\": 510, \"reached_slices\": 6, \"refused\": 1126, \"refused.no_credit\": 1126, \"whole\": 991, \"whole_bytes\": 141722241}; conf-fsx-b-10853 {\"claim_admitted\": 1, \"claim_ask_admitted\": 1, \"held\": 4233, \"hold.declined\": 1843, \"hold.entries\": 3498, \"hop.holder\": 3595, \"hop.holder_ns\": 2120797980, \"install_taken\": 449, \"period_slices\": 538, \"periods\": 538, \"reached_slices\": 8}; conf-fsx-c-10853 {\"claim_admitted\": 1, \"claim_ask_admitted\": 1, \"held\": 4192, \"hold.declined\": 1312, \"hold.entries\": 2968, \"hop.holder\": 3056, \"hop.holder_ns\": 1750538252, \"install_taken\": 929, \"period_slices\": 516, \"periods\": 516, \"reached_slices\": 8}"
+  ]
+}

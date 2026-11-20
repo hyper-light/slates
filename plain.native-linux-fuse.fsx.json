@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "suite": "fsx",
+  "transport": "native-linux-fuse",
+  "host": {
+    "os": "Ubuntu 26.04.1 LTS",
+    "kernel": "Linux 7.0.0-1020-azure",
+    "arch": "x86_64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-11-20",
+  "command": "cd <mount>/conformance-<pid>/fsx && <scratch>/tools/fsx -N 10000 -S 1 -l 262144 -q -P <scratch>/fsx-logs fsx.bin",
+  "bound": "10000 operations, seed 1, file length 262144 bytes, 300s a run",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "fsx",
+      "operations": 10000,
+      "seed": 1,
+      "file_length": 262144,
+      "ok": true
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-linux-fuse.fsx.txt",
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "entries": 0
+  },
+  "duration_ms": 116762,
+  "notes": [
+    "fsx: freebsd/freebsd-src@42c6944 tools/regression/fsx/fsx.c (APSL 2.0), sha256 b064208bec8519e80038ee1da8cb9c0f7c512a3242bbf4c06809a88ce15ae019, built `cc -O2 -w -include time.h -include stdint.h` (source unchanged)",
+    "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)",
+    "0 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent"
+  ]
+}
