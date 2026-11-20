@@ -1943,8 +1943,12 @@
 > test's two exports. **Part 1 of the slicing (same day, w-svn):** `Exporter::export` writes one changed path a call,
 > the revision's drive kept between calls (its rows, open directories and last path), so a unit is a changed path's
 > records, never a revision's (`every_export_call_writes_one_changed_path_of_its_revision`: a revision's changed paths
-> and two calls, both formats byte for byte). Owed (part 2): a text a window at a time, written twice over (its length
-> measured, then written), since its record's header names that length first (§4.17.4 item 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> and two calls, both formats byte for byte). **Part 2 (same day):** a text a window a call, `Text` pieces of
+> `WINDOW_LIMIT` (format 2, one walk: its length and checksums the record's) or one deltified window (format 3, taken
+> up again by `svndiff::deltas_at`); held by `every_export_call_writes_one_changed_path_or_one_window_of_its_text`
+> (largest call 102,400 and 102,413 bytes, the 107 KB text no longer one). Owed (part 3, next): format 3's measuring
+> walk, which its record's header needs first (the svndiff's length is kept nowhere), still one call over the whole
+> text, keeping no window (§4.17.4 item 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
