@@ -135,3 +135,4 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   (1) the harness client (one Python asyncio thread sending ~350 MB; split the client into processes, or time-stamp
   first-byte-sent vs answer), (2) the HTTP edge accept/body path, (3) arena growth (RSS 87 MiB -> 3.5 GB in seconds).
   Also: main b8e4591 ends the daemon at R=100 (run request; bisect owed).
+- 04376a543 LANDED: moved A-724's piece bullets (3c,4a,4b,5a,5,6,7,8-9) out of A-727/A-728/A-726/A-719p3 into A-724's entry (main's docs fix). RULE: append future A-724 log bullets at the END OF A-724'S ENTRY (before the next ### heading), never at the file's end.

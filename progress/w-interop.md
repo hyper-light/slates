@@ -150,3 +150,9 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   15 server files were pushed before checking (slip, told main); post-hoc run on main 67920ccf8 green (svn 137, server
   117, svn_interop 5/5). Piece 6 DONE.
 - Next: git + hg matrices on main 67920ccf8 (A-719 p1, 765a19ccc, A-720 p2b landed).
+
+## Piece 7 (main ~10:00Z): interop on other platforms -- Windows (jupiter f766f09294f2e17e3b8a631ffd4e6a4b) first, then Linux
+- git matrix on main 67920ccf8: v2.0.0 cut push still spins shard 0 (3554 ms), daemon killed; hg whole re-running (r49).
+- jupiter: git 2.56.0.windows.2, OpenSSH, cargo 1.99, uvx (hg 7.2 via uvx), NO svn (not installing without Ada).
+  Clone C:\Users\corph\.cache\w-interop\src, target C:\Users\corph\.cache\w-interop-target. r50: git_interop +
+  svn_interop on Windows (background).
