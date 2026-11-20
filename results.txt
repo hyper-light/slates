@@ -1,0 +1,29 @@
+svn:// 49216, http 49215
+bootstrapped
+repository: project
+id: 33a36b8578ca56110000100000000001
+repository: project
+revisions: 1000
+youngest: 1000
+import exit 0 5.888 s
+credential token: exit 0; exports        4 words; its lines but the token's:
+  id: ce8bdddde796e4964a271176a84950041b63a40fca617a84f17b204016fbb953
+  expires: never
+svnadmin load exit 0
+local checkout exit 0 youngest 1000
+local old checkout exit 0
+svn-checkout exit 0 7.004 s
+svn youngest 1000, files     4872
+svn-checkout against svnadmin's: diff exit 0 (       4 lines)
+svn-update-back against svnadmin's: diff exit 0 (       4 lines)
+svn-update-500 exit 0 3.539 s
+svn-update-500 against svnadmin's: diff exit 0 (       4 lines)
+svn status:        0 lines
+http-checkout exit 0 7.389 s
+http youngest 1000, files     4872
+http-checkout against svnadmin's: diff exit 0 (       4 lines)
+http-update-back against svnadmin's: diff exit 0 (       4 lines)
+http-update-500 exit 0 2.598 s
+http-update-500 against svnadmin's: diff exit 0 (       4 lines)
+http status:        0 lines
+6
