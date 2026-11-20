@@ -54812,6 +54812,16 @@ Applied in the same change to:
   window, which the sender's let-go or the healer releases. Test: `vcs_store::homes::tests::a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_its_image_is_published`
   (the barrier played by hand: no `Kept` before publication, `Kept` after, read back, let go, gone, misnamed refused).
   Owed: the sender (batched puts to the homes `homes()` names) and the healer's loop at each configuration change.
+- **Piece 6's region half, the sender and the healer (2026-11-20; the transport done).** A home keeps one region hold
+  a window however often the region offers it (`keep_for_region`, `let_go_for_region`), so offers are idempotent. The
+  healer (`vcs_store::homes::heal_region`), called from the control shard's `follow_configuration` every period, begins
+  a pass only at a new configuration version (never on a write's path, §2 ban 10): it walks the windows this node holds
+  for the region, a turn a period within the round budget, offers each to its homes (`homes()`, a `Put` broadcast on
+  `HOME_STREAM` over the record sessions), and lets this node's hold go once `heal()` finds every home holding it and
+  this node not among them (add before remove), counted (`vcs_store.homes.heal_offered`, `heal_released`). Tests:
+  `vcs_store::homes::tests` 6 of 6 (region offers idempotent; a lone node's healer moves nothing; the region put
+  acknowledged only after its image) and `fleet::` 33 of 33. A region home answers `Kept` only once A-727 a3 drives its
+  image barrier, so until then the healer offers and keeps its own copy (no release without every home's `Kept`).
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
