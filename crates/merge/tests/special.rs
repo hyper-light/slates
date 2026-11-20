@@ -77,6 +77,7 @@ fn increment(base: &Base, version: u64, journal: &[VolumeOp]) -> Increment {
     doc,
     post_state: post,
     evidence: vec![],
+    named: Default::default(),
   }
 }
 

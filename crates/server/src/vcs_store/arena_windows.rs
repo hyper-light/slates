@@ -323,6 +323,7 @@ impl ChunkWindows {
             block: claimed,
             identity: None,
             seal: None,
+            pins: slates_vfs::content::Pins::default(),
           },
           None,
         );

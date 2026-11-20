@@ -71,7 +71,8 @@ pub const fn heartbeat_of(liveness_budget_ns: u64) -> u64 {
 /// derived from the failover SLO: the fleet's detection and confirmation timers are multiples of this window's
 /// heartbeat, so a failover SLO derived from them (Ada's rule, 2026-11-18) cannot also set it. The machine's measured
 /// scheduling delay is its floor, checked and logged at boot (`config::liveness_window`).
-pub const LIVENESS_BUDGET_NS: u64 = slates_db::replay::RECOVERY_BUDGET_NS;
+/// One source with every tool that waits on a daemon: `slates_machine::budgets::liveness_budget_ns`.
+pub const LIVENESS_BUDGET_NS: u64 = slates_machine::budgets::liveness_budget_ns();
 /// How long an out-of-band observation ([`Daemon::observation`]) has, from its submission through its
 /// admission to its answer, before it ends with a deadline naming the stage it reached
 /// ([`crate::observe::ObserveError::Deadline`]). A live shard answers within a few coordinator periods
@@ -79,8 +80,9 @@ pub const LIVENESS_BUDGET_NS: u64 = slates_db::replay::RECOVERY_BUDGET_NS;
 /// headroom for a merely-slow shard to answer means an observation is not lost to a false timeout and
 /// misread as a real change (a peer "left", a leader "lost"), while a genuinely wedged shard still ends
 /// it — typed, so a poll tells the starvation from a fact.
-/// Derived: ten liveness budgets ([`LIVENESS_BUDGET_NS`]).
-pub const OBSERVE_BUDGET_NS: u64 = 10 * LIVENESS_BUDGET_NS;
+/// Derived: ten liveness budgets ([`LIVENESS_BUDGET_NS`]), from one source with every tool that waits on a daemon
+/// (`slates_machine::budgets::observe_budget_ns`).
+pub const OBSERVE_BUDGET_NS: u64 = slates_machine::budgets::observe_budget_ns();
 
 /// Derived: how long test support ([`Daemon::hold_record_session`], [`Daemon::ask_live_reports`]) waits for a record
 /// session that is not in its link (A-449): the span of one record-plane exchange (`fleet::record_exchange_budget_ns`,

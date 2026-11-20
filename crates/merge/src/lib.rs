@@ -41,6 +41,7 @@ mod history;
 mod identity;
 pub mod increment;
 pub mod map;
+pub mod named;
 pub mod ops_doc;
 pub mod origin;
 pub mod pace;

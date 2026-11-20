@@ -290,6 +290,13 @@ impl<U: Exchange, R: Exchange> Exchange for HalfExchange<U, R> {
     }
   }
 
+  fn interim(&mut self, out: &mut Vec<u8>) {
+    match self {
+      HalfExchange::Upload(upload) => upload.interim(out),
+      HalfExchange::Receive(receive) => receive.interim(out),
+    }
+  }
+
   async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed> {
     match self {
       HalfExchange::Upload(upload) => upload.reply(out, gone).await,
@@ -324,6 +331,13 @@ impl<E: Exchange> Exchange for GitExchange<E> {
 
   async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
     self.service.body_end(gone).await
+  }
+
+  fn interim(&mut self, out: &mut Vec<u8>) {
+    // An advertisement's prelude goes first, with its reply; a result has none.
+    if self.prelude.is_empty() {
+      self.service.interim(out);
+    }
   }
 
   async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed> {
@@ -478,6 +492,12 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     match self {
       SiteExchange::Git(git) => git.reply_fields().await,
       SiteExchange::Lfs(lfs) => lfs.reply_fields().await,
+    }
+  }
+
+  fn interim(&mut self, out: &mut Vec<u8>) {
+    if let SiteExchange::Git(git) = self {
+      git.interim(out);
     }
   }
 

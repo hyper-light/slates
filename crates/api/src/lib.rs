@@ -324,9 +324,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// start, and hands both to every daemon it starts, so a restart keeps the port and the key a client pinned; a fleet
 /// node's edge presents the node's own key; the daemon's log names the edge's address and its key's SHA256 fingerprint
 /// (2026-11-19).
+/// 57: the export route's judge (A-769, A-520's export route): [`container_engine::export_engine`] asks a runtime's
+/// engine as [`container_engine::engine_profile`] does, on every host (Windows' Docker Desktop over its named pipe
+/// among them), and answers a [`container_engine::ExportEngine`] (where it mounts a volume's NFS export from:
+/// [`container_engine::MountsFrom`], the host's kernel or Docker Desktop's VM) or an [`EngineFault`]; the re-exported
+/// [`container_engine::ProfileRefusal`] gains `RootlessCannotMount` (appended): an embedder matching it exhaustively
+/// gains the variant (2026-11-20).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 56;
+pub const CONTRACT: u32 = 57;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

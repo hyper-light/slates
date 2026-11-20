@@ -246,6 +246,7 @@ fn work(green: &Green, base: u64, edits: &[Edit], id: u64) -> Increment {
     doc: work.doc,
     post_state: work.post,
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 
@@ -691,6 +692,7 @@ fn submit_three_versions(source: &mut Green) {
       doc: work.doc,
       post_state: work.post,
       evidence: Vec::new(),
+      named: Default::default(),
     };
     assert_eq!(
       source.submit(&inc),
@@ -946,6 +948,7 @@ fn version_of(green: &Green, id: u8, ops: &[(OpKind, &str, &str)]) -> Increment 
     doc: work.doc,
     post_state: work.post,
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 
@@ -1044,6 +1047,7 @@ fn first_byte(green: &Green, path: &str, n: u32) -> Increment {
     doc: work.doc,
     post_state: work.post,
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 
@@ -1201,6 +1205,7 @@ fn an_empty_member_joins_with_nothing_and_holds_what_it_writes() {
     doc: work.doc,
     post_state: work.post,
     evidence: Vec::new(),
+    named: Default::default(),
   };
   assert_eq!(
     lineage.with(empty, |green| green.submit(&inc)).unwrap(),

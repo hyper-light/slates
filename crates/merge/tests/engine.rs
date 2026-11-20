@@ -28,9 +28,10 @@ use slates_merge::verdict::MergeConflictClass;
 fn conflict_class(outcome: &Outcome) -> Option<MergeConflictClass> {
   match outcome {
     Outcome::Conflict { windows } => windows.first().map(|window| window.class),
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } | Outcome::CopyRefused { .. } => {
-      None
-    }
+    Outcome::Accepted { .. }
+    | Outcome::BaseUnavailable { .. }
+    | Outcome::CopyRefused { .. }
+    | Outcome::ContentUnread { .. } => None,
   }
 }
 

@@ -443,7 +443,6 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
 /// text made whole from its chain by the reads (the counter where the commits left it); the text's end read empty.
 #[test]
 fn s4_c2_a_fetch_reads_a_texts_pieces_a_window_at_a_time_never_making_it_whole() {
-  use crate::reads::Repository as _;
   let mut repository = created();
   repository.commit(first()).unwrap();
   let line =

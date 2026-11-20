@@ -49,6 +49,12 @@
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
 >
+> **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
+> the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
+> standing grant; rows (`R N C V O D G`) in Mantle's `ShardDb`; everything else derived. Owed: the log format agreed
+> with w-hg, w-git, w-svn; Mantle's crates vendored; `slates-store`; the A/B against per-file deltas; each tool moved
+> onto it with an RSS red test.
+
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
@@ -209,6 +215,8 @@
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
+> f + 1; `crates/cli/tests/v3_takeover.rs`). Owed: credentials surviving their node (w-fed-faults), the v3 switch.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -234,7 +242,9 @@
 > (the 3,000-commit clone by use over HTTP and SSH); rule 4: a fetch holds the generation it began on (a shared fork at
 > the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects);
 > `begin`'s walks in turns (`ready`'s search, the cut, `include-tag`'s scan: `begin` reads what the request names, each
-> step a unit). Owed: protocol v0 in turns, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> step a unit); protocol v0's fetch in turns (its acknowledgments, each `ready`, the cut and the choice the answer's
+> steps); scattered plans bounded (a set of positions in its cheapest of three forms, at most 8 bytes a position).
+> Owed: none of A-745's git items; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -396,6 +406,12 @@
 > entry apply in one step: part 3a moved the paths map's step after a push into slices (94 -> 42 ms, 1,500 files
 > debug); left: the engine's verdict (8.3 ms) and commit (10.9), the recorded entry (4.7), retention's secure (5.0),
 > and the git store's record and commit (11.5, w-git's A-722).
+>
+> **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
+> (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
+> `ContentUnread` while unread. OWED: part 2, the commit's file blocks built a slice a unit and published in one step;
+> the server's `Objects` over vcs_store's plane and the svn landing's turns (w-svn); replay reading a chain entry's
+> runs first; items 3-7 (the green's block naming the plane's object, no copy).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -2179,6 +2195,14 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **A-766, DeltaV v1 (2026-11-20, w-svn; clients without HTTPv2: svn before 1.7, and 1.7+ where OPTIONS has no v2
+> headers):** part 1 BUILT, the read side as `mod_dav_svn` 1.14.x answers it: `!svn/vcc/default` (its `checked-in` the
+> youngest baseline; the v1 update-report's target, its hrefs version resources), `!svn/bln/REV` (`D:baseline`, its
+> collection `!svn/bc/REV/`, `version-name`, its revision's properties as dead properties), `!svn/ver/REV/PATH` (the
+> node in REV, no `checked-in`). Owed: part 2 the commit verbs (MKACTIVITY, CHECKOUT, the working baseline's PROPPATCH,
+> `wrk`, MERGE and DELETE of the activity) over DavCommit, part 3 the server site, part 4 by-use; the PROPFIND
+> writer's per-property strings rewritten into the connection's buffer (MEMORY SIZING; its subjects now lend their
+> properties).
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -3134,7 +3158,9 @@
 >   takeover's `make_taken` 38 ms of one poll's CPU; a forward-lane child 17 ms; the record period's capture of an owed
 >   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall. **A-763 (2026-11-20):** a live write ships the
 >   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
->   309,760 after)); and, after A-347's open, the takeover's
+>   309,760 after). **A-768 (2026-11-20):** a whole publication's content is read in turns from pinned chunks, a quantum a
+>   turn, the publications made meanwhile queued behind it (before: 4.5 to 6 ms of its turn, debug; its image's 2.0 to
+>   3.0 ms is still one turn)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -3758,7 +3784,9 @@
 >   root, remote or labelling stays refused typed. Owed: that profile's live check by use (filed 2026-11-19: `slates
 >   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
 >   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
->   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+>   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured. **Built 2026-11-20
+>   (A-769, `CONTRACT` = 57):** the export route's judge (`container_engine::export_engine`), asked on every host:
+>   Windows' Docker Desktop over its named pipe is taken, mounting the export from its VM; owed: its run on Windows;
 > - **a volume exported to one client, built 2026-11-19 (A-521, `CONTRACT` = 50; kiln's Kubernetes engine, kiln goal
 >   28e73c34's part 01a1f124, its `docs/agentic.md` W10):** §4.6's export was the command line's (`slates export`) and
 >   the raw client's alone, so a host that drives slates through the library alone (kiln) could not serve a pod's volume
@@ -7289,12 +7317,30 @@
 >   their stock clients' `exit_within` keeps `PATIENCE`, owed: a client waiting on a stock server has no slates tree to
 >   judge beside it. `load_scale` since 2026-11-20: its `eventually` and its wait for an anchor's daemon judged the
 >   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
->   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `vm`, `start_judgment`
->   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
->   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
->   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
->   own platforms), `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
->   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   5 s `START_WAIT` retry gone. `winfsp` since 2026-11-20: its daemon's successor, adoptions, counters and recovered
+>   daemon judged in the daemon's own CPU (`DaemonWatch`, re-aimed at each daemon `status` names); a drive's arrival and
+>   departure, a process's exit and a view following a change held to the observation budget (`KERNEL_WAIT`; owed:
+>   Windows' device-change event for the drive, which needs a window's message loop); the purge race's wedge bound kept;
+>   `recovered::await_recovered`'s wall form removed with its last caller. `start_judgment`, `shards`, `winfsp_semantics` and `live_winfsp` since
+>   2026-11-20, judged on Windows by the anchor's process or the daemon's (the pid its `status` names), since Windows
+>   lists no instance's processes by command line and a tree's children are not listed there; `start_judgment`'s
+>   replacement bound and `winfsp_semantics`' wedge bound (`within_wait`) kept as what those tests prove
+>   (`recovered::await_recovered`'s wall form goes with `winfsp`, which runs only on Windows); the VM harness `vm` and
+>   its suites (`guest_dax`, `guest_image`, `guest_vhost`) since 2026-11-20: the guest's boot, replies, console lines
+>   and power-off waited for while the VM's process tree gains CPU (`process_wait::Judged`; `BOOT_WAIT`, `REPLY_WAIT` and
+>   the start wait gone, `QUIT_WAIT` left bounding only the read of a VMM's last words after its exit), a daemon's
+>   restart and steadiness judged as `cli`'s are; `pmem` (its launcher's lines and end judged in its tree, its file's
+>   readback over the instance, its VMM's death awaited on a pidfd, `process_wait::await_exit_of`) and `load_fleet`
+>   (as `load_scale`); all written on macOS and compiled by w-lint on Linux, and `xtask`'s remaining `MOUNT_WAIT` uses (its tracers' bounds and the NFS attribute cache's
+>   `visible`, waits on other parties' work). Since 2026-11-20 a wait on the kernel's mount table, in the tests and in
+>   `xtask`'s mount, is `process_wait::await_mount_table`: woken by the kernel's own word (macOS `EVFILT_FS`, Linux
+>   `POLLPRI` on `/proc/self/mountinfo`), within the observation budget, never a poll (main's ruling). `xtask`'s conformance harness since 2026-11-20:
+>   its daemon's start and the live create judged by `process_wait::InstanceWait` (the suites' file, included by path:
+>   one judgment), an anchor's stop awaited on its log pipe's end (the kernel's word that every writer left) within
+>   the observation budget, the mount clients' deadlines the product's own; `START_WAIT` (60 s) gone. The observation
+>   budget's one source is `slates_machine::budgets` (`observe_budget_ns`, `liveness_budget_ns`, `RECOVERY_BUDGET_NS`),
+>   which the daemon's `OBSERVE_BUDGET_NS`/`LIVENESS_BUDGET_NS` and the db's `RECOVERY_BUDGET_NS` alias (R3; main's
+>   ruling). `kind`'s `SMOKE_START_WAIT` stays: it waits on `docker exec` into a container. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the

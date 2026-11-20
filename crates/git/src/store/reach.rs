@@ -332,7 +332,7 @@ fn put_tree(
     owned: Vec::new(),
     full: Vec::new(),
   };
-  let made = builder.node(level, 0, runs);
+  let made = builder.node(level, 0, &runs);
   builder.settle(made)
 }
 
