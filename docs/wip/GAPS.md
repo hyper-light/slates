@@ -239,6 +239,9 @@
 > (`Session::blocked` now reads on while `ServerTransport::is_rekeying`); every rekey is logged with its trigger
 > (`docs/bugs/2026-11-20-an-ssh-clone-stalled-at-a-rekey-with-its-outbox-full.md`). An answer refused past its
 > stream's start ends the SSH session as an abort, 255 and its words on stderr (it exited 0).
+> Rekeys follow RFC 4253 §9 (main's ruling): after a gigabyte of packets either way (`keylife::REKEY_BYTES`, a rekey
+> point, never a limit) or an hour (`RECOMMENDED_KEY_TIME_NS`), plus any the client asks; A-594's key time learned from
+> earlier connections' lifetimes is gone (one short session had set it to 31 ms, measured: the red).
 > `stream2` as stock 7.2 writes it (read 2026-11-20 from Homebrew's 7.2, `hg bundle --type 'none-v2;stream=v2'` of two
 > public changesets): one mandatory part with `bytecount`, `filecount` and the quoted `requirements`; each entry its
 > vfs byte (`s` store, `c` cache), the name's and the data's lengths as uvarints, the name, the data; small revlogs
@@ -2036,8 +2039,11 @@
 > lock (both its lock calls pass expiration 0); only a DAV `LOCK` with a `Timeout` does, so the case needs a timed DAV
 > lock and a commit spanning its expiry, off the scale path.
 > **Measured 2026-11-20 (the big Studio, release; BENCHMARKS):** the export's text calls run 12 to 20 times the copy
-> slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs): owed, the piece and the
-> window sliced to the slice. **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
+> slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs). Format 2's piece is now the
+> bytes the shard's copy slice digests at the machine's measured MD5 and SHA-1 rate (`DaemonConfig::
+> svn_text_piece_bytes`, `Exporter::with_text_piece`; the rate measured at the daemon's derivation through aws-lc-rs,
+> as the writer digests); its release numbers are owed with the big Studio back. Format 3's window made in parts is
+> w-bugs' shared encoder (main's routing). **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
 > refused E210009 by one request's room over svn:// and DAV (rule 2), and below that room `commit::drive::Work::texts`
 > holds every new text whole (rule 1, by reading); owed, w-svn's next piece. **Intake, part 1 (same day, w-svn, on w-perf's seam):**
 > the commit drive applies each svndiff window into one window's room and hands it to the caller's
