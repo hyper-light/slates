@@ -132,3 +132,8 @@
   RefOwner::Attachment(record.id); new cli test a_file_an_ended_mount_held_is_given_back + the takeover one. Mac:
   server --test attachment_term 4/4, attach_forms 9/9. CI: diag-w-bugs-a739-green-1 vs -red-2 (red-1 was identical to
   green: sed missed the reflowed call).
+- A-739 LANDED main 137bf3633 (commit c468b1309): B14 built; found + fixed: an ordinary FUSE mount's end swept nothing
+  its kernel held (end_attachment now sweeps the attachment). CI ubuntu red/green shown.
+- bug-claims: junction tests (fixed 2359d2550) and Windows landing w/o link privilege (passes on jupiter) marked.
+- Next candidates (by use): six fleet tests on jupiter (line 39); B5 arm64 WinFsp open/close 4 ms; B15 triage
+  (winfstest 382 entries now runnable); hangup test flake (line 87).

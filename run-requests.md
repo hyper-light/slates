@@ -6807,3 +6807,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-reaper A-733 (main bad0841): owed (main): clippy; Linux x86_64: cargo test -p slates-server --lib -- a_dav_ vcs_svn:: vcs_ssh:: (hook scripts under /bin/sh).
 - 2026-11-20 w-bugs A-737 (main 2a80ea399): owed (main): clippy vfs/bridge-winfsp; nothing Windows-only changed beyond tests.
 - 2026-11-20 w-git main e42c53886 (A-722 part 2, landing map): clippy + xtask; Linux/Windows cargo test -p slates-git --lib -- store:: upload:: hook_view
+- 2026-11-20 w-bugs A-739 (main 137bf3633): owed (main): clippy server/cli; Linux arm64 run of cli a_file_an_ended_mount_held_is_given_back + the takeover one; the full fuse lanes.
