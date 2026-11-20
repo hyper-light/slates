@@ -108,3 +108,12 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   v0.99/v1.0.0/v1.5.0 holding 70/183/777 MiB; v2.0.0 push KILLS the daemon (run-requests). run2 (3 classes) r7 running.
 - w-perf seam proposal sent via agents_send (id 01a1f722b428761c9ae0225a84cc3b41) + inbox/w-perf-from-w-balance.md;
   w-perf replies in inbox/w-perf-w-balance-homes.md.
+- P7 LANDED 489398c9a (harness + BENCHMARKS row + design log line), from worktree ~/slates-work/w-balance-land.
+  run3 (.local-2, release 1e84630b1): R=1/10/100 all ok; R=100 small p99 14.1x alone, medium 6.8x, hot 11.3x;
+  R=1000 estimate 202 GB > 30 GB free. Logs on .local-2 ~/.cache/w-balance/run{1,2,3}.log.
+- RULE FOR ME NOW: ~/slates-work/w-balance's local main holds wip commits 1e84630b1 + 7614bfe (bench, landed by content
+  in 489398c9a). NEVER push from that clone's HEAD. Work only in ~/slates-work/w-balance-land (worktree, detached,
+  fast-forward it from origin/main before each piece).
+- NEXT: P3c CPU share: each shard's step quanta scheduled fairly by repository (WFQ / DRF CPU dimension), proven by
+  rerunning multi_repo_load R=100 (target: small class p99 near alone). Then P5b/A-727 seam with w-perf, P6 region
+  half (Q3), P8, P9.
