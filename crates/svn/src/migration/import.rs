@@ -4,6 +4,7 @@
 //! - a revision record begins a transaction on the youngest revision (`new_revision_record`) and is committed when the
 //!   next revision record or the stream's end comes (`close_revision`), with exactly the stream's revision properties;
 //!   revision 0's properties are set into a repository that holds no revision but 0, as `close_revision` sets them;
+//! - a UUID record names a repository that holds no revision but 0 (`uuid_record`);
 //! - a node record's path is read through `svn_relpath_canonicalize` (`make_node_baton`); `change` makes no call of
 //!   its own, `delete` deletes, `add` makes a node or copies (`maybe_add_with_history`), `replace` deletes then adds;
 //! - a whole property section removes every property the node has, then sets each it lists (`remove_node_props`,
@@ -18,19 +19,28 @@
 //! into its canonical form by default, so the history is the one its source served. Every checksum the stream carries
 //! is checked: a whole text's by the reader, a delta's base and result and a copy source's text here, SHA-1 as well as
 //! MD5. Everything the import holds is charged to the repository's room as it arrives.
+//!
+//! **Committed by its caller's step** (A-652 part 3). What the import changes in the repository it hands its caller as
+//! a record of the commit step's (`crate::commit::record`), one at a time, and reads on only once the caller committed it
+//! ([`Importing::Commit`]): a revision as made, the UUID, revision 0's properties. A caller that holds the records alone
+//! commits each through [`Repository::commit_record`]; the server's owner commits each through its own step, which logs
+//! the record before it applies it, so an imported revision is a commit like a client's (§4.17.4 item 3.5).
 
 use super::MigrationRefusal;
 use super::paths::{ROOT, absolute, canonical_relpath};
 use super::records::{Facts, Properties, Repository, Transaction, node};
+use crate::commit::record::Record;
 use crate::dump::{
   Admission, CopyFrom, Digest, Digests, DumpError, Event, Md5, NodeAction, NodeHeader, Property,
   Read, Reader, RevisionHeader, Sha1, TextSection, Uuid, check_text,
 };
-use crate::index::{ContentIdentity, CopySource, NodeKind, PropertyList, Text, is_canonical};
+use crate::index::{
+  ContentIdentity, CopySource, NodeKind, PropertyList, Revision, Text, is_canonical,
+};
 use crate::svndiff::{SvndiffError, Window, apply};
 
 /// What one call of [`Importer::import`] made of its buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Importing {
   /// The buffer ends inside the stream: the caller drops the first `consumed` bytes, then calls again with at least
   /// `needed` bytes from the new start, or with the stream's last bytes and `ended` set.
@@ -40,8 +50,31 @@ pub enum Importing {
     /// How many bytes from the new start it needs at least, never more than the admission.
     needed: usize,
   },
-  /// The stream ended, and every revision it carried is in the repository.
+  /// A change made for the caller's step (the module documentation): the caller commits `record` to the repository,
+  /// then drops the first `consumed` bytes and calls again. A revision, made on the youngest revision; the UUID; or
+  /// revision 0's properties.
+  Commit {
+    /// The bytes, from the start of the buffer, the import is done with.
+    consumed: usize,
+    /// The record to commit.
+    record: Box<Record>,
+  },
+  /// The stream ended, and every record it made was handed to the caller.
   Done,
+}
+
+/// What the import does before it reads on, once its caller committed the record it handed over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pending {
+  /// Begins the revision whose record closed the one committed: its number, and whether a property section follows.
+  Begin {
+    /// The revision's number.
+    number: Revision,
+    /// Whether its record carries a property section.
+    properties: bool,
+  },
+  /// Ends: the stream's end closed the revision committed.
+  End,
 }
 
 /// An import of one dump stream into one repository (the module documentation).
@@ -61,13 +94,20 @@ pub struct Importer {
   in_flight: u64,
   /// The stream's refusal, once there is one: every later call answers it.
   refused: Option<MigrationRefusal>,
-  /// Whether the stream has ended and been committed.
+  /// What to do before reading on, once the caller committed the record handed over.
+  pending: Option<Pending>,
+  /// The revision whose record the import read last: the one it is reading, or about to begin, and still the one it
+  /// refused there once refused.
+  loading: Option<Revision>,
+  /// Whether the stream has ended and every record it made been handed over.
   done: bool,
 }
 
-/// A revision being read: its properties and its transaction (none for revision 0).
+/// A revision being read: its number, its properties and its transaction (none for revision 0).
 #[derive(Clone, Debug)]
 struct OpenRevision {
+  /// Its number, as the stream gives it.
+  number: Revision,
   /// Its properties as read.
   properties: Properties,
   /// Its transaction; revision 0 makes none (`new_revision_record`).
@@ -137,16 +177,35 @@ impl Importer {
       text: None,
       in_flight: 0,
       refused: None,
+      pending: None,
+      loading: None,
       done: false,
     }
   }
 
-  /// Reads on from the start of `buffer` (the bytes the last call did not consume, then any received since) into
-  /// `repository`, committing each revision once the next one or the stream's end comes; `ended` says `buffer` holds
-  /// the stream's last bytes.
+  /// The bytes the import holds outside the repository: the open revision's properties, section and text, and what its
+  /// transaction holds that the repository does not. What a caller charges between its calls.
+  pub fn holding(&self) -> u64 {
+    let pending = self
+      .revision
+      .as_ref()
+      .and_then(|revision| revision.transaction.as_ref())
+      .map_or(0, Transaction::pending_bytes);
+    self.in_flight.saturating_add(pending)
+  }
+
+  /// The revision the import is reading, or is about to begin, and once refused the one it refused there: what a
+  /// refusal names. None before the stream's first revision record.
+  pub fn loading(&self) -> Option<Revision> {
+    self.loading
+  }
+
+  /// Reads on from the start of `buffer` (the bytes the last call did not consume, then any received since) against
+  /// `repository`, handing over each record it makes ([`Importing::Commit`]: a revision once the next one or the
+  /// stream's end comes); `ended` says `buffer` holds the stream's last bytes.
   ///
   /// # Errors
-  /// Every refusal of [`MigrationRefusal`] the stream meets. The revisions committed before it stay; the one being
+  /// Every refusal of [`MigrationRefusal`] the stream meets. The records committed before it stay; the revision being
   /// read is dropped whole; every later call answers the same refusal.
   pub fn import(
     &mut self,
@@ -168,13 +227,24 @@ impl Importer {
     result
   }
 
-  /// Takes events until more bytes are needed or the stream ends.
+  /// Does what was pending once the caller committed, then takes events until a record is made, more bytes are needed
+  /// or the stream ends.
   fn run(
     &mut self,
     repository: &mut Repository,
     buffer: &[u8],
     ended: bool,
   ) -> Result<Importing, MigrationRefusal> {
+    match self.pending.take() {
+      Some(Pending::Begin { number, properties }) => {
+        self.begin_revision(repository, number, properties)?;
+      }
+      Some(Pending::End) => {
+        self.done = true;
+        return Ok(Importing::Done);
+      }
+      None => {}
+    }
     let mut offset = 0usize;
     loop {
       let rest = buffer.get(offset..).unwrap_or_default();
@@ -184,10 +254,13 @@ impl Importer {
         .map_err(MigrationRefusal::Stream)?
       {
         Read::Event { event, consumed } => {
-          self.take(repository, event)?;
+          let made = self.take(repository, event)?;
           offset = offset
             .checked_add(consumed)
             .ok_or(MigrationRefusal::Corrupt)?;
+          if let Some(record) = made {
+            return Ok(commit(offset, record));
+          }
         }
         Read::NeedMore { consumed, needed } => {
           let consumed = offset
@@ -196,7 +269,10 @@ impl Importer {
           return Ok(Importing::NeedMore { consumed, needed });
         }
         Read::End => {
-          self.close_revision(repository)?;
+          if let Some(record) = self.close_revision(repository)? {
+            self.pending = Some(Pending::End);
+            return Ok(commit(offset, record));
+          }
           self.done = true;
           return Ok(Importing::Done);
         }
@@ -204,51 +280,75 @@ impl Importer {
     }
   }
 
-  /// Applies one event.
+  /// Applies one event: the record it makes for the caller to commit, if it makes one.
   fn take(
     &mut self,
     repository: &mut Repository,
     event: Event<'_>,
-  ) -> Result<(), MigrationRefusal> {
+  ) -> Result<Option<Record>, MigrationRefusal> {
+    let unmade = |done: Result<(), MigrationRefusal>| done.map(|()| None);
     match event {
-      Event::Format(_) | Event::Delta(_) => Ok(()),
+      Event::Format(_) | Event::Delta(_) => Ok(None),
       Event::Uuid(uuid) => uuid_record(repository, uuid),
       Event::Revision(header) => self.revision_record(repository, &header),
-      Event::Node(header) => self.node_record(repository, &header),
-      Event::Property(property) => self.property(repository, property),
-      Event::PropertiesEnd => self.properties_end(repository),
-      Event::Text(bytes) => self.text_piece(repository, bytes),
-      Event::Window(window) => self.window(repository, &window),
-      Event::TextEnd => self.text_end(repository),
+      Event::Node(header) => unmade(self.node_record(repository, &header)),
+      Event::Property(property) => unmade(self.property(repository, property)),
+      Event::PropertiesEnd => unmade(self.properties_end(repository)),
+      Event::Text(bytes) => unmade(self.text_piece(repository, bytes)),
+      Event::Window(window) => unmade(self.window(repository, &window)),
+      Event::TextEnd => unmade(self.text_end(repository)),
     }
   }
 
-  /// A revision record: the open revision committed, then this one begun if it continues the history.
+  /// A revision record: the open revision closed and handed over, this one begun once the caller committed it;
+  /// begun now when none was open.
   fn revision_record(
     &mut self,
     repository: &mut Repository,
     header: &RevisionHeader,
+  ) -> Result<Option<Record>, MigrationRefusal> {
+    let properties = header.properties.is_some();
+    let closed = self.close_revision(repository)?;
+    self.loading = Some(header.number);
+    if closed.is_some() {
+      self.pending = Some(Pending::Begin {
+        number: header.number,
+        properties,
+      });
+      return Ok(closed);
+    }
+    self.begin_revision(repository, header.number, properties)?;
+    Ok(None)
+  }
+
+  /// Begins revision `number` if it continues the history, a transaction on the youngest revision for any but
+  /// revision 0, and opens its property section when `properties` says it has one.
+  fn begin_revision(
+    &mut self,
+    repository: &mut Repository,
+    number: Revision,
+    properties: bool,
   ) -> Result<(), MigrationRefusal> {
-    self.close_revision(repository)?;
     let youngest = repository.youngest();
     let expected = youngest.checked_add(1).ok_or(MigrationRefusal::Corrupt)?;
-    let continues = header.number == expected || (header.number == 0 && youngest == 0);
+    let continues = number == expected || (number == 0 && youngest == 0);
     if !continues {
       return Err(MigrationRefusal::OutOfSequence {
         expected,
-        found: header.number,
+        found: number,
       });
     }
-    let transaction = if header.number == 0 {
+    let transaction = if number == 0 {
       None
     } else {
       Some(repository.begin()?)
     };
     self.revision = Some(OpenRevision {
+      number,
       properties: Properties::new(),
       transaction,
     });
-    if header.properties.is_some() {
+    if properties {
       self.properties = Some(OpenProperties {
         owner: Owner::Revision,
         list: Properties::new(),
@@ -259,19 +359,25 @@ impl Importer {
     Ok(())
   }
 
-  /// Commits the open revision, or sets revision 0's properties.
-  fn close_revision(&mut self, repository: &mut Repository) -> Result<(), MigrationRefusal> {
+  /// Closes the open revision: its record for the caller to commit, a revision made on the youngest revision or
+  /// revision 0's properties.
+  fn close_revision(
+    &mut self,
+    repository: &Repository,
+  ) -> Result<Option<Record>, MigrationRefusal> {
     self.node = None;
     let Some(open) = self.revision.take() else {
-      return Ok(());
+      return Ok(None);
     };
     self.in_flight = 0;
     match open.transaction {
-      None => repository.set_revision_zero(open.properties),
+      None => Ok(Some(Record::RevisionProperties {
+        revision: open.number,
+        properties: open.properties,
+      })),
       Some(transaction) => {
         let revision = repository.revision_of(transaction, open.properties)?;
-        repository.commit(revision)?;
-        Ok(())
+        Ok(Some(Record::Revision(revision)))
       }
     }
   }
@@ -443,20 +549,27 @@ impl Importer {
   }
 }
 
-/// A UUID record: the repository named by it when it holds no revision but 0 (`uuid_record`), refused when it names
-/// another repository than one that holds history.
-fn uuid_record(repository: &mut Repository, uuid: Uuid) -> Result<(), MigrationRefusal> {
+/// A UUID record: the repository named by it when it holds no revision but 0 (`uuid_record`), the record handed over
+/// where the name changes; refused when it names another repository than one that holds history.
+fn uuid_record(repository: &Repository, uuid: Uuid) -> Result<Option<Record>, MigrationRefusal> {
+  if repository.uuid() == uuid {
+    return Ok(None);
+  }
   if repository.youngest() == 0 {
-    repository.set_uuid(uuid);
-    return Ok(());
+    return Ok(Some(Record::Uuid(uuid)));
   }
-  if repository.uuid() != uuid {
-    return Err(MigrationRefusal::ForeignRepository {
-      repository: repository.uuid(),
-      stream: uuid,
-    });
+  Err(MigrationRefusal::ForeignRepository {
+    repository: repository.uuid(),
+    stream: uuid,
+  })
+}
+
+/// The answer that hands `record` over, the first `consumed` bytes done with.
+fn commit(consumed: usize, record: Record) -> Importing {
+  Importing::Commit {
+    consumed,
+    record: Box::new(record),
   }
-  Ok(())
 }
 
 /// Applies a node record's action to the transaction and answers the node the record leaves at its path, or none

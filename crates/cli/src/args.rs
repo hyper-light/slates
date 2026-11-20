@@ -17,6 +17,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
            [--vcs-http ADDRESS]                                either role: serve git over HTTP(S) at ADDRESS; loopback
                                                                alone unless --fleet gives the node's HTTPS identity
+           [--vcs-ssh ADDRESS]                                 either role: serve git, hg and svn over SSH at ADDRESS;
+                                                               the daemon logs the host key's SHA256 fingerprint
            [--vcs-svn ADDRESS]                                 either role: serve svn:// (cleartext) at ADDRESS; loopback
                                                                alone unless --fleet
   profile  [--quick] [--json]                      measure and print the machine profile
@@ -759,6 +761,7 @@ const VALUES: &[&str] = &[
   "--fleet",
   "--node",
   "--vcs-http",
+  "--vcs-ssh",
   "--vcs-svn",
   "--bounded",
   "--dynamic",
@@ -1333,6 +1336,21 @@ fn vcs_address_of(
     .transpose()
 }
 
+/// `--vcs-ssh ADDRESS`, the version-control servers' SSH edge (A-684), read as the roles read it
+/// (`slates_api::role::vcs_ssh_address`): any IPv4 address and port, since SSH encrypts every connection; a name or an
+/// address without its port is refused as usage before anything starts.
+fn vcs_ssh_of(taken: &Taken) -> Result<Option<slates_rt::tcp::SocketAddrV4>, ParseError> {
+  taken
+    .value("--vcs-ssh")
+    .map(|text| {
+      slates_api::role::vcs_ssh_address(text).map_err(|reason| ParseError::BadValue {
+        what: "--vcs-ssh",
+        reason,
+      })
+    })
+    .transpose()
+}
+
 fn size_of(taken: &Taken) -> Result<SizeClass, ParseError> {
   match (taken.value("--bounded"), taken.value("--dynamic")) {
     (Some(limit), None) => Ok(SizeClass::Bounded {
@@ -1896,7 +1914,14 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
-        values: &["--shards", "--fleet", "--node", "--vcs-http", "--vcs-svn"],
+        values: &[
+          "--shards",
+          "--fleet",
+          "--node",
+          "--vcs-http",
+          "--vcs-ssh",
+          "--vcs-svn",
+        ],
         switches: &["--quick"],
       })?;
       let fleet = fleet_of(&taken)?;
@@ -1905,6 +1930,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         quick: taken.switch("--quick"),
         shards: shards_of(&taken)?,
         vcs_http: vcs_address_of(&taken, "--vcs-http", fleet.is_some())?,
+        vcs_ssh: vcs_ssh_of(&taken)?,
         vcs_svn: vcs_address_of(&taken, "--vcs-svn", fleet.is_some())?,
         fleet,
       };
@@ -2764,6 +2790,7 @@ mod tests {
         shards: Some(2),
         fleet: None,
         vcs_http: None,
+        vcs_ssh: None,
         vcs_svn: None,
       }))
     );
@@ -2873,6 +2900,7 @@ mod tests {
           node: "a".into(),
         }),
         vcs_http: None,
+        vcs_ssh: None,
         vcs_svn: None,
       }))
     );
@@ -2902,6 +2930,7 @@ mod tests {
         shards: None,
         fleet: None,
         vcs_http: Some(loopback),
+        vcs_ssh: None,
         vcs_svn: None,
       }))
     );
@@ -2927,6 +2956,42 @@ mod tests {
     ));
   }
 
+  /// A-684 (§4.17.2 "Transports" item 2). Do: parse `daemon --vcs-ssh` on a loopback address, an `anchor --vcs-ssh` that
+  /// is no fleet node on an address every interface reaches, beside `--vcs-http`, and an address that is a name. Expect:
+  /// the edge's address read on the daemon and on the anchor (which hands it to its daemon), any address taken without a
+  /// fleet since SSH encrypts every connection, and the name refused as a bad `--vcs-ssh`.
+  #[test]
+  fn the_grammar_parses_the_daemons_vcs_ssh_edge() {
+    let loopback = slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 2222);
+    assert_eq!(
+      parse(&args("daemon --instance a --vcs-ssh 127.0.0.1:2222")),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: None,
+        vcs_http: None,
+        vcs_ssh: Some(loopback),
+        vcs_svn: None,
+      }))
+    );
+    let anchor = parse(&args(
+      "anchor --vcs-http 127.0.0.1:8080 --vcs-ssh 0.0.0.0:2222",
+    ));
+    assert!(
+      matches!(&anchor, Ok(Command::Anchor(options)) if options.vcs_ssh
+        == Some(slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 2222))),
+      "{anchor:?}"
+    );
+    assert!(matches!(
+      parse(&args("daemon --vcs-ssh localhost:2222")),
+      Err(ParseError::BadValue {
+        what: "--vcs-ssh",
+        ..
+      })
+    ));
+  }
+
   /// A-656 part 2 (§4.17.4 piece 7). Do: parse `daemon --vcs-svn` on a loopback address beside `--vcs-http`, a fleet
   /// node's `anchor --vcs-svn` on an address every interface reaches, and a daemon that is no fleet node asking for the
   /// svn:// listener off loopback. Expect: each address read, the daemon's beside its HTTP edge's; the listener off
@@ -2945,6 +3010,7 @@ mod tests {
         shards: None,
         fleet: None,
         vcs_http: Some(loopback(8080)),
+        vcs_ssh: None,
         vcs_svn: Some(loopback(3690)),
       }))
     );

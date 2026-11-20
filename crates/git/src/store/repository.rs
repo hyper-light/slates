@@ -21,6 +21,10 @@ use super::push::Push;
 use super::rows::{self, CommitRow, ObjectRow};
 use reach::Sets;
 
+/// Objects by an abbreviated name (A-640 part 4), a child of this module so it reads the index kept here.
+#[path = "abbrev.rs"]
+pub(super) mod abbrev;
+
 /// The store read as upload-pack's commit graph (A-640), a child of this module so it reads the rows and chains kept
 /// here.
 #[path = "graph.rs"]
@@ -168,6 +172,9 @@ pub struct StoreCounters {
   pub remade: u64,
   /// Of those, the ones that started from another green's set.
   pub bases_found: u64,
+  /// Bytes the versions' values added to the content store as their commits put them: what the store held new, never
+  /// what it held already and was held once more by (A-647 part 4).
+  pub value_bytes: u64,
   /// Fragments encoded.
   pub fragments: u64,
   /// Entries written whole.
@@ -1021,7 +1028,9 @@ impl Repository {
     let brought_by = self.brought_by(moves, first);
     let owned = self.rows_for(store, push, &fresh, &positions, &brought_by)?;
     let (planned, heads) = self.plan(store, moves, &positions)?;
+    let before = store.used();
     let values = put_values(store, &planned)?;
+    let added = store.used().saturating_sub(before);
     let chains = self.chains_with(planned, &values);
     let total = footprint(&self.chains, &chains, &heads);
     let more = total.saturating_sub(self.charged);
@@ -1036,6 +1045,7 @@ impl Repository {
     }
     store.discharge(self.charged.saturating_sub(total))?;
     self.charged = total;
+    self.count(|counters| counters.value_bytes = counters.value_bytes.saturating_add(added));
     let versions = moves
       .iter()
       .map(|movement| {
@@ -1457,9 +1467,10 @@ fn put_values(
   store: &mut ContentStore,
   planned: &[Planned],
 ) -> Result<Vec<ContentId>, StoreRefused> {
+  let shape = reach::shape_of(store.window())?;
   let mut values = Vec::with_capacity(planned.len());
   for version in planned {
-    match version.sets.put(store) {
+    match version.sets.put(store, shape) {
       Ok(value) => values.push(value),
       Err(refused) => {
         give_back(store, &values)?;

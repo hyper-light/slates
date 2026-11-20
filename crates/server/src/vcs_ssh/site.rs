@@ -32,13 +32,17 @@
 //!    --stdio` runs (`super::hg`, A-679: `slates_hg::serve::stdio::Stdio`, A-650 part 2) when the lender the HTTP site
 //!    reads Mercurial's stores from holds the repository's ([`HgStores`]): the daemon's lends each repository's served
 //!    view from its store on its owner shard (`crate::vcs_store::hg_view::ServedViews`, A-680 part 2a). The daemon
-//!    hands this site both lenders once it starts the SSH edge (A-684). Receive-pack (A-654) and Subversion's tunnel
-//!    (A-656) wait for their entry points. Each becomes a [`Command`] behind [`Services`] as it can run, and the
-//!    not-served answer goes with the last of them.
+//!    hands this site both lenders once it starts the SSH edge (A-684). git's receive-pack runs A-654 part 2's driver
+//!    over the repository's store on its owner shard, the shard's own (A-662), so it needs no store lender: each of its
+//!    steps is lent the shard's state, as the HTTP site's are (A-654 part 3's [`ShardLender`]; `super::receive`,
+//!    A-683). Each becomes a [`Command`] behind [`Services`] as it can run, and the not-served answer goes with the last
+//!    of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
-//! begin `svnserve: ` and exit `EXIT_FAILURE` [C: `svnserve.c` at `d434dc14`]).
+//! begin `svnserve: ` and exit `EXIT_FAILURE` [C: `svnserve.c` at `d434dc14`]). The tunnel runs as a service of its own
+//! beside the others (`super::svn`'s `SvnServices`, A-688): A-656's connection over the channel, the repository found
+//! and judged when its URL comes, its store lent as git's is, and refused as not served where it is not held here.
 
 use slates_db::catalog::{CredentialKind, CredentialRecord, Principal, RepositoryRecord, VcsTool};
 use slates_ssh::command::Command as Asked;
@@ -47,7 +51,8 @@ use slates_vfs::clock::Clock;
 
 use super::git::UploadCommand;
 use super::hg::HgCommand;
-use crate::vcs_http::git::{Located, Repositories, StoreLender};
+use super::receive::ReceiveCommand;
+use crate::vcs_http::git::{Located, Repositories, ShardLender, StoreLender};
 use crate::vcs_http::hg::HgStores;
 use crate::vcs_policy::{self, Right};
 
@@ -299,39 +304,64 @@ pub(crate) trait Services {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NotYet;
 
-/// The services the server runs today: git's upload-pack from the stores `lender` lends (`super::git`, A-651 part 2)
-/// and Mercurial's `serve --stdio` from the stores `hg` lends (`super::hg`, A-679), each request admitted `room` bytes;
-/// receive-pack and Subversion's tunnel not yet, as their entry points (A-654, A-656) have not landed. A repository
-/// whose store its tool's lender does not hold is not served.
+/// The services the server runs today: git's upload-pack from the stores `lender` lends (`super::git`, A-651 part 2),
+/// Mercurial's `serve --stdio` from the stores `hg` lends (`super::hg`, A-679), and git's receive-pack through A-654
+/// part 2's driver on the repository's owner shard, whose state `shard` lends a step at a time as it lends the HTTP
+/// site's (`super::receive`, A-683), each request and each push admitted `room` bytes; Subversion's tunnel is served
+/// beside these by `super::svn`'s `SvnServices` (A-688). A repository whose store its tool's lender does not hold is not
+/// served upload-pack or `serve --stdio`.
 #[derive(Clone, Debug)]
-pub(crate) struct ToolServices<L, H> {
+pub(crate) struct ToolServices<L, H, S> {
   /// Where git's stores are lent.
   lender: L,
   /// Where Mercurial's stores are lent: the lender the HTTP site reads them from.
   hg: H,
-  /// The bytes each request may hold: the edge's room.
+  /// Where the shard's state is lent, for receive-pack (in the daemon the HTTP site's `ThisShard`).
+  shard: S,
+  /// The bytes each request, and each push, may hold: the edge's room.
   room: u64,
 }
 
-impl<L, H> ToolServices<L, H> {
-  /// The services over `lender`'s git stores and `hg`'s Mercurial stores, each request admitted `room` bytes.
-  pub(crate) fn new(lender: L, hg: H, room: u64) -> Self {
-    Self { lender, hg, room }
+impl<L, H, S> ToolServices<L, H, S> {
+  /// The services over `lender`'s git stores, `hg`'s Mercurial stores and the state `shard` lends, each request
+  /// admitted `room` bytes.
+  pub(crate) fn new(lender: L, hg: H, shard: S, room: u64) -> Self {
+    Self {
+      lender,
+      hg,
+      shard,
+      room,
+    }
   }
 }
 
-impl<L: StoreLender + Clone, H: HgStores + Clone> Services for ToolServices<L, H> {
-  type Command = ToolCommand<L, H>;
+impl<L, H, S> Services for ToolServices<L, H, S>
+where
+  L: StoreLender + Clone,
+  H: HgStores + Clone,
+  S: ShardLender + Clone,
+{
+  type Command = ToolCommand<L, H, S>;
 
-  fn start(&mut self, start: &Start<'_>) -> Result<ToolCommand<L, H>, Unserved> {
+  fn start(&mut self, start: &Start<'_>) -> Result<ToolCommand<L, H, S>, Unserved> {
+    let version = slates_git::http::version(start.git_protocol);
     match (start.service, start.repository) {
       (Service::GitUploadPack, Some(repository)) if self.lender.holds(repository.id) => {
         Ok(ToolCommand::Upload(UploadCommand::new(
           self.lender.clone(),
           (repository.id, start.principal.clone()),
-          slates_git::http::version(start.git_protocol),
+          version,
           self.room,
         )))
+      }
+      (Service::GitReceivePack, Some(repository)) => {
+        Ok(ToolCommand::Receive(Box::new(ReceiveCommand::new(
+          self.shard.clone(),
+          start.principal.clone(),
+          (repository.id, repository.name.clone()),
+          version,
+          self.room,
+        ))))
       }
       (Service::Mercurial { hidden }, Some(repository)) if self.hg.holds(repository.id) => {
         Ok(ToolCommand::Mercurial(HgCommand::new(
@@ -346,18 +376,22 @@ impl<L: StoreLender + Clone, H: HgStores + Clone> Services for ToolServices<L, H
   }
 }
 
-/// A command [`ToolServices`] started: one of the tools' sessions.
-pub(crate) enum ToolCommand<L: StoreLender, H> {
+/// A command [`ToolServices`] started: one of the tools' sessions, receive-pack's boxed, so its push's session (A-620's)
+/// does not set the size every connection's command takes (clippy's `large_enum_variant` is denied).
+pub(crate) enum ToolCommand<L: StoreLender, H, S> {
   /// git's upload-pack.
   Upload(UploadCommand<L>),
+  /// git's receive-pack.
+  Receive(Box<ReceiveCommand<S>>),
   /// Mercurial's `serve --stdio`.
   Mercurial(HgCommand<H>),
 }
 
-impl<L: StoreLender, H: HgStores> Command for ToolCommand<L, H> {
+impl<L: StoreLender, H: HgStores, S: ShardLender> Command for ToolCommand<L, H, S> {
   fn input(&mut self, run: &[u8]) -> Result<(), Refused> {
     match self {
       ToolCommand::Upload(command) => command.input(run),
+      ToolCommand::Receive(command) => command.input(run),
       ToolCommand::Mercurial(command) => command.input(run),
     }
   }
@@ -365,6 +399,7 @@ impl<L: StoreLender, H: HgStores> Command for ToolCommand<L, H> {
   fn input_end(&mut self) {
     match self {
       ToolCommand::Upload(command) => command.input_end(),
+      ToolCommand::Receive(command) => command.input_end(),
       ToolCommand::Mercurial(command) => command.input_end(),
     }
   }
@@ -372,6 +407,7 @@ impl<L: StoreLender, H: HgStores> Command for ToolCommand<L, H> {
   async fn step(&mut self) -> Result<Stepped, Refused> {
     match self {
       ToolCommand::Upload(command) => command.step().await,
+      ToolCommand::Receive(command) => command.step().await,
       ToolCommand::Mercurial(command) => command.step().await,
     }
   }
@@ -379,6 +415,7 @@ impl<L: StoreLender, H: HgStores> Command for ToolCommand<L, H> {
   fn output(&self) -> (&[u8], &[u8]) {
     match self {
       ToolCommand::Upload(command) => command.output(),
+      ToolCommand::Receive(command) => command.output(),
       ToolCommand::Mercurial(command) => command.output(),
     }
   }
@@ -386,6 +423,7 @@ impl<L: StoreLender, H: HgStores> Command for ToolCommand<L, H> {
   fn sent(&mut self, stderr: usize, stdout: usize) {
     match self {
       ToolCommand::Upload(command) => command.sent(stderr, stdout),
+      ToolCommand::Receive(command) => command.sent(stderr, stdout),
       ToolCommand::Mercurial(command) => command.sent(stderr, stdout),
     }
   }
@@ -507,7 +545,8 @@ fn repository_name(path: &[u8]) -> Option<&str> {
 }
 
 /// The words a service the server cannot start ends with, in its tool's words (the module doc, step 3); a session whose
-/// store goes away mid-way ends in them too.
+/// store goes away mid-way ends in them too, and so does a Subversion tunnel whose client names a repository not served
+/// here (`super::svn`).
 pub(crate) fn not_served(service: Service) -> Refused {
   Tool::of(service).refused(&format!("{} is not served yet", service.name()))
 }
