@@ -282,7 +282,7 @@ mod tests {
       env_section("default", &[("", b"1")]),
       env_section("default", &[("A=B", b"1")]),
       env_section("default", &[("A\0B", b"1")]),
-      env_section("default", &[("A", b"1\02")]),
+      env_section("default", &[("A", b"1\x002")]),
     ];
     for section in bad {
       let refused = Err(DbError::PolicyHooksEnvMalformed { index: 1 });
@@ -413,6 +413,12 @@ mod tests {
         Ok(())
       );
     }
+    assert_subversion_paths_are_held_only_from_the_root();
+  }
+
+  /// Subversion's path rules: one from the root is held, and one not from the root, an empty one and one holding a NUL
+  /// are refused by their index.
+  fn assert_subversion_paths_are_held_only_from_the_root() {
     let svn = |pattern: &str| {
       check(
         VcsTool::Subversion,
@@ -441,50 +447,8 @@ mod tests {
   /// Mercurial's suffixed names at one point are held.
   #[test]
   fn a_hook_is_held_only_at_its_tools_points_under_a_name_its_point_allows() {
+    assert_mercurial_hooks_are_held_only_under_their_points_names();
     let program = program();
-    let hg = |hooks: Vec<HookConfig>| check(VcsTool::Mercurial, &policy(Vec::new(), hooks));
-    assert_eq!(
-      hg(vec![
-        hook(
-          HookPointName::HgPretxnchangegroup,
-          "pretxnchangegroup",
-          &program
-        ),
-        hook(
-          HookPointName::HgPretxnchangegroup,
-          "pretxnchangegroup.acl",
-          &program
-        ),
-        hook(HookPointName::HgChangegroup, "changegroup.notify", &program),
-      ]),
-      Ok(())
-    );
-    assert_eq!(
-      hg(vec![
-        hook(
-          HookPointName::HgPretxnchangegroup,
-          "pretxnchangegroup.acl",
-          &program
-        ),
-        hook(
-          HookPointName::HgPretxnchangegroup,
-          "pretxnchangegroup.acl",
-          &program
-        ),
-      ]),
-      Err(DbError::PolicyHookMalformed { index: 1 })
-    );
-    for name in ["changegroup", "pretxnchangegroup.", "pretxnchangegroupx"] {
-      assert_eq!(
-        hg(vec![hook(
-          HookPointName::HgPretxnchangegroup,
-          name,
-          &program
-        )]),
-        Err(DbError::PolicyHookMalformed { index: 0 }),
-        "{name}"
-      );
-    }
     let git = |hooks: Vec<HookConfig>| check(VcsTool::Git, &policy(Vec::new(), hooks));
     assert_eq!(
       git(vec![
@@ -530,6 +494,55 @@ mod tests {
       ),
       Ok(())
     );
+  }
+
+  /// Mercurial's hooks: suffixed names at one point are held; a name repeated, or one that is not its point's, is
+  /// refused by its index.
+  fn assert_mercurial_hooks_are_held_only_under_their_points_names() {
+    let program = program();
+    let hg = |hooks: Vec<HookConfig>| check(VcsTool::Mercurial, &policy(Vec::new(), hooks));
+    assert_eq!(
+      hg(vec![
+        hook(
+          HookPointName::HgPretxnchangegroup,
+          "pretxnchangegroup",
+          &program
+        ),
+        hook(
+          HookPointName::HgPretxnchangegroup,
+          "pretxnchangegroup.acl",
+          &program
+        ),
+        hook(HookPointName::HgChangegroup, "changegroup.notify", &program),
+      ]),
+      Ok(())
+    );
+    assert_eq!(
+      hg(vec![
+        hook(
+          HookPointName::HgPretxnchangegroup,
+          "pretxnchangegroup.acl",
+          &program
+        ),
+        hook(
+          HookPointName::HgPretxnchangegroup,
+          "pretxnchangegroup.acl",
+          &program
+        ),
+      ]),
+      Err(DbError::PolicyHookMalformed { index: 1 })
+    );
+    for name in ["changegroup", "pretxnchangegroup.", "pretxnchangegroupx"] {
+      assert_eq!(
+        hg(vec![hook(
+          HookPointName::HgPretxnchangegroup,
+          name,
+          &program
+        )]),
+        Err(DbError::PolicyHookMalformed { index: 0 }),
+        "{name}"
+      );
+    }
   }
 
   /// A-622 (the charge). Do: weigh an empty policy, one rule, and one rule and one hook. Expect: nothing for the empty
