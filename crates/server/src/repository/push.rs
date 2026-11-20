@@ -948,6 +948,9 @@ fn judge(
           version: base,
         })
       }
+      Some(Judgment::CopyRefused { path, case }) => {
+        ChangeRefusal::Refused(crate::verbs::copy_refused(path, case))
+      }
       None => ChangeRefusal::Refused(Refusal::ContentUnavailable),
     };
     verdicts.push(None);

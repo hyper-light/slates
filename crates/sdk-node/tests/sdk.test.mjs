@@ -244,6 +244,10 @@ test('lifecycle round trip over a live daemon', async (t) => {
     const read = spawnSync(daemon, ['--instance', instance, 'read', green, '/e/x.txt'], { encoding: 'utf8' });
     assert.equal(read.status, 0, read.stderr);
     assert.equal(read.stdout, 'copied');
+    // a copy of nothing is refused before any verdict, typed by its case (A-586).
+    const empty = client.createWork(green, 'w-copy-nothing-node');
+    client.copy(empty.id, '/nothing', '/z');
+    assert.throws(() => client.submit(empty.id), /CopyRefused.*source_empty/);
   } finally {
     await endAnchor(anchor);
   }

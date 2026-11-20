@@ -15039,8 +15039,15 @@ and export by landing).
 > link names its node's copy); a name whose node lies outside the copied tree gets a node of its own in the copy,
 > holding that node's bytes, mode or IPC node, its bytes named by the content they hold. Derived at the commit from the
 > head before the copies land (`Green::copy_link_effects`), as a node's moves are, so a replay and a checkpoint hold the
-> same; a copy whose outside nodes changed after its version is refused. Owed: that refusal and A-586's other "does not
-> yet copy" cases answering their own typed refusals, not `TypeChanged`.
+> same; a copy whose outside nodes changed after its version is refused.
+>
+> **Status (2026-11-20, A-586's copy refusals typed; main's ruling).** A copy this piece does not make is refused before
+> any verdict, by a submit and a rebase alike, as `Refusal::CopyRefused { path, case }` (the wire's `CopyCase`; the
+> engine's `CopyRefusal`), never a conflict: no concurrent change caused it and no rebase answers it. Refusals FSFS's
+> commit makes too: `Root` (the root as destination), `PastHead` (a source version past the head), `SourceEmpty`.
+> Following from retention: `VersionFolded` (the version's values folded away). Owed work, refused until built:
+> `OutsideNodeChanged` (a link naming an outside node changed since the version), `ChangedSourceLink` (a hard link in a
+> source changed since its version), `LinkAcrossCopy` (a rename or hard link declared across a copied tree's edge).
 >
 > **Status (2026-11-19, A-626 part 1).** Built: the engine's replace with history (`REPLACE`, a flag on `Copy`: the
 > destination's tree taken away key by key at the copy's version, judged as a removal against the base) and copies
@@ -55925,3 +55932,24 @@ at each append and each snapshot); `crates/server` (`content_ranges`: the regist
 - **Owed.** The log ring's released pages given back (as the write log's are, A-105); `projected_snapshot_bytes`
   (A-724 piece 8) encodes a whole entry to read its length, where the derived `encoded_len` would do once every
   field's is exact.
+
+### A-586's copy refusals typed — A copy this piece does not make is refused before any verdict by its own case, never a conflict (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** Each copy the engine does not make was answered as a `TypeChanged` conflict window at its destination, which
+  misnamed it: no concurrent change caused it and no rebase answers it.
+- **Change.** `slates-merge`: `CopyRefusal` (`Root`, `PastHead`, `SourceEmpty`, `VersionFolded`, `OutsideNodeChanged`,
+  `ChangedSourceLink`, `LinkAcrossCopy`), decided before any verdict (`Green::copy_refusal`, from `compute` and `rebase`;
+  `copy_fix` now answers its own two cases; `split_copies` keeps a rename or link across a copy apart from the invalid
+  document's paths), answered as `ComputeRefused::CopyRefused`, `Judgment::CopyRefused`, `Outcome::CopyRefused`,
+  `Rebased::CopyRefused` and `Landed::CopyRefused`. The wire: `Refusal::CopyRefused { path, case }` and `CopyCase`,
+  appended (wire order published); the server maps the engine's case by an exhaustive match (`verbs::copy_refused`) for a
+  submit, a rebase and a push's held judgment; `slates-api` types it `Invalid::Copy`; the Python and Node SDKs and MCP
+  name every case by an exhaustive match (`copy_case_name`), reporting "the copy to PATH is refused: CASE".
+- **Which is which.** Refused by FSFS's commit too: `Root`, `PastHead`, `SourceEmpty`. Following from retention:
+  `VersionFolded`. Owed work, kept visible: `OutsideNodeChanged`, `ChangedSourceLink`, `LinkAcrossCopy`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-merge` lib 224 of 224 (the refusal test's
+  five typed cases, the folded version, the rebase-equals-submit oracle refusing `LinkAcrossCopy` alike), `--test
+  engine --test checkpoint` 4 and 49; `slates-server` `vcs_store::paths::tests::t_a626_p4_a_copy_of_nothing_is_refused_by_its_case`
+  and the filters `t_a626_p4 vcs_store:: work_home:: verbs:: repository::` 192 of 192; `slates-api`
+  `a_copy_refusal_is_typed_invalid_by_its_case`; by use against a real daemon, a copy of nothing refused with its case:
+  MCP's test, the Python SDK 4 of 4, the Node SDK 9 of 9, the CLI's JSON flow (`SLATES_TEST_CLI=1`); `slates-ipc
+  --test wire_order` published; fmt clean.

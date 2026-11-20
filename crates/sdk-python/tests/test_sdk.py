@@ -284,6 +284,13 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             copied = client.submit(copying["id"])
             self.assertTrue(copied["ok"], f"the copy submits: {copied}")
             self.assertEqual(_cli(binary, instance, "read", green, "/e/x.txt"), "copied")
+            # a copy of nothing is refused before any verdict, typed by its case (A-586).
+            empty = client.create_work(green, "w-copy-nothing")
+            client.copy(empty["id"], "/nothing", "/z")
+            with self.assertRaises(slates.SlatesError) as refused:
+                client.submit(empty["id"])
+            self.assertIn("CopyRefused", str(refused.exception))
+            self.assertIn("source_empty", str(refused.exception))
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:

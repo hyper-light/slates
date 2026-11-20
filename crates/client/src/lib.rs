@@ -57,7 +57,7 @@ pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, E
 pub use slates_ipc::protocol::{
   ARCHIVE_FILE, AbsenceIs, ActionCount, ArchiveFault, AttachRequest, AttachTransport,
   AttachmentCapability, AuditEntry, CauseRecord, ChangedCursor, CheckoutReport, ChokepointReport,
-  ConflictClass, Conformance, DaemonReport, DeleteWhileOpen, DetectorPeerReport,
+  ConflictClass, Conformance, CopyCase, DaemonReport, DeleteWhileOpen, DetectorPeerReport,
   DetectorPoolReport, DetectorRelayReport, DirEntry, EntriesCursor, EntryKind, Established, Filter,
   FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence,
   HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport, KernelCache,
