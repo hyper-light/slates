@@ -16,8 +16,13 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   and kiln never ended or failed the session, so the drive waited until it was killed.
 - The respawning `kiln agent --name slatesvm` on adacachy is another session's (pid 1925357, from
   ~/.cache/envscope-test/target, orphaned to systemd --user, ~4.5 h). Not ours; not touched; told main.
-- r14 (adacachy): microvm:: at kiln main ed8991d29 with SHARDS_LOG=debug, RUST_LOG hex/shards/kiln::sandbox debug.
-  Log ~/.cache/w-k90-microvm-kvm... -> ~/.cache/w-k90-kvm/logs/r1-ed8991d29{,.pack,.build}.
+- r14 lost (adacachy's runner restarted mid-clone; ~/.cache/w-k90-kvm/clone is a broken partial clone -> for main to
+  delete). r27/r34 kiln syncs timed out (kiln server not answering). Route that works: the partial sync's .git
+  (~/.kiln/reach/d1323898.../w-k90-kvm-0afe6c0693) -> `git worktree add --detach ~/.cache/w-k90-kvm/wt ed8991d29`.
+- r36 (adacachy, 08:58 PST, unit run-p3578166): microvm:: at ed8991d29 in ~/.cache/w-k90-kvm/wt, SHARDS_LOG=debug,
+  RUST_LOG hex/shards/kiln::sandbox debug. Logs ~/.cache/w-k90-kvm/logs/r2-ed8991d29{,.pack,.build}.
+- Reading: Shards' MCP lane answers Unstarted::Failed for "its run is over" (daemon/managed/mcp.rs), so the VM's run
+  likely ended right after boot; kiln's isolated.rs bridge() logs and returns, nothing ends the session.
 - Two defects to take red-first: (a) the guest member's exec failing on KVM; (b) a session whose microVM member never
   started is never ended/said (the drive's wait has no window).
 
@@ -30,4 +35,4 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   Asked main (08:0x PST): Ada's word on podman install or user_allow_other; overlap with w-k90-containers' r52.
 
 ## For main to delete
-- (none yet)
+- adacachy ~/.cache/w-k90-kvm/clone (broken partial clone, mine)
