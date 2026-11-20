@@ -107,3 +107,11 @@
 - Wall at fe4c64851 + fixes: host clean, six cross targets clean, structural/literals/unsafe/fmt clean, Windows
   (crates, cli, xtask) clean. Unsafe now 80/80 (w-engine's fix landed).
 - Target trimmed after the round (21 GB, CARGO_INCREMENTAL=0); box 100 GB free.
+
+## 2026-11-20 round 2 at 86d9e666c
+- Host: 16 errors in git, svn, server, cli (+ structural: git positions.rs proptest not through slates_test_seeds;
+  + 4 literals in server git_push.rs PhaseSteps) -> fixed in 9bb1558c2 and its merge (main restructured
+  negotiation/objects.rs meanwhile; took main's file; boxed Begun::Selecting). Host workspace clean after.
+- Six cross targets, unsafe (80/80), fmt: clean. structural, literals: clean after the fixes.
+- Windows (jupiter): r11 stopped (pre-fix tree); r14 on the fixed tree in flight -- kiln server timing out on reads.
+- Target trimmed after the round.
