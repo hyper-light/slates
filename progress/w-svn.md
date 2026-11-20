@@ -131,3 +131,8 @@
 - Run request: stock `svn propset --revprop -r1 svn:log` over svn:// and svn+ssh:// with a pre-revprop-change hook.
 - NEXT (main's bug, 2026-11-20): svnrdump replay-range over git/git spins shard 0 (3596 ms). Root cause read: the
   listener's go_on loop never yields on Turn::Wrote (Next::Again) or pipelined commands; fix = yield_now per turn.
+
+## replay-range spin fix -- LANDED main a469a6b85 (commit ea468de36)
+- vcs_svn follow(): Next::Again and Next::Consume yield_now before the next turn (SSH edge already yields a step).
+  Listener tests 12/12 on the landed tree. No unit test sees a missed yield; run request: git/git svnrdump dump.
+- NEXT: A-652 export half + lock-expiry by use (g268), then DeltaV v1, review piece 14.
