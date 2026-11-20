@@ -860,7 +860,7 @@ fn a_service_may_answer_no_content_with_no_framing_and_no_body() {
   let (mut written, mut fed, mut asked) = (Vec::new(), 0, 0);
   let mut named = false;
   let written = loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Read if fed == 2 => connection.peer_closed(),
       Next::Read => {
