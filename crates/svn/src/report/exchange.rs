@@ -360,7 +360,7 @@ impl Exchange {
     let held = !self.held.is_empty();
     out.append(&mut self.held);
     match std::mem::replace(&mut self.phase, Phase::Answered) {
-      Phase::Reporting(reporter) => self.report(reporter, input, out),
+      Phase::Reporting(reporter) => crate::diag_steps::timed("svn:report-items", || self.report(reporter, input, out)),
       Phase::Driving(drive, writer) => {
         let slice = Slice::begin(budget.quantum);
         self.drive(
@@ -440,7 +440,7 @@ impl Exchange {
         return self.aborting(Abort::Early, input, out);
       }
       let before = out.len();
-      write_call(&mut writer, &call, out)?;
+      crate::diag_steps::timed("svn:write-call", || write_call(&mut writer, &call, out))?;
       let past = out.len().saturating_sub(start) > budget.room && before > start;
       if past {
         self.held = out.split_off(before);

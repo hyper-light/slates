@@ -753,7 +753,8 @@ impl Drive {
         return Next::Paused;
       };
       left = rest;
-      if let Err(failure) = self.step(sources) {
+      let kind = self.diag_step_kind();
+      if let Err(failure) = crate::diag_steps::timed(kind, || self.step(sources)) {
         self.fail(failure);
       }
     }
@@ -792,6 +793,29 @@ impl Drive {
       }
       Some(Frame::Directory(directory)) => self.step_directory(*directory, sources),
       Some(Frame::File(file)) => self.step_file(*file, sources),
+    }
+  }
+
+  /// DIAG (w-bugs): the kind of the next step.
+  fn diag_step_kind(&self) -> &'static str {
+    match self.frames.last() {
+      None if !self.started => "drive:start",
+      None => "drive:close-edit",
+      Some(Frame::Anchor) => "drive:anchor",
+      Some(Frame::Directory(d)) => match d.phase {
+        DirectoryPhase::Properties => "dir:properties",
+        DirectoryPhase::Report => "dir:report",
+        DirectoryPhase::Deletions => "dir:deletions",
+        DirectoryPhase::Targets => "dir:targets",
+        DirectoryPhase::Close => "dir:close",
+      },
+      Some(Frame::File(f)) => match f.phase {
+        FilePhase::Properties => "file:properties",
+        FilePhase::Text => "file:text",
+        FilePhase::Windows => "file:window-unit",
+        FilePhase::End => "file:end",
+        FilePhase::Close => "file:close",
+      },
     }
   }
 
