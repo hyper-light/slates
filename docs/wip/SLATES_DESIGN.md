@@ -57057,6 +57057,32 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   `a_stored_text_is_read_a_store_window_a_step`.
 - **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.
 
+### A-760 — A green's increment names content by identity, read in bounded steps (2026-11-20, w-engine; main's ruling ~09:10, "1b", Ada's "performance gaps up front"; §4.16 data model, §4.17.1 "A push's intake"; A-727 (d), A-761)
+
+- **Why.** Subversion's intake writes each text once into the repository's content plane, durable before the revision's
+  entry (A-761). An increment that carried the text in its post-state made a second copy in the log and read a 500 MB
+  text in one call as it landed.
+- **Part 1, the name and the read.** `Increment::named` (`crate::named`): the runs of the post-state named rather than
+  carried, each an object's identity (plain BLAKE3 of its bytes and its length, the 07:36 ruling: the same on every
+  node whatever its page size), an offset into it and a length. An op's `src` keeps meaning an offset into the
+  post-state: the inline bytes, then the runs in order, so the engine's every reader of added bytes is unchanged once
+  the runs are read. `Increment::push_named` places a run and gives its `src`; `Increment::read_step` reads the next
+  slice of the runs from the owner's `named::Objects` (its content plane) onto the post-state, reserved once at its
+  whole length; `Increment::unread` names a run not yet read. The engine refuses a work with an unread run before any
+  verdict, typed (`ContentUnread` in `Outcome`, `Judgment`, `ComputeRefused`, `Rebased`, `stack::Landed`): a missing
+  byte is never a zero. Encoding: the inline bytes alone, then the run table after the evidence, only when a run is
+  named, so every encoding written before decodes as it did; a table's count is checked against the bytes left, and a
+  run past its object refused, before anything is reserved.
+- **Measured.** `named_tests::a_named_text_is_read_a_slice_a_step_then_lands_whole`: a 4 MiB text read in 64 steps of
+  at most 64 KiB, refused `ContentUnread` before, accepted after with the green's file the text's bytes; its encoding
+  under 4 KiB (the names), decoded with its run unread again.
+- **Owed, named.** Part 2: the commit building the green's file blocks a slice a unit off the green and publishing in
+  one step (today `Green::commit` copies the file's bytes in one call); the server's `Objects` over vcs_store's plane
+  and the landing's turns (w-svn's `svn.land.*` counters); replay reading a chain entry's runs before
+  `apply_recorded`; items 3-7 then name the plane's object from the green's block with no copy.
+- **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
+  `Increment` built), GAPS, amendments.tsv.
+
 ### A-763 — A live write ships the bytes it changed (2026-11-20, w-forming; main's order, item 1; found by use: 32 KiB NFS writes to a 3 MiB live file shipped about 245 KB of delta each, 54 MB over 221 appends; §4.10 "Live shipping"; A-126, A-200)
 
 - **Cause.** A live delta's content runs (`live_ship::content_runs`) carried every extent of each patched file's image,

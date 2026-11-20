@@ -62,6 +62,7 @@ fn increment(doc: OpsDoc, post: Vec<u8>, base: u64, id: u8) -> Increment {
     doc,
     post_state: post,
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 

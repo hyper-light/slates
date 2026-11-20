@@ -336,6 +336,7 @@ fn compose(
     doc,
     post_state,
     evidence: Vec::new(),
+    named: Default::default(),
   }))
 }
 

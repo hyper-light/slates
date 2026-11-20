@@ -159,6 +159,7 @@ impl Work {
       doc,
       post_state: self.post.clone(),
       evidence: Vec::new(),
+      named: Default::default(),
     }
   }
 }
@@ -209,9 +210,10 @@ fn windows(outcome: &Outcome) -> Option<Vec<(String, MergeConflictClass)>> {
         .map(|window| (window.path.clone(), window.class))
         .collect(),
     ),
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } | Outcome::CopyRefused { .. } => {
-      None
-    }
+    Outcome::Accepted { .. }
+    | Outcome::BaseUnavailable { .. }
+    | Outcome::CopyRefused { .. }
+    | Outcome::ContentUnread { .. } => None,
   }
 }
 
