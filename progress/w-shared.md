@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## NOW (main 2026-11-20): git/svn sliced rebuild, sibling of w-hg's A-732 part 3 (main 0f756ec77, VcsStores::rebuilding):
+  vcs_store::rebuild/make_whole for git and svn as a task replaying a record a turn; failing test first (a rebuild of a
+  many-object store on a running daemon advances a step a turn). Then A-697, A-658 3c. Reported homes test flaky (w-balance).
+
 ## LANDED 2026-11-20: svn symlinks 015f15b5f (main f771ede60). svn copies BLOCKED: no WorkOp copy (A-626 part 4) - told main.
   NOW: queue item 5, A-697 (a)-(f) then A-658 3c (briefs/g305.md, progress/g305-merge-anywhere.md).
 
