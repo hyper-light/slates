@@ -14667,8 +14667,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    3), the session over a byte channel the SSH server carries (A-650 part 2, `serve::stdio`), and HTTP version 1
    (A-650 part 1, `serve::http`, served by the daemon's `vcs_http::hg` site), and the served view over a repository's
    index, its content store and its register's state, held to 7.2's `served` filter (A-680 part 1, `serve::indexed`);
-   owed: the process around the stdio session, the learned response compression (the first value until then), and the
-   SSH edge's pushes (`unbundle` in the stdio session, through the same driver). Built (A-680 part 2a,
+   owed: the process around the stdio session and the learned response compression (the first value until then).
+   Built (A-696): the SSH edge's pushes, `unbundle` in the stdio session through the same driver. Built (A-680 part 2a,
    `vcs_http::ToolSites`, `vcs_store::hg_view`): the site on the daemon's edge, each repository's served view lent from
    its store on its owner shard; and its pushes (A-680 part 2b), `unbundle` through `hg_push::unbundle`. Built (A-679,
    `crates/server` `vcs_ssh::hg`): the stdio session behind the daemon's SSH edge, over the same lender; the daemon
@@ -14684,8 +14684,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after. Built (A-680
    part 2b, `push::read_bundle`, `repository::hg_push::unbundle`): the driver both edges call, the bundle read as 7.2's
    `unbundle` reads it, the revisions landed into the repository's store (A-662's Mercurial arm), a configured hook
-   refusing every push until its view is served; owed: each push's record (A-680 part 2c, A-687's record kind), the
-   bundle read in slices.
+   refusing every push until its view is served; each push's record in A-687's kind, replayed at recovery (A-680 part
+   2c, `record::write_push`); owed: the bundle read in slices.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
@@ -52172,7 +52172,8 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   admitted to the git store with the green's head moved and recorded with the version; a submit refused before its
   verdict when its post-state is one git cannot hold; a whole build and a whole map's release sliced a unit at a time
   (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
-  source's head is the version it was made at; the holders' maps (A-636's fleet half); a copy made through a work
+  source's head is the version it was made at (BUILT 2026-11-20, `paths::branch_before`: the branch's version 0 is that
+  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (A-636's fleet half); a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
   by the same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);

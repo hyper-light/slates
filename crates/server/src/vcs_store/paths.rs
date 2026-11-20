@@ -61,7 +61,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_db::catalog::{RepositoryId, VolumeId as DbVolumeId};
+use slates_db::catalog::{MemberOrigin, RepositoryId, VolumeId as DbVolumeId};
 use slates_git::derived::{FileClass, Trees, TreesRefused};
 use slates_git::object_name::ObjectFormat;
 use slates_merge::engine::Green;
@@ -259,6 +259,7 @@ fn step(
 ) -> Option<Result<Stepped, StepRefused>> {
   let repository = git_repository_of(state, green)?;
   let key = super::green_key(green);
+  let source = branch_source(state, green);
   let (answer, charged_whole) = {
     let ShardState {
       store,
@@ -275,12 +276,21 @@ fn step(
       (store, vcs_stores),
       repository,
       (key, version, whole),
+      source,
     )
   };
   if !charged_whole {
     state.count(super::CHARGE_SHORT, 1);
   }
   Some(answer)
+}
+
+/// The key of the green `green` was branched from and the version it was made at, for a branch.
+fn branch_source(state: &ShardState, green: DbVolumeId) -> Option<(u64, u64)> {
+  match state.db.partition().repositories().member(green)?.origin {
+    MemberOrigin::Branch { from, version } => Some((super::green_key(from), version)),
+    MemberOrigin::Root => None,
+  }
 }
 
 /// The git repository `green` is a member of, when its store is git's.
@@ -305,8 +315,9 @@ fn stepped(
   (store, stores): (&mut Store, &mut VcsStores),
   repository: RepositoryId,
   (key, version, whole): (u64, u64, bool),
+  source: Option<(u64, u64)>,
 ) -> (Result<Stepped, StepRefused>, bool) {
-  let plan = match plan(engine, stores, repository, (key, version, whole)) {
+  let plan = match plan(engine, stores, repository, (key, version, whole), source) {
     Ok(plan) => plan,
     Err(refused) => return (Err(refused), true),
   };
@@ -316,12 +327,15 @@ fn stepped(
   (answer, charged_whole)
 }
 
-/// What the step does (module docs), read from the store and the head alone.
+/// What the step does (module docs), read from the store and the head alone. A branch's first version with no map of
+/// its own derives over its source's head when that head is the version the branch was made at (`source`: the
+/// source's key and that version), since the branch's version 0 is that version (`Lineage::branch`).
 fn plan<'g>(
   engine: &'g Green,
   stores: &VcsStores,
   repository: RepositoryId,
   (key, version, whole): (u64, u64, bool),
+  source: Option<(u64, u64)>,
 ) -> Result<Plan<'g>, StepRefused> {
   let (content, git) = stores.git_ref(repository).ok_or(StepRefused::NoMap)?;
   let paths = git.paths.as_ref().ok_or(StepRefused::NoMap)?;
@@ -332,7 +346,9 @@ fn plan<'g>(
   if !whole && held.is_some_and(|head| head.version == version) {
     return Ok(Plan::Kept);
   }
-  let before = held.filter(|head| !whole && head.version.checked_add(1) == Some(version));
+  let before = held
+    .filter(|head| !whole && head.version.checked_add(1) == Some(version))
+    .or_else(|| branch_before(git, held, (whole, version), source));
   let Some(before) = before else {
     return Ok(Plan::Whole(whole_head(engine)));
   };
@@ -345,6 +361,22 @@ fn plan<'g>(
     || Plan::Whole(whole_head(engine)),
     |files| Plan::Change(before, files),
   ))
+}
+
+/// The source's head standing for a branch's version 0 (see [`plan`]): for the branch's first version, with no map of
+/// its own, whose source's head is the version the branch was made at.
+fn branch_before(
+  git: &GitStore,
+  held: Option<Head>,
+  (whole, version): (bool, u64),
+  source: Option<(u64, u64)>,
+) -> Option<Head> {
+  let (source, made_at) = source?;
+  if whole || held.is_some() || version != 1 {
+    return None;
+  }
+  let head = git.heads.get(&source).copied()?;
+  (head.version == made_at).then_some(Head { version: 0, ..head })
 }
 
 /// The version's change over the map `before` (module docs): each path [`named`] gives, set to its file at the head or

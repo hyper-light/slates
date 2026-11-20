@@ -44,6 +44,8 @@
 > record in an entry of the register holding it alone (no entry kind of its own: the register takes one, with no
 > position), appended in the version's own transaction and replayed by a recovery; a stock client's clone through
 > A-682's lender fetches it; a commit git would refuse or the budget refuses not made, counted, the version standing.
+> A branch's first map derived from its source's (2026-11-20, w-shared): BUILT where the source's head is the version the
+> branch was made at (its version 0); built whole otherwise (`paths::branch_before`; macOS arm64, this Mac, local).
 > OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); the holders'
@@ -1235,10 +1237,10 @@
 > of 64 and fmt clean on macOS arm64 (Mac Studio, kiln r467 and r480, 2026-11-19): stock 7.2's own HTTP push over a
 > two-shard daemon's TLS edge answered with 7.2's reply but its progress words, `heads` the pushed changeset after it;
 > the other platforms owed.
-> **Open (A-680 part 2c): a push's revisions are not durable.** Its entry records its moves and phase roots and no
-> record of its revisions, and a recovery replays no Mercurial record, so after a restart the store lacks what pushes
-> brought while the register keeps their moves: `heads` answered from a store that no longer holds them. A-687 makes
-> Mercurial's record kind (the import's); A-680 part 2c records each push's objects with it and replays them.
+> **Built (A-680 part 2c): a push's revisions are durable.** Its entry holds its record in A-687's kind
+> (`record::write_push`, `Source::Push`: the revisions it brought, in the order the landing appends them), replayed at
+> recovery after the import's (`vcs_store::replay_hg`); a push bringing nothing records nothing. macOS arm64 (Mac
+> Studio): `hg_push` a push's store made again from the log holds what it held. Owed: a push's obsmarkers.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -1263,9 +1265,8 @@
 > offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
 > first challenge alone), until A-686 put Basic's challenge first and took Basic with the token as password on the
 > loopback edge. The HTTP round trip passes since the hg site's pushes (A-680 part 2b: stock hg 7.2, macOS arm64, Mac
-> Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one waits on the pushes
-> over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
-> (A-679, built) reads as the HTTP site does (A-680).
+> Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one too since its pushes
+> (A-696: `unbundle` over `serve --stdio` through the same driver; stock hg 7.2, macOS arm64, Mac Studio, 1 of 1).
 > Stock hg 7.2's clone over the SSH edge runs (w-interop, 2026-11-20): `stock_hg_clones_over_the_ssh_edge`, an empty
 > repository cloned and pulled, host key checked strictly (macOS arm64, Mac Studio, kiln r3: 1 of 1, fmt clean).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
@@ -1295,10 +1296,7 @@
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
 > step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes (A-657 part 4
 > built the policy before the verdict in `acl`'s words and the `pretxnchangegroup` and `changegroup` hooks through
-> the driver): the principal's Mercurial identity in `acl`'s words (§4.13); each push's record and its replay at
-> recovery (A-680 part 2c, with A-687's record kind, whose import records replay since A-687; the landing into the
-> store's Mercurial arm and the HTTP site's pushes are built, A-680 part 2b); the SSH edge's pushes through the same
-> driver (`unbundle` in `serve --stdio`'s session, which A-679 serves for reads alone);
+> the driver): the principal's Mercurial identity in `acl`'s words (§4.13);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2

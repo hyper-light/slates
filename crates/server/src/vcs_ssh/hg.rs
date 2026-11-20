@@ -26,6 +26,16 @@
 //! bound is the channel's and its refusal of input past it is met only where a caller's room and window disagree. One
 //! answer is held at most: the channel takes it before the next request is served.
 //!
+//! **Pushes** (A-696; 7.2's `wireprotov1server.unbundle` over `sshv1protocolhandler` \[C\]). The session reads an
+//! `unbundle`, judges its `heads` argument against the served view, asks for the bundle and takes its chunks as they
+//! arrive, a chunk a step with no view made for it ([`Stdio::step_push`]). Once the bundle is whole the push is handed
+//! to the lender ([`HgStores::push`]), the driver the HTTP site's pushes go through too (A-680 part 2b:
+//! `crate::repository::hg_push::unbundle`, on the repository's owner shard the connection moved to), by the principal
+//! the client's key proved, within what is left of the request's room once the bundle is held; what the push came to
+//! is framed as 7.2 frames it over SSH ([`Stdio::pushed`]). The site lets a principal start `serve --stdio` holding
+//! any right on the repository (its step 2); a push's names are judged by the repository's policy in the driver, as
+//! over HTTP, so a principal who may only read is refused there in hgweb's words.
+//!
 //! **The store.** A repository whose store the lender does not hold is not served (the site's step 3). A step whose
 //! store went away mid-session, or whose view cannot be made, ends the session in the same words, with `abort`'s
 //! status. In the daemon the lender is the HTTP site's, `crate::vcs_store::hg_view::ServedViews` (A-680 part 2a): the
@@ -34,13 +44,16 @@
 //! **Tests** (`tests/hg.rs`, a child of the edge's tests, so that a session also runs over the real edge with their
 //! client): the probe stock `hg serve --stdio` 7.2 answered (`crates/hg/fixtures/serve`), after 7.2's handshake,
 //! answered byte for byte at every cut down to a byte and over the edge; the hidden warning; a store going away; the
-//! window's bookkeeping; the services' start; and the site's refusals in 7.2's recorded words.
+//! window's bookkeeping; the services' start; the site's refusals in 7.2's recorded words; a push handed to the lender
+//! as the client sent it, by the key's principal; and stock 7.2's push over SSH (`crates/hg/fixtures/wire`'s
+//! `ssh-push`) replayed against a daemon's shard through the daemon's lender, every answer after the handshake 7.2's
+//! byte for byte.
 //!
 //! **Owed** (GAPS): each answer made within the shard's step budget; a `getbundle` is one step today, as over HTTP.
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_hg::Admission;
-use slates_hg::serve::stdio::{EXIT_STATUS, PastWindow, Progress, Stdio};
+use slates_hg::serve::stdio::{EXIT_STATUS, PastWindow, Progress, Push, Stdio};
 
 use super::channel_window;
 use super::site::{self, Command, HG_ABORT_STATUS, Next, Refused, Service, Stepped};
@@ -56,6 +69,8 @@ pub(crate) struct HgCommand<S> {
   stores: S,
   /// The repository.
   repository: RepositoryId,
+  /// Who the session's pushes are by: the principal the client's key proved.
+  principal: Principal,
   /// The room each request is admitted.
   room: u64,
   /// The session.
@@ -67,25 +82,50 @@ pub(crate) struct HgCommand<S> {
 }
 
 impl<S: HgStores> HgCommand<S> {
-  /// A session over the store of `repository` that `stores` lends, each request admitted `room` bytes and the input
-  /// held within the channel's window over that room; `hidden` names the principal when the client asked for hidden
-  /// changesets.
+  /// A session by `principal` over the store of `repository` that `stores` lends, each request admitted `room` bytes and
+  /// the input held within the channel's window over that room; `hidden` when the client asked for hidden changesets.
   pub(crate) fn new(
     stores: S,
-    repository: RepositoryId,
+    (repository, principal): (RepositoryId, Principal),
     room: u64,
-    hidden: Option<&Principal>,
+    hidden: bool,
   ) -> Self {
     let window = usize::try_from(channel_window(room)).unwrap_or(usize::MAX);
+    let warning = if hidden {
+      hidden_refused(&principal)
+    } else {
+      Vec::new()
+    };
     Self {
       stores,
       repository,
+      principal,
       room,
       stdio: Stdio::new(window),
-      warning: hidden.map(hidden_refused).unwrap_or_default(),
+      warning,
       dropped: 0,
     }
   }
+}
+
+/// Lands `push` on `repository` by `principal` through `stores` (the module doc's pushes) and frames what it came to;
+/// refused with the not-served words where the lender no longer lends the store or no view of it could be made.
+fn land<S: HgStores>(
+  stores: &mut S,
+  (repository, principal): (RepositoryId, &Principal),
+  push: Push,
+  stdio: &mut Stdio,
+) -> Result<(), Refused> {
+  let mut left = push.admission;
+  let outcome = stores
+    .push(
+      repository,
+      (principal, &push.heads, &push.bundle),
+      &mut left,
+    )
+    .ok_or_else(unheld)?;
+  stdio.pushed(&outcome, &mut left);
+  Ok(())
 }
 
 /// 7.2's warning to `principal`, who asked for hidden changesets (the module doc).
@@ -131,19 +171,29 @@ impl<S: HgStores> Command for HgCommand<S> {
     let Self {
       stores,
       repository,
+      principal,
       room,
       stdio,
       dropped,
       ..
     } = self;
-    let mut admission = Admission::new(*room);
-    let progress = stores
-      .lend(*repository, &mut admission, |store, left| {
-        stdio.step(store, left.left())
-      })
-      .ok_or_else(unheld)?;
+    let progress = if stdio.taking_push() {
+      stdio.step_push()
+    } else {
+      let mut admission = Admission::new(*room);
+      stores
+        .lend(*repository, &mut admission, |store, left| {
+          stdio.step(store, left.left())
+        })
+        .ok_or_else(unheld)?
+    };
+    if let Some(push) = stdio.take_push() {
+      land(stores, (*repository, principal), push, stdio)?;
+    }
     let (consumed, next) = match progress {
-      Progress::Stepped { consumed, .. } => (consumed, Next::More),
+      Progress::Stepped { consumed, .. } | Progress::Took { consumed, .. } => {
+        (consumed, Next::More)
+      }
       Progress::Waiting => (0, Next::Input),
     };
     let next = if stdio.finished() {

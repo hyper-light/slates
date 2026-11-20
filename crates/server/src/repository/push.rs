@@ -343,6 +343,25 @@ pub(crate) fn push_imported(
   )
 }
 
+/// [`push`] of a Mercurial push (A-680 part 2c): the entry holds the push's record (`slates_hg::import::record`'s
+/// `Source::Push`, the revisions it brought), which a recovery replays into the index after the import's; the landing
+/// puts its fork in the index's place once the entry is appended (`repository::hg_push::land`).
+pub(crate) fn push_hg(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  changes: Vec<BranchChange>,
+  parts: EntryParts,
+  record: Vec<u8>,
+) -> Result<Appended, AppendRefused> {
+  push_holding(
+    state,
+    (principal, repository),
+    changes,
+    parts,
+    Some(Stored::Pushed(record)),
+  )
+}
+
 /// A Git LFS object an upload brings (A-629 part 3): its oid and bytes, and why the repository's LFS index refused it,
 /// once it has.
 pub(crate) struct LfsUpload<'u> {
@@ -384,11 +403,13 @@ enum Stored<'p, 'u> {
   Git(Sealed<'p>),
   /// A Mercurial import's index and its record (A-687).
   Imported((&'p mut Option<slates_hg::index::HgIndex>, Vec<u8>)),
+  /// A Mercurial push's record (A-680 part 2c).
+  Pushed(Vec<u8>),
   /// A Git LFS object's upload (A-629 part 3).
   Lfs(&'p mut LfsUpload<'u>),
 }
 
-/// [`push`], [`push_sealed`], [`push_imported`] and [`push_lfs`]'s one path, with what the entry's objects are, if any.
+/// [`push`], [`push_sealed`], [`push_imported`], [`push_hg`] and [`push_lfs`]'s one path, with what the entry's objects are, if any.
 fn push_holding(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
@@ -643,13 +664,15 @@ fn push_planned(
   // revision's properties (A-652 part 3), which move no green. A sealed push's objects, set below, and a revision's
   // record ride with the changes they came with.
   let brings_a_record = steps.is_empty() && !entry.objects.is_empty();
-  let imports = matches!(stored, Some(Stored::Imported(_)));
+  let imports = matches!(stored, Some(Stored::Imported(_) | Stored::Pushed(_)));
   let uploads = matches!(stored, Some(Stored::Lfs(_)));
   match stored.as_mut() {
     Some(Stored::Git((sealed, moves))) => {
       entry.objects = sealed_record(state, (&steps, &entry), (&mut **sealed, *moves))?;
     }
-    Some(Stored::Imported((_, bytes))) => entry.objects = core::mem::take(bytes),
+    Some(Stored::Imported((_, bytes)) | Stored::Pushed(bytes)) => {
+      entry.objects = core::mem::take(bytes);
+    }
     Some(Stored::Lfs(upload)) => {
       let available = state.store.admittable();
       entry.objects = crate::vcs_store::lfs_record::encode(&upload.oid, upload.bytes)
@@ -657,7 +680,8 @@ fn push_planned(
     }
     None => {}
   }
-  // An import's entry is recorded whatever it moves: its record is the repository's history (A-687); an upload's
+  // An import's or a Mercurial push's entry is recorded whatever it moves: its record is the repository's history
+  // (A-687, A-680 part 2c); an upload's
   // though it moves no green: its record is the object (A-629 part 3).
   let changes_anything = imports
     || brings_a_record
@@ -688,6 +712,8 @@ fn push_planned(
         .map_err(AppendRefused::Entry)?;
       true
     }
+    // The landing puts its fork in the index's place once the entry is appended (A-680 part 2c).
+    Some(Stored::Pushed(_)) | None => false,
     Some(Stored::Lfs(upload)) => {
       let kept = crate::vcs_store::admit_lfs(state, record.id, (&upload.oid, upload.bytes));
       if let Err(refused) = kept {
@@ -697,7 +723,6 @@ fn push_planned(
       }
       true
     }
-    None => false,
   };
   let moved: Vec<(DbVolumeId, u64)> = entry
     .versions

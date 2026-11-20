@@ -52,10 +52,9 @@
 //! naming the hook, until the hook's view of the push is served (piece 9's revlog view): no push lands that a configured
 //! hook was not asked about, and no hook is passed over without a word, as git's push refuses (`crate::git_push`).
 //!
-//! **Not yet durable** (GAPS §4.17.3). The entry a push appends holds its lines', bookmarks' and phase roots' moves,
-//! and no record of its revisions: a Mercurial record kind is A-687's (the import's), and recording a push's objects
-//! with it is A-680 part 2c. Until then a recovery replays no Mercurial record, so the store's index after a restart
-//! lacks what pushes brought while the register keeps their moves.
+//! **Durable** (A-680 part 2c). The entry a push appends holds its lines', bookmarks' and phase roots' moves and its
+//! record in A-687's kind (`slates_hg::import::record::write_push`, `Source::Push`), which a recovery replays into the
+//! index after the import's (`vcs_store::replay_hg`); a push that brought no revision records none.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -65,6 +64,7 @@ use slates_db::catalog::{
   NameBinding, Principal, RepositoryCheck, RepositoryId, StateChange, StateLog, VcsTool,
   VolumeId as DbVolumeId,
 };
+use slates_hg::import::record;
 use slates_hg::index::HgIndex;
 use slates_hg::push::check::{self, CheckRefusal, HeadsArgument, Moment, RACED};
 use slates_hg::push::classify::{
@@ -82,7 +82,7 @@ use slates_merge::engine::Increment;
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 use slates_vcs::IndexRefused;
 
-use super::push::{AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
+use super::push::{self, AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
 #[cfg(unix)]
 use crate::hook_driver::{self, Launch};
 use crate::state::ShardState;
@@ -147,6 +147,8 @@ const NOT_AUTHORIZED: &[u8] = b"push not authorized";
 const POLICY_UNREADABLE: &[u8] = b"the repository's policy cannot be read";
 /// Slates' words: the repository's store is not held on this shard (the lender lends none it does not hold).
 const NO_STORE: &[u8] = b"the repository's store is not held here";
+/// Slates' words for a push whose record could not be written (A-680 part 2c).
+const UNRECORDED: &[u8] = b"the push's record could not be written";
 /// Slates' words for a push refused while a Mercurial hook is configured (module docs, "The hook gate"), before the
 /// hook's configured name and after it.
 const HOOK_NOT_RUN: &[u8] = b"the repository's ";
@@ -1169,6 +1171,20 @@ pub(crate) fn land(
     wanted,
     ..
   } = prepared;
+  // The push's record, the revisions it brought written as the landing appends them, within the room it runs within
+  // (A-680 part 2c); a push that brought none records none.
+  let brings =
+    !(verified.changesets.is_empty() && verified.manifests.is_empty() && verified.files.is_empty());
+  let record = match brings.then(|| record::write_push(&verified, admission.left())) {
+    None => None,
+    Some(Ok(bytes)) => Some(bytes),
+    Some(Err(_)) => {
+      return Landed {
+        answer: Err(abort(UNRECORDED.to_vec())),
+        released: Ok(()),
+      };
+    }
+  };
   let forked = vcs_store::within_budget(state, brought(&verified), |stores| {
     let (content, store) = stores.mercurial(repository).ok_or(Unforked::NoStore)?;
     commit::fork_with(&mut store.index, content, &verified, admission).map_err(Unforked::Unindexed)
@@ -1182,7 +1198,11 @@ pub(crate) fn land(
       };
     }
   };
-  match RepositoryLogs::append(state, principal, repository, changes, parts) {
+  let appended = match record {
+    Some(record) => push::push_hg(state, (principal, repository), changes, parts, record),
+    None => RepositoryLogs::append(state, principal, repository, changes, parts),
+  };
+  match appended {
     Ok(_) => Landed {
       answer: Ok(Reply::accepted(&replied, wanted)),
       released: replace_index(state, repository, fork),
