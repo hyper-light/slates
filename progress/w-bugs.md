@@ -35,3 +35,9 @@
   outputs committed to <branch>-results-<run>-<runner> (status.txt, clippy.txt, fsx.txt, records). Run 1
   (diag-w-bugs-b3-1, 44682281003): steps under bash -e ended before publishing; fixed (set +e) -> diag-w-bugs-b3-2.
 - B3 question: does fsx seed 1 still wedge over the WinFsp drive on main's tree (efa2266be's parent = main 9ea6e1311)?
+- B11 run 1 (diag-w-bugs-b11-1, ubuntu-latest 4 CPUs, unloaded): 30/30 pass, real mount (3 seeds, conflicts/unknown/
+  direct reads counted). Run 2 (b11-2): 50 runs beside 2 spinners/CPU, in flight.
+- B3 run 2 (b3-2, run 44682893059): main's Windows build FAILS: crates/anchor/src/supervise.rs:381 E0560 (9abe7e9a2,
+  A-689, `vcs_svn_listener: None` without #[cfg(unix)]). fsx never ran (exit 1). Fix = commit 88a96c97c on local main
+  in ~/slates-work/w-bugs-main (not pushed yet); diag-w-bugs-b3-3 (2f47f0e0b = main + fix + workflow) proving Windows
+  compiles; land the fix on its green.
