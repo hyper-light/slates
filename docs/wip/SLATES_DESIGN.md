@@ -12430,6 +12430,21 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > now checks its units there. Time stays the by-use signal, read in release: the diagnostics runs' past-budget counters,
 > and `window_step_times` (`--ignored`, release). On an M-series Mac, `big.txt` r5 to r6 took 1,310 calls; 5 were past
 > 5 us, the longest 54 us.
+> **A directory's listing at O(live children) (2026-11-20, A-759, w-bugs; main's ruling: fix the complexity before
+> slicing; shape agreed with w-svn, index owner).** `diag-w-bugs-svnfetch-9` named the update drive's directory step
+> as the long step: it listed both revisions' entries in one step, 100-650 us on average and up to 19.8 ms. A listing
+> walked every name ever made beneath the directory and its copy chain, resolved each in the revision, and the drive
+> resolved each child again for its entry: O(history beneath the directory) plus two resolves a child. Now every
+> directory node-revision holds a persistent ordered map of its children (`index::children`: a B-tree of up to 32
+> entries a node, a child's interned path number and node-revision, 8 bytes, in name order). The map's nodes live in
+> an arena the index owns: a change copies its path from the root once a revision (a revision's own nodes are edited
+> in place), and a copy shares its source's map whole. `Index::children` resolves the directory once and walks the
+> map. `Index::listing` gives each child's node-revision, so the drive makes an entry from the row. The maps' bytes
+> are charged to the index's room. A/B (`listing_times`, release, M-series Mac, `/trunk/big` with 10,000 names over
+> 1,000 revisions): `Index::children` took 3.84 ms at r1001 (9,001 live) and r500 (4,492 live) alike, and now 0.234
+> and 0.112 ms; the drive's listing went from 5.87 and 4.86 ms to 0.98 and 0.47 ms. The index holds 65,575 entries
+> (1.6 MB) for that history, the maps about 1.2 MB of it. Owed next: the drive reads a very large directory's listing
+> through a cursor, a few entries a step (a 9,001-entry listing is about 1 ms, past the quantum in one step).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
