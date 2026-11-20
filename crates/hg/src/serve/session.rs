@@ -35,12 +35,16 @@
 //! **Stricter than 7.2, on purpose.** A request that cannot be read (a line too long for any command, an argument past
 //! the admission) is answered out of band and ends the session, where 7.2 fails mid-stream. A command's own refusal is
 //! answered out of band and the session goes on, where 7.2's exceptions end the process. A batch call of a command that
-//! does not answer a string is refused (7.2 asserts).
+//! does not answer a string is refused (7.2 asserts). A batch's `pushkey` call is landed by the caller that holds the
+//! push driver ([`Batch`], A-758), the batch answered a call at a time around it; where no such caller answers the batch
+//! ([`dispatch`]), it is refused as not served.
 
 use super::getbundle::{Answering, Asked, Store, getbundle};
+use super::keys;
 use super::{Refusal, discovery, lookup, pull, stream};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::decimal::Decimal;
+use crate::push::Outcome;
 use crate::ssh::{self, Read};
 use crate::wire::{Arguments, Spec};
 use crate::{Admission, PastAdmission, batch, capabilities, compression, http, pushkey};
@@ -422,7 +426,7 @@ fn framed(
 /// Which transport a command is answered over (§4.17.3 "The wire surface"): what `capabilities` and `hello` list, and
 /// the words a bundle1 `getbundle` is refused with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Transport {
+pub enum Transport {
   /// SSH version 1 (this module's session).
   Ssh,
   /// HTTP version 1 ([`super::http`]).
@@ -574,8 +578,9 @@ fn advertised(
   })
 }
 
-/// Writes a batch's answer: each call's string answer, escaped, joined by `;`. A call of a command that does not answer
-/// a string is refused, and with it the batch.
+/// Writes a batch's answer where no call needs a push landed: each call's string answer, escaped, joined by `;`
+/// ([`Batch`]). A call of a command that does not answer a string is refused, and with it the batch; so is a `pushkey`
+/// call here, whose push only a caller holding the push driver lands (the SSH session and the HTTP edge, A-758).
 fn batch_answer(
   store: &impl Store,
   transport: Transport,
@@ -583,43 +588,140 @@ fn batch_answer(
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refused> {
-  let mut buffer = Vec::new();
-  let calls = batch::calls(cmds, admission, &mut buffer)?;
-  admission.charge_items::<Vec<u8>>(calls.len())?;
-  let mut results = Vec::with_capacity(calls.len());
-  for call in &calls {
-    if call.command == b"batch" || call.command == b"getbundle" {
-      return Err(Refused::NotServed);
+  let mut batch = Batch::begin(cmds, admission)?;
+  match batch.step(store, transport, admission)? {
+    BatchStep::Answered(answer) => {
+      out.extend_from_slice(&answer);
+      Ok(())
     }
-    let argument = |name: &[u8]| {
-      call
-        .arguments
-        .iter()
-        .find(|(key, _)| *key == name)
-        .map(|(_, value)| *value)
-    };
-    let mut result = Vec::new();
-    string_answer(
-      store,
-      transport,
-      call.command,
-      argument,
-      admission,
-      &mut result,
-    )?;
-    results.push(result);
+    BatchStep::Push(_) => Err(Refused::NotServed),
   }
-  let total = results.iter().fold(0_u64, |total, result| {
-    total.saturating_add(
-      crate::read::to_u64(result.len())
-        .saturating_mul(ESCAPE_GROWTH)
-        .saturating_add(1),
-    )
-  });
-  admission.charge(total)?;
-  let views: Vec<&[u8]> = results.iter().map(Vec::as_slice).collect();
-  batch::encode_results(&views, out);
-  Ok(())
+}
+
+/// One call of a [`Batch`], owned: its command and its arguments, unescaped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedCall {
+  /// The command.
+  command: Vec<u8>,
+  /// The arguments, name and value, in order.
+  arguments: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// A `batch` answered a call at a time, in order, as 7.2's `wireprotov1server.batch` runs its calls (A-569, A-758): a
+/// call that answers a string is answered from the store it is stepped over, and a `pushkey` call is handed to the
+/// caller as the push it is landed as ([`super::keys`]), whose outcome [`Batch::pushed`] takes as that call's answer
+/// before the next call is answered, so a call after it reads what it moved. Its calls and answers are charged to the
+/// admission each step is given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Batch {
+  /// The calls.
+  calls: Vec<OwnedCall>,
+  /// The next call to answer.
+  next: usize,
+  /// The answers so far, in order, unescaped.
+  results: Vec<Vec<u8>>,
+}
+
+/// What a [`Batch`]'s step came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchStep {
+  /// A `pushkey` call's push, for the caller to land and hand back to [`Batch::pushed`] (the bundle [`super::keys::bundle`]
+  /// writes).
+  Push(Vec<u8>),
+  /// Every call answered: the batch's answer, each answer escaped, joined by `;`.
+  Answered(Vec<u8>),
+}
+
+impl Batch {
+  /// The batch `cmds` lists, its calls read and copied within `admission`.
+  pub fn begin(cmds: &[u8], admission: &mut Admission) -> Result<Batch, Refused> {
+    // The owned copies take at most the escaped bytes again, charged before the calls are read.
+    admission.charge(crate::read::to_u64(cmds.len()))?;
+    let mut buffer = Vec::new();
+    let calls = batch::calls(cmds, admission, &mut buffer)?;
+    admission.charge_items::<OwnedCall>(calls.len())?;
+    admission.charge_items::<Vec<u8>>(calls.len())?;
+    let calls = calls
+      .iter()
+      .map(|call| OwnedCall {
+        command: call.command.to_vec(),
+        arguments: call
+          .arguments
+          .iter()
+          .map(|(name, value)| (name.to_vec(), value.to_vec()))
+          .collect(),
+      })
+      .collect::<Vec<_>>();
+    Ok(Batch {
+      results: Vec::with_capacity(calls.len()),
+      calls,
+      next: 0,
+    })
+  }
+
+  /// Answers the calls from the next one on over `store`, within `admission`, until a `pushkey` call needs its push
+  /// landed or every call is answered. A call that cannot be answered refuses the batch, as 7.2's does.
+  pub fn step(
+    &mut self,
+    store: &impl Store,
+    transport: Transport,
+    admission: &mut Admission,
+  ) -> Result<BatchStep, Refused> {
+    while let Some(call) = self.calls.get(self.next) {
+      if call.command == b"batch" || call.command == b"getbundle" {
+        return Err(Refused::NotServed);
+      }
+      let argument = |name: &[u8]| {
+        call
+          .arguments
+          .iter()
+          .find(|(key, _)| key.as_slice() == name)
+          .map(|(_, value)| value.as_slice())
+      };
+      let mut result = Vec::new();
+      if call.command == keys::COMMAND {
+        let request = keys::request_by(argument)?;
+        match keys::bundle(&request, admission) {
+          Ok(bundle) => return Ok(BatchStep::Push(bundle)),
+          Err(refusal) => {
+            result = keys::refused(refusal, &request, admission)?;
+          }
+        }
+      } else {
+        string_answer(
+          store,
+          transport,
+          &call.command,
+          argument,
+          admission,
+          &mut result,
+        )?;
+      }
+      self.results.push(result);
+      self.next = self.next.saturating_add(1);
+    }
+    let total = self.results.iter().fold(0_u64, |total, result| {
+      total.saturating_add(
+        crate::read::to_u64(result.len())
+          .saturating_mul(ESCAPE_GROWTH)
+          .saturating_add(1),
+      )
+    });
+    admission.charge(total)?;
+    let views: Vec<&[u8]> = self.results.iter().map(Vec::as_slice).collect();
+    let mut out = Vec::new();
+    batch::encode_results(&views, &mut out);
+    Ok(BatchStep::Answered(out))
+  }
+
+  /// Takes what the push of the `pushkey` call [`Batch::step`] handed out came to as that call's answer
+  /// ([`super::keys::answer`]), charged to `admission`; the next step answers the call after it.
+  pub fn pushed(&mut self, outcome: &Outcome, admission: &mut Admission) -> Result<(), Refused> {
+    let answer = keys::answer(outcome, admission)?;
+    self.results.push(answer);
+    self.next = self.next.saturating_add(1);
+    Ok(())
+  }
 }
 
 /// Answers a `getbundle`: its stream; a refusal of a bundle2 request as an `ERROR:ABORT` part, sent uncompressed; of a

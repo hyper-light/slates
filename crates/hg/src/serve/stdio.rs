@@ -34,7 +34,10 @@
 //! **A `pushkey`** (A-758, [`super::keys`]) is landed as a push of one advisory `pushkey` part, through the same
 //! caller and driver: its four arguments read, it waits for its caller as a push taken whole does, with the `force`
 //! heads argument, and its answer is the command's string (`1` or `0`, then any words for the client) rather than a
-//! reply. A namespace no key is moved in is answered `0` with slates' words at once, nothing landed.
+//! reply. A namespace no key is moved in is answered `0` with slates' words at once, nothing landed. A `batch` is
+//! answered a call at a time ([`session::Batch`]): a `pushkey` call among its calls waits for the caller as a lone
+//! `pushkey` does, and once its outcome is in, the next step answers the calls after it, so the batch's answer is
+//! whole only when every call is.
 //!
 //! **Differs from 7.2, on purpose.** A request cut short by the end of input is dropped, not served: 7.2 reads a last
 //! line that has no newline and serves it less its last byte. A push's bundle is held within the request's room, where
@@ -49,7 +52,7 @@
 use super::Refusal;
 use super::getbundle::Store;
 use super::keys;
-use super::session::{self, BUNDLE2_REQUIRED, Refused, Step, spec_of};
+use super::session::{self, BUNDLE2_REQUIRED, BatchStep, Refused, Step, Transport, spec_of};
 use crate::Admission;
 use crate::push::Outcome;
 use crate::push::check::{self, CheckRefusal, HeadsArgument, HeadsArgumentRefusal, Moment};
@@ -72,6 +75,12 @@ const HEADS: &[u8] = b"heads";
 const UNBUNDLE_LINE: &[u8] = b"unbundle\n";
 /// Format: the command line a `pushkey` begins with (A-758).
 const PUSHKEY_LINE: &[u8] = b"pushkey\n";
+/// Format: the command a batch is sent as, its command line, and the argument its spec names (`batch`, `cmds`).
+const BATCH: &[u8] = b"batch";
+/// Format: see [`BATCH`].
+const BATCH_LINE: &[u8] = b"batch\n";
+/// Format: see [`BATCH`].
+const CMDS: &[u8] = b"cmds";
 
 /// Format: what 7.2's `Abort.format` writes before an abort's words on standard error.
 const ABORT: &[u8] = b"abort: ";
@@ -103,6 +112,8 @@ pub struct Stdio {
   /// Whether an answer was refused past its stream's start: the session ends as a process that failed does, its
   /// refusal on standard error, never with the status of one that served (A-745).
   failed: bool,
+  /// A batch whose `pushkey` call's push its caller is landing, or has landed: answered on from the next step (A-758).
+  batching: Option<session::Batch>,
 }
 
 /// A push this session took whole (the module doc's push): its `heads` argument, its bundle's bytes, and what is left of
@@ -138,6 +149,8 @@ enum Asked {
   Unbundle,
   /// `pushkey` (A-758): the command's string.
   Pushkey,
+  /// A `pushkey` call of a batch (A-758): its answer taken by the batch, answered once every call is.
+  Batch,
 }
 
 /// Input past the channel's window: the carrier let the client send more than the session may hold.
@@ -191,6 +204,7 @@ impl Stdio {
       push_room: None,
       answering: None,
       failed: false,
+      batching: None,
     }
   }
 
@@ -230,6 +244,12 @@ impl Stdio {
     }
     if !matches!(self.push, Pushing::None) {
       return self.step_push();
+    }
+    if let Some(batch) = self.batching.take() {
+      return self.batch_step(batch, store, Admission::new(room), 0);
+    }
+    if self.input.starts_with(BATCH_LINE) {
+      return self.batch(store, room);
     }
     if self.input.starts_with(UNBUNDLE_LINE) {
       return self.unbundle(store, room);
@@ -426,6 +446,60 @@ impl Stdio {
     }
   }
 
+  /// Serves the `batch` at the front of the input (the module doc's batch): its calls read within a request's room and
+  /// answered from `store` until one needs its push landed.
+  fn batch(&mut self, store: &impl Store, room: u64) -> Progress {
+    let mut admission = Admission::new(room);
+    let line = BATCH_LINE.len();
+    let Some(spec) = spec_of(BATCH) else {
+      return self.answered_out_of_band(Refused::NotServed, line);
+    };
+    let rest = self.input.get(line..).unwrap_or_default();
+    let (arguments, taken) = match ssh::arguments(rest, spec, &mut admission) {
+      Ok(Read::Done(arguments, taken)) => (arguments, taken),
+      Ok(Read::More { needed }) => return self.more(line.saturating_add(needed)),
+      Err(refusal) => return self.end_refused(Refused::Request(refusal)),
+    };
+    let used = line.saturating_add(taken);
+    let cmds = arguments.get(spec, CMDS).unwrap_or_default();
+    match session::Batch::begin(cmds, &mut admission) {
+      Ok(batch) => self.batch_step(batch, store, admission, used),
+      Err(refused) => self.answered_out_of_band(refused, used),
+    }
+  }
+
+  /// Answers `batch`'s calls from its next on over `store` within `admission`, the `used` bytes of its request taken:
+  /// its answer once every call is answered, or its `pushkey` call's push left for the caller.
+  fn batch_step(
+    &mut self,
+    mut batch: session::Batch,
+    store: &impl Store,
+    mut admission: Admission,
+    used: usize,
+  ) -> Progress {
+    match batch.step(store, Transport::Ssh, &mut admission) {
+      Ok(BatchStep::Answered(answer)) => match admission.charge(ssh::respond_len(&answer)) {
+        Ok(()) => {
+          ssh::respond(&answer, &mut self.stdout);
+          self.taken(Step::Answered { refused: None }, used)
+        }
+        Err(past) => self.answered_out_of_band(Refused::from(past), used),
+      },
+      Ok(BatchStep::Push(bundle)) => {
+        let left = admission.left();
+        let push = Push {
+          heads: HeadsArgument::Force,
+          bundle,
+          admission: Admission::new(self.push_room.map_or(left, |push| push.max(left))),
+        };
+        self.push = Pushing::Whole(push, Asked::Batch);
+        self.batching = Some(batch);
+        self.taken(Step::Answered { refused: None }, used)
+      }
+      Err(refused) => self.answered_out_of_band(refused, used),
+    }
+  }
+
   /// Answers `refused` out of band, the session going on past the `used` bytes of its request.
   fn answered_out_of_band(&mut self, refused: Refused, used: usize) -> Progress {
     ssh::respond_error(
@@ -490,16 +564,34 @@ impl Stdio {
   /// `unbundle` over SSH (the module doc's push), each answer's bytes charged to `admission` first; one that cannot be
   /// made is answered out of band. The session then goes on.
   pub fn pushed(&mut self, outcome: &Outcome, admission: &mut Admission) {
-    if let Pushing::Landing(Asked::Pushkey) = core::mem::take(&mut self.push) {
-      match keys::answer(outcome, admission) {
-        Ok(answer) => ssh::respond(&answer, &mut self.stdout),
-        Err(past) => ssh::respond_error(
-          &session::message(&Refused::from(past)),
-          &mut self.stdout,
-          &mut self.stderr,
-        ),
+    match core::mem::take(&mut self.push) {
+      Pushing::Landing(Asked::Pushkey) => {
+        match keys::answer(outcome, admission) {
+          Ok(answer) => ssh::respond(&answer, &mut self.stdout),
+          Err(past) => ssh::respond_error(
+            &session::message(&Refused::from(past)),
+            &mut self.stdout,
+            &mut self.stderr,
+          ),
+        }
+        return;
       }
-      return;
+      Pushing::Landing(Asked::Batch) => {
+        let taken = self
+          .batching
+          .as_mut()
+          .map(|batch| batch.pushed(outcome, admission));
+        if let Some(Err(refused)) = taken {
+          self.batching = None;
+          ssh::respond_error(
+            &session::message(&refused),
+            &mut self.stdout,
+            &mut self.stderr,
+          );
+        }
+        return;
+      }
+      _ => {}
     }
     let framed = match outcome {
       Outcome::Accepted(reply) | Outcome::Refused(reply) => reply

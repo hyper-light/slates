@@ -55739,6 +55739,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722's keepalive — A long push's answer writes git's keepalive while it is made (2026-11-20, w-git for UI goal 93; main's order: the two load-only edge tests)
+- **Why.** Over the HTTP edge a push's answer was made whole in the exchange's `body_end` and written only after it, so a
+  long push wrote nothing until its report: at a load of 56 to 67 the long-history edge tests' client gave up reading
+  after its 10 s wait. git's receive-pack writes `0005\1` (an empty band-1 packet) every `receive.keepAlive`, 5 s by
+  default, while it processes a pack under side-band-64k.
+- **Change.** `vcs_http::git::receive`: under side-band-64k a push is answered in `body_end` until its answer would have
+  been silent for `DaemonConfig::git_keepalive_ns` (`GIT_KEEPALIVE_NS`, git's 5 s), then in the reply's turns with
+  git's keepalive written whenever as long passes with nothing else to write; `Exchange::reply` is handed the client's
+  going (`ClientGone`) as `body_end` is, so a hook run in the reply's turns ends with its client. A push without
+  side-band is answered whole as before, and a refusal before any reply still answers with a status. The edge tests'
+  long-history requests now ask stock git's capabilities (`report-status-v2 side-band-64k ...`).
+- **Owed.** The silence before the reply begins: the edge's engine writes the status only once the body is read, while
+  git's `http-backend` writes its head before it reads the body, so a long pack's decode after the client's last byte
+  is silent (the two long-history tests still meet their 10 s read wait at a load of 40 to 50). The status written at
+  the head on a streamed route is an `http-edge` change (proposed to main).
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`
+  (a daemon whose interval is none: the answer begins with `0005\1`, its report whole after the keepalives);
+  `slates-server --lib -- vcs_http:: git_push:: vcs_ssh::` 156 passed, the two long-history tests (owed above) and
+  `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit` failing (its commit's texts not
+  made durable, `Unanswered`: Subversion's commit path, which this change does not touch); fmt clean (macOS arm64,
+  this Mac, local).
+
 ### A-722 part 4g — A replayed record's moves are admitted an object a turn (bug, 2026-11-20, w-git for UI goal 93; main's report: a restarted daemon recovering git/git's v2.0.0 spun and was killed again)
 - **Found by use.** r110 (w-interop, git v2.0.0): every daemon restarted after the push spun in A-662's recovery of the
   pushed repository (`daemon.rs` `spawn_alone`) and the watchdog killed it again, 7 of 27 steps answered.
@@ -56737,10 +56759,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Part 2, the build in turns.** `slates_merge::push::Building` owns a build across turns and borrows the green and
   the objects for one ([`Building::advance`]): the walk an entry of a tree a unit (`Comparing`: each side's listing
   named, then each name), the base a named path a unit (`Green::base_entries`, read at the push's base version, which
-  no later version changes), the composition, the post-state an operation or 64 KiB of zeros a unit, the identity a
-  piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or 64 KiB of the post-state a unit.
+  no later version changes), the composition, the post-state an operation or a copy slice of zeros a unit, the
+  identity a piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or a hash slice of the
+  post-state a unit. The slices are the owner's, derived from its measured memcpy and BLAKE3 rates and the quantum
+  (`pace::Slices`; the server's `copy_slice_bytes_within`, `archive_slice_bytes_within`; R3, main's 10:29 ruling).
   `build` is a `Building` run in one call. The deriver is `async` (R6): `compose_paced`'s every loop awaits a tick,
-  its sorts are a paced stable merge sort (`pace::sort_by`), its base lookups indexed (`BaseIndex`), so no unit is
+  its sorts are a paced stable merge sort of the input's own non-decreasing runs
+  (`pace::sort_by`, no tuned run length), its base lookups indexed (`BaseIndex`), so no unit is
   O(files); `compose_volume_planned` is its one-poll facade, one implementation. A `Pace` holds the turn's deadline
   and the owner's clock (a function: the merge engine reads no clock of its own); the first unit of a turn always
   runs; the composition is polled through `Pace::drive`, which lends the turn to the thread for that poll (a `Copy`

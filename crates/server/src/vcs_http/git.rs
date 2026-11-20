@@ -290,10 +290,10 @@ impl<U: Exchange, R: Exchange> Exchange for HalfExchange<U, R> {
     }
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed> {
     match self {
-      HalfExchange::Upload(upload) => upload.reply(out).await,
-      HalfExchange::Receive(receive) => receive.reply(out).await,
+      HalfExchange::Upload(upload) => upload.reply(out, gone).await,
+      HalfExchange::Receive(receive) => receive.reply(out, gone).await,
     }
   }
 }
@@ -326,12 +326,12 @@ impl<E: Exchange> Exchange for GitExchange<E> {
     self.service.body_end(gone).await
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed> {
     if !self.prelude.is_empty() {
       out.append(&mut self.prelude);
       return Ok(true);
     }
-    self.service.reply(out).await
+    self.service.reply(out, gone).await
   }
 }
 
@@ -436,7 +436,7 @@ impl<L: LfsService> Exchange for LfsExchange<L> {
     Ok(fields.unwrap_or_default())
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
     if let Some(mut answer) = self.answer.take() {
       out.append(&mut answer.body);
     }
@@ -481,10 +481,10 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     }
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed> {
     match self {
-      SiteExchange::Git(git) => git.reply(out).await,
-      SiteExchange::Lfs(lfs) => lfs.reply(out).await,
+      SiteExchange::Git(git) => git.reply(out, gone).await,
+      SiteExchange::Lfs(lfs) => lfs.reply(out, gone).await,
     }
   }
 }

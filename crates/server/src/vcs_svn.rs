@@ -200,6 +200,7 @@ const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hoo
 /// Format: why a configured hook is refused before this daemon has published its root mount (A-645 P3, main's ruling
 /// 1): a hook is shown its repository beneath the root mount, and there is none yet to show it under. Answered with
 /// [`UNSUPPORTED_FEATURE`], as the other hooks this server cannot run are.
+#[cfg(unix)]
 pub(crate) const ROOT_UNPUBLISHED_WORDS: &str =
   "This server cannot run this repository's hooks: its root mount is not yet published";
 

@@ -511,6 +511,13 @@ fn read_items_or_word(stream: &mut ClientStream) -> String {
   format!("{}{}", text(&word), read_items(stream, 1))
 }
 
+/// Removes the file at `path` from a test's own scratch directory.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
+fn remove_from_scratch(path: &std::path::Path) {
+  std::fs::remove_file(path).expect("the scratch file removed");
+}
+
 /// A hook program written as a shell script into `dir`, named for its point, made executable: its path. A hook's
 /// environment is its repository's hooks-env alone (A-623), so the script names every program by its absolute path.
 #[cfg(unix)]
@@ -676,7 +683,7 @@ fn a_hook_before_the_root_mount_is_published_is_refused_typed() {
   let at = dir.path.display().to_string();
   let accepting = hook_script(&dir.path, "start-commit", &format!("echo ran > {at}/ran"));
   // The warm-up run of `hook_script` wrote the mark; only a run of the commit's may write it again.
-  std::fs::remove_file(dir.path.join("ran")).expect("the warm-up's mark removed");
+  remove_from_scratch(&dir.path.join("ran"));
   let (_, committed, latest) = commit_under_hooks(3, None, |_| {
     vec![(
       slates_ipc::protocol::HookPointName::SvnStartCommit,
