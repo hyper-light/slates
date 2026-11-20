@@ -1725,6 +1725,20 @@ impl Repository {
     encoding.finish(self, store, clock, exchange)
   }
 
+  /// The first version whose fragments are not kept yet, by green and then version (A-718; §4.17.2
+  /// "A push" item 8): what the owner encodes next, so each version a push made is encoded once and
+  /// every fetch after copies its fragments rather than searching its objects for deltas again.
+  /// None once every version's fragments are kept.
+  pub fn first_unencoded(&self) -> Option<(u64, usize)> {
+    self.chains.iter().find_map(|(green, chain)| {
+      chain
+        .versions
+        .iter()
+        .position(|version| version.fragments.is_none())
+        .map(|version| (*green, version))
+    })
+  }
+
   /// What `green`'s version `version` brought, still to encode as its fragments; `None` once they
   /// are kept (A-653 continued (2)).
   pub(super) fn unencoded(
