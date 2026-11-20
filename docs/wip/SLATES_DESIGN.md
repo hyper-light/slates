@@ -12260,6 +12260,28 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > convergence plan's S3 (A-722: blobs as the push work's file ops, the git store an index); admission by the working
 > set; the verdicts and the seal a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
 
+**A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
+mirrored).** One server serves tens of thousands of concurrent clones, many of one repository, so an answer is held to
+four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, and Subversion's report cite:
+1. *Its working set is bounded whatever the repository's size.* The answer is made from what is stored (S5: revisions
+   kept as the deltas they arrived as, or the index's deltas) and sent as it is made, a slice at a time. Nothing holds
+   the whole answer, every text it sends, or a list of every revision it sends: across slices a fetch holds its place
+   (the log, the revision next), the one text a delta is made against, and tables of a bit or a word a changeset where
+   the protocol's order needs them (the missing set), charged as below.
+2. *Admission charges the slice in flight.* Each slice's bytes are charged to the request's room as they are made and
+   given back once sent; the tables of rule 1 are charged once, at the start. The answer's whole size never meets the
+   room, so a request's room bounds a slice, never a repository.
+3. *Every slice runs a turn at a time* under the shard's step quantum (§4.3), the repository's view lent for that turn
+   alone; a yield between slices.
+4. *Fetches run concurrently, one repository's too.* A fetch reads the index as it stood when it began (a hold on that
+   generation, given back as it ends), so a push landing meanwhile neither stops it nor changes its answer.
+
+> **Status (2026-11-20, A-745).** Red, by use: a clone whose answer is past one request's room is refused
+> `PastAdmission` (`vcs_http::daemon_edge`'s `a_mercurial_clone_larger_than_one_ring_region_...`, ignored until it
+> passes; w-interop's clone of Mercurial's 57,035 revisions, `asked: 228144, left: 218727`). Mercurial's `getbundle`
+> builds the whole answer, then frames it (`slates_hg::serve::getbundle`). Owed: the answer made and sent in slices
+> (Mercurial first, then its stream clone), git's upload-pack (w-git).
+
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
 > the tool named them by, read through `PushObjects` (tree entries, a blob's length, a blob's bytes; a store implements
