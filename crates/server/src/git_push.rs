@@ -1744,8 +1744,14 @@ impl ServerJudge<'_> {
       preparing,
       ..
     } = self;
-    let budget = state.config.step_quantum_ns() / 2;
+    let quantum = state.config.step_quantum_ns();
+    let budget = quantum / 2;
     let deadline = began.saturating_add(budget);
+    // A unit's bytes: the shard's copy and hash slices, derived from its measured memcpy and BLAKE3 rates (R3).
+    let slices = slates_merge::pace::Slices {
+      copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),
+      hash_bytes: state.config.archive_slice_bytes_within(quantum).max(1),
+    };
     let built = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
         return Ok::<bool, Declined>(true);
@@ -1765,6 +1771,7 @@ impl ServerJudge<'_> {
         pushed,
         preparing,
         (slates_rt::futures::now_ns, began, deadline),
+        slices,
       );
       Ok(built)
     })
