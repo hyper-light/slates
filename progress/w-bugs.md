@@ -68,3 +68,10 @@
   Run requests for main: Windows clippy of slates-ipc (marks_image is cfg(any(windows,test))); the Windows lanes'
   WinFsp suites now reachable.
 - Next: B3's answer from b3-5's fsx leg (running).
+- B3 REPRODUCED by use on main+A-717 (diag-w-bugs-b3-5, windows-latest x86_64): fsx seed 1 wedged after op 45
+  (TRUNCATE DOWN 0x3ced0 -> 0xde10, after a write past a hole / shrink / extend), ended at its 300 s bound; matches the
+  reviewed expected-failure line. Hypothesis (g258's GAPS "A delete racing a coherent purge"): WinFsp completes an
+  answered IRP on the sending thread; SetInformation's completion runs CcSetFileSizes there; a page fault/paging read
+  it needs can be received only by slates' single receive worker (A-198), which is the one sending -> deadlock.
+  Run 6 (diag-w-bugs-b3-6, worktree ~/slates-work/w-bugs-b3s, branch agents/w-bugs-b3-stacks = diag only): user-mode
+  stacks of every slates.exe/fsx.exe thread (cdb -pv) at 90/180/270 s into the wedge.
