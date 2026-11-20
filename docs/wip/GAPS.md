@@ -293,6 +293,21 @@
 > b94ae6e90); failing first, 16 of 105 with the resolution, the tree walk and the death's answer stubbed. Owed:
 > `sparse:oid` within `combine:` (refused: git's answer turns on its order of walk); the revision forms refused by
 > kind; git's band-2 warning of an ambiguous ref name; main's Linux and Windows runs, clippy, xtask, docs.
+> **A-640 part 4, fourth slice (2026-11-19, g296; names read with what git writes):** `upload::revision` reads a
+> `sparse:oid` filter's revision as git does but for its suffixes (an object's full name, a ref, `git describe`'s name,
+> and an abbreviated name of 4 to 64 digits by the store's search by prefix, `Repository::abbreviated` over
+> `slates-vcs`'s `Index::iter_from`), and relays what git's `pack-objects` writes meanwhile on band 2, before the pack
+> or the lines it dies with: the warning of a name that names a ref and something else, with git's advice for a ref
+> named like an object; an ambiguous abbreviation's error and its candidates (`Repository::unique_digits`, git's
+> descriptions). git's writes made one after another are relayed together in 128-byte reads, writes with an object read
+> between them apart (`answer::Said`). Held byte for byte to stock git 2.50.1's 14 new v2 recordings and one v0. macOS
+> arm64 (Mac Studio, kiln r472 over main be892650b with the slice): slates-git's `upload::`, `store::`, `tests::lfs`,
+> `tests::v0` and fixture sums 152 passed (4 ignored, main's), slates-vcs's `Index::iter_from` tests 2 of 2, fmt clean;
+> failing first (r459), with the search by prefix, the warning, the describe read, the read model and the unique
+> abbreviation stubbed, 7 of slates-git's 152 and slates-vcs's 2 failed. Owed: the suffixes `~`, `^`, `^{...}`, `@{...}`
+> and `:/<text>` (still refused by kind; the next slice), `sparse:oid` within `combine:`; main's Linux and Windows runs,
+> clippy, xtask, docs. Not git's: a commit's subject is taken from its bytes as stored (git re-encodes by its `encoding`
+> header); a date before 1970 in its zone (git dies of it) or past 9999 (git writes more digits).
 > **A-594 (2026-11-19, g294; piece 9's first part, the SSH transport):** `crates/ssh` (`slates-ssh`) serves RFC 4253 as a
 > sans-io core git's, Mercurial's and Subversion's SSH routes can share: the identification within 255 bytes; packets
 > under `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com` checked from their first four bytes; negotiation
@@ -367,6 +382,22 @@
 > 693bc8fe, fmt clean). Owed: the daemon keeping an SSH edge state on every shard as it starts the edge (A-684);
 > Subversion's tunnel moved to the shard of the repository its greeting names (A-688); a test of an arrival waiting
 > for a full shard's seat and of one refused past the bound; main's runs.
+> **A-688 (2026-11-19, g229; svn+ssh over slates' own SSH server, §4.17.4 piece 12):** `vcs_ssh::svn` serves the SSH
+> site's `svnserve -t` (`SvnServices` beside the other services): A-656's ra_svn connection over the channel, the
+> client's URL found as `find_repos` finds it (E125001, E125002, E210005), A-597's policy asked (E170001), the tunnel's
+> user the principal the key proved (its index key in hexadecimal), never the SSH login; sources lent a step at a time
+> (`SvnStores`); a commit begun, its hooks passed where none is configured, its work refused 200007; the tunnel ending
+> as `svnserve -t` 1.15.0 ends, held to stock recordings (the `mkdir` commit; scripted sessions recorded on the Mac
+> Studio, 2026-11-19) and end to end over the SSH edge (macOS arm64, Mac Studio, kiln r311: `--lib vcs_ssh::` red 26 of
+> 35, green 35 of 35; slates-svn `handshake:: serve::` 60 of 60; fmt clean; as it landed over main 693bc8feb, r377: 38
+> of 38 and 60 of 60). Owed: the lender of a Subversion store over A-662's map (the records A-655 part 2b keeps there, a
+> directory's entries from the green, the repository's `svnserve.conf` facts; the DAV site's own `SvnStores`, A-681,
+> waits for the same lender), without which the daemon's site cannot start the tunnel; the accepted work handed to A-655
+> part 2b's owner step (`repository::svn_commit::commit`); the tunnel moved to the shard of the repository its URL names
+> (A-651 part 4 moves a connection for a named repository); the daemon's edge (A-684); a configured hook run, not
+> refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve`
+> exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a
+> daemon.
 > **A-683 (2026-11-19, g302; git's receive-pack behind the SSH edge, A-654's SSH call):** the SSH site's
 > `git-receive-pack '<repo>'` runs A-654 part 2's driver (`vcs_ssh::receive`) on the shard the site found the
 > repository on, its owner, with no store lender (the driver reads the store the shard holds, A-662), each step lent the
@@ -377,7 +408,7 @@
 > git 2.50.1's `create` push over a real SSH session to the production site lands (`--lib -- vcs_ssh git_push`: red 28
 > passed and the 2 new failing at 954ed792e; with `vcs_http`, 74 of 74 over main b94ae6e90, r286, then 77, 82, 84
 > and 85 of as many over each merge as main moved, r313, r354, r375 and r403, and with `vcs_store::upload` 92 of 92
-> over 5206419be, r454; macOS arm64, Mac Studio).
+> over 5206419be, r454, and 106 of 106 over be892650b, r492; macOS arm64, Mac Studio).
 > Owed: a push over a connection A-651 part 4 moved to its owner shard (a two-shard daemon, as the HTTP site's push
 > test runs); main's live `git push` over SSH.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
@@ -775,6 +806,16 @@
 > driver (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until
 > they land); git's words for each outcome. Found, reported to main: a git hook inherits the daemon's `GIT_*` repository
 > variables, which `update` and `post-receive` would read in place of the view's objects.
+> **A-665 part 3 (2026-11-19, g293; git's push runs its hooks):** `slates-server` (`git_push`, its `hooks`) runs
+> `pre-receive`, `update` and `post-receive` as receive-pack 2.50.1 does, a step at a time (a view sealed in the
+> shard's slices, the hook run by the edge off the shard's step), in git's words (`pre-receive hook declined`; `hook
+> declined` with `error: hook declined to update <ref>`; accepted hooks' and `post-receive`'s words on band 2, the
+> report's last flush after `post-receive`), over a presenter seam (`git_hooks::PresentView`). Held by tests through a
+> presenter that writes each view into a scratch directory (macOS arm64, Mac Studio, kiln r430: red 3 of 3 with the
+> hooks stubbed out; green 52 of 52 and slates-git's 49 of 49). Owed: the daemon's
+> presenter, a read-only attachment the mount edges serve (a read-only volume whose base-plane host reads the
+> repository's content store, under the root mount): until it lands a push whose repository configures a git hook is
+> refused `hook not run`, as before; the edges' signal of a client gone; the hooks' learned times; the SSH channel's call.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
@@ -1134,6 +1175,14 @@
 > goes first on every connection and Basic with the token as password is taken on the loopback edge (A-686, g258,
 > main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299); and
 > over SSH the same lender, which the edge's `serve --stdio` (A-679, built) reads as the HTTP site does (A-680).
+> Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
+> token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
+> round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
+> bootstrapped, as A-685's test starts one) and run the verbs with `run_as_issuer`, skipping loudly on Linux, whose
+> surface is a descriptor only the anchor's children hold. macOS arm64 (Mac Studio, kiln r471 over main be892650b,
+> stock hg 7.2 through `uvx`): `-- stock_hg --ignored --test-threads=1` the HTTP round trip past `repository create`
+> and `credential token` to its wait (`hg push` refused, A-680 part 2b and A-686); the SSH round trip still stops at
+> `slates: unknown flag --vcs-ssh` (A-684), before its credential step.
 > **Built (A-679, 2026-11-19, g304): `serve --stdio` behind the daemon's SSH edge.** `vcs_ssh::hg` runs A-650 part 2's
 > `serve::stdio` over an SSH session, started by `ToolServices` (beside upload-pack, `ToolCommand`) over the store the
 > HTTP site's lender holds (`HgStores`; in the daemon `ServedViews`, A-680 part 2a); the site refuses a repository
@@ -1267,7 +1316,7 @@
 > again where its verdict's facts moved (FSFS's merge again at the youngest, the locks as they stand,
 > `Repository::judge_again`); the green's next version and the revision's record (`commit::record`) one entry through
 > A-635's append; the records replayed by a recovery (see A-655 part 2b). Owed from it: the svn:// connection task's
-> call (A-656) and the import's (A-652 part 3); the lock verbs' entries recorded; a directory deleted or replaced
+> call (A-656; the import's built, A-652 part 3); the lock verbs' entries recorded; a directory deleted or replaced
 > beneath a copy of an older revision, and a kind-changing replacement without history, refused `Unsupported` until the
 > engine lists a tree at a version and composes a kind change (§8f); the records' texts held once. A-602 (2026-11-19,
 > g250): the lock table, the guards of `lock` (with
@@ -1380,11 +1429,19 @@
 > alone on main from its seed (see A-628). The export in format 3 built by A-652 (2026-11-19, g264): Subversion's
 > deltifier ported as `svndiff::deltas(source, target, window room)`, the crate's one delta generator, remaking every
 > window `svnadmin dump --deltas` wrote, `deltas.dump` and `part2.dump` written again byte for byte (413 of 413 on the
-> Mac Studio, red first 4 of 413); A-616's drive takes its changed texts' deltas from it. Owed from it: the wiring, after
-> A-655's owner commit step, since an imported revision commits through it (A-652's third part; a
-> `CreateRepository` repository's records on its
-> shard, texts in the shared object store, the two verbs on the control channel, an import or export sliced under the
-> shard's budget); main's: clippy and `xtask` over the module. Found by it and fixed by A-652 (2026-11-19, g264): the
+> Mac Studio, red first 4 of 413); A-616's drive takes its changed texts' deltas from it. A-652 part 3 (2026-11-19,
+> g268, UI goal 93): the import verb. `ImportRepository` on a Subversion repository imports the dump in a host file,
+> read as a base, a turn at a time on the owner shard (`vcs_store::svn_import`); the import hands each record it makes
+> to its caller's step and reads on once it is committed (`Importing::Commit`), each revision through A-655's step and
+> the UUID and revision 0's properties each an entry of their own that moves no green (`Record::Uuid`,
+> `Record::RevisionProperties`, `svn_commit::record`; A-635's append records an entry of no change holding its caller's
+> record alone), so every imported revision is durable as it lands and a refusal keeps the ones before it; answered
+> `DumpImported`, or `ImportRefused { Subversion }` with Subversion's number, the revision and the path (see A-652 part
+> 3). Owed from it: the export verb (a range written as a dump into a volume, landed under a grant, §4.15), sliced under
+> the shard's budget; the records' texts in the shared object store; an import resumed across a restart (the committed
+> revisions are recovered; a request sent again refuses a stream that starts before the revision after the youngest);
+> the CLI's and the SDKs' words for the verb; main's: clippy and `xtask` over the modules. Found by it and fixed by
+> A-652 (2026-11-19, g264): the
 > index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
 > comes first; it takes it now as the copy FSFS makes, the index's and the verdict's oracles holding such replacements
 > (`cargo test -p slates-svn --lib --locked` 367 of 367 on the Mac Studio, red first 5 of 367). Designed
@@ -1505,7 +1562,8 @@
 > own for `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s
 > `get-dir`, compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at
 > once, where `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH
-> tunnel's entry point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's
+> tunnel's entry point (built since, A-688; one learned-wait mechanism for the three edges, after A-625's and A-651's
+> land); the daemon's
 > commit through A-655 part 2b's step (`repository::svn_commit::commit`, built); the lock verbs; the read commands'
 > authentication for one command with their
 > authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
@@ -1541,7 +1599,14 @@
 > `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
 > no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
 > differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
-> the file is Unix-only, as `tests/cli.rs` is).
+> the file is Unix-only, as `tests/cli.rs` is). Each slates leg mints its credential with the anchor's issuer surface
+> since 2026-11-19 (g309, main's ruling): `start_anchor` reads the surface beside the serving line, and `credential
+> token` and `credential key`, the issuer's verbs, run with it (`slates_as_issuer`), each leg skipping loudly on Linux,
+> whose surface is a descriptor only the anchor's children hold. macOS arm64 (Mac Studio, kiln r471 over main
+> be892650b): `--ignored --test-threads=1`, the `svn://` leg and both `http://` legs past `repository create` and the
+> token to their waits (`svn checkout`: `E210005 No repository found`, A-689's lookup; `E160013 '/project' path not
+> found`, A-681's later parts); `svn+ssh://` still stops at `slates: unknown flag --vcs-ssh` (A-684), before its
+> credential step; the control 1 passed.
 > Part 2, first slice, 2026-11-19 (A-689): the svn:// listener. `slates anchor|daemon --vcs-svn ADDRESS` (loopback alone
 > without `--fleet`; one address reader with `--vcs-http`) starts it on the control shard, its port logged; on Unix the
 > anchor binds it once and hands it to every daemon (`ENV_VCS_SVN`), so a restart never drops its port. Each connection,

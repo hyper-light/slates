@@ -19,8 +19,8 @@ use super::{
   TICK_NS, Transcript, blob, put_string, query, send_data, sign, transcript,
 };
 use crate::daemon::{audit_daemon, observe_first};
-use crate::git_push::ReceivePack;
 use crate::git_push::tests::{chain, files, git_repository, gits_report, owner, text};
+use crate::git_push::{ReceivePack, Unpresented};
 use crate::state::ShardState;
 use crate::vcs_http::Bounds;
 use crate::vcs_http::ShardRepositories;
@@ -89,8 +89,14 @@ type DaemonServices = ToolServices<ShardStores, ServedViews, ThisShard>;
 fn serving(state: &mut ShardState) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
   let repository = git_repository(state, NAME);
   let mut advertised = Vec::new();
-  ReceivePack::start(state, (&owner(), repository), (ROOM, true), &mut advertised)
-    .expect("the owner's push starts");
+  ReceivePack::start(
+    state,
+    (&owner(), repository),
+    (ROOM, true),
+    &mut advertised,
+    Unpresented,
+  )
+  .expect("the owner's push starts");
   let bounds = Bounds::of_shard(ONE_SEAT, ROOM_BYTES, TICK_NS);
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), bounds.backlog())
     .expect("a loopback listener");

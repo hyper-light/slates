@@ -7,6 +7,7 @@ mod clone;
 mod fetch;
 mod fragments;
 mod ls_refs;
+mod names;
 mod refused;
 mod sparse;
 mod steps;
