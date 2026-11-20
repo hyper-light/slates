@@ -55542,3 +55542,23 @@ control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, 
 - **Owed.** `Record::revision_bytes` (Subversion) and the register entry's decode-after-encode check still make
   revision-sized temporaries; the svn commit still clones its entry parts for a retry at the chain's cap; an embedding
   host must install the allocator itself; the anchor content object's 581 MiB is not yet split by range.
+
+### A-732's sibling for git and Subversion — A store made again from the log replays a record a turn, lent to nothing until it is whole (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** `vcs_store::rebuild` made a git or Subversion repository's store again in one step, every record replayed
+  and every map made at once; a large repository's rebuild held its shard past the watchdog's window, which
+  crash-looped the daemon when a recovery met it, as Mercurial's import did (A-732, whose part 3 sliced Mercurial's).
+- **Change.** `rebuild` of a git or Subversion repository (`rebuild_sliced`): the store freed and made empty, marked
+  rebuilding with a generation (`VcsStores::rebuild_turns`), and a task replays its records a record a turn
+  (`rebuild_turn`, a yield between); while it runs the store is lent to nothing (`VcsStores::git`, `git_ref`, `store`,
+  `subversion`, `subversion_records` answer none), and a rebuild started again ends the one before. At its end the store
+  is lent again and each git green's map is made again in slices by its build (`paths::whole_build::start_remade`,
+  counted `REMADE`), whose end makes any commit owed; submits to it are parked meanwhile. `rebuild_whole` stays for the
+  tests that read a store made at once.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::tests::
+  t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn` (red first: the store made whole at once and lent;
+  green: rebuilding and lent to nothing, its five records replayed one a turn, then lent again and its map made again).
+  The tests that make a store again drive its turns and builds to their end (`settle_rebuild`). `cargo test --locked -p
+  slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http:: vcs_ssh:: vcs_svn lfs:: work_home:: identities::
+  takeover:: --test-threads=4` 307 of 309, the two others failing alike without this change (`vcs_store::homes`' and
+  `vcs_http::daemon_edge`'s long history, each flaky alone, reported); fmt clean.
+- **Owed.** One git record (a large push's pack) is still one turn; a successor's rebuild (`make_whole`) is one step.

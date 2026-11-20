@@ -1420,6 +1420,7 @@ pub(crate) fn assert_made_again_whole(
   let count = u64::try_from(records(state, repository).len()).expect("a count");
   let replayed = state.refusals.get(super::REPLAYED).copied().unwrap_or(0);
   super::rebuild(state, repository);
+  super::settle_rebuild(state, repository);
   assert_eq!(state.vcs_stores.unrecovered(repository), None);
   let made = {
     let (content, store) = state
@@ -1805,4 +1806,51 @@ fn an_http_commit_idle_past_the_edges_idle_bound_is_released() {
     .take_dav_commit(id, b"alice", ("0-1", 2_600))
     .is_some();
   assert_eq!((found, kept, after), (true, 1, false));
+}
+
+/// A git repository of `pushes` pushes to its root green, each a commit changing `README` over the one before: its id
+/// and root.
+fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId, DbVolumeId) {
+  let (repository, root) = repository(state, name, VcsTool::Git);
+  let mut parent: Option<(ObjectId, ObjectId)> = None;
+  for push in 0..pushes {
+    let files = [(b"README".to_vec(), format!("push {push}\n").into_bytes())];
+    let parents: Vec<ObjectId> = parent.iter().map(|(commit, _)| *commit).collect();
+    let (objects, commit) = commit_of(&files, &parents, FIRST_DATE.saturating_add(push));
+    let tree = tree_of(&objects);
+    let base = parent.map(|(_, tree)| tree);
+    push_through(state, (repository, root), &objects, (base, commit, tree));
+    parent = Some((commit, tree));
+  }
+  (repository, root)
+}
+
+/// A-732's sibling for git (main's ruling of 2026-11-20: a large repository's rebuild in one step spun past the
+/// watchdog and crash-looped the daemon). Do: push five commits to a git repository; make its store again from the log.
+/// Expect: the rebuild under way and the store lent to nothing; its five records replayed one a turn; then the store
+/// lent again and its green's map made again by its build. Red before the change: the store was made whole at once.
+#[test]
+fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = pushed_many(state, "sliced-rebuild", 5);
+    let records = records(state, repository).len();
+    super::rebuild(state, repository);
+    let during = (
+      state.vcs_stores.rebuilding(repository),
+      state.vcs_stores.git_ref(repository).is_none(),
+    );
+    let mut turns = 0usize;
+    while super::rebuild_turn_once(state, repository) {
+      turns = turns.saturating_add(1);
+    }
+    let lent =
+      state.vcs_stores.git_ref(repository).is_some() && !state.vcs_stores.rebuilding(repository);
+    crate::vcs_store::paths::whole_build::settle(state);
+    let mapped = state
+      .vcs_stores
+      .git_ref(repository)
+      .is_some_and(|(_, git)| git.heads.contains_key(&green_key(root)));
+    (during, turns == records && records == 5, lent, mapped)
+  });
+  assert_eq!(seen, ((true, true), true, true, true));
 }
