@@ -700,6 +700,10 @@ pub struct Green {
   /// The content history values that name a file's block instead of copying its bytes, and those bytes (A-728's
   /// non-vacuity counters: a block named by the history instead of copied).
   history_named: (u64, u64),
+  /// The splices whose added runs name the file's new block (A-728 part 2), and those values' bytes.
+  history_spliced_named: (u64, usize),
+  /// The superseded values sealed by a copy of the runs they alone named, and the bytes copied (A-728 part 2).
+  history_sealed: (u64, u64),
   /// The bytes every content history value's piece list costs, a running total.
   history_lists: usize,
   /// The bytes of every path's latest content value and its piece list (the current files, as the history holds
@@ -2833,6 +2837,13 @@ impl Green {
     self.history_named
   }
 
+  /// The splices whose added runs named the file's new block instead of a copy, and those values' bytes; and the
+  /// superseded values sealed by copying out the runs they alone named, and the bytes copied (A-728 part 2's
+  /// non-vacuity counters).
+  pub fn history_splices_named(&self) -> ((u64, usize), (u64, u64)) {
+    (self.history_spliced_named, self.history_sealed)
+  }
+
   /// The bytes the content history owns, copied out of files (A-728: what a value stored whole no longer copies).
   pub fn history_owned_bytes(&self) -> usize {
     self.chunks.owned_bytes()
@@ -2848,17 +2859,56 @@ impl Green {
       content,
       ..
     } = self;
+    let block = content.block_of(path);
     let spliced = content_history
       .get(path)
       .and_then(|history| history.last())
       .and_then(|(_, value)| value.as_ref())
-      .and_then(|latest| {
-        let next = content.get(path).unwrap_or_default();
-        latest.spliced(chunks, content.blocks(), ops, next)
+      .zip(block)
+      .and_then(|(latest, block)| {
+        let blocks = content.blocks();
+        latest.spliced(chunks, (blocks, block), ops, blocks.bytes(block))
       });
-    match spliced {
-      Some(value) => value,
-      None => self.named_value(path),
+    match (spliced, block) {
+      (Some((value, named)), Some(block)) => {
+        // The added runs are the file's block (A-728 part 2): the chunk naming it takes its holder.
+        if named {
+          content.blocks_mut().hold(block);
+          let (values, bytes) = self.history_spliced_named;
+          self.history_spliced_named =
+            (values.saturating_add(1), bytes.saturating_add(value.len()));
+        }
+        value
+      }
+      _ => self.named_value(path),
+    }
+  }
+
+  /// Seals `path`'s latest content value as a change supersedes it, the file map having let its block go
+  /// (`crate::history::Value::seal`, A-728 part 2): the runs it alone names of a block nothing else holds are copied out
+  /// and the block let go, counted.
+  fn seal_latest(&mut self, path: &str) {
+    let Green {
+      content_history,
+      chunks,
+      content,
+      history_sealed,
+      ..
+    } = self;
+    let Some(latest) = content_history
+      .get_mut(path)
+      .and_then(|history| history.last_mut())
+      .and_then(|(_, value)| value.as_mut())
+    else {
+      return;
+    };
+    let copied = latest.seal(chunks, content.blocks_mut());
+    if copied > 0 {
+      let (values, bytes) = *history_sealed;
+      *history_sealed = (
+        values.saturating_add(1),
+        bytes.saturating_add(u64::try_from(copied).unwrap_or(u64::MAX)),
+      );
     }
   }
 
@@ -4612,6 +4662,7 @@ impl Green {
       .insert(IdentityKey::File(path.to_owned()));
     self.seed_content(path, version);
     self.content.remove(path);
+    self.seal_latest(path);
     self.last_changed.insert(path.to_owned(), version);
     self.file_removed.insert(path.to_owned(), version);
     self.push_content(path.to_owned(), version, None);
@@ -4634,8 +4685,9 @@ impl Green {
     // gains is the bytes the new value added, its piece list, and whatever the old one held that the new one does not,
     // the retention charged to the running totals.
     self.seed_content(&path, version);
-    // The file first, so the value names its block where it is stored whole (A-728).
+    // The file first, so the value names its block (A-728); the value it supersedes sealed before it is spliced from.
     self.content.insert(&path, bytes);
+    self.seal_latest(&path);
     let value = self.content_value(&path, &ops);
     self.last_changed.insert(path.clone(), version);
     self.push_content(path.clone(), version, Some(value));
@@ -5552,12 +5604,61 @@ impl Green {
   /// dropped value releases its chunks.
   fn fold_content_before(&mut self, floor: u64) {
     let mut dropped = Vec::new();
-    for history in self.content_history.values_mut() {
-      dropped.extend(fold_entries(history, floor));
+    let mut alone = Vec::new();
+    for (path, history) in &mut self.content_history {
+      let folded = fold_entries(history, floor);
+      if !folded.is_empty() && history.len() == 1 {
+        alone.push(path.clone());
+      }
+      dropped.extend(folded);
     }
     for (_, value) in dropped {
       self.release_content(value);
     }
+    for path in alone {
+      self.rename_alone(&path);
+    }
+  }
+
+  /// A path the fold left only its latest value, which is its current file: that value made the file's block, named
+  /// whole (A-728), so the earlier blocks and chunks it shared runs of are let go. Every read of the latest version is
+  /// the head's, and the verdict's head value is the file's bytes either way. A path whose value is a copy's (A-586), or
+  /// whose latest value is a removal or names the block already, is left as it is.
+  fn rename_alone(&mut self, path: &str) {
+    let history = self.content_history.get(path);
+    if self.covered_since(path, last_entry(history)).is_some() {
+      return;
+    }
+    let Some(block) = self.content.block_of(path) else {
+      return;
+    };
+    let Some(latest) = history
+      .and_then(|history| history.last())
+      .and_then(|(_, value)| value.as_ref())
+    else {
+      return;
+    };
+    if latest.is_block(&self.chunks, block) {
+      return;
+    }
+    let named = self.named_value(path);
+    let Some((_, slot)) = self
+      .content_history
+      .get_mut(path)
+      .and_then(|history| history.last_mut())
+    else {
+      return;
+    };
+    let old = slot.replace(named);
+    let new_cost = slot.as_ref().map_or(0, current_bytes);
+    let new_list = slot.as_ref().map_or(0, crate::history::Value::list_bytes);
+    let old_cost = old.as_ref().map_or(0, current_bytes);
+    self.history_current = self
+      .history_current
+      .saturating_sub(old_cost)
+      .saturating_add(new_cost);
+    self.history_lists = self.history_lists.saturating_add(new_list);
+    self.release_content(old);
   }
 
   /// Folds the IPC history below `floor`, its earlier nodes leaving the running total.

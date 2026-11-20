@@ -48,11 +48,12 @@ fn balanced(green: &Green) {
   );
 }
 
-/// A-728 (the shared path's non-vacuity counter). Do: create a 64 KiB file, replace it whole, overwrite 8 of its
-/// bytes, then fold the history to the head. Expect: the create and the whole replace each name the file's block (the
-/// counter moves by two values and 128 KiB) and the history owns no byte after them; every version reads back exactly;
-/// the history retains the replaced version's 64 KiB, its block, and its one piece; the small overwrite owns its 8 bytes and names
-/// nothing; the fold keeps the head readable; the running totals equal their recount throughout.
+/// A-728 (the shared path's non-vacuity counters). Do: create a 64 KiB file, replace it whole, overwrite 8 of its
+/// bytes, overwrite 4 more, remove it, then fold the history to the head. Expect: the create and the whole replace each
+/// name the file's block (two values, 128 KiB) and the history owns no byte after them; the history retains the replaced
+/// version's 64 KiB, its block, and its one piece; the first overwrite's added runs name the new block, nothing copied;
+/// the second seals it (its 8 bytes copied out, its block let go) and the removal seals the second (4 more); every
+/// version reads back exactly; the fold keeps the head; the running totals equal their recount throughout.
 #[test]
 fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
   const LEN: u64 = 64 * 1024;
@@ -102,13 +103,14 @@ fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
   assert_eq!(
     green.history_blocks_named(),
     (2, 2 * LEN),
-    "a splice names nothing"
+    "a splice names no whole block"
   );
   assert_eq!(
-    green.history_owned_bytes(),
-    8,
-    "a splice owns what it added"
+    green.history_splices_named(),
+    ((1, usize::try_from(LEN).unwrap()), (0, 0)),
+    "the splice's added runs name the new block (A-728 part 2)"
   );
+  assert_eq!(green.history_owned_bytes(), 0, "the splice copied nothing");
   assert_eq!(green.content("f"), Some(third.as_slice()));
   assert_eq!(
     green.content_ref_at("f", 2).as_deref(),
@@ -120,11 +122,53 @@ fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
   );
   balanced(&green);
 
-  green.fold_history_before(3);
-  assert_eq!(green.content("f"), Some(third.as_slice()));
+  let again = green.submit(&increment(
+    4,
+    3,
+    "f",
+    &[(OpKind::Overwrite, 200, 4)],
+    b"WXYZ",
+  ));
+  assert_eq!(again, Outcome::Accepted { version: 4 });
+  let mut fourth = third.clone();
+  fourth[200..204].copy_from_slice(b"WXYZ");
+  assert_eq!(
+    green.history_splices_named(),
+    ((2, 2 * usize::try_from(LEN).unwrap()), (1, 8)),
+    "superseded, version 3 is sealed: its 8 bytes copied out, its block let go"
+  );
+  assert_eq!(green.history_owned_bytes(), 8);
+  assert_eq!(green.content("f"), Some(fourth.as_slice()));
   assert_eq!(
     green.content_ref_at("f", 3).as_deref(),
     Some(third.as_slice())
   );
+  assert_eq!(
+    green.content_ref_at("f", 2).as_deref(),
+    Some(second.as_slice())
+  );
+  balanced(&green);
+
+  let removed = green.submit(&{
+    let mut inc = increment(5, 4, "f", &[(OpKind::Unlink, 0, 0)], b"");
+    inc.doc.ops[0].src = u64::MAX;
+    inc
+  });
+  assert_eq!(removed, Outcome::Accepted { version: 5 });
+  assert_eq!(green.content("f"), None);
+  assert_eq!(
+    green.history_splices_named().1,
+    (2, 12),
+    "a removal seals the value it supersedes"
+  );
+  assert_eq!(
+    green.content_ref_at("f", 4).as_deref(),
+    Some(fourth.as_slice())
+  );
+  balanced(&green);
+
+  green.fold_history_before(5);
+  assert_eq!(green.content("f"), None);
+  assert_eq!(green.content_ref_at("f", 5).as_deref(), None);
   balanced(&green);
 }
