@@ -35,3 +35,16 @@
   slates-server + kiln build won't fit. Asked main for space.
 - GitHub: run 44782069370 cancelled by newer pushes; run 44784299374 (0a17f46e5) carries `windows (Slates tests)`
   job 136462100187 and windows-latest build 136462100146 -- watching.
+
+## 2026-11-20 ~11:10 PST: kiln builds + clippy clean on Windows -- LANDED da441f112
+- jupiter C: freed by main (r865): 309 GB free. My ONE target: C:\Users\corph\w-k90-win\target; clone ...\w-k90-win\kiln.
+- r12 (jupiter, 83a03cd1): kiln lib did NOT compile on Windows: workspace/slates.rs:1231 `unmount_busy` (cfg(not(windows))
+  in Slates) from fa86489f5. GitHub job 136462100146 (run 44784299374, 0a17f46e5) also showed clone_on_copy + redundant
+  closure (annotation capped at 4096 chars).
+- Fix: let_go_busy cfg'd (Windows keeps the volume, MountStays + context), clippy fixes/allows. r18 (jupiter, tree
+  8462b0b5 = fix on 715063153): `cargo clippy -p kiln --all-targets --locked -- -D warnings` exit 0.
+- LANDED kiln main da441f112 (is-ancestor confirmed; main was 715063153).
+- Running r19 (jupiter): kiln.exe build + `KILN_TEST_KILN=... cargo test -p kiln --lib -- workspace::bare_metal_tests`.
+- jupiter has NO Python 3: slates_e2e bare_metal drives skip without it (NO_PYTHON, even with SLATES_E2E=1). Python is
+  an install -> asked main for Ada's word. GitHub windows-latest has Python (job `windows (Slates tests)`).
+- w-k90-pin added `slates` job (715063153) on ubuntu/macos/windows-11-arm; mine (`windows (Slates tests)`) is windows-latest.
