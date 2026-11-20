@@ -96,7 +96,7 @@ impl Fixture {
         .text(&text.identity, u64::try_from(bytes.len()).unwrap())
         .filter(|piece| !piece.is_empty())
       {
-        bytes.extend_from_slice(piece);
+        bytes.extend_from_slice(&piece);
       }
     }
     bytes
