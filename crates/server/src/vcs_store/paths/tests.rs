@@ -678,3 +678,48 @@ fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
     (2, (Some(b"alpha".to_vec()), Some(b"alpha".to_vec())), 1)
   );
 }
+
+/// Main's ruling of 2026-11-20 (a copy through a work of a tree holding a hard link; found by use through MCP, refused
+/// as a `TypeChanged` conflict at the destination before). Do: submit `/d/g.txt` and a hard link `/d/hard.txt` to it;
+/// then submit a work copying `/d` to `/e`. Expect: the copy accepted; `e/hard.txt` names `e/g.txt`, the copy's node, and
+/// reads its bytes; `d/hard.txt` still names `d/g.txt`.
+#[test]
+fn t_a626_p4_a_work_copies_a_tree_holding_a_hard_link() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let at = git_repository(state, "linked");
+    let link = Op::Declare(WorkOp::Link {
+      path: "/d/hard.txt".to_owned(),
+      target: "/d/g.txt".to_owned(),
+    });
+    version(state, at.1, 1, vec![create("/d/g.txt", b"keep"), link]);
+    let copy = Op::Declare(WorkOp::Copy {
+      from: "/d".to_owned(),
+      to: "/e".to_owned(),
+      version: None,
+      replace: false,
+    });
+    let second = version(state, at.1, 2, vec![copy]);
+    let engine = state
+      .greens
+      .get(&to_db_volume(at.1))
+      .expect("the green's engine");
+    let linked = (
+      engine.hardlink("e/hard.txt").map(str::to_owned),
+      engine.content("e/g.txt").map(<[u8]>::to_vec),
+      engine.hardlink("d/hard.txt").map(str::to_owned),
+    );
+    drop(engine);
+    (second, linked)
+  });
+  assert_eq!(
+    seen,
+    (
+      2,
+      (
+        Some("e/g.txt".to_owned()),
+        Some(b"keep".to_vec()),
+        Some("d/g.txt".to_owned())
+      )
+    )
+  );
+}

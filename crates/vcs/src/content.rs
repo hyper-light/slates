@@ -168,6 +168,18 @@ pub trait WindowStorage: std::fmt::Debug {
   fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>>;
   /// Lets the bytes kept under `window` go.
   fn release(&mut self, window: StoredWindow);
+
+  /// Takes in `lent`, when it is what this storage keeps its windows in and none is lent to it now (A-727: the shard's
+  /// chunk store, lent for one step), leaving what it held in its place: whether it took it. A storage that keeps its
+  /// windows itself takes nothing.
+  fn lend_in(&mut self, _lent: &mut dyn std::any::Any) -> bool {
+    false
+  }
+
+  /// Hands back what [`WindowStorage::lend_in`] took, exchanging it with `lent` again: whether it held one.
+  fn hand_back(&mut self, _lent: &mut dyn std::any::Any) -> bool {
+    false
+  }
 }
 
 /// The windows kept in the process's memory: the storage of a store made with [`ContentStore::new`], for tests and
@@ -813,6 +825,17 @@ impl ContentStore {
       Kept::Here(bytes) => Some(Cow::Borrowed(bytes)),
       Kept::Stored { window, .. } => self.storage.read(*window),
     }
+  }
+
+  /// Lends `lent` to the window storage for one step (A-727): whether it took it ([`WindowStorage::lend_in`]). The
+  /// lender hands it back with [`ContentStore::hand_back`] once the step ends.
+  pub fn lend_in(&mut self, lent: &mut dyn std::any::Any) -> bool {
+    self.storage.lend_in(lent)
+  }
+
+  /// Hands back what [`ContentStore::lend_in`] lent: whether the storage held one.
+  pub fn hand_back(&mut self, lent: &mut dyn std::any::Any) -> bool {
+    self.storage.hand_back(lent)
   }
 
   /// A store whose windows are kept by `storage` (A-727: the daemon's shard repository arena), otherwise as

@@ -1919,10 +1919,18 @@
 > `Record::RevisionProperties`, `svn_commit::record`; A-635's append records an entry of no change holding its caller's
 > record alone), so every imported revision is durable as it lands and a refusal keeps the ones before it; answered
 > `DumpImported`, or `ImportRefused { Subversion }` with Subversion's number, the revision and the path (see A-652 part
-> 3). Owed from it: the export verb (a range written as a dump into a volume, landed under a grant, §4.15), sliced under
-> the shard's budget; the records' texts in the shared object store; an import resumed across a restart (the committed
-> revisions are recovered; a request sent again refuses a stream that starts before the revision after the youngest);
-> the CLI's and the SDKs' words for the verb; main's: clippy and `xtask` over the modules. Found by it and fixed by
+> 3). The export verb (A-652 part 3 continued, 2026-11-20): `ExportDump` writes a range as `svnadmin dump` does into a
+> new volume holding `DUMP_FILE`, walked twice a revision a unit (measured, then written a copy slice at a time, both
+> hashed, a differing second walk refused), the caller landing the volume under a grant; landed by w-svn from g268's
+> work, with a fix found by its own test: two exports side by side minted one volume id at their walks' end, the
+> second refused `AlreadyExists` at its record, so the id is minted in the publishing atom now. **Owed, measured
+> 2026-11-20 (debug, this MacBook):** a unit is one revision whole, the exporter writing a revision or nothing
+> (`migration::export`), so a revision's texts are staged whole and its unit is unbounded: against a 14 µs copy-slice
+> budget, a 195-byte revision took 60 µs and one with a 107 KB text 2.4 ms, `image.units_past_budget` 87 over the
+> test's two exports; next piece: the exporter resumable inside a revision, a text a window at a time (§4.17.4 item
+> 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
+> words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
 > index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
 > comes first; it takes it now as the copy FSFS makes, the index's and the verdict's oracles holding such replacements
@@ -1940,7 +1948,10 @@
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). A-586 (2026-11-19, g295): the engine's `Copy` (`OpKind` 16), built: recorded once at its
 > destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
-> key, the identity one entry a copy, hard links refused by kind, the root a source and never a destination, a branch
+> key, the identity one entry a copy, hard links refused by kind (BUILT 2026-11-20, w-shared, main's ruling: a copied
+> tree's links share the copy's nodes, a link naming a node outside it gets a node of its own, `Green::copy_link_effects`;
+> refused only where that outside node changed after the copy's version, still as `TypeChanged`, owed its own typed
+> refusal), the root a source and never a destination, a branch
 > made before a copy cutting it, a review comment on a copied file moving with it (A-596); held to a reference green
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain
