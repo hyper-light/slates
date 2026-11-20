@@ -275,6 +275,10 @@ pub(crate) fn keep_here(
 
 /// The bytes of the window `identity` this shard keeps as its home, if it keeps it.
 pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<Vec<u8>> {
+  // The content store made first where a recovery left it unmade (no repository yet), so what the shard image restored
+  // (windows, lists, names, region holds) is taken in before the read.
+  let window = state.store.content.chunk_bytes();
+  state.vcs_stores.content_made(window).ok()?;
   let bytes = {
     let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
     lent.stores.content.as_ref().and_then(|content| {
@@ -293,6 +297,11 @@ pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<
 
 /// Lets go one holder of the window `identity` this shard keeps as its home; freed with its last, the charge settled.
 pub(crate) fn let_go_here(state: &mut ShardState, identity: &ContentId) -> Result<(), HomeRefused> {
+  let window = state.store.content.chunk_bytes();
+  state
+    .vcs_stores
+    .content_made(window)
+    .map_err(HomeRefused::Content)?;
   let held = state
     .vcs_stores
     .content
@@ -543,6 +552,65 @@ std::thread_local! {
   /// windows its content store holds.
   static REGION_HELD: std::cell::RefCell<std::collections::BTreeSet<ContentId>> =
     const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+  /// The region holds kept (true) or let go (false) since the shard's last committed publication: what a delta of the
+  /// shard image carries ([`region_changes`]), so a home's holds survive its restart (A-724 piece 8c). Bounded by them.
+  static REGION_CHANGES: std::cell::RefCell<std::collections::BTreeMap<ContentId, bool>> =
+    const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Marks the region hold of `identity` kept or let go since the last committed publication ([`REGION_CHANGES`]).
+fn region_changed(identity: ContentId, held: bool) {
+  REGION_CHANGES.with(|changes| {
+    if let Ok(mut changes) = changes.try_borrow_mut() {
+      changes.insert(identity, held);
+    }
+  });
+}
+
+/// The region holds kept (true) or let go (false) since this shard's last committed publication, for its delta
+/// (`crate::content_holder::held_changes`): a home's holds ride its shard image, so they survive its restart.
+pub(crate) fn region_changes() -> Vec<(ContentId, bool)> {
+  REGION_CHANGES.with(|changes| {
+    changes
+      .try_borrow()
+      .map(|changes| {
+        changes
+          .iter()
+          .map(|(identity, held)| (*identity, *held))
+          .collect()
+      })
+      .unwrap_or_default()
+  })
+}
+
+/// A publication of this shard committed: the region holds' changes it carried are forgotten.
+pub(crate) fn region_changes_committed() {
+  REGION_CHANGES.with(|changes| {
+    if let Ok(mut changes) = changes.try_borrow_mut() {
+      changes.clear();
+    }
+  });
+}
+
+/// The region holds a recovered shard image carried, taken back once its content store is made over the restored
+/// windows (`super::VcsStores::content_made`): each held again where the store has it (a restored window is held by no
+/// one until something holds it, and is freed once every record is replayed, `release_unheld`). How many were held.
+pub(crate) fn restore_region_holds(
+  content: &mut slates_vcs::ContentStore,
+  identities: &[ContentId],
+) -> u64 {
+  let mut held = 0u64;
+  for identity in identities {
+    if content.contains(identity) && content.hold(identity).is_ok() {
+      REGION_HELD.with(|region| {
+        if let Ok(mut region) = region.try_borrow_mut() {
+          region.insert(*identity);
+        }
+      });
+      held = held.saturating_add(1);
+    }
+  }
+  held
 }
 
 /// Keeps the window `bytes` on this shard for the region (module docs, "From the region"): a window held for the region
@@ -568,6 +636,7 @@ pub(crate) fn keep_for_region(
       held.insert(kept.0);
     }
   });
+  region_changed(kept.0, true);
   Ok(kept)
 }
 
@@ -585,6 +654,7 @@ pub(crate) fn let_go_for_region(
   if !held {
     return Err(HomeRefused::NotHeld);
   }
+  region_changed(*identity, false);
   let_go_here(state, identity)
 }
 
@@ -601,6 +671,155 @@ pub(crate) fn region_held_here() -> Vec<ContentId> {
 /// Counter: home exchanges a member served from the region (module docs, "From the region"). Format: a counter name.
 pub(crate) const REMOTE_SERVED: &str = "vcs_store.homes.remote_served";
 
+/// A whole put from the region kept at its home ([`serve_remote`]): only where the configuration ranks this node among
+/// the object's homes and its bytes hash to their name, answered `Kept` once the home's image holding it is published.
+async fn keep_put(
+  origin: u16,
+  shards: &[u16],
+  (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
+  (identity, bytes): ([u8; 32], Vec<u8>),
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  use slates_cluster::homes::{HomeOutcome, HomeRefusal, admits};
+  if let Err(refusal) = admits(&identity, &bytes, (local, members, f)) {
+    return HomeOutcome::Refused(refusal);
+  }
+  match keep_region_at_home(origin, shards, bytes, budget_ns).await {
+    Ok((_, ticket)) if published(origin, ticket, budget_ns).await => HomeOutcome::Kept {
+      generation: ticket.generation,
+    },
+    Ok(_) | Err(HomeRefused::Unanswered) => HomeOutcome::Refused(HomeRefusal::Unanswered),
+    Err(HomeRefused::Misnamed | HomeRefused::PastWindow) => {
+      HomeOutcome::Refused(HomeRefusal::Misnamed)
+    }
+    Err(HomeRefused::Content(_)) => HomeOutcome::Refused(HomeRefusal::Room),
+    Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
+  }
+}
+
+/// What a put's part did to its object's staging ([`stage_part`]).
+enum Staged {
+  /// Refused: the staging is dropped.
+  Refused(slates_cluster::homes::HomeRefusal),
+  /// Taken: the bytes received so far.
+  Taken(u64),
+  /// The object whole, to keep.
+  Whole(Vec<u8>),
+}
+
+std::thread_local! {
+  /// The objects put from the region a part at a time and not yet whole, on this serving shard (A-724 piece 8c): each its
+  /// length and the bytes received, in order. Bounded: their bytes together never pass what the shard can admit.
+  static STAGING: std::cell::RefCell<std::collections::BTreeMap<[u8; 32], (u64, Vec<u8>)>> =
+    const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+  /// The object a region read takes a part at a time on this serving shard, read whole at its first part and let go at its
+  /// last ([`read_part`]): one object.
+  static READING: std::cell::RefCell<Option<(ContentId, Vec<u8>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Stages a put's part (A-724 piece 8c): the first part (offset 0) only where the configuration ranks this node among
+/// the object's homes and the object's length fits what the shard can admit beside what is staged already; each next
+/// part only at the offset the staging has reached and within the length. Whole once every byte is in, its BLAKE3
+/// checked by [`keep_put`].
+fn stage_part(
+  (local, members, f): (slates_db::HostId, &[slates_db::HostId], usize),
+  (identity, total, offset): ([u8; 32], u64, u64),
+  bytes: Vec<u8>,
+) -> Staged {
+  use slates_cluster::homes::HomeRefusal;
+  let room = crate::state::with_state(|state| state.store.admittable()).unwrap_or(0);
+  STAGING.with(|staging| {
+    let Ok(mut staging) = staging.try_borrow_mut() else {
+      return Staged::Refused(HomeRefusal::Unanswered);
+    };
+    if offset == 0 {
+      staging.remove(&identity);
+      if !slates_db::identity_homes::homes(&identity, members, f).contains(&local) {
+        return Staged::Refused(HomeRefusal::NotAHome);
+      }
+      let staged: u64 = staging
+        .values()
+        .map(|(_, got)| u64::try_from(got.len()).unwrap_or(u64::MAX))
+        .sum();
+      if total.saturating_add(staged) > room {
+        return Staged::Refused(HomeRefusal::Room);
+      }
+      let mut got = Vec::new();
+      if got
+        .try_reserve_exact(usize::try_from(total).unwrap_or(usize::MAX))
+        .is_err()
+      {
+        return Staged::Refused(HomeRefusal::Room);
+      }
+      staging.insert(identity, (total, got));
+    }
+    let Some((length, got)) = staging.get_mut(&identity) else {
+      return Staged::Refused(HomeRefusal::NotHeld);
+    };
+    let at = u64::try_from(got.len()).unwrap_or(u64::MAX);
+    let end = at.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    if *length != total || at != offset || end > total {
+      staging.remove(&identity);
+      return Staged::Refused(HomeRefusal::NotHeld);
+    }
+    got.extend_from_slice(&bytes);
+    if end < total {
+      return Staged::Taken(end);
+    }
+    staging
+      .remove(&identity)
+      .map_or(Staged::Refused(HomeRefusal::NotHeld), |(_, got)| {
+        Staged::Whole(got)
+      })
+  })
+}
+
+/// A region read's part (A-724 piece 8c): the object read whole at its first part (this node's own home shard), its part
+/// from `offset` answered, at most `slates_cluster::homes::PART_BYTES`, with its length; let go once its last part is.
+async fn read_part(
+  origin: u16,
+  shards: &[u16],
+  identity: ContentId,
+  offset: u64,
+  budget_ns: u64,
+) -> slates_cluster::homes::HomeOutcome {
+  use slates_cluster::homes::{HomeOutcome, HomeRefusal, PART_BYTES};
+  let cached = READING.with(|reading| {
+    reading
+      .try_borrow()
+      .is_ok_and(|reading| reading.as_ref().is_some_and(|(held, _)| *held == identity))
+  });
+  if !cached || offset == 0 {
+    let Some(bytes) = read(origin, shards, identity, budget_ns).await else {
+      return HomeOutcome::Refused(HomeRefusal::NotHeld);
+    };
+    READING.with(|reading| {
+      if let Ok(mut reading) = reading.try_borrow_mut() {
+        *reading = Some((identity, bytes));
+      }
+    });
+  }
+  READING.with(|reading| {
+    let Ok(mut reading) = reading.try_borrow_mut() else {
+      return HomeOutcome::Refused(HomeRefusal::Unanswered);
+    };
+    let Some((_, bytes)) = reading.as_ref() else {
+      return HomeOutcome::Refused(HomeRefusal::NotHeld);
+    };
+    let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let end = usize::try_from(offset.saturating_add(PART_BYTES).min(total)).unwrap_or(usize::MAX);
+    let Some(part) = bytes.get(start..end) else {
+      return HomeOutcome::Refused(HomeRefusal::NotHeld);
+    };
+    let part = part.to_vec();
+    if u64::try_from(end).unwrap_or(u64::MAX) >= total {
+      *reading = None;
+    }
+    HomeOutcome::Part { total, bytes: part }
+  })
+}
+
 /// Serves one home exchange from another member of the region on shard `origin` (module docs, "From the region";
 /// `slates_cluster::homes`): a put kept only where the configuration this node knows ranks it among the window's homes
 /// and its bytes hash to their name, on the node's own home shard for the window, and answered `Kept` only once that
@@ -608,7 +827,7 @@ pub(crate) const REMOTE_SERVED: &str = "vcs_store.homes.remote_served";
 /// answered once its holder is let go. Each wait is judged in its target's own time within `budget_ns`. Malformed bytes
 /// answer nothing, as the session's other streams do.
 pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) -> Vec<u8> {
-  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal, admits};
+  use slates_cluster::homes::{HomeMessage, HomeOutcome, HomeRefusal};
   let Ok(message) = HomeMessage::decode(request) else {
     return Vec::new();
   };
@@ -624,23 +843,44 @@ pub(crate) async fn serve_remote(origin: u16, request: &[u8], budget_ns: u64) ->
     return Vec::new();
   };
   let (identity, outcome) = match message {
-    HomeMessage::Put { identity, bytes } => {
-      let outcome = match admits(&identity, &bytes, (local, &members, f)) {
-        Err(refusal) => HomeOutcome::Refused(refusal),
-        Ok(()) => match keep_region_at_home(origin, &shards, bytes, budget_ns).await {
-          Ok((_, ticket)) if published(origin, ticket, budget_ns).await => HomeOutcome::Kept {
-            generation: ticket.generation,
-          },
-          Ok(_) | Err(HomeRefused::Unanswered) => HomeOutcome::Refused(HomeRefusal::Unanswered),
-          Err(HomeRefused::Misnamed | HomeRefused::PastWindow) => {
-            HomeOutcome::Refused(HomeRefusal::Misnamed)
-          }
-          Err(HomeRefused::Content(_)) => HomeOutcome::Refused(HomeRefusal::Room),
-          Err(HomeRefused::NotHeld) => HomeOutcome::Refused(HomeRefusal::NotHeld),
-        },
+    HomeMessage::Put { identity, bytes } => (
+      identity,
+      keep_put(
+        origin,
+        &shards,
+        (local, &members, f),
+        (identity, bytes),
+        budget_ns,
+      )
+      .await,
+    ),
+    HomeMessage::PutPart {
+      identity,
+      total,
+      offset,
+      bytes,
+    } => {
+      let staged = stage_part((local, &members, f), (identity, total, offset), bytes);
+      let outcome = match staged {
+        Staged::Refused(refusal) => HomeOutcome::Refused(refusal),
+        Staged::Taken(received) => HomeOutcome::Taken { received },
+        Staged::Whole(bytes) => {
+          keep_put(
+            origin,
+            &shards,
+            (local, &members, f),
+            (identity, bytes),
+            budget_ns,
+          )
+          .await
+        }
       };
       (identity, outcome)
     }
+    HomeMessage::ReadPart { identity, offset } => (
+      identity,
+      read_part(origin, &shards, ContentId(identity), offset, budget_ns).await,
+    ),
     HomeMessage::Read { identity } => {
       let outcome = match read(origin, &shards, ContentId(identity), budget_ns).await {
         Some(bytes) => HomeOutcome::Bytes(bytes),
@@ -745,7 +985,12 @@ pub(crate) async fn home_in_region(
     .copied()
     .filter(|home| *home != local)
     .collect();
-  if !others.is_empty() {
+  // An object past one message goes a part at a time (A-724 piece 8c), every home staging it in order.
+  let past_a_message =
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX) > slates_cluster::homes::PART_BYTES;
+  if !others.is_empty() && past_a_message {
+    kept = kept.saturating_add(put_in_parts(&others, identity, &bytes, budget).await.len());
+  } else if !others.is_empty() {
     let request = HomeMessage::Put {
       identity: identity.0,
       bytes,
@@ -820,6 +1065,12 @@ pub(crate) async fn read_in_region(
   if others.is_empty() {
     return None;
   }
+  // A part at a time, each at most one message, so an object of any length reads back (A-724 piece 8c).
+  for home in &others {
+    if let Some(bytes) = read_in_parts(*home, identity, budget).await {
+      return Some(bytes);
+    }
+  }
   let request = HomeMessage::Read {
     identity: identity.0,
   }
@@ -854,6 +1105,127 @@ pub(crate) async fn read_in_region(
   }
   crate::fleet::return_sessions(returned);
   found
+}
+
+/// Sends the object `bytes` named `identity` to each of `homes` a part at a time, in order (A-724 piece 8c: an object past
+/// one message), each part to every home still taking it, a home dropped at its first answer other than the part taken:
+/// the homes that answered the last part kept (each only once its image holding it is published).
+async fn put_in_parts(
+  homes: &[slates_db::HostId],
+  identity: ContentId,
+  bytes: &[u8],
+  budget: slates_cluster::CommitBudget,
+) -> Vec<slates_db::HostId> {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome, PART_BYTES};
+  let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  let part = usize::try_from(PART_BYTES).unwrap_or(usize::MAX).max(1);
+  let mut taking: Vec<slates_db::HostId> = homes.to_vec();
+  let mut kept = Vec::new();
+  for (at, chunk) in bytes.chunks(part).enumerate() {
+    let offset = u64::try_from(at.saturating_mul(part)).unwrap_or(u64::MAX);
+    let end = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+    let request = HomeMessage::PutPart {
+      identity: identity.0,
+      total,
+      offset,
+      bytes: chunk.to_vec(),
+    }
+    .encode();
+    let sessions =
+      crate::fleet::take_sessions("vcs_store.homes.region_part", |host| taking.contains(&host));
+    let outgoing: Vec<_> = sessions
+      .into_iter()
+      .map(|(host, endpoint)| (host, request.clone(), endpoint))
+      .collect();
+    let (replied, _stragglers) = slates_cluster::broadcast(
+      outgoing,
+      HOME_STREAM,
+      slates_transport::connection::Priority::Bulk,
+      budget,
+    )
+    .await;
+    let mut still = Vec::new();
+    let mut returned = Vec::with_capacity(replied.len());
+    for (host, reply, endpoint) in replied {
+      match HomeMessage::decode(&reply.bytes) {
+        Ok(HomeMessage::Answer {
+          identity: answered,
+          outcome: HomeOutcome::Taken { received },
+        }) if answered == identity.0 && received == end && end < total => still.push(host),
+        Ok(HomeMessage::Answer {
+          identity: answered,
+          outcome: HomeOutcome::Kept { .. },
+        }) if answered == identity.0 && end == total => kept.push(host),
+        _ => {}
+      }
+      returned.push((host, endpoint));
+    }
+    crate::fleet::return_sessions(returned);
+    taking = still;
+    if taking.is_empty() {
+      break;
+    }
+  }
+  kept
+}
+
+/// Reads the object named `identity` back from `home` a part at a time (A-724 piece 8c), answered only when its parts
+/// make its whole length and hash to its identity.
+async fn read_in_parts(
+  home: slates_db::HostId,
+  identity: ContentId,
+  budget: slates_cluster::CommitBudget,
+) -> Option<Vec<u8>> {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
+  let mut bytes: Vec<u8> = Vec::new();
+  loop {
+    let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let request = HomeMessage::ReadPart {
+      identity: identity.0,
+      offset,
+    }
+    .encode();
+    let sessions =
+      crate::fleet::take_sessions("vcs_store.homes.region_read_part", |host| host == home);
+    let outgoing: Vec<_> = sessions
+      .into_iter()
+      .map(|(host, endpoint)| (host, request.clone(), endpoint))
+      .collect();
+    if outgoing.is_empty() {
+      return None;
+    }
+    let (replied, _stragglers) = slates_cluster::broadcast(
+      outgoing,
+      HOME_STREAM,
+      slates_transport::connection::Priority::Bulk,
+      budget,
+    )
+    .await;
+    let mut part = None;
+    let mut returned = Vec::with_capacity(replied.len());
+    for (host, reply, endpoint) in replied {
+      if let Ok(HomeMessage::Answer {
+        identity: answered,
+        outcome: HomeOutcome::Part { total, bytes: got },
+      }) = HomeMessage::decode(&reply.bytes)
+        && answered == identity.0
+        && !got.is_empty()
+      {
+        part = Some((total, got));
+      }
+      returned.push((host, endpoint));
+    }
+    crate::fleet::return_sessions(returned);
+    let (total, got) = part?;
+    bytes.extend_from_slice(&got);
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read > total {
+      return None;
+    }
+    if read == total {
+      return (ContentId::of(&bytes) == identity).then_some(bytes);
+    }
+  }
 }
 
 /// Counter: identities the healer offered to their region homes. Format: a counter name.
@@ -949,6 +1321,20 @@ async fn heal_one(
     let Some(bytes) = read(origin, shards, identity, budget.max_deadline_ns()).await else {
       return;
     };
+    // An object past one message is offered a part at a time (A-724 piece 8c), as `home_in_region` sends it.
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > slates_cluster::homes::PART_BYTES {
+      held.extend(put_in_parts(&others, identity, &bytes, budget).await);
+      crate::state::with_state(|state| state.count(HEAL_OFFERED, 1));
+      let plan = slates_db::identity_homes::heal(&identity.0, members, f, &held);
+      if plan.release.contains(&local)
+        && let_go_region_at_home(origin, shards, identity, budget.max_deadline_ns())
+          .await
+          .is_ok()
+      {
+        crate::state::with_state(|state| state.count(HEAL_RELEASED, 1));
+      }
+      return;
+    }
     let request = HomeMessage::Put {
       identity: identity.0,
       bytes,

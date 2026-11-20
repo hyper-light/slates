@@ -16993,7 +16993,11 @@ fn restore_held_image(
   // The repository windows' chunks too (A-727 slice a3), claimed before the commit below so none is reused before
   // this daemon's first publication commits, and before the records that name them are replayed.
   if let Some(held) = held.as_ref() {
-    crate::vcs_store::restore_windows(state, &held.windows, (&held.lists, &held.names));
+    crate::vcs_store::restore_windows(
+      state,
+      &held.windows,
+      (&held.lists, &held.names, &held.region_holds),
+    );
   }
   state.store.content.arena_mut().commit_live();
   let recovered_hold = held_claims.and_then(|claimed| {

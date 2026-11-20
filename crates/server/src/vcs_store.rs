@@ -224,6 +224,8 @@ pub(crate) struct VcsStores {
   restored_nodes: Option<RestoredNodes>,
   /// What the content store took back of them: restored, refused (counted by the recovery).
   nodes_restored: (u64, u64),
+  /// A recovery's region holds (A-724 piece 8c), held again when the content store is made over the restored windows.
+  restored_region: Vec<slates_vcs::ContentId>,
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -1138,6 +1140,10 @@ impl VcsStores {
         let offered = u64::try_from(lists.len().saturating_add(names.len())).unwrap_or(u64::MAX);
         let refused = content.restore_nodes(lists, names);
         self.nodes_restored = (offered.saturating_sub(refused), refused);
+      }
+      if let Some(content) = self.content.as_mut() {
+        let region = std::mem::take(&mut self.restored_region);
+        homes::restore_region_holds(content, &region);
       }
     }
     Ok(())
@@ -2595,14 +2601,17 @@ pub(crate) fn chunk_windows_mut(
 pub(crate) fn restore_windows(
   state: &mut ShardState,
   pieces: &[(u64, Vec<u8>)],
-  (lists, names): (
+  (lists, names, region): (
     &[(slates_vcs::ContentId, Vec<u8>)],
     &[(slates_vcs::ContentId, slates_vcs::ContentId)],
+    &[slates_vcs::ContentId],
   ),
 ) {
   if state.vcs_stores.content.is_some() {
     return;
   }
+  // The region holds are taken back with the lists and names, when the content store is made (A-724 piece 8c).
+  state.vcs_stores.restored_region = region.to_vec();
   // The lists and names are taken in when the content store is made over the windows (`VcsStores::content_made`).
   if !lists.is_empty() || !names.is_empty() {
     state.vcs_stores.restored_nodes = Some((lists.to_vec(), names.to_vec()));
