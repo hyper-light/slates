@@ -33,7 +33,14 @@
 - LANDED A-735 727ebe674 on origin/main (verified merge-base): ipc Claim::look made_again() reads its own slot (pid+start)
   in the object under the name; red 2.000 s -> 178 us; ipc --lib rendezvous:: 16/16, --test rendezvous 14/14, fmt.
   Landed from ~/slates-work/w-forming-repro (main ff'd), not the wip branch. Ledger row A-735 pushed first.
-- NEXT: when sw48 ends, rebuild on current main (with A-735) and run a clean 48 (tag sw48c, taskpolicy -b, nothing
+- ~09:40Z sw48 run 26 hung the same way (fresh b's `status` client in Claim::wait, pid absent from the live object):
+  A-735 again on the pre-fix build. Stopped sw48 at 24/26 PASS (16 = start starvation beside rp1; 25, 26 = A-735).
+  Started sw48c: clean 48 on exact origin/main 69d1f2ec3 (has A-735), built from ~/slates-work/w-forming-repro,
+  taskpolicy -b, nothing of mine beside it (another agent's g227 suite loop does run on this Mac). Bg task bff43ui5h.
+- Queue after sw48c: run-7 stall chase; then run-25 spin (main 2026-11-20: name the unsliced task, fix failing-test
+  first or hand main its location). Tool: ~/.cache/w-forming-scripts/spin-sampler.sh <runs-dir> samples every chaos
+  daemon on a >=300 ms poll line; use with repro loops only, never during evidence runs.
+- (old) NEXT: when sw48 ends, rebuild on current main (with A-735) and run a clean 48 (tag sw48c, taskpolicy -b, nothing
   beside it) = the goal evidence; then GAPS line + report. Run-7 chase after that (diag aid on agents/w-forming-repro).
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
