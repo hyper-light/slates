@@ -7992,15 +7992,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`live_ship::judge_held_destroys`), answered `Refusal::DurabilityPending { held_ns }` and counted
 > `fleet.live.held_gave_up` (`fleet.destroy.held_gave_up`), with what durability lacked logged. Through a shorter
 > silence the writer still waits, as the 2026-11-05 sweep chose (a writer waits, never a false success), so a candidate
-> stopped for a few liveness budgets still answers the write when it resumes. The refusal is recorded as the request's
-> completion, as a fence's is, so a retry under the same id meets it (§4.9); the verb's effects stay committed on the
-> owner, never claimed durable, and a consumer runs the verb again under a new id (slates-api's
-> `RetryCause::DurabilityPending`, CONTRACT 22). A retry that joined a request's wait is answered with it, judged by the
-> request's first hold. Held by
-> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`
+> stopped for a few liveness budgets still answers the write when it resumes. Since 2026-11-20 (main's ruling, A-354's
+> amendment) the verb's own reply is recorded as the request's completion and the refusal is delivered unrecorded
+> (`live_ship::answer_given_up`): the verb took effect once on the owner, so its resend under the same id is answered its
+> own reply (§4.9) and a verb never takes effect twice. The client sends a `DurabilityPending` request again under its id
+> itself, once, on the sync and the async path (`slates_client::Client`), so a caller is handed that reply. A retry that
+> joined a request's wait is answered with it, judged by the request's first hold. Held by
+> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`
 > (`crates/server/tests/fleet.rs`: both survivors refuse the owner's register records, so a new live volume's head never
-> places; the write refused after 10.03 and 10.08 s, the same request answered the same refusal, and the write sent again
-> answered `FsDone` once the refusals lifted).
+> places; a directory made through the raw ring is refused at the failover delay, and its resend answered `FsDone`; one
+> made through `slates_client` is answered `FsDone`; each listed once). Until then the refusal was the recorded
+> completion and a consumer told to make the call again ran the verb a second time (g226).
 >
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
@@ -33065,9 +33067,22 @@ Applied in the same change to:
 - `crates/server/src/live_ship.rs`: `Awaiting::held_since_ns`, `judge_held` (at the period's visit to a live volume),
   `judge_held_destroys` (once a period on each shard), `held_past` (a request's entries judged by its first hold),
   counters `fleet.live.held_gave_up` and `fleet.destroy.held_gave_up`. `crates/server/src/verbs.rs`: the refusal's name.
-- Tests: `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`
+- Tests: `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`
   (`crates/server/tests/fleet.rs`); `a_reply_held_past_its_durable_bound_is_a_retry` (`crates/api/src/error.rs`).
 - GAPS: the entry of 2026-11-18.
+
+**Amended 2026-11-20 (main's ruling on g226's finding): a verb never takes effect twice.** At the failover delay the
+verb's own reply, not the refusal, is recorded as its completion, in one durable step as every completion is (A-127's
+pattern, `verbs::record_completion`), and `DurabilityPending` is delivered unrecorded (`live_ship::answer_given_up`, for
+`judge_held` and `judge_held_destroys`). A resend under the same id is answered the verb's own reply. `slates_client`
+sends a `DurabilityPending` request again under its id once, itself (`Client::exchange` on the sync path,
+`resent_for_durability` on the async one), so every caller of the client is handed that reply. A yielded volume's
+waiters (A-409) still record `DurabilityPending`: their write was made on a copy the successor passed, so it never took
+effect there, and the same request run again goes to the successor. Why: the refusal recorded as the completion told a
+consumer to make the call again under a new id, which ran the verb a second time over its own effect: a directory's
+second making refused `AlreadyExists`, an append landed twice. Applied in the same change to: §4.10's status,
+`crates/server/src/live_ship.rs`, `crates/client/src/client.rs`, `crates/api/src/error.rs` (`RetryCause::DurabilityPending`),
+the test (renamed `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`), GAPS.
 - **What was there.** A deferred verb's reply ended only once its log was durable where its publication put it (or its
   tombstone placed), its owner fenced, or its volume destroyed. The 2026-11-05 sweep chose to keep the writer waiting
   rather than refuse it at the transports' silent window, and nothing bounded the wait: a log that could never be held
@@ -41182,7 +41197,7 @@ GAPS).
 - **Names.** The three tests that still said `failover_slo` after A-525 deleted the placeholder now name the failover
   delay they test: `a_held_replys_wait_ends_at_the_failover_delay_from_its_hold` (`crates/bridge-core/src/durable_bound.rs`,
   whose docs and reason line said "failover SLO" too),
-  `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again` and
+  `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply` and
   `the_failover_delay_ends_a_forwards_location_budget` (`crates/server/tests/fleet.rs`); their citations here and in
   GAPS follow.
 
@@ -54947,6 +54962,22 @@ Applied in the same change to:
   packs": with v1.5.0's 9.8 MB packs in the mix, capped at 5 or 3 pushes to one repository, the small repositories' p99
   is 3.07 and 3.63 times their fair share (within it without large packs); the wait is daemon-wide, to be profiled. Ten
   such pushes to one repository end the daemon (A-722's proof must hold at ten).
+- **The daemon's end at ten large pushes, fixed: a pack's waiting deltas resolve a delta a unit, in the answer's
+  turns (2026-11-20; main's ruling of 2026-11-20).** Profiled with new per-repository counters in `slates status`
+  (each repository's usage row, a push's steps, time, longest step and the wait before them by phase): the kill's cause
+  line at ten v1.5.0 pushes named `vcs_http.rs:1404` at its poll 595, and the longest input step was 1,435.7 ms:
+  `slates_git::unpack::Reader::finish_into` resolved every delta waiting at a pack's end, and their dependents, in the
+  input step that brought the trailer. Now `Reader::resolve_turn` resolves them under a quantum (one unit at least, a
+  unit applying one delta or listing one entry's waiting children; a thin pack's outside bases one table row a unit),
+  the session holds `State::Resolving` between turns, and `ReceivePack::check_turn` gives it the turns the checks
+  get. The red: `unpack::tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time` counts each step resolving
+  past its budget (64 deltas on one late base, a budget of four): 0 for the input step and 0 over every turn (the first
+  form of the fix, a base's children one unit, counted 1). By use (BENCHMARKS.md, "Waiting deltas resolved in
+  turns"): ten concurrent v1.5.0 pushes, 10 of 10 answered, the daemon alive, the longest input step 1.2 ms; v1.5.0
+  alone holds 424 to 438 MiB (about 758 before). Not the small repositories' wait: their counters show about 6,000
+  check turns a push of 23 µs each, each waiting about 91 µs for its shard, and about a second before the first step
+  still unaccounted, profiled next. Tests: slates-git 556 of 556; slates-server `git_push:: vcs_http::git:: vcs_ssh::
+  vcs_share:: vcs_store::upload::` 106 of 106; slates-ipc and slates-mcp whole.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
