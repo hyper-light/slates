@@ -180,12 +180,15 @@ fn golden_bytes() -> Vec<u8> {
 /// the bytes by the format's layout, field by field, and the identity by a BLAKE3 written in Python from the BLAKE3
 /// paper (no library), which reproduces the empty input's hash (`af1349b9…`), the official test vectors at 1, 1023,
 /// 1024, 1025, 2048, 2049 and 3072 bytes (one, two and three chunks), and A-646's ops-document vector (218 bytes,
-/// `553a422f…6c0d92`). Do: encode the golden checkpoint. Expect its bytes the layout's, 2,499 of them, and its identity
-/// the pinned one. If the format changes deliberately, derive both again the same way.
+/// `553a422f…6c0d92`). Do: encode the golden checkpoint, and encode it given up. Expect its bytes the layout's, 2,499 of
+/// them, the same given up and reserved at exactly that length, and its identity the pinned one. If the format changes deliberately, derive both again the same way.
 #[test]
 fn the_checkpoint_matches_its_golden_vectors() {
   let golden = golden();
   let bytes = golden.encode();
+  // A-742: given up, the same bytes, written into a buffer reserved at their exact length and never grown.
+  let given_up = golden.clone().into_encoded();
+  assert_eq!((&given_up, given_up.capacity()), (&bytes, bytes.len()));
   assert_eq!(bytes.len(), GOLDEN_LEN, "the recorded checkpoint's length");
   assert_eq!(bytes, golden_bytes(), "the encoding changed");
   let hex: String = golden

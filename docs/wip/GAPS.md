@@ -179,8 +179,13 @@
 > value stored whole and for a splice's added runs, sealed (runs copied out) only when superseded; a fold to one value
 > names the file whole; retire gives the history's holds back a step at a time; charges unchanged. Part 3 measured: svn
 > 1,000-revision import, history heap 50.3 -> 2.0 MiB, Green::commit 285.1 -> 200.0 MiB. Part 4: the honest charge (a first
-> small edit charges the earlier file whole; reservation = retention). OWED: `slates status --json` prints no
-> `retained_bytes`, so a green's retention charge is not readable from outside.
+> small edit charges the earlier file whole; reservation = retention). (`retained_bytes` now in `slates status
+> --json`, A-742.)
+>
+> **A-742 (2026-11-20, w-engine; main's ruling):** BUILT: large allocations mapped directly and unmapped when freed
+> (`slates_mem::large`), large temporaries cut (`Wire::encoded_len`, `Db::mutate_owned`, `Checkpoint::into_encoded`);
+> svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. OWED: `Record::revision_bytes`'s growth, the
+> log's decode-after-encode copy, the svn commit's retry clone, the anchor content object's 581 MiB split by range.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's

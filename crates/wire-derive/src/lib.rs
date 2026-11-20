@@ -116,6 +116,9 @@ fn expand_struct(
       fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
         #(::slates_wire::Wire::encode(&self.#idents, out);)*
       }
+      fn encoded_len(&self) -> usize {
+        0usize #(.saturating_add(::slates_wire::Wire::encoded_len(&self.#idents)))*
+      }
       fn decode(input: &mut &[u8]) -> ::std::result::Result<Self, ::slates_wire::WireError> {
         Ok(Self { #(#idents: <#types as ::slates_wire::Wire>::decode(input)?,)* })
       }
@@ -128,6 +131,7 @@ struct VariantParts {
   reflection: String,
   tag_const: proc_macro2::TokenStream,
   encode_arm: proc_macro2::TokenStream,
+  len_arm: proc_macro2::TokenStream,
   decode_arm: proc_macro2::TokenStream,
   hashes: Vec<proc_macro2::TokenStream>,
 }
@@ -160,6 +164,15 @@ fn expand_variant(index: usize, variant: &syn::Variant) -> syn::Result<VariantPa
   } else {
     field_arms(vname, discriminant, &idents, &types, &bound)
   };
+  // The variant's encoded length: its `u32` discriminant, then its fields (A-742).
+  let len_arm = if fields.is_empty() {
+    quote! { Self::#vname => ::std::mem::size_of::<u32>(), }
+  } else {
+    quote! {
+      Self::#vname { #(#idents: #bound),* } => ::std::mem::size_of::<u32>()
+        #(.saturating_add(::slates_wire::Wire::encoded_len(#bound)))*,
+    }
+  };
   let tag_name = format_ident!("WIRE_TAG_{}", screaming_snake(&vname.to_string()));
   let tag_doc = format!(
     "Format: the wire discriminant of `{vname}` (its declaration index), for an encoder that writes the variant's \
@@ -173,6 +186,7 @@ fn expand_variant(index: usize, variant: &syn::Variant) -> syn::Result<VariantPa
     reflection,
     tag_const,
     encode_arm,
+    len_arm,
     decode_arm,
     hashes,
   })
@@ -240,6 +254,7 @@ fn expand_enum(
       .join(",")
   );
   let encode_arms = parts.iter().map(|p| &p.encode_arm);
+  let len_arms = parts.iter().map(|p| &p.len_arm);
   let tag_consts = parts.iter().map(|p| &p.tag_const);
   let decode_arms = parts.iter().map(|p| &p.decode_arm);
   let hashes = parts.iter().flat_map(|p| p.hashes.iter());
@@ -255,6 +270,9 @@ fn expand_enum(
       );
       fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
         match self { #(#encode_arms)* }
+      }
+      fn encoded_len(&self) -> usize {
+        match self { #(#len_arms)* }
       }
       fn decode(input: &mut &[u8]) -> ::std::result::Result<Self, ::slates_wire::WireError> {
         let discriminant = <u32 as ::slates_wire::Wire>::decode(input)?;

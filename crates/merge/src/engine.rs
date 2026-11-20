@@ -99,20 +99,7 @@ impl Increment {
   /// and length-delimited so [`Increment::decode`] is exact.
   pub fn encode(&self) -> Vec<u8> {
     let doc = self.doc.encode();
-    let mut out = Vec::with_capacity(
-      [
-        self.id.len(),
-        size_of::<u64>(), // the base version
-        size_of::<u64>(), // the ops document's length
-        size_of::<u64>(), // the post-state's length
-        size_of::<u64>(), // the evidence count
-        doc.len(),
-        self.post_state.len(),
-        self.evidence.len().saturating_mul(EVIDENCE_BYTES),
-      ]
-      .into_iter()
-      .fold(0, usize::saturating_add),
-    );
+    let mut out = Vec::with_capacity(self.encoded_len_with(doc.len()));
     out.extend_from_slice(&self.id);
     out.extend_from_slice(&self.base.to_le_bytes());
     out.extend_from_slice(&(doc.len() as u64).to_le_bytes());
@@ -124,6 +111,29 @@ impl Increment {
       out.extend_from_slice(reference);
     }
     out
+  }
+
+  /// The length of [`Increment::encode`]'s bytes, without making them: what a caller sizing an entry by it needs (A-728
+  /// part 5: a push encoded each increment once only to read this length, a revision's bytes each time). Only the ops
+  /// document is encoded, which is small beside the post-state.
+  pub fn encoded_len(&self) -> usize {
+    self.encoded_len_with(self.doc.encode().len())
+  }
+
+  /// [`Increment::encoded_len`] given the ops document's encoded length.
+  fn encoded_len_with(&self, doc: usize) -> usize {
+    [
+      self.id.len(),
+      size_of::<u64>(), // the base version
+      size_of::<u64>(), // the ops document's length
+      size_of::<u64>(), // the post-state's length
+      size_of::<u64>(), // the evidence count
+      doc,
+      self.post_state.len(),
+      self.evidence.len().saturating_mul(EVIDENCE_BYTES),
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add)
   }
 
   /// Decodes an increment persisted by [`Increment::encode`] — the inverse used to replay a green's

@@ -463,22 +463,32 @@ impl Db {
     op: &Op,
     now_ns: u64,
   ) -> Result<u64, DbError> {
-    self.partition.check(op, now_ns)?;
+    self.mutate_owned(segment, op.clone(), now_ns)
+  }
+
+  /// [`Db::mutate`] of an operation the caller gives up: it moves into the log entry (or the transaction) instead of
+  /// being copied, so a large one (a repository entry carrying a revision, a green's checkpoint) is held once while it is
+  /// logged and applied (A-742: the copy was 202 MiB of large temporaries in a 1,000-revision import).
+  pub fn mutate_owned(
+    &mut self,
+    segment: &mut AnchorSegment,
+    op: Op,
+    now_ns: u64,
+  ) -> Result<u64, DbError> {
+    self.partition.check(&op, now_ns)?;
     self.last_now_ns = now_ns;
     if self.pending.is_some() {
       // Inside a transaction: applied now (later operations see it), logged at the commit.
-      self.apply_timed(op)?;
+      self.apply_timed(&op)?;
       if let Some(pending) = self.pending.as_mut() {
-        pending.push(op.clone());
+        pending.push(op);
       }
       let made = self.partition.take_state_log_records();
       self.logged_in_transaction.extend(made);
       return Ok(self.next_seq);
     }
     let seq = self.next_seq;
-    let entry = LogEntry {
-      ops: vec![op.clone()],
-    };
+    let entry = LogEntry { ops: vec![op] };
     // The work a replay repeats for this record, timed step by step: the append's ([`append_record`]), then the apply.
     let mut work_ns = 0;
     let bytes = match append_record(&self.log, segment, seq, &entry, &mut work_ns) {
@@ -491,7 +501,10 @@ impl Db {
       }
       Err(e) => return Err(e),
     };
-    let applied = timed(&mut work_ns, || self.partition.apply(op));
+    let applied = match entry.ops.first() {
+      Some(op) => timed(&mut work_ns, || self.partition.apply(op)),
+      None => Ok(()),
+    };
     self.charge_replay_work(work_ns);
     applied?;
     let made = self.partition.take_state_log_records();
