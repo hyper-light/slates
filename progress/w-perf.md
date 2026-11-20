@@ -37,3 +37,71 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   harness SERVERS="stock slates" RUNS=3 KEEP_LOGS=..., record rows.
 - Meanwhile piece 3 (profile slowest working paths -> ranked plan to main): svn checkout/commit (client-bound?),
   import memory (2.5 GB for 1,000 revisions).
+## Piece 3: profile -> ranked plan (started ~06:30Z 2026-11-20), Studio, release bc2803d66
+- svn checkout (1,000 revs): wall ~4.2 s both; client user 0.48 sys 2.78 (client-bound); server CPU slates 0.12 s vs
+  svnserve 0.56 s. log: server CPU ~0 both.
+- Footprint after import: 250 revs (85 MiB dump) ~920 MB; 500 (144 MiB) ~2,060 MB; 1,000 (223 MiB) ~2,430 MB
+  (MALLOC_LARGE/SMALL ~2/3, VM_ALLOCATE (content pool) the rest). `status --json` has no memory counters.
+- malloc_history (MallocStackLogging=1 on the anchor; daemon inherits), 250 revs, live heap 577 MiB:
+  Importer::import 118.7; Repositories::apply_advanced 86.5 (259 allocs, ~334 KB/revision); merge history
+  Value::whole 51.9; Partition::apply_green_checkpoint 46.8 (2 allocs); Green::commit 43.9; UnitSet::whole 42.7
+  (segment, fixed); apply_repository 39.7 (257); merge engine apply 31.5+20.5; thread stacks 47 (fixed).
+  Virtual only: timer Wheel::new 898 MiB (39 MiB a shard), segment/content-pool maps.
+- Plan sent to main ~06:45Z; awaiting its pick.
+- Slope 250->1000 (mh-250/mh-1000 on Studio ~/.cache/w-perf/prof): all linear. M2 corrected: the "Importer" heap is
+  svn records' Repository.contents (texts whole), and the green's content pool holds the same files: texts held
+  twice. Reported to main + w-svn (slates-work-3d); awaiting main's ruling on M2 (w-svn's code).
+- LANDED main 183dd0e23: BENCHMARKS.md "Where the svn server's time and memory go, ranked" (T2 + M1-M5).
+- Worktree now ~/slates-work/w-perf-plan (agents/w-perf-plan). Waiting on: w-git push spin, w-hg sliced intake +
+  import PastRoom, w-svn green_chains; main's M2 ruling. On each: rebuild on Studio, rerun harness, record.
+## A-715 (claimed; main's ruling ~07:00Z): svn texts held once (A-64), after w-svn's charging fix (A-714)
+- Readers of Repository::content: records.rs (properties, Contents::mergeinfo, ReadSource::text/properties,
+  drive::Green::text), Transaction::content/store/take_fresh_contents (importer delta base + dedupe), export.rs:542,
+  svn_commit.rs text_bytes (fresh or records). Engine: Green::content_ref_at(path, version) -> Cow (version N = rev N).
+- Seam proposed to w-svn (slates-work-3d) ~07:10Z: contents keep property lists only; texts -> TextPlace{path,
+  revision,len}; a lent TextSource (green content_ref_at); log entry's record drops text bytes (green version carries
+  them); rebuild replays green then records. Asked: green history trimming? which files A-714 touches?
+- Also queued (main): git read path vs git daemon (clone, blob:none, shallow; git/git cut v1.0.0, whole if it fits)
+  once w-interop's A-713 clone rows pass (w-interop r22).
+- LANDED fdef525e3 (on main, checked): git row at cut v1.0.0 (release 82d3538b0): clone 2.816 vs 0.300 (9.4x slower),
+  blob:none 1.092 vs 0.180, push 0.665 vs 0.310; sample: 72% of clone CPU in slates_git::store::deltas::Search::step.
+  T4 (reuse deltas) proposed to main; awaiting ruling (w-git's area). A-716 seam awaiting w-svn's reply.
+- A-716 seam agreed with w-svn (~07:40Z) with a change: green history IS trimmed (checkpoint_green folds below the
+  floor, f37a96515), so texts are keyed by ContentIdentity in a store surviving folding, not (path, revision). The
+  record's text bytes leaving the log entry also shrinks apply_advanced's ~245 KB/rev (w-svn hands that to A-716).
+  A-714 touches db repository.rs + repository/entry.rs, server repository/push.rs, svn_commit.rs, vcs_store.rs.
+## A-718 (main's ruling ~07:35Z; A-717 was w-git's): git deltas computed once and kept; clone streams stored deltas
+- Done when: clone --mirror, blob:none, shallow re-measured vs git daemon on the Studio (cut v1.0.0), memory before
+  and after, recorded. Ask w-git: can its sliced intake (A-717) record each pushed object's delta as it arrives?
+- A-718 built: branch agents/w-perf-plan (pushed as agents/w-perf-a718), land worktree ~/slates-work/w-perf-a718-land
+  (agents/w-perf-a718-land, squashed + merged main). Local green before merge: server t_a718+t_a682 6/6, git 2/2, fmt.
+  Re-running server test on merged tree (main changed vcs_store.rs, A-714). Studio A/B (cut v1.0.0): clone-again
+  2.766 -> 0.912 s (stock 0.342), blob:none 1.076 -> 0.558, shallow 0.154 -> 0.118, first clone 2.791 -> 4.293,
+  RSS end 384-388 -> 482-513 MiB. w-git agreed A-718 lands first.
+- svn 5,000 import at b705a24c5 (A-714 in): 3,540 revisions then Unpublished (record profile 803 MB > 747 MB segment
+  region); svn commit after it E160004 green not at youngest (w-svn bug). Sent main + w-svn.
+- QUEUE (main/Ada, ~08:00Z): A-718 land -> A-716 (svn texts once) -> concurrent-push load test (slim protocol client
+  replaying a recorded receive-pack, then hg unbundle, svn commit; 1/10/100/1,000/10,000+; per-push memory,
+  completions, refusals, p50/p99, footprint; sizes derived; RAM only) -> register entry objects named by identity
+  (every tool; seam with w-svn).
+- A-718 LANDED main 156f4437d (checked on origin/main). Merged-tree rerun green (server 6/6, fmt). Main had reversed
+  "A-718 first" after it landed; told main. w-git's store-once intake merges over it.
+- NEXT: A-716 (svn texts held once, keyed by ContentIdentity surviving checkpoint folding; record's text bytes out of
+  the entry). Then the concurrent-push load test. Then entry objects named by identity (every tool).
+- A-716 slice 1a LANDED main 5efce021a: merge held.rs identity table (hold_path shares the file block; hold_bytes;
+  held; release_held; set_held_room; AtRoom/Holders/NoFile/NotHeld). Tests merge --lib held_tests 3/3 local.
+  Worktree ~/slates-work/w-perf-a716 (agents/w-perf-a716). Load test draft on agents/w-perf-pushload
+  (crates/cli/bench/push_load.py), worktree ~/slates-work/w-perf-pushload.
+- NEXT: slice 1b: a green op that sets a path from a held identity reusing its block (ops-doc OpKind? or a
+  push-builder op): read crates/merge/src/ops_doc.rs + push.rs; no re-hash on VFS path. Then 1c: held table in the
+  checkpoint (new format version, presence byte like copies). Then load test (+ svn 5000 re-run after A-721: region
+  wall, commit lands, log names it -> w-svn + main). Then svn slices 2-3 (seam with w-svn). Then entry objects by id.
+- LANDED 54fa10ec5: push_load.py + BENCHMARKS (N=1/10/100 all ok; ~250-300 MiB kept per 3.4 MB push; 1,000 would OOM;
+  attribution put_object 69.1 / entry 63.5 / arena 63.7 MiB). Main: 1b/1c OFF (Ada: push = work, content once by
+  identity, D-28/§4.11/§4.17.1). No more load on the shared box until the plan is approved.
+- Convergence plan sent to main ~10:00Z: S1 entries hold no file bytes (me, now); S2 history latest value = file block,
+  held.rs stays as identity index, hold_bytes goes after S3/S5 (me); S3 git intake blobs as work ops + index (w-git);
+  S4 svn records by identity (w-svn + me); S5 hg (w-hg). Bound: per-connection window + admission refusal, TCP flow
+  control as backpressure.
+- NEXT: S1: read crates/server/src/vcs_store/record.rs (RecordWriter, record_of) + repository/push.rs + db entry.rs;
+  git entry record: keep moves + non-blob objects; blobs named by id, bytes in store; replay path reads them.

@@ -890,3 +890,115 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   36478561d (win clippy anchor lib red->clean from the Mac). Lint wall red in slates-db + slates-vcs -> new lint keeper
   w-lint (briefs/w-lint.md). w-bugs told to re-cut its Windows diag from >= 36478561d.
 - Stopped duplicate w-fed-a583 on Studio-2 (01a1f7744305737c8650cfbb776d54a0); kept the big Studio's (01a1f7749cc7...).
+- ~23:00 PST w-perf piece 3 ranked plan (release bc2803d66, MallocStackLogging on a 250-rev svn import, 85 MiB dump,
+  577 MiB live heap; footprint 920 MB @250, 2,060 @500, 2,430 @1,000 revs): M1 register repository records ~0.5 MB/rev
+  (apply_advanced 86.5 + apply_repository 39.7 MiB), maybe quadratic; M2 svn Importer::import buffers 118.7 MiB (1.4x
+  dump); M3 merge history whole-value copies 148 MiB; M4 green checkpoint whole copies 46.8 MiB; M5 virtual only
+  (timer wheels 898 MiB reserved). T2 svn checkout/commit/update client-bound: server CPU per checkout 0.12 s vs
+  svnserve 0.56 s. RULINGS: M1 measure slope only (w-svn is in that code), hand to w-svn; M2 w-perf now (bound);
+  T2 recorded client-bound with the server's share; M3-M5 recorded as owed.
+- ~23:15 PST w-perf CORRECTION: M2 is not importer retention; svn texts are held twice: svn records' own
+  `Repository.contents` BTreeMap (crates/svn/src/migration/records.rs:77; 306 MiB @1,000 revs, 1.37x dump) + the
+  green's content pool (585 MB); the register's A-662 entries hold a third (~245 KB/rev). RULING: content once (A-64):
+  svn records name the green's content by ContentIdentity; w-perf implements (seam agreed with w-svn: green content
+  durable before the naming record), lands after w-svn's charging fix; register copy -> w-svn GAPS. w-perf landed
+  183dd0e23 (BENCHMARKS "Where the svn server's time and memory go"). Next for w-perf after M2 starts: git read path
+  vs git daemon once w-interop's matrix shows clones passing (A-713).
+- ~23:30 PST FIRST GIT ROW (w-perf, release 82d3538b0, git/git cut at v1.0.0: 2,930 commits, 12,233 objects, 3.5 MiB
+  pack; interleaved best of 3, slates vs git daemon): clone --mirror 2.816 vs 0.300 s (9.4x SLOWER); blob:none 1.092 vs
+  0.180 (6x slower); push 0.665 vs 0.310; shallow 0.160 vs 0.111; one-commit push 0.058 vs 0.080; fetch 0.080 vs 0.068.
+  fsck clean, refs+objects identical. Cause: every clone re-runs slates_git::store::deltas::Search::step (72% of
+  samples). RULING T4 -> w-perf NOW (before A-716): delta computed once per object and kept with it, stored deltas
+  streamed, remaining search sliced; w-git's sliced intake may keep pushed deltas as they arrive (w-git's call).
+- Ledger clash fixed: A-715 = w-reaper (idle sweep), A-716 = w-perf (svn texts once); next free A-717.
+- w-shared A-636 2c-1 landed 82d3538b0 (878fc386c); next 2c-2 (successor rebuilds the repository by keep-whole rule).
+- ~23:55 PST CLEANUP: stopped Studio w-shared (couldn't push; local kiln w-shared 01a1f785b29870d68d5512861bc03492
+  landed 2c-1 82d3538b0 and continues 2c-2), w-fed-a583 (A-583 already on main via 8eeb004bd), w-fed-a503 (queue done).
+  Ledger clashes x2 resolved (A-715 w-reaper, A-716 w-perf svn texts once, A-717 w-bugs, A-718 w-perf git deltas,
+  A-719 w-git push spin; next A-720). common.md: claim A-numbers by pushing the ledger; own state folder per Studio
+  agent; adas-mac-studio.local-2 (32-core) has NO GitHub credentials (SSH publickey denied, HTTPS none) -> land via
+  kiln run on adas-mac-studio-2.local (SSH verified 23:50) like w-fed-faults. Broadcast to all 14 agents.
+- Goal stack items 487 (A-583 three-daemon fleet test) + 488 (A-503 move test): passed macOS arm64 (8eeb004bd);
+  Linux x86_64 run r627 started by main at 60e23101a (kiln linux/amd64) -> mark both met when it passes.
+- ~00:05 PST A-714 LANDED main b705a24c5 (w-svn, 5ddb7e09b): repository entry objects charged per repository to the
+  owner shard's memory budget (trued up after each append and at recovery, credited on free); admitted git/hg pushes
+  never refused by it; svn revisions check room first. db 29/29, server 105/105 + 61/61; GAPS: content held 2x (3x svn
+  texts). w-perf asked to rerun the 5,000-rev import; if refused for room, A-716 before T4. w-svn next: A-693 p2 lock.
+- ~00:10 PST ADA: "the change that stores svn file text once (A-716) -> we should do that anyway" -> A-716 now
+  unconditional for w-perf: rerun (measure) -> A-716 (unless T4 lands within ~30 min) -> T4 -> register entry objects
+  name content by identity (A-662, every tool; seam with w-svn).
+- ~00:15 PST ADA: "Likewise for git and mercurial" -> content once for all three tools: w-git (after A-719): git store
+  names blobs by the green's ContentIdentity (trees/commits stay git's), order vs w-perf's T4 agreed between them;
+  w-hg: folded into (1)+(2): filelog texts named by ContentIdentity, manifests/changelogs as deltas; w-perf: A-716
+  (svn), then register entry objects (A-662) for every tool.
+- ~00:25 PST svn 5,000-rev import rerun (w-perf, release b705a24c5): 3,540 revs committed (was 1,685), then refused
+  Unpublished{record 3560: segment profile 803,344,210 B > 746,962,928-byte region}; RSS 5,331 MiB. BUG BY USE -> w-svn
+  TOP (before lock): after the refusal every svn commit E160004 (green ahead of records; repository wedged) -> green
+  advance + record one atom, failing test first. Region wall -> A-716 + entry objects (w-perf, A-716 now).
+- ~00:30 PST ADA: "an individual slates server must be able to handle tens of thousands of concurrent large pushes.
+  For git - I would argue part of the reason we're crashing is the triplicate storage." -> content once moved INTO the
+  push fixes (not after): w-git A-719 = streaming intake, each object stored once on arrival, deltas against stored
+  bases, bounded working set, sliced; admission charges the working set, content charged as stored (A-714); w-git
+  writes the shared rule into §4.17.1. w-hg: same inside (3). w-svn: cite it on the commit path. w-perf: after A-716,
+  a concurrent-push load test (replay client; 1 -> 10,000+ pushes on one daemon), before T4.
+- ~00:45 PST w-hg fixed the two hg-site 503 tests on main 7379a4d8e (3a59b5776): cause was A-687 (a done import waits
+  in the map until it lands; create_hg_from_states stopped at Done), not A-711. Next: (3)+(4) with content once.
+- GOALS MET (main, verified): event-driven reaper (A-709 9b93fd77c, A-715 f70230cc8, reap_loop deleted); A-583 fleet
+  tests; A-503 move test (macOS arm64; Linux run r627 queued, adacachy full). w-reaper sent a stale "reap tick"
+  comment/name sweep (dax_backing, daemon.rs, cli.rs test, nfs_large_write bench).
+- ~00:50 PST w-shared A-636 2c-2 landed c7c18db3e (c8452ee97): successor rebuilds a taken-over repository by keep-whole
+  rule, Op::RepositoryRebuilt (wire 101). Finding: rebuilt store holds no objects (state log parts carry none) -> rides
+  content once (entries name green content by identity; successor holds the family's content); fetching parts a
+  successor doesn't hold stays owed. Next: A-664 holders' maps.
+- ~00:55 PST w-interop landed 78eea35b9 (git matrix tag row; git 26->27/27 expected at v1.0.0); hg 17/24. It was
+  idle-waiting -> REASSIGNED A-681's remaining DAV pieces (DAV routing + update-report; the two svn HTTP rows) from
+  w-svn to w-interop. w-svn: E160004 fix, then A-693 p2 lock.
+- ~01:00 PST w-git A-719 p1 landed 20ffba05f (81c36bd99): push checks (fsck + connectivity) a turn at a time under the
+  step quantum (Answering::Turned). Debug 3,000-commit push: prepare and decide still 0.3-2.7 s in one step -> next
+  parts: streamed store-once intake + §4.17.1 rule, then verdicts sliced. Ruling: w-git's intake does NOT wait on
+  A-718 (w-perf's T4 is behind A-716 + load test); w-perf builds T4 on the new store.
+- ~01:05 PST A-718 (T4) had already landed 156f4437d (w-perf) before the reversal: git/git cut v1.0.0, best of 3:
+  clone-again 2.766 -> 0.912 s (git daemon 0.342); blob:none 1.076 -> 0.558 s; shallow 0.154 -> 0.118 (daemon 0.119);
+  first clone after a push 2.791 -> 4.293 s (one-time encode); RSS 384-388 -> 482-513 MiB. Follow-ups (encode at
+  intake, first-clone cost) rebuilt on w-git's new store later. w-perf now: A-716, then concurrent-push load test.
+- ~01:15 PST A-716 DESIGN RULING (w-perf found the green's history chunks have no content identity; folding drops
+  history): (a) the green's identity table = the ONE byte store for git, hg and svn: hold by path at head (svn) and
+  hold bytes by identity path-less (git/hg intakes); landing op set_from_held(path, identity) reuses chunks (no rehash
+  on VFS write path); survives folding (refcounts), in checkpoint (recovery/replication rebuild), bounded holders.
+  w-perf: slice 1 (engine) NOW (before load test), then load test, then svn slices 2-3 (seam with w-svn's E160004).
+  w-git/w-hg: land streaming + slicing now; switch storage to the table when slice 1 lands; no second store meanwhile.
+- w-interop: A-681 tests on the Studio's warm target (Mac disk 32 GiB free); `git checkout -b x` breach owned (no harm).
+- ~01:20 PST w-hg A-720 p1 landed (56952183f): slates-hg push::intake, a changegroup into an index fork one revision
+  per step (rebuild vs stored base, node check, kept once); working set one revision's texts. RULING for p2: intakes
+  run concurrently even per repository (a fork per push); only the landing verdict is ordered per repository.
+  common.md: name branches with `git branch`/push HEAD:refs/heads/<name>, never checkout -b (two breaches tonight).
+- ~01:30 PST w-hg p2 plan APPROVED: fork per push, concurrent intake; ordered landing rebases the fork by node
+  (renumber rows; reuse stored content; skip revisions already landed; sliced) when the index moved. Added: judge
+  bundle2 check:heads / check:updated-heads at landing against current heads; advertise checkheads=related.
+- ~01:40 PST A-721 LANDED 0cb5120b1 (w-svn, 3169466fe): E160004 wedge fixed: reconcile_unpublished_effects remakes a
+  green whose engine is past its durable head from checkpoint + chain (lone engine / single-member lineage = every svn
+  repo). Owed (GAPS): multi-member lineages (git branches) counted (merge.unpublished.green_ahead_kept) not remade; a
+  submit's vcs_store paths/commits not taken back -> left for use to find (likely at git's region wall). w-perf to
+  confirm by the 5,000-rev import at its next release build. w-svn next: A-693 p2 (svn:// lock).
+- ~02:00 PST ADA (direction): "Don't we have an entire operations based merge mechanism to help with and solve this?"
+  / "This is our entire advantage ... we aren't just a git/mercurial/svn server too, we use our merge mechanisms and
+  default concurrent scale ... higher throughput, lower resource usage." = §4.17/D-28 as written (push = work, one
+  copy by identity). Ruling: slice 1b/1c (SetFromHeld OpKind, hold log) OFF; w-perf writes the convergence plan
+  (every copy measured vs §4.11/§4.17.1, steps + owners), then (2) entry objects by identity. w-git: compressed
+  deltas in the EXISTING ContentStore OK; no hold_bytes, no new store. w-hg/w-svn: no new store; wait for steps.
+  w-perf attribution: one 3.43 MB push = +229 MiB dirty (ContentStore inflated 69.1, register entry 63.5, arena
+  63.7), never released; load test N=1/10/100 ok, RSS 386 MiB / 3.3 GB / 28.2 GB.
+- ~02:05 PST ADA: "a single server should be able to facilitate numerous repositories ... balance consumption and usage
+  between them based upon agent, usage patterns. Dispatch an agent ... toy repos to Google's or Meta's *in multiple*."
+  -> w-balance (briefs/w-balance.md): design first (outline before code), then pieces, proven by a multi-repo push_load.
+- ~02:15 PST CONVERGENCE PLAN APPROVED (w-perf): today a 3.43 MB git push = inflated store 69.1 + entry 63.5 + arena
+  63.7 MiB (+ A-718 fragments 100-125 MiB later); svn text held ~4x (records 305.6, entries 244.7, history chunks
+  234.8 MiB, blocks ~585 MB @1,000 revs). Steps: S1 (w-perf, REVISED) the entry holds the pack as sent (compressed,
+  deltified, minus held objects) + moves, replay re-indexes; bounded parts past an entry's bound; S2 (w-perf) history's
+  latest value names the block, held.rs stays as identity->block, hold_bytes goes after S3/S5; S3 (w-git) store = index
+  oid->identity over the record's pack, blobs land as the push work's file ops, fragments from intake; S4 (w-svn +
+  w-perf) records name texts by identity; S5 (w-hg) filelogs as green files by identity, changelog/manifest deltas.
+  Push bound: streamed window per connection, TCP backpressure, admission charges window + post-state, typed refusal
+  before body; 10,000 x 256 KiB = 2.5 GiB.
+- w-git A-719 p2 landed 183150ab8 (569868917): unpack::Keep (objects handed to a keeper as resolved; bounded working
+  set); §4.17.1 "A push's intake" rule written. Next p3: keep into quarantine as read; admit_all goes.

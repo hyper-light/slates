@@ -75,3 +75,38 @@ CARGO_TARGET_DIR ~/.cache/w-interop-target, clone ~/.cache/w-interop/src (delete
 - LANDED 168ddfa96 (on main, checked): svn+ssh round trip un-ignored (passed --ignored at main a146359, r21); svn
   matrix 24/27 (lock E170003, HTTP A-681 remain). Reported.
 - r22: git matrix re-run for A-713 (a2f0fb970) with cuts v1.0.0 and v2.0.0. NEXT: GAPS line + report.
+- Rule (main): an A-number is mine only after my push of its amendments.tsv line on agents/fanout-state succeeds
+  (pull, append next free, bump "# next free", commit, push; on reject repeat). My pieces so far need none.
+- r22 v1.0.0 cut on main 168ddfa: git matrix 26/27 (A-713 fixed clones); checkout-tag fails only because the cut push
+  has no tags (script) -> change row to check out an old commit.
+- r22 v2.0.0 cut (56 MB): push spins shard 0, daemon killed (both edges). Reported.
+- LANDED 78eea35b9 (merge a304ec440; on main, checked): git matrix checkout-old row + GAPS line (git 26/27 at v1.0.0
+  since A-713; v2.0.0 push spins; hg 17/24 since A-711/A-696). Monitor b69za9xas on main (re-arm on expiry).
+- Gotcha: never pgrep for 'git fetch' in a wait loop: the monitor's fetch loop matches forever.
+
+## Piece 5 (main ~07:30Z): A-681's remainder -- stock svn over http(s). Handed from w-svn.
+Done when: svn_interop.rs HTTP round trip un-ignored + passes with stock svn 1.15, svn matrix HTTP rows pass.
+State on main: svn DAV site (crates/svn/src/dav/site.rs: OPTIONS, PROPFIND, GET/HEAD, REPORT log-report; others 501),
+server site crates/server/src/vcs_http/svn.rs (SvnSite, SvnStores) and lender vcs_store/svn_view.rs ServedRecords --
+but SvnSite is NOT composed into the daemon: ToolSites<G,H> (vcs_http.rs ~349) routes hg wire else git -> '/project'
+404 for svn. Sources: ~/slates-work/g297-sources/{dav-1.15.0,svn-1.15.0,httpd-2.4.66}; g297 progress lines 235+.
+Plan: A) compose: ToolSites gets svn, routed by shape (method not GET/HEAD/POST, or a `!svn` segment) and daemon_edge
+builds SvnSite over ServedRecords; B) update-report (checkout/update: request::UpdateReport -> report::drive -> dav::Drive,
+`me`/vcc resources, OPTIONS capabilities); C) commits (HTTPv2: POST me create-txn, PROPPATCH txn, PUT txr svndiff,
+MKCOL/DELETE/COPY, MERGE -> repository::svn_commit::commit_work). Each part its own landing. A-numbers: claim via
+agents/fanout-state amendments.tsv only if a design change needs one (A-681 parts are A-681's).
+Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's push fix lands.
+- Part A written: svn::dav_request + test a_request_is_subversions_by_its_method_or_its_special_segment;
+  ToolSites<G,H,S> with Svn arm; daemon_edge DaemonSvnSite over ServedRecords. Scratch b8903064f pushed as
+  agents/w-interop-a681. MISTAKE: ran `git checkout -b x` in w-interop-matrix-land (rule breach; no file change) -- the
+  worktree is now on local branch `x` (same commits); left as is, told main. Mac disk 33 GB -> tests on the Studio.
+- LANDED part A: 04da3ae92 (merge 7b46fbdcd; on main, checked). Unit 7/7 (Studio r24-ish), stock svn over HTTP:
+  info/ls/cat/log pass. Worktree ~/slates-work/w-interop-a681-land (branch agents/w-interop-a681-land) for B and C.
+- Part B next: REPORT on `!svn/me` (ra_serf report target under HTTPv2, util.c svn_ra_serf__report_resource) is
+  Resource::Unserved -> "requested report is unknown". Need: resolve `me` for REPORT; Asked::Update(UpdateReport) ->
+  report::drive::Drive (new(report, uuid)) -> dav::drive::Drive writing; streamed as Report variant like log.
+- Part B written (scratch 3e4dfd7de, pushed agents/w-interop-a681b; worktree w-interop-a681-land): report.rs
+  WholeCommand/WholeItem/WholeRefusal/whole_report (reuses Reporter checks); dav/update.rs UpdateWalk (src/dst URL ->
+  repos path, depth, items, streamed resume via dav::Drive::take_written + Body::drain); site.rs Resource::Me (!svn/me),
+  Walk {Log, Update}, Answer/Report now Debug-only derives, OPTIONS SVN-Allow-Bulk-Updates Prefer; test
+  an_update_report_on_me_streams_a_checkout_and_refuses_a_revision_past_the_youngest. r25 on Studio running.

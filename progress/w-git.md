@@ -45,3 +45,12 @@
 - A-713 (clone room bug) LANDED main 03dc601a5 (a2f0fb970 + merge). Worktree ~/slates-work/w-git-pushspin
   (branch agents/w-git-pushspin). Found while there: a 1,200-commit fetch's serve step ran >1 s in debug (upload-pack
   negotiation+plan unsliced) and a 3,000-commit push answered after 1.7 s (push-spin candidates). Next: push spin.
+- A-719 part 1 (push checks sliced: receive::Checking, Session::check_turn, Answering::Turned) LANDED main 20ffba05f.
+  Main's ruling: A-719 = whole streaming intake (store each object once on arrival in the content store, deltas
+  against stored bases, bounded working set, admission by working set, §4.17.1 rule in the amendment); prove with
+  w-interop's v2.0.0 cut then git/git. Coordinate with w-perf (A-718 lands first; tell w-perf before changing how a
+  fragment's bytes are held; keep pushed deltas for pack reuse). Also owed: quarantine admission + verdicts sliced.
+- A-719 part 2 (unpack::Keep keeper seam; §4.17.1 "A push's intake" rule incl. concurrency clause) LANDED 183150ab8.
+  Main: no hold_bytes, no new store; keeping client deltas compressed in the EXISTING ContentStore is OK; convergence
+  plan from w-perf decides blobs later. Next: part 3 = session/driver keep straight into the quarantine as the pack is
+  read (removes reader + Checked in-RAM copies; admit_all gone), checks reading objects back from the store.

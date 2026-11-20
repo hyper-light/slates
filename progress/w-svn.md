@@ -69,3 +69,28 @@
 - NOW: green_chains import bug NOT fixed by f37a96515 (w-perf rerun on 9ea6e1311: still refused at revision 1,685,
   RSS 3.4 GiB). Suspect: the repository log entries (each revision's record + contents, EntryParts.objects) are
   charged to the partition's merge budget (green_chain_bytes) and never fold. Investigating.
+
+## A-714 content charged per repository to the shard -- LANDED main b705a24c5 (commit 5ddb7e09b, verified on origin/main)
+- db: objects no longer charged to the merge budget (Repositories::objects_bytes); server: vcs_store::settle_objects
+  (after append, at make/recovery, credited at free), admit_objects for svn revisions only. Local: server 105/105 then
+  61/61 after merge, db 29/29, fmt clean. A-716 (w-perf) takes svn texts held once.
+- Ledger rule now: A-number is mine only after pushing its line on agents/fanout-state (next free A-720).
+- NEXT: A-693 part 2 (svn:// lock verbs; interop E170003), then DAV pieces (g297 brief: the two HTTP rows, A-681).
+
+## A-693 part 2 PARKED (main: the wedge bug first) -- branch agents/w-svn-a693p2-wip (pushed), worktree w-svn-a714
+- Written, unbuilt: commit/record.rs Record::Locks (tag 4) + records.rs commit_record applies it; svn_commit record
+  step handles Locks (check_entries); serve/locks.rs (lock_verb/locks_landed, Pending, words, read, answer);
+  reads/locks.rs with_lock_value; may_write, full_path, lock_error_message made pub(crate).
+- TODO: serve.rs: `mod locks;`, Phase::LockAsked/Locking (+Debug, waiting, session, receive out-of-turn, established
+  arms), Turn::LockAsked, Answered::LockAsked in elsewhere/command; vcs_svn Next::LockAsked -> lock_verb + record +
+  locks_landed; tunnel: answer LockAsked as unserved (210001); tests vs commit/lock-bob session.
+
+## NOW: wedge bug (main): green advanced but svn record rolled back ("record 3560 not published ... profile exceeds
+## region"), then every commit E160004 Diverged. Fix: one atom. Worktree ~/slates-work/w-svn-atom from origin/main.
+
+## A-721 wedge fix -- LANDED main 0cb5120b1 (commit 3169466fe, verified on origin/main; ledger A-721 pushed bb4bb3a)
+- verbs::reconcile_unpublished_effects -> remake_greens_ahead (lone engine / single-member lineage replayed from
+  checkpoint+chain; wider lineages counted green_ahead_kept, owed). Test a_revision_refused_at_publication_...
+  red then green; local 10/10 + 21/21, rechecked after the final merge.
+- DAV pieces (A-681 rows) moved to w-interop by main. NEXT: A-693 part 2 from agents/w-svn-a693p2-wip (worktree
+  ~/slates-work/w-svn-a714).
