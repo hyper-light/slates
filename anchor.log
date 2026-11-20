@@ -1,0 +1,323 @@
+slates anchor: a start's busiest thread is judged spinning past 1000 ms of CPU without a beat at least (the liveness window held to this build, A-318; the window is longer where this anchor's own waits run later, A-461)
+slates anchor: a crash loop backs off from its failed start's own life, doubling to 6000 ms: backoff_cap_ns = nfs_v4_lease_ns: a crash loop's doubling stops at the NFSv4 lease the daemon grants, so a client renewing at its floor finds the daemon back before its lease runs out (anchors ["nfs_v4_lease_ns"])
+slates anchor: instance svnf-23266 up; daemon pid 23434; 2 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=/slates-seg-svnf-23266-501 SLATES_ANCHOR_LEN=5637341184 SLATES_ANCHOR_CONTENT=/slates-con-svnf-23266-501 SLATES_ANCHOR_CONTENT_LEN=10647994368
+slates anchor: a daemon's beat is lapsed once older than the 1000 ms liveness window plus this anchor's own measured lateness p99, over its last 100 timed waits, at most 10000 ms (the daemon's observation budget); a running daemon is looked at again within that bound less the lateness p99 and a 100 ms beat, at least a beat apart (A-467)
+slates anchor: a starting daemon is judged until its watchdog takes the beat over, each of its beats a step: killed once it has neither beaten nor made CPU progress for its window, or one of its threads has run that window of CPU held to this build without a beat, in its own CPU time (read from the OS, each thread's); its window is the 1000 ms liveness window, raised to how late this anchor's own waits run where that is longer (A-461)
+slates daemon: liveness_budget_ns = LivenessWindow { window_ns: 1000000000, floor_ns: 13500, needed_ns: 1000000000, floor_past_window: false }: W = T, the recovery budget (rent or buy: a verdict waits as long as the recovery it starts costs); floor = the wake probe's p99; past W the daemon cannot meet its window on this machine and needs the floor (anchors ["RECOVERY_BUDGET_NS", "wake.p99_ns"])
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 7516192768: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1252698794: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 5261334937: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 313174698: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 711760: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: audit_records_per_shard = 1957341: table_bytes / size_of::<AuditRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 3700: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 313174698: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 626349396: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 2981: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 6765361428: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 12515: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: page_fault_ns = 2497: the profile's measured base-page fault cost (at least one) (anchors ["faults.base_ns"])
+slates daemon: prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = 1252698794, the arena's free bytes): the free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors ["reserve_per_shard", "content.allocated_bytes"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 147 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 1024: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 543706: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 410182: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 305834: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1252698794: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 50972: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 10: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1124: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 2560: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 2248: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3381: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: provision_floor_ns = 50000: R9: a create's single-client p99 at most 50 µs (anchors ["R9", "AC-2.1"])
+slates daemon: idle_estimate_multiple = 0: none: the window is R9's floor alone on every platform (anchors ["A-223", "A-361"])
+slates daemon: idle_window_ns = 50000: provision_floor_ns: R9's floor alone, which no wake estimate moves on any platform (anchors ["provision_floor_ns", "idle_estimate_multiple"])
+slates daemon: idle_spin_ceiling_ns = 900000000: liveness budget − one beat: under the least spin window the watchdog judges by (anchors ["LIVENESS_BUDGET_NS", "HEARTBEAT_NS", "A-318", "A-361"])
+slates daemon: closed_loop_hold_ns = 700000: 2 × provision_floor_ns × the least k with ((shards − 1) / shards)^k ≤ 1 / PROVISION_TAIL (anchors ["provision_floor_ns", "shards", "PROVISION_TAIL (R9's p99)"])
+slates daemon: guest_bandwidth_bytes_per_ns = 6: memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond) (anchors ["memcpy"])
+slates daemon: guest_requests_credit = 20: the owning shard's admission limit (Little's law: request rate × p99 service time); one attachment may use its shard's whole in-flight budget, which the daemon splits among attachments (anchors ["rt.requests_in_flight_per_shard"])
+slates daemon: guest_bytes_credit = 1310816: clamp(bandwidth × rtt, one frame cap, bandwidth × class latency budget) (anchors ["wire.bandwidth", "wire.rtt_p50", "wire.frame_cap", "wire.class_budget"])
+slates daemon: guest_listing_entries = 32768: guest writable cap / smallest fuse_dirent (anchors ["guest.writable_cap"])
+slates daemon: inode_reserve = 65536: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1151: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 156587349: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 1087412: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 1087412: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_lease_ns = 6000000000: ceil((NFS_V4_CLIENT_RENEWAL_FLOOR_NS + LIVENESS_BUDGET_NS) / 1 s) s: an idle Linux client's longest gap between renewals and the lateness a live party may show, in the whole seconds FATTR4_LEASE_TIME carries (anchors ["NFS_V4_CLIENT_RENEWAL_FLOOR_NS", "LIVENESS_BUDGET_NS"])
+slates daemon: control_shard_capacity = ShardCapacity { tasks: 3381, timers: 3381 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
+slates daemon: kept_bound = 150634: 2 × forward_lane_bound + control_shard_capacity.tasks + tasks_per_shard × (shards − 1) (anchors ["clients_per_shard", "region.slots", "shards", "tasks_per_shard", "fleet.peers"])
+slates-server: the start beat 13 times over 2 shards before the watchdog took the beat over
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck once it has gone its window without a step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a step; a shard's window is the 1000 ms liveness window, raised to the scheduler overrun the shard measures where that is longer, at most 10000 ms (the observation budget), so a poll may run 1000 ms of CPU at least (this build runs compiled code 1.0 times as slowly as the machine runs it in machine code, 4084 ns against 4166 ns for a batch of 8 chains); a shard waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host reports a memory stall (kern.memorystatus_vm_pressure_level, above normal: Some(Level { pressed: false }) now); an anchor reads the beat, so a stuck shard withholds it
+slates daemon: the version-control HTTP edge serves cleartext on 127.0.0.1:49210
+slates daemon: the svn:// listener serves on 127.0.0.1:49211
+slates daemon: instance svnf-23266 serving on 2 shards under the anchor
+slates-server: shard 1 initialized in 10452 µs, 3954 µs of its CPU, in 7 slices of 7 units; the longest slice 6223 µs, the most CPU in one 2268 µs, ending at unit 2 (a slice's floor 1 µs, 361 µs yielding)
+slates-server: shard 0 initialized in 10656 µs, 4080 µs of its CPU, in 5 slices of 7 units; the longest slice 9265 µs, the most CPU in one 3674 µs, ending at unit 2 (a slice's floor 1 µs, 364 µs yielding)
+slates anchor: daemon pid 23434 recovered: it has served as long as its start took (103 ms), so its exit is no failed start
+slates daemon: the control shard's beat task ran 1061 ms after its last turn (a near miss against its 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 219 steps and 220 polls (217 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 14 tasks live; its longest poll is 1043 ms and its timer overrun 1 ms
+slates daemon: the control shard's beat task ran 513 ms after its last turn (a near miss against its 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 350 steps and 351 polls (347 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 14 tasks live; its longest poll is 1043 ms and its timer overrun 1 ms
+slates daemon: the control shard's beat task ran 587 ms after its last turn (a near miss against its 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 147 steps and 148 polls (139 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 14 tasks live; its longest poll is 1043 ms and its timer overrun 1 ms
+diag-svnfetch svn:// conversation: turns 110, bytes 249, most a turn 119, room 278528, quantum_ns 3950, long_steps +158, longest_step_ns 1043252333
+diag-svnfetch svn:// conversation: turns 22, bytes 250, most a turn 119, room 278528, quantum_ns 3950, long_steps +35, longest_step_ns 1043252333
+diag-svnfetch svn:// conversation: turns 29, bytes 251, most a turn 119, room 278528, quantum_ns 3950, long_steps +45, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286602, most a run 286602, room 278528, done false, quantum_ns 3950, shard long_steps 18750, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280051, most a run 286602, room 278528, done false, quantum_ns 3950, shard long_steps 18751, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 304712, most a run 304712, room 278528, done false, quantum_ns 3950, shard long_steps 18752, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 289628, most a run 304712, room 278528, done false, quantum_ns 3950, shard long_steps 18753, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 313054, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18754, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 306216, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18756, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287488, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18759, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 297041, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18761, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279368, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18764, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 297421, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18766, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280096, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18769, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279621, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18771, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278697, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18773, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 292944, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18776, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286086, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18778, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280566, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18780, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280486, most a run 313054, room 278528, done false, quantum_ns 3950, shard long_steps 18782, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 334184, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18785, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287237, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18787, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280398, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18790, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286166, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18792, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281600, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18794, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 300029, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18797, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 288712, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18799, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287645, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18801, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 300412, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18803, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280236, most a run 334184, room 278528, done false, quantum_ns 3950, shard long_steps 18805, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 359183, most a run 359183, room 278528, done false, quantum_ns 3950, shard long_steps 18807, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 302584, most a run 359183, room 278528, done false, quantum_ns 3950, shard long_steps 18810, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 311276, most a run 359183, room 278528, done false, quantum_ns 3950, shard long_steps 18812, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 319453, most a run 359183, room 278528, done false, quantum_ns 3950, shard long_steps 18814, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 290440, most a run 359183, room 278528, done false, quantum_ns 3950, shard long_steps 18816, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 317358, most a run 359183, room 278528, done false, quantum_ns 3950, shard long_steps 18819, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 285408, most a run 359183, room 278528, done false, quantum_ns 3950, shard long_steps 18822, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 341922, most a run 359183, room 278528, done false, quantum_ns 3950, shard long_steps 18824, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 379264, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18826, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 289582, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18828, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 302804, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18830, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 343226, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18833, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 322988, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18835, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 302518, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18837, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 294070, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18839, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 297146, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18841, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280286, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18843, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 284169, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18845, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 305517, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18848, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 294969, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18850, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286462, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18852, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280109, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18854, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280668, most a run 379264, room 278528, done false, quantum_ns 3950, shard long_steps 18856, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 398464, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18859, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 282571, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18861, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287359, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18863, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 285130, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18866, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 296866, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18868, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 306508, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18871, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 298327, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18873, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279641, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18876, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 283825, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18878, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 293441, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18880, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 283768, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18882, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 295017, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18884, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 361890, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18887, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 346873, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18890, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 293355, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18892, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 367055, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18894, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 320653, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18897, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 345460, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18899, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 317817, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18901, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 303461, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18903, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 370604, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18905, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 283417, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18908, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 284954, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18910, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 363574, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18913, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 308186, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18915, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 393726, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18917, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281961, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18919, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 295361, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18921, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279077, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18923, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 310596, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18925, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 318066, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18928, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279402, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18930, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 349312, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18932, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 319042, most a run 398464, room 278528, done false, quantum_ns 3950, shard long_steps 18934, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 409652, room 278528, done false, quantum_ns 3950, shard long_steps 18936, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 409652, room 278528, done false, quantum_ns 3950, shard long_steps 18940, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 365191, most a run 409652, room 278528, done false, quantum_ns 3950, shard long_steps 18942, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 409652, room 278528, done false, quantum_ns 3950, shard long_steps 18944, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 409652, room 278528, done false, quantum_ns 3950, shard long_steps 18947, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 359460, most a run 409652, room 278528, done false, quantum_ns 3950, shard long_steps 18949, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 410239, most a run 410239, room 278528, done false, quantum_ns 3950, shard long_steps 18952, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410239, room 278528, done false, quantum_ns 3950, shard long_steps 18954, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410239, room 278528, done false, quantum_ns 3950, shard long_steps 18957, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 338967, most a run 410239, room 278528, done false, quantum_ns 3950, shard long_steps 18960, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410239, room 278528, done false, quantum_ns 3950, shard long_steps 18962, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 305760, most a run 410239, room 278528, done false, quantum_ns 3950, shard long_steps 18964, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 410235, most a run 410239, room 278528, done false, quantum_ns 3950, shard long_steps 18966, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 306012, most a run 410239, room 278528, done false, quantum_ns 3950, shard long_steps 18969, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 410243, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18971, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18973, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 348739, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18976, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18978, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18980, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 293019, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18982, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18984, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18987, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280667, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18989, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18991, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18994, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280406, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18996, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 18998, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19000, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 374139, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19004, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19006, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 353398, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19008, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19011, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19013, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278821, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19015, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19017, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 400220, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19020, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 410241, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19022, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19024, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 314091, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19027, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19029, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 338040, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19031, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 410243, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19033, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19036, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 375811, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19038, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19040, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19042, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 401971, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19043, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19046, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19047, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281620, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19048, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 410239, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19050, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19053, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 408061, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19055, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19058, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19060, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 368641, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19062, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19065, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19067, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 283597, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19069, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 367836, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19071, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 386042, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19074, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 293499, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19076, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281841, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19078, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279242, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19081, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281578, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19083, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 300716, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19085, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 372746, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19087, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 295164, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19089, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286279, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19092, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280653, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19094, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 288228, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19096, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 288131, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19098, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279873, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19101, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 294701, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19103, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 311430, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19105, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280683, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19107, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 366029, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19110, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19113, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278548, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19117, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 312156, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19120, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 294642, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19123, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 293942, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19125, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 314059, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19127, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 282016, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19129, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 282460, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19131, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 284171, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19133, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 363457, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19136, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 283459, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19138, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286770, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19140, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287002, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19142, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278648, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19144, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278587, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19147, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 303711, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19149, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278624, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19151, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 290471, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19153, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279572, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19156, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279971, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19158, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 294471, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19159, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280439, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19162, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 285760, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19164, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278999, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19168, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 296494, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19171, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278655, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19173, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287727, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19176, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279404, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19178, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 290981, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19181, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286868, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19184, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280103, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19186, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281063, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19188, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 298582, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19190, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 306983, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19193, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281313, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19195, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287309, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19198, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 317251, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19200, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279471, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19202, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286892, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19204, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 292440, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19206, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 313680, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19209, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 285696, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19211, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278559, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19213, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 352847, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19215, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279135, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19217, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 327806, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19220, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278535, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19222, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279322, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19224, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281843, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19226, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 281017, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19228, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278538, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19231, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278577, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19233, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 301695, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19235, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 283114, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19238, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 289356, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19240, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 303610, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19242, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 187991, most a run 410243, room 278528, done true, quantum_ns 3950, shard long_steps 19245, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278590, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19278, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286190, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19281, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 314628, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19286, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 289316, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19290, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 303670, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19294, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 302512, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19296, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 292196, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19298, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 333676, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19300, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 301282, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19302, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278535, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19304, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278591, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19307, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 226520, most a run 410243, room 278528, done true, quantum_ns 3950, shard long_steps 19308, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280483, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19346, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278687, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19347, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278787, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19348, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 285591, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19349, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 302824, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19350, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19351, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 364604, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19355, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 295281, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19357, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280483, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19361, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 289707, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19362, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 311139, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19365, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 402665, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19366, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19367, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19369, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 296622, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19370, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 291222, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19372, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 315348, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19373, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 303353, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19375, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279740, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19376, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280054, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19377, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287421, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19378, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279386, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19381, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 283978, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19382, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279346, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19384, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 83753, most a run 410243, room 278528, done true, quantum_ns 3950, shard long_steps 19385, longest_step_ns 1043252333

@@ -1,0 +1,45 @@
+== after svn
+diag-svnfetch svn:// conversation: turns 110, bytes 249, most a turn 119, room 278528, quantum_ns 3950, long_steps +158, longest_step_ns 1043252333
+diag-svnfetch svn:// conversation: turns 22, bytes 250, most a turn 119, room 278528, quantum_ns 3950, long_steps +35, longest_step_ns 1043252333
+diag-svnfetch svn:// conversation: turns 29, bytes 251, most a turn 119, room 278528, quantum_ns 3950, long_steps +45, longest_step_ns 1043252333
+== after http
+diag-svnfetch dav report run: wrote 289356, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19240, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 303610, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19242, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 187991, most a run 410243, room 278528, done true, quantum_ns 3950, shard long_steps 19245, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278590, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19278, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 286190, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19281, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 314628, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19286, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 289316, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19290, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 303670, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19294, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 302512, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19296, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 292196, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19298, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 333676, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19300, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 301282, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19302, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278535, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19304, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278591, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19307, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 226520, most a run 410243, room 278528, done true, quantum_ns 3950, shard long_steps 19308, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280483, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19346, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278687, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19347, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 278787, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19348, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 285591, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19349, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 302824, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19350, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19351, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 364604, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19355, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 295281, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19357, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280483, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19361, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 289707, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19362, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 311139, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19365, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 402665, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19366, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19367, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 409652, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19369, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 296622, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19370, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 291222, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19372, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 315348, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19373, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 303353, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19375, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279740, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19376, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 280054, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19377, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 287421, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19378, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279386, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19381, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 283978, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19382, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 279346, most a run 410243, room 278528, done false, quantum_ns 3950, shard long_steps 19384, longest_step_ns 1043252333
+diag-svnfetch dav report run: wrote 83753, most a run 410243, room 278528, done true, quantum_ns 3950, shard long_steps 19385, longest_step_ns 1043252333

@@ -1,0 +1,18 @@
+svn:// 49211, http 49210
+bootstrapped
+repository: project
+id: 4e2b16d410ad2de70000100000000001
+repository: project
+revisions: 1000
+youngest: 1000
+import exit 0 6.406 s
+credential token: exit 0; exports        4 words; its lines but the token's:
+  id: 47ba12adb7884a01119b4f7c5f2d8b936f5af154da45d8d288610568902488bb
+  expires: never
+svn-checkout exit 0 4.974 s
+svn youngest 1000, files     4872
+svn-update-500 exit 0 2.0 s
+http-checkout exit 0 5.878 s
+http youngest 1000, files     4872
+http-update-500 exit 0 2.029 s
+258
