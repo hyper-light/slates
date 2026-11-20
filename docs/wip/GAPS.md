@@ -109,7 +109,10 @@
 > its fork back. Part 2b BUILT: a fork made from an index another push replaced since is re-based by node at
 > landing (`intake::Rebase`: each kept row appended again to a fork of the index as it is, by node, its content reused,
 > a row the index already holds passed over), a slice at a time, then judged and landed; `land` never puts a stale
-> fork in the index's place. Owed: part 3, the import's room per repository; S5 (main's convergence plan): file
+> fork in the index's place. Part 3 BUILT: an import's room is what its shard could admit, a bound only,
+> the shard charged what it holds between turns (`Import::holding`), trued up each turn (it was one client region,
+> 278,528 B: Mercurial's own repository refused `PastRoom`); the by-use import of that repository is w-perf's run.
+> Owed: part 3's by-use proof; S5 (main's convergence plan): file
 > texts as the work's green files by identity, changelog and manifests as deltas, rows naming content by identity.
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
