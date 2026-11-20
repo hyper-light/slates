@@ -2029,8 +2029,11 @@
 > lock (both its lock calls pass expiration 0); only a DAV `LOCK` with a `Timeout` does, so the case needs a timed DAV
 > lock and a commit spanning its expiry, off the scale path.
 > **Measured 2026-11-20 (the big Studio, release; BENCHMARKS):** the export's text calls run 12 to 20 times the copy
-> slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs): owed, the piece and the
-> window sliced to the slice. **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
+> slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs). Format 2's piece is now the
+> bytes the shard's copy slice digests at the machine's measured MD5 and SHA-1 rate (`DaemonConfig::
+> svn_text_piece_bytes`, `Exporter::with_text_piece`; the rate measured at the daemon's derivation through aws-lc-rs,
+> as the writer digests); its release numbers are owed with the big Studio back. Format 3's window made in parts is
+> w-bugs' shared encoder (main's routing). **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
 > refused E210009 by one request's room over svn:// and DAV (rule 2), and below that room `commit::drive::Work::texts`
 > holds every new text whole (rule 1, by reading); owed, w-svn's next piece. **Intake, part 1 (same day, w-svn, on w-perf's seam):**
 > the commit drive applies each svndiff window into one window's room and hands it to the caller's

@@ -228,7 +228,7 @@ impl Repository {
     &mut self,
     revision: Revision,
     changes: &[ChangedPath],
-    mut fresh: BTreeMap<ContentIdentity, Vec<u8>>,
+    fresh: BTreeMap<ContentIdentity, Vec<u8>>,
   ) -> Result<u64, StepRefusal> {
     let mut saved = 0u64;
     for change in changes {
