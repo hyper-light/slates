@@ -31,7 +31,8 @@ Owed (main's): Linux/Windows clippy + tests of items 2-3 (gate), the Windows bar
 ## Next pieces from main (2026-11-20)
 Feedback: tool installs on Ada's machines (even user-scoped Python on jupiter) need Ada's word first (slates CLAUDE.md
 §2 item 14). Item 4 waits on Ada's word about WinFsp on jupiter; target kept there.
-5. kiln: `is_fuse` (crates/kiln/src/os/tree.rs) gated #[cfg(not(windows))] as let_go_of is. Worktree
+5. kiln: `is_fuse` LANDED kiln main 28ea7df79..90623ee40 (Windows -D warnings no longer reports it; that build still fails
+   on session.rs:5371 `sandbox::container` (hard error) and held.rs:29 unused import, reported). Was: worktree
    ~/kiln-work/w-k90-vendor-isfuse, branch agents/w-k90-isfuse (from kiln main 68964a93d), uncommitted until jupiter's
    check: `cargo rustc --locked -p kiln --lib -- -D warnings` on jupiter (kiln run r24, patch applied over 68964a93d in
    C:\Users\corph\.cache\w-k90-vendor-kiln, target ...\w-k90-vendor-target).
@@ -44,3 +45,13 @@ Feedback: tool installs on Ada's machines (even user-scoped Python on jupiter) n
    landing went from a clean re-merge in ~/slates-work/w-k90-vendor-land (branch agents/w-k90-ssh-gone-land).
    Run requests (main's): clippy/xtask for slates-server; Windows build of vcs_ssh; a live git push over SSH whose
    client is killed while a hook runs.
+7. g266 microVM EACCES (main's reorder): FOUND + FIXED. Looped kiln's `SLATES_E2E=1 VM_E2E=1 slates_e2e microvm::g266` on
+   this Studio (kiln 28ea7df79, a local diagnostic in vendored slates logging each Shards stream request): Shards'
+   owner word arrived as SetXattr node 1 uid 0 in the SHORT fuse_setxattr_in (8 bytes) while the stream had kept
+   FUSE_SETXATTR_EXT -> missed, dispatched, errno 95 -> no owner swap -> run uid 200000 refused EACCES. Cause: Linux
+   fuse_setxattr sizes by fc->setxattr_ext at the call, fuse_block_alloc holds it until INIT's reply (kernel.org
+   master, sha256 89203290559bd37a / 29cc467f872b1ef0). Fix A-741: abi::setxattr_head (per-request form).
+   LANDED slates main 2add2964..e0c06750 (b1f68fb9 red, be465b23 fix + merge); kiln recorded change 0002, kiln main
+   5a294413c..81174ac49. Drive: 3/3 first-run failures before, 6/6 passes after (same pin, same bridge sources).
+   Note: claimed A-737 then A-740 by mistake (both taken); A-741 is mine (registry fixed by a remote union rewrite).
+Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word about WinFsp on jupiter (target kept there).
