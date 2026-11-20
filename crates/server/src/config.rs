@@ -479,6 +479,10 @@ pub struct DaemonConfig {
   /// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3), when the operator starts one:
   /// none from [`DaemonConfig::derive`].
   pub vcs_http: Option<VcsHttpConfig>,
+  /// Where the svn:// listener listens, when the operator starts one (`--vcs-svn ADDRESS`; §4.17.4 piece 7, A-656 part
+  /// 2): A-656's connection on every connection it accepts, on a loopback address alone for a daemon that is no fleet
+  /// node, since ra_svn is cleartext; none from [`DaemonConfig::derive`].
+  pub vcs_svn: Option<slates_rt::tcp::SocketAddrV4>,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
@@ -1194,6 +1198,7 @@ impl DaemonConfig {
       nfs_v4,
       inode_reserve,
       vcs_http: None,
+      vcs_svn: None,
       derivations,
     }
     .with_control_shard_noted()

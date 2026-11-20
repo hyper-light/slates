@@ -58,7 +58,7 @@ use slates_hg::{Admission, http as hg_wire};
 use slates_http::head::{Head, Target};
 use slates_http::percent::{self, Plus};
 use slates_http::reply::Status;
-use slates_http_edge::connection::Fields;
+use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential;
 
 use super::git::{Authenticator, Located, Repositories, Unproven};
@@ -245,6 +245,7 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
         answer: Answer::Serve {
           fields: Fields::new(),
           head_only: false,
+          status: StatusMode::Streamed,
           exchange,
         },
         proven: true,

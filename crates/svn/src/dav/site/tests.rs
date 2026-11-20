@@ -59,6 +59,19 @@ impl Fixture {
     }
   }
 
+  /// The repository as the principal `rules` compile for reads it.
+  fn served<'a>(&'a self, rules: Option<&'a PrincipalRules>) -> Served<'a, Green> {
+    Served {
+      index: &self.index,
+      repository: &self.green,
+      root: ROOT,
+      uuid: UUID,
+      locks: &self.locks,
+      rules,
+      now: NOW,
+    }
+  }
+
   /// The answer to `method` on `path` below the root, as the principal `rules` compile for asks it.
   fn ask(
     &self,
@@ -67,22 +80,13 @@ impl Fixture {
     (path, depth): (&str, Option<&str>),
     body: &[u8],
   ) -> Answer {
-    let served = Served {
-      index: &self.index,
-      repository: &self.green,
-      root: ROOT,
-      uuid: UUID,
-      locks: &self.locks,
-      rules,
-      now: NOW,
-    };
     let request = Request {
       method,
       path,
       depth,
       body,
     };
-    answer(&served, &request, &BOUNDS, ROOM)
+    answer(&self.served(rules), &request, &BOUNDS, ROOM)
   }
 
   /// The whole answer anonymous gets to `method` on `path`.
@@ -96,6 +100,7 @@ fn whole(answer: Answer) -> HttpAnswer {
   match answer {
     Answer::Whole(whole) => whole,
     Answer::Text { .. } => panic!("a text where a whole answer was due"),
+    Answer::Report(_) => panic!("a report where a whole answer was due"),
   }
 }
 
@@ -125,8 +130,9 @@ fn hrefs(body: &str) -> Vec<String> {
 }
 
 /// A-681 (`version.c` `get_option`): do send the OPTIONS stock svn opens a session with, asking for the activity
-/// collection; expect `200`, the HTTPv2 stubs built from the root, the youngest revision 6, no capability line (each
-/// names a report or a commit this part does not serve), mergeinfo answered `no`, and the activity collection's href.
+/// collection; expect `200`, the HTTPv2 stubs built from the root, the youngest revision 6, the one capability served
+/// (`log-revprops`; every other names a report or a commit this site does not serve yet), mergeinfo answered `no`, and
+/// the activity collection's href.
 #[test]
 fn an_options_answer_lists_the_httpv2_facts_and_no_capability_unserved() {
   let fixture = Fixture::new();
@@ -147,7 +153,8 @@ fn an_options_answer_lists_the_httpv2_facts_and_no_capability_unserved() {
       vec![
         "1,2",
         "version-control,checkout,working-resource",
-        "merge,baseline,activity,version-controlled-collection"
+        "merge,baseline,activity,version-controlled-collection",
+        "http://subversion.tigris.org/xmlns/dav/svn/log-revprops"
       ],
       vec!["6"],
       vec!["/repo"],
@@ -508,4 +515,153 @@ fn a_mime_type_is_judged_as_subversion_judges_it() {
   .map(|value| valid_mime_type(value))
   .collect();
   assert_eq!(judged, [true, true, true, false, true, false, false, false]);
+}
+
+/// Shape: the `log-report` `svn log -v` sent (A-609's fixture): two entries at most, from revision 5 down.
+const LOG_VERBOSE: &[u8] = include_bytes!("../fixtures/log-report-verbose.xml");
+
+/// The answer a REPORT streams, a slice of `room` at a time, as the principal `rules` compile for reads it: its
+/// headers, what it wrote and how it ended.
+fn reported(
+  fixture: &Fixture,
+  rules: Option<&PrincipalRules>,
+  answer: Answer,
+  room: usize,
+) -> (Headers, Vec<u8>, ReportProgress) {
+  let Answer::Report(mut report) = answer else {
+    panic!("not a report: {answer:?}");
+  };
+  let mut out = Vec::new();
+  loop {
+    match report.resume(&fixture.served(rules), &mut out, room) {
+      ReportProgress::More => {}
+      ended => return (report.headers(), out, ended),
+    }
+  }
+}
+
+/// Each item's revision and its changed paths (each its element's name, its path and its copy source), in order.
+fn log_items(body: &[u8]) -> Vec<(String, Vec<String>)> {
+  let report = super::super::xml::parse(body, &BOUNDS).unwrap();
+  assert!(report.is(SVN_NS, "log-report"));
+  let change = |path: &super::super::xml::Element| {
+    let source = path.attribute("copyfrom-path").unwrap_or_default();
+    format!("{} {} {source}", path.name, path.text())
+  };
+  report
+    .elements()
+    .map(|item| {
+      let revision = item
+        .elements()
+        .find(|child| child.name == "version-name")
+        .unwrap()
+        .text();
+      let changed = item
+        .elements()
+        .filter(|child| child.name.ends_with("-path"))
+        .map(change)
+        .collect();
+      (revision, changed)
+    })
+    .collect()
+}
+
+/// Shape: the namespace Subversion's own elements are in.
+const SVN_NS: &str = "svn:";
+
+/// A-681 (`dav_method_report`, `reports/log.c`): do REPORT `svn log -v`'s body on the trunk, a slice of the smallest
+/// room at a time, then a log naming a missing path; expect the first `text/xml`, `log.c`'s header and end, and revisions
+/// 5 and 4 with their changed paths in the revision's order, the copy's source named; and the second refused before
+/// its first byte, `404`, FSFS's "File not found" in `D:error`.
+#[test]
+fn a_log_report_streams_its_walk_and_is_refused_before_its_first_byte() {
+  let fixture = Fixture::new();
+  let anonymous = rules_of(None);
+  let rules = Some(&anonymous);
+  let asked = fixture.ask(rules, "REPORT", ("/trunk", None), LOG_VERBOSE);
+  let (headers, body, ended) = reported(&fixture, rules, asked, 1);
+  let text = String::from_utf8(body.clone()).unwrap();
+  let start = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<S:log-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n<S:log-item>\n";
+  assert_eq!(
+    (
+      headers,
+      ended,
+      text.starts_with(start),
+      text.ends_with("</S:log-item>\n</S:log-report>\n")
+    ),
+    (
+      vec![("Content-Type", String::from("text/xml; charset=\"utf-8\""))],
+      ReportProgress::Done,
+      true,
+      true
+    )
+  );
+  let changed = |paths: &[&str]| {
+    paths
+      .iter()
+      .map(|path| (*path).to_owned())
+      .collect::<Vec<_>>()
+  };
+  assert_eq!(
+    log_items(&body),
+    vec![
+      (
+        "5".to_owned(),
+        changed(&["modified-path /trunk/a.txt ", "added-path /trunk/big.txt "])
+      ),
+      (
+        "4".to_owned(),
+        changed(&[
+          "modified-path /branches/b1/a.txt ",
+          "deleted-path /trunk/dir/c.bin ",
+          "added-path /trunk/dir/sub ",
+          "added-path /trunk/dir/sub/d.txt ",
+          "deleted-path /trunk/new.txt ",
+          "added-path /trunk/renamed.txt /trunk/new.txt",
+        ])
+      ),
+    ]
+  );
+  let missing = b"<S:log-report xmlns:S=\"svn:\"><S:path>missing.txt</S:path></S:log-report>";
+  let asked = fixture.ask(rules, "REPORT", ("/trunk", None), missing);
+  let (_, written, ended) = reported(&fixture, rules, asked, 1);
+  let words = "File not found: revision 6, path '/trunk/missing.txt'";
+  let error = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:error xmlns:D=\"DAV:\" xmlns:m=\"http://apache.org/dav/xmlns\" \
+xmlns:C=\"svn:\">\n<C:error/>\n<m:human-readable errcode=\"160013\">\n{words}\n</m:human-readable>\n</D:error>\n"
+  );
+  let ReportProgress::Refused(refused) = ended else {
+    panic!("not refused before its first byte: {ended:?}");
+  };
+  assert_eq!(
+    (written.len(), refused.status, text_of(&refused)),
+    (0, 404, error)
+  );
+}
+
+/// A-681 (`dav_method_report`, `deliver_report`; the module doc's departure): do REPORT a log on a missing file, a
+/// report this site does not serve yet on the trunk, and a log with a negative limit; expect `404` (no resource),
+/// `501` in `mod_dav_svn`'s words, and `400`.
+#[test]
+fn a_report_is_refused_by_its_resource_its_name_and_its_limit() {
+  let fixture = Fixture::new();
+  let log: &[u8] = b"<S:log-report xmlns:S=\"svn:\"><S:path></S:path></S:log-report>";
+  let dated: &[u8] = include_bytes!("../fixtures/dated-rev-report.xml");
+  let negative: &[u8] =
+    b"<S:log-report xmlns:S=\"svn:\"><S:limit>-1</S:limit><S:path></S:path></S:log-report>";
+  let unserved = fixture.anonymous("REPORT", "/trunk", None, dated);
+  let statuses = [
+    fixture
+      .anonymous("REPORT", "/trunk/missing.txt", None, log)
+      .status,
+    unserved.status,
+    fixture.anonymous("REPORT", "/trunk", None, negative).status,
+  ];
+  assert_eq!(
+    (
+      statuses,
+      text_of(&unserved).contains("The requested report is unknown")
+    ),
+    ([404, 501, 400], true)
+  );
 }

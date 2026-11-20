@@ -52,8 +52,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{
   AtomicHeld, AtomicRecord, BranchRecord, GreenPosition, LockRecord, LogName, LogSpan,
-  MemberOrigin, MemberRecord, NameChange, PhaseRoot, RegisterRecord, RepositoryId,
-  RepositoryPolicy, RepositoryRecord, StateChange, StateLog, VolumeId,
+  LoggedChange, MemberOrigin, MemberRecord, NameChange, PhaseRoot, RegisterRecord, RepositoryId,
+  RepositoryPolicy, RepositoryRecord, StateChange, StateLog, StateLogRecord, VolumeId,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -96,6 +96,15 @@ pub struct Repositories {
   atomic: BTreeMap<(LogName, u64), (AtomicRecord, u64)>,
   /// Derived: each position an atomic record took a green's log to, to the record's key: each green's log's pointers.
   atomic_at: BTreeMap<(VolumeId, u64), (LogName, u64)>,
+  /// The state logs' records the operation being applied made (A-636 part 2b): one a state log it moved, each with
+  /// the changes that took that log's positions, in order. Cleared as each operation starts
+  /// ([`Repositories::clear_made`]) and stamped with the operation's identity and spans once it is applied
+  /// ([`Repositories::seal_made`]), so it holds one operation's records at most; the database hands them on once the
+  /// operation is durable (`crate::replay::Db::take_state_log_records`).
+  made: Vec<StateLogRecord>,
+  /// What the operation being applied moved of its greens' logs (an entry's versions): spans its state logs' records
+  /// carry beside their own, so a takeover keeps the whole operation or none of it.
+  made_greens: Vec<LogSpan>,
 }
 
 /// A repository's own state (§4.17.1 shared piece 2; A-603, A-642): its logs of its own, each at its own position,
@@ -334,6 +343,15 @@ impl Register {
       }
     }
     Ok(register)
+  }
+}
+
+/// The state log a change of the repository's own state moves (A-642).
+fn state_log_of(change: &StateChange) -> StateLog {
+  match change {
+    StateChange::PhaseRootAdded { .. } | StateChange::PhaseRootRemoved { .. } => StateLog::Phases,
+    StateChange::MarkerAdded { .. } => StateLog::Markers,
+    StateChange::LockTaken { .. } | StateChange::LockReleased { .. } => StateLog::Locks,
   }
 }
 
@@ -841,7 +859,11 @@ impl Repositories {
       }
       Op::RepositoryBranchAdded { record } => {
         self.bind(record);
-        self.names_moved(record.repository, 1);
+        let change = NameChange::Bind {
+          name: record.name.clone(),
+          green: record.green,
+        };
+        self.log_names(record.repository, vec![LoggedChange::Named { change }]);
         Ok(StateBytes::default())
       }
       Op::RepositoryBranchRetired { repository, name } => {
@@ -850,18 +872,23 @@ impl Repositories {
           .remove(&(*repository, name.clone()))
           .ok_or(DbError::NotFound)?;
         self.bound.remove(&green);
-        self.names_moved(*repository, 1);
+        let change = NameChange::Retire { name: name.clone() };
+        self.log_names(*repository, vec![LoggedChange::Named { change }]);
         Ok(StateBytes::default())
       }
       Op::RepositoryDefaultSet { repository, branch } => {
         let record = self.records.get_mut(repository).ok_or(DbError::NotFound)?;
         record.default_branch = branch.clone();
-        self.names_moved(*repository, 1);
+        let change = NameChange::Default {
+          branch: branch.clone(),
+        };
+        self.log_names(*repository, vec![LoggedChange::Named { change }]);
         Ok(StateBytes::default())
       }
       Op::RepositoryGreenJoined { record } => {
         self.join(record);
-        self.names_moved(record.repository, 1);
+        let member = record.clone();
+        self.log_names(record.repository, vec![LoggedChange::Joined { member }]);
         Ok(StateBytes::default())
       }
       // An entry needs its greens' spans, which only the partition knows: `apply_advanced` takes them.
@@ -925,8 +952,12 @@ impl Repositories {
     if !self.records.contains_key(&entry.repository) {
       return Err(DbError::NotFound);
     }
+    let mut namespace = Vec::with_capacity(entry.joined.len().saturating_add(entry.names.len()));
     for member in &entry.joined {
       self.join(member);
+      namespace.push(LoggedChange::Joined {
+        member: member.clone(),
+      });
     }
     for change in &entry.names {
       match change {
@@ -946,17 +977,26 @@ impl Repositories {
           }
         }
       }
+      namespace.push(LoggedChange::Named {
+        change: change.clone(),
+      });
     }
-    let namespace = entry.joined.len().saturating_add(entry.names.len());
-    self.names_moved(
-      entry.repository,
-      u64::try_from(namespace).unwrap_or(u64::MAX),
-    );
+    self.log_names(entry.repository, namespace);
+    self.made_greens.clone_from(&greens);
     let mut bytes = StateBytes::default();
     let mut spans = greens;
+    let mut logged: BTreeMap<StateLog, Vec<LoggedChange>> = BTreeMap::new();
     if let Some(register) = self.registers.get_mut(&entry.repository) {
       for change in &entry.state {
+        let log = state_log_of(change);
+        let at = register.position(log);
         bytes.add(register.apply(change));
+        // A change that changed nothing took no position, so no record carries it (A-636 part 2b).
+        if register.position(log) > at {
+          logged.entry(log).or_default().push(LoggedChange::Changed {
+            change: change.clone(),
+          });
+        }
       }
       // The objects ride with the entry and take no position (A-662), so they never make it an atomic record.
       if !entry.objects.is_empty() {
@@ -974,6 +1014,17 @@ impl Repositories {
             from,
             to,
           });
+          if let Some(changes) = logged.remove(&log) {
+            self.made.push(StateLogRecord {
+              repository: entry.repository,
+              log,
+              from,
+              to,
+              identity: [0; 32],
+              spans: Vec::new(),
+              changes,
+            });
+          }
         }
       }
     }
@@ -986,11 +1037,66 @@ impl Repositories {
     Ok(bytes)
   }
 
-  /// The names log of `repository` takes `changes` positions (A-642). A repository that is gone has no log to move.
-  fn names_moved(&mut self, repository: RepositoryId, changes: u64) {
-    if let Some(register) = self.registers.get_mut(&repository) {
-      register.names = register.names.saturating_add(changes);
+  /// The names log of `repository` takes a position for each of `changes` (A-642), and they are its record of the
+  /// operation being applied (A-636 part 2b). No changes, no position and no record; a repository that is gone has no
+  /// log to move.
+  fn log_names(&mut self, repository: RepositoryId, changes: Vec<LoggedChange>) {
+    if changes.is_empty() {
+      return;
     }
+    let Some(register) = self.registers.get_mut(&repository) else {
+      return;
+    };
+    let from = register.names;
+    let to = from.saturating_add(u64::try_from(changes.len()).unwrap_or(u64::MAX));
+    register.names = to;
+    self.made.push(StateLogRecord {
+      repository,
+      log: StateLog::Names,
+      from,
+      to,
+      identity: [0; 32],
+      spans: Vec::new(),
+      changes,
+    });
+  }
+
+  /// Starts an operation's records afresh (A-636 part 2b): whatever an earlier operation left goes, so
+  /// [`Repositories::seal_made`] and the database read this operation's alone.
+  pub fn clear_made(&mut self) {
+    self.made.clear();
+    self.made_greens.clear();
+  }
+
+  /// Stamps the records the operation just applied made with what it moved and who it is (A-636 part 2b): every span
+  /// it moved, its greens' and each state log's, in log order, and its identity, BLAKE3 over those spans' encoding and
+  /// then the operation's own (`operation`, its log encoding), so the records of one operation name it alike and two
+  /// operations that moved the same positions alike are told apart by what they did. Nothing to stamp, nothing done.
+  pub fn seal_made(&mut self, operation: impl FnOnce() -> Vec<u8>) {
+    if self.made.is_empty() {
+      self.made_greens.clear();
+      return;
+    }
+    let mut spans: Vec<LogSpan> = std::mem::take(&mut self.made_greens);
+    spans.extend(self.made.iter().map(|record| LogSpan {
+      log: record.log_name(),
+      from: record.from,
+      to: record.to,
+    }));
+    spans.sort_by_key(|span| span.log);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&slates_wire::Wire::to_bytes(&spans));
+    hasher.update(&operation());
+    let identity = *hasher.finalize().as_bytes();
+    for record in &mut self.made {
+      record.identity = identity;
+      record.spans.clone_from(&spans);
+    }
+  }
+
+  /// Hands on the records the operation last applied made, stamped ([`Repositories::seal_made`]), leaving none.
+  pub fn take_made(&mut self) -> Vec<StateLogRecord> {
+    std::mem::take(&mut self.made)
   }
 
   /// Keeps `record`, its spans in log order, and points each position it took on each green's log to it (A-642).
@@ -1103,7 +1209,7 @@ impl Repositories {
       }
     }
     for repository in changed {
-      self.names_moved(repository, 1);
+      self.log_names(repository, vec![LoggedChange::Left { green }]);
     }
   }
 

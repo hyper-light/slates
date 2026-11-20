@@ -252,6 +252,24 @@ changed texts, owed), and `libsvn_ra_svn/marshal.c` at 1.15.0 for the editor com
     `liveprops.c`; `deadprops.c`; `util.c` `dav_svn__get_safe_cr`; httpd 2.4.66 `mod_dav.c` `dav_method_propfind`,
     `props.c` `dav_get_allprops`, `dav_get_props`]: as the module documentation of `slates-svn`'s `dav::site` states,
     each departure named there.
+- **The `log-report`** (read 2026-11-19 for A-681's second slice) [C: `mod_dav_svn/reports/log.c` 85-560;
+  `version.c` `deliver_report`; `util.c` `dav_svn__convert_err`, `dav_svn__final_flush_or_error`; httpd 2.4.66
+  `mod_dav.c` `dav_method_report`; Subversion 1.15.0 from the GitHub mirror, sha256 in
+  `g297-sources/dav-1.15.0.SHA256SUMS`, httpd's in `httpd-2.4.66.SHA256SUMS`]:
+  - `dav_svn__log_report` reads its children in the `svn:` namespace by local name, joins each `S:path` to the
+    resource's repository path (`svn_relpath_canonicalize`, `svn_fspath__join`), and calls `svn_repos_get_logs5` with
+    `dav_svn__authz_read_func`: the same walk and censoring `svnserve`'s `log_cmd` runs.
+  - The receivers write lazily: `maybe_send_header` before the first changed path or entry, `maybe_start_log_item`
+    before an item's first changed path; an entry of `SVN_INVALID_REVNUM` at stack depth 0 is dropped, else written
+    `-1`; the revision properties in the APR hash's order (`apr_hash_first`).
+  - A refusal from the walk is `dav_svn__convert_err(serr, HTTP_BAD_REQUEST, NULL)`: 404 for `SVN_ERR_FS_NOT_FOUND` and
+    `SVN_ERR_FS_NO_SUCH_REVISION`, 501 for `SVN_ERR_UNSUPPORTED_FEATURE`, 423 and 412 for the lock and base-value
+    errors, else 400. `dav_svn__final_flush_or_error` flushes whatever the brigade holds, so once the header is written
+    `dav_method_report` finds bytes sent and aborts the connection; before it, `dav_handle_err` answers the error. A
+    REPORT on a resource that does not exist is 404 before the report runs, and its answer is `DAV_XML_CONTENT_TYPE`.
+  - `svn_repos_get_logs5` (`libsvn_repos/log.c` 2380-2420, 2111, 2205): a limit applies to the shortcut only when
+    positive and stops `do_logs` whenever nonzero (`limit && ++send_count >= limit`), so a negative limit is none in
+    one and one entry in the other.
 - **svndiff over HTTP** [C: `mod_dav_svn/repos.c` 1784-1851]: the response's version follows the request's
   `Accept-Encoding` and the server's compression level (svndiff2 when the client lists it and the level is 1, else the
   client's preference, else 0). What a client sends in PUT bodies follows the server's advertised capabilities

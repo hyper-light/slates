@@ -898,3 +898,25 @@ server's directory are the ones its reviewed expected-failure list starts from.
   and `4ed9423` (secret); `heads` and `branchmap` answer `b252f2a` alone; `listkeys bookmarks` answers `one` and `two`,
   never `secret-one`, whose changeset is secret; `listkeys phases` answers the one draft root, `baa2576`. Both
   repositories (bookmarks in `.hg/bookmarks`, and in the store) answer alike.
+
+## 27. Found while serving `hg serve --stdio` behind the daemon's SSH edge (A-679, 2026-11-19; 7.2's code [C] read in Homebrew's 7.2: `dispatch.py` lines 329 to 353, `utils/stringutil.py` `escapestr` and `pprintgen`, `commands.py` `serve` lines 6215 to 6230; and runs of that stock `hg` 7.2, CPython 3.14, on macOS arm64 under `HGPLAIN=1 HGRCPATH=` in an empty directory)
+
+- **A repository argument starting `--` is refused before anything is opened** (`dispatch.py` `_runcatchfunc`). For
+  `serve` with `--stdio`, 7.2 accepts exactly `-R <repo> serve --stdio`, with `--hidden` as a fifth word when asked,
+  and refuses a `<repo>` starting `--` (its comment: a repository named `--debugger` or `--config=ui.debugger=1` "used
+  to actually run the debugger"): `abort: potentially unsafe serve --stdio invocation: <arguments>` on standard error,
+  nothing on standard output, status 255. A `<repo>` starting with one `-` passes and is looked up like any other.
+- **The arguments are listed by `stringutil.pprint`**: `[`, each argument in single quotes joined by `, `, `]`, each
+  argument's bytes through `escapestr`, which is `codecs.escape_encode`: a quote and a backslash each after a
+  backslash; tab, line feed and carriage return as `\t`, `\n` and `\r`; any other byte below a space or from DEL up
+  as `\x` and two lowercase hexadecimal digits; everything else, a double quote among it, as itself.
+- **Measured, every case refused 255 with standard output empty:** `--` gave `['-R', '--', 'serve', '--stdio']`;
+  `--x` gave `['-R', '--x', 'serve', '--stdio']`, and with `--hidden` `['-R', '--x', 'serve', '--stdio', '--hidden']`;
+  `--y'` and the byte 0xFF, with `--hidden`, gave `'--y\'\xff'`; `--a`, tab, `b`, line feed, `c`, carriage return,
+  `d`, a backslash, `e`, DEL, `h`, the byte 0x01, a double quote and `g` gave `'--a\tb\nc\rd\\e\x7fh\x01"g'`; `--`
+  and `é` in UTF-8 gave `'--\xc3\xa9'`; `-x`, with `--hidden` or not, gave `abort: repository -x not found`.
+- **`--hidden` without access** (`commands.py` `serve`). A user `experimental.server.allow-hidden-access` does not name
+  (the list is empty by default) is warned on standard error, `ignoring request to access hidden changeset by
+  unauthorized user: <user>` with the account `procutil.getuser()` names, and the session is then served with the
+  served view, as without the flag: run on a new repository with `hello` and the null `between`, it answered both and
+  exited 0. slates names the principal's record where 7.2 names the account, as A-657 part 4's `acl` words do.

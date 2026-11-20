@@ -21,27 +21,35 @@
 //! (`verbs::owner_of_name`, as `CreateRepository` routes it): a name another shard holds moves the connection there
 //! (`Answer::Move`), so a repository is found, judged and served on its own shard, its partition read with no crossing.
 //!
-//! **What is served.** git's services as the server has them, each from its own half: upload-pack once each
-//! repository's store is lent from its owner shard (A-662's map, a step at a time), `503` until then; receive-pack
-//! through the push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3).
-//! Mercurial's commands, a request whose query names one ([`ToolSites`]), from each repository's served view over its
-//! store on the shard the connection moved to, lent for each step (`ServedViews`, A-680 part 2); its pushes
-//! (`unbundle`) landed there by the same lender into the repository's store (A-680 part 2b).
+//! **What is served.** git's services as the server has them, each from its own half: upload-pack from each
+//! repository's store on its owner shard, lent from A-662's map a step at a time with the refs the principal may read
+//! (`crate::vcs_store::upload::ShardStores`, A-682), each request admitted the edge's room; receive-pack through the
+//! push driver on the shard the connection moved to, its state lent for each step (A-654 parts 2 and 3). Git LFS's
+//! locks API ([`ShardLfs`], A-629 part 2c), answered on the repository's owner shard over its locks log
+//! (`crate::lfs::answer`), which is durable as the partition's log is; the batch API and the transfers answer `503` at
+//! their head until the owner shard keeps LFS objects durably (A-581), so no upload is acknowledged that a restart
+//! would forget. Mercurial's commands, a request whose query names one ([`ToolSites`]), from each repository's served
+//! view over its store on the shard the connection moved to, lent for each step (`ServedViews`, A-680 part 2); its
+//! pushes (`unbundle`) landed there by the same lender into the repository's store (A-680 part 2b).
 
 use slates_db::catalog::{CredentialKind, Principal, RepositoryRecord};
+use slates_git::lfs::serve::{Answer as LfsAnswer, Endpoint};
+use slates_http::reply::Status;
 use slates_http_edge::credential::Credential;
 use slates_rt::tcp::{SocketAddrV4, TcpListener};
 use slates_rt::{RtError, Runtime, ShardId, futures};
 use slates_vfs::clock::Clock;
 
 use super::git::{
-  Authenticator, GitSite, Halves, Located, Proven, ReceiveServices, Repositories, ThisShard,
-  Unproven, Unserved,
+  Authenticator, GitSite, Halves, LfsService, Located, Proven, ReceiveServices, Repositories,
+  ThisShard, Unproven, UploadServices,
 };
 use super::hg::HgSite;
 use super::{Bounds, EdgeState, ToolSites, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
+use crate::lfs::{LfsCall, NoObjects};
 use crate::vcs_store::hg_view::ServedViews;
+use crate::vcs_store::upload::ShardStores;
 
 /// Counter: an edge whose listener's task the control shard's arena refused.
 const NOT_STARTED: &str = "vcs_http.not_started";
@@ -115,9 +123,33 @@ impl Repositories for ShardRepositories {
   }
 }
 
-/// git's site as the daemon serves it (the module doc, "What is served").
+/// Git LFS as the daemon serves it, on the shard its connection reached the repository's owner on (the module doc): the
+/// locks API over the repository's locks log; the batch API and the transfers not until the owner shard keeps LFS
+/// objects durably (A-581).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ShardLfs;
+
+impl LfsService for ShardLfs {
+  fn serves(&self, endpoint: &Endpoint) -> bool {
+    matches!(
+      endpoint,
+      Endpoint::CreateLock | Endpoint::ListLocks | Endpoint::VerifyLocks | Endpoint::Unlock { .. }
+    )
+  }
+
+  fn answer(&mut self, call: &LfsCall<'_>) -> LfsAnswer {
+    // A borrow of the shard's state refused is counted where it is refused; the request fails as the server's.
+    crate::state::with_state_counted(|state| crate::lfs::answer(state, &mut NoObjects, call))
+      .unwrap_or_else(|| crate::lfs::bare(Status::INTERNAL_SERVER_ERROR))
+  }
+}
+
+/// git's services as the daemon serves them (the module doc, "What is served").
+pub(crate) type DaemonServices = Halves<UploadServices<ShardStores>, ReceiveServices<ThisShard>>;
+
+/// git's site as the daemon serves it, Git LFS's among its routes (the module doc, "What is served").
 pub(crate) type DaemonGitSite =
-  GitSite<RecordedCredentials, ShardRepositories, Halves<Unserved, ReceiveServices<ThisShard>>>;
+  GitSite<RecordedCredentials, ShardRepositories, DaemonServices, ShardLfs>;
 
 /// Mercurial's site as the daemon serves it (the module doc, "What is served").
 pub(crate) type DaemonHgSite = HgSite<RecordedCredentials, ShardRepositories, ServedViews>;
@@ -126,7 +158,7 @@ pub(crate) type DaemonHgSite = HgSite<RecordedCredentials, ShardRepositories, Se
 pub(crate) type DaemonSite = ToolSites<DaemonGitSite, DaemonHgSite>;
 
 /// What makes the daemon's sites on any shard: their challenges name `realm`, each request's route and exchange are
-/// charged to the request's `room`, and receive-pack admits each push that room.
+/// charged to the request's `room`, and each git service admits each request that room.
 fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 'static {
   move || {
     let git = GitSite::new(
@@ -134,8 +166,12 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       room,
       RecordedCredentials,
       ShardRepositories,
-      Halves::new(Unserved, ReceiveServices::new(ThisShard, room)),
-    );
+      Halves::new(
+        UploadServices::new(ShardStores, room),
+        ReceiveServices::new(ThisShard, room),
+      ),
+    )
+    .with_lfs(ShardLfs);
     let hg = HgSite::new(
       realm.clone(),
       room,
@@ -178,7 +214,11 @@ pub(crate) fn start(
       "it has no identity, and serves cleartext on a loopback address alone",
     ));
   }
-  let listener = match listener_for(edge.address, bounds) {
+  let listener = match crate::daemon::held_or_bound_listener(
+    slates_anchor::ENV_VCS_HTTP,
+    edge.address,
+    bounds.backlog(),
+  ) {
     Ok(listener) => listener,
     Err(why) => return Ok(not_started(&why)),
   };
@@ -237,37 +277,6 @@ fn bounds_of(config: &DaemonConfig) -> Bounds {
 /// (`crate::daemon::bind_vcs_http_listener`), so both queue alike.
 pub(crate) fn bind(config: &DaemonConfig, address: SocketAddrV4) -> Result<TcpListener, RtError> {
   TcpListener::bind(address, bounds_of(config).backlog())
-}
-
-/// The edge's listener: the one a supervising anchor holds and handed over ([`slates_anchor::ENV_VCS_HTTP`]), adopted so
-/// the edge's port never drops while a daemon restarts (a client that connects then waits in its queue), when it listens
-/// where the configuration says ([`listens_at`]); else, with none handed over, one bound here at `address`. Why there
-/// is none, otherwise: a held listener elsewhere is refused, never served, since the edge would then answer somewhere
-/// the operator did not ask.
-fn listener_for(address: SocketAddrV4, bounds: Bounds) -> Result<TcpListener, String> {
-  match crate::daemon::held_listener(slates_anchor::ENV_VCS_HTTP) {
-    Some(Ok(held)) => {
-      let at = held
-        .local_addr()
-        .map_err(|error| format!("the anchor's listener's address is unread: {error}"))?;
-      if listens_at(at, address) {
-        Ok(held)
-      } else {
-        Err(format!(
-          "the anchor's listener is at {at}, not at {address}"
-        ))
-      }
-    }
-    Some(Err(error)) => Err(format!("the anchor's listener was not adopted: {error}")),
-    None => TcpListener::bind(address, bounds.backlog())
-      .map_err(|error| format!("{address} did not bind: {error}")),
-  }
-}
-
-/// Whether a listener bound at `at` listens where `address` says: at its address, and at its port unless it asks for
-/// any (port 0, the system's pick, which an anchor makes once for every daemon it starts).
-fn listens_at(at: SocketAddrV4, address: SocketAddrV4) -> bool {
-  at.ip() == address.ip() && (address.port() == 0 || at.port() == address.port())
 }
 
 #[cfg(test)]
