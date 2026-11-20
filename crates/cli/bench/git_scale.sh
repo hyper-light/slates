@@ -94,7 +94,8 @@ stop_servers() {
   if [ -n "$STOCK" ]; then kill "$STOCK" 2> /dev/null || true; wait "$STOCK" 2> /dev/null || true; fi
   ANCHOR="" DAEMON="" STOCK=""
 }
-trap 'stop_servers; rm -rf "$WORK"' EXIT
+# KEEP_LOGS in the environment names a directory the servers' logs and each step's output are copied into at the end.
+trap 'stop_servers; [ -n "${KEEP_LOGS:-}" ] && mkdir -p "$KEEP_LOGS" && cp "$WORK"/*.log "$WORK"/err.* "$WORK"/results.txt "$KEEP_LOGS"/ 2> /dev/null; rm -rf "$WORK"' EXIT
 
 # The value of the first line of FILE matching the sed expression, or nothing.
 first() { sed -n "$2" "$1" | head -1; }
