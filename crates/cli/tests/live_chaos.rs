@@ -2379,6 +2379,9 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_peers_")
             || line.contains("lent_to")
             || line.contains("lease")
+            || line.contains("fleet.learner")
+            || line.starts_with("fleet_learner")
+            || line.starts_with("fleet_record_dial")
         })
         .collect();
       format!(
