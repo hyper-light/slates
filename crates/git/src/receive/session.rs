@@ -224,6 +224,18 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     }
   }
 
+  /// The checked push, taken to be decided a command at a time ([`super::Deciding`], A-719); the
+  /// session is done after it. None while no push waits checked.
+  pub fn take_checked(&mut self) -> Option<Checked> {
+    match core::mem::replace(&mut self.state, State::Done) {
+      State::Checked(checked) => Some(checked),
+      other => {
+        self.state = other;
+        None
+      }
+    }
+  }
+
   /// The bytes of the objects the session read into its own memory ([`Session::input`]).
   pub fn kept(&self) -> &dyn Contents {
     &self.held

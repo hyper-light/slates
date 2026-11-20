@@ -81,6 +81,10 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-719 part 4 (2026-11-20, w-git; git/git's push of 1,027 refs spun its shard, found by use).** BUILT: a push
+> decided a command a step (`receive::Deciding`, `AnswerState::Deciding`). Owed (A-722): the first append's commit of
+> every object, the moves' admission and the seal still whole; git/git by use.
+>
 > **A-719 part 3 (2026-11-20, w-git).** BUILT: git's push read straight into its quarantine (`git_push::intake`),
 > each object fsck'd as kept, the session holding places not bytes. Owed: the verdicts and the seal a turn at a time;
 > the walk reading each commit and tree twice; S3 (A-722).
@@ -163,8 +167,9 @@
 > **A-728 (2026-11-20, w-engine; A-723's S2):** parts 1-2 BUILT: a green's content history names the file's block for every
 > value stored whole and for a splice's added runs, sealed (runs copied out) only when superseded; a fold to one value
 > names the file whole; retire gives the history's holds back a step at a time; charges unchanged. Part 3 measured: svn
-> 1,000-revision import, history heap 50.3 -> 2.0 MiB, Green::commit 285.1 -> 200.0 MiB. OWED: the retention figure still
-> counts a first small edit's earlier file as current (as before A-728).
+> 1,000-revision import, history heap 50.3 -> 2.0 MiB, Green::commit 285.1 -> 200.0 MiB. Part 4: the honest charge (a first
+> small edit charges the earlier file whole; reservation = retention). OWED: `slates status --json` prints no
+> `retained_bytes`, so a green's retention charge is not readable from outside.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's

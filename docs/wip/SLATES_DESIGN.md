@@ -11318,6 +11318,13 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >
 > **Status (2026-11-20, A-728 part 3: measured).** A 1,000-revision Subversion import: the history's heap 50.3 to
 > 2.0 MiB, `Green::commit`'s 285.1 to 200.0 MiB (BENCHMARKS.md).
+>
+> **Status (2026-11-20, A-728 part 4: the honest charge; main's ruling, A-714's rule).** The history's retention counts
+> every block it keeps whole; only the latest value's own block, the current file, is current (`Value::own`). A change
+> that supersedes a value adds its list and what it keeps of its own block (`Value::kept_when_superseded`: the whole
+> block when named whole or held elsewhere, else the runs it named), which `Green::history_reservation` charges before
+> the verdict whatever the ops (`Green::superseded_bytes`). A file's first small edit now charges the earlier file
+> whole, as it is kept; before, it was counted as the current value's and went uncharged.
 
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
@@ -54848,6 +54855,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   stack (`crates/cli/bench/svn_history_mem.sh`, three runs each, identical): the content history 50.3 MiB before,
   2.0 MiB after; everything under `Green::commit` 285.1 MiB before, 200.0 MiB after (85.1 MiB, 30%, less). A-723's
   234.8 MiB was that `Green::commit` row, mostly the current files' blocks, which stay.
+- **Part 4, the honest charge (main's ruling of 2026-11-20).** A block chunk counts its whole block, and a value's own
+  block (`Value::own`, the current file's while the value is its path's latest) is the only part counted as current;
+  the seal now touches that block alone and clears it, and `seal_latest` moves its length from current to history. The
+  reservation is one rule (`Green::superseded_bytes`): the superseded value's list and what it keeps of its own block,
+  so it equals what the commit retains (`short_edits_and_unlinks_reserve_the_values_they_supersede`: a 1-byte edit of a
+  2 KiB file reserves and retains 2,072 bytes, 25 before). The small-edits test retains the earlier file once (at least
+  64 KiB, under two copies); folded to the head, 0. Measured on the 1,000-revision import: the owner shard's committed
+  bytes after it are 646,696,952 with and without part 4, three runs each, since the service folds this green's
+  history as it imports (no reader holds a version), so nothing is retained at rest either way; the charge rises only
+  where a reader holds history. `slates status --json` does not print a shard's `retained_bytes`, so the charge is not
+  readable from outside (owed). macOS arm64, Mac Studio, local: `slates-merge --lib` 223 of 223; integration `engine`,
+  `special`, `checkpoint`, `chain_replay`, `rebase`, `splice`, `verdict`, `base_for`, `derive`, `increment`, `identity`,
+  `map`, `origin`; `slates-server --test green_retention`, `--lib merge_service` 14 of 14; fmt clean.
+
 
 
 ### A-726 — `svn blame` and `svn diff` over HTTP: the `file-revs-report` and `get-locations` served through the DAV site (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 5 "HTTP"; A-681, A-627, A-613)
@@ -54985,6 +55006,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
   restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
   (main's).
+
+### A-719 part 4 — A push is decided a command a step (bug, 2026-11-20, w-git for UI goal 93; found by use by w-perf: stock git 2.50.1's push of all of git/git, 1,027 refs, into a release slates over `--vcs-http` spun shard 10, 1,046 ms of CPU without a step, the anchor killed the daemon and git hung on `unable to rewind rpc post data`; §4.17.1 "A push's intake", rule 3)
+- **Change.** `slates_git::receive::Deciding`: a checked push decided a command at a time; without `atomic` each step
+  judges one command and, accepted, appends it; under `atomic` each step judges one, then one step appends all or none.
+  `decide` runs the same machine whole. `Session::take_checked` hands a checked push over. The server's push answers
+  through `AnswerState::Deciding` (`git_push::DecidingPush`): one step of the decision an answer step, `Turned` between,
+  with or without hooks (`post-receive` follows the last).
+- **Tests.** `slates-server` `git_push::tests::t_a719_a_push_is_decided_a_command_a_step` (forty branch creates: every
+  one `ok`, at least a step a command while it is decided; red with the decision made whole, 0 such steps);
+  `vcs_http::daemon_edge::tests::a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemons_edge`
+  (3,000 commits and a hundred branches through the daemon's edge, every ref `ok`, the watchdog armed). A step's wall
+  time is not asserted: on this Mac at a load average of 71 it measured the host (a debug step of the whole decision
+  1.09 s; of the stepped one's checks 0.4 to 1.7 s).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- receive::
+  protected_fixtures store::` 138 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- git_push::
+  git_hooks:: git_protect vcs_http::git:: vcs_http::daemon_edge:: vcs_ssh::receive vcs_ssh::tests::receive
+  vcs_ssh::tests::git vcs_store::` 105 of 105; fmt clean.
+- **Owed (A-722, main's ruling 2026-11-20).** What still runs whole in one step, measured on a 9,000-object push
+  (debug): the first append's commit of every object into the index (159 ms), each append's moves' admission (54 ms)
+  and the seal (26 ms); the walk's propagation. A-722 stages the index rows a slice at a time as objects land, so the
+  append only makes them visible, and slices the moves' admission and the seal. git/git by use (w-perf's
+  `git_scale.sh`) after it.
 
 ### A-664 live whole builds, part 2 — A submit whose map is built whole owes its commit durably, made at the build's end from what it staged (2026-11-20, w-shared for UI goal 93; main's ruling (a) and its three requirements)
 - **Why.** A green's first submit, or one past a copy, built the whole head's map in its own step, which part 1 moved

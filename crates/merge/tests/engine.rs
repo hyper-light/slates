@@ -1145,13 +1145,16 @@ fn apply_small_edits(green: &mut Green) {
   }
 }
 
-/// What the edits retained: less than one copy of the file for all of them together (one whole copy per edit before
-/// W2), the running total equal to the recount, the current file held once, and every version reconstructing.
+/// What the edits retained: the file as it was before them, once (its earlier block, which every version shares runs
+/// of), and what the edits wrote, never a copy per edit (one whole copy per edit before W2); the running total equal to
+/// the recount, the current file held once, and every version reconstructing. Since A-728 part 4 the earlier file is
+/// charged as the history's, which in memory it always was: before, the latest value's copy had stood in for the
+/// current file's bytes, and the earlier file went uncharged.
 fn assert_shared(green: &Green) {
   let retained = green.retained_bytes();
   assert!(
-    retained.history < LARGE_FILE_BYTES,
-    "{} small edits retained {} bytes, a copy of the file is {LARGE_FILE_BYTES}",
+    retained.history >= LARGE_FILE_BYTES && retained.history < 2 * LARGE_FILE_BYTES,
+    "{} small edits retained {} bytes; the earlier file is {LARGE_FILE_BYTES}, once",
     SMALL_EDITS,
     retained.history
   );
