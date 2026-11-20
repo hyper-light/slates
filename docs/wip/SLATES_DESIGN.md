@@ -22666,7 +22666,9 @@ Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on
 `crates/server/src/forward_lane.rs`) is being built by A-697, with production routing unchanged until its last piece: a
 `CreateWork` forwarded from another node still places the work on the green's shard. Part a1 (2026-11-20): the green's
 owner admits a work another node will hold by `AdmitWork`, a forwarded verb, judging the relayed principal's rights from
-its green's record and recording the work's floor at the head (`verbs::admit_work`, `verbs::owner_admit`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+its green's record and recording the work's floor at the head (`verbs::admit_work`, `verbs::owner_admit`). Part a2
+(2026-11-20, behind the test hook `Daemon::serve_works_on_holders`): a holder makes the work on its client's partition,
+asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22685,7 +22687,12 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     answered there with no hop between shards; only what needs the green crosses to the owner. Its name is held at the
     partition the name hashes to, as every name is: by an alias of the work's id when that is another partition
     (A-236's reservation, asked before the green's admission, confirmed once the creation commits). A creation
-    forwarded from another node is served on the green's owner, which places it there. Until A-400 a work was placed on
+    forwarded from another node is served on the green's owner, which places it there. Amended by A-697 (being built;
+    in force behind a test hook until its last piece): a node holding the green's replica makes the work itself, on
+    its client's partition, so the work's id names that node; the green's owner admits it by `AdmitWork`, forwarded,
+    judging the rights from its green's record and holding the base by the work's floor; and the work's base reads are
+    answered by the node's replica, byte for byte the owner's. Its verdict, its floors' moves, recovery and takeover
+    follow in A-697's later parts. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -56064,3 +56071,31 @@ Applied in the same change to: §4.16 (A-247's status, step two), GAPS (A-247's 
   answered equal; the unshared green refused `NotShared` with no floor; A's own client refused `Unsupported`);
   `a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`; `slates-server --lib work_home`
   2 of 2; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2 of 2; fmt clean.
+
+### A-697 part a2 — A holder makes a work over a green another node owns, admitted there, its base read from the holder's replica (2026-11-20, w-shared for UI goal 93; main's plan for A-697; amends A-247's "Where a work lives")
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/work_home.rs`, `crates/server/src/verbs.rs`, `crates/server/src/daemon.rs`,
+`crates/server/tests/fleet.rs`.
+- **Change, behind a test hook.** Main's plan keeps production routing unchanged until A-697's last piece, which puts the
+  rule "replicated here" in the hook's place. With `Daemon::serve_works_on_holders(true)` (every shard's
+  `WorkHome::on_holders`, never set from the wire), a green another node owns (`work_home::green_elsewhere`: the
+  routing's owner, else the id's creator, not this node) is served here:
+  - a `CreateWork` is not forwarded (`verbs::owned_by_another_host`) but made on its client's partition: its pending
+    record holds the id and the name as any creation's does; the admission is `AdmitWork` (part a1), forwarded from the
+    control shard under the creation's request id once the pending record is committed (`work_home::admit_over_fleet`),
+    so a resend is answered by the owner's completion record; a refusal the owner gives is the creation's answer, and
+    no answer within the parked verb's bound, or one not started, is answered retryable, unrecorded;
+  - the work's base reads (`Files`, `Page`, `Sizes`) go to the node's control shard, which answers them from its
+    replica of the green (`verbs::base_engine`), once the replica holds the work's base version; until then the read is
+    answered retryable (`merge.work.replica_behind`);
+  - a verdict or a rebase of such a work is refused `Unsupported` (part c, the commit by position), and a floor's move
+    is counted owed (`merge.work.floor_owed_holder`, part b): the owner keeps the floor the admission recorded.
+- **Counters.** `merge.work.asked_owner_node`, `merge.work.read_from_replica` (the test's non-vacuity count),
+  `merge.work.replica_behind`, `merge.work.floor_owed_holder`, `merge.work.admission_unstaged`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_its_replica` (two nodes at `f = 1`, B
+  with the hook: the work's id names B, as a volume B made does, and not A; admitted at base 1 with A's floor at 1; `f`
+  read on B equal to A's green's "hello", the replica-read counter moved; the edit read back "hello world"; the same
+  name `AlreadyExists` naming the work; the unshared green `NotShared` from A). Red with the hook off: the work's id
+  named A. The fleet filter `a_holder` 16 of 16 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2,
+  `verbs::` 62 of 62; fmt clean.

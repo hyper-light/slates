@@ -3063,6 +3063,17 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
   }
 
+  /// Test support (A-697, until its last piece puts the rule in its place; never reachable from the wire): with `on`,
+  /// every shard of this node serves the works of greens another node owns (`work_home::green_elsewhere`): a creation is
+  /// made on its client's partition and admitted by the green's owner over the fleet, and the work's base reads are
+  /// answered by this node's replica of the green. `Ok` once every shard has it, else the first typed refusal.
+  pub fn serve_works_on_holders(&self, on: bool) -> Result<(), ObserveError> {
+    for shard in &self.shards {
+      self.observe(Some(*shard), move |s| s.work_home.on_holders = on)?;
+    }
+    Ok(())
+  }
+
   /// Test support: loses the next verdict or admission the work's shard for `partition` is answered by its green's
   /// owner (A-247; never reachable from the wire), as a crash between the owner's step and the work's would.
   pub fn lose_next_owner_answer(&self, partition: u16) -> Result<(), ObserveError> {

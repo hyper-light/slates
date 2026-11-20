@@ -20868,6 +20868,153 @@ fn a_holders_work_is_admitted_by_its_greens_owner_once_and_by_the_owners_rights_
   );
 }
 
+/// Reads `path` of `volume` at its head through `client`: the bytes, or the reply that was no page.
+fn head_bytes(client: &mut Client, volume: VolumeId, path: &str) -> Result<Vec<u8>, ReplyBody> {
+  match client.call(&RequestBody::ReadRange {
+    volume,
+    path: path.to_owned(),
+    at: ReadAt::Head,
+    offset: 0,
+    max: 1 << 16,
+  }) {
+    ReplyBody::ReadPage { bytes, .. } => Ok(bytes),
+    other => Err(other),
+  }
+}
+
+/// A-697 part a, A-247 step two (a work over a green another node owns lives on the node that made it): in a two-node
+/// `f = 1` fleet, A owns a green at version 1 (`f` holding "hello"), shared with B's account, and another it shares with
+/// no one; B, which holds the green's replica, serves works over greens A owns (`Daemon::serve_works_on_holders`, the
+/// test hook until A-697's last piece). Do: a client on B creates a work over the shared green; reads `f` through it;
+/// edits it and reads it again; creates a second work under the same name; creates one over the unshared green.
+/// Expect: the work made on B, its id naming B as a volume B made does, admitted at base 1 with A's floor for it at 1;
+/// `f` byte for byte what A reads of its green, read on B from B's replica (its counter moved, and no forward of the
+/// work's verbs: B's work answers with A's record untouched); the edit read back; the same name `AlreadyExists`; the
+/// unshared green refused by A, `NotShared`.
+#[test]
+fn a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_its_replica() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  let ReplyBody::GreenCreated { id: unshared } = owner.call(&RequestBody::CreateGreen {
+    name: "unshared-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create the unshared green");
+  };
+  let owners_bytes = head_bytes(&mut owner, green, "f");
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let ReplyBody::Created { id: bs_own } = holder.call(&RequestBody::Create {
+    name: "a-volume-of-b".to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("a volume B made");
+  };
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base } = created else {
+    panic!("B made the work: {created:?}");
+  };
+  let floor = daemon_a.work_floor(green, work);
+  let read_from_replica = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("merge.work.read_from_replica")
+      .copied()
+      .unwrap_or(0)
+  };
+  let replica_reads_before = read_from_replica(&daemon_b);
+  let base_bytes = head_bytes(&mut holder, work, "f");
+  let replica_reads = read_from_replica(&daemon_b) - replica_reads_before;
+  let edited = holder.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 5,
+    delete_len: 0,
+    bytes: b" world".to_vec(),
+  });
+  let edited_bytes = head_bytes(&mut holder, work, "f");
+  let again = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let refused = holder.call(&RequestBody::CreateWork {
+    green: unshared,
+    name: "unshared-work".to_owned(),
+  });
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert_eq!(
+    ObjectId(work.bytes).creator(),
+    ObjectId(bs_own.bytes).creator(),
+    "the work's id names B"
+  );
+  assert_ne!(
+    ObjectId(work.bytes).creator(),
+    ObjectId(green.bytes).creator(),
+    "and not A"
+  );
+  assert_eq!(base, 1, "admitted at the green's head");
+  assert_eq!(floor, Ok(Some(1)), "A holds the work's base by its floor");
+  assert_eq!(owners_bytes, Ok(b"hello".to_vec()), "A's green holds f");
+  assert_eq!(
+    base_bytes, owners_bytes,
+    "B's work reads f byte for byte as A's green holds it"
+  );
+  assert!(replica_reads >= 1, "read from B's replica: {replica_reads}");
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  assert_eq!(
+    edited_bytes,
+    Ok(b"hello world".to_vec()),
+    "the edit reads back"
+  );
+  assert!(
+    matches!(
+      again,
+      ReplyBody::Refused {
+        refusal: Refusal::AlreadyExists { existing }
+      } if existing == work
+    ),
+    "the name is held by the work: {again:?}"
+  );
+  assert!(
+    matches!(
+      refused,
+      ReplyBody::Refused {
+        refusal: Refusal::NotShared { .. }
+      }
+    ),
+    "A judges the rights from its green's record: {refused:?}"
+  );
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
