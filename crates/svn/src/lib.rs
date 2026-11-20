@@ -17,7 +17,8 @@
 //! each principal ([`authz`], A-606); the dump format, Subversion's portable stream of a repository's history, read as
 //! it arrives and written byte for byte as `svnadmin dump` writes it ([`dump`], A-593); and the repository's import and
 //! export, a dump made into a repository's history as FSFS's load makes it and a history written as `svnadmin dump`
-//! writes it ([`migration`], A-628).
+//! writes it ([`migration`], A-628). Where a client's `svn://` URL leads is `svnserve`'s `find_repos`
+//! ([`find`], A-695).
 //!
 //! Nothing here performs I/O, reads a clock or draws randomness; every refusal is a typed value that names the
 //! Subversion error a client is answered with. The evidence is `docs/wip/research/vcs-servers-subversion.md`.
@@ -32,6 +33,7 @@ pub mod authz;
 pub mod commit;
 pub mod dav;
 pub mod dump;
+pub mod find;
 pub mod handshake;
 pub mod index;
 pub mod lock;

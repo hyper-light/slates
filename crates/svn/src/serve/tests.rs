@@ -178,7 +178,7 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
           .unwrap();
       }
       Ok(Turn::KeyNeeded { user, consumed }) => {
-        let key = CramKey::from_secret(recorded_secret(user)).unwrap();
+        let key = CramKey::from_secret(recorded_secret(user));
         held.drain(..consumed);
         connection.key(Some(&key), &mut out).unwrap();
       }
@@ -716,7 +716,7 @@ fn cram_md5(connection: &mut Connection, user: &[u8], secret: &[u8]) -> (String,
   connection
     .challenge(NONCE, TIME_MICROS, HOST, &mut out)
     .unwrap();
-  let key = CramKey::from_secret(secret).unwrap();
+  let key = CramKey::from_secret(secret);
   let challenge = format!("<{NONCE}.{TIME_MICROS}@{}>", HOST.to_str().unwrap());
   let digest: String = key
     .digest(challenge.as_bytes())

@@ -4,7 +4,8 @@
 //! MCP or an SDK, §4.13), each named by the SHA-256 of what a client presents: a key's blob (OpenSSH's fingerprint) or a
 //! token's bytes. The record lives on the partition its id routes to (`slates_server::credentials::owner_of`), so the
 //! HTTP edge's authenticator and the SSH edge's key holders find it by one lookup there, with no global index (D-14). A
-//! token is held as its hash alone, as an enrolled consumer's capability is checked and never handed back.
+//! token is held as its hash and its CRAM-MD5 keyed contexts (A-692), never itself, as an enrolled consumer's
+//! capability is checked and never handed back.
 //!
 //! **Guard then apply** (`crate::partition`). [`Credentials::check`] refuses an enrollment whose id is held
 //! (`AlreadyExists`) and a revocation of an id not held (`NotFound`); the partition refuses an enrollment past its table
@@ -33,12 +34,12 @@ pub struct Credentials {
   bytes: usize,
 }
 
-/// The bytes a credential charges (the module doc's bounds): its record, its key's blob and algorithm name, and a SID
-/// principal's text.
+/// The bytes a credential charges (the module doc's bounds): its record (a token's contexts among its own bytes), its
+/// key's blob and algorithm name, and a SID principal's text.
 fn record_bytes(record: &CredentialRecord) -> usize {
   let kind = match &record.kind {
     CredentialKind::SshKey { algorithm, blob } => algorithm.len().saturating_add(blob.len()),
-    CredentialKind::HttpToken => 0,
+    CredentialKind::HttpToken { .. } => 0,
   };
   let principal = match &record.principal {
     Principal::Sid { sid, .. } => sid.len(),
@@ -188,7 +189,9 @@ mod tests {
     CredentialRecord {
       id: [serial; 32],
       principal: person(uid),
-      kind: CredentialKind::HttpToken,
+      kind: CredentialKind::HttpToken {
+        cram_md5_contexts: [serial; 32],
+      },
       expires_ns,
     }
   }

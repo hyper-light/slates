@@ -15148,6 +15148,25 @@ and export by landing).
 > sources lent with every call, CRAM-MD5 keys over §4.13's principals, each phase's wait learned (one mechanism for the
 > HTTP, SSH and svn:// edges), and the SSH tunnel's entry point. Windows keeps no listener across a restart
 > (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
+>
+> **Status (2026-11-19, A-695: where an svn:// URL leads, A-656 part 2's second slice).** Built: the listener resolves
+> the client's URL as `svnserve`'s `find_repos` does (`slates_svn::find`, `serve.c` 3884-3955): no `svn://` URL is
+> "Non-svn URL passed to svn server", a path climbing with `..` (decoded first, so `%2E%2E` climbs) "Couldn't determine
+> repository path", and the server's root "No repository found". The repository is the longest run of the path's
+> leading segments that names one, as `svn_repos_find_root_path` walks up (a name may hold a `/`): each candidate is
+> asked of the shard its name's partition is on, every shard once (`vcs_svn::locate`, which the `svn+ssh://` tunnel
+> can call too), and a repository another shard owns moves the connection there whole (the socket's handle, the
+> connection with its answer read, its unread bytes and deadline), where it takes a seat as a new connection would
+> (every shard keeps the listener's seats). On the owner a name no Subversion repository has is "No repository
+> found"; its records are read as the shared lender lends them there (`vcs_store::svn_view::lend_in`, A-681), and a
+> repository is opened with its UUID, its root URL (the client's URL less the components beneath the
+> repository) and the mechanisms it allows, none yet: a client that has not authenticated is no principal (§4.13), and
+> CRAM-MD5 waits on the keyed contexts of enrolled credentials (A-692), so every repository answers as `svnserve`
+> answers one that allows no one. Proven on a two-shard daemon against stock `svnserve` 1.15.0's recorded `no-access`
+> session, a repository on each shard. Owed: the authenticated session's sources, read each call through the same lender
+> once a mechanism exists; `svn_uri_canonicalize` before the lookup (a stock client's URL
+> is already canonical); the tunnel's own move to the owner (A-688's site, which finds repositories on its shard
+> alone).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
@@ -15509,6 +15528,18 @@ global and per-repository rules), compiled per file identity into a path trie pe
 path the server sends (absent entries, log's access levels, `get-file`, `get-dir`) and every path a commit changes
 (write on the path and its parent; recursive write to delete or replace a directory; recursive read of a copy source).
 A principal with read on the whole repository and no rule beneath meets one comparison and no per-path check.
+
+> **Status (2026-11-19, A-692: `svn://`'s CRAM-MD5 against enrolled tokens).** Built: a token's credential record
+> (§4.13, A-625 part 3) keeps HMAC-MD5's keyed contexts beside the token's hash (`CredentialKind::HttpToken`'s
+> `cram_md5_contexts`: MD5's state after the token's outer pad block, then after its inner, Dovecot's CRAM-MD5 layout),
+> which the CLI's issuer derives as it mints the token (`slates credential token`), so the daemon holds neither the token
+> nor anything that gives it back; the contexts live where the record lives, in the partition's RAM on the owner and
+> the anchor, durable and recovered as the record is. A client names its token by the token's id in lowercase hex, the
+> CLI's `id:` line; `slates_server::credentials::cram_md5_key` finds the record on its partition and keys the session
+> while the token is live and its consumer enrolled, the session's principal the token's, and the handshake finishes
+> the digest from the kept contexts with MD5 written from RFC 1321 (`slates-svn`'s `handshake::rfc1321`). The anchor's
+> layout is 15. Owed: the `svn://` connection asking `cram_md5_key` for a client's key (A-689's next slice, g234), and
+> CRAM-MD5 through the SSH tunnel, where `EXTERNAL` serves (A-688, g229).
 
 > **Status (2026-11-19, A-606).** Built: authorization (`slates-svn`'s `authz`, piece 10). The rules file, and a
 > separate groups file, are read as `svn_config__parse_stream` reads them and their sections, groups, aliases and
@@ -53636,3 +53667,106 @@ alone), GAPS (the §4.17.3 entry).
   `release`); `vcs_store/tests.rs` and `vcs_store/upload.rs` with `upload/tests.rs` (helpers made visible to the new
   tests); `crates/server/src/verbs.rs` (the submit's step); §4.17.1's and §4.17.2's statuses and piece 13; GAPS (A-664's
   entry).
+
+### A-695 — Where an svn:// URL leads: `svnserve`'s `find_repos`, the longest run of segments naming a repository asked of each shard once, and the connection moved to the repository's owner (2026-11-19, g234, UI goal 93; §4.17.4 piece 7, A-656 part 2's second slice; after A-689)
+Applied in the same change to: §4.17.4's status; GAPS (the A-656 entry); `crates/svn/src/find.rs` and
+`find/tests.rs` (new), `lib.rs`, `report.rs` (`uri_decode_bytes`); `crates/server/src/vcs_svn.rs` (`locate`,
+`Location`, `Located`, the move and the open), `vcs_svn/tests.rs`, `daemon.rs` (the listener's seats kept on every
+shard); `docs/cli.md`.
+
+- **Why.** A-689's listener answered every URL "No repository found": nothing looked a repository up, so no stock
+  client could reach one, and the `svn+ssh://` tunnel (A-688) looked only on its own shard.
+- **The rule.** `slates_svn::find` is `find_repos` with no I/O (`serve.c` 3884-3955, 1.15.0): `skip_scheme_part`
+  (`svn://` or `svn+NAME://`, else `BadUrl`), the authority skipped, the path made a canonical relative path and
+  percent-decoded, a `..` segment `BadPath` (after the decoding), no segment `NoRepository`. Its candidates are the
+  path's leading runs of segments joined by `/`, longest first, as `svn_repos_find_root_path` walks up from the whole
+  path; a repository's name may hold a `/` (only an empty name or a NUL is refused), so the HTTP site's first-segment
+  rule (`SVNParentPath`) would miss what `svnserve -r` finds. The root URL is the client's URL less the components
+  beneath the repository (`svn_path_remove_components`).
+- **Asking the shards.** `vcs_svn::locate` groups the candidates by the shard their names' partitions are on and asks
+  each shard once (`xshard::call_in_shard_time_given_room` within the liveness budget), so a lookup costs at most one
+  question per shard whatever the path's depth; the longest name held as a Subversion repository wins, and a shard that
+  does not answer ends the connection, counted, rather than settle on a shorter name it might be shadowing. The tunnel
+  can call the same function from its shard.
+- **The move.** A repository another shard owns moves the connection there whole, as the HTTP edge moves one: its
+  handle, the connection with its answer read, its unread bytes and its deadline, one spawn on the owner's control
+  channel; its seat here is given back as it leaves, and there it takes a seat as a new connection would (every shard
+  keeps the listener's seats; arrivals waiting are bounded by the seats).
+- **Opened.** On the owner the record is read again and the store through the shared lender
+  (`vcs_store::svn_view::lend_in`, A-681, the records as it lends them to the DAV site; a repository gone meanwhile is
+  "No repository found"; records not held close the connection, counted), and the repository is opened with its UUID, also its realm,
+  and the mechanisms it allows: none yet, since a client that has not authenticated is no principal (§4.13) and
+  CRAM-MD5 waits on A-692's keyed contexts, so every repository answers "No access allowed to this repository", as
+  `svnserve` answers one that allows no one.
+- **Tests.** Red first (macOS arm64, Mac Studio, kiln r477, the test alone over main 574185afa): the repository on the
+  listener's partition was answered "No repository found in 'svn://127.0.0.1:50226/svn-1'" where `svnserve` answers
+  "No access allowed to this repository". Green (r508, 2026-11-20 00:10-00:14Z, over main 574185afa):
+  `cargo test --locked -p slates-svn --lib -- find:: report::tests::` 21 of 21 (the candidates and root URLs, the
+  refusals); `-p slates-server --lib -- vcs_svn:: vcs_http::daemon_edge::` 9 of 9, among them a two-shard daemon
+  answering stock `svnserve` 1.15.0's recorded `no-access` session for a repository on the listener's partition, one
+  on the other shard and one there whose name holds a `/`, named through a path beneath it; `-p slates-cli --test cli
+  -- vcs_svn svn_listeners` 2 of 2; `cargo fmt -p slates-svn -p slates-server -- --check` clean once rustfmt's three
+  rewraps were applied as it wrote them.
+- **Owed.** The authenticated session's sources, read each call through the same lender once a mechanism exists
+  (A-692); the tunnel calling `locate` and moving its SSH connection to the owner, with its test over
+  the SSH site; `svn_uri_canonicalize` before the lookup; the other platforms' runs (main's).
+
+### A-692 — `svn://`'s CRAM-MD5 against enrolled tokens: a token's record keeps HMAC-MD5's keyed contexts, never the token (2026-11-19, g307, UI goal 93; §4.17.4 item 10, §4.13; A-599's owed (3), A-625 part 3; found by the Subversion interop tests)
+Applied in the same change to: §4.17.4 item 10's status; GAPS (the §4.17.4 entry: A-599's owed (3), the interop tests'
+waits, an A-692 paragraph); `crates/svn/src/handshake.rs` (`CramContexts`, `CramKey::from_contexts`,
+`CramKey::from_secret` infallible, the module doc), `crates/svn/src/handshake/rfc1321.rs` (new), `crates/svn/Cargo.toml`
+and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `crates/db/src/catalog.rs`
+(`CredentialKind::HttpToken { cram_md5_contexts }`) and `crates/db/src/credentials.rs`; `crates/ipc/src/protocol.rs`
+(`CredentialMaterial::HttpToken { id, cram_md5_contexts }`, `EnrollCredential`'s doc); `crates/server/src/credentials.rs`
+(`cram_md5_contexts`, `cram_md5_key`, `Unkeyed`, `CramUser`, the module doc) and `vcs_http/daemon_edge.rs`;
+`crates/api/src/issuer.rs` (`enroll_token` derives and sends the contexts); `crates/anchor/src/layout.rs`
+(`LAYOUT_VERSION` 15) and `crates/anchor/tests/anchor.rs`; `crates/cli/src/args.rs` (`credential token`'s usage),
+`crates/cli/tests/svn_interop.rs` (the legs' waits: CRAM-MD5 served; A-685 landed); `docs/cli.md`.
+
+- **Why.** Stock `svn` commits over `svn://` only once it authenticated, by CRAM-MD5, whose server must hold the shared
+  secret or its keyed contexts (RFC 2195 §4). A token's record held its SHA-256 alone (A-625 part 3), which cannot
+  answer a challenge, so no stock client could commit over `svn://`; the interop tests' `svn://` leg found it (A-599's
+  owed (3)).
+- **What is kept.** HMAC-MD5's keyed contexts of the token: MD5's chaining state after the token's inner pad block and
+  after its outer pad block (RFC 2104 §4), 32 bytes in Dovecot's CRAM-MD5 layout (`hmac_md5_get_cram_context`,
+  `src/lib/hmac-cram-md5.c`: the outer state's words A, B, C, D, then the inner's, each low-order byte first; its
+  loader counts 64 bytes absorbed). The issuer derives them as it mints the token and sends them with the token's id;
+  the token never crosses a channel and is never held. The contexts answer CRAM-MD5 as the token does, so they "must be
+  protected" as it is, and they give no token back: an HTTP request, which presents the token, cannot be made from them.
+- **Who.** The client names its token by the token's id in lowercase hex, the CLI's `id:` line, since CRAM-MD5 finds a
+  secret by its user's name; the session's principal is the record's, never the name. A token keys a session while it
+  is live on the wall clock and, for a consumer's, while the consumer is enrolled, as the HTTP edge judges a presented
+  token; every other user (no id, unknown or revoked, an SSH key's id, expired) gets no key, answered as `svnserve`
+  answers a user it has no password for ("Username not found"), each reason typed (`Unkeyed`).
+- **MD5.** A digest finished from a kept state needs MD5's chaining state, which neither RustCrypto's `md-5` 0.10 (its
+  state and compression are private) nor the vendored aws-lc-rs (whole messages alone, and HMAC over the SHA family
+  alone) lets a caller start from, so `slates-svn`'s `handshake::rfc1321` writes MD5's compression and padding from RFC
+  1321 §3, with no allocation and no panic. `hmac` is dropped; `md-5` stays as a test oracle beside aws-lc-rs's MD5.
+- **Format.** The record's change is a field of `CredentialKind::HttpToken`, its tag unchanged (both wire-order guards
+  hold), so a token record of layout 14 would be misread: the anchor's layout is 15, and a segment of layout 14 is
+  refused at start, typed, before anything is served.
+- **Tests.** `slates-svn` (`handshake`): MD5 against RFC 1321's suite and both libraries at the padding's bounds, and
+  against both over generated messages; the contexts of RFC 2202's `Jefe` and of a minted token in Dovecot's bytes, as a
+  separate MD5 written from RFC 1321 in Python derived them (it checks its MD5 against `hashlib` and its HMAC against
+  `hmac`), and the token's contexts answering `<1.2@h>` with the digest Python's `hmac` made with the token; a key kept
+  as its contexts digesting as `cram.c`'s `compute_digest` (transcribed over `md-5`) does with the password, over
+  generated passwords either side of the block, and refusing a changed challenge; the existing stock sessions, RFC 2195's
+  example and RFC 2202's cases, now through the contexts. `slates-server` (`credentials`): a token enrolled through the
+  dispatch is held as its hash and contexts, its bytes nowhere in the record's encoding; an ra_svn session on a
+  two-shard daemon, keyed by `cram_md5_key` from the record, establishes the user its id names with the digest a stock
+  client makes (Python's, no code of slates'), the token proving its principal, answers another digest "Password
+  incorrect", and gives no key, each for its reason, to an expired token, a revoked one, an SSH key's id, `alice` and
+  the id in capitals. `slates-anchor`: `a_segment_from_before_cram_md5_contexts_is_refused_at_start`.
+- **Evidence.** macOS arm64 (Mac Studio). Red first against stubs (`agents/g307-a692-red`: the contexts carrying no key,
+  the lookup keying no user): kiln r416 `cargo test --locked -p slates-svn --lib -- handshake::` 7 failed of 37 (the
+  contexts' golden and property tests, and, through the contexts, the stock CRAM-MD5 sessions, RFC 2195's example, RFC
+  2202's cases, `cram.c`'s oracle and `lock-many`'s authentication); r450 `cargo test --locked -p slates-server --lib --
+  credentials::tests::an_ra_svn_session` failed at its outcomes. Green on this tree (main `9ca6e3883` with the piece,
+  kiln r456, 23:52-23:59Z): `-p slates-svn --lib -- handshake:: serve::` 64 of 64; `-p slates-db --lib -- credentials` 5
+  of 5; `-p slates-db --test wire_order` and `-p slates-ipc --test wire_order` 2 of 2 each, the tags unchanged; `-p
+  slates-server --lib -- credentials:: daemon_edge vcs_ssh::site::tests --test-threads=4` 21 of 21; `-p slates-anchor
+  --lib layout` 2 of 2 and `--test anchor a_segment_` 8 of 8; `-p slates-cli --test svn_interop` 1 passed, 4 ignored;
+  `cargo fmt --check` clean for slates-svn, -db, -ipc, -server, -anchor, -api and -cli.
+- **Owed.** The `svn://` connection asking `cram_md5_key` for a client's key (A-689's next slice, g234), when the
+  interop tests' `svn://` leg is un-ignored; CRAM-MD5 through the SSH tunnel (`svnserve -t` takes `EXTERNAL`; A-688,
+  g229); the Windows and Linux runs and the gates (main's).

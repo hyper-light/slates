@@ -1498,7 +1498,8 @@
 > (`svn_uri_canonicalize_safe`; `find_repos`' `skip_scheme_part`, `repos_path_valid` and `svn_path_remove_components`),
 > with piece 7's connection task, which today gives the handshake those values; (2) a limit on failed attempts per
 > principal and per address, learned (`svnserve`'s loop has none, and neither has the handshake), with §4.13's
-> admission; (3) the CRAM-MD5 keyed contexts held across a restart without the secret, with §4.13's secrets; (4) main's
+> admission; (3) the CRAM-MD5 keyed contexts held across a restart without the secret, with §4.13's secrets (built by
+> A-692, 2026-11-19: a token's credential record keeps them); (4) main's
 > decision whether HMAC-MD5 moves into the vendored aws-lc-rs as a local change beside its MD5, retiring `hmac` and
 > `md-5`; (5) main's gates over the new module (clippy, the cross-target lints, `xtask`). A-606 (2026-11-19, g229, UI
 > goal 92): authorization, built (`slates-svn`'s `authz`): the rules and groups files read as Subversion reads them,
@@ -1688,21 +1689,20 @@
 > main `e25799e8c`), `cargo test --locked -p slates-cli --test svn_interop` 1 passed (the control, 11.2 s) and 4
 > ignored, fmt clean. Each slates leg is ignored naming what it waits on, and run with `--ignored` each failed at its
 > first missing piece (r293: `--vcs-svn` and `--vcs-ssh` unknown flags; `repository create` refused as usage):
-> `svn://` on A-689 and its repository lookup (g234), A-685 (g305) and CRAM-MD5's secrets (A-599's owed (3), no piece
-> yet: the test's user, a token's id, and its password, the token, are its assumption); `http://`'s round trip on
-> A-681's reads and commits (g297) and A-685 (A-686's Basic is built), and its lock session on A-681's `LOCK` and
-> `UNLOCK`;
-> `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
-> no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
-> differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
-> the file is Unix-only, as `tests/cli.rs` is). Each slates leg mints its credential with the anchor's issuer surface
-> since 2026-11-19 (g309, main's ruling): `start_anchor` reads the surface beside the serving line, and `credential
-> token` and `credential key`, the issuer's verbs, run with it (`slates_as_issuer`), each leg skipping loudly on Linux,
-> whose surface is a descriptor only the anchor's children hold. macOS arm64 (Mac Studio, kiln r471 over main
-> be892650b): `--ignored --test-threads=1`, the `svn://` leg and both `http://` legs past `repository create` and the
-> token to their waits (`svn checkout`: `E210005 No repository found`, A-689's lookup; `E160013 '/project' path not
-> found`, A-681's later parts); `svn+ssh://` still stops at `slates: unknown flag --vcs-ssh` (A-684), before its
-> credential step; the control 1 passed.
+> `svn://` on the listener's repository lookup (A-689's next slice, g234), its CRAM-MD5 served by A-692 (the user a
+> token's id, the password the token); `http://`'s round trip on A-681's reads and commits (g297) (A-686's Basic is
+> built), and its lock session on A-681's `LOCK` and `UNLOCK`; `svn+ssh://` on A-684 (g299; the test assumes its port
+> line in the HTTP edge's words) and A-688 (g229); `slates repository create` landed (A-685). Owed: ra_svn's lock verbs
+> (answered 210001; A-693, g307), so the `svn://` and `svn+ssh://` legs lock nothing yet; item 14's differential run
+> over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's; the file is
+> Unix-only, as `tests/cli.rs` is). Each slates leg mints its credential with the anchor's issuer surface since
+> 2026-11-19 (g309, main's ruling): `start_anchor` reads the surface beside the serving line, and `credential token` and
+> `credential key`, the issuer's verbs, run with it (`slates_as_issuer`), each leg skipping loudly on Linux, whose
+> surface is a descriptor only the anchor's children hold. macOS arm64 (Mac Studio, kiln r471 over main be892650b):
+> `--ignored --test-threads=1`, the `svn://` leg and both `http://` legs past `repository create` and the token to their
+> waits (`svn checkout`: `E210005 No repository found`, A-689's lookup; `E160013 '/project' path not found`, A-681's
+> later parts); `svn+ssh://` still stops at `slates: unknown flag --vcs-ssh` (A-684), before its credential step; the
+> control 1 passed.
 > Part 2, first slice, 2026-11-19 (A-689): the svn:// listener. `slates anchor|daemon --vcs-svn ADDRESS` (loopback alone
 > without `--fleet`; one address reader with `--vcs-http`) starts it on the control shard, its port logged; on Unix the
 > anchor binds it once and hands it to every daemon (`ENV_VCS_SVN`), so a restart never drops its port. Each connection,
@@ -1713,6 +1713,28 @@
 > repositories' lookup (the rest of `find_repos`, the owner shard), the sources with every call, CRAM-MD5 keys, learned
 > waits (one mechanism for the three edges), the SSH tunnel's entry point; Windows and Linux runs (main's); Windows
 > holds no listener across a restart (`docs/wip/platforms.md`, gap 2).
+> Part 2, second slice, 2026-11-19 (A-695): where a URL leads. `slates_svn::find` ports `find_repos` (BadUrl, BadPath
+> after decoding, the root NoRepository); the repository is the longest run of the path's segments naming one, each
+> candidate asked of its name's shard, every shard once (`vcs_svn::locate`); one another shard owns moves the connection
+> there, where its records are read through the landed lender (`vcs_store::svn_view::lend_in`, A-681); every
+> repository answers "No access allowed" until a mechanism exists. Red then green on macOS arm64 (Mac
+> Studio, kiln r477, r508): svn find 21 of 21, server 9 of 9 (a two-shard daemon answering `svnserve`'s recorded
+> `no-access` session for repositories on both shards, one name with a `/`), cli 2 of 2. Owed: the authenticated
+> session's per-call sources through the same lender (after A-692's CRAM-MD5); the tunnel's move to the owner
+> (A-688 looks on its own shard alone) and its test over the SSH site; `svn_uri_canonicalize`.
+> A-692 (2026-11-19, g307): `svn://`'s CRAM-MD5 against enrolled tokens. A token's credential record keeps HMAC-MD5's
+> keyed contexts beside its hash (`CredentialKind::HttpToken`'s `cram_md5_contexts`, Dovecot's layout), derived by the
+> CLI's issuer as it mints the token, so the daemon holds neither the token nor anything that gives it back; a client
+> names its token by its id in lowercase hex; `slates_server::credentials::cram_md5_key` keys the session from the
+> record on its partition while the token is live and its consumer enrolled, the session's principal the token's; the
+> handshake finishes the digest from the kept contexts with MD5 written from RFC 1321 (`handshake::rfc1321`;
+> RustCrypto's `md-5` keeps its state private, so `hmac` is dropped and `md-5` is a test oracle beside aws-lc-rs); the
+> anchor's layout is 15. macOS arm64 (Mac Studio): red first against stubs (kiln r416: slates-svn's handshake tests 7 of
+> 37 failed; r450: the server's session test failed), then green on main `9ca6e3883` with the piece (r456): slates-svn's
+> handshake and serve 64 of 64, slates-server's credentials, HTTP edge and SSH site 21 of 21, slates-db's credentials 5
+> of 5, both wire-order guards, the anchor's layout 2 and refused segments 8, fmt clean. These are the "CRAM-MD5 keys"
+> A-689 lists as owed. Owed: the `svn://` connection asking `cram_md5_key` (A-689's next slice, g234); CRAM-MD5 through
+> the SSH tunnel, where `EXTERNAL` serves (A-688, g229); the Windows and Linux runs and the gates (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

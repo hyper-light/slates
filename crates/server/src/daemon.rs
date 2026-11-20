@@ -1202,8 +1202,9 @@ impl Daemon {
     // connections that move to it; its host key the fleet node's own, else the one the anchor keeps in the segment, else
     // this lone daemon's own.
     let vcs_ssh = crate::vcs_ssh::start(&runtime, control, &shards, &config, &segment)?;
-    // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-656 part 2): on the control shard too.
-    let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &config)?;
+    // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-689, A-695): on the control shard too,
+    // every shard keeping its seats for the connections that move to their repository's owner.
+    let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
     Ok(Daemon {
       runtime: Some(runtime),
       segment,
