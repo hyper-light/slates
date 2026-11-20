@@ -674,7 +674,6 @@ pub(crate) fn settle_objects(state: &mut ShardState, id: RepositoryId) {
 
 impl VcsStores {
   /// What repository `id`'s entries' objects hold of the shard's budget ([`settle_objects`]).
-  #[cfg(test)]
   pub(crate) fn objects_charged(&self, id: RepositoryId) -> u64 {
     self.objects_charged.get(&id).copied().unwrap_or(0)
   }

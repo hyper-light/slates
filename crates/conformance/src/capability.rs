@@ -142,9 +142,9 @@ pub const LINUX_NFS_ADAPTER: Adapter = Adapter {
     export (the same serving code as macOS)",
   not_covered: concat!(
     "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane ",
-    "mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), ",
-    "and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with ",
-    "`user_allow_other`)",
+    "mounts through the NFS adapter for this suite; the workload roster, fsx and fsstress run over the FUSE mount ",
+    "itself (A-293, 2026-11-19), and the other suites over it run in the Linux container lane (`oci-linux`, ",
+    "`slates mount --shared` with `user_allow_other`)",
   ),
 };
 
@@ -155,6 +155,9 @@ const LINUX_MOUNT_TOOLS: &[&str] = &["mount", "umount", "sh", "sudo"];
 /// Tools a suite over the daemon's own Linux FUSE mount needs: `fusermount3`, the setuid helper through which an
 /// unprivileged `slates mount` reaches `/dev/fuse` and by which the harness unmounts, and the shell.
 const LINUX_FUSE_TOOLS: &[&str] = &["fusermount3", "sh"];
+/// Tools fsx and fsstress need over the daemon's own Linux FUSE mount: [`LINUX_FUSE_TOOLS`], the compiler that builds
+/// each suite from its pinned source and the fetch that downloads it.
+const LINUX_FUSE_SUITE_TOOLS: &[&str] = &["fusermount3", "sh", "cc", "curl"];
 
 /// The availability of a cell.
 pub fn availability(transport: Transport, suite: Suite) -> Availability {
@@ -217,6 +220,14 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
     (Transport::NativeLinuxFuse, Suite::Workloads) => Availability::Runnable {
       on: HostOs::Linux,
       tools: LINUX_FUSE_TOOLS,
+      root: RootNeed::None,
+      adapter: None,
+    },
+    // fsx and fsstress over the same mount, unprivileged: what a live-shipped volume must conform to on Linux is the
+    // transport an agent uses, not an NFS adapter in front of it (goal 226, 2026-11-19).
+    (Transport::NativeLinuxFuse, Suite::Fsx | Suite::Fsstress) => Availability::Runnable {
+      on: HostOs::Linux,
+      tools: LINUX_FUSE_SUITE_TOOLS,
       root: RootNeed::None,
       adapter: None,
     },
@@ -366,8 +377,8 @@ mod tests {
   }
 
   /// The macOS transport runs its suites on macOS with no adapter; the Linux transport runs them
-  /// through the root NFS adapter, which names what it does not cover, except the workload roster, which runs over
-  /// the daemon's own FUSE mount with neither root nor adapter (A-293).
+  /// through the root NFS adapter, which names what it does not cover, except the workload roster (A-293), fsx and
+  /// fsstress (2026-11-19), which run over the daemon's own FUSE mount with neither root nor adapter.
   #[test]
   fn native_lanes_run_on_their_own_os() {
     for suite in [
@@ -380,7 +391,7 @@ mod tests {
       expect_runnable_on_macos_with_no_adapter(suite);
       match (suite, availability(Transport::NativeLinuxFuse, suite)) {
         (
-          Suite::Workloads,
+          Suite::Workloads | Suite::Fsx | Suite::Fsstress,
           Availability::Runnable {
             on,
             tools,
