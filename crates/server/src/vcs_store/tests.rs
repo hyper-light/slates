@@ -2275,3 +2275,60 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
   );
   assert_eq!(most, 1, "the most objects one turn walked");
 }
+
+/// main's ruling (b) on the identity rule's compatibility shim (banned item 7): a git record that names an object past
+/// one window by this node's root of it, as records did before the rule, is refused, never read as the object. Do:
+/// push a create of `main` whose one file is 1 MiB; take the push's record and name the file by its root in place of
+/// its BLAKE3; replay the record so altered into the repository's store made again empty. Expect: the record as written
+/// replays; the altered one refused, typed (`ReplayRefused::Diverged`: the objects the replay admits are named by
+/// their BLAKE3, which the record does not name), never accepted.
+#[test]
+fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() {
+  crate::daemon::audit_on_shard(|state| {
+    const LARGE: usize = 1 << 20;
+    let repository = crate::git_push::tests::git_repository(state, "old-form");
+    let (request, _) = crate::git_push::tests::large_create(LARGE);
+    crate::git_push::tests::pushed(state, repository, &request);
+    let blob: Vec<u8> = (0..LARGE)
+      .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
+      .collect();
+    let identity = ContentId::of(&blob);
+    let root = state
+      .vcs_stores
+      .content()
+      .map(|content| content.root_of(&identity))
+      .unwrap();
+    assert_ne!(root, identity, "the file is past one window");
+    let written = records(state, repository)
+      .into_iter()
+      .find(|record| record.windows(32).any(|at| at == identity.0))
+      .expect("a record naming the file");
+    let at = written
+      .windows(32)
+      .position(|bytes| bytes == identity.0)
+      .unwrap();
+    let mut altered = written.clone();
+    altered[at..at + 32].copy_from_slice(&root.0);
+    let record = state
+      .db
+      .partition()
+      .repositories()
+      .repository(repository)
+      .cloned()
+      .unwrap();
+    let mut replayed = |bytes: &[u8]| {
+      state.vcs_stores.entries.remove(&repository);
+      super::make(state, &record);
+      // The room a replay is lent, as `replay_record` lends it: the record's bytes.
+      super::lend(
+        &mut state.store,
+        &mut state.vcs_stores,
+        u64::try_from(bytes.len()).unwrap(),
+      );
+      let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+      super::replay_into(lent.stores, repository, bytes, None).map(|_| ())
+    };
+    assert_eq!(replayed(&written), Ok(()), "the record as written replays");
+    assert_eq!(replayed(&altered), Err(super::ReplayRefused::Diverged));
+  });
+}

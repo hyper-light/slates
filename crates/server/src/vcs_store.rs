@@ -1549,6 +1549,32 @@ impl SealedPush {
   }
 
   /// Gives back what a stage under way ([`SealedPush::restage_turn`]) holds: a push dropped mid-decision.
+  /// Has the push give back its pack's holds in turns once its objects land ([`SealedPush::give_back_turn`]), not in
+  /// the landing's step (A-722's landing step: 5.2 ms of git/git v1.5.0's). Its owner turns them before it abandons it.
+  pub(crate) fn give_back_in_turns(&mut self) {
+    self.push.give_back_in_turns();
+  }
+
+  /// One turn of giving back the holds the push set aside at its landing, for `ns` of the shard's clock and a unit at
+  /// least: whether none is left. A refusal is counted and ends the turns; the push's abandon gives back the rest.
+  pub(crate) fn give_back_turn(&mut self, state: &mut ShardState, ns: u64) -> bool {
+    let given = {
+      let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+      let mut clock = crate::git_push::ShardClock;
+      let quantum = slates_git::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns,
+      };
+      lent.stores.content.as_mut().map_or(Ok(true), |content| {
+        self.push.give_back_turn(content, quantum)
+      })
+    };
+    given.unwrap_or_else(|_| {
+      state.count(RELEASE_REFUSED, 1);
+      true
+    })
+  }
+
   pub(crate) fn abandon_staging(state: &mut ShardState, staging: slates_git::store::Staging) {
     let given = {
       let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
@@ -2123,7 +2149,8 @@ fn replay_push(
 }
 
 /// Whether the objects the replay's admission would record now, by the predicate the live append wrote its record by
-/// ([`record_of`]), are the record's, in order, by type, content identity and length. Each identity was checked
+/// ([`record_of`]), are the record's, by type, content identity and length: in order for a version-1 record, whose
+/// objects are admitted in its order; as sets for a pack's ([`names_alike`]). Each identity was checked
 /// against the record's bytes before the object was admitted, so this compares the record written again without
 /// copying its bytes: a recomputation that differs is refused (§4.16).
 fn recorded_alike(
@@ -2146,49 +2173,35 @@ fn recorded_alike(
     let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
     (object.kind, object.identity, len)
   });
-  alike(content, admitted, recorded)
+  admitted.eq(recorded)
 }
 
-/// Whether `made`, what the replay's admission records, is `named`, a record's, object by object ([`same_name`]).
-fn alike(
-  content: &ContentStore,
-  made: impl Iterator<Item = (slates_git::object_name::Kind, slates_vcs::ContentId, u64)>,
-  named: impl Iterator<Item = (slates_git::object_name::Kind, slates_vcs::ContentId, u64)>,
-) -> bool {
-  let mut named = named;
-  for made in made {
-    match named.next() {
-      Some(named) if same_name(content, made, named) => {}
-      _ => return false,
-    }
-  }
-  named.next().is_none()
-}
-
-/// Whether an object the replay admitted, by its identity, is the one a record named: the same kind and length, and
-/// the same identity, or (a record written before the identity rule) this node's root of it.
-fn same_name(
-  content: &ContentStore,
-  made: (slates_git::object_name::Kind, slates_vcs::ContentId, u64),
-  named: (slates_git::object_name::Kind, slates_vcs::ContentId, u64),
-) -> bool {
-  made.0 == named.0
-    && made.2 == named.2
-    && (made.1 == named.1 || content.root_of(&made.1) == named.1)
-}
-
-/// Whether the objects the replay's admission would record now are `names`, a version-2 record's, in order
-/// ([`recorded_alike`]).
+/// Whether the objects the replay's admission would record now are `names`, a pack record's ([`recorded_alike`]), as
+/// sets: the live push admitted its pack's objects as they resolved (those read whole or from a base already read in
+/// pack order as the client's bytes arrived, a thin pack's waiting deltas once the pack was whole, in the turns that
+/// resolved them), and a replay resolves them in turns of its own, so the same objects can come in another order (A-722:
+/// a thin pack whose waiting delta came first was refused as diverged, and its repository's store with it). A push
+/// holds an object once, so each name is once on each side. The two lists are kept to sort them: one name an object.
 fn names_alike(
   content: &ContentStore,
   store: &GitStore,
   remade: &RecordWriter,
   names: &[(slates_git::object_name::Kind, slates_vcs::ContentId, u64)],
 ) -> bool {
-  let made = remade
+  let mut made: Vec<(u8, slates_vcs::ContentId, u64)> = remade
     .lacked(lacks(content, store))
-    .map(|noted| (noted.kind, noted.identity, noted.len));
-  alike(content, made, names.iter().copied())
+    .map(|noted| (noted.kind.pack_number(), noted.identity, noted.len))
+    .collect();
+  if made.len() != names.len() {
+    return false;
+  }
+  let mut named: Vec<(u8, slates_vcs::ContentId, u64)> = names
+    .iter()
+    .map(|(kind, identity, len)| (kind.pack_number(), *identity, *len))
+    .collect();
+  made.sort_unstable();
+  named.sort_unstable();
+  made == named
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.
@@ -2202,10 +2215,7 @@ fn replay_objects(
     return replay_pack(content, store, (push, remade), record);
   }
   for object in &record.objects {
-    // A record written before the identity rule names an object past one window by this node's root of it.
-    if content.object_id(object.content) != object.identity
-      && content.root_id(object.content) != object.identity
-    {
+    if content.object_id(object.content) != object.identity {
       return Err(ReplayRefused::Identity);
     }
     let incoming = Incoming {

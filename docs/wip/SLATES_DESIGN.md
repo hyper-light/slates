@@ -55923,6 +55923,47 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's replay order — a pack record's names compared as sets (2026-11-20, w-git for UI goal 93; found reading B2's replay)
+- **The bug.** A live push admits its pack's objects as they resolve: those read whole, or from a base already read,
+  in pack order as the client's bytes arrive; a thin pack's waiting deltas (a REF_DELTA whose base is outside the pack)
+  once the pack is whole, in the turns that resolve them. Its record names the objects in that order. A replay admitted
+  them in pack order and compared the names in order, so a thin pack whose waiting delta was not its last object was
+  refused as diverged, and the repository's store with it: after a restart its refs were gone. Thin pushes are git's
+  usual second and later pushes.
+- **Change.** A pack record's names are compared with what the replay would record as sets
+  (`vcs_store::names_alike`, sorting both); a push holds an object once, so each name is once on each side. A version-1
+  record, whose objects are admitted in its own order, is still compared in order.
+- **Tests.** `slates-server` `git_push::tests::t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` (the
+  fixture `update` with its thin delta moved first; red before: no ref advertised after the rebuild); `slates-server
+  --lib -- git vcs_store` 163 passed (kiln, adas-mac-studio.local-2).
+
+### A-722's landing step — a commit takes what a move's walk found staged, not each id in its step (2026-11-20, w-git for UI goal 93; main's queue: Repository::commit's O(objects) passes)
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic over git/git's v1.5.0, a push's last step timed by
+  phase): the push's longest step is its last, `push_planned`, 35.8 ms: make, secure and judge 1.3 ms; entry and
+  record 1.7 ms; the store's commit 14.0 ms (landed runs 2.6, the plan's members by position 6.2, the holds' release
+  3.4, values 1.7); the entry's apply 18.2 ms; the paths map 0.3 ms.
+- **Change.** A move's walk (`Admitting`, the judge's turns) notes each new object's position as the push's stage gives
+  it, with that stage (its base and how many positions it gives; `Members::staged`); a commit adopting the same stage
+  takes those positions (`members_positions`), merging sorted sets, rather than looking each id up in its step. A stage
+  made again at the same base gives the same positions (no landing since gave any), so the base and count name it. One
+  move lands one run (`landed_runs`: every fresh object is the move's, or the first move's, the same); several moves'
+  runs take the staged positions too. Before it (00e6da185), the landing's runs were kept by position, not an id map.
+- **After.** The same push's commit: landed runs 0.01 ms, plan 0.003 ms, the store's commit 5.5 ms (now the holds'
+  release, 5.2 ms); its longest step 27.8 ms, of which the entry's apply is 18.6 ms: the record carries the whole pack
+  (9.4 MiB), so the apply is O(its bytes). Owed: the pack homed as content before the append, as version 3 homes the
+  names (asked of main: w-git under the current record, or w-store's changeset payload); the holds' release in turns
+  after the commit (releasing each at its row would make a restage read every object again), built below.
+- **Tests.** `slates-git --lib` 579 passed; `slates-server --lib -- git vcs_store` 161 passed (kiln,
+  adas-mac-studio.local-2).
+- **Then the holds** (the next landing). A live push gives its pack's holds back a unit at a time after its landing
+  (`Push::give_back_in_turns`, set when its decision begins; `Push::give_back_turn`, turned by the decision before it
+  gives the push back): the landing sets them aside rather than releasing each in its step. Every other owner of a push
+  (a replay, the server's own commits) still releases at the landing, so no push dropped after it holds anything; a
+  live push's abandon gives back what is set aside. The same v1.5.0 push: the store's commit 0.63 ms (from 14.0 ms),
+  the landing's step 23.4 ms, of which the entry's apply is 19.0 ms (the pack in the record, owed above). Test:
+  `store::tests::packed::a_landed_push_gives_its_holds_back_in_turns_not_in_the_landing`; `slates-git --lib` 580
+  passed; `slates-server --lib -- git vcs_store` 161 passed.
+
 ### A-722's memory per push, B2's in-flight half — A push read where it lies in its pack while it is judged (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING, storage and changesets rulings)
 - **Why.** B1 measured a push of git/git's v1.5.0 (9.4 MiB pack, 34,296 objects) putting every object inflated in the
   content store as it arrived (304.6 MiB). Ada's storage ruling keeps a change in RAM while it is in flight; her
@@ -57542,6 +57583,18 @@ Evidence: `cargo test --locked -p slates-server --test session_log` 1 passed (tw
 one waiting landing: exactly two named; the landing gone once granted and run); `-p slates-db --test model
 every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
 `args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
+
+### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
+Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
+(`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),
+the bug record, GAPS.
+
+Status: built 2026-11-20.
+- Why: on macOS a shared-memory object lives while its name does, and only its creator, the anchor, removed the names.
+  Four `SIGKILL`ed anchors held 21 GB of the big Studio with no process alive.
+- The rule: when the anchor is gone, its daemon removes the names of the segment and the content object before it
+  stops. Nobody adopts them after the anchor, so their memory goes back with the daemon's own mappings. Linux and
+  Windows objects carry no name that outlives their holders.
 
 ### A-777 — An idle shard keeps nothing pre-faulted; A-214's reserve removed (2026-11-20, w-sizing; MEMORY SIZING; amends A-105, removes A-214 and A-765)
 Applied in the same change to: `crates/server/src/daemon.rs` (the purge gives every free block back; the reserve, its

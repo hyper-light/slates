@@ -575,3 +575,75 @@ fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
     counted.steps.get()
   );
 }
+
+/// main's order of 2026-11-20 after w-bugs' run 13 (svn:// update still twice run 8's time: each 1,024-byte read made its
+/// whole delta window again). Do: commit revision 1, then 12 edits of [`FILE`], a 300 KiB text changing one line in
+/// each; read each revision's text in 1,024-byte pieces through one reader's `WindowCache`, as a fetch reads; then read
+/// one text again with a fresh cache, and the same text with no cache. Expect: every piece the text's bytes; each reader
+/// making each delta window of its text once (the windows made equal to the windows read, not to the pieces); the cache
+/// the reader's own, so a second reader makes the windows again, and reads with no cache make one a piece.
+#[test]
+fn s4_c2_a_reader_makes_each_window_of_a_text_once_whatever_the_pieces() {
+  let mut repository = created();
+  repository.commit(first()).unwrap();
+  let line =
+    |at: usize, version: usize| format!("{at:06} a line of the long file, version {version:04}\n");
+  let version = |n: usize| -> Vec<u8> {
+    (0..7_000)
+      .map(|at| line(at, if at == n * 331 % 7_000 { n } else { 0 }))
+      .collect::<String>()
+      .into_bytes()
+  };
+  let mut texts = Vec::new();
+  for n in 1..=12usize {
+    let bytes = version(n);
+    repository
+      .commit(edit(u64::try_from(n).unwrap(), &bytes, Vec::new()))
+      .unwrap();
+    texts.push(bytes);
+  }
+  let window = usize::try_from(crate::svndiff::WINDOW_LIMIT).unwrap();
+  let read = |bytes: &[u8], cache: Option<&mut crate::reads::WindowCache>| {
+    let identity = *blake3::hash(bytes).as_bytes();
+    let mut cache = cache;
+    let mut at = 0usize;
+    while at < bytes.len() {
+      let offset = u64::try_from(at).unwrap();
+      let run = match cache.as_deref_mut() {
+        Some(cache) => crate::reads::Repository::text_in(&repository, &identity, offset, cache)
+          .unwrap()
+          .into_owned(),
+        None => crate::reads::Repository::text(&repository, &identity, offset)
+          .unwrap()
+          .into_owned(),
+      };
+      let piece = &run[..run.len().min(1_024)];
+      assert_eq!(piece, &bytes[at..at + piece.len()]);
+      at += piece.len();
+    }
+  };
+  let windows_of = |bytes: &[u8]| u64::try_from(bytes.len().div_ceil(window)).unwrap();
+  let before = repository.windows_made();
+  for bytes in &texts {
+    let mut cache = crate::reads::WindowCache::new();
+    read(bytes, Some(&mut cache));
+  }
+  let made: u64 = repository.windows_made() - before;
+  let windows: u64 = texts.iter().map(|bytes| windows_of(bytes)).sum();
+  assert_eq!(made, windows, "each window a reader reads made once");
+  let last = texts.last().unwrap();
+  let before = repository.windows_made();
+  let mut again = crate::reads::WindowCache::new();
+  read(last, Some(&mut again));
+  assert!(
+    repository.windows_made() - before >= windows_of(last),
+    "a second reader makes its own"
+  );
+  let before = repository.windows_made();
+  read(last, None);
+  let pieces = u64::try_from(last.len().div_ceil(1_024)).unwrap();
+  assert!(
+    repository.windows_made() - before >= pieces,
+    "no cache: a window a piece"
+  );
+}

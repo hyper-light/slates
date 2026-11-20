@@ -331,11 +331,31 @@ fn bytes(count: usize, each: usize) -> u64 {
 }
 
 /// The objects a walk met that its green had not reached: those indexed by position, those new to the repository by
-/// id.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// id; and, where the walk met every new one while the push's stage was current, the positions that stage gives them
+/// (`staged`), which a commit adopting that stage takes rather than looking each id up in its step.
+#[derive(Clone, Debug, Default)]
 struct Members {
   indexed: Positions,
   new: Vec<ObjectId>,
+  staged: Option<StagedAt>,
+}
+
+/// What a walk is: what it met. The positions it found staged are how it was met, not what (`Members::staged`).
+impl PartialEq for Members {
+  fn eq(&self, other: &Members) -> bool {
+    self.indexed == other.indexed && self.new == other.new
+  }
+}
+
+impl Eq for Members {}
+
+/// The positions a stage gives a walk's new objects, and that stage: its base and how many positions it gives. A
+/// stage made again at the same base gives the same positions, since no landing since gave any (so none of the push's
+/// objects was indexed meanwhile and its fresh set is the same).
+#[derive(Clone, Debug)]
+struct StagedAt {
+  stage: (u64, usize),
+  positions: Positions,
 }
 
 /// How a move's reached set follows from its green's.
@@ -859,6 +879,7 @@ impl Repository {
       pending.extend(self.references(store, push, &id, &place)?);
     }
     Ok(Members {
+      staged: None,
       indexed: Positions::of(indexed),
       new,
     })
@@ -1023,7 +1044,7 @@ impl Repository {
       base.saturating_add(given)
     };
     let landed = self.landed_runs(moves, first, (base, &positions));
-    let (planned, heads) = self.plan(store, moves, &positions)?;
+    let (planned, heads) = self.plan(store, moves, (base, &positions))?;
     let before = store.used();
     let values = put_values(store, &planned)?;
     let added = store.used().saturating_sub(before);
@@ -1198,20 +1219,42 @@ impl Repository {
         u64::try_from(chain.versions.len()).unwrap_or(u64::MAX)
       })
     };
+    let otherwise = (first.green, version_of(first.green));
+    // One move brings every fresh object or leaves it to the first move, itself: one run.
+    if moves.len() == 1 {
+      let given = u64::try_from(positions.len()).unwrap_or(u64::MAX);
+      return (given > 0)
+        .then(|| (base, (base.saturating_add(given), otherwise.0, otherwise.1)))
+        .into_iter()
+        .collect();
+    }
     let mut by: Vec<Option<(u64, u64)>> = vec![None; positions.len()];
+    let mut give = |position: u64, pair: (u64, u64)| {
+      let slot = usize::try_from(position.saturating_sub(base))
+        .ok()
+        .filter(|_| position >= base)
+        .and_then(|at| by.get_mut(at));
+      if let Some(slot @ None) = slot {
+        *slot = Some(pair);
+      }
+    };
     for movement in moves {
       let pair = (movement.green, version_of(movement.green));
-      for id in &movement.brought.new {
-        let slot = positions
-          .get(id)
-          .and_then(|position| usize::try_from(position.checked_sub(base)?).ok())
-          .and_then(|at| by.get_mut(at));
-        if let Some(slot @ None) = slot {
-          *slot = Some(pair);
+      match &movement.brought.staged {
+        Some(staged) if staged.stage == (base, positions.len()) => {
+          staged
+            .positions
+            .iter()
+            .for_each(|position| give(position, pair));
         }
+        _ => movement
+          .brought
+          .new
+          .iter()
+          .filter_map(|id| positions.get(id))
+          .for_each(|position| give(*position, pair)),
       }
     }
-    let otherwise = (first.green, version_of(first.green));
     let mut runs: Vec<(u64, (u64, u64, u64))> = Vec::new();
     for (position, pair) in (base..).zip(by) {
       let (green, version) = pair.unwrap_or(otherwise);
@@ -1277,20 +1320,22 @@ impl Repository {
     &self,
     store: &ContentStore,
     moves: &[Move],
-    positions: &BTreeMap<ObjectId, u64>,
+    (base, positions): (u64, &BTreeMap<ObjectId, u64>),
   ) -> Result<(Vec<Planned>, HeadMap), StoreRefused> {
     let mut planned = Vec::with_capacity(moves.len());
     let mut heads = self.heads.clone();
     for movement in moves {
-      let brought = self.members_positions(store, &movement.brought, positions)?;
+      let brought = self.members_positions(store, &movement.brought, (base, positions))?;
       let reached = match &movement.reach {
         Reach::Grown => self
           .current_reached(store, movement.green)?
           .unwrap_or_default()
           .union(&brought),
-        Reach::Remade { base, beyond, .. } => {
-          base.union(&self.members_positions(store, beyond, positions)?)
-        }
+        Reach::Remade {
+          base: reached_base,
+          beyond,
+          ..
+        } => reached_base.union(&self.members_positions(store, beyond, (base, positions))?),
         Reach::Emptied => Positions::new(),
       };
       let head = movement
@@ -1324,13 +1369,19 @@ impl Repository {
     chains
   }
 
-  /// A walk's members as positions, the new ones by the positions given them now.
+  /// A walk's members as positions, the new ones by the positions given them now: as the walk found them staged where
+  /// the stage given from `base` is the one it met (`Members::staged`), else each looked up by id.
   fn members_positions(
     &self,
     store: &ContentStore,
     members: &Members,
-    positions: &BTreeMap<ObjectId, u64>,
+    (base, positions): (u64, &BTreeMap<ObjectId, u64>),
   ) -> Result<Positions, StoreRefused> {
+    if let Some(staged) = &members.staged
+      && staged.stage == (base, positions.len())
+    {
+      return Ok(members.indexed.union(&staged.positions));
+    }
     let new = members
       .new
       .iter()

@@ -185,9 +185,66 @@ fn peak_rss_mib() -> f64 {
     / 1024.0
 }
 
-fn percentile(values: &mut [f64], p: f64) -> f64 {
+/// The `per_mille`th of `values` (rounded to the nearest rank, as `((n - 1) * p).round()`).
+fn percentile(values: &mut [f64], per_mille: usize) -> f64 {
   values.sort_by(f64::total_cmp);
-  values[((values.len() as f64 - 1.0) * p).round() as usize]
+  values[(values.len().saturating_sub(1) * per_mille + 500) / 1000]
+}
+
+/// One file revision as read from the source: its path's index, revision, link, delta base, chunk and whole text's
+/// identity and length.
+struct Read {
+  path: usize,
+  rev: u32,
+  link: u32,
+  base: Option<u32>,
+  chunk: Vec<u8>,
+  text: [u8; 32],
+  text_len: usize,
+}
+
+/// Every file revision of every one of `paths` read once from `source`: its chunk (Mercurial's delta against its base,
+/// or whole), its base, its link, its whole text's identity.
+fn read_every_revision(source: &Source, paths: &[Vec<u8>]) -> Vec<Read> {
+  let mut read: Vec<Read> = Vec::new();
+  for (path_index, path) in paths.iter().enumerate() {
+    let store_path = [b"data/".as_slice(), path, b".i"].concat();
+    let Some(revlog) = source.revlog(&store_path) else {
+      continue;
+    };
+    for rev in 0..revlog.len() {
+      let entry = revlog.entry(rev).unwrap();
+      let chunk = revlog.chunk(rev, &mut Admission::new(ROOM)).unwrap();
+      let text = revlog.text(rev, &mut Admission::new(ROOM)).unwrap();
+      read.push(Read {
+        path: path_index,
+        rev,
+        link: entry.link,
+        base: (entry.base != rev).then_some(entry.base),
+        chunk,
+        text: *blake3::hash(&text).as_bytes(),
+        text_len: text.len(),
+      });
+    }
+  }
+  read
+}
+
+/// Revision `at`'s whole text, rebuilt through `cache` from its chain's whole base and each delta after it.
+fn rebuilt(arm: &Arm, cache: &mut Cache<'_>, at: usize, bytes: &mut Vec<u8>) -> Vec<u8> {
+  let mut chain = vec![at];
+  while let Some(base) = arm.revisions[*chain.last().unwrap()].base {
+    chain.push(base);
+  }
+  let whole = arm.revisions[chain.pop().unwrap()];
+  cache.read(whole.at, whole.len, bytes);
+  let mut text = bytes.clone();
+  while let Some(link) = chain.pop() {
+    let stored = arm.revisions[link];
+    cache.read(stored.at, stored.len, bytes);
+    text = slates_hg::delta::apply(&text, bytes, &mut Admission::new(ROOM)).unwrap();
+  }
+  text
 }
 
 fn main() {
@@ -223,36 +280,7 @@ fn main() {
   // Every file revision read once: its chunk (Mercurial's delta against its base, or whole), its base, its link, its
   // whole text's identity. Reading the source is the same for both arms and timed apart.
   let started = Instant::now();
-  struct Read {
-    path: usize,
-    rev: u32,
-    link: u32,
-    base: Option<u32>,
-    chunk: Vec<u8>,
-    text: [u8; 32],
-    text_len: usize,
-  }
-  let mut read: Vec<Read> = Vec::new();
-  for (path_index, path) in paths.iter().enumerate() {
-    let store_path = [b"data/".as_slice(), path, b".i"].concat();
-    let Some(revlog) = source.revlog(&store_path) else {
-      continue;
-    };
-    for rev in 0..revlog.len() {
-      let entry = revlog.entry(rev).unwrap();
-      let chunk = revlog.chunk(rev, &mut Admission::new(ROOM)).unwrap();
-      let text = revlog.text(rev, &mut Admission::new(ROOM)).unwrap();
-      read.push(Read {
-        path: path_index,
-        rev,
-        link: entry.link,
-        base: (entry.base != rev).then_some(entry.base),
-        chunk,
-        text: *blake3::hash(&text).as_bytes(),
-        text_len: text.len(),
-      });
-    }
-  }
+  let read = read_every_revision(&source, &paths);
   let read_s = started.elapsed().as_secs_f64();
   println!(
     "source read: {} file revisions, {:.1} MiB of chunks, every text rebuilt and hashed, {read_s:.1} s",
@@ -344,18 +372,7 @@ fn main() {
     for at in &sample {
       let started = Instant::now();
       let mut cache = Cache::new(&segments);
-      let mut chain = vec![*at];
-      while let Some(base) = arm.revisions[*chain.last().unwrap()].base {
-        chain.push(base);
-      }
-      let whole = arm.revisions[chain.pop().unwrap()];
-      cache.read(whole.at, whole.len, &mut bytes);
-      let mut text = bytes.clone();
-      while let Some(link) = chain.pop() {
-        let stored = arm.revisions[link];
-        cache.read(stored.at, stored.len, &mut bytes);
-        text = slates_hg::delta::apply(&text, &bytes, &mut Admission::new(ROOM)).unwrap();
-      }
+      let text = rebuilt(&arm, &mut cache, *at, &mut bytes);
       micros.push(started.elapsed().as_secs_f64() * 1e6);
       decodes.push(cache.decodes as f64);
       let wanted = arm.revisions[*at];
@@ -382,11 +399,11 @@ fn main() {
       "arm {arm_name} {codec:?}: held {:.1} MiB (encoded in {encode_s:.2} s); old read µs p50 {:.0} p99 {:.0} max {:.0}, \
        segments decoded p50 {:.0} p99 {:.0}; clone file section {:.1} MiB in {stream_s:.2} s, {} segment decodes; rss {:.0} MiB",
       segments.bytes() as f64 / 1048576.0,
-      percentile(&mut micros.clone(), 0.5),
-      percentile(&mut micros.clone(), 0.99),
-      percentile(&mut micros, 1.0),
-      percentile(&mut decodes.clone(), 0.5),
-      percentile(&mut decodes, 0.99),
+      percentile(&mut micros.clone(), 500),
+      percentile(&mut micros.clone(), 990),
+      percentile(&mut micros, 1000),
+      percentile(&mut decodes.clone(), 500),
+      percentile(&mut decodes, 990),
       sent as f64 / 1048576.0,
       cache.decodes,
       peak_rss_mib()

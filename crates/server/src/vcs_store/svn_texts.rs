@@ -89,6 +89,23 @@ impl TextSource for HeadTexts<'_> {
     }
   }
 
+  /// [`TextSource::text_at`] for a reader keeping `cache` across its steps: the green's and the content store's runs
+  /// lent in place as `text_at` lends them; a text the records keep, the delta window the reader is in made once into
+  /// its cache and lent from there.
+  fn text_in<'a>(
+    &'a self,
+    identity: &ContentIdentity,
+    offset: u64,
+    cache: &'a mut slates_svn::reads::WindowCache,
+  ) -> Option<Cow<'a, [u8]>> {
+    let kept_by_records = self.records.stored_len(identity).is_none()
+      && self.green.and_then(|green| green.held(identity)).is_none();
+    if kept_by_records {
+      return self.records.text_in(identity, offset, cache);
+    }
+    self.text_at(identity, offset)
+  }
+
   /// A step of the same order: the green's held text a window's room copied, the content store's a window of the
   /// store read (`ContentStore::window_at`, from the window the bytes read so far reach), the records' a delta window
   /// applied.

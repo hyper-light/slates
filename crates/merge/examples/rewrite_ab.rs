@@ -118,9 +118,19 @@ fn lines(text: &str) -> Vec<(usize, usize)> {
   out
 }
 
+/// The bytes `[start, end)` of `text`, at character boundaries (the corpus' tokens are ASCII).
+fn cut(text: &str, (start, end): (usize, usize)) -> &str {
+  text.get(start..end).unwrap()
+}
+
 /// `text` with the bytes `[start, end)` replaced by `with`.
 fn splice(text: &str, (start, end): (usize, usize), with: &str) -> String {
-  format!("{}{}{}", &text[..start], with, &text[end..])
+  format!(
+    "{}{}{}",
+    text.get(..start).unwrap(),
+    with,
+    text.get(end..).unwrap()
+  )
 }
 
 /// One workload pair: the base, the two agents' files, and the oracle (`None`: the second must conflict).
@@ -150,14 +160,14 @@ fn pairs(workload: &str, base: &str, rng: &mut Rng) -> Vec<Pair> {
         let ta = words(base, a.0, a.1)[0];
         let tb = words(base, b.0, b.1)[0];
         let (lo, hi) = if ta.0 < tb.0 { (ta, tb) } else { (tb, ta) };
-        let first = splice(base, ta, &format!("{}_a", &base[ta.0..ta.1]));
-        let second = splice(base, tb, &format!("{}_b", &base[tb.0..tb.1]));
+        let first = splice(base, ta, &format!("{}_a", cut(base, ta)));
+        let second = splice(base, tb, &format!("{}_b", cut(base, tb)));
         let lo_new = if lo == ta { "_a" } else { "_b" };
         let hi_new = if hi == ta { "_a" } else { "_b" };
         let both = splice(
-          &splice(base, hi, &format!("{}{hi_new}", &base[hi.0..hi.1])),
+          &splice(base, hi, &format!("{}{hi_new}", cut(base, hi))),
           lo,
-          &format!("{}{lo_new}", &base[lo.0..lo.1]),
+          &format!("{}{lo_new}", cut(base, lo)),
         );
         Pair {
           base: base.into(),
@@ -196,7 +206,7 @@ fn pairs(workload: &str, base: &str, rng: &mut Rng) -> Vec<Pair> {
             .split_inclusive('\n')
             .map(|l| {
               let lead = l.len() - l.trim_start_matches(' ').len();
-              format!("{}{}", " ".repeat(lead * 2), &l[lead..])
+              format!("{}{}", " ".repeat(lead * 2), l.get(lead..).unwrap())
             })
             .collect()
         };
@@ -217,8 +227,8 @@ fn pairs(workload: &str, base: &str, rng: &mut Rng) -> Vec<Pair> {
         let line = worded[rng.below(worded.len())];
         let ws = words(base, line.0, line.1);
         let t = ws[rng.below(ws.len())];
-        let first = splice(base, t, &format!("{}_a", &base[t.0..t.1]));
-        let second = splice(base, t, &format!("x{}", &base[t.0..t.1]));
+        let first = splice(base, t, &format!("{}_a", cut(base, t)));
+        let second = splice(base, t, &format!("x{}", cut(base, t)));
         Pair {
           base: base.into(),
           first,
@@ -279,6 +289,49 @@ struct Tally {
   hunks: usize,
 }
 
+/// One arm's correctness on one workload's pairs: each pair's two saves judged by the real green, the second after the
+/// first; conflicts, wrong files and the ranges the arm recovered, counted.
+fn tally_of(arm: Arm, set: &[Pair]) -> Tally {
+  let mut tally = Tally::default();
+  let mut refiner = Refiner::new();
+  for pair in set {
+    let (b, f, s) = (
+      pair.base.as_bytes(),
+      pair.first.as_bytes(),
+      pair.second.as_bytes(),
+    );
+    let h1 = hunks_of(arm, b, f, &mut refiner);
+    let h2 = hunks_of(arm, b, s, &mut refiner);
+    tally.hunks += h1.len() + h2.len();
+    let mut green = Green::with_origin(Origin {
+      files: vec![(PATH.into(), b.to_vec())],
+      ..Origin::default()
+    });
+    let one = green.submit(&increment(b, f, &h1, 1));
+    assert!(
+      matches!(one, Outcome::Accepted { .. }),
+      "{arm:?} first: {one:?}"
+    );
+    let two = green.submit(&increment(b, s, &h2, 2));
+    let conflicted = matches!(two, Outcome::Conflict { .. });
+    tally.pairs += 1;
+    tally.conflicts += usize::from(conflicted);
+    let content = green.content(PATH).unwrap_or_default();
+    let expect: &[u8] = match (&pair.oracle, conflicted) {
+      (Some(both), false) => both.as_bytes(),
+      _ => f,
+    };
+    // On `clash` an accept is wrong whatever the file holds; on the rest a conflict is counted, not wrong.
+    let wrong = if pair.oracle.is_none() {
+      !conflicted
+    } else {
+      content != expect
+    };
+    tally.wrong += usize::from(wrong);
+  }
+  tally
+}
+
 fn main() {
   let only: Option<String> = std::env::args().nth(1);
   let arms: Vec<Arm> = ARMS
@@ -309,43 +362,7 @@ fn main() {
   );
   for arm in arms.iter().copied() {
     for (workload, set) in &sets {
-      let mut tally = Tally::default();
-      let mut refiner = Refiner::new();
-      for pair in set {
-        let (b, f, s) = (
-          pair.base.as_bytes(),
-          pair.first.as_bytes(),
-          pair.second.as_bytes(),
-        );
-        let h1 = hunks_of(arm, b, f, &mut refiner);
-        let h2 = hunks_of(arm, b, s, &mut refiner);
-        tally.hunks += h1.len() + h2.len();
-        let mut green = Green::with_origin(Origin {
-          files: vec![(PATH.into(), b.to_vec())],
-          ..Origin::default()
-        });
-        let one = green.submit(&increment(b, f, &h1, 1));
-        assert!(
-          matches!(one, Outcome::Accepted { .. }),
-          "{arm:?} first: {one:?}"
-        );
-        let two = green.submit(&increment(b, s, &h2, 2));
-        let conflicted = matches!(two, Outcome::Conflict { .. });
-        tally.pairs += 1;
-        tally.conflicts += usize::from(conflicted);
-        let content = green.content(PATH).unwrap_or_default();
-        let expect: &[u8] = match (&pair.oracle, conflicted) {
-          (Some(both), false) => both.as_bytes(),
-          _ => f,
-        };
-        // On `clash` an accept is wrong whatever the file holds; on the rest a conflict is counted, not wrong.
-        let wrong = if pair.oracle.is_none() {
-          !conflicted
-        } else {
-          content != expect
-        };
-        tally.wrong += usize::from(wrong);
-      }
+      let tally = tally_of(arm, set);
       println!(
         "{:<15} {:>8} {:>9}/{:<6} {:>9}/{:<6} {:>8}",
         name(arm),

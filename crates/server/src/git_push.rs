@@ -657,9 +657,10 @@ impl<P> ReceivePack<P> {
   /// checked push taken from the session.
   fn deciding(
     &mut self,
-    (record, sealed, name): (RepositoryRecord, SealedPush, [u8; 32]),
+    (record, mut sealed, name): (RepositoryRecord, SealedPush, [u8; 32]),
     verdicts: HookVerdicts,
   ) -> Result<DecidingPush, PushFailed> {
+    sealed.give_back_in_turns();
     let checked = self.session.take_checked().ok_or(PushFailed::Unchecked)?;
     let deciding = Deciding::new(checked, &mut self.admission).map_err(PushFailed::Exchange)?;
     Ok(DecidingPush {
@@ -722,6 +723,13 @@ impl<P> ReceivePack<P> {
         .map_err(PushFailed::Exchange)?
     };
     if !done {
+      self.answer = AnswerState::Deciding(Box::new(decision));
+      return Ok(None);
+    }
+    // The holds the landing set aside are given back a turn at a time before the push is given back (A-722's landing
+    // step).
+    let ns = state.config.step_quantum_ns();
+    if !decision.sealed.give_back_turn(state, ns) {
       self.answer = AnswerState::Deciding(Box::new(decision));
       return Ok(None);
     }

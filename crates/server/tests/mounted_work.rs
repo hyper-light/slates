@@ -156,6 +156,98 @@ fn seeded_green(client: &mut Client) -> VolumeId {
   green
 }
 
+/// Each of [`EDITORS`] reads the green's base through its own work's mount and saves its edit as an editor does.
+fn every_editor_saves(daemon: &Daemon) {
+  for editor in 0..EDITORS {
+    let (file, line, text) = edit_of(editor);
+    let name = format!("f{file}");
+    let (mut stream, root) = mounted(daemon, &format!("mounted-work-{editor}"));
+    let opened = lookup(&mut stream, &root, &name, 2);
+    assert_eq!(
+      read_whole(&mut stream, &opened, 3),
+      base_file(file),
+      "editor {editor} reads the green's base through its mount"
+    );
+    let mut xid = 10;
+    editor_save(
+      &mut stream,
+      &root,
+      &name,
+      &with_line(&base_file(file), line, &text),
+      &mut xid,
+    );
+  }
+}
+
+/// Editor `editor`'s verdict as the flow expects it: 0-6 and 8 accepted, their edits then in the green (true); 7 (0's
+/// edit again) accepted as identical; 9 a conflict on the line 8 changed.
+fn verdict_as_expected(editor: usize, verdict: &Submitted) -> bool {
+  match editor {
+    0..=6 | 8 => {
+      assert!(
+        matches!(verdict, Submitted::Accepted(_)),
+        "editor {editor}: {verdict:?}"
+      );
+      true
+    }
+    7 => {
+      assert!(
+        matches!(verdict, Submitted::Accepted(_)),
+        "editor 7's identical save: {verdict:?}"
+      );
+      false
+    }
+    _ => {
+      assert!(
+        matches!(verdict, Submitted::Conflict(_)),
+        "editor 9 changed the line editor 8 changed: {verdict:?}"
+      );
+      false
+    }
+  }
+}
+
+/// Each of `works` submitted in turn, with no declaration: editors 0-6 and 8 accepted, 7 (0's edit again) accepted as
+/// identical, 9 a conflict on 8's line; the green's head then the oracle, which is returned.
+fn submitted_in_turn(client: &mut Client, green: VolumeId, works: &[VolumeId]) -> Vec<Vec<u8>> {
+  let mut oracle: Vec<Vec<u8>> = (0..FILES).map(base_file).collect();
+  for (editor, &work) in works.iter().enumerate() {
+    let verdict = client.submit(work).unwrap();
+    if verdict_as_expected(editor, &verdict) {
+      let (file, line, text) = edit_of(editor);
+      oracle[file] = with_line(&oracle[file], line, &text);
+    }
+  }
+  for (file, expected) in oracle.iter().enumerate() {
+    assert_eq!(
+      &client
+        .read(green, &format!("f{file}"), ReadAt::Head)
+        .unwrap(),
+      expected,
+      "the green's head of f{file}"
+    );
+  }
+  oracle
+}
+
+/// What landed in `path`: every file the oracle's, and nothing else (no editor's temporary).
+fn landed_exactly(path: &str, oracle: &[Vec<u8>]) {
+  for (file, expected) in oracle.iter().enumerate() {
+    let landed = std::fs::read(format!("{}/f{file}", path)).unwrap();
+    assert_eq!(&landed, expected, "the landed f{file} is the oracle's");
+  }
+  let mut names: Vec<String> = std::fs::read_dir(path)
+    .unwrap()
+    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+    .collect();
+  names.sort();
+  let expected: Vec<String> = (0..FILES).map(|file| format!("f{file}")).collect();
+  assert_eq!(
+    names, expected,
+    "exactly the green's files landed, no editor's temporary"
+  );
+}
+
 /// A-774 (GAP-A9-14). Do: make a green of eight files and ten works over it; mount each work over NFS and save one
 /// edit through it as an editor does (temporary file, rename over); submit each work in turn, with no declaration;
 /// grant and land the green's head into a fresh directory. Expect: editors 0-6 accepted, editor 7 (editor 0's edit
@@ -175,57 +267,9 @@ fn ten_editors_on_mounted_works_submit_and_a_grant_lands_the_green() {
     .collect();
 
   // Every editor saves through its own mount before any submits, as ten concurrent editors would.
-  for editor in 0..EDITORS {
-    let (file, line, text) = edit_of(editor);
-    let name = format!("f{file}");
-    let (mut stream, root) = mounted(&daemon, &format!("mounted-work-{editor}"));
-    let opened = lookup(&mut stream, &root, &name, 2);
-    assert_eq!(
-      read_whole(&mut stream, &opened, 3),
-      base_file(file),
-      "editor {editor} reads the green's base through its mount"
-    );
-    let mut xid = 10;
-    editor_save(
-      &mut stream,
-      &root,
-      &name,
-      &with_line(&base_file(file), line, &text),
-      &mut xid,
-    );
-  }
+  every_editor_saves(&daemon);
 
-  let mut oracle: Vec<Vec<u8>> = (0..FILES).map(base_file).collect();
-  for (editor, &work) in works.iter().enumerate() {
-    let verdict = client.submit(work).unwrap();
-    let (file, line, text) = edit_of(editor);
-    match editor {
-      0..=6 | 8 => {
-        assert!(
-          matches!(verdict, Submitted::Accepted(_)),
-          "editor {editor}: {verdict:?}"
-        );
-        oracle[file] = with_line(&oracle[file], line, &text);
-      }
-      7 => assert!(
-        matches!(verdict, Submitted::Accepted(_)),
-        "editor 7's identical save: {verdict:?}"
-      ),
-      _ => assert!(
-        matches!(verdict, Submitted::Conflict(_)),
-        "editor 9 changed the line editor 8 changed: {verdict:?}"
-      ),
-    }
-  }
-  for (file, expected) in oracle.iter().enumerate() {
-    assert_eq!(
-      &client
-        .read(green, &format!("f{file}"), ReadAt::Head)
-        .unwrap(),
-      expected,
-      "the green's head of f{file}"
-    );
-  }
+  let oracle = submitted_in_turn(&mut client, green, &works);
 
   // The human's grant (R10): presented, approved under the issuer's proof, then landed.
   let target = target_dir();
@@ -234,20 +278,7 @@ fn ten_editors_on_mounted_works_submit_and_a_grant_lands_the_green() {
     Ok(Landing::Landed(outcome)) => assert_eq!(outcome.state, "done"),
     other => panic!("the granted landing of the green: {other:?}"),
   }
-  for (file, expected) in oracle.iter().enumerate() {
-    let landed = std::fs::read(format!("{}/f{file}", target.path)).unwrap();
-    assert_eq!(&landed, expected, "the landed f{file} is the oracle's");
-  }
-  let mut names: Vec<String> = std::fs::read_dir(&target.path)
-    .unwrap()
-    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-    .collect();
-  names.sort();
-  let expected: Vec<String> = (0..FILES).map(|file| format!("f{file}")).collect();
-  assert_eq!(
-    names, expected,
-    "exactly the green's files landed, no editor's temporary"
-  );
+  landed_exactly(&target.path, &oracle);
   drop(client);
   daemon.stop();
 }
