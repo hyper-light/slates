@@ -36,3 +36,9 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   build held mid-compile by a FIFO include across a daemon SIGKILL; then make (mtime/ctime), cargo incremental and
   git status. The kiln run r3 (.realtools/exp.sh, needs macos) is queued; Studio-4's NFS client is stalled by a
   root-mounted dead mount (Ada's).
+- 16:05 PST: wrote crates/cli/tests/real_tools.rs (branch agents/w-realtools, not on main: unrun). One macOS kernel-mount
+  flow over an overlay of a git checkout: a cc compile held by a FIFO include across `volume snapshot` and a daemon
+  SIGKILL must see `#pragma once` header as one file; `make -q` and `git status --porcelain` clean after each event.
+  Compiles locally (`--list` shows it). Run: kiln r7 (needs macos), queued -- Studio-4's NFS client is stalled; the
+  balancer's macbook-pro-2 failed the repo sync 3x; adas-mac-studio.local and adas-macbook-pro.local went offline.
+  Land it once its red/green is read; if green on APFS (birth times), the red case is a no-birth-time base (A-781 shape).
