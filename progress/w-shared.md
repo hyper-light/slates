@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 part e = 76b5dd46a (main 285ab0923): holder work recovery over the replica. NEXT: part f (takeover
+  + routing flip: delete the test hook Daemon::serve_works_on_holders/WorkHome::on_holders, replace green_elsewhere's hook
+  with the real "replicated here" rule, two-node f=1 e2e with taken-by-position counter; takeover of A -> successor
+  answers holder works' asks). Owed: holder rebase + copies (Unsupported), dropped pending creation's floor at owner,
+  increment too large for the forward lane.
+
 ## LANDED 2026-11-20: A-697 part d = f253a8017 (main 04a69de57): hold_until_replica/replica_reached (control shard waits,
   woken by merge_service::recompute; bound = parked verb); fixed part b test's counter race. NEXT: part e (recovery:
   holder works after a restart -- unbuilt works whose green is elsewhere replayed via the replica / owner admission;
