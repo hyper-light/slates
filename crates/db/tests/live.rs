@@ -3576,3 +3576,65 @@ fn measure_the_whole_append_turn_hashed_in_slices() {
     slices[MEASURED_APPENDS / 2]
   );
 }
+
+/// A-757 part 2b (w-forming, 2026-11-20): a large delta's identity hashed in slices appends at the head a delta hashed
+/// at once takes, under the delta credit. Do: on two equal shippers, append a delta of a few hundred KiB, one at once
+/// and one fed in 4 KiB slices. Expect equal heads, and `admits_delta` true before each.
+#[test]
+fn a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once() {
+  const DELTA: usize = 200_000;
+  const SLICE: usize = 4096;
+  let payload: Vec<u8> = (0..DELTA)
+    .map(|at| u8::try_from(at % 239).unwrap())
+    .collect();
+  let mut at_once = shipper_bounded_by_whole(DELTA * 4);
+  let mut in_slices = shipper_bounded_by_whole(DELTA * 4);
+  assert!(at_once.admits_delta(payload.len()) && in_slices.admits_delta(payload.len()));
+  let expected = at_once.append_kept(payload.clone()).unwrap();
+  let mut hasher = in_slices.entry_hasher(payload.len()).unwrap();
+  for slice in payload.chunks(SLICE) {
+    hasher.feed(slice);
+  }
+  assert_eq!(in_slices.append_hashed(payload, hasher).unwrap(), expected);
+}
+
+/// A measurement (w-forming's A/B for A-757 part 2b; run alone in release with `--ignored --nocapture --exact`, under
+/// `/usr/bin/time -l`): a [`MEASURED_APPEND_BYTES`] delta's append turn, hashed at once (`append_kept`) and hashed
+/// [`MEASURED_SLICE_BYTES`] a turn before (`append_hashed`), with the longest hashing turn; best and median of
+/// [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_delta_append_turn() {
+  let mut at_once = Vec::new();
+  let mut hashed = Vec::new();
+  let mut slices = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let began = std::time::Instant::now();
+    shipper.append_kept(payload).unwrap();
+    at_once.push(began.elapsed());
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let mut hasher = shipper.entry_hasher(payload.len()).unwrap();
+    let mut longest = std::time::Duration::ZERO;
+    for slice in payload.chunks(MEASURED_SLICE_BYTES) {
+      let began = std::time::Instant::now();
+      hasher.feed(slice);
+      longest = longest.max(began.elapsed());
+    }
+    slices.push(longest);
+    let began = std::time::Instant::now();
+    shipper.append_hashed(payload, hasher).unwrap();
+    hashed.push(began.elapsed());
+  }
+  for times in [&mut at_once, &mut hashed, &mut slices] {
+    times.sort_unstable();
+  }
+  let median = MEASURED_APPENDS / 2;
+  println!(
+    "DELTA_APPEND_TURN bytes={MEASURED_APPEND_BYTES} at_once best={:?} median={:?}; hashed append best={:?} median={:?}; \
+     longest {MEASURED_SLICE_BYTES}-byte hashing turn best={:?} median={:?}",
+    at_once[0], at_once[median], hashed[0], hashed[median], slices[0], slices[median]
+  );
+}
