@@ -32,7 +32,7 @@ const AT_LEAST_PERCENT: u64 = 90;
 const PATTERN_BYTES: usize = 4093;
 /// Shape: how long a client retries the rendezvous while a daemon starts, as `crates/server/tests/recovery.rs` does.
 const START_WAIT: Duration = Duration::from_secs(5);
-/// Shape: how long the idle purge may take to reach the file's pages on a loaded runner: many reap ticks.
+/// Shape: how long the idle purge may take to reach the file's pages on a loaded runner: many sweep passes (`slates_server::idle_sweep`).
 const PURGE_WAIT: Duration = Duration::from_secs(120);
 /// Shape: the first part of a wait reported on its own. Windows trims a working set unasked: with every discard refused,
 /// CI's runners lost 24% to 69% of these bytes over the whole [`PURGE_WAIT`] (runs of 2026-11-05) with the daemon counting

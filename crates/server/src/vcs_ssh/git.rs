@@ -259,6 +259,8 @@ impl<L: StoreLender> Command for UploadCommand<L> {
       if !matches!(self.version, Version::V2) {
         return self.refuse_version();
       }
+      // A-718: the store's versions encoded and kept once, before any of the session's fetches is answered.
+      self.lender.encode(self.repository).await;
       self.serve(Asked::Advertise)?;
       return Ok(Stepped {
         consumed: 0,

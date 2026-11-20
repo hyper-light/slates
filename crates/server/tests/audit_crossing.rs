@@ -25,10 +25,10 @@ use common::target::target_dir;
 
 /// Shape: two shards, so a volume is owned by a shard that is not the control shard.
 const SHARDS: u16 = 2;
-/// Shape: how long a record owed across shards may take to reach the audit: the reap tick that sends it again runs
-/// once a liveness budget (a second), so this is many ticks on a loaded machine.
+/// Shape: how long a record owed across shards may take to reach the audit: the deadline keeper's look that sends it again
+/// comes a retry window (about a second) after the record (A-554), so this is many looks on a loaded machine.
 const CROSSING_WAIT: Duration = Duration::from_secs(30);
-/// Shape: the pause between a polling test's reads: a hundredth of the reap tick's second, so a wait ends soon after
+/// Shape: the pause between a polling test's reads: a hundredth of the look's second, so a wait ends soon after
 /// its condition holds without a read of the daemon's status on every turn of the thread.
 const POLL: Duration = Duration::from_millis(10);
 
@@ -84,7 +84,7 @@ fn counted(client: &mut Client, kind: &str) -> u64 {
 /// crossing; present the landing of a volume the shard that is not the control shard owns; read the audit; stop the
 /// daemon and start another over the same anchor; read the audit until it holds the presentation's record. Expect the
 /// first read without it, since the crossing was withheld, and after the restart the record once, within the wait: it
-/// was durable in the owing shard's partition from its atom on, and the new daemon's reap tick sent it. Before
+/// was durable in the owing shard's partition from its atom on, and the new daemon's deadline keeper sent it. Before
 /// 2026-11-18 it lived in the shard's memory between its atom's commit and its batch, and the restart lost it.
 #[test]
 fn a_record_owed_across_shards_survives_a_restart_before_its_batch() {
@@ -141,7 +141,7 @@ fn a_batch_sent_again_after_a_lost_acknowledgement_appends_nothing_twice() {
   while counted(&mut client, slates_server::landing::AUDIT_RESENT) < 2 {
     assert!(
       started.elapsed() < CROSSING_WAIT,
-      "the reap tick sent the unacknowledged record again within {CROSSING_WAIT:?}"
+      "the deadline keeper sent the unacknowledged record again within {CROSSING_WAIT:?}"
     );
     #[allow(clippy::disallowed_methods)] // the test polls the daemon for the crossing's records
     std::thread::sleep(POLL);

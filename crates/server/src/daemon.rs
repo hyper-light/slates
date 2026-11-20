@@ -3273,13 +3273,13 @@ impl Daemon {
     Ok(())
   }
 
-  /// Test support: gives back every shard's dead recovery memory now, as an idle shard's reap tick does
-  /// (`return_dead_recovery`, A-117), rather than waiting for the tick to find the shard idle: the bytes given back
+  /// Test support: gives back every shard's dead recovery memory now, as an idle shard's sweep pass does
+  /// (`return_dead_recovery`, A-117), rather than waiting for a sweep pass to find the shard idle: the bytes given back
   /// over every shard.
   pub fn give_back_recovery_on_every_shard(&self) -> Result<u64, ObserveError> {
     let mut returned = 0u64;
     for shard in self.shards.iter().copied() {
-      // Slice after slice, as the idle tick takes them (one quantum a step), until nothing is left.
+      // Slice after slice, as an idle sweep pass takes them (one quantum a step), until nothing is left.
       loop {
         let (bytes, more) = self.observe(Some(shard), return_dead_recovery)?;
         returned = returned.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
@@ -3313,7 +3313,7 @@ impl Daemon {
     Ok(left)
   }
 
-  /// Test support: gives back every shard's dead recovery memory a slice at a time, as an idle shard's reap tick does
+  /// Test support: gives back every shard's dead recovery memory a slice at a time, as an idle shard's sweep pass does
   /// (`return_dead_recovery`, A-226), timing each step on the shard thread's own CPU clock, which a loaded host does
   /// not inflate: the bytes given back, the steps, the CPU each step held its shard, and the step quantum the shard
   /// holds its work to. `None` for the CPU where the shard's thread clock cannot be read (Windows' thread times tick
@@ -3372,7 +3372,7 @@ impl Daemon {
     Ok(report)
   }
 
-  /// Test support: runs one idle give-back of the first shard's dead recovery memory, as a reap tick does, from a page
+  /// Test support: runs one idle give-back of the first shard's dead recovery memory, as a sweep pass does, from a page
   /// slice and over the whole of that memory as after a restart, with `neighbour` another task taking turns on the
   /// shard the whole time: how many idle steps it took, `None` if the shard could not be asked or did not finish within
   /// the budget. A neighbour that allocates nothing looks idle to the arena, as a granted landing does (A-226). The
@@ -5324,7 +5324,7 @@ fn return_dead_recovery_timed(
 }
 
 /// Gives an idle shard's resident free content, and its emptied write log's pages, back to the OS (A-105): when the
-/// content arena allocated nothing since the last reap tick, its free blocks are purged a slice at a time, yielding
+/// content arena allocated nothing since the last sweep pass (`crate::idle_sweep`), its free blocks are purged a slice at a time, yielding
 /// between slices so a request that arrives meanwhile is served first. Decay-based, as jemalloc purges dirty pages after
 /// a quiet interval: a busy shard keeps its zeroed free blocks resident for the allocations that follow, an idle one
 /// stops costing RAM for what it no longer holds. Before 2026-10-06 nothing ever went back: a deleted 128 MiB file left
@@ -5401,24 +5401,24 @@ async fn purge_if_idle() -> bool {
   }
 }
 
-/// Counter: give-backs that left the rest for the next reap tick because another task ran on the shard (A-226), the
+/// Counter: give-backs that left the rest for the next sweep pass because another task ran on the shard (A-226), the
 /// non-vacuity count of the check in [`purge_if_idle`].
 pub const GIVE_BACK_LEFT: &str = "content.give_back.left_for_next_tick";
 
-/// Counter: reap ticks whose idle sweep sealed content, and so published and left the purge for a later tick (A-105).
+/// Counter: sweep passes that sealed content, and so published and left the purge for a later pass (A-105).
 pub const TICKS_SEALING: &str = "content.ticks.sealing";
-/// Counter: reap ticks that found frees deferred behind the committed image, and so published and left the purge for a
+/// Counter: sweep passes that found frees deferred behind the committed image, and so published and left the purge for a
 /// later tick (A-64, A-105).
 pub const TICKS_DEFERRED: &str = "content.ticks.deferred";
-/// Counter: reap ticks that reached the purge and found the arena had allocated since the previous tick (A-105).
+/// Counter: purge steps that found the arena had allocated since the previous sweep pass (A-105).
 pub const TICKS_BUSY: &str = "content.ticks.busy";
-/// Counter: reap ticks that found the shard idle: the purge ran, and the reserve's refill (A-105, A-214).
+/// Counter: purge steps that found the shard idle: the purge ran, and the reserve's refill (A-105, A-214).
 pub const TICKS_IDLE: &str = "content.ticks.idle";
 
 /// Counter: free content bytes an idle shard faulted in for its reserve (A-214), the refill's non-vacuity count.
 pub const CONTENT_PREFAULTED: &str = "content.prefaulted_bytes";
 
-/// Ends a busy period at an idle reap tick (A-214): when the arena allocated or freed since the last idle tick, the
+/// Ends a busy period at an idle sweep pass (A-214): when the arena allocated or freed since the last idle pass, the
 /// period's net change of allocated bytes decides the reserve. A period that grew the content is the last write burst,
 /// its net growth; one that shrank it takes what it freed off the burst, so a written file deleted later takes its
 /// reserve with it. Before 2026-11-05 a period ended only when the allocation count moved, which a free does not move:
@@ -5460,14 +5460,14 @@ fn register_idle_refill(shard: u16) {
     registry::with_current(|ctx| ctx.set_idle_work(Box::new(refill_slice)))
   {
     slates_machine::log_line!(
-      "slates-server: shard {shard}: the reserve's idle refill was refused ({refusal}); it refills at reap ticks only"
+      "slates-server: shard {shard}: the reserve's idle refill was refused ({refusal}); it refills at idle sweep passes only"
     );
   }
 }
 
 /// The shard's idle work (A-214, registered with the runtime at the shard's start): one slice of its reserve's refill,
 /// `quantum / page_fault_ns` pages, whenever the shard has nothing else to do and its idle spin has run out, so a
-/// burst's pages are faulted in the moment the shard goes quiet rather than at the next reap tick, which the incumbent
+/// burst's pages are faulted in the moment the shard goes quiet rather than at the next idle sweep pass, which the incumbent
 /// harness's second-long pauses never reached (A-105's test needs a whole quiet tick). Whether it faulted anything or
 /// has more to fault; once it finds nothing it stays quiet until the arena allocates again.
 fn refill_slice() -> bool {
@@ -5498,7 +5498,7 @@ fn refill_slice() -> bool {
 fn prefault_reserve(s: &ShardState) -> Vec<slates_mem::arena::KeptRun> {
   let arena = s.store.content.arena();
   // The busy period under way counts as soon as it has grown past the last one: an idle moment inside it, or right
-  // after it, comes before the reap tick that closes it.
+  // after it, comes before the sweep pass that closes it.
   let running = s.burst_seen.map_or(0, |(_, before)| {
     arena.allocated_bytes().saturating_sub(before)
   });

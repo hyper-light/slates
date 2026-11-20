@@ -303,10 +303,10 @@ pub struct ShardState {
   /// the anchor provides no content object (a build or config without anchor-backed recovery); then
   /// a restart recreates content empty as before (BUG-11).
   pub content: Option<SparseObject>,
-  /// The content arena's allocation count at the last reap tick: unchanged at the next means the shard allocated
+  /// The content arena's allocation count at the last sweep pass: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
-  /// The content arena's allocation count and allocated bytes at the last idle reap tick (A-214), `None` before the
+  /// The content arena's allocation count and allocated bytes at the last idle sweep pass (A-214), `None` before the
   /// first: a later idle tick with another count ends a busy period, whose net growth is the allocated bytes' rise.
   pub(crate) burst_seen: Option<(u64, usize)>,
   /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
