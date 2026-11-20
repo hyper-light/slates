@@ -1,13 +1,11 @@
-# RESUME HERE (2026-11-20 ~13:30Z, Mac Studio d1323898; supersedes everything below)
-- LANDED: kiln 30c5929 (A-580 harness), e33c470 (A-708), 0edd8dc (A-734: one fleet, kiln founds its groups once,
-  link flows on macOS), e3e5d7b (A-734 follow-up: a move's refusal read from the timeline); slates a5140de
-  (fleet.rs:4819 test vs A-414). Both link flows PASS on macOS (cut-off 35.8 s, slow lossy link 43.3 s).
-- Nothing in flight. Owed to main: Linux run of the four signalling flows (run-requests.md); decisions: kiln
-  workspaces live-shipped by default?; shares only to a move's target. Findings: isolated agent's move refusal has no
-  W7 kind; Slates forward-lane log flood (lane dropped when empty re-crosses the failover delay, 1M lines a test); one
-  run's fleet-c never served (not reproduced).
-- Worktree kept: ~/slates-work/w-fed-faults-p3 (scratch). Targets ~/.cache/w-fed-faults-target,
-  ~/.cache/w-fed-faults-slates-target. Ship route: kiln run on b24c5c95... cwd ~/.cache/w-fed-faults-ship.
+# RESUME HERE (2026-11-20 ~15:30Z, Mac Studio d1323898; supersedes everything below)
+- LANDED: kiln 30c5929 (A-580), e33c470 (A-708), 0edd8dc + e3e5d7b (A-734), ed8991d (A-750: workspaces
+  live-shipped + shared with every member at making; isolated move refused [kind: isolated]); slates a5140de.
+- PROVEN on macOS with kiln alone: killed flow (owner's runner stopped, mounts gone, instance SIGKILLed; survivors
+  served 8/8), cut-off flow, slow-link flow (refused by kind unplaced).
+- IN FLIGHT: kiln run r23 on adacachy (linux/amd64): the four signalling flows over the A-750 code (synced from
+  worktree ~/slates-work/w-fed-faults-a750, same code as ed8991d). On its end: fix what fails, land, report.
+- Forward-lane log flood: g226's (main's word).
 
 - Answered w-balance Q3 (inbox 2cf8325).
 - Ship route: kiln run on adas-mac-studio-2.local (b24c5c95...), cwd ~/.cache/w-fed-faults-ship (land.sh, state3.sh,
