@@ -76,6 +76,8 @@
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
 > one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
+> Designed, owed: the snapshot slot sized by its data (8) and a giant repository's index cut across partitions by
+> object id (9).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -115,6 +117,12 @@
 > PastRoom { room: 278528 }` for the same repository), the unbundle's processing in slices, and w-perf's whole push.
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
+>
+> **A-727 (2026-11-20, w-perf, UI goal 93; designed):** repository bytes leave the partition snapshot (the 747 MB
+> wall a 5,000-revision svn import met is the snapshot, the sum of every retained record): the vcs content store in the
+> shard's chunk arena of the anchor's content object, its table in the shard image recovered before the records, records
+> naming identities (git v3: names + the pack's root identity), entries waiting on the next image barrier (group commit).
+> OWED: slices (a1) read seam, (a2) arena storage, (a3) image table + recovery order, (b) git v3, (c) svn, (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
