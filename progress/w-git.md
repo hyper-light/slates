@@ -155,3 +155,7 @@
   to + current_head match. Measured & sent: work build + apply dominate (works/merge).
   NEXT 4d: store commit passes (brought_by, landed_runs, plan/members_positions, release_holds) + stale restage sliced;
   by-use 10/19 proof when w-balance-fix1 (76070d077) lands on main.
+- A-722 part 4d LANDED a8aea3990 (main 14a85fbd2): replay thin-pack resolve in turns (Reader::resolve_turn_with).
+- BY-USE PROOF in progress: release build on adas-mac-studio.local-2 (kiln run r2, target ~/.cache/w-git-target.noindex,
+  CARGO_INCREMENTAL=0) of main d435c91b7 (has w-balance 032617278). Then: python3 crates/cli/bench/multi_repo_load.py
+  <slates> ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0 --steps 100 --per-repository-cap 10, then without cap (19).
