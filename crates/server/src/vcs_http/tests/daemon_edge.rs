@@ -2068,3 +2068,63 @@ fn a_dav_lock_runs_pre_lock_and_its_refusal_answers_the_lock() {
     "{status}: {body}"
   );
 }
+
+/// Shape: the blobs a partial clone's checkout fetches lazily in one request, as `git clone --filter=blob:none` asks
+/// for every blob of its checkout: two thousand, as w-interop's matrix source checked out.
+const LAZY_BLOBS: usize = 2_000;
+
+/// A v2 `fetch` as git's promisor fetch asks for missing objects (`promisor-remote.c` `fetch_objects`: `git fetch
+/// --filter=blob:none --stdin` with the no-op negotiator): a `want` for each of `ids`, the filter, no haves, `done`.
+fn lazy_fetch_of(ids: &[ObjectId]) -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  let mut arguments: Vec<String> = ids.iter().map(|id| format!("want {id}\n")).collect();
+  arguments.extend([
+    "filter blob:none\n".to_owned(),
+    "no-progress\n".to_owned(),
+    "done\n".to_owned(),
+  ]);
+  for argument in arguments {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// A-745 (found by use: w-interop's stock-git matrix, rows partial-clone and partial-blame, r103 on 36c6ed55d and r110
+/// on 944588f6a, and w-bugs' own run of the matrix on 612 commits over 2,000 files: `git clone --filter=blob:none` exited
+/// 128, "could not fetch <blob> from promisor remote", its checkout's lazy fetch refused `upload-pack: the request needs
+/// more room than the server admits`). Do: push a line of [`LONG_HISTORY`] commits through the daemon's edge, each
+/// request admitted one ring region; then fetch [`LAZY_BLOBS`] of its blobs as git's promisor fetch asks for a
+/// checkout's missing blobs. Expect: the fetch `200`, a packfile section holding every blob asked: a fetch's answer is
+/// admitted a slice at a time, never sized by its whole request.
+#[test]
+fn a_partial_clones_lazy_fetch_of_many_blobs_is_answered_over_the_daemons_edge() {
+  use slates_git::object_name::Kind;
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, _) = long_history(LONG_HISTORY);
+  let created = pushed(edge, &name, &request);
+  let blobs: Vec<ObjectId> = (0..LAZY_BLOBS)
+    .map(|at| git_name(Kind::Blob, format!("line {at}\n").as_bytes()))
+    .collect();
+  let fetched = uploaded(edge, &name, &lazy_fetch_of(&blobs));
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  let answer = String::from_utf8_lossy(
+    fetched
+      .1
+      .get(..fetched.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert_eq!(fetched.0, 200, "{answer}");
+  assert!(answer.starts_with("000dpackfile\n"), "{answer}");
+  assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), LAZY_BLOBS);
+}
