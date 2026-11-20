@@ -1,0 +1,7 @@
+000dpackfile
+002eerror: short object ID 5ad7 is ambiguous
+007bhint: The candidates are:
+hint:   5ad7d2ca6 blob
+hint:   5ad7d2ca9 blob
+fatal: unable to access sparse blob in '5ad7'
+0047aborting due to possible repository corruption on the remote side.

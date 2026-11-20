@@ -291,8 +291,28 @@ impl<'a> TableView<'a> {
 
   /// Every row, in key order.
   pub fn iter(&self) -> impl Iterator<Item = RowRef<'a>> + use<'a> {
+    self.iter_after(0)
+  }
+
+  /// Every row whose key is not before `start`, in key order: from the first such row, found by binary search. A row
+  /// whose bytes are not a row reads as a key past every other, as [`TableView::get`] stops at it, so the rows read
+  /// end there.
+  pub fn iter_from(&self, start: &[u8]) -> impl Iterator<Item = RowRef<'a>> + use<'a> {
+    let (mut low, mut high) = (0, self.rows);
+    while low < high {
+      let middle = low.midpoint(high);
+      match self.row(middle) {
+        Some(row) if row.key() < start => low = middle.saturating_add(1),
+        _ => high = middle,
+      }
+    }
+    self.iter_after(low)
+  }
+
+  /// Every row from row `first` on, in key order, to the first whose bytes are not a row.
+  fn iter_after(&self, first: usize) -> impl Iterator<Item = RowRef<'a>> + use<'a> {
     let view = *self;
-    (0..self.rows).map_while(move |at| view.row(at))
+    (first..self.rows).map_while(move |at| view.row(at))
   }
 }
 

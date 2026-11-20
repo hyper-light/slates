@@ -50,7 +50,7 @@
 
 use std::collections::BTreeSet;
 
-use super::answer::{Answer, Framing};
+use super::answer::{self, Answer, Framing};
 use super::{AGENT, PackPlan, PackSource, Refusal, Served, charged, refs, sparse};
 use crate::http::Version;
 use crate::negotiation::{self, Deepen, Filter, Graph, ShallowInfo};
@@ -584,14 +584,15 @@ fn answered<P: PackSource>(
   with_pack(graph, served, request, head, chosen, packs, admission)
 }
 
-/// The answer once its pack is due: `head`, then the pack, or, when the request's `sparse:oid` filter's blob was not
-/// resolved or read, git's answer to a `pack-objects` that dies as it begins (A-640 part 4). The blob is read here, as
+/// The answer once its pack is due: `head`, what git's `pack-objects` wrote to its error stream as it read a
+/// `sparse:oid` filter's name relayed on band 2 where there is one (A-640 part 4), then the pack; or, when the filter's
+/// blob was not resolved or read, git's answer to a `pack-objects` that dies as it begins. The blob is read here, as
 /// git's `pack-objects` reads it once the pack is due.
 fn with_pack<P: PackSource>(
   graph: &StoreGraph<'_>,
   served: &Served<'_>,
   request: &negotiation::Request<'_>,
-  head: Vec<u8>,
+  mut head: Vec<u8>,
   chosen: Chosen,
   packs: &mut P,
   admission: &mut Admission,
@@ -605,9 +606,13 @@ fn with_pack<P: PackSource>(
   let negotiation::Answer::Pack(pack) = outcome.answer else {
     return Ok(Answer::whole(head).counted(outcome.counters));
   };
+  let banded = chosen.framing.is_banded();
   if let Some(refusal) = sparse.dies {
-    return Answer::died(head, refusal, chosen.framing.is_banded(), admission)
+    return Answer::died(head, sparse.said, refusal, banded, admission)
       .map(|answer| answer.counted(outcome.counters));
+  }
+  if banded {
+    answer::relay(&sparse.said, &mut head, admission)?;
   }
   let plan = PackPlan {
     runs: &pack.runs,
