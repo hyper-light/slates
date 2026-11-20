@@ -81,6 +81,9 @@ const REVISION_DATE: &[u8] = b"svn:date";
 /// The prefix a property in Subversion's namespace is named by.
 /// Format: `svn_props.h` `SVN_PROP_PREFIX`.
 const SVN_PREFIX: &str = "svn:";
+/// The scheme every Subversion lock token is written in (`svn_fs_fs__generate_lock_token`).
+/// Format: RFC 4918 §20's `opaquelocktoken` URI scheme.
+const LOCK_TOKEN_SCHEME: &str = "opaquelocktoken:";
 /// The attribute naming a property value's encoding.
 /// Format: `dav_svn__encode_xml`'s `V:encoding` (`SVN_DAV_PROP_NS_DAV`).
 const ENCODING: &str = "encoding";
@@ -242,6 +245,29 @@ impl DavCommit {
   /// Whether the transaction has ended.
   pub fn over(&self) -> bool {
     self.over
+  }
+
+  /// Presents a lock's `token` for the transaction path `path` (an `If` header's, or a MERGE's `S:lock-token-list`,
+  /// A-681): a later request meeting the path's lock, and the MERGE's verdict, judge it with this token.
+  pub fn present(&mut self, path: &str, token: &str) {
+    self
+      .drive
+      .present_lock(format!("/{}", relpath(path)), token.to_owned());
+  }
+
+  /// Whether the commit keeps the locks it presented (`X-SVN-Options: keep-locks`), as the MERGE asks.
+  pub fn keep_locks(&mut self, keep: bool) {
+    self.drive.keep_locks(keep);
+  }
+
+  /// The tokens an `If` header presents (RFC 4918 §10.4): each state token in angle brackets that is a lock token
+  /// (`opaquelocktoken:`, as Subversion's are), a resource tag's URL passed over.
+  pub fn if_tokens(header: &str) -> Vec<&str> {
+    header
+      .split('<')
+      .filter_map(|rest| rest.split_once('>').map(|(inside, _)| inside))
+      .filter(|inside| inside.starts_with(LOCK_TOKEN_SCHEME))
+      .collect()
   }
 
   /// A PUT of `path`'s text (the module doc): `201` for a file this request adds, `204` for one it changes.
