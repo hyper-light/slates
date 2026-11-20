@@ -386,14 +386,13 @@ impl reads::Repository for View {
     Green::properties(self.0, identity)
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
-    let text = self.0.content(identity)?;
-    text.get(usize::try_from(offset).ok()?..)
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
+    reads::Repository::text(self.0, identity, offset)
   }
 }
 
 impl Green for View {
-  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
     Green::text(self.0, identity)
   }
 

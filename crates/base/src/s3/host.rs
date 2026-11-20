@@ -1563,6 +1563,14 @@ mod tests {
     assert_eq!(host.counts().relists, 1);
   }
 
+  /// Reads `buf.len()` bytes of `file` at `at` again: a hit, with no fetch.
+  fn a_second_read_hits_with_no_fetch(host: &mut S3Host, file: HostFile, at: u64, buf: &mut [u8]) {
+    let hits = host.counts().hits;
+    assert_eq!(host.read_at(file, at, buf), Ok(buf.len()));
+    assert_eq!(host.next_fetch(), None);
+    assert_eq!(host.counts().hits, hits + 1);
+  }
+
   /// A-524 (a file is bound to its object; ranges are chunks): do open a file of two and a half chunks and read across
   /// its first chunk's end, then the same bytes again, then its tail. Expect the first read a miss whose fetch is the
   /// run of the two chunks it needs bound by `If-Match` to the listed ETag; the bytes as put; the second read a hit
@@ -1598,10 +1606,7 @@ mod tests {
     host.landed(ticket, store.answer(&fetch), ROUND_TRIP_NS);
     assert_eq!(host.read_at(file, at, &mut buf), Ok(20));
     assert_eq!(&buf[..], &bytes[usize::try_from(at).unwrap()..][..20]);
-    let hits = host.counts().hits;
-    assert_eq!(host.read_at(file, at, &mut buf), Ok(20));
-    assert_eq!(host.next_fetch(), None);
-    assert_eq!(host.counts().hits, hits + 1);
+    a_second_read_hits_with_no_fetch(&mut host, file, at, &mut buf);
     assert_eq!(read_whole(&mut host, &mut store, file).unwrap(), bytes);
     assert_eq!(
       host.read_at(file, CHUNK * 3, &mut buf),

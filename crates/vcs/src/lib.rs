@@ -67,6 +67,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod arrival;
+pub mod cold;
 pub mod content;
 pub mod derived;
 pub mod index;
@@ -79,6 +80,7 @@ pub mod wildmatch;
 pub use arrival::{
   AdmitRefused, Admitted, Arriving, CommitRefused, Naming, Quarantine, object_payload, object_row,
 };
+pub use cold::{Prices, Rebuildable, choose};
 pub use content::{
   ContentCounters, ContentId, ContentRefused, ContentStore, DerivedNode, Form, Stored, Windows,
 };

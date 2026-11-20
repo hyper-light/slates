@@ -238,6 +238,60 @@ fn a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_ve
   }
 }
 
+/// The pack of both versions reads back as every object `first` and `second` made.
+fn assert_both_versions_read_back(
+  format: ObjectFormat,
+  (repository, store): (&Repository, &ContentStore),
+  first: &[Made],
+  second: &[Made],
+) {
+  let pack = pack_of(repository, store, &brought_by(repository, store, 1, 0..=1));
+  let made: BTreeMap<ObjectId, Vec<u8>> = first
+    .iter()
+    .chain(second)
+    .map(|object| (object.id, object.content.clone()))
+    .collect();
+  assert_eq!(unpacked(format, &pack), made);
+}
+
+/// A-724 piece 4 (§4.17.5 "The cold trigger"). Do: encode two versions, then drop the second's
+/// fragments, then encode it again. Expect: both listed as kept with the bytes their content
+/// holds; the drop giving exactly those bytes back to the content store and leaving the version to
+/// encode next; a second drop finding nothing; the version encoded again to the same fragments,
+/// so the pack reads back as before; and the store empty once the repository is released.
+#[test]
+fn a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same() {
+  for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+    let mut store = store();
+    let (mut repository, first, second) = two_versions(format, &mut store);
+    let kept = repository.kept_fragments(&store);
+    assert_eq!(
+      kept.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+      vec![(1, 0), (1, 1)]
+    );
+    let (_, second_bytes) = kept[1];
+    assert!(second_bytes > 0);
+    let before = repository
+      .fragments(1, 1)
+      .map(|(o, b)| (o.to_vec(), b.to_vec()));
+    let used = store.used();
+    assert!(repository.drop_fragments(&mut store, (1, 1)).unwrap());
+    assert_eq!(store.used(), used - second_bytes);
+    assert_eq!(repository.first_unencoded(), Some((1, 1)));
+    assert!(!repository.drop_fragments(&mut store, (1, 1)).unwrap());
+    repository
+      .encode_fragments(&mut store, (1, 1), &mut Ticks(0), EXCHANGE)
+      .unwrap();
+    let after = repository
+      .fragments(1, 1)
+      .map(|(o, b)| (o.to_vec(), b.to_vec()));
+    assert_eq!(after, before);
+    assert_both_versions_read_back(format, (&repository, &store), &first, &second);
+    repository.release(&mut store).unwrap();
+    assert!(store.is_empty());
+  }
+}
+
 /// A-614 part 2 (offset deltas within a fragment, chains no deeper than the learned depth). Do:
 /// push, from a client whose pack was one delta deep, a commit over a file, the file with eleven
 /// lines edited, and that with one more: the third is nearest the second. Expect: the later two

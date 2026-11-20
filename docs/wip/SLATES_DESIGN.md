@@ -11283,6 +11283,15 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >   (`docs/bugs/2026-11-07-a-greens-history-kept-a-copy-of-every-file-per-version.md`,
 >   `docs/bugs/2026-11-07-a-run-after-a-length-change-merged-zeros.md`.)
 
+> **Status (2026-11-20, A-728 part 1: the history's latest value names the file's block).** A content history chunk
+> is owned bytes or a file's block of the files' arena, holding one holder of it (`crates/merge/src/history.rs`,
+> `Source`). A value stored whole (a path's first change, its bytes before its first recorded change, a checkpoint's
+> restored file, and a change that shares no run with the value before it, which every push and import is) names the
+> file's block instead of copying it, so a changed file is held once; the file map letting the block go at the next
+> change leaves it held as the earlier version's bytes, nothing copied. A retired lineage member gives its chunks' holds
+> back a chunk a step (`Release`). Counted: `Green::history_blocks_named`. Owed (part 2): a splice's added runs named
+> in the new block too, copied out only when the value is superseded.
+
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
 > which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
@@ -14531,7 +14540,8 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
 working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
 push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
-landing.
+landing; a fork another push made stale is re-based by node first (part 2b), bookkeeping that leaves the verdict to the
+landing (D-27).
 1. **Intake.** The bundle (bundle2; bundle1 only where the policy allows legacy clients, as 7.2's `server.bundle1`
    does) is read in slices within the shard's budget per step, every length checked against the request's admission
    (A-16) before anything is held. A mandatory part or parameter slates does not know is refused, as bundle2 requires
@@ -15213,6 +15223,19 @@ and export by landing).
 > into the daemon's `ToolSites`; a repository's authorization file and a principal's Subversion user, which no
 > record names yet, so the lender gives no read rules (every path the policy lets the principal read).
 >
+> **Status (2026-11-20, A-726, part 1).** Built: the `file-revs-report` and the `get-locations` report over HTTP, so
+> stock `svn blame` (with or without `-r`), `svn cat -r` and `svn diff` of a URL at a peg read a repository through the
+> edge. `svn blame`'s report is the svn:// command's walk (`svn_repos_get_file_revs2`) with `file-revs.c`'s handler as
+> its writer (`reads::DavFileRevs`), streamed a revision a step: the header before the first revision, each revision's
+> `S:file-rev` (revision properties, property changes, `S:merged-revision`, the text's delta in base64), the end; a
+> walk refused before its first byte answered `dav_svn__convert_err`'s status with the error in `D:error`, one after it
+> ending the connection. `get-locations` is the svn:// trace (`svn_repos_trace_node_locations`) written as
+> `get-locations.c` writes it. Held to the fixture repository (each revision's delta replayed to the text the site's GET
+> serves there; a directory refused; a file traced back across its copy) and to stock svn 1.15 against `svnserve -t`
+> over one history: seven commands, every answer byte for byte the same but for the author. Departures: deltas in
+> svndiff 0, as the update-report writes them; locations in the trace's order, where `mod_dav_svn` walks a hash. Owed:
+> the `mergeinfo-report` (`svn blame -g`, `svn merge`).
+>
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
 > `accept_report` and `editorp.c` join them, sans-io, under the caller's room and steps; an early answer looked for
@@ -15316,6 +15339,10 @@ and export by landing).
 > repository with no pre-revprop-change hook ("Repository has not been enabled to accept revision propchanges",
 > 165006), after its checks in its order (`slates_svn::serve::revprops`). The change itself waits on ra_svn running a
 > repository's hooks.
+>
+> **Status (2026-11-19, S4 slice 1, with A-716).** A Subversion text is read through a source its reader is lent
+> (`slates_svn::migration::TextSource`; `WithTexts` pairs the records with one), so the green's content index can
+> serve every text once the records stop holding text bytes (slice 2).
 >
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
@@ -15945,8 +15972,10 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > **Status (2026-11-20, A-724 piece 1).** Designed below; piece 1 built: each repository's usage counted on its owner
 > shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
 > order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
-> dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3; its room built, below), the cold trigger (4), intake off the owner
-> shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
+> dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3; its room built, below), the cold trigger (4; its choice and git's drop built:
+> `slates_vcs::cold::choose`, `Repository::kept_fragments`/`drop_fragments`, and the server's trigger in
+> `vcs_share::room`; compression of cold content owed), intake off the owner
+> shard and content homed by identity across shards (5; the homes built: `vcs_store::homes`; intake off the owner owed), the fleet's placement by identity (6, main's ruling first: it
 > amends §4.10's content placement), the many-repository load proof (7), the snapshot sized by its data (8) and a
 > giant repository's index across partitions (9), both designed below.
 
@@ -52440,8 +52469,9 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
   `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
-  driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
-  by the same rule.
+  driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
+  (BUILT 2026-11-20, `vcs_store::svn_made`; its copies, symbolic links and author owed); Mercurial's manifests by the
+  same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
   `vcs_store/tests.rs`; `crates/server/src/verbs.rs` (the submit's step); `crates/server/src/repository/push.rs` (the
@@ -54617,6 +54647,122 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   committed image names is not reused before a newer image commits; (a3) the content table in the shard image and its
   recovery before the records; (b) git's record version 3; (c) Subversion's texts with A-716's slices; (d) replication's
   content-before-record order, held by the two-node test.
+- **Piece 4a, what an overrun drops first (2026-11-20).** `slates_vcs::cold::choose`: §4.11's cost model over a
+  repository's rebuildable values (bytes, measured rebuild time, expected reads): a value is dropped when its bytes'
+  worth at the repository's pressure passes its rebuilds' cost, highest saving a byte first, until the overrun is
+  covered (Dantzig 1957's greedy order). `slates_git::store::Repository::kept_fragments` lists each version's kept
+  fragments with the bytes dropping them gives back (content and entries' charge), and `drop_fragments` lets them go, the
+  next fetch encoding the version again (A-718). Tests: `slates-vcs` `cold::tests` (an oracle over 500 generated choices
+  against a serial reference: positive savings, a prefix of the order, the overrun covered by the shortest such prefix;
+  pressure letting a costly cache go); `slates-git` `store::tests::fragments::a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same`
+  (the bytes given back exact, the version re-encoded to the same fragments, the pack read back whole). Owed (4b): the
+  server's trigger (a repository whose grant `vcs_share::room` finds below what it holds drops by this choice, its
+  reads from its usage row, its rebuild times measured), then compression of cold content.
+- **Piece 4b, the trigger (2026-11-20).** What a repository holds now counts its kept fragments (`vcs_share`'s
+  `held_by`); while repositories contend (`vcs_share::room`'s divided path), each claimant holding more than its grant
+  gives back what §4.11's cost model says to (`vcs_store::git_encode::relieve`, counted `vcs_store.git_encode.dropped`):
+  the rebuild of a byte priced at what this repository's own encodings took (its usage row learns `derive_ns` and
+  `derive_bytes` at every encoding turn), on each read its row expects (its fetches over its answered intakes). Nothing
+  is dropped while its encoding runs, or before one was measured. Test: `vcs_share::tests::t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room`
+  (stock git's pushes encoded; with no reads to come every fragment dropped, bytes given back exactly, encoded again;
+  with fetches a thousandfold its pushes, kept), with `vcs_share:: git_push:: vcs_store::upload::` 17 of 17 and
+  `slates-vcs` `usage` green. Owed: compression of cold content; a drop of many versions a turn at a time.
+
+
+### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
+- **What was there.** A submitted version moved a Subversion repository's one green and made no revision, so the
+  green passed its records' youngest revision: every later `svn commit` was refused (its step lands only while the
+  green is at the youngest revision), and no client saw the version (`docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`).
+- **Change.** `vcs_store::svn_made::make`, from `verbs::judge_submission` after git's made commit: the revision after
+  the youngest, its changed-path rows from each path the change index names between the two versions, read before from
+  the records (`Index::node`) and after from the green (`add`, `delete`, `replace` where the kind changed, `modify`
+  where the text or the property list did; a file's text with its real digests, `slates_svn::commit::drive::text_of`,
+  new; a node's property list the identity its reserved attribute names, held by the records; each directory above an
+  added node that did not stand added; a deletion beneath a deleted directory dropped); `svn:log` the submit's message
+  and `svn:date` the owner's instant. Landed by `svn_commit::land_made`: checked as an import's revision, its record
+  appended in the submit's own transaction in an entry holding it alone, then applied; a recovery replays it with every
+  other record. Not made, counted `vcs.svn.revision_unmade`, the version standing: a copy, a symbolic link or special
+  file, a property list the records lack, a refusal.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `repository::svn_commit::tests::t_a664_svn_a_submitted_version_is_the_revision_the_server_makes` (a work making
+  `/trunk/a.txt` submitted, then a client's revision adding `/trunk/b.txt`): red first, the records' youngest left at
+  0; green, revision 1 adds `/trunk` and `/trunk/a.txt` with its real text, the client's revision lands as 2 and the
+  green holds both files. `cargo test --locked -p slates-server --lib -- repository::svn_commit:: vcs_svn
+  vcs_store::svn --test-threads=4` 21 of 21; fmt clean.
+- **Owed.** `svn:author` (the principal's Subversion name among its identities, A-664 part 1); a copy as a row with
+  its source; symbolic links as `svn:special` files; Mercurial's changesets of a submitted version; a stock `svn
+  update` over the made revision by use (main's).
+
+
+### A-728 — A green's content history names the file's block: a changed file's bytes held once (2026-11-20, w-engine; step S2 of A-723's content-once plan; §4.16 "The history" (A-242's status), D-28, §4.11; A-242, A-534, A-575, A-716, A-723)
+
+Applied in the same change to: `crates/merge` (`history.rs`: a chunk's `Source`, `Value::named`, `spliced` answering
+`None` for a value stored whole, every read taking the blocks; `dims.rs`: `Files::blocks`, `blocks_mut`;
+`engine.rs`: `set_file` stores the file before its value, `seed_content`, `restore_file` and `content_value` name the
+block, `Green::history_blocks_named`, `history_owned_bytes`; `engine/branch.rs`: `Release` gives the history's chunks
+back a step at a time); §4.16's status; GAPS (§4.17, A-723).
+
+- **Why.** A green held a changed file's bytes twice: in the file's block, which the green's maps name, and in its
+  content history's chunk, which the next change splices from. A whole replace (every git and Mercurial push, every
+  Subversion import) copied the whole file; a Subversion import of 1,000 revisions held 234.8 MiB of chunks beside
+  about 585 MB of blocks (A-723, w-perf).
+- **The rule.** Reads at a path's latest version are the head's already (`content_read`), so the history's latest value
+  is only the base the next change shares runs of and the verdict's head value. A value stored whole names the file's
+  block as its one chunk, holding one holder of it in the same counts the maps and the identity table (A-716) use. When
+  a later change replaces the file, the map lets the block go and the history's hold keeps it, now the earlier
+  version's bytes: what the old file was is what that version is, so nothing is copied either way. A splice keeps
+  sharing runs; its added bytes are still copied into a chunk of its own (part 2 names them in the new block).
+- **Lifetimes.** The blocks are the lineage's arena, lent with a member; the chunks are the green's. A member is read
+  and written only while lent, so a block a chunk names is in the arena at hand. A branch starts with no history. A
+  fold drops values and their chunks let their blocks go into the same arena. A retired member's chunks go into its
+  `Release` and are given back a chunk a step before its maps' nodes, so a lineage with every member retired holds no
+  block (the branch oracle's check).
+- **Recovery and replication.** Nothing new is persisted: a checkpoint materializes its values as before, a restore
+  names the file it placed, and a replay rebuilds the history through `set_file`. Reads stay contiguous: a file is its
+  block; an earlier version is materialized from its pieces.
+- **Evidence.** macOS arm64, Mac Studio, local: `slates-merge --lib` 221 of 221, with
+  `a_whole_value_names_the_files_block_and_the_history_owns_no_copy` (a create and a whole replace name two blocks,
+  128 KiB, and the history owns no byte; a small overwrite owns its 8 bytes; every version reads back; the running
+  totals equal their recount) and `a_value_named_by_a_files_block_copies_nothing_and_keeps_the_block_while_named`;
+  integration `engine`, `checkpoint`, `chain_replay`, `rebase`, `splice`, `verdict`, `base_for` green; fmt clean.
+- **Owed.** Part 2: a splice's added runs named in the new block, copied out when the value is superseded. Part 3: the
+  1,000-revision Subversion profile (`crates/cli/bench/svn_scale.sh`) before and after, in BENCHMARKS.md.
+- **Piece 5a, identity homes across a node's shards (2026-11-20).** `crate::vcs_store::homes`: a window (at most one
+  window of content, named by its plain BLAKE3) is homed at the shard of the node that rendezvous ranks first for its
+  identity, kept there in that shard's one content store (deduplicated with what its repositories hold, charged to its
+  budget, held once a sender), read back and let go by identity through cross-shard calls judged in the home's own
+  time; an object past a window homes as its windows. The weight is the one every placement ranks by:
+  `slates_db::register::rendezvous_weight_of` (factored out of `rendezvous_weight` with its outputs unchanged) and
+  `rendezvous_ranked_by_key`, so piece 6's fleet homes rank the region's members the same way. No catalog, no
+  coordination call. Tests: `vcs_store::homes::tests` (the home is the ranking's head and homes spread over four
+  shards; on a four-shard daemon 64 windows homed, read back whole, one homed twice kept to its second let-go, all
+  freed, past a window refused) and `slates-db` `register::` 93 of 93. Owed: the cold trigger's third lever moving a
+  repository's cold windows to their homes and the stores reading through them; the intake's decoding and hashing on
+  the shard its connection arrived at (with w-git's A-722).
+
+
+
+### A-726 — `svn blame` and `svn diff` over HTTP: the `file-revs-report` and `get-locations` served through the DAV site (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 5 "HTTP"; A-681, A-627, A-613)
+
+- **What was there.** The DAV site answered every REPORT but the log and the update-report `501` ("The requested report
+  is unknown"): stock `svn blame` over HTTP failed `E200007`, and so did any command resolving a URL's peg to an older
+  revision (`svn blame -r N URL`, `svn cat -r N URL`). A-627 had read the `file-revs-report` and written its answer
+  whole; nothing routed it.
+- **Change.** `request::report` reads `file-revs-report` (A-627's reader, `listing::file_revs_from`). The svn:// walk
+  (`reads::file_revs`) takes a writer: `svnserve`'s items, or `file-revs.c`'s elements (`listing::file_rev_element`),
+  so `reads::DavFileRevs` streams the answer a revision a step (`dav::report_file_revs`). `reads::trace_node_locations`
+  opens the svn:// trace to the site, and `dav::report_locations` writes `get-locations.c`'s answer. `svn diff` asked
+  nothing new: its update-report was served (A-681 part B).
+- **Tests.** `slates-svn` `dav::report_file_revs::tests` (2: deltas replayed to the GET's texts at every revision,
+  streamed at the least room and the whole room alike; a directory refused before the first byte),
+  `dav::report_locations::tests` (a copy traced back; a peg past the youngest `404`), `dav::tests`' refusals (a
+  file-revs-report without its path `400`); `slates-cli` `svn_http_reports`
+  `stock_svn_blames_and_diffs_over_the_vcs_http_edge_as_against_svnserve` (stock svn 1.15.0 on the Mac Studio: `blame`,
+  `blame -r 2`, `diff -r 1:3`, `diff -c 2`, `diff --summarize`, a two-peg diff, `cat -r 1`, each equal to `svnserve -t`'s).
+- **Applied in the same change to** §4.17.4's status, GAPS (A-681's owed reports), amendments.tsv.
+- **Owed.** Part 2: the `mergeinfo-report` and `SVN-Repository-MergeInfo: yes` (`svn blame -g`, `svn merge`). Deltas in
+  the svndiff version `Accept-Encoding` prefers. The interop harness copied into `svn_http_reports.rs` folded into one
+  module with `svn_interop.rs` once that file's pieces land.
 
 ### A-719 part 3 — git's push is read straight into its quarantine (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" items 3 to 5)
 - **Change (slates-git).** The receive session reads a pack into a site the caller gives it (`Session::input_into`,

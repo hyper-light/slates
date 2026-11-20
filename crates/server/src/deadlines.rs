@@ -70,6 +70,21 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   let _ended = crate::verbs::expire_lapsed_attachments(state);
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
+  release_due_records(state, now);
+  release_due_reclaims(state, now);
+  wake_due_tasks(state, now);
+  expire_capture_deadlines(state, now);
+  let earliest = earliest_deadline(state);
+  if earliest.is_some_and(|at| at <= now) {
+    state.count(DEADLINE_STUCK, 1);
+  }
+  let next = armed_for(earliest, now, retry_window_ns());
+  state.deadline_armed = next;
+  next.map(|at| at.saturating_sub(now))
+}
+
+/// The grants and the audit due at `now`: each ended or sent again.
+fn release_due_records(state: &mut ShardState, now: u64) {
   // A grant past its term ends, recorded expired with its audit record in one atom (A-266), at the first instant past
   // its term (A-554); one whose record is refused stays due, and is tried again a retry window on.
   if state
@@ -85,6 +100,10 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   if state.landing.audit_look_at.is_some_and(|at| at <= now) {
     crate::landing::look_at_owed_audit(state, now);
   }
+}
+
+/// The looks and reclaims due at `now`, each handed to the reaper.
+fn release_due_reclaims(state: &mut ShardState, now: u64) {
   // A look at departures some shard did not answer is asked for again at its retry (A-222, A-554): the reaper takes it.
   if state.departures_retry_at.is_some_and(|at| at <= now) {
     state.departures_retry_at = None;
@@ -98,6 +117,10 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   if state.nfs_purge_at.is_some_and(|at| at <= now) {
     crate::nfs::owe_purge_round(state);
   }
+}
+
+/// The placements, recalls, sweeps and retries due at `now`, each asked again or its task woken.
+fn wake_due_tasks(state: &mut ShardState, now: u64) {
   // §4.6, the backed route's L1 (A-193): the host is asked again for the placements it declined in a way likely to
   // hold, a retry window after the decline (A-570). A declined collapse costs milliseconds of compaction (1,954 and
   // 2,832 µs a step on adacachy at load 90), so a host out of huge pages is asked once a window, never once a range.
@@ -126,6 +149,10 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
       slates_rt::registry::wake(server.0);
     }
   }
+}
+
+/// The status pages whose capture deadline is past `now`, expired.
+fn expire_capture_deadlines(state: &mut ShardState, now: u64) {
   while let Some(&(at, index, generation)) = state.capture_deadlines.first() {
     if at > now {
       break;
@@ -136,7 +163,11 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
       client.status_pages.expire(now, &mut state.store.metadata);
     }
   }
-  let earliest = [
+}
+
+/// The earliest deadline set, of every kind the keeper releases.
+fn earliest_deadline(state: &mut ShardState) -> Option<u64> {
+  [
     state.staging.next_expiry(),
     state.capture_deadlines.first().map(|(at, ..)| *at),
     state.db.partition_mut().next_lease_expiry(),
@@ -153,13 +184,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   ]
   .into_iter()
   .flatten()
-  .min();
-  if earliest.is_some_and(|at| at <= now) {
-    state.count(DEADLINE_STUCK, 1);
-  }
-  let next = armed_for(earliest, now, retry_window_ns());
-  state.deadline_armed = next;
-  next.map(|at| at.saturating_sub(now))
+  .min()
 }
 
 /// Derived: the retry window (A-536, named by A-554): how long after a refusal a deadline its job could not end, or a

@@ -105,10 +105,12 @@ impl Repository for Green {
     )
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     let text = self.texts.get(identity)?;
     let start = usize::try_from(offset).ok()?;
-    text.get(start..start.saturating_add(PIECE).min(text.len()))
+    text
+      .get(start..start.saturating_add(PIECE).min(text.len()))
+      .map(std::borrow::Cow::Borrowed)
   }
 }
 
@@ -1086,13 +1088,17 @@ impl Repository for Torn<'_> {
     self.green.properties(identity)
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     let left = usize::try_from(self.kept.checked_sub(offset)?).ok()?;
     let piece = self.green.text(identity, offset)?;
     if left == 0 {
       return None;
     }
-    piece.get(..piece.len().min(left))
+    let kept = piece.len().min(left);
+    Some(match piece {
+      std::borrow::Cow::Borrowed(bytes) => std::borrow::Cow::Borrowed(bytes.get(..kept)?),
+      std::borrow::Cow::Owned(bytes) => std::borrow::Cow::Owned(bytes.get(..kept)?.to_vec()),
+    })
   }
 }
 
@@ -1168,7 +1174,7 @@ impl Repository for Garbled<'_> {
     self.green.properties(identity)
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     self.green.text(identity, offset)
   }
 }
