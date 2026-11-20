@@ -255,21 +255,24 @@ fn by_rev_list<S: Graph>(
   paint.run(graph, &BTreeSet::new(), old, admission, counters)?;
   let selected = paint.chosen();
   admission
-    .charge_items::<S::Node>(selected.len())
+    .charge_items::<(u64, u64)>(selected.runs())
     .map_err(Refusal::PastAdmission)?;
   if selected.is_empty() {
     return Err(Refusal::NothingSelected);
   }
   let (mut shallow, mut whole) = (BTreeSet::new(), BTreeSet::new());
-  for commit in &selected {
+  for commit in selected
+    .iter()
+    .filter_map(|position| S::Node::try_from(position).ok())
+  {
     charge::<(S::Node, S::Node)>(admission)?;
     if graph
-      .parents(*commit)
-      .any(|parent| !selected.contains(&parent))
+      .parents(commit)
+      .any(|parent| !selected.contains(parent.into()))
     {
-      shallow.insert(*commit);
+      shallow.insert(commit);
     } else {
-      whole.insert(*commit);
+      whole.insert(commit);
     }
   }
   Ok((shallow, whole))

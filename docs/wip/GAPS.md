@@ -70,8 +70,8 @@
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
 > principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20; symbolic links as `svn:special`
-> files, `link ` and the target, BUILT 2026-11-20), its copies as rows with their sources owed until a work can make a
-> copy (A-626 part 4); Mercurial's changesets of a submitted
+> files, `link ` and the target, BUILT 2026-11-20; its copies as copy-from rows, BUILT 2026-11-20 over A-626 part 4's
+> `WorkOp::Copy`); Mercurial's changesets of a submitted
 > version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
@@ -151,7 +151,8 @@
 > **A-713 (2026-11-20, w-git; every clone of a long history refused for its room, found by use).** BUILT: git's
 > upload-pack, HTTP and SSH, admits each request what its repository's shard could admit (`StoreLender::room`), as A-704
 > admits a push. A-745 git piece 1 (2026-11-20, w-k90-vendor): the plan carries its objects as runs of positions, never a
-> handle an object. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> handle an object; piece 2a: the negotiation's walk keeps its sets as runs, its stacks charged at their deepest (a 3,000-
+> commit clone negotiated within 4 KiB). Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
