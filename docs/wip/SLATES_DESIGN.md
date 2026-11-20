@@ -56630,8 +56630,14 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   no build turn (the work built inside the verdict's step); after, about 160,000 build turns a push, `past_budget` 0,
   the longest build turn 1.13 ms, its longest unit one tree's listing. A build in one-unit turns equals the one-call
   build over every generated push history (`push::tests::land`).
-- **Owed, named.** Part 2b: units still one object's size: a tree's listing (`PushObjects::tree` gives a whole tree),
-  a blob read and laid whole, the green's hard links, a copy's tree. Part 3: the entry apply in turns: the verdict
+- **Part 2b, a tree an entry a unit.** `PushObjects::listing` gives a tree's entries to read one a unit (`Listing`):
+  git's view owns the tree's bytes (one copy) and decodes an entry at each read with `tree::entry_after`, the decoder
+  `Tree::parse` runs, charging each entry as the whole listing does; a store with no such decoder lists whole (the
+  trait's default; Mercurial's for now). A tree git's walk cannot read is refused at the entry where it stops, the same
+  `Malformed`. Measured: the longest build unit 1.12 -> 0.22 ms and the longest build turn 1.13 -> 0.49 ms (t_a752,
+  debug).
+- **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
+  hard links, a copy's tree. Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
   the commit (main's call asked: the green held out across the commit's turns, or staged and published whole); the
   record's encode and append.

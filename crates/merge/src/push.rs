@@ -182,10 +182,75 @@ pub enum Unavailable {
 pub trait PushObjects {
   /// The entries of the tree `id`, in any order.
   fn tree(&self, id: ObjectKey) -> Result<Vec<TreeEntry>, Unavailable>;
+  /// The entries of the tree `id` to read an entry a unit ([`Listing`], A-752 part 2b): a store that can decode its
+  /// trees an entry at a time gives the tree's bytes and its decoder, so a build's unit is one entry, never a tree;
+  /// else the whole listing, read in one unit.
+  fn listing(&self, id: ObjectKey) -> Result<Listing, Unavailable> {
+    self.tree(id).map(Listing::of)
+  }
   /// The length in bytes of the blob `id`, which the store's index row holds, read before its bytes are.
   fn blob_len(&self, id: ObjectKey) -> Result<u64, Unavailable>;
   /// The bytes of the blob `id`.
   fn blob(&self, id: ObjectKey) -> Result<Cow<'_, [u8]>, Unavailable>;
+}
+
+/// A tree's entries read an entry a unit ([`PushObjects::listing`]; A-752 part 2b): listed whole, or the tree's bytes
+/// owned and decoded an entry at each read, so a build over a directory of any width reads it over as many turns.
+pub struct Listing {
+  /// Where the entries come from.
+  source: ListingSource,
+}
+
+/// A tree's own decoder: the entry beginning at an offset of its bytes and where the next begins, none past the last.
+pub type Decoder =
+  Box<dyn FnMut(&[u8], usize) -> Result<Option<(TreeEntry, usize)>, Unavailable> + Send>;
+
+/// Where a [`Listing`]'s entries come from.
+enum ListingSource {
+  /// Listed whole.
+  Listed(std::vec::IntoIter<TreeEntry>),
+  /// The tree's bytes, the offset of the next entry, and its decoder; none once read to the end or refused.
+  Read(Vec<u8>, Option<usize>, Decoder),
+}
+
+impl Listing {
+  /// The entries listed whole.
+  pub fn of(entries: Vec<TreeEntry>) -> Listing {
+    Listing {
+      source: ListingSource::Listed(entries.into_iter()),
+    }
+  }
+
+  /// The tree `bytes`, decoded an entry at each read by `decode`.
+  pub fn read(bytes: Vec<u8>, decode: Decoder) -> Listing {
+    Listing {
+      source: ListingSource::Read(bytes, Some(0), decode),
+    }
+  }
+
+  /// The next entry; none past the last or after a refusal.
+  pub fn next_entry(&mut self) -> Option<Result<TreeEntry, Unavailable>> {
+    match &mut self.source {
+      ListingSource::Listed(entries) => entries.next().map(Ok),
+      ListingSource::Read(bytes, at, decode) => {
+        let from = (*at)?;
+        match decode(bytes, from) {
+          Ok(Some((entry, next))) => {
+            *at = Some(next);
+            Some(Ok(entry))
+          }
+          Ok(None) => {
+            *at = None;
+            None
+          }
+          Err(why) => {
+            *at = None;
+            Some(Err(why))
+          }
+        }
+      }
+    }
+  }
 }
 
 /// A push to one branch, as its work is built.
@@ -661,8 +726,8 @@ struct Comparing {
   pushed: Option<ObjectKey>,
   /// Where the comparison is.
   side: Side,
-  /// The listing being named.
-  listed: std::vec::IntoIter<TreeEntry>,
+  /// The listing being named, and its tree.
+  listed: (Listing, Option<ObjectKey>),
   /// The base's entries by name.
   based: BTreeMap<String, (EntryKind, ObjectKey)>,
   /// The push's entries by name.
@@ -771,7 +836,7 @@ impl<O: PushObjects> Walker<'_, O> {
           base,
           pushed,
           side: Side::ReadBase,
-          listed: Vec::new().into_iter(),
+          listed: (Listing::of(Vec::new()), None),
           based: BTreeMap::new(),
           given: BTreeMap::new(),
         });
@@ -785,21 +850,36 @@ impl<O: PushObjects> Walker<'_, O> {
   fn compare_unit(&mut self, comparing: &mut Comparing) -> Result<bool, PushRefused> {
     match comparing.side {
       Side::ReadBase => {
-        comparing.listed = self.listing(&comparing.path, comparing.base)?;
+        comparing.listed = (
+          self.listing(&comparing.path, comparing.base)?,
+          comparing.base,
+        );
         comparing.side = Side::NameBase;
       }
       Side::ReadPushed => {
-        comparing.listed = self.listing(&comparing.path, comparing.pushed)?;
+        comparing.listed = (
+          self.listing(&comparing.path, comparing.pushed)?,
+          comparing.pushed,
+        );
         comparing.side = Side::NamePushed;
       }
       Side::NameBase | Side::NamePushed => {
         let base_side = comparing.side == Side::NameBase;
-        match comparing.listed.next() {
-          Some(TreeEntry {
+        let (listing, tree) = &mut comparing.listed;
+        match listing.next_entry() {
+          Some(Err(why)) => {
+            // Only a tree read refuses, so the listing has its tree.
+            let path = comparing.path.clone();
+            let Some(id) = *tree else {
+              return Err(PushRefused::Unplaced { path });
+            };
+            return Err(PushRefused::Object { path, id, why });
+          }
+          Some(Ok(TreeEntry {
             name,
             kind,
             id: named,
-          }) => {
+          })) => {
             let name = held_name(&comparing.path, name)?;
             let entries = if base_side {
               &mut comparing.based
@@ -836,22 +916,17 @@ impl<O: PushObjects> Walker<'_, O> {
     Ok(true)
   }
 
-  /// The listing of the tree `id` at `path`, read whole (one unit, owed: [`Building`]); none for no tree.
-  fn listing(
-    &mut self,
-    path: &str,
-    id: Option<ObjectKey>,
-  ) -> Result<std::vec::IntoIter<TreeEntry>, PushRefused> {
+  /// The listing of the tree `id` at `path`, to name an entry a unit ([`PushObjects::listing`]); none for no tree.
+  fn listing(&mut self, path: &str, id: Option<ObjectKey>) -> Result<Listing, PushRefused> {
     let Some(id) = id else {
-      return Ok(Vec::new().into_iter());
+      return Ok(Listing::of(Vec::new()));
     };
     self.reads.trees = self.reads.trees.saturating_add(1);
-    let listed = self.objects.tree(id).map_err(|why| PushRefused::Object {
+    self.objects.listing(id).map_err(|why| PushRefused::Object {
       path: path.to_owned(),
       id,
       why,
-    })?;
-    Ok(listed.into_iter())
+    })
   }
 
   /// The operations for one path: what the base held there and what the push holds.

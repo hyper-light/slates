@@ -326,9 +326,10 @@
 >
 > **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
 > deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict
-> (`Judge::ready`), the deriver async under a `Pace`. OWED (part 2b): units still one object's size: a tree's
-> listing (`PushObjects::tree` gives a whole tree: a flat 1,500-entry tree 1.1 ms debug), a blob read and laid whole,
-> the green's hard links (none in git or Mercurial greens), a copy's tree (a push makes none). OWED (part 3): the
+> (`Judge::ready`), the deriver async under a `Pace`. Part 2b: git's trees listed an entry a unit
+> (`PushObjects::listing`), the longest build unit 1.12 -> 0.22 ms (flat 1,500 files, debug). OWED: units still one
+> object's size: a blob read and laid whole, a tree's bytes copied once, the green's hard links (none in git or
+> Mercurial greens), a copy's tree (a push makes none); Mercurial's trees still listed whole. OWED (part 3): the
 > entry apply (`apply_planned`: the engine's verdict and commit, the record) in one step, 92 ms for 1,500 files debug.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
