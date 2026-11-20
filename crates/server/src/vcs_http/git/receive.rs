@@ -11,9 +11,10 @@
 //! push's room, what its shard could admit (A-704); once the body has ended the push is answered a step at a time (A-665 part 3): the shard yielded
 //! between the turns of a hook's view's sealing, and a hook run off the shard's step, its answer handed back in a step
 //! of its own. What the push wrote is given back a pkt-line's room at a time (`slates_git::pktline::MAX_LEN`), as
-//! upload-pack's answer is, so no reply run is longer. The daemon's presenter shows no hook's view yet
-//! (`crate::git_push::Unpresented`), so a push whose repository configures a git hook is refused `hook not run`; owed
-//! with the read-only attachment that shows one: this edge's signal of its client gone, which ends a hook's run.
+//! upload-pack's answer is, so no reply run is longer. A hook runs until it ends or the client goes: the edge's signal of
+//! its client gone ([`ClientGone`], the connection's socket closing while the push is answered) ends its run, and what
+//! the hook would have judged is refused (A-665 part 4). The daemon's presenter shows no hook's view yet
+//! (`crate::git_push::Unpresented`), so a push whose repository configures a git hook is refused `hook not run`.
 //!
 //! **Versions.** receive-pack answers protocol version 0 whatever the client asks, as git's own does: `receive-pack.c`
 //! (git 2.50.1, `cmd_receive_pack`) ignores a request for version 2 ("push support for protocol v2 has not been
@@ -37,7 +38,7 @@ use slates_http::reply::Status;
 use super::{GitServices, ServiceRefused, Start};
 use crate::git_push::{Answering, PushFailed, ReceivePack, Unpresented};
 use crate::state::ShardState;
-use crate::vcs_http::{Exchange, Failed};
+use crate::vcs_http::{ClientGone, Exchange, Failed};
 
 /// Format: the line git's receive-pack writes before its advertisement to a client asking protocol version 1
 /// (`receive-pack.c`, `cmd_receive_pack`).
@@ -136,7 +137,7 @@ impl<L: ShardLender> Exchange for Receive<L> {
       .map_err(failed)
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
     if self.advertise {
       return Ok(());
     }
@@ -159,9 +160,7 @@ impl<L: ShardLender> Exchange for Receive<L> {
         Answering::Answered(_) => return Ok(()),
         Answering::Sealing => slates_rt::futures::yield_now().await,
         Answering::Hook(call) => {
-          // This edge's signal of its client gone is owed with the presenter that shows a view (the
-          // module doc): until then no hook runs here.
-          let answer = call.run(core::future::pending()).await;
+          let answer = call.run(gone.gone()).await;
           lender
             .lend(|state| push.hook_ran(state, answer, given))
             .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?

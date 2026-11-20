@@ -39,9 +39,9 @@ pub mod hold;
 
 pub use client::{
   Advanced, ArchiveExported, ArchiveImported, Attachment, Client, Connecting, CreateSpec,
-  Deadlines, Digest, DriftedPage, EntriesPage, ImageBuilt, LAST_SEQUENCE, Landing, MergeRecord,
-  MergeStatement, MoveState, Page, Rebased, RepositorySpec, Rewitnessed, SESSION_KEY_BYTES,
-  Session, ShardsStream, SignedLanding, StreamEnd, Submitted, VhostUserDevice,
+  Deadlines, Digest, DriftedPage, EntriesPage, ImageBuilt, Imported, LAST_SEQUENCE, Landing,
+  MergeRecord, MergeStatement, MoveState, Page, Rebased, RepositorySpec, Rewitnessed,
+  SESSION_KEY_BYTES, Session, ShardsStream, SignedLanding, StreamEnd, Submitted, VhostUserDevice,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).

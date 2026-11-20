@@ -13292,8 +13292,10 @@ engine: the verdict, rebase, position mapping, the register).
 > with each one's words in git's order and `post-receive` reading the moved ref in its view's `packed-refs`, a refusing
 > `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
 > with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
-> and `protected_fixtures` 49 of 49, fmt clean). Owed: the read-only attachment; the
-> edges' signal of a client gone, which ends a hook's run; the hooks' learned times; seals kept as derived data.
+> and `protected_fixtures` 49 of 49, fmt clean). The HTTP edge's signal of a client gone ends a hook's run (A-665 part
+> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended). Each hook's run
+> is held to the bound it learned on the owner shard and teaches it as it ends (A-665 part 4b, `ShardState::hook_times`).
+> Owed: the read-only attachment; the SSH edge's signal; seals kept as derived data.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -14037,6 +14039,8 @@ signature verification).
 > first, the five failing against stubs). Owed: the verb that asks for an import, and the import made durable (the
 > register's first entry, with the phase roots and bookmarks it answers, and a recovery); until then an import is not
 > served.
+>
+> **Status (2026-11-20, A-710):** the command line asks it: `slates repository import NAME PATH` (PATH absolute).
 >
 > **Status (2026-11-19, A-678: the import verb).** A client asks the daemon to import a Mercurial repository's directory
 > with `ImportRepository { repository, path }`, served on the partition the repository's name hashes to and for its
@@ -53990,6 +53994,34 @@ Applied in the same change to: A-508's owed line (status), GAPS (A-272 (ii)'s A-
   `reclaimed_unasked` 2, `adopted` 764 (242 past tolerance), `completed` 638, no violation. `cargo fmt -p slates-db --
   --check` clean.
 - **Owed (main's).** The model beyond its default cases (`PROPTEST_CASES`); clippy for the test target.
+
+### A-665 part 4a — The HTTP edge tells a hook's run its client has gone (2026-11-20, w-git for UI goal 93; §4.17.2 "Hooks, in git's terms")
+- **Change.** `Exchange::body_end` takes `vcs_http::ClientGone`, the connection's socket watched once the request's
+  body has ended: its end of stream or a reset resolves it; bytes queued there (a pipelined request, a TLS record such as
+  `close_notify`) leave it unknown and are left for the edge, nothing consumed. git's receive-pack hands it to each
+  hook's run (`git_push`'s `HookCall::run`), so a hook whose client went is ended and what it would have judged refused,
+  in place of `pending()`.
+- **Tests.** `vcs_http::tests::serve::a_service_answering_after_the_body_learns_its_client_has_gone`: quiet while the
+  client waits for its answer, resolved once it closes.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_http::tests::
+  vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, the new test named in the output; fmt clean on the changed files.
+- **Owed.** The SSH edge's signal (the channel's close); a TLS client that sends `close_notify` before it closes is not
+  seen gone; the hooks' learned times; the daemon's presenter (A-665 part 4, main's ruling: the read-only view volume).
+
+### A-665 part 4b — A git hook's run is held to the times its hook learned (2026-11-20, w-git for UI goal 93; §4.17.1 "Policy", A-622's table)
+- **Change.** `vcs_hooks::HookTimesTable` on each shard (`ShardState::hook_times`): one `HookTimes` per configured
+  hook, keyed by its repository and name, kept with the program it learned from (a hook set to run another program
+  starts unlearned); the times of hooks the repository's policy no longer configures are dropped as a run teaches.
+  git's push driver hands each hook call the bound its hook learned (none before a run finished) and teaches the run's
+  lesson as its answer comes back (`git_push`'s `PushHooks::{call, learn}`), so a hook past its learned bound is
+  ended and what it would have judged refused, `ran past its bound`.
+- **Tests.** `vcs_hooks::tests::t_a665_a_hooks_times_are_its_own_program_on_its_own_repository`;
+  `git_push::tests::t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` (each of its three
+  hooks taught one finished run).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_http::tests::
+  vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, both tests named in the output; fmt clean on the changed files.
+- **Owed.** Forgetting a removed repository's hooks (the table drops them only as one of its hooks runs); Subversion's
+  and Mercurial's callers reading and teaching the same table; the daemon's presenter (A-665 part 4).
 
 ### A-698 — Commits over ra_svn: the work A-656's connection accepts lands through A-655 part 2b's owner step, for `svn://` and the svn+ssh tunnel alike (2026-11-20, g229, UI goal 93; §4.17.4 items 3.2 to 3.5 and pieces 7 and 12; after A-688, A-656 and A-655 part 2b)
 Applied in the same change to:

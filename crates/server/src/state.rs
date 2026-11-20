@@ -773,6 +773,9 @@ pub struct ShardState {
   /// repository's tool store with its derived values, made with its record and made again by a recovery from its
   /// entries' objects. Bounded by the shard's memory budget, which every byte of it is charged to.
   pub(crate) vcs_stores: crate::vcs_store::VcsStores,
+  /// The learned times of the hooks of this shard's repositories (A-622's table, `crate::vcs_hooks::HookTimesTable`):
+  /// bounded by the hooks their policies configure.
+  pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,

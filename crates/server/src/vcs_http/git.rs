@@ -65,7 +65,7 @@ use slates_http::reply::Status;
 use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential::{self, Credential, CredentialRefused};
 
-use super::{Answer, Decided, Exchange, Failed, Site};
+use super::{Answer, ClientGone, Decided, Exchange, Failed, Site};
 use crate::lfs::LfsCall;
 use crate::vcs_policy::{self, Right};
 
@@ -276,10 +276,10 @@ impl<U: Exchange, R: Exchange> Exchange for HalfExchange<U, R> {
     }
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
     match self {
-      HalfExchange::Upload(upload) => upload.body_end().await,
-      HalfExchange::Receive(receive) => receive.body_end().await,
+      HalfExchange::Upload(upload) => upload.body_end(gone).await,
+      HalfExchange::Receive(receive) => receive.body_end(gone).await,
     }
   }
 
@@ -322,8 +322,8 @@ impl<E: Exchange> Exchange for GitExchange<E> {
     self.service.body(run).await
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
-    self.service.body_end().await
+  async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
+    self.service.body_end(gone).await
   }
 
   async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
@@ -400,7 +400,7 @@ impl<L: LfsService> Exchange for LfsExchange<L> {
     Ok(())
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
     let body = std::mem::take(&mut self.body);
     let call = LfsCall {
       routed: &self.routed,
@@ -460,10 +460,10 @@ impl<E: Exchange, L: LfsService> Exchange for SiteExchange<E, L> {
     }
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
     match self {
-      SiteExchange::Git(git) => git.body_end().await,
-      SiteExchange::Lfs(lfs) => lfs.body_end().await,
+      SiteExchange::Git(git) => git.body_end(gone).await,
+      SiteExchange::Lfs(lfs) => lfs.body_end(gone).await,
     }
   }
 

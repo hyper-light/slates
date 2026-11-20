@@ -25,7 +25,7 @@ use slates_git::upload::{self, Answer, Asked, PackSource, Served, Written};
 use slates_http::reply::Status;
 
 use super::{GitServices, ServiceRefused, Start};
-use crate::vcs_http::{Exchange, Failed};
+use crate::vcs_http::{ClientGone, Exchange, Failed};
 
 /// Where repositories' stores are lent to upload-pack, afresh for each step of an answer (the module doc).
 pub(crate) trait StoreLender {
@@ -122,7 +122,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     Ok(())
   }
 
-  async fn body_end(&mut self) -> Result<(), Failed> {
+  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
     let Self {
       lender,
       repository,
