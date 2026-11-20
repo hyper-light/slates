@@ -849,8 +849,10 @@ fn stock_hg_pushes_a_bookmark_and_a_clone_sees_it() {
     &local,
     &with_config(&["push", "-B", "pushed-bm", &url], &config),
   );
-  let keys = hg_in(&hg, &local, &with_config(&["debugpushkey", &url, "bookmarks"], &config));
-  eprintln!("DIAG debugpushkey: {keys:?}");
+  for space in ["bookmarks", "namespaces", "phases"] {
+    let keys = hg_in(&hg, &local, &with_config(&["--debug", "debugpushkey", &url, space], &config));
+    eprintln!("DIAG debugpushkey {space}: {keys:?}");
+  }
   let copy = format!("{}/copy", scratch.path);
   hg_ok(
     &hg,
