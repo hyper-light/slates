@@ -11685,7 +11685,10 @@ never the whole work. A verdict crosses from the copy that computed it to the ow
 `Computed::encode`): the units in the order the work's are visited, each its effects as the chain entry records them
 (content by reference to the increment's post-state), its windows and where its content ops stood; the owner reads it
 back against the increment it judged (`Green::computed_from`), each effect rebuilt as a replay rebuilds it, a splice left
-unmade for the commit to make.
+unmade for the commit to make. Its route (A-658 part 3b, built by A-697 part c, behind A-697's test hook until its last
+piece): a holder's work composes its increment, the holder's replica computes its verdict, and `SubmitComputed`
+carries both to the owner, which commits it by `Green::submit_computed` (`judge_computed`, then `commit_judged` at once)
+inside the submit's own step.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -22682,7 +22685,8 @@ its green's record and recording the work's floor at the head (`verbs::admit_wor
 (2026-11-20, behind the test hook `Daemon::serve_works_on_holders`): a holder makes the work on its client's partition,
 asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. Part b
 (2026-11-20): the holder moves and drops the work's floor at the owner by `MoveWorkFloor` (`work_home::tell_floor_over_fleet`,
-`verbs::move_work_floor`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+`verbs::move_work_floor`). Part c (2026-11-20): a holder's submit is committed by the verdict its replica computed,
+taken by position at the owner (`work_home::verdict_over_fleet`, `SubmitComputed`, `Green::submit_computed`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22706,8 +22710,9 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     its client's partition, so the work's id names that node; the green's owner admits it by `AdmitWork`, forwarded,
     judging the rights from its green's record and holding the base by the work's floor; and the work's base reads are
     answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
-    by `MoveWorkFloor`, forwarded, monotone and idempotent there. Its verdict, recovery and takeover follow in A-697's
-    later parts. Until A-400 a work was placed on
+    by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
+    replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b). Its rebase, a copy it submits,
+    the settling of its versions, recovery and takeover follow in A-697's later parts. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -56177,3 +56182,42 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   floor gone and B's counter moved). Red with the forward removed: A's floor never dropped (the poll gave up). Fleet
   `a_holder_makes_a_work`, `a_holders_work_is_admitted`, `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2,
   `verbs::` 62 of 62; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2 of 2; fmt clean.
+
+### A-697 part c — A holder's submit is committed by the verdict its replica computed, taken by position at the owner (2026-11-20, w-shared for UI goal 93; main's plan for A-697; A-658 part 3b's route; A-645 "Merges computed anywhere, committed by position")
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status; "The verdict"'s wire-form
+sentence), GAPS (A-247's step two), `crates/merge/src/engine.rs` (`Green::submit_computed`, `commit_judgment`),
+`crates/merge/src/engine/compute_tests.rs`, `crates/ipc/src/protocol.rs`, `crates/server/src/verbs.rs`,
+`crates/server/src/work_home.rs`, `crates/server/src/landing.rs` (`wire_mode`, `db_mode` crate-visible),
+`crates/server/tests/fleet.rs`.
+- **Change, behind A-697's test hook.** A submit of a work on a holder node (`work_home::green_elsewhere`) composes its
+  increment on the work's shard as every work off its green's shard does (A-247), its base entries read from the
+  replica (part a2). Once its pending record is committed, the node's control shard computes the verdict on its replica
+  (`Green::compute`) and forwards `SubmitComputed { work, green, increment, computed, carried }` to the owner under the
+  submit's own request id (`work_home::verdict_over_fleet`): the increment as `Increment::encode` writes it, the verdict
+  in its wire form (A-658 part 3a), and `ComputedSubmit`, the policy the holder read where the work's record is (its
+  merge mode, the approval, the signature and the work's signers, the authorship). The owner (`verbs::submit_computed`,
+  a node's verb, refused `Unsupported` from a client of either node) runs `judge_submission` as for a submit asked
+  from a work's shard, with one difference: the verdict is read back (`Green::computed_from`) and taken by position
+  (`Green::submit_computed`: `judge_computed`, then `commit_judged` at once), counted `merge.verdict.taken_by_position`;
+  a form that does not read back, or a verdict not taken, is refused `BadRequest`, the retention it secured settled
+  first. The answer comes back over the forward (deferred to the quorum's commit at `f > 0`, as a forwarded submit's
+  is) and settles the submit on the holder, whose floor then rises at the owner (part b).
+- **Without a computed verdict.** The replica lacking the work's base (`BaseAhead`), or no replica: answered retryable,
+  `merge.work.replica_behind`; a base below the replica's restored floor: `UnknownBase`, as the owner answers; a copy the
+  verdict refuses: `CopyRefused` by its case. A copy the owner composes (a work holding one, `holds_copy`) and a rebase
+  of a work on a holder node are refused `Unsupported`, not built yet.
+- **Engine.** `Green::submit_computed` is `submit_resolved` with the verdict taken by position; the two share
+  `commit_judgment`, so the outcome and the chain's record are the same at the same head.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_position_at_the_owner` (two nodes at
+  `f = 1`, B with the hook: B's work edits `f` and submits, answered version 2; B's `computed_on_holder` and A's
+  `taken_by_position` each moved by one; A's green and B's work read "hello world"; A's floor for the work rose to 2).
+  `slates-merge` `engine::compute_tests::a_verdict_computed_on_a_copy_commits_through_its_wire_form_as_the_serial_submit`
+  (computed on a copy at version 50, the owner moved to 51, through the wire form: the outcome and the record equal the
+  serial submit's, both greens read alike, a second take answered version 52 with nothing committed); `slates-merge
+  --lib engine::` 151 of 151. Fleet `a_holder` 18 of 18 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of
+  2, `verbs::` 62 of 62, `landing::` 14 of 14; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2
+  of 2; fmt clean.
+- **Owed.** The increment rides the forward whole, so an increment the forward lane cannot carry is refused by the lane
+  (the inputs' placement before the record, A-286, would carry it by reference); a verdict computed at a replica head
+  the owner has moved past is judged again by position (the engine's oracle covers it; no fleet test forces the lag).

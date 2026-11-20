@@ -1368,6 +1368,27 @@ pub enum RequestBody {
     /// The work's base now, or `None` when the work is gone.
     base: Option<u64>,
   },
+  /// Commit a work's increment by the verdict a holder computed (A-697 part c; A-658 part 3b; A-645 "Merges computed
+  /// anywhere, committed by position"): the node holding work `work` over green `green`, which another node owns,
+  /// composed the work's increment, computed its verdict on its replica of the green, and sends both to the owner, which
+  /// takes the verdict by position (`Green::judge_computed`: at the head it was computed against it stands, and once the
+  /// green moved only what the versions since changed is judged again) and commits it as a submit does, answering as a
+  /// submit is answered (`Submitted`, a conflict, or the submit's refusals). A node's verb, never a client's: served only
+  /// as a forward from another node, under the forward's completion record (keyed by the client's own submit), and
+  /// refused `Unsupported` from a client of either node. A verdict that is not this increment's, or one computed past
+  /// the owner's head, is refused `BadRequest`. Appended.
+  SubmitComputed {
+    /// The work, a work of the asking node.
+    work: VolumeId,
+    /// Its green.
+    green: VolumeId,
+    /// The increment, as `Increment::encode` writes it.
+    increment: Vec<u8>,
+    /// Its verdict, as `Computed::encode` writes it (A-658 part 3a).
+    computed: Vec<u8>,
+    /// What the owner judges the write policy, the signature and the commit by.
+    carried: ComputedSubmit,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2358,6 +2379,7 @@ impl RequestBody {
       | RequestBody::CreateWork { green: volume, .. }
       | RequestBody::AdmitWork { green: volume, .. }
       | RequestBody::MoveWorkFloor { green: volume, .. }
+      | RequestBody::SubmitComputed { green: volume, .. }
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
@@ -2473,6 +2495,7 @@ impl RequestBody {
         | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
         | RequestBody::AdmitWork { .. }
+        | RequestBody::SubmitComputed { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
@@ -2553,6 +2576,28 @@ impl RequestBody {
   pub fn may_be_forwarded(&self) -> bool {
     self.forwards_as_read() || self.forwards_as_write()
   }
+}
+
+/// What a submit computed on a holder node carries to its green's owner beside its increment and its verdict
+/// (`RequestBody::SubmitComputed`, A-697 part c): what the owner judges the write policy (A-285), the signature (A-321)
+/// and the commit the server makes (A-664) by, read on the holder, where the work's record is, as a work's shard reads
+/// them for its green's owner on one node.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ComputedSubmit {
+  /// The work's merge mode.
+  pub work_mode: WriteMode,
+  /// Whether the submit asks to be held for approval (`SubmitHeld`).
+  pub held: bool,
+  /// The launcher's approval of exactly this increment, by its identity (`SubmitApproved`), verified on the holder.
+  pub approved: Option<[u8; 32]>,
+  /// The signature over the merge's statement, if the submit carries one.
+  pub signature: Option<Vec<u8>>,
+  /// The work's trusted signers, read for a submit that carries a signature.
+  pub signers: Vec<Vec<u8>>,
+  /// Whether merges from the work must be signed.
+  pub signed_required: bool,
+  /// The message and the session's identities for the commit the server makes of the work.
+  pub authorship: Authorship,
 }
 
 /// One record session to a peer, as this node last saw it (§4.8; condition 7's evidence): the sender's congestion
