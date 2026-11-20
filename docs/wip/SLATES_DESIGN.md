@@ -55035,6 +55035,19 @@ Applied in the same change to:
   check turns a push of 23 µs each, each waiting about 91 µs for its shard, and about a second before the first step
   still unaccounted, profiled next. Tests: slates-git 556 of 556; slates-server `git_push:: vcs_http::git:: vcs_ssh::
   vcs_share:: vcs_store::upload::` 106 of 106; slates-ipc and slates-mcp whole.
+- **The small repositories' wait, found and fixed: a shard's turns divided by repository, not by push (piece 3c,
+  2026-11-20; Ada's rule that performance gaps are addressed upfront).** Profiled with the per-phase counters: a small
+  push's time is its own 0.26 s and 0.96 s waiting before its check turns, nothing before its first step; the slowest
+  sat on shard 7 beside r2's three pushes (2.45 s of steps), each getting about a tenth of the shard. The runtime gives
+  each ready task a turn, and a check turn is about one object (15 to 23 µs) whoever takes it, so the shard was fair per
+  push: three pushes, three turns a round. `crate::vcs_share::turns`: before each answer step a push takes its
+  repository's turn and keeps it through the yield after (`Turn::yield_holding`), the repository's other pushes parked in
+  order and never polled, so each repository with work takes one turn a round (deficit round robin, a repository a
+  flow). Wired in the HTTP and SSH answer loops, given back before a hook runs off the shard. The earlier lanes
+  (1b8010400) gave the lane back before the yield, so they never held. Red first:
+  `vcs_share::turns::tests::a_repositorys_pushes_share_one_turn_a_round_of_the_shard` (three pushes of one repository
+  took 3 turns between the small one's, now at most 1). Tests: slates-server `vcs_share:: git_push:: vcs_http::git
+  vcs_ssh::` 106 of 106. The cap-3 and cap-10 by-use proof follows in BENCHMARKS.md.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
