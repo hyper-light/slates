@@ -769,8 +769,9 @@ fn after_body_reply(status: &str) -> String {
 /// POST with a body on a route that decides its status after the body, its service naming `201` as its reply begins;
 /// naming none; naming `204`; naming `205`; then on a streamed route naming `201`, and naming `200`, its own; then on
 /// the first route naming `201` after its first run. Expect the first reply's head to carry `201`; the second `200`;
-/// the third, the fourth and the fifth refused `500` in stages, nothing of a reply written; the sixth's head `200`; and
-/// the seventh's head `200`, the late status never written.
+/// the third `204`, its head alone with no framing field and its run dropped (A-681); the fourth and the fifth refused
+/// `500` in stages, nothing of a reply written; the sixth's head `200`; and the seventh's head `200`, the late status
+/// never written.
 #[test]
 fn a_route_deciding_its_status_after_the_body_carries_the_status_its_service_names() {
   let refused =
@@ -788,7 +789,7 @@ fn a_route_deciding_its_status_after_the_body_carries_the_status_its_service_nam
     [
       after_body_reply("201 Created"),
       after_body_reply("200 OK"),
-      refused.to_owned(),
+      String::from("HTTP/1.1 204 No Content\r\nContent-Type: application/vnd.git-lfs+json\r\n\r\n"),
       refused.to_owned(),
       refused.to_owned(),
       after_body_reply("200 OK"),
