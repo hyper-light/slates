@@ -26,15 +26,15 @@
 use std::io::BufRead;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use slates_client::{Client, ClientError, Deadlines, ReadAt, Submitted, VolumeId};
+use slates_client::{Client, Deadlines, ReadAt, Submitted, VolumeId};
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
 #[path = "support/recovered.rs"]
 mod recovered;
 
-/// Shape: how long the anchor's daemon, or its successor after a kill, may take to answer.
-const START_WAIT: Duration = Duration::from_secs(60);
 /// Shape: the kills, each landing as a submit leaves the client.
 const KILLS: u32 = 6;
 /// Shape: the shared files and the blocks of each, which every round overwrites one of.
@@ -129,9 +129,11 @@ fn start_anchor(instance: &str) -> AnchorProcess {
     child,
     drain: Some(drain),
   };
-  let started = Instant::now();
+  // Waited for while the anchor's tree lives and gains CPU (`support/process_wait.rs`; until 2026-11-20 sixty seconds,
+  // `START_WAIT`).
+  let mut judged = process_wait::Judged::of(anchor.child.id());
   while daemon_pid(instance).is_none() {
-    assert!(started.elapsed() < START_WAIT, "the daemon never answered");
+    judged.look("the daemon answered");
     pause();
   }
   let (code, _) = run(instance, &["bootstrap", "root"]);
@@ -155,14 +157,11 @@ fn daemon_pid(instance: &str) -> Option<u32> {
     .ok()
 }
 
-/// Waits until a daemon other than `killed` answers.
-fn await_successor(instance: &str, killed: u32) {
-  let started = Instant::now();
+/// Waits until a daemon other than `killed` answers, while the tree under `anchor` lives and gains CPU.
+fn await_successor(instance: &str, killed: u32, anchor: u32) {
+  let mut judged = process_wait::Judged::of(anchor);
   while daemon_pid(instance).is_none_or(|pid| pid == killed) {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "no successor of daemon {killed}"
-    );
+    judged.look(&format!("a successor of daemon {killed} answered"));
     pause();
   }
 }
@@ -182,15 +181,9 @@ fn connect(instance: &str) -> Client {
     slates_db::replay::RECOVERY_BUDGET_NS,
   )
   .get();
-  let started = Instant::now();
   loop {
     match Client::connect(instance, deadlines) {
       Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        pause();
-      }
       Err(e) => panic!("{e}"),
     }
   }
@@ -220,26 +213,46 @@ struct Shared {
   rounds: AtomicU64,
   /// Set when the killer is done.
   done: AtomicBool,
+  /// Set when the client's rounds have ended, however they ended ([`RoundsEnded`]), so the killer never waits on a client
+  /// that is gone.
+  client_ended: AtomicBool,
+}
+
+/// Raises [`Shared::client_ended`] as the client's rounds end, a panic's unwinding included.
+struct RoundsEnded<'a>(&'a Shared);
+
+impl Drop for RoundsEnded<'_> {
+  fn drop(&mut self) {
+    self.0.client_ended.store(true, Ordering::SeqCst);
+  }
 }
 
 /// The killer: each time the client is about to submit, after enough rounds since the last kill and once the anchor has
 /// judged the daemon recovered (A-311: a daemon killed sooner is a failed start, and a second in a row is a crash loop
 /// the anchor backs off), `SIGKILL` the daemon at once, then wait for the anchor's successor.
-fn killer(instance: &str, shared: &Shared) {
+fn killer(instance: &str, shared: &Shared, anchor: u32) {
   for _ in 0..KILLS {
-    let pid = recovered::await_recovered(instance, &|_| true, POLL, START_WAIT);
+    let pid = recovered::await_recovered_while_alive(
+      instance,
+      &|_| true,
+      POLL,
+      &mut process_wait::Judged::of(anchor),
+    );
     let after = shared.rounds.load(Ordering::SeqCst) + ROUNDS_BETWEEN_KILLS;
-    let started = Instant::now();
+    // The client's next submit, waited for while it runs and the anchor's tree lives and gains CPU, its rounds needing
+    // the daemon (until 2026-11-20 sixty seconds, `START_WAIT`).
+    let mut judged = process_wait::Judged::of(anchor);
     while !(shared.aim.load(Ordering::SeqCst) && shared.rounds.load(Ordering::SeqCst) >= after) {
       assert!(
-        started.elapsed() < START_WAIT,
-        "the client stopped submitting"
+        !shared.client_ended.load(Ordering::SeqCst),
+        "the client's rounds ended before the kill"
       );
+      judged.look("the client's next submit");
       std::hint::spin_loop();
     }
     signal_kill(pid);
     shared.aim.store(false, Ordering::SeqCst);
-    await_successor(instance, pid);
+    await_successor(instance, pid, anchor);
   }
   shared.done.store(true, Ordering::SeqCst);
 }
@@ -247,6 +260,7 @@ fn killer(instance: &str, shared: &Shared) {
 /// The client: rounds of an overwrite of one block, then a submit, until the killer is done; a work is replaced after
 /// a conflict or a restart (a rebuilt work is based on the head the client did not see).
 fn client_rounds(client: &mut Client, green: VolumeId, shared: &Shared) -> Vec<Told> {
+  let _ended = RoundsEnded(shared);
   let mut told = Vec::new();
   let mut made = 0usize;
   let mut work = client.create_work(green, "w0").unwrap().0;
@@ -302,7 +316,8 @@ fn a_daemon_killed_mid_merge_loses_no_told_version_and_tells_none_twice() {
     return;
   }
   let instance = format!("merge-kill-{}", std::process::id());
-  let _anchor = start_anchor(&instance);
+  let anchor = start_anchor(&instance);
+  let anchor_pid = anchor.child.id();
   let mut client = connect(&instance);
   let green = client.create_green("kill-g", false).unwrap();
   let (seed, _) = client.create_work(green, "seed").unwrap();
@@ -317,9 +332,10 @@ fn a_daemon_killed_mid_merge_loses_no_told_version_and_tells_none_twice() {
     aim: AtomicBool::new(false),
     rounds: AtomicU64::new(0),
     done: AtomicBool::new(false),
+    client_ended: AtomicBool::new(false),
   };
   let told = std::thread::scope(|scope| {
-    let killing = scope.spawn(|| killer(&instance, &shared));
+    let killing = scope.spawn(|| killer(&instance, &shared, anchor_pid));
     let told = client_rounds(&mut client, green, &shared);
     killing.join().unwrap();
     told

@@ -13,10 +13,11 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Shape: how long the daemon may take to come up, and to be replaced after a kill.
-const START_WAIT: Duration = Duration::from_secs(20);
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 /// Shape: the poll interval of the waits.
 const POLL: Duration = Duration::from_millis(20);
 /// Shape: consecutive answered verbs before the daemon counts as settled (the anchor may restart it
@@ -94,7 +95,9 @@ fn start_anchor(instance: &str) -> Anchor {
     .spawn()
     .unwrap();
   let anchor = Anchor(child);
-  let started = Instant::now();
+  // Waited for while the anchor's tree lives and gains CPU (`support/process_wait.rs`; until 2026-11-20 twenty seconds,
+  // `START_WAIT`).
+  let mut judged = process_wait::Judged::of(anchor.0.id());
   let mut streak = 0;
   while streak < STABLE_STREAK {
     streak = if run(instance, &["volume", "list"]).0 == 0 {
@@ -102,7 +105,7 @@ fn start_anchor(instance: &str) -> Anchor {
     } else {
       0
     };
-    assert!(started.elapsed() < START_WAIT, "the daemon came up");
+    judged.look("the daemon came up");
     pause();
   }
   let (code, _, error) = run(instance, &["bootstrap", "root"]);
@@ -119,7 +122,7 @@ fn nfsv4_opens_and_locks_survive_a_daemon_restart() {
     return;
   }
   let instance = format!("nfs4-restart-{}", std::process::id());
-  let _anchor = start_anchor(&instance);
+  let anchor = start_anchor(&instance);
   let (code, out, error) = run(
     &instance,
     &["volume", "create", "held", "--bounded", "16MiB"],
@@ -194,14 +197,11 @@ fn held_file_survives_restart(client: &mut slates_client::Client, root: &Path) {
     .status()
     .unwrap();
   assert!(killed.success(), "kill the daemon");
-  let started = Instant::now();
+  let mut judged = process_wait::Judged::of(anchor.0.id());
   while client.daemon_status().map(|status| status.pid).ok() == Some(previous)
     || client.daemon_status().is_err()
   {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the anchor replaced the daemon"
-    );
+    judged.look("the anchor replaced the daemon");
     pause();
   }
 
