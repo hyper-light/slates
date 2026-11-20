@@ -578,6 +578,10 @@
 > **A-636 part 2c-1 (2026-11-20, w-shared):** a repository's record is its own register (`REPOSITORY_CLASS`), shipped
 > to its family's candidates at each policy setting or names change and adopted by its successor as a pending
 > repository. Owed: the successor's rebuild of the repository from its record and its logs by part 1's rule (2c-2).
+> **A-636 part 2c-2 (2026-11-20, w-shared):** the successor rebuilds a repository taken over once its record, its
+> family's registers and its greens are adopted: each operation kept only where every log it moved holds it whole
+> (`repository::whole_parts`), the repository recorded whole (`Op::RepositoryRebuilt`) and its store made. Owed: a
+> log's parts the successor lacks fetched from its holders; the tool store's objects shipped (no part carries them).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the

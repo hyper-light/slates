@@ -12036,8 +12036,12 @@ decides the details.
 > from it and keep or drop each operation whole. A repository's greens are of its family (A-636 part 2b-2), so every
 > log of a repository, its greens' included, is placed on one set of holders and follows one successor; and its record
 > (name, tool, format, owner, policy) is its own register, shipped as its catalog is a volume's and adopted by its
-> successor (A-636 part 2c-1). Owed: the successor's rebuild of the repository from its record and its logs by this
-> rule (2c-2); and the repository policy's check before the verdict (A-622's next part).
+> successor (A-636 part 2c-1). The successor rebuilds the repository by this rule (A-636 part 2c-2): once its record,
+> every register of its family and its greens are adopted, it keeps each state log's parts it holds only where every
+> log their operation moved holds them whole, a green's log judged by its adopted head, records the repository whole
+> from them (`Op::RepositoryRebuilt`) and makes its store from the log. Owed: the parts of a state log a successor
+> does not hold fetched from its holders; the tool store's objects shipped beside the logs (a state log's part carries
+> none, so a rebuilt store holds none yet); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12580,7 +12584,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
    operation's identity and spans (A-636 part 2b); and a repository's greens minted in its family, placed and taken
    over as it is (A-636 part 2b-2); and its record shipped as its own register and adopted by its successor (A-636 part
-   2c-1); owed: the successor's rebuild of the repository by the rule (2c-2).
+   2c-1); and rebuilt by its successor by the rule (A-636 part 2c-2); owed: the tool store's objects shipped beside
+   the logs, and a log's parts the successor lacks fetched from its holders.
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -54139,3 +54144,37 @@ Applied in the same change to:
   its successor keeps each state log's records only where every log they span holds them whole (part 1's rule, a
   green's log judged by its adopted head), records the repository whole in its database and makes its store from the
   log; the record's commit batched with the names log's part.
+
+### A-636 part 2c-2 — A successor rebuilds a repository taken over whole from its record and the logs it holds (2026-11-20, w-shared for UI goal 93)
+- **Why.** 2c-1 ships a repository's record to its holders and keeps it pending on its successor; nothing yet made the
+  repository again there, so a repository whose owner left had no record, namespace or state on any surviving node.
+- **Change.** The rule (A-636 part 1's, over parts): `slates_db::repository::whole_parts` keeps each state log's parts
+  that continue it from its start, then drops every operation some log it moved does not hold whole, with what follows
+  it in each state log, until every operation kept is whole; a state log holds an operation's span where its part over
+  those positions names the operation, a green's log where the green's head is at or past the span's end. The record:
+  `Op::RepositoryRebuilt { record, parts }` (appended, wire order published), guarded as a creation (name and id free,
+  under capacity; its policy whatever it was set to), each log's parts its own and contiguous from its start, each
+  change of its log, each green it names of its family and held by no other repository; applied as each part's changes
+  were first made, each log left at its last part's position, each operation that moved a green's log and another kept
+  as its atomic record, taking no position a record ships from; its state and policy charged to the merge budget. The
+  server: `takeover::repositories_ready` (the record adopted, no register of its family still learned by any round,
+  none of its greens still materializing; its parts read from this node's acceptors), then
+  `takeover::rebuild_repository` on the shard its id routes to, called each period after the greens'
+  materialization (`fleet::rebuild_adopted_repositories`): the parts kept by the rule with that shard's green heads,
+  the op recorded, the store made from the log (`vcs_store::make_from_log`); counted
+  `fleet.takeover.repository_rebuilt`, `repository_operation_dropped`, `repository_unrebuilt` (a refusal, logged, not
+  attempted again).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-db`
+  `repository::tests::a_successor_keeps_each_operation_whole_and_drops_what_a_log_lacks` (a push past the green's head
+  dropped with the name after it, an operation whose other log lacks it dropped, a part past a gap never kept; at the
+  head, kept) and `a_rebuilt_repository_is_recorded_whole_as_its_logs_left_it` (membership, binding, lock and
+  positions, kept by a snapshot; a second record `AlreadyExists`; gapped, misowned, stranger's and taken parts
+  `Corrupt`, nothing applied): `cargo test --locked -p slates-db --lib -- repository::` 29 of 29; `wire_order` 2 of 2.
+  `slates-server` `fleet::state_log_tests::a_successor_rebuilds_a_repository_whole_from_the_logs_it_holds` (a names
+  log held as shipped, the record adopted: rebuilt with `main` alone, the push dropped, its store made; again, standing):
+  `cargo test --locked -p slates-server --lib -- fleet::state_log_tests takeover:: state_log mirror:: repository::tests
+  --test-threads=4` 34 of 34. fmt clean.
+- **Owed.** A state log's parts the successor does not hold, fetched from its holders before the rule runs (as a green's
+  missing records are, A-364); the tool store's objects (`RepositoryEntry::objects`) shipped beside the logs, since no
+  part carries them and a rebuilt store holds none; the gate's fleet run (a repository's owner killed, its successor
+  serving it), main's.

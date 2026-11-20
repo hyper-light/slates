@@ -749,6 +749,16 @@ pub enum Op {
     /// The credential's id.
     id: [u8; 32],
   },
+  /// A repository taken over was recorded whole by its successor (A-636 part 2c-2): its adopted record and the parts of
+  /// its four state logs the successor kept by A-636 part 1's rule, each log's from its start, in log order
+  /// (`crate::repository::whole_parts`). Applied as if each part's changes were made again, taking no position a record
+  /// ships from, since every holder already holds them. Appended.
+  RepositoryRebuilt {
+    /// The record, as its own register held it (A-636 part 2c-1).
+    record: RepositoryRecord,
+    /// The kept parts, by log and then position.
+    parts: Vec<crate::catalog::StateLogRecord>,
+  },
 }
 
 impl Op {
@@ -856,6 +866,7 @@ impl Op {
       Op::IdentitiesSet { .. } => "identities_set",
       Op::CredentialEnrolled { .. } => "credential_enrolled",
       Op::CredentialRevoked { .. } => "credential_revoked",
+      Op::RepositoryRebuilt { .. } => "repository_rebuilt",
     }
   }
 }
