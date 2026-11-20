@@ -4663,6 +4663,11 @@ pub enum DatabaseRefusal {
     /// The slot's bytes.
     room: u64,
   },
+  /// A repository's index cut moved other than one bit within an id's 32 (A-724 piece 9): the cut now. Appended.
+  IndexCutStep {
+    /// The cut's bits now.
+    current: u8,
+  },
 }
 
 /// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the

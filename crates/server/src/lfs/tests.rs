@@ -196,6 +196,7 @@ fn an_id_names_its_own_lock_and_never_one_taken_after_it() {
 /// A git repository's record owned by [`owner`], its default branch `main`, with `policy`.
 fn record_with(policy: RepositoryPolicy) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id: RepositoryId::default(),
     name: "repo.git".to_owned(),
     tool: DbTool::Git,

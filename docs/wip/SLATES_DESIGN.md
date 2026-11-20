@@ -54832,6 +54832,17 @@ Applied in the same change to:
   `vcs_store::homes::tests` 6 of 6 (region offers idempotent; a lone node's healer moves nothing; the region put
   acknowledged only after its image) and `fleet::` 33 of 33. A region home answers `Kept` only once A-727 a3 drives its
   image barrier, so until then the healer offers and keeps its own copy (no release without every home's `Kept`).
+- **Piece 9b, the cut in the record and look-ups routed by it (2026-11-20).** `RepositoryRecord::index_bits` (appended,
+  zero at creation, the whole index on the owner) moves one bit at a time by `Op::RepositoryIndexCut` (appended, `Op`
+  102), its guard refusing any other step or a cut past 32 bits `DbError::IndexCutStep { current }` (the wire's
+  `DatabaseRefusal::IndexCutStep`, 13); a partition's snapshot carries it. `crate::vcs_share::place::index_partition`
+  names the partition holding an object's index row from the record and the id alone (the owner's at a cut of zero,
+  else the range's by `range_partition`), and `index_cut_step` moves a cut one bit toward `bits_for` of the index's
+  bytes. Nothing moves a live cut yet: until a push's rows are routed to their ranges (with record v3, after A-727 a3),
+  a cut above zero would send look-ups to partitions holding no rows. Tests: `repository::tests::a_repositorys_index_cut_moves_one_bit_at_a_time_and_is_kept_by_its_snapshot`
+  and `place::tests::a_repositorys_index_rows_route_by_its_cut_and_the_cut_steps_one_bit_at_a_time`; slates-db `--lib`
+  180 of 180, `--test model` 26 of 26, both `wire_order` goldens; slates-server `repository:: takeover:: vcs_ssh::
+  vcs_http:: git_protect:: lfs:: vcs_policy:: vcs_share::` 236 of 236.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 

@@ -122,6 +122,7 @@ impl Repositories for Held {
       _ => return None,
     };
     Some(RepositoryRecord {
+      index_bits: 0,
       id,
       name: name.to_owned(),
       tool,
