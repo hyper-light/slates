@@ -28,15 +28,16 @@
 //! spelling the driver takes for one path therefore names one node by one name, the made spelling where nothing else
 //! holds it, which is what `GetFinalPathNameByHandleW` then shows.
 //!
-//! **What it cannot reach.** Three cases, each in GAPS (A-551):
+//! **What it cannot reach.** Two cases, each in GAPS (A-551):
 //! - Names the volume folds alike and Windows' table does not, since the table has no normalization and keeps letters
 //!   such as the Kelvin sign apart from `K` (a decomposed `é` against a precomposed one): each such component is
 //!   answered as asked, so Windows holds one node per such spelling, as it would of two names on NTFS.
 //! - A path past [`NORMALIZED_UNITS_MAX`] units is named by the driver itself, upper-cased: the record keeps that name,
 //!   but a rename of a directory above it that the records spell otherwise moves the driver's node and not the record.
-//! - Names Windows' table folds alike and the volume does not (final sigma `ς` against `σ`, which the table upcases
-//!   alike and Unicode lowercasing keeps apart) are two files to the volume and one node to the driver: an open of the
-//!   second while the first is open joins the first's node, and its record takes that node's name.
+//!
+//! A third case A-551 named, names Windows' table folds alike and a folding volume keeps apart, does not arise: every
+//! pair Windows' own table folds alike, NFC and lowercasing fold alike too (A-737: all 973 of its mappings, 2026-11-20).
+//! It arose only through the exFAT table the volume core kept until then, which upcased final sigma `ς` to `Σ`.
 
 use slates_vfs::names::NameEquivalence;
 
@@ -231,7 +232,7 @@ mod tests {
   /// A folding volume's drive holding the names `held` open, each by its own handle and inode.
   fn folding(held: &[&str]) -> OpenNames {
     // Windows' upcase table as the volume core keeps it (A-576), which the Windows host's `system_upcase` is checked
-    // against: `é` to `É`, final and medial sigma to `Σ`, the Kelvin sign and a combining acute as they are.
+    // against: `é` to `É`, medial sigma to `Σ`, final sigma, the Kelvin sign and a combining acute as they are (A-737).
     let mut names = OpenNames::searching(NameSearch::CaseInsensitive {
       upcase: slates_vfs::upcase::upcase,
     });
@@ -373,15 +374,15 @@ mod tests {
     );
   }
 
-  /// A-551, the third case the module docs name. Do: hold `\σ.txt` open and name an open of `\ς.txt`, another file to
-  /// the volume, whose name the table upcases alike. Expect: the held node's name, since the driver joins the open to
-  /// that node whatever the reply says, and the records keep the driver's name for it.
+  /// A-551's third case, gone under Windows' own table (A-737). Do: hold `\σ.txt` open and name an open of `\ς.txt`,
+  /// another file to the volume. Expect: `\ς.txt` answered as asked, its own node, since Windows' table keeps final sigma
+  /// apart from `σ` as the volume does. Under the exFAT table it was joined to the held node.
   #[test]
-  fn a_name_the_table_folds_alike_takes_the_open_nodes_name() {
+  fn final_sigma_is_its_own_node_beside_an_open_medial_sigma() {
     let names = folding(&["\\\u{3c3}.txt"]);
     assert_eq!(
       answered(&names, "\\\u{3c2}.txt", "\\\u{3c2}.txt"),
-      "\\\u{3c3}.txt"
+      "\\\u{3c2}.txt"
     );
   }
 }

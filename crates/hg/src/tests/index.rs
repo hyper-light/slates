@@ -246,7 +246,9 @@ fn the_history_7_2_stored_is_numbered_as_7_2_numbered_it() {
   assert!(copy.block.is_some());
   let meta = index.revision(&store, Log::File(b"meta"), 0).unwrap();
   assert_eq!(
-    meta.block.map(|block| store.get(&block).map(<[u8]>::len)),
+    meta
+      .block
+      .map(|block| store.bytes_of(&block).map(|bytes| bytes.len())),
     Some(Some(0))
   );
 }
@@ -379,8 +381,15 @@ fn a_log_row_never_meets_an_object_key_whatever_a_path_s_length() {
   assert!(index.commit_objects(&mut store, &mut quarantine).is_ok());
   let node = Node::try_from(id.as_slice()).unwrap();
   let (kind, len, root) = index.object(&store, &node).unwrap();
-  let object = (kind, len, store.get(&root));
-  assert_eq!(object, (FILE, 18, Some(&b"the object's bytes"[..])));
+  let object = (kind, len, store.bytes_of(&root));
+  assert_eq!(
+    object,
+    (
+      FILE,
+      18,
+      Some(std::borrow::Cow::Borrowed(&b"the object's bytes"[..]))
+    )
+  );
   let revision = index.revision(&store, log, 0).map(|row| row.node);
   assert_eq!(
     (revision, quarantine.is_empty()),

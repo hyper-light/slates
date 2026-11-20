@@ -54715,6 +54715,20 @@ Applied in the same change to:
   is passed; an index is cut into `2^b` ranges by object id, each range held where rendezvous over `(family, range)`
   ranks first, `b` one integer in the repository's record, a push's rows committed by the owner's one landing record.
   Nothing built yet.
+- **Piece 7, starvation held to the fair share (2026-11-20, main's ruling).** BENCHMARKS.md, "Many repositories on one
+  daemon, held to their fair share": against the fair share of today's placement (a repository's intake on its owner
+  shard) no class is starved (every p99 ratio 0.72 to 0.87); against a repository spread over as many shards as it has
+  pushes, a hot repository's 19 pushes are 7.61 times slower and the small class 2.72 times: the gap A-722's intake off
+  the owner shard closes, w-balance supplying its placement policy. Per-repository lanes on a shard were measured dead
+  even and rejected.
+- **Piece 5b's placement policy, for A-722 (2026-11-20, main's ruling: w-git builds intake off the owner shard, w-balance
+  supplies which shard decodes a push).** `crate::vcs_share::place::intake_shard(arrived, key, shards, load)`: the
+  shorter of two queues (Mitzenmacher, IEEE TPDS 2001), the arrival shard or the shard rendezvous ranks first for the
+  push's key, by the intakes decoding on each now (`decoding_on`), the arrival shard on a tie. Each shard counts its own
+  in one word on its own cache line per registry slot, written by its shard alone and read relaxed (a statistic); a git
+  push holds a `Decoding` guard from its start (today on its owner). Tests: `vcs_share::place::tests` (19 pushes of one
+  repository over 23 shards: at most two decoding on any shard, against all 19 on the owner today; the count follows its
+  guards; a tie stays). `intake_shard` and `decoding_on` wait for A-722 to call them.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55218,3 +55232,23 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   --locked -p slates-server --lib -- vcs_ssh vcs_svn vcs_store::upload` 79 of 79; fmt clean.
 - **Owed.** A live push over SSH whose client is killed while its hook runs (main's runs); Windows' build of the edge
   (main's).
+
+### A-737 — A folding WinFsp drive's volume folds by Windows' own upcase table, not the exFAT specification's (bug, 2026-11-20, w-bugs for goal 87; found by use; amends A-576; §4.4 name policy, §4.6 Windows)
+
+- **Found by use.** A-576's Windows check, `slates-bridge-winfsp` `host::upcase_table::the_volumes_upcase_table_is_the_systems`,
+  first run on 2026-11-20 (jupiter x86_64; CI windows-latest and windows-11-arm, diag-w-bugs-lib-*), failed on every
+  Windows: 109 units where the volume core's table (the exFAT specification's recommended Table 25, which A-576 took for
+  Windows' from memory) and `RtlUpcaseUnicodeChar`, the table WinFsp's driver compares by, differ.
+- **Change.** `crates/vfs/src/upcase.rs` holds Windows' own table: every unit upcased through `RtlUpcaseUnicodeChar` on
+  CI's runners (x86_64 build 26100.33828, arm64 build 26200.9974; identical; 973 units mapped; SHA-256 of the dump
+  `cf0c33b4...`; diag-w-bugs-upcase-1). It maps no two units to one (final sigma `ς` stays `ς`), nothing past ASCII
+  into ASCII, and folds the post-2006 case pairs (`ɐ`/`Ɐ`, `ͱ`/`Ͱ`). A-551's third residual (names Windows folds alike
+  that a folding volume keeps apart) does not arise under it, so `normalized.rs` and GAPS say so.
+- **Tests.** vfs `upcase::tests::the_table_is_windows_own` (the whole table's TableChecksum E61F453Bh, 973 mapped),
+  `the_table_folds_as_windows_does` (`σ`→`Σ`, `ς` itself, `ɐ`→`Ɐ`, `Ⱥ` itself; each red against the exFAT arrays),
+  `no_two_units_fold_to_one_and_none_into_ascii`; `names::tests` and `volume::upcase_name_tests` restated on `ɐ`/`Ɐ`
+  and the sigmas two names; bridge-winfsp `normalized::tests::final_sigma_is_its_own_node_beside_an_open_medial_sigma`.
+  macOS arm64 (Mac Studio): vfs `upcase`/`names::` 9/9, bridge-winfsp `normalized` 7/7. The Windows check itself is
+  the by-use proof on both architectures: with this change `slates-bridge-winfsp --lib` with WinFsp passes whole on
+  x86_64 and arm64 (diag-w-bugs-lib-737, 2026-11-20), where every Windows run failed the check before.
+- **Applied in the same change to** GAPS (A-576's entry), `normalized.rs`' module docs, amendments.tsv.
