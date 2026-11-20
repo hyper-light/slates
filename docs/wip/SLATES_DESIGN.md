@@ -14473,6 +14473,8 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
    advertise it while it is held. Whether an artefact stays is learned (the table below).
 
 **Push.** Each step names what it refuses; nothing takes effect before step 6.
+Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
+working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices in part 2.
 1. **Intake.** The bundle (bundle2; bundle1 only where the policy allows legacy clients, as 7.2's `server.bundle1`
    does) is read in slices within the shard's budget per step, every length checked against the request's admission
    (A-16) before anything is held. A mandatory part or parameter slates does not know is refused, as bundle2 requires
