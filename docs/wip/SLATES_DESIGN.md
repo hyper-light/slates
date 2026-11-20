@@ -55817,6 +55817,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   back that label, the shard and the pid. Red first: with the record not written the test fails ("the watchdog recorded
   no stuck task"); green, the line reads "shard 1 is spinning: 3198 ms of CPU … in task liveness::spinner, at its
   poll 1" (macOS arm64, Mac Studio 2).
+- **Follow-up (2026-11-20, w-forming; found by use: a 2,933 ms poll and every fleet loop's long poll were named by
+  lines inside helpers).** Work spawned through a helper is labelled with the helper's caller: `fleet::spawn_detached`
+  is `#[track_caller]`, and `xshard::task_within` and `task_in_shard_time` are `#[track_caller]` functions that take
+  their caller's site and spawn the work with `slates_rt::futures::spawn_at` (the call is made when the helper is
+  called, its answer awaited after). Tests: `fleet::spawn_label_tests::a_fleet_loops_label_names_the_line_that_spawned_it`
+  and `xshard::tests::a_cross_shard_tasks_label_names_the_line_that_asked_for_it`, red before (named `fleet.rs:7034`
+  and `xshard.rs:1092`).
 - **Applied in the same change to** the watchdog's module docs, amendments.tsv.
 
 ### A-664 Subversion objects, symbolic links — A submitted symbolic link is a file of `link ` and its target whose list is `svn:special` (2026-11-20, w-shared for UI goal 93; main's ruling)
