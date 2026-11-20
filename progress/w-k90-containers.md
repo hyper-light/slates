@@ -54,3 +54,19 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
   xprtsec=mtls/claimRef/Retain, claim volumeName "", pod volume+mount+runAsUser/Group; PodExport Debug hides token;
   Unbuildable), 2 w10 tests; W10 doc line. RBAC deferred to the engine piece (first code that creates PVs). Run in flight.
 - Next K8s piece: kiln's call of Instance::export (workspace::slates::export) + the engine/home + RBAC.
+
+## 5b-i LANDED 2026-11-20 ~02:0xZ kiln main ..7e77ebecd (a69822973); reported to main.
+## K8s builders: committed d5d613ef6 (worktree w-k90-containers-k8s), 2/2 green; push run r8 (b24c) in flight.
+## 5b-ii (in progress, worktree ~/kiln-work/w-k90-containers-kiln, uncommitted):
+- Engine::Container (kiln-ci facts), [agent] container_image (runner::probe::Declared), ContainerFacts.image +
+  ContainerMissing::Image; harness::engine: containers(), held(asked, can, boxed) (never container by default), asked_of
+  "container", set 409 unless containers usable, session_engine()/split/drained, view "container"/"containers";
+  session::InContainer + Spec/Info.container (copied at host.rs/registry.rs/session.rs; Info::differs);
+  lineage::container_at + on_engine arms; registry::open_as sets spec.container for new non-isolated conversations;
+  narrow::Whole::Container; sandbox::container::{launch_of, launch}; session launch branch (no MCP, no kind.prepare);
+  experiments' matches (Container grouped with Host). Docs W9 + status row.
+- Tests added: engine w9_a_runner_holds_container_only_..., a_put_sets_host_microvm_container_or_null...,
+  lineage w9_a_container_runners_new_conversations_take_its_image..., sandbox::container
+  w9_a_sessions_container_launch_is_its_harness_by_name..., workspace::container facts test (image).
+- Run t1 in flight (KILN_WRITE_TS=1).
+- Gap to report: a harness in a container has no sign-in (image's own or a credential grant: next piece).
