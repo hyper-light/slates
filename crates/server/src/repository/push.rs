@@ -343,25 +343,58 @@ pub(crate) fn push_imported(
   )
 }
 
+/// A Git LFS object an upload brings (A-629 part 3): its oid and bytes, and why the repository's LFS index refused it,
+/// once it has.
+pub(crate) struct LfsUpload<'u> {
+  /// The object's oid, as the client named it.
+  pub(crate) oid: slates_git::lfs::Oid,
+  /// Its bytes.
+  pub(crate) bytes: &'u [u8],
+  /// Why the LFS index kept nothing, when the append was refused there: told apart so an upload whose bytes are not
+  /// its oid's is answered in LFS's words.
+  pub(crate) refused: Option<crate::vcs_store::LfsAdmitRefused>,
+}
+
+/// [`push`] of a Git LFS object's upload (A-629 part 3): the entry holds the object's record
+/// (`crate::vcs_store::lfs_record`), and the repository's LFS index keeps the object between the register's guard and
+/// the entry's apply (`crate::vcs_store::admit_lfs`, its bytes checked against its oid there), as a git push's store
+/// commits its objects there (A-662). The entry is recorded though it moves no green, since its record is the object.
+/// Appended, the index holds the object; refused by the index, `upload.refused` says why and nothing is kept.
+pub(crate) fn push_lfs(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  upload: &mut LfsUpload<'_>,
+) -> Result<Appended, AppendRefused> {
+  push_holding(
+    state,
+    (principal, repository),
+    Vec::new(),
+    EntryParts::default(),
+    Some(Stored::Lfs(upload)),
+  )
+}
+
 /// A sealed push and the moves its append commits.
 type Sealed<'p> = (&'p mut crate::vcs_store::SealedPush, &'p [StoreMove]);
 
 /// What a push's entry holds as its objects, and how the repository's store takes them between the register's guard
 /// and the entry's apply.
-enum Stored<'p> {
+enum Stored<'p, 'u> {
   /// A git push's sealed objects and the moves its append commits (A-662).
   Git(Sealed<'p>),
   /// A Mercurial import's index and its record (A-687).
   Imported((&'p mut Option<slates_hg::index::HgIndex>, Vec<u8>)),
+  /// A Git LFS object's upload (A-629 part 3).
+  Lfs(&'p mut LfsUpload<'u>),
 }
 
-/// [`push`], [`push_sealed`] and [`push_imported`]'s one path, with what the entry's objects are, if any.
+/// [`push`], [`push_sealed`], [`push_imported`] and [`push_lfs`]'s one path, with what the entry's objects are, if any.
 fn push_holding(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   changes: Vec<BranchChange>,
   parts: EntryParts,
-  stored: Option<Stored<'_>>,
+  stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
   let record = state
     .db
@@ -593,7 +626,7 @@ fn push_planned(
   record: &RepositoryRecord,
   (steps, parts): (Vec<Step>, EntryParts),
   held: &mut Held,
-  mut stored: Option<Stored<'_>>,
+  mut stored: Option<Stored<'_, '_>>,
 ) -> Result<Appended, AppendRefused> {
   make(state, &steps, held).map_err(AppendRefused::Changes)?;
   secure(state, &steps, held).map_err(AppendRefused::Changes)?;
@@ -611,16 +644,24 @@ fn push_planned(
   // record ride with the changes they came with.
   let brings_a_record = steps.is_empty() && !entry.objects.is_empty();
   let imports = matches!(stored, Some(Stored::Imported(_)));
+  let uploads = matches!(stored, Some(Stored::Lfs(_)));
   match stored.as_mut() {
     Some(Stored::Git((sealed, moves))) => {
       entry.objects = sealed_record(state, (&steps, &entry), (&mut **sealed, *moves))?;
     }
     Some(Stored::Imported((_, bytes))) => entry.objects = core::mem::take(bytes),
+    Some(Stored::Lfs(upload)) => {
+      let available = state.store.admittable();
+      entry.objects = crate::vcs_store::lfs_record::encode(&upload.oid, upload.bytes)
+        .map_err(|_| AppendRefused::Entry(Refusal::BudgetExceeded { available }))?;
+    }
     None => {}
   }
-  // An import's entry is recorded whatever it moves: its record is the repository's history (A-687).
+  // An import's entry is recorded whatever it moves: its record is the repository's history (A-687); an upload's
+  // though it moves no green: its record is the object (A-629 part 3).
   let changes_anything = imports
     || brings_a_record
+    || uploads
     || !(entry.joined.is_empty()
       && entry.versions.is_empty()
       && entry.names.is_empty()
@@ -631,8 +672,8 @@ fn push_planned(
     settle_secured(state, held);
     return Ok(answer(&steps, &verdicts));
   }
-  // The store commits the push's objects, or takes the import's index, between the guard and the apply (A-662, A-687),
-  // so a refusal here applies nothing.
+  // The store commits the push's objects, takes the import's index, or keeps the upload's LFS object, between the
+  // guard and the apply (A-662, A-687, A-629 part 3), so a refusal here applies nothing.
   let store_committed = match stored {
     Some(Stored::Git((sealed, _))) => {
       if let Err(refused) = crate::vcs_store::commit(state, sealed) {
@@ -645,6 +686,15 @@ fn push_planned(
     Some(Stored::Imported((index, _))) => {
       crate::vcs_store::hg_import::place_imported(state, record.id, index)
         .map_err(AppendRefused::Entry)?;
+      true
+    }
+    Some(Stored::Lfs(upload)) => {
+      let kept = crate::vcs_store::admit_lfs(state, record.id, (&upload.oid, upload.bytes));
+      if let Err(refused) = kept {
+        let refusal = crate::vcs_store::lfs_refusal_of(state, &refused);
+        upload.refused = Some(refused);
+        return Err(AppendRefused::Entry(refusal));
+      }
       true
     }
     None => false,

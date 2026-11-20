@@ -910,6 +910,12 @@
 > Owed: A-581's durable LFS objects on the owner shard, and the batch API and the transfers served over them; locks by
 > others than the owner (A-635's policy check); principals' names for people (§4.13); the stock git-lfs client end to
 > end against the daemon (main's).
+> **A-629 part 3 (2026-11-19, g230; durable Git LFS objects):** each upload is one entry of the repository's logs
+> holding the object's record (`vcs_store::lfs_record`), kept in the store's LFS index (`GitStore::lfs`) between the
+> register's guard and the entry's apply (`push_lfs`, `admit_lfs`), replayed by a recovery (`replay_lfs`); the daemon's
+> edge serves the batch API and the transfers over it (`ShardObjects`), an upload `200` once durable, bytes not the
+> oid's `422` with nothing recorded. Closes part 2c's "A-581's durable LFS objects". Owed: uploads by others than the
+> owner (A-635), a streaming put, the stock git-lfs client end to end (main's queue).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
@@ -1416,7 +1422,13 @@
 > slices (a refusal before its first byte answered with its error, one after it ending the connection); held to the
 > ra_svn walk entry for entry over nine requests and to stock `svn log` and `svn log -v` (see A-681 part 1, second
 > slice). Owed from it: (1) a negative `S:limit`, refused where `svn_repos_get_logs5` reads two limits; (2) the other
-> REPORTs and the update-report. A-531 (2026-11-19): the ra_svn item codec, its
+> REPORTs and the update-report. A-681, the lender (2026-11-19, g297): a Subversion repository's records lent as the
+> read source on its owner shard (`reads::Repository` and `Contents` over `slates_svn::migration::Repository`, the
+> index's directory listing `Index::children`, `slates-server`'s `vcs_store::svn_view::ServedRecords` and `lend_in`
+> for the svn:// listener); held to the index's oracle and to committed records read back through the DAV site on a
+> daemon's shard (see A-681, the lender). Owed from it: (1) a repository's Subversion authorization file and a
+> principal's Subversion user have no home in its record, so the lender gives no read rules; (2) the site routed into
+> the daemon's `ToolSites`. A-531 (2026-11-19): the ra_svn item codec, its
 > bounds the caller's, golden vectors from the protocol document, `cargo test -p slates-svn --lib` on the Mac Studio
 > (see A-531). A-553 (2026-11-19): the Subversion index, every node-revision with FSFS's node, copy and copy-root
 > identities, predecessors, history lists and mergeinfo counts computed from the revisions' changed-path rows; its

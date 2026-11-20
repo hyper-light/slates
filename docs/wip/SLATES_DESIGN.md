@@ -13019,6 +13019,20 @@ engine: the verdict, rebase, position mapping, the register).
 > transfers served over them; locks by others than the owner once the push's policy check lands; principals' names for
 > people (§4.13); the stock git-lfs client end to end against the daemon (main's).
 >
+> **Status (2026-11-19, A-629 part 3: durable Git LFS objects, the batch API and the transfers served).** A git
+> repository's LFS objects live in its store on the owner shard (`crates/server`, `vcs_store`: `GitStore::lfs`, the
+> index `slates_git::lfs::objects::LfsObjects` over the shard's one content store). An upload is one entry of the
+> repository's logs holding the object's record (`vcs_store::lfs_record`: the oid and the bytes, magic "SGLF"), the
+> index keeping the object between the register's guard and the entry's apply (`repository::push::push_lfs`,
+> `vcs_store::admit_lfs`, the bytes checked against the oid there), so an upload is answered `200` only once its entry
+> is durable, bytes that are not their oid's are `422` with nothing kept or recorded, and an object held already
+> appends nothing. A recovery replays the record into the index through the same check (`vcs_store::replay_lfs`), told
+> from a push's record by its first word. The daemon's edge serves every LFS endpoint (`daemon_edge::ShardLfs`): the
+> batch API and the downloads read the index, each request answered with the seam its endpoint asks (`lfs::answer`:
+> the locks log, or the store's objects). Owed: uploads by others than the owner (the append's owner rule, A-635; such
+> an upload is answered `500` meanwhile); a streaming put, so an upload is not held whole; the stock git-lfs client end
+> to end against a daemon.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
@@ -15013,6 +15027,19 @@ and export by landing).
 > `svn log -v` through the edge over HTTPS. Owed: the other REPORTs, then the update-report for `svn checkout`; a
 > negative `S:limit` is refused (`svn_repos_get_logs5` would read it as two limits); revision properties are written in
 > the green's order where `mod_dav_svn` walks an APR hash.
+>
+> **Status (2026-11-19, A-681, the lender).** Built: a Subversion repository's records (A-655 part 2b's
+> `slates_svn::migration::Repository` in A-662's map) are the read source both front ends read a repository through
+> on its owner shard: `reads::Repository` and `mergeinfo::Contents` over the records (a revision's properties, a
+> property list decoded in place, a text from an offset), a directory's entries from the index's new listing
+> (`Index::children`: the names the index named beneath the directory and beneath each copy's source what stands
+> beneath it comes from, each kept where its own path reads as a node), and `slates-server`'s
+> `vcs_store::svn_view::ServedRecords`, the DAV site's lender, whose `lend_in` the svn:// listener's connection takes
+> its sources from (A-689). Held to the index's oracle (every directory of every generated revision listed as the
+> naive tree holds it, listings through copies counted) and to a repository committed through the owner's step on a
+> daemon's shard, read back through the lender by a depth-1 PROPFIND, a GET and a `log-report`. Owed: the site routed
+> into the daemon's `ToolSites`; a repository's authorization file and a principal's Subversion user, which no
+> record names yet, so the lender gives no read rules (every path the policy lets the principal read).
 >
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
@@ -53337,6 +53364,79 @@ tests' empty store and the SSH tests' probed repository), GAPS (a fixed entry),
   `vcs_ssh/tests/hg.rs` (A-679's site and its start test, which names receive-pack's command too) building the services
   with `ThisShard`; §4.17.2's status (A-654 part 2's and part 3's owed calls, A-651's, A-679's and A-684's lines on
   receive-pack, A-683's status); GAPS (A-654's and A-684's entries, the A-683 entry).
+
+### A-681, the lender — A Subversion repository's records lent as the read source on their owner shard: the records as `reads::Repository` and `mergeinfo::Contents`, a directory's entries from the index's new listing, and the daemon's `ServedRecords` (2026-11-19, g297, UI goal 93 (kiln 51cef9f7); §4.17.4 item 5 "HTTP", item 10 and pieces 7 and 13; A-655 part 2b, A-662, A-553; for A-689's svn:// listener too)
+Applied in the same change to: §4.17.4's status; GAPS (the §4.17.4 entry); `crates/svn` (`index.rs`'s
+`Index::children` and its oracle in `index/tests.rs`; `migration/records.rs`'s `Contents` and `reads::Repository`
+for the records; the index's and the records' module documentation); `crates/server` (`vcs_store/svn_view.rs`, new;
+`vcs_http/svn.rs` without its placeholder stores, `vcs_http.rs`'s `svn` opened to the crate; the site's tests).
+
+- **The listing** (`Index::children`). FSFS keeps a directory's entries; the index keeps none, only each path's
+  history and shape lists (A-553). A directory's entries in a revision are the names the index named directly beneath
+  it, and beneath each copy's source that what stands beneath it comes from, down the chain `shape_above` decides for
+  a name with no history of its own (each source's revision before its copy's, so the chain ends); each name is kept
+  where its own path resolves to a node there. One run of the path map from the directory's path on gives its named
+  children, each child's subtree passed at once by starting after it (`AFTER_SEPARATOR`, the character after `/`), so
+  a listing reads names, never descendants. `None` where nothing, or a file, stands.
+- **The read source** (`migration::Repository`): a revision's properties as held; a property list decoded in place
+  from the bytes held under its identity (FSFS's form, the records' own decoder); a text from an offset to its end,
+  held in one piece; `svn:mergeinfo` from a list; a directory's entries from the listing.
+- **The lender** (`vcs_store::svn_view`): `ServedRecords` lends the DAV site a repository's records on this shard as
+  they stand, with its UUID as text and the owner's wall clock as the instant locks are judged at; `lend_in` is the
+  same over a shard state a caller already holds, for the svn:// listener's connection (A-689; main's ruling: one
+  lender). A repository whose records this shard does not hold is not lent (`503`). No read rules are given: no
+  record names a repository's authorization file or a principal's Subversion user yet, so a principal reads every
+  path the repository's policy lets it read, as `svnserve` reads every path without an `authz-db`. The placeholder
+  stores (`NoSvnStores`) are gone.
+- **Tests and the run.** The index's oracle now lists every directory of every generated revision and holds it equal
+  to the naive tree's, a file's and an absent path's listing none, and its census requires listings that reach a name
+  only through a copy's source (`listed_through_copies`). `the_daemons_lender_serves_a_repositorys_committed_records`
+  makes a Subversion repository on a daemon's shard, commits revision 1 through the owner's step (A-655 part 2b), and
+  reads it from a task on that shard through `ServedRecords`: held (another repository not), the trunk listed with its
+  two children by a PROPFIND at depth 1, a file's text by GET, and the log of every revision by REPORT. macOS arm64,
+  Mac Studio, 2026-11-19/20: kiln r470 (23:58-00:00Z, over main 9ca6e3883) `cargo test --locked -p slates-svn --lib
+  -- index:: migration:: reads:: dav::` 177 of 177 (the server's build refused
+  `HostClock::wall_ns` without its trait in scope: fixed); kiln r479 (00:01-00:04Z) on the fixed tree (crates byte for
+  byte this change's after `cargo fmt`, tree `f7ff212d`): the same 177 of 177, `cargo test --locked -p slates-server
+  --lib -- vcs_http::svn:: --test-threads=4` 6 of 6, `cargo fmt -p slates-svn -p slates-server -- --check` clean.
+- **Owed.** The site in the daemon's `ToolSites` (the next slice); the update-report; a home for a repository's
+  authorization file and a principal's Subversion user; main's runs (clippy, `xtask`, the other platforms,
+  red-checks).
+
+### A-629 part 3 — Durable Git LFS objects: each upload an entry of the repository's logs holding the object's record, kept in its store's LFS index between the guard and the apply, replayed by a recovery; the batch API and the transfers served (2026-11-19, g230, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", §4.17.1 "Durability and residency"; after A-629 part 2c, A-662)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`lfs::objects::LfsObjects::release`
+and its test); `crates/server` (`vcs_store.rs`: `GitStore::lfs`, its release, `admit_lfs`, `LfsAdmitRefused`,
+`lfs_refusal_of`, `lfs_held`, `lfs_bytes`, `replay_lfs` and the replay's dispatch, `ReplayRefused`'s LFS kinds, the module
+doc; `vcs_store/lfs_record.rs` and its tests, new; `repository/push.rs`: `LfsUpload`, `push_lfs`, the `Stored` choice of
+what an entry's objects are, `sealed_record`; `lfs.rs`: `ShardObjects`, `NoLocks`, `answer` choosing its seams by
+endpoint, the module doc, and its tests; `vcs_http/daemon_edge.rs`: `ShardLfs` serving every endpoint; the site's test).
+- **Why.** A-629 part 2c answered the batch API and the transfers `503` at their head: no store on the owner shard kept
+  LFS objects durably, and an upload acknowledged and then forgotten by a restart would leave a pushed pointer naming
+  nothing. A-662 made a repository's store durable through its entries' records; this piece gives LFS objects the same.
+- **The record and its place.** An upload is one entry of the repository's logs that moves no green, holding the
+  object's record alone (`lfs_record`: magic "SGLF", version 1, the oid's 32 bytes, the length, the bytes; every count
+  checked, every malformation refused typed). The entry is recorded though it changes no log: its record is the object.
+  The repository's LFS index keeps the object between the register's guard and the entry's apply, as a git push's store
+  commits its objects there (A-662), with the bytes checked against the oid by LFS's own naming, so a refused guard
+  keeps nothing and a refused object records nothing. The append's choice of what its entry's objects are is one enum
+  (`Stored`: a git push's sealed objects, or an LFS upload), the shape A-687 gives Mercurial's import.
+- **Replay.** A recovery and a rebuild replay each record in log order; a git repository's record is an LFS object's
+  when its first word is "SGLF", replayed into the index through the same check (`replay_lfs`), and otherwise a push's.
+  An object the index holds already is kept as it is, so a replayed record holds one object.
+- **Serving.** `lfs::answer` answers a request with the one seam its endpoint asks, since both read and write the
+  shard's state: the locks API over the locks log, every other endpoint over the store's objects (`ShardObjects`), whose
+  upload appends through `push_lfs` and is answered `200` once the entry is durable; an object held already appends
+  nothing. Refusals in LFS's words: bytes not the oid's `422`, past the budget `507`, any other refusal of the append
+  (its owner rule among them) `500`.
+- **Tests.** `slates-git` `lfs_objects::an_index_given_back_leaves_the_store_holding_nothing`; `slates-server`
+  `vcs_store::lfs_record::tests` (the golden record, told from a push's, every malformation refused);
+  `lfs::tests::an_uploaded_object_is_durable_and_served_after_the_store_is_made_again` (an upload `200` with one record,
+  again with none, the store made again from the logs, the download's bytes and the batch's download action) and
+  `an_upload_whose_bytes_are_not_its_oid_is_refused_and_nothing_is_recorded` (`422`, no record, `404`); the site's
+  `the_daemons_lfs_serves_every_endpoint_deciding_its_status_after_its_body`.
+- **Owed.** Uploads by others than the owner (A-635's policy check, the queue's next piece); a streaming put in
+  `slates-vcs`, so an upload is not held whole and its record not copied whole; the stock git-lfs client end to end
+  against a daemon (the queue's next piece); a snapshot carrying the index by its tables, as A-662 owes for the store.
 
 ### A-687 — An import made durable: its entry holds its record, its phase roots and its bookmarks' greens, and a recovery replays it (2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.3 piece 3, decisions 2 and 3; §4.17.1 "Durability and residency" and shared piece 2; R8; A-635, A-662, A-675, A-678)
 
