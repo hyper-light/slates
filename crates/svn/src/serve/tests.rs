@@ -88,6 +88,8 @@ struct Fixture {
   authz: Authz,
   /// The instant every call hands over, at which locks are judged: [`NOW`] unless a test moves it.
   now: AprTime,
+  /// Where a commit's new texts go.
+  texts: crate::commit::drive::HeldTexts,
 }
 
 /// The fixtures' repository built.
@@ -99,6 +101,7 @@ fn fixture() -> Fixture {
     locks: LockTable::new(),
     authz: Authz::parse(AUTHZ, None, authz::Bounds::of(AUTHZ, None)).unwrap(),
     now: NOW,
+    texts: crate::commit::drive::HeldTexts::new(),
   }
 }
 
@@ -124,6 +127,7 @@ impl Fixture {
         authz: Some((&self.authz, b"repo")),
         filesystem: "repo",
       },
+      texts: &self.texts,
     }
   }
 }

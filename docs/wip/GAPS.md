@@ -2023,7 +2023,17 @@
 > slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs): owed, the piece and the
 > window sliced to the slice. **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
 > refused E210009 by one request's room over svn:// and DAV (rule 2), and below that room `commit::drive::Work::texts`
-> holds every new text whole (rule 1, by reading); owed, w-svn's next piece. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> holds every new text whole (rule 1, by reading); owed, w-svn's next piece. **Intake, part 1 (same day, w-svn, on w-perf's seam):**
+> the commit drive applies each svndiff window into one window's room and hands it to the caller's
+> `commit::drive::TextSink` (stage, append, seal), naming the text (BLAKE3) and checking its MD5 and SHA-1 as the
+> windows pass, so it holds the window being read and no text; `Work::texts` names identities, `Revision::of_work`
+> reads them back from the sink, and a sink's refusal is the shard's room (`NoRoom`, E160000), never a request's.
+> Every edge lends one: the listener's connection, the tunnel's session, each DAV commit (`DavCommit` owns it and hands
+> it out with the accepted work). The green's staging (`slates_merge` `Green::stage`, `append_staged`, `seal_staged`,
+> `discard_staged`) landed first. Held by `a_text_larger_than_the_request_room_is_streamed_into_the_sink_and_accepted`
+> (a 1 MB text through a 256 KB room: red E210009 before). Owed: the server's sink over the green's staged blocks
+> (w-perf; until then `HeldTexts` keeps them in memory per connection), the revision's record and log reading the held
+> texts by identity (w-perf's c2, c3), and the by-use 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
