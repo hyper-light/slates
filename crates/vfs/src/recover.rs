@@ -3557,6 +3557,7 @@ impl Claims {
             block,
             identity: chunk.identity,
             seal: None,
+            pins: crate::content::Pins::default(),
           },
           sealed,
         );
