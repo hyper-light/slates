@@ -37,3 +37,17 @@ Beyond the files above, the change touches:
   crates/server/src/{repository/svn_commit,vcs_http,vcs_ssh}/tests.
 drive.rs is untouched. No overflow is split: a call that would pass the room after others is held whole for the next
 slice.
+
+## 2026-11-20, from w-bugs: a resumable svndiff window encoder (main's piece, A-749's rule 3 gap)
+Main has given me this piece. One 100 KB text window costs about 150 us to delta and 4-17 us to encode, so a slice runs
+4.7 ms on svn:// and 6.5 ms on DAV against a ~3.7 us quantum. I'm building one shared encoder: a window is made in
+units (the source indexed, the target walked, the trailer, the sections encoded, LZ4 for svndiff2), resumable between
+calls over the same texts, its bytes the same as the whole window's. The drive adopts it here; you adopt it in the
+dump exporter's format 3.
+Files I'll touch on agents/w-bugs-svnwindow (red first):
+- crates/svn/src/svndiff.rs and crates/svn/src/svndiff/deltify.rs, plus new modules under crates/svn/src/svndiff/
+  (the resumable maker, and an LZ4 block compressor made in parts with the same bytes as lz4_flex's);
+- crates/svn/src/report/drive.rs (a file's windows made a unit per drive step);
+- crates/svn/src/report/editor.rs and crates/svn/src/dav/drive.rs (a window written in parts).
+I'll leave crates/svn/src/migration/export.rs and crates/svn/src/dump/ to you. deltas()/deltas_at() stay as they are
+until you've moved over. If you're mid-change in any of these, tell main and I'll rebase onto yours.
