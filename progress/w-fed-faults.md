@@ -3,8 +3,11 @@
   live-shipped + shared with every member at making; isolated move refused [kind: isolated]); slates a5140de.
 - PROVEN on macOS with kiln alone: killed flow (owner's runner stopped, mounts gone, instance SIGKILLed; survivors
   served 8/8), cut-off flow, slow-link flow (refused by kind unplaced).
-- IN FLIGHT: kiln run r23 on adacachy (linux/amd64): the four signalling flows over the A-750 code (synced from
-  worktree ~/slates-work/w-fed-faults-a750, same code as ed8991d). On its end: fix what fails, land, report.
+- BLOCKED (infrastructure, ~16:30Z): the Linux run of the four signalling flows. r23 failed to build (a sync from a
+  worktree didn't carry vendor/aws-lc-rs; syncing from ~/slates-work/w-fed-faults-kiln-clone fixes it, r26 checked).
+  r27 lost (adacachy's runner restarted), r28/r29 lost, then the kiln server stopped answering. Next: when kiln answers,
+  merge origin/main in the clone, rerun the same command from the clone on adacachy (needs linux/amd64), fix, land.
+  Pushing also goes through kiln (b24c5c95 ship route): this file's update is local only until then.
 - Forward-lane log flood: g226's (main's word).
 
 - Answered w-balance Q3 (inbox 2cf8325).
