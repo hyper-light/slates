@@ -435,6 +435,9 @@ fn serve_with<P: PackSource>(
     (Version::V0 | Version::V1, Asked::Advertise) => v0::advertisement(served, version, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
+    (Version::V0 | Version::V1, Asked::Request(bytes)) if turns => {
+      v0::answer_in_turns::<P>(served, bytes, admission).map_err(Refused::plain)
+    }
     (Version::V0 | Version::V1, Asked::Request(bytes)) => {
       v0::answer(served, bytes, packs, admission).map_err(Refused::plain)
     }

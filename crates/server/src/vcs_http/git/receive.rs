@@ -115,6 +115,7 @@ impl<L: ShardLender + Clone> GitServices for ReceiveServices<L> {
       sent: 0,
       answering: false,
       keepalive_ns: self.keepalive_ns,
+      last_written_ns: slates_rt::futures::now_ns(),
     })
   }
 }
@@ -138,9 +139,24 @@ pub(crate) struct Receive<L> {
   answering: bool,
   /// How long the answer may write nothing before git's keepalive is written.
   keepalive_ns: u64,
+  /// When the exchange last wrote: its head, or an interim keepalive while its body was read.
+  last_written_ns: u64,
 }
 
 impl<L: ShardLender> Exchange for Receive<L> {
+  /// git's keepalive while the push's pack is still being read (A-722; the module doc): once its commands show
+  /// side-band-64k, whenever the keepalive interval has passed since the exchange last wrote.
+  fn interim(&mut self, out: &mut Vec<u8>) {
+    if self.advertise || !self.push.side_band() {
+      return;
+    }
+    let now = slates_rt::futures::now_ns();
+    if now.saturating_sub(self.last_written_ns) >= self.keepalive_ns {
+      out.extend_from_slice(KEEPALIVE);
+      self.last_written_ns = now;
+    }
+  }
+
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     // An advertisement's request is a `GET`, whose body asks nothing: `http-backend` reads none for it.
     if self.advertise {

@@ -42,6 +42,8 @@ cc = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 # The hermeticity tracer names the daemon's own socket node by the route's own path function (A-161).
 slates-ipc = { workspace = true }
+# The suites' wait judgment the harness shares lists a process's children (`proc_listchildpids`).
+libc = { workspace = true }
 
 [dev-dependencies]
 # Exercise the harness's mount source against the real daemon without a privileged kernel mount.

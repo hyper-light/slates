@@ -53,6 +53,7 @@
 
 pub mod attribution;
 pub mod bench;
+pub mod budgets;
 pub mod build_cost;
 pub mod clock;
 pub mod derived;

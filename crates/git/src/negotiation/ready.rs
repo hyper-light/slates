@@ -67,24 +67,6 @@ pub(super) fn generation<S: Graph>(graph: &S, node: S::Node) -> u64 {
   graph.commit(node).map_or(0, |row| row.generation)
 }
 
-/// Whether the server is ready: there is a common have, and every want, but those `answered` by a run of versions,
-/// reaches a commit the client has. The search done whole ([`Readying`] stepped to its end).
-pub(super) fn is_ready<S: Graph>(
-  graph: &S,
-  wants: &[S::Node],
-  answered: &[S::Node],
-  common: &[S::Node],
-  admission: &mut Admission,
-  counters: &mut Counters,
-) -> Result<bool, Refusal> {
-  let mut readying = Readying::begin(graph, common, admission)?;
-  loop {
-    if let Some(ready) = readying.unit(graph, wants, answered, admission, counters)? {
-      return Ok(ready);
-    }
-  }
-}
-
 /// The commits the client has as git marks them `THEY_HAVE`: each common have that is a commit, and its parents.
 fn they_have<S: Graph>(
   graph: &S,
