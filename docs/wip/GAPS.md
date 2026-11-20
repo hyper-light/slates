@@ -45,7 +45,9 @@
 > shard). **Closed quiet by A-400** (a work on its client's shard): Linux arm64 accept p50 51–55 → 20–21 µs (before W1
 > 18), the Mac 155 → 40–43 (before W1 48–54); loaded on Linux main is three times lower than before W1 (p99 21.0 →
 > 4.6–7.0 ms). **Open:** (a) about 10 µs added to every quiet lone submit since A-400 (Linux accept p50 20–21 → 31–35
-> µs, conflict 17–18 → 27–28; in `f2081a3c8..a5233e228`, bisect under way); (b) the shared Mac loaded, where main is
+> µs, conflict 17–18 → 27–28; bisected over `f2081a3c8..a5233e228`: small steps, the reproducible ones in code a submit
+> never runs, so the release build's layout, not a fix to find; an instruction-count gate on the lone submit is owed
+> to hold it); (b) the shared Mac loaded, where main is
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
 >
@@ -1827,6 +1829,12 @@
 > 300 generated `.hgtags` sequences and to `hg log -r` on a recorded repository). Owed: a branch made at a changeset no
 > line or bookmark heads (a tag inside a line's history), refused `Unsupported` until a green can be branched at the
 > version whose head it was.
+> FIXED by use (w-hg's r15, 2026-11-20, release at 1d4909821): `hg clone -r default` of hg's own history aborted
+> `PastAdmission { asked: 179155, left: 85302 }`. The served `lookup`'s tag step reads each head's manifest for its
+> `.hgtags`, charged to what the request left of the edge's room. Both edges now admit a whole answer (`lookup`,
+> `heads`, a batch) the room a fetch's turn is (`HgStores::fetch_turn`, the owner shard's `vcs_share::room`), as A-745
+> admits each streamed turn and 4136fcd89 admits git's upload-pack answer. Red first:
+> `vcs_http::hg::tests::a_lookup_is_answered_within_a_fetchs_room_not_its_requests`.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
