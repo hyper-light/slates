@@ -1812,6 +1812,13 @@ impl Repository {
     })
   }
 
+  /// The bytes `green`'s version `version`'s two fragments hold, their parts' lengths as encoded (the pack bytes a clone
+  /// copies of them); `None` while they are not kept.
+  pub fn fragments_len(&self, green: u64, version: usize) -> Option<u64> {
+    let fragments = self.version_record(green, version).ok()?.fragments.as_ref()?;
+    Some(fragments.objects.len.saturating_add(fragments.blobs.len))
+  }
+
   /// Every version whose fragments are kept, by green and then version, with the bytes dropping
   /// them gives back: their content and what their entries are charged (A-724 piece 4): what a repository over its memory share may drop, since a version
   /// whose fragments are gone is encoded again by the next fetch (A-718), as after a recovery.
