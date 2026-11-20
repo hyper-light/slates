@@ -8757,6 +8757,83 @@ fn a_forward_is_never_refused_below_its_paths_floor() {
   assert_answered_at_the_paths_floor(&answer, (took, slo), &counters);
 }
 
+/// Shape: the forwards [`a_lane_measured_past_the_failover_delay_logs_it_once`] makes through b, one after another: enough
+/// that a line a forward (the flood's rate) and a line a lane are told apart many times over.
+const FLOOR_FORWARDS: u64 = 40;
+
+/// Format: b's count of its lanes' floors crossing past the failover delay (`forward_lane::note_floor`).
+const FLOOR_PAST_SLO: &str = "fleet.forward.floor_past_slo";
+/// Format: b's count of the log lines it wrote about its lanes' floors (`forward_lane::note_floor`).
+const FLOOR_LOGGED: &str = "fleet.forward.floor_logged";
+
+/// CLAUDE.md §2 item 8 (no unbounded log), found by w-fed-faults' flows (2026-11-20): a lane whose path's floor is past the
+/// failover delay says so once, not once a forward. Do: three nodes whose failover delay is held at one liveness budget
+/// (injected, A-363), below the path's floor on loopback (about 2 to 3 s); a volume on a; through b, [`FLOOR_FORWARDS`]
+/// status reads of it, one after another, each a forward to a on its own lane turn. Expect b to count the floor crossing
+/// past the delay once and one line about it (`fleet.forward.floor_past_slo`, `fleet.forward.floor_logged`). Before, a
+/// lane left with nothing was dropped and the next forward made it afresh, its floor measured from nothing, so every
+/// forward crossed the delay again and logged a line: about a million lines, 260 MB, in one flow.
+#[test]
+fn a_lane_measured_past_the_failover_delay_logs_it_once() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  for daemon in &daemons {
+    daemon
+      .inject_failover(Some(LIVENESS_BUDGET_NS))
+      .expect("the failover delay is held on each node");
+  }
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "floor-once", &daemons);
+  let mut router = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut router, volume, COUNCIL_RETIRE_DEADLINE);
+  let before = summed_counters(&daemons[1]);
+  let answered = (0..FLOOR_FORWARDS)
+    .filter(|_| {
+      matches!(
+        router.call(&RequestBody::Status { volume }),
+        ReplyBody::Status { .. }
+      )
+    })
+    .count();
+  let after = summed_counters(&daemons[1]);
+  drop(router);
+  drop(owner);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let grew = |name: &str| count_of(&after, name).saturating_sub(count_of(&before, name));
+  let (crossed, logged) = (
+    count_of(&after, FLOOR_PAST_SLO),
+    count_of(&after, FLOOR_LOGGED),
+  );
+  eprintln!(
+    "{answered} of {FLOOR_FORWARDS} reads answered through b; b's floor crossed past the delay {crossed} times ({} in \
+     the reads), {logged} lines ({} in the reads)",
+    grew(FLOOR_PAST_SLO),
+    grew(FLOOR_LOGGED)
+  );
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert_eq!(
+    u64::try_from(answered).unwrap(),
+    FLOOR_FORWARDS,
+    "every read was answered"
+  );
+  assert_eq!(crossed, 1, "the lane's floor crossed past the delay once");
+  assert_eq!(logged, 1, "one line said so");
+}
+
 /// The probe through b's deaf session: answered on the replacement session, never refused below its path's floor;
 /// answered past its failover SLO `slo`, so the floor is what held it; and b's `counters` show the deaf session dropped
 /// and the probe's bound held at the path's measured floor.
@@ -13775,8 +13852,12 @@ const BUILT_VOLUME_FILES: usize = 1536;
 const BUILT_VOLUME_LIMIT: u64 = 16 << 20;
 /// Shape: the writers that write while the whole entry seals, each one file.
 const BUILT_WRITERS: usize = 8;
-/// Shape: the pieces the whole entry spans at least: the content's mebibytes.
-const BUILT_PIECES: u64 = 3;
+/// Derived: the turns the whole entry's build takes at least under the cut quantum: the content's bytes over one archive
+/// page (`slates_archive::format::MAX_BASE_PAGE_BYTES`), the piece a turn seals when its quantum is spent (w-forming,
+/// 2026-11-20). Until then a turn sealed a whole archive chunk (a MiB) however small its quantum: 87 to 302 ms of the
+/// owner shard's CPU a turn against quanta of 14 to 784 us in a debug fleet under `taskpolicy -b`.
+const BUILT_PIECES: u64 = (BUILT_VOLUME_FILES * BURST_VOLUME_FILE_BYTES) as u64
+  / slates_archive::format::MAX_BASE_PAGE_BYTES;
 /// Format: the owner's counts of whole entries sealed in turns, of their turns, and of the publications queued behind
 /// them (`live_ship::begin_whole_build`, `advance_whole_build`, `queue_behind_build`).
 const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
@@ -13931,7 +14012,7 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
   assert!(builds >= 1, "the whole entry was sealed in turns");
   assert!(
     turns >= BUILT_PIECES,
-    "the whole entry was sealed a piece a turn: {turns} turns for at least {BUILT_PIECES} pieces"
+    "the whole entry was sealed a page a turn under the cut quantum: {turns} turns for at least {BUILT_PIECES} pages"
   );
   assert!(
     queued >= 1,
@@ -21742,6 +21823,182 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
     "composed on B's replica: {composed_here}"
   );
   assert_eq!(copied, Ok(b"hello".to_vec()), "A's green holds the copy");
+}
+
+/// A-697 part e2 (a holder creation a restart caught waiting for its admission releases the owner's floor before it is
+/// dropped): on a settled three-node fleet at `f = 1` whose nodes keep their state across a restart, A owns a green at
+/// version 1 shared with B, and B serves works over greens A owns (the test hook). Do: B loses the next admission its
+/// owner answers, so a creation's answer is lost after A recorded the work's floor; restart B over its own segment; then
+/// create a work of the same name on B. Expect: the lost creation answered retryable and A holding a floor for a work
+/// whose id names B; after the restart A's floor for that work released (B's counter moved), never left holding the
+/// green's history; the name made again on B, at a new id.
+#[test]
+fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["holder-release-a", "holder-release-b", "holder-release-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("holder-release-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(
+        &format!("holder-release-{node}-{pid}"),
+        profile,
+        &configs[node],
+      )
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let (green, owners_work) = green_and_work_on(daemons[0].instance(), &[&daemons[1]]);
+  let mut owner = Client::connect(daemons[0].instance());
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  drop(owner);
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let replicated = poll_until(&refs, PLACEMENT_DEADLINE, || {
+    Ok(daemons[1].merge_holder_state(green)?.version == Some(1))
+  });
+  assert!(replicated, "B replicates the green at version 1");
+  daemons[1].serve_works_on_holders(true).unwrap();
+  for partition in 0..u16::try_from(daemons[1].shards().len()).unwrap() {
+    daemons[1].lose_next_owner_answer(partition).unwrap();
+  }
+  let floors_before = daemons[0].work_floors_of(green).unwrap();
+  let mut holder = Client::connect(daemons[1].instance());
+  let lost = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "held-work".to_owned(),
+  });
+  drop(holder);
+  let floors_after_loss = daemons[0].work_floors_of(green).unwrap();
+  let admitted: Vec<VolumeId> = floors_after_loss
+    .iter()
+    .filter(|floor| !floors_before.contains(floor))
+    .map(|(work, _)| *work)
+    .collect();
+  daemons.remove(1).stop();
+  daemons.insert(
+    1,
+    start_fleet_node(
+      &profiles[1],
+      configs[1].clone(),
+      identities[1].pop().unwrap(),
+      ports[1],
+      peers(1),
+      source(1),
+    ),
+  );
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let released = poll_until(&refs, PLACEMENT_DEADLINE, || {
+    let floors = daemons[0].work_floors_of(green)?;
+    Ok(
+      admitted
+        .iter()
+        .all(|work| floors.iter().all(|(held, _)| held != work)),
+    )
+  });
+  let released_count = daemons[1]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("merge.work.admission_released").copied());
+  daemons[1].serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemons[1].instance());
+  let made = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "held-work".to_owned(),
+  });
+  drop(holder);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(
+      lost,
+      ReplyBody::Refused {
+        refusal: Refusal::Overloaded { .. }
+      }
+    ),
+    "the creation's answer was lost: {lost:?}"
+  );
+  assert_eq!(
+    admitted.len(),
+    1,
+    "A recorded the lost creation's floor: {floors_after_loss:?}"
+  );
+  assert!(released, "A released the floor after B's restart");
+  assert!(
+    matches!(released_count, Ok(Some(count)) if count >= 1),
+    "B released it: {released_count:?}"
+  );
+  assert!(
+    matches!(&made, ReplyBody::WorkCreated { id, base: 1 } if !admitted.contains(id)),
+    "the name made again, at a new id: {made:?}"
+  );
 }
 
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447

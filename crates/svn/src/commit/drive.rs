@@ -546,11 +546,19 @@ pub enum DriveRefusal {
     /// The path, lossily.
     path: String,
   },
-  /// The work's new texts and property lists past [`Setup::room`].
+  /// The work's property lists and its open deltas' unread svndiff past [`Setup::room`].
   Room {
     /// The room.
     room: usize,
   },
+  /// The shard has no room for a new text's bytes (§4.17.1 rule 2: refused by the shard's room, never a request's),
+  /// answered as the commit step answers it (`repository::svn_commit`'s `Budget`).
+  NoRoom {
+    /// The bytes the shard could still take.
+    available: u64,
+  },
+  /// The text sink refused a text: its table of held texts at its room, or a text it does not know.
+  TextRefused,
   /// The digest library failed, which no input causes.
   DigestFailed,
   /// An added path holding a control character (`path.c` `svn_path_check_valid`).
@@ -614,6 +622,7 @@ impl DriveRefusal {
       Self::LockTokens(refusal) => refusal.subversion_code(),
       Self::PathSyntax { .. } => SVN_ERR_FS_PATH_SYNTAX,
       Self::Room { .. } => SVN_ERR_RA_SVN_REQUEST_SIZE,
+      Self::NoRoom { .. } | Self::TextRefused => SVN_ERR_FS_GENERAL,
       Self::DigestFailed => SVN_ERR_BASE,
       Self::ControlCharacter { .. } => SVN_ERR_FS_PATH_SYNTAX,
       Self::NotRegular { .. } => SVN_ERR_REPOS_BAD_ARGS,
@@ -762,8 +771,8 @@ pub struct Pending<'drive> {
   pub revision_properties: &'drive [(Vec<u8>, Vec<u8>)],
   /// Its changed-path rows so far, by path.
   pub rows: &'drive BTreeMap<String, ChangedPath>,
-  /// The texts it made, by identity.
-  pub texts: &'drive BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts it made, by identity: their bytes are the caller's sink's ([`TextSink`]).
+  pub texts: &'drive std::collections::BTreeSet<ContentIdentity>,
   /// The property lists it made, by identity, each sorted by name.
   pub property_lists: &'drive BTreeMap<ContentIdentity, PropertyPairs>,
   /// The session's path in the repository, which the client's paths are relative to.
@@ -807,8 +816,8 @@ pub struct Work {
   /// (`serve.c` 1526-1541), each name once in name order; the ephemeral `svn:txn-` properties the client sent are
   /// dropped once pre-commit passed, as `svn_repos_fs_commit_txn` drops them before it commits (`fs-wrap.c` 72-89).
   pub revision_properties: Vec<(Vec<u8>, Vec<u8>)>,
-  /// The texts the work made, by identity.
-  pub texts: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts the work made, by identity: sealed in the caller's sink ([`TextSink`]), which holds their bytes.
+  pub texts: std::collections::BTreeSet<ContentIdentity>,
   /// The property lists the work made, by identity, each sorted by name.
   pub property_lists: BTreeMap<ContentIdentity, PropertyPairs>,
   /// The commit's locks: who commits, the tokens it presented and whether it keeps them, which the owner's step judges
@@ -869,10 +878,16 @@ struct Delta {
   pending: Vec<u8>,
   /// The text it applies to: its identity, or `None` for an empty one.
   source: Option<ContentIdentity>,
-  /// The new text, as written so far.
-  target: Vec<u8>,
+  /// The new text in the caller's sink, a window appended as each is applied.
+  staged: StagedText,
+  /// The new text's bytes so far.
+  size: u64,
+  /// The window being made, its room reused.
+  window: Vec<u8>,
   /// Its MD5 and SHA-1, taken as it is written.
   digests: Digests,
+  /// Its identity (BLAKE3, the records' rule), taken as it is written.
+  namer: blake3::Hasher,
 }
 
 /// A file token's file (`commit.c` `struct file_baton`).
@@ -1310,11 +1325,11 @@ pub struct Drive {
   tokens: BTreeMap<Vec<u8>, Baton>,
   /// The changed-path rows, one per path, folded as FSFS folds them.
   rows: BTreeMap<String, ChangedPath>,
-  /// The texts the work made.
-  texts: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts the work made, sealed in the caller's sink.
+  texts: std::collections::BTreeSet<ContentIdentity>,
   /// The property lists the work made.
   property_lists: BTreeMap<ContentIdentity, PropertyPairs>,
-  /// The bytes held: the work's texts and property lists, and its open deltas'.
+  /// The bytes held: the work's property lists and its open deltas' unread svndiff; its texts are the sink's.
   held: usize,
   /// The kinds of the nodes the drive deleted and then replaced, by path, for a deletion of the replacement.
   replaced: BTreeMap<String, NodeKind>,
@@ -1331,7 +1346,7 @@ impl Drive {
       base: 0,
       tokens: BTreeMap::new(),
       rows: BTreeMap::new(),
-      texts: BTreeMap::new(),
+      texts: std::collections::BTreeSet::new(),
       property_lists: BTreeMap::new(),
       held: 0,
       replaced: BTreeMap::new(),
@@ -1348,6 +1363,7 @@ impl Drive {
     index: &Index,
     green: &G,
     locks: &LockTable,
+    texts: &dyn TextSink,
     item: &Value<'_>,
     out: &mut Vec<u8>,
   ) -> Result<Step, ItemError> {
@@ -1371,6 +1387,7 @@ impl Drive {
       index,
       green,
       locks,
+      texts,
     };
     let outcome = self.run(&world, &command);
     self.answer(outcome, out)
@@ -1389,6 +1406,7 @@ impl Drive {
     index: &Index,
     green: &G,
     locks: &LockTable,
+    texts: &dyn TextSink,
     answer: Result<(), Vec<(u32, String)>>,
     out: &mut Vec<u8>,
   ) -> Result<Step, ItemError> {
@@ -1408,6 +1426,7 @@ impl Drive {
         index,
         green,
         locks,
+        texts,
       }),
     };
     self.answer(outcome, out)
@@ -1435,6 +1454,7 @@ impl Drive {
     index: &Index,
     green: &G,
     locks: &LockTable,
+    texts: &dyn TextSink,
     command: &EditCommand<'_>,
   ) -> Edited {
     if self.phase != Phase::Driving {
@@ -1445,6 +1465,7 @@ impl Drive {
       index,
       green,
       locks,
+      texts,
     };
     let outcome = self.run(&world, command);
     self.edited(outcome)
@@ -1456,6 +1477,7 @@ impl Drive {
     index: &Index,
     green: &G,
     locks: &LockTable,
+    texts: &dyn TextSink,
     answer: Result<(), Vec<(u32, String)>>,
   ) -> Edited {
     let Phase::Waiting(pause) = self.phase else {
@@ -1473,6 +1495,7 @@ impl Drive {
         index,
         green,
         locks,
+        texts,
       }),
     };
     self.edited(outcome)
@@ -1621,6 +1644,10 @@ impl Drive {
         format!("Commit rejected because mergeinfo on '{path}' is syntactically invalid")
       }
       DriveRefusal::Unwritable | DriveRefusal::Unreadable => "Access denied".to_owned(),
+      DriveRefusal::NoRoom { available } => {
+        format!("No room for the commit: {available} bytes available")
+      }
+      DriveRefusal::TextRefused => "The repository could not keep a new text".to_owned(),
       DriveRefusal::Room { .. } => {
         "The client request size exceeds the configured limit".to_owned()
       }
@@ -1730,8 +1757,8 @@ impl Drive {
         file,
         base_checksum,
       } => self.apply_textdelta(world, file, base_checksum),
-      EditCommand::TextdeltaChunk { file, chunk } => self.textdelta_chunk(world.green, file, chunk),
-      EditCommand::TextdeltaEnd { file } => self.textdelta_end(world.green, file),
+      EditCommand::TextdeltaChunk { file, chunk } => self.textdelta_chunk(world, file, chunk),
+      EditCommand::TextdeltaEnd { file } => self.textdelta_end(world, file),
       EditCommand::ChangeFileProp { file, name, value } => {
         let path = self.file(file)?.path.clone();
         self.check_written(file, &path)?;
@@ -2080,12 +2107,16 @@ impl Drive {
         .into(),
       );
     }
+    let staged = world.texts.stage().map_err(DriveRefusal::from)?;
     let delta = Delta {
       decoder: Decoder::new(),
       pending: Vec::new(),
       source: node.text.map(|text| text.identity),
-      target: Vec::new(),
+      staged,
+      size: 0,
+      window: Vec::new(),
       digests: Digests::new()?,
+      namer: blake3::Hasher::new(),
     };
     if let Some(Baton::File(file)) = self.tokens.get_mut(token) {
       file.delta = Some(Box::new(delta));
@@ -2096,7 +2127,7 @@ impl Drive {
   /// `textdelta-chunk` (`editorp.c` 788-805): the chunk read on, every whole window applied to the file's text.
   fn textdelta_chunk<G: Green + ?Sized>(
     &mut self,
-    green: &G,
+    world: &World<'_, G>,
     token: &[u8],
     chunk: &[u8],
   ) -> Result<Outcome, Stop> {
@@ -2112,20 +2143,18 @@ impl Drive {
     else {
       return Err(Stop::Close);
     };
-    let before = delta.pending.len().saturating_add(delta.target.len());
+    let before = delta.pending.len();
     delta.pending.extend_from_slice(chunk);
     let source = match delta.source {
-      Some(identity) => texts
-        .get(&identity)
-        .map(|text| std::borrow::Cow::Borrowed(text.as_slice()))
-        .or_else(|| green.text(&identity)),
+      Some(identity) if texts.contains(&identity) => world.texts.sealed(&identity),
+      Some(identity) => world.green.text(&identity),
       None => Some(std::borrow::Cow::Borrowed(&[][..])),
     };
     let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(
       IndexRefusal::Corrupt,
     )))?;
-    read_windows(delta, &source)?;
-    let after = delta.pending.len().saturating_add(delta.target.len());
+    read_windows(delta, &source, world.texts)?;
+    let after = delta.pending.len();
     let held = held.saturating_sub(before).saturating_add(after);
     if held > room {
       return Err(DriveRefusal::Room { room }.into());
@@ -2135,7 +2164,11 @@ impl Drive {
   }
 
   /// `textdelta-end` (`editorp.c` 808-826): the delta must end whole; the new text named, kept and declared.
-  fn textdelta_end<G: Green + ?Sized>(&mut self, green: &G, token: &[u8]) -> Result<Outcome, Stop> {
+  fn textdelta_end<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    token: &[u8],
+  ) -> Result<Outcome, Stop> {
     let Some(Baton::File(file)) = self.tokens.get_mut(token) else {
       return Err(Stop::Close);
     };
@@ -2145,17 +2178,19 @@ impl Drive {
     let path = file.path.clone();
     delta.decoder.finish(&delta.pending)?;
     let (md5, sha1) = delta.digests.finish()?;
-    let size = u64::try_from(delta.target.len()).map_err(|_| DriveRefusal::Room {
-      room: self.setup.room,
-    })?;
-    let identity = green.name_text(&delta.target);
+    let identity = *delta.namer.finalize().as_bytes();
+    world
+      .texts
+      .seal(delta.staged, identity)
+      .map_err(DriveRefusal::from)?;
     let text = Text {
       identity,
       md5,
       sha1,
-      size,
+      size: delta.size,
     };
-    self.texts.insert(identity, delta.target);
+    self.held = self.held.saturating_sub(delta.pending.len());
+    self.texts.insert(identity);
     self.record(&path, NodeKind::File, |row| row.text = Some(text));
     Ok(Outcome::Taken)
   }
@@ -2561,6 +2596,8 @@ struct World<'w, G: ?Sized> {
   green: &'w G,
   /// The lock table.
   locks: &'w LockTable,
+  /// Where its new texts go.
+  texts: &'w dyn TextSink,
 }
 
 /// What a command came to.
@@ -2589,9 +2626,14 @@ fn deletion(path: &str, kind: NodeKind) -> ChangedPath {
   }
 }
 
-/// Reads every whole part of a delta's pending bytes, applying each window to `source` and taking the new bytes into
-/// the digests.
-fn read_windows(delta: &mut Delta, source: &[u8]) -> Result<(), DriveRefusal> {
+/// Reads every whole part of a delta's pending bytes, applying each window to `source` into one window's room, taking
+/// its new bytes into the digests and the name, and handing them to `texts` at once (§4.17.1 rule 1: the drive holds a
+/// window, never the text).
+fn read_windows(
+  delta: &mut Delta,
+  source: &[u8],
+  texts: &dyn TextSink,
+) -> Result<(), DriveRefusal> {
   let mut consumed_total = 0_usize;
   loop {
     let rest = delta.pending.get(consumed_total..).unwrap_or_default();
@@ -2601,11 +2643,15 @@ fn read_windows(delta: &mut Delta, source: &[u8]) -> Result<(), DriveRefusal> {
         let offset =
           usize::try_from(window.source_offset).map_err(|_| SvndiffError::SourceShort)?;
         let view = source.get(offset..).unwrap_or_default();
-        let start = delta.target.len();
-        svndiff::apply(&window, view, &mut delta.target)?;
-        delta
-          .digests
-          .update(delta.target.get(start..).unwrap_or_default())?;
+        delta.window.clear();
+        svndiff::apply(&window, view, &mut delta.window)?;
+        delta.digests.update(&delta.window)?;
+        delta.namer.update(&delta.window);
+        texts
+          .append(delta.staged, &delta.window)
+          .map_err(DriveRefusal::from)?;
+        let made = u64::try_from(delta.window.len()).map_err(|_| SvndiffError::SourceShort)?;
+        delta.size = delta.size.saturating_add(made);
         consumed_total = consumed_total.saturating_add(consumed);
       }
       Decoded::NeedMore { .. } => break,
@@ -2842,6 +2888,18 @@ fn write_failure_words(code: u32, message: &str, out: &mut Vec<u8>) -> Result<()
     &Value::List(vec![Value::Word(FAILURE), Value::List(vec![error])]),
     out,
   )
+}
+
+mod texts;
+pub use texts::{HeldTexts, StagedText, TextRefused, TextSink};
+
+impl From<TextRefused> for DriveRefusal {
+  fn from(refused: TextRefused) -> Self {
+    match refused {
+      TextRefused::Room { available } => DriveRefusal::NoRoom { available },
+      TextRefused::Held | TextRefused::Unknown => DriveRefusal::TextRefused,
+    }
+  }
 }
 
 #[cfg(test)]

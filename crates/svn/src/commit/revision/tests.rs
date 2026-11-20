@@ -52,7 +52,7 @@ fn work() -> Work {
       ),
       (b"svn:log".to_vec(), b"an edit".to_vec()),
     ],
-    texts: BTreeMap::from([(TEXT_IDENTITY, b"alpha\n".to_vec())]),
+    texts: std::collections::BTreeSet::from([TEXT_IDENTITY]),
     property_lists: BTreeMap::from([(
       LIST_IDENTITY,
       vec![(b"svn:eol-style".to_vec(), b"native".to_vec())],
@@ -61,13 +61,23 @@ fn work() -> Work {
   }
 }
 
+/// The sink holding the work's text sealed, as the drive leaves it.
+fn sealed() -> crate::commit::drive::HeldTexts {
+  use crate::commit::drive::TextSink;
+  let texts = crate::commit::drive::HeldTexts::new();
+  let staged = texts.stage().unwrap();
+  texts.append(staged, b"alpha\n").unwrap();
+  texts.seal(staged, TEXT_IDENTITY).unwrap();
+  texts
+}
+
 /// A-655 (`transaction.c` `write_final_revprop` 3617-3630; `fs-wrap.c` 151-152; `time.c` `svn_time_to_cstring`). Do:
 /// make the work into a revision at the owner's instant 2026-11-19T07:26:35.123456Z. Expect: its `svn:date` that instant
 /// as `svn_time_to_cstring` writes it, in place of the date the client sent; its author and log the work's; the date
 /// and author `commit-info` carries read back.
 #[test]
 fn a_work_is_dated_by_the_owners_instant_at_the_step() {
-  let revision = Revision::of_work(work(), NOW).unwrap();
+  let revision = Revision::of_work(work(), NOW, &sealed()).unwrap();
   let expected = Properties::from([
     (b"svn:author".to_vec(), b"alice".to_vec()),
     (
@@ -90,7 +100,7 @@ fn a_work_is_dated_by_the_owners_instant_at_the_step() {
 #[test]
 fn a_works_contents_and_entries_are_the_revisions() {
   let made = work();
-  let revision = Revision::of_work(made.clone(), NOW).unwrap();
+  let revision = Revision::of_work(made.clone(), NOW, &sealed()).unwrap();
   let text = revision.contents.get(&TEXT_IDENTITY).cloned();
   assert_eq!(text, Some(b"alpha\n".to_vec()));
   let list = revision
@@ -109,7 +119,7 @@ fn a_works_contents_and_entries_are_the_revisions() {
 #[test]
 fn an_instant_before_1970_is_refused() {
   let before = AprTime(-1);
-  let refusal = Revision::of_work(work(), before).unwrap_err();
+  let refusal = Revision::of_work(work(), before, &sealed()).unwrap_err();
   let answered = (refusal.subversion_code(), refusal.message());
   assert_eq!(answered, (160_000, "General filesystem error".to_owned()));
   assert_eq!(refusal, StepRefusal::Date { now: before });

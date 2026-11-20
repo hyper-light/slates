@@ -282,6 +282,12 @@ pub struct Supervisor {
   /// Windows handles acknowledged into the anchor and handed only to its own successors (A-198).
   #[cfg(windows)]
   windows_handles: Option<windows::Hold>,
+  /// The version-control servers' listeners the anchor holds on Windows (A-748: the HTTP edge's, the SSH edge's, the
+  /// svn:// listener's), each with the environment variable it answers to. Windows inherits no socket (A-183), so each
+  /// is shared with every daemon this supervisor spawns as an explicit duplicate made for that daemon's process
+  /// ([`crate::shared_listeners`]), and its port, with the connections waiting on it, survives a restart as on Unix.
+  #[cfg(windows)]
+  shared_listeners: Vec<(&'static str, slates_rt::tcp::OwnedStream)>,
   /// The hold refusals and refused log lines last written to the segment (`layout::SUP_HOLD_REFUSALS`,
   /// `SUP_LOG_REFUSALS`), so a step writes only a change.
   published_refusals: (u64, u64),
@@ -384,6 +390,8 @@ impl Supervisor {
       devices: None,
       #[cfg(windows)]
       windows_handles: None,
+      #[cfg(windows)]
+      shared_listeners: Vec::new(),
       published_refusals: (0, 0),
     })
   }
@@ -712,6 +720,26 @@ impl Supervisor {
     self.vcs_svn_listener = Some(fd);
   }
 
+  /// Holds `listener` — bound and listening at the address the operator gave the version-control HTTP edge — and shares
+  /// it with every daemon this supervisor spawns (A-748), so its port is stable across restarts as on Unix (A-625 part
+  /// 3). The supervisor owns it for its life.
+  #[cfg(windows)]
+  pub fn hold_vcs_http_listener(&mut self, listener: slates_rt::tcp::OwnedStream) {
+    self.shared_listeners.push((ENV_VCS_HTTP, listener));
+  }
+
+  /// [`Supervisor::hold_vcs_http_listener`] for the SSH edge's listener (A-684, A-748).
+  #[cfg(windows)]
+  pub fn hold_vcs_ssh_listener(&mut self, listener: slates_rt::tcp::OwnedStream) {
+    self.shared_listeners.push((ENV_VCS_SSH, listener));
+  }
+
+  /// [`Supervisor::hold_vcs_http_listener`] for the svn:// listener (A-689, A-748).
+  #[cfg(windows)]
+  pub fn hold_vcs_svn_listener(&mut self, listener: slates_rt::tcp::OwnedStream) {
+    self.shared_listeners.push((ENV_VCS_SVN, listener));
+  }
+
   /// The segment.
   pub fn segment(&self) -> &AnchorSegment {
     &self.segment
@@ -820,8 +848,71 @@ impl Supervisor {
         .to_owned(),
     ));
     let job = self.lifetime.job()?;
-    windows::spawn(&self.program, &self.args, &env, handoff.as_ref(), job)
-      .map_err(|error| AnchorError::Hold(crate::handles::HandleRefusal::Ipc(error)))
+    let hold_error = |error| AnchorError::Hold(crate::handles::HandleRefusal::Ipc(error));
+    // The shared listeners' pipe (A-748): its reading end, an inheritable duplicate the spawn's handle list hands the
+    // daemon, named in its environment; its writing end, this process's alone, written once the daemon's id is known.
+    let pipe = if self.shared_listeners.is_empty() {
+      None
+    } else {
+      let (reader, writer) = std::io::pipe().map_err(|error| AnchorError::Spawn {
+        code: error.raw_os_error(),
+      })?;
+      let handed = slates_ipc::win_spawn::duplicate_inheritable(
+        std::os::windows::io::AsRawHandle::as_raw_handle(&reader),
+      )
+      .map_err(hold_error)?;
+      env.push((
+        crate::shared_listeners::ENV_SHARED_LISTENERS.to_owned(),
+        (handed.raw() as usize).to_string(),
+      ));
+      Some((reader, writer, handed))
+    };
+    let extra: Vec<windows_sys::Win32::Foundation::HANDLE> =
+      pipe.iter().map(|(_, _, handed)| handed.raw()).collect();
+    let child = windows::spawn(
+      &self.program,
+      &self.args,
+      &env,
+      handoff.as_ref(),
+      job,
+      &extra,
+    )
+    .map_err(hold_error)?;
+    if let Some((reader, writer, handed)) = pipe {
+      // This process's copies of the reading end go first, so the daemon's read meets the pipe's end once the writer
+      // closes, and a daemon that died meanwhile fails the write rather than leaving it waiting.
+      drop((reader, handed));
+      self.share_listeners(child.id(), writer);
+    }
+    Ok(child)
+  }
+
+  /// Writes each held listener's share with daemon `process` down `writer` and closes it (A-748,
+  /// [`crate::shared_listeners`]). A listener that cannot be shared, or a pipe the daemon no longer reads, is said on
+  /// the log and left out: that daemon then binds its own where the operator asked, and the next spawn shares again.
+  #[cfg(windows)]
+  fn share_listeners(&self, process: u32, mut writer: std::io::PipeWriter) {
+    use std::io::Write;
+    let mut shares = Vec::new();
+    for (variable, listener) in &self.shared_listeners {
+      match slates_rt::tcp::share_listener(listener, process) {
+        Ok(bytes) => shares.push(crate::shared_listeners::Share {
+          variable: (*variable).to_owned(),
+          bytes,
+        }),
+        Err(error) => slates_machine::log_line!(
+          "slates anchor: the listener {variable} could not be shared with daemon {process} ({error}); it binds its own"
+        ),
+      }
+    }
+    let written = crate::shared_listeners::encode(&shares)
+      .map_err(|refusal| format!("{refusal:?}"))
+      .and_then(|bytes| writer.write_all(&bytes).map_err(|error| error.to_string()));
+    if let Err(why) = written {
+      slates_machine::log_line!(
+        "slates anchor: the shared listeners could not be written to daemon {process} ({why}); it binds its own"
+      );
+    }
   }
 
   /// Polls the daemon once: running, restarted after an exit, or backed off as a crash loop (the module's rule).

@@ -32,8 +32,6 @@ use slates_wire::request::RequestId;
 
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
-/// Shape: how long a client waits for a full ring to drain before giving up.
-const CREDIT_WAIT: Duration = Duration::from_secs(5);
 /// Shape: shards per test daemon: two, so a client lands on a shard other than the control
 /// shard's and the cross-shard hand-off runs.
 const TEST_SHARDS: u16 = 2;
@@ -46,23 +44,16 @@ struct Client {
 }
 
 impl Client {
+  /// A client of `instance`, whose daemon started before this, its rendezvous held and published by then: the claim
+  /// waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait (A-571's rule;
+  /// until 2026-11-20 a five-second retry, `CREDIT_WAIT`).
   fn connect(instance: &str) -> Client {
-    let started = Instant::now();
-    loop {
-      match connect(instance) {
-        Ok(connected) => {
-          let client = connected.region.client_id();
-          return Client {
-            end: ClientEnd::connected(connected),
-            client,
-            sequence: 0,
-          };
-        }
-        Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-          std::hint::spin_loop();
-        }
-        Err(e) => panic!("{e}"),
-      }
+    let connected = connect(instance).unwrap_or_else(|e| panic!("{e}"));
+    let client = connected.region.client_id();
+    Client {
+      end: ClientEnd::connected(connected),
+      client,
+      sequence: 0,
     }
   }
 
@@ -98,14 +89,16 @@ impl Client {
       body,
     )
     .unwrap();
-    let started = Instant::now();
-    loop {
-      match self.end.send(&slot) {
-        Ok(()) => break,
-        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::hint::spin_loop(),
-        Err(e) => panic!("{e}"),
-      }
-    }
+    // A full ring is waited out while the daemon lives, as every client end waits (A-571).
+    let roomed = self
+      .end
+      .send_when_room(|end| end.send(&slot))
+      .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+      roomed,
+      slates_ipc::room::Roomed::Sent,
+      "the daemon went away while its ring was full"
+    );
     let reply = self
       .end
       .wait(Some(DEADLINE_NS))
@@ -220,6 +213,94 @@ fn daemon(name: &str) -> (Daemon, String) {
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
+}
+
+/// Shape: the stop watch's install budget before 2026-11-20: the observe budget, ten liveness windows, at which a control
+/// shard still busy with recovered work refused the install and the daemon stopped itself (w-interop's restart loop).
+const OLD_STOP_WATCH_BUDGET_NS: u64 = slates_server::daemon::OBSERVE_BUDGET_NS;
+
+/// Set once the test gives the stop watch its reason ([`a_stop_watch_asked_of_a_busy_control_shard_is_installed_and_waits_for_a_reason`]).
+static STOP_REASON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once the stop watch's wait returned.
+static STOP_WATCH_RETURNED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+/// Set once the busy work holding the control shard alone has ended.
+static BUSY_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the busy work holds the control shard: the old install budget held to this build's cost (the CPU an
+/// observation gave a busy shard before calling it one that would never answer, `observe::held_to_this_build`), and a
+/// liveness window more, so the old install is refused while the shard is still busy.
+fn busy_span_ns() -> u64 {
+  slates_machine::build_cost::build_cost()
+    .map_or(OLD_STOP_WATCH_BUDGET_NS, |cost| {
+      cost.scale(OLD_STOP_WATCH_BUDGET_NS)
+    })
+    .saturating_add(slates_server::daemon::LIVENESS_BUDGET_NS)
+}
+
+/// A daemon never stops itself because its control shard is busy (w-interop's git matrix, 2026-11-20: a restart's
+/// recovered encode work held the control shard 36 s, the stop watch's install was refused at its 10 s budget, the daemon
+/// logged "the stop watch could not be installed ... stopping" and exited 0, and its anchor restarted it into the same
+/// work, 78 times). Do: hold the control shard alone with busy work, a heartbeat's spin at a time between yields (each
+/// yield a step, as recovered work slices), for [`busy_span_ns`]; meanwhile wait for a reason to stop; once the work ends,
+/// look again two heartbeats later, then give the watch its reason. Expect the watch still waiting after the work (taken
+/// in, not refused), and its wait to end once given its reason. Before, the watch was installed by an observation the
+/// busy shard could not answer within its budget, and its refusal ended the wait while the shard was still busy, which
+/// the daemon's role took as its reason to stop.
+#[test]
+fn a_stop_watch_asked_of_a_busy_control_shard_is_installed_and_waits_for_a_reason() {
+  use std::sync::atomic::Ordering;
+  let (daemon, _instance) = daemon("stop-watch-busy");
+  let span_ns = busy_span_ns();
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |_| {
+      let busy = slates_rt::futures::spawn_alone(async move {
+        let end = slates_rt::futures::now_ns().saturating_add(span_ns);
+        while slates_rt::futures::now_ns() < end {
+          let slice_end =
+            slates_rt::futures::now_ns().saturating_add(slates_server::daemon::HEARTBEAT_NS);
+          while slates_rt::futures::now_ns() < slice_end {
+            std::hint::spin_loop();
+          }
+          slates_rt::futures::yield_now().await;
+        }
+        BUSY_ENDED.store(true, Ordering::Release);
+      });
+      busy.and_then(slates_rt::futures::detach).is_ok()
+    })
+    .map(|spawned| assert!(spawned, "the busy work was spawned alone"))
+    .expect("the control shard took the busy work");
+  let giver = std::thread::spawn(|| {
+    while !BUSY_ENDED.load(Ordering::Acquire) {
+      #[allow(clippy::disallowed_methods)] // a test watches the busy work's end on the wall
+      std::thread::sleep(Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS));
+    }
+    #[allow(clippy::disallowed_methods)] // two of the watch's heartbeats
+    std::thread::sleep(Duration::from_nanos(
+      2 * slates_server::daemon::HEARTBEAT_NS,
+    ));
+    let waiting_after_busy = !STOP_WATCH_RETURNED.load(Ordering::Acquire);
+    STOP_REASON.store(true, Ordering::Release);
+    waiting_after_busy
+  });
+  let began = Instant::now();
+  daemon.wait_for_stop(|| STOP_REASON.load(Ordering::Acquire));
+  STOP_WATCH_RETURNED.store(true, Ordering::Release);
+  let waited = began.elapsed();
+  let waiting_after_busy = giver.join().unwrap();
+  drop(daemon);
+  eprintln!(
+    "the control shard was busy {:?}; the watch waited {waited:?}, still waiting after the work: {waiting_after_busy}",
+    Duration::from_nanos(span_ns)
+  );
+  assert!(
+    waiting_after_busy,
+    "the watch was taken in and waited past the busy work, not refused while it ran (waited {waited:?})"
+  );
+  assert!(
+    waited >= Duration::from_nanos(span_ns),
+    "the watch ended at its reason, after the work"
+  );
 }
 
 /// §2.6 boot step 2 (A-312). Do: start a daemon of [`TEST_SHARDS`] shards and ask how often its start beat. Expect at least
@@ -546,13 +627,15 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
       Control::Spawn(Box::new(SpawnRequest::new(
         Box::pin(async move {
           entered.send(()).unwrap();
-          released.recv_timeout(CREDIT_WAIT).unwrap();
+          // Held until the test releases it: the test lives as long as this wait (A-571's rule).
+          released.recv().unwrap();
         }),
         None,
       ))),
     )
     .unwrap();
-    held.recv_timeout(CREDIT_WAIT).unwrap();
+    // The shard runs the task while the daemon lives; a task dropped unrun drops its sender, which ends this wait.
+    held.recv().unwrap();
     releases.push(release);
   }
   let Kick::Eventfd(observer) =
@@ -634,7 +717,7 @@ fn shard_holdings(client: &mut Client) -> Vec<(u64, u64)> {
 /// 1 MiB volumes on one partition, exhausted its version slots and could not run
 /// (docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md). Do: create volumes
 /// whose names place them on every shard, destroy them all, then read each shard's holdings. Expect: every
-/// shard back to no volume and no committed byte within the credit wait.
+/// shard back to no volume and no committed byte, waited for while the daemon lives.
 #[test]
 fn a_destroy_completes_on_an_owner_shard_that_has_no_client() {
   let (daemon, instance) = daemon("destroy-owner");
@@ -657,16 +740,14 @@ fn a_destroy_completes_on_an_owner_shard_that_has_no_client() {
       ReplyBody::Destroyed
     ));
   }
-  let started = Instant::now();
-  loop {
-    let holdings = shard_holdings(&mut client);
-    if holdings.iter().all(|held| *held == (0, 0)) {
-      break;
-    }
-    assert!(
-      started.elapsed() < CREDIT_WAIT,
-      "a destroy never completed on its owner: {holdings:?} (volumes, committed bytes per shard)"
-    );
+  // Waited while the daemon lives (A-232's rule): each look is a status the daemon answers, which fails the test at once
+  // when the daemon has gone. Until 2026-11-20 five seconds on the wall (`CREDIT_WAIT`), which a host that kept the
+  // owner shard off its CPU could outlast with the destroy still stepping.
+  while !shard_holdings(&mut client)
+    .iter()
+    .all(|held| *held == (0, 0))
+  {
+    std::thread::yield_now();
   }
   drop(daemon);
 }
@@ -940,7 +1021,8 @@ fn resize_and_destroy(client: &mut Client, id: slates_ipc::protocol::VolumeId) {
       refusal: Refusal::Destroying | Refusal::NotFound
     }
   ));
-  let started = Instant::now();
+  // Waited while the daemon lives: each look is an answer of the live daemon, a gone one failing the call at once
+  // (A-232's rule; until 2026-11-20 five seconds on the wall, `CREDIT_WAIT`).
   loop {
     let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
@@ -949,10 +1031,7 @@ fn resize_and_destroy(client: &mut Client, id: slates_ipc::protocol::VolumeId) {
     if names == vec!["one-clone"] {
       break;
     }
-    assert!(
-      started.elapsed() < CREDIT_WAIT,
-      "destroy completes in slices: {names:?}"
-    );
+    std::thread::yield_now();
   }
 }
 
@@ -2249,7 +2328,8 @@ fn version_reservation_scenario() {
     client.call(&RequestBody::Destroy { volume: grower }),
     ReplyBody::Destroyed
   ));
-  let started = Instant::now();
+  // Waited while the daemon lives: each look is an answer of the live daemon, a gone one failing the call at once
+  // (A-232's rule; until 2026-11-20 five seconds on the wall, `CREDIT_WAIT`).
   loop {
     let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
@@ -2257,10 +2337,7 @@ fn version_reservation_scenario() {
     if !volumes.iter().any(|v| v.id == grower) {
       break;
     }
-    assert!(
-      started.elapsed() < CREDIT_WAIT,
-      "destroy completes in slices: {volumes:?}"
-    );
+    std::thread::yield_now();
   }
   // With the hold returned, a fresh volume is admitted again — the hold is released on teardown.
   assert!(
@@ -2684,7 +2761,8 @@ fn snapshot_destroy_scenario() {
     client.call(&RequestBody::Destroy { volume: clone }),
     ReplyBody::Destroyed
   ));
-  let started = Instant::now();
+  // Waited while the daemon lives: each look is an answer of the live daemon, a gone one failing the call at once
+  // (A-232's rule; until 2026-11-20 five seconds on the wall, `CREDIT_WAIT`).
   loop {
     let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
@@ -2692,7 +2770,7 @@ fn snapshot_destroy_scenario() {
     if volumes.iter().all(|v| v.name != "clone") {
       break;
     }
-    assert!(started.elapsed() < CREDIT_WAIT, "clone destroy completes");
+    std::thread::yield_now();
   }
   // With the pin released, the snapshot can now be destroyed.
   assert!(
@@ -3669,10 +3747,10 @@ fn create_until_the_ledger_refuses(client: &mut Client) -> Vec<slates_ipc::proto
   }
 }
 
-/// Waits, within the credit budget, until the daemon lists exactly `count` volumes (a destroy
-/// completes in cooperative slices).
+/// Waits, while the daemon lives, until it lists exactly `count` volumes (a destroy completes in cooperative slices).
 fn wait_for_volume_count(client: &mut Client, count: usize) {
-  let started = Instant::now();
+  // Waited while the daemon lives: each look is an answer of the live daemon, a gone one failing the call at once
+  // (A-232's rule; until 2026-11-20 five seconds on the wall, `CREDIT_WAIT`).
   loop {
     let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
@@ -3680,10 +3758,7 @@ fn wait_for_volume_count(client: &mut Client, count: usize) {
     if volumes.len() == count {
       return;
     }
-    assert!(
-      started.elapsed() < CREDIT_WAIT,
-      "destroy completes in slices: {volumes:?}"
-    );
+    std::thread::yield_now();
   }
 }
 

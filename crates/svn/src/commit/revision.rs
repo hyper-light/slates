@@ -97,11 +97,21 @@ impl Revision {
   /// # Errors
   /// [`StepRefusal::Date`] for an instant this writer cannot write as `svn_time_to_cstring` does: before 1970 or past
   /// the year 9999, which no owner's clock reads.
-  pub fn of_work(work: Work, now: AprTime) -> Result<Self, StepRefusal> {
+  pub fn of_work(
+    work: Work,
+    now: AprTime,
+    texts: &dyn crate::commit::drive::TextSink,
+  ) -> Result<Self, StepRefusal> {
     let date = crate::dav::response::svn_time(now).map_err(|_| StepRefusal::Date { now })?;
     let mut properties: Properties = work.revision_properties.into_iter().collect();
     properties.insert(REVISION_DATE.to_vec(), date.into_bytes());
-    let mut contents = work.texts;
+    // The work's texts are its sink's, read back for the revision's record until the records keep identities alone
+    // (A-716, w-perf's slices).
+    let mut contents = BTreeMap::new();
+    for identity in work.texts {
+      let bytes = texts.sealed(&identity).ok_or(StepRefusal::Corrupt)?;
+      contents.insert(identity, bytes.into_owned());
+    }
     for (identity, list) in work.property_lists {
       let list: Properties = list.into_iter().collect();
       contents.insert(identity, encode(&list));

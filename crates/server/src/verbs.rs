@@ -967,6 +967,19 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   // uid means something only on its host, so the owner judges it as (origin, account) and never by the origin's word.
   let principal = principal.rehosted(origin);
   let requester = principal.clone();
+  // A node's verb about one of its works (A-697) is the work's own member's alone: the id's creator must be the member
+  // this node has learned for the link's authenticated anchor (fleet certificates bind member ids). Any other member is
+  // refused, however its principal reads.
+  if let Some(work) = node_verb_work(&body)
+    && !crate::state::try_with_state(|s| {
+      crate::member_task::anchor_of(s, ObjectId(work.bytes).creator()) == Some(origin)
+    })
+    .unwrap_or(false)
+  {
+    return encode_body(&refused(Refusal::Forbidden {
+      verb: "a node's verb about another member's work".to_owned(),
+    }));
+  }
   if let RequestBody::PromoteRegion { region } = body {
     return encode_body(
       &crate::state::try_with_state(|s| propose_region_promotion(s, region))
@@ -1026,6 +1039,17 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// The work a node's verb is about (A-697: `AdmitWork`, `MoveWorkFloor`, `SubmitComputed`), whose creator alone may send
+/// it; `None` for any other verb.
+fn node_verb_work(body: &RequestBody) -> Option<VolumeId> {
+  match body {
+    RequestBody::AdmitWork { work, .. }
+    | RequestBody::MoveWorkFloor { work, .. }
+    | RequestBody::SubmitComputed { work, .. } => Some(*work),
+    _ => None,
+  }
 }
 
 /// The refusal for a shard whose state refused a borrow (`state::try_with_state`), by what refused it (A-564). Fenced
@@ -18286,6 +18310,8 @@ const WORK_REBUILD_ASK_REFUSED: &str = "merge.work_rebuild_ask_refused";
 /// this shard holds is replayed here. Each message waits for room on its target's channel while that shard lives
 /// (`xshard::run_on_waiting`), so one is lost only with its shard, counted.
 pub(crate) fn ask_owners_to_replay(state: &mut ShardState) {
+  // The holder creations a restart held for their release at the green's owner ask for it now too (A-697 part e2).
+  crate::work_home::release_admissions(state);
   let here = state.shard;
   for unbuilt in state.work_home.unbuilt.clone() {
     let entries = state.db.partition().work_log(unbuilt.work).to_vec();
@@ -24452,6 +24478,85 @@ mod tests {
       ))
       .ok()?;
     super::decode_body::<ReplyBody>(&bytes).ok()
+  }
+
+  /// A-697 (a work's floor is moved by its own member alone). Do: on a one-shard daemon owning a green, learn member
+  /// 0x51 for [`PEER`]'s anchor; record floors for a work whose id names member 0x51 and for one whose id names member
+  /// 0x52; forward from [`PEER`] a `MoveWorkFloor` dropping each. Expect: the first answered `WorkFloorMoved` and its
+  /// floor gone; the second refused `Forbidden`, another member's work, and its floor kept.
+  #[test]
+  fn a_works_floor_is_moved_by_the_member_its_id_names_alone() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let named = |member: u64| {
+      let mut bytes = [0x11; 16];
+      bytes[..8].copy_from_slice(&member.to_be_bytes());
+      super::VolumeId { bytes }
+    };
+    let (own, anothers) = (named(0x51), named(0x52));
+    let green = crate::daemon::observe_first(&daemon, move |state| {
+      state.learned_members.insert(
+        PEER,
+        crate::state::LearnedMember {
+          boot_nonce: 1,
+          host: HostId(0x51),
+          previous: None,
+        },
+      );
+      let super::ReplyBody::GreenCreated { id } = super::dispatch(
+        state,
+        1,
+        &scatter_asker(),
+        super::RequestBody::CreateGreen {
+          name: "floored".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ) else {
+        return None;
+      };
+      for work in [own, anothers] {
+        super::owner_floor(
+          state,
+          super::to_db_volume(id),
+          super::to_db_volume(work),
+          Some(0),
+        );
+      }
+      Some(id)
+    })
+    .expect("a green");
+    let drop_floor = |work| super::RequestBody::MoveWorkFloor {
+      green,
+      work,
+      base: None,
+    };
+    let moved = served_as_forwarded(&daemon, drop_floor(own));
+    let refused = served_as_forwarded(&daemon, drop_floor(anothers));
+    let floors = crate::daemon::observe_first(&daemon, move |state| {
+      let partition = state.db.partition();
+      [own, anothers]
+        .map(|work| partition.work_floor(super::to_db_volume(green), super::to_db_volume(work)))
+    });
+    daemon.stop();
+    assert_eq!(
+      moved,
+      Some(ReplyBody::WorkFloorMoved),
+      "its own member's move"
+    );
+    assert!(
+      matches!(
+        refused,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Forbidden { .. }
+        })
+      ),
+      "another member's work: {refused:?}"
+    );
+    assert_eq!(
+      floors,
+      [None, Some(0)],
+      "the first dropped, the second kept"
+    );
   }
 
   /// What the fenced-owner test was answered for a volume whose owner shard is fenced: asked by a client on another

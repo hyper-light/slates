@@ -84,6 +84,9 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
+> resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.
+>
 > **A-722 part 4c (2026-11-20, w-git).** BUILT: a move's admission a unit at a time before its append
 > (`Admitting`, `Judge::ready`, `SealedPush::admission_turn`). Owed: the store commit's whole passes and a stale restage
 > sliced; the work build and the entry's apply (works, merge).
@@ -171,8 +174,10 @@
 > (`negotiation::begin`, `Negotiating::step`); part 2: `upload::serve_in_turns` and `Answer::write_within` choose them
 > within the owner's quantum, the answer the same bytes; piece 3a: sets in runs or bits, whichever is smaller, and packets
 > sized from the room (a clone within 4 KiB); piece 3b: both edges admit a fetch a request's room and answer it in turns
-> (the 3,000-commit clone by use over HTTP and SSH). Owed: protocol v0 in turns, `begin`'s walks in units, scattered
-> plans, rule 4's generation hold; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> (the 3,000-commit clone by use over HTTP and SSH); rule 4: a fetch holds the generation it began on (a shared fork at
+> the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects);
+> `begin`'s walks in turns (`ready`'s search, the cut, `include-tag`'s scan: `begin` reads what the request names, each
+> step a unit). Owed: protocol v0 in turns, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -279,8 +284,13 @@
 > (a1) BUILT: `ContentStore::windows`/`window_at` answer `Cow` (a sealed arena window is copied out), every reader in
 > git, hg, the server and vcs moved over; lists and tables stay lent (`get`). (a2) step 1 BUILT: windows kept through a
 > `WindowStorage` seam (`HeapWindows` for tests and tools; `ContentStore::with_storage`), read by `bytes_of`, sized by `len_of`.
-> OWED: (a2) step 2 the daemon's arena storage (a repository chunk store per home shard, own pool owner-tag range), (a3) image table
-> + recovery order, (b) git v3, (c) svn, (d) replication.
+> (a2) BUILT 479f950ed: windows are chunks of the shard's own chunk store, lent per step by a swap under a guard (main's
+> ruling (ii)). (a3) BUILT 782eb711c: the windows' table in the shard image (held pieces), claimed before the volumes,
+> held again by the replay. (c) c1 BUILT: a Subversion head's texts held by the green by path (`vcs_store::svn_texts`),
+> held again at a recovery; `HeadTexts` reads the green, then the records: that second read path is OWED away with c3
+> (the reads switched to it, the records dropping text bytes), in one series. OWED: (b) git v3 (w-balance's names, on
+> main's f+1 ruling), (c) c2 (an old text kept as an svndiff delta in the repository store before the green folds it)
+> and c3, (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -2024,7 +2034,17 @@
 > slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs): owed, the piece and the
 > window sliced to the slice. **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
 > refused E210009 by one request's room over svn:// and DAV (rule 2), and below that room `commit::drive::Work::texts`
-> holds every new text whole (rule 1, by reading); owed, w-svn's next piece. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> holds every new text whole (rule 1, by reading); owed, w-svn's next piece. **Intake, part 1 (same day, w-svn, on w-perf's seam):**
+> the commit drive applies each svndiff window into one window's room and hands it to the caller's
+> `commit::drive::TextSink` (stage, append, seal), naming the text (BLAKE3) and checking its MD5 and SHA-1 as the
+> windows pass, so it holds the window being read and no text; `Work::texts` names identities, `Revision::of_work`
+> reads them back from the sink, and a sink's refusal is the shard's room (`NoRoom`, E160000), never a request's.
+> Every edge lends one: the listener's connection, the tunnel's session, each DAV commit (`DavCommit` owns it and hands
+> it out with the accepted work). The green's staging (`slates_merge` `Green::stage`, `append_staged`, `seal_staged`,
+> `discard_staged`) landed first. Held by `a_text_larger_than_the_request_room_is_streamed_into_the_sink_and_accepted`
+> (a 1 MB text through a 256 KB room: red E210009 before). Owed: the server's sink over the green's staged blocks
+> (w-perf; until then `HeldTexts` keeps them in memory per connection), the revision's record and log reading the held
+> texts by identity (w-perf's c2, c3), and the by-use 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -2470,6 +2490,12 @@
 > formed and settled (sw48c 48/48, rp2 40/40, rp3 54/55, rp4 5/5 with the CPU-judged start wait), past the 143 at which
 > a 1-in-48 stall shows with 95% odds; the one other run (rp3 run 9) never reached forming, an initial daemon starved
 > past the old 30 s wall start wait (fixed in b25a5b7a6). No stall of membership in any run.
+> **A holder move onto the replaced member stalled once, not reproduced (2026-11-20, w-forming):** in fm1 run 7 (main
+> a6764af1e, unthrottled) the fleet formed and the replaced member rejoined, then the owner's holder move from
+> [1150.., 7405..] to [1150.., the replaced member] never completed and writes were refused about 40 s ("covers
+> candidates false": the last whole entry held no key for the replaced member's anchor), failing
+> `settled_holders`. Not seen again in the 147 runs that formed since (sw48c, rp2, rp3, rp4, each with the flow's
+> holder move); not chased. Its log was ~/.cache/w-forming-runs/fm1/run-7.log on adas-mac-studio-4.
 > **Start waits under load (2026-11-20, w-forming; same box):** at load 29 to 31 on its 14 CPUs (other agents' builds,
 > Spotlight indexing cargo targets, a VM), the fleet daemons' control shards went 8 to 12 s between heartbeat turns
 > ("the control shard's beat task ran 12053 ms after its last turn", against windows of 1 to 4.2 s, with 4 to 35 long
@@ -2477,8 +2503,10 @@
 > before its banner (sw48 run 16, rp3 run 3; the fleet had formed and settled each time). The live_chaos start wait now
 > judges the start in its processes' own CPU, as the anchor judges its daemon (A-228): waited while they live and gain
 > CPU, up to 30 s of it, given up after 10 s with none or once they are gone (`wait_answers`, `start_verdict`).
-> Still a fixed wall bound under load: the flow's `FLEET_WAIT` (40 s), which a takeover's register adoption missed at
-> load 31 (probe run pr3 run 3).
+> The flow's fleet waits (`FLEET_WAIT`, 40 s) were a fixed wall bound too, which a takeover's register adoption missed
+> at load 7 to 31 under `taskpolicy -b` (probe runs pr3 run 3, pr4 run 2); since 2026-11-20 each is the window divided by
+> the share of a CPU the test process measures it is given at the window's end (`FleetWait`, `cpu_share`): the window
+> uncontended, about twice it at load 31. A wait whose end is only noted (`copies_kept`) keeps the plain window.
 
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
@@ -2842,6 +2870,35 @@
 > - **Owed (A-354):** the reply a write through the successor held waited without a bound; held replies of the slates
 >   protocol are judged by no time bound (NFS and FUSE judge theirs by `durable_bound` up to the failover SLO).
 
+> **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
+> work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
+> at v2.0.0 left the daemon in a restart loop: 78 exits, each `daemon exited (Some(0))`. Each restart served,
+> re-started its recovered fragment encoding (97% CPU, one poll 3.5 s), then logged "the stop watch could not be
+> installed (the budget of 10000 ms elapsed at execution after 1 attempt(s) (35963 ms)); stopping", while a
+> `git clone --depth 1` waited 16 minutes. The stop watch was installed by an observation of the control shard under the
+> observe budget (ten liveness windows), which a shard busy past that budget's CPU refused, and the role read the
+> refusal as its reason to stop. The watch now reaches the control shard over a channel its start receives
+> (`ShardHolds::stop_watch`), taken in at the heartbeat; `Daemon::wait_for_stop` only sends it, so no work on the shard
+> can refuse it and the install has no budget. Priority was not the lever: a shard held alone runs nothing else by design
+> (`spawn_alone`), so an install that needs a shard turn waits for the work however it is ordered. Test:
+> `a_stop_watch_asked_of_a_busy_control_shard_is_installed_and_waits_for_a_reason` (`crates/server/tests/daemon.rs`:
+> the control shard held alone by busy work for the old budget at this build's cost and a window more; Adas-Mac-Studio-4,
+> base cdfbb4020: busy 31.8 s and the watch still waiting after it, ending at its reason at 32.3 s; with the change
+> reversed, the wait ended at 31.4 s while the shard was busy for 32.2 s, the refusal the daemon stopped on). Owed (w-k90-vendor):
+> slicing the encode poll (`git_encode.rs:345`); owed (R3): `OBSERVE_BUDGET_NS`, ten liveness windows, still bounds every
+> other observation.
+
+> **A forward lane's floor was logged once a forward: about a million lines, 260 MB, in one flow (2026-11-20; CLOSED,
+> g226; found by w-fed-faults).** A lane left with nothing was dropped, so each forward made it afresh and measured its
+> floor from nothing; where the floor sat past the failover delay (3,102 ms against 3,100), every forward crossed it
+> again and `forward_lane::note_floor` wrote a line (CLAUDE.md §2 item 8). A lane is now kept while idle (idle lanes of
+> peers gone from the configuration are pruned, `ForwardLanes::prune_idle`), and a floor is said only where the log's
+> last line about the lane differs from what is so, at most once a window (the longer of the delay and the floor), with
+> the crossings since (`fleet.forward.floor_logged`). Test: `a_lane_measured_past_the_failover_delay_logs_it_once`
+> (`crates/server/tests/fleet.rs`, 40 forwards through b; Adas-Mac-Studio-4, 2026-11-20, the delay held at 1 s, the
+> floor 3,107 ms: 1 crossing and 1 line with the fix, 41 crossings and 41 lines with `forward_lane.rs` reversed) and
+> `an_idle_lane_is_kept_for_a_member_and_pruned_for_a_peer_gone` (`crates/server/src/forward_lane.rs`).
+
 > **A verb's reply held for durability had no time bound: refused at the failover SLO (2026-11-18, A-354, §4.10 "Live
 > shipping"; g230).** `live_ship::defer` and `defer_destroy` held a reply until its log was durable, its owner fenced or
 > its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21
@@ -2897,7 +2954,13 @@
 >   volume's whole image in one turn, at every whole entry and install image; **the whole entry's half closed
 >   2026-11-18, A-377, g230:** captured in its publication's turn and sealed a piece a turn by a task of the owner
 >   shard, the publications made meanwhile queued behind it, each appended in order as the credit admits it; install
->   images (`refresh_image`) still one turn, owed); and, after A-347's open, the takeover's
+>   images (`refresh_image`) still one turn, owed; **since A-755 (2026-11-20, w-forming) a turn's pieces are sized to the
+>   seal rate measured in the build and the quantum left, a page to an archive chunk** (a turn had sealed a MiB at least
+>   however small its quantum, 87 to 302 ms of CPU against 14 to 784 us quanta, a debug fleet under `taskpolicy -b`);
+>   **still one turn, owed:** the append that ends a build (`append_build`: the sealed body joined and cloned into the
+>   shipper and the volume's whole state, 223 to 498 ms of CPU a turn for 1.8 to 2.5 MB in the same runs), and a
+>   shipper append of a large delta (128 to 331 ms for 1.8 to 2.5 MB; 29 ms for 4.8 KB, so not the payload's size
+>   alone)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -4692,8 +4755,10 @@
 > holder's submit committed by the verdict its replica computed, taken by position at the owner, `SubmitComputed`);
 > part d built (the submit settles once the holder's replica holds the version); part e built (a holder's work comes
 > back from its log over the holder's replica after a restart); a holder work's rebase and copies built over the
-> replica; an increment too large for the forward lane, the floor of a creation a restart dropped, the floor move's
-> authority by member id, and part f (takeover and the routing flip) are open.
+> replica; a creation a restart caught releases its floor at the owner (part e2); the increment carried by reference
+> to placed content, one copy of each byte (main's ruling: the forward carries a 4 MiB increment, but at f = 1 a 4 MiB
+> holder submit took 3.5-4.8 s and a local one 2.8-3.4 s in a debug build, with the inputs shipped back to the holder
+> that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
@@ -6982,11 +7047,23 @@
 >   keeps A-454's shard steps for the daemons it freezes on purpose; and a hold's start is waited on its observation,
 >   which ends by its answer or its typed refusal past the observe budget
 >   (`a_send_on_a_full_ring_whose_daemon_is_gone_ends_at_its_first_look`,
->   `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`). Owed (A-571's next part):
->   `shards.rs`'s guest windows (`Guest::await_answer`, A-65 and A-228's rule sized by `CREDIT_WAIT`), its condition
->   polls (`wait_until`, `wait_for_count`), its attach's answer and its stream reads, each still five seconds on the
->   wall; `daemon.rs`'s raw client, the same constant and the same two waits; and `common/client.rs`'s `START_WAIT`, a
->   connect retried five seconds while a daemon starts. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   `a_send_on_a_full_ring_waits_while_its_daemon_lives_and_is_written_once_a_slot_frees`). A-571's next part since
+>   2026-11-20 (g226, goal 88's last part), each wait by the rule A-468, A-571 and A-232 proved red, where each was five
+>   seconds (twenty for `TAKEN_WAIT`) on the wall: `daemon.rs`', `nfs_mount.rs`', `virtiofs.rs`' and
+>   `nfs_v4_kernel.rs`' raw clients (a connect is one claim, a full ring is waited out by `send_when_room`, a shard
+>   task's handshake is a plain `recv`, an NFS socket has no timeout, five destroy-in-slices polls wait while the daemon
+>   answers); `shards.rs`' attach answer (a plain `recv`), its guest's waits (`Guest::await_answer` waits on its stream
+>   while the daemon lives, the daemon's own watchdog ending a stuck or spinning shard, so the guest no longer judges
+>   the shards' CPU itself; an answer past the old five seconds is still counted, `Waits::extended`), its condition polls
+>   (`wait_until`, `wait_for_count`, the route's malformed count), its route and resync reads; and `common/client.rs`'s
+>   `START_WAIT` and `TAKEN_WAIT`. Found by its sweep, outside the part: the same five- to sixty-second waits under other
+>   names (`START_WAIT`, `TAKEN_WAIT`, `HOLD_START_WAIT`), each a test's wait on a live daemon on the wall. In
+>   `server/tests` since 2026-11-20 (g226, main's ruling): `recovery` (a connect, two create retries, a pool's return,
+>   a heartbeat's stop, a stop's end and nine condition loops), `give_back`, `cross_shard_wait`, `consumers`,
+>   `attachment_term`, `reply_room` and `forward_retry` wait on their event while the daemon lives, its watchdog the
+>   bound (A-232). Owed: `client/tests` and its examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
+>   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
+>   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the
@@ -7017,10 +7094,15 @@
 >   edge's own reads (RFC 6298 over each bearer holder's acceptance-to-bearer time, `G` the shard's tick or scheduler
 >   lateness, RFC 9002's initial probe timeout as the prior keeping the share `1/(n+1)` after `n` arrivals), and is cut
 >   off unanswered there; a connection that has shown the bearer waits while it lives
->   (`a_sender_that_never_shows_the_bearer_is_cut_off_at_the_learned_bound_and_a_token_holder_is_waited_for`). Owed: a
->   listen stream's keep-alive period still comes from the reply deadline (half of it,
->   `slates_mcp::http::listen_keep_alive_ns`); an honest client cut off before its bearer arrived looks like any other
->   sender and teaches the bound nothing. The
+>   (`a_sender_that_never_shows_the_bearer_is_cut_off_at_the_learned_bound_and_a_token_holder_is_waited_for`). A listen
+>   stream's keep-alive period since 2026-11-20 (g226, goal 88's last part; main's ruling): it was half the reply
+>   deadline, a fixed 500 ms; it now beats by the heartbeat's rule over the liveness budget (the CLI's
+>   `listen_keep_alive_ns` over `slates_server::daemon::heartbeat_of`, `W / ELECTION_MARGIN`, the anchor's beat's rule),
+>   so a beat lands inside each liveness window and follows the budget
+>   (`the_mcp_listens_keep_alive_beats_by_the_heartbeats_rule_over_the_liveness_budget`; red before: 500,000,000 ns
+>   against the heartbeat's 100,000,000). Not learned from the stream's ends, since a client's close cannot tell an idle
+>   timeout from a cancellation. Owed: an honest client cut off before its bearer arrived looks like any other sender
+>   and teaches the bound nothing. The
 >   macOS route's claim steps since A-523 (2026-11-18, g251b): each socket step waited the caller's reply deadline at a
 >   time and asked the daemon's liveness when it ran out; it now waits while the route's connection lives, as the
 >   daemon's side waits on the client's since A-492, a daemon gone closing its end

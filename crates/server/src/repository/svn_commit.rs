@@ -69,7 +69,7 @@ use super::push::{
 use crate::state::ShardState;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Format: the reserved attribute a Subversion repository's green names a node's property list in, by the list's
 /// content identity (§4.17.4 item 1).
@@ -200,9 +200,10 @@ pub(crate) fn commit_work(
   (principal, repository): (&Principal, RepositoryId),
   work: Work,
   now: AprTime,
+  texts: &dyn slates_svn::commit::drive::TextSink,
 ) -> Result<Committed, Uncommitted> {
   let locks = work.locks.clone();
-  let revision = Revision::of_work(work, now).map_err(Uncommitted::Step)?;
+  let revision = Revision::of_work(work, now, texts).map_err(Uncommitted::Step)?;
   commit(
     state,
     (principal, repository),
@@ -371,16 +372,40 @@ fn append_made(
     return Err(Uncommitted::Append(AppendRefused::Entry(refusal)));
   }
   let revision = checked.revision();
-  let applied = state
-    .vcs_stores
-    .subversion(repository)
-    .and_then(|svn| svn.records.as_mut())
-    .map(|records| records.apply(checked));
+  let applied = apply_holding(state, repository, checked);
   if applied != Some(Ok(revision)) {
     state.count(APPLY_REFUSED, 1);
     crate::vcs_store::rebuild(state, repository);
   }
   Ok(revision)
+}
+
+/// Applies `checked` to repository `repository`'s records and follows it in the green's held table (S4 c1,
+/// `vcs_store::svn_texts`): the texts its paths held before let go, those they hold after held by path. What the apply
+/// answered; none when the records are not held here.
+fn apply_holding(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  checked: Checked,
+) -> Option<Result<u64, StepRefusal>> {
+  let changes = checked.changes().to_vec();
+  let records = state.vcs_stores.subversion_records(repository)?;
+  let released =
+    crate::vcs_store::svn_texts::released_before(records, &changes, records.youngest());
+  let applied = state
+    .vcs_stores
+    .subversion(repository)
+    .and_then(|svn| svn.records.as_mut())
+    .map(|records| records.apply(checked))?;
+  if let (Ok(revision), Ok(green)) = (&applied, green_of(state, repository)) {
+    let held = state
+      .vcs_stores
+      .subversion_records(repository)
+      .map(|records| crate::vcs_store::svn_texts::held_after(records, &changes, *revision))
+      .unwrap_or_default();
+    crate::vcs_store::svn_texts::follow(state, green, &released, &held);
+  }
+  Some(applied)
 }
 
 /// The repository's one green (item 1): its default branch's, here and not fenced. `NotHeld` otherwise, and for a
@@ -516,11 +541,7 @@ fn applied(
     [BranchAppended::Moved { version, before: false, .. }] if *version == answer.revision
   );
   let made = if moved {
-    state
-      .vcs_stores
-      .subversion(repository)
-      .and_then(|svn| svn.records.as_mut())
-      .map(|records| records.apply(checked))
+    apply_holding(state, repository, checked)
   } else {
     None
   };
@@ -846,14 +867,14 @@ impl<'b> Building<'b> {
   }
 
   /// `text`'s bytes: brought by the revision, or held by the records.
-  fn text_bytes(&self, text: &Text) -> Result<&'b [u8], Uncommitted> {
+  fn text_bytes(&self, text: &Text) -> Result<std::borrow::Cow<'b, [u8]>, Uncommitted> {
     let checked: &'b Checked = self.checked;
     let records: &'b Repository = self.records;
     checked
       .fresh()
       .get(&text.identity)
-      .map(Vec::as_slice)
-      .or_else(|| records.content(&text.identity))
+      .map(|bytes| std::borrow::Cow::Borrowed(bytes.as_slice()))
+      .or_else(|| records.text(&text.identity))
       .ok_or_else(corrupt)
   }
 
@@ -876,7 +897,7 @@ impl<'b> Building<'b> {
     }
     let src = u64::try_from(self.post.len()).map_err(|_| corrupt())?;
     let len = u64::try_from(bytes.len()).map_err(|_| corrupt())?;
-    self.post.extend_from_slice(bytes);
+    self.post.extend_from_slice(&bytes);
     self.op_at(OpKind::Insert, path, (0, len, src), 0);
     Ok(())
   }

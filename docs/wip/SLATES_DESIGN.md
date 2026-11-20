@@ -6868,6 +6868,16 @@ version.
 > `a_forward_is_never_refused_below_its_paths_floor` (a 1 s SLO, below any path's silence window: answered after 2.04 s,
 > refused at 1.004 s with the floor removed;
 > `docs/bugs/2026-11-18-a-starved-forward-lane-was-judged-on-the-wall.md`).
+>
+> **Status (2026-11-20, a lane's floor said once).** A lane is kept while it is idle, so what it measured of its path
+> outlives a forward; idle lanes of peers no longer in the council's configuration are pruned as forwards are queued
+> (`ForwardLanes::prune_idle`), which bounds the lanes by the members and the lanes in use. A lane's floor is said in
+> the log only where what the log last said of the lane differs from what is so now, at most once a window, the longer
+> of the failover delay and the floor (one forward's whole life), and each line tells the crossings since the last
+> (`forward_lane::note_floor`, counted `fleet.forward.floor_logged`). Before, a lane left with nothing was dropped and
+> the next forward made it afresh, its floor measured from nothing, so every forward crossed the delay again and logged:
+> about a million lines, 260 MB, in one of w-fed-faults' flows (CLAUDE.md §2 item 8). Test:
+> `a_lane_measured_past_the_failover_delay_logs_it_once`.
 
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
@@ -12341,9 +12351,26 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > it in turns, the pack source's `turn` the shard's step quantum on the shard's clock (`ShardPacks`); an SSH session
 > dies as git's does on a refusal the answer gives as it is written. By use: the 3,000-commit clone over the daemon's
 > HTTP edge, each request one ring region, and the same history pushed and cloned over the SSH edge, each request 64
-> KiB, its pack far larger, each answered whole. Owed for git: protocol v0's fetch in turns, `begin`'s `ready` and cut
-> and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a run), and a fetch held to the index
-> generation it began on (rule 4); the live `git clone` rows of the matrix (main's).
+> KiB, its pack far larger, each answered whole. **Rule 4 BUILT (same day):** a fetch's request takes a hold on its
+> repository's generation (`StoreLender::hold`, `vcs_store::upload::GitGeneration`): a fork of the store's repository at
+> its stamp (`Repository::fork`, `Repository::stamp`: the positions given and the versions its greens have, both only
+> growing), shared by every fetch that begins at that stamp, with the refs and `HEAD` as they stood; every later step of
+> the answer is lent from it (`lend_held`), and the last hold's release gives the fork back. By use, a push and a new tag
+> landing after a fetch's first step: the held answer's pack is the start generation's objects in its order (each by
+> id, so byte for byte; the zlib level each is deflated at is the stream's own timed choice, §4.11). Before it, the
+> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. **`begin`'s walks in turns BUILT
+> (same day):** `negotiation::begin` does only what the request names (its wants, haves and shallow lines, the one-round
+> runs, `deepen-not`'s names) and answers at once only where no search could make the server ready (`wait-for-done`,
+> no common have); `ready`'s search (`ready::Readying`: a parent of the path's top a unit, its place an index into the
+> parents), the cut (`shallow::Cutting`: a commit of `deepen`'s breadth-first walk, a ref's tip of `deepen-relative`'s
+> search, a commit painted or judged of `deepen-since`/`deepen-not`'s) and `include-tag` (a run's version joined to what
+> the runs carry as runs of positions, `Graph::brought_set`; then a tag a unit, `Graph::tags_from` keeping its place by
+> the ref's index) are `Negotiating::step`'s, before the choice. The sections before the pack wait for them: the answer
+> writes nothing until they are decided (`upload::fetch::Before`), the acknowledgments alone when not ready, a refusal
+> before them answered as one refused whole. By test: over 2,000 commits and 500 tags, `begin` read 3,499 parents of
+> the graph on main (the whole search and cut), at most 4 now, and each step at most 2, the answer the one made whole.
+> Owed for git: protocol v0's fetch in turns, a plan of scattered positions (16 bytes a run); the live `git clone` rows
+> of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
@@ -12360,6 +12387,37 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > working copies match svnadmin's over both edges after a checkout, an update back 500 revisions and the update forward.
 > The largest slice is 99,424 B on svn:// and 136,865 B on DAV. Rule 3 is still owed: one drive step, a text window's
 > delta, takes up to 4.7 ms on svn:// and 6.5 ms on DAV, so a window must be made in pieces (`report::drive`).
+> **The window encoder BUILT (2026-11-20, A-751, w-bugs; Ada's rule: performance gaps are addressed upfront).** One
+> shared encoder makes a window in units: `svndiff::WindowMaking`, which takes a unit a target position walked, a byte
+> compared or copied, a source block indexed, or an instruction encoded, at least one a step. It keeps its place between
+> steps and never borrows the texts. Each phase is `compute_delta`'s, cut at its loops, and the sections are the
+> encoder's. Version 2's LZ4 block is made in parts by `svndiff::lz4`, a port of `lz4_flex` 0.11.6's block compressor
+> that makes its bytes. The oracle is the whole window, which `deltas` makes and `Encoder::window` encodes: every
+> window, made under every unit size in versions 0 and 2, stored and LZ4, is the same bytes. Red, by main's test: a
+> 102,400-byte window made whole took 6.0 to 7.7 ms in one step (debug, M-series Mac). At 256 units a step, no step
+> passes 500 us. **The update report's drive BUILT (same day, A-751 part 2).** The drive makes each window a step at a
+> time (`report::drive`'s `WindowWork`): its target and source pieces are read 1,024 bytes a step, the window is made
+> 1,024 units a step, and its writes, as `svndiff.c` makes them, are sent 1,024 bytes a piece (`Call::DeltaPiece`).
+> 1,024 units are about 1.5 us of an M-series Mac's release build, under half the ~3.7 us quantum. Each consumer frames
+> the pieces as before: svn:// sends a write's pieces as its one `textdelta-chunk` string, the head of which carries
+> the write's whole length (`ra_svn::write_string_head`); DAV base64s them. The drive encodes in its consumer's
+> version (`Drive::with_encoding`, svn://'s `editor::encoding_of`). By test: `/trunk/big.txt` (6,000 lines) driven a
+> step a call, edited and added, in version 0 and version 2 with LZ4: before, 4 steps of 2.8-3.0 ms each run (debug);
+> now none past 500 us, and its stream is the whole-window path's byte for byte. The recorded svnserve sessions are
+> unchanged. **The replay drive and `get-file-revs` BUILT (same day, A-751 part 3).** Both make every window through
+> the same step (`report::drive::window_unit`, which hands each piece to its caller's sink). The replay drive
+> (`report::drive::replay`, svn://'s `replay` and `replay-range`) gives a window's pieces as the update drive does, a
+> step at a time (`Replay::next_within`). Its svn:// turn ends at the first step past the budget's quantum, as the
+> report exchange's does, where it was one whole call a step. `get-file-revs` (`reads::file_revs`) sends a revision as
+> its tuple, or its DAV element's head (`dav::listing::file_rev_head`), then its delta a step at a time: a string a
+> write over svn://, streamed base64 over DAV. It holds a window's two pieces at most, where it held both texts whole
+> and made the revision whole in one step. `Stream::resume` and the DAV file-revs report take the budget, so a slice
+> stops at its quantum. By test, `big.txt` (6,000 lines; added at r5, edited at r6), a step a call, a step over budget
+> timed again from its state before (a preemption under the suite's load reached 3.6 ms, past a whole window's 3.0 ms):
+> the replay of r6 and r5 and `get-file-revs` 5:6 over svn:// (svndiff 0 and 2) and DAV made no step past 500 us, where
+> whole-window steps made several of about 3 ms. Their deltas are the whole-window path's byte for byte, and the
+> recorded svnserve sessions (replay, `get-file-revs`, svndiff 0) are unchanged. The dump exporter computes its own
+> windows (`migration::export`, `deltas_at`); its format 3 adopting the maker is w-svn's.
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -13108,7 +13166,8 @@ engine: the verdict, rebase, position mapping, the register).
 > restart never drops the edge's port: a client that connects while a daemon is down waits in the listener's queue and
 > is answered by the next daemon. An address the anchor cannot bind ends its start by name, as a fleet node's serve
 > sockets do. A library starter asks for the edge too (`StartSpec::vcs_http`), and its anchor holds it the same way.
-> Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
+> Since A-748 Windows holds it too, with the SSH edge's and svn://'s: the anchor shares each with every daemon it spawns
+> as an explicit duplicate made for that daemon's process (`WSADuplicateSocketW`), never an inherited handle (A-183).
 >
 > **Status (2026-11-19, A-682: upload-pack served from each repository's store on its owner shard).** The daemon's
 > git site serves upload-pack from the store A-662 keeps on the repository's owner shard, lent by
@@ -32842,8 +32901,8 @@ Applied in the same change to:
   stall budget), the link's redial pace, and four probe timeouts (the stall budget's tail, the replacement's handshake,
   its first discovery page, and the forward's exchange). Each driving turn measures it on the session it borrowed. The
   floor never lowers a forward's bound: a replacement's fresh estimator measures a shorter one than the silent session
-  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log once a crossing
-  and counts it (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
+  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log, at most once a
+  window since 2026-11-20 (§4.8's status of that day), and counts each crossing (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
   as A-129 runs the fleet's timers at their measured floors and reports the overrun.
 - **Why the floor and not a longer SLO.** The SLO is the operator's; the floor is the path's, and only the path knows
   it. On loopback, quiet, the floor is about 3.1 s (the window floored at three initial probe timeouts, about 2 s), inside
@@ -51867,7 +51926,10 @@ unchanged); `docs/cli.md`; `docs/library.md`.
   with the edge's own backlog, derived from the same configuration the daemon derives (`bind_vcs_http_listener`), so
   the queue is the edge's whoever bound it. (3) An address the anchor cannot bind ends its start by name, as a fleet
   node's serve sockets do: the operator asked for the edge there, and a daemon would fail the same bind; one that cannot
-  be made inheritable is not held, and each daemon binds its own, as for the NFS listener. (4) No second `unsafe` site:
+  be made inheritable is not held, and each daemon binds its own, as for the NFS listener. *Amended by A-748
+  (2026-11-20, main's ruling): Windows gets the same hold, the anchor sharing each listener with each daemon as an
+  explicit `WSADuplicateSocketW` duplicate made for its process id; a listener that cannot be shared with one daemon is
+  said on the log, and that daemon binds its own.* (4) No second `unsafe` site:
   the NFS listener's adoption became `held_listener(variable)`, which both use. (5) A library starter's anchor takes the
   same option (`StartSpec::vcs_http`), its role and command carrying it, as main asked if it was the same piece.
 - **Tests.** macOS arm64 (Mac Studio, `cargo test --locked`, fmt clean for `slates-anchor`, `slates-api`, `slates-cli`
@@ -51882,7 +51944,7 @@ unchanged); `docs/cli.md`; `docs/library.md`.
   (`a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again`: a request made while the killed daemon's
   successor started was answered `401` by it, at the port the successor named again).
 - **Owed.** Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2), the edge's as the NFS
-  listener's.
+  listener's. *The edges' closed by A-748; the NFS listener's and the fleet's serve sockets stay owed.*
 
 ### A-654 part 3 — receive-pack on git's HTTP site (2026-11-19, g258, UI goal 93; §4.17.2 "A push", "Transports" item 1 and "Access"; A-625 parts 2 and 3, A-654 part 2)
 
@@ -55621,6 +55683,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-753 — A branch created at a commit another branch holds is made from it, and a resent object is read from the index (bug, 2026-11-20, w-git for UI goal 93; found by use in A-722's proof)
+- **Found by use.** A-722's proof on the 32-core Studio (release, git/git): 100 concurrent v1.5.0 pushes to one
+  repository, each creating its own branch, answered 80 `ok` and 20 `ng refs/heads/pN failed to update ref`, twice; a
+  diagnostic build (branch agents/w-git-diag, never main) logged each as the append refused
+  `TableAtCapacity { table: "green_chains" }`.
+- **Causes.** (1) A create was made at the green its new value's first parent heads, else the default branch's head:
+  with neither, each branch made the whole tree again as its own work, and a hundred branches at one commit held it a
+  hundred times in the partition's chains (a checkpoint costs the chains what its increments did, so folding frees
+  nothing). (2) Found by the test: a push resending objects the repository indexes was refused `missing necessary
+  objects`, since the connectivity check read each pack object from the quarantine, which passes over what the index
+  holds. (3) At the chains' cap a push checkpointed only the greens it updated, so an entry of creates alone could free
+  nothing.
+- **Change.** `receive::works::Greens::holding_head`: a create is made first at the green whose head is its new value,
+  its work empty (`ShardGreens::holding`); `git_push::intake::Quarantined` reads an object the quarantine passed over
+  from the index (`Repository::stored`); `repository::push::admit` at the cap checkpoints the repository's other members
+  too.
+- **Tests.** `slates-server` `git_push::tests::t_a753_a_repository_takes_branch_creates_past_its_chain_budget` (24
+  creates under a 64 KiB chain budget, each resending its pack; red on main: every create after the first refused).
+  `slates-server --lib -- vcs_store:: git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks::
+  git_protect` 199 passed; `slates-git --lib -- receive::` 46 passed; fmt clean (macOS arm64, this Mac, local).
+
 ### A-722 part 4b's race — A staging a landing overtakes is staged again, whatever step it was in (bug, 2026-11-20, w-git; found by reading after the 100-push run)
 - **Cause.** Part 4b made the stage's fork at its rows' step and read the next position at its positions' step, so a
   push that landed during the staging's earlier turns could leave a stage that looked current (its fork made after
@@ -55819,6 +55902,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   back that label, the shard and the pid. Red first: with the record not written the test fails ("the watchdog recorded
   no stuck task"); green, the line reads "shard 1 is spinning: 3198 ms of CPU … in task liveness::spinner, at its
   poll 1" (macOS arm64, Mac Studio 2).
+- **Follow-up (2026-11-20, w-forming; found by use: a 2,933 ms poll and every fleet loop's long poll were named by
+  lines inside helpers).** Work spawned through a helper is labelled with the helper's caller: `fleet::spawn_detached`
+  is `#[track_caller]`, and `xshard::task_within` and `task_in_shard_time` are `#[track_caller]` functions that take
+  their caller's site and spawn the work with `slates_rt::futures::spawn_at` (the call is made when the helper is
+  called, its answer awaited after). Tests: `fleet::spawn_label_tests::a_fleet_loops_label_names_the_line_that_spawned_it`
+  and `xshard::tests::a_cross_shard_tasks_label_names_the_line_that_asked_for_it`, red before (named `fleet.rs:7034`
+  and `xshard.rs:1092`).
 - **Applied in the same change to** the watchdog's module docs, amendments.tsv.
 
 ### A-664 Subversion objects, symbolic links — A submitted symbolic link is a file of `link ` and its target whose list is `svn:special` (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -56221,7 +56311,8 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   node's anchor) and only for a work another node made (the id's creator); a client of the holder is refused at its
   channel (`route_gated`), a client of the owner by the owner's check, both `Unsupported`. The owner cannot yet tell
   which node made the work from the anchor alone (an id names a member id, which is derived from the anchor and the
-  boot's nonce), so any other member may move such a floor; members are mutually authenticated.
+  boot's nonce), so any other member may move such a floor; members are mutually authenticated. (Closed the same day,
+  below: the work's own member alone.)
 - **Counters.** `merge.work.floor_told_owner_node` (the test's non-vacuity count), `merge.work.floor_not_sent`.
 - **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
   a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed` (two nodes at `f = 1`, B with the hook:
@@ -56318,9 +56409,8 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   install so (the work answered `Unpublished` for good; the test's first run, by use).
 - **Counters.** `merge.work.replay_awaits_replica`, `merge.work.replayed_on_replica` (the test's non-vacuity count),
   `merge.work.replay_ask_unhanded`.
-- **Owed.** A creation a restart caught waiting for the owner's admission is dropped here (`drop_pending_creations`),
-  and the floor the owner may have recorded for it stays there, since the pending record does not name the green: it
-  keeps more history, not less. Recovering a holder's pending submit is the existing path: the work's next verb runs it
+- **Owed (closed the same day, part e2 below).** A creation a restart caught waiting for the owner's admission was
+  dropped here (`drop_pending_creations`), and the floor the owner may have recorded for it stayed there. Recovering a holder's pending submit is the existing path: the work's next verb runs it
   again under its key, and the owner's completion record answers it.
 - **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
   a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_restart` (three nodes at `f = 1` keeping
@@ -56351,6 +56441,97 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   keeps `g`; A's floor rose to 2) and `a_holders_work_submits_a_copy_composed_over_the_holders_replica` (B's work copies
   `f` to `f2` and submits: version 2, composed on B's replica, A's green reads `f2` "hello"). Fleet `a_holder` 22 of 22;
   `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62, `merge_service::` 14 of 14; fmt clean.
+
+### A-697, the node verbs' authority — A work's node verbs are its own member's alone (2026-11-20, w-shared for UI goal 93; main's ruling on part b's open point)
+Applied in the same change to: part b's entry (its "Who may send it" closed), GAPS (A-247's step two),
+`crates/server/src/verbs.rs` (`serve_forward`, `node_verb_work`).
+- **Rule (main).** A node's verb about one of its works (`AdmitWork`, `MoveWorkFloor`, `SubmitComputed`) is served only
+  when the work's id names, as its creator (its high bytes), the member this node has learned for the fleet link's
+  authenticated anchor (`member_task::anchor_of`, read on the control shard, where `serve_forward` runs). Fleet
+  certificates bind member ids, so no boot nonce is needed; a warm restart keeps the member id, so the member that made
+  a work moves its floor after one. Any other member is refused `Forbidden`, before anything is dispatched or recorded.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --lib
+  verbs::tests::a_works_floor_is_moved_by_the_member_its_id_names_alone` (a one-shard daemon owning a green, member
+  0x51 learned for the peer's anchor: a drop of a 0x51 work's floor moved it; a drop of a 0x52 work's floor refused
+  `Forbidden` and the floor kept). Red with the check removed: the second floor dropped. Fleet `a_holder` 22 of 22 (the
+  admissions, floor moves and computed submits of every holder test pass the check); `verbs::` 63 of 63, `work_home` 2
+  of 2; fmt clean.
+
+### A-748 — On Windows the anchor holds the version-control listeners too, sharing each with every daemon as an explicit duplicate (2026-11-20, w-reaper, main's ruling; amends A-625 part 3 continued (2) decision 3; §4.6; A-183, A-684, A-689)
+
+- **Found by use.** w-interop on jupiter: after each daemon restart both version-control edges came back on new ports
+  (the HTTP edge at 52289, then 53602, 53617, 53629; the SSH edge likewise, its host key kept), so every client lost
+  its URL whenever the daemon restarted. On Unix the anchor holds each listener and hands it over inherited; A-625 part
+  3's decision 3 let a listener that "cannot be made inheritable" go unheld, and Windows inherits no socket (A-183), so
+  there none was held.
+- **Change (main's ruling).** Windows gets the same hold, never by inheritance. The anchor binds the HTTP edge's, the
+  SSH edge's and the svn:// listener once and keeps them (`Supervisor::hold_vcs_*_listener` on Windows). At each spawn
+  it hands the daemon the reading end of a fresh pipe in the spawn's explicit handle list, named by
+  `ENV_SHARED_LISTENERS`; once the daemon's process id is known it duplicates each listener for that process alone
+  (`slates_rt::tcp::share_listener`, `WSADuplicateSocketW`) and writes the protocol records down the pipe
+  (`slates_anchor::shared_listeners`: the variable each answers to and its 628-byte record, every length checked on
+  read), then closes it. The daemon reads the pipe once and makes each listener from its record
+  (`TcpListener::from_share`, `WSASocketW` with `FROM_PROTOCOL_INFO`, kept from its children). The kernel keeps the
+  listening socket and its queue across a restart, as on Unix. A listener that cannot be shared with one daemon is said
+  on the log, and that daemon binds its own; the next spawn shares again.
+- **Unsafe.** `slates-rt` 107 → 109 (`WSADuplicateSocketW`; `WSASocketW` over the record), `slates-server` 5 → 6 (the
+  pipe's reading end taken into ownership once); the record crosses as bytes encoded field by field, with no unsafe
+  view. Each site has its SAFETY line and is named in `unsafe-budget.toml`.
+- **Tests.** `crates/cli/tests/vcs_edge_restart.rs` (`a_daemon_restart_keeps_every_version_control_listeners_port`,
+  every platform): an anchor with all three listeners on loopback ports the system picks; the daemon killed; each port
+  asked while no daemon runs and answered by the successor (`401`, `SSH-2.0-`, svnserve's greeting); the successor
+  naming the same three ports. Green on Windows x86_64 (jupiter, kiln r33: 61321, 61322 and 61323 before and after the
+  kill, 2.10 s) and macOS arm64 (Mac Studio 2, 3.1 s). Pure: rt's `share` codec (a record whose every field differs,
+  back whole; a byte short or long refused) and the anchor's `shared_listeners` (three shares back in order; every cut
+  inside a record refused `Truncated`; too many, too long).
+- **Applied in the same change to** A-625 part 3's status and decision 3, `docs/wip/platforms.md` gap 2,
+  `unsafe-budget.toml`, amendments.tsv.
+
+### A-755 — A live whole entry's build sizes each piece to the quantum left at the seal rate it measures (bug, 2026-11-20, w-forming; found by use: main's performance-gaps-upfront order; amends A-377's "one piece at least"; §4.10 "Live shipping"; CLAUDE.md "Bounded work everywhere")
+
+- **What was measured.** Probes in the live_chaos fresh-member flow (a debug fleet under `taskpolicy -b`, macOS arm64,
+  Mac Studio adas-mac-studio-4) timed each part of a whole build's turn: one piece, a whole archive chunk (a MiB), took
+  87 to 302 ms of the owner shard's CPU against seal quanta of 14 to 784 us. A-377 sealed pieces until the quantum passed,
+  one piece at least, and a piece was always a whole chunk.
+- **The change.** `WholeBuild` keeps the bytes it has sealed and the clock time their seals took; `piece_bytes` sizes each
+  next piece to what that rate seals in the turn's quantum left, at least one archive page (`MAX_BASE_PAGE_BYTES`, so a
+  turn moves the build on and a piece's name and tag stay a small share of it) and at most a chunk. Pieces of any size
+  open as before (`open_body` joins them in order).
+- **Owed (GAPS).** The append that ends a build (223 to 498 ms of CPU a turn in the same runs) and a large delta's
+  shipper append stay one turn.
+- **Tests.** `live_ship::tests::a_whole_builds_piece_is_what_the_measured_rate_seals_in_the_quantum_left`; the fleet test
+  `a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it` now holds the build to at least the
+  content's bytes over a page in turns under the cut quantum (48 for 3 MiB), red before (8 turns); `--test fleet whole`
+  5/5, `--test fleet live` 20/20, `--lib live_ship::` 24/24.
+- **Applied in the same change to** A-377's doc lines in `live_ship.rs`, GAPS (the one-turn walks entry), amendments.tsv.
+
+### A-697 part e2 — A holder creation a restart caught waiting for its admission releases the owner's floor before it is dropped (2026-11-20, w-shared for UI goal 93; main's order: performance gaps up front, held history the same waste as A-742's)
+Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's step two), `crates/db/src/catalog.rs`
+(`PendingCreationRecord::green`), `crates/db/tests/alias.rs`, `crates/server/src/work_home.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/verbs.rs`, `crates/server/tests/fleet.rs`.
+- **What was there.** A restart drops every creation it catches waiting for its green's owner (`drop_pending_creations`):
+  its name and id go back, and the client's resend makes the work afresh. For a holder's creation (part a2) the owner
+  may already have admitted it and recorded its floor, which then held the green's history at that version for a work
+  never made, for good.
+- **Change.** The pending record names its green (`PendingCreationRecord::green`; a field of a record, so the log's
+  schema hash moves as an appended variant would move it, `record.rs`). At recovery a pending creation over a green
+  another node owns is not dropped (`work_home::hold_for_release`): its record stays, holding its name and id, and its
+  resend is answered retryable. Its release is asked as clients are let in (`verbs::ask_owners_to_replay` →
+  `work_home::release_admissions`) and again at each resend: `MoveWorkFloor` with no base, from the control shard, which
+  the owner applies monotonically (a floor never recorded stays none). On `WorkFloorMoved` the creation is settled, its
+  name and id given back, and the next resend makes the work afresh. One release is out at a time a creation; one
+  unanswered is asked again at the next resend or the next start (no timer, A-533's pattern), and the record survives
+  a restart between, so the release is never lost.
+- **Counters.** `merge.work.admission_held_for_release`, `merge.work.admission_released` (the test's non-vacuity count),
+  `merge.work.admission_release_unanswered`.
+- **Test seam.** `Daemon::lose_next_owner_answer` now loses an admission over the fleet too (`admit_over_fleet`), as it
+  loses one between shards; `Daemon::work_floors_of` lists a green's floors at its owner.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner` (three nodes at `f = 1` keeping their state; B
+  loses a creation's admission answer after A recorded the work's floor, restarts over its own segment: A's floor for
+  that work released, B's counter moved, the name made again at a new id). Red with the creation dropped as before: A's
+  floor never released (the poll gave up). Fleet `a_holder` 23 of 23; `slates-server --lib work_home verbs::
+  takeover::`, `slates-db --lib` and `--test alias`; fmt clean.
 
 ### A-756 — A volume made on a node by materialization is found there by its name: it claims its name's alias (bug, 2026-11-20, w-fed-move, kiln goal 91; found by use: kiln's live move of an agent's captured clone, its mount refused `NOENT` on the new owner in four runs of five; §4.8 "Lookup", §4.10 "Ownership follows the writer"; A-236, A-291)
 - **Why.** A clone named for another partition than its origin's lives beside its origin and is found by name only

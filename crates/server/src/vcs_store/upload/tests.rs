@@ -202,6 +202,22 @@ fn ids_in(pack: &[u8]) -> Vec<String> {
   ids
 }
 
+/// The ids of the objects `pack` holds, in the order it sends them.
+fn sent_in_order(pack: &[u8]) -> Vec<String> {
+  let unpacked = unpack::read_whole(
+    pack,
+    ObjectFormat::Sha1,
+    &NoIndex,
+    &mut Admission::new(ROOM),
+  )
+  .expect("a whole pack");
+  unpacked
+    .objects
+    .iter()
+    .map(|object| object.id.to_string())
+    .collect()
+}
+
 /// The ids of `objects`, in name order.
 fn ids_of(objects: &[Brought]) -> Vec<String> {
   let mut ids: Vec<String> = objects.iter().map(|(_, id, _)| id.to_string()).collect();
@@ -539,4 +555,137 @@ fn t_a718_a_pushed_version_is_encoded_once_and_fetched_from_its_kept_fragments()
   for (pack, _) in [before, after] {
     assert_eq!(ids_in(&pack_of(&pack)), ids_of(&objects));
   }
+}
+
+/// An annotated tag `name` of commit `target`, as git writes one: its object, its id and its bytes.
+fn annotated_tag(
+  target: ObjectId,
+  name: &str,
+) -> (slates_git::object_name::Kind, ObjectId, Vec<u8>) {
+  use slates_git::object_name::{Kind, name_of};
+  let bytes = format!(
+    "object {target}\ntype commit\ntag {name}\ntagger A <a@example.com> 1700000000 +0000\n\n{name}\n"
+  )
+  .into_bytes();
+  let id = name_of(ObjectFormat::Sha1, Kind::Tag, &bytes).expect("named");
+  (Kind::Tag, id, bytes)
+}
+
+/// Pushes annotated tag `name` of commit `target` to repository `id` as the ref `refs/tags/<name>`, from `main`'s green
+/// `root` at `version`.
+fn tagged(
+  state: &mut ShardState,
+  (id, root, version): (RepositoryId, DbVolumeId, u64),
+  target: ObjectId,
+  name: &str,
+) {
+  let tag = annotated_tag(target, name);
+  let tag_id = tag.1;
+  branch_at(
+    state,
+    (id, &[tag]),
+    (&format!("refs/tags/{name}"), root, version),
+    tag_id,
+  );
+}
+
+/// A-745 (§4.17.1 "A fetch's answer" rule 4: a fetch reads the index as it stood when it began, so a push landing
+/// meanwhile neither stops it nor changes its answer). Do: push a commit to `main` and tag it `v1` (annotated); answer a
+/// `fetch` of the commit with `include-tag` whole, the start generation's answer; then answer it again in turns through
+/// the lender's hold, one unit a step, and after its first step push a second commit to `main` and tag the first commit
+/// `v2`. Expect: the held answer's pack the start generation's objects byte for byte, in the same order (`v1`'s tag, not
+/// `v2`'s, nor the second commit; each object's zlib level is the stream's own timed choice, §4.11, so the compressed
+/// bytes are compared by the objects they inflate to); and, holding no generation and lent the objects alone as the
+/// edges lent an answer's later steps before this, the same steps' pack other objects (its `include-tag` scan meets no
+/// ref, so the tag is lost), so the hold is what keeps it.
+#[test]
+fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile() {
+  let (start, held, unheld) = crate::daemon::audit_on_shard(|state| {
+    let (id, root) = repository(state, "generations", VcsTool::Git);
+    let files = [(b"README".to_vec(), b"one\n".to_vec())];
+    let (objects, first) = commit_of(&files, &[], FIRST_DATE);
+    let first_tree = tree_of(&objects);
+    let version = push_through(state, (id, root), &objects, (None, first, first_tree));
+    tagged(state, (id, root, version), first, "v1");
+    let mut wants = fetch(&[first], &[]);
+    // `include-tag` beside the request's other arguments, before its flush.
+    let flush_at = wants.len() - FLUSH.len();
+    wants.splice(flush_at..flush_at, packet(b"include-tag\n"));
+    let began = super::hold_in(state, id, &owner()).expect("held");
+    let start = answered(state, (id, &owner()), Asked::Request(&wants)).0;
+    let in_turns = |state: &mut ShardState,
+                    hold: super::GitGeneration,
+                    held: bool,
+                    land: &mut dyn FnMut(&mut ShardState)| {
+      let mut admission = Admission::new(ROOM);
+      let mut answer = super::lend_held_in(state, &hold, |served, packs| {
+        upload::serve_in_turns(
+          served,
+          Version::V2,
+          Asked::Request(&wants),
+          packs,
+          &mut admission,
+        )
+      })
+      .expect("the request's step lent");
+      let mut out = Vec::new();
+      for step in 0..STEPS {
+        let write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
+          answer.write_within(
+            served,
+            packs,
+            &mut admission,
+            &mut out,
+            MAX_LEN,
+            &mut || true,
+          )
+        };
+        let written = if held {
+          super::lend_held_in(state, &hold, write)
+        } else {
+          lend_on(state, (id, None), write)
+        }
+        .expect("the answer's step lent");
+        if step == 0 {
+          land(state);
+        }
+        if written == Written::End {
+          return out;
+        }
+      }
+      panic!("an answer that never ended")
+    };
+    let mut landed = false;
+    let held = in_turns(state, began, true, &mut |state| {
+      let files = [(b"README".to_vec(), b"two\n".to_vec())];
+      let (objects, second) = commit_of(&files, &[first], FIRST_DATE + 1);
+      let version = push_through(
+        state,
+        (id, root),
+        &objects,
+        (Some(first_tree), second, tree_of(&objects)),
+      );
+      tagged(state, (id, root, version), first, "v2");
+      landed = true;
+    });
+    assert!(landed, "the push landed mid-answer");
+    let hold = super::hold_in(state, id, &owner()).expect("held");
+    let unheld = in_turns(state, hold, false, &mut |_| {});
+    (start, held, unheld)
+  });
+  // What the generation says: the pack's objects, in the order the stream sent them, each by its id, the hash of its
+  // bytes, so equal ids are the objects byte for byte. How each is deflated is the stream's own measured choice on the
+  // shard's clock (§4.11, `fragment::level` samples every level timed), so two streams of one generation may deflate
+  // one object at two levels; the zlib bytes are not the generation's to say.
+  let said = |answer: &[u8]| sent_in_order(&pack_of(answer));
+  assert_eq!(
+    said(&held),
+    said(&start),
+    "held to the generation it began on"
+  );
+  assert_ne!(
+    said(&unheld),
+    said(&start),
+    "lent the objects alone, an answer's later steps lose its refs"
+  );
 }

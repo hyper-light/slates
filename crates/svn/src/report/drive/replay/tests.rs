@@ -3,7 +3,7 @@
 //! `svnrdump dump` replayed, and the scripted replays (a copy with and without deltas and below the low-water mark, a
 //! replacement by a copy, revision 0, part of the history).
 
-use super::Replay;
+use super::{Replay, Stepped};
 use crate::ra_svn::Value;
 use crate::reads::tests::Fixture;
 use crate::report::editor::EditorWriter;
@@ -101,7 +101,8 @@ pub(crate) fn recorded_drives(server: &[u8]) -> Vec<Vec<&[u8]>> {
 
 /// Our replay of `revision`, written as the connection writes it for a stock 1.15 client.
 fn replayed(fixture: &Fixture, (revision, low, deltas): (u64, u64, bool)) -> Vec<u8> {
-  let mut replay = Replay::new(revision, "/", low, deltas);
+  let (version, compression) = crate::report::editor::encoding_of(&stock_capabilities());
+  let mut replay = Replay::new(revision, "/", low, deltas).with_encoding(version, compression);
   let mut writer = EditorWriter::new(&stock_capabilities(), MOST_OPEN);
   let mut out = Vec::new();
   while let Some(call) = replay.next(&fixture.index, &fixture.green, None).unwrap() {
@@ -149,4 +150,85 @@ fn every_recorded_replay_is_driven_as_svnserve_drove_it() {
   }
   // svnsync: revisions 1 to 11; svnrdump: 1 to 11; five single replays; the range 2 to 5.
   assert_eq!(compared, 11 + 11 + 5 + 4);
+}
+
+/// A-751, main's red for the replay drive ("a window in units through the same encoder, red first with the past-budget
+/// counter at 0, bytes equal to today's"). Do: over the report fixtures' repository, replay r6, where `/trunk/big.txt`
+/// (6,000 lines, several windows) is edited, and r5, where it is added, with deltas, in version 0 and in version 2
+/// with LZ4, a step a call, timing each call (a call past the budget timed again from its state before,
+/// `RETIMES`). Expect: no call past `STEP_BUDGET`; `big.txt`'s delta the stream the whole-window path made
+/// (`big_text_stream`), byte for byte. Red before the change: a window was made and given in one call, milliseconds in
+/// a debug build.
+#[test]
+fn a_large_texts_replayed_windows_are_made_with_no_step_past_its_budget() {
+  use crate::report::drive::green::repository;
+  use crate::report::drive::tests::{RETIMES, STEP_BUDGET, big_text_stream};
+  use crate::report::drive::{Call, Sources};
+  use crate::svndiff::{Compression, Version};
+  use std::time::{Duration, Instant};
+  let (index, green) = repository();
+  let locks = crate::lock::LockTable::new();
+  let sources = Sources {
+    index: &index,
+    repository: &green,
+    locks: &locks,
+    now: crate::lock::AprTime(0),
+    rules: None,
+  };
+  let text_at = |revision| {
+    let text = super::super::dirent(&sources, "/trunk/big.txt", revision)
+      .unwrap()
+      .unwrap()
+      .text
+      .unwrap();
+    green.texts[&text.identity].clone()
+  };
+  for (revision, base) in [(6, Some(text_at(5))), (5, None)] {
+    for (version, compression) in [
+      (Version::Zero, Compression::Stored),
+      (Version::Two, Compression::Lz4),
+    ] {
+      let expected = big_text_stream(
+        (base.as_deref(), &text_at(revision)),
+        (version, compression),
+      );
+      let mut replay = Replay::new(revision, "/", 0, true).with_encoding(version, compression);
+      let (mut past, mut longest, mut streams) = (0usize, Duration::ZERO, Vec::new());
+      let mut stream: Option<Vec<u8>> = None;
+      loop {
+        let before = replay.clone();
+        let began = Instant::now();
+        let next = replay.next_within((&index, &green), None, 1).unwrap();
+        let mut took = began.elapsed();
+        for _ in 0..RETIMES {
+          if took <= STEP_BUDGET {
+            break;
+          }
+          let mut again = before.clone();
+          let began = Instant::now();
+          let _ = again.next_within((&index, &green), None, 1).unwrap();
+          took = took.min(began.elapsed());
+        }
+        longest = longest.max(took);
+        past += usize::from(took > STEP_BUDGET);
+        match next {
+          Stepped::Ended => break,
+          Stepped::Call(Call::ApplyTextDelta { .. }) => stream = Some(Vec::new()),
+          Stepped::Call(Call::DeltaPiece { bytes, .. }) => {
+            stream.as_mut().unwrap().extend_from_slice(bytes);
+          }
+          Stepped::Call(Call::TextDeltaEnd) => streams.push(stream.take().unwrap()),
+          _ => {}
+        }
+      }
+      assert!(
+        streams.contains(&expected),
+        "r{revision}, {version:?}: big.txt's stream"
+      );
+      assert_eq!(
+        past, 0,
+        "r{revision}, {version:?}: longest step {longest:?}"
+      );
+    }
+  }
 }

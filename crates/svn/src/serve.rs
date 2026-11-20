@@ -180,6 +180,9 @@ pub struct Sources<'s, R: ?Sized> {
   pub now: AprTime,
   /// Who may do what in the repository.
   pub policy: Policy<'s>,
+  /// Where a commit's new texts go, a window at a time (§4.17.1 rule 1; `commit::drive::TextSink`): the caller keeps a
+  /// landed work's sealed texts and gives back every other one.
+  pub texts: &'s dyn commit_drive::TextSink,
 }
 
 /// Who may do what in a repository, as its `svnserve.conf` and authorization file say
@@ -956,6 +959,7 @@ impl Connection {
         sources.index,
         sources.repository,
         sources.locks,
+        sources.texts,
         answer,
         out,
       )
@@ -1577,6 +1581,7 @@ impl Connection {
         sources.index,
         sources.repository,
         sources.locks,
+        sources.texts,
         &value,
         out,
       )
@@ -1656,13 +1661,7 @@ impl Connection {
     let authentication = established.reads_authentication(&sources.policy);
     let session = established.reads_session(&sources.policy, authentication);
     let progress = stream
-      .resume(
-        sources.index,
-        sources.repository,
-        &session,
-        out,
-        budget.room,
-      )
+      .resume(sources.index, sources.repository, &session, out, budget)
       .map_err(Refused::Item)?;
     self.phase = match progress {
       reads::Progress::More => Phase::Streaming(established, stream),

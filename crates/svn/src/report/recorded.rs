@@ -129,6 +129,18 @@ pub(crate) fn admitting(bytes: &[u8]) -> Bounds {
   }
 }
 
+/// How many whole items `bytes` begins with: an item a connection is still writing in pieces at its end (a delta's
+/// `textdelta-chunk` sent a piece a turn, A-751) not counted.
+pub(crate) fn whole_items(bytes: &[u8]) -> usize {
+  let mut count = 0;
+  let mut rest = bytes;
+  while let Ok(Parsed::Item { consumed, .. }) = Parser::new(admitting(rest)).parse(rest) {
+    count += 1;
+    rest = &rest[consumed..];
+  }
+  count
+}
+
 /// `bytes` split into its items, each with its whitespace.
 pub(crate) fn items(bytes: &[u8]) -> Vec<&[u8]> {
   let mut items = Vec::new();

@@ -104,6 +104,21 @@ pub trait Graph {
   fn fast_forward(&self, green: Self::Green, version: u64) -> bool;
   /// D(k): the objects version `version` of `green` brought, reachable from its head and not from the head before.
   fn brought(&self, green: Self::Green, version: u64) -> impl Iterator<Item = Self::Node>;
+  /// The same, as runs of positions (A-745: `include-tag` asks a run's objects whether they hold a tag's end, a version
+  /// a unit, never an object a unit). A store that keeps D(k) as runs gives them as kept.
+  fn brought_set(&self, green: Self::Green, version: u64) -> Positions {
+    Positions::of(self.brought(green, version).map(Into::into).collect())
+  }
+  /// What every ref names, from the ref at index `from` on, each with its ref's index (A-745: a walk over the refs
+  /// keeps its place by index across steps). A store that keeps its refs in a list starts at `from` at once.
+  fn tips_from(&self, from: usize) -> impl Iterator<Item = (usize, Self::Node)> {
+    self.tips().enumerate().skip(from)
+  }
+  /// The annotated tags under `refs/tags/`, from the ref at index `from` on, each with its ref's index, as
+  /// [`Graph::tips_from`] walks the refs.
+  fn tags_from(&self, from: usize) -> impl Iterator<Item = (usize, Self::Node)> {
+    self.tags().enumerate().skip(from)
+  }
 }
 
 /// What a commit's row holds of what the negotiation reads (§4.17.2 "The repository in git's terms", item 2).
@@ -353,11 +368,6 @@ impl Held {
     }
   }
 
-  /// Whether nothing is held.
-  pub(super) fn is_empty(&self) -> bool {
-    self.next_from(0).is_none()
-  }
-
   /// The least position held at `from` or after it.
   pub(super) fn next_from(&self, from: u64) -> Option<u64> {
     match &self.form {
@@ -524,74 +534,222 @@ pub fn negotiate<S: Graph>(
   }
 }
 
-/// A negotiation begun (A-745): answered already (nothing, or the acknowledgments alone), or a pack whose objects are
-/// still being chosen, a unit at a time.
+/// A negotiation begun (A-745): answered already (nothing, or the acknowledgments alone where no search could make it
+/// ready), or under way a unit at a time: `ready`'s search, the cut, and the choice of the pack's objects.
 pub enum Begun<G, N> {
   /// Answered.
   Answered(Outcome<G, N>),
-  /// A pack, its objects being chosen ([`Negotiating::step`]); boxed, the walk being most of its size.
+  /// Under way ([`Negotiating::step`]); boxed, the walk being most of its size.
   Selecting(Box<Negotiating<G, N>>),
 }
 
-/// A negotiation whose pack's objects are being chosen a unit at a time (A-745, §4.17.1 "A fetch's answer" rule 3): what
-/// its answer says besides them (the acknowledgments, the shallow-info section and the runs), how it went so far, and
-/// the walk, which keeps its place across steps and is lent the graph for each.
+/// A negotiation answered a unit at a time (A-745, §4.17.1 "A fetch's answer" rule 3): whether the server is `ready`
+/// (the search below each want), the shallow cut (its walk), then the choice of the objects its pack sends one by one;
+/// what its answer says besides them (the acknowledgments, the shallow-info section and the runs) as each is decided,
+/// how it went so far, and the walk under way, which keeps its place across steps and is lent the graph for each.
 pub struct Negotiating<G, N> {
-  /// The acknowledgments, `None` after `done`.
+  /// The acknowledgments, `None` after `done` (and before `ready` is decided).
   acknowledgments: Option<Acknowledgments>,
-  /// The shallow-info section, when one is due.
+  /// The shallow-info section, when one is due, once the cut is made.
   shallow_info: Option<ShallowInfo>,
   /// The runs the pack carries whole.
   runs: Vec<Run<G>>,
   /// How it went so far.
   counters: Counters,
-  /// The walk choosing the objects sent one by one.
-  selecting: objects::Selecting<N, G>,
+  /// The walk under way.
+  phase: Phase<G, N>,
+}
+
+/// What a negotiation does next.
+enum Phase<G, N> {
+  /// The search for `ready`.
+  Ready(Box<ready::Readying<N>>, Box<Decided<N>>),
+  /// The shallow cut.
+  Cut(Box<shallow::Cutting<N>>, Box<Decided<N>>),
+  /// The choice of the objects sent one by one.
+  Selecting(Box<objects::Selecting<N, G>>),
+  /// Answered: nothing left.
+  Done,
+}
+
+/// What the request decided before the walks, owned so it outlives every lending of the graph: the wants, those a run
+/// answers, the common haves, the client's shallow commits, the deepening, and what the choice reads of the request.
+struct Decided<N> {
+  /// The wants.
+  wants: Vec<N>,
+  /// The wants a run answers.
+  one_round: Vec<N>,
+  /// The common haves.
+  common: Vec<N>,
+  /// The client's shallow commits.
+  client_shallow: Vec<N>,
+  /// The deepening, taken when the cut begins.
+  deepening: Option<shallow::Deepening<N>>,
+  /// What the choice reads of the request.
+  asked: objects::Asked,
+  /// `done`: the acknowledgments are left out.
+  done: bool,
 }
 
 impl<G, N> Negotiating<G, N> {
-  /// The acknowledgments the answer gives before its pack, `None` after `done`.
-  pub fn acknowledgments(&self) -> Option<&Acknowledgments> {
-    self.acknowledgments.as_ref()
+  /// How it went so far.
+  pub fn counters(&self) -> Counters {
+    self.counters
   }
 
-  /// The shallow-info section, when one is due.
-  pub fn shallow_info(&self) -> Option<&ShallowInfo> {
-    self.shallow_info.as_ref()
+  /// The sections the answer gives before its pack, once they are decided (`ready` found and the cut made, the choice
+  /// of the objects under way): the acknowledgments (`None` after `done`) and the shallow-info section; `None` before.
+  pub fn sections(&self) -> Option<(Option<&Acknowledgments>, Option<&ShallowInfo>)> {
+    matches!(self.phase, Phase::Selecting(_))
+      .then(|| (self.acknowledgments.as_ref(), self.shallow_info.as_ref()))
   }
 }
 
 impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
-  /// Does units of the choice until `spent` says the owner's quantum is spent, at least one (each a commit or a tree
-  /// entry): the outcome once the last object is chosen, `None` while more are left.
+  /// Does units of the negotiation until `spent` says the owner's quantum is spent, at least one (a step of `ready`'s
+  /// search, of the cut's walk, or of the choice: a commit or a tree entry): the outcome once it is answered (the
+  /// acknowledgments alone when the server is not ready, else the pack once its last object is chosen), `None` while
+  /// more is left.
   pub fn step<S: Graph<Node = N, Green = G>>(
     &mut self,
     graph: &S,
     admission: &mut Admission,
     spent: &mut dyn FnMut() -> bool,
   ) -> Result<Option<Outcome<G, N>>, Refusal> {
-    let Some(objects) = self
-      .selecting
-      .step(graph, admission, &mut self.counters, spent)?
-    else {
-      return Ok(None);
-    };
-    Ok(Some(Outcome {
-      answer: Answer::Pack(Pack {
-        acknowledgments: self.acknowledgments.take(),
-        shallow_info: self.shallow_info.take(),
-        runs: core::mem::take(&mut self.runs),
-        objects,
-        _node: core::marker::PhantomData,
-      }),
-      counters: self.counters,
-    }))
+    loop {
+      if let Some(outcome) = self.unit(graph, admission, spent)? {
+        return Ok(Some(outcome));
+      }
+      if spent() {
+        return Ok(None);
+      }
+    }
+  }
+
+  /// One unit (the choice does as many as `spent` allows, its own step): the outcome once answered.
+  fn unit<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Option<Outcome<G, N>>, Refusal> {
+    match core::mem::replace(&mut self.phase, Phase::Done) {
+      Phase::Ready(mut readying, decided) => {
+        let found = readying.unit(
+          graph,
+          &decided.wants,
+          &decided.one_round,
+          admission,
+          &mut self.counters,
+        );
+        match found {
+          Err(refusal) => Err(refusal),
+          Ok(None) => {
+            self.phase = Phase::Ready(readying, decided);
+            Ok(None)
+          }
+          Ok(Some(ready)) => {
+            let acknowledgments = Acknowledgments {
+              common: decided.common.iter().map(|node| graph.id(*node)).collect(),
+              ready,
+            };
+            if !ready {
+              return Ok(Some(Outcome {
+                answer: Answer::Acknowledgments(acknowledgments),
+                counters: self.counters,
+              }));
+            }
+            self.acknowledgments = Some(acknowledgments);
+            self.cut(graph, decided, admission).map(|()| None)
+          }
+        }
+      }
+      Phase::Cut(mut cutting, decided) => {
+        match cutting.unit(
+          graph,
+          &decided.client_shallow,
+          admission,
+          &mut self.counters,
+        )? {
+          None => {
+            self.phase = Phase::Cut(cutting, decided);
+            Ok(None)
+          }
+          Some(cut) => self.select(graph, cut, *decided, admission).map(|()| None),
+        }
+      }
+      Phase::Selecting(mut selecting) => {
+        let chosen = selecting.step(graph, admission, &mut self.counters, spent)?;
+        let Some(objects) = chosen else {
+          self.phase = Phase::Selecting(selecting);
+          return Ok(None);
+        };
+        Ok(Some(Outcome {
+          answer: Answer::Pack(Pack {
+            acknowledgments: self.acknowledgments.take(),
+            shallow_info: self.shallow_info.take(),
+            runs: core::mem::take(&mut self.runs),
+            objects,
+            _node: core::marker::PhantomData,
+          }),
+          counters: self.counters,
+        }))
+      }
+      Phase::Done => Ok(None),
+    }
+  }
+
+  /// Begins the cut, `ready` decided (or `done` said).
+  fn cut<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    mut decided: Box<Decided<N>>,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    let cutting = shallow::Cutting::begin(
+      graph,
+      decided.deepening.take(),
+      &decided.wants,
+      &decided.client_shallow,
+      admission,
+    )?;
+    self.phase = Phase::Cut(Box::new(cutting), decided);
+    Ok(())
+  }
+
+  /// Begins the choice of the objects, the cut made.
+  fn select<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    cut: shallow::Cut<N>,
+    decided: Decided<N>,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    self.shallow_info = cut.info.clone();
+    admission
+      .charge_items::<Run<G>>(self.runs.len())
+      .map_err(Refusal::PastAdmission)?;
+    let selecting = objects::Selecting::begin(
+      graph,
+      decided.asked,
+      objects::Sides {
+        wants: decided.wants,
+        one_round: decided.one_round,
+        common: decided.common,
+        cut,
+      },
+      self.runs.clone(),
+      admission,
+    )?;
+    self.phase = Phase::Selecting(Box::new(selecting));
+    Ok(())
   }
 }
 
-/// Begins answering `request` from `graph` (A-745): everything but the choice of the objects sent one by one, which is
-/// bounded by the request (its wants, haves and shallow lines, the one-round runs, `ready` and the cut), then the choice
-/// begun; within `admission`.
+/// Begins answering `request` from `graph` (A-745): what the request bounds (its wants, haves and shallow lines, the
+/// one-round runs, the deepening's `deepen-not` names), answered at once where no search could make the server ready
+/// (`wait-for-done`, or no common have); else `ready`'s search begun (or, after `done`, the cut), each walk then left to
+/// [`Negotiating::step`]; within `admission`.
 pub fn begin<S: Graph>(
   graph: &S,
   request: &Request<'_>,
@@ -612,61 +770,42 @@ pub fn begin<S: Graph>(
   }
   let runs = one_round::runs(graph, request, &wants, &common, &client_shallow, admission)?;
   counters.one_round = runs.answered;
-  let acknowledgments = if request.done {
-    None
-  } else {
-    let ready = !request.wait_for_done
-      && ready::is_ready(
-        graph,
-        &wants,
-        &runs.wants,
-        &common,
-        admission,
-        &mut counters,
-      )?;
+  // Never ready under `wait-for-done`, nor without a common have: answered without a search.
+  if !request.done && (request.wait_for_done || common.is_empty()) {
     let acknowledgments = Acknowledgments {
       common: common.iter().map(|node| graph.id(*node)).collect(),
-      ready,
+      ready: false,
     };
-    if !ready {
-      return Ok(Begun::Answered(Outcome {
-        answer: Answer::Acknowledgments(acknowledgments),
-        counters,
-      }));
-    }
-    Some(acknowledgments)
-  };
-  let cut = shallow::cut(
-    graph,
-    request,
-    &wants,
-    &client_shallow,
-    admission,
-    &mut counters,
-  )?;
-  let shallow_info = cut.info.clone();
-  admission
-    .charge_items::<Run<S::Green>>(runs.runs.len())
-    .map_err(Refusal::PastAdmission)?;
-  let selecting = objects::Selecting::begin(
-    graph,
-    request,
-    objects::Sides {
-      wants,
-      one_round: runs.wants,
-      common,
-      cut,
-    },
-    runs.runs.clone(),
-    admission,
-  )?;
-  Ok(Begun::Selecting(Box::new(Negotiating {
-    acknowledgments,
-    shallow_info,
+    return Ok(Begun::Answered(Outcome {
+      answer: Answer::Acknowledgments(acknowledgments),
+      counters,
+    }));
+  }
+  let deepening = shallow::Deepening::of(graph, request, admission)?;
+  let asked = objects::Asked::of(request, admission)?;
+  let decided = Box::new(Decided {
+    wants,
+    one_round: runs.wants,
+    common,
+    client_shallow,
+    deepening,
+    asked,
+    done: request.done,
+  });
+  let mut negotiating = Negotiating {
+    acknowledgments: None,
+    shallow_info: None,
     runs: runs.runs,
     counters,
-    selecting,
-  })))
+    phase: Phase::Done,
+  };
+  if decided.done {
+    negotiating.cut(graph, decided, admission)?;
+  } else {
+    let readying = ready::Readying::begin(graph, &decided.common, admission)?;
+    negotiating.phase = Phase::Ready(Box::new(readying), decided);
+  }
+  Ok(Begun::Selecting(Box::new(negotiating)))
 }
 
 /// Whether a server whose client holds `common` is ready to send the pack (A-640 part 3: protocol v0's

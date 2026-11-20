@@ -54,7 +54,14 @@ const SLEEP_REFUSED: &str = "runtime.sleep_refused";
 /// `daemon.alive`): the liveness window over the election margin, `W / ELECTION_MARGIN` (A-129 item 1, the leader beats
 /// ten times per election timeout, and item 2, the death-confirmation window is the election timeout; A-359), so nine
 /// beats fit inside a window. 100 ms.
-pub const HEARTBEAT_NS: u64 = LIVENESS_BUDGET_NS / slates_cluster::timing::ELECTION_MARGIN;
+pub const HEARTBEAT_NS: u64 = heartbeat_of(LIVENESS_BUDGET_NS);
+
+/// The heartbeat's rule over a liveness window of `liveness_budget_ns`: `W / ELECTION_MARGIN`, so nine beats fit inside
+/// the window ([`HEARTBEAT_NS`] at the daemon's own window). Shared by every beat that shows a peer it is alive within
+/// that peer's patience: the anchor's, and a quiet MCP listen stream's keep-alive (`slates_mcp::http`).
+pub const fn heartbeat_of(liveness_budget_ns: u64) -> u64 {
+  liveness_budget_ns / slates_cluster::timing::ELECTION_MARGIN
+}
 /// Derived: the liveness window `W` (A-228, A-359): how long a daemon, a shard or a peer may show no progress before it
 /// is judged stuck or silent and its recovery begins. It is the recovery budget `T`
 /// (`slates_db::replay::RECOVERY_BUDGET_NS`, ratified, GAPS §5): the verdict starts a recovery that costs `T`, so
@@ -243,6 +250,8 @@ pub struct RecordDialReport {
 
 /// The daemon.
 pub struct Daemon {
+  /// Where [`Self::wait_for_stop`] hands the control shard its watch, taken in at the next heartbeat.
+  stop_watch_send: std::sync::mpsc::SyncSender<StopWatch>,
   runtime: Option<Runtime>,
   segment: AnchorSegment,
   doorbell: Option<DoorbellThread>,
@@ -502,10 +511,60 @@ pub(crate) fn held_listener(variable: &str) -> Option<Result<TcpListener, RtErro
   Some(TcpListener::from_owned(owned))
 }
 
-/// See the Unix arm: no anchor holds a listener for its daemons on Windows (`docs/wip/platforms.md`, gap 2).
+/// See the Unix arm. On Windows the anchor shares each listener it holds with this daemon as an explicit duplicate made
+/// for this process (A-748, `slates_anchor::shared_listeners`): the shares arrive on the pipe the environment names,
+/// read once, and the one answering to `variable` is made into this process's listener. None where the anchor shared
+/// none for it (a standalone start, tests, or an anchor that could not share it, which said so).
 #[cfg(windows)]
-pub(crate) fn held_listener(_variable: &str) -> Option<Result<TcpListener, RtError>> {
-  None
+pub(crate) fn held_listener(variable: &str) -> Option<Result<TcpListener, RtError>> {
+  let share = shared_listeners()
+    .iter()
+    .find(|share| share.variable == variable)?;
+  Some(TcpListener::from_share(&share.bytes))
+}
+
+/// The listeners the anchor shared with this daemon (A-748), read whole from the pipe [`slates_anchor::shared_listeners::
+/// ENV_SHARED_LISTENERS`] names the first time a listener is asked for, and kept for the process's life. A pipe that
+/// cannot be read, or whose bytes are not shares, is said on the log and read as none: each edge then binds its own.
+#[cfg(windows)]
+fn shared_listeners() -> &'static [slates_anchor::shared_listeners::Share] {
+  /// Shape: the records a pipe may hold: one a listener the anchor holds (the HTTP edge's, the SSH edge's, svn://'s).
+  const MOST_SHARES: usize = 3;
+  static SHARES: std::sync::OnceLock<Vec<slates_anchor::shared_listeners::Share>> =
+    std::sync::OnceLock::new();
+  SHARES.get_or_init(|| {
+    let Some(raw) = std::env::var(slates_anchor::shared_listeners::ENV_SHARED_LISTENERS)
+      .ok()
+      .and_then(|value| value.parse::<usize>().ok())
+    else {
+      return Vec::new();
+    };
+    // SAFETY: the anchor duplicated the pipe's reading end into the explicit handle list of this process's spawn and
+    // named its value here (`slates_anchor::Supervisor`'s Windows spawn); nothing else in this process owns it, and it
+    // is read once, in this initializer, so this is its single owner.
+    let owned = unsafe {
+      <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(
+        raw as std::os::windows::io::RawHandle,
+      )
+    };
+    let _ = slates_ipc::win_spawn::clear_inheritance(&owned);
+    let mut bytes = Vec::new();
+    let read = std::io::Read::read_to_end(&mut std::io::PipeReader::from(owned), &mut bytes);
+    match read
+      .map_err(|error| error.to_string())
+      .and_then(|_| {
+        slates_anchor::shared_listeners::decode(&bytes, MOST_SHARES)
+          .map_err(|refusal| format!("{refusal:?}"))
+      }) {
+      Ok(shares) => shares,
+      Err(why) => {
+        slates_machine::log_line!(
+          "slates daemon: the anchor's shared listeners could not be read ({why}); each edge binds its own"
+        );
+        Vec::new()
+      }
+    }
+  })
 }
 
 /// Binds the version-control servers' shared HTTP edge's listener at `address` as the daemon binds its own, its backlog
@@ -1044,6 +1103,11 @@ impl Daemon {
       crate::watchdog::own_window_ns,
       HEARTBEAT_NS,
     );
+    // The process thread's stop watch reaches the control shard over this channel, not as a question the shard must
+    // answer: a shard busy with recovered work answers late, and a watch refused for it stopped the daemon, whose anchor
+    // restarted it into the same work (w-interop's restart loop, 2026-11-20). One slot: one process thread waits.
+    let (stop_watch_send, stop_watch_install) = std::sync::mpsc::sync_channel::<StopWatch>(1);
+    let mut stop_watch_install = Some(stop_watch_install);
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();
@@ -1051,8 +1115,15 @@ impl Daemon {
       let partition = u16::try_from(index).unwrap_or(u16::MAX);
       let all: Vec<u16> = shards.iter().map(|s| s.0).collect();
       let retained = retained.clone();
+      // The stop watch's channel goes to the control shard, in its state before anything runs on the shard.
+      let stop_watch = if index == 0 {
+        stop_watch_install.take()
+      } else {
+        None
+      };
       #[cfg(unix)]
       let holds = ShardHolds {
+        stop_watch,
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
@@ -1060,6 +1131,7 @@ impl Daemon {
       };
       #[cfg(windows)]
       let holds = ShardHolds {
+        stop_watch,
         winfsp: inherited_winfsp.next().unwrap_or_default(),
         channel: if index == 0 {
           windows_channel.take()
@@ -1206,6 +1278,7 @@ impl Daemon {
     // every shard keeping its seats for the connections that move to their repository's owner.
     let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
     Ok(Daemon {
+      stop_watch_send,
       runtime: Some(runtime),
       segment,
       doorbell,
@@ -2078,22 +2151,25 @@ impl Daemon {
   /// returning true (the caller's own reasons: a signal, a gone parent). Both are asked at the control shard's
   /// heartbeat, which beats at this cadence anyway, so the waiting thread wakes for nothing else. Before 2026-10-10 the
   /// daemon process's thread polled the same three questions every heartbeat on its own, ten wakeups a second at rest
-  /// (BENCHMARKS). Returns once a reason holds, or when the control shard's state ends (its watch dropped); the caller
-  /// asks which reason it was. A refusal to install the watch is the control shard's typed refusal.
-  pub fn wait_for_stop(
-    &self,
-    also: impl Fn() -> bool + Clone + Send + 'static,
-  ) -> Result<(), ObserveError> {
+  /// (BENCHMARKS). Returns once a reason holds, or when the control shard's state ends (its watch dropped).
+  ///
+  /// The watch is handed to the control shard over the channel its start received, and taken in at its next heartbeat:
+  /// nothing here waits on the shard's work, so a shard busy with recovered work cannot refuse it. Until 2026-11-20 the
+  /// watch was installed by an observation under the observe budget (ten liveness windows, a fixed 10,000 ms), and a
+  /// control shard whose recovered encoding held it past that refused the install; the daemon stopped itself, exited 0,
+  /// and its anchor restarted it into the same work, 78 times in w-interop's git matrix, its clients waiting meanwhile.
+  pub fn wait_for_stop(&self, also: impl Fn() -> bool + Send + 'static) {
     let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
-    self.observe(self.shards.first().copied(), move |s| {
-      s.stop_watch = Some(StopWatch {
-        also: Box::new(also.clone()),
-        wake: wake.clone(),
-      });
-    })?;
+    let watch = StopWatch {
+      also: Box::new(also),
+      wake,
+    };
+    // A send refused means the control shard's state, and the channel with it, is gone: the daemon is stopping.
+    if self.stop_watch_send.send(watch).is_err() {
+      return;
+    }
     // Either a reason was sent, or the watch's sender went with the control shard's state: both end the wait.
     let _reason_or_gone = woken.recv();
-    Ok(())
   }
 
   /// Hands off every consensus leadership this daemon holds before it stops (thesis §3.10;
@@ -3061,6 +3137,30 @@ impl Daemon {
     fault: crate::merge_service::MergeFault,
   ) -> Result<(), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
+  }
+
+  /// Every floor `green`'s owner partition keeps for its works, as (work, base) (A-247; A-697: a holder's works among
+  /// them, whose ids name the holder), for a test. The typed refusal when the shard could not be observed.
+  pub fn work_floors_of(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<Vec<(slates_ipc::protocol::VolumeId, u64)>, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db
+        .partition()
+        .work_floors()
+        .filter(|floor| floor.green.bytes == green.bytes)
+        .map(|floor| {
+          (
+            slates_ipc::protocol::VolumeId {
+              bytes: floor.work.bytes,
+            },
+            floor.base,
+          )
+        })
+        .collect()
+    })
   }
 
   /// Test support (A-697, until its last piece puts the rule in its place; never reachable from the wire): with `on`,
@@ -4314,6 +4414,8 @@ fn shard_arena(
 #[cfg(unix)]
 #[derive(Debug, Default)]
 struct ShardHolds {
+  /// Where the process thread's stop watch arrives (the control shard's alone; [`StopWatch`]).
+  stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
   /// The held devices.
   devices: Vec<crate::fuse_hold::HeldDevice>,
   /// The held writable copies.
@@ -4327,6 +4429,8 @@ struct ShardHolds {
 /// control shard's alone), and its Shards streams' resync ends (A-433) and DAX sections (A-448).
 #[cfg(windows)]
 struct ShardHolds {
+  /// Where the process thread's stop watch arrives (the control shard's alone; [`StopWatch`]).
+  stop_watch: Option<std::sync::mpsc::Receiver<StopWatch>>,
   /// The held WinFsp mounts.
   winfsp: Vec<crate::winfsp::InheritedMount>,
   /// The hold channel's daemon end: the control shard installs it.
@@ -4493,6 +4597,7 @@ async fn init_shard(
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
   #[cfg(windows)]
   let ShardHolds {
+    stop_watch: stop_watch_install,
     winfsp: inherited_winfsp,
     channel: windows_channel,
     resync: inherited_resync,
@@ -4500,6 +4605,8 @@ async fn init_shard(
   } = holds;
   #[cfg(unix)]
   let inherited_dax = holds.dax;
+  #[cfg(unix)]
+  let stop_watch_install = holds.stop_watch;
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
   // failure, as a refused serve loop is below.
@@ -4886,6 +4993,7 @@ async fn init_shard(
     pressure_task: None,
     pressure_asked: false,
     stop_watch: None,
+    stop_watch_install,
     nfs_purges_refused: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
@@ -6085,12 +6193,15 @@ async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
       origin,
       shard.0,
       |s| {
-        let names: Vec<String> = s
-          .db
-          .partition()
-          .pending_creations()
-          .map(|pending| pending.name.clone())
-          .collect();
+        let pendings: Vec<slates_db::catalog::PendingCreationRecord> =
+          s.db.partition().pending_creations().cloned().collect();
+        let mut names = Vec::new();
+        for pending in pendings {
+          // A holder's creation is released at its green's owner before it is dropped (A-697 part e2).
+          if !crate::work_home::hold_for_release(s, &pending) {
+            names.push(pending.name);
+          }
+        }
         for name in names {
           s.db.begin();
           let settled = crate::verbs::settle_creation(s, &name);
@@ -6684,6 +6795,15 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
       Err(_) => (false, None),
     };
     state::with_state(|s| {
+      // A watch the process thread sent since the last beat is taken in now ([`Daemon::wait_for_stop`]).
+      if s.stop_watch.is_none()
+        && let Some(watch) = s
+          .stop_watch_install
+          .as_ref()
+          .and_then(|install| install.try_recv().ok())
+      {
+        s.stop_watch = Some(watch);
+      }
       if let Some(watch) = s.stop_watch.as_ref()
         && (requested || (watch.also)())
       {

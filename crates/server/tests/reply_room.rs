@@ -29,8 +29,6 @@ mod common;
 const TEST_SHARDS: u16 = 2;
 /// Shape: how long the owner is held so the forward waits there, short of the client's own hold.
 const OWNER_HOLD: Duration = Duration::from_nanos(HEARTBEAT_NS);
-/// Shape: how long the test waits for a hold to begin.
-const HOLD_START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: names tried for one the other shard owns.
 const NAME_TRIES: usize = 64;
 
@@ -90,9 +88,17 @@ fn hold(
     })
     .unwrap();
   let waiter = std::thread::spawn(move || observation.wait().unwrap());
-  let started = Instant::now();
+  // The hold begins when the shard runs the observation, which ends otherwise by its own answer or its typed refusal past
+  // the daemon's observe budget (A-571's rule; until 2026-11-20 five seconds, `HOLD_START_WAIT`).
   while !held.load(Ordering::Acquire) {
-    assert!(started.elapsed() < HOLD_START_WAIT, "the hold began");
+    if waiter.is_finished() {
+      // The flag is set before the observation ends, so a hold that began and ended since the first read shows here.
+      assert!(
+        held.load(Ordering::Acquire),
+        "the hold's observation ended before the hold began"
+      );
+      break;
+    }
     std::thread::yield_now();
   }
   waiter
@@ -171,18 +177,15 @@ fn attempt(n: usize) -> Attempt {
   owner_holding.join().unwrap();
   // The owner answers into the full channel: the client stays held until that wait has begun and two periods more, so
   // the answer waits past the period after which it used to be dropped.
-  let watching = Instant::now();
-  let mut held_past_wait = false;
-  while watching.elapsed() < HOLD_START_WAIT {
-    if room_waits_on(&daemon, owner).started > 0 {
-      #[allow(clippy::disallowed_methods)]
-      std::thread::sleep(HELD_PAST_WAIT);
-      held_past_wait = true;
-      break;
-    }
+  // Watched until the owner's wait for room has begun, while the daemon lives (A-232's rule; until 2026-11-20 five
+  // seconds, `HOLD_START_WAIT`).
+  while room_waits_on(&daemon, owner).started == 0 {
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(HOLD_POLL);
   }
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(HELD_PAST_WAIT);
+  let held_past_wait = true;
   CLIENT_RELEASE.store(true, Ordering::Release);
   client_holding.join().unwrap();
   let released = Instant::now();
@@ -238,9 +241,17 @@ fn hold_until(
     })
     .unwrap();
   let waiter = std::thread::spawn(move || observation.wait().unwrap());
-  let started = Instant::now();
+  // The hold begins when the shard runs the observation, which ends otherwise by its own answer or its typed refusal past
+  // the daemon's observe budget (A-571's rule; until 2026-11-20 five seconds, `HOLD_START_WAIT`).
   while !held.load(Ordering::Acquire) {
-    assert!(started.elapsed() < HOLD_START_WAIT, "the hold began");
+    if waiter.is_finished() {
+      // The flag is set before the observation ends, so a hold that began and ended since the first read shows here.
+      assert!(
+        held.load(Ordering::Acquire),
+        "the hold's observation ended before the hold began"
+      );
+      break;
+    }
     std::thread::yield_now();
   }
   waiter

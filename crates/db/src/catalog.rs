@@ -1288,6 +1288,9 @@ pub struct PendingCreationRecord {
   pub client: u32,
   /// The completion key's sequence.
   pub sequence: u32,
+  /// The green the work is being made over: on a holder node, whose green another node owns, what a restart releases
+  /// the work's admission at (A-697 part e2).
+  pub green: VolumeId,
 }
 
 /// A work's submit that went to its green's owner and whose answer the work has not yet settled (A-247): kept on the

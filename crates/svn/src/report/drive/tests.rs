@@ -38,7 +38,7 @@ const MOST_OPEN: usize = 64;
 /// rules.
 fn run(drive: &mut Drive, index: &Index, green: &Green, locks: &LockTable) -> Vec<Written> {
   let mut calls = Vec::new();
-  let mut delta: Option<(Option<[u8; 16]>, Vec<Window>)> = None;
+  let mut delta: Option<(Option<[u8; 16]>, Vec<u8>)> = None;
   let anonymous = rules_of(None);
   let sources = Sources {
     index,
@@ -55,14 +55,23 @@ fn run(drive: &mut Drive, index: &Index, green: &Green, locks: &LockTable) -> Ve
     };
     match call {
       Call::ApplyTextDelta { base_md5 } => delta = Some((base_md5, Vec::new())),
-      Call::Window(window) => delta.as_mut().unwrap().1.push(window.clone()),
+      Call::DeltaPiece { bytes, .. } => delta.as_mut().unwrap().1.extend_from_slice(bytes),
       Call::TextDeltaEnd => {
-        let (base, windows) = delta.take().unwrap();
-        calls.push(Written::Delta(base, 0, windows));
+        let (base, stream) = delta.take().unwrap();
+        calls.push(Written::Delta(base, 0, windows_of(&stream)));
       }
       other => calls.push(owned(other)),
     }
   }
+}
+
+/// The windows of a delta's svndiff stream as the drive sent it in pieces (A-751): none for a delta
+/// with no window, whose stream its writer ends with the header alone.
+fn windows_of(stream: &[u8]) -> Vec<Window> {
+  if stream.is_empty() {
+    return Vec::new();
+  }
+  crate::svndiff::decode_all(stream).unwrap().1
 }
 
 /// A call that is no part of a delta, owned.
@@ -338,7 +347,7 @@ fn run_paused(
 ) -> (Vec<Written>, usize) {
   let mut calls = Vec::new();
   let mut pauses = 0;
-  let mut delta: Option<(Option<[u8; 16]>, Vec<Window>)> = None;
+  let mut delta: Option<(Option<[u8; 16]>, Vec<u8>)> = None;
   let anonymous = rules_of(None);
   let sources = Sources {
     index,
@@ -352,10 +361,12 @@ fn run_paused(
       Next::Paused => pauses += 1,
       Next::Ended => return (calls, pauses),
       Next::Call(Call::ApplyTextDelta { base_md5 }) => delta = Some((base_md5, Vec::new())),
-      Next::Call(Call::Window(window)) => delta.as_mut().unwrap().1.push(window.clone()),
+      Next::Call(Call::DeltaPiece { bytes, .. }) => {
+        delta.as_mut().unwrap().1.extend_from_slice(bytes);
+      }
       Next::Call(Call::TextDeltaEnd) => {
-        let (base, windows) = delta.take().unwrap();
-        calls.push(Written::Delta(base, 0, windows));
+        let (base, stream) = delta.take().unwrap();
+        calls.push(Written::Delta(base, 0, windows_of(&stream)));
       }
       Next::Call(call) => calls.push(owned(call)),
     }
@@ -508,4 +519,133 @@ fn a_changed_text_is_sent_as_a_delta_against_its_base() {
     closed,
     "the text made is not the one closed"
   );
+}
+
+/// The time no drive step may take: far past one of [`STEP_WORK`] units even in a debug build, far short of a whole
+/// window's making there (milliseconds).
+pub(crate) const STEP_BUDGET: std::time::Duration = std::time::Duration::from_micros(500);
+
+/// How many more times a step past [`STEP_BUDGET`] is timed again from its state before it: a step's time is the least
+/// of its timings, so time the machine took away from the test (a preemption, measured up to 3.6 ms under the suite's
+/// load) is not charged to it, while a step whose own work is past the budget stays past it every time.
+pub(crate) const RETIMES: usize = 2;
+
+/// The svndiff stream the whole-window path made of `/trunk/big.txt` from its text at `from` to its text at `to`
+/// (`read_window`, `window_of`, `Encoder::window`): the bytes a drive's pieces must make.
+pub(crate) fn big_text_stream(
+  (from, to): (Option<&[u8]>, &[u8]),
+  (version, compression): (Version, Compression),
+) -> Vec<u8> {
+  let mut encoder = Encoder::new(version);
+  let mut stream = encoder.header().to_vec();
+  let mut sent = 0usize;
+  while sent < to.len() {
+    let target = &to[sent..(sent + WINDOW_LIMIT as usize).min(to.len())];
+    let source = from.map_or(&[][..], |from| {
+      let view = sent.min(from.len());
+      &from[view..(view + WINDOW_LIMIT as usize).min(from.len())]
+    });
+    let mut window = window_of(source, target).unwrap();
+    window.source_offset = sent.min(from.map_or(0, <[u8]>::len)) as u64;
+    encoder.window(&window, compression, &mut stream).unwrap();
+    sent += target.len();
+  }
+  stream
+}
+
+/// A-751, main's red at the drive ("a large text's window driven with the past-budget counter at 0, and the bytes equal
+/// to the whole window's"). Do: drive `/trunk` from r5 to r6, where `big.txt` (6,000 lines, several windows) is edited,
+/// and from r4, where it is added, in version 0 and in version 2 with LZ4, a step a call, timing each call (a call past
+/// the budget timed again from its state before, [`RETIMES`]). Expect: no call past [`STEP_BUDGET`]; `big.txt`'s delta the stream the whole-window path made,
+/// byte for byte. Red before the change: a window was made and written in one step, milliseconds in a debug build.
+#[test]
+fn a_large_texts_windows_are_driven_with_no_step_past_its_budget() {
+  let (index, green) = repository();
+  let locks = LockTable::new();
+  let anonymous = rules_of(None);
+  let sources = Sources {
+    index: &index,
+    repository: &green,
+    locks: &locks,
+    now: NOW,
+    rules: Some(&anonymous),
+  };
+  let text_at = |revision: Revision| {
+    let text = dirent(&sources, "/trunk/big.txt", revision)
+      .unwrap()
+      .unwrap()
+      .text
+      .unwrap();
+    green.texts[&text.identity].clone()
+  };
+  let encodings = [
+    (Version::Zero, Compression::Stored),
+    (Version::Two, Compression::Lz4),
+  ];
+  for (from, base) in [(5, Some(text_at(5))), (4, None)] {
+    for encoding in encodings {
+      let expected = big_text_stream((base.as_deref(), &text_at(6)), encoding);
+      let mut drive =
+        Drive::new(trunk_report(from, 6, false), b"u").with_encoding(encoding.0, encoding.1);
+      let (mut past, mut longest, mut streams) = (0usize, std::time::Duration::ZERO, Vec::new());
+      let mut stream: Option<Vec<u8>> = None;
+      loop {
+        let before = drive.clone();
+        let began = std::time::Instant::now();
+        let next = drive.next(&sources, 1);
+        let mut took = began.elapsed();
+        for _ in 0..RETIMES {
+          if took <= STEP_BUDGET {
+            break;
+          }
+          let mut again = before.clone();
+          let began = std::time::Instant::now();
+          let _ = again.next(&sources, 1);
+          took = took.min(began.elapsed());
+        }
+        longest = longest.max(took);
+        past += usize::from(took > STEP_BUDGET);
+        match next {
+          Next::Ended => break,
+          Next::Call(Call::ApplyTextDelta { .. }) => stream = Some(Vec::new()),
+          Next::Call(Call::DeltaPiece { bytes, .. }) => {
+            stream.as_mut().unwrap().extend_from_slice(bytes)
+          }
+          Next::Call(Call::TextDeltaEnd) => streams.push(stream.take().unwrap()),
+          _ => {}
+        }
+      }
+      assert!(
+        streams.contains(&expected),
+        "r{from}, {encoding:?}: big.txt's stream"
+      );
+      assert_eq!(past, 0, "r{from}, {encoding:?}: longest step {longest:?}");
+    }
+  }
+}
+
+/// The report fixtures' repository and `/trunk/big.txt`'s text where it is added (r5) and where it is edited (r6), for
+/// the window tests of the other readers (A-751).
+pub(crate) fn big_texts() -> (Index, Green, Vec<u8>, Vec<u8>) {
+  let (index, green) = repository();
+  let locks = LockTable::new();
+  let (five, six) = {
+    let sources = Sources {
+      index: &index,
+      repository: &green,
+      locks: &locks,
+      now: NOW,
+      rules: None,
+    };
+    let text_at = |revision: Revision| {
+      let text = dirent(&sources, "/trunk/big.txt", revision)
+        .unwrap()
+        .unwrap()
+        .text
+        .unwrap();
+      green.texts[&text.identity].clone()
+    };
+    (text_at(5), text_at(6))
+  };
+  (index, green, five, six)
 }
