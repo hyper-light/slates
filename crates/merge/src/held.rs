@@ -23,6 +23,11 @@
 //! readable whatever later versions do to the path, and a checkpoint's folding, which drops history below its floor,
 //! drops no block the table holds (the blocks are not history).
 //!
+//! - by its pieces ([`crate::engine::Green::stage`], `append_staged`, then `seal_staged` or `discard_staged`): a text
+//!   arriving a piece at a time, a commit's svndiff windows (§4.17.1 "A push's intake", rule 1), kept in its one block
+//!   as each piece comes, so its holder never holds the whole text; named once its last piece is in, when its identity
+//!   is known. A staged text whose identity is held already gives its block back and adds a holder.
+//!
 //! **Bounds.** The table holds at most its room's entries ([`HeldRefused::AtRoom`]), which its owner derives and sets
 //! (`Green::set_held_room`; zero until it does, so every hold is refused until the owner says what it may hold). An
 //! entry's holders are counted in a `u64` and a hold past it is refused ([`HeldRefused::Holders`]), never wrapped.
@@ -52,6 +57,24 @@ pub enum HeldRefused {
   NoFile,
   /// The identity is not held.
   NotHeld,
+}
+
+/// A text being staged a piece at a time ([`crate::engine::Green::stage`]): a block of the green's named by no path and
+/// held by no identity yet, which its owner seals under the text's identity or discards. One owner: neither `Clone` nor
+/// `Copy`, so a staged block is sealed or discarded once.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Staged {
+  /// Its block.
+  pub(crate) block: Block,
+  /// The bytes appended so far.
+  pub(crate) length: u64,
+}
+
+impl Staged {
+  /// The bytes appended so far.
+  pub fn length(&self) -> u64 {
+    self.length
+  }
 }
 
 /// One held text: its block and its holders.
