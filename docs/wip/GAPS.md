@@ -1933,7 +1933,10 @@
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). A-586 (2026-11-19, g295): the engine's `Copy` (`OpKind` 16), built: recorded once at its
 > destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
-> key, the identity one entry a copy, hard links refused by kind, the root a source and never a destination, a branch
+> key, the identity one entry a copy, hard links refused by kind (BUILT 2026-11-20, w-shared, main's ruling: a copied
+> tree's links share the copy's nodes, a link naming a node outside it gets a node of its own, `Green::copy_link_effects`;
+> refused only where that outside node changed after the copy's version, still as `TypeChanged`, owed its own typed
+> refusal), the root a source and never a destination, a branch
 > made before a copy cutting it, a review comment on a copied file moving with it (A-596); held to a reference green
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain

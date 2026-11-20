@@ -15017,6 +15017,14 @@ and export by landing).
 > one, a copy from a version its source changed after, and Subversion's replace with history (a copy onto a path its
 > own increment removes), each in the A-586 entry.
 >
+> **Status (2026-11-20, A-586's hard link in a copied tree; main's ruling).** Built: a copy of a tree holding hard links.
+> The rule, a snapshot's: names in the copied tree that share a node keep sharing one new node in the copy (a copied
+> link names its node's copy); a name whose node lies outside the copied tree gets a node of its own in the copy,
+> holding that node's bytes, mode or IPC node, its bytes named by the content they hold. Derived at the commit from the
+> head before the copies land (`Green::copy_link_effects`), as a node's moves are, so a replay and a checkpoint hold the
+> same; a copy whose outside nodes changed after its version is refused. Owed: that refusal and A-586's other "does not
+> yet copy" cases answering their own typed refusals, not `TypeChanged`.
+>
 > **Status (2026-11-19, A-626 part 1).** Built: the engine's replace with history (`REPLACE`, a flag on `Copy`: the
 > destination's tree taken away key by key at the copy's version, judged as a removal against the base) and copies
 > nested in one increment, a second copy into a new branch and a move inside one (a copy and a removal) among them, so
@@ -55745,3 +55753,27 @@ at its exact length); `crates/mcp` (a shard's `content_ranges`); §4.2's status;
 - **Found by use** (reported, next piece): a copy of a tree holding a hard link is refused as a `TypeChanged` conflict at
   its destination (A-586's "does not yet copy" case answering the wrong kind); the surfaces' tests copy a tree without
   one.
+
+### A-586's hard link in a copied tree — Names sharing a node share the copy's node; a name whose node lies outside gets one of its own (2026-11-20, w-shared for UI goal 93; main's ruling; found by use through MCP)
+- **Why.** A copy of a tree holding a hard link was refused (A-586: "does not yet copy"), and answered as a `TypeChanged`
+  conflict at the destination. An agent's workspace holds hard links routinely (`git clone --local` links its objects),
+  so the copy verb on every surface met it: MCP's by-use test did.
+- **The rule** (amended into A-586's status in §4.16 and `slates-merge`'s `engine/copy.rs` docs), as for a snapshot:
+  names in the copied tree that share a node keep sharing one new node in the copy; a name whose node also has a name
+  outside the copied tree, or lies outside it, gets a node of its own in the copy, holding the node's bytes, mode or IPC
+  node, its bytes named by the content they hold, never copied by the outside node.
+- **Change.** `Green::copy_link_effects`, called by `Green::commit` beside `node_moves`: for each copy, every hard link in
+  its source's tree becomes `Effect::Hardlink` naming its node's copy, or `RemoveHardlink` and the outside node's
+  `Special`, or its `Mode` and `SetContent` (`ContentSource::Copied`), applied after the graft; derived from the head,
+  never recorded, so a replay and a checkpoint hold the same. The verdict accepts a source holding hard links, refusing
+  only one whose outside nodes changed after the copy's version (`Green::outside_link_moved`): the head would not hold
+  what they held then.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-merge` `engine::copy_tests::
+  a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns_one` (an inside link names the copy's
+  node; an outside one is a file of its own with the node's bytes and mode; identity equal to its recount; a replayed
+  replica and a restored checkpoint read and hash alike); `a_copy_is_refused_typed_and_changes_nothing` (the refusal
+  now a copy from before its outside node changed); `cargo test --locked -p slates-merge --lib -- copy engine::` 163 of
+  163. `slates-server` `vcs_store::paths::tests::t_a626_p4_a_work_copies_a_tree_holding_a_hard_link` (red before: the
+  server's repro, refused `TypeChanged`), `-- t_a626_p4 vcs_store::paths:: vcs_store::commits::` 20 of 20; fmt clean.
+- **Owed.** The refusal kept, and A-586's other "does not yet copy" cases, answering their own typed refusals rather than
+  `TypeChanged` (next); a copy from before an outside node changed, read from its history.
