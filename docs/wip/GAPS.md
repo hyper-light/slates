@@ -616,7 +616,8 @@
 > Clippy, `xtask` and the lint matrix over the change are main's (run requests).
 > **A-625 part 1 (2026-11-19, g076b; the edge's engine):** `crates/http-edge` (`slates-http-edge`) holds one
 > connection's request loop as a state machine over bytes: HTTPS through rustls (TLS 1.3 and 1.2, ALPN `http/1.1`, no
-> client certificate, no resumption), Basic over TLS alone and Bearer, `100 Continue`, keep-alive, bodies streamed as
+> client certificate, no resumption), Basic over TLS alone (on the loopback edge too since A-686, below) and Bearer,
+> `100 Continue`, keep-alive, bodies streamed as
 > slices or inflated runs, typed refusals, and the staged close for a refusal with bytes unread (A-183). `cargo test -p
 > slates-http-edge --lib` 31 of 31 on the Mac Studio, red first (29 of 31 on stubs). Owed (part 2): the daemon's
 > listener and tasks with each phase's wait learned and the bounds derived from the shard's budget; git's site (routes,
@@ -627,7 +628,8 @@
 > room, the listener not accepting at the bound (the kernel's backlog the same bound); each phase's wait learned with
 > `LearnedWait`, the handshake, idleness, a head and the drain whole and a body's and a reply's silences one at a time,
 > no bound before a phase's first completed wait, only a connection whose credentials proved a principal teaching.
-> git's site: `http-backend`'s route, `401` with the connection's challenges, `404`, the policy's `403`
+> git's site: `http-backend`'s route, `401` with the connection's challenges (Basic's first on every connection since
+> A-686), `404`, the policy's `403`
 > (`vcs_policy::reaches`), `503` while a service has not landed (both today). `slates-git` gives its reply fields as
 > data. `cargo test -p slates-server --lib vcs_` 46 of 46 and `-p slates-git --lib http` 18 of 18 on the Mac Studio, red
 > first on stubs (20 and 2 failing). Owed: the daemon starting an edge (address, identity, an authenticator over
@@ -697,19 +699,37 @@
 > **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
 > (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
 > first commit pushed to an empty repository, cloned, an edit pushed from the clone and fetched back into the first
-> copy) run as a control against stock git's own server (a bare repository over `file://`), so every step expects
-> what git's own server answers; git with no credential refused in its own words (`could not read Username for
+> copy) run as a control against stock git's own server (a bare repository over `file://`), so every step expects what
+> git's own server answers; git with no credential refused in its own words (`could not read Username for
 > 'http://127.0.0.1:PORT': terminal prompts disabled`, exit 128); and the round trip over the HTTP edge, the token a
-> bearer credential (`http.extraHeader`), which passes: stock git 2.50.1 clones a repository `slates repository
-> create` made, pushes to it and fetches from it over the daemon's edge. Ignored naming their waits: the round trip
-> with the token as Basic's password in the URL (A-686, g258: the cleartext edge's `401` offers Bearer alone, so git
-> answers `Authentication failed`), and over the SSH edge (A-684, g299: `--vcs-ssh`; A-683, g302: git-receive-pack on
-> the SSH edge). A credential is minted with the anchor's issuer surface, so on Linux, where that surface is a
-> descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln r426 over main
-> 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2 ignored; with
-> `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication failed for
-> 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the control and
-> the refusal run there, the HTTP leg skips), main's.
+> bearer credential (`http.extraHeader`), which passes: stock git 2.50.1 clones a repository `slates repository create`
+> made, pushes to it and fetches from it over the daemon's edge. The round trip with the token as Basic's password in
+> the URL runs since A-686 (g258), its one wait (the cleartext edge's `401` offered Bearer alone, so git answered
+> `Authentication failed`); the one over the SSH edge is ignored naming its waits (A-684, g299: `--vcs-ssh`; A-683,
+> g302: git-receive-pack on the SSH edge). A credential is minted with the anchor's issuer surface, so on Linux, where
+> that surface is a descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln
+> r426 over main 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2
+> ignored; with `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication
+> failed for 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the
+> control and the refusal run there, the HTTP leg skips), main's.
+> **A-686 (2026-11-19, g258; main's ruling, revising A-625 part 3's "never in cleartext"):** the shared edge takes
+> Basic with the token as the password on the loopback cleartext edge as over TLS (`--vcs-http` serves cleartext on
+> loopback alone, where Bearer was already taken), and every `401` offers Basic's challenge first and Bearer's after
+> it, TLS included: stock Mercurial 7.2 reads the first challenge alone and crashed on a Bearer first, and stock git
+> and Subversion send Basic alone, so a lone anchor's cleartext edge took none of their credentials. macOS arm64 (Mac
+> Studio, kiln r295 red over main b94ae6e90: 2, 8 and 1 failing, stock hg 7.2 in its crash report; r325 green over
+> main 770ae8826): `slates-http-edge --lib credential` 10 of 10, `slates-server --lib vcs_http::` 46 of 46 (stock hg
+> 7.2 against the edge serving the hg site: `abort: HTTP Error 503`, the site reached), `slates-cli --test cli
+> vcs_http` 2 of 2, fmt clean; over main 693bc8feb (kiln r361, Subversion's site deciding alike) 10, 51 and 2 of each.
+> Over main b288b412e, with Mercurial's site on the daemon's edge (A-680 part 2a): stock hg 7.2's `hg
+> debugcapabilities` by Basic on a daemon's loopback cleartext edge answered from the repository's store, and g083's
+> clone with no credentials against a real anchor un-ignored, refused in hg's own words: red first over main's code
+> (kiln r392 and r429: both in hg's crash report), then 10 of 10, 52 of 52 and 4 of 4 (r415, r429), fmt clean. g309's
+> stock git round trip with the token as Basic's password in the URL against a real anchor (`git_interop`), its one
+> wait this piece, un-ignored as main merged it in (red there: `fatal: Authentication failed`, g309's kiln r426).
+> Owed: g083's stock-hg round trip over the anchor's edge, once the hg site takes pushes (A-680 part 2b); stock `hg
+> identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
+> found here, main's); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -1190,12 +1210,13 @@
 > stock Mercurial 7.2 (`SLATES_TEST_HG`, skipping loudly without it) against a real anchor: a clone with no credentials
 > refused in hg's own words, and a round trip (a fresh history pushed, cloned, a changeset pushed from the clone and
 > pulled back) over the HTTP edge and over the SSH edge. Each is ignored naming the pieces it waits on, and the last
-> of them to land un-ignores it as its integration test: the daemon's edge serves git's site alone, so hg's request
-> meets `404` (A-680, g303: the hg site's stores and lender); the site's `401` offers Bearer alone, on which stock hg
-> 7.2 crashes (`ValueError` from urllib's digest handler, which reads the first challenge alone), so Basic's challenge
-> goes first on every connection and Basic with the token as password is taken on the loopback edge (A-686, g258,
-> main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299, built); and
-> over SSH the same lender, which the edge's `serve --stdio` (A-679, built) reads as the HTTP site does (A-680).
+> of them to land un-ignores it as its integration test. The clone with no credentials runs since A-686 (g258), its
+> last wait: the daemon's edge served git's site alone until A-680 part 2a (hg met `404`), and the site's `401`
+> offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
+> first challenge alone), until A-686 put Basic's challenge first and took Basic with the token as password on the
+> loopback edge. The HTTP round trip waits on the hg site's pushes (A-680 part 2b, g303); the SSH one on the pushes
+> over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
+> (A-679, built) reads as the HTTP site does (A-680).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
@@ -1380,8 +1401,9 @@
 > served, so `svn log` and `svn checkout` reach a repository (part 1's next slices); (2) the write side (part 2); (3)
 > the daemon composing the site beside git's and handing it the stores, `503` until then; (4) a repository whose name
 > holds a slash, which `SVNParentPath`'s first-segment rule cannot reach over HTTP without a longest-prefix search
-> across partitions; (5) a browser's `?p=` and `?r=` and a directory's HTML listing (`501`); (6) Basic on the cleartext
-> loopback edge (A-686). A-681 part 1, its second slice (2026-11-19, g297): the `log-report`, A-613's log walk with
+> across partitions; (5) a browser's `?p=` and `?r=` and a directory's HTML listing (`501`). Basic on the cleartext
+> loopback edge, offered first, is built (A-686). A-681 part 1, its second slice (2026-11-19, g297): the `log-report`,
+> A-613's log walk with
 > `mod_dav_svn`'s receivers, streamed by the edge's exchange a slice a reply run, its status decided by its first
 > slices (a refusal before its first byte answered with its error, one after it ending the connection); held to the
 > ra_svn walk entry for entry over nine requests and to stock `svn log` and `svn log -v` (see A-681 part 1, second
@@ -1625,7 +1647,8 @@
 > first missing piece (r293: `--vcs-svn` and `--vcs-ssh` unknown flags; `repository create` refused as usage):
 > `svn://` on A-689 and its repository lookup (g234), A-685 (g305) and CRAM-MD5's secrets (A-599's owed (3), no piece
 > yet: the test's user, a token's id, and its password, the token, are its assumption); `http://`'s round trip on
-> A-681's reads and commits (g297), A-686 (g258) and A-685, and its lock session on A-681's `LOCK` and `UNLOCK`;
+> A-681's reads and commits (g297) and A-685 (A-686's Basic is built), and its lock session on A-681's `LOCK` and
+> `UNLOCK`;
 > `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
 > no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
 > differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;

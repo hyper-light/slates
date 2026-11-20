@@ -24,10 +24,10 @@ fn head(bytes: &[u8]) -> Head<'_> {
   }
 }
 
-/// The credentials a request with `fields` carries, on a connection `secure` or not.
-fn read(fields: &[&str], secure: bool) -> Result<Option<Credential>, CredentialRefused> {
+/// The credentials a request with `fields` carries.
+fn read(fields: &[&str]) -> Result<Option<Credential>, CredentialRefused> {
   let bytes = request(fields);
-  credential(&head(&bytes), secure)
+  credential(&head(&bytes))
 }
 
 /// A Basic credential of `user` and `password`.
@@ -38,10 +38,11 @@ fn basic(user: &[u8], password: &[u8]) -> Credential {
   }
 }
 
-/// A-625: do read RFC 7617 §2's own example, its scheme in another case, and a password holding a colon, over TLS.
-/// Expect the user id before the first colon and the password after it.
+/// A-625 and A-686: do read RFC 7617 §2's own example, its scheme in another case, and a password holding a colon.
+/// Expect the user id before the first colon and the password after it, on every connection: the reading takes none
+/// since A-686 (main's ruling, 2026-11-19), as the server serves cleartext on loopback alone.
 #[test]
-fn basic_over_tls_reads_rfc_7617s_own_example() {
+fn basic_reads_rfc_7617s_own_example() {
   let cases: [(&str, Credential); 3] = [
     (
       "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
@@ -57,31 +58,28 @@ fn basic_over_tls_reads_rfc_7617s_own_example() {
     ),
   ];
   for (field, expected) in cases {
-    assert_eq!(read(&[field], true), Ok(Some(expected)), "{field}");
+    assert_eq!(read(&[field]), Ok(Some(expected)), "{field}");
   }
 }
 
-/// A-625: do read RFC 6750 §2.1's own example, a token with its padding, over TLS and over a loopback cleartext
-/// connection. Expect the token each time.
+/// A-625: do read RFC 6750 §2.1's own example, and a token with its padding. Expect the token each time.
 #[test]
-fn bearer_reads_its_token_over_tls_and_loopback() {
-  for secure in [true, false] {
-    assert_eq!(
-      read(&["Authorization: Bearer mF_9.B5f-4.1JqM"], secure),
-      Ok(Some(Credential::Bearer(b"mF_9.B5f-4.1JqM".to_vec())))
-    );
-    assert_eq!(
-      read(&["Authorization: Bearer ab+/cd=="], secure),
-      Ok(Some(Credential::Bearer(b"ab+/cd==".to_vec())))
-    );
-  }
+fn bearer_reads_rfc_6750s_own_example() {
+  assert_eq!(
+    read(&["Authorization: Bearer mF_9.B5f-4.1JqM"]),
+    Ok(Some(Credential::Bearer(b"mF_9.B5f-4.1JqM".to_vec())))
+  );
+  assert_eq!(
+    read(&["Authorization: Bearer ab+/cd=="]),
+    Ok(Some(Credential::Bearer(b"ab+/cd==".to_vec())))
+  );
 }
 
-/// A-625: do read a request with no `Authorization`. Expect no credentials, whatever the connection.
+/// A-625: do read a request with no `Authorization`, and one with other fields alone. Expect no credentials.
 #[test]
 fn a_request_without_authorization_carries_none() {
-  assert_eq!(read(&[], true), Ok(None));
-  assert_eq!(read(&["Accept: */*"], false), Ok(None));
+  assert_eq!(read(&[]), Ok(None));
+  assert_eq!(read(&["Accept: */*"]), Ok(None));
 }
 
 /// A-625: do send every malformed Basic and Bearer credential: no token, a byte outside base64, a cut quantum, padding
@@ -103,11 +101,7 @@ fn malformed_credentials_are_refused_400() {
     "Authorization: Bearer a,b",
   ];
   for field in cases {
-    assert_eq!(
-      read(&[field], true),
-      Err(CredentialRefused::Malformed),
-      "{field}"
-    );
+    assert_eq!(read(&[field]), Err(CredentialRefused::Malformed), "{field}");
   }
   assert_eq!(CredentialRefused::Malformed.status(), Status::BAD_REQUEST);
 }
@@ -121,7 +115,7 @@ fn an_unknown_scheme_is_refused_401() {
     "Authorization: Negotiate YII=",
   ] {
     assert_eq!(
-      read(&[field], true),
+      read(&[field]),
       Err(CredentialRefused::UnknownScheme),
       "{field}"
     );
@@ -136,47 +130,31 @@ fn an_unknown_scheme_is_refused_401() {
 #[test]
 fn a_repeated_authorization_is_refused_400() {
   let fields = ["Authorization: Bearer abc", "Authorization: Bearer def"];
-  assert_eq!(read(&fields, true), Err(CredentialRefused::Repeated));
+  assert_eq!(read(&fields), Err(CredentialRefused::Repeated));
   assert_eq!(CredentialRefused::Repeated.status(), Status::BAD_REQUEST);
 }
 
-/// A-625: do send Basic over a cleartext connection. Expect it refused, `401`, whatever it names (RFC 7617 §4).
+/// A-686 (main's ruling, 2026-11-19: Basic's challenge first on every connection, TLS included). Do: ask for the
+/// challenges naming a realm, one holding a quote and a backslash, and one holding a control byte. Expect: Basic with
+/// its charset first and Bearer second, the realm a quoted string with its quote and backslash escaped, and the control
+/// byte refused.
 #[test]
-fn basic_in_cleartext_is_refused_401() {
+fn challenges_offer_basic_first_then_bearer_each_naming_the_realm() {
   assert_eq!(
-    read(
-      &["Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="],
-      false
-    ),
-    Err(CredentialRefused::BasicInCleartext)
-  );
-  assert_eq!(
-    CredentialRefused::BasicInCleartext.status(),
-    Status::UNAUTHORIZED
-  );
-}
-
-/// A-625: do ask for the challenges over TLS and in cleartext, and with a realm holding a quote and a backslash, and one
-/// holding a control byte. Expect Basic with its charset and Bearer over TLS, Bearer alone in cleartext, the realm a
-/// quoted string with its quote and backslash escaped, and the control byte refused.
-#[test]
-fn challenges_name_the_realm_and_offer_basic_over_tls_alone() {
-  assert_eq!(
-    challenges("slates", true),
+    challenges("slates"),
     Ok(vec![
       b"Basic realm=\"slates\", charset=\"UTF-8\"".to_vec(),
       b"Bearer realm=\"slates\"".to_vec(),
     ])
   );
   assert_eq!(
-    challenges("slates", false),
-    Ok(vec![b"Bearer realm=\"slates\"".to_vec()])
+    challenges("a\"b\\c"),
+    Ok(vec![
+      b"Basic realm=\"a\\\"b\\\\c\", charset=\"UTF-8\"".to_vec(),
+      b"Bearer realm=\"a\\\"b\\\\c\"".to_vec(),
+    ])
   );
-  assert_eq!(
-    challenges("a\"b\\c", false),
-    Ok(vec![b"Bearer realm=\"a\\\"b\\\\c\"".to_vec()])
-  );
-  assert_eq!(challenges("a\nb", true), Err(BadRealm));
+  assert_eq!(challenges("a\nb"), Err(BadRealm));
 }
 
 /// A-625: do compare secrets equal, differing at their last byte, one the other's prefix, and both empty. Expect equal

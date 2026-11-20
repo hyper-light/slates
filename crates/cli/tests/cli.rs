@@ -13475,12 +13475,13 @@ fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
 const VCS_HTTP_CLEARTEXT_LINE: &str =
   "slates daemon: the version-control HTTP edge serves cleartext on 127.0.0.1:";
 
-/// A-625 part 3 (§4.17.2 "Transports" item 1), A-629 part 2c. Do: start an anchor whose daemon is asked for the
-/// version-control HTTP edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the daemon
-/// names; ask that port for a repository's refs with no credentials, then for its Git LFS locks. Expect: the daemon names
-/// the edge's port before it says it serves, and the edge answers each `401` with a Bearer challenge and no Basic one
-/// (Basic's password is taken over TLS alone), the LFS request's in `LFS-Authenticate` too: the flag went from the anchor
-/// to its daemon, which started the shared edge, and git's site routes Git LFS through its authentication.
+/// A-625 part 3 (§4.17.2 "Transports" item 1), A-629 part 2c and A-686. Do: start an anchor whose daemon is asked for
+/// the version-control HTTP edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the
+/// daemon names; ask that port for a repository's refs with no credentials, then for its Git LFS locks. Expect: the
+/// daemon names the edge's port before it says it serves, and the edge answers each `401` with Basic's challenge first
+/// and Bearer's after it (main's ruling, 2026-11-19: Basic's password is taken on the loopback edge as over TLS, and
+/// stock Mercurial reads the first challenge alone), the LFS request's in `LFS-Authenticate` too: the flag went from the
+/// anchor to its daemon, which started the shared edge, and git's site routes Git LFS through its authentication.
 #[test]
 fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   use std::io::{BufRead, Write};
@@ -13527,19 +13528,20 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   anchor.drain = Some(echo_the_rest(stderr));
   let port = port.expect("the daemon named its edge's port before it served");
   let refs = bare_request(port, WAIT_FOR).expect("the edge answered");
-  assert!(bearer_alone(&refs, "www-authenticate"), "{refs}");
+  assert!(basic_then_bearer(&refs, "www-authenticate"), "{refs}");
   let locks = answer_head(port, LFS_LOCKS_REQUEST, WAIT_FOR).expect("the edge answered LFS");
-  assert!(bearer_alone(&locks, "lfs-authenticate"), "{locks}");
+  assert!(basic_then_bearer(&locks, "lfs-authenticate"), "{locks}");
 }
 
 /// Shape: a Git LFS locks listing of `r.git` with no credentials, as git-lfs asks it (A-629 part 2c).
 const LFS_LOCKS_REQUEST: &str = "GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n";
 
-/// Whether `head`, in lower case, is a `401` whose `field` offers Bearer's challenge and no Basic one anywhere.
-fn bearer_alone(head: &str, field: &str) -> bool {
+/// Whether `head`, in lower case, is a `401` whose `field` offers Basic's challenge first and Bearer's after it (A-686).
+fn basic_then_bearer(head: &str, field: &str) -> bool {
+  let basic = head.find(&format!("{field}: basic realm="));
+  let bearer = head.find(&format!("{field}: bearer realm="));
   head.starts_with("http/1.1 401 ")
-    && head.contains(&format!("{field}: bearer realm="))
-    && !head.contains("basic")
+    && matches!((basic, bearer), (Some(basic), Some(bearer)) if basic < bearer)
 }
 
 /// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
@@ -13896,21 +13898,17 @@ fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
   );
 }
 
-/// A-650 part 1 and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a Basic challenge,
-/// which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial 7.2, given no
-/// credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort: http
-/// authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
-/// stock hg 7.2 ([`STOCK_HG`]). Ignored until it can pass. As of main 34d10acb5 the daemon's edge serves git's site
-/// alone (`DaemonSite`), so hg's request is answered `404` (hg: `abort: HTTP Error 404: Not Found`; Mac Studio, kiln
-/// r174): the hg site's stores and lender are A-680 (g303). That site's `401` offers Bearer alone, which crashes 7.2
-/// ("** unknown exception encountered", `ValueError: AbstractDigestAuthHandler does not support the following scheme:
-/// 'Bearer'`, raised at Python 3.12's `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1; measured on
-/// the Mac Studio on 2026-11-19 against a stub answering that `401`), since urllib's digest handler reads the first
-/// challenge alone and refuses any scheme but Digest and Basic: Basic's challenge first on every connection is A-686
-/// (g258).
+/// A-650 part 1, A-680 part 2a and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a
+/// Basic challenge, which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial
+/// 7.2, given no credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort:
+/// http authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]). Its waits, as they ended: the daemon's edge served git's site alone, so hg's request
+/// met `404` (`abort: HTTP Error 404: Not Found`; Mac Studio, kiln r174), until A-680 part 2a put Mercurial's site
+/// beside it; that site's `401` offered Bearer alone, which crashed 7.2 ("** unknown exception encountered",
+/// `ValueError: AbstractDigestAuthHandler does not support the following scheme: 'Bearer'`, raised at Python 3.12's
+/// `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1), since urllib's digest handler reads the first
+/// challenge alone, until A-686 put Basic's challenge first on every connection.
 #[test]
-#[ignore = "waits on A-686 (g258: Basic's challenge first; stock hg 7.2 crashes on a first Bearer challenge); \
-            the hg site and its lender are on the daemon's edge (A-680 part 2a)"]
 fn stock_hg_without_credentials_is_refused_in_its_own_words() {
   let Some(hg) = stock_hg() else {
     eprintln!(
@@ -13945,14 +13943,11 @@ fn stock_hg_without_credentials_is_refused_in_its_own_words() {
 /// (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and pull it back
 /// ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips loudly without
 /// stock hg 7.2 ([`STOCK_HG`]), and where the platform names no issuer surface ([`NO_ISSUER_SURFACE`]). Ignored until
-/// it can pass: as of main 34d10acb5 the CLI has no
-/// `repository create` (A-685, g305; `unknown flag --tool`, kiln r174), the daemon's edge serves git's site alone and
-/// the hg site holds no store (A-680, g303: the hg site's stores and lender, its pushes' `unbundle` with them), and the
-/// edge offers hg no challenge it reads nor takes Basic in cleartext (A-686, g258;
-/// [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
+/// it can pass: the hg site's pushes (`unbundle` through `hg_push`) are A-680 part 2b (g303); `slates repository
+/// create` (A-685), the hg site on the daemon's edge (A-680 part 2a) and the edge's Basic, its challenge first and
+/// taken on the loopback edge (A-686, [`stock_hg_without_credentials_is_refused_in_its_own_words`]), are built.
 #[test]
-#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push) and A-686 (g258: Basic \
-            with the token as password on the loopback edge, Basic's challenge first)"]
+#[ignore = "waits on A-680 part 2b (g303: the hg site's pushes, unbundle through hg_push)"]
 fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   let Some(hg) = stock_hg() else {
     eprintln!(
