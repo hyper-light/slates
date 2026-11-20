@@ -212,6 +212,16 @@ impl SegmentSource {
       }
     }
   }
+
+  /// The rendezvous a daemon started over this source adopts (A-114): the one the anchor across the spawn named in the
+  /// environment, the one held beside a handoff, or none for a daemon that makes its own.
+  fn adoption(&self) -> Result<Option<Adoption>, ServerError> {
+    Ok(match self {
+      SegmentSource::Create { .. } => None,
+      SegmentSource::FromEnv => Adoption::from_env()?,
+      SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
+    })
+  }
 }
 
 /// A held register record as a holder keeps it ([`Daemon::fleet_held_record`]).
@@ -918,6 +928,22 @@ impl Daemon {
     Self::start_with_fleet(profile, config, source, None)
   }
 
+  /// The observability gate (§2.6, §4.14): refused, naming what is missing, unless every chokepoint span has
+  /// registered its emitter.
+  fn chokepoints_ready() -> Result<(), ServerError> {
+    let chokepoints = registered_chokepoints();
+    if chokepoints.is_ready() {
+      return Ok(());
+    }
+    Err(ServerError::ChokepointsUnregistered {
+      missing: chokepoints
+        .missing()
+        .into_iter()
+        .map(Chokepoint::name)
+        .collect(),
+    })
+  }
+
   /// Like [`start`](Daemon::start) but **joins a fleet** (§4.8, boot step 6): `fleet_transport` — this
   /// node's fleet TLS identity, its advertised accept socket, and its peers — drives the control shard's
   /// membership loop, which probes the peers, serves their probes, and folds the converged view into the
@@ -935,16 +961,7 @@ impl Daemon {
     // span has registered its emitter, so a daemon never serves with a silently missing span source.
     // Fail-closed and checked before any resource is acquired — an incomplete roster stops the boot
     // here, naming what is missing, rather than serving blind.
-    let chokepoints = registered_chokepoints();
-    if !chokepoints.is_ready() {
-      return Err(ServerError::ChokepointsUnregistered {
-        missing: chokepoints
-          .missing()
-          .into_iter()
-          .map(Chokepoint::name)
-          .collect(),
-      });
-    }
+    Self::chokepoints_ready()?;
     // This daemon's own mounts (A-227), recorded as each is made, so no daemon thread opens a path on one; room for one
     // a live attachment the shards can hold, the bound the anchor's device holds take.
     slates_base::own_mounts::install(config.held_device_bound()).map_err(|error| {
@@ -955,11 +972,7 @@ impl Daemon {
     let supervision = source.supervision();
     // The rendezvous comes from wherever the segment does (A-114): an anchor across the spawn names both in the
     // environment, an anchor in this process hands both over, and a daemon with no anchor makes its own.
-    let adoption = match &source {
-      SegmentSource::Create { .. } => None,
-      SegmentSource::FromEnv => Adoption::from_env()?,
-      SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
-    };
+    let adoption = source.adoption()?;
     // The owner first (A-254, the rule of A-176 and A-178): a second daemon of a live instance is refused here, having
     // created nothing. On macOS a segment's creation unlinks any holder of its name and its drop unlinks the name again,
     // so a refused start that had created one took the live daemon's name with it. Every Linux rendezvous is sealed
@@ -1356,8 +1369,12 @@ impl Daemon {
     self.pending(target, budget_ns, move || state::try_with_state(question))
   }
 
-  /// Runs `question` on this daemon's shard at `target` and returns its answer within
-  /// [`OBSERVE_BUDGET_NS`] ([`Self::observation`]). That budget is **generous on purpose**: under noisy,
+  /// Runs `question` on this daemon's shard at `target` and returns its answer once the shard runs it, while the shard
+  /// lives (A-232's rule; `Observation::patient`, looked at every liveness window): however long the shard is busy,
+  /// starved or held alone by other work, only its going ends the wait, and a stuck shard is its watchdog's to end. Until
+  /// 2026-11-20 the answer was waited for within [`OBSERVE_BUDGET_NS`], ten liveness windows, and a control shard held
+  /// alone by recovered work past that budget's CPU refused every default observation, the stop watch's install among
+  /// them (w-interop's restart loop). That budget was **generous on purpose**: under noisy,
   /// heavy CPU load a live shard can be starved of the scheduler for several seconds before it services
   /// this one-shot question, and a tight budget would end the observation with a deadline where the
   /// shard was merely slow — so a slow shard answers, and only a wedged one ends the observation, with
@@ -1374,7 +1391,7 @@ impl Daemon {
     Q: FnOnce(&mut ShardState) -> T + Clone + Send + 'static,
   {
     self
-      .observation(target, OBSERVE_BUDGET_NS, question)?
+      .pending_patient(target, move || state::try_with_state(question))?
       .wait()
   }
 
@@ -1386,7 +1403,7 @@ impl Daemon {
     Q: FnOnce(&slates_rt::shard::ShardContext) -> T + Clone + Send + 'static,
   {
     self
-      .pending(target, OBSERVE_BUDGET_NS, move || {
+      .pending_patient(target, move || {
         registry::with_current(question).ok_or(StateAccess::Absent)
       })?
       .wait()
@@ -1426,6 +1443,26 @@ impl Daemon {
   /// The observation core: a question in the unified form (it answers, or names why the shard's state
   /// was out of reach), pinned to the registration holding the shard at `target`, with the refusals
   /// decidable before a submission decided here.
+  /// The observation of `question` at `target` that waits while the shard lives (`Observation::patient`), looking every
+  /// liveness window: the default observations' form ([`Self::observe`]).
+  fn pending_patient<T, Q>(
+    &self,
+    target: Option<ShardId>,
+    question: Q,
+  ) -> Result<Observation<T, Q>, ObserveError>
+  where
+    T: Send + 'static,
+    Q: FnOnce() -> Result<T, StateAccess> + Clone + Send + 'static,
+  {
+    let shard = target.ok_or(ObserveError::NoTarget)?;
+    let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
+    let holder = runtime.holder_of(shard).ok_or(ObserveError::ShardGone {
+      shard: shard.0,
+      stage: ObserveStage::Submission,
+    })?;
+    Ok(Observation::patient(holder, LIVENESS_BUDGET_NS, question))
+  }
+
   fn pending<T, Q>(
     &self,
     target: Option<ShardId>,

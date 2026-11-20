@@ -15,21 +15,28 @@
 //!   exchange runs; a key that reaches its whole limit anyway ends the connection.
 //! - An operator may cap a key's use lower ([`UsageCap`], as the session plane's `cap_key_usage` does), never higher.
 //!
-//! **By time, learned.** RFC 4253 §9 recommends new keys "after each hour of connection time" and warns that a
-//! re-exchange "should not be performed too often". The key's time is [`key_time_limit_ns`]: the tail of the lifetimes
-//! this deployment's connections have lived, which the server measures (A-363's estimator form), so a long connection's
-//! key serves no longer than an ordinary connection's only key does, and never past the RFC's hour, which is also the
-//! value before any lifetime is measured (as RFC 6298 §2.1 starts from a stated value until a measurement exists). The
-//! transport never rekeys by time sooner than its last exchange took, so a re-exchange can never fill the connection.
+//! **By data and time, the RFC's.** RFC 4253 §9: "It is RECOMMENDED that the keys be changed after each gigabyte of
+//! transmitted data or after each hour of connection time, whichever comes sooner", and a re-exchange "should not be
+//! performed too often". So a key is due after a gigabyte of packets in either direction ([`REKEY_BYTES`]) and after an
+//! hour ([`RECOMMENDED_KEY_TIME_NS`]), a protocol rule, not a tunable. A-594 had learned the time from the lifetimes of
+//! this edge's earlier connections; one short session (31 ms, measured) then put every long transfer on a rekey every few
+//! seconds, which a stall at a rekey made visible (A-745, found by use), so nothing an earlier session measured moves it.
+//! The transport never rekeys by time sooner than its last exchange took, so a re-exchange can never fill the connection.
 
 use crate::packet::{AES_BLOCK_LEN, Cipher, Usage};
 
 /// Format: nanoseconds in a second.
 pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
-/// RFC 4253 §9's recommended key time, an hour ("after each hour of connection time"): the ceiling on the learned key
-/// time and its value before a lifetime is measured.
+/// RFC 4253 §9's key time, an hour ("after each hour of connection time").
 pub const RECOMMENDED_KEY_TIME_NS: u64 = NANOS_PER_SECOND.saturating_mul(SECONDS_PER_HOUR);
+
+/// RFC 4253 §9's data a key serves in each direction, a gigabyte ("after each gigabyte of transmitted data"), taken as
+/// 2^30 bytes.
+pub const REKEY_BYTES: u64 = 1 << GIGABYTE_BITS;
+
+/// Format: the bits of a gigabyte's byte count, 2^30.
+const GIGABYTE_BITS: u32 = 30;
 
 /// Format: seconds in an hour.
 const SECONDS_PER_HOUR: u64 = 3_600;
@@ -47,6 +54,8 @@ pub struct KeyLimits {
   pub packets: u64,
   /// Block-cipher blocks.
   pub blocks: u64,
+  /// Bytes after which a re-exchange is due (RFC 4253 §9's gigabyte): a rekey point, never a limit that ends the key.
+  pub bytes: u64,
 }
 
 /// An operator's cap on a key's use, below the derived limits.
@@ -75,7 +84,11 @@ impl KeyLimits {
       ),
       Cipher::ChaCha20Poly1305 => u64::MAX,
     };
-    Self { packets, blocks }
+    Self {
+      packets,
+      blocks,
+      bytes: REKEY_BYTES,
+    }
   }
 
   /// These limits under `cap`, which can only lower them.
@@ -87,6 +100,7 @@ impl KeyLimits {
       blocks: cap
         .blocks
         .map_or(self.blocks, |blocks| blocks.min(self.blocks)),
+      bytes: self.bytes,
     }
   }
 
@@ -95,16 +109,10 @@ impl KeyLimits {
     usage.packets > self.packets || usage.blocks > self.blocks
   }
 
-  /// Whether `usage` has reached the rekey point, half of each limit.
+  /// Whether `usage` has reached the rekey point: half of each limit, or the RFC's gigabyte of data.
   pub fn due(self, usage: Usage) -> bool {
-    usage.packets >= self.packets.div_ceil(2) || usage.blocks >= self.blocks.div_ceil(2)
+    usage.packets >= self.packets.div_ceil(2)
+      || usage.blocks >= self.blocks.div_ceil(2)
+      || usage.bytes >= self.bytes
   }
-}
-
-/// The time a key serves: the tail of the connection lifetimes the deployment measured, never past
-/// [`RECOMMENDED_KEY_TIME_NS`], and that hour before any is measured.
-pub fn key_time_limit_ns(measured_lifetime_tail_ns: Option<u64>) -> u64 {
-  measured_lifetime_tail_ns.map_or(RECOMMENDED_KEY_TIME_NS, |tail| {
-    tail.min(RECOMMENDED_KEY_TIME_NS)
-  })
 }

@@ -50,13 +50,46 @@ pub enum StallReading {
 
 /// The host's memory stall now, or `None` where the platform reads none (the module's note names each source).
 pub fn read() -> Option<StallReading> {
-  platform::read()
+  match IN_PLACE.load(std::sync::atomic::Ordering::Acquire) {
+    PUT_CLEAR => Some(StallReading::Level { pressed: false }),
+    PUT_PRESSED => Some(StallReading::Level { pressed: true }),
+    _ => platform::read(),
+  }
 }
 
 /// Where this platform reads the host's memory stall, in a log line's words.
 pub fn source() -> &'static str {
-  platform::SOURCE
+  match IN_PLACE.load(std::sync::atomic::Ordering::Acquire) {
+    PUT_CLEAR | PUT_PRESSED => "a level this process's test put in the host's reading's place",
+    _ => platform::SOURCE,
+  }
 }
+
+/// Test support: puts a level in the host's reading's place for this whole process, pressed or clear, or gives the
+/// host's own reading back (`None`): what [`read`] answers from then on, so every reader of it in the process (the
+/// anchor's judgment of its daemon, a daemon's watchdog) takes the same level. A test that drives a wedge, a block or a
+/// frozen process puts a clear level, since on a host under memory pressure a waiting thread is rightly taken for one
+/// waiting on memory (A-336), and the condition the test means would never be judged (the two `slates-api` anchor
+/// liveness tests on a Mac under kernel memory pressure, 2026-11-20). A daemon's own `MemoryStallSource` injection, where
+/// a test sets one, is read before this.
+pub fn put_in_place(pressed: Option<bool>) {
+  let word = match pressed {
+    None => HOST_READING,
+    Some(false) => PUT_CLEAR,
+    Some(true) => PUT_PRESSED,
+  };
+  IN_PLACE.store(word, std::sync::atomic::Ordering::Release);
+}
+
+/// What [`read`] answers in this process: [`HOST_READING`], [`PUT_CLEAR`] or [`PUT_PRESSED`] ([`put_in_place`]). Written
+/// by a test, read by any thread; a flag, so acquire and release.
+static IN_PLACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(HOST_READING);
+/// Format: [`IN_PLACE`]'s word when the host's own reading is taken.
+const HOST_READING: u8 = 0;
+/// Format: [`IN_PLACE`]'s word when a clear level stands in the host's reading's place.
+const PUT_CLEAR: u8 = 1;
+/// Format: [`IN_PLACE`]'s word when a pressed level stands in the host's reading's place.
+const PUT_PRESSED: u8 = 2;
 
 /// Whether the host reported a memory stall between the reading `before` and the reading `now` (A-336): a level pressed
 /// at `now`, or a cumulative total risen past `before`'s. A cumulative reading with no earlier one of its kind says

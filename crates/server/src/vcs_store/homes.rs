@@ -154,19 +154,32 @@ fn ticket_here(shard: u16) -> HomeTicket {
   HomeTicket { shard, generation }
 }
 
-/// Waits, on this shard, until its image of `generation` is published.
+/// Waits, on this shard, until its image of `generation` is published. Its first poll that finds it unpublished
+/// publishes the shard itself (`crate::verbs::publish_shard`: a delta, made and committed in one turn), since nothing
+/// else publishes on a schedule (persistence before reply): every window kept before that publication rides it, so the
+/// waits behind it find their generation published (group commit, one publication for all of them). A publication
+/// refused leaves the wait for the next one that commits.
 struct PublishedHere {
   generation: u64,
+  /// Whether this wait has published the shard already.
+  asked: bool,
 }
 
 impl core::future::Future for PublishedHere {
   type Output = bool;
 
   fn poll(
-    self: core::pin::Pin<&mut Self>,
+    mut self: core::pin::Pin<&mut Self>,
     context: &mut core::task::Context<'_>,
   ) -> core::task::Poll<bool> {
     let generation = self.generation;
+    if !self.asked && !published_here(generation) {
+      self.asked = true;
+      if crate::state::with_state(|state| crate::verbs::publish_shard(state).is_ok()) == Some(true)
+      {
+        crate::state::with_state(|state| state.count(HOME_PUBLISHED, 1));
+      }
+    }
     IMAGES.with(|images| match images.try_borrow_mut() {
       Ok(images) if images.published >= generation => core::task::Poll::Ready(true),
       Ok(mut images) => {
@@ -181,6 +194,10 @@ impl core::future::Future for PublishedHere {
   }
 }
 
+/// Counter: publications a home's wait for its ticket made itself (A-724 piece 8c), nothing else having published since
+/// the window was kept. Format: a counter name.
+pub(crate) const HOME_PUBLISHED: &str = "vcs_store.homes.published_for_ticket";
+
 /// Whether the window of `ticket` is durable at its home, asked from shard `origin` (module docs): waits on the home, in
 /// its own time up to `budget_ns`, for its image of the ticket's generation; false when that did not come within it.
 pub(crate) async fn published(origin: u16, ticket: HomeTicket, budget_ns: u64) -> bool {
@@ -188,7 +205,10 @@ pub(crate) async fn published(origin: u16, ticket: HomeTicket, budget_ns: u64) -
   crate::xshard::task_in_shard_time(
     origin,
     ticket.shard,
-    move || PublishedHere { generation },
+    move || PublishedHere {
+      generation,
+      asked: false,
+    },
     budget_ns,
   )
   .await
@@ -660,6 +680,159 @@ async fn let_go_region_at_home(
   )
   .await
   .ok_or(HomeRefused::Unanswered)?
+}
+
+/// Counter: objects homed in the region at `f + 1` before a record names them (A-724 piece 8c). Format: a counter name.
+pub(crate) const HOMED_IN_REGION: &str = "vcs_store.homes.homed_in_region";
+/// Counter: homings in the region that fell short of `f + 1` within their budget. Format: a counter name.
+pub(crate) const HOMED_SHORT: &str = "vcs_store.homes.homed_short";
+
+/// The object `bytes` homed in the region before a record names it (main's ruling of 2026-11-20 (ii), A-727's rule:
+/// content durable at `f + 1` before the record that names it): kept on each of its region homes
+/// (`slates_db::identity_homes::homes` over its BLAKE3), this node's own through its home shard, every other through
+/// [`slates_cluster::homes`]; each answers kept only once its home's image holding it is published. Its identity once
+/// `f + 1` homes (every member, in a region of fewer) answered kept within `budget`; refused `Unanswered` otherwise, and
+/// the caller records the names inline instead (version 2). Asked from shard `origin`; at most one window
+/// (`ContentRefused::PastWindow` refused `PastWindow`) until an object past one is sent in parts.
+pub(crate) async fn home_in_region(
+  origin: u16,
+  shards: &[u16],
+  bytes: Vec<u8>,
+  budget: slates_cluster::CommitBudget,
+) -> Result<ContentId, HomeRefused> {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
+  let (local, members, f) = crate::state::with_state(|state| {
+    (
+      state.fleet.host(),
+      state.fleet.members().to_vec(),
+      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+    )
+  })
+  .ok_or(HomeRefused::Unanswered)?;
+  let identity = ContentId::of(&bytes);
+  let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
+  let budget_ns = budget.max_deadline_ns();
+  let mut kept = 0usize;
+  if homes.contains(&local) {
+    let (_, ticket) = keep_region_at_home(origin, shards, bytes.clone(), budget_ns).await?;
+    if published(origin, ticket, budget_ns).await {
+      kept = kept.saturating_add(1);
+    }
+  }
+  let others: Vec<slates_db::HostId> = homes
+    .iter()
+    .copied()
+    .filter(|home| *home != local)
+    .collect();
+  if !others.is_empty() {
+    let request = HomeMessage::Put {
+      identity: identity.0,
+      bytes,
+    }
+    .encode();
+    let sessions =
+      crate::fleet::take_sessions("vcs_store.homes.region", |host| others.contains(&host));
+    let outgoing: Vec<_> = sessions
+      .into_iter()
+      .map(|(host, endpoint)| (host, request.clone(), endpoint))
+      .collect();
+    let (replied, _stragglers) = slates_cluster::broadcast(
+      outgoing,
+      HOME_STREAM,
+      slates_transport::connection::Priority::Bulk,
+      budget,
+    )
+    .await;
+    let mut returned = Vec::with_capacity(replied.len());
+    for (host, reply, endpoint) in replied {
+      if let Ok(HomeMessage::Answer {
+        identity: answered,
+        outcome: HomeOutcome::Kept { .. },
+      }) = HomeMessage::decode(&reply.bytes)
+        && answered == identity.0
+      {
+        kept = kept.saturating_add(1);
+      }
+      returned.push((host, endpoint));
+    }
+    crate::fleet::return_sessions(returned);
+  }
+  let homed = kept >= homes.len() && !homes.is_empty();
+  crate::state::with_state(|state| {
+    state.count(if homed { HOMED_IN_REGION } else { HOMED_SHORT }, 1)
+  });
+  if homed {
+    Ok(identity)
+  } else {
+    Err(HomeRefused::Unanswered)
+  }
+}
+
+/// The object `identity` read from the region (A-724 piece 8c: a version-3 record's names, read where its replay runs):
+/// from this node's own home shard when it holds it, else from each of its region homes in turn, the first answer whose
+/// bytes hash to `identity` taken (a home answering other bytes is passed over). None when no home answered it within
+/// `budget`. Asked from shard `origin`.
+pub(crate) async fn read_in_region(
+  origin: u16,
+  shards: &[u16],
+  identity: ContentId,
+  budget: slates_cluster::CommitBudget,
+) -> Option<Vec<u8>> {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
+  let budget_ns = budget.max_deadline_ns();
+  if let Some(bytes) = read(origin, shards, identity, budget_ns).await
+    && ContentId::of(&bytes) == identity
+  {
+    return Some(bytes);
+  }
+  let (local, members, f) = crate::state::with_state(|state| {
+    (
+      state.fleet.host(),
+      state.fleet.members().to_vec(),
+      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+    )
+  })?;
+  let others: Vec<slates_db::HostId> = slates_db::identity_homes::homes(&identity.0, &members, f)
+    .into_iter()
+    .filter(|home| *home != local)
+    .collect();
+  if others.is_empty() {
+    return None;
+  }
+  let request = HomeMessage::Read {
+    identity: identity.0,
+  }
+  .encode();
+  let sessions =
+    crate::fleet::take_sessions("vcs_store.homes.region_read", |host| others.contains(&host));
+  let outgoing: Vec<_> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.clone(), endpoint))
+    .collect();
+  let (replied, _stragglers) = slates_cluster::broadcast(
+    outgoing,
+    HOME_STREAM,
+    slates_transport::connection::Priority::Bulk,
+    budget,
+  )
+  .await;
+  let mut found = None;
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    if found.is_none()
+      && let Ok(HomeMessage::Answer {
+        identity: answered,
+        outcome: HomeOutcome::Bytes(bytes),
+      }) = HomeMessage::decode(&reply.bytes)
+      && answered == identity.0
+      && ContentId::of(&bytes) == identity
+    {
+      found = Some(bytes);
+    }
+    returned.push((host, endpoint));
+  }
+  crate::fleet::return_sessions(returned);
+  found
 }
 
 /// Counter: identities the healer offered to their region homes. Format: a counter name.

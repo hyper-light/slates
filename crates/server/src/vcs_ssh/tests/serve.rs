@@ -685,11 +685,9 @@ fn a_held_key_runs_its_command_and_its_connection_teaches_the_edge() {
     (1, 1, 1, 1, 0)
   );
   assert!(samples[3] >= 1, "{samples:?}");
-  assert!(
-    seen.key_time_ns < RECOMMENDED_KEY_TIME_NS,
-    "{}",
-    seen.key_time_ns
-  );
+  // RFC 4253 §9: new keys after a gigabyte or an hour, never sooner for a lifetime an earlier session measured (A-745:
+  // a short session's tail rekeyed every long clone every few seconds).
+  assert_eq!(seen.key_time_ns, RECOMMENDED_KEY_TIME_NS);
 }
 
 /// Whether [`SAW_ITS_CLIENT_GO`] is marked within `for_ns`, looked at every [`TICK_NS`].
