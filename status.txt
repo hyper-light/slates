@@ -46,3 +46,8 @@ run 42 exit 0 0 skip-lines
 run 43 exit 0 0 skip-lines
 run 44 exit 0 0 skip-lines
 run 45 exit 0 0 skip-lines
+run 46 exit 0 0 skip-lines
+run 47 exit 0 0 skip-lines
+run 48 exit 0 0 skip-lines
+run 49 exit 0 0 skip-lines
+run 50 exit 0 0 skip-lines
