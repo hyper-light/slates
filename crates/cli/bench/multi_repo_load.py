@@ -493,7 +493,10 @@ def main():
                         print("      by phase: " + "; ".join(
                             f"{label} {tally['steps'][at]} steps {tally['ns'][at] / 1e9:.3f} s "
                             f"waited before {tally['gap_ns'][at] / 1e9:.3f} s"
-                            for at, label in enumerate(("input", "end", "check", "answer"))), flush=True)
+                            for at, label in enumerate(("input", "end", "check", "answer")))
+                            + f"; from the push's beginning to its first step "
+                            f"{sum(rows.get(name, {}).get('push_phases', {}).get('first_gap_ns', 0) for name in names) / 1e9:.3f} s",
+                            flush=True)
                 busiest = sorted(by_shard.items(), key=lambda item: -item[1])[:3]
                 print("    busiest shards by step time: " + ", ".join(f"{part}: {ns / 1e9:.2f} s" for part, ns in busiest), flush=True)
                 print(f"    {len(served)} one-push repositories: served p50 {quantile(served, 0.5):.3f} s p99 "

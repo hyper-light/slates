@@ -355,12 +355,15 @@ impl<P> ReceivePack<P> {
         .map_err(PushFailed::Exchange)?;
     }
     // A-724 piece 1: the push is counted on its repository's row as it begins.
-    state.vcs_usage.begun(
-      &repository,
-      principal,
-      Work::Intake,
-      slates_rt::futures::now_ns(),
-    );
+    let begun = slates_rt::futures::now_ns();
+    state
+      .vcs_usage
+      .begun(&repository, principal, Work::Intake, begun);
+    PHASE_LONGEST.with(|longest| {
+      if let Ok(mut longest) = longest.try_borrow_mut() {
+        longest.entry(repository).or_default().begun_at = Some(begun);
+      }
+    });
     Ok(ReceivePack {
       repository,
       principal: principal.clone(),
@@ -1013,8 +1016,12 @@ pub(crate) struct PhaseSteps {
   /// before a check turn or an answer step, the time the push waited for its shard (it was ready); before an input step,
   /// that and the client's bytes.
   pub(crate) gap_ns: [u64; 4],
+  /// The nanoseconds from each push's beginning (its session made, `vcs_usage`'s `begun`) to its first step.
+  pub(crate) first_gap_ns: u64,
   /// The shard clock at the repository's latest push step's end; zero before its first.
   last_end: u64,
+  /// The shard clock at a push's beginning while its first step is still to come.
+  begun_at: Option<u64>,
 }
 
 /// [`PhaseSteps`] by repository on this shard: one entry a repository with a push stepped here, so bounded by the
@@ -1053,7 +1060,16 @@ fn charge_phase(
   PHASE_LONGEST.with(|longest| {
     if let Ok(mut longest) = longest.try_borrow_mut() {
       let entry = longest.entry(repository).or_default();
-      let gap = if entry.last_end == 0 { 0 } else { began.saturating_sub(entry.last_end) };
+      let gap = match entry.begun_at.take() {
+        Some(begun) => {
+          entry.first_gap_ns = entry
+            .first_gap_ns
+            .saturating_add(began.saturating_sub(begun));
+          0
+        }
+        None if entry.last_end == 0 => 0,
+        None => began.saturating_sub(entry.last_end),
+      };
       entry.last_end = now;
       if let (Some(most), Some(steps), Some(ns), Some(gaps)) = (
         entry.longest.get_mut(phase),

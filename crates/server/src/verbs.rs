@@ -4341,6 +4341,7 @@ fn repository_usage_reports(
       push_phase_steps: crate::git_push::phase_longest(*id).steps.to_vec(),
       push_phase_ns: crate::git_push::phase_longest(*id).ns.to_vec(),
       push_phase_gap_ns: crate::git_push::phase_longest(*id).gap_ns.to_vec(),
+      push_first_gap_ns: crate::git_push::phase_longest(*id).first_gap_ns,
     })
     .collect()
 }

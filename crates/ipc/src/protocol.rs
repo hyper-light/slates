@@ -2064,6 +2064,8 @@ pub struct RepositoryUsageReport {
   /// The nanoseconds from the repository's previous push step's end to each step's start, by the step's phase: before
   /// a check turn or the answer, the push's wait for its shard; before an input step, that and the client's bytes.
   pub push_phase_gap_ns: Vec<u64>,
+  /// The nanoseconds from each git push's beginning to its first step, summed.
+  pub push_first_gap_ns: u64,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last

@@ -2228,6 +2228,7 @@ fn push_phases_json(r: &slates_ipc::protocol::RepositoryUsageReport) -> serde_js
     "steps": r.push_phase_steps,
     "ns": r.push_phase_ns,
     "gap_ns": r.push_phase_gap_ns,
+    "first_gap_ns": r.push_first_gap_ns,
   })
 }
 
