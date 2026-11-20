@@ -83,6 +83,9 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
+/// A directory's listing page: its entries (each name with its node-revision), and whether more follow.
+pub type Listing = (Vec<(String, NodeRevisionId)>, bool);
+
 /// A revision number. Revision 0 is the empty root every repository starts with (`svn_fs.h` 1021-1104; notes §5).
 pub type Revision = u64;
 
@@ -1031,7 +1034,7 @@ impl Index {
     revision: Revision,
     after: Option<&str>,
     most: usize,
-  ) -> Result<Option<(Vec<(String, NodeRevisionId)>, bool)>, IndexRefusal> {
+  ) -> Result<Option<Listing>, IndexRefusal> {
     let path = checked_path(path)?;
     self.check_revision(revision)?;
     let Some(id) = self.resolve(path, revision)? else {

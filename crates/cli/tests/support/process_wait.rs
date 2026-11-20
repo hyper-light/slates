@@ -1,6 +1,7 @@
 //! A test's wait on slates processes it started, judged in their own CPU (A-228's rule, as the anchor judges its
 //! daemon's start; `live_chaos`' start wait, b25a5b7a6): the wait goes on while the process tree it watches lives and
-//! gains CPU, and fails, naming what it waited for, once the tree is gone or has gained no CPU for [`STALL`]. A fixed
+//! gains CPU, and fails, naming what it waited for, once the tree is gone, has gained no CPU for [`STALL`], or has spent
+//! [`CPU_BUDGET`] of it without the answer. A fixed
 //! wall bound lost to load: a loaded box starves a daemon's start or an anchor's restart past any wall bound while both
 //! keep running, and those tests failed for the box, not the code (goal 88's sweep; main's ruling, 2026-11-20).
 
@@ -14,6 +15,12 @@ use std::time::{Duration, Instant};
 /// judged a stuck daemon and the tree would show its restart.
 pub(crate) const STALL: Duration = Duration::from_nanos(slates_server::daemon::OBSERVE_BUDGET_NS);
 
+/// Shape: the CPU a waited-on tree may spend, from the wait's start, before the wait fails without the answer:
+/// `live_chaos`' `START_CPU`, over twice the 13 s of CPU a lone debug daemon's start measured on a loaded Mac
+/// (`MachineProfile::measure_patiently`, 2026-11-07). In CPU, not the wall: a starved tree spends it slowly and is
+/// waited on, and one that runs without bringing the answer about spends it at its own pace and fails.
+pub(crate) const CPU_BUDGET: Duration = Duration::from_secs(30);
+
 /// A wait on the process tree under `root` (an anchor and its daemon, or a daemon alone), judged in its own CPU.
 pub(crate) struct Judged {
   root: u32,
@@ -21,6 +28,8 @@ pub(crate) struct Judged {
   mark: Option<Duration>,
   /// When that look was.
   since: Instant,
+  /// The CPU the tree gained over the looks since the wait began (a successor's from its first reading).
+  spent: Duration,
 }
 
 /// What a look at a waited-on tree came to.
@@ -32,6 +41,8 @@ pub(crate) enum Verdict {
   Gone,
   /// No CPU gained for [`STALL`].
   Stalled,
+  /// [`CPU_BUDGET`] spent since the wait began.
+  SpentItsBudget,
 }
 
 impl Judged {
@@ -41,6 +52,7 @@ impl Judged {
       root,
       mark: tree_cpu(root),
       since: Instant::now(),
+      spent: Duration::ZERO,
     }
   }
 
@@ -50,9 +62,11 @@ impl Judged {
     match self.judge() {
       Verdict::Waiting { .. } => {}
       gave_up => panic!(
-        "{what}: the processes under {} are {gave_up:?} (no CPU gained for {:?}, the bound {STALL:?})",
+        "{what}: the processes under {} are {gave_up:?} (no CPU gained for {:?}, the bound {STALL:?}; {:?} of CPU \
+         spent, the budget {CPU_BUDGET:?})",
         self.root,
-        self.since.elapsed()
+        self.since.elapsed(),
+        self.spent
       ),
     }
   }
@@ -61,7 +75,10 @@ impl Judged {
   /// (reaping it), where a root gone between its check and this look is no failure.
   pub(crate) fn judge(&mut self) -> Verdict {
     let now = tree_cpu(self.root);
-    let judged = verdict(self.mark, now, self.since.elapsed());
+    if let (Some(then), Some(now)) = (self.mark, now) {
+      self.spent = self.spent.saturating_add(now.saturating_sub(then));
+    }
+    let judged = verdict(self.mark, now, self.since.elapsed(), self.spent);
     if judged == (Verdict::Waiting { progressed: true }) {
       self.mark = now;
       self.since = Instant::now();
@@ -70,16 +87,20 @@ impl Judged {
   }
 }
 
-/// [`Judged::look`]'s rule, apart from the clocks it reads: the tree's CPU at the last progress (`then`) and now, and how
-/// long since that progress.
+/// [`Judged::look`]'s rule, apart from the clocks it reads: the tree's CPU at the last progress (`then`) and now, how
+/// long since that progress, and the CPU it spent since the wait began.
 pub(crate) fn verdict(
   then: Option<Duration>,
   now: Option<Duration>,
   since_progress: Duration,
+  spent: Duration,
 ) -> Verdict {
   let Some(now) = now else {
     return Verdict::Gone;
   };
+  if spent >= CPU_BUDGET {
+    return Verdict::SpentItsBudget;
+  }
   if then.is_none_or(|then| now > then) {
     return Verdict::Waiting { progressed: true };
   }
@@ -160,20 +181,34 @@ fn children_of(_parent: u32) -> Vec<u32> {
 }
 
 /// [`verdict`] (goal 88's sweep, 2026-11-20). Do: judge a tree that gained CPU long after the old wall bounds, one that
-/// gained none for [`STALL`], one that gained none for less, and one whose root is gone. Expect the first waited on with
-/// its progress marked, the second given up as stalled, the third still waited on, the last given up as gone.
+/// gained none for [`STALL`], one that gained none for less, one whose root is gone, and one that gained CPU until the
+/// wait had spent [`CPU_BUDGET`] of it. Expect the first waited on with its progress marked, the second given up as
+/// stalled, the third still waited on, the fourth given up as gone, and the last given up as having spent its budget:
+/// a tree that runs and never brings the answer about is not waited on forever (`live_chaos`' `START_CPU`).
 #[test]
-fn a_tree_is_waited_on_while_it_gains_cpu_and_given_up_stalled_or_gone() {
+fn a_tree_is_waited_on_while_it_gains_cpu_and_given_up_stalled_gone_or_spent() {
   let cpu = Duration::from_millis(5);
+  let spent = cpu;
   assert_eq!(
-    verdict(Some(cpu), Some(cpu * 2), STALL * 10),
+    verdict(Some(cpu), Some(cpu * 2), STALL * 10, spent),
     Verdict::Waiting { progressed: true },
     "a tree gaining CPU is waited on however long it takes"
   );
-  assert_eq!(verdict(Some(cpu), Some(cpu), STALL), Verdict::Stalled);
   assert_eq!(
-    verdict(Some(cpu), Some(cpu), STALL / 2),
+    verdict(Some(cpu), Some(cpu), STALL, spent),
+    Verdict::Stalled
+  );
+  assert_eq!(
+    verdict(Some(cpu), Some(cpu), STALL / 2, spent),
     Verdict::Waiting { progressed: false }
   );
-  assert_eq!(verdict(Some(cpu), None, Duration::ZERO), Verdict::Gone);
+  assert_eq!(
+    verdict(Some(cpu), None, Duration::ZERO, spent),
+    Verdict::Gone
+  );
+  assert_eq!(
+    verdict(Some(cpu), Some(cpu * 2), Duration::ZERO, CPU_BUDGET),
+    Verdict::SpentItsBudget,
+    "a tree that spent the wait's CPU budget without the answer is given up"
+  );
 }

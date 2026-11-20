@@ -593,16 +593,27 @@ fn recorded_lines(dir: &std::path::Path, file: &str) -> Vec<String> {
     .collect()
 }
 
-/// Signs in to a fresh Subversion repository on the other shard's partition whose policy runs `hooks`, and sends stock
+/// The root mount the hook tests publish (A-645 P3): a hook's REPOS is the repository's name beneath it.
+#[cfg(unix)]
+pub(crate) const TEST_ROOT: &str = "/slates-root";
+
+/// Signs in to a fresh Subversion repository on the other shard's partition whose policy runs `hooks`, the daemon
+/// having published `root` as its root mount where one is given, and sends stock
 /// `svn` 1.15.0's recorded `mkdir` commit of `/trunk`: the repository's name, the commit's answer (`items` items: five
 /// for a commit made, three for one refused at `open-root`) and the youngest revision then, asked on a second
 /// connection, since a refused commit's client sends `abort-edit`, which the recording does not hold.
 #[cfg(unix)]
 fn commit_under_hooks(
   items: usize,
+  root: Option<&std::path::Path>,
   hooks: impl FnOnce(&str) -> Vec<(slates_ipc::protocol::HookPointName, String)>,
 ) -> (String, String, String) {
   let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  if let Some(root) = root {
+    daemon
+      .record_root_mount(root)
+      .expect("the root mount recorded");
+  }
   let port = daemon.vcs_svn_port().expect("the listener started");
   enrolled(&daemon);
   let refusal_at = NO_ACCESS_SERVER
@@ -640,7 +651,7 @@ fn commit_under_hooks(
 fn a_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words() {
   let dir = crate::git_hooks::tests::ScratchDir::new();
   let refusing = hook_script(&dir.path, "start-commit", "echo 'not today' >&2\nexit 1");
-  let (_, committed, latest) = commit_under_hooks(3, |_| {
+  let (_, committed, latest) = commit_under_hooks(3, Some(std::path::Path::new(TEST_ROOT)), |_| {
     vec![(
       slates_ipc::protocol::HookPointName::SvnStartCommit,
       refusing,
@@ -651,6 +662,33 @@ fn a_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words() {
     committed.contains("165001") && committed.contains(&format!("{}:{words}", words.len())),
     "{committed}"
   );
+  assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 0 ) ) ");
+}
+
+/// A-645 P3 (main's ruling 1). Do: configure a start-commit hook that records that it ran and accepts, publish no root
+/// mount, and send the recorded commit. Expect: the commit refused at `open-root`, typed, in words naming why (the
+/// daemon's root mount is not yet published, so it has nowhere to show the hook its repository); the hook never run;
+/// the youngest revision still 0. Before A-645 P3 the hook ran with REPOS `/<name>`, a path that holds nothing.
+#[cfg(unix)]
+#[test]
+fn a_hook_before_the_root_mount_is_published_is_refused_typed() {
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let accepting = hook_script(&dir.path, "start-commit", &format!("echo ran > {at}/ran"));
+  // The warm-up run of `hook_script` wrote the mark; only a run of the commit's may write it again.
+  std::fs::remove_file(dir.path.join("ran")).expect("the warm-up's mark removed");
+  let (_, committed, latest) = commit_under_hooks(3, None, |_| {
+    vec![(
+      slates_ipc::protocol::HookPointName::SvnStartCommit,
+      accepting,
+    )]
+  });
+  assert!(
+    committed.contains(&super::UNSUPPORTED_FEATURE.to_string())
+      && committed.contains(super::ROOT_UNPUBLISHED_WORDS),
+    "{committed}"
+  );
+  assert!(!dir.path.join("ran").exists(), "the hook ran");
   assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 0 ) ) ");
 }
 
@@ -679,16 +717,17 @@ fn a_commit_over_svn_runs_its_repositorys_commit_hooks_as_svnserve_runs_them() {
     ),
   );
   let post = hook_script(&dir.path, "post-commit", "echo 'post said no' >&2\nexit 1");
-  let (name, committed, latest) = commit_under_hooks(5, |_| {
-    vec![
-      (HookPointName::SvnStartCommit, start),
-      (HookPointName::SvnPreCommit, pre),
-      (HookPointName::SvnPostCommit, post),
-    ]
-  });
+  let (name, committed, latest) =
+    commit_under_hooks(5, Some(std::path::Path::new(TEST_ROOT)), |_| {
+      vec![
+        (HookPointName::SvnStartCommit, start),
+        (HookPointName::SvnPreCommit, pre),
+        (HookPointName::SvnPostCommit, post),
+      ]
+    });
   let started = recorded_lines(&dir.path, "start.args");
   let precommitted = recorded_lines(&dir.path, "pre.args");
-  let repos = format!("/{name}");
+  let repos = format!("{TEST_ROOT}/{name}");
   assert_eq!(
     (
       started.first(),
@@ -764,6 +803,9 @@ fn under_policy(
   verbs: &[(&[u8], bool)],
 ) -> Vec<String> {
   let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+  daemon
+    .record_root_mount(std::path::Path::new(TEST_ROOT))
+    .expect("the root mount recorded");
   let port = daemon.vcs_svn_port().expect("the listener started");
   enrolled(&daemon);
   let refusal_at = NO_ACCESS_SERVER
