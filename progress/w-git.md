@@ -92,3 +92,8 @@
 - A-719 part 4 (decision a command a step) LANDED main c9100be04 (e4f2aeaf7). A-645 hook view moved to w-reaper; SSH
   client-gone to w-k90-vendor. Stay on A-722: staged index rows as objects land (append only makes visible), moves'
   admission + seal sliced, landing O(changes), vcs_share::room seam. Design note (~20 lines) owed to main.
+- A-722 design note SENT to main (staged index in a per-push Index::fork; positions reserved at pack header
+  base+pack-index (holes question); non-commit rows staged at keep; commit rows + generations in sliced pass after
+  pack; moves' admission sliced pre-append; landing = new Index::adopt (O(runs)) + staged values; stale fork re-base;
+  admission window+post-state on vcs_share::room; blobs-as-green-ops later, blocked on w-perf 1b/1c + green blob
+  source). Awaiting objections; meanwhile checking readers' tolerance of position holes (Positions, upload runs).
