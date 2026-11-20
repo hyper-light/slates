@@ -28,6 +28,8 @@ unicode-normalization = { workspace = true }
 md-5 = { workspace = true }
 proptest = { workspace = true }
 slates-test-seeds = { workspace = true }
+# The changeset A/B's segment codecs (`examples/changeset_ab.rs`), as slates-hg's same example compresses its log.
+zstd = { workspace = true }
 
 [lints]
 workspace = true
