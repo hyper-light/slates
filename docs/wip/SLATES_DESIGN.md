@@ -14684,8 +14684,8 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    verdict in `acl`'s words, the `pretxnchangegroup` hooks before it and the `changegroup` hooks after. Built (A-680
    part 2b, `push::read_bundle`, `repository::hg_push::unbundle`): the driver both edges call, the bundle read as 7.2's
    `unbundle` reads it, the revisions landed into the repository's store (A-662's Mercurial arm), a configured hook
-   refusing every push until its view is served; owed: each push's record (A-680 part 2c, A-687's record kind), the
-   bundle read in slices.
+   refusing every push until its view is served; each push's record in A-687's kind, replayed at recovery (A-680 part
+   2c, `record::write_push`); owed: the bundle read in slices.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
    pushback (decision 8).
 7. Markers and their exchange; topics as review requests.
