@@ -22,7 +22,8 @@
 //! once and its haves round by round, so a stateless answer to its second round would have lost its wants. That session
 //! is owed (GAPS).
 //!
-//! **Bounds.** Each request is admitted the edge's room (`Admission`), as the HTTP edge admits one. An answer is written
+//! **Bounds.** Each request is admitted what the repository's shard could admit when it began (the lender's `room`,
+//! A-713), as the HTTP edge admits one. An answer is written
 //! one whole pkt-line's room a step (`pktline::MAX_LEN`, the format's own limit), and the edge steps the command again only
 //! once that step's bytes have gone to the channel, so the output held is a packet at most. The input held is at most the
 //! channel's window, which the session refuses to exceed; what a request consumed is given back to it.
@@ -86,8 +87,6 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   reader: Principal,
   /// The protocol version the client asked for (`GIT_PROTOCOL`).
   version: Version,
-  /// The room each request is admitted.
-  room: u64,
   /// The client's input held, not yet consumed.
   input: Vec<u8>,
   /// Whether the client's input has ended.
@@ -106,44 +105,41 @@ pub(crate) struct UploadCommand<L: StoreLender> {
 
 impl<L: StoreLender> UploadCommand<L> {
   /// A session of `reader` over the store of `repository` that `lender` lends, at protocol `version`, each request
-  /// admitted `room` bytes.
+  /// admitted the room its stores' shard could admit when it began.
   pub(crate) fn new(
     lender: L,
     (repository, reader): (RepositoryId, Principal),
     version: Version,
-    room: u64,
   ) -> Self {
     Self {
       lender,
       repository,
       reader,
       version,
-      room,
       input: Vec::new(),
       input_ended: false,
       out: Vec::new(),
       advertised: false,
       answer: None,
-      admission: Admission::new(room),
+      admission: Admission::new(0),
       after: After::Next,
     }
   }
 
-  /// Answers `asked` over the lent store, within a fresh admission of the room, kept for the answer's writing; refused
-  /// when the store is no longer held.
+  /// Answers `asked` over the lent store, within a fresh admission of the room its shard could admit now, kept for the
+  /// answer's writing; refused when the store is no longer held.
   fn serve(&mut self, asked: Asked<'_>) -> Result<(), Refused> {
     let Self {
       lender,
       repository,
       reader,
       version,
-      room,
       answer,
       admission,
       after,
       ..
     } = self;
-    *admission = Admission::new(*room);
+    *admission = Admission::new(lender.room().ok_or_else(unheld)?);
     let made = lender
       .lend((*repository, reader), |served, packs| {
         upload::serve(served, *version, asked, packs, admission)

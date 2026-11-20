@@ -307,7 +307,8 @@ pub(crate) struct NotYet;
 /// The services the server runs today: git's upload-pack from the stores `lender` lends (`super::git`, A-651 part 2),
 /// Mercurial's `serve --stdio` from the stores `hg` lends (`super::hg`, A-679), and git's receive-pack through A-654
 /// part 2's driver on the repository's owner shard, whose state `shard` lends a step at a time as it lends the HTTP
-/// site's (`super::receive`, A-683), each request and each push admitted `room` bytes; Subversion's tunnel is served
+/// site's (`super::receive`, A-683), git's requests and pushes each admitted what its repository's shard could admit
+/// (A-713, A-704) and Mercurial's requests `room` bytes; Subversion's tunnel is served
 /// beside these by `super::svn`'s `SvnServices` (A-688). A repository whose store its tool's lender does not hold is not
 /// served upload-pack or `serve --stdio`.
 #[derive(Clone, Debug)]
@@ -318,13 +319,13 @@ pub(crate) struct ToolServices<L, H, S> {
   hg: H,
   /// Where the shard's state is lent, for receive-pack (in the daemon the HTTP site's `ThisShard`).
   shard: S,
-  /// The bytes each request, and each push, may hold: the edge's room.
+  /// The bytes each Mercurial request may hold: the edge's room.
   room: u64,
 }
 
 impl<L, H, S> ToolServices<L, H, S> {
-  /// The services over `lender`'s git stores, `hg`'s Mercurial stores and the state `shard` lends, each request
-  /// admitted `room` bytes.
+  /// The services over `lender`'s git stores, `hg`'s Mercurial stores and the state `shard` lends, each Mercurial
+  /// request admitted `room` bytes.
   pub(crate) fn new(lender: L, hg: H, shard: S, room: u64) -> Self {
     Self {
       lender,
@@ -351,7 +352,6 @@ where
           self.lender.clone(),
           (repository.id, start.principal.clone()),
           version,
-          self.room,
         )))
       }
       (Service::GitReceivePack, Some(repository)) => {

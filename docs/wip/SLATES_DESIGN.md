@@ -54004,3 +54004,21 @@ Applied in the same change to: A-508's owed line (status), GAPS (A-272 (ii)'s A-
   vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, both tests named in the output; fmt clean on the changed files.
 - **Owed.** Forgetting a removed repository's hooks (the table drops them only as one of its hooks runs); Subversion's
   and Mercurial's callers reading and teaching the same table; the daemon's presenter (A-665 part 4).
+
+### A-713 — A fetch is admitted what its repository's shard can serve, never one request's room (bug, 2026-11-20, w-git for UI goal 93; found by use by w-interop: with git/git cut at v1.0.0, 2,930 commits in a 3.4 MB pack, the push landed and every clone, over HTTP, over SSH and with `--filter=blob:none`, was refused `upload-pack: the request needs more room than the server admits`; §4.17.2 "A fetch")
+- **Change.** `vcs_http::git::upload::StoreLender::room`: what the shard the stores live on could admit now
+  (`Store::admittable`, as `git_push::push_room` admits a push, A-704). The HTTP site's `Upload` and the SSH site's
+  `UploadCommand` admit each request that room, taken as the request begins, in place of the edge's request room: a
+  long history's walk and its pack's list of objects (eight bytes an object) passed one ring region.
+- **Tests.** `vcs_http::daemon_edge::tests::a_long_history_pushed_over_the_daemons_edge_is_fetched_whole_over_it` (a
+  line of 3,000 commits pushed through the daemon's edge, then fetched as `git clone` asks: red first, the fetch answered
+  `ERR aborting due to possible repository corruption on the remote side.` from the pack's `PastAdmission { asked:
+  72000, left: 38194 }`; green, its pack holds every object pushed). Its client now waits ten liveness windows, as a
+  stock client waits for as long as its server works.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib --
+  vcs_http::git:: vcs_http::daemon_edge:: vcs_ssh:: vcs_store::upload::` 91 passed with the new test named, 2 failed
+  (the Mercurial site's `a_mercurial_repositorys_store_is_served_over_the_daemons_edge` and
+  `stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic`, `503`, failing alike on main
+  bc2803d66, reported); fmt clean on the changed files.
+- **Owed.** upload-pack's answer made in slices (its negotiation and the pack's plan run in one step: a 1,200-commit
+  fetch's ran past a liveness window in a debug build); the git-matrix clone rows by use (main's).
