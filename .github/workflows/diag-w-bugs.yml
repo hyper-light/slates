@@ -109,7 +109,7 @@ jobs:
   # Thirty runs of it alone, each verdict and its output's last lines published.
   b11:
     if: startsWith(github.ref_name, 'diag-w-bugs-b11')
-    name: B11 coherence chaos x30 on ubuntu-latest
+    name: B11 coherence chaos x50 beside two spinners a CPU on ubuntu-latest
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
@@ -146,7 +146,9 @@ jobs:
           echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD); $(nproc) CPUs; $(uname -r)" > "$out/status.txt"
           cargo test --locked -p slates-bridge-fuse --test coherence_mount --no-run > "$out/build.txt" 2>&1
           echo "build exit $?" >> "$out/status.txt"; publish
-          for n in $(seq 1 30); do
+          for k in $(seq 1 $(( $(nproc) * 2 ))); do ( while :; do :; done ) & done
+          echo "spinners: $(( $(nproc) * 2 ))" >> "$out/status.txt"
+          for n in $(seq 1 50); do
             cargo test --locked -p slates-bridge-fuse --test coherence_mount \
               generated_map_stores_direct_reads_and_other_writes_never_revert_another_paths_write -- --nocapture > "$out/run.txt" 2>&1
             code=$?
