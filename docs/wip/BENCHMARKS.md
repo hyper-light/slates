@@ -14780,6 +14780,27 @@ in every run, three of each, interleaved. The service folds this green's history
 holds a version, so the history retains nothing at rest with or without part 4; the honest charge differs only while a
 reader holds history (the merge tests: one 1-byte edit of a 2 KiB file reserves and retains 2,072 bytes, 25 before).
 
+## Freed memory returns to the OS: the svn import's footprint before and after (A-742; UI goal 93; 2026-11-20)
+
+- **Machine and builds:** the Mac Studio of the entries above, 2026-11-20 ~10:11 UTC, load average 4.87 at the start
+  and 6.62 at the end (shared; not quiesced). Release builds of `slates-cli` from main de9591c70 (*before*) and of it
+  with A-742 (*after*).
+- **Data:** git/git's newest 1,000 first-parent commits as a dump (`git-1000.dump`, 223 MiB).
+- **Command:** for each build, a fresh anchor, `slates repository create project --tool svn`, `slates repository import
+  project git-1000.dump`, then `footprint PID` at once and five seconds later, and `slates status --json`; three runs
+  each, interleaved, before first.
+
+| | footprint after the import (MB) | 5 s later | import (s) | large blocks mapped / returned |
+|---|---|---|---|---|
+| before 1 / 2 / 3 | 2,417 / 2,551 / 2,423 | 2,417 / 2,551 / 2,423 | 1.74 / 1.83 / 1.73 | (no allocator) |
+| after 1 / 2 / 3 | 1,431 / 1,486 / 1,495 | 1,432 / 1,486 / 1,495 | 1.77 / 1.78 / 1.69 | 695 / 575 blocks, 4.21 GB returned |
+
+About 1,000 MB (40 %) less, at once and steady, in the same time. With the allocator alone (the temporaries not yet
+cut) the import ended at 1,575 / 1,645 / 1,562 MB but took 2.04 / 2.27 / 2.87 s, 5.77 GB of fresh pages faulted in;
+cutting the temporaries brought both down. Measured-and-rejected: `malloc_zone_pressure_relief(NULL, 0)` after the
+import released 0 bytes (footprint 2,457 and 2,545 MB). With the system allocator alone the freed memory came back on
+its schedule: five seconds after the import 1,565 to 1,834 MB in three runs and none in two others.
+
 ## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
 
 - **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
