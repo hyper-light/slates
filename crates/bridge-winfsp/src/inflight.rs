@@ -936,47 +936,51 @@ mod tests {
   fn a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response() {
     let mut packet = opened_response(10, 20);
     assert_eq!(finish_response(&mut packet, 0), Ok(176));
-    assert!(
-      packet[RESPONSE_BASE..RESPONSE_BASE + 10]
-        .iter()
-        .all(|byte| *byte == 0x11)
+    assert_span(&packet, RESPONSE_BASE..RESPONSE_BASE + 10, 0x11, "the name");
+    assert_span(
+      &packet,
+      RESPONSE_BASE + 10..RESPONSE_BASE + 16,
+      0,
+      "the alignment between the name and the descriptor",
     );
-    assert!(
-      packet[RESPONSE_BASE + 10..RESPONSE_BASE + 16]
-        .iter()
-        .all(|byte| *byte == 0),
-      "the alignment between the name and the descriptor"
+    assert_span(
+      &packet,
+      RESPONSE_BASE + 16..RESPONSE_BASE + 36,
+      0x22,
+      "the descriptor",
     );
-    assert!(
-      packet[RESPONSE_BASE + 16..RESPONSE_BASE + 36]
-        .iter()
-        .all(|byte| *byte == 0x22)
+    assert_span(
+      &packet,
+      RESPONSE_BASE + 36..176,
+      0,
+      "the span the DLL counted twice",
     );
-    assert!(
-      packet[RESPONSE_BASE + 36..176]
-        .iter()
-        .all(|byte| *byte == 0),
-      "the span the DLL counted twice"
-    );
-    assert!(packet[176..].iter().all(|byte| *byte == 0xAB));
+    assert_span(&packet, 176..packet.len(), 0xAB, "past the length");
     let mut packet = opened_response(0, 20);
     assert_eq!(finish_response(&mut packet, 0), Ok(152));
-    assert!(
-      packet[RESPONSE_BASE..RESPONSE_BASE + 20]
-        .iter()
-        .all(|byte| *byte == 0x22)
+    assert_span(
+      &packet,
+      RESPONSE_BASE..RESPONSE_BASE + 20,
+      0x22,
+      "the descriptor alone",
     );
     let mut packet = opened_response(10, 0);
     assert_eq!(finish_response(&mut packet, 0), Ok(144));
-    assert!(
-      packet[RESPONSE_BASE..RESPONSE_BASE + 10]
-        .iter()
-        .all(|byte| *byte == 0x11)
+    assert_span(
+      &packet,
+      RESPONSE_BASE..RESPONSE_BASE + 10,
+      0x11,
+      "the name alone",
     );
+    assert_span(&packet, RESPONSE_BASE + 10..144, 0, "past the name alone");
+  }
+
+  /// Asserts every byte of `packet` in `span` is `byte`.
+  #[track_caller]
+  fn assert_span(packet: &[u8], span: std::ops::Range<usize>, byte: u8, what: &str) {
     assert!(
-      packet[RESPONSE_BASE + 10..144]
-        .iter()
-        .all(|byte| *byte == 0)
+      packet[span.clone()].iter().all(|at| *at == byte),
+      "{what}: {span:?} is not all {byte:#04x}"
     );
   }
 
