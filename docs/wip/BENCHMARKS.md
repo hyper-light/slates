@@ -14773,6 +14773,13 @@ keeps; the history held 50.3 MiB of them twice, and now holds none. The service 
 its floor as it imports (the row is flat from 250 to 1,000 revisions), which is why the history was 50 MiB and not the
 dump's size.
 
+**Part 4, the honest charge (same machine and dump, 2026-11-20 ~08:57 UTC, load 3.37 to 5.03).** Release builds of main
+52c1d8af5 and of it with part 4, `slates repository import` of the 1,000-revision dump, then `slates status --json`
+(`committed_bytes`, which the merge service's retention charge is part of): the owner shard grew by 646,696,917 bytes
+in every run, three of each, interleaved. The service folds this green's history as the import goes, since no reader
+holds a version, so the history retains nothing at rest with or without part 4; the honest charge differs only while a
+reader holds history (the merge tests: one 1-byte edit of a 2 KiB file reserves and retains 2,072 bytes, 25 before).
+
 ## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
 
 - **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
