@@ -48,6 +48,13 @@ class Converter:
         # Every directory under trunk/ and the count of its entries (files and directories), and every file.
         self.directories = {"trunk": 0}
         self.files = set()
+        # The empty tree, which the first kept commit is compared against (written whole).
+        self.empty_tree = subprocess.run(
+            ["git", "-C", git_dir, "hash-object", "-t", "tree", "--stdin"],
+            input=b"",
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout.decode().strip()
 
     def blob(self, object_id):
         self.batch.stdin.write(object_id.encode() + b"\n")
@@ -133,10 +140,8 @@ class Converter:
     def changes(self, parent, commit):
         """The commit's changes against its first parent (or the empty tree), deletions first."""
         command = ["git", "-C", self.git_dir, "diff-tree", "-r", "--no-renames", "--raw", "-z"]
-        command += ["--root", commit] if parent is None else [parent, commit]
+        command += [parent or self.empty_tree, commit]
         fields = subprocess.run(command, check=True, stdout=subprocess.PIPE).stdout.split(b"\0")
-        if parent is None:
-            fields = fields[1:]
         deletions, puts = [], []
         for header, raw_path in zip(fields[0::2], fields[1::2]):
             old_mode, new_mode, _, new_id, status = header.decode().lstrip(":").split()

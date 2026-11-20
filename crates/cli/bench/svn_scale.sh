@@ -3,14 +3,16 @@
 # Subversion site is measured against. `docs/wip/BENCHMARKS.md` records each run of it; the command there is the
 # contract.
 #
-# The dataset: a dump of git/git's first-parent history under trunk/ (`git_to_svn_dump.py`), so Subversion is measured
-# over the same commits as git.
+# The dataset: a dump of git/git's newest first-parent commits under trunk/ (`git_to_svn_dump.py`), so Subversion is
+# measured over the same commits as git. (Stock `svnadmin load` writes about 0.15 s a revision on the Studio, flushing
+# each, so all 24,547 would take an hour a load.)
 #
 # The server, a fresh one for every run: `svnserve -d` over svn:// on loopback over the repository the run loaded,
 # anonymous write allowed (`anon-access = write`), as a stock server that takes commits without accounts is configured.
 #
 # The steps, each timed on the wall clock and bounded (`alarm`), a failure recorded and the run going on:
-# 1. load: `svnadmin load` of the whole dump into a fresh repository (Subversion's own import of a history);
+# 1. load: `svnadmin load` of the whole dump into a fresh repository (Subversion's own import of a history), timed
+#    once, on the first run; every later run serves its own copy of that repository (`cp -c`, APFS's clone);
 # 2. checkout: `svn checkout` of trunk at its youngest revision; on the first run the working copy is checked: its
 #    files equal REFERENCE's (`diff -r`, `.svn` left out);
 # 3. log: `svn log -q` of the whole history, which must name every revision;
@@ -79,12 +81,15 @@ stop_servers() {
 }
 trap 'stop_servers; rm -rf "$WORK"' EXIT
 
-# Loads the dump into a fresh repository for run $1 (timed) and starts `svnserve` over it: sets URL and STOCK.
+# Loads the dump (on the first run, timed), copies the loaded repository for run $1 and starts `svnserve` over it: sets URL and STOCK.
 start_stock() {
   local root="$WORK/stock-$1" port
   mkdir -p "$root"
-  "${A[@]}" create "$root/project"
-  timed "stock load $1" "${A[@]}" load -q --bypass-prop-validation --file "$DUMP" "$root/project"
+  if [ ! -d "$WORK/loaded" ]; then
+    "${A[@]}" create "$WORK/loaded"
+    timed "stock load $1" "${A[@]}" load -q --bypass-prop-validation --file "$DUMP" "$WORK/loaded"
+  fi
+  cp -Rc "$WORK/loaded" "$root/project"
   printf '[general]\nanon-access = write\n' > "$root/project/conf/svnserve.conf"
   port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
   svnserve -d --foreground --listen-host 127.0.0.1 --listen-port "$port" -r "$root" \
