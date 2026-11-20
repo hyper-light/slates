@@ -7425,6 +7425,23 @@ instructions everywhere on the matrix), BLAKE3 identity on bulk chunks (already 
 
 ### 4.10 Distribution: replication under one rule, auto-seal, remote attach, ownership migration, mirroring, anti-entropy (D-14, D-16, D-17, D-18)
 
+**Content homed by identity (A-724 piece 6; main's ruling of 2026-11-20).** The rule below places what an owner
+keeps: a volume's or a repository's register, its ordered landing, its indexes' tails and fences, and its hot set, at
+the owner's candidates by its family (A-636 part 2b-2). A version-control repository's content outside its owner's hot
+set (cold, or past the repository's share, §4.17.5) is placed instead by its identity: rendezvous over the content id,
+by the same weight every placement ranks by (`register::rendezvous_weight_of`), across a node's shards (one home: a
+node's shards share its RAM) and across the region's members (f+1 homes, `candidates_for`'s ranking keyed by the
+content id, no family bit, so identical content across repositories lands on one home set). Such content is fetched by
+identity when read, and it is durable at its homes before any record naming it commits: the order below is unchanged.
+A move moves the register and the hot set only; cold content stays at its identity homes. A successor rebuilding a
+taken-over repository fetches each object by identity from its homes. Content homes follow membership as any id of no
+family does, never an owner's epoch. Homes are computed from the configuration version every message carries; no
+coordination call is added on a write's path (§2 ban 10).
+
+> **Status (2026-11-20).** The node's half is built (A-724 piece 5a, `crate::vcs_store::homes`). Owed: the region's
+> half (f+1 homes, the healer's re-offer keyed by content id) once the fault paths are agreed with w-fed-faults; the
+> read-through and durability seam with A-727's arena (proposed to w-perf).
+
 **Content replication.** Sealed chunks and manifests go to the owner's candidate holders under
 the rule of §4.8: f+1 first, hedged to the rest of the 2f+1 after the measured p95, committed at
 f+1 acknowledgements from any, the acknowledging set recorded in the head record; a chunk
@@ -15233,8 +15250,11 @@ and export by landing).
 > `get-locations.c` writes it. Held to the fixture repository (each revision's delta replayed to the text the site's GET
 > serves there; a directory refused; a file traced back across its copy) and to stock svn 1.15 against `svnserve -t`
 > over one history: seven commands, every answer byte for byte the same but for the author. Departures: deltas in
-> svndiff 0, as the update-report writes them; locations in the trace's order, where `mod_dav_svn` walks a hash. Owed:
-> the `mergeinfo-report` (`svn blame -g`, `svn merge`).
+> svndiff 0, as the update-report writes them; locations in the trace's order, where `mod_dav_svn` walks a hash.
+> **Part 2:** the `mergeinfo-report`, the svn:// catalog (`svn_repos_fs_get_mergeinfo2`) written as `mergeinfo.c`
+> writes it (each path relative to the resource's), and OPTIONS now answers `SVN-Repository-MergeInfo: yes` and lists
+> `mergeinfo`, so stock `svn merge`, `svn blame -g` and `svn mergeinfo` work through the edge, each held to `svnserve
+> -t`'s answers. Owed: a catalog with descendants is written whole within the reply's room, refused past it.
 >
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
@@ -54760,9 +54780,21 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `stock_svn_blames_and_diffs_over_the_vcs_http_edge_as_against_svnserve` (stock svn 1.15.0 on the Mac Studio: `blame`,
   `blame -r 2`, `diff -r 1:3`, `diff -c 2`, `diff --summarize`, a two-peg diff, `cat -r 1`, each equal to `svnserve -t`'s).
 - **Applied in the same change to** §4.17.4's status, GAPS (A-681's owed reports), amendments.tsv.
-- **Owed.** Part 2: the `mergeinfo-report` and `SVN-Repository-MergeInfo: yes` (`svn blame -g`, `svn merge`). Deltas in
+- **Part 2 (same day).** `dav::report_mergeinfo` answers the `mergeinfo-report` from the svn:// catalog
+  (`reads::repository_mergeinfo`, the `get-mergeinfo` walk opened to the site), and the site's OPTIONS answers
+  `SVN-Repository-MergeInfo: yes` and lists `mergeinfo`. Tests: `dav::report_mergeinfo::tests` (a directory's own, a file's
+  inherited, none before it was set, a revision past the youngest `404`), the OPTIONS test now holding `yes`; `slates-cli`
+  `svn_http_reports` `stock_svn_blames_merged_revisions_over_the_vcs_http_edge_as_against_svnserve` (`svn merge
+  ^/branch`'s report, `svn blame -g`, `svn mergeinfo`, `propget svn:mergeinfo`, each equal to `svnserve -t`'s).
+- **Owed.** A mergeinfo catalog with descendants streamed (written whole within the reply's room now). Deltas in
   the svndiff version `Accept-Encoding` prefers. The interop harness copied into `svn_http_reports.rs` folded into one
   module with `svn_interop.rs` once that file's pieces land.
+- **Piece 6, §4.10 amended (2026-11-20, main's ruling).** §4.10 "Content homed by identity": the owner keeps its
+  register, landing, tails, fences and hot set by family placement; a repository's cold content is homed by identity
+  (one weight, a node's shards and f+1 of the region's members), fetched by identity, durable at its homes before any
+  record naming it. Agreed: w-shared (the ranking keyed by content id; a successor's rebuild fetches from homes), main
+  (a move leaves cold content at its homes; no coordination call). Owed: w-fed-faults' answer on fault paths, then the
+  region's half.
 
 ### A-719 part 3 — git's push is read straight into its quarantine (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" items 3 to 5)
 - **Change (slates-git).** The receive session reads a pack into a site the caller gives it (`Session::input_into`,

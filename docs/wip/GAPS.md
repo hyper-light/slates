@@ -121,7 +121,10 @@
 > its fork back. Part 2b BUILT: a fork made from an index another push replaced since is re-based by node at
 > landing (`intake::Rebase`: each kept row appended again to a fork of the index as it is, by node, its content reused,
 > a row the index already holds passed over), a slice at a time, then judged and landed; `land` never puts a stale
-> fork in the index's place. Owed: part 3, the import's room per repository; S5 (main's convergence plan): file
+> fork in the index's place. Part 3 BUILT: an import's room is what its shard could admit, a bound only,
+> the shard charged what it holds between turns (`Import::holding`), trued up each turn (it was one client region,
+> 278,528 B: Mercurial's own repository refused `PastRoom`); the by-use import of that repository is w-perf's run.
+> Owed: part 3's by-use proof; S5 (main's convergence plan): file
 > texts as the work's green files by identity, changelog and manifests as deltas, rows naming content by identity.
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
@@ -1485,8 +1488,10 @@
 > site (`dav::report_file_revs`, `dav::report_locations`; the svn:// walks with `mod_dav_svn`'s writers); `svn diff`
 > needed nothing new (the update-report's diff form). Stock svn 1.15's `blame`, `blame -r 2`, `diff -r 1:3`, `diff -c
 > 2`, `diff --summarize`, a two-peg URL diff and `cat -r 1` over HTTP match `svnserve -t`'s byte for byte but for the
-> author (`tests/svn_http_reports.rs`). Owed: part 2, the `mergeinfo-report` and OPTIONS' `SVN-Repository-MergeInfo:
-> yes` (`svn blame -g` is refused by the client until then, and `svn merge`); deltas in svndiff 0 whatever
+> author (`tests/svn_http_reports.rs`). **Part 2:** the `mergeinfo-report` (`dav::report_mergeinfo`, the svn://
+> catalog) and OPTIONS' `SVN-Repository-MergeInfo: yes` with the `mergeinfo` capability: stock svn 1.15's `svn merge
+> ^/branch`, `svn blame -g`, `svn mergeinfo` and `propget svn:mergeinfo` over HTTP match `svnserve -t`'s. Owed: a
+> catalog with descendants written whole within the reply's room (streamed is owed); deltas in svndiff 0 whatever
 > `Accept-Encoding` prefers; the copied interop harness folded into one module with `tests/svn_interop.rs`.
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the

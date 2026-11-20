@@ -58,6 +58,7 @@ pub mod listing;
 pub mod locking;
 mod report_file_revs;
 mod report_locations;
+mod report_mergeinfo;
 pub mod request;
 pub mod response;
 pub mod site;
