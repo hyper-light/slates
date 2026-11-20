@@ -69,8 +69,9 @@
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
-> principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20), its copies as rows with their
-> sources and symbolic links as `svn:special` files owed; Mercurial's changesets of a submitted
+> principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20; symbolic links as `svn:special`
+> files, `link ` and the target, BUILT 2026-11-20), its copies as rows with their sources owed until a work can make a
+> copy (A-626 part 4); Mercurial's changesets of a submitted
 > version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
@@ -115,7 +116,8 @@
 > intakes decoding) built, waiting for w-git's A-722 to call it.
 > Piece 6's region half: its rule (`slates_db::identity_homes`: homes and the healer's plan by membership and rank
 > alone); its wire (`slates_cluster::homes`, the door's rule); the daemon serving it (`vcs_store::homes::serve_remote`,
-> acknowledged after the home image, so `Unanswered` until A-727 a3). The sender and the healer's loop owed.
+> acknowledged after the home image, so `Unanswered` until A-727 a3); the healer at each configuration change
+> (`heal_region`, region holds idempotent). The transport is complete; it acknowledges once A-727 a3 lands.
 > Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
@@ -2095,8 +2097,10 @@
 > `replay-range` spun shard 0 (3596 ms without a step after 53 MB; the daemon killed, the client E210002) while
 > `svnsync`, a command a revision, passed: the svn:// listener went on to its next turn with no yield where a turn read
 > nothing from the client (a long answer's slices, pipelined commands), and a client draining as fast as it is written
-> never made a write wait. Fixed (w-svn): such a turn yields first, as the HTTP and SSH edges' turns do. No unit test
-> sees a missed yield; the check is the git/git `svnrdump dump` run again (main's).
+> never made a write wait. Fixed (w-svn): a turn that never waited yields first, as the HTTP and SSH edges' turns do.
+> Held by `pipelined_commands_are_answered_one_turn_a_shard_poll` (64 pipelined commands; `vcs_svn.turns_unyielded`,
+> a turn begun in the shard poll of the turn before, 0 on both shards; 67 on the repository's shard without the yield)
+> and the git/git `svnrdump dump` run again (main's).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
