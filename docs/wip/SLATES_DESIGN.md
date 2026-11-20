@@ -12050,8 +12050,9 @@ decides the details.
 > every register of its family and its greens are adopted, it keeps each state log's parts it holds only where every
 > log their operation moved holds them whole, a green's log judged by its adopted head, records the repository whole
 > from them (`Op::RepositoryRebuilt`) and makes its store from the log. Owed: the parts of a state log a successor
-> does not hold fetched from its holders; the tool store's objects shipped beside the logs (a state log's part carries
-> none, so a rebuilt store holds none yet); and the repository policy's check before the verdict (A-622's next part).
+> does not hold fetched from its holders; the store's objects rebuilt by content identity once entries and stores
+> name content held once in the family's pool (a state log's part carries none, so a rebuilt store holds none yet);
+> and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12601,8 +12602,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
    operation's identity and spans (A-636 part 2b); and a repository's greens minted in its family, placed and taken
    over as it is (A-636 part 2b-2); and its record shipped as its own register and adopted by its successor (A-636 part
-   2c-1); and rebuilt by its successor by the rule (A-636 part 2c-2); owed: the tool store's objects shipped beside
-   the logs, and a log's parts the successor lacks fetched from its holders.
+   2c-1); and rebuilt by its successor by the rule (A-636 part 2c-2); owed: the store's objects rebuilt by content
+   identity from the family's pool, and a log's parts the successor lacks fetched from its holders.
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -54211,6 +54212,8 @@ Applied in the same change to:
   `cargo test --locked -p slates-server --lib -- fleet::state_log_tests takeover:: state_log mirror:: repository::tests
   --test-threads=4` 34 of 34. fmt clean.
 - **Owed.** A state log's parts the successor does not hold, fetched from its holders before the rule runs (as a green's
-  missing records are, A-364); the tool store's objects (`RepositoryEntry::objects`) shipped beside the logs, since no
-  part carries them and a rebuilt store holds none; the gate's fleet run (a repository's owner killed, its successor
+  missing records are, A-364); the store's objects (`RepositoryEntry::objects`; no part carries them, so a rebuilt
+  store holds none yet) rebuilt by content identity once entries and the tools' stores name content held once in the
+  green family's pool, which the successor holds by A-636's placement (Ada's ruling 2026-11-20: content held once for
+  every tool; no separate shipping); the gate's fleet run (a repository's owner killed, its successor
   serving it), main's.
