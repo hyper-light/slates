@@ -269,6 +269,8 @@ struct ReplicaWait {
   reply: ReplyBody,
   /// Past this instant (the host's monotonic clock) the parked submit has been answered retryable and released.
   until_ns: u64,
+  /// When it was held, on the same clock: what [`SUBMIT_SETTLE`] times.
+  held_ns: u64,
 }
 
 /// What [`gate`] decided for a verb.
@@ -714,7 +716,14 @@ pub(crate) fn gate(
     return Gate::Answer(crate::verbs::refused(refusal));
   }
   let need = if may_ask(state, principal, &body) {
-    need_of(state, work, &body)
+    let started = slates_machine::clock::monotonic_ns();
+    let need = need_of(state, work, &body);
+    // A submit's composition is timed (A-697's measured breakdown): it is most of what a verdict need costs here.
+    if matches!(need, Some(Need::Verdict { .. })) {
+      let composed_ns = slates_machine::clock::monotonic_ns().saturating_sub(started);
+      crate::merge_service::count_phase(state, SUBMIT_COMPOSE, composed_ns);
+    }
+    need
   } else {
     None
   };
@@ -1363,6 +1372,18 @@ pub(crate) const SETTLED_ON_REPLICA: &str = "merge.work.settled_on_replica";
 /// Format: such an answer that could not be handed to the work's shard; the submit's bound answers it retryable.
 const SETTLE_UNHANDED: &str = "merge.work.settle_unhanded";
 
+/// Counter pairs of a holder node's own submit (A-697's measured breakdown; `merge_service::SUBMIT_JUDGE` and its
+/// siblings): its increment composed on the work's shard (with what the verdict need reads), its verdict computed on
+/// the replica, the forward to the owner and back (the owner's whole step and its quorum commit within it), and the
+/// wait for the replica to hold the version.
+pub(crate) const SUBMIT_COMPOSE: (&str, &str) = ("merge.submit.compose", "merge.submit.compose_ns");
+/// See [`SUBMIT_COMPOSE`].
+pub(crate) const SUBMIT_COMPUTE: (&str, &str) = ("merge.submit.compute", "merge.submit.compute_ns");
+/// See [`SUBMIT_COMPOSE`].
+pub(crate) const SUBMIT_FORWARD: (&str, &str) = ("merge.submit.forward", "merge.submit.forward_ns");
+/// See [`SUBMIT_COMPOSE`].
+pub(crate) const SUBMIT_SETTLE: (&str, &str) = ("merge.submit.settle", "merge.submit.settle_ns");
+
 /// Format: a verdict a holder computed on its replica of a green another node owns, to send its owner (A-697 part c),
 /// the non-vacuity count of [`verdict_over_fleet`].
 pub(crate) const COMPUTED_ON_HOLDER: &str = "merge.work.computed_on_holder";
@@ -1430,6 +1451,7 @@ fn verdict_over_fleet(
       move || async move {
         let built =
           state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
+        let forward_start = slates_machine::clock::monotonic_ns();
         let reply = match built {
           Some(Ok(request)) => crate::verbs::resolve_and_forward(
             crate::verbs::to_wire_volume(green),
@@ -1444,8 +1466,10 @@ fn verdict_over_fleet(
           Some(Err(reply)) => *reply,
           None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
         };
+        let forward_ns = slates_machine::clock::monotonic_ns().saturating_sub(forward_start);
         // The work settles on its new base only once this node's replica holds it (A-697 part d).
         let held = state::with_state(|s| {
+          crate::merge_service::count_phase(s, SUBMIT_FORWARD, forward_ns);
           hold_until_replica(s, (green, &reply), (here, origin, id), deadline)
         })
         .unwrap_or(false);
@@ -1495,7 +1519,11 @@ fn computed_request(
     state.count(REPLICA_BEHIND, 1);
     return Err(Box::new(behind));
   };
-  let computed = match replica.compute(&inc) {
+  let compute_start = slates_machine::clock::monotonic_ns();
+  let computed = replica.compute(&inc);
+  let compute_ns = slates_machine::clock::monotonic_ns().saturating_sub(compute_start);
+  crate::merge_service::count_phase(state, SUBMIT_COMPUTE, compute_ns);
+  let computed = match computed {
     Ok(computed) => computed,
     Err(ComputeRefused::BaseAhead { .. }) => {
       state.count(REPLICA_BEHIND, 1);
@@ -1584,6 +1612,7 @@ fn hold_until_replica(
     id,
     reply: reply.clone(),
     until_ns: now.saturating_add(bound_ns),
+    held_ns: now,
   });
   state.count(SETTLE_AWAITS_REPLICA, 1);
   true
@@ -1610,8 +1639,10 @@ pub(crate) fn replica_reached(state: &mut ShardState, object: slates_db::registe
       .into_iter()
       .partition(|wait| wait.green == object && wait.version <= head);
   state.work_home.replica_waits = waiting;
+  let now = slates_machine::clock::monotonic_ns();
   for wait in ready {
     state.count(SETTLED_ON_REPLICA, 1);
+    crate::merge_service::count_phase(state, SUBMIT_SETTLE, now.saturating_sub(wait.held_ns));
     let ReplicaWait {
       shard,
       origin,

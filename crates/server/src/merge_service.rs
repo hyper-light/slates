@@ -2033,6 +2033,40 @@ pub struct PendingMergeRecord {
   /// these, so inputs larger than one shipment cross in several; a target not here is sent the inputs from their
   /// first chunk. Bounded by the candidates times the inputs' chunks; a target leaves once it holds the inputs.
   pub lacking: BTreeMap<HostId, Vec<[u8; 32]>>,
+  /// When it was enqueued, on the host's monotonic clock: what [`SUBMIT_PLACE`] times its placement from.
+  pub enqueued_ns: u64,
+  /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
+  /// cross in several, one a record-plane pass.
+  pub shipments: u64,
+}
+
+/// Counter pairs (how many were timed, and their nanoseconds or their count) of a submit's phases (A-697's measured
+/// breakdown, main's ruling of 2026-11-20: the by-reference forward is measured before and after, phase by phase). A
+/// mean is the second over the first. On the green's owner: the verdict ([`SUBMIT_JUDGE`]), the chain's append
+/// ([`SUBMIT_APPEND`]), the version's placement at the quorum from its enqueue ([`SUBMIT_PLACE`]) and the shipments its
+/// inputs took ([`SUBMIT_SHIPMENTS`]); on a holder, the recomputation of a version into its replica
+/// ([`SUBMIT_RECOMPUTE`]); and on a holder node submitting its own work (`crate::work_home`), the composition, the
+/// verdict computed on its replica, the forward to the owner and the wait for its replica to hold the version.
+pub(crate) const SUBMIT_JUDGE: (&str, &str) = ("merge.submit.judge", "merge.submit.judge_ns");
+/// See [`SUBMIT_JUDGE`]: the version's increment and verdict appended to the green's chain.
+pub(crate) const SUBMIT_APPEND: (&str, &str) = ("merge.submit.append", "merge.submit.append_ns");
+/// See [`SUBMIT_JUDGE`]: from the version's enqueue to its record placed at the quorum, its inputs shipped first.
+pub(crate) const SUBMIT_PLACE: (&str, &str) = ("merge.submit.place", "merge.submit.place_ns");
+/// See [`SUBMIT_JUDGE`]: the versions placed, and the input shipments they took in all.
+pub(crate) const SUBMIT_SHIPMENTS: (&str, &str) =
+  ("merge.submit.shipped_versions", "merge.submit.shipments");
+/// See [`SUBMIT_JUDGE`]: a holder's recomputation of a version into its replica.
+pub(crate) const SUBMIT_RECOMPUTE: (&str, &str) =
+  ("merge.submit.recompute", "merge.submit.recompute_ns");
+
+/// Counts one timed phase of `amount` ([`SUBMIT_JUDGE`] and its siblings).
+pub(crate) fn count_phase(
+  state: &mut ShardState,
+  (count, sum): (&'static str, &'static str),
+  amount: u64,
+) {
+  state.count(count, 1);
+  state.count(sum, amount);
 }
 
 /// Faults a test injects on a holder (never reachable from the wire): refuse every content put
@@ -2337,6 +2371,8 @@ pub(crate) fn insert_pending(
       first_period: stamped,
       work,
       lacking: BTreeMap::new(),
+      enqueued_ns: slates_machine::clock::monotonic_ns(),
+      shipments: 0,
     },
   );
   nudge_record_plane(state);
@@ -2654,6 +2690,20 @@ fn ship_version(
     value,
   };
   let shipments = cut_shipments(state, (object, version), groups);
+  let carrying = shipments
+    .iter()
+    .filter(|(_, inputs)| inputs.is_some())
+    .count();
+  if let Some(pending) = state
+    .merge
+    .pending
+    .get_mut(&object)
+    .and_then(|pending_green| pending_green.records.get_mut(&version))
+  {
+    pending.shipments = pending
+      .shipments
+      .saturating_add(u64::try_from(carrying).unwrap_or(u64::MAX));
+  }
   for (targets, inputs) in shipments {
     if let Some(inputs) = &inputs {
       state.count(INPUTS_UNPLACED, 1);
@@ -3086,11 +3136,20 @@ fn record_merge_acks_in(
     .pending
     .get(&object)
     .and_then(|pending_green| pending_green.records.get(&version))
-    .map(|pending| (pending.record.placed(quorum), pending.first_period));
+    .map(|pending| {
+      (
+        pending.record.placed(quorum),
+        pending.first_period,
+        (pending.enqueued_ns, pending.shipments),
+      )
+    });
   record_merge_acks(state, local, object, version, placement, quorum);
-  if let Some((false, first)) = before
+  if let Some((false, first, (enqueued_ns, shipments))) = before
     && placed_version(state, object).is_some_and(|placed| placed >= version)
   {
+    let now = slates_machine::clock::monotonic_ns();
+    count_phase(state, SUBMIT_PLACE, now.saturating_sub(enqueued_ns));
+    count_phase(state, SUBMIT_SHIPMENTS, shipments);
     let waited = period.saturating_sub(first.unwrap_or(period));
     let counter = if waited == 0 {
       PLACED_WITHIN_PERIOD
@@ -3217,7 +3276,64 @@ pub struct AwaitingAcceptance {
   pub origin: u64,
   /// The request id.
   pub id: RequestId,
+  /// For a request forwarded from another node: the forward's exchange waiting on this node's control shard for the
+  /// completion, as (that shard, its awaited call), answered when the version resolves ([`resolve_accepted`],
+  /// [`await_forwarded`]); `None` until the exchange attaches, and for every other request.
+  pub forwarded: Option<(u16, u64)>,
 }
+
+/// What [`await_forwarded`] found of a forwarded request's deferred acceptance.
+pub(crate) enum ForwardedAcceptance {
+  /// Its completion is recorded: these bytes are the reply.
+  Completed(Vec<u8>),
+  /// It waits for its version's commit, and the exchange is now answered when that resolves.
+  Waiting,
+  /// Neither: no completion and no wait (a restart between dropped it), so the exchange answers retryable.
+  Gone,
+}
+
+/// Attaches the forward's exchange, waiting as `waiter` (the control shard and its awaited call), to the deferred
+/// acceptance of `(origin, id)` on this owner shard (AUD-11; A-697's measured forward), or gives its completion when it
+/// is recorded already. Before, the exchange looked at the completion window once a heartbeat, so a commit of 30 ms was
+/// answered at about 100 (the release bench, 2026-11-20).
+pub(crate) fn await_forwarded(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  waiter: (u16, u64),
+) -> ForwardedAcceptance {
+  if let slates_wire::request::Seen::Completed(bytes) =
+    state
+      .db
+      .partition()
+      .completion(origin, id.client, id.sequence)
+  {
+    return ForwardedAcceptance::Completed(bytes);
+  }
+  let Some(key) = state
+    .merge
+    .awaiting_by_request
+    .get(&(origin, id.client, id.sequence))
+    .copied()
+  else {
+    return ForwardedAcceptance::Gone;
+  };
+  let Some(entry) = state.merge.awaiting.get_mut(&key).and_then(|waiting| {
+    waiting
+      .iter_mut()
+      .find(|entry| entry.origin == origin && entry.id == id)
+  }) else {
+    return ForwardedAcceptance::Gone;
+  };
+  entry.forwarded = Some(waiter);
+  state.count(ACCEPTANCE_FORWARD_ATTACHED, 1);
+  ForwardedAcceptance::Waiting
+}
+
+/// Format: a forward's exchange attached to its deferred acceptance, answered when the version resolves
+/// ([`await_forwarded`]), the non-vacuity count of the event-driven forwarded completion.
+pub(crate) const ACCEPTANCE_FORWARD_ATTACHED: &str = "merge.acceptance_forward_attached";
+/// Format: a forward's exchange answered at its version's resolve ([`resolve_accepted`]).
+pub(crate) const ACCEPTANCE_FORWARD_ANSWERED: &str = "merge.acceptance_forward_answered";
 
 /// Registers the acceptance of `version` of `green` as **waiting** for its record to commit at the
 /// quorum (AUD-11): the reply is not written and the completion not recorded until
@@ -3235,7 +3351,12 @@ pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, versio
     .awaiting
     .entry((object, version))
     .or_default()
-    .push(AwaitingAcceptance { route, origin, id });
+    .push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   state
     .merge
     .awaiting_by_request
@@ -3312,7 +3433,12 @@ pub(crate) fn serve_awaiting(
     .awaiting
     .entry((object, version))
     .or_default()
-    .push(AwaitingAcceptance { route, origin, id });
+    .push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   state
     .merge
     .awaiting_by_request
@@ -3337,7 +3463,12 @@ pub(crate) fn join_awaiting(state: &mut ShardState, origin: u64, id: RequestId) 
   if let Some(waiting) = state.merge.awaiting.get_mut(&key)
     && route.is_some()
   {
-    waiting.push(AwaitingAcceptance { route, origin, id });
+    waiting.push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   }
   true
 }
@@ -3436,6 +3567,11 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
         continue;
       }
       state.count(ACCEPTANCE_RESOLVED, 1);
+      // A forward's exchange waiting on its control shard is answered now, with the reply just recorded.
+      if let Some((control, call)) = entry.forwarded {
+        crate::xshard::answer_awaited(control, call, recorded.clone());
+        state.count(ACCEPTANCE_FORWARD_ANSWERED, 1);
+      }
       let Some(route) = entry.route else {
         continue;
       };
@@ -3788,7 +3924,14 @@ fn recompute(
     };
     let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
     let mut replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
-    match replica.submit(&increment) {
+    let started = slates_machine::clock::monotonic_ns();
+    let outcome = replica.submit(&increment);
+    count_phase(
+      state,
+      SUBMIT_RECOMPUTE,
+      slates_machine::clock::monotonic_ns().saturating_sub(started),
+    );
+    match outcome {
       Outcome::Accepted { version } if version == value.version => {}
       // The owner accepted it; a holder that computes anything else has diverged.
       _ => return Err(RECOMPUTE_MISMATCH),
@@ -3991,6 +4134,8 @@ mod tests {
       first_period: None,
       work: None,
       lacking: BTreeMap::new(),
+      enqueued_ns: 0,
+      shipments: 0,
     };
     assert!(carries_inputs(&pending, &[second, third]));
     assert!(!carries_inputs(&pending, &[second]));
@@ -4092,6 +4237,8 @@ mod tests {
             first_period: None,
             work: None,
             lacking: BTreeMap::new(),
+            enqueued_ns: 0,
+            shipments: 0,
           },
         );
       }
@@ -4534,6 +4681,8 @@ mod tests {
           first_period: None,
           work: None,
           lacking: BTreeMap::new(),
+          enqueued_ns: 0,
+          shipments: 0,
         },
       );
       let ack = |holder, sequence, manifest| {

@@ -345,7 +345,7 @@ fn a_large_delta_is_measured_and_written_a_window_a_call() {
   let (mut calls, mut largest) = (0, 0);
   loop {
     let before = out.len();
-    match exporter.export(&source, &mut out).unwrap() {
+    match exporter.export(&source, &source, &mut out).unwrap() {
       Exporting::Wrote(2) => calls += 1,
       Exporting::Wrote(_) => {}
       Exporting::Done => break,
@@ -401,7 +401,7 @@ fn export_call_times() {
     loop {
       out.clear();
       let began = std::time::Instant::now();
-      let done = exporter.export(&source, &mut out).unwrap() == Exporting::Done;
+      let done = exporter.export(&source, &source, &mut out).unwrap() == Exporting::Done;
       times.push(began.elapsed().as_nanos());
       if done {
         break;

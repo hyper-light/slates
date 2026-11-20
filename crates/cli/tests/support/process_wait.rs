@@ -47,19 +47,26 @@ impl Judged {
   /// One look: returns while the tree lives and has gained CPU within [`STALL`]; fails the test naming `what` once it is
   /// gone or stalled.
   pub(crate) fn look(&mut self, what: &str) {
-    let now = tree_cpu(self.root);
-    match verdict(self.mark, now, self.since.elapsed()) {
-      Verdict::Waiting { progressed: true } => {
-        self.mark = now;
-        self.since = Instant::now();
-      }
-      Verdict::Waiting { progressed: false } => {}
+    match self.judge() {
+      Verdict::Waiting { .. } => {}
       gave_up => panic!(
         "{what}: the processes under {} are {gave_up:?} (no CPU gained for {:?}, the bound {STALL:?})",
         self.root,
         self.since.elapsed()
       ),
     }
+  }
+
+  /// The tree's verdict now, moving the mark on progress; for a waiter that ends its own wait when the root leaves
+  /// (reaping it), where a root gone between its check and this look is no failure.
+  pub(crate) fn judge(&mut self) -> Verdict {
+    let now = tree_cpu(self.root);
+    let judged = verdict(self.mark, now, self.since.elapsed());
+    if judged == (Verdict::Waiting { progressed: true }) {
+      self.mark = now;
+      self.since = Instant::now();
+    }
+    judged
   }
 }
 

@@ -225,6 +225,8 @@ fn revision_of(
     },
     properties,
     contents,
+    // A made revision brings its texts whole (the records keep them) until made revisions stream too.
+    stored: std::collections::BTreeMap::new(),
     lock_entries: Vec::new(),
   })
 }

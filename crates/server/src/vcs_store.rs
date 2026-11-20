@@ -100,8 +100,7 @@ use crate::state::ShardState;
 pub(crate) mod arena_windows;
 pub(crate) mod commits;
 pub(crate) mod durable;
-#[allow(unused_imports)]
-// Owed callers: w-svn's landing (A-727 slice b); `BarrierRefused` and `ContentTicket` name its terms.
+#[allow(unused_imports)] // `ContentTicket` names the barrier's term for its callers.
 pub(crate) use durable::{BarrierRefused, ContentTicket, content_durable, content_ticket};
 pub(crate) mod git_encode;
 pub(crate) mod git_replay;
@@ -398,6 +397,9 @@ pub(crate) enum ReplayRefused {
   SvnStep(StepRefusal),
   /// A Subversion record out of its order: a creation once the records are made, or a revision before them.
   SvnOrder,
+  /// A Subversion revision names a text its commit stored that the content store does not hold (§4.17.1 "A push's
+  /// intake": the content is durable before the entry naming it, so a recovery that lacks it lost it).
+  SvnStored,
   /// A Mercurial import's record refused by its replay (A-687): its bytes, a text not its node's, or the import's own
   /// step.
   Mercurial(slates_hg::import::record::Refused),
@@ -2362,7 +2364,7 @@ fn replay_into(
     }
     Some(RepositoryStore::Git(store)) => replay_git(content, store, bytes),
     Some(RepositoryStore::Subversion(store)) => {
-      replay_svn(store, bytes, svn_room.ok_or(unheld)?).map(|()| 0)
+      replay_svn((content, store), bytes, svn_room.ok_or(unheld)?).map(|()| 0)
     }
     Some(RepositoryStore::Mercurial(store)) => replay_hg(content, store, bytes),
     None => Err(unheld),
@@ -2486,7 +2488,11 @@ pub(crate) fn lfs_bytes(stores: &VcsStores, id: RepositoryId, oid: &Oid) -> Opti
 /// (`commit_record`): a revision checked and applied, its lock entries as recorded; the UUID and a revision's properties
 /// an import set (A-652 part 3). A record out of its order is refused, and so is one the step refuses; either leaves
 /// the records as they were.
-fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), ReplayRefused> {
+fn replay_svn(
+  (content, store): (&mut ContentStore, &mut SvnStore),
+  bytes: &[u8],
+  room: SvnRoom,
+) -> Result<(), ReplayRefused> {
   match SvnRecord::decode(bytes).map_err(ReplayRefused::SvnRecord)? {
     SvnRecord::Created { uuid, date } => {
       if store.records.is_some() {
@@ -2499,9 +2505,26 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
     record => {
       let records = store.records.as_mut().ok_or(ReplayRefused::SvnOrder)?;
       records.set_room(room);
+      // The texts the revision stored, which the records now reference: each held again in the content store, as the
+      // live landing held it, so a recovery's sweep of unheld content keeps it.
+      let stored: Vec<slates_svn::index::ContentIdentity> = match &record {
+        SvnRecord::Revision(revision) => revision
+          .stored
+          .keys()
+          .filter(|identity| !records.holds(identity))
+          .copied()
+          .collect(),
+        _ => Vec::new(),
+      };
       records
         .commit_record(record)
-        .map_err(ReplayRefused::SvnStep)
+        .map_err(ReplayRefused::SvnStep)?;
+      for identity in stored {
+        content
+          .hold(&slates_vcs::ContentId(identity))
+          .map_err(|_| ReplayRefused::SvnStored)?;
+      }
+      Ok(())
     }
   }
 }

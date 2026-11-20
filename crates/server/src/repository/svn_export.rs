@@ -241,14 +241,11 @@ impl ExportJob {
     } = self;
     let walk = walk.as_mut().ok_or_else(unreachable)?;
     let done = sliced(state, |s| {
-      let records = s
-        .vcs_stores
-        .subversion_records(repository)
-        .ok_or(Refusal::ContentUnavailable)?;
-      match walk
-        .export(records, &mut scratch)
-        .map_err(|refusal| of_export(&refusal))?
-      {
+      let exported = crate::vcs_store::svn_view::with_view(s, (repository, None), |view| {
+        walk.export(view.records, view.texts, &mut scratch)
+      })
+      .ok_or(Refusal::ContentUnavailable)?;
+      match exported.map_err(|refusal| of_export(&refusal))? {
         Exporting::Wrote(_) => {
           hasher.update(&scratch);
           *length = length.saturating_add(u64::try_from(scratch.len()).unwrap_or(u64::MAX));
@@ -336,14 +333,11 @@ impl ExportJob {
       }
       stage.clear();
       *staged_written = 0;
-      let records = s
-        .vcs_stores
-        .subversion_records(repository)
-        .ok_or(Refusal::ContentUnavailable)?;
-      match walk
-        .export(records, stage)
-        .map_err(|refusal| of_export(&refusal))?
-      {
+      let exported = crate::vcs_store::svn_view::with_view(s, (repository, None), |view| {
+        walk.export(view.records, view.texts, stage)
+      })
+      .ok_or(Refusal::ContentUnavailable)?;
+      match exported.map_err(|refusal| of_export(&refusal))? {
         Exporting::Wrote(_) => {
           hasher.update(stage);
           *length = length.saturating_add(u64::try_from(stage.len()).unwrap_or(u64::MAX));
