@@ -305,14 +305,17 @@ fn an_uploaded_object_is_durable_and_served_after_the_store_is_made_again() {
       me,
       ("POST", "/repo.git/info/lfs/objects/batch", batch.as_bytes()),
     );
+    assert_eq!((uploaded, logged, again, logged_again), (200, 1, 200, 1));
     assert_eq!(
-      (uploaded, logged, again, logged_again),
-      (200, 1, 200, 1)
+      (downloaded.status.code, downloaded.body == bytes),
+      (200, true)
     );
-    assert_eq!((downloaded.status.code, downloaded.body == bytes), (200, true));
     let listed_body = String::from_utf8(listed.body).unwrap();
     assert_eq!(
-      (listed.status.code, listed_body.contains(r#""download":{"href":"#)),
+      (
+        listed.status.code,
+        listed_body.contains(r#""download":{"href":"#)
+      ),
       (200, true),
       "{listed_body}"
     );
@@ -331,7 +334,9 @@ fn an_upload_whose_bytes_are_not_its_oid_is_refused_and_nothing_is_recorded() {
     let oid = LfsNaming::oid(b"the bytes the client named");
     let object = format!("/repo.git/info/lfs/objects/{oid}");
     let before = records(state, repository);
-    let refused = serve(state, me, ("PUT", &object, b"other bytes")).status.code;
+    let refused = serve(state, me, ("PUT", &object, b"other bytes"))
+      .status
+      .code;
     let logged = records(state, repository) - before;
     let downloaded = serve(state, me, ("GET", &object, b"")).status.code;
     assert_eq!((refused, logged, downloaded), (422, 0, 404));

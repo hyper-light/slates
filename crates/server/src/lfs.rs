@@ -54,9 +54,9 @@ use slates_vfs::clock::Clock;
 use slates_wire::Wire;
 
 use crate::repository::push::{AppendRefused, EntryParts, LfsUpload, RepositoryLogs, push_lfs};
-use crate::vcs_store::LfsAdmitRefused;
 use crate::state::ShardState;
 use crate::vcs_policy::{Asked, Name, Right, admit};
+use crate::vcs_store::LfsAdmitRefused;
 
 /// Format: the namespace a git branch's short name lives under (`git-check-ref-format`).
 const HEADS: &str = "refs/heads/";

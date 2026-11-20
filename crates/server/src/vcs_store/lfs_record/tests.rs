@@ -40,7 +40,11 @@ fn an_lfs_record_is_its_documented_bytes_and_reads_back() {
 #[test]
 fn an_lfs_record_is_told_from_a_push_record_by_its_first_word() {
   assert_eq!(
-    [is_lfs(GOLDEN), is_lfs(b"SGPR\x01\x00\x00\x00"), is_lfs(b"SGL")],
+    [
+      is_lfs(GOLDEN),
+      is_lfs(b"SGPR\x01\x00\x00\x00"),
+      is_lfs(b"SGL")
+    ],
     [true, false, false]
   );
 }
