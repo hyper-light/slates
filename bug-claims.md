@@ -31,13 +31,13 @@
 - unasked holder keeps its copy | GAPS:2306 (A-309 open) | a holder the takeover round never asked keeps its copy (`fleet.takeover.kept_unasked`): memory held, not safety.
 - ex-holder keeps its live copy | GAPS:2567 | a holder the joint transition drops keeps its live copy at an old fence until the volume's tombstone: memory held, not safety.
 - WinFsp purge retried without bound | docs/bugs/2026-11-01-a-winfsp-purge-windows-did-not-take-left-a-mapped-view-stale (Siblings) | a purge round a rename's lock deferred, or one WinFsp refused, is owed again with no bound on its attempts (`winfsp.rs` `take_outcomes`), against CLAUDE.md §2 item 8.
-- WinFsp fsx wedges | docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke (Open) | the WinFsp fsx port at seed 1 stops making progress over the drive at an extension after a cached write past a hole and a shrink (ops 41-43), both architectures.
+- [LANDED A-725 w-bugs 0f5591c03, main c22dce946] WinFsp fsx wedges | docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke (Open) | the WinFsp fsx port at seed 1 stops making progress over the drive at an extension after a cached write past a hole and a shrink (ops 41-43), both architectures.
 - arm stall without the watch | GAPS:2502 | on arm, runs without the live-durability watch stall after the holder resumes; cause open (stale install answered late, or slow catch-up).
 - takeover flake under load (old) | GAPS:12087, 12355 | three_daemons_take_over_a_dead_owners_head failed 2 of 4 full fleet suites under load; counters owed when it recurs.
 - live fsstress over NFSv3 hangs (old) | GAPS:4296 | on ubuntu-latest the live fsstress over the NFSv3 adapter hung over three hours, so no live fsstress or pjdfstest result exists for Linux.
 - liveness suite hang | GAPS:3787 | the liveness suite hung 2 of about 9 parallel runs on adacachy2: two starving tests stood still starting their spinners; the lock their test threads held is not named.
 - six fleet tests fail on jupiter | GAPS:2043 | six fleet tests fail on jupiter (Windows x86_64, loaded) though they pass on the runners.
-- junction tests on jupiter | GAPS:19236 | two slates-base junction tests fail on jupiter: `cmd /C mklink /J` reads the forward-slash CARGO_TARGET_TMPDIR as a switch (a test bug).
+- [FIXED 2359d2550 (2026-11-18, mklink gets backslashed paths); found already on main by w-bugs 2026-11-20] junction tests on jupiter | GAPS:19236 | two slates-base junction tests fail on jupiter: `cmd /C mklink /J` reads the forward-slash CARGO_TARGET_TMPDIR as a switch (a test bug).
 - goal-83 audit B12, B4, B9, B8, B10, B3, B5, B11, B14, B15, B16 | g079's order (B2 is A-543, g079's) | their descriptions are recorded neither in the repo nor in the goal stack (item 01a1f12cc155 names them only); g079 holds the list.
 Count: 24 lines (34 bugs counting each B item), 3 owned by goal 225 without a row, 1 queued for g085, 11 B items with g079.
 - 2026-11-19T00:57Z | g079 | B2: a WinFsp drive declared a folding volume case-sensitive (GAPS, A-300) | part 1 landed 279af73ba (main 3cc9ce3f0, A-543); part 2 (Windows wiring) filed for main
