@@ -25,7 +25,7 @@ use super::super::learn::Clock;
 use super::super::naming::kind_of;
 use super::super::push::{Push, Staged};
 use super::super::rows::{self, ObjectRow};
-use super::{Repository, StoreRefused};
+use super::{IndexBases, Repository, StoreRefused};
 use crate::object_name::{Kind, ObjectId};
 
 /// A new object as staging meets it: its id, type, root content and length.
@@ -219,6 +219,34 @@ impl Repository {
     Ok(())
   }
 
+  /// The content-store root of the push's object `id`, its row's content: where the push holds it in the store, or put
+  /// there now from where it lies in the push's pack (`Push::put_placed`).
+  fn stored_for_row(
+    &self,
+    store: &mut ContentStore,
+    push: &mut Push,
+    id: &ObjectId,
+  ) -> Result<ContentId, StoreRefused> {
+    if let Some(content) = push.stored(id) {
+      return Ok(content);
+    }
+    let unreadable = StoreRefused::Unreadable { id: *id };
+    let bytes = {
+      let outside = IndexBases {
+        repository: self,
+        store,
+      };
+      match push.bytes(store, &outside, id) {
+        Some(Ok(bytes)) => bytes.into_owned(),
+        _ => return Err(unreadable),
+      }
+    };
+    push
+      .put_placed(store, id, &bytes)
+      .map_err(StoreRefused::Content)?
+      .ok_or(unreadable)
+  }
+
   /// One unit of the fresh objects' census: the next object the push holds after `after`, kept with its kind when the
   /// store has not indexed it; the positions begun once none is left. Refused, the fork is given back.
   fn fresh_unit(
@@ -228,20 +256,24 @@ impl Repository {
     (fork, base, after): (Index, u64, Option<ObjectId>),
     (mut fresh, mut kinds): (Vec<Fresh>, BTreeMap<Kind, u64>),
   ) -> Result<Step, StoreRefused> {
-    let held = push.held_after(after.as_ref().map(ObjectId::as_bytes));
-    let Some((bytes, number, content, len)) = held else {
+    let Some((id, held)) = push.held_after(after.as_ref()) else {
       return self.positions_begun((fork, base), fresh, &kinds);
     };
-    let Some(id) = ObjectId::from_bytes(self.format, bytes) else {
-      fork.release(store)?;
-      return Err(StoreRefused::ForeignPush);
-    };
     if self.indexed(store, &id).is_none() {
-      let Some(kind) = kind_of(number) else {
+      let Some(kind) = kind_of(held.number) else {
         fork.release(store)?;
         return Err(StoreRefused::Malformed { id });
       };
-      fresh.push((id, kind, content, len));
+      // An object read where it lies in the push's pack is put in the store now, its row's content (the module docs of
+      // `push`, "Read in place while judged"): what lands is held there.
+      let content = match self.stored_for_row(store, push, &id) {
+        Ok(content) => content,
+        Err(refused) => {
+          fork.release(store)?;
+          return Err(refused);
+        }
+      };
+      fresh.push((id, kind, content, held.len));
       let count = kinds.entry(kind).or_insert(0);
       *count = count.saturating_add(1);
     }

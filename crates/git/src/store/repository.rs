@@ -1,6 +1,7 @@
 //! A git repository's index, versions and walks (A-614; §4.17.2 "The repository in git's terms", items 2 and 3; piece
 //! 5, part 1): the store's module docs say what each holds and why.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::mem::size_of;
@@ -17,8 +18,9 @@ use super::fragment::{self, FragmentRefused, Learning, Placed, Stored};
 use super::hook_view::Quantum;
 use super::learn::{Clock, Depth, Exchange, Levels, Rebuild, Window};
 use super::naming::{GitNaming, kind_of};
+use super::packed::{Base, Bases};
 use super::positions::Positions;
-use super::push::Push;
+use super::push::{Push, stored_bytes};
 use super::rows::{self, CommitRow, ObjectRow};
 use reach::Sets;
 
@@ -393,31 +395,46 @@ impl Move {
 }
 
 /// Where an object is: indexed, with its row, or held by the push.
-enum Place {
+enum Place<'p> {
   Indexed {
     row: ObjectRow,
     content: ContentId,
   },
+  /// Held by `push`, read through it: from the content store or where it lies in the push's pack.
   Pushed {
     kind: Kind,
-    content: ContentId,
-    len: u64,
+    push: &'p Push,
   },
 }
 
-impl Place {
+impl Place<'_> {
   fn kind(&self) -> Kind {
     match self {
       Place::Indexed { row, .. } => row.kind,
       Place::Pushed { kind, .. } => *kind,
     }
   }
+}
 
-  fn content(&self) -> (ContentId, u64) {
-    match self {
-      Place::Indexed { row, content } => (*content, row.len),
-      Place::Pushed { content, len, .. } => (*content, *len),
+/// The repository's index as the bases a pack's REF_DELTA names (`packed::Bases`): each object written whole from the
+/// content store.
+pub struct IndexBases<'a> {
+  /// The repository.
+  pub repository: &'a Repository,
+  /// The store its objects are in.
+  pub store: &'a ContentStore,
+}
+
+impl Bases for IndexBases<'_> {
+  fn locate(&self, id: &ObjectId, whole: &mut Vec<u8>, room: u64) -> Option<Base> {
+    let (row, content) = self.repository.indexed(self.store, id)?;
+    if row.len > room {
+      return None;
     }
+    let bytes = stored_bytes(self.store, &content, row.len)?;
+    whole.clear();
+    whole.extend_from_slice(&bytes);
+    Some(Base::Whole(row.kind))
   }
 }
 
@@ -537,24 +554,39 @@ impl Repository {
   }
 
   /// Where `id` is: indexed first, then held by the push.
-  fn locate(&self, store: &ContentStore, push: &Push, id: &ObjectId) -> Option<Place> {
+  fn locate<'p>(&self, store: &ContentStore, push: &'p Push, id: &ObjectId) -> Option<Place<'p>> {
     if let Some((row, content)) = self.indexed(store, id) {
       return Some(Place::Indexed { row, content });
     }
-    let (number, content, len) = push.object(id)?;
+    let held = push.object(id)?;
     Some(Place::Pushed {
-      kind: kind_of(number)?,
-      content,
-      len,
+      kind: kind_of(held.number)?,
+      push,
     })
   }
 
-  /// The bytes of the object at `place`.
-  fn bytes_of(store: &ContentStore, id: &ObjectId, place: &Place) -> Result<Vec<u8>, StoreRefused> {
-    let (content, len) = place.content();
-    store
-      .object_bytes(&content, len)
-      .ok_or(StoreRefused::Unreadable { id: *id })
+  /// The bytes of the object at `place`: lent where the store holds it as one window, read where it lies in a push's
+  /// pack otherwise (`Push::bytes`).
+  fn bytes_of<'s>(
+    &self,
+    store: &'s ContentStore,
+    id: &ObjectId,
+    place: &Place<'s>,
+  ) -> Result<Cow<'s, [u8]>, StoreRefused> {
+    let unreadable = StoreRefused::Unreadable { id: *id };
+    match place {
+      Place::Indexed { row, content } => stored_bytes(store, content, row.len).ok_or(unreadable),
+      Place::Pushed { push, .. } => {
+        let outside = IndexBases {
+          repository: self,
+          store,
+        };
+        match push.bytes(store, &outside, id) {
+          Some(Ok(bytes)) => Ok(bytes),
+          _ => Err(unreadable),
+        }
+      }
+    }
   }
 
   /// The objects `id` names: a commit's tree and parents, a tree's entries (a submodule's commit is no object of this
@@ -659,7 +691,7 @@ impl Repository {
     place: &Place,
     path: &'p [u8],
   ) -> Result<Option<(ObjectId, &'p [u8])>, StoreRefused> {
-    let bytes = Repository::bytes_of(store, id, place)?;
+    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
     let tree =
       Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
@@ -682,7 +714,7 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<Vec<(ObjectId, Vec<u8>)>, StoreRefused> {
-    let bytes = Repository::bytes_of(store, id, place)?;
+    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
     let tree =
       Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
@@ -706,7 +738,7 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<Vec<ObjectId>, StoreRefused> {
-    let bytes = Repository::bytes_of(store, id, place)?;
+    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
     let tree =
       Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
@@ -725,7 +757,7 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<ObjectId, StoreRefused> {
-    let bytes = Repository::bytes_of(store, id, place)?;
+    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
     let tag = Tag::parse(&bytes, &mut Admission::new(store.room())).map_err(|_| malformed)?;
     tag.object(self.format).ok_or(malformed)

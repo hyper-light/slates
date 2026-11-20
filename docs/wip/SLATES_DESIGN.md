@@ -55885,6 +55885,39 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's memory per push, B2's in-flight half — A push read where it lies in its pack while it is judged (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING, storage and changesets rulings)
+- **Why.** B1 measured a push of git/git's v1.5.0 (9.4 MiB pack, 34,296 objects) putting every object inflated in the
+  content store as it arrived (304.6 MiB). Ada's storage ruling keeps a change in RAM while it is in flight; her
+  changesets ruling makes what lands changesets, git's packs and objects derived. B2's in-flight half: the quarantine
+  holds the pack the client sent and where each object lies in it, never the objects inflated beside it.
+- **Change.** `slates_git::store::Push` keeps the client's pack (`extend_pack`: the server hands it each call's pack
+  bytes, which the receive session no longer copies; `Session::pack_len`) and each pack object's place, type, length
+  and content identity (`admit_placed`: named, checked and read as a commit from the reader's bytes, nothing put). An
+  object is read through the push (`Push::bytes`: `packed::read` over the push as a `PackSource`, a REF_DELTA's base an
+  entry of the pack, an object the push holds, or the repository's, `IndexBases`), so the pack's checks, the
+  connectivity walk, the verdicts' pushed-tree reads (`PushedObjects`) and a commit's tree and tag reads
+  (`Repository::bytes_of`) read it in place. A chain is resolved from the objects read lately
+  (`packed::Recent`, git's delta base cache): each object the reader resolves is kept there taken whole, each object a
+  read builds copied in, held to the pack's length, so a push's resident is at most twice its pack. Staging puts each
+  object new to the repository in the content store as its row is written (`Push::put_placed`, a census unit an object),
+  and the hook view's pushed pack is made from those. The record writes the push's own pack (`RecordWriter::finish`'s
+  `pack`), as before byte for byte. Objects no pack brought (the server's own commits, a replay's) are held in the
+  content store as before.
+- **Measured** (adas-mac-studio.local-2, 2026-11-20). Before: a push held each object inflated in the content store as
+  it arrived (B1's run: git/git's v1.5.0, 9.4 MiB of pack, left 309 MiB). After: held in place, the store grows by
+  nothing until staging; the bound test's 64 objects of 64 KiB (4,194,304 bytes inflated, a 41,568-byte pack) hold
+  4,194,304 bytes in the store before and 41,568 bytes, the pack, after. The v1.5.0 rerun of B1's diagnostic is owed
+  in BENCHMARKS.md.
+- **Owed.** The landed half (w-store: the changesets a clone's pack is derived from; rows naming a pack place in place
+  of an inflated content); a replay reading its record's pack whole (`git_replay`'s `Unpacked`) and holding its objects
+  in the store, as the live push did before.
+- **Tests.** `slates-git` `store::tests::packed::b2_every_object_of_a_push_read_where_it_lies_in_its_pack_is_the_object_read_whole`
+  (six captured pushes, their packs handed seven bytes a call, thin bases among them; the store holds nothing more) and
+  `b2_an_in_flight_push_holds_its_pack_and_not_its_objects_inflated` (64 blobs of 64 KiB: held in the store 4,194,304
+  bytes, held in place 41,568, the pack; bound: twice the pack).; `slates-git --lib` 579
+  passed; `slates-server --lib -- git vcs_store vcs_http` 218 passed; check clean; clippy clean on the changed crates
+  (one finding on main outside them, `live_ship.rs`); fmt clean (kiln, adas-mac-studio.local-2).
+
 ### A-722's head at once — A git service's reply head is written before its body is read (2026-11-20, w-git for UI goal 93; main's ruling)
 - **Why.** The edge's engine wrote a reply's status and headers only once the service's reply began, after the whole
   request body was read. A long push's pack is decoded as its body is read, so after the client's last byte the
