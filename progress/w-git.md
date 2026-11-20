@@ -266,3 +266,6 @@
   sets). 16:05 LANDED 5c6327b8e (replay reads its pack in place: v1.5.0 rebuild RSS +189.6 MiB -> +0.1 MiB).
 - Waiting on main: pack homing as content before the append (19 ms apply). Studio release target
   ~/.cache/w-git-target-rel.noindex still there for diags; delete when the memory work ends.
+- 16:20 landing step split further: apply = greens commit 1.7 + recorded_entry (work encode) 3.3 + record_all (db
+  write of the 11 MiB entry) 18.3 ms. Took main's 14:20 note (landed half stays with w-store) as the answer to the
+  pack-homing question; sent w-store the numbers (inbox/w-store-from-w-git-entry-apply-2026-11-20.md).

@@ -31,6 +31,14 @@ Signing: kiln's GIT_CONFIG_* env beats `-c commit.gpgsign=false`; use `git commi
    [landing view]. Lens sites: nfs.rs ~392 (with_export, destructure adds `greens`, `works`), fuse.rs ~997, landing,
    declare_mount. Submit declares from `Volume::diverged()` (base.rs ~948) read through the Overlay with the lens.
    Old version listing: Green::beneath(head) corrected by changed_between(pin, head) (no files_at walk).
+   STATUS 16:40: mount half DONE in tree (uncommitted): crates/vfs/src/host/tree.rs (TreeHost/TreeLens/TreeSource),
+   BaseHost::Tree, verbs::admit_over/AdmitBase, server green_tree.rs, mounted_work.rs rewritten (overlay + diverged
+   declaration, MountPin in reachable_floor), nfs.rs/fuse.rs lend sites. Debug: 8 mounts +1.5 MB (was 548 MB), mount
+   1.4 ms vs 0.6 ms small (was 34 ms). Both mounted_work tests green. Release A/B in ~/.cache/w-work-mount-ab (ab3.log).
+   GOTCHA: never build two worktrees into one target dir -- release artifacts got poisoned (cargo took the other tree's
+   slates-vfs/db as fresh); the A/B's before side uses ~/.cache/w-work-mount-ab-target.noindex (delete after).
+   NEXT (part 3): landing of a green without a head copy: land crate needs a read-only base host beside the target
+   host (Source::read_at uses landing.host) + PlanWalk listing untouched tree-base entries as created.
 2. Restart durability of unsubmitted mount writes (red: save, restart, submit, save is there; A-127 anchor segment).
 3. D-O17 multi-span: w-rewrite-ops' minimiser on main 561c655a3, one call site (`changed_span` in mounted_work.rs).
 4. Kernel-mount real-editors variant -> run-requests.md only.

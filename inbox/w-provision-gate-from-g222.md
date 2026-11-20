@@ -47,3 +47,18 @@ written ("served"). 20,953 requests a run (edits and submits; the green is on th
 Next, both parts: (1) the daemon's queue — shard threads at macOS `QOS_CLASS_USER_INTERACTIVE` (no privilege; the
 load's spinners are default QoS), A/B on edit_merge_bench; Linux has no unprivileged raise (R10), so there it is the
 window and the park. (2) the client's — the harness's reply wait. Tell me if you have the QoS A/B already.
+
+## 2026-11-20 16:10 PST — finding 3: the daemon's loaded tail is a 1.00–1.02 ms spike, a timer, not the scheduler
+
+Same Mac and diagnostic. The queued wait (a request's landing in the ring to its shard taking it) under load has a
+sharp spike at 1,000–1,020 µs over a flat floor: per loaded run of 52,050 requests, 535–672 land in [1.00, 1.02) ms
+against about 20 per 10 µs bin on either side (10 µs bins 900–1090: 20 20 24 20 15 18 18 19 13 18 **385 150** 25 3 4 6
+…). Quiet: 1 in 20,952. That band is the queued p99 (1,006–1,010 µs in every loaded run, whatever else changed).
+Two things do not move it (one binary, env-gated, 3 rounds interleaved, load 28–38):
+- shard threads at `QOS_CLASS_USER_INTERACTIVE` (`G222_QOS`): queued p99 1,007 / 1,007 µs against 1,007 / 1,010 / 1,006
+  off; the submit's loaded p50 no better (201–306 against 102–203 µs);
+- the macOS doorbell thread at that class (`G222_BELL_QOS`): the band 388 against 299 requests.
+So a request that lands while its shard waits is, about 1% of the time under load, taken only at a ~1 ms timer, not
+by its ring's wake. Check yours: if your daemon part's 1.14–1.46 ms median tail has the same 1.00–1.02 ms mode, it is
+this. I'm now stamping the shard's park (its deadline, whether it was announced idle, whether a kick ended it) to name
+the timer and the missing wake.
