@@ -690,6 +690,23 @@ impl From<SvndiffError> for Stop {
 }
 
 /// What the drive made of one item.
+/// What one command a caller made itself came to ([`Drive::edit`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Edited {
+  /// Taken; the drive goes on.
+  Taken,
+  /// `abort-edit` taken: the drive is over.
+  Aborted,
+  /// `close-edit`'s verdict accepted the work: the caller commits it.
+  Accepted(Box<Work>),
+  /// A hook is due: answer it with [`Drive::resume_edit`].
+  Hook(Due),
+  /// Refused, with `svnserve`'s errors, outermost first: the drive is over.
+  Refused(Vec<(u32, String)>),
+  /// The drive was over already, or the command could not be read: nothing more is taken.
+  Closed,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
   /// The command was taken; nothing is written.
@@ -1352,6 +1369,88 @@ impl Drive {
       }),
     };
     self.answer(outcome, out)
+  }
+
+  /// Takes one editor command a caller made itself (A-681: the HTTP site's commits, which arrive as requests, not as
+  /// ra_svn items), answering what it made typed, with no ra_svn bytes: a refusal comes back as `svnserve`'s errors,
+  /// outermost first ([`Drive::errors`]), and ends the drive, as the early-error rule leaves nothing after it.
+  pub fn edit<G: Green + ?Sized>(
+    &mut self,
+    index: &Index,
+    green: &G,
+    locks: &LockTable,
+    command: &EditCommand<'_>,
+  ) -> Edited {
+    if self.phase != Phase::Driving {
+      self.phase = Phase::Done;
+      return Edited::Closed;
+    }
+    let world = World {
+      index,
+      green,
+      locks,
+    };
+    let outcome = self.run(&world, command);
+    self.edited(outcome)
+  }
+
+  /// Takes the answer of the hook the last [`Drive::edit`] waits for, as [`Drive::resume`] takes it, answering typed.
+  pub fn resume_edit<G: Green + ?Sized>(
+    &mut self,
+    index: &Index,
+    green: &G,
+    locks: &LockTable,
+    answer: Result<(), Vec<(u32, String)>>,
+  ) -> Edited {
+    let Phase::Waiting(pause) = self.phase else {
+      self.phase = Phase::Done;
+      return Edited::Closed;
+    };
+    self.phase = Phase::Driving;
+    if let Err(errors) = answer {
+      self.phase = Phase::Done;
+      return Edited::Refused(errors);
+    }
+    let outcome = match pause {
+      Pause::OpenRoot => self.make_root(),
+      Pause::CloseEdit => self.judge(&World {
+        index,
+        green,
+        locks,
+      }),
+    };
+    self.edited(outcome)
+  }
+
+  /// What a command's outcome made, typed ([`Drive::edit`]).
+  fn edited(&mut self, outcome: Result<Outcome, Stop>) -> Edited {
+    match outcome {
+      Ok(Outcome::Taken) => Edited::Taken,
+      Ok(Outcome::Aborted) => {
+        self.phase = Phase::Done;
+        Edited::Aborted
+      }
+      Ok(Outcome::Accepted(work)) => {
+        self.phase = Phase::Done;
+        Edited::Accepted(work)
+      }
+      Ok(Outcome::Hook(due)) => {
+        self.phase = Phase::Waiting(match due {
+          Due::StartCommit { .. } => Pause::OpenRoot,
+          Due::PreCommit { .. } => Pause::CloseEdit,
+        });
+        Edited::Hook(due)
+      }
+      Err(Stop::Close) => {
+        self.phase = Phase::Done;
+        Edited::Closed
+      }
+      Err(Stop::Refused(refusal)) => {
+        let errors = self.errors(&refusal);
+        self.phase = Phase::Done;
+        Edited::Refused(errors)
+      }
+    }
   }
 
   /// The transaction as a hook reads it while its command waits ([`Step::Hook`]): its name, base, revision properties,
