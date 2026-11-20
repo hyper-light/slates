@@ -23,6 +23,7 @@ mod encoding;
 mod fragments;
 mod hook_view;
 mod oracle;
+mod packed;
 mod protect;
 mod reach;
 mod upload;
