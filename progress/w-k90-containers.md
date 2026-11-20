@@ -197,3 +197,8 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - On Adas-MacBook-Pro-2: ~/.cache/w-k90-containers-e2e (test binary + logs), ~/.cache/w-k90-containers-target-a520/debug/kiln
   (kiln binary at its compile-time path), ~/kiln-work/w-k90-containers-a520 (shallow clone of agents/w-k90-a520),
   ~/.cache/w-k90-containers-live-r70.log
+## 2026-11-20 ~12:45: export route ON MAIN (a82ce7ede; my clone at 64412a674). main: Mac leg proved the route end to end
+   except the end; w-k90-a520 now does (a) the end fixes (my diagnosis: kill/next release race; volume rm `?` skips the
+   export detach) and (b) Slates' judge accepting Docker Desktop on Windows for the export route. When both land: re-run
+   Mac (no stale slates: mounts there, checked 0) then jupiter (WinFsp + Docker Desktop up). Watcher b0zdxv38e on main.
+   Removed worktree ~/kiln-work/w-k90-containers-a520 (git worktree remove).
