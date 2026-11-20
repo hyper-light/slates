@@ -943,3 +943,52 @@ fn an_at_head_routes_reply_head_is_written_before_its_body_is_read() {
   assert_eq!(reply.matches("HTTP/1.1 200 OK").count(), 1, "{reply:?}");
   assert!(reply.ends_with("4\r\n0000\r\n0\r\n\r\n"), "{reply:?}");
 }
+
+/// A-722's keepalive while a long pack is read (main's ruling of 2026-11-20: git's `receive.keepAlive` writes while it
+/// processes a push, and a proxy should never see a silent connection). Do: decide a POST of ten body bytes
+/// `StatusMode::AtHead`, hand it its head and three of the bytes, take them, and pass an interim run while the rest of
+/// the body is still to come; then the rest and an empty reply. Expect: the interim run written, chunked after the head,
+/// before the body's end; the reply then ended once, its last chunk after it.
+#[test]
+fn an_at_head_route_writes_an_interim_run_while_its_body_is_read() {
+  let mut connection = Connection::clear(ROOM);
+  connection
+    .receive(b"POST /r.git/git-receive-pack HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nabc");
+  let mut written = Vec::new();
+  let mut interim_sent = false;
+  loop {
+    match connection.next_step() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Decide => connection.decide(Decision::Serve {
+        fields: fields(&[("Content-Type", "application/x-git-receive-pack-result")]),
+        head_only: false,
+        status: StatusMode::AtHead,
+      }),
+      Next::Body(_) => {
+        connection.body_taken();
+        if !interim_sent {
+          connection.interim(b"0005\x01");
+          interim_sent = true;
+        }
+      }
+      Next::Read => break,
+      other => panic!("unexpected before the body's end: {other:?}"),
+    }
+  }
+  let before_end = String::from_utf8_lossy(&written).into_owned();
+  connection.receive(b"defghij");
+  loop {
+    match connection.next_step() {
+      Next::Write => written.extend(connection.take_output()),
+      Next::Body(_) => connection.body_taken(),
+      Next::BodyEnd => {}
+      Next::Reply => connection.reply_end(),
+      Next::Read | Next::Close => break,
+      other => panic!("unexpected: {other:?}"),
+    }
+  }
+  assert!(before_end.ends_with("5\r\n0005\u{1}\r\n"), "{before_end:?}");
+  let whole = String::from_utf8_lossy(&written).into_owned();
+  assert_eq!(whole.matches("HTTP/1.1 200 OK").count(), 1, "{whole:?}");
+  assert!(whole.ends_with("5\r\n0005\u{1}\r\n0\r\n\r\n"), "{whole:?}");
+}

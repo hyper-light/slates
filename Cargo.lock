@@ -2623,6 +2623,7 @@ dependencies = [
  "aws-lc-rs",
  "blake3",
  "cc",
+ "libc",
  "rcgen",
  "rustix",
  "serde",
