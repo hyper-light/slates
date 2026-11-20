@@ -169,3 +169,4 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   by identity (put_object), w-perf owns record.rs; offered names.rs helper. Waiting reply.
 - 61a74fe35 LANDED P9a: slates_vcs::cut (range_of, bits_for, split_due, child_of) + vcs_share::place::range_partition.
 - NEXT: 9b needs 8c; meanwhile snapshot_room as 2nd resource in vcs_share::room (DRF over memory + snapshot room).
+- b759bddb3 LANDED: vcs_share::room DRF over [memory, snapshot slot room]; Bound::Snapshot; tests 23/23, edges 88/88 (the hg ssh test now passes on main).
