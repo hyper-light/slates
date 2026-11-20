@@ -89,7 +89,10 @@ pub use content::{
 pub use derived::{
   Derivations, DerivedCounters, DerivedRefused, DerivedType, Fill, Graph, Mode, Progress, Read,
 };
-pub use index::{AdoptRefused, Batch, Index, IndexCounters, IndexRefused, Inserted, NewRow};
+pub use index::{
+  AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, NewRow,
+  TAIL_SLOT_BYTES,
+};
 pub use rule::Compaction;
 pub use share::{Claim, Granted, amount_of, divide, whole_units};
 pub use table::{RowRef, TableRefused, TableView};
