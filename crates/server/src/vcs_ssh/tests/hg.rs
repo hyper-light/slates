@@ -306,6 +306,25 @@ impl Store for Probed {
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
     std::iter::empty()
   }
+
+  fn manifest_linked(&self, _position: u64) -> Option<slates_hg::serve::getbundle::Linked> {
+    None
+  }
+
+  fn file_linked_from(
+    &self,
+    _from: (&[u8], u64),
+  ) -> Option<(Vec<u8>, u64, slates_hg::serve::getbundle::Linked)> {
+    None
+  }
+
+  fn holds_manifest(&self, _node: &Node) -> bool {
+    false
+  }
+
+  fn serves_every_changeset(&self) -> bool {
+    true
+  }
 }
 
 /// Lends the probed repository's store as [`HG`]'s, and no other, until the test says it went away.
