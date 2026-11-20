@@ -1312,6 +1312,14 @@ pub enum RequestBody {
     /// The host directory that holds a Mercurial repository's `.hg`, or the host file that holds a Subversion dump.
     path: String,
   },
+  /// Read repository `repository`'s policy (§4.17.1 "Policy"; A-622), on the partition its name hashes to: its owner's
+  /// verb, as setting it is, so a setter can change one part and keep the rest (`slates repository policy`). Answered
+  /// `RepositoryPolicy` with its version and every part; refused `NotFound` for no such repository, `Forbidden` for
+  /// any principal but its owner, and `BadRequest` for a rule naming a principal the wire cannot carry. Appended.
+  DescribeRepositoryPolicy {
+    /// The repository's name.
+    repository: String,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2351,7 +2359,8 @@ impl RequestBody {
       | RequestBody::BindBranch { .. }
       | RequestBody::RetireBranch { .. }
       | RequestBody::SetRepositoryPolicy { .. }
-      | RequestBody::ImportRepository { .. } => None,
+      | RequestBody::ImportRepository { .. }
+      | RequestBody::DescribeRepositoryPolicy { .. } => None,
     }
   }
 
@@ -5443,6 +5452,20 @@ pub enum ReplyBody {
     revisions: u64,
     /// The youngest revision.
     youngest: u64,
+  },
+  /// A repository's policy (`DescribeRepositoryPolicy`): its version (0 for one never set) and every part, as
+  /// `SetRepositoryPolicy` gives them. Appended.
+  RepositoryPolicy {
+    /// The policy's version, which a `SetRepositoryPolicy` reads.
+    version: u64,
+    /// The rules, in order.
+    rules: Vec<PolicyRule>,
+    /// The hooks, in order.
+    hooks: Vec<HookConfig>,
+    /// A Subversion repository's hooks-env sections, in order.
+    hooks_env: Vec<HooksEnvSection>,
+    /// A git repository's keys trusted to sign its commits.
+    signers: Vec<Vec<u8>>,
   },
 }
 
