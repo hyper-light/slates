@@ -7,6 +7,12 @@
 // Each test binary uses part of the harness.
 #![allow(dead_code)]
 
+#[path = "../support/process_wait.rs"]
+mod process_wait;
+
+/// The suites' wait judgment, for a test of these harnesses' VMs (`guest_image`'s launcher).
+pub(crate) use process_wait::{Judged, Verdict};
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -16,18 +22,15 @@ use std::time::{Duration, Instant};
 
 use slates_guest_probe::protocol::{Command as Ask, Reply};
 
-/// Shape: how long the anchor and its daemon get to answer verbs.
-pub(crate) const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the pause between polls of a starting daemon.
 pub(crate) const POLL: Duration = Duration::from_millis(20);
 /// Shape: consecutive verbs a starting daemon must answer before the test runs its own, so the anchor's one startup
 /// restart has settled (as `tests/cli.rs` waits).
 pub(crate) const STABLE_STREAK: u32 = 10;
-/// Shape: how long the guest gets to boot, mount the tag and say it is ready.
-pub(crate) const BOOT_WAIT: Duration = Duration::from_secs(60);
-/// Shape: how long one command's reply may take. A sync writes the map back through two filesystems.
-pub(crate) const REPLY_WAIT: Duration = Duration::from_secs(30);
-/// Shape: how long the VM gets to power off after it is told to quit.
+/// Shape: how long the console's last lines are read once the VM has exited ([`Guest::drain`]): a VMM's last words are
+/// written as it exits and arrive after its exit is seen. Not a wait on the VM: the boot, every reply and the power-off
+/// are waited for while the VM's process tree gains CPU (`process_wait::Judged`), since 2026-11-20 (until then within a
+/// 60 s boot wait, a 30 s reply wait and a 20 s quit wait, and a daemon's start within 20 s).
 pub(crate) const QUIT_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the console lines kept to explain a failure.
 pub(crate) const TRANSCRIPT_LINES: usize = 80;
@@ -142,12 +145,10 @@ pub(crate) fn kill_daemon(anchor: &Anchor, instance: &str, old: u32) -> u32 {
     rustix::process::Signal::KILL,
   )
   .unwrap();
-  let started = Instant::now();
+  // While the anchor's tree gains CPU (until 2026-11-20 within `START_WAIT`).
+  let mut judged = process_wait::Judged::of(anchor.child.id());
   let new = loop {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the anchor restarted its daemon within {START_WAIT:?}"
-    );
+    judged.look("the anchor restarted its daemon");
     match daemon_of(anchor) {
       Some(pid) if pid != old => break pid,
       _ => pause(),
@@ -157,15 +158,13 @@ pub(crate) fn kill_daemon(anchor: &Anchor, instance: &str, old: u32) -> u32 {
   new
 }
 
-/// Waits until `instance`'s daemon answers [`STABLE_STREAK`] verbs in a row.
+/// Waits until `instance`'s daemon answers [`STABLE_STREAK`] verbs in a row, while the instance's processes progress
+/// (`process_wait::InstanceWait`; until 2026-11-20 within `START_WAIT`).
 pub(crate) fn await_steady(instance: &str) {
-  let started = Instant::now();
+  let mut progress = process_wait::InstanceWait::new();
   let mut streak = 0u32;
   while streak < STABLE_STREAK {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the daemon answered {STABLE_STREAK} verbs in a row within {START_WAIT:?}"
-    );
+    progress.check(instance, "the daemon answered verbs in a row");
     streak = if run(instance, &["volume", "list"]).0 == 0 {
       streak.saturating_add(1)
     } else {
@@ -400,7 +399,7 @@ impl Guest {
       transcript: std::collections::VecDeque::new(),
       most_bytes,
     };
-    let first = guest.next_reply(BOOT_WAIT);
+    let first = guest.next_reply();
     (guest, first)
   }
 
@@ -451,7 +450,7 @@ impl Guest {
       transcript: std::collections::VecDeque::new(),
       most_bytes,
     };
-    let first = guest.next_reply(BOOT_WAIT);
+    let first = guest.next_reply();
     assert_eq!(first, Reply::Ready, "{}", guest.transcript());
     guest
   }
@@ -468,14 +467,30 @@ impl Guest {
     format!("--- the console's last lines:\n{}", lines.join("\n"))
   }
 
-  /// The next reply on the console within `within`, the kernel's and crosvm's own lines kept for a failure's report.
-  pub(crate) fn next_reply(&mut self, within: Duration) -> Reply {
-    let deadline = Instant::now().checked_add(within).unwrap();
+  /// The next line on the console, waited for while the VM's process tree gains CPU (`process_wait::Judged`: the VMM
+  /// and the device processes it forks; the guest's work is their CPU), failing the test with the console's last lines
+  /// once the tree stalls, spends its CPU budget or is gone. Until 2026-11-20 each wait had a wall bound of its own.
+  fn next_line(&mut self, what: &str) -> Result<String, RecvTimeoutError> {
+    let mut judged = process_wait::Judged::of(self.vm.id());
     loop {
-      match self
-        .lines
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-      {
+      match self.lines.recv_timeout(POLL) {
+        Err(RecvTimeoutError::Timeout) => match judged.judge() {
+          process_wait::Verdict::Waiting { .. } => {}
+          gave_up => panic!(
+            "no {what}: the VM's processes are {gave_up:?}\n{}",
+            self.transcript()
+          ),
+        },
+        other => return other,
+      }
+    }
+  }
+
+  /// The next reply on the console ([`Guest::next_line`]'s wait), the kernel's and crosvm's own lines kept for a
+  /// failure's report.
+  pub(crate) fn next_reply(&mut self) -> Reply {
+    loop {
+      match self.next_line("reply") {
         Ok(line) => {
           let parsed = Reply::parse(&line, self.most_bytes);
           self.keep(line.clone());
@@ -489,7 +504,7 @@ impl Guest {
           }
         }
         Err(RecvTimeoutError::Timeout) => {
-          panic!("no reply within {within:?}\n{}", self.transcript())
+          panic!("no reply\n{}", self.transcript())
         }
         Err(RecvTimeoutError::Disconnected) => {
           panic!("the VM's console closed\n{}", self.transcript())
@@ -499,9 +514,9 @@ impl Guest {
   }
 
   /// Sends one command and returns its reply.
-  pub(crate) fn ask(&mut self, command: &Ask, within: Duration) -> Reply {
+  pub(crate) fn ask(&mut self, command: &Ask) -> Reply {
     self.send(command);
-    self.next_reply(within)
+    self.next_reply()
   }
 
   /// Sends one command and leaves its reply unread: a test that kills the VM, or its daemon, while the command runs.
@@ -515,7 +530,7 @@ impl Guest {
 
   /// Asks, and expects [`Reply::Done`].
   pub(crate) fn done(&mut self, command: &Ask) {
-    let reply = self.ask(command, REPLY_WAIT);
+    let reply = self.ask(command);
     assert_eq!(
       reply,
       Reply::Done,
@@ -537,16 +552,12 @@ impl Guest {
     }
   }
 
-  /// The next console line holding `words` within `within`, every line read kept in the transcript: a line the VM's
+  /// The next console line holding `words` ([`Guest::next_line`]'s wait), every line read kept in the transcript: a line the VM's
   /// launcher prints on the same stream (`slates pmem`'s `synced:`), which is no probe reply. A reply read meanwhile is
   /// kept, not answered: a caller expects none while it waits.
-  pub(crate) fn expect_line(&mut self, words: &str, within: Duration) -> String {
-    let deadline = Instant::now().checked_add(within).unwrap();
+  pub(crate) fn expect_line(&mut self, words: &str) -> String {
     loop {
-      match self
-        .lines
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-      {
+      match self.next_line(words) {
         Ok(line) => {
           self.keep(line.clone());
           if line.contains(words) {
@@ -554,10 +565,7 @@ impl Guest {
           }
         }
         Err(RecvTimeoutError::Timeout) => {
-          panic!(
-            "no line holding `{words}` within {within:?}\n{}",
-            self.transcript()
-          )
+          panic!("no line holding `{words}`\n{}", self.transcript())
         }
         Err(RecvTimeoutError::Disconnected) => {
           panic!(
@@ -591,16 +599,21 @@ impl Guest {
   }
 
   /// Waits for an already-requested exit and retains its final stdout/stderr, including errors after the probe replied.
+  /// Waited for while the VM's tree gains CPU (until 2026-11-20 within `QUIT_WAIT`).
   pub(crate) fn wait_for_exit(&mut self) -> std::process::ExitStatus {
-    let started = Instant::now();
+    let mut judged = process_wait::Judged::of(self.vm.id());
     loop {
       if let Some(status) = self.vm.try_wait().unwrap() {
         self.drain(QUIT_WAIT);
         return status;
       }
+      let verdict = judged.judge();
       assert!(
-        started.elapsed() < QUIT_WAIT,
-        "the VM powered off within {QUIT_WAIT:?}\n{}",
+        matches!(
+          verdict,
+          process_wait::Verdict::Waiting { .. } | process_wait::Verdict::Gone
+        ),
+        "the VM powered off: its processes are {verdict:?}\n{}",
         self.transcript()
       );
       pause();
@@ -622,8 +635,11 @@ impl Drop for Guest {
   fn drop(&mut self) {
     if matches!(self.vm.try_wait(), Ok(None)) {
       let _ = writeln!(self.console, "{}", Ask::Quit.encode());
-      let started = Instant::now();
-      while matches!(self.vm.try_wait(), Ok(None)) && started.elapsed() < QUIT_WAIT {
+      // While the VM's tree gains CPU (until 2026-11-20 within `QUIT_WAIT`); one that stays still is killed below.
+      let mut judged = process_wait::Judged::of(self.vm.id());
+      while matches!(self.vm.try_wait(), Ok(None))
+        && matches!(judged.judge(), process_wait::Verdict::Waiting { .. })
+      {
         pause();
       }
       // A VMM may fork a process per device (crosvm does); the group holds them all.
