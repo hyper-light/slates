@@ -82,3 +82,10 @@
   sliced, landing O(changes), push on vcs_share::room seam. Proof: w-interop v2.0.0 cut (36,430 commits, 56MB) then
   git/git, no watchdog kill, RSS per push. Design note (~20 lines) to main after the read (Explore agent surveying
   merge push/work + git store APIs). Worktree ~/slates-work/w-git-land at origin/main 2fb7d49b3 (clean).
+- S3 survey (Explore): blockers for "blobs only in the green": (1) upload-pack/encoding/sparse/hook views read blob
+  bytes via ContentStore::object_bytes(row ContentId); (2) Repository::commit/locate/fresh need every object in Push
+  quarantine; (3) merge has no op setting a path from a held identity (w-perf slice 1b owed); build copies blob bytes
+  into Increment.post_state; one work per ref, not per commit; (4) held table not checkpointed (1c owed); (5) recovery
+  replays recorded pack into ContentStore; paths::put_file copies blobs into ContentStore. Design note owed to main.
+- TOP PRIORITY (main): git/git push spin. Doing: slates-git receive::Deciding (one command a step; decide() = same
+  machine whole) DONE (builds); next server AnswerState::Deciding + hooks path; then seal sliced; then staged commit.
