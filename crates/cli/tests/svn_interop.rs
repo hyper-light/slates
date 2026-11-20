@@ -827,3 +827,78 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh() {
   let svn = Svn::new(&scratch, "trip", vec!["--config-option".to_owned(), tunnel]);
   round_trip(&svn, &format!("svn+ssh://{USER}@127.0.0.1/{REPOSITORY}"));
 }
+
+/// Writes a hook program at `path` that allows what it is asked, as an administrator writes `exit 0` into a
+/// repository's `hooks/` directory, made executable.
+#[allow(clippy::disallowed_methods)]
+fn allowing_hook(path: &str) {
+  use std::os::unix::fs::PermissionsExt;
+  std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+  std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A-622 and A-702 part 2 (`slates repository policy`; `fs-wrap.c` `svn_repos_fs_change_rev_prop4`, a repository
+/// with no pre-revprop-change hook refusing every revision property change). Do: over the svn:// listener, commit
+/// revision 1 as stock `svn` 1.15; change its `svn:log` with no hook; configure a pre-revprop-change hook that allows
+/// (`slates repository policy project --hook pre-revprop-change=PROGRAM`, the owner's verb); change it again; read it.
+/// Expect: the first change refused in svnserve's words (E165006), the verb's answer naming the hook at policy version
+/// 1, the second change taken and the value read back.
+#[test]
+fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
+  if !stock_svn() {
+    eprintln!(
+      "skipping the policy's revprop hook: no stock Subversion 1.15 here (svn on the PATH)"
+    );
+    return;
+  }
+  let instance = format!("svn-revprop-{}", std::process::id());
+  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let port = port_after(&lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port");
+  let Some(issuer) = issuer_or_skip(issuer, "the policy's revprop hook") else {
+    return;
+  };
+  create_repository(&instance);
+  let (id, token) = minted_token(&instance, &issuer);
+  let scratch = Scratch::new("svn-revprop");
+  let svn = Svn::new(&scratch, "revprop", credentials(id, token));
+  let url = format!("svn://127.0.0.1:{port}/{REPOSITORY}");
+  let first = svn.copy("first");
+  svn.ok(&svn.scratch, &["checkout", &url, &first]);
+  put(&first, "first\n");
+  svn.ok(&first, &["add", FILE]);
+  expect_line(
+    &svn.ok(&first, &["commit", "--message", "first"]),
+    "Committed revision 1.",
+  );
+  let change = [
+    "propset",
+    "--revprop",
+    "-r1",
+    "svn:log",
+    "changed",
+    url.as_str(),
+  ];
+  let refused = svn.run(&svn.scratch, &change);
+  let hook = format!("{}/allow-revprop-change", scratch.path);
+  allowing_hook(&hook);
+  let given = format!("pre-revprop-change={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  let changed = svn.run(&svn.scratch, &change);
+  let read = svn.ok(
+    &svn.scratch,
+    &["propget", "--revprop", "-r1", "svn:log", &url],
+  );
+  assert_eq!(
+    (
+      refused.0 != 0 && refused.2.contains("E165006"),
+      (code, out.contains("version: 1"), out.contains(&given)),
+      changed.0,
+      read.trim(),
+    ),
+    (true, (0, true, true), 0, "changed"),
+    "policy: {out}{err}; changed: {changed:?}"
+  );
+}
