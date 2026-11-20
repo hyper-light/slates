@@ -115,3 +115,11 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - NEXT: S2 (merge engine: content history's latest value names the file's block instead of a chunk copy). Then
   S4 server slice. Then bounded parts across entries. push_load re-run after S3 (w-git A-722).
 - Worktree: ~/slates-work/w-perf-a723 (agents/w-perf-a723). Disk this Mac ~44 GB free now.
+- ~11:30Z: found the 747 MB wall = partition SNAPSHOT (db replay.rs snapshot -> anchor publish Snapshot slot), the
+  sum of all retained records; "bounded parts across entries" would not help -> not built. Main ruling (option 2):
+  repository bytes leave the snapshot, become content in the anchor's content regions, entries name identities.
+- S2 handed to w-engine; my notes at progress/w-engine-notes.md (state branch 87a26ad).
+- Design draft sent to main ~11:40Z: vcs ContentStore windows in the shard's chunk arena (A-64 anchor content object),
+  its table in the shard recovery image; git record v3 = names + pack root identity; order: content in arena ->
+  shard image published -> entry commits; recovery: images first, then records; replication content before record.
+  Slices (a) store over arena + image, (b) record v3, (c) svn via S4, (d) replication order. Awaiting OK + A-number.
