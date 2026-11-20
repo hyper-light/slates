@@ -144,6 +144,13 @@ impl LfsObjects {
   pub fn is_empty(&self) -> bool {
     self.index.rows() == 0
   }
+
+  /// Gives back everything the index holds: each object's hold on its content, the rows and their
+  /// tables, as a repository's store is given back with the repository (A-629 part 3). It goes on
+  /// past a refusal and answers the first.
+  pub fn release(self, store: &mut ContentStore) -> Result<(), IndexRefused> {
+    self.index.release(store)
+  }
 }
 
 #[cfg(test)]
