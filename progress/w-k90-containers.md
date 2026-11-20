@@ -16,3 +16,25 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 ## Queue
 1. (=3) A-520 piece 5a: runner facts + probe + engine selection for `container`; 5b: the launch through container::{start,end}.
 2. K8s engine (W10 build order 2-6, g294's notes): needs the re-vendor at contract >= 50.
+
+## Piece 5a (in progress, 2026-11-19 ~22:00 PST): a runner's container facts
+- Split re-decided: 5a = facts only (Engine::Container would be selectable but unlaunchable without 5b); 5b = engine
+  (held from facts, set/asked_of, placement/drain, session marker) + launch through workspace::container.
+- Uncommitted in ~/kiln-work/w-k90-containers-kiln (from main f7ec15878): kiln-ci facts.rs ContainerFacts +
+  ContainerMissing{workspaces,engine,profile,shared_mount,platform} + RunnerFacts.containers; workspace/container.rs
+  facts()/facts_of()/engine_word() + test w9_a_runners_facts_say_whether_its_agents_can_run_in_containers_and_what_it_lacks;
+  runner/probe.rs one line; docs/agentic.md W9 + status row. Committed e73ad6d39 (branch agents/w-k90-containers-5a, local).
+- Test (macOS arm64, this Mac, local): `cargo test --locked -p kiln --lib -- workspace::container wire::ts` 14 passed incl.
+  the new w9 test and bindings_are_current. Merged origin/main (19c0e4160; config.rs, slates_fleet*); re-run in flight.
+- LANDING ROUTE (main 2026-11-19 ~23:50): this Studio has no GitHub creds; `kiln run` on adas-mac-studio-2.local
+  (b24c5c951260dcdfd0972f2aeaf3cf51), cwd = this worktree (synced), `git push git@github.com:hyper-light/kiln.git
+  HEAD:main`, then is-ancestor; retry if main moved. State branch: same, from ~/fanout-state-w-k90-containers.
+  First sync ~670 MB took ~10 min, and main moved meanwhile (push r2 rejected).
+
+## 5b plan (decided by me, tell main): launch first, engine second
+- A container session must NOT reuse harness Isolation (104 sites read isolation.is_some() as microVM): own marker.
+- 5b-i: sandbox::container implementing kiln-seams Boundary::Container{image} over workspace::container (keeper
+  container + `<cli> exec -i -w <workdir>`), unit-tested over stand-ins, unreachable until 5b-ii.
+- 5b-ii: Engine::Container (appended; serde "container"), held from RunnerFacts.containers, asked_of/set (409 when
+  not available), split/drained by session engine, lineage wanted/on_engine, exhaustive matches; image source TBD
+  (Agentfiles are Shards images built on microvm runners only).
