@@ -1421,7 +1421,10 @@ impl ServedForwards {
   }
 
   /// Runs `serve` for the request on `stream_id` as a child task of the loop. `Some(reply)` to send at once when the
-  /// task could not be spawned (an empty reply, counted).
+  /// task could not be spawned (an empty reply, counted). The task is labelled with the line that called this (A-740:
+  /// `#[track_caller]` carries the caller's site into `futures::spawn_child`), so a shard found stuck in one names the
+  /// request it serves, not this helper.
+  #[track_caller]
   pub(crate) fn spawn(
     &mut self,
     stream_id: u64,
@@ -1765,6 +1768,56 @@ mod tests {
         run.step(step);
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod spawn_label_tests {
+  /// A-740's labels through a serve loop's child tasks (w-forming, 2026-11-20; found by use: a 17 ms poll was named by
+  /// the one `forward_lane.rs` line inside `ServedForwards::spawn`, whichever request it served). Do: on a shard, from a
+  /// task there, spawn a request's serve through `ServedForwards::spawn` whose future reads the task the shard's pulse
+  /// says it is polling. Expect it named by the line of this test that spawned it. Before, by the line in `spawn` that
+  /// called `futures::spawn_child`.
+  #[test]
+  // The test thread waits off-shard for what the shard's task reports.
+  #[allow(clippy::disallowed_methods)]
+  fn a_served_forwards_label_names_the_line_that_spawned_it() {
+    /// Shape: how long the test thread waits for the report.
+    const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    let daemon = crate::daemon::audit_daemon();
+    let (seen, label) = std::sync::mpsc::sync_channel::<(u32, Option<u32>)>(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let home = state.shard;
+      let loop_task = slates_rt::futures::spawn(async move {
+        let mut forwards = super::ServedForwards::new();
+        let spawned_at = line!() + 1;
+        let _ = forwards.spawn(1, async move {
+          let named = slates_rt::registry::with_entry(home, |entry| entry.pulse.polling().label)
+            .flatten()
+            .and_then(|label| match label {
+              slates_rt::label::TaskLabel::Site(site)
+                if site.file().ends_with("forward_lane.rs") =>
+              {
+                Some(site.line())
+              }
+              _ => None,
+            });
+          let _ = seen.try_send((spawned_at, named));
+          Vec::new()
+        });
+        slates_rt::futures::yield_now().await;
+        slates_rt::futures::yield_now().await;
+      })
+      .unwrap();
+      slates_rt::futures::detach(loop_task).unwrap();
+    });
+    let (spawned_at, named) = label.recv_timeout(REPORT_WAIT).unwrap();
+    assert_eq!(
+      named,
+      Some(spawned_at),
+      "the serve is named by the line that spawned it"
+    );
+    daemon.stop();
   }
 }
 
