@@ -55704,7 +55704,12 @@ shared with the export's).
   walk refused `Unpublished`, counted once, the volume given back. Refused by kind: a repository nobody made, another
   principal, a git repository, the two ranges in Subversion's words, the green's own name, and a request outside a
   recorded one.
-- **Evidence** (kiln, macOS arm64, Mac Studio d1323898, debug): EVIDENCE_TO_FILL.
+- **Evidence** (w-svn, local, macOS arm64 MacBook, debug, 2026-11-20, over main 57839dd54): `cargo test -p
+  slates-server --lib -- repository::svn_export vcs_store::svn_import` 11 of 11, the two exports side by side byte for
+  byte (`full.dump` 223,752 bytes, `part2.dump` 112,741). Red first: the whole history's export refused
+  `AlreadyExists` naming the part's volume (both minted one fresh id at their walks' end), fixed by minting in the
+  publishing atom. Measured and owed: a unit is a whole revision (60 µs for 195 bytes, 2.4 ms for a 107 KB text,
+  against a 14 µs slice; `image.units_past_budget` 87), so the exporter must resume inside a revision (GAPS).
 - **Owed.** The CLI's and the SDKs' words for the import and the export; the export's volume landed by `slates land`
   as any volume is (no new verb needed); main's runs (clippy, `xtask check`, the doc gate, Linux and Windows builds,
   the mutation red-checks).

@@ -262,10 +262,6 @@ impl ExportJob {
   /// file empty and owned as the root is, and starts the second walk.
   pub(crate) fn prepare(&mut self, state: &mut ShardState) -> Result<(), Refusal> {
     let (length, _) = self.measured.ok_or_else(unreachable)?;
-    let id = match self.volume {
-      Some(id) => id,
-      None => fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?,
-    };
     let chunk = u64::try_from(state.store.content.chunk_bytes().max(1)).unwrap_or(u64::MAX);
     let size = SizeClass::Bounded {
       limit: length.div_ceil(chunk).max(1).saturating_mul(chunk),
@@ -286,7 +282,6 @@ impl ExportJob {
       .chown(store, file, owner.uid, owner.gid)
       .map_err(vfs)?;
     self.file = file;
-    self.volume = Some(id);
     self.piece = usize::try_from(state.config.copy_slice_bytes())
       .unwrap_or(usize::MAX)
       .max(1);
@@ -373,7 +368,14 @@ impl ExportJob {
 
   /// Records the volume, a plain volume of its own, moves it into the registry and publishes it; the reply.
   pub(crate) fn publish(&mut self, state: &mut ShardState) -> Result<ReplyBody, Refusal> {
-    let id = self.volume.ok_or_else(unreachable)?;
+    // Minted here, in the atom that records it, unless its name's alias named it: an id minted at `prepare` was the
+    // next unrecorded one for every export prepared before the first published, so a second export side by side took
+    // the first's id and was refused `AlreadyExists` at its record (measured: the whole history's export of the test
+    // below, beside a part's).
+    let id = match self.volume {
+      Some(id) => id,
+      None => fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?,
+    };
     let admitted = self.admitted.take().ok_or_else(unreachable)?;
     let limit = admitted.volume.capacity_bytes();
     let record = VolumeRecord {

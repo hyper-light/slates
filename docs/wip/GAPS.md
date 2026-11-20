@@ -1902,8 +1902,14 @@
 > `DumpImported`, or `ImportRefused { Subversion }` with Subversion's number, the revision and the path (see A-652 part
 > 3). The export verb (A-652 part 3 continued, 2026-11-20): `ExportDump` writes a range as `svnadmin dump` does into a
 > new volume holding `DUMP_FILE`, walked twice a revision a unit (measured, then written a copy slice at a time, both
-> hashed, a differing second walk refused), the caller landing the volume under a grant. Owed from them: the records'
-> texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> hashed, a differing second walk refused), the caller landing the volume under a grant; landed by w-svn from g268's
+> work, with a fix found by its own test: two exports side by side minted one volume id at their walks' end, the
+> second refused `AlreadyExists` at its record, so the id is minted in the publishing atom now. **Owed, measured
+> 2026-11-20 (debug, this MacBook):** a unit is one revision whole, the exporter writing a revision or nothing
+> (`migration::export`), so a revision's texts are staged whole and its unit is unbounded: against a 14 µs copy-slice
+> budget, a 195-byte revision took 60 µs and one with a 107 KB text 2.4 ms, `image.units_past_budget` 87 over the
+> test's two exports; next piece: the exporter resumable inside a revision, a text a window at a time (§4.17.4 item
+> 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the

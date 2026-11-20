@@ -107,7 +107,8 @@ fn dump_of(state: &ShardState, name: &str) -> Option<Vec<u8>> {
 /// `part1.dump` and `part2.dump`, then ask for revisions 0 to 13 in format 2 into one volume and revisions 4 to 13 in
 /// format 3 into another, under two requests. Expect: both held (acknowledged and deferred); then within the wait both
 /// volumes published, the first's dump file `full.dump` byte for byte (`svnadmin dump`) and the second's `part2.dump`
-/// byte for byte (`svnadmin dump --deltas --incremental -r 4:13`).
+/// byte for byte (`svnadmin dump --deltas --incremental -r 4:13`). The two run side by side, each into a volume of its
+/// own: red when both took one fresh id at their walks' end, the second refused `AlreadyExists` at its record.
 #[test]
 fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
   let daemon = crate::daemon::audit_daemon();
