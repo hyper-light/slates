@@ -5,7 +5,7 @@ name: DIAG w-bugs -- A-551 / A-576 drive tests and A-498's workloads over the Wi
 
 on:
   push:
-    branches: ['diag-w-bugs-win-*']
+    branches: ['diag-w-bugs-race-*']
 
 permissions:
   contents: write
@@ -119,14 +119,10 @@ jobs:
         run: |
           set +e
           out="$RUNNER_TEMP/out"
-          for t in every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows an_exact_drive_keeps_two_spellings_two_files \
-                   names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two; do
-            cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture --exact "$t" > "$out/$t.txt" 2>&1
-            echo "$t exit $? $(grep -E '^test result' "$out/$t.txt" | tail -1)" >> "$out/status.txt"
+          for n in 1 2 3; do
+            timeout 900 cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture --exact a_delete_racing_a_coherent_purge_returns_and_removes_the_file > "$out/race-$n.txt" 2>&1
+            echo "race run $n exit $? $(grep -E '^test result' "$out/race-$n.txt" | tail -1) $(grep -c 'purge race round' "$out/race-$n.txt") rounds" >> "$out/status.txt"
+            "$RUNNER_TEMP/publish.sh"
           done
-          "$RUNNER_TEMP/publish.sh"
-          cargo xtask conformance run --suite workloads --records target/conformance-records --scratch target/conformance-scratch --keep > "$out/workloads.txt" 2>&1
-          echo "workloads exit $?" >> "$out/status.txt"
-          cp target/conformance-records/*.json "$out/" 2>/dev/null
           echo "ended $(date -u +%FT%TZ)" >> "$out/status.txt"
           "$RUNNER_TEMP/publish.sh"
