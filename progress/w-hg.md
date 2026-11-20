@@ -93,3 +93,24 @@
 - Target trimmed: 24 GB -> ~1.3 GB (incremental, release, orphaned *.rcgu.o); disk 78 GB free.
 - QUEUE NEXT: S5 (main's convergence plan; main will send hg's step details), then the server-made hg changeset
   (hg_made::make hook in verbs::judge_submission, per w-shared's seam message), then the inventory list.
+- A-731 (server-made hg changeset: slates-hg push::made, vcs_store::hg_made, Source::Made, HgStore::made, head_of)
+  LANDED main (piece 9ed874650, merge 36c65b2a3). Local: hg 74/74, server `-- hg vcs_store:: repository::` 130/130.
+- NOW: S5 = A-729 (claimed): content once by identity (main's 6-point spec: file texts by identity homed via homes.rs,
+  read via A-727 Cow seam; manifests/changelogs as revlog-shaped deltas, snapshot interval derived; SHGR names
+  identities only; intake rebuilds against stored base; replay re-indexes by identity; proof w-perf's import).
+- A-732 crash-loop fix (record::Replay + record::Writer; recovery replays hg records a revision a unit; import's
+  Stage::Writing) LANDED main (piece 165bcd2a7, merge e7353d339). Bug record docs/bugs/2026-11-20-a-large-mercurial-
+  import-crash-looped-the-daemon.md. Local hg 74/74, server 131/131 (+ flaky git test t_a664_live... passes alone).
+- NEXT (main's order): (2) the whole 57k push over HTTP still spins shard 0 ~183 s in (w-interop, release 1533d52b,
+  RSS 13.9 GB): find the unsliced step (landing/record write/classify), failing test first; then (3) S5 (A-729).
+- A-732 part 2 (push record written in slices before landing: record::Writer::begin_kept, hg_push::record_sliced)
+  LANDED main (piece d8b23d0e5, merge 5a917afcd). Local hg 75/75, server 136/136 (61/61 on landed tree).
+  Still one step: the landing's append of an entry as large as the record -> S5 (A-729) fixes by identity-only records.
+- NOW: S5 (A-729).
+- A-729 part 1 (manifests kept as deltas in the index; delta::encode_lines; HgIndex::revision_text) LANDED main
+  (piece 2a42df233, merge d7713a435). Local hg lib 354/354, server 137/137, cli stock_hg 4/4.
+- NEXT: (1) slice vcs_store::rebuild's replay (post-recovery spin per w-interop rerun); (2) S5 part 2 (SHGR v2:
+  names + changegroup deltas; replay re-intakes).
+- A-732 part 3 (sliced Mercurial rebuild: VcsStores::rebuilding, replay_sliced task; rebuild_whole for git/svn/tests)
+  LANDED main (piece 4fa835b3f, merge 0f756ec77). Local server 140/140.
+- NOW: S5 part 2 (A-729): SHGR v2 = names + changegroup deltas; replay re-takes it through the intake.

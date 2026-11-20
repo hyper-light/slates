@@ -17,5 +17,41 @@ sync:true of the kiln repo to that machine hung (r7, never synced). Runner e3018
    variants boxed, needless borrows, tests'/bench's net::Spec revoked_serials). w10_ proto::tests wire:: 266 passed on
    the merged tree; clippy -p kiln --lib --tests --benches clean.
 4. slates_e2e bare_metal on Windows: code ALREADY ON main (b7720ebca, bare_metal cfg(any(unix, windows))).
-   Windows run BLOCKED: jupiter takes no kiln work; kiln's GitHub CI windows legs build only (no slates_e2e, no WinFsp).
+   2026-11-20 on jupiter (kiln main fa96bcc47, clone C:\Users\corph\.cache\w-k90-vendor-kiln, target
+   C:\Users\corph\.cache\w-k90-vendor-target): `cargo test --locked -p kiln --test slates_e2e --no-run` built (66 min
+   cold); --list holds both bare_metal::g266_* tests. Python 3.13.17 + py launcher installed per-user (winget
+   Python.Python.3.13 --scope user). `SLATES_E2E=1 slates_e2e.exe bare_metal:: --test-threads=1`: 0 passed, 2 failed, both
+   at kiln's runner's own refusal "cannot mount here: WinFsp is not installed: winfsp-x64.dll did not load".
+   BLOCKED (Ada): WinFsp (a machine-wide kernel file-system driver) is not installed on jupiter; not installed by me.
+   To finish once it is: same binary, PATH with the Python Launcher, SLATES_E2E=1, bare_metal:: --test-threads=1.
+   Finding (read, not mine): crates/kiln/src/os/tree.rs:101 `is_fuse` is dead code on Windows (a warning there; a
+   Windows clippy -D warnings would fail).
 Owed (main's): Linux/Windows clippy + tests of items 2-3 (gate), the Windows bare_metal drive once jupiter takes kiln work.
+
+## Next pieces from main (2026-11-20)
+Feedback: tool installs on Ada's machines (even user-scoped Python on jupiter) need Ada's word first (slates CLAUDE.md
+§2 item 14). Item 4 waits on Ada's word about WinFsp on jupiter; target kept there.
+5. kiln: `is_fuse` LANDED kiln main 28ea7df79..90623ee40 (Windows -D warnings no longer reports it; that build still fails
+   on session.rs:5371 `sandbox::container` (hard error) and held.rs:29 unused import, reported). Was: worktree
+   ~/kiln-work/w-k90-vendor-isfuse, branch agents/w-k90-isfuse (from kiln main 68964a93d), uncommitted until jupiter's
+   check: `cargo rustc --locked -p kiln --lib -- -D warnings` on jupiter (kiln run r24, patch applied over 68964a93d in
+   C:\Users\corph\.cache\w-k90-vendor-kiln, target ...\w-k90-vendor-target).
+6. slates A-736 (SSH edge client-gone): LANDED slates main 431b1102..2b1b8106 (2a16c482 red, 028d88bf green, merges
+   a8aee59c + 2b1b8106). vcs_ssh::site::ClientGone (client's bytes read_now'd while a step runs, kept for the session,
+   EOF/reset = gone, past one read peer_closed once); Command::step(gone); git receive answer_step; svn tunnel via
+   HookSite::Tunnel(policy, gone), client left -> E210002. Red: g90 test (false,false); green 79/79; merged tree
+   vcs_ssh vcs_svn vcs_store::upload git_push vcs_http 159/159; fmt clean. amendments.tsv A-736 row (update to landed).
+   A local merge 15453374 had conflict markers in vcs_svn.rs (my marker check covered docs only); never pushed: the
+   landing went from a clean re-merge in ~/slates-work/w-k90-vendor-land (branch agents/w-k90-ssh-gone-land).
+   Run requests (main's): clippy/xtask for slates-server; Windows build of vcs_ssh; a live git push over SSH whose
+   client is killed while a hook runs.
+7. g266 microVM EACCES (main's reorder): FOUND + FIXED. Looped kiln's `SLATES_E2E=1 VM_E2E=1 slates_e2e microvm::g266` on
+   this Studio (kiln 28ea7df79, a local diagnostic in vendored slates logging each Shards stream request): Shards'
+   owner word arrived as SetXattr node 1 uid 0 in the SHORT fuse_setxattr_in (8 bytes) while the stream had kept
+   FUSE_SETXATTR_EXT -> missed, dispatched, errno 95 -> no owner swap -> run uid 200000 refused EACCES. Cause: Linux
+   fuse_setxattr sizes by fc->setxattr_ext at the call, fuse_block_alloc holds it until INIT's reply (kernel.org
+   master, sha256 89203290559bd37a / 29cc467f872b1ef0). Fix A-741: abi::setxattr_head (per-request form).
+   LANDED slates main 2add2964..e0c06750 (b1f68fb9 red, be465b23 fix + merge); kiln recorded change 0002, kiln main
+   5a294413c..81174ac49. Drive: 3/3 first-run failures before, 6/6 passes after (same pin, same bridge sources).
+   Note: claimed A-737 then A-740 by mistake (both taken); A-741 is mine (registry fixed by a remote union rewrite).
+Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word about WinFsp on jupiter (target kept there).

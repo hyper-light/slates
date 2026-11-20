@@ -114,3 +114,29 @@
   slates-svn's lib-test build on main for one push; fixed by 5ff74820f (landed 1d7c602ec). Landed tree: svn 157/157
   (reads/dav/serve), server lib tests compile. Lesson: re-run after the last merge even when only tests changed.
 - NEXT: w-perf's slice 2. My queue: A-702 part 2 waits on w-reaper's hooks piece; A-703 replay/replay-range next.
+
+## A-703 replay/replay-range -- LANDED main 2963b7ad2 (commit 5fd097b10, verified)
+- report::drive::replay (svn_repos_replay2 + path_driver3), serve::replays (streamed, budgeted), fixtures
+  crates/svn/fixtures/replay (svnsync, svnrdump, 6 scripted; recorded on the Studio, moved via kiln code_run).
+- Tests: 31 revisions call for call; every session through a connection (also byte+step a call). Local svn 296/296,
+  server 35/35 on the landing tree (merged with A-730's lock hooks; serve.rs conflicts kept both sides).
+- Run request: live svnsync/svnrdump over svn:// against a daemon vs svnsync.dump / svnrdump-dump.dump.
+- NEXT: A-702 part 2 on A-730's hooks (vcs_svn::run_hook with HookPoint::SvnPreRevpropChange).
+
+## A-702 part 2 revprop change through hooks -- LANDED main 0aaed9b3f (commit f5ab439dc)
+- serve::revprops hands Turn::RevisionPropertyHook; revision_property_hooked (160006 / 160049, whole Record),
+  _landed, _finished; listener vcs_svn::revision_property + tunnel SvnCommand::revision_property (A-736 ClientGone);
+  SvnStores::land_locks -> land_record. Tests: svn 5/5, server 3/3 (hook args/stdin, svn:log read back, no hook 165006).
+- Ledger A-702 row updated (fanout-state e19429d).
+- Run request: stock `svn propset --revprop -r1 svn:log` over svn:// and svn+ssh:// with a pre-revprop-change hook.
+- NEXT (main's bug, 2026-11-20): svnrdump replay-range over git/git spins shard 0 (3596 ms). Root cause read: the
+  listener's go_on loop never yields on Turn::Wrote (Next::Again) or pipelined commands; fix = yield_now per turn.
+
+## replay-range spin fix -- LANDED main a469a6b85 (commit ea468de36)
+- vcs_svn follow(): Next::Again and Next::Consume yield_now before the next turn (SSH edge already yields a step).
+  Listener tests 12/12 on the landed tree. No unit test sees a missed yield; run request: git/git svnrdump dump.
+- NEXT: A-652 export half + lock-expiry by use (g268), then DeltaV v1, review piece 14.
+- Follow-up LANDED main 1fc450f1a (commit aa3a60af1): counter vcs_svn.turns_unyielded (polls_so_far unchanged
+  between turns) + test pipelined_commands_are_answered_one_turn_a_shard_poll (64 pipelined, count 0 both shards).
+  Red [1,68] on a469a6b85's parent, [1,2] on a469a6b85 (handshake turns), so the yield moved to go_on after any turn
+  whose run did not move the shard's polls: red [1,67] without, green 13/13 with.

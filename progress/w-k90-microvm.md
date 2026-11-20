@@ -58,3 +58,18 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   23f066947, log ~/.cache/w-k90-microvm-kvm.log on adacachy. Queued 2026-11-19 22:55 PST (adacachy load ~29).
 - WHP: BLOCKED (jupiter 156 commits behind; kiln can't build itself for Windows).
 - 22:52 PST: this Mac's free disk fell to 17 GB (others' caches); nothing of mine to delete beyond small clones.
+
+## 2026-11-20 ~01:30 PST: piece 2 LANDED on kiln main 3a7e4116c..522ba54b3 (b3e781328 + merges fc299a1f9, 522ba54b3)
+- HVF drive (this Mac): g90_an_agents_share_outlives_its_slates_daemon PASSED (daemon 93483 SIGKILLed, successor
+  34236 served the agent's next write). `--lib sandbox::` 76/77 on the merged tree; the one failure is main's own
+  (windows_path w8_p2, /mnt/c vs /work since af97d9029).
+- g266 fails intermittently with every write of an agent's VM refused EACCES (A-587's symptom): 3 runs on this
+  branch, AND the A/B with no resync channel passed (served.rs returning None) failed the same (Ask agent), so it is
+  NOT this piece's; it passed once at main 60cd0e284. Reported to main as a finding (owner word / kernel attr cache
+  timing suspected, unverified). Logs ~/.cache/w-k90-microvm-logs/hvf-*.log.
+- CAUTION for whoever runs drives here: never run two `microvm::` drives at once on one Mac (I did by mistake once:
+  interleaved logs).
+- Shards D288 awaits Shards' coordinator merge (branch agents/w-k90-microvm-resync-d288); kiln carries it as
+  vendor/patches/shards/0002 meanwhile. Hex change offered as kiln's vendor/patches/hex/0003 (Hex's pin b4db7e69c is
+  on no reachable remote; `vendor.py check hex` owed on a machine that has it).
+- Piece 3: HVF proven (g90 + piece 1's g266 pass); KVM r4 (adacachy, piece-1 tree) still running; WHP BLOCKED.

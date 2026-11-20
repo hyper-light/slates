@@ -49,3 +49,24 @@ register, so it follows owner epochs. The paths are:
 So: hold identity-homed content keyed by content id, outside `held_content`'s object scope (or under an object no
 record, takeover or tombstone ever names), and make the healer's re-offer read only membership and rank, never
 `holder_records`. Then no owner event reaches it.
+
+## w-balance -> w-fed-move, w-fed-faults, w-shared (via main): piece 6's transport, proposed (2026-11-20)
+Built on Q3's answer and landed: `slates_db::identity_homes` (58f756e0a). `homes(identity, members, f)` is the
+rendezvous head keyed by content id. `heal(identity, members, f, held)` offers to the homes that lack the content and
+releases at non-homes only once every home holds it. Neither takes an owner, epoch, record or holder-ledger input.
+The node half (each shard's content store keyed by identity, `vcs_store::homes`, 129cd0d1b + 1729a9c5a) is on main.
+
+Proposed transport (I build it once you agree; it touches `slates_cluster::content` and the record session):
+1. A request kind of its own, `HomeContent { identity, bytes }` / `HomeRead { identity }` / `HomeLetGo { identity }`,
+   beside today's object-scoped content requests, never inside `ContentHold`. Authority is the configuration alone:
+   a member accepts a window only if `homes(identity, members_at_its_config_version, f)` ranks it among the homes, so
+   an owner event can't release it (your Q3 constraint).
+2. Verification at the door: the receiver hashes the bytes and refuses a mismatch typed. No object record is consulted.
+3. Durability: the receiving member keeps the window in its home shard's store (`vcs_store::homes::keep_here`) and
+   acknowledges only after that shard's image holds it (`HomeTicket` + `published`, 9e9cfbd58).
+4. The healer's loop runs per member over the identities its home shards hold, a turn at a time. It calls `heal` at
+   each configuration change only (never per write, §2 ban 10), offering by `HomeContent` and releasing by
+   `HomeLetGo` after every home acknowledged.
+5. A successor's rebuild (w-shared's owed fetch) reads by `HomeRead` from the homes `homes` names.
+Questions: is a new request kind in the record session acceptable, or should it be its own session class? Which of you
+owns `slates_cluster::content`'s request enum?

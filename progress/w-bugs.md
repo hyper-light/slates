@@ -100,3 +100,47 @@
   settle_pending gets the saved open from either. Failing test first: pure relief module over generic Port/Station,
   model driver whose kind-8 send blocks until a nested request is answered (red with today's single receiver).
   Residual: R stuck in its own send is not relieved (bound 2).
+- B3 LANDED A-725 main c22dce946 (commit 0f5591c03, one commit + merge): relief receiver (bridge-winfsp
+  inflight/relief.rs), two journal regions, server RELIEF_BEAT = HEARTBEAT_NS; fsx judge counts the port's extensions;
+  fsx-seed-1 line struck; bridge-winfsp Windows test support fixed (A-551 Mounted::new, A-460 handoff section).
+  Evidence: red/green on Mac (10.1 s timeout -> 0.03 s); CI b3-11 x64+arm64 fsx PASS, winfsp_semantics/cli winfsp
+  pass; lib-fix-1 127 vs lib-control-1 126 (only failure both arms: A-576 upcase table, 109 units differ).
+- FOUND (pre-existing, not mine, next item for me after B14): host::upcase_table::the_volumes_upcase_table_is_the_systems
+  fails on Windows x64+arm64: 109 code units where Windows' upcase table differs from the published exFAT table
+  (e.g. 023A: volume 2C65, system 023A). A-576 part 1's owed Windows check; A-576 said: take the system's table.
+- jupiter: no NASM -> server builds need AWS_LC_SYS_PREBUILT_NASM=1 there (check builds only).
+- Slips this stretch: a retry loop with a `git reset --soft` fallback (never ran); noted.
+- Next: B14 (takeover-kept files at a real Linux mount's end, test gap), then the upcase table, then bug-claims open.
+- A-737 (claimed; Windows' own upcase table) on branch agents/w-bugs-a737 (wip bfdc82eed, worktree ~/slates-work/w-bugs-a725
+  which also carries B14's wip test commit -- land each from its net diff). Windows' table dumped on CI x64 build 26100
+  + arm64 build 26200 (identical, 973 mapped, no many-to-one: final sigma kept apart; diag-w-bugs-upcase-1). vfs
+  upcase/names 9/9, bridge-winfsp normalized 7/7 on Mac. Windows check run: diag-w-bugs-lib-737 (pending).
+  Slip: a sed renaming A-726->A-737 hit another agent's A-726 refs in crates/svn + cli test; restored from HEAD by
+  `git show HEAD:path > path` before any commit.
+- B14: new test a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends FAILS in green too
+  (CI ubuntu kernel 7.0: 1,048,576 B stay referenced after lazy unmount + close; red arm the same). Hypothesis: an
+  ordinary FUSE mount's end (no FUSE_DESTROY) never sweeps the attachment's restored lookup references
+  (end_attachment only ends the takeover holder; sweep_attachment only from FUSE_DESTROY). diag-w-bugs-b14-green-2:
+  status at the end + the same without a takeover.
+- A-737 LANDED main 2a80ea399: Windows' own upcase table (973 units), Windows check passes on both arches.
+- B14 = REAL BUG, shown by use (diag-w-bugs-b14-green-2, CI ubuntu kernel 7.0): a file unlinked while open on a FUSE
+  mount that then ends by lazy unmount + last close stays referenced forever (status: attachments 0, no takeover_kept,
+  referenced_bytes 1,048,576), WITH OR WITHOUT a takeover. Cause: nothing sweeps a FUSE attachment's references at an
+  ordinary end (no FUSE_DESTROY; only virtio-fs/NFSv4 call sweep_attachment); end_attachment only ends the takeover
+  holder. Fix: end_attachment sweeps RefOwner::Attachment(record.id) (sweep_attachment ends the holder too).
+- A-739 (B14's fix) wip on agents/w-bugs-a739 (worktree ~/slates-work/w-bugs-a739): end_attachment sweeps
+  RefOwner::Attachment(record.id); new cli test a_file_an_ended_mount_held_is_given_back + the takeover one. Mac:
+  server --test attachment_term 4/4, attach_forms 9/9. CI: diag-w-bugs-a739-green-1 vs -red-2 (red-1 was identical to
+  green: sed missed the reflowed call).
+- A-739 LANDED main 137bf3633 (commit c468b1309): B14 built; found + fixed: an ordinary FUSE mount's end swept nothing
+  its kernel held (end_attachment now sweeps the attachment). CI ubuntu red/green shown.
+- bug-claims: junction tests (fixed 2359d2550) and Windows landing w/o link privilege (passes on jupiter) marked.
+- Next candidates (by use): six fleet tests on jupiter (line 39); B5 arm64 WinFsp open/close 4 ms; B15 triage
+  (winfstest 382 entries now runnable); hangup test flake (line 87).
+- B15 ANSWERED (no code): every reviewed-list entry has a stated reason; winfstest on CI both arches (diag-w-bugs-b15-1)
+  733 cases / 351 pass / 382 fail all expected. Line 39 (six fleet tests on jupiter): load/oversubscription, already
+  handed to owners; not reproduced by me (would need whole fleet suites).
+- Next: B5 (WinFsp arm64 open/close 4-5 ms) by use on CI arm64.
+- B5 in flight: diag-w-bugs-b5-1 (both arches): a written file's open+close via PowerShell: arm64 NTFS 73 us, WinFsp
+  memfs 190 us (no 4 ms on the platform's own sample FS); x86_64 NTFS 51 us, memfs 123 us. The slates half failed
+  before timing (unknown step); b5-2 logs each slates step.

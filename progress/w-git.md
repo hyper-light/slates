@@ -89,3 +89,39 @@
   replays recorded pack into ContentStore; paths::put_file copies blobs into ContentStore. Design note owed to main.
 - TOP PRIORITY (main): git/git push spin. Doing: slates-git receive::Deciding (one command a step; decide() = same
   machine whole) DONE (builds); next server AnswerState::Deciding + hooks path; then seal sliced; then staged commit.
+- A-719 part 4 (decision a command a step) LANDED main c9100be04 (e4f2aeaf7). A-645 hook view moved to w-reaper; SSH
+  client-gone to w-k90-vendor. Stay on A-722: staged index rows as objects land (append only makes visible), moves'
+  admission + seal sliced, landing O(changes), vcs_share::room seam. Design note (~20 lines) owed to main.
+- A-722 design note SENT to main (staged index in a per-push Index::fork; positions reserved at pack header
+  base+pack-index (holes question); non-commit rows staged at keep; commit rows + generations in sliced pass after
+  pack; moves' admission sliced pre-append; landing = new Index::adopt (O(runs)) + staged values; stale fork re-base;
+  admission window+post-state on vcs_share::room; blobs-as-green-ops later, blocked on w-perf 1b/1c + green blob
+  source). Awaiting objections; meanwhile checking readers' tolerance of position holes (Positions, upload runs).
+- MAIN APPROVED A-722 points 1-7; point 2 change: readers tolerate position holes (fix any dense-assuming reader,
+  e.g. hook_view units.rs cover over Positions::span(0,next_position)); NO compaction at landing. Point 8 reframed
+  (ruling B): index resolves oid -> (pack identity, offset); upload/encoding/sparse decode from stored pack in place;
+  head files from the green; ContentStore::object_bytes inflated copy + put_object go away. Build 1-7 first, then 8.
+  Piece order: (a) slates-vcs Index::adopt (+ parent epoch / stale check) ...
+- A-722 part 1 (slates-vcs Index::adopt) LANDED main de9591c70 (adfe74896). Next A-722 part 2: positions taken as each
+  object arrives + readers tolerating holes (hook_view units.rs cover, text.rs depth loop, any 0..next_position user);
+  then part 3: rows staged into a per-push fork at keep time (git store Push/Repository API), commit rows + generations
+  sliced after the pack; part 4: moves' admission sliced; part 5: landing adopts fork (O(changes)) + stale re-base.
+- Main additions to A-722: (1) after part 3, intake on the ARRIVAL shard (fork there; decode/hash/check there; only
+  the landing's adopt on the owner via cross-shard message); placement-policy fn from w-balance (kiln id
+  01a1f7b42ec27702a195501719d3f919 / inbox) — agree the seam. (2) Concurrency proof: 19 then 100 concurrent pushes to
+  one repository (v1.5.0 cut kills daemon at 19 today; run-requests.md), no watchdog kill, every push answered.
+- A-722 part 2 in progress (w-git-land, uncommitted): rows lose green/version; Repository::landings map +
+  bringer_of(position); upload + hook_view units switched; store tests fixed. Running git tests.
+- A-722 part 2 (rows w/o green/version; landing map bringer_of) LANDED e42c53886 (c1aa1a5b1). Next part 3: stage rows
+  into a per-push fork as objects land (positions at arrival; commit rows + generation sliced after pack), landing
+  adopts the fork. Then concurrency (19/100 pushes) and arrival-shard decode (w-balance seam).
+- TODO after part 3: t_a665 hook tests wait on push's own answer with deadline derived from shard step time x steps (like w-shared da4dc2ff0), not fixed PUSH_WAIT_NS.
+- A-722 part 3 in progress (w-git-land, uncommitted): Push.Staged (fork, positions, commits, whole); Repository::stage
+  / stage_commits / stage_room / commits_room; commit adopts fork when adoptable else legacy (holes); hook_view cover
+  skips holes; vcs Index::adoptable + fork_room; server GitPush admit_all stages (lends rows room), seal stage_commits.
+  slates-git store tests green incl. 2 new; server tests being run.
+- A-722 p3 design refined: tentative positions (base = next_position at fork, no holes); ONE landing path: commit
+  adopts the staged fork when adoptable, else restage() (fresh fork, arrival order) then adopt -> repository index
+  keeps no tail, so fork timing never changes tables and log replay matches. Replay stages too (InOrder keeper keeps
+  resolution order); intake Queue keeps resolution order. Removed legacy fresh/positions_for/rows_for/insert.
+  A-639 by-type positions given up (arrival order) -> flag to main to measure fragment-set runs.

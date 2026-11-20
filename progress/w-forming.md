@@ -25,6 +25,28 @@
   measure(--quick) (pre-banner profile measurement, role/daemon.rs start()) past START_WAIT 30 s; control-shard beats
   of a gapped 3-5 s = host starvation while rp1 ran beside the throttled sweep. Stopped rp1. sw48 runs 1-21 overlapped
   rp1 (contaminated); plan: sweep finishes, then 21 clean runs (tag sw48b) -> 48 clean. Then resume the run-7 chase.
+- ~09:00Z sw48 run 25 HUNG 30+ min: fresh member a's `volume list` client stuck in rendezvous Claim::wait; the live
+  bootstrap object had all 64 slots free (read via shm at the hang) -> claim stranded in the predecessor's unlinked
+  object while the successor held the owner name. Evidence ~/.cache/w-forming-runs/sw48-25-evidence/ (samples).
+  Also in run 25: two daemons watchdog-killed (exit 4: shard 0 spinning 5.7 s CPU without a step) under the throttle --
+  reported, not chased. Killed run 25 (counted FAIL), sweep continues on pre-fix main.
+- LANDED A-735 727ebe674 on origin/main (verified merge-base): ipc Claim::look made_again() reads its own slot (pid+start)
+  in the object under the name; red 2.000 s -> 178 us; ipc --lib rendezvous:: 16/16, --test rendezvous 14/14, fmt.
+  Landed from ~/slates-work/w-forming-repro (main ff'd), not the wip branch. Ledger row A-735 pushed first.
+- ~09:40Z sw48 run 26 hung the same way (fresh b's `status` client in Claim::wait, pid absent from the live object):
+  A-735 again on the pre-fix build. Stopped sw48 at 24/26 PASS (16 = start starvation beside rp1; 25, 26 = A-735).
+  Started sw48c: clean 48 on exact origin/main 69d1f2ec3 (has A-735), built from ~/slates-work/w-forming-repro,
+  taskpolicy -b, nothing of mine beside it (another agent's g227 suite loop does run on this Mac). Bg task bff43ui5h.
+- sw48c run 21 FAIL after forming (formed, fresh b rejoined 37 s): new owner d served the volume after 19.7 s of takeover (6254 writes acked), then its shard 0 spun 5628 ms CPU without a step -> watchdog exit 4 -> a write unanswered 40 s (live_chaos.rs:1779). Same spin as run 25: on a successor owner right after a takeover. Log ~/.cache/w-forming-runs/sw48c/run-21.log (diagnosis printed).
+- DONE sw48c (09:41Z end): formed+settled 48/48, fresh member rejoined 48/48, test 47/48 (run 21 = takeover spin).
+  GAPS line landed 2add29641 (verified on origin/main). Reported to main for the forming goal.
+- ~10:50Z rp2 started: 40 runs throttled on agents/w-forming-repro (c685be2eb = origin/main + settled_holders diagnosis aid), spin-sampler on, A-740 (main) names a spinning task in the watchdog line. bg b420ae1gd, logs ~/.cache/w-forming-runs/rp2.
+- main: forming goal met at 143/143 formed-and-settled on main with A-735 (1-in-48 stall shows with 95% odds). Count: sw48c 48 + rp2 (up to 40) + rp3 (55 more, same flow, throttled, sampler on) -> then add the combined count to the GAPS sweep entry.
+- Queue after sw48c: run-7 stall chase; then run-25 spin (main 2026-11-20: name the unsliced task, fix failing-test
+  first or hand main its location). Tool: ~/.cache/w-forming-scripts/spin-sampler.sh <runs-dir> samples every chaos
+  daemon on a >=300 ms poll line; use with repro loops only, never during evidence runs.
+- (old) NEXT: when sw48 ends, rebuild on current main (with A-735) and run a clean 48 (tag sw48c, taskpolicy -b, nothing
+  beside it) = the goal evidence; then GAPS line + report. Run-7 chase after that (diag aid on agents/w-forming-repro).
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
   test, fix, land (needs a machine that can push). No failure -> report count to slates-7a.

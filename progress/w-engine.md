@@ -70,3 +70,37 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   A-728's entry in the amendment log; I used `git checkout --ours` once to resolve a conflict (banned; no harm: only
   my own two files).
 - NEXT: part 3: svn_scale.sh 1,000 revisions before (e71043ff6, pre-A-728) and after (origin/main), BENCHMARKS.md.
+
+## Part 3 (measure) in progress
+- Before = main 99ecba1b1 with crates/merge/src/{history,dims,engine,engine/branch,engine/reanchor}.rs from e71043ff6
+  (only A-728 and a test lint touched them since): worktree ~/slates-work/w-engine-before. After = main 99ecba1b1.
+- Method: ~/.cache/w-engine-bench/mem.sh (w-perf's mem.sh + MallocStackLogging + malloc_history -allBySize) on
+  ~/.cache/w-perf/data/git-1000.dump (read only); classify.py sums stacks through slates_merge::history.
+- FINDING (reading w-perf's mh-1000.txt): the "234.8 MiB" of the brief is NOT history chunks: of Green::commit's
+  285.1 MiB, 50.3 MiB is history (Value::whole, flat 250->1000 since the service folds) and ~226 MiB is the new file
+  bytes built in commit/apply that become the file blocks (the current files). Expect A-728 to save ~50 MiB here.
+
+## Part 3 LANDED -- S2 DONE (queue empty)
+- 4aad39d29 (merges to 52c1d8af5), confirmed on origin/main. BENCHMARKS.md "A green's history names the file's block":
+  history 50.3 -> 2.0 MiB, Green::commit 285.1 -> 200.0 MiB (-85.1 MiB, 30%); footprint 2.5 -> 2.4-2.5 GB (rounding).
+- Scratch: ~/.cache/w-engine-bench (binaries, runs; deletable), ~/.cache/w-engine-target, ~/.cache/w-engine-clone on
+  studio-2. Worktree ~/slates-work/w-engine (at main).
+- Open for main (not mine to decide): the history retention figure (admission) counts a first small edit's earlier file
+  as current, as it did before A-728; honest accounting would charge it until a fold.
+
+## Rulings of 2026-11-20 (main): 1 honest charge LANDED 529144e79; 2 stack oracle fix LANDED 183604041 (merge 2103b1177)
+- 2: 3/30 failed on main (A-728 did not fix it; earlier 0/10 was chance). Cause: a delete between makes two inserts one
+  in the green's order (design's answer); the oracle's bottom branch was too strict. 0/30 after; regression test named.
+- 1: measured delta at rest on the 1,000-rev import = 0 (committed 646,696,917 both; history folded as it imports).
+  Owed: slates status --json prints no retained_bytes.
+- 3: ranked table sent: inbox/w-perf-from-w-engine.md. Biggest: ~850 MiB freed-but-retained malloc pages.
+
+## A-742 LANDED (main's item 1 of 2026-11-20 ~09:30): e064c2dc7, merge 80a7d5788
+- Cause found: the import made/freed 4,188 MiB in 698 blocks >= 1 MiB (encode growth, clones, decode-after-encode,
+  checkpoints, a 179.7 MiB snapshot); macOS malloc kept ~896 MiB as "(empty)" regions. pressure_relief released 0.
+- Fix: slates_mem::large global allocator (>= 64 pages mmap/munmap) + Wire::encoded_len/to_bytes reserve + derive,
+  Db::mutate_owned, Checkpoint::into_encoded exact, chain entries reserve bound, Increment::encoded_len.
+- Measured: 2,417-2,551 -> 1,431-1,495 MB, time same. status --json: retained_bytes, mem.large.*.
+- Item 2: design note inbox/main-from-w-engine-greens-in-pool.md (premise corrected: greens hold files only in the
+  engine; 241.5 MiB = 48.2 MiB current + ~193 MiB history); waiting for main's call before code.
+- Scratch kept: ~/.cache/w-engine-bench/*.sh, *.py (profile tools). Delete when item 2 is decided.

@@ -1,5 +1,44 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: successor's sliced rebuild dae3f979e (main af3551739). NOW: A-626 part 4: WorkOp::Copy (client verb) over
+  VolumeOp::Copy (merge increment.rs:184) / LoggedOp::Copy; then svn_made copy-from rows; A-697; A-658 3c.
+
+## NOW (main): slice make_whole (successor's rebuild, takeover::rebuild_repository) via vcs_store::rebuild; then A-626 part 4
+  (WorkOp::Copy over VolumeOp::Copy/LoggedOp::Copy), svn copy rows, A-697, A-658 3c. Pack-record turn -> w-git; flaky fetch -> w-perf.
+
+## LANDED 2026-11-20: git/svn sliced rebuild adb33875d (main 7efceb67b). NOW: A-626 part 4 (the WorkOp that makes a copy;
+  read GAPS' A-626 entry), then svn_made copy-from rows, then A-697, A-658 3c.
+
+## QUEUE (main 2026-11-20): git/svn sliced rebuild (NOW) -> A-626 part 4 myself (the WorkOp that makes a copy; engine
+  CopyTree parts 1-3 on main; read GAPS' A-626 entry) -> svn_made copy-from rows -> A-697 (a)-(f) -> A-658 3c.
+
+## NOW (main 2026-11-20): git/svn sliced rebuild, sibling of w-hg's A-732 part 3 (main 0f756ec77, VcsStores::rebuilding):
+  vcs_store::rebuild/make_whole for git and svn as a task replaying a record a turn; failing test first (a rebuild of a
+  many-object store on a running daemon advances a step a turn). Then A-697, A-658 3c. Reported homes test flaky (w-balance).
+
+## LANDED 2026-11-20: svn symlinks 015f15b5f (main f771ede60). svn copies BLOCKED: no WorkOp copy (A-626 part 4) - told main.
+  NOW: queue item 5, A-697 (a)-(f) then A-658 3c (briefs/g305.md, progress/g305-merge-anywhere.md).
+
+## LANDED 2026-11-20: parked-wait bound 968c90093 (main 92bc438bf). (a) complete. NOW: svn_made copies (copy-from rows), then
+  symlinks (svn:special). Then A-697 (a)-(f), A-658 3c (briefs/g305.md, progress/g305-merge-anywhere.md). Target dir was wiped
+  clean for disk (90 GB free then).
+
+## LANDED 2026-11-20: flaky fix 1d4aeb63d (da4dc2ff0); push storm 6ad42c7a4 (c0071e402). NOW: parked submit's wait bounded by
+  the derived failover delay (state.failover_ns, as base_wait), typed refusal past it. Then svn copies, symlinks; A-697; A-658 3c.
+
+## LANDED 2026-11-20: (a) part 2 owed commit = 311e4a235 (main 602983873). NOW: fix flaky t_a664_live_a_pushs_whole_map_is_built_
+  in_slices (slice count depends on step budget timing; make settle's budget 0 -> deterministic), 20 loaded runs. Then push
+  storm, parked-wait bound, svn copies, symlinks.
+
+## MAIN ORDER 2026-11-20: 1 (a) part 2 owed commit; 2 push storm: one build per green, a mid-build push hands its change to
+  the running build (or moves to newest head once at a slice boundary), never restarts; RESTARTED counter asserted 0 under a
+  50-push storm test; 3 parked submit's wait bounded by the derived failover delay, typed refusal past it. Then svn copies,
+  symlinks; A-697; A-658 3c.
+
+## LANDED 2026-11-20: (a) push half = cd302e110 (main 777022f2a). NOW: (a) part 2, the owed commit (main's 3 requirements:
+  replay reads no clock + determinism test crash-after-staging recover-twice same ids; completion settles owed in the
+  same transaction; one owed per green, parked, typed refusal at bound). Then svn copies, symlinks. Then A-697, A-658 3c.
+
 ## (a) PUSH HALF DESIGN (in progress, worktree ~/slates-work/g261-a636p2b2, nothing committed yet for it)
 - New child module crates/server/src/vcs_store/paths/whole_build.rs (child of paths: uses Plan::Put, made_holding,
   give_back, git_file, map_path, put_file, count, BUILT). Builds(BTreeMap<green, Build>) in VcsStores.whole_builds.

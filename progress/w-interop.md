@@ -150,3 +150,30 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   15 server files were pushed before checking (slip, told main); post-hoc run on main 67920ccf8 green (svn 137, server
   117, svn_interop 5/5). Piece 6 DONE.
 - Next: git + hg matrices on main 67920ccf8 (A-719 p1, 765a19ccc, A-720 p2b landed).
+
+## Piece 7 (main ~10:00Z): interop on other platforms -- Windows (jupiter f766f09294f2e17e3b8a631ffd4e6a4b) first, then Linux
+- git matrix on main 67920ccf8: v2.0.0 cut push still spins shard 0 (3554 ms), daemon killed; hg whole re-running (r49).
+- jupiter: git 2.56.0.windows.2, OpenSSH, cargo 1.99, uvx (hg 7.2 via uvx), NO svn (not installing without Ada).
+  Clone C:\Users\corph\.cache\w-interop\src, target C:\Users\corph\.cache\w-interop-target. r50: git_interop +
+  svn_interop on Windows (background).
+- r51 release hg push (main 1533d52b): killed at 183 s (shard 0 spins 1093 ms > 1051 ms window), daemon peak RSS
+  13,861 MiB, matrix 17/24. Reported to main for w-hg. Release target ~/.cache/w-interop-release-target (Studio).
+- r50 Windows git_interop+svn_interop building on jupiter.
+- LANDED 4997b707f: svn matrix svnrdump + svnsync rows (byte-identical with fixtures on the reads repo, 29/29; git-2000
+  svnrdump spins -> w-svn). Reported.
+- r55: release hg whole push on main (A-732 p2, 5a917afcd+) with RSS sampling. r50: Windows interop on jupiter still
+  building (first Windows build is long).
+- r55 release hg push on 4997b707f (A-732 p2 in): killed at 194 s (spin 1080 ms), RSS 13,450 MiB, nothing durable;
+  restarted daemon spun again after recovery; matrix 17/24. Reported.
+- Windows: git_interop/svn_interop/cli.rs are #![cfg(unix)] -> 0 tests on jupiter. Proving by use: r57 builds
+  slates.exe + git matrix (v1.0.0 cut) under MSYS bash. Porting the interop tests to Windows = later piece.
+- Revprop row (A-702 p2) BLOCKED: no CLI verb sends SetRepositoryPolicy; proposed `slates repository hooks NAME --hook
+  POINT=PROGRAM` to main; will start it after r57 unless told otherwise.
+- svnrdump spin: w-svn fixing (listener never yields while client drains); re-run row when it lands.
+- svnrdump row green (r58, main 0f756ec7 w/ a469a6b85): 72 MB in 14 s, matrix 29/29. Reported.
+- Policy verb (piece 8, owner main): scratch agents/w-interop-policy (ac5b63c03): ipc DescribeRepositoryPolicy +
+  ReplyBody::RepositoryPolicy (appended; wire_order publish pending r59), server repository::describe_policy +
+  wire_* converters + test a_repositorys_policy_is_read_and_set_by_its_owner_alone, client describe/set +
+  RepositoryPolicy type, cli `repository policy NAME [--hook POINT=PROGRAM]...` + grammar test, svn_interop test
+  a_repository_policys_hook_lets_stock_svn_change_a_revision_property. NEXT: apply wire_order.txt diff from r59, land,
+  then revprop matrix row (svn:// + svn+ssh), then branch verbs.

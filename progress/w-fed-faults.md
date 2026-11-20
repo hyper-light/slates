@@ -1,9 +1,23 @@
-# RESUME HERE (2026-11-20, Mac Studio d1323898; supersedes everything below)
-- QUEUE DONE. PIECE 1 LANDED kiln main 30c5929 (A-580 harness on every Unix + kiln-answer pointer fixes).
-  PIECE 2 LANDED kiln main e33c470 (A-708: [slates_fleet.binds] -> manifest bind; relay flows slow lossy link and
-  runner cut off). Both: macOS arm64, Mac Studio, local; flows owed to main on Linux (run-requests.md).
-- IN FLIGHT: kiln run r9 (needs linux/amd64; queued behind adacachy's strain): first Linux build + SLATES_FLEET_FAULTS=1
-  run of the six flows from ~/slates-work/w-fed-faults-kiln-clone @ e33c47001. On its end: fix what fails, land.
+# RESUME HERE (2026-11-20 ~03:30 PST, Mac Studio d1323898; supersedes everything below)
+- LANDED: kiln 30c5929 (A-580 harness), e33c470 (A-708). Linux run r9 STOPPED (old code; re-queue after A-734 lands).
+- IN FLIGHT, piece A-734 (claimed, ledger row "in progress"), worktree ~/slates-work/w-fed-faults-p3 (branch
+  agents/w-fed-faults-p3 off kiln main e33c470, uncommitted), target ~/.cache/w-fed-faults-target:
+  1. tests: Fault::{Signal,Link} gate (link flows run on macOS), lab end unmounts Slates mounts before ending instances,
+     runners started with their harness (common::Fleet::start_runner_harnessed; --no-terminal started no Slates),
+     agents.start workspace "volume", writes at volume root, fleet_seen/read_refusals diagnostics, until_one_fleet proof,
+     pre-cut control read through survivors.
+  2. kiln: slates_fleet::short_of + join waits for 2f+1 in the directory (found by use: 3 runners wrote 3 one-node
+     manifests). Unit a734_a_manifest_waits_... red then green. PROVEN by use: one fleet of 3, records cross the relay.
+  3. kiln (main's ruling): one-time bootstrap. migration 20261120-0900_slates_fleet_bootstrap.sql; slates_fleet::
+     bootstrapper/ask_bootstrap_on (claim recorded first, bound to machine, done never again) + POST
+     /api/agents/slates-fleet/bootstrap + ensure_up asks after report_member, ensure_group, says done. Unit
+     a734_kilns_slates_fleet_is_bootstrapped_once_... Lab has no operator step.
+  OPEN FINDING (by use, macOS, seed 0x522bdda8): with fleet-a cut off, survivors served 0 of 8 acknowledged files in
+  900 s. Diagnosing (logs ~/.cache/w-fed-faults-logs/p4-cut.log): replication-at-seal vs no takeover vs read path.
+- Answered w-balance Q3 (inbox 2cf8325).
+- Ship route: kiln run on adas-mac-studio-2.local (b24c5c95...), cwd ~/.cache/w-fed-faults-ship (land.sh, state3.sh,
+  inbox.sh, claim.sh).
+
 - Earlier: Worktrees ~/slates-work/w-fed-faults-a708, -a708land deletable; target ~/.cache/w-fed-faults-target.
 - PUSHING: this Studio has no GitHub credentials (HTTPS none; ssh agent hangs). Land via kiln `run` on
   cec37f60f22c5a60d27f08f4d2e5daa8 (or 2768d0d5...; both have GitHub SSH) with cwd ~/.cache/w-fed-faults-ship (a tiny

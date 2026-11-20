@@ -16,9 +16,43 @@
   answer_hook + land async; svn Pending::lock_tokens). Tests vcs_svn 7/7 (+2), svn_hooks/vcs_hooks/hook_driver/vcs_svn
   58/58, svn commit::/serve:: 90/90. Test hook scripts are warmed once (macOS assesses a new executable 0.16-0.29 s at
   its first exec -- NOT a driver latency; an earlier "finding" withdrawn).
-  NEXT part 2: svn:// lock hooks: pre-lock per path (token from stdout), post-lock once; pre-unlock per path,
-  post-unlock once -- split serve/locks.rs lock_verb/locks_landed so the server can run hooks between judging and
-  answering. Then part 3: svn+ssh:// (vcs_ssh/svn.rs). Worktree ~/slates-work/w-reaper-a730 (branch w-reaper-a730).
+  A-730 PART 2 LANDED: main 25494f2 (merged 8096c3b): svn:// lock/unlock hooks; svn serve lock verb = 4 calls
+  (lock_verb -> LockHookCall, lock_judged(PreHooked), locks_landed -> post call, locks_finished). vcs_svn 10/10.
+  A-730 PART 3 LANDED: main af59477 (merged 1533d52): svn+ssh:// tunnel runs the same hooks (vcs_svn::run_hook with
+  HookSite::Tunnel; pre_lock_hooks/post_lock_hook shared). 135/135 focused. A-730 DONE; told main so w-svn can build
+  A-702 part 2 (revprop change) on vcs_svn::run_hook (HookSite, Hooked::new, svn_pre/post_revprop_change builders).
+  Owed (GAPS): SSH edge client-gone signal for a hook run; DAV's hooks; REPOS as A-645's FSFS view.
+  NEW QUEUE (main): (1) DAV hooks -> A-733 LANDED main bad0841 (merged 431b110): DavCommit begin_hooked/resume_begin,
+  merge_hooked/resume_merge; SvnStores::begin_commit returns Due; exchange POST/MERGE/LOCK/UNLOCK async with
+  HookSite::Http(ClientGone, policy); post-lock/unlock failure counted, never told. Tests daemon_edge a_dav_* 3/3,
+  focused 101/101 + svn 171/171, stock svn HTTP on Studio-1 4/4.
+  (2) A-645 hook view: SCOPED, reported to main for a ruling (2026-11-20). Findings:
+    - design (A-665 part 3 / GAPS): view = read-only volume whose base host reads the repo's content store, shown under
+      the root mount (D-1). But: (a) the daemon publishes no root mount (SLATES_ROOT must be named; design 33585 owed),
+      so no path to present at; (b) a HostFs is called inside the volume's borrow and cannot reach ShardState's
+      vcs_stores, so a lazy view host needs either A-727 a2 (VCS content in the shard chunk arena: a RAM volume
+      referencing the same chunks, content once) or a RAM copy of the view (doubles memory for the hook's life).
+    - svn's view = FSFS format 6 (physical addressing, sharded): per-revision rev files (node-revs with node/copy ids,
+      pred/count, copyroot; dir reps naming children by r<rev>/<offset>; changed-paths; trailer), revprops, current,
+      format, uuid; plus transactions/<txn>.txn for `svnlook -t`. Offsets chain across history -> derived data per
+      revision. Multi-part: (P1) FSFS rev/revprop generator + stock svnlook oracle on Studio-1; (P2) txn dir for -t;
+      (P3) presenter (needs (a)+(b) decided); (P4) git presenter replacing Unpresented.
+  (3) Linux run of hook tests: queued on adacachy (kiln run r15, "no room here now"); starts by itself.
+  RULING (main): placement (b) now, then (a) after P4; bytes (a), wait for A-727 a2, never copy. Go P1+P2 now.
+  A-738 P1 LANDED: main 210843f (merged): slates_svn::fsfs (FSFS 6 view: View::advance a revision/step under a
+  node-revision budget, View::revision_file generated on read, texts streamed; revprops/fixed files/dirs), Index::created_in.
+  Test crates/svn/tests/fsfs_view.rs 3/3; on Studio-1 (kiln on adas-mac-studio.local-2 = d1323898, stock 1.15.0):
+  svnadmin verify ok, dump == full.dump, dump --deltas == deltas.dump, svnlook changed == changed.txt.
+  A-738 P2 LANDED: main a75731c (9143016): fsfs::transaction_files from Index::trial (Trial::made/node_revision
+  added); node.<n>.<c>(+.props/.children), props, next-ids, changes, txn-protorevs/<txn>.rev streamed. Oracle on
+  Studio-1: each golden revision's work tried on R-1 -> svnlook -t == svnlook -r (changed/info/tree/dirs-changed/diff).
+  NEXT: P3 waits for A-727 a2 (w-perf) + SLATES_ROOT placement (b); then P4 (git), then (a) root mount publication.
+  URGENT (main) A-740 LANDED: spin reports name the task. slates_rt::label (TaskLabel Site via #[track_caller] at every
+  spawn entry / Named via futures::doing guard; interned table 4096 cells), Pulse::polling (label+polls, one store per
+  poll), watchdog lines "in task L, at its poll P", segment SUP_STUCK_* record -> anchor lapse kill line. Named steps:
+  hg_push::{unbundle,record,rebase,take}, vcs_svn::{answer,land}. Tests: rt spin_label, anchor stuck record, liveness
+  a_spinning_shard_stops_the_beat (red without the record). Seen: anchor a_table_past_the_old_exec_limit fails sendmsg
+  ENOBUFS(55) here -- unrelated to A-740, left for main.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS

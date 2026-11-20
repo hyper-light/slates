@@ -153,3 +153,45 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   push/held.rs, render.rs, serve/indexed.rs (copied generic over AsRef, framed chains Cow MARKER, lend counts borrow);
   server commits.rs, record.rs; vcs blame.rs; tests oracle.rs, hg tests/import.rs, vcs content tests. Compiles.
   Focused tests running (vcs content/derived, git store/derived/upload, hg serve/import/push/render, server vcs_store/git_push).
+- A-727 a1 LANDED main f8c9c95cd (windows/window_at -> Cow; readers moved; fixed w-git's intake.rs on merge). Tests
+  local on landed tree: server 63/63; earlier vcs 51, git 167, hg 111.
+- Seam with w-balance (Studio-2, kiln id 01a1f7b42ec27702a195501719d3f919; reach by agents_send): agreed. Its
+  HomeTicket + homes::image_begun(g)/image_published(g)/published(origin,ticket,budget) on main 93c0e64cc. Windows
+  live on identity-home shards (homes.rs); owner image carries non-home rows {identity,len,home}. Batch forms after a3.
+- By-use at f8c9c95cd: push_load N=1/10/100 = 205.9/165.9/40.2 MiB a push (was 300.8/289.9/248.8), all ok.
+  hg import of Mercurial repo: crash loop (shard 9 spins >1 s at every restart, 11 restarts) -> w-hg + main.
+- NEXT: (a2) arena storage on one shard (windows homed here) for slates-vcs ContentStore: storage seam (heap vs
+  arena), arena backed by the shard's vfs ChunkStore (open/write_open/seal/read_extent_into); then (a3) image table
+  + recovery + barrier hooks image_begun/image_published; then (b) git v3; S4 slice 2 (svn texts via WithTexts).
+- ~13:00Z rulings: A-727 (a2) = option (i): repository store's OWN chunk arena per home shard behind a storage seam,
+  extents from the anchor content pool under its own owner-tag range (per home; w-balance's holdings read from it),
+  its own image section + recovery; no ripple into git/hg/svn. Rule (B): green = head files (hot); repository store
+  = compressed history (packs as sent, revlog/svndiff deltas) + tool metadata, NEVER inflated file bytes; non-vacuity
+  counter "blob put into the repository store" asserted 0 on a push once S3 lands. S4 slice 2 after (a3): when the
+  head moves the old head's delta must be durable in the repo store before the green folds that version; test fold ->
+  restart -> svn cat -r N.
+- (a2) step 1 (slates-vcs): WindowStorage seam (heap impl default for tests/tools); windows go through it, lists/tables
+  stay in the store's memory; get() lends lists/tables only (git derived/tree.rs:813 gitlink read -> windows()).
+- (a2) step 1 built in worktree ~/slates-work/w-perf-a723 (uncommitted): slates-vcs WindowStorage trait (put/read/
+  release), StoredWindow handle, HeapWindows default, ContentStore::with_storage, Held.kept = Kept::Here (lists, tables,
+  derived) | Kept::Stored{window,len} (windows); get() lends Here only; new bytes_of() reads any form (Cow); release
+  copies a stored window out then releases it; ContentRefused::Storage; git derived/tree.rs gitlink read -> bytes_of;
+  vcs tests moved to bytes_of; new test windows_kept_by_a_storage_that_copies_out_read_and_free_as_the_heap_store_does.
+  vcs content:: 8/8. Dependents' tests running. Then: land step 1; step 2 = server ArenaWindows over a repository
+  ChunkStore per shard (pool owner-tag range), then (a3).
+- (a2) step 1 LANDED main 6b1fb644f (WindowStorage seam, HeapWindows, with_storage, Kept Here/Stored, bytes_of,
+  len_of; readers moved incl. homes read_here, kept_fragments). Landed tree: server 72/72, git store 87/87.
+- hg import re-run (A-732, w-hg's fix) running on Studio as kiln r66 (log ~/.cache/w-perf/hgimp2.log/.out, evidence
+  hg-import-2.log). Report result (completes/typed refusal, no spin/restart, RSS) to w-hg (slates-work-09) + main.
+- NEXT (a2) step 2: server ArenaWindows: a repository ChunkStore per home shard (vfs ChunkStore over a ChunkArena whose
+  ExtentSource = ContentPool with a distinct owner-tag range; content_pool.rs owner word = partition+1 today),
+  installed via ContentStore::with_storage where VcsStores.content is made; reads via read_extent_into (copy-out).
+  Then (a3): image section for the repository arena's chunk table + recovery before records + homes::image_begun/
+  image_published hooks + group commit; then (b) git record v3; then S4 slice 2 under rule (B).
+- (a2) step 2 PARKED on branch agents/w-perf-a727-a2s2 (08cb0ddd0): ContentPool::open_repository (owner
+  partitions+partition), daemon repository_windows(), ArenaWindows (seal/read-copy/free; tests pass), VcsStores::
+  with_windows wiring. FINDING: in a real shard the repository arena is starved: first put ArenaExhausted, grow adds 0
+  (volume arena holds the slice's pool extents); hg_made t_a731 test fails with it, passes with heap storage. Also the
+  shard budget tracks only the volume arena. Asked main to rule: (i') layout range per slice, (i'') budget-grown +
+  balancing, or (ii) windows as chunks of the volume ChunkStore lent per step (recommended). Waiting.
+- hg import re-run (A-732) r66 still running on Studio (or done: check logs hgimp2.out / evidence/hg-import-2.log).
