@@ -1154,6 +1154,10 @@ pub struct Shipper {
   head: Option<Head>,
   /// The retained entries, oldest first, dense in position.
   retained: VecDeque<Entry>,
+  /// The position whose payload the owner keeps as its last whole state ([`Shipper::keep`]), and that entry once the
+  /// retained tail let it go: the one copy of the whole state, lent to the owner ([`Shipper::payload_at`]) whether the
+  /// tail still holds it or not (A-757 part 3).
+  keep: (Option<u64>, Option<Entry>),
   /// What each holder holds on this chain, as last reported.
   /// One head a host, for hosts it ships to only: a reply from any other is dropped ([`Shipper::on_reply`]) and a host
   /// leaving the holder set is forgotten ([`Shipper::activate`]), so at most the holders and the transition's target.
@@ -1243,6 +1247,7 @@ impl Shipper {
       first: 0,
       head: start,
       retained: VecDeque::new(),
+      keep: (None, None),
       held: BTreeMap::new(),
       durable: None,
       checkpoint: None,
@@ -1934,8 +1939,40 @@ impl Shipper {
         break;
       }
       bytes = bytes.saturating_sub(oldest.wire_bytes());
-      self.retained.pop_front();
+      // The entry the owner keeps as its whole state moves to the kept slot, not away: still its one copy.
+      if let Some(left) = self.retained.pop_front()
+        && self.keep.0 == Some(left.position)
+      {
+        self.keep.1 = Some(left);
+      }
     }
+  }
+
+  /// Keeps the payload of the entry at `position` (a whole state the owner appended) past the retained tail, as the
+  /// owner's last whole state, lent through [`Shipper::payload_at`]; `None` keeps none (the owner's whole state is an
+  /// image it holds itself). An entry kept before for another position is let go. Before A-757 part 3 the owner held its
+  /// own copy of every whole state beside the entry it appended: two copies of the volume, three during the append.
+  pub fn keep(&mut self, position: Option<u64>) {
+    self.keep.0 = position;
+    if self.keep.1.as_ref().map(|entry| entry.position) != position {
+      self.keep.1 = None;
+    }
+  }
+
+  /// The payload of the entry at `position`, lent: from the retained tail, or the entry kept past it ([`Shipper::keep`]).
+  pub fn payload_at(&self, position: u64) -> Option<&[u8]> {
+    self
+      .retained
+      .iter()
+      .find(|entry| entry.position == position)
+      .or(
+        self
+          .keep
+          .1
+          .as_ref()
+          .filter(|entry| entry.position == position),
+      )
+      .map(|entry| entry.payload.as_slice())
   }
 
   /// Moves its bounds (the caller's derivation, [`Bounds::of_whole`] in the daemon: the size of the whole state an
