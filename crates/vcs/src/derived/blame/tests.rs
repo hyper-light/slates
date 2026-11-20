@@ -270,7 +270,7 @@ impl Grower {
     let mut map = self.built.map(tip);
     let path = PATHS[two % PATHS.len()].as_bytes().to_vec();
     match map.get(&path) {
-      Some(_) if three % 11 == 0 => {
+      Some(_) if three.is_multiple_of(11) => {
         map.remove(&path);
       }
       Some(bytes) => {
@@ -280,7 +280,10 @@ impl Grower {
       None => {
         map.insert(
           path,
-          text(&[three % TOKENS, three / 3 % TOKENS], three % 2 == 0),
+          text(
+            &[three % TOKENS, three / 3 % TOKENS],
+            three.is_multiple_of(2),
+          ),
         );
       }
     }
@@ -375,7 +378,7 @@ impl Grower {
     let (ours, theirs) = (self.tips[first], self.tips[second]);
     let map = Grower::merged(&self.built.map(ours), &self.built.map(theirs), three);
     self.tips[first] = self.built.record(&[ours, theirs], map, Sources::new());
-    if three % 5 == 0 {
+    if three.is_multiple_of(5) {
       self.tips.remove(second);
     }
   }
