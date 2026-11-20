@@ -307,6 +307,7 @@ fn the_end_of_input_inside_a_request_dies_as_gits_reader_does() {
 /// The git repository `id`, the owner's, with no rules.
 fn record(id: RepositoryId) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id,
     name: "r.git".to_owned(),
     tool: VcsTool::Git,

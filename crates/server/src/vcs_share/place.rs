@@ -115,6 +115,40 @@ pub(crate) fn range_partition(family: &[u8], range: u32, partitions: &[u16]) -> 
     .and_then(|member| u16::try_from(*member).ok())
 }
 
+/// The partition that holds the index row of the object named `object` in `record`'s repository (A-724 piece 9, §4.17.5
+/// "A giant repository's metadata across partitions"): the repository's own partition while its cut is zero (the whole
+/// index on its owner, R9), else the partition of `partitions` that holds the object's range (`slates_vcs::cut::range_of`
+/// of its id at the record's `index_bits`, placed by [`range_partition`] over the repository's family line key). Every
+/// shard computes it from the record and the id alone: no catalog (§2 ban 12). None for no partitions.
+// Owed caller: the rows' routing of A-724 piece 9 (with record v3, after A-727 a3); until then only the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn index_partition(
+  record: &slates_db::catalog::RepositoryRecord,
+  object: &[u8],
+  partitions: &[u16],
+) -> Option<u16> {
+  if record.index_bits == 0 {
+    return Some(record.id.partition());
+  }
+  let range = slates_vcs::cut::range_of(object, record.index_bits)?;
+  let family = slates_db::register::ObjectId(record.id.bytes).line_key();
+  range_partition(&family.0, range, partitions)
+}
+
+/// The cut a repository's index should have (A-724 piece 9, `slates_vcs::cut::bits_for`): the least at which its
+/// `index_bytes`, spread evenly over its ranges, fit `room` a range, one bit from `current` at a time toward it (a split
+/// or a merge moves each row once), or none when it is where it should be.
+// Owed caller: the rows' routing of A-724 piece 9; until then only the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn index_cut_step(current: u8, index_bytes: u64, room: u64) -> Option<u8> {
+  let wanted = slates_vcs::cut::bits_for(index_bytes, room);
+  match wanted.cmp(&current) {
+    core::cmp::Ordering::Greater => current.checked_add(1),
+    core::cmp::Ordering::Less => current.checked_sub(1),
+    core::cmp::Ordering::Equal => None,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::{Decoding, decoding_on, intake_shard};
@@ -197,6 +231,51 @@ mod tests {
       "two families placed alike: {differ} of 64 ranges differ"
     );
     assert_eq!(range_partition(b"monorepo-family", 0, &[]), None);
+  }
+
+  /// A-724 piece 9. Do: route objects of a repository whose cut is 0, then 4; and step a cut toward what its index's
+  /// bytes need. Expect: at 0 every object on the repository's own partition; at 4 objects whose ids share their first
+  /// 4 bits on one partition, the 16 ranges spread over several; the cut stepping one bit at a time toward the derived
+  /// cut and standing once there.
+  #[test]
+  fn a_repositorys_index_rows_route_by_its_cut_and_the_cut_steps_one_bit_at_a_time() {
+    use super::{index_cut_step, index_partition};
+    let partitions: Vec<u16> = (0..23).collect();
+    let mut bytes = [0u8; 16];
+    bytes[8] = 0;
+    bytes[9] = 5;
+    let mut record = slates_db::catalog::RepositoryRecord {
+      index_bits: 0,
+      id: slates_db::catalog::RepositoryId { bytes },
+      name: "monorepo".to_owned(),
+      tool: slates_db::catalog::VcsTool::Git,
+      format: slates_db::catalog::ObjectFormat::Sha1,
+      default_branch: None,
+      owner: slates_db::catalog::Principal::Certificate { hash: [1; 32] },
+      policy: slates_db::catalog::RepositoryPolicy::default(),
+    };
+    let own = record.id.partition();
+    for first in 0..=255u8 {
+      assert_eq!(
+        index_partition(&record, &[first, 1, 2, 3], &partitions),
+        Some(own)
+      );
+    }
+    record.index_bits = 4;
+    let a = index_partition(&record, &[0x30, 0, 0, 0], &partitions);
+    let b = index_partition(&record, &[0x3f, 9, 9, 9], &partitions);
+    assert_eq!(a, b, "one range, one partition");
+    let spread: std::collections::BTreeSet<_> = (0..16u8)
+      .map(|range| index_partition(&record, &[range << 4], &partitions))
+      .collect();
+    assert!(spread.len() > 4, "16 ranges on {} partitions", spread.len());
+    let row = 41u64;
+    let room = 1u64 << 20;
+    assert_eq!(index_cut_step(0, 10 * room, room), Some(1));
+    assert_eq!(index_cut_step(3, 10 * room, room), Some(4));
+    assert_eq!(index_cut_step(4, 10 * room, room), None);
+    assert_eq!(index_cut_step(4, room / 2, room), Some(3));
+    assert_eq!(index_cut_step(0, 424_851 * row, 746_962_928), None);
   }
 
   /// A-724. Do: decode on a shard, then let each intake go. Expect: the shard's count rises with each and falls back

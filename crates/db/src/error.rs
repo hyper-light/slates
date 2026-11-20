@@ -98,6 +98,12 @@ pub enum DbError {
     /// The slot's bytes.
     room: u64,
   },
+  /// A repository's index cut moved other than one bit within an id's 32, or for a repository not here (A-724 piece 9):
+  /// the cut now.
+  IndexCutStep {
+    /// The cut's bits now.
+    current: u8,
+  },
   /// The encoding refused.
   Wire(WireError),
   /// The segment refused.
@@ -213,6 +219,10 @@ impl fmt::Display for DbError {
         )
       }
       Self::LogFull { needed, free } => write!(f, "log full: {needed} bytes needed, {free} free"),
+      Self::IndexCutStep { current } => write!(
+        f,
+        "a repository's index cut moves one bit at a time within 32; it is at {current}"
+      ),
       Self::SnapshotRoom { needed, room } => write!(
         f,
         "the partition's state, {needed} bytes encoded, does not fit its {room}-byte snapshot slot"

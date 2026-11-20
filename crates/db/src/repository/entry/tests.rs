@@ -119,6 +119,7 @@ fn volume(id: VolumeId, is_green: bool) -> VolumeRecord {
 
 fn repository(serial: u8, name: &str) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id: repository_id(serial),
     name: name.to_owned(),
     tool: VcsTool::Mercurial,

@@ -10663,6 +10663,9 @@ async fn follow_configuration(
   // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
   // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
   fan_configs_to_shards(origin, shards);
+  // Windows homed by identity in the region (A-724 piece 6): at a new configuration, offered to their homes and let go
+  // here once every home holds them, a turn a period (`vcs_store::homes::heal_region`).
+  crate::vcs_store::homes::heal_region(origin, shards, budget).await;
   // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
   // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
   crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;
@@ -13413,6 +13416,7 @@ mod state_log_tests {
         assert!(Ack::decode(&reply).is_ok());
       }
       let record = slates_db::catalog::RepositoryRecord {
+        index_bits: 0,
         id: repo,
         name: "linux".to_owned(),
         tool: slates_db::catalog::VcsTool::Git,
