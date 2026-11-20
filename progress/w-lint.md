@@ -139,3 +139,11 @@
 - Windows: r21 clone hit a GitHub reset; r22 lost to a jupiter runner restart; the run at 982ea33d5 found A-718's
   git errors (fixed in b3fd44bda, unverified on Windows); the last re-run failed (network reset, then kiln timeout).
 - At 2e521d875 on macOS: host, six cross targets, structural, literals, unsafe, fmt clean.
+
+## 2026-11-20 round 5 (Windows confirmed): main 4c2a3aede clean on Windows; 9e33fd418 clean on the macOS host
+- Landed: d412275d3 (Windows at a5233e2: git_push tests' PUSH_WAIT_NS/pack_of unix-only yet used everywhere,
+  give_back.rs import, client leftover; ipc hex literal), 4c2a3aede (INTERLEAVED gated as its unix test),
+  9e33fd418 (cli merge_kill never-looping loop).
+- At 4c2a3aede: Windows (crates, cli, xtask) clean on jupiter; six cross targets, structural, unsafe, fmt clean.
+- Open, not mine: literals in merge pace.rs RUN = 16 and push.rs UNIT_BYTES = 64 KiB (A-752, 004f072d4) -- owner
+  to derive. Red test slates-vcs the_same_bytes_from_git_and_mercurial... (w-perf).
