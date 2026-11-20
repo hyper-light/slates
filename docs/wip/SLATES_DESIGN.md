@@ -55938,9 +55938,17 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   release, 5.2 ms); its longest step 27.8 ms, of which the entry's apply is 18.6 ms: the record carries the whole pack
   (9.4 MiB), so the apply is O(its bytes). Owed: the pack homed as content before the append, as version 3 homes the
   names (asked of main: w-git under the current record, or w-store's changeset payload); the holds' release in turns
-  after the commit (releasing each at its row would make a restage read every object again).
+  after the commit (releasing each at its row would make a restage read every object again), built below.
 - **Tests.** `slates-git --lib` 579 passed; `slates-server --lib -- git vcs_store` 161 passed (kiln,
   adas-mac-studio.local-2).
+- **Then the holds** (the next landing). A live push gives its pack's holds back a unit at a time after its landing
+  (`Push::give_back_in_turns`, set when its decision begins; `Push::give_back_turn`, turned by the decision before it
+  gives the push back): the landing sets them aside rather than releasing each in its step. Every other owner of a push
+  (a replay, the server's own commits) still releases at the landing, so no push dropped after it holds anything; a
+  live push's abandon gives back what is set aside. The same v1.5.0 push: the store's commit 0.63 ms (from 14.0 ms),
+  the landing's step 23.4 ms, of which the entry's apply is 19.0 ms (the pack in the record, owed above). Test:
+  `store::tests::packed::a_landed_push_gives_its_holds_back_in_turns_not_in_the_landing`; `slates-git --lib` 580
+  passed; `slates-server --lib -- git vcs_store` 161 passed.
 
 ### A-722's memory per push, B2's in-flight half — A push read where it lies in its pack while it is judged (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING, storage and changesets rulings)
 - **Why.** B1 measured a push of git/git's v1.5.0 (9.4 MiB pack, 34,296 objects) putting every object inflated in the

@@ -15309,6 +15309,24 @@ encoded, does not fit its 746950834-byte snapshot slot" }`. Two walls are left, 
 of a 1.3 GB entry, and the partition snapshot that carries every retained record (A-727: records naming identities,
 their bytes in the content plane). Peak RSS does not follow the record from B to C: it is the import's working set.
 
+### D: records naming identities only, the import completes (w-hg's v4, S5; 2026-11-20)
+Build D = b831a2877 (main with 306214c57: the import record names identities, the texts' bytes in the content store),
+release, the same Studio and command as A to C (`VARIANTS=D`, three imports, cap 1,800 s). `hg-src`'s `.hg` is
+87,836 KiB (`du -sk`), the data size RSS is read against.
+
+| run | exit | wall (s) | peak RSS (KiB) | record (bytes) | spins |
+|---|---|---|---|---|---|
+| D-1 | 0 | 143.8 | 5,736,096 | 30,703,702 | 0 |
+| D-2 | 0 | 148.5 | 5,732,688 | 30,703,702 | 0 |
+| D-3 | 0 | 165.5 | 5,730,752 | 30,703,702 | 0 |
+
+The record falls from C's 1.30 GB to 30.7 MB (42 times less; 327 times less than A), 0.35 times the data, and the
+747 MB snapshot slot no longer refuses it: the import lands in one step, no spin, the anchor's one restart the start's.
+Peak RSS is 5.73 GB, about **65 times the data**: against Ada's sizing rule (RSS recorded against data size), the
+over-allocation left. w-hg's account: the import keeps every file revision whole in the content store (Mercurial's
+115,479 file revisions are 4,296.9 MiB as whole texts; a push of the same history committed 4,495.5 MiB). Ada's
+changeset ruling (changesets the stored unit, per-file deltas derived) replaces that; its A/B is the next section.
+
 ### The lend's swap, release (A-727 slice a2)
 `vcs_store::arena_windows::tests::wperf_swap_cost_probe` (bench-only, not committed) in a release test build of B's
 tree on the same Studio: a `ContentStore::lend_in` and `hand_back` pair costs **38.83 ns** over 10,000,000 pairs after
