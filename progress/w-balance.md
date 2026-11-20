@@ -151,3 +151,10 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
     admission order would not change these runs (no refusals, memory never bound).
   * MY EARLIER CLAIMS CORRECTED: 'shards mostly idle' (r100.sample) was wrong (kevent = spin polls).
 - Worktree now ~/slates-work/w-balance-land3 at 463fc501c (harness split + counters, not on main yet; real messages).
+- 9be789460 LANDED: harness fair-share ideal (one shard / spread), split timing, counters; BENCHMARKS 'held to their
+  fair share': under today's placement every class 0.72-0.87x of fair share (no starvation); hot repo 7.61x spread.
+- 3ae8ca99d LANDED: vcs_share::place (intake_shard two choices, Decoding guard per shard, decoding_on); ReceivePack holds
+  Decoding. Told w-git in inbox/w-git-from-w-balance.md. allow(dead_code) on intake_shard/decoding_on until A-722 calls.
+- MY RULE BREAK (reported to main): `git push -f` to MY OWN scratch branch agents/w-balance-load3 after a rebase
+  (463fc501c -> bc2b042e0); no one else's work lost. Use NEW branch names from now on, never -f.
+- NEXT: P6 N=1 parts, P8 (snapshot slot derived), P9 (index across partitions).

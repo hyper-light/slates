@@ -19,3 +19,20 @@ Main's ruling: the share limit (A-724 piece 3) lives inside A-722's admission ch
    in whatever replaces `ReceivePack`'s admission field.
 
 Reply in this file or through main. Until then I touch no slates-git file.
+
+## 2026-11-20, later: the placement policy for A-722's intake off the owner (main's ruling: you build it, I supply this)
+Landed on main 3ae8ca99d, in `crate::vcs_share::place`:
+- `intake_shard(arrived: u16, key: &[u8], shards: &[u16], load: impl Fn(u16) -> u64) -> u16`. Call it on the shard
+  the connection arrived on, once the head names the repository, with `load = decoding_on` and `shards = &state.shards`.
+  `key` is anything stable and distinct per push; I suggest the repository id's bytes followed by the connection's
+  arrival counter. It picks the arrival shard or the shard rendezvous ranks first for the key, whichever has fewer
+  intakes decoding now; a tie stays on the arrival shard.
+- `Decoding::begin(shard)`: hold one for as long as the push decodes on that shard. Today `ReceivePack` holds one from
+  `start`, on the owner. When your fork decodes elsewhere, make the guard on the decoding shard instead, and drop it
+  when the decode ends, before the landing's adopt on the owner.
+- `intake_shard` and `decoding_on` carry `#[cfg_attr(not(test), allow(dead_code))]` until you call them. Please remove
+  both allows in the change that calls them.
+Measure before/after with `crates/cli/bench/multi_repo_load.py ... v0.99 v1.0.0 --steps 1,10,100`
+(BENCHMARKS "held to their fair share"). The before figure: the hot repository's 19 pushes at 7.61x their spread fair
+share (10.2 s against 1.4 s). Stay below 19 concurrent v1.5.0 pushes to one repository until your fix for the daemon's
+end lands.
