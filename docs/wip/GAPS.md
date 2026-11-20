@@ -367,6 +367,22 @@
 > 693bc8fe, fmt clean). Owed: the daemon keeping an SSH edge state on every shard as it starts the edge (A-684);
 > Subversion's tunnel moved to the shard of the repository its greeting names (A-688); a test of an arrival waiting
 > for a full shard's seat and of one refused past the bound; main's runs.
+> **A-688 (2026-11-19, g229; svn+ssh over slates' own SSH server, §4.17.4 piece 12):** `vcs_ssh::svn` serves the SSH
+> site's `svnserve -t` (`SvnServices` beside the other services): A-656's ra_svn connection over the channel, the
+> client's URL found as `find_repos` finds it (E125001, E125002, E210005), A-597's policy asked (E170001), the tunnel's
+> user the principal the key proved (its index key in hexadecimal), never the SSH login; sources lent a step at a time
+> (`SvnStores`); a commit begun, its hooks passed where none is configured, its work refused 200007; the tunnel ending
+> as `svnserve -t` 1.15.0 ends, held to stock recordings (the `mkdir` commit; scripted sessions recorded on the Mac
+> Studio, 2026-11-19) and end to end over the SSH edge (macOS arm64, Mac Studio, kiln r311: `--lib vcs_ssh::` red 26 of
+> 35, green 35 of 35; slates-svn `handshake:: serve::` 60 of 60; fmt clean; as it landed over main 693bc8feb, r377: 38
+> of 38 and 60 of 60). Owed: the lender of a Subversion store over A-662's map (the records A-655 part 2b keeps there, a
+> directory's entries from the green, the repository's `svnserve.conf` facts; the DAV site's own `SvnStores`, A-681,
+> waits for the same lender), without which the daemon's site cannot start the tunnel; the accepted work handed to A-655
+> part 2b's owner step (`repository::svn_commit::commit`); the tunnel moved to the shard of the repository its URL names
+> (A-651 part 4 moves a connection for a named repository); the daemon's edge (A-684); a configured hook run, not
+> refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve`
+> exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a
+> daemon.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -626,9 +642,25 @@
 > vcs_ssh:: vcs_store::` 95 of 95, among them stock git's `create` push posted to the daemon's edge and its objects
 > fetched back whole over the same edge, `slates-cli --test cli vcs_http` 2 of 2, fmt clean. Owed: the objects a
 > hidden ref alone reaches stay fetchable by id (slates-git's negotiation answers a want of any object the store holds;
-> its hidden refs are owed there); the daemon starting the SSH edge (A-684); the live stock `git clone` over the
-> daemon's edge (the interop piece after this one) and other platforms' runs (main's); the exchange moved by the live
-> memory-pressure and load signals, as the codec policy's.
+> its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
+> exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
+> the daemon's edge is built since (stock git's interop tests, next).
+> **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
+> (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
+> first commit pushed to an empty repository, cloned, an edit pushed from the clone and fetched back into the first
+> copy) run as a control against stock git's own server (a bare repository over `file://`), so every step expects
+> what git's own server answers; git with no credential refused in its own words (`could not read Username for
+> 'http://127.0.0.1:PORT': terminal prompts disabled`, exit 128); and the round trip over the HTTP edge, the token a
+> bearer credential (`http.extraHeader`), which passes: stock git 2.50.1 clones a repository `slates repository
+> create` made, pushes to it and fetches from it over the daemon's edge. Ignored naming their waits: the round trip
+> with the token as Basic's password in the URL (A-686, g258: the cleartext edge's `401` offers Bearer alone, so git
+> answers `Authentication failed`), and over the SSH edge (A-684, g299: `--vcs-ssh`; A-683, g302: git-receive-pack on
+> the SSH edge). A credential is minted with the anchor's issuer surface, so on Linux, where that surface is a
+> descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln r426 over main
+> 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2 ignored; with
+> `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication failed for
+> 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the control and
+> the refusal run there, the HTTP leg skips), main's.
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the
@@ -1476,7 +1508,8 @@
 > own for `lock-many`, byte for byte but one property list `svnserve` wrote in its hash table's order (`import`'s
 > `get-dir`, compared as a set and counted). Corrected: part 1 refused an anonymous `update` of an unreadable target at
 > once, where `svnserve` asks for an authentication first. Owed of A-656: part 2, the server's listener and the SSH
-> tunnel's entry point (one learned-wait mechanism for the three edges, after A-625's and A-651's land); the daemon's
+> tunnel's entry point (built since, A-688; one learned-wait mechanism for the three edges, after A-625's and A-651's
+> land); the daemon's
 > commit through A-655 part 2b's step (`repository::svn_commit::commit`, built); the lock verbs; the read commands'
 > authentication for one command with their
 > authorization (A-606). Found: A-613's `get-dir` lists an entry `svnserve` hides from the principal (`/trunk/secret`
