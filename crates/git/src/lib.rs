@@ -54,6 +54,7 @@ pub mod objects;
 pub mod out;
 pub mod pack;
 pub mod pktline;
+pub mod positions;
 pub mod receive;
 pub mod refname;
 pub mod sideband;

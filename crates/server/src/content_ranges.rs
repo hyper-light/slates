@@ -4,8 +4,10 @@
 //! **What it reports.** For each range of the shard's slice (`DaemonConfig::shard_content_layout`): the write log, the
 //! two image slots, the delta log, the DAX range table, and the chunk arena summed over the regions the shard holds,
 //! the range's bytes, the bytes of its pages in RAM, and the bytes written where the OS says (macOS), read from the
-//! kernel's page table (`slates_mem::resident`); for the arena also the bytes allocated in it. `slates status --json`
-//! prints them per shard under `content_ranges`.
+//! kernel's page table (`slates_mem::resident`); for the arena also the bytes allocated in it and the reserve an idle
+//! shard keeps pre-faulted. Beside them, the register (the partition's log since its last snapshot, and that snapshot)
+//! by what its bytes carry: repository records, green chain entries, checkpoints and the rest (A-745,
+//! `slates_db::replay::RegisterSplit`). `slates status --json` prints them per shard under `content_ranges`.
 //!
 //! **Bounded.** The kernel answers a page at a time, about 3 ns a page on the Mac Studio (1 GiB in 0.23 ms, 64 GiB in
 //! 11.9 ms, measured 2026-11-20), so a slice of tens of GiB of address space is past a turn. Each status request
@@ -234,6 +236,26 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
     u64::try_from(state.store.content.allocated_bytes()).unwrap_or(u64::MAX),
   ));
   rows.push((
+    format!("{PREFIX}arena.prefault_reserve"),
+    u64::try_from(crate::daemon::prefault_reserve_bytes(state)).unwrap_or(u64::MAX),
+  ));
+  // The register (the partition's log and snapshot in the anchor segment) by what its bytes carry (A-745): the log
+  // since the last snapshot, and the last snapshot.
+  let stats = state.db.stats();
+  for (range, split) in [
+    ("register_log", stats.tail_split),
+    ("register_snapshot", stats.snapshot_split),
+  ] {
+    for (figure, bytes) in [
+      ("repository_records", split.repository_records),
+      ("chain_entries", split.chain_entries),
+      ("checkpoints", split.checkpoints),
+      ("rest", split.rest),
+    ] {
+      rows.push((format!("{PREFIX}{range}.{figure}"), bytes));
+    }
+  }
+  rows.push((
     format!("{PREFIX}sweep.completed"),
     state.content_sweep.sweeps,
   ));
@@ -249,32 +271,40 @@ mod tests {
 
   use super::*;
 
-  /// A-744. Do: on a shard, ask the report again and again until a sweep completes (a bounded number of times: the
+  /// Shape: a shard reserve small enough that its slice sweeps in a few steps.
+  const SMALL_SLICE_RESERVE: u64 = 64 << 20;
+
+  /// A-744. Do: on a shard with a small reserve, ask the report again and again until a sweep completes (a bounded number of times: the
   /// slice's bytes over one step each, plus one). Expect: a sweep completes; the arena's measured bytes are its regions'
   /// lengths; every range's resident and written bytes are within its own bytes; the counter of sweeps moved.
   #[test]
   fn a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes() {
-    let found = crate::daemon::audit_on_shard(|state| {
-      let page = state.config.page.max(1);
-      let step = page.saturating_mul(page);
-      let total: usize = targets(state).iter().map(Target::len).sum();
-      let bound = total / step + targets(state).len() + 1;
-      let mut asked = 0;
-      while state.content_sweep.sweeps == 0 && asked < bound {
-        report(state);
-        asked += 1;
-      }
-      let arena_len: usize = targets(state)
-        .iter()
-        .filter(|target| target.range() == ARENA)
-        .map(Target::len)
-        .sum();
-      (
-        state.content_sweep.sweeps,
-        state.content_sweep.done,
-        arena_len,
-      )
-    });
+    // A small slice, so the whole sweep is a few steps even in a debug build: the test asks again and again inside one
+    // closure on the shard, and a slice the size of the machine's share spun a debug shard past its liveness window.
+    let found = crate::daemon::audit_on_shard_configured(
+      |state| {
+        let page = state.config.page.max(1);
+        let step = page.saturating_mul(page);
+        let total: usize = targets(state).iter().map(Target::len).sum();
+        let bound = total / step + targets(state).len() + 1;
+        let mut asked = 0;
+        while state.content_sweep.sweeps == 0 && asked < bound {
+          report(state);
+          asked += 1;
+        }
+        let arena_len: usize = targets(state)
+          .iter()
+          .filter(|target| target.range() == ARENA)
+          .map(Target::len)
+          .sum();
+        (
+          state.content_sweep.sweeps,
+          state.content_sweep.done,
+          arena_len,
+        )
+      },
+      |config| config.reserve_per_shard = SMALL_SLICE_RESERVE,
+    );
     let (sweeps, done, arena_len) = found;
     assert!(sweeps > 0, "no sweep completed within its bound");
     let done = done.unwrap();

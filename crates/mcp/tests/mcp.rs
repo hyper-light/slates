@@ -790,42 +790,54 @@ fn assert_status_exports_the_registries(status: &Value) {
   assert_chokepoint_registry(shards);
   assert_span_identities(shards);
   for shard in shards {
-    // The budget's retention (§4.2): what freed heads' snapshots pin and greens' histories hold, part of the committed
-    // bytes (A-742: the JSON printed it nowhere, so a retention charge was invisible).
-    let (retained, committed) = (&shard["retained_bytes"], &shard["committed_bytes"]);
+    assert_retention_ranges_and_drain(shard);
+  }
+}
+
+/// One shard's block: its retained bytes and versions within its committed bytes (A-742), its content ranges, the arena
+/// among them, none resident or written past its own bytes (A-744), and its telemetry drain's figures.
+fn assert_retention_ranges_and_drain(shard: &Value) {
+  // The budget's retention (§4.2): what freed heads' snapshots pin and greens' histories hold, part of the committed
+  // bytes (A-742: the JSON printed it nowhere, so a retention charge was invisible).
+  let (retained, committed) = (&shard["retained_bytes"], &shard["committed_bytes"]);
+  assert!(
+    retained.is_u64() && shard["retained_versions"].is_u64(),
+    "{shard}"
+  );
+  assert!(
+    retained.as_u64() <= committed.as_u64(),
+    "retention is part of the committed bytes: {shard}"
+  );
+  assert_content_ranges(shard);
+  let drain = &shard["telemetry"];
+  assert!(drain["shed_before"].is_u64() && drain["dropped_total"].is_u64());
+  assert!(drain["remaining"].is_u64() && drain["missing_links"].is_u64());
+  assert!(drain["window_ns"].is_u64() && drain["horizon_ns"].is_u64());
+}
+
+/// A-744: one shard's slice of the anchor content object, range by range; the arena always among them; nothing in RAM
+/// or written past a range's own bytes.
+fn assert_content_ranges(shard: &Value) {
+  // A-744: the slice of the anchor content object, range by range; the arena always among them; nothing in RAM or
+  // written past a range's own bytes.
+  let ranges = shard["content_ranges"]
+    .as_object()
+    .expect("the content ranges, by name");
+  assert!(ranges["sweep"]["completed"].is_u64(), "{shard}");
+  assert!(ranges["arena"]["allocated"].is_u64(), "{shard}");
+  // A sweep advances a bounded slice a request; the ranges a completed one measured hold to their bytes.
+  for (range, figures) in ranges {
+    let Some(bytes) = figures["bytes"].as_u64() else {
+      continue;
+    };
     assert!(
-      retained.is_u64() && shard["retained_versions"].is_u64(),
-      "{shard}"
+      figures["resident"].as_u64().is_some_and(|r| r <= bytes),
+      "{range}: {figures}"
     );
     assert!(
-      retained.as_u64() <= committed.as_u64(),
-      "retention is part of the committed bytes: {shard}"
+      figures["modified"].as_u64().is_none_or(|m| m <= bytes),
+      "{range}: {figures}"
     );
-    // A-744: the slice of the anchor content object, range by range; the arena always among them; nothing in RAM or
-    // written past a range's own bytes.
-    let ranges = shard["content_ranges"]
-      .as_object()
-      .expect("the content ranges, by name");
-    assert!(ranges["sweep"]["completed"].is_u64(), "{shard}");
-    assert!(ranges["arena"]["allocated"].is_u64(), "{shard}");
-    // A sweep advances a bounded slice a request; the ranges a completed one measured hold to their bytes.
-    for (range, figures) in ranges {
-      let Some(bytes) = figures["bytes"].as_u64() else {
-        continue;
-      };
-      assert!(
-        figures["resident"].as_u64().is_some_and(|r| r <= bytes),
-        "{range}: {figures}"
-      );
-      assert!(
-        figures["modified"].as_u64().is_none_or(|m| m <= bytes),
-        "{range}: {figures}"
-      );
-    }
-    let drain = &shard["telemetry"];
-    assert!(drain["shed_before"].is_u64() && drain["dropped_total"].is_u64());
-    assert!(drain["remaining"].is_u64() && drain["missing_links"].is_u64());
-    assert!(drain["window_ns"].is_u64() && drain["horizon_ns"].is_u64());
   }
 }
 

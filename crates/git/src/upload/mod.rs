@@ -116,8 +116,8 @@ pub enum Asked<'b> {
 pub struct PackPlan<'p> {
   /// Runs of a green's versions the pack carries whole, from their fragments, in the negotiation's order.
   pub runs: &'p [Run<u64>],
-  /// Objects the pack carries one by one, by position, each once, in position order.
-  pub objects: &'p [u64],
+  /// Objects the pack carries one by one, by position, as runs (A-745: never listed an object at a time).
+  pub objects: &'p crate::positions::Positions,
   /// The filter the runs' objects are held to, one that decides each object by its own row
   /// ([`Filter::is_per_object`]); the single objects were chosen under it already.
   pub filter: Option<&'p Filter>,

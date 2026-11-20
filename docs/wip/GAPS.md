@@ -84,6 +84,13 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
+> admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
+> admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-743 (2026-11-20, w-git).** BUILT: a branch `CreateBranch` makes is a git ref at the commit it was made at
+> (recorded as a no-object push), so stock git lists, retires, binds and pushes it as the namespace says.
+>
 > **A-722 part 3 (2026-11-20, w-git).** BUILT: the seal writes a push's rows into a fork of the index
 > (`Repository::stage`), the landing adopts it (or stages again when stale). Owed (part 4): the staging pass, the
 > moves' admission, the landing's whole passes and a stale restage sliced; record replay through the sliced intake.
@@ -140,7 +147,8 @@
 >
 > **A-713 (2026-11-20, w-git; every clone of a long history refused for its room, found by use).** BUILT: git's
 > upload-pack, HTTP and SSH, admits each request what its repository's shard could admit (`StoreLender::room`), as A-704
-> admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> admits a push. A-745 git piece 1 (2026-11-20, w-k90-vendor): the plan carries its objects as runs of positions, never a
+> handle an object. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -171,8 +179,10 @@
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
-> lands ignored. Owed: `getbundle`'s answer made and sent in slices, each charged and let go; the stream clone's; then
-> w-interop's matrix rerun.
+> lands ignored. Piece 1 BUILT: `getbundle::Answering`, the answer a slice at a time, a clone of every head walked by
+> its links (the request holds ranges and a place), its least room a slice less than the whole answer's (test), the
+> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Owed: the server driving it
+> a turn at a time over HTTP and SSH (piece 2, which turns the red green); the stream clone's; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -233,8 +243,12 @@
 > (`slates_mem::large`), large temporaries cut (`Wire::encoded_len`, `Db::mutate_owned`, `Checkpoint::into_encoded`);
 > svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. A-744 closed the record's growth, the retry
 > clone and the split (the 581 MiB is the owner partition's segment log ring and snapshot slots; the content object
-> 2.3 MiB). OWED: a replay measure that does not decode (A-420), so the log's decode-after-encode copy can go; Windows'
-> residency (`QueryWorkingSetEx`).
+> 2.3 MiB). The log's decode-after-encode stays (main's
+> call: A-420's measure and guard). OWED: Windows' residency (`QueryWorkingSetEx`).
+>
+> **A-746 (2026-11-20, w-engine):** the register split by kind: chain entries + checkpoints 270.5 MiB lead repository
+> records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
+> the log ring's released pages given back (88 MiB resident past the live tail); `projected_snapshot_bytes`'s encode.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1912,10 +1926,32 @@
 > `Record::RevisionProperties`, `svn_commit::record`; A-635's append records an entry of no change holding its caller's
 > record alone), so every imported revision is durable as it lands and a refusal keeps the ones before it; answered
 > `DumpImported`, or `ImportRefused { Subversion }` with Subversion's number, the revision and the path (see A-652 part
-> 3). Owed from it: the export verb (a range written as a dump into a volume, landed under a grant, §4.15), sliced under
-> the shard's budget; the records' texts in the shared object store; an import resumed across a restart (the committed
-> revisions are recovered; a request sent again refuses a stream that starts before the revision after the youngest);
-> the CLI's and the SDKs' words for the verb; main's: clippy and `xtask` over the modules. Found by it and fixed by
+> 3). The export verb (A-652 part 3 continued, 2026-11-20): `ExportDump` writes a range as `svnadmin dump` does into a
+> new volume holding `DUMP_FILE`, walked twice a revision a unit (measured, then written a copy slice at a time, both
+> hashed, a differing second walk refused), the caller landing the volume under a grant; landed by w-svn from g268's
+> work, with a fix found by its own test: two exports side by side minted one volume id at their walks' end, the
+> second refused `AlreadyExists` at its record, so the id is minted in the publishing atom now. The sibling sweep (main,
+> same day): every id minted before the record that holds it could repeat, since `verbs::fresh_volume_id_at` named
+> the database's next sequence unreserved: an image's identity at its plan, an archive export's and an archive
+> import's volume at admission, a name alias's. Each mint is now the shard's alone (`ShardState::volume_ids_minted`,
+> held to the counter's bound); held by `image::tests::two_imports_admitted_side_by_side_mint_distinct_volume_ids`
+> (red: one id twice). Minting inside the recording transaction was not the structural form: an image's identity
+> holds its id before its volume is recorded. The reservation needs nothing durable: an id minted and never recorded dies with
+> its job at a restart, and the database's own counter moves past every id a record holds. **Owed, measured
+> 2026-11-20 (debug, this MacBook):** a unit is one revision whole, the exporter writing a revision or nothing
+> (`migration::export`), so a revision's texts are staged whole and its unit is unbounded: against a 14 µs copy-slice
+> budget, a 195-byte revision took 60 µs and one with a 107 KB text 2.4 ms, `image.units_past_budget` 87 over the
+> test's two exports. **Part 1 of the slicing (same day, w-svn):** `Exporter::export` writes one changed path a call,
+> the revision's drive kept between calls (its rows, open directories and last path), so a unit is a changed path's
+> records, never a revision's (`every_export_call_writes_one_changed_path_of_its_revision`: a revision's changed paths
+> and two calls, both formats byte for byte). **Part 2 (same day):** a text a window a call, `Text` pieces of
+> `WINDOW_LIMIT` (format 2, one walk: its length and checksums the record's) or one deltified window (format 3, taken
+> up again by `svndiff::deltas_at`); held by `every_export_call_writes_one_changed_path_or_one_window_of_its_text`
+> (largest call 102,400 and 102,413 bytes, the 107 KB text no longer one). Owed (part 3, next): format 3's measuring
+> walk, which its record's header needs first (the svndiff's length is kept nowhere), still one call over the whole
+> text, keeping no window (§4.17.4 item 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
+> words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
 > index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
 > comes first; it takes it now as the copy FSFS makes, the index's and the verdict's oracles holding such replacements
@@ -1933,7 +1969,10 @@
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). A-586 (2026-11-19, g295): the engine's `Copy` (`OpKind` 16), built: recorded once at its
 > destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
-> key, the identity one entry a copy, hard links refused by kind, the root a source and never a destination, a branch
+> key, the identity one entry a copy, hard links refused by kind (BUILT 2026-11-20, w-shared, main's ruling: a copied
+> tree's links share the copy's nodes, a link naming a node outside it gets a node of its own, `Green::copy_link_effects`;
+> refused only where that outside node changed after the copy's version, still as `TypeChanged`, owed its own typed
+> refusal), the root a source and never a destination, a branch
 > made before a copy cutting it, a review comment on a copied file moving with it (A-596); held to a reference green
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain
@@ -2350,6 +2389,15 @@
 > run 21 failed after forming, a successor owner's shard 0 spinning 5.6 s without a step right after its takeover
 > (watchdog exit 4; owed, w-forming's queue). An earlier sweep on the build before A-735 hung twice on a replaced
 > member's client claim (A-735).
+> **Start waits under load (2026-11-20, w-forming; same box):** at load 29 to 31 on its 14 CPUs (other agents' builds,
+> Spotlight indexing cargo targets, a VM), the fleet daemons' control shards went 8 to 12 s between heartbeat turns
+> ("the control shard's beat task ran 12053 ms after its last turn", against windows of 1 to 4.2 s, with 4 to 35 long
+> polls in each gap), and a replaced member's daemon spent the flow's whole 30 s start wait measuring the machine
+> before its banner (sw48 run 16, rp3 run 3; the fleet had formed and settled each time). The live_chaos start wait now
+> judges the start in its processes' own CPU, as the anchor judges its daemon (A-228): waited while they live and gain
+> CPU, up to 30 s of it, given up after 10 s with none or once they are gone (`wait_answers`, `start_verdict`).
+> Still a fixed wall bound under load: the flow's `FLEET_WAIT` (40 s), which a takeover's register adoption missed at
+> load 31 (probe run pr3 run 3).
 
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
@@ -3623,6 +3671,13 @@
 >   none on arm64), which is a filter's pattern.
 > - Unproven: which IRP the worker's answer completed, and which filter waited. The worker's stack ends at FltMgr's
 >   first frame, because FltMgr's symbols were not loaded.
+> - **Cured by A-725, shown by use on WinFsp as released (2026-11-20, w-bugs, goal 87):** the race with an outside
+>   writer in place of the link (`crates/cli/tests/winfsp.rs`
+>   `a_delete_racing_a_coherent_purge_returns_and_removes_the_file`: 60 rounds of an SDK write, a held open through the
+>   drive, an SDK rewrite whose round purges it, then the close and delete at once). On main just before A-725, on CI's
+>   x86_64 runner, 2 of 3 runs hung: one deleter past 10 s at round 7, one test process stuck at round 43 until the
+>   step's 900 s bound (diag-w-bugs-race-old-1); with A-725's relief receiver 6 of 6 runs passed whole on x86_64 and
+>   arm64 (diag-w-bugs-race-new-1). The VM race on the patched driver is not rerun (no VM here).
 > - **The fix, once confirmed, is slates':** a receive must never wait for a send's completion. One way is a second
 >   receiver, WinFsp's own posture; A-198's capture-and-settle order assumes one, so this is a design amendment.
 >   Another way is to send from a thread that does not receive.
@@ -3672,6 +3727,13 @@
 >   `the_spelling_windows_holds_a_path_by_follows_opens_closes_and_renames`, `inflight::tests`'s
 >   `a_create_answered_with_a_name_and_a_descriptor_sends_no_byte_of_an_earlier_response`, `held::tests`'s
 >   `the_mount_record_keeps_how_its_drive_compares_names`).
+> - **Run and red-checked (2026-11-20, w-bugs, goal 87; CI windows-latest and windows-11-arm):** A-551's two drive
+>   tests pass on both architectures; with `CaseSensitiveSearch` declared for every volume (the rule before A-551)
+>   `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` fails and the exact one still passes
+>   (diag-w-bugs-win-green-1 / -red-1). A-576's case, held by use under Windows' own table (A-737):
+>   `names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two` (`ɐ`/`Ɐ` one file, `ς`/`σ` two,
+>   as on NTFS) passes, and fails with the same forced flag. The roster's git, Mercurial and Subversion workloads pass
+>   over the drive on both (WinFsp as released makes no hard link, so the stated hard-link lines apply).
 > - **Owed (main, filed in run-requests.md):** the Windows build of A-551 (`host.rs`, the server's `winfsp.rs`) and the
 >   drive tests `every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows` (red before: `a.txt` opened beside
 >   an unshared `A.TXT`, final path `a.txt`) and `an_exact_drive_keeps_two_spellings_two_files`
@@ -4859,6 +4921,23 @@
 > So a mixed fleet stops typed, but by accident of length: a later change that keeps the length, or appends a field
 > whose absence parses, would be read with the field defaulted. Owed: a version in the encoding, refused by name on
 > mismatch.
+
+> **Fixed (live-durability, 2026-11-11): a live volume kept a laggard's entries only up to its first whole record's size,
+> so a holder a few entries behind was installed whole.** The retained tail's byte bound was set only at a whole record
+> or an install image, and a whole record comes only once the log reaches the volume's quota (`kept_reaches_size`):
+> 215,997 bytes at head 16,526, so a holder 12 entries behind fell past the tail and drew a whole install, its 195 to
+> 219 MB image built on the owner's shard, 2 to 6 times in every resumed holder's catch-up (diag-live-durability-81 and
+> -82). Every publication now bounds the tail by what installing the volume would send now, the larger of its referenced
+> bytes and its last whole record or image (`live_ship::retain_bound`, red with the referenced bytes ignored).
+> Landed only with the reply fold's fix (g227, 2026-11-19): every reply of a lagging holder had cloned each retained
+> entry it lacked (21 allocations a reply 16 behind, 1,035 at 1,024; 1.4 ms a reply 1,000 behind), so the tail alone
+> left the owner's shard spending itself on those replies, and the holder never caught up within 90 s (diag-84, 8 of 8).
+> `Shipper::fold_reply` names what the holder lacks and builds nothing, and `retains_after`, which each write's sends ask
+> per holder, no longer builds the entries either (`a_lagging_holders_reply_costs_its_owner_the_same_whatever_it_lacks`,
+> red first). Together, at 20,000 behind: 0 installs in 7 of 8 runs (main 1 to 5), the neighbour volume's worst write
+> 0.16–0.40 s (main 1.16–1.85 s); the catch-up itself slower, 3.95–6.09 s on x86 and 9.38–13.34 s on arm (main
+> 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). Open: the arm catch-up time, and this flow on
+> today's main, whose byte bounds (`Bounds::of_whole`) the measured trees predate.
 
 > **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
 > predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement
@@ -6844,7 +6923,14 @@
 >   macOS route's claim steps since A-523 (2026-11-18, g251b): each socket step waited the caller's reply deadline at a
 >   time and asked the daemon's liveness when it ran out; it now waits while the route's connection lives, as the
 >   daemon's side waits on the client's since A-492, a daemon gone closing its end
->   (`a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound`). A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
+>   (`a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound`). A client gone before its route connection is
+>   accepted since A-747 (2026-11-20, w-bugs; main's red, found by g227): on macOS `setsockopt(SO_NOSIGPIPE)` on such a
+>   socket answers `EINVAL`, which `route::Listener::accept` reported as its own failure, so the daemon counted
+>   `shards.route_failed` for a client's close and stopped draining its queue until the next wake;
+>   `route::hostile_claims_get_no_descriptor_and_the_honest_claim_succeeds_once` had failed on macOS since d576a383a
+>   added its silent connection. `accept` now answers `Accepted::Departed` for it (a peek reads its end), counted
+>   `shards.route_malformed`, a hello cut short (`a_client_gone_before_its_accept_is_no_failure_of_the_listener`). A
+>   delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
 >   descriptor until its reply deadline and gave up `DeadlineExceeded` there; it now waits on the control socket itself,
 >   readable or hung up, with no clock (`ClientEnd::wait_delivery`), and ends `ChannelLost` once the daemon is gone with
 >   nothing delivered (`a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock`, Linux, main's to run). The synchronous send's

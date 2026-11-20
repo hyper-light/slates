@@ -331,8 +331,8 @@ fn every_fetch_stock_git_answered_is_answered_from_the_stores_parts() {
 }
 
 /// Every object of `fixture`, by position, ascending.
-fn every_position(fixture: &served::Served) -> Vec<u64> {
-  let mut positions: Vec<u64> = fixture
+fn every_position(fixture: &served::Served) -> crate::positions::Positions {
+  let positions: Vec<u64> = fixture
     .objects
     .iter()
     .map(|object| {
@@ -343,8 +343,7 @@ fn every_position(fixture: &served::Served) -> Vec<u64> {
         .position
     })
     .collect();
-  positions.sort_unstable();
-  positions
+  crate::positions::Positions::of(positions)
 }
 
 /// A-653 (the store's parts through A-640 part 3's source, `Streamed::counters`). Do: begin through the source the pack
@@ -415,4 +414,47 @@ fn a_plan_past_its_admission_is_refused() {
   };
   let begun = source.begin(&served, &plan, &mut Admission::new(0));
   assert!(matches!(begun, Err(PackRefused::PastAdmission(_))));
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rule 1: nothing holds a list of every object a fetch sends). Do: begin through the
+/// source the pack of every object of A-582's repository, and the pack of none, each with room to spare, and read what
+/// each charged. Expect: what every object costs past none is one run's bytes for each run its positions make, a few
+/// words however many objects the runs hold, where the plan's copy had charged a handle an object.
+#[test]
+fn a745_a_plans_objects_are_charged_as_runs_never_an_object_at_a_time() {
+  let fixture = served::served();
+  let every = every_position(&fixture);
+  let none = crate::positions::Positions::new();
+  let charged = |objects: &crate::positions::Positions| {
+    let plan = PackPlan {
+      runs: &[],
+      objects,
+      filter: None,
+      thin: true,
+      ofs_delta: true,
+    };
+    let served = serving(&fixture, &REFS, MAIN_REF);
+    let mut clock = Ticks(0);
+    let mut source = Fragments {
+      clock: &mut clock,
+      exchange: EXCHANGE,
+      quantum_ns: LONG_TURN,
+    };
+    let mut admission = Admission::new(u64::MAX);
+    assert!(source.begin(&served, &plan, &mut admission).is_ok());
+    u64::MAX - admission.left()
+  };
+  let run_bytes = crate::to_u64(core::mem::size_of::<(u64, u64)>());
+  let past_none = charged(&every) - charged(&none);
+  assert_eq!(
+    past_none,
+    run_bytes * crate::to_u64(every.runs()),
+    "{} objects in {} runs",
+    every.len(),
+    every.runs()
+  );
+  assert!(
+    every.len() > crate::to_u64(every.runs()) * 2,
+    "the repository's objects make fewer runs than objects"
+  );
 }
