@@ -4273,33 +4273,6 @@ fn shard_arena(
   Ok((arena, slice))
 }
 
-/// This shard's repository arena (A-727 slice a2): its own chunk arena over the same content pool, its claims made under
-/// the repository owner range (`ContentPool::open_repository`), so a repository's windows are kept in the anchor's
-/// content object apart from the volumes' chunks; the extents a previous daemon's repository arena held come back to it
-/// as free regions until the shard image names its chunks (A-727 slice a3). Not `published`: no image captures this
-/// arena yet, so a free is immediate.
-fn repository_windows(
-  config: &DaemonConfig,
-  partition: u16,
-  env: &[(String, String)],
-  identity: &Identity,
-) -> Result<crate::vcs_store::arena_windows::ArenaWindows, ServerError> {
-  let (handoff, len) = handoff_of(env)?;
-  let segment = AnchorSegment::attach(&handoff, len, identity)?;
-  let mut pool = crate::content_pool::ContentPool::open_repository(config, partition, env, segment);
-  let mut arena =
-    ChunkArena::new(config.content_granule()).discarding_from(config.discard_from_bytes);
-  for (id, region) in pool.held()? {
-    arena.add_region_at(id, region)?;
-  }
-  arena.set_source(Box::new(pool));
-  Ok(crate::vcs_store::arena_windows::ArenaWindows::new(
-    arena,
-    config.page,
-    config.store.max_chunks,
-  ))
-}
-
 /// What the anchor handed back for one shard's partition (Unix): its held devices, FUSE devices (Linux) and Shards
 /// streams' resync ends (A-61, A-316, A-339), and on Linux its held writable copies (A-197).
 #[cfg(unix)]
@@ -4505,7 +4478,6 @@ async fn init_shard(
   let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
   slices.unit_done().await;
   let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
-  let repository_windows = repository_windows(config, partition, env, identity)?;
   let headroom = operation_headroom(config, slice_capacity);
   // The store owns the shard budget (§4.2): it is over what the arena can actually hand out (its
   // buddy-allocatable capacity), not the region's mapping length, so admission never promises quota
@@ -4926,7 +4898,9 @@ async fn init_shard(
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
-    vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(repository_windows)),
+    vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
+      crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
+    )),
     vcs_usage: slates_vcs::Ledger::new(config.clients_per_shard),
     hook_times: crate::vcs_hooks::HookTimesTable::default(),
     pending_green_materializations: std::collections::BTreeMap::new(),

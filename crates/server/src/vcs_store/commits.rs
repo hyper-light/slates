@@ -568,7 +568,9 @@ fn recorded(
       vec![(key, version, Some(commit))],
     )
     .map_err(Unmade::Store)?;
-  let objects = sealed.record(&state.vcs_stores).map_err(Unmade::Store)?;
+  let objects = sealed
+    .record(super::Lent::new(&mut state.store, &mut state.vcs_stores).stores)
+    .map_err(Unmade::Store)?;
   let entry = Op::RepositoryAdvanced {
     entry: RepositoryEntry {
       repository,

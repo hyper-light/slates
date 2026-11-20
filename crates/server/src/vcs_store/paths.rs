@@ -297,19 +297,21 @@ pub(crate) async fn remake_green_sliced(
       return;
     };
     let mut held = Vec::new();
-    let answer = match put_sliced(vcs_stores, repository, files, &mut held, slices).await {
+    let lent = super::Lent::new(&mut *store, vcs_stores);
+    let answer = match put_sliced(lent.stores, repository, files, &mut held, slices).await {
       Ok(entries) => made_holding(
-        vcs_stores,
+        lent.stores,
         repository,
         (key, version),
         Plan::Put(entries),
         held,
       ),
       Err(refused) => {
-        give_back(vcs_stores, repository, &held);
+        give_back(lent.stores, repository, &held);
         Err(refused)
       }
     };
+    drop(lent);
     (answer, super::settle_in(store, vcs_stores))
   };
   if !charged_whole {
@@ -445,7 +447,10 @@ fn stepped(
     Err(refused) => return (Err(refused), true),
   };
   super::lend(store, stores, plan_bytes(&plan));
-  let answer = made(stores, repository, (key, version), plan);
+  let answer = {
+    let lent = super::Lent::new(&mut *store, stores);
+    made(lent.stores, repository, (key, version), plan)
+  };
   let charged_whole = super::settle_in(store, stores);
   (answer, charged_whole)
 }

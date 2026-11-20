@@ -158,9 +158,6 @@ pub(crate) struct ContentPool {
   segment: AnchorSegment,
   /// This shard's partition.
   partition: u16,
-  /// The owner its claims are made under: the partition for the volumes' arena, or past every partition for the
-  /// repository content's arena (A-727: one shard holds two arenas from one pool, each claim told apart by its word).
-  owner: u16,
   /// Partitions in the segment.
   partitions: u16,
   /// Where each partition's slice starts in the content object, and its arena's offset within the slice.
@@ -192,7 +189,6 @@ impl ContentPool {
     ContentPool {
       segment,
       partition,
-      owner: partition,
       partitions: config.geometry.partitions.max(1),
       stride: layout.stride,
       arena_offset: layout.arena.0,
@@ -205,20 +201,6 @@ impl ContentPool {
     }
   }
 
-  /// The pool for `partition`'s repository content (A-727): the same pool and parts, its claims made under the owner
-  /// `partitions + partition`, so the repository arena's extents are told from the volumes' arena's by their words, and
-  /// a restarted daemon hands each arena back only its own.
-  pub(crate) fn open_repository(
-    config: &DaemonConfig,
-    partition: u16,
-    env: &[(String, String)],
-    segment: AnchorSegment,
-  ) -> ContentPool {
-    let mut pool = ContentPool::open(config, partition, env, segment);
-    pool.owner = pool.partitions.saturating_add(partition);
-    pool
-  }
-
   /// The capacity of one slice's parts: what this shard holds when it has claimed its own slice whole, the scale its
   /// operation headroom is derived against.
   pub(crate) fn slice_capacity(&self) -> usize {
@@ -229,14 +211,14 @@ impl ContentPool {
   /// before recovery claims the blocks its image names. A held id this layout has no part for is released.
   pub(crate) fn held(&mut self) -> Result<Vec<(u16, Region)>, ServerError> {
     let mut held = Vec::new();
-    for extent in self.segment.pool_held_by(self.owner)? {
+    for extent in self.segment.pool_held_by(self.partition)? {
       match u16::try_from(extent)
         .ok()
         .filter(|id| self.part(*id).is_some())
       {
         Some(id) => held.push((id, self.map(id)?)),
         None => {
-          self.segment.pool_release(extent, self.owner)?;
+          self.segment.pool_release(extent, self.partition)?;
         }
       }
     }
@@ -314,7 +296,7 @@ impl ContentPool {
       Ok(region) => Some((id, region)),
       Err(_) => {
         self.refused = self.refused.saturating_add(1);
-        let _released = self.segment.pool_release(usize::from(id), self.owner);
+        let _released = self.segment.pool_release(usize::from(id), self.partition);
         None
       }
     }
@@ -329,7 +311,7 @@ impl ContentPool {
         continue;
       }
       if matches!(self.segment.pool_release(word, POOL_HOLD_OWNER), Ok(true))
-        && matches!(self.segment.pool_claim(word, self.owner), Ok(true))
+        && matches!(self.segment.pool_claim(word, self.partition), Ok(true))
       {
         return self.hand_out(id);
       }
@@ -341,7 +323,7 @@ impl ContentPool {
 impl ExtentSource for ContentPool {
   fn claim(&mut self) -> Option<(u16, Region)> {
     for id in self.candidates() {
-      match self.segment.pool_claim(usize::from(id), self.owner) {
+      match self.segment.pool_claim(usize::from(id), self.partition) {
         Ok(true) => return self.hand_out(id),
         Ok(false) => {}
         // A word the segment refuses to reach (its geometry is checked at attach, so this is a layout fault): counted,
@@ -363,7 +345,7 @@ impl ExtentSource for ContentPool {
     // Unmapped first: the word may be claimed by another shard the moment it is released.
     drop(region);
     if !matches!(
-      self.segment.pool_release(usize::from(id), self.owner),
+      self.segment.pool_release(usize::from(id), self.partition),
       Ok(true)
     ) {
       self.refused = self.refused.saturating_add(1);

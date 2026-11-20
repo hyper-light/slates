@@ -672,14 +672,7 @@ pub(crate) fn make(state: &mut ShardState, record: &RepositoryRecord) {
 
 /// [`make`]'s step over the stores, the content store made at the first repository with the content plane's `window`.
 fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Result<(), Unmade> {
-  if stores.content.is_none() {
-    let content = match stores.window_storage.take() {
-      Some(storage) => ContentStore::with_storage(stores.charged, window, storage),
-      None => ContentStore::new(stores.charged, window),
-    }
-    .map_err(|_| Unmade)?;
-    stores.content = Some(content);
-  }
+  stores.content_made(window).map_err(|_| Unmade)?;
   let window = stores.content.as_ref().map_or(window, ContentStore::window);
   let store = match record.tool {
     VcsTool::Git => {
@@ -969,9 +962,128 @@ pub(crate) fn within_budget<T>(
   step: impl FnOnce(&mut VcsStores) -> T,
 ) -> T {
   lend(&mut state.store, &mut state.vcs_stores, bytes);
-  let answer = step(&mut state.vcs_stores);
+  let answer = {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    step(&mut *lent.stores)
+  };
   settle(state);
   answer
+}
+
+impl VcsStores {
+  /// Makes the shard's content store if it has none, over the windows' storage it was given (`with_windows`) or the
+  /// heap's, with the content plane's `window`: what a first repository, or a first window homed here, makes.
+  pub(crate) fn content_made(&mut self, window: usize) -> Result<(), slates_vcs::ContentRefused> {
+    if self.content.is_none() {
+      let content = match self.window_storage.take() {
+        Some(storage) => ContentStore::with_storage(self.charged, window, storage),
+        None => ContentStore::new(self.charged, window),
+      }?;
+      self.content = Some(content);
+    }
+    Ok(())
+  }
+
+  /// Lends `chunks` to the content store's windows, or to the storage a content store not made yet will keep them in,
+  /// so a store made inside the step finds it lent (`Lent`): whether it took them.
+  fn lend_in(&mut self, chunks: &mut slates_vfs::content::ChunkStore) -> bool {
+    match (self.content.as_mut(), self.window_storage.as_mut()) {
+      (Some(content), _) => content.lend_in(chunks),
+      (None, Some(storage)) => storage.lend_in(chunks),
+      (None, None) => false,
+    }
+  }
+
+  /// Hands back what [`VcsStores::lend_in`] took, from the content store or the storage not made into one yet.
+  fn hand_back(&mut self, chunks: &mut slates_vfs::content::ChunkStore) -> bool {
+    match (self.content.as_mut(), self.window_storage.as_mut()) {
+      (Some(content), _) => content.hand_back(chunks),
+      (None, Some(storage)) => storage.hand_back(chunks),
+      (None, None) => false,
+    }
+  }
+}
+
+/// The shard's chunk store lent to the repository content store for one step (A-727 slice a2, `arena_windows`): taken
+/// in when made, handed back when dropped, so no path out of the step keeps it, and the shard budget extended by what
+/// the step's puts grew the arena from its pool. A lend inside a lend takes nothing and hands nothing back; with no
+/// content store made yet, the storage it will be made over is lent.
+pub(crate) struct Lent<'a> {
+  /// The shard's chunk store, or the placeholder the content store left in its place while it is lent.
+  chunks: &'a mut slates_vfs::content::ChunkStore,
+  /// The shard's budget, extended by the arena's growth at the end.
+  budget: &'a mut slates_mem::budget::ShardBudget,
+  /// The stores the step runs over.
+  pub(crate) stores: &'a mut VcsStores,
+  /// The arena's capacity when lent, if this lend took the chunk store in.
+  took: Option<usize>,
+}
+
+impl<'a> Lent<'a> {
+  /// Lends the chunk store of `store` to the content store of `stores` for as long as this lives.
+  pub(crate) fn new(store: &'a mut Store, stores: &'a mut VcsStores) -> Lent<'a> {
+    let Store {
+      content, budget, ..
+    } = store;
+    let took = lend_chunks(content, stores);
+    Lent {
+      chunks: content,
+      budget,
+      stores,
+      took,
+    }
+  }
+}
+
+impl Drop for Lent<'_> {
+  fn drop(&mut self) {
+    hand_chunks_back(self.chunks, self.budget, self.stores, self.took);
+  }
+}
+
+/// The shard's chunk store taken in by [`take_chunks`], for [`give_chunks`] to hand back.
+#[derive(Debug)]
+#[must_use = "a chunk store taken in is handed back by give_chunks"]
+pub(crate) struct Taken(Option<usize>);
+
+/// Lends the shard's chunk store to its content store for a caller that holds the state across a serving call whose
+/// reads are `&self` (`lfs::ShardObjects`): handed back by [`give_chunks`].
+pub(crate) fn take_chunks(state: &mut ShardState) -> Taken {
+  Taken(lend_chunks(&mut state.store.content, &mut state.vcs_stores))
+}
+
+/// Hands back what [`take_chunks`] took, the shard budget extended by the arena's growth.
+pub(crate) fn give_chunks(state: &mut ShardState, taken: Taken) {
+  let ShardState {
+    store, vcs_stores, ..
+  } = state;
+  hand_chunks_back(&mut store.content, &mut store.budget, vcs_stores, taken.0);
+}
+
+/// Lends `chunks` to `stores`: the arena's capacity then, if taken.
+fn lend_chunks(
+  chunks: &mut slates_vfs::content::ChunkStore,
+  stores: &mut VcsStores,
+) -> Option<usize> {
+  let capacity = chunks.arena().capacity();
+  stores.lend_in(chunks).then_some(capacity)
+}
+
+/// Hands back what [`lend_chunks`] took, `budget` extended by what the arena grew meanwhile.
+fn hand_chunks_back(
+  chunks: &mut slates_vfs::content::ChunkStore,
+  budget: &mut slates_mem::budget::ShardBudget,
+  stores: &mut VcsStores,
+  took: Option<usize>,
+) {
+  let Some(before) = took else {
+    return;
+  };
+  stores.hand_back(chunks);
+  let grown = chunks.arena().capacity().saturating_sub(before);
+  if grown > 0 {
+    budget.extend(u64::try_from(grown).unwrap_or(u64::MAX));
+  }
 }
 
 /// Runs `read` over the stores, read only, with the room [`lend`] gives: what a step that parses objects needs, since
@@ -983,7 +1095,10 @@ fn lent_to_read<T>(
   read: impl FnOnce(&VcsStores) -> T,
 ) -> T {
   lend(store, stores, 0);
-  let answer = read(stores);
+  let answer = {
+    let lent = Lent::new(&mut *store, stores);
+    read(&*lent.stores)
+  };
   set_back(stores);
   answer
 }
@@ -993,8 +1108,22 @@ fn lent_to_read<T>(
 /// (A-654). Read only, so the room lent is given back and nothing is charged.
 pub(crate) fn with_room<T>(state: &mut ShardState, read: impl FnOnce(&ShardState) -> T) -> T {
   lend(&mut state.store, &mut state.vcs_stores, 0);
-  let answer = read(state);
+  let answer = lent_state(state, |state| read(state));
   set_back(&mut state.vcs_stores);
+  answer
+}
+
+/// Runs `step` over the whole shard state with the shard's chunk store lent to the repository content store (`Lent`'s
+/// rule, for a step that needs more of the state than the stores): taken in before and handed back after, nothing
+/// between the two able to leave another way. Within it the volume store's chunk store is the placeholder, so the step
+/// grows nothing and reads no volume chunk; [`lend`] runs before it.
+pub(crate) fn lent_state<T>(state: &mut ShardState, step: impl FnOnce(&mut ShardState) -> T) -> T {
+  let took = lend_chunks(&mut state.store.content, &mut state.vcs_stores);
+  let answer = step(state);
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  hand_chunks_back(&mut store.content, &mut store.budget, vcs_stores, took);
   answer
 }
 
@@ -1573,7 +1702,10 @@ fn replay_record(
       .map_or(0, |records| records.index().entries());
     svn_room(store, svn.charged, entries)
   });
-  let replayed = replay_into(vcs_stores, id, bytes, room);
+  let replayed = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    replay_into(lent.stores, id, bytes, room)
+  };
   let mut whole = settle_in(store, vcs_stores);
   if let Some(svn) = vcs_stores.subversion(id) {
     whole &= settle_records(store, svn);
@@ -1641,7 +1773,10 @@ fn hg_record_step(
     0
   };
   lend(store, vcs_stores, lent);
-  let stepped = hg_step_in(vcs_stores, id, bytes, replay);
+  let stepped = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    hg_step_in(lent.stores, id, bytes, replay)
+  };
   let whole = settle_in(store, vcs_stores);
   if !whole {
     state.count(CHARGE_SHORT, 1);

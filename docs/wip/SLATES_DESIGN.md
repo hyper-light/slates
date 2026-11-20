@@ -54808,6 +54808,16 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   committed image names is not reused before a newer image commits; (a3) the content table in the shard image and its
   recovery before the records; (b) git's record version 3; (c) Subversion's texts with A-716's slices; (d) replication's
   content-before-record order, held by the two-node test.
+- **Slice a2, landed (2026-11-20; main's ruling (ii)).** The windows are chunks of the volume store's own chunk store
+  (`vcs_store::arena_windows::ChunkWindows`), one arena and one budget (A-64): a second arena over the same pool was
+  tried first and found nothing to claim. The chunk store is lent to the content store per step by a swap
+  (`WindowStorage::lend_in`/`hand_back`, `ChunkStore::empty` the placeholder) under a guard (`vcs_store::Lent`, and
+  `lent_state` for a step over the whole state), so readers keep `&ContentStore` and nothing is unsafe; a lend inside
+  a lend takes nothing; outside one a read answers none and a put is refused `ContentRefused::Storage`, typed, and a
+  release frees its chunk at the next lend. A put the arena has no block for grows it from its pool, the lend's end
+  extending the shard budget by the growth. The swap moves a `ChunkStore` (560 bytes); its release cost is measured with the slice's by-use run.
+  Tests: `slates-server` lib 926 of 927 (the one, `vcs_ssh::tests::hg::an_hg_client_is_served_over_the_edge_as_7_2_serves_it`,
+  failed once under the full run's load and passes alone 3 of 3), `arena_windows::tests` 2 of 2.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)

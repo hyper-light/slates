@@ -369,7 +369,8 @@ fn advance(
     return None;
   }
   lend(&mut state.store, &mut state.vcs_stores, 0);
-  let stores = &mut state.vcs_stores;
+  let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let stores = &mut *lent.stores;
   let advanced = match (stores.content.as_mut(), stores.imports.get_mut(&id)) {
     (
       Some(content),
@@ -387,6 +388,7 @@ fn advance(
     }
     _ => None,
   };
+  drop(lent);
   grown_and_settled(state);
   true_up_holding(state, id);
   advanced
@@ -495,7 +497,8 @@ fn write_turn(
   (clock, quantum_ns): (&mut dyn Clock, u64),
 ) -> Result<Turned, ImportFailed> {
   let start = clock.now_ns();
-  let stores = &mut state.vcs_stores;
+  let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let stores = &mut *lent.stores;
   let written = match (stores.content.as_ref(), stores.imports.get_mut(&id)) {
     (
       Some(content),
@@ -520,6 +523,7 @@ fn write_turn(
     }
     _ => return Err(ImportFailed::NoStore),
   };
+  drop(lent);
   match written {
     Ok(true) => Ok(Turned::More),
     Ok(false) => written_whole(state, id),
@@ -692,7 +696,9 @@ pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), Impor
     }
     None => return Err(ImportFailed::NoStore),
   };
-  let entry = landing_entry(state, id, (&*imported, room), record);
+  let entry = super::lent_state(state, |state| {
+    landing_entry(state, id, (&*imported, room), record)
+  });
   let mut index = Some(core::mem::take(&mut imported.index));
   let appended = entry.and_then(|(owner, changes, parts, record)| {
     crate::repository::push::push_imported(

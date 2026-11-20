@@ -312,6 +312,8 @@ pub(crate) struct ShardObjects<'s> {
   repository: RepositoryId,
   /// Who asks: an upload's entry is appended by them.
   principal: Option<Principal>,
+  /// The shard's chunk store, lent to the repository's windows while the answer reads them (A-727 slice a2).
+  taken: Option<crate::vcs_store::Taken>,
 }
 
 impl Objects for ShardObjects<'_> {
@@ -336,7 +338,13 @@ impl Objects for ShardObjects<'_> {
       bytes,
       refused: None,
     };
-    match push_lfs(self.state, (&principal, self.repository), &mut upload) {
+    // The upload's append lends the chunk store itself, with the room the shard admits, so it is handed back first.
+    if let Some(taken) = self.taken.take() {
+      crate::vcs_store::give_chunks(self.state, taken);
+    }
+    let pushed = push_lfs(self.state, (&principal, self.repository), &mut upload);
+    self.taken = Some(crate::vcs_store::take_chunks(self.state));
+    match pushed {
       Ok(_) => Ok(Admitted::New),
       Err(refused) => Err(upload_refused(upload.refused, &refused, bytes.len())),
     }
@@ -462,17 +470,23 @@ pub(crate) fn answer(state: &mut ShardState, call: &LfsCall<'_>) -> Answer {
     };
     return server.answer(&request, &context, &mut admission);
   }
+  let taken = Some(crate::vcs_store::take_chunks(state));
   let mut objects = ShardObjects {
     state,
     repository: record.id,
     principal: call.principal.cloned(),
+    taken,
   };
   let mut server = Server {
     access: &access,
     objects: &mut objects,
     locks: &mut NoLocks,
   };
-  server.answer(&request, &context, &mut admission)
+  let answer = server.answer(&request, &context, &mut admission);
+  if let Some(taken) = objects.taken.take() {
+    crate::vcs_store::give_chunks(objects.state, taken);
+  }
+  answer
 }
 
 /// Whether `endpoint` is the locks API's, whose answer reads and writes the locks log alone.

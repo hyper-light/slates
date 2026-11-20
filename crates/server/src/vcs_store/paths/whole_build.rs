@@ -277,7 +277,8 @@ fn put_some(
     };
     let brought = u64::try_from(file.bytes.len()).unwrap_or(u64::MAX);
     super::super::lend(store, vcs_stores, brought);
-    let put = vcs_stores
+    let put = super::super::Lent::new(&mut *store, vcs_stores)
+      .stores
       .git(build.repository)
       .ok_or(StepRefused::NoMap)
       .and_then(|(content, _)| super::put_file(content, &file, &mut build.held));
@@ -320,7 +321,7 @@ fn finish(state: &mut ShardState, green: DbVolumeId, build: Build) {
     // The map's and trees' nodes are lent the room the shard could admit now, as a step's are (`super::stepped`).
     super::super::lend(&mut state.store, &mut state.vcs_stores, 0);
     let answer = made_holding(
-      &mut state.vcs_stores,
+      super::super::Lent::new(&mut state.store, &mut state.vcs_stores).stores,
       repository,
       (key, version),
       Plan::Put(entries),

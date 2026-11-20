@@ -32,7 +32,7 @@
 //! not answer within the budget; an answer naming another identity than the bytes' (never in a correct home).
 
 use slates_db::register::rendezvous_ranked_by_key;
-use slates_vcs::{ContentId, ContentRefused, ContentStore};
+use slates_vcs::{ContentId, ContentRefused};
 
 use crate::state::ShardState;
 
@@ -175,18 +175,21 @@ pub(crate) fn keep_here(
   state: &mut ShardState,
   bytes: &[u8],
 ) -> Result<(ContentId, HomeTicket), HomeRefused> {
-  if state.vcs_stores.content.is_none() {
-    let window = state.store.content.chunk_bytes();
-    let made = ContentStore::new(state.vcs_stores.charged, window).map_err(HomeRefused::Content)?;
-    state.vcs_stores.content = Some(made);
-  }
+  let window = state.store.content.chunk_bytes();
+  state
+    .vcs_stores
+    .content_made(window)
+    .map_err(HomeRefused::Content)?;
   let need = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   super::lend(&mut state.store, &mut state.vcs_stores, need);
-  let kept = state
-    .vcs_stores
-    .content
-    .as_mut()
-    .map(|content| content.put(bytes));
+  let kept = {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map(|content| content.put(bytes))
+  };
   super::settle(state);
   match kept {
     Some(Ok(identity)) => {
@@ -201,12 +204,15 @@ pub(crate) fn keep_here(
 
 /// The bytes of the window `identity` this shard keeps as its home, if it keeps it.
 pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<Vec<u8>> {
-  let bytes = state
-    .vcs_stores
-    .content
-    .as_ref()
-    .and_then(|content| content.bytes_of(identity))
-    .map(std::borrow::Cow::into_owned)?;
+  let bytes = {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_ref()
+      .and_then(|content| content.bytes_of(identity))
+      .map(std::borrow::Cow::into_owned)
+  }?;
   state.count(READ, 1);
   Some(bytes)
 }
@@ -222,11 +228,14 @@ pub(crate) fn let_go_here(state: &mut ShardState, identity: &ContentId) -> Resul
     return Err(HomeRefused::NotHeld);
   }
   super::lend(&mut state.store, &mut state.vcs_stores, 0);
-  let released = state
-    .vcs_stores
-    .content
-    .as_mut()
-    .map(|content| content.release(identity));
+  let released = {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map(|content| content.release(identity))
+  };
   super::settle(state);
   match released {
     Some(Ok(_)) => {
