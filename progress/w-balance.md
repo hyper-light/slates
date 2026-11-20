@@ -100,3 +100,11 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - NEXT: P5b = cold lever 3 (move a repository's cold windows to homes; stores read through) needs a read-through seam
   in ContentStore/git store (crates w-perf/w-git own) -> propose seam; intake decode on ingress shard waits on A-722.
   Meanwhile P7 harness (push_load.py many repos) can proceed.
+- dcb6a0406 LANDED: §4.10 amended (content homed by identity), from worktree ~/slates-work/w-balance-land (clean
+  origin/main) since local w-balance main holds wip bench commit 1e84630b1 (branch agents/w-balance-load; must be
+  re-landed via fresh worktree with real message).
+- P7: harness crates/cli/bench/multi_repo_load.py on agents/w-balance-load; release built on .local-2 at
+  ~/.cache/w-balance-target/release/slates (src ~/.cache/w-balance/src). run1: alone 0.228/0.705/3.174 s for
+  v0.99/v1.0.0/v1.5.0 holding 70/183/777 MiB; v2.0.0 push KILLS the daemon (run-requests). run2 (3 classes) r7 running.
+- w-perf seam proposal sent via agents_send (id 01a1f722b428761c9ae0225a84cc3b41) + inbox/w-perf-from-w-balance.md;
+  w-perf replies in inbox/w-perf-w-balance-homes.md.
