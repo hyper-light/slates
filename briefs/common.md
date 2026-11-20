@@ -111,6 +111,9 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
   fast landing rule, confirmed with `git merge-base --is-ancestor`.
 - A red check still running (a Windows red, a CI diag) doesn't hold a green piece back: land on the green, then add the red's
   numbers as a follow-up commit.
+- Only finished commits reach main, each with an area-prefixed message that carries the measured fact. Fold "wip"
+  commits into the real one before pushing (`git commit --amend` while they're unpushed). A commit on main is
+  permanent, since we never force-push. (03f872541 "wip" reached main at 07:39.)
 - An experiment that lost goes into BENCHMARKS as measured-and-rejected, and then its branch is deleted. Main audits
   agents/* branches every five minutes.
 
