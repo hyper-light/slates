@@ -6822,3 +6822,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-bugs A-747 (main 4e9c31aba): owed (main): clippy ipc/server; Linux run of slates-ipc --lib route:: (accept on Linux: departed path).
 - 2026-11-20 w-shared typed copy refusals (main c2de447a8): clippy + xtask (ipc Refusal/CopyCase appended, merge Outcome/Judgment/Rebased/Landed variants); SDK lane; Linux/Windows slates-merge lib + server t_a626_p4
 - 2026-11-20 w-git A-722 part 4b (main 5014be90a): push intake seal now turn-sliced; w-perf git_scale.sh / push_load.py rerun requested
+- 2026-11-20 w-fed-faults A-580/A-708 (kiln main 30c5929, e33c470): owed (main): Linux x86_64 `SLATES_FLEET_FAULTS=1 cargo test -p kiln --test slates_fleet_faults -- --nocapture --test-threads 1` (six flows: killed, partitioned, restarted, move cut midway, slow lossy link, runner cut off; never run yet); kiln clippy on the change.

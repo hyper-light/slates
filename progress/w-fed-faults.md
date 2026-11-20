@@ -1,13 +1,14 @@
 # RESUME HERE (2026-11-20 ~13:00Z, Mac Studio d1323898; supersedes everything below)
 - LANDED: kiln 30c5929 (A-580 harness), e33c470 (A-708); slates a5140de (fleet.rs:4819 red: test held a's write
   attachment while b attached, A-414 refuses LeaseHeld by design; a detaches first; 808 s red -> 1.45 s green).
-- A-734 READY TO LAND: tested change = worktree ~/slates-work/w-fed-faults-p3 (merge 348845f88 over kiln main
+- A-734 LANDED kiln 0edd8dc (2026-11-20). Was: tested change = worktree ~/slates-work/w-fed-faults-p3 (merge 348845f88 over kiln main
   4aabdba18) PLUS later test-only edits there (agents.start "try again" retry, isolation "none", on_hosts engine host,
   hold_to_no_loss live-ship+share). Clean single-commit worktree ~/slates-work/w-fed-faults-a734 (branch
   agents/w-fed-faults-a734 off 4aabdba18) holds the earlier diff staged: re-apply `git -C p3 diff 4aabdba18` before
   committing. Land via ship route (land.sh, kiln).
 - PROVEN by use (macOS): cut-off flow PASSES end to end (one fleet, kiln's own bootstrap, live-shipped+shared volume,
-  8/8 served while cut and after heal, fleet re-forms; 35.8 s). Slow-link flow in progress (p12-slow.log).
+  8/8 served while cut and after heal, fleet re-forms; 35.8 s). Slow-link flow: move over the slow link neither moved nor refused in 900 s (p12-slow.log); diagnosing
+  with move diagnostics (p13-slow.log), worktree ~/slates-work/w-fed-faults-p3.
 - Findings for main: kiln workspaces not live-shipped (decision); kiln shares a workspace only with a move target;
   "isolated agent doesn't move" refusal has no W7 kind; Slates forward-lane log flood (lane dropped when empty, floor
   re-crosses the failover delay each forward: 1M lines in one test); one run where fleet-c never served (not reproduced).
