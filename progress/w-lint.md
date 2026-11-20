@@ -172,3 +172,6 @@
   the background (r33).
 - Ada (2026-11-20): don't block on remote/CI runs; run focused unit and integration tests here and merge. Windows lane
   now runs in the background and its findings are fixed when it ends.
+- Windows r34 at 159f1c8 (r33 lost to a kiln timeout): referenced-content tests from bc6cc7ab1 (vfs tests/referenced.rs
+  unwrap_in_result, slicing, cast; server vcs_store/referenced.rs cast) -> 6e5f6a53a, landed via 2d3f218cb; vfs
+  referenced 6 pass, server referenced 2 pass locally.
