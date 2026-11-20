@@ -549,3 +549,58 @@ fn an_ra_svn_session_proves_a_tokens_principal_by_cram_md5_from_its_record() {
     ]
   );
 }
+
+/// A-764 (a principal and its credentials are fleet state, §4.13). Do: apply a member's enrollment of a key here, then
+/// the same again, then its revocation, then the same again. Expect the record held after the first, held unchanged
+/// after the second (each answered held, as asked), gone after the revocation and still gone after the second; each
+/// change counted as applied, and an answer, which asks nothing, never held.
+#[test]
+fn a764_a_members_enrollment_and_revocation_are_held_here_and_idempotent() {
+  use slates_cluster::credentials::CredentialMessage;
+  crate::daemon::audit_on_shard(|state| {
+    let blob = rsa_blob();
+    let id = ssh_key_id(&blob);
+    let record = CredentialRecord {
+      id,
+      principal: proven(),
+      kind: CredentialKind::SshKey {
+        algorithm: "ssh-rsa".to_owned(),
+        blob,
+      },
+      expires_ns: None,
+    };
+    let enroll = CredentialMessage::Enroll {
+      record: record.clone(),
+    };
+    assert!(super::apply_here(state, &enroll), "held as asked");
+    assert_eq!(held(state, &id), Some(record.clone()));
+    assert!(
+      super::apply_here(state, &enroll),
+      "the same enrollment again: held, nothing changed"
+    );
+    assert_eq!(held(state, &id), Some(record));
+    assert_eq!(
+      counted(state, "credential.fleet.applied"),
+      1,
+      "one change made"
+    );
+    revoked_twice(state, id);
+  });
+}
+
+/// The revocation half of the A-764 test above: a member's revocation of `id` applied here twice, then an answer.
+fn revoked_twice(state: &mut ShardState, id: [u8; 32]) {
+  use slates_cluster::credentials::CredentialMessage;
+  let revoke = CredentialMessage::Revoke { id };
+  assert!(super::apply_here(state, &revoke), "let go as asked");
+  assert_eq!(held(state, &id), None);
+  assert!(
+    super::apply_here(state, &revoke),
+    "the same revocation again: gone either way"
+  );
+  assert_eq!(counted(state, "credential.fleet.applied"), 2);
+  assert!(
+    !super::apply_here(state, &CredentialMessage::Answer { id, held: true }),
+    "an answer asks nothing"
+  );
+}

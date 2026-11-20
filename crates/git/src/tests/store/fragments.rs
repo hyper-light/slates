@@ -523,3 +523,53 @@ fn double_hashing_costs() {
   std::io::stdout().write_all(line.as_bytes()).unwrap();
   repository.release(&mut store).unwrap();
 }
+
+/// A clock whose every read jumps by a different, large amount: what a loaded shard's clock looks like to the encoder.
+struct Jumps(u64, u64);
+
+impl crate::store::learn::Clock for Jumps {
+  fn now_ns(&mut self) -> u64 {
+    // Format: xorshift64's shifts (Marsaglia, 2003), the jump its low 20 bits.
+    self.1 ^= self.1 << 13;
+    self.1 ^= self.1 >> 7;
+    self.1 ^= self.1 << 17;
+    self.0 = self.0.saturating_add(self.1 & 0xF_FFFF);
+    self.0
+  }
+}
+
+/// Main's ruling (2026-11-20; CLAUDE.md §4's determinism gates): the encoder's bytes are one function of its input. Do:
+/// in two fresh repositories, push the same two versions (a 200-line file, then one line of it edited) and encode each
+/// version's fragments, one under a clock that ticks a nanosecond a read, the other under one that jumps by a different
+/// large amount every read. Expect: both versions' fragments byte for byte the same. Before the level and the window
+/// were chosen from measured rates, each level sampled and each trial was timed on the clock, so the two could differ.
+#[test]
+fn a_versions_fragments_are_the_same_bytes_whatever_the_owners_clock_reads() {
+  for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+    let encode = |clock: &mut dyn crate::store::learn::Clock| {
+      let mut store = store();
+      let mut repository = Repository::new(format);
+      let first = commit_over(format, &text(200, &[]), &[], 1);
+      let second = commit_over(format, &text(200, &[120]), &[first[0].id], 2);
+      let mut kept = Vec::new();
+      for (version, objects) in [first, second].into_iter().enumerate() {
+        let head = objects[0].id;
+        push_and_move(&mut repository, &mut store, objects, &[(1, Some(head))]).unwrap();
+        repository
+          .encode_fragments(&mut store, (1, version), clock, EXCHANGE)
+          .unwrap();
+        kept.push(
+          repository
+            .fragments(1, version)
+            .map(|(objects, blobs)| (objects.to_vec(), blobs.to_vec())),
+        );
+      }
+      repository.release(&mut store).unwrap();
+      kept
+    };
+    let ticking = encode(&mut Ticks(0));
+    let jumping = encode(&mut Jumps(0, 0x9E37_79B9_7F4A_7C15));
+    assert!(ticking.iter().all(Option::is_some));
+    assert_eq!(ticking, jumping);
+  }
+}

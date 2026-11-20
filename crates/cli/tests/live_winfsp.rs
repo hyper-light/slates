@@ -17,12 +17,13 @@
   clippy::disallowed_methods
 )]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Shape: how long a fleet step may take on a loaded box: the formation wait of the process flows.
-const FLEET_WAIT: Duration = Duration::from_secs(60);
 /// Shape: the pause between polls.
 const POLL: Duration = Duration::from_millis(20);
 /// Shape: shards per daemon: two, so a volume's owner shard need not be the control shard.
@@ -75,12 +76,23 @@ fn value_of(text: &str, key: &str) -> String {
     .to_owned()
 }
 
-/// Runs `args` on `instance` until it is not refused for an unready consensus, within the fleet wait.
+/// A wait judged in the CPU of `instance`'s daemon (`process_wait::Judged` on the pid its `status` names): Windows lists
+/// no instance's processes by command line, and a live daemon's watchdog keeps it moving, so it is waited on while it
+/// lives (A-232). Every wait of this suite's is judged so since 2026-11-20; until then within a 60 s `FLEET_WAIT`.
+fn daemon_judged(instance: &str) -> process_wait::Judged {
+  let (code, out, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "status: {err}");
+  process_wait::Judged::of(value_of(&out, "pid").parse().unwrap())
+}
+
+/// Runs `args` on `instance` until it is not refused for an unready consensus, while its daemon gains CPU
+/// ([`daemon_judged`]).
 fn run_ready(instance: &str, args: &[&str]) -> String {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let mut judged = daemon_judged(instance);
   loop {
     let (code, out, err) = run(instance, args);
-    if code == 1 && err.contains("ConsensusNotInitialized") && Instant::now() < deadline {
+    if code == 1 && err.contains("ConsensusNotInitialized") {
+      judged.look(&format!("{args:?} not refused: {err}"));
       pause();
       continue;
     }
@@ -203,15 +215,19 @@ fn start_fleet_anchor(instance: &str, manifest: &str, node: &str) -> OwnedProces
   OwnedProcess { child }
 }
 
-fn wait_answers(instance: &str) {
-  let started = Instant::now();
+/// Waits until the daemon at `instance` answers, while its anchor `anchor` gains CPU (until 2026-11-20 within the fleet
+/// wait).
+fn wait_answers(instance: &str, anchor: &OwnedProcess) {
+  let mut judged = process_wait::Judged::of(anchor.child.id());
   while run(instance, &["volume", "list"]).0 != 0 {
-    assert!(
-      started.elapsed() < FLEET_WAIT,
-      "the daemon at {instance} came up"
-    );
+    judged.look(&format!("the daemon at {instance} came up"));
     pause();
   }
+}
+
+/// A wait over every node of a fleet: its anchors' processes judged together.
+fn anchors_judged(anchors: &[OwnedProcess]) -> process_wait::Judged {
+  process_wait::Judged::of_all(anchors.iter().map(|anchor| anchor.child.id()).collect())
 }
 
 /// This node's member id and how many members and probed peers it holds, from `status`.
@@ -227,9 +243,9 @@ fn fleet_view(instance: &str) -> Option<(String, usize, u32)> {
   ))
 }
 
-/// Waits until every node holds all three members with both peers probed; their member ids.
-fn wait_formed(instances: &[String]) -> Vec<String> {
-  let deadline = Instant::now() + FLEET_WAIT;
+/// Waits until every node holds all three members with both peers probed, while the anchors gain CPU; their member ids.
+fn wait_formed(instances: &[String], anchors: &[OwnedProcess]) -> Vec<String> {
+  let mut judged = anchors_judged(anchors);
   loop {
     let views: Vec<_> = instances
       .iter()
@@ -242,14 +258,15 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
     }) {
       return views.into_iter().map(|view| view.unwrap().0).collect();
     }
-    assert!(Instant::now() < deadline, "the fleet formed: {views:?}");
+    judged.look(&format!("the fleet formed: {views:?}"));
     pause();
   }
 }
 
-/// Waits until every node has all three members voting and configured and a record session to each peer.
-fn wait_settled(instances: &[String]) {
-  let deadline = Instant::now() + FLEET_WAIT;
+/// Waits until every node has all three members voting and configured and a record session to each peer, while the
+/// anchors gain CPU.
+fn wait_settled(instances: &[String], anchors: &[OwnedProcess]) {
+  let mut judged = anchors_judged(anchors);
   loop {
     let views: Vec<(String, String, usize)> = instances
       .iter()
@@ -274,10 +291,9 @@ fn wait_settled(instances: &[String]) {
     if whole {
       return;
     }
-    assert!(
-      Instant::now() < deadline,
+    judged.look(&format!(
       "the fleet settled (council voters, configuration members, record sessions): {views:?}"
-    );
+    ));
     pause();
   }
 }
@@ -307,16 +323,14 @@ fn free_drive_letter() -> String {
   format!("{letter}:")
 }
 
-/// Waits until `path` answers (the drive registers after the mount's reply), within the fleet wait.
-fn wait_ready(path: &str) {
-  let started = Instant::now();
-  while started.elapsed() < FLEET_WAIT {
-    if std::fs::metadata(path).is_ok() {
-      return;
-    }
+/// Waits until `path` answers (the drive registers after the mount's reply), while `instance`'s daemon gains CPU
+/// ([`daemon_judged`]).
+fn wait_ready(instance: &str, path: &str) {
+  let mut judged = daemon_judged(instance);
+  while std::fs::metadata(path).is_err() {
+    judged.look(&format!("{path} answered"));
     pause();
   }
-  panic!("{path} never answered within {FLEET_WAIT:?}");
 }
 
 #[link(name = "ntdll")]
@@ -412,26 +426,27 @@ fn start_fleet() -> (ScratchDir, Vec<OwnedProcess>, Vec<String>, usize) {
     .zip(&instances)
     .map(|(node, instance)| start_fleet_anchor(instance, &manifest, node))
     .collect();
-  for instance in &instances {
-    wait_answers(instance);
+  for (instance, anchor) in instances.iter().zip(&anchors) {
+    wait_answers(instance, anchor);
   }
-  let hosts = wait_formed(&instances);
+  let hosts = wait_formed(&instances, &anchors);
   let bootstrap = (0..hosts.len())
     .min_by_key(|index| hosts[*index].parse::<u64>().unwrap())
     .unwrap();
   let (code, _, err) = run(&instances[bootstrap], &["bootstrap", "root"]);
   assert_eq!(code, 0, "one bootstrap of the fresh fleet: {err}");
-  wait_settled(&instances);
+  wait_settled(&instances, &anchors);
   (scratch, anchors, instances, bootstrap)
 }
 
-/// `sync_all` retried while it fails, within the fleet wait: resumed, the owner's lease is confirmed again within a
-/// heartbeat or two, and its first flush may meet the log not yet caught up. The last answer.
-fn synced_once_served(file: &std::fs::File) -> std::io::Result<()> {
-  let deadline = Instant::now() + FLEET_WAIT;
+/// `sync_all` retried while it fails and the owner `owner`'s daemon gains CPU ([`daemon_judged`]): resumed, the owner's
+/// lease is confirmed again within a heartbeat or two, and its first flush may meet the log not yet caught up. The last
+/// answer.
+fn synced_once_served(owner: &str, file: &std::fs::File) -> std::io::Result<()> {
+  let mut judged = daemon_judged(owner);
   loop {
     let synced = file.sync_all();
-    if synced.is_ok() || Instant::now() >= deadline {
+    if synced.is_ok() || !matches!(judged.judge(), process_wait::Verdict::Waiting { .. }) {
       return synced;
     }
     pause();
@@ -468,7 +483,7 @@ fn a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   let drive = free_drive_letter();
   let (code, _, err) = run(&owner, &["mount", &id, &drive]);
   assert_eq!(code, 0, "mount: {err}");
-  wait_ready(&format!("{drive}\\"));
+  wait_ready(&owner, &format!("{drive}\\"));
   let path = format!("{drive}\\synced");
   let mut file = std::fs::File::create(&path).unwrap();
   file.write_all(b"held by a candidate").unwrap();
@@ -485,7 +500,7 @@ fn a_winfsp_flush_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   let alone = file.sync_all();
   let alone_took = began.elapsed();
   drop(suspended);
-  let resumed = synced_once_served(&file);
+  let resumed = synced_once_served(&owner, &file);
   drop(file);
   let counters = live_counters(&owner);
   let _ = run(&owner, &["unmount", &drive]);

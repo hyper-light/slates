@@ -5789,7 +5789,8 @@ fn a_destroyed_volumes_mount_refuses_writes_and_never_lets_them_reach_the_disk_b
     .status();
   assert!(
     await_unmounted(&mount_point.path),
-    "the user's unmount took within {MOUNT_TABLE_WAIT:?}"
+    "the user's unmount took within {:?}",
+    process_wait::MOUNT_TABLE_WAIT
   );
   let beneath: Vec<_> = std::fs::read_dir(&mount_point.path)
     .unwrap()
@@ -5941,7 +5942,8 @@ fn fill_through_a_writable_mount(instance: &str, id: &str, path: &str) -> String
   assert_eq!(code, 0, "{err}");
   assert!(
     await_unmounted(path),
-    "the writable mount ended within {MOUNT_TABLE_WAIT:?}"
+    "the writable mount ended within {:?}",
+    process_wait::MOUNT_TABLE_WAIT
   );
   file
 }
@@ -6140,41 +6142,11 @@ fn a_fuse_mounts_unmount_frees_its_registry_attachment() {
   );
 }
 
-/// Derived: how long a wait on the kernel's mount table may take to show a change: the observation budget
-/// (`slates_server::daemon::OBSERVE_BUDGET_NS`, ten liveness budgets), the longest any party here goes unobserved. No
-/// CPU budget: the waiting test spends none, and the kernel's unmount is the kernel's work (main's ruling,
-/// 2026-11-20). Until 2026-11-20 the wait polled the table at the test's pace.
-#[cfg(target_os = "linux")]
-const MOUNT_TABLE_WAIT: Duration = Duration::from_nanos(slates_server::daemon::OBSERVE_BUDGET_NS);
-
-/// Waits until the kernel's mount table lists nothing at `path`, woken by the table's own change notification (a
-/// `POLLPRI` on `/proc/self/mountinfo`, which the kernel raises at each mount or unmount in the namespace; read to its
-/// end again after each, which rearms it), within [`MOUNT_TABLE_WAIT`]; whether it came to list nothing.
+/// Waits until the kernel's mount table lists nothing at `path`, woken by the table's own change notification
+/// ([`process_wait::await_mount_table`]), within [`process_wait::MOUNT_TABLE_WAIT`]; whether it came to list nothing.
 #[cfg(target_os = "linux")]
 fn await_unmounted(path: &str) -> bool {
-  use std::io::{Read, Seek};
-  let deadline = Instant::now() + MOUNT_TABLE_WAIT;
-  let mut table = std::fs::File::open("/proc/self/mountinfo").unwrap();
-  let mut drained = String::new();
-  loop {
-    // Read to the end before checking, so a change between the check and the wait raises the next notification.
-    drained.clear();
-    table.rewind().unwrap();
-    table.read_to_string(&mut drained).unwrap();
-    if mountinfo_at(path).is_none() {
-      return true;
-    }
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-      return false;
-    }
-    let mut fds = [rustix::event::PollFd::new(
-      &table,
-      rustix::event::PollFlags::PRI,
-    )];
-    let timeout = rustix::time::Timespec::try_from(left).unwrap();
-    let _ = rustix::event::poll(&mut fds, Some(&timeout));
-  }
+  process_wait::await_mount_table(|| mountinfo_at(path).is_none())
 }
 
 /// The kernel's mount table entry at `path` (Linux `mountinfo`): its filesystem type and source.

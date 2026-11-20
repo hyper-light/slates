@@ -802,3 +802,319 @@ fn at_flush(
     _ => Ok(false),
   }
 }
+
+/// A v0 or v1 request answered in turns (A-745 item 3; §4.17.1 "A fetch's answer" rule 3): what the request bounds is
+/// read and checked now, as [`answer`] reads it; then the answer's steps ([`Answer::write_within`]) make its
+/// acknowledgments a have a unit, each `ready` the server asks stepped a parent a unit ([`negotiation::Ready`]), and its
+/// negotiation (`done` taken, as a stateless v0 request's is) its cut and its choice a unit at a time; the head (the
+/// shallow-update, then the acknowledgments) is written once both are known, and the pack begun from the choice.
+pub(super) fn answer_in_turns<P: PackSource>(
+  served: &Served<'_>,
+  bytes: &[u8],
+  admission: &mut Admission,
+) -> Result<Answer<P::Pack>, Refusal> {
+  refs::check_order(served.refs)?;
+  let format = served.repository.format();
+  let asked = read(bytes, format, admission)?;
+  check_chosen(&asked, format)?;
+  if asked.wants.is_empty() {
+    return Ok(Answer::whole(Vec::new()));
+  }
+  let graph = StoreGraph::new(served.repository, served.store, served.refs);
+  if let Some(id) = asked.wants.iter().find(|id| graph.node(id).is_none()) {
+    return Err(Refusal::Negotiation(negotiation::Refusal::NotOurs {
+      id: *id,
+    }));
+  }
+  let not = asked
+    .not
+    .iter()
+    .map(|rev| refs::deepen_not(&graph, served, rev))
+    .collect::<Result<Vec<ObjectId>, Refusal>>()?;
+  let filter = asked
+    .filter
+    .map(Filter::parse)
+    .transpose()
+    .map_err(Refusal::Filter)?;
+  let chosen = asked.chosen();
+  let sparse = sparse::read(&graph, served, filter.as_ref(), admission)?;
+  let request = negotiation::Request {
+    wants: &asked.wants,
+    haves: &asked.haves,
+    done: true,
+    wait_for_done: false,
+    shallow: &asked.shallow,
+    deepen: deepen(&asked, &not, chosen.relative),
+    filter: filter.as_ref(),
+    sparse: sparse.patterns.as_ref(),
+    include_tag: chosen.include_tag,
+    thin: chosen.thin,
+  };
+  let deepens = request.deepen.is_some();
+  let begun = negotiation::begin(&graph, &request, admission).map_err(Refusal::Negotiation)?;
+  if let Some(fault) = graph.fault() {
+    return Err(Refusal::Store(fault));
+  }
+  let negotiation::Begun::Selecting(negotiating) = begun else {
+    return Ok(Answer::whole(Vec::new()));
+  };
+  admission
+    .charge_items::<ObjectId>(asked.wants.len().saturating_add(asked.haves.len()))
+    .and_then(|()| {
+      admission.charge_items::<ServerLine<'static>>(asked.haves.len().saturating_add(CLOSING_LINES))
+    })
+    .map_err(Refusal::PastAdmission)?;
+  let opening = Opening {
+    wants: asked.wants.clone(),
+    haves: asked.haves.clone(),
+    chosen,
+    done: asked.done,
+    deepens,
+    at: 0,
+    learned: Learned::default(),
+    lines: Vec::with_capacity(asked.haves.len().saturating_add(CLOSING_LINES)),
+    asking: None,
+    due: None,
+    sparse,
+  };
+  Ok(Answer::choosing(answer::Choosing::v0(
+    *negotiating,
+    filter,
+    chosen.thin,
+    chosen.ofs_delta,
+    opening,
+  )))
+}
+
+/// A v0 answer's head being made (module docs of [`answer_in_turns`]): the request's wants and haves, what the client
+/// chose, its acknowledgments so far, the `ready` being asked, and, once they are made, whether the pack is due.
+pub(super) struct Opening {
+  /// The objects wanted.
+  wants: Vec<ObjectId>,
+  /// The haves, in the order sent.
+  haves: Vec<ObjectId>,
+  /// What the client chose.
+  chosen: Chosen,
+  /// Whether the haves ended with `done`.
+  done: bool,
+  /// Whether the request deepens, so the answer begins with its shallow-update.
+  deepens: bool,
+  /// The next have to acknowledge.
+  at: usize,
+  /// What the haves taught so far.
+  learned: Learned,
+  /// The acknowledgment lines so far.
+  lines: Vec<ServerLine<'static>>,
+  /// The `ready` being asked, and what waits for its answer.
+  asking: Option<Asking>,
+  /// Whether the pack follows the acknowledgments, once they are made.
+  due: Option<bool>,
+  /// A `sparse:oid` filter's blob, read: what `pack-objects` wrote as it read it, and whether it dies.
+  sparse: sparse::Read,
+}
+
+/// A `ready` asked a unit at a time, within a copy of the admission let go after (as [`Learned::ready`] asks it whole),
+/// and what waits for its answer.
+struct Asking {
+  ready: negotiation::Ready<u64>,
+  room: Admission,
+  then: Then,
+}
+
+/// What waits for a `ready`'s answer.
+#[derive(Clone, Copy)]
+enum Then {
+  /// A have the store lacks, acknowledged as `ready` or `continue` once the server is.
+  Lacked(ObjectId),
+  /// The lines at the request's flush.
+  Flush,
+}
+
+/// What an opening's head made of the answer.
+pub(super) enum Opened<K> {
+  /// The whole answer, no pack due: the head alone, no negotiation's counters, as [`answer`] answers it.
+  NoPack(Answer<K>),
+  /// The whole answer: `pack-objects` died as it began.
+  Whole(Answer<K>),
+  /// The bytes before the pack, and how the pack is framed.
+  Pack(Vec<u8>, Framing),
+}
+
+impl Opening {
+  /// Units of the acknowledgments until `spent` says the owner's quantum is spent, at least one: whether they are made.
+  pub(super) fn acknowledge(
+    &mut self,
+    graph: &StoreGraph<'_>,
+    admission: &Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<bool, Refusal> {
+    loop {
+      if self.due.is_some() {
+        return Ok(true);
+      }
+      if let Some(asking) = self.asking.as_mut() {
+        let Asking { ready, room, .. } = asking;
+        let Some(answer) = ready
+          .step(graph, room, spent)
+          .map_err(Refusal::Negotiation)?
+        else {
+          return Ok(false);
+        };
+        let then = asking.then;
+        self.asking = None;
+        self.learned.asked = Some((self.learned.common.len(), answer));
+        self.answered(then, answer);
+      } else {
+        self.unit(graph, admission)?;
+      }
+      if self.due.is_none() && spent() {
+        return Ok(false);
+      }
+    }
+  }
+
+  /// One unit: the next have acknowledged, or the request's end; a `ready` begun where one must be asked.
+  fn unit(&mut self, graph: &StoreGraph<'_>, admission: &Admission) -> Result<(), Refusal> {
+    let Some(have) = self.haves.get(self.at).copied() else {
+      if self.done {
+        self.lines.extend(at_done(&self.learned, self.chosen));
+        self.due = Some(true);
+      } else if self.chosen.multi_ack == MultiAck::Detailed
+        && self.learned.got_common
+        && !self.learned.got_other
+        && self.learned.last.is_some()
+      {
+        self.ask(graph, admission, Then::Flush)?;
+      } else {
+        self.answered(Then::Flush, false);
+      }
+      return Ok(());
+    };
+    self.at = self.at.saturating_add(1);
+    let Some(node) = graph.node(&have) else {
+      self.learned.got_other = true;
+      if self.chosen.multi_ack != MultiAck::None {
+        self.ask(graph, admission, Then::Lacked(have))?;
+      }
+      return Ok(());
+    };
+    self.learned.hold(graph, have, node);
+    let status = match self.chosen.multi_ack {
+      MultiAck::Detailed => Some(AckStatus::Common),
+      MultiAck::Plain => Some(AckStatus::Continue),
+      MultiAck::None if self.learned.counted == 1 => Some(AckStatus::Plain),
+      MultiAck::None => None,
+    };
+    if let Some(status) = status {
+      self.lines.push(ServerLine::Ack { id: have, status });
+    }
+    Ok(())
+  }
+
+  /// Asks whether the server is ready, for `then`: answered at once where the haves held have not changed since it
+  /// last was ([`Learned::ready`]'s rule), else begun to be stepped.
+  fn ask(
+    &mut self,
+    graph: &StoreGraph<'_>,
+    admission: &Admission,
+    then: Then,
+  ) -> Result<(), Refusal> {
+    if let Some((common, ready)) = self.learned.asked
+      && common == self.learned.common.len()
+    {
+      self.answered(then, ready);
+      return Ok(());
+    }
+    // Within a copy of the request's admission, let go after, as `Learned::ready` asks it whole.
+    let mut room = *admission;
+    let ready = negotiation::Ready::begin(graph, &self.wants, &self.learned.common, &mut room)
+      .map_err(Refusal::Negotiation)?;
+    self.asking = Some(Asking { ready, room, then });
+    Ok(())
+  }
+
+  /// `then`, the server's readiness known.
+  fn answered(&mut self, then: Then, ready: bool) {
+    match then {
+      Then::Lacked(have) => {
+        if !ready {
+          return;
+        }
+        let status = if self.chosen.multi_ack == MultiAck::Detailed {
+          self.learned.sent_ready = true;
+          AckStatus::Ready
+        } else {
+          AckStatus::Continue
+        };
+        self.lines.push(ServerLine::Ack { id: have, status });
+      }
+      Then::Flush => {
+        if ready && let Some(id) = self.learned.last {
+          self.learned.sent_ready = true;
+          self.lines.push(ServerLine::Ack {
+            id,
+            status: AckStatus::Ready,
+          });
+        }
+        if self.learned.counted == 0 || self.chosen.multi_ack != MultiAck::None {
+          self.lines.push(ServerLine::Nak);
+        }
+        let due = match self.learned.last {
+          Some(id) if self.chosen.no_done && self.learned.sent_ready => {
+            self.lines.push(ServerLine::Ack {
+              id,
+              status: AckStatus::Plain,
+            });
+            true
+          }
+          _ => false,
+        };
+        self.due = Some(due);
+      }
+    }
+  }
+
+  /// The head, the cut's `shallow` known: the shallow-update where the request deepens, then the acknowledgments,
+  /// charged to `admission`; then the answer whole where no pack is due or `pack-objects` dies as it begins, else the
+  /// bytes before the pack (what it wrote as it read a `sparse:oid` filter's name relayed where there is a band).
+  pub(super) fn write<K>(
+    self,
+    shallow: Option<&ShallowInfo>,
+    admission: &mut Admission,
+  ) -> Result<Opened<K>, Refusal> {
+    let update = self
+      .deepens
+      .then(|| shallow.cloned().unwrap_or_default())
+      .map(|ShallowInfo { shallow, unshallow }| ShallowUpdate { shallow, unshallow });
+    let (mut head, ()) = charged(admission, |out| {
+      if let Some(update) = &update {
+        update.write(out).map_err(Refusal::Write)?;
+      }
+      self
+        .lines
+        .iter()
+        .try_for_each(|line| line.write(out).map_err(Refusal::Write))
+    })?;
+    if self.due != Some(true) {
+      return Ok(Opened::NoPack(Answer::whole(head)));
+    }
+    let banded = self.chosen.framing.is_banded();
+    if let Some(refusal) = self.sparse.dies {
+      return Answer::died(head, self.sparse.said, refusal, banded, admission).map(Opened::Whole);
+    }
+    if banded {
+      answer::relay(&self.sparse.said, &mut head, admission)?;
+    }
+    Ok(Opened::Pack(head, self.chosen.framing))
+  }
+
+  /// Whether the request deepens, so its head begins with the cut's shallow-update.
+  pub(super) fn deepens(&self) -> bool {
+    self.deepens
+  }
+
+  /// Whether no pack follows its head, once the acknowledgments are made.
+  pub(super) fn pack_not_due(&self) -> bool {
+    self.due == Some(false)
+  }
+}

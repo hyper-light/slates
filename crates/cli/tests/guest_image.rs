@@ -81,8 +81,8 @@ use std::process::Command;
 
 use slates_guest_probe::protocol::{Command as Ask, EntryKind, Reply, digest, sweep_value};
 use vm::{
-  Anchor, DELIVERY_MILLIS, Guest, Module, MountPoint, QUIT_WAIT, REPLY_WAIT, created_volume,
-  initramfs, kill_the_daemon, run, start_anchor, write_at, write_whole,
+  Anchor, DELIVERY_MILLIS, Guest, Module, MountPoint, QUIT_WAIT, created_volume, initramfs,
+  kill_the_daemon, run, start_anchor, write_at, write_whole,
 };
 
 /// Shape: the image's capacity: the source's files and the guest's room to write. A 2 MiB multiple, so a handed copy of
@@ -408,14 +408,14 @@ fn sorted(mut entries: Vec<Reply>) -> Vec<Reply> {
 /// The guest's listing: every [`Reply::Entry`] until its [`Reply::Done`].
 fn listed(guest: &mut Guest) -> Vec<Reply> {
   let mut entries = Vec::new();
-  let mut reply = guest.ask(&Ask::List, REPLY_WAIT);
+  let mut reply = guest.ask(&Ask::List);
   loop {
     match reply {
       Reply::Done => return entries,
       entry @ Reply::Entry { .. } => entries.push(entry),
       other => panic!("list → {other:?}\n{}", guest.transcript()),
     }
-    reply = guest.next_reply(REPLY_WAIT);
+    reply = guest.next_reply();
   }
 }
 
@@ -1318,13 +1318,10 @@ fn lists_and_maps(rig: &Rig, guest: &mut Guest) -> usize {
   let (at, len) = PATCH;
   let patch_at = rig.source.chunk + at;
   let pages = (patch_at + len).div_ceil(rustix::param::page_size());
-  match guest.ask(
-    &Ask::Map {
-      path: "docs/sub/b.bin".to_owned(),
-      pages: u64::try_from(pages).unwrap(),
-    },
-    REPLY_WAIT,
-  ) {
+  match guest.ask(&Ask::Map {
+    path: "docs/sub/b.bin".to_owned(),
+    pages: u64::try_from(pages).unwrap(),
+  }) {
     Reply::Mapped { dax: true } => {}
     other => panic!(
       "map docs/sub/b.bin → {other:?}: DAX is what this test is for\n{}",
@@ -1371,7 +1368,7 @@ fn launcher_syncs(guest: &mut Guest) -> u64 {
     rustix::process::Signal::USR1,
   )
   .unwrap();
-  let line = guest.expect_line(LAUNCHER_SYNCED, REPLY_WAIT);
+  let line = guest.expect_line(LAUNCHER_SYNCED);
   line
     .rsplit_once(LAUNCHER_SYNCED)
     .and_then(|(_, written)| written.trim().parse().ok())
@@ -1427,14 +1424,11 @@ fn hosts_write_shows_in_the_map(
     u64::try_from(offset).unwrap(),
     &vec![PATCH_BYTE; len],
   );
-  match guest.ask(
-    &Ask::Wait {
-      at: u64::try_from(map_at + len - 1).unwrap(),
-      byte: PATCH_BYTE,
-      millis: DELIVERY_MILLIS,
-    },
-    REPLY_WAIT,
-  ) {
+  match guest.ask(&Ask::Wait {
+    at: u64::try_from(map_at + len - 1).unwrap(),
+    byte: PATCH_BYTE,
+    millis: DELIVERY_MILLIS,
+  }) {
     Reply::Waited { micros } => {
       eprintln!("the host's write showed in the guest's map in {micros} µs")
     }
@@ -1565,13 +1559,10 @@ fn stores_after_the_takeover(rig: &Rig, guest: &mut Guest, patch_at: usize, len:
   let counters = fuse_counters(rig);
   let again = longest_run(&rig.image_bytes());
   let held = longest_run(&rig.held_by_slates());
-  let map = guest.ask(
-    &Ask::Read {
-      at: u64::try_from(patch_at).unwrap(),
-      len: u64::try_from(len).unwrap(),
-    },
-    REPLY_WAIT,
-  );
+  let map = guest.ask(&Ask::Read {
+    at: u64::try_from(patch_at).unwrap(),
+    len: u64::try_from(len).unwrap(),
+  });
   let mapped = match map {
     Reply::Bytes(bytes) => format!("{:?}", longest_run(&bytes)),
     other => format!("{other:?}"),
@@ -1635,7 +1626,7 @@ fn a_daemon_killed_under_the_map_over(gate: &Gate, disk: &Disk, backing: Backing
   assert_ne!(old, new, "the anchor's successor is a new daemon");
   eprintln!("daemon {old} killed under the guest's live map; successor {new}");
   if backing == Backing::Handed {
-    let resynced = guest.expect_line(LAUNCHER_RESYNCED, REPLY_WAIT);
+    let resynced = guest.expect_line(LAUNCHER_RESYNCED);
     eprintln!("the launcher, its daemon gone: {resynced}");
   }
   let found = stores_after_the_takeover(&rig, &mut guest, patch_at, 2 * quarter);
@@ -1717,14 +1708,16 @@ fn kill_the_vmm_under_its_launcher(guest: &mut Guest) -> u64 {
     rustix::process::Signal::KILL,
   )
   .unwrap();
-  let started = std::time::Instant::now();
+  // While the launcher's tree gains CPU (until 2026-11-20 within `QUIT_WAIT`).
+  let mut judged = vm::Judged::of(guest.vm.id());
   let status = loop {
     if let Some(status) = guest.vm.try_wait().unwrap() {
       break status;
     }
+    let verdict = judged.judge();
     assert!(
-      started.elapsed() < QUIT_WAIT,
-      "the launcher ended within {QUIT_WAIT:?} once its VMM was killed\n{}",
+      matches!(verdict, vm::Verdict::Waiting { .. } | vm::Verdict::Gone),
+      "the launcher ended once its VMM was killed: its processes are {verdict:?}\n{}",
       guest.transcript()
     );
     vm::pause();
@@ -1928,15 +1921,12 @@ fn flush_storm_over_a_handed_copy(gate: &Gate) {
   let first = Served::now(&rig);
   let before = Served::now(&rig);
   let read = before.requests - first.requests;
-  match guest.ask(
-    &Ask::Storm {
-      at: u64::try_from(patch_at).unwrap(),
-      len: u64::try_from(PATCH.1).unwrap(),
-      byte: PATCH_BYTE,
-      rounds: STORM_ROUNDS,
-    },
-    REPLY_WAIT,
-  ) {
+  match guest.ask(&Ask::Storm {
+    at: u64::try_from(patch_at).unwrap(),
+    len: u64::try_from(PATCH.1).unwrap(),
+    byte: PATCH_BYTE,
+    rounds: STORM_ROUNDS,
+  }) {
     Reply::Stormed { micros } => eprintln!(
       "the guest stored and synced {STORM_ROUNDS} times over in {} ms",
       micros / 1_000
@@ -2071,13 +2061,10 @@ fn killed_mid_store_over_a_handed_copy(gate: &Gate) {
   let mut second = rig.boot_over(gate, &disk, Backing::Handed);
   let listing = listed(&mut second);
   maps_the_large_file(&mut second, large.len().div_ceil(page));
-  let read = match second.ask(
-    &Ask::Read {
-      at: 0,
-      len: u64::try_from(large.len()).unwrap(),
-    },
-    REPLY_WAIT,
-  ) {
+  let read = match second.ask(&Ask::Read {
+    at: 0,
+    len: u64::try_from(large.len()).unwrap(),
+  }) {
     Reply::Bytes(bytes) => bytes,
     other => panic!("read → {other:?}\n{}", second.transcript()),
   };
@@ -2119,13 +2106,10 @@ fn killed_mid_store_over_a_handed_copy(gate: &Gate) {
 
 /// The guest maps the large file's first `pages` pages, with DAX.
 fn maps_the_large_file(guest: &mut Guest, pages: usize) {
-  match guest.ask(
-    &Ask::Map {
-      path: "docs/sub/b.bin".to_owned(),
-      pages: u64::try_from(pages).unwrap(),
-    },
-    REPLY_WAIT,
-  ) {
+  match guest.ask(&Ask::Map {
+    path: "docs/sub/b.bin".to_owned(),
+    pages: u64::try_from(pages).unwrap(),
+  }) {
     Reply::Mapped { dax: true } => {}
     other => panic!(
       "map docs/sub/b.bin {pages} → {other:?}: DAX is what this test is for\n{}",

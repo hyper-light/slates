@@ -82,6 +82,7 @@ impl Green {
       doc: work.doc.clone(),
       post_state: work.post_state.clone(),
       evidence: work.evidence.clone(),
+      named: Default::default(),
     };
     let resolved = Green::resolve(&restated);
     if let Some(path) = resolved.copies.keys().next() {
@@ -99,7 +100,7 @@ impl Green {
       let path = names.path(op.path).unwrap_or_default();
       !(is_content(op.kind) && identical.contains(path))
     });
-    Restated::Over(restated)
+    Restated::Over(Box::new(restated))
   }
 
   /// The head's node at `path`, in a tree's terms: the root always a directory, as the green holds it (A-618).

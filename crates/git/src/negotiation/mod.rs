@@ -404,17 +404,12 @@ impl Held {
     })
   }
 
-  /// The positions held, as runs, the set given up.
+  /// The positions held, the set given up: its bit table handed over as it is, never turned back into a run a position
+  /// (A-745 item 4: a plan of scattered positions costs at most what each object's handle cost).
   pub(super) fn into_positions(self) -> Positions {
     match self.form {
       Form::Runs(runs) => runs,
-      Form::Bits { .. } => {
-        let mut runs = Positions::new();
-        for position in self.iter() {
-          runs.insert(position);
-        }
-        runs
-      }
+      Form::Bits { start, words } => Positions::of_bits(start, words),
     }
   }
 
@@ -817,16 +812,64 @@ pub fn ready<S: Graph>(
   common: &[ObjectId],
   admission: &mut Admission,
 ) -> Result<bool, Refusal> {
-  let wants = ready::wants(graph, wants, admission)?;
-  let common = ready::common(graph, common, admission)?;
-  ready::is_ready(
-    graph,
-    &wants,
-    &[],
-    &common,
-    admission,
-    &mut Counters::default(),
-  )
+  let mut asking = Ready::begin(graph, wants, common, admission)?;
+  loop {
+    if let Some(ready) = asking.step(graph, admission, &mut || false)? {
+      return Ok(ready);
+    }
+  }
+}
+
+/// [`ready`] asked a unit at a time (A-745 item 3: protocol v0's acknowledgments in turns): the wants and the common
+/// haves looked up as it begins (what the request names), then the search below each want a parent a unit.
+pub struct Ready<N> {
+  /// The wants.
+  wants: Vec<N>,
+  /// The search.
+  readying: ready::Readying<N>,
+  /// What it searched.
+  counters: Counters,
+}
+
+impl<N: Copy + Ord> Ready<N> {
+  /// The question begun for `wants` over the client's `common` objects.
+  pub fn begin<S: Graph<Node = N>>(
+    graph: &S,
+    wants: &[ObjectId],
+    common: &[ObjectId],
+    admission: &mut Admission,
+  ) -> Result<Ready<N>, Refusal> {
+    let wants = ready::wants(graph, wants, admission)?;
+    let common = ready::common(graph, common, admission)?;
+    let readying = ready::Readying::begin(graph, &common, admission)?;
+    Ok(Ready {
+      wants,
+      readying,
+      counters: Counters::default(),
+    })
+  }
+
+  /// Units of the search until `spent` says the owner's quantum is spent, at least one: whether the server is ready
+  /// once decided, `None` while it is not.
+  pub fn step<S: Graph<Node = N>>(
+    &mut self,
+    graph: &S,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Option<bool>, Refusal> {
+    loop {
+      if let Some(ready) =
+        self
+          .readying
+          .unit(graph, &self.wants, &[], admission, &mut self.counters)?
+      {
+        return Ok(Some(ready));
+      }
+      if spent() {
+        return Ok(None);
+      }
+    }
+  }
 }
 
 /// The shallow-update `request`'s deepening makes, the shallow-info section's lines (A-640 part 3: protocol v0 sends

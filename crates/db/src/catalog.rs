@@ -2220,6 +2220,13 @@ pub enum LoggedChange {
     /// The change.
     change: StateChange,
   },
+  /// A push's record (the names log; A-724 piece 8c, the takeover test's fix): the objects an entry brought, as its
+  /// register keeps them (`RepositoryEntry::objects`), so they ride the replicated log to the repository's candidates
+  /// and a successor replays them, never only the owner's own partition. Appended.
+  Objects {
+    /// The record's bytes.
+    record: Vec<u8>,
+  },
 }
 
 /// One record of one of a repository's state logs as the fleet holds it (§4.17.1 shared piece 2, the fleet half; A-636

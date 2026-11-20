@@ -14,8 +14,7 @@ use slates_db::register::{HostId, ObjectId, RegionId};
 use slates_transport::connection::Priority;
 use slates_wire::Wire;
 
-use crate::daemon::HEARTBEAT_NS;
-use crate::fleet::{POLL_PER_PERIOD, return_sessions, take_sessions};
+use crate::fleet::{return_sessions, take_sessions};
 use crate::state::{self, ShardState};
 
 /// Format: read-only owner location follows the enrollment stream (13).
@@ -468,12 +467,15 @@ fn round_budget_for(slowest_tail_ns: Option<u64>) -> slates_cluster::CommitBudge
   crate::fleet::consensus_budget(slowest_tail_ns)
 }
 
-/// Whether a round may wait one more poll for sessions still out: no once the round's span (`span_ns`, its budget's
-/// longest, [`round_budget_for`]) has passed since it began, or when no poll can be timed (a refused sleep, off a shard —
-/// never a spin, AUD-29-39); either way counted as sessions that never returned.
-async fn wait_for_returning_sessions(began: u64, span_ns: u64, poll_ns: u64) -> bool {
-  let spent = slates_rt::futures::now_ns().saturating_sub(began) >= span_ns;
-  if spent || slates_rt::futures::sleep(poll_ns).await.is_err() {
+/// Whether a round may look again for the sessions still `out`, having waited for one of them to come back within
+/// what is left of the round's span (`span_ns`, its budget's longest, [`round_budget_for`]): no once the span has passed,
+/// or when no wait can be made (off a shard — never a spin, AUD-29-39); either way counted as sessions that never
+/// returned.
+async fn wait_for_returning_sessions(began: u64, span_ns: u64, out: &[HostId]) -> bool {
+  let left = span_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+  // Woken by one of the sessions coming back, or its link changing (`crate::fleet::session_returned`); before
+  // 2026-11-20 it slept a tenth of a period between looks.
+  if left == 0 || crate::fleet::session_returned(out, left).await.is_none() {
     count("fleet.owner_location.session_never_returned");
     return false;
   }
@@ -530,7 +532,6 @@ async fn locate_round(query: Query) -> (Result<HostId, LocationError>, Option<[u
   // found 1). A peer with no session at all is not waited for: the bounded neighbourhood keeps no session
   // to most peers by design.
   let began = slates_rt::futures::now_ns();
-  let poll_ns = HEARTBEAT_NS / POLL_PER_PERIOD;
   let mut unasked = peers;
   let mut answers = Answers::default();
   let mut met_out = false;
@@ -551,8 +552,9 @@ async fn locate_round(query: Query) -> (Result<HostId, LocationError>, Option<[u
       met_out = true;
       count("fleet.owner_location.session_out");
     }
+    let waiting_for: Vec<HostId> = out.iter().copied().collect();
     unasked = out;
-    if !wait_for_returning_sessions(began, budget.max_deadline_ns(), poll_ns).await {
+    if !wait_for_returning_sessions(began, budget.max_deadline_ns(), &waiting_for).await {
       break;
     }
   }

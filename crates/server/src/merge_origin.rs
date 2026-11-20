@@ -1634,6 +1634,7 @@ mod tests {
       doc,
       post_state: bytes.to_vec(),
       evidence: Vec::new(),
+      named: Default::default(),
     }
   }
 
@@ -2337,6 +2338,7 @@ mod tests {
       doc,
       post_state: bytes.to_vec(),
       evidence: Vec::new(),
+      named: Default::default(),
     }
   }
 

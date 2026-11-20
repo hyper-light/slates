@@ -436,6 +436,57 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
   );
 }
 
+/// main's order of 2026-11-20 (w-bugs' runs 10/11: svn checkout and update 3 to 12 times as slow after c2, the fetch's
+/// 1,024-byte steps each making the whole text through its chain). Do: commit revision 1, then 20 edits of [`FILE`], a
+/// 300 KiB text changing one line in each; read every revision's text through the read source in 1,024-byte pieces,
+/// as a fetch reads. Expect: every piece the text's own bytes at its offset and at most one delta window long; no
+/// text made whole from its chain by the reads (the counter where the commits left it); the text's end read empty.
+#[test]
+fn s4_c2_a_fetch_reads_a_texts_pieces_a_window_at_a_time_never_making_it_whole() {
+  let mut repository = created();
+  repository.commit(first()).unwrap();
+  let line =
+    |at: usize, version: usize| format!("{at:06} a line of the long file, version {version:04}\n");
+  let version = |n: usize| -> Vec<u8> {
+    (0..7_000)
+      .map(|at| line(at, if at == n * 331 % 7_000 { n } else { 0 }))
+      .collect::<String>()
+      .into_bytes()
+  };
+  let mut texts = Vec::new();
+  for n in 1..=20usize {
+    let bytes = version(n);
+    repository
+      .commit(edit(u64::try_from(n).unwrap(), &bytes, Vec::new()))
+      .unwrap();
+    texts.push(bytes);
+  }
+  let window = usize::try_from(crate::svndiff::WINDOW_LIMIT).unwrap();
+  // Each commit made its base whole to deltify against: the reads below add none.
+  let made_by_commits = repository.texts_made_whole();
+  for bytes in &texts {
+    let identity = *blake3::hash(bytes).as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+      let run =
+        crate::reads::Repository::text(&repository, &identity, u64::try_from(at).unwrap()).unwrap();
+      assert!(!run.is_empty() && run.len() <= window);
+      let piece = &run[..run.len().min(1_024)];
+      assert_eq!(piece, &bytes[at..at + piece.len()]);
+      at += piece.len();
+    }
+    let end =
+      crate::reads::Repository::text(&repository, &identity, u64::try_from(bytes.len()).unwrap())
+        .unwrap();
+    assert!(end.is_empty());
+  }
+  assert_eq!(
+    repository.texts_made_whole(),
+    made_by_commits,
+    "a read makes a window, never a text"
+  );
+}
+
 /// c2's exporter text rebuild sliced (main's item 2 of 2026-11-20; Ada's rule: a performance gap is fixed first). Do:
 /// commit [`FILE`] with a 512 KiB text, then edit a few of its bytes in each of 31 revisions, so the youngest text is
 /// kept as a chain of skip deltas; export the youngest revision alone in format 2 through a source that counts what

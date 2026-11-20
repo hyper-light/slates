@@ -172,6 +172,24 @@ impl SharedObject {
     self.len == 0
   }
 
+  /// What of `len` bytes at `offset` is in RAM, and written where the OS says ([`crate::resident::of_range`], A-744),
+  /// pages of `page` bytes: the kernel's page table read, no byte of the object touched, nothing suspended (the daemon's
+  /// own memory report, §4.14). Refused `OutOfRange` past the object's end.
+  pub fn residency(
+    &self,
+    offset: usize,
+    len: usize,
+    page: usize,
+  ) -> Result<crate::resident::Residency, MemError> {
+    if offset.checked_add(len).is_none_or(|end| end > self.len) {
+      return Err(MemError::OutOfRange {
+        offset,
+        len: self.len,
+      });
+    }
+    crate::resident::of_range(self.inner.base().wrapping_add(offset), len, page)
+  }
+
   /// Copies the `into.len()` bytes at `offset` out, for the side that owns them under the layout's
   /// protocol; refused past the end or touching a declared word.
   pub fn read(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {

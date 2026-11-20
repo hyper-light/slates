@@ -285,6 +285,30 @@ pub enum BodyImage {
     /// The minor number.
     minor: u32,
   },
+  /// A read-only referenced file's pieces ([`Body::Referenced`], A-645 P3 ruling 2), in file order; appended, as
+  /// `Device` was. The identities are named, not carried: a successor's store holds their bytes, and the recovered
+  /// volume owes its holds ([`crate::Volume::hold_owed_references`]).
+  Referenced {
+    /// The pieces.
+    pieces: Vec<PieceImage>,
+  },
+}
+
+/// One piece of a referenced file in an image ([`crate::referenced::Piece`]).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub enum PieceImage {
+  /// `len` bytes of the content-store object `id`.
+  Content {
+    /// The object's identity.
+    id: [u8; 32],
+    /// The bytes the piece shows.
+    len: u64,
+  },
+  /// Bytes the presenter made.
+  Made {
+    /// The bytes.
+    bytes: Vec<u8>,
+  },
 }
 
 /// A block of the shard's arena (A-64): its region, its offset within it and its length (a power-of-two number
@@ -2240,6 +2264,20 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
         born: open.born.0,
       }),
     }),
+    Body::Referenced(body) => Ok(BodyImage::Referenced {
+      pieces: body
+        .pieces()
+        .iter()
+        .map(|piece| match piece {
+          crate::referenced::Piece::Content { id, len } => {
+            PieceImage::Content { id: *id, len: *len }
+          }
+          crate::referenced::Piece::Made(bytes) => PieceImage::Made {
+            bytes: bytes.to_vec(),
+          },
+        })
+        .collect(),
+    }),
     Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Base(_) | Body::Device(_) => {
       Err(VfsError::RecoveryIncomplete)
     }
@@ -2634,6 +2672,7 @@ impl Volume {
       let no = InodeNo(image_inode.no);
       kinds.insert(image_inode.no, image_inode.kind);
       let body = body_for(store, claims, image_inode, no, epoch, &mut dirs)?;
+      self.referenced.recovered(&body);
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
@@ -2894,6 +2933,7 @@ impl Volume {
         continue;
       }
       let body = body_for(store, claims, image_inode, no, epoch, &mut dirs)?;
+      self.referenced.recovered(&body);
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
@@ -2998,6 +3038,7 @@ impl Volume {
         continue;
       }
       let body = body_for(store, claims, image_inode, no, epoch, dirs)?;
+      self.referenced.recovered(&body);
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
       self.table_set_in_order(store, no, handle, &mut cursor)?;
@@ -3209,7 +3250,9 @@ fn body_crc(body: &BodyImage) -> u32 {
     BodyImage::Symlink { target } | BodyImage::BaseLink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,
-    BodyImage::Base { .. } | BodyImage::Device { .. } => crc32c(&body.to_bytes()),
+    BodyImage::Base { .. } | BodyImage::Device { .. } | BodyImage::Referenced { .. } => {
+      crc32c(&body.to_bytes())
+    }
   }
 }
 
@@ -3293,6 +3336,27 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       lost: *lost,
       file: crate::inode::FileTag::from_word(*file),
     })),
+    // A referenced file whose pieces do not sum to its size is corrupt, refused as a chunked one past its size is.
+    BodyImage::Referenced { pieces } => {
+      let body = crate::referenced::ReferencedBody::new(
+        pieces
+          .iter()
+          .map(|piece| match piece {
+            PieceImage::Content { id, len } => {
+              crate::referenced::Piece::Content { id: *id, len: *len }
+            }
+            PieceImage::Made { bytes } => {
+              crate::referenced::Piece::Made(bytes.clone().into_boxed_slice())
+            }
+          })
+          .collect(),
+      )
+      .map_err(|_| VfsError::RecoveryIncomplete)?;
+      if body.len() != size {
+        return Err(VfsError::RecoveryIncomplete);
+      }
+      Ok(Body::Referenced(Box::new(body)))
+    }
     BodyImage::Directory { .. }
     | BodyImage::Symlink { .. }
     | BodyImage::BaseLink { .. }
@@ -3493,6 +3557,7 @@ impl Claims {
             block,
             identity: chunk.identity,
             seal: None,
+            pins: crate::content::Pins::default(),
           },
           sealed,
         );

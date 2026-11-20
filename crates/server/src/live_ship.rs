@@ -114,9 +114,10 @@ pub(crate) fn forget(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
   // Its kept log goes with it (A-344): the next publication removes the piece.
   state.live.resumed.remove(&id.bytes);
   state.live.owned_dirty.insert(id.bytes);
-  if state.live.shipping.remove(&id.bytes).is_none() {
+  let Some(live) = state.live.shipping.remove(&id.bytes) else {
     return;
-  }
+  };
+  release_capture(state, live.building.and_then(|build| build.capture));
   let gone = slates_ipc::protocol::ReplyBody::Refused {
     refusal: slates_ipc::protocol::Refusal::NotFound,
   };
@@ -2087,7 +2088,14 @@ pub(crate) fn published(
   record: Option<&[u8]>,
 ) {
   if !is_live(state, id) {
-    let shipped = state.live.shipping.remove(&id.bytes).is_some();
+    let removed = state.live.shipping.remove(&id.bytes);
+    let shipped = removed.is_some();
+    release_capture(
+      state,
+      removed
+        .and_then(|live| live.building)
+        .and_then(|build| build.capture),
+    );
     let resumed = state.live.resumed.remove(&id.bytes).is_some();
     if shipped || resumed {
       // Its kept log goes with it (A-344).
@@ -2195,12 +2203,13 @@ pub(crate) fn published(
     queue_behind_build(state, id, whole, record);
     return;
   }
-  let built = if whole {
-    whole_record(state, id)
-  } else {
-    record.map(<[u8]>::to_vec)
-  };
-  let Some(record) = built else {
+  // A whole state's content is read in turns from its pinned chunks (A-768): read here in one turn, a volume's every
+  // byte held the shard (4.5 to 6 ms of a debug owner's CPU for about a MB, beside its image's 2.4 to 3 ms).
+  if whole {
+    begin_capture(state, id);
+    return;
+  }
+  let Some(record) = record.map(<[u8]>::to_vec) else {
     refuse(state, id, "fleet.live.refused.no_record");
     return;
   };
@@ -2208,9 +2217,19 @@ pub(crate) fn published(
     refuse(state, id, "fleet.live.refused.no_payload");
     return;
   };
-  // A whole entry of more than one piece is sealed in turns of this shard (A-377): sealed here in one turn, its AEAD and
-  // keyed names a byte held the shard about a second a GiB (g251's trace: a taken-over volume's first publication,
-  // 1.06 s in one turn).
+  publish_body(state, id, whole, body);
+}
+
+/// Makes `id`'s entry of a publication's plain `body`, captured in this turn: a body of more than one piece is sealed in
+/// turns of this shard (A-377: sealed here in one turn, its AEAD and keyed names a byte held the shard about a second a
+/// GiB, g251's trace: a taken-over volume's first publication, 1.06 s in one turn); a smaller one is sealed, appended and
+/// shipped now, its install image refreshed from the volume's state, which is the body's.
+fn publish_body(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  whole: bool,
+  body: Vec<u8>,
+) {
   if built_in_turns(state, whole, &body) {
     begin_whole_build(state, id, body, whole);
     return;
@@ -2416,6 +2435,9 @@ struct WholeBuild {
   whole: bool,
   /// Whether its body ships in the clear (this node seals nothing): nothing to seal, only to hash.
   clear: bool,
+  /// While its whole state's content is still being read in turns ([`Capture`], A-768): its body is empty until then,
+  /// and the publications made meanwhile queue behind it.
+  capture: Option<Box<Capture>>,
 }
 
 impl std::fmt::Debug for WholeBuild {
@@ -2463,6 +2485,375 @@ fn built_in_turns(state: &ShardState, whole: bool, body: &[u8]) -> bool {
 fn sealed_in_pieces(state: &ShardState, body: &[u8]) -> bool {
   state.seal_root.is_some()
     && usize::try_from(slates_archive::format::MAX_CHUNK_BYTES).is_ok_and(|cap| body.len() > cap)
+}
+
+/// A whole state's content being read in turns (A-768): the volume's image as its publication's turn found it, and each
+/// chunked file's sealed extents as they stood then, every chunk pinned (`Volume::pin_extents`), so the writes and
+/// publications made while it reads cannot free a byte it has yet to read; an open extent, which the next write changes
+/// in place, is copied in that turn. Its runs are what [`content_runs`] reads from the volume in one turn, in the same
+/// order, so a successor rebuilds the same state. The pins are bounded by the record and let go at its last turn
+/// ([`finish_capture`]) or wherever its build ends ([`release_capture`]). Until 2026-11-20 every byte was read in the
+/// publication's own turn: 4.5 to 6 ms of a debug owner's CPU for about a MB (w-forming's probes, `taskpolicy -b`), beside
+/// seal quanta of 14 to 784 us.
+struct Capture {
+  /// The whole record (`VolumeRecord::Full`'s wire bytes).
+  record: Vec<u8>,
+  /// Each chunked file, in the record's order.
+  files: Vec<CapturedFile>,
+  /// The pinned extents of every file in `files`, in order.
+  extents: Vec<slates_vfs::content::Extent>,
+  /// The runs read so far.
+  runs: Vec<LiveRun>,
+  /// The file being read, by its index in `files`.
+  file: usize,
+  /// The extents of that file read so far.
+  taken: usize,
+  /// The next extent to read, by its index in `extents`.
+  extent: usize,
+  /// The run being read, and how many of its bytes are.
+  current: Option<(LiveRun, usize)>,
+  /// The bytes read so far and the clock time their reads took, the rate a piece is sized by ([`piece_bytes`]).
+  read_rate: (u64, u64),
+}
+
+/// A file of a [`Capture`]: its number, its size when pinned, how many of the capture's extents are its, and its open
+/// extent's offset and copied bytes.
+struct CapturedFile {
+  inode: u64,
+  size: u64,
+  extents: usize,
+  open: Option<(u64, Vec<u8>)>,
+}
+
+/// Counter: whole states whose content was read in turns of their own (A-768).
+const LIVE_CAPTURES: &str = "fleet.live.captures";
+/// Counter: the turns those reads took, the first included.
+const LIVE_CAPTURE_TURNS: &str = "fleet.live.capture_turns";
+/// Counter: a capture's pins that could not be let go (a chunk no longer there): counted, never silent.
+const LIVE_CAPTURE_UNPIN_REFUSED: &str = "fleet.live.capture_unpin_refused";
+
+/// Begins `id`'s whole publication: its content read in turns from its pinned chunks ([`start_capture`]), a task of this
+/// shard running the turns after the first.
+fn begin_capture(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+  let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
+  if start_capture(state, id, quantum) == Advance::Done {
+    return;
+  }
+  let spawned =
+    slates_rt::futures::spawn(whole_build_task(id)).and_then(slates_rt::futures::detach);
+  if spawned.is_err() {
+    drop_build(state, id, "fleet.live.refused.no_build_task");
+  }
+}
+
+/// The first turn of `id`'s whole publication: its image taken and its files' chunks pinned ([`pinned_capture`]), then
+/// read until `quantum` has passed since the pins were taken ([`read_capture`]). Read whole in this turn, the entry is
+/// made now ([`publish_body`]); else the capture waits as the volume's build, the publications made meanwhile queued
+/// behind it, and `More` is returned for its turns ([`advance_capture`]).
+fn start_capture(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  quantum: u64,
+) -> Advance {
+  let Some(image) = whole_image(state, id) else {
+    refuse(state, id, "fleet.live.refused.no_record");
+    return Advance::Done;
+  };
+  let Some(mut capture) = pinned_capture(state, id, image) else {
+    refuse(state, id, "fleet.live.refused.no_payload");
+    return Advance::Done;
+  };
+  state.count(LIVE_CAPTURE_TURNS, 1);
+  match read_capture(
+    &state.store,
+    &mut capture,
+    slates_rt::futures::now_ns(),
+    quantum,
+  ) {
+    None => {
+      release_capture(state, Some(capture));
+      refuse(state, id, "fleet.live.refused.no_payload");
+      Advance::Done
+    }
+    Some(true) => {
+      let body = finish_capture(state, capture);
+      publish_body(state, id, true, body);
+      Advance::Done
+    }
+    Some(false) => {
+      let clear = state.seal_root.is_none();
+      let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
+        release_capture(state, Some(capture));
+        return Advance::Done;
+      };
+      // The capture is the whole state the volume owed: a barrier made now waits for its position.
+      live.owes_whole = false;
+      live.building = Some(Box::new(WholeBuild {
+        body: Vec::new(),
+        next: 0,
+        sealed: Vec::new(),
+        sealing: None,
+        anchors: Vec::new(),
+        appended: false,
+        queued: VecDeque::new(),
+        queued_bytes: 0,
+        seal_rate: (0, 0),
+        hashing: None,
+        hash_rate: (0, 0),
+        whole: true,
+        clear,
+        capture: Some(capture),
+      }));
+      state.count(LIVE_CAPTURES, 1);
+      Advance::More
+    }
+  }
+}
+
+/// One later turn of `id`'s capture: read until `quantum` has passed ([`read_capture`]). Once every run is read, its
+/// pins go and its body takes the head of the build's queue, made into its entry as the queue is ([`append_build`]): a
+/// whole state of more than one piece becomes a build of its own, sealed in turns, the rest queued behind it. A read
+/// refused ends the build ([`drop_build`]), and the volume owes a whole state again.
+fn advance_capture(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  quantum: u64,
+) -> Advance {
+  let Some(mut capture) = state
+    .live
+    .shipping
+    .get_mut(&id.bytes)
+    .and_then(|live| live.building.as_mut())
+    .and_then(|build| build.capture.take())
+  else {
+    return Advance::Done;
+  };
+  state.count(LIVE_CAPTURE_TURNS, 1);
+  let read = read_capture(
+    &state.store,
+    &mut capture,
+    slates_rt::futures::now_ns(),
+    quantum,
+  );
+  let build = state
+    .live
+    .shipping
+    .get_mut(&id.bytes)
+    .and_then(|live| live.building.as_mut());
+  match (read, build) {
+    (Some(false), Some(build)) => {
+      build.capture = Some(capture);
+      Advance::More
+    }
+    (Some(true), Some(_)) => {
+      let body = finish_capture(state, capture);
+      if let Some(build) = state
+        .live
+        .shipping
+        .get_mut(&id.bytes)
+        .and_then(|live| live.building.as_mut())
+      {
+        build.appended = true;
+        build.queued.push_front(Queued { whole: true, body });
+      }
+      append_build(state, id);
+      Advance::Done
+    }
+    (None, _) => {
+      release_capture(state, Some(capture));
+      drop_build(state, id, "fleet.live.refused.no_payload");
+      Advance::Done
+    }
+    (Some(_), None) => {
+      release_capture(state, Some(capture));
+      Advance::Done
+    }
+  }
+}
+
+/// `id`'s whole image, standing alone ([`whole_record`]).
+fn whole_image(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+) -> Option<slates_vfs::recover::VolumeImage> {
+  let handle = *state.by_id.get(&id)?;
+  let ShardState { volumes, store, .. } = state;
+  let slot = volumes.get_mut(handle).ok()?;
+  let host = slot
+    .host
+    .as_mut()
+    .map(|host| host as &mut dyn slates_vfs::host::HostFs);
+  slot.volume.to_standalone_image(store, host).ok()
+}
+
+/// A [`Capture`] of `image`, taken in the turn that took the image: every chunked file's sealed extents pinned and its
+/// open extent copied. `None`, holding no pin, when a file's chunks could not be pinned or the image names a chunked
+/// file the volume does not hold so.
+fn pinned_capture(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  image: slates_vfs::recover::VolumeImage,
+) -> Option<Box<Capture>> {
+  let handle = *state.by_id.get(&id)?;
+  let ShardState { volumes, store, .. } = state;
+  let slot = volumes.get(handle).ok()?;
+  let mut extents = Vec::new();
+  let mut files = Vec::new();
+  for inode in &image.inodes {
+    if !matches!(inode.body, BodyImage::Chunked { .. }) {
+      continue;
+    }
+    match slot
+      .volume
+      .pin_extents(store, InodeNo(inode.no), &mut extents)
+    {
+      Ok(Some(pinned)) => files.push(CapturedFile {
+        inode: inode.no,
+        size: pinned.size,
+        extents: pinned.extents,
+        open: pinned.open,
+      }),
+      Ok(None) | Err(_) => {
+        // What was pinned goes back: the capture is not made.
+        let _ = store.content.unpin_extents(&extents);
+        return None;
+      }
+    }
+  }
+  Some(Box::new(Capture {
+    record: VolumeRecord::Full { image }.to_bytes(),
+    files,
+    extents,
+    runs: Vec::new(),
+    file: 0,
+    taken: 0,
+    extent: 0,
+    current: None,
+    read_rate: (0, 0),
+  }))
+}
+
+/// Reads `capture`'s runs from its pinned extents until `quantum` has passed since `began`, each piece sized to what is
+/// left of it at the rate measured so far ([`piece_bytes`]), a page at least, so every turn moves it on. A sealed
+/// extent's run is its bytes within the file's size, with the open extent's copy laid over what it covers, as a read of
+/// the volume returned it; the open extent's run follows its file's. `Some(true)` once every run is read, `Some(false)`
+/// while some are left, `None` when a read is refused.
+fn read_capture(
+  store: &slates_vfs::volume::Store,
+  capture: &mut Capture,
+  began: u64,
+  quantum: u64,
+) -> Option<bool> {
+  let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES)
+    .unwrap_or(usize::MAX)
+    .max(1);
+  let floor = usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES)
+    .unwrap_or(cap)
+    .clamp(1, cap);
+  loop {
+    let file = capture.files.get_mut(capture.file);
+    let (run, read) = match (capture.current.take(), file) {
+      (_, None) => return Some(true),
+      (Some(current), Some(_)) => current,
+      (None, Some(file)) if capture.taken < file.extents => {
+        let extent = capture.extents.get(capture.extent)?;
+        let len = file.size.saturating_sub(extent.off).min(extent.len);
+        let run = LiveRun {
+          inode: file.inode,
+          offset: extent.off,
+          bytes: vec![0u8; usize::try_from(len).ok()?],
+        };
+        (run, 0)
+      }
+      (None, Some(file)) => {
+        if let Some((offset, mut bytes)) = file.open.take() {
+          bytes.truncate(usize::try_from(file.size.saturating_sub(offset)).unwrap_or(usize::MAX));
+          capture.runs.push(LiveRun {
+            inode: file.inode,
+            offset,
+            bytes,
+          });
+        }
+        capture.file = capture.file.saturating_add(1);
+        capture.taken = 0;
+        continue;
+      }
+    };
+    let mut run = run;
+    let extent = capture.extents.get(capture.extent)?;
+    let left = quantum.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    let to = read
+      .saturating_add(piece_bytes(capture.read_rate, left, floor, cap))
+      .min(run.bytes.len());
+    let piece_began = slates_rt::futures::now_ns();
+    let at = run
+      .offset
+      .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    store
+      .content
+      .read_extent_into(extent, at, run.bytes.get_mut(read..to)?)
+      .ok()?;
+    let (rate_bytes, rate_ns) = capture.read_rate;
+    capture.read_rate = (
+      rate_bytes.saturating_add(u64::try_from(to.saturating_sub(read)).unwrap_or(u64::MAX)),
+      rate_ns.saturating_add(slates_rt::futures::now_ns().saturating_sub(piece_began)),
+    );
+    if to >= run.bytes.len() {
+      if let Some((open_at, open)) = capture
+        .files
+        .get(capture.file)
+        .and_then(|file| file.open.as_ref())
+      {
+        lay_over(open, *open_at, run.offset, &mut run.bytes);
+      }
+      capture.runs.push(run);
+      capture.extent = capture.extent.saturating_add(1);
+      capture.taken = capture.taken.saturating_add(1);
+    } else {
+      capture.current = Some((run, to));
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= quantum {
+      return Some(capture.files.get(capture.file).is_none());
+    }
+  }
+}
+
+/// Copies the part of `bytes`, file bytes from offset `base`, that overlaps `out`, file bytes from offset `off`, into it.
+fn lay_over(bytes: &[u8], base: u64, off: u64, out: &mut [u8]) {
+  let out_end = off.saturating_add(u64::try_from(out.len()).unwrap_or(u64::MAX));
+  let bytes_end = base.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+  let (from, to) = (base.max(off), bytes_end.min(out_end));
+  if from >= to {
+    return;
+  }
+  let span = usize::try_from(to.saturating_sub(from)).unwrap_or(0);
+  let source_at = usize::try_from(from.saturating_sub(base)).unwrap_or(usize::MAX);
+  let out_at = usize::try_from(from.saturating_sub(off)).unwrap_or(usize::MAX);
+  if let (Some(source), Some(target)) = (
+    bytes.get(source_at..source_at.saturating_add(span)),
+    out.get_mut(out_at..out_at.saturating_add(span)),
+  ) {
+    target.copy_from_slice(source);
+  }
+}
+
+/// A read capture's plain body (`LivePublication` bytes), its pins let go.
+fn finish_capture(state: &mut ShardState, mut capture: Box<Capture>) -> Vec<u8> {
+  let record = std::mem::take(&mut capture.record);
+  let runs = std::mem::take(&mut capture.runs);
+  release_capture(state, Some(capture));
+  LivePublication { record, runs }.to_bytes()
+}
+
+/// Lets go of a capture's pins (A-768): at its last turn, or wherever its build ends unread (dropped, its volume gone or
+/// no longer live-shipped), so no pin outlives its capture. A pin refused is counted.
+fn release_capture(state: &mut ShardState, capture: Option<Box<Capture>>) {
+  let Some(capture) = capture else {
+    return;
+  };
+  if state.store.content.unpin_extents(&capture.extents).is_err() {
+    state.count(LIVE_CAPTURE_UNPIN_REFUSED, 1);
+  }
 }
 
 /// Whether a whole entry of `volume`'s log is being sealed in turns, or the publications queued behind one wait.
@@ -2535,6 +2926,7 @@ fn begin_whole_build_with(
     hash_rate: (0, 0),
     whole,
     clear,
+    capture: None,
   }));
   state.count(
     if whole {
@@ -2601,6 +2993,15 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
     return Advance::Done;
   }
   let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
+  let capturing = state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .and_then(|live| live.building.as_ref())
+    .is_some_and(|build| build.capture.is_some());
+  if capturing {
+    return advance_capture(state, id, quantum);
+  }
   let clear = state
     .live
     .shipping
@@ -2897,12 +3298,15 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
 /// Ends `id`'s [`WholeBuild`] unappended (`why` counted): it and the publications queued behind it follow in a whole
 /// state the volume now owes ([`drop_queue`]).
 fn drop_build(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'static str) {
-  let unappended = state
+  let build = state
     .live
     .shipping
     .get_mut(&id.bytes)
-    .and_then(|live| live.building.take())
-    .map_or(0, |build| build.queued.len());
+    .and_then(|live| live.building.take());
+  let unappended = build.map_or(0, |mut build| {
+    release_capture(state, build.capture.take());
+    build.queued.len()
+  });
   drop_queue(state, id, unappended, why);
 }
 
@@ -3510,14 +3914,7 @@ fn refuse(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'stati
 /// origin too, since a successor rebuilds the volume from its log with no origin beside it (`Volume::to_standalone_image`;
 /// its recovery image names those inodes by number only, and a rebuild from it found no tree under its root).
 fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Option<Vec<u8>> {
-  let handle = *state.by_id.get(&id)?;
-  let ShardState { volumes, store, .. } = state;
-  let slot = volumes.get_mut(handle).ok()?;
-  let host = slot
-    .host
-    .as_mut()
-    .map(|host| host as &mut dyn slates_vfs::host::HostFs);
-  let image = slot.volume.to_standalone_image(store, host).ok()?;
+  let image = whole_image(state, id)?;
   Some(VolumeRecord::Full { image }.to_bytes())
 }
 
@@ -4612,8 +5009,8 @@ fn exchange_budget_for(bytes: usize, path: HolderPath) -> slates_cluster::Commit
   )
 }
 
-/// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
-/// within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
+/// Borrows `holder`'s record session, waiting for it while another dispatch has it out, woken by its return
+/// (`crate::fleet::session_returned`), within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
 /// write's message waited for whichever later dispatch carried it, at worst the next record period: two in three sends of
 /// a stable-write run found the session out, and the rare write took about 100 ms (2026-11-05, BENCHMARKS "What live
 /// shipping adds to a stable NFS write"). The forward path learned the same (`fleet::forward_over_leader_session`).
@@ -4638,8 +5035,13 @@ async fn borrow_session(
       return sessions;
     }
     missed = true;
-    // Shape: one tick of the shard's timer wheel, the finest park there is (`sleep` rounds up to it).
-    if slates_rt::futures::sleep(1).await.is_err() {
+    // Waits for the session's return (or its link's change) within what is left of the deadline, then looks again. It
+    // waited a timer tick at a time before 2026-11-20, a park and a look per tick for as long as the session was out.
+    let left = deadline_ns.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    if crate::fleet::session_returned(&[holder], left)
+      .await
+      .is_none()
+    {
       return Vec::new();
     }
   }
@@ -4765,6 +5167,7 @@ fn lose_links(hosts: &[HostId]) {
   let _ = state::with_state(|s| {
     for host in hosts {
       s.record_sessions.remove(host);
+      crate::fleet::sessions_changed(s, *host);
       s.count(LIVE_LINK_LOST, 1);
     }
   });
@@ -8692,6 +9095,229 @@ mod tests {
     assert!(
       silence <= floor + 3 * super::DURABLE_LOOK_NS,
       "a silent holder is given up within the floor and the looks that confirm it: {silence} ns"
+    );
+  }
+
+  /// Shape: each captured file's bytes: eight of a capture's floor pieces (an archive page, 64 KiB), so a capture read a
+  /// piece a turn spans many turns; two of them fit the test daemon's volume.
+  const CAPTURED_FILE_BYTES: usize = 512 << 10;
+  /// Shape: a bound on a capture's turns in these tests, far past the pieces of two captured files.
+  const CAPTURE_TURN_LIMIT: u64 = 10_000;
+
+  /// Writes `CAPTURED_FILE_BYTES` derived from `seed` into a new file `name` of `id`'s root, or over it.
+  fn write_captured(
+    state: &mut ShardState,
+    id: slates_db::catalog::VolumeId,
+    name: &str,
+    seed: &[u8],
+  ) -> Option<InodeNo> {
+    let handle = *state.by_id.get(&id)?;
+    let ShardState { store, volumes, .. } = &mut *state;
+    let slot = volumes.get_mut(handle).ok()?;
+    let root = slot.volume.root_inode(store).ok()?;
+    let file = match slot.volume.lookup_no(store, root, name) {
+      Ok(found) => found.inode,
+      Err(_) => slot.volume.create_file_no(store, root, name, 0o644).ok()?,
+    };
+    let mut bytes = vec![0u8; CAPTURED_FILE_BYTES];
+    blake3::Hasher::new()
+      .update(seed)
+      .finalize_xof()
+      .fill(&mut bytes);
+    slot.volume.write(store, file, 0, &bytes).ok()?;
+    Some(file)
+  }
+
+  /// A-768: a whole capture read in turns reads the head it began on. Do: write two 512 KiB files to a live volume, take the
+  /// one-turn body ([`plain_body`] of [`whole_record`]) as the reference, pin a capture at the same head, read one turn,
+  /// then overwrite the first file and unlink the second (their chunks freed), and read the rest a turn at a time at a
+  /// quantum of zero. Expect: the body equals the reference byte for byte; each turn read at most one floor piece (an
+  /// archive page), so the sealed bytes took at least that many turns; chunks were freed while pinned; and once the body
+  /// is made no pin is held.
+  #[test]
+  fn a_whole_capture_read_in_turns_reads_the_head_it_began_on() {
+    let measured = crate::daemon::audit_on_shard(|state| {
+      let id = live_volume_here(state, "capture-oracle")?;
+      write_captured(state, id, "first", b"A-768: the first file")?;
+      write_captured(state, id, "second", b"A-768: the second file")?;
+      let record = whole_record(state, id)?;
+      let reference = plain_body(state, id, record)?;
+      let image = whole_image(state, id)?;
+      let mut capture = pinned_capture(state, id, image)?;
+      let pinned = state.store.content.pinned();
+      let sealed_bytes: u64 = capture.extents.iter().map(|extent| extent.len).sum();
+      let freed_before = state.store.content.freed_while_pinned();
+      let mut turns = 1u64;
+      let mut done = read_capture(&state.store, &mut capture, slates_rt::futures::now_ns(), 0)?;
+      write_captured(state, id, "first", b"A-768: the head moved on")?;
+      let handle = *state.by_id.get(&id)?;
+      let ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(handle).ok()?;
+      let root = slot.volume.root_inode(store).ok()?;
+      slot.volume.unlink_no(store, root, "second").ok()?;
+      while !done && turns < CAPTURE_TURN_LIMIT {
+        turns += 1;
+        done = read_capture(&state.store, &mut capture, slates_rt::futures::now_ns(), 0)?;
+      }
+      let freed = state.store.content.freed_while_pinned() - freed_before;
+      let body = finish_capture(state, capture);
+      Some((
+        reference,
+        body,
+        pinned,
+        sealed_bytes,
+        turns,
+        freed,
+        state.store.content.pinned(),
+      ))
+    });
+    let (reference, body, pinned, sealed_bytes, turns, freed, after) =
+      measured.expect("the scene was made");
+    let floor = slates_archive::format::MAX_BASE_PAGE_BYTES;
+    println!(
+      "a capture of {sealed_bytes} sealed bytes over {pinned} pinned chunks took {turns} turns at a zero quantum; \
+       {freed} chunks were freed while pinned; {after} pins left"
+    );
+    assert!(pinned > 0, "the capture pinned the files' chunks");
+    assert!(
+      freed > 0,
+      "the head let pinned chunks go while the capture read"
+    );
+    assert!(
+      body == reference,
+      "the capture read the head it began on: {} bytes against the one-turn read's {}",
+      body.len(),
+      reference.len()
+    );
+    assert!(
+      turns.saturating_mul(floor) >= sealed_bytes,
+      "each turn stopped at the quantum after one floor piece: {turns} turns for {sealed_bytes} bytes"
+    );
+    assert_eq!(after, 0, "no pin outlived the capture");
+  }
+
+  /// A-768: a whole publication's capture runs in turns of the volume's build, and a publication made meanwhile queues
+  /// behind it. Do: write two 512 KiB files to a live volume, start its whole publication at a quantum of zero, overwrite a
+  /// file and publish the shard, then run the capture's turns. Expect: the first turn left the capture waiting as the
+  /// build with chunks pinned; the publication made meanwhile was queued behind it; the capture took more than one turn;
+  /// and once it ended no pin is held.
+  #[test]
+  fn a_whole_capture_in_turns_queues_what_publishes_behind_it_and_lets_its_pins_go() {
+    let measured = crate::daemon::audit_on_shard(|state| {
+      let id = live_volume_here(state, "capture-queue")?;
+      write_captured(state, id, "first", b"A-768: the first file")?;
+      write_captured(state, id, "second", b"A-768: the second file")?;
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        HostId(local.0.wrapping_add(1)),
+        HostId(local.0.wrapping_add(2)),
+      ];
+      owe_first_whole(state, id, &holders);
+      let first = start_capture(state, id, 0);
+      let capturing = building(state, id.bytes);
+      let pinned = state.store.content.pinned();
+      write_captured(state, id, "first", b"A-768: the head moved on")?;
+      let _ = crate::verbs::publish_shard(state);
+      let queued = state.refusals.get(LIVE_QUEUED).copied().unwrap_or(0);
+      let mut turns = 1u64;
+      while advance_capture(state, id, 0) == Advance::More && turns < CAPTURE_TURN_LIMIT {
+        turns += 1;
+      }
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      Some((
+        first,
+        capturing,
+        pinned,
+        queued,
+        turns,
+        counted(LIVE_CAPTURES),
+        counted(LIVE_CAPTURE_TURNS),
+        state.store.content.pinned(),
+      ))
+    });
+    let (first, capturing, pinned, queued, turns, captures, capture_turns, after) =
+      measured.expect("the scene was made");
+    println!(
+      "first turn {first:?}, capturing {capturing}, {pinned} pins, {queued} queued behind, {turns} turns \
+       (counted: {captures} captures, {capture_turns} turns), {after} pins after"
+    );
+    assert_eq!(
+      first,
+      Advance::More,
+      "the first turn stopped at the quantum"
+    );
+    assert!(
+      capturing && pinned > 0,
+      "the capture waits as the build, its chunks pinned"
+    );
+    assert!(
+      queued >= 1,
+      "the publication made meanwhile queued behind the capture"
+    );
+    assert!(
+      turns > 1 && captures == 1 && capture_turns >= turns,
+      "the capture ran in turns of its own"
+    );
+    assert_eq!(after, 0, "no pin outlived the capture");
+  }
+
+  /// A-768: a capture whose build ends unread leaks no pin, and what the head let go meanwhile is freed with it. Do: start
+  /// a whole publication's capture at a quantum of zero, overwrite a file (its chunks freed while pinned), then drop the
+  /// build; start one again and forget the volume (its destroy). Expect: no pin held after either, and the chunks freed
+  /// while pinned gone from the store.
+  #[test]
+  fn a_capture_dropped_or_forgotten_leaks_no_pin() {
+    let measured = crate::daemon::audit_on_shard(|state| {
+      let id = live_volume_here(state, "capture-cancel")?;
+      write_captured(state, id, "first", b"A-768: the first file")?;
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        HostId(local.0.wrapping_add(1)),
+        HostId(local.0.wrapping_add(2)),
+      ];
+      owe_first_whole(state, id, &holders);
+      if start_capture(state, id, 0) != Advance::More {
+        return None;
+      }
+      let pinned = state.store.content.pinned();
+      let freed_before = state.store.content.freed_while_pinned();
+      write_captured(state, id, "first", b"A-768: the head moved on")?;
+      let freed = state.store.content.freed_while_pinned() - freed_before;
+      let held = state.store.content.chunks();
+      drop_build(state, id, "fleet.live.refused.test");
+      let after_drop = state.store.content.pinned();
+      let let_go = held - state.store.content.chunks();
+      if start_capture(state, id, 0) != Advance::More {
+        return None;
+      }
+      let pinned_again = state.store.content.pinned();
+      forget(state, id);
+      Some((
+        pinned,
+        freed,
+        after_drop,
+        let_go,
+        pinned_again,
+        state.store.content.pinned(),
+      ))
+    });
+    let (pinned, freed, after_drop, let_go, pinned_again, after_forget) =
+      measured.expect("the scene was made");
+    println!(
+      "{pinned} pins, {freed} freed while pinned, {after_drop} after the drop ({let_go} chunks let go); \
+       {pinned_again} pins again, {after_forget} after the forget"
+    );
+    assert!(pinned > 0 && freed > 0, "the overwrite freed pinned chunks");
+    assert_eq!(after_drop, 0, "a dropped build's capture let its pins go");
+    assert_eq!(
+      let_go,
+      usize::try_from(freed).unwrap(),
+      "the chunks freed while pinned went with the pins"
+    );
+    assert!(pinned_again > 0);
+    assert_eq!(
+      after_forget, 0,
+      "a forgotten volume's capture let its pins go"
     );
   }
 

@@ -22368,6 +22368,60 @@ fn a_forwarded_submit_is_answered_by_its_commit_not_by_a_poll() {
   );
 }
 
+/// §4.8 "Lookup" (a forward waits for its peer's record session while another borrower has it out, and is woken by its
+/// return, never paced: main's sweep after A-697's release bench, 2026-11-20). Do: in a two-node `f = 1` fleet, B takes
+/// its record session to A out on loan for [`SESSION_HOLD_NS`] (the test hook), and a client on B asks A for its green's
+/// versions meanwhile, three times. Expect: each answered; every wait for the session woken by the session's own return to
+/// its link (B's returned counter moved by three at least: another change of the link, a discovery refresh, also wakes a
+/// wait, so the return's own count is the one held), none elapsed.
+#[test]
+fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, _) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let a_member = daemon_a.member_identity().unwrap();
+  let count = |name: &str| {
+    daemon_b
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let mut client = Client::connect(daemon_b.instance());
+  let warm = client.call(&RequestBody::Versions { green });
+  assert!(matches!(warm, ReplyBody::Versions { .. }), "{warm:?}");
+  let before = (
+    count("fleet.session_wait.returned"),
+    count("fleet.session_wait.elapsed"),
+  );
+  let mut answers = Vec::new();
+  for _ in 0..3 {
+    let held = daemon_b.hold_record_session(a_member, SESSION_HOLD_NS);
+    assert!(
+      matches!(held, Ok(slates_server::daemon::SessionHold::Took { .. })),
+      "B took its session to A out: {held:?}"
+    );
+    let started = Instant::now();
+    let reply = client.call(&RequestBody::Versions { green });
+    answers.push((
+      started.elapsed(),
+      matches!(reply, ReplyBody::Versions { .. }),
+    ));
+  }
+  let after = (
+    count("fleet.session_wait.returned"),
+    count("fleet.session_wait.elapsed"),
+  );
+  eprintln!("forwards answered while the session was out: {answers:?}");
+  assert!(answers.iter().all(|(_, answered)| *answered), "{answers:?}");
+  assert!(
+    after.0 - before.0 >= 3,
+    "each forward woken by the session's return: {before:?} then {after:?}"
+  );
+  assert_eq!(after.1, before.1, "no wait elapsed unwoken");
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the

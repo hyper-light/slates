@@ -2161,6 +2161,25 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
     fields.insert("dumps_local_full".to_owned(), json!(r.dumps_local_full));
     // Whether the anchor has judged the daemon recovered (A-311): what a caller that ends a daemon on purpose waits for.
     fields.insert("recovered".to_owned(), json!(r.recovered));
+    // The daemon's memory by kind (§4.14), read in its own process with nothing suspended (A-232's gotcha).
+    fields.insert(
+      "memory".to_owned(),
+      Value::Array(
+        r.memory
+          .iter()
+          .map(|kind| {
+            json!({
+              "kind": kind.kind,
+              "mappings": kind.mappings,
+              "reserved_bytes": kind.reserved_bytes,
+              "resident_bytes": kind.resident_bytes,
+              "modified_bytes": kind.modified_bytes,
+              "measured": kind.measured,
+            })
+          })
+          .collect(),
+      ),
+    );
   }
   report
 }

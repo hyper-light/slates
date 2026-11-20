@@ -30,14 +30,19 @@ use std::time::{Duration, Instant};
 
 /// Shape: shards for the test daemon.
 const SHARDS: &str = "2";
-/// Shape: how long a change through another path gets to reach the mount: ten liveness budgets
-/// (`LIVENESS_BUDGET_NS`, 1 s), as the Unix CLI tests' `WAIT_FOR`.
+/// Shape: how long a close and delete racing a coherent purge get to return before they count as wedged
+/// ([`a_delete_racing_a_coherent_purge_returns_and_removes_the_file`]): ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s).
+/// The bound that test proves, not a wait on the daemon: since 2026-11-20 this suite's other waits are judged in the
+/// daemon's own CPU, or held to [`KERNEL_WAIT`].
 const WAIT_FOR: Duration = Duration::from_secs(10);
+/// Derived: how long a change in the kernel's name space (a drive arriving after its mount, gone after its unmount), a
+/// process's exit, or a view following a change the daemon told the driver of, may take: the observation budget, from
+/// its one source (`slates_machine::budgets`). Windows offers no drive-arrival event without a window's message loop,
+/// so the drive's arrival and departure are still looked for at the test's pace (owed: the device-change
+/// notification); until 2026-11-20 these were held to `WAIT_FOR`.
+const KERNEL_WAIT: Duration = Duration::from_nanos(slates_machine::budgets::observe_budget_ns());
 /// Shape: the pause between polls of a change or a start.
 const POLL: Duration = Duration::from_millis(20);
-/// Derived: how long a daemon gets to be judged recovered (A-311): [`WAIT_FOR`] to serve, as a successor gets, and as long
-/// again to serve as long as its start took.
-const RECOVERED_WAIT: Duration = WAIT_FOR.saturating_mul(2);
 /// Shape: consecutive answers to `volume list` a start waits for, so the anchor's one startup restart has settled.
 const STABLE_STREAK: u32 = 10;
 /// Shape: the most `volume list` attempts a start makes after the daemon's serving line (`crates/cli/tests/cli.rs`
@@ -190,16 +195,16 @@ fn free_drive_letter() -> String {
   format!("{letter}:")
 }
 
-/// Waits until `path` answers a read (the drive registers after the mount's reply), within [`WAIT_FOR`].
+/// Waits until `path` answers a read (the drive registers after the mount's reply), within [`KERNEL_WAIT`].
 fn wait_ready(path: &str) {
   let started = Instant::now();
-  while started.elapsed() < WAIT_FOR {
+  while started.elapsed() < KERNEL_WAIT {
     if std::fs::metadata(path).is_ok() {
       return;
     }
     pause();
   }
-  panic!("{path} never answered within {WAIT_FOR:?}");
+  panic!("{path} never answered within {KERNEL_WAIT:?}");
 }
 
 /// Runs a Windows program and asserts it succeeded: the mount's writes are made by programs (PowerShell's file
@@ -294,7 +299,7 @@ fn a_volume_mounted_through_winfsp_is_read_and_written_by_windows_programs() {
   let started = Instant::now();
   while std::fs::metadata(&root).is_ok() || drive_target(&drive).is_some() {
     assert!(
-      started.elapsed() < WAIT_FOR,
+      started.elapsed() < KERNEL_WAIT,
       "the drive is gone after the unmount"
     );
     pause();
@@ -387,7 +392,7 @@ fn read_uncached_page(handle: &std::fs::File) -> std::io::Result<Vec<u8>> {
   Ok(page.0[..read].to_vec())
 }
 
-/// Polls `look` until every byte it returns is `fill`, within [`WAIT_FOR`]; the time it took, or `None`.
+/// Polls `look` until every byte it returns is `fill`, within [`KERNEL_WAIT`]; the time it took, or `None`.
 fn follows(fill: u8, mut look: impl FnMut() -> Vec<u8>) -> Option<Duration> {
   let started = Instant::now();
   loop {
@@ -395,7 +400,7 @@ fn follows(fill: u8, mut look: impl FnMut() -> Vec<u8>) -> Option<Duration> {
     if bytes.len() == FILE_BYTES && bytes.iter().all(|byte| *byte == fill) {
       return Some(started.elapsed());
     }
-    if started.elapsed() >= WAIT_FOR {
+    if started.elapsed() >= KERNEL_WAIT {
       return None;
     }
     pause();
@@ -404,7 +409,7 @@ fn follows(fill: u8, mut look: impl FnMut() -> Vec<u8>) -> Option<Duration> {
 
 /// §4.6 "Windows" cache posture (`FileInfoTimeout` infinite with `FspFileSystemNotify`), G-mount step 2. Do: open
 /// `file.bin` through the drive and read it twice (the second read served from Windows' cache), then rewrite it in
-/// place through the SDK, and read again through the same handle. Expect: the new bytes within [`WAIT_FOR`]: the mount
+/// place through the SDK, and read again through the same handle. Expect: the new bytes within [`KERNEL_WAIT`]: the mount
 /// told Windows of the change, which purged the file's cached pages, so the next read reached the shard.
 #[test]
 fn a_cached_read_through_a_winfsp_mount_shows_another_paths_change() {
@@ -424,13 +429,13 @@ fn a_cached_read_through_a_winfsp_mount_shows_another_paths_change() {
   eprintln!(
     "WINFSP CACHED READ: {}",
     took.map_or_else(
-      || format!("stale after {WAIT_FOR:?}"),
+      || format!("stale after {KERNEL_WAIT:?}"),
       |took| format!("followed the SDK's change in {took:?}")
     )
   );
   assert!(
     took.is_some(),
-    "a cached read through the same handle shows the SDK's change within {WAIT_FOR:?}"
+    "a cached read through the same handle shows the SDK's change within {KERNEL_WAIT:?}"
   );
   let _ = &fixture.instance;
 }
@@ -626,7 +631,7 @@ fn kill_daemon(pid: u32) {
   let waited = unsafe {
     WaitForSingleObject(
       process.as_raw_handle(),
-      u32::try_from(WAIT_FOR.as_millis()).unwrap(),
+      u32::try_from(KERNEL_WAIT.as_millis()).unwrap(),
     )
   };
   assert_eq!(
@@ -635,9 +640,45 @@ fn kill_daemon(pid: u32) {
   );
 }
 
+/// A wait judged in the CPU of `instance`'s daemon (`process_wait::Judged`), re-aimed at each new daemon its `status`
+/// names: Windows lists no instance's processes by command line, and a live daemon's watchdog keeps it moving, so it is
+/// waited on while it lives (A-232). Across a restart the `status` itself waits while the anchor holds the rendezvous
+/// (A-468). Until 2026-11-20 these waits were held to `WAIT_FOR`.
+struct DaemonWatch {
+  aimed: Option<(u32, process_wait::Judged)>,
+}
+
+impl DaemonWatch {
+  fn new() -> DaemonWatch {
+    DaemonWatch { aimed: None }
+  }
+
+  /// One look at `instance`'s daemon now; fails the test naming `what` once the daemon it watches stalls or spends its
+  /// CPU budget.
+  fn look(&mut self, instance: &str, what: &str) {
+    let Some(pid) = daemon_pid(instance) else {
+      return;
+    };
+    if self.aimed.as_ref().is_none_or(|(aimed, _)| *aimed != pid) {
+      self.aimed = Some((pid, process_wait::Judged::of(pid)));
+    }
+    if let Some((_, judged)) = self.aimed.as_mut() {
+      judged.look(what);
+    }
+  }
+}
+
+/// The daemon of `instance` once the anchor has judged it recovered (A-311), waited for while that daemon gains CPU
+/// (`recovered::await_recovered_while_alive`; until 2026-11-20 within `RECOVERED_WAIT`, twice `WAIT_FOR`).
+fn recovered_daemon(instance: &str) -> u32 {
+  let pid = daemon_pid(instance).expect("the instance's daemon answers");
+  let mut judged = process_wait::Judged::of(pid);
+  recovered::await_recovered_while_alive(instance, &|_| true, POLL, &mut judged)
+}
+
 /// Waits for the held volume to be adopted, checking its drive target throughout the gap between daemons.
 fn wait_for_successor(instance: &str, drive: &str, original: &[u16], killed: u32, iteration: u32) {
-  let started = Instant::now();
+  let mut watch = DaemonWatch::new();
   loop {
     let target = drive_target(drive);
     eprintln!(
@@ -654,9 +695,9 @@ fn wait_for_successor(instance: &str, drive: &str, original: &[u16], killed: u32
     {
       break;
     }
-    assert!(
-      started.elapsed() < WAIT_FOR,
-      "no successor served after kill {iteration}"
+    watch.look(
+      instance,
+      &format!("a successor served after kill {iteration}"),
     );
     pause();
   }
@@ -735,7 +776,7 @@ fn a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons() {
   for iteration in 1..=TAKEOVER_KILLS {
     // Each daemon is killed once the anchor has judged it recovered (A-311): a daemon killed sooner is a failed start,
     // and the second in a row is a crash loop the anchor backs off, which this test does not test.
-    let killed = recovered::await_recovered(&fixture.instance, &|_| true, POLL, RECOVERED_WAIT);
+    let killed = recovered_daemon(&fixture.instance);
     kill_daemon(killed);
     wait_for_successor(&fixture.instance, &drive, &original, killed, iteration);
     let served = successor_bytes(&mut fixture, &handle, &view, iteration);
@@ -782,7 +823,7 @@ fn a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused() {
   let (mut kept, mut refused, mut lost) = (0u32, 0u32, Vec::new());
   for iteration in 1..=UNFLUSHED_KILLS {
     // Each daemon is killed once the anchor has judged it recovered (A-311), as in the takeover test.
-    let killed = recovered::await_recovered(&instance, &|_| true, POLL, RECOVERED_WAIT);
+    let killed = recovered_daemon(&instance);
     let fill = b'A' + u8::try_from(iteration).unwrap();
     let handle = std::fs::OpenOptions::new()
       .read(true)
@@ -1015,10 +1056,10 @@ impl Drop for AnchorSuspended<'_> {
   }
 }
 
-/// Waits for the drive to be gone from the kernel's name space, within [`WAIT_FOR`]: whether it went.
+/// Waits for the drive to be gone from the kernel's name space, within [`KERNEL_WAIT`]: whether it went.
 fn drive_goes(drive: &str) -> bool {
   let started = Instant::now();
-  while started.elapsed() < WAIT_FOR {
+  while started.elapsed() < KERNEL_WAIT {
     if drive_target(drive).is_none() {
       return true;
     }
@@ -1442,13 +1483,13 @@ fn waited_process(process: &mut OwnedProcess) -> std::process::ExitStatus {
   let waited = unsafe {
     windows_sys::Win32::System::Threading::WaitForSingleObject(
       process.child.as_raw_handle(),
-      u32::try_from(WAIT_FOR.as_millis()).unwrap(),
+      u32::try_from(KERNEL_WAIT.as_millis()).unwrap(),
     )
   };
   assert_eq!(
     waited,
     windows_sys::Win32::Foundation::WAIT_OBJECT_0,
-    "the probe must exit within {WAIT_FOR:?}"
+    "the probe must exit within {KERNEL_WAIT:?}"
   );
   process.child.wait().unwrap()
 }
@@ -1469,7 +1510,7 @@ fn startup_failure(command: &mut Command) -> (std::process::ExitStatus, String) 
     send.send((result, bytes)).unwrap();
   }));
   let exit = waited_process(&mut process);
-  let (result, bytes) = receive.recv_timeout(WAIT_FOR).unwrap();
+  let (result, bytes) = receive.recv_timeout(KERNEL_WAIT).unwrap();
   result.unwrap();
   assert!(
     u64::try_from(bytes.len()).unwrap() < STARTUP_TRACE_BYTES,
@@ -1618,16 +1659,18 @@ const PURGES_UNTAKEN: &str = "winfsp.purges_untaken";
 /// Format: the daemon's counter of purges given up after Windows kept their page until the volume's request timeout.
 const PURGES_KEPT: &str = "winfsp.purges_kept";
 
-/// The daemon's counter `name` once it reaches `floor`, asked again until [`WAIT_FOR`] passes, else its last reading. A
+/// The daemon's counter `name` once it reaches `floor`, asked again while the daemon gains CPU ([`DaemonWatch`]; until
+/// 2026-11-20 until `WAIT_FOR` passed, else its last reading. A
 /// purge is counted after the view it purged has followed (its read back comes after its write), so a reading taken
 /// the moment the view follows can be early.
 fn counter_reaching(instance: &str, name: &str, floor: u64) -> u64 {
-  let started = Instant::now();
+  let mut watch = DaemonWatch::new();
   loop {
     let count = counter(instance, name);
-    if count >= floor || started.elapsed() >= WAIT_FOR {
+    if count >= floor {
       return count;
     }
+    watch.look(instance, &format!("{name} reached {floor}"));
     pause();
   }
 }
@@ -1646,7 +1689,7 @@ fn counter(instance: &str, name: &str) -> u64 {
 
 /// §4.6 "Windows", the DAX matrix's Windows mount-route cell, G-mount step 2, A-190. Do: map `file.bin` read-only through
 /// the drive and read the view, then rewrite the file in place through the SDK, and watch the view as memory alone for
-/// [`WAIT_FOR`]; beside it, read the file through a second handle opened after the view; then close the view and every
+/// [`KERNEL_WAIT`]; beside it, read the file through a second handle opened after the view; then close the view and every
 /// handle and open the file again. Expect: the view does what [`MAPPED_VIEW_FOLLOWS`] records (it follows), and so does
 /// the read through the second handle, since the purge drops the range from Windows' cache too; and the daemon counts a
 /// purge made and its write answered without being applied, so the view cannot follow by any other path. Before A-190
@@ -1674,11 +1717,11 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
   eprintln!(
     "WINFSP MAPPED VIEW: {}; a read through a handle {}",
     view_took.map_or_else(
-      || format!("stale after {WAIT_FOR:?} (first byte {first:?})"),
+      || format!("stale after {KERNEL_WAIT:?} (first byte {first:?})"),
       |took| format!("followed the SDK's change in {took:?}")
     ),
     read_took.map_or_else(
-      || format!("stale after {WAIT_FOR:?}"),
+      || format!("stale after {KERNEL_WAIT:?}"),
       |took| format!("followed it in {took:?}")
     ),
   );
@@ -1721,7 +1764,7 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
   eprintln!(
     "WINFSP AFTER THE VIEW: {}",
     fresh_took.map_or_else(
-      || format!("a fresh open still stale after {WAIT_FOR:?}"),
+      || format!("a fresh open still stale after {KERNEL_WAIT:?}"),
       |took| format!("a fresh open read the change in {took:?}")
     )
   );
@@ -1814,7 +1857,7 @@ fn process_isolated_image() -> Option<&'static str> {
     }
   }
   // `ver` prints "Microsoft Windows [Version 10.0.BUILD.REVISION]".
-  let (_, ver, _) = bounded_output(Command::new("cmd").args(["/c", "ver"]), WAIT_FOR).ok()?;
+  let (_, ver, _) = bounded_output(Command::new("cmd").args(["/c", "ver"]), KERNEL_WAIT).ok()?;
   let build = ver
     .split("Version ")
     .nth(1)
@@ -2247,13 +2290,13 @@ const HEALTHY_DRIVES: usize = 2;
 
 /// Waits until a successor of `killed` has adopted `drives` held drives.
 fn wait_for_adoptions(instance: &str, killed: u32, drives: u64) {
-  let started = Instant::now();
+  let mut watch = DaemonWatch::new();
   while !(daemon_pid(instance).is_some_and(|pid| pid != killed)
     && counter(instance, "winfsp.adopted") >= drives)
   {
-    assert!(
-      started.elapsed() < WAIT_FOR,
-      "no successor adopted the {drives} held drives"
+    watch.look(
+      instance,
+      &format!("a successor adopted the {drives} held drives"),
     );
     pause();
   }

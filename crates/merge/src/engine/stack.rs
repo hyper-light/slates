@@ -129,6 +129,11 @@ pub enum Landed {
     /// Why.
     case: super::CopyRefusal,
   },
+  /// A named run of the work is not read yet (as [`super::Outcome::ContentUnread`]).
+  ContentUnread {
+    /// The run's object.
+    identity: crate::named::Identity,
+  },
   /// Never judged: a work below it did not land.
   LowerRefused {
     /// The place in the stack of the first work below it that did not land (the bottom is 0).
@@ -141,7 +146,7 @@ pub enum Landed {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Restated {
   /// The upper as a work based on that version, its operations in that version's coordinates: what the green judges.
-  Over(Increment),
+  Over(Box<Increment>),
   /// It meets a change it did not see: the windows, nothing changed.
   Conflict {
     /// The conflicting windows.
@@ -216,7 +221,7 @@ impl Green {
   /// windows of the changes it meets, or why it cannot be restated.
   pub fn restate(&self, stack: (&Increment, &[Upper]), upper: &Upper) -> Restated {
     match self.restated(stack, upper) {
-      Ok(Ok(work)) => Restated::Over(work),
+      Ok(Ok(work)) => Restated::Over(Box::new(work)),
       Ok(Err(windows)) => Restated::Conflict { windows },
       Err(why) => Restated::Refused(why),
     }
@@ -236,6 +241,7 @@ impl Green {
       doc: upper.doc.clone(),
       post_state: upper.post_state.clone(),
       evidence: upper.evidence.clone(),
+      named: Default::default(),
     };
     let resolved = Green::resolve(&work);
     if let Some(path) = resolved.copies.keys().next() {
@@ -308,6 +314,7 @@ impl Green {
       Judgment::Conflict { windows } => Landed::Conflict { windows },
       Judgment::BaseUnavailable { base, floor } => Landed::BaseUnavailable { base, floor },
       Judgment::CopyRefused { path, case } => Landed::CopyRefused { path, case },
+      Judgment::ContentUnread { identity } => Landed::ContentUnread { identity },
     }
   }
 }
@@ -318,7 +325,7 @@ enum Landing<'a> {
   /// The bottom.
   Bottom(&'a Increment),
   /// An upper, restated.
-  Upper(Increment),
+  Upper(Box<Increment>),
 }
 
 impl Landing<'_> {
@@ -334,7 +341,7 @@ impl Landing<'_> {
   fn restated(self) -> Option<Increment> {
     match self {
       Landing::Bottom(_) => None,
-      Landing::Upper(work) => Some(work),
+      Landing::Upper(work) => Some(*work),
     }
   }
 }

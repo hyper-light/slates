@@ -169,6 +169,8 @@ impl Replica {
         return Ok(1);
       }
       LoggedChange::Changed { change } => self.changed(change)?,
+      // A push's record: content for the store's replay, no state this model keeps.
+      LoggedChange::Objects { .. } => {}
     }
     Ok(0)
   }
@@ -246,9 +248,10 @@ impl Replica {
 /// The log a change of a record moves.
 fn log_of(change: &LoggedChange) -> StateLog {
   match change {
-    LoggedChange::Joined { .. } | LoggedChange::Named { .. } | LoggedChange::Left { .. } => {
-      StateLog::Names
-    }
+    LoggedChange::Joined { .. }
+    | LoggedChange::Named { .. }
+    | LoggedChange::Left { .. }
+    | LoggedChange::Objects { .. } => StateLog::Names,
     LoggedChange::Changed { change } => match change {
       StateChange::PhaseRootAdded { .. } | StateChange::PhaseRootRemoved { .. } => StateLog::Phases,
       StateChange::MarkerAdded { .. } => StateLog::Markers,
