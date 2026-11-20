@@ -38,6 +38,7 @@ slates-bridge-core = { workspace = true }
 slates-http = { workspace = true }
 slates-http-edge = { workspace = true }
 slates-git = { workspace = true }
+slates-ssh = { workspace = true }
 blake3 = { workspace = true }
 rustls = { workspace = true }
 

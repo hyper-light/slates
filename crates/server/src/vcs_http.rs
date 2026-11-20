@@ -39,7 +39,7 @@
 //! upload-pack, A-615; receive-pack's commit, A-620 part 2), which answer `503` until they land; Mercurial's and
 //! Subversion's sites; the MCP edge onto this engine; the live `git clone` over HTTPS (main's run).
 
-mod git;
+pub(crate) mod git;
 mod waits;
 
 use std::cell::{Cell, RefCell};

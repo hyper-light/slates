@@ -1909,6 +1909,7 @@ dependencies = [
  "slates-merge",
  "slates-rt",
  "slates-seal",
+ "slates-ssh",
  "slates-test-seeds",
  "slates-transport",
  "slates-vfs",
