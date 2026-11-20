@@ -438,15 +438,35 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
 
 /// c2's exporter text rebuild sliced (main's item 2 of 2026-11-20; Ada's rule: a performance gap is fixed first). Do:
 /// commit [`FILE`] with a 512 KiB text, then edit a few of its bytes in each of 31 revisions, so the youngest text is
-/// read through a chain of skip deltas; export the youngest revision alone in format 2, timing each call (best of three
-/// exports), and time one whole read of the text (best of three). Expect: the dump carries the text, and no call costs
-/// a quarter of the whole read: the chain is rebuilt a window a call. Before, the call that wrote the text's first piece
-/// rebuilt the whole chain.
+/// kept as a chain of skip deltas; export the youngest revision alone in format 2 through a source that counts what
+/// each call asks of it. Expect: the dump carries the text; no call reads a text whole, and none takes more than one
+/// bounded step of reading (a window of the chain); and the reading took at least a step for each window of the chain,
+/// so it walked the chain rather than skipping it. Before, the call that wrote the text's first piece read it whole
+/// (512 KiB, a chain of 6: that call 6.18 ms against a whole read of 6.04 ms, debug, this Mac).
 #[test]
 fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
+  use std::cell::Cell;
+
   use crate::dump::Format;
-  use crate::migration::{Exporter, Exporting};
-  use std::time::{Duration, Instant};
+  use crate::migration::{Exporter, Exporting, TextReading, TextSource};
+  use crate::svndiff::WINDOW_LIMIT;
+  /// The records as a text source, counting the whole reads and the steps asked of it.
+  struct Counted<'a> {
+    records: &'a Repository,
+    whole: Cell<u64>,
+    steps: Cell<u64>,
+  }
+  impl TextSource for Counted<'_> {
+    fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+      self.whole.set(self.whole.get() + 1);
+      TextSource::text(self.records, identity)
+    }
+
+    fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+      self.steps.set(self.steps.get() + 1);
+      TextSource::read_step(self.records, identity, reading)
+    }
+  }
   const LEN: usize = 512 * 1024;
   let mut bytes: Vec<u8> = (0..LEN).map(|at| (at % 251) as u8).collect();
   let mut repository = created();
@@ -473,42 +493,34 @@ fn an_export_rebuilds_a_long_delta_chain_a_window_a_call() {
   }
   let youngest = repository.youngest();
   let identity = *blake3::hash(&bytes).as_bytes();
-  assert!(repository.text_chain(&identity).unwrap() >= 5);
-  let whole = (0..3)
-    .map(|_| {
-      let began = Instant::now();
-      assert_eq!(
-        repository.text(&identity).as_deref(),
-        Some(bytes.as_slice())
-      );
-      began.elapsed()
-    })
-    .min()
-    .unwrap();
-  let mut longest = Duration::MAX;
+  let chain = u64::try_from(repository.text_chain(&identity).unwrap()).unwrap();
+  assert!(chain >= 5, "a chain of {chain}");
+  let counted = Counted {
+    records: &repository,
+    whole: Cell::new(0),
+    steps: Cell::new(0),
+  };
+  let mut exporter = Exporter::new(&repository, youngest, youngest, Format::Two).unwrap();
   let mut dump = Vec::new();
-  for _ in 0..3 {
-    let mut exporter = Exporter::new(&repository, youngest, youngest, Format::Two).unwrap();
-    let mut out = Vec::new();
-    let mut slowest = Duration::ZERO;
-    loop {
-      let began = Instant::now();
-      let exported = exporter.export(&repository, &repository, &mut out).unwrap();
-      slowest = slowest.max(began.elapsed());
-      if exported == Exporting::Done {
-        break;
-      }
+  let mut most_steps = 0;
+  loop {
+    let before = counted.steps.get();
+    let exported = exporter.export(&repository, &counted, &mut dump).unwrap();
+    most_steps = most_steps.max(counted.steps.get() - before);
+    if exported == Exporting::Done {
+      break;
     }
-    longest = longest.min(slowest);
-    dump = out;
   }
+  let windows = chain * u64::try_from(LEN).unwrap().div_ceil(WINDOW_LIMIT);
   assert!(
     dump
       .windows(bytes.len())
       .any(|window| window == bytes.as_slice())
   );
+  assert_eq!((counted.whole.get(), most_steps), (0, 1));
   assert!(
-    longest.saturating_mul(4) < whole,
-    "longest call {longest:?} against a whole read of {whole:?}"
+    counted.steps.get() >= windows,
+    "{} steps for {windows} windows",
+    counted.steps.get()
   );
 }
