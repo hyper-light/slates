@@ -1,0 +1,45 @@
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.43s
+     Running unittests src/lib.rs (target/debug/deps/slates_server-70d82b025845d804)
+
+running 14 tests
+test hangup::tests::a_client_killed_with_sigkill_is_seen_at_the_next_event_turn ... ok
+test hook_driver::tests::a_hook_role ... ok
+test hangup::tests::a_client_dead_before_its_watch_registered_is_caught_at_the_registration ... ok
+test hook_driver::tests::a_hook_that_cannot_start_is_unstartable_by_its_cause ... ok
+test hook_driver::tests::a_hook_runs_in_its_view_with_its_points_input ... ok
+test hook_driver::tests::a_hook_that_reads_none_of_a_large_input_ends_its_run_by_its_exit ... ok
+test hangup::tests::a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind ... FAILED
+test hook_driver::tests::a_pre_lock_hooks_standard_output_comes_back_as_its_token ... ok
+test hook_driver::tests::a_refusing_hook_is_refused_with_its_exit_and_its_points_words ... ok
+test hook_driver::tests::a_subversion_hook_runs_in_the_filesystems_root ... ok
+test hook_driver::tests::a_subversion_hook_starts_with_its_own_environment_alone ... ok
+test hook_driver::tests::a_hooks_first_run_ends_when_its_client_leaves_and_teaches_nothing ... ok
+test hook_driver::tests::a_hook_past_its_learned_bound_is_killed_with_its_group_and_reaped ... ok
+test hook_driver::tests::a_hook_whose_child_holds_its_output_is_judged_by_its_exit_and_its_child_ended ... ok
+
+failures:
+
+---- hangup::tests::a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind stdout ----
+
+thread 'hangup::tests::a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind' (7411) panicked at crates/server/src/hangup.rs:554:5:
+the peer read Err(Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }), not the daemon's close
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    hangup::tests::a_cancelled_watch_leaves_no_wait_and_no_descriptor_behind
+
+test result: FAILED. 13 passed; 1 failed; 0 ignored; 0 measured; 921 filtered out; finished in 1.07s
+
+error: test failed, to rerun pass `-p slates-server --lib`
