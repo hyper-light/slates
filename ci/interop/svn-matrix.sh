@@ -111,7 +111,7 @@ row cat bash -c "f=\$($R ls $URL/trunk | grep -v /\$ | head -1) && $R cat $URL/t
 row checkout bash -c "$R checkout -q $URL/trunk $WORK/a"
 row log bash -c "$R log -q $URL"
 row log-verbose bash -c "$R log -v -l 100 $URL/trunk"
-row blame bash -c "cd $WORK/a && f=\$(ls | grep -m1 '\.c$') && $R blame \$f"
+row blame bash -c "cd $WORK/a && f=\$(ls -p | grep -v / | head -1) && [ -n \"\$f\" ] && $R blame \$f"
 row diff bash -c "r=\$($R info --show-item last-changed-revision $URL/trunk) && $R diff -c \$r $URL/trunk"
 row export bash -c "$R export -q $URL/trunk $WORK/exported"
 row update-back bash -c "cd $WORK/a && $R update -q -r PREV && $R update -q"
@@ -120,7 +120,7 @@ row commit-edit bash -c "cd $WORK/a && echo more >>matrix.txt && $R commit -q -m
 row status bash -c "cd $WORK/a && [ -z \"\$($R status -q)\" ]"
 row propset bash -c "cd $WORK/a && $R propset -q matrix:prop value matrix.txt && $R commit -q -m prop \
   && [ \"\$($R propget matrix:prop $URL/trunk/matrix.txt)\" = value ]"
-row mkdir-url bash -c "$R mkdir -q -m dirs $URL/branches $URL/tags"
+row mkdir-url bash -c "for d in branches tags; do $R ls $URL/\$d >/dev/null 2>&1 || $R mkdir -q -m dirs $URL/\$d || exit 1; done"
 row copy-branch bash -c "$R copy -q -m branch $URL/trunk $URL/branches/matrix"
 row copy-tag bash -c "$R copy -q -m tag $URL/trunk $URL/tags/matrix-v1"
 row switch bash -c "cd $WORK/a && $R switch -q $URL/branches/matrix && echo b >>matrix.txt && $R commit -q -m on-branch"
