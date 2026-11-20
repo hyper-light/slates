@@ -657,3 +657,53 @@ fn t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_
     (first.head, first.text, Some(0))
   );
 }
+
+/// A-664's live whole builds (main's ruling of 2026-11-20: tens of thousands of concurrent pushes, so a busy green's
+/// build must end). Do: push a commit of sixty-one files to a git repository's root green, its map left to its build;
+/// then fifty pushes, each a commit over the one before changing `README`, with one slice of the build (one file)
+/// between each two; drive the build to its end. Expect: no build started again, the build moved to the newest head at
+/// its slices' boundaries, built once, and the tree kept the last push's.
+#[test]
+fn t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, green) = git_repository(state, "storm");
+    let root = to_db_volume(green);
+    let mut files: Vec<(Vec<u8>, Vec<u8>)> = (0..60)
+      .map(|serial| {
+        (
+          format!("f{serial}").into_bytes(),
+          format!("file {serial}\n").into_bytes(),
+        )
+      })
+      .collect();
+    files.insert(0, (b"README".to_vec(), b"one\n".to_vec()));
+    let (objects, mut head) = commit_of(&files, &[], FIRST_DATE);
+    let mut tree = tree_of(&objects);
+    push_unsettled(state, (repository, root), &objects, (None, head, tree));
+    for push in 0..50u64 {
+      crate::vcs_store::paths::whole_build::step_once(state);
+      if let Some(readme) = files.first_mut() {
+        readme.1 = format!("push {push}\n").into_bytes();
+      }
+      let (objects, next) = commit_of(&files, &[head], FIRST_DATE.saturating_add(push + 1));
+      let before = tree;
+      tree = tree_of(&objects);
+      push_unsettled(
+        state,
+        (repository, root),
+        &objects,
+        (Some(before), next, tree),
+      );
+      head = next;
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    let whole_build = |name| count(state, name);
+    (
+      whole_build(crate::vcs_store::paths::whole_build::RESTARTED),
+      whole_build(crate::vcs_store::paths::whole_build::MOVED) > 0,
+      whole_build(crate::vcs_store::paths::BUILT),
+      kept_tree(state, repository, green_key(root)) == Some(tree),
+    )
+  });
+  assert_eq!(seen, (0, true, 1, true));
+}
