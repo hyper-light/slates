@@ -1596,6 +1596,9 @@
 > `Forbidden`, a stale set `PolicyChanged`. By use: a pre-revprop-change hook set this way lets stock svn 1.15 change
 > a revision property over svn://. Found by use: with no hook such a change is taken (`change-rev-prop2`), where
 > svnserve refuses E165006; `svn_interop.rs` holds that test ignored for w-svn.
+> The svn matrix sets that hook with the verb and changes revision 1's `svn:log` over svn:// and svn+ssh (rows
+> revprop-hook, revprop-svn, revprop-ssh): 32 of 32 over the reads fixtures' repository and over git/git's last 2,000
+> commits (Mac Studio, debug).
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
