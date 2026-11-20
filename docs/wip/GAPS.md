@@ -3573,6 +3573,14 @@
 >   replaces the entry, and a decomposed and a precomposed `é` are two names. Such a volume and its drive take the same
 >   names for one, so neither residual above that comes from the two rules (the first and the last) can arise on it.
 >   Held by vfs's unit tests on every host (red 5 of 10 with the table removed, green 10 of 10, Mac Studio).
+> - **Fixed, A-737 (2026-11-20, w-bugs, goal 87; found by use): the table was not Windows'.** The Windows check
+>   (`the_volumes_upcase_table_is_the_systems`) failed on CI's x86_64 and arm64 runners: 109 units apart. Windows' own
+>   table (dumped through `RtlUpcaseUnicodeChar` on both, identical: 973 units mapped, no two to one, TableChecksum of
+>   the whole table E61F453Bh) leaves final sigma `ς` as it is, folds the case pairs Unicode added after the exFAT
+>   table (`ɐ`/`Ɐ`, `ͱ`/`Ͱ`, ...), and leaves `Ⱥ` (the exFAT table mapped it to the lowercase `ⱥ`). `Upcase` now folds by
+>   Windows' table; the "names the table folds alike and the volume keeps apart" residual above does not arise (every
+>   pair it folds alike, NFC and lowercasing fold alike too), and `ς` beside `σ` is two names, as on NTFS. No volume was
+>   made `Upcase` before (no client can choose it until part 2), so no stored name changes meaning.
 > - **Owed, A-576 part 2:** the policy in the protocol and the catalog (`NamePolicy`, `DbNamePolicy`, appended and
 >   published), its choice in the CLI, the SDKs and MCP, an archive importing it (refused `Unsupported` until then), and
 >   what a WinFsp mount of a `Fold` volume does once a drive's volume can be made `Upcase`. Main's: the Windows check
