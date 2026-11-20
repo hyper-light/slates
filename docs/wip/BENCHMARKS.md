@@ -14741,3 +14741,30 @@ Ranked plan, each owed:
 - M3, the merge engine's ~235 KB a revision under `Green::commit`, likely retention of work already durable.
 - M4, the green checkpoint's whole-green copy (47 MiB in two allocations).
 - M5, fixed per daemon: the timer wheels' 898 MiB reservation, the segment's 43 MiB unit set, 47 MiB of thread stacks.
+
+## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
+
+- **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
+  end (shared; not quiesced). slates: release build of main 82d3538b0 (A-713's clone room in).
+- **Data:** git/git cut at v1.0.0 (`git push cut.git 'v1.0.0^{commit}:refs/heads/master' refs/tags/v1.0.0`): 2,930
+  commits, 12,233 objects, a 3.46 MiB pack. Both servers' first mirror clones: `fsck --full` clean, refs (2) and object
+  ids (12,233) identical to the source.
+- **Command:** `KEEP_LOGS=DIR SERVERS="stock slates" crates/cli/bench/git_scale.sh slates cut-1.0.git WORK 3 900`,
+  interleaved, stock first.
+
+| git | stock 1 | 2 | 3 | best | slates 1 | 2 | 3 | best |
+|---|---|---|---|---|---|---|---|---|
+| push, both refs | 0.368 | 0.319 | 0.310 | 0.310 | 0.665 | 1.369 | 0.689 | 0.665 |
+| clone `--mirror` | 0.321 | 0.305 | 0.300 | 0.300 | 2.983 | 2.853 | 2.816 | 2.816 |
+| one-commit push | 0.080 | 0.088 | 0.099 | 0.080 | 0.058 | 0.089 | 0.060 | 0.058 |
+| fetch of it | 0.068 | 0.085 | 0.082 | 0.068 | 0.080 | 0.083 | 0.087 | 0.080 |
+| clone `--depth 1` | 0.115 | 0.144 | 0.111 | 0.111 | 0.165 | 0.171 | 0.160 | 0.160 |
+| clone `--filter=blob:none` | 0.180 | 0.195 | 0.189 | 0.180 | 1.120 | 1.136 | 1.092 | 1.092 |
+
+The daemon held 383 to 395 MiB.
+
+Where a clone's time goes (macOS `sample PID 4 1` on the daemon during one clone): the clone took 3.51 s at the client
+and 5.15 s of the daemon's CPU; of the daemon's samples on CPU, about 72% (1,522 of about 2,100) are in
+`slates_git::store::deltas::Search::step`. Every clone searches the whole store for deltas again, where `git daemon`
+sends the deltas its pack already holds. T4, owed and first for git's time: keep and reuse deltas (the pushed pack's
+bases, or the search's result at the repository's version), so a clone streams deltas it already has.
