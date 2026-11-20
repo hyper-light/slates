@@ -1,5 +1,10 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **REAL TOOLS ACROSS SNAPSHOTS, EVICTION AND TAKEOVER (w-realtools, 2026-11-20).** A-781 BUILT: without a birth time,
+> an unchanged base file keeps its inode number across a takeover (`#pragma once`). Open: the kernel-mount acceptance
+> runs (a `#pragma once` build, `make`, `cargo build` and `git status` over a mount across a snapshot, a restart and a
+> takeover) on macOS NFS, Linux FUSE and Windows WinFsp.
+
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
 > only a ceiling. **A-777 BUILT:** the idle prefault reserve (A-214) is removed: provisioning p99 unchanged, NFS peak
