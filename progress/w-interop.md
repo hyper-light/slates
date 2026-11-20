@@ -79,3 +79,7 @@ CARGO_TARGET_DIR ~/.cache/w-interop-target, clone ~/.cache/w-interop/src (delete
   (pull, append next free, bump "# next free", commit, push; on reject repeat). My pieces so far need none.
 - r22 v1.0.0 cut on main 168ddfa: git matrix 26/27 (A-713 fixed clones); checkout-tag fails only because the cut push
   has no tags (script) -> change row to check out an old commit.
+- r22 v2.0.0 cut (56 MB): push spins shard 0, daemon killed (both edges). Reported.
+- LANDED 78eea35b9 (merge a304ec440; on main, checked): git matrix checkout-old row + GAPS line (git 26/27 at v1.0.0
+  since A-713; v2.0.0 push spins; hg 17/24 since A-711/A-696). Monitor b69za9xas on main (re-arm on expiry).
+- Gotcha: never pgrep for 'git fetch' in a wait loop: the monitor's fetch loop matches forever.

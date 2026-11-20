@@ -950,3 +950,6 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   rule, Op::RepositoryRebuilt (wire 101). Finding: rebuilt store holds no objects (state log parts carry none) -> rides
   content once (entries name green content by identity; successor holds the family's content); fetching parts a
   successor doesn't hold stays owed. Next: A-664 holders' maps.
+- ~00:55 PST w-interop landed 78eea35b9 (git matrix tag row; git 26->27/27 expected at v1.0.0); hg 17/24. It was
+  idle-waiting -> REASSIGNED A-681's remaining DAV pieces (DAV routing + update-report; the two svn HTTP rows) from
+  w-svn to w-interop. w-svn: E160004 fix, then A-693 p2 lock.
