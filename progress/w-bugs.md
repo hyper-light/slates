@@ -100,3 +100,14 @@
   settle_pending gets the saved open from either. Failing test first: pure relief module over generic Port/Station,
   model driver whose kind-8 send blocks until a nested request is answered (red with today's single receiver).
   Residual: R stuck in its own send is not relieved (bound 2).
+- B3 LANDED A-725 main c22dce946 (commit 0f5591c03, one commit + merge): relief receiver (bridge-winfsp
+  inflight/relief.rs), two journal regions, server RELIEF_BEAT = HEARTBEAT_NS; fsx judge counts the port's extensions;
+  fsx-seed-1 line struck; bridge-winfsp Windows test support fixed (A-551 Mounted::new, A-460 handoff section).
+  Evidence: red/green on Mac (10.1 s timeout -> 0.03 s); CI b3-11 x64+arm64 fsx PASS, winfsp_semantics/cli winfsp
+  pass; lib-fix-1 127 vs lib-control-1 126 (only failure both arms: A-576 upcase table, 109 units differ).
+- FOUND (pre-existing, not mine, next item for me after B14): host::upcase_table::the_volumes_upcase_table_is_the_systems
+  fails on Windows x64+arm64: 109 code units where Windows' upcase table differs from the published exFAT table
+  (e.g. 023A: volume 2C65, system 023A). A-576 part 1's owed Windows check; A-576 said: take the system's table.
+- jupiter: no NASM -> server builds need AWS_LC_SYS_PREBUILT_NASM=1 there (check builds only).
+- Slips this stretch: a retry loop with a `git reset --soft` fallback (never ran); noted.
+- Next: B14 (takeover-kept files at a real Linux mount's end, test gap), then the upcase table, then bug-claims open.
