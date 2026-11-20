@@ -240,6 +240,27 @@ fn answered_with(
   while answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX) == Written::More
   {
   }
+  // A-745 item 3: the same exchange answered in turns, its acknowledgments, each `ready`, the cut and the choice of the
+  // pack's objects stepped a unit a write, is the same answer byte for byte, refusal and counters alike.
+  let mut in_turns = WholeObjects::new(&fixture.objects);
+  let mut turns_admission = Admission::new(u64::MAX);
+  let mut stepped =
+    super::serve_in_turns(&served, version, asked, &mut in_turns, &mut turns_admission);
+  let mut stepped_bytes = Vec::new();
+  while stepped.write_within(
+    &served,
+    &mut in_turns,
+    &mut turns_admission,
+    &mut stepped_bytes,
+    usize::MAX,
+    &mut || true,
+  ) == Written::More
+  {}
+  assert_eq!(stepped_bytes, bytes, "answered in turns");
+  assert_eq!(stepped.refusal(), answer.refusal(), "answered in turns");
+  if answer.refusal().is_none() {
+    assert_eq!(stepped.counters(), answer.counters(), "answered in turns");
+  }
   (bytes, answer)
 }
 
@@ -606,4 +627,51 @@ fn a_ref_name_two_patterns_find_is_warned_of_on_the_band_before_the_pack() {
     (ours, names(&our_pack, &fixture), answer.refusal()),
     (theirs, names(&their_pack, &fixture), None)
   );
+}
+
+/// A-745 item 3 (§4.17.1 "A fetch's answer" rule 3: every slice a turn at a time). Do: answer each of git's stateless
+/// v0 requests in turns, then step it a unit a write. Expect: nothing decided as it is made (no head yet, no
+/// negotiation's counters: its acknowledgments, each `ready`, the cut and the choice are the steps'), more than one step
+/// to its end where a pack follows, and the answer the one made whole (`answered` holds that for every v0 exchange).
+/// Before this, a v0 request was answered whole when the answer was made, its walks in one call.
+#[test]
+fn a_v0_answer_in_turns_decides_nothing_as_it_is_made_and_walks_in_its_steps() {
+  let fixture = repository();
+  let mut packs_stepped = 0;
+  for (name, request, _) in STATELESS {
+    let served = serving(&fixture, &REFS, b"refs/heads/main");
+    let mut source = WholeObjects::new(&fixture.objects);
+    let mut admission = Admission::new(u64::MAX);
+    let mut answer = super::serve_in_turns(
+      &served,
+      Version::V0,
+      Asked::Request(request),
+      &mut source,
+      &mut admission,
+    );
+    if answer.refusal().is_some() {
+      continue;
+    }
+    assert_eq!(answer.counters(), None, "{name}: decided as it was made");
+    let mut bytes = Vec::new();
+    let mut steps = 0;
+    while answer.write_within(
+      &served,
+      &mut source,
+      &mut admission,
+      &mut bytes,
+      usize::MAX,
+      &mut || true,
+    ) == Written::More
+    {
+      steps += 1;
+    }
+    let (whole, _) = answered(&fixture, Version::V0, Asked::Request(request));
+    assert_eq!(bytes, whole, "{name}");
+    if answer.pack_source().is_some() {
+      assert!(steps > 1, "{name}: {steps} steps");
+      packs_stepped += 1;
+    }
+  }
+  assert!(packs_stepped > 0, "no pack answered in turns");
 }

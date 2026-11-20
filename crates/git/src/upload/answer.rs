@@ -25,6 +25,7 @@
 //! the filter's name and lives on (a warning) is relayed the same way before the pack.
 
 use super::fetch::{Before, Sections};
+use super::v0::Opened;
 use super::{ABORT, PackPlan, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::{
   Acknowledgments, Answer as NegotiatedAnswer, Counters, Filter, Negotiating, Outcome, ShallowInfo,
@@ -166,7 +167,7 @@ pub(super) struct Choosing {
   /// The negotiation.
   negotiating: Negotiating<u64, u64>,
   /// What the sections before the pack are written from, until they are written.
-  before: Option<Before>,
+  before: Option<Opening>,
   /// The request's filter.
   filter: Option<Filter>,
   /// `thin-pack`.
@@ -193,13 +194,55 @@ impl Choosing {
   ) -> Choosing {
     Choosing {
       negotiating,
-      before: Some(before),
+      before: Some(Opening::V2(before)),
       filter,
       thin,
       ofs_delta,
       framing: None,
       at: 0,
       packet: 0,
+    }
+  }
+}
+
+impl Choosing {
+  /// A protocol v0 or v1 answer's negotiation `negotiating`, its head made by `opening` (its acknowledgments, then the
+  /// shallow-update the cut makes), and what the pack begins with after it (A-745 item 3).
+  pub(super) fn v0(
+    negotiating: Negotiating<u64, u64>,
+    filter: Option<Filter>,
+    thin: bool,
+    ofs_delta: bool,
+    opening: super::v0::Opening,
+  ) -> Choosing {
+    Choosing {
+      negotiating,
+      before: Some(Opening::V0(Box::new(opening))),
+      filter,
+      thin,
+      ofs_delta,
+      framing: None,
+      at: 0,
+      packet: 0,
+    }
+  }
+}
+
+/// What an answer's head is made from, until it is written: a protocol v2 `fetch`'s sections, or a v0 or v1 answer's
+/// acknowledgments and shallow-update.
+enum Opening {
+  /// Protocol v2.
+  V2(Before),
+  /// Protocol v0 or v1.
+  V0(Box<super::v0::Opening>),
+}
+
+impl Opening {
+  /// Whether its refusal is said on band 3 (v2's `sideband-all`); v0's never is.
+  fn multiplexed(&self) -> bool {
+    match self {
+      Opening::V2(before) => before.multiplexed,
+      Opening::V0(_) => false,
     }
   }
 }
@@ -341,6 +384,26 @@ impl<K> Answer<K> {
       return;
     };
     let graph = StoreGraph::new(served.repository, served.store, served.refs);
+    if let Some(Opening::V0(opening)) = choosing.before.as_mut() {
+      let acknowledged = opening.acknowledge(&graph, admission, spent);
+      let acknowledged = match graph.fault() {
+        Some(fault) => Err(Refusal::Store(fault)),
+        None => acknowledged,
+      };
+      match acknowledged {
+        Err(refusal) => return self.refuse_before(refusal),
+        Ok(false) => return,
+        // No pack follows and no cut is answered: the head is the acknowledgments alone, the negotiation let go.
+        Ok(true) if opening.pack_not_due() && !opening.deepens() => {
+          self.decide((None, None), admission);
+          return;
+        }
+        Ok(true) => {}
+      }
+    }
+    let Some(choosing) = self.choosing.as_mut() else {
+      return;
+    };
     let stepped = choosing
       .negotiating
       .step(&graph, admission, spent)
@@ -440,23 +503,40 @@ impl<K> Answer<K> {
     else {
       return false;
     };
-    let multiplexed = before.multiplexed;
+    let multiplexed = before.multiplexed();
     let counters = self
       .choosing
       .as_ref()
       .map(|choosing| choosing.negotiating.counters());
-    let written = before
-      .write(sections, admission)
-      .and_then(|written| match written {
-        Sections::Died(answer) => Ok(Err(answer)),
-        Sections::Pack(head, framing, at) => {
-          let packet = packet_data(framing, admission.left());
-          admission
-            .charge(to_u64(packet).saturating_add(to_u64(framed_most(packet))))
-            .map_err(Refusal::PastAdmission)?;
-          Ok(Ok((head, framing, at, packet)))
+    let written = match before {
+      Opening::V2(before) => before
+        .write(sections, admission)
+        .map(|written| match written {
+          Sections::Died(answer) => Err(answer),
+          Sections::Pack(head, framing, at) => Ok((head, framing, at)),
+        }),
+      Opening::V0(opening) => match opening.write(sections.1, admission) {
+        // No pack is due: the head alone, with no negotiation's counters, as the whole answer is.
+        Ok(Opened::NoPack(answer)) => {
+          *self = answer;
+          return false;
         }
-      });
+        written => written.map(|opened| match opened {
+          Opened::NoPack(answer) | Opened::Whole(answer) => Err(answer),
+          Opened::Pack(head, framing) => Ok((head, framing, 0)),
+        }),
+      },
+    }
+    .and_then(|written| match written {
+      Err(answer) => Ok(Err(answer)),
+      Ok((head, framing, at)) => {
+        let packet = packet_data(framing, admission.left());
+        admission
+          .charge(to_u64(packet).saturating_add(to_u64(framed_most(packet))))
+          .map_err(Refusal::PastAdmission)?;
+        Ok(Ok((head, framing, at, packet)))
+      }
+    });
     match written {
       Err(refusal) => {
         *self = Answer::refused(Refused {
@@ -491,7 +571,8 @@ impl<K> Answer<K> {
     counters: Counters,
     admission: &mut Admission,
   ) {
-    let Some(before) = self.choosing.take().and_then(|choosing| choosing.before) else {
+    let Some(Opening::V2(before)) = self.choosing.take().and_then(|choosing| choosing.before)
+    else {
       return;
     };
     match before.acknowledged(acknowledgments, admission) {
@@ -507,7 +588,7 @@ impl<K> Answer<K> {
       .choosing
       .as_ref()
       .and_then(|choosing| choosing.before.as_ref())
-      .is_some_and(|before| before.multiplexed);
+      .is_some_and(Opening::multiplexed);
     *self = Answer::refused(Refused {
       refusal,
       multiplexed,

@@ -12375,7 +12375,14 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > writes nothing until they are decided (`upload::fetch::Before`), the acknowledgments alone when not ready, a refusal
 > before them answered as one refused whole. By test: over 2,000 commits and 500 tags, `begin` read 3,499 parents of
 > the graph on main (the whole search and cut), at most 4 now, and each step at most 2, the answer the one made whole.
-> Owed for git: protocol v0's fetch in turns, a plan of scattered positions (16 bytes a run); the live `git clone` rows
+> **Protocol v0's fetch in turns BUILT (same day):** a v0 or v1 request is read and checked when its answer is made,
+> then the answer's steps make it (`upload::v0::answer_in_turns`, `Opening`): its acknowledgments a have a unit, each
+> `ready` the server asks a parent a unit (`negotiation::Ready`, the stepped form of `negotiation::ready`), and its
+> negotiation (`done` taken, as a stateless v0 request's is) its cut and its choice; the head (the shallow-update, then
+> the acknowledgments) written once both are known, the pack begun from the choice. Every v0 test's exchange is answered
+> both ways and held to the same bytes, refusal and counters (git's stateless exchanges, the cut-and-flip property);
+> made, a v0 answer has decided nothing, and a pack's takes more than one step. Before it, `serve_in_turns` answered v0
+> whole as the answer was made. Owed for git: a plan of scattered positions (16 bytes a run); the live `git clone` rows
 > of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
