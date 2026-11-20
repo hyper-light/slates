@@ -1353,6 +1353,21 @@ pub enum RequestBody {
     /// The work, its id minted on the asking node's partition.
     work: VolumeId,
   },
+  /// Move work `work`'s floor on green `green` to version `base`, or drop it (`None`), at the green's owner (A-247,
+  /// A-697 part b): the node holding a work over a green another node owns tells the owner when the work's base rises or
+  /// the work is gone, so the owner keeps the history the work reads and no more. A node's verb, never a client's:
+  /// refused `Unsupported` from a client of either node. It is monotone and idempotent, so it forwards with no completion
+  /// record, as a read does: a floor only rises (a lower or equal base is a no-op), a drop is final, and a work with no
+  /// floor at the owner (never admitted, or dropped) is left without one, so a late or repeated move changes nothing.
+  /// Answered `WorkFloorMoved`; `NotFound` for no such green. Appended.
+  MoveWorkFloor {
+    /// The green.
+    green: VolumeId,
+    /// The work, a work of the asking node.
+    work: VolumeId,
+    /// The work's base now, or `None` when the work is gone.
+    base: Option<u64>,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2342,6 +2357,7 @@ impl RequestBody {
       | RequestBody::ChangedSince { green: volume, .. }
       | RequestBody::CreateWork { green: volume, .. }
       | RequestBody::AdmitWork { green: volume, .. }
+      | RequestBody::MoveWorkFloor { green: volume, .. }
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
@@ -2492,7 +2508,8 @@ impl RequestBody {
   /// Whether a verb is a **read** a node forwards to a volume's owner without a completion record: a volume-scoped
   /// query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup"). A staging verb
   /// forwards the same way: a retried put of bytes already written is answered unchanged, and a retried begin only
-  /// strands a charged buffer that expires within a lease.
+  /// strands a charged buffer that expires within a lease. So does a work's floor move (`MoveWorkFloor`), monotone and
+  /// idempotent at the owner.
   pub fn forwards_as_read(&self) -> bool {
     matches!(
       self,
@@ -2507,6 +2524,8 @@ impl RequestBody {
         | RequestBody::ReadDir { .. }
         | RequestBody::StageBegin { .. }
         | RequestBody::StagePut { .. }
+        // A floor's move is monotone and idempotent (A-697 part b), so a resent forward changes nothing.
+        | RequestBody::MoveWorkFloor { .. }
     )
   }
 
@@ -5614,6 +5633,9 @@ pub enum ReplyBody {
     /// The green's version the work is based on.
     base: u64,
   },
+  /// A work's floor moved or dropped at its green's owner, or left as it was where the move changed nothing
+  /// (`MoveWorkFloor`, A-697 part b). Appended.
+  WorkFloorMoved,
 }
 
 /// What a checkout changed in its green's base volume (§4.16 A-201): the head's difference from the origin, by

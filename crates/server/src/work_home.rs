@@ -85,9 +85,9 @@ pub(crate) const READ_FROM_REPLICA: &str = "merge.work.read_from_replica";
 /// Format: a base read the node's replica could not answer, holding no such green or not yet the work's base version
 /// (A-697 part a): answered retryable, unrecorded.
 pub(crate) const REPLICA_BEHIND: &str = "merge.work.replica_behind";
-/// Format: a floor a work on a holder node would move or drop at its green's owner on another node, which A-697 part b
-/// carries; until then the owner keeps the floor the admission recorded.
-pub(crate) const FLOOR_OWED_HOLDER: &str = "merge.work.floor_owed_holder";
+/// Format: a floor of a work on a holder node moved or dropped at its green's owner on another node (A-697 part b), the
+/// non-vacuity count of [`tell_floor_over_fleet`].
+pub(crate) const FLOOR_TOLD_OWNER_NODE: &str = "merge.work.floor_told_owner_node";
 /// Format: an admission over the fleet whose creation was not committed when its ask was to leave: not asked.
 const ADMISSION_UNSTAGED: &str = "merge.work.admission_unstaged";
 /// Format: a work's increment composed on its own shard (A-247), the non-vacuity count of `composed`.
@@ -1764,7 +1764,7 @@ pub(crate) fn tell_floor(
   base: Option<u64>,
 ) {
   if green_elsewhere(state, green) {
-    state.count(FLOOR_OWED_HOLDER, 1);
+    tell_floor_over_fleet(state, green, work, base);
     return;
   }
   if state.greens.contains_key(&green) {
@@ -1809,6 +1809,86 @@ pub(crate) fn tell_floor(
     if sent.is_none() {
       let _ = state::with_state_counted(|s| s.count(FLOOR_NOT_SENT, 1));
     }
+  });
+  match spawned {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+    }
+    Err(_) => state.count(FLOOR_NOT_SENT, 1),
+  }
+}
+
+/// [`tell_floor`] for a work on a holder node (A-697 part b): once the verb's transaction has committed, and only if its
+/// change took, `MoveWorkFloor` is forwarded from the control shard to the green's owner on another node. The move is
+/// monotone and idempotent there, so it goes with no completion record; one not answered within the parked verb's bound
+/// is counted not sent, and its loss only keeps more history, as a lost floor message on one node does.
+fn tell_floor_over_fleet(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  work: DbVolumeId,
+  base: Option<u64>,
+) {
+  let (Some(here), Some(control)) = (
+    crate::verbs::shard_of_partition(state, state.partition),
+    state.shards.first().copied(),
+  ) else {
+    state.count(FLOOR_NOT_SENT, 1);
+    return;
+  };
+  let region = state
+    .node_regions
+    .get(&state.fleet.host())
+    .map_or(0, |region| region.0);
+  let request_word = state.current_request.map_or(0, |(_, id)| id.word());
+  // The node's own principal: the owner judges the move by the node it came from, never by an account's rights.
+  let principal = Principal::Uid {
+    host: state.origin_anchor,
+    uid: 0,
+  };
+  let wire_green = crate::verbs::to_wire_volume(green);
+  let request = crate::verbs::forwarded_request(
+    state,
+    request_word,
+    principal,
+    RequestBody::MoveWorkFloor {
+      green: wire_green,
+      work: crate::verbs::to_wire_volume(work),
+      base,
+    },
+  );
+  let deadline = park_bound_ns(state);
+  let spawned = slates_rt::futures::spawn(async move {
+    let took = state::with_state(|s| match base {
+      Some(base) => s.works.get(&work).is_some_and(|w| w.base_version == base),
+      None => s.db.partition().volume(work).is_none(),
+    })
+    .unwrap_or(false);
+    if !took {
+      return;
+    }
+    let reply = crate::xshard::task_within(
+      here,
+      control,
+      move || async move {
+        crate::verbs::resolve_and_forward(wire_green, region, None, vec![request])
+          .await
+          .0
+          .first()
+          .clone()
+      },
+      deadline,
+    )
+    .await;
+    let _ = state::with_state_counted(|s| {
+      s.count(
+        if matches!(reply, Some(ReplyBody::WorkFloorMoved)) {
+          FLOOR_TOLD_OWNER_NODE
+        } else {
+          FLOOR_NOT_SENT
+        },
+        1,
+      );
+    });
   });
   match spawned {
     Ok(task) => {
