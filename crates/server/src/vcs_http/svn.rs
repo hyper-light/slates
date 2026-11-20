@@ -29,6 +29,16 @@
 //! before its first byte is answered with its error, as `mod_dav` answers one, and one refused after it ends the
 //! connection (a refusal within those first slices after the first byte is `500`, nothing sent).
 //!
+//! **Commits** (A-681 part C, `slates_svn::dav::commit`). A POST to `!svn/me` begins a transaction over the
+//! repository's records, named `REV-SEQ` and kept on the owner shard between its requests (`VcsStores`, one a
+//! repository and principal, a new POST replacing the older); PUT, MKCOL, DELETE and PROPPATCH under `!svn/txr/NAME/`,
+//! a COPY whose `Destination` is there, and a DELETE of `!svn/txn/NAME` each drive it a step; a MERGE naming it closes
+//! it, the accepted work landed through the owner's commit step (`repository::svn_commit::commit_work`) and answered
+//! with the new revision. A hook the repository configures at start-commit or pre-commit refuses the commit, as the
+//! svn+ssh tunnel refuses it, until hooks run. Not yet: the lock tokens a commit presents (an `If` header, the MERGE's
+//! `S:lock-token-list`), so a commit under one's own lock is refused as under another's; an abandoned transaction is
+//! kept until its principal begins another.
+//!
 //! **Names.** A repository is the one named by the URL's first path segment, decoded; the rest of the path is below
 //! its root (`/repo/!svn/rvr/5/trunk` is `repo`'s `/!svn/rvr/5/trunk`). A repository whose name holds a slash cannot be
 //! reached over HTTP: `SVNParentPath`'s rule, which a name routed to its partition by its hash cannot widen to a
