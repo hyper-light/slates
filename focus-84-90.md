@@ -843,3 +843,4 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - UNRESOLVED-OBJECT GOAL MET (d9f7a795...) + parts (Lineage.tla = A-518; goal 84 audit b2a544735); A-707 05e3a2ddc.
 - hg room bug widened: import refused PastRoom 278,528 B too (w-perf A-710 verb) -> w-hg.
 - WATCH: kiln-queued copies on this Mac (7 from ~21:15 + w-shared x2) -> stop on sight.
+- Handoffs complete: w-shared (2c-1 on agents/w-shared-a636p2c1 1c91eaac2) and w-fed-faults (agents/w-fed-faults 72cef952d, agents/w-fed-faults-a708 473a560ed) -> fanout-state re-pushed; Studio instances told to pull. A-710 landed (main 5c6eb940d, w-perf): `slates repository import NAME PATH`.
