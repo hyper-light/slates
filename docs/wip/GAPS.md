@@ -1867,10 +1867,12 @@
 > `Record::RevisionProperties`, `svn_commit::record`; A-635's append records an entry of no change holding its caller's
 > record alone), so every imported revision is durable as it lands and a refusal keeps the ones before it; answered
 > `DumpImported`, or `ImportRefused { Subversion }` with Subversion's number, the revision and the path (see A-652 part
-> 3). Owed from it: the export verb (a range written as a dump into a volume, landed under a grant, §4.15), sliced under
-> the shard's budget; the records' texts in the shared object store; an import resumed across a restart (the committed
-> revisions are recovered; a request sent again refuses a stream that starts before the revision after the youngest);
-> the CLI's and the SDKs' words for the verb; main's: clippy and `xtask` over the modules. Found by it and fixed by
+> 3). The export verb (A-652 part 3 continued, 2026-11-20): `ExportDump` writes a range as `svnadmin dump` does into a
+> new volume holding `DUMP_FILE`, walked twice a revision a unit (measured, then written a copy slice at a time, both
+> hashed, a differing second walk refused), the caller landing the volume under a grant. Owed from them: the records'
+> texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
+> words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
 > index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
 > comes first; it takes it now as the copy FSFS makes, the index's and the verdict's oracles holding such replacements

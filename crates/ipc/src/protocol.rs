@@ -1312,6 +1312,26 @@ pub enum RequestBody {
     /// The host directory that holds a Mercurial repository's `.hg`, or the host file that holds a Subversion dump.
     path: String,
   },
+  /// Export revisions `first` to `last` of Subversion repository `repository` as the dump stream `svnadmin dump` writes
+  /// for the same range (§4.17.4 piece 6; A-628, A-652 part 3): format 2, or format 3 with `deltas` (`--deltas`); a
+  /// range starting after revision 0 written incrementally (`--incremental`). The dump is written into a new volume
+  /// `name` holding it as [`DUMP_FILE`] in its root, which the caller lands where it wants the file, under a grant
+  /// (§4.15, R10), or reads through a mount. Served on the partition the repository's name hashes to, for the
+  /// repository's owner; the export runs in slices on its owner shard and the request is answered when it ends:
+  /// `DumpExported`, or refused by kind (`Unsupported` for another tool's repository, `BadRequest` for a range the
+  /// repository does not hold, `AlreadyExists` for a name taken, `BudgetExceeded`). Appended.
+  ExportDump {
+    /// The repository's name.
+    repository: String,
+    /// The range's first revision.
+    first: u64,
+    /// Its last revision.
+    last: u64,
+    /// Whether texts and property changes are written as deltas (format 3).
+    deltas: bool,
+    /// The new volume's name.
+    name: String,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -1545,6 +1565,10 @@ pub const IMAGE_FILE: &str = "image.ext2";
 /// Format: the name of the archive file in an archive volume's root (`ArchiveExport`, A-441): the snapshot's archive in
 /// the format of `slates_archive` (§4.11), its own magic and version inside.
 pub const ARCHIVE_FILE: &str = "snapshot.slatesarchive";
+
+/// Format: the name of the dump file in the root of a volume a Subversion repository's export makes (`ExportDump`, A-652
+/// part 3): the stream `svnadmin dump` writes, which `svnadmin load` takes.
+pub const DUMP_FILE: &str = "repository.dump";
 
 /// What an image merge did (§4.6, A-160), counted.
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2351,7 +2375,8 @@ impl RequestBody {
       | RequestBody::BindBranch { .. }
       | RequestBody::RetireBranch { .. }
       | RequestBody::SetRepositoryPolicy { .. }
-      | RequestBody::ImportRepository { .. } => None,
+      | RequestBody::ImportRepository { .. }
+      | RequestBody::ExportDump { .. } => None,
     }
   }
 
@@ -5443,6 +5468,14 @@ pub enum ReplyBody {
     revisions: u64,
     /// The youngest revision.
     youngest: u64,
+  },
+  /// A Subversion repository's range of revisions exported as a dump into a new volume (`ExportDump`, A-652 part 3):
+  /// the volume, which holds it as [`DUMP_FILE`], and the dump's length in bytes. Appended.
+  DumpExported {
+    /// The new volume.
+    id: VolumeId,
+    /// The dump's length in bytes.
+    dump_bytes: u64,
   },
 }
 
