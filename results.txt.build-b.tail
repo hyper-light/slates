@@ -1,0 +1,40 @@
+   Compiling slates-anchor v0.1.0 (/home/runner/work/slates/b/crates/anchor)
+   Compiling slates-db v0.1.0 (/home/runner/work/slates/b/crates/db)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/g227-target/b/release/build/aws-lc-sys-3d7eb136a6063351/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Using flag: -ffile-prefix-map=/home/runner/work/slates/b/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Using assembler flag: -Wa,--debug-prefix-map=/home/runner/work/slates/b/vendor/aws-lc-sys=
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/g227-target/b/release/build/aws-lc-sys-3d7eb136a6063351/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/g227-target/b/release/build/aws-lc-sys-3d7eb136a6063351/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/g227-target/b/release/build/aws-lc-sys-3d7eb136a6063351/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling rustls-webpki v0.103.15
+   Compiling slates-transport v0.1.0 (/home/runner/work/slates/b/crates/transport)
+   Compiling slates-ipc v0.1.0 (/home/runner/work/slates/b/crates/ipc)
+   Compiling slates-bridge-core v0.1.0 (/home/runner/work/slates/b/crates/bridge-core)
+   Compiling slates-base v0.1.0 (/home/runner/work/slates/b/crates/base)
+   Compiling slates-seal v0.1.0 (/home/runner/work/slates/b/crates/seal)
+   Compiling slates-bridge-fuse v0.1.0 (/home/runner/work/slates/b/crates/bridge-fuse)
+   Compiling hyper-seal v0.1.0 (/home/runner/work/slates/b/vendor/hyper-raft/hyper-seal)
+   Compiling hyper-datagram v0.1.0 (/home/runner/work/slates/b/vendor/hyper-raft/hyper-datagram)
+   Compiling slates-cluster v0.1.0 (/home/runner/work/slates/b/crates/cluster)
+   Compiling slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/b/crates/bridge-virtiofs)
+   Compiling slates-client v0.1.0 (/home/runner/work/slates/b/crates/client)
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/b/crates/bridge-nfs)
+   Compiling slates-land v0.1.0 (/home/runner/work/slates/b/crates/land)
+   Compiling slates-http-edge v0.1.0 (/home/runner/work/slates/b/crates/http-edge)
+   Compiling slates-ssh v0.1.0 (/home/runner/work/slates/b/crates/ssh)
+   Compiling slates-svn v0.1.0 (/home/runner/work/slates/b/crates/svn)
+   Compiling slates-git v0.1.0 (/home/runner/work/slates/b/crates/git)
+   Compiling slates-hg v0.1.0 (/home/runner/work/slates/b/crates/hg)
+   Compiling slates-mcp v0.1.0 (/home/runner/work/slates/b/crates/mcp)
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/b/crates/server)
+   Compiling rcgen v0.13.2
+   Compiling slates-api v0.1.0 (/home/runner/work/slates/b/crates/api)
+   Compiling slates-cli v0.1.0 (/home/runner/work/slates/b/crates/cli)
+    Finished `release` profile [optimized] target(s) in 10m 09s

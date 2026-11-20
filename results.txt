@@ -1,0 +1,32 @@
+host ip-10-0-139-135 Linux x86_64, 4 CPUs, Fri Nov 20 17:56:17 UTC 2026, A 998f9089a (main + flow), B 41ed11f43 (pair reverted), backlog 20000, N 4
+== build a exit 0
+== build b exit 0
+== run 1 leg a exit 124 load 1.24, 2.84, 2.70
+   1a LD-CU backlog 20000 volumes cca428df2a6f5c1b000000000000006f cca428df2a6f5c1b0000000000000085 by shard {"0": ["cca428df2a6f5c1b000000000000006f", "cca428df2a6f5c1b0000000000000085"], "1": ["cca428df2a6f5c1b0001000000000037"]}
+   1a LD-CU prefill 30000 writes, 0 refused
+   1a LD-CU quiet v2 n 12870 p50 164 us p99 258 us max 334022 us
+   1a LD-CU ahead 20000 writes, 205908573 change bytes, in 13.66803236s with the holder stopped
+== run 2 leg b exit 124 load 1.04, 1.05, 1.48
+   2b LD-CU backlog 20000 volumes fbb996a93d8f89d5000000000000006b fbb996a93d8f89d50000000000000081 by shard {"0": ["fbb996a93d8f89d5000000000000006b", "fbb996a93d8f89d50000000000000081"], "1": ["fbb996a93d8f89d50001000000000035"]}
+   2b LD-CU prefill 30000 writes, 0 refused
+   2b LD-CU quiet v2 n 12322 p50 154 us p99 336 us max 269962 us
+   2b LD-CU ahead 20000 writes, 189075169 change bytes, in 8.51045064s with the holder stopped
+== run 3 leg b exit 124 load 1.12, 1.06, 1.16
+== run 4 leg a exit 124 load 1.02, 1.03, 1.08
+== run 5 leg a exit 124 load 1.07, 1.06, 1.08
+   5a LD-CU backlog 20000 volumes b252820fbc10ed23000000000000006b b252820fbc10ed230000000000000081 by shard {"0": ["b252820fbc10ed23000000000000006b", "b252820fbc10ed230000000000000081"], "1": ["b252820fbc10ed230001000000000035"]}
+   5a LD-CU prefill 30000 writes, 0 refused
+   5a LD-CU quiet v2 n 11732 p50 175 us p99 316 us max 653996 us
+   5a LD-CU ahead 20000 writes, 185046770 change bytes, in 14.258689135s with the holder stopped
+== run 6 leg b exit 124 load 1.14, 1.09, 1.09
+== run 7 leg b exit 124 load 1.00, 1.04, 1.05
+   7b LD-CU backlog 20000 volumes dfb8d7a15c4892eb00000000000000a9 dfb8d7a15c4892eb00000000000000bf by shard {"0": ["dfb8d7a15c4892eb00000000000000a9", "dfb8d7a15c4892eb00000000000000bf"], "1": ["dfb8d7a15c4892eb0001000000000054"]}
+   7b LD-CU prefill 30000 writes, 0 refused
+   7b LD-CU quiet v2 n 5979 p50 399 us p99 1196 us max 77117 us
+   7b LD-CU ahead 20000 writes, 191277931 change bytes, in 10.48879952s with the holder stopped
+== run 8 leg a exit 124 load 1.12, 1.08, 1.07
+   8a LD-CU backlog 20000 volumes 4bbfca255bfed20c0000000000000067 4bbfca255bfed20c000000000000007d by shard {"0": ["4bbfca255bfed20c0000000000000067", "4bbfca255bfed20c000000000000007d"], "1": ["4bbfca255bfed20c0001000000000033"]}
+   8a LD-CU prefill 30000 writes, 0 refused
+   8a LD-CU quiet v2 n 11368 p50 170 us p99 338 us max 504487 us
+   8a LD-CU ahead 20000 writes, 187029251 change bytes, in 9.651808108s with the holder stopped
+== done Fri Nov 20 20:55:30 UTC 2026
