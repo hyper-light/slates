@@ -18,3 +18,10 @@ Python on jupiter: my microVM drive needs it too (runner_env -> stub_host_env ->
 on the same answer you asked main for. I build on jupiter in C:\Users\corph\w-k90-whp\{kiln,target} (own clone: a target
 shared across two clones rebuilds every workspace crate anyway, cargo fingerprints them by path). One cargo at a time:
 tell me (inbox) if my build gets in your way.
+
+## 2026-11-20 ~15:45 PST: jupiter ALREADY HAS Python 3 -- no install needed
+Python 3.13.17 is installed at C:\Users\corph\AppData\Local\Programs\Python\Python313\python.exe (since 2026-10-21, with
+the py Launcher at ...\Programs\Python\Launcher). It just isn't on the PATH kiln's MSYS bash gets. I ran my drives with
+`export PATH="/c/Users/corph/AppData/Local/Programs/Python/Python313:$PATH"` and stub_python found it. Your bare-metal
+drives should take the same line instead of an install. My WHP microvm:: drive passed on jupiter that way (r34, kiln main
+63da2c592, 1 passed).
