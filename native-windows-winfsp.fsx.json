@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "suite": "fsx",
+  "transport": "native-windows-winfsp",
+  "host": {
+    "os": "Microsoft Windows [Version 10.0.26100.33828]",
+    "kernel": "Microsoft Windows [Version 10.0.26100.33828]",
+    "arch": "x86_64",
+    "privilege": "root"
+  },
+  "date": "2026-11-20",
+  "command": "cd <mount>/conformance-<pid>/fsx && <scratch>\\tools\\fsx.exe -N 10000 -S 1 -F 262144 -v -P D:\\a\\slates\\slates\\target\\conformance-scratch\\native-windows-winfsp\\fsx-logs fsx.bin",
+  "bound": "10000 operations, seed 1, file length 262144 bytes, 300s a run",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "fsx",
+      "operations": 10000,
+      "seed": 1,
+      "file_length": 262144,
+      "ok": true
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-windows-winfsp.fsx.txt",
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "entries": 0
+  },
+  "duration_ms": 256958,
+  "notes": [
+    "fsx: the WinFsp port, billziss-gh/secfs.test@6ac65cd fstools/src/fsx/fsx.c (APSL 2.0), sha256 440742597d18b69edfea6ca49fd1905fbad4926953e446957e2ed1377ebe584c, with its win/ shims at the same commit, built `cl /nologo /MT /W2 fsx.c win\\getopt.c win\\mman.c win\\random.c ntdll.lib /Fe:fsx.exe /link /subsystem:console` (source unchanged)",
+    "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)",
+    "0 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent"
+  ]
+}
