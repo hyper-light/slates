@@ -2773,7 +2773,13 @@
 > its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21
 > minutes. A hold now ends at the failover SLO, refused `DurabilityPending` and recorded as the request's outcome; the
 > writer still waits through a shorter silence. Test:
-> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`.
+> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`.
+> - **CLOSED 2026-11-20 (g226; main's ruling): the given-up verb never takes effect twice.** The refusal was recorded as
+>   the request's completion, so a consumer told to make the call again ran the verb a second time over its own effect
+>   (an append twice, a directory's second making refused `AlreadyExists`). The verb's own reply is now the recorded
+>   completion and the refusal goes unrecorded; `slates_client` sends the request again under its id once, so its caller
+>   is handed the verb's own reply. A yield's waiters (A-409) still record the refusal: their write never took effect on
+>   the successor.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
