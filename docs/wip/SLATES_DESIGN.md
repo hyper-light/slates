@@ -15310,6 +15310,11 @@ and export by landing).
 > (`slates_svn::serve::locks`), their entries landed through the owner's step as a `Record::Locks`, then answered as
 > `svnserve` answers them, over `svn://` and `svn+ssh://`. Owed: the pre-lock and post-lock hooks.
 >
+> **Status (2026-11-19, A-702 part 1).** `change-rev-prop` and `change-rev-prop2` are answered as `svnserve` answers a
+> repository with no pre-revprop-change hook ("Repository has not been enabled to accept revision propchanges",
+> 165006), after its checks in its order (`slates_svn::serve::revprops`). The change itself waits on ra_svn running a
+> repository's hooks.
+>
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
 > token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's
