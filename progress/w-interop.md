@@ -123,3 +123,9 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   VcsStores.dav_commits table (one per repo+principal), SvnStores begin_commit/on_commit/land (defaults None;
   ServedRecords implements), SvnExchange::commit_side, Status CREATED/NO_CONTENT/CONFLICT/PRECONDITION_FAILED/LOCKED.
   Scratch on agents/w-interop-a681c. NEXT: Studio run server vcs_http::svn + svn_interop http --ignored.
+- LANDED part C: d858d1904 (merge b0655e8a3; on main, checked) -- HTTPv2 commits + edge 204. Landing-tree run (r33):
+  svn dav::/commit:: 135/135, http-edge connection 20/20, server vcs_http::/vcs_store::/svn_commit 127/127, svn_interop
+  4 passed 1 ignored (HTTP round trip PASSES, un-ignored), fmt clean. Matrix: HTTP 23/27, svn:// 26/27.
+- PIECE 5 DONE per main's criteria. Owed (GAPS): LOCK/UNLOCK + commit lock tokens (lock test still ignored); reports
+  file-revs (blame), diff's, mergeinfo (merge); PUT body whole in room; abandoned txn expiry.
+- Next: tell main; ask nothing; continue queue: re-run hg/git matrices when w-hg/w-git push-spin fixes land; monitor.
