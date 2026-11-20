@@ -150,3 +150,9 @@
   t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it (image.units_past_budget=41, reply.undeliverable=2).
   NEXT: failing test with units_past_budget at 0, slice that path, then see full.dump / the 2 undeliverable replies.
   Disk: one worktree only; CARGO_INCREMENTAL=0.
+- 2026-11-20: LANDED b1206d96c (svn landing waits on the barrier only when it put texts; red vcs_ssh::svn::tests stock
+  mkdir on main, my filter vcs_ssh::tests::svn had named no module -- sweep with `cargo test -p slates-server --lib svn`).
+  LANDED A-762 507d722b3 + 2cf1b1d35: exporter reads a text a bounded step a call (TextSource::read_step, TextReading).
+  Ledger edits now from ~/slates-work/w-svn-ledger (shared checkout had another agent's staged state).
+- NEXT: DeltaV v1 for pre-1.7 clients (MKACTIVITY/CHECKOUT/MERGE; review piece 14); w-interop piece 5 done, no overlap.
+  Owed: Linux daemon:: run on kiln (r36 never started, no room); 500 MB commit re-measured after w-engine 1b.
