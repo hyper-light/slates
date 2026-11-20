@@ -704,8 +704,10 @@ fn present_directories(base: &Base, journal: &[VolumeOp]) -> std::collections::B
 
 /// Composes the `SetMode` operations into a mode per path (last one wins), emitting a `SetMode`
 /// only where the mode differs from the base and the path is present at seal (a surviving file or
-/// a present directory). A mode set on a renamed-away path (chmod then rename) is a typed
-/// `Unsupported` refusal (owed); a mode on a path present nowhere is `SetModeMissing`.
+/// a present directory). A file's mode moves with its `Rename`, as POSIX `rename` keeps it: a mode set
+/// before the rename, or a base file's own mode, is declared at the new path (2026-11-20: keyed by its
+/// path alone, chmod then rename was refused and a renamed base file lost its mode). A mode left on a
+/// renamed-away path is a typed `Unsupported` refusal; a mode on a path present nowhere is `SetModeMissing`.
 fn compose_modes(
   base: &Base,
   journal: &[VolumeOp],
@@ -714,6 +716,8 @@ fn compose_modes(
   present_dirs: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<(String, u32)>, DeriveError> {
   let mut final_mode: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+  // Paths a rename moved a file from or over: a base mode there no longer names the base's file.
+  let mut moved: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
   for op in journal {
     match op {
       VolumeOp::SetMode { path, mode } => {
@@ -721,6 +725,19 @@ fn compose_modes(
       }
       VolumeOp::Mknod { path, mode, .. } if survivors.contains(path) => {
         final_mode.insert(path.clone(), *mode);
+      }
+      VolumeOp::Rename { from, to } if from != to => {
+        let carried = final_mode.remove(from).or_else(|| {
+          (!moved.contains(from.as_str()))
+            .then(|| base_mode_of(base, from))
+            .flatten()
+        });
+        final_mode.remove(to);
+        if let Some(mode) = carried {
+          final_mode.insert(to.clone(), mode);
+        }
+        moved.insert(from);
+        moved.insert(to);
       }
       _ => {}
     }

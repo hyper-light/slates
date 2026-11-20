@@ -917,9 +917,19 @@ fn set_mode_on_a_missing_path_refuses() {
   ));
 }
 
-/// A mode set then the path renamed away is the owed chmod-then-rename case, refused.
+/// The mode the document sets at `path`, if it sets one.
+fn mode_set_at(doc: &OpsDoc, path: &str) -> Option<u64> {
+  doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::SetMode && doc.paths.path(op.path) == Some(path))
+    .map(|op| op.len)
+}
+
+/// A mode set then the path renamed away moves with its file, as POSIX `rename` keeps a file's mode (until 2026-11-20
+/// refused `Unsupported`: the mode was keyed by its path).
 #[test]
-fn set_mode_then_rename_refuses() {
+fn set_mode_then_rename_sets_the_mode_at_the_new_path() {
   let base = Base {
     specials: Vec::new(),
     files: vec![("a".to_owned(), 4)],
@@ -929,7 +939,7 @@ fn set_mode_then_rename_refuses() {
     xattrs: Vec::new(),
     hardlinks: Vec::new(),
   };
-  let result = compose_volume(
+  let doc = compose_volume(
     &base,
     &[
       VolumeOp::SetMode {
@@ -941,8 +951,70 @@ fn set_mode_then_rename_refuses() {
         to: "b".to_owned(),
       },
     ],
-  );
-  assert!(matches!(result, Err(DeriveError::Unsupported(_))));
+  )
+  .expect("chmod then mv composes");
+  assert_eq!(mode_set_at(&doc, "b"), Some(0o600));
+  assert_eq!(mode_set_at(&doc, "a"), None);
+}
+
+/// A new file made executable then moved keeps its mode at its new path (by use: `chmod +x d/a; mv d/a x/a` in one
+/// work was refused `SetModeMissing("d/a")`).
+#[test]
+fn a_new_executable_file_moved_keeps_its_mode() {
+  let doc = compose_volume(
+    &Base::default(),
+    &[
+      VolumeOp::Mkdir {
+        path: "d".to_owned(),
+      },
+      VolumeOp::Create {
+        path: "d/a".to_owned(),
+      },
+      VolumeOp::SetMode {
+        path: "d/a".to_owned(),
+        mode: 0o755,
+      },
+      VolumeOp::Mkdir {
+        path: "x".to_owned(),
+      },
+      VolumeOp::Rename {
+        from: "d/a".to_owned(),
+        to: "x/a".to_owned(),
+      },
+    ],
+  )
+  .expect("chmod then mv composes");
+  assert_eq!(mode_set_at(&doc, "x/a"), Some(0o755));
+  assert_eq!(mode_set_at(&doc, "d/a"), None);
+}
+
+/// A base file's mode moves with it when it is renamed in a later version: the moved file is declared its mode at its
+/// new path (the green keys a mode by its path, so a rename alone left `y/b` at the default mode).
+#[test]
+fn a_base_files_mode_moves_with_its_rename() {
+  let base = Base {
+    specials: Vec::new(),
+    files: vec![("e/b".to_owned(), 4)],
+    dirs: vec!["e".to_owned()],
+    modes: vec![("e/b".to_owned(), 0o755)],
+    symlinks: Vec::new(),
+    xattrs: Vec::new(),
+    hardlinks: Vec::new(),
+  };
+  let doc = compose_volume(
+    &base,
+    &[
+      VolumeOp::Mkdir {
+        path: "y".to_owned(),
+      },
+      VolumeOp::Rename {
+        from: "e/b".to_owned(),
+        to: "y/b".to_owned(),
+      },
+    ],
+  )
+  .expect("mv composes");
+  assert_eq!(mode_set_at(&doc, "y/b"), Some(0o755));
 }
 
 // --- Symlink composition ---

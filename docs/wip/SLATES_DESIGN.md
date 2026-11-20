@@ -53653,6 +53653,8 @@ alone), GAPS (the §4.17.3 entry).
   `t_a664_p3_an_executable_file_moved_is_100755_in_its_commit` written for this piece, failing at its first submit).
   With the `chmod` and the `mv` in two versions the move lands and drops the mode (part 3's first piece's finding), so
   the commit lists `x/a` `100644`. Both follow from the green keeping a mode at its path (A-618).
+  **Status (2026-11-20): FIXED** -- `increment::compose_modes` moves a file's mode with its `Rename` (a mode set before it,
+  or the base file's own), declared at the new path; docs/bugs/2026-11-20-a-files-mode-was-lost-when-it-was-renamed.md.
 - **Found by reading, reported to main and not chased.** `verbs::reconcile_unpublished_effects` rebuilds no
   repository's store when a verb's publication fails at `Db::commit`, so a push or a made commit inside that verb's
   transaction leaves the store ahead of the rolled-back log, as the green's engine is left ahead of it; a branch
