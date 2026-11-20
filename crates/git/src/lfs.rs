@@ -62,9 +62,10 @@ impl Oid {
       return None;
     }
     let mut bytes = [0u8; OID_LEN];
-    for (slot, pair) in bytes.iter_mut().zip(hex.chunks_exact(2)) {
-      let high = lower_hex_value(*pair.first()?)?;
-      let low = lower_hex_value(*pair.get(1)?)?;
+    for (slot, pair) in bytes.iter_mut().zip(hex.as_chunks::<2>().0) {
+      let [high, low] = *pair;
+      let high = lower_hex_value(high)?;
+      let low = lower_hex_value(low)?;
       *slot = high.checked_shl(HEX_DIGIT_BITS)? | low;
     }
     Some(Oid(bytes))

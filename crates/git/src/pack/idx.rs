@@ -319,11 +319,8 @@ fn fixed_len(count: usize, raw_len: usize) -> Option<usize> {
 /// The count a fanout ends with, once each count is at least the one before it.
 fn fanout_count(fanout: &[u8]) -> Result<usize, Refusal> {
   let mut before = 0;
-  for (byte, digits) in (0..=u8::MAX).zip(fanout.chunks_exact(WORD)) {
-    let count = digits
-      .try_into()
-      .map(u32::from_be_bytes)
-      .unwrap_or_default();
+  for (byte, digits) in (0..=u8::MAX).zip(fanout.as_chunks::<WORD>().0) {
+    let count = u32::from_be_bytes(*digits);
     if count < before {
       return Err(Refusal::FanoutDown { byte });
     }
