@@ -119,7 +119,7 @@ impl Version {
   }
 
   /// Whether the version carries the tree-manifest list.
-  fn has_tree_list(self) -> bool {
+  pub(crate) fn has_tree_list(self) -> bool {
     self >= Self::V03
   }
 }
@@ -605,6 +605,42 @@ fn encode_group(
   }
   out.put(&EMPTY.to_be_bytes());
   Ok(())
+}
+
+/// Appends one revision's delta chunk (its header, then its delta) in `version`, which names each delta's base (from
+/// `02`): a changegroup written a revision at a time (A-745).
+pub(crate) fn put_revision(
+  revision: &Revision<'_>,
+  version: Version,
+  out: &mut Vec<u8>,
+) -> Result<(), EncodeRefusal> {
+  if version == Version::V01 {
+    return Err(EncodeRefusal::Unencodable {
+      node: revision.node,
+      reason: "a changegroup written a revision at a time names each delta's base",
+    });
+  }
+  check_encodable(revision, version, None)?;
+  let header = header_bytes(revision, version);
+  put_chunk_length(out, header.len().saturating_add(revision.data.len()))?;
+  out.put(&header);
+  out.put(revision.data);
+  if let Some(sidedata) = revision.sidedata {
+    put_sidedata(out, sidedata)?;
+  }
+  Ok(())
+}
+
+/// Appends a group's name chunk (A-745).
+pub(crate) fn put_name(name: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
+  put_chunk_length(out, name.len())?;
+  out.put(name);
+  Ok(())
+}
+
+/// Appends the empty chunk that ends a group or a list (A-745).
+pub(crate) fn put_end(out: &mut Vec<u8>) {
+  out.put(&EMPTY.to_be_bytes());
 }
 
 /// Writes a sidedata chunk: the empty chunk for none, as [`chunk`] reads it back.

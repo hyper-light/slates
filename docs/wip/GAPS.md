@@ -178,8 +178,10 @@
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
-> lands ignored. Owed: `getbundle`'s answer made and sent in slices, each charged and let go; the stream clone's; then
-> w-interop's matrix rerun.
+> lands ignored. Piece 1 BUILT: `getbundle::Answering`, the answer a slice at a time, a clone of every head walked by
+> its links (the request holds ranges and a place), its least room a slice less than the whole answer's (test), the
+> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Owed: the server driving it
+> a turn at a time over HTTP and SSH (piece 2, which turns the red green); the stream clone's; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -1933,12 +1935,16 @@
 > import's volume at admission, a name alias's. Each mint is now the shard's alone (`ShardState::volume_ids_minted`,
 > held to the counter's bound); held by `image::tests::two_imports_admitted_side_by_side_mint_distinct_volume_ids`
 > (red: one id twice). Minting inside the recording transaction was not the structural form: an image's identity
-> holds its id before its volume is recorded. **Owed, measured
+> holds its id before its volume is recorded. The reservation needs nothing durable: an id minted and never recorded dies with
+> its job at a restart, and the database's own counter moves past every id a record holds. **Owed, measured
 > 2026-11-20 (debug, this MacBook):** a unit is one revision whole, the exporter writing a revision or nothing
 > (`migration::export`), so a revision's texts are staged whole and its unit is unbounded: against a 14 µs copy-slice
 > budget, a 195-byte revision took 60 µs and one with a 107 KB text 2.4 ms, `image.units_past_budget` 87 over the
-> test's two exports; next piece: the exporter resumable inside a revision, a text a window at a time (§4.17.4 item
-> 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> test's two exports. **Part 1 of the slicing (same day, w-svn):** `Exporter::export` writes one changed path a call,
+> the revision's drive kept between calls (its rows, open directories and last path), so a unit is a changed path's
+> records, never a revision's (`every_export_call_writes_one_changed_path_of_its_revision`: a revision's changed paths
+> and two calls, both formats byte for byte). Owed (part 2): a text a window at a time, written twice over (its length
+> measured, then written), since its record's header names that length first (§4.17.4 item 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the

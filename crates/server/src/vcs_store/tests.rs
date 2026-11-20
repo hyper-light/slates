@@ -1406,13 +1406,17 @@ pub(crate) fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u
     .collect()
 }
 
-/// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one
-/// whole over the refs keyed `greens`, every record replayed and none refused.
+/// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one,
+/// its whole builds settled, whole over the refs keyed `greens`, every record replayed and none refused.
 pub(crate) fn assert_made_again_whole(
   state: &mut ShardState,
   repository: RepositoryId,
   greens: &[u64],
 ) {
+  // The live store's whole builds run in slices after a push's answer, and a rebuild settles its own before it is
+  // compared (`settle_rebuild`), so the live store is compared settled too: otherwise a build under way holds what it
+  // has put so far and the two differ in holders and contents while their rows and refs agree.
+  super::paths::whole_build::settle(state);
   let live = {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     facts(content, store, greens)
