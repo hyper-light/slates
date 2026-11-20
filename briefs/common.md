@@ -88,6 +88,40 @@ Never put a number in a commit for main that you haven't pushed to the ledger.
 `git checkout` and `git switch` stay banned, including `-b`. To name your work as a branch, use `git branch <name>` (the
 worktree stays where it is) or push it directly: `git push origin HEAD:refs/heads/<name>`.
 
+## PERFORMANCE GAPS ARE FIXED UP FRONT (ADA 2026-11-20 ~06:30 PST: "we address performance gaps upfront. Period")
+- A measured performance gap is fixed in the same piece, or as your very next piece, before any new feature. That covers
+  a step past its budget, a working set that grows with the input, RSS far above the design's bound, or a number far
+  from its target.
+- GAPS may name it only while that fix is in flight. Never write "owed" for a performance gap and move on.
+- A stopgap that shrinks a gap without bounding it is not the fix. Go straight to the bound.
+
+## KEEP YOUR CHECKOUT CURRENT (ADA 2026-11-20 ~07:05 PST: "all agents need to also be keeping their local checkout up to date")
+- Bring your working tree up to date: `git fetch origin && git merge origin/main`. Never rebase, reset, checkout or stash.
+  Do it at the start of every piece, before every test run you report, and at least every 30 minutes while you work.
+  The same goes for kiln, Shards and Hex checkouts, each against its own origin/main.
+- Name the base commit (origin/main's short hash) with every result you report. A result from a stale tree is not a
+  result: g227's "red on clean main" list came from a main four hours old, and half of it was already fixed.
+- Delete worktrees whose work has landed, by exact path (`git worktree remove`), so stale trees don't pile up.
+
+## ON ORIGIN/MAIN, REGULARLY (ADA 2026-11-20 ~07:00 PST: "be sure we're also regularly pushing these changes origin/main")
+- Finished work never sits on a branch. Each piece lands on origin/main within about 30 minutes of being green, under the
+  fast landing rule, confirmed with `git merge-base --is-ancestor`.
+- A red check still running (a Windows red, a CI diag) doesn't hold a green piece back: land on the green, then add the red's
+  numbers as a follow-up commit.
+- An experiment that lost goes into BENCHMARKS as measured-and-rejected, and then its branch is deleted. Main audits
+  agents/* branches every five minutes.
+
+## DECISIONS BACKED BY DATA; MAKE DESIGNS BETTER (ADA 2026-11-20 ~06:45 PST)
+- Ada: "push back and make designs more robust, more performant, make your agents do A|B testing and back their decisions
+  with data." When a design choice affects performance or robustness, A/B the candidates on the real workload before
+  you build the rest:
+  - release binaries, interleaved runs, best of N with all N shown;
+  - the competitor's number where one exists (stock git daemon / hg serve / svnserve, FSFS), since goal 93's bar is
+    an order of magnitude faster;
+  - the numbers go in BENCHMARKS and the amendment.
+- Push back on main's rulings too, when data or a better design says so. w-perf's skip-delta for svn history replaced
+  main's reverse-delta cut that way.
+
 ## NEVER PAUSE ON A BLOCKER YOU CAN CLEAR (ADA 2026-11-20 ~02:40 PST)
 - Unsigned commits are fine. If a signer refuses (kiln's signer refuses non-kiln sessions), commit with
   `git -c commit.gpgsign=false commit ...`. Never stop to ask about signing.
@@ -97,4 +131,11 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
   Main checks every agent about every five minutes and will unblock you.
 - Disk: before each build check `df -h ~`. Below 25 GB free, delete your OWN landed worktrees, your target's
   `release/` and `incremental/` directories, and datasets you no longer need. Never delete another agent's
-  folders; tell main instead.
+  folders; tell main instead. Delete by exact path only, never a glob over ~/.cache. Never write `rm -rf $var`
+  or a delete over a computed path inside a loop: kiln's gate stops such a command for a person's approval even in
+  bypass mode, and you sit in needs_you until someone clicks (w-perf, 2026-11-20 04:10). Use `git worktree add`/`git
+  worktree remove` for scratch trees, or one literal path per `rm`.
+- Spotlight (main 2026-11-20 03:55): Spotlight indexes build output (Studio-4: 1,181 rlibs under ~/.cache, mds at
+  ~66% CPU at load 29 on 14 cores). It skips any folder whose name ends in `.noindex`. Whenever you next create or
+  wipe your cargo target, name it `~/.cache/<your-target>.noindex` (CARGO_TARGET_DIR) and build with
+  CARGO_INCREMENTAL=0. Don't rename a live target mid-run; make the switch at your next wipe.

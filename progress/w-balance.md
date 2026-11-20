@@ -197,3 +197,12 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - 783e14e64 LANDED P7 large-pack run: cap 5/3 toys 3.07x/3.63x fair share (daemon-wide wait, profile owed); cap 10
   kills daemon (run request updated).
 - NEXT: profile the toys' wait with v1.5.0 present (memory making?), cap 3, on .local-2.
+- PROFILE (quiet runs on .local-2): small repos' wait = server-side between their steps (served 0.19 s, span 1.8 s);
+  span tracks others' step time on the shard. Longest steps by phase: input up to 1,435.7 ms (resolve_waiting at pack
+  end in one call), answer up to 247 ms; mean 0.04 ms. Kill at cap 10: shard spinning in task vcs_http.rs:1404, poll 595.
+- FIX (branch agents/w-balance-fix1 76070d077, NOT LANDED per main's rule): resolve in turns. Input longest 1.1 ms, cap 10
+  alive, v1.5.0 alone 423 MiB, but toys still 3.34x fair share -> resolve is NOT the toys' wait. Inbox note to w-git
+  written. Awaiting main's ruling. NEXT: profile the answer step (213-247 ms) and per-step round cost.
+- 2026-11-20: LANDED 032617278 on main: a pack's waiting deltas resolve a delta a unit in the answer's turns (the daemon's end at ten v1.5.0 pushes); red past-budget counter 0/0; cap 10 10/10 alive (not quiet: 3 daemons, load 9-11, quiet rerun owed). Per-repository push counters by phase in status. w-git told. Next work in progress: the toys' wait, ~1 s before a push's first step unaccounted, measuring it.
+- 2026-11-20: LANDED 36212ac98 (record_names codec for v3, w-perf asked) and 3f4996b5f (homes barrier driven by committed publications; before, never called). v3 shape needs main's ruling: inbox/main-from-w-balance.md (windows-only image, takeover replay). Toys' profile r43 blocked: kiln server not answering, logs on the Studio unread.
+- 2026-11-20: LANDED 3283dd758 (via 1e992537f): a shard's turns by repository (vcs_share::turns), cause found by counters (shard 7: r2's 3 pushes took 3 turns a round). Proof (run 30, BENCHMARKS 369102a32): slowest small span 2.67->1.44 s (cap 3), 5.66->1.74 s (cap 10); small p99/fair 3.0->2.0-2.45, 4.39->2.09; medium 1.08->2.2, hot 0.72->1.45, wall 10.9->20 s (their many pushes now share one turn). Remaining gap: co-location (repos on owner shard by name); measuring busiest repo's shard mates (run 31, Studio not answering). Branches cpu/lanes/load recorded as replaced and deleted, with my merged branches. identity_homes API note to w-fed-move written.

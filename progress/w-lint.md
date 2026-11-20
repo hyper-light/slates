@@ -86,3 +86,43 @@
   GlobalAlloc` has one. Without their own: the four trait methods' `unsafe fn` (alloc, alloc_zeroed, dealloc,
   realloc; covered only by the impl's comment) and the three `unsafe fn unmap` declarations (a `/// # Safety` doc
   each, no `// SAFETY:` line). Not changed by me: the budget is the author's to raise and name (w-engine).
+
+## 2026-11-20 "Waiting on main" lines: ANSWERED (main's rulings)
+1. deploy.rs rustls Arcs in a test: approved as D-8 exception 2. Was already green (c9137cb9f); now in main's ruled
+   form, `#[allow(clippy::disallowed_types, reason = "D-8: rustls takes Arc<..> by signature")]` with a comment
+   naming the two owners (landed, see git log for deploy.rs).
+2. Part B's park_timeout loops (marked_within, hook_driver `gone`): waits on an observable condition with a deadline;
+   kept. Scanned test code for the dodge shape (wait out a time, then assert something did NOT happen): none found;
+   doorbell.rs and closed_loop.rs pace cycles / rest a hold out, then assert on counters (events). Nothing to send.
+3. Closed by main: carry.rs:497's sleep gone; share.rs EPSILON derived (Higham 3.1, share.rs:159-166).
+- Handed off by main: A-742 unsafe budget (81 vs 79) to w-engine, urgent; the red content-once test to w-perf.
+  Hourly rounds drop both from "known".
+
+## 2026-11-20 round 1 (main asked: Windows lane at or after 90d405247) -- at fe4c64851..8ebdc1d1a
+- 90d405247 (w-svn's off-unix run_svn_hook, 165006): compiles and is clippy-clean on Windows. Nothing to send back.
+- Fixed and landed: 231ac7d11 cluster/mem/server/bridge-winfsp Windows lane (14); c37ffd11e mem resident + 38
+  literals (anchor, rt, cluster, server, vcs, vfs); fff3ebaa7 git/merge/wire + new svn fsfs_view test (36; it got the
+  crate-level harness allow the 329 other integration tests carry); 0907608c4 db/server/cli/mcp (8); 12f2ed442 hg
+  test (1); 8ebdc1d1a cli winfsp remove_through_drive (1, Windows).
+- Wall at fe4c64851 + fixes: host clean, six cross targets clean, structural/literals/unsafe/fmt clean, Windows
+  (crates, cli, xtask) clean. Unsafe now 80/80 (w-engine's fix landed).
+- Target trimmed after the round (21 GB, CARGO_INCREMENTAL=0); box 100 GB free.
+
+## 2026-11-20 round 2 at 86d9e666c
+- Host: 16 errors in git, svn, server, cli (+ structural: git positions.rs proptest not through slates_test_seeds;
+  + 4 literals in server git_push.rs PhaseSteps) -> fixed in 9bb1558c2 and its merge (main restructured
+  negotiation/objects.rs meanwhile; took main's file; boxed Begun::Selecting). Host workspace clean after.
+- Six cross targets, unsafe (80/80), fmt: clean. structural, literals: clean after the fixes.
+- Windows (jupiter): r11 stopped (pre-fix tree); r14 on the fixed tree in flight -- kiln server timing out on reads.
+- Target trimmed after the round.
+
+## 2026-11-20 round 3 at 562b58593 (closed at 4ce207710, clean on every lane)
+- Fixed and landed: e3f012a61 (19: git, vcs, hg, server; structural A-745 suite seeds; literals; two polling loops
+  as deadline waits, neither a "did not happen" wait), f23d5ac80 (2: ungated Hook arm off unix; A-697 floor test),
+  22fcede45 (4: A-697 part c computed_request boxed, judge_submission split), 4ce207710 (3: svn_interop hook test
+  cfg(unix); A-697 settle test).
+- Windows lane now runs on a FRESH CLONE on jupiter (kiln run, sync: false, ~/w-lint-src re-cloned each round,
+  same target dir): kiln's synced copy there is damaged (a read-only .git pack "Access is denied"), which gave stale
+  files and false errors in r16/r17.
+- At 4ce207710: host, six cross targets, structural, literals, unsafe, fmt, Windows (crates, cli, xtask): clean.
+- Target trimmed after the round.

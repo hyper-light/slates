@@ -125,3 +125,37 @@
   keeps no tail, so fork timing never changes tables and log replay matches. Replay stages too (InOrder keeper keeps
   resolution order); intake Queue keeps resolution order. Removed legacy fresh/positions_for/rows_for/insert.
   A-639 by-type positions given up (arrival order) -> flag to main to measure fragment-set runs.
+- REGRESSION found before landing part 3: long-history push 6s/fetch 15.5s vs main 1.9s/4.1s (arrival-order positions
+  break A-639 by-type runs; per-object staging slow). REWORK: stage the whole push at SEAL (positions by type then id
+  as before, rows via insert_all into a fork), landing adopts (or restages = stage again). Revert per-object stage,
+  arrival order, intake ordered Queue, replay InOrder. Part 4: slice seal+stage pass and make record replay the same
+  sliced intake path (main 2026-11-20: replay of a big pack record runs in ONE turn -> crash-loop; failing test first:
+  replaying a many-object pack record takes many turns).
+- A-722 part 3 LANDED 82ff3bc79 (main 7b93d68c3), 2026-11-20 ~03:15: seal stages whole push into index fork (by-type
+  positions), landing adopts or restages; push 2.0s/fetch 3.7s vs main 1.9/4.1. Ledger + run-request done.
+- A-743 LANDED f6ca826e6 (main 4d9de40c9), ~03:45: CreateBranch records new green's git ref (no-object push record,
+  vcs_store::commits::branch_made); git_interop stock_git_sees_the_branches un-ignored. Finding sent: assert_made_again_whole
+  fails after plain pushes (content holders differ).
+- NEXT: A-722 part 4 in worktree ~/slates-work/w-git-refs (reuse after fetch): (a) failing test first: replaying a
+  many-object pack record takes many turns; (b) slice the seal+stage pass and moves' admission; (c) remaining O(objects)
+  in commit; (d) sliced restage on stale. Then concurrency proof 19/100, arrival-shard decode (w-balance seam),
+  t_a665 derived deadline, ruling B.
+- A-722 part 4a LANDED cafd1058f (~04:30): vcs_store::git_replay (record decoded once, pack read in chunks
+  archive_slice_bytes_within(ns), objects admitted one a unit, deadline = step quantum; record_turn in rebuild turns
+  and recovery units; Lent guard per turn since A-727 a2). Next 4b: slice seal+stage pass and moves' admission (live
+  GitPush::seal + admit), then landing's O(objects) passes, stale restage; thin-pack resolve waits on w-balance's slicing.
+- A-722 part 4b LANDED 8ceff213f (main 5014be90a, ~04:40): slates_git::store::Staging (generations, fresh via
+  Quarantine::object_after cursor, positions by per-kind counts, rows inserted per object, Index::seal_step), live
+  AnswerState::Sealing + SealingPush::turn, replay seal through Staging, Drop gives back Sealing/Deciding.
+  NEXT 4c: moves' admission (admit_moves / SealedPush::admit walk) + landing O(objects) passes + stale restage sliced;
+  then by-use proof 10/19 concurrent pushes after w-balance resolve-in-turns lands.
+- A-722 part 4c LANDED 51fff3e6f (main d435c91b7, ~05:15): slates_git::store::Admitting (walk/descent/base/beyond units),
+  Repository::admit = units to end; receive::Judge::ready (default true) called before verdict in each_step/atomic_step;
+  ServerJudge::ready → SealedPush::admission_turn keeps Move in sealed.prepared; SealedPush::admit takes it when
+  to + current_head match. Measured & sent: work build + apply dominate (works/merge).
+  NEXT 4d: store commit passes (brought_by, landed_runs, plan/members_positions, release_holds) + stale restage sliced;
+  by-use 10/19 proof when w-balance-fix1 (76070d077) lands on main.
+- A-722 part 4d LANDED a8aea3990 (main 14a85fbd2): replay thin-pack resolve in turns (Reader::resolve_turn_with).
+- BY-USE PROOF in progress: release build on adas-mac-studio.local-2 (kiln run r2, target ~/.cache/w-git-target.noindex,
+  CARGO_INCREMENTAL=0) of main d435c91b7 (has w-balance 032617278). Then: python3 crates/cli/bench/multi_repo_load.py
+  <slates> ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0 --steps 100 --per-repository-cap 10, then without cap (19).

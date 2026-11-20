@@ -104,3 +104,35 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - Item 2: design note inbox/main-from-w-engine-greens-in-pool.md (premise corrected: greens hold files only in the
   engine; 241.5 MiB = 48.2 MiB current + ~193 MiB history); waiting for main's call before code.
 - Scratch kept: ~/.cache/w-engine-bench/*.sh, *.py (profile tools). Delete when item 2 is decided.
+
+## A-744 LANDED c3c581f87 (merge 65cb4c522), main's rulings of 2026-11-20 ~11:00
+- 581 MiB split: owner partition's anchor-segment log ring 355.2 MiB + snapshot slots 225.8 MiB; content object
+  2.3 MiB; greens' files are not in it. status --json content_ranges per shard (swept, bounded).
+- Leftovers: svn record exact length; svn commit checkpoint-first, one append; log decode-after-encode KEPT (A-420's
+  replay measure; removing needs a non-decoding replay measure: main's call).
+- Unsafe: large.rs every site SAFETY-directly-above; fold of unmap kept 79; +1 mincore -> 80; xtask unsafe ok.
+- ~/.cache/w-engine-bench deleted.
+
+## A-746 LANDED 9f57288b2 (merge aaadfae5e); sweep test fix de381e643
+- Register split: chain 133.1 + checkpoints 137.4 = 270.5 MiB > records 222.4 MiB -> items 3-7 on A-727's seam.
+- Seam proposal sent to w-perf (inbox/w-perf-from-w-engine-block-seam.md); numbers to w-svn. No seam code until w-perf
+  answers (inbox/w-engine-from-w-perf.md).
+- Meanwhile: the log ring's released pages (88 MiB resident past the live tail) given back.
+- main's calls: log decode-after-encode stays (A-420); unsafe gate green at 80.
+
+## Reds fixed (main's FIRST list), landed b004dd29c + f5c9be2b6 (merge cf4e9b703)
+- Retained-history red: real on current main; bisected to my 529144e79 (honest charge; passes at 183604041). Test bound
+  updated to the ruled honest figure (earlier file once + edits, < 2 copies).
+- Sweep red: one report a poll in the test; steps sized to the budget left by measured fixed + per-page cost; segment
+  regions stepped; sweep.past_budget 0 (red 141,612 before), 20/20 runs 4-parallel.
+- Push route now merges on studio-2 in a fresh worktree when main moved without touching my paths (overlap aborts).
+- NEXT: w-perf's seam answer (inbox/w-engine-from-w-perf.md) gates items 3-7; meanwhile the log ring's released pages
+  given back (main: before 3-7 if small), measured before/after.
+
+## A-752 (main's item 1 of 2026-11-20 ~06:40: push work build + entry apply under the step quantum)
+- Ledger: A-752 (A-751 went to w-bugs in a three-way union; nothing of mine says A-751).
+- Part 1 LANDED ca204fc87: deriver replay indexed; flat 3,500 compose 129 -> 28 ms, 7,000 458 -> 58 ms (debug).
+- Probe (debug, merge): 3,500 files build 66 ms, compute 16.8, commit 26.6, encode 0.6.
+- Design + one call sent: inbox/main-from-w-engine-a752.md (may a green be held out across turns during commit?).
+- Part 2 in progress: Building (walk/base/compose/post/identity in units), async deriver with Pace, ServerJudge::ready.
+- w-perf answered the seam (inbox/w-engine-from-w-perf.md): items 3-7 after A-752 and the log give-back.

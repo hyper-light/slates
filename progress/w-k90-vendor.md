@@ -55,3 +55,71 @@ Feedback: tool installs on Ada's machines (even user-scoped Python on jupiter) n
    5a294413c..81174ac49. Drive: 3/3 first-run failures before, 6/6 passes after (same pin, same bridge sources).
    Note: claimed A-737 then A-740 by mistake (both taken); A-741 is mine (registry fixed by a remote union rewrite).
 Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word about WinFsp on jupiter (target kept there).
+8. Goal "slates_e2e bare_metal tests run on Windows too": LANDED kiln main 4aabdba18..7e542f29c (1d0657923, a321a8189 +
+   merge). bare_metal was already any(unix, windows) (b7720ebca) and skips loudly without WinFsp ("cannot mount here:
+   WinFsp is not installed ... install WinFsp from winfsp.dev"; SLATES_E2E=1 makes it a failure, by design). Ported:
+   stand_in (4 tests, no mount) off cfg(unix), its Python via vm_e2e::stub_python on Windows; the stand-in itself used
+   os.uname (Unix-only) for its WHERE line -> platform.system, which the bare-metal drive's Windows run also needed.
+   jupiter (kiln 81174ac49 + branch): stand_in 4/4 (4 failed before, AttributeError), bare_metal 2 skipped loudly;
+   macOS stand_in 4/4. Once WinFsp is installed on jupiter: SLATES_E2E=1 slates_e2e bare_metal:: (Python Launcher on
+   PATH), no code change; target C:\Users\corph\.cache\w-k90-vendor-target kept.
+ P1 LANDED slates main bc180d63..86adda1c (86adda1c6 = merge of the piece; worktree ~/slates-work/w-k90-vendor-a745):
+    Positions moved to slates_git::positions; Graph::Node: Into<u64>+TryFrom<u64>; Pack.objects/PackPlan.objects/
+    Planned/Answered::objects are Positions; plan copy charged per run. Red (old per-object charge put back): left 96
+    right 16. Green: slates-git negotiation::/upload::/store::... 207 passed; slates-server git upload paths 25 passed.
+ NEXT P2: the walk's own sets (objects::select's BTreeSet/BTreeMap: objects, opened, done, sent commits, left_out;
+    paint's flags; ready; shallow cut) made resumable under a quantum, upload::Answering {begin, step} modelled on
+    hg's getbundle::Answering; oracle = sliced bytes == serve()'s whole for every upload test; least room < whole.
+ P2a LANDED slates main b56e5766..1c5c79a9: negotiation::Held (Positions charged per run) for paint want/have/taken,
+    sent commits, left_out, chosen objects, done, opened (tree: filter keeps a depth map); negotiation::Peak for queue
+    and stacks; Positions::insert_new in place. Red (main 86adda1c6 + test): PastAdmission{asked 16,left 0}; green 210
+    passed (merged tree). CAUTION learned: a scratch worktree sharing my target dir made cargo run ITS binary in my
+    worktree (same member path hash) -> never share a target dir between two worktrees of one repo at once.
+ NEXT P2b: walk resumable under a quantum (Paint::run, mark, open, sparse walk, ready, shallow cut) as a
+    negotiation::Negotiating state machine with step(graph, spent); upload::Answering {begin, step}; oracle: sliced
+    bytes == serve()'s whole for every upload test; least room a slice needs < whole answer's. Then P3 (server).
+ P2b part 1 LANDED slates main 216c57ad..392c1e9c: negotiation::begin + Negotiating::step (objects::Selecting stages:
+    Commits via Paint::step, Edges, Haves, Choose, Wants, Tags; stacks persist; sparse frames held/released);
+    negotiate = begin stepped to end. a745_a_negotiation_stepped_a_unit_at_a_time_answers_as_one_made_whole (1,024
+    generated). 211 passed merged.
+ NEXT P2b part 2: upload::Answer gains the negotiation pending (owned Asked from fetch::read, sparse::Read), its write
+    taking the owner's quantum check and stepping Negotiating until done, then building the streaming answer as
+    fetch::written does; v0 likewise; servers pass the quantum. Oracle: every upload test's bytes unchanged; a test
+    serving with the quantum spent after every unit == whole. Then P3 (server: request room per slice; red by use).
+    Also owed: begin's ready/cut walks and include-tag's scan in units.
+ P2b part 2 LANDED slates main cf4e9b70..9ebcfbf8: upload::serve_in_turns + Answer::write_within (Choosing state;
+    abandon -> band-3 ABORT appended to head); serve/write unchanged; upload tests' answer_of answers every exchange
+    both ways, same bytes/refusal. Main's lint round boxed Begun::Selecting (9bb1558c2): adapted.
+ NEXT P3 (server): HTTP vcs_http/git/upload.rs Upload and SSH vcs_ssh/git.rs UploadCommand call serve_in_turns and
+    write_within with their quantum (they already step write per turn); admission = the request's room (revert A-713's
+    StoreLender::room); red BY USE first: daemon_edge clone of a long history whose pack is past one request's room,
+    over HTTP and over SSH. Owed after: v0 in turns, begin's ready/cut + include-tag scan in units, rule 4 generation.
+ P3a LANDED slates main 57ea648f..5a93963f: Held hybrid (runs or bit table, Roaring), Paint::chosen -> Held;
+    answer::packet_data (packets <= room/4 as the pack begins). Found by use: 64 KiB per request -> 3,000-commit clone
+    refused "needs more room" (framing asked 131,106 after a 2.7 KB walk); with 3a answered whole.
+    adas-mac-studio-2 (b24c) stopped answering kiln ~05:4x; MacBook Pro-2 (e30189) pushes over HTTPS
+    (clone ~/.cache/w-k90-vendor-slates-push there).
+ NEXT P3b (server): UploadServices::new(lender, room) (room from daemon_edge site) and SSH UploadCommand given
+    ToolServices.room; admission = min(request room, StoreLender::room); serve_in_turns + write_within with
+    PackSource::turn() (new provided method; ShardPacks overrides with the shard clock + quantum); by-use tests: HTTP
+    long-history clone (existing A-713 test now at the request room) + an SSH long-history clone (new).
+ P3b LANDED slates main f14562e4..562b5859: UploadServices::new(lender, room), UploadCommand::new(..., room); admission
+    = min(request room, StoreLender::room); serve_in_turns + write_within(packs.turn()); PackSource::turn (ShardPacks:
+    shard clock + step quantum); SSH dies on a refusal given while writing. By use: HTTP long-history clone (ring
+    region) + new vcs_ssh::tests::receive::a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room
+    (64 KiB). 108 server / 214 git passed.
+ A-745 git half: DONE as asked (sliced answer, slice-only admission, request room, by-use HTTP+SSH). OWED (in GAPS):
+    protocol v0's fetch in turns; begin's ready/cut walks + include-tag scan in units; plans of scattered positions
+    (16 B/run); rule 4 (a fetch held to the index generation it began on); the live git clone matrix rows (main's).
+
+## Ada's rule "performance gaps upfront" (main, 2026-11-20): next 4 in order
+ 1. Rule 4 LANDED slates main ca204fc8..00b99ebb (3991b1df code, 00b99ebb docs). StoreLender::{Hold, hold, lend_held};
+    vcs_store::upload::GitGeneration (shared Repository::fork per (repo, Repository::stamp), refs+HEAD snapshot,
+    released within budget on last drop). Edges (HTTP upload, SSH git) hold on a Request, lend every later step from it.
+    Red: vcs_store::upload::tests::a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile (push +
+    tag v2 after step 0; held pack = start's objects in order, by id; unheld != start). Found: since P3b later steps had
+    no refs, so include-tag lost tags; fixed by the hold. Note: zlib bytes can't be byte-equal across two streams --
+    level sampling is timed on the shard's real clock (fragment::level), so objects compared by id (content hash).
+    Pre-existing on main, not mine: clippy cognitive_complexity in crates/git/src/store/staging.rs:223 `unit`.
+ 2. NEXT: begin's ready/cut walks + include-tag scan in turns. Then v0 in turns; then bounded scattered plans.
+    After 1+2: ask w-interop (via main) to rerun Windows git clone rows on current main.

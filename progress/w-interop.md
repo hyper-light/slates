@@ -177,3 +177,16 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   RepositoryPolicy type, cli `repository policy NAME [--hook POINT=PROGRAM]...` + grammar test, svn_interop test
   a_repository_policys_hook_lets_stock_svn_change_a_revision_property. NEXT: apply wire_order.txt diff from r59, land,
   then revprop matrix row (svn:// + svn+ssh), then branch verbs.
+- LANDED policy verb 870a7d270 (merge b3b877856; on main, checked). Reported. change-rev-prop2 no-hook bug -> w-svn
+  (test landed ignored).
+- Revprop matrix rows (svn:// + svn+ssh, hook set via policy verb) scratch 606c59c4f on agents/w-interop-revprop; r62.
+- Then: branch verbs `slates repository branch create|bind|retire` (CreateBranch/BindBranch/RetireBranch).
+- jupiter r57 (Windows slates.exe + git matrix) still running.
+- LANDED revprop rows 1a0d9ae01 (on main, checked): 32/32 both datasets. Reported.
+- NOW: branch verbs `slates repository branch create|bind|retire` -> CreateBranch/BindBranch/RetireBranch.
+- LANDED branch verbs 1794a768a (on main, checked). By-use: CLI branch not in git refs -> w-git (test ignored).
+  (Sent wrong id 40dfe94a4 first, corrected. RULE FOR ME: copy ids from push/log output only.)
+- Repository verbs owed by A-685 all on CLI now (create, import, policy, branch create/bind/retire).
+- NEXT: Windows (jupiter r57) results; then Linux when adacachy has room.
+- r67 release hg whole push on main 7b93d68c3: PUSH PASSES 142 s (~400 rev/s), RSS 5,460 MiB; clones refused
+  PastAdmission (asked 228144 / stream 7081) -> w-hg; matrix 4/24. Reported.

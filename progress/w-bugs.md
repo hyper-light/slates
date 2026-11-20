@@ -144,3 +144,70 @@
 - B5 in flight: diag-w-bugs-b5-1 (both arches): a written file's open+close via PowerShell: arm64 NTFS 73 us, WinFsp
   memfs 190 us (no 4 ms on the platform's own sample FS); x86_64 NTFS 51 us, memfs 123 us. The slates half failed
   before timing (unknown step); b5-2 logs each slates step.
+- B5 NOT REPRODUCED (diag-w-bugs-b5-4, main 137bf3633): written-file open+close p50 arm64 slates 229 us vs memfs
+  186 us vs NTFS 68 us; x86_64 93 / 44 / 13 us. No 4-5 ms. Closed in bug-claims.
+- Goal 87 B-list now: landed B3 (A-725), B14 (A-739), B16; fixed earlier B4; answered B15; not reproduced B5, B11;
+  reading findings B8, B9 (main's). Plus A-717, A-737 found and landed on the way.
+- hangup flake LANDED main 64e5667fa (test fix; reproduced 2/30, fixed 0/30 on CI ubuntu under load).
+- Main's ask (2026-11-20): A-551/A-576/A-498 on Windows via CI, failing-test-first. In flight: diag-w-bugs-win-green-1 /
+  -red-1 (red = CaseSensitiveSearch for every volume): A-551's two drive tests + new A-576 test
+  names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two (branch agents/w-bugs-win, commit
+  "wip: winfsp drive test...") + the workloads suite (A-498 hg byte-identity on stock WinFsp).
+  A-551's drive tests already passed on both arches in b3-11 (22/22 winfsp_semantics).
+- A-498 hang: new test a_delete_racing_a_coherent_purge_returns_and_removes_the_file (crates/cli/tests/winfsp.rs; 60
+  rounds: SDK write, drive open+hold, SDK rewrite -> purge, close+delete at once; hang = 10 s). diag-w-bugs-race-new-1
+  (main with A-725) vs -old-1 (main just before A-725), 3 runs each, both arches. Patch: ~/.cache/w-bugs-msg/race.patch.
+- B-list for main: B6 has no record anywhere (state, repo, bug-claims); g079's rebuilt list (2026-11-19) lacked it with
+  B1/B7 (landed) -- likely closed before the wipe, unverifiable here.
+- Disk (main 2026-11-20): deleted ~/.cache/w-bugs-target; ~/.cache/w-bugs-target-land kept without incremental/; builds now CARGO_INCREMENTAL=0. ~/.cache/slates-work-target-g227-* is not mine.
+- A-747 LANDED main 4e9c31aba (14c95642f): main's red route::hostile_claims_... -- not A-735 (fails at its parent and
+  back to d576a383a, which added the silent-connection step: never passed on macOS). Cause: XNU setsockopt(SO_NOSIGPIPE)
+  EINVAL on an accepted socket whose client already closed -> Listener::accept Err -> route_failed. Fix: Accepted::
+  {Connection, Departed}; serve counts Departed as route_malformed.
+- Windows items (CI both arches): A-551 red-checked (folding test FAILS with CaseSensitiveSearch forced; green passes);
+  A-576 drive test (ɐ/Ɐ one file, ς/σ two) green, red with the same forced flag; workloads (git/hg/svn) pass on stock
+  WinFsp; A-498 hang REPRODUCED on pre-A-725 main x86_64 (2 of 3 runs: one 10 s timeout at round 7, one process hang
+  at round 43) and gone with A-725 (6/6). To land: the race test + A-576 drive test (patches in ~/.cache/w-bugs-msg).
+- LANDED main 15d25e8b2: the A-498 race test (A-725 cures the hang: pre-A-725 x86_64 2/3 hung, post 6/6) and the
+  A-576/A-737 folding-drive test; A-551 drive tests red-checked; workloads pass on stock WinFsp both arches. GAPS updated.
+- Goal 87's assigned items done. Open: B8, B9 (reading, main's); B6 no record anywhere.
+- e8788ea65 (docs): A-551 sharing-violation + normalized-name parts red-checked apart (win-red-1 / win-nred-1, both
+  arches); B7a/B7b tests pass on Windows x86_64 (jupiter); GAPS records the B-list closed and B6 unknown.
+- Slip: `git switch -c` used once to name a detached diag worktree's branch (no harm); no repeat.
+- Goal 87 parts done; waiting for main's next piece.
+- LANDED main b56e5766d: the WinFsp fsx record re-recorded (diag-w-bugs-fsxrec-1: x86_64 + arm64 both pass seed 1
+  whole, list empty) and conformance.md's matrix re-rendered; matrix test 4/4 (main's doc-truth red from my A-725).
+- NEXT PIECE (main, goal 93): Subversion's fetch rule (§4.17.1 "A fetch's answer", A-745): measure checkout +
+  update-report of a large repo over svn:// and DAV (past-budget counter, admitted sizes); if past budget or whole-answer
+  admission, slice the editor drive on both edges, red first (checkout larger than a request's room), svnadmin-identical
+  bytes as oracle, generation hold test. w-svn owns the svn crates: inbox note first.
+- svn fetch (goal 93) in flight: reading says both edges already slice (svn:// report exchange writes calls until the
+  turn's room or steps are spent, yields between turns; DAV REPORT a room-sized slice a reply run, store lent each run;
+  drive steps are bounded). Measuring by use: diag-w-bugs-svnfetch-1 (ubuntu, release, git/git 1,000 commits as svn,
+  checkout + update across 500 revs over svn:// and DAV), instrumented (diag-only) with per-conversation shard
+  long_steps/longest_step_ns, the most bytes a turn wrote vs the room. Worktree ~/slates-work/w-bugs-svn (branch has
+  the diag commit; a real change starts fresh from origin/main). Inbox note left for w-svn.
+- svn fetch run 4 (macos-latest; Linux names no issuer surface so no token): checkout svn:// 4.97 s, DAV 5.88 s, update
+  across 500 revs 2.0 / 2.03 s (4,872 files, 1,000 revs). FOUND: DAV report runs write up to 410,243 B against a room
+  of 278,528 (1.47x) -- the room does not bound a slice. Quantum on CI mac 3.95 us; lifetime longest_step 1.04 s (the
+  import). svn:// bytes were measured after step() clears out -- wrong place. Run 5 measures each slice's own time and
+  bytes (svn:// answer(), DAV report.resume()).
+- svn fetch run 5 (macos-latest): BOTH EDGES PAST BUDGET AND ROOM. svn:// slices up to 12.4 ms (99/108 past ~6.2 us
+  quantum), up to 316,779 B vs room 278,528; DAV runs up to 8.3 ms (255 past), 410,243 B. Checkout 3.7/3.9 s, update
+  2.1/2.06 s. Fix planned (A-745's hg template): slice never past its room (carry overflow), a stop-check closure from
+  the server bounding each slice by the quantum, the report's generation held. Inbox note to w-svn written.
+
+## 2026-11-20: A-751, the resumable svndiff window encoder (main's piece, Ada's rule: performance gaps upfront)
+- Landed part 1 d12b5cdc8: svndiff::WindowMaking (the deltifier and the sections in units, no borrow of the texts)
+  and svndiff::lz4 (lz4_flex 0.11.6's block compressor, same bytes, in units). Main's red: a 102,400 B window took
+  6.0-7.7 ms in one step (debug); with 256 units a step, none past 500 us; every window is the whole window's bytes
+  under every unit size, v0 and v2 stored/LZ4.
+- Landed part 2 (main 1d7a60e1d): the update report's drive reads, makes and sends each window 1,024 units a step
+  (Call::DeltaPiece). svn:// frames a write's pieces as one textdelta-chunk; DAV base64s them. Red: big.txt driven a
+  step a call, 4 steps of 2.8-3.0 ms each run; green none past 500 us; the stream is the whole-window path's byte for
+  byte; the svnserve sessions are unchanged.
+- Owed: the replay drive (report/drive/replay.rs: svn:// replay/replay-range and the exporter's source) and
+  get-file-revs (reads/file_revs.rs) still make a window whole; format 3 adopts the maker (w-svn, inbox note sent).
+- Run request for main: re-run diag-w-bugs-svnfetch's checkout/update on macos-latest at 1d7a60e1d (svn:// and DAV
+  against svnadmin load over file://). Red would be a diff against svnadmin's working copy, or a slice still in
+  milliseconds.

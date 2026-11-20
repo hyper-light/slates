@@ -1,19 +1,12 @@
-# RESUME HERE (2026-11-20 ~03:30 PST, Mac Studio d1323898; supersedes everything below)
-- LANDED: kiln 30c5929 (A-580 harness), e33c470 (A-708). Linux run r9 STOPPED (old code; re-queue after A-734 lands).
-- IN FLIGHT, piece A-734 (claimed, ledger row "in progress"), worktree ~/slates-work/w-fed-faults-p3 (branch
-  agents/w-fed-faults-p3 off kiln main e33c470, uncommitted), target ~/.cache/w-fed-faults-target:
-  1. tests: Fault::{Signal,Link} gate (link flows run on macOS), lab end unmounts Slates mounts before ending instances,
-     runners started with their harness (common::Fleet::start_runner_harnessed; --no-terminal started no Slates),
-     agents.start workspace "volume", writes at volume root, fleet_seen/read_refusals diagnostics, until_one_fleet proof,
-     pre-cut control read through survivors.
-  2. kiln: slates_fleet::short_of + join waits for 2f+1 in the directory (found by use: 3 runners wrote 3 one-node
-     manifests). Unit a734_a_manifest_waits_... red then green. PROVEN by use: one fleet of 3, records cross the relay.
-  3. kiln (main's ruling): one-time bootstrap. migration 20261120-0900_slates_fleet_bootstrap.sql; slates_fleet::
-     bootstrapper/ask_bootstrap_on (claim recorded first, bound to machine, done never again) + POST
-     /api/agents/slates-fleet/bootstrap + ensure_up asks after report_member, ensure_group, says done. Unit
-     a734_kilns_slates_fleet_is_bootstrapped_once_... Lab has no operator step.
-  OPEN FINDING (by use, macOS, seed 0x522bdda8): with fleet-a cut off, survivors served 0 of 8 acknowledged files in
-  900 s. Diagnosing (logs ~/.cache/w-fed-faults-logs/p4-cut.log): replication-at-seal vs no takeover vs read path.
+# RESUME HERE (2026-11-20 ~15:30Z, Mac Studio d1323898; supersedes everything below)
+- LANDED: kiln 30c5929 (A-580), e33c470 (A-708), 0edd8dc + e3e5d7b (A-734), ed8991d (A-750: workspaces
+  live-shipped + shared with every member at making; isolated move refused [kind: isolated]); slates a5140de.
+- PROVEN on macOS with kiln alone: killed flow (owner's runner stopped, mounts gone, instance SIGKILLed; survivors
+  served 8/8), cut-off flow, slow-link flow (refused by kind unplaced).
+- IN FLIGHT: kiln run r23 on adacachy (linux/amd64): the four signalling flows over the A-750 code (synced from
+  worktree ~/slates-work/w-fed-faults-a750, same code as ed8991d). On its end: fix what fails, land, report.
+- Forward-lane log flood: g226's (main's word).
+
 - Answered w-balance Q3 (inbox 2cf8325).
 - Ship route: kiln run on adas-mac-studio-2.local (b24c5c95...), cwd ~/.cache/w-fed-faults-ship (land.sh, state3.sh,
   inbox.sh, claim.sh).
