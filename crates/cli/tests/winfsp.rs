@@ -488,7 +488,7 @@ fn a_delete_racing_a_coherent_purge_returns_and_removes_the_file() {
     let deleting = path.clone();
     std::thread::spawn(move || {
       drop(held);
-      let removed = std::fs::remove_file(&deleting).map_err(|error| error.raw_os_error());
+      let removed = remove_through_drive(&deleting).map_err(|error| error.raw_os_error());
       let _ = done.send(removed);
     });
     let removed = finished.recv_timeout(WAIT_FOR);
@@ -1161,6 +1161,12 @@ const VERBATIM_DRIVE_UNITS: usize = 6;
 #[allow(clippy::disallowed_methods)]
 fn write_through_drive(path: &str, bytes: &[u8]) -> std::io::Result<()> {
   std::fs::write(path, bytes)
+}
+
+/// Removes a file through the mounted drive, as [`write_through_drive`] writes: a volume in RAM, never the disk (R1).
+#[allow(clippy::disallowed_methods)]
+fn remove_through_drive(path: &str) -> std::io::Result<()> {
+  std::fs::remove_file(path)
 }
 
 /// Makes a directory through the mounted drive, as [`write_through_drive`] writes.
