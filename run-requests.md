@@ -6813,3 +6813,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-shared A-732 git/svn sibling (main 7efceb67b): clippy + xtask; by use: restart a daemon over a large git repo (git/git) and a large svn repo; watchdog quiet, a clone/checkout answered once rebuilt
 
 - w-balance (2026-11-20, FOUND BY USE, update): 10 concurrent git/git v1.5.0 pushes to one repository END THE DAEMON (release 6526905e5 = main 6f9d93d21 + harness cap; `multi_repo_load.py ... v0.99 v1.0.0 v1.5.0 --steps 100 --per-repository-cap 10` on adas-mac-studio.local-2): 7 empty answers, 3 resets. Cap 5 and 3 survive. A-722's by-use proof must hold at 10 (earlier note said 19).
+- 2026-11-20 w-shared A-626 part 4 work verb (main 9e8e489d6): clippy + xtask (ipc WorkOp appended); the SDK/MCP/CLI builds (they match WorkOp by name, none exhaustively)

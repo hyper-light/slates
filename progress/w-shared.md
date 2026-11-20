@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-626 part 4 work verb 7fed9d428 (main 9e8e489d6). NOW: svn_made copy-from rows (pass the increment's
+  Copy ops (path=dest, src=source, at=version, REPLACE flag) from judge_submission; rows Add/Replace with copy_from; paths
+  beneath a dest compared to the source at its revision). Then A-697, A-658 3c.
+
 ## LANDED 2026-11-20: successor's sliced rebuild dae3f979e (main af3551739). NOW: A-626 part 4: WorkOp::Copy (client verb) over
   VolumeOp::Copy (merge increment.rs:184) / LoggedOp::Copy; then svn_made copy-from rows; A-697; A-658 3c.
 
