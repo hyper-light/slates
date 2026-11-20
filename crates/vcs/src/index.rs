@@ -245,6 +245,23 @@ pub struct Index {
   compacted_rows: u64,
   rule: Compaction,
   counters: IndexCounters,
+  /// The rows this index has taken in that it did not hold, by insert or adoption: what tells a fork whether its parent
+  /// changed since it was made ([`Index::adopt`]).
+  keys_added: u64,
+  /// For a fork, the runs it took from its parent (the first of its runs) and its parent's `keys_added` then.
+  forked: Option<(usize, u64)>,
+}
+
+/// Why a parent did not adopt a fork ([`Index::adopt`]), the fork handed back whole.
+#[derive(Debug)]
+pub enum AdoptRefused {
+  /// The parent took in rows since the fork was made, so a key of the fork's may be the parent's too: the fork's rows
+  /// are to be checked against the parent first (A-722's stale fork).
+  Stale(Box<Index>),
+  /// The index is no fork of this parent: it was made by no fork, or by one of another index.
+  NotAFork(Box<Index>),
+  /// Sealing the fork's tail was refused.
+  Refused(IndexRefused, Box<Index>),
 }
 
 /// A table, opened.
@@ -608,6 +625,7 @@ impl Index {
     self.tail_charged = self.tail_charged.saturating_add(charge);
     self.tail_bytes = self.tail_bytes.saturating_add(bytes);
     self.inserted = self.inserted.saturating_add(1);
+    self.keys_added = self.keys_added.saturating_add(1);
     Ok(())
   }
 
@@ -839,8 +857,38 @@ impl Index {
     Ok(Index {
       runs: self.runs.clone(),
       rule: self.rule.clone(),
+      forked: Some((self.runs.len(), self.keys_added)),
       ..Index::default()
     })
+  }
+
+  /// Takes in `fork`, a fork of this index, whole (A-722: a push's index rows staged in its own fork, then made the
+  /// repository's as the push lands): the fork's tail sealed into tables of its own, its holds on the runs it took from
+  /// this index given back, and its own runs added as this index's newest, holding what they held. It copies no row and
+  /// writes no table but its tail's, so it costs the fork's runs and one window of rows at most. Refused, with the
+  /// fork handed back, when this index took in any row since the fork was made (the fork's rows are to be checked
+  /// against it first) or the fork was made of no index; a refusal to seal leaves the tail sealed as far as it went.
+  pub fn adopt(&mut self, store: &mut ContentStore, mut fork: Index) -> Result<(), AdoptRefused> {
+    let Some((inherited, keys_added)) = fork.forked else {
+      return Err(AdoptRefused::NotAFork(Box::new(fork)));
+    };
+    if keys_added != self.keys_added || inherited > fork.runs.len() {
+      return Err(AdoptRefused::Stale(Box::new(fork)));
+    }
+    if let Err(refused) = fork.seal_rows(store, false) {
+      return Err(AdoptRefused::Refused(refused, Box::new(fork)));
+    }
+    let own = fork.runs.split_off(inherited);
+    for run in &fork.runs {
+      // The parent holds each of these tables still: this gives back the fork's own hold and its fences' charge.
+      let _ = release_run(store, run);
+    }
+    let added: u64 = own.iter().map(|run| run.rows).sum();
+    self.runs.extend(own);
+    self.keys_added = self.keys_added.saturating_add(added.max(1));
+    self.relearn(store);
+    self.restart();
+    Ok(())
   }
 
   /// Gives back everything the index holds: its tail rows' holds and charge, and its runs, each table freed giving back
