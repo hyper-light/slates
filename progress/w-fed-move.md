@@ -1,5 +1,13 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-20 ~12:30 PST: kiln LANDED main 64412a674 (commits 1e2ba19d6, 21b48bd62 + merges)
+- vendor/patches/slates/0004 = Slates A-756 (main had taken 0003 for its own Windows claim fix); vendor check: 4
+  recorded changes, 0 differences. Test: runners start together; disjoint words (FIRST=WRITE+REMOVE, SECOND=APPEND).
+- LOCAL release run 25 PASSED end to end (moved at ask 4; carried on in live-b's mount; old runner refuses write
+  attachment Busy(WriteLease); end took the mount down). Checks 10/10 on the landed tree.
+- This Studio's LAN address is now 192.168.1.88 (was .82 before the reboot).
+- Two-Mac run: ~/slates-work/w-fed-move-remote6.log (B=adas-mac-studio-2.local, C=adas-mac-studio-3.local).
+
 ## 2026-11-20 11:10 PST (after the Studio's 10:35 reboot)
 - Blocker 2 was NOT a Slates stall: current kiln leaves a moved agent whose turn was over idle on its new runner,
   waiting for its next message (hand-off goes with it); the test waited for a self-started hand-off turn. Test fixed
