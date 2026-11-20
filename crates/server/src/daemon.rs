@@ -4899,7 +4899,9 @@ async fn init_shard(
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
-    vcs_stores: crate::vcs_store::VcsStores::default(),
+    vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
+      crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
+    )),
     vcs_usage: slates_vcs::Ledger::new(config.clients_per_shard),
     #[cfg(unix)]
     hook_times: crate::vcs_hooks::HookTimesTable::default(),
