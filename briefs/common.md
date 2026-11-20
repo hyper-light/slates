@@ -95,6 +95,17 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
 - GAPS may name it only while that fix is in flight. Never write "owed" for a performance gap and move on.
 - A stopgap that shrinks a gap without bounding it is not the fix. Go straight to the bound.
 
+## DECISIONS BACKED BY DATA; MAKE DESIGNS BETTER (ADA 2026-11-20 ~06:45 PST)
+- Ada: "push back and make designs more robust, more performant, make your agents do A|B testing and back their decisions
+  with data." When a design choice affects performance or robustness, A/B the candidates on the real workload before
+  you build the rest:
+  - release binaries, interleaved runs, best of N with all N shown;
+  - the competitor's number where one exists (stock git daemon / hg serve / svnserve, FSFS), since goal 93's bar is
+    an order of magnitude faster;
+  - the numbers go in BENCHMARKS and the amendment.
+- Push back on main's rulings too, when data or a better design says so. w-perf's skip-delta for svn history replaced
+  main's reverse-delta cut that way.
+
 ## NEVER PAUSE ON A BLOCKER YOU CAN CLEAR (ADA 2026-11-20 ~02:40 PST)
 - Unsigned commits are fine. If a signer refuses (kiln's signer refuses non-kiln sessions), commit with
   `git -c commit.gpgsign=false commit ...`. Never stop to ask about signing.
