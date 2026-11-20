@@ -12290,6 +12290,9 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > call, the checks reading commits and trees back from the store, the push holding none of their bytes). Owed: the
 > convergence plan's S3 (A-722: blobs as the push work's file ops, the git store an index); admission by the working
 > set; the verdicts and the seal a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
+> Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
+> landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
+> revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
 mirrored).** One server serves tens of thousands of concurrent clones, many of one repository, so an answer is held to
@@ -56766,3 +56769,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `slates-cli` with `--no-deps`, main's `slates-git` holding a lint of its own).
 - **Applied in the same change to** §4.13's status (the Linux issuer surface owed since 2026-09-13), GAPS, the test
   harnesses' `PRINTS_ISSUER_SURFACE` and their words, amendments.tsv.
+
+### A-761 — Subversion's intake: texts streamed into a sink, then stored once by identity before the entry (2026-11-20, w-svn for UI goal 93; §4.17.1 "A push's intake", rules 1 to 3; main's ruling (B))
+
+- Part 1 (b5c4b8848): `commit::drive` applies each svndiff window into one window's room and hands it to a `TextSink`.
+- Part 2: `svn_commit::land_work` puts the sink's texts into the repository's content store a copy slice a turn, takes
+  `content_ticket`, awaits `content_durable` (A-727 slice b), then commits; the revision's record (version 2) names
+  each stored text by (identity, length) and the records keep only the reference. A refusal gives back every put text
+  (`Uncommitted::NotDurable`). Reads go green, store, records (`svn_texts::HeadTexts`); replay holds each stored identity
+  or refuses `SvnStored`. Held by `daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
+- **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.

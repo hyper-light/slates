@@ -2095,7 +2095,14 @@
 > `discard_staged`) landed first. Held by `a_text_larger_than_the_request_room_is_streamed_into_the_sink_and_accepted`
 > (a 1 MB text through a 256 KB room: red E210009 before). Owed: the server's sink over the green's staged blocks
 > (w-perf; until then `HeldTexts` keeps them in memory per connection), the revision's record and log reading the held
-> texts by identity (w-perf's c2, c3), and the by-use 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> texts by identity (w-perf's c2, c3), and the by-use 500 MB commit measured again. **Intake, part 2 (A-761, same day, w-svn, main's ruling (B)):**
+> a commit's texts go into the repository's content store (A-727's chunk arena), put from the sink a copy slice a turn
+> (`svn_commit::land_work`, `store_step`); the revision names each by (identity, length) (`Revision::stored`, record
+> version 2) and the records keep the reference, no bytes; the entry is appended only once the store answers the texts
+> durable (`vcs_store::content_durable`, A-727 slice b), a refusal giving every put text back (`NotDurable`); reads
+> find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity and
+> refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
+> Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
