@@ -179,7 +179,6 @@ pub fn no_such_transaction(transaction: &str) -> HttpAnswer {
 }
 
 /// One HTTPv2 transaction's drive (the module doc).
-#[derive(Debug)]
 pub struct DavCommit {
   /// The commit drive.
   drive: Drive,
@@ -193,6 +192,18 @@ pub struct DavCommit {
   tokens: u64,
   /// Whether the transaction has ended: refused, aborted or merged.
   over: bool,
+}
+
+impl std::fmt::Debug for DavCommit {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("DavCommit")
+      .field("transaction", &self.drive.pending().transaction)
+      .field("directories", &self.directories)
+      .field("added", &self.added)
+      .field("over", &self.over)
+      .finish_non_exhaustive()
+  }
 }
 
 impl DavCommit {
