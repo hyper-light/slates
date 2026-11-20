@@ -240,3 +240,10 @@
 - 2026-11-20 A-759 landed: part 1 088bf935b (children maps, listing O(live), children 3.84 -> 0.23 ms), part 2
   1417c0868 (cursor, 16 entries a step, 1.6-1.75 us a step; red 1,801). Main signalled
   (inbox/main-from-w-bugs-a759.md). Left: replay add_subdir whole listing; CI re-measure waits on w-perf's S4 c2 fix.
+- 2026-11-20 A-759 part 3 landed 7d2b45174 (replay add_subdir through the cursor, red 10,000 -> 16). Reported to
+  main: vcs_ssh svnserve_t commit test red on clean main 359da2388, suspect 28e57ac18 (durable texts). Next: CI
+  rerun after w-perf's S4 c2 fix, then the next open bug.
+- 2026-11-20 next-bug triage (main: "the next open bug in your goal's list"): none left in my lane that use found and
+  no one owns. verify_current and the NFS purge are already fixed (bug-claims.md struck); the completion record's
+  framing is g262's; the svnserve_t red is A-761's (w-svn told). The jupiter fleet six are filed in run-requests.md.
+  Asked main which to take.

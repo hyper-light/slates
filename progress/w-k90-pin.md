@@ -60,3 +60,10 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   vendored.rs crate->project map, agentic.md 721/884 naming Slates' own CLI beside the library call kiln makes.
   workspace/slates.rs: "command line" only in comments/test text; `which` only for systemd-run -> replaced, not layered.
 - w-k90-win: windows (Slates tests) job in ci.yml (842cc2c2f); watching run 44784299374 (job 136462100187).
+- GitHub run 44790740630 (ca1a0302e) was cancelled before any job ran (concurrency: one pending per group; main's pushes
+  cancel the pending one). Run 44784299374 (0a17f46e5): Clippy fails on every lane -> each `build` job red regardless.
+- LANDED kiln main 83a03cd1a..715063153 (merge-base confirmed): ci.yml job `slates` (ubuntu-latest, ubuntu-24.04-arm,
+  macos-latest, windows-11-arm; no clippy): build, `--lib -- workspace::slates`, `--test vendored --test slates_roles`;
+  Slates step taken back out of `build`. Windows x86-64 = w-k90-win's windows-slates job.
+- Poller: ~/kiln-work/w-k90-pin-logs/poll2.sh 715063153 (first completed, non-cancelled main run containing it).
+- Goal on my kiln stack: 01a1fa367d4c (plan 01a1fa36 step 1): goals_done with commit + run ids per platform + base.

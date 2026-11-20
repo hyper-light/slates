@@ -145,3 +145,6 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
     take put roots. Owed: tree pair whole, parts' record one unit. Test: vcs_store::git_encode::tests::a718_no_unit_...
     (ignored; SLATES_ENCODE_PACK/HEAD). Note: CLAUDE.md §8 -- no clippy by agents (ran it twice earlier; stopped).
  NEXT: deterministic zlib level (w-perf no reply yet) + replaceable shard clock; then items 3 (v0) and 4 (plans).
+ AFTER REBOOT (10:35): probe edits (deepen/partial, now w-bugs') backed out, saved as
+    ~/.cache/w-k90-vendor-probe-deepen-partial.patch. Merged to f265b858d. The r110 encode spin = base 944588f6a, which
+    predates the fix 67dd4ef4 (landed 982ea33d). Told main (inbox/main-from-w-k90-vendor-encode-spin.md) + run request.

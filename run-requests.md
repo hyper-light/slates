@@ -6833,3 +6833,21 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-shared A-697 rebase+copies (main b279ba52c): clippy + xtask (server verbs replica_rebase/compose_on_replica/rebase_answer); Linux run of `cargo test -p slates-server --test fleet a_holders_work` (red: rebase not Rebased at 2, or the copy not committed as version 2).
 - 2026-11-20 w-shared A-697 node-verb authority (main b0ececd09): clippy + xtask (server verbs serve_forward check, node_verb_work); Linux run of `cargo test -p slates-server --lib verbs::tests::a_works_floor_is_moved_by_the_member_its_id_names_alone` (red: another member's floor dropped).
 - 2026-11-20 w-shared A-697 part e2 (main e261100c1): clippy + xtask (db PendingCreationRecord.green: log schema hash moves; server work_home hold_for_release/release_admissions/start_release/released, Daemon::work_floors_of); Linux run of `cargo test -p slates-server --test fleet a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner` (red: A's floor never released) and `cargo test -p slates-db --lib --test alias`.
+- 2026-11-20 w-shared AUD-11 forwarded completion (main 2eca76a9b): clippy + xtask (server merge_service await_forwarded/ForwardedAcceptance/AwaitingAcceptance.forwarded, xshard awaited/answer_awaited, verbs await_deferred_completion, phase counters); Linux run of `cargo test -p slates-server --test fleet a_forwarded_submit` (red: best answer >= 100 ms or the attached/answered counters not 3).
+
+## w-bugs, 2026-11-20 (base 7d2b45174): the GAPS "six fleet tests fail on jupiter" open bug, re-run before it's chased
+- **Platform:** jupiter (Windows x86_64), current main, and the same on CI's windows-latest as the control.
+- **Command** (each test alone, one at a time; `-p slates-server --test fleet`):
+  `cargo test -p slates-server --test fleet -- --exact --test-threads 1 <name>` for
+  `a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor`,
+  `an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green`,
+  `a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region`,
+  `a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_and_promoted`,
+  `a_settled_fleet_admits_a_create_on_every_node`,
+  `a_slow_first_round_candidate_is_hedged_after_the_measured_p95`.
+- **Red would look like** (GAPS 4967, 2026-11-06/07): holders never recomputing version 3 (1,015-1,685 s), the mirror
+  lag never reaching 0, a 2.2 GB allocation abort (0xC0000409, every in-process daemon sizing itself from the whole
+  machine), `BudgetExceeded { available: 44252790784 }` on 3 of 5 nodes, a hedged seal placed after 20.57 s.
+- **Why:** it's the one open item on w-bugs' list that was found by use and isn't another agent's; the rest are
+  reading-found (unchased by rule) or owned elsewhere. The record is two weeks old. I'll take whichever still fails,
+  failing test first; if none does, the GAPS entry gets struck with this run's numbers.
