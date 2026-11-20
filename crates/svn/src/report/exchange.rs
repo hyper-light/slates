@@ -262,7 +262,7 @@ impl Exchange {
   ) -> Result<Opened, Refused> {
     Ok(match Reporter::begin(context, request, out)? {
       Begun::Reporting(reporter) => Opened::Reporting(Box::new(Self {
-        phase: Phase::Reporting(Box::new(reporter)),
+        phase: Phase::Reporting(reporter),
         capabilities: context.session.capabilities,
         uuid: context.session.uuid.clone(),
         item_bytes: context.item_bytes,

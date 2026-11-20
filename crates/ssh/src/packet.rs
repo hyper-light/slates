@@ -428,15 +428,7 @@ struct Shape {
 /// The shape of a packet carrying `payload_len` bytes under `cipher` (none in the clear), or none if it would pass
 /// [`MAX_PACKET_EVERY_PEER_ACCEPTS`].
 fn layout(cipher: Option<Cipher>, payload_len: usize) -> Option<Shape> {
-  let alignment = cipher.map_or(CLEAR_ALIGNMENT, Cipher::alignment);
-  let length_padded = if cipher.is_some() { 0 } else { LENGTH_LEN };
-  let aligned = payload_len.checked_add(1)?.checked_add(length_padded)?;
-  let short = alignment.checked_sub(aligned.checked_rem(alignment)?)?;
-  let padding = if short < MIN_PADDING {
-    short.checked_add(alignment)?
-  } else {
-    short
-  };
+  let padding = padding_for(cipher, payload_len)?;
   let packet_length = payload_len.checked_add(1)?.checked_add(padding)?;
   let tag = if cipher.is_some() { TAG_LEN } else { 0 };
   let size = packet_length.checked_add(LENGTH_LEN)?.checked_add(tag)?;
@@ -452,6 +444,20 @@ fn layout(cipher: Option<Cipher>, payload_len: usize) -> Option<Shape> {
     padding: u8::try_from(padding).ok()?,
     blocks,
   })
+}
+
+/// The padding a packet carrying `payload_len` bytes under `cipher` needs: enough to align the packet to the
+/// cipher's block, and never less than [`MIN_PADDING`].
+fn padding_for(cipher: Option<Cipher>, payload_len: usize) -> Option<usize> {
+  let alignment = cipher.map_or(CLEAR_ALIGNMENT, Cipher::alignment);
+  let length_padded = if cipher.is_some() { 0 } else { LENGTH_LEN };
+  let aligned = payload_len.checked_add(1)?.checked_add(length_padded)?;
+  let short = alignment.checked_sub(aligned.checked_rem(alignment)?)?;
+  if short < MIN_PADDING {
+    short.checked_add(alignment)
+  } else {
+    Some(short)
+  }
 }
 
 /// Appends the plain packet: length, padding length, payload, random padding.

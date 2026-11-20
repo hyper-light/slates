@@ -60,7 +60,7 @@ impl Session {
   }
 
   /// Moves the server's output to the client; whether there was any.
-  fn to_client(&mut self) -> bool {
+  fn send_to_client(&mut self) -> bool {
     let out = self.server.pending_output().to_vec();
     self.server.consume_output(out.len());
     self.transcript.extend_from_slice(&out);
@@ -70,7 +70,7 @@ impl Session {
 
   /// Passes `input` to the server, taking its events and moving its output whenever it waits on them. A server that
   /// takes nothing, raises nothing and writes nothing ends the pass, and the test's own checks then fail.
-  fn to_server(&mut self, input: &[u8]) -> Result<(), Refusal> {
+  fn send_to_server(&mut self, input: &[u8]) -> Result<(), Refusal> {
     let mut rest = input;
     let mut stalls = 0u32;
     while !rest.is_empty() && !self.server.is_closed() {
@@ -81,7 +81,7 @@ impl Session {
         self.events.push(event);
         moved = true;
       }
-      if !moved && (!self.to_client() || stalls > 10_000) {
+      if !moved && (!self.send_to_client() || stalls > 10_000) {
         break;
       }
       stalls += u32::from(!moved);
@@ -92,12 +92,12 @@ impl Session {
   /// Moves bytes both ways until neither side sends anything, within a bound no test reaches.
   fn pump(&mut self) -> Result<(), Refusal> {
     for _ in 0..1_000 {
-      let sent = self.to_client();
+      let sent = self.send_to_client();
       let input = self.client.take_output();
       if !sent && input.is_empty() {
         return Ok(());
       }
-      self.to_server(&input)?;
+      self.send_to_server(&input)?;
     }
     Ok(())
   }
@@ -234,11 +234,11 @@ fn serves_both_ways(session: &mut Session) {
 fn the_transport_is_established_by_the_clients_newkeys() {
   let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, true));
   let first = session.client.take_output();
-  session.to_server(&first).unwrap();
+  session.send_to_server(&first).unwrap();
   let before = session.server.is_established();
-  session.to_client();
+  session.send_to_client();
   let init = session.client.take_output();
-  session.to_server(&init).unwrap();
+  session.send_to_server(&init).unwrap();
   let known = (
     session.server.session_id().is_some(),
     session.server.is_established(),
@@ -306,10 +306,13 @@ fn strict_refuses_a_message_before_the_kexinit() {
   let mut input = first[..line_end].to_vec();
   input.extend_from_slice(&clear_packet(&[2, 0, 0, 0, 0]));
   input.extend_from_slice(&first[line_end..]);
-  assert_eq!(session.to_server(&input), Err(Refusal::KexInitNotFirst));
+  assert_eq!(
+    session.send_to_server(&input),
+    Err(Refusal::KexInitNotFirst)
+  );
   assert!(session.server.is_closed());
   assert_eq!(session.server.disconnect_sealed(), Some(true));
-  session.to_client();
+  session.send_to_client();
   assert_eq!(disconnect_reason(session.last_received()), 2);
 }
 
@@ -322,7 +325,7 @@ fn strict_refuses_a_message_inside_the_first_exchange() {
   for strict in [true, false] {
     let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, strict));
     let first = session.client.take_output();
-    session.to_server(&first).unwrap();
+    session.send_to_server(&first).unwrap();
     session.client.send(&[2, 0, 0, 0, 0]);
     let outcome = session.pump();
     if strict {
@@ -340,23 +343,23 @@ fn strict_refuses_a_message_inside_the_first_exchange() {
 fn exchange_messages_out_of_place_are_refused() {
   let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, true));
   let first = session.client.take_output();
-  session.to_server(&first).unwrap();
-  session.to_client();
+  session.send_to_server(&first).unwrap();
+  session.send_to_client();
   let init = session.client.take_output();
   let mut twice = init.clone();
   twice.extend_from_slice(&init);
   assert_eq!(
-    session.to_server(&twice),
+    session.send_to_server(&twice),
     Err(Refusal::Unexpected { number: 30 })
   );
 
   let mut session = Session::new(config(), ClientOptions::openssh_like(GCM, false));
   let first = session.client.take_output();
-  session.to_server(&first).unwrap();
+  session.send_to_server(&first).unwrap();
   session.client.send(&[21]);
   let early = session.client.take_output();
   assert_eq!(
-    session.to_server(&early),
+    session.send_to_server(&early),
     Err(Refusal::Unexpected { number: 21 })
   );
 }
@@ -370,7 +373,7 @@ fn services_are_accepted_once_and_only_ssh_userauth() {
   session.pump().unwrap();
   session.client.send(&service_request("ssh-connection"));
   assert_eq!(session.pump(), Err(Refusal::ServiceNotAvailable));
-  session.to_client();
+  session.send_to_client();
   assert_eq!(disconnect_reason(session.last_received()), 7);
 
   let mut session = Session::serving(config(), ClientOptions::openssh_like(CHACHA, true));
@@ -437,7 +440,7 @@ fn a_client_sharing_no_cipher_is_refused() {
       List::CipherClientToServer
     )))
   );
-  session.to_client();
+  session.send_to_client();
   assert_eq!(disconnect_reason(session.last_received()), 3);
 }
 
@@ -447,16 +450,16 @@ fn a_client_sharing_no_cipher_is_refused() {
 fn a_small_order_client_key_is_refused() {
   let mut session = Session::new(config(), ClientOptions::classical(CHACHA, true));
   let first = session.client.take_output();
-  session.to_server(&first).unwrap();
+  session.send_to_server(&first).unwrap();
   let mut init = vec![30];
   put_string(&mut init, &[0; 32]);
   session.client.send(&init);
   let bad = session.client.take_output();
   assert_eq!(
-    session.to_server(&bad),
+    session.send_to_server(&bad),
     Err(Refusal::Kex(KexRefusal::SharedSecretRejected))
   );
-  session.to_client();
+  session.send_to_client();
   assert_eq!(disconnect_reason(session.last_received()), 3);
 }
 
@@ -471,10 +474,10 @@ fn a_forged_packet_is_refused_with_mac_error() {
     let middle = forged.len() / 2;
     forged[middle] ^= 0x04;
     assert_eq!(
-      session.to_server(&forged),
+      session.send_to_server(&forged),
       Err(Refusal::Packet(PacketRefusal::TagMismatch))
     );
-    session.to_client();
+    session.send_to_client();
     assert_eq!(disconnect_reason(session.last_received()), 5);
   }
 }
@@ -656,11 +659,11 @@ fn a_client_that_never_rekeys_exhausts_its_key() {
 fn input_waits_while_an_event_does() {
   let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, true));
   let first = session.client.take_output();
-  session.to_server(&first).unwrap();
-  session.to_client();
+  session.send_to_server(&first).unwrap();
+  session.send_to_client();
   let init = session.client.take_output();
-  session.to_server(&init).unwrap();
-  session.to_client();
+  session.send_to_server(&init).unwrap();
+  session.send_to_client();
   session.client.send(&service_request("ssh-userauth"));
   let both = session.client.take_output();
   let used = session.server.receive(&both, 0).unwrap();
@@ -689,8 +692,8 @@ fn input_waits_while_the_output_is_full() {
   assert!(used < flood.len());
   assert!(session.server.pending_output().len() >= MAX_PACKET_EVERY_PEER_ACCEPTS);
   assert_eq!(session.server.send(&[94], 0), Err(SendRefusal::OutputFull));
-  session.to_server(&flood[used..]).unwrap();
-  session.to_client();
+  session.send_to_server(&flood[used..]).unwrap();
+  session.send_to_client();
   assert_eq!(
     session
       .client
@@ -795,13 +798,13 @@ fn bad_hybrid_values_end_the_exchange() {
   for (init, refusal) in cases {
     let mut session = Session::new(config(), ClientOptions::openssh_like(CHACHA, true));
     let first = session.client.take_output();
-    session.to_server(&first).unwrap();
+    session.send_to_server(&first).unwrap();
     let mut message = vec![30];
     put_string(&mut message, &init);
     session.client.send(&message);
     let bad = session.client.take_output();
-    let outcome = session.to_server(&bad);
-    session.to_client();
+    let outcome = session.send_to_server(&bad);
+    session.send_to_client();
     assert_eq!(
       (outcome, disconnect_reason(session.last_received())),
       (Err(Refusal::Kex(refusal)), 3)

@@ -87,6 +87,9 @@ pub type Revision = u64;
 /// A content identity: the BLAKE3 digest the green names content by (§4.11).
 pub type ContentIdentity = [u8; 32];
 
+/// A property list as pairs: each property's name and value, in the list's order.
+pub type PropertyPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// The root directory's path, the one path with no parent.
 /// Format: Subversion's canonical absolute path of the root (`svn_fspath__is_canonical`).
 const ROOT: &str = "/";

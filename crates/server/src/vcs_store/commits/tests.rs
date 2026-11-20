@@ -275,7 +275,7 @@ fn recorded(state: &ShardState, repository: RepositoryId, skip: usize) -> Vec<Re
     .skip(skip)
     .map(|bytes| {
       let record = Record::decode(bytes, FORMAT).expect("a record");
-      let kinds = record.objects.iter().map(|object| object.kind).collect();
+      let kinds = record.names.iter().map(|name| name.0).collect();
       (record.moves, kinds)
     })
     .collect()

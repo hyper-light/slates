@@ -815,31 +815,22 @@ fn a_comment_is_outdated_when_its_file_is_renamed_onto_unlinked_or_renamed_away(
   }
 }
 
-/// A-596. Do: ask a green to follow a comment past its head, backward, from a version below its fold floor, on a range
-/// that is not whole lines, on a file absent at the comment's version, and on a path no change ever touched. Expect
-/// each refused by its kind (`PastHead` with the head, `Backward`, `Folded` with the floor, `NotLines`), and a whole-lines
-/// range on the untouched path moved where it stood.
-#[test]
-fn a_comment_is_refused_past_the_head_backward_below_the_floor_or_off_whole_lines() {
-  let mut green = green_of(b"zero\none\ntwo\n", b"other\n");
-  let range = line_range(b"zero\none\ntwo\n", 1, 1).unwrap();
+/// Three versions of the refusal test's green, each inserting a line at the start of its file.
+fn insert_a_line_three_times(green: &mut Green) {
   for id in 1..=3u8 {
     let work = one(OpKind::Insert, FILE, 0, 2, b"x\n");
     assert_eq!(
-      submit(&mut green, work, u64::from(id) - 1, id),
+      submit(green, work, u64::from(id) - 1, id),
       Outcome::Accepted {
         version: u64::from(id)
       }
     );
   }
-  assert_eq!(
-    green.reanchor(FILE, range, (0, 4)),
-    Err(ReanchorRefused::PastHead { head: 3 })
-  );
-  assert_eq!(
-    green.reanchor(FILE, range, (2, 1)),
-    Err(ReanchorRefused::Backward)
-  );
+}
+
+/// A range not of whole lines, and a file absent at the comment's version, each refused `NotLines`; a whole-lines range
+/// on the untouched path moved where it stood.
+fn refused_off_whole_lines(green: &mut Green, range: Range) {
   assert_eq!(
     green.reanchor(FILE, Range::new(6, 3), (0, 3)),
     Err(ReanchorRefused::NotLines)
@@ -856,6 +847,26 @@ fn a_comment_is_refused_past_the_head_backward_below_the_floor_or_off_whole_line
     green.reanchor(OTHER, Range::new(0, 3), (0, 3)),
     Err(ReanchorRefused::NotLines)
   );
+}
+
+/// A-596. Do: ask a green to follow a comment past its head, backward, from a version below its fold floor, on a range
+/// that is not whole lines, on a file absent at the comment's version, and on a path no change ever touched. Expect
+/// each refused by its kind (`PastHead` with the head, `Backward`, `Folded` with the floor, `NotLines`), and a whole-lines
+/// range on the untouched path moved where it stood.
+#[test]
+fn a_comment_is_refused_past_the_head_backward_below_the_floor_or_off_whole_lines() {
+  let mut green = green_of(b"zero\none\ntwo\n", b"other\n");
+  let range = line_range(b"zero\none\ntwo\n", 1, 1).unwrap();
+  insert_a_line_three_times(&mut green);
+  assert_eq!(
+    green.reanchor(FILE, range, (0, 4)),
+    Err(ReanchorRefused::PastHead { head: 3 })
+  );
+  assert_eq!(
+    green.reanchor(FILE, range, (2, 1)),
+    Err(ReanchorRefused::Backward)
+  );
+  refused_off_whole_lines(&mut green, range);
   assert_eq!(
     green.reanchor(FILE, range, (0, 3)),
     Ok(Reanchored::Moved(Range::new(11, 4)))

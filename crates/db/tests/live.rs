@@ -1331,6 +1331,32 @@ impl Run {
     {
       self.reconfigure();
     }
+    self.deliver_until_converged();
+    if !self.converged() {
+      self.note(|| self.convergence_state());
+    }
+    assert!(
+      self.converged(),
+      "Convergence: live holders never caught up"
+    );
+    let owner = &self.owners[self.current];
+    for (position, value) in &self.durable {
+      assert_eq!(
+        owner.state.get(usize::try_from(*position).unwrap()),
+        Some(value),
+        "NoLoss at the end: durable position {position}"
+      );
+    }
+    // ReadSafety, judged after every step and every delivery here, is reported last, so a history another check breaks
+    // is named by that check.
+    if let Some(broken) = self.read_safety_broken.take() {
+      panic!("{broken}");
+    }
+  }
+
+  /// Delivers the network's messages, the daemon's period after each, until the live holders converge or the budget
+  /// runs out.
+  fn deliver_until_converged(&mut self) {
     // Messages of superseded owners are still delivered: they must change nothing. The budget covers the backlog in
     // flight at the heal on top of the steps to converge: a run whose candidates changed often heals with thousands of
     // re-sends in flight (6,160 in one f = 2 run), which a bare 10,000 never drained.
@@ -1353,26 +1379,6 @@ impl Run {
       if self.converged() {
         break;
       }
-    }
-    if !self.converged() {
-      self.note(|| self.convergence_state());
-    }
-    assert!(
-      self.converged(),
-      "Convergence: live holders never caught up"
-    );
-    let owner = &self.owners[self.current];
-    for (position, value) in &self.durable {
-      assert_eq!(
-        owner.state.get(usize::try_from(*position).unwrap()),
-        Some(value),
-        "NoLoss at the end: durable position {position}"
-      );
-    }
-    // ReadSafety, judged after every step and every delivery here, is reported last, so a history another check breaks
-    // is named by that check.
-    if let Some(broken) = self.read_safety_broken.take() {
-      panic!("{broken}");
     }
   }
 
