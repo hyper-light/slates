@@ -70,3 +70,13 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - NEXT (P2b+P3): server side. Per shard: claims from vcs_usage rows + held bytes (objects_charged, store) -> divide
   over [admittable room, step-ns per period]; admission by share in git_push::push_room / upload room; typed
   ShareExceeded in git's words; floor fast path counted.
+- P3a LANDED main 08b440739 (merge-base checked; pushed as f2a3a04fa after re-running focused tests on the merged
+  tree, since the merge touched git_push.rs). crate::vcs_share (room, Live, Bound, Room; counters vcs_share.fast /
+  divided / narrowed). Seam proposal to w-git: inbox/w-git-from-w-balance.md (A-722 checks vcs_share::room, carries
+  Bound into its typed refusal; share words). Found (pre-existing on main b0655e8a3, reported, not chased):
+  vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it panics "a step
+  that waits".
+- Gotcha: a second worktree built into my target dir left stale slates-vcs artifacts (E0432 on new exports); touching
+  the crate's files fixed it. Prefer not to share the target across worktrees.
+- NEXT: P3b (once w-git answers or A-722 lands): share words per tool; hg/svn intakes Live; backpressure. Meanwhile P4
+  cold trigger design.
