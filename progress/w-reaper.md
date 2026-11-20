@@ -18,6 +18,8 @@
   1/1, idle 5/5, vfs seal 5/5, fmt.
 - Tick-name cleanup (main's last piece, no A-number) LANDED: main 4c6445f (merged ae70481). Docs/names in bridge-core,
   vfs, server, cli; test renamed the_formation_check_allows_every_idle_sweep_event; bench IDLE_TICKS -> IDLE_PAUSE_NS.
+- Follow-up (own initiative, no A-number) LANDED: main 00b9e79 (22345f7): deadlines/landing/nfs keeper tests no longer
+  sleep out the deleted reap loop's first look (PAST_THE_FIRST_LOOK_NS gone); 4/4 in 1.55 s.
 - QUEUE DONE: 1 (A-475, on main from g255), 2 (A-522..A-570 g255; A-709, A-715 w-reaper), 3 (A-715 deleted the tick).
 - Finding (read, not chased): a start's free-content/recovery give-back (3.2 GB on the Studio) is interrupted by the
   control shard's 100 ms heartbeat every pass, so it takes ~10 passes (one an interval) -- same pace as the old tick.
