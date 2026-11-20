@@ -10157,6 +10157,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
 
+> **Status (2026-11-20, A-779: a newer presentation supersedes the older).** A presentation of a volume into a target,
+> by any client, supersedes every earlier one of that volume and target still awaiting its grant: each leaves
+> `AwaitingGrant` for `Superseded`, naming the newer (`Op::LandingSuperseded`), drops off the session log (A-773), and a
+> grant of it is refused `LandingSuperseded { newer }`, so an older state never lands over a newer one. Nothing expires
+> on a clock (R3). A granted landing's presentation kept for its resume is not superseded. The session log lists only
+> the presentations a grant can still take, read from the shard's held presentations.
+
 **Special names (A-26).** A landing containing FIFO/socket creation refuses before its
 first host write. The current grant authorizes filesystem content, not new host IPC endpoints.
 No copy-up, hashing, archive or landing step opens a host special file as regular content. A landing containing a
@@ -57672,3 +57679,21 @@ volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardSt
   main: given up after 23 attempts waiting on its live, unserved through the serve deadline; after: judged afresh once,
   served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
   fleet tests unchanged.
+
+### A-779 — A newer presentation of a volume into a target supersedes the older, whose grant is refused by kind (2026-11-20, w-sessionlog; main's ruling 15:20 PST; §4.15 steps 2–3; AUD-29-07, A-773, R3, R10)
+Until A-779 only the same client's re-presentation replaced its earlier one, in the shard's memory alone: the earlier
+record still read `AwaitingGrant` (so the session log listed it), and another client's re-presentation left it
+grantable. Now any presentation of the same volume into the same target supersedes the earlier ones awaiting a grant:
+`Op::LandingSuperseded { id, by }` moves each record to `LandingState::Superseded` with `superseded_by` (both
+appended), the partition's waiting index drops it, and `grant` answers `Refusal::LandingSuperseded { newer }`
+(`slates_api::Stale::Superseded`). The session log reads the shard's held presentations, which are exactly the
+grantable ones (an abandoned one, AUD-29-07, is not there either). No clock expires a presentation (R3).
+Applied in the same change to: §4.15 (a status line), GAPS (A-773's owed presentation item closed), `crates/db`
+(`Superseded`, `superseded_by`, `Op::LandingSuperseded`, its model step), `crates/ipc` (`LandingStage::Superseded`,
+`Refusal::LandingSuperseded`, tags published), `crates/api` (`Stale::Superseded`, `LandingStage::Superseded`),
+`crates/server` (`superseded_by_presentation`, the grant's refusal, the log's source), `crates/server/tests/
+presentations.rs` (the replaced presentation is refused by kind).
+Evidence: `cargo test --locked -p slates-server --test session_log` 2 passed, the new
+`a_newer_presentation_supersedes_the_older_whose_grant_is_refused` red with the supersede disabled (`Refused(NotFound)`)
+and green with it; `--test presentations` 10 passed; `-p slates-db --test model every_recovery` 2 and `--test
+wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe` 2 (macOS arm64, this Mac, local).

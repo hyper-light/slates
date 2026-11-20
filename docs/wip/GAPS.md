@@ -63,7 +63,8 @@
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. Owed: identical submissions told apart from accepted ones (a field on the submit's reply), the
-> MCP tool and the SDKs' read, and a presentation never granted stays listed (no presentation expires yet).
+> MCP tool and the SDKs' read. A-779 closed the stale presentation: a newer one of the same volume into the same target
+> supersedes it (typed refusal, off the log), and the log lists only grantable presentations.
 
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
