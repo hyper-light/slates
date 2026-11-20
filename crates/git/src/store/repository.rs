@@ -1891,18 +1891,13 @@ impl Repository {
     Ok((version, self.sets(store, green, version)?.reached))
   }
 
-  /// The encoder's learned rules, this repository's own, with the owner's clock and exchange.
-  pub(super) fn learning<'a>(
-    &'a mut self,
-    exchange: Exchange,
-    clock: &'a mut dyn Clock,
-  ) -> Learning<'a> {
+  /// The encoder's learned rules, this repository's own, with the owner's exchange (its measured rates among it).
+  pub(super) fn learning(&mut self, exchange: Exchange) -> Learning<'_> {
     Learning {
       window: &mut self.window,
       levels: &mut self.levels,
       depth: self.depth.limit(),
       exchange,
-      clock,
     }
   }
 

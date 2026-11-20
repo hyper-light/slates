@@ -69,7 +69,16 @@ impl Clock for Ticks {
 }
 
 /// Shape: the exchange a test's turns judge by, a saved byte worth a nanosecond.
-const EXCHANGE: Exchange = Exchange { ns: 1, bytes: 1 };
+/// Shape: the tests' exchange, a nanosecond a byte, and fixed rates (A-718: the encoder's time is the measured rates',
+/// never a clock's), each level a nanosecond a KiB dearer than the one before.
+const EXCHANGE: Exchange = Exchange {
+  ns: 1,
+  bytes: 1,
+  rates: crate::store::learn::Rates {
+    deflate_ns_per_kib: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    search_ns_per_kib: 1,
+  },
+};
 
 /// Shape: a turn long enough for many units of work, as the tests' clock counts.
 const LONG_TURN: u64 = 1 << 20;

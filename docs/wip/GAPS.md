@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
+> buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
+> only a ceiling. **A-765 BUILT:** an idle shard's prefault reserve (A-214) decays: the last burst whole for one sweep
+> interval, then halved each interval (`daemon::decayed_reserve`); before, the burst was held whole for as long as the
+> shard stayed idle (macOS arm64, Studio-4: a 64 MiB burst still reserved whole after 20 s idle; after, 0 and 234 MB
+> given back). **Measure the footprint on macOS, not RSS:** a given-back page of a shared object leaves the footprint
+> but stays in RSS and vmmap's resident until the kernel wants it (a 64 MiB `shm_open` probe: footprint 64 -> 0 MiB,
+> RSS 64 -> 64); `slates_machine::facts::resident_now`, which the pressure hold's own growth reads, is RSS (open).
+> **Open, by size:**
+> `reserve_per_shard` = memory / shards / 3 sizes each shard's slice of the content object (write log R/4, image slots
+> 2R, delta log R, arena R: about 1.4 times the machine's memory of address space, ~220 GB on the 96 GB Studio, g226),
+> the reserve's ceiling, the DAX table, the client and fleet shares; the sweep of every sizing site follows here.
+>
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
 > shard). **Closed quiet by A-400** (a work on its client's shard): Linux arm64 accept p50 51–55 → 20–21 µs (before W1
@@ -370,6 +383,9 @@
 > kept fragments made again after a recovery without a fetch paying; the parts' bytes an encoding holds between turns
 > charged; a pair of trees read whole and the parts' record in one unit. Each other unit is a window's work at most
 > (w-k90-vendor, 2026-11-20: the 56 MB git/git v2.0.0 push's encoding had spun the shard 3.5 s in one object's unit).
+> The level and the window are chosen from the bytes saved and the machine's rates measured once a process
+> (`learn::Rates`), not timed per object: one input, one output. OWED: the release A/B on git/git; a deployment's rates
+> shared by its nodes.
 >
 > **A-654 (2026-11-19, g258; git's push end to end).** Part 1 BUILT (slates-git): a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). Part 2 BUILT: the server's driver `crates/server/src/git_push.rs`, one entry point for both edges (`ReceivePack::start`, `input`, `end`, `answer`, each one step on the owner shard): the advertisement of each branch whose green holds a git head (namespace name `N` is `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under A-622's policy hidden; input and end over A-638's index view lent the shard's room (`vcs_store::with_room`); a configured git hook refusing every command `hook not run` until A-665 part 2's view; the checked objects admitted to A-662's quarantine and sealed; each command asked of A-622's policy through A-644 part 2's check point (`git_protect`: the right its change needs, then a protected name's linear history and signed commits on what it brings) before its work is built, refused in git's words; A-654 part 1's verdicts over the shard's greens, a ref's base its green's head alone, held at the append by compare and swap; `push_sealed` per entry, or once for all under `atomic`; git's report. Part 3 BUILT: git's HTTP site serves receive-pack through the driver (`vcs_http::git::receive`: each service from its own half, each step lent the state of the shard the connection moved to, a failure before any reply a status, a command's refusal the report's), proven by stock git's `create` push over loopback TLS to a daemon. The SSH site's call BUILT (A-683: `vcs_ssh::receive`, each step lent the shard's state through the HTTP site's seam, `ShardLender`). OWED: the live `git push` over HTTPS and over SSH with stock git's binary (main's runs); the hooks run over A-665 part 2's view (`pre-receive`, `update`, `post-receive`); a push based on an older version than its green's head, refused as a ref that moved until A-664's server-made commits; a principal the policy allows who is not the owner, whom A-635's append refuses `Forbidden`; push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8); a tag of a tag; a create while the default branch is unborn and holds files no commit names (A-664's).
 >

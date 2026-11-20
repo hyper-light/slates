@@ -25,16 +25,32 @@ mkdir -p "$HOME" "$WORK/config"
 FAILED=0
 ROWS=()
 # row NAME COMMAND...: runs COMMAND within STEP_LIMIT seconds, records PASS/FAIL and its seconds, keeps its output.
+# daemon_rss: the resident KiB of this instance's daemon (0 while none runs), as ps reports it.
+daemon_rss() {
+  ps -axo rss=,command= 2>/dev/null | grep -F -- "--instance $INSTANCE daemon" | grep -v grep | awk '{s+=$1} END {print s+0}'
+}
+# RSS_PERIOD: seconds between a row's samples of the daemon's resident memory (default 1). Each row's peak is printed
+# with it (rss=), and the whole run's after the summary, so a matrix records the memory each phase takes; where ps
+# cannot list the daemon (Git Bash on Windows) every figure reads 0.
+RSS_PERIOD=${RSS_PERIOD:-1}
+RUN_PEAK_KIB=0
 row() {
   local name=$1; shift
-  local log="$WORK/logs/$name.log" start end code
+  local log="$WORK/logs/$name.log" peak="$WORK/logs/$name.rss" start end code sampler kib
   mkdir -p "$WORK/logs"
   start=$(date +%s)
+  daemon_rss >"$peak"
+  ( top=0; while :; do now=$(daemon_rss); [ "$now" -gt "$top" ] && { top=$now; echo "$top" >"$peak"; }
+    sleep "$RSS_PERIOD"; done ) &
+  sampler=$!
   perl -e 'alarm shift; exec @ARGV or exit 127' "$STEP_LIMIT" "$@" >"$log" 2>&1
   code=$?
   end=$(date +%s)
-  if [ "$code" -eq 0 ]; then ROWS+=("PASS $name $((end - start))s"); else
-    ROWS+=("FAIL $name $((end - start))s exit=$code: $(tail -3 "$log" | tr '\n' ' ' | cut -c1-300)")
+  kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
+  kib=$(cat "$peak" 2>/dev/null || echo 0)
+  [ "$kib" -gt "$RUN_PEAK_KIB" ] && RUN_PEAK_KIB=$kib
+  if [ "$code" -eq 0 ]; then ROWS+=("PASS $name $((end - start))s rss=$((kib / 1024))MiB"); else
+    ROWS+=("FAIL $name $((end - start))s rss=$((kib / 1024))MiB exit=$code: $(tail -3 "$log" | tr '\n' ' ' | cut -c1-300)")
     FAILED=1
   fi
   echo "${ROWS[${#ROWS[@]}-1]}"
@@ -143,5 +159,6 @@ row ssh-checkout bash -c "ss checkout -q $SSHURL/trunk $WORK/s"
 row ssh-commit bash -c "cd $WORK/s && echo s >ssh.txt && ss add -q ssh.txt && ss commit -q -m ssh"
 
 echo "---- summary ($(printf '%s\n' "${ROWS[@]}" | grep -c '^PASS') of ${#ROWS[@]} passed)"
+echo "daemon peak RSS over every row: $((RUN_PEAK_KIB / 1024)) MiB"
 printf '%s\n' "${ROWS[@]}"
 exit $FAILED

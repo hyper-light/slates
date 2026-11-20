@@ -115,7 +115,7 @@ mod tests {
   fn text(n: usize) -> Vec<u8> {
     let len = 1 + (n * 53) % (5 * WINDOW + 7);
     (0..len)
-      .map(|at| ((n * 131 + at * 7) % 251) as u8)
+      .map(|at| u8::try_from((n * 131 + at * 7) % 251).unwrap())
       .collect()
   }
 

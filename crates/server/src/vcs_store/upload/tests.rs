@@ -593,9 +593,9 @@ fn tagged(
 /// meanwhile neither stops it nor changes its answer). Do: push a commit to `main` and tag it `v1` (annotated); answer a
 /// `fetch` of the commit with `include-tag` whole, the start generation's answer; then answer it again in turns through
 /// the lender's hold, one unit a step, and after its first step push a second commit to `main` and tag the first commit
-/// `v2`. Expect: the held answer's pack the start generation's objects byte for byte, in the same order (`v1`'s tag, not
-/// `v2`'s, nor the second commit; each object's zlib level is the stream's own timed choice, §4.11, so the compressed
-/// bytes are compared by the objects they inflate to); and, holding no generation and lent the objects alone as the
+/// `v2`. Expect: the held answer the start generation's byte for byte (`v1`'s tag, not `v2`'s, nor the second commit;
+/// until the encoder's level was chosen from measured rates, not timed on the shard's clock, two streams could deflate one
+/// object at two levels, and this compared the objects alone); and, holding no generation and lent the objects alone as the
 /// edges lent an answer's later steps before this, the same steps' pack other objects (its `include-tag` scan meets no
 /// ref, so the tag is lost), so the hold is what keeps it.
 #[test]
@@ -673,16 +673,10 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
     let unheld = in_turns(state, hold, false, &mut |_| {});
     (start, held, unheld)
   });
-  // What the generation says: the pack's objects, in the order the stream sent them, each by its id, the hash of its
-  // bytes, so equal ids are the objects byte for byte. How each is deflated is the stream's own measured choice on the
-  // shard's clock (§4.11, `fragment::level` samples every level timed), so two streams of one generation may deflate
-  // one object at two levels; the zlib bytes are not the generation's to say.
+  // Byte for byte: the encoder's level and window are one function of the bytes and the machine's measured rates
+  // (`learn::Rates`), never the shard's clock, so two streams of one generation write one answer.
+  assert_eq!(held, start, "held to the generation it began on");
   let said = |answer: &[u8]| sent_in_order(&pack_of(answer));
-  assert_eq!(
-    said(&held),
-    said(&start),
-    "held to the generation it began on"
-  );
   assert_ne!(
     said(&unheld),
     said(&start),

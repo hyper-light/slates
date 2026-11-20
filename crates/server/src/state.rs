@@ -317,6 +317,9 @@ pub struct ShardState {
   /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
   /// shard keeps free pages pre-faulted for (`daemon::purge_if_idle`).
   pub(crate) last_burst: usize,
+  /// When the idle sweep pass closed [`ShardState::last_burst`] (the shard's monotonic clock, nanoseconds): the reserve
+  /// held for it decays from then (`daemon::prefault_reserve_bytes`, w-sizing piece 1).
+  pub(crate) burst_closed_ns: u64,
   /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
   /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
   pub(crate) refill_settled: Option<u64>,
