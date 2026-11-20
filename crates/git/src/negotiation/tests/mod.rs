@@ -14,7 +14,17 @@ use super::{
   Refusal, Request, Run, ShallowInfo, filter, negotiate,
 };
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
+use crate::positions::Positions;
 use crate::{Admission, to_u64};
+
+/// The objects `pack` sends one by one, as the graph names them (A-745: the answer keeps them as runs of positions).
+fn nodes(pack: &Pack<u32, u32>) -> Vec<u32> {
+  pack
+    .objects
+    .iter()
+    .map(|position| u32::try_from(position).unwrap())
+    .collect()
+}
 
 /// The index of `node`.
 fn at(node: u32) -> usize {
@@ -529,7 +539,8 @@ fn oracle(graph: &TestGraph, asks: &Asks) -> Result<Expected, Refusal> {
     acknowledgments,
     shallow_info: cut.info.clone(),
     runs,
-    objects,
+    objects: Positions::of(objects.iter().map(|node| u64::from(*node)).collect()),
+    _node: core::marker::PhantomData,
   };
   Ok(Expected {
     answer: Answer::Pack(pack),
@@ -1502,8 +1513,7 @@ impl Census {
     }
     self.filter(graph, asks.filter.as_ref(), pack);
     let wanted: Vec<u32> = held(graph, &asks.wants);
-    let tag_included = pack
-      .objects
+    let tag_included = nodes(pack)
       .iter()
       .any(|node| graph.objects[at(*node)].kind == Kind::Tag && !wanted.contains(node));
     self.tags_included += u64::from(asks.include_tag && tag_included);
@@ -1621,7 +1631,7 @@ fn check_carried(plan: &Plan, census: &mut Census) -> Result<(), TestCaseError> 
   census.packs_checked += 1;
   let wants = held(&graph, &asks.wants);
   let common = held(&graph, &asks.haves);
-  let mut carried: BTreeSet<u32> = pack.objects.iter().copied().collect();
+  let mut carried: BTreeSet<u32> = nodes(&pack).into_iter().collect();
   for run in &pack.runs {
     census.runs_checked += 1;
     let mut union = BTreeSet::new();
@@ -1681,6 +1691,50 @@ fn a_pack_carries_what_the_client_lacks_and_nothing_unwanted() {
     census.packs_checked > 0 && census.runs_checked > 0,
     "{census:?}"
   );
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rule 3: every slice a turn at a time). Do: negotiate generated requests over
+/// generated histories (every path, deepening and filter of `every_answer_is_the_oracles`) whole, and again begun and
+/// stepped one unit a step, the quantum spent after every unit, counting the steps. Expect: the same outcome, refusals
+/// included, answer and counters alike; and some pack chosen over more than one step, so the walk is cut and resumed.
+#[test]
+fn a745_a_negotiation_stepped_a_unit_at_a_time_answers_as_one_made_whole() {
+  let most_steps = RefCell::new(0u64);
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
+    cases: 1024,
+    ..Config::default()
+  }));
+  let result = runner.run(&any_plan(), |plan| {
+    let (graph, asks) = build(&plan);
+    let request = asks.request();
+    let whole = negotiate(&graph, &request, &mut Admission::new(u64::MAX));
+    let mut admission = Admission::new(u64::MAX);
+    let stepped = match super::begin(&graph, &request, &mut admission) {
+      Err(refusal) => Err(refusal),
+      Ok(super::Begun::Answered(outcome)) => Ok(outcome),
+      Ok(super::Begun::Selecting(mut negotiating)) => {
+        let mut steps = 0u64;
+        loop {
+          steps += 1;
+          match negotiating.step(&graph, &mut admission, &mut || true) {
+            Err(refusal) => break Err(refusal),
+            Ok(Some(outcome)) => break Ok(outcome),
+            Ok(None) => {}
+          }
+        }
+        .inspect(|_| {
+          let mut most = most_steps.borrow_mut();
+          *most = (*most).max(steps);
+        })
+      }
+    };
+    prop_assert_eq!(stepped, whole);
+    Ok(())
+  });
+  if let Err(failure) = result {
+    panic!("{failure}");
+  }
+  assert!(*most_steps.borrow() > 1, "no pack took more than one step");
 }
 
 /// A straight history, `count` commits each with its own tree and blob, and one green whose versions are its commits.
@@ -1756,7 +1810,7 @@ fn a_rewrite_between_takes_the_walk() {
     panic!("{:?}", outcome.answer)
   };
   assert!(pack.runs.is_empty());
-  assert_eq!(pack.objects, [blob, tree, side, top]);
+  assert_eq!(nodes(&pack), [blob, tree, side, top]);
   assert_eq!(outcome.counters.one_round, 0);
   assert!(outcome.counters.walked >= 2);
 }
@@ -1829,7 +1883,7 @@ fn a_clone_at_depth_one_sends_the_head_alone_and_names_it_shallow() {
     graph.objects[at(head.tree)].entries[0],
   ];
   expected.sort();
-  assert_eq!(pack.objects, expected);
+  assert_eq!(nodes(&pack), expected);
 }
 
 /// A-615 part 2 (§4.2): do negotiate a walk with one byte of room, and with none needed by a request with no wants.
@@ -1850,6 +1904,41 @@ fn a_negotiation_past_its_admission_is_refused() {
     negotiate(&graph, &Asks::default().request(), &mut Admission::new(0))
       .map(|outcome| outcome.answer),
     Ok(Answer::Nothing)
+  );
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rule 1: a fetch's working set is bounded whatever the repository's size). Do: make
+/// a straight history of 3,000 commits, each with a tree of its own blob, given positions as one push gives them (every
+/// blob, then every tree, then every commit, each kind one run), and clone it, every object wanted and none held, within
+/// 4 KiB. Expect: the pack's 9,000 objects chosen, as one run: what the walk keeps is a run a range of positions,
+/// where its sets and stacks had charged 8 bytes and more an object (72,000 for the objects alone).
+#[test]
+fn a745_a_long_history_pushed_in_one_piece_is_negotiated_within_a_few_kilobytes() {
+  const COMMITS: usize = 3_000;
+  let mut graph = TestGraph::default();
+  let blobs: Vec<u32> = (0..COMMITS)
+    .map(|n| graph.new_blob(u64::try_from(n).unwrap() + 1))
+    .collect();
+  let trees: Vec<u32> = blobs.iter().map(|blob| graph.new_tree(&[*blob])).collect();
+  let mut head = None;
+  for (n, tree) in trees.iter().enumerate() {
+    let parents: Vec<u32> = head.into_iter().collect();
+    head = Some(graph.new_commit(&parents, *tree, u64::try_from(n).unwrap()));
+  }
+  let asks = Asks {
+    wants: vec![graph.id(head.unwrap())],
+    done: true,
+    ..Asks::default()
+  };
+  let outcome = negotiate(&graph, &asks.request(), &mut Admission::new(4096)).unwrap();
+  let Answer::Pack(pack) = outcome.answer else {
+    panic!("{:?}", outcome.answer)
+  };
+  assert_eq!(pack.objects.len(), u64::try_from(3 * COMMITS).unwrap());
+  assert_eq!(
+    pack.objects.runs(),
+    1,
+    "blobs, trees and commits, one push's positions, make one run"
   );
 }
 
@@ -1878,7 +1967,7 @@ fn a_tree_met_again_shallower_is_opened_again_under_a_depth_filter() {
   let Answer::Pack(pack) = outcome.answer else {
     panic!()
   };
-  assert!(pack.objects.contains(&blob), "{:?}", pack.objects);
+  assert!(nodes(&pack).contains(&blob), "{:?}", pack.objects);
   let mut expected = vec![
     blob,
     inner,
@@ -1890,18 +1979,19 @@ fn a_tree_met_again_shallower_is_opened_again_under_a_depth_filter() {
     second,
   ];
   expected.sort();
-  assert_eq!(pack.objects, expected);
+  assert_eq!(nodes(&pack), expected);
 }
 
 /// Whether `pack` holds a tree without one of the blobs in it: a sparse filter left that blob out (A-640 part 4).
 fn left_a_blob(graph: &TestGraph, pack: &Pack<u32, u32>) -> bool {
-  pack.objects.iter().any(|node| {
+  let sent = nodes(pack);
+  sent.iter().any(|node| {
     let object = &graph.objects[at(*node)];
     object.kind == Kind::Tree
       && object
         .entries
         .iter()
-        .any(|entry| graph.objects[at(*entry)].kind == Kind::Blob && !pack.objects.contains(entry))
+        .any(|entry| graph.objects[at(*entry)].kind == Kind::Blob && !sent.contains(entry))
   })
 }
 
@@ -1936,7 +2026,7 @@ fn sparse_clone(
   };
   let outcome = negotiate(graph, &request, &mut Admission::new(u64::MAX))?;
   match outcome.answer {
-    Answer::Pack(pack) => Ok((pack.objects, outcome.counters.trees)),
+    Answer::Pack(pack) => Ok((nodes(&pack), outcome.counters.trees)),
     _ => Ok((Vec::new(), outcome.counters.trees)),
   }
 }

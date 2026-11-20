@@ -56,6 +56,20 @@ pub(crate) struct ServedViews;
 
 impl HgStores for ServedViews {
   type Store<'s> = Indexed<'s>;
+  type Hold = Generation;
+
+  fn hold(&mut self, id: RepositoryId, room: &mut Admission) -> Option<Generation> {
+    crate::state::with_state(|state| hold_in(state, id, room)).flatten()
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    hold: &Generation,
+    room: &mut Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut Admission) -> R,
+  ) -> Option<R> {
+    crate::state::with_state(|state| lend_held_in(state, hold, room, step)).flatten()
+  }
 
   fn holds(&self, id: RepositoryId) -> bool {
     crate::state::with_state(|state| held(state, id)).unwrap_or(false)
@@ -92,12 +106,114 @@ impl HgStores for ServedViews {
   fn push_room(&self, id: RepositoryId) -> Option<u64> {
     crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes)
   }
+
+  fn fetch_turn(&self, id: RepositoryId) -> Option<(u64, u64)> {
+    crate::state::with_state(|state| {
+      (
+        crate::vcs_share::room(state, id).bytes,
+        crate::vcs_store::hg_import::quantum_of(state),
+      )
+    })
+  }
 }
 
 /// [`held`], for the tests.
 #[cfg(test)]
 pub(crate) fn held_here(state: &ShardState, id: RepositoryId) -> bool {
   held(state, id)
+}
+
+/// A fetch's hold on the generation of a repository's index it began on (A-745, §4.17.1 "A fetch's answer" rule 4): a
+/// fork of the index (its rows as they stood, their tables shared) and the register's phase roots and bookmarks as they
+/// stood, so every turn of the fetch's answer reads the view its first turn read, whatever lands, is re-based or is
+/// rebuilt meanwhile. Given back by its drop, on the shard that holds its store; a refused release counted.
+pub(crate) struct Generation {
+  /// The repository.
+  id: RepositoryId,
+  /// The fork of its index, until it is given back.
+  index: Option<HgIndex>,
+  /// The register's phase roots as they stood.
+  roots: Vec<PhaseHead>,
+  /// The register's bookmarks as they stood.
+  bookmarks: BookmarkHeads,
+}
+
+impl Generation {
+  /// Gives the fork back on `state`, for a caller that holds the shard's state (the tests), which its drop cannot reach.
+  #[cfg(test)]
+  pub(crate) fn give_back(mut self, state: &mut ShardState) {
+    if let Some(index) = self.index.take() {
+      release_generation(state, index);
+    }
+  }
+}
+
+impl Drop for Generation {
+  fn drop(&mut self) {
+    if let Some(index) = self.index.take() {
+      crate::state::with_state(|state| release_generation(state, index)).unwrap_or_default();
+    }
+  }
+}
+
+/// Gives a generation's fork back, a refused release counted.
+fn release_generation(state: &mut ShardState, index: HgIndex) {
+  let released = super::within_budget(state, 0, |stores| {
+    stores
+      .content_mut()
+      .map_or(Ok(()), |content| index.release(content))
+  });
+  if released.is_err() {
+    state.count(super::RELEASE_REFUSED, 1);
+  }
+}
+
+/// Holds repository `id`'s generation as `state` holds it now ([`Generation`]), the register's copies charged to `room`;
+/// none when it is not lent (module docs).
+pub(crate) fn hold_in(
+  state: &mut ShardState,
+  id: RepositoryId,
+  room: &mut Admission,
+) -> Option<Generation> {
+  if !held(state, id) {
+    return None;
+  }
+  let (roots, bookmarks) = register_of(state, id, room).ok()?;
+  let index = super::within_budget(state, 0, |stores| {
+    let (content, store) = stores.mercurial(id)?;
+    store.index.fork(content).ok()
+  })?;
+  Some(Generation {
+    id,
+    index: Some(index),
+    roots,
+    bookmarks,
+  })
+}
+
+/// Runs `step` over the served view of `generation`, made within `room`; none when its store is gone or the view
+/// cannot be made, an unmade view counted.
+pub(crate) fn lend_held_in<R>(
+  state: &mut ShardState,
+  generation: &Generation,
+  room: &mut Admission,
+  step: impl for<'s> FnOnce(&Indexed<'s>, &mut Admission) -> R,
+) -> Option<R> {
+  let index = generation.index.as_ref()?;
+  let made = super::lent_state(state, |state| {
+    let (content, _) = state.vcs_stores.mercurial_ref(generation.id)?;
+    let read = State {
+      roots: &generation.roots,
+      bookmarks: &generation.bookmarks,
+      publishing: PUBLISHING,
+    };
+    let view = Indexed::new(index, content, read, room).ok()?;
+    Some(step(&view, room))
+  });
+  if made.is_none() {
+    crate::fleet::count_refusal_in(state, UNMADE);
+  }
+  made
 }
 
 /// Whether repository `id`'s Mercurial store is held here with no import filling it.

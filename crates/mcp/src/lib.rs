@@ -902,6 +902,13 @@ struct McpError {
 /// daemon is its own code so an agent can distinguish "refused" from "gone".
 fn refusal(e: ClientError) -> McpError {
   match e {
+    ClientError::Refused(slates_ipc::protocol::Refusal::CopyRefused { path, case }) => McpError {
+      code: code::REFUSED,
+      message: format!(
+        "CopyRefused: the copy to {path} is refused: {}",
+        copy_case_name(case)
+      ),
+    },
     ClientError::Refused(refusal) => McpError {
       code: code::REFUSED,
       message: format!("{refusal:?}"),
@@ -915,6 +922,21 @@ fn refusal(e: ClientError) -> McpError {
       code: code::REFUSED,
       message: other.to_string(),
     },
+  }
+}
+
+/// The name a refused copy's case is reported by (A-586; main's ruling of 2026-11-20): every case of the wire's
+/// `CopyCase` by an exhaustive match, so a case appended to the wire breaks this build until this surface names it.
+pub fn copy_case_name(case: slates_ipc::protocol::CopyCase) -> &'static str {
+  use slates_ipc::protocol::CopyCase;
+  match case {
+    CopyCase::Root => "root",
+    CopyCase::PastHead => "past_head",
+    CopyCase::SourceEmpty => "source_empty",
+    CopyCase::VersionFolded => "version_folded",
+    CopyCase::OutsideNodeChanged => "outside_node_changed",
+    CopyCase::ChangedSourceLink => "changed_source_link",
+    CopyCase::LinkAcrossCopy => "link_across_copy",
   }
 }
 
@@ -2253,6 +2275,7 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "target_leases": s.target_leases,
     "nfs_calls": s.nfs_calls,
     "registry_attachments": s.registry_attachments,
+    "repositories": repositories_json(&s.repositories),
     "telemetry": telemetry.map(telemetry_json),
   })
 }
@@ -2265,6 +2288,43 @@ pub fn signal_json(s: &Signal) -> Value {
     "value": s.value,
     "absence": s.absence.name(),
     "freshness_ns": s.freshness_ns,
+  })
+}
+
+/// Each repository's usage row in `slates status` (A-724), apart so the status object stays within `json!`'s recursion.
+fn repositories_json(repositories: &[slates_ipc::protocol::RepositoryUsageReport]) -> Value {
+  Value::Array(
+    repositories
+      .iter()
+      .map(|r| {
+        json!({
+          "name": r.name,
+          "intakes_begun": r.intakes_begun,
+          "intakes_answered": r.intakes_answered,
+          "intake_steps": r.intake_steps,
+          "intake_step_ns": r.intake_step_ns,
+          "intake_bytes_in": r.intake_bytes_in,
+          "fetches_begun": r.fetches_begun,
+          "fetch_step_ns": r.fetch_step_ns,
+          "first_ns": r.first_ns,
+          "last_ns": r.last_ns,
+          "longest_intake_step_ns": r.longest_intake_step_ns,
+          "push_phases": push_phases_json(r),
+        })
+      })
+      .collect(),
+  )
+}
+
+/// A repository's git push steps by phase in `slates status` (A-724's profile), apart so the status object stays within
+/// `json!`'s recursion.
+fn push_phases_json(r: &slates_ipc::protocol::RepositoryUsageReport) -> serde_json::Value {
+  json!({
+    "longest_ns": r.longest_push_phases_ns,
+    "steps": r.push_phase_steps,
+    "ns": r.push_phase_ns,
+    "gap_ns": r.push_phase_gap_ns,
+    "first_gap_ns": r.push_first_gap_ns,
   })
 }
 

@@ -37,6 +37,12 @@ pub(super) const VECTOR_UUID: &[u8] = b"7bf7a5ef-cabf-0310-b7d4-93df341afa7e";
 pub(super) const CREATED_DATE: &[u8] = b"2026-11-19T00:00:00.000000Z";
 
 /// A repository as `CreateRepository` leaves one, within a room no test comes near.
+/// Shape: what one export call may append past a window of text: a window's svndiff framing, or a record's headers and
+/// property section, which in the fixture history are each far below a page. Measured 2026-11-20 (debug, this
+/// MacBook): the largest call 102,400 bytes in format 2 (a text's piece) and 102,413 in format 3 (a window and its 13
+/// bytes of framing); before this piece, a call wrote a revision's 107 KB text whole.
+pub(super) const CALL_HEADROOM: usize = 4096;
+
 pub(super) fn created() -> Repository {
   created_within(ROOMY)
 }

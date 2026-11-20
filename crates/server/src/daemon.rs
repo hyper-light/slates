@@ -3927,6 +3927,15 @@ impl Daemon {
       .map(|watchdog| watchdog.turns().read())
   }
 
+  /// Test support: the latest episode in which the watchdog withheld the beat for a stuck shard (A-232 step 5,
+  /// [`crate::watchdog::Turns::episode`]): the last beat before it and how late the watchdog's looks ran to its verdict.
+  pub fn watchdog_episode(&self) -> Option<crate::watchdog::Withheld> {
+    self
+      .watchdog
+      .as_ref()
+      .and_then(|watchdog| watchdog.turns().episode())
+  }
+
   /// Test support: puts a memory-pressure level in place of the host's reading the watchdog takes at its looks (A-336,
   /// [`crate::watchdog::MemoryStallSource`]): `Some(true)` the host reports a memory stall, `Some(false)` none, `None`
   /// the host's own reading again. In production the watchdog reads the host (`slates_machine::memory_stall`); this

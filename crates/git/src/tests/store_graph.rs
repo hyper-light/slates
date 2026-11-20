@@ -287,7 +287,7 @@ fn the_store_answers_gits_own_fetches_with_gits_own_objects() {
     panic!("{:?}", outcome.answer)
   };
   assert!(pack.runs.is_empty() && outcome.counters.walked > 0);
-  let sent: BTreeSet<ObjectId> = pack.objects.iter().map(|node| graph.id(*node)).collect();
+  let sent: BTreeSet<ObjectId> = pack.objects.iter().map(|node| graph.id(node)).collect();
   assert_eq!(sent, git_pack(FETCH_CLONE_RESPONSE, &served));
   assert_eq!(graph.fault(), None);
 }
@@ -320,7 +320,7 @@ fn a_sparse_clone_sends_every_tree_and_the_blobs_its_patterns_match() {
     let Answer::Pack(pack) = &outcome.answer else {
       panic!("{:?}", outcome.answer)
     };
-    pack.objects.iter().map(|node| graph.id(*node)).collect()
+    pack.objects.iter().map(|node| graph.id(node)).collect()
   };
   let git = git_pack(FETCH_CLONE_RESPONSE, &served);
   assert_eq!(clone(b"*\n"), git);

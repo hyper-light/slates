@@ -24,8 +24,8 @@
 //! removed at its end; `svn` reads no user's configuration and caches no credential. A slates leg mints its credential
 //! (`slates credential token|key`, the issuer's verbs) with the anchor's issuer surface, which the anchor names on macOS
 //! and Windows; on Linux the surface is a descriptor only the anchor's children hold, so those legs skip loudly there.
-//! Unix only, as `tests/cli.rs` is: the control's tunnel runs through `sh`, and the SSH leg's through OpenSSH's `ssh`.
-#![cfg(unix)]
+//! Every platform: on a host without stock Subversion 1.15 (jupiter, until Ada decides on installing it) each leg skips
+//! loudly; the control's tunnel runs through `sh`, and the SSH leg's through OpenSSH's `ssh`.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -113,7 +113,9 @@ const NO_ISSUER_SURFACE: &str = "this platform publishes no issuer surface throu
 
 /// A scratch directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a
 /// count, removed when dropped, even when an assertion fails (A-50: a test's host files live in the build output, never
-/// `/tmp`). Made by `mkdir`, as `tests/cli.rs` makes its own.
+/// `/tmp`). Its path is written with forward slashes, which every stock client on every platform reads (Git for Windows,
+/// MSYS2's OpenSSH and Mercurial's `ssh` command on Windows among them), and without Windows' `\\?\` prefix, which
+/// they do not.
 struct Scratch {
   path: String,
 }
@@ -130,24 +132,33 @@ impl Scratch {
     );
     made_directory(&raw);
     Scratch {
-      path: std::fs::canonicalize(&raw)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned(),
+      path: portable(&std::fs::canonicalize(&raw).unwrap()),
     }
   }
 }
 
 impl Drop for Scratch {
+  // The test's own scratch directory, inside the build output (R1's wall is shipped code's).
+  #[allow(clippy::disallowed_methods)]
   fn drop(&mut self) {
-    let _ = Command::new("rm").args(["-rf", &self.path]).output();
+    let _ = std::fs::remove_dir_all(&self.path);
   }
 }
 
-/// Makes directory `path` and any parent it lacks, by `mkdir -p`.
+/// Makes directory `path` and any parent it lacks, inside the test's build output.
+#[allow(clippy::disallowed_methods)]
 fn made_directory(path: &str) {
-  let made = Command::new("mkdir").args(["-p", path]).output().unwrap();
-  assert!(made.status.success(), "mkdir -p {path}: {made:?}");
+  std::fs::create_dir_all(path).unwrap_or_else(|error| panic!("making {path}: {error}"));
+}
+
+/// `path` as every stock client reads it: forward slashes, and on Windows no `\\?\` verbatim prefix, which
+/// `canonicalize` adds and Git for Windows and MSYS2's tools refuse.
+fn portable(path: &std::path::Path) -> String {
+  let text = path.to_string_lossy();
+  text
+    .strip_prefix(r"\\?\")
+    .unwrap_or(&text)
+    .replace('\\', "/")
 }
 
 /// Whether this host runs stock Subversion's `svn` of the 1.15 line ([`SVN_LINE`]).

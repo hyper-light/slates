@@ -115,6 +115,9 @@ fn to_u64(count: usize) -> u64 {
 pub(crate) trait HgStores {
   /// The served view a repository's commands are answered from, lent for one step.
   type Store<'s>: Store;
+  /// A fetch's hold on the generation of a repository it began on (A-745, §4.17.1 "A fetch's answer" rule 4), given
+  /// back as it is dropped.
+  type Hold;
   /// Whether the store of repository `id` is held here, to be lent.
   fn holds(&self, id: RepositoryId) -> bool;
   /// Runs `step` over repository `id`'s served view, the view made within `room` and `step` handed what is left of it;
@@ -140,6 +143,30 @@ pub(crate) trait HgStores {
   fn push_room(&self, _repository: RepositoryId) -> Option<u64> {
     None
   }
+  /// The room each turn of a fetch's answer is lent and the time it may run (A-745, §4.17.1 "A fetch's answer" rules 2
+  /// and 3): what the repository's owner shard could admit now and its step quantum; `None` where the lender names
+  /// none, and a turn is one step within the edge's request room.
+  fn fetch_turn(&self, _repository: RepositoryId) -> Option<(u64, u64)> {
+    None
+  }
+  /// Holds repository `id` as it is now, what the hold copies charged to `room`: taken in the turn a fetch's answer
+  /// began, so its later turns read what that one read; none when its store is not held here.
+  fn hold(&mut self, id: RepositoryId, room: &mut Admission) -> Option<Self::Hold>;
+  /// Runs `step` over the served view of the generation `hold` holds, made within `room`; none when it cannot be made.
+  fn lend_held<R>(
+    &mut self,
+    hold: &Self::Hold,
+    room: &mut Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut Admission) -> R,
+  ) -> Option<R>;
+}
+
+/// An exchange's answer once made: whole, or a `getbundle`'s, made a turn at a time (A-745).
+enum Made {
+  /// The media type and the whole body.
+  Whole(&'static [u8], Vec<u8>),
+  /// A `getbundle`'s answer, streamed.
+  Streamed(Box<hg_http::Streamed>),
 }
 
 /// The design's first value for a stream's compression (§4.17.3 "Learned tunables": "each named engine at its fastest
@@ -425,7 +452,7 @@ fn refused_with<E>(status: Status, fields: Fields, proven: bool) -> Decided<E> {
 
 /// A served request's exchange (the module doc's bounds): its arguments copied from the head, its body, and its answer
 /// once the body has ended.
-pub(crate) struct HgExchange<S> {
+pub(crate) struct HgExchange<S: HgStores> {
   /// Where the repository's store is read.
   stores: S,
   /// The repository.
@@ -440,14 +467,18 @@ pub(crate) struct HgExchange<S> {
   body: Vec<u8>,
   /// The room the exchange may still hold.
   room: Admission,
-  /// The answer's media type and body, once made.
-  answered: Option<(&'static [u8], Vec<u8>)>,
+  /// The answer, once made or begun.
+  answered: Option<Made>,
+  /// A streamed answer's hold on the generation it began on (A-745 rule 4).
+  generation: Option<S::Hold>,
+  /// The edge's room for one request, which bounds a turn of a fetch's answer where the lender names none.
+  request_room: u64,
   /// Whether a push's body ran past its room: its bytes let go as they arrive, and the push refused in Mercurial's
   /// words once the body has ended (A-711).
   past_room: bool,
 }
 
-impl<S> HgExchange<S> {
+impl<S: HgStores> HgExchange<S> {
   /// The exchange for `head` on `repository`, by `pusher` where it is a push, its arguments copied and charged to
   /// `room`; none past it.
   fn new(
@@ -488,6 +519,8 @@ impl<S> HgExchange<S> {
       body: Vec::new(),
       room: admission,
       answered: None,
+      generation: None,
+      request_room: room,
       past_room: false,
     })
   }
@@ -526,35 +559,104 @@ impl<S: HgStores> Exchange for HgExchange<S> {
     let id = self.repository.id;
     if self.past_room {
       let answered = hg_http::pushed(&Outcome::Unprocessed(PAST_ROOM.to_vec()), &mut admission);
-      self.answered = Some((answered.media_type, answered.body));
+      self.answered = Some(Made::Whole(answered.media_type, answered.body));
       return Ok(());
     }
-    let answered = match &self.pusher {
-      Some(principal) => {
-        answered_push(&mut self.stores, (id, principal), &request, &mut admission).await
-      }
+    let made = match &self.pusher {
+      Some(principal) => answered_push(&mut self.stores, (id, principal), &request, &mut admission)
+        .await
+        .map(|answered| Made::Whole(answered.media_type, answered.body)),
       None => self.stores.lend(id, &mut admission, |store, room| {
-        hg_http::answer(store, &request, header_line(), &mut Fastest, room)
+        match hg_http::begin(store, &request, header_line(), &mut Fastest, room) {
+          hg_http::Begun::Answered(answered) => Made::Whole(answered.media_type, answered.body),
+          hg_http::Begun::Streamed(streamed) => Made::Streamed(streamed),
+        }
       }),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-    self.answered = Some((answered.media_type, answered.body));
+    if let Made::Streamed(_) = made {
+      // Taken in the turn the answer began, with no wait between, so every later turn reads what this one read.
+      let mut held = Admission::new(self.request_room);
+      self.generation = Some(
+        self
+          .stores
+          .hold(id, &mut held)
+          .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?,
+      );
+    }
+    self.answered = Some(made);
     Ok(())
   }
 
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
-    let (media_type, _) = self
-      .answered
-      .as_ref()
-      .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
+    let media_type = match self.answered.as_ref() {
+      Some(Made::Whole(media_type, _)) => *media_type,
+      Some(Made::Streamed(streamed)) => streamed.media_type(),
+      None => return Err(Failed(Status::INTERNAL_SERVER_ERROR)),
+    };
     Ok(vec![(CONTENT_TYPE.to_vec(), media_type.to_vec())])
   }
 
   async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
-    if let Some((_, mut body)) = self.answered.take() {
-      out.append(&mut body);
+    match self.answered.take() {
+      Some(Made::Whole(_, mut body)) => {
+        out.append(&mut body);
+        Ok(false)
+      }
+      Some(Made::Streamed(mut streamed)) => {
+        let more = self.turn(&mut streamed, out)?;
+        if more {
+          self.answered = Some(Made::Streamed(streamed));
+        } else {
+          self.generation = None;
+        }
+        Ok(more)
+      }
+      None => Ok(false),
     }
-    Ok(false)
+  }
+}
+
+impl<S: HgStores> HgExchange<S> {
+  /// One turn of a streamed answer (A-745, §4.17.1 "A fetch's answer"): the repository's view lent for the turn alone,
+  /// steps taken within the room the lender names until its quantum is spent or the answer ends; a step past the turn's
+  /// room after others ends the turn, and is taken again by the next within a room of its own. Whether more follow.
+  fn turn(&mut self, streamed: &mut hg_http::Streamed, out: &mut Vec<u8>) -> Result<bool, Failed> {
+    let id = self.repository.id;
+    let (room, quantum) = self
+      .stores
+      .fetch_turn(id)
+      .map_or((self.request_room, 0), |(room, quantum)| (room, quantum));
+    let mut admission = Admission::new(room);
+    let start = slates_rt::futures::now_ns();
+    let generation = self
+      .generation
+      .as_ref()
+      .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
+    let turned = self
+      .stores
+      .lend_held(generation, &mut admission, |store, room| {
+        let mut taken = false;
+        loop {
+          match streamed.step(store, room, out) {
+            Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {
+              taken = true
+            }
+            Ok(more) => break Ok(more),
+            Err(slates_hg::serve::session::Refused::Serve(
+              slates_hg::serve::Refusal::PastAdmission(_),
+            )) if taken => {
+              break Ok(true);
+            }
+            Err(refused) => break Err(refused),
+          }
+        }
+      });
+    match turned {
+      Some(Ok(more)) => Ok(more),
+      Some(Err(_)) => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
+      None => Err(Failed(Status::SERVICE_UNAVAILABLE)),
+    }
   }
 }
 

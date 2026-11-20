@@ -2,7 +2,8 @@
 //! history written record by record.
 
 use super::support::{
-  Dump, Node, VECTOR_UUID, created, export, history, import_whole, properties, revision_properties,
+  CALL_HEADROOM, Dump, Node, VECTOR_UUID, created, export, history, import_whole, properties,
+  revision_properties,
 };
 use crate::dump::Format;
 use crate::index::{Action, ChangedPath, NodeKind};
@@ -292,4 +293,74 @@ fn same_history_through_its_export(repository: &Repository) {
   )
   .unwrap();
   assert_eq!(history(&again), history(repository));
+}
+
+/// Shape: how many deltifier windows the test's large file spans, so measuring and writing its delta each take that
+/// many calls at least.
+const LARGE_WINDOWS: usize = 5;
+
+/// Noisy bytes no window shortens, `len` long, from a xorshift seeded by `seed` (odd).
+fn noisy(seed: u64, len: usize) -> Vec<u8> {
+  let mut state = seed | 1;
+  (0..len)
+    .map(|_| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state.to_le_bytes()[0]
+    })
+    .collect()
+}
+
+/// A-652 (the export's units, part 3: format 3's measuring walk). Do: import a history whose revision 1 adds a file
+/// [`LARGE_WINDOWS`] windows long and whose revision 2 changes every window of it, then export it in format 3 a call at
+/// a time. Expect revision 2 to take at least its changed path, two calls, and two calls a window (the delta's length
+/// measured a window a call before its record, then written a window a call); no call appending more than a window
+/// and [`CALL_HEADROOM`]; and the export to import as the history. Before, the record's call measured the whole delta:
+/// 9 calls by count (its record, its five windows and its end, the revision's record and its close), 15 now.
+#[test]
+fn a_large_delta_is_measured_and_written_a_window_a_call() {
+  use crate::migration::{Exporter, Exporting};
+  use crate::svndiff::WINDOW_LIMIT;
+  let window = usize::try_from(WINDOW_LIMIT).unwrap();
+  let length = LARGE_WINDOWS * window;
+  let mut dump = Dump::new(Format::Two, Some(VECTOR_UUID));
+  dump
+    .revision(
+      0,
+      &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]),
+    )
+    .revision(1, &revision_properties(1))
+    .node(
+      &Node::add("big", NodeKind::File)
+        .properties(Properties::new())
+        .text(&noisy(1, length)),
+    )
+    .revision(2, &revision_properties(2))
+    .node(&Node::change("big").text(&noisy(3, length)));
+  let mut source = created();
+  import_whole(&mut source, &dump.bytes()).unwrap();
+  let mut exporter = Exporter::new(&source, 0, 2, Format::Three).unwrap();
+  let mut out = Vec::new();
+  let (mut calls, mut largest) = (0, 0);
+  loop {
+    let before = out.len();
+    match exporter.export(&source, &mut out).unwrap() {
+      Exporting::Wrote(2) => calls += 1,
+      Exporting::Wrote(_) => {}
+      Exporting::Done => break,
+    }
+    largest = largest.max(out.len() - before);
+  }
+  assert!(
+    calls >= 1 + 2 + 2 * LARGE_WINDOWS,
+    "revision 2 in {calls} calls"
+  );
+  assert!(
+    largest <= window + CALL_HEADROOM,
+    "a call appended {largest} bytes"
+  );
+  let mut again = created();
+  import_whole(&mut again, &out).unwrap();
+  assert!(history(&again) == history(&source));
 }

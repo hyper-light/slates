@@ -51,6 +51,7 @@ mod shallow;
 pub mod sparse;
 
 use crate::object_name::{Kind, ObjectId};
+use crate::positions::Positions;
 use crate::{Admission, PastAdmission};
 
 pub use filter::Filter;
@@ -65,7 +66,9 @@ pub const INFINITE_DEPTH: u32 = i32::MAX.unsigned_abs();
 pub trait Graph {
   /// One object the store holds, named by the store's own handle (its position in the repository's index), so a walk
   /// keeps handles rather than names.
-  type Node: Copy + Ord + core::fmt::Debug;
+  /// Its position in the index is its number (A-745): the answer carries the objects it sends as runs of positions
+  /// ([`Positions`]), never one at a time.
+  type Node: Copy + Ord + core::fmt::Debug + Into<u64> + TryFrom<u64>;
   /// A green, one branch of the repository, whose versions each have a head.
   type Green: Copy + Ord + core::fmt::Debug;
 
@@ -201,8 +204,11 @@ pub struct Pack<G, N> {
   pub shallow_info: Option<ShallowInfo>,
   /// Runs of versions sent whole; the request's filter applies to their objects.
   pub runs: Vec<Run<G>>,
-  /// Objects sent one by one, each once, in handle order.
-  pub objects: Vec<N>,
+  /// Objects sent one by one, by position, as runs (A-745: a fetch holds what it sends as runs, which one push's objects
+  /// make one of, never an object at a time); `N` names the graph's objects elsewhere in the answer.
+  pub objects: Positions,
+  /// The graph's objects, named in the answer's other sections.
+  pub(crate) _node: core::marker::PhantomData<N>,
 }
 
 /// What a `fetch` request is answered.
@@ -273,19 +279,153 @@ fn charge<T>(admission: &mut Admission) -> Result<(), Refusal> {
     .map_err(Refusal::PastAdmission)
 }
 
+/// A set of the graph's objects a walk keeps, by position, as runs (A-745, §4.17.1 "A fetch's answer" rule 1: a fetch's
+/// working set is a run a range of positions, never an entry an object), charged a run's bytes as its runs grow past
+/// what was charged before: a walk over one push's objects keeps one run whatever it meets.
+#[derive(Debug, Default)]
+pub(super) struct Held {
+  /// The positions held.
+  set: Positions,
+  /// The most runs it has held, each charged once.
+  charged: usize,
+}
+
+impl Held {
+  /// Adds `node`: whether it was not held, its run charged where it begins one past those charged.
+  pub(super) fn insert<N: Into<u64>>(
+    &mut self,
+    node: N,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let new = self.set.insert_new(node.into());
+    if self.set.runs() > self.charged {
+      charge::<(u64, u64)>(admission)?;
+      self.charged = self.set.runs();
+    }
+    Ok(new)
+  }
+
+  /// Whether `node` is held.
+  pub(super) fn contains<N: Into<u64>>(&self, node: N) -> bool {
+    self.set.contains(node.into())
+  }
+
+  /// The positions held.
+  pub(super) fn positions(&self) -> &Positions {
+    &self.set
+  }
+
+  /// The positions held, the set given up.
+  pub(super) fn into_positions(self) -> Positions {
+    self.set
+  }
+}
+
+/// What a walk's transient list (a stack, a queue) has cost: its most entries, each charged once as the list first grows
+/// past it (A-745: a walk's stack is charged at its deepest, never once an entry pushed over the walk).
+#[derive(Debug, Default)]
+pub(super) struct Peak {
+  /// The most entries charged.
+  charged: usize,
+}
+
+impl Peak {
+  /// Charges `len` entries of `T` past the most charged before.
+  pub(super) fn reach<T>(&mut self, len: usize, admission: &mut Admission) -> Result<(), Refusal> {
+    if len > self.charged {
+      admission
+        .charge_items::<T>(len.saturating_sub(self.charged))
+        .map_err(Refusal::PastAdmission)?;
+      self.charged = len;
+    }
+    Ok(())
+  }
+}
+
 /// Answers `request` from `graph`, keeping what it must within `admission`.
 pub fn negotiate<S: Graph>(
   graph: &S,
   request: &Request<'_>,
   admission: &mut Admission,
 ) -> Result<Outcome<S::Green, S::Node>, Refusal> {
+  match begin(graph, request, admission)? {
+    Begun::Answered(outcome) => Ok(outcome),
+    Begun::Selecting(mut negotiating) => loop {
+      if let Some(outcome) = negotiating.step(graph, admission, &mut || false)? {
+        return Ok(outcome);
+      }
+    },
+  }
+}
+
+/// A negotiation begun (A-745): answered already (nothing, or the acknowledgments alone), or a pack whose objects are
+/// still being chosen, a unit at a time.
+pub enum Begun<G, N> {
+  /// Answered.
+  Answered(Outcome<G, N>),
+  /// A pack, its objects being chosen ([`Negotiating::step`]).
+  Selecting(Negotiating<G, N>),
+}
+
+/// A negotiation whose pack's objects are being chosen a unit at a time (A-745, §4.17.1 "A fetch's answer" rule 3): what
+/// its answer says besides them (the acknowledgments, the shallow-info section and the runs), how it went so far, and
+/// the walk, which keeps its place across steps and is lent the graph for each.
+pub struct Negotiating<G, N> {
+  /// The acknowledgments, `None` after `done`.
+  acknowledgments: Option<Acknowledgments>,
+  /// The shallow-info section, when one is due.
+  shallow_info: Option<ShallowInfo>,
+  /// The runs the pack carries whole.
+  runs: Vec<Run<G>>,
+  /// How it went so far.
+  counters: Counters,
+  /// The walk choosing the objects sent one by one.
+  selecting: objects::Selecting<N, G>,
+}
+
+impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
+  /// Does units of the choice until `spent` says the owner's quantum is spent, at least one (each a commit or a tree
+  /// entry): the outcome once the last object is chosen, `None` while more are left.
+  pub fn step<S: Graph<Node = N, Green = G>>(
+    &mut self,
+    graph: &S,
+    admission: &mut Admission,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<Option<Outcome<G, N>>, Refusal> {
+    let Some(objects) = self
+      .selecting
+      .step(graph, admission, &mut self.counters, spent)?
+    else {
+      return Ok(None);
+    };
+    Ok(Some(Outcome {
+      answer: Answer::Pack(Pack {
+        acknowledgments: self.acknowledgments.take(),
+        shallow_info: self.shallow_info.take(),
+        runs: core::mem::take(&mut self.runs),
+        objects,
+        _node: core::marker::PhantomData,
+      }),
+      counters: self.counters,
+    }))
+  }
+}
+
+/// Begins answering `request` from `graph` (A-745): everything but the choice of the objects sent one by one, which is
+/// bounded by the request (its wants, haves and shallow lines, the one-round runs, `ready` and the cut), then the choice
+/// begun; within `admission`.
+pub fn begin<S: Graph>(
+  graph: &S,
+  request: &Request<'_>,
+  admission: &mut Admission,
+) -> Result<Begun<S::Green, S::Node>, Refusal> {
   let mut counters = Counters::default();
   let wants = ready::wants(graph, request.wants, admission)?;
   if wants.is_empty() && !request.wait_for_done {
-    return Ok(Outcome {
+    return Ok(Begun::Answered(Outcome {
       answer: Answer::Nothing,
       counters,
-    });
+    }));
   }
   let common = ready::common(graph, request.haves, admission)?;
   let client_shallow = shallow::client(graph, request.shallow, admission)?;
@@ -311,10 +451,10 @@ pub fn negotiate<S: Graph>(
       ready,
     };
     if !ready {
-      return Ok(Outcome {
+      return Ok(Begun::Answered(Outcome {
         answer: Answer::Acknowledgments(acknowledgments),
         counters,
-      });
+      }));
     }
     Some(acknowledgments)
   };
@@ -326,28 +466,29 @@ pub fn negotiate<S: Graph>(
     admission,
     &mut counters,
   )?;
-  let objects = objects::select(
+  let shallow_info = cut.info.clone();
+  admission
+    .charge_items::<Run<S::Green>>(runs.runs.len())
+    .map_err(Refusal::PastAdmission)?;
+  let selecting = objects::Selecting::begin(
     graph,
     request,
-    &objects::Sides {
-      wants: &wants,
-      one_round: &runs.wants,
-      common: &common,
-      cut: &cut,
+    objects::Sides {
+      wants,
+      one_round: runs.wants,
+      common,
+      cut,
     },
-    &runs.runs,
+    runs.runs.clone(),
     admission,
-    &mut counters,
   )?;
-  Ok(Outcome {
-    answer: Answer::Pack(Pack {
-      acknowledgments,
-      shallow_info: cut.info,
-      runs: runs.runs,
-      objects,
-    }),
+  Ok(Begun::Selecting(Negotiating {
+    acknowledgments,
+    shallow_info,
+    runs: runs.runs,
     counters,
-  })
+    selecting,
+  }))
 }
 
 /// Whether a server whose client holds `common` is ready to send the pack (A-640 part 3: protocol v0's
