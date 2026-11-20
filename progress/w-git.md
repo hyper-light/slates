@@ -112,3 +112,6 @@
   one repository (v1.5.0 cut kills daemon at 19 today; run-requests.md), no watchdog kill, every push answered.
 - A-722 part 2 in progress (w-git-land, uncommitted): rows lose green/version; Repository::landings map +
   bringer_of(position); upload + hook_view units switched; store tests fixed. Running git tests.
+- A-722 part 2 (rows w/o green/version; landing map bringer_of) LANDED e42c53886 (c1aa1a5b1). Next part 3: stage rows
+  into a per-push fork as objects land (positions at arrival; commit rows + generation sliced after pack), landing
+  adopts the fork. Then concurrency (19/100 pushes) and arrival-shard decode (w-balance seam).
