@@ -131,6 +131,20 @@ impl<N: Copy + Ord + Into<u64>> Paint<N> {
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<(), Refusal> {
+    while self.step(graph, grafts, &cut, admission, counters)? {}
+    Ok(())
+  }
+
+  /// Takes the next commit from the queue and passes its paint on (A-745: the walk a unit at a time, its owner choosing
+  /// how many a turn): whether the walk goes on, false once no queued commit is painted [`WANT`] alone.
+  pub(super) fn step<S: Graph<Node = N>>(
+    &mut self,
+    graph: &S,
+    grafts: &BTreeSet<N>,
+    cut: &dyn Fn(N) -> bool,
+    admission: &mut Admission,
+    counters: &mut Counters,
+  ) -> Result<bool, Refusal> {
     while self.pending > 0 {
       let Some((_, commit)) = self.queue.pop() else {
         break;
@@ -145,14 +159,14 @@ impl<N: Copy + Ord + Into<u64>> Paint<N> {
       }
       self.set(commit, before, after, admission)?;
       counters.walked = counters.walked.saturating_add(1);
-      if grafts.contains(&commit) {
-        continue;
+      if !grafts.contains(&commit) {
+        for parent in graph.parents(commit) {
+          self.paint(graph, parent, after & (WANT | HAVE), admission)?;
+        }
       }
-      for parent in graph.parents(commit) {
-        self.paint(graph, parent, after & (WANT | HAVE), admission)?;
-      }
+      return Ok(self.pending > 0);
     }
-    Ok(())
+    Ok(false)
   }
 
   /// The commits taken painted [`WANT`] alone: reached from a want and from no have, as runs of positions.

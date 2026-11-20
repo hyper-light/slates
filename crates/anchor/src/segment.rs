@@ -975,6 +975,26 @@ impl AnchorSegment {
     )
   }
 
+  /// [`AnchorSegment::region_residency`] of `len` bytes at `at` within the region, a span past the region refused
+  /// (`Geometry`): what a caller walking a large region a bounded step at a time asks (A-744). Words and payloads alike:
+  /// the kernel's page table is read, no byte.
+  pub fn region_residency_of(
+    &self,
+    kind: RegionKind,
+    at: usize,
+    len: usize,
+  ) -> Result<slates_mem::resident::Residency, AnchorError> {
+    let range = self.range(self.spec(kind)?)?;
+    let start = range
+      .start
+      .checked_add(at)
+      .filter(|start| start.saturating_add(len) <= range.end)
+      .ok_or(AnchorError::Geometry {
+        reason: "a residency span past its region",
+      })?;
+    Ok(self.object.residency(start, len)?)
+  }
+
   /// A region's length in bytes.
   pub fn region_len(&self, kind: RegionKind) -> Result<usize, AnchorError> {
     let range = self.range(self.spec(kind)?)?;

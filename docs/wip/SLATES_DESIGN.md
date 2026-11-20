@@ -12302,8 +12302,9 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
 > shard's room and quantum, the stream compressed as it is made; the red passes. Piece 2b BUILT: SSH the same
 > (`Stdio::stream`, `vcs_ssh::hg`). Rule 4 BUILT: a streamed answer holds its generation (`hg_view::Generation`, a
-> fork of the index with the register's roots and bookmarks), every turn lent a view over it. Owed: the stream clone
-> (piece 3), git's upload-pack (w-git).
+> fork of the index with the register's roots and bookmarks), every turn lent a view over it. Piece 3 BUILT: the stream
+> clone (`stream_out`) is sent a row at a time (`slates_hg::render::Streaming`, counted first from the rows alone).
+> Owed: `stream2`, git's upload-pack (w-git).
 > **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
 > fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
 > none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
@@ -12313,8 +12314,21 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > set's runs grow, and its queue and stacks at their longest (`negotiation::Peak`), never once an entry pushed: a clone
 > of 3,000 commits pushed in one piece, 9,000 objects, is negotiated within 4 KiB (it was refused there, `PastAdmission`).
 > Positions met in no order (a set the store gave piece by piece) cost a run an object, 16 bytes against the 8 the sets
-> charged; one push's order costs a run a kind or less. Owed for git: the walk a step at a time and `upload::Answering`
-> (piece 2b), the server driving it a turn at a time within a request's room (piece 3, reverting A-713's shard room).
+> charged; one push's order costs a run a kind or less. **Piece 2b part 1 BUILT (same day):** the choice of what a pack
+> sends one by one is made a unit at a time (`negotiation::begin`, then `Negotiating::step` until its owner's quantum is
+> spent, at least one unit a step, a commit from the walk's queue or an entry from a tree walk's stack, its place kept:
+> the commit walk, what the client holds, the sent commits' trees, the wants, `include-tag`); `negotiate` is the same
+> stepped to its end, and a sparse walk's frames are held while they live, given back as they are left. Held to the
+> negotiation's oracle and to the whole answer on 1,024 generated requests stepped a unit at a time. **Piece 2b part 2
+> BUILT (same day):** `upload::serve_in_turns` answers a protocol v2 `fetch` with the sections before its pack encoded
+> from what `begin` decided, and `Answer::write_within` chooses the pack's objects within its owner's quantum (the
+> repository lent for each write), then begins the pack; a choice refused, or a pack that cannot begin, after those
+> sections ends the response with git's band-3 words, as a pack refused midway ends. `serve` still chooses them before
+> it answers. Every upload test's exchange is answered both ways and held to the same bytes and refusal (its counters
+> too, but where a `sparse:oid` blob dies unread: in turns it dies before any walk, as git's `pack-objects` does).
+> Owed for git: the servers answering in turns within a request's room (piece 3, reverting A-713's shard room), protocol
+> v0's fetch in turns, what `begin` decides (`ready`, the cut) and `include-tag`'s scan in units, and a fetch held to
+> the index generation it began on (rule 4).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
