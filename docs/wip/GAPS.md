@@ -2955,8 +2955,11 @@
 >   shipper append of a large delta (128 to 331 ms for 1.8 to 2.5 MB; 29 ms for 4.8 KB, so not the payload's size
 >   alone). **A-757 part 1 (2026-11-20):** the entry's identity is hashed once per append, as its fields stream (it was
 >   hashed three times, each over a copy): 2.4 MB in release 3.1 to 4.6 ms a turn before, 0.94 to 1.63 ms after;
->   parts 2 (the identity hashed in quantum slices across turns) and 3 (the body held once) owed); and, after A-347's
->   open, the takeover's
+>   **A-757 part 2 (2026-11-20):** a whole build's identity is hashed in slices across its turns after the last piece is
+>   sealed, sized to the quantum left at the rate it measures, and the build appends with it: 2.4 MB in release, the
+>   append turn 0.92 to 0.94 ms before, about 0.46 us after, each hashing turn at most 27 to 32 us; peak RSS unchanged
+>   (8.8 MB). **Owed:** a large delta still seals and hashes in its publication's turn (A-757 part 2b), and the body is
+>   held twice (part 3)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
