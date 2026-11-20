@@ -404,13 +404,17 @@ fn no_request_after_a_push_is_served_before_its_answer() {
     .receive(&[&push_input()[..], b"heads\n"].concat())
     .unwrap();
   let mut whole = false;
-  while !whole {
+  for _ in 0..=push_input().len() {
     stdio.sent_stdout(stdio.stdout().len());
-    whole = matches!(
+    if matches!(
       stdio.step(&served, ROOM),
       Progress::Took { whole: true, .. }
-    );
+    ) {
+      whole = true;
+      break;
+    }
   }
+  assert!(whole, "the push was taken whole");
   let waiting = (
     stdio.step(&served, ROOM),
     stdio.step_push(),
