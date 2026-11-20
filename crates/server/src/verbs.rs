@@ -17876,6 +17876,8 @@ enum GreenReplayPhase {
     next: usize,
     replayed: Vec<crate::merge_service::ReplayedVersion>,
     head_check: Option<(u64, [u8; 32])>,
+    /// The next entry while its named runs are read from the content plane, a copy slice a step (A-760).
+    reading: Option<Box<slates_merge::chain_entry::ChainEntry>>,
   },
 }
 
@@ -17974,7 +17976,16 @@ impl GreenReplay {
         next,
         replayed,
         head_check,
-      } => return replay_chain_entry(state, id, green, (*held, *head_check), next, replayed),
+        reading,
+      } => {
+        return replay_chain_entry(
+          state,
+          (id, green),
+          (*held, *head_check),
+          (next, reading),
+          replayed,
+        );
+      }
     };
     match seeded {
       // The origin is seeded: the engine is restored at its checkpoint and the chain's replay begins.
@@ -18039,24 +18050,54 @@ impl GreenReplay {
 /// it, with the head identity the green has at that version; true once no entry is left.
 fn replay_chain_entry(
   state: &ShardState,
-  id: DbVolumeId,
-  green: &mut slates_merge::engine::Green,
+  (id, green): (DbVolumeId, &mut slates_merge::engine::Green),
   (held, head_check): (u64, Option<(u64, [u8; 32])>),
-  next: &mut usize,
+  (next, reading): (
+    &mut usize,
+    &mut Option<Box<slates_merge::chain_entry::ChainEntry>>,
+  ),
   replayed: &mut Vec<crate::merge_service::ReplayedVersion>,
 ) -> Result<bool, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
-  let Some(bytes) = state.db.partition().green_chain(id).get(*next) else {
-    return Ok(true);
-  };
   let version = u64::try_from(*next)
     .unwrap_or(u64::MAX)
     .saturating_add(held)
     .saturating_add(1);
   // Applied as the verdict resolved it (A-257): a checkpoint's position cannot refuse it. A replay that does not reach an
   // identity recorded for this version, by the entry or by the checkpoint at its head, is fenced.
-  let entry =
-    slates_merge::chain_entry::decode(bytes).map_err(|_| GreenFence::EntryCorrupt { version })?;
+  let mut entry = match reading.take() {
+    Some(entry) => entry,
+    None => {
+      let Some(bytes) = state.db.partition().green_chain(id).get(*next) else {
+        return Ok(true);
+      };
+      Box::new(
+        slates_merge::chain_entry::decode(bytes)
+          .map_err(|_| GreenFence::EntryCorrupt { version })?,
+      )
+    }
+  };
+  // An entry naming its content (A-760) reads it from the content plane first, a copy slice a step, so no step reads
+  // a large text whole: the step ends with the entry kept for the next.
+  if entry.increment.unread().is_some() {
+    let store = state
+      .vcs_stores
+      .content()
+      .ok_or(GreenFence::ContentMissing { version })?;
+    let objects = crate::vcs_store::named_objects::PlaneObjects {
+      store,
+      kept_in: &state.store.content,
+    };
+    let read = entry
+      .increment
+      .read_step(&objects, state.config.copy_slice_bytes().max(1))
+      .map_err(|_| GreenFence::ContentMissing { version })?;
+    if !read {
+      *reading = Some(entry);
+      return Ok(false);
+    }
+  }
+  let entry = *entry;
   let accepted = green.apply_recorded(&entry.increment, &entry.applied);
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
@@ -18164,6 +18205,7 @@ fn chain_phase_or_back(
     next: 0,
     replayed,
     head_check,
+    reading: None,
   })
 }
 

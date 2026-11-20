@@ -411,9 +411,10 @@
 >
 > **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
-> `ContentUnread` while unread. OWED: part 2, the commit's file blocks built a slice a unit and published in one step;
-> the server's `Objects` over vcs_store's plane and the svn landing's turns (w-svn); replay reading a chain entry's
-> runs first; items 3-7 (the green's block naming the plane's object, no copy).
+> `ContentUnread` while unread. Part 2 BUILT: each run read into its own buffer, which the commit makes the file with
+> no copy (`judge_named`); the server's `PlaneObjects` over vcs_store's plane (range reads); replay reads runs a slice a
+> step. OWED: the svn landing's turns (w-svn); a partial splice of a run copies at the commit; items 3-7 (the green's
+> block naming the plane's object, no copy).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's

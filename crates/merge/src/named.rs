@@ -42,6 +42,92 @@ pub struct Named {
   pub inline_len: u64,
   /// The runs, in the post-state's order.
   pub runs: Vec<NamedRun>,
+  /// Each run's bytes as read so far ([`crate::engine::Increment::read_step`]), one buffer a run, so a whole text's
+  /// buffer becomes the green's file at the commit with no copy ([`Read`]).
+  pub read: Read,
+}
+
+/// The named runs' bytes read so far, one buffer a run: what the plane holds, read here a slice a step. Not part of
+/// the work's value: two works naming the same runs are equal whatever each has read, and a clone names the runs and
+/// reads them again (a clone that copied a 500 MB text would break the sizing rule A-760 keeps), so it carries none.
+#[derive(Debug, Default)]
+pub struct Read(pub(crate) Vec<Vec<u8>>);
+
+impl Clone for Read {
+  fn clone(&self) -> Read {
+    Read(Vec::new())
+  }
+}
+
+impl PartialEq for Read {
+  fn eq(&self, _other: &Read) -> bool {
+    true
+  }
+}
+
+impl Eq for Read {}
+
+/// A work's post-state as the engine reads it (A-760): its inline bytes, then each named run's bytes as read, one
+/// address space an op's `src` indexes. A span inside one piece is lent, one across pieces copied.
+#[derive(Clone, Copy, Debug)]
+pub struct Post<'a> {
+  /// The inline bytes.
+  pub(crate) inline: &'a [u8],
+  /// Each run's bytes as read.
+  pub(crate) runs: &'a [Vec<u8>],
+}
+
+impl<'a> Post<'a> {
+  /// The post-state of `inline` bytes and `runs`.
+  pub(crate) fn of(inline: &'a [u8], runs: &'a [Vec<u8>]) -> Post<'a> {
+    Post { inline, runs }
+  }
+
+  /// Its length: the inline bytes and every run's as read.
+  pub(crate) fn len(&self) -> u64 {
+    let runs = self
+      .runs
+      .iter()
+      .fold(0usize, |total, run| total.saturating_add(run.len()));
+    u64::try_from(self.inline.len().saturating_add(runs)).unwrap_or(u64::MAX)
+  }
+
+  /// The run whose bytes are exactly the `len` bytes at `src`, by its place: what a whole text's file is made of.
+  pub(crate) fn whole_run(&self, src: u64, len: u64) -> Option<usize> {
+    let mut start = u64::try_from(self.inline.len()).ok()?;
+    for (at, run) in self.runs.iter().enumerate() {
+      let run_len = u64::try_from(run.len()).ok()?;
+      if src == start && len == run_len {
+        return Some(at);
+      }
+      start = start.saturating_add(run_len);
+    }
+    None
+  }
+
+  /// The `len` bytes at `src`, clamped to its length (as a slice of one buffer was).
+  pub(crate) fn span(&self, src: u64, len: u64) -> std::borrow::Cow<'a, [u8]> {
+    let end = src.saturating_add(len).min(self.len());
+    let mut pieces: Vec<&'a [u8]> = Vec::new();
+    let mut start = 0u64;
+    for piece in core::iter::once(self.inline).chain(self.runs.iter().map(Vec::as_slice)) {
+      let piece_end = start.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+      if src < piece_end && end > start {
+        let from = usize::try_from(src.saturating_sub(start)).unwrap_or(usize::MAX);
+        let to = usize::try_from(end.min(piece_end).saturating_sub(start)).unwrap_or(usize::MAX);
+        pieces.push(piece.get(from..to).unwrap_or_default());
+      }
+      if piece_end >= end {
+        break;
+      }
+      start = piece_end;
+    }
+    match pieces.as_slice() {
+      [] => std::borrow::Cow::Borrowed(&[]),
+      [one] => std::borrow::Cow::Borrowed(one),
+      many => std::borrow::Cow::Owned(many.concat()),
+    }
+  }
 }
 
 impl Named {
