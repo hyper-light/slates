@@ -12053,9 +12053,10 @@ is one more version, and the chain itself is never rewritten.
 > trees from its path map's change, and its commit from its tree, its parents' commits, the merge record's principal
 > and time and the submit's message, so every holder computes the same commit (§4.16 "Apply on holders"); a version a
 > client pushed keeps the client's commit. Item 4's identities are kept in each principal's record (A-664 part 1,
-> `slates-db`'s `IdentityRecord`). Owed: setting them on the control channel, a session carrying them from its first
-> submit, and the refusals at submit (part 1's server half), the commit recorded with the version and admitted (part
-> 3), Mercurial's and Subversion's.
+> `slates-db`'s `IdentityRecord`), set by their owner on the control channel (`SetIdentities`), read once a session at
+> its first submit and carried by every submit with its message (`Authorship`); a repository's green refuses a submit
+> without either, `MessageRequired` or `IdentityRequired`, before any work is built (A-664 part 1). Owed: the commit
+> recorded with the version and admitted (part 3), Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -47319,3 +47320,42 @@ Applied in the same change to:
   slates-merge --lib`): 177 of 178 at ac6a83b09, A-643's model failing as said; 178 of 178 at e8c10097e; the census
   33 refused and 13 kept at a late link, 130 agreed, 102 refused by the deriver, 34 conflicts; `cargo fmt -p
   slates-merge -- --check` clean.
+
+### A-664 part 1, the server half — A submit carries its message and its session's identities, and a repository's green refuses one without either before any work is built (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.13; §4.17.1 "A push is a work" item 4; after A-664 part 1's record, A-285, A-247)
+
+- **The submit carries what the commit needs** (`slates_ipc::protocol::Authorship`, appended to the six submit
+  variants): the message the client gives, and the session's tool identities (`ToolIdentities`: git's name and email,
+  Mercurial's user). `RequestBody::submit(work, evidence)` is the one way a `Submit` is made and `with_message` adds a
+  message, so a field a submit gains is not restated at its callers; every test site now uses them (61 rewritten).
+  `slates_client::Client::submit_with_message` sends one; the api maps the two refusals (`Invalid::MessageRequired`,
+  `Invalid::IdentityRequired(tool)`).
+- **Set by the owner** (`SetIdentities`, `slates-server`'s `identities`): the launcher's act on the control channel,
+  proven by the keyed hash under its secret (`landing::identities_proof`, its own domain), refused `Forbidden` on a
+  consumer's channel whatever its proof and `GrantIssuerUnverified` without it; git's identity held to git's own rules
+  (`slates_git::derived::Identity`) and Mercurial's user to one line, else `BadRequest` naming the part; recorded on the
+  principal's partition (a consumer's, the one its id names; any other's, the one its key hashes to) as the version
+  after the one read (`PolicyChanged` from a stale read), answered `IdentitiesSet`.
+- **Read once a session** (main's ruling, 2026-11-19): at a session's first submit the channel reads the principal's
+  identities from its partition as a task, keeps them with the session (`ClientSlot::identities`), then routes the
+  submit as any request (`verbs::route_gated`, the tail of `verbs::serve` it shares); every later submit of the session
+  carries the kept identities, written over whatever the client sent. The green's owner never reads a record for a
+  merge, and a setting made mid-session applies from the next session.
+- **Refused before any work is built** (`identities::refused_for_its_commit`, in `verbs::judge_submission` beside
+  `EvidenceRequired`, before the increment is built, on the owner whether the work's shard asked it or not, A-247): a
+  submit to a green of a repository's lineage without a message is refused `MessageRequired`, and one whose session has
+  no identity in a git or Mercurial repository's tool `IdentityRequired { tool }`. A plain green takes either. A stock
+  client's push is judged on the push path and is never a submit. Subversion's author is the principal's own name,
+  owed with its revisions.
+- **Wire** (`slates-ipc`, published): `RequestBody::SetIdentities` tag 87, `Refusal::MessageRequired` 76 and
+  `IdentityRequired` 77, `ReplyBody::IdentitiesSet` 74.
+- **Tests** (`crates/server/src/identities/tests.rs`; Windows x86_64, jupiter, 2026-11-19, a fresh clone of the pushed
+  branch with its own target directory; the macOS run is owed): RESULTS_ENTRY
+- **Owed.** The session path end to end in main's daemon lane (an agent's two submits read the identities once, counted
+  `identities.read`; a setting mid-session applies from the next session); the SDKs' and the CLI's surfaces; Subversion's
+  author; part 3 (the merge record carrying the message and the identities, and the commit admitted, over A-662).
+- **Applied in the same change to:** `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`;
+  `crates/server/src/identities.rs`, `identities/tests.rs` (new), `verbs.rs`, `work_home.rs`, `state.rs`, `landing.rs`,
+  `lib.rs`, `daemon.rs`, `deadlines.rs`, `reap.rs`, `repository.rs`; `crates/api/src/error.rs`;
+  `crates/client/src/client.rs`; the submit sites of `crates/server/tests/{daemon,fleet,verdict_pages,works_off_owner}.rs`,
+  `crates/client/tests/edit_and_submit.rs`, `crates/client/examples/load_bench.rs`; §4.17.1 "A push is a work"'s
+  status; GAPS' §4.17 entry.

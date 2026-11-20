@@ -17,13 +17,15 @@
 > Mercurial's `Name <address>`), kept by principal key on the principal's partition, set whole as the version after
 > the one held (`Op::IdentitiesSet`, wire tag 98; a stale setting refused `PolicyChanged`, nothing changed) and carried
 > by the partition's snapshot (`slates-db --lib` 144 of 144 and `--test wire_order` on Windows x86_64, jupiter; the
-> macOS run owed). OWED: part 1's server half (after main's `slates-server` baseline on jupiter): the owner's setting on
-> the control channel (the launcher's proof, `Forbidden` on a consumer's channel, each identity held to its tool's
-> rules); a session's identities resolved once, at its first submit, from the principal's partition and kept with the
-> session (main's ruling: the owner never reads them per merge, and a change mid-session applies from the next
-> session); the submit carrying its message and the session's identities, refused at the green's owner
-> `MessageRequired` without a message and `IdentityRequired` without an identity in the repository's tool, before any
-> work is built; part 3, the made commit recorded with the version (the merge record
+> macOS run owed). Part 1's server half BUILT (RESULTS_GAPS): `SetIdentities` on the control channel (the launcher's
+> proof, `Forbidden` on a consumer's channel, git's identity held to `slates_git::derived::Identity`, a one-line
+> Mercurial user), recorded on the principal's partition; a session's identities read once, at its first submit, kept
+> with the session and written into each submit over the client's claim (main's ruling); every submit carrying its
+> message (`Authorship`; `RequestBody::submit` the one constructor, `with_message` the builder); the green's owner
+> refusing `MessageRequired` and `IdentityRequired` beside `EvidenceRequired`, before any work is built. OWED: the
+> session path proven end to end in main's daemon lane (an agent's two submits read its identities once; a setting
+> mid-session applies from the next session); the SDKs' and the CLI's surfaces (a message on submit, setting
+> identities); Subversion's author (its revisions); part 3, the made commit recorded with the version (the merge record
 > carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
 > it and the branch's head names it; the green's state as the path map these types read (A-647's owed map), its classes
 > `FileClass`'s; a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
