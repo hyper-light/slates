@@ -6863,3 +6863,13 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - clippy + xtask over `crates/vfs` (content.rs Pins/pin_chunk/unpin_chunk/unpin_extents, volume.rs pin_extents/PinnedFile) and `crates/server/src/live_ship.rs` (Capture, start_capture, advance_capture, read_capture, release_capture).
 - Flows (macOS arm64 debug, `SLATES_TEST_CLI=1`): `cargo test -p slates-cli --test live_fleet -- a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns a_live_write_ships_the_bytes_it_changed_not_its_window` and the takeover flows; `--test live_chaos a_member_that_never_held_the_log_never_stands_in_for_its_holder` under `taskpolicy -b`. Red: a rebuild refused (`fleet.live.refused.*`), `fleet.live.capture_unpin_refused` > 0, or a successor serving bytes other than the owner's.
 - Release A/B of the takeover's `published_before_served` turn (before: 21 ms debug, of which capture reads 4.5-6 ms); expect the reads gone from that turn, the image (2-3 ms debug) left.
+
+## 2026-11-20, w-reaper: A-748 on Windows after w-interop's git matrix met "Failed to connect to 127.0.0.1:61367" (main's ask; base fe7cb5232)
+- Windows x86_64 (jupiter): `cargo test -p slates-cli --test vcs_edge_restart -- --nocapture`
+  (`a_daemon_restart_keeps_every_version_control_listeners_port`); I'm running it as kiln r48 now. Then rerun w-interop's
+  `matrix-git` on jupiter at the same base.
+- Red would look like: a port different after the restart, or a connect refused while the daemon restarts (the anchor
+  must hold each listener, so a connect waits in its backlog).
+- What the logs show (C:\Users\corph\.cache\w-interop\matrix-git\anchor.log): the daemon was killed (exit 143) at
+  12:42:43.98 and restarted as pid 470456. That is after the last row's log (ssh-fetch, 12:42:42), and the successor
+  logged nothing before the run ended. No row log in logs\ holds the "Failed to connect" text.
