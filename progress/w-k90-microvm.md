@@ -14,8 +14,17 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
 - Kiln side: g262's re-vendor e4d7f4eae (Slates 38ed3dfd8, CONTRACT 50) merged with kiln main f7ec15878 cleanly as
   23f066947 in ~/kiln-work/w-k90-microvm-a587 (branch agents/w-k90-microvm-a587, pushed). vendor.py check slates: 1355
   files, 1 recorded change, 0 differences.
-- Run r1 (kiln, linux/amd64): `cargo +stable test --locked -p kiln --lib -- workspace::slates` -- queued.
+- Run r1 (kiln, linux/amd64): `cargo +stable test --locked -p kiln --lib -- workspace::slates` -- queued (Linux under strain).
+- Run r2 (kiln, needs macos,cpus=8,mem=32g,disk=60g): ci/shards/pack.sh + the HVF `microvm::` drive on 23f066947,
+  log ~/.cache/w-k90-microvm-hvf.log on whichever Mac ran it.
 - Then: land on kiln main; the macOS HVF drive (`SLATES_E2E=1 VM_E2E=1 cargo test -p kiln --test slates_e2e microvm::`)
   needs a Mac with room for a ~25 GB target.
-## Piece 2: SlatesVolumes keeps slates' resync end -- not started
+## Piece 2: SlatesVolumes keeps slates' resync end -- BLOCKED on Shards (then Hex)
+- Slates hands `ShardsStream { stream, resync: Option<StreamEnd> }`; kiln's served.rs returns `served.stream` alone
+  because Hex's `hex_api::serve::Servers::stream` returns one `Stream`, and Shards' `ServedStream` /
+  `--slates-fs-fd` take one end. Shards main 7158020b6 (= kiln's vendor) has NO resync anywhere (crates, docs, any of
+  its 432 branches). Kiln holding the end alone would change nothing: no device reads it. Needs, in order: Shards' VMM
+  device takes a resync end and speaks Slates' Resync (A-316/A-339 Unix, A-418/A-427 Windows) beside its stream (an
+  image-channel field, frozen-wire growth: Shards' owner, "shards-7f", per focus-84-90.md), then Hex's Servers returns
+  both ends, then kiln passes `served.resync`. Reported to main.
 ## Piece 3: Shards microVM engine proven on KVM (adacachy), HVF; WHP BLOCKED (jupiter takes no kiln work)
