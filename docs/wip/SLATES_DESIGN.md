@@ -15956,7 +15956,7 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3; its room built, below), the cold trigger (4; its choice and git's drop built:
 > `slates_vcs::cold::choose`, `Repository::kept_fragments`/`drop_fragments`, and the server's trigger in
 > `vcs_share::room`; compression of cold content owed), intake off the owner
-> shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
+> shard and content homed by identity across shards (5; the homes built: `vcs_store::homes`; intake off the owner owed), the fleet's placement by identity (6, main's ruling first: it
 > amends §4.10's content placement), the many-repository load proof (7), the snapshot sized by its data (8) and a
 > giant repository's index across partitions (9), both designed below.
 
@@ -54708,3 +54708,15 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   integration `engine`, `checkpoint`, `chain_replay`, `rebase`, `splice`, `verdict`, `base_for` green; fmt clean.
 - **Owed.** Part 2: a splice's added runs named in the new block, copied out when the value is superseded. Part 3: the
   1,000-revision Subversion profile (`crates/cli/bench/svn_scale.sh`) before and after, in BENCHMARKS.md.
+- **Piece 5a, identity homes across a node's shards (2026-11-20).** `crate::vcs_store::homes`: a window (at most one
+  window of content, named by its plain BLAKE3) is homed at the shard of the node that rendezvous ranks first for its
+  identity, kept there in that shard's one content store (deduplicated with what its repositories hold, charged to its
+  budget, held once a sender), read back and let go by identity through cross-shard calls judged in the home's own
+  time; an object past a window homes as its windows. The weight is the one every placement ranks by:
+  `slates_db::register::rendezvous_weight_of` (factored out of `rendezvous_weight` with its outputs unchanged) and
+  `rendezvous_ranked_by_key`, so piece 6's fleet homes rank the region's members the same way. No catalog, no
+  coordination call. Tests: `vcs_store::homes::tests` (the home is the ranking's head and homes spread over four
+  shards; on a four-shard daemon 64 windows homed, read back whole, one homed twice kept to its second let-go, all
+  freed, past a window refused) and `slates-db` `register::` 93 of 93. Owed: the cold trigger's third lever moving a
+  repository's cold windows to their homes and the stores reading through them; the intake's decoding and hashing on
+  the shard its connection arrived at (with w-git's A-722).
