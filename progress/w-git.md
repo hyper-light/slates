@@ -254,3 +254,11 @@
   9.73 s (+45% CPU). Suspect: staging reads in id order -> chains re-inflated. Fix drafted (agents/w-git-order
   cf0941c6e: Push.order = admission order, staging Step::Putting before Forking). Profile run r42 (sample) pending.
 - Replied to w-store's changeset-log ask (inbox/w-store-from-w-git-changeset-log-2026-11-20.md): names section.
+- 14:40 LANDED 47dc24b72 (staging puts in resolution order: 229,619 -> 168,761 steps). 15:00 LANDED 15917f29a
+  (walk notes staged positions; one move one run). 15:10 LANDED ccd07b58c (holds given back in turns after the
+  landing). v1.5.0 store commit 14.0 -> 0.63 ms; longest step 35.8 -> 23.4 ms, of which the entry's apply is 19 ms
+  (pack in record; asked main: home the pack as content, or wait for w-store's changeset payload). Main's socket
+  slates-9a is gone; reports are in inbox/main-from-w-git.md.
+- Diag kit on the Studio: ~/.cache/w-git-diag/{v150.request, diag2.rs, phase_patch.py, phase_patch2.py}; release
+  target ~/.cache/w-git-target-rel.noindex (delete when done).
+- NEXT: git_replay reads a record's pack whole (Unpacked) -> read in place as the live push does.
