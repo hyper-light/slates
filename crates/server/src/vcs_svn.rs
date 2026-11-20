@@ -75,7 +75,7 @@ use slates_svn::handshake::{Access, Unserved};
 use slates_svn::index::{ContentIdentity, Revision};
 use slates_svn::lock::AprTime;
 use slates_svn::migration::Repository as SvnRecords;
-use slates_svn::report::exchange::Budget;
+use slates_svn::report::exchange::{Budget, Quantum};
 use slates_svn::serve::{CommitStart, Connection, Limits, Made, Policy, Sources, Turn};
 
 use slates_vfs::clock::Clock;
@@ -908,16 +908,30 @@ async fn located_step(
   }
 }
 
+/// `budget` timed by the shard's step quantum (A-745, §4.17.1 "A fetch's answer" rule 3): a report's drive then taken a
+/// step at a time until the quantum has run, whatever its room; as it is where no shard's state is reached (the tests).
+pub(crate) fn timed(budget: Budget) -> Budget {
+  match crate::state::with_state(|state| crate::vcs_store::hg_import::quantum_of(state)) {
+    Some(ns) => Budget {
+      steps: 1,
+      quantum: Some(Quantum { now_ns, ns }),
+      ..budget
+    },
+    None => budget,
+  }
+}
+
 /// What the conversation's connection makes of the client's bytes, its output appended to `out` (the module doc):
 /// before a session is established the handshake asks for more bytes, hands over the client's answer, whose URL is
 /// resolved, or asks for a CRAM-MD5 challenge or key; once the client authenticated, each call is handed its
 /// repository's sources, lent afresh on the owner ([`lend_in`]). A commit, and any refusal, ends the connection, the
 /// refusal's words already in `out`.
 fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
-  let budget = Budget {
+  let budget = timed(Budget {
     room: conversation.limits.item_bytes,
     steps: conversation.limits.most_open,
-  };
+    quantum: None,
+  });
   let Conversation {
     connection,
     input,

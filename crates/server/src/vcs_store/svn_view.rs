@@ -48,6 +48,10 @@ pub(crate) struct ServedRecords;
 impl SvnStores for ServedRecords {
   type Repository = SvnRecords;
 
+  fn fetch_quantum(&self) -> Option<u64> {
+    crate::state::with_state(|state| crate::vcs_store::hg_import::quantum_of(state))
+  }
+
   fn holds(&self, id: RepositoryId) -> bool {
     crate::state::with_state(|state| state.vcs_stores.subversion_records(id).is_some())
       .unwrap_or(false)

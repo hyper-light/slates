@@ -556,7 +556,8 @@ fn turns_of(fixture: &Fixture, recorded: Recorded, budget: Budget) -> Vec<Writte
   let (mut input, mut answer) = client_parts(recorded, index);
   let locks = session_locks(recorded);
   let mut out = Vec::new();
-  let Opened::Reporting(mut exchange) = Exchange::begin(&context, request, &mut out).unwrap() else {
+  let Opened::Reporting(mut exchange) = Exchange::begin(&context, request, &mut out).unwrap()
+  else {
     panic!("{}: refused at its beginning", recorded.name);
   };
   let anonymous = rules_of(None);
@@ -570,7 +571,9 @@ fn turns_of(fixture: &Fixture, recorded: Recorded, budget: Budget) -> Vec<Writte
   let mut turns = vec![(out, false)];
   loop {
     let mut wrote = Vec::new();
-    let turn = exchange.receive(&sources, &input, &mut wrote, budget).unwrap();
+    let turn = exchange
+      .receive(&sources, &input, &mut wrote, budget)
+      .unwrap();
     turns.push((wrote, !matches!(turn, Turn::Answered { .. })));
     match turn {
       Turn::NeedMore { .. } if !answer.is_empty() => input.append(&mut answer),
@@ -650,7 +653,10 @@ fn a_turn_of_a_drive_ends_at_the_first_step_past_its_quantum() {
   let fixture = fixture();
   let timed = Budget {
     steps: 1,
-    quantum: Some(Quantum { now_ns: tick, ns: 1 }),
+    quantum: Some(Quantum {
+      now_ns: tick,
+      ns: 1,
+    }),
     ..PLENTY
   };
   for name in SLICED {

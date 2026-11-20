@@ -73,6 +73,7 @@ const BOUNDS: TunnelBounds = TunnelBounds {
   budget: Budget {
     room: 1 << 24,
     steps: 1 << 20,
+    quantum: None,
   },
   commit_room: 1 << 30,
 };

@@ -77,7 +77,7 @@ use slates_svn::dav::commit::{
 use slates_svn::dav::locking::{self, HttpAnswer, LockHttp, UnlockHttp};
 use slates_svn::dav::response::MergeResponse;
 use slates_svn::dav::site::{
-  self, Answer as SiteAnswer, Headers, Report, ReportProgress, Request, Served,
+  self, Answer as SiteAnswer, Budget, Headers, Quantum, Report, ReportProgress, Request, Served,
 };
 use slates_svn::dav::xml::Element;
 use slates_svn::index::NodeKind;
@@ -152,6 +152,11 @@ pub(crate) trait SvnStores {
   type Repository: Repository + ?Sized;
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
+  /// The time each slice of a fetch's answer may run (A-745, §4.17.1 "A fetch's answer" rule 3): the shard's step
+  /// quantum; `None` where the lender names none, and a slice is as many steps as its room.
+  fn fetch_quantum(&self) -> Option<u64> {
+    None
+  }
   /// Runs `step` over repository `id`'s store as `principal` reads it; none when it is not held here.
   fn lend<T>(
     &mut self,
@@ -461,6 +466,26 @@ enum Answered {
   },
 }
 
+/// One slice's budget of a report's answer (A-745, §4.17.1 "A fetch's answer"): `room` bytes, taken a step of the
+/// drive at a time until `quantum` has run where the lender names one, else as many steps as the room.
+fn slice_budget(room: usize, quantum: Option<u64>) -> Budget {
+  match quantum {
+    Some(ns) => Budget {
+      room,
+      steps: 1,
+      quantum: Some(Quantum {
+        now_ns: slates_rt::futures::now_ns,
+        ns,
+      }),
+    },
+    None => Budget {
+      room,
+      steps: room,
+      quantum: None,
+    },
+  }
+}
+
 /// The repository as `site` reads it for one step: what `lent` lends, under the repository root's URL path `root`.
 fn served_of<'a, R: ?Sized>(lent: &'a Lent<'a, R>, root: &'a str) -> Served<'a, R> {
   Served {
@@ -487,9 +512,10 @@ async fn first_slices<S: SvnStores>(
   let (repository, principal, root) = asker;
   let mut pending = Vec::new();
   loop {
+    let budget = slice_budget(room, stores.fetch_quantum());
     let progress = stores
       .lend(repository, principal, |lent| {
-        report.resume(&served_of(lent, root), &mut pending, room)
+        report.resume(&served_of(lent, root), &mut pending, budget)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     let done = match progress {
@@ -1603,11 +1629,12 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
           out.append(pending);
           return Ok(!*done);
         }
-        let (root, room) = (self.root.as_str(), to_usize(self.request_room));
+        let root = self.root.as_str();
+        let budget = slice_budget(to_usize(self.request_room), self.stores.fetch_quantum());
         let progress = self
           .stores
           .lend(self.repository, &self.principal, |lent| {
-            report.resume(&served_of(lent, root), out, room)
+            report.resume(&served_of(lent, root), out, budget)
           })
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
         match progress {

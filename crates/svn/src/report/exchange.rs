@@ -116,7 +116,7 @@ const MALFORMED_DATA: &str = "Malformed network data";
 /// What one call may do: the bytes it may add to the output, the steps it gives the drive and the
 /// time it may run. A call writes at least one of the drive's calls and gives it at least one step,
 /// so an exchange always ends.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
   /// The bytes the output may grow by before the call hands the turn back.
   pub room: usize,
@@ -137,6 +137,15 @@ pub struct Quantum {
   /// The nanoseconds a call may run.
   pub ns: u64,
 }
+
+impl PartialEq for Quantum {
+  /// The same clock, by its address, and the same nanoseconds.
+  fn eq(&self, other: &Self) -> bool {
+    std::ptr::fn_addr_eq(self.now_ns, other.now_ns) && self.ns == other.ns
+  }
+}
+
+impl Eq for Quantum {}
 
 /// One call's time, from its start ([`Quantum`]).
 #[derive(Clone, Copy, Debug)]
@@ -354,7 +363,13 @@ impl Exchange {
       Phase::Reporting(reporter) => self.report(reporter, input, out),
       Phase::Driving(drive, writer) => {
         let slice = Slice::begin(budget.quantum);
-        self.drive((drive, writer), sources, input, (out, start, held), (budget, slice))
+        self.drive(
+          (drive, writer),
+          sources,
+          input,
+          (out, start, held),
+          (budget, slice),
+        )
       }
       Phase::Closing(writer) => self.closing(writer, input, out),
       Phase::Aborting(abort) => self.aborting(abort, input, out),

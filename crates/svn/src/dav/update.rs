@@ -257,7 +257,9 @@ impl UpdateWalk {
       (Stop::Ended, None) => {
         writer.take_written(&mut written);
         match writer.finish() {
-          Ok(mut rest) if written.len().saturating_add(rest.len()) > room && !written.is_empty() => {
+          Ok(mut rest)
+            if written.len().saturating_add(rest.len()) > room && !written.is_empty() =>
+          {
             self.begun = true;
             self.held.append(&mut rest);
             out.extend_from_slice(&written);

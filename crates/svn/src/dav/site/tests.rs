@@ -743,7 +743,10 @@ fn an_update_report_on_me_streams_a_checkout_and_refuses_a_revision_past_the_you
 /// send-all mode.
 fn update_report() -> Vec<u8> {
   String::from_utf8_lossy(CHECKOUT_REPORT)
-    .replace("rev=\"5\" depth=\"infinity\" start-empty=\"true\"", "rev=\"1\" depth=\"infinity\"")
+    .replace(
+      "rev=\"5\" depth=\"infinity\" start-empty=\"true\"",
+      "rev=\"1\" depth=\"infinity\"",
+    )
     .into_bytes()
 }
 
@@ -822,7 +825,10 @@ fn a_slice_of_an_update_report_ends_at_the_first_step_past_its_quantum() {
   let timed = Budget {
     room: ROOM,
     steps: 1,
-    quantum: Some(Quantum { now_ns: tick, ns: 1 }),
+    quantum: Some(Quantum {
+      now_ns: tick,
+      ns: 1,
+    }),
   };
   for body in [CHECKOUT_REPORT.to_vec(), update_report()] {
     let (whole, calls) = whole_and_calls(&fixture, &body);
