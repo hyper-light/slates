@@ -946,3 +946,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - GOALS MET (main, verified): event-driven reaper (A-709 9b93fd77c, A-715 f70230cc8, reap_loop deleted); A-583 fleet
   tests; A-503 move test (macOS arm64; Linux run r627 queued, adacachy full). w-reaper sent a stale "reap tick"
   comment/name sweep (dax_backing, daemon.rs, cli.rs test, nfs_large_write bench).
+- ~00:50 PST w-shared A-636 2c-2 landed c7c18db3e (c8452ee97): successor rebuilds a taken-over repository by keep-whole
+  rule, Op::RepositoryRebuilt (wire 101). Finding: rebuilt store holds no objects (state log parts carry none) -> rides
+  content once (entries name green content by identity; successor holds the family's content); fetching parts a
+  successor doesn't hold stays owed. Next: A-664 holders' maps.
