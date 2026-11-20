@@ -1,0 +1,177 @@
+name: DIAG w-bugs -- B3 (fsx wedge over the WinFsp drive), stacks while wedged (not for main)
+
+# Goal 87 (every open slates bug): does fsx seed 1 still wedge over the WinFsp drive (B3, A-209)?
+# The job's logs need admin rights to read, so every output is published to a results branch.
+
+on:
+  push:
+    branches: ['diag-w-bugs-[a-z0-9]*-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+    name: probe on ${{ matrix.runner }}
+    if: startsWith(github.ref_name, 'diag-w-bugs-b3')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      RESULTS_BRANCH: ${{ github.ref_name }}-results-${{ github.run_id }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Publisher
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          # One commit per call on the results branch holding every file in $RUNNER_TEMP/out; never fails the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          entries=""
+          for f in "$RUNNER_TEMP"/out/*; do
+            [ -f "$f" ] || continue
+            b=$(tail -c 3000000 "$f" | git hash-object -w --stdin) || continue
+            entries="$entries$(printf '100644 blob %s\t%s' "$b" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push -q origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD)" > "$RUNNER_TEMP/out/status.txt"
+          "$RUNNER_TEMP/publish.sh"
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount 20 -RetryIntervalSec 60 -TimeoutSec 120
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: fsx over the WinFsp drive, with every thread's stack taken while it is wedged
+        shell: bash
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          set +e
+          out="$RUNNER_TEMP/out"
+          cargo build --locked -p slates-cli --bin slates -p xtask > "$out/build.txt" 2>&1
+          echo "build exit $?" >> "$out/status.txt"
+          cdb=""
+          for c in "/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe" "/c/Program Files/Windows Kits/10/Debuggers/x64/cdb.exe"; do
+            [ -x "$c" ] && cdb="$c" && break
+          done
+          echo "cdb: ${cdb:-none}" >> "$out/status.txt"
+          cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep > "$out/fsx.txt" 2>&1 &
+          xt=$!
+          for round in 1 2 3; do
+            sleep 90
+            {
+              echo "==== round $round at $(date -u +%T)"
+              tasklist //v //fi "IMAGENAME eq slates.exe"
+              tasklist //v //fi "IMAGENAME eq fsx.exe"
+            } >> "$out/stacks.txt" 2>&1
+            for img in slates.exe fsx.exe; do
+              for pid in $(tasklist //fo csv //nh //fi "IMAGENAME eq $img" | tr -d '"\r' | cut -d, -f2); do
+                echo "==== $img pid $pid round $round" >> "$out/stacks.txt"
+                [ -n "$cdb" ] && timeout 120 "$cdb" -pv -p "$pid" -c ".symfix c:\\symbols; .reload; ~*kn 40; qd" >> "$out/stacks.txt" 2>&1
+              done
+            done
+            "$RUNNER_TEMP/publish.sh"
+          done
+          wait $xt
+          echo "fsx exit $?" >> "$out/status.txt"
+          "$RUNNER_TEMP/publish.sh"
+      - name: Publish whatever was found
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find target/conformance-records target/conformance-scratch -maxdepth 4 -type f -size -2M 2>/dev/null | head -60 > "$RUNNER_TEMP/out/files.txt"
+          i=0
+          while read -r f; do i=$((i+1)); cp "$f" "$RUNNER_TEMP/out/rec-$i-$(basename "$f")"; done < "$RUNNER_TEMP/out/files.txt"
+          echo "ended $(date -u +%FT%TZ)" >> "$RUNNER_TEMP/out/status.txt"
+          bash "$RUNNER_TEMP/publish.sh"
+
+  # B11: the FUSE coherence chaos test panicked once on CI's Linux lane (run 40252840969, EIO on a third seed).
+  # Thirty runs of it alone, each verdict and its output's last lines published.
+  b11:
+    if: startsWith(github.ref_name, 'diag-w-bugs-b11')
+    name: B11 coherence chaos x50 beside two spinners a CPU on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      RESULTS_BRANCH: ${{ github.ref_name }}-results-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: fuse3 and user_allow_other
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -q '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          ls -l /dev/fuse
+      - name: Thirty runs, published as they go
+        shell: bash
+        run: |
+          set +e
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          publish() {
+            entries=""
+            for f in "$out"/*; do
+              b=$(tail -c 3000000 "$f" | git hash-object -w --stdin)
+              entries="$entries$(printf '100644 blob %s\t%s' "$b" "$(basename "$f")")"$'\n'
+            done
+            tree=$(printf '%s' "$entries" | git mktree)
+            parent=$(cat "$RUNNER_TEMP/parent" 2>/dev/null)
+            c=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID")
+            git push -q origin "$c:refs/heads/$RESULTS_BRANCH" && echo "$c" > "$RUNNER_TEMP/parent"
+          }
+          echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD); $(nproc) CPUs; $(uname -r)" > "$out/status.txt"
+          cargo test --locked -p slates-bridge-fuse --test coherence_mount --no-run > "$out/build.txt" 2>&1
+          echo "build exit $?" >> "$out/status.txt"; publish
+          for k in $(seq 1 $(( $(nproc) * 2 ))); do ( while :; do :; done ) & done
+          echo "spinners: $(( $(nproc) * 2 ))" >> "$out/status.txt"
+          for n in $(seq 1 50); do
+            cargo test --locked -p slates-bridge-fuse --test coherence_mount \
+              generated_map_stores_direct_reads_and_other_writes_never_revert_another_paths_write -- --nocapture > "$out/run.txt" 2>&1
+            code=$?
+            echo "run $n exit $code $(grep -cE 'skip' "$out/run.txt") skip-lines" >> "$out/status.txt"
+            if [ $code -ne 0 ]; then cp "$out/run.txt" "$out/failed-$n.txt"; fi
+            [ $((n % 5)) -eq 0 ] && publish
+          done
+          tail -c 20000 "$out/run.txt" > "$out/last-run.txt"; rm -f "$out/run.txt"
+          echo "ended $(date -u +%FT%TZ)" >> "$out/status.txt"; publish
