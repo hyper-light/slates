@@ -4,11 +4,18 @@
 //! `unlock ( path:string ( [token:string] ) break:bool )` and
 //! `unlock-many ( break:bool ( ( path:string ( [token:string] ) ) ... ) )`.
 //!
-//! **Two steps** ([`Connection::lock_verb`], then [`Connection::locks_landed`]). The connection judges the request
-//! against the lock table at the owner's instant (A-602's guard, `LockTable::lock` and `LockTable::unlock`, the head
-//! read from the index) and hands its caller the entries it makes; the caller lands them through the owner's step (a
-//! `Record::Locks`, durable as a revision is) and says whether they landed; then the connection answers as `svnserve`
-//! does. So nothing of the table changes until the step has recorded it.
+//! **Four steps** (A-730, `fs-wrap.c` `svn_repos_fs_lock_many` and `svn_repos_fs_unlock_many`). [`Connection::lock_verb`]
+//! reads the request and checks access, then hands its caller each writable path's pre-hook call ([`LockHookCall`]:
+//! pre-lock with the user, the comment and whether the lock is stolen; pre-unlock with the user, the token presented and
+//! whether it is broken). The caller runs the repository's hook and hands back each path's verdict ([`PreHooked`]):
+//! [`Connection::lock_judged`] answers a refused path with the hook's chain, makes a lock with the token pre-lock gave,
+//! and judges the rest against the lock table at the owner's instant (A-602's guard, `LockTable::lock` and
+//! `LockTable::unlock`, the head read from the index), handing its caller the entries it makes; the caller lands them
+//! through the owner's step (a `Record::Locks`, durable as a revision is) and says whether they landed:
+//! [`Connection::locks_landed`] answers each path (`lock-many`'s and `unlock-many`'s, then `done`) and hands back the
+//! post-hook's call over the paths changed, none where none changed; the caller runs it, and
+//! [`Connection::locks_finished`] ends the verb with success or the post-hook's failure, the locks standing. So nothing
+//! of the table changes until the step has recorded it, and a hook runs where `svnserve` runs it.
 //!
 //! **Access** (`must_have_access` for a write, a user needed unless an unlock breaks): an anonymous session that could
 //! authenticate is asked to, for the command, and the verb runs again once it has (with no trivial authentication
@@ -22,7 +29,7 @@
 //! refuses whole (no user, a comment XML cannot carry) answers each path "No result for '…'." (160059) and then fails
 //! with the refusal after `done`. A lock is written as `write_lock` writes it (`crate::reads::locks`).
 //!
-//! **Not here.** The pre-lock and post-lock hooks run nowhere yet (GAPS).
+//! **The hooks** are the caller's to run (they are processes; `slates-server`'s `svn_hooks`), between these steps.
 
 use std::collections::BTreeMap;
 
@@ -122,12 +129,48 @@ pub(super) struct Pending {
   verb: Verb,
   /// Each path's answer in the client's order: its lock (an unlock's none), or its failure.
   answers: Vec<PathAnswer>,
+  /// Each path's repository path, in the same order: what the post-hook names.
+  fulls: Vec<String>,
+  /// The session's user, empty for none: what the post-hook names.
+  user: String,
   /// The whole request's refusal.
   whole: Option<Failure>,
 }
 
-/// A path and its answer: its lock (an unlock's none), or its failure.
-type PathAnswer = (Vec<u8>, Result<Option<Lock>, Failure>);
+/// A path and its answer: its lock (an unlock's none), or its failure's chain, outermost first.
+type PathAnswer = (Vec<u8>, Result<Option<Lock>, Vec<Failure>>);
+
+/// A verb that passed its access checks, its pre-hooks with the caller (A-730): what was asked, by whom, and which of
+/// its paths the session may write.
+pub(super) struct Hooking {
+  /// What was asked.
+  asked: Asked,
+  /// The session's user.
+  user: Option<String>,
+  /// The repository paths the session may write, which are judged.
+  allowed: std::collections::BTreeSet<String>,
+}
+
+/// What a lock verb's hooks are run with (A-730; `hooks.c` `svn_repos__hooks_pre_lock`, `_post_lock`, `_pre_unlock`,
+/// `_post_unlock`), handed to the caller: before the verb is judged, its pre-hook's for each path the session may write;
+/// once its paths are answered, its post-hook's for the paths it locked or unlocked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockHookCall {
+  /// Whether the verb locks (pre-lock, post-lock) or unlocks (pre-unlock, post-unlock).
+  pub locks: bool,
+  /// The session's user, empty for none.
+  pub user: String,
+  /// The lock's comment, empty for none (pre-lock alone).
+  pub comment: String,
+  /// Whether the lock is stolen or broken (the pre-hooks alone).
+  pub force: bool,
+  /// The paths, each its repository path and, for pre-unlock, the token presented (empty for none).
+  pub paths: Vec<(String, String)>,
+}
+
+/// One path's pre-hook verdict (A-730): go on, with the token pre-lock's standard output gave if it gave one; or the
+/// path refused with this chain, outermost first.
+pub type PreHooked = Result<Option<String>, Vec<(u32, String)>>;
 
 /// The head as the lock guard reads it: the index's youngest revision and its nodes.
 struct IndexHead<'i>(&'i Index);
@@ -155,10 +198,8 @@ impl Connection {
   pub fn lock_verb<R: ?Sized>(
     &mut self,
     sources: &Sources<'_, R>,
-    draw: &mut impl FnMut() -> [u8; UUID_BYTES],
-    room: usize,
     out: &mut Vec<u8>,
-  ) -> Result<Option<Vec<LockEntry>>, Refused> {
+  ) -> Result<Option<LockHookCall>, Refused> {
     let (established, item, authenticated_now) =
       match std::mem::replace(&mut self.phase, Phase::Ended) {
         Phase::LockAsked(established, item, authenticated_now) => {
@@ -223,27 +264,113 @@ impl Connection {
     if !authenticated_now {
       trivial_auth(out)?;
     }
-    let allowed =
-      |target: &Target| !asked.verb.many() || may_write(&session, Some(&target.full), needs_user);
+    let allowed: std::collections::BTreeSet<String> = asked
+      .targets
+      .iter()
+      .filter(|target| !asked.verb.many() || may_write(&session, Some(&target.full), needs_user))
+      .map(|target| target.full.clone())
+      .collect();
+    let call = LockHookCall {
+      locks: asked.verb.locks(),
+      user: user.clone().unwrap_or_default(),
+      comment: asked
+        .comment
+        .as_deref()
+        .map(|comment| String::from_utf8_lossy(comment).into_owned())
+        .unwrap_or_default(),
+      force: asked.force,
+      paths: asked
+        .targets
+        .iter()
+        .filter(|target| allowed.contains(&target.full))
+        .map(|target| {
+          (
+            target.full.clone(),
+            target.token.clone().unwrap_or_default(),
+          )
+        })
+        .collect(),
+    };
+    let hooking = Hooking {
+      asked,
+      user,
+      allowed,
+    };
+    self.phase = Phase::LockHooking(established, Box::new(hooking));
+    Ok(Some(call))
+  }
+
+  /// Judges the lock verb whose pre-hooks ran ([`Connection::lock_verb`]'s call), `verdicts` their answers in the
+  /// call's path order (A-730; `fs-wrap.c` `svn_repos_fs_lock_many`): a path a pre-hook refused is answered with the
+  /// hook's chain, pre-lock's token is the lock's, and the rest are judged against `sources`' lock table at their
+  /// instant as before: the entries it makes, which the caller lands and then reports ([`Connection::locks_landed`]).
+  /// New tokens are drawn from `draw`; the table holds at most `room` locks.
+  ///
+  /// # Errors
+  /// [`Refused::OutOfTurn`] unless a verb's pre-hooks were handed out.
+  pub fn lock_judged<R: ?Sized>(
+    &mut self,
+    sources: &Sources<'_, R>,
+    verdicts: Vec<PreHooked>,
+    draw: &mut impl FnMut() -> [u8; UUID_BYTES],
+    room: usize,
+  ) -> Result<Vec<LockEntry>, Refused> {
+    let (established, hooking) = match std::mem::replace(&mut self.phase, Phase::Ended) {
+      Phase::LockHooking(established, hooking) => (established, hooking),
+      other => {
+        self.phase = other;
+        return Err(Refused::OutOfTurn);
+      }
+    };
+    let Hooking {
+      asked,
+      user,
+      allowed,
+    } = *hooking;
+    let paths = asked
+      .targets
+      .iter()
+      .filter(|target| allowed.contains(&target.full))
+      .map(|target| target.full.clone());
+    let mut refused: BTreeMap<String, Vec<Failure>> = BTreeMap::new();
+    let mut tokens: BTreeMap<String, String> = BTreeMap::new();
+    for (path, verdict) in paths.zip(verdicts) {
+      match verdict {
+        Ok(Some(token)) => {
+          tokens.insert(path, token);
+        }
+        Ok(None) => {}
+        Err(chain) => {
+          refused.insert(path, chain);
+        }
+      }
+    }
     let judged = Judged {
       asked: &asked,
       user: user.as_deref(),
       filesystem: sources.policy.filesystem,
     };
-    let (entries, pending) = if asked.verb.locks() {
+    let judged_here =
+      |target: &Target| allowed.contains(&target.full) && !refused.contains_key(&target.full);
+    let (entries, mut pending) = if asked.verb.locks() {
       let head = IndexHead(sources.index);
-      judged.lock(&allowed, |request| {
+      judged.lock(&judged_here, &tokens, |request| {
         sources
           .locks
           .lock(request, &head, sources.now, room, &mut *draw)
       })
     } else {
-      judged.unlock(&allowed, |request| {
+      judged.unlock(&judged_here, |request| {
         sources.locks.unlock(request, sources.now)
       })
     };
+    for ((_, answer), full) in pending.answers.iter_mut().zip(&pending.fulls) {
+      if let Some(chain) = refused.get(full) {
+        *answer = Err(chain.clone());
+      }
+    }
     self.phase = Phase::Locking(established, Box::new(pending));
-    Ok(Some(entries))
+    Ok(entries)
   }
 
   /// Answers the lock verb judged last ([`Connection::lock_verb`]) once its entries `landed` through the owner's step,
@@ -256,7 +383,7 @@ impl Connection {
     &mut self,
     landed: Result<(), Failure>,
     out: &mut Vec<u8>,
-  ) -> Result<(), Refused> {
+  ) -> Result<Option<LockHookCall>, Refused> {
     let (established, mut pending) = match std::mem::replace(&mut self.phase, Phase::Ended) {
       Phase::Locking(established, pending) => (established, pending),
       other => {
@@ -267,11 +394,51 @@ impl Connection {
     if let Err(failure) = landed {
       for (_, answer) in &mut pending.answers {
         if answer.is_ok() {
-          *answer = Err(failure.clone());
+          *answer = Err(vec![failure.clone()]);
         }
       }
     }
-    answer(&pending, out)?;
+    answer_paths(&pending, out)?;
+    // The post-hook runs once over the paths the verb changed, and not at all where it changed none (`fs-wrap.c`).
+    let changed: Vec<(String, String)> = pending
+      .answers
+      .iter()
+      .zip(&pending.fulls)
+      .filter(|((_, answer), _)| answer.is_ok())
+      .map(|(_, full)| (full.clone(), String::new()))
+      .collect();
+    let call = (pending.whole.is_none() && !changed.is_empty()).then(|| LockHookCall {
+      locks: pending.verb.locks(),
+      user: pending.user.clone(),
+      comment: String::new(),
+      force: false,
+      paths: changed,
+    });
+    self.phase = Phase::LockFinishing(established, pending);
+    Ok(call)
+  }
+
+  /// Ends the lock verb whose paths are answered ([`Connection::locks_landed`]) with its post-hook's verdict, `Ok` where
+  /// none ran (A-730): `lock-many`'s and `unlock-many`'s success after their `done`, or the post-hook's failure in its
+  /// place, the locks standing (`svn_repos_fs_lock_many` returns it after its callbacks); `lock`'s and `unlock`'s answer,
+  /// or the post-hook's failure in its place.
+  ///
+  /// # Errors
+  /// [`Refused::OutOfTurn`] unless a verb's paths were just answered; [`Refused::Item`] where an answer cannot be
+  /// written.
+  pub fn locks_finished(
+    &mut self,
+    post: Result<(), Vec<Failure>>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refused> {
+    let (established, pending) = match std::mem::replace(&mut self.phase, Phase::Ended) {
+      Phase::LockFinishing(established, pending) => (established, pending),
+      other => {
+        self.phase = other;
+        return Err(Refused::OutOfTurn);
+      }
+    };
+    answer_end(&pending, post, out)?;
     self.phase = Phase::Commands(established);
     Ok(())
   }
@@ -292,6 +459,7 @@ impl Judged<'_> {
   fn lock(
     &self,
     allowed: &impl Fn(&Target) -> bool,
+    tokens: &BTreeMap<String, String>,
     guard: impl FnOnce(
       &LockRequest,
     ) -> Result<crate::lock::Decision<Result<Lock, LockRefusal>>, LockRefusal>,
@@ -302,9 +470,10 @@ impl Judged<'_> {
       .iter()
       .filter(|target| allowed(target))
       .map(|target| {
+        // pre-lock's token, where it gave one, is the lock's, judged as a client's is (`hooks.c`; A-730).
         let lock_target = LockTarget {
           current: target.revision,
-          token: None,
+          token: tokens.get(&target.full).cloned(),
         };
         (target.full.clone(), lock_target)
       })
@@ -402,12 +571,22 @@ impl Judged<'_> {
           let written = String::from_utf8_lossy(&target.written);
           Err((LOCK_OPERATION_FAILED, format!("No result for '{written}'.")))
         };
-        (target.written.clone(), answer)
+        (
+          target.written.clone(),
+          answer.map_err(|failure| vec![failure]),
+        )
       })
       .collect();
     Pending {
       verb: self.asked.verb,
       answers,
+      fulls: self
+        .asked
+        .targets
+        .iter()
+        .map(|target| target.full.clone())
+        .collect(),
+      user: self.user.unwrap_or_default().to_owned(),
       whole,
     }
   }
@@ -572,40 +751,56 @@ fn success(params: Value<'_>, out: &mut Vec<u8>) -> Result<(), Refused> {
   ra_svn::write(&Value::List(vec![Value::Word(SUCCESS), params]), out).map_err(Refused::Item)
 }
 
-/// The verb's answer (module documentation).
-fn answer(pending: &Pending, out: &mut Vec<u8>) -> Result<(), Refused> {
+/// The verb's paths' answers (module documentation): `lock-many`'s and `unlock-many`'s each path's, then `done`;
+/// nothing for `lock` and `unlock`, whose one answer is their end ([`answer_end`]).
+fn answer_paths(pending: &Pending, out: &mut Vec<u8>) -> Result<(), Refused> {
   if !pending.verb.many() {
-    let Some((_, answer)) = pending.answers.first() else {
-      return write_failure(
-        &[pending
-          .whole
-          .clone()
-          .unwrap_or((LOCK_OPERATION_FAILED, String::new()))],
-        out,
-      );
-    };
-    let answer = match (&pending.whole, answer) {
-      (Some(whole), _) => Err(whole.clone()),
-      (None, answer) => answer.clone(),
-    };
-    return match answer {
-      Ok(Some(lock)) => {
-        crate::reads::locks::with_lock_value(&lock, |value| success(Value::List(vec![value]), out))
-      }
-      Ok(None) => success(Value::List(Vec::new()), out),
-      Err(failure) => write_failure(&[failure], out),
-    };
+    return Ok(());
   }
   for (written, answer) in &pending.answers {
     match answer {
       Ok(Some(lock)) => crate::reads::locks::with_lock_value(lock, |value| success(value, out))?,
       Ok(None) => success(Value::List(vec![Value::String(written)]), out)?,
-      Err(failure) => write_failure(std::slice::from_ref(failure), out)?,
+      Err(chain) => write_failure(chain, out)?,
     }
   }
-  ra_svn::write(&Value::Word(DONE), out).map_err(Refused::Item)?;
-  match &pending.whole {
-    Some(whole) => write_failure(std::slice::from_ref(whole), out),
-    None => success(Value::List(Vec::new()), out),
+  ra_svn::write(&Value::Word(DONE), out).map_err(Refused::Item)
+}
+
+/// The verb's end (module documentation), `post` the post-hook's verdict: `lock-many`'s and `unlock-many`'s success,
+/// or the whole request's refusal, or the post-hook's failure; `lock`'s and `unlock`'s one answer, or the post-hook's
+/// failure in its place.
+fn answer_end(
+  pending: &Pending,
+  post: Result<(), Vec<Failure>>,
+  out: &mut Vec<u8>,
+) -> Result<(), Refused> {
+  if pending.verb.many() {
+    return match (&pending.whole, post) {
+      (Some(whole), _) => write_failure(std::slice::from_ref(whole), out),
+      (None, Err(chain)) => write_failure(&chain, out),
+      (None, Ok(())) => success(Value::List(Vec::new()), out),
+    };
+  }
+  let Some((_, answer)) = pending.answers.first() else {
+    return write_failure(
+      &[pending
+        .whole
+        .clone()
+        .unwrap_or((LOCK_OPERATION_FAILED, String::new()))],
+      out,
+    );
+  };
+  let answer = match (&pending.whole, answer, post) {
+    (Some(whole), _, _) => Err(vec![whole.clone()]),
+    (None, Ok(_), Err(chain)) => Err(chain),
+    (None, answer, _) => answer.clone(),
+  };
+  match answer {
+    Ok(Some(lock)) => {
+      crate::reads::locks::with_lock_value(&lock, |value| success(Value::List(vec![value]), out))
+    }
+    Ok(None) => success(Value::List(Vec::new()), out),
+    Err(chain) => write_failure(&chain, out),
   }
 }

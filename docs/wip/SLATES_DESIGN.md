@@ -15844,8 +15844,18 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > conversation. REPOS is `/<repository name>`, `SVNParentPath`'s layout, until A-645's read-only FSFS-layout view gives
 > stock `svnlook` a directory. Windows, with no driver, still refuses a commit at a configured point. Held to the
 > listener's tests: a refusing start-commit answered in `svnserve`'s words with no revision made; accepting start- and
-> pre-commit given `svnserve`'s arguments and standard input; a failing post-commit's words in `commit-info`. Owed: the
-> lock hooks, `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
+> pre-commit given `svnserve`'s arguments and standard input; a failing post-commit's words in `commit-info`.
+> **Part 2:** the lock verbs run their hooks where `svn_repos_fs_lock_many` and `svn_repos_fs_unlock_many` run them:
+> pre-lock (REPOS, the path, the user, the comment, the steal flag) or pre-unlock (REPOS, the path, the user, the token,
+> the break flag) for each path the session may write, before the lock table judges it, a refusal being that path's
+> answer and pre-lock's standard output the lock's token (judged as a client's token is); then post-lock or
+> post-unlock once (REPOS and the user, the paths changed on standard input) after the paths' answers, its failure
+> (`E165008` or `E165009` over `E165001`) the verb's end, the locks standing. The svn crate's lock verb is four calls
+> (`lock_verb` hands out the pre-hooks, `lock_judged` takes their verdicts, `locks_landed` answers the paths and hands
+> out the post-hook, `locks_finished` ends it), so the connection task runs each hook between them. Held to the
+> listener's tests: a refusing pre-lock answered in `svnserve`'s words with no lock held; pre-lock's arguments and
+> token, post-lock's arguments, standard input and failure after `done`; pre- and post-unlock's arguments and standard
+> input. Owed: `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -54917,5 +54927,16 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `SetRepositoryPolicy`; stock `svn`'s recorded commit; red before: the not-run refusal, no hook run); `slates-svn`
   `commit::drive::tests::pre_commits_lock_tokens_name_each_path_as_the_client_sent_it`. macOS arm64, Mac Studio.
 - **Applied in the same change to** §4.17.4 item 9's status, GAPS (A-661's line), amendments.tsv.
-- **Owed.** Part 2: pre-lock (its token the lock's) and post-lock, pre- and post-unlock around A-602's check. Part 3:
-  the `svn+ssh://` tunnel. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
+- **Part 2 (same day): the lock hooks on `svn://`.** `slates_svn::serve::Connection`'s lock verb is four calls:
+  `lock_verb` (the request read, access checked, each writable path's pre-hook call handed out as a `LockHookCall`),
+  `lock_judged` (the pre-hooks' `PreHooked` verdicts: a refused path answered with its chain, pre-lock's token the
+  lock's, the rest judged against the lock table), `locks_landed` (each path's answer and `done` written, the post-hook's
+  call over the paths changed handed out, none where none changed) and `locks_finished` (success, or the post-hook's
+  failure, the locks standing). `vcs_svn::lock` runs pre-lock or pre-unlock per path and post-lock or post-unlock once
+  through `run_hook`, the paths' answers sent before the post-hook runs, as `svnserve`'s callbacks send them. A pre-lock
+  whose output runs past what the server keeps refuses its path (no lock with a token not all here). The `svn+ssh://`
+  tunnel takes the four calls with no hook run, as before. Tests: `vcs_svn::tests::a_pre_lock_hook_that_refuses_refuses_
+  its_path_in_svnserves_words`, `a_lock_runs_pre_lock_for_its_token_and_post_lock_after_it_as_svnserve_does`,
+  `an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` (a file committed from stock `svn`'s recorded delta);
+  `slates-svn` `serve::` and `commit::` (stock `svnserve`'s recorded lock sessions replayed through the four calls).
+- **Owed.** Part 3: the `svn+ssh://` tunnel. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
