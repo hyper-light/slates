@@ -112,6 +112,13 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
+> repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
+> `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
+> branch): kept in an index fork and recorded as a push's are (`Source::Made`, the green's key and the version beside
+> the revisions) in the submit's own transaction; a line's or bookmark's head is the made changeset while its version
+> is the green's head, else the one a push named (`hg_made::head_of`), and a recovery puts the made node back from the
+> record. Owed: copies as file revisions naming their source; merges' second parents; the holders' changesets.
 > **A-720 (2026-11-20, w-hg; main's ruling after w-perf's 57,036-changeset push tripped the watchdog: a push's working
 > set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
 > push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
@@ -142,7 +149,9 @@
 > wall a 5,000-revision svn import met is the snapshot, the sum of every retained record): the vcs content store in the
 > shard's chunk arena of the anchor's content object, its table in the shard image recovered before the records, records
 > naming identities (git v3: names + the pack's root identity), entries waiting on the next image barrier (group commit).
-> OWED: slices (a1) read seam, (a2) arena storage, (a3) image table + recovery order, (b) git v3, (c) svn, (d) replication.
+> (a1) BUILT: `ContentStore::windows`/`window_at` answer `Cow` (a sealed arena window is copied out), every reader in
+> git, hg, the server and vcs moved over; lists and tables stay lent (`get`). OWED: (a2) arena storage, (a3) image table
+> + recovery order, (b) git v3, (c) svn, (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -150,9 +159,11 @@
 > held left out of the pack; S2 (history's latest value = the file's block), S3 (w-git, A-722), S4 (svn texts by identity),
 > S5 (w-hg); the push bound (a streamed window per connection, admission refusal before the body); push_load re-run.
 >
-> **A-728 (2026-11-20, w-engine; A-723's S2):** part 1 BUILT: a green's content history names the file's block for every
-> value stored whole (first change, seed, restore, a whole replace), so a changed file is held once; retire gives the
-> history's holds back a step at a time. OWED: part 2 a splice's added runs in the new block; part 3 svn_scale before/after.
+> **A-728 (2026-11-20, w-engine; A-723's S2):** parts 1-2 BUILT: a green's content history names the file's block for every
+> value stored whole and for a splice's added runs, sealed (runs copied out) only when superseded; a fold to one value
+> names the file whole; retire gives the history's holds back a step at a time; charges unchanged. Part 3 measured: svn
+> 1,000-revision import, history heap 50.3 -> 2.0 MiB, Green::commit 285.1 -> 200.0 MiB. OWED: the retention figure still
+> counts a first small edit's earlier file as current (as before A-728).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -739,6 +750,15 @@
 > ra_svn and DAV. Linux x86_64 (adacachy): server lib 630 passed beside main's 624, the glue's five tests new and
 > nothing failing that main's tree passed; each of four choices broken in a copy failed only its own tests; the macOS
 > run owed. Owed: DAV's LOCK and UNLOCK wired (A-661's next part, after g298's serving); the hook times' table.
+> **A-730 part 1 (2026-11-20, w-reaper; A-661 part 2's first calls):** the `svn://` listener runs a repository's
+> start-commit (at `open-root`: REPOS, the user, `mergeinfo` where announced, the transaction), pre-commit (at
+> `close-edit`: REPOS, the transaction, the presented lock tokens' lines as the client sent each path) and post-commit
+> (after the append: REPOS, the revision, the transaction; its failure `commit-info`'s `post-commit-err`) through the
+> driver, held to the hook's learned bound, ended if the client hangs up, the lesson taught to the shard's hook times;
+> where it refused any commit to a repository with a hook configured ("does not run this repository's hooks yet").
+> REPOS is `/<name>` until A-645's read-only FSFS-layout view gives `svnlook` a directory. Windows keeps the refusal
+> (no driver there). Owed: the lock and unlock hooks (part 2), `svn+ssh://` (part 3), the revprop hooks' calls (A-702
+> part 2, w-svn, on this runner), DAV's.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`

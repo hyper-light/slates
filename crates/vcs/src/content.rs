@@ -44,6 +44,7 @@
 //!
 //! The map is ordered (`BTreeMap`) so that every walk of it is deterministic.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::num::NonZeroUsize;
@@ -678,7 +679,10 @@ impl ContentStore {
     Ok(Some((freed.bytes, freed.form)))
   }
 
-  /// The bytes of the content `identity` names: a window's, a list's identities, or a table's.
+  /// The bytes of the content `identity` names: a window's, a list's identities, or a table's. Lists and tables are the
+  /// store's own metadata and stay in its memory, so they are lent; an object's windows are read through
+  /// [`ContentStore::windows`] and [`ContentStore::window_at`], which answer a `Cow` (A-727: a window kept as a sealed
+  /// chunk of the shard's arena is copied out to be read).
   pub fn get(&self, identity: &ContentId) -> Option<&[u8]> {
     self.entries.get(identity).map(|held| &*held.bytes)
   }
@@ -703,7 +707,7 @@ impl ContentStore {
   /// its fanout, so the list naming window `index` at each level is that level's digit of `index` in the fanout's base.
   /// A reader that resumes at a window reads the lists above it alone, never the windows before it. `None` past the
   /// object's last window, or where the store does not hold the path down whole.
-  pub fn window_at(&self, root: &ContentId, len: u64, index: u64) -> Option<&[u8]> {
+  pub fn window_at(&self, root: &ContentId, len: u64, index: u64) -> Option<Cow<'_, [u8]>> {
     let window = u64::try_from(self.window.get()).ok()?;
     let fanout = u64::try_from(self.fanout.get()).ok()?;
     let windows = len.div_ceil(window).max(1);
@@ -732,14 +736,14 @@ impl ContentStore {
       .entries
       .get(&identity)
       .filter(|held| held.form == Form::Window)
-      .map(|held| &*held.bytes)
+      .map(|held| Cow::Borrowed(&*held.bytes))
   }
 
   /// An object's bytes, read whole from its root, or `None` when the store does not hold its tree whole.
   pub fn object_bytes(&self, root: &ContentId, len: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     for window in self.windows(root) {
-      bytes.extend_from_slice(window);
+      bytes.extend_from_slice(&window);
     }
     (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
   }
@@ -913,14 +917,14 @@ impl Windows<'_> {
 }
 
 impl<'s> Iterator for Windows<'s> {
-  type Item = &'s [u8];
+  type Item = Cow<'s, [u8]>;
 
-  fn next(&mut self) -> Option<&'s [u8]> {
+  fn next(&mut self) -> Option<Cow<'s, [u8]>> {
     loop {
       let identity = self.next_identity()?;
       let held = self.store.entries.get(&identity)?;
       if held.form != Form::List {
-        return Some(&*held.bytes);
+        return Some(Cow::Borrowed(&*held.bytes));
       }
       self.stack.push((&*held.bytes, 0));
     }
@@ -1178,13 +1182,13 @@ mod tests {
       ] {
         let bytes: Vec<u8> = (0..len).map(|at| u8::try_from(at % 251).unwrap()).collect();
         let root = store.put_object(&bytes).unwrap();
-        let walked: Vec<&[u8]> = store.windows(&root).collect();
+        let walked: Vec<std::borrow::Cow<'_, [u8]>> = store.windows(&root).collect();
         let whole = u64::try_from(len).unwrap();
         for (index, expected) in walked.iter().enumerate() {
           let at = u64::try_from(index).unwrap();
           assert_eq!(
             store.window_at(&root, whole, at),
-            Some(*expected),
+            Some(expected.clone()),
             "{len} {index}"
           );
         }

@@ -206,6 +206,14 @@ impl Blocks {
     }
   }
 
+  /// How many hold `block`: map nodes, the identity table and the content history (zero for a block that is gone).
+  pub(crate) fn holders(&self, block: Block) -> u64 {
+    match self.slots.get(block.0) {
+      Some(Some((_, holders))) => *holders,
+      _ => 0,
+    }
+  }
+
   /// One holder of `block` fewer; the block is freed with its last.
   pub(crate) fn release(&mut self, block: Block) {
     let Some(place) = self.slots.get_mut(block.0) else {
@@ -323,6 +331,11 @@ impl Files {
       .map
       .prefix(prefix)
       .map(|(path, block)| (path, self.blocks.bytes(*block)))
+  }
+
+  /// The block `path`'s file holds, with no holder added: what a reader that holds it later names (A-728).
+  pub(crate) fn block_of(&self, path: impl AsRef<[u8]>) -> Option<Block> {
+    self.map.get(path).copied()
   }
 
   /// The block `path`'s file holds, given one more holder: what a held text shares with the file (A-716, the green's

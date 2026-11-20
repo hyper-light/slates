@@ -689,7 +689,7 @@ mod tests {
         std::process::exit(REFUSED);
       }
       "sleep" => {
-        park_for(std::time::Duration::from_secs(SLEEP_SECONDS));
+        outlast(SLEEP_SECONDS);
         std::process::exit(0);
       }
       "linger" => {
@@ -830,15 +830,33 @@ mod tests {
     }
   }
 
-  /// Parks this thread until `span` has passed; `park_timeout` may return early, so it parks again until then.
-  fn park_for(span: std::time::Duration) {
-    let until = std::time::Instant::now() + span;
-    while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
-      if left.is_zero() {
-        break;
-      }
-      std::thread::park_timeout(left);
-    }
+  /// Lets `seconds` pass on the runtime's timer, on a one-shard runtime of the hook's own: the sleeping hook stands for
+  /// one that outlasts the driver's deadline, so the time itself is what it does.
+  fn outlast(seconds: u64) {
+    let runtime = slates_rt::runtime::LocalRuntime::new(&slates_rt::runtime::RuntimeConfig {
+      shards: 1,
+      tasks_per_shard: 4,
+      timers_per_shard: 4,
+      ring_entries: 8,
+      step_budget_ns: 1_000_000,
+      timer_tick_ns: 1_000_000,
+      batch: 8,
+      pin: false,
+      cores: Vec::new(),
+      page_bytes: 4096,
+      spin_ns: 0,
+      wake_tracking: None,
+    })
+    .expect("the hook's runtime");
+    let ns = seconds.saturating_mul(1_000_000_000);
+    runtime
+      .spawn(async move {
+        slates_rt::futures::sleep(ns)
+          .await
+          .expect("the hook's sleep on its runtime's timer");
+      })
+      .expect("the sleep's task");
+    runtime.run_until_idle();
   }
 
   /// Whether process `pid` is gone, asked until a liveness window has passed.
