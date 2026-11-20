@@ -1,6 +1,16 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
-## STATUS 2026-11-20 ~06:30 PST: ENDED. Four landings on kiln main (founder 3d8e479cf, share 5a294413c, test 4aabdba18,
+## 2026-11-20 ~08:15 PST: REOPENED by main ("fix em up"): the live move's two Slates blockers
+- A-756 LANDED slates main 0f681456 (fix 0fc610f9): a materialized volume (moved/taken over) claims its name's alias
+  (verbs::claim_name_alias from fleet::make_taken). Red/green: fleet test
+  a_captured_clone_moved_to_another_node_is_found_there_by_its_name (three_members_sharded(4)). Slates clone
+  ~/slates-work/w-fed-move-slates; push via bundle + adas-mac-studio-3.local clone ~/.cache/w-fed-move-slates-push.
+- kiln worktree ~/slates-work/w-fed-move-kv (branch agents/w-fed-move-vendor): vendor/patches/slates/0003 recorded
+  (python3.12 scripts/vendor.py record/check: 0 differences) + test's remote_logs now include Slates anchor logs.
+  Uncommitted; local release run ~/slates-work/w-fed-move-local20.log.
+- Next: blocker 2 (LAN adoption never completes on the target): remote run with anchor logs, diagnose, fix red-first.
+
+## STATUS 2026-11-20 ~06:30 PST: ENDED (superseded above). Four landings on kiln main (founder 3d8e479cf, share 5a294413c, test 4aabdba18,
 ## test follow-up 9129995e8). Everything cleaned (worktrees, clone, target, labs, remote folders, push clone).
 ## The live move's last leg is blocked in Slates: a moved volume's MOUNT NOENT (4/5 local runs) and, across the LAN, the
 ## target waiting on adoption with no end. Next owner: rerun
