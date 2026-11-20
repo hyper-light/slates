@@ -73,7 +73,8 @@
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
 > standing grant; rows (`R N C V O D G`) in Mantle's `ShardDb`; everything else derived. Owed: the log format agreed
 > with w-hg, w-git, w-svn; Mantle's crates vendored; `slates-store`; the A/B against per-file deltas; each tool moved
-> onto it with an RSS red test.
+> onto it with an RSS red test. Piece 2a (2026-11-20): `hyper-block` (no issuer), `hyper-log`, `hyper-sim` vendored at
+> hyper-raft `5e40eb9`; 2b (engine, chunk, disk: `hyper-rt`'s channel) waits on main's decision.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. Owed: the MCP tool and the SDKs' read. A-782 closed identical versus accepted (one typed
@@ -3217,7 +3218,8 @@
 >   3.0 ms is still one turn). **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
 >   content, in steps of a page (before, debug: a whole entry's open 56 to 59 ms of one turn, the archive's hashing 93 to
 >   99 ms of another). **A-775 (2026-11-20):** a taken-over volume given up while its log's holder (or its catalog's or
->   content's cohort) was away is judged afresh once that member is heard alive at a later incarnation; before, the
+>   content's cohort) was away, or a green given up while the holder of its inputs was, is judged afresh once that member is
+>   heard alive at a later incarnation; before, the
 >   give-up was final until a new configuration (live_chaos fresh-member: `NotRecovered` for good after a 3 s pause));
 >   and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn

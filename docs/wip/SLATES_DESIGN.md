@@ -57533,6 +57533,13 @@ two owners); the lint wall; each `unsafe` with its SAFETY line. Counted at Mantl
 the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Arc`, `Mutex`, `RwLock` or `Rc` (chunk
 30, engine 22, disk 1, block 1), 72 `unsafe` sites (block 32, disk 21, engine 19).
 
+> **Status (2026-11-20, piece 2a: the log's substrate vendored).** `hyper-block`, `hyper-log` and `hyper-sim` are in
+> `vendor/hyper-raft/` at hyper-raft `5e40eb9` (mantle `87ab09e1`'s copies), `hyper-block` without its device issuer
+> and so without `hyper-rt` (two local changes, `vendor/hyper-raft/README.md`); no slates crate links them until
+> `slates-store` (piece 3) does, with R1's table. Owed (2b): the engine, chunk and disk crates, which need the issuer and
+> `hyper-rt`'s cross-thread channel, whose ring is `unsafe impl Send`/`Sync` (CLAUDE.md §3 forbids it): a decision for
+> main between porting a safe channel into `slates-rt` and driving `ShardDb` inline with no worker pool.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -57736,6 +57743,14 @@ volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardSt
   main: given up after 23 attempts waiting on its live, unserved through the serve deadline; after: judged afresh once,
   served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
   fleet tests unchanged.
+- **Greens too (2026-11-20, main's next piece).** A taken-over green given up while it waited on its inputs or its
+  catalog register is kept the same way, the members it waits on being its sources (the survivors that reported its
+  adopted version, which hold the inputs it lacks), and judged afresh once one is heard again (`merge.takeover_judged_afresh`).
+  One record for both kinds (`ShardState::given_up_taken_over`, `GivenUpRecord`); the injection became
+  `Daemon::inject_holder_silence`, which also leaves the asker's content requests unanswered. Test:
+  `fleet` `a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_is_heard_again` (red with greens
+  never kept: given up after 25 attempts waiting on its inputs, `NotRecovered` once the holder was back; after: judged
+  afresh once, placed at version 3, served with the owner's bytes, 8.06 s).
 
 ### §4.8 amended — A dispatch's stragglers are waited for by their own reports' wakes, never a tick or a poll interval at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family two of three)
 Applied in the same change to: §4.8 "Lookup" (a location round's stragglers), GAPS (the sweep's line),
