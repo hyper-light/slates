@@ -28,7 +28,10 @@ fn t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding() 
     id
   });
   let mut done = None;
-  for _ in 0..600 {
+  // Derived: 600 looks 20 ms apart, the wait the encoding is given to end.
+  let deadline =
+    std::time::Instant::now() + std::time::Duration::from_millis(20).saturating_mul(600);
+  while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
     let seen = crate::daemon::observe_first(&daemon, move |state| {
       let unencoded = state
         .vcs_stores
@@ -44,7 +47,7 @@ fn t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding() 
       done = Some(seen);
       break;
     }
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::thread::park_timeout(std::time::Duration::from_millis(20).min(left));
   }
   daemon.stop();
   assert_eq!(done, Some((1, None, false)));

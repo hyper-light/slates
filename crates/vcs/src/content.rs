@@ -1593,18 +1593,7 @@ mod tests {
         .push((ContentId::of(bytes), window, bytes.len()));
     }
     let mut store = ContentStore::with_storage(1 << 20, NARROW, Box::new(storage)).unwrap();
-    let held: u64 = windows
-      .iter()
-      .map(|bytes| u64::try_from(bytes.len()).unwrap())
-      .sum();
-    assert_eq!((store.len(), store.used()), (3, held));
-    for bytes in windows {
-      assert_eq!(store.holders(&ContentId::of(bytes)), 0);
-      assert_eq!(
-        store.bytes_of(&ContentId::of(bytes)).as_deref(),
-        Some(bytes)
-      );
-    }
+    assert_kept_held_for_no_one(&store, windows);
     let stored = store.counters().stored;
     assert_eq!(store.put(windows[0]).unwrap(), ContentId::of(windows[0]));
     assert_eq!(
@@ -1625,6 +1614,27 @@ mod tests {
       store.bytes_of(&fresh).as_deref(),
       Some(&b"new since the restart"[..])
     );
+    assert_only_the_new_window_named(&store, fresh);
+  }
+
+  /// The windows kept before the restart, held for no one, counted in what `store` holds and readable by identity.
+  fn assert_kept_held_for_no_one(store: &ContentStore, windows: [&[u8]; 3]) {
+    let held: u64 = windows
+      .iter()
+      .map(|bytes| u64::try_from(bytes.len()).unwrap())
+      .sum();
+    assert_eq!((store.len(), store.used()), (3, held));
+    for bytes in windows {
+      assert_eq!(store.holders(&ContentId::of(bytes)), 0);
+      assert_eq!(
+        store.bytes_of(&ContentId::of(bytes)).as_deref(),
+        Some(bytes)
+      );
+    }
+  }
+
+  /// Only `fresh`, the window stored since the restart, was named to the storage, by its identity.
+  fn assert_only_the_new_window_named(store: &ContentStore, fresh: ContentId) {
     let named = store
       .storage()
       .as_any()

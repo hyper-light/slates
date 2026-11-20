@@ -1083,6 +1083,20 @@ fn batch_bound(state: &ShardState) -> usize {
     .max(1)
 }
 
+/// Counts where a verdict's or a rebase's sealed work was composed: on the work's shard, or by the green's owner.
+fn count_composed(state: &mut ShardState, need: &Need) {
+  if let Need::Verdict { sealed, .. } | Need::Rebase { sealed } = need {
+    state.count(
+      if sealed.composed.is_some() {
+        COMPOSED_ON_WORK
+      } else {
+        COMPOSED_BY_OWNER
+      },
+      1,
+    );
+  }
+}
+
 /// Queues `need`'s ask to the green's owner, sending a batch at once if fewer than [`BATCHES_OUT`] are out (A-388).
 /// Returns whether it was queued; its answer resumes the queue.
 fn start_ask(
@@ -1096,16 +1110,7 @@ fn start_ask(
   let Some(need) = need else {
     return true;
   };
-  if let Need::Verdict { sealed, .. } | Need::Rebase { sealed } = &need {
-    state.count(
-      if sealed.composed.is_some() {
-        COMPOSED_ON_WORK
-      } else {
-        COMPOSED_BY_OWNER
-      },
-      1,
-    );
-  }
+  count_composed(state, &need);
   // A green another node owns admits its work there, by a forward (A-697 part a).
   if let Need::Admit {
     green,
