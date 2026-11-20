@@ -21561,6 +21561,178 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
   );
 }
 
+/// A-697 (a holder's work rebased over the holder's replica; A-658: a rebase is a pure function of the versions it maps
+/// through): in a two-node `f = 1` fleet, A owns a green at version 1 (`f` holding "hello") shared with B, and B serves
+/// works over greens A owns (the test hook). Do: B makes a work at base 1 and writes a new file `g`; A's own work changes
+/// `f` and submits, version 2; B's work rebases. Expect: answered `Rebased` at version 2, mapped on B's replica (B's
+/// counter moved); the work then reads `f` as version 2 holds it and keeps `g`; A's floor for the work rises to 2.
+#[test]
+fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edit = |client: &mut Client, work, path: &str, at, bytes: &[u8]| {
+    client.call(&RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at,
+      delete_len: 0,
+      bytes: bytes.to_vec(),
+    })
+  };
+  let version_of = |reply: &ReplyBody| match reply {
+    ReplyBody::Submitted { version, .. } => *version,
+    _ => None,
+  };
+  assert!(matches!(
+    edit(&mut owner, owners_work, "f", 0, b"hello"),
+    ReplyBody::Edited
+  ));
+  let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert_eq!(version_of(&first), Some(1), "{first:?}");
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  let wrote = edit(&mut holder, work, "g", 0, b"mine");
+  assert!(matches!(
+    edit(&mut owner, owners_work, "f", 5, b", there"),
+    ReplyBody::Edited
+  ));
+  let second = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  let rebased_before = daemon_b
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("merge.work.rebased_on_replica")
+    .copied()
+    .unwrap_or(0);
+  let both = [&daemon_a, &daemon_b];
+  let replica_at_two = poll_until(&both, PLACEMENT_DEADLINE, || {
+    Ok(daemon_b.merge_holder_state(green)?.version == Some(2))
+  });
+  let rebased = holder.call(&RequestBody::Rebase { work });
+  let rebased_on_replica = daemon_b
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("merge.work.rebased_on_replica")
+    .copied()
+    .unwrap_or(0)
+    - rebased_before;
+  let f = head_bytes(&mut holder, work, "f");
+  let g = head_bytes(&mut holder, work, "g");
+  let floor_rose = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a
+      .work_floor(green, work)
+      .map(|floor| floor == Some(2))
+  });
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert!(matches!(wrote, ReplyBody::Edited), "{wrote:?}");
+  assert_eq!(version_of(&second), Some(2), "{second:?}");
+  assert!(replica_at_two, "B's replica took version 2");
+  assert!(
+    matches!(
+      rebased,
+      ReplyBody::Rebased {
+        version: Some(2),
+        ..
+      }
+    ),
+    "the work rebased onto version 2: {rebased:?}"
+  );
+  assert_eq!(rebased_on_replica, 1, "mapped on B's replica");
+  assert_eq!(f, Ok(b"hello, there".to_vec()), "f as version 2 holds it");
+  assert_eq!(g, Ok(b"mine".to_vec()), "the work keeps its own file");
+  assert!(floor_rose, "A's floor for the work rose to 2");
+}
+
+/// A-697 (a copy a holder's work declares, composed over the holder's replica; A-626): in a two-node `f = 1` fleet, A
+/// owns a green at version 1 (`f` holding "hello") shared with B, and B serves works over greens A owns (the test
+/// hook). Do: B's work declares a copy of `f` to `f2` and submits. Expect: answered `Submitted` at version 2, its
+/// increment composed on B's replica (B's counter moved), since a copy's source is the green's; A's green reads `f2` as
+/// "hello".
+#[test]
+fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, _daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      first,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{first:?}"
+  );
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  let composed = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("merge.work.composed_on_replica")
+      .copied()
+      .unwrap_or(0)
+  };
+  let before = composed(&daemon_b);
+  let declared = holder.call(&RequestBody::Declare {
+    work,
+    op: slates_ipc::protocol::WorkOp::Copy {
+      from: "f".to_owned(),
+      to: "f2".to_owned(),
+      version: None,
+      replace: false,
+    },
+  });
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  let composed_here = composed(&daemon_b) - before;
+  let copied = head_bytes(&mut owner, green, "f2");
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert!(
+    matches!(declared, ReplyBody::Declared { .. }),
+    "{declared:?}"
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "the copy committed as version 2: {submitted:?}"
+  );
+  assert!(
+    composed_here >= 1,
+    "composed on B's replica: {composed_here}"
+  );
+  assert_eq!(copied, Ok(b"hello".to_vec()), "A's green holds the copy");
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the

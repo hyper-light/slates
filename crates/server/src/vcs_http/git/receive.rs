@@ -154,16 +154,22 @@ impl<L: ShardLender> Exchange for Receive<L> {
       .lend(|state| push.end(state))
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
       .map_err(failed)?;
+    let repository = push.repository();
     loop {
+      // Each step takes its repository's turn on the shard and keeps it through the yield after, so a repository's
+      // pushes share one turn a round (A-724, `crate::vcs_share::turns`).
+      let turn = crate::vcs_share::turns::take(repository).await;
       let step = lender
         .lend(|state| push.answer_step(state, given))
         .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
         .map_err(failed)?;
       match step {
         Answering::Answered(_) => return Ok(()),
-        Answering::Turned => slates_rt::futures::yield_now().await,
+        Answering::Turned => turn.yield_holding().await,
         #[cfg(unix)]
         Answering::Hook(call) => {
+          // A hook runs off the shard: its repository's other pushes take their turns meanwhile.
+          drop(turn);
           let answer = call.run(gone.gone()).await;
           lender
             .lend(|state| push.hook_ran(state, answer, given))
