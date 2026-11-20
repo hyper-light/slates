@@ -35,11 +35,12 @@
 //!    the policy admits, its refusal answering that command `hook declined`; `post-receive` after the appends, only
 //!    observing. Where nothing shows a view (the daemon's [`Unpresented`], until the view is served as a read-only
 //!    attachment; or a platform with no hook driver), every command is refused `hook not run` with a line naming the
-//!    hook, before any object is admitted: no ref moves that a configured hook was not asked about, and no hook is
-//!    skipped without a word.
-//! 2. The pushed objects are admitted to the repository's quarantine and sealed (A-662's `GitPush`); a push whose every
-//!    command the protocol's checks refused admits none. A store that does not admit them (the shard's budget) refuses
-//!    every command, `objects not admitted`, with why.
+//!    hook, its quarantine given back: no ref moves that a configured hook was not asked about, and no hook is skipped
+//!    without a word.
+//! 2. The pushed objects were admitted to the repository's quarantine as the pack arrived (A-719 part 3, `intake`: the
+//!    session reads the pack into it, so the push holds none of their bytes) and are sealed here (A-662's `GitPush`); a
+//!    push whose every command the protocol's checks refused gives them back and seals none. A store that did not admit
+//!    them (the shard's budget) refuses every command, `objects not admitted`, with why.
 //! 3. Each command under the policy, through A-644 part 2's check point (`git_protect`): A-644's store answers how the
 //!    change moves its ref and so the right it needs (Submit for a create or a fast-forward, Rewrite for a move that is
 //!    no fast-forward, Delete for a delete), and A-622's `admit` judges that right and, where a rule imposes them, the
@@ -133,6 +134,7 @@ use crate::verbs::to_wire_volume;
 
 #[cfg(unix)]
 mod hooks;
+mod intake;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -203,6 +205,10 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   presenter: P,
   /// Where its answer stands between the edge's steps (module docs, "A step at a time").
   answer: AnswerState,
+  /// The quarantine its pack is read into as it arrives (A-719 part 3), until the answer seals it.
+  quarantine: Option<GitPush>,
+  /// The store's refusal of an object the pack brought, which answers every command.
+  unadmitted: Option<GitRefused>,
 }
 
 /// The shard's clock as the store's and the checks' passes read it: the runtime's monotonic
@@ -253,8 +259,8 @@ impl crate::git_hooks::PresentView for Unpresented {
 
 /// What the answer's first step left.
 enum Begun {
-  /// The answer, written.
-  Answering(Answering),
+  /// The answer, written; boxed, as the hooks' state is, since a received push is far larger.
+  Answering(Box<Answering>),
   /// The push sealed, its hooks before the verdicts due.
   #[cfg(unix)]
   Hooking(Box<hooks::Hooking>),
@@ -353,58 +359,85 @@ impl<P> ReceivePack<P> {
       session,
       admission: Admission::new(crate::vcs_share::room(state, repository).bytes),
       _live: crate::vcs_share::Live::begin(repository),
+      quarantine: GitPush::begin(&state.vcs_stores, repository),
+      unadmitted: None,
       presenter,
       answer: AnswerState::Unbegun,
     })
   }
 
-  /// Hands the push the client's next `bytes`: whether it is now read whole and checked, waiting for its answer. A
-  /// refusal of the exchange ends the push.
+  /// Hands the push the client's next `bytes`, its pack's objects admitted to the quarantine as
+  /// they resolve (A-719 part 3): whether it is now read whole, its checks to make. A refusal of the
+  /// exchange ends the push.
   pub(crate) fn input(&mut self, state: &mut ShardState, bytes: &[u8]) -> Result<bool, PushFailed> {
     let began = slates_rt::futures::now_ns();
-    let Self {
-      repository,
-      session,
-      admission,
-      ..
-    } = self;
-    let read = with_room(state, |state| {
-      let (content, git) = state
-        .vcs_stores
-        .git_ref(*repository)
-        .ok_or(PushFailed::NoStore)?;
-      let indexed = IndexedObjects::new(&git.repository, content, admission.left());
-      session
-        .input(bytes, &indexed, admission)
-        .map_err(PushFailed::Exchange)
+    let read = self.intake(state, |session, site, admission| {
+      session.input_into(bytes, site, admission)
     });
     let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    charge_step(state, *repository, began, bytes_in);
+    charge_step(state, self.repository, began, bytes_in);
     read
   }
 
-  /// The client's bytes have ended: whether the push is now checked. A request cut short ends the push; a pack cut
-  /// short is checked as git answers a short pack.
+  /// The client's bytes have ended: whether the push is now read whole. A request cut short ends the
+  /// push; a pack cut short is checked as git answers a short pack.
   pub(crate) fn end(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
     let began = slates_rt::futures::now_ns();
+    let ended = self.intake(state, |session, site, admission| {
+      session.end_into(site, admission)
+    });
+    charge_step(state, self.repository, began, 0);
+    ended
+  }
+
+  /// Runs `call` of the session over the push's intake site, read only over the repository's index
+  /// and the quarantine, then admits what it resolved to the quarantine (`intake`'s module docs). A
+  /// store's refusal is kept to answer every command, and nothing more is admitted after it.
+  fn intake(
+    &mut self,
+    state: &mut ShardState,
+    call: impl FnOnce(
+      &mut Session<'static, PolicyHidden>,
+      &mut intake::Intake<'_>,
+      &mut Admission,
+    ) -> Result<bool, receive::Refusal>,
+  ) -> Result<bool, PushFailed> {
     let Self {
       repository,
       session,
       admission,
+      quarantine,
       ..
     } = self;
-    let ended = with_room(state, |state| {
+    let (called, queue) = with_room(state, |state| {
       let (content, git) = state
         .vcs_stores
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
-      let indexed = IndexedObjects::new(&git.repository, content, admission.left());
-      session
-        .end(&indexed, admission)
-        .map_err(PushFailed::Exchange)
-    });
-    charge_step(state, *repository, began, 0);
-    ended
+      let mut site = intake::Intake {
+        indexed: IndexedObjects::new(&git.repository, content, admission.left()),
+        quarantined: intake::Quarantined {
+          push: quarantine.as_ref().map(GitPush::quarantine),
+          store: content,
+        },
+        queue: BTreeMap::new(),
+      };
+      let called = call(session, &mut site, admission);
+      Ok::<_, PushFailed>((called, site.queue))
+    })?;
+    match (quarantine.as_mut(), self.unadmitted.is_some()) {
+      (Some(quarantine), false) => {
+        if let Err(refused) = intake::admit_queued(state, quarantine, queue, admission) {
+          self.unadmitted = Some(refused);
+        }
+      }
+      _ => {
+        for (_, hold) in queue.into_values() {
+          admission.release(hold);
+        }
+      }
+    }
+    called.map_err(PushFailed::Exchange)
   }
 
   /// One turn of the pack's checks (A-719), for the shard's step quantum and at least one object,
@@ -420,6 +453,7 @@ impl<P> ReceivePack<P> {
       repository,
       session,
       admission,
+      quarantine,
       ..
     } = self;
     with_room(state, |state| {
@@ -428,15 +462,26 @@ impl<P> ReceivePack<P> {
         .git_ref(*repository)
         .ok_or(PushFailed::NoStore)?;
       let indexed = IndexedObjects::new(&git.repository, content, admission.left());
+      let quarantined = intake::Quarantined {
+        push: quarantine.as_ref().map(GitPush::quarantine),
+        store: content,
+      };
       let mut clock = ShardClock;
       let quantum = Quantum {
         clock: &mut clock,
         ns,
       };
       session
-        .check_turn(&indexed, admission, quantum)
+        .check_turn_with((&indexed, &quarantined), admission, quantum)
         .map_err(PushFailed::Exchange)
     })
+  }
+
+  /// Gives back the quarantine the push's pack was read into, holding nothing of the shard after.
+  fn give_back(&mut self, state: &mut ShardState) {
+    if let Some(quarantine) = self.quarantine.take() {
+      quarantine.abandon(state);
+    }
   }
 
   /// The answer's first step (module docs, "Answering"): every command refused while a git hook is
@@ -455,13 +500,15 @@ impl<P> ReceivePack<P> {
     #[cfg(unix)]
     let hooked = git_hook(&record).is_some();
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
+      self.give_back(state);
       let answering = self.declined(&mut Declining::hook(hook), out)?;
-      return Ok(Begun::Answering(answering));
+      return Ok(Begun::Answering(Box::new(answering)));
     }
-    match prepare(state, &record, checked, pack)? {
-      Prepared::Declined(mut declining) => {
-        Ok(Begun::Answering(self.declined(&mut declining, out)?))
-      }
+    let quarantine = (self.quarantine.take(), self.unadmitted.take());
+    match prepare(state, &record, checked, quarantine, pack)? {
+      Prepared::Declined(mut declining) => Ok(Begun::Answering(Box::new(
+        self.declined(&mut declining, out)?,
+      ))),
       Prepared::Sealed { sealed, name } => {
         #[cfg(unix)]
         if hooked {
@@ -470,7 +517,7 @@ impl<P> ReceivePack<P> {
         }
         let received = self.decide(state, (&record, sealed, name), HookVerdicts::default())?;
         write_report(&received, out).map_err(PushFailed::Exchange)?;
-        Ok(Begun::Answering(Answering::Answered(received)))
+        Ok(Begun::Answering(Box::new(Answering::Answered(received))))
       }
     }
   }
@@ -485,7 +532,7 @@ impl<P> ReceivePack<P> {
       session, admission, ..
     } = self;
     let received = session
-      .answer(declining, out, admission)
+      .answer_with(declining, None, out, admission)
       .map_err(PushFailed::Exchange)?
       .ok_or(PushFailed::Unchecked)?;
     Ok(Answering::Answered(received))
@@ -515,7 +562,7 @@ impl<P> ReceivePack<P> {
       name,
       hooks: &mut verdicts,
     };
-    let decided = session.decide(&mut judge, admission);
+    let decided = session.decide_with(&mut judge, None, admission);
     sealed.abandon(state);
     decided
       .map_err(PushFailed::Exchange)?
@@ -554,7 +601,7 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
       AnswerState::Unbegun => {
         let can_present = self.presenter.can_present();
         match self.begin(state, can_present, out)? {
-          Begun::Answering(answering) => Ok(answering),
+          Begun::Answering(answering) => Ok(*answering),
           Begun::Hooking(hooking) => self.hooking(state, *hooking, out),
         }
       }
@@ -617,7 +664,7 @@ impl<P> ReceivePack<P> {
       }
       AnswerState::Unbegun => {
         let Begun::Answering(answering) = self.begin(state, false, out)?;
-        Ok(answering)
+        Ok(*answering)
       }
       AnswerState::Done => Err(PushFailed::Unchecked),
     }
@@ -634,13 +681,22 @@ impl<P> ReceivePack<P> {
   }
 }
 
-#[cfg(unix)]
 impl<P> Drop for ReceivePack<P> {
-  /// A push dropped between its steps (its edge's task ended, its client gone) gives back what its
-  /// answer holds of the shard: the sealed push and a hook's open view (module docs, "A step at a
-  /// time"). A view's showing is its presenter's, which ends what it still shows when it is
-  /// dropped.
+  /// A push dropped between its steps (its edge's task ended, its client gone) gives back what it
+  /// holds of the shard: the quarantine its pack was read into, the sealed push and a hook's open
+  /// view (module docs, "A step at a time"). A view's showing is its presenter's, which ends what it
+  /// still shows when it is dropped.
   fn drop(&mut self) {
+    if let Some(quarantine) = self.quarantine.take() {
+      let given = crate::state::with_state(|state| quarantine.abandon(state));
+      if given.is_none() {
+        slates_machine::log_line!(
+          "slates-server: a git push dropped mid-read could not give back its quarantine: the \
+           shard's state was not lent to its drop"
+        );
+      }
+    }
+    #[cfg(unix)]
     hooks::dropped(core::mem::replace(&mut self.answer, AnswerState::Done));
   }
 }
@@ -791,24 +847,33 @@ enum Prepared {
   },
 }
 
-/// Prepares `checked`, a push to `record`'s repository (module docs, "Answering", item 2): its
-/// objects admitted to the quarantine and sealed (none when the checks refused every command), or
-/// every command refused when the store does not admit them.
+/// Prepares `checked`, a push to `record`'s repository (module docs, "Answering", item 2), its
+/// objects already admitted to `quarantine` as its pack arrived (A-719 part 3): sealed (emptied
+/// first when the checks refused every command), or every command refused when the store did not
+/// admit them (`unadmitted`).
 fn prepare(
   state: &mut ShardState,
   record: &RepositoryRecord,
   checked: &Checked,
+  (quarantine, unadmitted): (Option<GitPush>, Option<GitRefused>),
   pack: Vec<u8>,
 ) -> Result<Prepared, PushFailed> {
-  let mut push = GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?;
-  push.keep_pack(pack);
-  let judged = checked.early.iter().any(Option::is_none);
-  let objects = if judged { checked.objects() } else { &[] };
-  let incoming: Vec<Incoming<'_>> = objects.iter().map(incoming_of).collect();
-  if let Err(refused) = push.admit_all(state, &incoming) {
-    push.abandon(state);
+  let quarantine = match quarantine {
+    Some(quarantine) => quarantine,
+    None => GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?,
+  };
+  if let Some(refused) = unadmitted {
+    quarantine.abandon(state);
     return Ok(Prepared::Declined(Declining::unadmitted(&refused)));
   }
+  let judged = checked.early.iter().any(Option::is_none);
+  let mut push = if judged {
+    quarantine
+  } else {
+    quarantine.abandon(state);
+    GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?
+  };
+  push.keep_pack(pack);
   match push.seal(state) {
     Ok(sealed) => Ok(Prepared::Sealed {
       sealed,

@@ -180,17 +180,15 @@ fn work_paths(state: &ShardState, work: &crate::state::WorkState) -> Vec<(String
       }
       // A replacing copy takes its destination's tree away before it lands (A-626): what the journal declared there
       // goes. The copied tree's own entries are listed once the work model resolves copies (A-626 part 4, owed: GAPS).
-      VolumeOp::Copy { to, replace, .. } => {
-        if *replace {
-          let inside = |path: &String| {
-            path == to
-              || path
-                .strip_prefix(to.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
-          };
-          dirs.retain(|path| !inside(path));
-          symlinks.retain(|path| !inside(path));
-        }
+      VolumeOp::Copy { to, replace, .. } if *replace => {
+        let inside = |path: &String| {
+          path == to
+            || path
+              .strip_prefix(to.as_str())
+              .is_some_and(|rest| rest.starts_with('/'))
+        };
+        dirs.retain(|path| !inside(path));
+        symlinks.retain(|path| !inside(path));
       }
       _ => {}
     }

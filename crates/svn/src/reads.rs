@@ -409,8 +409,9 @@ pub trait Repository: Contents {
 
   /// The bytes of the text held as `identity` from `offset`: a run of at least one byte, as long as the green holds it
   /// in one piece (§4.17.4 item 11: a read streams from chunks, nothing is assembled whole), or none at the text's end;
-  /// `None` when the green does not hold the text.
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]>;
+  /// `None` when the green does not hold the text. Borrowed where the source holds the bytes, owned where it must copy
+  /// them (a text read through a lent [`crate::migration::TextSource`]).
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>>;
 }
 
 /// What the handler made of a command.
@@ -903,7 +904,32 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
       return Ok(Outcome::Close);
     };
     self.trivial_auth()?;
-    let found = self.at_or_youngest(request.revision).and_then(|revision| {
+    let found = self.mergeinfo_catalog(&request);
+    match found {
+      Ok(catalog) => {
+        let entries: Vec<(String, Vec<u8>)> = catalog
+          .into_iter()
+          .map(|(path, mergeinfo)| (relative_to(self.base, &path), mergeinfo))
+          .collect();
+        let items = entries
+          .iter()
+          .map(|(path, value)| {
+            Value::List(vec![Value::String(path.as_bytes()), Value::String(value)])
+          })
+          .collect();
+        self.success(vec![Value::List(items)])
+      }
+      Err(failure) => self.failure(&failure),
+    }
+  }
+
+  /// `svn_repos_fs_get_mergeinfo2`'s catalog for `request`: each readable path's mergeinfo (and its descendants' where
+  /// asked), each as its repository path and its mergeinfo's string, at the revision asked or the youngest.
+  fn mergeinfo_catalog(
+    &self,
+    request: &MergeinfoRequest,
+  ) -> Result<Vec<(String, Vec<u8>)>, Failure> {
+    self.at_or_youngest(request.revision).and_then(|revision| {
       let paths: Vec<&str> = request
         .paths
         .iter()
@@ -921,24 +947,14 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
         request.inheritance,
         request.descendants,
       )
-      .map_err(|refusal| Failure::of_query(&refusal, revision))
-    });
-    match found {
-      Ok(catalog) => {
-        let entries: Vec<(String, Vec<u8>)> = catalog
+      .map(|catalog| {
+        catalog
           .into_iter()
-          .map(|(path, mergeinfo)| (relative_to(self.base, &path), mergeinfo.to_bytes()))
-          .collect();
-        let items = entries
-          .iter()
-          .map(|(path, value)| {
-            Value::List(vec![Value::String(path.as_bytes()), Value::String(value)])
-          })
-          .collect();
-        self.success(vec![Value::List(items)])
-      }
-      Err(failure) => self.failure(&failure),
-    }
+          .map(|(path, mergeinfo)| (path, mergeinfo.to_bytes()))
+          .collect()
+      })
+      .map_err(|refusal| Failure::of_query(&refusal, revision))
+    })
   }
 
   /// `get-iprops ( path:string [ rev:number ] )`: the property lists of the path's ancestors that have any and the
@@ -1987,6 +2003,100 @@ mod log;
 mod segments;
 mod stream;
 
+pub use file_revs::DavFileRevs;
+
+/// Where the node at `path` in `peg` stood in each of `revisions`, as `svn_repos_trace_node_locations` traces it, read
+/// from `index` and `repository` with each path judged by `rules` (none: every path readable): the `get-locations`
+/// report's walk over HTTP (`reports/get-locations.c`; A-726), the svn:// command's own (`get-locations`). Each found
+/// location as its revision and its path, in the trace's order; or Subversion's error number and message.
+///
+/// # Errors
+/// The trace's refusal: a revision past the youngest, an unreadable path, a path missing in the peg revision.
+pub fn trace_node_locations<R: Repository + ?Sized>(
+  index: &Index,
+  repository: &R,
+  rules: Option<&PrincipalRules>,
+  (path, peg): (&str, Revision),
+  revisions: &[Option<Revision>],
+) -> Result<Vec<(Revision, String)>, (u32, String)> {
+  let mut out = Vec::new();
+  let reads = Reads {
+    index,
+    repository,
+    base: ROOT,
+    uuid: "",
+    authz: rules,
+    authentication: Authentication::Settled,
+    out: &mut out,
+  };
+  let signed = |revision: Revision| i64::try_from(revision).unwrap_or(i64::MAX);
+  let peg = signed(peg);
+  let revisions = revisions
+    .iter()
+    .map(|revision| revision.map_or(INVALID_REVISION, signed))
+    .collect();
+  reads
+    .trace_locations(path, peg, revisions)
+    .map_err(|failure| (failure.code, failure.message))
+}
+
+/// The mergeinfo catalog of `paths` (repository paths) at `revision` (the youngest when `None`), as
+/// `svn_repos_fs_get_mergeinfo2` gathers it, read from `index` and `repository` with each path judged by `rules` (none:
+/// every path readable): the `mergeinfo-report`'s over HTTP (`reports/mergeinfo.c`; A-726 part 2), the svn://
+/// command's own (`get-mergeinfo`). Each entry as its path relative to `target` (`svn_fspath__skip_ancestor`) and its
+/// mergeinfo's string; or Subversion's error number and message.
+///
+/// # Errors
+/// The walk's refusal: a revision past the youngest, a path missing in it.
+pub fn repository_mergeinfo<R: Repository + ?Sized>(
+  index: &Index,
+  repository: &R,
+  rules: Option<&PrincipalRules>,
+  (target, paths): (&str, Vec<String>),
+  revision: Option<Revision>,
+  (inheritance, descendants): (mergeinfo::MergeinfoInheritance, bool),
+) -> Result<Vec<(String, String)>, (u32, String)> {
+  let mut out = Vec::new();
+  let reads = Reads {
+    index,
+    repository,
+    base: ROOT,
+    uuid: "",
+    authz: rules,
+    authentication: Authentication::Settled,
+    out: &mut out,
+  };
+  let request = MergeinfoRequest {
+    paths,
+    revision: revision.map(|revision| i64::try_from(revision).unwrap_or(i64::MAX)),
+    inheritance,
+    descendants,
+  };
+  reads
+    .mergeinfo_catalog(&request)
+    .map(|catalog| {
+      catalog
+        .into_iter()
+        .map(|(path, value)| {
+          (
+            relative_to(target, &path),
+            String::from_utf8_lossy(&value).into_owned(),
+          )
+        })
+        .collect()
+    })
+    .map_err(|failure| (failure.code, failure.message))
+}
+
+/// `relative`, a report's `S:path`, joined to `target`, the repository path of the resource the report names, as
+/// `svn_fspath__join` joins them.
+pub fn full_path_of(target: &str, relative: &str) -> String {
+  full_path(target, relative.as_bytes())
+}
+
+/// `SVN_INVALID_REVNUM`: a location revision the body wrote negative.
+/// Format: `svn_types.h`, -1.
+const INVALID_REVISION: i64 = -1;
 pub use log::dav::{DavLog, DavLogProgress};
 pub use stream::{Progress, Stream};
 

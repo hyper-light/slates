@@ -23,10 +23,11 @@
 //! head (decision 1) is not made here: owed (GAPS), so a push after an import finds the root as its first line.
 //!
 //! **Bounds.** An import holds, between its turns as within them, at most its room (`Admission`): the listing, the log
-//! it reads (an inline revlog whole), a text being rebuilt and the text before it. The room is one client region's bytes
-//! (`RegionGeometry::total_bytes`), what one request of the version-control edge may hold (`vcs_http`'s `Bounds`),
-//! since an import is asked for by one client; it is charged to the shard's budget as retention when the import starts
-//! and given back when it is done, so the shard's charge covers what the import may hold while it waits between turns.
+//! it reads (an inline revlog whole), a text being rebuilt and the text before it. The room is what the shard could admit
+//! when the import starts (A-720 part 3; it was one client region's bytes, 278,528 B, which refused Mercurial's own
+//! repository), a bound only: the shard is charged as retention what the import holds between turns
+//! (`Import::holding`), trued up after each turn and given back when it is done, so the charge covers what the import
+//! holds while it waits.
 //! What the import keeps in the content store is charged as every store's is (the map's module doc): each turn is lent
 //! every byte the shard could admit now, then the arena is grown from its pool by what the turn kept and the charge
 //! trued up to what the content store holds. One import a repository at a time, so the imports under way or waiting to
@@ -97,8 +98,8 @@ enum Stage {
   /// Under way: the import, the host its directory is read through (the import's own, closed when it is done) and the
   /// repository's directory on the host.
   Running {
-    /// The import.
-    import: Import,
+    /// The import, boxed: it is by far the largest of a stage.
+    import: Box<Import>,
     /// The host.
     host: Box<dyn HostFs>,
     /// The directory.
@@ -215,10 +216,12 @@ impl Clock for ShardClock {
   }
 }
 
-/// Derived: the most an import holds at once, its room (the module doc): one client region's bytes, what one request of
-/// the version-control edge may hold.
+/// Derived: the most an import may hold at once, its room (the module doc; A-720 part 3): what its shard could admit
+/// when it starts (`Store::admittable`, as a push is admitted, `crate::git_push::push_room`), never one request's room,
+/// since a repository's logs, and so what reading one holds, are as large as the repository. The room is a bound; what
+/// the shard is charged is what the import holds ([`Import::holding`]), trued up after each turn.
 pub(crate) fn room_of(state: &ShardState) -> u64 {
-  u64::try_from(state.config.region.total_bytes()).unwrap_or(u64::MAX)
+  state.store.admittable()
 }
 
 /// Derived: the nanoseconds a turn may spend: the runtime's step quantum (§4.3), as the shard's other long work is cut,
@@ -238,29 +241,27 @@ pub(crate) fn begin(
 ) -> Result<(), ImportFailed> {
   takes_import(&mut state.vcs_stores, id)?;
   let room = room_of(state);
-  reserve(state, room)?;
   let started = Import::start(
     &mut HgBase::new(&mut *host, directory),
     Admission::new(room),
   );
   match started {
     Ok(import) => {
+      let holding = import.holding();
+      reserve(state, holding)?;
       let importing = Importing {
         stage: Stage::Running {
-          import,
+          import: Box::new(import),
           host,
           directory,
         },
-        reserved: room,
+        reserved: holding,
       };
       state.vcs_stores.imports.insert(id, importing);
       state.count(STARTED, 1);
       Ok(())
     }
-    Err(refused) => {
-      state.store.budget.credit_retention(room);
-      Err(ImportFailed::Refused(refused))
-    }
+    Err(refused) => Err(ImportFailed::Refused(refused)),
   }
 }
 
@@ -357,7 +358,40 @@ fn advance(
     _ => None,
   };
   grown_and_settled(state);
+  true_up_holding(state, id);
   advanced
+}
+
+/// Trues the shard's charge for repository `id`'s running import up to what it holds between turns
+/// ([`Import::holding`], A-720 part 3): more charged as retention, less credited back. A charge the shard refuses is
+/// counted ([`super::CHARGE_SHORT`]) and the import goes on within its room.
+fn true_up_holding(state: &mut ShardState, id: RepositoryId) {
+  let Some(Importing {
+    stage: Stage::Running { import, .. },
+    reserved,
+  }) = state.vcs_stores.imports.get(&id)
+  else {
+    return;
+  };
+  let (holding, charged) = (import.holding(), *reserved);
+  let short = if holding > charged {
+    state
+      .store
+      .budget
+      .charge_retention(holding.saturating_sub(charged))
+      .is_err()
+  } else {
+    state
+      .store
+      .budget
+      .credit_retention(charged.saturating_sub(holding));
+    false
+  };
+  if short {
+    state.count(super::CHARGE_SHORT, 1);
+  } else if let Some(Importing { reserved, .. }) = state.vcs_stores.imports.get_mut(&id) {
+    *reserved = holding;
+  }
 }
 
 /// After a turn: the arena grown from its pool by what the content store holds past the shard's charge, then the
@@ -381,7 +415,7 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
     Some(Importing {
       stage: Stage::Running { import, .. },
       reserved,
-    }) => (import, reserved),
+    }) => (*import, reserved),
     Some(done) => {
       state.vcs_stores.imports.insert(id, done);
       return Err(ImportFailed::Busy);
@@ -394,10 +428,13 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
     .into_imported()
     .ok_or(ImportFailed::Refused(ImportRefused::Ended))?;
   let finished = Finished::of(&imported, turns);
+  // The landing's room, which bounds its record and its bookmarks' works: what the shard could admit now (A-720 part 3),
+  // the import's own holding given back above.
+  let room = room_of(state);
   let done = Importing {
     stage: Stage::Done {
       imported: Box::new(imported),
-      room: reserved,
+      room,
     },
     reserved: 0,
   };
@@ -412,15 +449,15 @@ fn place(
   stores: &mut VcsStores,
   id: RepositoryId,
   index: HgIndex,
-) -> Result<bool, (ImportFailed, HgIndex)> {
+) -> Result<bool, Box<(ImportFailed, HgIndex)>> {
   let Some(content) = stores.content.as_mut() else {
-    return Err((ImportFailed::NoStore, index));
+    return Err(Box::new((ImportFailed::NoStore, index)));
   };
   let Some(RepositoryStore::Mercurial(store)) = stores.entries.get_mut(&id) else {
-    return Err((ImportFailed::NoStore, index));
+    return Err(Box::new((ImportFailed::NoStore, index)));
   };
   if !holds_none(&mut store.index) {
-    return Err((ImportFailed::NotEmpty, index));
+    return Err(Box::new((ImportFailed::NotEmpty, index)));
   }
   let empty = core::mem::replace(&mut store.index, index);
   let released = empty.release(content).is_ok();
@@ -448,7 +485,8 @@ pub(crate) fn place_imported(
       settle(state);
       Ok(())
     }
-    Err((failed, back)) => {
+    Err(refused) => {
+      let (failed, back) = *refused;
       *index = Some(back);
       Err(match failed {
         ImportFailed::NotEmpty => Refusal::ImportRefused {
@@ -476,7 +514,7 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   };
   state.store.budget.credit_retention(reserved);
   let whole = match (state.vcs_stores.content.as_mut(), stage) {
-    (Some(content), Stage::Running { import, .. }) => import.abandon(content).is_ok(),
+    (Some(content), Stage::Running { import, .. }) => (*import).abandon(content).is_ok(),
     (Some(content), Stage::Done { imported, .. }) => {
       let Imported { index, .. } = *imported;
       index.release(content).is_ok()

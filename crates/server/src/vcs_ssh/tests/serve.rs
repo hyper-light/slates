@@ -584,18 +584,29 @@ fn pushed() -> Transcript {
   }
 }
 
+/// Parks this thread until `span` has passed; `park_timeout` may return early, so it parks again until then.
+fn park_for(span: Duration) {
+  let until = Instant::now() + span;
+  while let Some(left) = until.checked_duration_since(Instant::now()) {
+    if left.is_zero() {
+      break;
+    }
+    std::thread::park_timeout(left);
+  }
+}
+
 /// A whole session with the held key: authenticate (pausing `auth_pause_ns` between the server's `PK_OK` and the
 /// signature), run `git-receive-pack`, read [`READY`], pause `push_pause_ns`, send [`PACK`], and read to the end.
 fn session(address: SocketAddrV4, auth_pause_ns: u64, push_pause_ns: u64) -> Option<Transcript> {
   let mut peer = Peer::connect(address)?;
   (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
-  std::thread::sleep(Duration::from_nanos(auth_pause_ns));
+  park_for(Duration::from_nanos(auth_pause_ns));
   (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
   exec(&mut peer, b"git-receive-pack '/r.git'").then_some(())?;
   let ready = peer.next(&[94])?;
   let mut at = 5;
   (read_string(&ready, &mut at) == READY).then_some(())?;
-  std::thread::sleep(Duration::from_nanos(push_pause_ns));
+  park_for(Duration::from_nanos(push_pause_ns));
   send_data(&mut peer, PACK);
   let mut transcript = transcript(&mut peer);
   transcript.out.splice(0..0, READY.iter().copied());

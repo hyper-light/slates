@@ -510,10 +510,10 @@ impl Hook {
 
   /// Reaps the child when its exit was read; otherwise leaves it to `Drop`, which kills and reaps it.
   fn reap(&mut self) {
-    if let Some(child) = self.child.as_mut() {
-      if let Ok(Some(_)) = child.try_wait() {
-        self.child = None;
-      }
+    if let Some(child) = self.child.as_mut()
+      && let Ok(Some(_)) = child.try_wait()
+    {
+      self.child = None;
     }
   }
 }
@@ -689,7 +689,7 @@ mod tests {
         std::process::exit(REFUSED);
       }
       "sleep" => {
-        std::thread::sleep(std::time::Duration::from_secs(SLEEP_SECONDS));
+        park_for(std::time::Duration::from_secs(SLEEP_SECONDS));
         std::process::exit(0);
       }
       "linger" => {
@@ -830,6 +830,17 @@ mod tests {
     }
   }
 
+  /// Parks this thread until `span` has passed; `park_timeout` may return early, so it parks again until then.
+  fn park_for(span: std::time::Duration) {
+    let until = std::time::Instant::now() + span;
+    while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+      if left.is_zero() {
+        break;
+      }
+      std::thread::park_timeout(left);
+    }
+  }
+
   /// Whether process `pid` is gone, asked until a liveness window has passed.
   fn gone(pid: i32) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(LIVENESS_BUDGET_NS);
@@ -839,7 +850,7 @@ mod tests {
       if !alive {
         return true;
       }
-      std::thread::sleep(std::time::Duration::from_nanos(ASK_EVERY_NS));
+      std::thread::park_timeout(std::time::Duration::from_nanos(ASK_EVERY_NS));
     }
     false
   }
@@ -936,7 +947,7 @@ mod tests {
     ];
     let (outcome, _, _) = drive(None, hook, None, None).expect("the run ended");
     assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
-    let mut names = vec![ROLE, "SLATES_FIXTURE"];
+    let mut names = [ROLE, "SLATES_FIXTURE"];
     names.sort_unstable();
     let expected = format!("{TAG}names={}", names.join("|"));
     assert!(
@@ -1029,7 +1040,7 @@ mod tests {
     .expect("the run ended");
     assert_eq!(outcome, Outcome::Abandoned);
     assert!(
-      took >= LEAVES_AFTER_NS && took < LIVENESS_BUDGET_NS,
+      (LEAVES_AFTER_NS..LIVENESS_BUDGET_NS).contains(&took),
       "ended {took} ns in"
     );
     assert_eq!(lesson, Lesson::default());

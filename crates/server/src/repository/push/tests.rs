@@ -464,6 +464,17 @@ fn assert_created_deleted_and_moved(
   pushed: &Appended,
   [main, topic]: [DbVolumeId; 2],
 ) {
+  let feature = assert_feature_made(state, repo, pushed, topic);
+  assert_recorded_as_one(state, repo, pushed, [main, feature, topic]);
+}
+
+/// Branch `feature` made at version 1 with its files and head, `topic`'s name retired and its green kept: `feature`.
+fn assert_feature_made(
+  state: &mut ShardState,
+  repo: RepositoryId,
+  pushed: &Appended,
+  topic: DbVolumeId,
+) -> DbVolumeId {
   let Some(BranchAppended::Created {
     green: feature,
     version: 1,
@@ -482,6 +493,16 @@ fn assert_created_deleted_and_moved(
   assert_eq!(file(state, feature, "h").as_deref(), Some(&b"new"[..]));
   assert_eq!(head(state, feature).as_deref(), Some(&b"fe1"[..]));
   assert_eq!(state.db.partition().green_head(feature), 1);
+  feature
+}
+
+/// One atomic record on `main` and `feature`, naming the names log, and the delete and the move answered in order.
+fn assert_recorded_as_one(
+  state: &mut ShardState,
+  repo: RepositoryId,
+  pushed: &Appended,
+  [main, feature, topic]: [DbVolumeId; 3],
+) {
   let record = record_at(state, main, 2).expect("one atomic record");
   assert_eq!(record_at(state, feature, 1), Some(record.clone()));
   assert!(logs_of(&record).contains(&LogName::State {

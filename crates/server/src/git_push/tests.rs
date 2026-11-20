@@ -404,7 +404,11 @@ fn assert_hold_the_second_text(state: &ShardState, repository: RepositoryId, nam
 }
 
 /// Pushes the fixtures' scenarios `names` in order to `repository`, each answered `ok` for every command.
-fn pushed_from_the_fixtures(state: &mut ShardState, repository: RepositoryId, names: &[&str]) {
+pub(crate) fn pushed_from_the_fixtures(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  names: &[&str],
+) {
   let mut taken = Vec::new();
   for (scenario, _) in chain() {
     if names.contains(&scenario.name) {
@@ -582,42 +586,68 @@ fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
     let repository = git_repository(state, "atomic");
     pushed_from_the_fixtures(state, repository, &["create", "update", "tag", "copy"]);
     let held = records(state, repository);
-    let (copy, tag): (&[u8], &[u8]) = (b"refs/heads/copy", b"refs/tags/v1");
-    let stale = [(SECOND, "", copy), (FIRST, "", tag)];
+    let stale = [(SECOND, "", COPY_REF), (FIRST, "", TAG_REF)];
     let received = pushed(state, repository, &request(&stale, ATOMIC, &[]));
     assert_eq!(reasons(&received), [ATOMIC_FAILURE, FAILED_TO_UPDATE]);
-    let reply = dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateBranch {
-        repository: "atomic".to_owned(),
-        name: "cli".to_owned(),
-        from: "main".to_owned(),
-        version: None,
-      },
-    );
-    assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-    let cli = [(TAG, "", tag), ("", SECOND, b"refs/heads/cli".as_slice())];
-    let received = pushed(state, repository, &request(&cli, ATOMIC, empty_pack()));
-    assert_eq!(
-      reasons(&received),
-      [ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]
-    );
-    assert_first_line_names(&received, b"refs/heads/cli");
-    assert_eq!(records(state, repository), held);
-    assert!(bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
+    atomic_refused_whole_at_its_append(state, repository, held);
     let received = pushed(state, repository, &request(&stale, CAPABILITIES, &[]));
     assert_eq!(reasons(&received), [b"ok".as_slice(), FAILED_TO_UPDATE]);
     assert_eq!(records(state, repository), held + 1);
     assert!(!bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
-    let again = [(TAG, "", tag), ("", SECOND, b"refs/heads/again".as_slice())];
-    let received = pushed(state, repository, &request(&again, ATOMIC, empty_pack()));
-    assert_eq!(reasons(&received), [b"ok", b"ok"]);
-    assert_eq!(records(state, repository), held + 2);
-    assert!(!bound(state, repository, "refs/tags/v1"));
-    assert_hold_the_second_text(state, repository, &["again"]);
+    atomic_applied_as_one_entry(state, repository, held + 1);
   });
+}
+
+/// Format: the ref the atomic test's fixtures push as `copy`.
+const COPY_REF: &[u8] = b"refs/heads/copy";
+/// Format: the tag the atomic test's fixtures push.
+const TAG_REF: &[u8] = b"refs/tags/v1";
+
+/// Branch `cli` made with the CLI's verb, then, with `atomic`, the tag deleted and `cli` created at a commit held:
+/// refused whole at its append, git's line naming `cli`, the tag still bound and the `held` records unchanged.
+fn atomic_refused_whole_at_its_append(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  held: usize,
+) {
+  let reply = dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::CreateBranch {
+      repository: "atomic".to_owned(),
+      name: "cli".to_owned(),
+      from: "main".to_owned(),
+      version: None,
+    },
+  );
+  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
+  let cli = [
+    (TAG, "", TAG_REF),
+    ("", SECOND, b"refs/heads/cli".as_slice()),
+  ];
+  let received = pushed(state, repository, &request(&cli, ATOMIC, empty_pack()));
+  assert_eq!(
+    reasons(&received),
+    [ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]
+  );
+  assert_first_line_names(&received, b"refs/heads/cli");
+  assert_eq!(records(state, repository), held);
+  assert!(bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
+}
+
+/// With `atomic`, the tag deleted and `again` created at a commit held: both applied as one entry past the `held`
+/// records, `again` holding the second commit's text.
+fn atomic_applied_as_one_entry(state: &mut ShardState, repository: RepositoryId, held: usize) {
+  let again = [
+    (TAG, "", TAG_REF),
+    ("", SECOND, b"refs/heads/again".as_slice()),
+  ];
+  let received = pushed(state, repository, &request(&again, ATOMIC, empty_pack()));
+  assert_eq!(reasons(&received), [b"ok", b"ok"]);
+  assert_eq!(records(state, repository), held + 1);
+  assert!(!bound(state, repository, "refs/tags/v1"));
+  assert_hold_the_second_text(state, repository, &["again"]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -675,7 +705,7 @@ fn pushed_with_hooks(daemon: &crate::Daemon, repository: RepositoryId, request: 
   });
   got
     .recv_timeout(std::time::Duration::from_nanos(PUSH_WAIT_NS))
-    .expect("the push answered within the test's bound")
+    .unwrap_or_else(|_| Err("the push did not answer within the test's bound".to_owned()))
 }
 
 /// Drives the push of [`pushed_with_hooks`] and sends what it answered on `sent`.
@@ -954,6 +984,115 @@ fn t_a665_an_update_hook_refuses_its_own_command_alone() {
   let words = "no refs/heads/other\nerror: hook declined to update refs/heads/other\n";
   assert_eq!(band_two(&answer), words);
   assert_eq!(shown, (2, 2));
+}
+
+/// Shape: the file of [`t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes`]: a mebibyte,
+/// many times what the push's tables take.
+const LARGE: usize = 1 << 20;
+/// Format: the most bytes one stored deflate block holds (RFC 1951 §3.2.4).
+const STORED_BLOCK: usize = 0xffff;
+/// Format: Adler-32's modulus (RFC 1950 §8).
+const ADLER_MODULUS: u32 = 65_521;
+
+/// `data` as a zlib stream of stored blocks.
+fn stored_zlib(data: &[u8]) -> Vec<u8> {
+  let mut out = vec![0x78, 0x01];
+  let mut blocks = data.chunks(STORED_BLOCK).peekable();
+  while let Some(block) = blocks.next() {
+    out.push(u8::from(blocks.peek().is_none()));
+    let len = u16::try_from(block.len()).unwrap();
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(block);
+  }
+  let (low, high) = data.iter().fold((1u32, 0u32), |(low, high), byte| {
+    let low = (low + u32::from(*byte)) % ADLER_MODULUS;
+    (low, (high + low) % ADLER_MODULUS)
+  });
+  out.extend_from_slice(&((high << 16) | low).to_be_bytes());
+  out
+}
+
+/// A create of `main` at a root commit whose one file is `bytes` long, as stock git posts it, and the file's name.
+fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
+  use slates_git::entry::{self, Header, Representation};
+  use slates_git::object_name::{Kind, name_of};
+  let blob: Vec<u8> = (0..bytes).map(|at| (at % 251) as u8).collect();
+  let blob_id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
+  let mut tree = b"100644 large\0".to_vec();
+  tree.extend_from_slice(blob_id.as_bytes());
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let commit = format!(
+    "tree {tree_id}\nauthor A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\nlarge\n"
+  )
+  .into_bytes();
+  let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  let mut pack = Vec::new();
+  let objects = [
+    (Kind::Commit, &commit),
+    (Kind::Tree, &tree),
+    (Kind::Blob, &blob),
+  ];
+  let mut writer = slates_git::pack::Writer::new(ObjectFormat::Sha1, 3, &mut pack);
+  let mut at = entry::PACK_HEADER_LEN;
+  for (kind, content) in objects {
+    let header = Header {
+      representation: Representation::Whole(kind),
+      size: u64::try_from(content.len()).unwrap(),
+    };
+    let zlib = stored_zlib(content);
+    entry::write(header, at, &mut writer).unwrap();
+    slates_git::out::Out::put(&mut writer, &zlib);
+    at += entry::written_len(header, at).unwrap() + u64::try_from(zlib.len()).unwrap();
+  }
+  writer.finish().unwrap();
+  let request = request(
+    &[("", &commit_id.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack,
+  );
+  (request, blob_id)
+}
+
+/// A-719 part 3 (§4.17.1 "A push's intake", rule 1). Do: push a create of `main` at a commit whose one file is a
+/// mebibyte, handing the driver its request a piece at a time, then answer it. Expect: once its bytes are all taken,
+/// the file in the push's quarantine and the push's admission holding the pack as sent (A-723's record) and less than
+/// a sixteenth of the file beside it (each object's bytes given back once the quarantine took it); then `main`
+/// created.
+#[test]
+fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "large");
+    let (_, mut push) = started(state, repository);
+    let (request, blob) = large_create(LARGE);
+    let room = push.admission.left();
+    for piece in request.chunks(LARGE / 16) {
+      push.input(state, piece).expect("taken");
+    }
+    let held = room - push.admission.left();
+    let quarantined = push
+      .quarantine
+      .as_ref()
+      .and_then(|quarantine| quarantine.quarantine().object(&blob));
+    assert!(quarantined.is_some(), "the file is not in the quarantine");
+    // The pack as the client sent it is the record's (A-723); nothing inflated is held beside it.
+    let sent = request.len() as u64;
+    assert!(
+      held < sent + (LARGE as u64) / 16,
+      "the push holds {held} bytes of a {sent}-byte request"
+    );
+    push.end(state).expect("ended");
+    let mut answer = Vec::new();
+    let received = loop {
+      match push.answer_step(state, &mut answer).expect("answered") {
+        Answering::Answered(received) => break received,
+        Answering::Turned => {}
+        Answering::Hook(_) => panic!("no hook is configured"),
+      }
+    };
+    assert_eq!(reasons(&received), [b"ok"]);
+  });
 }
 
 /// A-724 piece 1 (§4.17.5 "What a repository costs, counted"). Do: push stock git's fixture pushes into one repository

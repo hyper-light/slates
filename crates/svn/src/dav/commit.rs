@@ -20,8 +20,11 @@
 //! with its first error, `dav_svn__convert_err`'s status, and ends the transaction: what follows is refused `404`, as
 //! `mod_dav_svn` answers a transaction that no longer exists.
 //!
-//! Stricter than `mod_dav_svn`, each stated: a PUT's body is held whole within the request's room (the edge's
-//! admission), where `mod_dav_svn` streams it into FSFS; revision properties are taken from the POST alone (ra_serf 1.8
+//! A PUT's body is handed to the drive a run at a time as it arrives ([`DavCommit::begin_put`], [`DavCommit::put_chunk`],
+//! [`DavCommit::end_put`]), as `mod_dav_svn` streams it into FSFS, so a commit never holds a body whole (§4.17.1 "A
+//! push's intake").
+//!
+//! Stricter than `mod_dav_svn`, each stated: revision properties are taken from the POST alone (ra_serf 1.8
 //! and later send them there; a PROPPATCH of `!svn/txn/NAME` is refused `501`).
 //!
 //! No I/O, no clock (the caller's instant in its setup), no randomness, no panic.
@@ -195,6 +198,33 @@ pub struct DavCommit {
   tokens: u64,
   /// Whether the transaction has ended: refused, aborted or merged.
   over: bool,
+  /// The PUT whose text is being taken, between its body's runs ([`DavCommit::begin_put`]).
+  putting: Option<Putting>,
+}
+
+/// A PUT whose delta is open: its file's token, its path, whether it adds the file, and the result checksum its
+/// close is judged by.
+#[derive(Debug)]
+struct Putting {
+  /// The file's token.
+  file: Vec<u8>,
+  /// The editor's path.
+  path: String,
+  /// Whether this PUT adds the file.
+  adds: bool,
+  /// `X-SVN-Result-Fulltext-MD5`.
+  result_md5: Option<String>,
+}
+
+/// A PUT's headers, which open its file before its body's first run (the module doc).
+#[derive(Clone, Copy, Debug)]
+pub struct PutStart<'a> {
+  /// `X-SVN-Base-Fulltext-MD5`.
+  pub base_md5: Option<&'a str>,
+  /// `X-SVN-Result-Fulltext-MD5`.
+  pub result_md5: Option<&'a str>,
+  /// `X-SVN-Version-Name`: an opened file's base revision.
+  pub version_name: Option<u64>,
 }
 
 impl std::fmt::Debug for DavCommit {
@@ -227,6 +257,7 @@ impl DavCommit {
       added: BTreeSet::new(),
       tokens: 0,
       over: false,
+      putting: None,
     };
     commit.step(
       world,
@@ -433,7 +464,7 @@ impl DavCommit {
     bare(HTTP_NO_CONTENT)
   }
 
-  /// A PUT's file: its parents opened, then opened or added, its delta applied, closed.
+  /// A PUT's file: begun, its whole body one chunk, ended.
   fn put_file<G: Green + ?Sized>(
     &mut self,
     world: &World<'_, G>,
@@ -441,9 +472,33 @@ impl DavCommit {
     path: &str,
     put: &Put<'_>,
   ) -> Result<HttpAnswer, HttpAnswer> {
-    let parent = self.open_parents(world, hooks, path)?;
+    let start = PutStart {
+      base_md5: put.base_md5,
+      result_md5: put.result_md5,
+      version_name: put.version_name,
+    };
+    self.begin_put(world, hooks, path, &start)?;
+    self.put_chunk(world, hooks, put.body)?;
+    Ok(self.end_put(world, hooks))
+  }
+
+  /// Begins a PUT of `path`'s text before its body's first run (§4.17.1 "A push's intake": a body is taken as it
+  /// arrives, never held whole): its parents opened, the file opened at the request's base revision or added, its delta
+  /// opened with the base checksum.
+  ///
+  /// # Errors
+  /// The answer to the PUT where the drive refused it, which ends the transaction.
+  pub fn begin_put<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    hooks: Hooks<'_>,
+    path: &str,
+    start: &PutStart<'_>,
+  ) -> Result<(), HttpAnswer> {
+    let path = relpath(path);
+    let parent = self.open_parents(world, hooks, &path)?;
     let file = self.token(b'c');
-    let adds = put.version_name.is_none() && !self.added.contains(path);
+    let adds = start.version_name.is_none() && !self.added.contains(&path);
     let command = if adds {
       EditCommand::AddFile {
         path: path.as_bytes(),
@@ -456,41 +511,83 @@ impl DavCommit {
         path: path.as_bytes(),
         directory: &parent,
         file: &file,
-        revision: put.version_name,
+        revision: start.version_name,
       }
     };
     self.step(world, hooks, &command)?;
-    let base = put.base_md5.map(str::as_bytes);
     self.step(
       world,
       hooks,
       &EditCommand::ApplyTextdelta {
         file: &file,
-        base_checksum: base,
+        base_checksum: start.base_md5.map(str::as_bytes),
       },
     )?;
+    self.putting = Some(Putting {
+      file,
+      path,
+      adds,
+      result_md5: start.result_md5.map(str::to_owned),
+    });
+    Ok(())
+  }
+
+  /// One run of the PUT's body, handed to the drive as the delta's next chunk and held no longer: the drive applies
+  /// each window as it completes.
+  ///
+  /// # Errors
+  /// The answer to the PUT where the drive refused the chunk, or where no PUT was begun.
+  pub fn put_chunk<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    hooks: Hooks<'_>,
+    chunk: &[u8],
+  ) -> Result<(), HttpAnswer> {
+    let Some(file) = self.putting.as_ref().map(|putting| putting.file.clone()) else {
+      return Err(unserved("A PUT's body with no PUT begun"));
+    };
     self.step(
       world,
       hooks,
-      &EditCommand::TextdeltaChunk {
-        file: &file,
-        chunk: put.body,
-      },
-    )?;
-    self.step(world, hooks, &EditCommand::TextdeltaEnd { file: &file })?;
-    self.step(
-      world,
-      hooks,
-      &EditCommand::CloseFile {
-        file: &file,
-        text_checksum: put.result_md5.map(str::as_bytes),
-      },
-    )?;
-    if adds {
-      self.added.insert(path.to_owned());
-      Ok(bare(HTTP_CREATED))
-    } else {
-      Ok(bare(HTTP_NO_CONTENT))
+      &EditCommand::TextdeltaChunk { file: &file, chunk },
+    )
+  }
+
+  /// Ends the PUT begun last: its delta ended and its file closed with the result checksum; `201` for a file it added,
+  /// `204` for one it changed.
+  pub fn end_put<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    hooks: Hooks<'_>,
+  ) -> HttpAnswer {
+    let Some(putting) = self.putting.take() else {
+      return unserved("A PUT's end with no PUT begun");
+    };
+    let ended = self
+      .step(
+        world,
+        hooks,
+        &EditCommand::TextdeltaEnd {
+          file: &putting.file,
+        },
+      )
+      .and_then(|()| {
+        self.step(
+          world,
+          hooks,
+          &EditCommand::CloseFile {
+            file: &putting.file,
+            text_checksum: putting.result_md5.as_deref().map(str::as_bytes),
+          },
+        )
+      });
+    match ended {
+      Ok(()) if putting.adds => {
+        self.added.insert(putting.path);
+        bare(HTTP_CREATED)
+      }
+      Ok(()) => bare(HTTP_NO_CONTENT),
+      Err(refused) => refused,
     }
   }
 

@@ -137,7 +137,7 @@ pub struct Unpacked {
 /// on its admission that its bytes took; then it holds only what names the object. A keeper that stores an object
 /// elsewhere gives its hold back, so the reader's working set is an entry being read, a delta, its base and its
 /// target, and the deltas still waiting for their bases; one that keeps the bytes itself keeps the hold ([`Held`]).
-pub trait Keep {
+pub trait Keep: Contents {
   /// Keeps `object`, the pack's object at position `at` in pack order, its bytes held on `admission` by `hold`. Objects
   /// come as they resolve: a delta waiting for its base comes after objects later in the pack.
   fn keep(
@@ -148,12 +148,16 @@ pub trait Keep {
     admission: &mut Admission,
   ) -> Result<(), Refusal>;
 
-  /// The content of the object kept at position `at`, named `id`, as a delta's base; `None` when none is kept there.
-  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>>;
-
   /// The reader is done with what `hold` held of `admission` (a delta applied, its bytes dropped): given back where
   /// the keeper bounds the reader's working set, kept charged where it charges the pack whole.
   fn release(&mut self, hold: Hold, admission: &mut Admission);
+}
+
+/// Where a pack's objects are read back from once kept: a delta's base as the reader resolves the delta, and each
+/// object as a push's checks and verdicts read it (A-719 part 3).
+pub trait Contents {
+  /// The content of the object kept at position `at` in pack order, named `id`; `None` when none is kept there.
+  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>>;
 }
 
 /// A keeper that holds every object's bytes itself, each charged for as long as the reader's admission lasts: the pack
@@ -195,6 +199,10 @@ impl Keep for Held {
     Ok(())
   }
 
+  fn release(&mut self, _hold: Hold, _admission: &mut Admission) {}
+}
+
+impl Contents for Held {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     self
       .objects
@@ -203,8 +211,71 @@ impl Keep for Held {
       .filter(|object| object.id == *id)
       .map(|object| Cow::Borrowed(object.content.as_slice()))
   }
+}
 
-  fn release(&mut self, _hold: Hold, _admission: &mut Admission) {}
+/// A keeper over a thin pack's outside bases: the reader's own keeper beside the objects `outside` holds, as
+/// [`Reader::finish_with`] takes them apart.
+struct Beside<'k, O: ?Sized> {
+  /// The objects outside the pack.
+  outside: &'k O,
+  /// The keeper.
+  held: &'k mut Held,
+}
+
+impl<O: Outside + ?Sized> Outside for Beside<'_, O> {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    self.outside.object(id)
+  }
+}
+
+impl<O: ?Sized> Contents for Beside<'_, O> {
+  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    self.held.content(at, id)
+  }
+}
+
+impl<O: ?Sized> Keep for Beside<'_, O> {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: Object,
+    hold: Hold,
+    admission: &mut Admission,
+  ) -> Result<(), Refusal> {
+    self.held.keep(at, object, hold, admission)
+  }
+
+  fn release(&mut self, hold: Hold, admission: &mut Admission) {
+    self.held.release(hold, admission);
+  }
+}
+
+impl Unpacked {
+  /// The pack's objects as a reader that keeps them elsewhere answers them ([`Kept`]), each kept in a [`Held`] at its
+  /// position: what a push's checks take ([`crate::receive::check`]).
+  pub fn into_kept(self) -> (Kept, Held) {
+    let objects = self
+      .objects
+      .iter()
+      .map(|object| Placed {
+        offset: object.offset,
+        stored: object.stored,
+        kind: object.kind,
+        id: object.id,
+        chain: object.chain,
+      })
+      .collect();
+    let held = Held {
+      objects: self.objects.into_iter().map(Some).collect(),
+    };
+    (
+      Kept {
+        objects,
+        checksum: self.checksum,
+      },
+      held,
+    )
+  }
 }
 
 /// An object a pack brought, as a reader that kept its bytes elsewhere names it ([`Reader::finish_into`]).
@@ -570,7 +641,11 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     admission: &mut Admission,
   ) -> Result<Unpacked, Refusal> {
     let mut held = core::mem::take(&mut self.held);
-    let kept = self.finish_into(outside, admission, &mut held)?;
+    let mut beside = Beside {
+      outside,
+      held: &mut held,
+    };
+    let kept = self.finish_into(admission, &mut beside)?;
     charge_items::<Object>(admission, kept.objects.len())?;
     let mut objects = Vec::new();
     reserve(&mut objects, kept.objects.len())?;
@@ -584,18 +659,18 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     })
   }
 
-  /// [`Reader::finish_with`] for a pack read into `keep` ([`Reader::read_into`]): the waiting deltas resolved into it,
-  /// and every object's place in pack order, charged to `admission` first.
-  pub fn finish_into<O: Outside + ?Sized, K: Keep + ?Sized>(
+  /// [`Reader::finish_with`] for a pack read into `keep` ([`Reader::read_into`]), which holds a thin pack's outside
+  /// bases too: the waiting deltas resolved into it, and every object's place in pack order, charged to `admission`
+  /// first.
+  pub fn finish_into<K: Keep + Outside + ?Sized>(
     mut self,
-    outside: &O,
     admission: &mut Admission,
     keep: &mut K,
   ) -> Result<Kept, Refusal> {
     let Stage::Done(checksum) = self.stage else {
       return Err(Refusal::Truncated { at: self.at });
     };
-    self.resolve_waiting(outside, admission, keep)?;
+    self.resolve_waiting(admission, keep)?;
     let count = self.entries.len();
     charge_items::<Placed>(admission, count)?;
     let mut objects = Vec::new();
@@ -965,9 +1040,8 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   /// Resolves the waiting deltas into `keep`, each once its base is: their table sorted by base, then every entry's
   /// children found in it by the entry's position and by its name, newly resolved ones on a stack; then those whose base
   /// no object of the pack is, from `outside`. A delta still waiting after is refused.
-  fn resolve_waiting<O: Outside + ?Sized, K: Keep + ?Sized>(
+  fn resolve_waiting<K: Keep + Outside + ?Sized>(
     &mut self,
-    outside: &O,
     admission: &mut Admission,
     keep: &mut K,
   ) -> Result<(), Refusal> {
@@ -989,7 +1063,7 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         self.resolve_children(child, &waiting, &mut stack, (admission, &mut *keep))?;
       }
     }
-    self.resolve_outside(&waiting, &mut stack, outside, (admission, keep))?;
+    self.resolve_outside(&waiting, &mut stack, (admission, keep))?;
     let first = self
       .entries
       .iter()
@@ -1058,28 +1132,45 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
   }
 
   /// Applies the deltas still waiting for a base named outside the pack: one table group at a time, the base taken from
-  /// `outside` when it holds it, each delta resolved then its own children as the pack's are.
-  fn resolve_outside<O: Outside + ?Sized, K: Keep + ?Sized>(
+  /// the keeper's outside when it holds it (copied, as the keeper then takes what it makes), each delta resolved then
+  /// its own children as the pack's are.
+  fn resolve_outside<K: Keep + Outside + ?Sized>(
     &mut self,
     waiting: &[(Key, usize)],
     stack: &mut Vec<usize>,
-    outside: &O,
     (admission, keep): (&mut Admission, &mut K),
   ) -> Result<(), Refusal> {
     for (key, child) in waiting {
       let Key::Id(id) = key else {
         continue;
       };
-      let Some((kind, content)) = outside.object(id) else {
+      if !matches!(
+        self.entries.get(*child).map(|record| &record.state),
+        Some(State::Waiting(_))
+      ) {
+        continue;
+      }
+      let Some((kind, content)) = keep.object(id) else {
         continue;
       };
+      let (content, hold) = held_while(admission, |admission| {
+        admission
+          .charge(to_u64(content.len()))
+          .map_err(Refusal::PastAdmission)?;
+        let mut owned = Vec::new();
+        reserve(&mut owned, content.len())?;
+        owned.extend_from_slice(content);
+        Ok(owned)
+      })?;
       let source = Source {
         kind,
         id: *id,
-        content,
+        content: &content,
         depth: 0,
       };
-      if self.resolve_child_on(source, *child, (admission, &mut *keep))? {
+      let resolved = self.resolve_child_on(source, *child, (admission, &mut *keep))?;
+      keep.release(hold, admission);
+      if resolved {
         stack.push(*child);
         while let Some(next) = stack.pop() {
           self.resolve_children(next, waiting, stack, (admission, &mut *keep))?;

@@ -1869,6 +1869,20 @@ mod tests {
       &[create.clone(), moved.clone()],
       Some(&options),
     );
+    assert_git_pre_receive_lists_commands_and_numbers_options(&pre);
+    let bare = git_pre_receive(PendingView(7), std::slice::from_ref(&moved), None);
+    assert_eq!(
+      bare.env,
+      vec![(
+        "GIT_PUSH_OPTION_COUNT".to_owned(),
+        EnvValue::Bytes(b"0".to_vec())
+      )]
+    );
+    assert_git_update_and_post_receive_for_the_applied_command(moved);
+  }
+
+  /// The pre-receive expectations of [`gits_hooks_get_what_receive_pack_gives_them`]: two commands, two options.
+  fn assert_git_pre_receive_lists_commands_and_numbers_options(pre: &super::HookInput) {
     assert_eq!(pre.point, HookPoint::GitPreReceive);
     assert!(pre.args.is_empty());
     assert_eq!(pre.view, View::Pending(PendingView(7)));
@@ -1897,14 +1911,10 @@ mod tests {
         ),
       ]
     );
-    let bare = git_pre_receive(PendingView(7), &[moved.clone()], None);
-    assert_eq!(
-      bare.env,
-      vec![(
-        "GIT_PUSH_OPTION_COUNT".to_owned(),
-        EnvValue::Bytes(b"0".to_vec())
-      )]
-    );
+  }
+
+  /// The update and post-receive expectations of [`gits_hooks_get_what_receive_pack_gives_them`] for `moved`.
+  fn assert_git_update_and_post_receive_for_the_applied_command(moved: RefUpdate) {
     let update = git_update(PendingView(7), &moved);
     assert_eq!(
       update.args,
@@ -2056,27 +2066,50 @@ mod tests {
     };
     let pending = hg_pretxnchangegroup(PendingView(3), "pretxnchangegroup.check", &changes);
     let committed = hg_changegroup(CommittedView(4), "changegroup.notify", &changes);
-    let value = |input: &super::HookInput, name: &str| {
-      input
-        .env
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.clone())
-    };
-    let bytes = |text: &str| Some(EnvValue::Bytes(text.as_bytes().to_vec()));
-    assert_eq!(value(&pending, "HG_HOOKTYPE"), bytes("pretxnchangegroup"));
+    assert_hg_admission_hooks_environment(&pending);
     assert_eq!(
-      value(&pending, "HG_HOOKNAME"),
-      bytes("pretxnchangegroup.check")
+      env_value(&committed, "HG_HOOKTYPE"),
+      env_bytes("changegroup")
     );
-    assert_eq!(value(&pending, "HG_NODE"), bytes(&"aa".repeat(20)));
-    assert_eq!(value(&pending, "HG_NODE_LAST"), bytes(&"bb".repeat(20)));
-    assert_eq!(value(&pending, "HG_SOURCE"), bytes("serve"));
-    assert_eq!(value(&pending, "HG_URL"), bytes("remote:ssh:192.0.2.7"));
-    assert_eq!(value(&pending, "HG_PENDING"), Some(EnvValue::ViewRoot));
-    assert_eq!(value(&committed, "HG_HOOKTYPE"), bytes("changegroup"));
-    assert_eq!(value(&committed, "HG_PENDING"), None);
+    assert_eq!(env_value(&committed, "HG_PENDING"), None);
     assert_eq!(committed.view, View::Committed(CommittedView(4)));
+  }
+
+  /// The value `input` sets for the environment variable `name`, if any.
+  fn env_value(input: &super::HookInput, name: &str) -> Option<EnvValue> {
+    input
+      .env
+      .iter()
+      .find(|(key, _)| key == name)
+      .map(|(_, value)| value.clone())
+  }
+
+  /// `text` as an environment value.
+  fn env_bytes(text: &str) -> Option<EnvValue> {
+    Some(EnvValue::Bytes(text.as_bytes().to_vec()))
+  }
+
+  /// The pretxnchangegroup expectations of [`mercurials_hooks_get_its_hook_environment`].
+  fn assert_hg_admission_hooks_environment(pending: &super::HookInput) {
+    assert_eq!(
+      env_value(pending, "HG_HOOKTYPE"),
+      env_bytes("pretxnchangegroup")
+    );
+    assert_eq!(
+      env_value(pending, "HG_HOOKNAME"),
+      env_bytes("pretxnchangegroup.check")
+    );
+    assert_eq!(env_value(pending, "HG_NODE"), env_bytes(&"aa".repeat(20)));
+    assert_eq!(
+      env_value(pending, "HG_NODE_LAST"),
+      env_bytes(&"bb".repeat(20))
+    );
+    assert_eq!(env_value(pending, "HG_SOURCE"), env_bytes("serve"));
+    assert_eq!(
+      env_value(pending, "HG_URL"),
+      env_bytes("remote:ssh:192.0.2.7")
+    );
+    assert_eq!(env_value(pending, "HG_PENDING"), Some(EnvValue::ViewRoot));
   }
 
   /// A-597, A-623 (Subversion's inputs, `hooks.c`). Do: build pre-commit with two lock tokens, one path holding a
@@ -3185,13 +3218,13 @@ mod tests {
   /// A generated event, its offsets spread over a few liveness windows, around a learned bound.
   fn generated() -> impl Strategy<Value = Generated> {
     let span = 4 * LIVENESS_BUDGET_NS;
-    prop_oneof![
-      (1_usize..40).prop_map(Generated::Output),
-      Just(Generated::OutputEnded),
-      (0..span).prop_map(Generated::Exited),
-      (0..span).prop_map(Generated::Timer),
-      Just(Generated::ClientLeft),
-    ]
+    prop::strategy::Union::new([
+      (1_usize..40).prop_map(Generated::Output).boxed(),
+      Just(Generated::OutputEnded).boxed(),
+      (0..span).prop_map(Generated::Exited).boxed(),
+      (0..span).prop_map(Generated::Timer).boxed(),
+      Just(Generated::ClientLeft).boxed(),
+    ])
   }
 
   /// What first took a run out of running: its exit, the timer at its deadline, or its client leaving.
