@@ -743,6 +743,56 @@ fn a_push_sealed_and_staged_a_unit_a_turn_lands_as_one_staged_whole() {
   assert!(stepped_store.is_empty() && whole_store.is_empty());
 }
 
+/// `green`'s move to `to` admitted a unit a turn, each turn's quantum none: the move, and the turns it took.
+fn admitted_in_turns(
+  repository: &Repository,
+  store: &ContentStore,
+  push: &Push,
+  (green, to): (u64, ObjectId),
+) -> (crate::store::Move, usize) {
+  let mut admitting = repository.admitting(store, push, green, to).unwrap();
+  let (mut clock, mut turns) = (Ticking(0), 0usize);
+  loop {
+    turns += 1;
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 0,
+    };
+    if repository
+      .admit_turn(store, push, &mut admitting, quantum)
+      .unwrap()
+    {
+      return (admitting.admitted().unwrap(), turns);
+    }
+  }
+}
+
+/// A-722 part 4c (a move admitted a unit at a time). Do: push the wide history's first version and admit green 1's
+/// create of it whole and a unit a turn; land it; push its second version and admit green 1's fast-forward to it whole
+/// and a unit a turn. Expect: each move admitted a unit a turn the move admitted whole, over more turns than one.
+#[test]
+fn a_move_admitted_a_unit_a_turn_is_the_move_admitted_whole() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let (first, second, c1, c2) = wide(format);
+  let push = sealed(&repository, &mut store, first);
+  let whole = repository.admit(&store, &push, 1, Some(c1.id)).unwrap();
+  let (stepped, turns) = admitted_in_turns(&repository, &store, &push, (1, c1.id));
+  assert_eq!(stepped, whole);
+  assert!(turns > 1, "{turns} turns");
+  let mut push = push;
+  repository.commit(&mut store, &mut push, &[whole]).unwrap();
+  let push = sealed(&repository, &mut store, second);
+  let whole = repository.admit(&store, &push, 1, Some(c2.id)).unwrap();
+  let (stepped, turns) = admitted_in_turns(&repository, &store, &push, (1, c2.id));
+  assert_eq!(stepped, whole);
+  assert!(turns > 1, "{turns} turns");
+  push.abandon(&mut store).unwrap();
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty());
+}
+
 /// The green and version the landing map gives each position of `positions`.
 fn bringers(repository: &Repository, positions: &Positions) -> BTreeSet<Option<(u64, u64)>> {
   let mut found = BTreeSet::new();

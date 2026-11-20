@@ -296,8 +296,27 @@ fn recorded(
     .map(|changeset| changeset.node)
     .ok_or(Unmade::Record)?;
   let room = crate::vcs_share::room(state, repository).bytes;
-  let objects = slates_hg::import::record::write_made(verified, (green_key(green), version), room)
-    .map_err(|_| Unmade::Record)?;
+  // The made manifest's record is its delta against its first parent's text (A-729 part 2), read from the index.
+  let parent = verified
+    .manifests
+    .first()
+    .map(|manifest| manifest.p1)
+    .filter(|p1| *p1 != slates_hg::NULL_NODE)
+    .and_then(|p1| {
+      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
+      slates_hg::push::verify::Held::manifest_text(
+        &slates_hg::push::held::IndexHeld::new(&store.index, content),
+        &p1,
+      )
+      .map(std::borrow::Cow::into_owned)
+    });
+  let objects = slates_hg::import::record::write_made(
+    verified,
+    (green_key(green), version),
+    parent.as_deref(),
+    room,
+  )
+  .map_err(|_| Unmade::Record)?;
   let entry = Op::RepositoryAdvanced {
     entry: RepositoryEntry {
       repository,

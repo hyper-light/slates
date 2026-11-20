@@ -3036,6 +3036,22 @@ impl Daemon {
     })
   }
 
+  /// The version of `green` that `work` holds as its floor at the green's owner partition (A-247; A-697 part a: a work
+  /// another node holds is admitted by a forwarded ask), as the owner's record keeps it: `None` for no floor. The typed
+  /// refusal when the shard could not be observed.
+  pub fn work_floor(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+    work: slates_ipc::protocol::VolumeId,
+  ) -> Result<Option<u64>, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    let green = slates_db::catalog::VolumeId { bytes: green.bytes };
+    let work = slates_db::catalog::VolumeId { bytes: work.bytes };
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db.partition().work_floor(green, work)
+    })
+  }
+
   /// Test support: injects a merge-plane fault on this node's control shard (§4.16; never reachable
   /// from the wire): refuse every content put while set, so an owner's merge record must wait for its
   /// inputs to place; or corrupt the next inputs a record is recomputed from, so the recomputation
