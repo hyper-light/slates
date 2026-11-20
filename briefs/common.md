@@ -218,14 +218,18 @@ slates' CLAUDE.md §8 (Ada, 2026-11-18, "binding on every agent and subagent, fo
   design decision between competing shapes is settled by the agent's own A/B: release builds, interleaved, all N
   shown, built as a measured example where possible (w-hg's changeset_ab.rs).
 
-## CLOSE THE OPEN ITEMS (ADA 2026-11-20 ~16:05 PST; binding, supersedes main's side assignments of the afternoon)
-Ada: "stop FUCKING doing that and ensure they close the existing fucking items." Main had let UI parts gain new open
-items as fast as old ones closed, and handed agents side pieces; only one UI part closed between 07:20 and 16:00.
-- **Your queue is your UI part's listed items, nothing else** (briefs/close-list.md names each agent's items, in order).
-  Land what is in flight only if it lands within 30 minutes; otherwise park it on a branch and move.
-- **A new finding** (a bug, a gap, a faster shape) goes to docs/wip/GAPS.md and your progress file. It is not worked,
-  and it is not added to any UI part, unless it blocks one of your listed items.
+## CLOSE THE OPEN ITEMS (ADA 2026-11-20 ~16:05-16:15 PST; binding)
+Ada: "stop FUCKING doing that and ensure they close the existing fucking items"; "anything you have currently added
+up until now gets closed, but no more new"; "the large message I sent you (the Codex/ChatGPT analysis) also needs to
+be closed"; "as well as the changeset work and integration in full"; "prioritize implementation/completion first,
+then robustness, then performance". Main had let UI parts gain new open items as fast as old ones closed; only one UI
+part closed between 07:20 and 16:00.
+- **Your queue is fixed: what you have been given up to now, and nothing more** (briefs/close-list.md names each
+  agent's items). Everything on it gets closed; nothing is dropped and nothing is added.
+- **Order: completion first, then robustness, then performance.** Build what's missing before hardening it, and
+  harden it before speeding it up.
+- **A new finding** (a bug, a gap, a faster shape) goes to docs/wip/GAPS.md and your progress file. It isn't worked
+  and isn't added to your queue or any UI part, unless it blocks an item already on your list.
 - **When an item closes**, write inbox/main-from-<you>-close.md: the item, the commit on origin/main, the test or the
-  measurement. Main marks the part met the same check.
-- Main adds no new open items to UI parts. Performance items already listed are closed as listed (Ada's "performance
-  gaps upfront" still holds for them).
+  measurement. Main marks the UI part met the same check.
+- Main adds no new open items to UI parts and gives no new pieces beyond the close list.
