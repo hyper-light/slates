@@ -927,3 +927,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - ~00:10 PST ADA: "the change that stores svn file text once (A-716) -> we should do that anyway" -> A-716 now
   unconditional for w-perf: rerun (measure) -> A-716 (unless T4 lands within ~30 min) -> T4 -> register entry objects
   name content by identity (A-662, every tool; seam with w-svn).
+- ~00:15 PST ADA: "Likewise for git and mercurial" -> content once for all three tools: w-git (after A-719): git store
+  names blobs by the green's ContentIdentity (trees/commits stay git's), order vs w-perf's T4 agreed between them;
+  w-hg: folded into (1)+(2): filelog texts named by ContentIdentity, manifests/changelogs as deltas; w-perf: A-716
+  (svn), then register entry objects (A-662) for every tool.
