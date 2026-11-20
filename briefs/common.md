@@ -95,6 +95,14 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
 - GAPS may name it only while that fix is in flight. Never write "owed" for a performance gap and move on.
 - A stopgap that shrinks a gap without bounding it is not the fix. Go straight to the bound.
 
+## ON ORIGIN/MAIN, REGULARLY (ADA 2026-11-20 ~07:00 PST: "be sure we're also regularly pushing these changes origin/main")
+- Finished work never sits on a branch. Each piece lands on origin/main within about 30 minutes of being green, under the
+  fast landing rule, confirmed with `git merge-base --is-ancestor`.
+- A red check still running (a Windows red, a CI diag) doesn't hold a green piece back: land on the green, then add the red's
+  numbers as a follow-up commit.
+- An experiment that lost goes into BENCHMARKS as measured-and-rejected, and then its branch is deleted. Main audits
+  agents/* branches every five minutes.
+
 ## DECISIONS BACKED BY DATA; MAKE DESIGNS BETTER (ADA 2026-11-20 ~06:45 PST)
 - Ada: "push back and make designs more robust, more performant, make your agents do A|B testing and back their decisions
   with data." When a design choice affects performance or robustness, A/B the candidates on the real workload before
