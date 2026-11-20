@@ -2,12 +2,14 @@
 //! place from the pack the content store holds, is the object git's reader made of the pack whole.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 
 use slates_vcs::ContentStore;
 
 use crate::Admission;
 use crate::object_name::{Kind, ObjectFormat, ObjectId};
 use crate::store::packed::{Base, Bases, InPack, PackedRefused, Scratch, read};
+use crate::store::{GitNaming, Incoming, Push};
 use crate::unpack::{self, NoIndex, Outside};
 
 /// Shape: a window small enough that the captured packs' entries cross windows (the fixtures' packs are a few hundred
@@ -223,5 +225,145 @@ fn an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed() {
   assert!(
     missing > 0,
     "the thin pack has a delta on a base outside it"
+  );
+}
+
+/// The pack of each captured push and the objects its server held before (its thin bases), read whole.
+fn captured(request: &[u8], before: &[u8]) -> (Vec<u8>, Held) {
+  let at = request
+    .windows(4)
+    .position(|magic| magic == b"PACK")
+    .unwrap();
+  let held = Held(
+    read_whole(before, &Held(BTreeMap::new()))
+      .objects
+      .into_iter()
+      .map(|object| (object.id, (object.kind, object.content)))
+      .collect(),
+  );
+  (request[at..].to_vec(), held)
+}
+
+/// `object` as a pack's reader hands it to a push.
+fn incoming(object: &unpack::Object) -> Incoming<'_> {
+  Incoming {
+    kind: object.kind,
+    claimed: Some(object.id),
+    content: &object.content,
+    depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
+  }
+}
+
+/// B2, a push read in place while judged (main's ruling B part 2). Do: for each captured push, hand a push its pack
+/// seven bytes a call, as a client's bytes arrive, and admit each object its reader resolved where its entry begins,
+/// keeping none of the objects' bytes; read every object back through the push. Expect: each object's bytes those of
+/// the whole read, deltas against an earlier entry and against an object held outside the pack among them; the content
+/// store holding nothing more; what the push keeps lately within its pack's length.
+#[test]
+fn b2_every_object_of_a_push_read_where_it_lies_in_its_pack_is_the_object_read_whole() {
+  for (name, request, before) in PUSHES {
+    let (pack, held) = captured(request, before);
+    let whole = read_whole(&pack, &held);
+    let store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
+    let used = store.used();
+    let naming = GitNaming {
+      format: ObjectFormat::Sha1,
+    };
+    let mut push = Push::new(ObjectFormat::Sha1);
+    for piece in pack.chunks(7) {
+      push.extend_pack(piece);
+    }
+    for object in &whole.objects {
+      push
+        .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
+        .unwrap_or_else(|refused| panic!("{name} at {}: {refused:?}", object.offset));
+    }
+    let outside = Located {
+      entries: BTreeMap::new(),
+      held: &held,
+    };
+    for object in &whole.objects {
+      let read = push
+        .bytes(&store, &outside, &object.id)
+        .unwrap_or_else(|| panic!("{name}: {} not held", object.id))
+        .unwrap_or_else(|refused| panic!("{name} at {}: {refused:?}", object.offset));
+      assert_eq!(
+        read.as_ref(),
+        object.content.as_slice(),
+        "{name} at {}",
+        object.offset
+      );
+    }
+    assert_eq!(
+      store.used(),
+      used,
+      "{name}: the store holds none of the push's objects"
+    );
+    assert!(
+      push.kept_lately() <= pack.len(),
+      "{name}: {} kept lately",
+      push.kept_lately()
+    );
+  }
+}
+
+/// B2's resident bound (Ada's MEMORY SIZING rule: resident ≤ k×N + base). Do: push 64 blobs of 64 KiB each, each one
+/// byte repeated (git/git's v1.5.0 push is 9.4 MiB of pack for 304.6 MiB of objects; these deflate further), once held
+/// in the content store as they arrive (`Push::admit`, what a push did before) and once where each lies in the pack
+/// (`Push::admit_placed`), its reader's bytes kept as read lately. Expect: held in place, the push's resident (what the
+/// store grew by, its pack and what it keeps lately) within twice its pack; held in the store, past it, every object
+/// inflated. Both printed, before and after.
+#[test]
+fn b2_an_in_flight_push_holds_its_pack_and_not_its_objects_inflated() {
+  const BLOBS: u8 = 64;
+  const BLOB_LEN: usize = 64 << 10;
+  let blobs: Vec<Vec<u8>> = (0..BLOBS).map(|byte| vec![byte; BLOB_LEN]).collect();
+  let pack = crate::pack::of_whole(
+    ObjectFormat::Sha1,
+    blobs.iter().map(|blob| (Kind::Blob, blob.as_slice())),
+  )
+  .unwrap();
+  let whole = read_whole(&pack, &Held(BTreeMap::new()));
+  let naming = GitNaming {
+    format: ObjectFormat::Sha1,
+  };
+  let inflated: usize = blobs.iter().map(Vec::len).sum();
+
+  let mut store = ContentStore::new(1 << 30, 1 << 16).unwrap();
+  let used = store.used();
+  let mut stored = Push::new(ObjectFormat::Sha1);
+  for object in &whole.objects {
+    stored
+      .admit::<_, Infallible>(&mut store, &naming, incoming(object))
+      .unwrap();
+  }
+  let before = usize::try_from(store.used().saturating_sub(used)).unwrap();
+  stored.abandon(&mut store).unwrap();
+
+  let used = store.used();
+  let mut placed = Push::new(ObjectFormat::Sha1);
+  placed.extend_pack(&pack);
+  for object in read_whole(&pack, &Held(BTreeMap::new())).objects {
+    placed
+      .admit_placed::<_, Infallible>(&store, &naming, (incoming(&object), object.offset))
+      .unwrap();
+    placed.keep_read(object.offset, object.kind, object.content);
+  }
+  let grown = usize::try_from(store.used().saturating_sub(used)).unwrap();
+  let after = grown + placed.pack().len() + placed.kept_lately();
+  println!(
+    "b2 in-flight resident: {BLOBS} objects, {inflated} bytes inflated, a pack of {} bytes; held in the store {before} \
+     bytes, held in place {after} bytes ({grown} in the store, {} kept lately)",
+    pack.len(),
+    placed.kept_lately()
+  );
+  assert!(
+    after <= 2 * pack.len(),
+    "held in place: {after} bytes for a {}-byte pack",
+    pack.len()
+  );
+  assert!(
+    before >= inflated,
+    "held in the store: {before} bytes for {inflated} inflated"
   );
 }

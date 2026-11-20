@@ -2698,6 +2698,9 @@ pub(crate) fn route_gated(
   if let RequestBody::Grants { after } = body {
     return scatter_grants(state, client.index(), request, principal, after);
   }
+  if let RequestBody::SessionLog { after } = body {
+    return scatter_session_log(state, client.index(), request, principal, after);
+  }
   if matches!(
     &body,
     RequestBody::Bootstrap { .. } | RequestBody::RecoveryPlan { .. } | RequestBody::Recover { .. }
@@ -3814,6 +3817,78 @@ fn gather_grants(
   }
 }
 
+/// The session log (A-773) is a scatter-gather like the grants: each shard holds its works and the landings presented
+/// on it, so every shard reports its part and the origin folds them into one page ([`crate::session_log`]).
+fn scatter_session_log(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  principal: Principal,
+  after: Option<slates_ipc::protocol::LogCursor>,
+) -> Served {
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|s| *s != state.shard)
+    .collect();
+  let mine = crate::session_log::part(state, &principal, after);
+  if others.is_empty() {
+    return Served::Reply(crate::session_log::page(vec![mine]));
+  }
+  state
+    .log_scatters
+    .insert(request, (client_index, others.len(), vec![mine]));
+  let origin = state.shard;
+  for shard in others {
+    let principal = principal.clone();
+    let task = SpawnRequest::new(
+      Box::pin(async move {
+        let part = crate::state::with_state(|s| crate::session_log::part(s, &principal, after));
+        crate::xshard::send_reply_home(origin, move || {
+          gather_session_log(request, shard, part);
+        });
+      }),
+      None,
+    );
+    if let Some(reply) = send_part(state, shard, task, ScatterKind::SessionLog, request) {
+      return Served::Reply(reply);
+    }
+  }
+  Served::Forwarded
+}
+
+/// Folds one shard's part of a session log page into the scatter and, on the last part, delivers the merged page; a
+/// part `shard` did not serve is settled refused ([`settle_unserved`]).
+fn gather_session_log(
+  request: u64,
+  shard: u16,
+  part: Option<PagePart<slates_ipc::protocol::LogLine>>,
+) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::SessionLog, request, shard);
+    return;
+  };
+  let done = crate::state::with_state(|s| {
+    let entry = s.log_scatters.get_mut(&request)?;
+    entry.2.push(part);
+    entry.1 = entry.1.saturating_sub(1);
+    if entry.1 == 0 {
+      let refused_for = s.scatter_refusals.remove(&request);
+      s.log_scatters
+        .remove(&request)
+        .map(|entry| (entry, refused_for.map(|shard| part_unsent(s, shard))))
+    } else {
+      None
+    }
+  })
+  .flatten();
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| crate::session_log::page(parts));
+    crate::state::deliver(client_index, request, reply, false);
+  }
+}
+
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
 /// the origin assembles the daemon's view (§4.14 `slates.status`). An unserved report refuses the status, as a
 /// listing's part does.
@@ -3856,6 +3931,8 @@ enum ScatterKind {
   List,
   /// `scatter_grants`, in [`ShardState::grant_scatters`].
   Grants,
+  /// `scatter_session_log`, in [`ShardState::log_scatters`] (A-773).
+  SessionLog,
   /// `scatter_status`, in [`ShardState::status_scatters`].
   Status,
   /// `scatter_acknowledge`, in [`ShardState::ack_scatters`] (A-216).
@@ -3941,6 +4018,7 @@ fn settle_refused(
     }
     ScatterKind::List => (count_down(&mut state.scatters, request), false),
     ScatterKind::Grants => (count_down(&mut state.grant_scatters, request), false),
+    ScatterKind::SessionLog => (count_down(&mut state.log_scatters, request), false),
     ScatterKind::Status => (count_down(&mut state.status_scatters, request), true),
   };
   let first = *state.scatter_refusals.entry(request).or_insert(shard);
@@ -3987,6 +4065,9 @@ fn settle_gone(state: &mut ShardState, kind: ScatterKind, request: u64) {
     }
     ScatterKind::Grants => {
       state.grant_scatters.remove(&request);
+    }
+    ScatterKind::SessionLog => {
+      state.log_scatters.remove(&request);
     }
     ScatterKind::Status => {
       state.status_scatters.remove(&request);
@@ -5615,6 +5696,9 @@ fn dispatch_inner(
     ),
     RequestBody::Grants { after } => {
       crate::landing::grants_page(vec![crate::landing::grants_part(state, principal, after)])
+    }
+    RequestBody::SessionLog { after } => {
+      crate::session_log::page(vec![crate::session_log::part(state, principal, after)])
     }
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to, owed } => acknowledge(state, client_id, up_to, &owed),
@@ -8391,6 +8475,7 @@ fn create_work_here(
       charged,
       entries: std::collections::BTreeMap::new(),
       verdict: None,
+      accepted: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -9790,6 +9875,10 @@ fn settle_submit(
     return refused(refusal_of_db(&e));
   }
   reset_accepted_work(state, work_id, version);
+  // The session log's mark (A-773): the version the work's last submission made, which it now stands on.
+  if let Some(work) = state.works.get_mut(&work_id) {
+    work.accepted = Some(version);
+  }
   crate::work_home::tell_floor(state, green_id, work_id, Some(version));
   reply
 }
@@ -18505,6 +18594,7 @@ fn install_rebuilt_work(
       charged,
       entries: std::collections::BTreeMap::new(),
       verdict: None,
+      accepted: None,
     },
   );
 }

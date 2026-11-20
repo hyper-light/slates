@@ -20,8 +20,8 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  GrantState, IdentityRecord, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge,
-  NameAliasRecord, NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  GrantState, IdentityRecord, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
+  LineageEdge, NameAliasRecord, NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
   NfsOpenRecord, NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES,
   SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone,
   VolumeId, VolumeRecord,
@@ -200,6 +200,8 @@ pub struct PartitionSnapshot {
   /// a repository's or a green's (A-636 part 2b-2; appended), so a recovery mints the family ids the live partition
   /// would.
   pub family_counter: u64,
+  /// The version-control credentials revoked here (A-764; appended), by id: each never enrolled again.
+  pub credential_tombstones: Vec<[u8; 32]>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -316,6 +318,10 @@ pub struct Partition {
   identities: BTreeMap<Vec<u8>, IdentityRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
+  /// The landings presented and awaiting a grant (§4.15 `AwaitingGrant`), by the volume they land and their id
+  /// (A-773): what the session log shows, so its read costs the landings waiting, never the partition's landing
+  /// history. Kept by `apply` beside `landings` and rebuilt from them at a restore; bounded by `landings`.
+  awaiting_grant: BTreeSet<(VolumeId, u64)>,
   /// The audit records retained, oldest first: at most `caps.audit_records` (A-265).
   audit: std::collections::VecDeque<AuditRecord>,
   /// The audit records dropped oldest first past the bound (A-265), snapshotted with the window.
@@ -484,6 +490,7 @@ impl Partition {
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
+      awaiting_grant: BTreeSet::new(),
       audit: std::collections::VecDeque::new(),
       audit_dropped: 0,
       green_chains: BTreeMap::new(),
@@ -1412,6 +1419,27 @@ impl Partition {
     self.landings.get(&id)
   }
 
+  /// The landings awaiting a grant from `from` (a volume and, within it, a landing id), in that order (A-773): a seek
+  /// into the waiting set, so a page costs the lines it carries.
+  pub fn awaiting_grant_from(
+    &self,
+    from: std::ops::Bound<(VolumeId, u64)>,
+  ) -> impl Iterator<Item = &LandingRecord> + '_ {
+    self
+      .awaiting_grant
+      .range((from, std::ops::Bound::Unbounded))
+      .filter_map(|(_, id)| self.landings.get(id))
+  }
+
+  /// Keeps `awaiting_grant` equal to the landings whose state is `AwaitingGrant`.
+  fn note_awaiting(&mut self, volume: VolumeId, id: u64, state: LandingState) {
+    if state == LandingState::AwaitingGrant {
+      self.awaiting_grant.insert((volume, id));
+    } else {
+      self.awaiting_grant.remove(&(volume, id));
+    }
+  }
+
   /// The highest landing id the partition holds, or `None` when it holds none — asked once at boot, so
   /// a fresh counter never re-mints a recovered landing's id (the records are durable and the guard
   /// refuses a duplicate).
@@ -1661,7 +1689,9 @@ impl Partition {
       }
       // A version-control credential (A-625 part 3): `crate::credentials`; its bytes fit the table byte budget, and the
       // refusal names the table the human was adding to.
-      Op::CredentialEnrolled { .. } | Op::CredentialRevoked { .. } => {
+      Op::CredentialEnrolled { .. }
+      | Op::CredentialRevoked { .. }
+      | Op::CredentialTombstoned { .. } => {
         self.credentials.check(op)?;
         let (released, added) = self.credentials.charge(op);
         self
@@ -2253,7 +2283,9 @@ impl Partition {
           .saturating_add(added);
         Ok(())
       }
-      Op::CredentialEnrolled { .. } | Op::CredentialRevoked { .. } => {
+      Op::CredentialEnrolled { .. }
+      | Op::CredentialRevoked { .. }
+      | Op::CredentialTombstoned { .. } => {
         let (released, added) = self.credentials.charge(op);
         self.credentials.apply(op)?;
         self.green_chain_bytes = self
@@ -2551,6 +2583,7 @@ impl Partition {
       }
       Op::LandingRecorded { record } => {
         self.landings.insert(record.id, record.clone());
+        self.note_awaiting(record.volume, record.id, record.state);
         Ok(())
       }
       Op::LandingStateChanged {
@@ -2563,6 +2596,8 @@ impl Partition {
         landing.state = *state;
         landing.written = *written;
         landing.conflicts = *conflicts;
+        let volume = landing.volume;
+        self.note_awaiting(volume, *id, *state);
         Ok(())
       }
       Op::AuditAppended { record } => {
@@ -2952,6 +2987,7 @@ impl Partition {
       atomic_records: self.repositories.atomic_held(),
       identities: self.identities.values().cloned().collect(),
       credentials: self.credentials.records().cloned().collect(),
+      credential_tombstones: self.credentials.tombstones().copied().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -3180,6 +3216,7 @@ impl Partition {
     }
     for l in &snapshot.landings {
       p.landings.insert(l.id, l.clone());
+      p.note_awaiting(l.volume, l.id, l.state);
     }
     p.audit = snapshot.audit.iter().cloned().collect();
     p.audit_dropped = snapshot.audit_dropped;
@@ -3225,7 +3262,10 @@ impl Partition {
     )?;
     p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.reviews.bytes());
     // The version-control credentials, charged to the table byte budget as when each was enrolled (A-625 part 3).
-    p.credentials = crate::credentials::Credentials::restore(&snapshot.credentials)?;
+    p.credentials = crate::credentials::Credentials::restore(
+      &snapshot.credentials,
+      &snapshot.credential_tombstones,
+    )?;
     p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.credentials.bytes());
     Ok(p)
   }

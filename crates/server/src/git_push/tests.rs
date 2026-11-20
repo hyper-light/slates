@@ -1914,3 +1914,27 @@ fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
     assert_eq!(carried, kept);
   });
 }
+
+/// A-724 piece 8c (a decision never waits for a homing nobody runs: found by the takeover test, where the HTTP edge had
+/// lost its homing in a refactor and a version-3 push hung). Do: with version 3 on, push stock git's `create` through a
+/// driver that never takes the homing its decision asks for (`pushed`). Expect: answered `ok`, its record version 2,
+/// the untaken homing counted.
+#[test]
+fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
+  crate::daemon::audit_on_shard(|state| {
+    crate::vcs_store::write_version_3_for_test(true);
+    let repository = git_repository(state, "untaken");
+    pushed_from_the_fixtures(state, repository, &["create"]);
+    let records = crate::vcs_store::tests::records(state, repository);
+    let versions: Vec<u32> = records
+      .iter()
+      .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
+      .collect();
+    assert_eq!(versions, vec![2]);
+    assert_eq!(
+      state.refusals.get(crate::vcs_store::homes::HOMING_UNTAKEN).copied(),
+      Some(1)
+    );
+    crate::vcs_store::write_version_3_for_test(false);
+  });
+}

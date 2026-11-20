@@ -130,7 +130,9 @@ mod tests {
   fn t_a760_a_large_named_text_lands_a_slice_a_turn_held_once() {
     crate::daemon::audit_on_shard(|state| {
       let _repository = crate::git_push::tests::git_repository(state, "texts");
-      let bytes: Vec<u8> = (0..TEXT).map(|at| (at % 239) as u8).collect();
+      let bytes: Vec<u8> = (0..TEXT)
+        .map(|at| u8::try_from(at % 239).unwrap())
+        .collect();
       let object = put_text(state, &bytes);
       let slice = state.config.copy_slice_bytes().max(1);
       let budget = state.config.step_quantum_ns() / 2;

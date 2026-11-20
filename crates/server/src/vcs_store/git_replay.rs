@@ -271,8 +271,13 @@ impl GitReplay {
             content: &object.content,
             depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
           };
-          admit_object(content, store, (&mut self.push, &mut self.remade), incoming)
-            .map_err(ReplayRefused::Git)?;
+          admit_object(
+            content,
+            store,
+            (&mut self.push, &mut self.remade),
+            (incoming, None),
+          )
+          .map_err(ReplayRefused::Git)?;
           (
             Stage::Admitting {
               objects,
