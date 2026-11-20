@@ -662,6 +662,92 @@ async fn let_go_region_at_home(
   .ok_or(HomeRefused::Unanswered)?
 }
 
+/// Counter: objects homed in the region at `f + 1` before a record names them (A-724 piece 8c). Format: a counter name.
+pub(crate) const HOMED_IN_REGION: &str = "vcs_store.homes.homed_in_region";
+/// Counter: homings in the region that fell short of `f + 1` within their budget. Format: a counter name.
+pub(crate) const HOMED_SHORT: &str = "vcs_store.homes.homed_short";
+
+/// The object `bytes` homed in the region before a record names it (main's ruling of 2026-11-20 (ii), A-727's rule:
+/// content durable at `f + 1` before the record that names it): kept on each of its region homes
+/// (`slates_db::identity_homes::homes` over its BLAKE3), this node's own through its home shard, every other through
+/// [`slates_cluster::homes`]; each answers kept only once its home's image holding it is published. Its identity once
+/// `f + 1` homes (every member, in a region of fewer) answered kept within `budget`; refused `Unanswered` otherwise, and
+/// the caller records the names inline instead (version 2). Asked from shard `origin`; at most one window
+/// (`ContentRefused::PastWindow` refused `PastWindow`) until an object past one is sent in parts.
+pub(crate) async fn home_in_region(
+  origin: u16,
+  shards: &[u16],
+  bytes: Vec<u8>,
+  budget: slates_cluster::CommitBudget,
+) -> Result<ContentId, HomeRefused> {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
+  let (local, members, f) = crate::state::with_state(|state| {
+    (
+      state.fleet.host(),
+      state.fleet.members().to_vec(),
+      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+    )
+  })
+  .ok_or(HomeRefused::Unanswered)?;
+  let identity = ContentId::of(&bytes);
+  let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
+  let budget_ns = budget.max_deadline_ns();
+  let mut kept = 0usize;
+  if homes.contains(&local) {
+    let (_, ticket) = keep_region_at_home(origin, shards, bytes.clone(), budget_ns).await?;
+    if published(origin, ticket, budget_ns).await {
+      kept = kept.saturating_add(1);
+    }
+  }
+  let others: Vec<slates_db::HostId> = homes
+    .iter()
+    .copied()
+    .filter(|home| *home != local)
+    .collect();
+  if !others.is_empty() {
+    let request = HomeMessage::Put {
+      identity: identity.0,
+      bytes,
+    }
+    .encode();
+    let sessions =
+      crate::fleet::take_sessions("vcs_store.homes.region", |host| others.contains(&host));
+    let outgoing: Vec<_> = sessions
+      .into_iter()
+      .map(|(host, endpoint)| (host, request.clone(), endpoint))
+      .collect();
+    let (replied, _stragglers) = slates_cluster::broadcast(
+      outgoing,
+      HOME_STREAM,
+      slates_transport::connection::Priority::Bulk,
+      budget,
+    )
+    .await;
+    let mut returned = Vec::with_capacity(replied.len());
+    for (host, reply, endpoint) in replied {
+      if let Ok(HomeMessage::Answer {
+        identity: answered,
+        outcome: HomeOutcome::Kept { .. },
+      }) = HomeMessage::decode(&reply.bytes)
+        && answered == identity.0
+      {
+        kept = kept.saturating_add(1);
+      }
+      returned.push((host, endpoint));
+    }
+    crate::fleet::return_sessions(returned);
+  }
+  let homed = kept >= homes.len() && !homes.is_empty();
+  crate::state::with_state(|state| {
+    state.count(if homed { HOMED_IN_REGION } else { HOMED_SHORT }, 1)
+  });
+  if homed {
+    Ok(identity)
+  } else {
+    Err(HomeRefused::Unanswered)
+  }
+}
+
 /// Counter: identities the healer offered to their region homes. Format: a counter name.
 pub(crate) const HEAL_OFFERED: &str = "vcs_store.homes.heal_offered";
 /// Counter: identities this node let go once every region home held them. Format: a counter name.
