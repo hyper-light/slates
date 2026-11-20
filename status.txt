@@ -1,2 +1,3 @@
 started 2026-11-20T05:48:41Z at 2f47f0e0bec170319c1dea16cddadcfe3bd335f8
 clippy exit 101
+fsx exit 1
