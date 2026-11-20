@@ -1,6 +1,12 @@
 # w-store progress (brief: briefs/w-store.md)
 
-## State (2026-11-20 ~13:50 PST)
+## State (2026-11-20 ~14:40 PST)
+- LANDED 9d74daf2a on main: A-767 design (one unit the changeset; Ada ~13:35) + research/vcs-store-prior-art.md,
+  GAPS line, §4.17.1 and R1 status lines. Base origin/main 990c83e77.
+- Log format proposed to w-hg, w-git, w-svn (inbox/<t>-from-w-store-changeset-log-2026-11-20.md); awaiting replies.
+- Mantle origin clone -> ~/.cache/w-store-mantle (background).
+
+## Earlier
 - A-767 claimed on the ledger (state branch 3a6db5515).
 - Worktree: ~/slates-work/w-store-design (detached at origin/main 6337049f6). Design draft:
   ~/fanout-state-w-store/scratch-w-store/A-767-draft.md.
@@ -16,4 +22,4 @@
 4. hg onto it (w-hg), 5. git (w-git B1-B4), 6. svn (w-svn): each with an RSS red test.
 
 ## For main to delete
-(none)
+- /tmp/rsch (my research subagent saved fetched sources there against the rules; delete it)
