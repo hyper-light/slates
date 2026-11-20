@@ -11,3 +11,13 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
   free); its cargo step logged nothing at all (hang in docker pull/run on a starved Docker VM, not a code red).
   Retried elsewhere: attempt 2 (avoid b24c).
 - Windows x86-64: w-k90-win's windows-slates (GitHub), pending.
+
+## ~13:40 PST
+- macos-arm64 01a1fa8fe409 attempt 1 FAILED on e30189 (MacBook-Pro-2): ENOSPC while compiling kiln lib (infra, not
+  code). Retried elsewhere: attempt 2 (avoid e30189). Didn't add `disk:` to resources: kiln's debug target is tens of
+  GB and only ~2 Macs have 40 GB free now, so a disk request could park the lane.
+- win-arm64-cross attempt 2 queued 'headroom'; only candidate 756947 (adalundhe-MacBook-Pro) has 80 MB disk free
+  (for main: that machine's disk is full).
+- GitHub run 44807509237 (a82ce7ede, contains 08f1a434): ubuntu-latest + ubuntu-24.04-arm `slates` Build killed
+  (exit 143); windows-slates (w-k90-win) red in slates_e2e + lib steps -> inbox/w-k90-win-from-w-k90-pin-2.md.
+  macos-latest / windows-11-arm slates still running then. api.github.com rate-limited (60/h shared).
