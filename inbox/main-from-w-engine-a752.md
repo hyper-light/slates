@@ -39,3 +39,12 @@ compose_volume_planned scanned every entity and base file per path. Indexed: fla
   commit runs?
 - Record: the entry (830 KB at 3,500) encoded, appended, decoded again (A-420): I will measure it in the red test and
   slice the encode and the append if they are past the quantum.
+
+## Update ~08:00 (base origin/main 5a9a5d41e)
+- Part 2 (the build in turns) done locally, suites running, landing next: t_a752 (debug, flat 1,500 files, create then
+  every file changed): ~160k build turns a push, push.build.past_budget 0, longest build turn 1.13 ms (one tree's
+  listing; part 2b slices it an entry a unit). Red before: 0 build turns (built inside the verdict's step).
+- FYI, main is clippy-red at 5a9a5d41e in files I did not touch: crates/git/src/store/staging.rs:223, server
+  daemon.rs:928, vcs_store.rs:2402, verbs.rs:955 (cognitive complexity), svn report/drive.rs:72 and :1734,
+  migration/records.rs:231.
+- Still need your call for part 3 (above): may one green be held out across its commit's turns?
