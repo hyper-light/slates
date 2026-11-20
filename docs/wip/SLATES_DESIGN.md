@@ -54736,6 +54736,19 @@ Applied in the same change to:
   `vcs_store::homes::tests::a_batch_of_windows_goes_to_each_home_in_one_call_a_shard` (five batches of 259 windows over
   four homes: 151 calls in a debug build; every window homed, read back in order, held twice where sent twice, freed).
   Owed: the region's half once w-fed-faults answers; the owner's rows and reads through them with w-perf's a2 and a3.
+- **Piece 8a, growth refused typed before it passes the snapshot slot (2026-11-20).** `slates_db::replay::Db`: a record's
+  projected snapshot (the last snapshot's exact bytes, every record's since, and its own) is checked against the slot
+  (`segment.geometry().snapshot_bytes`) before it is appended. Past it, the state is snapshotted at once and so measured
+  exactly: a state that fits goes on (a transaction's applied effects carried by that snapshot, as a full log's are),
+  one that cannot is refused `DbError::SnapshotRoom { needed, room }` with nothing applied (a transaction rolled back
+  with it as the cause, AUD-06's rule), counted. A snapshot too large for its slot is refused the same way before the
+  segment is touched. `Db::snapshot_room` reads the room left, for admission. On the wire `DatabaseRefusal::SnapshotRoom`
+  (appended, `wire_order.txt` 12). Tests: `replay::tests::a_record_whose_state_would_pass_the_snapshot_slot_is_refused_typed_and_one_that_fits_never_is`
+  (records three slots long over a state a fifth of the slot: none refused; a slot and a half refused, nothing applied,
+  recovered as before) and `...a_transaction_whose_state_would_pass_the_snapshot_slot_rolls_back_typed`; slates-db
+  `--lib` 176 of 176, `--test model` 26 of 26; slates-ipc `--test wire_order`. Owed: the slot derived at each snapshot
+  and grown by a re-laid segment at a handoff (8b); the snapshot naming sealed index tables by identity (8c, with A-727);
+  the room read by `vcs_share::room` as a second resource.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
