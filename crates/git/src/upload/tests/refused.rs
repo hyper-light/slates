@@ -1,7 +1,8 @@
 //! Refusals, each answered in git's words (A-640 part 2; the module's **Refusals**), and hostile requests.
 
 use super::{
-  MAIN_REF, WholeObjects, WholePack, answer_of, answer_v2, command, naming, pkt, serving,
+  MAIN_REF, WholeObjects, WholePack, answer_of, answer_v2, command, naming, pkt, read_fetch,
+  serving,
 };
 use crate::fixtures::{FETCH_CLONE_REQUEST, FETCH_HAVES_REQUEST};
 use crate::http::Version;
@@ -186,12 +187,14 @@ fn a_filter_git_does_not_read_is_refused_and_a_sparse_blob_that_is_no_blob_dies_
 
 /// A-640 part 2 (the request's admission bounds what the answer keeps): do answer the clone within admissions too
 /// small for it. Expect: each refused as past its admission, in an `ERR` line; and the same request answered whole
-/// with room enough.
+/// with room enough. A-745 (§4.17.1 "A fetch's answer" rule 2: a request's room bounds a slice, never a repository): do
+/// answer it within 4 KiB, which once fell short of the two whole packets the pack was framed through. Expect: the same
+/// pack, every object of it, framed in packets a quarter of the room left at most, so more of them.
 #[test]
 fn an_answer_past_its_admission_is_refused() {
   let fixture = served::served();
   let served = serving(&fixture, &REFS, MAIN_REF);
-  for room in [0u64, 64, 512, 4096] {
+  for room in [0u64, 64, 512] {
     let mut source = WholeObjects::new(&fixture.objects);
     let mut admission = Admission::new(room);
     let mut answer = serve(
@@ -219,8 +222,30 @@ fn an_answer_past_its_admission_is_refused() {
       "room {room}"
     );
   }
-  let (_, answer) = answer_v2(&fixture, FETCH_CLONE_REQUEST);
+  let (whole, answer) = answer_v2(&fixture, FETCH_CLONE_REQUEST);
   assert_eq!(answer.refusal(), None);
+  let mut source = WholeObjects::new(&fixture.objects);
+  let mut admission = Admission::new(4096);
+  let mut small = serve(
+    &served,
+    Version::V2,
+    Asked::Request(FETCH_CLONE_REQUEST),
+    &mut source,
+    &mut admission,
+  );
+  let mut bytes = Vec::new();
+  while small.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX) == Written::More {
+  }
+  assert_eq!(small.refusal(), None);
+  let (_, names) = read_fetch(&bytes, false, &fixture.objects);
+  let (_, every) = read_fetch(&whole, false, &fixture.objects);
+  assert_eq!(names, every, "the same pack within 4 KiB");
+  assert!(
+    bytes.len() > whole.len(),
+    "in more packets: {} bytes against {}",
+    bytes.len(),
+    whole.len()
+  );
 }
 
 /// A-640 part 2 (a flush alone; the served refs' order): do send a flush alone, then serve refs out of order. Expect:

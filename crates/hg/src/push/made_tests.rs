@@ -79,6 +79,7 @@ fn a_made_history_is_the_one_stock_7_2_commits() {
     &[Change {
       path: b"a",
       after: Some((b"a\n", Flag::Regular)),
+      copied_from: None,
     }],
     (b"default", b"one"),
   );
@@ -90,10 +91,12 @@ fn a_made_history_is_the_one_stock_7_2_commits() {
       Change {
         path: b"b",
         after: Some((b"b\n", Flag::Executable)),
+        copied_from: None,
       },
       Change {
         path: b"a",
         after: Some((b"a2\n", Flag::Regular)),
+        copied_from: None,
       },
     ],
     (b"default", b"two"),
@@ -105,6 +108,7 @@ fn a_made_history_is_the_one_stock_7_2_commits() {
     &[Change {
       path: b"a",
       after: None,
+      copied_from: None,
     }],
     (b"stable", b"three"),
   );
@@ -124,6 +128,7 @@ fn a_version_that_changes_nothing_or_names_no_parent_makes_none() {
     &[Change {
       path: b"a",
       after: Some((b"a\n", Flag::Regular)),
+      copied_from: None,
     }],
     (b"default", b"one"),
   );
@@ -137,6 +142,7 @@ fn a_version_that_changes_nothing_or_names_no_parent_makes_none() {
   let same = [Change {
     path: b"a",
     after: Some((b"a\n", Flag::Regular)),
+    copied_from: None,
   }];
   assert_eq!(
     made(&held, one.0, &same, &authored, &mut room()).err(),
@@ -168,6 +174,7 @@ fn an_imports_record_holds_its_manifests_as_deltas_and_replays_row_for_row() {
     .map(|path| Change {
       path,
       after: Some((b"fn main() {}\n", Flag::Regular)),
+      copied_from: None,
     })
     .collect();
   let mut head = commit(
@@ -184,6 +191,7 @@ fn an_imports_record_holds_its_manifests_as_deltas_and_replays_row_for_row() {
     let change = [Change {
       path: &paths[at],
       after: Some((body, Flag::Regular)),
+      copied_from: None,
     }];
     head = commit(
       (&mut index, &mut store),
@@ -224,5 +232,60 @@ fn an_imports_record_holds_its_manifests_as_deltas_and_replays_row_for_row() {
     deltas
   );
   replayed.release(&mut replay_store).unwrap();
+  index.release(&mut store).unwrap();
+}
+
+/// Shape: stock 7.2's nodes for `one` (add `a`), `two` (`hg cp a b`) and `three` (`hg cp a c`, then `c` changed to
+/// `c2`), committed as the tests above commit (recorded 2026-11-20, macOS arm64, this Mac, mercurial 7.2 from
+/// Homebrew): each changeset's node and its manifest's.
+const COPIED: [(&str, &str); 3] = [
+  (
+    "951f20955075c11a8299b5dd1a8970f1eeb80bf5",
+    "a0c8bcbbb45c63b90b70ad007bf38961f64f2af0",
+  ),
+  (
+    "d0f53d73335f5ec35939a4529932b829993da8b5",
+    "0796472117e33ad9d223297bb640055aca5b0c18",
+  ),
+  (
+    "a726b80c089129ea379db9cb6f4c6fa1c39c9731",
+    "db0d8a056f0a17c5f68d3fffb7245b2019926030",
+  ),
+];
+
+/// A-731 (a copy, A-626 part 4). Do: make `one`, then `two` copying `a` to `b` unchanged, then `three` copying `a` to
+/// `c` with other bytes, as stock 7.2 committed them. Expect each changeset's and manifest's node stock 7.2's: the
+/// copy's file revision names its source and the source's node (`copy`, `copyrev`) with a null first parent, its
+/// bytes the copy's own.
+#[test]
+fn a_copy_is_made_as_stock_7_2_commits_one() {
+  let mut store = ContentStore::new(1 << 24, WINDOW).unwrap();
+  let mut index = HgIndex::new();
+  let plain = |path: &'static [u8], bytes: &'static [u8], copied_from| Change {
+    path,
+    after: Some((bytes, Flag::Regular)),
+    copied_from,
+  };
+  let one = commit(
+    (&mut index, &mut store),
+    NULL_NODE,
+    &[plain(b"a", b"a\n", None)],
+    (b"default", b"one"),
+  );
+  assert_eq!(one, (node(COPIED[0].0), node(COPIED[0].1)));
+  let two = commit(
+    (&mut index, &mut store),
+    one.0,
+    &[plain(b"b", b"a\n", Some(&b"a"[..]))],
+    (b"default", b"two"),
+  );
+  assert_eq!(two, (node(COPIED[1].0), node(COPIED[1].1)));
+  let three = commit(
+    (&mut index, &mut store),
+    two.0,
+    &[plain(b"c", b"c2\n", Some(&b"a"[..]))],
+    (b"default", b"three"),
+  );
+  assert_eq!(three, (node(COPIED[2].0), node(COPIED[2].1)));
   index.release(&mut store).unwrap();
 }

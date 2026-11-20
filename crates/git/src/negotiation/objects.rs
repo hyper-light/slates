@@ -107,7 +107,7 @@ pub(super) struct Selecting<N, G> {
   /// The commit walk.
   paint: Paint<N>,
   /// The commits sent, once the walk is done.
-  sent: Positions,
+  sent: Held,
   /// What the client holds of trees and blobs.
   held: Held,
   /// The trees being marked held, not yet taken.
@@ -250,7 +250,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G> Selecting<N, G> {
       runs,
       stage: Stage::Commits,
       paint,
-      sent: Positions::new(),
+      sent: Held::default(),
       held: Held::default(),
       mark: Vec::new(),
       mark_peak: Peak::default(),
@@ -321,10 +321,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G> Selecting<N, G> {
           admission,
           counters,
         )? {
-          self.sent = self.paint.chosen();
-          admission
-            .charge_items::<(u64, u64)>(self.sent.runs())
-            .map_err(Refusal::PastAdmission)?;
+          self.sent = self.paint.chosen(admission)?;
           self.stage = Stage::Edges { next: 0 };
         }
       }
@@ -405,7 +402,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G> Selecting<N, G> {
     }
     for parent in graph
       .parents(commit)
-      .filter(|parent| !self.sent.contains((*parent).into()))
+      .filter(|parent| !self.sent.contains(*parent))
     {
       if let Some(row) = graph.commit(parent) {
         self.mark.push(row.tree);

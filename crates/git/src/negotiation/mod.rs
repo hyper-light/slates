@@ -279,45 +279,211 @@ fn charge<T>(admission: &mut Admission) -> Result<(), Refusal> {
     .map_err(Refusal::PastAdmission)
 }
 
-/// A set of the graph's objects a walk keeps, by position, as runs (A-745, §4.17.1 "A fetch's answer" rule 1: a fetch's
-/// working set is a run a range of positions, never an entry an object), charged a run's bytes as its runs grow past
-/// what was charged before: a walk over one push's objects keeps one run whatever it meets.
+/// A set of the graph's objects a walk keeps, by position (A-745, §4.17.1 "A fetch's answer" rule 1: a fetch's working
+/// set is a bit or a word an object at most, never an entry an object), in whichever of two forms is smaller, as
+/// Roaring keeps each container [A: Lemire, Ssi-Yan-Kai and Kaser, "Consistently faster and smaller compressed bitmaps
+/// with Roaring", 2016]: runs of positions ([`Positions`]), a few words for one push's objects whatever their number;
+/// or a bit for each position across the set's span, where the runs would cost more (a push's commits interleaved with
+/// its trees and blobs, every third position). Charged as it grows past what was charged before.
 #[derive(Debug, Default)]
 pub(super) struct Held {
-  /// The positions held.
-  set: Positions,
-  /// The most runs it has held, each charged once.
-  charged: usize,
+  /// The set, in its form.
+  form: Form,
+  /// The most bytes it has cost, each charged once.
+  charged: u64,
 }
 
+/// The two forms a [`Held`] keeps its positions in.
+#[derive(Debug)]
+enum Form {
+  /// Runs of positions.
+  Runs(Positions),
+  /// A bit for each position from `start`, a word for each 64 of them.
+  Bits {
+    /// The position of the first word's lowest bit.
+    start: u64,
+    /// The words.
+    words: Vec<u64>,
+  },
+}
+
+impl Default for Form {
+  fn default() -> Form {
+    Form::Runs(Positions::new())
+  }
+}
+
+/// Format: the positions one word of a bit table holds.
+const WORD_BITS: u64 = u64::BITS as u64;
+
+/// Format: the bytes one run of positions costs.
+const RUN_BYTES: u64 = (2 * core::mem::size_of::<u64>()) as u64;
+
 impl Held {
-  /// Adds `node`: whether it was not held, its run charged where it begins one past those charged.
+  /// Adds `node`: whether it was not held, what the set costs past what was charged before charged now.
   pub(super) fn insert<N: Into<u64>>(
     &mut self,
     node: N,
     admission: &mut Admission,
   ) -> Result<bool, Refusal> {
-    let new = self.set.insert_new(node.into());
-    if self.set.runs() > self.charged {
-      charge::<(u64, u64)>(admission)?;
-      self.charged = self.set.runs();
+    let position = node.into();
+    let new = match &mut self.form {
+      Form::Runs(runs) => runs.insert_new(position),
+      Form::Bits { start, words } => set_bit(start, words, position),
+    };
+    if new {
+      self.choose_form();
+      let bytes = self.bytes();
+      if bytes > self.charged {
+        admission
+          .charge(bytes.saturating_sub(self.charged))
+          .map_err(Refusal::PastAdmission)?;
+        self.charged = bytes;
+      }
     }
     Ok(new)
   }
 
   /// Whether `node` is held.
   pub(super) fn contains<N: Into<u64>>(&self, node: N) -> bool {
-    self.set.contains(node.into())
+    let position = node.into();
+    match &self.form {
+      Form::Runs(runs) => runs.contains(position),
+      Form::Bits { start, words } => bit(*start, words, position),
+    }
   }
 
-  /// The positions held.
-  pub(super) fn positions(&self) -> &Positions {
-    &self.set
+  /// Whether nothing is held.
+  pub(super) fn is_empty(&self) -> bool {
+    self.next_from(0).is_none()
   }
 
-  /// The positions held, the set given up.
+  /// The least position held at `from` or after it.
+  pub(super) fn next_from(&self, from: u64) -> Option<u64> {
+    match &self.form {
+      Form::Runs(runs) => runs.next_from(from),
+      Form::Bits { start, words } => {
+        let mut at = from.max(*start);
+        loop {
+          let offset = at.saturating_sub(*start);
+          let word_at = usize::try_from(offset / WORD_BITS).ok()?;
+          let word = *words.get(word_at)?;
+          let shifted = word
+            .checked_shr(u32::try_from(offset % WORD_BITS).unwrap_or(0))
+            .unwrap_or(0);
+          if shifted != 0 {
+            return Some(at.saturating_add(u64::from(shifted.trailing_zeros())));
+          }
+          at = start.saturating_add(
+            crate::to_u64(word_at)
+              .saturating_add(1)
+              .saturating_mul(WORD_BITS),
+          );
+        }
+      }
+    }
+  }
+
+  /// The positions held, ascending.
+  pub(super) fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+    let mut next = self.next_from(0);
+    core::iter::from_fn(move || {
+      let at = next?;
+      next = self.next_from(at.saturating_add(1));
+      Some(at)
+    })
+  }
+
+  /// The positions held, as runs, the set given up.
   pub(super) fn into_positions(self) -> Positions {
-    self.set
+    match self.form {
+      Form::Runs(runs) => runs,
+      Form::Bits { .. } => {
+        let mut runs = Positions::new();
+        for position in self.iter() {
+          runs.insert(position);
+        }
+        runs
+      }
+    }
+  }
+
+  /// What the set costs in its form.
+  fn bytes(&self) -> u64 {
+    match &self.form {
+      Form::Runs(runs) => RUN_BYTES.saturating_mul(crate::to_u64(runs.runs())),
+      Form::Bits { words, .. } => {
+        crate::to_u64(core::mem::size_of::<u64>()).saturating_mul(crate::to_u64(words.len()))
+      }
+    }
+  }
+
+  /// Keeps the set in runs while they cost no more than a bit table over its span would, in bits once they cost more.
+  fn choose_form(&mut self) {
+    let Form::Runs(runs) = &self.form else {
+      return;
+    };
+    let (Some(&(first, _)), Some(&(_, end))) = (runs.run_pairs().first(), runs.run_pairs().last())
+    else {
+      return;
+    };
+    let span_words = end.saturating_sub(first).div_ceil(WORD_BITS);
+    let bits_bytes = span_words.saturating_mul(crate::to_u64(core::mem::size_of::<u64>()));
+    if RUN_BYTES.saturating_mul(crate::to_u64(runs.runs())) <= bits_bytes {
+      return;
+    }
+    let start = first.saturating_sub(first % WORD_BITS);
+    let mut words = Vec::new();
+    let mut start_at = start;
+    for position in runs.iter() {
+      set_bit(&mut start_at, &mut words, position);
+    }
+    self.form = Form::Bits {
+      start: start_at,
+      words,
+    };
+  }
+}
+
+/// Whether the bit table of `words` from `start` holds `position`.
+fn bit(start: u64, words: &[u64], position: u64) -> bool {
+  let Some(offset) = position.checked_sub(start) else {
+    return false;
+  };
+  let Ok(word_at) = usize::try_from(offset / WORD_BITS) else {
+    return false;
+  };
+  words
+    .get(word_at)
+    .is_some_and(|word| word & (1u64 << (offset % WORD_BITS)) != 0)
+}
+
+/// Sets `position`'s bit in the table of `words` from `start`, growing it either way to hold it (`start` stays a word's
+/// first position): whether it was not set.
+fn set_bit(start: &mut u64, words: &mut Vec<u64>, position: u64) -> bool {
+  let aligned = position.saturating_sub(position % WORD_BITS);
+  if words.is_empty() {
+    *start = aligned;
+  }
+  if aligned < *start {
+    let more = usize::try_from(start.saturating_sub(aligned) / WORD_BITS).unwrap_or(0);
+    words.splice(0..0, core::iter::repeat_n(0, more));
+    *start = aligned;
+  }
+  let offset = position.saturating_sub(*start);
+  let Ok(word_at) = usize::try_from(offset / WORD_BITS) else {
+    return false;
+  };
+  if word_at >= words.len() {
+    words.resize(word_at.saturating_add(1), 0);
+  }
+  let mask = 1u64 << (offset % WORD_BITS);
+  match words.get_mut(word_at) {
+    Some(word) if *word & mask == 0 => {
+      *word |= mask;
+      true
+    }
+    _ => false,
   }
 }
 
