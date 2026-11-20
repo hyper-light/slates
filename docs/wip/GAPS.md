@@ -59,7 +59,8 @@
 > creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
-> until it ends; a green's first submit's and one past a copy owed, with the owed commit main approved) and a whole
+> until it ends; a green's first submit's and one past a copy BUILT 2026-11-20 too, its commit owed durably,
+> `vcs_store::owed`, made at its build's end from what the submit staged) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
@@ -121,6 +122,12 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
+> FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
+> resumable, its place a byte offset; `vcs_store::replay_hg_sliced`), and an import's record is written a revision a turn
+> before its landing (`record::Writer`, the import's `Stage::Writing`), where each was one step; `docs/bugs/2026-11-20-
+> a-large-mercurial-import-crash-looped-the-daemon.md`. Owed: a rebuild's replay (`vcs_store::rebuild`, one step still);
+> the record's size itself (S5, A-729: identities, no texts); w-perf's by-use rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
