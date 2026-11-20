@@ -128,3 +128,11 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - Push route now merges on studio-2 in a fresh worktree when main moved without touching my paths (overlap aborts).
 - NEXT: w-perf's seam answer (inbox/w-engine-from-w-perf.md) gates items 3-7; meanwhile the log ring's released pages
   given back (main: before 3-7 if small), measured before/after.
+
+## A-752 (main's item 1 of 2026-11-20 ~06:40: push work build + entry apply under the step quantum)
+- Ledger: A-752 (A-751 went to w-bugs in a three-way union; nothing of mine says A-751).
+- Part 1 LANDED ca204fc87: deriver replay indexed; flat 3,500 compose 129 -> 28 ms, 7,000 458 -> 58 ms (debug).
+- Probe (debug, merge): 3,500 files build 66 ms, compute 16.8, commit 26.6, encode 0.6.
+- Design + one call sent: inbox/main-from-w-engine-a752.md (may a green be held out across turns during commit?).
+- Part 2 in progress: Building (walk/base/compose/post/identity in units), async deriver with Pace, ServerJudge::ready.
+- w-perf answered the seam (inbox/w-engine-from-w-perf.md): items 3-7 after A-752 and the log give-back.
