@@ -1,5 +1,15 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-20 11:10 PST (after the Studio's 10:35 reboot)
+- Blocker 2 was NOT a Slates stall: current kiln leaves a moved agent whose turn was over idle on its new runner,
+  waiting for its next message (hand-off goes with it); the test waited for a self-started hand-off turn. Test fixed
+  (sends SECOND after the move; expected files by whether the turn heard kiln_handoff).
+- A-734 (main) makes runners join only once the server lists every node: test now starts all runners together.
+- kiln commit 1e2ba19d6 on agents/w-fed-move-vendor (worktree ~/slates-work/w-fed-move-kv): vendor patch 0003 (A-756),
+  test changes, W7 paragraph; merged kiln main 715063153; vendor check 0 differences. NOT LANDED.
+- Running: checks + local release live move (~/slates-work/w-fed-move-local24.log). Then remote (adas-mac-studio-2 +
+  adas-mac-studio-3), then land kiln via bundle + Studio-4 (~/.cache/w-fed-move-push may need re-cloning).
+
 ## 2026-11-20 ~08:15 PST: REOPENED by main ("fix em up"): the live move's two Slates blockers
 - A-756 LANDED slates main 0f681456 (fix 0fc610f9): a materialized volume (moved/taken over) claims its name's alias
   (verbs::claim_name_alias from fleet::make_taken). Red/green: fleet test
