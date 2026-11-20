@@ -95,3 +95,11 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - W9 harness sign-in in a container: image's own vs credential grant by name.
 ## Owed by others: live container start + Runners page browser check (main); Docker Desktop share key (needs a Mac with
    Desktop); Windows (jupiter BLOCKED).
+
+## main's decisions 2026-11-20: W10 = ephemeral one-session runner in the pod; W9 sign-in = named secret granted per
+   session; jupiter unblocked; do the Runners browser check myself; queue the live start on adacachy.
+- LANDED 68964a93d: Runners page browser check (e2e/runner-engine-container.spec.ts, 4/4 Chromium+WebKit desk+phone).
+- LANDED 82e81809f: W9 sign-in via Kind::in_container (environment secrets by name into a container's exec).
+- Live start: run r19 (linux/amd64, cpus=4, mem=32g) building + running workspace::container_live_tests (file
+  uncommitted in the clone: crates/kiln/src/workspace/container_live_tests.rs + mod.rs line); commit it when r19 reports.
+## NEXT: W10 ephemeral one-session runner (`kiln agent --ephemeral --session`), pod start + reaper; then Windows items.
