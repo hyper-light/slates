@@ -4975,6 +4975,40 @@ async fn materialize_adopted_objects(
   adopt_pending_tombstones(origin).await;
   materialize_pending(origin, local, budget).await;
   materialize_pending_greens(origin, local, budget, in_flight).await;
+  rebuild_adopted_repositories(origin).await;
+}
+
+/// Rebuilds each repository this node took over once its logs and greens are in (A-636 part 2c-2,
+/// [`crate::takeover::repositories_ready`]), on the shard its id routes to ([`crate::takeover::rebuild_repository`]):
+/// one that stands there, or that the database refused (logged and counted there), is pending no more; one whose
+/// partition has no shard here, or whose shard does not answer within the period, is attempted again next period.
+async fn rebuild_adopted_repositories(origin: u16) {
+  let ready: Vec<(crate::takeover::ReadyRepository, Option<u16>)> = state::with_state(|s| {
+    crate::takeover::repositories_ready(s)
+      .into_iter()
+      .map(|ready| {
+        let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: ready.0.0 });
+        let target = s.shards.get(usize::from(partition)).copied();
+        (ready, target)
+      })
+      .collect()
+  })
+  .unwrap_or_default();
+  for ((object, record, parts), target) in ready {
+    let Some(target) = target else {
+      continue;
+    };
+    let answered = call_within(
+      origin,
+      target,
+      move |s| crate::takeover::rebuild_repository(s, record, parts),
+      HEARTBEAT_NS,
+    )
+    .await;
+    if answered.is_some() {
+      state::with_state(|s| s.pending_repositories.remove(&object));
+    }
+  }
 }
 
 /// Records each adopted tombstone (AUD-29-43) on the shard the destroyed volume's id routes to, with the
@@ -13339,6 +13373,123 @@ mod state_log_tests {
     assert_eq!(seen.0, vec![false, true, true, true, false], "{seen:?}");
     assert_eq!(seen.1, vec![2, 3, 5], "every position kept: {seen:?}");
     assert_eq!((seen.2, seen.3), (1, 1), "{seen:?}");
+  }
+
+  /// A-636 part 2c-2. Do: on a holder in a region of three at `f = 1`, hold a departed owner's repository's names log
+  /// as its record plane ships it: its root bound `main` (0 to 1), then `topic` bound by a push of a version of
+  /// `topic`'s green that this node's head never reached (1 to 2); adopt the repository's record; rebuild it, twice.
+  /// Expect: it is ready with both parts; it stands with `main` alone, its names log at 1, the push dropped and counted
+  /// once, its store made, counted rebuilt once; the second rebuild finds it standing and changes nothing.
+  #[test]
+  fn a_successor_rebuilds_a_repository_whole_from_the_logs_it_holds() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      let (local, [departed, _]) = region_of_three(state);
+      let family = |number| ObjectId::family(departed, 0, 9, number).unwrap();
+      let green = |number| VolumeId {
+        bytes: family(number).0,
+      };
+      let repo = RepositoryId { bytes: family(1).0 };
+      let generation = state.fleet.configuration().version;
+      for held in held_names(repo, green(2), green(3)) {
+        let shipped = Record {
+          owner: departed,
+          object: held.log_name().register(),
+          sequence: held.to,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: crate::state_log::value_of(&held),
+        };
+        let reply = super::accept_held_record(state, local, departed, &shipped);
+        assert!(Ack::decode(&reply).is_ok());
+      }
+      let record = slates_db::catalog::RepositoryRecord {
+        id: repo,
+        name: "linux".to_owned(),
+        tool: slates_db::catalog::VcsTool::Git,
+        format: slates_db::catalog::ObjectFormat::Sha1,
+        default_branch: Some("main".to_owned()),
+        owner: owner(),
+        policy: slates_db::catalog::RepositoryPolicy::default(),
+      };
+      state.pending_repositories.insert(family(1), (2, record));
+      let ready = crate::takeover::repositories_ready(state);
+      let held: Vec<usize> = ready.iter().map(|(_, _, parts)| parts.len()).collect();
+      let rebuilt: Vec<bool> = ready
+        .into_iter()
+        .flat_map(|(_, record, parts)| {
+          let again = (record.clone(), parts.clone());
+          [
+            crate::takeover::rebuild_repository(state, record, parts),
+            crate::takeover::rebuild_repository(state, again.0, again.1),
+          ]
+        })
+        .collect();
+      let repositories = state.db.partition().repositories();
+      let names = (
+        repositories.branch(repo, "main") == Some(green(2)),
+        repositories.branch(repo, "topic"),
+        repositories.log_position(repo, StateLog::Names),
+      );
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let counted = [
+        crate::takeover::TAKEOVER_REPOSITORY_REBUILT,
+        crate::takeover::TAKEOVER_REPOSITORY_OPERATION_DROPPED,
+        crate::takeover::TAKEOVER_REPOSITORY_UNREBUILT,
+      ]
+      .map(count);
+      (held, rebuilt, names, state.vcs_stores.holds(repo), counted)
+    });
+    assert_eq!(
+      seen,
+      (
+        vec![2],
+        vec![true, true],
+        (true, None, Some(1)),
+        true,
+        [1, 1, 0]
+      )
+    );
+  }
+
+  /// A departed owner's names log of `repo`: `main` bound to `root` (0 to 1), then `topic` bound to `topic` by a push
+  /// of its version 1 (1 to 2).
+  fn held_names(repo: RepositoryId, root: VolumeId, topic: VolumeId) -> [StateLogRecord; 2] {
+    let names = LogName::State {
+      repository: repo,
+      log: StateLog::Names,
+    };
+    let part = |from: u64, (name, green): (&str, VolumeId), pushed: Option<LogSpan>| {
+      let to = from.saturating_add(1);
+      StateLogRecord {
+        repository: repo,
+        log: StateLog::Names,
+        from,
+        to,
+        identity: [u8::try_from(to).unwrap_or(u8::MAX); 32],
+        spans: std::iter::once(LogSpan {
+          log: names,
+          from,
+          to,
+        })
+        .chain(pushed)
+        .collect(),
+        changes: vec![LoggedChange::Named {
+          change: NameChange::Bind {
+            name: name.to_owned(),
+            green,
+          },
+        }],
+      }
+    };
+    let pushed = LogSpan {
+      log: LogName::Green { green: topic },
+      from: 0,
+      to: 1,
+    };
+    [
+      part(0, ("main", root), None),
+      part(1, ("topic", topic), Some(pushed)),
+    ]
   }
 
   /// A-636 part 2b. Do: name the counters a volume's head, its catalog and each of a repository's state logs ship

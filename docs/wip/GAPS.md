@@ -594,6 +594,13 @@
 > **A-636 part 2c-1 (2026-11-20, w-shared):** a repository's record is its own register (`REPOSITORY_CLASS`), shipped
 > to its family's candidates at each policy setting or names change and adopted by its successor as a pending
 > repository. Owed: the successor's rebuild of the repository from its record and its logs by part 1's rule (2c-2).
+> **A-636 part 2c-2 (2026-11-20, w-shared):** the successor rebuilds a repository taken over once its record, its
+> family's registers and its greens are adopted: each operation kept only where every log it moved holds it whole
+> (`repository::whole_parts`), the repository recorded whole (`Op::RepositoryRebuilt`) and its store made. Owed: a
+> log's parts the successor lacks fetched from its holders. The store's objects (no part carries them) are rebuilt by
+> content identity once the register's entry objects and the tools' stores name content held once in the green
+> family's pool (Ada's ruling 2026-11-20, content held once for every tool: w-perf's entry objects, w-git's and w-hg's
+> stores), which a successor holds by A-636's placement; no separate shipping.
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the
@@ -1346,6 +1353,9 @@
 > git/git whole (607 MiB pack) kills the daemon on either edge (shard 0 spins 3,559 ms unsliced; git hangs); cut at
 > v1.0.0 (3.4 MB) it pushes, but every non-shallow clone is refused (`upload-pack: the request needs more room than
 > the server admits`) and `fetch --deepen` reports corruption: 4 of 27 pass. Owed to w-git; re-run when they land.
+> Since A-713 (fetch admission) the v1.0.0 cut passes 26 of 27 (clone, deepen and partial clone among them; the 27th
+> the script's tag row, since fixed); cut at v2.0.0 (56 MB) the push still spins shard 0 and the daemon is killed
+> (main 168ddfa, debug, Mac Studio). hg after A-711 and A-696: 17 of 24, its pushes of hg's history spinning alike.
 > **Stock hg command matrix (w-interop, 2026-11-20):** `ci/interop/hg-matrix.sh` (24 rows, hg's own repository): any
 > real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
 > (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
