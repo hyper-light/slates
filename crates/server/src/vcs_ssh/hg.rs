@@ -110,7 +110,7 @@ impl<S: HgStores> HgCommand<S> {
 
 /// Lands `push` on `repository` by `principal` through `stores` (the module doc's pushes) and frames what it came to;
 /// refused with the not-served words where the lender no longer lends the store or no view of it could be made.
-fn land<S: HgStores>(
+async fn land<S: HgStores>(
   stores: &mut S,
   (repository, principal): (RepositoryId, &Principal),
   push: Push,
@@ -123,6 +123,7 @@ fn land<S: HgStores>(
       (principal, &push.heads, &push.bundle),
       &mut left,
     )
+    .await
     .ok_or_else(unheld)?;
   stdio.pushed(&outcome, &mut left);
   Ok(())
@@ -191,7 +192,7 @@ impl<S: HgStores> Command for HgCommand<S> {
         .ok_or_else(unheld)?
     };
     if let Some(push) = stdio.take_push() {
-      land(stores, (*repository, principal), push, stdio)?;
+      land(stores, (*repository, principal), push, stdio).await?;
     }
     let (consumed, next) = match progress {
       Progress::Stepped { consumed, .. } | Progress::Took { consumed, .. } => {

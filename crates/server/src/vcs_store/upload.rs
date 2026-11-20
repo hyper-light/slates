@@ -44,6 +44,7 @@ use slates_git::receive::HiddenRefs;
 use slates_git::store::NamedRef;
 use slates_git::store::learn::{Clock, Exchange};
 use slates_git::upload::{Fragments, PackPlan, PackRefused, PackSource, Served, Streamed};
+use slates_vcs::Work;
 
 use crate::config::DaemonConfig;
 use crate::git_push::{PolicyHidden, ref_of};
@@ -102,6 +103,28 @@ impl StoreLender for ShardStores {
 /// read. None when the store is not lendable here ([`lendable`]), or the repository's policy cannot be read for a
 /// reader (A-622's guard keeps such rules out: a damaged record is never read without its policy).
 pub(crate) fn lend_on<R>(
+  state: &mut ShardState,
+  (id, reader): (RepositoryId, Option<&Principal>),
+  step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,
+) -> Option<R> {
+  let began = slates_rt::futures::now_ns();
+  let lent = lend_uncounted(state, (id, reader), step);
+  // A-724 piece 1: a request's step (one with a reader) begins a fetch on the repository's usage row; every step that
+  // was lent is counted with its time. Owed: a fetch's answered count, at the pack's last step.
+  if lent.is_some() {
+    let now = slates_rt::futures::now_ns();
+    if let Some(reader) = reader {
+      state.vcs_usage.begun(&id, reader, Work::Fetch, began);
+    }
+    state
+      .vcs_usage
+      .stepped(&id, Work::Fetch, (now.saturating_sub(began), 0), now);
+  }
+  lent
+}
+
+/// [`lend_on`]'s step, uncounted.
+fn lend_uncounted<R>(
   state: &mut ShardState,
   (id, reader): (RepositoryId, Option<&Principal>),
   step: impl FnOnce(&Served<'_>, &mut ShardPacks) -> R,

@@ -120,6 +120,7 @@ use slates_git::unpack::Object;
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::Increment;
 use slates_vcs::ContentStore;
+use slates_vcs::Work;
 
 use crate::git_protect::{StoreBrings, declined, right_of};
 use crate::repository::push::{
@@ -337,6 +338,13 @@ impl<P> ReceivePack<P> {
         .advertise(&listed, out)
         .map_err(PushFailed::Exchange)?;
     }
+    // A-724 piece 1: the push is counted on its repository's row as it begins.
+    state.vcs_usage.begun(
+      &repository,
+      principal,
+      Work::Intake,
+      slates_rt::futures::now_ns(),
+    );
     Ok(ReceivePack {
       repository,
       principal: principal.clone(),
@@ -350,13 +358,14 @@ impl<P> ReceivePack<P> {
   /// Hands the push the client's next `bytes`: whether it is now read whole and checked, waiting for its answer. A
   /// refusal of the exchange ends the push.
   pub(crate) fn input(&mut self, state: &mut ShardState, bytes: &[u8]) -> Result<bool, PushFailed> {
+    let began = slates_rt::futures::now_ns();
     let Self {
       repository,
       session,
       admission,
       ..
     } = self;
-    with_room(state, |state| {
+    let read = with_room(state, |state| {
       let (content, git) = state
         .vcs_stores
         .git_ref(*repository)
@@ -365,19 +374,23 @@ impl<P> ReceivePack<P> {
       session
         .input(bytes, &indexed, admission)
         .map_err(PushFailed::Exchange)
-    })
+    });
+    let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    charge_step(state, *repository, began, bytes_in);
+    read
   }
 
   /// The client's bytes have ended: whether the push is now checked. A request cut short ends the push; a pack cut
   /// short is checked as git answers a short pack.
   pub(crate) fn end(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
+    let began = slates_rt::futures::now_ns();
     let Self {
       repository,
       session,
       admission,
       ..
     } = self;
-    with_room(state, |state| {
+    let ended = with_room(state, |state| {
       let (content, git) = state
         .vcs_stores
         .git_ref(*repository)
@@ -386,7 +399,9 @@ impl<P> ReceivePack<P> {
       session
         .end(&indexed, admission)
         .map_err(PushFailed::Exchange)
-    })
+    });
+    charge_step(state, *repository, began, 0);
+    ended
   }
 
   /// One turn of the pack's checks (A-719), for the shard's step quantum and at least one object,
@@ -516,6 +531,18 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
     state: &mut ShardState,
     out: &mut impl Out,
   ) -> Result<Answering, PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let stepped = self.answer_turn(state, out);
+    charge_answer(state, self.repository, began, &stepped);
+    stepped
+  }
+
+  /// One step of the answer, uncounted ([`Self::answer_step`] counts it).
+  fn answer_turn(
+    &mut self,
+    state: &mut ShardState,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
     match core::mem::replace(&mut self.answer, AnswerState::Done) {
       AnswerState::Unbegun if !self.check_turn(state)? => {
         self.answer = AnswerState::Unbegun;
@@ -564,6 +591,18 @@ impl<P> ReceivePack<P> {
   /// Refused for a push not yet checked or answered already, a repository gone, a store not held,
   /// or a report git's protocol cannot carry.
   pub(crate) fn answer_step(
+    &mut self,
+    state: &mut ShardState,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
+    let began = slates_rt::futures::now_ns();
+    let stepped = self.answer_turn(state, out);
+    charge_answer(state, self.repository, began, &stepped);
+    stepped
+  }
+
+  /// One step of the answer, uncounted ([`Self::answer_step`] counts it).
+  fn answer_turn(
     &mut self,
     state: &mut ShardState,
     out: &mut impl Out,
@@ -773,6 +812,34 @@ fn prepare(
       name: push_name(record.id, &checked.request),
     }),
     Err(refused) => Ok(Prepared::Declined(Declining::unadmitted(&refused))),
+  }
+}
+
+/// Counts a step of a push of `repository`'s that began at `began` on the shard's clock and read `bytes_in` of the
+/// client's bytes on the repository's usage row (A-724 piece 1, `slates_vcs::usage`).
+fn charge_step(state: &mut ShardState, repository: RepositoryId, began: u64, bytes_in: u64) {
+  let now = slates_rt::futures::now_ns();
+  state.vcs_usage.stepped(
+    &repository,
+    Work::Intake,
+    (now.saturating_sub(began), bytes_in),
+    now,
+  );
+}
+
+/// Counts a step of a push's answer that began at `began` (A-724 piece 1), and the push as answered when the step
+/// answered it whole.
+fn charge_answer(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  began: u64,
+  stepped: &Result<Answering, PushFailed>,
+) {
+  charge_step(state, repository, began, 0);
+  if let Ok(Answering::Answered(_)) = stepped {
+    state
+      .vcs_usage
+      .answered(&repository, Work::Intake, slates_rt::futures::now_ns());
   }
 }
 

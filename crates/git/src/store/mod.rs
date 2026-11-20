@@ -99,7 +99,7 @@ pub use positions::Positions;
 pub use push::{Entries, Incoming, Push, PushRefused};
 pub use repository::abbrev::Abbrev;
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
-pub use repository::protect::{Change, CommitSigners, Unsigned};
+pub use repository::protect::{Change, CommitSigners, Unsigned, UnsignedCommit};
 pub use repository::reach::{ReachRefused, ReachSets, Sets};
 pub use repository::{Found, Move, Repository, StoreCounters, StoreRefused};
 pub use upload::{Answered, Progress, Turn, Upload, UploadCounters, Versions};

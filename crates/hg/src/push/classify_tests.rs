@@ -959,7 +959,7 @@ fn bookmarks_move_as_7_2_moves_them() {
   };
   let plan = classify(
     &unbundle,
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &marks),
     false,
@@ -972,7 +972,7 @@ fn bookmarks_move_as_7_2_moves_them() {
     .push(part(3, pushkey(b"bookmarks", b"m", (&hex([1; 20]), b""))));
   let refused = classify(
     &unbundle,
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &marks),
     false,
@@ -1038,7 +1038,7 @@ fn phases_move_only_toward_public_as_7_2_moves_them() {
   };
   let plan = classify(
     &unbundle,
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &[]),
     false,
@@ -1063,7 +1063,7 @@ fn phases_move_only_toward_public_as_7_2_moves_them() {
   };
   let refused = classify(
     &unknown,
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &[]),
     false,
@@ -1096,7 +1096,7 @@ fn a_divergent_bookmark_is_refused_in_7_2s_words() {
   };
   let divergent = classify(
     &named(b"a@b", [2; 20]),
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &[]),
     false,
@@ -1111,7 +1111,7 @@ fn a_divergent_bookmark_is_refused_in_7_2s_words() {
   );
   let unknown = classify(
     &named(b"a@", [7; 20]),
-    (&[], &[]),
+    (&[] as &[Arrived], &[]),
     &view,
     (&line_at_b(), &[]),
     false,

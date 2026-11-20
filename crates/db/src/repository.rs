@@ -145,6 +145,7 @@ impl Register {
   }
 
   /// Every state log's position, in log order.
+  /// Shape: 4, one for each `StateLog` (names, phases, markers, locks).
   fn positions(&self) -> [(StateLog, u64); 4] {
     [
       StateLog::Names,
@@ -1884,23 +1885,7 @@ mod tests {
       from: root,
       version: 0,
     };
-    let before = partition.to_snapshot(0);
-    for outsider in [stranger, familyless] {
-      let refused = run(&mut partition, &joined(repo, outsider, from_root));
-      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
-      let entry = crate::catalog::RepositoryEntry {
-        repository: repo,
-        joined: vec![MemberRecord {
-          repository: repo,
-          green: outsider,
-          origin: from_root,
-        }],
-        ..crate::catalog::RepositoryEntry::default()
-      };
-      let refused = run(&mut partition, &Op::RepositoryAdvanced { entry });
-      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
-    }
-    assert_eq!(partition.to_snapshot(0), before, "a refused join applied");
+    assert_outsiders_refused_both_ways(&mut partition, repo, [stranger, familyless], from_root);
     run(&mut partition, &joined(repo, successors, from_root)).unwrap();
     assert_eq!(
       (partition.family_counter(), partition.volume_counter()),
@@ -1912,6 +1897,33 @@ mod tests {
       (24, 41)
     );
     assert_eq!(answers(&rebuilt), answers(&partition));
+  }
+
+  /// Each of `outsiders` joining `repo` by a membership record and by an entry: both refused `NotFound`, nothing
+  /// applied.
+  fn assert_outsiders_refused_both_ways(
+    partition: &mut Partition,
+    repo: RepositoryId,
+    outsiders: [VolumeId; 2],
+    origin: MemberOrigin,
+  ) {
+    let before = partition.to_snapshot(0);
+    for outsider in outsiders {
+      let refused = run(partition, &joined(repo, outsider, origin));
+      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
+      let entry = crate::catalog::RepositoryEntry {
+        repository: repo,
+        joined: vec![MemberRecord {
+          repository: repo,
+          green: outsider,
+          origin,
+        }],
+        ..crate::catalog::RepositoryEntry::default()
+      };
+      let refused = run(partition, &Op::RepositoryAdvanced { entry });
+      assert!(matches!(refused, Err(DbError::NotFound)), "{outsider:?}");
+    }
+    assert_eq!(partition.to_snapshot(0), before, "a refused join applied");
   }
 
   fn joined(repo: RepositoryId, green: VolumeId, origin: MemberOrigin) -> Op {
@@ -1945,77 +1957,17 @@ mod tests {
       (plain, false),
       (foreign, true),
     ] {
-      run(
-        &mut partition,
-        &Op::VolumeCreated {
-          record: volume(id, green),
-        },
-      )
-      .unwrap();
+      create_volume(&mut partition, id, green);
     }
     let record = repository(9, "linux");
     let repo = record.id;
     run(&mut partition, &Op::RepositoryCreated { record }).unwrap();
-    let branch = |from: VolumeId, version: u64| MemberOrigin::Branch { from, version };
     run(&mut partition, &joined(repo, root, MemberOrigin::Root)).unwrap();
     run(&mut partition, &joined(repo, first, branch(root, 7))).unwrap();
     run(&mut partition, &joined(repo, second, branch(root, 3))).unwrap();
     run(&mut partition, &joined(repo, deep, branch(first, 1))).unwrap();
-    let refused = |partition: &mut Partition, op: &Op| run(partition, op).unwrap_err();
-    assert!(matches!(
-      refused(&mut partition, &joined(repo, plain, MemberOrigin::Root)),
-      DbError::NotGreen
-    ));
-    assert!(matches!(
-      refused(&mut partition, &joined(repo, root, branch(first, 0))),
-      DbError::AlreadyExists { .. }
-    ));
-    assert!(matches!(
-      refused(
-        &mut partition,
-        &joined(repository_id(HOME, 8), plain, MemberOrigin::Root)
-      ),
-      DbError::NotFound
-    ));
-    assert!(matches!(
-      refused(&mut partition, &joined(repo, foreign, MemberOrigin::Root)),
-      DbError::NotFound
-    ));
-    let other = repository(10, "other");
-    let other_repo = other.id;
-    run(&mut partition, &Op::RepositoryCreated { record: other }).unwrap();
-    let spare = volume_id(HOME, 7);
-    run(
-      &mut partition,
-      &Op::VolumeCreated {
-        record: volume(spare, true),
-      },
-    )
-    .unwrap();
-    assert!(matches!(
-      refused(&mut partition, &joined(other_repo, spare, branch(root, 0))),
-      DbError::NotFound
-    ));
-    run(
-      &mut partition,
-      &joined(other_repo, spare, MemberOrigin::Root),
-    )
-    .unwrap();
-    let late = volume_id(HOME, 11);
-    run(
-      &mut partition,
-      &Op::VolumeCreated {
-        record: volume(late, true),
-      },
-    )
-    .unwrap();
-    assert!(matches!(
-      refused(
-        &mut partition,
-        &joined(other_repo, late, MemberOrigin::Root)
-      ),
-      DbError::AlreadyExists { .. }
-    ));
+    assert_wrong_joins_refused(&mut partition, repo, [root, first, plain, foreign]);
+    assert_another_lineage_takes_one_root(&mut partition, root);
     assert_eq!(partition.repositories().branch_floor(root), Some(3));
     assert_eq!(partition.repositories().branch_floor(first), Some(1));
     assert_eq!(partition.repositories().branch_floor(second), None);
@@ -2027,21 +1979,110 @@ mod tests {
       .map(|member| member.green)
       .collect();
     assert_eq!(order, vec![root, first, second, deep]);
+    assert_destroys_wait_for_branches(&mut partition, repo, [root, first, second, deep]);
+    assert_disordered_members_are_corrupt(&partition, repo, [root, first]);
+  }
+
+  /// A member made from `from` at `version`.
+  fn branch(from: VolumeId, version: u64) -> MemberOrigin {
+    MemberOrigin::Branch { from, version }
+  }
+
+  /// The refusal `op` meets.
+  fn refused(partition: &mut Partition, op: &Op) -> DbError {
+    run(partition, op).unwrap_err()
+  }
+
+  /// Creates the volume `id`, a green or not.
+  fn create_volume(partition: &mut Partition, id: VolumeId, green: bool) {
+    run(
+      partition,
+      &Op::VolumeCreated {
+        record: volume(id, green),
+      },
+    )
+    .unwrap();
+  }
+
+  /// `repo`'s wrong joins: the plain volume `NotGreen`, the root joining twice `AlreadyExists`, an unknown repository
+  /// and the foreign green `NotFound`.
+  fn assert_wrong_joins_refused(
+    partition: &mut Partition,
+    repo: RepositoryId,
+    [root, first, plain, foreign]: [VolumeId; 4],
+  ) {
+    assert!(matches!(
+      refused(partition, &joined(repo, plain, MemberOrigin::Root)),
+      DbError::NotGreen
+    ));
+    assert!(matches!(
+      refused(partition, &joined(repo, root, branch(first, 0))),
+      DbError::AlreadyExists { .. }
+    ));
+    assert!(matches!(
+      refused(
+        partition,
+        &joined(repository_id(HOME, 8), plain, MemberOrigin::Root)
+      ),
+      DbError::NotFound
+    ));
+    assert!(matches!(
+      refused(partition, &joined(repo, foreign, MemberOrigin::Root)),
+      DbError::NotFound
+    ));
+  }
+
+  /// Another repository's lineage: a branch of the first lineage's `root` is `NotFound`; it takes a root of its own, and
+  /// a second root `AlreadyExists`.
+  fn assert_another_lineage_takes_one_root(partition: &mut Partition, root: VolumeId) {
+    let other = repository(10, "other");
+    let other_repo = other.id;
+    run(partition, &Op::RepositoryCreated { record: other }).unwrap();
+    let spare = volume_id(HOME, 7);
+    create_volume(partition, spare, true);
+    assert!(matches!(
+      refused(partition, &joined(other_repo, spare, branch(root, 0))),
+      DbError::NotFound
+    ));
+    run(partition, &joined(other_repo, spare, MemberOrigin::Root)).unwrap();
+    let late = volume_id(HOME, 11);
+    create_volume(partition, late, true);
+    assert!(matches!(
+      refused(partition, &joined(other_repo, late, MemberOrigin::Root)),
+      DbError::AlreadyExists { .. }
+    ));
+  }
+
+  /// Destroys: a green members were made from refuses `BranchedFrom` until they go, and the root's branch floor moves
+  /// as its branches go; at the end `repo` has no members.
+  fn assert_destroys_wait_for_branches(
+    partition: &mut Partition,
+    repo: RepositoryId,
+    [root, first, second, deep]: [VolumeId; 4],
+  ) {
     assert_eq!(
-      refused(&mut partition, &Op::VolumeDestroyed { id: root }),
+      refused(partition, &Op::VolumeDestroyed { id: root }),
       DbError::BranchedFrom { members: 2 }
     );
     assert_eq!(
-      refused(&mut partition, &Op::VolumeDestroyed { id: first }),
+      refused(partition, &Op::VolumeDestroyed { id: first }),
       DbError::BranchedFrom { members: 1 }
     );
-    run(&mut partition, &Op::VolumeDestroyed { id: deep }).unwrap();
-    run(&mut partition, &Op::VolumeDestroyed { id: first }).unwrap();
+    run(partition, &Op::VolumeDestroyed { id: deep }).unwrap();
+    run(partition, &Op::VolumeDestroyed { id: first }).unwrap();
     assert_eq!(partition.repositories().branch_floor(root), Some(3));
-    run(&mut partition, &Op::VolumeDestroyed { id: second }).unwrap();
+    run(partition, &Op::VolumeDestroyed { id: second }).unwrap();
     assert_eq!(partition.repositories().branch_floor(root), None);
-    run(&mut partition, &Op::VolumeDestroyed { id: root }).unwrap();
+    run(partition, &Op::VolumeDestroyed { id: root }).unwrap();
     assert_eq!(partition.repositories().members_of(repo).count(), 0);
+  }
+
+  /// A snapshot listing `first` before the `root` it was made from is refused `Corrupt`.
+  fn assert_disordered_members_are_corrupt(
+    partition: &Partition,
+    repo: RepositoryId,
+    [root, first]: [VolumeId; 2],
+  ) {
     let mut disordered = partition.to_snapshot(0);
     disordered.repository_members = vec![
       MemberRecord {
@@ -2142,8 +2183,11 @@ mod tests {
     greens: BTreeSet<u8>,
     /// Each lineage's members in the order they joined, by repository serial: each green serial with the member it was
     /// made from and the version, `None` for the root (A-575).
-    lineages: BTreeMap<u8, Vec<(u8, Option<(u8, u8)>)>>,
+    lineages: BTreeMap<u8, Vec<Member>>,
   }
+
+  /// A lineage's member: its green serial, with the member it was made from and the version, `None` for the root.
+  type Member = (u8, Option<(u8, u8)>);
 
   /// What the model answers: the refusal's kind, so the comparison is of rules, not of the existing ids named.
   #[derive(Debug, PartialEq, Eq)]
@@ -2506,6 +2550,51 @@ mod tests {
     assert_eq!(held(&replayed), Some(policy));
   }
 
+  /// Policy settings `repo` refuses: from the stale version 0 (naming version 1), a branch rule in a git repository and
+  /// a relative program (by kind and index), and a repository created already holding a policy (naming version 0).
+  fn assert_bad_policy_settings_refused(partition: &mut Partition, repo: RepositoryId) {
+    let stale = Op::RepositoryPolicySet {
+      repository: repo,
+      policy: rules_policy(1, Vec::new()),
+    };
+    assert_eq!(
+      run(partition, &stale),
+      Err(DbError::PolicyChanged { current: 1 })
+    );
+    let mut branches = ref_rule("main");
+    branches.names = crate::catalog::PolicyNames::Branches;
+    let wrong_kind = Op::RepositoryPolicySet {
+      repository: repo,
+      policy: rules_policy(2, vec![ref_rule("refs/tags/*"), branches]),
+    };
+    assert_eq!(
+      run(partition, &wrong_kind),
+      Err(DbError::PolicyRuleMalformed { index: 1 })
+    );
+    let mut relative = rules_policy(2, Vec::new());
+    relative.hooks.push(crate::catalog::HookConfig {
+      point: crate::catalog::HookPointName::GitUpdate,
+      name: "update".to_owned(),
+      program: "hooks/update".to_owned(),
+    });
+    assert_eq!(
+      run(
+        partition,
+        &Op::RepositoryPolicySet {
+          repository: repo,
+          policy: relative,
+        }
+      ),
+      Err(DbError::PolicyHookMalformed { index: 0 })
+    );
+    let mut holding = repository(10, "holding");
+    holding.policy = rules_policy(1, Vec::new());
+    assert_eq!(
+      run(partition, &Op::RepositoryCreated { record: holding }),
+      Err(DbError::PolicyChanged { current: 0 })
+    );
+  }
+
   /// A-622 (§4.17.1 "Policy"). Do: create a git repository; set its policy from version 0 with a rule and a hook; set
   /// it again from the stale version 0; set one holding a branch rule, which a git repository has not, and one running
   /// a relative program; create a repository already holding a policy; then rebuild the partition from its snapshot,
@@ -2550,46 +2639,7 @@ mod tests {
       names
     );
     let before = answers(&partition);
-    let stale = Op::RepositoryPolicySet {
-      repository: repo,
-      policy: rules_policy(1, Vec::new()),
-    };
-    assert_eq!(
-      run(&mut partition, &stale),
-      Err(DbError::PolicyChanged { current: 1 })
-    );
-    let mut branches = ref_rule("main");
-    branches.names = crate::catalog::PolicyNames::Branches;
-    let wrong_kind = Op::RepositoryPolicySet {
-      repository: repo,
-      policy: rules_policy(2, vec![ref_rule("refs/tags/*"), branches]),
-    };
-    assert_eq!(
-      run(&mut partition, &wrong_kind),
-      Err(DbError::PolicyRuleMalformed { index: 1 })
-    );
-    let mut relative = rules_policy(2, Vec::new());
-    relative.hooks.push(crate::catalog::HookConfig {
-      point: crate::catalog::HookPointName::GitUpdate,
-      name: "update".to_owned(),
-      program: "hooks/update".to_owned(),
-    });
-    assert_eq!(
-      run(
-        &mut partition,
-        &Op::RepositoryPolicySet {
-          repository: repo,
-          policy: relative,
-        }
-      ),
-      Err(DbError::PolicyHookMalformed { index: 0 })
-    );
-    let mut holding = repository(10, "holding");
-    holding.policy = rules_policy(1, Vec::new());
-    assert_eq!(
-      run(&mut partition, &Op::RepositoryCreated { record: holding }),
-      Err(DbError::PolicyChanged { current: 0 })
-    );
+    assert_bad_policy_settings_refused(&mut partition, repo);
     assert_eq!(
       answers(&partition),
       before,

@@ -665,3 +665,66 @@ fn a_report_is_refused_by_its_resource_its_name_and_its_limit() {
     ([404, 501, 400], true)
   );
 }
+
+/// Shape: a fresh `svn checkout`'s update-report of the trunk at revision 5, as ra_serf 1.15 writes it in send-all mode
+/// (`libsvn_ra_serf/update.c` `make_update_reporter`, `set_path` of the target, start-empty).
+const CHECKOUT_REPORT: &[u8] = b"<S:update-report xmlns:S=\"svn:\" send-all=\"true\">\
+<S:include-props>yes</S:include-props>\
+<S:src-path>http://svn.example/repo/trunk</S:src-path>\
+<S:target-revision>5</S:target-revision>\
+<S:depth>unknown</S:depth>\
+<S:entry rev=\"5\" depth=\"infinity\" start-empty=\"true\"></S:entry>\
+</S:update-report>";
+
+/// A-681 (`reports/update.c`, HTTPv2's `me` resource): do a fresh checkout's REPORT on `!svn/me`, streamed a slice of the
+/// smallest room at a time and again within the whole room, and one naming a revision past the youngest; expect the
+/// first `text/xml`, `update.c`'s send-all header, the target revision, the trunk's file added with its text inline
+/// and the report's end, the two streams the same bytes; and the second refused before its first byte, `404`, "No such
+/// revision".
+#[test]
+fn an_update_report_on_me_streams_a_checkout_and_refuses_a_revision_past_the_youngest() {
+  let fixture = Fixture::new();
+  let anonymous = rules_of(None);
+  let rules = Some(&anonymous);
+  let sliced = fixture.ask(rules, "REPORT", ("/!svn/me", None), CHECKOUT_REPORT);
+  let (headers, body, ended) = reported(&fixture, rules, sliced, 1);
+  let whole_room = fixture.ask(rules, "REPORT", ("/!svn/me", None), CHECKOUT_REPORT);
+  let (_, at_once, _) = reported(&fixture, rules, whole_room, ROOM);
+  let text = String::from_utf8(body.clone()).unwrap();
+  assert_eq!(
+    (
+      headers,
+      ended,
+      text.contains("<S:update-report xmlns:S=\"svn:\""),
+      text.contains("send-all=\"true\""),
+      text.contains("<S:target-revision rev=\"5\""),
+      text.contains("<S:add-file name=\"a.txt\""),
+      text.contains("<S:txdelta>"),
+      text.ends_with("</S:update-report>\n"),
+      body == at_once,
+    ),
+    (
+      vec![("Content-Type", String::from("text/xml; charset=\"utf-8\""))],
+      ReportProgress::Done,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    )
+  );
+  let past = String::from_utf8_lossy(CHECKOUT_REPORT).replace(
+    "<S:target-revision>5</S:target-revision>",
+    "<S:target-revision>99</S:target-revision>",
+  );
+  let refused = fixture.anonymous("REPORT", "/!svn/me", None, past.as_bytes());
+  assert_eq!(
+    (
+      refused.status,
+      String::from_utf8_lossy(&refused.body).contains("No such revision 99")
+    ),
+    (404, true)
+  );
+}
