@@ -86,3 +86,14 @@
   GlobalAlloc` has one. Without their own: the four trait methods' `unsafe fn` (alloc, alloc_zeroed, dealloc,
   realloc; covered only by the impl's comment) and the three `unsafe fn unmap` declarations (a `/// # Safety` doc
   each, no `// SAFETY:` line). Not changed by me: the budget is the author's to raise and name (w-engine).
+
+## 2026-11-20 "Waiting on main" lines: ANSWERED (main's rulings)
+1. deploy.rs rustls Arcs in a test: approved as D-8 exception 2. Was already green (c9137cb9f); now in main's ruled
+   form, `#[allow(clippy::disallowed_types, reason = "D-8: rustls takes Arc<..> by signature")]` with a comment
+   naming the two owners (landed, see git log for deploy.rs).
+2. Part B's park_timeout loops (marked_within, hook_driver `gone`): waits on an observable condition with a deadline;
+   kept. Scanned test code for the dodge shape (wait out a time, then assert something did NOT happen): none found;
+   doorbell.rs and closed_loop.rs pace cycles / rest a hold out, then assert on counters (events). Nothing to send.
+3. Closed by main: carry.rs:497's sleep gone; share.rs EPSILON derived (Higham 3.1, share.rs:159-166).
+- Handed off by main: A-742 unsafe budget (81 vs 79) to w-engine, urgent; the red content-once test to w-perf.
+  Hourly rounds drop both from "known".
