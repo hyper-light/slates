@@ -4863,6 +4863,23 @@
 > whose absence parses, would be read with the field defaulted. Owed: a version in the encoding, refused by name on
 > mismatch.
 
+> **Fixed (live-durability, 2026-11-11): a live volume kept a laggard's entries only up to its first whole record's size,
+> so a holder a few entries behind was installed whole.** The retained tail's byte bound was set only at a whole record
+> or an install image, and a whole record comes only once the log reaches the volume's quota (`kept_reaches_size`):
+> 215,997 bytes at head 16,526, so a holder 12 entries behind fell past the tail and drew a whole install, its 195 to
+> 219 MB image built on the owner's shard, 2 to 6 times in every resumed holder's catch-up (diag-live-durability-81 and
+> -82). Every publication now bounds the tail by what installing the volume would send now, the larger of its referenced
+> bytes and its last whole record or image (`live_ship::retain_bound`, red with the referenced bytes ignored).
+> Landed only with the reply fold's fix (g227, 2026-11-19): every reply of a lagging holder had cloned each retained
+> entry it lacked (21 allocations a reply 16 behind, 1,035 at 1,024; 1.4 ms a reply 1,000 behind), so the tail alone
+> left the owner's shard spending itself on those replies, and the holder never caught up within 90 s (diag-84, 8 of 8).
+> `Shipper::fold_reply` names what the holder lacks and builds nothing, and `retains_after`, which each write's sends ask
+> per holder, no longer builds the entries either (`a_lagging_holders_reply_costs_its_owner_the_same_whatever_it_lacks`,
+> red first). Together, at 20,000 behind: 0 installs in 7 of 8 runs (main 1 to 5), the neighbour volume's worst write
+> 0.16–0.40 s (main 1.16–1.85 s); the catch-up itself slower, 3.95–6.09 s on x86 and 9.38–13.34 s on arm (main
+> 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). Open: the arm catch-up time, and this flow on
+> today's main, whose byte bounds (`Bounds::of_whole`) the measured trees predate.
+
 > **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
 > predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement
 > keeps its anchor. Every pair it was sent was refused (1,583 of 1,583, diag-live-durability-72). On main the
