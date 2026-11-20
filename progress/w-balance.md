@@ -130,3 +130,8 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   main between 129cd0d1b and b8e4591 (run request filed). Corrected BENCHMARKS (landed). Profile saved on .local-2
   ~/.cache/w-balance/r100.sample (8 s sample during burst); kiln server stopped answering before I could read it.
 - NEXT: read r100.sample when kiln answers (heaviest shard threads); find toys' wait cause.
+- r100.sample read: shards' samples ~101k of 133k at ShardContext::run+2576 (the runtime loop itself, not git work);
+  git unpack/sha1/fsck only a sliver. So the toys' 14-16x wait is not shard CPU. Candidates to measure next (not guess):
+  (1) the harness client (one Python asyncio thread sending ~350 MB; split the client into processes, or time-stamp
+  first-byte-sent vs answer), (2) the HTTP edge accept/body path, (3) arena growth (RSS 87 MiB -> 3.5 GB in seconds).
+  Also: main b8e4591 ends the daemon at R=100 (run request; bisect owed).
