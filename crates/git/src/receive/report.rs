@@ -13,6 +13,7 @@ use super::{
   Declined, Outcome, PackRefusal, PackRefused, Received, Refusal, Reported, Requested, unpack_words,
 };
 use crate::object_name::ObjectId;
+use crate::{delta, entry, unpack};
 use crate::out::Out;
 use crate::pktline::{self, Packet};
 use crate::sideband::{self, Band};
@@ -44,6 +45,11 @@ const FSCK_OBJECT: &[u8] = b"object ";
 /// Format: the line git's unpacking dies with after an fsck error (`index-pack.c`,
 /// `unpack-objects.c`).
 const FSCK_FATAL: &[u8] = b"fatal: fsck error in packed object\n";
+
+/// Format: the line git's `index-pack` and `unpack-objects` die with for a pack past `receive.maxInputSize`
+/// (git 2.50.1, `builtin/index-pack.c` `use`, `builtin/unpack-objects.c` `use`), which receive-pack's sideband
+/// carries on band 2 (A-704).
+const PAST_ROOM_FATAL: &[u8] = b"fatal: pack exceeds maximum allowed size\n";
 
 /// The line git's `rp_error` sends for `text`: `error: ` and the text, cut to git's 4096 bytes with
 /// its LF.
@@ -149,8 +155,23 @@ fn pack_lines(refused: &PackRefused) -> Vec<Vec<u8>> {
       .concat();
       vec![message(&text), FSCK_FATAL.to_vec()]
     }
+    PackRefusal::Unpack(refusal) if past_room(&refusal) => vec![PAST_ROOM_FATAL.to_vec()],
     PackRefusal::Unpack(_) => Vec::new(),
   }
+}
+
+/// Whether the pack's reading was refused for its room (A-704): what git's unpacking refuses past
+/// `receive.maxInputSize`.
+fn past_room(refusal: &unpack::Refusal) -> bool {
+  matches!(
+    refusal,
+    unpack::Refusal::PastAdmission(_)
+      | unpack::Refusal::Entry(entry::Refusal::PastAdmission(_))
+      | unpack::Refusal::Delta {
+        refusal: delta::Refusal::PastAdmission(_),
+        ..
+      }
+  )
 }
 
 /// The report's own packets: the unpack status, each command's line (and under v2 its option

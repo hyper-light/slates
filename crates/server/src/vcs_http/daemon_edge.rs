@@ -164,7 +164,7 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       ShardRepositories,
       Halves::new(
         UploadServices::new(ShardStores, room),
-        ReceiveServices::new(ThisShard, room),
+        ReceiveServices::new(ThisShard),
       ),
     )
     .with_lfs(ShardLfs);
