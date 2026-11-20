@@ -76,3 +76,13 @@
   held_by_both_repositories (store.get None after the git release); suspects f3429bdcd (storage seam) / e064c2dc7.
 - Skipped loudly: slates-sdk-python on jupiter (pyo3-build-config: no Python 3 interpreter there).
 - Hourly cron aa63302c at :17 (session-only, 7-day expiry); includes the jupiter Windows lane.
+
+## 2026-11-20 disk trim + A-742 unsafe check (for main)
+- Trimmed ~/.cache/w-lint-target 45 GB -> 17 GB (every incremental/; no release/ dirs). Rounds now run with
+  CARGO_INCREMENTAL=0 and trim incremental/ + release/ after each (cron 162512f6). Box at 136 GB free.
+- A-742 (e064c2dc7, merged by 80a7d5788): `cargo xtask unsafe` FAILS on main: "slates-mem: 81 unsafe sites exceed
+  the budget of 79". The xtask counts 18 new `unsafe` tokens in crates/mem/src/large.rs; the budget edit names 16.
+- SAFETY lines: every unsafe block in large.rs has a `// SAFETY:` comment directly above it, and the `unsafe impl
+  GlobalAlloc` has one. Without their own: the four trait methods' `unsafe fn` (alloc, alloc_zeroed, dealloc,
+  realloc; covered only by the impl's comment) and the three `unsafe fn unmap` declarations (a `/// # Safety` doc
+  each, no `// SAFETY:` line). Not changed by me: the budget is the author's to raise and name (w-engine).
