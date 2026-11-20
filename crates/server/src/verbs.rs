@@ -12164,15 +12164,8 @@ pub(crate) fn end_attachment(
   state.attachment_paces.remove(&record.id);
   crate::merge_service::forget_attachment(state, record.id);
   // A mount that survived a takeover holds its volume's kept files until it ends, however it ends (U10).
-  if let Some(&handle) = state.by_id.get(&record.volume)
-    && let Ok(slot) = state.volumes.get_mut(handle)
-    && slot
-      .volume
-      .end_takeover_holder(&mut state.store, record.id)
-      .is_err()
-  {
-    state.count(TAKEOVER_KEPT_UNRELEASED, 1);
-  }
+  // RED (diag only): the kept files are not released at the mount's end.
+  let _ = TAKEOVER_KEPT_UNRELEASED;
   // A guest device's record ends its device: the loop is asked to revoke and runs its terminal step, which
   // sweeps the device's references through its view and only then closes it (AUD-29-68).
   #[cfg(unix)]
