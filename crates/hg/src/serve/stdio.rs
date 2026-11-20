@@ -83,6 +83,9 @@ pub struct Stdio {
   ended: bool,
   /// The push the session is taking, or that waits for its caller (the module doc's push).
   push: Pushing,
+  /// The room a push's bundle is admitted, where its caller names one past a request's (A-711: what the repository's
+  /// shard can hold).
+  push_room: Option<u64>,
 }
 
 /// A push this session took whole (the module doc's push): its `heads` argument, its bundle's bytes, and what is left of
@@ -154,7 +157,14 @@ impl Stdio {
       input_ended: false,
       ended: false,
       push: Pushing::None,
+      push_room: None,
     }
+  }
+
+  /// Admits each push from now on `room` bytes where that is more than a request's (A-711): a push is bounded by what
+  /// its repository's shard can hold, never by one request's room.
+  pub fn admit_pushes(&mut self, room: u64) {
+    self.push_room = Some(room);
   }
 
   /// Takes the channel's next bytes of the client's input; refused, taking nothing, past the window. Bytes that come
@@ -261,7 +271,7 @@ impl Stdio {
   /// Serves the `unbundle` at the front of the input (the module doc's push): its `heads` argument read and judged
   /// against `store`, a race answered as 7.2's `pusherr`, else the empty answer that asks for the bundle.
   fn unbundle(&mut self, store: &impl Store, room: u64) -> Progress {
-    let mut admission = Admission::new(room);
+    let mut admission = Admission::new(self.push_room.map_or(room, |push| push.max(room)));
     let (heads, used) = match heads_of(&self.input, &mut admission) {
       Ok(Read::Done(heads, used)) => (heads, used),
       Ok(Read::More { needed }) => return self.more(needed),
