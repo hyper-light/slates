@@ -4373,6 +4373,10 @@ impl Green {
     self.make_mapped(&mut effects, post_state);
     let moves = self.node_moves(&effects);
     effects.extend(moves);
+    // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from the
+    // head before the copies land and applied after them.
+    let linked = self.copy_link_effects(&effects);
+    effects.extend(linked);
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
     let mut staged = Staged::default();

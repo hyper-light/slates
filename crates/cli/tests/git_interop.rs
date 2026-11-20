@@ -822,11 +822,8 @@ fn stock_git_clones_pushes_and_fetches_over_the_ssh_edge() {
 /// first commit to [`BRANCH`] as stock git; make branch `topic` from it with the CLI; list the heads with stock `git
 /// ls-remote`; retire `topic` and list them; bind `topic` again to the green the create printed and list them. Expect
 /// `topic` at the pushed commit after the create, gone after the retire, and back at the same commit after the bind:
-/// stock git sees the namespace the CLI changes. Ignored until it can pass: by use (2026-11-20, Mac Studio) the create
-/// answers with the new green and `git ls-remote` lists `main` alone, so a branch the repository's namespace binds is not
-/// among the refs git's site serves.
+/// stock git sees the namespace the CLI changes (A-743: every name the namespace binds is a ref git's site serves).
 #[test]
-#[ignore = "waits on w-git: a branch the namespace binds (CreateBranch, BindBranch) is not among the refs git's site serves"]
 fn stock_git_sees_the_branches_the_cli_makes_retires_and_binds() {
   let Some(program) = stock_git() else {
     eprintln!(

@@ -84,7 +84,8 @@ pub use arrival::{
 };
 pub use cold::{Prices, Rebuildable, choose};
 pub use content::{
-  ContentCounters, ContentId, ContentRefused, ContentStore, DerivedNode, Form, Stored, Windows,
+  ContentCounters, ContentId, ContentRefused, ContentStore, DerivedNode, Form, HeapWindows, Stored,
+  StoredWindow, WindowStorage, Windows,
 };
 pub use derived::{
   Derivations, DerivedCounters, DerivedRefused, DerivedType, Fill, Graph, Mode, Progress, Read,

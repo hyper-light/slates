@@ -291,6 +291,35 @@ pub(crate) fn make_owed(state: &mut ShardState, green: DbVolumeId) {
   }
 }
 
+/// The status count of the branches `CreateBranch` made whose ref the store could not record (A-743): zero in every
+/// correct use.
+pub(crate) const BRANCH_REF_UNMADE: &str = "vcs_commits.branch_ref_unmade";
+
+/// Records the ref of the branch `green` that `CreateBranch` just made (A-743; §4.17's concept table, a slates branch a
+/// git ref): the store's first version of it, at its head version, naming the commit it was made at (module docs, "Its
+/// parent"), as a push of no objects moving one ref is recorded (module docs, "Recorded as a push is"), so git's site
+/// serves the name the namespace binds and a push to it moves this green. Nothing for a green of no git repository, or
+/// one made from a branch git sees unborn; a refusal counted.
+pub(crate) fn branch_made(state: &mut ShardState, green: DbVolumeId) {
+  let Some(repository) = super::paths::git_repository_of(state, green) else {
+    return;
+  };
+  let Some(head) = parent_of(state, repository, green) else {
+    return;
+  };
+  let version = state.db.partition().green_head(green);
+  if admitted(
+    state,
+    repository,
+    (green_key(green), version),
+    (Vec::new(), head),
+  )
+  .is_err()
+  {
+    state.count(BRANCH_REF_UNMADE, 1);
+  }
+}
+
 /// Whether the store holds a version of the green keyed `key` at or past its version `version`: a commit made already.
 fn made_already(stores: &VcsStores, repository: RepositoryId, key: u64, version: u64) -> bool {
   stores.git_ref(repository).is_some_and(|(_, git)| {
@@ -568,7 +597,9 @@ fn recorded(
       vec![(key, version, Some(commit))],
     )
     .map_err(Unmade::Store)?;
-  let objects = sealed.record(&state.vcs_stores).map_err(Unmade::Store)?;
+  let objects = sealed
+    .record(super::Lent::new(&mut state.store, &mut state.vcs_stores).stores)
+    .map_err(Unmade::Store)?;
   let entry = Op::RepositoryAdvanced {
     entry: RepositoryEntry {
       repository,

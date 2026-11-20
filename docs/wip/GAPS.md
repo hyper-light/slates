@@ -84,6 +84,13 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
+> admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
+> admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-743 (2026-11-20, w-git).** BUILT: a branch `CreateBranch` makes is a git ref at the commit it was made at
+> (recorded as a no-object push), so stock git lists, retires, binds and pushes it as the namespace says.
+>
 > **A-722 part 3 (2026-11-20, w-git).** BUILT: the seal writes a push's rows into a fork of the index
 > (`Repository::stage`), the landing adopts it (or stages again when stale). Owed (part 4): the staging pass, the
 > moves' admission, the landing's whole passes and a stale restage sliced; record replay through the sliced intake.
@@ -1914,10 +1921,24 @@
 > `Record::RevisionProperties`, `svn_commit::record`; A-635's append records an entry of no change holding its caller's
 > record alone), so every imported revision is durable as it lands and a refusal keeps the ones before it; answered
 > `DumpImported`, or `ImportRefused { Subversion }` with Subversion's number, the revision and the path (see A-652 part
-> 3). Owed from it: the export verb (a range written as a dump into a volume, landed under a grant, §4.15), sliced under
-> the shard's budget; the records' texts in the shared object store; an import resumed across a restart (the committed
-> revisions are recovered; a request sent again refuses a stream that starts before the revision after the youngest);
-> the CLI's and the SDKs' words for the verb; main's: clippy and `xtask` over the modules. Found by it and fixed by
+> 3). The export verb (A-652 part 3 continued, 2026-11-20): `ExportDump` writes a range as `svnadmin dump` does into a
+> new volume holding `DUMP_FILE`, walked twice a revision a unit (measured, then written a copy slice at a time, both
+> hashed, a differing second walk refused), the caller landing the volume under a grant; landed by w-svn from g268's
+> work, with a fix found by its own test: two exports side by side minted one volume id at their walks' end, the
+> second refused `AlreadyExists` at its record, so the id is minted in the publishing atom now. The sibling sweep (main,
+> same day): every id minted before the record that holds it could repeat, since `verbs::fresh_volume_id_at` named
+> the database's next sequence unreserved: an image's identity at its plan, an archive export's and an archive
+> import's volume at admission, a name alias's. Each mint is now the shard's alone (`ShardState::volume_ids_minted`,
+> held to the counter's bound); held by `image::tests::two_imports_admitted_side_by_side_mint_distinct_volume_ids`
+> (red: one id twice). Minting inside the recording transaction was not the structural form: an image's identity
+> holds its id before its volume is recorded. **Owed, measured
+> 2026-11-20 (debug, this MacBook):** a unit is one revision whole, the exporter writing a revision or nothing
+> (`migration::export`), so a revision's texts are staged whole and its unit is unbounded: against a 14 µs copy-slice
+> budget, a 195-byte revision took 60 µs and one with a 107 KB text 2.4 ms, `image.units_past_budget` 87 over the
+> test's two exports; next piece: the exporter resumable inside a revision, a text a window at a time (§4.17.4 item
+> 11). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
+> words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
 > index refused a replacement by a copy of the node it replaces (`CopyOntoItself`), which FSFS records when the deletion
 > comes first; it takes it now as the copy FSFS makes, the index's and the verdict's oracles holding such replacements
@@ -1935,7 +1956,10 @@
 > O(the paths' lengths), no walk, held to a reference that copies key by key (`cargo test -p slates-merge --lib` on the
 > Mac Studio, see A-542). A-586 (2026-11-19, g295): the engine's `Copy` (`OpKind` 16), built: recorded once at its
 > destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
-> key, the identity one entry a copy, hard links refused by kind, the root a source and never a destination, a branch
+> key, the identity one entry a copy, hard links refused by kind (BUILT 2026-11-20, w-shared, main's ruling: a copied
+> tree's links share the copy's nodes, a link naming a node outside it gets a node of its own, `Green::copy_link_effects`;
+> refused only where that outside node changed after the copy's version, still as `TypeChanged`, owed its own typed
+> refusal), the root a source and never a destination, a branch
 > made before a copy cutting it, a review comment on a copied file moving with it (A-596); held to a reference green
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain
@@ -4861,6 +4885,23 @@
 > So a mixed fleet stops typed, but by accident of length: a later change that keeps the length, or appends a field
 > whose absence parses, would be read with the field defaulted. Owed: a version in the encoding, refused by name on
 > mismatch.
+
+> **Fixed (live-durability, 2026-11-11): a live volume kept a laggard's entries only up to its first whole record's size,
+> so a holder a few entries behind was installed whole.** The retained tail's byte bound was set only at a whole record
+> or an install image, and a whole record comes only once the log reaches the volume's quota (`kept_reaches_size`):
+> 215,997 bytes at head 16,526, so a holder 12 entries behind fell past the tail and drew a whole install, its 195 to
+> 219 MB image built on the owner's shard, 2 to 6 times in every resumed holder's catch-up (diag-live-durability-81 and
+> -82). Every publication now bounds the tail by what installing the volume would send now, the larger of its referenced
+> bytes and its last whole record or image (`live_ship::retain_bound`, red with the referenced bytes ignored).
+> Landed only with the reply fold's fix (g227, 2026-11-19): every reply of a lagging holder had cloned each retained
+> entry it lacked (21 allocations a reply 16 behind, 1,035 at 1,024; 1.4 ms a reply 1,000 behind), so the tail alone
+> left the owner's shard spending itself on those replies, and the holder never caught up within 90 s (diag-84, 8 of 8).
+> `Shipper::fold_reply` names what the holder lacks and builds nothing, and `retains_after`, which each write's sends ask
+> per holder, no longer builds the entries either (`a_lagging_holders_reply_costs_its_owner_the_same_whatever_it_lacks`,
+> red first). Together, at 20,000 behind: 0 installs in 7 of 8 runs (main 1 to 5), the neighbour volume's worst write
+> 0.16–0.40 s (main 1.16–1.85 s); the catch-up itself slower, 3.95–6.09 s on x86 and 9.38–13.34 s on arm (main
+> 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). Open: the arm catch-up time, and this flow on
+> today's main, whose byte bounds (`Bounds::of_whole`) the measured trees predate.
 
 > **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
 > predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement

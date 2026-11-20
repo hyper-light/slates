@@ -285,19 +285,22 @@ impl GitHookView {
           .ok_or(GitHookRefused::Seal(SealRefused::NoPack))?
       }
     };
-    let (content, _) = state
-      .vcs_stores
-      .git_ref(self.repository)
-      .ok_or(GitHookRefused::NoStore)?;
     let mut clock = ShardClock;
     let quantum = Quantum {
       clock: &mut clock,
       ns,
     };
-    let passed = self
-      .view
-      .seal_step(&mut sealing, content, quantum)
-      .map_err(GitHookRefused::Seal)?;
+    let passed = {
+      let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+      let (content, _) = lent
+        .stores
+        .git_ref(self.repository)
+        .ok_or(GitHookRefused::NoStore)?;
+      self
+        .view
+        .seal_step(&mut sealing, content, quantum)
+        .map_err(GitHookRefused::Seal)?
+    };
     if !passed {
       self.sealing = Some(sealing);
       return Ok(false);
@@ -366,8 +369,8 @@ impl GitHookView {
   /// through the shard's one content store, then settles the shard's charge. A refusal there is
   /// counted ([`VIEW_RELEASE_REFUSED`]) and the rest given back.
   pub(crate) fn close(self, state: &mut ShardState) {
-    let given_back = state
-      .vcs_stores
+    let given_back = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores)
+      .stores
       .content_mut()
       .is_some_and(|content| self.give_back(content));
     if !given_back {
