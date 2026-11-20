@@ -55118,3 +55118,22 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Residual.** A relief itself held in a send is relieved by no one (two completions each waiting on the drive at
   once); the relief's receive may run its transaction timeout (1 s) before it hands the state back.
 - **Applied in the same change to** GAPS (the delete/purge hang entry), the fsx bug record, amendments.tsv.
+
+### A-737 — A folding WinFsp drive's volume folds by Windows' own upcase table, not the exFAT specification's (bug, 2026-11-20, w-bugs for goal 87; found by use; amends A-576; §4.4 name policy, §4.6 Windows)
+
+- **Found by use.** A-576's Windows check, `slates-bridge-winfsp` `host::upcase_table::the_volumes_upcase_table_is_the_systems`,
+  first run on 2026-11-20 (jupiter x86_64; CI windows-latest and windows-11-arm, diag-w-bugs-lib-*), failed on every
+  Windows: 109 units where the volume core's table (the exFAT specification's recommended Table 25, which A-576 took for
+  Windows' from memory) and `RtlUpcaseUnicodeChar`, the table WinFsp's driver compares by, differ.
+- **Change.** `crates/vfs/src/upcase.rs` holds Windows' own table: every unit upcased through `RtlUpcaseUnicodeChar` on
+  CI's runners (x86_64 build 26100.33828, arm64 build 26200.9974; identical; 973 units mapped; SHA-256 of the dump
+  `cf0c33b4...`; diag-w-bugs-upcase-1). It maps no two units to one (final sigma `ς` stays `ς`), nothing past ASCII
+  into ASCII, and folds the post-2006 case pairs (`ɐ`/`Ɐ`, `ͱ`/`Ͱ`). A-551's third residual (names Windows folds alike
+  that a folding volume keeps apart) does not arise under it, so `normalized.rs` and GAPS say so.
+- **Tests.** vfs `upcase::tests::the_table_is_windows_own` (the whole table's TableChecksum E61F453Bh, 973 mapped),
+  `the_table_folds_as_windows_does` (`σ`→`Σ`, `ς` itself, `ɐ`→`Ɐ`, `Ⱥ` itself; each red against the exFAT arrays),
+  `no_two_units_fold_to_one_and_none_into_ascii`; `names::tests` and `volume::upcase_name_tests` restated on `ɐ`/`Ɐ`
+  and the sigmas two names; bridge-winfsp `normalized::tests::final_sigma_is_its_own_node_beside_an_open_medial_sigma`.
+  macOS arm64 (Mac Studio): vfs `upcase`/`names::` 9/9, bridge-winfsp `normalized` 7/7. The Windows check itself is
+  the by-use proof on both architectures (diag-w-bugs-lib-737).
+- **Applied in the same change to** GAPS (A-576's entry), `normalized.rs`' module docs, amendments.tsv.
