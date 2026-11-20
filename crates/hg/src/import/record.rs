@@ -255,6 +255,8 @@ pub(crate) struct Kept {
   block: Option<ContentId>,
   /// The text, or a file revision's bytes.
   bytes: ContentId,
+  /// A manifest kept as a delta: its text, rebuilt from its chain (A-729).
+  rebuilt: Option<Vec<u8>>,
 }
 
 /// The record of the index an import made (module docs), `room` the room it ran within: every revision it holds, the
@@ -636,6 +638,7 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
       len: row.len,
       block: None,
       bytes: row.text,
+      rebuilt: None,
     });
   }
   let row = index.revision(store, log, rev)?;
@@ -644,6 +647,12 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
       return Some(NULL_NODE);
     }
     index.revision(store, log, number).map(|parent| parent.node)
+  };
+  // A manifest kept as a delta (A-729): its text rebuilt from its chain, the one revision's text held.
+  let rebuilt = if row.base == NONE {
+    None
+  } else {
+    Some(index.revision_text(store, log, rev)?)
   };
   Some(Kept {
     node: row.node,
@@ -654,6 +663,7 @@ pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32
     len: row.len,
     block: row.block,
     bytes: row.bytes,
+    rebuilt,
   })
 }
 
@@ -672,6 +682,10 @@ pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -
     out.extend_from_slice(bytes);
     *written = written.saturating_add(to_u64(bytes.len()));
   };
+  if let Some(text) = &kept.rebuilt {
+    put(text, &mut written);
+    return written;
+  }
   if let Some(block) = kept.block {
     put(MARKER, &mut written);
     for window in store.windows(&block) {
