@@ -23,6 +23,15 @@
   (inbox/<t>-from-w-store-stored-form-2026-11-20.md). Datasets: ~/.cache/w-store-ab (data-hg, data-git).
 - NEXT: agreement replies; git normalization timing in Rust (asked w-git); then vendoring (piece 2).
 
+- ~18:00 LANDED 31223cb2d: piece 2a, hyper-block (issuer, unwind and hyper-rt left out), hyper-log, hyper-sim
+  vendored at hyper-raft 5e40eb9 into vendor/hyper-raft (README "Two snapshots", "Local changes"). Evidence: hyper-log
+  unit 18/18, log 65/65, confirm 2/2, group 14/14; hyper-block threads 3/3; macOS arm64 Adas-Mac-Studio-2, own target
+  ~/.cache/w-store-local-target.noindex. Untracked leftovers in ~/slates-work/w-store-design/vendor/hyper-raft:
+  hyper-block/tests, hyper-log/tests, hyper-sim/tests, hyper-measure (for main to delete).
+- 2b (engine, chunk, disk) needs hyper-rt's sync channel (ring is unsafe impl Send/Sync, banned) + the issuer: asked main.
+- Stored form: w-hg's own proposal is arm (b) (agrees in substance); w-git sent data (pack-in-entry 18.3 ms of a
+  23-28 ms landing: slices + commit mark fix it); w-svn not yet.
+
 ## Earlier
 - A-767 claimed on the ledger (state branch 3a6db5515).
 - Worktree: ~/slates-work/w-store-design (detached at origin/main 6337049f6). Design draft:
@@ -39,5 +48,6 @@
 4. hg onto it (w-hg), 5. git (w-git B1-B4), 6. svn (w-svn): each with an RSS red test.
 
 ## For main to delete
+- ~/slates-work/w-store-design/vendor/hyper-raft/{hyper-block/tests,hyper-log/tests,hyper-sim/tests,hyper-measure} (untracked copies)
 - Big Studio: ~/.cache/w-store-ab/hg-as-git-1795210958.git, hg-as-git-1795211602.git (failed/partial conversions); ~/.cache/w-store-ab after A/B
 - /tmp/rsch (my research subagent saved fetched sources there against the rules; delete it)
