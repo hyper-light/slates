@@ -70,3 +70,9 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
   w9_a_sessions_container_launch_is_its_harness_by_name..., workspace::container facts test (image).
 - Run t1 in flight (KILN_WRITE_TS=1).
 - Gap to report: a harness in a container has no sign-in (image's own or a credential grant: next piece).
+
+## 5b-ii LANDED 2026-11-20 ~02:4xZ kiln main 4eda3a697 (fast-forward; is-ancestor confirmed); reported to main.
+- NOT done (told main): browser check of the Runners page (Chromium/WebKit); live container start.
+- ui/node_modules installed in ~/kiln-work/w-k90-containers-kiln/ui (npm ci) for UI checks.
+## K8s builders d5d613ef6: push r8 still running on b24c (slow first sync of the k8s worktree path).
+## NEXT: W10 engine scoping (export call over the link, PV/claim/pod creation, RBAC), W9 sign-in in container.
