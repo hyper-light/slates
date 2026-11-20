@@ -14668,7 +14668,7 @@ delta bytes stay within its text's length (derived, as 7.2's `deltas.py` bounds 
 rebuilds it through `HgIndex::revision_text`.
 Status (A-729 part 2): a push's record is its changegroup as it arrived (`SHGR` version 2), replayed through the same
 intake; the landing appends deltas, never texts. An import's record (version 3) writes each delta-kept manifest as its
-delta and base; a made changeset's record is still version 1 (texts).
+delta and base; a made changeset's record (version 3) its manifest as its delta against its first parent's.
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
 working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
 push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
@@ -55091,6 +55091,13 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   release frees its chunk at the next lend. A put the arena has no block for grows it from its pool, the lend's end
   extending the shard budget by the growth. The swap moves a `ChunkStore` (560 bytes); its release cost is measured with the slice's by-use run.
   Tests (merged with main, local, own target): `slates-server` lib 947 of 947 run (`content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`, A-744's, skipped: it spins a debug shard past its window here, alone too, and touches no repository code), `arena_windows::tests` 2 of 2; `slates-vcs` 100, `slates-hg` 356, `slates-git` 557. Slice a2 step 1's three red `slates-vcs` tests read windows through `get()`, which lends only content held Here; they read through `bytes_of`/`len_of` now.
+- **Slice a3 (2026-11-20).** The windows' table rides the shard image as held pieces (kind 11, one a window: identity,
+  length, block), whole in a checkpoint and by its changes in a delta. A recovery claims every block they name before
+  the volumes and before `commit_live`, hands the windows to the content store made at the first replay, held for no
+  one; the replay's puts hold them again by identity, storing nothing, and the rest are freed once every record is
+  replayed (`vcs_store.windows_restored`, `.windows_unrestored`, `.windows_unheld`). Test
+  `daemon::tests::t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image`. Owed: records naming
+  identities only (slice b, with w-balance's name rows and the `homes` tickets); a homed window's holders.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
@@ -55558,6 +55565,36 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed (part 4).** The seal's staging pass and the moves' admission sliced; the landing's remaining whole passes
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
+
+### A-722 part 4d — A replayed record's thin pack resolves its deltas a delta a unit (2026-11-20, w-git for UI goal 93)
+- **Change.** `slates_git::unpack::Reader::resolve_turn_with`: w-balance's resolution in turns (032617278) over the
+  reader's own keeper, a thin pack's outside bases read from the store; a git record's replay (`git_replay`) resolves
+  its pack's waiting deltas there, a delta a unit, before it admits the objects.
+- **Tests.** `slates-server` `git_push::tests::t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved`
+  (the fixtures' `create` and thin `update`, the store made again at a quantum of none: more turns than records, the
+  refs advertised alike).
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-server --lib -- vcs_store:: git_push:: repository::
+  vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 192 passed; fmt clean.
+
+### A-722 part 4c — A move is admitted a unit at a time before its append (2026-11-20, w-git for UI goal 93)
+- **Change.** `slates_git::store::Admitting` (`Repository::admitting`, `admit_turn`): A-614's admission of a move (the
+  walk of what it brings against the green's reached set, the fast-forward's descent by generation number, the search
+  for a base green, the walk beyond the base) cut into units, an object or a commit each; `Repository::admit` runs the
+  same units to their end. `slates_git::receive::Judge::ready` (default ready at once) lets a judge prepare a command
+  over turns before its verdict; the server's judge admits the command's move there (`SealedPush::admission_turn`, the
+  shard's step quantum a turn) and keeps it, and the append takes it whole while its green's head is still the one it
+  was admitted from (`SealedPush::admit`), admitting again otherwise.
+- **Measured** (debug, this Mac, one command bringing 3,502 objects of a 3,500-file tree, load 20 to 30): the work build
+  374 to 642 ms, the entry's apply 114 to 196 ms, the append's judge 67 to 86 ms, the store's commit 21 to 119 ms, the
+  store's admission 13 to 58 ms (now turns), the seal 59 to 163 ms (turns since part 4b). Sent to main: the work build
+  and the apply grow with the head's files and are the works' and merge's.
+- **Tests.** `slates-git` `store::tests::a_move_admitted_a_unit_a_turn_is_the_move_admitted_whole` (a create and a
+  fast-forward); `slates-server` `vcs_store::tests::t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands`.
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-git --lib -- receive:: store::` 138 passed, 4 ignored
+  (and `store:: upload:: receive:: hook_view` 204 before the receive change); `slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 185 passed; fmt clean.
+- **Owed.** The store commit's whole passes (members' positions, landed runs, holds' release) and a stale restage
+  sliced; the work build and the entry's apply (works, merge).
 
 ### A-722 part 4b — A push is sealed and staged a unit at a time (2026-11-20, w-git for UI goal 93; main's ruling: what a push's landing ran whole held its shard past the watchdog's window at git/git's size)
 - **Change.** `slates_git::store::Staging` (`Repository::sealing`, `staging`, `stage_turn`): the seal and stage cut into

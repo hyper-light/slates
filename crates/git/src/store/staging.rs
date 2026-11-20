@@ -93,7 +93,7 @@ enum Step {
 }
 
 /// A clock that never moves: a staging run to its end in one call ([`Repository::stage`]).
-struct Unbounded;
+pub(super) struct Unbounded;
 
 impl Clock for Unbounded {
   fn now_ns(&mut self) -> u64 {

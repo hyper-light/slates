@@ -273,8 +273,10 @@ pub struct Revision<'t> {
   pub link: Node,
   /// 7.2's index flags.
   pub flags: u16,
-  /// The whole text.
+  /// The whole text; a revision given as a delta ([`DELTA_VERSION`]), its delta against `base`.
   pub text: &'t [u8],
+  /// A revision given as a delta: its base's node (A-729 part 2, a made changeset's manifest against its parent's).
+  pub base: Option<Node>,
 }
 
 /// One group of a push's record: a log, and its revisions in the order they were appended.
@@ -516,6 +518,16 @@ pub fn write_revisions(
   groups: &[Group<'_>],
   markers: &[&[u8]],
 ) -> Result<Vec<u8>, WriteRefused> {
+  write_groups((VERSION, source, room), groups, markers)
+}
+
+/// [`write_revisions`] in `version`: [`DELTA_VERSION`] writes each revision's form, its base after a delta's.
+fn write_groups(
+  (version, source, room): (u32, Source, u64),
+  groups: &[Group<'_>],
+  markers: &[&[u8]],
+) -> Result<Vec<u8>, WriteRefused> {
+  let formed = version == DELTA_VERSION;
   let made = if matches!(source, Source::Made { .. }) {
     MADE_BYTES
   } else {
@@ -527,8 +539,14 @@ pub fn write_revisions(
   for (log, revisions) in groups {
     len = len.saturating_add(group_head_len(*log));
     for revision in *revisions {
+      let form = match (formed, revision.base) {
+        (false, _) => 0,
+        (true, None) => TAG_BYTES,
+        (true, Some(_)) => TAG_BYTES.saturating_add(NODE_LEN),
+      };
       len = len
         .saturating_add(fixed_len(*log))
+        .saturating_add(to_u64(form))
         .saturating_add(to_u64(revision.text.len()));
     }
   }
@@ -542,11 +560,11 @@ pub fn write_revisions(
   out
     .try_reserve_exact(usize::try_from(len).map_err(|_| WriteRefused::Allocation)?)
     .map_err(|_| WriteRefused::Allocation)?;
-  write_head(&mut out, (VERSION, source, room), to_u64(groups.len()));
+  write_head(&mut out, (version, source, room), to_u64(groups.len()));
   for (log, revisions) in groups {
     write_group_head(&mut out, *log, to_u64(revisions.len()));
     for revision in *revisions {
-      write_revision_head(&mut out, *log, revision);
+      write_revision_head(&mut out, *log, revision, formed);
       out.extend_from_slice(revision.text);
     }
   }
@@ -571,12 +589,67 @@ pub fn write_push(
 
 /// A made changeset's record (A-731, [`Source::Made`]): the revisions the server made of `green`'s `version`, written as
 /// [`write_push`] writes a push's, the green's key and the version beside them.
+///
+/// Written in [`DELTA_VERSION`] (A-729 part 2): its manifest as its delta against `parent`, its first parent's text
+/// (`delta::encode_lines`), where it has one, so a made changeset's record holds the lines it changed, never the whole
+/// listing; every other revision whole.
 pub fn write_made(
   verified: &crate::push::verify::Verified,
   (green, version): (u64, u64),
+  parent: Option<&[u8]>,
   room: u64,
 ) -> Result<Vec<u8>, WriteRefused> {
-  write_verified(verified, Source::Made { green, version }, room)
+  let changesets = pushed(&verified.changesets, false);
+  let mut deltas: Vec<Vec<u8>> = Vec::new();
+  for (manifest, base) in verified
+    .manifests
+    .iter()
+    .zip(core::iter::once(parent).chain(core::iter::repeat(None)))
+  {
+    let mut delta = Vec::new();
+    if let Some(base) = base.filter(|_| manifest.p1 != NULL_NODE) {
+      crate::delta::encode_lines(base, &manifest.text, &mut delta)
+        .map_err(|_| WriteRefused::Allocation)?;
+    }
+    deltas.push(delta);
+  }
+  let manifests: Vec<Revision<'_>> = verified
+    .manifests
+    .iter()
+    .zip(&deltas)
+    .zip(core::iter::once(parent).chain(core::iter::repeat(None)))
+    .map(|((manifest, delta), base)| {
+      let delta_of = base.is_some() && manifest.p1 != NULL_NODE;
+      Revision {
+        node: manifest.node,
+        p1: manifest.p1,
+        p2: manifest.p2,
+        link: manifest.link,
+        flags: 0,
+        text: if delta_of { delta } else { &manifest.text },
+        base: delta_of.then_some(manifest.p1),
+      }
+    })
+    .collect();
+  let files: Vec<(Log<'_>, Vec<Revision<'_>>)> = verified
+    .files
+    .iter()
+    .map(|(path, arrived)| (Log::File(path), pushed(arrived, true)))
+    .collect();
+  let mut groups: Vec<Group<'_>> = vec![
+    (Log::Changelog, changesets.as_slice()),
+    (Log::Manifest, manifests.as_slice()),
+  ];
+  groups.extend(
+    files
+      .iter()
+      .map(|(log, revisions)| (*log, revisions.as_slice())),
+  );
+  write_groups(
+    (DELTA_VERSION, Source::Made { green, version }, room),
+    &groups,
+    &[],
+  )
 }
 
 /// [`write_push`] and [`write_made`]'s one writer.
@@ -706,6 +779,7 @@ fn pushed(arrived: &[crate::push::verify::Arrived], linked: bool) -> Vec<Revisio
       link: if linked { revision.link } else { NULL_NODE },
       flags: 0,
       text: &revision.text,
+      base: None,
     })
     .collect()
 }
@@ -755,7 +829,7 @@ fn write_group_head(out: &mut Vec<u8>, log: Log<'_>, count: u64) {
 }
 
 /// Writes a revision's fixed part: node, parents, link (not a changeset's), flags and text length.
-fn write_revision_head(out: &mut Vec<u8>, log: Log<'_>, revision: &Revision<'_>) {
+fn write_revision_head(out: &mut Vec<u8>, log: Log<'_>, revision: &Revision<'_>, formed: bool) {
   out.extend_from_slice(&revision.node);
   out.extend_from_slice(&revision.p1);
   out.extend_from_slice(&revision.p2);
@@ -763,6 +837,15 @@ fn write_revision_head(out: &mut Vec<u8>, log: Log<'_>, revision: &Revision<'_>)
     out.extend_from_slice(&revision.link);
   }
   out.extend_from_slice(&revision.flags.to_le_bytes());
+  if formed {
+    match revision.base {
+      None => out.push(TEXT_FORM),
+      Some(base) => {
+        out.push(DELTA_FORM);
+        out.extend_from_slice(&base);
+      }
+    }
+  }
   out.extend_from_slice(&to_u64(revision.text.len()).to_le_bytes());
 }
 

@@ -14,6 +14,7 @@ use crate::{Admission, to_u64};
 
 use super::encoding::Encoding;
 use super::fragment::{self, FragmentRefused, Learning, Named, Placed, Stored};
+use super::hook_view::Quantum;
 use super::learn::{Clock, Depth, Exchange, Levels, Rebuild, Window};
 use super::naming::{GitNaming, kind_of};
 use super::positions::Positions;
@@ -42,6 +43,10 @@ pub(super) mod reach;
 /// A push sealed and staged a unit at a time (A-722 part 4), a child of this module so it writes the rows kept here.
 #[path = "staging.rs"]
 pub(super) mod staging;
+
+/// A move admitted a unit at a time (A-722 part 4c), a child of this module so it walks the rows and chains kept here.
+#[path = "admitting.rs"]
+pub(super) mod admitting;
 
 /// Shape: what one version's record costs the budget beside its set's runs. Derived from the type.
 const VERSION_BYTES: usize = size_of::<Version>();
@@ -364,6 +369,23 @@ impl Move {
   /// Whether it is a fast-forward of its green.
   pub fn is_fast_forward(&self) -> bool {
     self.reach == Reach::Grown
+  }
+
+  /// The position of its green's head when it was admitted; none for a green with no head.
+  pub fn from_head(&self) -> Option<u64> {
+    self.from
+  }
+
+  /// The object it moves its green to; none for a delete.
+  pub fn to(&self) -> Option<ObjectId> {
+    self.to
+  }
+
+  /// The same move of `green`: a move admitted for a ref before its append named the green that holds it (A-722 part
+  /// 4c: a create's green is made by its append), taken by that green while its head is still this move's `from`.
+  pub fn of_green(mut self, green: u64) -> Move {
+    self.green = green;
+    self
   }
 }
 
@@ -878,62 +900,10 @@ impl Repository {
     Ok(false)
   }
 
-  /// The green whose current head is the newest commit `head` peels to or descends from, found back through generation
-  /// numbers; `None` when no green's head is among them.
-  fn base(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-    head: ObjectId,
-  ) -> Result<Option<u64>, StoreRefused> {
-    let Some(start) = self.peel(store, push, head)? else {
-      return Ok(None);
-    };
-    let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
-    let mut heap = BinaryHeap::from([(self.generation(store, push, &start)?, start)]);
-    while let Some((_, id)) = heap.pop() {
-      if !seen.insert(id) {
-        continue;
-      }
-      if let Some(green) = self.green_at(store, &id) {
-        return Ok(Some(green));
-      }
-      for parent in self.parents(store, push, &id)? {
-        heap.push((self.generation(store, push, &parent)?, parent));
-      }
-    }
-    Ok(None)
-  }
-
   /// A green whose current head is the indexed commit `id`.
   fn green_at(&self, store: &ContentStore, id: &ObjectId) -> Option<u64> {
     let (row, _) = self.indexed(store, id)?;
     self.heads.get(&row.position)?.iter().next().copied()
-  }
-
-  /// The reached set made again for a head `to` (module docs): a base green's set, and what a walk finds beyond it; and
-  /// the green and version the base set is, when one was found.
-  fn remade(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-    to: ObjectId,
-  ) -> Result<RemadeSet, StoreRefused> {
-    let (base, from) = match self.base(store, push, to)? {
-      Some(green) => {
-        self.count(|counters| counters.bases_found = counters.bases_found.saturating_add(1));
-        let version = self.chains.get(&green).and_then(Chain::newest);
-        let set = match version {
-          Some(version) => self.sets(store, green, version)?.reached,
-          None => Positions::new(),
-        };
-        (set, version.map(|version| (green, version)))
-      }
-      None => (Positions::new(), None),
-    };
-    let beyond = self.walk(store, push, to, &base)?;
-    self.count(|counters| counters.remade = counters.remade.saturating_add(1));
-    Ok((base, beyond, from))
   }
 
   /// Admits `green`'s move to `to` (`None` deletes the ref) before its verdict: what its version brings and how its
@@ -960,64 +930,18 @@ impl Repository {
         reach: Reach::Emptied,
       });
     };
-    match (from, chain) {
-      (Some(from), Some(_)) => {
-        let reached = self.current_reached(store, green)?.unwrap_or_default();
-        self.admit_onto(store, push, (green, from, &reached), to)
-      }
-      _ => self.admit_create(store, push, green, to),
-    }
-  }
-
-  /// A move of a green that has a head: D(k) walked against its reached set, then a fast-forward or a rewrite.
-  fn admit_onto(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-    (green, from, reached): (u64, u64, &Positions),
-    to: ObjectId,
-  ) -> Result<Move, StoreRefused> {
-    let brought = self.walk(store, push, to, reached)?;
-    let old = self
-      .id_at(store, from)
-      .ok_or(StoreRefused::Unreadable { id: to })?;
-    let reach = if self.fast_forward(store, push, to, old)? {
-      self.count(|counters| counters.fast_forwards = counters.fast_forwards.saturating_add(1));
-      Reach::Grown
-    } else {
-      let (base, beyond, from) = self.remade(store, push, to)?;
-      Reach::Remade { base, beyond, from }
-    };
-    Ok(Move {
-      green,
-      from: Some(from),
-      to: Some(to),
-      brought,
-      reach,
-    })
-  }
-
-  /// A move that makes a ref, or makes a deleted one again: D(0) is everything its head reaches, the set made again,
-  /// with no walk of what a base green reaches.
-  fn admit_create(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-    green: u64,
-    to: ObjectId,
-  ) -> Result<Move, StoreRefused> {
-    let (base, beyond, from) = self.remade(store, push, to)?;
-    let brought = Members {
-      indexed: base.union(&beyond.indexed),
-      new: beyond.new.clone(),
-    };
-    Ok(Move {
-      green,
-      from: None,
-      to: Some(to),
-      brought,
-      reach: Reach::Remade { base, beyond, from },
-    })
+    let mut admitting = self.admitting(store, push, green, to)?;
+    let mut clock = staging::Unbounded;
+    while !self.admit_turn(
+      store,
+      push,
+      &mut admitting,
+      Quantum {
+        clock: &mut clock,
+        ns: u64::MAX,
+      },
+    )? {}
+    admitting.admitted().ok_or(StoreRefused::Unsealed)
   }
 
   /// Commits `push` and `moves` once the verdict accepts them: a position and rows for each object new to the
@@ -1365,6 +1289,12 @@ impl Repository {
     Ok(Some(self.sets(store, green, newest)?.reached))
   }
 
+  /// The position of `green`'s current head; none while it has none (A-722 part 4c: what a move admitted before its
+  /// append must still be from).
+  pub fn current_head(&self, green: u64) -> Option<u64> {
+    self.chains.get(&green).and_then(Chain::head)
+  }
+
   /// The head of `green`'s version `version`; `None` for a deleted ref.
   pub fn head(&self, store: &ContentStore, green: u64, version: usize) -> Option<ObjectId> {
     let position = self.chains.get(&green)?.versions.get(version)?.head?;
@@ -1551,10 +1481,6 @@ fn footprint(
     .fold(0_usize, |total, greens| total.saturating_add(greens.len()));
   chains.saturating_add(bytes(entries, HEAD_BYTES))
 }
-
-/// A remade reached set: its positions, its members, and the green and version of the base set it
-/// grew from, when one was found.
-type RemadeSet = (Positions, Members, Option<(u64, usize)>);
 
 /// For each object a move found new, the green and version that brought it; and the pair for an
 /// object no move holds.

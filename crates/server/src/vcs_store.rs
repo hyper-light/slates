@@ -136,6 +136,12 @@ pub(crate) const VALUE_UNKEPT: &str = "vcs_store.value_unkept";
 /// Counter: a record replayed into its store by a recovery or a rebuild: the replay's non-vacuity counter. Format: a
 /// counter name.
 pub(crate) const REPLAYED: &str = "vcs_store.replayed";
+/// Counter (A-727 slice a3): repository windows a recovery took back from the shard image, their chunks claimed.
+pub(crate) const WINDOWS_RESTORED: &str = "vcs_store.windows_restored";
+/// Counter (A-727 slice a3): window pieces of the shard image a recovery could not take back (put again by replay).
+pub(crate) const WINDOWS_UNRESTORED: &str = "vcs_store.windows_unrestored";
+/// Counter (A-727 slice a3): restored windows no replayed record named, freed once the records were replayed.
+pub(crate) const WINDOWS_UNHELD: &str = "vcs_store.windows_unheld";
 /// Counter: a store a recovery could not make again from its records: zero in every correct use. Format: a counter name.
 pub(crate) const REPLAY_REFUSED: &str = "vcs_store.replay_refused";
 /// Counter: a store made again from the log after its commit's entry was not made durable. Format: a counter name.
@@ -1210,6 +1216,9 @@ pub(crate) struct SealedPush {
   keyed: Vec<RecordedMove>,
   /// The record's objects, until a commit takes them.
   objects: RecordWriter,
+  /// Moves admitted a turn at a time before their append (A-722 part 4c, `git_push`'s judge), each taken by its append
+  /// while its green's head is still the one it was admitted from.
+  prepared: Vec<Move>,
 }
 
 impl SealedPush {
@@ -1246,10 +1255,28 @@ impl SealedPush {
     stores: (&mut Store, &mut VcsStores),
     moves: Vec<RecordedMove>,
   ) -> Result<(), GitRefused> {
-    let (repository, push) = (self.repository, &self.push);
+    let (repository, push, prepared) = (self.repository, &self.push, &mut self.prepared);
     let admitted = lent_to_read(stores, |stores| {
       let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
-      admit_moves(content, store, push, &moves)
+      moves
+        .iter()
+        .map(|(green, _, head)| {
+          let taken = head.and_then(|to| {
+            let current = store.repository.current_head(*green);
+            let at = prepared
+              .iter()
+              .position(|admitted| admitted.to() == Some(to) && admitted.from_head() == current)?;
+            Some(prepared.swap_remove(at).of_green(*green))
+          });
+          match taken {
+            Some(admitted) => Ok(admitted),
+            None => store
+              .repository
+              .admit(content, push, *green, *head)
+              .map_err(GitRefused::Store),
+          }
+        })
+        .collect::<Result<Vec<Move>, GitRefused>>()
     })?;
     self.moves = admitted;
     self.keyed = moves;
@@ -1259,6 +1286,49 @@ impl SealedPush {
   /// Gives back every hold the push took: a push no append committed. One a commit took holds nothing.
   pub(crate) fn abandon(self, state: &mut ShardState) {
     abandon_push(state, self.push);
+  }
+
+  /// One turn of the admission of the move of the green keyed `green` to `to` (A-722 part 4c), begun where `admitting`
+  /// holds none, for `ns` of the shard's clock and a unit at least: whether it is done, its move kept for its append
+  /// ([`SealedPush::admit`]). A refusal ends it, the append admitting the move again and answering the refusal there.
+  pub(crate) fn admission_turn(
+    &mut self,
+    state: &mut ShardState,
+    (green, to): (u64, ObjectId),
+    (admitting, ns): (&mut Option<slates_git::store::Admitting>, u64),
+  ) -> bool {
+    let (repository, push, prepared) = (self.repository, &self.push, &mut self.prepared);
+    if prepared.iter().any(|admitted| admitted.to() == Some(to)) {
+      return true;
+    }
+    let turned = lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+      let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
+      let mut begun = match admitting.take() {
+        Some(begun) => begun,
+        None => store
+          .repository
+          .admitting(content, push, green, to)
+          .map_err(GitRefused::Store)?,
+      };
+      let mut clock = crate::git_push::ShardClock;
+      let quantum = slates_git::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns,
+      };
+      let done = store
+        .repository
+        .admit_turn(content, push, &mut begun, quantum)
+        .map_err(GitRefused::Store)?;
+      if done {
+        if let Some(admitted) = begun.admitted() {
+          prepared.push(admitted);
+        }
+      } else {
+        *admitting = Some(begun);
+      }
+      Ok::<bool, GitRefused>(done)
+    });
+    turned.unwrap_or(true)
   }
 }
 
@@ -1420,6 +1490,7 @@ impl SealingPush {
         moves: Vec::new(),
         keyed: Vec::new(),
         objects: self.push.record,
+        prepared: Vec::new(),
       }))),
       Err(refused) => {
         self.abandon(state);
@@ -2185,6 +2256,62 @@ pub(crate) async fn recover(
   for record in records {
     recover_repository(state, &record, slices).await;
   }
+  release_unheld_windows(state);
+}
+
+/// The repository windows kept as chunks of the shard's chunk store (A-727, `arena_windows`), whether the content store
+/// is made over them yet or not; none where the stores keep their windows elsewhere (a test's heap).
+pub(crate) fn chunk_windows(stores: &VcsStores) -> Option<&arena_windows::ChunkWindows> {
+  let storage = match stores.content.as_ref() {
+    Some(content) => content.storage(),
+    None => &**stores.window_storage.as_ref()?,
+  };
+  storage.as_any()?.downcast_ref()
+}
+
+/// [`chunk_windows`], mutably.
+pub(crate) fn chunk_windows_mut(
+  stores: &mut VcsStores,
+) -> Option<&mut arena_windows::ChunkWindows> {
+  let storage = match stores.content.as_mut() {
+    Some(content) => content.storage_mut(),
+    None => &mut **stores.window_storage.as_mut()?,
+  };
+  storage.as_any_mut()?.downcast_mut()
+}
+
+/// Takes the repository windows the shard image names back (A-727 slice a3), before the volumes and the records: each
+/// chunk's block claimed in the shard's chunk store and its chunk recorded, the windows handed to the content store the
+/// first repository's replay makes. Only before a content store is made; counted restored and not.
+pub(crate) fn restore_windows(state: &mut ShardState, pieces: &[(u64, Vec<u8>)]) {
+  if pieces.is_empty() || state.vcs_stores.content.is_some() {
+    return;
+  }
+  let (windows, refused) =
+    arena_windows::ChunkWindows::restore(state.config.page, pieces, &mut state.store.content);
+  let restored = u64::try_from(pieces.len())
+    .unwrap_or(u64::MAX)
+    .saturating_sub(refused);
+  state.vcs_stores.window_storage = Some(Box::new(windows));
+  state.count(WINDOWS_RESTORED, restored);
+  state.count(WINDOWS_UNRESTORED, refused);
+}
+
+/// Frees the restored windows no replayed record named (A-727 slice a3), once every record is replayed, and settles the
+/// shard's charge.
+fn release_unheld_windows(state: &mut ShardState) {
+  let freed = {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map_or(0, ContentStore::release_unheld)
+  };
+  if freed > 0 {
+    state.count(WINDOWS_UNHELD, freed);
+  }
+  settle(state);
 }
 
 /// Makes `record`'s store again and replays its records in log order, a record a unit of the recovery's slices, then

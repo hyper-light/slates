@@ -735,6 +735,28 @@ fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_gre
   });
 }
 
+/// A-722 part 4 (a record's replay a unit a turn, its pack's waiting deltas resolved a delta a unit). Do: push the
+/// fixtures' `create` and `update` (a thin pack, its delta's base outside it); make the store again from the log, each
+/// turn held to no time at all, counting the turns. Expect: more turns than records; the refs advertised after as
+/// before.
+#[test]
+fn t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "thin-replayed");
+    pushed_from_the_fixtures(state, repository, &["create", "update"]);
+    let before = super::advertised_refs(state, repository);
+    let held = records(state, repository);
+    crate::vcs_store::rebuild(state, repository);
+    let mut turns = 0usize;
+    while crate::vcs_store::rebuild_turn_once_within(state, repository, 0) {
+      turns += 1;
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    assert!(turns > held, "{turns} turns for {held} records");
+    assert_eq!(super::advertised_refs(state, repository), before);
+  });
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The hooks (A-665 part 3; Unix, where the hook driver runs).
 
