@@ -64,7 +64,8 @@ pub fn parse_secret(text: &str) -> Option<[u8; SECRET_BYTES]> {
     return None;
   }
   let mut secret = [0u8; SECRET_BYTES];
-  for (slot, pair) in secret.iter_mut().zip(bytes.chunks_exact(2)) {
+  let (pairs, _) = bytes.as_chunks::<2>();
+  for (slot, pair) in secret.iter_mut().zip(pairs) {
     let text = std::str::from_utf8(pair).ok()?;
     *slot = u8::from_str_radix(text, 16).ok()?;
   }
@@ -292,7 +293,7 @@ mod tests {
     }
     let text = secret_text(&secret);
     assert_eq!(parse_secret(&text), Some(secret));
-    assert_eq!(parse_secret(&text[1..]), None);
+    assert_eq!(parse_secret(text.get(1..).unwrap()), None);
     assert_eq!(parse_secret(&format!("{text}0")), None);
     assert_eq!(parse_secret(&"zz".repeat(SECRET_BYTES)), None);
     assert!(same_secret(&secret, &secret));
@@ -313,6 +314,7 @@ mod tests {
     let name = route.name().to_owned();
     let segment =
       rustix::fs::memfd_create("issuer-route-test", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+    #[allow(clippy::disallowed_methods)] // sizing a memory object: RAM, not a host path (R1).
     rustix::fs::ftruncate(&segment, 4096).unwrap();
     let secret = [9u8; SECRET_BYTES];
     let patience = std::time::Duration::from_secs(10);

@@ -200,6 +200,48 @@ fn kill(pid: u32) {
   assert!(status.unwrap().success(), "the daemon {pid} was killed");
 }
 
+/// What a restart showed, read from the anchor's lines until it restarted its daemon and the successor served: the
+/// successor's pid, each listener's first answer to a connection made while no daemon ran, and the ports the successor
+/// named. The anchor's restart line and the successor's own lines come from two processes, in whichever order they
+/// arrive.
+type Restart = (
+  Option<u32>,
+  Vec<(Ask, u16, std::io::Result<Vec<u8>>)>,
+  [Option<u16>; 3],
+);
+
+/// See [`Restart`]: the listeners at `ports` asked once the anchor says it restarted its daemon.
+fn across_a_restart(lines: &Receiver<String>, serving: &str, ports: [u16; 3]) -> Restart {
+  let started = Instant::now();
+  let mut successor = None;
+  let mut while_restarting = Vec::new();
+  let mut again = [None; 3];
+  let mut served = false;
+  while successor.is_none() || !served {
+    assert!(started.elapsed() < PATIENCE * 2, "the daemon served again");
+    let line = next_line(lines);
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| (EDGES[index].2, *port, first_answer(*port, EDGES[index].2)))
+        .collect();
+    }
+    for (index, port) in again.iter_mut().enumerate() {
+      *port = port_on(&line, index).or(*port);
+    }
+    served |= line.starts_with(serving);
+  }
+  (successor, while_restarting, again)
+}
+
 /// A-748 with A-625 part 3, A-684 and A-689 (§4.6, every platform). Do: start an anchor with the HTTP edge, the SSH edge
 /// and the svn:// listener on loopback, each on a port the system picks (`127.0.0.1:0`); read the ports its daemon
 /// names and ask each; kill the daemon; once the anchor says it restarted it, ask each port again, before the successor
@@ -242,34 +284,7 @@ fn a_daemon_restart_keeps_every_version_control_listeners_port() {
   }
   let killed = daemon_pid(&instance).expect("the daemon's pid");
   kill(killed);
-  // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
-  let started = Instant::now();
-  let mut successor = None;
-  let mut while_restarting = Vec::new();
-  let mut again = [None; 3];
-  let mut served = false;
-  while successor.is_none() || !served {
-    assert!(started.elapsed() < PATIENCE * 2, "the daemon served again");
-    let line = next_line(&lines);
-    if successor.is_none()
-      && let Some(after) = line.split(RESTARTED_AS).nth(1)
-    {
-      successor = after
-        .split(|character: char| !character.is_ascii_digit())
-        .next()
-        .and_then(|pid| pid.parse::<u32>().ok());
-      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
-      while_restarting = ports
-        .iter()
-        .enumerate()
-        .map(|(index, port)| (EDGES[index].2, *port, first_answer(*port, EDGES[index].2)))
-        .collect();
-    }
-    for (index, port) in again.iter_mut().enumerate() {
-      *port = port_on(&line, index).or(*port);
-    }
-    served |= line.starts_with(&serving);
-  }
+  let (successor, while_restarting, again) = across_a_restart(&lines, &serving, ports);
   assert_ne!(successor, Some(killed), "the anchor started a new daemon");
   for (ask, port, answer) in while_restarting {
     let answer = answer.unwrap_or_else(|error| {

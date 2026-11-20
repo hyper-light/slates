@@ -56442,7 +56442,9 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   every platform): an anchor with all three listeners on loopback ports the system picks; the daemon killed; each port
   asked while no daemon runs and answered by the successor (`401`, `SSH-2.0-`, svnserve's greeting); the successor
   naming the same three ports. Green on Windows x86_64 (jupiter, kiln r33: 61321, 61322 and 61323 before and after the
-  kill, 2.10 s) and macOS arm64 (Mac Studio 2, 3.1 s). Pure: rt's `share` codec (a record whose every field differs,
+  kill, 2.10 s) and macOS arm64 (Mac Studio 2, 3.1 s). Red on Windows (jupiter, kiln r36, the same tree with the anchor
+  role's change alone reversed, which is main's behaviour before: the anchor held no listener): the killed daemon's
+  successor named the HTTP edge at 62797 where its predecessor had served 62786, and the test failed (7.81 s). Pure: rt's `share` codec (a record whose every field differs,
   back whole; a byte short or long refused) and the anchor's `shared_listeners` (three shares back in order; every cut
   inside a record refused `Truncated`; too many, too long).
 - **Applied in the same change to** A-625 part 3's status and decision 3, `docs/wip/platforms.md` gap 2,
