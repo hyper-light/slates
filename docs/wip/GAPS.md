@@ -1737,6 +1737,10 @@
 > A-693 part 1, 2026-11-19 (w-svn): `get-lock` and `get-locks` answered from the lock table (stock `svnserve`'s
 > recorded `info`/`ls` sessions now replayed with them; a held, an expired and a hidden lock; the depth refusal).
 > Owed: the four lock-changing verbs through the owner's step (A-693 part 2).
+> A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
+> (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
+> access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
+> server `vcs_svn::` 9 of 9) signs in on either shard and reads. Owed: commits (A-698), the interop leg.
 > A-692 (2026-11-19, g307): `svn://`'s CRAM-MD5 against enrolled tokens. A token's credential record keeps HMAC-MD5's
 > keyed contexts beside its hash (`CredentialKind::HttpToken`'s `cram_md5_contexts`, Dovecot's layout), derived by the
 > CLI's issuer as it mints the token, so the daemon holds neither the token nor anything that gives it back; a client

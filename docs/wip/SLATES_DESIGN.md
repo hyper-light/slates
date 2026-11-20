@@ -15195,6 +15195,11 @@ and export by landing).
 > repository's lock table at the call's instant (`slates_svn::reads::answer_lock_read`, `serve.c` 3366-3446): a held
 > lock as `write_lock` writes it, an expired one and one on an unreadable path left out, a depth `get_locks` refuses in
 > its words. Owed: `lock`, `lock-many`, `unlock`, `unlock-many` through the owner's step.
+>
+> **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
+> UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
+> token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's
+> principal writing where the repository's policy reaches it. Owed: commits through the owner's step (A-698).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
