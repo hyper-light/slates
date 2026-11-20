@@ -36,3 +36,38 @@ Measure before/after with `crates/cli/bench/multi_repo_load.py ... v0.99 v1.0.0 
 (BENCHMARKS "held to their fair share"). The before figure: the hot repository's 19 pushes at 7.61x their spread fair
 share (10.2 s against 1.4 s). Stay below 19 concurrent v1.5.0 pushes to one repository until your fix for the daemon's
 end lands.
+
+## 2026-11-20, later: a pack's waiting deltas resolved in turns (branch agents/w-balance-fix1, 76070d077, NOT landed)
+Main's rule: land only if the profile shows resolve as the toys' wait. It does not, so this waits for main's ruling or
+for you to take it into A-722 part 4. It fixes the daemon's end at ten concurrent v1.5.0 pushes.
+
+What the profile showed (32-core Studio, multi_repo_load.py, R = 100, git/git v0.99/v1.0.0/v1.5.0, quiet: load 3.8 to
+7.0, no other daemons):
+- The kill's cause line at cap 10: `shard 20 is spinning: 1019 ms of CPU without a step ... in task spawned at
+  crates/server/src/vcs_http.rs:1404, at its poll 595`, then the anchor's kill naming the same task and poll.
+- Longest step of each phase of a git push, per class (new per-repository counters, `longest_push_phases_ns` in the
+  status JSON): input 91.3 / 292.3 / 1,435.7 ms (small / medium / v1.5.0), end 0.0, check turn 0.4 / 0.6 / 1.7,
+  answer 33.9 / 81.8 / 246.9. Mean step 0.04 to 0.06 ms.
+- Cause: `slates_git::unpack::Reader::finish_into` -> `resolve_waiting` resolves every delta waiting at the pack's end
+  (and their dependents, `while let Some(next) = stack.pop()`) in one call, inside the input step that brings the
+  trailer (`Session::take` -> `check_pack` -> `finished_pack`).
+After the change: longest input 1.1 ms (from 1,435.7), longest step 213.5 ms (answer), cap 10 ALIVE with 10/10 ok,
+v1.5.0 alone held 423 MiB (from ~758). The toys' p99 is still 3.34x its fair share (3.66x before): their wait is not
+resolve. I'm profiling the answer step and the per-step cost next.
+
+What the change touches:
+- `crates/git/src/unpack.rs`: `Reader::resolving: Option<Resolving>` (waiting table, stack, next entry, outside done);
+  `pub fn resolve_turn(admission, keep, Quantum) -> Result<bool, Refusal>` (one unit at least, stops when the quantum
+  is spent, keeps where it stopped); `resolve_waiting` REMOVED, `finish_into` drives `resolve_turn` to the end under a
+  clock that never moves (one path); `Key` derives Debug.
+- `crates/git/src/receive/session.rs`: `State::Resolving { request, reader }`; `check_pack` enters it for a whole pack
+  (a short or refused pack is finished at once as before, `finish_pack`); `pub fn resolve_turn_into(site, admission,
+  Quantum)`; `is_resolving()`; `is_checking()` now true while resolving; `check_turn` (the session's own memory)
+  takes resolution turns first.
+- `crates/server/src/git_push.rs`: `ReceivePack::check_turn` gives a resolving session its turn through `intake` (what
+  resolves is admitted to the quarantine as during input), under the shard's step quantum; plus the per-phase longest
+  counters (`phase_longest`, reported per repository).
+Tests: `unpack::tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time` (64 deltas on a late base: many turns,
+objects equal to reading whole); `git_push::tests::t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_step`
+(fixture `update`, a thin pack: still resolving after its bytes, answered over turns with git's report);
+slates-git receive:: unpack:: 69/69; server git_push:: vcs_http::git:: vcs_ssh:: vcs_share:: vcs_store::upload:: 105/105.
