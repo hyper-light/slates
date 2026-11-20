@@ -1312,6 +1312,7 @@ pub enum RequestBody {
     /// The host directory that holds a Mercurial repository's `.hg`, or the host file that holds a Subversion dump.
     path: String,
   },
+<<<<<<< HEAD
   /// Export revisions `first` to `last` of Subversion repository `repository` as the dump stream `svnadmin dump` writes
   /// for the same range (§4.17.4 piece 6; A-628, A-652 part 3): format 2, or format 3 with `deltas` (`--deltas`); a
   /// range starting after revision 0 written incrementally (`--incremental`). The dump is written into a new volume
@@ -1331,6 +1332,15 @@ pub enum RequestBody {
     deltas: bool,
     /// The new volume's name.
     name: String,
+=======
+  /// Read repository `repository`'s policy (§4.17.1 "Policy"; A-622), on the partition its name hashes to: its owner's
+  /// verb, as setting it is, so a setter can change one part and keep the rest (`slates repository policy`). Answered
+  /// `RepositoryPolicy` with its version and every part; refused `NotFound` for no such repository, `Forbidden` for
+  /// any principal but its owner, and `BadRequest` for a rule naming a principal the wire cannot carry. Appended.
+  DescribeRepositoryPolicy {
+    /// The repository's name.
+    repository: String,
+>>>>>>> origin/main
   },
 }
 
@@ -2376,7 +2386,11 @@ impl RequestBody {
       | RequestBody::RetireBranch { .. }
       | RequestBody::SetRepositoryPolicy { .. }
       | RequestBody::ImportRepository { .. }
+<<<<<<< HEAD
       | RequestBody::ExportDump { .. } => None,
+=======
+      | RequestBody::DescribeRepositoryPolicy { .. } => None,
+>>>>>>> origin/main
     }
   }
 
@@ -2865,6 +2879,20 @@ pub enum WorkOp {
     path: String,
     /// The metadata recorded by the declaring volume.
     node: IpcNode,
+  },
+  /// Copy `from`'s tree, as version `version` of the work's green holds it (the work's base when none), to `to`, by
+  /// reference (A-586; A-626 part 4: a copy made through a work; Subversion's copy with history): replacing what `to`
+  /// holds when `replace`, else refused where `to` holds anything. What the work does in `to`'s tree after it lands on
+  /// what the copy brings. Appended.
+  Copy {
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from; none for the work's base.
+    version: Option<u64>,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
   },
 }
 
@@ -4688,6 +4716,11 @@ pub enum DatabaseRefusal {
     /// The slot's bytes.
     room: u64,
   },
+  /// A repository's index cut moved other than one bit within an id's 32 (A-724 piece 9): the cut now. Appended.
+  IndexCutStep {
+    /// The cut's bits now.
+    current: u8,
+  },
 }
 
 /// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
@@ -5469,6 +5502,7 @@ pub enum ReplyBody {
     /// The youngest revision.
     youngest: u64,
   },
+<<<<<<< HEAD
   /// A Subversion repository's range of revisions exported as a dump into a new volume (`ExportDump`, A-652 part 3):
   /// the volume, which holds it as [`DUMP_FILE`], and the dump's length in bytes. Appended.
   DumpExported {
@@ -5476,6 +5510,21 @@ pub enum ReplyBody {
     id: VolumeId,
     /// The dump's length in bytes.
     dump_bytes: u64,
+=======
+  /// A repository's policy (`DescribeRepositoryPolicy`): its version (0 for one never set) and every part, as
+  /// `SetRepositoryPolicy` gives them. Appended.
+  RepositoryPolicy {
+    /// The policy's version, which a `SetRepositoryPolicy` reads.
+    version: u64,
+    /// The rules, in order.
+    rules: Vec<PolicyRule>,
+    /// The hooks, in order.
+    hooks: Vec<HookConfig>,
+    /// A Subversion repository's hooks-env sections, in order.
+    hooks_env: Vec<HooksEnvSection>,
+    /// A git repository's keys trusted to sign its commits.
+    signers: Vec<Vec<u8>>,
+>>>>>>> origin/main
   },
 }
 

@@ -196,6 +196,7 @@ fn an_id_names_its_own_lock_and_never_one_taken_after_it() {
 /// A git repository's record owned by [`owner`], its default branch `main`, with `policy`.
 fn record_with(policy: RepositoryPolicy) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id: RepositoryId::default(),
     name: "repo.git".to_owned(),
     tool: DbTool::Git,
@@ -295,6 +296,7 @@ fn an_uploaded_object_is_durable_and_served_after_the_store_is_made_again() {
     let again = serve(state, me, ("PUT", &object, &bytes)).status.code;
     let logged_again = records(state, repository) - before;
     crate::vcs_store::rebuild(state, repository);
+    crate::vcs_store::settle_rebuild(state, repository);
     let downloaded = serve(state, me, ("GET", &object, b""));
     let batch = format!(
       r#"{{"operation":"download","objects":[{{"oid":"{oid}","size":{}}}]}}"#,

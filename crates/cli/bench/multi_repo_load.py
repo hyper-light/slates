@@ -37,6 +37,8 @@ Usage: multi_repo_load.py SLATES SOURCE REV [REV ...] [--steps 1,10,100,1000]
   SOURCE  a git repository holding every REV (a bare clone of the dataset)
   REV     one revision a size class, smallest first (e.g. v0.99 v1.0.0 v1.5.0 v2.0.0 of git/git)
   --steps the repository counts of the steps, in order (default: powers of ten up to the open-file room)
+  --per-repository-cap N  at most N pushes to one repository in a step (main's order of 2026-11-20: below the 19
+          concurrent v1.5.0 pushes to one repository that end the daemon until A-722 lands)
 """
 
 import asyncio
@@ -276,6 +278,11 @@ def main():
         at = args.index("--steps")
         steps = [int(n) for n in args[at + 1].split(",")]
         del args[at : at + 2]
+    cap = None
+    if "--per-repository-cap" in args:
+        at = args.index("--per-repository-cap")
+        cap = int(args[at + 1])
+        del args[at : at + 2]
     slates, source, *revs = args
     if not revs:
         raise SystemExit(__doc__)
@@ -283,7 +290,8 @@ def main():
         steps = push_load.steps_up_to(room)
     packs = [pack_of(source, rev) for rev in revs]
     print(f"machine: {subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], stdout=subprocess.PIPE, text=True).stdout.strip()}, "
-          f"{os.cpu_count()} cores, load {os.getloadavg()}, free {free_mib():,.0f} MiB, open-file room {room}")
+          f"{os.cpu_count()} cores, load {os.getloadavg()}, free {free_mib():,.0f} MiB, open-file room {room}, "
+          f"per-repository cap {cap}")
     for size, (pack, head, count) in enumerate(packs):
         print(f"class {size}: {revs[size]} -> {head[:12]}, {count:,} objects, {len(pack):,} bytes")
 
@@ -304,6 +312,8 @@ def main():
 
     for repositories in steps:
         counts = pushes_by_zipf(repositories)
+        if cap is not None:
+            counts = [min(count, cap) for count in counts]
         classes = [class_of(rank, len(packs)) for rank in range(1, repositories + 1)]
         total = sum(counts)
         if total > room:

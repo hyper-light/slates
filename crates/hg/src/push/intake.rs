@@ -27,17 +27,17 @@
 //! **Refused**, the caller gives the fork back ([`Intake::abandon`]): the repository's index and the content store are
 //! as they were. The refusals are verification's ([`Unverified`]) and the keeping's ([`Unindexed`]).
 
+use core::ops::Range;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_vcs::{ContentStore, IndexRefused};
 
-use super::ChangegroupPart;
 use super::classify::ReadChangeset;
 use super::commit::{Unindexed, keep_one};
 use super::held::IndexHeld;
 use super::verify::{Arrived, Held, LogOf, Unverified, audit};
-use crate::changegroup::{Changegroup, Revision};
+use crate::changegroup::{Changegroup, Revision, Version};
 use crate::index::{HgIndex, Log, NONE};
 use crate::read::to_u64;
 use crate::{Admission, NULL_NODE, Node, changeset, delta, filerev, manifest, node};
@@ -119,10 +119,123 @@ enum Stage {
   Done,
 }
 
-/// A push's changegroup being taken into a fork of its repository's index (module docs).
-pub struct Intake<'g> {
+/// One revision of the changegroup, by where its delta lies in the changegroup's bytes.
+#[derive(Clone, Debug)]
+struct RevisionAt {
+  /// The node.
+  node: Node,
+  /// The first parent.
+  p1: Node,
+  /// The second parent.
+  p2: Node,
+  /// Its delta's base.
+  base: Node,
+  /// The changeset it belongs to.
+  link: Node,
+  /// Its revision flags.
+  flags: u16,
+  /// Version 04's delta information.
+  info: Option<crate::changegroup::DeltaInfo>,
+  /// The protocol flags.
+  protocol_flags: u8,
+  /// Where its delta lies in the payload.
+  data: Range<usize>,
+}
+
+/// The changegroup's framing as places in its bytes, so the intake borrows nothing between steps.
+#[derive(Clone, Debug, Default)]
+struct Frame {
+  /// Every revision, in stream order.
+  revisions: Vec<RevisionAt>,
+  /// The changelog's revisions.
+  changelog: Range<usize>,
+  /// The manifests'.
+  manifests: Range<usize>,
+  /// Each file group: where its path lies in the payload, and its revisions.
+  files: Vec<(Range<usize>, Range<usize>)>,
+}
+
+impl Frame {
+  /// The framing of `payload`, a changegroup of `version`, within `admission`.
+  fn of(payload: &[u8], version: Version, admission: &mut Admission) -> Result<Frame, Refused> {
+    let group =
+      Changegroup::decode(payload, version, admission).map_err(Unverified::Changegroup)?;
+    if !group.trees.is_empty() {
+      return Err(Unverified::TreeManifests.into());
+    }
+    let start = payload.as_ptr().addr();
+    let place = |bytes: &[u8]| {
+      let at = bytes.as_ptr().addr().saturating_sub(start);
+      at..at.saturating_add(bytes.len())
+    };
+    admission.charge_items::<RevisionAt>(group.revisions.len())?;
+    let revisions = group
+      .revisions
+      .iter()
+      .map(|revision| RevisionAt {
+        node: revision.node,
+        p1: revision.p1,
+        p2: revision.p2,
+        base: revision.base,
+        link: revision.link,
+        flags: revision.flags,
+        info: revision.info,
+        protocol_flags: revision.protocol_flags,
+        data: place(revision.data),
+      })
+      .collect();
+    let files = group
+      .files
+      .iter()
+      .map(|file| (place(file.name), file.revisions.clone()))
+      .collect();
+    Ok(Frame {
+      revisions,
+      changelog: group.changelog,
+      manifests: group.manifests,
+      files,
+    })
+  }
+
+  /// The revision at `at` of `range`, its delta read from `payload`.
+  fn revision<'p>(
+    &self,
+    payload: &'p [u8],
+    range: &Range<usize>,
+    at: usize,
+  ) -> Option<Revision<'p>> {
+    let index = range
+      .start
+      .checked_add(at)
+      .filter(|index| *index < range.end)?;
+    let found = self.revisions.get(index)?;
+    Some(Revision {
+      node: found.node,
+      p1: found.p1,
+      p2: found.p2,
+      base: found.base,
+      link: found.link,
+      flags: found.flags,
+      info: found.info,
+      protocol_flags: found.protocol_flags,
+      data: payload.get(found.data.clone())?,
+      sidedata: None,
+    })
+  }
+}
+
+/// A push's changegroup being taken into a fork of its repository's index (module docs): the changegroup's framing, as
+/// places in its bytes, which the caller keeps and lends each step (a push's driver, from the bundle; a replay, from
+/// the record), and what taking it has made so far.
+pub struct Intake {
   /// The changegroup's framing.
-  group: Changegroup<'g>,
+  frame: Frame,
+  /// What taking it has made so far.
+  taker: Taker,
+}
+
+/// What an intake has made so far: its fork, where it stands, and what it keeps across steps.
+struct Taker {
   /// The fork: the repository's revisions, and the push's as they are kept.
   fork: HgIndex,
   /// The unit next.
@@ -141,52 +254,59 @@ pub struct Intake<'g> {
   intaken: Intaken,
 }
 
-impl<'g> Intake<'g> {
-  /// Starts taking `part`'s changegroup into a fork of `index` (module docs), its framing decoded within `admission`.
+impl Intake {
+  /// Starts taking a changegroup of `version`, `payload` its bytes, into a fork of `index` (module docs), its framing
+  /// decoded within `admission`. Every step is lent the same bytes.
   pub fn begin(
-    part: &'g ChangegroupPart,
+    (version, payload): (Version, &[u8]),
     index: &mut HgIndex,
     store: &mut ContentStore,
     admission: &mut Admission,
   ) -> Result<Self, Refused> {
-    let group = Changegroup::decode(&part.payload, part.version, admission)
-      .map_err(Unverified::Changegroup)?;
-    if !group.trees.is_empty() {
-      return Err(Unverified::TreeManifests.into());
-    }
+    let frame = Frame::of(payload, version, admission)?;
     let fork = index.fork(store).map_err(Unindexed::Fork)?;
     Ok(Intake {
-      group,
-      fork,
-      stage: Stage::Changelog(0),
-      brought: BTreeSet::new(),
-      manifest_of: Vec::new(),
-      manifests: Vec::new(),
-      last: None,
-      logged: false,
-      intaken: Intaken::default(),
+      frame,
+      taker: Taker {
+        fork,
+        stage: Stage::Changelog(0),
+        brought: BTreeSet::new(),
+        manifest_of: Vec::new(),
+        manifests: Vec::new(),
+        last: None,
+        logged: false,
+        intaken: Intaken::default(),
+      },
     })
   }
 
-  /// Takes the next unit (module docs). Refused, the caller gives the fork back ([`Intake::abandon`]).
+  /// Takes the next unit of the changegroup whose bytes are `payload`, the ones it began with (module docs). Refused,
+  /// the caller gives the fork back ([`Intake::abandon`]).
   pub fn step(
     &mut self,
+    payload: &[u8],
     store: &mut ContentStore,
     admission: &mut Admission,
   ) -> Result<Stepped, Refused> {
-    match self.stage {
+    let Intake { frame, taker } = self;
+    match taker.stage {
       Stage::Changelog(at) => {
-        let next = self.group.group(&self.group.changelog).get(at).copied();
-        self.take_or(next, Log::Changelog, store, admission, Stage::Manifests(0))
+        let next = frame.revision(payload, &frame.changelog, at);
+        taker.take_or(
+          next,
+          Log::Changelog,
+          (store, admission),
+          Stage::Manifests(0),
+        )
       }
       Stage::Manifests(at) => {
-        let next = self.group.group(&self.group.manifests).get(at).copied();
+        let next = frame.revision(payload, &frame.manifests, at);
         let after = Stage::Files { file: 0, at: 0 };
-        self.take_or(next, Log::Manifest, store, admission, after)
+        taker.take_or(next, Log::Manifest, (store, admission), after)
       }
-      Stage::Files { file, at } => self.file_step(file, at, store, admission),
-      Stage::ManifestsPresent(at) => self.manifest_present(at, store),
-      Stage::FilesPresent(at) => self.files_present(at, store, admission),
+      Stage::Files { file, at } => taker.file_step((frame, payload), (file, at), store, admission),
+      Stage::ManifestsPresent(at) => taker.manifest_present(at, store),
+      Stage::FilesPresent(at) => taker.files_present(at, store, admission),
       Stage::Done => Ok(Stepped::Done),
     }
   }
@@ -194,8 +314,8 @@ impl<'g> Intake<'g> {
   /// The fork and what was brought, once every unit is taken; the intake itself (boxed: it is large) while there is
   /// more.
   pub fn finish(self) -> Result<(HgIndex, Intaken), Box<Self>> {
-    if self.stage == Stage::Done {
-      Ok((self.fork, self.intaken))
+    if self.taker.stage == Stage::Done {
+      Ok((self.taker.fork, self.taker.intaken))
     } else {
       Err(Box::new(self))
     }
@@ -203,16 +323,17 @@ impl<'g> Intake<'g> {
 
   /// Gives the fork back: the repository's index and the content store as they were before the intake began.
   pub fn abandon(self, store: &mut ContentStore) -> Result<(), IndexRefused> {
-    self.fork.release(store)
+    self.taker.fork.release(store)
   }
+}
 
+impl Taker {
   /// Takes `next` of `log`, or moves to `after` where its group has no more.
   fn take_or(
     &mut self,
-    next: Option<Revision<'g>>,
+    next: Option<Revision<'_>>,
     log: Log<'_>,
-    store: &mut ContentStore,
-    admission: &mut Admission,
+    (store, admission): (&mut ContentStore, &mut Admission),
     after: Stage,
   ) -> Result<Stepped, Refused> {
     let Some(revision) = next else {
@@ -228,43 +349,44 @@ impl<'g> Intake<'g> {
     Ok(Stepped::More)
   }
 
-  /// Moves to `stage`, a new log's: what the last one brought is let go.
-  fn enter(&mut self, stage: Stage) {
-    self.brought.clear();
-    self.last = None;
-    self.logged = false;
-    self.stage = stage;
-  }
-
   /// One step of the file groups: a group's path audited at its first revision, then its revisions; after the last
   /// group, the checks.
   fn file_step(
     &mut self,
-    file: usize,
-    at: usize,
+    (frame, payload): (&Frame, &[u8]),
+    (file, at): (usize, usize),
     store: &mut ContentStore,
     admission: &mut Admission,
   ) -> Result<Stepped, Refused> {
-    let Some(group) = self.group.files.get(file).cloned() else {
+    let Some((name, revisions)) = frame.files.get(file).cloned() else {
       self.enter(Stage::ManifestsPresent(0));
       return Ok(Stepped::More);
     };
+    let path = payload.get(name).ok_or(Unverified::TreeManifests)?;
     if at == 0 {
-      audit(group.name)?;
+      audit(path)?;
     }
-    let Some(revision) = self.group.group(&group.revisions).get(at).copied() else {
+    let Some(revision) = frame.revision(payload, &revisions, at) else {
       self.enter(Stage::Files {
         file: file.saturating_add(1),
         at: 0,
       });
       return Ok(Stepped::More);
     };
-    self.take(Log::File(group.name), &revision, store, admission)?;
+    self.take(Log::File(path), &revision, store, admission)?;
     self.stage = Stage::Files {
       file,
       at: at.saturating_add(1),
     };
     Ok(Stepped::More)
+  }
+
+  /// Moves to `stage`, a new log's: what the last one brought is let go.
+  fn enter(&mut self, stage: Stage) {
+    self.brought.clear();
+    self.last = None;
+    self.logged = false;
+    self.stage = stage;
   }
 
   /// Takes one revision of `log` (module docs): passed over, or checked, rebuilt and kept.
@@ -604,7 +726,7 @@ impl Rebase {
     rev: u32,
     store: &mut ContentStore,
   ) -> Result<(), Unindexed> {
-    let kept = crate::import::record::kept(&self.stale, store, log, rev).ok_or(
+    let kept = crate::import::record::kept(&self.stale, store, log, rev, true).ok_or(
       Unindexed::Index(crate::index::Refused::MissingLink { node: NULL_NODE }),
     )?;
     let node = kept.node;

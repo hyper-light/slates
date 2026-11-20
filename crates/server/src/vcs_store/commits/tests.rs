@@ -638,9 +638,11 @@ fn t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_
     let owed = staged_owed(state, repository);
     crate::vcs_store::rebuild(state, repository);
     crate::vcs_store::rebuild(state, repository);
+    crate::vcs_store::settle_rebuild(state, repository);
     crate::vcs_store::paths::whole_build::settle(state);
     let first = cloned(state, repository, "main");
     crate::vcs_store::rebuild(state, repository);
+    crate::vcs_store::settle_rebuild(state, repository);
     let again = cloned(state, repository, "main");
     let owing = state
       .vcs_stores

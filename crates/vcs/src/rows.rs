@@ -154,6 +154,12 @@ mod tests {
         width: WIDTH
       })
     ));
+    assert_zero_width_rows_and_an_absent_root_refused();
+  }
+
+  /// Rows of width zero: one row refused by its length, none read as none; and a root the store does not hold refused
+  /// `Missing`.
+  fn assert_zero_width_rows_and_an_absent_root_refused() {
     assert!(matches!(
       rows_of(&[], 1, 0),
       Err(RowsRefused::Length { .. })
