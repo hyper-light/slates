@@ -26,7 +26,9 @@
 //! tells this module two things on the home's own thread: [`image_begun`] when an image captures the shard's content
 //! table (the next image is the one after it), and [`image_published`] when it is durable. The wait runs as a task on
 //! the home (`crate::xshard::task_in_shard_time`), so the owner's request awaits it and no step ever waits. One barrier
-//! serves every window kept before it: group commit per shard, never a publication per push.
+//! serves every window kept before it: group commit per shard, never a publication per push. The daemon drives it at
+//! each publication it commits ([`publication_committed`], from `crate::content_holder::held_committed`): a publication
+//! captures and commits in one turn, so the image begins and is published at once.
 //!
 //! **In batches** ([`home_many`], [`read_many`], [`let_go_many`]; agreed with w-perf). A request's windows go to their
 //! homes in one cross-shard call a home shard a turn, never one a window: each call works through its items until the
@@ -125,6 +127,25 @@ pub(crate) fn image_published(generation: u64) {
   for waker in woken {
     waker.wake();
   }
+}
+
+/// Whether this shard's image of `generation` is published ([`image_published`]).
+pub(crate) fn published_here(generation: u64) -> bool {
+  IMAGES.with(|images| {
+    images
+      .try_borrow()
+      .is_ok_and(|images| images.published >= generation)
+  })
+}
+
+/// A publication of this shard's image committed (`crate::content_holder::held_committed`, the end of every checkpoint
+/// and delta `crate::verbs::publish_shard` commits): every window kept before it is in it, since a publication captures
+/// and commits in one turn of the shard's thread, so the image a ticket kept now names begins and is published at once,
+/// and a window kept after waits for the next.
+pub(crate) fn publication_committed() {
+  let generation = IMAGES.with(|images| images.try_borrow().map_or(1, |images| images.next));
+  image_begun(generation);
+  image_published(generation);
 }
 
 /// The ticket of a window kept on this shard now.
