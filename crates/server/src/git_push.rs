@@ -113,11 +113,9 @@ use slates_git::receive::{
   Reported, Repository as _, Request, Session, write_report,
 };
 use slates_git::refname;
-use slates_git::store::Incoming;
 use slates_git::store::hook_view::Quantum;
 use slates_git::store::learn::Clock;
 use slates_git::store::views::{IndexedObjects, PushedObjects};
-use slates_git::unpack::Object;
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::Increment;
 use slates_vcs::ContentStore;
@@ -440,7 +438,7 @@ impl<P> ReceivePack<P> {
   /// exchange ends the push.
   pub(crate) fn input(&mut self, state: &mut ShardState, bytes: &[u8]) -> Result<bool, PushFailed> {
     let began = slates_rt::futures::now_ns();
-    let read = self.intake(state, |session, site, admission| {
+    let read = self.intake(state, bytes, |session, site, admission| {
       session.input_into(bytes, site, admission)
     });
     let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -452,7 +450,7 @@ impl<P> ReceivePack<P> {
   /// push; a pack cut short is checked as git answers a short pack.
   pub(crate) fn end(&mut self, state: &mut ShardState) -> Result<bool, PushFailed> {
     let began = slates_rt::futures::now_ns();
-    let ended = self.intake(state, |session, site, admission| {
+    let ended = self.intake(state, &[], |session, site, admission| {
       session.end_into(site, admission)
     });
     charge_step(state, self.repository, began, 0);
@@ -460,11 +458,12 @@ impl<P> ReceivePack<P> {
   }
 
   /// Runs `call` of the session over the push's intake site, read only over the repository's index
-  /// and the quarantine, then admits what it resolved to the quarantine (`intake`'s module docs). A
-  /// store's refusal is kept to answer every command, and nothing more is admitted after it.
+  /// and the quarantine, then keeps the pack `input` brought and admits what it resolved to the quarantine (`intake`'s
+  /// module docs). A store's refusal is kept to answer every command, and nothing more is admitted after it.
   fn intake(
     &mut self,
     state: &mut ShardState,
+    input: &[u8],
     call: impl FnOnce(
       &mut Session<'static, PolicyHidden>,
       &mut intake::Intake<'_>,
@@ -497,6 +496,7 @@ impl<P> ReceivePack<P> {
     })?;
     match (quarantine.as_mut(), self.unadmitted.is_some()) {
       (Some(quarantine), false) => {
+        quarantine.keep_pack_to(session.pack_len(), input);
         if let Err(refused) = intake::admit_queued(state, quarantine, queue, admission) {
           self.unadmitted = Some(refused);
         }
@@ -520,7 +520,7 @@ impl<P> ReceivePack<P> {
     // admitted to the quarantine as an input's is.
     if self.session.is_resolving() {
       let ns = state.config.step_quantum_ns();
-      self.intake(state, |session, site, admission| {
+      self.intake(state, &[], |session, site, admission| {
         let mut clock = ShardClock;
         let quantum = Quantum {
           clock: &mut clock,
@@ -581,7 +581,6 @@ impl<P> ReceivePack<P> {
     out: &mut impl Out,
   ) -> Result<Begun, PushFailed> {
     let record = record_of(state, self.repository)?;
-    let pack = self.session.take_pack();
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       self.give_back(state);
@@ -589,7 +588,7 @@ impl<P> ReceivePack<P> {
       return Ok(Begun::Answering(Box::new(answering)));
     }
     let quarantine = (self.quarantine.take(), self.unadmitted.take());
-    match prepare(state, &record, checked, quarantine, pack)? {
+    match prepare(state, &record, checked, quarantine)? {
       Prepared::Declined(mut declining) => Ok(Begun::Answering(Box::new(
         self.declined(&mut declining, out)?,
       ))),
@@ -761,7 +760,14 @@ impl<P> ReceivePack<P> {
           None => true,
         }
       }
-      waiting @ (Homing::Asked(..) | Homing::Waiting(_)) => {
+      // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the names are given back
+      // and the record is version 2, never a decision waiting for a homing nobody runs.
+      Homing::Asked(_, (identity, _)) => {
+        crate::vcs_store::release_names(state, &identity);
+        crate::vcs_store::homes::count_untaken(state);
+        true
+      }
+      waiting @ Homing::Waiting(_) => {
         decision.homing = waiting;
         false
       }
@@ -1217,7 +1223,6 @@ fn prepare(
   record: &RepositoryRecord,
   checked: &Checked,
   (quarantine, unadmitted): (Option<GitPush>, Option<GitRefused>),
-  pack: Vec<u8>,
 ) -> Result<Prepared, PushFailed> {
   let quarantine = match quarantine {
     Some(quarantine) => quarantine,
@@ -1228,13 +1233,12 @@ fn prepare(
     return Ok(Prepared::Declined(Declining::unadmitted(&refused)));
   }
   let judged = checked.early.iter().any(Option::is_none);
-  let mut push = if judged {
+  let push = if judged {
     quarantine
   } else {
     quarantine.abandon(state);
     GitPush::begin(&state.vcs_stores, record.id).ok_or(PushFailed::NoStore)?
   };
-  push.keep_pack(pack);
   match push.sealing(state) {
     Ok(sealing) => Ok(Prepared::Sealing {
       sealing: Box::new(sealing),
@@ -1379,17 +1383,6 @@ fn git_hook(record: &RepositoryRecord) -> Option<&HookConfig> {
     .hooks
     .iter()
     .find(|hook| hook.point.tool() == VcsTool::Git)
-}
-
-/// `object` as the store admits it (A-614's `Incoming`): claimed by the id the pack reader named it by, at the depth of
-/// the delta chain the client's pack stored it at.
-fn incoming_of(object: &Object) -> Incoming<'_> {
-  Incoming {
-    kind: object.kind,
-    claimed: Some(object.id),
-    content: &object.content,
-    depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
-  }
 }
 
 /// The push's name (module docs): its repository, then each command's old and new ids and its ref, the ref's length

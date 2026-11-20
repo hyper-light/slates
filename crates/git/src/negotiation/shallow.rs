@@ -326,7 +326,7 @@ impl<N: Copy + Ord + Into<u64> + TryFrom<u64>> Cutting<N> {
       } => {
         let Some(commit) = frontier.pop() else {
           if next.is_empty() {
-            let found = core::mem::replace(found, (BTreeSet::new(), Held::default()));
+            let found = core::mem::take(found);
             self.walk = Walk::Finish(found);
           } else {
             core::mem::swap(frontier, next);

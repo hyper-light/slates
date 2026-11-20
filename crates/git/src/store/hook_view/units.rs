@@ -263,7 +263,7 @@ pub(super) fn build(
     units.push(lay_out(format, PackKind::Rest, &[], objects, admission)?);
   }
   if let Some(push) = push {
-    let objects = pushed(push)?;
+    let objects = pushed(repository, store, push)?;
     counters.pushed = counters.pushed.saturating_add(to_u64(objects.len()));
     units.push(lay_out(format, PackKind::Pushed, &[], objects, admission)?);
   }
@@ -323,16 +323,28 @@ fn objects_at(
     .collect()
 }
 
-/// The push's objects, in their names' order.
-fn pushed(push: &Push) -> Result<Vec<Object>, ViewRefused> {
+/// The push's objects, in their names' order, each read from the content store: where the push holds it there, or
+/// where its staging put it (a sealed push's objects new to the repository; `Push::put_placed`), or, for an object the
+/// repository held already, the repository's.
+fn pushed(
+  repository: &Repository,
+  store: &ContentStore,
+  push: &Push,
+) -> Result<Vec<Object>, ViewRefused> {
   push
     .held()
-    .map(|(id, number, content, len)| {
-      let format = push.format();
+    .map(|(id, held)| {
+      let content = match push.stored(&id) {
+        Some(content) => content,
+        None => repository
+          .stored(store, &id)
+          .map(|(_, content, _)| content)
+          .ok_or(ViewRefused::PushUnreadable)?,
+      };
       Ok(Object {
-        id: ObjectId::from_bytes(format, id).ok_or(ViewRefused::PushUnreadable)?,
-        kind: kind_of(number).ok_or(ViewRefused::PushUnreadable)?,
-        len,
+        id,
+        kind: kind_of(held.number).ok_or(ViewRefused::PushUnreadable)?,
+        len: held.len,
         content,
       })
     })

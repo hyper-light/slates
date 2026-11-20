@@ -15463,3 +15463,109 @@ median:
   and gone by point 77, is the same kind.
 - So the creep is not bisectable to a fix. What would hold it is an instruction-count gate on the lone submit (§5's
   iai-callgrind gate, which counts work, not layout), owed.
+
+## Mercurial's history held as changesets or as per-file deltas, counted (Ada's ruling of 2026-11-20 ~13:35; main's A/B order; UI goal 93; 2026-11-20)
+
+**The question.** A push of hg's own history kept every file revision as a whole text in the content store: 4,495.5 MiB
+committed (`slates status`, release at 1d4909821, big Studio) for a 162 MB uncompressed bundle and an 84 MB stock
+store. Ada ruled the changeset the unit, every other form derived. Before either shape is built, both were counted.
+
+**Commands** (big Studio, macOS arm64, 32 cores; Mercurial 7.2 through `uvx`; scripts kept beside the checkouts in
+`~/.cache/w-hg-ab/`, run with `uvx -q --from mercurial==7.2 python -I`):
+- `changeset_ab.py ~/.cache/w-hg-mem/hg 256,1024,4096 2000` (2026-11-20 12:26 PST, load 11.2): bytes and sampled old
+  reads for A and for B with tree checkpoints.
+- `checkpoint_texts.py ... 256,1024,4096`: the whole texts the tree checkpoints name, each once.
+- `perfile_b.py ... 2000`: B with per-file wholes.
+- Stock reference: `hg serve` on loopback, then `hg clone -q -U http://...` of the same history, the server's RSS
+  sampled every 0.5 s.
+
+**The data.** hg's history at 57,054 changesets (tip 57,053): 4,243 paths and 115,479 file revisions. All of them as
+whole texts come to 4,296.9 MiB. Deltas are `mdiff.textdiff` (Mercurial's own bdiff), uncompressed. Old reads are
+2,000 sampled (path, changeset touching it) pairs, seeded 20261120.
+
+| Shape | Held, uncompressed | Old read: deltas applied p50 / p99 / max | Bytes read p50 / p99 |
+|---|---|---|---|
+| Whole texts (a push's store today) | 4,296.9 MiB | 0 | whole |
+| A per-file deltas, chain ≤ text length | 145.7 MiB (7,423 whole, 108,056 deltas) | 14 / 205 / 572 | 20 KB / 398 KB |
+| B changesets + tree checkpoints, K=256 | 103.2 + 1,057.4 MiB of checkpoint texts | 2 / 48 / 105 | 0.6 KB / 46 KB + text |
+| B, K=1024 | 96.1 + 499.8 MiB | 4 / 121 / 301 | 1.5 KB / 90 KB + text |
+| B, K=4096 | 94.3 + 190.5 MiB | 9 / 405 / 987 | 5.4 KB / 305 KB + text |
+| B changesets + per-file wholes, chain ≤ text length | ≈ 137 MiB (edits 68.6, new files 25.1, 43.7 more wholes) | 15 / 350 / 661 | 20 KB / 361 KB |
+| Stock hg 7.2 store (zlib revlogs) | 84 MiB on disk | | |
+
+Stock `hg clone -U` over HTTP took 283 s at load 11, and `hg serve` peaked at 111 MiB.
+
+**Decided by these counts** (provisional, main's ruling): B with per-file wholes. The changeset as the unit costs
+nothing in bytes against per-file deltas (≈ 137 against 146 MiB), and a file is made whole again where its own edit
+chain passes its length. That bound is derived from the data, not picked. Tree checkpoints cost 0.2 to 1 GB in the
+whole texts they name for shorter reads, and are rejected (measured-and-rejected, these rows).
+
+**Release timings** (`cargo build --release -p slates-hg --example changeset_ab`, then
+`/usr/bin/time -l changeset_ab ~/.cache/w-hg-mem/hg <A|B> 2000`. Big Studio, 2026-11-20 14:07 PST, load 12 to 16; N=1
+run an arm, 2,000 old reads each, every rebuilt text checked against its BLAKE3 and length):
+- Both arms hold Mercurial's own deltas: each file revision's revlog chunk against its recorded base, no diff at the
+  server. A keeps them per file in revision order; B in changeset order (grouped by link), a file's revisions found
+  through its path history.
+- The history read has 114,732 file revisions, 94.0 MiB of chunks. Every text was rebuilt and hashed once: 59.5 s
+  (A) and 57.2 s (B) of reading the source, the same work for both. Laying out the arm took 0.04 s.
+- Peak RSS 572 MiB (A) and 619 MiB (B). That includes the leaked source revlogs and every read chunk, an example's
+  ceiling, not a server's.
+- Old reads go through a fresh 64-segment cache each (a cold read). The clone's file section is every revision, file by
+  file, through one 64-segment cache.
+
+| Arm, form (64 KiB segments) | Held | Old read µs p50 / p99 / max | Segments decoded a read p50 / p99 | Clone file section, decodes |
+|---|---|---|---|---|
+| A raw | 94.0 MiB | 23 / 3,807 / 11,837 | 2 / 10 | 0.03 s, 5,251 |
+| A LZ4 | 36.2 MiB | 58 / 4,062 / 9,355 | 2 / 10 | 0.15 s, 5,251 |
+| A zstd 1 | 26.6 MiB | 91 / 3,716 / 10,091 | 2 / 10 | 0.27 s, 5,251 |
+| A zstd 3 | 25.2 MiB | 88 / 3,690 / 7,731 | 2 / 10 | 0.27 s, 5,251 |
+| A zstd 9 | 23.1 MiB (encoded in 1.39 s) | 86 / 4,421 / 10,454 | 2 / 10 | 0.28 s, 5,251 |
+| B raw | 94.0 MiB | 56 / 2,993 / 4,458 | 20 / 272 | 0.08 s, 52,511 |
+| B LZ4 | 38.7 MiB | 461 / 8,361 / 11,273 | 20 / 272 | 1.10 s, 52,511 |
+| B zstd 1 | 28.5 MiB | 864 / 13,029 / 18,375 | 20 / 272 | 2.11 s, 52,511 |
+| B zstd 3 | 27.1 MiB | 874 / 13,214 / 17,569 | 20 / 272 | 2.13 s, 52,511 |
+| B zstd 9 | 25.1 MiB (encoded in 1.07 s) | 859 / 12,964 / 18,392 | 20 / 272 | 2.10 s, 52,511 |
+
+What it says:
+- Compressed, either arm holds hg's history in a third of stock's 84 MiB store (zstd 1: 26.6 and 28.5 MiB).
+- Changeset order costs locality once the log is compressed. A file's chain is scattered across the changesets that
+  made it, so an old read decodes 10 times the segments, about 0.9 ms against 0.09 ms at p50 under zstd 1. A clone's
+  file section, streamed file by file, decodes 52,511 segments against 5,251: 2.1 s against 0.27 s.
+- Raw, B's reads are no slower: 56 against 23 µs at p50, and 2,993 against 3,807 µs at p99.
+- Against stock's 283 s clone and the goal's 28 s, even B's 2.1 s is small.
+- zstd 3 and 9 save 1 to 4 MiB over zstd 1 at the same decode cost.
+
+Owed: the full clone over the wire (changesets, manifests derived, files) and an import's RSS in the daemon, once
+the shape is built there. And N=3 an arm on a quiet machine.
+
+## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
+
+- **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
+  from a `git archive` of its commit into one directory with fresh mtimes, into a target directory of its own; the
+  binaries differ. Before the rounds, one push on each: v2 counts no homing; v3 counts `homes.homed_in_region` 1 and
+  `homes.published_for_ticket` 1 (git/git v1.0.0's 12,232 names, about 500 KB, past one window: homed whole by its BLAKE3).
+- **The command:** `crates/cli/bench/push_load.py SLATES ~/.cache/g309-scale/src.git 'v1.0.0^{commit}' --max 10`
+  (a fresh daemon a run: 1 push, then 10 at once, each to its own repository), v2 and v3 alternating, ten rounds.
+  Studio-2 (Adas-Mac-Studio-2, 14 cores), load 5.0 to 6.5 with other agents' work: one node, so the names' one home is
+  the owner's own shard and the cost is the local keep and one publication of its shard (its delta).
+
+| round | v2 1 push | v3 1 push | v2 10, p50 | v3 10, p50 | v2 10, p99 | v3 10, p99 |
+|---|---|---|---|---|---|---|
+| 1 | 1.605 | 1.735 | 2.525 | 2.496 | 3.277 | 2.838 |
+| 2 | 1.399 | 1.125 | 2.004 | 1.544 | 2.890 | 2.608 |
+| 3 | 1.186 | 1.274 | 1.487 | 1.688 | 2.577 | 2.714 |
+| 4 | 1.330 | 1.359 | 1.967 | 1.872 | 2.782 | 2.812 |
+| 5 | 1.105 | 1.679 | 1.552 | 3.126 | 2.698 | 3.721 |
+| 6 | 1.255 | 0.995 | 1.634 | 1.403 | 2.770 | 2.560 |
+| 7 | 2.355 | 1.498 | 2.837 | 1.904 | 3.267 | 3.218 |
+| 8 | 2.074 | 1.887 | 2.651 | 2.417 | 3.392 | 2.966 |
+| 9 | 1.859 | 1.719 | 2.359 | 2.246 | 3.403 | 3.500 |
+| 10 | 1.198 | 1.403 | 1.710 | 1.825 | 2.878 | 3.116 |
+
+- **What it says.** Best of ten: one push 1.105 s (v2) against 0.995 s (v3); ten at once, p50 1.487 s against 1.403 s, p99
+  2.577 s against 2.560 s. Medians: 1.365 s against 1.451 s; 1.986 s against 1.888 s; 2.884 s against 2.902 s. The
+  difference is inside the rounds' own spread on a loaded host (round to round the same build moves by up to 1.2 s):
+  the barrier's publication costs a single node nothing measurable here. Across nodes the homing adds a region round
+  trip per push (the takeover test's three nodes: each survivor served 19 region exchanges for three pushes and their
+  heals); a three-node release A/B is owed.
+

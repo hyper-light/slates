@@ -4958,6 +4958,7 @@ async fn init_shard(
     destroy_retry_at: None,
     scatters: std::collections::BTreeMap::new(),
     grant_scatters: std::collections::BTreeMap::new(),
+    log_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
     recovered,
     booted_ns: now,

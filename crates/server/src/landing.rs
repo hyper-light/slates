@@ -265,7 +265,18 @@ pub fn land_verb(
   principal: &Principal,
   call: LandCall<'_>,
 ) -> ReplyBody {
-  // A merge volume has no store-backed snapshot to land (§4.16; the extent-backed green is owed).
+  // A green lands its head through its store-backed view (A-774), under the grant any volume's landing takes; a work
+  // lands through its green.
+  let id = crate::verbs::to_db_volume(call.volume);
+  if matches!(
+    crate::merge_service::merge_role(state, id),
+    Some(crate::merge_service::MergeRole::Green { .. })
+  ) {
+    if let Err(refusal) = crate::mounted_work::ensure_green_view(state, id, call.snapshot) {
+      return crate::verbs::refused(refusal);
+    }
+    return land_verb_os(state, client_id, principal, call);
+  }
   if let Some(reply) = crate::merge_service::refuse_store_verb(
     state,
     call.volume,

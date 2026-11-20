@@ -182,6 +182,7 @@ Op 99 CredentialEnrolled
 Op 100 CredentialRevoked
 Op 101 RepositoryRebuilt
 Op 102 RepositoryIndexCut
+Op 103 CredentialTombstoned
 PlacementState 0 Local
 PlacementState 1 Placed
 PolicyEffect 0 Allow

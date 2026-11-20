@@ -156,6 +156,13 @@ impl VolumeSet for ShardVolumeSet {
   fn entries(&self) -> Vec<(String, VolumeId)> {
     let capability = self.capability;
     state::with_state(|s| {
+      // A work mounts like any volume (A-774): its capability's volume gets its slot here, at the mount's first look.
+      if let Some((attachment, _)) = capability
+        && let Some(record) = s.db.partition().attachment(attachment)
+      {
+        let volume = record.volume;
+        crate::mounted_work::ensure_slot(s, volume);
+      }
       // List each volume under its provisioned mount name (its slot's `name`), so `ls /` shows friendly
       // names and `cd <name>` resolves by matching it (`MultiExport`) — but only the volume the presented
       // mount capability authorizes (§4.13; AUD-01). Without a capability nothing is listed: a volume
@@ -336,6 +343,8 @@ fn with_export<R>(
   capability: MountCapability,
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
+  // A mounted work's slot, made again after a restart (A-774).
+  crate::mounted_work::ensure_slot(s, volume);
   let handle = *s.by_id.get(&volume)?;
   crate::verbs::relieve_deferred(s);
   let write_verifier = s.write_verifier;

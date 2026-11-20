@@ -748,6 +748,17 @@ pub struct ShardState {
       Vec<crate::verbs::PagePart<slates_ipc::protocol::GrantSummary>>,
     ),
   >,
+  /// Session log reads in flight (A-773): each shard holds its works and its landings awaiting a grant, so the read is
+  /// a scatter-gather like the grants, by request word, the client slot, the shards still to answer, and the parts so
+  /// far, each at most a page.
+  pub(crate) log_scatters: BTreeMap<
+    u64,
+    (
+      u32,
+      usize,
+      Vec<crate::verbs::PagePart<slates_ipc::protocol::LogLine>>,
+    ),
+  >,
   /// Every shard of the daemon, for the scatter.
   pub shards: Vec<u16>,
   /// What the last start's recovery found (the status reports it).
@@ -1425,6 +1436,10 @@ pub struct WorkState {
   /// number is bounded by the journal the merge budget charges; a restart forgets it, and a read of it is then refused
   /// `VerdictReplaced`.
   pub verdict: Option<KeptVerdict>,
+  /// The green version the work's last accepted submission made (A-773, the session log's mark): the work stands on it
+  /// while `base_version` equals it, and a rebase that moves the work past it leaves the work open again. Kept in RAM
+  /// with the work, as its verdict is; a restart forgets it.
+  pub accepted: Option<u64>,
 }
 
 /// A work's kept conflicting verdict (§4.16, A-267): its id, which the `Submitted` or `Rebased` reply named, and every
