@@ -18,6 +18,15 @@ use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use std::collections::BTreeMap;
 
+/// A budget of `room` bytes and as many steps, untimed: a slice as the readers' callers gave one before A-751's quantum.
+fn untimed(room: usize) -> crate::report::exchange::Budget {
+  crate::report::exchange::Budget {
+    room,
+    steps: room,
+    quantum: None,
+  }
+}
+
 /// A transaction name of the form §4.17.4 item 3.1 gives.
 const TRANSACTION: &str = "0-1z";
 
@@ -376,7 +385,13 @@ fn drained(
   };
   loop {
     match stream
-      .resume(&fixture.index, &fixture.green, session, out, SLICE_ROOM)
+      .resume(
+        &fixture.index,
+        &fixture.green,
+        session,
+        out,
+        untimed(SLICE_ROOM),
+      )
       .unwrap()
     {
       Progress::More => {}
@@ -1006,14 +1021,26 @@ fn streamed<R: Repository>(
   };
   let mut slices = 1;
   while stream
-    .resume(&fixture.index, repository, &ROOT_SESSION, &mut out, room)
+    .resume(
+      &fixture.index,
+      repository,
+      &ROOT_SESSION,
+      &mut out,
+      untimed(room),
+    )
     .unwrap()
     == Progress::More
   {
     slices += 1;
   }
   let whole = out.len();
-  let again = stream.resume(&fixture.index, repository, &ROOT_SESSION, &mut out, room);
+  let again = stream.resume(
+    &fixture.index,
+    repository,
+    &ROOT_SESSION,
+    &mut out,
+    untimed(room),
+  );
   assert_eq!((again, out.len()), (Ok(Progress::Done), whole));
   (outcome, out, slices)
 }
@@ -2052,7 +2079,13 @@ fn hostile_command_holds(command: &str) -> Result<(), TestCaseError> {
   };
   let mut slices = 0_usize;
   while stream
-    .resume(&fixture.index, &fixture.green, &ROOT_SESSION, &mut out, 1)
+    .resume(
+      &fixture.index,
+      &fixture.green,
+      &ROOT_SESSION,
+      &mut out,
+      untimed(1),
+    )
     .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?
     == Progress::More
   {
@@ -2422,7 +2455,7 @@ fn items_log(fixture: &Fixture, case: &LogCase, rules: Option<&PrincipalRules>) 
       &fixture.green,
       &session,
       &mut out,
-      SLICE_ROOM,
+      untimed(SLICE_ROOM),
     )
     .unwrap()
     == Progress::More
@@ -2699,4 +2732,118 @@ fn the_lock_reads_answer_from_the_lock_table_as_svnserve_writes_them() {
     ),
   ];
   assert_eq!(answers, expected);
+}
+
+thread_local! {
+  /// [`tick`]'s clock.
+  static TICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A clock one nanosecond on at every reading: a quantum of one has run by the first step's end.
+fn tick() -> u64 {
+  TICKS.with(|ticks| {
+    let now = ticks.get().wrapping_add(1);
+    ticks.set(now);
+    now
+  })
+}
+
+/// A budget of one step a call: room past any answer, a quantum that has run by the first step's end.
+const ONE_STEP: crate::report::exchange::Budget = crate::report::exchange::Budget {
+  room: usize::MAX,
+  steps: 1,
+  quantum: Some(crate::report::exchange::Quantum {
+    now_ns: tick,
+    ns: 1,
+  }),
+};
+
+/// A-751, main's red for `get-file-revs` ("a window in units through the same encoder, red first with the past-budget
+/// counter at 0, bytes equal to today's"), held by units, which contention cannot blur. Do: over the report fixtures'
+/// repository, ask `get-file-revs` of `/trunk/big.txt` (6,000 lines, several windows) from r5, where it is added, to r6,
+/// where it is edited, over svn:// in svndiff 0 and in svndiff 2 with LZ4, and as DAV's `file-revs-report`, a step a
+/// call. Expect: no window step past `WINDOW_STEP_UNITS` units, a step for every `STEP_WORK` bytes of the texts at
+/// least; each revision's delta the stream the whole-window path made (`big_text_stream`: r5's from no text, r6's from
+/// r5's), its strings over svn:// and its base64 over DAV. Red before the change: a revision's whole delta was made and
+/// written in one step.
+#[test]
+fn a_large_texts_file_revisions_are_sent_with_no_step_past_its_budget() {
+  use crate::report::drive::tests::{big_text_stream, big_texts};
+  use crate::report::drive::{STEP_WORK, WINDOW_STEP_UNITS, take_most_window_units};
+  use crate::svndiff::{Compression, Version};
+  let (index, green, five, six) = big_texts();
+  let least_steps = (five.len() + six.len()) / STEP_WORK;
+  let command = items(b"( get-file-revs ( 13:trunk/big.txt ( 5 ) ( 6 ) ) ) ").remove(0);
+  for (session, encoding) in [
+    (&SVNDIFF0_SESSION, (Version::Zero, Compression::Stored)),
+    (&ROOT_SESSION, (Version::Two, Compression::Lz4)),
+  ] {
+    let mut out = Vec::new();
+    let Outcome::Streaming(mut stream) =
+      answer(&index, &green, session, &command, &mut out).unwrap()
+    else {
+      panic!("not streamed");
+    };
+    let (mut most, mut window_steps) = (0usize, 0usize);
+    take_most_window_units();
+    while stream
+      .resume(&index, &green, session, &mut out, ONE_STEP)
+      .unwrap()
+      == Progress::More
+    {
+      let units = take_most_window_units();
+      most = most.max(units);
+      window_steps += usize::from(units > 0);
+    }
+    let deltas: Vec<(u64, Vec<u8>)> = file_revisions_sent(&out)
+      .into_iter()
+      .map(|(revision, strings)| (revision, strings.concat()))
+      .collect();
+    assert!(
+      deltas
+        == [
+          (5, big_text_stream((None, &five), encoding)),
+          (6, big_text_stream((Some(&five), &six), encoding)),
+        ],
+      "{encoding:?}: the deltas"
+    );
+    assert_eq!(
+      (most <= WINDOW_STEP_UNITS, window_steps >= least_steps),
+      (true, true),
+      "{encoding:?}: most units {most}, window steps {window_steps}"
+    );
+  }
+  let report = crate::dav::listing::FileRevsReport {
+    path: String::from("trunk/big.txt"),
+    start: Some(5),
+    end: Some(6),
+    include_merged_revisions: false,
+  };
+  let mut revisions = crate::reads::DavFileRevs::new(&report, "/");
+  let (mut out, mut most, mut window_steps) = (Vec::new(), 0usize, 0usize);
+  take_most_window_units();
+  while revisions.resume(&index, &green, None, &mut out, ONE_STEP)
+    == crate::reads::DavLogProgress::More
+  {
+    let units = take_most_window_units();
+    most = most.max(units);
+    window_steps += usize::from(units > 0);
+  }
+  let text = String::from_utf8(out).unwrap();
+  for (from, to) in [(None, &five), (Some(&five), &six)] {
+    let stream = big_text_stream(
+      (from.map(Vec::as_slice), to),
+      (Version::Zero, Compression::Stored),
+    );
+    let base64 = crate::dav::xml::base64_lines(&stream).replace('\n', "");
+    assert!(
+      text.contains(&format!("<S:txdelta>{base64}</S:txdelta>")),
+      "DAV: a delta"
+    );
+  }
+  assert_eq!(
+    (most <= WINDOW_STEP_UNITS, window_steps >= least_steps),
+    (true, true),
+    "DAV: most units {most}, window steps {window_steps}"
+  );
 }

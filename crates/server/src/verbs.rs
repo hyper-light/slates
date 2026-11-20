@@ -18230,6 +18230,8 @@ const WORK_REBUILD_ASK_REFUSED: &str = "merge.work_rebuild_ask_refused";
 /// this shard holds is replayed here. Each message waits for room on its target's channel while that shard lives
 /// (`xshard::run_on_waiting`), so one is lost only with its shard, counted.
 pub(crate) fn ask_owners_to_replay(state: &mut ShardState) {
+  // The holder creations a restart held for their release at the green's owner ask for it now too (A-697 part e2).
+  crate::work_home::release_admissions(state);
   let here = state.shard;
   for unbuilt in state.work_home.unbuilt.clone() {
     let entries = state.db.partition().work_log(unbuilt.work).to_vec();

@@ -173,8 +173,10 @@ pub(super) fn history(repository: &Repository) -> History {
       for identity in named(change) {
         let bytes = repository
           .content(&identity)
+          .map(<[u8]>::to_vec)
+          .or_else(|| repository.text(&identity).map(std::borrow::Cow::into_owned))
           .expect("a content the index names");
-        contents.insert(identity, bytes.to_vec());
+        contents.insert(identity, bytes);
       }
     }
     revisions.push(RevisionView {

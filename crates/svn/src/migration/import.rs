@@ -484,16 +484,16 @@ impl Importer {
       .as_ref()
       .and_then(|revision| revision.transaction.as_ref())
       .ok_or(MigrationRefusal::Corrupt)?;
-    let base: &[u8] = match open.form {
+    let base: std::borrow::Cow<'_, [u8]> = match open.form {
       TextForm::Delta {
         base: Some(identity),
       } => transaction
         .content(repository, &identity)
         .ok_or(MigrationRefusal::Corrupt)?,
-      TextForm::Delta { base: None } => &[],
+      TextForm::Delta { base: None } => std::borrow::Cow::Borrowed(&[]),
       TextForm::Whole => return Err(MigrationRefusal::Corrupt),
     };
-    let view = source_view(base, window.source_offset, window.source_len)
+    let view = source_view(&base, window.source_offset, window.source_len)
       .ok_or(MigrationRefusal::Delta(SvndiffError::SourceShort))?;
     apply(window, view, &mut open.bytes).map_err(MigrationRefusal::Delta)
   }
@@ -739,7 +739,7 @@ fn list_of(
     PropertyList::Empty => Ok(Properties::new()),
     PropertyList::Held { identity, .. } => transaction
       .content(repository, &identity)
-      .and_then(super::properties::decode)
+      .and_then(|bytes| super::properties::decode(&bytes))
       .ok_or(MigrationRefusal::Corrupt),
   }
 }

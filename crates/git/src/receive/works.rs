@@ -13,8 +13,10 @@
 //!   work is built;
 //! - its work is A-618's: the whole-file operations between that version's tree and the tree the
 //!   new value names, and the head operation (items 2 and 3);
-//! - a create is made at the version of a green its new value's first parent heads, where one can
-//!   still be branched from, else at the default branch's head ([`Greens::base_of_create`]), and
+//! - a create is made at the version of a green its new value heads, where one can still be branched
+//!   from, its work then empty ([`Greens::holding_head`], A-753); else at the version of a green its new
+//!   value's first parent heads, where one can still be branched from, else at the default branch's
+//!   head ([`Greens::base_of_create`]), and
 //!   its work states the whole difference against that version's tree, so the new green holds
 //!   exactly the client's tree; in a repository whose default branch is unborn, over an empty
 //!   green. A create of a ref that names a green is a ref that moved, as git's lock refuses a ref
@@ -119,6 +121,18 @@ pub trait Greens {
     parent: Option<&ObjectId>,
     with: impl FnOnce(GreenRead<'_>, Version) -> T,
   ) -> Option<T>;
+
+  /// Runs `with` over the green and version whose head is `head` itself, where one can still be branched from: what a
+  /// create of a ref at a commit another branch holds is made at, its work empty (A-753: a hundred branches created at
+  /// one commit held its whole tree a hundred times in the partition's chains, past their budget at the eightieth).
+  /// None where no green holds it, the create then made as [`Greens::base_of_create`] says.
+  fn holding_head<T>(
+    &self,
+    _head: &ObjectId,
+    _with: impl FnOnce(GreenRead<'_>, Version) -> T,
+  ) -> Option<T> {
+    None
+  }
 }
 
 /// What a command's verdict carries to its append: one entry for a green's own log (A-642).
@@ -429,14 +443,18 @@ where
 
   /// A create's work, against the version it is made at, or over an empty green (module docs).
   fn create(&self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
-    let parent = self.first_parent(&command.new, pushed);
-    let made = self
-      .greens
-      .base_of_create(parent.as_ref(), |read, version| {
-        self
-          .work(command, pushed, read.green, Some(version))
-          .map(|increment| (Some((read.id, version.number)), increment))
-      });
+    let at = |read: GreenRead<'_>, version: Version| {
+      self
+        .work(command, pushed, read.green, Some(version))
+        .map(|increment| (Some((read.id, version.number)), increment))
+    };
+    let made = match self.greens.holding_head(&command.new, at) {
+      Some(made) => Some(made),
+      None => {
+        let parent = self.first_parent(&command.new, pushed);
+        self.greens.base_of_create(parent.as_ref(), at)
+      }
+    };
     let (from, increment) = match made {
       Some(made) => made?,
       None => (None, self.work(command, pushed, &Green::new(), None)?),

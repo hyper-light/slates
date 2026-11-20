@@ -2234,22 +2234,52 @@ fn append_entry(
   payload: Vec<u8>,
   anchors: Option<Vec<u64>>,
 ) -> Result<(), NotAppended> {
+  append_entry_with(state, id, (whole, image_now), payload, anchors, None)
+}
+
+/// [`append_entry`] for a whole build's entry, whose identity `hashed` was hashed in the build's turns (A-757 part 2).
+fn append_entry_hashed(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  payload: Vec<u8>,
+  anchors: Option<Vec<u64>>,
+  hashed: Option<slates_db::live::EntryHasher>,
+) -> Result<(), NotAppended> {
+  append_entry_with(state, id, (true, false), payload, anchors, hashed)
+}
+
+/// [`append_entry`]'s body: a whole entry with `hashed` appends with that identity.
+fn append_entry_with(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  (whole, image_now): (bool, bool),
+  payload: Vec<u8>,
+  anchors: Option<Vec<u64>>,
+  hashed: Option<slates_db::live::EntryHasher>,
+) -> Result<(), NotAppended> {
   let referenced = referenced_bytes(state, id);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return Err(NotAppended::Gone);
   };
   // A whole record is a checkpoint and may go one past the credit (`Shipper::append_checkpoint`); a delta waits for it.
+  // The head alone back: the entry stays in the retained tail, and its identity is hashed once (w-forming,
+  // 2026-11-20: asked here twice more, each a copy and a hash of the payload).
   let appended = if whole {
-    live.shipper.append_checkpoint(payload.clone())
+    match hashed {
+      Some(hashed) => live
+        .shipper
+        .append_checkpoint_hashed(payload.clone(), hashed),
+      None => live.shipper.append_checkpoint_kept(payload.clone()),
+    }
   } else {
-    live.shipper.append(payload.clone())
+    live.shipper.append_kept(payload.clone())
   };
-  let entry = appended.map_err(NotAppended::Refused)?;
+  let head = appended.map_err(NotAppended::Refused)?;
   let published_ns = live
     .publishing_ns
     .take()
     .unwrap_or_else(slates_machine::clock::monotonic_ns);
-  live.newest = Some((entry.head().position, published_ns));
+  live.newest = Some((head.position, published_ns));
   let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
   if whole {
     live.owes_whole = false;
@@ -2263,7 +2293,6 @@ fn append_entry(
   // where later publications are captured past it (A-377); the record period makes it once the volume is clean.
   let image_owed = live.owes_image && !whole && image_now;
   if whole {
-    let head = entry.head();
     live.shipper.mark_checkpoint(head);
     // Derived (AC-8.9, A-200 amended 2026-11-17): the credit and the retained tail are both this whole record's
     // size, the install a laggard would be sent instead: the deltas outstanding never cost more than the whole
@@ -2332,6 +2361,14 @@ struct WholeBuild {
   queued: VecDeque<Queued>,
   /// The bytes of the deltas in `queued`: held to the credit, as their entries would be.
   queued_bytes: usize,
+  /// The bytes sealed so far and the clock time their seals took, the rate the next piece is sized by
+  /// ([`piece_bytes`]).
+  seal_rate: (u64, u64),
+  /// Once every piece is sealed: the whole entry's payload, joined once, and its identity's hasher, fed a slice a turn
+  /// at the rate `hash_rate` measures ([`hash_whole_turn`], A-757 part 2).
+  hashing: Option<(Vec<u8>, slates_db::live::EntryHasher)>,
+  /// The bytes hashed so far and the clock time their hashing took.
+  hash_rate: (u64, u64),
 }
 
 impl std::fmt::Debug for WholeBuild {
@@ -2421,6 +2458,9 @@ fn begin_whole_build_with(
     appended: false,
     queued,
     queued_bytes,
+    seal_rate: (0, 0),
+    hashing: None,
+    hash_rate: (0, 0),
   }));
   state.count(LIVE_WHOLE_BUILDS, 1);
   if advance_whole_build(state, id) == Advance::Done {
@@ -2447,9 +2487,27 @@ async fn whole_build_task(id: slates_db::catalog::VolumeId) {
   }
 }
 
+/// The bytes of a whole build's next piece: what the seal rate measured so far in the build (`(bytes, ns)`) seals in the
+/// turn's quantum `left`, at least `floor` (one archive page, so every turn moves the build on and a piece's name and tag
+/// stay a small share of it) and at most `cap` (an archive chunk); `floor` before any rate is measured. Until 2026-11-20 a
+/// turn sealed whole chunks, a MiB at least however small its quantum: 87 to 302 ms of the owner shard's CPU a turn
+/// against quanta of 14 to 784 us in a debug fleet under `taskpolicy -b` (w-forming's probes; A-377's bound).
+fn piece_bytes((bytes, ns): (u64, u64), left: u64, floor: usize, cap: usize) -> usize {
+  if bytes == 0 || ns == 0 {
+    return floor.min(cap);
+  }
+  let fits = u128::from(bytes)
+    .saturating_mul(u128::from(left))
+    .checked_div(u128::from(ns))
+    .unwrap_or(0);
+  usize::try_from(fits)
+    .unwrap_or(usize::MAX)
+    .clamp(floor.min(cap), cap)
+}
+
 /// One turn of `id`'s [`WholeBuild`]: its next pieces sealed until the seal turns' share of the shard's quantum has
-/// passed (`config::wrap_slice_ns`, as a seal's wrap and a takeover's open are held, A-323, A-347), one piece at least,
-/// so every turn moves it on; once every piece is sealed, what the credit admits is appended ([`append_build`]). A
+/// passed (`config::wrap_slice_ns`, as a seal's wrap and a takeover's open are held, A-323, A-347), each sized to what is
+/// left of it at the rate measured so far ([`piece_bytes`]), one page at least, so every turn moves it on; once every piece is sealed, what the credit admits is appended ([`append_build`]). A
 /// build whose owner was superseded, or whose keys are refused, ends here.
 fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Advance {
   let superseded = match state.live.shipping.get(&id.bytes) {
@@ -2479,17 +2537,31 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
   else {
     return Advance::Done;
   };
+  let floor = usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES)
+    .unwrap_or(cap)
+    .clamp(1, cap);
   let mut refused = false;
-  while let Some(piece) = build
-    .body
-    .get(build.next..build.next.saturating_add(cap).min(build.body.len()))
-    .filter(|piece| !piece.is_empty())
-  {
+  loop {
+    let left = quantum.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    let size = piece_bytes(build.seal_rate, left, floor, cap);
+    let Some(piece) = build
+      .body
+      .get(build.next..build.next.saturating_add(size).min(build.body.len()))
+      .filter(|piece| !piece.is_empty())
+    else {
+      break;
+    };
+    let piece_began = slates_rt::futures::now_ns();
     let chunk = slates_archive::Archive::raw_chunk(piece.to_vec());
     let Ok(sealed) = slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, segment) else {
       refused = true;
       break;
     };
+    let (rate_bytes, rate_ns) = build.seal_rate;
+    build.seal_rate = (
+      rate_bytes.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX)),
+      rate_ns.saturating_add(slates_rt::futures::now_ns().saturating_sub(piece_began)),
+    );
     build.next = build.next.saturating_add(piece.len());
     build.sealed.push(SealedPiece {
       name: sealed.name.to_vec(),
@@ -2507,8 +2579,93 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
   if !sealed_whole {
     return Advance::More;
   }
+  match hash_whole_turn(state, id, began, quantum) {
+    Advance::More => return Advance::More,
+    Advance::Done => {}
+  }
   append_build(state, id);
   Advance::Done
+}
+
+/// One turn of a sealed [`WholeBuild`]'s identity (A-757 part 2): its payload joined and its hasher seeded from the
+/// shipper's next place in the turn after the last piece is sealed, then fed slices sized to the quantum left at the
+/// rate it measures ([`piece_bytes`], a page at least) until every byte is hashed. `Done` once it is (or the build is
+/// gone), so the build appends with the identity in its next step; `More` while bytes are left. Until 2026-11-20 the
+/// whole payload was hashed in the turn that appended it: 0.94 ms of release CPU for 2.4 MB against seal quanta of 14
+/// to 784 us, three times that before A-757 part 1.
+fn hash_whole_turn(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  began: u64,
+  quantum: u64,
+) -> Advance {
+  let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES)
+    .unwrap_or(usize::MAX)
+    .max(1);
+  let floor = usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES)
+    .unwrap_or(cap)
+    .clamp(1, cap);
+  let feeding = state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .and_then(|live| live.building.as_ref())
+    .is_some_and(|build| !build.appended && build.hashing.is_some());
+  if feeding {
+    state.count(LIVE_WHOLE_HASH_TURNS, 1);
+  }
+  let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
+    return Advance::Done;
+  };
+  let Some(build) = live.building.as_mut() else {
+    return Advance::Done;
+  };
+  if build.appended {
+    return Advance::Done;
+  }
+  let Some((payload, hasher)) = build.hashing.as_mut() else {
+    let mut payload = vec![KIND_WHOLE, BODY_SEALED];
+    payload.extend_from_slice(
+      &SealedBody {
+        sealing: build.sealing.take(),
+        pieces: std::mem::take(&mut build.sealed),
+      }
+      .to_bytes(),
+    );
+    build.body = Vec::new();
+    match live.shipper.entry_hasher(payload.len()) {
+      Ok(hasher) => build.hashing = Some((payload, hasher)),
+      Err(_) => {
+        drop_build(state, id, "fleet.live.refused.no_position");
+        return Advance::Done;
+      }
+    }
+    return Advance::More;
+  };
+  loop {
+    let fed = hasher.fed();
+    if fed >= payload.len() {
+      return Advance::Done;
+    }
+    let left = quantum.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    let size = piece_bytes(build.hash_rate, left, floor, cap);
+    let Some(slice) = payload.get(fed..fed.saturating_add(size).min(payload.len())) else {
+      return Advance::Done;
+    };
+    let slice_began = slates_rt::futures::now_ns();
+    hasher.feed(slice);
+    let (rate_bytes, rate_ns) = build.hash_rate;
+    build.hash_rate = (
+      rate_bytes.saturating_add(u64::try_from(slice.len()).unwrap_or(u64::MAX)),
+      rate_ns.saturating_add(slates_rt::futures::now_ns().saturating_sub(slice_began)),
+    );
+    if hasher.fed() >= payload.len() {
+      return Advance::Done;
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= quantum {
+      return Advance::More;
+    }
+  }
 }
 
 /// Appends what `id`'s [`WholeBuild`] holds ready ([`append_ready`]) and ships it.
@@ -2538,25 +2695,24 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
       return appended_any;
     };
     if !build.appended {
-      if build.next < build.body.len() {
+      // Appended only once its identity is hashed, in the build's turns ([`hash_whole_turn`]).
+      let hashed = build
+        .hashing
+        .as_ref()
+        .is_some_and(|(payload, hasher)| hasher.fed() >= payload.len());
+      if !hashed {
         return appended_any;
       }
       if !admits {
         state.count(LIVE_BUILD_WAITED, 1);
         return appended_any;
       }
-      let mut payload = vec![KIND_WHOLE, BODY_SEALED];
-      payload.extend_from_slice(
-        &SealedBody {
-          sealing: build.sealing.take(),
-          pieces: std::mem::take(&mut build.sealed),
-        }
-        .to_bytes(),
-      );
+      let Some((payload, hasher)) = build.hashing.take() else {
+        return appended_any;
+      };
       let anchors = std::mem::take(&mut build.anchors);
-      build.body = Vec::new();
       build.appended = true;
-      match append_entry(state, id, (true, false), payload, Some(anchors)) {
+      match append_entry_hashed(state, id, payload, Some(anchors), Some(hasher)) {
         Ok(()) => appended_any = true,
         Err(_) => {
           drop_build(state, id, "fleet.live.refused.no_position");
@@ -2715,7 +2871,12 @@ fn queue_behind_build(
   let Some(build) = live.building.as_mut() else {
     return;
   };
-  let credit = credit.max(build.body.len());
+  // The build's size whether it is sealing (its plain body) or hashing (its sealed payload, A-757 part 2).
+  let building_bytes = build
+    .hashing
+    .as_ref()
+    .map_or(build.body.len(), |(payload, _)| payload.len());
+  let credit = credit.max(building_bytes);
   if !whole && build.queued_bytes > 0 && build.queued_bytes.saturating_add(body.len()) > credit {
     refuse(state, id, "fleet.live.refused.no_credit");
     return;
@@ -2733,6 +2894,8 @@ const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
 /// Counter: one turn of a whole entry's sealing ([`advance_whole_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_WHOLE_BUILD_TURNS: &str = "fleet.live.whole_build_turns";
+/// Counter: the turns a whole build hashed its entry's identity in (A-757 part 2), a slice of the payload a turn.
+const LIVE_WHOLE_HASH_TURNS: &str = "fleet.live.whole_hash_turns";
 /// Counter: a publication captured while a whole entry sealed and queued behind it ([`queue_behind_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_QUEUED: &str = "fleet.live.queued";
@@ -6858,6 +7021,27 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A whole build's piece sizing (w-forming, 2026-11-20; found by use: a turn sealed a MiB however small its quantum).
+  /// Do: size a piece with no rate measured, with a rate that fits half a MiB in the quantum left, with one that fits a
+  /// byte, and with one that fits ten MiB. Expect: a page; half a MiB; a page (the floor); a MiB (the cap).
+  #[test]
+  fn a_whole_builds_piece_is_what_the_measured_rate_seals_in_the_quantum_left() {
+    const PAGE: usize = 64 << 10;
+    const CHUNK: usize = 1 << 20;
+    assert_eq!(super::piece_bytes((0, 0), 1_000, PAGE, CHUNK), PAGE);
+    // A MiB in 2 ms of sealing: half a MiB fits a 1 ms quantum.
+    assert_eq!(
+      super::piece_bytes((1 << 20, 2_000_000), 1_000_000, PAGE, CHUNK),
+      CHUNK / 2
+    );
+    assert_eq!(super::piece_bytes((1, 1_000_000), 1_000, PAGE, CHUNK), PAGE);
+    assert_eq!(
+      super::piece_bytes((10 << 20, 1_000), 1_000, PAGE, CHUNK),
+      CHUNK
+    );
+    assert_eq!(super::piece_bytes((1 << 20, 1_000), 0, PAGE, CHUNK), PAGE);
+  }
 
   /// A live volume grown far past its last whole record: do ask what a publication bounds the retained tail by. Expect
   /// the volume as it is now, what installing it would send. A whole record comes only once the log reaches the volume's

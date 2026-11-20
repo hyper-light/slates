@@ -3,7 +3,7 @@
 //! `svnrdump dump` replayed, and the scripted replays (a copy with and without deltas and below the low-water mark, a
 //! replacement by a copy, revision 0, part of the history).
 
-use super::Replay;
+use super::{Replay, Stepped};
 use crate::ra_svn::Value;
 use crate::reads::tests::Fixture;
 use crate::report::editor::EditorWriter;
@@ -101,7 +101,8 @@ pub(crate) fn recorded_drives(server: &[u8]) -> Vec<Vec<&[u8]>> {
 
 /// Our replay of `revision`, written as the connection writes it for a stock 1.15 client.
 fn replayed(fixture: &Fixture, (revision, low, deltas): (u64, u64, bool)) -> Vec<u8> {
-  let mut replay = Replay::new(revision, "/", low, deltas);
+  let (version, compression) = crate::report::editor::encoding_of(&stock_capabilities());
+  let mut replay = Replay::new(revision, "/", low, deltas).with_encoding(version, compression);
   let mut writer = EditorWriter::new(&stock_capabilities(), MOST_OPEN);
   let mut out = Vec::new();
   while let Some(call) = replay.next(&fixture.index, &fixture.green, None).unwrap() {
@@ -149,4 +150,57 @@ fn every_recorded_replay_is_driven_as_svnserve_drove_it() {
   }
   // svnsync: revisions 1 to 11; svnrdump: 1 to 11; five single replays; the range 2 to 5.
   assert_eq!(compared, 11 + 11 + 5 + 4);
+}
+
+/// A-751, main's red for the replay drive ("a window in units through the same encoder, red first with the past-budget
+/// counter at 0, bytes equal to today's"), held by units, which contention cannot blur. Do: over the report fixtures'
+/// repository, replay r6, where `/trunk/big.txt` (6,000 lines, several windows) is edited, and r5, where it is added,
+/// with deltas, in version 0 and in version 2 with LZ4, a step a call. Expect: no window step past `WINDOW_STEP_UNITS`
+/// units, a step for every `STEP_WORK` bytes of the text at least, and `big.txt`'s delta the stream the whole-window
+/// path made (`big_text_stream`), byte for byte. Red before the change: a window was made and given in one call.
+#[test]
+fn a_large_texts_replayed_windows_are_made_with_no_step_past_its_budget() {
+  use crate::report::drive::tests::{big_text_stream, big_texts};
+  use crate::report::drive::{Call, STEP_WORK, WINDOW_STEP_UNITS, take_most_window_units};
+  use crate::svndiff::{Compression, Version};
+  let (index, green, five, six) = big_texts();
+  for (revision, base, text) in [(6, Some(five.clone()), &six), (5, None, &five)] {
+    for (version, compression) in [
+      (Version::Zero, Compression::Stored),
+      (Version::Two, Compression::Lz4),
+    ] {
+      let expected = big_text_stream((base.as_deref(), text), (version, compression));
+      let mut replay = Replay::new(revision, "/", 0, true).with_encoding(version, compression);
+      let (mut most, mut window_steps) = (0usize, 0usize);
+      let (mut streams, mut stream) = (Vec::new(), None::<Vec<u8>>);
+      take_most_window_units();
+      loop {
+        let next = replay.next_within((&index, &green), None, 1).unwrap();
+        let units = take_most_window_units();
+        most = most.max(units);
+        window_steps += usize::from(units > 0);
+        match next {
+          Stepped::Ended => break,
+          Stepped::Call(Call::ApplyTextDelta { .. }) => stream = Some(Vec::new()),
+          Stepped::Call(Call::DeltaPiece { bytes, .. }) => {
+            stream.as_mut().unwrap().extend_from_slice(bytes);
+          }
+          Stepped::Call(Call::TextDeltaEnd) => streams.push(stream.take().unwrap()),
+          _ => {}
+        }
+      }
+      assert!(
+        streams.contains(&expected),
+        "r{revision}, {version:?}: big.txt's stream"
+      );
+      assert_eq!(
+        (
+          most <= WINDOW_STEP_UNITS,
+          window_steps >= text.len() / STEP_WORK
+        ),
+        (true, true),
+        "r{revision}, {version:?}: most units {most}, window steps {window_steps}"
+      );
+    }
+  }
 }

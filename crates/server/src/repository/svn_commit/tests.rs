@@ -288,7 +288,11 @@ fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
     let alpha = state
       .vcs_stores
       .subversion_records(svn)
-      .and_then(|records| records.content(&identity(b"alpha\n")).map(<[u8]>::to_vec));
+      .and_then(|records| {
+        records
+          .text(&identity(b"alpha\n"))
+          .map(std::borrow::Cow::into_owned)
+      });
     assert_eq!(alpha, Some(b"alpha\n".to_vec()));
     let (youngest, held, charged) = kept(state, svn);
     assert_eq!((youngest, charged), (1, held));
@@ -865,7 +869,10 @@ fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
       Some(held(special)),
     );
     assert_eq!(seen, Some(expected));
-    assert_eq!(records.content(&identity(special)), Some(&special[..]));
+    assert_eq!(
+      records.text(&identity(special)).as_deref(),
+      Some(&special[..])
+    );
   });
 }
 
@@ -954,11 +961,8 @@ fn read_held(
   state: &mut ShardState,
   hold: &crate::vcs_store::svn_view::SvnHold,
 ) -> Option<(u64, Option<Vec<u8>>)> {
-  use slates_svn::reads::Repository as _;
   crate::vcs_store::svn_view::lend_held_in(state, hold, |lent| {
-    let text = lent
-      .repository
-      .text(&identity(b"alpha\n"), 0)
+    let text = slates_svn::reads::Repository::text(lent.repository, &identity(b"alpha\n"), 0)
       .map(std::borrow::Cow::into_owned);
     (lent.index.youngest(), text)
   })

@@ -757,6 +757,52 @@ fn t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved()
   });
 }
 
+/// Shape: the partition's green-chain budget in [`t_a753_a_repository_takes_branch_creates_past_its_chain_budget`]:
+/// small, so a few creates' works pass it.
+const SMALL_CHAIN_BUDGET: usize = 64 << 10;
+
+/// Shape: the branches [`t_a753_a_repository_takes_branch_creates_past_its_chain_budget`] creates: enough that their
+/// works together pass [`SMALL_CHAIN_BUDGET`] several times over.
+const CREATES: usize = 24;
+
+/// A-753 (found by use, A-722's proof: of 100 concurrent v1.5.0 pushes creating a branch each in one repository, 20 were
+/// answered `failed to update ref`, the append refused `green_chains` at capacity: each create held the whole tree as
+/// its own work). Do: with a small green-chain budget, push [`CREATES`] creates of branches, each at the fixtures' first
+/// commit, each resending its whole pack. Expect: every create `ok`, its branch bound, every branch's green holding the
+/// first commit's text. Red before the change: every create after the first refused `missing necessary objects` (the
+/// connectivity check read the resent objects from the quarantine, which passes over what the index holds); and, that
+/// fixed, refused at the chains' cap, each create making its whole tree again rather than branching from the green that
+/// holds its commit.
+#[test]
+fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
+  let refused = crate::daemon::audit_on_shard_configured(
+    |state| {
+      let repository = git_repository(state, "chains");
+      let pack = pack_of(scenario!("create").request);
+      let mut refused = Vec::new();
+      for k in 0..CREATES {
+        let name = format!("refs/heads/p{k}");
+        let created = [("", FIRST, name.as_bytes())];
+        let received = pushed(state, repository, &request(&created, CAPABILITIES, pack));
+        if reasons(&received) != [b"ok".to_vec()] || !bound(state, repository, &format!("p{k}")) {
+          if k == 1 {
+            eprintln!("DBG {:?}", received.outcomes);
+          }
+          refused.push(k);
+        }
+      }
+      let first = vec![("text".to_owned(), text(false))];
+      let wrong = (0..CREATES)
+        .filter(|k| !refused.contains(k))
+        .filter(|k| files(state, repository, &format!("p{k}")) != first)
+        .count();
+      (refused, wrong)
+    },
+    |config| config.caps.green_chain_bytes = SMALL_CHAIN_BUDGET,
+  );
+  assert_eq!(refused, (Vec::new(), 0));
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The hooks (A-665 part 3; Unix, where the hook driver runs).
 

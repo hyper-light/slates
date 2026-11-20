@@ -8,7 +8,6 @@ use super::*;
 use crate::svndiff::{Encoder, Window, deltas};
 use proptest::prelude::*;
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
 
 /// The encodings the tests make every window in.
 const ENCODINGS: [(Version, Compression); 3] = [
@@ -139,57 +138,37 @@ fn every_window_is_the_whole_windows_bytes_under_any_unit() {
 /// The units the red test gives each step: a few hundred, as a drive's step takes.
 const STEP_WORK: usize = 256;
 
-/// The time no step of [`STEP_WORK`] units may take: far past such a step even in a debug build (tens of
-/// microseconds), far short of a whole window's making there (milliseconds).
-const STEP_BUDGET: Duration = Duration::from_micros(500);
-
-/// How many timed runs the red test makes: a step the machine took away from the test (a preemption) is not the
-/// unit's, so the run with the fewest steps past the budget is the one judged.
-const TIMED_RUNS: usize = 3;
-
 /// A-751, the red (main's: "a large text's window driven with the past-budget counter at 0, and the bytes equal to the
-/// whole window's"). Do: make a full 102,400-byte window of a text edited every 997 bytes against its source, in each
-/// encoding, [`STEP_WORK`] units a step, timing each step. Expect: in the best of [`TIMED_RUNS`] runs no step past
-/// [`STEP_BUDGET`] (the units-past-budget counter at 0), many steps, and the bytes the whole window's. Red before the
-/// change: the window was made in one call, milliseconds in a debug build.
+/// whole window's"), held by units, which contention cannot blur. Do: make a full 102,400-byte window of a text edited
+/// every 997 bytes against its source, and one of a text no block of which its source holds (every look-up a miss), in
+/// each encoding, [`STEP_WORK`] units a step. Expect: no step past [`STEP_WORK`] and [`STEP_OVERRUN`] units by the
+/// making's own count, a step for every [`STEP_WORK`] bytes at least, and the bytes the whole window's. Red before the
+/// change: the window was made in one call, its units the whole window's.
 #[test]
 fn a_large_texts_window_is_made_with_no_step_past_its_budget() {
   let source = varied(WINDOW_LIMIT as usize, 11);
-  let target = edited(&source, 997);
-  for encoding in ENCODINGS {
-    let expected = whole(&source, &target, encoding);
-    let mut fewest_past = usize::MAX;
-    let mut runs = Vec::new();
-    for _ in 0..TIMED_RUNS {
+  for target in [edited(&source, 997), varied(WINDOW_LIMIT as usize, 12)] {
+    for encoding in ENCODINGS {
+      let expected = whole(&source, &target, encoding);
       let mut making =
         WindowMaking::new((0, source.len()), target.len(), encoding.0, encoding.1).unwrap();
-      let (mut steps, mut past, mut longest) = (0usize, 0usize, Duration::ZERO);
+      let (mut steps, mut most) = (0usize, 0u64);
       loop {
-        let began = Instant::now();
+        let before = making.units_taken();
         let done = making.step(&source, &target, STEP_WORK).unwrap();
-        let took = began.elapsed();
+        most = most.max(making.units_taken() - before);
         steps += 1;
-        longest = longest.max(took);
-        past += usize::from(took > STEP_BUDGET);
         if done {
           break;
         }
       }
-      runs.push((steps, past, longest, making.made().map(|made| made.bytes())));
-      fewest_past = fewest_past.min(past);
-    }
-    let seen: Vec<_> = runs
-      .iter()
-      .map(|(steps, past, longest, _)| (steps, past, longest))
-      .collect();
-    assert_eq!(
-      fewest_past, 0,
-      "{encoding:?}: (steps, past, longest) {seen:?}"
-    );
-    for (steps, _, _, bytes) in &runs {
-      assert!(bytes.as_ref() == Some(&expected), "{encoding:?}");
       assert!(
-        *steps > target.len() / STEP_WORK,
+        most <= (STEP_WORK + STEP_OVERRUN) as u64,
+        "{encoding:?}: a step of {most} units"
+      );
+      assert!(making.made().unwrap().bytes() == expected, "{encoding:?}");
+      assert!(
+        steps > target.len() / STEP_WORK,
         "{encoding:?}: {steps} steps"
       );
     }
