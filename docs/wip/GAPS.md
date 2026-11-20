@@ -430,8 +430,9 @@
 > over 5206419be, r454, 106 of 106 over be892650b, r492, 119 of 119 over 0b0c8e12e, r512, and 124 of 124 over
 > 20ae700a7, r530, the daemon's site serving it since A-684; macOS arm64, Mac Studio).
 > Owed: a push over a connection A-651 part 4 moved to its owner shard (a two-shard daemon, as the HTTP site's push
-> test runs); main's live `git push` over SSH (`git_interop.rs`'s `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`,
-> ignored until A-684 and A-683, its ignore lifted).
+> test runs). Stock git's live `git push` over SSH runs since 2026-11-20 (`git_interop.rs`'s
+> `stock_git_clones_pushes_and_fetches_over_the_ssh_edge`, un-ignored by w-interop, passing; its evidence on g083's
+> stock git line).
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -705,8 +706,13 @@
 > bearer credential (`http.extraHeader`), which passes: stock git 2.50.1 clones a repository `slates repository create`
 > made, pushes to it and fetches from it over the daemon's edge. The round trip with the token as Basic's password in
 > the URL runs since A-686 (g258), its one wait (the cleartext edge's `401` offered Bearer alone, so git answered
-> `Authentication failed`); the one over the SSH edge is ignored naming its waits (A-684, g299: `--vcs-ssh`; A-683,
-> g302: git-receive-pack on the SSH edge). A credential is minted with the anchor's issuer surface, so on Linux, where
+> `Authentication failed`); the one over the SSH edge runs since A-684 (g299: `--vcs-ssh`) and A-683 (g302:
+> git-receive-pack on the SSH edge), un-ignored by w-interop (2026-11-20): git runs OpenSSH with the enrolled key alone,
+> trusting only the host key the daemon's SSH line names (a `known_hosts` written by `ssh-keyscan`, its `ssh-keygen -l`
+> fingerprint checked against the printed one, `StrictHostKeyChecking=yes`), and stock git 2.50.1 clones, pushes and
+> fetches over it with OpenSSH 10.2p1 (macOS arm64, Mac Studio, kiln r1 over 43c86824e: `cargo test --locked -p
+> slates-cli --test git_interop -- --test-threads=1` 5 passed, 0 ignored, the SSH leg alone 1 of 1 in 7.4 s;
+> `cargo fmt -p slates-cli -- --check` clean). A credential is minted with the anchor's issuer surface, so on Linux, where
 > that surface is a descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln
 > r426 over main 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2
 > ignored; with `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication

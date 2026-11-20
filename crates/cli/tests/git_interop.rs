@@ -99,9 +99,16 @@ const PRINTS_ISSUER_SURFACE: bool = cfg!(not(target_os = "linux"));
 const VCS_HTTP_LINE: &str =
   "slates daemon: the version-control HTTP edge serves cleartext on 127.0.0.1:";
 
-/// Format: the start of the daemon's line naming where its SSH edge serves (A-684, as g299's branch prints it); the
-/// port's digits are read, and what follows them (the host key's fingerprint) is left.
+/// Format: the start of the daemon's line naming where its SSH edge serves (A-684, `crates/api/src/role/daemon.rs`);
+/// the port follows, then [`VCS_SSH_KEY_WORDS`] and the host key's SHA256 fingerprint.
 const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves on 127.0.0.1:";
+
+/// Format: the words between the port and the host key's fingerprint on the daemon's SSH edge line ([`VCS_SSH_LINE`]):
+/// the key's type as OpenSSH writes it in a fingerprint's line, before the fingerprint.
+const VCS_SSH_KEY_WORDS: &str = " with the ED25519 host key ";
+
+/// Format: the key type `ssh-keyscan` asks the SSH edge for (`-t`), the type [`VCS_SSH_KEY_WORDS`] names.
+const VCS_SSH_KEY_TYPE: &str = "ed25519";
 
 /// A scratch directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a
 /// count, removed when dropped, even when an assertion fails (A-50: a test's host files live in the build output, never
@@ -718,16 +725,57 @@ fn fresh_key(scratch: &Scratch) -> Option<(String, String)> {
   Some((key, public.trim().to_owned()))
 }
 
+/// The port and host key fingerprint `line` names, when it is the daemon's SSH edge line ([`VCS_SSH_LINE`]).
+fn ssh_edge_of(line: &str) -> Option<(u16, String)> {
+  let rest = line.strip_prefix(VCS_SSH_LINE)?;
+  let (port, fingerprint) = rest.trim().split_once(VCS_SSH_KEY_WORDS)?;
+  Some((port.parse().ok()?, fingerprint.to_owned()))
+}
+
+/// A `known_hosts` file in `scratch` holding the host key the SSH edge at loopback `port` presents, made as a user
+/// makes one: OpenSSH's `ssh-keyscan` reads the key, and `ssh-keygen -l` fingerprints the file it wrote. Fails the
+/// test unless that fingerprint is `fingerprint`, the one the daemon printed, so the client that trusts this file
+/// trusts the key the daemon named and no other. The file's path.
+#[allow(clippy::disallowed_methods)]
+fn known_hosts(scratch: &Scratch, port: u16, fingerprint: &str) -> String {
+  let path = format!("{}/known_hosts", scratch.path);
+  let scanned = Command::new("ssh-keyscan")
+    .args(["-p", &port.to_string(), "-t", VCS_SSH_KEY_TYPE])
+    .args(["-T", &PATIENCE.as_secs().to_string(), "127.0.0.1"])
+    .output()
+    .unwrap();
+  let lines = String::from_utf8_lossy(&scanned.stdout).into_owned();
+  assert!(
+    scanned.status.success() && !lines.trim().is_empty(),
+    "ssh-keyscan read no host key at port {port}: {scanned:?}"
+  );
+  std::fs::write(&path, &lines).unwrap();
+  let listed = Command::new("ssh-keygen")
+    .args(["-l", "-E", "sha256", "-f", &path])
+    .output()
+    .unwrap();
+  let listing = String::from_utf8_lossy(&listed.stdout).into_owned();
+  let fingerprints: Vec<&str> = listing
+    .lines()
+    .filter_map(|line| line.split_whitespace().nth(1))
+    .collect();
+  assert_eq!(
+    fingerprints,
+    [fingerprint],
+    "the key ssh-keyscan read at port {port} is the one the daemon named: {lines}"
+  );
+  path
+}
+
 /// §4.17.2 "A fetch", "A push" and "Transports" item 2 (slates' own SSH server running `git-upload-pack '<repo>'` and
 /// `git-receive-pack '<repo>'`). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make
 /// repository [`REPOSITORY`] through the CLI and enroll a fresh key for its owner (`slates credential key`); run the
 /// round trip as stock git at `ssh://git@127.0.0.1:PORT/project`, git running OpenSSH with that key alone and no
-/// configuration of its own (`core.sshCommand`). Expect every step as [`round_trip`] states. Skips loudly without stock
+/// configuration of its own (`core.sshCommand`), trusting only the host key the daemon named ([`known_hosts`], checked
+/// strictly). Expect every step as [`round_trip`] states. Skips loudly without stock
 /// git ([`STOCK_GIT`]), OpenSSH's `ssh` or `ssh-keygen`, and on a platform whose issuer surface a separate process
 /// cannot use.
 #[test]
-#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>, the daemon's SSH site serving upload-pack over A-682's lender) \
-            and A-683 (g302: git-receive-pack on the SSH edge)"]
 fn stock_git_clones_pushes_and_fetches_over_the_ssh_edge() {
   let Some(program) = stock_git() else {
     eprintln!(
@@ -746,17 +794,22 @@ fn stock_git_clones_pushes_and_fetches_over_the_ssh_edge() {
   };
   let instance = format!("git-ssh-{}", std::process::id());
   let started = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
-  let port =
-    port_after(&started.lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+  let (port, fingerprint) = started
+    .lines
+    .iter()
+    .find_map(|line| ssh_edge_of(line))
+    .expect("the daemon named its SSH edge's port and host key");
   let Some(issuer) = issuer_of(&started, "the SSH leg") else {
     return;
   };
+  let known_hosts = known_hosts(&scratch, port, &fingerprint);
   create_repository(&instance);
   let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
   assert_eq!(code, 0, "credential key: {out}{err}");
   let ssh = format!(
     "core.sshCommand=ssh -F /dev/null -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
-     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+     -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts} \
+     -o GlobalKnownHostsFile=/dev/null"
   );
   let git = Git::new(&program, &scratch, "ssh", vec!["-c".to_owned(), ssh]);
   round_trip(&git, &format!("ssh://{USER}@127.0.0.1:{port}/{REPOSITORY}"));
