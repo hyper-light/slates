@@ -83,6 +83,13 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-720 (2026-11-20, w-hg; main's ruling after w-perf's 57,036-changeset push tripped the watchdog: a push's working
+> set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
+> push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
+> log reads it, kept once), then the manifests' and files' presence a step each; the same fork as `verify` then
+> `fork_with`, row for row, within less room. Owed: part 2, the server driving it in slices within the shard's step
+> budget (the push driver still verifies whole); part 3, the import's room per repository; the store w-perf's table
+> gives (main's ruling).
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
 > (`HgStores::push_room`, `git_push::push_room`, A-704's rule), and a bundle past it is refused in Mercurial's words
@@ -91,6 +98,19 @@
 > PastRoom { room: 278528 }` for the same repository), the unbundle's processing in slices, and w-perf's whole push.
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
+>
+> **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
+> holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
+> room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the
+> table in the green's checkpoint (recovery, replication); 2-3 svn records naming texts by identity and reading them
+> here (the log entry's text bytes dropped); git's and hg's intakes holding by bytes.
+>
+> **A-718 (2026-11-20, w-perf, UI goal 93; §4.17.2 "A push" item 8):** a pushed version's fragments are encoded once,
+> by the first fetch after its push, before its answer (`vcs_store::git_encode`, driven through `StoreLender::encode` on
+> both edges), and kept as content charged to the shard; later fetches copy them. OWED: the encoding from the push's own
+> intake (keep the deltas the client sent; w-git's streaming intake); the base pack's rebuild under the learned rule;
+> kept fragments made again after a recovery without a fetch paying; the parts' bytes an encoding holds between turns
+> charged.
 >
 > **A-654 (2026-11-19, g258; git's push end to end).** Part 1 BUILT (slates-git): a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). Part 2 BUILT: the server's driver `crates/server/src/git_push.rs`, one entry point for both edges (`ReceivePack::start`, `input`, `end`, `answer`, each one step on the owner shard): the advertisement of each branch whose green holds a git head (namespace name `N` is `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under A-622's policy hidden; input and end over A-638's index view lent the shard's room (`vcs_store::with_room`); a configured git hook refusing every command `hook not run` until A-665 part 2's view; the checked objects admitted to A-662's quarantine and sealed; each command asked of A-622's policy through A-644 part 2's check point (`git_protect`: the right its change needs, then a protected name's linear history and signed commits on what it brings) before its work is built, refused in git's words; A-654 part 1's verdicts over the shard's greens, a ref's base its green's head alone, held at the append by compare and swap; `push_sealed` per entry, or once for all under `atomic`; git's report. Part 3 BUILT: git's HTTP site serves receive-pack through the driver (`vcs_http::git::receive`: each service from its own half, each step lent the state of the shard the connection moved to, a failure before any reply a status, a command's refusal the report's), proven by stock git's `create` push over loopback TLS to a daemon. The SSH site's call BUILT (A-683: `vcs_ssh::receive`, each step lent the shard's state through the HTTP site's seam, `ShardLender`). OWED: the live `git push` over HTTPS and over SSH with stock git's binary (main's runs); the hooks run over A-665 part 2's view (`pre-receive`, `update`, `post-receive`); a push based on an older version than its green's head, refused as a ref that moved until A-664's server-made commits; a principal the policy allows who is not the owner, whom A-635's append refuses `Forbidden`; push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8); a tag of a tag; a create while the default branch is unborn and holds files no commit names (A-664's).
 >
@@ -505,6 +525,14 @@
 > times: the svn records' `Repository.contents`, the green's content pool (A-716, w-perf: the records name the green's
 > content by identity) and the register's entry objects, each revision's record with its texts (~245 KB a revision
 > under `apply_advanced`, w-perf); A-716's record without text bytes takes the third with it.
+> Fixed 2026-11-19 (A-721, w-svn, found by use: an import's record refused `Unpublished`, then every `svn commit`
+> E160004): a verb commits a version to its green's engine before the record holding it is durable, and a refused
+> publication took the record back but left the engine ahead; `verbs::reconcile_unpublished_effects` now makes such a
+> green again from its durable checkpoint and chain (`remake_greens_ahead`). Test
+> `a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands`, red then green; macOS
+> arm64, this Mac, local. Owed: a green in a lineage of several members (git branches) is counted
+> (`merge.unpublished.green_ahead_kept`) and kept as it is; a submit's `vcs_store::paths`/`commits` advanced before
+> its record are not taken back either.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -1372,6 +1400,10 @@
 > export, update, commits, properties, server-side copies, switch, merge, delete and revert pass; `lock` is refused
 > (`Server doesn't support the lock command`), HTTP meets `path not found` (A-681) and the SSH edge answers
 > `svnserve -t is not served yet`: 22 of 27 (main 4785858, debug, Mac Studio).
+> **A-681, the daemon's routing (w-interop, 2026-11-20):** Subversion's DAV site is composed into the daemon's edge
+> (`ToolSites`, a request Subversion's by a method no other client sends or its `!svn` segment, `svn::dav_request`;
+> `DaemonSvnSite` over `ServedRecords`): stock svn 1.15's `info`, `ls`, `cat`, `log` and `log -v` over HTTP pass (svn
+> matrix, ROUTE=http, Mac Studio); checkout, update, diff and export wait on the update-report, commits on POST.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

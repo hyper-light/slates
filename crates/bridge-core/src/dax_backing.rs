@@ -50,7 +50,8 @@
 //!   behind it as surely as its stores (Kim et al., ISCA 2014), so a placed range lies on 2 MiB of contiguous memory of
 //!   its own, beside foreign rows only at its two ends where 2 MiB spans several DRAM rows of each bank (§4.6 says where
 //!   it buys less). A placement the kernel declines is counted, and the range is served on base
-//!   pages; a decline likely to hold is remembered until the daemon's reap tick (`ShardsBackings::place`), since each
+//!   pages; a decline likely to hold is remembered until the shard's deadline keeper re-arms it a retry window on (A-570;
+//!   `ShardsBackings::place`), since each
 //!   costs the shard milliseconds of the kernel's compaction. A range is placed only once it is filled and counted, so
 //!   the placed bytes stay within the fill budget.
 //!
@@ -156,7 +157,7 @@ pub struct Counts {
   pub refill_writable: u64,
   /// Ranges placed in one huge page each as their fills finished (§4.6, the backed route's L1; A-193).
   pub placed: u64,
-  /// Ranges whose placement the kernel declined, or that a decline remembered since the daemon's last reap tick passed
+  /// Ranges whose placement the kernel declined, or that a decline remembered until the deadline keeper's re-arm passed
   /// over: they are served on base pages.
   pub placement_refused: u64,
 }

@@ -12502,12 +12502,27 @@ what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
 
+> **Status (2026-11-20, A-716 slice 1a: a text held once, by content identity).** A green holds texts by identity in a
+> table of its file blocks (`crates/merge/src/held.rs`; `Green::hold_path`, `hold_bytes`, `held`, `release_held`,
+> `set_held_room`): by path, the head file's own block with one more holder, so no byte is copied; or by bytes, a block
+> no path names, for an intake that streams objects before any tree. A held text outlives its file's change and
+> removal, and is let go with its last holder. The table's room is its owner's to derive (zero until set), every hold
+> past it refused typed. It replaces the copies each tool keeps of the green's bytes (A-64: a Subversion text was held
+> three times, the records' copy alone 1.37 times the dump; BENCHMARKS.md). Owed: a green op setting a path from a held
+> identity (slice 1b), the table in the checkpoint (1c), Subversion's records reading through it (2, 3), git's and
+> Mercurial's intakes holding by bytes (w-git, w-hg).
+
 > **Status (2026-11-19, A-714, w-svn, found by use: a 5,000-revision Subversion import refused `green_chains` at 1,685).** An
 > entry's objects are the repository's content: the register keeps them as before, but the owner shard charges them to
 > its memory budget as retention with the tool store (`vcs_store::settle_objects`: trued up after each append and at a
 > recovery, given back with the repository; a push's own admission bounds it, a Subversion revision asks
 > `admit_objects` first), never to the partition's merge budget, so a
 > repository's bound is what its shard can hold. This replaces A-662's "charged to the merge budget" below.
+>
+> **Status (2026-11-19, A-721, w-svn).** A refused publication takes back the verb's record; a green whose engine had
+> already committed the version is made again from its durable checkpoint and chain in the same reconciliation
+> (`verbs::remake_greens_ahead`), so the engine never answers a version no log holds. Lone engines and single-member
+> lineages; a lineage of several members is counted and owed.
 >
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
@@ -13602,6 +13617,16 @@ cooperative slices (§4.3).
    answer's path (each D(k) was computed at admission). A fetch that comes before a fragment exists sends those objects
    from the compressed forms the push brought them in.
 
+> **Status (2026-11-20, A-718: item 8's fragments, encoded before a fetch's answer).** No step encoded a pushed version,
+> so every clone searched every object for deltas again: on the Mac Studio a clone of git/git cut at v1.0.0 took 2.816 s
+> against `git daemon`'s 0.300 s, about 72% of the daemon's CPU in `deltas::Search::step` (BENCHMARKS.md). Now a fetch's
+> request, before its answer is made, encodes each version whose fragments are not kept (`Repository::first_unencoded`)
+> a turn at a time under the shard's quantum, yielding between turns, and keeps them as content charged to the shard
+> (`crates/server/src/vcs_store/git_encode.rs`); the answer copies them. A version is encoded once, by the first fetch
+> after its push; one encoding a repository at a time, kept in the map between turns. Owed: the encoding from the push's
+> own intake (git's pack reuse, w-git's streaming intake), the base pack's rebuild, kept fragments across a recovery, and
+> the parts' bytes held between turns charged.
+
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
 create or update a reference named "refs/for/master", but may create or update a pull request" [B: config
@@ -14501,6 +14526,8 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
    advertise it while it is held. Whether an artefact stays is learned (the table below).
 
 **Push.** Each step names what it refuses; nothing takes effect before step 6.
+Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
+working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices in part 2.
 1. **Intake.** The bundle (bundle2; bundle1 only where the policy allows legacy clients, as 7.2's `server.bundle1`
    does) is read in slices within the shard's budget per step, every length checked against the request's admission
    (A-16) before anything is held. A mandatory part or parameter slates does not know is refused, as bundle2 requires

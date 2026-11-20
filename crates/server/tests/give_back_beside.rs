@@ -8,12 +8,12 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 mod common;
 
 /// Shape: the idle steps a give-back beside another task may take: the one before it sees the neighbour ran, and one
-/// more for the daemon's own reap tick landing inside the probe.
+/// more for the daemon's own sweep pass landing inside the probe.
 const STEPS_BESIDE_A_NEIGHBOUR: u64 = 2;
 
 /// A-226, §4.3. Do: on a one-shard daemon, give back the whole of the dead recovery memory from a page slice, once with
 /// another task taking turns on the shard the whole time, allocating nothing as a granted landing does, and once alone.
-/// Expect: beside the neighbour the give-back stops after a step or two and leaves the rest for the next reap tick;
+/// Expect: beside the neighbour the give-back stops after a step or two and leaves the rest for the next sweep pass;
 /// alone it takes more. Under load a landing was 4-5 times slower, a give-back step of a whole quantum between each of
 /// its short steps: median 20.9 s against 4.3 s, and the give-back's 3,925 to 6,900 steps took 26 to 68% of the
 /// landing's time. Where a give-back takes so few steps that the two cannot differ (Linux's hole punch: tens of

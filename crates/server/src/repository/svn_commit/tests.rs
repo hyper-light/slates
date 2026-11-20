@@ -657,3 +657,29 @@ fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget
   let expected: Vec<_> = (1..10).map(answered).collect();
   assert_eq!(landed, (expected, true, true));
 }
+
+/// Found by use (w-perf, 2026-11-19, release b705a24c5: a 5,000-revision import's record 3,560 refused `Unpublished`,
+/// "profile … exceeds its region", then every `svn commit` refused E160004 "The repository's green is not at its
+/// youngest revision"). Do: land revision 1; with the next publication refused before its append, commit revision 2;
+/// then commit revision 2 again. Expect: the first attempt refused, the green's engine still at revision 1, where the
+/// durable chain and the records are; the second attempt lands as revision 2. Before the fix the engine had committed
+/// the version before its record was refused, and kept it: the green moved past the records for good.
+#[test]
+fn a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    let first_landed = commit(state, (&owner(), svn), first(), None);
+    let second = || {
+      let rows = vec![file("/trunk/a.txt", Action::Modify, b"two\n")];
+      revision(1, rows, &[b"two\n"])
+    };
+    state
+      .db
+      .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend));
+    let refused = commit(state, (&owner(), svn), second(), None).is_err();
+    let head_after = green_head(state, green);
+    let again = commit(state, (&owner(), svn), second(), None);
+    (first_landed, refused, head_after, again)
+  });
+  assert_eq!(seen, (answered(1), true, Some(1), answered(2)));
+}
