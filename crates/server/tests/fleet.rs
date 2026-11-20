@@ -21015,6 +21015,97 @@ fn a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_
   );
 }
 
+/// A-697 part b, A-247 (a work's floor is held at its green's owner while the work reads it): in a two-node `f = 1`
+/// fleet, B serves works over greens A owns (the test hook), and makes a work over A's green at version 1. Do: a client on
+/// B asks `MoveWorkFloor` to drop the work's floor; a client on A asks it too; B destroys the work. Expect: A holds the
+/// work's floor at 1 after the creation; both clients refused `Unsupported` (a node's verb), the floor still 1; after
+/// the destroy, A drops the floor, told by B over the fleet (B's counter moved).
+#[test]
+fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  let admitted_floor = daemon_a.work_floor(green, work);
+  let drop = RequestBody::MoveWorkFloor {
+    green,
+    work,
+    base: None,
+  };
+  let from_bs_client = holder.call(&drop);
+  let from_as_client = owner.call(&drop);
+  let floor_kept = daemon_a.work_floor(green, work);
+  let told = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("merge.work.floor_told_owner_node")
+      .copied()
+      .unwrap_or(0)
+  };
+  let told_before = told(&daemon_b);
+  let destroyed = holder.call(&RequestBody::Destroy { volume: work });
+  let both = [&daemon_a, &daemon_b];
+  let dropped = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a
+      .work_floor(green, work)
+      .map(|floor| floor.is_none())
+  });
+  let told_after = told(&daemon_b);
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert_eq!(
+    admitted_floor,
+    Ok(Some(1)),
+    "A holds the work's base by its floor"
+  );
+  for (who, reply) in [("B's", &from_bs_client), ("A's", &from_as_client)] {
+    assert!(
+      matches!(
+        reply,
+        ReplyBody::Refused {
+          refusal: Refusal::Unsupported { .. }
+        }
+      ),
+      "{who} client may not move a work's floor: {reply:?}"
+    );
+  }
+  assert_eq!(floor_kept, Ok(Some(1)), "no client moved the floor");
+  assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+  assert!(dropped, "A dropped the floor of the work B destroyed");
+  assert!(
+    told_after > told_before,
+    "B told A over the fleet: {told_before} then {told_after}"
+  );
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the

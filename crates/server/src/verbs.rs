@@ -2633,6 +2633,17 @@ pub(crate) fn route_gated(
   if let RequestBody::Acknowledge { up_to, owed } = body {
     return scatter_acknowledge(state, client.index(), request, client_id, (up_to, owed));
   }
+  // A work's floor is moved by the node that holds the work (A-697 part b), never by a client.
+  if matches!(body, RequestBody::MoveWorkFloor { .. }) {
+    return Served::Reply(record_completion(
+      state,
+      origin,
+      id,
+      refused(Refusal::Unsupported {
+        feature: "move_work_floor from a client".to_owned(),
+      }),
+    ));
+  }
   // An attach of another host's volume is remembered with its client here, on the client's own shard, before it is
   // sent anywhere, so the client's reap reaches the owner (A-222).
   if let Some(refusal) = crate::remote_attach::foreign_attach(state, &body) {
@@ -5026,6 +5037,9 @@ fn dispatch_inner(
     } => changed_since(state, principal, green, version, from),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
     RequestBody::AdmitWork { green, work } => admit_work(state, principal, green, work),
+    RequestBody::MoveWorkFloor { green, work, base } => {
+      move_work_floor(state, principal, (green, work), base)
+    }
     RequestBody::Edit {
       work,
       path,
@@ -10174,6 +10188,41 @@ fn base_engine(state: &ShardState, green: DbVolumeId) -> Option<BaseEngine<'_>> 
     .replicas
     .get(&ObjectId(green.bytes))
     .map(BaseEngine::Replica)
+}
+
+/// `MoveWorkFloor` (A-697 part b): the node holding a work over this green moves or drops the work's floor here. Only
+/// from another node (the relayed principal names another node's anchor; a client of either node is refused, the
+/// holder's at its channel, `route_gated`) and only for a work another node made. Monotone and idempotent, so it needs no
+/// completion record: a floor only rises, a drop is final, and a work holding no floor here (never admitted, or
+/// dropped) is left without one, so a late or repeated move changes nothing.
+fn move_work_floor(
+  state: &mut ShardState,
+  principal: &Principal,
+  (green, work): (VolumeId, VolumeId),
+  base: Option<u64>,
+) -> ReplyBody {
+  let from_another_node = principal
+    .host()
+    .is_some_and(|host| host != state.origin_anchor);
+  let anothers_work = ObjectId(work.bytes).creator() != state.fleet.host();
+  if !(from_another_node && anothers_work) {
+    return refused(Refusal::Unsupported {
+      feature: "move_work_floor from a client".to_owned(),
+    });
+  }
+  let (green, work) = (to_db_volume(green), to_db_volume(work));
+  if !state.greens.contains_key(&green) {
+    return refused(Refusal::NotFound);
+  }
+  let moves = match (state.db.partition().work_floor(green, work), base) {
+    (None, _) => false,
+    (Some(floor), Some(base)) => base > floor,
+    (Some(_), None) => true,
+  };
+  if moves {
+    owner_floor(state, green, work, base);
+  }
+  ReplyBody::WorkFloorMoved
 }
 
 /// The base's bytes of `paths` for a verb on a work's shard (A-247).

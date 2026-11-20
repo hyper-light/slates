@@ -22668,7 +22668,9 @@ Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on
 owner admits a work another node will hold by `AdmitWork`, a forwarded verb, judging the relayed principal's rights from
 its green's record and recording the work's floor at the head (`verbs::admit_work`, `verbs::owner_admit`). Part a2
 (2026-11-20, behind the test hook `Daemon::serve_works_on_holders`): a holder makes the work on its client's partition,
-asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. Part b
+(2026-11-20): the holder moves and drops the work's floor at the owner by `MoveWorkFloor` (`work_home::tell_floor_over_fleet`,
+`verbs::move_work_floor`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22691,8 +22693,9 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     in force behind a test hook until its last piece): a node holding the green's replica makes the work itself, on
     its client's partition, so the work's id names that node; the green's owner admits it by `AdmitWork`, forwarded,
     judging the rights from its green's record and holding the base by the work's floor; and the work's base reads are
-    answered by the node's replica, byte for byte the owner's. Its verdict, its floors' moves, recovery and takeover
-    follow in A-697's later parts. Until A-400 a work was placed on
+    answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
+    by `MoveWorkFloor`, forwarded, monotone and idempotent there. Its verdict, recovery and takeover follow in A-697's
+    later parts. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -56136,3 +56139,29 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   name `AlreadyExists` naming the work; the unshared green `NotShared` from A). Red with the hook off: the work's id
   named A. The fleet filter `a_holder` 16 of 16 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2,
   `verbs::` 62 of 62; fmt clean.
+
+### A-697 part b — A holder's work moves and drops its floor at its green's owner, by a monotone forwarded verb (2026-11-20, w-shared for UI goal 93; main's plan for A-697)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/ipc/src/protocol.rs`, `crates/server/src/verbs.rs`, `crates/server/src/work_home.rs`,
+`crates/server/tests/fleet.rs`.
+- **Change.** `RequestBody::MoveWorkFloor { green, work, base: Option<u64> }` and `ReplyBody::WorkFloorMoved`,
+  appended (wire order published). Where a work on a holder node moves its floor (its base rises) or drops it (the
+  work is destroyed, or its creation lost its name after the admission), `work_home::tell_floor` hands the change to
+  `tell_floor_over_fleet`: once the verb's transaction has committed and its change took, `MoveWorkFloor` is forwarded
+  from the control shard to the green's owner. Part a2 had counted such a change owed and left the floor at the owner.
+- **Why it needs no completion record.** The owner's rule is monotone (`verbs::move_work_floor`): a floor only rises, so a
+  lower or equal base is a no-op; a drop is final; and a work with no floor there (never admitted, or dropped) is left
+  without one, so a late, repeated or reordered move changes nothing. So it forwards as a read does (`forwards_as_read`,
+  its doc amended), and a lost one only keeps more history, as a lost floor message between shards does (A-247).
+- **Who may send it.** A node's verb: the owner serves it only from another node (the relayed principal names another
+  node's anchor) and only for a work another node made (the id's creator); a client of the holder is refused at its
+  channel (`route_gated`), a client of the owner by the owner's check, both `Unsupported`. The owner cannot yet tell
+  which node made the work from the anchor alone (an id names a member id, which is derived from the anchor and the
+  boot's nonce), so any other member may move such a floor; members are mutually authenticated.
+- **Counters.** `merge.work.floor_told_owner_node` (the test's non-vacuity count), `merge.work.floor_not_sent`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed` (two nodes at `f = 1`, B with the hook:
+  A's floor 1 after the creation; B's and A's clients refused `Unsupported`, the floor still 1; after B's destroy, A's
+  floor gone and B's counter moved). Red with the forward removed: A's floor never dropped (the poll gave up). Fleet
+  `a_holder_makes_a_work`, `a_holders_work_is_admitted`, `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2,
+  `verbs::` 62 of 62; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2 of 2; fmt clean.
