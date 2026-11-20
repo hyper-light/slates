@@ -54843,6 +54843,10 @@ Applied in the same change to:
   and `place::tests::a_repositorys_index_rows_route_by_its_cut_and_the_cut_steps_one_bit_at_a_time`; slates-db `--lib`
   180 of 180, `--test model` 26 of 26, both `wire_order` goldens; slates-server `repository:: takeover:: vcs_ssh::
   vcs_http:: git_protect:: lfs:: vcs_policy:: vcs_share::` 236 of 236.
+- **Piece 7, with a hot repository's large packs (2026-11-20).** BENCHMARKS.md, "A hot repository pushing large
+  packs": with v1.5.0's 9.8 MB packs in the mix, capped at 5 or 3 pushes to one repository, the small repositories' p99
+  is 3.07 and 3.63 times their fair share (within it without large packs); the wait is daemon-wide, to be profiled. Ten
+  such pushes to one repository end the daemon (A-722's proof must hold at ten).
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
