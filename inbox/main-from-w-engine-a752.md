@@ -58,3 +58,23 @@ compose_volume_planned scanned every entity and base file per path. Indexed: fla
 - Part 2 on base 0f6814561: merge 405/405, git 568/568; server full suite run 1: 1289 pass, 1 fail
   (`fleet::a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over`, a takeover test, not on the push
   path); run 2 under way. This Studio is at ~2 GB free memory with several agents' builds.
+
+## ~10:00 LANDED part 2 (595f0d8f2) and 2b (23eb15b49); part 3 measured (base 23eb15b49)
+- 2b: git's trees read an entry a unit: longest build unit 1.12 -> 0.22 ms, longest build turn 1.13 -> 0.49 ms
+  (t_a752, debug, 1,500 flat files), past_budget 0. Landed as one commit (my local "wip" commit was not landed).
+- The update's answer is still one 94 ms step (debug, 1,500 files). Where it goes (probes, cumulative, push_planned):
+  | part | ms | whose |
+  |---|---|---|
+  | secure (retention settle, fold) | 5.0 | mine (merge_service) |
+  | engine verdict (Green::judge) | 8.3 | mine |
+  | git store record (sealed_record) | 6.5 | w-git (A-722) |
+  | git store commit (vcs_store::commit) | 5.0 | w-git (A-722 4d) |
+  | engine commit | 10.9 | mine |
+  | recorded_entry (chain entries) | 4.7 | mine |
+  | record_all | 0.3 | - |
+  | vcs_store::paths::advance_after_push | 52.4 | g308's A-664 (no owner now?) |
+- Proposal: (1) I take paths::advance_after_push: the map's step over the change runs as whole_build's task does,
+  in slices after the answer (its own comment: nothing of the answer needs the map). (2) The verdict in the ready
+  turns (Green::compute resumable, judge_computed at the append). (3) The commit in turns: still need your call
+  (green held out across its commit's turns, or staged and published whole). (4) w-git's two store parts are theirs.
+  Going ahead with (1) and (2) unless you say otherwise.
