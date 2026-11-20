@@ -88,6 +88,13 @@ Never put a number in a commit for main that you haven't pushed to the ledger.
 `git checkout` and `git switch` stay banned, including `-b`. To name your work as a branch, use `git branch <name>` (the
 worktree stays where it is) or push it directly: `git push origin HEAD:refs/heads/<name>`.
 
+## PERFORMANCE GAPS ARE FIXED UP FRONT (ADA 2026-11-20 ~06:30 PST: "we address performance gaps upfront. Period")
+- A measured performance gap is fixed in the same piece, or as your very next piece, before any new feature. That covers
+  a step past its budget, a working set that grows with the input, RSS far above the design's bound, or a number far
+  from its target.
+- GAPS may name it only while that fix is in flight. Never write "owed" for a performance gap and move on.
+- A stopgap that shrinks a gap without bounding it is not the fix. Go straight to the bound.
+
 ## NEVER PAUSE ON A BLOCKER YOU CAN CLEAR (ADA 2026-11-20 ~02:40 PST)
 - Unsigned commits are fine. If a signer refuses (kiln's signer refuses non-kiln sessions), commit with
   `git -c commit.gpgsign=false commit ...`. Never stop to ask about signing.
