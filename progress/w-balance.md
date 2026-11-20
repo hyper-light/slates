@@ -80,3 +80,9 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   the crate's files fixed it. Prefer not to share the target across worktrees.
 - NEXT: P3b (once w-git answers or A-722 lands): share words per tool; hg/svn intakes Live; backpressure. Meanwhile P4
   cold trigger design.
+- Main's input (w-perf): snapshot slot 746,962,928 B fixed at boot; ~41 B/object after A-727. Designed P8 (snapshot
+  names sealed index tables by identity; slot derived per snapshot, grown by re-laid segment at handoff, typed
+  SnapshotRoom refusal) and P9 (index cut into 2^b ranges by object id, rendezvous over (family, range), b in the
+  record, split by doubling, push rows committed by owner's landing record). LANDED docs 3471c18a2. Note: config.rs
+  snapshot_bytes = 2 x table_bytes is the current boot derivation.
+- Queue: P3b (after w-git), P4 cold trigger, P5, P6 (ruling), P7, P8, P9.
