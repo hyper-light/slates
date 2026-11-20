@@ -60,7 +60,11 @@ def receive_pack_request(source: str, rev: str) -> tuple[bytes, str, int]:
 def derived_max() -> int:
     """The largest step: the open-file limit, raised to the hard limit, less a tenth for everything else."""
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    target = hard if hard != resource.RLIM_INFINITY else soft
+    target = hard
+    if hard == resource.RLIM_INFINITY:
+        # macOS reports no hard limit; the kernel's per-process ceiling is the real one.
+        ceiling = subprocess.run(["sysctl", "-n", "kern.maxfilesperproc"], stdout=subprocess.PIPE, text=True).stdout
+        target = int(ceiling.strip()) if ceiling.strip().isdigit() else soft
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
         soft = target
