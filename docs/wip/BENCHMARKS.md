@@ -15537,3 +15537,35 @@ What it says:
 
 Owed: the full clone over the wire (changesets, manifests derived, files) and an import's RSS in the daemon, once
 the shape is built there. And N=3 an arm on a quiet machine.
+
+## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
+
+- **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
+  from a `git archive` of its commit into one directory with fresh mtimes, into a target directory of its own; the
+  binaries differ. Before the rounds, one push on each: v2 counts no homing; v3 counts `homes.homed_in_region` 1 and
+  `homes.published_for_ticket` 1 (git/git v1.0.0's 12,232 names, about 500 KB, past one window: homed whole by its BLAKE3).
+- **The command:** `crates/cli/bench/push_load.py SLATES ~/.cache/g309-scale/src.git 'v1.0.0^{commit}' --max 10`
+  (a fresh daemon a run: 1 push, then 10 at once, each to its own repository), v2 and v3 alternating, ten rounds.
+  Studio-2 (Adas-Mac-Studio-2, 14 cores), load 5.0 to 6.5 with other agents' work: one node, so the names' one home is
+  the owner's own shard and the cost is the local keep and one publication of its shard (its delta).
+
+| round | v2 1 push | v3 1 push | v2 10, p50 | v3 10, p50 | v2 10, p99 | v3 10, p99 |
+|---|---|---|---|---|---|---|
+| 1 | 1.605 | 1.735 | 2.525 | 2.496 | 3.277 | 2.838 |
+| 2 | 1.399 | 1.125 | 2.004 | 1.544 | 2.890 | 2.608 |
+| 3 | 1.186 | 1.274 | 1.487 | 1.688 | 2.577 | 2.714 |
+| 4 | 1.330 | 1.359 | 1.967 | 1.872 | 2.782 | 2.812 |
+| 5 | 1.105 | 1.679 | 1.552 | 3.126 | 2.698 | 3.721 |
+| 6 | 1.255 | 0.995 | 1.634 | 1.403 | 2.770 | 2.560 |
+| 7 | 2.355 | 1.498 | 2.837 | 1.904 | 3.267 | 3.218 |
+| 8 | 2.074 | 1.887 | 2.651 | 2.417 | 3.392 | 2.966 |
+| 9 | 1.859 | 1.719 | 2.359 | 2.246 | 3.403 | 3.500 |
+| 10 | 1.198 | 1.403 | 1.710 | 1.825 | 2.878 | 3.116 |
+
+- **What it says.** Best of ten: one push 1.105 s (v2) against 0.995 s (v3); ten at once, p50 1.487 s against 1.403 s, p99
+  2.577 s against 2.560 s. Medians: 1.365 s against 1.451 s; 1.986 s against 1.888 s; 2.884 s against 2.902 s. The
+  difference is inside the rounds' own spread on a loaded host (round to round the same build moves by up to 1.2 s):
+  the barrier's publication costs a single node nothing measurable here. Across nodes the homing adds a region round
+  trip per push (the takeover test's three nodes: each survivor served 19 region exchanges for three pushes and their
+  heals); a three-node release A/B is owed.
+
