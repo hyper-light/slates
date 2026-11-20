@@ -12326,9 +12326,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > sections ends the response with git's band-3 words, as a pack refused midway ends. `serve` still chooses them before
 > it answers. Every upload test's exchange is answered both ways and held to the same bytes and refusal (its counters
 > too, but where a `sparse:oid` blob dies unread: in turns it dies before any walk, as git's `pack-objects` does).
-> Owed for git: the servers answering in turns within a request's room (piece 3, reverting A-713's shard room), protocol
-> v0's fetch in turns, what `begin` decides (`ready`, the cut) and `include-tag`'s scan in units, and a fetch held to
-> the index generation it began on (rule 4).
+> **Piece 3a BUILT (same day):** a walk's set keeps whichever form is smaller, runs or a bit table over its span
+> (`negotiation::Held`, Roaring's choice): a push's commits interleaved with their trees and blobs, every third
+> position, cost a bit each (3,000 of them about 1.1 KiB a set, where runs cost 48 KB); and a pack is framed in packets
+> of at most a quarter of the room left as it begins (`answer::packet_data`), the format's most where the room holds it
+> four times over, so the two packets it is framed through fit a request's room (they had cost two whole pkt-lines,
+> 128 KiB, past one ring region). A-582's clone is answered whole within 4 KiB, the same pack in more packets; with
+> each request held to 64 KiB, the 3,000-commit clone over the daemon's edge is answered whole, where it was refused
+> `the request needs more room than the server admits`. Owed for git: the servers admitting a request's room and
+> answering in turns (piece 3b, by use over HTTP and SSH), protocol v0's fetch in turns, `begin`'s `ready` and cut and
+> `include-tag`'s scan in units, a scattered plan's runs, and a fetch held to the index generation it began on (rule 4).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
