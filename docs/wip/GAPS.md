@@ -7079,7 +7079,11 @@
 >   `server/tests` since 2026-11-20 (g226, main's ruling): `recovery` (a connect, two create retries, a pool's return,
 >   a heartbeat's stop, a stop's end and nine condition loops), `give_back`, `cross_shard_wait`, `consumers`,
 >   `attachment_term`, `reply_room` and `forward_retry` wait on their event while the daemon lives, its watchdog the
->   bound (A-232). Owed: `client/tests` and its examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
+>   bound (A-232). In `client/tests` since 2026-11-20 (g226): `driver`, `merge_identity`, `merge_chaos`,
+>   `edit_and_submit`, `merge_post_state`, `async_core`, `waits`, `consumer`, `client` and `lone_daemon` (a connect is
+>   one claim, a full ring is waited out, a listing, a reply, an edit, a seat and a returned id are waited for while the
+>   daemon lives, a child's tagged line while the child lives, `lone_daemon`'s role a clear memory level in the host's
+>   place). Owed: the client's examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
 >   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
