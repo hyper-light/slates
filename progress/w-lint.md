@@ -75,4 +75,4 @@
 - RED (not mine, fails on main's own code): slates-vcs tests::the_same_bytes_from_git_and_mercurial_are_one_content_
   held_by_both_repositories (store.get None after the git release); suspects f3429bdcd (storage seam) / e064c2dc7.
 - Skipped loudly: slates-sdk-python on jupiter (pyo3-build-config: no Python 3 interpreter there).
-- Hourly cron now 1fe... (see session); includes the jupiter Windows lane.
+- Hourly cron aa63302c at :17 (session-only, 7-day expiry); includes the jupiter Windows lane.
