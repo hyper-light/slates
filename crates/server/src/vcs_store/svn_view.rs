@@ -321,6 +321,10 @@ const MERGEINFO_KEPT: bool = true;
 impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
   type Green<'a> = SvnView<'a>;
 
+  fn root_mount(&self) -> Option<std::path::PathBuf> {
+    crate::state::with_state(|state| state.root_mount.clone()).flatten()
+  }
+
   fn holds(&self, id: RepositoryId) -> bool {
     crate::state::with_state(|state| state.vcs_stores.subversion_records(id).is_some())
       .unwrap_or(false)

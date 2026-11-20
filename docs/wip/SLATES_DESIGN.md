@@ -55969,8 +55969,25 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `svnadmin verify` passes the view, `svnadmin dump` and `--deltas` give `full.dump` and `deltas.dump` byte for byte,
   `svnlook changed` gives `changed.txt`, and `svnlook -t` reads each work as `-r` reads its revision. The A/B against
   P1's whole texts is in BENCHMARKS.md (128 and 460 times fewer view bytes, reads 8 and 27 times faster).
-- **Owed.** P3 (the presenter under SLATES_ROOT, after A-727 a2: the hook drivers handing the view's path as REPOS),
-  P4, the root mount's publication.
+- **Part 3, its second piece (2026-11-20, main's ruling 1): a hook is shown its repository beneath the root mount the
+  daemon published, and refused, typed, before there is one.** No configured value: the daemon's own record of the
+  root mount it published (`ShardState::root_mount`, written on every shard by `Daemon::record_root_mount`, which the
+  root mount's publication calls, A-645 (a), owed). Subversion's hooks (svn://, svn+ssh://, DAV) are given REPOS
+  `<root mount>/<repository>`; before publication a configured hook is never started and its point is refused
+  `SVN_ERR_UNSUPPORTED_FEATURE` "This server cannot run this repository's hooks: its root mount is not yet published"
+  (post-commit's `post-commit-err` too). The fallback REPOS `/<name>`, a path that held nothing, is gone (banned item 7).
+  A git push whose repository configures a hook is refused `root mount not yet published` before publication, and `hook
+  not run` after while nothing yet shows its view. The tunnel reads the root through its stores
+  (`vcs_ssh::svn::SvnStores::root_mount`), the listener and the DAV site from the shard. Red first:
+  `vcs_svn::tests::a_hook_before_the_root_mount_is_published_is_refused_typed` (the hook ran with REPOS `/<name>`; now
+  refused, never run, revision 0) and the git push test's refusal (`hook not run` before; now `root mount not yet
+  published`, and `hook not run` after publication); every hook test that runs a hook publishes a root and holds REPOS to
+  it. macOS arm64, main 359da238: `slates-server --lib` vcs_svn, vcs_ssh, vcs_http, git_push, git_hooks, svn_hooks,
+  hook_driver, vcs_hooks 227 of 228, the one failure `vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_
+  lands_a_stock_commit` ("The commit's texts were not made durable: Unanswered"), which fails alike on main 359da238
+  without this change.
+- **Owed.** P3's presenter (the view a hook runs in, under the root mount, once the vfs's referenced file is agreed with
+  w-perf, main's ruling 2), P4, the root mount's publication (A-645 (a)).
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
