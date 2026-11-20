@@ -34,6 +34,11 @@ READS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(READS)
 
 URL = READS.URL
+# The last item of a replay's and a replay-range's answer: `finish-replay`, then the command's success. A scripted
+# session waits for it before it closes.
+DONE = b"( finish-replay ( ) ) ( success ( ) ) "
+# The mirror's fixed identity, so its dump is the same on every run (`svnadmin setuuid`).
+MIRROR_UUID = "00000000-0000-4000-8000-00000000a703"
 
 
 def command(name, *params):
@@ -85,6 +90,7 @@ def main():
     stock("svnrdump-dump", "svnrdump", ["dump", URL], keep="svnrdump-dump.dump")
     mirror = os.path.join(workdir, "mirror")
     READS.run(["svnadmin", "create", mirror])
+    READS.run(["svnadmin", "setuuid", mirror, MIRROR_UUID])
     hook = os.path.join(mirror, "hooks", "pre-revprop-change")
     with open(hook, "w") as handle:
         handle.write("#!/bin/sh\nexit 0\n")
@@ -95,8 +101,16 @@ def main():
     READS.write(outdir, "svnsync.dump", READS.run(["svnadmin", "dump", "--quiet", mirror]).stdout, written)
     opening = READS.opening_items(greeting)
     for name, commands in SCRIPTED.items():
+        # The connection stays open while svnserve answers: a replay's editor watches its client's input, and an
+        # input that ends mid-drive is answered `abort-edit` and "Network connection closed unexpectedly" (210002).
         peer = socket.create_connection(("127.0.0.1", READS.PORT), timeout=READS.STEP_SECONDS)
         peer.sendall(opening + b"".join(commands))
+        answered = bytearray()
+        while not answered.endswith(DONE):
+            data = peer.recv(READS.CHUNK)
+            if not data:
+                break
+            answered.extend(data)
         peer.shutdown(socket.SHUT_WR)
         while peer.recv(READS.CHUNK):
             pass
