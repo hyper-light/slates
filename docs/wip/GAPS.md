@@ -2835,6 +2835,17 @@
 > - **Owed (A-354):** the reply a write through the successor held waited without a bound; held replies of the slates
 >   protocol are judged by no time bound (NFS and FUSE judge theirs by `durable_bound` up to the failover SLO).
 
+> **A forward lane's floor was logged once a forward: about a million lines, 260 MB, in one flow (2026-11-20; CLOSED,
+> g226; found by w-fed-faults).** A lane left with nothing was dropped, so each forward made it afresh and measured its
+> floor from nothing; where the floor sat past the failover delay (3,102 ms against 3,100), every forward crossed it
+> again and `forward_lane::note_floor` wrote a line (CLAUDE.md §2 item 8). A lane is now kept while idle (idle lanes of
+> peers gone from the configuration are pruned, `ForwardLanes::prune_idle`), and a floor is said only where the log's
+> last line about the lane differs from what is so, at most once a window (the longer of the delay and the floor), with
+> the crossings since (`fleet.forward.floor_logged`). Test: `a_lane_measured_past_the_failover_delay_logs_it_once`
+> (`crates/server/tests/fleet.rs`, 40 forwards through b; Adas-Mac-Studio-4, 2026-11-20, the delay held at 1 s, the
+> floor 3,107 ms: 1 crossing and 1 line with the fix, 41 crossings and 41 lines with `forward_lane.rs` reversed) and
+> `an_idle_lane_is_kept_for_a_member_and_pruned_for_a_peer_gone` (`crates/server/src/forward_lane.rs`).
+
 > **A verb's reply held for durability had no time bound: refused at the failover SLO (2026-11-18, A-354, §4.10 "Live
 > shipping"; g230).** `live_ship::defer` and `defer_destroy` held a reply until its log was durable, its owner fenced or
 > its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21

@@ -6868,6 +6868,16 @@ version.
 > `a_forward_is_never_refused_below_its_paths_floor` (a 1 s SLO, below any path's silence window: answered after 2.04 s,
 > refused at 1.004 s with the floor removed;
 > `docs/bugs/2026-11-18-a-starved-forward-lane-was-judged-on-the-wall.md`).
+>
+> **Status (2026-11-20, a lane's floor said once).** A lane is kept while it is idle, so what it measured of its path
+> outlives a forward; idle lanes of peers no longer in the council's configuration are pruned as forwards are queued
+> (`ForwardLanes::prune_idle`), which bounds the lanes by the members and the lanes in use. A lane's floor is said in
+> the log only where what the log last said of the lane differs from what is so now, at most once a window, the longer
+> of the failover delay and the floor (one forward's whole life), and each line tells the crossings since the last
+> (`forward_lane::note_floor`, counted `fleet.forward.floor_logged`). Before, a lane left with nothing was dropped and
+> the next forward made it afresh, its floor measured from nothing, so every forward crossed the delay again and logged:
+> about a million lines, 260 MB, in one of w-fed-faults' flows (CLAUDE.md §2 item 8). Test:
+> `a_lane_measured_past_the_failover_delay_logs_it_once`.
 
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
@@ -32840,8 +32850,8 @@ Applied in the same change to:
   stall budget), the link's redial pace, and four probe timeouts (the stall budget's tail, the replacement's handshake,
   its first discovery page, and the forward's exchange). Each driving turn measures it on the session it borrowed. The
   floor never lowers a forward's bound: a replacement's fresh estimator measures a shorter one than the silent session
-  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log once a crossing
-  and counts it (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
+  did. Where the floor passes the SLO, the SLO cannot be met on that path: the lane says so in the log, at most once a
+  window since 2026-11-20 (§4.8's status of that day), and counts each crossing (`fleet.forward.floor_past_slo`), and each forward it holds is counted (`fleet.forward.held_past_slo`),
   as A-129 runs the fleet's timers at their measured floors and reports the overrun.
 - **Why the floor and not a longer SLO.** The SLO is the operator's; the floor is the path's, and only the path knows
   it. On loopback, quiet, the floor is about 3.1 s (the window floored at three initial probe timeouts, about 2 s), inside
