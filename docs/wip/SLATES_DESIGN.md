@@ -52304,8 +52304,9 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
   source's head is the version it was made at (BUILT 2026-11-20, `paths::branch_before`: the branch's version 0 is that
   version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (BUILT 2026-11-20 through A-636 part 2c-2: a successor's
-  rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a copy
-  made through a work
+  rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
+  recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
+  `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
   by the same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
@@ -54328,3 +54329,23 @@ Applied in the same change to:
   protected_fixtures store:: upload::` 224 passed, 4 ignored, the new test named; fmt clean.
 - **Owed.** Part 3: git's intake keeping into the repository's store as the pack is read (the session and the push
   driver over a store keeper, the checks reading objects back from it), on w-perf's byte table once it lands.
+
+### A-664 sliced whole builds, part 1 — A recovery's remake of a green's map steps a file a unit (2026-11-20, w-shared for UI goal 93)
+- **Why.** A recovery made each git green's map and trees again from its head in one unit of its slices
+  (`crate::recovery_slices`): putting every file of the head, hashing each as git's blob, then building the map and
+  trees. A green of many files is one unit as long as its build, so the watchdog, which judges a shard that runs a
+  liveness window of CPU without a step, could end a daemon restarting over a large repository.
+- **Change.** `paths::remake_green_sliced`, which `vcs_store::recover` calls for each member green: the head's files
+  put one a unit of the recovery's slices (`put_sliced`), then the map and trees built of them and kept as
+  `remake_green` keeps them (`Plan::Put`, through `made_holding`, which gives the put files' holds back with the
+  step's own, past a refusal too). A recovery runs alone on its shard, so nothing reads the green or its store between
+  units. `remake_green` stays for a rebuild and a successor's (both run inside one step of a verb or a period).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::paths::tests::t_a664_sliced_a_recoverys_whole_build_steps_a_file_a_unit` (six files, the map given back,
+  remade in slices whose least is a nanosecond: polled more than once, six units, the map equal to its model, remade
+  once): `cargo test --locked -p slates-server --lib -- vcs_store::paths:: vcs_store::commits:: vcs_store::tests
+  --test-threads=4` 26 of 26; fmt clean.
+- **Owed.** The map's and trees' build of the put files in slices of their own (one unit now); the live whole builds
+  (a push's, a green's first submit's, one past a copy), whose version's made commit needs the trees in the version's
+  own transaction; a whole map's release (`ContentStore::release`'s cascade) a unit at a time; recovery's timing over a
+  large repository (main's).

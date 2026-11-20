@@ -48,15 +48,18 @@
 > branch was made at (its version 0); built whole otherwise (`paths::branch_before`; macOS arm64, this Mac, local).
 > The holders' maps (2026-11-20, w-shared): BUILT through A-636 part 2c-2's rebuild: a successor's rebuilt repository
 > makes its store and each member green's map and trees from its adopted head (`vcs_store::make_whole`), as a rebuild
-> does (macOS arm64, this Mac, local).
+> does (macOS arm64, this Mac, local). A recovery's whole builds sliced (2026-11-20, w-shared): BUILT, the head's files
+> put one a unit of the recovery's slices (`paths::remake_green_sliced`), then the map and trees built of them (macOS
+> arm64, this Mac, local).
 > OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); the holders'
 > commits (the merge record carrying the version's principal, time and message, so every holder makes the same
 > commit; a register entry's objects reach no holder yet, A-636); a branch `CreateBranch` makes named by a ref from its
 > creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
-> holding the blobs its version's chain entry holds already, once, by reference; the maps' whole builds and a
-> whole map's release sliced a unit at a time (each is one step, as A-662's replay of a record is); a branch's first
+> holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
+> push's, a green's first submit's, past a copy) and a whole map's release sliced a unit at a time, and the build of
+> the put files in slices of its own (a recovery's remake puts the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
