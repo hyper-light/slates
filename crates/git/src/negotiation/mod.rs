@@ -383,6 +383,18 @@ pub struct Negotiating<G, N> {
   selecting: objects::Selecting<N, G>,
 }
 
+impl<G, N> Negotiating<G, N> {
+  /// The acknowledgments the answer gives before its pack, `None` after `done`.
+  pub fn acknowledgments(&self) -> Option<&Acknowledgments> {
+    self.acknowledgments.as_ref()
+  }
+
+  /// The shallow-info section, when one is due.
+  pub fn shallow_info(&self) -> Option<&ShallowInfo> {
+    self.shallow_info.as_ref()
+  }
+}
+
 impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
   /// Does units of the choice until `spent` says the owner's quantum is spent, at least one (each a commit or a tree
   /// entry): the outcome once the last object is chosen, `None` while more are left.

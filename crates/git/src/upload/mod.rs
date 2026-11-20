@@ -393,11 +393,38 @@ pub fn serve<P: PackSource>(
   packs: &mut P,
   admission: &mut Admission,
 ) -> Answer<P::Pack> {
+  serve_with(served, version, asked, packs, admission, false)
+}
+
+/// [`serve`], a protocol v2 `fetch`'s choice of the objects its pack sends one by one left to the answer's steps
+/// (A-745, §4.17.1 "A fetch's answer" rule 3): the answer is made with what the request bounds decided and the sections
+/// before the pack encoded, and [`Answer::write_within`] then chooses the objects a unit at a time within its owner's
+/// quantum, lent the repository for each step, before the pack begins. Everything else is answered as [`serve`]
+/// answers it.
+pub fn serve_in_turns<P: PackSource>(
+  served: &Served<'_>,
+  version: Version,
+  asked: Asked<'_>,
+  packs: &mut P,
+  admission: &mut Admission,
+) -> Answer<P::Pack> {
+  serve_with(served, version, asked, packs, admission, true)
+}
+
+/// [`serve`] or [`serve_in_turns`], as `turns` says.
+fn serve_with<P: PackSource>(
+  served: &Served<'_>,
+  version: Version,
+  asked: Asked<'_>,
+  packs: &mut P,
+  admission: &mut Admission,
+  turns: bool,
+) -> Answer<P::Pack> {
   let made = match (version, asked) {
     (Version::V2, Asked::Advertise) => advertise::answer(served.repository.format(), admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
-    (Version::V2, Asked::Request(bytes)) => request(served, bytes, packs, admission),
+    (Version::V2, Asked::Request(bytes)) => request(served, bytes, packs, admission, turns),
     (Version::V0 | Version::V1, Asked::Advertise) => v0::advertisement(served, version, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
@@ -414,6 +441,7 @@ fn request<P: PackSource>(
   bytes: &[u8],
   packs: &mut P,
   admission: &mut Admission,
+  turns: bool,
 ) -> Result<Answer<P::Pack>, Refused> {
   refs::check_order(served.refs).map_err(Refused::plain)?;
   let command = match request::decode(bytes, admission) {
@@ -423,7 +451,7 @@ fn request<P: PackSource>(
   };
   advertise::check(&command, served.repository.format()).map_err(Refused::plain)?;
   let graph = StoreGraph::new(served.repository, served.store, served.refs);
-  command_answer(served, &graph, &command, packs, admission)
+  command_answer(served, &graph, &command, packs, admission, turns)
 }
 
 /// Answers `command`, held to the advertisement already.
@@ -433,12 +461,13 @@ fn command_answer<P: PackSource>(
   command: &CommandRequest<'_>,
   packs: &mut P,
   admission: &mut Admission,
+  turns: bool,
 ) -> Result<Answer<P::Pack>, Refused> {
   match &command.arguments {
     Arguments::LsRefs(arguments) => refs::ls_refs(graph, served, arguments, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),
-    Arguments::Fetch(arguments) => fetch::answer(graph, served, arguments, packs, admission),
+    Arguments::Fetch(arguments) => fetch::answer(graph, served, arguments, packs, admission, turns),
     Arguments::ObjectInfo(arguments) => object_info_answer(served, arguments, admission)
       .map(Answer::whole)
       .map_err(Refused::plain),

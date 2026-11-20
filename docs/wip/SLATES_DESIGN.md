@@ -12318,10 +12318,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > spent, at least one unit a step, a commit from the walk's queue or an entry from a tree walk's stack, its place kept:
 > the commit walk, what the client holds, the sent commits' trees, the wants, `include-tag`); `negotiate` is the same
 > stepped to its end, and a sparse walk's frames are held while they live, given back as they are left. Held to the
-> negotiation's oracle and to the whole answer on 1,024 generated requests stepped a unit at a time. Owed for git: the
-> answer stepping it within the owner's quantum (piece 2b part 2: `upload::Answer::write`), what `begin` decides
-> (`ready`, the cut) and `include-tag`'s scan in units too, and the server within a request's room (piece 3, reverting
-> A-713's shard room).
+> negotiation's oracle and to the whole answer on 1,024 generated requests stepped a unit at a time. **Piece 2b part 2
+> BUILT (same day):** `upload::serve_in_turns` answers a protocol v2 `fetch` with the sections before its pack encoded
+> from what `begin` decided, and `Answer::write_within` chooses the pack's objects within its owner's quantum (the
+> repository lent for each write), then begins the pack; a choice refused, or a pack that cannot begin, after those
+> sections ends the response with git's band-3 words, as a pack refused midway ends. `serve` still chooses them before
+> it answers. Every upload test's exchange is answered both ways and held to the same bytes and refusal (its counters
+> too, but where a `sparse:oid` blob dies unread: in turns it dies before any walk, as git's `pack-objects` does).
+> Owed for git: the servers answering in turns within a request's room (piece 3, reverting A-713's shard room), protocol
+> v0's fetch in turns, what `begin` decides (`ready`, the cut) and `include-tag`'s scan in units, and a fetch held to
+> the index generation it began on (rule 4).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
