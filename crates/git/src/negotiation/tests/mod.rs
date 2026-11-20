@@ -1810,7 +1810,7 @@ fn a_rewrite_between_takes_the_walk() {
     panic!("{:?}", outcome.answer)
   };
   assert!(pack.runs.is_empty());
-  assert_eq!(nodes(&pack), [blob, tree, side, top]);
+  assert_eq!(nodes(pack), [blob, tree, side, top]);
   assert_eq!(outcome.counters.one_round, 0);
   assert!(outcome.counters.walked >= 2);
 }

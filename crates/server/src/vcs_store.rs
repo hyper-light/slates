@@ -109,6 +109,8 @@ pub(crate) mod lfs_record;
 pub(crate) mod owed;
 pub(crate) mod paths;
 pub(crate) mod record;
+#[cfg_attr(not(test), allow(dead_code))] // Owed caller: record v3 (w-perf's A-727 (b)).
+pub(crate) mod record_names;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
 pub(crate) mod svn_view;
@@ -1214,6 +1216,9 @@ pub(crate) struct SealedPush {
   keyed: Vec<RecordedMove>,
   /// The record's objects, until a commit takes them.
   objects: RecordWriter,
+  /// Moves admitted a turn at a time before their append (A-722 part 4c, `git_push`'s judge), each taken by its append
+  /// while its green's head is still the one it was admitted from.
+  prepared: Vec<Move>,
 }
 
 impl SealedPush {
@@ -1250,10 +1255,28 @@ impl SealedPush {
     stores: (&mut Store, &mut VcsStores),
     moves: Vec<RecordedMove>,
   ) -> Result<(), GitRefused> {
-    let (repository, push) = (self.repository, &self.push);
+    let (repository, push, prepared) = (self.repository, &self.push, &mut self.prepared);
     let admitted = lent_to_read(stores, |stores| {
       let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
-      admit_moves(content, store, push, &moves)
+      moves
+        .iter()
+        .map(|(green, _, head)| {
+          let taken = head.and_then(|to| {
+            let current = store.repository.current_head(*green);
+            let at = prepared
+              .iter()
+              .position(|admitted| admitted.to() == Some(to) && admitted.from_head() == current)?;
+            Some(prepared.swap_remove(at).of_green(*green))
+          });
+          match taken {
+            Some(admitted) => Ok(admitted),
+            None => store
+              .repository
+              .admit(content, push, *green, *head)
+              .map_err(GitRefused::Store),
+          }
+        })
+        .collect::<Result<Vec<Move>, GitRefused>>()
     })?;
     self.moves = admitted;
     self.keyed = moves;
@@ -1263,6 +1286,49 @@ impl SealedPush {
   /// Gives back every hold the push took: a push no append committed. One a commit took holds nothing.
   pub(crate) fn abandon(self, state: &mut ShardState) {
     abandon_push(state, self.push);
+  }
+
+  /// One turn of the admission of the move of the green keyed `green` to `to` (A-722 part 4c), begun where `admitting`
+  /// holds none, for `ns` of the shard's clock and a unit at least: whether it is done, its move kept for its append
+  /// ([`SealedPush::admit`]). A refusal ends it, the append admitting the move again and answering the refusal there.
+  pub(crate) fn admission_turn(
+    &mut self,
+    state: &mut ShardState,
+    (green, to): (u64, ObjectId),
+    (admitting, ns): (&mut Option<slates_git::store::Admitting>, u64),
+  ) -> bool {
+    let (repository, push, prepared) = (self.repository, &self.push, &mut self.prepared);
+    if prepared.iter().any(|admitted| admitted.to() == Some(to)) {
+      return true;
+    }
+    let turned = lent_to_read((&mut state.store, &mut state.vcs_stores), |stores| {
+      let (content, store) = stores.git_ref(repository).ok_or(GitRefused::NoStore)?;
+      let mut begun = match admitting.take() {
+        Some(begun) => begun,
+        None => store
+          .repository
+          .admitting(content, push, green, to)
+          .map_err(GitRefused::Store)?,
+      };
+      let mut clock = crate::git_push::ShardClock;
+      let quantum = slates_git::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns,
+      };
+      let done = store
+        .repository
+        .admit_turn(content, push, &mut begun, quantum)
+        .map_err(GitRefused::Store)?;
+      if done {
+        if let Some(admitted) = begun.admitted() {
+          prepared.push(admitted);
+        }
+      } else {
+        *admitting = Some(begun);
+      }
+      Ok::<bool, GitRefused>(done)
+    });
+    turned.unwrap_or(true)
   }
 }
 
@@ -1321,7 +1387,7 @@ impl GitPush {
     loop {
       match sealing.turn(state, u64::MAX)? {
         SealTurn::More(more) => sealing = *more,
-        SealTurn::Sealed(sealed) => return Ok(sealed),
+        SealTurn::Sealed(sealed) => return Ok(*sealed),
       }
     }
   }
@@ -1392,8 +1458,8 @@ pub(crate) struct SealingPush {
 pub(crate) enum SealTurn {
   /// More turns remain (boxed: the push is most of its size).
   More(Box<SealingPush>),
-  /// Sealed and staged.
-  Sealed(SealedPush),
+  /// Sealed and staged (boxed too: a sealed push is hundreds of bytes).
+  Sealed(Box<SealedPush>),
 }
 
 impl SealingPush {
@@ -1418,13 +1484,14 @@ impl SealingPush {
     });
     match turned {
       Ok(false) => Ok(SealTurn::More(Box::new(self))),
-      Ok(true) => Ok(SealTurn::Sealed(SealedPush {
+      Ok(true) => Ok(SealTurn::Sealed(Box::new(SealedPush {
         repository,
         push: self.push.push,
         moves: Vec::new(),
         keyed: Vec::new(),
         objects: self.push.record,
-      })),
+        prepared: Vec::new(),
+      }))),
       Err(refused) => {
         self.abandon(state);
         Err(refused)

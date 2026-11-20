@@ -4468,8 +4468,9 @@ const RETENTION_EDITS: u64 = 6;
 /// lagging work still names the old version the copies are kept for it (the fold floor is its base),
 /// a conflicting submit from it is cached and charged too, and destroying it raises the floor to the
 /// head, folds every copy away and credits the charge — so only the rejected-result cache remains
-/// charged. Non-vacuous: the history grew with the edits before the fold (by less than one copy of the file for all of
-/// them) and is zero after it, and every observation has `charged == history + rejected`.
+/// charged. Non-vacuous: the history grew with the edits before the fold (the earlier file once, which the lagging work
+/// keeps, and what the edits wrote: under two copies for all of them, A-728 part 4's honest charge) and is zero after
+/// it, and every observation has `charged == history + rejected`.
 #[test]
 fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded() {
   let (daemon, instance) = daemon("merge-retention");
@@ -4486,11 +4487,14 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
     submit_accepted(&mut client, writer, 2 + edit);
   }
   let retained = daemon.merge_retention(g).unwrap();
+  // The honest charge (A-728 part 4, main's ruling): the lagging work keeps the file as it was before the edits, once,
+  // which the history holds (its earlier block); the edits add what they wrote. Never a copy per edit (W2).
+  let file = RETENTION_FILE_BYTES as u64;
   assert!(
-    retained.history > 0 && retained.history < RETENTION_FILE_BYTES as u64,
-    "the small edits retained what they changed for the lagging work, less than one copy of the file for all \
-     of them (W2: a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
-    RETENTION_EDITS * RETENTION_FILE_BYTES as u64
+    retained.history >= file && retained.history < 2 * file,
+    "the small edits retained the earlier file once for the lagging work and what they wrote, under two copies of \
+     the file for all of them (W2: a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
+    RETENTION_EDITS * file
   );
   assert_balanced(&retained, 0);
 

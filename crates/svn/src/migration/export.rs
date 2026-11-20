@@ -799,10 +799,7 @@ fn window_room() -> Result<NonZeroUsize, MigrationRefusal> {
 }
 
 /// The bytes of `text`, the empty text for none.
-fn bytes_of<'r>(
-  repository: &'r Repository,
-  text: Option<Text>,
-) -> Result<&'r [u8], MigrationRefusal> {
+fn bytes_of(repository: &Repository, text: Option<Text>) -> Result<&[u8], MigrationRefusal> {
   match text {
     Some(text) => repository
       .content(&text.identity)

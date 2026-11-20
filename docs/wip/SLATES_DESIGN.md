@@ -12302,8 +12302,9 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
 > shard's room and quantum, the stream compressed as it is made; the red passes. Piece 2b BUILT: SSH the same
 > (`Stdio::stream`, `vcs_ssh::hg`). Rule 4 BUILT: a streamed answer holds its generation (`hg_view::Generation`, a
-> fork of the index with the register's roots and bookmarks), every turn lent a view over it. Owed: the stream clone
-> (piece 3), git's upload-pack (w-git).
+> fork of the index with the register's roots and bookmarks), every turn lent a view over it. Piece 3 BUILT: the stream
+> clone (`stream_out`) is sent a row at a time (`slates_hg::render::Streaming`, counted first from the rows alone).
+> Owed: `stream2`, git's upload-pack (w-git).
 > **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
 > fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
 > none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
@@ -12318,10 +12319,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > spent, at least one unit a step, a commit from the walk's queue or an entry from a tree walk's stack, its place kept:
 > the commit walk, what the client holds, the sent commits' trees, the wants, `include-tag`); `negotiate` is the same
 > stepped to its end, and a sparse walk's frames are held while they live, given back as they are left. Held to the
-> negotiation's oracle and to the whole answer on 1,024 generated requests stepped a unit at a time. Owed for git: the
-> answer stepping it within the owner's quantum (piece 2b part 2: `upload::Answer::write`), what `begin` decides
-> (`ready`, the cut) and `include-tag`'s scan in units too, and the server within a request's room (piece 3, reverting
-> A-713's shard room).
+> negotiation's oracle and to the whole answer on 1,024 generated requests stepped a unit at a time. **Piece 2b part 2
+> BUILT (same day):** `upload::serve_in_turns` answers a protocol v2 `fetch` with the sections before its pack encoded
+> from what `begin` decided, and `Answer::write_within` chooses the pack's objects within its owner's quantum (the
+> repository lent for each write), then begins the pack; a choice refused, or a pack that cannot begin, after those
+> sections ends the response with git's band-3 words, as a pack refused midway ends. `serve` still chooses them before
+> it answers. Every upload test's exchange is answered both ways and held to the same bytes and refusal (its counters
+> too, but where a `sparse:oid` blob dies unread: in turns it dies before any walk, as git's `pack-objects` does).
+> Owed for git: the servers answering in turns within a request's room (piece 3, reverting A-713's shard room), protocol
+> v0's fetch in turns, what `begin` decides (`ready`, the cut) and `include-tag`'s scan in units, and a fetch held to
+> the index generation it began on (rule 4).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -22656,8 +22663,10 @@ named below, BENCHMARKS, GAPS.
 
 Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1, on main since
 2026-11-17 (g231). Step two (a work on the creating client's node, with the forward lanes of
-`crates/server/src/forward_lane.rs`) is not built: a `CreateWork` forwarded from another node still places the work on
-the green's shard. A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+`crates/server/src/forward_lane.rs`) is being built by A-697, with production routing unchanged until its last piece: a
+`CreateWork` forwarded from another node still places the work on the green's shard. Part a1 (2026-11-20): the green's
+owner admits a work another node will hold by `AdmitWork`, a forwarded verb, judging the relayed principal's rights from
+its green's record and recording the work's floor at the head (`verbs::admit_work`, `verbs::owner_admit`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -55550,6 +55559,26 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4c — A move is admitted a unit at a time before its append (2026-11-20, w-git for UI goal 93)
+- **Change.** `slates_git::store::Admitting` (`Repository::admitting`, `admit_turn`): A-614's admission of a move (the
+  walk of what it brings against the green's reached set, the fast-forward's descent by generation number, the search
+  for a base green, the walk beyond the base) cut into units, an object or a commit each; `Repository::admit` runs the
+  same units to their end. `slates_git::receive::Judge::ready` (default ready at once) lets a judge prepare a command
+  over turns before its verdict; the server's judge admits the command's move there (`SealedPush::admission_turn`, the
+  shard's step quantum a turn) and keeps it, and the append takes it whole while its green's head is still the one it
+  was admitted from (`SealedPush::admit`), admitting again otherwise.
+- **Measured** (debug, this Mac, one command bringing 3,502 objects of a 3,500-file tree, load 20 to 30): the work build
+  374 to 642 ms, the entry's apply 114 to 196 ms, the append's judge 67 to 86 ms, the store's commit 21 to 119 ms, the
+  store's admission 13 to 58 ms (now turns), the seal 59 to 163 ms (turns since part 4b). Sent to main: the work build
+  and the apply grow with the head's files and are the works' and merge's.
+- **Tests.** `slates-git` `store::tests::a_move_admitted_a_unit_a_turn_is_the_move_admitted_whole` (a create and a
+  fast-forward); `slates-server` `vcs_store::tests::t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands`.
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-git --lib -- receive:: store::` 138 passed, 4 ignored
+  (and `store:: upload:: receive:: hook_view` 204 before the receive change); `slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 185 passed; fmt clean.
+- **Owed.** The store commit's whole passes (members' positions, landed runs, holds' release) and a stale restage
+  sliced; the work build and the entry's apply (works, merge).
+
 ### A-722 part 4b — A push is sealed and staged a unit at a time (2026-11-20, w-git for UI goal 93; main's ruling: what a push's landing ran whole held its shard past the watchdog's window at git/git's size)
 - **Change.** `slates_git::store::Staging` (`Repository::sealing`, `staging`, `stage_turn`): the seal and stage cut into
   units, a turn taking as many as its quantum allows and one at least: a commit's generation number; a held object
@@ -56041,3 +56070,24 @@ at each append and each snapshot); `crates/server` (`content_ranges`: the regist
   as 3); `cargo test --locked -p slates-server --lib -- repository::svn_commit:: vcs_svn vcs_store:: identities::
   --test-threads=4` 116 of 116; fmt clean.
 - **Owed.** A stock `svn log -v` and `svn checkout` over the made copy by use (main's).
+
+### A-697 part a1 — The green's owner admits a work another node holds, by a forwarded verb (2026-11-20, w-shared for UI goal 93; main's plan for A-697, the briefs' g305)
+Applied in the same change to: §4.16 (A-247's status, step two), GAPS (A-247's step two), `crates/ipc/src/protocol.rs`,
+`crates/server/src/verbs.rs`, `crates/server/src/daemon.rs`, `crates/server/tests/fleet.rs`.
+- **Change.** `RequestBody::AdmitWork { green, work }` and `ReplyBody::WorkAdmitted { id, base }`, appended (wire order
+  published). The node that will hold a work over a green another node owns asks the owner: the verb names the green, so
+  it forwards as a write under the forward's completion record (`run_forwarded`, keyed by the authenticated origin), and
+  a resent ask is answered once. On the owner, `verbs::admit_work` serves it only when the request came from another
+  node (the request's origin is not this node's anchor); a client of the owner's node asks for a work by `CreateWork`,
+  and this verb from one is refused `Unsupported`. It runs `owner_admit`, as a work made on another shard of the
+  owner's node is admitted: the relayed principal's rights from the green's record (`NotShared` for a principal of
+  another node the green is not shared with, `Forbidden` without the right, `NotFound` for no such green), and the
+  work's floor recorded at the green's head (`WorkFloorSet`), which keeps that version's history while the work reads
+  it. Production routing is unchanged: nothing asks it yet; part a2 serves the holder's `CreateWork` on the holder
+  behind a test hook and asks it.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_is_admitted_by_its_greens_owner_once_and_by_the_owners_rights_alone` (two nodes at `f = 1`: B's ask
+  admitted by A at base 1, the head, and A's floor for the work at 1 read back by `Daemon::work_floor`; the resend
+  answered equal; the unshared green refused `NotShared` with no floor; A's own client refused `Unsupported`);
+  `a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`; `slates-server --lib work_home`
+  2 of 2; `slates-ipc --lib protocol` 5 of 5, `--test wire_order` published and 2 of 2; fmt clean.

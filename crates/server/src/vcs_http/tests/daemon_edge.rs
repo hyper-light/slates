@@ -1361,6 +1361,65 @@ fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons
   assert_eq!(payload.get(found..found + large.len()), Some(large));
 }
 
+/// A-745 (§4.17.1 "A fetch's answer"; found by use, w-interop: `clone --stream` of Mercurial's own history refused
+/// `PastAdmission`). Do: start a two-shard daemon whose edge serves loopback TLS, each request admitted one ring region;
+/// push one changeset whose one file is twice that room; then ask `stream_out` as `hg clone --stream` asks it. Expect
+/// `200` in `application/mercurial-0.1`, the answer `0` and its counts, and the file's revlog carrying its bytes whole:
+/// the revlogs sent a row at a time, never rendered whole within one request's room.
+#[test]
+fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let room = super::bounds_of(&crate::DaemonConfig::derive(
+    &crate::daemon::test_profile(),
+    &instance,
+    Some(SHARDS),
+  ))
+  .room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let mut state = 0x6a09_e667_f3bc_c908u64;
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|_| {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      state.to_be_bytes()[0] | 1
+    })
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let (port, certificate) = edge;
+  let request = format!(
+    "GET /{name}?cmd=stream_out HTTP/1.1\r\nHost: localhost\r\nAccept: application/mercurial-0.1\r\n{}\r\n\r\n",
+    owner_bearer()
+  );
+  let streamed = typed_exchange(port, certificate, request.as_bytes());
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(
+    (streamed.0, streamed.1.as_str()),
+    (200, "application/mercurial-0.1"),
+    "{}",
+    String::from_utf8_lossy(&streamed.2[..streamed.2.len().min(200)])
+  );
+  assert!(
+    streamed.2.starts_with(b"0\n"),
+    "{:?}",
+    &streamed.2[..streamed.2.len().min(40)]
+  );
+  let found = streamed
+    .2
+    .windows(64)
+    .position(|window| window == &large[..64])
+    .expect("the file's bytes");
+  assert_eq!(streamed.2.get(found..found + large.len()), Some(large));
+}
+
 /// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP
 /// (`getbundle` with bundle2's changegroup 02 and 03, nothing common, the answer uncompressed): its status,
 /// `Content-Type` and body.

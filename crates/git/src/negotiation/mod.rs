@@ -363,8 +363,8 @@ pub fn negotiate<S: Graph>(
 pub enum Begun<G, N> {
   /// Answered.
   Answered(Outcome<G, N>),
-  /// A pack, its objects being chosen ([`Negotiating::step`]).
-  Selecting(Negotiating<G, N>),
+  /// A pack, its objects being chosen ([`Negotiating::step`]); boxed, the walk being most of its size.
+  Selecting(Box<Negotiating<G, N>>),
 }
 
 /// A negotiation whose pack's objects are being chosen a unit at a time (A-745, §4.17.1 "A fetch's answer" rule 3): what
@@ -381,6 +381,18 @@ pub struct Negotiating<G, N> {
   counters: Counters,
   /// The walk choosing the objects sent one by one.
   selecting: objects::Selecting<N, G>,
+}
+
+impl<G, N> Negotiating<G, N> {
+  /// The acknowledgments the answer gives before its pack, `None` after `done`.
+  pub fn acknowledgments(&self) -> Option<&Acknowledgments> {
+    self.acknowledgments.as_ref()
+  }
+
+  /// The shallow-info section, when one is due.
+  pub fn shallow_info(&self) -> Option<&ShallowInfo> {
+    self.shallow_info.as_ref()
+  }
 }
 
 impl<G: Copy, N: Copy + Ord + Into<u64> + TryFrom<u64>> Negotiating<G, N> {
@@ -482,13 +494,13 @@ pub fn begin<S: Graph>(
     runs.runs.clone(),
     admission,
   )?;
-  Ok(Begun::Selecting(Negotiating {
+  Ok(Begun::Selecting(Box::new(Negotiating {
     acknowledgments,
     shallow_info,
     runs: runs.runs,
     counters,
     selecting,
-  }))
+  })))
 }
 
 /// Whether a server whose client holds `common` is ready to send the pack (A-640 part 3: protocol v0's

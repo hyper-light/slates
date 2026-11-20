@@ -219,6 +219,8 @@ mod tests {
   use super::Positions;
 
   proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
     /// A-745 (a walk inserts positions in any order). Do: insert random positions, repeats among them, in the order
     /// drawn, into a set and into an ordered set beside it. Expect: after each insert, the same answer to "was it new",
     /// the same members, and runs kept in their one form (each non-empty, ascending, a gap between each two), so the

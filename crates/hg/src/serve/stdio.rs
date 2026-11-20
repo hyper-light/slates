@@ -42,7 +42,7 @@
 //! where 7.2 aborts on standard error with the push's result `0`; a stock client never sends one.
 
 use super::Refusal;
-use super::getbundle::{Answering, Store};
+use super::getbundle::Store;
 use super::session::{self, BUNDLE2_REQUIRED, Refused, Step, spec_of};
 use crate::Admission;
 use crate::push::Outcome;
@@ -87,7 +87,7 @@ pub struct Stdio {
   /// shard can hold).
   push_room: Option<u64>,
   /// A `getbundle`'s answer being made a slice at a time (A-745): the session serves no other request until it ends.
-  answering: Option<Box<Answering>>,
+  answering: Option<session::Producing>,
 }
 
 /// A push this session took whole (the module doc's push): its `heads` argument, its bundle's bytes, and what is left of
