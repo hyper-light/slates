@@ -1,5 +1,15 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: typed copy refusals 9ddd1fbe9 (main c2de447a8). NOW: svn_made copy-from rows (plan above: pass the
+  increment's Copy ops; dest rows Add/Replace with copy_from; beneath dest compared to source at version; add_parents with
+  copies). Then A-697 (a)-(f), A-658 3c.
+
+## NOW step 4 (main's call): merge verdict gets its own refused outcome (not a conflict); submit answers
+  Refusal::CopyRefused { case } with case a closed enum (Root, PastHead, SourceEmpty, OutsideNodeChanged, VersionFolded,
+  LinkAcrossCopy ...); append both to ipc wire + publish; SDKs/MCP exhaustive match over cases; A-586/GAPS classify cases
+  (FSFS also refuses: root, past head, empty source; retention: folded; owed: outside node changed, links across copy).
+  THEN svn copy rows (not started; plan in notes above).
+
 ## LANDED 2026-11-20: hard-link copy 7fe4dc0e2 (main 95044a373). NOW: step 4 - every remaining "does not yet copy" case its
   own typed refusal, never TypeChanged (needs a conflict class or a typed submit refusal: ask main the shape). Then svn copy
   rows, A-697, A-658 3c.
