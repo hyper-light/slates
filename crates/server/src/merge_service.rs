@@ -135,6 +135,12 @@ pub struct MergeShardState {
   /// (`crate::green_adopt::readopt_at_boot`). Every verb on it is answered `Overloaded` meanwhile. Bounded by the greens
   /// this shard owns; empty once the boot has re-adopted or fenced each.
   pub(crate) awaiting_adoption: BTreeMap<DbVolumeId, crate::green_adopt::AwaitingAdoption>,
+  /// The base snapshot of each mounted work of this shard (A-774, `crate::mounted_work`): what its mount changed is its
+  /// slot's op log since it. One entry a mounted work, dropped with the work.
+  pub(crate) mounted: crate::mounted_work::MountedBases,
+  /// The head version each green's landing view holds (A-774, `crate::mounted_work::ensure_green_view`): one entry a
+  /// green landed, dropped with the green.
+  pub(crate) green_views: crate::mounted_work::GreenViews,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -617,7 +623,7 @@ pub(crate) enum StoreVerb {
   Resize,
   /// `clone`: a work is the clone of a green version (`create_work`).
   Clone,
-  /// `land`: landing a merge volume onto disk (owed with the extent-backed green).
+  /// `land`: a work lands through its green (a green's head lands through its store-backed view, A-774).
   Land,
   /// `destroy_snapshot`, `read_base`, `rewitness`, `pin`: the volume-core and base-plane verbs.
   Base,
@@ -650,7 +656,7 @@ pub(crate) fn refuse_store_verb(
       feature: "clone of a merge volume: create a work over the green".to_owned(),
     },
     (_, StoreVerb::Land) => Refusal::Unsupported {
-      feature: "landing a merge volume".to_owned(),
+      feature: "landing a work volume: submit it, then land its green".to_owned(),
     },
     (_, StoreVerb::Base) => Refusal::Unsupported {
       feature: "the volume-core and base-plane verbs on a merge volume".to_owned(),
@@ -1369,6 +1375,8 @@ pub(crate) fn destroy_merge_volume(
   crate::verbs::retire_local_tombstones(state);
   // A retired work may have held the oldest reachable version of its green: fold and credit. A
   // destroyed green credits everything it charged as retention.
+  // A mounted work's slot goes with it (A-774).
+  crate::mounted_work::release(state, id);
   if let Some(work) = state.works.remove(&id) {
     crate::work_charge::release(state, work.charged);
     // The floor goes with it: on this shard in this transaction, elsewhere by a message once it has committed (A-247).

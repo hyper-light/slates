@@ -20,7 +20,7 @@ use super::learn::{Clock, Depth, Exchange, Levels, Rebuild, Window};
 use super::naming::{GitNaming, kind_of};
 use super::packed::{Base, Bases};
 use super::positions::Positions;
-use super::push::{Push, stored_bytes};
+use super::push::{Push, Staged, stored_bytes};
 use super::rows::{self, CommitRow, ObjectRow};
 use reach::Sets;
 
@@ -1010,18 +1010,19 @@ impl Repository {
         push.take_staged().ok_or(StoreRefused::Unsealed)?
       }
     };
-    let fresh_ids: Vec<ObjectId> = staged.positions.keys().copied().collect();
-    let positions = staged.positions.clone();
+    let Staged {
+      fork,
+      positions,
+      base,
+    } = staged;
+    let given = u64::try_from(positions.len()).unwrap_or(u64::MAX);
     // A stage that gives no position leaves the next position where it is, however long ago it was made.
-    let next = if staged.positions.is_empty() {
+    let next = if positions.is_empty() {
       self.next_position
     } else {
-      staged
-        .base
-        .saturating_add(u64::try_from(staged.positions.len()).unwrap_or(u64::MAX))
+      base.saturating_add(given)
     };
-    let brought_by = self.brought_by(moves, first);
-    let landed = landed_runs(&fresh_ids, &positions, &brought_by);
+    let landed = self.landed_runs(moves, first, (base, &positions));
     let (planned, heads) = self.plan(store, moves, &positions)?;
     let before = store.used();
     let values = put_values(store, &planned)?;
@@ -1040,12 +1041,12 @@ impl Repository {
       return Err(refused.into());
     }
     // A stage that gives no position writes no row: its fork is given back, never adopted.
-    let inserted = if staged.positions.is_empty() {
-      staged.fork.release(store).map_err(StoreRefused::from)
+    let inserted = if positions.is_empty() {
+      fork.release(store).map_err(StoreRefused::from)
     } else {
       self
         .index
-        .adopt(store, staged.fork)
+        .adopt(store, fork)
         .map_err(|refused| match refused {
           slates_vcs::AdoptRefused::Refused(refused, fork) => {
             let _ = fork.release(store);
@@ -1080,7 +1081,6 @@ impl Repository {
     self.chains.extend(chains);
     self.heads = heads;
     self.next_position = next;
-    let given = u64::try_from(fresh_ids.len()).unwrap_or(u64::MAX);
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
     self.depth.seen(push.deepest());
     push.release_holds(store)?;
@@ -1183,22 +1183,48 @@ impl Repository {
     Ok(None)
   }
 
-  /// For each object a move's walk found new, the green and version that brought it: the first move in order whose D(k)
-  /// holds it; an object no move's holds is the first move's.
-  fn brought_by(&self, moves: &[Move], first: &Move) -> BroughtBy {
+  /// The landing map's runs for a commit's fresh objects (`Repository::landings`): each object's position, given from
+  /// `base` on, with the green and version that brought it (the first move whose walk met it, else `first`'s),
+  /// consecutive positions of one pair joined into one run. The positions a stage gives run from its base with no gap,
+  /// so each object's pair is kept by position: one slot an object, no map and no sort.
+  fn landed_runs(
+    &self,
+    moves: &[Move],
+    first: &Move,
+    (base, positions): (u64, &BTreeMap<ObjectId, u64>),
+  ) -> Vec<(u64, (u64, u64, u64))> {
     let version_of = |green: u64| {
       self.chains.get(&green).map_or(0, |chain| {
         u64::try_from(chain.versions.len()).unwrap_or(u64::MAX)
       })
     };
-    let mut by = BTreeMap::new();
+    let mut by: Vec<Option<(u64, u64)>> = vec![None; positions.len()];
     for movement in moves {
+      let pair = (movement.green, version_of(movement.green));
       for id in &movement.brought.new {
-        by.entry(*id)
-          .or_insert((movement.green, version_of(movement.green)));
+        let slot = positions
+          .get(id)
+          .and_then(|position| usize::try_from(position.checked_sub(base)?).ok())
+          .and_then(|at| by.get_mut(at));
+        if let Some(slot @ None) = slot {
+          *slot = Some(pair);
+        }
       }
     }
-    (by, (first.green, version_of(first.green)))
+    let otherwise = (first.green, version_of(first.green));
+    let mut runs: Vec<(u64, (u64, u64, u64))> = Vec::new();
+    for (position, pair) in (base..).zip(by) {
+      let (green, version) = pair.unwrap_or(otherwise);
+      match runs.last_mut() {
+        Some((_, (end, run_green, run_version)))
+          if *end == position && (*run_green, *run_version) == (green, version) =>
+        {
+          *end = position.saturating_add(1);
+        }
+        _ => runs.push((position, (position.saturating_add(1), green, version))),
+      }
+    }
+    runs
   }
 
   /// The position of `id`: given now, or its row's.
@@ -1623,41 +1649,8 @@ fn footprint(
   chains.saturating_add(bytes(entries, HEAD_BYTES))
 }
 
-/// For each object a move found new, the green and version that brought it; and the pair for an
-/// object no move holds.
-type BroughtBy = (BTreeMap<ObjectId, (u64, u64)>, (u64, u64));
-
 /// Derived: what one run of the landing map charges the store: its key and its value, four words.
 const LANDING_BYTES: usize = size_of::<(u64, (u64, u64, u64))>();
-
-/// The landing map's runs for a commit's fresh objects (`Repository::landings`): each object's position with the green
-/// and version that brought it, consecutive positions of one pair joined into one run.
-fn landed_runs(
-  fresh: &[ObjectId],
-  positions: &BTreeMap<ObjectId, u64>,
-  (by, otherwise): &BroughtBy,
-) -> Vec<(u64, (u64, u64, u64))> {
-  let mut placed: Vec<(u64, (u64, u64))> = fresh
-    .iter()
-    .filter_map(|id| {
-      let position = *positions.get(id)?;
-      Some((position, by.get(id).copied().unwrap_or(*otherwise)))
-    })
-    .collect();
-  placed.sort_unstable();
-  let mut runs: Vec<(u64, (u64, u64, u64))> = Vec::new();
-  for (position, (green, version)) in placed {
-    match runs.last_mut() {
-      Some((_, (end, run_green, run_version)))
-        if *end == position && (*run_green, *run_version) == (green, version) =>
-      {
-        *end = position.saturating_add(1);
-      }
-      _ => runs.push((position, (position.saturating_add(1), green, version))),
-    }
-  }
-  runs
-}
 
 /// For each commit some green's head names, by its position, those greens.
 type HeadMap = BTreeMap<u64, BTreeSet<u64>>;

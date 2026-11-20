@@ -101,6 +101,7 @@ mod member_task;
 mod merge_origin;
 pub mod merge_service;
 mod mirror;
+mod mounted_work;
 /// The planned move of a volume to another fleet member (§4.10, A-291).
 mod moves;
 // A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").

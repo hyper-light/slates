@@ -8811,6 +8811,28 @@ fn edit(
   ReplyBody::Edited
 }
 
+/// [`edit`] for a mounted work's declaration (A-774, `crate::mounted_work`): the splice `(at, delete_len)` with `bytes`.
+pub(crate) fn edit_op(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  path: &str,
+  (at, delete_len): (u64, u64),
+  bytes: &[u8],
+) -> ReplyBody {
+  edit(state, principal, work, path, at, delete_len, bytes)
+}
+
+/// [`declare`] for a mounted work's declaration (A-774, `crate::mounted_work`).
+pub(crate) fn declare_op(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  op: WorkOp,
+) -> ReplyBody {
+  declare(state, principal, work, op)
+}
+
 /// Records a change to `work` in its log, in the verb's transaction (A-207; D-18: an acknowledged change survives a
 /// daemon restart; `crate::work_log`), after charging the `added` bytes it brings: refused, with nothing changed, when
 /// the partition's merge budget cannot hold the entry or the budget cannot cover the bytes.
@@ -9156,7 +9178,7 @@ pub(crate) fn compose_increment(
   journal: &[VolumeOp],
   evidence: Vec<[u8; 32]>,
 ) -> Result<slates_merge::engine::Increment, Refusal> {
-  let (doc, plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
+  let (mut doc, mut plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
     Ok(planned) => planned,
     Err(e) => {
       return Err(Refusal::BadRequest {
@@ -9164,6 +9186,21 @@ pub(crate) fn compose_increment(
       });
     }
   };
+  // A file the work replaced whole (an editor's write-and-rename, a formatter's or a codemod's rewrite) is judged as
+  // the edit it was, not a replacement of the file (D-O17, A-776; `slates_merge::refine`): the base bytes it was given
+  // and the bytes it wrote, both already held here, give the ranges it changed. A base this shard cannot read (a work
+  // off the green's shard whose base the owner did not send, A-247) keeps the replacement. The refiner's scratch is
+  // sized by the files it compares and dropped with this submit, so nothing stays resident between submits.
+  slates_merge::refine::refine_rewrites(
+    &mut doc,
+    &mut plan,
+    &mut slates_merge::refine::Refiner::new(),
+    &mut |path| {
+      let before = files_base.file(path).ok().flatten()?;
+      let after = files.get(files_base, path).ok().flatten()?;
+      Some((before, after))
+    },
+  );
   let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal);
   // The identity names the work and its base before the post-state and the document (§4.16 data model:
   // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
@@ -9746,6 +9783,10 @@ fn submit(
       Ok((record, green)) => (record.id, green),
       Err(refusal) => return refused(refusal),
     };
+  // A mounted work's journal is its changeset: what its mount changed is declared first (A-774).
+  if let Err(refusal) = crate::mounted_work::declare_mount(state, principal, work) {
+    return refused(refusal);
+  }
   let reply = match state.work_home.verdict.take() {
     Some(reply) => {
       // The owner's verdict on a submit the work recorded as pending (A-247): settled here, in this transaction.
@@ -11791,6 +11832,14 @@ fn attach(
   if matches!(record.policy.role, Role::Green { .. }) {
     return crate::merge_service::attach_green(state, client_id, principal, &record, intent, &form);
   }
+  // A work mounts like any volume (A-774): its slot is made here, so every bridge (FUSE, NFS, WinFsp) serves it.
+  if matches!(record.policy.role, Role::Work { .. })
+    && !crate::mounted_work::ensure_slot(state, record.id)
+  {
+    return refused(Refusal::Unsupported {
+      feature: "a mount of a work whose green's base this shard cannot read".to_owned(),
+    });
+  }
   let rights = rights_of(&record, principal);
   if !permits(rights, intent) {
     return forbidden("attach");
@@ -13790,7 +13839,7 @@ fn record_unrecovered_destroy(
 /// teardown): its byte reservation, a bounded claim's inode allowance or a dynamic volume's version
 /// hold (so the version slab is never over-offered; A-342), its records' metadata reservation, and the
 /// growth a dynamic volume acquired from the shard budget as it wrote.
-fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
+pub(crate) fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
   // The volume's hold on its seal key goes with it (A-208); its sealed chunks hold the key while any of them lives.
   if !crate::content_cipher::release_seal_key(&mut state.store, slot.volume.seal_key()) {
     state.count(crate::content_cipher::KEY_RELEASE_REFUSED, 1);
