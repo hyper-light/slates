@@ -201,4 +201,6 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    except the end; w-k90-a520 now does (a) the end fixes (my diagnosis: kill/next release race; volume rm `?` skips the
    export detach) and (b) Slates' judge accepting Docker Desktop on Windows for the export route. When both land: re-run
    Mac (no stale slates: mounts there, checked 0) then jupiter (WinFsp + Docker Desktop up). Watcher b0zdxv38e on main.
-   Removed worktree ~/kiln-work/w-k90-containers-a520 (git worktree remove).
+   Worktree ~/kiln-work/w-k90-containers-a520 NOT removed (holds my superseded local patch; no --force).
+## For main to delete (add): worktree ~/kiln-work/w-k90-containers-a520 (`git -C ~/kiln-work/w-k90-containers-kiln worktree
+   remove --force /Users/adalundhe/kiln-work/w-k90-containers-a520`; its only change, the slates_e2e.rs:1824 fix, is on main).
