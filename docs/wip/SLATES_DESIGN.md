@@ -12177,6 +12177,20 @@ is one more version, and the chain itself is never rewritten.
 > from the head by a recovery, so the store after a recovery equals the store before (A-662). Owed: the commit derived
 > from these maps, recorded with the version and admitted to the git store (part 3's commit), Mercurial's and
 > Subversion's.
+>
+> **Status (2026-11-19, A-664 part 3, its commit: item 3's commit made, recorded and admitted).** Each version a work
+> submits to a git repository's green becomes the commit the server makes (`crates/server/src/vcs_store/commits.rs`), in
+> the submit's own step on the owner, after its verdict: over the version's git trees, which the green keeps beside its
+> map, made in the same step over the same change (`vcs_store::paths`); its parent the commit of the version before as
+> git's history reads it (the green's newest commit, pushed or made; for a branch `CreateBranch` made, the commit it was
+> made at); the session's git identity as author and committer, dated at the owner's instant in UTC; the submit's
+> message. Its objects are admitted to the repository's store through a push's own steps and recorded by a push's
+> record, in an entry of the repository's register holding the record alone, appended in the version's own transaction,
+> so the version and its commit are one durable atom and a recovery makes every made commit again (A-662). The green's
+> ref names it, so a stock client's clone fetches native work (A-682's lender). A commit git would refuse (a NUL in the
+> message) or the budget refuses is not made and is counted; the version stands, and its successor's commit holds both.
+> Owed: the holders' commits (the merge record carrying the message, the identity and the time), a submit refused
+> before its verdict when git cannot hold its message or its post-state, Mercurial's and Subversion's.
 1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
    the server must "validate each reference that is being updated that it hasn't changed while the request was being
    processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
@@ -12959,6 +12973,13 @@ engine: the verdict, rebase, position mapping, the register).
 > the change between two kept maps. Part 1 is built too (A-664 part 1). Owed: the trees and the commit made from these
 > maps, admitted with the green's head moved and recorded with the version.
 >
+> **Status (2026-11-19, A-664 part 3, its commit: piece 13's made commits in the store).** Built: each git green keeps
+> its head's `Trees` value beside its map, made in the same step over the same change; a submitted version's commit made
+> over it (`Commits`), its objects the repository lacks admitted to A-614's store through a push's steps and recorded by
+> A-662's record in an entry of the register holding it alone, the green's ref moved to it in the store
+> (`vcs_store::commits`, §4.17.1's status), so upload-pack lends it. Owed: Mercurial's changesets and Subversion's
+> revisions by the same rule; the holders' commits.
+>
 > **Status (2026-11-19, A-610: Git LFS's codecs built, the first part of piece 12).** `crates/git` (`lfs`) reads the
 > batch API's requests and the basic adapter's verify callback, and writes its answers: the basic adapter's actions
 > (`href`, headers, `expires_in` or `expires_at`), nothing for an object held, or a per-object error with LFS's codes.
@@ -13688,7 +13709,8 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
     A-664: part 2 built, a version's trees and commit as derived types; part 1 built, the principal's identities and
     `MessageRequired` and `IdentityRequired` at submit; part 3's first piece built, each green's map of paths to git's
-    files kept at its head (`vcs_store::paths`); the made commit recorded and admitted, owed.)
+    files kept at its head (`vcs_store::paths`); part 3's commit built, each submitted version's commit made over its
+    git trees, recorded as a push's objects are and admitted (`vcs_store::commits`); the holders' commits owed.)
 14. A v0 and v1 fetch for older clients; `packfile-uris` and `bundle-uri`.
 15. Import of a bare repository on disk as a base (its loose objects, packs and indexes, read-only, §4.15); export by
     landing.
@@ -53507,3 +53529,110 @@ alone), GAPS (the §4.17.3 entry).
 - **Owed.** A-680 part 2c (each push's record with A-687's kind, and its replay); the SSH edge's pushes (A-679's loop
   calls the same driver); the bundle read in slices; the stock-hg round trip over the edge once A-686 lands; the other
   platforms' runs (main's).
+
+### A-664 part 3, its commit — Each version a work submits to a git repository's green becomes the commit the server makes: its git trees kept beside its map, the commit made over them and the commit before, recorded as a push's objects are in an entry of the register holding the record alone, in the version's own transaction, and made again by a recovery (2026-11-19, g308, UI goal 93 (kiln 51cef9f7); §4.17.1 "A push is a work" items 3 and 4; §4.17.2 "The repository in git's terms" item 5 and piece 13; A-662; A-636 part 2b; A-682; after part 3's first piece)
+
+- **What it does.** A work submitted to a git repository's green carries no head operation (§4.17.1 item 3), so the
+  server makes the version's commit after the verdict, in the submit's own step on the owner
+  (`crates/server/src/vcs_store/commits.rs`, called by `verbs::judge_submission` right after the version's map step):
+  A-664 part 2's `Commits` over the version's git trees, its parent, the merging session's git identity as author and
+  committer (A-664 part 1: read from the principal's record and written over any a client sent), dated at the owner's
+  wall clock in whole seconds, in UTC, and the submit's message, completed as `git commit-tree -m` completes it. The
+  commit's objects the repository lacks are admitted to A-614's store and the green's ref moved to the commit, so
+  A-682's lender lists the branch at it and a stock client's clone fetches it: native work becomes git history.
+- **The trees beside the map** (`vcs_store::paths`). Each green's head keeps its git trees (`Trees`, A-664 part 2)
+  beside its map of paths to git's files: `paths::Head` holds the version, the map's root and the trees' root, each held
+  once by the store. They are made in the same step: over the same change where the map is derived
+  (`Trees::apply` from the version before's trees), built whole from the same files where the map is built whole; a
+  step keeps both or neither, so a version whose tree git refuses (a `.git` name, strict fsck) keeps neither, counted
+  as a refused step, and the next step builds both whole. A recovery and a rebuild build the trees whole from the head
+  with the map; a trees value is a function of the files alone (part 2's oracle), so the store made again holds what
+  the live one held, node for node. A push's version keeps its trees too, the pushed commit's own tree (a test holds
+  them equal), so a submit after a push derives its trees from them.
+- **The parent.** The commit of the version before as git's history reads it: the head of the green's newest store
+  version that names one, a client's pushed commit or one the server made. A green holding none, the first version of
+  a branch `CreateBranch` made, takes the commit its branch was made at: the newest of its source's store versions at
+  or before the version it was made at (`GitStore::versions` is in order, so a binary search), a member a step towards
+  the lineage's root (`MemberOrigin::Branch`), never more steps than the lineage has members. A root holding none makes
+  a root commit. Without the branch's rule, a branch's first made commit had been a root commit: a history unrelated to
+  its source's, which a stock client shows as two disjoint histories.
+- **Recorded as a push is, in an entry holding the record alone: no entry kind of its own.** The made commit's objects
+  must be recorded, not derived again, by A-662's rule (a push's objects are its changeset): a recovery must make every
+  made commit again, and a version a checkpoint folded holds no tree to derive one from. They go through the push
+  path's own steps: a `GitPush` admits the commit and each tree and blob of the version the repository lacks (each
+  tree from the root down that the store does not index, with each blob it names that the store does not index, each
+  once; a tree the store indexes is held whole with what it names, so it is not read), the push is sealed, the green's
+  move to the commit at the version admitted (one `RecordedMove`: the green's key, the version, the commit), and A-662's
+  record written: the move and every object the repository lacked, with its bytes. The brief asked whether the
+  repository's log refuses an entry that moves no branch, in which case an entry kind would be part of this piece. It
+  does not: the register's guard (`slates_db::repository::entry::check`) refuses nothing for an entry whose only part
+  is its objects, and its apply (`apply_advanced`) keeps the objects in the register's order, takes no position on any
+  log and makes no atomic record ("the objects ride with the entry and take no position", A-662); A-636 part 2b makes a
+  state-log record only for a log that took a position, so none. So the record rides `Op::RepositoryAdvanced` with an
+  entry holding the repository and the objects alone, judged and charged to the merge budget as a push's are, and a
+  recovery replays it with every push's, in log order, through the same steps (`vcs_store::replay_git`). Considered and
+  not taken: the version itself carried by that entry (`RepositoryEntry::versions`, as a push's is) in place of its
+  `GreenAdvanced`, which moves a submit's recording off the one path every green shares (`record_accepted` with its
+  completion key, `stage_awaiting`, the merge record and its replay) for nothing the transaction does not give already.
+- **One durable atom.** The entry is appended in the submit's own transaction (`verbs::run_recorded`'s, or
+  `owner_judge`'s for a submit from another shard), after the version's own record, so the version and its commit are
+  one log record (`slates_db::replay`'s begin through commit): a crash leaves both or neither.
+- **Guard then apply**, as `repository::push::push_sealed` does it: the entry judged by the register's guard first
+  (`Partition::check`: the merge budget), then the store committed (`vcs_store::commit`), then the entry appended; a
+  store whose entry the log refuses after its commit is made again from the log (`vcs_store::rebuild`). A commit is made
+  once a version: a version the store holds a commit at or past (a submit sent again, which the engine answers from its
+  idempotent accept) is passed over.
+- **Not made, and counted** (`vcs_commits.unmade`; `vcs_commits.made` is the path's non-vacuity count): a version whose
+  trees are not kept (its map step refused), an identity git would not write as it is, a commit git's strict fsck
+  refuses (a NUL in the message: `nulInCommit`), the store's refusals (the budget), the register's. The version stands,
+  since its own record is in the transaction already; the green's ref stays at the commit before; nothing new is held;
+  the next version's commit names the commit before as its parent and its tree holds both versions' files (a test
+  holds it).
+- **Found by use, left to its own piece** (reported to main, the next piece's failing test). In one work, `create d/a`,
+  `chmod 0755 d/a`, `mkdir x` and `mv d/a x/a`, then submit: the submit is refused `BadRequest` ("increment does not
+  compose: SetModeMissing(\"d/a\")"), so an agent's ordinary `chmod` then `mv` cannot land at all (kiln r469, the test
+  `t_a664_p3_an_executable_file_moved_is_100755_in_its_commit` written for this piece, failing at its first submit).
+  With the `chmod` and the `mv` in two versions the move lands and drops the mode (part 3's first piece's finding), so
+  the commit lists `x/a` `100644`. Both follow from the green keeping a mode at its path (A-618).
+- **Found by reading, reported to main and not chased.** `verbs::reconcile_unpublished_effects` rebuilds no
+  repository's store when a verb's publication fails at `Db::commit`, so a push or a made commit inside that verb's
+  transaction leaves the store ahead of the rolled-back log, as the green's engine is left ahead of it; a branch
+  `CreateBranch` makes has no ref a client sees until its first made commit, since the lender lists a branch only once
+  its green holds a store version.
+- **Tests** (`crates/server/src/vcs_store/commits/tests.rs`, each reading the commit as a stock client does: A-682's
+  lender driven by protocol v2's `ls-refs` and `fetch` with `done`, the commit and its tree read from the fetched pack
+  alone, as index-pack reads one, and listed as `git ls-tree -r` lists it): a submitted version's commit (`d/a`
+  `100755`, `f` `100644`, no parent, the session's identity dated within the submit's instant, the message completed,
+  the pack exactly the commit, its two trees and its two blobs); made commits naming the one before after a push (the
+  pushed version's trees the pushed tree; each made commit's record its one move and exactly what the repository
+  lacked, in order; the second version's trees derived over its change alone, two directories made and one blob
+  hashed; the store made again from the log equal whole, every record replayed, and `main` fetched at the second made
+  commit after it); a `CreateBranch` branch's first made commit naming its source's commit; a commit git refuses not
+  made, counted, nothing recorded, its successor's made as the repository's first, holding both versions' files.
+  Beside them the first piece's tests run with commits made at every version, among them the destroyed branch's
+  store held equal to the store made again, now with made commits' records replayed.
+- **Runs** (macOS arm64, the Mac Studio, 2026-11-20 UTC, rustc 1.98.1, debug, `CARGO_BUILD_JOBS=2`). Red first (kiln
+  r469, at de4c0ddb5 over main 2c3fa2bcc, `commits::make` returning at its first statement): `cargo test --locked -p
+  slates-server --lib -- vcs_store::commits::` 0 passed, 5 failed: `main` listed at nothing (three), the second clone's
+  commit naming no parent (it was the pushed one), and the mode test's submit refused (above). Green (kiln r495,
+  8a30b5e8a over main 2c3fa2bcc, 00:09:40-00:17:42Z, slates-server compiled afresh): `cargo test --locked -p
+  slates-server --lib -- vcs_store:: repository:: verbs::tests vcs_http:: identities git_push:: --test-threads=4` 193
+  passed, 2 ignored (measurements, not gates), none failed: this piece's four, the first piece's five and every store,
+  push, edge and identities test with commits made at each submit to a git green; the integration tests through the
+  submit's step, filtered as part 3's first piece's were: `-p slates-client --test edit_and_submit` 2 of 2, `-p
+  slates-server --test daemon` 7 of 7, `--test works_off_owner` 5 of 5, `--test fleet` 14 of 14 (186.9 s); `cargo fmt
+  -p slates-server -- --check` clean. Again over the merge 09a38d73d with main b63f8a05d (kiln r2, 04:08-04:16Z), `lfs::` added to the filter: 224 passed, 2 ignored; the same four integration sets passed; fmt clean. No integration target submits to a git repository's green (the CLI and the SDKs
+  carry no message yet, GAPS), so the unit tests above make every commit; clippy, xtask, the doc gate and the Windows
+  x86_64 and Linux runs are main's.
+- **Owed.** The holders' commits (A-636's fleet half): the merge record carrying the version's principal, time and
+  message, so every holder makes the same commit, since a register entry's objects reach no holder yet; a submit refused
+  before its verdict when git cannot hold its post-state or its message; a branch `CreateBranch` makes named by a ref
+  from its creation; a made commit's record naming the blobs its version's chain entry holds by reference rather than
+  holding their bytes twice; Mercurial's changesets and Subversion's revisions by the same rule.
+- **Applied in the same change to:** `crates/server/src/vcs_store/commits.rs` and `commits/tests.rs` (new);
+  `crates/server/src/vcs_store/paths.rs` (the trees beside the map: `Head::trees`, `GreenTrees`, `declare_trees`,
+  `release_head`, `StepRefused::Trees`, the step making both) and `paths/tests.rs` (`version_saying`, helpers made
+  visible); `crates/server/src/vcs_store.rs` (`GitStore::trees` and `commits`, declared in `made`, released in
+  `release`); `vcs_store/tests.rs` and `vcs_store/upload.rs` with `upload/tests.rs` (helpers made visible to the new
+  tests); `crates/server/src/verbs.rs` (the submit's step); §4.17.1's and §4.17.2's statuses and piece 13; GAPS (A-664's
+  entry).

@@ -50,8 +50,9 @@ use crate::git_push::{PolicyHidden, ref_of};
 use crate::state::ShardState;
 use crate::vcs_http::git::StoreLender;
 
+// Its clone over protocol v2 serves the made commits' tests too (`super::commits`, A-664 part 3).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Format: nanoseconds in a second, the measured throughput's unit of time against the exchange's.
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
