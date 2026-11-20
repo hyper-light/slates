@@ -330,7 +330,64 @@ fn assert_declare_namespace_ops(server: &mut McpServer, green: &str) {
     submitted["accepted"], true,
     "the namespace ops submit cleanly: {submitted}"
   );
+  assert_copy_declared_and_read_back(server, green);
   assert_attach_advance_read(server, green);
+}
+
+/// A copy over MCP (A-626 part 4, `slates.merge.declare` with `copy`): `/c/g.txt` lands; a work copies `/c`'s tree
+/// from its base to `/e` by reference and submits; a read at the green's head finds the copied file with its bytes. Every op this
+/// surface offers decodes from its `kind`, and the kinds name each one once (`work_op_kind`).
+fn assert_copy_declared_and_read_back(server: &mut McpServer, green: &str) {
+  let made = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "source" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  call(
+    server,
+    "slates.merge.edit",
+    json!({ "work": made, "path": "/c/g.txt", "at": 0, "text": "keep" }),
+  );
+  let source = call(server, "slates.merge.submit", json!({ "work": made }));
+  assert_eq!(
+    source["accepted"], true,
+    "the copy's source lands: {source}"
+  );
+  let work = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "copied" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let op = json!({ "kind": "copy", "from": "/c", "to": "/e" });
+  assert_eq!(
+    call(
+      server,
+      "slates.merge.declare",
+      json!({ "work": work, "op": op })
+    ),
+    json!({ "declared": true })
+  );
+  let submitted = call(server, "slates.merge.submit", json!({ "work": work }));
+  assert_eq!(submitted["accepted"], true, "the copy submits: {submitted}");
+  let read = call(
+    server,
+    "slates.fs.read",
+    json!({ "volume": green, "path": "/e/g.txt" }),
+  );
+  assert_eq!(read["text"], "keep", "the copied file reads back: {read}");
+  let copy = slates_ipc::protocol::WorkOp::Copy {
+    from: "/d".to_owned(),
+    to: "/e".to_owned(),
+    version: None,
+    replace: false,
+  };
+  assert_eq!(slates_mcp::work_op_kind(&copy), Some("copy"));
 }
 
 /// Calls a tool expecting a JSON-RPC error, returning its message.

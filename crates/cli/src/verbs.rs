@@ -739,6 +739,26 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
       delete_len,
       bytes,
     } => merge_edit(client, *work, path, *at, *delete_len, bytes, json)?,
+    Verb::Copy {
+      work,
+      from,
+      to,
+      version,
+      replace,
+    } => {
+      let op = slates_ipc::protocol::WorkOp::Copy {
+        from: from.clone(),
+        to: to.clone(),
+        version: *version,
+        replace: *replace,
+      };
+      client.declare(*work, op)?;
+      if json {
+        slates_machine::out_line!("{}", serde_json::json!({ "declared": true }));
+      } else {
+        slates_machine::out_line!("declared");
+      }
+    }
     Verb::Submit { work, evidence } => {
       let outcome = client.submit_with_evidence(*work, evidence)?;
       if json {
@@ -1597,6 +1617,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::ChangedSince { .. }
     | Verb::Work { .. }
     | Verb::Edit { .. }
+    | Verb::Copy { .. }
     | Verb::Submit { .. }
     | Verb::Rebase { .. }
     | Verb::Advance { .. }
