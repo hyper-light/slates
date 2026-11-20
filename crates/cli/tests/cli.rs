@@ -3777,8 +3777,7 @@ fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Op
 /// work, and the events of formation's ordinary work that the counter map carries beside refusals.
 fn formation_counter_allowed(line: &str) -> bool {
   use slates_server::daemon::{
-    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
-    TICKS_SEALING,
+    CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE, TICKS_SEALING,
   };
   let Some(counter) = line
     .split_whitespace()
@@ -3809,7 +3808,7 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.plane.announcements_sent",
     // The idle sweep's events (`slates_server::idle_sweep`, A-715), named by the constants the daemon counts them under, so one added there is not missed
     // here: the idle purge's freed bytes, what a shard was doing at each pass (A-214: sealing, deferred, busy, idle),
-    // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
+    // and a give-back that left its rest for the
     // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
     // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
     CONTENT_PURGED,
@@ -3817,7 +3816,6 @@ fn formation_counter_allowed(line: &str) -> bool {
     TICKS_DEFERRED,
     TICKS_BUSY,
     TICKS_IDLE,
-    CONTENT_PREFAULTED,
     GIVE_BACK_LEFT,
     // A record link dropped because its anchor's learned member became another incarnation
     // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
@@ -3869,8 +3867,7 @@ fn formation_counter_allowed(line: &str) -> bool {
 #[test]
 fn the_formation_check_allows_every_idle_sweep_event() {
   use slates_server::daemon::{
-    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
-    TICKS_SEALING,
+    CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE, TICKS_SEALING,
   };
   for counter in [
     CONTENT_PURGED,
@@ -3879,7 +3876,6 @@ fn the_formation_check_allows_every_idle_sweep_event() {
     TICKS_DEFERRED,
     TICKS_BUSY,
     TICKS_IDLE,
-    CONTENT_PREFAULTED,
   ] {
     let line = format!("shard 0 refused {counter}: 1");
     assert!(
