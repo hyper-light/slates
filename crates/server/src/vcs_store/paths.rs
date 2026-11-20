@@ -52,11 +52,15 @@
 //! **Counters.** [`DERIVED`] (a map derived from the one before: the non-vacuity count of the incremental path),
 //! [`BUILT`] (built from the whole head as a version commits), [`REMADE`] (built by a recovery), [`REFUSED`].
 //!
+//! **Sliced, in a recovery** (A-664's sliced whole builds): a recovery's remake puts the head's files one a unit of its
+//! slices ([`remake_green_sliced`]), so a green of any size steps through it; the map and trees are then built of them
+//! in one unit.
+//!
 //! **Owed** (GAPS, A-664): a submit refused before its verdict when its post-state is one git cannot hold (a named
-//! pipe, a socket, a device, a `.git` name); a whole build and a whole map's release sliced a unit at a time (each is
-//! one step, as A-662's replay of a record is); a branch's first map derived from its source's where the source's head
-//! is the version it was made at; the holders' maps (A-636's fleet half); and a copy made through a work, which no
-//! client verb makes yet (A-626 part 4), driven through this module's whole build by a test.
+//! pipe, a socket, a device, a `.git` name); a live whole build (a push's, a green's first submit's, past a copy) and a
+//! whole map's release sliced a unit at a time, and the map's and trees' build of the put files in slices of their
+//! own; and a copy made through a work, which no client verb makes yet (A-626 part 4), driven through this module's
+//! whole build by a test.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -145,6 +149,9 @@ enum Plan<'g> {
   Change(Head, Vec<(Vec<u8>, Option<GitFile<'g>>)>),
   /// Every file of the head.
   Whole(Vec<(Vec<u8>, GitFile<'g>)>),
+  /// Every file of the head put already, a recovery's unit each ([`remake_green_sliced`]): the map and trees built of
+  /// them.
+  Put(BTreeMap<Vec<u8>, Entry>),
 }
 
 /// How a green's map was had.
@@ -210,6 +217,77 @@ pub(crate) fn remake_green(state: &mut ShardState, green: DbVolumeId) {
   if let Some(answer) = step(state, green, version, true) {
     count(state, answer, REMADE);
   }
+}
+
+/// [`remake_green`] in a recovery's slices (A-664's sliced whole builds): the head's files put one a unit of the
+/// recovery's ([`crate::recovery_slices`]), so a green of any size steps through its build and the watchdog sees the
+/// shard step, then the map and trees built of them and kept, as [`remake_green`] keeps them. A recovery runs alone on
+/// its shard, so nothing reads the green or its store between the units.
+pub(crate) async fn remake_green_sliced(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
+  let Some(repository) = git_repository_of(state, green) else {
+    return;
+  };
+  let key = super::green_key(green);
+  let (answer, charged_whole) = {
+    let ShardState {
+      store,
+      vcs_stores,
+      greens,
+      ..
+    } = &mut *state;
+    let Some(engine) = greens.get(&green) else {
+      return;
+    };
+    let version = engine.head();
+    if version == 0 {
+      return;
+    }
+    let whole = Plan::Whole(whole_head(&engine));
+    super::lend(store, vcs_stores, plan_bytes(&whole));
+    let Plan::Whole(files) = whole else {
+      return;
+    };
+    let mut held = Vec::new();
+    let answer = match put_sliced(vcs_stores, repository, files, &mut held, slices).await {
+      Ok(entries) => made_holding(
+        vcs_stores,
+        repository,
+        (key, version),
+        Plan::Put(entries),
+        held,
+      ),
+      Err(refused) => {
+        give_back(vcs_stores, repository, &held);
+        Err(refused)
+      }
+    };
+    (answer, super::settle_in(store, vcs_stores))
+  };
+  if !charged_whole {
+    state.count(super::CHARGE_SHORT, 1);
+  }
+  count(state, answer, REMADE);
+}
+
+/// Puts each of `files` in `repository`'s content store, a recovery's unit each, noting each hold.
+async fn put_sliced(
+  stores: &mut VcsStores,
+  repository: RepositoryId,
+  files: Vec<(Vec<u8>, GitFile<'_>)>,
+  held: &mut Vec<ContentId>,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Result<BTreeMap<Vec<u8>, Entry>, StepRefused> {
+  let mut entries = BTreeMap::new();
+  for (name, file) in files {
+    let (content, _) = stores.git(repository).ok_or(StepRefused::NoMap)?;
+    entries.insert(name, put_file(content, &file, held)?);
+    slices.unit_done().await;
+  }
+  Ok(entries)
 }
 
 /// Gives back `green`'s map and trees as it leaves `repository`'s lineage (`repository::retire_member`: its destroy, a
@@ -511,6 +589,7 @@ fn plan_bytes(plan: &Plan<'_>) -> u64 {
       .iter()
       .map(|(_, file)| file.bytes.len())
       .fold(0, usize::saturating_add),
+    Plan::Put(_) => 0,
   };
   u64::try_from(bytes).unwrap_or(u64::MAX)
 }
@@ -524,16 +603,32 @@ fn made(
   (key, version): (u64, u64),
   plan: Plan<'_>,
 ) -> Result<Stepped, StepRefused> {
-  let (content, git) = stores.git(repository).ok_or(StepRefused::NoMap)?;
+  made_holding(stores, repository, (key, version), plan, Vec::new())
+}
+
+/// [`made`], with the holds `held` the plan's files took already (a sliced build's, [`Plan::Put`]) given back with the
+/// step's own.
+fn made_holding(
+  stores: &mut VcsStores,
+  repository: RepositoryId,
+  (key, version): (u64, u64),
+  plan: Plan<'_>,
+  mut held: Vec<ContentId>,
+) -> Result<Stepped, StepRefused> {
+  let Some((content, git)) = stores.git(repository) else {
+    give_back(stores, repository, &held);
+    return Err(StepRefused::NoMap);
+  };
   let GitStore {
     paths,
     trees,
     heads,
     ..
   } = git;
-  let paths = paths.as_mut().ok_or(StepRefused::NoMap)?;
-  let trees = trees.as_mut().ok_or(StepRefused::NoMap)?;
-  let mut held = Vec::new();
+  let (Some(paths), Some(trees)) = (paths.as_mut(), trees.as_mut()) else {
+    give_back(stores, repository, &held);
+    return Err(StepRefused::NoMap);
+  };
   let answer = make(content, (paths, trees), plan, &mut held);
   if let Ok(Some((root, tree_root, _))) = &answer {
     let made = Head {
@@ -582,9 +677,29 @@ fn make(
     }
     Plan::Whole(files) => {
       let entries = put_whole(content, files, held)?;
-      let root = paths.build(content, &entries).map_err(StepRefused::Paths)?;
-      let made = trees.build(content, &entries);
-      with_trees(made, root, held).map(|(root, trees)| Some((root, trees, Stepped::Built)))
+      build_whole(content, (paths, trees), &entries, held)
+    }
+    Plan::Put(entries) => build_whole(content, (paths, trees), &entries, held),
+  }
+}
+
+/// The map and trees built of every file of the head, put already.
+fn build_whole(
+  content: &mut ContentStore,
+  (paths, trees): (&mut GreenPaths, &mut GreenTrees),
+  entries: &BTreeMap<Vec<u8>, Entry>,
+  held: &mut Vec<ContentId>,
+) -> Result<Made, StepRefused> {
+  let root = paths.build(content, entries).map_err(StepRefused::Paths)?;
+  let made = trees.build(content, entries);
+  with_trees(made, root, held).map(|(root, trees)| Some((root, trees, Stepped::Built)))
+}
+
+/// Gives back each hold of `held` in `repository`'s content store, as [`made`] gives back a refused step's.
+fn give_back(stores: &mut VcsStores, repository: RepositoryId, held: &[ContentId]) {
+  if let Some((content, _)) = stores.git(repository) {
+    for id in held {
+      let _ = content.release(id);
     }
   }
 }

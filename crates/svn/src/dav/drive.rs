@@ -510,6 +510,14 @@ impl Drive {
     self.stage = Stage::Aborted;
   }
 
+  /// Takes what is written so far into `out`, as a streamed answer sends it a slice at a time (A-681): what follows is
+  /// written within the room afresh. Nothing of an aborted drive is taken, since its bytes are never sent.
+  pub fn take_written(&mut self, out: &mut Vec<u8>) {
+    if self.stage != Stage::Aborted {
+      out.extend_from_slice(&self.body.drain());
+    }
+  }
+
   /// Ends the answer: the bytes to send. Refused for an aborted drive, and while a node or a delta is open.
   pub fn finish(mut self) -> Result<Vec<u8>, DavRefusal> {
     if self.stage == Stage::Aborted {

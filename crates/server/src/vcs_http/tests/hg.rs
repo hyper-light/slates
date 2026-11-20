@@ -236,7 +236,7 @@ impl HgStores for OneStore {
   }
 
   /// `hg`'s pushes are accepted with no reply part, as a push without `replycaps` is answered.
-  fn push(
+  async fn push(
     &mut self,
     id: RepositoryId,
     _pushing: Pushing<'_>,
@@ -669,7 +669,7 @@ impl HgStores for Vanishing {
     None
   }
 
-  fn push(
+  async fn push(
     &mut self,
     _id: RepositoryId,
     _pushing: Pushing<'_>,

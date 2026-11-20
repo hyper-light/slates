@@ -12174,6 +12174,28 @@ is one more version, and the chain itself is never rewritten.
 
 **A push is a work.**
 
+**A push's intake (the rule for every tool's push and commit; A-719, main's ruling 2026-11-20).** Ada's target is tens
+of thousands of concurrent large pushes on one server, many of them to one repository, so an intake is held to four
+rules, which git's, Mercurial's and Subversion's intakes cite:
+1. *Its working set is bounded whatever its size.* Its objects are decoded as they arrive and each is stored once, in
+   the repository's one byte store, as it resolves; a delta is resolved against a base already stored (an offset
+   delta's lies earlier in the pack, a thin pack's reference delta's in the repository). Nothing holds the whole pack,
+   or every object verified in memory: at once an intake holds the entry being read, a delta with its base and its
+   target, the deltas still waiting for their bases, and tables of a few words an object.
+2. *Admission charges that working set.* The content a push adds is charged as it is stored (A-714's retention), and a
+   push past the shard's room is refused typed, never by one request's room (A-704, A-713).
+3. *Every pass runs a turn at a time* under the shard's step quantum (§4.3): reading, the checks, the store's admission
+   and the verdicts. No step of a push is longer than its quantum by more than one unit of work.
+4. *Intakes run concurrently, one repository's too.* Each push has its own working set (or its own fork); only its
+   landing, the verdict against the head and the ref's move, is ordered per repository, as Subversion's revision
+   assignment is the only ordered step of a commit.
+
+> **Status (2026-11-20, A-719 parts 1 and 2).** Rule 3's checks are built for git (part 1: `slates_git::receive::Checking`);
+> rule 1's reader seam is built (part 2: `slates_git::unpack::Keep`, each object handed to its keeper as it resolves,
+> with the hold its bytes took, and a delta's base read back from it). Owed: git's intake keeping into the repository's
+> store as it reads (part 3), on w-perf's byte table once it lands; admission by the working set; the store's
+> admission and the verdicts a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
+
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
 > the tool named them by, read through `PushObjects` (tree entries, a blob's length, a blob's bytes; a store implements
@@ -12479,6 +12501,16 @@ restart by the anchor segment (§4.4). On a laptop (f = 0) the anchor's RAM is t
 what was not landed. Importing an existing
 repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
 under a grant (§4.15, R10).
+
+> **Status (2026-11-20, A-716 slice 1a: a text held once, by content identity).** A green holds texts by identity in a
+> table of its file blocks (`crates/merge/src/held.rs`; `Green::hold_path`, `hold_bytes`, `held`, `release_held`,
+> `set_held_room`): by path, the head file's own block with one more holder, so no byte is copied; or by bytes, a block
+> no path names, for an intake that streams objects before any tree. A held text outlives its file's change and
+> removal, and is let go with its last holder. The table's room is its owner's to derive (zero until set), every hold
+> past it refused typed. It replaces the copies each tool keeps of the green's bytes (A-64: a Subversion text was held
+> three times, the records' copy alone 1.37 times the dump; BENCHMARKS.md). Owed: a green op setting a path from a held
+> identity (slice 1b), the table in the checkpoint (1c), Subversion's records reading through it (2, 3), git's and
+> Mercurial's intakes holding by bytes (w-git, w-hg).
 
 > **Status (2026-11-19, A-714, w-svn, found by use: a 5,000-revision Subversion import refused `green_chains` at 1,685).** An
 > entry's objects are the repository's content: the register keeps them as before, but the owner shard charges them to
@@ -14495,7 +14527,9 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 
 **Push.** Each step names what it refuses; nothing takes effect before step 6.
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
-working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices in part 2.
+working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
+push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
+landing.
 1. **Intake.** The bundle (bundle2; bundle1 only where the policy allows legacy clients, as 7.2's `server.bundle1`
    does) is read in slices within the shard's budget per step, every length checked against the request's admission
    (A-16) before anything is held. A mandatory part or parameter slates does not know is refused, as bundle2 requires
@@ -52273,7 +52307,10 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   verdict when its post-state is one git cannot hold; a whole build and a whole map's release sliced a unit at a time
   (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
   source's head is the version it was made at (BUILT 2026-11-20, `paths::branch_before`: the branch's version 0 is that
-  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (A-636's fleet half); a copy made through a work
+  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (BUILT 2026-11-20 through A-636 part 2c-2: a successor's
+  rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
+  recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
+  `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
   by the same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
@@ -54263,3 +54300,56 @@ Applied in the same change to:
   delta's in the repository), no whole pack held; admission charging that working set and the content charged as it is
   stored (A-714's retention), refused typed at the shard's room; the quarantine's admission and the verdicts made a turn
   at a time; the by-use proof over w-interop's v2.0.0 cut and whole git/git.
+
+### A-664 holders' maps — A successor's rebuilt repository holds each green's map and trees (2026-11-20, w-shared for UI goal 93)
+- **Why.** A-664 part 3 keeps each git green's map of paths and its head's trees on the owner, made again by a recovery
+  and a rebuild; a successor that rebuilt a repository it took over (A-636 part 2c-2) made its store and no map, so its
+  greens' next versions could not derive their commits from the head they adopted.
+- **Change.** `vcs_store::make_whole`: the store made from the log, then each member green's map and trees from its
+  head (`paths::remake`), in one step; `vcs_store::rebuild` and `takeover::rebuild_repository` both call it. The maps
+  are derived from the greens' own content, so they need nothing shipped beside the logs.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::paths::tests::t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map` (two versions of a
+  file, the repository's record and store dropped leaving its green, rebuilt from its record and names log as a
+  successor does: the head's map equal to its model, remade once; the next version derived from it): `cargo test
+  --locked -p slates-server --lib -- vcs_store::paths:: vcs_store::commits:: fleet::state_log_tests takeover::
+  --test-threads=4` 34 of 34; fmt clean.
+- **Owed.** The fleet gate by use (a git repository's owner killed, its successor answering a stock clone and taking the
+  next submit), main's.
+
+### A-719 part 2 — A pack is read into a keeper, its working set bounded whatever its size (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" item 3)
+- **Change.** `slates_git::unpack::Keep`: the reader hands its keeper each object as it resolves, with the hold
+  (`Admission::hold`) its bytes took, and reads a delta's base back from it; it keeps only what names each object
+  (`Reader::read_into`, `Reader::finish_into`, answering each object's place, `Placed`, in pack order). A keeper that
+  stores objects elsewhere gives each hold back, so the reader's admission bounds its working set (the entry being read,
+  a delta with its base and its target, the deltas waiting for their bases, its tables), not the pack. `Held`, the
+  reader's own keeper, keeps every object and its charge, so `Reader::read`, `Reader::finish`, `finish_with` and
+  `read_whole` answer and charge as before. The rule it serves is written into §4.17.1 ("A push's intake").
+- **Tests.** `slates-git` `unpack::tests::a_pack_read_into_a_keeper_that_stores_elsewhere_holds_a_bounded_working_set`
+  (the 300-deep chain read into a keeper that stores elsewhere, fed in pieces of 61 bytes, under an admission of its
+  tables and eight versions, which cannot hold a third of its targets: every object as the pack read whole makes it;
+  read into memory under the same admission, refused).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- unpack:: receive::
+  protected_fixtures store:: upload::` 224 passed, 4 ignored, the new test named; fmt clean.
+- **Owed.** Part 3: git's intake keeping into the repository's store as the pack is read (the session and the push
+  driver over a store keeper, the checks reading objects back from it), on w-perf's byte table once it lands.
+
+### A-664 sliced whole builds, part 1 — A recovery's remake of a green's map steps a file a unit (2026-11-20, w-shared for UI goal 93)
+- **Why.** A recovery made each git green's map and trees again from its head in one unit of its slices
+  (`crate::recovery_slices`): putting every file of the head, hashing each as git's blob, then building the map and
+  trees. A green of many files is one unit as long as its build, so the watchdog, which judges a shard that runs a
+  liveness window of CPU without a step, could end a daemon restarting over a large repository.
+- **Change.** `paths::remake_green_sliced`, which `vcs_store::recover` calls for each member green: the head's files
+  put one a unit of the recovery's slices (`put_sliced`), then the map and trees built of them and kept as
+  `remake_green` keeps them (`Plan::Put`, through `made_holding`, which gives the put files' holds back with the
+  step's own, past a refusal too). A recovery runs alone on its shard, so nothing reads the green or its store between
+  units. `remake_green` stays for a rebuild and a successor's (both run inside one step of a verb or a period).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::paths::tests::t_a664_sliced_a_recoverys_whole_build_steps_a_file_a_unit` (six files, the map given back,
+  remade in slices whose least is a nanosecond: polled more than once, six units, the map equal to its model, remade
+  once): `cargo test --locked -p slates-server --lib -- vcs_store::paths:: vcs_store::commits:: vcs_store::tests
+  --test-threads=4` 26 of 26; fmt clean.
+- **Owed.** The map's and trees' build of the put files in slices of their own (one unit now); the live whole builds
+  (a push's, a green's first submit's, one past a copy), whose version's made commit needs the trees in the version's
+  own transaction; a whole map's release (`ContentStore::release`'s cascade) a unit at a time; recovery's timing over a
+  large repository (main's).

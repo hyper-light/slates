@@ -323,6 +323,29 @@ impl Files {
       .map(|(path, block)| (path, self.blocks.bytes(*block)))
   }
 
+  /// The block `path`'s file holds, given one more holder: what a held text shares with the file (A-716, the green's
+  /// identity table), so holding a file's text copies no byte. None for no file at `path`.
+  pub(crate) fn hold_block_of(&mut self, path: impl AsRef<[u8]>) -> Option<Block> {
+    let block = *self.map.get(path)?;
+    self.blocks.hold(block);
+    Some(block)
+  }
+
+  /// A new block holding `bytes`, with one holder and named by no path (A-716: a text held before any file names it).
+  pub(crate) fn add_unnamed_block(&mut self, bytes: Vec<u8>) -> Block {
+    self.blocks.add(bytes)
+  }
+
+  /// A held block's bytes; none for a block that is gone (never, while the table holds it).
+  pub(crate) fn block_bytes(&self, block: Block) -> &[u8] {
+    self.blocks.bytes(block)
+  }
+
+  /// One holder of a held block fewer; the block is freed with its last.
+  pub(crate) fn release_block(&mut self, block: Block) {
+    self.blocks.release(block);
+  }
+
   /// [`Dim::fork`]: the blocks stay with the arena.
   pub(crate) fn fork(&mut self) -> Files {
     Files {
