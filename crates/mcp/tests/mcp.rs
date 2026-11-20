@@ -388,6 +388,26 @@ fn assert_copy_declared_and_read_back(server: &mut McpServer, green: &str) {
     replace: false,
   };
   assert_eq!(slates_mcp::work_op_kind(&copy), Some("copy"));
+  // A copy of nothing is refused before any verdict, typed by its case (A-586; main's ruling of 2026-11-20).
+  let empty = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "copied-nothing" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let op = json!({ "kind": "copy", "from": "/nothing", "to": "/z" });
+  call(
+    server,
+    "slates.merge.declare",
+    json!({ "work": empty, "op": op }),
+  );
+  let refused = call_refused(server, "slates.merge.submit", json!({ "work": empty }));
+  assert!(
+    refused.contains("CopyRefused") && refused.contains("source_empty"),
+    "{refused}"
+  );
 }
 
 /// Calls a tool expecting a JSON-RPC error, returning its message.

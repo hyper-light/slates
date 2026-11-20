@@ -157,6 +157,9 @@ fn agent(agent: usize, requests: SyncSender<Request>) {
           "the shuttle green is never checkpointed, so no base is below its floor: base {base}, floor {floor}"
         )
       }
+      Outcome::CopyRefused { path, case } => {
+        panic!("the shuttle green's works declare no copy: {path} {case:?}")
+      }
     }
   }
   requests.send(Request::Done).unwrap();

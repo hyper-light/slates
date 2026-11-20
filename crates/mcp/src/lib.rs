@@ -902,6 +902,13 @@ struct McpError {
 /// daemon is its own code so an agent can distinguish "refused" from "gone".
 fn refusal(e: ClientError) -> McpError {
   match e {
+    ClientError::Refused(slates_ipc::protocol::Refusal::CopyRefused { path, case }) => McpError {
+      code: code::REFUSED,
+      message: format!(
+        "CopyRefused: the copy to {path} is refused: {}",
+        copy_case_name(case)
+      ),
+    },
     ClientError::Refused(refusal) => McpError {
       code: code::REFUSED,
       message: format!("{refusal:?}"),
@@ -915,6 +922,21 @@ fn refusal(e: ClientError) -> McpError {
       code: code::REFUSED,
       message: other.to_string(),
     },
+  }
+}
+
+/// The name a refused copy's case is reported by (A-586; main's ruling of 2026-11-20): every case of the wire's
+/// `CopyCase` by an exhaustive match, so a case appended to the wire breaks this build until this surface names it.
+pub fn copy_case_name(case: slates_ipc::protocol::CopyCase) -> &'static str {
+  use slates_ipc::protocol::CopyCase;
+  match case {
+    CopyCase::Root => "root",
+    CopyCase::PastHead => "past_head",
+    CopyCase::SourceEmpty => "source_empty",
+    CopyCase::VersionFolded => "version_folded",
+    CopyCase::OutsideNodeChanged => "outside_node_changed",
+    CopyCase::ChangedSourceLink => "changed_source_link",
+    CopyCase::LinkAcrossCopy => "link_across_copy",
   }
 }
 
