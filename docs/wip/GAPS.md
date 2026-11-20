@@ -7022,11 +7022,14 @@
 >   while the daemon lives, the daemon's own watchdog ending a stuck or spinning shard, so the guest no longer judges
 >   the shards' CPU itself; an answer past the old five seconds is still counted, `Waits::extended`), its condition polls
 >   (`wait_until`, `wait_for_count`, the route's malformed count), its route and resync reads; and `common/client.rs`'s
->   `START_WAIT` and `TAKEN_WAIT`. Not in the part, found by its sweep: the same five- to sixty-second waits under other
->   names (`START_WAIT`, `TAKEN_WAIT`, `HOLD_START_WAIT`) in `server/tests` (`recovery`, `give_back`,
->   `cross_shard_wait`, `consumers`, `attachment_term`, `reply_room`, `forward_retry`), `client/tests` and its
->   examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module and `xtask`'s conformance and kind harnesses;
->   each is a test's wait on a live daemon on the wall. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   `START_WAIT` and `TAKEN_WAIT`. Found by its sweep, outside the part: the same five- to sixty-second waits under other
+>   names (`START_WAIT`, `TAKEN_WAIT`, `HOLD_START_WAIT`), each a test's wait on a live daemon on the wall. In
+>   `server/tests` since 2026-11-20 (g226, main's ruling): `recovery` (a connect, two create retries, a pool's return,
+>   a heartbeat's stop, a stop's end and nine condition loops), `give_back`, `cross_shard_wait`, `consumers`,
+>   `attachment_term`, `reply_room` and `forward_retry` wait on their event while the daemon lives, its watchdog the
+>   bound (A-232). Owed: `client/tests` and its examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
+>   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
+>   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the
