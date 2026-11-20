@@ -114,3 +114,27 @@
 - A-732 part 3 (sliced Mercurial rebuild: VcsStores::rebuilding, replay_sliced task; rebuild_whole for git/svn/tests)
   LANDED main (piece 4fa835b3f, merge 0f756ec77). Local server 140/140.
 - NOW: S5 part 2 (A-729): SHGR v2 = names + changegroup deltas; replay re-takes it through the intake.
+- 2026-11-20 (after compaction), LANDED on main, each with focused tests (target now ~/.cache/w-hg-local-target.noindex,
+  CARGO_INCREMENTAL=0):
+  - A-729 part 2 push: SHGR v2 = changegroup as arrived, replayed through the intake (b1d001601). Proven by use:
+    w-interop 57,035-rev push 142 s, RSS 5,460 MiB vs 13,450, no spin.
+  - A-729 part 2 import: SHGR v3 manifests as index deltas (5ad8dea09); made records v3 manifest delta (669bf99e4);
+    import file revisions as one-hunk deltas vs previous rev (de49b6bd4; w-perf found 4.66 GB record + one-step
+    landing append spins shard 9; C run queued). OPEN (main's ruling asked): bounded import append (entry parts, or
+    identity-only records after A-727 a3).
+  - A-575 sibling: hg branch verbs name bookmarks (62fb88997).
+  - A-745 (claimed): fetch answer in slices. Design rule §4.17.1 + red (3daa8b369); piece 1 Answering/Walk by links
+    (d0749fe2d); 2a HTTP streamed (658eb7d9c); 2b SSH (2aeeac954); rule 4 generation hold (216c57ad2); piece 3
+    stream_out streamed (84a596819); stream2 findings in GAPS (f14562e4c). Owed: stream2, matrix rerun (w-interop).
+  - A-731 copies in made changesets (eeabd1dfe).
+- OPEN with main: S5 homing design (homes.rs first consumer + async read path) — asked, awaiting ruling.
+- NEXT: inventory by user impact: pushrebase (server-made changesets over a moved head), clone bundles, ...
+- 2026-11-20 (later), LANDED: ssh-clone stall (rekey with a full outbox; key time fixed at RFC's 1 h; bytes-driven
+  volume rekey proved under ChaCha20, 53a81211d); identity-only import records SHGR v4 (306214c57).
+- Item 5 (A-575 `--from`, main's ruling): Mercurial lookup order (bookmark, tag, branch tip) via
+  slates_hg::serve::lookup::resolve_name; slates_hg::tags (7.2 fold, 300 vectors from 7.2's own functions);
+  served lookup resolves tags. Commit e531594fa, merged with origin/main 2cf1b1d35; focused tests rerunning as kiln r24.
+- Item 2 clone memory: r21 big Studio, base 359da2388: push peak 7,687 MiB, after-push 8,109; first HTTP clone ->
+  12,143 MiB, held after; ssh and stream clones add nothing. r23 (vmmap + heap per phase, second HTTP clone) running.
+- Local target deleted (main, disk low): every cargo run now through kiln, no `on`.
+- NEXT: item 2 bound (red first), item 6 (forced new-head push over a moved line), item 4 S5 head texts.
