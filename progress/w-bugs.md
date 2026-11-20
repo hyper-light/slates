@@ -220,3 +220,20 @@
   the update back 500 and the update forward. Most bytes in a slice 9,216 (svn://) / 2,732 (DAV). The longest slice
   is still 3.2-4.6 ms / 2.7-3.6 ms against a ~2.9 us quantum: the long step is not a window's. Unnamed; naming it
   needs per-step instrumentation (a diag run).
+- 2026-11-20 A-751 tests on units landed 26e125adb (base adacdeec8): each window step held to WINDOW_STEP_UNITS (1,088),
+  red 205,172; the maker's walk now checks its units after a failed look-up. (Its parent 03f872541 reached main as
+  "wip": don't repeat; amend before push.)
+- CI diag-w-bugs-svnfetch-9 (macos-latest, base 508b2be88, step kinds timed): dir:properties is the long step, max
+  3.9-5.8 ms (svn://) and up to 19.8 ms (DAV), 100-650 us on average (both listings, every name ever made beneath,
+  two resolves per child). Rarer: file:window-unit spikes to 1.9-5.4 ms (<10 per ~200K steps, before 26e125adb's walk
+  fix), dir:targets 2.7-8.5 ms (1 each), file:properties 1.2-2.0 ms, a call's write 1.2-3.5 ms. Correctness holds.
+  Checkout times 11.0 s / 14.2 s vs run 8's 7.1 / 7.6: unexplained (runner, part 3, or other commits), to A/B.
+- Proposed to w-svn (inbox): per-directory-row persistent children maps in the index, listing at O(live children),
+  entries with ids (no second resolve), then a cursor for very large directories. Waiting on w-svn's agreement
+  before touching index.rs.
+- 2026-11-20 runs 10/11 (macos-latest, 477abbf73): fetches 3-12x slower than run 8 (checkout 25.0 s / 23.2 s vs
+  7.1 / 7.6; update 32.5 / 24.6 vs 2.7 / 3.6). Window steps ~100 us average (4.4 us in run 9), up to 95 ms. Cause:
+  S4 c2 14215b0c3 (w-perf): Repository::text rebuilds the whole text from its skip-delta chain on every call, and
+  the fetches read 1,024 bytes a step. Sent to w-perf's inbox with two shapes that fit the budget (a made-text cache
+  or reader handle; the chain applied in units). Listing measurement landed 477abbf73 (3.84 ms children regardless
+  of live count). Still waiting on w-svn's agreement for the listing index.

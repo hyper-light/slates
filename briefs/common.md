@@ -111,6 +111,9 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
   fast landing rule, confirmed with `git merge-base --is-ancestor`.
 - A red check still running (a Windows red, a CI diag) doesn't hold a green piece back: land on the green, then add the red's
   numbers as a follow-up commit.
+- Only finished commits reach main, each with an area-prefixed message that carries the measured fact. Fold "wip"
+  commits into the real one before pushing (`git commit --amend` while they're unpushed). A commit on main is
+  permanent, since we never force-push. (03f872541 "wip" reached main at 07:39.)
 - An experiment that lost goes into BENCHMARKS as measured-and-rejected, and then its branch is deleted. Main audits
   agents/* branches every five minutes.
 
@@ -132,6 +135,9 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
   routes above), a full disk, a stale branch, a merge conflict, a flaky run. Otherwise say it in one line in your
   summary or report and go straight on to the next item in your queue. Never end a turn just to wait for an answer.
   Main checks every agent about every five minutes and will unblock you.
+- Reading free disk on macOS: `df -h ~ | awk 'NR==2{print $4}'`. The 4th column (Avail) is free space. The "10G"
+  further right is ifree (free inodes), and three agents misread it on 2026-11-20 as 6-13 GB free on a Studio with
+  999 GiB free.
 - Disk: before each build check `df -h ~`. Below 25 GB free, delete your OWN landed worktrees, your target's
   `release/` and `incremental/` directories, and datasets you no longer need. Never delete another agent's
   folders; tell main instead. Delete by exact path only, never a glob over ~/.cache. Never write `rm -rf $var`

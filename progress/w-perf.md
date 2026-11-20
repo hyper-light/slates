@@ -247,3 +247,7 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - r79 built C = de49b6bd4 (bin/slates-C, bench line in). r80 (bg): waits for r75's ab.sh, then VARIANTS=C ab2.sh 3
   (CAP 1800) -> new ~/.cache/w-perf/ab/<ts>/results.tsv. Then BENCHMARKS.md: A x3, B x3, C x3 + swap 38.83 ns.
 - Waiting on main: S4 slice 2 cut (c1/c2/c3, skip A-716 1c by re-holding head paths at rebuild).
+- Seam answer to w-engine pushed (state 1fc0f6ebd), accepted by main. w-svn staging API on main (e9b70d6d4).
+- S4 c1 LANDED 17aa54dd8 (svn_texts: hold/release per landed revision, rehold_head at recovery, HeadTexts source).
+  Reads switch to HeadTexts + drop records' text bytes + drop fallback = c3 (one series; GAT refactor of SvnStores).
+- NEXT: c2 (old text as svndiff delta vs successor in repo ContentStore before the green folds); BENCHMARKS on r80.

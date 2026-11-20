@@ -46,3 +46,13 @@ lift it to a shared one in the server, not a second format.
 ## What I change for you
 When you start: I lift `vcs_store::Lent`/`lent_state`/`take_chunks` to the shard-level holder (one series, no
 behaviour change, my tests), so your `BlockStore` lands on it. Tell me when, and I do that piece first.
+
+## Addendum (2026-11-20, main's ruling (B) for Subversion's intake): one identity space
+A text's identity is the vcs content store's object root (`slates_vcs::ContentStore::object_id`): plain BLAKE3 for at
+most one window, `put_object`'s list root past it (w-svn's streaming `begin_object`/`put_window`/`finish_object`,
+e211d430c, gives the same root). svn's intake writes into that store (durable via A-727 a3's image pieces); the log
+entry names identities; the green's held table (A-716, S4 c1 17aa54dd8) and a green's head file point at those
+identities, so the head file is the store's content, one copy. Your items 3-7 (green blocks as chunk references) should
+key on the same root identity: a green block that is a repository text is that content-store object, not a second
+chunk. Window size and list fanout are the content store's (`ContentStore::window`), so name a block by its root only
+through the store's rule.

@@ -75,3 +75,69 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
 - Piece 3: HVF proven (g90 + piece 1's g266 pass); KVM r4 (adacachy, piece-1 tree) still running; WHP BLOCKED.
 
 ## 2026-11-20: piece 1 goal closed: HVF `microvm::` at kiln main 81174ac49 (A-741 in): 2 passed, 0 failed (g266 Ask+Bypass, g90 daemon 4630 killed -> successor 19863), 1998 s, alone on the Mac; log ~/.cache/w-k90-microvm-logs/hvf-main.log; target trimmed.
+
+## 2026-11-20 ~08:20 PST: KVM drive (piece 3) -- r4 was HUNG, not slow
+- r4 (piece-1 tree 23f066947) waited ~7 h on g266's first turn: on KVM the Ask agent's microVM started twice
+  (kiln-z1-0, kiln-z1-1), each failing `agent control: Unstarted(Failed)` (its member's command never started in the
+  guest; Hex's MCP wait ran out at 41 ms), and kiln never failed the session, so the unbounded drive waited for ever.
+  The runner itself (`kiln agent --name slatesvm`) did NOT respawn: up 6h54m; the fresh `kiln agent` children
+  beneath it are unexplained yet. Stopped r4 and its unit (run-p112760).
+- Reproduced at kiln main 9129995e8 (r17, bounded): same Unstarted(Failed) twice. Hex deletes a failed box's
+  run-host diagnostics (hex-records/image-diagnostics) with it, so the cause in the guest is unread yet.
+- r33 (ed8991d29) failed at once: ENOSPC. adacachy's /tmp (62 GB tmpfs, shared) was 100% full: my two killed
+  drives' fixtures (3.4 GB, removed) and /tmp/.tmpZzjYQO (38 GB, someone's ACTIVE kiln test fixture since 08:07,
+  not mine, left alone, reported to main). Drives here now run with TMPDIR=$HOME/.k9t.
+- r41 (ed8991d29, bounded: test 2400 s, unit 3000 s, run 3300 s): g266 on KVM with a copier saving each box's
+  diagnostics to ~/.cache/w-k90-microvm-diag on adacachy. Queued.
+- Next: read the guest's words on why the member never started; failing test first; fix; rerun bounded.
+- Also owed (kiln bug seen): a session whose microVM's member never starts is never failed (the drive waited 7 h).
+
+## HANDOFF to w-k90-kvm (2026-11-20 ~09:00 PST): w-k90-microvm stops here
+### Runs: none of mine is running
+- r4 (KVM, piece-1 tree 23f066947): HUNG ~7 h, stopped; its unit run-p112760 stopped. Log on adacachy
+  ~/.cache/w-k90-microvm-kvm.log (610 lines, last written 23:38). r17 (kiln main 9129995e8, bounded) reproduced the
+  same failure, stopped (unit run-p2923027). r33 (ed8991d29) failed at once: ENOSPC in /tmp. r41 (ed8991d29, with a
+  diagnostics copier) stopped before it ever started (queued). r27/r30/r31 ended (stop helper / refused for room).
+- Still running on adacachy, NOT mine: unit run-p3578166-i1857887806 uses CARGO_TARGET_DIR w-k90-microvm-target
+  (presumably w-k90-kvm's). Left alone. The target ~/.cache/w-k90-microvm-target on adacachy is yours to reuse or
+  delete (kiln test build at ed8991d29, Shards packed in shards-carried-out).
+### What I found
+- The failure (KVM only; macOS HVF passes 2/2 at 81174ac49): g266's first agent's microVM starts, and its member never
+  starts: runner log (`<fixture>/slatesvm.log`) says, within ~40 s of the session's start, twice:
+  `kiln's MCP takes no more of its harness's connections vm=kiln-z1-0 why=its microVM isn't valid: waiting for a
+  member's MCP connection failed: box kiln-z1-0's member 0: agent control: Unstarted(Failed)`, then the same for
+  kiln-z1-1 (with `hex.wait event=ran_out wait=hex.image.mcp w_star_ns=41583036`). kiln then never fails the session,
+  so the drive (`pace.until`, no window) waits for ever: that is the "hang". Same at kiln main 9129995e8.
+- Why the member never starts: NOT read yet. Hex deletes a failed box's run-host diagnostics
+  (`<fixture>/slatesvm-state/hex-records/image-diagnostics/*`) with the box; copy them while they exist (r41's
+  copier, below). Shards' daemon.log has nothing (image runs go through their own run host).
+- "kiln agent --name slatesvm respawning": the runner itself did NOT respawn (pid 1857459 up 6h54m). A fresh
+  `kiln agent ...` CHILD of it (pid 1995460, 0 s old when seen) kept appearing; its cmdline couldn't be read in time
+  (reading some /proc/<pid>/cmdline on adacachy hangs: use `timeout 1` per read, or /proc/<pid>/status). Unexplained.
+- adacachy's /tmp (62 GB tmpfs, shared) was 100% full: 38 GB in /tmp/.tmpZzjYQO (someone's active kiln fixture,
+  not mine). The drive's fixture goes under $TMPDIR: run it with TMPDIR=$HOME/.k9t (short: sockets <108 bytes).
+- Also: two kiln bugs to file/fix: (a) a session whose microVM member never starts is never failed (needs a
+  failing test in kiln's held/hexvm path); (b) the member's own failure on KVM (cause unread).
+### The exact command (r41's; in a kiln checkout at origin/main, on adacachy, bounded)
+  git log --oneline -1; [ -c /dev/kvm ] || exit 3; systemd-run --user --wait --pipe --collect -p MemoryMax=30G
+  -p CPUWeight=1 -p Nice=19 -p RuntimeMaxSec=3000 bash -lc 'cd <checkout> && export TMPDIR=$HOME/.k9t
+  CARGO_TARGET_DIR=$HOME/.cache/w-k90-microvm-target KILN_SHARDS_DIR=$HOME/.cache/w-k90-microvm-target/shards-carried-out
+  CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 SHARDS_LOG=debug GIT_CONFIG_COUNT=0 && rm -rf $TMPDIR && mkdir -p $TMPDIR
+  $HOME/.cache/w-k90-microvm-diag && ( while true; do for f in $TMPDIR/.tmp*/slatesvm-state/hex-records/image-diagnostics/*;
+  do [ -f "$f" ] && cp -f "$f" $HOME/.cache/w-k90-microvm-diag/; done; sleep 0.2; done ) & C=$!; ci/shards/pack.sh &&
+  SLATES_E2E=1 VM_E2E=1 timeout -s KILL 2400 cargo test --locked -p kiln --test slates_e2e microvm:: -- --nocapture
+  --test-threads 1 > $HOME/.cache/w-k90-microvm-kvm2.log 2>&1; echo rc=$?; kill $C'
+  (kiln `run` with needs linux/amd64,cpus=2,mem=30g queues; `on: adacachy` with cpus it can't give is refused.)
+### Done by w-k90-microvm (goal 90)
+- Piece 1 LANDED kiln main fa96bcc47; macOS HVF drive at 81174ac49: 2 of 2 (g266, g90). Goal met (main).
+- Piece 2 (resync end) LANDED kiln main 522ba54b3; HVF g90 proves it; Shards D288 (branch
+  agents/w-k90-microvm-resync-d288) and Hex patch 0003 carried by kiln until their owners merge. KVM proof owed.
+
+## 2026-11-20 FINAL (w-k90-microvm): COMPLETE for my part; signal to main to mark in the UI
+- MARK COMPLETE: goal 90 queue item 1, "kiln's macOS microVM drive green again at main (r134, A-587)": kiln main
+  fa96bcc47 (re-vendor at Slates 38ed3dfd8), HVF drive 2 of 2 at 81174ac49 (base origin/main 81174ac49).
+- MARK COMPLETE: goal 90 queue item 2, "kiln's SlatesVolumes keeps slates' resync end": kiln main 522ba54b3
+  (b3e781328), HVF g90 passed (daemon killed, successor served the share). Its KVM run is w-k90-kvm's; Shards D288
+  (agents/w-k90-microvm-resync-d288, b9006561b) waits on Shards' coordinator (R15), carried by kiln meanwhile.
+- NOT mine any more: item 3's KVM proof (w-k90-kvm, handoff above); WHP BLOCKED (jupiter).
+- Nothing unpushed; worktrees of landed work removed. Verified at kiln origin/main 0a17f46e5.
