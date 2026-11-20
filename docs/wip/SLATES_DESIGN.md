@@ -14595,7 +14595,8 @@ Status (A-729 part 1, the index's storage): a manifest is kept as its delta agai
 delta bytes stay within its text's length (derived, as 7.2's `deltas.py` bounds a delta), else whole; every reader
 rebuilds it through `HgIndex::revision_text`.
 Status (A-729 part 2): a push's record is its changegroup as it arrived (`SHGR` version 2), replayed through the same
-intake; the landing appends deltas, never texts. Imports' and made changesets' records are still version 1 (texts).
+intake; the landing appends deltas, never texts. An import's record (version 3) writes each delta-kept manifest as its
+delta and base; a made changeset's record is still version 1 (texts).
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
 working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
 push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at

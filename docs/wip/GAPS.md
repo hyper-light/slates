@@ -148,8 +148,10 @@
 > the head, the room the intake began within, the changegroup's version and bytes; deltas, never texts), written a
 > mean revision's bytes a step (`record::ChangegroupWriter`) and replayed by taking the changegroup again through the
 > live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
-> in place); the landing appends that, where it appended every text whole. Owed: an import's and a made changeset's
-> records still hold texts (version 1); the names list (the changegroup names every node, so none is written yet);
+> in place); the landing appends that, where it appended every text whole. An import's record (version 3) writes a
+> manifest the index keeps as a delta as that delta and its base's node, never rebuilt (Mercurial's own manifests:
+> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. Owed: a made
+> changeset's record still holds its manifest whole (version 1); the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.
 > **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
 > FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
