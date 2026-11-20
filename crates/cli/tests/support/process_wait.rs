@@ -12,9 +12,11 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Derived: how long a waited-on tree may gain no CPU before the wait fails: the anchor's own ceiling on judging a lapse
-/// (`slates_server::daemon::OBSERVE_BUDGET_NS`, which its lapse bound never exceeds), past which a live anchor has
-/// judged a stuck daemon and the tree would show its restart.
-pub(crate) const STALL: Duration = Duration::from_nanos(slates_server::daemon::OBSERVE_BUDGET_NS);
+/// (the observation budget, `slates_server::daemon::OBSERVE_BUDGET_NS`, which its lapse bound never exceeds), past which
+/// a live anchor has judged a stuck daemon and the tree would show its restart. Read from its one source,
+/// `slates_machine::budgets`, so `xtask`, which includes this file too, derives it as the daemon does.
+pub(crate) const STALL: Duration =
+  Duration::from_nanos(slates_machine::budgets::observe_budget_ns());
 
 /// Shape: the CPU a waited-on tree may spend, from the wait's start, before the wait fails without the answer:
 /// `live_chaos`' `START_CPU`, over twice the 13 s of CPU a lone debug daemon's start measured on a loaded Mac

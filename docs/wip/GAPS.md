@@ -7293,8 +7293,14 @@
 >   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
 >   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
->   own platforms), `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
->   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   own platforms), and `xtask`'s conformance harness's mount waits (`MOUNT_WAIT`, waits on the kernel's mount table and
+>   its tracers, owed onto the table's own event as `cli`'s unmount is). `xtask`'s conformance harness since 2026-11-20:
+>   its daemon's start and the live create judged by `process_wait::InstanceWait` (the suites' file, included by path:
+>   one judgment), an anchor's stop awaited on its log pipe's end (the kernel's word that every writer left) within
+>   the observation budget, the mount clients' deadlines the product's own; `START_WAIT` (60 s) gone. The observation
+>   budget's one source is `slates_machine::budgets` (`observe_budget_ns`, `liveness_budget_ns`, `RECOVERY_BUDGET_NS`),
+>   which the daemon's `OBSERVE_BUDGET_NS`/`LIVENESS_BUDGET_NS` and the db's `RECOVERY_BUDGET_NS` alias (R3; main's
+>   ruling). `kind`'s `SMOKE_START_WAIT` stays: it waits on `docker exec` into a container. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the
