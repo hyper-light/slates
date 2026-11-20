@@ -79,13 +79,14 @@
 //!
 //! **CRAM-MD5** is HMAC-MD5 (RFC 2104) keyed with the user's shared secret (RFC 2195 §2; `cram.c`
 //! `compute_digest`, a secret longer than MD5's 64-byte block hashed first). The server holds the
-//! keyed contexts, never the secret ([`CramKey`]; RFC 2195 §4: storing the "contexts" avoids
-//! "explicit cleartext storage of the shared secret", and the two "must both be protected"), and
-//! compares a digest in constant time where `cram.c` uses `memcmp`. HMAC-MD5 is RustCrypto's `hmac`
-//! over its `md-5`, approved for this mechanism alone (A-599): the workspace's cryptographic
-//! library, aws-lc-rs as vendored, has MD5 (`digest::MD5_FOR_LEGACY_USE_ONLY`, a local change for
-//! S3) but HMAC over the SHA family alone (`vendor/aws-lc-rs/src/hmac.rs`: `Algorithm`'s field is
-//! private, and its constants are HMAC with SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512).
+//! keyed contexts, never the secret ([`CramContexts`], [`CramKey`]; RFC 2195 §4: storing the
+//! "contexts" avoids "explicit cleartext storage of the shared secret", and the two "must both be
+//! protected"), and compares a digest in constant time where `cram.c` uses `memcmp`. Since A-692 the
+//! contexts are what a token's credential record keeps (§4.13), made when the token is enrolled, so
+//! each digest is finished from a kept MD5 state: MD5 is written here from RFC 1321 (`rfc1321`), since
+//! neither RustCrypto's `md-5` 0.10, which A-599 took with its `hmac`, nor the vendored aws-lc-rs
+//! (MD5 as `digest::MD5_FOR_LEGACY_USE_ONLY`, a local change for S3, and HMAC over the SHA family
+//! alone) lets a caller start from a kept state. Both libraries are its tests' oracles.
 //!
 //! **Bounds.** The client's items are read with the item codec ([`crate::ra_svn`]) within bounds
 //! derived from the handshake's own prototypes and from the one bound the caller gives, the bytes
@@ -99,10 +100,9 @@
 
 use std::ffi::CStr;
 
-use hmac::{Hmac, Mac};
-use md5::Md5;
-
 use crate::ra_svn::{self, Bounds, ItemError, Parsed, Parser, Value};
+
+mod rfc1321;
 
 /// The one protocol version spoken, the greeting's least and greatest.
 /// Format: `serve.c` greets "version 2 to 2" (`construct_server_baton`) and refuses any other
@@ -531,12 +531,100 @@ pub enum Verdict {
   Failed(AuthFailure),
 }
 
-/// A user's CRAM-MD5 key: HMAC-MD5's keyed contexts (RFC 2104 §2; RFC 2195 §4's "contexts"), made
-/// from the shared secret, which is not kept. A secret longer than MD5's 64-byte block is hashed
-/// first, as RFC 2104 and `cram.c` do.
+/// Format: RFC 2104 §2's `ipad`, the byte the key is XORed with for the inner hash (`cram.c`
+/// `compute_digest` 97).
+const INNER_PAD: u8 = 0x36;
+
+/// Format: RFC 2104 §2's `opad`, the byte the key is XORed with for the outer hash (`cram.c`
+/// `compute_digest` 102).
+const OUTER_PAD: u8 = 0x5c;
+
+/// Format: the bytes a kept context has absorbed, its one pad block (RFC 2104 §2's B, MD5's block),
+/// as Dovecot counts them when it loads one (`hmac_md5_set_cram_context`: `lo = 64`, `hi = 0`).
+const CONTEXT_ABSORBED: u64 = 64;
+
+/// HMAC-MD5's keyed contexts of one CRAM-MD5 secret (RFC 2104 §4; RFC 2195 §4's "contexts"): MD5's
+/// chaining state after the key's inner pad block, and after its outer pad block, from which every
+/// digest is finished without the secret. They answer CRAM-MD5 as the secret does, so they "must be
+/// protected" as it is (RFC 2195 §4), but they do not give it back: a credential record keeps them,
+/// never a token, which is also Basic's password and a bearer token (A-692). Their bytes
+/// ([`CramContexts::to_bytes`]) are Dovecot's CRAM-MD5 scheme's (`hmac_md5_get_cram_context`,
+/// `src/lib/hmac-cram-md5.c`): the outer state's words A, B, C and D, then the inner state's, each
+/// low-order byte first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CramContexts {
+  /// MD5's state after the key's outer pad block.
+  outer: rfc1321::State,
+  /// MD5's state after the key's inner pad block.
+  inner: rfc1321::State,
+}
+
+impl std::fmt::Debug for CramContexts {
+  /// Writes nothing of the contexts, which answer CRAM-MD5 as the secret does (RFC 2195 §4).
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str("CramContexts(..)")
+  }
+}
+
+impl CramContexts {
+  /// Format: the bytes of a pair of contexts (Dovecot's `CRAM_MD5_CONTEXTLEN`): two MD5 states of
+  /// four 32-bit words each.
+  pub const BYTES: usize = 2 * DIGEST_BYTES;
+
+  /// The contexts of `secret` (RFC 2104 §2): the key is the secret, or its MD5 where the secret is
+  /// longer than MD5's block, as `cram.c` makes it, zero-filled to the block; each pad block is
+  /// compressed once from MD5's initial state.
+  pub fn of_secret(secret: &[u8]) -> CramContexts {
+    let hashed;
+    let shortened: &[u8] = if secret.len() > rfc1321::BLOCK_BYTES {
+      hashed = rfc1321::digest(secret);
+      &hashed
+    } else {
+      secret
+    };
+    let mut key = [0u8; rfc1321::BLOCK_BYTES];
+    for (slot, byte) in key.iter_mut().zip(shortened) {
+      *slot = *byte;
+    }
+    CramContexts {
+      outer: padded_state(&key, OUTER_PAD),
+      inner: padded_state(&key, INNER_PAD),
+    }
+  }
+
+  /// The contexts' bytes, in Dovecot's layout (the type's doc).
+  pub fn to_bytes(&self) -> [u8; Self::BYTES] {
+    let mut bytes = [0u8; Self::BYTES];
+    let halves = bytes.as_chunks_mut::<DIGEST_BYTES>().0.iter_mut();
+    for (half, state) in halves.zip([self.outer, self.inner]) {
+      *half = rfc1321::bytes_of(state);
+    }
+    bytes
+  }
+
+  /// The contexts `bytes` holds, as [`CramContexts::to_bytes`] wrote them.
+  pub fn from_bytes(bytes: &[u8; Self::BYTES]) -> CramContexts {
+    let mut states = [rfc1321::INITIAL; 2];
+    for (state, half) in states.iter_mut().zip(bytes.as_chunks::<DIGEST_BYTES>().0) {
+      *state = rfc1321::state_of(half);
+    }
+    let [outer, inner] = states;
+    CramContexts { outer, inner }
+  }
+}
+
+/// MD5's state after one block of `key` XORed with `pad`, from its initial state.
+fn padded_state(key: &[u8; rfc1321::BLOCK_BYTES], pad: u8) -> rfc1321::State {
+  let mut state = rfc1321::INITIAL;
+  rfc1321::compress(&mut state, &key.map(|byte| byte ^ pad));
+  state
+}
+
+/// A user's CRAM-MD5 key: the shared secret's keyed contexts ([`CramContexts`]), the secret not
+/// kept.
 #[derive(Clone)]
 pub struct CramKey {
-  contexts: Hmac<Md5>,
+  contexts: CramContexts,
 }
 
 impl std::fmt::Debug for CramKey {
@@ -547,32 +635,28 @@ impl std::fmt::Debug for CramKey {
 }
 
 impl CramKey {
-  /// The key of `secret`; `None` only if HMAC refused the key, which it never does for MD5 (any
-  /// length is taken).
-  pub fn from_secret(secret: &[u8]) -> Option<Self> {
-    <Hmac<Md5> as Mac>::new_from_slice(secret)
-      .ok()
-      .map(|contexts| Self { contexts })
+  /// The key whose contexts are `contexts`, as a credential record keeps them (A-692).
+  pub fn from_contexts(contexts: CramContexts) -> Self {
+    Self { contexts }
   }
 
-  /// HMAC-MD5 of `challenge` under the key: the digest a client sends, as `cram.c`'s
-  /// `compute_digest` makes it.
+  /// The key of `secret`, by its contexts ([`CramContexts::of_secret`]).
+  pub fn from_secret(secret: &[u8]) -> Self {
+    Self::from_contexts(CramContexts::of_secret(secret))
+  }
+
+  /// HMAC-MD5 of `challenge` under the key, finished from its contexts (RFC 2104 §4): MD5 of the
+  /// challenge after the inner pad block, then MD5 of that digest after the outer pad block. The
+  /// digest a client sends, as `cram.c`'s `compute_digest` makes it.
   pub fn digest(&self, challenge: &[u8]) -> [u8; DIGEST_BYTES] {
-    let mut mac = self.contexts.clone();
-    mac.update(challenge);
-    let made = mac.finalize().into_bytes();
-    let mut digest = [0; DIGEST_BYTES];
-    for (slot, byte) in digest.iter_mut().zip(made.iter()) {
-      *slot = *byte;
-    }
-    digest
+    let inner = rfc1321::finish(self.contexts.inner, CONTEXT_ABSORBED, challenge);
+    rfc1321::finish(self.contexts.outer, CONTEXT_ABSORBED, &inner)
   }
 
-  /// Whether `digest` is HMAC-MD5 of `challenge` under the key, compared in constant time.
+  /// Whether `digest` is HMAC-MD5 of `challenge` under the key, compared in constant time (aws-lc's
+  /// `CRYPTO_memcmp`).
   pub fn verifies(&self, challenge: &[u8], digest: &[u8; DIGEST_BYTES]) -> bool {
-    let mut mac = self.contexts.clone();
-    mac.update(challenge);
-    mac.verify_slice(digest).is_ok()
+    aws_lc_rs::constant_time::verify_slices_are_equal(&self.digest(challenge), digest).is_ok()
   }
 }
 

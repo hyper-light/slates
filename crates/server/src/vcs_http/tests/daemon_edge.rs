@@ -143,10 +143,14 @@ fn create(daemon: &Daemon, name: &str) {
 /// Enrolls `token` for uid `uid` until `expires_ns`, on the partition its hash routes to, as the human surface does.
 fn enroll(daemon: &Daemon, token: &str, uid: u32, expires_ns: Option<u64>) {
   let id = crate::credentials::token_id(token.as_bytes());
+  let cram_md5_contexts = crate::credentials::cram_md5_contexts(token.as_bytes());
   let partition = usize::from(crate::credentials::owner_of(&id, usize::from(SHARDS)));
   let reply = crate::daemon::observe_at(daemon, partition, move |state| {
     let principal = slates_ipc::protocol::Principal::Uid { host: 0, uid };
-    let material = CredentialMaterial::HttpToken { id };
+    let material = CredentialMaterial::HttpToken {
+      id,
+      cram_md5_contexts,
+    };
     let proof =
       crate::credentials::enroll_proof(&state.issuer_secret, &principal, &material, expires_ns);
     crate::verbs::dispatch(

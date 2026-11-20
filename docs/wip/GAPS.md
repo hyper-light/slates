@@ -35,17 +35,28 @@
 > regular file at the file alone), built whole where no map of the version before is kept or a copy names a tree by its
 > destination alone (`Green::copied_after`, A-586); given back as the green leaves its lineage
 > (`repository::retire_member`), made again from the head by a recovery and a rebuild, freed with the repository; the
-> live store held equal to one made again after a branch's destroy. OWED: the clients' surfaces
+> live store held equal to one made again after a branch's destroy. Part 3's commit BUILT
+> (`crates/server/src/vcs_store/commits.rs` and its tests; A-664 part 3's commit's entry has the runs, on macOS arm64):
+> each green keeps its head's git trees beside its map, made over the same change; each version a work submits to a
+> git repository's green becomes the commit the server makes over them, its parent the commit before (pushed or made;
+> a `CreateBranch` branch's first, the commit it was made at), the session's git identity at the owner's instant in UTC,
+> the submit's message; its objects the repository lacks admitted through a push's steps and recorded by A-662's
+> record in an entry of the register holding it alone (no entry kind of its own: the register takes one, with no
+> position), appended in the version's own transaction and replayed by a recovery; a stock client's clone through
+> A-682's lender fetches it; a commit git would refuse or the budget refuses not made, counted, the version standing.
+> OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
-> message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); part 3, the made
-> commit recorded with the version (the merge record
-> carrying its principal, time and message) and admitted to the repository's git store over A-662, so clients fetch
-> it and the branch's head names it, derived from the maps part 3's first piece keeps; the maps' whole builds and a
+> message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); the holders'
+> commits (the merge record carrying the version's principal, time and message, so every holder makes the same
+> commit; a register entry's objects reach no holder yet, A-636); a branch `CreateBranch` makes named by a ref from its
+> creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
+> holding the blobs its version's chain entry holds already, once, by reference; the maps' whole builds and a
 > whole map's release sliced a unit at a time (each is one step, as A-662's replay of a record is); a branch's first
 > map derived from its source's where the source's head is the version it was made at; the holders' maps (A-636's
 > fleet half); a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
-> (A-626 part 4); a submit refused before the verdict when its post-state is one git cannot hold (a `.git` name, a
-> `.gitmodules` link, a name past 4096 bytes); a `.gitmodules` blob's own checks; blob ids read by content from the git
+> (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
+> `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
+> commit is not made, counted); a `.gitmodules` blob's own checks; blob ids read by content from the git
 > store's rows, so a rename or a revert hashes nothing; a derivation's transient listings charged to the store; then
 > Mercurial's changesets the server makes (§4.17.3 decision 7, piece 6) and Subversion's revisions (§4.17.4's revision
 > record) by the same rule, main to start them.
@@ -1247,6 +1258,8 @@
 > Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one waits on the pushes
 > over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
 > (A-679, built) reads as the HTTP site does (A-680).
+> Stock hg 7.2's clone over the SSH edge runs (w-interop, 2026-11-20): `stock_hg_clones_over_the_ssh_edge`, an empty
+> repository cloned and pulled, host key checked strictly (macOS arm64, Mac Studio, kiln r3: 1 of 1, fmt clean).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
@@ -1489,7 +1502,8 @@
 > (`svn_uri_canonicalize_safe`; `find_repos`' `skip_scheme_part`, `repos_path_valid` and `svn_path_remove_components`),
 > with piece 7's connection task, which today gives the handshake those values; (2) a limit on failed attempts per
 > principal and per address, learned (`svnserve`'s loop has none, and neither has the handshake), with §4.13's
-> admission; (3) the CRAM-MD5 keyed contexts held across a restart without the secret, with §4.13's secrets; (4) main's
+> admission; (3) the CRAM-MD5 keyed contexts held across a restart without the secret, with §4.13's secrets (built by
+> A-692, 2026-11-19: a token's credential record keeps them); (4) main's
 > decision whether HMAC-MD5 moves into the vendored aws-lc-rs as a local change beside its MD5, retiring `hmac` and
 > `md-5`; (5) main's gates over the new module (clippy, the cross-target lints, `xtask`). A-606 (2026-11-19, g229, UI
 > goal 92): authorization, built (`slates-svn`'s `authz`): the rules and groups files read as Subversion reads them,
@@ -1679,21 +1693,20 @@
 > main `e25799e8c`), `cargo test --locked -p slates-cli --test svn_interop` 1 passed (the control, 11.2 s) and 4
 > ignored, fmt clean. Each slates leg is ignored naming what it waits on, and run with `--ignored` each failed at its
 > first missing piece (r293: `--vcs-svn` and `--vcs-ssh` unknown flags; `repository create` refused as usage):
-> `svn://` on A-689 and its repository lookup (g234), A-685 (g305) and CRAM-MD5's secrets (A-599's owed (3), no piece
-> yet: the test's user, a token's id, and its password, the token, are its assumption); `http://`'s round trip on
-> A-681's reads and commits (g297) and A-685 (A-686's Basic is built), and its lock session on A-681's `LOCK` and
-> `UNLOCK`;
-> `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
-> no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
-> differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
-> the file is Unix-only, as `tests/cli.rs` is). Each slates leg mints its credential with the anchor's issuer surface
-> since 2026-11-19 (g309, main's ruling): `start_anchor` reads the surface beside the serving line, and `credential
-> token` and `credential key`, the issuer's verbs, run with it (`slates_as_issuer`), each leg skipping loudly on Linux,
-> whose surface is a descriptor only the anchor's children hold. macOS arm64 (Mac Studio, kiln r471 over main
-> be892650b): `--ignored --test-threads=1`, the `svn://` leg and both `http://` legs past `repository create` and the
-> token to their waits (`svn checkout`: `E210005 No repository found`, A-689's lookup; `E160013 '/project' path not
-> found`, A-681's later parts); `svn+ssh://` still stops at `slates: unknown flag --vcs-ssh` (A-684), before its
-> credential step; the control 1 passed.
+> `svn://` on the listener's repository lookup (A-689's next slice, g234), its CRAM-MD5 served by A-692 (the user a
+> token's id, the password the token); `http://`'s round trip on A-681's reads and commits (g297) (A-686's Basic is
+> built), and its lock session on A-681's `LOCK` and `UNLOCK`; `svn+ssh://` on A-684 (g299; the test assumes its port
+> line in the HTTP edge's words) and A-688 (g229); `slates repository create` landed (A-685). Owed: ra_svn's lock verbs
+> (answered 210001; A-693, g307), so the `svn://` and `svn+ssh://` legs lock nothing yet; item 14's differential run
+> over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's; the file is
+> Unix-only, as `tests/cli.rs` is). Each slates leg mints its credential with the anchor's issuer surface since
+> 2026-11-19 (g309, main's ruling): `start_anchor` reads the surface beside the serving line, and `credential token` and
+> `credential key`, the issuer's verbs, run with it (`slates_as_issuer`), each leg skipping loudly on Linux, whose
+> surface is a descriptor only the anchor's children hold. macOS arm64 (Mac Studio, kiln r471 over main be892650b):
+> `--ignored --test-threads=1`, the `svn://` leg and both `http://` legs past `repository create` and the token to their
+> waits (`svn checkout`: `E210005 No repository found`, A-689's lookup; `E160013 '/project' path not found`, A-681's
+> later parts); `svn+ssh://` still stops at `slates: unknown flag --vcs-ssh` (A-684), before its credential step; the
+> control 1 passed.
 > Part 2, first slice, 2026-11-19 (A-689): the svn:// listener. `slates anchor|daemon --vcs-svn ADDRESS` (loopback alone
 > without `--fleet`; one address reader with `--vcs-http`) starts it on the control shard, its port logged; on Unix the
 > anchor binds it once and hands it to every daemon (`ENV_VCS_SVN`), so a restart never drops its port. Each connection,
@@ -1713,6 +1726,19 @@
 > `no-access` session for repositories on both shards, one name with a `/`), cli 2 of 2. Owed: the authenticated
 > session's per-call sources through the same lender (after A-692's CRAM-MD5); the tunnel's move to the owner
 > (A-688 looks on its own shard alone) and its test over the SSH site; `svn_uri_canonicalize`.
+> A-692 (2026-11-19, g307): `svn://`'s CRAM-MD5 against enrolled tokens. A token's credential record keeps HMAC-MD5's
+> keyed contexts beside its hash (`CredentialKind::HttpToken`'s `cram_md5_contexts`, Dovecot's layout), derived by the
+> CLI's issuer as it mints the token, so the daemon holds neither the token nor anything that gives it back; a client
+> names its token by its id in lowercase hex; `slates_server::credentials::cram_md5_key` keys the session from the
+> record on its partition while the token is live and its consumer enrolled, the session's principal the token's; the
+> handshake finishes the digest from the kept contexts with MD5 written from RFC 1321 (`handshake::rfc1321`;
+> RustCrypto's `md-5` keeps its state private, so `hmac` is dropped and `md-5` is a test oracle beside aws-lc-rs); the
+> anchor's layout is 15. macOS arm64 (Mac Studio): red first against stubs (kiln r416: slates-svn's handshake tests 7 of
+> 37 failed; r450: the server's session test failed), then green on main `9ca6e3883` with the piece (r456): slates-svn's
+> handshake and serve 64 of 64, slates-server's credentials, HTTP edge and SSH site 21 of 21, slates-db's credentials 5
+> of 5, both wire-order guards, the anchor's layout 2 and refused segments 8, fmt clean. These are the "CRAM-MD5 keys"
+> A-689 lists as owed. Owed: the `svn://` connection asking `cram_md5_key` (A-689's next slice, g234); CRAM-MD5 through
+> the SSH tunnel, where `EXTERNAL` serves (A-688, g229); the Windows and Linux runs and the gates (main's).
 
 > **The fenced register's invariants over the real holders, under a network nemesis: built (2026-11-18, goal 81's chaos
 > part, its network half, g229).** The register invariants TLC proved over `FencedRegister.tla` and `FencedLedger.tla`

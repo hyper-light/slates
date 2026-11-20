@@ -14052,6 +14052,134 @@ fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   hg_round_trip(&hg, &scratch.path, &url, &config);
 }
 
+/// A fresh ed25519 key for OpenSSH in `scratch`, made by `ssh-keygen`: its path and its public line, or `None` (the
+/// caller skips loudly) on a host without `ssh-keygen`.
+#[allow(clippy::disallowed_methods)]
+fn hg_ssh_key(scratch: &str) -> Option<(String, String)> {
+  let key = format!("{scratch}/key");
+  let made = Command::new("ssh-keygen")
+    .args([
+      "-q",
+      "-t",
+      "ed25519",
+      "-N",
+      "",
+      "-C",
+      "slates-hg-test",
+      "-f",
+      &key,
+    ])
+    .output()
+    .ok()?;
+  assert!(made.status.success(), "ssh-keygen: {made:?}");
+  let public = std::fs::read_to_string(format!("{key}.pub")).unwrap();
+  Some((key, public.trim().to_owned()))
+}
+
+/// A `known_hosts` file in `scratch` holding the host key the SSH edge at loopback `port` presents, made as a user
+/// makes one: `ssh-keyscan` reads the key, and `ssh-keygen -l` fingerprints the file it wrote. Fails the test unless
+/// that fingerprint is `fingerprint`, the one the daemon printed. The file's path.
+#[allow(clippy::disallowed_methods)]
+fn hg_known_hosts(scratch: &str, port: u16, fingerprint: &str) -> String {
+  let path = format!("{scratch}/known_hosts");
+  let scanned = Command::new("ssh-keyscan")
+    .args([
+      "-p",
+      &port.to_string(),
+      "-t",
+      "ed25519",
+      "-T",
+      "10",
+      "127.0.0.1",
+    ])
+    .output()
+    .unwrap();
+  let lines = String::from_utf8_lossy(&scanned.stdout).into_owned();
+  assert!(
+    scanned.status.success() && !lines.trim().is_empty(),
+    "ssh-keyscan read no host key at port {port}: {scanned:?}"
+  );
+  std::fs::write(&path, &lines).unwrap();
+  let listed = Command::new("ssh-keygen")
+    .args(["-l", "-E", "sha256", "-f", &path])
+    .output()
+    .unwrap();
+  let listing = String::from_utf8_lossy(&listed.stdout).into_owned();
+  let fingerprints: Vec<&str> = listing
+    .lines()
+    .filter_map(|line| line.split_whitespace().nth(1))
+    .collect();
+  assert_eq!(
+    fingerprints,
+    [fingerprint],
+    "the key ssh-keyscan read at port {port} is the one the daemon named: {lines}"
+  );
+  path
+}
+
+/// A-650, A-679 and A-684 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo>
+/// serve --stdio`). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make a Mercurial
+/// repository through the CLI ([`create_hg_repository`]); enroll a fresh key for its owner (`credential key`); clone
+/// it with stock hg over `ssh://`, OpenSSH holding that key alone and trusting only the host key the daemon named
+/// ([`hg_known_hosts`], `StrictHostKeyChecking=yes`); pull into the clone. Expect the clone made, empty (nothing has
+/// been pushed: the pushes over `serve --stdio` are A-696, [`stock_hg_clones_pulls_and_pushes_over_the_ssh_edge`]),
+/// its default path the edge's URL, and the pull finding no changes. Skips loudly without stock hg 7.2 ([`STOCK_HG`])
+/// or `ssh-keygen`, and where the platform names no issuer surface ([`NO_ISSUER_SURFACE`]).
+#[test]
+fn stock_hg_clones_over_the_ssh_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's clone over the SSH edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-hg-ssh-clone"),
+  };
+  let Some((key, public)) = hg_ssh_key(&scratch.path) else {
+    eprintln!("skipping stock hg's clone over the SSH edge: no ssh-keygen here");
+    return;
+  };
+  let instance = format!("cli-hg-ssh-clone-{}", std::process::id());
+  let (_anchor, lines, issuer) =
+    anchor_with_edges_and_issuer(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (port, fingerprint) = lines
+    .iter()
+    .find_map(|line| ssh_edge_of(line))
+    .expect("the daemon named its SSH edge's port and host key");
+  let Some(issuer) = issuer else {
+    eprintln!("SKIP stock hg's clone over the SSH edge: {NO_ISSUER_SURFACE}");
+    return;
+  };
+  let known_hosts = hg_known_hosts(&scratch.path, port, &fingerprint);
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "key", &public]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let ssh = format!(
+    "ui.ssh=ssh -F /dev/null -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
+     -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts} -o GlobalKnownHostsFile=/dev/null"
+  );
+  let config = vec!["--config".to_owned(), ssh];
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
+  let clone = format!("{}/clone", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", &url, &clone], &config),
+  );
+  assert_eq!(
+    hg_nodes(&hg, &clone),
+    Vec::<String>::new(),
+    "the clone is empty"
+  );
+  assert_eq!(hg_ok(&hg, &clone, &["paths", "default"]).trim(), url);
+  let (code, out, err) = hg_in(&hg, &clone, &with_config(&["pull"], &config));
+  assert!(
+    code == 0 && out.contains("no changes found"),
+    "hg pull over the SSH edge: {code} {out}{err}"
+  );
+}
+
 /// Starts an anchor whose daemon serves the version-control HTTP edge on loopback, on a port the system picks
 /// (`--vcs-http 127.0.0.1:0`), and waits for it as [`start_anchor_with_issuer_surface`] does, its consensus group
 /// bootstrapped: the anchor, the issuer surface's exports where this platform prints them ([`PRINTS_ISSUER_SURFACE`]),

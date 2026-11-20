@@ -17,9 +17,10 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// 2026-11-19), so a version 3 checkpoint is never read: its segment is refused at adoption, before anything is served,
 /// 13 the copies' section and the sum each behind a presence byte, written beside a copy's record alone (checkpoint
 /// version 5, A-626 part 3, continued (1), 2026-11-19), 14 a work's logged journal may hold a copy (`LoggedOp::Copy`,
-/// A-626 part 4, 2026-11-19). An older segment is refused, never misread.
+/// A-626 part 4, 2026-11-19), 15 a token's credential record keeps its CRAM-MD5 keyed contexts beside its hash
+/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19). An older segment is refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 14;
+pub const LAYOUT_VERSION: u32 = 15;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
