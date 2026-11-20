@@ -2911,9 +2911,9 @@ impl Mounted {
     // open files by name compared without case, and every spelling of a file is one file node (one share access, one
     // cache), named by the normalized name its first open answers (`crate::normalized`). Declared for every volume
     // before A-551, it made each spelling a node of its own.
-    if search.case_sensitive() {
-      params.flags |= ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH;
-    }
+    // RED (diag only): every volume case-sensitive, as before A-551.
+    let _ = search.case_sensitive();
+    params.flags |= ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH;
     if read_only {
       params.flags |= ffi::VOLUME_FLAG_READ_ONLY_VOLUME;
     }
