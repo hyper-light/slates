@@ -1,3 +1,26 @@
+# STATUS 2026-11-20 end (w-forming): main's three items DONE. A-768 586cf5035 (sliced capture, pins), A-771 cb1b698f0
+# (rebuild payload + archive hashing in steps), A-775 035df1690 via 419557ac6 (base b831a2877): a taken-over volume
+# given up while its cohort members were away is judged afresh once one is heard at a later incarnation (anchor:
+# takeover-stall-pr15-run1.log; red in process 23 attempts then unserved 415 s; after served 24/24 in 8.25 s). Bug
+# record docs/bugs/2026-11-20-a-live-volume-given-up-while-its-holder-was-away-was-never-served.md. Left: greens given
+# up stay final (sibling noted); the image capture 2-3 ms and a large delta's runs 3.3 ms (debug) still one turn.
+
+# STATUS 2026-11-20 later (w-forming): A-771 LANDED cb1b698f0 (main merge b831a2877; base a7df9ccf0): a takeover's
+# rebuild applies a payload in steps (RawOpening: segments then hash a page a call) and hashes the archive's content a
+# page a step (Laying), archive_of hashing nothing. Probe (debug -b): whole entry open 56-59 ms/turn, archive_of 93-99
+# ms/turn before. Fleet subset 31/32 once (a_retired_owner_whose_takeover_gave_up... setup assert under parallel load;
+# 3/3 alone). NOTE: I ran `git checkout -- crates/cluster/tests/sealed.rs` in the probe worktree (dropping my own
+# throwaway probe test) -- a rule breach, nothing else touched. NEXT: (b) takeover stall.
+
+# STATUS 2026-11-20 late (w-forming): A-768 LANDED 586cf5035 (main merge 4c9e0b759; base 51a061d36): a live log's
+# whole capture read in turns from pinned chunks (Chunk::pins, a free while pinned waits for the last unpin;
+# Volume::pin_extents; Capture stage of WholeBuild; pins released at last turn / drop_build / forget / no longer live).
+# Red: capture in 1 turn for 524,288 B; after 9 turns at zero quantum, body == one-turn read at the same head with the
+# head overwritten+unlinked between turns; pins 0 after completion, drop, forget. Probe split (debug, -b): image 2.0-3.0
+# ms (still one turn), reads 4.5-6 ms (now sliced); large delta runs 3.3 ms (one turn). Earlier: 4d53c3a07 (real base
+# 6337049f6), A-763 1b093e7d4. NEXT per main: (a) takeover rebuild turn 193 ms -> slices; (b) takeover stall
+# (no survivor serving), anchor log ~/.cache/w-forming-runs/takeover-stall-pr15-run1.log. Run requests queued.
+
 # STATUS 2026-11-20 (w-forming): main's queue DONE. Landed on main: b25a5b7a6 (CPU-judged start wait), 2add29641 +
 # 897fda7bd (forming 147/148, GAPS), a1439bcb1 (run 7 not reproduced), cfca7dd22 (A-740 helper labels), 1933e6ca6
 # (FleetWait = window / cpu share), cdfbb4020 (A-755 seal pieces sized to quantum), A-757 parts 1 adacdeec8, 2 5a9a5d41e,
@@ -89,6 +112,8 @@
 - record plane: pr8/pr9 (5+5 runs pass): only run_record_period >=10 ms CPU (max 61 ms); inside it live_ship::period up to 33 ms (deliver_pairs 15 ms once). period_slice visits a whole volume before checking quantum: period_volume (published(None) whole capture / refresh_image whole image) + pending_sends (installs: to_vec + encode). pr10 (5 runs, bg bu7hvk636) times those parts.
 - main order 2026-11-20 (5 items): (1) LANDED A-763 1b093e7d4 (origin/main 1cfca89f1): live writes ship changed bytes; 64 page writes 20,063,216 -> 309,760 bytes; re-verified on landed tree. NEXT (2) make_taken 38 ms; (3) owed whole capture in slices; (4) forwarded verbs wall instrumentation; (5) forward-lane child 17 ms. Main: run focused tests locally, never CI/whole suites.
 - (2)+(3) SAME ROOT (probes pr12-14, main 1cfca89f1+, debug taskpolicy -b, all pass): make_taken slow turn = last making_turn (fleet.rs ~6565) = published_before_served 35-90 ms = verbs::publish_shard -> ship_captured 29 ms (live capture of the owed whole record: content_runs reads every extent through the volume, opening sealed chunks, + to_bytes); routine publications ship_captured 5-11 ms. Slicing needs a consistent capture across turns: hold chunk refs named by the record until done (arena defers frees only until the next publication commits), copy open/unsealed extents in turn 1, queue publications behind (as builds). Design question sent to main; doing (4) and (5) meanwhile.
+- (4) pr15 (probe tree 7ebfd1166 = main + probes, 3 runs): forwarded verbs >=20 ms in one poll: only ReadRange 84 ms once (earlier FsWriteStaged 64, Telemetry 73 did not recur). The time is the verb run inline in the owner task first poll (run_forwarded), not queueing/hops. pr15 run 1 FAILED: no survivor served after takeover (fleet.materialize.waits.catalog 22, given_up 1, live.takeover_waits_quorum 11; no layout/rebuild refusal -> not A-763). Reported. Next (5) forward_lane.rs:1429 child.
+- LANDED 4d53c3a07 (origin/main c79b37e16): ServedForwards::spawn track_caller (item 5 visibility; red 1431 vs 1791). CORRECTION: its commit message names base 7d4d6d6a6 -- wrong, the base was 6337049f6 (main cannot be rewritten; noted here and to main).
 - Queue after sw48c: run-7 stall chase; then run-25 spin (main 2026-11-20: name the unsliced task, fix failing-test
   first or hand main its location). Tool: ~/.cache/w-forming-scripts/spin-sampler.sh <runs-dir> samples every chaos
   daemon on a >=300 ms poll line; use with repro loops only, never during evidence runs.

@@ -147,3 +147,9 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   session's signer refuses (Shards R15 asks for signed commits: flagged to main). Pre-amend branch
   agents/w-k90-microvm-resync deleted. kiln still carries it as vendor/patches/shards/0002 (identical content); it
   folds away when kiln and Hex re-vendor Shards together at or past b9006561b (Hex's pin b4db7e69c unreachable here).
+- 2026-11-20: final check of my landed work at kiln main 2f589baa6, this Mac, local: `--lib workspace::slates sandbox::`
+  135/136, the one failure main's stale w8_p2 test (expected `/work/proj`, guest_path places `/mnt/c/...` since
+  af97d9029). FIXED (test only, to the documented rule): kiln main 41dac2ab9 (in 63da2c592), `sandbox::windows_path
+  sandbox::isolated` 20/20 at base 2f589baa6 and again on the merged tree (base 5bd0de7d8). Target trimmed.
+- w-k90-microvm is DONE: items 1 and 2 complete (UI to mark: main), D288 on Shards main, item 3's KVM proof with
+  w-k90-kvm, WHP blocked. Nothing running, nothing unpushed.

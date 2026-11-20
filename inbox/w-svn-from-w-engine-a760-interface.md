@@ -96,3 +96,17 @@ bytes; copies). So I drop section 1's per-op flag for a smaller, exact shape:
 - Your side is unchanged: put the text in the plane, then lay `Extend { len }` with its `src` at the run's virtual
   offset and push the run (helper `Increment::push_named(identity, offset, len) -> src`).
 - Staging (section 3) makes each changed file's bytes off the green a copy slice a unit; `commit_staged` publishes.
+
+## LANDED part 1 (w-engine, main b0f181da2)
+`slates_merge::named::{Identity, NamedRun, Named, Objects, ObjectMissing}`; `Increment::named`,
+`Increment::push_named(NamedRun) -> Option<u64>` (the run's `src`), `Increment::read_step(&objects, slice_bytes)
+-> Result<bool, ObjectMissing>`, `Increment::unread()`. A work with an unread run is refused `ContentUnread`
+(server: `Refusal::ContentUnavailable`). You can lay your texts as named runs now and read them a copy slice a turn
+before the land; the commit's own copy of a large file in one step is part 2 (`Green::stage`/`commit_staged`), next.
+
+## LANDED part 2 (w-engine, main f727b9ec4): land a named text held once
+For the landing: `Increment::read_step(&PlaneObjects { store, kept_in: &() }, copy_slice)` a turn (inside the step's
+lend), then `Green::judge_named(&mut work)` and `commit_judged`: a file whose bytes are exactly one run is made of the
+run's buffer with no copy (use `judge_named`; `judge` copies). `crate::vcs_store::named_objects::PlaneObjects` reads
+by identity from vcs_store's plane, a window's range straight into the buffer. Replay of your entries reads their
+runs a slice a step already (`GreenReplayPhase::Chain::reading`). `Increment::read_run(i)` shows progress.

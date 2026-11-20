@@ -48,3 +48,33 @@
 - jupiter has NO Python 3: slates_e2e bare_metal drives skip without it (NO_PYTHON, even with SLATES_E2E=1). Python is
   an install -> asked main for Ada's word. GitHub windows-latest has Python (job `windows (Slates tests)`).
 - w-k90-pin added `slates` job (715063153) on ubuntu/macos/windows-11-arm; mine (`windows (Slates tests)`) is windows-latest.
+
+## 2026-11-20 ~12:30 PST: by-use on jupiter -- RED in Slates' channel on Windows (before any mount)
+- r19 (jupiter, kiln main da441f112): kiln.exe built (12m21s); `KILN_TEST_KILN=...\kiln.exe cargo test -p kiln --lib --
+  workspace::bare_metal_tests` (lib tests built 29m) FAILED: "Slates' anchor ended before its instance answered: the host
+  refused: the channel's shared memory refused: shared layout refused at 0 for 64 bytes: TouchesWord".
+- r24 RUST_BACKTRACE=1: from kiln::workspace::slates::up_or_started <- ensure_up <- make_as <- workspace::prepare, i.e. the
+  first attach to a fresh instance (kilntest<pid>), no mount yet. Anchor log: daemon started, 2 shards, served normally.
+- Reading: "host refused" = the daemon's refusal relayed at rendezvous; 64 bytes at 0 matches slates-ipc
+  ClientRegion::create's fixed-header write (region.rs:303, FIXED_HEADER_BYTES=64) -> on Windows something declares a
+  word in [0,64) or the check misfires. Not found by reading (REGION_WORDS start at 64; Layout::touches looks right).
+- Slates CI gives no Windows evidence (every main run cancelled by newer pushes).
+- NEXT: r25 on jupiter: slates main clone C:\Users\corph\w-k90-win\slates, `cargo test -p slates-ipc --lib -- region
+  endpoint` (same one target). Red there -> Slates bug: fix in slates (failing test first), then w-k90-pin re-pins.
+- kiln server dropping runs often (r13, r22, r25/r26 lost).
+- GitHub run 44784299374: windows-latest clippy job 136462100146 failed (fixed by da441f112); slates_e2e step failed
+  (expected: kiln lib didn't compile on Windows then).
+
+## 2026-11-20 ~14:15 PST: WinFsp mount by use GREEN on jupiter; Windows runner MCP gap found and being built
+- r29 (jupiter, kiln main 64412a67 incl. cc1ecb625's A-717 carry, WinFsp 2.1.25156): `KILN_TEST_KILN=...\kiln.exe
+  cargo test -p kiln --lib -- workspace::bare_metal_tests` -> 1 passed (w2_every_harness_and_agent_works_on_a_volume_
+  reviews_drifts_and_lands_under_a_grant), 37.7 s. A Slates volume mounted through WinFsp on jupiter, by use.
+- GitHub run 44807509237 (a82ce7ede, windows-latest): windows-latest clippy PASSED; bare_metal_tests ok there too;
+  slates_e2e bare_metal drives FAILED at landing: "LAND_FAIL no kiln MCP server was given to this harness" (mount at Z:,
+  edits, change request all PROVEN). Cause: kiln gives a Windows runner's process harness no kiln MCP (reach socket is
+  Unix-only; docs/reach.md §9 "Not yet"). Also some other workspace:: lib test failed there (annotation truncated).
+- Building: reach::loopback (kiln, branch agents/w-k90-win-mcp1 abe073d89): runner listens on 127.0.0.1:0, serves each
+  connection as the session's lane (reach::mcp::serve_lane) after a per-session token hello; `kiln reach mcp` on
+  Windows pipes stdio over it (KILN_REACH_ADDR/KILN_REACH_TOKEN); Claude's --mcp-config is a user-only file in
+  %TEMP%\kiln-mcp. Mac: 4/4 new tests green. r31 (jupiter): Windows clippy + reach::loopback tests.
+- Python on jupiter still needed for the e2e drive there (inbox/main-from-w-k90-win.md).

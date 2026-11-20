@@ -1,14 +1,17 @@
-# RESUME HERE (2026-11-20 ~15:30Z, Mac Studio d1323898; supersedes everything below)
-- LANDED: kiln 30c5929 (A-580), e33c470 (A-708), 0edd8dc + e3e5d7b (A-734), ed8991d (A-750: workspaces
-  live-shipped + shared with every member at making; isolated move refused [kind: isolated]); slates a5140de.
-- PROVEN on macOS with kiln alone: killed flow (owner's runner stopped, mounts gone, instance SIGKILLed; survivors
-  served 8/8), cut-off flow, slow-link flow (refused by kind unplaced).
-- IN FLIGHT (after the Studio's 10:35 PST reboot): the four signalling flows on adacachy as a systemd user unit,
-  `w-fed-faults-linux.service` (survives kiln runner restarts, which killed r23-r37), base 715063153, script
-  w-fed-faults-linux-flows.sh in the synced clone ~/.kiln/reach/d1323898.../w-fed-faults-kiln-clone-323fa02d14, output
-  linux-flows.out there. Poll: `kiln run --on 451397fcc585f7f7cb9aaf00e42064bb --no-sync -- 'systemctl --user
-  is-active w-fed-faults-linux; cat <dir>/linux-flows.out'`. On its end: fix what fails, land, report with the base.
-- Forward-lane log flood: g226's (main's word).
+# RESUME HERE (2026-11-20 ~21:00Z, Mac Studio d1323898; supersedes everything below)
+- LANDED: kiln 30c5929 (A-580), e33c470 (A-708), 0edd8dc + e3e5d7b (A-734), ed8991d (A-750); slates a5140de
+  (fleet.rs:4819), 51a061d (A-764: credentials are fleet state; red by use in w-balance's v3_takeover, 401 -> the
+  successor authenticates the owner's token; focused tests green over origin/main 51a061d36).
+- LANDED later: slates 8d0e137 (A-764 tombstones: a revoked credential never comes back; the healer would have
+  resurrected it); kiln 5bd0de7 (partitioned/restarted flows on macOS, PASSED; queued agent start waited for).
+- IN FLIGHT: adacachy systemd unit w-fed-faults-linux.service, base 5bd0de7d8: partitioned + move-cut flows on Linux.
+- Handed to w-balance: branch agents/w-fed-faults-v3-creds (v3_takeover without grant-all, owner's token throughout),
+  one commit over their 7e5ce95dc; inbox/w-balance-from-w-fed-faults.md. The test's verdict waits on their refs fix.
+- Findings for main: slates main's wire_order fails on VolumeRefusal's ReferenceUnresolved/ReferencesHeld appended
+  unpublished (bc6cc7ab1); the healer re-offers per configuration version.
+- Parked: the partitioned/restarted flows made safe on macOS (worktree ~/slates-work/w-fed-faults-unmounted, nothing
+  written); Linux signalling flows as systemd unit w-fed-faults-linux.service on adacachy (base 715063153; read its
+  linux-flows.out in the synced clone dir; not blocking).
 
 - Answered w-balance Q3 (inbox 2cf8325).
 - Ship route: kiln run on adas-mac-studio-2.local (b24c5c95...), cwd ~/.cache/w-fed-faults-ship (land.sh, state3.sh,

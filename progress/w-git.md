@@ -204,3 +204,53 @@
      -> Push::admit -> Quarantine::admit put windows).
   B4 remove object_bytes/put_object inflated copies (upload/encoding/sparse read the pack). No hold_bytes, no new store.
   Red per step: resident <= k*pack + base, k derived. Worktree ~/slates-work/w-git-packed (from origin/main 86e23c4ef).
+- ~13:20 LANDED memory B1 ea5f0d6da (main a011645e6): store::packed (PackSource seam, read in place, Scratch). Seam note
+  to w-store sent. Builds/tests: kiln run with `on: adas-mac-studio.local-2`, sync false, clone ~/.cache/w-git-clone,
+  worktree ~/.cache/w-git-wt, CARGO_TARGET_DIR=~/.cache/w-git-target.noindex CARGO_INCREMENTAL=0 (kiln once placed a
+  needs-only run on this Mac: never again). NEXT: B2 rows by (pack, offset) + all readers via packed::read; B3
+  quarantine by entry place; B4 drop inflated copies; red: resident <= k*pack + base.
+- ~14:10 LANDED eea6b39f6 (main ab049942c): Connection::interim + Exchange::interim; receive-pack keepalive while the
+  pack is read. Debug-load rerun filed in run-requests.md. NEXT: measure the push input decode per byte/object
+  (release, cold/warm; main's push-back: 820 KB should be ms) and fix if it's the gap; then B2 in-flight half
+  (quarantine reads the pushed pack in place while judged; landing via w-store's seam, no pack store; Ada's changeset
+  ruling: history = changesets; git objects derived & cached by identity).
+- ~14:40 decode measured (diag branch agents/w-git-decodediag): release cold input 25.9 ms (2.9 us/obj, 31.6 ns/B), answer
+  71 ms/8.5k steps; debug cold input 300 ms, answer 1.42 s/29k steps -> decode not the gap; reported to main.
+- B2 IN-FLIGHT HALF DESIGN (Ada's changeset ruling: what lands is changesets via w-store's seam; no pack store):
+  * The pushed pack is already kept whole in RAM (session take_pack -> GitPush::keep_pack -> RecordWriter.pack). Make it
+    the in-flight PackSource (a RAM pack: slice source over that Vec, identity = ContentId::of / pack checksum).
+  * Quarantine (slates_vcs::arrival::Quarantine Staged{kind, content, len}) gains an in-pack place for git objects:
+    the intake keeper (git_push::intake::Intake::keep) names each resolved object (SHA-1) then keeps only its entry
+    offset, dropping the inflated bytes; Contents::content / Quarantined::content read through store::packed::read.
+  * Landing (Repository::commit) still needs object bytes in the content store until w-store's changeset store: put
+    them at the commit from the pack (turned), so the in-flight peak drops; landed size unchanged until w-store.
+  * Red: in-flight resident of a v1.5.0 push before landing <= k*pack + base (today the quarantine holds inflated).
+  * Worktree ~/slates-work/w-git-packed has a DIAG commit at HEAD: make a fresh worktree from origin/main first.
+- B2 STEP LIST (worktree ~/slates-work/w-git-inflight, fresh from origin/main 62e5e5009):
+  A. slates-git Push owns the in-flight pack (Vec, appended per run by the server before session.input_into) and is
+     a PackSource; Push gains `placed: BTreeMap<id,(Kind, offset, len, identity)>` beside the vcs Quarantine; Push
+     accessors (object, held, held_after, len, is_empty, abandon/release_holds) cover both.
+  B. Repository::locate gains Place::InPack{kind, offset, len}; bytes_of / references / tag reads go through
+     store::packed::read (Bases = index + push placed); PushedObjects view the same.
+  C. Staging's Rows unit puts a fresh in-pack object's bytes into the content store (put_object) for its row contents,
+     a unit a turn (landed size unchanged until w-store's changeset store).
+  D. Server intake admit_queued records places (identity via ContentStore::object_id, no put); Quarantined::content
+     reads in place; the session stops keeping its own pack copy (take_pack -> the push's).
+  E. Record writer names by identity (unchanged); its pack is the push's.
+  F. Red: in-flight resident of a v1.5.0 push before its seal <= k*pack + base (diag measured 16.9-34 MiB admission +
+     content 14 MiB+ during input today).
+- ~13:20 main's HEAD-after-restart report (Windows v1.0.0, 16/27): diagnosed as harness, not slates — jupiter's
+  git-src HEAD is main, git-matrix.sh creates the repo with --default-branch from the source HEAD, PUSH_REFS pushed
+  master only; stock git answers the same. Main routed the script fix to w-interop.
+- B2 in-flight half WRITTEN (branch agents/w-git-b2, 6c33bc0ca; worktree ~/slates-work/w-git-inflight): Push keeps the
+  client's pack + placed map, Push::bytes reads in place (packed::Recent cache, budget = pack len), staging puts fresh
+  objects (put_placed), hook view from staged contents, record writes push.pack(), session keeps pack_len only.
+  Studio (kiln .local-2, own target): check clean; slates-git --lib 579 passed incl. both b2_ tests; server --lib
+  git_push/vcs_store/git_hooks/vcs_http/git_protect 198 passed (pre-merge). b2 bound test: 4 MiB inflated -> held in
+  store 4,194,304 B before, in place 41,568 B (the pack). v1.5.0 diag before/after running (target-rel, delete after).
+- 14:00 B2 in-flight half LANDED 5518fb2bc. 14:15 LANDED 00e6da185: t_a665 derived deadline (Progress per step,
+  TEST_BOUND_NS each) + commit's landed runs by position (no positions clone, no id map/sort). Main recorded both.
+- v1.5.0 diag (release): before 14.4 MiB content after input, 173,409 steps, 6.71 s; after 0.0 MiB, 229,619 steps,
+  9.73 s (+45% CPU). Suspect: staging reads in id order -> chains re-inflated. Fix drafted (agents/w-git-order
+  cf0941c6e: Push.order = admission order, staging Step::Putting before Forking). Profile run r42 (sample) pending.
+- Replied to w-store's changeset-log ask (inbox/w-store-from-w-git-changeset-log-2026-11-20.md): names section.

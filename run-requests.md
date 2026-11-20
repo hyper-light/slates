@@ -6852,3 +6852,44 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   reading-found (unchased by rule) or owned elsewhere. The record is two weeks old. I'll take whichever still fails,
   failing test first; if none does, the GAPS entry gets struck with this run's numbers.
 - 2026-11-20 w-shared sweep family 1, lent record sessions woken by their return (main 86e23c4ef): clippy + xtask (server fleet session_returned/SessionChange/sessions_changed, forward_lane drive_turn, live_ship borrow_session, owner_location wait_for_returning_sessions, campaign wait, state session_waiters/session_woken); Linux run of `cargo test -p slates-server --test fleet a_forward_waiting_for_its_lent_session_is_woken_by_its_return` (red: fleet.session_wait.returned not moved by 3) and `--test fleet -- session hold_record location campaign`.
+- 2026-11-20 w-git keepalive while the pack is read (main ab049942c, eea6b39f6): rerun in DEBUG at load 50-60 (60 PID burners on adas-mac-studio.local-2): `cargo test --locked -p slates-server --lib -- vcs_http::daemon_edge::tests::a_long_history vcs_http::daemon_edge::tests::a_push_of_a_long vcs_http::daemon_edge::tests::a_partial_clones_lazy`, 3+ runs; red = `the answer ended inside a line ... WouldBlock` at daemon_edge.rs line_of (7/9 failed before)
+
+## 2026-11-20, w-svn: a hook test flaky under load (main to reproduce; not chased)
+- `cargo test -p slates-server --lib svn` (macOS arm64, this Mac, loaded, base 514500813 + A-766 part 1): 83/84,
+  `vcs_svn::tests::an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` failed at tests.rs:1180 (the pre-unlock
+  hook's recorded args); alone 3/3 green. Red would be the same assertion failing in a loaded full run.
+
+## 2026-11-20, w-forming: A-768 whole capture in turns from pinned chunks (main 4c9e0b759; commit 586cf5035, base 51a061d36)
+- clippy + xtask over `crates/vfs` (content.rs Pins/pin_chunk/unpin_chunk/unpin_extents, volume.rs pin_extents/PinnedFile) and `crates/server/src/live_ship.rs` (Capture, start_capture, advance_capture, read_capture, release_capture).
+- Flows (macOS arm64 debug, `SLATES_TEST_CLI=1`): `cargo test -p slates-cli --test live_fleet -- a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns a_live_write_ships_the_bytes_it_changed_not_its_window` and the takeover flows; `--test live_chaos a_member_that_never_held_the_log_never_stands_in_for_its_holder` under `taskpolicy -b`. Red: a rebuild refused (`fleet.live.refused.*`), `fleet.live.capture_unpin_refused` > 0, or a successor serving bytes other than the owner's.
+- Release A/B of the takeover's `published_before_served` turn (before: 21 ms debug, of which capture reads 4.5-6 ms); expect the reads gone from that turn, the image (2-3 ms debug) left.
+
+## 2026-11-20, w-reaper: A-748 on Windows after w-interop's git matrix met "Failed to connect to 127.0.0.1:61367" (main's ask; base fe7cb5232)
+- Windows x86_64 (jupiter): `cargo test -p slates-cli --test vcs_edge_restart -- --nocapture`
+  (`a_daemon_restart_keeps_every_version_control_listeners_port`); I'm running it as kiln r48 now. Then rerun w-interop's
+  `matrix-git` on jupiter at the same base.
+- Red would look like: a port different after the restart, or a connect refused while the daemon restarts (the anchor
+  must hold each listener, so a connect waits in its backlog).
+- What the logs show (C:\Users\corph\.cache\w-interop\matrix-git\anchor.log): the daemon was killed (exit 143) at
+  12:42:43.98 and restarted as pid 470456. That is after the last row's log (ssh-fetch, 12:42:42), and the successor
+  logged nothing before the run ended. No row log in logs\ holds the "Failed to connect" text.
+
+## 2026-11-20, w-forming: A-771 rebuild in steps (main b831a2877; commit cb1b698f0, base a7df9ccf0)
+- clippy + xtask over `crates/cluster/src/sealed.rs` (RawOpening) and `crates/server/src/live_ship.rs` (Rebuilding steps, Laying, hashed_chunk).
+- Flows: live_chaos takeover flows and live_fleet takeovers (macOS arm64 debug, `SLATES_TEST_CLI=1`, `taskpolicy -b`); red = `fleet.live.takeover_refused.layout` or `.open` counted, or a successor's bytes differing from the owner's. Expect `fleet.live.rebuild_slices` up by about a page of log a slice.
+- `cargo test -p slates-server --test fleet a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` under full-suite load: failed once at fleet.rs:17261 (setup: cut && given_up) in a 32-test run, 3/3 alone.
+
+## 2026-11-20, w-work-cow: a work costs its divergence, the grid (main baa470b90; commit 819341ab4)
+- Grid, release, macOS arm64 Mac Studio (and Linux): `for f in 1000 10000 100000; do for b in 1024 65536 10240; do for w in 1 10 100; do SLATES_WORK_COW_FILES=$f SLATES_WORK_COW_FILE_BYTES=$b SLATES_WORK_COW_WORKS=$w cargo test --locked --release -p slates-server --test work_cow -- --nocapture | grep work_cow:; done; done; done` (pick f x b for 1 MB to 1 GB greens). Red = the assert fails, or per-work resident or time grows with the green's size.
+- clippy + xtask over `crates/server/tests/work_cow.rs`.
+
+## 2026-11-20, w-work-mount: mounted works end to end (A-774; main 089bc78a0, commit a2415c930)
+- clippy + xtask over `crates/server/src/mounted_work.rs`, `crates/server/tests/mounted_work.rs` (all targets incl. Linux and Windows lint; the module is cfg-free).
+- Suites touched: `cargo test -p slates-server --test nfs_mount --test snapshot_landing --test green_post_state` and `-p slates-client --test client --test edit_and_submit` (attach of a work now makes its slot; land of a green now presents instead of refusing Unsupported). Red: any refusal/mismatch there.
+- Owed next (mine, gated kernel variant): ten real editor processes on kernel NFS mounts of ten works (macOS `mount_nfs`, Linux `mount -t nfs`, root), the same verdicts and landing; will land as `mounted_work_kernel` gated on SLATES_TEST_MOUNTED_WORK_KERNEL=1.
+- w-rewrite-ops A-776 (main 561c655a3): `cargo clippy -p slates-merge --all-targets -- -D warnings` and Linux + Windows `cargo test --locked -p slates-merge --lib refine` and `cargo test --locked -p slates-server --test green_post_state` (unix-only file); red = any failure or a lint in crates/merge/src/refine.rs / examples/rewrite_ab.rs.
+
+## 2026-11-20, w-forming: A-775 given-up volume judged afresh (main 419557ac6; commit 035df1690, base b831a2877)
+- clippy + xtask over `crates/server/src/fleet.rs` (judge_given_up_afresh, VolumeWait::waits_on_members, give_up_taken_over), `state.rs` (GivenUpVolume), `daemon.rs` (inject_live_silence), `live_ship.rs` (silenced report/fetch).
+- The anchor flow, repeated (macOS arm64 debug, `SLATES_TEST_CLI=1`, `taskpolicy -b`): `cargo test -p slates-cli --test live_chaos a_member_that_never_held_the_log_never_stands_in_for_its_holder` x24. Red = "no survivor served the volume within the fleet wait" with `fleet.materialize.given_up` and no `fleet.materialize.judged_afresh`.
+- Linux run of `cargo test -p slates-server --test fleet a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is_heard_again`.

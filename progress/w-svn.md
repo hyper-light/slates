@@ -258,3 +258,8 @@
   them; 2 WRITES sans-io (dav/activity.rs: URIs, CHECKOUT body, mod_dav's 201 HTML body pinned from httpd 2.4.x
   mod_dav.h DAV_RESPONSE_BODY_1..5 + "X Y has been created.", Cache-Control no-cache; DavCommit activity + checked-out
   revisions); 3 server; 4 by-use.
+- A-766 (DeltaV v1) part 1 LANDED 84c74cc52: vcc/default, bln/REV, ver/REV/PATH; update-report at the VCC. Next: part 2
+  (commit verbs over DavCommit), against w-store's seam once agreed (inbox/w-store-from-w-svn-text-source-2026-11-20.md).
+  Owed: PROPFIND writer's per-property strings into the connection's buffer (MEMORY SIZING); 500 MB commit re-measured
+  after A-760. Flake seen once under load: vcs_svn::tests::an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does
+  (passes alone 3/3).

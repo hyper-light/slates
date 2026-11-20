@@ -120,3 +120,45 @@ records. The successor rebuilds from what it holds (`takeover::rebuild_repositor
 own partition has, which appear to be none). Whoever owns A-636 should see this. The v3 switch stays off until this
 test passes; v3 adds nothing to the failure. Shall I take it (ship the repository's push records and greens to the
 successor), or does an A-636 owner?
+
+### 2026-11-20: acknowledged pushes survive their owner's death: LANDED f95edf68e (fix + test together)
+Cause, from counters: a push's records were kept only in the owner partition's register. The successor replayed none
+(`vcs_store.replayed` absent, `repository_records` 0 everywhere) and served no refs.
+Fix:
+1. A push's record is a change of the names log (`LoggedChange::Objects`, appended, db wire order pinned). It ships
+   to the repository's candidates with the operation's identity and spans. A takeover keeps or drops the push whole,
+   and the successor's adoption puts the record back for replay.
+2. A push is answered only once its names log is held at f+1 (`state_log::names_committed_within`; the HTTP and SSH
+   edges wait on it before the report). Without it, the first run kept only the pushes whose parts had shipped.
+`crates/cli/tests/v3_takeover.rs` passes 3 of 3 (NoLoss, TotalOrder, StaleNeverCommits by `git fsck` on a clone). It
+keeps the labelled grant-all workaround until w-fed-faults' credential fix lands; it's that fix's red too.
+Tests: slates-db all; slates-server takeover/state_log/vcs_store/git_push/vcs_http::git/vcs_ssh 236/236.
+Next: the v3 switch on, its takeover runs going now.
+
+### 2026-11-20: v3 switch LANDED 08fba4007; grant-all workaround removed e73283fd6
+- 08fba4007: `vcs_store::write_version_3` true. Takeover test 4/4 with it. One run's counts: the successor replayed 3
+  records and read one record's names from a region home (`names_fetched` 1); each survivor homed 2 objects and served
+  19 region exchanges, and its homing waits published its home shard 11 and 13 times.
+  The first v3 runs hung: main's `answer_until` refactor had dropped the HTTP edge's `take_homing`. It's restored, and
+  a decision whose homing no edge takes by its next turn now falls back to v2 (`homing_untaken`), never waits; there's a
+  unit test for that.
+- e73283fd6: the takeover test asks the successor with the OWNER's token (A-764 works); the grant is gone. 3/3.
+- Running now: the local release A/B, v2 (f95edf68e) against v3 (5ca050628), all rounds shown.
+
+### 2026-11-20: report (§8): your three items done, base c5ba38665
+1. e73283fd6: the takeover test asks the successor with the OWNER's token; the grant-all workaround is gone. It passes
+   3/3 with v3 on. That proves A-764: a credential survives its node's death.
+2. 08fba4007: v3 switch on, as its own commit, with the region-homing numbers (in it and in the design log). It needed
+   the HTTP edge's homing restored (lost in main's `answer_until` refactor) and a never-wait fallback to v2.
+3. c5ba38665: the v2-against-v3 A/B, release, local (Studio-2, 14 cores, load 5 to 6.5), ten alternating rounds, every
+   round in BENCHMARKS. v3 is confirmed active (`homed_in_region` 1 for git/git v1.0.0's ~500 KB of names). Best of
+   ten: one push 1.105 s (v2) against 0.995 s (v3); 10 at once p50 1.487 against 1.403 s, p99 2.577 against 2.560 s.
+   Medians 1.365/1.451, 1.986/1.888, 2.884/2.902. No measurable cost on one node; the rounds' own spread is larger.
+   Owed: a three-node release A/B, where homing adds a region round trip.
+Also landed today: f95edf68e (acknowledged pushes survive the owner's death), the durability barrier, homes in parts,
+per-repository turns. Branches agents/w-balance-v3ab and agents/w-balance-takeover-test deleted.
+For main to delete: /Users/adalundhe/slates-work/w-balance-ab (a worktree, clean except an untracked
+crates/cli/bench/__pycache__; `git worktree remove` refuses without --force, which I won't use), and the two listed
+before (w-balance, w-balance-docs).
+Still owed (GAPS): run 31's co-location measurement (its runs kept losing placement or memory); learned weights in
+place of one turn a repository; the three-node A/B.
