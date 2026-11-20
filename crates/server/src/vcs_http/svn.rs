@@ -867,7 +867,18 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
   }
 
   async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
-    if let Some(answer) = self.commit_side() {
+    let diag = self.commit_side();
+    #[allow(clippy::print_stderr)]
+    if let Some(answer) = &diag {
+      eprintln!(
+        "DIAG-A681 {} {} -> {} {}",
+        self.method,
+        self.path,
+        answer.status,
+        String::from_utf8_lossy(&answer.body).replace('\n', " ")
+      );
+    }
+    if let Some(answer) = diag {
       self.answered = Some(Answered::Whole {
         status: status_of(answer.status),
         headers: answer.headers,
