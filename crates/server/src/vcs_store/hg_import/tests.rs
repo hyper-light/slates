@@ -58,7 +58,7 @@ fn owner() -> Principal {
 }
 
 /// Creates repository `name` of `tool` on the shard: its id.
-fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
+pub(crate) fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
   let reply = dispatch(
     state,
     1,
@@ -81,7 +81,7 @@ fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
 }
 
 /// `files` laid out on a simulated host, as an import takes them: the host, and the repository's directory on it.
-fn directory(
+pub(crate) fn directory(
   files: impl IntoIterator<Item = (&'static str, &'static [u8])>,
 ) -> (Box<dyn slates_vfs::host::HostFs>, slates_vfs::host::HostDir) {
   let (host, directory) = laid_out(files);
@@ -106,7 +106,7 @@ fn in_one_call(state: &ShardState, files: Files) -> (Rows, Imported) {
 }
 
 /// Repository `id`'s index rows, each its key and its body.
-fn rows_of(state: &mut ShardState, id: RepositoryId) -> Rows {
+pub(crate) fn rows_of(state: &mut ShardState, id: RepositoryId) -> Rows {
   let (content, store) = state.vcs_stores.mercurial(id).expect("the store");
   store
     .index
@@ -127,7 +127,7 @@ fn used(state: &ShardState) -> u64 {
 }
 
 /// Runs repository `id`'s import a unit a turn to its end: the turns taken, and how it ended.
-fn to_its_end(
+pub(crate) fn to_its_end(
   state: &mut ShardState,
   id: RepositoryId,
 ) -> (u64, Result<Box<Finished>, ImportFailed>) {
@@ -266,7 +266,9 @@ fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
 /// A-732 (found by use, w-perf: importing Mercurial's own repository, 57,036 changesets, crash-looped the daemon, its
 /// shard spinning past the watchdog's 1 s window at every restart: the recovery replayed the import's record in one
 /// unit, and the landing wrote it in one step). Do: import the `states` repository a unit a turn and land it; then make
-/// its store again as a recovery does, its slices a nanosecond, polling the recovery until it ends. Expect: the record
+/// its store again as a recovery does, its slices a nanosecond, polling the recovery until it ends, its content held
+/// meanwhile as a warm restart's image holds it (A-727 a3; the record names it by identity, A-729 part 2). Expect: the
+/// record
 /// written over more turns than the import's own (a revision a turn at the least), the recovery yielding between its
 /// units, at least one a revision of the record, and the store's rows after it the rows the landing left.
 #[test]
@@ -281,6 +283,7 @@ fn t_a732_a_recovery_replays_an_import_record_a_revision_a_unit() {
     assert!(turns > revisions, "{turns} turns for {revisions} revisions");
     assert_eq!(land(state, id), Ok(()));
     let landed = rows_of(state, id);
+    let image = crate::vcs_store::set_aside(state, id);
     crate::vcs_store::free(state, id);
     let mut slices = crate::recovery_slices::RecoverySlices::begin(1);
     let polls = {
@@ -297,6 +300,7 @@ fn t_a732_a_recovery_replays_an_import_record_a_revision_a_unit() {
     assert!(polls > 1, "the recovery never yielded");
     assert!(units > revisions, "{units} units for {revisions} revisions");
     assert_eq!(rows_of(state, id), landed);
+    crate::vcs_store::release_aside(state, image);
   });
 }
 

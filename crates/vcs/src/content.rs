@@ -336,6 +336,10 @@ pub struct ContentStore {
   objects: BTreeMap<ContentId, ContentId>,
   /// [`ContentStore::objects`] inverted: a root to the identity of the object it roots.
   rooted: BTreeMap<ContentId, ContentId>,
+  /// The lists kept or freed since its owner last took the changes (A-727 slice a3b: the shard image carries them).
+  lists_changed: BTreeSet<ContentId>,
+  /// The objects named or unnamed since its owner last took the changes (A-727 slice a3b).
+  names_changed: BTreeSet<ContentId>,
   /// Where the windows' bytes are kept (A-727).
   storage: Box<dyn WindowStorage>,
   /// The longest content the store holds: the content plane's window.
@@ -491,6 +495,8 @@ impl ContentStore {
       entries: BTreeMap::new(),
       objects: BTreeMap::new(),
       rooted: BTreeMap::new(),
+      lists_changed: BTreeSet::new(),
+      names_changed: BTreeSet::new(),
       storage: Box::new(HeapWindows::default()),
       window,
       fanout,
@@ -609,6 +615,7 @@ impl ContentStore {
     self.counters.stored = self.counters.stored.saturating_add(1);
     if form == Form::List {
       self.counters.lists = self.counters.lists.saturating_add(1);
+      self.lists_changed.insert(identity);
     }
     Ok(())
   }
@@ -640,9 +647,9 @@ impl ContentStore {
   /// `identity`, the BLAKE3 of an object's bytes, named for `root`, the tree this store keeps it as (module docs, "The
   /// identity rule"): a root that is the identity itself (an object of at most one window) needs no name. The identity.
   fn named_object(&mut self, identity: ContentId, root: ContentId) -> ContentId {
-    if identity != root {
-      self.objects.insert(identity, root);
+    if identity != root && self.objects.insert(identity, root).is_none() {
       self.rooted.insert(root, identity);
+      self.names_changed.insert(identity);
     }
     identity
   }
@@ -985,6 +992,10 @@ impl ContentStore {
     // A freed root takes its object's name with it (module docs, "The identity rule").
     if let Some(named) = self.rooted.remove(identity) {
       self.objects.remove(&named);
+      self.names_changed.insert(named);
+    }
+    if freed.form == Form::List {
+      self.lists_changed.insert(*identity);
     }
     let len = width(freed.len())?;
     self.content_bytes = self.content_bytes.saturating_sub(len);
@@ -1075,21 +1086,136 @@ impl ContentStore {
       .filter(|(_, held)| held.holders == 0)
       .map(|(identity, _)| *identity)
       .collect();
-    let mut freed = 0u64;
+    let freed_before = self.counters.freed;
     for identity in unheld {
-      let Some(held) = self.entries.remove(&identity) else {
+      // Held by no one: one count stands in for the holder it never had, so release frees it, and a list gives back
+      // the windows it names (a3b), each freed with its last.
+      if let Some(held) = self.entries.get_mut(&identity) {
+        if held.holders != 0 {
+          continue;
+        }
+        held.holders = 1;
+      }
+      let _ = self.release(&identity);
+    }
+    self.counters.freed.saturating_sub(freed_before)
+  }
+
+  /// The lists the store keeps, each with its bytes (A-727 slice a3b): what the shard image carries whole beside the
+  /// windows, so an object longer than a window is whole again after a restart before any record is replayed.
+  pub fn lists(&self) -> impl Iterator<Item = (ContentId, &[u8])> + '_ {
+    self
+      .entries
+      .iter()
+      .filter(|(_, held)| held.form == Form::List)
+      .filter_map(|(identity, held)| Some((*identity, held.here()?)))
+  }
+
+  /// Each object longer than a window, by its identity, with the root this store cut it into (A-727 slice a3b).
+  pub fn names(&self) -> impl Iterator<Item = (ContentId, ContentId)> + '_ {
+    self
+      .objects
+      .iter()
+      .map(|(identity, root)| (*identity, *root))
+  }
+
+  /// The lists and names kept or let go since the owner last took them ([`ContentStore::clear_changes`]): each list
+  /// with its bytes, none once freed; each name with its root, none once unnamed (A-727 slice a3b: a delta carries them).
+  pub fn changes(
+    &self,
+  ) -> (
+    Vec<(ContentId, Option<&[u8]>)>,
+    Vec<(ContentId, Option<ContentId>)>,
+  ) {
+    let lists = self
+      .lists_changed
+      .iter()
+      .map(|identity| {
+        let bytes = self
+          .entries
+          .get(identity)
+          .filter(|held| held.form == Form::List)
+          .and_then(Held::here);
+        (*identity, bytes)
+      })
+      .collect();
+    let names = self
+      .names_changed
+      .iter()
+      .map(|identity| (*identity, self.objects.get(identity).copied()))
+      .collect();
+    (lists, names)
+  }
+
+  /// Forgets the changes a committed publication carried.
+  pub fn clear_changes(&mut self) {
+    self.lists_changed.clear();
+    self.names_changed.clear();
+  }
+
+  /// Takes back the lists and names a shard image carried (A-727 slice a3b), after the windows its storage restored
+  /// ([`ContentStore::with_storage`]): each list held by no one until a holder puts or holds its object again, holding
+  /// once each node it names, as it did; each name whose root the store holds. A list whose bytes are not its identity's
+  /// or not a list's, or that names a node the store does not hold, and a name whose root it does not hold, are left
+  /// out. The count left out.
+  pub fn restore_nodes(
+    &mut self,
+    lists: Vec<(ContentId, Vec<u8>)>,
+    names: Vec<(ContentId, ContentId)>,
+  ) -> u64 {
+    let mut refused = 0u64;
+    let mut kept = Vec::new();
+    for (identity, bytes) in lists {
+      let whole = ContentId::named(Form::List, &bytes) == identity
+        && bytes.len() % IDENTITY_BYTES == 0
+        && !bytes.is_empty()
+        && !self.entries.contains_key(&identity);
+      if !whole {
+        refused = refused.saturating_add(1);
         continue;
-      };
+      }
       self.content_bytes = self
         .content_bytes
-        .saturating_sub(u64::try_from(held.len()).unwrap_or(u64::MAX));
-      if let Kept::Stored { window, .. } = held.kept {
-        self.storage.release(window);
-      }
-      freed = freed.saturating_add(1);
+        .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+      self.entries.insert(
+        identity,
+        Held {
+          kept: Kept::Here(bytes.into_boxed_slice()),
+          form: Form::List,
+          holders: 0,
+        },
+      );
+      kept.push(identity);
     }
-    self.counters.freed = self.counters.freed.saturating_add(freed);
-    freed
+    // Each list holds the nodes it names, once for each time it names them, as it did before the restart.
+    for identity in kept {
+      let named: Vec<ContentId> = self
+        .entries
+        .get(&identity)
+        .and_then(Held::here)
+        .map(|bytes| {
+          bytes
+            .chunks_exact(IDENTITY_BYTES)
+            .filter_map(ContentId::from_slice)
+            .collect()
+        })
+        .unwrap_or_default();
+      for node in named {
+        match self.entries.get_mut(&node) {
+          Some(held) => held.holders = held.holders.saturating_add(1),
+          None => refused = refused.saturating_add(1),
+        }
+      }
+    }
+    for (identity, root) in names {
+      if self.entries.contains_key(&root) && !self.objects.contains_key(&identity) {
+        self.objects.insert(identity, root);
+        self.rooted.insert(root, identity);
+      } else {
+        refused = refused.saturating_add(1);
+      }
+    }
+    refused
   }
 
   /// The storage the windows are kept in (A-727 slice a3: its owner images it).
@@ -1931,5 +2057,60 @@ mod tests {
       Some(object),
       "{len} by {piece}"
     );
+  }
+
+  /// A-727 slice a3b (an object longer than a window across a restart). Do: put two objects of five windows into a
+  /// store; carry its windows (by identity and bytes), its lists and its names into a new store, as a shard image does;
+  /// read both objects by identity before anything is put; put the first again; free what no one holds. Expect: both
+  /// read whole by their identities before any put; the put again storing no window and no list (the lists restored
+  /// answer it) and holding the object once; the second object, held by no one, freed with every window and list it
+  /// named, the first whole.
+  #[test]
+  fn an_object_past_a_window_is_whole_again_after_a_restart_from_its_lists_and_name() {
+    let window = 2 * IDENTITY_BYTES;
+    let first: Vec<u8> = (0..5 * window)
+      .map(|at| u8::try_from(at % 199).unwrap())
+      .collect();
+    let second: Vec<u8> = (0..5 * window)
+      .map(|at| u8::try_from(at % 97).unwrap())
+      .collect();
+    let mut before = ContentStore::new(1 << 20, window).unwrap();
+    let (one, two) = (
+      before.put_object(&first).unwrap(),
+      before.put_object(&second).unwrap(),
+    );
+    let mut storage = RestoredWindows::default();
+    for (identity, held) in &before.entries {
+      if held.form == Form::Window {
+        let bytes = before.bytes_of(identity).unwrap().into_owned();
+        let kept = storage.inner.put(&bytes).unwrap();
+        storage.kept.push((*identity, kept, bytes.len()));
+      }
+    }
+    let lists: Vec<(ContentId, Vec<u8>)> = before
+      .lists()
+      .map(|(identity, bytes)| (identity, bytes.to_vec()))
+      .collect();
+    let names: Vec<(ContentId, ContentId)> = before.names().collect();
+    assert!(!lists.is_empty() && names.len() == 2);
+    let mut after = ContentStore::with_storage(1 << 20, window, Box::new(storage)).unwrap();
+    assert_eq!(after.restore_nodes(lists, names), 0);
+    let len = u64::try_from(first.len()).unwrap();
+    assert_eq!(after.object_bytes(&one, len), Some(first.clone()));
+    assert_eq!(after.object_bytes(&two, len), Some(second.clone()));
+    let stored = after.counters().stored;
+    assert_eq!(after.put_object(&first).unwrap(), one);
+    assert_eq!(
+      after.counters().stored,
+      stored,
+      "the restored nodes answer the put"
+    );
+    assert_eq!(after.holders(&one), 1);
+    let freed = after.release_unheld();
+    assert!(freed > 0, "the second object's nodes freed");
+    assert_eq!(after.object_bytes(&two, len), None);
+    assert_eq!(after.object_bytes(&one, len), Some(first));
+    after.release(&one).unwrap();
+    assert!(after.is_empty() && after.used() == 0);
   }
 }

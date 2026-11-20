@@ -100,8 +100,7 @@ use crate::state::ShardState;
 pub(crate) mod arena_windows;
 pub(crate) mod commits;
 pub(crate) mod durable;
-#[allow(unused_imports)]
-// Owed callers: w-svn's landing (A-727 slice b); `BarrierRefused` and `ContentTicket` name its terms.
+#[allow(unused_imports)] // `ContentTicket` names the barrier's term for its callers.
 pub(crate) use durable::{BarrierRefused, ContentTicket, content_durable, content_ticket};
 pub(crate) mod git_encode;
 pub(crate) mod git_replay;
@@ -147,6 +146,10 @@ pub(crate) const WINDOWS_RESTORED: &str = "vcs_store.windows_restored";
 pub(crate) const WINDOWS_UNRESTORED: &str = "vcs_store.windows_unrestored";
 /// Counter (A-727 slice a3): restored windows no replayed record named, freed once the records were replayed.
 pub(crate) const WINDOWS_UNHELD: &str = "vcs_store.windows_unheld";
+/// Counter (A-727 slice a3b): a content store's lists and names a recovery took back from the shard image.
+pub(crate) const NODES_RESTORED: &str = "vcs_store.nodes_restored";
+/// Counter (A-727 slice a3b): lists and names of the shard image a recovery could not take back.
+pub(crate) const NODES_UNRESTORED: &str = "vcs_store.nodes_unrestored";
 /// Counter: a store a recovery could not make again from its records: zero in every correct use. Format: a counter name.
 pub(crate) const REPLAY_REFUSED: &str = "vcs_store.replay_refused";
 /// Counter: a store made again from the log after its commit's entry was not made durable. Format: a counter name.
@@ -216,6 +219,10 @@ pub(crate) struct VcsStores {
   /// Where the content store keeps its windows once it is made (A-727 slice a2): the shard's repository arena, given by
   /// the shard's start; none in a test's stores, whose content store keeps them in memory.
   window_storage: Option<Box<dyn slates_vcs::WindowStorage>>,
+  /// A recovery's lists and names of the content store (A-727 slice a3b), taken in when the store is made.
+  restored_nodes: Option<RestoredNodes>,
+  /// What the content store took back of them: restored, refused (counted by the recovery).
+  nodes_restored: (u64, u64),
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -390,6 +397,9 @@ pub(crate) enum ReplayRefused {
   SvnStep(StepRefusal),
   /// A Subversion record out of its order: a creation once the records are made, or a revision before them.
   SvnOrder,
+  /// A Subversion revision names a text its commit stored that the content store does not hold (§4.17.1 "A push's
+  /// intake": the content is durable before the entry naming it, so a recovery that lacks it lost it).
+  SvnStored,
   /// A Mercurial import's record refused by its replay (A-687): its bytes, a text not its node's, or the import's own
   /// step.
   Mercurial(slates_hg::import::record::Refused),
@@ -1123,6 +1133,14 @@ impl VcsStores {
         None => ContentStore::new(self.charged, window),
       }?;
       self.content = Some(content);
+      // A recovery's lists and names (a3b), over the windows the storage handed back: counted by the owner.
+      if let (Some((lists, names)), Some(content)) =
+        (self.restored_nodes.take(), self.content.as_mut())
+      {
+        let offered = u64::try_from(lists.len().saturating_add(names.len())).unwrap_or(u64::MAX);
+        let refused = content.restore_nodes(lists, names);
+        self.nodes_restored = (offered.saturating_sub(refused), refused);
+      }
     }
     Ok(())
   }
@@ -1146,6 +1164,13 @@ impl VcsStores {
     }
   }
 }
+
+/// A content store's lists, each by identity with its bytes, and its names, an object's identity with its root, as a
+/// shard image carried them (A-727 slice a3b).
+type RestoredNodes = (
+  Vec<(slates_vcs::ContentId, Vec<u8>)>,
+  Vec<(slates_vcs::ContentId, slates_vcs::ContentId)>,
+);
 
 /// The shard's chunk store lent to the repository content store for one step (A-727 slice a2, `arena_windows`): taken
 /// in when made, handed back when dropped, so no path out of the step keeps it, and the shard budget extended by what
@@ -2339,7 +2364,7 @@ fn replay_into(
     }
     Some(RepositoryStore::Git(store)) => replay_git(content, store, bytes),
     Some(RepositoryStore::Subversion(store)) => {
-      replay_svn(store, bytes, svn_room.ok_or(unheld)?).map(|()| 0)
+      replay_svn((content, store), bytes, svn_room.ok_or(unheld)?).map(|()| 0)
     }
     Some(RepositoryStore::Mercurial(store)) => replay_hg(content, store, bytes),
     None => Err(unheld),
@@ -2463,7 +2488,11 @@ pub(crate) fn lfs_bytes(stores: &VcsStores, id: RepositoryId, oid: &Oid) -> Opti
 /// (`commit_record`): a revision checked and applied, its lock entries as recorded; the UUID and a revision's properties
 /// an import set (A-652 part 3). A record out of its order is refused, and so is one the step refuses; either leaves
 /// the records as they were.
-fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), ReplayRefused> {
+fn replay_svn(
+  (content, store): (&mut ContentStore, &mut SvnStore),
+  bytes: &[u8],
+  room: SvnRoom,
+) -> Result<(), ReplayRefused> {
   match SvnRecord::decode(bytes).map_err(ReplayRefused::SvnRecord)? {
     SvnRecord::Created { uuid, date } => {
       if store.records.is_some() {
@@ -2476,9 +2505,26 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
     record => {
       let records = store.records.as_mut().ok_or(ReplayRefused::SvnOrder)?;
       records.set_room(room);
+      // The texts the revision stored, which the records now reference: each held again in the content store, as the
+      // live landing held it, so a recovery's sweep of unheld content keeps it.
+      let stored: Vec<slates_svn::index::ContentIdentity> = match &record {
+        SvnRecord::Revision(revision) => revision
+          .stored
+          .keys()
+          .filter(|identity| !records.holds(identity))
+          .copied()
+          .collect(),
+        _ => Vec::new(),
+      };
       records
         .commit_record(record)
-        .map_err(ReplayRefused::SvnStep)
+        .map_err(ReplayRefused::SvnStep)?;
+      for identity in stored {
+        content
+          .hold(&slates_vcs::ContentId(identity))
+          .map_err(|_| ReplayRefused::SvnStored)?;
+      }
+      Ok(())
     }
   }
 }
@@ -2569,8 +2615,22 @@ pub(crate) fn chunk_windows_mut(
 /// Takes the repository windows the shard image names back (A-727 slice a3), before the volumes and the records: each
 /// chunk's block claimed in the shard's chunk store and its chunk recorded, the windows handed to the content store the
 /// first repository's replay makes. Only before a content store is made; counted restored and not.
-pub(crate) fn restore_windows(state: &mut ShardState, pieces: &[(u64, Vec<u8>)]) {
-  if pieces.is_empty() || state.vcs_stores.content.is_some() {
+pub(crate) fn restore_windows(
+  state: &mut ShardState,
+  pieces: &[(u64, Vec<u8>)],
+  (lists, names): (
+    &[(slates_vcs::ContentId, Vec<u8>)],
+    &[(slates_vcs::ContentId, slates_vcs::ContentId)],
+  ),
+) {
+  if state.vcs_stores.content.is_some() {
+    return;
+  }
+  // The lists and names are taken in when the content store is made over the windows (`VcsStores::content_made`).
+  if !lists.is_empty() || !names.is_empty() {
+    state.vcs_stores.restored_nodes = Some((lists.to_vec(), names.to_vec()));
+  }
+  if pieces.is_empty() {
     return;
   }
   let (windows, refused) =
@@ -2586,6 +2646,9 @@ pub(crate) fn restore_windows(state: &mut ShardState, pieces: &[(u64, Vec<u8>)])
 /// Frees the restored windows no replayed record named (A-727 slice a3), once every record is replayed, and settles the
 /// shard's charge.
 fn release_unheld_windows(state: &mut ShardState) {
+  let (restored, refused) = std::mem::take(&mut state.vcs_stores.nodes_restored);
+  state.count(NODES_RESTORED, restored);
+  state.count(NODES_UNRESTORED, refused);
   let freed = {
     let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
     lent
@@ -2678,14 +2741,19 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
     return;
   }
   // A Mercurial repository's records replayed whole in one step held a large repository's shard past the watchdog's
-  // window (A-732): its store made empty now, lent to nothing, and its records replayed a step a turn by a task.
+  // window (A-732): its store made empty now, lent to nothing, and its records replayed a step a turn by a task. Its
+  // records name contents by identity (A-729 part 2), so the index it had is set aside, holding them, until the replay
+  // ends.
+  let aside = set_aside(state, id);
   free(state, id);
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
+    release_aside(state, aside);
     return;
   };
   make(state, &record);
   state.vcs_stores.rebuilding.insert(id);
-  let task = slates_rt::futures::spawn(replay_sliced(id)).and_then(slates_rt::futures::detach);
+  let task =
+    slates_rt::futures::spawn(replay_sliced(id, aside)).and_then(slates_rt::futures::detach);
   if task.is_err() {
     // No task to run it: the store stays lent to nothing, and the next recovery makes it again a unit at a time.
     state.count(REPLAY_REFUSED, 1);
@@ -2968,19 +3036,53 @@ pub(crate) fn rebuild_turn_once_within(state: &mut ShardState, id: RepositoryId,
     .is_some_and(|(generation, _)| rebuild_turn_within(state, (id, generation), ns))
 }
 
-/// [`rebuild`] in one step, every record replayed at once: the tests' and Mercurial's tests'.
+/// [`rebuild`] in one step, every record replayed at once: the tests' and Mercurial's tests'. A Mercurial index is set
+/// aside while its records replay, as [`rebuild`] sets it aside.
 pub(crate) fn rebuild_whole(state: &mut ShardState, id: RepositoryId) {
+  let aside = set_aside(state, id);
   free(state, id);
-  let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
+  if let Some(record) = state.db.partition().repositories().repository(id).cloned() {
+    make_whole(state, &record);
+    state.count(REBUILT, 1);
+  }
+  release_aside(state, aside);
+}
+
+/// Repository `id`'s Mercurial index taken out of its store, still holding every content it names (A-729 part 2): its
+/// records name contents by identity, never their bytes, so a rebuild that replays them must find them held, and this
+/// holds them until the replay ends ([`release_aside`]). None for another tool's store, or none at all.
+pub(crate) fn set_aside(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> Option<slates_hg::index::HgIndex> {
+  match state.vcs_stores.entries.get_mut(&id) {
+    Some(RepositoryStore::Mercurial(store)) => Some(core::mem::replace(
+      &mut store.index,
+      slates_hg::index::HgIndex::new(),
+    )),
+    _ => None,
+  }
+}
+
+/// Gives back an index [`set_aside`] kept, its holds released; a refused release counted.
+pub(crate) fn release_aside(state: &mut ShardState, aside: Option<slates_hg::index::HgIndex>) {
+  let Some(index) = aside else {
     return;
   };
-  make_whole(state, &record);
-  state.count(REBUILT, 1);
+  let released = within_budget(state, 0, |stores| {
+    stores
+      .content_mut()
+      .map_or(Ok(()), |content| index.release(content))
+  });
+  if released.is_err() {
+    state.count(RELEASE_REFUSED, 1);
+  }
+  settle(state);
 }
 
 /// Repository `id`'s Mercurial records replayed into its store a step a turn, a yield between (A-732: [`rebuild`]'s
 /// task); then the store lent again, its index's generation moved, so a push forked from the store before is re-based.
-async fn replay_sliced(id: RepositoryId) {
+async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex>) {
   let mut index = 0usize;
   let mut replay = None;
   loop {
@@ -3008,6 +3110,7 @@ async fn replay_sliced(id: RepositoryId) {
   crate::state::with_state(|state| {
     state.vcs_stores.rebuilding.remove(&id);
     state.vcs_stores.index_changed(id);
+    release_aside(state, aside);
   })
   .unwrap_or_default();
 }

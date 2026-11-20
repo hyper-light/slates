@@ -51,6 +51,24 @@ impl Store {
     }
   }
 
+  /// The map of `root` as names and ids, read `most` at a time through the cursor ([`entries_after`]).
+  fn read_by_cursor(&self, root: u32, most: usize) -> Vec<(String, usize)> {
+    let mut read: Vec<(String, usize)> = Vec::new();
+    loop {
+      let after = read.last().map(|(name, _)| name.clone());
+      let (part, more) = entries_after(self, root, after.as_deref(), most).unwrap();
+      assert!(part.len() <= most);
+      read.extend(
+        part
+          .into_iter()
+          .map(|(key, id)| (self.key_name(key as u32).unwrap().to_owned(), id.0)),
+      );
+      if !more {
+        return read;
+      }
+    }
+  }
+
   /// The map of `root` as names and ids.
   fn read(&self, root: u32) -> Vec<(String, usize)> {
     entries(self, root)
@@ -98,6 +116,10 @@ fn run(changes: &[Change], batch: usize) {
     if check {
       assert_eq!(
         store.read(root),
+        model.clone().into_iter().collect::<Vec<_>>()
+      );
+      assert_eq!(
+        store.read_by_cursor(root, 1 + at % 13),
         model.clone().into_iter().collect::<Vec<_>>()
       );
     }

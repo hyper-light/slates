@@ -3728,3 +3728,82 @@ fn measure_whole_states_held_once() {
     .collect();
   println!("WHOLE_STATES_HELD path=once volumes={}", held.len());
 }
+
+/// A-757 part 4 (w-forming, 2026-11-20): a holder's identity of a received entry, hashed a slice at a time, is the entry's
+/// identity, and the guard given it admits exactly what the guard that hashes admits. Do: build an entry of a few hundred
+/// KiB extending an empty replica, feed it to `EntryHasher::of` in 4 KiB slices, and check it both ways; commit it, and
+/// check it again both ways (a duplicate). Expect the identities equal, `Apply` at the same head both ways, then `Held`
+/// both ways.
+#[test]
+fn a_holder_hashing_an_entry_in_slices_admits_what_the_hashing_guard_admits() {
+  const PAYLOAD: usize = 300_000;
+  const SLICE: usize = 4096;
+  let mut shipper = shipper_bounded_by_whole(PAYLOAD * 4);
+  let entry = shipper
+    .append(
+      (0..PAYLOAD)
+        .map(|at| u8::try_from(at % 233).unwrap())
+        .collect(),
+    )
+    .unwrap();
+  let mut hasher = slates_db::live::EntryHasher::of(&entry).unwrap();
+  for slice in entry.payload.chunks(SLICE) {
+    hasher.feed(slice);
+  }
+  let identity = hasher.finish().unwrap();
+  assert_eq!(identity, entry.identity());
+  let mut replica = Replica::new(HostId(1), OBJECT);
+  let hashing = replica.check(&entry).unwrap();
+  assert_eq!(replica.check_identified(&entry, identity).unwrap(), hashing);
+  assert_eq!(hashing, Admitted::Apply(entry.head()));
+  replica.commit(entry.epoch, entry.head());
+  assert_eq!(replica.check(&entry).unwrap(), Admitted::Held);
+  assert_eq!(
+    replica.check_identified(&entry, identity).unwrap(),
+    Admitted::Held
+  );
+}
+
+/// A measurement (w-forming's A/B for A-757 part 4; run in release with `--ignored --nocapture --exact`): a holder's
+/// take turn of a [`MEASURED_APPEND_BYTES`] entry, the guard hashing it (`check`) and given its identity hashed in
+/// [`MEASURED_SLICE_BYTES`] slices before (`check_identified`), with the longest slice; best and median of
+/// [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_holders_take_turn() {
+  let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+  let entry = shipper
+    .append(vec![0x5a_u8; MEASURED_APPEND_BYTES])
+    .unwrap();
+  let replica = Replica::new(HostId(1), OBJECT);
+  let (mut hashing, mut given, mut slices) = (Vec::new(), Vec::new(), Vec::new());
+  for _ in 0..MEASURED_APPENDS {
+    let began = std::time::Instant::now();
+    let admitted = replica.check(&entry).unwrap();
+    hashing.push(began.elapsed());
+    let mut hasher = slates_db::live::EntryHasher::of(&entry).unwrap();
+    let mut longest = std::time::Duration::ZERO;
+    for slice in entry.payload.chunks(MEASURED_SLICE_BYTES) {
+      let began = std::time::Instant::now();
+      hasher.feed(slice);
+      longest = longest.max(began.elapsed());
+    }
+    slices.push(longest);
+    let identity = hasher.finish().unwrap();
+    let began = std::time::Instant::now();
+    assert_eq!(
+      replica.check_identified(&entry, identity).unwrap(),
+      admitted
+    );
+    given.push(began.elapsed());
+  }
+  for times in [&mut hashing, &mut given, &mut slices] {
+    times.sort_unstable();
+  }
+  let median = MEASURED_APPENDS / 2;
+  println!(
+    "HOLDER_TAKE_TURN bytes={MEASURED_APPEND_BYTES} hashing best={:?} median={:?}; identified best={:?} median={:?}; \
+     longest {MEASURED_SLICE_BYTES}-byte slice best={:?} median={:?}",
+    hashing[0], hashing[median], given[0], given[median], slices[0], slices[median]
+  );
+}

@@ -59,7 +59,9 @@ use slates_merge::ops_doc::{NODE_EXCLUSIVE, Op, OpKind, OpsDoc, REPLACE};
 use slates_svn::commit::drive::Work;
 use slates_svn::commit::record::Record;
 use slates_svn::commit::revision::{Revision, StepRefusal};
-use slates_svn::index::{Action, ChangedPath, CopySource, NodeKind, PropertyList, Text};
+use slates_svn::index::{
+  Action, ChangedPath, ContentIdentity, CopySource, NodeKind, PropertyList, Text,
+};
 use slates_svn::lock::{AprTime, CommitLocks};
 use slates_svn::migration::{Before, Checked, Repository, before};
 
@@ -136,6 +138,9 @@ pub(crate) enum Uncommitted {
   },
   /// The append refused (A-635's refusal): nothing applied.
   Append(AppendRefused),
+  /// The commit's texts were not answered durable in the shard's image (A-727 slice b's barrier): nothing applied,
+  /// the texts given back.
+  NotDurable(crate::vcs_store::BarrierRefused),
 }
 
 /// Format: `SVN_ERR_FS_GENERAL`, the filesystem category's start (160,000): the error a refusal of the step's own that
@@ -188,6 +193,10 @@ impl Uncommitted {
         SVN_ERR_FS_GENERAL,
         format!("The repository's log refused the commit: {refused:?}"),
       ),
+      Uncommitted::NotDurable(refused) => (
+        SVN_ERR_FS_GENERAL,
+        format!("The commit's texts were not made durable: {refused:?}"),
+      ),
     };
     Answered::Refused { code, message }
   }
@@ -200,10 +209,10 @@ pub(crate) fn commit_work(
   (principal, repository): (&Principal, RepositoryId),
   work: Work,
   now: AprTime,
-  texts: &dyn slates_svn::commit::drive::TextSink,
 ) -> Result<Committed, Uncommitted> {
   let locks = work.locks.clone();
-  let revision = Revision::of_work(work, now, texts).map_err(Uncommitted::Step)?;
+  // The work's texts are in the repository's content store already ([`store_step`]); the revision names them.
+  let revision = Revision::of_work(work, now).map_err(Uncommitted::Step)?;
   commit(
     state,
     (principal, repository),
@@ -212,9 +221,205 @@ pub(crate) fn commit_work(
   )
 }
 
+/// Lands a client's accepted `work` on `repository`'s logs by `principal` (§4.17.1 "A push's intake"; main's ruling (B)
+/// of 2026-11-20): its texts put from the commit's sink `texts` into the repository's content store a copy slice a step,
+/// the shard served between steps; the content made durable before any entry names it (the content plane's barrier);
+/// then the revision, which names the texts, committed through the step ([`commit_work`]) at the owner's instant. A
+/// refused landing gives back every text it put; a text the records came to hold meanwhile gives back its extra hold.
+/// None where the shard's state is gone (its shutdown).
+pub(crate) async fn land_work(
+  (principal, repository): (&Principal, RepositoryId),
+  work: Work,
+  texts: &dyn slates_svn::commit::drive::TextSink,
+) -> Option<Result<Committed, Uncommitted>> {
+  let begun = crate::state::with_state(|state| begin_storing(state, repository, &work))?;
+  let mut storing = match begun {
+    Ok(storing) => storing,
+    Err(refused) => return Some(Err(refused)),
+  };
+  loop {
+    let stepped = crate::state::with_state(|state| store_step(state, &mut storing, texts))?;
+    match stepped {
+      Ok(true) => break,
+      Ok(false) => slates_rt::futures::yield_now().await,
+      Err(refused) => {
+        let _ = crate::state::with_state(|state| release_stored(state, storing));
+        return Some(Err(refused));
+      }
+    }
+  }
+  let (origin, ticket) =
+    crate::state::with_state(|state| (state.shard, crate::vcs_store::content_ticket(state)))?;
+  let budget_ns = crate::fleet::live_budget().max_deadline_ns();
+  if let Err(refused) = crate::vcs_store::content_durable(origin, ticket, budget_ns).await {
+    let _ = crate::state::with_state(|state| release_stored(state, storing));
+    return Some(Err(Uncommitted::NotDurable(refused)));
+  }
+  crate::state::with_state(|state| {
+    let twice = held_twice(state, repository, &storing);
+    let now = AprTime::from_wall_ns(slates_vfs::clock::Clock::wall_ns(&mut state.clock));
+    let landed = commit_work(state, (principal, repository), work, now);
+    match &landed {
+      Ok(_) => release_texts(state, None, &twice),
+      Err(_) => release_stored(state, storing),
+    }
+    landed
+  })
+}
+
 /// The refusal of records that do not hold together.
 fn corrupt() -> Uncommitted {
   Uncommitted::Step(StepRefusal::Corrupt)
+}
+
+/// A commit's texts being put into the repository's content store from its sink, a slice a step, before its revision
+/// lands (§4.17.1 "A push's intake"; main's ruling (B) of 2026-11-20): the texts still to put, the one being put, and
+/// those put whole, each holding one count of the store, which the records keep as their reference once the revision
+/// lands and a refused landing gives back ([`release_stored`]). Until the sink writes into the store itself (w-perf's
+/// wiring), this is where a text's bytes enter it.
+#[derive(Debug, Default)]
+pub(crate) struct Storing {
+  /// The texts still to put, each with its length.
+  queue: std::collections::VecDeque<(ContentIdentity, u64)>,
+  /// The text being put: its identity, its length, its writer and the bytes put so far.
+  current: Option<(ContentIdentity, u64, slates_vcs::Writing, u64)>,
+  /// The texts put whole, each holding one count of the store.
+  put: Vec<ContentIdentity>,
+}
+
+/// What `work` brings that the repository's records do not hold: its texts to put ([`store_step`]).
+pub(crate) fn begin_storing(
+  state: &ShardState,
+  repository: RepositoryId,
+  work: &Work,
+) -> Result<Storing, Uncommitted> {
+  let records = state
+    .vcs_stores
+    .subversion_records(repository)
+    .ok_or(Uncommitted::NotHeld)?;
+  let lengths: BTreeMap<ContentIdentity, u64> = work
+    .record
+    .changes
+    .iter()
+    .filter_map(|change| change.text.map(|text| (text.identity, text.size)))
+    .collect();
+  let mut queue = std::collections::VecDeque::new();
+  for identity in &work.texts {
+    if records.holds(identity) {
+      continue;
+    }
+    let len = lengths.get(identity).copied().ok_or_else(corrupt)?;
+    queue.push_back((*identity, len));
+  }
+  Ok(Storing {
+    queue,
+    ..Storing::default()
+  })
+}
+
+/// One step of putting a commit's texts into the store: at most the shard's copy slice of the text being put, read from
+/// `texts` (the commit's sink) and kept a window at a time, admitted against the shard's room and charged as kept.
+/// Whether every text is put. A text whose bytes are not the identity its commit named is refused `Corrupt`.
+///
+/// # Errors
+/// [`Uncommitted::Budget`] past the shard's room; [`Uncommitted::NotHeld`] with no content store; `Corrupt` for a text
+/// the sink does not hold or whose bytes are not its identity.
+pub(crate) fn store_step(
+  state: &mut ShardState,
+  storing: &mut Storing,
+  texts: &dyn slates_svn::commit::drive::TextSink,
+) -> Result<bool, Uncommitted> {
+  let slice = usize::try_from(state.config.copy_slice_bytes())
+    .unwrap_or(usize::MAX)
+    .max(1);
+  let (identity, len, mut writing, sent) = match storing.current.take() {
+    Some(current) => current,
+    None => match storing.queue.pop_front() {
+      Some((identity, len)) => (identity, len, slates_vcs::Writing::default(), 0),
+      None => return Ok(true),
+    },
+  };
+  let piece = texts
+    .sealed_piece(&identity, sent, slice)
+    .ok_or_else(corrupt)?;
+  let piece_len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+  let kept = crate::vcs_store::within_budget(state, piece_len, |stores| {
+    let store = stores.content_mut().ok_or(Uncommitted::NotHeld)?;
+    store
+      .put_window(&mut writing, &piece)
+      .map_err(|refused| store_refused(&refused))?;
+    let sent = sent.saturating_add(piece_len);
+    if sent < len && !piece.is_empty() {
+      return Ok(Some((writing, sent)));
+    }
+    let made = store
+      .finish_object(&mut writing)
+      .map_err(|refused| store_refused(&refused))?;
+    if made != slates_vcs::ContentId(identity) {
+      let _ = store.release(&made);
+      return Err(corrupt());
+    }
+    Ok(None)
+  });
+  match kept {
+    Ok(Some((writing, sent))) => storing.current = Some((identity, len, writing, sent)),
+    Ok(None) => storing.put.push(identity),
+    Err(refused) => return Err(refused),
+  }
+  Ok(storing.queue.is_empty() && storing.current.is_none())
+}
+
+/// The commit step's answer to a content store's refusal: past the shard's room, `Budget`; anything else the store
+/// refuses, `Corrupt`.
+fn store_refused(refused: &slates_vcs::ContentRefused) -> Uncommitted {
+  match *refused {
+    slates_vcs::ContentRefused::OverBudget { room, .. } => Uncommitted::Budget { available: room },
+    _ => corrupt(),
+  }
+}
+
+/// The texts `storing` put whole that repository `repository`'s records hold already (another commit of the same text
+/// landed meanwhile): their store holds are one too many once this revision lands, since the records reference a text
+/// once. Read just before the revision's commit, on the same step.
+pub(crate) fn held_twice(
+  state: &ShardState,
+  repository: RepositoryId,
+  storing: &Storing,
+) -> Vec<ContentIdentity> {
+  let Some(records) = state.vcs_stores.subversion_records(repository) else {
+    return Vec::new();
+  };
+  storing
+    .put
+    .iter()
+    .filter(|identity| records.holds(identity))
+    .copied()
+    .collect()
+}
+
+/// Gives back every text `storing` put whole and the one it was putting: a landing that was refused.
+pub(crate) fn release_stored(state: &mut ShardState, storing: Storing) {
+  let Storing { current, put, .. } = storing;
+  release_texts(state, current.map(|(_, _, writing, _)| writing), &put);
+}
+
+/// Gives back one store hold of each of `texts`, and abandons `writing`'s object.
+pub(crate) fn release_texts(
+  state: &mut ShardState,
+  writing: Option<slates_vcs::Writing>,
+  texts: &[ContentIdentity],
+) {
+  crate::vcs_store::within_budget(state, 0, |stores| {
+    let Some(store) = stores.content_mut() else {
+      return;
+    };
+    if let Some(writing) = writing {
+      store.abandon_object(writing);
+    }
+    for identity in texts {
+      let _ = store.release(&slates_vcs::ContentId(*identity));
+    }
+  });
 }
 
 /// The step for a record that moves no version (module docs; A-652 part 3): `record`, the repository's UUID or a
@@ -410,7 +615,10 @@ fn apply_holding(
 
 /// The repository's one green (item 1): its default branch's, here and not fenced. `NotHeld` otherwise, and for a
 /// repository not here or not Subversion's.
-fn green_of(state: &ShardState, repository: RepositoryId) -> Result<DbVolumeId, Uncommitted> {
+pub(crate) fn green_of(
+  state: &ShardState,
+  repository: RepositoryId,
+) -> Result<DbVolumeId, Uncommitted> {
   let repositories = state.db.partition().repositories();
   let record = repositories
     .repository(repository)
@@ -576,19 +784,21 @@ fn version_of(
   checked: &Checked,
   record: &[u8],
 ) -> Result<Increment, Uncommitted> {
-  let built = {
+  // Built with the content store's chunks lent, so a text the commit stored reads from it (A-727's lend).
+  let built = crate::vcs_store::lent_state(state, |state| {
     let records = state
       .vcs_stores
       .subversion_records(repository)
       .ok_or(Uncommitted::NotHeld)?;
+    let store = state.vcs_stores.content();
     let engine = state.greens.get(&green).ok_or(Uncommitted::NotHeld)?;
     let head = records.youngest();
     if engine.head() == head {
-      Building::new(records, &engine, checked).build(head, identity(record))
+      Building::new((records, store), &engine, checked).build(head, identity(record))
     } else {
       Err(Uncommitted::Diverged)
     }
-  };
+  });
   match &built {
     Err(Uncommitted::Diverged) => state.count(DIVERGED, 1),
     Err(Uncommitted::Unsupported { .. }) => state.count(UNSUPPORTED, 1),
@@ -641,6 +851,8 @@ struct Building<'b> {
   records: &'b Repository,
   /// The repository's green, at the same head.
   engine: &'b Green,
+  /// The repository's content store, lent: where a text its commit stored is read from (§4.17.1 "A push's intake").
+  store: Option<&'b slates_vcs::ContentStore>,
   /// The revision, checked.
   checked: &'b Checked,
   /// Its rows, by path.
@@ -655,7 +867,11 @@ struct Building<'b> {
 
 impl<'b> Building<'b> {
   /// An empty increment for `checked` over `records` and `engine`.
-  fn new(records: &'b Repository, engine: &'b Green, checked: &'b Checked) -> Self {
+  fn new(
+    (records, store): (&'b Repository, Option<&'b slates_vcs::ContentStore>),
+    engine: &'b Green,
+    checked: &'b Checked,
+  ) -> Self {
     let rows = checked
       .changes()
       .iter()
@@ -664,6 +880,7 @@ impl<'b> Building<'b> {
     Self {
       records,
       engine,
+      store,
       checked,
       rows,
       doc: OpsDoc::default(),
@@ -866,15 +1083,24 @@ impl<'b> Building<'b> {
     Ok(())
   }
 
-  /// `text`'s bytes: brought by the revision, or held by the records.
+  /// `text`'s bytes: brought by the revision, held by the records, or stored in the content store by its commit. Until
+  /// the green's increment can name stored content (A-716 1b, w-engine's), a stored text is read whole into it.
   fn text_bytes(&self, text: &Text) -> Result<std::borrow::Cow<'b, [u8]>, Uncommitted> {
     let checked: &'b Checked = self.checked;
     let records: &'b Repository = self.records;
+    let store: Option<&'b slates_vcs::ContentStore> = self.store;
     checked
       .fresh()
       .get(&text.identity)
       .map(|bytes| std::borrow::Cow::Borrowed(bytes.as_slice()))
       .or_else(|| records.text(&text.identity))
+      .or_else(|| {
+        let store = store?;
+        let root = store.root_of(&slates_vcs::ContentId(text.identity));
+        store
+          .object_bytes(&root, text.size)
+          .map(std::borrow::Cow::Owned)
+      })
       .ok_or_else(corrupt)
   }
 

@@ -726,7 +726,7 @@ impl Rebase {
     rev: u32,
     store: &mut ContentStore,
   ) -> Result<(), Unindexed> {
-    let kept = crate::import::record::kept(&self.stale, store, log, rev, true).ok_or(
+    let kept = crate::import::record::kept(&self.stale, store, log, rev).ok_or(
       Unindexed::Index(crate::index::Refused::MissingLink { node: NULL_NODE }),
     )?;
     let node = kept.node;

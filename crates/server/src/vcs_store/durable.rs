@@ -22,7 +22,6 @@
 use crate::state::ShardState;
 
 /// Where and when content written on a shard is durable: the shard, and the first generation of its image that holds it.
-#[cfg_attr(not(test), allow(dead_code))] // Owed callers: w-svn's landing (A-727 slice b).
 pub(crate) type ContentTicket = super::homes::HomeTicket;
 
 /// Why content was not answered durable (module docs).
@@ -35,7 +34,6 @@ pub(crate) enum BarrierRefused {
 }
 
 /// The ticket of every chunk written on `state`'s shard so far (module docs): taken after a landing's last put.
-#[cfg_attr(not(test), allow(dead_code))] // Owed callers: w-svn's landing, git's version-3 records.
 pub(crate) fn content_ticket(state: &ShardState) -> ContentTicket {
   super::homes::ticket_here(state.shard)
 }
