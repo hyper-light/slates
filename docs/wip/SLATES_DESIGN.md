@@ -12455,7 +12455,9 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > (release, M-series Mac). By test (`a_very_large_directory_is_listed_a_few_entries_a_step`, 1,801 live entries;
 > a checkout and an update from r100): no step lists more than 16, where whole listings listed 1,801 in a step. The
 > checkout adds exactly the live names in order, and the update deletes exactly those gone. The replay drive's
-> `add_subdir` still lists a copied directory whole through `Repository::entries` (now the map walk).
+> `add_subdir` (A-759 part 3) adds a copied directory's source entries through the same cursor, `LIST_STEP` read a step
+> (`a_copied_large_directory_is_added_whole_a_few_entries_a_step`: a copy of a 10,000-entry directory, red 10,000
+> entries listed in one step, now at most 16, its additions the source's names in order).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids

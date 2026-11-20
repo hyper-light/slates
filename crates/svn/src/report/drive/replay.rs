@@ -35,13 +35,28 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use super::{
-  Call, Delta, DriveFailure, Owned, OwnedFacts, WindowWork, property_changes, property_list,
-  window_unit,
+  Call, Delta, DriveFailure, LIST_STEP, Owned, OwnedFacts, WindowWork, property_changes,
+  property_list, window_unit,
 };
 use crate::authz::{PrincipalRules, may_read};
 use crate::index::{Action, ChangedPath, Index, NodeKind, Revision, Text};
 use crate::reads::Repository;
 use crate::svndiff::{Compression, Version};
+
+/// A step of `add_subdir`'s listing (A-759): the source's next [`LIST_STEP`] entries in name order, read through the
+/// index's cursor after the last one read, so no step lists a large directory whole.
+fn read_whole_entries(index: &Index, whole: &mut Whole) -> Result<(), DriveFailure> {
+  let (source, revision) = (&whole.source.0, whole.source.1);
+  let (part, more) = index
+    .listing_after(source, revision, whole.listed_after.as_deref(), LIST_STEP)
+    .map_err(|_| DriveFailure::corrupt())?
+    .unwrap_or_default();
+  super::note_listed(part.len());
+  whole.listed_after = part.last().map(|(name, _)| name.clone());
+  whole.entries.extend(part.into_iter().map(|(name, _)| name));
+  whole.more = more;
+  Ok(())
+}
 
 /// The path separator.
 const SEPARATOR: char = '/';
@@ -78,8 +93,12 @@ struct Whole {
   path: String,
   /// Its source's repository path and revision.
   source: (String, Revision),
-  /// Its source's entries not yet added, in name order.
+  /// Its source's entries read and not yet added, in name order: at most [`LIST_STEP`] of them (A-759).
   entries: VecDeque<String>,
+  /// The last entry read from the source's listing, where its cursor goes on.
+  listed_after: Option<String>,
+  /// Whether the source's listing has entries not yet read.
+  more: bool,
 }
 
 /// One revision's replay (module documentation).
@@ -514,15 +533,12 @@ impl Replay {
         .pending
         .push_back(Owned::ChangeProperty(name, Some(value)));
     }
-    let mut entries = index
-      .children(&source.0, source.1)
-      .map_err(|_| DriveFailure::corrupt())?
-      .unwrap_or_default();
-    entries.sort();
     self.wholes.push(Whole {
       path: path.to_owned(),
       source,
-      entries: entries.into(),
+      entries: VecDeque::new(),
+      listed_after: None,
+      more: true,
     });
     Ok(())
   }
@@ -538,6 +554,9 @@ impl Replay {
     let Some(whole) = self.wholes.last_mut() else {
       return Ok(());
     };
+    if whole.entries.is_empty() && whole.more {
+      return read_whole_entries(index, whole);
+    }
     let Some(name) = whole.entries.pop_front() else {
       self.wholes.pop();
       if !self.wholes.is_empty() {
