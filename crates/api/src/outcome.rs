@@ -289,6 +289,7 @@ impl LandingState {
       Stage::Refused => Some(Self::Refused),
       Stage::Aborted => Some(Self::Aborted),
       Stage::Planning
+      | Stage::Superseded
       | Stage::AwaitingGrant
       | Stage::Validating
       | Stage::Writing

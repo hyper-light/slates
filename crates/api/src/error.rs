@@ -335,6 +335,12 @@ pub enum Stale {
   },
   /// An approval of another manifest than the one about to be written: present again.
   Approval,
+  /// An approval of a landing a newer presentation of the same volume into the same target superseded (A-779): an
+  /// older state never lands over a newer one. Read and grant the newer.
+  Superseded {
+    /// The newer presentation.
+    newer: u64,
+  },
   /// A grant missing, expired or revoked.
   Grant,
   /// The disk changed under these entries after the plan was made (§4.15 step 4): present again.
@@ -864,6 +870,7 @@ impl Error {
       Refusal::UnknownBase { green, version } => Error::Stale(Stale::Base { green, version }),
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
+      Refusal::LandingSuperseded { newer } => Error::Stale(Stale::Superseded { newer }),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
       Refusal::VerdictReplaced { work } => Error::Stale(Stale::Verdict { work }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
