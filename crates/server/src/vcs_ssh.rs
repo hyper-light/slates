@@ -62,16 +62,18 @@
 //! **The daemon's edge** ([`daemon_edge`], A-684): `--vcs-ssh ADDRESS` starts it, its listener on the control shard and
 //! an edge state kept on every shard, so a connection moves to its repository's owner; its listener and host key held
 //! by the anchor across daemon restarts (the fleet node's own key on a fleet node); and the daemon's log names its
-//! address and its host key's fingerprint.
+//! address and its host key's fingerprint. Its site serves git's receive-pack through the push driver on that owner
+//! shard, each step lent the shard's state (`receive`, A-683).
 //!
 //! **Owed** (GAPS, the §4.17 entry): Subversion's tunnel in the daemon's site (A-688's `SvnServices`), which awaits a
-//! lender of its stores over A-662's map, and is refused as not served until it lands; receive-pack's server half,
-//! refused so until it lands (A-620, A-683); Subversion's tunnel moved to the shard of the repository its greeting
-//! names; the live `git clone`, `hg clone` and `svn checkout svn+ssh://` over SSH (main's runs).
+//! lender of its stores over A-662's map, and is refused as not served until it lands; Subversion's tunnel moved to the
+//! shard of the repository its greeting names; the live `git clone`, `git push`, `hg clone` and `svn checkout
+//! svn+ssh://` over SSH (main's runs).
 
 mod daemon_edge;
 mod git;
 mod hg;
+mod receive;
 pub(crate) mod site;
 mod svn;
 mod waits;
