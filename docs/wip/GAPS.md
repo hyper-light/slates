@@ -59,7 +59,8 @@
 > creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
-> until it ends; a green's first submit's and one past a copy owed, with the owed commit main approved) and a whole
+> until it ends; a green's first submit's and one past a copy BUILT 2026-11-20 too, its commit owed durably,
+> `vcs_store::owed`, made at its build's end from what the submit staged) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;

@@ -1048,6 +1048,8 @@ mod tests {
     assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
     let message = format!("f, version {serial}");
     let submitted = ask(state, &owner(), crate::identities::authored(work, &message));
+    // A green's first submit builds its map in slices after it (A-664's live whole builds): driven to its end here.
+    crate::vcs_store::paths::whole_build::settle(state);
     let ReplyBody::Submitted {
       version: Some(version),
       ..
