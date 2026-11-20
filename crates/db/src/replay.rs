@@ -20,10 +20,9 @@ use crate::op::Op;
 use crate::partition::{Partition, PartitionCaps, PartitionSnapshot};
 use crate::record::{LogEntry, LogRing, Replayed};
 
-/// Shape: the recovery budget, RAMCloud's target of about a second for a crashed node
-/// [A: Ongaro et al., SOSP'11: 35 GB in 1.6 s]; an operator input in Phase 2's CLI, ratified
-/// here as the default (GAPS §5).
-pub const RECOVERY_BUDGET_NS: u64 = 1_000_000_000;
+/// The recovery budget: `slates_machine::budgets::RECOVERY_BUDGET_NS` (RAMCloud's target of about a second for a crashed
+/// node, ratified as the default, GAPS §5), held there so the daemon and the workspace's tools derive from one source.
+pub const RECOVERY_BUDGET_NS: u64 = slates_machine::budgets::RECOVERY_BUDGET_NS;
 /// Format: nanoseconds per microsecond.
 const NS_PER_US: u64 = 1_000;
 

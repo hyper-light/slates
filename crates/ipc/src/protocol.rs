@@ -4648,6 +4648,16 @@ pub enum Refusal {
     /// Why.
     case: CopyCase,
   },
+  /// A credential's enrollment or revocation reached fewer members of the region than it must (A-764: a principal and
+  /// its credentials are fleet state, §4.13): an enrollment is acknowledged once `f + 1` members hold it, a revocation
+  /// once every member has let it go. What was done stands where it reached; the same request again reaches the rest.
+  /// Appended.
+  CredentialUnreplicated {
+    /// The members that hold it as asked, this one among them.
+    held: u64,
+    /// The members it must reach.
+    needed: u64,
+  },
 }
 
 /// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the

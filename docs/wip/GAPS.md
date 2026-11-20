@@ -49,6 +49,12 @@
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
 >
+> **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
+> the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
+> standing grant; rows (`R N C V O D G`) in Mantle's `ShardDb`; everything else derived. Owed: the log format agreed
+> with w-hg, w-git, w-svn; Mantle's crates vendored; `slates-store`; the A/B against per-file deltas; each tool moved
+> onto it with an RSS red test.
+
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
@@ -234,7 +240,8 @@
 > (the 3,000-commit clone by use over HTTP and SSH); rule 4: a fetch holds the generation it began on (a shared fork at
 > the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects);
 > `begin`'s walks in turns (`ready`'s search, the cut, `include-tag`'s scan: `begin` reads what the request names, each
-> step a unit). Owed: protocol v0 in turns, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> step a unit); protocol v0's fetch in turns (its acknowledgments, each `ready`, the cut and the choice the answer's
+> steps). Owed: scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -1480,6 +1487,12 @@
 > sliced under the shard's budget (the store's owed item): a create of a protected name walks, and verifies, its whole
 > history at once. Found beside it: `deadlines::tests::a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request`
 > fails on main (8b3297fe0) on the Mac Studio, 3 of 3 alone.
+>
+> **A-764 (2026-11-20, w-fed-faults; credentials are fleet state):** a credential enrolled or revoked anywhere is sent
+> to every member of the region and held on each, acknowledged at `f + 1` (a revocation at every member), healed at each
+> configuration change, so a token proves its principal on a takeover's successor (w-balance's `v3_takeover`: 401 before,
+> authenticated after). Owed: a revocation's tombstone, for a member partitioned through a revocation and back with its
+> state.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads (A-545)
 > and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its objects and
@@ -7295,8 +7308,16 @@
 >   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
 >   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
->   own platforms), `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
->   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   own platforms), and `xtask`'s remaining `MOUNT_WAIT` uses (its tracers' bounds and the NFS attribute cache's
+>   `visible`, waits on other parties' work). Since 2026-11-20 a wait on the kernel's mount table, in the tests and in
+>   `xtask`'s mount, is `process_wait::await_mount_table`: woken by the kernel's own word (macOS `EVFILT_FS`, Linux
+>   `POLLPRI` on `/proc/self/mountinfo`), within the observation budget, never a poll (main's ruling). `xtask`'s conformance harness since 2026-11-20:
+>   its daemon's start and the live create judged by `process_wait::InstanceWait` (the suites' file, included by path:
+>   one judgment), an anchor's stop awaited on its log pipe's end (the kernel's word that every writer left) within
+>   the observation budget, the mount clients' deadlines the product's own; `START_WAIT` (60 s) gone. The observation
+>   budget's one source is `slates_machine::budgets` (`observe_budget_ns`, `liveness_budget_ns`, `RECOVERY_BUDGET_NS`),
+>   which the daemon's `OBSERVE_BUDGET_NS`/`LIVENESS_BUDGET_NS` and the db's `RECOVERY_BUDGET_NS` alias (R3; main's
+>   ruling). `kind`'s `SMOKE_START_WAIT` stays: it waits on `docker exec` into a container. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the

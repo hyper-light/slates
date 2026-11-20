@@ -40,6 +40,7 @@
 
 pub mod config_group;
 pub mod content;
+pub mod credentials;
 pub mod envelope;
 pub mod failover;
 pub mod fleet;
