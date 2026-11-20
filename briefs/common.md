@@ -73,3 +73,13 @@ push of its line to that branch succeeds:
 3. If the push is rejected, pull again (a conflict in the ledger means the number went to someone else), take the
    new next free number and push again.
 Never put a number in a commit for main that you haven't pushed to the ledger.
+
+## STUDIOS: OWN STATE FOLDER, AND HOW TO PUSH (main 2026-11-19 ~23:55 PST)
+- Keep the state branch in a folder of your own: ~/fanout-state-<your name>. Agents that shared ~/fanout-state on
+  one Studio deleted and re-cloned it under each other.
+- Pushing, checked 23:50 PST:
+  - adas-mac-studio-2.local and adas-mac-studio-3.local push to GitHub over SSH. Use
+    `git remote set-url --push origin git@github.com:hyper-light/<repo>.git`.
+  - adas-mac-studio.local-2 (the 32-core Studio) has no GitHub credentials (SSH publickey denied, no HTTPS
+    credential). Land from it through kiln `run` on adas-mac-studio-2.local, as w-fed-faults does: sync your worktree
+    there, then `git push origin HEAD:main` and check `git merge-base --is-ancestor`, retrying if the push is rejected.
