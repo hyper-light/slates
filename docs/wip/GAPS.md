@@ -748,9 +748,10 @@
 > (kiln r392 and r429: both in hg's crash report), then 10 of 10, 52 of 52 and 4 of 4 (r415, r429), fmt clean. g309's
 > stock git round trip with the token as Basic's password in the URL against a real anchor (`git_interop`), its one
 > wait this piece, un-ignored as main merged it in (red there: `fatal: Authentication failed`, g309's kiln r426).
-> g083's stock-hg round trip over the anchor's edge runs un-ignored since A-680 part 2b (the hg site's pushes). Owed:
-> stock `hg identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
-> found here, main's); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
+> g083's stock-hg round trip over the anchor's edge runs un-ignored since A-680 part 2b (the hg site's pushes). Stock
+> `hg identify` resolves through `lookup` since A-705 (`serve::lookup`, 7.2's `revsymbol` order, listed over HTTP and
+> SSH; held to stock 7.2's recorded answers; both round trips run `identify -r tip`; macOS arm64, this Mac, local).
+> Owed: tags beyond `tip` in `lookup` (no `.hgtags` reading yet); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
 > repository's `capabilities^{}` line, v1's `version 1`, peeled lines folded into their tags, the shallow lines), the

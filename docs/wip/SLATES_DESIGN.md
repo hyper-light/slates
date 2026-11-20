@@ -14407,6 +14407,8 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 **Pull and clone.**
 1. Discovery (`heads`, `known`, `branchmap`, `lookup`, `listkeys`, and the legacy `between` and `branches`) reads the
    index in RAM at one register position (§4.17.1 "Reads"): one consistent cut of every line, bookmark and phase.
+   Status (A-705): `lookup` served over both transports in 7.2's `revsymbol` order (`serve::lookup`); tags beyond `tip`
+   owed.
 2. `getbundle` with `common` and `heads`: the missing changesets are the ancestors of `heads` that are not ancestors of
    `common`, in the served view (no secret and no hidden changeset), walked over revision numbers as Mercurial's own
    outgoing computation walks them [C: `exchange._computeoutgoing`].
