@@ -1508,8 +1508,8 @@
 > **A-764 (2026-11-20, w-fed-faults; credentials are fleet state):** a credential enrolled or revoked anywhere is sent
 > to every member of the region and held on each, acknowledged at `f + 1` (a revocation at every member), healed at each
 > configuration change, so a token proves its principal on a takeover's successor (w-balance's `v3_takeover`: 401 before,
-> authenticated after). Owed: a revocation's tombstone, for a member partitioned through a revocation and back with its
-> state.
+> authenticated after). A revocation leaves a tombstone the healer offers too, so a member partitioned through it lets
+> its record go and no member's offer enrolls a revoked credential again.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads (A-545)
 > and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its objects and

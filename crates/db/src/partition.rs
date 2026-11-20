@@ -200,6 +200,8 @@ pub struct PartitionSnapshot {
   /// a repository's or a green's (A-636 part 2b-2; appended), so a recovery mints the family ids the live partition
   /// would.
   pub family_counter: u64,
+  /// The version-control credentials revoked here (A-764; appended), by id: each never enrolled again.
+  pub credential_tombstones: Vec<[u8; 32]>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -1687,7 +1689,9 @@ impl Partition {
       }
       // A version-control credential (A-625 part 3): `crate::credentials`; its bytes fit the table byte budget, and the
       // refusal names the table the human was adding to.
-      Op::CredentialEnrolled { .. } | Op::CredentialRevoked { .. } => {
+      Op::CredentialEnrolled { .. }
+      | Op::CredentialRevoked { .. }
+      | Op::CredentialTombstoned { .. } => {
         self.credentials.check(op)?;
         let (released, added) = self.credentials.charge(op);
         self
@@ -2279,7 +2283,9 @@ impl Partition {
           .saturating_add(added);
         Ok(())
       }
-      Op::CredentialEnrolled { .. } | Op::CredentialRevoked { .. } => {
+      Op::CredentialEnrolled { .. }
+      | Op::CredentialRevoked { .. }
+      | Op::CredentialTombstoned { .. } => {
         let (released, added) = self.credentials.charge(op);
         self.credentials.apply(op)?;
         self.green_chain_bytes = self
@@ -2981,6 +2987,7 @@ impl Partition {
       atomic_records: self.repositories.atomic_held(),
       identities: self.identities.values().cloned().collect(),
       credentials: self.credentials.records().cloned().collect(),
+      credential_tombstones: self.credentials.tombstones().copied().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -3255,7 +3262,10 @@ impl Partition {
     )?;
     p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.reviews.bytes());
     // The version-control credentials, charged to the table byte budget as when each was enrolled (A-625 part 3).
-    p.credentials = crate::credentials::Credentials::restore(&snapshot.credentials)?;
+    p.credentials = crate::credentials::Credentials::restore(
+      &snapshot.credentials,
+      &snapshot.credential_tombstones,
+    )?;
     p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.credentials.bytes());
     Ok(p)
   }

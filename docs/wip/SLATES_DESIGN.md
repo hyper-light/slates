@@ -9692,8 +9692,10 @@ server, not inferred from command names.
 > acknowledged once `f + 1` members hold it, a revocation only once every member has let it go (a member that kept it
 > would go on proving a revoked credential); short of that each is refused `CredentialUnreplicated` and asked again
 > reaches the rest. At each configuration change every member offers what it holds, so one that joined holds what the
-> region holds. Owed: a member partitioned through a revocation and back with its state keeps the record until the
-> revocation is asked again; a revocation's tombstone would close it (GAPS).
+> region holds. A revocation leaves a tombstone on every member that applies it (`CredentialTombstoned`, appended), which
+> the healer offers too, so a revoked credential is never enrolled again: not by a member that missed its revocation
+> and rejoins with the record (it lets the record go), and not by that member's offer of it (refused where the
+> tombstone is). Tombstones are charged to the credentials' table byte budget and carried in the partition's snapshot.
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -57195,10 +57197,19 @@ install, refresh and removals, `take_campaign_sessions`), `crates/server/src/for
   owner's token used throughout: before, both survivors answered 401; after, each survivor counts
   `credential.fleet.applied` and the successor authenticates the owner's token (`ls-remote` exit 0). The test's own
   verdict still fails on the refs a takeover loses, w-balance's half. macOS arm64, Mac Studio, local.
-- **Owed.** A member partitioned through a revocation that comes back with its state keeps the record until the
-  revocation is asked again: a revocation's tombstone, kept and offered as enrollments are, closes it. The healer
-  offers every credential at each configuration version, idempotent but repeated while a fleet forms (13 and 14 offers
-  in the test's run).
+- **Tombstones (the same day, w-fed-faults).** As first landed (51a061d), the healer would have brought a revoked
+  credential back: a member partitioned through a revocation rejoins holding the record and offers it, and every other
+  member, holding nothing under its id, enrolled it again. A revocation now leaves a tombstone (`Op::CredentialRevoked`
+  keeps the id; `Op::CredentialTombstoned`, appended, wire tag 103, keeps it for a revocation from elsewhere, held or
+  not); an enrollment of a tombstoned id is refused (`AlreadyExists` at the guard; answered not held to a member, counted
+  `credential.fleet.revoked_refused`), and the healer offers tombstones as revocations, so the rejoining member lets its
+  record go. A tombstone charges its id's 32 bytes to the table byte budget, so a revocation gives back a record's room
+  less that, and the snapshot carries them (`credential_tombstones`, appended). Red first:
+  `slates-db --lib a764_a_revoked_credential_is_never_enrolled_again` (a revoked id enrolled again); the model test
+  states the rule (`the_credentials_equal_the_rules_over_every_history`, a tombstone step drawn), and
+  `slates-server --lib a764_a_member_never_brings_back_a_credential_revoked_here`. The healer still offers every
+  credential and tombstone at each configuration version, idempotent but repeated while a fleet forms (13 and 14 offers
+  in the takeover test's run).
 
 
 ### A-767 — One unit, the changeset: changes in RAM, the repository's history an append-only changeset log on disk, everything else derived, metadata in Mantle's K/V engine (2026-11-20, w-store; Ada's storage ruling ~12:40 PST, her changeset ruling ~13:35 PST, her memory-sizing ruling ~12:15 PST; §4.17.1 "Objects", "Durability and residency"; R1, R10; CLAUDE.md §2 item 3; A-581, A-645, A-647, A-662, A-716, A-765)
