@@ -1315,7 +1315,7 @@ impl GitPush {
     loop {
       match sealing.turn(state, u64::MAX)? {
         SealTurn::More(more) => sealing = *more,
-        SealTurn::Sealed(sealed) => return Ok(sealed),
+        SealTurn::Sealed(sealed) => return Ok(*sealed),
       }
     }
   }
@@ -1386,8 +1386,8 @@ pub(crate) struct SealingPush {
 pub(crate) enum SealTurn {
   /// More turns remain (boxed: the push is most of its size).
   More(Box<SealingPush>),
-  /// Sealed and staged.
-  Sealed(SealedPush),
+  /// Sealed and staged (boxed too: a sealed push is hundreds of bytes).
+  Sealed(Box<SealedPush>),
 }
 
 impl SealingPush {
@@ -1412,13 +1412,13 @@ impl SealingPush {
     });
     match turned {
       Ok(false) => Ok(SealTurn::More(Box::new(self))),
-      Ok(true) => Ok(SealTurn::Sealed(SealedPush {
+      Ok(true) => Ok(SealTurn::Sealed(Box::new(SealedPush {
         repository,
         push: self.push.push,
         moves: Vec::new(),
         keyed: Vec::new(),
         objects: self.push.record,
-      })),
+      }))),
       Err(refused) => {
         self.abandon(state);
         Err(refused)

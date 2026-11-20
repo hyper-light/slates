@@ -502,6 +502,29 @@ impl<N: Copy + Ord + Into<u64>> Chosen<'_, N> {
     Ok(())
   }
 
+  /// Whether `tree`, met at `depth`, is opened now: never opened before (or, where depth counts, only deeper), marked
+  /// opened and charged if so.
+  fn opens(&mut self, tree: N, depth: u64, admission: &mut Admission) -> Result<bool, Refusal> {
+    let opened_before = match &self.opened {
+      Opened::Once(opened) => opened.contains(tree),
+      Opened::AtDepth(opened) => opened.get(&tree).is_some_and(|before| *before <= depth),
+    };
+    if opened_before {
+      return Ok(false);
+    }
+    match &mut self.opened {
+      Opened::Once(opened) => {
+        opened.insert(tree, admission)?;
+      }
+      Opened::AtDepth(opened) => {
+        if opened.insert(tree, depth).is_none() {
+          charge::<(N, u64)>(admission)?;
+        }
+      }
+    }
+    Ok(true)
+  }
+
   /// Opens `tree`, its entries met at `depth`, and every tree below it, without recursion.
   fn open<S: Graph<Node = N>>(
     &mut self,
@@ -516,22 +539,8 @@ impl<N: Copy + Ord + Into<u64>> Chosen<'_, N> {
       if !self.filter.is_none_or(|filter| filter.reaches(depth)) {
         continue;
       }
-      let opened_before = match &self.opened {
-        Opened::Once(opened) => opened.contains(tree),
-        Opened::AtDepth(opened) => opened.get(&tree).is_some_and(|before| *before <= depth),
-      };
-      if opened_before {
+      if !self.opens(tree, depth, admission)? {
         continue;
-      }
-      match &mut self.opened {
-        Opened::Once(opened) => {
-          opened.insert(tree, admission)?;
-        }
-        Opened::AtDepth(opened) => {
-          if opened.insert(tree, depth).is_none() {
-            charge::<(N, u64)>(admission)?;
-          }
-        }
       }
       counters.trees = counters.trees.saturating_add(1);
       for entry in graph

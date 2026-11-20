@@ -595,10 +595,7 @@ impl<S: HgStores> HgExchange<S> {
   /// room after others ends the turn, and is taken again by the next within a room of its own. Whether more follow.
   fn turn(&mut self, streamed: &mut hg_http::Streamed, out: &mut Vec<u8>) -> Result<bool, Failed> {
     let id = self.repository.id;
-    let (room, quantum) = self
-      .stores
-      .fetch_turn(id)
-      .map_or((self.request_room, 0), |(room, quantum)| (room, quantum));
+    let (room, quantum) = self.stores.fetch_turn(id).unwrap_or((self.request_room, 0));
     let mut admission = Admission::new(room);
     let start = slates_rt::futures::now_ns();
     let turned = self.stores.lend(id, &mut admission, |store, room| {
