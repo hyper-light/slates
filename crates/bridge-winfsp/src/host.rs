@@ -2281,9 +2281,8 @@ fn finish_open(
   unsafe {
     *p_context = std::ptr::without_provenance_mut(context);
     put_info(p_info, info);
-    if let Some(units) = normalized {
-      put_normalized_name(p_info.cast::<ffi::OpenFileInfo>(), units);
-    }
+    // RED (diag only): no normalized name answered, as before A-551.
+    let _ = normalized;
   }
   STATUS_SUCCESS.as_i32()
 }
