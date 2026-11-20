@@ -22,6 +22,9 @@ jobs:
       matrix:
         include:
           - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
     name: probe on ${{ matrix.runner }}
     if: startsWith(github.ref_name, 'diag-w-bugs-b3')
     runs-on: ${{ matrix.runner }}
@@ -36,8 +39,19 @@ jobs:
           toolchain: 1.98.1
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install NASM
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
         uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Publisher
         shell: bash
         run: |
@@ -77,26 +91,24 @@ jobs:
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-      - name: An anchor as xtask starts one, and what `volume list` answers it
+      - name: The relief receiver's tests, the recovery oracles and Win32 semantics, as main's lane runs them
         shell: bash
         continue-on-error: true
-        timeout-minutes: 20
+        timeout-minutes: 60
+        env:
+          WINFSP_TEST_MOUNT: "1"
+          SLATES_TEST_CLI: "1"
         run: |
           set +e
           out="$RUNNER_TEMP/out"
-          cargo build --locked -p slates-cli --bin slates > "$out/build.txt" 2>&1
-          echo "build exit $?" >> "$out/status.txt"
-          mkdir -p "$RUNNER_TEMP/probe" && cd "$RUNNER_TEMP/probe"
-          bin="$GITHUB_WORKSPACE/target/debug/slates.exe"
-          "$bin" --instance w-bugs-probe anchor --quick --shards 2 < /dev/null > /dev/null 2> "$out/anchor.txt" &
-          for n in $(seq 1 20); do
-            sleep 3
-            "$bin" --instance w-bugs-probe volume list > "$RUNNER_TEMP/o.txt" 2> "$RUNNER_TEMP/e.txt"
-            code=$?
-            { echo "== try $n at $(date -u +%T): exit $code"; echo "-- stdout"; cat "$RUNNER_TEMP/o.txt"; echo "-- stderr"; cat "$RUNNER_TEMP/e.txt"; } >> "$out/volume-list.txt"
-          done
-          "$bin" --instance w-bugs-probe status >> "$out/volume-list.txt" 2>&1; echo "status exit $?" >> "$out/volume-list.txt"
-          kill %1; sleep 2
+          cargo test -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture > "$out/bridge-lib.txt" 2>&1
+          echo "bridge-winfsp lib exit $?" >> "$out/status.txt"
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture > "$out/semantics.txt" 2>&1
+          echo "winfsp_semantics exit $?" >> "$out/status.txt"
+          "$RUNNER_TEMP/publish.sh"
+          cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture > "$out/cli-winfsp.txt" 2>&1
+          echo "cli winfsp exit $?" >> "$out/status.txt"
           "$RUNNER_TEMP/publish.sh"
       - name: fsx over the WinFsp drive, as main's lane runs it
         shell: bash
