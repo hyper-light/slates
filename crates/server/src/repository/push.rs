@@ -1031,7 +1031,9 @@ fn entry(
 }
 
 /// The entry judged whole by the register's guard, the new greens counted held, before anything is applied; a chain
-/// past the merge budget is checkpointed at each green's floor first and judged again (A-238, as a submit's admission).
+/// past the merge budget is checkpointed at each green's floor first and judged again (A-238, as a submit's admission):
+/// each green the entry updates, and every other member of its repository (A-753: an entry that only makes branches
+/// updates none, and the room its new greens need is held by the chains of the repository's other branches).
 fn admit(
   state: &mut ShardState,
   made: &[VolumeRecord],
@@ -1043,14 +1045,24 @@ fn admit(
     table: "green_chains",
   }) = first
   {
-    for step in steps {
-      if let Step::Update { green, .. } = step {
-        crate::merge_service::checkpoint_green_when(
-          state,
-          *green,
-          crate::merge_service::Doubling::Now,
-        );
-      }
+    let members: Vec<DbVolumeId> = state
+      .db
+      .partition()
+      .repositories()
+      .members_of(entry.repository)
+      .map(|member| member.green)
+      .collect();
+    let updated = steps.iter().filter_map(|step| match step {
+      Step::Update { green, .. } => Some(*green),
+      _ => None,
+    });
+    let folded: std::collections::BTreeSet<DbVolumeId> = updated.chain(members).collect();
+    for green in folded {
+      crate::merge_service::checkpoint_green_when(
+        state,
+        green,
+        crate::merge_service::Doubling::Now,
+      );
     }
   } else {
     return first.map_err(|error| AppendRefused::Entry(refusal_of_db(&error)));

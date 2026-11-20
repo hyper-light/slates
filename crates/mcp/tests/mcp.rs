@@ -1436,7 +1436,8 @@ fn start_http_edge(profile: &MachineProfile, instance: &str) -> u16 {
       port,
       bearer: TEST_BEARER,
       tick_ns: config.runtime.timer_tick_ns,
-      keep_alive_ns: slates_mcp::http::listen_keep_alive_ns(reply_deadline_ns()),
+      // The heartbeat over the liveness budget, as the CLI's edge beats (its `listen_keep_alive_ns`).
+      keep_alive_ns: slates_server::daemon::HEARTBEAT_NS,
       connections: config.clients_per_shard,
     };
     port_tx.send(port).unwrap();

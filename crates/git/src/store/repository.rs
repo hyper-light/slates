@@ -520,6 +520,13 @@ impl Repository {
     self.indexed(store, id).map(|(row, _)| row)
   }
 
+  /// The type, root content and length of the object `id` the index holds: where its bytes are read from (A-753: a
+  /// pack resending an object the repository holds is read back from the index, its quarantine holding none).
+  pub fn stored(&self, store: &ContentStore, id: &ObjectId) -> Option<(Kind, ContentId, u64)> {
+    let (row, content) = self.indexed(store, id)?;
+    Some((row.kind, content, row.len))
+  }
+
   /// The id of the object at `position`.
   pub fn id_at(&self, store: &ContentStore, position: u64) -> Option<ObjectId> {
     let found = self.index.get(store, &rows::position_key(position))?;

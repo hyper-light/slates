@@ -84,6 +84,9 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
+> resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.
+>
 > **A-722 part 4c (2026-11-20, w-git).** BUILT: a move's admission a unit at a time before its append
 > (`Admitting`, `Judge::ready`, `SealedPush::admission_turn`). Owed: the store commit's whole passes and a stale restage
 > sliced; the work build and the entry's apply (works, merge).
@@ -2493,8 +2496,10 @@
 > before its banner (sw48 run 16, rp3 run 3; the fleet had formed and settled each time). The live_chaos start wait now
 > judges the start in its processes' own CPU, as the anchor judges its daemon (A-228): waited while they live and gain
 > CPU, up to 30 s of it, given up after 10 s with none or once they are gone (`wait_answers`, `start_verdict`).
-> Still a fixed wall bound under load: the flow's `FLEET_WAIT` (40 s), which a takeover's register adoption missed at
-> load 31 (probe run pr3 run 3).
+> The flow's fleet waits (`FLEET_WAIT`, 40 s) were a fixed wall bound too, which a takeover's register adoption missed
+> at load 7 to 31 under `taskpolicy -b` (probe runs pr3 run 3, pr4 run 2); since 2026-11-20 each is the window divided by
+> the share of a CPU the test process measures it is given at the window's end (`FleetWait`, `cpu_share`): the window
+> uncontended, about twice it at load 31. A wait whose end is only noted (`copies_kept`) keeps the plain window.
 
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
@@ -7052,10 +7057,15 @@
 >   edge's own reads (RFC 6298 over each bearer holder's acceptance-to-bearer time, `G` the shard's tick or scheduler
 >   lateness, RFC 9002's initial probe timeout as the prior keeping the share `1/(n+1)` after `n` arrivals), and is cut
 >   off unanswered there; a connection that has shown the bearer waits while it lives
->   (`a_sender_that_never_shows_the_bearer_is_cut_off_at_the_learned_bound_and_a_token_holder_is_waited_for`). Owed: a
->   listen stream's keep-alive period still comes from the reply deadline (half of it,
->   `slates_mcp::http::listen_keep_alive_ns`); an honest client cut off before its bearer arrived looks like any other
->   sender and teaches the bound nothing. The
+>   (`a_sender_that_never_shows_the_bearer_is_cut_off_at_the_learned_bound_and_a_token_holder_is_waited_for`). A listen
+>   stream's keep-alive period since 2026-11-20 (g226, goal 88's last part; main's ruling): it was half the reply
+>   deadline, a fixed 500 ms; it now beats by the heartbeat's rule over the liveness budget (the CLI's
+>   `listen_keep_alive_ns` over `slates_server::daemon::heartbeat_of`, `W / ELECTION_MARGIN`, the anchor's beat's rule),
+>   so a beat lands inside each liveness window and follows the budget
+>   (`the_mcp_listens_keep_alive_beats_by_the_heartbeats_rule_over_the_liveness_budget`; red before: 500,000,000 ns
+>   against the heartbeat's 100,000,000). Not learned from the stream's ends, since a client's close cannot tell an idle
+>   timeout from a cancellation. Owed: an honest client cut off before its bearer arrived looks like any other sender
+>   and teaches the bound nothing. The
 >   macOS route's claim steps since A-523 (2026-11-18, g251b): each socket step waited the caller's reply deadline at a
 >   time and asked the daemon's liveness when it ran out; it now waits while the route's connection lives, as the
 >   daemon's side waits on the client's since A-492, a daemon gone closing its end
