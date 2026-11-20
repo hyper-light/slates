@@ -127,3 +127,5 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 
 ## STATUS 2026-11-20: nothing waits on main. Waiting: r24 (live W9 on adacachy, load 74), r33 (Windows cargo check,
    queued for jupiter). Blocked on a PERSON only: W9 Windows measurement (WinFsp, console-session runner, Docker Desktop).
+
+## 2026-11-20: Windows `cargo check -p kiln --bins --tests` at 2b5a3d559 PASSED on jupiter (r33). r24 failed on adacachy /tmp full (my TMPDIR mistake) -> r36 queued with TMPDIR under ~/.cache.
