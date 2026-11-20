@@ -1,3 +1,4 @@
 started 2026-11-20T08:52:35Z at 94ac658a058e74c0d369943cb17a71d2b0d66f68
 bridge-winfsp lib exit 101
 winfsp_semantics exit 0
+cli winfsp exit 0
