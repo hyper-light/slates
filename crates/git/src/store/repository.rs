@@ -1173,12 +1173,25 @@ impl Repository {
   /// tail it replaces; and the fork staging makes.
   pub fn stage_room(&self, push: &Push) -> u64 {
     let raw = self.format.raw_len();
-    let object_row = 1 + raw + rows::OBJECT_PAYLOAD_BYTES + slates_vcs::TAIL_SLOT_BYTES;
-    let position_row = 1 + size_of::<u64>() + raw + slates_vcs::TAIL_SLOT_BYTES;
-    let objects = bytes(push.len(), (object_row + position_row) * 2);
+    let object_row = raw
+      .saturating_add(1)
+      .saturating_add(rows::OBJECT_PAYLOAD_BYTES)
+      .saturating_add(slates_vcs::TAIL_SLOT_BYTES);
+    let position_row = raw
+      .saturating_add(1)
+      .saturating_add(size_of::<u64>())
+      .saturating_add(slates_vcs::TAIL_SLOT_BYTES);
+    let objects = bytes(
+      push.len(),
+      object_row.saturating_add(position_row).saturating_mul(2),
+    );
     let commits = push.commits().values().fold(0_u64, |total, arrived| {
-      let part = rows::COMMIT_PART_BYTES + arrived.parents.len() * size_of::<u64>();
-      total.saturating_add(bytes(1, part * 2))
+      let part = arrived
+        .parents
+        .len()
+        .saturating_mul(size_of::<u64>())
+        .saturating_add(rows::COMMIT_PART_BYTES);
+      total.saturating_add(bytes(1, part.saturating_mul(2)))
     });
     objects
       .saturating_add(commits)
