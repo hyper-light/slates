@@ -1,0 +1,4 @@
+== after svn
+diag-svnfetch svn:// conversation: turns 5, bytes 131, most a turn 69, room 270336, quantum_ns 6179, long_steps +2, longest_step_ns 656643550
+== after http
+diag-svnfetch svn:// conversation: turns 5, bytes 131, most a turn 69, room 270336, quantum_ns 6179, long_steps +2, longest_step_ns 656643550

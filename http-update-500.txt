@@ -1,0 +1,2 @@
+Skipped '/home/runner/work/_temp/wc-http'
+svn: E155007: None of the targets are working copies
