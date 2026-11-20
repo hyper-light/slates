@@ -111,3 +111,6 @@
   (piece 2a42df233, merge d7713a435). Local hg lib 354/354, server 137/137, cli stock_hg 4/4.
 - NEXT: (1) slice vcs_store::rebuild's replay (post-recovery spin per w-interop rerun); (2) S5 part 2 (SHGR v2:
   names + changegroup deltas; replay re-intakes).
+- A-732 part 3 (sliced Mercurial rebuild: VcsStores::rebuilding, replay_sliced task; rebuild_whole for git/svn/tests)
+  LANDED main (piece 4fa835b3f, merge 0f756ec77). Local server 140/140.
+- NOW: S5 part 2 (A-729): SHGR v2 = names + changegroup deltas; replay re-takes it through the intake.
