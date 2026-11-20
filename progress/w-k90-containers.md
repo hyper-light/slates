@@ -76,3 +76,10 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - ui/node_modules installed in ~/kiln-work/w-k90-containers-kiln/ui (npm ci) for UI checks.
 ## K8s builders d5d613ef6: push r8 still running on b24c (slow first sync of the k8s worktree path).
 ## NEXT: W10 engine scoping (export call over the link, PV/claim/pod creation, RBAC), W9 sign-in in container.
+
+## LANDED 2026-11-20: K8s builders kiln main 948ca0a57 (d5d613ef6); W9 .nfs.* silly-rename exclusion 3046fed87.
+- r8 (worktree sync) hung >1h: git worktrees sync badly via kiln run -> land everything from ONE clone
+  (~/kiln-work/w-k90-containers-kiln); k8s worktree + its target removed.
+- Reported not built: Docker Desktop share check (settings key unverified; no Desktop on this Studio).
+## NEXT: W10 home holder: workspace::Ask::{Hold, Release} (no proto change), workspace/held.rs map keyed by pod
+   session id, slates::export wrapper (Instance::export), loops::workspace falls back to held map; then server side.
