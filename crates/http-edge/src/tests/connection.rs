@@ -2,8 +2,7 @@ use std::io::{Read as _, Write as _};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls::ClientConnection;
 use slates_http::head::Head;
 use slates_http::reply::Status;
 
@@ -46,7 +45,7 @@ fn drive(connection: &mut Connection, pieces: &[&[u8]], script: &Script<'_>) -> 
   let mut pieces = pieces.iter();
   let (mut body, mut replies) = (Vec::new(), script.reply.iter());
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => seen.written.extend(connection.take_output()),
       Next::Read => match pieces.next() {
         Some(piece) => connection.receive(piece),
@@ -459,7 +458,7 @@ fn fail_after(runs: usize, status: Status) -> (Vec<u8>, Option<Ended>) {
   let mut written = Vec::new();
   let mut sent = 0;
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Decide => connection.decide(serve(&connection.head().unwrap())),
       Next::Reply if sent == runs => connection.fail(status),
@@ -491,7 +490,7 @@ fn a_failing_service_is_refused_before_its_reply_and_aborted_after() {
 
 /// What `connection` needs next, as its debug text, and its phase once it has said so.
 fn step(connection: &mut Connection) -> (String, Phase) {
-  let next = format!("{:?}", connection.next());
+  let next = format!("{:?}", connection.next_step());
   (next, connection.phase())
 }
 
@@ -532,27 +531,12 @@ fn the_phase_follows_the_exchange() {
   assert_eq!(seen, expected);
 }
 
-/// A self-signed identity for `localhost`, and a client trusting it offering `http/1.1`.
+/// A self-signed identity for `localhost`, and a client trusting it offering `http/1.1` (the TLS tests' own, whose
+/// module holds rustls's `Arc` under D-8 exception 2).
 fn tls_pair() -> (ServingIdentity, ClientConnection) {
-  let key = rcgen::KeyPair::generate().unwrap();
-  let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-    .unwrap()
-    .self_signed(&key)
-    .unwrap();
-  let private = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-  let identity = ServingIdentity::new(vec![cert.der().clone()], private).unwrap();
-  let mut roots = RootCertStore::empty();
-  roots.add(cert.der().clone()).unwrap();
-  let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-  let mut config = ClientConfig::builder_with_provider(provider)
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-  config.alpn_protocols = vec![ALPN_HTTP_1_1.to_vec()];
-  let name = ServerName::try_from("localhost").unwrap();
-  let client = ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
-  (identity, client)
+  let (identity, cert) = crate::tls::tests::identity();
+  let peer = crate::tls::tests::client(&cert, &[ALPN_HTTP_1_1], rustls::DEFAULT_VERSIONS);
+  (identity, peer.connection)
 }
 
 /// Drives `connection` against `client` until the client has read a reply's last chunk: the client's request is
@@ -566,7 +550,7 @@ fn drive_tls(
   client.writer().write_all(request).unwrap();
   let (mut read, mut seen_credential, mut replies) = (Vec::new(), None, RUNS.iter());
   while !read.ends_with(b"0\r\n\r\n") {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => {
         let output = connection.take_output();
         let mut rest = output.as_slice();
@@ -634,7 +618,7 @@ fn served_with_late_fields(late: Fields, after_first: bool) -> String {
   let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
   let mut late = Some(late);
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {
@@ -723,7 +707,7 @@ fn served_after_body((mode, named, after_first): Naming) -> String {
   let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
   let mut named = named;
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {
@@ -811,7 +795,7 @@ fn served_with_status(status: Status, after_first: bool) -> String {
   let (mut written, mut fed, mut runs) = (Vec::new(), false, 0);
   let mut status = Some(status);
   loop {
-    match connection.next() {
+    match connection.next_step() {
       Next::Write => written.extend(connection.take_output()),
       Next::Read if fed => connection.peer_closed(),
       Next::Read => {

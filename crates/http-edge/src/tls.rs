@@ -210,4 +210,4 @@ impl HttpsSession {
 
 #[cfg(test)]
 #[path = "tests/tls.rs"]
-mod tests;
+pub(crate) mod tests;
