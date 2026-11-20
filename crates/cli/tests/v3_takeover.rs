@@ -379,24 +379,9 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   let owner = (bootstrap + 1) % nodes.len();
   run_ready(&nodes[owner], &["repository", "create", REPOSITORY, "--tool", "git"]);
   eprintln!("V3TAKEOVER: repository created on node {owner}");
-  // Every principal may read and push its refs: an account is its host's alone (A-237), and a credential minted on the
-  // owner is not known to a survivor once the owner is gone, so a client asks the successor with a survivor's own token.
-  // Granted before the owner dies, as a volume is shared with the other nodes before (`live_fleet`'s `share_with_nodes`).
-  {
-    use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
-    let mut client = slates_client::Client::connect(&nodes[owner].instance, slates_api::deadlines()).unwrap();
-    let mut policy = client.describe_repository_policy(REPOSITORY).unwrap();
-    for right in [PolicyRight::Read, PolicyRight::Submit] {
-      policy.rules.push(PolicyRule {
-        names: PolicyNames::Refs,
-        pattern: "refs/".to_owned(),
-        right,
-        effect: PolicyEffect::Allow,
-        who: PolicyWho::Anyone,
-      });
-    }
-    client.set_repository_policy(REPOSITORY, &policy).unwrap();
-  }
+  // The client's credential is minted on the owner and used for every request before and after the takeover: a
+  // principal and its credentials are fleet state (§4.13, A-764), so the successor knows the owner's token and the
+  // account it proves, the repository's owner, with no grant to every principal.
   let token = value_of(&run_ready(&nodes[owner], &["credential", "token"]), "token").expect("a token");
   // A fleet node's edge presents the node's own certificate (self-signed here): git is told not to verify it.
   let url = |node: &Node| format!("https://127.0.0.1:{}/{REPOSITORY}", node.port);
@@ -423,11 +408,10 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   // The successor: the survivor whose edge answers `main` for the repository.
   let deadline = Instant::now() + FLEET_WAIT * 3;
   let (successor, head) = loop {
-    // A survivor's own credential (the owner's is gone with it), the repository's policy letting every principal in.
+    // The owner's own credential, which the successor knows (fleet state, §4.13, A-764).
     let found = survivors.iter().find_map(|at| {
       let node = &nodes[*at];
-      let token = value_of(&slates(&node.instance, &node.issuer, &["credential", "token"]).1, "token")?;
-      remote_main(&work, &token, &url(node)).map(|head| (*at, head, token))
+      remote_main(&work, &token, &url(node)).map(|head| (*at, head, token.clone()))
     });
     if let Some((at, head, token)) = found {
       break ((at, token), head);
@@ -438,12 +422,11 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
         .iter()
         .map(|at| {
           let node = &nodes[*at];
-          let own = value_of(&slates(&node.instance, &node.issuer, &["credential", "token"]).1, "token").unwrap_or_default();
-          let (code, out, err) = git(&work, &own, &["ls-remote", &url(node)]);
+          let (code, out, err) = git(&work, &token, &["ls-remote", &url(node)]);
           let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
           let counted: Vec<&str> = status
             .lines()
-            .filter(|line| line.contains("takeover") || line.contains("vcs_store") || line.contains("repositor"))
+            .filter(|line| line.contains("takeover") || line.contains("vcs_store") || line.contains("repositor") || line.contains("credential"))
             .collect();
           format!("node {at}: ls-remote {code} {}{}; counted {counted:?}", out.trim(), err.trim())
         })
