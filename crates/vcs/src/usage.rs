@@ -246,14 +246,21 @@ mod tests {
     if intake { Work::Intake } else { Work::Fetch }
   }
 
+  /// Any event, each kind alike. The union is built as `prop_oneof!` builds one of more than ten arms, from boxed
+  /// strategies: its shorter forms hold their arms in `Arc`s (R2).
   fn event() -> impl Strategy<Value = Event> {
-    prop_oneof![
-      (0u8..6, 0u8..24, any::<bool>()).prop_map(|(r, p, w)| Event::Begun(r, p, w)),
+    proptest::strategy::Union::new([
+      (0u8..6, 0u8..24, any::<bool>())
+        .prop_map(|(r, p, w)| Event::Begun(r, p, w))
+        .boxed(),
       (0u8..6, any::<bool>(), any::<u32>(), any::<u32>())
-        .prop_map(|(r, w, n, b)| Event::Stepped(r, w, n, b)),
-      (0u8..6, any::<bool>()).prop_map(|(r, w)| Event::Answered(r, w)),
-      (0u8..6).prop_map(Event::Forget),
-    ]
+        .prop_map(|(r, w, n, b)| Event::Stepped(r, w, n, b))
+        .boxed(),
+      (0u8..6, any::<bool>())
+        .prop_map(|(r, w)| Event::Answered(r, w))
+        .boxed(),
+      (0u8..6).prop_map(Event::Forget).boxed(),
+    ])
   }
 
   /// The serial model: exact counts of everything, every principal counted.
