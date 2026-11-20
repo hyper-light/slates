@@ -54793,6 +54793,25 @@ Applied in the same change to:
   a join moving only the newcomer in and a departure only the leaver out; the healer adding before it removes; no owner
   event an input). Owed: the transport (a window shipped to a remote home's shard by identity, held there outside
   `ContentHold`), the healer's loop over held identities, and the successor's rebuild fetching from homes (w-shared).
+- **Piece 6's region half, its wire (2026-11-20, main's ruling: built as proposed).** `slates_cluster::homes`: the home
+  exchanges' own messages on their own stream (`HOME_STREAM`, 30), never `ContentHold`: `Put` (an identity and its
+  window), `Read`, `LetGo`, and the member's `Answer` (kept with the image generation it is durable from, its bytes, let
+  go, or refused by kind: not a home, misnamed, not held, no room, unanswered). The door's rule, `admits`: a member keeps
+  a window only if the configuration it knows ranks it among the window's homes and the bytes hash to the identity they
+  came under. A window's bytes are capped at the archive format's chunk cap before they are copied. Tests:
+  `homes::tests` (300 generated messages round-trip; every cut refused; flips never panic; exactly a window's two homes
+  of nine keep it, others refused `NotAHome`; other bytes under its name `Misnamed`; hostile lengths and kinds). Owed
+  (6c-2): the daemon serving the stream (the home shard's `keep_here`, the answer after its image is published), the
+  sender's batched calls and the healer's loop at each configuration change.
+- **Piece 6's region half, served (2026-11-20).** The record session dispatches `slates_cluster::homes::HOME_STREAM` to
+  `crate::vcs_store::homes::serve_remote`: a put kept only where the configuration this node knows (`fleet.members()`,
+  its quorum's f) ranks it among the window's homes and the bytes hash to their name, on the node's own home shard for
+  the window, and answered `Kept` only once that shard's image holding it is published (`published`, A-727's barrier);
+  reads and let-goes by identity. Until A-727 a3 calls the barrier's hooks no image holds the content store, so a put
+  from the region answers `Unanswered`, never a `Kept` the image could not back; a put so answered may have kept the
+  window, which the sender's let-go or the healer releases. Test: `vcs_store::homes::tests::a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_its_image_is_published`
+  (the barrier played by hand: no `Kept` before publication, `Kept` after, read back, let go, gone, misnamed refused).
+  Owed: the sender (batched puts to the homes `homes()` names) and the healer's loop at each configuration change.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55411,3 +55430,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   t_a664_live_a_parked_submit_waits_at_most_its_bound` (parked once; none answered within an unbounded wait; answered
   overdue past a bound of none; the build's end runs nothing of it). `cargo test --locked -p slates-server --lib --
   vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities:: --test-threads=4` 153 of 153; fmt clean.
+
+### A-740 — A stuck shard's report names the task it was polling (2026-11-20, w-reaper, main's urgent piece; §4.3 tasks, §4.14 `daemon.alive`; A-228, A-232, A-318)
+
+- **Why.** The watchdog's spin line ("shard N is spinning: X ms of CPU without a step") and the anchor's kill line named
+  the shard alone, and three agents were guessing which task spun (hg's whole push at 194 s, svnrdump's replay-range, a
+  forming run's 5.7 s).
+- **Change.** `slates_rt::label`: every task carries a label, interned once into a process-wide table of write-once
+  cells (open addressing over FNV-1a; 4,096 cells; a full table reads "unlabelled", never refuses a spawn). A label is
+  the spawn site, taken by `#[track_caller]` at every spawn entry (`futures::spawn`, `spawn_child`, `spawn_alone`,
+  `SpawnRequest::new`/`with_receipt`, `Runtime::spawn_on`/`spawn_on_with_receipt`/`spawn`, `ShardContext::spawn_local`/
+  `spawn_alone`, the simulator's), so no site goes unlabelled; or the work a task names while it runs
+  (`futures::doing("hg_push::record")`, a guard that gives the old label back, only to the task it took it from). The
+  shard stores the label's index and the task's poll count in one pulse word before each poll (`Pulse::polling`), on the
+  line it already writes each step. The watchdog's wedged, spinning and end lines name it; before it withholds the beat it
+  records it in the anchor's segment (`SUP_STUCK_WRITTEN`…`SUP_STUCK_LABEL`, the writer's pid released last), and the
+  anchor's lapse kill line names it ("its watchdog found shard N stuck in task L, at its poll P"). Named steps now: hg
+  push's unbundle, record, rebase and take; svn's call answer and landing.
+- **Tests.** rt `label::tests` (an index kept, a word given back) and `tests/spin_label.rs` (read from another thread, a
+  spinning task's site label at its third poll, then its named step, then the site again); anchor
+  `a_recorded_stuck_task_is_read_by_the_anchor` (a long label cut at a character boundary); server liveness
+  `a_spinning_shard_stops_the_beat` now names its spin `liveness::spinner` and requires the segment's record to give
+  back that label, the shard and the pid. Red first: with the record not written the test fails ("the watchdog recorded
+  no stuck task"); green, the line reads "shard 1 is spinning: 3198 ms of CPU … in task liveness::spinner, at its
+  poll 1" (macOS arm64, Mac Studio 2).
+- **Applied in the same change to** the watchdog's module docs, amendments.tsv.
