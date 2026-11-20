@@ -74,7 +74,7 @@ impl Exchange for NoExchange {
     match *self {}
   }
 
-  async fn reply(&mut self, _out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, _out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
     match *self {}
   }
 }
@@ -207,7 +207,7 @@ impl Exchange for Scripted {
     Ok(())
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
     match self.reply.take() {
       Some(reply) => {
         out.extend(reply);
@@ -324,7 +324,7 @@ fn replies<E: Exchange>(exchange: &mut E) -> Vec<Vec<u8>> {
   let mut runs = Vec::new();
   loop {
     let mut run = Vec::new();
-    let more = ready(exchange.reply(&mut run)).unwrap();
+    let more = ready(exchange.reply(&mut run, ClientGone::never())).unwrap();
     if !run.is_empty() {
       runs.push(run);
     }

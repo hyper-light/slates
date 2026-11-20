@@ -720,7 +720,7 @@ fn exchanged(
   let status = exchange.reply_status().code;
   let fields = ready(exchange.reply_fields()).unwrap();
   let (mut reply, mut runs) = (Vec::new(), 1);
-  while ready(exchange.reply(&mut reply)).unwrap() {
+  while ready(exchange.reply(&mut reply, crate::vcs_http::ClientGone::never())).unwrap() {
     runs += 1;
   }
   (status, fields, reply, runs)

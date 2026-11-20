@@ -248,12 +248,16 @@ pub(crate) async fn land_work(
       }
     }
   }
-  let (origin, ticket) =
-    crate::state::with_state(|state| (state.shard, crate::vcs_store::content_ticket(state)))?;
-  let budget_ns = crate::fleet::live_budget().max_deadline_ns();
-  if let Err(refused) = crate::vcs_store::content_durable(origin, ticket, budget_ns).await {
-    let _ = crate::state::with_state(|state| release_stored(state, storing));
-    return Some(Err(Uncommitted::NotDurable(refused)));
+  // Only a landing that put texts has content to make durable: the texts the records already held were made durable
+  // by the landing that put them, and a work of directories and properties alone names no content.
+  if !storing.put.is_empty() {
+    let (origin, ticket) =
+      crate::state::with_state(|state| (state.shard, crate::vcs_store::content_ticket(state)))?;
+    let budget_ns = crate::fleet::live_budget().max_deadline_ns();
+    if let Err(refused) = crate::vcs_store::content_durable(origin, ticket, budget_ns).await {
+      let _ = crate::state::with_state(|state| release_stored(state, storing));
+      return Some(Err(Uncommitted::NotDurable(refused)));
+    }
   }
   crate::state::with_state(|state| {
     let twice = held_twice(state, repository, &storing);

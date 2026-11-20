@@ -1038,3 +1038,243 @@ fn stock_hg_lists_and_moves_keys_over_the_ssh_edge() {
     &config,
   );
 }
+
+/// Runs `hg -R r serve --stdio` over the SSH edge at loopback `port` with stock OpenSSH (`key` alone, trusting the host
+/// keys in `known_hosts`, as [`ssh_command`]), `input` on its standard input, in `dir`: its exit code and both outputs.
+fn ssh_fed(
+  dir: &str,
+  (key, known_hosts, port): (&str, &str, u16),
+  input: &str,
+) -> (i32, String, String) {
+  let known = format!("UserKnownHostsFile={known_hosts}");
+  let mut child = Command::new("ssh")
+    .args([
+      "-F",
+      "/dev/null",
+      "-i",
+      key,
+      "-o",
+      "IdentitiesOnly=yes",
+      "-o",
+      "BatchMode=yes",
+    ])
+    .args([
+      "-o",
+      "StrictHostKeyChecking=yes",
+      "-o",
+      &known,
+      "-o",
+      "GlobalKnownHostsFile=/dev/null",
+    ])
+    .args([
+      "-p",
+      &port.to_string(),
+      &format!("{HG_USER}@127.0.0.1"),
+      "hg -R r serve --stdio",
+    ])
+    .current_dir(dir)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(input.as_bytes())
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let code = exit_within(&mut child, &format!("ssh serve --stdio in {dir}"));
+  (code, out.join().unwrap(), err.join().unwrap())
+}
+
+/// Runs stock hg as [`hg_in`] does with `input` on its standard input: its exit code and both outputs.
+fn hg_fed(hg: &[String], dir: &str, args: &[&str], input: &str) -> (i32, String, String) {
+  let (program, leading) = hg.split_first().expect("a command");
+  let mut child = Command::new(program)
+    .args(leading)
+    .args(args)
+    .current_dir(dir)
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .env("HGUSER", "Test <test@example.com>")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(input.as_bytes())
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let code = exit_within(&mut child, &format!("hg {args:?} in {dir}"));
+  (code, out.join().unwrap(), err.join().unwrap())
+}
+
+/// Stock hg's batched `pushkey` through slates at `url`, `config` its `--config` words: two changesets pushed, bookmark
+/// `batched-bm` made at the first by `hg debugpushkey`, then one `batch` sent by `send` (given the working copy and the
+/// two changesets) moving `batched-bm` from the first changeset to the second by a `pushkey` call among its calls.
+/// Fails the test unless the batch's client exits `code`, its outputs holding `expected` (given the second changeset),
+/// and the server then lists `batched-bm` at the second changeset where `moves`, else still at the first.
+#[allow(clippy::disallowed_methods)]
+fn batch_legs(
+  hg: &[String],
+  scratch: &str,
+  (url, config): (&str, &[String]),
+  send: impl Fn(&str, &str, &str) -> (i32, String, String),
+  (code, expected, moves): (i32, impl Fn(&str) -> String, bool),
+) {
+  let local = format!("{scratch}/local");
+  hg_ok(hg, scratch, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(hg, &local, &["commit", "--addremove", "--message", "first"]);
+  hg_ok(hg, &local, &with_config(&["push", url], config));
+  let first = hg_nodes(hg, &local).into_iter().next().unwrap_or_default();
+  let made = hg_in(
+    hg,
+    &local,
+    &with_config(
+      &["debugpushkey", url, "bookmarks", "batched-bm", "", &first],
+      config,
+    ),
+  );
+  std::fs::write(format!("{local}/file"), "first\nsecond\n").unwrap();
+  hg_ok(hg, &local, &["commit", "--message", "second"]);
+  hg_ok(hg, &local, &with_config(&["push", url], config));
+  let second = hg_nodes(hg, &local).into_iter().next().unwrap_or_default();
+  let batched = send(&local, &first, &second);
+  let listed = hg_in(
+    hg,
+    &local,
+    &with_config(&["debugpushkey", url, "bookmarks"], config),
+  );
+  let at = if moves { &second } else { &first };
+  assert_eq!(
+    (
+      made.0,
+      batched.0,
+      format!("{}{}", batched.1, batched.2).contains(&expected(&second)),
+      listed.1.contains(&format!("batched-bm\t{at}"))
+    ),
+    (0, code, true, true),
+    "debugpushkey: {made:?}; the batch: {batched:?}; the bookmarks after it: {listed:?}"
+  );
+}
+
+/// A-758 (a batched `pushkey`, 7.2's `wireprotov1server.batch`, over the HTTP edge). 7.2 runs a batched call that pushes
+/// only for a request by `POST` (`checkperm`'s "push requires POST request", `405`), and its client sends a batch by
+/// `POST` only to a server listing `httppostargs`, which a stock server does not by default and slates does not: so a
+/// stock client's batched `pushkey` is refused as a stock server refuses it. Do: send [`batch_legs`]'s batch as stock
+/// hg 7.2 over `--vcs-http`. Expect `HTTP Error 405: Method Not Allowed` and the bookmark where it was (the batch by
+/// `POST` is held by the edge's own test, `a_batched_pushkey_is_landed_over_post_and_refused_over_get`). Skips loudly
+/// without stock hg 7.2 ([`STOCK_HG`]) and where the platform names no issuer surface ([`issuer_of`]).
+#[test]
+fn stock_hg_batches_a_pushkey_over_the_vcs_http_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's batched pushkey over HTTP: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs \
+       it)"
+    );
+    return;
+  };
+  let instance = format!("hg-batch-http-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's batched pushkey over HTTP") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-batch-http");
+  let url = format!("{prefix}r");
+  // 7.2's batching peer (`hg debugwireproto`'s `batchbegin` and `batchsubmit`): `listkeys`, the `pushkey`, `listkeys`.
+  let send = |local: &str, first: &str, second: &str| {
+    let script = format!(
+      "batchbegin\ncommand listkeys\n    namespace bookmarks\ncommand pushkey\n    namespace bookmarks\n    key \
+       batched-bm\n    old {first}\n    new {second}\ncommand listkeys\n    namespace bookmarks\nbatchsubmit\n"
+    );
+    hg_fed(
+      &hg,
+      local,
+      &with_config(&["debugwireproto", &url], &config),
+      &script,
+    )
+  };
+  let expected = |_: &str| "abort: HTTP Error 405: Method Not Allowed".to_owned();
+  batch_legs(
+    &hg,
+    &scratch.path,
+    (&url, &config),
+    send,
+    (255, expected, false),
+  );
+}
+
+/// A-758 (a batched `pushkey` over `hg serve --stdio`, the SSH edge). Do: a fresh key enrolled for the repository's
+/// owner, run [`batch_legs`] as stock hg 7.2 over `--vcs-ssh`. Expect the batch answered and the bookmark moved. Skips
+/// loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`, and where the platform names no issuer surface
+/// ([`issuer_of`]).
+#[test]
+fn stock_hg_batches_a_pushkey_over_the_ssh_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's batched pushkey over SSH: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs \
+       it)"
+    );
+    return;
+  };
+  let scratch = Scratch::new("hg-batch-ssh");
+  let Some((key, public)) = fresh_key(&scratch) else {
+    eprintln!("skipping stock hg's batched pushkey over SSH: no ssh-keygen here");
+    return;
+  };
+  let instance = format!("hg-batch-ssh-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (port, fingerprint) = started
+    .lines
+    .iter()
+    .find_map(|line| ssh_edge_of(line))
+    .expect("the daemon named its SSH edge's port and host key");
+  let Some(issuer) = issuer_of(&started, "stock hg's batched pushkey over SSH") else {
+    return;
+  };
+  let known_hosts = known_hosts(&scratch, port, &fingerprint);
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let config = vec!["--config".to_owned(), ssh_command(&key, &known_hosts)];
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
+  // 7.2's `debugwireproto` reaches no `ssh://` peer, so the batch goes as 7.2's SSH peer frames one (`batch`, its
+  // dictionary, its `cmds`), through stock OpenSSH to `hg -R r serve --stdio`: the `pushkey`, then `listkeys`.
+  let send = |local: &str, first: &str, second: &str| {
+    let cmds = format!(
+      "pushkey namespace=bookmarks,key=batched-bm,old={first},new={second};listkeys namespace=bookmarks"
+    );
+    let request = format!("batch\n* 0\ncmds {}\n{cmds}\n", cmds.len());
+    ssh_fed(local, (&key, &known_hosts, port), &request)
+  };
+  // The `listkeys` after the `pushkey` lists the move: the calls ran in order.
+  let expected = |second: &str| format!("1\n;batched-bm\t{second}");
+  batch_legs(
+    &hg,
+    &scratch.path,
+    (&url, &config),
+    send,
+    (0, expected, true),
+  );
+}

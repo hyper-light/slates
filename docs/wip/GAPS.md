@@ -1826,7 +1826,13 @@
 > and race checks a part's key meets), answered `1` or `0` with words; a namespace no key is moved in (`obsolete`, any
 > other) is refused by type before anything lands, answered `0` naming it. Red first and green by use with stock 7.2
 > over both edges (`hg_interop`'s `stock_hg_lists_and_moves_keys_over_the_*_edge`) on macOS arm64; other platforms
-> owed. OWED: `pushkey` inside a `batch` is refused as not served (7.2 serves it there).
+> owed. A `pushkey` inside a `batch` (w-interop, 2026-11-20) is landed between its neighbours as a lone one is
+> (`serve::session::Batch`: the calls answered in order, a later `listkeys` reading the move); over HTTP only by `POST`,
+> as 7.2 checks a batched call's `push` permission, so stock hg's batch by `GET` (sent so to any server not listing
+> `httppostargs`, slates included) is refused `405` as a stock server refuses it. Red first by use (`command not served
+> here` over both edges), green: `hg_interop`'s `stock_hg_batches_a_pushkey_over_the_*_edge`, the edge's
+> `a_batched_pushkey_is_landed_over_post_and_refused_over_get`, the session's `a_batched_pushkey_is_landed_between_its_
+> neighbours`.
 
 > **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
 > Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part
@@ -2109,7 +2115,13 @@
 > durable (`vcs_store::content_durable`, A-727 slice b), a refusal giving every put text back (`NotDurable`); reads
 > find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity and
 > refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
-> Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. **The export's text
+> read sliced (A-762, same day, w-svn, main's item 2; found by reading):** the exporter rebuilt a text through its whole delta
+> chain in one call (512 KiB, a chain of 6: the longest call 6.18 ms against a whole read of 6.04 ms, debug). Now a text
+> is read a bounded step a call (`TextSource::read_step`, `migration::TextReading`): a chain one svndiff window a step,
+> a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
+> writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
+> and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -3038,7 +3050,8 @@
 >   volume's whole image in one turn, at every whole entry and install image; **the whole entry's half closed
 >   2026-11-18, A-377, g230:** captured in its publication's turn and sealed a piece a turn by a task of the owner
 >   shard, the publications made meanwhile queued behind it, each appended in order as the credit admits it; install
->   images (`refresh_image`) still one turn, owed; **since A-755 (2026-11-20, w-forming) a turn's pieces are sized to the
+>   images (`refresh_image`) one turn until A-757 part 5 (2026-11-20, w-forming: sealed in turns of a build of their own,
+>   183 to 264 ms of one debug turn's CPU before); **since A-755 (2026-11-20, w-forming) a turn's pieces are sized to the
 >   seal rate measured in the build and the quantum left, a page to an archive chunk** (a turn had sealed a MiB at least
 >   however small its quantum, 87 to 302 ms of CPU against 14 to 784 us quanta, a debug fleet under `taskpolicy -b`);
 >   **still one turn, owed:** the append that ends a build (`append_build`: the sealed body joined and cloned into the
@@ -3056,10 +3069,13 @@
 >   holds its own bytes only for an install image: 50 volumes' 2.4 MB whole states at rest, peak RSS 249 MB before, 128
 >   MB after (release). **A-757 part 4 (2026-11-20):** a holder takes a live message over one page on a task of its own,
 >   its entries' identities hashed in slices across turns before the guard, which checks them as given: 2.4 MB in
->   release, the take turn's guard 0.96 to 1.05 ms before, under 0.1 us after, each 64 KiB slice 27 to 34 us. **Owed
->   (measured, w-forming's probes, debug under `taskpolicy -b`):** the record-plane coordinator `run_record_plane` held
->   one poll 312 ms of CPU; the rest of `serve_peer_records` 76 to 179 ms (now outside the live entries); a takeover's
->   `make_taken` 46 ms; one forwarded `Telemetry` verb 415 ms of wall); and, after A-347's open, the takeover's
+>   release, the take turn's guard 0.96 to 1.05 ms before, under 0.1 us after, each 64 KiB slice 27 to 34 us. **A-757
+>   part 5 (2026-11-20):** the record-plane coordinator's long polls (`run_record_plane`, 185 to 312 ms of one poll's
+>   CPU) were `refresh_image` sealing a 3 MiB volume's install image in the record period's one turn; a sealed image of
+>   more than one piece is now captured at the head, sealed in turns of an `ImageBuild` and made the image if the head
+>   has not moved (else dropped, still owed). **Still measured, debug under `taskpolicy -b` on main 359da2388:** a
+>   takeover's `make_taken` 38 ms of one poll's CPU; a forward-lane child 17 ms; the record period's capture of an owed
+>   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -7175,8 +7191,9 @@
 >   claim, its host reactor waits until the signal and through a live daemon's deadlines, its listings and attachment
 >   counts are waited for and its stream ends read without a timeout, its daemon in-process (A-232); `start.rs`'
 >   `NOBODY_WAIT` is the deadline its test proves, and stays. In `cli/tests` since 2026-11-20 (g226), judged in the waited-on processes' own CPU
->   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone or stalled
->   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`; `recovered::await_recovered_while_alive`):
+>   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone, stalled
+>   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`, or has spent `CPU_BUDGET` without the answer, as
+>   `live_chaos`' `START_CPU` judges a start; `recovered::await_recovered_while_alive`):
 >   `held_rendezvous`, `merge_kill` (its killer's wait for the client's submit ends too at the client's end),
 >   `nfs_v4_restart` (Linux's, compiled here) and `nfs_held` (its NFS sockets read without a timeout, the anchor holding
 >   them across a restart, A-113); `cli`'s `START_WAIT` waits (`StartProgress` judges every process of the instance,
@@ -7184,8 +7201,14 @@
 >   anchor's log, the anchor's successor and its end after refusing a replaced image judged the same; the TLS probe's
 >   socket reads with no timeout; `kill -9` run unbounded); `cli`'s `START_CEILING` waits (the anchor's restart and
 >   serving lines judged the same; the version-control edges' HTTP, svn:// and SSH reads with no timeout, the anchor
->   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone. Owed in `cli/tests`: `cli`'s
->   `WAIT_FOR`, `FLEET_WAIT` and container waits, `live_fleet`, `vm`,
+>   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone; `cli`'s `wait_for` (polled while
+>   the instance's processes progress; the epoch tests read the kernel's refusal before waiting on what it prevents)
+>   and its `FLEET_WAIT` waits (every node's processes judged together, `StartProgress::look_all`; the fleet submit run
+>   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone; `cli`'s map,
+>   second-mount, journal-pipeline and referenced-bytes waits judged the same (`WAIT_FOR` now bounds only what no slates
+>   process holds: a sibling test's child keeping a mount busy or a pipe's end open, and a container probe's map). Owed
+>   in `cli/tests`: `cli`'s container waits (`CONTAINER_WAIT`, `DOCKER_INFO_WAIT`, on Docker) and `shards_reader`'s
+>   read timeout, `live_fleet`, `vm`,
 >   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module

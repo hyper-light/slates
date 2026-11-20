@@ -270,7 +270,9 @@ pub(crate) trait Exchange {
     Ok(Fields::new())
   }
   /// Appends the reply's next run to `out`: `true` while more follows, `false` once the reply has ended.
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed>;
+  /// `gone` resolves if the client goes while the reply is made (a git push answered in the reply's turns, which may
+  /// run a hook, A-722's keepalive).
+  async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed>;
 }
 
 /// How a site answers a request's head.
@@ -412,11 +414,11 @@ impl<G: Exchange, H: Exchange, S: Exchange> Exchange for ToolExchange<G, H, S> {
     }
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, gone: ClientGone<'_>) -> Result<bool, Failed> {
     match self {
-      Self::Git(exchange) => exchange.reply(out).await,
-      Self::Hg(exchange) => exchange.reply(out).await,
-      Self::Svn(exchange) => exchange.reply(out).await,
+      Self::Git(exchange) => exchange.reply(out, gone).await,
+      Self::Hg(exchange) => exchange.reply(out, gone).await,
+      Self::Svn(exchange) => exchange.reply(out, gone).await,
     }
   }
 }
@@ -1209,7 +1211,8 @@ impl<S: Site> Parts<S> {
       return Flow::Go;
     }
     self.reply.clear();
-    match started.exchange.reply(&mut self.reply).await {
+    let gone = ClientGone::watching(&self.socket.stream);
+    match started.exchange.reply(&mut self.reply, gone).await {
       Ok(true) => connection.reply(&self.reply),
       Ok(false) => {
         if !self.reply.is_empty() {

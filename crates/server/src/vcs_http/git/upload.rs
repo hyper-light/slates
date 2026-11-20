@@ -199,7 +199,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     Ok(())
   }
 
-  async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed> {
+  async fn reply(&mut self, out: &mut Vec<u8>, _gone: ClientGone<'_>) -> Result<bool, Failed> {
     let Self {
       lender,
       repository,

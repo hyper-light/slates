@@ -484,6 +484,9 @@ pub struct DaemonConfig {
   /// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3), when the operator starts one:
   /// none from [`DaemonConfig::derive`].
   pub vcs_http: Option<VcsHttpConfig>,
+  /// How long a git push's answer over the HTTP edge may write nothing before the edge writes git's keepalive (A-722):
+  /// [`GIT_KEEPALIVE_NS`] from [`DaemonConfig::derive`].
+  pub git_keepalive_ns: u64,
   /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684), when the operator starts one: none from
   /// [`DaemonConfig::derive`].
   pub vcs_ssh: Option<VcsSshConfig>,
@@ -507,6 +510,11 @@ pub struct VcsHttpConfig {
   /// (§4.6, AUD-29-75), handed in by the command that read the operator's files (R1: the daemon reads none).
   pub identity: Option<EdgeIdentity>,
 }
+
+/// Derived: git's own interval for a push's keepalive (`receive.keepAlive`, 5 seconds by default, git-config(1);
+/// `receive-pack.c` writes it while a push is processed once its pack is in, so neither the client nor a proxy between
+/// waits past it on a silent answer).
+pub const GIT_KEEPALIVE_NS: u64 = 5_000_000_000;
 
 /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684): where it listens and whose key it presents.
 /// Its connections, seats and channel window are derived from the shard's budget, as the HTTP edge's are, never
@@ -1240,6 +1248,7 @@ impl DaemonConfig {
       nfs_v4,
       inode_reserve,
       vcs_http: None,
+      git_keepalive_ns: GIT_KEEPALIVE_NS,
       vcs_ssh: None,
       vcs_svn: None,
       derivations,

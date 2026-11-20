@@ -522,8 +522,15 @@ fn landed(
   Ok((next, committed))
 }
 
+/// The root mount the stub's daemon published (A-645 P3): a hook's REPOS is the repository's name beneath it.
+const TEST_ROOT: &str = "/slates-root";
+
 impl SvnStores for Lends {
   type Green<'a> = View;
+
+  fn root_mount(&self) -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(TEST_ROOT))
+  }
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HELD
@@ -1326,7 +1333,7 @@ fn a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them() {
       .collect()
   };
   let (started, precommitted) = (lines("start.args"), lines("pre.args"));
-  let repos = format!("/{REPOSITORY}");
+  let repos = format!("{TEST_ROOT}/{REPOSITORY}");
   let user = crate::lfs::owner_name(&principal(OWNER));
   assert_eq!(
     (

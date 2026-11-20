@@ -87,6 +87,14 @@ fn daemon(identity: EdgeIdentity) -> Daemon {
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`, or serving
 /// cleartext without one, and its instance's name, which its edge's realm names (`slates <instance>`).
 fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
+  daemon_configured(identity, |_| {})
+}
+
+/// [`daemon_named`], its configuration changed by `configure` before it starts.
+fn daemon_configured(
+  identity: Option<EdgeIdentity>,
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+) -> (Daemon, String) {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -99,6 +107,7 @@ fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
     address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
     identity,
   });
+  configure(&mut config);
   let daemon = Daemon::start(
     &profile,
     config,
@@ -806,7 +815,8 @@ fn long_history_refs(commits: usize, branches: usize) -> (Vec<u8>, Vec<ObjectId>
     .map(|(kind, bytes)| (*kind, bytes.as_slice()))
     .collect();
   let mut request = Vec::new();
-  let line = format!("{ZERO} {last} refs/heads/main\0 report-status");
+  // Stock git's capabilities (A-722's keepalive: the answer multiplexed, so the edge can keep it alive while it is made).
+  let line = format!("{ZERO} {last} refs/heads/main\0{CAPABILITIES}");
   pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
   for branch in 0..branches {
     let at = made[branch * commits / branches.max(1)];
@@ -858,6 +868,44 @@ pub(crate) fn fetch_of(want: ObjectId) -> Vec<u8> {
   }
   pktline::write(Packet::Flush, &mut request).expect("the flush");
   request
+}
+
+/// Shape: the commits of [`a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`]'s push: enough
+/// that its answer takes many turns.
+const KEPT_ALIVE_HISTORY: usize = 300;
+
+/// A-722's keepalive (the load-only edge tests: a long push's answer wrote nothing until its report, and the client's
+/// read gave up on the silence at a load of 56 to 67; git's receive-pack writes `0005\1` every `receive.keepAlive`
+/// while it processes a push under side-band-64k). Do: start a daemon whose keepalive interval is none; push a history
+/// of [`KEPT_ALIVE_HISTORY`] commits under side-band-64k over its edge. Expect: `200`; the answer begun with git's
+/// keepalive, and its report whole after the keepalives (`unpack ok`, `ok refs/heads/main`).
+#[test]
+fn a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report() {
+  let (identity, certificate) = identity();
+  let (daemon, _) = daemon_configured(Some(identity), |config| config.git_keepalive_ns = 0);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let (request, _) = long_history(KEPT_ALIVE_HISTORY);
+  let (status, answer) = pushed((port, &certificate), &name, &request);
+  daemon.stop();
+  assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+  let keepalive = b"0005\x01";
+  assert!(
+    answer.starts_with(keepalive),
+    "{}",
+    String::from_utf8_lossy(&answer)
+  );
+  let mut rest = answer.as_slice();
+  while let Some(after) = rest.strip_prefix(keepalive.as_slice()) {
+    rest = after;
+  }
+  let report = String::from_utf8_lossy(rest);
+  assert!(
+    report.contains("unpack ok") && report.contains("ok refs/heads/main"),
+    "{report}"
+  );
 }
 
 /// A-713 (found by use, 2026-11-20: with git/git cut at v1.0.0, 2,930 commits in a 3.4 MB pack, the push landed and every
@@ -1754,6 +1802,10 @@ fn create_svn_hooked(
   name: &str,
   hooks: Vec<(slates_ipc::protocol::HookPointName, String)>,
 ) {
+  // A hook is shown its repository beneath the root mount the daemon published (A-645 P3).
+  daemon
+    .record_root_mount(std::path::Path::new(crate::vcs_svn::tests::TEST_ROOT))
+    .expect("the root mount recorded");
   let name = name.to_owned();
   let replies = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
     let created = crate::verbs::dispatch(
@@ -1999,7 +2051,7 @@ fn a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them() {
       .collect()
   };
   let (started, precommitted) = (lines("start.args"), lines("pre.args"));
-  let repos = format!("/{name}");
+  let repos = format!("{}/{name}", crate::vcs_svn::tests::TEST_ROOT);
   assert_eq!(
     (
       (posted, put, merged),
