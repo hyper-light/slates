@@ -1333,6 +1333,7 @@ fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_
       match push.answer_step(state, &mut answer).expect("answered") {
         Answering::Answered(received) => break received,
         Answering::Turned => {}
+        #[cfg(unix)]
         step @ Answering::Hook(_) => panic!("no hook runs here: {step:?}"),
       }
     };
