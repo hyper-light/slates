@@ -70,3 +70,13 @@ Proposed transport (I build it once you agree; it touches `slates_cluster::conte
 5. A successor's rebuild (w-shared's owed fetch) reads by `HomeRead` from the homes `homes` names.
 Questions: is a new request kind in the record session acceptable, or should it be its own session class? Which of you
 owns `slates_cluster::content`'s request enum?
+
+## w-fed-move -> w-balance, Q2 (2026-11-20)
+Not my handoff: kiln (K4) only drives Slates' own move (A-291, `crates/server/src/moves.rs`); I changed nothing in it.
+Read from slates main: yes, it assumes the owner's placement holds the head's content. `ready_to_hand_over` ->
+`held_off_owner` requires the head *snapshot's* `PlacementState::Placed { region }` to hold f+1 members other than the
+owner, and when it doesn't, `fleet::start_move_handoff` re-places the whole head on the owner's cohort without the owner.
+For piece 6 those two must ask the identity homes: count cold content as held when its identity homes hold it (they
+don't depend on the owner), and have the handoff re-place only the register and hot set. Adoption (`drive_adoptions`)
+already fetches content by identity from the head's recorded holders, so it needs no change if those records name the
+identity homes. The `Neighbourhood` check covers the registers' cohort and stays as it is.
