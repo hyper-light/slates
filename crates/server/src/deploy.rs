@@ -1221,6 +1221,7 @@ mod tests {
   /// the handshake completes and the client was shown b's own certificate, the one its peers pin and its RPC-with-TLS
   /// export presents: the plan hands the edge the node's identity, so the daemon reads no file for it (R1).
   #[test]
+  #[allow(clippy::disallowed_types)] // rustls takes its configuration and provider as `Arc` by signature (D-8's test-harness exception).
   fn a_plan_hands_the_http_edge_the_nodes_own_identity() {
     let (manifest, keys) = manifest();
     let plan = plan(&manifest, "b", key_of(&keys, "b"), None).expect("b's plan");

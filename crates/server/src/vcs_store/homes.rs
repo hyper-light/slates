@@ -20,6 +20,14 @@
 //! A-432), the caller's budget its bound; a call to the caller's own shard runs at once, the same code at one shard and
 //! many (R8). No catalog is consulted: the identity is the route (§2 ban 12), and no coordination call is made.
 //!
+//! **Durable before named** (main's ruling; A-727's barrier). A window kept on its home answers a [`HomeTicket`]: its
+//! home shard and the generation of the first image of that shard that will hold it. An entry naming the window commits
+//! only once [`published`] answers that the home has published that image. The home's image barrier (A-727, w-perf's)
+//! tells this module two things on the home's own thread: [`image_begun`] when an image captures the shard's content
+//! table (the next image is the one after it), and [`image_published`] when it is durable. The wait runs as a task on
+//! the home (`crate::xshard::task_in_shard_time`), so the owner's request awaits it and no step ever waits. One barrier
+//! serves every window kept before it: group commit per shard, never a publication per push.
+//!
 //! **Refused** ([`HomeRefused`]): bytes past a window; a home whose content store refused (its budget); a home that did
 //! not answer within the budget; an answer naming another identity than the bytes' (never in a correct home).
 
@@ -50,6 +58,106 @@ pub(crate) enum HomeRefused {
   NotHeld,
 }
 
+/// Where and when a homed window is durable (module docs, "Durable before named"): its home shard, and the generation of
+/// the first of that shard's images that holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HomeTicket {
+  /// The home shard.
+  pub(crate) shard: u16,
+  /// The first image generation of the home that holds the window.
+  pub(crate) generation: u64,
+}
+
+/// A home shard's images as its barrier reports them (module docs, "Durable before named").
+#[derive(Debug, Default)]
+struct Images {
+  /// The generation of the next image to capture the content table: what a window kept now is first held by.
+  next: u64,
+  /// The newest generation published.
+  published: u64,
+  /// The waits for a newer publication, woken at each: one an awaiting ticket, so bounded by the requests waiting.
+  waiters: Vec<std::task::Waker>,
+}
+
+std::thread_local! {
+  /// This shard's images, as a home (module docs).
+  static IMAGES: std::cell::RefCell<Images> = std::cell::RefCell::new(Images { next: 1, ..Images::default() });
+}
+
+/// The home's barrier: an image of `generation` captured this shard's content table, so a window kept from now on is
+/// first held by the image after it (module docs). Called on the home's own thread.
+pub(crate) fn image_begun(generation: u64) {
+  IMAGES.with(|images| {
+    if let Ok(mut images) = images.try_borrow_mut() {
+      images.next = images.next.max(generation.saturating_add(1));
+    }
+  });
+}
+
+/// The home's barrier: the image of `generation` is durable (module docs); every wait for it or an older one ends.
+/// Called on the home's own thread.
+pub(crate) fn image_published(generation: u64) {
+  let woken = IMAGES.with(|images| {
+    images.try_borrow_mut().map_or_else(
+      |_| Vec::new(),
+      |mut images| {
+        images.published = images.published.max(generation);
+        core::mem::take(&mut images.waiters)
+      },
+    )
+  });
+  for waker in woken {
+    waker.wake();
+  }
+}
+
+/// The ticket of a window kept on this shard now.
+fn ticket_here(shard: u16) -> HomeTicket {
+  let generation = IMAGES.with(|images| images.try_borrow().map_or(1, |images| images.next));
+  HomeTicket { shard, generation }
+}
+
+/// Waits, on this shard, until its image of `generation` is published.
+struct PublishedHere {
+  generation: u64,
+}
+
+impl core::future::Future for PublishedHere {
+  type Output = bool;
+
+  fn poll(
+    self: core::pin::Pin<&mut Self>,
+    context: &mut core::task::Context<'_>,
+  ) -> core::task::Poll<bool> {
+    let generation = self.generation;
+    IMAGES.with(|images| match images.try_borrow_mut() {
+      Ok(images) if images.published >= generation => core::task::Poll::Ready(true),
+      Ok(mut images) => {
+        images.waiters.push(context.waker().clone());
+        core::task::Poll::Pending
+      }
+      Err(_) => {
+        context.waker().wake_by_ref();
+        core::task::Poll::Pending
+      }
+    })
+  }
+}
+
+/// Whether the window of `ticket` is durable at its home, asked from shard `origin` (module docs): waits on the home, in
+/// its own time up to `budget_ns`, for its image of the ticket's generation; false when that did not come within it.
+pub(crate) async fn published(origin: u16, ticket: HomeTicket, budget_ns: u64) -> bool {
+  let generation = ticket.generation;
+  crate::xshard::task_in_shard_time(
+    origin,
+    ticket.shard,
+    move || PublishedHere { generation },
+    budget_ns,
+  )
+  .await
+  .unwrap_or(false)
+}
+
 /// The shard of `shards` that is `identity`'s home (module docs): the first by rendezvous over the identity; none for
 /// no shards.
 pub(crate) fn home_of(shards: &[u16], identity: &ContentId) -> Option<u16> {
@@ -59,10 +167,14 @@ pub(crate) fn home_of(shards: &[u16], identity: &ContentId) -> Option<u16> {
     .and_then(|member| u16::try_from(*member).ok())
 }
 
-/// Keeps the window `bytes` on this shard, its home, held once more for its sender: its identity. The shard's content
+/// Keeps the window `bytes` on this shard, its home, held once more for its sender: its identity, and the ticket an
+/// entry naming it waits on (module docs, "Durable before named"). The shard's content
 /// store is made if it has none (as a first repository makes it), lent the room the shard could admit for the step,
 /// and settled after.
-pub(crate) fn keep_here(state: &mut ShardState, bytes: &[u8]) -> Result<ContentId, HomeRefused> {
+pub(crate) fn keep_here(
+  state: &mut ShardState,
+  bytes: &[u8],
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
   if state.vcs_stores.content.is_none() {
     let window = state.store.content.chunk_bytes();
     let made = ContentStore::new(state.vcs_stores.charged, window).map_err(HomeRefused::Content)?;
@@ -79,7 +191,7 @@ pub(crate) fn keep_here(state: &mut ShardState, bytes: &[u8]) -> Result<ContentI
   match kept {
     Some(Ok(identity)) => {
       state.count(HOMED, 1);
-      Ok(identity)
+      Ok((identity, ticket_here(state.shard)))
     }
     Some(Err(ContentRefused::PastWindow { .. })) => Err(HomeRefused::PastWindow),
     Some(Err(refused)) => Err(HomeRefused::Content(refused)),
@@ -127,13 +239,13 @@ pub(crate) fn let_go_here(state: &mut ShardState, identity: &ContentId) -> Resul
 }
 
 /// Homes the window `bytes` from shard `origin` at its home among `shards` (module docs), waiting for the home at most
-/// `budget_ns` of its own time: the window's identity, held once more for the caller.
+/// `budget_ns` of its own time: the window's identity, held once more for the caller, and its ticket.
 pub(crate) async fn home(
   origin: u16,
   shards: &[u16],
   bytes: Vec<u8>,
   budget_ns: u64,
-) -> Result<ContentId, HomeRefused> {
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
   let identity = ContentId::of(&bytes);
   let target = home_of(shards, &identity).ok_or(HomeRefused::Unanswered)?;
   let kept = crate::xshard::call_in_shard_time(
@@ -144,8 +256,8 @@ pub(crate) async fn home(
   )
   .await
   .ok_or(HomeRefused::Unanswered)??;
-  if kept == identity {
-    Ok(identity)
+  if kept.0 == identity {
+    Ok(kept)
   } else {
     Err(HomeRefused::Misnamed)
   }

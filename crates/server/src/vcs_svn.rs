@@ -82,7 +82,7 @@ use slates_vfs::clock::Clock;
 
 use crate::config::DaemonConfig;
 use crate::repository::svn_commit;
-use crate::vcs_hooks::HookPoint;
+use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
 use crate::vcs_http::waits::first_rto_ns;
 use crate::vcs_http::{Bounds, awaited};
 use crate::vcs_store::svn_view::lend_in;
@@ -176,8 +176,17 @@ const COMMIT_REFUSED: &str = "vcs_svn.commit_refused";
 /// Format: `SVN_ERR_UNSUPPORTED_FEATURE`, the miscellaneous category's start (200,000) plus 7 (`svn_error_codes.h`).
 const UNSUPPORTED_FEATURE: u32 = 200_007;
 
-/// The words a commit is refused with at a point where the repository configures a hook, which the listener does not
-/// run yet, as the `svn+ssh://` tunnel refuses it.
+/// Format: the capability start-commit is given where the client announced it (`serve.c` remembers `mergeinfo` alone
+/// among the client's capabilities, `svn_repos_remember_client_capabilities`; the recorded runs, A-623).
+const MERGEINFO: &str = "mergeinfo";
+
+/// Format: where a Subversion hook runs (`HookPoint::directory`: the filesystem's root, as `svnserve -d` runs them), the
+/// view root the driver is handed, which no Subversion point reads.
+#[cfg(unix)]
+const HOOK_DIRECTORY: &str = "/";
+
+/// The words a change is refused with at a point where the repository configures a hook this platform cannot run (no
+/// hook driver on Windows yet), or whose repository left the shard, as the `svn+ssh://` tunnel refuses it.
 const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
 
 /// Counter: a CRAM-MD5 response naming no key a token's record holds: answered as `svnserve` answers a user it has
@@ -804,11 +813,11 @@ async fn follow(
     }
     Next::Hook { due, consumed } => {
       consume(conversation, consumed);
-      answer_hook(conversation, &due, out)
+      answer_hook(stream, conversation, &due, out).await
     }
     Next::Accepted { work, consumed } => {
       consume(conversation, consumed);
-      land(conversation, *work, out)
+      land(stream, conversation, *work, out).await
     }
   };
   written(stream, went, out).await
@@ -1065,36 +1074,77 @@ fn lock(conversation: &mut Conversation, out: &mut Vec<u8>) -> bool {
   connection.locks_landed(landed, out).is_ok()
 }
 
-/// Answers the hook the commit's drive waits for, as the `svn+ssh://` tunnel answers it: passed where the repository's
-/// policy configures none at its point, as `svnserve` answers a point with no hook; refused where one is, since the
-/// listener runs no hook yet and none is ever skipped. A drive the answer lets accept its work lands it ([`land`]).
-fn answer_hook(conversation: &mut Conversation, due: &Due, out: &mut Vec<u8>) -> bool {
-  let point = match due {
-    Due::StartCommit { .. } => HookPoint::SvnStartCommit,
-    Due::PreCommit { .. } => HookPoint::SvnPreCommit,
-  };
-  let Some(opened) = conversation.opened.as_ref() else {
+/// Runs the hook the commit's drive waits for (A-730): start-commit at `open-root` with the user, the client's
+/// capabilities and the transaction; pre-commit at `close-edit` with the transaction and the lock tokens the commit
+/// presented; each over the repository's policy ([`run_hook`]). Its verdict resumes the drive, as `svnserve`'s does: on,
+/// or refused in `check_hook_result`'s words. A client that left before the hook ended ends the conversation. A drive the
+/// answer lets accept its work lands it ([`land`]).
+async fn answer_hook(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  due: &Due,
+  out: &mut Vec<u8>,
+) -> bool {
+  let Some(opened) = conversation.opened.as_ref().map(Opened::hooked) else {
     return false;
   };
-  let configured = crate::state::with_state(|state| {
-    state
-      .db
-      .partition()
-      .repositories()
-      .repository_named(&opened.name)
-      .is_some_and(|record| {
-        record
-          .policy
-          .hooks
-          .iter()
-          .any(|hook| HookPoint::of(hook.point) == point)
-      })
-  })
-  .unwrap_or(true);
-  let answer = if configured {
-    Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
-  } else {
-    Ok(())
+  let (user, mergeinfo) = conversation
+    .connection
+    .session()
+    .map(|session| {
+      (
+        hook_user(&session.principal),
+        session.capabilities.mergeinfo,
+      )
+    })
+    .unwrap_or_default();
+  let tokens: Vec<LockToken> = conversation
+    .connection
+    .pending()
+    .map(|pending| pending.lock_tokens())
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(path, token)| LockToken { path, token })
+    .collect();
+  let base = conversation
+    .connection
+    .pending()
+    .map_or(0, |pending| pending.base);
+  let words_cap = conversation.limits.item_bytes;
+  let ran = match due {
+    Due::StartCommit { transaction } => {
+      let capabilities: &[&str] = if mergeinfo { &[MERGEINFO] } else { &[] };
+      run_hook(
+        stream,
+        &opened,
+        words_cap,
+        HookPoint::SvnStartCommit,
+        |env, repos| {
+          vcs_hooks::svn_start_commit(
+            PendingView(base),
+            env,
+            repos,
+            &user,
+            capabilities,
+            transaction,
+          )
+        },
+      )
+      .await
+    }
+    Due::PreCommit { transaction } => {
+      run_hook(
+        stream,
+        &opened,
+        words_cap,
+        HookPoint::SvnPreCommit,
+        |env, repos| vcs_hooks::svn_pre_commit(PendingView(base), env, repos, transaction, &tokens),
+      )
+      .await
+    }
+  };
+  let Some(answer) = ran.verdict else {
+    return false;
   };
   let Conversation {
     connection,
@@ -1109,16 +1159,157 @@ fn answer_hook(conversation: &mut Conversation, due: &Due, out: &mut Vec<u8>) ->
     connection.answer_hook(answer, sources, out)
   });
   match answered {
-    Some(Ok(Turn::Accepted { work, .. })) => land(conversation, *work, out),
+    Some(Ok(Turn::Accepted { work, .. })) => land(stream, conversation, *work, out).await,
     Some(Ok(_)) => true,
     Some(Err(_)) | None => false,
+  }
+}
+
+/// The user a Subversion hook is given: the session's, or empty for an anonymous one (`hooks.c` passes `""`).
+fn hook_user(principal: &slates_svn::handshake::Principal) -> String {
+  match principal {
+    slates_svn::handshake::Principal::Anonymous => String::new(),
+    slates_svn::handshake::Principal::User(name) => String::from_utf8_lossy(name).into_owned(),
+  }
+}
+
+/// What a hook's run answers the conversation (A-730): the verdict an admission point resumes with, `None` where the
+/// client left (nothing to resume, and the change does not go on); and post-commit's words, which `commit-info` carries
+/// as `post-commit-err`.
+#[derive(Debug, Default)]
+struct HookAnswer {
+  /// The verdict: on, or refused with errors outermost first.
+  verdict: Option<Result<(), Vec<(u32, String)>>>,
+  /// post-commit's failure, in `svnserve`'s words.
+  post_commit_error: Option<String>,
+}
+
+/// What a conversation's hooks need of its repository: its id, its name, and REPOS, the directory a hook is given (the
+/// repository's name beneath `/`, as `SVNParentPath` lays repositories out, until A-645's read-only FSFS-layout view
+/// gives `svnlook` a directory to read: design §4.17.4 item 9).
+struct Hooked {
+  /// The repository's id, which its hooks' learned times are kept under.
+  id: RepositoryId,
+  /// Its name, which its record is found by on its owner shard.
+  name: String,
+  /// REPOS.
+  repos: String,
+}
+
+impl Opened {
+  /// What this repository's hooks need of it.
+  fn hooked(&self) -> Hooked {
+    Hooked {
+      id: self.id,
+      name: self.name.clone(),
+      repos: format!("/{}", self.name),
+    }
+  }
+}
+
+/// Runs the hook `repository`'s policy configures at `point` with the input `input` builds from the policy's hooks-env
+/// and REPOS (A-730; `crate::svn_hooks::run`, the hook driver of A-622 with A-623's Subversion rules), held to the bound
+/// its runs taught this shard and ended if the client hangs up (`vcs_http::ClientGone`), then teaches the shard what this
+/// run showed. A point with no hook answers at once, running nothing, as `svnserve` does.
+#[cfg(unix)]
+async fn run_hook(
+  stream: &TcpStream,
+  repository: &Hooked,
+  words_cap: usize,
+  point: HookPoint,
+  input: impl FnOnce(&vcs_hooks::SvnHooksEnv, &str) -> vcs_hooks::HookInput,
+) -> HookAnswer {
+  use crate::svn_hooks::{SvnHookSite, configured, run};
+  let found = crate::state::with_state(|state| {
+    let policy = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&repository.name)
+      .map(|record| record.policy.clone())?;
+    let bound =
+      configured(&policy, point).and_then(|hook| state.hook_times.bound_ns(repository.id, hook));
+    Some((policy, bound))
+  })
+  .flatten();
+  // A repository no longer on this shard runs nothing here: its change is refused as the commit step refuses it.
+  let Some((policy, bound_ns)) = found else {
+    return HookAnswer {
+      verdict: Some(Err(vec![(
+        UNSUPPORTED_FEATURE,
+        HOOK_NOT_RUN_WORDS.to_owned(),
+      )])),
+      post_commit_error: None,
+    };
+  };
+  let env = vcs_hooks::SvnHooksEnv::of(&policy);
+  let input = input(&env, &repository.repos);
+  let site = SvnHookSite {
+    policy: &policy,
+    view_root: std::path::Path::new(HOOK_DIRECTORY),
+    words_cap,
+  };
+  let gone = crate::vcs_http::ClientGone::watching(stream).gone();
+  let ran = run(&site, &input, bound_ns, gone).await;
+  if let (Some(lesson), Some(hook)) = (ran.lesson, configured(&policy, point)) {
+    let _ = crate::state::with_state(|state| {
+      state.hook_times.teach(repository.id, &policy, hook, lesson);
+    });
+  }
+  let post_commit_error = match &ran.told {
+    vcs_hooks::SvnTold::PostCommitErr(words) => Some(words.clone()),
+    vcs_hooks::SvnTold::Nothing | vcs_hooks::SvnTold::Failure(_) => None,
+  };
+  HookAnswer {
+    verdict: ran.verdict(),
+    post_commit_error,
+  }
+}
+
+/// No hook runs on Windows yet (the hook driver is Unix's alone, A-622 part 3): a point where the repository configures
+/// one refuses its change in the not-run words, as before A-730, and a point with none lets it go on.
+#[cfg(not(unix))]
+async fn run_hook(
+  _stream: &TcpStream,
+  repository: &Hooked,
+  _words_cap: usize,
+  point: HookPoint,
+  _input: impl FnOnce(&vcs_hooks::SvnHooksEnv, &str) -> vcs_hooks::HookInput,
+) -> HookAnswer {
+  let configured = crate::state::with_state(|state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&repository.name)
+      .is_some_and(|record| {
+        record
+          .policy
+          .hooks
+          .iter()
+          .any(|hook| HookPoint::of(hook.point) == point)
+      })
+  })
+  .unwrap_or(true);
+  HookAnswer {
+    verdict: Some(if configured {
+      Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
+    } else {
+      Ok(())
+    }),
+    post_commit_error: None,
   }
 }
 
 /// Lands the accepted `work` through the owner's commit step (A-698's `repository::svn_commit::commit_work`, which the
 /// `svn+ssh://` tunnel calls too, at the owner's instant) and answers `close-edit` with `commit-info` or with the
 /// step's refusal as its failure: whether the conversation goes on, the answer in `out`.
-fn land(conversation: &mut Conversation, work: Work, out: &mut Vec<u8>) -> bool {
+async fn land(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  work: Work,
+  out: &mut Vec<u8>,
+) -> bool {
   let (Some(opened), Some(principal)) = (
     conversation.opened.as_ref(),
     conversation.principal.as_ref(),
@@ -1126,12 +1317,33 @@ fn land(conversation: &mut Conversation, work: Work, out: &mut Vec<u8>) -> bool 
     return false;
   };
   let id = opened.id;
+  let hooked = opened.hooked();
+  let transaction = work.record.transaction.clone();
   let landed = crate::state::with_state(|state| {
     let now = AprTime::from_wall_ns(state.clock.wall_ns());
     svn_commit::commit_work(state, (principal, id), work, now)
   });
   let Some(landed) = landed else {
     return false;
+  };
+  // post-commit runs once the revision stands, and its failure is `commit-info`'s `post-commit-err` (A-730).
+  let post_commit = match &landed {
+    Ok(committed) => {
+      let revision = committed.revision;
+      let words_cap = conversation.limits.item_bytes;
+      run_hook(
+        stream,
+        &hooked,
+        words_cap,
+        HookPoint::SvnPostCommit,
+        |env, repos| {
+          vcs_hooks::svn_post_commit(CommittedView(revision), env, repos, revision, &transaction)
+        },
+      )
+      .await
+      .post_commit_error
+    }
+    Err(_) => None,
   };
   let answered = match &landed {
     // A client's work always carries the date the step gave it (`Revision::of_work`).
@@ -1140,7 +1352,7 @@ fn land(conversation: &mut Conversation, work: Work, out: &mut Vec<u8>) -> bool 
         revision: committed.revision,
         date: committed.date.as_deref().unwrap_or_default(),
         author: committed.author.as_deref(),
-        post_commit_error: None,
+        post_commit_error: post_commit.as_deref(),
       },
       out,
     ),

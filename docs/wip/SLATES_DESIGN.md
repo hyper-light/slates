@@ -11306,8 +11306,18 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > restored file, and a change that shares no run with the value before it, which every push and import is) names the
 > file's block instead of copying it, so a changed file is held once; the file map letting the block go at the next
 > change leaves it held as the earlier version's bytes, nothing copied. A retired lineage member gives its chunks' holds
-> back a chunk a step (`Release`). Counted: `Green::history_blocks_named`. Owed (part 2): a splice's added runs named
-> in the new block too, copied out only when the value is superseded.
+> back a chunk a step (`Release`). Counted: `Green::history_blocks_named`.
+>
+> **Status (2026-11-20, A-728 part 2: a splice's added bytes are the new block's).** A splice's added runs are pieces of
+> the file's new block at their place, so the latest value copies nothing at all; the change that supersedes it seals it
+> (`Value::seal`): a block it alone names and nothing else holds is cut to its runs, copied into one owned chunk, and let
+> go, when they are less than the block. A fold that leaves a path only its latest value makes that value the file's
+> block whole (`Green::rename_alone`), so the earlier blocks it shared runs of go. A block chunk is charged the runs its
+> value was made with, the copy it replaces, so admission's reservation is unchanged. Counted:
+> `Green::history_splices_named` (splices named, values sealed and the bytes copied).
+>
+> **Status (2026-11-20, A-728 part 3: measured).** A 1,000-revision Subversion import: the history's heap 50.3 to
+> 2.0 MiB, `Green::commit`'s 285.1 to 200.0 MiB (BENCHMARKS.md).
 
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
@@ -15828,6 +15838,20 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > and UNLOCK, DAV's wiring A-661's next part once g298's serving lands. Tested on Linux x86_64 (adacachy, 2026-11-19):
 > the server's lib tests 630 passed beside main's 624, the glue's five new and nothing failing that main's tree passed;
 > each of its four choices broken in a copy failed only its own tests. The macOS run is owed.
+>
+> **Status (2026-11-20, A-730 part 1: the `svn://` listener runs the commit hooks).** Built: start-commit at
+> `open-root` (REPOS, the user, the client's `mergeinfo` capability, the transaction), pre-commit at `close-edit` (REPOS
+> and the transaction; on standard input the presented lock tokens, each path as the client sent it, relative to the
+> commit's base) and post-commit once the revision stands (REPOS, the revision, the transaction), each the hook the
+> repository's policy configures, run by `svn_hooks::run` (A-622's driver with A-623's rules), held to the bound its
+> runs taught the shard (taught again as each run ends) and ended if the client hangs up (`vcs_http::ClientGone`). A
+> start-commit or pre-commit that refuses refuses the command in `check_hook_result`'s words; post-commit's failure is
+> `commit-info`'s `post-commit-err`, the commit standing; a client that left before its hook ended ends the
+> conversation. REPOS is `/<repository name>`, `SVNParentPath`'s layout, until A-645's read-only FSFS-layout view gives
+> stock `svnlook` a directory. Windows, with no driver, still refuses a commit at a configured point. Held to the
+> listener's tests: a refusing start-commit answered in `svnserve`'s words with no revision made; accepting start- and
+> pre-commit given `svnserve`'s arguments and standard input; a failing post-commit's words in `commit-info`. Owed: the
+> lock hooks, `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -54748,8 +54772,33 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   128 KiB, and the history owns no byte; a small overwrite owns its 8 bytes; every version reads back; the running
   totals equal their recount) and `a_value_named_by_a_files_block_copies_nothing_and_keeps_the_block_while_named`;
   integration `engine`, `checkpoint`, `chain_replay`, `rebase`, `splice`, `verdict`, `base_for` green; fmt clean.
-- **Owed.** Part 2: a splice's added runs named in the new block, copied out when the value is superseded. Part 3: the
-  1,000-revision Subversion profile (`crates/cli/bench/svn_scale.sh`) before and after, in BENCHMARKS.md.
+- **Part 2: a splice's added runs are the new block's.** `Value::spliced` checks the runs it keeps against the new
+  bytes first, then makes its added runs pieces of the file's new block at their place (one chunk naming the block),
+  so the latest value copies nothing. The copy is made only when a later change supersedes the value and the map lets
+  the block go (`Value::seal`, from `set_file` and `remove_file_now`): a block chunk only that value names, whose block
+  nothing else holds, is cut to the runs the value names when they are less than the block; one it names whole, or one
+  another holder keeps (a branch's map, the identity table), stays. A fold that leaves a path only its latest value names
+  the current file's block whole (`Green::rename_alone`), letting the earlier blocks and chunks go: folded to the head,
+  the small-edits test's history holds 0 bytes, where it held the overwritten bytes of a shared chunk before.
+- **The charge.** A block chunk counts the runs its value was made with (the whole block for a value named whole, a
+  splice's added runs otherwise): what the copy it replaces counted, so `Green::history_reservation` and every
+  retention figure the service admits by are as before. Said plainly, that figure counts the file before a path's
+  first small edit as the current value's, though since that edit the current file is its own block: a first small
+  edit keeps the earlier file whole in memory (as the copy did before A-728) and charges its edit's bytes; a fold to the
+  head now frees it.
+- **Evidence (part 2).** macOS arm64, Mac Studio, local: `slates-merge --lib` 222 of 222 (`history::` 5, among them the
+  engine's flow restated over generated chains with sealing, and `a_seal_keeps_a_block_another_holder_keeps`;
+  `history_block_tests` extended: a splice copies nothing, the next change seals 8 bytes, a removal seals 4 more);
+  integration `engine` (the fold-to-head bound tightened to 0), `special`, `checkpoint`, `chain_replay`, `rebase`,
+  `splice`, `verdict`, `base_for`, `derive`, `increment`, `identity`, `map`, `origin`; `slates-server --test
+  green_retention`; fmt clean. Found by running: the stack oracle
+  (`a_stack_lands_as_its_works_applied_in_order_to_whole_trees_over_every_history`) refuses a bottom on origin/main at
+  `PROPTEST_CASES=3000` in 2 of 10 runs, with or without this change (0 of 10 with it): reported, not chased.
+- **Part 3, measured (BENCHMARKS.md, "A green's history names the file's block").** A 1,000-revision Subversion
+  import of git/git (223 MiB) on the Mac Studio, release builds differing by A-728 alone, the daemon's live heap by
+  stack (`crates/cli/bench/svn_history_mem.sh`, three runs each, identical): the content history 50.3 MiB before,
+  2.0 MiB after; everything under `Green::commit` 285.1 MiB before, 200.0 MiB after (85.1 MiB, 30%, less). A-723's
+  234.8 MiB was that `Green::commit` row, mostly the current files' blocks, which stay.
 - **Piece 5a, identity homes across a node's shards (2026-11-20).** `crate::vcs_store::homes`: a window (at most one
   window of content, named by its plain BLAKE3) is homed at the shard of the node that rendezvous ranks first for its
   identity, kept there in that shard's one content store (deduplicated with what its repositories hold, charged to its
@@ -54843,4 +54892,39 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   Studio, every push landed, but the small repositories' p99 was 14.1 times their push alone while one hot repository
   pushed: piece 3's memory share does not schedule CPU, so the shard's step quanta scheduled fairly by repository is next.
   R = 1,000 waits on one copy a byte (A-723, A-727). A push of git/git v2.0.0 ends the daemon (reported).
+- **Piece 5, A-727's barrier at the homes (2026-11-20, agreed with w-perf).** `vcs_store::homes::keep_here` and `home`
+  answer a `HomeTicket { shard, generation }`: the home and the first of its images that holds the window. The home's
+  barrier (A-727, w-perf's) calls `image_begun(g)` when image g captures the shard's content table and
+  `image_published(g)` when it is durable; `published(origin, ticket, budget)` waits on the home, as a task there, until
+  its image of the ticket's generation is published, so an entry's request awaits it and no step waits. Agreed with
+  w-perf (proposal in inbox `w-perf-from-w-balance.md`, its reply by kiln message, 2026-11-20): rows {identity, length, home} with the holder count
+  at the owner, bytes at the home; reads `Read::Here(Cow)` or `Read::Elsewhere { home }`, fetched between steps into a
+  charged per-request cache; `let_go` batched; the owner the default home for small repositories. Test:
+  `vcs_store::homes::tests::a_homed_windows_ticket_is_published_only_once_its_homes_image_is`. Owed: `home_many`,
+  `read_many` and the batched `let_go` (after w-perf's slice a3).
+- **Piece 3c, fair turns by repository: measured and rejected (2026-11-20).** BENCHMARKS.md, "Fair turns by
+  repository on a shard": at R = 100 the toys' p99 grew from 14.1 to 22.8 times alone and the daemon ended. The toys'
+  wait is not the owner shard's CPU; the R = 100 step is to be profiled first. Also in this change: `share::divide`'s
+  full-resource tolerance is derived from Higham's bound for the solver's own operations (w-lint's R3 finding).
 
+
+### A-730 — ra_svn runs a repository's hooks (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 9; A-661 part 2, A-622, A-623, A-648)
+
+- **What was there.** A-661 part 1 built the glue (`svn_hooks::run`) and the commit drive's pauses (A-655), but nothing
+  called it: the `svn://` listener, the `svn+ssh://` tunnel and the DAV site refused any commit to a repository with a
+  hook configured at start-commit or pre-commit ("This server does not run this repository's hooks yet"), never ran
+  post-commit, and ignored the lock hooks.
+- **Part 1 (this change): the `svn://` listener's commit hooks.** `vcs_svn::run_hook` reads the repository's policy on
+  its owner shard, builds the point's input with its hooks-env and REPOS (`/<name>`), runs `svn_hooks::run` held to
+  the hook's learned bound and ended on the client's hang-up, and teaches the shard's hook times. `answer_hook` runs
+  start-commit (the user, `mergeinfo` where the client announced it, the transaction) and pre-commit (the transaction,
+  the presented lock tokens from the drive's `Pending::lock_tokens`, each path relative to the commit's base) and
+  resumes the drive with the verdict; `land` runs post-commit after the append and writes its failure as
+  `post-commit-err`. Windows keeps the refusal at a configured point.
+- **Tests.** `slates-server` `vcs_svn::tests::a_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`
+  and `a_commit_over_svn_runs_its_repositorys_commit_hooks_as_svnserve_runs_them` (shell-script hooks through
+  `SetRepositoryPolicy`; stock `svn`'s recorded commit; red before: the not-run refusal, no hook run); `slates-svn`
+  `commit::drive::tests::pre_commits_lock_tokens_name_each_path_as_the_client_sent_it`. macOS arm64, Mac Studio.
+- **Applied in the same change to** §4.17.4 item 9's status, GAPS (A-661's line), amendments.tsv.
+- **Owed.** Part 2: pre-lock (its token the lock's) and post-lock, pre- and post-unlock around A-602's check. Part 3:
+  the `svn+ssh://` tunnel. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
