@@ -13,6 +13,7 @@
 mod common;
 
 use common::{store, volume};
+use slates_vfs::content::Extent;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
@@ -25,6 +26,22 @@ fn write_windows(vol: &mut Volume, store: &mut Store, no: InodeNo, fill: u8) {
   let block = vec![fill; usize::try_from(chunk).unwrap()];
   for window in 0..WINDOWS {
     vol.write(store, no, window * chunk, &block).unwrap();
+  }
+}
+
+/// Every one of `pinned` reads back whole, every byte `fill`: what it was pinned at, whatever the head did since.
+fn pinned_extents_read(store: &Store, pinned: &[Extent], fill: u8) {
+  for extent in pinned {
+    let mut back = vec![0u8; usize::try_from(extent.len).unwrap()];
+    store
+      .content
+      .read_extent_into(extent, extent.off, &mut back)
+      .expect("a pinned extent stays readable after the head let it go");
+    assert!(
+      back.iter().all(|b| *b == fill),
+      "a pinned extent at {} reads the bytes it was pinned at",
+      extent.off
+    );
   }
 }
 
@@ -58,18 +75,7 @@ fn a_pinned_extent_reads_the_bytes_it_was_pinned_at_after_the_head_replaced_them
     "the overwrite freed a pinned chunk: {}",
     store.content.freed_while_pinned()
   );
-  for extent in &pinned {
-    let mut back = vec![0u8; usize::try_from(extent.len).unwrap()];
-    store
-      .content
-      .read_extent_into(extent, extent.off, &mut back)
-      .expect("a pinned extent stays readable after the head let it go");
-    assert!(
-      back.iter().all(|b| *b == b'a'),
-      "a pinned extent at {} reads the bytes it was pinned at",
-      extent.off
-    );
-  }
+  pinned_extents_read(&store, &pinned, b'a');
   let held = store.content.chunks();
   store.content.unpin_extents(&pinned).unwrap();
   assert_eq!(store.content.pinned(), 0, "every pin was let go");

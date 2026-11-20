@@ -967,26 +967,9 @@ impl Repositories {
     }
   }
 
-  /// Applies an entry the guard admitted (A-603, A-642), unconditionally: its members join, its names change and its
-  /// state moves, in order, each change taking its own log's next position; its versions are the partition's chains,
-  /// which moved each green in `greens` (`Repositories::green_spans`). An entry that moved two logs or more, a green's
-  /// among them, is kept as an atomic record, each position it took on each green's log pointing to it. An entry of a
-  /// repository this partition does not hold is a corrupted history, refused before anything changes.
-  pub fn apply_advanced(
-    &mut self,
-    entry: &crate::catalog::RepositoryEntry,
-    greens: Vec<LogSpan>,
-  ) -> Result<StateBytes, DbError> {
-    let Some(before) = self
-      .registers
-      .get(&entry.repository)
-      .map(Register::positions)
-    else {
-      return Err(DbError::NotFound);
-    };
-    if !self.records.contains_key(&entry.repository) {
-      return Err(DbError::NotFound);
-    }
+  /// [`Self::apply_advanced`]'s namespace half: `entry`'s members joined and its names changed here, in order, and the
+  /// changes its names log takes for them (with the push's record, if it carries one).
+  fn namespace_changes(&mut self, entry: &crate::catalog::RepositoryEntry) -> Vec<LoggedChange> {
     let mut namespace = Vec::with_capacity(entry.joined.len().saturating_add(entry.names.len()));
     for member in &entry.joined {
       self.join(member);
@@ -1007,6 +990,30 @@ impl Repositories {
         record: entry.objects.clone(),
       });
     }
+    namespace
+  }
+
+  /// Applies an entry the guard admitted (A-603, A-642), unconditionally: its members join, its names change and its
+  /// state moves, in order, each change taking its own log's next position; its versions are the partition's chains,
+  /// which moved each green in `greens` (`Repositories::green_spans`). An entry that moved two logs or more, a green's
+  /// among them, is kept as an atomic record, each position it took on each green's log pointing to it. An entry of a
+  /// repository this partition does not hold is a corrupted history, refused before anything changes.
+  pub fn apply_advanced(
+    &mut self,
+    entry: &crate::catalog::RepositoryEntry,
+    greens: Vec<LogSpan>,
+  ) -> Result<StateBytes, DbError> {
+    let Some(before) = self
+      .registers
+      .get(&entry.repository)
+      .map(Register::positions)
+    else {
+      return Err(DbError::NotFound);
+    };
+    if !self.records.contains_key(&entry.repository) {
+      return Err(DbError::NotFound);
+    }
+    let namespace = self.namespace_changes(entry);
     self.log_names(entry.repository, namespace);
     self.made_greens.clone_from(&greens);
     let mut bytes = StateBytes::default();

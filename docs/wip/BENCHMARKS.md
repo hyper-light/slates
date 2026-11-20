@@ -15438,3 +15438,28 @@ to write it whole and P3 hands the stored delta through. Layout is about 0.3 ms 
 first representation, which a delta names its base by). Both stream, so the view's own memory is a megabyte or two over
 the import either way; one P3 run (256 KiB, round 2) peaked 132 MB over its baseline, unexplained, the other four within
 a megabyte. Kept: P3. Rejected: P1's whole texts.
+
+### The ~10 µs since A-400, bisected: small steps, the last two not the code they land (g222, 2026-11-20)
+
+The quiet lone submit's gain since A-400 (Linux arm64 accept p50 20–21 → 31–35 µs, above) bisected over the 309
+first-parent commits `f2081a3c8..a5233e228`, the same harness quiet only (`--quiet-only --files 10 --files 1000 --form
+accept --form conflict`), CI `ubuntu-24.04-arm`, 3 rounds of 3 runs, the arms rotated. Accept p50 µs, each round's
+median:
+
+| run | arms (first-parent position: accept p50 per round) |
+|---|---|
+| 44793023133 (`diag-measurer-g222-2`) | 0: 20.3 / 19.1 / 20.3; 38: 35.9 / 34.7 / 32.3; 77: 21.7 / 22.6 / 21.1; 115: 24.6 / 24.5 / 24.1; 154 (`fa995b7bb`): does not build; 193: 26.6 / 24.2 / 25.8; 231: 25.8 / 27.2 / 26.0; 270: 27.1 / 25.8 / 26.6; 309: 31.8 / 32.8 / 32.2 |
+| 44801688472 (`-3`) | 270: 26.1 / 25.3 / 29.1; 275: 26.8 / 27.2 / 26.4; 280: 30.0 / 29.7 / 29.6; 285: 30.4 / 31.1 / 28.5; 290: 29.9 / 29.2 / 29.5; 295: 28.6 / 30.1 / 30.1; 300: 30.4 / 28.9 / 31.7; 305: 28.8 / 29.8 / 29.3; 309: 32.5 / 32.1 / 33.1 |
+| 44809794056 (`-4`) | 275: 28.6 / 26.3 / 28.2; 276: 25.7 / 27.9 / 26.7; 277: 28.3 / 27.9 / 26.8; 278: 28.2 / 29.2 / 27.5; 279: 30.5 / 27.3 / 28.9; 280: 27.9 / 28.1 / 28.2; 305: 28.1 / 28.0 / 28.1; 306: 26.9 / 27.8 / 28.7; 307 (`524542460`): 31.4 / 30.5 / 31.1; 308 (`23eb15b49`): 32.8 / 34.7 / 33.8; 309: 32.4 / 31.4 / 31.1 |
+
+- No one commit holds the 10 µs: about 3 over positions 77–115, 2 over 115–193, and 3 at `524542460` (a merge
+  bringing A-752 part 2, the paced push build). The 275–280 step of the second run did not reproduce in the third.
+- The two steps that reproduce are not the code they land. `23eb15b49` changes only a push's tree reading, which a
+  submit never runs, and moved the submit 2 µs; `a5233e228`, the paths map's slicing (also off the path), moved it 1–2
+  µs back. And A-752's rewrite of the ops document, the one change at `524542460` on a submit's path, costs nothing:
+  a one-op document canonicalized and encoded takes 202–217 ns at `524542460` against 203–208 ns at `be175cd9d`
+  (a scratch example, never committed, best of 7 × 2,000,000, alternated twice; adas-mac-studio-3.local). Steps of 2–3
+  µs that follow code a request never runs are the release build's layout, not work. Point 38 (`b207f2321`), 32–36 µs
+  and gone by point 77, is the same kind.
+- So the creep is not bisectable to a fix. What would hold it is an instruction-count gate on the lone submit (§5's
+  iai-callgrind gate, which counts work, not layout), owed.

@@ -81,15 +81,9 @@ impl TextSource for HeadTexts<'_> {
         if offset >= len {
           return (offset == len).then_some(Cow::Borrowed(&[]));
         }
-        let store = self.store?;
-        let root = store.root_of(&slates_vcs::ContentId(*identity));
-        let window = u64::try_from(store.window()).ok()?;
-        let piece = store.window_at(&root, len, offset.checked_div(window)?)?;
-        let from = usize::try_from(offset.checked_rem(window)?).ok()?;
-        match piece {
-          Cow::Borrowed(bytes) => bytes.get(from..).map(Cow::Borrowed),
-          Cow::Owned(bytes) => bytes.get(from..).map(|rest| Cow::Owned(rest.to_vec())),
-        }
+        self
+          .store?
+          .run_at(&slates_vcs::ContentId(*identity), len, offset)
       }
       None => self.records.text_at(identity, offset).map(Cow::Owned),
     }
