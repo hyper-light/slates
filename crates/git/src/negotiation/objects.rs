@@ -33,9 +33,10 @@ use super::paint::{HAVE, Paint, WANT};
 use super::ready::peel;
 use super::shallow::Cut;
 use super::sparse::Verdict;
-use super::{Counters, Filter, Graph, Patterns, Refusal, Request, Run, charge};
+use super::{Counters, Filter, Graph, Held, Patterns, Peak, Refusal, Request, Run, charge};
 use crate::Admission;
 use crate::object_name::{Kind, ObjectId};
+use crate::positions::Positions;
 
 /// Format: the byte between a path's segments.
 const SLASH: u8 = b'/';
@@ -60,22 +61,31 @@ pub(super) fn select<S: Graph>(
   runs: &[Run<S::Green>],
   admission: &mut Admission,
   counters: &mut Counters,
-) -> Result<Vec<S::Node>, Refusal> {
+) -> Result<Positions, Refusal> {
   let sent = commits(graph, sides, admission, counters)?;
   let left_out = left_out(graph, request, sides, &sent, admission)?;
+  let depth_decides = request.filter.is_some_and(|filter| !filter.is_per_object());
   let mut chosen = Chosen {
     filter: request.filter,
     sparse: sparse_patterns(request),
     left_out: &left_out,
-    objects: BTreeSet::new(),
-    opened: BTreeMap::new(),
-    done: BTreeSet::new(),
+    objects: Held::default(),
+    opened: if depth_decides {
+      Opened::AtDepth(BTreeMap::new())
+    } else {
+      Opened::Once(Held::default())
+    },
+    done: Held::default(),
+    stack: Peak::default(),
   };
-  for commit in &sent {
+  for commit in sent
+    .iter()
+    .filter_map(|position| S::Node::try_from(position).ok())
+  {
     if chosen.admits(Kind::Commit, 0, 0) {
-      chosen.take(*commit, admission)?;
+      chosen.take(commit, admission)?;
     }
-    if let Some(row) = graph.commit(*commit) {
+    if let Some(row) = graph.commit(commit) {
       chosen.root(graph, row.tree, admission, counters)?;
     }
   }
@@ -90,7 +100,7 @@ pub(super) fn select<S: Graph>(
     let carried = carried_by_runs(graph, runs, request.filter, admission)?;
     chosen.tags(graph, &carried, admission)?;
   }
-  Ok(chosen.objects.into_iter().collect())
+  Ok(chosen.objects.into_positions())
 }
 
 /// The commits to send: wanted and not had.
@@ -99,7 +109,7 @@ fn commits<S: Graph>(
   sides: &Sides<'_, S::Node>,
   admission: &mut Admission,
   counters: &mut Counters,
-) -> Result<BTreeSet<S::Node>, Refusal> {
+) -> Result<Positions, Refusal> {
   let mut paint = Paint::new();
   let walked = sides
     .wants
@@ -120,7 +130,7 @@ fn commits<S: Graph>(
   paint.run(graph, &sides.cut.grafts, |_| false, admission, counters)?;
   let sent = paint.chosen();
   admission
-    .charge_items::<S::Node>(sent.len())
+    .charge_items::<(u64, u64)>(sent.runs())
     .map_err(Refusal::PastAdmission)?;
   Ok(sent)
 }
@@ -136,27 +146,29 @@ fn left_out<S: Graph>(
   graph: &S,
   request: &Request<'_>,
   sides: &Sides<'_, S::Node>,
-  sent: &BTreeSet<S::Node>,
+  sent: &Positions,
   admission: &mut Admission,
-) -> Result<BTreeSet<S::Node>, Refusal> {
-  let mut held = BTreeSet::new();
+) -> Result<Held, Refusal> {
+  let mut held = Held::default();
+  let mut stack = Peak::default();
   for commit in sent
     .iter()
+    .filter_map(|position| S::Node::try_from(position).ok())
     .filter(|commit| !sides.cut.grafts.contains(commit))
   {
     for parent in graph
-      .parents(*commit)
-      .filter(|parent| !sent.contains(parent))
+      .parents(commit)
+      .filter(|parent| !sent.contains((*parent).into()))
     {
       if let Some(row) = graph.commit(parent) {
-        mark(graph, row.tree, &mut held, admission)?;
+        mark(graph, row.tree, &mut held, &mut stack, admission)?;
       }
     }
   }
-  left_out_aggressively(graph, request, sides, &mut held, admission)?;
+  left_out_aggressively(graph, request, sides, &mut held, &mut stack, admission)?;
   for have in sides.common.iter().filter_map(|node| peel(graph, *node)) {
     if graph.commit(have).is_none() {
-      mark(graph, have, &mut held, admission)?;
+      mark(graph, have, &mut held, &mut stack, admission)?;
     }
   }
   Ok(held)
@@ -168,7 +180,8 @@ fn left_out_aggressively<S: Graph>(
   graph: &S,
   request: &Request<'_>,
   sides: &Sides<'_, S::Node>,
-  held: &mut BTreeSet<S::Node>,
+  held: &mut Held,
+  stack: &mut Peak,
   admission: &mut Admission,
 ) -> Result<(), Refusal> {
   if !request.thin || sides.cut.grafts.is_empty() {
@@ -177,7 +190,7 @@ fn left_out_aggressively<S: Graph>(
   let listed = listed_haves(graph, request.haves, admission)?;
   for had in listed.iter().chain(&sides.cut.haves) {
     if let Some(row) = graph.commit(*had) {
-      mark(graph, row.tree, held, admission)?;
+      mark(graph, row.tree, held, stack, admission)?;
     }
   }
   Ok(())
@@ -211,24 +224,23 @@ fn listed_haves<S: Graph>(
   Ok(listed)
 }
 
-/// Adds `root` and everything below it to `held`, without recursion, a tree already held skipped whole.
+/// Adds `root` and everything below it to `held`, without recursion, a tree already held skipped whole; the stack
+/// charged at its deepest (`peak`).
 fn mark<S: Graph>(
   graph: &S,
   root: S::Node,
-  held: &mut BTreeSet<S::Node>,
+  held: &mut Held,
+  peak: &mut Peak,
   admission: &mut Admission,
 ) -> Result<(), Refusal> {
   let mut stack = vec![root];
   while let Some(node) = stack.pop() {
-    if !held.insert(node) {
+    if !held.insert(node, admission)? {
       continue;
     }
-    charge::<S::Node>(admission)?;
     if graph.kind(node) == Kind::Tree {
-      for entry in graph.entries(node) {
-        charge::<S::Node>(admission)?;
-        stack.push(entry);
-      }
+      stack.extend(graph.entries(node));
+      peak.reach::<S::Node>(stack.len(), admission)?;
     }
   }
   Ok(())
@@ -240,8 +252,8 @@ fn carried_by_runs<S: Graph>(
   runs: &[Run<S::Green>],
   filter: Option<&Filter>,
   admission: &mut Admission,
-) -> Result<BTreeSet<S::Node>, Refusal> {
-  let mut carried = BTreeSet::new();
+) -> Result<Held, Refusal> {
+  let mut carried = Held::default();
   for run in runs {
     for version in run.after.saturating_add(1)..=run.through {
       for node in graph.brought(run.green, version) {
@@ -251,8 +263,8 @@ fn carried_by_runs<S: Graph>(
         } else {
           0
         };
-        if filter.is_none_or(|filter| filter.admits(kind, size, 0)) && carried.insert(node) {
-          charge::<S::Node>(admission)?;
+        if filter.is_none_or(|filter| filter.admits(kind, size, 0)) {
+          carried.insert(node, admission)?;
         }
       }
     }
@@ -265,15 +277,26 @@ struct Chosen<'c, N> {
   /// The request's filter.
   filter: Option<&'c Filter>,
   /// What the client holds of trees and blobs.
-  left_out: &'c BTreeSet<N>,
+  left_out: &'c Held,
   /// The objects chosen.
-  objects: BTreeSet<N>,
-  /// Each tree opened, and the depth its entries were met at the last time it was, the least so far.
-  opened: BTreeMap<N, u64>,
+  objects: Held,
+  /// Each tree opened (and, under a `tree:` filter, the depth its entries were met at, the least so far).
+  opened: Opened<N>,
   /// The patterns of a `sparse:oid` filter, which decide by path.
   sparse: Option<&'c Patterns>,
   /// Under a `sparse:oid` filter, each tree no blob below which was left out: never walked again.
-  done: BTreeSet<N>,
+  done: Held,
+  /// The tree walk's stack, charged at its deepest.
+  stack: Peak,
+}
+
+/// The trees a walk opened: as runs where each opens once (every filter but `tree:`), with the depth each was last met
+/// at where that depth decides what is sent below it (a `tree:` filter, which reopens a tree met again shallower).
+enum Opened<N> {
+  /// Each opened once.
+  Once(Held),
+  /// Each with the least depth its entries were met at.
+  AtDepth(BTreeMap<N, u64>),
 }
 
 /// One `sparse:oid` walk from a root tree: the path of the tree being walked, its segments joined by `/` and a `/` after
@@ -327,12 +350,10 @@ fn charge_bytes(admission: &mut Admission, bytes: usize) -> Result<(), Refusal> 
     .map_err(Refusal::PastAdmission)
 }
 
-impl<N: Copy + Ord> Chosen<'_, N> {
+impl<N: Copy + Ord + Into<u64>> Chosen<'_, N> {
   /// Chooses `node`.
   fn take(&mut self, node: N, admission: &mut Admission) -> Result<(), Refusal> {
-    if self.objects.insert(node) {
-      charge::<N>(admission)?;
-    }
+    self.objects.insert(node, admission)?;
     Ok(())
   }
 
@@ -343,11 +364,6 @@ impl<N: Copy + Ord> Chosen<'_, N> {
       .is_none_or(|filter| filter.admits(kind, size, depth))
   }
 
-  /// Whether the depth a tree is met at decides what is sent below it: under a `tree:` filter alone.
-  fn depth_decides(&self) -> bool {
-    self.filter.is_some_and(|filter| !filter.is_per_object())
-  }
-
   /// A sent commit's root tree, at depth 0, and what lies below it.
   fn root<S: Graph<Node = N>>(
     &mut self,
@@ -356,7 +372,7 @@ impl<N: Copy + Ord> Chosen<'_, N> {
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<(), Refusal> {
-    if self.left_out.contains(&tree) {
+    if self.left_out.contains(tree) {
       return Ok(());
     }
     if let Some(patterns) = self.sparse {
@@ -409,7 +425,7 @@ impl<N: Copy + Ord> Chosen<'_, N> {
     admission: &mut Admission,
     counters: &mut Counters,
   ) -> Result<(), Refusal> {
-    if self.left_out.contains(&tree) || self.done.contains(&tree) {
+    if self.left_out.contains(tree) || self.done.contains(tree) {
       return Ok(());
     }
     let base = walk.path.len();
@@ -448,7 +464,7 @@ impl<N: Copy + Ord> Chosen<'_, N> {
     name: &[u8],
     admission: &mut Admission,
   ) -> Result<(), Refusal> {
-    if self.left_out.contains(&blob) || self.objects.contains(&blob) {
+    if self.left_out.contains(blob) || self.objects.contains(blob) {
       return Ok(());
     }
     let Some(frame) = walk.frames.last_mut() else {
@@ -480,8 +496,8 @@ impl<N: Copy + Ord> Chosen<'_, N> {
     if let Some(parent) = walk.frames.last_mut() {
       parent.left_out_below |= frame.left_out_below;
     }
-    if !frame.left_out_below && self.done.insert(frame.tree) {
-      charge::<N>(admission)?;
+    if !frame.left_out_below {
+      self.done.insert(frame.tree, admission)?;
     }
     Ok(())
   }
@@ -500,20 +516,27 @@ impl<N: Copy + Ord> Chosen<'_, N> {
       if !self.filter.is_none_or(|filter| filter.reaches(depth)) {
         continue;
       }
-      let opened_before = self
-        .opened
-        .get(&tree)
-        .is_some_and(|before| !self.depth_decides() || *before <= depth);
+      let opened_before = match &self.opened {
+        Opened::Once(opened) => opened.contains(tree),
+        Opened::AtDepth(opened) => opened.get(&tree).is_some_and(|before| *before <= depth),
+      };
       if opened_before {
         continue;
       }
-      if self.opened.insert(tree, depth).is_none() {
-        charge::<(N, u64)>(admission)?;
+      match &mut self.opened {
+        Opened::Once(opened) => {
+          opened.insert(tree, admission)?;
+        }
+        Opened::AtDepth(opened) => {
+          if opened.insert(tree, depth).is_none() {
+            charge::<(N, u64)>(admission)?;
+          }
+        }
       }
       counters.trees = counters.trees.saturating_add(1);
       for entry in graph
         .entries(tree)
-        .filter(|entry| !self.left_out.contains(entry))
+        .filter(|entry| !self.left_out.contains(*entry))
       {
         let kind = graph.kind(entry);
         let size = if kind == Kind::Blob {
@@ -525,8 +548,8 @@ impl<N: Copy + Ord> Chosen<'_, N> {
           self.take(entry, admission)?;
         }
         if kind == Kind::Tree {
-          charge::<(N, u64)>(admission)?;
           stack.push((entry, depth.saturating_add(1)));
+          self.stack.reach::<(N, u64)>(stack.len(), admission)?;
         }
       }
     }
@@ -569,7 +592,7 @@ impl<N: Copy + Ord> Chosen<'_, N> {
   fn tags<S: Graph<Node = N>>(
     &mut self,
     graph: &S,
-    carried: &BTreeSet<N>,
+    carried: &Held,
     admission: &mut Admission,
   ) -> Result<(), Refusal> {
     for tag in graph.tags() {
@@ -589,7 +612,7 @@ impl<N: Copy + Ord> Chosen<'_, N> {
         }
         current = next;
       }
-      let packed = ends.is_some_and(|end| self.objects.contains(&end) || carried.contains(&end));
+      let packed = ends.is_some_and(|end| self.objects.contains(end) || carried.contains(end));
       if packed {
         for link in chain {
           self.take(link, admission)?;

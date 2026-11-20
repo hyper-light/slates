@@ -48,6 +48,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 import push_load
@@ -196,7 +197,7 @@ async def burst(daemon: Daemon, pushes: list[tuple[str, int, bytes, str]]) -> tu
 
 # Format: the daemon's counters a step reports (A-724: where a starved push waits on the server): the HTTP edge's seats,
 # arrivals, overdue marks and reaps, and the share model's own.
-WATCHED_COUNTERS = re.compile(r"vcs_http|seat|arriv|overdue|reap|vcs_share|lane|turn")
+WATCHED_COUNTERS = re.compile(r"vcs_http|seat|arriv|overdue|reap|vcs_share|lane|turn|mem\.large")
 
 
 def counters(daemon: Daemon) -> dict[str, int]:
@@ -210,6 +211,10 @@ def counters(daemon: Daemon) -> dict[str, int]:
 
     def walk(value):
         if isinstance(value, dict):
+            # A refusal or event counter is reported as {"kind": name, "count": n}.
+            kind, count = value.get("kind"), value.get("count")
+            if isinstance(kind, str) and isinstance(count, int) and WATCHED_COUNTERS.search(kind):
+                found[kind] = found.get(kind, 0) + count
             for key, inner in value.items():
                 if isinstance(inner, int) and not isinstance(inner, bool) and WATCHED_COUNTERS.search(key):
                     found[key] = found.get(key, 0) + inner
@@ -266,8 +271,69 @@ def fair_share_ideal(work: dict[str, float], parallel: dict[str, int], capacity:
     return done
 
 
+# Where each daemon's own lines are kept, one file a daemon (A-724: the stuck, spinning and kill lines of a daemon that
+# ends name the task it ended in, A-740): beside the harness's scratch, never in the tree.
+LOG_DIR = os.path.expanduser(os.environ.get("MULTI_REPO_LOGS", "~/.cache/w-balance/daemon-logs"))
+# Format: the lines of a daemon's log that say why it ended.
+ENDING_LINES = re.compile(r"stuck|spinning|kill|out of memory|abort|panick|wedged", re.IGNORECASE)
+
+
+def drain(daemon: Daemon, path: str) -> threading.Thread:
+    """Copies the anchor's stderr to `path` as it comes, so the pipe never fills and a daemon's last words are kept."""
+
+    def copy():
+        with open(path, "a", encoding="utf-8", errors="replace") as log:
+            log.writelines(daemon.lines)
+            for line in daemon.anchor.stderr:
+                log.write(line)
+                log.flush()
+
+    thread = threading.Thread(target=copy, daemon=True)
+    thread.start()
+    return thread
+
+
+def ending(path: str) -> list[str]:
+    """The lines of a daemon's log that say why it ended."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as log:
+            return [line.rstrip() for line in log if ENDING_LINES.search(line)][-6:]
+    except OSError:
+        return []
+
+
+def usage_rows(daemon: Daemon) -> dict[str, dict]:
+    """Each repository's usage row from the daemon's status (A-724): by name."""
+    out = daemon.cli("status", "--json", check=False).stdout
+    try:
+        report = json.loads(out)
+    except ValueError:
+        return {}
+    rows: dict[str, dict] = {}
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                if key == "repositories" and isinstance(inner, list):
+                    for row in inner:
+                        if isinstance(row, dict) and row.get("name"):
+                            rows[row["name"]] = dict(row, partition=value.get("partition"))
+                else:
+                    walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+
+    walk(report)
+    return rows
+
+
 def fresh_daemon(slates: str, label: str) -> Daemon:
-    return Daemon(slates, instance=f"w-balance-multi-{os.getpid()}-{label}")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    daemon = Daemon(slates, instance=f"w-balance-multi-{os.getpid()}-{label}")
+    daemon.log_path = os.path.join(LOG_DIR, f"daemon-{os.getpid()}-{label}.log")
+    drain(daemon, daemon.log_path)
+    return daemon
 
 
 def main():
@@ -342,9 +408,13 @@ def main():
             results, wall, before, peak = asyncio.run(burst(daemon, pushes))
             alive = rss_kib(daemon.pid) > 0
             seen = counters(daemon) if alive else {}
+            rows = usage_rows(daemon) if alive else {}
         finally:
             daemon.stop()
         refused = sum(1 for _, _, words in results if words != "ok")
+        if not alive:
+            for line in ending(daemon.log_path):
+                print(f"  daemon's last words: {line[:300]}", flush=True)
         if seen:
             print("  counters: " + ", ".join(f"{k}={v}" for k, v in sorted(seen.items())), flush=True)
         print(f"R={repositories}: {total} pushes, wall {wall:.3f} s, rss {before / 1024:.0f} -> peak {peak / 1024:.0f} MiB, "
@@ -374,6 +444,64 @@ def main():
                 print(f"    {name}: p50 {quantile(values, 0.5):.3f} s, p99 {quantile(values, 0.99):.3f} s", flush=True)
             ideal_owner = quantile([i for (got, *_), i in zip(results, ideal_one) if got == size], 0.99)
             ideal_spread = quantile([i for (got, *_), i in zip(results, ideal_many) if got == size], 0.99)
+            single = [rank for rank in range(1, repositories + 1) if classes[rank - 1] == size and counts[rank - 1] == 1]
+            served, spans, queued = [], [], []
+            for rank in single:
+                row = rows.get(f"r{rank}")
+                wall = [took for (name, got, _, _), (got2, took, _) in zip(pushes, results) if name == f"r{rank}"]
+                if row and wall:
+                    serve = row.get("intake_step_ns", 0) / 1e9
+                    served.append(serve)
+                    spans.append((row.get("last_ns", 0) - row.get("first_ns", 0)) / 1e9)
+                    queued.append(max(0.0, wall[0] - serve))
+            if served:
+                # Each shard's step time spent on the repositories it owns (A-724), and beside each slow one-push
+                # repository the step time the others on its shard spent: a wait its shard's queue explains tracks it.
+                by_shard: dict = {}
+                for name, row in rows.items():
+                    by_shard[row.get("partition")] = by_shard.get(row.get("partition"), 0) + row.get("intake_step_ns", 0)
+                slow = sorted(
+                    ((row.get("last_ns", 0) - row.get("first_ns", 0)) / 1e9, rank, row)
+                    for rank in single
+                    if (row := rows.get(f"r{rank}"))
+                )[-5:]
+                for span, rank, row in slow:
+                    others = (by_shard.get(row.get("partition"), 0) - row.get("intake_step_ns", 0)) / 1e9
+                    print(f"    r{rank} on shard {row.get('partition')}: span {span:.3f} s, served "
+                          f"{row.get('intake_step_ns', 0) / 1e9:.3f} s, others' steps on its shard {others:.3f} s", flush=True)
+                # Each class's intake steps: how long one step holds its shard on average (step time over steps).
+                for cls in range(len(packs)):
+                    names = [f"r{rank}" for rank in range(1, repositories + 1) if classes[rank - 1] == cls]
+                    took = sum(rows[name].get("intake_step_ns", 0) for name in names if name in rows)
+                    steps = sum(rows[name].get("intake_steps", 0) for name in names if name in rows)
+                    longest = max((rows[name].get("longest_intake_step_ns", 0) for name in names if name in rows), default=0)
+                    phases = [0, 0, 0, 0]
+                    for name in names:
+                        for at, ns in enumerate(rows.get(name, {}).get("push_phases", {}).get("longest_ns", [])[:4]):
+                            phases[at] = max(phases[at], ns)
+                    if steps:
+                        print(f"    class {cls} intake: {steps} steps, {took / 1e9:.3f} s, a step {took / steps / 1e6:.2f} ms "
+                              f"on average, the longest {longest / 1e6:.1f} ms; longest by phase: input "
+                              f"{phases[0] / 1e6:.1f} ms, end {phases[1] / 1e6:.1f} ms, check turn {phases[2] / 1e6:.1f} ms, "
+                              f"answer {phases[3] / 1e6:.1f} ms", flush=True)
+                        # Each phase's steps, their time, and the time the push waited before them (A-724's profile).
+                        tally = {key: [0, 0, 0, 0] for key in ("steps", "ns", "gap_ns")}
+                        for name in names:
+                            for key, sums in tally.items():
+                                for at, value in enumerate(rows.get(name, {}).get("push_phases", {}).get(key, [])[:4]):
+                                    sums[at] += value
+                        print("      by phase: " + "; ".join(
+                            f"{label} {tally['steps'][at]} steps {tally['ns'][at] / 1e9:.3f} s "
+                            f"waited before {tally['gap_ns'][at] / 1e9:.3f} s"
+                            for at, label in enumerate(("input", "end", "check", "answer")))
+                            + f"; from the push's beginning to its first step "
+                            f"{sum(rows.get(name, {}).get('push_phases', {}).get('first_gap_ns', 0) for name in names) / 1e9:.3f} s",
+                            flush=True)
+                busiest = sorted(by_shard.items(), key=lambda item: -item[1])[:3]
+                print("    busiest shards by step time: " + ", ".join(f"{part}: {ns / 1e9:.2f} s" for part, ns in busiest), flush=True)
+                print(f"    {len(served)} one-push repositories: served p50 {quantile(served, 0.5):.3f} s p99 "
+                      f"{quantile(served, 0.99):.3f} s; server span p99 {quantile(spans, 0.99):.3f} s; "
+                      f"queued p50 {quantile(queued, 0.5):.3f} s p99 {quantile(queued, 0.99):.3f} s", flush=True)
             print(f"  class {size}: {len(mine)} pushes over {classes.count(size)} repositories, "
                   f"p50 {quantile(times, 0.5):.3f} s, p99 {p99:.3f} s ({p99 / alone[size]:.1f}x alone); "
                   f"starvation {p99 / ideal_owner:.2f}x its fair share (one shard a repository, ideal p99 {ideal_owner:.3f} s), "

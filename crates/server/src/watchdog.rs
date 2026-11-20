@@ -185,6 +185,23 @@ impl MemoryStallSource {
 pub struct Turns {
   looks: std::sync::atomic::AtomicU64,
   withheld: std::sync::atomic::AtomicU64,
+  /// The beat before the latest withheld episode began, on the watchdog's clock; zero before any.
+  episode_beat_ns: std::sync::atomic::AtomicU64,
+  /// How late the looks of that episode ran, up to its first withheld look: the term past a window and a beat its
+  /// verdict may come (A-232 step 5).
+  episode_late_ns: std::sync::atomic::AtomicU64,
+}
+
+/// The latest episode in which the watchdog withheld the beat for a stuck shard ([`Turns::episode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Withheld {
+  /// The last beat before it, on the watchdog's clock (`slates_vfs::clock::HostClock`'s monotonic time).
+  pub last_beat_ns: u64,
+  /// How late the watchdog's looks ran from that beat to its first withheld look. A stuck shard's beat stops within its
+  /// window, a beat and this of the moment it stuck, by the rule's own measure: the look before the one that last saw
+  /// it move came no later than that moment, and the verdict's look a window after it, each look up to a beat and this
+  /// late.
+  pub late_ns: u64,
 }
 
 impl Turns {
@@ -192,6 +209,26 @@ impl Turns {
   pub fn read(&self) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (self.looks.load(Relaxed), self.withheld.load(Relaxed))
+  }
+
+  /// The latest withheld episode, none before the first (A-232 step 5's bound, for a test to hold the beat's stop to).
+  pub fn episode(&self) -> Option<Withheld> {
+    use std::sync::atomic::Ordering::Acquire;
+    let last_beat_ns = self.episode_beat_ns.load(Acquire);
+    (last_beat_ns != 0).then(|| Withheld {
+      last_beat_ns,
+      late_ns: self.episode_late_ns.load(Acquire),
+    })
+  }
+
+  /// Records a withheld look of the episode after the beat at `last_beat_ns`, its looks `late_ns` late so far: the
+  /// episode's first withheld look alone, whose lateness is the verdict's.
+  fn withheld_after(&self, last_beat_ns: u64, late_ns: u64) {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    if self.episode_beat_ns.load(Acquire) != last_beat_ns {
+      self.episode_late_ns.store(late_ns, Release);
+      self.episode_beat_ns.store(last_beat_ns, Release);
+    }
   }
 
   fn looked(&self, withheld: bool) {
@@ -799,6 +836,7 @@ fn run(
   let mut said_control_ended = false;
   let mut stopping = false;
   let mut lateness = Lateness::default();
+  let mut last_beat_ns = 0_u64;
   loop {
     match stop.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS)) {
       Err(RecvTimeoutError::Timeout) => {}
@@ -874,7 +912,14 @@ fn run(
       }
     }
     turns.looked(stuck.is_some());
-    lateness.since_beat(turn == Turn::Beat, late_ns);
+    let episode_late_ns = lateness.since_beat(turn == Turn::Beat, late_ns);
+    match turn {
+      Turn::Beat => last_beat_ns = now.max(1),
+      Turn::Withhold(Cause::Stuck { .. }) if last_beat_ns != 0 => {
+        turns.withheld_after(last_beat_ns, episode_late_ns);
+      }
+      Turn::Withhold(_) | Turn::End(_) => {}
+    }
     mark(segment, turn, now);
     match turn {
       Turn::Beat => {}

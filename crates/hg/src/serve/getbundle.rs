@@ -231,6 +231,7 @@ pub fn getbundle(
 /// one payload chunk, or the parts after it and the stream's end. What the answer holds across steps is the parts after
 /// the changegroup (made when it begins: bookmarks, `listkeys`, markers, phase heads), the missing changesets as ranges
 /// ([`pull::Ranges`]) and its place in the changegroup ([`Walk`]); never a revision's text past its step.
+#[derive(Debug)]
 pub struct Answering {
   /// The stream's head and the changegroup part's header, until the first step writes them.
   head: Option<Vec<u8>>,
@@ -307,7 +308,6 @@ impl Answering {
       let mut chunk = Vec::new();
       let more = walk.step(store, room, &mut chunk)?;
       if !chunk.is_empty() {
-        room.charge(to_u64(chunk.len()))?;
         crate::bundle2::put_payload_chunk(out, &chunk).map_err(|_| unencodable("a chunk"))?;
       }
       if !more {
@@ -621,6 +621,7 @@ enum At {
 /// (`mdiff.trivialdiffheader`). The walk holds its place alone: the missing changesets as ranges, and the log and
 /// position next. It never collects the paths the changesets touch: the file logs are walked from one to the next
 /// ([`Store::file_linked_from`]), and a log whose revisions no missing changeset links sends no group.
+#[derive(Debug)]
 pub struct Walk {
   /// The changesets the client lacks.
   missing: pull::Ranges,
@@ -667,7 +668,8 @@ impl Walk {
       out.extend_from_slice(&named);
       return Ok(false);
     }
-    let Some(at) = self.at.take() else {
+    // A refused step leaves the walk where it was, so a step given more room takes the same unit again.
+    let Some(at) = self.at.clone() else {
       return Ok(false);
     };
     self.at = match at {

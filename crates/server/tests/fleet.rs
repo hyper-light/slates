@@ -4698,9 +4698,10 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
 }
 
 /// AC (§4.8 "Lookup": a lookup by id routes to the volume's creator, whatever the asker's region). Three daemons in
-/// one region; a volume is created and write-attached on a. Do: through clients of b and c, ask its status, make a
-/// directory in it under b's client's own attachment of it (A-222: a forward through a's attachment is refused since
-/// 2026-11-05), and list its root. Expect: each is served by a, the directory b made is the
+/// one region; a volume is created and write-attached on a. Do: through clients of b and c, ask its status; let a's write
+/// attachment go (A-414: while it lives the write lease stays a's, and another host's attach for writing is refused
+/// `LeaseHeld`); make a directory in it under b's client's own attachment of it (A-222: a forward through a's attachment
+/// is refused since 2026-11-05), and list its root. Expect: each is served by a, the directory b made is the
 /// one c lists, and a lists it too. Before 2026-10-07 only a volume homed in another region was forwarded; a client
 /// of b or c was answered `NotFound` for a's volume (found on two Docker networks, `docs/wip/GAPS.md`).
 #[test]
@@ -4756,23 +4757,33 @@ fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_thr
   let (status_served, status_last) =
     poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
   // b's client writes under its own attachment, which a records under b's host (A-222): a forward through a's own
-  // attachment is refused, as a forward naming another host's attachment always is.
-  let _ = attachment;
+  // attachment is refused, as a forward naming another host's attachment always is. a lets its own write attachment go
+  // first: while it lives the write lease stays a's and b's attach for writing is refused `LeaseHeld` (A-414); once it
+  // has gone the lease lasts one term more, which b's attach below waits out.
+  assert!(
+    matches!(
+      client_a.call(&RequestBody::Detach { attachment }),
+      ReplyBody::Detached
+    ),
+    "a detached its write attachment"
+  );
   let mut b_attachment = None;
   let mut made = None;
   let made_served = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
     COUNCIL_RETIRE_DEADLINE,
     || {
-      if b_attachment.is_none()
-        && let ReplyBody::Attached { attachment, .. } = client_b.call(&RequestBody::Attach {
+      if b_attachment.is_none() {
+        match client_b.call(&RequestBody::Attach {
           volume: id,
           snapshot: None,
           intent: Intent::Write,
           form: AttachRequest::Root,
-        })
-      {
-        b_attachment = Some(attachment);
+        }) {
+          ReplyBody::Attached { attachment, .. } => b_attachment = Some(attachment),
+          // What refused b's attach is what the failure says, not `None`.
+          refused => made = Some(refused),
+        }
       }
       let Some(attachment) = b_attachment else {
         return Ok(false);
@@ -14521,20 +14532,22 @@ fn assert_refused_at_the_slo(first: &Result<ReplyBody, IpcError>, slo_ns: u64) {
   );
 }
 
-/// A-354 (§4.10 "Live shipping"; CLAUDE.md §2 items 8 and 9): a reply held for a live volume's durability waits through
-/// a silence but is answered at the latest at the failover delay from its hold, the total bound of the rule every
-/// transport judges a held reply by (`slates_bridge_core::durable_bound`), refused `DurabilityPending` as the request's
-/// recorded outcome; the verb sent again under a new id runs again and is answered once the log is durable. Do: three
-/// nodes at `f = 1`; both survivors refuse every register record from a (`Daemon::inject_record_refusal`), so a new
-/// live volume's head and catalog never place and nothing written to it can be durable; on a, a live-shipped volume
-/// shared with the fleet; one write, its reply awaited for at most the placement wait; the same request again; then
-/// lift the refusals and send the write under a new id. Expect the write refused `DurabilityPending` after it was held
-/// the failover delay and within a liveness budget past it, counted `fleet.live.held_gave_up`; the same request answered
-/// that same refusal (its completion, §4.9); and the write under a new id answered `FsDone`. Before, a held reply ended
-/// only durable, fenced or destroyed, so its client waited as long as its daemon lived (A-353's hang: a write through a
-/// successor whose catalog was refused for good waited 21 minutes).
+/// A-354 (§4.10 "Live shipping"; CLAUDE.md §2 items 8 and 9) with main's ruling of 2026-11-20 (a verb never takes
+/// effect twice): a reply held for a live volume's durability is answered at the latest at the failover delay from its
+/// hold, `DurabilityPending`, and the verb's own reply is recorded as its completion, so its resend under the same id is
+/// answered that reply and never runs it again. Do: three nodes at `f = 1`; both survivors refuse every register record
+/// from a (`Daemon::inject_record_refusal`), so a new live volume's head and catalog never place and nothing written to it
+/// can be durable; on a, a live-shipped volume shared with the fleet; a directory made through the raw ring, its reply
+/// awaited for at most the placement wait, then the same request again; a second directory made through
+/// `slates_client::Client`, which sends a `DurabilityPending` request again under its id itself; then lift the refusals
+/// and list the root. Expect the first answer `DurabilityPending` after the failover delay and within a liveness budget
+/// past it, counted `fleet.live.held_gave_up`; its resend answered `FsDone`, the verb's own reply; the client's call
+/// answered `FsDone`; and each directory listed once. Before, the refusal was the recorded completion: the resend was
+/// answered `DurabilityPending` again, and a consumer told to make the call again ran the verb a second time (a
+/// directory's second making refused `AlreadyExists`, an append landed twice; g226). Before 2026-11-18 a held reply ended
+/// only durable, fenced or destroyed, so its client waited as long as its daemon lived (A-353's hang).
 #[test]
-fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again() {
+fn a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   // a's failover delay held at its estimate now (A-363), so the hold's bound cannot move under the assertion; held from
@@ -14548,38 +14561,59 @@ fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_dela
   }
   let mut client = Client::connect(daemons[0].instance());
   let (id, attachment) = live_volume_attached(&mut client, &daemons, "held-for-good");
-  let write = RequestBody::FsWrite {
+  let mkdir = |path: &str| RequestBody::FsMkdir {
     volume: id,
     attachment,
-    path: "/held".to_owned(),
-    bytes: b"held for a durability it cannot reach".to_vec(),
-    mode: 0o644,
+    path: path.to_owned(),
+    mode: 0o755,
   };
   let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap();
-  let first = client.try_call(&write, deadline_ns);
-  let same_id = client.try_retry(&write, deadline_ns);
+  let first = client.try_call(&mkdir("/raw"), deadline_ns);
+  let same_id = client.try_retry(&mkdir("/raw"), deadline_ns);
+  let deadlines =
+    slates_client::Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS)
+      .get();
+  let through_client = slates_client::Client::connect(daemons[0].instance(), deadlines)
+    .unwrap()
+    .call(&mkdir("/client"));
   let gave_up = count_of(&summed_counters(&daemons[0]), LIVE_HELD_GAVE_UP);
   for daemon in &daemons[1..] {
     daemon.inject_record_refusal(&[]).unwrap();
   }
-  let again = client.try_call(&write, deadline_ns);
+  let listed = client.call(&RequestBody::ReadDir {
+    volume: id,
+    path: "/".to_owned(),
+    at: ReadAt::Head,
+    cursor: 0,
+  });
   drop(client);
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "held for good: the write {first:?}, the same request {same_id:?}, {gave_up} given up, the write again {again:?}"
+    "held for good: the mkdir {first:?}, the same request {same_id:?}, through the client {through_client:?}, \
+     {gave_up} given up, the root {listed:?}"
   );
   assert_refused_at_the_slo(&first, slo_ns);
   assert!(gave_up >= 1, "the owner counted the reply given up");
   assert!(
-    matches!((&first, &same_id), (Ok(first), Ok(same)) if first == same),
-    "the same request was answered its recorded refusal: {same_id:?}"
+    matches!(same_id, Ok(ReplyBody::FsDone { .. })),
+    "the same request was answered the verb's own reply, not run again: {same_id:?}"
   );
   assert!(
-    matches!(again, Ok(ReplyBody::FsDone { .. })),
-    "the write under a new id was answered once the log was durable: {again:?}"
+    matches!(through_client, Ok(ReplyBody::FsDone { .. })),
+    "the client asked again under the id and handed back the verb's own reply: {through_client:?}"
   );
+  let ReplyBody::DirPage { entries, .. } = &listed else {
+    panic!("the root was listed: {listed:?}");
+  };
+  for name in ["raw", "client"] {
+    assert_eq!(
+      entries.iter().filter(|entry| entry.name == name).count(),
+      1,
+      "{name} was made once: {entries:?}"
+    );
+  }
 }
 
 /// Format: a node's count of live volumes it took over from their logs (`live_ship::archive_from_live`).

@@ -183,6 +183,25 @@ impl<S: HgStores> Command for HgCommand<S> {
     }
     let progress = if stdio.taking_push() {
       stdio.step_push()
+    } else if stdio.streaming() {
+      // A-745 (§4.17.1 "A fetch's answer"): a `getbundle`'s answer made a turn at a time, the view lent for the turn,
+      // each slice within the shard's room, the turn ending at its quantum or once a room's worth waits to be sent.
+      let (turn_room, quantum) = stores.fetch_turn(*repository).unwrap_or((*room, 0));
+      let mut admission = Admission::new(turn_room);
+      let start = slates_rt::futures::now_ns();
+      let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
+      stores
+        .lend(*repository, &mut admission, |store, _| {
+          loop {
+            match stdio.stream(store, turn_room) {
+              Progress::Streamed { more: true }
+                if slates_rt::futures::now_ns().saturating_sub(start) < quantum
+                  && stdio.stdout().len() < bound => {}
+              other => break other,
+            }
+          }
+        })
+        .ok_or_else(unheld)?
     } else {
       let mut admission = Admission::new(*room);
       stores
@@ -198,6 +217,7 @@ impl<S: HgStores> Command for HgCommand<S> {
       Progress::Stepped { consumed, .. } | Progress::Took { consumed, .. } => {
         (consumed, Next::More)
       }
+      Progress::Streamed { .. } => (0, Next::More),
       Progress::Waiting => (0, Next::Input),
     };
     let next = if stdio.finished() {

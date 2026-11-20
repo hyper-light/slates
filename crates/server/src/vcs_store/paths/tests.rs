@@ -723,3 +723,36 @@ fn t_a626_p4_a_work_copies_a_tree_holding_a_hard_link() {
     )
   );
 }
+
+/// A-586 (main's ruling of 2026-11-20: a copy this piece does not make is refused typed, never a conflict). Do: submit
+/// a work copying `/nothing` to `/z`. Expect: the submit refused `CopyRefused` naming `z` and `SourceEmpty`.
+#[test]
+fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
+  let reply = crate::daemon::audit_on_shard(|state| {
+    let at = git_repository(state, "nothing");
+    version(state, at.1, 1, vec![create("/a", b"a")]);
+    let made = ask(
+      state,
+      RequestBody::CreateWork {
+        green: at.1,
+        name: "w".to_owned(),
+      },
+    );
+    let ReplyBody::WorkCreated { id: work, .. } = made else {
+      return made;
+    };
+    let copy = WorkOp::Copy {
+      from: "/nothing".to_owned(),
+      to: "/z".to_owned(),
+      version: None,
+      replace: false,
+    };
+    ask(state, RequestBody::Declare { work, op: copy });
+    ask(state, crate::identities::authored(work, "copy nothing"))
+  });
+  let expected = slates_ipc::protocol::Refusal::CopyRefused {
+    path: "z".to_owned(),
+    case: slates_ipc::protocol::CopyCase::SourceEmpty,
+  };
+  assert_eq!(reply, ReplyBody::Refused { refusal: expected });
+}

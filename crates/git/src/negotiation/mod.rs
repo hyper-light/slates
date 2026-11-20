@@ -51,6 +51,7 @@ mod shallow;
 pub mod sparse;
 
 use crate::object_name::{Kind, ObjectId};
+use crate::positions::Positions;
 use crate::{Admission, PastAdmission};
 
 pub use filter::Filter;
@@ -65,7 +66,9 @@ pub const INFINITE_DEPTH: u32 = i32::MAX.unsigned_abs();
 pub trait Graph {
   /// One object the store holds, named by the store's own handle (its position in the repository's index), so a walk
   /// keeps handles rather than names.
-  type Node: Copy + Ord + core::fmt::Debug;
+  /// Its position in the index is its number (A-745): the answer carries the objects it sends as runs of positions
+  /// ([`Positions`]), never one at a time.
+  type Node: Copy + Ord + core::fmt::Debug + Into<u64> + TryFrom<u64>;
   /// A green, one branch of the repository, whose versions each have a head.
   type Green: Copy + Ord + core::fmt::Debug;
 
@@ -201,8 +204,11 @@ pub struct Pack<G, N> {
   pub shallow_info: Option<ShallowInfo>,
   /// Runs of versions sent whole; the request's filter applies to their objects.
   pub runs: Vec<Run<G>>,
-  /// Objects sent one by one, each once, in handle order.
-  pub objects: Vec<N>,
+  /// Objects sent one by one, by position, as runs (A-745: a fetch holds what it sends as runs, which one push's objects
+  /// make one of, never an object at a time); `N` names the graph's objects elsewhere in the answer.
+  pub objects: Positions,
+  /// The graph's objects, named in the answer's other sections.
+  pub(crate) _node: core::marker::PhantomData<N>,
 }
 
 /// What a `fetch` request is answered.
@@ -271,6 +277,69 @@ fn charge<T>(admission: &mut Admission) -> Result<(), Refusal> {
   admission
     .charge_items::<T>(1)
     .map_err(Refusal::PastAdmission)
+}
+
+/// A set of the graph's objects a walk keeps, by position, as runs (A-745, §4.17.1 "A fetch's answer" rule 1: a fetch's
+/// working set is a run a range of positions, never an entry an object), charged a run's bytes as its runs grow past
+/// what was charged before: a walk over one push's objects keeps one run whatever it meets.
+#[derive(Debug, Default)]
+pub(super) struct Held {
+  /// The positions held.
+  set: Positions,
+  /// The most runs it has held, each charged once.
+  charged: usize,
+}
+
+impl Held {
+  /// Adds `node`: whether it was not held, its run charged where it begins one past those charged.
+  pub(super) fn insert<N: Into<u64>>(
+    &mut self,
+    node: N,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    let new = self.set.insert_new(node.into());
+    if self.set.runs() > self.charged {
+      charge::<(u64, u64)>(admission)?;
+      self.charged = self.set.runs();
+    }
+    Ok(new)
+  }
+
+  /// Whether `node` is held.
+  pub(super) fn contains<N: Into<u64>>(&self, node: N) -> bool {
+    self.set.contains(node.into())
+  }
+
+  /// The positions held.
+  pub(super) fn positions(&self) -> &Positions {
+    &self.set
+  }
+
+  /// The positions held, the set given up.
+  pub(super) fn into_positions(self) -> Positions {
+    self.set
+  }
+}
+
+/// What a walk's transient list (a stack, a queue) has cost: its most entries, each charged once as the list first grows
+/// past it (A-745: a walk's stack is charged at its deepest, never once an entry pushed over the walk).
+#[derive(Debug, Default)]
+pub(super) struct Peak {
+  /// The most entries charged.
+  charged: usize,
+}
+
+impl Peak {
+  /// Charges `len` entries of `T` past the most charged before.
+  pub(super) fn reach<T>(&mut self, len: usize, admission: &mut Admission) -> Result<(), Refusal> {
+    if len > self.charged {
+      admission
+        .charge_items::<T>(len.saturating_sub(self.charged))
+        .map_err(Refusal::PastAdmission)?;
+      self.charged = len;
+    }
+    Ok(())
+  }
 }
 
 /// Answers `request` from `graph`, keeping what it must within `admission`.
@@ -345,6 +414,7 @@ pub fn negotiate<S: Graph>(
       shallow_info: cut.info,
       runs: runs.runs,
       objects,
+      _node: core::marker::PhantomData,
     }),
     counters,
   })

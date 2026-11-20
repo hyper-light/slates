@@ -38,9 +38,9 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  ArchiveFault, AttachTransport, DatabaseRefusal, HostPathReason, ImportFault, MoveRefusal,
-  OwnMountUse, Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason,
-  VcsTool, VolumeId, VolumeRefusal,
+  ArchiveFault, AttachTransport, CopyCase, DatabaseRefusal, HostPathReason, ImportFault,
+  MoveRefusal, OwnMountUse, Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal,
+  UnsupportedReason, VcsTool, VolumeId, VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -410,8 +410,9 @@ pub enum RetryCause {
   /// A stream's holder record has not reached its shard yet (A-181).
   HolderPending,
   /// The verb ran on its owner, but what its reply waits for (a live volume's log on `f` candidates, a destroy's
-  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): its effects stay on the
-  /// owner, never claimed durable, and the call made again runs the verb again.
+  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): it took effect once and
+  /// recorded its own reply, which the client asks for again under the request's id itself (since 2026-11-20), so this
+  /// reaches a caller only where that resend found no room. Asked again under a new id it runs again: a new request.
   DurabilityPending {
     /// How long the reply was held, nanoseconds.
     held_ns: u64,
@@ -538,6 +539,14 @@ pub enum Invalid {
   /// import under way, a format or a file the import does not take, more than it may hold, a fetch still pending, or
   /// the import given back. The repository's store is as it was.
   Import(ImportFault),
+  /// A copy the submitted work declares was refused before any verdict, by its case (A-586; main's ruling of
+  /// 2026-11-20): no rebase answers it; nothing of the work was applied.
+  Copy {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyCase,
+  },
 }
 
 /// Why a move's target cannot take the volume ([`Invalid::MoveTarget`], A-291).
@@ -954,6 +963,7 @@ impl Error {
       Refusal::ImageRefused { reason } => Error::Invalid(Invalid::Image(Note::new(reason))),
       Refusal::ArchiveRefused { fault } => Error::Invalid(Invalid::Archive(fault)),
       Refusal::ImportRefused { fault } => Error::Invalid(Invalid::Import(fault)),
+      Refusal::CopyRefused { path, case } => Error::Invalid(Invalid::Copy { path, case }),
       Refusal::OwnMount { path, used_as } => Error::Invalid(Invalid::OwnMount { path, used_as }),
       Refusal::Destroying => Error::Unusable(Unusable::Destroying),
       Refusal::Archived => Error::Unusable(Unusable::Archived),
@@ -1733,6 +1743,23 @@ mod tests {
     );
     assert!(overloaded.is_retryable());
     assert_eq!(overloaded.retry_pause_ns(), Some(PAUSE_NS));
+  }
+
+  /// A-586 (main's ruling of 2026-11-20): do type a copy refused before its verdict as a consumer meets it; expect an
+  /// invalid request naming the copy's destination and case, never retried.
+  #[test]
+  fn a_copy_refusal_is_typed_invalid_by_its_case() {
+    let refused = ClientError::Refused(Refusal::CopyRefused {
+      path: "y".to_owned(),
+      case: slates_ipc::protocol::CopyCase::LinkAcrossCopy,
+    });
+    let typed = Error::of_client("w", refused, None, PAUSE_NS);
+    let expected = Invalid::Copy {
+      path: "y".to_owned(),
+      case: slates_ipc::protocol::CopyCase::LinkAcrossCopy,
+    };
+    assert_eq!(typed, Error::Invalid(expected));
+    assert!(!typed.is_retryable());
   }
 
   /// A-678: do type a repository import's refusal as a consumer meets it, from a call that names no volume; expect an
