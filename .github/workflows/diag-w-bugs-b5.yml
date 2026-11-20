@@ -135,6 +135,8 @@ jobs:
             $anchor = Start-Process $bin -ArgumentList '--instance','b5','anchor','--quick','--shards','2' -PassThru -RedirectStandardError "$out\anchor.txt" -RedirectStandardOutput "$out\anchor-out.txt"
             for ($i = 0; $i -lt 60; $i++) { & $bin --instance b5 volume list *> $null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep 1 }
             "volume list exit $LASTEXITCODE after $i s" | Add-Content $log
+            & $bin --instance b5 bootstrap root *>> $log
+            "bootstrap exit $LASTEXITCODE" | Add-Content $log
             $created = (& $bin --instance b5 volume create b5 --bounded 256MiB 2>&1 | Out-String)
             "volume create exit $LASTEXITCODE`n$created" | Add-Content $log
             $vol = ($created -split "`n" | Where-Object { $_ -match '^id:' } | Select-Object -First 1).Split()[-1].Trim()
