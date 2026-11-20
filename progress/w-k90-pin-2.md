@@ -21,3 +21,16 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - GitHub run 44807509237 (a82ce7ede, contains 08f1a434): ubuntu-latest + ubuntu-24.04-arm `slates` Build killed
   (exit 143); windows-slates (w-k90-win) red in slates_e2e + lib steps -> inbox/w-k90-win-from-w-k90-pin-2.md.
   macos-latest / windows-11-arm slates still running then. api.github.com rate-limited (60/h shared).
+
+## ~14:50 PST
+- GitHub run 44807509237 (a82ce7ede, contains 08f1a434), per job:
+  windows-11-arm `slates` 136537837042: build 62 min OK, `--lib workspace::slates` OK (52 min), integration step stopped
+  by timeout-minutes 120. macos-latest `slates` 136537836996: build 98 min, stopped in lib tests. Ubuntu slates both
+  lost the runner ~23 min into the build (exit 143). windows-11-arm (clippy, build) 136537837066 GREEN; windows-latest
+  (clippy, build) 136537837057 GREEN. macos-latest/ubuntu-arm clippy red (deprecated fetch_update in vendor/slates under
+  -D warnings; for main's lint keeper). linux (clippy, tests) lost its runner.
+- LANDED kiln c0f576eb3 (merge-base confirmed; base c0f576eb3): GitHub `slates` job timeout 240, "Room on disk (Linux)"
+  step (rm the image's dotnet/android/ghc/CodeQL). Validated (ci.workflows.validate: 0 diagnostics).
+- kiln lanes: linux-x86_64 leg 01a1fa8f0de8 'running' but waits 'capacity' on 451397 (steps pending ~2.5 h);
+  macos-arm64 attempt 2 running on d13238; linux-arm64 + win-arm64-cross queued 'headroom'.
+- Worktree ~/kiln-work/w-k90-pin-2-land (landed; remove when done).
