@@ -1489,7 +1489,10 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
 
 /// One push of `request` driven as an edge drives it (`crate::vcs_http::git::receive`): its answer a step at a time,
 /// yielding after a turn, and the names it asks to home homed in the region off the step (A-724 piece 8c).
-async fn homed_drive(repository: RepositoryId, request: &[u8]) -> Result<super::Received, String> {
+pub(crate) async fn homed_drive(
+  repository: RepositoryId,
+  request: &[u8],
+) -> Result<super::Received, String> {
   use crate::state::with_state;
   let mut push = with_state(|state| {
     ReceivePack::start(

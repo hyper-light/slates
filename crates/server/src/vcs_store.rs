@@ -99,6 +99,10 @@ use crate::state::ShardState;
 
 pub(crate) mod arena_windows;
 pub(crate) mod commits;
+pub(crate) mod durable;
+#[allow(unused_imports)]
+// Owed callers: w-svn's landing (A-727 slice b); `BarrierRefused` and `ContentTicket` name its terms.
+pub(crate) use durable::{BarrierRefused, ContentTicket, content_durable, content_ticket};
 pub(crate) mod git_encode;
 pub(crate) mod git_replay;
 pub(crate) mod hg_import;
