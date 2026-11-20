@@ -83,6 +83,7 @@
 //! No I/O, no clock, no randomness, no panic.
 
 mod locks;
+pub use locks::{LockHookCall, PreHooked};
 mod revprops;
 #[cfg(test)]
 mod tests;
@@ -591,9 +592,15 @@ enum Phase {
   /// A lock verb was read, its item kept, and whether the client has just authenticated for it: the
   /// caller's judging is awaited ([`Connection::lock_verb`]).
   LockAsked(Box<Established>, Vec<u8>, bool),
+  /// A lock verb passed its access checks, its pre-hooks with the caller: their verdicts are awaited
+  /// ([`Connection::lock_judged`]; A-730).
+  LockHooking(Box<Established>, Box<locks::Hooking>),
   /// A lock verb was judged, its entries with the caller: their landing is awaited
   /// ([`Connection::locks_landed`]).
   Locking(Box<Established>, Box<locks::Pending>),
+  /// A lock verb's paths are answered, its post-hook with the caller: its verdict is awaited
+  /// ([`Connection::locks_finished`]; A-730).
+  LockFinishing(Box<Established>, Box<locks::Pending>),
   /// The connection has ended.
   Ended,
 }
@@ -614,7 +621,9 @@ impl std::fmt::Debug for Phase {
       Self::Accepted(_) => "Accepted",
       Self::Dropping(_) => "Dropping",
       Self::LockAsked(..) => "LockAsked",
+      Self::LockHooking(..) => "LockHooking",
       Self::Locking(..) => "Locking",
+      Self::LockFinishing(..) => "LockFinishing",
       Self::Ended => "Ended",
     })
   }
@@ -659,7 +668,9 @@ impl Connection {
       | Phase::Hooked(..)
       | Phase::Accepted(_)
       | Phase::LockAsked(..)
-      | Phase::Locking(..) => Waiting::Writing,
+      | Phase::LockHooking(..)
+      | Phase::Locking(..)
+      | Phase::LockFinishing(..) => Waiting::Writing,
       Phase::Reporting(_, exchange) => match exchange.awaiting() {
         Awaiting::Report => Waiting::Report,
         Awaiting::Drive => Waiting::Writing,
@@ -685,7 +696,9 @@ impl Connection {
       | Phase::Accepted(established)
       | Phase::Dropping(established)
       | Phase::LockAsked(established, _, _)
-      | Phase::Locking(established, _) => Some(&established.session),
+      | Phase::LockHooking(established, _)
+      | Phase::Locking(established, _)
+      | Phase::LockFinishing(established, _) => Some(&established.session),
       Phase::Handshake(_) | Phase::Ended => None,
     }
   }
@@ -713,7 +726,9 @@ impl Connection {
         | Phase::Hooked(..)
         | Phase::Accepted(_)
         | Phase::LockAsked(..)
+        | Phase::LockHooking(..)
         | Phase::Locking(..)
+        | Phase::LockFinishing(..)
         | Phase::Ended
     ) {
       return Err(Refused::OutOfTurn);
@@ -1008,7 +1023,9 @@ impl Connection {
       | Phase::Hooked(..)
       | Phase::Accepted(_)
       | Phase::LockAsked(..)
+      | Phase::LockHooking(..)
       | Phase::Locking(..)
+      | Phase::LockFinishing(..)
       | Phase::Ended => Err(Refused::OutOfTurn),
     }
   }

@@ -1708,3 +1708,45 @@ fn pre_commit_reads_the_transaction_whose_work_drops_its_ephemeral_properties() 
   let expected = ("3-1".to_owned(), 3, vec![log.clone(), agent], rows);
   assert_eq!((read, accepted), (Some(expected), Some(vec![log])));
 }
+
+/// A-730 (`hooks.c` `lock_token_content`; `serve.c` `add_lock_tokens` hands the filesystem each path as the client sent
+/// it). Do: read pre-commit's lock tokens off a transaction whose session is based at `/trunk/with space`, presenting
+/// tokens for two files beneath it, and off one based at the root. Expect: each path relative to its base, as the
+/// client wrote it (`b.txt` for `/trunk/with space/b.txt`, A-623's recording), in path order; at the root, the path
+/// without its leading slash.
+#[test]
+fn pre_commits_lock_tokens_name_each_path_as_the_client_sent_it() {
+  let presented: BTreeMap<String, String> = [
+    ("/trunk/with space/b.txt", "opaquelocktoken:b"),
+    ("/trunk/with space/sub/c.txt", "opaquelocktoken:c"),
+  ]
+  .into_iter()
+  .map(|(path, token)| (path.to_owned(), token.to_owned()))
+  .collect();
+  let (rows, texts, property_lists) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+  let pending = |base_path| Pending {
+    transaction: "0-0",
+    base: 0,
+    revision_properties: &[],
+    rows: &rows,
+    texts: &texts,
+    property_lists: &property_lists,
+    base_path,
+    presented: &presented,
+  };
+  let pair = |path: &str, token: &str| (path.to_owned(), token.to_owned());
+  assert_eq!(
+    pending("/trunk/with space").lock_tokens(),
+    vec![
+      pair("b.txt", "opaquelocktoken:b"),
+      pair("sub/c.txt", "opaquelocktoken:c")
+    ]
+  );
+  assert_eq!(
+    pending("/").lock_tokens(),
+    vec![
+      pair("trunk/with space/b.txt", "opaquelocktoken:b"),
+      pair("trunk/with space/sub/c.txt", "opaquelocktoken:c")
+    ]
+  );
+}

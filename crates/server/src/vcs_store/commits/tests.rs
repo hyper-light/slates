@@ -24,7 +24,8 @@ use crate::vcs_store::paths::tests::{
 };
 use crate::vcs_store::record::Record;
 use crate::vcs_store::tests::{
-  FIRST_DATE, assert_made_again_whole, commit_of, hex, owner, push_through, records, tree_of,
+  FIRST_DATE, assert_made_again_whole, commit_of, hex, owner, push_through, push_unsettled,
+  records, tree_of,
 };
 use crate::vcs_store::upload::tests::{answered, fetch, lines_of, ls_refs, pack_of};
 use crate::verbs::to_db_volume;
@@ -422,4 +423,120 @@ fn t_a664_p3_an_executable_file_moved_is_100755_in_its_commit() {
     ("y/b", Mode::Executable, b"beta"),
   ]);
   assert_eq!(second, expected);
+}
+
+/// A pushed commit of three files on `repository`'s root green, its map left to its build (A-664's live whole builds):
+/// the pushed tree.
+fn pushed_three(
+  state: &mut ShardState,
+  (repository, root): (RepositoryId, slates_db::catalog::VolumeId),
+) -> ObjectId {
+  let files = [
+    (b"README".to_vec(), b"one\n".to_vec()),
+    (b"a".to_vec(), b"alpha\n".to_vec()),
+    (b"b".to_vec(), b"beta\n".to_vec()),
+  ];
+  let (objects, pushed) = commit_of(&files, &[], FIRST_DATE);
+  let tree = tree_of(&objects);
+  push_unsettled(state, (repository, root), &objects, (None, pushed, tree));
+  tree
+}
+
+/// A-664's live whole builds (a push's; main's ruling of 2026-11-20). Do: push a commit of three files to a git
+/// repository's root green, whose map the push leaves to its build; read the green's kept tree; drive the build's slices
+/// to its end; read it again. Expect: the push answered with no map kept and the build under way; the build ran in
+/// more slices than one (a test's step budget is none, so a file a slice) and kept the pushed commit's tree, built once.
+#[test]
+fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, green) = git_repository(state, "sliced");
+    let root = to_db_volume(green);
+    let key = green_key(root);
+    let tree = pushed_three(state, (repository, root));
+    let building = crate::vcs_store::paths::whole_build::building;
+    let answered = (kept_tree(state, repository, key), building(state, root));
+    crate::vcs_store::paths::whole_build::settle(state);
+    let built = (
+      kept_tree(state, repository, key) == Some(tree),
+      building(state, root),
+    );
+    let slices = count(state, crate::vcs_store::paths::whole_build::SLICES);
+    (
+      answered,
+      built,
+      slices > 1,
+      count(state, crate::vcs_store::paths::BUILT),
+    )
+  });
+  assert_eq!(seen, ((None, true), (true, false), true, 1));
+}
+
+/// A-664's live whole builds (a submit parked behind one). Do: push a commit of three files to a git repository's root
+/// green, its map left to its build; submit a work editing `README` while the build is under way; drive the build to
+/// its end. Expect: the submit parked, the green still at the pushed version; once the build ends the submit runs
+/// again, the green at its version and its commit made over the map the build kept, its tree another than the
+/// pushed one.
+#[test]
+fn t_a664_live_a_submit_waits_parked_for_its_greens_whole_build() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, green) = git_repository(state, "parked");
+    let root = to_db_volume(green);
+    let key = green_key(root);
+    let pushed = pushed_three(state, (repository, root));
+    let head = |state: &ShardState| state.greens.get(&root).map(|engine| engine.head());
+    let ask = crate::vcs_store::paths::tests::ask;
+    let made = ask(
+      state,
+      slates_ipc::protocol::RequestBody::CreateWork {
+        green,
+        name: "work-parked".to_owned(),
+      },
+    );
+    let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+      return (None, None, None, false, 0);
+    };
+    ask(
+      state,
+      slates_ipc::protocol::RequestBody::Edit {
+        work,
+        path: "/README".to_owned(),
+        at: 0,
+        delete_len: 4,
+        bytes: b"two\n".to_vec(),
+      },
+    );
+    recorded_submit(state, crate::identities::authored(work, "edit the readme"));
+    let parked = count(state, crate::vcs_store::paths::whole_build::PARKED);
+    let during = head(state);
+    crate::vcs_store::paths::whole_build::settle(state);
+    let after = head(state);
+    let tree = kept_tree(state, repository, key);
+    (
+      during,
+      after,
+      tree.filter(|tree| *tree != pushed),
+      parked == 1,
+      counts(state).0,
+    )
+  });
+  assert_eq!(
+    (seen.0, seen.1, seen.2.is_some(), seen.3, seen.4),
+    (Some(1), Some(2), true, true, 1)
+  );
+}
+
+/// `body` run as a recorded request is (`verbs::run_recorded`): in its own transaction under its completion key, so a
+/// submit that waits is deferred with its key, as a client's is.
+fn recorded_submit(state: &mut ShardState, body: slates_ipc::protocol::RequestBody) {
+  let id = slates_wire::request::RequestId {
+    client: 1,
+    sequence: 7,
+  };
+  state.db.begin();
+  state.current_request = Some((1, id));
+  let reply = crate::verbs::dispatch(state, 1, &owner(), body);
+  state.current_request = None;
+  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let committed = state.db.commit(&mut state.segment);
+  assert!(deferred && committed.is_ok(), "{reply:?}");
 }

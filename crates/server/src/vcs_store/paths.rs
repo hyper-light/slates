@@ -80,6 +80,7 @@ use crate::state::ShardState;
 // Its works and submits serve the made commits' tests too (`super::commits`, A-664 part 3).
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod whole_build;
 
 /// The status count of the maps derived from the one before.
 pub(crate) const DERIVED: &str = "vcs_paths.derived";
@@ -189,6 +190,50 @@ pub(crate) fn advance(state: &mut ShardState, green: DbVolumeId, version: u64) {
   if let Some(answer) = step(state, green, version, false) {
     count(state, answer, BUILT);
   }
+}
+
+/// [`advance`] for a version a push committed (A-664's live whole builds): a version whose map must be built from the
+/// whole head is built in slices by a task of the shard ([`whole_build`]), since a push carries its own commits and
+/// nothing of its answer needs the map; a step over the change runs here, as [`advance`]'s does. A push to a green whose
+/// build is under way starts it again at the new head.
+pub(crate) fn advance_after_push(state: &mut ShardState, green: DbVolumeId, version: u64) {
+  if version == 0 {
+    return;
+  }
+  let Some(repository) = git_repository_of(state, green) else {
+    return;
+  };
+  if whole_build::building(state, green) || needs_whole(state, (repository, green), version) {
+    whole_build::start(state, repository, green, version);
+    return;
+  }
+  advance(state, green, version);
+}
+
+/// Whether `green`'s step at `version` would build the map from the whole head ([`plan`]'s rule, read over the change
+/// alone, never the head's files): no map of the version before is kept and the branch's source stands for none, or a
+/// copy is named in the change.
+fn needs_whole(
+  state: &ShardState,
+  (repository, green): (RepositoryId, DbVolumeId),
+  version: u64,
+) -> bool {
+  let key = super::green_key(green);
+  let source = branch_source(state, green);
+  let Some(engine) = state.greens.get(&green) else {
+    return false;
+  };
+  let Some((_, git)) = state.vcs_stores.git_ref(repository) else {
+    return false;
+  };
+  let held = git.heads.get(&key).copied();
+  if engine.head() != version || held.is_some_and(|head| head.version == version) {
+    return false;
+  }
+  let before = held
+    .filter(|head| head.version.checked_add(1) == Some(version))
+    .or_else(|| branch_before(git, held, (false, version), source));
+  before.is_none_or(|before| named(&engine, before.version, version).is_none())
 }
 
 /// Builds the map of each member green of `repository` that committed a version, from its head (module docs): what a

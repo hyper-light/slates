@@ -83,7 +83,6 @@ use slates_hg::serve::Repository;
 use slates_hg::{Admission, Node};
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
 use slates_merge::engine::Increment;
-use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 use slates_vcs::{ContentStore, IndexRefused};
 
 use super::push::{self, AppendRefused, BranchChange, ChangeRefusal, EntryParts, RepositoryLogs};
@@ -298,11 +297,7 @@ struct Read {
 /// `green` as read, bound to `name`.
 fn named(state: &ShardState, (name, green): (&str, DbVolumeId)) -> Named {
   let version = state.db.partition().green_head(green);
-  let head = state.greens.get(&green).and_then(|engine| {
-    engine
-      .xattr(ROOT, HEAD_ATTRIBUTE)
-      .and_then(|bytes| Node::try_from(bytes).ok())
-  });
+  let head = vcs_store::hg_made::head_of(state, green);
   Named {
     name: name.to_owned(),
     green,

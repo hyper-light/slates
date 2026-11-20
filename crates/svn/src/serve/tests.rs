@@ -193,9 +193,14 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
           ..fixture.sources_with(&locks)
         };
         let mut draw = || drawn;
-        let judged = connection.lock_verb(&given, &mut draw, LOCK_ROOM, &mut out);
-        if judged.unwrap().is_some() {
+        // No hook configured: each pre-hook goes on, and no post-hook's verdict is a failure (A-730).
+        if let Some(call) = connection.lock_verb(&given, &mut out).unwrap() {
+          let verdicts = call.paths.iter().map(|_| Ok(None)).collect();
+          connection
+            .lock_judged(&given, verdicts, &mut draw, LOCK_ROOM)
+            .unwrap();
           connection.locks_landed(Ok(()), &mut out).unwrap();
+          connection.locks_finished(Ok(()), &mut out).unwrap();
         }
       }
       Ok(Turn::Unserved { .. }) => return (out, Ending::Unserved(before)),

@@ -58,8 +58,10 @@
 > commit; a register entry's objects reach no holder yet, A-636); a branch `CreateBranch` makes named by a ref from its
 > creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
-> push's, a green's first submit's, past a copy) and a whole map's release sliced a unit at a time, and the build of
-> the put files in slices of its own (a recovery's remake puts the files a unit each, BUILT 2026-11-20); a branch's first
+> push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
+> until it ends; a green's first submit's and one past a copy owed, with the owed commit main approved) and a whole
+> map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
+> the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
@@ -77,6 +79,10 @@
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. The partition's records shipped a log at a time BUILT (A-636 part 2b): each state log's record of each operation, carrying the operation's identity and spans, held by its holders as a prefix of the log; every server dispatch by the register's class. OWED: a repository's greens placed on its holders at their joins (A-636 part 2b-2), then the server's takeover by the rule, every log of a repository following one successor (2c).
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
+>
+> **A-719 part 4 (2026-11-20, w-git; git/git's push of 1,027 refs spun its shard, found by use).** BUILT: a push
+> decided a command a step (`receive::Deciding`, `AnswerState::Deciding`). Owed (A-722): the first append's commit of
+> every object, the moves' admission and the seal still whole; git/git by use.
 >
 > **A-719 part 3 (2026-11-20, w-git).** BUILT: git's push read straight into its quarantine (`git_push::intake`),
 > each object fsck'd as kept, the session holding places not bytes. Owed: the verdicts and the seal a turn at a time;
@@ -110,6 +116,13 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
+> repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
+> `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
+> branch): kept in an index fork and recorded as a push's are (`Source::Made`, the green's key and the version beside
+> the revisions) in the submit's own transaction; a line's or bookmark's head is the made changeset while its version
+> is the green's head, else the one a push named (`hg_made::head_of`), and a recovery puts the made node back from the
+> record. Owed: copies as file revisions naming their source; merges' second parents; the holders' changesets.
 > **A-720 (2026-11-20, w-hg; main's ruling after w-perf's 57,036-changeset push tripped the watchdog: a push's working
 > set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
 > push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
@@ -152,8 +165,10 @@
 >
 > **A-728 (2026-11-20, w-engine; A-723's S2):** parts 1-2 BUILT: a green's content history names the file's block for every
 > value stored whole and for a splice's added runs, sealed (runs copied out) only when superseded; a fold to one value
-> names the file whole; retire gives the history's holds back a step at a time; charges unchanged. OWED: part 3
-> svn_scale before/after; the retention figure still counts a first small edit's earlier file as current (as before).
+> names the file whole; retire gives the history's holds back a step at a time; charges unchanged. Part 3 measured: svn
+> 1,000-revision import, history heap 50.3 -> 2.0 MiB, Green::commit 285.1 -> 200.0 MiB. Part 4: the honest charge (a first
+> small edit charges the earlier file whole; reservation = retention). OWED: `slates status --json` prints no
+> `retained_bytes`, so a green's retention charge is not readable from outside.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -740,6 +755,21 @@
 > ra_svn and DAV. Linux x86_64 (adacachy): server lib 630 passed beside main's 624, the glue's five tests new and
 > nothing failing that main's tree passed; each of four choices broken in a copy failed only its own tests; the macOS
 > run owed. Owed: DAV's LOCK and UNLOCK wired (A-661's next part, after g298's serving); the hook times' table.
+> **A-730 part 1 (2026-11-20, w-reaper; A-661 part 2's first calls):** the `svn://` listener runs a repository's
+> start-commit (at `open-root`: REPOS, the user, `mergeinfo` where announced, the transaction), pre-commit (at
+> `close-edit`: REPOS, the transaction, the presented lock tokens' lines as the client sent each path) and post-commit
+> (after the append: REPOS, the revision, the transaction; its failure `commit-info`'s `post-commit-err`) through the
+> driver, held to the hook's learned bound, ended if the client hangs up, the lesson taught to the shard's hook times;
+> where it refused any commit to a repository with a hook configured ("does not run this repository's hooks yet").
+> REPOS is `/<name>` until A-645's read-only FSFS-layout view gives `svnlook` a directory. Windows keeps the refusal
+> (no driver there). **Part 2 (same day):** the lock verbs run pre-lock or pre-unlock for each writable path before it
+> is judged (a refusal that path's answer in `check_hook_result`'s words; pre-lock's standard output the lock's token)
+> and post-lock or post-unlock once over the paths changed after their answers, its failure after `done`, the locks
+> standing (`fs-wrap.c`); `slates_svn::serve`'s lock verb is four calls now (`lock_verb`, `lock_judged`, `locks_landed`,
+> `locks_finished`). **Part 3 (same day):** the `svn+ssh://` tunnel runs the same hooks through the same runner
+> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). Owed: the tunnel's signal of its client
+> gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); the revprop hooks'
+> calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
