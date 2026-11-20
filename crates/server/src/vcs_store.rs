@@ -1549,6 +1549,32 @@ impl SealedPush {
   }
 
   /// Gives back what a stage under way ([`SealedPush::restage_turn`]) holds: a push dropped mid-decision.
+  /// Has the push give back its pack's holds in turns once its objects land ([`SealedPush::give_back_turn`]), not in
+  /// the landing's step (A-722's landing step: 5.2 ms of git/git v1.5.0's). Its owner turns them before it abandons it.
+  pub(crate) fn give_back_in_turns(&mut self) {
+    self.push.give_back_in_turns();
+  }
+
+  /// One turn of giving back the holds the push set aside at its landing, for `ns` of the shard's clock and a unit at
+  /// least: whether none is left. A refusal is counted and ends the turns; the push's abandon gives back the rest.
+  pub(crate) fn give_back_turn(&mut self, state: &mut ShardState, ns: u64) -> bool {
+    let given = {
+      let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+      let mut clock = crate::git_push::ShardClock;
+      let quantum = slates_git::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns,
+      };
+      lent.stores.content.as_mut().map_or(Ok(true), |content| {
+        self.push.give_back_turn(content, quantum)
+      })
+    };
+    given.unwrap_or_else(|_| {
+      state.count(RELEASE_REFUSED, 1);
+      true
+    })
+  }
+
   pub(crate) fn abandon_staging(state: &mut ShardState, staging: slates_git::store::Staging) {
     let given = {
       let lent = Lent::new(&mut state.store, &mut state.vcs_stores);

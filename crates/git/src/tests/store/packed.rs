@@ -367,3 +367,63 @@ fn b2_an_in_flight_push_holds_its_pack_and_not_its_objects_inflated() {
     "held in the store: {before} bytes for {inflated} inflated"
   );
 }
+
+/// A clock that moves one tick each read: a quantum of one tick is one unit a turn.
+struct EachRead(u64);
+
+impl crate::store::learn::Clock for EachRead {
+  fn now_ns(&mut self) -> u64 {
+    self.0 += 1;
+    self.0
+  }
+}
+
+/// A-722's landing step (the holds' release out of the landing). Do: admit a captured push's objects in place and put
+/// each in the content store as staging does; have the push give back in turns, then land its holds; turn the
+/// give-back one unit a turn. Expect: the landing gives back none (the store holds what it held); each turn gives back
+/// one object's hold; the last leaves the store as before the puts.
+#[test]
+fn a_landed_push_gives_its_holds_back_in_turns_not_in_the_landing() {
+  let (_, request, before) = PUSHES[0];
+  let (pack, held) = captured(request, before);
+  let whole = read_whole(&pack, &held);
+  let mut store = ContentStore::new(1 << 26, SMALL_WINDOW).unwrap();
+  let naming = GitNaming {
+    format: ObjectFormat::Sha1,
+  };
+  let mut push = Push::new(ObjectFormat::Sha1);
+  push.extend_pack(&pack);
+  let used = store.used();
+  for object in &whole.objects {
+    push
+      .admit_placed::<_, Infallible>(&store, &naming, (incoming(object), object.offset))
+      .unwrap();
+    push
+      .put_placed(&mut store, &object.id, &object.content)
+      .unwrap();
+  }
+  let put = store.used();
+  assert!(put > used, "the puts hold the objects");
+  push.give_back_in_turns();
+  push.release_holds(&mut store).unwrap();
+  assert_eq!(store.used(), put, "the landing gives back no hold");
+  assert!(push.is_empty(), "the landed push holds no object");
+  let mut turns = 0;
+  loop {
+    let mut clock = EachRead(0);
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: 1,
+    };
+    turns += 1;
+    if push.give_back_turn(&mut store, quantum).unwrap() {
+      break;
+    }
+  }
+  assert_eq!(store.used(), used, "every hold given back");
+  assert!(
+    turns >= whole.objects.len(),
+    "{turns} turns for {} objects",
+    whole.objects.len()
+  );
+}
