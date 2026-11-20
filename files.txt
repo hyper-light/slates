@@ -1,0 +1,17 @@
+target/conformance-records/native-windows-winfsp.fsx-logs/fsx.bin.fsxgood
+target/conformance-records/native-windows-winfsp.fsx-logs/fsx.bin.fsxlog
+target/conformance-records/native-windows-winfsp.fsx.json
+target/conformance-scratch/native-windows-winfsp/anchor-conf-fsx-2300.log
+target/conformance-scratch/native-windows-winfsp/fsx-logs/fsx.bin.fsxgood
+target/conformance-scratch/native-windows-winfsp/fsx-logs/fsx.bin.fsxlog
+target/conformance-scratch/native-windows-winfsp/tools/fsx.c
+target/conformance-scratch/native-windows-winfsp/tools/fsx.exe
+target/conformance-scratch/native-windows-winfsp/tools/fsx.obj
+target/conformance-scratch/native-windows-winfsp/tools/getopt.obj
+target/conformance-scratch/native-windows-winfsp/tools/mman.obj
+target/conformance-scratch/native-windows-winfsp/tools/random.obj
+target/conformance-scratch/native-windows-winfsp/tools/win/getopt.c
+target/conformance-scratch/native-windows-winfsp/tools/win/getopt.h
+target/conformance-scratch/native-windows-winfsp/tools/win/mman.c
+target/conformance-scratch/native-windows-winfsp/tools/win/mman.h
+target/conformance-scratch/native-windows-winfsp/tools/win/random.c
