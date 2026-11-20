@@ -2,3 +2,4 @@ started 2026-11-20T06:41:02Z at f59ff7698adacf622be822cdc962fa77d7f47231
 build exit 0
 cdb: /c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe
 fsx seen at 06:45:23
+fsx exit 0
