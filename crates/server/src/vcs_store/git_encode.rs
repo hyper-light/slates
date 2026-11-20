@@ -89,14 +89,14 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
     return Turned::Idle;
   };
   let mut begun = false;
-  if !stores.encodings.0.contains_key(&id) {
+  if let std::collections::btree_map::Entry::Vacant(unencoded) = stores.encodings.0.entry(id) {
     let Some((green, version)) = store.repository.first_unencoded() else {
       super::settle(state);
       return Turned::Idle;
     };
     match Encoding::fragments(&store.repository, content, green, version) {
       Ok(encoding) => {
-        stores.encodings.0.insert(id, encoding);
+        unencoded.insert(encoding);
         begun = true;
       }
       Err(_) => {

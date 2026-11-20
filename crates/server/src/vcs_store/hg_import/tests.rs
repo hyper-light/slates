@@ -276,25 +276,32 @@ fn t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time() {
       Err(ImportFailed::Busy)
     );
     assert!(state.vcs_stores.importing(first));
-    let full = created(state, "full", VcsTool::Mercurial);
-    assert_eq!(
-      begin(state, full, directory(STATES.iter().copied())),
-      Ok(())
-    );
-    assert!(to_its_end(state, full).1.is_ok());
-    assert_eq!(
-      begin(state, full, directory(STATES.iter().copied())),
-      Err(ImportFailed::Busy)
-    );
-    assert_eq!(land(state, full), Ok(()));
-    let rows = rows_of(state, full);
-    assert_eq!(
-      begin(state, full, directory(STATES.iter().copied())),
-      Err(ImportFailed::NotEmpty)
-    );
-    assert_eq!(land(state, full), Err(ImportFailed::NoStore));
-    assert_eq!(rows_of(state, full), rows);
+    assert_an_imported_store_takes_no_second_import(state);
   });
+}
+
+/// The second import of [`t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time`]: run to its end, a further
+/// import is refused `Busy` while it waits to land and `NotEmpty` once it landed, a second landing `NoStore`, the
+/// store's rows unchanged.
+fn assert_an_imported_store_takes_no_second_import(state: &mut ShardState) {
+  let full = created(state, "full", VcsTool::Mercurial);
+  assert_eq!(
+    begin(state, full, directory(STATES.iter().copied())),
+    Ok(())
+  );
+  assert!(to_its_end(state, full).1.is_ok());
+  assert_eq!(
+    begin(state, full, directory(STATES.iter().copied())),
+    Err(ImportFailed::Busy)
+  );
+  assert_eq!(land(state, full), Ok(()));
+  let rows = rows_of(state, full);
+  assert_eq!(
+    begin(state, full, directory(STATES.iter().copied())),
+    Err(ImportFailed::NotEmpty)
+  );
+  assert_eq!(land(state, full), Err(ImportFailed::NoStore));
+  assert_eq!(rows_of(state, full), rows);
 }
 
 /// A-675 (cancellation): do start an import, run it a unit a turn until the content store holds some of it, then free
@@ -305,18 +312,7 @@ fn t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time() {
 fn t_a675_a_repository_freed_midway_gives_its_import_back() {
   crate::daemon::audit_on_shard(|state| {
     let retained = state.store.budget.retained();
-    let midway = created(state, "midway", VcsTool::Mercurial);
-    assert_eq!(
-      begin(state, midway, directory(STATES.iter().copied())),
-      Ok(())
-    );
-    let mut clock = Ticking(0);
-    while used(state) == 0 {
-      assert_eq!(turn(state, midway, (&mut clock, 1)), Some(Ok(Turned::More)));
-    }
-    super::super::free(state, midway);
-    assert!(!state.vcs_stores.importing(midway));
-    assert_eq!(count(state, ABANDONED), 1);
+    assert_an_import_freed_midway_is_given_back(state);
     let whole = created(state, "whole", VcsTool::Mercurial);
     assert_eq!(
       begin(state, whole, directory(STATES.iter().copied())),
@@ -331,6 +327,23 @@ fn t_a675_a_repository_freed_midway_gives_its_import_back() {
       (0, retained)
     );
   });
+}
+
+/// The first import of [`t_a675_a_repository_freed_midway_gives_its_import_back`]: run a unit a turn until the content
+/// store holds some of it, then its repository freed: no import under way, counted abandoned.
+fn assert_an_import_freed_midway_is_given_back(state: &mut ShardState) {
+  let midway = created(state, "midway", VcsTool::Mercurial);
+  assert_eq!(
+    begin(state, midway, directory(STATES.iter().copied())),
+    Ok(())
+  );
+  let mut clock = Ticking(0);
+  while used(state) == 0 {
+    assert_eq!(turn(state, midway, (&mut clock, 1)), Some(Ok(Turned::More)));
+  }
+  super::super::free(state, midway);
+  assert!(!state.vcs_stores.importing(midway));
+  assert_eq!(count(state, ABANDONED), 1);
 }
 
 /// A-675 (the shard's task): do start an import of the `states` repository on a running shard and hand it to a task of
@@ -431,24 +444,30 @@ fn t_a687_an_import_lands_its_record_phase_roots_and_bookmarks_in_one_entry() {
     assert!(to_its_end(state, id).1.is_ok());
     assert!(roots_of(state, id).is_empty());
     assert_eq!(land(state, id), Ok(()));
-    let records = state.db.partition().repositories().objects(id).count();
-    assert_eq!(records, 1);
-    assert!(!expected.phase_roots.is_empty());
-    let mut roots = roots_of(state, id);
-    roots.sort();
-    assert_eq!(roots, as_kept(&expected.phase_roots));
-    let wanted: Vec<(String, Option<Node>)> = expected
-      .bookmarks
-      .iter()
-      .map(|(name, node)| (crate::repository::hg_push::bookmark_name(name), Some(*node)))
-      .collect();
-    assert_eq!(wanted.len(), 3);
-    assert_eq!(heads_under(state, id, BOOKMARK_TAG), wanted);
+    assert_landed_as_imported(state, id, &expected);
     assert_eq!(
       (count(state, LANDED), count(state, LANDING_REFUSED)),
       (1, 0)
     );
   });
+}
+
+/// What [`t_a687_an_import_lands_its_record_phase_roots_and_bookmarks_in_one_entry`] finds landed in repository `id`:
+/// one object record, the phase roots `expected` found, and each of its bookmarks bound to its changeset.
+fn assert_landed_as_imported(state: &ShardState, id: RepositoryId, expected: &Imported) {
+  let records = state.db.partition().repositories().objects(id).count();
+  assert_eq!(records, 1);
+  assert!(!expected.phase_roots.is_empty());
+  let mut roots = roots_of(state, id);
+  roots.sort();
+  assert_eq!(roots, as_kept(&expected.phase_roots));
+  let wanted: Vec<(String, Option<Node>)> = expected
+    .bookmarks
+    .iter()
+    .map(|(name, node)| (crate::repository::hg_push::bookmark_name(name), Some(*node)))
+    .collect();
+  assert_eq!(wanted.len(), 3);
+  assert_eq!(heads_under(state, id, BOOKMARK_TAG), wanted);
 }
 
 /// A-687 (a landing refused gives everything back): do bind `bookmark:one:` in a Mercurial repository through the

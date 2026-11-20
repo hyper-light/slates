@@ -176,12 +176,12 @@ pub(crate) struct VcsStores {
 /// One repository's store, by its tool (module docs).
 #[derive(Debug)]
 pub(crate) enum RepositoryStore {
-  /// git's.
-  Git(GitStore),
+  /// git's. Each arm is boxed: their stores differ in size by hundreds of bytes.
+  Git(Box<GitStore>),
   /// Mercurial's.
-  Mercurial(HgStore),
+  Mercurial(Box<HgStore>),
   /// Subversion's.
-  Subversion(SvnStore),
+  Subversion(Box<SvnStore>),
 }
 
 /// A git repository's store: A-614's store and the values derived from it (A-647).
@@ -611,13 +611,13 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
       git.paths = paths::declare(window);
       git.trees = paths::declare_trees(format, window);
       git.commits = Some(commits::declare(format, window));
-      RepositoryStore::Git(git)
+      RepositoryStore::Git(Box::new(git))
     }
-    VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore {
+    VcsTool::Mercurial => RepositoryStore::Mercurial(Box::new(HgStore {
       generation: stores.next_generation(),
       ..HgStore::default()
-    }),
-    VcsTool::Subversion => RepositoryStore::Subversion(SvnStore::default()),
+    })),
+    VcsTool::Subversion => RepositoryStore::Subversion(Box::default()),
   };
   stores.entries.entry(record.id).or_insert(store);
   Ok(())
@@ -659,11 +659,19 @@ pub(crate) fn settle_objects(state: &mut ShardState, id: RepositoryId) {
     .copied()
     .unwrap_or(0);
   if held > charged {
-    if state.store.budget.charge_retention(held - charged).is_err() {
+    if state
+      .store
+      .budget
+      .charge_retention(held.saturating_sub(charged))
+      .is_err()
+    {
       state.count(CHARGE_SHORT, 1);
     }
   } else {
-    state.store.budget.credit_retention(charged - held);
+    state
+      .store
+      .budget
+      .credit_retention(charged.saturating_sub(held));
   }
   if held == 0 {
     state.vcs_stores.objects_charged.remove(&id);
@@ -707,9 +715,11 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
     RepositoryStore::Git(store) => {
       let versions = content.discharge(store.charged).is_ok();
       let values = store.derivations.release(content).is_ok();
-      let maps = store.heads.values().fold(true, |whole, head| {
-        paths::release_head(content, head) && whole
-      });
+      // Every head's map is released, whichever fails: no short circuit.
+      let mut maps = true;
+      for head in store.heads.values() {
+        maps &= paths::release_head(content, head);
+      }
       let lfs = store.lfs.release(content).is_ok();
       store.repository.release(content).is_ok() && values && versions && maps && lfs
     }
