@@ -96,3 +96,7 @@ builds SvnSite over ServedRecords; B) update-report (checkout/update: request::U
 MKCOL/DELETE/COPY, MERGE -> repository::svn_commit::commit_work). Each part its own landing. A-numbers: claim via
 agents/fanout-state amendments.tsv only if a design change needs one (A-681 parts are A-681's).
 Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's push fix lands.
+- Part A written: svn::dav_request + test a_request_is_subversions_by_its_method_or_its_special_segment;
+  ToolSites<G,H,S> with Svn arm; daemon_edge DaemonSvnSite over ServedRecords. Scratch b8903064f pushed as
+  agents/w-interop-a681. MISTAKE: ran `git checkout -b x` in w-interop-matrix-land (rule breach; no file change) -- the
+  worktree is now on local branch `x` (same commits); left as is, told main. Mac disk 33 GB -> tests on the Studio.

@@ -961,3 +961,10 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   clone-again 2.766 -> 0.912 s (git daemon 0.342); blob:none 1.076 -> 0.558 s; shallow 0.154 -> 0.118 (daemon 0.119);
   first clone after a push 2.791 -> 4.293 s (one-time encode); RSS 384-388 -> 482-513 MiB. Follow-ups (encode at
   intake, first-clone cost) rebuilt on w-git's new store later. w-perf now: A-716, then concurrent-push load test.
+- ~01:15 PST A-716 DESIGN RULING (w-perf found the green's history chunks have no content identity; folding drops
+  history): (a) the green's identity table = the ONE byte store for git, hg and svn: hold by path at head (svn) and
+  hold bytes by identity path-less (git/hg intakes); landing op set_from_held(path, identity) reuses chunks (no rehash
+  on VFS write path); survives folding (refcounts), in checkpoint (recovery/replication rebuild), bounded holders.
+  w-perf: slice 1 (engine) NOW (before load test), then load test, then svn slices 2-3 (seam with w-svn's E160004).
+  w-git/w-hg: land streaming + slicing now; switch storage to the table when slice 1 lands; no second store meanwhile.
+- w-interop: A-681 tests on the Studio's warm target (Mac disk 32 GiB free); `git checkout -b x` breach owned (no harm).
