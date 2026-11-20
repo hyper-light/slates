@@ -154,19 +154,32 @@ fn ticket_here(shard: u16) -> HomeTicket {
   HomeTicket { shard, generation }
 }
 
-/// Waits, on this shard, until its image of `generation` is published.
+/// Waits, on this shard, until its image of `generation` is published. Its first poll that finds it unpublished
+/// publishes the shard itself (`crate::verbs::publish_shard`: a delta, made and committed in one turn), since nothing
+/// else publishes on a schedule (persistence before reply): every window kept before that publication rides it, so the
+/// waits behind it find their generation published (group commit, one publication for all of them). A publication
+/// refused leaves the wait for the next one that commits.
 struct PublishedHere {
   generation: u64,
+  /// Whether this wait has published the shard already.
+  asked: bool,
 }
 
 impl core::future::Future for PublishedHere {
   type Output = bool;
 
   fn poll(
-    self: core::pin::Pin<&mut Self>,
+    mut self: core::pin::Pin<&mut Self>,
     context: &mut core::task::Context<'_>,
   ) -> core::task::Poll<bool> {
     let generation = self.generation;
+    if !self.asked && !published_here(generation) {
+      self.asked = true;
+      if crate::state::with_state(|state| crate::verbs::publish_shard(state).is_ok()) == Some(true)
+      {
+        crate::state::with_state(|state| state.count(HOME_PUBLISHED, 1));
+      }
+    }
     IMAGES.with(|images| match images.try_borrow_mut() {
       Ok(images) if images.published >= generation => core::task::Poll::Ready(true),
       Ok(mut images) => {
@@ -181,6 +194,10 @@ impl core::future::Future for PublishedHere {
   }
 }
 
+/// Counter: publications a home's wait for its ticket made itself (A-724 piece 8c), nothing else having published since
+/// the window was kept. Format: a counter name.
+pub(crate) const HOME_PUBLISHED: &str = "vcs_store.homes.published_for_ticket";
+
 /// Whether the window of `ticket` is durable at its home, asked from shard `origin` (module docs): waits on the home, in
 /// its own time up to `budget_ns`, for its image of the ticket's generation; false when that did not come within it.
 pub(crate) async fn published(origin: u16, ticket: HomeTicket, budget_ns: u64) -> bool {
@@ -188,7 +205,10 @@ pub(crate) async fn published(origin: u16, ticket: HomeTicket, budget_ns: u64) -
   crate::xshard::task_in_shard_time(
     origin,
     ticket.shard,
-    move || PublishedHere { generation },
+    move || PublishedHere {
+      generation,
+      asked: false,
+    },
     budget_ns,
   )
   .await

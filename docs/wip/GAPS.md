@@ -239,6 +239,9 @@
 > (`Session::blocked` now reads on while `ServerTransport::is_rekeying`); every rekey is logged with its trigger
 > (`docs/bugs/2026-11-20-an-ssh-clone-stalled-at-a-rekey-with-its-outbox-full.md`). An answer refused past its
 > stream's start ends the SSH session as an abort, 255 and its words on stderr (it exited 0).
+> Rekeys follow RFC 4253 §9 (main's ruling): after a gigabyte of packets either way (`keylife::REKEY_BYTES`, a rekey
+> point, never a limit) or an hour (`RECOMMENDED_KEY_TIME_NS`), plus any the client asks; A-594's key time learned from
+> earlier connections' lifetimes is gone (one short session had set it to 31 ms, measured: the red).
 > `stream2` as stock 7.2 writes it (read 2026-11-20 from Homebrew's 7.2, `hg bundle --type 'none-v2;stream=v2'` of two
 > public changesets): one mandatory part with `bytecount`, `filecount` and the quoted `requirements`; each entry its
 > vfs byte (`s` store, `c` cache), the name's and the data's lengths as uvarints, the name, the data; small revlogs
