@@ -89,9 +89,9 @@ def rss_kib(pid: int) -> int:
 class Daemon:
     """An anchor and its daemon, with the HTTP edge on loopback and a token."""
 
-    def __init__(self, slates: str):
+    def __init__(self, slates: str, instance: str = ""):
         self.slates = slates
-        self.instance = f"w-perf-push-load-{os.getpid()}"
+        self.instance = instance or f"w-perf-push-load-{os.getpid()}"
         self.anchor = subprocess.Popen(
             [slates, "--instance", self.instance, "anchor", "--vcs-http", "127.0.0.1:0"],
             stdout=subprocess.DEVNULL,

@@ -851,7 +851,7 @@ impl<S> Work<'_, '_, S> {
     let mut windows = Vec::new();
     for window in self.store.windows(&content) {
       windows.push(u64::try_from(window.len()).unwrap_or(u64::MAX));
-      bytes.extend_from_slice(window);
+      bytes.extend_from_slice(&window);
     }
     self.charge(
       windows

@@ -1193,11 +1193,12 @@ fn assert_fold_to_head(green: &mut Green, head: u64) {
     (retained, Some(LARGE_FILE_BYTES)),
     "balanced, and the current file is untouched"
   );
-  // What stays is the bytes the edits overwrote, held inside the chunk the current file still shares (W2): a chunk
-  // lives while any piece names it.
-  assert!(
-    retained <= usize::try_from(SMALL_EDITS).unwrap() * 4,
-    "nothing is retained but the overwritten bytes of a shared chunk: {retained}"
+  // Folded to the head, the latest value is all the history holds, and it names the current file's block (A-728): the
+  // earlier block and the edits' chunks are let go, and nothing is retained (before A-728, the overwritten bytes of the
+  // chunk the current value still shared stayed).
+  assert_eq!(
+    retained, 0,
+    "the history holds nothing beyond the current file once folded to it"
   );
   assert_eq!(green.fold_history_to_budget(head, 0), 0, "idempotent");
 }

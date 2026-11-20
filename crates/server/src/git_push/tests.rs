@@ -1017,7 +1017,9 @@ fn stored_zlib(data: &[u8]) -> Vec<u8> {
 fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
   use slates_git::entry::{self, Header, Representation};
   use slates_git::object_name::{Kind, name_of};
-  let blob: Vec<u8> = (0..bytes).map(|at| (at % 251) as u8).collect();
+  let blob: Vec<u8> = (0..bytes)
+    .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
+    .collect();
   let blob_id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
   let mut tree = b"100644 large\0".to_vec();
   tree.extend_from_slice(blob_id.as_bytes());

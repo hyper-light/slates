@@ -604,8 +604,15 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       out,
       ..
     } = self;
+    // The tunnel runs no hook yet (A-730 part 3): every path's pre-hook goes on, and no post-hook runs.
     let judged = stores.lend(id, |sources| {
-      connection.lock_verb(sources, &mut draw, room, out)
+      let Some(call) = connection.lock_verb(sources, out)? else {
+        return Ok(None);
+      };
+      let verdicts = call.paths.iter().map(|_| Ok(None)).collect();
+      connection
+        .lock_judged(sources, verdicts, &mut draw, room)
+        .map(Some)
     });
     let entries = match judged {
       None => return self.not_held(),
@@ -626,7 +633,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
         Some(landed) => landed.map_err(|refused| refused.failure()),
       }
     };
-    let answered = self.connection.locks_landed(landed, &mut self.out);
+    let answered = self
+      .connection
+      .locks_landed(landed, &mut self.out)
+      .and_then(|_| self.connection.locks_finished(Ok(()), &mut self.out));
     self.end_if_refused(answered);
   }
 

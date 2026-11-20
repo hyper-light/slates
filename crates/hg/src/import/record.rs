@@ -82,8 +82,13 @@ const FILE_TAG: u8 = 2;
 /// Format: the fewest bytes a marker takes: its length.
 const MARKER_MIN_BYTES: usize = LONG_BYTES;
 
-/// Format: the bytes before the groups: the magic, the version, the source and the room.
+/// Format: the bytes before the groups: the magic, the version, the source and the room (a made changeset's record
+/// has [`MADE_BYTES`] more, after the source).
 const HEAD_BYTES: usize = WORD_BYTES + WORD_BYTES + TAG_BYTES + LONG_BYTES;
+/// Format: the source byte of a made changeset's record ([`Source::Made`]).
+const MADE_TAG: u8 = 2;
+/// Format: what a made changeset's record holds after its source byte: the green's key and the version.
+const MADE_BYTES: usize = LONG_BYTES + LONG_BYTES;
 
 /// Whose revisions a record holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +97,14 @@ pub enum Source {
   Import,
   /// A push's: the revisions it brought that the repository lacked, appended after what the index holds.
   Push,
+  /// A changeset the server made of a version submitted to a green (A-731), appended as a push's are: the green's key
+  /// and the version, so a replay names the changeset made of that version from the record alone, never from a clock.
+  Made {
+    /// The green's key.
+    green: u64,
+    /// The version.
+    version: u64,
+  },
 }
 
 impl Source {
@@ -100,6 +113,7 @@ impl Source {
     match self {
       Source::Import => 0,
       Source::Push => 1,
+      Source::Made { .. } => MADE_TAG,
     }
   }
 }
@@ -197,6 +211,8 @@ pub struct Replayed {
   /// Whether the index the replayed one took the place of was given back whole; not, the content store's count of
   /// holds is off, which its caller counts.
   pub whole: bool,
+  /// For a made changeset's record (A-731): the green's key, the version, and the changeset the server made of it.
+  pub made: Option<(u64, u64, Node)>,
 }
 
 /// One revision a push's record holds ([`write_revisions`]): its node, parents, link (the null node for a changeset,
@@ -280,7 +296,14 @@ pub fn write_revisions(
   groups: &[Group<'_>],
   markers: &[&[u8]],
 ) -> Result<Vec<u8>, WriteRefused> {
-  let mut len = to_u64(HEAD_BYTES).saturating_add(to_u64(LONG_BYTES));
+  let made = if matches!(source, Source::Made { .. }) {
+    MADE_BYTES
+  } else {
+    0
+  };
+  let mut len = to_u64(HEAD_BYTES)
+    .saturating_add(to_u64(LONG_BYTES))
+    .saturating_add(to_u64(made));
   for (log, revisions) in groups {
     len = len.saturating_add(group_head_len(*log));
     for revision in *revisions {
@@ -323,6 +346,25 @@ pub fn write_push(
   verified: &crate::push::verify::Verified,
   room: u64,
 ) -> Result<Vec<u8>, WriteRefused> {
+  write_verified(verified, Source::Push, room)
+}
+
+/// A made changeset's record (A-731, [`Source::Made`]): the revisions the server made of `green`'s `version`, written as
+/// [`write_push`] writes a push's, the green's key and the version beside them.
+pub fn write_made(
+  verified: &crate::push::verify::Verified,
+  (green, version): (u64, u64),
+  room: u64,
+) -> Result<Vec<u8>, WriteRefused> {
+  write_verified(verified, Source::Made { green, version }, room)
+}
+
+/// [`write_push`] and [`write_made`]'s one writer.
+fn write_verified(
+  verified: &crate::push::verify::Verified,
+  source: Source,
+  room: u64,
+) -> Result<Vec<u8>, WriteRefused> {
   let changesets = pushed(&verified.changesets, false);
   let manifests = pushed(&verified.manifests, true);
   let files: Vec<(Log<'_>, Vec<Revision<'_>>)> = verified
@@ -339,7 +381,7 @@ pub fn write_push(
       .iter()
       .map(|(log, revisions)| (*log, revisions.as_slice())),
   );
-  write_revisions((Source::Push, room), &groups, &[])
+  write_revisions((source, room), &groups, &[])
 }
 
 /// A revision kept in the fork and its text, read back whole (as [`write_kept`] reads them).
@@ -421,6 +463,10 @@ fn write_head(out: &mut Vec<u8>, (source, room): (Source, u64), groups: u64) {
   out.extend_from_slice(&MAGIC.to_le_bytes());
   out.extend_from_slice(&VERSION.to_le_bytes());
   out.push(source.byte());
+  if let Source::Made { green, version } = source {
+    out.extend_from_slice(&green.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
+  }
   out.extend_from_slice(&room.to_le_bytes());
   out.extend_from_slice(&groups.to_le_bytes());
 }
@@ -615,12 +661,12 @@ pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -
   if let Some(block) = kept.block {
     put(MARKER, &mut written);
     for window in store.windows(&block) {
-      put(window, &mut written);
+      put(&window, &mut written);
     }
     put(MARKER, &mut written);
   }
   for window in store.windows(&kept.bytes) {
-    put(window, &mut written);
+    put(&window, &mut written);
   }
   written
 }
@@ -633,7 +679,7 @@ fn write_markers(out: &mut Vec<u8>, index: &HgIndex, store: &ContentStore) -> Re
     let marker = index.marker(store, number).ok_or(number)?;
     out.extend_from_slice(&window_bytes(store, &marker).to_le_bytes());
     for window in store.windows(&marker) {
-      out.extend_from_slice(window);
+      out.extend_from_slice(&window);
     }
   }
   Ok(())
@@ -787,7 +833,7 @@ fn replay_into(
   store: &mut ContentStore,
 ) -> Result<Replayed, Refused> {
   let mut reader = Reader { rest: bytes };
-  let (_, room) = head(&mut reader)?;
+  let (source, room) = head(&mut reader)?;
   let first = index.len(store, Log::Changelog);
   let mut replayed = Replayed::default();
   for _ in 0..reader.count(GROUP_MIN_BYTES)? {
@@ -797,6 +843,13 @@ fn replay_into(
     check_manifest(index, store, rev)?;
   }
   replayed.markers = replay_markers(&mut reader, index, store)?;
+  if let Source::Made { green, version } = source {
+    let node = index
+      .changeset(store, first)
+      .map(|row| row.node)
+      .ok_or(Refused::Truncated)?;
+    replayed.made = Some((green, version, node));
+  }
   if reader.rest.is_empty() {
     Ok(replayed)
   } else {
@@ -816,6 +869,10 @@ fn head(reader: &mut Reader<'_>) -> Result<(Source, Admission), Refused> {
   let source = match reader.byte()? {
     tag if tag == Source::Import.byte() => Source::Import,
     tag if tag == Source::Push.byte() => Source::Push,
+    MADE_TAG => Source::Made {
+      green: reader.long()?,
+      version: reader.long()?,
+    },
     tag => return Err(Refused::Tag { tag }),
   };
   Ok((source, Admission::new(reader.long()?)))

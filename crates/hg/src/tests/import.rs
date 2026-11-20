@@ -172,7 +172,10 @@ fn paths() -> Vec<Vec<u8>> {
 
 /// A content's bytes, read whole through its windows.
 fn whole(store: &ContentStore, root: &ContentId) -> Vec<u8> {
-  store.windows(root).flatten().copied().collect()
+  store
+    .windows(root)
+    .flat_map(|window| window.into_owned())
+    .collect()
 }
 
 /// A manifest's or a file revision's text read back: the block between its markers, when it has one, then the bytes.

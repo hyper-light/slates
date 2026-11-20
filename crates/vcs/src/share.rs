@@ -127,7 +127,7 @@ pub fn divide<const R: usize>(capacity: &[f64; R], claims: &[Claim<R>]) -> Vec<G
         .map(|claim| fraction(claim, level) * claim.demand.get(resource).copied().unwrap_or(0.0))
         .sum();
       let room = left.get(resource).copied().unwrap_or(0.0);
-      *flag = used >= room * (1.0 - f64::EPSILON * 64.0) && used > 0.0;
+      *flag = used >= room * (1.0 - rounding_bound(rising.len())) && used > 0.0;
     }
     let mut still: Vec<Rising<R>> = Vec::with_capacity(rising.len());
     for claim in rising {
@@ -150,6 +150,26 @@ pub fn divide<const R: usize>(capacity: &[f64; R], claims: &[Claim<R>]) -> Vec<G
     settle(&mut grants, &mut left, &claim, given);
   }
   grants
+}
+
+/// The most a resource's use computed at a solved level can fall short of the room the level was solved for, relative
+/// to it, when `claims` claims are rising: the tolerance a full resource is recognized within.
+///
+/// Derived: Higham's bound for a sum of k rounded nonnegative terms, `γ_k = k u / (1 - k u)` with the unit roundoff
+/// `u = f64::EPSILON / 2` [A: Higham, "Accuracy and Stability of Numerical Algorithms", 2nd ed., SIAM 2002, §3.1 and
+/// Lemma 3.1]. The level is solved from two sums of `claims` terms (the whole claims' demand and the slope), one
+/// subtraction and one division; the use is a sum of `claims` products of a division (the fraction) and a demand. So the
+/// operations a use passes through number at most `k = 3 × claims + 4`, and `γ_k` bounds its relative error.
+fn rounding_bound(claims: usize) -> f64 {
+  let operations =
+    crate::share::amount_of(u64::try_from(claims).unwrap_or(u64::MAX)).mul_add(3.0, 4.0);
+  let unit = f64::EPSILON / 2.0;
+  let product = operations * unit;
+  if product >= 1.0 {
+    1.0
+  } else {
+    product / (1.0 - product)
+  }
 }
 
 /// A rising claim's fraction at `level`: `min(1, level / full_at)`.

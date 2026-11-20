@@ -766,6 +766,30 @@ pub struct Pending<'drive> {
   pub texts: &'drive BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists it made, by identity, each sorted by name.
   pub property_lists: &'drive BTreeMap<ContentIdentity, PropertyPairs>,
+  /// The session's path in the repository, which the client's paths are relative to.
+  pub base_path: &'drive str,
+  /// The lock tokens the commit presented, by full path.
+  pub presented: &'drive BTreeMap<String, String>,
+}
+
+impl Pending<'_> {
+  /// The lock tokens the commit presented as pre-commit reads them (`hooks.c` `lock_token_content`; A-730): each path
+  /// as the client gave it, relative to the commit's base (`serve.c` `add_lock_tokens` hands the filesystem the path as
+  /// sent), with its token, in path order.
+  pub fn lock_tokens(&self) -> Vec<(String, String)> {
+    let base = self.base_path.trim_end_matches('/');
+    self
+      .presented
+      .iter()
+      .map(|(full, token)| {
+        let relative = full
+          .strip_prefix(base)
+          .unwrap_or(full)
+          .trim_start_matches('/');
+        (relative.to_owned(), token.clone())
+      })
+      .collect()
+  }
 }
 
 /// An accepted work: what the caller commits.
@@ -1495,6 +1519,8 @@ impl Drive {
       rows: &self.rows,
       texts: &self.texts,
       property_lists: &self.property_lists,
+      base_path: &self.setup.base_path,
+      presented: &self.setup.locks.presented,
     }
   }
 
