@@ -177,6 +177,9 @@ impl<S: HgStores> Command for HgCommand<S> {
       dropped,
       ..
     } = self;
+    if let Some(push_room) = stores.push_room() {
+      stdio.admit_pushes(push_room);
+    }
     let progress = if stdio.taking_push() {
       stdio.step_push()
     } else {
