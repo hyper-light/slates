@@ -37,7 +37,7 @@
 - live fsstress over NFSv3 hangs (old) | GAPS:4296 | on ubuntu-latest the live fsstress over the NFSv3 adapter hung over three hours, so no live fsstress or pjdfstest result exists for Linux.
 - liveness suite hang | GAPS:3787 | the liveness suite hung 2 of about 9 parallel runs on adacachy2: two starving tests stood still starting their spinners; the lock their test threads held is not named.
 - six fleet tests fail on jupiter | GAPS:2043 | six fleet tests fail on jupiter (Windows x86_64, loaded) though they pass on the runners.
-- [CLAIMED w-bugs 2026-11-20] junction tests on jupiter | GAPS:19236 | two slates-base junction tests fail on jupiter: `cmd /C mklink /J` reads the forward-slash CARGO_TARGET_TMPDIR as a switch (a test bug).
+- [FIXED 2359d2550 (2026-11-18, mklink gets backslashed paths); found already on main by w-bugs 2026-11-20] junction tests on jupiter | GAPS:19236 | two slates-base junction tests fail on jupiter: `cmd /C mklink /J` reads the forward-slash CARGO_TARGET_TMPDIR as a switch (a test bug).
 - goal-83 audit B12, B4, B9, B8, B10, B3, B5, B11, B14, B15, B16 | g079's order (B2 is A-543, g079's) | their descriptions are recorded neither in the repo nor in the goal stack (item 01a1f12cc155 names them only); g079 holds the list.
 Count: 24 lines (34 bugs counting each B item), 3 owned by goal 225 without a row, 1 queued for g085, 11 B items with g079.
 - 2026-11-19T00:57Z | g079 | B2: a WinFsp drive declared a folding volume case-sensitive (GAPS, A-300) | part 1 landed 279af73ba (main 3cc9ce3f0, A-543); part 2 (Windows wiring) filed for main
