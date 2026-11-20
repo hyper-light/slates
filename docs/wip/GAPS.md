@@ -530,8 +530,15 @@
 > see A-636 part 2b's amendment entry. Owed: a push's answer waiting for its records to commit (the barrier); a
 > candidate that joins a log's placement past parts every earlier one held (the log's state installed first, with a
 > state-log checkpoint, which also bounds the holders' copies); the parts rebuilt after the owner restarts; parts
-> batched; a destroyed repository's state-log registers forgotten; the greens placed on their repository's holders at
-> their joins (2b-2); the successor adopting a repository's logs by the rule (2c).
+> batched; a destroyed repository's state-log registers forgotten; the successor adopting a repository's logs by the
+> rule (2c).
+> **A-636 part 2b-2 (2026-11-20, w-shared; routed by id):** a repository's id and every green minted to join it carry
+> its family (`ObjectId::family`; tag, number), and rendezvous hashes the family (`ObjectId::line_key`), so a
+> repository, its state logs and its greens have one set of holders and one successor with nothing stored per green; a
+> green joins only its repository's family (`repository::in_family`); a lone green is a family of its own, which an
+> adopting repository joins. Owed: a green minted under no family (an older build's) cannot be adopted (refused
+> `Unsupported`); a repository made by an older build, whose id is of no family, can join no new green; the successor
+> adopting a repository's logs by the rule (2c).
 > **A-608 (2026-11-19, g258; piece 3, the pack reader):** `slates-git` (`unpack`) reads a pack as a stream delivers it:
 > the header (A-591), each entry's header (A-582 part 3), its data inflated through flate2 over zlib-rs (A-607) to
 > exactly its header's size (longer, shorter, unended and refused streams refused by kind), each delta through the

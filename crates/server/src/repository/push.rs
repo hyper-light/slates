@@ -594,8 +594,10 @@ fn plan_create(
     return Err(refused(Refusal::NotFound));
   }
   let version = super::branch_version(state, from, Some(version)).map_err(refused)?;
-  let id = crate::verbs::fresh_volume_id_at(state, minted)
-    .ok_or_else(|| refused(crate::verbs::ids_exhausted()))?;
+  // In the repository's family (A-636 part 2b-2), each create at its own offset (A-694).
+  let id =
+    crate::verbs::fresh_family_id_at(state, crate::verbs::family_of(record.id.bytes), minted)
+      .ok_or_else(|| refused(crate::verbs::family_ids_exhausted()))?;
   let named = super::member_name(&record.name, &name, id).map_err(refused)?;
   let require_evidence = requires_evidence(state, from);
   if require_evidence && work.as_ref().is_some_and(|work| work.evidence.is_empty()) {
