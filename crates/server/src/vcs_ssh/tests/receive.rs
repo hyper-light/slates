@@ -26,7 +26,7 @@ use crate::vcs_http::Bounds;
 use crate::vcs_http::ShardRepositories;
 use crate::vcs_http::git::{ShardLender, ThisShard};
 use crate::vcs_ssh::receive::ReceiveCommand;
-use crate::vcs_ssh::site::{Command, GIT_DIE_STATUS, Refused, ToolServices, ToolSite};
+use crate::vcs_ssh::site::{ClientGone, Command, GIT_DIE_STATUS, Refused, ToolServices, ToolSite};
 use crate::vcs_ssh::{EdgeState, serve};
 use crate::vcs_store::hg_view::ServedViews;
 use crate::vcs_store::upload::ShardStores;
@@ -281,7 +281,7 @@ fn died(message: &str) -> Refused {
 fn t_a683_a_push_whose_shard_is_not_lent_is_refused_as_not_served() {
   let mut command = ReceiveCommand::new(NotLent, owner(), (GONE, NAME.to_owned()), Version::V1);
   assert_eq!(
-    ready(command.step()),
+    ready(command.step(ClientGone::never())),
     Err(died("git-receive-pack is not served yet"))
   );
 }
@@ -300,7 +300,7 @@ fn t_a683_a_repository_gone_before_its_push_starts_is_refused_in_gits_words() {
       (GONE, "gone".to_owned()),
       Version::V0,
     );
-    ready(command.step())
+    ready(command.step(ClientGone::never()))
   });
   daemon.stop();
   assert_eq!(
