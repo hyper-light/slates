@@ -1,0 +1,6 @@
+Windows ARM64; Microsoft Windows [Version 10.0.26200.9974]
+ntfs written: open+close p50 71.9 us p90 87.0 us max 6,475.8 us
+ntfs empty: open+close p50 59.2 us p90 72.3 us max 131.2 us
+memfs: C:\Program Files (x86)\WinFsp\bin\memfs-a64.exe
+memfs written: open+close p50 157.7 us p90 184.9 us max 13,832.0 us
+memfs empty: open+close p50 189.9 us p90 208.1 us max 322.1 us
