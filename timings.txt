@@ -1,0 +1,8 @@
+Windows AMD64; Microsoft Windows [Version 10.0.26100.33674]
+ntfs written: open+close p50 12.5 us p90 16.2 us max 5,651.6 us
+ntfs empty: open+close p50 9.5 us p90 10.8 us max 61.7 us
+memfs: C:\Program Files (x86)\WinFsp\bin\memfs-x64.exe
+memfs written: open+close p50 43.9 us p90 49.6 us max 120.2 us
+memfs empty: open+close p50 45.5 us p90 52.8 us max 98.7 us
+slates written: open+close p50 93.4 us p90 127.4 us max 238.1 us
+slates empty: open+close p50 138.2 us p90 150.6 us max 212.1 us
