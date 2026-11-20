@@ -410,9 +410,16 @@ fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize
     };
     let mut out = Vec::new();
     let locks = (&no_locks, AprTime(0));
-    let outcome = answer_lock_read(&fixture.index, &fixture.green, locks, &session, command, &mut out)
-      .unwrap_or_else(|| answer(&fixture.index, &fixture.green, &session, command, &mut out))
-      .unwrap();
+    let outcome = answer_lock_read(
+      &fixture.index,
+      &fixture.green,
+      locks,
+      &session,
+      command,
+      &mut out,
+    )
+    .unwrap_or_else(|| answer(&fixture.index, &fixture.green, &session, command, &mut out))
+    .unwrap();
     match drained(outcome, &fixture, &session, &mut out) {
       Outcome::Streaming(_) => panic!("{name}: a drained stream streams"),
       Outcome::Answered => {
@@ -713,11 +720,7 @@ fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("svn-blame-g"), 5),
   ];
   for ((name, client, server), commands) in sessions {
-    assert_eq!(
-      replay(name, client, server, &[]),
-      commands,
-      "{name}"
-    );
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
   }
 }
 
@@ -738,11 +741,7 @@ fn stock_locked_sessions_are_answered_as_svnserve_answered_them() {
     (transcript!("locked-svn-proplist"), 4),
   ];
   for ((name, client, server), commands) in sessions {
-    assert_eq!(
-      replay(name, client, server, &[]),
-      commands,
-      "{name}"
-    );
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
   }
 }
 
