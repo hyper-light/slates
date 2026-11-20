@@ -1168,6 +1168,9 @@ pub(crate) struct Census {
   /// transaction already cloned with another copy identity, which the other order compares against the parent's old
   /// node-revision (`get_copy_inheritance`'s comparison of the two copy identities).
   sensitive: usize,
+  /// Directory listings holding a name the index never named beneath the directory itself, reached through a copy's
+  /// source (`Index::children`).
+  listed_through_copies: usize,
 }
 
 impl Census {
@@ -1186,6 +1189,7 @@ impl Census {
     self.mergeinfo_beneath += other.mergeinfo_beneath;
     self.reordered += other.reordered;
     self.sensitive += other.sensitive;
+    self.listed_through_copies += other.listed_through_copies;
     for (sum, more) in self.relations.iter_mut().zip(other.relations) {
       *sum += more;
     }
@@ -2081,7 +2085,59 @@ fn same_as_index(index: &Index, fs: &NaiveFs, census: &mut Census) -> Result<(),
   for path in &paths {
     same_history(index, fs, path, &mut pairings)?;
   }
+  for revision in 0..=index.youngest() {
+    same_listings(index, fs, revision, census)?;
+  }
   same_relations(index, &places, census)
+}
+
+/// The name of `path` when it stands one level beneath `directory`.
+fn child_name(directory: &str, path: &str) -> Option<String> {
+  let name = path.rsplit('/').next().unwrap_or_default();
+  (path != directory && parent_path(path) == directory).then(|| name.to_owned())
+}
+
+/// Holds every directory's listing in `revision` equal to the naive tree's (the names one level beneath it, in byte
+/// order), a file's and the youngest absent path's none; counts the listings holding a name only a copy's source gave.
+fn same_listings(
+  index: &Index,
+  fs: &NaiveFs,
+  revision: Revision,
+  census: &mut Census,
+) -> Result<(), String> {
+  let tree = &fs.trees[usize::try_from(revision).unwrap()];
+  for (path, &label) in tree {
+    let listed = index
+      .children(path, revision)
+      .map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))?;
+    let expected = (fs.nodes[label].kind == NodeKind::Directory).then(|| {
+      tree
+        .keys()
+        .filter_map(|other| child_name(path, other))
+        .collect::<Vec<_>>()
+    });
+    if listed != expected {
+      return Err(format!(
+        "{path}@{revision}: listed {listed:?}, naive {expected:?}"
+      ));
+    }
+    let through_copy = listed.iter().flatten().any(|name| {
+      let child = if path == "/" {
+        format!("/{name}")
+      } else {
+        format!("{path}/{name}")
+      };
+      index.history(&child).is_ok_and(<[HistoryEntry]>::is_empty)
+    });
+    census.listed_through_copies += usize::from(through_copy);
+  }
+  let absent = index
+    .children("/never/named", revision)
+    .map_err(|refusal| format!("/never/named@{revision}: {refusal:?}"))?;
+  if absent.is_some() {
+    return Err(format!("/never/named@{revision} listed {absent:?}"));
+  }
+  Ok(())
 }
 
 /// Holds one path's index history equal to its naive history.
@@ -2233,6 +2289,7 @@ fn the_index_equals_a_naive_filesystem_replaying_the_same_revisions() {
     census.mergeinfo_beneath,
     census.reordered,
     census.sensitive,
+    census.listed_through_copies,
   ];
   assert!(
     met.iter().all(|&count| count > 0),

@@ -43,6 +43,14 @@
 //! and counter, which `verbs::fresh_volume_id` makes unique among the partition's volumes, so a recovery keys each green
 //! as before.
 //!
+//! **Git LFS objects** (A-629 part 3). A git repository's LFS objects live in its store's LFS index (`GitStore::lfs`,
+//! `slates_git::lfs::objects`): each object's bytes in the shared content store, one row under its oid, apart from the
+//! git objects' index. An upload is one entry of the repository's logs holding the object's record ([`lfs_record`]: the
+//! oid and the bytes); the index keeps the object between the register's guard and the entry's apply ([`admit_lfs`],
+//! the bytes checked against the oid there), so an upload a guard refuses keeps nothing and one acknowledged is
+//! durable as the entry is. A recovery replays the record into the index through the same check ([`replay_lfs`]), told
+//! from a push's record by its first word.
+//!
 //! **Subversion** (A-655 part 2b). A Subversion repository's entries hold its records (`slates_svn::commit::record`):
 //! the entry that joins its root holds its creation (its UUID and revision 0's date), and each entry that moves its
 //! green holds the revision the commit step committed. A recovery replays them through the step's own check and apply
@@ -69,6 +77,8 @@ use std::convert::Infallible;
 use slates_db::catalog::{
   ObjectFormat as DbFormat, RepositoryId, RepositoryRecord, VcsTool, VolumeId as DbVolumeId,
 };
+use slates_git::lfs::Oid;
+use slates_git::lfs::objects::{LfsObjects, ObjectRefused};
 use slates_git::object_name::{ObjectFormat, ObjectId};
 use slates_git::store::views::PushedObjects;
 use slates_git::store::{Incoming, Move, Push, PushRefused, ReachSets, Repository, StoreRefused};
@@ -85,14 +95,17 @@ use crate::state::ShardState;
 
 pub(crate) mod hg_import;
 pub(crate) mod hg_view;
+pub(crate) mod lfs_record;
 pub(crate) mod paths;
 pub(crate) mod record;
 pub(crate) mod svn_import;
+pub(crate) mod svn_view;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod upload;
 
+use lfs_record::LfsRecordRefused;
 use record::{Noted, Record, RecordRefused, RecordWriter, RecordedMove, WriteRefused};
 
 /// Counter: a repository whose store could not be made (a window too short for two identities, or a git repository
@@ -174,6 +187,10 @@ pub(crate) struct GitStore {
   /// What `versions` holds of the content store's budget (`ContentStore::charge`), charged before a commit keeps a
   /// version and given back with the store ([`versions_cost`]).
   charged: u64,
+  /// The repository's Git LFS objects (A-629 part 3): each upload's bytes in the content store under its oid, one row
+  /// of an index apart from the git objects', put there by its entry's append ([`admit_lfs`]) and by a recovery's
+  /// replay of that entry's record ([`lfs_record`]), and given back with the store.
+  pub(crate) lfs: LfsObjects,
 }
 
 impl GitStore {
@@ -187,6 +204,7 @@ impl GitStore {
       heads: BTreeMap::new(),
       versions: BTreeMap::new(),
       charged: 0,
+      lfs: LfsObjects::new(),
     }
   }
 
@@ -266,6 +284,10 @@ pub(crate) enum ReplayRefused {
   SvnOrder,
   /// A record of a tool whose replay is owed: Mercurial's (g304's push).
   Owed,
+  /// An LFS object's record's bytes (A-629 part 3).
+  LfsRecord(LfsRecordRefused),
+  /// An LFS object the repository's LFS index refused again: bytes that are not their oid's, or past the budget.
+  Lfs(ObjectRefused),
 }
 
 /// Why a git push's step was refused. Each leaves the store as it was, and the push holding what it held.
@@ -505,7 +527,8 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
       let maps = store.heads.values().fold(true, |whole, head| {
         content.release(&head.root).is_ok() && whole
       });
-      store.repository.release(content).is_ok() && values && versions && maps
+      let lfs = store.lfs.release(content).is_ok();
+      store.repository.release(content).is_ok() && values && versions && maps && lfs
     }
     RepositoryStore::Mercurial(store) => {
       let values = store.derivations.release(content).is_ok();
@@ -1217,6 +1240,9 @@ fn replay_into(
   let unheld = ReplayRefused::Git(GitRefused::NoStore);
   let content = stores.content.as_mut().ok_or(unheld.clone())?;
   match stores.entries.get_mut(&id) {
+    Some(RepositoryStore::Git(store)) if lfs_record::is_lfs(bytes) => {
+      replay_lfs(content, store, bytes).map(|()| 0)
+    }
     Some(RepositoryStore::Git(store)) => replay_git(content, store, bytes),
     Some(RepositoryStore::Subversion(store)) => {
       replay_svn(store, bytes, svn_room.ok_or(unheld)?).map(|()| 0)
@@ -1224,6 +1250,80 @@ fn replay_into(
     Some(RepositoryStore::Mercurial(_)) => Err(ReplayRefused::Owed),
     None => Err(unheld),
   }
+}
+
+/// Replays one LFS object's record (A-629 part 3; [`lfs_record`]) into the repository's LFS index through the path its
+/// upload took: the bytes checked against the oid before they are kept. An object the index holds already is kept as
+/// it is, so a record replayed twice holds one object.
+fn replay_lfs(
+  content: &mut ContentStore,
+  store: &mut GitStore,
+  bytes: &[u8],
+) -> Result<(), ReplayRefused> {
+  let record = lfs_record::decode(bytes).map_err(ReplayRefused::LfsRecord)?;
+  store
+    .lfs
+    .admit(content, &record.oid, record.bytes)
+    .map(drop)
+    .map_err(ReplayRefused::Lfs)
+}
+
+/// Keeps the LFS object `oid` of repository `id` with `bytes` in its LFS index (A-629 part 3), the step its upload's
+/// append takes between the register's guard and the entry's apply (`crate::repository::push::push_lfs`), lent the room
+/// the bytes take: checked against the oid first, so bytes that are not the oid's are refused with nothing kept, and
+/// past the budget refused typed. An object held already is kept as it is.
+pub(crate) fn admit_lfs(
+  state: &mut ShardState,
+  id: RepositoryId,
+  (oid, bytes): (&Oid, &[u8]),
+) -> Result<Admitted, LfsAdmitRefused> {
+  let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  within_budget(state, brought, |stores| {
+    let (content, store) = stores.git(id).ok_or(LfsAdmitRefused::NoStore)?;
+    store
+      .lfs
+      .admit(content, oid, bytes)
+      .map_err(LfsAdmitRefused::Object)
+  })
+}
+
+/// Why [`admit_lfs`] kept nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LfsAdmitRefused {
+  /// No git store of the repository is held here.
+  NoStore,
+  /// The LFS index refused the object: bytes that are not its oid's, or past the budget.
+  Object(ObjectRefused),
+}
+
+/// The refusal an LFS upload's append answers when the LFS index kept nothing ([`admit_lfs`]): past the budget the room
+/// the shard's budget had, otherwise content that cannot be had, counted as a store's refused commit is.
+pub(crate) fn lfs_refusal_of(state: &mut ShardState, refused: &LfsAdmitRefused) -> Refusal {
+  match refused {
+    LfsAdmitRefused::Object(ObjectRefused::Store(ContentRefused::OverBudget { room, .. })) => {
+      Refusal::BudgetExceeded { available: *room }
+    }
+    // Bytes that are not their oid's are the client's to send again; the caller answers them in LFS's words.
+    LfsAdmitRefused::Object(ObjectRefused::Mismatch) => Refusal::BadRequest {
+      reason: "the object's bytes are not its oid's".to_owned(),
+    },
+    LfsAdmitRefused::NoStore | LfsAdmitRefused::Object(_) => {
+      state.count(COMMIT_REFUSED, 1);
+      Refusal::ContentUnavailable
+    }
+  }
+}
+
+/// The LFS object `oid`'s size in repository `id`'s LFS index, when it holds it (A-629 part 3).
+pub(crate) fn lfs_held(stores: &VcsStores, id: RepositoryId, oid: &Oid) -> Option<u64> {
+  let (content, store) = stores.git_ref(id)?;
+  store.lfs.held(content, oid)
+}
+
+/// The LFS object `oid`'s bytes in repository `id`'s LFS index, when it holds it (A-629 part 3).
+pub(crate) fn lfs_bytes(stores: &VcsStores, id: RepositoryId, oid: &Oid) -> Option<Vec<u8>> {
+  let (content, store) = stores.git_ref(id)?;
+  store.lfs.bytes(content, oid)
 }
 
 /// Replays one Subversion record (A-655 part 2b; module docs, "Subversion") within `room`: a creation makes the
