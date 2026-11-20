@@ -62,3 +62,9 @@
   diag-w-bugs-b3-5 (048dbaf9b = fix + workflow) running. LAND as ONE commit from a fresh worktree off origin/main.
 - Slip: one command ended in `git checkout -b diag-w-bugs-b3-5-local` in ~/slates-work/w-bugs-fix (same commit,
   nothing lost); no further checkouts.
+- State folder moved to ~/fanout-state-w-bugs (main's rule, 4d39b11). Numbers: claim only by a successful push.
+- A-717 LANDED main 721f4ff97 (one commit, fast-forward; files: crates/ipc/src/rendezvous.rs, the bug record, GAPS).
+  Windows proof by use: diag-w-bugs-b3-5 (run 44685574660): `slates volume list` against a live anchor exit 0 (was 4).
+  Run requests for main: Windows clippy of slates-ipc (marks_image is cfg(any(windows,test))); the Windows lanes'
+  WinFsp suites now reachable.
+- Next: B3's answer from b3-5's fsx leg (running).
