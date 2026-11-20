@@ -410,8 +410,9 @@ pub enum RetryCause {
   /// A stream's holder record has not reached its shard yet (A-181).
   HolderPending,
   /// The verb ran on its owner, but what its reply waits for (a live volume's log on `f` candidates, a destroy's
-  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): its effects stay on the
-  /// owner, never claimed durable, and the call made again runs the verb again.
+  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): it took effect once and
+  /// recorded its own reply, which the client asks for again under the request's id itself (since 2026-11-20), so this
+  /// reaches a caller only where that resend found no room. Asked again under a new id it runs again: a new request.
   DurabilityPending {
     /// How long the reply was held, nanoseconds.
     held_ns: u64,

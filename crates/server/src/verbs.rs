@@ -4323,7 +4323,41 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       slates_ipc::protocol::LearnerReport::default()
     },
     failover: failover_report(state),
+    repositories: repository_usage_reports(state),
   }
+}
+
+/// Each repository's usage row this shard keeps (A-724, `ShardState::vcs_usage`), named by its record, for the shard's
+/// report.
+fn repository_usage_reports(
+  state: &ShardState,
+) -> Vec<slates_ipc::protocol::RepositoryUsageReport> {
+  let repositories = state.db.partition().repositories();
+  state
+    .vcs_usage
+    .rows()
+    .map(|(id, usage)| slates_ipc::protocol::RepositoryUsageReport {
+      name: repositories
+        .repository(*id)
+        .map(|record| record.name.clone())
+        .unwrap_or_default(),
+      intakes_begun: usage.intake.begun,
+      intakes_answered: usage.intake.answered,
+      intake_steps: usage.intake.steps,
+      intake_step_ns: usage.intake.step_ns,
+      intake_bytes_in: usage.intake.bytes_in,
+      fetches_begun: usage.fetch.begun,
+      fetch_step_ns: usage.fetch.step_ns,
+      first_ns: usage.first_ns,
+      last_ns: usage.last_ns,
+      longest_intake_step_ns: usage.intake.longest_step_ns,
+      longest_push_phases_ns: crate::git_push::phase_longest(*id).longest.to_vec(),
+      push_phase_steps: crate::git_push::phase_longest(*id).steps.to_vec(),
+      push_phase_ns: crate::git_push::phase_longest(*id).ns.to_vec(),
+      push_phase_gap_ns: crate::git_push::phase_longest(*id).gap_ns.to_vec(),
+      push_first_gap_ns: crate::git_push::phase_longest(*id).first_gap_ns,
+    })
+    .collect()
 }
 
 /// This shard's failover estimate as the wire carries it (A-363): live on the control shard, which runs the
@@ -9659,6 +9693,9 @@ fn judge_submission(
   crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
     slates_merge::engine::Outcome::Accepted { version } => {
+      // The copies the version made, read before the increment's parts move: a Subversion green's revision names them
+      // (`vcs_store::svn_made`).
+      let copies = crate::vcs_store::svn_made::copies_of(&inc);
       // The wait goes first, in this transaction, so a version is never durable without it (A-252).
       if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
         return refused(refusal_of_db(&e));
@@ -9698,7 +9735,7 @@ fn judge_submission(
       crate::vcs_store::commits::after_submit(state, green_id, version, &policy.authorship);
       // A Subversion repository's green: the version becomes the revision the server makes of it, recorded in this
       // transaction (A-664's Subversion objects, `vcs_store::svn_made`).
-      crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship);
+      crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship, &copies);
       // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
       // transaction (A-731, `vcs_store::hg_made`).
       crate::vcs_store::hg_made::make(state, green_id, version, &policy.authorship);

@@ -867,3 +867,82 @@ fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
     assert_eq!(records.content(&identity(special)), Some(&special[..]));
   });
 }
+
+/// A-664's Subversion objects (a copy; main's ruling: a work's copy as Subversion's copy-from row). Do: make a Subversion
+/// repository; submit a work making `/trunk/a.txt` and the directory `/branches`; submit a work copying `/trunk` to
+/// `/branches/b` from its base; then commit a client's revision on the youngest adding `/branches/b/c.txt`. Expect:
+/// revision 2's one row adds `/branches/b`, a directory, copied from `/trunk` at revision 1; the records hold
+/// `/branches/b/a.txt` at revision 2; the client's revision lands as revision 3.
+#[test]
+fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "copied");
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let first = vec![
+      crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n"),
+      crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Mkdir {
+        path: "/branches".to_owned(),
+      }),
+    ];
+    crate::vcs_store::paths::tests::version(state, ipc_green, 1, first);
+    let copy = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Copy {
+      from: "/trunk".to_owned(),
+      to: "/branches/b".to_owned(),
+      version: None,
+      replace: false,
+    });
+    assert_eq!(
+      crate::vcs_store::paths::tests::version(state, ipc_green, 2, vec![copy]),
+      2
+    );
+    let records = state
+      .vcs_stores
+      .subversion_records(svn)
+      .expect("the records");
+    let rows: Vec<(String, Action, NodeKind, Option<CopySource>)> = records
+      .index()
+      .changes(2)
+      .map(|rows| {
+        rows
+          .iter()
+          .map(|row| {
+            (
+              row.path.clone(),
+              row.action,
+              row.kind,
+              row.copy_from.clone(),
+            )
+          })
+          .collect()
+      })
+      .unwrap_or_default();
+    let copied = CopySource {
+      path: "/trunk".to_owned(),
+      revision: 1,
+    };
+    assert_eq!(
+      rows,
+      vec![(
+        "/branches/b".to_owned(),
+        Action::Add,
+        NodeKind::Directory,
+        Some(copied)
+      )]
+    );
+    let held = records
+      .index()
+      .node("/branches/b/a.txt", 2)
+      .ok()
+      .flatten()
+      .is_some();
+    assert!(held, "the copy brings /trunk/a.txt");
+    let rows = vec![file("/branches/b/c.txt", Action::Add, b"gamma\n")];
+    let committed = commit(
+      state,
+      (&owner(), svn),
+      revision(2, rows, &[b"gamma\n"]),
+      None,
+    );
+    assert_eq!(committed, answered(3));
+  });
+}

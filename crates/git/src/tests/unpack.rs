@@ -5,8 +5,8 @@ use flate2::{Compress, Compression, FlushCompress};
 use proptest::prelude::*;
 
 use super::{
-  Chain, Contents, IndexMismatch, Keep, Locate, NoIndex, Object, Outside, Reader, Refusal,
-  Unpacked, check_index, read_whole,
+  Beside, Chain, Contents, IndexMismatch, Keep, Locate, NoIndex, NoObjects, Object, Outside,
+  Reader, Refusal, Unpacked, check_index, read_whole,
 };
 use crate::delta::{self, Sizes};
 use crate::entry::{self, Header, Representation};
@@ -1062,4 +1062,121 @@ proptest! {
     prop_assert_eq!(&through, &unpacked);
     prop_assert_eq!(fed_in_chunks(&bytes, format, &NoIndex, chunk).unwrap(), unpacked);
   }
+}
+
+/// A clock that moves a nanosecond each time it is read, so a turn of one nanosecond is spent after its first unit of
+/// work.
+struct Ticking(u64);
+
+impl crate::store::learn::Clock for Ticking {
+  fn now_ns(&mut self) -> u64 {
+    self.0 += 1;
+    self.0
+  }
+}
+
+/// Shape: a resolution turn's budget, in units of the ticking clock (one unit of work a read).
+const BUDGET: u64 = 4;
+
+/// The objects `held` keeps.
+fn kept(held: &super::Held) -> u64 {
+  held.objects.iter().flatten().count() as u64
+}
+
+/// Resolves `reader`'s waiting deltas in turns of [`BUDGET`] on a ticking clock: the turns taken, and how many resolved
+/// more than their budget.
+fn in_turns(
+  reader: &mut Reader<'_, Placed>,
+  admission: &mut Admission,
+  held: &mut super::Held,
+) -> (u32, u32) {
+  let mut clock = Ticking(0);
+  let (mut turns, mut past_budget) = (0u32, 0u32);
+  loop {
+    turns += 1;
+    assert!(turns <= 1_000, "the resolution never ended");
+    let before = kept(held);
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: BUDGET,
+    };
+    let done = reader
+      .resolve_turn(
+        admission,
+        &mut Beside {
+          outside: &NoObjects,
+          held: &mut *held,
+        },
+        quantum,
+      )
+      .unwrap();
+    if kept(held) - before > BUDGET {
+      past_budget += 1;
+    }
+    if done {
+      return (turns, past_budget);
+    }
+  }
+}
+
+/// A-724's starvation fix (found by use: a push's last input step resolved every delta waiting on a late base in one
+/// poll, 1,435.7 ms for git/git v1.5.0 on the 32-core Studio, starving the small repositories on its shard and ending
+/// the daemon at ten such pushes). Do: read a pack of 64 reference deltas whose base comes last (the input step), then
+/// resolve its waiting deltas in turns of a budget of four units on a clock that ticks each read, counting each step
+/// that resolved more than its budget. Expect: the past-budget count 0 for the input step (it resolves none of the 64:
+/// before the fix it resolved all of them, past any budget) and 0 over every turn after it; many turns; every object as reading the pack whole in one call makes it; and the pack then finished with
+/// nothing left to resolve.
+#[test]
+fn deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time() {
+  let format = ObjectFormat::Sha256;
+  let base = b"a base every delta waits for, and it comes last\n".repeat(4);
+  let id = blob_id(format, &base);
+  let mut builder = Builder::new(format);
+  for n in 0..64u32 {
+    let target = [base.as_slice(), format!("edit {n}\n").as_bytes()].concat();
+    builder.put(
+      Representation::RefDelta { base: id },
+      &delta_between(&base, &target),
+    );
+  }
+  builder.put(Representation::Whole(Kind::Blob), &base);
+  let bytes = builder.finish();
+  let index = Placed(vec![]);
+  let whole = read_whole(&bytes, format, &index, &mut unbounded()).unwrap();
+  let mut reader = Reader::new(format, &index);
+  let mut admission = unbounded();
+  let mut held = super::Held::default();
+  reader
+    .read_into(
+      &bytes,
+      &mut admission,
+      &mut Beside {
+        outside: &NoObjects,
+        held: &mut held,
+      },
+    )
+    .unwrap();
+  assert!(reader.is_whole());
+  let input_step = kept(&held);
+  assert_eq!(input_step, 1, "the input step resolved waiting deltas");
+  let (turns, past_budget) = in_turns(&mut reader, &mut admission, &mut held);
+  assert_eq!(past_budget, 0, "turns past their budget");
+  assert!(
+    turns >= 16,
+    "64 waiting deltas resolved in {turns} turns of {BUDGET} units"
+  );
+  for (at, object) in whole.objects.iter().enumerate() {
+    let kept = held.take(at).expect("each object kept");
+    assert_eq!(kept.content, object.content, "object {at}");
+  }
+  let kept = reader
+    .finish_into(
+      &mut admission,
+      &mut Beside {
+        outside: &NoObjects,
+        held: &mut held,
+      },
+    )
+    .unwrap();
+  assert_eq!(kept.objects.len(), 65);
 }
