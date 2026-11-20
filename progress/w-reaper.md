@@ -26,8 +26,18 @@
   merge_hooked/resume_merge; SvnStores::begin_commit returns Due; exchange POST/MERGE/LOCK/UNLOCK async with
   HookSite::Http(ClientGone, policy); post-lock/unlock failure counted, never told. Tests daemon_edge a_dav_* 3/3,
   focused 101/101 + svn 171/171, stock svn HTTP on Studio-1 4/4.
-  (2) NEXT: A-645 hook view (route A: read-only slates volume presented to the hook; svnlook + git hooks read REPOS).
-  (3) Linux run of hook tests on adacachy when it has room.
+  (2) A-645 hook view: SCOPED, reported to main for a ruling (2026-11-20). Findings:
+    - design (A-665 part 3 / GAPS): view = read-only volume whose base host reads the repo's content store, shown under
+      the root mount (D-1). But: (a) the daemon publishes no root mount (SLATES_ROOT must be named; design 33585 owed),
+      so no path to present at; (b) a HostFs is called inside the volume's borrow and cannot reach ShardState's
+      vcs_stores, so a lazy view host needs either A-727 a2 (VCS content in the shard chunk arena: a RAM volume
+      referencing the same chunks, content once) or a RAM copy of the view (doubles memory for the hook's life).
+    - svn's view = FSFS format 6 (physical addressing, sharded): per-revision rev files (node-revs with node/copy ids,
+      pred/count, copyroot; dir reps naming children by r<rev>/<offset>; changed-paths; trailer), revprops, current,
+      format, uuid; plus transactions/<txn>.txn for `svnlook -t`. Offsets chain across history -> derived data per
+      revision. Multi-part: (P1) FSFS rev/revprop generator + stock svnlook oracle on Studio-1; (P2) txn dir for -t;
+      (P3) presenter (needs (a)+(b) decided); (P4) git presenter replacing Unpresented.
+  (3) Linux run of hook tests: queued on adacachy (kiln run r15, "no room here now"); starts by itself.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
