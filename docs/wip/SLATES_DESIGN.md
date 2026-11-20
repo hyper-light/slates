@@ -54520,3 +54520,47 @@ version-2 record through git's own reader, `StoreBases`, `ReplayRefused::Pack`, 
   3,540); the objects the repository already holds left out of the recorded pack; the push_load re-run at N = 1, 10 and
   100 once S1 and S3 are in, against today's 229 MiB a push.
 
+### A-727 — Repository bytes leave the partition snapshot: the version-control content store in the shard's chunk arena, its table in the shard image, records naming identities (2026-11-20, w-perf for UI goal 93; main's ruling, option 2; §4.17.1 "Objects" and "Durability and residency", §4.8 "Recovery", §4.10, A-64, A-99, A-662, A-716, A-723)
+
+Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (d) below build it.
+
+- **Why.** The wall a 5,000-revision Subversion import met at revision 3,540 (`Unpublished { ... profile of 803,344,210
+  bytes exceeds its 746,962,928-byte region }`) is the partition's snapshot, not an entry: `slates_db`'s `snapshot`
+  publishes the whole partition (`Partition::to_snapshot`) into one anchor slot region, and the register keeps every
+  repository entry's record bytes, so the snapshot is the sum of every retained record. Splitting a pack across
+  entries leaves that sum as it is (A-723's owed "bounded parts" was withdrawn for it). git/git's whole pack, 607 MiB as
+  A-723's version 2 records it, would sit near the slot alone.
+- **Where the bytes go.** `slates_vcs::ContentStore` keeps its windows, today process heap, as sealed chunks of the
+  owner shard's chunk store (`slates_vfs::content::ChunkStore`) in that shard's arena range of the anchor's content
+  object (A-64): written there once, immutable once sealed (D-6), sealed under the shard's cipher where it seals (A-99),
+  surviving a daemon restart because the anchor holds the object. Its windows are already cut at the content plane's
+  chunk window and named by plain BLAKE3, as a volume's sealed chunks are, so a repository's window and a green's file
+  chunk of the same bytes can be one block; A-716's table (`crates/merge/src/held.rs`) stays the green's identity ->
+  block index over the same arena.
+- **What a record holds.** Identities only. git's record version 3: the moves, each new object's name (type, identity,
+  length: 41 bytes), and the pack's root identity (the pack put as content, its windows under a list); A-723's version 2
+  (the pack's bytes) and version 1 (objects inflated) stay readable. Subversion's records name their texts (A-716's
+  slices 2 and 3, with w-svn); Mercurial's its texts (w-hg's S5). The partition's snapshot then carries metadata: about
+  41 bytes a new object (git/git, 424,851 objects: about 17 MiB; the Linux kernel's ~10 million: about 410 MiB, near a
+  slot), which w-balance derives and spreads (§4.17.5).
+- **Order: content, then image, then entry, by group commit.** A push's content is written into the arena as it
+  streams, charged by admission. Before an entry naming it commits, the owner shard's image (A-64's barrier: 0.11 to
+  0.16 ms at 256 MiB) lists the content's chunks, so no durable record ever names content no durable image holds. One
+  publication covers every push whose content was written before it: entries wait on the next barrier and never each
+  start one, so ten thousand concurrent pushes share barriers (main's requirement; measured at load by
+  `push_load.py`).
+- **Recovery.** The shard images first (their content tables restore each `ContentStore`'s entries over the chunks
+  the arena still holds, through `ChunkStore::claim_chunk_blocks` and `adopt_chunk`, as volumes' chunks are), then
+  the partition's snapshot and log, whose records find their content by identity. A record naming content no image
+  holds is refused typed (the order above never makes one).
+- **Replication.** Content ships as content (§4.10: by identity, deduplicated at the holder) before the record that
+  names it, so a holder replaying a record holds what it names.
+- **The read seam (slice a1).** A sealed chunk is read by copying it out (and decrypting it where sealed under a
+  cipher), so `ContentStore::windows` cannot keep lending `&[u8]` slices of its own storage. Its nine readers in the
+  tools' stores and the server read through a copy-out (`read_into`, or a `Cow` that borrows where the storage can
+  lend). Slices: (a1) the content store's storage behind a seam and its readers over the copy-out, the heap storage
+  kept for tests and tools; (a2) the arena storage over the shard's chunk store, with A-64's rule that a block the
+  committed image names is not reused before a newer image commits; (a3) the content table in the shard image and its
+  recovery before the records; (b) git's record version 3; (c) Subversion's texts with A-716's slices; (d) replication's
+  content-before-record order, held by the two-node test.
+
