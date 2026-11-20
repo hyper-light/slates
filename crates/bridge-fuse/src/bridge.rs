@@ -1885,7 +1885,8 @@ fn serve_getxattr(
 }
 
 /// `SETXATTR`: `fuse_setxattr_in` is the value's size and the `setxattr(2)` flags, and on a connection whose kernel
-/// sends the extended form (`FUSE_SETXATTR_EXT`, a guest's route, A-378) the setter's flags and a pad; then the name,
+/// sends the extended form (`FUSE_SETXATTR_EXT`, a guest's route, A-378) the setter's flags and a pad, each request's
+/// form read from the request ([`crate::abi::setxattr_head`], A-741); then the name,
 /// then the value. Only a name in a namespace the transport reaches is stored; any other is `EOPNOTSUPP`, what a
 /// filesystem without that namespace answers. A POSIX ACL is checked as Linux checks one and kept with its named owners
 /// turned through the bridge's view (A-302), and the seam keeps the file's mode with an access ACL (A-314); an access
@@ -1902,15 +1903,14 @@ fn serve_setxattr(
   else {
     return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
   };
-  let (head, setter_flags) = if bridge.setxattr_ext() {
-    match body_u32(req.body, crate::abi::COMPAT_SETXATTR_IN_BYTES) {
-      Some(setter_flags) => (crate::abi::SETXATTR_IN_BYTES, setter_flags),
-      None => return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
-    }
-  } else {
-    (crate::abi::COMPAT_SETXATTR_IN_BYTES, 0)
-  };
+  // The form each request carries: a connection that kept the extended one still sends the short one for a call made
+  // before its INIT was answered (A-741).
+  let (head, setter_flags) = crate::abi::setxattr_head(req.body, bridge.setxattr_ext());
   let rest = req.body.get(head..).unwrap_or_default();
+  if !rest.contains(&0) {
+    // No name ends within the body: no request the kernel sends.
+    return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
+  }
   let Some(name) = reached_attribute(rest, bridge.attribute_namespaces()) else {
     return write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out);
   };

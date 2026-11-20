@@ -3009,6 +3009,13 @@
 > in each form (`crates/bridge-fuse/src/shards_fs.rs`), and a daemon's stream taking it after an INIT that kept the
 > extended form, its root then shown as the run's (`crates/server/src/shards.rs`). Swept: no other intercept of the
 > stream reads a negotiated form. Owed: kiln's re-vendor and its macOS microVM drive (main's run).
+> **Fixed since (A-741, 2026-11-20, w-k90-vendor):** a connection that kept the extended form still sends a SETXATTR
+> its kernel sized before INIT's reply arrived in the short form (Linux `fuse_setxattr` sizes by `fc->setxattr_ext`
+> at the call; `fuse_block_alloc` holds it until the reply), and Shards' init sets the owner word just then: read in the
+> extended form alone, the word fell to the dispatch (`EOPNOTSUPP`) and kiln's macOS microVM g266 drive was refused
+> every write `EACCES`, intermittently (recorded on the Mac Studio: `SetXattr` node 1 from uid 0, `setxattr_ext=true`,
+> an 8-byte `fuse_setxattr_in`). The form is the request's own now (`abi::setxattr_head`), for the word and the
+> dispatch alike. Owed: kiln's re-vendor (with its drive's run).
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto
