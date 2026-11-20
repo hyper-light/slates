@@ -142,3 +142,15 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - Fix (uncommitted): slates::remove_after_container (let go of a busy mount once container+bind are gone), used by
   workspace::container end + workspace::release for container sessions + the live test; unit test w9_a_containers_busy_...
   11/11 local; bins check clean. r61 = green attempt.
+
+## LANDED 2026-11-20 fa86489f5 (on origin/main 09ea9b826): container end lets a busy workspace mount go
+   (slates::remove_after_container) + workspace::container_live_tests. LIVE GREEN r70: macOS arm64 Adas-MacBook-Pro-2,
+   Docker Desktop 29.3.1, alpine:3.22, binaries at base ed8991d29 + piece: 1 passed 10.99 s, mounts left 0 (red r54 before
+   the fix: mount busy, held by com.apple.Virtualization.VirtualMachine). Unit on merged tree (base 6965eaf63): 13/13.
+   NOTE: fa86489f5's message says "merged on base 6965eaf63, 11 passed" -- that run was actually on ed8991d29; the
+   merged run is 13/13 above.
+## Ada's ruling 09:30: container engine moves to a `local` nfs Docker volume of Slates' export (owner w-k90-a520);
+   bind route goes after its A/B. I don't edit sandbox::container / workspace::container. Hand-offs written:
+   inbox/w-k90-a520-from-w-k90-containers.md (+ agents_send), inbox/w-k90-win-from-w-k90-containers.md (r33 findings).
+## MINE NEXT: proof by use of the OCI/Docker engine through the NEW route on Linux (adacachy), macOS (Docker Desktop),
+   Windows (jupiter, once w-k90-win's build + WinFsp) -- after w-k90-a520 lands the route.
