@@ -94,9 +94,20 @@ every profile name a run leaves behind here; no other admin steps or installs.
 - r26 (jupiter): SLATES_E2E=1 VM_E2E=1 microvm:: at cc1ecb625, log C:\Users\corph\w-k90-whp\drive-cc1ecb625.log
   (cargo rebuilt the kiln crate first: env differed from r21's).
 
+## 2026-11-20 14:04 PST: THE WHP DRIVE PASSED ON JUPITER (r26, kiln main cc1ecb625)
+- `SLATES_E2E=1 VM_E2E=1 cargo test --locked -p kiln --test slates_e2e microvm:: -- --nocapture --test-threads 1`:
+  1 passed, 0 failed, 455.84 s (g266; g90's resync drive is cfg(unix) by design: Windows' channel names a handle Shards'
+  device takes none of yet). Ask: three edits in volume ...05 with no host mount, harness at /mnt/c/..., change request
+  exactly its changes, landing held then written on the person's approval; Bypass: LAND_WRITTEN at once (3 written).
+  Log C:\Users\corph\w-k90-whp\drive-cc1ecb625.log.
+- Rerun at current main 63da2c592 (36 commits on, incl. w-k90-kvm's 22bb3fb9e in the microVM sandbox path): r27, log
+  C:\Users\corph\w-k90-whp\drive-<sha>.log. goals_done after it.
+
 ## AppContainer profiles left on jupiter by my runs
+- After r26: 164 profiles, identical to the baseline: none added, none removed (Shards removed its per-VM profiles).
 - Baseline before r26 (HKCU ...\AppContainer\Mappings monikers, C:\Users\corph\w-k90-whp\appcontainers-before.txt):
   164 profiles, 2 of them Shards' and not mine: shards.pipes-s0.41940.0, shards.pipes-s0.48268.0.
 
 ## For main to delete
-- (none)
+- jupiter: C:\Users\corph\w-k90-whp\target (my kiln build) and C:\Users\corph\w-k90-whp\kiln (my clone), once the
+  goal is marked; adas-mac-studio-3 and adas-mac-studio.local-2: ~/.cache/w-k90-whp-clone, ~/.cache/w-k90-whp-target.noindex.
