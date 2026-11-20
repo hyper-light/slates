@@ -913,27 +913,43 @@ fn run(
     }
     turns.looked(stuck.is_some());
     let episode_late_ns = lateness.since_beat(turn == Turn::Beat, late_ns);
-    match turn {
-      Turn::Beat => last_beat_ns = now.max(1),
-      Turn::Withhold(Cause::Stuck { .. }) if last_beat_ns != 0 => {
-        turns.withheld_after(last_beat_ns, episode_late_ns);
-      }
-      Turn::Withhold(_) | Turn::End(_) => {}
-    }
+    count_turn(turns, turn, (&mut last_beat_ns, now), episode_late_ns);
     mark(segment, turn, now);
-    match turn {
-      Turn::Beat => {}
-      Turn::Withhold(Cause::ControlEnded) => {
-        if !stopping && !said_control_ended {
-          said_control_ended = true;
-          slates_machine::log_line!(
-            "slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"
-          );
-        }
-      }
-      // Ended above, before any line that takes the log's lock.
-      Turn::Withhold(Cause::Stuck { .. }) | Turn::End(_) => {}
+    say_control_ended(turn, stopping, &mut said_control_ended);
+  }
+}
+
+/// Counts `turn` taken at `now`: a beat is the last beat's time; a withholding for a stuck shard after a beat counts
+/// the episode, `episode_late_ns` its lateness.
+fn count_turn(
+  turns: &Turns,
+  turn: Turn,
+  (last_beat_ns, now): (&mut u64, u64),
+  episode_late_ns: u64,
+) {
+  match turn {
+    Turn::Beat => *last_beat_ns = now.max(1),
+    Turn::Withhold(Cause::Stuck { .. }) if *last_beat_ns != 0 => {
+      turns.withheld_after(*last_beat_ns, episode_late_ns);
     }
+    Turn::Withhold(_) | Turn::End(_) => {}
+  }
+}
+
+/// Says once, unless the daemon is stopping, that the control loop ended and the beat is withheld for it.
+fn say_control_ended(turn: Turn, stopping: bool, said: &mut bool) {
+  match turn {
+    Turn::Beat => {}
+    Turn::Withhold(Cause::ControlEnded) => {
+      if !stopping && !*said {
+        *said = true;
+        slates_machine::log_line!(
+          "slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"
+        );
+      }
+    }
+    // Ended above, before any line that takes the log's lock.
+    Turn::Withhold(Cause::Stuck { .. }) | Turn::End(_) => {}
   }
 }
 

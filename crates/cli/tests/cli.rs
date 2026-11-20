@@ -2018,7 +2018,11 @@ fn merge_copy(instance: &str, green: &str) {
   let (code, out, err) = run(instance, &["read", green, "/e/x.txt"]);
   assert_eq!(code, 0, "{err}");
   assert_eq!(out, "copied", "the copied file streams at the head");
-  // A copy of nothing is refused before any verdict, typed by its case (A-586).
+  copy_of_nothing_is_refused(instance, green);
+}
+
+/// A copy of nothing is refused before any verdict, typed by its case (A-586).
+fn copy_of_nothing_is_refused(instance: &str, green: &str) {
   let (code, out, err) = run(instance, &["work", green, "worknothing"]);
   assert_eq!(code, 0, "{err}");
   let work = value_of(&out, "id");
