@@ -15076,3 +15076,41 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
 - **The daemon's end.** Ten concurrent pushes of git/git v1.5.0 to one repository ended the daemon (the earlier record
   had nineteen): A-722's by-use proof must hold at ten. Reported to main.
 
+
+## Subversion dump export calls in release: a text's call runs 12 to 20 times the copy slice (A-652 slicing; UI goal 93; 2026-11-20)
+
+Hardware: the big Mac Studio (Adas-Mac-Studio, d1323898, 32 cores, 96 GB, macOS arm64), load averages 3.3 to 5.3
+during the runs. Tree: main bca18403d plus the measurement test. Command:
+`CARGO_INCREMENTAL=0 cargo test --release -p slates-svn --lib -- --ignored export_call_times --nocapture`
+(`migration::tests::rules::export_call_times`: a history whose revision 1 adds a 200-window file, 20 MB of noisy bytes,
+and whose revision 2 changes it whole, exported a call at a time, each call timed; one run).
+
+| Format | Calls | Median | p99 | Max |
+|---|---|---|---|---|
+| 2 (whole texts, 100 KB pieces) | 408 | 167.8 µs | 190.8 µs | 220.0 µs |
+| 3 (deltas, measured then written) | 814 | 9.6 µs | 289.6 µs | 303.9 µs |
+
+Against the 14 µs copy slice (`DaemonConfig::copy_slice_ns`, as the MacBook's debug daemon derived it; the Studio's
+release value not read): every format 2 text call and format 3's window calls run 12 to 20 times past it. Format 2's
+call is a 100 KB piece; the writer digests every piece (MD5 and SHA-1, the text's checksums checked as it is written),
+about 1.6 µs a KB, which a smaller piece shortens without changing a byte. Format 3's is one deltifier window (100 KB of
+target, Subversion's window size, which fixes the output's bytes), so only a window made in parts shortens it. Next:
+the piece and the window sliced to the shard's slice (owed, GAPS).
+
+## A 500 MB Subversion commit over svn:// and DAV: refused by one request's room, nothing held (§4.17.1 "A push's intake"; UI goal 93; 2026-11-20)
+
+Hardware and tree as above. Command:
+`CARGO_INCREMENTAL=0 cargo test --release -p slates-cli --test svn_interop -- --ignored a_large_commit_measured --nocapture`
+(`a_large_commit_measured`: an anchor and a two-shard release daemon per scheme, a repository and a token through the
+CLI, stock `svn` 1.15.0 checking out, adding a 500 MB file of noisy bytes and committing it; the daemon's resident
+bytes sampled every 20 ms by `ps`; two runs, the same both times).
+
+| Scheme | Answer | Seconds | Daemon RSS before | Peak | Text |
+|---|---|---|---|---|---|
+| `svn://` | E210009 "The client request size exceeds the configured limit" | 2.8 | 37.4 MB | 50.4 MB | 500 MB |
+| `http://` (DAV) | E210009, the same words | 5.0 | 38.1 MB | 50.4 MB | 500 MB |
+
+The commit is refused by one request's room (the listener's `Limits::item_bytes`, the DAV site's request room), where
+§4.17.1's rule 2 refuses only past the shard's room; and below that room the commit's work holds every new text whole
+(`commit::drive::Work::texts`, by reading), where rule 1 bounds the working set whatever the text's size. Neither rule
+holds for Subversion's intake yet (GAPS).
