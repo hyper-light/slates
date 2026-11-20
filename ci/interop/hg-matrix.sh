@@ -29,7 +29,7 @@ row() {
   local log="$WORK/logs/$name.log" start end code
   mkdir -p "$WORK/logs"
   start=$(date +%s)
-  perl -e 'alarm shift; exec @ARGV' "$STEP_LIMIT" "$@" >"$log" 2>&1
+  perl -e 'alarm shift; exec @ARGV or exit 127' "$STEP_LIMIT" "$@" >"$log" 2>&1
   code=$?
   end=$(date +%s)
   if [ "$code" -eq 0 ]; then ROWS+=("PASS $name $((end - start))s"); else
@@ -82,20 +82,20 @@ PUSH=(--new-branch -f)
 [ -n "${PUSH_REV:-}" ] && PUSH+=(-r "$PUSH_REV")
 echo "hg $(h --version | head -1); source $SOURCE $(h -R "$SOURCE" log -r 'all()' -T x | wc -c | tr -d ' ') changesets; http $HTTP ssh $SSH"
 
-row push-all h -R "$SOURCE" push "${PUSH[@]}" "$URL"
-row identify h identify "$URL"
-row clone h clone -q "$URL" a
-row verify h -R a verify -q
+row push-all "${HG[@]}" -R "$SOURCE" push "${PUSH[@]}" "$URL"
+row identify "${HG[@]}" identify "$URL"
+row clone "${HG[@]}" clone -q "$URL" a
+row verify "${HG[@]}" -R a verify -q
 row same-tip bash -c "[ \"\$(${HG[*]} -R a identify -r tip -i)\" = \"\$(${HG[*]} identify -r tip $URL)\" ]"
-row log h -R a log -l 1000 --stat -T '{node}\n'
-row log-graph h -R a log -G -l 2000 -T '{rev}\n'
+row log "${HG[@]}" -R a log -l 1000 --stat -T '{node}\n'
+row log-graph "${HG[@]}" -R a log -G -l 2000 -T '{rev}\n'
 row annotate bash -c "cd a && ${HG[*]} annotate \$(${HG[*]} files 'glob:**.py' | head -1)"
-row diff h -R a diff -r 'tip~50' -r tip --stat
+row diff "${HG[@]}" -R a diff -r 'tip~50' -r tip --stat
 row bookmark-push bash -c "cd a && ${HG[*]} bookmark matrix-bm && ${HG[*]} push -B matrix-bm"
 row tag-push bash -c "cd a && ${HG[*]} tag matrix-v1 && ${HG[*]} push"
 row branch-push bash -c "cd a && ${HG[*]} branch matrix-branch && echo b >matrix.txt && ${HG[*]} commit -qAm branch \
   && ${HG[*]} push --new-branch -r ."
-row clone-b h clone -q "$URL" b
+row clone-b "${HG[@]}" clone -q "$URL" b
 row merge-push bash -c "cd b && ${HG[*]} update -q default && echo m >matrix-main.txt && ${HG[*]} commit -qAm main \
   && ${HG[*]} merge -q matrix-branch && ${HG[*]} commit -qm merge && ${HG[*]} push -r ."
 row pull-update bash -c "cd a && ${HG[*]} pull -q -u"
@@ -105,10 +105,10 @@ row rebase-push bash -c "cd b && ${HG[*]} update -q matrix-branch && echo r >>ma
 row incoming bash -c "cd a && ${HG[*]} incoming -q >/dev/null; [ \$? -le 1 ]"
 row outgoing bash -c "cd b && ${HG[*]} outgoing -q >/dev/null; [ \$? -le 1 ]"
 row phase-public bash -c "cd a && ${HG[*]} pull -q && [ \"\$(${HG[*]} phase -r tip | cut -d' ' -f2)\" = public ]"
-row clone-rev h clone -q -r 'default' "$URL" c
-row stream-clone h clone -q --stream "$URL" d
-row ssh-clone h clone -q "$SSHURL" e
-row ssh-pull h -R a pull -q "$SSHURL"
+row clone-rev "${HG[@]}" clone -q -r 'default' "$URL" c
+row stream-clone "${HG[@]}" clone -q --stream "$URL" d
+row ssh-clone "${HG[@]}" clone -q "$SSHURL" e
+row ssh-pull "${HG[@]}" -R a pull -q "$SSHURL"
 row ssh-push bash -c "cd e && echo ssh >ssh.txt && ${HG[*]} commit -qAm ssh && ${HG[*]} push -r . $SSHURL"
 
 echo "---- summary ($(printf '%s\n' "${ROWS[@]}" | grep -c '^PASS') of ${#ROWS[@]} passed)"
