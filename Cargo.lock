@@ -1934,6 +1934,7 @@ dependencies = [
  "proptest",
  "slates-test-seeds",
  "unicode-normalization",
+ "zstd",
 ]
 
 [[package]]

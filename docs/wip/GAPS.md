@@ -10,7 +10,10 @@
 > but stays in RSS and vmmap's resident until the kernel wants it (a 64 MiB `shm_open` probe: footprint 64 -> 0 MiB,
 > RSS 64 -> 64). Correction (same day): those pages stay physically held (not reclaimed in 10 s under pressure), so RSS,
 > which `slates_machine::facts::resident_now` reads, is the honest holding and the footprint understates it.
-> **Open, by size:**
+> **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
+> (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
+> anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
 > `reserve_per_shard` = memory / shards / 3 sizes each shard's slice of the content object (write log R/4, image slots
 > 2R, delta log R, arena R: about 1.4 times the machine's memory of address space, ~220 GB on the 96 GB Studio, g226),
 > the reserve's ceiling, the DAX table, the client and fleet shares; the sweep of every sizing site follows here.
@@ -40,6 +43,15 @@
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
 > - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
 >   the reserve's per-pass run list removed with the reserve (A-777).
+> - The anchor segment (45.9 GB mapped on the big Studio, 23 shards): each partition's log ring is `table_bytes` and each
+>   of its two snapshot slots twice that, a share of `reserve_per_shard` (`config.rs`), where `Geometry`'s own docs say
+>   "recovery budget x measured replay throughput" and "the measured partition state size x the growth headroom"
+>   (drift; no replay rate is measured). Address space only (backed where written). -> With the content extents
+>   proposal (main's inbox): sized from the measured state, grown by new regions.
+> - Allocations per NFS request (by reading, `bridge-nfs`): each procedure builds its results in a fresh `XdrWriter`
+>   (31 in `procedures.rs`, 15 in `multi.rs`, the v4 compound), and `reply_record` frames them into a second `Vec`,
+>   copying the results once (a READ's data). Some replies are kept (`nfs_replay::record`, `hold_reply`). -> Write into
+>   the connection's own buffer behind a reserved header; keep a reply by moving that buffer out only when it is kept.
 >
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
@@ -4998,8 +5010,8 @@
 > that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
-> pace between looks). Owed from that sweep, each with its own wake: a broadcast's stragglers (`owner_location.rs`), a
-> FUSE mount helper's exit (`fuse.rs`); the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
+> pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
+> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against

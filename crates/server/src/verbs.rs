@@ -11829,16 +11829,8 @@ fn attach(
   {
     return reply;
   }
-  if matches!(record.policy.role, Role::Green { .. }) {
-    return crate::merge_service::attach_green(state, client_id, principal, &record, intent, &form);
-  }
-  // A work mounts like any volume (A-774): its slot is made here, so every bridge (FUSE, NFS, WinFsp) serves it.
-  if matches!(record.policy.role, Role::Work { .. })
-    && !crate::mounted_work::ensure_slot(state, record.id)
-  {
-    return refused(Refusal::Unsupported {
-      feature: "a mount of a work whose green's base this shard cannot read".to_owned(),
-    });
+  if let Some(reply) = merge_role_form(state, (client_id, principal), &record, intent, &form) {
+    return reply;
   }
   let rights = rights_of(&record, principal);
   if !permits(rights, intent) {
@@ -11948,6 +11940,31 @@ fn established_form(
       crate::transports::oci(situation),
     ),
   }
+}
+
+/// A merge volume's attachment by its role: a green's answered whole ([`crate::merge_service::attach_green`]); a work
+/// mounts like any volume (A-774), its slot made here so every bridge (FUSE, NFS, WinFsp) serves it, refused where this
+/// shard cannot read its green's base. None for a plain volume, or a work whose slot is made: attached as any volume.
+fn merge_role_form(
+  state: &mut ShardState,
+  (client_id, principal): (u32, &Principal),
+  record: &VolumeRecord,
+  intent: Intent,
+  form: &AttachRequest,
+) -> Option<ReplyBody> {
+  if matches!(record.policy.role, Role::Green { .. }) {
+    return Some(crate::merge_service::attach_green(
+      state, client_id, principal, record, intent, form,
+    ));
+  }
+  if matches!(record.policy.role, Role::Work { .. })
+    && !crate::mounted_work::ensure_slot(state, record.id)
+  {
+    return Some(refused(Refusal::Unsupported {
+      feature: "a mount of a work whose green's base this shard cannot read".to_owned(),
+    }));
+  }
+  None
 }
 
 /// The attach verb's answer when `form` is the Shards form (A-161), which its own module makes and serves, its end handed

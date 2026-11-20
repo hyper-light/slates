@@ -970,7 +970,7 @@ enum Progress {
   /// A step of the push taken, or one of its hooks run.
   Went,
   /// The push answered, or its drive stopped.
-  Done(Driven),
+  Done(Box<Driven>),
 }
 
 /// `request` pushed to `repository` by its owner as the HTTP edge pushes one
@@ -993,7 +993,7 @@ fn pushed_with_hooks(daemon: &crate::Daemon, repository: RepositoryId, request: 
   loop {
     match got.recv_timeout(bound) {
       Ok(Progress::Went) => went += 1,
-      Ok(Progress::Done(driven)) => return driven,
+      Ok(Progress::Done(driven)) => return *driven,
       Err(_) => {
         return Err(format!(
           "the push went no further within the test's bound after {went} steps"
@@ -1011,7 +1011,7 @@ async fn drive(
   sent: std::sync::mpsc::Sender<Progress>,
 ) {
   let driven = driven(repository, &request, &sent).await;
-  let _ = sent.send(Progress::Done(driven));
+  let _ = sent.send(Progress::Done(Box::new(driven)));
 }
 
 /// The push of [`pushed_with_hooks`], driven, `progress` told of each step and hook.

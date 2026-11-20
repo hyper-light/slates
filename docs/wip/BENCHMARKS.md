@@ -15556,6 +15556,63 @@ What it says:
 Owed: the full clone over the wire (changesets, manifests derived, files) and an import's RSS in the daemon, once
 the shape is built there. And N=3 an arm on a quiet machine.
 
+## Subversion's history held as changesets or as per-file deltas, counted: svn's arm of the changeset A/B (Ada's ruling of 2026-11-20 ~13:35; main's A/B order; UI goal 93; 2026-11-20)
+
+**What it is.** The same A/B as Mercurial's (the section above, w-hg's `changeset_ab`). Both arms hold exactly the
+deltas the svn records computed at import (S4 c2: each text an svndiff of version 2, LZ4 sections, against its node's
+skip-delta predecessor), so neither diffs at read time; they differ only in the unit. **A, per-file**: each path's texts
+together in revision order (FSFS's and a revlog's shape). **B, changesets**: one log in revision order, each revision's
+texts together. Beside the hg columns it times the import (the dump streamed in, every text deltified), counts the
+skip-delta chains (svn's checkpoint spacing: a read applies at most that many deltas) and reads RSS against the
+history's whole-text bytes (Ada's sizing rule).
+
+**Command.** `cargo build --release -p slates-svn --example changeset_ab` at b51f908f2 (with the example), then
+`/usr/bin/time -l changeset_ab ~/.cache/w-svn-gitgit/git-2000.dump <A|B> 2000`, interleaved A B A B A B, capped at
+600 s a run. Machine: Adas-MacBook-Pro-2.local (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1), 2026-11-20
+15:09 to 15:12 PST, shared with other agents' builds, load average 22.9 at the start, 50.0 at the end (not quiesced, so
+the tails are the machine's). Logs: `~/.cache/w-perf/svn-ab/{A,B}-{1,2,3}.log`.
+
+**The data.** w-svn's `git_to_svn_dump.py` dump of git/git's newest 2,000 first-parent commits under `trunk/` (the
+svn_scale dataset): 436.9 MiB of dump, 2,000 revisions, 5,228 paths, 15,725 distinct texts, **427.4 MiB as whole
+texts**, 33.2 MiB as the records' deltas (12.9 times less).
+
+**The import and memory**, the same for both arms (the arm is chosen after it):
+- Import wall: 3.2, 5.4, 27.3 s (A runs) and 2.6, 34.6, 18.0 s (B runs). Best **2.6 s**, 1.3 ms a revision; the tails
+  are the load.
+- RSS after the import: 129 to 149 MiB, **0.30 to 0.35 times the whole texts**.
+- Peak RSS (`/usr/bin/time -l`), including the example's copy of every delta and its compressed logs: A 256.8, 203.4,
+  230.8 MB; B 202.8, 190.9, 194.8 MB. That is **0.43 to 0.57 times the whole texts**, against hg import D's 65 times
+  (the section above).
+- Skip-delta chains: p50 2, p99 5, max 7 deltas a read. The records' bound is 65 (`MAX_CHAIN`, derived from a `u64`'s
+  halvings); ⌈log2 2,000⌉ + 1 = 12 is this history's ceiling.
+
+| Arm, form (64 KiB segments) | Held | Old read µs p50, runs 1-3 | p99, runs 1-3 | Segments a read p50 / p99 | Checkout file section, runs 1-3, decodes |
+|---|---|---|---|---|---|
+| A raw | 33.2 MiB | 7, 11, 13 | 190, 788, 1,524 | 1 / 3 | 0.00, 0.01, 0.00 s, 531 |
+| A LZ4 | 30.7 MiB | 23, 28, 30 | 243, 427, 4,505 | 1 / 3 | 0.01, 0.01, 0.09 s, 531 |
+| A zstd 1 | 26.1 MiB | 82, 99, 95 | 520, 7,075, 24,115 | 1 / 3 | 0.03, 0.05, 0.19 s, 531 |
+| A zstd 3 | 25.4 MiB | 89, 97, 105 | 518, 44,821, 9,887 | 1 / 3 | 0.04, 0.15, 0.35 s, 531 |
+| A zstd 9 | 24.5 MiB | 94, 104, 109 | 479, 16,939, 7,321 | 1 / 3 | 0.06, 0.35, 0.20 s, 531 |
+| B raw | 33.2 MiB | 10, 15, 15 | 204, 1,749, 394 | 2 / 6 | 0.01, 0.22, 0.02 s, 3,267 |
+| B LZ4 | 32.2 MiB | 30, 44, 42 | 252, 25,209, 1,665 | 2 / 6 | 0.03, 0.47, 0.12 s, 3,267 |
+| B zstd 1 | 27.3 MiB | 150, 194, 169 | 610, 81,734, 8,781 | 2 / 6 | 0.21, 3.27, 0.98 s, 3,267 |
+| B zstd 3 | 26.8 MiB | 153, 208, 179 | 684, 79,305, 11,456 | 2 / 6 | 0.24, 3.44, 0.61 s, 3,267 |
+| B zstd 9 | 25.9 MiB | 203, 262, 201 | 4,388, 82,102, 8,860 | 2 / 6 | 0.49, 3.58, 0.58 s, 3,267 |
+
+Every rebuilt text was checked against its BLAKE3 identity and length (2,000 samples a form a run).
+
+What it says:
+- **The bytes don't decide it.** Changesets cost 0 to 5 % over per-file at every form (raw 33.2 both, zstd 1 27.3
+  against 26.1 MiB). svn's deltas are already LZ4 inside, so segment compression gains less than for hg: LZ4 3 to 8 %,
+  zstd 1 18 to 21 %.
+- **Changeset order costs locality, as for hg, but less.** An old read decodes twice the segments (p50 2 against 1,
+  p99 6 against 3). A checkout's file section decodes 6.2 times the segments (3,267 against 531). hg's factor is 10,
+  since its chains are linear and svn's skip-delta chains are at most 7 deltas here. Under zstd 1, B's best old read
+  is 150 against 82 µs at p50, and its file section 0.21 against 0.03 s. Raw, the two read alike: best p50 10 against
+  7 µs, p99 204 against 190 µs.
+- **Memory meets the sizing rule.** Import and peak stay at or below half the history's text bytes.
+- Owed: stock FSFS's bytes for the same history (`svnadmin load`, about 0.15 s a revision), and N=3 on a quiet machine.
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built

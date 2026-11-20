@@ -284,11 +284,9 @@ mod tests {
     );
   }
 
-  /// A-773. Do: render the same log as JSON. Expect: `needs_you` holds exactly the collision and the waiting landing,
-  /// each typed by `kind`, and the green carries its head and all ten works with base, behind and mark.
-  #[test]
-  fn the_json_view_is_stable_and_names_the_same_two() {
-    let value = json(&ten_works());
+  /// The JSON view's `needs_you`: exactly the collision on `shared.txt`, nine versions behind, then landing 3 awaiting
+  /// its grant by manifest.
+  fn json_needs_the_two(value: &serde_json::Value) {
     let needs = value["needs_you"].as_array().unwrap();
     assert_eq!(needs.len(), 2);
     assert_eq!(needs[0]["kind"], "collided");
@@ -297,6 +295,14 @@ mod tests {
     assert_eq!(needs[1]["kind"], "awaiting_grant");
     assert_eq!(needs[1]["landing"], 3);
     assert_eq!(needs[1]["manifest"], "ab".repeat(32));
+  }
+
+  /// A-773. Do: render the same log as JSON. Expect: `needs_you` holds exactly the collision and the waiting landing,
+  /// each typed by `kind`, and the green carries its head and all ten works with base, behind and mark.
+  #[test]
+  fn the_json_view_is_stable_and_names_the_same_two() {
+    let value = json(&ten_works());
+    json_needs_the_two(&value);
     let green = &value["greens"][0];
     assert_eq!(green["head"], 10);
     let works = green["works"].as_array().unwrap();
