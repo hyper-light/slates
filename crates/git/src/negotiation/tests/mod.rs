@@ -2336,3 +2336,52 @@ fn a745_begin_reads_what_the_request_names_and_each_step_one_unit_of_ready_the_c
     assert_eq!(stepped, whole, "case {case}");
   }
 }
+
+/// A-745 (found by use: w-interop's stock-git matrix on git v2.0.0, row deepen, and w-bugs' own run of it on a release
+/// daemon: `git fetch --deepen 100` from a `--depth 1` clone exited 128, `the request needs more room than the server
+/// admits`; on git's history a depth of 100 reaches 24,885 of its 36,430 commits). Do: make git's shape, a main line of
+/// 4,000 commits, each after the first a merge of the line and a one-commit topic branched 150 commits back (so every
+/// two levels of the walk reach 150 commits further back), each commit with a tree of its own blob; then, as a shallow
+/// clone of the tip, ask `deepen 100` with `deepen-relative`, the tip had, within 32 KiB. Expect: the oracle's answer,
+/// its shallow-info and its pack: the deepening's walk keeps the commits it meets and keeps whole as runs or bits,
+/// where it had charged a depth entry and more a commit: 65,445 bytes before, 23,373 now (measured).
+#[test]
+fn a745_a_deepening_through_a_merge_heavy_history_is_negotiated_within_a_few_kilobytes() {
+  const MAINLINE: usize = 4_000;
+  const BACK: usize = 150;
+  // Shape: between what the answer needs now (23,373 bytes, measured: the walk's sets as bits across the history's
+  // 24,000 positions) and what it needed with an entry a commit met (65,445 bytes).
+  const ROOM: u64 = 32 * 1024;
+  let mut graph = TestGraph::default();
+  let mut made = 0u64;
+  let mut commit = |graph: &mut TestGraph, parents: &[u32]| {
+    made += 1;
+    let blob = graph.new_blob(made);
+    let tree = graph.new_tree(&[blob]);
+    graph.new_commit(parents, tree, made)
+  };
+  let mut main = vec![commit(&mut graph, &[])];
+  for at in 1..MAINLINE {
+    let topic = commit(&mut graph, &[main[at.saturating_sub(BACK)]]);
+    let merge = commit(&mut graph, &[main[at - 1], topic]);
+    main.push(merge);
+  }
+  let tip_node = *main.last().unwrap();
+  graph.tips.push(tip_node);
+  let tip = graph.id(tip_node);
+  let asks = Asks {
+    wants: vec![tip],
+    haves: vec![tip],
+    shallow: vec![tip],
+    deepen: Some(OwnedDeepen::Depth(100, true)),
+    done: true,
+    ..Asks::default()
+  };
+  let expected = oracle(&graph, &asks).unwrap();
+  let outcome = negotiate(&graph, &asks.request(), &mut Admission::new(ROOM)).unwrap();
+  assert!(outcome.answer == expected.answer, "the oracle's answer");
+  let Answer::Pack(pack) = outcome.answer else {
+    panic!("not a pack")
+  };
+  assert!(pack.objects.len() > 6_000, "{} objects", pack.objects.len());
+}

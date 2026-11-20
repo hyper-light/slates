@@ -66,6 +66,7 @@ pub struct Rates {
 }
 
 /// [`LEVELS`] as an array length.
+/// Format: zlib's compression levels, 0 through 9 [B: zlib.h, `Z_BEST_COMPRESSION`].
 const LEVELS_USIZE: usize = 10;
 
 /// Format: the bytes in a KiB, the rates' unit of input.
@@ -144,11 +145,13 @@ fn corpus(len: usize) -> Vec<u8> {
   let mut out = Vec::with_capacity(len);
   while out.len() < len {
     let word = next();
+    // Shape: a word of one to eight letters, each letter five bits of the draw past its low byte, one of 26.
     let letters = (word % 8).saturating_add(1);
     for at in 0..letters {
       let letter = u8::try_from((word >> at.saturating_mul(5).saturating_add(8)) % 26).unwrap_or(0);
       out.push(b'a'.saturating_add(letter));
     }
+    // Shape: a line break after about one word in 11, as text's lines run.
     out.push(if word % 11 == 0 { b'\n' } else { b' ' });
   }
   out.truncate(len);

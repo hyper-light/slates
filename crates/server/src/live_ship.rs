@@ -6010,6 +6010,16 @@ fn held_entry_in(live: &mut LiveState, owner: HostId, object: ObjectId) -> &mut 
 /// control shard's single 557 ms poll beside it. Run on its own task of the serve loop, so the turns hold no other
 /// request of the peer.
 pub(crate) async fn serve_fetch(local: HostId, peer: HostId, request: Vec<u8>) -> Vec<u8> {
+  let silenced = state::with_state(|s| {
+    let silenced = s.injected_live_silence.contains(&peer);
+    if silenced {
+      s.count(LIVE_SILENCED_BY_FAULT, 1);
+    }
+    silenced
+  });
+  if silenced == Some(true) {
+    return Vec::new();
+  }
   let begun = state::with_state(|s| begin_fetch_answer(s, local, peer, &request));
   let mut answer = match begun {
     Some(Ok(answer)) => answer,
@@ -6224,6 +6234,9 @@ const LIVE_OWN_FENCE_UNPUBLISHED: &str = "fleet.live.own_fence_unpublished";
 /// Counter: phase-one reports this candidate answered (A-240).
 /// Format: a counter name in the daemon's status report.
 const LIVE_REPORTED: &str = "fleet.live.reported";
+/// Counter: a live phase-one report or log fetch a test left unanswered (`Daemon::inject_live_silence`); zero in
+/// production.
+const LIVE_SILENCED_BY_FAULT: &str = "fleet.live.silenced_by_fault";
 
 /// This candidate's copy of `object` with its fence raised to a takeover's `epoch` (phase one): the copy it holds, or
 /// an empty one made now for `successor`. An empty report counts toward phase one's `f + 1` (a durable entry is held by
@@ -6259,6 +6272,10 @@ pub(crate) fn serve_state(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  if state.injected_live_silence.contains(&peer) {
+    state.count(LIVE_SILENCED_BY_FAULT, 1);
+    return Vec::new();
+  }
   if slates_db::live::is_report(request) {
     serve_report(state, local, peer, request)
   } else {
@@ -7574,7 +7591,10 @@ pub(crate) fn taken_over(state: &mut ShardState) {
 /// the publication after them the turn ran past the watchdog's spin window, which ended the successor's process
 /// (`live_chaos`'s nemesis, seeds 17036665960917068132 and 2120743995065985386). Each payload is the unit: opened under
 /// the keys the rebuild began with, decoded, applied to the image a whole record began (a delta before any whole one is
-/// refused), and its content runs kept, a later run at the same place over an earlier one.
+/// refused), and its content runs kept, a later run at the same place over an earlier one. A payload is applied in steps
+/// (A-771): each sealed piece opened, then its record, then each run laid over, the slice's clock read between them, so a
+/// whole entry, which carries the volume's every byte, is not one step: one of 3 MiB held a debug successor's turn
+/// 193 ms (w-forming's probe, `taskpolicy -b`).
 pub(crate) struct Rebuilding {
   /// The lineage key and namer the payloads are opened under, when the log is sealed.
   keys: Option<(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
@@ -7588,16 +7608,63 @@ pub(crate) struct Rebuilding {
   volume_local: u64,
   /// The daemon's base page, the archive header's.
   page: usize,
+  /// The payload being applied, part-way: its next step is the rebuild's next.
+  applying: Option<Applying>,
+  /// Once every payload is applied: the image's content spans being hashed for its archive, a page a step.
+  laying: Option<Laying>,
+  /// Each content span hashed, by inode, offset and length: its identity, and its bytes until the archive takes them.
+  hashed: BTreeMap<(u64, u64, u64), ([u8; 32], Option<Vec<u8>>)>,
+}
+
+/// A rebuilt image's content spans being hashed for its archive (A-771), in the image's order: the spans its chunked
+/// files' extents and open extents name, as [`node_of`] lays them out; the next one; and the bytes of the one being
+/// hashed, its hasher and how many it was fed. Hashed whole in the turn that laid the archive out, 1.5 to 1.75 MB of runs
+/// held a debug successor's turn 93 to 99 ms (w-forming's probe, `taskpolicy -b`).
+struct Laying {
+  spans: Vec<(u64, u64, u64)>,
+  next: usize,
+  current: Option<(Vec<u8>, blake3::Hasher, usize)>,
+}
+
+impl Laying {
+  /// The content spans of `image`, in its order.
+  fn of(image: &slates_vfs::recover::VolumeImage) -> Laying {
+    let mut spans = Vec::new();
+    for inode in &image.inodes {
+      let BodyImage::Chunked { extents, open } = &inode.body else {
+        continue;
+      };
+      spans.extend(
+        extents
+          .iter()
+          .filter(|extent| matches!(extent.source, ExtentSourceImage::Chunk { .. }))
+          .map(|extent| (inode.no, extent.offset, extent.len))
+          .chain(open.iter().map(|open| (inode.no, open.offset, open.len))),
+      );
+    }
+    Laying {
+      spans,
+      next: 0,
+      current: None,
+    }
+  }
+}
+
+/// A payload part-way applied to a rebuild ([`Rebuilding::advance`], A-771).
+enum Applying {
+  /// Its sealed body's pieces being opened, a page of bytes a step (`slates_cluster::sealed::RawOpening`): those not
+  /// begun, the one being opened, and the bytes opened so far, joined.
+  Opening {
+    pieces: std::vec::IntoIter<SealedPiece>,
+    opening: Option<Box<slates_cluster::sealed::RawOpening>>,
+    body: Vec<u8>,
+  },
+  /// Its record applied: its runs being laid over the rebuild's, those left.
+  Overlaying { runs: std::vec::IntoIter<LiveRun> },
 }
 
 /// The lineage key a takeover fetched for a live volume (its id and wrapped bytes), with the head's naming.
 type AdoptedKey = (Option<([u8; 16], Vec<u8>)>, Option<crate::head::HeadNaming>);
-
-/// A rebuild's image so far and the runs it keeps beside it.
-type RebuildState<'a> = (
-  &'a mut Option<slates_vfs::recover::VolumeImage>,
-  &'a mut BTreeMap<(u64, u64), Vec<u8>>,
-);
 
 impl Rebuilding {
   /// Begins the rebuild of the live log `payloads` of volume `id`, owned by `owner`: the lineage key adopted when the
@@ -7640,31 +7707,132 @@ impl Rebuilding {
       runs: BTreeMap::new(),
       volume_local: ObjectId(id.bytes).local(),
       page: state.config.page,
+      applying: None,
+      laying: None,
+      hashed: BTreeMap::new(),
     })
   }
 
-  /// Applies the next payloads, one at least, until `spent` says the turn's share is spent; `Ok(true)` once every
-  /// payload is applied. Refused as the whole rebuild is: [`REFUSED_OPEN`], [`REFUSED_RECORD`], [`REFUSED_APPLY`],
+  /// Applies the payloads' next steps, one at least, until `spent` says the turn's share is spent: a payload begun (its
+  /// sealed body's pieces taken, or a clear body's record applied), a sealed piece opened, its record applied once every
+  /// piece is, or one of its runs laid over the rebuild's. `Ok(true)` once every payload is applied. Refused as the whole
+  /// rebuild is: [`REFUSED_FETCHED`], [`REFUSED_OPEN`], [`REFUSED_RECORD`], [`REFUSED_APPLY`],
   /// [`REFUSED_NOT_WHOLE_FIRST`].
   pub(crate) fn advance(&mut self, mut spent: impl FnMut() -> bool) -> Result<bool, &'static str> {
     loop {
-      let Some(payload) = self.payloads.next_payload() else {
-        return Ok(true);
-      };
-      // Its framing broken in transit, not the log's bytes: fetched again ([`REFUSED_FETCHED`]).
-      let payload = payload.map_err(|_| REFUSED_FETCHED)?;
-      apply_payload(
-        self.keys.as_ref(),
-        (&mut self.image, &mut self.runs),
-        payload,
-      )?;
-      if self.payloads.is_spent() {
+      if let Some(applying) = self.applying.take() {
+        self.applying = self.step(applying)?;
+      } else if let Some(payload) = self.payloads.next_payload() {
+        // Its framing broken in transit, not the log's bytes: fetched again ([`REFUSED_FETCHED`]).
+        let payload = payload.map_err(|_| REFUSED_FETCHED)?;
+        self.applying = Some(match begin_applying(self.keys.is_some(), payload)? {
+          Begun::Sealed(applying) => applying,
+          Begun::Clear(publication) => self.apply_publication(publication)?,
+        });
+      } else if self.lay_step()? {
         return Ok(true);
       }
       if spent() {
         return Ok(false);
       }
     }
+  }
+
+  /// One step of hashing the rebuilt image's content for its archive ([`Laying`]): a span's bytes gathered from the
+  /// runs, or a page of them hashed. Whether every span is hashed (at once with no image: [`Rebuilding::archive`] refuses
+  /// that). Refused [`REFUSED_LAYOUT`] when a span's bytes are not all in the runs.
+  fn lay_step(&mut self) -> Result<bool, &'static str> {
+    let Some(image) = self.image.as_ref() else {
+      return Ok(true);
+    };
+    let laying = self.laying.get_or_insert_with(|| Laying::of(image));
+    if let Some((bytes, hasher, fed)) = laying.current.as_mut() {
+      let end = fed.saturating_add(open_step_bytes()).min(bytes.len());
+      hasher.update(bytes.get(*fed..end).ok_or(REFUSED_LAYOUT)?);
+      *fed = end;
+      if *fed >= bytes.len() {
+        let key = *laying.spans.get(laying.next).ok_or(REFUSED_LAYOUT)?;
+        let (bytes, hasher, _) = laying.current.take().ok_or(REFUSED_LAYOUT)?;
+        self
+          .hashed
+          .insert(key, (*hasher.finalize().as_bytes(), Some(bytes)));
+        laying.next = laying.next.saturating_add(1);
+      }
+      return Ok(false);
+    }
+    let Some(&(inode, offset, len)) = laying.spans.get(laying.next) else {
+      return Ok(true);
+    };
+    if self.hashed.contains_key(&(inode, offset, len)) {
+      laying.next = laying.next.saturating_add(1);
+      return Ok(false);
+    }
+    let bytes = run_bytes(&self.runs, inode, offset, len).ok_or(REFUSED_LAYOUT)?;
+    laying.current = Some((bytes, blake3::Hasher::new(), 0));
+    Ok(false)
+  }
+
+  /// One step of the payload being applied; what is left of it, `None` once it is applied.
+  fn step(&mut self, applying: Applying) -> Result<Option<Applying>, &'static str> {
+    match applying {
+      Applying::Opening {
+        mut pieces,
+        opening,
+        mut body,
+      } => {
+        let (lineage, namer) = self.keys.as_ref().ok_or(REFUSED_OPEN)?;
+        let opening = match opening {
+          Some(mut current) => {
+            // A sealed body is a raw chunk of the publication's bytes a piece (`seal_body`), so each opened chunk's
+            // payload is the next of them.
+            match current
+              .advance(namer, open_step_bytes())
+              .map_err(|_| REFUSED_OPEN)?
+            {
+              Some(opened) => {
+                body.extend_from_slice(&opened.payload);
+                None
+              }
+              None => Some(current),
+            }
+          }
+          None => {
+            let Some(piece) = pieces.next() else {
+              let publication =
+                <LivePublication as Wire>::decode(&mut &body[..]).map_err(|_| REFUSED_OPEN)?;
+              return self.apply_publication(publication).map(Some);
+            };
+            let chunk = slates_cluster::sealed::SealedChunk {
+              name: piece.name.as_slice().try_into().map_err(|_| REFUSED_OPEN)?,
+              bytes: piece.bytes,
+            };
+            let begun =
+              slates_cluster::sealed::RawOpening::new(lineage, chunk).map_err(|_| REFUSED_OPEN)?;
+            Some(Box::new(begun))
+          }
+        };
+        Ok(Some(Applying::Opening {
+          pieces,
+          opening,
+          body,
+        }))
+      }
+      Applying::Overlaying { mut runs } => {
+        let Some(run) = runs.next() else {
+          return Ok(None);
+        };
+        overlay_run(&mut self.runs, run.inode, run.offset, run.bytes);
+        Ok(Some(Applying::Overlaying { runs }))
+      }
+    }
+  }
+
+  /// Applies a payload's record to the rebuild's image ([`apply_record`]); its runs are left to lay over.
+  fn apply_publication(&mut self, publication: LivePublication) -> Result<Applying, &'static str> {
+    apply_record(&mut self.image, &mut self.runs, &publication.record)?;
+    Ok(Applying::Overlaying {
+      runs: publication.runs.into_iter(),
+    })
   }
 
   /// The payloads applied so far.
@@ -7674,24 +7842,61 @@ impl Rebuilding {
 
   /// The rebuilt volume laid out as the archive `materialize_taken_over` restores; refused
   /// [`REFUSED_NOT_WHOLE_FIRST`] when no whole record began the log.
-  pub(crate) fn archive(self) -> Result<slates_archive::Archive, &'static str> {
+  pub(crate) fn archive(mut self) -> Result<slates_archive::Archive, &'static str> {
     let image = self.image.ok_or(REFUSED_NOT_WHOLE_FIRST)?;
-    archive_of(&image, &self.runs, self.volume_local, self.page)
+    archive_of(
+      &image,
+      (&self.runs, &mut self.hashed),
+      self.volume_local,
+      self.page,
+    )
   }
 }
 
-/// One payload of a live log opened under `keys`, decoded and applied to the rebuild's image, its runs kept: a whole
-/// record begins the image again, a delta applies to it, and a delta before any whole one is refused. A clone's full
-/// record, which names what the clone shares with its origin by number, keeps those inodes from the image before it
-/// ([`keep_shared`], A-577).
-fn apply_payload(
-  keys: Option<&(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
-  (image, runs): RebuildState<'_>,
-  payload: &[u8],
+/// The bytes a rebuild's step opens or hashes of a sealed piece (A-771): an archive page, the floor a whole build's
+/// pieces are sealed in (`piece_bytes`), so a step costs about what a sealing build's smallest turn does; a 1 MiB piece
+/// opened whole held a debug successor's turn about 13 ms, nearly all of it its identity's BLAKE3.
+fn open_step_bytes() -> usize {
+  usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES).unwrap_or(usize::MAX)
+}
+
+/// How a payload begins to be applied ([`begin_applying`]).
+enum Begun {
+  /// Its sealed body's pieces, to open a step each.
+  Sealed(Applying),
+  /// Its publication, in the clear.
+  Clear(LivePublication),
+}
+
+/// A payload's first step: its sealed body's pieces taken to open (refused [`REFUSED_OPEN`] with no keys to open them
+/// under, or none to open), or its clear body decoded.
+fn begin_applying(keyed: bool, payload: &[u8]) -> Result<Begun, &'static str> {
+  let (header, body) = payload.split_at_checked(2).ok_or(REFUSED_OPEN)?;
+  if header.get(1) == Some(&BODY_SEALED) {
+    let sealed = <SealedBody as Wire>::decode(&mut &body[..]).map_err(|_| REFUSED_OPEN)?;
+    if !keyed || sealed.pieces.is_empty() {
+      return Err(REFUSED_OPEN);
+    }
+    return Ok(Begun::Sealed(Applying::Opening {
+      pieces: sealed.pieces.into_iter(),
+      opening: None,
+      body: Vec::new(),
+    }));
+  }
+  <LivePublication as Wire>::decode(&mut &body[..])
+    .map(Begun::Clear)
+    .map_err(|_| REFUSED_OPEN)
+}
+
+/// A payload's record applied to a rebuild's image: a whole record begins the image again, a delta applies to it, and a
+/// delta before any whole one is refused. A clone's full record, which names what the clone shares with its origin by
+/// number, keeps those inodes from the image before it ([`keep_shared`], A-577). The payload's runs follow it.
+fn apply_record(
+  image: &mut Option<slates_vfs::recover::VolumeImage>,
+  runs: &mut BTreeMap<(u64, u64), Vec<u8>>,
+  record: &[u8],
 ) -> Result<(), &'static str> {
-  let publication = open_payload(keys, payload).ok_or(REFUSED_OPEN)?;
-  let record =
-    <VolumeRecord as Wire>::decode(&mut &publication.record[..]).map_err(|_| REFUSED_RECORD)?;
+  let record = <VolumeRecord as Wire>::decode(&mut &record[..]).map_err(|_| REFUSED_RECORD)?;
   match record {
     VolumeRecord::Full { image: mut whole } => {
       if whole.origin_shared.is_empty() {
@@ -7706,9 +7911,6 @@ fn apply_payload(
       let image = image.as_mut().ok_or(REFUSED_NOT_WHOLE_FIRST)?;
       slates_vfs::recover::VolumeImage::apply(image, &delta).map_err(|_| REFUSED_APPLY)?;
     }
-  }
-  for run in publication.runs {
-    overlay_run(runs, run.inode, run.offset, run.bytes);
   }
   Ok(())
 }
@@ -7771,7 +7973,8 @@ fn seal_body(
 }
 
 /// A body [`seal_body`] sealed, opened piece by piece and joined: the publication's bytes. `None` when any piece will
-/// not open, or there are none.
+/// not open, or there are none. The rebuild opens them a step each ([`Rebuilding::advance`]).
+#[cfg(test)]
 fn open_body(
   lineage: &hyper_seal::keys::WrappingKey,
   namer: &hyper_seal::name::Namer,
@@ -7795,24 +7998,6 @@ fn open_body(
   Some(body)
 }
 
-/// One payload's body, opened under the volume's lineage key when sealed.
-fn open_payload(
-  keys: Option<&(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
-  payload: &[u8],
-) -> Option<LivePublication> {
-  let (header, body) = payload.split_at_checked(2)?;
-  let bytes = if header.get(1) == Some(&BODY_SEALED) {
-    let sealed = <SealedBody as Wire>::decode(&mut &body[..]).ok()?;
-    let (lineage, namer) = keys?;
-    open_body(lineage, namer, sealed.pieces)?
-  } else {
-    body.to_vec()
-  };
-  // A sealed body was sealed from a raw chunk of the publication's bytes (`payload`), so the opened chunk's payload is
-  // those bytes.
-  <LivePublication as Wire>::decode(&mut &bytes[..]).ok()
-}
-
 /// A volume image and the content its extents name, laid out as an archive (the export's layout,
 /// `slates_vfs::export`): each directory's entries under it, each file's extents over chunks of their bytes, a
 /// symlink as a file of its target; holes stay holes. `volume_id` is the archive's header field: the volume's
@@ -7820,7 +8005,7 @@ fn open_payload(
 /// daemon's (`DaemonConfig::page`, measured once at boot).
 fn archive_of(
   image: &slates_vfs::recover::VolumeImage,
-  runs: &BTreeMap<(u64, u64), Vec<u8>>,
+  content: Content<'_>,
   volume_id: u64,
   base_page: usize,
 ) -> Result<slates_archive::Archive, &'static str> {
@@ -7830,7 +8015,8 @@ fn archive_of(
   let root = inodes.get(&image.root_no).ok_or(REFUSED_LAYOUT)?;
   let root_meta = meta_of(root);
   let mut visiting = Vec::new();
-  let manifest = node_of(root, &inodes, runs, &mut chunks, &mut visiting)?;
+  let mut content = content;
+  let manifest = node_of(root, &inodes, &mut content, &mut chunks, &mut visiting)?;
   let chunk_max = chunks
     .iter()
     .map(|chunk: &slates_archive::Chunk| u32::try_from(chunk.raw_len).unwrap_or(u32::MAX))
@@ -7856,7 +8042,7 @@ fn archive_of(
 fn node_of(
   inode: &InodeImage,
   inodes: &BTreeMap<u64, &InodeImage>,
-  runs: &BTreeMap<(u64, u64), Vec<u8>>,
+  content: &mut Content<'_>,
   chunks: &mut Vec<slates_archive::Chunk>,
   visiting: &mut Vec<u64>,
 ) -> Result<slates_archive::Node, &'static str> {
@@ -7874,7 +8060,7 @@ fn node_of(
         children.push(slates_archive::Entry {
           name: entry.name.clone(),
           meta: meta_of(child),
-          node: node_of(child, inodes, runs, chunks, visiting)?,
+          node: node_of(child, inodes, content, chunks, visiting)?,
         });
       }
       visiting.pop();
@@ -7895,8 +8081,7 @@ fn node_of(
         .map(|extent| (extent.offset, extent.len))
         .chain(open.iter().map(|open| (open.offset, open.len)));
       for (offset, len) in spans {
-        let bytes = run_bytes(runs, inode.no, offset, len).ok_or(REFUSED_LAYOUT)?;
-        let chunk = slates_archive::Archive::raw_chunk(bytes);
+        let chunk = hashed_chunk(content, (inode.no, offset, len))?;
         laid.push(slates_archive::Extent {
           offset,
           len,
@@ -7909,6 +8094,37 @@ fn node_of(
     }
     _ => Ok(slates_archive::Node::File(Vec::new())),
   }
+}
+
+/// A rebuild's content for its archive: its runs, and its spans hashed in its steps ([`Laying`]).
+type Content<'a> = (
+  &'a BTreeMap<(u64, u64), Vec<u8>>,
+  &'a mut BTreeMap<(u64, u64, u64), ([u8; 32], Option<Vec<u8>>)>,
+);
+
+/// The raw chunk of span `key` (inode, offset, length) under the identity its rebuild hashed ([`Laying`]): its bytes
+/// taken as hashed, or gathered from the runs again for a file laid out twice (a hard link). Refused [`REFUSED_LAYOUT`]
+/// for a span not hashed or not all in the runs.
+fn hashed_chunk(
+  (runs, hashed): &mut Content<'_>,
+  key: (u64, u64, u64),
+) -> Result<slates_archive::Chunk, &'static str> {
+  let (identity, bytes) = hashed.get_mut(&key).ok_or(REFUSED_LAYOUT)?;
+  let (inode, offset, len) = key;
+  let bytes = match bytes.take() {
+    Some(bytes) => bytes,
+    None => run_bytes(runs, inode, offset, len).ok_or(REFUSED_LAYOUT)?,
+  };
+  let raw_len = u64::try_from(bytes.len()).map_err(|_| REFUSED_LAYOUT)?;
+  Ok(slates_archive::Chunk {
+    identity: *identity,
+    raw_len,
+    stored_len: raw_len,
+    encoding: slates_archive::format::Encoding::Raw,
+    level: 0,
+    dictionary: [0u8; 32],
+    payload: bytes,
+  })
 }
 
 /// A file of `bytes` from offset zero, one chunk (none when empty).
@@ -9013,6 +9229,105 @@ mod tests {
         open_body(&lineage, &namer, pieces).as_ref(),
         Some(&body),
         "a body of {len} bytes opens as it was sealed"
+      );
+    }
+  }
+
+  /// A-771: a rebuild applies a large payload and hashes its archive's content in steps, and lays out the same volume. Do:
+  /// take a live volume's whole body (two 512 KiB files), make it a payload in the clear and one sealed in 16 KiB-segment
+  /// pieces, and rebuild each from a fetched log twice: with the slice never spent, and spent after every step. Expect:
+  /// the first in one call; the second in a call a step, more than one for each run and at least one a page of the body,
+  /// since a step opens or hashes a page at most; the same archive from both, every chunk of it the one its identity
+  /// names. Before, a payload was one step (a 1.39 MB whole entry's open 59 ms of a debug turn) and the archive's content
+  /// was hashed in the turn that laid it out (93 to 99 ms).
+  #[test]
+  fn a_rebuilds_large_payload_is_applied_in_steps_and_lays_out_the_same_volume() {
+    let _ = hyper_seal::lock_keys(KEYS);
+    let tenant = hyper_seal::keys::WrappingKey::generate(GENERATION).unwrap();
+    let (naming, _) = tenant.make_child().unwrap();
+    let body = crate::daemon::audit_on_shard(|state| {
+      let id = live_volume_here(state, "rebuilt-in-steps")?;
+      write_captured(state, id, "first", b"A-771: the first file")?;
+      write_captured(state, id, "second", b"A-771: the second file")?;
+      let record = whole_record(state, id)?;
+      plain_body(state, id, record)
+    })
+    .expect("the body was made");
+    let runs = <LivePublication as Wire>::decode(&mut &body[..])
+      .unwrap()
+      .runs
+      .len();
+    let lineage = hyper_seal::keys::WrappingKey::generate(GENERATION).unwrap();
+    let namer = hyper_seal::name::Namer::new(&naming).unwrap();
+    let pieces = seal_body(&lineage, &namer, body.clone(), 16_384).unwrap();
+    let mut sealed = vec![KIND_WHOLE, BODY_SEALED];
+    sealed.extend_from_slice(
+      &SealedBody {
+        sealing: None,
+        pieces,
+      }
+      .to_bytes(),
+    );
+    let mut clear = vec![KIND_WHOLE, BODY_CLEAR];
+    clear.extend_from_slice(&body);
+    let head = Head {
+      epoch: HostEpoch(1),
+      position: 0,
+      identity: [7; 32],
+    };
+    let mut keys = Some((lineage, namer));
+    for (what, payload, keyed) in [("clear", clear, false), ("sealed", sealed, true)] {
+      let mut rebuilt = |always_spent: bool| {
+        let mut answer = slates_db::live::fetched_reply(&Ok(Some(head)), payload.len());
+        slates_db::live::push_fetched(&mut answer, &payload);
+        let (_, log) = slates_db::live::FetchedLog::decode(answer, 1 << 24).unwrap();
+        let mut rebuilding = Rebuilding {
+          keys: if keyed { keys.take() } else { None },
+          payloads: log,
+          image: None,
+          runs: BTreeMap::new(),
+          volume_local: 1,
+          page: 4096,
+          applying: None,
+          laying: None,
+          hashed: BTreeMap::new(),
+        };
+        let mut calls = 0u64;
+        loop {
+          calls += 1;
+          if rebuilding.advance(|| always_spent).unwrap() {
+            break;
+          }
+        }
+        if keyed {
+          keys = rebuilding.keys.take();
+        }
+        (rebuilding.archive().unwrap(), calls)
+      };
+      let (at_once, one) = rebuilt(false);
+      let (stepped, steps) = rebuilt(true);
+      println!(
+        "a {what} payload of {} bytes, {runs} runs: {one} call at once, {steps} a step",
+        payload.len()
+      );
+      assert_eq!(one, 1, "{what}: applied at once in one call");
+      assert!(
+        steps > u64::try_from(runs).unwrap(),
+        "{what}: a call a step, one at least a run: {steps} for {runs} runs"
+      );
+      let pages = u64::try_from(body.len() / open_step_bytes()).unwrap();
+      assert!(
+        steps >= pages,
+        "{what}: a step opens or hashes a page at most: {steps} for {pages} pages"
+      );
+      assert!(at_once == stepped, "{what}: the same volume laid out");
+      assert!(
+        !stepped.chunks.is_empty()
+          && stepped
+            .chunks
+            .iter()
+            .all(|chunk| slates_archive::Archive::content(chunk).is_ok()),
+        "{what}: every chunk laid out is the one its identity names"
       );
     }
   }

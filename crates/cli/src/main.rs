@@ -31,6 +31,7 @@ use std::process::ExitCode;
 mod apparmor;
 mod args;
 mod format;
+mod log_view;
 // The handshake is the library's (`slates_api::container_engine`, A-520), which asks an engine only on Unix, where
 // its poll loop runs; this module prints its answer there, and Windows keeps its refusal (`run_oci_runtime`).
 #[cfg(unix)]

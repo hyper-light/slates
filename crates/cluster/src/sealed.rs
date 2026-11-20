@@ -108,6 +108,120 @@ pub fn seal_chunk(
   })
 }
 
+/// A sealed raw chunk opened in steps (A-771): its segments opened, then its content hashed against its identity, a budget
+/// of bytes a call ([`RawOpening::advance`]), so an opener on a shard's turn reads its clock between them. What it accepts
+/// and refuses is [`open_chunk`]'s for a raw chunk, which is the form a live publication's body is sealed in
+/// (`Archive::raw_chunk`); another encoding is refused [`SealedError::Malformed`]. Opened whole in one call, a 1 MiB piece
+/// held a debug successor's turn about 13 ms, nearly all of it the identity's BLAKE3 (w-forming, 2026-11-20).
+pub struct RawOpening {
+  /// The sealed chunk's keyed name.
+  name: [u8; NAME],
+  /// The sealed bytes.
+  bytes: Vec<u8>,
+  /// The opener its header's data key made.
+  opener: FileOpener,
+  /// A stored segment's bytes: the segment and its tag.
+  stored: usize,
+  /// Where the next segment begins in `bytes`.
+  at: usize,
+  /// The next segment's index.
+  index: u64,
+  /// The record opened so far.
+  record: Vec<u8>,
+  /// Once every segment is open: the chunk, its content's hasher, and how many of its bytes it was fed.
+  hashing: Option<(Chunk, blake3::Hasher, usize)>,
+}
+
+impl RawOpening {
+  /// Begins opening `sealed` under `lineage`: its header read and its data key unwrapped and checked against its
+  /// commitment, before any segment opens.
+  pub fn new(lineage: &WrappingKey, sealed: SealedChunk) -> Result<RawOpening, SealedError> {
+    let head = sealed.bytes.get(..HEADER).ok_or(SealedError::Truncated)?;
+    let header = Header::decode(head)?;
+    let opener = FileOpener::new(lineage, &header)?;
+    let size = usize::try_from(header.segment).map_err(|_| SealedError::Seal(SealError::Size))?;
+    Ok(RawOpening {
+      name: sealed.name,
+      record: Vec::with_capacity(sealed.bytes.len()),
+      bytes: sealed.bytes,
+      opener,
+      stored: size.saturating_add(TAG),
+      at: HEADER,
+      index: 0,
+      hashing: None,
+    })
+  }
+
+  /// Opens segments, then hashes the content, until `budget` bytes are done in this call (a segment or a slice at
+  /// least); the chunk once its content hashes to its identity and its name is that identity's under `namer`, `None`
+  /// while bytes are left. Refused as [`open_chunk`] refuses.
+  pub fn advance(&mut self, namer: &Namer, budget: usize) -> Result<Option<Chunk>, SealedError> {
+    let mut done = 0usize;
+    loop {
+      if let Some((chunk, hasher, fed)) = self.hashing.as_mut() {
+        let end = fed
+          .saturating_add(budget.saturating_sub(done).max(1))
+          .min(chunk.payload.len());
+        hasher.update(chunk.payload.get(*fed..end).ok_or(SealedError::Malformed)?);
+        done = done.saturating_add(end.saturating_sub(*fed));
+        *fed = end;
+        if *fed >= chunk.payload.len() {
+          let (chunk, hasher, _) = self.hashing.take().ok_or(SealedError::Malformed)?;
+          if *hasher.finalize().as_bytes() != chunk.identity {
+            return Err(SealedError::Identity);
+          }
+          if namer.name(&chunk.identity)? != self.name {
+            return Err(SealedError::Name);
+          }
+          return Ok(Some(chunk));
+        }
+      } else {
+        done = done.saturating_add(self.open_segment()?);
+      }
+      if done >= budget {
+        return Ok(None);
+      }
+    }
+  }
+
+  /// Opens the next segment into the record, its bytes; the last one leaves the chunk to hash, refused
+  /// [`SealedError::Malformed`] unless it is one whole raw chunk record in canonical form within the format's cap.
+  fn open_segment(&mut self) -> Result<usize, SealedError> {
+    let body = self.bytes.get(self.at..).ok_or(SealedError::Truncated)?;
+    let last = body.len() <= self.stored;
+    let piece = body
+      .get(..body.len().min(self.stored))
+      .ok_or(SealedError::Truncated)?;
+    let (ciphertext, tag) = piece
+      .split_at_checked(piece.len().checked_sub(TAG).ok_or(SealedError::Truncated)?)
+      .ok_or(SealedError::Truncated)?;
+    let tag: &[u8; TAG] = tag.try_into().map_err(|_| SealedError::Truncated)?;
+    let start = self.record.len();
+    self.record.extend_from_slice(ciphertext);
+    let opened = self.record.get_mut(start..).ok_or(SealedError::Truncated)?;
+    self.opener.open(self.index, last, opened, tag)?;
+    let opened_bytes = ciphertext.len();
+    self.at = self.at.saturating_add(piece.len());
+    self.index = self
+      .index
+      .checked_add(1)
+      .ok_or(SealedError::Seal(SealError::Size))?;
+    if last {
+      let chunk = chunk_from_record(&self.record).map_err(|_| SealedError::Malformed)?;
+      self.record = Vec::new();
+      let raw = chunk.encoding == slates_archive::format::Encoding::Raw
+        && chunk.raw_len > 0
+        && chunk.raw_len <= slates_archive::format::MAX_CHUNK_BYTES
+        && u64::try_from(chunk.payload.len()).is_ok_and(|len| len == chunk.raw_len);
+      if !raw {
+        return Err(SealedError::Malformed);
+      }
+      self.hashing = Some((chunk, blake3::Hasher::new(), 0));
+    }
+    Ok(opened_bytes)
+  }
+}
+
 /// Opens `sealed` under `lineage`: the chunk, verified against its identity and its keyed name under `namer`.
 pub fn open_chunk(
   lineage: &WrappingKey,

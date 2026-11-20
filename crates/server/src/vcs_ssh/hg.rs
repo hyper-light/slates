@@ -208,7 +208,13 @@ impl<S: HgStores> Command for HgCommand<S> {
         })
         .ok_or_else(unheld)?
     } else {
-      let mut admission = Admission::new(*room);
+      // A request's answer is admitted the room a fetch's turn is (A-745 rule 2), as over HTTP: a `lookup` reads each
+      // head's manifest for its `.hgtags`, past the edge's room in hg's own history. The input stays bounded by the
+      // channel's window.
+      let answer_room = stores
+        .fetch_turn(*repository)
+        .map_or(*room, |(turn_room, _)| turn_room);
+      let mut admission = Admission::new(answer_room);
       let progress = stores
         .lend(*repository, &mut admission, |store, left| {
           stdio.step(store, left.left())

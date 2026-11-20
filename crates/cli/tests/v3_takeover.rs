@@ -349,7 +349,7 @@ fn stock_git() -> Option<String> {
 
 /// Runs stock git with `args` in `dir`, a bearer `token` on every request: its exit code and both outputs.
 fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
-  let output = Command::new("git")
+  let mut output = Command::new("git")
     .args([
       "-c",
       &format!("http.extraHeader=Authorization: Bearer {token}"),
@@ -372,8 +372,20 @@ fn git(dir: &str, token: &str, args: &[&str]) -> (i32, String, String) {
     .env_remove("GIT_DIR")
     .env_remove("GIT_WORK_TREE")
     .stdin(Stdio::null())
-    .output()
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
     .unwrap();
+  // Bounded: a command that hangs fails the test at twice the fleet wait, never stalls it.
+  let deadline = Instant::now() + FLEET_WAIT * 2;
+  while output.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      let _ = output.kill();
+      panic!("git {args:?} did not end within {:?}", FLEET_WAIT * 2);
+    }
+    pause();
+  }
+  let output = output.wait_with_output().unwrap();
   (
     output.status.code().unwrap_or(-1),
     String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -402,6 +414,119 @@ fn remote_main(dir: &str, token: &str, url: &str) -> Option<String> {
   let (code, out, _) = git(dir, token, &["ls-remote", url, "refs/heads/main"]);
   (code == 0).then_some(())?;
   out.split_whitespace().next().map(str::to_owned)
+}
+
+/// The repository's URL at `node`'s edge.
+fn repository_url(node: &Node) -> String {
+  format!("https://127.0.0.1:{}/{REPOSITORY}", node.port)
+}
+
+/// [`PUSHES`] commits made in `work` and pushed to `url` one by one, each acknowledged: their ids, in push order.
+fn pushed_acknowledged(work: &str, token: &str, url: &str) -> Vec<String> {
+  let mut acknowledged = Vec::new();
+  for n in 0..PUSHES {
+    let id = commit(work, token, n);
+    let (code, out, err) = git(work, token, &["push", "-q", url, "main"]);
+    assert_eq!(code, 0, "push {n}: {out}{err}");
+    acknowledged.push(id);
+    eprintln!("V3TAKEOVER: push {n} acknowledged");
+  }
+  acknowledged
+}
+
+/// The first of `survivors` whose edge answers `main` for the repository, asked with its own credential (the owner's is
+/// gone with it): its place, `main` there and the token.
+fn survivor_serving(
+  nodes: &[Node],
+  survivors: &[usize],
+  (work, token): (&str, &str),
+) -> Option<(usize, String, String)> {
+  survivors.iter().find_map(|at| {
+    remote_main(work, token, &repository_url(&nodes[*at])).map(|head| (*at, head, token.to_owned()))
+  })
+}
+
+/// What each of `survivors` answers, and what its takeover counted, so a failure names its cause.
+fn survivors_seen(nodes: &[Node], survivors: &[usize], (work, token): (&str, &str)) -> Vec<String> {
+  survivors
+    .iter()
+    .map(|at| {
+      let node = &nodes[*at];
+      let (code, out, err) = git(work, token, &["ls-remote", &repository_url(node)]);
+      let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
+      let counted: Vec<&str> = status
+        .lines()
+        .filter(|line| {
+          [
+            "takeover",
+            "vcs_store",
+            "repositor",
+            "state_log",
+            "part",
+            "held",
+            "record",
+          ]
+          .iter()
+          .any(|word| line.contains(word))
+        })
+        .collect();
+      format!(
+        "node {at}: ls-remote {code} {}{}; counted {counted:?}",
+        out.trim(),
+        err.trim()
+      )
+    })
+    .collect()
+}
+
+/// The survivor that serves the repository once the owner is gone, waited for under [`FLEET_WAIT`] three times over: its
+/// place, `main` there and its own token. Fails naming what each survivor answered.
+fn successor_after(
+  nodes: &[Node],
+  survivors: &[usize],
+  (work, token): (&str, &str),
+) -> (usize, String, String) {
+  let deadline = Instant::now() + FLEET_WAIT * 3;
+  loop {
+    // The client's own credential, minted on the owner: a credential is fleet state (A-764), so the successor knows it.
+    let found = survivor_serving(nodes, survivors, (work, token));
+    if let Some((at, head, token)) = found {
+      return (at, head, token);
+    }
+    if Instant::now() >= deadline {
+      // What each survivor answers, and what its takeover counted, so a failure names its cause.
+      let seen = survivors_seen(nodes, survivors, (work, token));
+      panic!("no survivor served the repository: {seen:#?}");
+    }
+    pause();
+  }
+}
+
+/// A clone from `url` into `scratch` is whole by `git fsck`, and every one of `acknowledged` is on its `main`, in push
+/// order (StaleNeverCommits, NoLoss, TotalOrder).
+fn clone_whole_in_order(scratch: &str, token: &str, url: &str, acknowledged: &[String]) {
+  let clone = format!("{}/clone", scratch);
+  let (code, out, err) = git(scratch, token, &["clone", "-q", url, &clone]);
+  assert_eq!(code, 0, "the clone from the successor: {out}{err}");
+  let (code, out, err) = git(&clone, token, &["fsck", "--full", "--strict"]);
+  assert_eq!(
+    code, 0,
+    "the successor's repository whole (StaleNeverCommits): {out}{err}"
+  );
+  let (_, log, _) = git(&clone, token, &["rev-list", "--reverse", "main"]);
+  let order: Vec<String> = log.lines().map(str::to_owned).collect();
+  let positions: Vec<Option<usize>> = acknowledged
+    .iter()
+    .map(|id| order.iter().position(|seen| seen == id))
+    .collect();
+  assert!(
+    positions.iter().all(Option::is_some),
+    "an acknowledged push missing (NoLoss): {positions:?}"
+  );
+  assert!(
+    positions.windows(2).all(|pair| pair[0] < pair[1]),
+    "pushes out of order (TotalOrder): {positions:?}"
+  );
 }
 
 /// A-724 piece 8c (main's ruling (ii) and its takeover test). Do: three anchors at `f = 1` with their HTTP edges;
@@ -447,31 +572,12 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
     &["repository", "create", REPOSITORY, "--tool", "git"],
   );
   eprintln!("V3TAKEOVER: repository created on node {owner}");
-  // WORKAROUND, until w-fed-faults' fix lands (main's ruling of 2026-11-20): a credential minted on the owner is not
-  // known to the successor once the owner is gone (401), and a survivor's own token names its own account (403, A-237).
-  // So every principal may read and push the repository's refs, granted before the owner dies, and the client asks the
-  // successor with a survivor's own token. Remove this grant, and ask with the owner's token, once credentials survive
-  // their node; this test is that fix's red too.
-  {
-    use slates_ipc::protocol::{PolicyEffect, PolicyNames, PolicyRight, PolicyRule, PolicyWho};
-    let mut client =
-      slates_client::Client::connect(&nodes[owner].instance, slates_api::deadlines()).unwrap();
-    let mut policy = client.describe_repository_policy(REPOSITORY).unwrap();
-    for right in [PolicyRight::Read, PolicyRight::Submit] {
-      policy.rules.push(PolicyRule {
-        names: PolicyNames::Refs,
-        pattern: "refs/".to_owned(),
-        right,
-        effect: PolicyEffect::Allow,
-        who: PolicyWho::Anyone,
-      });
-    }
-    client.set_repository_policy(REPOSITORY, &policy).unwrap();
-  }
+  // The client's own credential, minted where it created the repository, is used on the successor too: a credential is
+  // fleet state since A-764 (w-fed-faults), so it survives its node's death (this test was that fix's red).
   let token =
     value_of(&run_ready(&nodes[owner], &["credential", "token"]), "token").expect("a token");
   // A fleet node's edge presents the node's own certificate (self-signed here): git is told not to verify it.
-  let url = |node: &Node| format!("https://127.0.0.1:{}/{REPOSITORY}", node.port);
+  let url = repository_url;
   let work = format!("{}/work", scratch.path);
   assert!(
     Command::new("mkdir")
@@ -482,14 +588,7 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
       .success()
   );
   assert_eq!(git(&work, &token, &["init", "-q", "-b", "main"]).0, 0);
-  let mut acknowledged = Vec::new();
-  for n in 0..PUSHES {
-    let id = commit(&work, &token, n);
-    let (code, out, err) = git(&work, &token, &["push", "-q", &url(&nodes[owner]), "main"]);
-    assert_eq!(code, 0, "push {n}: {out}{err}");
-    acknowledged.push(id);
-    eprintln!("V3TAKEOVER: push {n} acknowledged");
-  }
+  let acknowledged = pushed_acknowledged(&work, &token, &url(&nodes[owner]));
   // One push in flight as the owner dies.
   let in_flight = commit(&work, &token, PUSHES);
   let owner_url = url(&nodes[owner]);
@@ -507,61 +606,7 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   eprintln!("V3TAKEOVER: owner killed, in-flight push answered {flight_code}");
   let survivors: Vec<usize> = (0..nodes.len()).filter(|at| *at != owner).collect();
   // The successor: the survivor whose edge answers `main` for the repository.
-  let deadline = Instant::now() + FLEET_WAIT * 3;
-  let (successor, head) = loop {
-    // A survivor's own credential (the owner's is gone with it), the repository's policy letting every principal in.
-    let found = survivors.iter().find_map(|at| {
-      let node = &nodes[*at];
-      let token = value_of(
-        &slates(&node.instance, &node.issuer, &["credential", "token"]).1,
-        "token",
-      )?;
-      remote_main(&work, &token, &url(node)).map(|head| (*at, head, token))
-    });
-    if let Some((at, head, token)) = found {
-      break ((at, token), head);
-    }
-    if Instant::now() >= deadline {
-      // What each survivor answers, and what its takeover counted, so a failure names its cause.
-      let seen: Vec<String> = survivors
-        .iter()
-        .map(|at| {
-          let node = &nodes[*at];
-          let own = value_of(
-            &slates(&node.instance, &node.issuer, &["credential", "token"]).1,
-            "token",
-          )
-          .unwrap_or_default();
-          let (code, out, err) = git(&work, &own, &["ls-remote", &url(node)]);
-          let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
-          let counted: Vec<&str> = status
-            .lines()
-            .filter(|line| {
-              [
-                "takeover",
-                "vcs_store",
-                "repositor",
-                "state_log",
-                "part",
-                "held",
-                "record",
-              ]
-              .iter()
-              .any(|word| line.contains(word))
-            })
-            .collect();
-          format!(
-            "node {at}: ls-remote {code} {}{}; counted {counted:?}",
-            out.trim(),
-            err.trim()
-          )
-        })
-        .collect();
-      panic!("no survivor served the repository: {seen:#?}");
-    }
-    pause();
-  };
-  let (at, successor_token) = successor;
+  let (at, head, successor_token) = successor_after(&nodes, &survivors, (&work, &token));
   eprintln!("V3TAKEOVER: node {at} serves main at {head}");
   let last = acknowledged.last().cloned().unwrap();
   assert!(
@@ -571,32 +616,33 @@ fn a_repositorys_acknowledged_pushes_survive_its_owners_death_whole_and_in_order
   if flight_code == 0 {
     assert_eq!(head, in_flight, "an acknowledged push lost (NoLoss)");
   }
-  let clone = format!("{}/clone", scratch.path);
-  let (code, out, err) = git(
+  clone_whole_in_order(
     &scratch.path,
     &successor_token,
-    &["clone", "-q", &url(&nodes[at]), &clone],
+    &url(&nodes[at]),
+    &acknowledged,
   );
-  assert_eq!(code, 0, "the clone from the successor: {out}{err}");
-  let (code, out, err) = git(&clone, &successor_token, &["fsck", "--full", "--strict"]);
-  assert_eq!(
-    code, 0,
-    "the successor's repository whole (StaleNeverCommits): {out}{err}"
-  );
-  let (_, log, _) = git(&clone, &successor_token, &["rev-list", "--reverse", "main"]);
-  let order: Vec<String> = log.lines().map(str::to_owned).collect();
-  let positions: Vec<Option<usize>> = acknowledged
-    .iter()
-    .map(|id| order.iter().position(|seen| seen == id))
-    .collect();
-  assert!(
-    positions.iter().all(Option::is_some),
-    "an acknowledged push missing (NoLoss): {positions:?}"
-  );
-  assert!(
-    positions.windows(2).all(|pair| pair[0] < pair[1]),
-    "pushes out of order (TotalOrder): {positions:?}"
-  );
+  // The region homing's and the takeover's own counts, for the record (main's order: land the switch with them).
+  for at in &survivors {
+    let node = &nodes[*at];
+    let (_, status, _) = slates(&node.instance, &node.issuer, &["status"]);
+    let counted: Vec<&str> = status
+      .lines()
+      .filter(|line| {
+        [
+          "homes.",
+          "names_fetched",
+          "names_unfetched",
+          "push_uncommitted",
+          "replayed",
+          "repository_rebuilt",
+        ]
+        .iter()
+        .any(|word| line.contains(word))
+      })
+      .collect();
+    eprintln!("V3TAKEOVER: node {at} counted {counted:?}");
+  }
   drop(nodes);
   drop(scratch);
 }

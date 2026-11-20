@@ -2,12 +2,14 @@
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
-> only a ceiling. **A-765 BUILT:** an idle shard's prefault reserve (A-214) decays: the last burst whole for one sweep
+> only a ceiling. **A-777 BUILT:** the idle prefault reserve (A-214) is removed: provisioning p99 unchanged, NFS peak
+> RSS 1,137 -> 625 MiB, writes right after idle ~5% slower (BENCHMARKS). **A-765 (superseded):** the reserve decayed: the last burst whole for one sweep
 > interval, then halved each interval (`daemon::decayed_reserve`); before, the burst was held whole for as long as the
 > shard stayed idle (macOS arm64, Studio-4: a 64 MiB burst still reserved whole after 20 s idle; after, 0 and 234 MB
 > given back). **Measure the footprint on macOS, not RSS:** a given-back page of a shared object leaves the footprint
 > but stays in RSS and vmmap's resident until the kernel wants it (a 64 MiB `shm_open` probe: footprint 64 -> 0 MiB,
-> RSS 64 -> 64); `slates_machine::facts::resident_now`, which the pressure hold's own growth reads, is RSS (open).
+> RSS 64 -> 64). Correction (same day): those pages stay physically held (not reclaimed in 10 s under pressure), so RSS,
+> which `slates_machine::facts::resident_now` reads, is the honest holding and the footprint understates it.
 > **Open, by size:**
 > `reserve_per_shard` = memory / shards / 3 sizes each shard's slice of the content object (write log R/4, image slots
 > 2R, delta log R, arena R: about 1.4 times the machine's memory of address space, ~220 GB on the 96 GB Studio, g226),
@@ -22,9 +24,8 @@
 >   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
 >   grown by doubling; the arena grown by pool extents (A-98) as content arrives; the write log from the measured
 >   write stream between barriers.
-> - The idle prefault reserve (A-214): the last burst, capped at R. A-765 decays it; w-hg's release run held 4,931.4
->   MiB resident after hg's history push and faulted 3.5 GB more at idle. -> Removed unless the A/B (prefault vs none,
->   R9 provisioning p99, RSS) shows it pays; if it does, an EWMA of the pages a turn touches.
+> - The idle prefault reserve (A-214): the last burst, capped at R; w-hg's release run held 4,931.4 MiB resident after
+>   hg's history push. REMOVED by A-777.
 > - Tables from R: `table_bytes` (R x TABLE_SHARE), `max_inodes`, `max_dirs`, `max_chunks`, `metadata_class_bytes`,
 >   the volume record bound. -> Grown on demand (doubling, given back on shrink), bounded by admission, not
 >   preallocated from R.
@@ -37,15 +38,17 @@
 > - Give-back on macOS: `MADV_FREE_REUSABLE` over the shared content object leaves RSS (probe: 513 MiB stays, not
 >   reclaimed in 10 s under pressure); a purgeable Mach memory entry set `VM_PURGABLE_EMPTY` frees at once (513 -> 1
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
-> - Allocations on the idle path: `prefault_reserve` builds a `Vec` a pass, `purge_keeping` clones the region order,
->   `pieces_against` a `Vec` a run. -> Reused per-shard scratch.
+> - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
+>   the reserve's per-pass run list removed with the reserve (A-777).
 >
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
 > shard). **Closed quiet by A-400** (a work on its client's shard): Linux arm64 accept p50 51–55 → 20–21 µs (before W1
 > 18), the Mac 155 → 40–43 (before W1 48–54); loaded on Linux main is three times lower than before W1 (p99 21.0 →
 > 4.6–7.0 ms). **Open:** (a) about 10 µs added to every quiet lone submit since A-400 (Linux accept p50 20–21 → 31–35
-> µs, conflict 17–18 → 27–28; in `f2081a3c8..a5233e228`, bisect under way); (b) the shared Mac loaded, where main is
+> µs, conflict 17–18 → 27–28; bisected over `f2081a3c8..a5233e228`: small steps, the reproducible ones in code a submit
+> never runs, so the release build's layout, not a fix to find; an instruction-count gate on the lone submit is owed
+> to hold it); (b) the shared Mac loaded, where main is
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
 >
@@ -54,6 +57,10 @@
 > standing grant; rows (`R N C V O D G`) in Mantle's `ShardDb`; everything else derived. Owed: the log format agreed
 > with w-hg, w-git, w-svn; Mantle's crates vendored; `slates-store`; the A/B against per-file deltas; each tool moved
 > onto it with an RSS red test.
+>
+> **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
+> awaiting a grant first. Owed: identical submissions told apart from accepted ones (a field on the submit's reply), the
+> MCP tool and the SDKs' read, and a presentation never granted stays listed (no presentation expires yet).
 
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
@@ -140,8 +147,10 @@
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
 > **A-722 memory B1 (2026-11-20, w-git).** BUILT: an object read in place from a held pack (`store::packed`, one
-> `PackSource` seam for RAM and w-store's disk). Owed: B2 rows by pack place and every reader through it, B3 the
-> quarantine by entry place, B4 the inflated copies gone; resident after a push bounded by a derived multiple of its pack.
+> `PackSource` seam for RAM and w-store's disk). B2's in-flight half BUILT (2026-11-20): a push holds the client's pack
+> and each object's place in it, every reader through `Push::bytes`, chains from objects read lately held to the
+> pack's length (resident at most twice the pack while judged); staging puts what lands. Owed: the landed half
+> (changesets, a clone's pack derived from them, with w-store); a replay still reads its record's pack whole.
 >
 > **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
 > position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
@@ -216,7 +225,8 @@
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
-> f + 1; `crates/cli/tests/v3_takeover.rs`). Owed: credentials surviving their node (w-fed-faults), the v3 switch.
+> f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
+> takeover).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -283,6 +293,14 @@
 > import's landing appends its whole record as one entry in one step (w-perf, 2026-11-20: 4.66 GB spun shard 9 past
 > its window; the record is now cut by file deltas, but its append is still unbounded: parts across entries, or
 > identity-only records once A-727 a3 lands, main's ruling asked); w-perf's and w-interop's by-use reruns.
+> Part 4 FIXED (found by use, w-hg's r2, big Studio, release: a restart's replay of hg's own history ran 130 s of CPU
+> in 259,321 slices, its longest 265 to 277 ms): a push's intake keeps a revision a step, so each manifest's append
+> rebuilt its predecessor's whole text from its delta chain (up to its length of deltas, each applied over a copy of the
+> text), the replay's and the live push's alike. The intake now hands each append the text it kept last
+> (`HgIndex::append_revisions_after`, borrowed, no copy); a predecessor is rebuilt only where the caller holds none.
+> Red first: `push::intake::tests::the_intake_hands_each_manifest_its_predecessors_text_never_rebuilding_it` (6
+> rebuilds of stock 7.2's bundle before, 0 after). Owed: the restart's replay of hg's history measured again, its
+> longest step against the quantum and the per-step lend and settle (0.5 ms a slice).
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
@@ -409,9 +427,10 @@
 >
 > **A-760 (2026-11-20, w-engine; main's ruling ~09:10, "1b"):** part 1 BUILT: an increment names content by identity
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
-> `ContentUnread` while unread. OWED: part 2, the commit's file blocks built a slice a unit and published in one step;
-> the server's `Objects` over vcs_store's plane and the svn landing's turns (w-svn); replay reading a chain entry's
-> runs first; items 3-7 (the green's block naming the plane's object, no copy).
+> `ContentUnread` while unread. Part 2 BUILT: each run read into its own buffer, which the commit makes the file with
+> no copy (`judge_named`); the server's `PlaneObjects` over vcs_store's plane (range reads); replay reads runs a slice a
+> step. OWED: the svn landing's turns (w-svn); a partial splice of a run copies at the commit; items 3-7 (the green's
+> block naming the plane's object, no copy).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1500,8 +1519,8 @@
 > **A-764 (2026-11-20, w-fed-faults; credentials are fleet state):** a credential enrolled or revoked anywhere is sent
 > to every member of the region and held on each, acknowledged at `f + 1` (a revocation at every member), healed at each
 > configuration change, so a token proves its principal on a takeover's successor (w-balance's `v3_takeover`: 401 before,
-> authenticated after). Owed: a revocation's tombstone, for a member partitioned through a revocation and back with its
-> state.
+> authenticated after). A revocation leaves a tombstone the healer offers too, so a member partitioned through it lets
+> its record go and no member's offer enrolls a revoked credential again.
 
 > **§4.17.3 the Mercurial server: designed (A-499); piece 1 built whole, its framings (A-514), its part payloads (A-545)
 > and its compressed streams (A-598); piece 2 built, the protocol codecs (A-569); piece 3 built whole, its objects and
@@ -1827,6 +1846,12 @@
 > 300 generated `.hgtags` sequences and to `hg log -r` on a recorded repository). Owed: a branch made at a changeset no
 > line or bookmark heads (a tag inside a line's history), refused `Unsupported` until a green can be branched at the
 > version whose head it was.
+> FIXED by use (w-hg's r15, 2026-11-20, release at 1d4909821): `hg clone -r default` of hg's own history aborted
+> `PastAdmission { asked: 179155, left: 85302 }`. The served `lookup`'s tag step reads each head's manifest for its
+> `.hgtags`, charged to what the request left of the edge's room. Both edges now admit a whole answer (`lookup`,
+> `heads`, a batch) the room a fetch's turn is (`HgStores::fetch_turn`, the owner shard's `vcs_share::room`), as A-745
+> admits each streamed turn and 4136fcd89 admits git's upload-pack answer. Red first:
+> `vcs_http::hg::tests::a_lookup_is_answered_within_a_fetchs_room_not_its_requests`.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -3160,7 +3185,12 @@
 >   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
 >   309,760 after). **A-768 (2026-11-20):** a whole publication's content is read in turns from pinned chunks, a quantum a
 >   turn, the publications made meanwhile queued behind it (before: 4.5 to 6 ms of its turn, debug; its image's 2.0 to
->   3.0 ms is still one turn)); and, after A-347's open, the takeover's
+>   3.0 ms is still one turn). **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
+>   content, in steps of a page (before, debug: a whole entry's open 56 to 59 ms of one turn, the archive's hashing 93 to
+>   99 ms of another). **A-775 (2026-11-20):** a taken-over volume given up while its log's holder (or its catalog's or
+>   content's cohort) was away is judged afresh once that member is heard alive at a later incarnation; before, the
+>   give-up was final until a new configuration (live_chaos fresh-member: `NotRecovered` for good after a 3 s pause));
+>   and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -9344,7 +9374,7 @@ them rather than renumbering or weakening the original gates.
 - D-O14 (opened 2026-09-04) FUSE passthrough for untouched base files — CLOSED 2026-09-04: not used; slates never requires `CAP_SYS_ADMIN` or root beyond the OS-provided brokers installed once (`fusermount3`/user namespaces, the FSKit extension, the WinFsp driver); the daemon copy path is the only base read path.
 - D-O15 (opened 2026-09-04) The landing fallback where the target filesystem lacks an atomic exchange (verify-then-rename-over with a reported window until 2026-09-29; since A-43 the old entry moves aside and the new one in by renames that replace nothing, the name's absent window reported) versus a staging-directory strategy — Phase 1 measures the window; Phase 4 measures per platform.
 - D-O16 (opened 2026-09-04) Landing filters — DECIDED 2026-09-04: the confirmation surface offers suggestions the human toggles (ignore-file-aware); the agent's filter stays explicit; a toggle produces a new manifest hash (§4.15 step 2). Phase 5 builds it.
-- D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations: if the measured share of conflicts caused by whole-file rewrites on shared files exceeds the operator SLO, reopen the ergonomics (a declared-edit bridge path for editors; stronger skill guidance) — Phase 6 measures.
+- D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations — CLOSED 2026-11-20 by A-776: the seal recovers a whole-file rewrite (editor write-and-rename, formatter, codemod) as the token-grain edit it was (`slates_merge::refine`), so it merges as precisely as a declared edit; measured on 1,920 rewrite pairs (`crates/merge/examples/rewrite_ab.rs`): 0 false conflicts on different lines, different tokens of one line, or a formatter beside an edit (whole-file: 720 of 720), every one-token clash still a conflict.
 - D-O18 (opened 2026-09-04) Merge proposer authority: slates departs from hecate's leader-fused proposer (one shared pointer group; partitioned execution) and uses a consensus-issued lease with an epoch check at commit; CLOSED 2026-09-04 by A-6: the owner is the distinguished proposer of its own registers under its host epoch, so no leader-versus-leaseholder split can exist; a resumed stale owner is refused at the first holder (model-checked as StaleNeverCommits and Continuity).
 
 ## 3. Undesigned (charter only)
@@ -12341,7 +12371,7 @@ or executable regression was performed by this docs change.
 | GAP-A9-11 | Separate frame classes do not bound CPU, device, arena or full-object transfer costs; resumable helper is not bounded end-to-end ingest. | §4.2/§4.9: all-resource QoS, bounded quanta/credits, verified named and unknown-length transfer, cancellation and release. | AC-0.10/T-0.10; AC-7.7/T-7.8; Phases 0/7/8. |
 | GAP-A9-12 | Closed registry, distinct identities with type-enforced causation, and typed loss/absence markers built and proven by use single-node (`e18619a`); open: cross-node trace propagation and the fleet/archive emitters (§4.8/§4.10 integration). (Was: signal names/absence and request-vs-trace causation not enforced end to end; nine spans were called seven.) | §4.14: closed registry, absence/freshness semantics, distinct identities and telemetry loss markers. | AC-0.11/T-0.11; Phase 0 foundation with surface/fleet integration. |
 | GAP-A9-13 | **Built single-node (2026-09-14, `docs/wip/clean-digest.md`):** verified current digest only (`Overlay::digest`, the `Digest` verb on the wire/CLI/MCP); invalidated before any mutation (`copy_up`, `base_forget`, listing refresh); bounded cache discovery (`Store.digests`, `digest_capacity`, typed counted `DigestCacheFull`); watcher hints backed by revalidation, overflow drops all. Owed: cooperative slicing of the hash, sealed-content digests, SDK exposure. (Was: clean-file digest export and bounded cache discovery not implemented; stale source knowledge must not imply clean content.) | §4.15: verified current digest only; invalidate before mutation; watcher hints backed by revalidation. | AC-1.17/T-1.21; Phase 1 core and bridge integration. |
-| GAP-A9-14 | Service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation **built** (2026-09-13, `docs/wip/merge-service.md`); the mounted work/green (T-6.15's mounted client, the bridge's `EROFS`) and the extent-backed chain remain: a work is not a VFS volume yet. (Was: pure merge core lacked service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation.) | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
+| GAP-A9-14 | Service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation **built** (2026-09-13, `docs/wip/merge-service.md`). **Mounted work and green landing built** (2026-11-20, A-774, `crates/server/src/mounted_work.rs`): a work mounts like any volume (a slot under its id, seeded over its base), its mount's journal is declared into it at submit, and a green's head lands under a grant; ten editors by use (`crates/server/tests/mounted_work.rs`). Remain: the mount's seed copies the work's files (w-work-cow's copy-on-write base), the slot and unsubmitted mount writes are lost at a restart, a mount is not refreshed when its work's base moves, a work over a green on another shard mounts nothing, the green's landing view copies its head (incremental owed), several spans a file (D-O17), the extent-backed chain. A work over a green costs its divergence, not the green (2026-11-20, `tests/work_cow.rs`: 16 works over 64 MiB add 1.2 MB, 975 MB with a copy per work; the 1 to 100 k files, 1 MB to 1 GB, 1 to 100 works grid is in run-requests). (Was: pure merge core lacked service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation.) | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
 | GAP-A9-15 | Evidence surface built (2026-09-14, `docs/wip/conformance.md`): a typed record per transport × suite rendered as a doc-truth matrix, with `cargo xtask conformance` driving the real binary over a real mount and a CI `conformance` lane; on macOS NFS fsx and fsstress pass, the workloads differ by two declared NFS limits (AppleDouble sidecars, SQLite WAL) and pjdfstest ran unprivileged (3,348/3,331/2,007) with its failures categorized, none reviewed as expected; Linux runs as a LIMITED root-NFS adapter, Windows/virtio-fs/OCI and the pressure/failure suites are typed skips. Historical overstatement is closed by construction; the transport guarantees themselves remain open. (Was: native/guest POSIX, strict RAM residency and grant-only disk effects lack complete transport-specific evidence; historical stages overstate coverage.) | §4.6, Part 6 and EQUIVALENCE.md: explicit semantics/boundaries; report skipped lanes and limited adapters honestly. | AC-9.7/T-9.1 plus original conformance/workload gates; Phase 9, prerequisite gates run in their owning phase. |
 
 **Additional decisions/evidence owed.** Phase 4 must establish the supported VMM/device seam,

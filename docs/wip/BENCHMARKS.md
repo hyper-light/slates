@@ -15438,3 +15438,210 @@ to write it whole and P3 hands the stored delta through. Layout is about 0.3 ms 
 first representation, which a delta names its base by). Both stream, so the view's own memory is a megabyte or two over
 the import either way; one P3 run (256 KiB, round 2) peaked 132 MB over its baseline, unexplained, the other four within
 a megabyte. Kept: P3. Rejected: P1's whole texts.
+
+### The ~10 µs since A-400, bisected: small steps, the last two not the code they land (g222, 2026-11-20)
+
+The quiet lone submit's gain since A-400 (Linux arm64 accept p50 20–21 → 31–35 µs, above) bisected over the 309
+first-parent commits `f2081a3c8..a5233e228`, the same harness quiet only (`--quiet-only --files 10 --files 1000 --form
+accept --form conflict`), CI `ubuntu-24.04-arm`, 3 rounds of 3 runs, the arms rotated. Accept p50 µs, each round's
+median:
+
+| run | arms (first-parent position: accept p50 per round) |
+|---|---|
+| 44793023133 (`diag-measurer-g222-2`) | 0: 20.3 / 19.1 / 20.3; 38: 35.9 / 34.7 / 32.3; 77: 21.7 / 22.6 / 21.1; 115: 24.6 / 24.5 / 24.1; 154 (`fa995b7bb`): does not build; 193: 26.6 / 24.2 / 25.8; 231: 25.8 / 27.2 / 26.0; 270: 27.1 / 25.8 / 26.6; 309: 31.8 / 32.8 / 32.2 |
+| 44801688472 (`-3`) | 270: 26.1 / 25.3 / 29.1; 275: 26.8 / 27.2 / 26.4; 280: 30.0 / 29.7 / 29.6; 285: 30.4 / 31.1 / 28.5; 290: 29.9 / 29.2 / 29.5; 295: 28.6 / 30.1 / 30.1; 300: 30.4 / 28.9 / 31.7; 305: 28.8 / 29.8 / 29.3; 309: 32.5 / 32.1 / 33.1 |
+| 44809794056 (`-4`) | 275: 28.6 / 26.3 / 28.2; 276: 25.7 / 27.9 / 26.7; 277: 28.3 / 27.9 / 26.8; 278: 28.2 / 29.2 / 27.5; 279: 30.5 / 27.3 / 28.9; 280: 27.9 / 28.1 / 28.2; 305: 28.1 / 28.0 / 28.1; 306: 26.9 / 27.8 / 28.7; 307 (`524542460`): 31.4 / 30.5 / 31.1; 308 (`23eb15b49`): 32.8 / 34.7 / 33.8; 309: 32.4 / 31.4 / 31.1 |
+
+- No one commit holds the 10 µs: about 3 over positions 77–115, 2 over 115–193, and 3 at `524542460` (a merge
+  bringing A-752 part 2, the paced push build). The 275–280 step of the second run did not reproduce in the third.
+- The two steps that reproduce are not the code they land. `23eb15b49` changes only a push's tree reading, which a
+  submit never runs, and moved the submit 2 µs; `a5233e228`, the paths map's slicing (also off the path), moved it 1–2
+  µs back. And A-752's rewrite of the ops document, the one change at `524542460` on a submit's path, costs nothing:
+  a one-op document canonicalized and encoded takes 202–217 ns at `524542460` against 203–208 ns at `be175cd9d`
+  (a scratch example, never committed, best of 7 × 2,000,000, alternated twice; adas-mac-studio-3.local). Steps of 2–3
+  µs that follow code a request never runs are the release build's layout, not work. Point 38 (`b207f2321`), 32–36 µs
+  and gone by point 77, is the same kind.
+- So the creep is not bisectable to a fix. What would hold it is an instruction-count gate on the lone submit (§5's
+  iai-callgrind gate, which counts work, not layout), owed.
+
+## Mercurial's history held as changesets or as per-file deltas, counted (Ada's ruling of 2026-11-20 ~13:35; main's A/B order; UI goal 93; 2026-11-20)
+
+**The question.** A push of hg's own history kept every file revision as a whole text in the content store: 4,495.5 MiB
+committed (`slates status`, release at 1d4909821, big Studio) for a 162 MB uncompressed bundle and an 84 MB stock
+store. Ada ruled the changeset the unit, every other form derived. Before either shape is built, both were counted.
+
+**Commands** (big Studio, macOS arm64, 32 cores; Mercurial 7.2 through `uvx`; scripts kept beside the checkouts in
+`~/.cache/w-hg-ab/`, run with `uvx -q --from mercurial==7.2 python -I`):
+- `changeset_ab.py ~/.cache/w-hg-mem/hg 256,1024,4096 2000` (2026-11-20 12:26 PST, load 11.2): bytes and sampled old
+  reads for A and for B with tree checkpoints.
+- `checkpoint_texts.py ... 256,1024,4096`: the whole texts the tree checkpoints name, each once.
+- `perfile_b.py ... 2000`: B with per-file wholes.
+- Stock reference: `hg serve` on loopback, then `hg clone -q -U http://...` of the same history, the server's RSS
+  sampled every 0.5 s.
+
+**The data.** hg's history at 57,054 changesets (tip 57,053): 4,243 paths and 115,479 file revisions. All of them as
+whole texts come to 4,296.9 MiB. Deltas are `mdiff.textdiff` (Mercurial's own bdiff), uncompressed. Old reads are
+2,000 sampled (path, changeset touching it) pairs, seeded 20261120.
+
+| Shape | Held, uncompressed | Old read: deltas applied p50 / p99 / max | Bytes read p50 / p99 |
+|---|---|---|---|
+| Whole texts (a push's store today) | 4,296.9 MiB | 0 | whole |
+| A per-file deltas, chain ≤ text length | 145.7 MiB (7,423 whole, 108,056 deltas) | 14 / 205 / 572 | 20 KB / 398 KB |
+| B changesets + tree checkpoints, K=256 | 103.2 + 1,057.4 MiB of checkpoint texts | 2 / 48 / 105 | 0.6 KB / 46 KB + text |
+| B, K=1024 | 96.1 + 499.8 MiB | 4 / 121 / 301 | 1.5 KB / 90 KB + text |
+| B, K=4096 | 94.3 + 190.5 MiB | 9 / 405 / 987 | 5.4 KB / 305 KB + text |
+| B changesets + per-file wholes, chain ≤ text length | ≈ 137 MiB (edits 68.6, new files 25.1, 43.7 more wholes) | 15 / 350 / 661 | 20 KB / 361 KB |
+| Stock hg 7.2 store (zlib revlogs) | 84 MiB on disk | | |
+
+Stock `hg clone -U` over HTTP took 283 s at load 11, and `hg serve` peaked at 111 MiB.
+
+**Decided by these counts** (provisional, main's ruling): B with per-file wholes. The changeset as the unit costs
+nothing in bytes against per-file deltas (≈ 137 against 146 MiB), and a file is made whole again where its own edit
+chain passes its length. That bound is derived from the data, not picked. Tree checkpoints cost 0.2 to 1 GB in the
+whole texts they name for shorter reads, and are rejected (measured-and-rejected, these rows).
+
+**Release timings** (`cargo build --release -p slates-hg --example changeset_ab`, then
+`/usr/bin/time -l changeset_ab ~/.cache/w-hg-mem/hg <A|B> 2000`. Big Studio, 2026-11-20 14:07 PST, load 12 to 16; N=1
+run an arm, 2,000 old reads each, every rebuilt text checked against its BLAKE3 and length):
+- Both arms hold Mercurial's own deltas: each file revision's revlog chunk against its recorded base, no diff at the
+  server. A keeps them per file in revision order; B in changeset order (grouped by link), a file's revisions found
+  through its path history.
+- The history read has 114,732 file revisions, 94.0 MiB of chunks. Every text was rebuilt and hashed once: 59.5 s
+  (A) and 57.2 s (B) of reading the source, the same work for both. Laying out the arm took 0.04 s.
+- Peak RSS 572 MiB (A) and 619 MiB (B). That includes the leaked source revlogs and every read chunk, an example's
+  ceiling, not a server's.
+- Old reads go through a fresh 64-segment cache each (a cold read). The clone's file section is every revision, file by
+  file, through one 64-segment cache.
+
+| Arm, form (64 KiB segments) | Held | Old read µs p50 / p99 / max | Segments decoded a read p50 / p99 | Clone file section, decodes |
+|---|---|---|---|---|
+| A raw | 94.0 MiB | 23 / 3,807 / 11,837 | 2 / 10 | 0.03 s, 5,251 |
+| A LZ4 | 36.2 MiB | 58 / 4,062 / 9,355 | 2 / 10 | 0.15 s, 5,251 |
+| A zstd 1 | 26.6 MiB | 91 / 3,716 / 10,091 | 2 / 10 | 0.27 s, 5,251 |
+| A zstd 3 | 25.2 MiB | 88 / 3,690 / 7,731 | 2 / 10 | 0.27 s, 5,251 |
+| A zstd 9 | 23.1 MiB (encoded in 1.39 s) | 86 / 4,421 / 10,454 | 2 / 10 | 0.28 s, 5,251 |
+| B raw | 94.0 MiB | 56 / 2,993 / 4,458 | 20 / 272 | 0.08 s, 52,511 |
+| B LZ4 | 38.7 MiB | 461 / 8,361 / 11,273 | 20 / 272 | 1.10 s, 52,511 |
+| B zstd 1 | 28.5 MiB | 864 / 13,029 / 18,375 | 20 / 272 | 2.11 s, 52,511 |
+| B zstd 3 | 27.1 MiB | 874 / 13,214 / 17,569 | 20 / 272 | 2.13 s, 52,511 |
+| B zstd 9 | 25.1 MiB (encoded in 1.07 s) | 859 / 12,964 / 18,392 | 20 / 272 | 2.10 s, 52,511 |
+
+What it says:
+- Compressed, either arm holds hg's history in a third of stock's 84 MiB store (zstd 1: 26.6 and 28.5 MiB).
+- Changeset order costs locality once the log is compressed. A file's chain is scattered across the changesets that
+  made it, so an old read decodes 10 times the segments, about 0.9 ms against 0.09 ms at p50 under zstd 1. A clone's
+  file section, streamed file by file, decodes 52,511 segments against 5,251: 2.1 s against 0.27 s.
+- Raw, B's reads are no slower: 56 against 23 µs at p50, and 2,993 against 3,807 µs at p99.
+- Against stock's 283 s clone and the goal's 28 s, even B's 2.1 s is small.
+- zstd 3 and 9 save 1 to 4 MiB over zstd 1 at the same decode cost.
+
+Owed: the full clone over the wire (changesets, manifests derived, files) and an import's RSS in the daemon, once
+the shape is built there. And N=3 an arm on a quiet machine.
+
+## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
+
+- **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
+  from a `git archive` of its commit into one directory with fresh mtimes, into a target directory of its own; the
+  binaries differ. Before the rounds, one push on each: v2 counts no homing; v3 counts `homes.homed_in_region` 1 and
+  `homes.published_for_ticket` 1 (git/git v1.0.0's 12,232 names, about 500 KB, past one window: homed whole by its BLAKE3).
+- **The command:** `crates/cli/bench/push_load.py SLATES ~/.cache/g309-scale/src.git 'v1.0.0^{commit}' --max 10`
+  (a fresh daemon a run: 1 push, then 10 at once, each to its own repository), v2 and v3 alternating, ten rounds.
+  Studio-2 (Adas-Mac-Studio-2, 14 cores), load 5.0 to 6.5 with other agents' work: one node, so the names' one home is
+  the owner's own shard and the cost is the local keep and one publication of its shard (its delta).
+
+| round | v2 1 push | v3 1 push | v2 10, p50 | v3 10, p50 | v2 10, p99 | v3 10, p99 |
+|---|---|---|---|---|---|---|
+| 1 | 1.605 | 1.735 | 2.525 | 2.496 | 3.277 | 2.838 |
+| 2 | 1.399 | 1.125 | 2.004 | 1.544 | 2.890 | 2.608 |
+| 3 | 1.186 | 1.274 | 1.487 | 1.688 | 2.577 | 2.714 |
+| 4 | 1.330 | 1.359 | 1.967 | 1.872 | 2.782 | 2.812 |
+| 5 | 1.105 | 1.679 | 1.552 | 3.126 | 2.698 | 3.721 |
+| 6 | 1.255 | 0.995 | 1.634 | 1.403 | 2.770 | 2.560 |
+| 7 | 2.355 | 1.498 | 2.837 | 1.904 | 3.267 | 3.218 |
+| 8 | 2.074 | 1.887 | 2.651 | 2.417 | 3.392 | 2.966 |
+| 9 | 1.859 | 1.719 | 2.359 | 2.246 | 3.403 | 3.500 |
+| 10 | 1.198 | 1.403 | 1.710 | 1.825 | 2.878 | 3.116 |
+
+- **What it says.** Best of ten: one push 1.105 s (v2) against 0.995 s (v3); ten at once, p50 1.487 s against 1.403 s, p99
+  2.577 s against 2.560 s. Medians: 1.365 s against 1.451 s; 1.986 s against 1.888 s; 2.884 s against 2.902 s. The
+  difference is inside the rounds' own spread on a loaded host (round to round the same build moves by up to 1.2 s):
+  the barrier's publication costs a single node nothing measurable here. Across nodes the homing adds a region round
+  trip per push (the takeover test's three nodes: each survivor served 19 region exchanges for three pushes and their
+  heals); a three-node release A/B is owed.
+
+## Whole-file rewrites recovered as the edits they were: token grain, Myers anchored on unique tokens (A-776; D-O17; 2026-11-20)
+
+The A/B that settled `slates_merge::refine`'s shape. Command: `cargo run --release -p slates-merge --example rewrite_ab`
+(one arm alone: `... -- myers/token`). Corpus: six of the merge crate's own source files (462 KiB) at main 46951a489.
+Workloads: 240 pairs each of two agents saving whole files from one base, the second judged after the first by the real
+green (`Green::submit`). `lines`: one token changed on each of two different lines. `tokens`: two different tokens of
+one line. `format`: a re-indent of every line beside a one-token edit. `clash`: one token changed differently by both,
+where an accept is a silent merge. "Wrong" counts a green file differing from the oracle, or an accept on `clash`.
+Cost: the refinement alone, µs per KiB of the larger file, median and p99 over 3,840 saves; the median is the fastest of
+five interleaved rounds, all five shown. Scratch: the refiner's high-water. Apple M3 Ultra (32 cores), macOS arm64,
+release, load 18.5 at the start (other agents' builds), 14:03 PST.
+
+| arm | lines conflicts | tokens conflicts | format conflicts | clash conflicts (wrong) | median µs/KiB | p99 µs/KiB | scratch KiB | rounds (median) |
+|---|---|---|---|---|---|---|---|---|
+| whole (before) | 240/240 | 240/240 | 240/240 | 240/240 (0) | 0.000 | 0.007 | 0 | 0.000 ×5 |
+| trim only | 0/240 | 0/240 | 215/240 | 240/240 (0) | 0.467 | 6.567 | 1,024 | 0.480 0.484 0.480 0.480 0.467 |
+| Myers, bytes | 0/240 | 0/240 | 156/240 | 0/240 (**240**) | 0.486 | 174.5 | 4,211 | 0.497 0.494 0.500 0.503 0.486 |
+| **Myers, tokens (kept)** | **0/240** | **0/240** | **0/240** | **240/240 (0)** | **0.479** | **51.2** | **1,480** | 0.488 0.479 0.483 0.479 0.484 |
+| Myers, lines | 0/240 | 240/240 | 182/240 | 240/240 (0) | 0.484 | 24.0 | 441 | 0.536 0.484 0.486 0.487 0.485 |
+
+No arm produced a wrong file on the three accepting workloads. Every arm above runs anchored on unique units when Myers
+alone exhausts its budget.
+
+- **Rejected: bytes.** They accepted all 240 one-token clashes, merging two agents' changes inside one identifier into a
+  word neither wrote. That is the silent interleave D-27 forbids.
+- **Rejected: lines, and with them patience and histogram.** Those two anchor on lines and answer at line grain. Two
+  edits to different tokens of one line conflicted 240 of 240.
+- **Rejected: trim alone.** A formatter pass beside an edit conflicted 215 of 240.
+- **Rejected: Myers over tokens without anchoring** (the first run, budget 64 steps a unit). 148 of 240 formatter pairs
+  conflicted, the re-indent kept whole at the budget, and p99 was 191 µs/KiB.
+- **The budgets, measured on the token arm.** Steps a unit for Myers alone, then for the anchored search: (1, 16) gave a
+  p99 of 50.5 µs/KiB; (2, 16) 53.8; (4, 16) 59.7; (2, 32) 53.8; (1, 64) 50.5. All gave 0/240 format conflicts. One shared
+  budget of 16, 4 and 1 a unit gave 0, 28 and 78 of 240. Kept: (1, 16).
+- **Competitor.** `git diff --no-index --diff-algorithm={myers,histogram,patience}` (git 2.50.1) of the same re-indent
+  of `engine.rs` (274 KiB to 300 KiB) takes 10 to 40 ms a process, at line grain and including process start. The
+  refiner's p99 save, at token grain, is about 14 ms for that file.
+
+## The idle prefault reserve against none (A-777; main's items 1-2 after A-765; 2026-11-20)
+- **The command and machine:** Adas-Mac-Studio.local (macOS arm64, 32 cores), kiln run r6, release, interleaved, three
+  rounds: A = main 5518fb2bc (the reserve, A-765's decay), B = agents/w-sizing-noprefault (none).
+  `provision_bench` (R9, AC-2.1) then `nfs_large_write`, each under a Python `getrusage` wrapper for peak RSS. Load
+  average 8.7 to 30.8 (a shared Studio).
+- **Provisioning, 1 client spinning, p99 (us):** A 226.7, 197.4, 203.5; B 232.5, 200.6, 182.3. Both arms fail the 50 us
+  floor at this load alike. Parked p99: A 296.7, 287.5, 255.3; B 276.8, 241.3, 263.2.
+- **NFS large write, best (MiB/s):** v3 A 1,962.8, 2,051.1, 2,154.1; B 1,945.9, 2,045.8, 2,103.0. v4 A 1,945.3,
+  2,047.9, 2,144.2; B 1,928.1, 2,031.3, 2,061.4.
+- **Kept rounds after idle (MiB/s, five a round):** A 1,534.7 1,677.5 1,696.9 1,650.9 1,601.3 / 1,528.8 1,637.4
+  1,688.2 1,688.8 1,628.7 / 1,672.8 1,737.4 1,747.3 1,738.8 1,673.0; B 1,543.9 1,442.4 1,560.6 1,552.3 1,649.5 / 1,547.9
+  1,571.7 1,542.0 1,611.8 1,395.2 / 1,628.0 1,681.1 1,689.9 1,689.4 1,579.9. About 5% to A.
+- **Peak RSS, NFS bench (MiB):** A 1,139.2, 1,136.9, 1,137.0; B 626.5, 625.0, 625.0. Provisioning: 420-423 both.
+- **Verdict:** measured and rejected, the reserve (A-214, A-765): 512 MiB of peak RSS for about 5% on writes landing
+  right after idle and nothing on R9. Removed by A-777. Linux run (r7) owed as a follow-up.
+
+## A push read where it lies in its pack while it is judged: none of its objects in the store until it lands (A-722 memory B2, in-flight half; main's ruling B; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; the diagnostic test of B1 (one push driven by phase on a
+  daemon's shard, its request 64 KiB a call; branch agents/w-git-memdiag's test, never main) over a receive-pack request
+  of git/git's v1.5.0 (9.4 MiB of pack, 34,296 objects), before (main e73283fd6) and after (5518fb2bc).
+
+| | content store after input | quarantined after input | admission peak | content peak (landing) | content after | answer steps | test time |
+|---|---|---|---|---|---|---|---|
+| before | 14.4 MiB | 10,644 objects, inflated | 34.4 MiB | 310.3 MiB | 309.0 MiB | 173,409 | 6.71 s |
+| after (5518fb2bc) | 0.0 MiB | 10,644 objects, in place | 34.4 MiB | 310.3 MiB | 309.0 MiB | 229,619 | 9.73 s |
+| after, staging in resolution order | 0.0 MiB | 10,644 objects, in place | 34.4 MiB | 310.3 MiB | 309.0 MiB | 168,761 | 9.44 s (loaded) |
+
+- **What it says.** While the push is read and checked, the content store holds none of its objects; the push holds its
+  pack and what it read lately (at most the pack again). What lands is put at staging, so the landed size is the same:
+  the landed half (changesets, a clone's pack derived from them) is w-store's seam, owed. The admission (the session's
+  charge for the pack and its reader) is unchanged. (After input, 10,644 is the pack's whole objects; its 23,653 deltas
+  resolve in the answer's first turns, held in place the same way.)
+- **What it cost, and the cut.** The push took 3.0 s more (+45%) and 56,210 more steps of the shard's quantum. A
+  profile (`sample`, 5 s mid-push) put zlib's inflate on top: staging read each object in place in its name's order,
+  random against the pack, so each read inflated its chain again (git/git v1.5.0: chains 12.6 deep on average). Staging
+  now puts the pack's objects in the order the reader resolved them, each just after its base, which the objects read
+  lately hold (`Step::Putting`). The same push then answered in 168,761 steps, fewer than before B2 (173,409); its time,
+  9.44 s, was taken while the Studio built other work, so the steps are the comparison. Its longest step, 48 ms, is
+  its last: the landing (the commit's whole passes, next).

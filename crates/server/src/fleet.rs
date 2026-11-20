@@ -4778,6 +4778,7 @@ const MATERIALIZE_REFUSED: &str = "fleet.materialize";
 /// stands still. Before, each wait (`fleet.materialize.waits.*`, a fetch that never completed, a refused or unanswered
 /// materialization) retried every period without end.
 async fn materialize_pending(origin: u16, local: HostId, budget: CommitBudget) {
+  judge_given_up_afresh(origin).await;
   let pending: Vec<(ObjectId, HeadValue, Option<HostId>)> = state::with_state(|s| {
     s.pending_materializations
       .iter()
@@ -4833,7 +4834,7 @@ async fn materialize_pending(origin: u16, local: HostId, budget: CommitBudget) {
         origin,
         local,
         (object, TakenOver::Volume),
-        waited.named(),
+        (waited.named(), waited.waits_on_members()),
         attempts,
       )
       .await;
@@ -5256,7 +5257,7 @@ async fn materialize_pending_greens(
         origin,
         local,
         (object, TakenOver::Green),
-        waited.named(),
+        (waited.named(), false),
         attempts,
       )
       .await;
@@ -5680,6 +5681,87 @@ enum TakenOver {
   Green,
 }
 
+/// Judges afresh each taken-over volume given up on while it waited on its takeover cohorts' members
+/// ([`ShardState::given_up_volumes`], A-775) once one of them is heard again: alive at a later incarnation than when it was
+/// given up, back from a pause or a partition the failover SLO's worth of attempts did not outlast. Its owner shard's
+/// unrecovered record goes, so the verbs on it wait for its materialization again (A-548), and it is pending again with
+/// its attempts from zero, counted [`MATERIALIZE_JUDGED_AFRESH`]. Bounded as the takeover round's own fresh judgement is
+/// (`takeover::HostTakeover::heard_since`): once per member's later incarnation, each with the failover SLO's worth of
+/// attempts. Before, a give-up was final until a new configuration: a live volume whose log's holder was stopped about
+/// the failover SLO (`live_chaos`'s fresh-member flow stops it 3 s, its successor's bound 30 periods) answered
+/// `NotRecovered` for good once the holder came back with every acknowledged write (w-forming's anchor log,
+/// `takeover-stall-pr15-run1.log`: `fleet.materialize.given_up` 1 after 22 catalog and 11 quorum waits, the holder left at
+/// fence 1).
+async fn judge_given_up_afresh(origin: u16) {
+  let heard: Vec<ObjectId> = state::with_state(|s| {
+    let membership = s.fleet.membership();
+    s.given_up_volumes
+      .iter()
+      .filter(|(_, given_up)| {
+        given_up.heard.iter().any(|(host, incarnation)| {
+          membership
+            .state(*host)
+            .is_some_and(|held| held.liveness == Liveness::Alive && held.incarnation > *incarnation)
+        })
+      })
+      .map(|(object, _)| *object)
+      .collect()
+  })
+  .unwrap_or_default();
+  for object in heard {
+    let id = DbVolumeId { bytes: object.0 };
+    let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+    let Some(target) =
+      state::with_state(|s| s.shards.get(usize::from(partition)).copied()).flatten()
+    else {
+      continue;
+    };
+    let cleared = call_within(
+      origin,
+      target,
+      move |s| {
+        let given_up = matches!(
+          s.unrecovered.get(&id),
+          Some(slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { .. })
+        );
+        if given_up {
+          s.unrecovered.remove(&id);
+        }
+        given_up
+      },
+      HEARTBEAT_NS,
+    )
+    .await;
+    let Some(still_given_up) = cleared else {
+      // The owner shard did not answer this period: judged again next period.
+      continue;
+    };
+    state::with_state(|s| {
+      let given_up = s.given_up_volumes.remove(&object)?;
+      // Its record gone another way (the volume destroyed, or recorded unrecovered for another cause): not taken up.
+      if !still_given_up || s.pending_materializations.contains_key(&object) {
+        // Adopted again meanwhile (a new configuration's round): that record stands.
+        return None;
+      }
+      if let Some(catalog) = given_up.catalog {
+        s.pending_catalogs.entry(object).or_insert(catalog);
+      }
+      let mut pending = given_up.pending;
+      pending.attempts = 0;
+      pending.round_seen = None;
+      pending.turns_seen = None;
+      pending.live_adopted = None;
+      s.pending_materializations.insert(object, pending);
+      s.count(MATERIALIZE_JUDGED_AFRESH, 1);
+      Some(())
+    });
+  }
+}
+
+/// Counter: a taken-over volume given up on, judged afresh once a member of its cohorts was heard again
+/// ([`judge_given_up_afresh`]).
+const MATERIALIZE_JUDGED_AFRESH: &str = "fleet.materialize.judged_afresh";
+
 /// Gives up on the taken-over `object` of its kind after `attempts` without progress, the last of which waited on
 /// `waited` ([`materialize_pending`], [`materialize_pending_greens`]): its owner shard records it unrecovered with that
 /// cause, so every verb on it answers `Refusal::NotRecovered`; this node stops attempting it and claims it to lookups
@@ -5691,7 +5773,7 @@ async fn give_up_taken_over(
   origin: u16,
   local: HostId,
   (object, kind): (ObjectId, TakenOver),
-  waited: &'static str,
+  (waited, on_members): (&'static str, bool),
   attempts: u32,
 ) {
   let id = DbVolumeId { bytes: object.0 };
@@ -5725,16 +5807,39 @@ async fn give_up_taken_over(
     TakenOver::Green => ("green", GREEN_TAKEOVER_GIVEN_UP),
   };
   state::with_state(|s| {
+    let catalog = s.pending_catalogs.remove(&object);
     match kind {
       TakenOver::Volume => {
-        s.pending_materializations.remove(&object);
+        let given_up = s.pending_materializations.remove(&object);
+        // A volume that waited on its cohorts' members is judged afresh once one is heard again
+        // ([`judge_given_up_afresh`]).
+        if let Some(pending) =
+          given_up.filter(|pending| on_members && !pending.cohort_hosts.is_empty())
+        {
+          let membership = s.fleet.membership();
+          let heard = pending
+            .cohort_hosts
+            .iter()
+            .map(|host| {
+              let incarnation = membership.state(*host).map_or(0, |held| held.incarnation);
+              (*host, incarnation)
+            })
+            .collect();
+          s.given_up_volumes.insert(
+            object,
+            crate::state::GivenUpVolume {
+              pending,
+              catalog,
+              heard,
+            },
+          );
+        }
       }
       TakenOver::Green => {
         s.pending_green_materializations.remove(&object);
         crate::green_adopt::forget_completions(s, object);
       }
     }
-    s.pending_catalogs.remove(&object);
     if target.is_some() {
       crate::takeover::track_owner_on_every_shard(s, object, local);
     }
@@ -6606,9 +6711,10 @@ async fn restore_and_begin(
   Ok(())
 }
 
-/// A live log's rebuild on its owner shard, its payloads opened and applied a slice a turn, each held to the turn's
-/// share of the seal quantum (`config::wrap_slice_ns`, a payload at least: [`crate::live_ship::Rebuilding`]), counted
-/// [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a turn. The archive, and the head the
+/// A live log's rebuild on its owner shard, its payloads opened and applied and its archive's content hashed a slice a
+/// turn, each held to the turn's share of the seal quantum (`config::wrap_slice_ns`, a step at least: a sealed page opened
+/// or hashed, a record applied, a run laid over, a page of content hashed: [`crate::live_ship::Rebuilding`], A-771),
+/// counted [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a turn, its content hashed already. The archive, and the head the
 /// takeover adopted. Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68
 /// to 1.08 s to rebuild 152 to 306 MB of log, past the watchdog's spin window, which ended the successor's process.
 async fn rebuild_in_turns(
@@ -6821,6 +6927,15 @@ impl VolumeWait {
   /// catalog register or that register's placement ([`paging_round`]).
   const fn waits_on_the_round(self) -> bool {
     matches!(self, VolumeWait::Catalog | VolumeWait::CatalogPlacement)
+  }
+
+  /// Whether it waits on members of the volume's takeover cohorts, which a member heard again may clear: its live log's
+  /// holders, its catalog register's (or that register's placement's), or its content's ([`judge_given_up_afresh`]).
+  const fn waits_on_members(self) -> bool {
+    matches!(
+      self,
+      VolumeWait::Live | VolumeWait::Catalog | VolumeWait::CatalogPlacement | VolumeWait::Content
+    )
   }
 
   /// Its name in a refusal's cause (`RecoveryCause::TakeoverIncomplete`).

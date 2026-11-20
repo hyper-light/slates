@@ -122,13 +122,15 @@ pub fn fork_with(
 }
 
 /// Keeps one revision a push brought in `fork`'s `log` (A-720, the sliced intake): its text kept as content once and its
-/// row appended, numbered its log's next, as [`fork_with`] keeps a group; the holds its puts took given back. Refused,
-/// what it put is given back and `fork` holds none of it.
+/// row appended, numbered its log's next, as [`fork_with`] keeps a group; the holds its puts took given back. `previous`
+/// is the node and whole text of the revision the intake kept last, so a manifest's delta is made against it rather
+/// than a text rebuilt from its chain (`HgIndex::append_revisions_after`, A-732). Refused, what it put is given back
+/// and `fork` holds none of it.
 pub(crate) fn keep_one(
   fork: &mut HgIndex,
   store: &mut ContentStore,
   log: Log<'_>,
-  arrived: &Arrived,
+  (arrived, previous): (&Arrived, Option<(&Node, &[u8])>),
   admission: &mut Admission,
 ) -> Result<(), Unindexed> {
   let mut puts = Puts::default();
@@ -139,7 +141,7 @@ pub(crate) fn keep_one(
       let files = matches!(log, Log::File(_));
       revisions(store, one, &mut puts, admission, files).and_then(|group| {
         fork
-          .append_revisions(store, log, &group)
+          .append_revisions_after(store, log, &group, previous)
           .map(drop)
           .map_err(Unindexed::from)
       })
