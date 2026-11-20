@@ -34,3 +34,13 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - kiln lanes: linux-x86_64 leg 01a1fa8f0de8 'running' but waits 'capacity' on 451397 (steps pending ~2.5 h);
   macos-arm64 attempt 2 running on d13238; linux-arm64 + win-arm64-cross queued 'headroom'.
 - Worktree ~/kiln-work/w-k90-pin-2-land (landed; remove when done).
+
+## ~16:10 PST
+- LANDED kiln 5264caaa3 (merge-base confirmed; base 5264caaa3): build job's Report annotates `error` blocks first
+  (run 44825381107, 63da2c592: windows-latest + windows-11-arm (clippy, build) red exit 101, annotation full of
+  vendor/slates fetch_update warnings, error unseen). Validated 0 diagnostics.
+- GitHub: run on c0f576eb3 (44830441910) pending behind 44825381107 (63da2c592, old 120-min slates timeout); the next
+  started main run carries both fixes.
+- kiln lanes WEDGED ~4 h: linux-x86_64 leg 01a1fa8f0de8 and macos-arm64 attempt-2 leg 01a1fae6520e both 'running' with
+  every step pending (no checkout); mac leg's routing says held for cec37f (room=true, room_at long past) yet never
+  starts. linux-arm64 + win-arm64-cross queued 'headroom'. Told main (scheduler, needs a person's look).
