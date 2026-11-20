@@ -1038,3 +1038,157 @@ fn stock_hg_lists_and_moves_keys_over_the_ssh_edge() {
     &config,
   );
 }
+
+/// Runs stock hg as [`hg_in`] does with `input` on its standard input: its exit code and both outputs.
+fn hg_fed(hg: &[String], dir: &str, args: &[&str], input: &str) -> (i32, String, String) {
+  let (program, leading) = hg.split_first().expect("a command");
+  let mut child = Command::new(program)
+    .args(leading)
+    .args(args)
+    .current_dir(dir)
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .env("HGUSER", "Test <test@example.com>")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(input.as_bytes())
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let code = exit_within(&mut child, &format!("hg {args:?} in {dir}"));
+  (code, out.join().unwrap(), err.join().unwrap())
+}
+
+/// Stock hg's batched `pushkey` through slates at `url`, `config` its `--config` words: two changesets pushed, bookmark
+/// `batched-bm` made at the first by `hg debugpushkey`, then one `batch` sent by `hg debugwireproto` (`batchbegin`,
+/// `batchsubmit`: 7.2's batching peer) of `listkeys bookmarks`, a `pushkey` moving `batched-bm` from the first
+/// changeset to the second, and `listkeys bookmarks` again. Fails the test unless the batch is answered and the server
+/// then lists `batched-bm` at the second changeset.
+#[allow(clippy::disallowed_methods)]
+fn batch_legs(hg: &[String], scratch: &str, url: &str, config: &[String]) {
+  let local = format!("{scratch}/local");
+  hg_ok(hg, scratch, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(hg, &local, &["commit", "--addremove", "--message", "first"]);
+  hg_ok(hg, &local, &with_config(&["push", url], config));
+  let first = hg_nodes(hg, &local).into_iter().next().unwrap_or_default();
+  let made = hg_in(
+    hg,
+    &local,
+    &with_config(
+      &["debugpushkey", url, "bookmarks", "batched-bm", "", &first],
+      config,
+    ),
+  );
+  std::fs::write(format!("{local}/file"), "first\nsecond\n").unwrap();
+  hg_ok(hg, &local, &["commit", "--message", "second"]);
+  hg_ok(hg, &local, &with_config(&["push", url], config));
+  let second = hg_nodes(hg, &local).into_iter().next().unwrap_or_default();
+  let script = format!(
+    "batchbegin\ncommand listkeys\n    namespace bookmarks\ncommand pushkey\n    namespace bookmarks\n    key \
+     batched-bm\n    old {first}\n    new {second}\ncommand listkeys\n    namespace bookmarks\nbatchsubmit\n"
+  );
+  let batched = hg_fed(
+    hg,
+    &local,
+    &with_config(&["debugwireproto", url], config),
+    &script,
+  );
+  let listed = hg_in(
+    hg,
+    &local,
+    &with_config(&["debugpushkey", url, "bookmarks"], config),
+  );
+  assert_eq!(
+    (
+      made.0,
+      batched.0,
+      listed.1.contains(&format!("batched-bm\t{second}"))
+    ),
+    (0, 0, true),
+    "debugpushkey: {made:?}; the batch: {batched:?}; the bookmarks after it: {listed:?}"
+  );
+}
+
+/// A-758 (a batched `pushkey`, 7.2's `wireprotov1server.batch`, over the HTTP edge: the batch sent by `POST`, its
+/// arguments in the body, `experimental.httppostargs`, as 7.2 serves a batched push command only by `POST`). Do: run
+/// [`batch_legs`] as stock hg 7.2 over `--vcs-http`. Expect the batch answered and the bookmark moved. Skips loudly
+/// without stock hg 7.2 ([`STOCK_HG`]) and where the platform names no issuer surface ([`issuer_of`]).
+#[test]
+fn stock_hg_batches_a_pushkey_over_the_vcs_http_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's batched pushkey over HTTP: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs \
+       it)"
+    );
+    return;
+  };
+  let instance = format!("hg-batch-http-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's batched pushkey over HTTP") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+    "experimental.httppostargs=true".to_owned(),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-batch-http");
+  batch_legs(&hg, &scratch.path, &format!("{prefix}r"), &config);
+}
+
+/// A-758 (a batched `pushkey` over `hg serve --stdio`, the SSH edge). Do: a fresh key enrolled for the repository's
+/// owner, run [`batch_legs`] as stock hg 7.2 over `--vcs-ssh`. Expect the batch answered and the bookmark moved. Skips
+/// loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`, and where the platform names no issuer surface
+/// ([`issuer_of`]).
+#[test]
+fn stock_hg_batches_a_pushkey_over_the_ssh_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's batched pushkey over SSH: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs \
+       it)"
+    );
+    return;
+  };
+  let scratch = Scratch::new("hg-batch-ssh");
+  let Some((key, public)) = fresh_key(&scratch) else {
+    eprintln!("skipping stock hg's batched pushkey over SSH: no ssh-keygen here");
+    return;
+  };
+  let instance = format!("hg-batch-ssh-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (port, fingerprint) = started
+    .lines
+    .iter()
+    .find_map(|line| ssh_edge_of(line))
+    .expect("the daemon named its SSH edge's port and host key");
+  let Some(issuer) = issuer_of(&started, "stock hg's batched pushkey over SSH") else {
+    return;
+  };
+  let known_hosts = known_hosts(&scratch, port, &fingerprint);
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let config = vec!["--config".to_owned(), ssh_command(&key, &known_hosts)];
+  batch_legs(
+    &hg,
+    &scratch.path,
+    &format!("ssh://{HG_USER}@127.0.0.1:{port}/r"),
+    &config,
+  );
+}
