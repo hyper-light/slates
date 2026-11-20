@@ -1120,15 +1120,15 @@ fn hg_fed(hg: &[String], dir: &str, args: &[&str], input: &str) -> (i32, String,
 /// Stock hg's batched `pushkey` through slates at `url`, `config` its `--config` words: two changesets pushed, bookmark
 /// `batched-bm` made at the first by `hg debugpushkey`, then one `batch` sent by `send` (given the working copy and the
 /// two changesets) moving `batched-bm` from the first changeset to the second by a `pushkey` call among its calls.
-/// Fails the test unless the batch is answered, its answer holding `expected` (given the second changeset), and the
-/// server then lists `batched-bm` at the second changeset.
+/// Fails the test unless the batch's client exits `code`, its outputs holding `expected` (given the second changeset),
+/// and the server then lists `batched-bm` at the second changeset where `moves`, else still at the first.
 #[allow(clippy::disallowed_methods)]
 fn batch_legs(
   hg: &[String],
   scratch: &str,
   (url, config): (&str, &[String]),
   send: impl Fn(&str, &str, &str) -> (i32, String, String),
-  expected: impl Fn(&str) -> String,
+  (code, expected, moves): (i32, impl Fn(&str) -> String, bool),
 ) {
   let local = format!("{scratch}/local");
   hg_ok(hg, scratch, &["init", &local]);
@@ -1154,21 +1154,25 @@ fn batch_legs(
     &local,
     &with_config(&["debugpushkey", url, "bookmarks"], config),
   );
+  let at = if moves { &second } else { &first };
   assert_eq!(
     (
       made.0,
       batched.0,
-      batched.1.contains(&expected(&second)),
-      listed.1.contains(&format!("batched-bm\t{second}"))
+      format!("{}{}", batched.1, batched.2).contains(&expected(&second)),
+      listed.1.contains(&format!("batched-bm\t{at}"))
     ),
-    (0, 0, true, true),
+    (0, code, true, true),
     "debugpushkey: {made:?}; the batch: {batched:?}; the bookmarks after it: {listed:?}"
   );
 }
 
-/// A-758 (a batched `pushkey`, 7.2's `wireprotov1server.batch`, over the HTTP edge: the batch sent by `POST`, its
-/// arguments in the body, `experimental.httppostargs`, as 7.2 serves a batched push command only by `POST`). Do: run
-/// [`batch_legs`] as stock hg 7.2 over `--vcs-http`. Expect the batch answered and the bookmark moved. Skips loudly
+/// A-758 (a batched `pushkey`, 7.2's `wireprotov1server.batch`, over the HTTP edge). 7.2 runs a batched call that pushes
+/// only for a request by `POST` (`checkperm`'s "push requires POST request", `405`), and its client sends a batch by
+/// `POST` only to a server listing `httppostargs`, which a stock server does not by default and slates does not: so a
+/// stock client's batched `pushkey` is refused as a stock server refuses it. Do: send [`batch_legs`]'s batch as stock
+/// hg 7.2 over `--vcs-http`. Expect `HTTP Error 405: Method Not Allowed` and the bookmark where it was (the batch by
+/// `POST` is held by the edge's own test, `a_batched_pushkey_is_landed_over_post_and_refused_over_get`). Skips loudly
 /// without stock hg 7.2 ([`STOCK_HG`]) and where the platform names no issuer surface ([`issuer_of`]).
 #[test]
 fn stock_hg_batches_a_pushkey_over_the_vcs_http_edge() {
@@ -1192,7 +1196,6 @@ fn stock_hg_batches_a_pushkey_over_the_vcs_http_edge() {
     format!("auth.slates.prefix={prefix}"),
     format!("auth.slates.username={HG_USER}"),
     format!("auth.slates.password={token}"),
-    "experimental.httppostargs=true".to_owned(),
   ]
   .into_iter()
   .flat_map(|item| ["--config".to_owned(), item])
@@ -1212,8 +1215,14 @@ fn stock_hg_batches_a_pushkey_over_the_vcs_http_edge() {
       &script,
     )
   };
-  let expected = |_: &str| "sending batch with 3 sub-commands".to_owned();
-  batch_legs(&hg, &scratch.path, (&url, &config), send, expected);
+  let expected = |_: &str| "abort: HTTP Error 405: Method Not Allowed".to_owned();
+  batch_legs(
+    &hg,
+    &scratch.path,
+    (&url, &config),
+    send,
+    (255, expected, false),
+  );
 }
 
 /// A-758 (a batched `pushkey` over `hg serve --stdio`, the SSH edge). Do: a fresh key enrolled for the repository's
@@ -1261,5 +1270,11 @@ fn stock_hg_batches_a_pushkey_over_the_ssh_edge() {
   };
   // The `listkeys` after the `pushkey` lists the move: the calls ran in order.
   let expected = |second: &str| format!("1\n;batched-bm\t{second}");
-  batch_legs(&hg, &scratch.path, (&url, &config), send, expected);
+  batch_legs(
+    &hg,
+    &scratch.path,
+    (&url, &config),
+    send,
+    (0, expected, true),
+  );
 }

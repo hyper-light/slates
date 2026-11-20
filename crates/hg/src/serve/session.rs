@@ -35,7 +35,9 @@
 //! **Stricter than 7.2, on purpose.** A request that cannot be read (a line too long for any command, an argument past
 //! the admission) is answered out of band and ends the session, where 7.2 fails mid-stream. A command's own refusal is
 //! answered out of band and the session goes on, where 7.2's exceptions end the process. A batch call of a command that
-//! does not answer a string is refused (7.2 asserts).
+//! does not answer a string is refused (7.2 asserts). A batch's `pushkey` call is landed by the caller that holds the
+//! push driver ([`Batch`], A-758), the batch answered a call at a time around it; where no such caller answers the batch
+//! ([`dispatch`]), it is refused as not served.
 
 use super::getbundle::{Answering, Asked, Store, getbundle};
 use super::keys;

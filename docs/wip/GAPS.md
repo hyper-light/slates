@@ -1801,7 +1801,13 @@
 > and race checks a part's key meets), answered `1` or `0` with words; a namespace no key is moved in (`obsolete`, any
 > other) is refused by type before anything lands, answered `0` naming it. Red first and green by use with stock 7.2
 > over both edges (`hg_interop`'s `stock_hg_lists_and_moves_keys_over_the_*_edge`) on macOS arm64; other platforms
-> owed. OWED: `pushkey` inside a `batch` is refused as not served (7.2 serves it there).
+> owed. A `pushkey` inside a `batch` (w-interop, 2026-11-20) is landed between its neighbours as a lone one is
+> (`serve::session::Batch`: the calls answered in order, a later `listkeys` reading the move); over HTTP only by `POST`,
+> as 7.2 checks a batched call's `push` permission, so stock hg's batch by `GET` (sent so to any server not listing
+> `httppostargs`, slates included) is refused `405` as a stock server refuses it. Red first by use (`command not served
+> here` over both edges), green: `hg_interop`'s `stock_hg_batches_a_pushkey_over_the_*_edge`, the edge's
+> `a_batched_pushkey_is_landed_over_post_and_refused_over_get`, the session's `a_batched_pushkey_is_landed_between_its_
+> neighbours`.
 
 > **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
 > Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part

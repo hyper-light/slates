@@ -767,3 +767,43 @@ fn streams_take_the_fastest_form_the_client_reads() {
     ]
   );
 }
+
+/// Format: a batch of `heads` and a `pushkey` of bookmark `k`, as `X-HgArgs-Post` carries it (`cmds`, form-encoded).
+const BATCHED_PUSHKEY: &[u8] =
+  b"cmds=heads+%3Bpushkey+namespace%3Dbookmarks%2Ckey%3Dk%2Cold%3D%2Cnew%3D";
+
+/// A-758 (7.2's `wireprotov1server.batch` checks a batched call's `push` permission, which over HTTP needs `POST`). Do:
+/// send the owner's batch of `heads` and a `pushkey` by `POST`, its arguments in the body; then the same batch by `GET`,
+/// its arguments in `X-HgArg-1`. Expect the `POST` answered in `application/mercurial-0.1` with both calls' answers in
+/// order, the null head, then `0` (the tests' lender lands every push with no reply part, so no key is reported
+/// moved), and the `GET` refused `405` once its batch reaches the `pushkey`.
+#[test]
+fn a_batched_pushkey_is_landed_over_post_and_refused_over_get() {
+  let mut site = site(Vec::new());
+  let length = BATCHED_PUSHKEY.len();
+  let posted = exchanged(
+    served(
+      &mut site,
+      "POST",
+      "/hg?cmd=batch",
+      &[
+        &format!("X-HgArgs-Post: {length}"),
+        &format!("Content-Length: {length}"),
+      ],
+    ),
+    BATCHED_PUSHKEY,
+  );
+  let header = format!("X-HgArg-1: {}", String::from_utf8_lossy(BATCHED_PUSHKEY));
+  let mut got = served(&mut site, "GET", "/hg?cmd=batch", &[&header]);
+  let refused = ready(got.body_end(ClientGone::never())).err();
+  assert_eq!(
+    (posted, refused),
+    (
+      (
+        media(hg_wire::MEDIA_TYPE_V1),
+        [EMPTY_HEADS, b";0\n"].concat()
+      ),
+      Some(Failed(Status::METHOD_NOT_ALLOWED))
+    )
+  );
+}
