@@ -145,3 +145,10 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   vcs_store.rs:2402, verbs.rs:955 (cognitive complexity), svn report/drive.rs:72/1734, migration/records.rs:231.
 - NEXT: land part 2; 2b: git tree listing an entry a unit (PushObjects::listing, owned bytes + entry_at); part 3 the
   apply (waiting main's call: green held out across commit turns?).
+- Part 2 LANDED 595f0d8f2 (base 2e521d875; confirmed merge-base). Suites: merge 405, git 568, hg 361, server full
+  1623 (one earlier run: fleet takeover test flaked under load, passed on rerun), server lib 998 on the final base.
+  Fixes on the way: a pending composition ends its turn (re-ask timed overhead as no unit's); A-744 sweep steps now
+  contiguous (preemption between steps made its past_budget 1 under a loaded suite).
+- Route: studio-2 synced runs time out; LAN bundle (http.server on 192.168.1.82) + unsynced fetch works.
+- Slip reported to main: one `git checkout --detach` in my scratch clone on studio-2.
+- NEXT: 2b (tree listing an entry a unit; drafted in ~/slates-work/w-engine-2b), then part 3 (apply).
