@@ -1,3 +1,9 @@
+# STATUS (2026-11-19, Mac Studio instance): QUEUE DONE
+- Landed docs commit 8eeb004bd on main (GAPS + A-589 design entry: the three fleet tests compiled and passed on macOS
+  arm64). amendments.tsv A-589 row updated; run-requests.md has the Linux x86_64 lane line. Pushed over SSH (HTTPS has
+  no credentials on the Studio). No build on the Studio (10 GB free disk). Nothing running. Worktree
+  ~/slates-work/w-fed-a503-move can be deleted.
+
 # RESUME HERE (checkpoint 2026-11-19 ~21:45 PST, main asked every agent to stop and move into kiln)
 - Branch agents/w-fed-a503-move, worktree ~/slates-work/w-fed-a503-move, at origin/main 3fee2f575. It has NO commits
   and NO uncommitted changes, so there is nothing to push.
