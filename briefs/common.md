@@ -97,4 +97,8 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
   Main checks every agent about every five minutes and will unblock you.
 - Disk: before each build check `df -h ~`. Below 25 GB free, delete your OWN landed worktrees, your target's
   `release/` and `incremental/` directories, and datasets you no longer need. Never delete another agent's
-  folders; tell main instead.
+  folders; tell main instead. Delete by exact path only, never a glob over ~/.cache.
+- Spotlight (main 2026-11-20 03:55): Spotlight indexes build output (Studio-4: 1,181 rlibs under ~/.cache, mds at
+  ~66% CPU at load 29 on 14 cores). It skips any folder whose name ends in `.noindex`. Whenever you next create or
+  wipe your cargo target, name it `~/.cache/<your-target>.noindex` (CARGO_TARGET_DIR) and build with
+  CARGO_INCREMENTAL=0. Don't rename a live target mid-run; make the switch at your next wipe.
