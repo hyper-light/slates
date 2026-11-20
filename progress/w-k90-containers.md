@@ -173,3 +173,14 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    (jupiter) proofs from main once its route lands (it will message me). Tests to drive, with CONTAINER_E2E=1 SLATES_E2E=1:
    slates_e2e container::a520_in_a_container_on_its_volume_an_agents_work_is_reviewed_and_landed_by_its_mode and
    container::a520_in_a_container_a_file_changed_on_disk_after_the_agent_changed_it_is_drift_and_no_landing_writes_over_it.
+
+## 2026-11-20 ~12:05 PST: Mac leg through the EXPORT route, run r8 (Adas-MacBook-Pro-2, Docker Desktop 29.3.1)
+- Split agreed with w-k90-a520: it runs adacachy; I run Mac + jupiter.
+- Binaries built here from agents/w-k90-a520 4004e6a91 (+ local fix slates_e2e.rs:1824 workspaces_ready(&f, Engine::BareMetal),
+  reported, NOT committed: its file), served over LAN (this Studio is 192.168.1.88 since the reboot), kiln binary placed at
+  its compile-time path on the MacBook, repo files from a shallow clone at the same path (92ee4dfd).
+- slates_e2e container:: 1 passed 1 failed (393 s): drift drive PASSED; review/landing drive PROVEN up to the end
+  (export nfs volume, change request exact, landing approved, folder byte-exact, HEAD/index unchanged) then FAILED:
+  container + engine volume outlived the session at the check (gone a minute later); drift's Bypass session leaked its
+  engine volume (removed by hand). Reported to w-k90-a520 + main. Re-run when it fixes the end.
+- Docker Desktop on the MacBook: its API answered 500 once; restarted (quit + TERM my leftovers + open); left running.
