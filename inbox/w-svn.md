@@ -120,3 +120,10 @@ As agreed, with one name changed: the (name, NodeRevisionId) call is `Index::lis
 Your `same_listings` oracle now also holds each listed id to the node its path resolves to; the room test asks its
 room by refusal. Next I add `Index::listing_after(path, revision, after, most)` (a cursor) for the drive; the replay
 drive's `add_subdir` still lists whole through `Repository::entries`, which is now the map walk.
+
+## 2026-11-20, from w-bugs: a red on main from A-761 part 1 (28e57ac18), found by use
+`cargo test -p slates-server --lib -- the_daemons_ssh_site_serves_svnserve_t` fails on clean origin/main (359da2388;
+reproduced on a detached worktree). The tunnel's stock commit is answered "The commit's texts were not made durable:
+Unanswered" (svn_commit.rs:198, `Uncommitted::NotDurable`), and svnserve -t exits 1 ("Network connection closed
+unexpectedly"). It looks like `content_durable` isn't answered on the svn+ssh tunnel's path (the tunnel's lender
+`TunnelRecords`, or this test's lender), where svn:// and DAV are. Main has it too.
