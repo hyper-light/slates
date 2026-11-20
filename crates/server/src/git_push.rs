@@ -328,6 +328,11 @@ enum AnswerState {
 }
 
 impl<P> ReceivePack<P> {
+  /// The repository pushed to.
+  pub(crate) fn repository(&self) -> RepositoryId {
+    self.repository
+  }
+
   /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what
   /// reading them builds admitted [`crate::vcs_share::room`], its hooks' views shown by `presenter`; writes the
   /// advertisement to `out` when `advertise`. Refused for a repository not here or not git's, a

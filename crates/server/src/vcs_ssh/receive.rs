@@ -84,6 +84,9 @@ pub(crate) struct ReceiveCommand<S> {
   push: Option<ReceivePack>,
   /// Whether the driver has read the push whole and checked it, so it waits for its answer.
   checked: bool,
+  /// The repository's turn on the shard, kept from an answer's step through the edge's yield after it (A-724,
+  /// `crate::vcs_share::turns`).
+  turn: Option<crate::vcs_share::turns::Turn>,
   /// The client's input held, not yet handed to the driver.
   input: Vec<u8>,
   /// Whether the client's input has ended.
@@ -109,6 +112,7 @@ impl<S: ShardLender> ReceiveCommand<S> {
       version,
       push: None,
       checked: false,
+      turn: None,
       input: Vec::new(),
       input_ended: false,
       out: Vec::new(),
@@ -169,7 +173,17 @@ impl<S: ShardLender> Command for ReceiveCommand<S> {
       return self.start();
     };
     if self.checked {
-      let next = answer_step(&mut self.lender, push, &mut self.out, &self.name, gone).await?;
+      // The turn kept through the edge's yield is given back, then taken again behind the repository's other pushes.
+      drop(self.turn.take());
+      let turn = crate::vcs_share::turns::take(self.repository).await;
+      let (next, kept) = answer_step(
+        &mut self.lender,
+        push,
+        (&mut self.out, &self.name),
+        (gone, turn),
+      )
+      .await?;
+      self.turn = kept;
       return Ok(Stepped { consumed: 0, next });
     }
     if !self.input.is_empty() {
@@ -216,28 +230,29 @@ fn lent<S: ShardLender, R>(
 /// One step of the checked push's answer (the module doc's answer): exited 0 once it is answered whole; another step
 /// after a turn of a hook's view sealed, the edge yielding the shard between its steps; another step after a hook run off
 /// the shard's step, ended once `gone` says the client has gone (as on the HTTP site, A-665 part 4a), and what it
-/// answered handed back.
+/// answered handed back. The repository's `turn` (A-724) comes back to be kept through the edge's yield after a turn;
+/// it is given back before a hook runs off the shard and once the push is answered.
 async fn answer_step<S: ShardLender>(
   lender: &mut S,
   push: &mut ReceivePack,
-  out: &mut Vec<u8>,
-  name: &str,
-  gone: ClientGone<'_>,
-) -> Result<Next, Refused> {
+  (out, name): (&mut Vec<u8>, &str),
+  (gone, turn): (ClientGone<'_>, crate::vcs_share::turns::Turn),
+) -> Result<(Next, Option<crate::vcs_share::turns::Turn>), Refused> {
   // The client's going ends a hook's run alone, and no hook runs off unix.
   #[cfg(not(unix))]
   let _ = gone;
   let answering = lent(lender, |state| push.answer_step(state, &mut *out))?
     .map_err(|failed| refused(failed, name))?;
   match answering {
-    Answering::Answered(_) => Ok(Next::Exited(0)),
-    Answering::Turned => Ok(Next::More),
+    Answering::Answered(_) => Ok((Next::Exited(0), None)),
+    Answering::Turned => Ok((Next::More, Some(turn))),
     #[cfg(unix)]
     Answering::Hook(call) => {
+      drop(turn);
       let answer = call.run(gone.gone()).await;
       lent(lender, |state| push.hook_ran(state, answer, &mut *out))?
         .map_err(|failed| refused(failed, name))?;
-      Ok(Next::More)
+      Ok((Next::More, None))
     }
   }
 }
