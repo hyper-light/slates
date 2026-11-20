@@ -24,9 +24,11 @@
 //! band-3 words, and no flush; with no band, what came before the pack alone. What `pack-objects` writes as it reads
 //! the filter's name and lives on (a warning) is relayed the same way before the pack.
 
+use super::fetch::{Before, Sections};
 use super::{ABORT, PackPlan, PackRefused, PackSource, Refusal, Refused, Served};
-use crate::negotiation::Counters;
-use crate::negotiation::{Answer as NegotiatedAnswer, Filter, Negotiating};
+use crate::negotiation::{
+  Acknowledgments, Answer as NegotiatedAnswer, Counters, Filter, Negotiating, Outcome, ShallowInfo,
+};
 use crate::out::Out;
 use crate::pktline::{self, Packet};
 use crate::sideband::{self, Band, MAX_BAND_DATA};
@@ -156,44 +158,48 @@ pub struct Answer<K> {
   choosing: Option<Box<Choosing>>,
 }
 
-/// A fetch's pack whose objects are still being chosen (A-745, §4.17.1 "A fetch's answer" rule 3): the negotiation's
-/// choice, stepped within the owner's quantum by [`Answer::write_within`], and what the pack's source begins with once it
-/// ends: the request's filter, `thin-pack`, `ofs-delta`, the framing and where the response stands.
+/// A fetch still being negotiated (A-745, §4.17.1 "A fetch's answer" rule 3): the negotiation (`ready`'s search, the
+/// cut, the choice of the pack's objects), stepped within the owner's quantum by [`Answer::write_within`]; what the
+/// sections before the pack are written from until they are decided; and what the pack's source begins with once the
+/// choice ends: the request's filter, `thin-pack`, `ofs-delta`, the framing and where the response stands.
 pub(super) struct Choosing {
-  /// The choice.
+  /// The negotiation.
   negotiating: Negotiating<u64, u64>,
+  /// What the sections before the pack are written from, until they are written.
+  before: Option<Before>,
   /// The request's filter.
   filter: Option<Filter>,
   /// `thin-pack`.
   thin: bool,
   /// `ofs-delta`.
   ofs_delta: bool,
-  /// How the pack's data will be framed.
-  framing: Framing,
+  /// How the pack's data will be framed, once the sections before it are written.
+  framing: Option<Framing>,
   /// How many bytes of the response come before the pack.
   at: u64,
-  /// The most data one packet of the pack carries, sized as the answer is made ([`packet_data`]).
+  /// The most data one packet of the pack carries, sized as the sections are written ([`packet_data`]).
   packet: usize,
 }
 
 impl Choosing {
-  /// The choice `negotiating` makes, and what the pack begins with after it.
+  /// The negotiation `negotiating`, its sections written from `before` once decided, and what the pack begins with
+  /// after it.
   pub(super) fn new(
     negotiating: Negotiating<u64, u64>,
     filter: Option<Filter>,
     thin: bool,
     ofs_delta: bool,
-    framing: Framing,
-    at: u64,
+    before: Before,
   ) -> Choosing {
     Choosing {
       negotiating,
+      before: Some(before),
       filter,
       thin,
       ofs_delta,
-      framing,
-      at,
-      packet: framing.data(),
+      framing: None,
+      at: 0,
+      packet: 0,
     }
   }
 }
@@ -312,25 +318,18 @@ impl<K> Answer<K> {
     })
   }
 
-  /// An answer of `head`, the sections before a pack, then the pack whose objects `choosing` is still choosing: the two
-  /// packet buffers the pack is framed through charged to `admission` now, as [`Answer::streaming`] charges them.
-  pub(super) fn choosing(
-    head: Vec<u8>,
-    choosing: Choosing,
-    admission: &mut Admission,
-  ) -> Result<Answer<K>, Refusal> {
-    let packet = packet_data(choosing.framing, admission.left());
-    admission
-      .charge(to_u64(packet).saturating_add(to_u64(framed_most(packet))))
-      .map_err(Refusal::PastAdmission)?;
-    Ok(Answer {
-      choosing: Some(Box::new(Choosing { packet, ..choosing })),
-      ..Answer::whole(head)
-    })
+  /// An answer still being negotiated (`choosing`): nothing written until its sections are decided.
+  pub(super) fn choosing(choosing: Choosing) -> Answer<K> {
+    Answer {
+      choosing: Some(Box::new(choosing)),
+      ..Answer::whole(Vec::new())
+    }
   }
 
-  /// Steps the choice of the pack's objects within `spent` ([`Answer::write_within`]), the repository lent for the step;
-  /// once it ends, the pack's source begun from the plan it made.
+  /// Steps the negotiation within `spent` ([`Answer::write_within`]), the repository lent for the step: the sections
+  /// before the pack written once they are decided (the acknowledgments alone, and the answer's end, when the server is
+  /// not ready); once the choice ends, the pack's source begun from the plan it made. Refused before its sections, the
+  /// answer is the refusal alone, as a request refused whole is answered.
   fn choose<P: PackSource<Pack = K>>(
     &mut self,
     served: &Served<'_>,
@@ -342,20 +341,61 @@ impl<K> Answer<K> {
       return;
     };
     let graph = StoreGraph::new(served.repository, served.store, served.refs);
-    let stepped = choosing.negotiating.step(&graph, admission, spent);
-    if let Some(fault) = graph.fault() {
-      return self.abandon(Refusal::Store(fault));
-    }
+    let stepped = choosing
+      .negotiating
+      .step(&graph, admission, spent)
+      .map_err(Refusal::Negotiation);
+    let stepped = match graph.fault() {
+      Some(fault) => Err(Refusal::Store(fault)),
+      None => stepped,
+    };
+    let undecided = choosing.before.is_some();
     let outcome = match stepped {
-      Err(refusal) => return self.abandon(Refusal::Negotiation(refusal)),
-      Ok(None) => return,
-      Ok(Some(outcome)) => outcome,
+      Err(refusal) if undecided => return self.refuse_before(refusal),
+      Err(refusal) => return self.abandon(refusal),
+      Ok(outcome) => outcome,
+    };
+    if undecided {
+      let sections = match &outcome {
+        Some(Outcome {
+          answer: NegotiatedAnswer::Acknowledgments(acknowledgments),
+          counters,
+        }) => return self.acknowledged(acknowledgments, *counters, admission),
+        Some(Outcome {
+          answer: NegotiatedAnswer::Pack(pack),
+          ..
+        }) => Some((pack.acknowledgments.clone(), pack.shallow_info.clone())),
+        Some(Outcome {
+          answer: NegotiatedAnswer::Nothing,
+          counters,
+        }) => {
+          self.choosing = None;
+          self.counters = Some(*counters);
+          return;
+        }
+        None => choosing
+          .negotiating
+          .sections()
+          .map(|(acknowledgments, shallow)| (acknowledgments.cloned(), shallow.cloned())),
+      };
+      let Some((acknowledgments, shallow)) = sections else {
+        return;
+      };
+      if !self.decide((acknowledgments.as_ref(), shallow.as_ref()), admission) {
+        return;
+      }
+    }
+    let Some(outcome) = outcome else {
+      return;
     };
     self.counters = Some(outcome.counters);
     let Some(choosing) = self.choosing.take() else {
       return;
     };
     let NegotiatedAnswer::Pack(pack) = outcome.answer else {
+      return;
+    };
+    let Some(framing) = choosing.framing else {
       return;
     };
     let plan = PackPlan {
@@ -369,7 +409,7 @@ impl<K> Answer<K> {
       Ok(source) => {
         self.pack = Some(Streaming {
           source,
-          framing: choosing.framing,
+          framing,
           at: choosing.at,
           data: Vec::with_capacity(choosing.packet),
           packet: choosing.packet,
@@ -385,12 +425,101 @@ impl<K> Answer<K> {
     }
   }
 
+  /// Writes the sections before the pack, decided: the head the pack follows, its framing and the two packet buffers it
+  /// is framed through charged to `admission`, as [`Answer::streaming`] charges them; or the answer `pack-objects`
+  /// dying gives. Whether the pack is still to come.
+  fn decide(
+    &mut self,
+    sections: (Option<&Acknowledgments>, Option<&ShallowInfo>),
+    admission: &mut Admission,
+  ) -> bool {
+    let Some(before) = self
+      .choosing
+      .as_mut()
+      .and_then(|choosing| choosing.before.take())
+    else {
+      return false;
+    };
+    let multiplexed = before.multiplexed;
+    let counters = self
+      .choosing
+      .as_ref()
+      .map(|choosing| choosing.negotiating.counters());
+    let written = before
+      .write(sections, admission)
+      .and_then(|written| match written {
+        Sections::Died(answer) => Ok(Err(answer)),
+        Sections::Pack(head, framing, at) => {
+          let packet = packet_data(framing, admission.left());
+          admission
+            .charge(to_u64(packet).saturating_add(to_u64(framed_most(packet))))
+            .map_err(Refusal::PastAdmission)?;
+          Ok(Ok((head, framing, at, packet)))
+        }
+      });
+    match written {
+      Err(refusal) => {
+        *self = Answer::refused(Refused {
+          refusal,
+          multiplexed,
+        });
+        false
+      }
+      Ok(Err(died)) => {
+        *self = match counters {
+          Some(counters) => died.counted(counters),
+          None => died,
+        };
+        false
+      }
+      Ok(Ok((head, framing, at, packet))) => {
+        self.head = head;
+        if let Some(choosing) = self.choosing.as_mut() {
+          choosing.framing = Some(framing);
+          choosing.at = at;
+          choosing.packet = packet;
+        }
+        true
+      }
+    }
+  }
+
+  /// The acknowledgments alone, the server not ready: the whole answer.
+  fn acknowledged(
+    &mut self,
+    acknowledgments: &Acknowledgments,
+    counters: Counters,
+    admission: &mut Admission,
+  ) {
+    let Some(before) = self.choosing.take().and_then(|choosing| choosing.before) else {
+      return;
+    };
+    match before.acknowledged(acknowledgments, admission) {
+      Ok(head) => *self = Answer::whole(head).counted(counters),
+      Err(refusal) => self.refuse_before(refusal),
+    }
+  }
+
+  /// The answer to a negotiation refused before its sections: the refusal alone, as [`Answer::refused`] answers one
+  /// refused whole.
+  fn refuse_before(&mut self, refusal: Refusal) {
+    let multiplexed = self
+      .choosing
+      .as_ref()
+      .and_then(|choosing| choosing.before.as_ref())
+      .is_some_and(|before| before.multiplexed);
+    *self = Answer::refused(Refused {
+      refusal,
+      multiplexed,
+    });
+  }
+
   /// Ends the response of a pack whose choice was refused, or whose source could not begin, after the sections before
   /// it: git's band-3 words where the framing has a band to say them on, else nothing, so the pack is missing; refused
   /// with `refusal`. Their packet is within what [`Answer::choosing`] charged.
   fn abandon(&mut self, refusal: Refusal) {
     if let Some(choosing) = self.choosing.take()
-      && choosing.framing.is_banded()
+      && choosing.framing.is_some_and(Framing::is_banded)
     {
       sideband::write(Band::Error, ABORT, &mut self.head);
     }

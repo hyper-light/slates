@@ -35,11 +35,13 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use super::{
-  Call, DriveFailure, Owned, OwnedFacts, property_changes, property_list, read_window, window_of,
+  Call, Delta, DriveFailure, Owned, OwnedFacts, WindowWork, property_changes, property_list,
+  window_unit,
 };
 use crate::authz::{PrincipalRules, may_read};
 use crate::index::{Action, ChangedPath, Index, NodeKind, Revision, Text};
 use crate::reads::Repository;
+use crate::svndiff::{Compression, Version};
 
 /// The path separator.
 const SEPARATOR: char = '/';
@@ -54,8 +56,8 @@ struct Copy {
   source: Option<(String, Revision)>,
 }
 
-/// A text being sent: its target, its delta source, and how much of the target is sent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A text being sent: its target, its delta source, how much of the target is sent, and the window in the making.
+#[derive(Clone, Debug)]
 struct Sending {
   /// The text in the revision.
   target: Text,
@@ -63,6 +65,10 @@ struct Sending {
   source: Option<Text>,
   /// The target's bytes sent.
   sent: u64,
+  /// The window in the making, between its steps (A-751).
+  window: Option<Box<WindowWork>>,
+  /// Whether the delta's svndiff header is sent: with its first window's first write.
+  header_sent: bool,
 }
 
 /// A directory being added whole (`add_subdir`): where it is added, where its entries are read, and its entries left.
@@ -77,7 +83,7 @@ struct Whole {
 }
 
 /// One revision's replay (module documentation).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Replay {
   /// The revision.
   revision: Revision,
@@ -107,6 +113,19 @@ pub struct Replay {
   pending: VecDeque<Owned>,
   /// The call given last.
   given: Option<Owned>,
+  /// The svndiff version and compression its deltas are encoded in (A-751).
+  encoding: (Version, Compression),
+}
+
+/// What [`Replay::next_within`] made.
+#[derive(Debug)]
+pub enum Stepped<'a> {
+  /// The replay's next call.
+  Call(Call<'a>),
+  /// The steps given were taken and no call is ready yet: ask again.
+  Paused,
+  /// The replay has made its last call.
+  Ended,
 }
 
 impl Replay {
@@ -128,7 +147,47 @@ impl Replay {
       sending: None,
       pending: VecDeque::new(),
       given: None,
+      encoding: (Version::Zero, Compression::Stored),
     }
+  }
+
+  /// The replay with its deltas encoded in `version` with `compression`, as its consumer negotiated (version 0,
+  /// stored, unless set).
+  pub fn with_encoding(mut self, version: Version, compression: Compression) -> Self {
+    self.encoding = (version, compression);
+    self
+  }
+
+  /// The replay's next call made within `steps` steps, at least one (A-751): [`Stepped::Paused`] when they are taken
+  /// first, so a caller holds its turn to its time; [`Stepped::Ended`] after the last call.
+  ///
+  /// # Errors
+  /// [`Replay::next`]'s.
+  pub fn next_within<R: Repository + ?Sized>(
+    &mut self,
+    (index, repository): (&Index, &R),
+    rules: Option<&PrincipalRules>,
+    steps: usize,
+  ) -> Result<Stepped<'_>, DriveFailure> {
+    let mut left = steps.max(1);
+    while self.pending.is_empty() {
+      let Some(rest) = left.checked_sub(1) else {
+        self.given = None;
+        return Ok(Stepped::Paused);
+      };
+      left = rest;
+      if !self.step(index, repository, rules)? {
+        self.given = None;
+        return Ok(Stepped::Ended);
+      }
+    }
+    self.given = self.pending.pop_front();
+    Ok(
+      self
+        .given
+        .as_ref()
+        .map_or(Stepped::Ended, |given| Stepped::Call(given.lent())),
+    )
   }
 
   /// The replay's next call; none at its end.
@@ -394,6 +453,8 @@ impl Replay {
           target: text,
           source: base,
           sent: 0,
+          window: None,
+          header_sent: false,
         });
         return Ok(());
       }
@@ -403,7 +464,8 @@ impl Replay {
     Ok(())
   }
 
-  /// The delta's next window, `txdelta_next_window`'s (the update drive's), or its end and the file's close.
+  /// One step of the delta's next window, `txdelta_next_window`'s, made and sent a step at a time as the update drive's
+  /// are (`super::window_unit`, A-751), or its end and the file's close.
   fn window<R: Repository + ?Sized>(&mut self, repository: &R) -> Result<(), DriveFailure> {
     let Some(mut sending) = self.sending.take() else {
       return Ok(());
@@ -413,18 +475,19 @@ impl Replay {
       self.pending.push_back(Owned::CloseFile(sending.target.md5));
       return Ok(());
     }
-    let target = read_window(repository, &sending.target, sending.sent)?;
-    let source_size = sending.source.map_or(0, |source| source.size);
-    let view = sending.sent.min(source_size);
-    let source = match sending.source {
-      Some(source) if view < source.size => read_window(repository, &source, view)?,
-      _ => Vec::new(),
+    let delta = Delta {
+      text: sending.target,
+      source: sending.source,
+      sent: &mut sending.sent,
+      header_sent: &mut sending.header_sent,
     };
-    let mut window = window_of(&source, &target)?;
-    window.source_offset = view;
-    let length = u64::try_from(target.len()).map_err(|_| DriveFailure::corrupt())?;
-    sending.sent = sending.sent.saturating_add(length);
-    self.pending.push_back(Owned::Window(window));
+    let pending = &mut self.pending;
+    window_unit(
+      &mut sending.window,
+      delta,
+      (self.encoding, repository),
+      &mut |write, at, piece| pending.push_back(Owned::DeltaPiece(write, at, piece)),
+    )?;
     self.sending = Some(sending);
     Ok(())
   }
@@ -525,6 +588,8 @@ impl Replay {
       target: text,
       source: None,
       sent: 0,
+      window: None,
+      header_sent: false,
     });
     Ok(())
   }

@@ -630,7 +630,7 @@ fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile
       .expect("the request's step lent");
       let mut out = Vec::new();
       for step in 0..STEPS {
-        let mut write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
+        let write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
           answer.write_within(
             served,
             packs,
