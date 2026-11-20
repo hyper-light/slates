@@ -19,7 +19,8 @@
 //! placeholder, `ChunkStore::empty`, that allocates nothing) and swaps it back when the step ends, by a guard's drop
 //! (`super::Lent`). Swapping moves the store's handles, never its chunks. A lend inside a lend takes nothing, so only
 //! the outer one hands back. Outside a lend a window read answers none and a put is refused `ContentRefused::Storage`,
-//! both typed; a release outside one frees its chunk at the next lend. Every reader keeps `&ContentStore`; nothing ripples into git, Mercurial or Subversion.
+//! both typed; a release outside one frees its chunk at the next lend. A read inside a lend borrows a chunk in the clear
+//! in place (`ChunkStore::chunk_bytes_lent`), nothing copied or allocated; only a sealed chunk is opened into a buffer. Every reader keeps `&ContentStore`; nothing ripples into git, Mercurial or Subversion.
 //!
 //! **Room.** A put takes a block from the shard's arena. What the content store may hold is bounded by its own budget,
 //! which its owner sets from the shard's admittable bytes before each step (`super::lend`): what the arena holds free and
@@ -394,6 +395,11 @@ impl WindowStorage for ChunkWindows {
     };
     if !self.lent {
       return None;
+    }
+    // A chunk in the clear is lent in place (Ada's ruling: a read allocates nothing); a sealed one is opened into a
+    // buffer, the one copy its cipher needs (A-99).
+    if let Some(bytes) = self.chunks.chunk_bytes_lent(&placed.extent) {
+      return Some(Cow::Borrowed(bytes));
     }
     let mut bytes = vec![0; usize::try_from(placed.extent.len).ok()?];
     self

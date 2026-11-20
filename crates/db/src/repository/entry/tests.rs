@@ -646,9 +646,18 @@ fn a_pushs_objects_are_kept_in_order_carried_by_a_snapshot_and_never_charged_to_
     pushed.objects = vec![byte; 50];
     advance(&mut partition, pushed).unwrap();
   }
-  let atomic = partition.repositories().atomic_at(a, 1).expect("the push is one atomic record");
+  let atomic = partition
+    .repositories()
+    .atomic_at(a, 1)
+    .expect("the push is one atomic record");
   assert!(
-    atomic.spans.iter().any(|span| matches!(span.log, LogName::State { log: StateLog::Names, .. })),
+    atomic.spans.iter().any(|span| matches!(
+      span.log,
+      LogName::State {
+        log: StateLog::Names,
+        ..
+      }
+    )),
     "{atomic:?}"
   );
   let kept: Vec<Vec<u8>> = partition

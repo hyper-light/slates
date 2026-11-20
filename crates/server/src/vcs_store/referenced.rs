@@ -11,7 +11,7 @@
 
 use std::borrow::Cow;
 
-use slates_vcs::{ContentId, ContentStore, Form};
+use slates_vcs::{ContentId, ContentStore};
 use slates_vfs::VfsError;
 use slates_vfs::referenced::{Identity, ReferencedContent, ReferencedHolds};
 
@@ -22,52 +22,14 @@ pub(crate) struct Lent<'s>(pub(crate) &'s ContentStore);
 pub(crate) struct Holding<'s>(pub(crate) &'s mut ContentStore);
 
 impl ReferencedContent for Lent<'_> {
+  /// The run of `id` from `offset` the content store lends (`ContentStore::run_at`: its window holding `offset`, the
+  /// object's length checked as the store can; a chunk in the clear lent in place, nothing copied).
   fn run_at(&self, id: &Identity, len: u64, offset: u64) -> Result<Cow<'_, [u8]>, VfsError> {
-    let store = self.0;
-    let identity = ContentId(*id);
-    // `len` is the object's whole length, as its row records it: the store keeps no object's length, and the tree a
-    // window is found down is cut from it (`ContentStore::window_at`).
-    if offset >= len {
-      return Err(VfsError::ReferenceUnresolved);
-    }
-    // What the store can check of that length, it does: an object of one window is that window, its length the
-    // window's; a longer one is a tree, its length past one window. A length the record got wrong would find another
-    // tree's windows, so it is refused, never read.
-    let window = u64::try_from(store.window()).map_err(|_| VfsError::ReferenceUnresolved)?;
-    let fits = match store.form(&identity) {
-      Some(Form::Window) => store.len_of(&identity) == Some(len),
-      Some(Form::List) => len > window,
-      Some(Form::Table | Form::Derived) | None => false,
-    };
-    if !fits {
-      return Err(VfsError::ReferenceUnresolved);
-    }
-    let index = offset
-      .checked_div(window)
-      .ok_or(VfsError::ReferenceUnresolved)?;
-    let start = index.saturating_mul(window);
-    let bytes = store
-      .window_at(&identity, len, index)
-      .ok_or(VfsError::ReferenceUnresolved)?;
-    let from =
-      usize::try_from(offset.saturating_sub(start)).map_err(|_| VfsError::ReferenceUnresolved)?;
-    let to = usize::try_from(len.saturating_sub(start))
-      .unwrap_or(usize::MAX)
-      .min(bytes.len());
-    if from >= to {
-      return Err(VfsError::ReferenceUnresolved);
-    }
-    Ok(match bytes {
-      Cow::Borrowed(bytes) => {
-        Cow::Borrowed(bytes.get(from..to).ok_or(VfsError::ReferenceUnresolved)?)
-      }
-      Cow::Owned(bytes) => Cow::Owned(
-        bytes
-          .get(from..to)
-          .ok_or(VfsError::ReferenceUnresolved)?
-          .to_vec(),
-      ),
-    })
+    self
+      .0
+      .run_at(&ContentId(*id), len, offset)
+      .filter(|run| !run.is_empty())
+      .ok_or(VfsError::ReferenceUnresolved)
   }
 }
 
