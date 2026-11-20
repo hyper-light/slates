@@ -261,3 +261,29 @@ fn a_stale_fork_is_re_based_by_node_onto_the_index_as_it_is_now() {
   }
   assert_eq!(store.len(), 0, "a hold was kept");
 }
+
+/// A-732 (found by use, w-interop: a 57,035-revision push over HTTP spun its shard past the watchdog's window at its
+/// landing, its record written whole there). Do: take stock 7.2's bundle through the intake, then write its record a
+/// step at a time with `record::Writer::begin_kept`. Expect at least one step per revision kept, and the record the one
+/// `write_kept` writes whole, byte for byte.
+#[test]
+fn a_pushs_record_is_written_a_revision_a_step() {
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  let mut writer = crate::import::record::Writer::begin_kept(&intaken.logs, 1 << 20).unwrap();
+  let mut steps = 1_u64;
+  while writer.step(&fork, &store).unwrap() {
+    steps += 1;
+  }
+  let whole = crate::import::record::write_kept(&fork, &store, &intaken.logs, 1 << 20).unwrap();
+  assert_eq!(writer.finish(), Some(whole));
+  assert!(
+    steps > intaken.kept,
+    "{steps} steps for {} revisions",
+    intaken.kept
+  );
+  fork.release(&mut store).unwrap();
+  index.release(&mut store).unwrap();
+}
