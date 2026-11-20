@@ -73,8 +73,9 @@ fn retained_bytes(entry_wire_bytes: usize) -> usize {
 /// Shape: the volume's number on its owner.
 const VOLUME: u64 = 7;
 
-/// The allocator calls the owner makes folding one reply of a holder that still lacks `backlog` entries after it.
-fn lagging_reply_allocations(backlog: usize) -> usize {
+/// The allocator calls the owner makes folding one reply of a holder that still lacks `backlog` entries after it, and
+/// asking whether its retained tail reaches that holder (`Shipper::retains_after`, which each write's sends ask).
+fn lagging_reply_allocations(backlog: usize) -> (usize, usize) {
   let (owner, healthy, lagging) = (HostId(1), HostId(2), HostId(3));
   // One delta is admitted with no credit while none is in flight: it measures an entry's wire size for the bounds.
   let mut shipper = Shipper::new(
@@ -102,17 +103,24 @@ fn lagging_reply_allocations(backlog: usize) -> usize {
     Some(heads[1]),
     "the reply was folded"
   );
-  folded
+  let (asked, retained) = counted(|| shipper.retains_after(heads[1].position));
+  assert!(retained, "the backlog lies inside the retained tail");
+  (folded, asked)
 }
 
-/// A-200: do fold one reply of a holder 16 entries behind and one 1,024 behind. Expect the same allocator calls for
-/// both. Before, each reply cloned every entry the holder lacked (21 calls at 16 behind, 1,035 at 1,024).
+/// A-200: do fold one reply of a holder 16 entries behind and one 1,024 behind, and ask each time whether the retained
+/// tail reaches it. Expect the same allocator calls for both at either backlog. Before, each reply cloned every entry the
+/// holder lacked (21 calls at 16 behind, 1,035 at 1,024), and `retains_after` cloned them again on every write's sends.
 #[test]
 fn a_lagging_holders_reply_costs_its_owner_the_same_whatever_it_lacks() {
-  let small = lagging_reply_allocations(SMALL);
-  let large = lagging_reply_allocations(LARGE);
+  let (small_fold, small_ask) = lagging_reply_allocations(SMALL);
+  let (large_fold, large_ask) = lagging_reply_allocations(LARGE);
   assert_eq!(
-    small, large,
-    "folding one reply allocated {small} times {SMALL} entries behind and {large} times {LARGE} behind"
+    small_fold, large_fold,
+    "folding one reply allocated {small_fold} times {SMALL} entries behind and {large_fold} times {LARGE} behind"
+  );
+  assert_eq!(
+    small_ask, large_ask,
+    "asking whether the tail reaches the holder allocated {small_ask} times {SMALL} behind and {large_ask} times {LARGE} behind"
   );
 }
