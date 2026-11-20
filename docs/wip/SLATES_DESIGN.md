@@ -15868,7 +15868,23 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > out the post-hook, `locks_finished` ends it), so the connection task runs each hook between them. Held to the
 > listener's tests: a refusing pre-lock answered in `svnserve`'s words with no lock held; pre-lock's arguments and
 > token, post-lock's arguments, standard input and failure after `done`; pre- and post-unlock's arguments and standard
-> input. Owed: `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
+> input. **Part 3:** the `svn+ssh://` tunnel (`svnserve -t`) runs them the same way through the same runner, the
+> repository's policy its record's; no signal of the client gone reaches the SSH edge yet, so a run there ends at its
+> learned bound or by itself.
+>
+> **Status (2026-11-20, A-733: the DAV site runs the hooks).** Built: svn over http(s) runs them where `mod_dav_svn`
+> runs them, through A-730's runner (`HookSite::Http`, the exchange's `ClientGone` and its repository's policy):
+> start-commit as the POST makes the transaction (REPOS, the user, `mergeinfo`, which every stock client announces in its
+> `DAV` header, and the transaction), pre-commit at the MERGE before the verdict (REPOS, the transaction, the presented
+> lock tokens by repository path) and post-commit once the revision stands, its failure the MERGE response's
+> `S:post-commit-err` (`merge.c`); pre-lock before a LOCK is judged (its refusal the LOCK's, "Failed to create new
+> lock.", its standard output the lock's token) and post-lock after it, pre-unlock and post-unlock around an UNLOCK, a
+> post-hook's failure logged and counted, never told (`lock.c`: the lock stands and its answer with it). The svn crate's
+> DAV commit stops at its hooks (`DavCommit::begin_hooked` and `resume_begin`, `merge_hooked` and `resume_merge`), so
+> the exchange runs each between two lends. Held to the daemon edge's tests over HTTPS: a refusing start-commit answers
+> the POST in `svnserve`'s words; a DAV commit's start- and pre-commit given their arguments and post-commit's failure in
+> `S:post-commit-err`; a refusing pre-lock answers the LOCK. Owed: the revprop hooks' calls (A-702 part 2, w-svn), the
+> SSH edge's client-gone signal, REPOS as A-645's FSFS-layout view.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -55004,3 +55020,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
   restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
   (main's).
+
+### A-733 — The DAV site runs a repository's hooks (2026-11-20, w-reaper, UI goal 93; §4.17.4 items 5 "HTTP" and 9; A-730, A-681, A-627, A-661)
+
+- **What was there.** After A-730, svn:// and svn+ssh:// ran a repository's hooks, but the DAV site refused a commit
+  at a configured start-commit or pre-commit ("This server does not run this repository's hooks yet"), never ran
+  post-commit, and ignored the lock hooks.
+- **Change.** `slates_svn::dav::commit::DavCommit` stops at its hooks: `begin_hooked` (the transaction begun as far as
+  start-commit, its due handed back) and `resume_begin`; `merge_hooked` (as far as pre-commit) and `resume_merge`;
+  `begin` and `merge` with a hooks closure are wrappers over them. `pending_base` and `pending_tokens` give a hook its
+  transaction's base and its presented tokens by repository path. The server's `SvnStores::begin_commit` hands back
+  start-commit's due with the transaction's name; `SvnExchange`'s POST, MERGE, LOCK and UNLOCK are async steps of its
+  `body_end`, each running its hooks through `vcs_svn::run_hook` with `HookSite::Http` (the exchange's `ClientGone`, the
+  repository's policy, which the exchange keeps). pre-lock and pre-unlock run once the request reads as a lock or an
+  unlock, before the table judges it (a read-only lend plans it first); a post-hook's failure is counted
+  (`vcs_http.svn_post_lock_failed`, `_post_unlock_failed`) and never told, as `mod_dav_svn` logs it.
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_dav_posts_start_commit_hook_that_refuses_refuses_the_
+  transaction_in_svnserves_words`, `a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them`,
+  `a_dav_lock_runs_pre_lock_and_its_refusal_answers_the_lock` (a daemon's HTTPS edge, shell-script hooks through
+  `SetRepositoryPolicy`; red before: the not-run refusal, or the hook ignored); `vcs_http::svn`, `vcs_svn::`,
+  `vcs_ssh::` and the svn crate's `dav::` and `commit::` unchanged; stock svn 1.15's HTTP round trip, locks, blame and
+  diff on the Mac Studio. macOS arm64.
+- **Applied in the same change to** §4.17.4 item 9's status, GAPS (A-730's line), amendments.tsv.
+- **Departure, stated.** start-commit's capabilities are `mergeinfo`, which every stock client announces in its
+  requests' `DAV` header, rather than read from the request.
+- **Owed.** The revprop hooks' calls with A-702 part 2 (w-svn). REPOS as A-645's read-only view (next).

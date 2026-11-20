@@ -1367,6 +1367,11 @@ pub(crate) enum HookSite<'a> {
   Listener(&'a TcpStream),
   /// The tunnel's repository policy.
   Tunnel(&'a slates_db::catalog::RepositoryPolicy),
+  /// The DAV site's exchange (A-733): its client's hang-up and its repository's policy.
+  Http(
+    crate::vcs_http::ClientGone<'a>,
+    &'a slates_db::catalog::RepositoryPolicy,
+  ),
 }
 
 /// Runs the hook `repository`'s policy configures at `point` with the input `input` builds from the policy's hooks-env
@@ -1400,17 +1405,22 @@ pub(crate) async fn run_hook(
           token: None,
         };
       };
-      run_svn_hook(&policy, repository, words_cap, point, input, Some(stream)).await
+      let gone = crate::vcs_http::ClientGone::watching(stream).gone();
+      run_svn_hook(&policy, repository, words_cap, point, input, gone).await
     }
     HookSite::Tunnel(policy) => {
-      run_svn_hook(policy, repository, words_cap, point, input, None).await
+      let gone = core::future::pending::<()>();
+      run_svn_hook(policy, repository, words_cap, point, input, gone).await
+    }
+    HookSite::Http(client, policy) => {
+      run_svn_hook(policy, repository, words_cap, point, input, client.gone()).await
     }
   }
 }
 
 /// Runs the hook `policy` configures at `point` (`crate::svn_hooks::run`, the hook driver of A-622 with A-623's
-/// Subversion rules), held to the bound its runs taught this shard and ended if the client hangs up where `stream` names
-/// its connection, then teaches the shard what this run showed. A point with no hook answers at once, running nothing,
+/// Subversion rules), held to the bound its runs taught this shard and ended when `gone` answers (its client hung up),
+/// then teaches the shard what this run showed. A point with no hook answers at once, running nothing,
 /// as `svnserve` does.
 #[cfg(unix)]
 async fn run_svn_hook(
@@ -1419,7 +1429,7 @@ async fn run_svn_hook(
   words_cap: usize,
   point: HookPoint,
   input: impl FnOnce(&vcs_hooks::SvnHooksEnv, &str) -> vcs_hooks::HookInput,
-  stream: Option<&TcpStream>,
+  gone: impl core::future::Future<Output = ()>,
 ) -> HookAnswer {
   use crate::svn_hooks::{SvnHookSite, configured, run};
   let bound_ns = crate::state::with_state(|state| {
@@ -1432,12 +1442,6 @@ async fn run_svn_hook(
     policy,
     view_root: std::path::Path::new(HOOK_DIRECTORY),
     words_cap,
-  };
-  let gone = async {
-    match stream {
-      Some(stream) => crate::vcs_http::ClientGone::watching(stream).gone().await,
-      None => core::future::pending::<()>().await,
-    }
   };
   let ran = run(&site, &input, bound_ns, gone).await;
   if let (Some(lesson), Some(hook)) = (ran.lesson, configured(policy, point)) {
@@ -1465,7 +1469,7 @@ async fn run_svn_hook(
   _words_cap: usize,
   point: HookPoint,
   _input: impl FnOnce(&vcs_hooks::SvnHooksEnv, &str) -> vcs_hooks::HookInput,
-  _stream: Option<&TcpStream>,
+  _gone: impl core::future::Future<Output = ()>,
 ) -> HookAnswer {
   let configured = policy
     .hooks
@@ -1949,4 +1953,4 @@ async fn read_more(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

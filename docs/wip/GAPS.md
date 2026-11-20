@@ -766,6 +766,11 @@
 > (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). Owed: the tunnel's signal of its client
 > gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); the revprop hooks'
 > calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
+> **A-733 (2026-11-20, w-reaper):** svn over http(s) runs the hooks too, where `mod_dav_svn` runs them, through A-730's
+> runner (`HookSite::Http`): start-commit at the POST, pre-commit at the MERGE, post-commit's failure in the MERGE's
+> `S:post-commit-err`, pre-lock/post-lock around a LOCK (pre-lock's token the lock's), pre-unlock/post-unlock around an
+> UNLOCK, a post-hook's failure logged, never told (`lock.c`). DAV's commit and lock hooks closed; owed still: the
+> revprop hooks' calls (A-702 part 2), the SSH edge's client-gone signal, REPOS as A-645's view (w-reaper, next).
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
