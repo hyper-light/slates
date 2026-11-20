@@ -75,3 +75,8 @@
   it needs can be received only by slates' single receive worker (A-198), which is the one sending -> deadlock.
   Run 6 (diag-w-bugs-b3-6, worktree ~/slates-work/w-bugs-b3s, branch agents/w-bugs-b3-stacks = diag only): user-mode
   stacks of every slates.exe/fsx.exe thread (cdb -pv) at 90/180/270 s into the wedge.
+- WinFsp v2.1 source confirms the path: volume.c 1089-1102 completes each answered IRP on the sender's thread;
+  fileinfo.c 1407 (SetInformation EndOfFile completion) -> FspFileNodeSetFileInfo -> file.c 1852 FspCcSetFileSizes.
+  settle.rs is strictly serial over one journal (save, send, ack, then next receive), so a blocked send stops the drive.
+- Run 6 (b3-6): stacks taken too early (mount not up; no slates-winfsp-receive thread yet), no slates symbols.
+  Run 7 (diag-w-bugs-b3-7, f59ff7698): waits for fsx.exe + 60 s, slates PDB from target/debug.
