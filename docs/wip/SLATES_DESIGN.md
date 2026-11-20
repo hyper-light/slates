@@ -56580,3 +56580,19 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
+
+### A-756 — A volume made on a node by materialization is found there by its name: it claims its name's alias (bug, 2026-11-20, w-fed-move, kiln goal 91; found by use: kiln's live move of an agent's captured clone, its mount refused `NOENT` on the new owner in four runs of five; §4.8 "Lookup", §4.10 "Ownership follows the writer"; A-236, A-291)
+- **Why.** A clone named for another partition than its origin's lives beside its origin and is found by name only
+  through the alias its name's partition holds (A-236). A planned move releases the old owner's alias with its copy
+  (`moves::release`), and the new owner materializes the volume in the partition its id names (`fleet::make_taken`)
+  without one, so a `MNT` of the name, routed to the name's partition (`nfs::routed`), found nothing there unless the
+  name happened to hash to the clone's partition. A takeover's successor had the same gap.
+- **Change.** `verbs::claim_name_alias`: once `make_taken` has made a volume, where its name hashes to another
+  partition, the name's shard reserves and confirms the alias for it (the clone's own two steps, `Op::NameAliasReserved`
+  then `Op::NameAliasConfirmed`): nothing when it already names the volume confirmed, refused when the name or its
+  alias is another volume's; a claim not taken is counted `names.alias_step_untaken` and left to recovery's
+  reconciliation, as an alias step is.
+- **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
+  a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
+  captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
+  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.
