@@ -53,3 +53,15 @@
 - PAUSED for main's TOP PRIORITY: hg push of Mercurial's own repo (57k changesets, 84 MiB) -> 413 (unbundle body past
   the request's room, vcs_http/hg.rs). Fix as A-704 did for git, sliced; failing tests first; proof w-perf's
   crates/cli/bench/hg_scale.sh (branch agents/w-perf-p2); tell w-perf (slates-work-89) when landed.
+- A-711 (hg push room = shard's admittable, HTTP+SSH; past it pusherr) LANDED main bc2803d66 (worktree
+  ~/slates-work/w-hg-a711). Local 24/24 incl. new daemon_edge large push test (red 413 first). Told w-perf to rerun
+  hg_scale.sh. A-712 claimed for stream part 2 (commit ed54ff9b1 on agents/g083-hg-stream-p1; the A-711 commit there
+  too, cherry-picked to main -- re-merge before landing).
+- NOW: import room (ImportRefused PastRoom{278528} on Mercurial's repo; hg_import::room_of = one region, reserved as
+  retention at begin). Derive per repository, sliced (the import is already turn-sliced).
+- 2026-11-20: w-perf rerun of A-711: 413 gone; 57k push trips watchdog (1152 ms). Measured hg repo manifests: 57,007
+  revs, 9.4 MB deltas, 5.5 GB full texts -> slates' full-text storage (index content, push Verified, SHGR records) is
+  the blocker. Sent main a 4-piece proposal (delta storage, delta records, sliced intake, per-repo import room);
+  awaiting word; starting (4)/(3) meanwhile. One-off import least-room measurement running (bg task byk42vq42).
+- A-712 stream part 2 (`stream_out`, streamreqs) LANDED main 7405f9508 (piece f78ff53f0; worktree ~/slates-work/w-hg-a712).
+  Local hg serve:: import 96/96. Owed: stock `hg clone --stream` over the edge (part 3 with stream2).

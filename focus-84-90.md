@@ -863,3 +863,30 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   Kept running: w-forming, w-bugs (Studio-4 2768d0d5, 10 GB disk free there). w-fed-a503 done (idle). A queued
   w-fed-a583 on Studio-2 (link down) may start later -> stop it.
 - green_chains import fix landed f37a96515 (main 9ea6e1311, w-svn): Subversion landings (import, svn://, tunnel via svn_commit::land) checkpoint their green by the doubling rule, Doubling::Now at the cap; red first. w-perf asked to rerun svn_scale.sh (import, RSS, commit, timings).
+- ~22:15 PST ADA: "make sure each agent knows to merge to main then push to origin/main once complete" -> common.md section
+  "EVERY PIECE ENDS ON origin/main" (fetch, merge, push HEAD:main, verify with merge-base --is-ancestor, never leave done
+  work on a branch); sent to all 16 agents via agents_send; fanout-state re-pushed.
+- w-interop svn matrix landed (merge 4ac4c6526): ci/interop/svn-matrix.sh, 22/27 pass over svn:// (reads, commit, copy,
+  switch, merge). Remaining: svn lock over svn:// E170003 (A-693 p2, w-svn); svn+ssh "svnserve -t is not served yet" in
+  the daemon's SSH site (w-svn queue item); HTTP path not found (A-681, w-svn). w-interop confirmed all its pieces on
+  origin/main by merge-base.
+- ~22:35 PST w-perf a11712269: svn_scale.sh measures slates; svn over 1,000 git/git revisions (main bc2803d66, best of
+  3): import 1.87 s vs svnadmin load 62.8 s; log 0.062 vs 0.140 s; checkout/commit/update even (client-bound); daemon
+  holds 2.57 GB after a 223 MiB import (11.5x). 5,000-rev import still TableAtCapacity{green_chains} at 1,685 revs.
+- w-svn root cause (green_chains): repository entries' objects (A-662) charged to the partition's MERGE budget and kept
+  in the register; tool store holds them again. APPROVED fix: objects off the merge budget, charged to the owner
+  shard's memory budget as retention at RepositoryLogs::append (credit on refusal; replay; destroy). Notes sent:
+  admission hold vs retention (no double charge), second copy -> GAPS owed (A-64), claim A-714+.
+- w-svn landed svn+ssh in the daemon a14635977 (fc79d36ae). w-interop 168ddfa96: svn+ssh round trip un-ignored; svn
+  matrix 24/27 (left: svn:// lock E170003; two HTTP rows A-681).
+- w-git A-713 landed 03dc601a5 (a2f0fb970): upload-pack admits by the shard (clone room bug fixed). Next: push spin.
+- w-hg A-712 stream clones p2 landed 7405f9508. A-711 (bc2803d66): 413 gone, but whole hg push spin-kills (w-perf
+  shard 10 1,152 ms; w-interop shard 0 3,698 ms). w-git found 2 hg-site tests 503 on clean main bc2803d66 -> w-hg FIRST.
+  w-hg MEASURED: manifest log 57,007 revs = 9.4 MB deltas vs 5,501,443,727 B full texts; slates stores full texts.
+  RULING: (3) sliced intake + (4) derived import room first (started), then (1) delta storage + (2) delta records as one
+  amendment (§4.17.3, SHGR v2); engine's append takes a revision as arrived; snapshot interval derived.
+- MAIN CI: last finished run 44676412887 (3691deb5c, 04:44Z) failed 15 jobs; every later run cancelled by the next
+  push. Windows had not compiled since 9abe7e9a2 (anchor vcs_svn_listener init lacked cfg(unix)) -> main fixed it,
+  36478561d (win clippy anchor lib red->clean from the Mac). Lint wall red in slates-db + slates-vcs -> new lint keeper
+  w-lint (briefs/w-lint.md). w-bugs told to re-cut its Windows diag from >= 36478561d.
+- Stopped duplicate w-fed-a583 on Studio-2 (01a1f7744305737c8650cfbb776d54a0); kept the big Studio's (01a1f7749cc7...).

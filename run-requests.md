@@ -6769,5 +6769,6 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - 2026-11-20 w-perf A-710 (main 5c6eb940d): owed (main): clippy -p slates-cli -p slates-client; Linux/Windows runs of `cargo test -p slates-cli --bin slates repository`.
 - A-698 landed main ddbd387a2 (local: server vcs_svn/vcs_ssh::svn/svn_commit 21/21, vcs_ssh 59/59, svn 120/120); w-perf's svn_scale.sh commit repro + other platforms owed [w-svn]
 - w-svn green_chains fold fix landed main 9ea6e1311: rerun w-perf's svn_scale.sh git-5000.dump import + svn commit repro (RSS too) [w-svn]
+- 2026-11-20 w-git main 03dc601a5 (A-713 upload room): clippy + xtask gates; Linux/Windows cargo test -p slates-server --lib -- vcs_http::git:: vcs_http::daemon_edge:: vcs_ssh:: vcs_store::upload::; git-matrix clone rows (PUSH_REFS v1.0.0) by use
 - 2026-11-19 w-fed-a503 main 8eeb004bd (A-589, docs only): Linux x86_64 fleet lane owed for `cargo test --locked -p slates-server --test fleet` on a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an_old_one and A-583's two (passed macOS arm64).
 - 2026-11-20 w-reaper A-709 (main 9b93fd77c): owed (main): clippy + xtask unsafe (slates-base 11 -> 10); Linux x86_64: cargo test -p slates-base --lib hint_set and -p slates-server --lib base_hints (the epoll arm); Windows build (no-op arms).

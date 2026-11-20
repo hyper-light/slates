@@ -60,3 +60,18 @@ CARGO_TARGET_DIR ~/.cache/w-interop-target, clone ~/.cache/w-interop/src (delete
   E210002 closed; HTTP legs '/project' path not found (A-681 DAV reads) -> stay ignored; reported.
 - 4c: ci/interop/svn-matrix.sh written (uncommitted in w-interop-matrix-land), seeds by `repository import` of a
   git_to_svn_dump.py dump of git/git (LIMIT 2000). NEXT: push branch, run on the Studio, land with a GAPS line.
+- LANDED 4c: merge 4ac4c6526 (svn-matrix.sh + GAPS). svn:// 22/27; lock E170003 refused; svn+ssh "svnserve -t is not
+  served yet"; HTTP path not found (A-681). Reported.
+- QUEUE NOW: watch main; on each fix (w-git: large push spin / upload-pack room / deepen; w-hg: 413, lookup, A-696;
+  w-svn: lock, svnserve -t on SSH edge, A-681 DAV reads) re-run the matrix / un-ignore the stock test, land, report.
+  Remaining ignored: cli.rs stock_hg ssh round trip (A-696); svn_interop http round trip + locks (A-681), svn+ssh.
+- 2026-11-20: checked with merge-base --is-ancestor: a0175d10b 630eb8d76 003936b3e b17700bb0 41c2e662e 2d8f041c6
+  4ac4c6526 all on origin/main. Scratch branches agents/w-interop-git-ssh, -hg-ssh-clone, -matrix hold only superseded
+  drafts of what landed (checked file by file); nothing finished off main. Monitor on main running (re-arm on expiry).
+- 43551dc93 (A-711 hg push admission) and 3691deb5c (A-696, hg SSH push; w-hg un-ignored the SSH round trip) on main.
+  r22: hg matrix re-run (cut 1.0 and whole) on a fresh build of main. NEXT: land a GAPS line with the new count.
+- hg re-run (r20, main bc2803d): 17/24; push of hg history (cut 1.0 or whole) now spins shard 0 and the daemon is
+  killed (`bad HTTP status line`); reported for w-hg.
+- LANDED 168ddfa96 (on main, checked): svn+ssh round trip un-ignored (passed --ignored at main a146359, r21); svn
+  matrix 24/27 (lock E170003, HTTP A-681 remain). Reported.
+- r22: git matrix re-run for A-713 (a2f0fb970) with cuts v1.0.0 and v2.0.0. NEXT: GAPS line + report.
