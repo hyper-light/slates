@@ -60,7 +60,8 @@
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
 > until it ends; a green's first submit's and one past a copy BUILT 2026-11-20 too, its commit owed durably,
-> `vcs_store::owed`, made at its build's end from what the submit staged) and a whole
+> `vcs_store::owed`, made at its build's end from what the submit staged; a push mid-build moves the build to the newest
+> head at a slice's boundary, never restarting it, BUILT 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
@@ -100,8 +101,10 @@
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
 > one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
-> Designed, owed: the snapshot slot sized by its data (8) and a giant repository's index cut across partitions by
-> object id (9).
+> Piece 8a: growth past the snapshot slot refused typed before it is written (`DbError::SnapshotRoom`). The slot's room is
+> admission's second resource (`vcs_share::room`, `Bound::Snapshot`). Owed: the slot
+> derived and re-laid at a handoff (8b), the snapshot naming sealed index tables (8c), a giant repository's index cut
+> across partitions by object id (9: the cut and its placement built, 9a; the record, routing and split owed, 9b).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
 > (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
@@ -808,6 +811,12 @@
 > `S:post-commit-err`, pre-lock/post-lock around a LOCK (pre-lock's token the lock's), pre-unlock/post-unlock around an
 > UNLOCK, a post-hook's failure logged, never told (`lock.c`). DAV's commit and lock hooks closed; owed still: the
 > revprop hooks' calls (A-702 part 2), the SSH edge's client-gone signal, REPOS as A-645's view (w-reaper, next).
+> **A-738 (2026-11-20, w-reaper; A-645 route A P1):** `slates_svn::fsfs` derives a repository's FSFS format 6 revision
+> and revprops files from the index and the green, laid out a revision a step and generated when read; stock
+> `svnadmin verify`, `dump` (whole and `--deltas`) and `svnlook changed` read the golden repository's view as the
+> repository the dump came from. Part 2: `fsfs::transaction_files`, an open transaction's directory and
+> prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. Owed: P3 (the presenter under
+> SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
@@ -1553,6 +1562,12 @@
 > after which the edge judges a client gone) is released at the table's next use, counted
 > (`vcs_store.dav_commits_released`). Before the edge has learned that bound none is released early; the table stays
 > bounded by one a repository and principal.
+> **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
+> `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
+> (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
+> byte-identical and the matrix passes 29 of 29 (Mac Studio, debug). Over git/git's last 2,000 commits svnsync passes
+> but `svnrdump dump` (one `replay-range` of the whole history) gets shard 0 spinning 3.6 s and the daemon killed
+> after 53 MB: 28 of 29, owed to w-svn.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -22856,6 +22871,14 @@ Goal item 4 of 2026-10-22, the leak A-148 recorded.
   release test as evidence, which a mount's own `FORGET` now settles before the mount ends (2d8eee97). A test needs a file
   kept with no `FORGET` to come: unlinked through the successor while a handle no image counted is open, then the mount
   unmounted while the handle is held (a lazy unmount) and `referenced_bytes` read back to its level before the file.
+  **Built 2026-11-20 (A-739, w-bugs; goal-83 B14), and it found a leak wider than the kept files:** the test
+  (`crates/cli/tests/cli.rs` `a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends`)
+  failed on CI's ubuntu (kernel 7.0) with and without a takeover: the mount ended (`attachments: 0`, nothing
+  `takeover_kept`) and the file's 1 MiB stayed referenced. An ordinary mount's end swept nothing its kernel held
+  (`sweep_attachment` was reached only from `FUSE_DESTROY` and virtio-fs), so a file it held open or looked up,
+  unlinked meanwhile, stayed charged for good. `end_attachment` now sweeps the attachment's references, which ends a
+  takeover holder too; with `a_file_an_ended_mount_held_is_given_back`, both tests red with the old call and green
+  with the sweep (diag-w-bugs-a739-red-2 / -green-1).
 - **Found under load afterwards, fixed by A-154 (next section but two):** a handle released after the last publication
   left its open in the image, and nothing ever gave it back.
 

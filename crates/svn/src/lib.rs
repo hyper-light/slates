@@ -34,6 +34,7 @@ pub mod commit;
 pub mod dav;
 pub mod dump;
 pub mod find;
+pub mod fsfs;
 pub mod handshake;
 pub mod index;
 pub mod lock;

@@ -54739,6 +54739,38 @@ Applied in the same change to:
   `vcs_store::homes::tests::a_batch_of_windows_goes_to_each_home_in_one_call_a_shard` (five batches of 259 windows over
   four homes: 151 calls in a debug build; every window homed, read back in order, held twice where sent twice, freed).
   Owed: the region's half once w-fed-faults answers; the owner's rows and reads through them with w-perf's a2 and a3.
+- **Piece 8a, growth refused typed before it passes the snapshot slot (2026-11-20).** `slates_db::replay::Db`: a record's
+  projected snapshot (the last snapshot's exact bytes, every record's since, and its own) is checked against the slot
+  (`segment.geometry().snapshot_bytes`) before it is appended. Past it, the state is snapshotted at once and so measured
+  exactly: a state that fits goes on (a transaction's applied effects carried by that snapshot, as a full log's are),
+  one that cannot is refused `DbError::SnapshotRoom { needed, room }` with nothing applied (a transaction rolled back
+  with it as the cause, AUD-06's rule), counted. A snapshot too large for its slot is refused the same way before the
+  segment is touched. `Db::snapshot_room` reads the room left, for admission. On the wire `DatabaseRefusal::SnapshotRoom`
+  (appended, `wire_order.txt` 12). Tests: `replay::tests::a_record_whose_state_would_pass_the_snapshot_slot_is_refused_typed_and_one_that_fits_never_is`
+  (records three slots long over a state a fifth of the slot: none refused; a slot and a half refused, nothing applied,
+  recovered as before) and `...a_transaction_whose_state_would_pass_the_snapshot_slot_rolls_back_typed`; slates-db
+  `--lib` 176 of 176, `--test model` 26 of 26; slates-ipc `--test wire_order`. Owed: the slot derived at each snapshot
+  and grown by a re-laid segment at a handoff (8b); the snapshot naming sealed index tables by identity (8c, with A-727);
+  the room read by `vcs_share::room` as a second resource.
+- **Piece 9a, the cut and its placement (2026-11-20).** `slates_vcs::cut`: an index cut into `2^b` ranges by its
+  objects' ids' leading bits (`range_of`), `b` the least that fits each range's room (`bits_for`,
+  `ceil(log2(bytes / room))`), a split due when a measured range passes the room (`split_due`), each row then moving to
+  one of its range's two children (`child_of`; Fagin et al. 1979). `crate::vcs_share::place::range_partition`: a range
+  held on the partition rendezvous ranks first for the repository's family key and the range. Tests: `cut::tests`
+  (300 generated cuts: one range an id, a split's children holding exactly the parent's ids; the derived cut the least
+  that fits; git/git whole, the kernel at 2 bits against a quarter slot, a billion objects cut; hostile ids total) and
+  `place::tests::a_repositorys_index_ranges_spread_over_the_partitions_by_rendezvous`. Owed (9b): `b` in the repository's
+  record; a push's rows sent to their ranges' partitions and committed by the owner's landing record (needs 8c's names
+  by identity, proposed to w-perf); look-ups routed by range; the split's moves.
+- **Piece 8a in admission, the snapshot slot a second resource (2026-11-20).** `crate::vcs_share::room` divides memory and
+  the partition's snapshot slot's room left (`Db::snapshot_room`) together by dominant-resource fairness: each
+  repository holds its records' bytes of the slot (`Repositories::objects_bytes`) and claims them with its traffic's
+  mean, and its room is the lesser headroom, its bound naming the binding resource's share; a repository alone gets
+  the lesser of what the shard admits and the slot's room (`Bound::Snapshot { room }`). So a push whose record could
+  not fit the snapshot is refused at admission, before its body, not at its commit. Tests: `vcs_share::tests`
+  (`t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot`: a slot shrunk below the admittable room binds
+  alone and is divided beside another; the share test against the lesser resource), 23 of 23 with `git_push::` and
+  `vcs_store::upload::`; `vcs_http::git:: vcs_http::hg vcs_ssh::` 88 of 88.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55276,3 +55308,74 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   receive:: hook_view` 200 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- vcs_store:: git_push::
   vcs_http::git:: git_hooks::` 91 passed and one hook test past its bound under load (load average 71), passing alone
   (3 of 3); fmt clean.
+
+### A-664 live whole builds, the push storm — A push landing mid-build moves the build to the newest head at a slice's boundary, never starts it again (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** Part 1 started a green's whole build again from nothing at every push that landed while it ran, so under
+  a steady stream of pushes (the target is tens of thousands concurrent) a busy repository's build never ended.
+- **Change.** A push to a green whose build runs leaves it alone (`paths::advance_after_push`); at the build's next
+  slice the build moves to the green's newest head once (`whole_build::moved`): each path the change index names since
+  its version loses what was put of it and is put again from the head, where git holds a file there, and everything
+  else put stays. Only a change holding a copy (named at its destination alone) starts it again, counted
+  `vcs_store.paths.whole_build.restarted`; a move is counted `...moved`. A commit a submit owed of the version the build
+  began at is not made over the newer map (`make_owed` checks the version) and the push's own move settles it, counted
+  unmade.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::commits::tests::
+  t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build` (a 61-file first push, then fifty pushes each
+  changing `README`, a slice between each two: restarted 0, moved, built once, the last push's tree kept). `cargo test
+  --locked -p slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities::
+  --test-threads=4` 151 of 151; fmt clean.
+- **Owed.** A parked submit's wait bounded by the failover delay (next); a copy in a storm's change still restarts.
+### A-739 — A FUSE mount's end gives back every reference its kernel held (bug, 2026-11-20, w-bugs for goal 87; found by goal-83 B14's test; §4.5 references, §4.6 FUSE, U10)
+
+- **Found by use.** B14's real-mount test (a file kept for a mount that survived a takeover, the mount lazily
+  unmounted with the uncounted handle held, then closed) failed on CI's ubuntu-latest, kernel 7.0: the mount ended
+  (`slates status`: `attachments: 0`, no `takeover_kept`) and `referenced_bytes` stayed 1,048,576. The same steps with
+  no takeover failed the same way (diag-w-bugs-b14-green-2).
+- **Cause.** `Volume::sweep_attachment` gives back an attachment's references, opens and takeover hold; the FUSE path
+  reached it only through `FUSE_DESTROY`, which Linux sends to fuseblk and virtio-fs mounts alone, and the server's
+  `end_attachment` ended only the takeover holder. A lazily unmounted mount's last `RELEASE` and `FORGET`s can be lost
+  with its connection, so whatever its kernel held stayed charged to the volume for good.
+- **Change.** `verbs::end_attachment` sweeps `RefOwner::Attachment(record.id)`: however an attachment ends, its kernel
+  holds nothing of the volume any more. The counter `recovery.takeover_kept_unreleased` counts a refused sweep too.
+- **Tests.** `crates/cli/tests/cli.rs` `a_file_an_ended_mount_held_is_given_back` (no takeover) and
+  `a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends`: red with the old call
+  (diag-w-bugs-a739-red-2), green with the sweep (-green-1), CI ubuntu-latest; the neighbouring takeover and release
+  tests and the server's `--test fuse_mount` (7/7) pass in both. macOS arm64 (Mac Studio): server `--test
+  attachment_term` 4/4, `--test attach_forms` 9/9.
+- **Applied in the same change to** GAPS (U10's "release at a real mount's end" entry), amendments.tsv.
+
+### A-738 — The FSFS view of a repository, part 1: revision and revision-property files (2026-11-20, w-reaper, UI goal 93; A-645 route A P1; §4.17.4 item 9; A-553, A-730, A-733)
+
+- **Why.** A hook is handed REPOS and reads it with `svnlook`, which opens an FSFS directory; slates holds a
+  repository as one green (§4.17.1), so REPOS has been `/<name>` (A-730). Main's ruling for A-645 route A: present a
+  read-only FSFS view, derived data generated lazily and sliced; P1 the revision and revprops files, P2 the
+  transaction directory for `svnlook -t`, P3 the presenter under SLATES_ROOT after A-727 a2 (referencing the same
+  blocks, never a copy), P4 git's, then the daemon publishing its root mount.
+- **Change.** `slates_svn::fsfs`: FSFS format 6 (sharded 1000, physical addressing, `PLAIN` representations) written
+  from the index and the green as `libsvn_fs_fs` writes it (`low_level.c`, `id.c`, `structure`; module docs). A
+  `View` keeps only each node-revision's offset and where its representations lie, laid out a revision a call under the
+  caller's node-revision budget (`View::advance`); a revision's file is generated when read (`View::revision_file`),
+  its texts read from the green in runs (`RevisionFile::read`), never copied. A text or property list equal to its
+  predecessor's is the predecessor's representation; a directory's entries list is new exactly when a child was
+  created or deleted beneath it in the revision. `Index::created_in` answers a revision's node-revisions (one run of
+  rows). Revision properties, the fixed files (`format`, `db/format`, `uuid`, `current`, …) and the directories are
+  answered beside it.
+- **Tests.** `crates/svn/tests/fsfs_view.rs`: revision 0 is `svnadmin create`'s file byte for byte; laid out one
+  node-revision a call, the layout takes one call a revision and every file equals the unsliced one, its trailer naming
+  the root's header and the changed paths and each header naming its own offset; and against stock Subversion 1.15.0,
+  the golden dump's repository written out as the view is passed by `svnadmin verify`, dumps back to `full.dump` and
+  `deltas.dump` byte for byte, and `svnlook changed --copy-info` gives `changed.txt` for every revision (macOS arm64,
+  Mac Studio 1, 3 of 3; the stock leg skips loudly where Subversion is absent).
+- **Part 2 (same day): the transaction directory.** `fsfs::transaction_files` writes what FSFS keeps for an open
+  transaction (`structure`, "Transaction layout"), from the index's trial of a work on its base (`Index::trial`; the
+  trial now answers its node-revisions, `Trial::made` and `Trial::node_revision`): `props`, `next-ids`, the changed
+  paths unterminated, a `node.<node>.<copy>` file a node-revision it made (identities `_<n>` and `t<name>`), a
+  `.props` file where it changed a list and a `.children` file, entries whole, where a child was made or deleted, each
+  then `-1`; texts it gave in `db/txn-protorevs/<name>.rev`, generated when read and streamed from the source;
+  anything kept names the committed representation the view placed. Test: every revision of the golden repository,
+  its work tried as a transaction on the revision before it in a repository cut there, is read by stock `svnlook -t`
+  as `svnlook -r` reads the revision: `changed --copy-info`, `info`, `tree`, `dirs-changed` and `diff` (Mac Studio 1,
+  Subversion 1.15.0; `fsfs_view` 5 of 5).
+- **Owed.** P3 (the presenter under SLATES_ROOT, after A-727 a2: the hook drivers handing the view's path as REPOS),
+  P4, the root mount's publication.
+- **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
