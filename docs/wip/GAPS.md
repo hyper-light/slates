@@ -7208,8 +7208,11 @@
 >   `process_wait::InstanceWait`; its NFS reads with no timeout; a stop awaited on the kernel's report, `waitid` for a
 >   stopped child, within the observation budget; `FLEET_WAIT` and `START_WAIT` gone; the fenced owner's
 >   `STALE_WRITE_WAIT` kept as the deadline that test proves). `cli`'s container waits (`CONTAINER_WAIT`,
->   `DOCKER_INFO_WAIT`) stay: they wait on Docker Desktop's VM, no process of the test's tree. Owed in `cli/tests`: `vm`,
->   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
+>   `DOCKER_INFO_WAIT`) stay: they wait on Docker Desktop's VM, no process of the test's tree. `vcs_edge_restart` since
+>   2026-11-20: its anchor's lines judged in the anchor's process tree (`process_wait::Judged`, which Windows builds too),
+>   its listeners' first answers read without a timeout, `PATIENCE` gone. Owed in `cli/tests`: `vm`, `start_judgment`
+>   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
+>   are not listed yet), `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
