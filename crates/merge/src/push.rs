@@ -426,7 +426,6 @@ impl Building {
       if !composing && !self.pace.more() {
         return None;
       }
-      let units = self.pace.units();
       match self.unit(green, objects) {
         Ok(None) => {}
         Ok(Some(built)) => {
@@ -438,8 +437,9 @@ impl Building {
           return Some(Err(refused));
         }
       }
-      // A composition that took no unit is pending: the turn is spent.
-      if composing && self.pace.units() == units {
+      // A composition still pending spent the turn: it asked for a unit past the deadline and was refused. Asking
+      // again would time the drive between the two asks as no unit's.
+      if composing && matches!(self.stage, Stage::Compose { .. }) {
         return None;
       }
     }

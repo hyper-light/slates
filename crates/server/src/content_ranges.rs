@@ -190,6 +190,10 @@ fn advance(state: &mut ShardState) {
   // The targets first: a handful, built in constant time; the budget's clock starts at the first step.
   let targets = targets(state);
   let began = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  // Each step is timed from where the last ended (the first from `began`), so the steps cover the advance whole: time
+  // the thread spent preempted between two steps is the later step's, and the advance passes its budget by at most the
+  // step that crossed it.
+  let mut mark = began;
   loop {
     let (index, offset) = state.content_sweep.at;
     let Some(target) = targets.get(index) else {
@@ -199,7 +203,7 @@ fn advance(state: &mut ShardState) {
       sweep.at = (0, 0);
       return;
     };
-    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    let now = mark;
     let left = budget.saturating_sub(now.saturating_sub(began));
     let fixed = state.content_sweep.ns_fixed;
     let pages = match state.content_sweep.ns_per_page {
@@ -214,6 +218,7 @@ fn advance(state: &mut ShardState) {
       .min(pages.saturating_mul(page));
     let found = residency(state, target, (offset, len));
     let after = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    mark = after;
     let sweep = &mut state.content_sweep;
     let walked = u64::try_from(len.div_ceil(page).max(1)).unwrap_or(u64::MAX);
     let took = after.saturating_sub(now);

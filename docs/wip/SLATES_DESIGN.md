@@ -56573,3 +56573,43 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
+
+### A-752 — A push's work is built a unit at a time over the turns before its verdict, under the step quantum (2026-11-20, w-engine; Ada's rule "we address performance gaps upfront", main's order; w-git's measure; §4.3, §4.16, §4.17.1; A-618, A-658, A-722)
+
+- **The gap** (w-git's measure, debug, one command bringing 3,502 objects over a flat 3,500-file tree): the work build
+  (`ServerJudge::verdict` -> `push::build`) took 374 to 642 ms and the entry apply (`apply_planned`) 114 to 196 ms,
+  each in one step, both growing with the head's files: a monorepo's push would outlast the watchdog.
+- **Part 1, the deriver's replay** (landed): `compose_volume_planned` looked each path up by scanning every entity and
+  base file, O(n^2). Indexed (`Entities`: the live entity by path, the origins, the unlinked base files, the base's
+  lengths): a flat 3,500-file compose 129 -> 28 ms, 7,000 458 -> 58 ms (debug).
+- **Part 2, the build in turns.** `slates_merge::push::Building` owns a build across turns and borrows the green and
+  the objects for one ([`Building::advance`]): the walk an entry of a tree a unit (`Comparing`: each side's listing
+  named, then each name), the base a named path a unit (`Green::base_entries`, read at the push's base version, which
+  no later version changes), the composition, the post-state an operation or 64 KiB of zeros a unit, the identity a
+  piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or 64 KiB of the post-state a unit.
+  `build` is a `Building` run in one call. The deriver is `async` (R6): `compose_paced`'s every loop awaits a tick,
+  its sorts are a paced stable merge sort (`pace::sort_by`), its base lookups indexed (`BaseIndex`), so no unit is
+  O(files); `compose_volume_planned` is its one-poll facade, one implementation. A `Pace` holds the turn's deadline
+  and the owner's clock (a function: the merge engine reads no clock of its own); the first unit of a turn always
+  runs; the composition is polled through `Pace::drive`, which lends the turn to the thread for that poll (a `Copy`
+  of its figures in a thread-local cell, R2: nothing shared), so a turn shorter than any unit still runs one.
+  `Verdicts::prepare` runs a turn of the command's build from `ServerJudge::ready` (w-git's hook, after the move's
+  admission), its state beside `admitting` in the deciding push; the verdict takes the work built
+  (`Verdicts::prepared`), or builds in one call where no turn ran (another judge).
+- **Measure.** `slates status --json` `push.build.{turns, past_budget, longest_ns, longest_unit_ns,
+  longest_opening_ns}`: a turn is its opening (the admission's turn and the views set up, before its first unit), its
+  units, and what follows its last ask; one that ran past its budget (half the step quantum) by more than its opening,
+  its longest unit and its tail is past budget. Red first (`t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time`):
+  a flat 1,500-file create then an update changing every file (debug, the audit daemon's quantum about 3 us): before,
+  no build turn (the work built inside the verdict's step); after, about 160,000 build turns a push, `past_budget` 0,
+  the longest build turn 1.13 ms, its longest unit one tree's listing. A build in one-unit turns equals the one-call
+  build over every generated push history (`push::tests::land`).
+- **Owed, named.** Part 2b: units still one object's size: a tree's listing (`PushObjects::tree` gives a whole tree),
+  a blob read and laid whole, the green's hard links, a copy's tree. Part 3: the entry apply in turns: the verdict
+  (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
+  the commit (main's call asked: the green held out across the commit's turns, or staged and published whole); the
+  record's encode and append.
+- **Applied in the same change to** `crates/merge` (`pace`, `push::Building`, `increment::compose_paced` and its
+  stages, `ops_doc::OpsDoc::{canonicalize_paced, encode_piece}`, `special::Composition`, `Green::{base_entries,
+  base_links, base_copied}`), `crates/git` (`receive::works::{Preparing, Verdicts::prepare, Verdicts::prepared}`),
+  `crates/server` (`git_push::{PushTurns, ServerJudge::build_turn}`, status rows), GAPS, BENCHMARKS.md, amendments.tsv.

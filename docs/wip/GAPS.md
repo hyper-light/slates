@@ -309,6 +309,13 @@
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
 > the log ring's released pages given back (88 MiB resident past the live tail); `projected_snapshot_bytes`'s encode.
 >
+> **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
+> deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict
+> (`Judge::ready`), the deriver async under a `Pace`. OWED (part 2b): units still one object's size: a tree's
+> listing (`PushObjects::tree` gives a whole tree: a flat 1,500-entry tree 1.1 ms debug), a blob read and laid whole,
+> the green's hard links (none in git or Mercurial greens), a copy's tree (a push makes none). OWED (part 3): the
+> entry apply (`apply_planned`: the engine's verdict and commit, the record) in one step, 92 ms for 1,500 files debug.
+>
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
 > room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the
