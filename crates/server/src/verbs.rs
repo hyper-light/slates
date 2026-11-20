@@ -5018,6 +5018,7 @@ fn dispatch_inner(
       from,
     } => changed_since(state, principal, green, version, from),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
+    RequestBody::AdmitWork { green, work } => admit_work(state, principal, green, work),
     RequestBody::Edit {
       work,
       path,
@@ -10100,6 +10101,34 @@ pub(crate) fn owner_admit(
   )
   .map_err(|error| refusal_of_db(&error))?;
   Ok(crate::work_home::Admitted { id: work, base })
+}
+
+/// `AdmitWork` (A-697 part a): another node asks this green's owner to admit a work it will hold. Served only as a
+/// forward from another node, whose completion record (`run_forwarded`, keyed by the authenticated origin) makes a resent
+/// ask answered once; a client of this node asks for a work by `CreateWork`, so from one this is refused `Unsupported`.
+/// The relayed principal's rights are judged from the green's record and the work's floor is recorded at the head, as a
+/// work created on this node is admitted (`owner_admit`).
+fn admit_work(
+  state: &mut ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  work: VolumeId,
+) -> ReplyBody {
+  let forwarded = state
+    .current_request
+    .is_some_and(|(origin, _)| origin != state.origin_anchor.0);
+  if !forwarded {
+    return refused(Refusal::Unsupported {
+      feature: "admit_work from a client".to_owned(),
+    });
+  }
+  match owner_admit(state, principal, to_db_volume(green), to_db_volume(work)) {
+    Ok(admitted) => ReplyBody::WorkAdmitted {
+      id: to_wire_volume(admitted.id),
+      base: admitted.base,
+    },
+    Err(refusal) => refused(refusal),
+  }
 }
 
 /// The base's bytes of `paths` for a verb on a work's shard (A-247).
