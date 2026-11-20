@@ -56,10 +56,14 @@ const AWAY: (&str, u16) = ("away", 3);
 const UUID: &str = "6b4a5e2c-1d3f-4a7b-9c8e-0f1a2b3c4d5e";
 /// Shape: the repository's authorization file: alice and bob read everything but `/trunk/secret`, hidden from alice.
 const AUTHZ: &[u8] = b"[/]\nalice = r\nbob = r\n[/trunk/secret]\nalice =\n";
-/// Shape: the text of `/trunk/a.txt`.
-const A_TEXT: &[u8] = b"hello, slates\n";
+/// Shape: the text of `/trunk/a.txt`: more bytes than [`SMALL_ROOM`] twice over.
+const A_TEXT: &[u8] = b"hello, slates: a text longer than twice the small room, so that a GET given that room \
+gives it over in three runs\n";
 /// Shape: the bytes the tests' green hands over at once: fewer than a text, so a GET's reply takes several runs.
 const PIECE: usize = 4;
+/// Shape: a request room the GET of `/repo/!svn/rvr/1/trunk/a.txt` fits in (its route and exchange hold 30 bytes) and
+/// [`A_TEXT`] does not.
+const SMALL_ROOM: u64 = 48;
 /// Shape: revision 1's date, as stored.
 const DATE: &str = "2026-11-19T00:00:01.000000Z";
 /// Shape: the instant locks are judged at.
@@ -184,6 +188,9 @@ struct Repo {
   lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
   /// The texts, by identity.
   texts: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The bytes the green hands over at once from an offset: [`PIECE`], or a text's whole rest as the daemon's records
+  /// hand it over (`slates_svn::migration::Repository`).
+  piece: usize,
   /// Each revision's properties.
   revisions: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
   /// The locks: none.
@@ -245,6 +252,7 @@ impl Repo {
         (text_of(A_TEXT).identity, A_TEXT.to_vec()),
         (text_of(secret).identity, secret.to_vec()),
       ]),
+      piece: PIECE,
       revisions: vec![
         vec![date("2026-11-18T00:00:00.000000Z")],
         vec![
@@ -309,7 +317,7 @@ impl Repository for Repo {
   fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
     let text = self.texts.get(identity)?;
     let start = usize::try_from(offset).ok()?;
-    text.get(start..start.saturating_add(PIECE).min(text.len()))
+    text.get(start..start.saturating_add(self.piece).min(text.len()))
   }
 }
 
@@ -362,8 +370,16 @@ impl SvnStores for Stores {
 
 /// The tests' site, its repository built and kept for the test's life.
 fn site() -> SvnSite<Tokens, Held, Stores> {
-  let repo: &'static Repo = Box::leak(Box::new(Repo::build()));
-  SvnSite::new(REALM.to_owned(), ROOM, Tokens, Held, Stores { repo })
+  site_of(ROOM, PIECE)
+}
+
+/// The tests' site charging each request to `room`, its repository's green handing over `piece` bytes at once.
+fn site_of(room: u64, piece: usize) -> SvnSite<Tokens, Held, Stores> {
+  let repo: &'static Repo = Box::leak(Box::new(Repo {
+    piece,
+    ..Repo::build()
+  }));
+  SvnSite::new(REALM.to_owned(), room, Tokens, Held, Stores { repo })
 }
 
 /// Reads `input` as a head.
@@ -678,7 +694,19 @@ fn exchanged(
   depth: Option<&str>,
   body: &[u8],
 ) -> (u16, Fields, Vec<u8>, usize) {
-  let mut site = site();
+  let (status, fields, reply, runs) = exchanged_on(site(), (method, target), depth, body);
+  (status, fields, reply, runs.len())
+}
+
+/// What `site` answers the owner's `method target` (`asked`) with `depth` and `body`: its status, its fields, its
+/// reply's bytes and the bytes of each reply run.
+fn exchanged_on(
+  mut site: SvnSite<Tokens, Held, Stores>,
+  asked: (&str, &str),
+  depth: Option<&str>,
+  body: &[u8],
+) -> (u16, Fields, Vec<u8>, Vec<usize>) {
+  let (method, target) = asked;
   let owner = basic("alice", OWNER_TOKEN);
   let depth = depth.map(|depth| format!("Depth: {depth}"));
   let mut fields = vec![owner.as_str()];
@@ -693,9 +721,14 @@ fn exchanged(
   ready(exchange.body_end()).unwrap();
   let status = exchange.reply_status().code;
   let fields = ready(exchange.reply_fields()).unwrap();
-  let (mut reply, mut runs) = (Vec::new(), 1);
-  while ready(exchange.reply(&mut reply)).unwrap() {
-    runs += 1;
+  let (mut reply, mut runs) = (Vec::new(), Vec::new());
+  loop {
+    let before = reply.len();
+    let more = ready(exchange.reply(&mut reply)).unwrap();
+    runs.push(reply.len() - before);
+    if !more {
+      break;
+    }
   }
   (status, fields, reply, runs)
 }
@@ -784,6 +817,22 @@ fn a_get_streams_the_text_a_piece_a_reply_run() {
       A_TEXT.len().div_ceil(PIECE),
       vec![b"Cache-Control".as_slice(), b"ETag", b"Content-Type"]
     )
+  );
+}
+
+/// A-681 (§4.17.4 item 11; the module doc's bounds: an answer is written within the room): do GET a file whose green
+/// hands over its text's whole rest from an offset, as the daemon's records do, on a site whose request room is less
+/// than half the text; expect `200` and the text whole, given over in reply runs of the room's bytes and its rest.
+#[test]
+fn a_get_gives_a_text_held_whole_over_runs_of_the_room() {
+  let room = usize::try_from(SMALL_ROOM).unwrap();
+  let site = site_of(SMALL_ROOM, usize::MAX);
+  let (status, _, reply, runs) =
+    exchanged_on(site, ("GET", "/repo/!svn/rvr/1/trunk/a.txt"), None, b"");
+  let rest = A_TEXT.len() - 2 * room;
+  assert_eq!(
+    (status, reply, runs),
+    (200, A_TEXT.to_vec(), vec![room, room, rest])
   );
 }
 

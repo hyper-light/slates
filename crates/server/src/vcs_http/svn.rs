@@ -23,7 +23,8 @@
 //! A served request's body is read whole within the request's room (`413` past it), then answered at its end from the
 //! store as `slates_svn::dav::site` decides: its status, which the reply names as it begins (`207` for a PROPFIND; the
 //! route decides its status after its body, `StatusMode::AfterBody`, A-629 part 2c's engine rule), its headers and its
-//! body; a file's text a piece a reply run, lent from the green each run, never held whole; a REPORT's answer a slice
+//! body; a file's text a piece a reply run, lent from the green each run and at most the room's bytes, never held
+//! whole (a green that holds a text whole hands over its whole rest from an offset); a REPORT's answer a slice
 //! of the room a reply run, the store lent again for each, its first slices stepped at the body's end (the task
 //! yielding between them) until it has written its first bytes or ended, since they decide its status: a walk refused
 //! before its first byte is answered with its error, as `mod_dav` answers one, and one refused after it ends the
@@ -331,7 +332,7 @@ enum Answered {
     /// The body, until the reply takes it.
     body: Vec<u8>,
   },
-  /// A file's text, read from the green a piece a reply run, from `offset`.
+  /// A file's text, read from the green a piece of at most the request's room a reply run, from `offset`.
   Text {
     /// The headers.
     headers: Headers,
@@ -571,11 +572,12 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         let Some(text) = *text else {
           return Ok(false);
         };
-        let at = *offset;
+        let (at, room) = (*offset, to_usize(self.request_room));
         let piece = self
           .stores
           .lend(self.repository, &self.principal, |lent| {
-            lent.repository.text(&text.identity, at).map(<[u8]>::to_vec)
+            let run = lent.repository.text(&text.identity, at)?;
+            Some(run.get(..room).unwrap_or(run).to_vec())
           })
           .flatten()
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
