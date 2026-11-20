@@ -90,9 +90,9 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    end/reaper: delete pod, claim, PV; release at home.
 
 ## W10 cluster piece LANDED 2026-11-20 kiln main 8c501c906 (kubeapi PV/claim verbs, k8s::volume::{make,unmake}, chart rbac.agentPods).
-## BLOCKED on main (asked 2026-11-20 ~00:4x PST):
-- W10 pod start: ephemeral one-session runner in the pod (my pick) vs harness-only pod.
-- W9 harness sign-in in a container: image's own vs credential grant by name.
+## ANSWERED by main 2026-11-20 (was "blocked on main", asked ~00:4x PST; both built since: 82e81809f, 3a7e4116c..75757b07d):
+- W10 pod start: ANSWERED -- ephemeral one-session runner in the pod (built: 3a7e4116c, 5c5adfae9, b07098718, 75757b07d).
+- W9 harness sign-in in a container: ANSWERED -- credential grant by name (built: 82e81809f).
 ## Owed by others: live container start + Runners page browser check (main); Docker Desktop share key (needs a Mac with
    Desktop); Windows (jupiter BLOCKED).
 
@@ -124,3 +124,6 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    2b5a3d559 (k8s node tlshd cert: POST /api/kubernetes/node-certificates, kind k8s-node refused on link).
 ## W10 code done except the KIND proof (main's). Open: r24 live W9 (adacachy), r30 Windows cargo check (jupiter),
    W9 Windows measurement (person: WinFsp, console session, Docker Desktop). container_live_tests.rs uncommitted.
+
+## STATUS 2026-11-20: nothing blocked on main. Waiting: r24 (live W9 on adacachy, load 74), r33 (Windows cargo check,
+   queued for jupiter). Blocked on a PERSON only: W9 Windows measurement (WinFsp, console-session runner, Docker Desktop).
