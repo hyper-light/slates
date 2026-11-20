@@ -774,6 +774,57 @@ fn t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved()
   });
 }
 
+/// Format: where the fixture `update`'s pack's three entries begin (`git verify-pack -v`): its commit, its tree, then
+/// its blob, a REF_DELTA whose base is outside the pack (the thin delta).
+const UPDATE_ENTRIES: [usize; 3] = [12, 153, 196];
+
+/// The fixture `update`'s request with its pack's thin delta moved first: the same objects, the delta now waiting on its
+/// base before the commit and tree that follow it (a REF_DELTA names its base by id, so its place in the pack is free;
+/// git's own thin packs put such deltas where the object order puts them).
+fn update_with_its_delta_first() -> Vec<u8> {
+  let request = scenario!("update").request;
+  let at = request
+    .windows(4)
+    .position(|magic| magic == b"PACK")
+    .unwrap();
+  let pack = &request[at..];
+  let end = pack.len() - ObjectFormat::Sha1.raw_len();
+  let [commit, _, delta] = UPDATE_ENTRIES;
+  let mut moved = pack[..commit].to_vec();
+  moved.extend_from_slice(&pack[delta..end]);
+  moved.extend_from_slice(&pack[commit..delta]);
+  let mut hasher = slates_git::object_name::Hasher::raw(ObjectFormat::Sha1);
+  hasher.update(&moved);
+  moved.extend_from_slice(hasher.finish().unwrap().as_bytes());
+  let mut out = request[..at].to_vec();
+  out.extend_from_slice(&moved);
+  out
+}
+
+/// A-722 (found by reading B2's replay: a push admits a thin pack's waiting deltas once its pack is whole, after every
+/// object resolved as it was read, and its record names its objects in that order; a replay admitted them in pack
+/// order and compared the two in order). Do: push the fixtures' `create`, then `update` with its thin delta first in its
+/// pack; make the store again from the log. Expect: both pushes `ok`; the refs advertised after as before. Red before
+/// the change: the replay refused as diverged, the second push's ref lost.
+#[test]
+fn t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "thin-first");
+    pushed_from_the_fixtures(state, repository, &["create"]);
+    let received = pushed(state, repository, &update_with_its_delta_first());
+    assert!(
+      reasons(&received).iter().all(|reason| reason == b"ok"),
+      "{:?}",
+      received.outcomes
+    );
+    let before = super::advertised_refs(state, repository);
+    crate::vcs_store::rebuild(state, repository);
+    while crate::vcs_store::rebuild_turn_once_within(state, repository, 0) {}
+    crate::vcs_store::paths::whole_build::settle(state);
+    assert_eq!(super::advertised_refs(state, repository), before);
+  });
+}
+
 /// Shape: the partition's green-chain budget in [`t_a753_a_repository_takes_branch_creates_past_its_chain_budget`]:
 /// small, so a few creates' works pass it.
 const SMALL_CHAIN_BUDGET: usize = 64 << 10;

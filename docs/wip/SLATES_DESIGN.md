@@ -55923,6 +55923,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's replay order — a pack record's names compared as sets (2026-11-20, w-git for UI goal 93; found reading B2's replay)
+- **The bug.** A live push admits its pack's objects as they resolve: those read whole, or from a base already read,
+  in pack order as the client's bytes arrive; a thin pack's waiting deltas (a REF_DELTA whose base is outside the pack)
+  once the pack is whole, in the turns that resolve them. Its record names the objects in that order. A replay admitted
+  them in pack order and compared the names in order, so a thin pack whose waiting delta was not its last object was
+  refused as diverged, and the repository's store with it: after a restart its refs were gone. Thin pushes are git's
+  usual second and later pushes.
+- **Change.** A pack record's names are compared with what the replay would record as sets
+  (`vcs_store::names_alike`, sorting both); a push holds an object once, so each name is once on each side. A version-1
+  record, whose objects are admitted in its own order, is still compared in order.
+- **Tests.** `slates-server` `git_push::tests::t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` (the
+  fixture `update` with its thin delta moved first; red before: no ref advertised after the rebuild); `slates-server
+  --lib -- git vcs_store` 163 passed (kiln, adas-mac-studio.local-2).
+
 ### A-722's landing step — a commit takes what a move's walk found staged, not each id in its step (2026-11-20, w-git for UI goal 93; main's queue: Repository::commit's O(objects) passes)
 - **Measured** (adas-mac-studio.local-2, release; B1's diagnostic over git/git's v1.5.0, a push's last step timed by
   phase): the push's longest step is its last, `push_planned`, 35.8 ms: make, secure and judge 1.3 ms; entry and
