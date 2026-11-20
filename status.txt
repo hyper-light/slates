@@ -1,3 +1,4 @@
 started 2026-11-20T06:25:42Z at 69d2a11742221d8847443070d21b19300d149650
 build exit 0
 cdb: /c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe
+fsx exit 0
