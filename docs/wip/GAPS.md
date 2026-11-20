@@ -6322,8 +6322,9 @@
 > **Since A-709 (piece 6)** base hints are drained at the kernel's report: one hint set a shard (epoll or kqueue, keyed
 > by the volume's generational handle) awaited by one task, and a delegation nobody returned lapses at its own deadline
 > on the keeper. Left on the tick: the idle seal with its purge, then the tick's deletion.
-> Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
-> series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
+> **Since A-715 (the series' last piece)** the idle sweep runs a pass at its own deadline, armed by the write,
+> allocation or free that owes it, and an idle shard runs none; the reap loop and its tick are deleted. Closed.
+> Still on `W` itself (class D): nothing of the reaper's since A-715 deleted the reap loop's tick (`reap_loop`). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
 > the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for

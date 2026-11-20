@@ -1191,6 +1191,18 @@ pub struct ShardState {
   /// (`crate::delegation::drain`), kept by the deadline keeper, which drains again then to revoke it; `None` while no
   /// recall is outstanding.
   pub(crate) delegation_lapse_at: Option<u64>,
+  /// When the deadline keeper next hands the idle sweep a pass (A-715): set a sweep's interval after the write, free or
+  /// allocation that owes one ([`crate::idle_sweep::after_borrow`]), and after a pass that left work; `None` while the
+  /// shard owes no sweep, which is then never woken for one.
+  pub(crate) idle_sweep_at: Option<u64>,
+  /// The idle sweep (A-715): its task, woken by the keeper at `idle_sweep_at`.
+  pub(crate) idle_sweeper: Option<slates_rt::TaskId>,
+  /// Whether a sweep pass is asked for or under way (A-715): set by the keeper at `idle_sweep_at`, cleared by the sweep
+  /// as its pass ends, so nothing arms another while one runs.
+  pub(crate) idle_sweep_running: bool,
+  /// The content arena's allocation count and allocated bytes as the last sweep pass ended (A-715): a borrow that finds
+  /// either changed owes a sweep (a write's allocation, a delete's free once published).
+  pub(crate) idle_sweep_seen: (u64, usize),
   /// Whether the reaper owes a purge round (A-570): set by the keeper at `nfs_purge_at`, taken by the reaper.
   pub(crate) nfs_purge_owed: bool,
   /// When the deadline keeper re-arms the backed route's huge-page placement (A-570): a retry window after the host
@@ -1518,6 +1530,8 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     crate::deadlines::after_borrow(state);
     // A volume owed a hint drain whose host a landing gave back wakes the hint watcher (A-709).
     crate::base_hints::after_borrow(state);
+    // A write, free or allocation the idle sweep owes a pass arms it (A-715).
+    crate::idle_sweep::after_borrow(state);
     crate::retention::retain(state).map_err(StateAccess::Retention)?;
     Ok(result)
   })

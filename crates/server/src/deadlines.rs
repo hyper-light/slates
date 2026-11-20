@@ -5,7 +5,7 @@
 //! whose completion record was refused at its retry deadline (the serve loop, woken then, steps it again), a grant at
 //! the first instant past its term (A-266, the grants' index of terms), and the look at what the shard owes the audit
 //! (A-265), a retry window after the record that armed it and again while anything is owed, and a recalled
-//! delegation's revocation at its lapse (A-709). One task a shard, the
+//! delegation's revocation at its lapse (A-709), and the idle sweep's next pass (A-715). One task a shard, the
 //! keeper, sleeps on the wheel until the earliest of them, releases what is due then, and sleeps until the next; a
 //! deadline set earlier than the one it sleeps for wakes it at once, so it re-arms. Nothing is scanned on a tick: each
 //! pass reads only the due entries of ordered indexes (the staging buffers by expiry, the seats by their capture's
@@ -111,6 +111,14 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.delegation_lapse_at = None;
     crate::delegation::drain(state);
   }
+  // The idle sweep's pass falls due a sweep's interval after what owed it (A-715): its task is woken to run it.
+  if state.idle_sweep_at.is_some_and(|at| at <= now) {
+    state.idle_sweep_at = None;
+    state.idle_sweep_running = true;
+    if let Some(sweeper) = state.idle_sweeper {
+      slates_rt::registry::wake(sweeper.0);
+    }
+  }
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
     state.destroy_retry_at = None;
@@ -141,6 +149,7 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     state.nfs_purge_at,
     state.placement_rearm_at,
     state.delegation_lapse_at,
+    state.idle_sweep_at,
   ]
   .into_iter()
   .flatten()
