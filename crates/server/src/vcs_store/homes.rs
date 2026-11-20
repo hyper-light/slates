@@ -28,6 +28,11 @@
 //! the home (`crate::xshard::task_in_shard_time`), so the owner's request awaits it and no step ever waits. One barrier
 //! serves every window kept before it: group commit per shard, never a publication per push.
 //!
+//! **In batches** ([`home_many`], [`read_many`], [`let_go_many`]; agreed with w-perf). A request's windows go to their
+//! homes in one cross-shard call a home shard a turn, never one a window: each call works through its items until the
+//! home's step quantum (§4.3) is spent, at least one, and answers the rest to be sent in the next turn, so a batch of any
+//! size holds no home past a quantum. Answers come back in the request's order.
+//!
 //! **Refused** ([`HomeRefused`]): bytes past a window; a home whose content store refused (its budget); a home that did
 //! not answer within the budget; an answer naming another identity than the bytes' (never in a correct home).
 
@@ -302,6 +307,156 @@ pub(crate) async fn let_go(
   )
   .await
   .ok_or(HomeRefused::Unanswered)?
+}
+
+/// Counter: cross-shard calls the batch forms made, one a home shard a turn (module docs, "In batches"). Format: a
+/// counter name.
+pub(crate) const BATCH_CALLS: &str = "vcs_store.homes.batch_calls";
+
+/// Runs `work` on each of `items` at its identity's home among `shards` (module docs, "In batches"): one cross-shard
+/// call a home shard a turn, each working through its items until the home's step quantum is spent and answering the
+/// rest to be sent again, so no call holds a home past a quantum. Each item's answer in `items`' order; none for an item
+/// whose home did not answer within `budget_ns` of its own time.
+async fn per_home<I, O>(
+  origin: u16,
+  shards: &[u16],
+  items: Vec<(ContentId, I)>,
+  budget_ns: u64,
+  work: fn(&mut ShardState, &ContentId, I) -> O,
+) -> Vec<Option<O>>
+where
+  I: Send + 'static,
+  O: Send + 'static,
+{
+  let mut answers: Vec<Option<O>> = items.iter().map(|_| None).collect();
+  let mut by_home: std::collections::BTreeMap<u16, Vec<(usize, ContentId, I)>> =
+    std::collections::BTreeMap::new();
+  for (at, (identity, item)) in items.into_iter().enumerate() {
+    if let Some(home) = home_of(shards, &identity) {
+      by_home.entry(home).or_default().push((at, identity, item));
+    }
+  }
+  for (home, mut pending) in by_home {
+    while !pending.is_empty() {
+      let batch = core::mem::take(&mut pending);
+      let answered = crate::xshard::call_in_shard_time(
+        origin,
+        home,
+        move |state| {
+          let quantum_ns = state.config.step_quantum_ns();
+          let began = slates_rt::futures::now_ns();
+          let mut done = Vec::new();
+          let mut rest = Vec::new();
+          for (at, identity, item) in batch {
+            // At least one item a call, so a turn always progresses.
+            if !done.is_empty() && slates_rt::futures::now_ns().saturating_sub(began) >= quantum_ns
+            {
+              rest.push((at, identity, item));
+            } else {
+              done.push((at, work(state, &identity, item)));
+            }
+          }
+          state.count(BATCH_CALLS, 1);
+          (done, rest)
+        },
+        budget_ns,
+      )
+      .await;
+      let Some((done, rest)) = answered else {
+        break;
+      };
+      for (at, answer) in done {
+        if let Some(slot) = answers.get_mut(at) {
+          *slot = Some(answer);
+        }
+      }
+      pending = rest;
+      if !pending.is_empty() {
+        slates_rt::futures::yield_now().await;
+      }
+    }
+  }
+  answers
+}
+
+/// [`keep_here`] for one item of a batch: the window's bytes, checked against the identity it was sent under.
+fn keep_item(
+  state: &mut ShardState,
+  identity: &ContentId,
+  bytes: Vec<u8>,
+) -> Result<(ContentId, HomeTicket), HomeRefused> {
+  let kept = keep_here(state, &bytes)?;
+  if kept.0 == *identity {
+    Ok(kept)
+  } else {
+    Err(HomeRefused::Misnamed)
+  }
+}
+
+/// [`read_here`] for one item of a batch.
+fn read_item(state: &mut ShardState, identity: &ContentId, (): ()) -> Option<Vec<u8>> {
+  read_here(state, identity)
+}
+
+/// [`let_go_here`] for one item of a batch.
+fn let_go_item(state: &mut ShardState, identity: &ContentId, (): ()) -> Result<(), HomeRefused> {
+  let_go_here(state, identity)
+}
+
+/// Homes every window of `windows` from shard `origin` (module docs, "In batches"): each one's identity and ticket, in
+/// order, or why not (`Unanswered` where its home did not answer within `budget_ns` of its own time).
+pub(crate) async fn home_many(
+  origin: u16,
+  shards: &[u16],
+  windows: Vec<Vec<u8>>,
+  budget_ns: u64,
+) -> Vec<Result<(ContentId, HomeTicket), HomeRefused>> {
+  let items: Vec<(ContentId, Vec<u8>)> = windows
+    .into_iter()
+    .map(|bytes| (ContentId::of(&bytes), bytes))
+    .collect();
+  per_home(origin, shards, items, budget_ns, keep_item)
+    .await
+    .into_iter()
+    .map(|answer| answer.unwrap_or(Err(HomeRefused::Unanswered)))
+    .collect()
+}
+
+/// Reads every window of `identities` from its home, from shard `origin` (module docs, "In batches"): each one's bytes,
+/// in order, checked against its name, or none.
+pub(crate) async fn read_many(
+  origin: u16,
+  shards: &[u16],
+  identities: &[ContentId],
+  budget_ns: u64,
+) -> Vec<Option<Vec<u8>>> {
+  let items: Vec<(ContentId, ())> = identities.iter().map(|identity| (*identity, ())).collect();
+  per_home(origin, shards, items, budget_ns, read_item)
+    .await
+    .into_iter()
+    .zip(identities)
+    .map(|(answer, identity)| {
+      answer
+        .flatten()
+        .filter(|bytes| ContentId::of(bytes) == *identity)
+    })
+    .collect()
+}
+
+/// Lets go one holder of every window of `identities` at its home, from shard `origin` (module docs, "In batches"):
+/// each one's answer, in order.
+pub(crate) async fn let_go_many(
+  origin: u16,
+  shards: &[u16],
+  identities: &[ContentId],
+  budget_ns: u64,
+) -> Vec<Result<(), HomeRefused>> {
+  let items: Vec<(ContentId, ())> = identities.iter().map(|identity| (*identity, ())).collect();
+  per_home(origin, shards, items, budget_ns, let_go_item)
+    .await
+    .into_iter()
+    .map(|answer| answer.unwrap_or(Err(HomeRefused::Unanswered)))
+    .collect()
 }
 
 #[cfg(test)]
