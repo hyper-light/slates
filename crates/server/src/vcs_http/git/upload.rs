@@ -39,7 +39,7 @@ pub(crate) trait StoreLender {
   /// The room a request is admitted (A-713): what the shard the stores live on could admit now, as a push is admitted
   /// (A-704), since everything upload-pack keeps answering it is that shard's to hold; never one request's room, which a
   /// long history's walk and its pack's list of objects pass. None when the shard's state is not lent.
-  fn room(&mut self) -> Option<u64>;
+  fn room(&mut self, repository: RepositoryId) -> Option<u64>;
 
   /// Runs `step` over the store of the repository `asked` names as upload-pack answers a request of the principal it
   /// names, with the pack source: the refs that principal may read, in name order and each once, and the branch `HEAD`
@@ -88,7 +88,10 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
     if start.service != Service::UploadPack || !self.lender.holds(start.repository.id) {
       return Err(ServiceRefused::Unavailable);
     }
-    let room = self.lender.room().ok_or(ServiceRefused::Unavailable)?;
+    let room = self
+      .lender
+      .room(start.repository.id)
+      .ok_or(ServiceRefused::Unavailable)?;
     Ok(Upload {
       lender: self.lender.clone(),
       repository: start.repository.id,

@@ -135,9 +135,9 @@ pub(crate) trait HgStores {
     room: &mut Admission,
   ) -> Option<Outcome>;
   /// The room a push is admitted (A-711): what the repository's owner shard could admit now (the daemon's,
-  /// `crate::git_push::push_room`, as A-704 admits a git push), never one request's room; `None` where the lender
+  /// `crate::vcs_share::room`, as A-704 and A-724 admit a git push), never one request's room; `None` where the lender
   /// names none, and the edge's request room bounds it.
-  fn push_room(&self) -> Option<u64> {
+  fn push_room(&self, _repository: RepositoryId) -> Option<u64> {
     None
   }
 }
@@ -251,7 +251,7 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     }
     let pusher = routed.unbundle.then_some(principal);
     let room = match pusher {
-      Some(_) => self.stores.push_room().unwrap_or(self.room),
+      Some(_) => self.stores.push_room(repository.id).unwrap_or(self.room),
       None => self.room,
     };
     match HgExchange::new(self.stores.clone(), (repository, pusher), head, room) {

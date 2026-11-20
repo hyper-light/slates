@@ -408,7 +408,7 @@ impl StoreLender for NoGit {
     false
   }
 
-  fn room(&mut self) -> Option<u64> {
+  fn room(&mut self, _repository: RepositoryId) -> Option<u64> {
     None
   }
 
