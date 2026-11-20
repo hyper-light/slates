@@ -85,6 +85,7 @@ pub mod hook_view;
 pub mod learn;
 mod naming;
 use crate::positions;
+pub mod packed;
 mod push;
 mod repository;
 pub mod rows;

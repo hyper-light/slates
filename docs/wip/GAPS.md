@@ -12,6 +12,33 @@
 > `reserve_per_shard` = memory / shards / 3 sizes each shard's slice of the content object (write log R/4, image slots
 > 2R, delta log R, arena R: about 1.4 times the machine's memory of address space, ~220 GB on the 96 GB Studio, g226),
 > the reserve's ceiling, the DAX table, the client and fleet shares; the sweep of every sizing site follows here.
+> **The sweep (w-sizing, 2026-11-20, by reading origin/main 6337049f6; today -> what it should be):**
+> - The root: `reserve_per_shard` = min(memory.total, the OS/job/cgroup bound) / shards / 3 (`config.rs`
+>   `DaemonConfig::derive`, `slates_mem::budget::region_bytes`). Machine-derived, fixed at boot. Every size below
+>   derives from it. -> Split its two roles: an admission ceiling learned from the work and the device's pressure (the
+>   machine total only a ceiling), and address space reserved by what is stored, not by the ceiling.
+> - The content object's address space, per shard (`shard_content_layout`): write log R/4, two image slots 2R, delta
+>   log R, DAX table, arena R; about 4.25R a shard, 1.4 times memory in all (220 GB mapped on the 96 GB Studio, g226;
+>   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
+>   grown by doubling; the arena grown by pool extents (A-98) as content arrives; the write log from the measured
+>   write stream between barriers.
+> - The idle prefault reserve (A-214): the last burst, capped at R. A-765 decays it; w-hg's release run held 4,931.4
+>   MiB resident after hg's history push and faulted 3.5 GB more at idle. -> Removed unless the A/B (prefault vs none,
+>   R9 provisioning p99, RSS) shows it pays; if it does, an EWMA of the pages a turn touches.
+> - Tables from R: `table_bytes` (R x TABLE_SHARE), `max_inodes`, `max_dirs`, `max_chunks`, `metadata_class_bytes`,
+>   the volume record bound. -> Grown on demand (doubling, given back on shrink), bounded by admission, not
+>   preallocated from R.
+> - Shares of R: `clients_per_shard` (R x CLIENT_SHARE / region), the NFSv4 client share and slots, the fleet receive
+>   windows (R x FLEET_RECEIVE_SHARE), `dax_range_slots` (R / DAX_RANGE_BYTES), the quota-to-inode bound in `verbs.rs`.
+>   -> From measured concurrency (clients served now, windows a peer's measured rate x RTT), pressure-capped.
+> - Device reads: `slates_machine::facts::resident_now` is RSS on macOS, which counts given-back shared pages (above);
+>   the pressure hold's own growth reads it. -> The footprint on macOS; Linux PSI and Windows commit already watched
+>   (A-570). The pressure seam is consulted by admission only; the sizes above don't read it yet.
+> - Give-back on macOS: `MADV_FREE_REUSABLE` over the shared content object leaves RSS (probe: 513 MiB stays, not
+>   reclaimed in 10 s under pressure); a purgeable Mach memory entry set `VM_PURGABLE_EMPTY` frees at once (513 -> 1
+>   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
+> - Allocations on the idle path: `prefault_reserve` builds a `Vec` a pass, `purge_keeping` clones the region order,
+>   `pieces_against` a `Vec` a run. -> Reused per-shard scratch.
 >
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
@@ -105,6 +132,10 @@
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. The partition's records shipped a log at a time BUILT (A-636 part 2b): each state log's record of each operation, carrying the operation's identity and spans, held by its holders as a prefix of the log; every server dispatch by the register's class. OWED: a repository's greens placed on its holders at their joins (A-636 part 2b-2), then the server's takeover by the rule, every log of a repository following one successor (2c).
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
+>
+> **A-722 memory B1 (2026-11-20, w-git).** BUILT: an object read in place from a held pack (`store::packed`, one
+> `PackSource` seam for RAM and w-store's disk). Owed: B2 rows by pack place and every reader through it, B3 the
+> quarantine by entry place, B4 the inflated copies gone; resident after a push bounded by a derived multiple of its pack.
 >
 > **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
 > position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
