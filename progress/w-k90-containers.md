@@ -88,3 +88,10 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 ## NEXT: W10 server side: pod start -> hold at home -> host/port from [slates_fleet.nodes] -> k8s::volume::objects ->
    kubeapi create PV/claim/pod (new verbs) + chart RBAC (Role pvc create/delete in jobs ns; ClusterRole PV create/get/delete);
    end/reaper: delete pod, claim, PV; release at home.
+
+## W10 cluster piece LANDED 2026-11-20 kiln main 8c501c906 (kubeapi PV/claim verbs, k8s::volume::{make,unmake}, chart rbac.agentPods).
+## BLOCKED on main (asked 2026-11-20 ~00:4x PST):
+- W10 pod start: ephemeral one-session runner in the pod (my pick) vs harness-only pod.
+- W9 harness sign-in in a container: image's own vs credential grant by name.
+## Owed by others: live container start + Runners page browser check (main); Docker Desktop share key (needs a Mac with
+   Desktop); Windows (jupiter BLOCKED).
