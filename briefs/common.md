@@ -135,6 +135,9 @@ worktree stays where it is) or push it directly: `git push origin HEAD:refs/head
   routes above), a full disk, a stale branch, a merge conflict, a flaky run. Otherwise say it in one line in your
   summary or report and go straight on to the next item in your queue. Never end a turn just to wait for an answer.
   Main checks every agent about every five minutes and will unblock you.
+- Reading free disk on macOS: `df -h ~ | awk 'NR==2{print $4}'`. The 4th column (Avail) is free space. The "10G"
+  further right is ifree (free inodes), and three agents misread it on 2026-11-20 as 6-13 GB free on a Studio with
+  999 GiB free.
 - Disk: before each build check `df -h ~`. Below 25 GB free, delete your OWN landed worktrees, your target's
   `release/` and `incremental/` directories, and datasets you no longer need. Never delete another agent's
   folders; tell main instead. Delete by exact path only, never a glob over ~/.cache. Never write `rm -rf $var`
