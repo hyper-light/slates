@@ -11318,6 +11318,13 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >
 > **Status (2026-11-20, A-728 part 3: measured).** A 1,000-revision Subversion import: the history's heap 50.3 to
 > 2.0 MiB, `Green::commit`'s 285.1 to 200.0 MiB (BENCHMARKS.md).
+>
+> **Status (2026-11-20, A-728 part 4: the honest charge; main's ruling, A-714's rule).** The history's retention counts
+> every block it keeps whole; only the latest value's own block, the current file, is current (`Value::own`). A change
+> that supersedes a value adds its list and what it keeps of its own block (`Value::kept_when_superseded`: the whole
+> block when named whole or held elsewhere, else the runs it named), which `Green::history_reservation` charges before
+> the verdict whatever the ops (`Green::superseded_bytes`). A file's first small edit now charges the earlier file
+> whole, as it is kept; before, it was counted as the current value's and went uncharged.
 
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
@@ -54846,6 +54853,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   stack (`crates/cli/bench/svn_history_mem.sh`, three runs each, identical): the content history 50.3 MiB before,
   2.0 MiB after; everything under `Green::commit` 285.1 MiB before, 200.0 MiB after (85.1 MiB, 30%, less). A-723's
   234.8 MiB was that `Green::commit` row, mostly the current files' blocks, which stay.
+- **Part 4, the honest charge (main's ruling of 2026-11-20).** A block chunk counts its whole block, and a value's own
+  block (`Value::own`, the current file's while the value is its path's latest) is the only part counted as current;
+  the seal now touches that block alone and clears it, and `seal_latest` moves its length from current to history. The
+  reservation is one rule (`Green::superseded_bytes`): the superseded value's list and what it keeps of its own block,
+  so it equals what the commit retains (`short_edits_and_unlinks_reserve_the_values_they_supersede`: a 1-byte edit of a
+  2 KiB file reserves and retains 2,072 bytes, 25 before). The small-edits test retains the earlier file once (at least
+  64 KiB, under two copies); folded to the head, 0. Measured on the 1,000-revision import: the owner shard's committed
+  bytes after it are 646,696,952 with and without part 4, three runs each, since the service folds this green's
+  history as it imports (no reader holds a version), so nothing is retained at rest either way; the charge rises only
+  where a reader holds history. `slates status --json` does not print a shard's `retained_bytes`, so the charge is not
+  readable from outside (owed). macOS arm64, Mac Studio, local: `slates-merge --lib` 223 of 223; integration `engine`,
+  `special`, `checkpoint`, `chain_replay`, `rebase`, `splice`, `verdict`, `base_for`, `derive`, `increment`, `identity`,
+  `map`, `origin`; `slates-server --test green_retention`, `--lib merge_service` 14 of 14; fmt clean.
+
 
 
 ### A-726 — `svn blame` and `svn diff` over HTTP: the `file-revs-report` and `get-locations` served through the DAV site (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 5 "HTTP"; A-681, A-627, A-613)
@@ -54946,11 +54967,14 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   its_path_in_svnserves_words`, `a_lock_runs_pre_lock_for_its_token_and_post_lock_after_it_as_svnserve_does`,
   `an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` (a file committed from stock `svn`'s recorded delta);
   `slates-svn` `serve::` and `commit::` (stock `svnserve`'s recorded lock sessions replayed through the four calls).
-- **Owed.** Part 3: the `svn+ssh://` tunnel. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
-
-- **Owed.** Part 2: pre-lock (its token the lock's) and post-lock, pre- and post-unlock around A-602's check. Part 3:
-  the `svn+ssh://` tunnel. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
-
+- **Part 3 (same day): the `svn+ssh://` tunnel.** `vcs_svn::run_hook` takes a `HookSite`: the listener's connection
+  (its repository's policy read on the owner shard, `ClientGone` its hang-up) or the tunnel's repository policy (no
+  hang-up signal on the SSH edge yet). The tunnel's steps await its hooks: start-commit and pre-commit, post-commit,
+  and the lock verbs' through `vcs_svn::pre_lock_hooks` and `post_lock_hook`. Tests:
+  `vcs_ssh::svn::tests::a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`,
+  `a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them` (the tunnel driven on a runtime of its own).
+- **Owed.** The SSH edge's signal of the client gone, for a hook's run. The revprop hooks' calls with A-702 part 2
+  (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view.
 
 ### A-664 live whole builds, part 1 — A push's whole map built in slices after its answer, the submits that need it parked (2026-11-20, w-shared for UI goal 93; main's ruling (a))
 - **Why.** A push that leaves a git green with no map of the version before (its first push, one past a copy) built
