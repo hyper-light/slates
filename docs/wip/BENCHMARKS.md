@@ -14742,6 +14742,37 @@ Ranked plan, each owed:
 - M4, the green checkpoint's whole-green copy (47 MiB in two allocations).
 - M5, fixed per daemon: the timer wheels' 898 MiB reservation, the segment's 43 MiB unit set, 47 MiB of thread stacks.
 
+## A green's history names the file's block: the svn import's merge-engine heap before and after (A-728; UI goal 93; 2026-11-20)
+
+- **Machine and builds:** the Mac Studio of the entries above (Adas-Mac-Studio.local, 32 cores), 2026-11-20 ~08:37
+  UTC, load average 5.68 at the start and 17.03 at the end (shared; not quiesced). Release builds of `slates-cli`:
+  *after*, main 99ecba1b1 (A-728 parts 1 and 2 in); *before*, the same tree with `crates/merge/src/{history,dims,
+  engine,engine/branch,engine/reanchor}.rs` taken back to e71043ff6 (since then only A-728 and a test-only lint touched
+  them), so the two differ by A-728 alone (`nm` finds `Value::seal` in after only).
+- **Data:** git/git's newest 1,000 first-parent commits as a dump (`git_to_svn_dump.py src.git master 1000`, 223 MiB),
+  the dataset of "Where the svn server's time and memory go" above.
+- **Command:** `crates/cli/bench/svn_history_mem.sh SLATES git-1000.dump LABEL`, three runs each, interleaved, before
+  first. Every import answered `revisions: 1000 youngest: 1000`.
+
+| Live heap after the import, by stack | before 1 | 2 | 3 | after 1 | 2 | 3 |
+|---|---|---|---|---|---|---|
+| the content history (`slates_merge::history`) | 50.3 | 50.3 | 50.3 | 2.0 | 2.0 | 2.0 |
+| `Green::commit`, all | 285.1 | 285.1 | 285.1 | 200.0 | 200.0 | 200.0 |
+| physical footprint (GB, as `malloc_history` rounds it) | 2.5 | 2.5 | 2.5 | 2.4 | 2.4 | 2.5 |
+
+MiB unless marked. The history's own allocations go from 50.3 MiB, its whole copies of files (`Value::whole`), to
+2.0 MiB, its piece lists (`Value::named`, 0.9 MiB) and the like: every value it keeps whole is now the file's block.
+Under `Green::commit` the heap falls by 85.1 MiB (30%): the 48.3 MiB above, and 35.5 MiB fewer bytes in allocations
+inlined into `commit` and `engine::apply` (228.6 MiB before, 193.1 after), which hold the new files' bytes. That second
+part is inferred, not traced: the history's copies made by callers the release build inlines into `commit` (the seed's
+and the splice's) carry no history frame, so they counted there. The footprint moves within its rounding.
+
+Said plainly, this is less than the 234.8 MiB A-723 quoted for the history: that row of the table above is everything
+`Green::commit` allocates, about 226 MiB of it the current files' own bytes (the greens' file blocks), which A-728
+keeps; the history held 50.3 MiB of them twice, and now holds none. The service folds this repository's history to
+its floor as it imports (the row is flat from 250 to 1,000 revisions), which is why the history was 50 MiB and not the
+dump's size.
+
 ## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
 
 - **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
@@ -14878,8 +14909,13 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
 | medium class p99 / alone | 6.8 | 7.1 |
 | hot repository's 19 pushes | all ok, 30.1 s | none ok: 12 connections reset, 7 empty answers; the daemon gone |
 
-- **Why it lost.** A step that waits its turn re-polls by yielding, so a shard with many waiting pushes polls without
-  stepping, and the watchdog ended the daemon. And the toys grew slower, not faster, so their wait was not the owner
-  shard's CPU taken by the hot repository's steps. Rejected. The cause of the toys' p99 is to be found by profiling the
-  R = 100 step (owed, A-724), not guessed.
+- **Why it lost.** The toys grew slower, not faster, so their wait was not the owner shard's CPU taken by the hot
+  repository's steps. Rejected. The cause of the toys' p99 is to be found by profiling the R = 100 step (owed, A-724),
+  not guessed.
+- **Corrected (2026-11-20, a later run).** This section first said the daemon ended because waiting steps re-polled by
+  yielding. A run of main itself (release from b8e4591, no fair turns, the same command at R = 100, load 10.0) ended the
+  daemon the same way: the hot repository's 19 pushes 10 connections reset and 9 empty answers; the toys' p99 16.5 times
+  alone (5.293 s), the medium class 10.1 times. So the daemon's end is not this experiment's: main regressed between
+  1e84630b1 (the section above: every push ok) and b8e4591, or the end is intermittent. The rejection stands on the
+  toys' p99 alone. Reported to main; the run's profile is `~/.cache/w-balance/r100.sample` on adas-mac-studio.local-2.
 

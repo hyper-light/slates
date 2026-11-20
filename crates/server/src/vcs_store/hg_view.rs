@@ -35,7 +35,7 @@ use slates_hg::push::Outcome;
 use slates_hg::push::held::IndexHeld;
 use slates_hg::serve::indexed::{Indexed, State};
 use slates_hg::{Admission, Node, PastAdmission};
-use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
+
 use slates_vcs::ContentStore;
 
 use crate::repository::hg_push::{self, BOOKMARK_TAG, Pushing, bookmark_of};
@@ -191,11 +191,7 @@ fn register_of(
   charge_each::<(Vec<u8>, Node)>(room, repositories.branches(id, BOOKMARK_TAG).count())?;
   let mut bookmarks = Vec::new();
   for (name, green) in repositories.branches(id, BOOKMARK_TAG) {
-    let head = state.greens.get(&green).and_then(|engine| {
-      engine
-        .xattr(ROOT, HEAD_ATTRIBUTE)
-        .and_then(|bytes| Node::try_from(bytes).ok())
-    });
+    let head = super::hg_made::head_of(state, green);
     let (Some(bookmark), Some(head)) = (bookmark_of(name), head) else {
       continue;
     };
