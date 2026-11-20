@@ -644,6 +644,7 @@ fn check_hello(ours: &[u8], theirs: &[u8]) {
     b"known",
     b"lookup",
     b"protocaps",
+    b"pushkey",
     b"unbundle",
   ];
   assert_eq!(names, served);

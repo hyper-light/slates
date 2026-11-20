@@ -14046,18 +14046,8 @@ const STAGED_DELTA_BYTES: usize = BUILT_VOLUME_FILES * BURST_VOLUME_FILE_BYTES;
 /// Shape: one `StagePut`'s bytes: under the test client's 4 KiB ring slot with the request's framing.
 const STAGE_PUT_BYTES: usize = 3 << 10;
 
-/// A-757 part 2b (w-forming, 2026-11-20; found by use: a 1.8 to 2.5 MB delta sealed and appended in its publication's
-/// one turn, 128 to 331 ms of a debug owner shard's CPU, 1.39 ms in release for 2.4 MB). Do: three nodes at `f = 1`; on a,
-/// a small live-shipped volume; cut a's seal turns to a page (`Daemon::inject_seal_walk_quantum(Some(0))`); stage three
-/// MiB and write them as one file (`FsWriteStaged`), one publication. Expect the write answered at durability, its delta
-/// sealed and hashed by a build of its own over at least the content's bytes over a page in turns, and a's log durable at
-/// its head with both holders there. Before, the delta was sealed and hashed in the turn that published it.
-#[test]
-fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
-  let _serial = serialize_fleet_tests();
-  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
-  let owner = daemons[0].instance().to_owned();
-  let mut client = Client::connect(&owner);
+/// A volume `client` makes on the owner, written once, set live-shipped, and written again: its id and attachment.
+fn live_shipped_between_small_writes(client: &mut Client) -> (VolumeId, u64) {
   let ReplyBody::Created { id } = client.call(&RequestBody::Create {
     name: "large-delta".to_owned(),
     size: SizeClass::Bounded {
@@ -14069,7 +14059,7 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
   }) else {
     panic!("the volume was created");
   };
-  let attachment = write_attachment(&mut client, id);
+  let attachment = write_attachment(client, id);
   let first = client.call(&RequestBody::FsWrite {
     volume: id,
     attachment,
@@ -14094,6 +14084,11 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
     mode: 0o644,
   });
   assert!(matches!(second, ReplyBody::FsDone { .. }), "{second:?}");
+  (id, attachment)
+}
+
+/// The large content staged on `id`'s staging buffer, a put at a time: the buffer's token.
+fn staged_large_content(client: &mut Client, id: VolumeId) -> u64 {
   let len = u64::try_from(STAGED_DELTA_BYTES).unwrap();
   let ReplyBody::Staged { token } = client.call(&RequestBody::StageBegin { work: id, len }) else {
     panic!("a staging buffer of {len} bytes");
@@ -14110,6 +14105,23 @@ fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
     });
     assert!(matches!(put, ReplyBody::StagePutDone { .. }), "{put:?}");
   }
+  token
+}
+
+/// A-757 part 2b (w-forming, 2026-11-20; found by use: a 1.8 to 2.5 MB delta sealed and appended in its publication's
+/// one turn, 128 to 331 ms of a debug owner shard's CPU, 1.39 ms in release for 2.4 MB). Do: three nodes at `f = 1`; on a,
+/// a small live-shipped volume; cut a's seal turns to a page (`Daemon::inject_seal_walk_quantum(Some(0))`); stage three
+/// MiB and write them as one file (`FsWriteStaged`), one publication. Expect the write answered at durability, its delta
+/// sealed and hashed by a build of its own over at least the content's bytes over a page in turns, and a's log durable at
+/// its head with both holders there. Before, the delta was sealed and hashed in the turn that published it.
+#[test]
+fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let (id, attachment) = live_shipped_between_small_writes(&mut client);
+  let token = staged_large_content(&mut client, id);
   let counts = |daemon: &Daemon| {
     [LIVE_DELTA_BUILDS, LIVE_WHOLE_HASH_TURNS].map(|kind| refusal_count(daemon, kind).unwrap())
   };
@@ -21949,6 +21961,16 @@ fn assert_released_after_the_restart<F: std::fmt::Debug>(
     1,
     "A recorded the lost creation's floor: {floors_after_loss:?}"
   );
+  assert_released_and_made_again((released, released_count), admitted, made);
+}
+
+/// After B's restart: A released the floor and B's count moved, and the name was made again at an id none of
+/// `admitted`.
+fn assert_released_and_made_again(
+  (released, released_count): (bool, &Result<Option<u64>, ObserveError>),
+  admitted: &[VolumeId],
+  made: &ReplyBody,
+) {
   assert!(released, "A released the floor after B's restart");
   assert!(
     matches!(released_count, Ok(Some(count)) if *count >= 1),

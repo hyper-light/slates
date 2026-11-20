@@ -81,11 +81,9 @@ fn await_live<T>(daemon: &Daemon, what: &str, mut step: impl FnMut() -> Option<T
 }
 
 fn connect(instance: &str) -> Client {
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(e) => panic!("{e}"),
-    }
+  match Client::connect(instance, deadlines()) {
+    Ok(client) => client,
+    Err(e) => panic!("{e}"),
   }
 }
 

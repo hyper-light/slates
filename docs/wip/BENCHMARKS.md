@@ -15207,3 +15207,102 @@ ended the daemon; run 1's DAV landing finished inside its window. Peak RSS is ab
 growing copy, `Revision::of_work`'s copy, the revision record's encoding into one log entry, the records' copy and the
 green's file. Owed (GAPS): the landing a slice at a time (rule 3) and the texts held once (rule 1: the green's staged
 blocks as the sink, the increment setting the path from the held identity, the record and log naming identities).
+
+## A-722's proof: 19 and 100 concurrent large pushes to one repository, every one answered and the daemon alive (A-722, A-753; UI goal 93; 2026-11-20)
+
+- **The machine and builds.** adas-mac-studio.local-2 (M3 Ultra, 32 cores, 23 shards), release builds of main in
+  w-git's own clone and target (`~/.cache/w-git-clone`, `~/.cache/w-git-target.noindex`, `CARGO_INCREMENTAL=0`): main
+  c729cdea5 for (a) to (c) and the first (d), the diagnostic branch agents/w-git-diag (main 91a546972 with the append's
+  refusal logged) for the second, main 7ad7e19fc with A-753 for (e). Dataset `~/.cache/g309-scale/src.git` (git/git);
+  v1.5.0's pack 34,296 objects, 9.8 MB.
+- **The commands.** (a) `crates/cli/bench/multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0
+  --steps 100 --per-repository-cap 10`; (b) the same uncapped (its hot repository takes 19 v1.5.0 pushes); (c) to (e)
+  N concurrent v1.5.0 pushes to one repository, each creating its own branch with the whole pack, through
+  `multi_repo_load`'s own daemon and burst (a scratch driver, `~/.cache/w-git-runs/one_repo.py SLATES SOURCE v1.5.0 19
+  100`, on that machine, not in the tree).
+
+| run | load | pushes | answered | ok | daemon | wall | peak RSS (a push) | longest step (phase) |
+|---|---|---|---|---|---|---|---|---|
+| (a) R=100, cap 10 | 3.7 | 77 | 77 | 77 | alive | 29.4 s | 4,046 MiB | 72.8 ms (answer) |
+| (b) R=100, uncapped | 3.9 | 86 | 86 | 86 | alive | 56.5 s | 4,390 MiB | 76.5 ms (answer) |
+| (c) one repository, N=19 | 2.7 | 19 | 19 | 19 | alive | 58.7 s | 1,337 MiB (65.8 MiB) | 73.0 ms (answer) |
+| (d) one repository, N=100, before A-753 | 2.7, 3.3 | 100 | 100 | 80 | alive | 391 s, 372 s | 4,836 to 5,435 MiB (47 to 54 MiB) | 218.3 ms (answer) |
+| (e) one repository, N=100, A-753 | 6.3 to 7.3, not quiet | 100 | 100 | 100 | alive | 1,509 s | 2,969 MiB (28.8 MiB) | 73.7 ms (answer), 57.9 ms (check) |
+
+- **What it says.** No run ended the daemon: ten, nineteen and a hundred concurrent v1.5.0 pushes to one repository
+  are each answered. The 20 of 100 refused in (d) were the partition's green chains at their cap (the diagnostic build's
+  log: `TableAtCapacity { table: "green_chains" }`), each branch created from nothing holding the whole tree as its own
+  work; A-753 makes a branch at a commit another branch holds from that branch, and (e) answers all 100 with less than
+  half the memory a push. (e) ran with other agents' work on the machine (load 6 to 7, 9 GB free at its start), so its
+  wall is not comparable with (d)'s. The longest step, about 74 ms, is the answer's: a stage another landing overtook,
+  made again whole by the commit (A-722 part 4e moves it into the judge's turns).
+
+
+## A push's work built over turns: the build no longer one step (A-752 part 2; main's order of 2026-11-20; 2026-11-20)
+
+- **Machine, build, command:** Mac Studio (M-series), debug, `cargo test -p slates-server --lib t_a752` on the audit
+  daemon (its step quantum about 3 us, so a turn's budget about 1.5 to 2.6 us): a flat 1,500-file tree created, then a
+  commit changing every file, each pushed by a task on the shard a step at a time.
+- **Before** (main ca204fc87, part 1 only): the work built inside the verdict's one step; w-git's 3,500-file measure
+  374 to 642 ms in that step.
+- **After:**
+
+| push (1,500 files, debug) | build turns | past budget | longest build turn | longest unit | longest opening |
+|---|---|---|---|---|---|
+| create | 158,681 | 0 | 1.13 ms | 1.12 ms (a tree's listing) | 0.43 ms |
+| update | 163,182 | 0 | 1.13 ms | 1.12 ms | 0.43 ms |
+
+  The update's longest step of its whole answer is 92 ms, the create's 37 ms: outside the build turns (the entry apply,
+  part 3, is the one left in one step).
+- **Cost:** the paced build (async deriver, merge sort, indexed base) builds a 3,500-file push in 85 ms where the
+  one-call form took 66 ms (merge-level probe of the whole build, debug, unbounded pace).
+- **Part 2b** (git's trees listed an entry a unit, same command and machine, 2026-11-20): longest build unit 1.12 ->
+  0.22 ms, longest build turn 1.13 -> 0.49 ms, past budget 0, turns unchanged (158,681 and 163,182).
+- **Part 3a** (the paths map's step after a push in slices, same command and machine, 2026-11-20): the update's longest
+  answer step 94 -> 42 ms (its parts before, by probes: secure 5.0, engine verdict 8.3, git store record 6.5, git store
+  commit 5.0, engine commit 10.9, recorded entry 4.7, paths map 52.4 ms).
+
+## Mercurial's own repository imported: the record 7.8 times smaller in three steps, the landing still one step (A-727, A-732, S5; UI goal 93; 2026-11-20)
+
+- **Machine:** Mac Studio `adas-mac-studio.local-2` (32 cores, 96 GiB), 2026-11-20 04:26 to 07:57 UTC, shared (other
+  agents' builds), not quiesced.
+- **Builds** (release, `cargo build --locked --release -p slates-cli`, each with one bench-only line printing the
+  import record's length after `writer.finish()` in `vcs_store::hg_import`, not committed):
+  A = b1d001601 (before S5's import half: file texts and manifests whole);
+  B = de381e643 (main with w-hg's 98bcb0002: manifests as delta and base; A-740's task names);
+  C = de49b6bd4 (w-hg's file revisions as one hunk against the previous revision in their log).
+- **Command:** `~/.cache/w-perf/ab.sh 3` (A and B interleaved, the order flipped each round) and
+  `VARIANTS=C ab2.sh 3` after, cap 1,800 s an import (`perl alarm`): a fresh anchor and daemon a run, `slates
+  repository create mercurial --tool hg`, then `slates repository import mercurial ~/.cache/w-perf/hg-src`
+  (Mercurial's own repository). Peak RSS is the largest resident set of the instance's processes other than the anchor
+  (the daemon, through restarts), sampled every 200 ms. Logs and timestamps: `~/.cache/w-perf/ab/20261120T042601/` and
+  `.../20261120T072703/` on the Studio.
+
+| run | exit | wall (s) | peak RSS (KiB) | record (bytes) | spins |
+|---|---|---|---|---|---|
+| A-1 | cap (142) | 1,800.2 | 23,969,952 | 10,049,541,313 | 6 |
+| A-2 | cap (142) | 1,800.2 | 23,886,736 | 10,049,541,313 | 6 |
+| A-3 | cap (142) | 1,800.2 | 23,883,024 | 10,049,541,313 | 8 |
+| B-1 | cap (142) | 1,800.2 | 10,076,352 | 4,657,833,574 | 9 |
+| B-2 | cap (142) | 1,800.2 | 10,079,408 | 4,657,833,574 | 8 |
+| B-3 | cap (142) | 1,800.2 | 10,215,616 | 4,657,833,574 | 8 |
+| C-1 | refused (1) | 502.4 | 11,280,928 | 1,295,268,184 | 3 |
+| C-2 | refused (1) | 161.8 | 10,727,136 | 1,295,268,184 | 1 |
+| C-3 | refused (1) | 154.8 | 10,996,336 | 1,295,268,184 | 1 |
+
+Best of three: A 23,883,024 KiB and a 10.05 GB record; B 10,076,352 KiB (2.4 times less) and 4.66 GB (2.2 times); C
+10,727,136 KiB and 1.30 GB (7.8 times less than A).
+
+What it means: the import's turns run 150 to 250 s every time; the record is what fails. In A and B the landing appends
+the whole record as one entry in one step (`repository/import.rs:235`'s task): the shard spins 1.0 to 1.2 s, the anchor
+restarts the daemon, recovery serves within 100 ms, and the CLI's retry imports again from the start, every cycle
+until the cap. C's record still spins its landing once, then the retry is refused, typed, at the next wall:
+`Unpublished { reason: "record 2 not published, transaction rolled back: the partition's state, 1295269070 bytes
+encoded, does not fit its 746950834-byte snapshot slot" }`. Two walls are left, both the record's: the one-step append
+of a 1.3 GB entry, and the partition snapshot that carries every retained record (A-727: records naming identities,
+their bytes in the content plane). Peak RSS does not follow the record from B to C: it is the import's working set.
+
+### The lend's swap, release (A-727 slice a2)
+`vcs_store::arena_windows::tests::wperf_swap_cost_probe` (bench-only, not committed) in a release test build of B's
+tree on the same Studio: a `ContentStore::lend_in` and `hand_back` pair costs **38.83 ns** over 10,000,000 pairs after
+100,000 to warm (`ChunkStore` 560 bytes, moved by `mem::swap` both ways).

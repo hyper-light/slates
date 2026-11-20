@@ -99,6 +99,10 @@ use crate::state::ShardState;
 
 pub(crate) mod arena_windows;
 pub(crate) mod commits;
+pub(crate) mod durable;
+#[allow(unused_imports)]
+// Owed callers: w-svn's landing (A-727 slice b); `BarrierRefused` and `ContentTicket` name its terms.
+pub(crate) use durable::{BarrierRefused, ContentTicket, content_durable, content_ticket};
 pub(crate) mod git_encode;
 pub(crate) mod git_replay;
 pub(crate) mod hg_import;
@@ -1465,6 +1469,64 @@ impl SealedPush {
     abandon_push(state, self.push);
   }
 
+  /// One turn of the push's stage made again where a landing overtook it since its seal (A-722 part 4e), begun where
+  /// `staging` holds none, for `ns` of the shard's clock and a unit at least: whether it is current, so its append's
+  /// commit adopts it rather than staging it again whole. A refusal ends it, the commit staging it and answering the
+  /// refusal there.
+  pub(crate) fn restage_turn(
+    &mut self,
+    state: &mut ShardState,
+    (staging, ns): (&mut Option<slates_git::store::Staging>, u64),
+  ) -> bool {
+    let repository = self.repository;
+    let push = &mut self.push;
+    let room = state
+      .vcs_stores
+      .git_ref(repository)
+      .map_or(0, |(_, store)| store.repository.stage_room(push));
+    let turned = within_budget(state, room, |stores| {
+      let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
+      let mut begun = match staging.take() {
+        Some(begun) => begun,
+        None if !store.repository.needs_stage(push) => return Ok(true),
+        None => store
+          .repository
+          .staging(content, push)
+          .map_err(GitRefused::Store)?,
+      };
+      let mut clock = crate::git_push::ShardClock;
+      let quantum = slates_git::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns,
+      };
+      let done = store
+        .repository
+        .stage_turn(content, push, &mut begun, quantum)
+        .map_err(GitRefused::Store)?;
+      if !done {
+        *staging = Some(begun);
+      }
+      // A stage that a landing overtook while it was made is made again from the next turn.
+      Ok::<bool, GitRefused>(done && !store.repository.needs_stage(push))
+    });
+    turned.unwrap_or(true)
+  }
+
+  /// Gives back what a stage under way ([`SealedPush::restage_turn`]) holds: a push dropped mid-decision.
+  pub(crate) fn abandon_staging(state: &mut ShardState, staging: slates_git::store::Staging) {
+    let given = {
+      let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+      lent
+        .stores
+        .content
+        .as_mut()
+        .map_or(Ok(()), |content| staging.abandon(content))
+    };
+    if given.is_err() {
+      state.count(RELEASE_REFUSED, 1);
+    }
+  }
+
   /// One turn of the admission of the move of the green keyed `green` to `to` (A-722 part 4c), begun where `admitting`
   /// holds none, for `ns` of the shard's clock and a unit at least: whether it is done, its move kept for its append
   /// ([`SealedPush::admit`]). A refusal ends it, the append admitting the move again and answering the refusal there.
@@ -2009,7 +2071,35 @@ fn recorded_alike(
     let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
     (object.kind, object.identity, len)
   });
-  admitted.eq(recorded)
+  alike(content, admitted, recorded)
+}
+
+/// Whether `made`, what the replay's admission records, is `named`, a record's, object by object ([`same_name`]).
+fn alike(
+  content: &ContentStore,
+  made: impl Iterator<Item = (slates_git::object_name::Kind, slates_vcs::ContentId, u64)>,
+  named: impl Iterator<Item = (slates_git::object_name::Kind, slates_vcs::ContentId, u64)>,
+) -> bool {
+  let mut named = named;
+  for made in made {
+    match named.next() {
+      Some(named) if same_name(content, made, named) => {}
+      _ => return false,
+    }
+  }
+  named.next().is_none()
+}
+
+/// Whether an object the replay admitted, by its identity, is the one a record named: the same kind and length, and
+/// the same identity, or (a record written before the identity rule) this node's root of it.
+fn same_name(
+  content: &ContentStore,
+  made: (slates_git::object_name::Kind, slates_vcs::ContentId, u64),
+  named: (slates_git::object_name::Kind, slates_vcs::ContentId, u64),
+) -> bool {
+  made.0 == named.0
+    && made.2 == named.2
+    && (made.1 == named.1 || content.root_of(&made.1) == named.1)
 }
 
 /// Whether the objects the replay's admission would record now are `names`, a version-2 record's, in order
@@ -2020,10 +2110,10 @@ fn names_alike(
   remade: &RecordWriter,
   names: &[(slates_git::object_name::Kind, slates_vcs::ContentId, u64)],
 ) -> bool {
-  remade
+  let made = remade
     .lacked(lacks(content, store))
-    .map(|noted| (noted.kind, noted.identity, noted.len))
-    .eq(names.iter().copied())
+    .map(|noted| (noted.kind, noted.identity, noted.len));
+  alike(content, made, names.iter().copied())
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.
@@ -2037,7 +2127,10 @@ fn replay_objects(
     return replay_pack(content, store, (push, remade), record);
   }
   for object in &record.objects {
-    if content.object_id(object.content) != object.identity {
+    // A record written before the identity rule names an object past one window by this node's root of it.
+    if content.object_id(object.content) != object.identity
+      && content.root_id(object.content) != object.identity
+    {
       return Err(ReplayRefused::Identity);
     }
     let incoming = Incoming {

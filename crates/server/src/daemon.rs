@@ -4810,6 +4810,7 @@ async fn init_shard(
     content,
     purge_seen_allocations: 0,
     content_sweep: crate::content_ranges::Sweep::default(),
+    push_turns: crate::git_push::PushTurns::default(),
     burst_seen: None,
     last_burst: 0,
     refill_settled: None,
@@ -7659,6 +7660,104 @@ mod tests {
         "restarting cannot grant a second vote in the same term"
       );
     }
+  }
+
+  /// A-727 slice b (the content plane's durability barrier; main's order of 2026-11-20). Do: on a daemon over a retained
+  /// anchor segment, with version 3 on, push the fixtures' `create`: its record names its names by identity, appended only
+  /// once the names are durable (`vcs_store::content_durable`, through the homing); then stop the daemon without
+  /// publishing anything more, as a crash between the push and anything after it, and start a successor over the same
+  /// segment. Expect: the successor replays the record whole from the content its image holds: the repository recovered,
+  /// `main` at the pushed commit, no replay refused and no names missing, the record version 3. Without the barrier (the
+  /// entry appended right after the names were put) the names are in no image and the replay is refused `Names`.
+  #[test]
+  fn t_a727b_a_crash_after_an_entry_naming_content_by_identity_loses_nothing_it_names() {
+    use slates_anchor::AnchorSegment;
+    let profile = test_profile();
+    let instance = format!("a727b-barrier-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    first
+      .observe(shard, move |state| {
+        crate::vcs_store::write_version_3_for_test(true);
+        let repository = crate::git_push::tests::git_repository(state, "barrier");
+        let request = crate::git_push::tests::chain()
+          .into_iter()
+          .next()
+          .map(|(scenario, _)| scenario.request.to_vec())
+          .unwrap();
+        let task = slates_rt::futures::spawn(async move {
+          let answered = crate::git_push::tests::homed_drive(repository, &request).await;
+          let _ = sent.send((repository, answered.map(|_| ())));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let (repository, answered) = got
+      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
+      .expect("the push answered");
+    answered.expect("the push homed its names and answered");
+    // The crash: nothing more published.
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let read = || {
+      second
+        .observe(shard, move |state| {
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          let recovered = state.vcs_stores.unrecovered(repository).is_none()
+            && !state.vcs_stores.rebuilding(repository)
+            && state.vcs_stores.holds(repository);
+          let main = state
+            .db
+            .partition()
+            .repositories()
+            .branch(repository, "main");
+          let versions: Vec<u32> = crate::vcs_store::tests::records(state, repository)
+            .iter()
+            .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
+            .collect();
+          (
+            recovered,
+            main.is_some(),
+            count(crate::vcs_store::REPLAY_REFUSED),
+            count(crate::vcs_store::NAMES_UNFETCHED),
+            versions,
+          )
+        })
+        .ok()
+    };
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    let mut seen = read();
+    while std::time::Instant::now() < deadline
+      && !seen
+        .as_ref()
+        .is_some_and(|seen| seen.0 || seen.2 > 0 || seen.3 > 0)
+    {
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+      seen = read();
+    }
+    second.stop();
+    drop(segment);
+    assert_eq!(seen, Some((true, true, 0, 0, vec![3])));
   }
 
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a

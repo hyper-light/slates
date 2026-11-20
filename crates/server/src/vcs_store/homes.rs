@@ -149,7 +149,7 @@ pub(crate) fn publication_committed() {
 }
 
 /// The ticket of a window kept on this shard now.
-fn ticket_here(shard: u16) -> HomeTicket {
+pub(crate) fn ticket_here(shard: u16) -> HomeTicket {
   let generation = IMAGES.with(|images| images.try_borrow().map_or(1, |images| images.next));
   HomeTicket { shard, generation }
 }
@@ -178,6 +178,10 @@ impl core::future::Future for PublishedHere {
       if crate::state::with_state(|state| crate::verbs::publish_shard(state).is_ok()) == Some(true)
       {
         crate::state::with_state(|state| state.count(HOME_PUBLISHED, 1));
+      } else if !published_here(generation) {
+        // The shard's publication was refused (its image lost, or no room): answered not durable at once, typed, rather
+        // than left to wait for a publication that may never come.
+        return core::task::Poll::Ready(false);
       }
     }
     IMAGES.with(|images| match images.try_borrow_mut() {
@@ -212,6 +216,16 @@ pub(crate) const HOME_PUBLISHED: &str = "vcs_store.homes.published_for_ticket";
 /// Whether the window of `ticket` is durable at its home, asked from shard `origin` (module docs): waits on the home, in
 /// its own time up to `budget_ns`, for its image of the ticket's generation; false when that did not come within it.
 pub(crate) async fn published(origin: u16, ticket: HomeTicket, budget_ns: u64) -> bool {
+  published_within(origin, ticket, budget_ns).await == Some(true)
+}
+
+/// [`published`], telling a home that did not answer (none) from one whose image of the ticket's generation was not
+/// published within the wait (false): what `super::durable::content_durable` refuses by kind.
+pub(crate) async fn published_within(
+  origin: u16,
+  ticket: HomeTicket,
+  budget_ns: u64,
+) -> Option<bool> {
   let generation = ticket.generation;
   crate::xshard::task_in_shard_time(
     origin,
@@ -223,7 +237,6 @@ pub(crate) async fn published(origin: u16, ticket: HomeTicket, budget_ns: u64) -
     budget_ns,
   )
   .await
-  .unwrap_or(false)
 }
 
 /// The shard of `shards` that is `identity`'s home (module docs): the first by rendezvous over the identity; none for
@@ -726,7 +739,10 @@ pub(crate) async fn home_in_region(
   let mut kept = 0usize;
   if homes.contains(&local) {
     let (_, ticket) = keep_region_at_home(origin, shards, bytes.clone(), budget_ns).await?;
-    if published(origin, ticket, budget_ns).await {
+    if super::durable::content_durable(origin, ticket, budget_ns)
+      .await
+      .is_ok()
+    {
       kept = kept.saturating_add(1);
     }
   }

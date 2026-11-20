@@ -373,11 +373,9 @@ fn await_tag(lines: &Receiver<(u64, String)>, tag: &str) -> String {
 }
 
 fn connect(instance: &str) -> Client {
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(refused) => panic!("the lone daemon refused a client: {refused}"),
-    }
+  match Client::connect(instance, deadlines()) {
+    Ok(client) => client,
+    Err(refused) => panic!("the lone daemon refused a client: {refused}"),
   }
 }
 

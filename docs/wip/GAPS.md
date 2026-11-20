@@ -84,6 +84,10 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
+> position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
+> store commit's whole passes; the check's propagation in one unit (57.9 ms at 100 pushes).
+>
 > **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
 > resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.
 >
@@ -324,6 +328,16 @@
 > records 222.4 MiB after the svn import. OWED: items 3-7 (a green's bytes named, on A-727's seam, agreed with w-perf);
 > the log ring's released pages given back (88 MiB resident past the live tail); `projected_snapshot_bytes`'s encode.
 >
+> **A-752 (2026-11-20, w-engine; Ada's rule, main's order):** a push's work build a unit at a time: part 1 the
+> deriver's replay indexed (O(n^2) -> O(n log n)); part 2 `push::Building` over the turns before the verdict
+> (`Judge::ready`), the deriver async under a `Pace`. Part 2b: git's trees listed an entry a unit
+> (`PushObjects::listing`), the longest build unit 1.12 -> 0.22 ms (flat 1,500 files, debug). OWED: units still one
+> object's size: a blob read and laid whole, a tree's bytes copied once, the green's hard links (none in git or
+> Mercurial greens), a copy's tree (a push makes none); Mercurial's trees still listed whole. OWED (part 3): the
+> entry apply in one step: part 3a moved the paths map's step after a push into slices (94 -> 42 ms, 1,500 files
+> debug); left: the engine's verdict (8.3 ms) and commit (10.9), the recorded entry (4.7), retention's secure (5.0),
+> and the git store's record and commit (11.5, w-git's A-722).
+>
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
 > room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the
@@ -335,7 +349,8 @@
 > both edges), and kept as content charged to the shard; later fetches copy them. OWED: the encoding from the push's own
 > intake (keep the deltas the client sent; w-git's streaming intake); the base pack's rebuild under the learned rule;
 > kept fragments made again after a recovery without a fetch paying; the parts' bytes an encoding holds between turns
-> charged.
+> charged; a pair of trees read whole and the parts' record in one unit. Each other unit is a window's work at most
+> (w-k90-vendor, 2026-11-20: the 56 MB git/git v2.0.0 push's encoding had spun the shard 3.5 s in one object's unit).
 >
 > **A-654 (2026-11-19, g258; git's push end to end).** Part 1 BUILT (slates-git): a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). Part 2 BUILT: the server's driver `crates/server/src/git_push.rs`, one entry point for both edges (`ReceivePack::start`, `input`, `end`, `answer`, each one step on the owner shard): the advertisement of each branch whose green holds a git head (namespace name `N` is `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under A-622's policy hidden; input and end over A-638's index view lent the shard's room (`vcs_store::with_room`); a configured git hook refusing every command `hook not run` until A-665 part 2's view; the checked objects admitted to A-662's quarantine and sealed; each command asked of A-622's policy through A-644 part 2's check point (`git_protect`: the right its change needs, then a protected name's linear history and signed commits on what it brings) before its work is built, refused in git's words; A-654 part 1's verdicts over the shard's greens, a ref's base its green's head alone, held at the append by compare and swap; `push_sealed` per entry, or once for all under `atomic`; git's report. Part 3 BUILT: git's HTTP site serves receive-pack through the driver (`vcs_http::git::receive`: each service from its own half, each step lent the state of the shard the connection moved to, a failure before any reply a status, a command's refusal the report's), proven by stock git's `create` push over loopback TLS to a daemon. The SSH site's call BUILT (A-683: `vcs_ssh::receive`, each step lent the shard's state through the HTTP site's seam, `ShardLender`). OWED: the live `git push` over HTTPS and over SSH with stock git's binary (main's runs); the hooks run over A-665 part 2's view (`pre-receive`, `update`, `post-receive`); a push based on an older version than its green's head, refused as a ref that moved until A-664's server-made commits; a principal the policy allows who is not the owner, whom A-635's append refuses `Forbidden`; push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8); a tag of a tag; a create while the default branch is unborn and holds files no commit names (A-664's).
 >
@@ -1088,7 +1103,8 @@
 > fetches over it with OpenSSH 10.2p1 (macOS arm64, Mac Studio, kiln r1 over 43c86824e: `cargo test --locked -p
 > slates-cli --test git_interop -- --test-threads=1` 5 passed, 0 ignored, the SSH leg alone 1 of 1 in 7.4 s;
 > `cargo fmt -p slates-cli -- --check` clean). A credential is minted with the anchor's issuer surface, so on Linux, where
-> that surface is a descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln
+> that surface was a descriptor only the anchor's children hold, those legs skipped loudly (since A-754, 2026-11-20, the
+> Linux anchor prints its issuer route and secret, and they run). macOS arm64 (Mac Studio, kiln
 > r426 over main 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2
 > ignored; with `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication
 > failed for 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the
@@ -1780,6 +1796,16 @@
 > `Repository::draft_roots` answers the register's draft roots still draft, read before the served filter; red first
 > (r411), green (r421) on macOS arm64, the other platforms owed
 > (`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`).
+
+> **Fixed (w-interop, 2026-11-20, A-758; found by use, the hg matrix's bookmark-push row): stock hg saw no server key
+> but in a clone.** Neither edge listed `pushkey`, so a 7.2 client asked no `listkeys` (`wireprotov1peer.listkeys`
+> answers `{}` unasked): `hg incoming -B` and `hg outgoing -B` said "remote doesn't support bookmarks", and `hg
+> debugpushkey` listed nothing. Now `pushkey` is listed over SSH and HTTP and its command served, landed as a push of
+> one advisory `pushkey` part through the one push driver (`slates_hg::serve::keys`; heads `force`; the policy, hooks
+> and race checks a part's key meets), answered `1` or `0` with words; a namespace no key is moved in (`obsolete`, any
+> other) is refused by type before anything lands, answered `0` naming it. Red first and green by use with stock 7.2
+> over both edges (`hg_interop`'s `stock_hg_lists_and_moves_keys_over_the_*_edge`) on macOS arm64; other platforms
+> owed. OWED: `pushkey` inside a `batch` is refused as not served (7.2 serves it there).
 
 > **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
 > Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part

@@ -211,50 +211,67 @@ pub(crate) struct Composition {
   changes: std::collections::BTreeMap<String, Option<SpecialNode>>,
 }
 
+/// One journal operation applied to the IPC nodes `present`: a node made, or one of `paths` unlinked, refused typed.
+fn replayed(
+  op: &crate::increment::VolumeOp,
+  (paths, link_targets): (
+    &std::collections::BTreeSet<String>,
+    &std::collections::BTreeSet<&str>,
+  ),
+  present: &mut std::collections::BTreeMap<String, SpecialNode>,
+) -> Result<(), crate::increment::DeriveError> {
+  use crate::increment::{DeriveError, VolumeOp};
+  match op {
+    VolumeOp::Mknod { path, node, .. } => {
+      if present.insert(path.clone(), *node).is_some() {
+        return Err(DeriveError::CreateOverExisting(path.clone()));
+      }
+    }
+    VolumeOp::Unlink { path } if paths.contains(path) => {
+      // The current path-based link model names its inode through one primary path. Removing that path
+      // while aliases survive needs an inode-aware namespace journal (GAPS §8f).
+      if link_targets.contains(path.as_str()) {
+        return Err(DeriveError::Unsupported(path.clone()));
+      }
+      if present.remove(path).is_none() {
+        return Err(DeriveError::UnlinkMissing(path.clone()));
+      }
+    }
+    _ => {}
+  }
+  Ok(())
+}
+
 impl Composition {
   /// Compose creations and removals. Cross-kind transitions and rename composition have the
   /// same explicit refusal as the existing symlink/hard-link deriver; never invent a file edit.
-  pub(crate) fn of(
+  pub(crate) async fn of(
     base: &crate::increment::Base,
-    journal: &[crate::increment::VolumeOp],
+    (link_targets, journal): (
+      &std::collections::BTreeSet<&str>,
+      &[crate::increment::VolumeOp],
+    ),
+    pace: &crate::pace::Ticks,
   ) -> Result<Self, crate::increment::DeriveError> {
-    use crate::increment::{DeriveError, VolumeOp};
-    use std::collections::{BTreeMap, BTreeSet};
-    let initial: BTreeMap<_, _> = base.specials.iter().cloned().collect();
-    let mut present = initial.clone();
-    let mut paths: BTreeSet<_> = initial.keys().cloned().collect();
-    paths.extend(journal.iter().filter_map(|op| match op {
-      VolumeOp::Mknod { path, .. } => Some(path.clone()),
-      _ => None,
-    }));
+    use std::collections::BTreeSet;
+    let (initial, mut present, paths) = Self::named(base, journal, pace).await;
     for op in journal {
-      match op {
-        VolumeOp::Mknod { path, node, .. } => {
-          if present.insert(path.clone(), *node).is_some() {
-            return Err(DeriveError::CreateOverExisting(path.clone()));
-          }
-        }
-        VolumeOp::Unlink { path } if paths.contains(path) => {
-          // The current path-based link model names its inode through one primary path. Removing that path
-          // while aliases survive needs an inode-aware namespace journal (GAPS §8f).
-          if base.hardlinks.iter().any(|(_, target)| target == path) {
-            return Err(DeriveError::Unsupported(path.clone()));
-          }
-          if present.remove(path).is_none() {
-            return Err(DeriveError::UnlinkMissing(path.clone()));
-          }
-        }
-        _ => {}
+      pace.tick().await;
+      replayed(op, (&paths, link_targets), &mut present)?;
+    }
+    let mut survivors = BTreeSet::new();
+    for path in present.keys() {
+      pace.tick().await;
+      survivors.insert(path.clone());
+    }
+    let mut changes = std::collections::BTreeMap::new();
+    for path in &paths {
+      pace.tick().await;
+      let value = present.get(path).copied();
+      if value != initial.get(path).copied() {
+        changes.insert(path.clone(), value);
       }
     }
-    let survivors = present.keys().cloned().collect();
-    let changes = paths
-      .iter()
-      .filter_map(|path| {
-        let value = present.get(path).copied();
-        (value != initial.get(path).copied()).then(|| (path.clone(), value))
-      })
-      .collect();
     Ok(Self {
       paths,
       survivors,
@@ -262,23 +279,56 @@ impl Composition {
     })
   }
 
+  /// The base's IPC nodes, a unit a node: as the base holds them, as present before the journal, and every path a node
+  /// is or is made at.
+  async fn named(
+    base: &crate::increment::Base,
+    journal: &[crate::increment::VolumeOp],
+    pace: &crate::pace::Ticks,
+  ) -> (
+    std::collections::BTreeMap<String, SpecialNode>,
+    std::collections::BTreeMap<String, SpecialNode>,
+    std::collections::BTreeSet<String>,
+  ) {
+    use crate::increment::VolumeOp;
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut initial: BTreeMap<String, SpecialNode> = BTreeMap::new();
+    for (path, node) in &base.specials {
+      pace.tick().await;
+      initial.insert(path.clone(), *node);
+    }
+    let mut present = BTreeMap::new();
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for (path, node) in &initial {
+      pace.tick().await;
+      present.insert(path.clone(), *node);
+      paths.insert(path.clone());
+    }
+    for op in journal {
+      pace.tick().await;
+      if let VolumeOp::Mknod { path, .. } = op {
+        paths.insert(path.clone());
+      }
+    }
+    (initial, present, paths)
+  }
+
   /// Append metadata after file/xattr bytes. It is an explicitly typed payload, not a content
   /// operation. Canonicalization also remaps the existing link and xattr path references.
-  pub(crate) fn emit(self, doc: &mut crate::ops_doc::OpsDoc) {
+  pub(crate) async fn emit(self, doc: &mut crate::ops_doc::OpsDoc, pace: &crate::pace::Ticks) {
     use crate::ops_doc::{Op, OpKind};
-    let mut offset = doc
-      .ops
-      .iter()
-      .filter(|op| {
-        matches!(
-          op.kind,
-          OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::SetXattr
-        )
-      })
-      .map(|op| op.src.saturating_add(op.len))
-      .max()
-      .unwrap_or(0);
+    let mut offset = 0u64;
+    for op in &doc.ops {
+      pace.tick().await;
+      if matches!(
+        op.kind,
+        OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::SetXattr
+      ) {
+        offset = offset.max(op.src.saturating_add(op.len));
+      }
+    }
     for (path, node) in self.changes {
+      pace.tick().await;
       let path = doc.paths.intern(&path);
       let (kind, len, src) = if let Some(node) = node {
         let start = offset;
@@ -297,7 +347,7 @@ impl Composition {
         src,
       });
     }
-    doc.canonicalize();
+    doc.canonicalize_paced(pace).await;
   }
 }
 

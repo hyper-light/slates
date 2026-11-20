@@ -31,6 +31,11 @@
 //! the bundle2 was processed as `pusherr` in `0.1` (`0`, a line end, the words, a line end); a bundle1 in 7.2's
 //! `bundle2required` words, out of band.
 //!
+//! **A `pushkey`** (A-758, [`super::keys`]) is landed as a push of one advisory `pushkey` part through the same caller:
+//! [`pushkey_request`] reads its four arguments and writes that push, or answers a namespace no key is moved in at once,
+//! and [`pushkeyed`] frames what the push came to as the command's string in `application/mercurial-0.1` (`1` or `0`,
+//! then any words for the client).
+//!
 //! **Stricter than 7.2, on purpose.** A named argument the request lacks, or post arguments that are not a length
 //! within the body, is answered out of band, where 7.2's `KeyError` and `int()` end in a `500`; so is a `heads` item
 //! that is not hexadecimal, where 7.2's `bin` fails.
@@ -42,6 +47,7 @@
 
 use super::Refusal;
 use super::getbundle::{Answering, Store};
+use super::keys;
 use super::session::{self, Answer, BUNDLE2_REQUIRED, Refused, Transport, dispatch, spec_of};
 use crate::compression::{self, Engine};
 use crate::http::{self, MEDIA_TYPE_ERROR, MEDIA_TYPE_V1, MEDIA_TYPE_V2, ProtocolCaps, Request};
@@ -424,6 +430,48 @@ pub fn unbundle_request<'r>(
   })?;
   let bundle = http::payload(request).map_err(|refusal| error(Refused::Http(refusal)))?;
   Ok((heads, bundle))
+}
+
+/// What an HTTP `pushkey` brings (the module doc's `pushkey`): the push it is landed as, its arguments read by the
+/// command's spec as `unbundle`'s are; or the answer made at once, to arguments that cannot be read or to a namespace
+/// no key is moved in. Everything read and written is charged to `admission`.
+pub fn pushkey_request(
+  request: &Request<'_>,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Answered> {
+  let mut buffer = Vec::new();
+  let fields = http::fields(request, admission, &mut buffer)
+    .map_err(|refusal| error(Refused::Http(refusal)))?;
+  let spec = spec_of(keys::COMMAND).ok_or_else(not_available)?;
+  let arguments = fields
+    .arguments(spec, admission)
+    .map_err(|refusal| error(Refused::Http(refusal)))?;
+  let asked = keys::request(&arguments, spec).map_err(error)?;
+  let refusal = match keys::bundle(&asked, admission) {
+    Ok(bundle) => return Ok(bundle),
+    Err(refusal) => refusal,
+  };
+  Err(match keys::refused(refusal, &asked, admission) {
+    Ok(body) => Answered {
+      media_type: MEDIA_TYPE_V1,
+      body,
+      refused: Some(Refused::Pushkey(refusal)),
+    },
+    Err(past) => error(Refused::from(past)),
+  })
+}
+
+/// The answer to a `pushkey` over HTTP that the push driver came to `outcome` on (the module doc's `pushkey`): the
+/// command's string in `application/mercurial-0.1`, charged to `admission` first.
+pub fn pushkeyed(outcome: &Outcome, admission: &mut Admission) -> Answered {
+  match keys::answer(outcome, admission) {
+    Ok(body) => Answered {
+      media_type: MEDIA_TYPE_V1,
+      body,
+      refused: None,
+    },
+    Err(past) => error(Refused::from(past)),
+  }
 }
 
 /// The answer to a push over HTTP (the module doc's push): a reply in `application/mercurial-0.1` as it is, its length

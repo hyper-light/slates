@@ -44,11 +44,9 @@ fn start(tag: &str) -> (Daemon, Client) {
   daemon.bootstrap(true).unwrap();
   let deadlines =
     Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS).get();
-  let client = loop {
-    match Client::connect(&instance, deadlines) {
-      Ok(client) => break client,
-      Err(e) => panic!("{e}"),
-    }
+  let client = match Client::connect(&instance, deadlines) {
+    Ok(client) => client,
+    Err(e) => panic!("{e}"),
   };
   (daemon, client)
 }

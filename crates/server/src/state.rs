@@ -309,6 +309,8 @@ pub struct ShardState {
   /// The sweep of the shard's slice of the anchor content object that the status report advances (A-744,
   /// `crate::content_ranges`).
   pub(crate) content_sweep: crate::content_ranges::Sweep,
+  /// The turns pushes' work builds took (A-752, `crate::git_push::PushTurns`).
+  pub(crate) push_turns: crate::git_push::PushTurns,
   /// The content arena's allocation count and allocated bytes at the last idle sweep pass (A-214), `None` before the
   /// first: a later idle tick with another count ends a busy period, whose net growth is the allocated bytes' rise.
   pub(crate) burst_seen: Option<(u64, usize)>,

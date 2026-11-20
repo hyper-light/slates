@@ -1554,7 +1554,7 @@ fn svn_digest_rate(step_budget_ns: u64) -> u64 {
   use aws_lc_rs::digest::{Context, MD5_FOR_LEGACY_USE_ONLY, SHA1_FOR_LEGACY_USE_ONLY};
   let len = usize::try_from(slates_svn::svndiff::WINDOW_LIMIT).unwrap_or(0);
   let buffer: Vec<u8> = (0..len)
-    .map(|at| u8::try_from(at % usize::from(u8::MAX)).unwrap_or(0))
+    .map(|at| u8::try_from(at.checked_rem(usize::from(u8::MAX)).unwrap_or(0)).unwrap_or(0))
     .collect();
   let measured = slates_machine::bench::measure(
     || {
