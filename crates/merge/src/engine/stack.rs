@@ -129,6 +129,11 @@ pub enum Landed {
     /// Why.
     case: super::CopyRefusal,
   },
+  /// A named run of the work is not read yet (as [`super::Outcome::ContentUnread`]).
+  ContentUnread {
+    /// The run's object.
+    identity: crate::named::Identity,
+  },
   /// Never judged: a work below it did not land.
   LowerRefused {
     /// The place in the stack of the first work below it that did not land (the bottom is 0).
@@ -236,6 +241,7 @@ impl Green {
       doc: upper.doc.clone(),
       post_state: upper.post_state.clone(),
       evidence: upper.evidence.clone(),
+      named: Default::default(),
     };
     let resolved = Green::resolve(&work);
     if let Some(path) = resolved.copies.keys().next() {
@@ -308,6 +314,7 @@ impl Green {
       Judgment::Conflict { windows } => Landed::Conflict { windows },
       Judgment::BaseUnavailable { base, floor } => Landed::BaseUnavailable { base, floor },
       Judgment::CopyRefused { path, case } => Landed::CopyRefused { path, case },
+      Judgment::ContentUnread { identity } => Landed::ContentUnread { identity },
     }
   }
 }

@@ -1321,6 +1321,7 @@ impl Hashing {
         doc: self.doc,
         post_state: self.post_state,
         evidence: Vec::new(),
+        named: Default::default(),
       },
       reads: self.reads,
     }
