@@ -980,3 +980,14 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   repo). Owed (GAPS): multi-member lineages (git branches) counted (merge.unpublished.green_ahead_kept) not remade; a
   submit's vcs_store paths/commits not taken back -> left for use to find (likely at git's region wall). w-perf to
   confirm by the 5,000-rev import at its next release build. w-svn next: A-693 p2 (svn:// lock).
+- ~02:00 PST ADA (direction): "Don't we have an entire operations based merge mechanism to help with and solve this?"
+  / "This is our entire advantage ... we aren't just a git/mercurial/svn server too, we use our merge mechanisms and
+  default concurrent scale ... higher throughput, lower resource usage." = §4.17/D-28 as written (push = work, one
+  copy by identity). Ruling: slice 1b/1c (SetFromHeld OpKind, hold log) OFF; w-perf writes the convergence plan
+  (every copy measured vs §4.11/§4.17.1, steps + owners), then (2) entry objects by identity. w-git: compressed
+  deltas in the EXISTING ContentStore OK; no hold_bytes, no new store. w-hg/w-svn: no new store; wait for steps.
+  w-perf attribution: one 3.43 MB push = +229 MiB dirty (ContentStore inflated 69.1, register entry 63.5, arena
+  63.7), never released; load test N=1/10/100 ok, RSS 386 MiB / 3.3 GB / 28.2 GB.
+- ~02:05 PST ADA: "a single server should be able to facilitate numerous repositories ... balance consumption and usage
+  between them based upon agent, usage patterns. Dispatch an agent ... toy repos to Google's or Meta's *in multiple*."
+  -> w-balance (briefs/w-balance.md): design first (outline before code), then pieces, proven by a multi-repo push_load.

@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-664 holders' maps = 107297a15, main f0b23d651 (+ docs 22347ac53: 2c-2 objects owed -> content held
+  once, main's ruling). Ledger/run request pushed, reported. NOW: queue 3, A-664 sliced whole builds (whole map builds and
+  whole map release sliced a unit at a time). Then (4) hg and svn server-made objects, (5) A-697 (a)-(f), A-658 3c.
+
 ## LANDED 2026-11-20: A-636 part 2c-2 = c8452ee97, main 7379a4d8e..c7c18db3e (ledger + run request on agents/fanout-state
   f168847; reported). NOW: queue item 2, A-664 holders' maps (briefs/g308.md; progress/g308-server-commits.md). Worktree
   ~/slates-work/g261-a636p2b2 reusable (merge origin/main into it).
