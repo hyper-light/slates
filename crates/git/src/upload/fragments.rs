@@ -29,7 +29,7 @@ use crate::store::{Answered, Progress, Turn, Upload, UploadCounters, Versions};
 pub struct Planned {
   /// The runs of versions, in the negotiation's order.
   runs: Vec<Versions>,
-  /// The single objects, by position, as runs (A-745).
+  /// The single objects, by position, in the form the negotiation kept them (A-745).
   objects: Positions,
   /// The request's filter, one that decides by an object's own row.
   filter: Option<Filter>,
@@ -44,7 +44,7 @@ impl Planned {
   fn of(plan: &PackPlan<'_>, admission: &mut Admission) -> Result<Planned, PackRefused> {
     admission
       .charge_items::<Versions>(plan.runs.len())
-      .and_then(|()| admission.charge_items::<(u64, u64)>(plan.objects.runs()))
+      .and_then(|()| admission.charge(plan.objects.bytes()))
       .map_err(PackRefused::PastAdmission)?;
     Ok(Planned {
       runs: plan

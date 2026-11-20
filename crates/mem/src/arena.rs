@@ -1302,11 +1302,24 @@ mod tests {
     covers.sort_unstable();
     let mut inside = vec![false; reach];
     for (start, end) in covers {
-      for unit in start..end {
-        inside[unit] = true;
-      }
+      inside[start..end].fill(true);
     }
     (first..reach).map(|unit| (unit, inside[unit])).collect()
+  }
+
+  /// One run `(first, reach)` of region 0 walked against `keep` with `for_each_piece`: the pieces tile it, contiguous and
+  /// in address order, and cover exactly the units the sorting reference covers.
+  fn walk_matches_sorting((first, reach): (usize, usize), keep: &[KeptRun]) {
+    let mut walked = Vec::new();
+    let mut at = first;
+    for_each_piece(0, (first, reach), keep, |(start, end), inside| {
+      assert_eq!(start, at, "the pieces are contiguous, in address order");
+      assert!(end > start, "no empty piece");
+      walked.extend((start..end).map(|unit| (unit, inside)));
+      at = end;
+    });
+    assert_eq!(at, reach, "the pieces reach the run's end");
+    assert_eq!(walked, pieces_by_sorting(0, (first, reach), keep));
   }
 
   /// w-sizing (MEMORY SIZING, zero-alloc). Do: walk every run `(first, reach)` of a 12-unit region against every set
@@ -1331,16 +1344,7 @@ mod tests {
           let keep = [*third, *first, *second];
           for run_first in 0..UNITS {
             for run_reach in run_first + 1..=UNITS {
-              let mut walked = Vec::new();
-              let mut at = run_first;
-              for_each_piece(0, (run_first, run_reach), &keep, |(start, end), inside| {
-                assert_eq!(start, at, "the pieces are contiguous, in address order");
-                assert!(end > start, "no empty piece");
-                walked.extend((start..end).map(|unit| (unit, inside)));
-                at = end;
-              });
-              assert_eq!(at, run_reach, "the pieces reach the run's end");
-              assert_eq!(walked, pieces_by_sorting(0, (run_first, run_reach), &keep));
+              walk_matches_sorting((run_first, run_reach), &keep);
               checked += 1;
             }
           }
