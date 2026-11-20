@@ -88,6 +88,23 @@ impl Repository for View {
   fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
     core::iter::empty()
   }
+
+  /// The view hides nothing, so the roots its register would keep are its draft changesets none of whose parents is
+  /// draft.
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    self
+      .changesets
+      .iter()
+      .filter(|old| {
+        old.phase == Phase::Draft
+          && old
+            .parents
+            .iter()
+            .flatten()
+            .all(|parent| self.phase(*parent) == Phase::Public)
+      })
+      .map(|old| old.node)
+  }
 }
 
 /// Nothing held: an empty repository.

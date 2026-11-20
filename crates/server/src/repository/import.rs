@@ -1,17 +1,21 @@
-//! The import verb (A-678; §4.17.3 piece 3; §4.15; A-675): a client asks the daemon to import the Mercurial repository at
-//! a host directory into a repository's store, and is answered when the import ends.
+//! The import verb (A-678; §4.17.3 piece 3; §4.17.4 piece 6; §4.15; A-675, A-652 part 3): a client asks the daemon to
+//! import a repository's history from the host into its store, and is answered when the import ends: a Mercurial
+//! repository's directory, or the dump of a Subversion repository's history `svnadmin dump` wrote.
 //!
 //! **The verb.** `ImportRepository { repository, path }` is served on the partition the repository's name hashes to, as
 //! every repository verb is, and for the repository's owner alone (`NotFound` for none, `Forbidden` for another
-//! principal's; the parent module's "Rights"). A repository of another tool is refused `ImportRefused { NotMercurial }`
-//! before anything is opened. The directory is opened as a base is (§4.15: read-only, the one path the host resolves,
-//! never through a link), refused as a base is (`BaseUnavailable`, `OwnMount`), and the import is started
-//! (`vcs_store::hg_import::begin`); what refuses it there is answered at once.
+//! principal's; the parent module's "Rights"). A repository of another tool than Mercurial or Subversion is refused
+//! `ImportRefused { NotMercurial }` before anything is opened. A Mercurial repository's directory, or the directory
+//! holding a Subversion dump's file, is opened as a base is (§4.15: read-only, the one path the host resolves, never
+//! through a link), refused as a base is (`BaseUnavailable`, `OwnMount`), and the import is started
+//! (`vcs_store::hg_import::begin`, `vcs_store::svn_import::begin`, which opens the dump's file in it); what refuses it
+//! there is answered at once. A Subversion dump's revisions are each committed as they land, through the owner's commit
+//! step (A-655), so a refusal keeps the ones before it, and its answer is `DumpImported`.
 //!
 //! **Answered when it ends.** A started import runs a turn at a time on this shard, in a task of the shard
 //! (`hg_import::run`). The request's reply is held meanwhile: the request's origin and id and the route its reply goes
 //! by ([`Answer`]) are kept in the shard's map beside the import, one an import, so bounded as the imports are, and the
-//! running verb is marked deferred, so its transaction records no completion yet. When the import is done, the task
+//! running verb is marked deferred, so its transaction records no completion yet. When a Mercurial import is done, the task
 //! lands it (`hg_import::land`, A-687: the repository's entry holding its record, its phase roots and its bookmarks'
 //! greens, the index put in the store's place) and records the request's completion with its reply in the same
 //! transaction, so the import and its answer are one durable step, as every verb's effect and completion are; then it
@@ -21,14 +25,18 @@
 //! import runs (its client reconnected) takes the route over, so the import's end answers the client where it is now;
 //! any other request for the repository is refused `UnderWay`.
 //!
-//! **Refusals, by kind** ([`refusal_of`]). The store holding a history (`NotEmpty`); an import under way (`UnderWay`);
+//! **Refusals, by kind** ([`refusal_of`]; a Subversion dump's, [`svn_refusal_of`]). The store holding a history
+//! (`NotEmpty`); an import under way (`UnderWay`);
 //! the shard's budget unable to take the import's room (`BudgetExceeded`, with what it could admit); the repository's
 //! format (`Format`: a requirement the import does not know or take, a censored, ellipsis, externally stored or
 //! unknown-flagged revision); a file missing, not of its format or at odds with the rest (`Damaged`, with its path
 //! under `.hg` where the refusal names one); more than an import may hold at once (`PastRoom`, with its room); a fetch
 //! still pending on an S3 base (`Pending`: ask again once it lands); the host's own refusal (`BaseUnavailable` with the
 //! directory's path); an import given back before its end (`Abandoned`); and its landing's own refusal (the register's
-//! guard, the budget, a bookmark's name the namespace refuses, or `PastRoom` for a bookmark's work past the room).
+//! guard, the budget, a bookmark's name the namespace refuses, or `PastRoom` for a bookmark's work past the room). A
+//! Subversion dump refused as `svnadmin load` refuses it is `Subversion`, with Subversion's error number, the revision
+//! being loaded and the path; a revision whose green version this build cannot declare yet is `Format`; a record the
+//! owner's step refused for the shard's budget is `BudgetExceeded`, and one its append refused is the append's refusal.
 //!
 //! **Owed** (GAPS' §4.17.3 entry). A request that reached the owner from another node, whose exchange cannot be held
 //! here, is refused `Unawaited`.
@@ -36,14 +44,18 @@
 use slates_db::catalog::{Principal, RepositoryId, VcsTool};
 use slates_hg::import::ImportRefused;
 use slates_ipc::protocol::{ImportFault, Refusal, ReplyBody};
+use slates_svn::migration::MigrationRefusal;
 use slates_vcs::ContentRefused;
 use slates_vfs::host::{HostDir, HostError, HostFs};
 use slates_wire::request::RequestId;
 
+use super::push::{AppendRefused, ChangeRefusal};
+use super::svn_commit::Uncommitted;
 use crate::hg_base::BaseRefused;
 use crate::merge_service::ReplyRoute;
 use crate::state::ShardState;
 use crate::vcs_store::hg_import::{self, Finished, ImportFailed};
+use crate::vcs_store::svn_import::{self, LoadFailed, Loaded};
 use crate::verbs::refused;
 
 #[cfg(test)]
@@ -71,14 +83,32 @@ pub(crate) struct Answer {
   id: RequestId,
   /// Where its reply goes.
   route: ReplyRoute,
-  /// The directory the import reads, which a host's refusal names.
+  /// The directory or the dump's file the import reads, which a host's refusal names.
   path: String,
+}
+
+/// Which import a request waits on: a Mercurial repository's directory, or a Subversion dump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Imports {
+  /// A Mercurial repository's directory (A-678).
+  Mercurial,
+  /// A Subversion dump (A-652 part 3).
+  Subversion,
+}
+
+/// How an import ended: its tool's own outcome, `None` when it was given back before its end.
+#[derive(Debug)]
+pub(crate) enum Outcome {
+  /// A Mercurial repository's directory's.
+  Mercurial(Option<Result<Box<Finished>, ImportFailed>>),
+  /// A Subversion dump's.
+  Subversion(Option<Result<Loaded, LoadFailed>>),
 }
 
 /// A host's directory opened for an import: its host, and the directory on it.
 type Opened = (Box<dyn HostFs>, HostDir);
 
-/// Opens `path` as a base is opened (§4.15): read-only, the one path the host resolves.
+/// Opens the directory `path` as a base is opened (§4.15): read-only, the one path the host resolves.
 fn on_the_host(path: &str) -> Result<Opened, HostError> {
   let (host, directory) = slates_base::OsHost::open_root(std::path::Path::new(path))?;
   Ok((Box::new(host), directory))
@@ -94,7 +124,8 @@ pub(crate) fn import_repository(
   import_with(state, principal, (name, path), on_the_host)
 }
 
-/// [`import_repository`] with the directory opened by `open`: the host's own, or a test's simulated one.
+/// [`import_repository`] with the directory opened by `open`: the host's own, or a test's simulated one. For a
+/// Subversion dump, `open` opens the directory the dump's file is in.
 pub(crate) fn import_with(
   state: &mut ShardState,
   principal: &Principal,
@@ -105,9 +136,11 @@ pub(crate) fn import_with(
     Ok(record) => record,
     Err(reply) => return reply,
   };
-  if record.tool != VcsTool::Mercurial {
-    return refused(import_refused(ImportFault::NotMercurial));
-  }
+  let imports = match record.tool {
+    VcsTool::Mercurial => Imports::Mercurial,
+    VcsTool::Subversion => Imports::Subversion,
+    _ => return refused(import_refused(ImportFault::NotMercurial)),
+  };
   let Some((origin, request)) = state.current_request else {
     return refused(import_refused(ImportFault::Unawaited));
   };
@@ -117,12 +150,12 @@ pub(crate) fn import_with(
   let Some(route) = state.reply_route.take() else {
     return refused(import_refused(ImportFault::Unawaited));
   };
-  let opened = match open(path) {
-    Ok(opened) => opened,
-    Err(error) => return refused(crate::verbs::base_open_refusal(path, error)),
+  let started = match imports {
+    Imports::Mercurial => start_mercurial(state, record.id, path, open),
+    Imports::Subversion => start_subversion(state, (principal, record.id), path, open),
   };
-  if let Err(failed) = hg_import::begin(state, record.id, opened) {
-    return refused(refusal_of(path, hg_import::room_of(state), failed));
+  if let Err(refusal) = started {
+    return refused(refusal);
   }
   let answer = Answer {
     origin,
@@ -130,7 +163,41 @@ pub(crate) fn import_with(
     route,
     path: path.to_owned(),
   };
-  hold(state, record.id, answer)
+  hold(state, (record.id, imports), answer)
+}
+
+/// Starts repository `id`'s import of the Mercurial repository whose directory `path` is, opened by `open`.
+fn start_mercurial(
+  state: &mut ShardState,
+  id: RepositoryId,
+  path: &str,
+  open: impl FnOnce(&str) -> Result<Opened, HostError>,
+) -> Result<(), Refusal> {
+  let opened = open(path).map_err(|error| crate::verbs::base_open_refusal(path, error))?;
+  hg_import::begin(state, id, opened)
+    .map_err(|failed| refusal_of(path, hg_import::room_of(state), failed))
+}
+
+/// Starts repository `id`'s import of the Subversion dump in the file `path`, for `principal`, its owner: the directory
+/// it is in opened by `open`, the file by its name in it. A path that names no file is refused as the host refuses one
+/// it does not find.
+fn start_subversion(
+  state: &mut ShardState,
+  (principal, id): (&Principal, RepositoryId),
+  path: &str,
+  open: impl FnOnce(&str) -> Result<Opened, HostError>,
+) -> Result<(), Refusal> {
+  let unfound = || crate::verbs::base_open_refusal(path, HostError::NotFound);
+  let file = std::path::Path::new(path);
+  let directory = file.parent().and_then(std::path::Path::to_str);
+  let name = file.file_name().and_then(std::ffi::OsStr::to_str);
+  let (Some(directory), Some(name)) = (directory, name) else {
+    return Err(unfound());
+  };
+  let (host, opened) =
+    open(directory).map_err(|error| crate::verbs::base_open_refusal(path, error))?;
+  svn_import::begin(state, (principal, id), (host, opened, name))
+    .map_err(|failed| svn_refusal_of(path, hg_import::room_of(state), failed))
 }
 
 /// A request for a repository whose import is under way: a resend of the held request takes its route over and waits
@@ -157,9 +224,13 @@ fn rejoin(
 
 /// Holds `answer` until repository `id`'s import ends and starts the shard's task that runs it (the module doc). A task
 /// the runtime refuses gives the import back, and the request is answered `Overloaded` now.
-fn hold(state: &mut ShardState, id: RepositoryId, answer: Answer) -> ReplyBody {
+fn hold(
+  state: &mut ShardState,
+  (id, imports): (RepositoryId, Imports),
+  answer: Answer,
+) -> ReplyBody {
   let task = async move {
-    answer_at_end(id).await;
+    answer_at_end(id, imports).await;
   };
   match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
     Ok(()) => {
@@ -169,7 +240,10 @@ fn hold(state: &mut ShardState, id: RepositoryId, answer: Answer) -> ReplyBody {
       ReplyBody::Acknowledged
     }
     Err(_) => {
-      hg_import::abandon(state, id);
+      match imports {
+        Imports::Mercurial => hg_import::abandon(state, id),
+        Imports::Subversion => svn_import::abandon(state, id),
+      }
       state.count(UNRUN, 1);
       refused(Refusal::Overloaded { shard: state.shard })
     }
@@ -180,8 +254,11 @@ fn hold(state: &mut ShardState, id: RepositoryId, answer: Answer) -> ReplyBody {
 /// once the shard's state is let go, since its delivery takes the state itself (`state::deliver`), and a nested lend of
 /// it is refused. A lend refused in a way that loses the answer is counted as the shard's lost step
 /// (`state::with_state_counted`), never dropped unseen.
-async fn answer_at_end(id: RepositoryId) {
-  let outcome = hg_import::run(id).await;
+async fn answer_at_end(id: RepositoryId, imports: Imports) {
+  let outcome = match imports {
+    Imports::Mercurial => Outcome::Mercurial(hg_import::run(id).await),
+    Imports::Subversion => Outcome::Subversion(svn_import::run(id).await),
+  };
   let answered = crate::state::with_state_counted(|state| answer(state, id, outcome)).flatten();
   if let Some((route, reply, here)) = answered {
     crate::told::deliver_to(route, reply, here);
@@ -194,19 +271,25 @@ async fn answer_at_end(id: RepositoryId) {
 fn answer(
   state: &mut ShardState,
   id: RepositoryId,
-  outcome: Option<Result<Box<Finished>, ImportFailed>>,
+  outcome: Outcome,
 ) -> Option<(ReplyRoute, ReplyBody, u16)> {
   state.db.begin();
   let outcome = match outcome {
-    Some(Ok(finished)) => Some(hg_import::land(state, id).map(|()| finished)),
+    Outcome::Mercurial(Some(Ok(finished))) => {
+      Outcome::Mercurial(Some(hg_import::land(state, id).map(|()| finished)))
+    }
     other => other,
   };
-  let landed = matches!(outcome, Some(Ok(_)));
+  let landed = matches!(outcome, Outcome::Mercurial(Some(Ok(_))));
   let Some(held) = state.vcs_stores.take_answer(id) else {
     committed(state, (id, landed), ReplyBody::Acknowledged);
     return None;
   };
-  let reply = reply_of(&held.path, hg_import::room_of(state), outcome);
+  let room = hg_import::room_of(state);
+  let reply = match outcome {
+    Outcome::Mercurial(outcome) => reply_of(&held.path, room, outcome),
+    Outcome::Subversion(outcome) => svn_reply_of(&held.path, room, outcome),
+  };
   let reply = crate::verbs::record_completion(state, held.origin, held.id, reply);
   let reply = committed(state, (id, landed), reply);
   state.count(ANSWERED, 1);
@@ -323,5 +406,94 @@ fn of_store(refusal: ImportRefused<BaseRefused>) -> Refusal {
     | ImportRefused::Link { revlog, .. }
     | ImportRefused::Duplicate { revlog, .. } => damaged(&revlog),
     _ => damaged(b""),
+  }
+}
+
+/// The reply a Subversion dump's import's `outcome` gives (the module doc): the revisions it committed and the youngest
+/// revision, or its refusal by kind, `Abandoned` when it was given back before its end.
+pub(crate) fn svn_reply_of(
+  path: &str,
+  room: u64,
+  outcome: Option<Result<Loaded, LoadFailed>>,
+) -> ReplyBody {
+  match outcome {
+    Some(Ok(loaded)) => ReplyBody::DumpImported {
+      revisions: loaded.revisions,
+      youngest: loaded.youngest,
+    },
+    Some(Err(failed)) => refused(svn_refusal_of(path, room, failed)),
+    None => refused(import_refused(ImportFault::Abandoned)),
+  }
+}
+
+/// The wire's refusal for a Subversion dump's import that did not start or did not reach the stream's end (the module
+/// doc): `path` the dump's file, `room` the bytes its reader may hold at once.
+pub(crate) fn svn_refusal_of(path: &str, room: u64, failed: LoadFailed) -> Refusal {
+  match failed {
+    // The repository is Subversion's (the verb asked first), so its records were not made or not recovered here.
+    LoadFailed::NoStore => Refusal::ContentUnavailable,
+    LoadFailed::Busy => import_refused(ImportFault::UnderWay),
+    LoadFailed::Host(HostError::Pending(_)) => import_refused(ImportFault::Pending),
+    LoadFailed::Host(error) => crate::verbs::base_open_refusal(path, error),
+    LoadFailed::Budget { available } => Refusal::BudgetExceeded { available },
+    LoadFailed::Refused { refusal, revision } => of_dump(room, refusal, revision),
+    LoadFailed::Uncommitted { refusal, revision } => of_step(room, refusal, revision),
+  }
+}
+
+/// The wire's refusal for the import's own refusal of the stream: past its reader's admission `PastRoom`, else
+/// Subversion's own, with its number, the revision being loaded and the path it names.
+fn of_dump(room: u64, refusal: MigrationRefusal, revision: Option<u64>) -> Refusal {
+  if let MigrationRefusal::Stream(slates_svn::dump::DumpError::PastAdmission { .. }) = refusal {
+    return import_refused(ImportFault::PastRoom { room });
+  }
+  import_refused(ImportFault::Subversion {
+    code: refusal.subversion_code(),
+    revision,
+    path: path_named(&refusal),
+  })
+}
+
+/// The path `refusal` names, empty where it names none.
+fn path_named(refusal: &MigrationRefusal) -> String {
+  match refusal {
+    MigrationRefusal::PathSyntax { path } => String::from_utf8_lossy(path).into_owned(),
+    MigrationRefusal::NotFound { path, .. }
+    | MigrationRefusal::AlreadyExists { path }
+    | MigrationRefusal::NotDirectory { path }
+    | MigrationRefusal::KindMismatch { path }
+    | MigrationRefusal::ChecksumMismatch { path, .. }
+    | MigrationRefusal::BaseChecksumMismatch { path, .. }
+    | MigrationRefusal::CopySourceChecksumMismatch { path, .. } => path.clone(),
+    _ => String::new(),
+  }
+}
+
+/// The wire's refusal for the owner's step's refusal of a record the import made, at `revision`: the step's own refusal
+/// as the import's (Subversion's number), a revision whose green version this build cannot declare yet `Format`, the
+/// append's refusal as it is, and records not held here or a green that does not follow them `ContentUnavailable`.
+fn of_step(room: u64, refusal: Uncommitted, revision: u64) -> Refusal {
+  match refusal {
+    Uncommitted::Step(step) => of_dump(room, MigrationRefusal::from(step), Some(revision)),
+    Uncommitted::Unsupported { .. } => import_refused(ImportFault::Format),
+    Uncommitted::Budget { available } => Refusal::BudgetExceeded { available },
+    Uncommitted::Append(refused) => of_append(refused),
+    Uncommitted::NotHeld | Uncommitted::Diverged => Refusal::ContentUnavailable,
+  }
+}
+
+/// The wire's refusal for an append that refused a record the import made: the repository's or the entry's own, a
+/// change's typed refusal, else `ContentUnavailable` (a conflict, a change twice or an approval, none of which an
+/// import's revision meets on a green only the step moves).
+fn of_append(refused: AppendRefused) -> Refusal {
+  match refused {
+    AppendRefused::Repository(refusal) | AppendRefused::Entry(refusal) => refusal,
+    AppendRefused::Changes(changes) => changes
+      .into_iter()
+      .find_map(|change| match change.why {
+        ChangeRefusal::Refused(refusal) => Some(refusal),
+        _ => None,
+      })
+      .unwrap_or(Refusal::ContentUnavailable),
   }
 }

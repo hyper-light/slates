@@ -240,20 +240,14 @@ impl Timestamp {
   /// Writes the instant as RFC 3339 does, upper case, to the second, in UTC: `YYYY-MM-DDTHH:MM:SSZ` (batch.md: "String
   /// uppercase RFC 3339-formatted timestamp with second precision"; Go's `time.Time` writes UTC with `Z`).
   pub fn put_rfc3339(&self, out: &mut impl Out) {
-    let days = self.seconds.div_euclid(DAY_SECONDS);
     let of_day = self.seconds.rem_euclid(DAY_SECONDS);
-    let (year, month, day) = civil_from_days(days);
     let hour = of_day.checked_div(HOUR_SECONDS).unwrap_or(0);
     let minute = of_day
       .checked_rem(HOUR_SECONDS)
       .and_then(|rest| rest.checked_div(MINUTE_SECONDS))
       .unwrap_or(0);
     let second = of_day.checked_rem(MINUTE_SECONDS).unwrap_or(0);
-    put_padded(out, year, YEAR_DIGITS);
-    out.put(b"-");
-    put_padded(out, month, FIELD_DIGITS);
-    out.put(b"-");
-    put_padded(out, day, FIELD_DIGITS);
+    self.put_date(out);
     out.put(b"T");
     put_padded(out, hour, FIELD_DIGITS);
     out.put(b":");
@@ -261,6 +255,18 @@ impl Timestamp {
     out.put(b":");
     put_padded(out, second, FIELD_DIGITS);
     out.put(b"Z");
+  }
+
+  /// Writes the instant's date in UTC as `YYYY-MM-DD`: RFC 3339's full date, and git's short date mode for an instant
+  /// already moved into its time zone (`date.c` `show_date` with `DATE_SHORT`; A-640 part 4, the date of a commit or a
+  /// tag git lists among an abbreviated name's objects).
+  pub fn put_date(&self, out: &mut impl Out) {
+    let (year, month, day) = civil_from_days(self.seconds.div_euclid(DAY_SECONDS));
+    put_padded(out, year, YEAR_DIGITS);
+    out.put(b"-");
+    put_padded(out, month, FIELD_DIGITS);
+    out.put(b"-");
+    put_padded(out, day, FIELD_DIGITS);
   }
 }
 

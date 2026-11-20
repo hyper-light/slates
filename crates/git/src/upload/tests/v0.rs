@@ -159,12 +159,18 @@ fn packets_from(bytes: &[u8], mut at: usize) -> Vec<&[u8]> {
 /// A response's packets after its advertisement (from `skip`), the pack's data and progress aside, and the pack's
 /// data.
 fn split(response: &[u8], skip: usize) -> (Vec<&[u8]>, Vec<u8>) {
+  split_keeping(response, skip, false)
+}
+
+/// A response's packets after its advertisement (from `skip`), the pack's data aside, and band 2's too unless
+/// `progress` keeps them; and the pack's data.
+fn split_keeping(response: &[u8], skip: usize, progress: bool) -> (Vec<&[u8]>, Vec<u8>) {
   let mut others = Vec::new();
   let mut pack = Vec::new();
   for packet in packets_from(response, skip) {
     match packet.get(4) {
       Some(1) => pack.extend_from_slice(&packet[5..]),
-      Some(2) => {}
+      Some(2) if !progress => {}
       _ => others.push(packet),
     }
   }
@@ -216,7 +222,17 @@ fn answered(
   version: Version,
   asked: Asked<'_>,
 ) -> (Vec<u8>, Answer<super::WholePack>) {
-  let served = serving(fixture, &REFS, b"refs/heads/main");
+  answered_with(fixture, &REFS, version, asked)
+}
+
+/// What `asked` is answered with at `version`, served with `refs`, as [`answered`] writes it.
+fn answered_with(
+  fixture: &served::Served,
+  refs: &[NamedRef<'_>],
+  version: Version,
+  asked: Asked<'_>,
+) -> (Vec<u8>, Answer<super::WholePack>) {
+  let served = serving(fixture, refs, b"refs/heads/main");
   let mut source = WholeObjects::new(&fixture.objects);
   let mut admission = Admission::new(u64::MAX);
   let mut answer = serve(&served, version, asked, &mut source, &mut admission);
@@ -559,4 +575,33 @@ fn a_round_with_no_pack_due_never_reads_its_sparse_blob() {
     (plain.as_slice(), None)
   );
   assert_eq!(filtered, pkt(b"NAK\n"));
+}
+
+/// A-640 part 4, fourth slice (`get_oid_basic`'s warning, relayed by `create_pack_file` on side-band-64k; git's
+/// `sparse-warn-v0`): do send a clone's request under `sparse:oid=main:a`, choosing side-band-64k, with a tag `main`
+/// served beside the branch, both naming the tip. Expect: git's packets after the advertisement, its warning on band 2
+/// after the `NAK` and before the pack among them, and a pack of git's objects; not refused.
+#[test]
+fn a_ref_name_two_patterns_find_is_warned_of_on_the_band_before_the_pack() {
+  let mut fixture = repository();
+  served::commit(
+    &mut fixture.repository,
+    &mut fixture.store,
+    &[],
+    &[(4, TIP)],
+  );
+  let tag = NamedRef {
+    name: b"refs/tags/main",
+    green: 4,
+  };
+  let refs = [REFS[0], REFS[1], tag, REFS[2]];
+  let request = fixture!("sparse-warn-v0.request.bin");
+  let response = fixture!("sparse-warn-v0.response.bin");
+  let (bytes, answer) = answered_with(&fixture, &refs, Version::V0, Asked::Request(request));
+  let (ours, our_pack) = split_keeping(&bytes, 0, true);
+  let (theirs, their_pack) = split_keeping(response, 0, true);
+  assert_eq!(
+    (ours, names(&our_pack, &fixture), answer.refusal()),
+    (theirs, names(&their_pack, &fixture), None)
+  );
 }

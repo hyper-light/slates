@@ -10,7 +10,7 @@
 
 use super::protected::HOOK_PIECE;
 use super::{
-  Declined, Outcome, PackRefusal, PackRefused, Received, Refusal, Reported, unpack_words,
+  Declined, Outcome, PackRefusal, PackRefused, Received, Refusal, Reported, Requested, unpack_words,
 };
 use crate::object_name::ObjectId;
 use crate::out::Out;
@@ -60,6 +60,14 @@ pub fn message(text: &[u8]) -> Vec<u8> {
 /// flush under side-band-64k. Refused for a line past a pkt-line's room (git's "impossibly long
 /// line").
 pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refusal> {
+  write_report_held(received, out)?;
+  write_report_end(received, out)
+}
+
+/// [`write_report`]'s answer but its last flush, which [`write_report_end`] writes once what git
+/// sends after its report is written: `post-receive`'s words, as `cmd_receive_pack` runs that hook
+/// after its report and before its last `packet_flush` (A-665 part 3).
+pub fn write_report_held(received: &Received, out: &mut impl Out) -> Result<(), Refusal> {
   let requested = &received.request.requested;
   if received.request.commands.is_empty() {
     return Ok(());
@@ -86,18 +94,40 @@ pub fn write_report(received: &Received, out: &mut impl Out) -> Result<(), Refus
       out.put(&body);
     }
   }
-  if multiplexed {
-    write_line(Packet::Flush, out)?;
-  }
   Ok(())
+}
+
+/// The last flush of the answer to `received` under side-band-64k, after [`write_report_held`] and
+/// what follows the report; nothing for a request of no command or one not multiplexed.
+pub fn write_report_end(received: &Received, out: &mut impl Out) -> Result<(), Refusal> {
+  let request = &received.request;
+  if request.commands.is_empty() || !request.requested.side_band_64k {
+    return Ok(());
+  }
+  write_line(Packet::Flush, out)
+}
+
+/// Writes a hook's `words` as git relays them while the hook runs (`copy_to_sideband`): on band 2,
+/// in the pieces git reads them in, when the client `requested` side-band-64k; nothing otherwise,
+/// as git's words then go to its own standard error, which no client of a server reads (A-665
+/// part 3: an accepted hook's words, and `post-receive`'s).
+pub fn write_hook_words(requested: &Requested, words: &[u8], out: &mut impl Out) {
+  if requested.side_band_64k {
+    write_words(words, out);
+  }
+}
+
+/// `words` on band 2, in the pieces `copy_to_sideband` reads them in.
+fn write_words(words: &[u8], out: &mut impl Out) {
+  for piece in words.chunks(HOOK_PIECE) {
+    sideband::write(Band::Progress, piece, out);
+  }
 }
 
 /// What git sends on band 2 of a refused command: a hook's words in the pieces `copy_to_sideband`
 /// reads them in, then the `rp_error` line.
 fn write_band_two(declined: &Declined, out: &mut impl Out) {
-  for piece in declined.hook.chunks(HOOK_PIECE) {
-    sideband::write(Band::Progress, piece, out);
-  }
+  write_words(&declined.hook, out);
   if let Some(line) = &declined.message {
     sideband::write(Band::Progress, line, out);
   }
