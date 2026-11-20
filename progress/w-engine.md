@@ -168,3 +168,39 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - A-752 R3 LANDED 4b6d5c24b (base 89a1d6c06): UNIT_BYTES -> the turn's Slices (server's copy_slice_bytes_within /
   archive_slice_bytes_within); RUN=16 -> the sort's own non-decreasing runs. t_a752 past_budget 0.
 - NEXT: A-760 (1b), w-svn answered (A-761 p2 28e57ac18: (BLAKE3, len) before the append, texts durable first).
+- A-760 part 1 LANDED b0f181da2 (tip 2e65566c5, base 990c83e77): Increment::named (BLAKE3+len runs in the post-state's
+  one address space), push_named / read_step (a copy slice a step via named::Objects) / unread; ContentUnread refused
+  before any verdict (server: ContentUnavailable); encoding carries names only when named (old encodings unchanged).
+  Tests: merge 408/408 incl. named_tests (4 MiB in 64 steps of <= 64 KiB, encoded < 4 KiB); server repository::,
+  work_home, vcs_store::, git_push:: green. NEXT part 2: commit's file blocks a slice a unit, published in one step;
+  server Objects over vcs_store's plane; replay reads runs first.
+- QUEUE (main ~12:50): pacing gap, Pace owner: a step runs as many cheap units as fill the quantum, learned per unit
+  kind (EWMA of measured cost), yielding only when the quantum is spent (w-git: an 820 KB / 9,000-object answer in
+  8,498 release / 29,177 debug steps, ~10 s at load 60 for ms of CPU). Red: N cheap units take ~work/quantum steps, not
+  N; longest step under the quantum. After A-760 part 2 (not quick: git's Quantum paths and the shard's quantum size
+  are in it too).
+## A-760 part 2 (main's start, ~13:00) -- PLAN (RSS bounded by a slice, not the file)
+Facts read: Blocks::add moves a Vec (no copy), so a file's insert is O(1); make_mapped's apply copies the whole file;
+merge_create builds a created file's bytes in the verdict (only needed to compare with an existing file);
+hold_computed clones inc.post_state into Judged (a whole copy); part 1's read_step reads runs into the post-state (a
+transient whole copy). So today a named 500 MB text exists 3x at peak (plane, post-state, green file).
+Build order:
+1. Staging in the green's arena: Green::stage_named(&inc, &objects, slice) reads each named run straight into an
+   unreferenced Blocks slot (reserved at its length, pages made as written), a slice a step; Staged { runs: Vec<Block> }.
+2. One read view Post<'_> { inline: &[u8], runs: staged blocks } replacing every engine &[u8] post-state reader
+   (apply, span_bytes, post_slice, special_payload, lands_on_head, merge_*, copy.rs, stack judge identical).
+3. merge_create: bytes lazy (len from declared ops; bytes only when a file stands there to compare).
+4. Judged carries the inline post-state and the staged blocks (handles), never a whole clone.
+5. Publish: make_mapped takes a whole-text run's block as the file (Files::insert_block, holders), copies a slice a
+   unit only for a partial splice (staged too); commit O(files).
+6. Server: Objects over vcs_store's plane (identity -> object root map); land turns; replay reads runs first.
+Red: a focused server test landing a large named text: no step past the quantum, RSS growth <= file + slice.
+- A-760 part 2 LANDED f727b9ec4 (tip d6ee7bede, base 37c84db43): runs read into own buffers (named::Read), engine reads
+  via named::Post; judge_named + commit make a whole-text file of the run's buffer (no copy); creates' bytes at the
+  commit; server PlaneObjects (window_range_in: range reads straight into the buffer); replay reads runs a copy slice a
+  step (ContentMissing fence). Tests: merge 410/410; vcs content 13; server t_a760 (8 MiB: 149 turns of 56,656 B, file
+  = read buffer), vcs_store:: 96, git_push:: 19, replay 16, rebuild 12, merge_service 14.
+- NOT MINE, for main: repository::tests::each_verb_moves_the_names_log_and_each_members_version_its_own_log fails
+  deterministically (names log Some(5), expected Some(2)) since 455fe41fb "wip: push records ride the names log"
+  (A-724 piece 8c); a probe with my engine change reverted fails the same.
+- NEXT (main starts it): the pacing item (steps fill the quantum, per-unit-kind EWMA).

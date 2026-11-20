@@ -175,3 +175,37 @@
 - Windows r34 at 159f1c8 (r33 lost to a kiln timeout): referenced-content tests from bc6cc7ab1 (vfs tests/referenced.rs
   unwrap_in_result, slicing, cast; server vcs_store/referenced.rs cast) -> 6e5f6a53a, landed via 2d3f218cb; vfs
   referenced 6 pass, server referenced 2 pass locally.
+
+## 2026-11-20 main's run requests (g226 / 599603559, slates-mem 80 -> 83, cross matrix)
+- (2) `cargo xtask unsafe`: slates-mem 83/83 ok. The three new sites in mem/src/heap.rs (zeroed malloc_statistics_t,
+  malloc_zone_statistics on macOS; mallinfo2 on glibc) each have a SAFETY line directly above.
+- (3) Cross clippy matrix (ci.yml's crate set, pure-hash) on 51a061d36: x86_64/aarch64 linux gnu, x86_64/aarch64 linux
+  musl, x86_64/aarch64 windows msvc all clean -- mallinfo2 compiled on both gnu triples, the None fallback on musl and
+  Windows.
+- (1) Native: Linux amd64 (r36) and jupiter Windows (r35) clippy + slates-mem heap test running in the background.
+- Host wall on 606d0d0ec was broken by the day's landings; fixed in place: 60cc4073a (git learn/packed/answer, svn
+  records/step, hg serve tests, server credentials test split, cli memory_lines, xtask's included process_wait.rs,
+  Cargo.lock missing xtask's libc so --locked refused) and 111d561a0 (merge stack boxing + named_tests split, svn dav
+  site no-op as_deref). recovery.rs's two sleeps (6ea16f4c5) sent to w-sizing (inbox/w-sizing-from-w-lint.md).
+- xtask tests/helm_chart.rs the_render_equals_the_golden fails here; not from these changes; noted, not chased yet.
+
+## 2026-11-20 round 8 at fe7cb5232 (landed 553e3d3ee, main a7df9ccf0)
+- Host: db repository.rs apply_advanced (namespace_changes), vfs tests/pinned_chunks (pinned_extents_read),
+  cli tests/v3_takeover flow test 17/10 (455fe41fb, a wip commit; split into seven helpers, and it was not
+  rustfmt-clean -- fmt --check was failing on main). Literals: cluster credentials wire widths, hg tags radix,
+  git store/learn level count and corpus shape. Tests here: db repository 34, vfs pinned_chunks 2, cluster
+  credentials 3, hg tags 2, v3_takeover 1 under SLATES_TEST_CLI=1 (11 s). Merge conflict with d94410e74 (rustfmt of
+  the same file only): kept the split version.
+- Cross six targets, structural, literals, unsafe, fmt: clean. Still red: server tests/recovery.rs two sleeps,
+  w-sizing's piece (inbox/w-sizing-from-w-lint.md).
+- r35 (Windows) and r36 (Linux) for g226 lost to kiln timeouts; re-run on current main as r37/r38 in the background.
+
+## 2026-11-20 between rounds (main 37c84db43 -> 0916cf5b4)
+- api container_engine.rs (7e7e242f3), Windows-only `ask`: literals 4096 / 10 ms -> Shape lines (eb410fdac). Its
+  10 ms `thread::sleep` poll loop is D-9-disallowed and Windows clippy (r37) refused slates-api and thus slates-cli;
+  rewritten as a condition wait (pipe readers send on a channel, `recv_timeout` under the observe budget, kill past
+  budget or cap, then wait) at 088e05d50 on agents/w-lint-winapi-check; jupiter check r41 before it lands on main.
+- mem arena.rs (2dc414a84) walk test: needless_range_loop + 12/10 on every target -> 0916cf5b4 (arena 19 pass).
+- xtask helm_chart golden fails here only because local helm is v4.1.0 and CI pins v4.3.0 (blank lines between
+  documents); not a main breakage.
+- r38/r39 (Linux) lost to a runner restart / no room; r40 running on the Linux runner.

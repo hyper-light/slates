@@ -29,6 +29,16 @@
   ab/no-prefault.patch (reserve 0); provision_bench + nfs_large_write, release, interleaved x3, /usr/bin/time -l.
 - Sweep list LANDED main 79e0a4723 (GAPS, MEMORY SIZING entry: every site, today -> target).
 - A/B r1 lost its placement before starting; resubmitted as r2, started on d1323898.
+- LANDED main 2dc414a84: idle purge walk allocation-free (for_each_piece, no order clone; oracle test). mem arena:: 19/19.
+- A/B: r2 (sync not answered by d1323898), r4 (d1323898 silent 15 s), r3 stopped (no room at mem=24g); r5 = no-sync
+  remote clone of origin/main cbf7c84c3 + inline patch, needs cpus=4,mem=8g: QUEUED (macOS fleet full). Local Studio-4 is
+  at load 26 (A/B here would be noise).
+- Correction (probe): on macOS RSS is the honest holding; footprint UNDERstates (given-back shared pages stay physical,
+  not reclaimed in 10 s under pressure). resident_now (RSS) stays; GAPS line "(open)" to be corrected.
+- By reading: reserve_per_shard's tables (inodes, dirs, chunks, tags, clients) are segmented slabs grown on demand,
+  bounds only; its RAM cost is the prefault cap + admission; the rest is address space.
+- True macOS give-back design (to scope with main): pool extents as purgeable Mach memory entries (VM_PURGABLE_EMPTY frees
+  while the anchor still maps it), handed to the anchor by port; replaces shm_open's one content object on macOS.
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 

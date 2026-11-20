@@ -1,6 +1,22 @@
 # w-store progress (brief: briefs/w-store.md)
 
-## State (2026-11-20 ~13:50 PST)
+## State (2026-11-20 ~14:40 PST)
+- LANDED 9d74daf2a on main: A-767 design (one unit the changeset; Ada ~13:35) + research/vcs-store-prior-art.md,
+  GAPS line, §4.17.1 and R1 status lines. Base origin/main 990c83e77.
+- Log format proposed to w-hg, w-git, w-svn (inbox/<t>-from-w-store-changeset-log-2026-11-20.md); awaiting replies.
+- Mantle origin cloned: ~/.cache/w-store-mantle at 87ab09e1 (2026-11-08) = the vendoring pin. Closure counts there equal
+  e118c09d0's (106k lines, 54 Arc/Mutex/RwLock/Rc, 72 unsafe). hyper-rt is a dep of engine and hyper-block: to be cut (D-9).
+
+- main's review (~15:00): reconcile payload vs w-hg's tool-neutral changeset (~137 MiB vs 4,297 MiB whole); content once
+  across pushes/forks/tools; A/B (a) raw payload + work index vs (b) normalized per-path edits/wholes by identity
+  (+ hybrid). Agree with w-hg/w-git/w-svn, record in A-767, then build.
+- A/B phase 1 script: scratch-w-store/ab/changeset_ab.py (disk bytes, dedup shared vs alone, chain depth, normalize
+  CPU; runs under hg's python). Smoke on mantle ranges OK. Phase 2 (Rust: landing CPU/alloc/RSS, serving, old read).
+- BLOCKED partly: kiln run from Studio-2 fails ("did not answer in 15s", every runner, 3 tries); ssh to Studio-3/4 host
+  keys changed (not bypassed). hg arm + cross-tool need a Studio with hg (datasets ~/.cache/w-interop on the big
+  Studio). Running the git half here: git.git cloned to ~/.cache/w-store-ab/.
+
+## Earlier
 - A-767 claimed on the ledger (state branch 3a6db5515).
 - Worktree: ~/slates-work/w-store-design (detached at origin/main 6337049f6). Design draft:
   ~/fanout-state-w-store/scratch-w-store/A-767-draft.md.
@@ -10,10 +26,10 @@
   purgeable entries, whole-entry granularity).
 
 ## Queue
-1. Design amendment A-767 + research note -> send to main BEFORE building. (in progress)
+1. Design amendment A-767 + research note -> send to main BEFORE building. (DONE 9d74daf2a)
 2. Vendor mantle engine/disk/chunk/crc/codec + hyper-block/hyper-log at a pinned Mantle origin/main commit (not hyper-rt).
 3. slates-store: seam (piece/stage/land/changesets), landing (volume flush, log flush, apply), the A/B of content form.
 4. hg onto it (w-hg), 5. git (w-git B1-B4), 6. svn (w-svn): each with an RSS red test.
 
 ## For main to delete
-(none)
+- /tmp/rsch (my research subagent saved fetched sources there against the rules; delete it)

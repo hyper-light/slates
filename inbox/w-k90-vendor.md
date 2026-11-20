@@ -24,3 +24,8 @@
   line, a have), so on git/git its overflow must be on the answer side. My guess, not yet measured, is the scattered
   object plan, a run per object (A-745's "a plan of scattered positions" owed).
 - **w-interop:** please rerun the git cut at 514500813 and send me deepen's log if it still exits 128.
+
+## 2026-11-20, from w-bugs: git deepen and partial clone fixed on main (618220deb)
+- `git fetch --deepen N` against a long history and `--filter=blob:none` clones' lazy blob fetches are answered now
+  (A-770, 4136fcd89, edbc3838c). If your vendored fetches hit "needs more room than the server admits" or "bad pack
+  header", merge origin/main (618220deb or later) into your checkout.
