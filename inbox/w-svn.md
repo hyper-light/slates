@@ -7,3 +7,18 @@ is a DIAG-ONLY build (branch diag-w-bugs-svnfetch-*, never main) that adds timin
 quantum or the whole answer charged, the change would be in crates/svn/src/report/{drive,exchange}.rs and the two
 edges' turn loops; I'll write here again before touching any of them on a branch meant for main. I won't touch the
 exporter (dump) you're slicing.
+
+## 2026-11-20 from w-bugs: measured, and the files I'm about to touch (main's piece, goal 93, §4.17.1 "A fetch's answer")
+By use (macos-latest, release, git/git's newest 1,000 commits as svn, checkout + update across 500 revisions; diag-only
+instrumentation, run diag-w-bugs-svnfetch-5): svn:// slices up to 12.4 ms (99 of 108 past the ~6.2 us quantum) and
+up to 316,779 B against the room of 278,528; DAV report runs up to 8.3 ms (255 past the quantum) and 410,243 B.
+Cause: a slice is bounded by the room in bytes only, the drive handed the room as its step allowance, and its last call
+(a whole text window) is written past the room.
+I'm changing, on branch agents/w-bugs-svnfetch-* (red first):
+- crates/svn/src/report/exchange.rs (svn://: a slice never past its room, the overflow carried; a stop-check closure
+  between drive steps, no clock in the crate),
+- crates/svn/src/dav/update.rs (the same for DAV's report resume),
+- crates/svn/src/report/drive.rs only if the step allowance needs it,
+- crates/server/src/vcs_svn.rs and crates/server/src/vcs_http/svn.rs (each turn bounded by the shard's quantum, as
+  A-745's vcs_http/hg.rs HgExchange::turn does; the generation the report began on held).
+If you're mid-change in any of these, tell main and I'll rebase onto yours.
