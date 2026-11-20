@@ -73,7 +73,7 @@ use slates_hg::push::classify::{
 };
 use slates_hg::push::commit::Unindexed;
 use slates_hg::push::held::IndexHeld;
-use slates_hg::push::intake::{self, Intake, Intaken, Refused as IntakeRefused, Stepped};
+use slates_hg::push::intake::{self, Intake, Intaken, Rebase, Refused as IntakeRefused, Stepped};
 use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::tree::{self, Move};
 use slates_hg::push::verify::{Held, Unverified, Verified};
@@ -1176,6 +1176,21 @@ pub(crate) fn land(
     wanted,
     ..
   } = prepared;
+  // A fork made from an index another push replaced since names its parents by numbers that index no longer gives:
+  // never put in the index's place (A-720 part 2b re-bases it before its landing).
+  if forked
+    .as_ref()
+    .is_some_and(|forked| is_stale(state, repository, forked))
+  {
+    let released = match forked {
+      Some(Forked { fork, .. }) => release_index(state, fork),
+      None => Ok(()),
+    };
+    return Landed {
+      answer: Err(abort(MOVED.to_vec())),
+      released,
+    };
+  }
   let Some(Forked { fork, intaken, .. }) = forked else {
     let appended = RepositoryLogs::append(state, principal, repository, changes, parts);
     return Landed {
@@ -1286,17 +1301,156 @@ pub(crate) async fn unbundle(
       Err(outcome) => return Some(outcome),
     },
   };
-  crate::state::with_state(|state| {
-    landing(
-      state,
-      repository,
-      (principal, bundle),
-      &unbundle,
-      forked,
-      room,
-    )
-  })
-  .flatten()
+  // Landed in one step against the index as it is then; a fork another push made stale meanwhile is re-based by node
+  // (A-720 part 2b), a slice at a time, and the landing tried again.
+  let mut forked = forked;
+  loop {
+    let tried = crate::state::with_state(|state| match forked.take() {
+      Some(stale) if is_stale(state, repository, &stale) => Err(stale),
+      fresh => Ok(landing(
+        state,
+        repository,
+        (principal, bundle),
+        &unbundle,
+        fresh,
+        room,
+      )),
+    });
+    match tried? {
+      Ok(outcome) => return outcome,
+      Err(stale) => match rebase_sliced(repository, stale).await? {
+        Ok(rebased) => forked = Some(rebased),
+        Err(outcome) => return Some(outcome),
+      },
+    }
+  }
+}
+
+/// Whether `forked` was made from an index another push has replaced since (A-720 part 2b).
+fn is_stale(state: &ShardState, repository: RepositoryId, forked: &Forked) -> bool {
+  state.vcs_stores.generation_of(repository) != Some(forked.generation)
+}
+
+/// A stale fork's re-base while it runs (A-720 part 2b), given back by its drop if it is not finished.
+struct Rebasing {
+  /// The re-base, until it is finished or given back.
+  rebase: Option<Rebase>,
+  /// The generation of the index it re-bases onto.
+  generation: u64,
+}
+
+impl Rebasing {
+  /// One slice: rows re-appended until the re-base is done or the shard's quantum is spent; none when the content
+  /// store is gone.
+  fn slice(&mut self, state: &mut ShardState) -> Option<Result<Stepped, Unindexed>> {
+    let rebase = self.rebase.as_mut()?;
+    let quantum = vcs_store::hg_import::quantum_of(state);
+    let start = slates_rt::futures::now_ns();
+    vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut()?;
+      Some(loop {
+        match rebase.step(content) {
+          Ok(Stepped::More) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          other => break other,
+        }
+      })
+    })
+  }
+
+  /// The re-based fork, the stale one given back; none, counted, when its release is refused or the store is gone.
+  fn finish_in(mut self, state: &mut ShardState) -> Option<Forked> {
+    let rebase = self.rebase.take()?;
+    let generation = self.generation;
+    let finished = vcs_store::within_budget(state, 0, |stores| {
+      stores.content_mut().map(|content| rebase.finish(content))
+    });
+    match finished {
+      Some(Ok((fork, intaken))) => Some(Forked {
+        fork,
+        intaken,
+        generation,
+      }),
+      _ => {
+        state.count(vcs_store::RELEASE_REFUSED, 1);
+        None
+      }
+    }
+  }
+}
+
+impl Drop for Rebasing {
+  fn drop(&mut self) {
+    if let Some(rebase) = self.rebase.take() {
+      // Dropped mid-re-base (its connection ended): both forks given back on the shard that holds the store.
+      crate::state::with_state(|state| {
+        let released = vcs_store::within_budget(state, 0, |stores| {
+          stores
+            .content_mut()
+            .map_or(Ok(()), |content| rebase.abandon(content))
+        });
+        if released.is_err() {
+          state.count(vcs_store::RELEASE_REFUSED, 1);
+        }
+      })
+      .unwrap_or_default();
+    }
+  }
+}
+
+/// Starts re-basing `stale` onto `repository`'s index as it is now; none when its store is not held here.
+fn begin_rebase(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  stale: Forked,
+) -> Option<Result<Rebasing, PushOutcome>> {
+  let Forked { fork, intaken, .. } = stale;
+  let begun = vcs_store::within_budget(state, 0, |stores| {
+    let Some(generation) = stores.generation_of(repository) else {
+      return Err((None, fork));
+    };
+    let Some((content, store)) = stores.mercurial(repository) else {
+      return Err((None, fork));
+    };
+    Rebase::begin(fork, &intaken, &mut store.index, content)
+      .map(|rebase| Rebasing {
+        rebase: Some(rebase),
+        generation,
+      })
+      .map_err(|(refused, fork)| (Some(refused), fork))
+  });
+  match begun {
+    Ok(rebasing) => Some(Ok(rebasing)),
+    Err((refused, fork)) => {
+      if release_index(state, fork).is_err() {
+        state.count(vcs_store::RELEASE_REFUSED, 1);
+      }
+      refused.map(|refused| Err(PushOutcome::refused(&abort(unindexed_words(&refused)))))
+    }
+  }
+}
+
+/// `stale` re-based a slice at a time, a yield between slices (A-720 part 2b); none when the store went away.
+async fn rebase_sliced(
+  repository: RepositoryId,
+  stale: Forked,
+) -> Option<Result<Forked, PushOutcome>> {
+  let begun = crate::state::with_state(|state| begin_rebase(state, repository, stale));
+  let mut rebasing = match begun.flatten()? {
+    Ok(rebasing) => rebasing,
+    Err(outcome) => return Some(Err(outcome)),
+  };
+  loop {
+    let sliced = crate::state::with_state(|state| rebasing.slice(state));
+    match sliced.flatten()? {
+      Ok(Stepped::More) => slates_rt::futures::yield_now().await,
+      Ok(Stepped::Done) => {
+        return crate::state::with_state(|state| rebasing.finish_in(state))
+          .flatten()
+          .map(Ok);
+      }
+      Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
+    }
+  }
 }
 
 /// [`unbundle`] in one call, every slice at once: the driver's steps for a caller that holds the shard's state (the
@@ -1391,7 +1545,7 @@ impl Taking<'_> {
         generation: self.generation,
       }),
       Err(intake) => {
-        self.intake = Some(intake);
+        self.intake = Some(*intake);
         None
       }
     }
@@ -1496,6 +1650,45 @@ pub(crate) fn take_whole(
       }
     }
   }
+}
+
+/// A prepared push landed as the driver lands it once its intake is done (A-720 part 2b): a fork another push made stale
+/// re-based first, every row at once, then judged at landing and landed: the driver's steps for the tests, which land
+/// pushes side by side with no runtime.
+#[cfg(test)]
+pub(crate) fn land_in(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (principal, bundle): (&Principal, &[u8]),
+  unbundle: &Unbundle,
+  forked: Option<Forked>,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  let forked = match forked {
+    Some(stale) if is_stale(state, repository, &stale) => {
+      let mut rebasing = match begin_rebase(state, repository, stale)? {
+        Ok(rebasing) => rebasing,
+        Err(outcome) => return Some(outcome),
+      };
+      loop {
+        match rebasing.slice(state)? {
+          Ok(Stepped::More) => {}
+          Ok(Stepped::Done) => break,
+          Err(refused) => return Some(PushOutcome::refused(&abort(unindexed_words(&refused)))),
+        }
+      }
+      Some(rebasing.finish_in(state)?)
+    }
+    fresh => fresh,
+  };
+  landing(
+    state,
+    repository,
+    (principal, bundle),
+    unbundle,
+    forked,
+    room,
+  )
 }
 
 /// What an intake's refusal answers: verification's and the keeping's words, as 7.2 aborts.
