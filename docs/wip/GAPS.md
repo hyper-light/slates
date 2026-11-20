@@ -1191,6 +1191,21 @@
 > `phases.publish`. `slates-server --lib` filtered 51 of 51 and fmt clean on macOS arm64 (Mac Studio, kiln r357,
 > 2026-11-19): a daemon's edge answers `capabilities` and `heads` of a repository on another shard holding
 > `fixtures/state`'s `states` by an import; the other platforms owed.
+> **Built (A-680 part 2b):** Mercurial's pushes over HTTP: the site reads `unbundle`'s `heads` argument and bundle and
+> hands them to the lender's driver (`repository::hg_push::unbundle`), one step on the owner shard in 7.2's order
+> (`heads` judged against the served view, `pusherr` for a race; the bundle read as 7.2's `unbundle` reads it,
+> `push::read_bundle`; `prepare`, the policy, a gate refusing every push while a Mercurial hook is configured, the
+> landing), its revisions kept in a fork of the index in the repository's store in A-662's map (`hg_push::land` over
+> the Mercurial arm, `Objects` gone), its answer framed as 7.2 frames `unbundle`'s (`serve::http::pushed`); HTTP's
+> capabilities list `unbundle` and a push's bundle2 capabilities. Red first (the edge's push test over main without the fix:
+> `200` `application/hg-error`, kiln r467); `slates-hg --lib push:: serve::` 93 of 93, `slates-server --lib` filtered 64
+> of 64 and fmt clean on macOS arm64 (Mac Studio, kiln r467 and r480, 2026-11-19): stock 7.2's own HTTP push over a
+> two-shard daemon's TLS edge answered with 7.2's reply but its progress words, `heads` the pushed changeset after it;
+> the other platforms owed.
+> **Open (A-680 part 2b): a push's revisions are not durable.** Its entry records its moves and phase roots and no
+> record of its revisions, and a recovery replays no Mercurial record, so after a restart the store lacks what pushes
+> brought while the register keeps their moves: `heads` answered from a store that no longer holds them. A-687 makes
+> Mercurial's record kind (the import's); A-680 part 2c records each push's objects with it and replays them.
 > **Fixed (A-673, 2026-11-19, g303): an answer's room charged at the linked zlib-rs's own bound.** `compression::bound`
 > charged zlib at stock zlib's `compressBound`, which counts stored blocks, while zlib-rs's level 1 (zlib-ng's
 > `deflate_quick`) writes every literal in fixed codes and never falls back to one, so bytes that do not compress
@@ -1244,12 +1259,10 @@
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
 > step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes (A-657 part 4
 > built the policy before the verdict in `acl`'s words and the `pretxnchangegroup` and `changegroup` hooks through
-> the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the landing's seam
-> (`hg_push::Objects`) handed each repository's index and content store from their home on its owner shard (A-662 built
-> it: `vcs_store`'s Mercurial arm, made with the record, charged and freed with it), each push's record and its replay
-> at recovery (A-662 refuses a Mercurial record `Owed` until then), and the HTTP site's pushes through them (A-680 part
-> 2b; the served view and the site's lender are built) and the SSH edge's (`unbundle` in `serve --stdio`'s session,
-> which A-679 serves for reads alone);
+> the driver): the principal's Mercurial identity in `acl`'s words (§4.13); each push's record and its replay at
+> recovery (A-680 part 2c, with A-687's record kind; A-662 refuses a Mercurial record `Owed` until then; the landing
+> into the store's Mercurial arm and the HTTP site's pushes are built, A-680 part 2b); the SSH edge's pushes through the
+> same driver (A-679's loop);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2
