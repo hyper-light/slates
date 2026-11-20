@@ -38,3 +38,8 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - 5b-ii: Engine::Container (appended; serde "container"), held from RunnerFacts.containers, asked_of/set (409 when
   not available), split/drained by session engine, lineage wanted/on_engine, exhaustive matches; image source TBD
   (Agentfiles are Shards images built on microvm runners only).
+
+## Piece 5a: LANDED 2026-11-20 ~00:5xZ, kiln main ..edc8a2c8e (e73ad6d39 + merges 2b0cdc815/19c0e4160/.../edc8a2c8e)
+- is-ancestor confirmed from the Studio. Merges: config.rs/slates_fleet (re-ran 14/14), review.rs/git.rs (w-k90-vendor
+  filemode), docs/agentic.md status-row conflict (main's row + my W9 sentence). Reported to main (agents_send).
+- NEXT: 5b-i (sandbox::container), then 5b-ii (Engine::Container).
