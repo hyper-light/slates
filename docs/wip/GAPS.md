@@ -1711,6 +1711,9 @@
 > `no-access` session for repositories on both shards, one name with a `/`), cli 2 of 2. Owed: the authenticated
 > session's per-call sources through the same lender (after A-692's CRAM-MD5); the tunnel's move to the owner
 > (A-688 looks on its own shard alone) and its test over the SSH site; `svn_uri_canonicalize`.
+> A-693 part 1, 2026-11-19 (w-svn): `get-lock` and `get-locks` answered from the lock table (stock `svnserve`'s
+> recorded `info`/`ls` sessions now replayed with them; a held, an expired and a hidden lock; the depth refusal).
+> Owed: the four lock-changing verbs through the owner's step (A-693 part 2).
 > A-692 (2026-11-19, g307): `svn://`'s CRAM-MD5 against enrolled tokens. A token's credential record keeps HMAC-MD5's
 > keyed contexts beside its hash (`CredentialKind::HttpToken`'s `cram_md5_contexts`, Dovecot's layout), derived by the
 > CLI's issuer as it mints the token, so the daemon holds neither the token nor anything that gives it back; a client

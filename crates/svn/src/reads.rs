@@ -66,6 +66,7 @@
 use crate::authz::{PrincipalRules, may_read};
 use crate::handshake::ClientCapabilities;
 use crate::index::{ContentIdentity, Index, IndexRefusal, Node, NodeKind, PropertyList, Revision};
+use crate::lock::{AprTime, LockTable};
 use crate::mergeinfo::{self, Contents, MergeinfoInheritance, QueryRefusal};
 use crate::ra_svn::{ItemError, Value, write};
 use crate::report::drive::history as copies;
@@ -476,6 +477,44 @@ pub fn answer<R: Repository + ?Sized>(
     other if ELSEWHERE.contains(&other) => Ok(Outcome::Elsewhere),
     other => reads.unknown(other),
   }
+}
+
+/// `get-lock` and `get-locks` ([`locks`]' documentation), answered from the repository's lock table `locks` at the
+/// owner's instant `now`; `None` for any other command, which [`answer`] answers.
+///
+/// # Errors
+/// [`ItemError`] when an answer cannot be written, which no answer here can give.
+pub fn answer_lock_read<R: Repository + ?Sized>(
+  index: &Index,
+  repository: &R,
+  (locks, now): (&LockTable, AprTime),
+  session: &Session<'_>,
+  command: &Value<'_>,
+  out: &mut Vec<u8>,
+) -> Option<Result<Outcome, ItemError>> {
+  let Value::List(parts) = command else {
+    return None;
+  };
+  let (Some(Value::Word(name)), Some(Value::List(params))) = (parts.first(), parts.get(1)) else {
+    return None;
+  };
+  if *name != "get-lock" && *name != "get-locks" {
+    return None;
+  }
+  let mut reads = Reads {
+    index,
+    repository,
+    base: session.base,
+    uuid: session.uuid,
+    authz: session.authz,
+    authentication: session.authentication,
+    out,
+  };
+  Some(if *name == "get-lock" {
+    reads.get_lock(params, locks, now)
+  } else {
+    reads.get_locks(params, locks, now)
+  })
 }
 
 /// A refusal as `svnserve` writes it: Subversion's error number and its message.
@@ -1919,6 +1958,7 @@ mod file_revs;
 mod fold;
 mod history;
 mod list;
+mod locks;
 mod log;
 mod segments;
 mod stream;
