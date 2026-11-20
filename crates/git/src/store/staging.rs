@@ -50,8 +50,17 @@ enum Step {
     /// The numbers so far.
     done: BTreeMap<ObjectId, u64>,
   },
+  /// The fork the rows are written into made, and the next position read: what the staging is current against. A
+  /// landing after it moves the index's rows or its next position, so the commit stages the push again (A-722 part
+  /// 4b's race, found by reading after the 100-push run: a fork made at the rows' step met rows another push landed
+  /// meanwhile).
+  Forking,
   /// Each held object checked against the index, an object a unit.
   Fresh {
+    /// The fork, made as the staging began.
+    fork: Index,
+    /// The next position as the fork was made.
+    base: u64,
     /// The last object checked.
     after: Option<ObjectId>,
     /// The new objects, in their ids' order.
@@ -61,6 +70,10 @@ enum Step {
   },
   /// Each new object given its position, an object a unit.
   Positions {
+    /// The fork.
+    fork: Index,
+    /// The next position as the fork was made.
+    base: u64,
     /// The new objects.
     fresh: Vec<Fresh>,
     /// The next one to place.
@@ -72,6 +85,8 @@ enum Step {
   },
   /// Each new object's rows inserted into the fork, an object a unit.
   Rows {
+    /// The next position as the fork was made.
+    base: u64,
     /// The new objects.
     fresh: Vec<Fresh>,
     /// The next one to write.
@@ -83,6 +98,8 @@ enum Step {
   },
   /// The fork's tail sealed, a table a unit.
   Sealing {
+    /// The next position as the fork was made.
+    base: u64,
     /// The positions given.
     positions: BTreeMap<ObjectId, u64>,
     /// The fork sealed.
@@ -105,9 +122,10 @@ impl Staging {
   /// Gives back what a staging ended before its end holds: its fork.
   pub fn abandon(self, store: &mut ContentStore) -> Result<(), StoreRefused> {
     match self.step {
-      Step::Rows { fork, .. } | Step::Sealing { fork, .. } => {
-        fork.release(store).map_err(StoreRefused::from)
-      }
+      Step::Fresh { fork, .. }
+      | Step::Positions { fork, .. }
+      | Step::Rows { fork, .. }
+      | Step::Sealing { fork, .. } => fork.release(store).map_err(StoreRefused::from),
       _ => Ok(()),
     }
   }
@@ -154,11 +172,7 @@ impl Repository {
       old.fork.release(store)?;
     }
     Ok(Staging {
-      step: Step::Fresh {
-        after: None,
-        fresh: Vec::new(),
-        kinds: BTreeMap::new(),
-      },
+      step: Step::Forking,
     })
   }
 
@@ -220,11 +234,7 @@ impl Repository {
       } => {
         let Some(id) = ids.get(next).copied() else {
           push.seal_with(&done);
-          return Ok(Step::Fresh {
-            after: None,
-            fresh: Vec::new(),
-            kinds: BTreeMap::new(),
-          });
+          return Ok(Step::Forking);
         };
         self.generations_from(store, push, id, &mut done)?;
         Ok(Step::Generations {
@@ -233,49 +243,71 @@ impl Repository {
           done,
         })
       }
+      Step::Forking => Ok(Step::Fresh {
+        fork: self.index.fork(store)?,
+        base: self.next_position,
+        after: None,
+        fresh: Vec::new(),
+        kinds: BTreeMap::new(),
+      }),
       Step::Fresh {
+        fork,
+        base,
         after,
         mut fresh,
         mut kinds,
       } => {
         let held = push.held_after(after.as_ref().map(ObjectId::as_bytes));
         let Some((bytes, number, content, len)) = held else {
-          return self.positions_begun(fresh, &kinds);
+          return self.positions_begun((fork, base), fresh, &kinds);
         };
-        let id = ObjectId::from_bytes(self.format, bytes).ok_or(StoreRefused::ForeignPush)?;
+        let Some(id) = ObjectId::from_bytes(self.format, bytes) else {
+          fork.release(store)?;
+          return Err(StoreRefused::ForeignPush);
+        };
         if self.indexed(store, &id).is_none() {
-          let kind = kind_of(number).ok_or(StoreRefused::Malformed { id })?;
+          let Some(kind) = kind_of(number) else {
+            fork.release(store)?;
+            return Err(StoreRefused::Malformed { id });
+          };
           fresh.push((id, kind, content, len));
           let count = kinds.entry(kind).or_insert(0);
           *count = count.saturating_add(1);
         }
         Ok(Step::Fresh {
+          fork,
+          base,
           after: Some(id),
           fresh,
           kinds,
         })
       }
       Step::Positions {
+        fork,
+        base,
         fresh,
         at,
         mut next_of,
         mut positions,
       } => {
         let Some((id, kind, ..)) = fresh.get(at).copied() else {
-          let fork = self.index.fork(store)?;
           return Ok(Step::Rows {
+            base,
             fresh,
             at: 0,
             positions,
             fork,
           });
         };
-        let next = next_of
-          .get_mut(&kind)
-          .ok_or(StoreRefused::Malformed { id })?;
+        let Some(next) = next_of.get_mut(&kind) else {
+          fork.release(store)?;
+          return Err(StoreRefused::Malformed { id });
+        };
         positions.insert(id, *next);
         *next = next.saturating_add(1);
         Ok(Step::Positions {
+          fork,
+          base,
           fresh,
           at: at.saturating_add(1),
           next_of,
@@ -283,19 +315,25 @@ impl Repository {
         })
       }
       Step::Rows {
+        base,
         fresh,
         at,
         positions,
         mut fork,
       } => {
         let Some(object) = fresh.get(at).copied() else {
-          return Ok(Step::Sealing { positions, fork });
+          return Ok(Step::Sealing {
+            base,
+            positions,
+            fork,
+          });
         };
         if let Err(refused) = self.rows_of(store, push, &positions, object, &mut fork) {
           fork.release(store)?;
           return Err(refused);
         }
         Ok(Step::Rows {
+          base,
           fresh,
           at: at.saturating_add(1),
           positions,
@@ -303,15 +341,20 @@ impl Repository {
         })
       }
       Step::Sealing {
+        base,
         positions,
         mut fork,
       } => match fork.seal_step(store) {
-        Ok(false) => Ok(Step::Sealing { positions, fork }),
+        Ok(false) => Ok(Step::Sealing {
+          base,
+          positions,
+          fork,
+        }),
         Ok(true) => {
           push.set_staged(Staged {
             fork,
             positions,
-            base: self.next_position,
+            base,
           });
           Ok(Step::Ended)
         }
@@ -325,14 +368,15 @@ impl Repository {
   }
 
   /// The positions step begun over `fresh`: each type's run starting where the types before it, in their order, end,
-  /// from the repository's next position (A-639: by type, then id).
+  /// from the next position as the fork was made (A-639: by type, then id).
   fn positions_begun(
     &self,
+    (fork, base): (Index, u64),
     fresh: Vec<Fresh>,
     kinds: &BTreeMap<Kind, u64>,
   ) -> Result<Step, StoreRefused> {
     let mut next_of = BTreeMap::new();
-    let mut start = self.next_position;
+    let mut start = base;
     for (kind, count) in kinds {
       next_of.insert(*kind, start);
       start = start
@@ -341,6 +385,8 @@ impl Repository {
         .ok_or(StoreRefused::PositionsExhausted)?;
     }
     Ok(Step::Positions {
+      fork,
+      base,
       fresh,
       at: 0,
       next_of,

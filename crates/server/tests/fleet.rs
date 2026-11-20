@@ -20856,6 +20856,33 @@ fn assert_the_name_held_and_the_unshared_refused(
 /// What [`head_bytes`] reads.
 type HeadBytes = Result<Vec<u8>, Box<ReplyBody>>;
 
+/// B and C replicate `green` at version 1 within the placement deadline.
+fn assert_replicated_at_version_one(
+  all: &[&Daemon],
+  [daemon_b, daemon_c]: [&Daemon; 2],
+  green: VolumeId,
+) {
+  let replicated = poll_until(all, PLACEMENT_DEADLINE, || {
+    Ok(
+      daemon_b.merge_holder_state(green)?.version == Some(1)
+        && daemon_c.merge_holder_state(green)?.version == Some(1),
+    )
+  });
+  assert!(replicated, "B and C replicate the green at version 1");
+}
+
+/// The work B's client makes over `green`, named `holders-work`, admitted at base 1: its id.
+fn holders_work_at_base_one(holder: &mut Client, green: VolumeId) -> VolumeId {
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  work
+}
+
 /// `owner` edits `owners_work`, `f` holding "hello", and submits it: the green at version 1.
 fn at_version_one(owner: &mut Client, owners_work: VolumeId) {
   let edited = owner.call(&RequestBody::Edit {
@@ -21077,13 +21104,7 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
   at_version_one(&mut owner, owners_work);
   daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let created = holder.call(&RequestBody::CreateWork {
-    green,
-    name: "holders-work".to_owned(),
-  });
-  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
-    panic!("B made the work at base 1: {created:?}");
-  };
+  let work = holders_work_at_base_one(&mut holder, green);
   let admitted_floor = daemon_a.work_floor(green, work);
   let drop = RequestBody::MoveWorkFloor {
     green,
@@ -21137,34 +21158,10 @@ fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_posi
   let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
-  let edited = owner.call(&RequestBody::Edit {
-    work: owners_work,
-    path: "f".to_owned(),
-    at: 0,
-    delete_len: 0,
-    bytes: b"hello".to_vec(),
-  });
-  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
-  assert!(
-    matches!(
-      submitted,
-      ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }
-    ),
-    "{submitted:?}"
-  );
+  at_version_one(&mut owner, owners_work);
   daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let created = holder.call(&RequestBody::CreateWork {
-    green,
-    name: "holders-work".to_owned(),
-  });
-  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
-    panic!("B made the work at base 1: {created:?}");
-  };
+  let work = holders_work_at_base_one(&mut holder, green);
   let count = |daemon: &Daemon, name: &str| {
     daemon
       .refusals_on_every_shard()
@@ -21216,6 +21213,33 @@ fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_posi
   assert!(floor_rose, "A's floor for the work rose to its new base");
 }
 
+/// The resent submit answered `Submitted` at version 2 once B's replica held it, settled there at least once, the
+/// replica at version 2, and the work reading its new base.
+fn assert_answered_once_replicated<E: std::fmt::Debug>(
+  answer: &Option<Result<ReplyBody, E>>,
+  settled: u64,
+  replica_after: Result<Option<u64>, ObserveError>,
+  works_bytes: &HeadBytes,
+) {
+  assert!(
+    matches!(
+      answer,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }))
+    ),
+    "answered once the replica held it: {answer:?}"
+  );
+  assert!(settled >= 1, "settled on the replica: {settled}");
+  assert_eq!(replica_after, Ok(Some(2)));
+  assert_eq!(
+    *works_bytes,
+    Ok(b"hello world".to_vec()),
+    "the work reads its new base"
+  );
+}
+
 /// A-697 part d (a holder's submit settles once its replica holds the version): in a three-node `f = 1` fleet (every
 /// node a holder, a quorum of two), A owns a green at version 1 (`f` holding "hello"), which B and C replicate; B serves
 /// works over greens A owns (the test hook) and makes one at base 1. Do: B withholds every merge record (A commits with
@@ -21229,42 +21253,12 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
   let (daemon_a, daemon_b, daemon_c) = (&daemons[0], &daemons[1], &daemons[2]);
   let (green, owners_work) = green_and_work_on(daemon_a.instance(), &[daemon_b]);
   let mut owner = Client::connect(daemon_a.instance());
-  let edited = owner.call(&RequestBody::Edit {
-    work: owners_work,
-    path: "f".to_owned(),
-    at: 0,
-    delete_len: 0,
-    bytes: b"hello".to_vec(),
-  });
-  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
-  assert!(
-    matches!(
-      submitted,
-      ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }
-    ),
-    "{submitted:?}"
-  );
+  at_version_one(&mut owner, owners_work);
   let all: Vec<&Daemon> = daemons.iter().collect();
-  let replicated = poll_until(&all, PLACEMENT_DEADLINE, || {
-    Ok(
-      daemon_b.merge_holder_state(green)?.version == Some(1)
-        && daemon_c.merge_holder_state(green)?.version == Some(1),
-    )
-  });
-  assert!(replicated, "B and C replicate the green at version 1");
+  assert_replicated_at_version_one(&all, [daemon_b, daemon_c], green);
   daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let created = holder.call(&RequestBody::CreateWork {
-    green,
-    name: "holders-work".to_owned(),
-  });
-  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
-    panic!("B made the work at base 1: {created:?}");
-  };
+  let work = holders_work_at_base_one(&mut holder, green);
   let edited = holder.call(&RequestBody::Edit {
     work,
     path: "f".to_owned(),
@@ -21320,23 +21314,7 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
     Ok(Some(1)),
     "while B's replica lacked version 2"
   );
-  assert!(
-    matches!(
-      answer,
-      Some(Ok(ReplyBody::Submitted {
-        version: Some(2),
-        ..
-      }))
-    ),
-    "answered once the replica held it: {answer:?}"
-  );
-  assert!(settled >= 1, "settled on the replica: {settled}");
-  assert_eq!(replica_after, Ok(Some(2)));
-  assert_eq!(
-    works_bytes,
-    Ok(b"hello world".to_vec()),
-    "the work reads its new base"
-  );
+  assert_answered_once_replicated(&answer, settled, replica_after, &works_bytes);
 }
 
 /// A-697 part e, A-207 (a work comes back from its log after a restart), A-313 (a holder's replica is rebuilt from the

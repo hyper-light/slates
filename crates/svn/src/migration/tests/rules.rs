@@ -364,3 +364,57 @@ fn a_large_delta_is_measured_and_written_a_window_a_call() {
   import_whole(&mut again, &out).unwrap();
   assert!(history(&again) == history(&source));
 }
+
+/// Shape: the measured history's large file, in windows: 20 MB, a large text a migration meets.
+const MEASURED_WINDOWS: usize = 200;
+
+/// A-652 (measurement, not a gate; BENCHMARKS "Subversion dump export calls"). Do: in release, export a history whose
+/// revision 1 adds a [`MEASURED_WINDOWS`]-window file and whose revision 2 changes it whole, in each format, a call at
+/// a time, timing each call. Expect nothing: print each format's call count, median, p99 and maximum, which the
+/// benchmark compares with the daemon's copy slice.
+#[test]
+#[ignore = "a measurement, run in release: cargo test --release -p slates-svn --lib -- --ignored export_call_times --nocapture"]
+fn export_call_times() {
+  use crate::migration::{Exporter, Exporting};
+  use crate::svndiff::WINDOW_LIMIT;
+  let length = MEASURED_WINDOWS * usize::try_from(WINDOW_LIMIT).unwrap();
+  let mut dump = Dump::new(Format::Two, Some(VECTOR_UUID));
+  dump
+    .revision(
+      0,
+      &properties(&[("svn:date", "2005-04-07T22:13:00.000000Z")]),
+    )
+    .revision(1, &revision_properties(1))
+    .node(
+      &Node::add("big", NodeKind::File)
+        .properties(Properties::new())
+        .text(&noisy(1, length)),
+    )
+    .revision(2, &revision_properties(2))
+    .node(&Node::change("big").text(&noisy(3, length)));
+  let mut source = created();
+  import_whole(&mut source, &dump.bytes()).unwrap();
+  for format in [Format::Two, Format::Three] {
+    let mut exporter = Exporter::new(&source, 0, 2, format).unwrap();
+    let mut out = Vec::new();
+    let mut times = Vec::new();
+    loop {
+      out.clear();
+      let began = std::time::Instant::now();
+      let done = exporter.export(&source, &mut out).unwrap() == Exporting::Done;
+      times.push(began.elapsed().as_nanos());
+      if done {
+        break;
+      }
+    }
+    times.sort_unstable();
+    let at = |share: usize| times[(times.len() - 1) * share / 100];
+    println!(
+      "export_call_times {format:?}: {} calls, median {} ns, p99 {} ns, max {} ns",
+      times.len(),
+      at(50),
+      at(99),
+      times[times.len() - 1]
+    );
+  }
+}

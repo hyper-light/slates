@@ -1428,7 +1428,7 @@ fn verdict_over_fleet(
           .0
           .first()
           .clone(),
-          Some(Err(reply)) => reply,
+          Some(Err(reply)) => *reply,
           None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
         };
         // The work settles on its new base only once this node's replica holds it (A-697 part d).
@@ -1465,7 +1465,7 @@ fn computed_request(
   inc: slates_merge::engine::Increment,
   (id, principal): (RequestId, Principal),
   carried: slates_ipc::protocol::ComputedSubmit,
-) -> Result<Vec<u8>, ReplyBody> {
+) -> Result<Vec<u8>, Box<ReplyBody>> {
   use slates_merge::engine::ComputeRefused;
   let behind = crate::verbs::refused(Refusal::Overloaded { shard: state.shard });
   let Some(replica) = state
@@ -1474,24 +1474,24 @@ fn computed_request(
     .get(&slates_db::register::ObjectId(green.bytes))
   else {
     state.count(REPLICA_BEHIND, 1);
-    return Err(behind);
+    return Err(Box::new(behind));
   };
   let computed = match replica.compute(&inc) {
     Ok(computed) => computed,
     Err(ComputeRefused::BaseAhead { .. }) => {
       state.count(REPLICA_BEHIND, 1);
-      return Err(behind);
+      return Err(Box::new(behind));
     }
     Err(ComputeRefused::BaseUnavailable { base, .. }) => {
-      return Err(crate::verbs::refused(Refusal::UnknownBase {
+      return Err(Box::new(crate::verbs::refused(Refusal::UnknownBase {
         green: crate::verbs::to_wire_volume(green),
         version: base,
-      }));
+      })));
     }
     Err(ComputeRefused::CopyRefused { path, case }) => {
-      return Err(crate::verbs::refused(crate::verbs::copy_refused(
+      return Err(Box::new(crate::verbs::refused(crate::verbs::copy_refused(
         path, case,
-      )));
+      ))));
     }
   };
   state.count(COMPUTED_ON_HOLDER, 1);

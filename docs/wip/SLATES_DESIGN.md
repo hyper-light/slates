@@ -55606,6 +55606,18 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4b's race — A staging a landing overtakes is staged again, whatever step it was in (bug, 2026-11-20, w-git; found by reading after the 100-push run)
+- **Cause.** Part 4b made the stage's fork at its rows' step and read the next position at its positions' step, so a
+  push that landed during the staging's earlier turns could leave a stage that looked current (its fork made after
+  the landing) with positions or rows the landing had taken: a shared object's row met as `RowDiffers`, or two objects
+  at one position.
+- **Change.** The staging's first unit makes its fork and reads the next position (`Step::Forking`); every later step
+  carries them, and the stage records that base, so any landing in between leaves it stale and the commit stages it
+  again.
+- **Tests.** `slates-git` `store::tests::a_push_landed_while_another_is_staged_takes_no_position_of_the_others` (red:
+  `Index(RowDiffers)`); `slates-git --lib -- store:: receive::` 139 passed, 4 ignored; `slates-server --lib --
+  vcs_store:: git_push:: repository:: vcs_http::git` 170 passed; fmt clean (macOS arm64, this Mac, local).
+
 ### A-722 part 4d — A replayed record's thin pack resolves its deltas a delta a unit (2026-11-20, w-git for UI goal 93)
 - **Change.** `slates_git::unpack::Reader::resolve_turn_with`: w-balance's resolution in turns (032617278) over the
   reader's own keeper, a thin pack's outside bases read from the store; a git record's replay (`git_replay`) resolves

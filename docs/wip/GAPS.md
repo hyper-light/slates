@@ -2007,7 +2007,17 @@
 > measuring walk a window a call before the record's call (the step run first on copies, its writes dropped, to learn
 > its delta's texts); held by `a_large_delta_is_measured_and_written_a_window_a_call` (a five-window change: 15 calls,
 > each within a window and `CALL_HEADROOM`, where by count the record's call measured all five). The dump export's
-> calls are bounded by a window now; a call's time against the shard's slice is main's to measure in release. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> calls are bounded by a window now; a call's time against the shard's slice is measured in release (BENCHMARKS).
+> **Found by reading, not chased (2026-11-20, g268's queue, by main's ruling):** a commit's drive judges a path's lock
+> at the commit's start (`commit::drive`'s `setup.now`), where FSFS judges each call at its own instant (`lock.c` 457),
+> so a lock that expires while a commit is driven could refuse a change FSFS takes. `svnserve` never makes an expiring
+> lock (both its lock calls pass expiration 0); only a DAV `LOCK` with a `Timeout` does, so the case needs a timed DAV
+> lock and a commit spanning its expiry, off the scale path.
+> **Measured 2026-11-20 (the big Studio, release; BENCHMARKS):** the export's text calls run 12 to 20 times the copy
+> slice (format 2's 100 KB piece digested, median 168 µs; format 3's window, p99 290 µs): owed, the piece and the
+> window sliced to the slice. **Subversion's intake (§4.17.1 "A push's intake"):** a 500 MB commit by stock svn is
+> refused E210009 by one request's room over svn:// and DAV (rule 2), and below that room `commit::drive::Work::texts`
+> holds every new text whole (rule 1, by reading); owed, w-svn's next piece. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
