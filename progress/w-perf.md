@@ -172,3 +172,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   restart -> svn cat -r N.
 - (a2) step 1 (slates-vcs): WindowStorage seam (heap impl default for tests/tools); windows go through it, lists/tables
   stay in the store's memory; get() lends lists/tables only (git derived/tree.rs:813 gitlink read -> windows()).
+- (a2) step 1 built in worktree ~/slates-work/w-perf-a723 (uncommitted): slates-vcs WindowStorage trait (put/read/
+  release), StoredWindow handle, HeapWindows default, ContentStore::with_storage, Held.kept = Kept::Here (lists, tables,
+  derived) | Kept::Stored{window,len} (windows); get() lends Here only; new bytes_of() reads any form (Cow); release
+  copies a stored window out then releases it; ContentRefused::Storage; git derived/tree.rs gitlink read -> bytes_of;
+  vcs tests moved to bytes_of; new test windows_kept_by_a_storage_that_copies_out_read_and_free_as_the_heap_store_does.
+  vcs content:: 8/8. Dependents' tests running. Then: land step 1; step 2 = server ArenaWindows over a repository
+  ChunkStore per shard (pool owner-tag range), then (a3).

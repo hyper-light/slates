@@ -1,5 +1,10 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## MAIN ORDER 2026-11-20: 1 (a) part 2 owed commit; 2 push storm: one build per green, a mid-build push hands its change to
+  the running build (or moves to newest head once at a slice boundary), never restarts; RESTARTED counter asserted 0 under a
+  50-push storm test; 3 parked submit's wait bounded by the derived failover delay, typed refusal past it. Then svn copies,
+  symlinks; A-697; A-658 3c.
+
 ## LANDED 2026-11-20: (a) push half = cd302e110 (main 777022f2a). NOW: (a) part 2, the owed commit (main's 3 requirements:
   replay reads no clock + determinism test crash-after-staging recover-twice same ids; completion settles owed in the
   same transaction; one owed per green, parked, typed refusal at bound). Then svn copies, symlinks. Then A-697, A-658 3c.
