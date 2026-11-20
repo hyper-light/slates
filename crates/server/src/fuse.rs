@@ -517,8 +517,14 @@ fn deliver(s: &mut ShardState, reply: ReplyBody, route: Option<crate::merge_serv
   }
 }
 
+/// Format: a mount helper's exit awaited by its exit watch (family three of main's sweep, 2026-11-20), the non-vacuity
+/// count of [`mount_without_blocking`]'s woken wait.
+const HELPER_EXIT_WATCHED: &str = "fuse.helper_exit.watched";
+/// Format: a mount helper whose exit the kernel would not watch (no pidfd), its exit polled a tick at a time instead.
+const HELPER_EXIT_UNWATCHED: &str = "fuse.helper_exit.unwatched";
+
 /// Mounts at `mount_point` through the OS helper without blocking the shard: the helper's answer awaited on
-/// its socket's readiness, its exit on the heartbeat's tick, all within `deadline_ns` (the bound its shard learned of its
+/// its socket's readiness, its exit on its exit watch, all within `deadline_ns` (the bound its shard learned of its
 /// helpers, A-525). A run that finishes is a sample of how long this machine's helpers take; one given up at the bound is
 /// not (Karn's rule) and backs the next bound off (`crate::helper_runs`).
 async fn mount_without_blocking(
@@ -536,6 +542,7 @@ async fn mount_without_blocking(
   let mut pending = begin_mount(mount_point, fsname, &extra)?;
   let began = futures::now_ns();
   let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+  let (mut exit_watch, mut exit_watch_refused) = (None, false);
   loop {
     let left = deadline_ns.saturating_sub(futures::now_ns().saturating_sub(began));
     if left == 0 {
@@ -555,8 +562,31 @@ async fn mount_without_blocking(
         let _ = futures::within(left, slates_rt::readiness::readable(socket)).await;
       }
       Progress::Waiting(Awaiting::Exit) => {
-        if futures::sleep(tick.min(left)).await.is_err() {
-          return Err(pending.abort(std::time::Duration::from_nanos(deadline_ns)));
+        // The helper's exit, awaited by an exit watch on its process (a pidfd, readable at the exit), taken once; before
+        // 2026-11-20 it was polled a tick at a time (main's sweep after A-697's release bench, family three). A watch
+        // the kernel refuses (no pidfd) leaves the tick, counted.
+        if exit_watch.is_none() && !exit_watch_refused {
+          exit_watch = pending
+            .helper_pid()
+            .and_then(|pid| slates_ipc::exit_watch::ExitWatch::on(pid).ok());
+          exit_watch_refused = exit_watch.is_none();
+          if exit_watch_refused {
+            let _ = state::with_state_counted(|s| s.count(HELPER_EXIT_UNWATCHED, 1));
+          }
+        }
+        let readiness = exit_watch
+          .as_ref()
+          .and_then(|watch| watch.readiness().map(|fd| std::os::fd::AsRawFd::as_raw_fd(&fd)));
+        match readiness {
+          Some(fd) => {
+            let _ = futures::within(left, slates_rt::readiness::readable(fd)).await;
+            let _ = state::with_state_counted(|s| s.count(HELPER_EXIT_WATCHED, 1));
+          }
+          None => {
+            if futures::sleep(tick.min(left)).await.is_err() {
+              return Err(pending.abort(std::time::Duration::from_nanos(deadline_ns)));
+            }
+          }
         }
       }
     }

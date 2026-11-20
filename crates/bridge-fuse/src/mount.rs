@@ -409,7 +409,8 @@ pub fn handshake(mut helper: Command, deadline: Duration) -> Result<OwnedFd, Mou
 pub enum Awaiting {
   /// The helper's answer on the socket: await [`PendingHandshake::socket`]'s readability.
   Socket,
-  /// The helper's exit after it answered: poll again after the owner's tick (an exit raises no readiness).
+  /// The helper's exit after it answered: poll again once it has exited, which the owner awaits through an exit watch
+  /// on [`PendingHandshake::helper_pid`] (a pidfd on Linux, readable at the exit).
   Exit,
 }
 
@@ -490,6 +491,12 @@ pub fn begin_handshake(mut helper: Command) -> Result<PendingHandshake, MountErr
 }
 
 impl PendingHandshake {
+  /// The helper's process id while it is not yet reaped: the owner takes an exit watch on it while [`Awaiting::Exit`],
+  /// so the wait ends at the exit itself. `None` once the helper is reaped.
+  pub fn helper_pid(&self) -> Option<u32> {
+    self.guard.0.as_ref().map(std::process::Child::id)
+  }
+
   /// The socket the helper answers on: the owner awaits its readability while [`Awaiting::Socket`].
   pub fn socket(&self) -> std::os::fd::BorrowedFd<'_> {
     self.socket.as_fd()
