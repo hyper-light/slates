@@ -43,6 +43,15 @@
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
 > - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
 >   the reserve's per-pass run list removed with the reserve (A-777).
+> - The anchor segment (45.9 GB mapped on the big Studio, 23 shards): each partition's log ring is `table_bytes` and each
+>   of its two snapshot slots twice that, a share of `reserve_per_shard` (`config.rs`), where `Geometry`'s own docs say
+>   "recovery budget x measured replay throughput" and "the measured partition state size x the growth headroom"
+>   (drift; no replay rate is measured). Address space only (backed where written). -> With the content extents
+>   proposal (main's inbox): sized from the measured state, grown by new regions.
+> - Allocations per NFS request (by reading, `bridge-nfs`): each procedure builds its results in a fresh `XdrWriter`
+>   (31 in `procedures.rs`, 15 in `multi.rs`, the v4 compound), and `reply_record` frames them into a second `Vec`,
+>   copying the results once (a READ's data). Some replies are kept (`nfs_replay::record`, `hold_reply`). -> Write into
+>   the connection's own buffer behind a reserved header; keep a reply by moving that buffer out only when it is kept.
 >
 > **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
 > W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
