@@ -1720,6 +1720,34 @@ fn every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows() {
   );
 }
 
+/// A-576, A-737 (goal 87): names Windows' own upcase table takes for one are one file on a folding drive, and names it
+/// keeps apart are two, as on NTFS. Do: on a folding volume's drive, make `ɐ.txt` and read `Ɐ.TXT`; make `ς.txt` and
+/// then `σ.txt`. Expect: `Ɐ.TXT` reads `ɐ.txt`'s bytes and its final path names `ɐ.txt`; `ς.txt` and `σ.txt` two files
+/// with their own bytes. Windows' table leaves final sigma `ς` as it is (dumped through `RtlUpcaseUnicodeChar` on both
+/// architectures, A-737), so A-576's premise that a Windows-alike `ς` beside `σ` must be refused does not hold.
+#[test]
+fn names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount_with("fold-upcase", &["--fold"]);
+  std::fs::write(drive.path("\u{250}.txt"), b"turned").unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("\u{2c6f}.TXT")).unwrap(),
+    b"turned"
+  );
+  let canonical = final_path(&drive.path("\u{2c6f}.TXT"));
+  eprintln!("A-576 the final path of `\u{2c6f}.TXT`: {canonical:?}");
+  assert_eq!(
+    canonical,
+    Ok(format!("\\\\?\\{}\\\u{250}.txt", drive.letter))
+  );
+  std::fs::write(drive.path("\u{3c2}.txt"), b"final").unwrap();
+  std::fs::write(drive.path("\u{3c3}.txt"), b"medial").unwrap();
+  assert_eq!(std::fs::read(drive.path("\u{3c2}.txt")).unwrap(), b"final");
+  assert_eq!(std::fs::read(drive.path("\u{3c3}.txt")).unwrap(), b"medial");
+}
+
 /// A-551. Do: on an exact volume's drive, make `a.txt` and `A.TXT` with different bytes, open `A.TXT` sharing nothing
 /// and open `a.txt` while it is held. Expect: two files, each with its own bytes, and the second open granted, since an
 /// exact volume's drive still declares `CaseSensitiveSearch` and each spelling is a file of its own.
