@@ -1,0 +1,124 @@
+ Downloading crates ...
+  Downloaded getrandom v0.3.4
+  Downloaded autocfg v1.5.1
+  Downloaded fastrand v2.5.0
+  Downloaded fnv v1.0.7
+  Downloaded bit-set v0.8.0
+  Downloaded unarray v0.1.4
+  Downloaded rand_xorshift v0.4.0
+  Downloaded bit-vec v0.8.0
+  Downloaded quick-error v1.2.3
+  Downloaded rusty-fork v0.3.1
+  Downloaded wait-timeout v0.2.1
+  Downloaded rand_core v0.9.5
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded rand_chacha v0.9.0
+  Downloaded tempfile v3.27.0
+  Downloaded num-traits v0.2.19
+  Downloaded rand v0.9.5
+  Downloaded proptest v1.11.0
+  Downloaded zerocopy v0.8.56
+  Downloaded regex-syntax v0.8.11
+   Compiling rustix v1.1.4
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-8d0e3a50ce015af7/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling getrandom v0.3.4
+   Compiling zerocopy v0.8.56
+   Compiling autocfg v1.5.1
+   Compiling rand_core v0.9.5
+   Compiling num-traits v0.2.19
+   Compiling fastrand v2.5.0
+   Compiling wait-timeout v0.2.1
+   Compiling fnv v1.0.7
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling bit-set v0.8.0
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.5
+   Compiling unarray v0.1.4
+   Compiling regex-syntax v0.8.11
+   Compiling slates-conformance v0.1.0 (/home/runner/work/slates/slates/crates/conformance)
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling slates-machine v0.1.0 (/home/runner/work/slates/slates/crates/machine)
+   Compiling tempfile v3.27.0
+   Compiling hyper-seal v0.1.0 (/home/runner/work/slates/slates/vendor/hyper-raft/hyper-seal)
+   Compiling rusty-fork v0.3.1
+   Compiling proptest v1.11.0
+   Compiling slates-bridge-oci v0.1.0 (/home/runner/work/slates/slates/crates/bridge-oci)
+   Compiling slates-mem v0.1.0 (/home/runner/work/slates/slates/crates/mem)
+   Compiling slates-wire v0.1.0 (/home/runner/work/slates/slates/crates/wire)
+   Compiling slates-rt v0.1.0 (/home/runner/work/slates/slates/crates/rt)
+   Compiling slates-vfs v0.1.0 (/home/runner/work/slates/slates/crates/vfs)
+   Compiling slates-anchor v0.1.0 (/home/runner/work/slates/slates/crates/anchor)
+   Compiling slates-db v0.1.0 (/home/runner/work/slates/slates/crates/db)
+   Compiling slates-transport v0.1.0 (/home/runner/work/slates/slates/crates/transport)
+   Compiling slates-ipc v0.1.0 (/home/runner/work/slates/slates/crates/ipc)
+   Compiling slates-bridge-core v0.1.0 (/home/runner/work/slates/slates/crates/bridge-core)
+   Compiling slates-base v0.1.0 (/home/runner/work/slates/slates/crates/base)
+   Compiling slates-bridge-fuse v0.1.0 (/home/runner/work/slates/slates/crates/bridge-fuse)
+   Compiling slates-seal v0.1.0 (/home/runner/work/slates/slates/crates/seal)
+   Compiling slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-virtiofs)
+   Compiling slates-land v0.1.0 (/home/runner/work/slates/slates/crates/land)
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+   Compiling slates-cluster v0.1.0 (/home/runner/work/slates/slates/crates/cluster)
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/slates/crates/server)
+   Compiling slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+   Compiling slates-test-seeds v0.1.0 (/home/runner/work/slates/slates/crates/test-seeds)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 16s
+     Running tests/fuse_mount.rs (target/debug/deps/fuse_mount-136aee8cdfd008c5)
+
+running 7 tests
+test a_fenced_shards_fuse_mount_ends_with_the_daemon ... slates-server: the start beat 7 times over 1 shards before the watchdog took the beat over
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck once it has gone its window without a step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a step; a shard's window is the 1000 ms liveness window, raised to the scheduler overrun the shard measures where that is longer, at most 10000 ms (the observation budget), so a poll may run 4977 ms of CPU at least (this build runs compiled code 4.9 times as slowly as the machine runs it in machine code, 26279 ns against 5280 ns for a batch of 8 chains); a shard waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host reports a memory stall (/proc/pressure/memory's some total, rising: Some(Cumulative { stalled_us: 2 }) now); no anchor reads the beat, so a stuck shard ends the daemon's process
+slates-server: shard 0 initialized in 3368 µs, 3289 µs of its CPU, in 7 slices of 7 units; the longest slice 2208 µs, the most CPU in one 2251 µs, ending at unit 2 (a slice's floor 5 µs, 165 µs yielding)
+slates-server: the host's memory-pressure watch is refused (write(memory pressure trigger) refused (error 22)); the pressure hold stands as its start sample left it
+ok
+test a_fuse_mount_over_a_kept_fence_ends_at_its_next_request ... slates-server: the start beat 13 times over 2 shards before the watchdog took the beat over
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck once it has gone its window without a step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a step; a shard's window is the 1000 ms liveness window, raised to the scheduler overrun the shard measures where that is longer, at most 10000 ms (the observation budget), so a poll may run 4977 ms of CPU at least (this build runs compiled code 4.9 times as slowly as the machine runs it in machine code, 26279 ns against 5280 ns for a batch of 8 chains); a shard waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host reports a memory stall (/proc/pressure/memory's some total, rising: Some(Cumulative { stalled_us: 2 }) now); no anchor reads the beat, so a stuck shard ends the daemon's process
+slates-server: shard 1 initialized in 1627 µs, 1549 µs of its CPU, in 4 slices of 7 units; the longest slice 813 µs, the most CPU in one 850 µs, ending at unit 2 (a slice's floor 4 µs, 87 µs yielding)
+slates-server: shard 0 initialized in 2204 µs, 2144 µs of its CPU, in 4 slices of 7 units; the longest slice 1449 µs, the most CPU in one 1480 µs, ending at unit 2 (a slice's floor 4 µs, 116 µs yielding)
+slates-server: the host's memory-pressure watch is refused (write(memory pressure trigger) refused (error 22)); the pressure hold stands as its start sample left it
+ok
+test a_held_descriptor_on_a_superseded_volume_reads_nothing_more ... slates-server: the start beat 13 times over 2 shards before the watchdog took the beat over
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck once it has gone its window without a step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a step; a shard's window is the 1000 ms liveness window, raised to the scheduler overrun the shard measures where that is longer, at most 10000 ms (the observation budget), so a poll may run 4977 ms of CPU at least (this build runs compiled code 4.9 times as slowly as the machine runs it in machine code, 26279 ns against 5280 ns for a batch of 8 chains); a shard waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host reports a memory stall (/proc/pressure/memory's some total, rising: Some(Cumulative { stalled_us: 2 }) now); no anchor reads the beat, so a stuck shard ends the daemon's process
+slates-server: shard 1 initialized in 1686 µs, 1659 µs of its CPU, in 3 slices of 7 units; the longest slice 942 µs, the most CPU in one 990 µs, ending at unit 2 (a slice's floor 4 µs, 115 µs yielding)
+slates-server: shard 0 initialized in 2221 µs, 2155 µs of its CPU, in 5 slices of 7 units; the longest slice 1451 µs, the most CPU in one 1505 µs, ending at unit 2 (a slice's floor 4 µs, 110 µs yielding)
+slates-server: the host's memory-pressure watch is refused (write(memory pressure trigger) refused (error 22)); the pressure hold stands as its start sample left it
+ok
+test a_revoked_consumers_fuse_mount_reaches_nothing ... slates-server: the start beat 13 times over 2 shards before the watchdog took the beat over
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck once it has gone its window without a step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a step; a shard's window is the 1000 ms liveness window, raised to the scheduler overrun the shard measures where that is longer, at most 10000 ms (the observation budget), so a poll may run 4977 ms of CPU at least (this build runs compiled code 4.9 times as slowly as the machine runs it in machine code, 26279 ns against 5280 ns for a batch of 8 chains); a shard waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host reports a memory stall (/proc/pressure/memory's some total, rising: Some(Cumulative { stalled_us: 2 }) now); no anchor reads the beat, so a stuck shard ends the daemon's process
+slates-server: shard 1 initialized in 1636 µs, 1618 µs of its CPU, in 4 slices of 7 units; the longest slice 885 µs, the most CPU in one 923 µs, ending at unit 2 (a slice's floor 4 µs, 99 µs yielding)
+slates-server: shard 0 initialized in 2140 µs, 2090 µs of its CPU, in 4 slices of 7 units; the longest slice 1454 µs, the most CPU in one 1516 µs, ending at unit 2 (a slice's floor 4 µs, 110 µs yielding)
+slates-server: the host's memory-pressure watch is refused (write(memory pressure trigger) refused (error 22)); the pressure hold stands as its start sample left it
+ok
+test a_revoked_consumers_open_descriptor_reads_nothing_it_had_not_read ... slates-server: the start beat 13 times over 2 shards before the watchdog took the beat over
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck once it has gone its window without a step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a step; a shard's window is the 1000 ms liveness window, raised to the scheduler overrun the shard measures where that is longer, at most 10000 ms (the observation budget), so a poll may run 4977 ms of CPU at least (this build runs compiled code 4.9 times as slowly as the machine runs it in machine code, 26279 ns against 5280 ns for a batch of 8 chains); a shard waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host reports a memory stall (/proc/pressure/memory's some total, rising: Some(Cumulative { stalled_us: 2 }) now); no anchor reads the beat, so a stuck shard ends the daemon's process
+slates-server: shard 1 initialized in 1679 µs, 1662 µs of its CPU, in 4 slices of 7 units; the longest slice 932 µs, the most CPU in one 968 µs, ending at unit 2 (a slice's floor 4 µs, 92 µs yielding)
+slates-server: shard 0 initialized in 2230 µs, 2164 µs of its CPU, in 4 slices of 7 units; the longest slice 1547 µs, the most CPU in one 1584 µs, ending at unit 2 (a slice's floor 4 µs, 127 µs yielding)
+slates-server: the host's memory-pressure watch is refused (write(memory pressure trigger) refused (error 22)); the pressure hold stands as its start sample left it
+ok
+test a_scoped_fuse_mount_presents_one_directory_and_follows_it ... slates-server: the start beat 13 times over 2 shards before the watchdog took the beat over
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck once it has gone its window without a step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a step; a shard's window is the 1000 ms liveness window, raised to the scheduler overrun the shard measures where that is longer, at most 10000 ms (the observation budget), so a poll may run 4977 ms of CPU at least (this build runs compiled code 4.9 times as slowly as the machine runs it in machine code, 26279 ns against 5280 ns for a batch of 8 chains); a shard waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host reports a memory stall (/proc/pressure/memory's some total, rising: Some(Cumulative { stalled_us: 2 }) now); no anchor reads the beat, so a stuck shard ends the daemon's process
+slates-server: shard 1 initialized in 1790 µs, 1686 µs of its CPU, in 4 slices of 7 units; the longest slice 945 µs, the most CPU in one 977 µs, ending at unit 2 (a slice's floor 4 µs, 94 µs yielding)
+slates-server: shard 0 initialized in 2369 µs, 2217 µs of its CPU, in 4 slices of 7 units; the longest slice 1526 µs, the most CPU in one 1580 µs, ending at unit 2 (a slice's floor 4 µs, 119 µs yielding)
+slates-server: the host's memory-pressure watch is refused (write(memory pressure trigger) refused (error 22)); the pressure hold stands as its start sample left it
+ok
+test a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount ... slates-server: the start beat 13 times over 2 shards before the watchdog took the beat over
+slates daemon: the watchdog beats every 100 ms and finds a shard stuck once it has gone its window without a step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a step; a shard's window is the 1000 ms liveness window, raised to the scheduler overrun the shard measures where that is longer, at most 10000 ms (the observation budget), so a poll may run 4977 ms of CPU at least (this build runs compiled code 4.9 times as slowly as the machine runs it in machine code, 26279 ns against 5280 ns for a batch of 8 chains); a shard waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host reports a memory stall (/proc/pressure/memory's some total, rising: Some(Cumulative { stalled_us: 2 }) now); no anchor reads the beat, so a stuck shard ends the daemon's process
+slates-server: shard 1 initialized in 1618 µs, 1589 µs of its CPU, in 4 slices of 7 units; the longest slice 852 µs, the most CPU in one 890 µs, ending at unit 2 (a slice's floor 5 µs, 90 µs yielding)
+slates-server: shard 0 initialized in 2275 µs, 2201 µs of its CPU, in 4 slices of 7 units; the longest slice 1471 µs, the most CPU in one 1534 µs, ending at unit 2 (a slice's floor 5 µs, 111 µs yielding)
+slates-server: the host's memory-pressure watch is refused (write(memory pressure trigger) refused (error 22)); the pressure hold stands as its start sample left it
+ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+
