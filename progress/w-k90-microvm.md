@@ -73,3 +73,5 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   vendor/patches/shards/0002 meanwhile. Hex change offered as kiln's vendor/patches/hex/0003 (Hex's pin b4db7e69c is
   on no reachable remote; `vendor.py check hex` owed on a machine that has it).
 - Piece 3: HVF proven (g90 + piece 1's g266 pass); KVM r4 (adacachy, piece-1 tree) still running; WHP BLOCKED.
+
+## 2026-11-20: piece 1 goal closed: HVF `microvm::` at kiln main 81174ac49 (A-741 in): 2 passed, 0 failed (g266 Ask+Bypass, g90 daemon 4630 killed -> successor 19863), 1998 s, alone on the Mac; log ~/.cache/w-k90-microvm-logs/hvf-main.log; target trimmed.
