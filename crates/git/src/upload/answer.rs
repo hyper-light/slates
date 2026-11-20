@@ -20,8 +20,9 @@
 //! A pack git's `pack-objects` would die of as it begins (A-640 part 4: a `sparse:oid` filter's blob not resolved or
 //! not read) is answered as git's server answers it: what came before the pack, then the dying process's lines as git
 //! formats them (`vfreportf`: cut to 4096 bytes, a control byte but a tab and a newline shown as `?`) and relays them
-//! (a band-2 packet each read of at most 128 bytes, a line read alone), then git's band-3 words, and no flush; with no
-//! band, what came before the pack alone.
+//! (a band-2 packet each read of at most 128 bytes, writes made one after another read together, [`Said`]), then git's
+//! band-3 words, and no flush; with no band, what came before the pack alone. What `pack-objects` writes as it reads
+//! the filter's name and lives on (a warning) is relayed the same way before the pack.
 
 use super::{ABORT, PackRefused, PackSource, Refusal, Refused, Served};
 use crate::negotiation::Counters;
@@ -39,7 +40,10 @@ const ERR: &[u8] = b"ERR ";
 const FATAL: &[u8] = b"fatal: ";
 
 /// Format: what git's `warning` writes before its words (`usage.c` `warn_builtin`).
-const WARNING: &[u8] = b"warning: ";
+pub(super) const WARNING: &[u8] = b"warning: ";
+
+/// Format: what git's `error` writes before its words (`usage.c` `error_builtin`).
+pub(super) const ERROR: &[u8] = b"error: ";
 
 /// Format: the most bytes one of git's reported lines takes, its newline last (`usage.c` `vfreportf`'s `msg[4096]`).
 const REPORTED: usize = 4096;
@@ -180,36 +184,30 @@ impl<K> Answer<K> {
 
   /// The answer git's server gives when `pack-objects` dies as it begins (A-640 part 4: a `sparse:oid` filter's blob
   /// that is not resolved or not read): `head`, everything written before the pack; then, where the answer has a band
-  /// to say them on (`banded`), the lines the dying process writes (`Refusal::warning`'s, then `refusal`'s words as
-  /// its `fatal:` line) as git's server relays them, a band-2 packet a read of at most `RELAYED` bytes, each line read
-  /// alone, then git's band-3 words, and no flush, as none follows git's. With no band, `head` alone: git's server
-  /// writes those lines to its own error stream, and the client finds the pack missing. The packets are charged to
-  /// `admission` first.
+  /// to say them on (`banded`), what the dying process writes to its error stream (`said`, its writes while it read
+  /// the filter's name; `Refusal::warning`'s line; then `refusal`'s words as its `fatal:` line) as git's server relays
+  /// it ([`relay`]), then git's band-3 words, and no flush, as none follows git's. With no band, `head` alone: git's
+  /// server writes those lines to its own error stream, and the client finds the pack missing. The packets are charged
+  /// to `admission` first. The `fatal:` line joins `said`'s last run when git read nothing since, as it dies at once
+  /// of a name that names nothing after it listed an abbreviation's candidates.
   pub(super) fn died(
     mut head: Vec<u8>,
+    mut said: Said,
     refusal: Refusal,
     banded: bool,
     admission: &mut Admission,
   ) -> Result<Answer<K>, Refusal> {
     if banded {
-      let lines: Vec<Vec<u8>> = refusal
-        .warning()
-        .map(|words| reported(WARNING, &words))
-        .into_iter()
-        .chain([reported(FATAL, &refusal.words())])
-        .collect();
-      let relayed = lines
-        .iter()
-        .flat_map(|line| line.chunks(RELAYED))
-        .map(|read| sideband::written_len(to_u64(read.len())))
-        .fold(
-          sideband::written_len(to_u64(ABORT.len())),
-          u64::saturating_add,
-        );
-      admission.charge(relayed).map_err(Refusal::PastAdmission)?;
-      for read in lines.iter().flat_map(|line| line.chunks(RELAYED)) {
-        sideband::write(Band::Progress, read, &mut head);
+      if let Some(words) = refusal.warning() {
+        said.write(&reported(WARNING, &words));
+        // git frees the blob it read, past its limit, before it dies.
+        said.read();
       }
+      said.write(&reported(FATAL, &refusal.words()));
+      relay(&said, &mut head, admission)?;
+      admission
+        .charge(sideband::written_len(to_u64(ABORT.len())))
+        .map_err(Refusal::PastAdmission)?;
       sideband::write(Band::Error, ABORT, &mut head);
     }
     Ok(Answer {
@@ -403,9 +401,63 @@ impl<K> Streaming<K> {
   }
 }
 
+/// What git's `pack-objects` writes to its error stream before its pack or its death, kept as git's server reads it
+/// (A-640 part 4; `create_pack_file` reads at most `RELAYED` bytes a read): writes made one after another reach the
+/// pipe together, so a read takes as much of them as it holds; git reading an object between two writes lets its
+/// server read the first before the second comes, so no read spans two runs of writes. Stock git's own recordings show
+/// both (`fixtures/fetch-sparse-*`): a refname warning and its advice read together; an abbreviation's `error:` line
+/// read alone before git reads the candidates it lists, then its advice and the `fatal:` line together; a refname
+/// warning before git reads the object it names, and the `fatal:` line after it, read apart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Said {
+  /// The runs of writes made with no object read between them, each whole, in order.
+  runs: Vec<Vec<u8>>,
+  /// Whether git read an object since the last write, so the next write begins a run.
+  read_since: bool,
+}
+
+impl Said {
+  /// Adds a write: to the last run, unless git read an object since it.
+  pub(super) fn write(&mut self, bytes: &[u8]) {
+    match self.runs.last_mut() {
+      Some(run) if !self.read_since => run.extend_from_slice(bytes),
+      _ => self.runs.push(bytes.to_vec()),
+    }
+    self.read_since = false;
+  }
+
+  /// Marks that git reads an object, or frees one, before its next write.
+  pub(super) fn read(&mut self) {
+    self.read_since = true;
+  }
+
+  /// Each read git's server makes of the writes: at most `RELAYED` bytes, never across two runs.
+  pub(super) fn reads(&self) -> impl Iterator<Item = &[u8]> {
+    self.runs.iter().flat_map(|run| run.chunks(RELAYED))
+  }
+}
+
+/// Puts what `said` holds after `out` on band 2 as git's server relays it: a packet each read ([`Said::reads`]); the
+/// packets charged to `admission` first.
+pub(super) fn relay(
+  said: &Said,
+  out: &mut Vec<u8>,
+  admission: &mut Admission,
+) -> Result<(), Refusal> {
+  let len = said
+    .reads()
+    .map(|read| sideband::written_len(to_u64(read.len())))
+    .fold(0, u64::saturating_add);
+  admission.charge(len).map_err(Refusal::PastAdmission)?;
+  for read in said.reads() {
+    sideband::write(Band::Progress, read, out);
+  }
+  Ok(())
+}
+
 /// The line git's `vfreportf` writes for `words` after `prefix`: the words cut to what its buffer holds, each control
 /// byte but a tab and a newline shown as `?`, and a newline last.
-fn reported(prefix: &[u8], words: &[u8]) -> Vec<u8> {
+pub(super) fn reported(prefix: &[u8], words: &[u8]) -> Vec<u8> {
   let most = REPORTED
     .saturating_sub(prefix.len())
     .saturating_sub(NEWLINE.len());
