@@ -35,7 +35,7 @@ use flate2::{Compress, Compression, FlushCompress, Status};
 use crate::entry::{self, Header, PACK_HEADER_LEN, Representation};
 use crate::object_name::{Kind, ObjectId};
 
-use super::deltas::delta_of;
+use super::deltas::{Search, SearchStep};
 use super::learn::{Clock, Exchange, LEVELS, Levels, Window};
 
 /// An object to encode: its id, position, type and bytes, and the object its path held in the
@@ -133,6 +133,103 @@ struct Choice {
   depth: u64,
 }
 
+/// A candidate base an object's trials try: the object its path held before, or an earlier entry
+/// of its kind, by its index among the encoder's recent entries of that kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Candidate {
+  Named,
+  Recent(usize),
+}
+
+/// Where an object's encoding stands (A-718).
+enum PutStage {
+  /// Trying its candidate bases, a step of a search at a time.
+  Trials,
+  /// Sampling the levels on the data's first window, `level` next.
+  Sample { level: u32 },
+  /// Deflating the data a window a step: the stream, the entry's CRC so far, the next byte to
+  /// feed, and the entry's header, written with the first step.
+  Deflate {
+    compress: Compress,
+    crc: crc32fast::Hasher,
+    next: usize,
+    header: Vec<u8>,
+  },
+}
+
+/// An object being encoded a step at a time ([`Encoder::begin`], [`Encoder::step`]).
+pub(crate) struct Putting {
+  object: ToEncode,
+  /// Where its entry begins in its pack.
+  at: u64,
+  /// Whether its kind's levels are sampled on it: the first of its kind this encoder encodes.
+  sample: bool,
+  /// Whether an earlier entry is named by its offset back.
+  by_offset: bool,
+  /// The candidate bases, in the order they are tried.
+  tries: Vec<Candidate>,
+  /// The candidate being tried, by its index in `tries`.
+  trying: usize,
+  /// Its search.
+  search: Search,
+  /// The owner's nanoseconds its trial has taken so far.
+  trial_ns: u64,
+  /// The shortest representation so far: the object's length, or the best delta's.
+  best: usize,
+  /// The representation chosen so far.
+  choice: Choice,
+  stage: PutStage,
+}
+
+impl Putting {
+  /// The bytes its entry holds: the delta chosen, or the object.
+  fn data(&self) -> &[u8] {
+    self.choice.delta.as_deref().unwrap_or(&self.object.bytes)
+  }
+
+  /// How its entry holds its object, as chosen.
+  fn representation(&self) -> (Representation, Stored, Option<u64>) {
+    match self.choice.base {
+      Base::Whole => (Representation::Whole(self.object.kind), Stored::Whole, None),
+      Base::Earlier { at: base, .. } if self.by_offset => (
+        Representation::OfsDelta { base },
+        Stored::Offset,
+        Some(base),
+      ),
+      Base::Earlier { id, position, .. } | Base::Named { id, position } => (
+        Representation::RefDelta { base: id },
+        Stored::Reference,
+        Some(position),
+      ),
+    }
+  }
+
+  /// The deflate stage at `level`: the entry's header written, its CRC begun.
+  fn deflating(&self, level: u32) -> Result<PutStage, FragmentRefused> {
+    let (representation, _, _) = self.representation();
+    let header = Header {
+      representation,
+      size: to_u64(self.data().len()),
+    };
+    let mut written = Vec::new();
+    entry::write(header, self.at, &mut written).map_err(FragmentRefused::Entry)?;
+    Ok(PutStage::Deflate {
+      compress: Compress::new(Compression::new(level), true),
+      crc: crc32fast::Hasher::new(),
+      next: 0,
+      header: written,
+    })
+  }
+}
+
+/// What a step of an object's encoding gave.
+pub(crate) enum Put {
+  /// The entry's next bytes, and more to come.
+  More(Vec<u8>),
+  /// The entry's last bytes, and its record.
+  Done(Vec<u8>, Placed),
+}
+
 /// An earlier entry a delta may name: its object, where its entry begins, its chain's depth.
 struct Recent {
   id: ObjectId,
@@ -163,95 +260,241 @@ impl Encoder {
   }
 
   /// Encodes `object` as the entry beginning `at` bytes into its pack: the entry's bytes, and its
-  /// record, whose offset and offset base are the pack's.
+  /// record, whose offset and offset base are the pack's. [`Encoder::begin`]'s steps, driven to
+  /// their end in one call, `window` bytes a step.
   pub(crate) fn put(
     &mut self,
     object: ToEncode,
     at: u64,
     learning: &mut Learning<'_>,
   ) -> Result<(Vec<u8>, Placed), FragmentRefused> {
-    let choice = self.choose(&object, learning);
-    let sample = self.sampled.insert(object.kind);
-    let (representation, stored, base) = match choice.base {
-      Base::Whole => (Representation::Whole(object.kind), Stored::Whole, None),
-      Base::Earlier { at: base, .. } if self.by_offset => (
-        Representation::OfsDelta { base },
-        Stored::Offset,
-        Some(base),
-      ),
-      Base::Earlier { id, position, .. } | Base::Named { id, position } => (
-        Representation::RefDelta { base: id },
-        Stored::Reference,
-        Some(position),
-      ),
-    };
-    let data = choice.delta.as_deref().unwrap_or(&object.bytes);
-    let header = Header {
-      representation,
-      size: to_u64(data.len()),
-    };
+    let window = object.bytes.len().max(1);
+    let mut putting = self.begin(object, at, learning);
     let mut entry = Vec::new();
-    entry::write(header, at, &mut entry).map_err(FragmentRefused::Entry)?;
-    entry.extend_from_slice(&compress(object.kind, data, sample, learning)?);
+    loop {
+      match self.step(&mut putting, learning, window)? {
+        Put::More(bytes) => entry.extend_from_slice(&bytes),
+        Put::Done(bytes, placed) => {
+          entry.extend_from_slice(&bytes);
+          return Ok((entry, placed));
+        }
+      }
+    }
+  }
+
+  /// Begins encoding `object` as the entry beginning `at` bytes into its pack (A-718: an object a
+  /// window's work a step, [`Encoder::step`]): its candidate bases chosen now, as [`Encoder::put`]
+  /// tries them, the named base first, then the window's earlier entries of its kind, the nearest
+  /// first, whose chains have room.
+  pub(crate) fn begin(&mut self, object: ToEncode, at: u64, learning: &Learning<'_>) -> Putting {
+    let sample = self.sampled.insert(object.kind);
+    let mut tries = Vec::new();
+    if learning.depth > 0 {
+      if object.named.is_some() {
+        tries.push(Candidate::Named);
+      }
+      let recent = self.recent.get(&object.kind).map_or(0, VecDeque::len);
+      let window = learning.window.size(learning.exchange, recent);
+      tries.extend((0..recent).rev().take(window).map(Candidate::Recent));
+    }
+    let best = object.bytes.len();
+    Putting {
+      object,
+      at,
+      sample,
+      by_offset: self.by_offset,
+      tries,
+      trying: 0,
+      search: Search::new(),
+      trial_ns: 0,
+      best,
+      choice: Choice {
+        base: Base::Whole,
+        delta: None,
+        depth: 0,
+      },
+      stage: PutStage::Trials,
+    }
+  }
+
+  /// One step of `putting`, at most `window` bytes of work (A-718): a step of one candidate's delta
+  /// search, one level sampled on the data's first window, or a window of the data deflated; the
+  /// entry's bytes made so far, and once done its record. The object is then kept as a candidate.
+  pub(crate) fn step(
+    &mut self,
+    putting: &mut Putting,
+    learning: &mut Learning<'_>,
+    window: usize,
+  ) -> Result<Put, FragmentRefused> {
+    let window = window.max(1);
+    match putting.stage {
+      PutStage::Trials => {
+        self.trial_step(putting, learning, window);
+        Ok(Put::More(Vec::new()))
+      }
+      PutStage::Sample { level } => {
+        let data = putting.data();
+        let sample = data.get(..window.min(data.len())).unwrap_or_default();
+        sample_level(putting.object.kind, sample, level, learning)?;
+        let next = level.saturating_add(1);
+        putting.stage = if next < LEVELS {
+          PutStage::Sample { level: next }
+        } else {
+          let chosen = learning
+            .levels
+            .level(putting.object.kind, learning.exchange)
+            .unwrap_or(0);
+          putting.deflating(chosen)?
+        };
+        Ok(Put::More(Vec::new()))
+      }
+      PutStage::Deflate { .. } => self.deflate_step(putting, learning, window),
+    }
+  }
+
+  /// A step of the trials: a step of the current candidate's search, or, with none left, the level
+  /// chosen (sampled first where the kind was not yet sampled here or no level is learned).
+  fn trial_step(&self, putting: &mut Putting, learning: &mut Learning<'_>, window: usize) {
+    let Some(candidate) = putting.tries.get(putting.trying).copied() else {
+      let learned = learning
+        .levels
+        .level(putting.object.kind, learning.exchange);
+      putting.stage = match learned {
+        Some(level) if !putting.sample => match putting.deflating(level) {
+          Ok(stage) => stage,
+          Err(_) => PutStage::Sample { level: 0 },
+        },
+        _ => PutStage::Sample { level: 0 },
+      };
+      return;
+    };
+    let base: &[u8] = match candidate {
+      Candidate::Named => putting
+        .object
+        .named
+        .as_ref()
+        .map_or(&[][..], |named| &named.bytes),
+      Candidate::Recent(index) => self
+        .recent
+        .get(&putting.object.kind)
+        .and_then(|recent| recent.get(index))
+        .map_or(&[][..], |recent| &recent.bytes),
+    };
+    let start = learning.clock.now_ns();
+    let step = putting.search.step(base, &putting.object.bytes, window);
+    putting.trial_ns = putting
+      .trial_ns
+      .saturating_add(learning.clock.now_ns().saturating_sub(start));
+    let SearchStep::Done(delta) = step else {
+      return;
+    };
+    let rank = putting.trying.saturating_add(1);
+    let len = delta.as_ref().map_or(usize::MAX, Vec::len);
+    let saved = u64::try_from(putting.best.saturating_sub(len)).unwrap_or(u64::MAX);
+    learning.window.record(rank, saved, putting.trial_ns);
+    if len < putting.best {
+      putting.best = len;
+      putting.choice = match candidate {
+        Candidate::Named => Choice {
+          base: putting
+            .object
+            .named
+            .as_ref()
+            .map_or(Base::Whole, |named| Base::Named {
+              id: named.id,
+              position: named.position,
+            }),
+          delta,
+          depth: 1,
+        },
+        Candidate::Recent(index) => {
+          let recent = self
+            .recent
+            .get(&putting.object.kind)
+            .and_then(|recent| recent.get(index));
+          match recent {
+            Some(recent) => Choice {
+              base: Base::Earlier {
+                at: recent.at,
+                id: recent.id,
+                position: recent.position,
+              },
+              delta,
+              depth: recent.depth.saturating_add(1),
+            },
+            None => Choice {
+              base: Base::Whole,
+              delta: None,
+              depth: 0,
+            },
+          }
+        }
+      };
+    }
+    putting.trying = putting.trying.saturating_add(1);
+    putting.search = Search::new();
+    putting.trial_ns = 0;
+  }
+
+  /// A step of the deflate: the entry's header first, then a window of the data; once the last is
+  /// fed, the entry's record, and the object kept as a candidate.
+  fn deflate_step(
+    &mut self,
+    putting: &mut Putting,
+    learning: &mut Learning<'_>,
+    window: usize,
+  ) -> Result<Put, FragmentRefused> {
+    let PutStage::Deflate {
+      ref mut compress,
+      ref mut crc,
+      ref mut next,
+      ref mut header,
+    } = putting.stage
+    else {
+      return Ok(Put::More(Vec::new()));
+    };
+    let mut bytes = core::mem::take(header);
+    let data = match &putting.choice.delta {
+      Some(delta) => delta.as_slice(),
+      None => putting.object.bytes.as_slice(),
+    };
+    let from = (*next).min(data.len());
+    let to = from.saturating_add(window).min(data.len());
+    let last = to >= data.len();
+    bytes.extend_from_slice(&deflate_more(
+      compress,
+      data.get(from..to).unwrap_or_default(),
+      last,
+    )?);
+    *next = to;
+    crc.update(&bytes);
+    if !last {
+      return Ok(Put::More(bytes));
+    }
+    let crc = crc.clone().finalize();
+    let (_, stored, base) = putting.representation();
     let placed = Placed {
-      id: object.id,
-      position: object.position,
-      kind: object.kind,
-      offset: at,
-      crc: crc32fast::hash(&entry),
-      depth: choice.depth,
+      id: putting.object.id,
+      position: putting.object.position,
+      kind: putting.object.kind,
+      offset: putting.at,
+      crc,
+      depth: putting.choice.depth,
       stored,
       base,
     };
-    self.remember(object, (at, choice.depth), learning);
-    Ok((entry, placed))
-  }
-
-  /// The representation of `object` (module docs): the named base first, then the window's
-  /// earlier entries of its kind whose chains have room.
-  fn choose(&self, object: &ToEncode, learning: &mut Learning<'_>) -> Choice {
-    let mut choice = Choice {
-      base: Base::Whole,
-      delta: None,
-      depth: 0,
-    };
-    if learning.depth == 0 {
-      return choice;
-    }
-    let mut best = object.bytes.len();
-    let mut rank = 0_usize;
-    if let Some(named) = &object.named {
-      rank = rank.saturating_add(1);
-      if let Some(delta) = trial(&named.bytes, &object.bytes, rank, &mut best, learning) {
-        choice = Choice {
-          base: Base::Named {
-            id: named.id,
-            position: named.position,
-          },
-          delta: Some(delta),
-          depth: 1,
-        };
-      }
-    }
-    let Some(recent) = self.recent.get(&object.kind) else {
-      return choice;
-    };
-    let window = learning.window.size(learning.exchange, recent.len());
-    for candidate in recent.iter().rev().take(window) {
-      rank = rank.saturating_add(1);
-      if let Some(delta) = trial(&candidate.bytes, &object.bytes, rank, &mut best, learning) {
-        choice = Choice {
-          base: Base::Earlier {
-            at: candidate.at,
-            id: candidate.id,
-            position: candidate.position,
-          },
-          delta: Some(delta),
-          depth: candidate.depth.saturating_add(1),
-        };
-      }
-    }
-    choice
+    let object = core::mem::replace(
+      &mut putting.object,
+      ToEncode {
+        id: placed.id,
+        position: placed.position,
+        kind: placed.kind,
+        bytes: Vec::new(),
+        named: None,
+      },
+    );
+    self.remember(object, (putting.at, putting.choice.depth), learning);
+    Ok(Put::Done(bytes, placed))
   }
 
   /// Keeps `object`, written at `at` with a chain `depth` deep, as a candidate while its chain has
@@ -288,46 +531,22 @@ pub(crate) fn in_fragment(mut record: Placed) -> Placed {
   record
 }
 
-/// One timed trial of a delta against `base`, taught to the window at `rank`; the delta when it
-/// is shorter than `best`, which it then becomes.
-fn trial(
-  base: &[u8],
-  target: &[u8],
-  rank: usize,
-  best: &mut usize,
-  learning: &mut Learning<'_>,
-) -> Option<Vec<u8>> {
-  let start = learning.clock.now_ns();
-  let delta = delta_of(base, target);
-  let ns = learning.clock.now_ns().saturating_sub(start);
-  let len = delta.as_ref().map_or(usize::MAX, Vec::len);
-  let saved = u64::try_from(best.saturating_sub(len)).unwrap_or(u64::MAX);
-  learning.window.record(rank, saved, ns);
-  if len < *best {
-    *best = len;
-    return delta;
-  }
-  None
-}
-
-/// `data` deflated at its kind's learned level; a sample deflates it at every level, each timed
-/// and taught, and keeps the output of the level the samples then choose.
-fn compress(
+/// One level sampled on `sample`: deflated at `level`, timed and taught to `kind`'s levels.
+fn sample_level(
   kind: Kind,
-  data: &[u8],
-  sample: bool,
+  sample: &[u8],
+  level: u32,
   learning: &mut Learning<'_>,
-) -> Result<Vec<u8>, FragmentRefused> {
-  if !sample && let Some(level) = learning.levels.level(kind, learning.exchange) {
-    return deflate(data, level);
-  }
-  let outputs = sampled(kind, data, learning)?;
-  let chosen = learning.levels.level(kind, learning.exchange).unwrap_or(0);
-  let chosen = usize::try_from(chosen).unwrap_or(0);
-  outputs
-    .into_iter()
-    .nth(chosen)
-    .ok_or(FragmentRefused::Deflate)
+) -> Result<(), FragmentRefused> {
+  let start = learning.clock.now_ns();
+  let output = deflate(sample, level)?;
+  let ns = learning.clock.now_ns().saturating_sub(start);
+  learning.levels.record(
+    kind,
+    level,
+    (to_u64(sample.len()), to_u64(output.len()), ns),
+  );
+  Ok(())
 }
 
 /// `data` deflated at every level, each timed and taught to `kind`'s levels; the outputs, by level.
