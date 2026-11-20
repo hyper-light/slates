@@ -984,3 +984,32 @@ fn stock_svn_reads_a_repository_through_the_site_over_https() {
     (true, true)
   );
 }
+
+/// A-681 (§4.17.4 item 5 "HTTP"; the daemon's [`crate::vcs_http::ToolSites`]): a request is Subversion's by its shape,
+/// since stock svn sends what git's and Mercurial's clients never send. Do: ask [`super::dav_request`] of the heads
+/// stock svn 1.15 sends (recorded, g297: OPTIONS, PROPFIND, REPORT on a public URL; a GET and a POST under `!svn`) and
+/// of git's (`info/refs`, `git-upload-pack`, `git-receive-pack`) and Git LFS's. Expect svn's every one, and none of
+/// git's.
+#[test]
+fn a_request_is_subversions_by_its_method_or_its_special_segment() {
+  let asked = |method: &str, target: &str| {
+    let input = request(method, target, &[]);
+    super::dav_request(&head(&input))
+  };
+  let svn = [
+    asked("OPTIONS", "/project"),
+    asked("PROPFIND", "/project/trunk"),
+    asked("REPORT", "/project/!svn/me"),
+    asked("GET", "/project/!svn/rvr/3/trunk/a.txt"),
+    asked("POST", "/project/!svn/me"),
+    asked("MERGE", "/project/trunk"),
+  ];
+  let others = [
+    asked("GET", "/project/info/refs?service=git-upload-pack"),
+    asked("POST", "/project/git-upload-pack"),
+    asked("POST", "/project/git-receive-pack"),
+    asked("POST", "/project.git/info/lfs/objects/batch"),
+    asked("GET", "/project/svn/trunk"),
+  ];
+  assert_eq!((svn, others), ([true; 6], [false; 5]));
+}

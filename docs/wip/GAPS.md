@@ -1390,6 +1390,10 @@
 > export, update, commits, properties, server-side copies, switch, merge, delete and revert pass; `lock` is refused
 > (`Server doesn't support the lock command`), HTTP meets `path not found` (A-681) and the SSH edge answers
 > `svnserve -t is not served yet`: 22 of 27 (main 4785858, debug, Mac Studio).
+> **A-681, the daemon's routing (w-interop, 2026-11-20):** Subversion's DAV site is composed into the daemon's edge
+> (`ToolSites`, a request Subversion's by a method no other client sends or its `!svn` segment, `svn::dav_request`;
+> `DaemonSvnSite` over `ServedRecords`): stock svn 1.15's `info`, `ls`, `cat`, `log` and `log -v` over HTTP pass (svn
+> matrix, ROUTE=http, Mac Studio); checkout, update, diff and export wait on the update-report, commits on POST.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

@@ -45,10 +45,12 @@ use super::git::{
   ThisShard, Unproven, UploadServices,
 };
 use super::hg::HgSite;
+use super::svn::SvnSite;
 use super::{Bounds, EdgeState, ToolSites, admits_cleartext, keep_here, serve};
 use crate::config::DaemonConfig;
 use crate::lfs::LfsCall;
 use crate::vcs_store::hg_view::ServedViews;
+use crate::vcs_store::svn_view::ServedRecords;
 use crate::vcs_store::upload::ShardStores;
 
 /// Counter: an edge whose listener's task the control shard's arena refused.
@@ -151,8 +153,11 @@ pub(crate) type DaemonGitSite =
 /// Mercurial's site as the daemon serves it (the module doc, "What is served").
 pub(crate) type DaemonHgSite = HgSite<RecordedCredentials, ShardRepositories, ServedViews>;
 
+/// Subversion's site as the daemon serves it: each repository's records lent on its owner shard (`ServedRecords`).
+pub(crate) type DaemonSvnSite = SvnSite<RecordedCredentials, ShardRepositories, ServedRecords>;
+
 /// The daemon's sites on its edge: each request to its tool's (the module doc, "What is served").
-pub(crate) type DaemonSite = ToolSites<DaemonGitSite, DaemonHgSite>;
+pub(crate) type DaemonSite = ToolSites<DaemonGitSite, DaemonHgSite, DaemonSvnSite>;
 
 /// What makes the daemon's sites on any shard: their challenges name `realm`, each request's route and exchange are
 /// charged to the request's `room`, and each git service admits each request that room.
@@ -176,7 +181,14 @@ fn site(realm: String, room: u64) -> impl Fn() -> DaemonSite + Clone + Send + 's
       ShardRepositories,
       ServedViews,
     );
-    ToolSites::new(git, hg, room)
+    let svn = SvnSite::new(
+      realm.clone(),
+      room,
+      RecordedCredentials,
+      ShardRepositories,
+      ServedRecords,
+    );
+    ToolSites::new(git, hg, svn, room)
   }
 }
 
