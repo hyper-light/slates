@@ -55787,6 +55787,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722's keepalive while the pack is read (2026-11-20, w-git for UI goal 93; main's ruling)
+- **Found** (w-k90-vendor; reproduced on adas-mac-studio.local-2, debug, load 51 to 63, 7 of 9 failed): with the head
+  written at once the status line came in 24 ms, but a debug daemon read and decoded the long-history tests' 820 KB
+  pack for over the client's 10 s read window after the client's last byte, writing nothing.
+- **Change.** `Connection::interim`: on an AtHead route whose head is out, a run the service gives while the request's
+  body is still being read is written at once, chunked. The driver asks the exchange after each body run
+  (`Exchange::interim`, nothing by default), and receive-pack gives git's `0005\1` once the client's commands show
+  side-band-64k and the keepalive interval has passed since it last wrote (`git_keepalive_ns`, git's
+  `receive.keepAlive`).
+- **Tests.** `slates-http-edge` `connection::tests::an_at_head_route_writes_an_interim_run_while_its_body_is_read`
+  (red with the interim run dropped); `slates-http-edge --lib` 36 passed; `slates-server --lib -- vcs_http:: git_push::
+  vcs_ssh::` 162 passed; fmt clean (kiln, adas-mac-studio.local-2). The debug-load rerun is in run-requests.md. Owed:
+  the read itself measured per byte and per object (main's push-back: 820 KB should be milliseconds).
+
 ### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
 - **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
   never main): a push of git/git's v1.5.0 (9.4 MiB, 34,296 objects) holds a transient working set of 16.9 MiB after its

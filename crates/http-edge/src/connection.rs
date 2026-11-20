@@ -815,6 +815,26 @@ impl Connection {
     )))
   }
 
+  /// The service's bytes of its reply while its request's body is still being read: taken only on a route whose head
+  /// is written at once ([`StatusMode::AtHead`]) and already sent, each run chunked (HTTP/1.1) or as it is (HTTP/1.0);
+  /// ignored otherwise. What lets git's receive-pack write its keepalive while a long pack is still being read, after
+  /// the client has sent it all (A-722: a debug daemon at load 51 to 63 read an 820 KB pack for over the client's 10 s
+  /// read window with nothing written).
+  pub fn interim(&mut self, data: &[u8]) {
+    let State::Body { request, reply, .. } = &self.state else {
+      return;
+    };
+    if data.is_empty() || !reply.started || reply.head_only || reply.mode != StatusMode::AtHead {
+      return;
+    }
+    let mut bytes = Vec::new();
+    match request.version {
+      Version::Http11 => reply::chunk(data, &mut bytes),
+      Version::Http10 => bytes.extend_from_slice(data),
+    }
+    self.send(&bytes);
+  }
+
   /// The service's next bytes of its reply: the head before the first, each run chunked (HTTP/1.1) or as it is
   /// (HTTP/1.0); nothing past the head of a `HEAD`'s reply.
   pub fn reply(&mut self, data: &[u8]) {
