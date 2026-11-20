@@ -75,7 +75,7 @@ mod git;
 mod hg;
 mod receive;
 pub(crate) mod site;
-mod svn;
+pub(crate) mod svn;
 mod waits;
 
 pub(crate) use daemon_edge::{bind, start};

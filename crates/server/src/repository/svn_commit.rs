@@ -41,6 +41,13 @@
 //! whose tree no public read of the engine lists at that version; and a replacement without history that changes a
 //! node's kind, which the engine refuses as `TypeChanged` (GAPS §8f).
 //!
+//! **A client's work** ([`commit_work`], A-698): what both ra_svn transports call with the work their connection
+//! accepted at `close-edit`, `svn://` and `svnserve -t` through the SSH tunnel sharing A-656's connection. The revision
+//! is made of the work at the owner's instant (`Revision::of_work`, its `svn:date`), judged again with the commit's
+//! locks at that instant, and landed; the connection answers `commit-info` with the revision, or `close-edit`'s
+//! failure with the refusal ([`Uncommitted::answered`]): the step's own in FSFS's words, the others in slates' words
+//! under Subversion's nearest error.
+//!
 //! **Owed**: the svn:// connection task's call of the step (A-656 part 2); the lock verbs' entries recorded as the
 //! commits' are; the records' texts read from the green's content rather than held beside it and in the record.
 
@@ -49,6 +56,7 @@ use std::collections::BTreeMap;
 use slates_db::catalog::{Principal, RepositoryId, VcsTool, VolumeId as DbVolumeId};
 use slates_merge::engine::{Green, Increment};
 use slates_merge::ops_doc::{NODE_EXCLUSIVE, Op, OpKind, OpsDoc, REPLACE};
+use slates_svn::commit::drive::Work;
 use slates_svn::commit::record::Record;
 use slates_svn::commit::revision::{Revision, StepRefusal};
 use slates_svn::index::{Action, ChangedPath, CopySource, NodeKind, PropertyList, Text};
@@ -124,6 +132,64 @@ pub(crate) enum Uncommitted {
   },
   /// The append refused (A-635's refusal): nothing applied.
   Append(AppendRefused),
+}
+
+/// Format: `SVN_ERR_FS_GENERAL`, the filesystem category's start (160,000): the error a refusal of the step's own that
+/// FSFS has no closer error for is answered with (`svn_error_codes.h`).
+const SVN_ERR_FS_GENERAL: u32 = 160_000;
+/// Format: `SVN_ERR_FS_CORRUPT`, the filesystem category's start plus 4 (`svn_error_codes.h`).
+const SVN_ERR_FS_CORRUPT: u32 = 160_004;
+/// Format: `SVN_ERR_UNSUPPORTED_FEATURE`, the miscellaneous category's start (200,000) plus 7 (`svn_error_codes.h`).
+const SVN_ERR_UNSUPPORTED_FEATURE: u32 = 200_007;
+
+impl Uncommitted {
+  /// The refusal as an ra_svn connection answers `close-edit` with it (module docs, "A client's work"): the step's in
+  /// its own words; the others, which no FSFS commit meets, in slates' words under Subversion's nearest error.
+  pub(crate) fn answered(&self) -> slates_svn::serve::Uncommitted {
+    use slates_svn::serve::Uncommitted as Answered;
+    let (code, message) = match self {
+      Uncommitted::Step(refusal) => return Answered::Step(refusal.clone()),
+      Uncommitted::NotHeld => (
+        SVN_ERR_FS_GENERAL,
+        "The repository is not held on this shard".to_owned(),
+      ),
+      Uncommitted::Diverged => (
+        SVN_ERR_FS_CORRUPT,
+        "The repository's green is not at its youngest revision".to_owned(),
+      ),
+      Uncommitted::Unsupported { path } => (
+        SVN_ERR_UNSUPPORTED_FEATURE,
+        format!("This server cannot commit '{path}' yet"),
+      ),
+      Uncommitted::Budget { available } => (
+        SVN_ERR_FS_GENERAL,
+        format!("No room for the commit: {available} bytes available"),
+      ),
+      Uncommitted::Append(refused) => (
+        SVN_ERR_FS_GENERAL,
+        format!("The repository's log refused the commit: {refused:?}"),
+      ),
+    };
+    Answered::Refused { code, message }
+  }
+}
+
+/// A client's accepted `work` (module docs, "A client's work") landed on `repository`'s logs by `principal`: the
+/// revision made of it at the owner's instant `now`, judged again with the commit's locks at `now`.
+pub(crate) fn commit_work(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  work: Work,
+  now: AprTime,
+) -> Result<Committed, Uncommitted> {
+  let locks = work.locks.clone();
+  let revision = Revision::of_work(work, now).map_err(Uncommitted::Step)?;
+  commit(
+    state,
+    (principal, repository),
+    revision,
+    Some((&locks, now)),
+  )
 }
 
 /// The refusal of records that do not hold together.
