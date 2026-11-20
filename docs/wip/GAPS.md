@@ -1612,6 +1612,11 @@
 > `bind_branch`, `retire_branch`). Found by use: a branch the namespace binds is not among the refs git's site serves
 > (`git ls-remote` lists `main` alone after `branch create topic --from main`); `git_interop.rs` holds the by-use test
 > ignored for w-git.
+> Mercurial's sibling (w-hg, 2026-11-20) FIXED: its namespace spells a bookmark `bookmark:<label>:`, so a branch the
+> verbs named `topic` was no bookmark and `--from one` was refused `NotFound`. In a Mercurial repository the three verbs
+> now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
+> (`hg_push::owner_name`); `hg_view`'s test creates `topic` from `one`, retires and binds it, listed as a bookmark at
+> `one`'s node, gone, and back. Owed (main's lane): the same with stock hg through the CLI (`hg pull`, `hg bookmarks`).
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the

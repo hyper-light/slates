@@ -241,6 +241,17 @@ pub(crate) fn line_name(branch: &[u8], number: u32) -> String {
   name
 }
 
+/// The namespace's name of a branch the owner's verbs name in a Mercurial repository (A-575; §4.17.1's table: a slates
+/// branch is a bookmark, names one to one): a line's or a bookmark's name as the namespace spells it stays as it is, and
+/// any other name is the bookmark of that name.
+pub(crate) fn owner_name(name: &str) -> String {
+  if line_of(name).is_some() || bookmark_of(name).is_some() {
+    name.to_owned()
+  } else {
+    bookmark_name(name.as_bytes())
+  }
+}
+
 /// The name of the bookmark `name` (module docs).
 pub(crate) fn bookmark_name(name: &[u8]) -> String {
   let mut named = String::from(BOOKMARK_TAG);

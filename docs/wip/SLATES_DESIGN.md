@@ -14439,7 +14439,9 @@ markers and topics, which git has no counterpart for, are decided here.
    the second in one entry. A new named branch (`--new-branch`) is a line made at its first parent's version (item 4
    there). A closing changeset (`close=1`) is one more version, and its line stays, closed, as `branchmap` reports
    closed heads.
-2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. A bookmark moves only
+2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. The owner's branch
+   verbs name it as Mercurial does (`topic`), spelled `bookmark:topic:` in the namespace; a line's or bookmark's
+   namespace spelling passes as it is (A-575, `hg_push::owner_name`). A bookmark moves only
    when a push names it (the `bookmarks` part or a `bookmarks` pushkey), and every move is a compare and swap on the old
    value the client sent (a pushkey "should succeed iff value was old" [C: `pushkey.py`]; `check:bookmarks` [B:
    `internals.bundle2`]), so the head operation decides it as it decides a git ref. A deletion retires the green.
