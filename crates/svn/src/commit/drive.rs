@@ -912,6 +912,23 @@ impl Digests {
   }
 }
 
+/// `bytes` as a row names its text (A-664's Subversion objects: a revision the server makes of a submitted version):
+/// its content identity, its MD5 and SHA-1 as the drive keeps them for a text a client sent, and its length.
+///
+/// # Errors
+/// [`DriveRefusal::DigestFailed`] where the digests cannot be made.
+pub fn text_of(bytes: &[u8]) -> Result<Text, DriveRefusal> {
+  let mut digests = Digests::new()?;
+  digests.update(bytes)?;
+  let (md5, sha1) = digests.finish()?;
+  Ok(Text {
+    identity: *blake3::hash(bytes).as_bytes(),
+    md5,
+    sha1,
+    size: u64::try_from(bytes.len()).map_err(|_| DriveRefusal::DigestFailed)?,
+  })
+}
+
 /// The MD5 of `bytes`.
 fn md5_of(bytes: &[u8]) -> Result<[u8; 16], DriveRefusal> {
   let mut digests = Digests::new()?;
@@ -1369,6 +1386,20 @@ impl Drive {
       }),
     };
     self.answer(outcome, out)
+  }
+
+  /// Presents `token` for the repository path `path` while the drive runs (A-681: an HTTP client presents a lock's token
+  /// with each request that changes the path, in its `If` header, and every token again in its MERGE's
+  /// `S:lock-token-list`), as ra_svn's `commit` presents its tokens at the start: a later call meeting the path's lock,
+  /// and the verdict, judge it with this token.
+  pub fn present_lock(&mut self, path: String, token: String) {
+    self.setup.locks.presented.insert(path, token);
+  }
+
+  /// Whether the commit keeps the locks it presented (`X-SVN-Options: keep-locks`, ra_svn's `keep-locks`), decided
+  /// before `close-edit`.
+  pub fn keep_locks(&mut self, keep: bool) {
+    self.setup.locks.keep = keep;
   }
 
   /// Takes one editor command a caller made itself (A-681: the HTTP site's commits, which arrive as requests, not as

@@ -934,18 +934,18 @@ impl OsLand {
     let current = walk_target(path)?;
     let root = Path::new(path.ancestors().last().unwrap_or(path));
     let (host, _) = OsHost::open_root(root).map_err(TargetRefusal::Unavailable)?;
-    Self::adopt_target(host, current, key_of(path)).map_err(|(_, refusal)| refusal)
+    Self::adopt_target(host, current, key_of(path)).map_err(|handed| handed.1)
   }
 
   /// [`OsLand::open_target`] inside an existing host — the base host an overlay volume's slot holds — so the target
-  /// and every handle the volume's base names live in one host. A refusal hands the host back.
+  /// and every handle the volume's base names live in one host. A refusal hands the host back (boxed, with the refusal).
   pub fn open_target_in(
     host: OsHost,
     path: &Path,
-  ) -> Result<(Self, LandingTarget), (OsHost, TargetRefusal)> {
+  ) -> Result<(Self, LandingTarget), Box<(OsHost, TargetRefusal)>> {
     match walk_target(path) {
       Ok(current) => Self::adopt_target(host, current, key_of(path)),
-      Err(refusal) => Err((host, refusal)),
+      Err(refusal) => Err(Box::new((host, refusal))),
     }
   }
 
@@ -954,10 +954,10 @@ impl OsLand {
     mut host: OsHost,
     current: OwnedHandle,
     key: String,
-  ) -> Result<(Self, LandingTarget), (OsHost, TargetRefusal)> {
+  ) -> Result<(Self, LandingTarget), Box<(OsHost, TargetRefusal)>> {
     let dir = match host.adopt_dir(current) {
       Ok(dir) => dir,
-      Err(error) => return Err((host, TargetRefusal::Unavailable(error))),
+      Err(error) => return Err(Box::new((host, TargetRefusal::Unavailable(error)))),
     };
     Ok((
       Self {

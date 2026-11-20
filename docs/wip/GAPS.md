@@ -60,7 +60,12 @@
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's, a green's first submit's, past a copy) and a whole map's release sliced a unit at a time, and the build of
 > the put files in slices of its own (a recovery's remake puts the files a unit each, BUILT 2026-11-20); a branch's first
-> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
+> Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
+> `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
+> read before from the records and after from the green, recorded in the submit's transaction), its copies as rows with
+> their sources, symbolic links as `svn:special` files and `svn:author` owed; Mercurial's changesets of a submitted
+> version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
 > commit is not made, counted); a `.gitmodules` blob's own checks; blob ids read by content from the git
@@ -76,6 +81,11 @@
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
 > one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
+> Designed, owed: the snapshot slot sized by its data (8) and a giant repository's index cut across partitions by
+> object id (9).
+> Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
+> re-encoded (`Repository::drop_fragments`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
+> Owed: compression of cold content.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -104,8 +114,10 @@
 > fork a slice at a time within the shard's quantum with a yield between (pushes to one repository taken side by side),
 > then in one step judges it over the view as it is at landing (the race checks there), classifies it from the fork's
 > rows and lands the fork, the record written from it (`record::write_kept`); a connection that ends mid-intake gives
-> its fork back. Owed: part 2b, a fork made from an index another push replaced since is refused (`MOVED`) where it
-> should be re-based by node at landing; part 3, the import's room per repository; S5 (main's convergence plan): file
+> its fork back. Part 2b BUILT: a fork made from an index another push replaced since is re-based by node at
+> landing (`intake::Rebase`: each kept row appended again to a fork of the index as it is, by node, its content reused,
+> a row the index already holds passed over), a slice at a time, then judged and landed; `land` never puts a stale
+> fork in the index's place. Owed: part 3, the import's room per repository; S5 (main's convergence plan): file
 > texts as the work's green files by identity, changelog and manifests as deltas, rows naming content by identity.
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
@@ -115,6 +127,12 @@
 > PastRoom { room: 278528 }` for the same repository), the unbundle's processing in slices, and w-perf's whole push.
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
+>
+> **A-727 (2026-11-20, w-perf, UI goal 93; designed):** repository bytes leave the partition snapshot (the 747 MB
+> wall a 5,000-revision svn import met is the snapshot, the sum of every retained record): the vcs content store in the
+> shard's chunk arena of the anchor's content object, its table in the shard image recovered before the records, records
+> naming identities (git v3: names + the pack's root identity), entries waiting on the next image barrier (group commit).
+> OWED: slices (a1) read seam, (a2) arena storage, (a3) image table + recovery order, (b) git v3, (c) svn, (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -1443,6 +1461,14 @@
 > updating PUT and a DELETE). Stock svn 1.15's HTTP round trip runs un-ignored and passes; svn matrix over HTTP 23 of
 > 27. Owed: LOCK/UNLOCK and a commit's lock tokens (`If`, `S:lock-token-list`); the reports blame, diff and merge ask
 > (`file-revs`, a diff's, `mergeinfo`); a PUT's body held whole within the room; an abandoned transaction's expiry.
+> **A-681, HTTP locks (w-interop, 2026-11-20):** LOCK and UNLOCK of a public path over A-627's readers and writers
+> and the lock table, their entries landed as `Record::Locks` (`SvnStores::lock_verb`); a commit presents its tokens
+> (`If`, the MERGE's `S:lock-token-list`, `keep-locks`; `Drive::present_lock`). Stock svn 1.15's HTTP lock session
+> runs un-ignored and passes (`svn_interop.rs` 5 of 5, none ignored).
+> **A-681, a PUT's body streamed (w-interop, 2026-11-20; §4.17.1 "A push's intake"):** a PUT under `!svn/txr/` is
+> handed to its transaction's drive a body run at a time (`DavCommit::begin_put`, `put_chunk`, `end_put`; the exchange's
+> `Streamed`), never held: a commit holds the drive's window and the texts it makes, bounded by its room. svn matrix
+> over HTTP 24 of 27 (lock passes; blame, diff and merge wait on w-reaper's reports).
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

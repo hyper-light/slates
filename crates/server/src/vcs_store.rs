@@ -105,6 +105,7 @@ pub(crate) mod lfs_record;
 pub(crate) mod paths;
 pub(crate) mod record;
 pub(crate) mod svn_import;
+pub(crate) mod svn_made;
 pub(crate) mod svn_view;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
@@ -674,7 +675,6 @@ pub(crate) fn settle_objects(state: &mut ShardState, id: RepositoryId) {
 
 impl VcsStores {
   /// What repository `id`'s entries' objects hold of the shard's budget ([`settle_objects`]).
-  #[cfg(test)]
   pub(crate) fn objects_charged(&self, id: RepositoryId) -> u64 {
     self.objects_charged.get(&id).copied().unwrap_or(0)
   }

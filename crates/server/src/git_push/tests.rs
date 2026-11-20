@@ -404,7 +404,11 @@ fn assert_hold_the_second_text(state: &ShardState, repository: RepositoryId, nam
 }
 
 /// Pushes the fixtures' scenarios `names` in order to `repository`, each answered `ok` for every command.
-fn pushed_from_the_fixtures(state: &mut ShardState, repository: RepositoryId, names: &[&str]) {
+pub(crate) fn pushed_from_the_fixtures(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  names: &[&str],
+) {
   let mut taken = Vec::new();
   for (scenario, _) in chain() {
     if names.contains(&scenario.name) {
