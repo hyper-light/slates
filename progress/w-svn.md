@@ -102,3 +102,9 @@
 - Disk fell to 17 GiB: deleted my target (now 59 GiB free).
 - NEXT (main): S4 with w-perf -- svn records name texts by identity, read from the green's content-identity index
   (held.rs hold_path); agree the seam with w-perf. Queue after: A-702 revprops / replay (g302 brief), A-652 export.
+
+## A-702 part 1 -- LANDED main 15a3c5d4c (commit 3960207de, verified). serve::revprops; 165006 without a hook after
+## svnserve's checks. Local svn 128/128 then 131/131 merged. Part 2 waits on ra_svn running hooks.
+## NOW: S4 slice 1 (agreed with w-perf): slates-svn records keep text identity+size+checksums, no bytes; readers via
+## lent `TextSource` (`fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>>`); Room charges places.
+## w-perf does slice 2 (server TextSource over Green::held, svn_commit drops text bytes, rebuild re-holds).

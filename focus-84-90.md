@@ -1018,3 +1018,4 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   (update-report) + C d858d1904 (HTTPv2 commits): SVN OVER HTTP PROVEN, matrix HTTP 23/27, svn:// 26/27. w-perf A-716
   1a 5efce021a (held.rs). w-interop next: HTTP locks, streamed PUT, abandoned txn deadline.
 - ~03:10 PST check: all 16 w-* agents working (w-fed-faults building piece 3 locally; its Linux run r9 queued behind adacachy's stuck kiln CI, whose stale-run cancels wait on Ada's click). Disks: Mac 93 GiB, Studio-2 89, Studio-4 128, big Studio 1.2 TiB.
+- ~03:15 PST w-svn A-702 p1 landed 15a3c5d4c (change-rev-prop(2) answer E165006 in svnserve's check order). Ruling: ra_svn running repository hooks (start-commit..post-unlock) -> w-reaper after its DAV reports; then w-svn A-702 p2 (revprop change). w-svn next: S4 slice 1.
