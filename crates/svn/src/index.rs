@@ -55,9 +55,12 @@
 //! source, in the source's revision. So a file beneath a branch is its trunk node-revision, created on trunk, until it
 //! changes on the branch, as FSFS shares it. The node relation follows (`svn_fs.h`'s three answers): the same
 //! node-revision is unchanged, the same node identity a common ancestor, anything else unrelated. A directory's
-//! listing (`Index::children`, A-681: the index holds none, as FSFS holds a directory's entries) is every name the
-//! index named directly beneath it or beneath a copy's source that what stands beneath it comes from, each kept where
-//! its own path reads as a node; the oracle holds every directory of every generated revision to the naive tree's.
+//! listing (`Index::children`, `Index::listing`; A-759) is its node-revision's children map: every directory row
+//! holds a persistent ordered map of its children's names and node-revisions (`children`), made as the row is made (a
+//! clone keeps its predecessor's map and its parent's map points the name at it; an addition sets the name in its
+//! parent's; a deletion removes it; a copy shares its source's map whole), its nodes shared between successors and
+//! charged to the room. So a listing resolves the directory once and walks its live children; the oracle holds every
+//! directory of every generated revision to the naive tree's, and each listed child to the node its path resolves to.
 //!
 //! Every record is checked whole before anything changes, and a refused record leaves the index as it was: a path out
 //! of Subversion's canonical form; two rows for one path; a row naming a path its own revision leaves absent or present
@@ -78,8 +81,7 @@
 //! No I/O, no clock, no randomness, no panic.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
+use std::collections::BTreeMap;
 
 /// A revision number. Revision 0 is the empty root every repository starts with (`svn_fs.h` 1021-1104; notes §5).
 pub type Revision = u64;
@@ -97,16 +99,6 @@ const ROOT: &str = "/";
 /// The character between a path's names.
 /// Format: Subversion's path separator (`svn_fspath__join`).
 const SEPARATOR: char = '/';
-
-/// The character after the separator in byte order: every path beneath a directory sorts before the directory's path
-/// followed by it, so a run of the path map passes a whole subtree by starting there.
-/// Format: ASCII, `/` 0x2F then `0` 0x30.
-const AFTER_SEPARATOR: char = '0';
-
-/// A name beneath a directory, which the shape of what stands beneath it is asked for: any name decides alike, since
-/// only the directories above a path are read (`shape_above`).
-/// Format: one character of a canonical name.
-const PROBE_NAME: &str = "-";
 
 /// The name that means the directory itself, which no stored path holds.
 /// Format: `svn_fs__path_valid` refuses "'.' or '..' element\[s\]" (`libsvn_fs/fs-loader.c`).
@@ -507,6 +499,9 @@ struct Row {
   properties: PropertyList,
   /// The nodes holding `svn:mergeinfo` at and beneath it.
   mergeinfo_count: u64,
+  /// A directory's children, its map's handle ([`children`], A-759); [`children::EMPTY`] for a file and an empty
+  /// directory.
+  children: u32,
 }
 
 /// How a path's shape changed in one revision, which decides what stands beneath it.
@@ -591,16 +586,6 @@ fn checked_path(path: &str) -> Result<&str, IndexRefusal> {
     Err(IndexRefusal::PathSyntax {
       path: path.to_owned(),
     })
-  }
-}
-
-/// The path of `name` beneath `directory`; with an empty name, the directory's path with its separator, which every
-/// path beneath it begins with.
-fn child_path(directory: &str, name: &str) -> String {
-  if directory == ROOT {
-    format!("{ROOT}{name}")
-  } else {
-    format!("{directory}{SEPARATOR}{name}")
   }
 }
 
@@ -832,6 +817,10 @@ pub struct Index {
   youngest: Revision,
   /// The deletions the history lists hold.
   deletions: usize,
+  /// The nodes of every directory row's children map (A-759).
+  maps: Vec<children::MapNode>,
+  /// The bytes those nodes cost (`children::MapNode::bytes`), charged to the room in [`Index::ENTRY_BYTES`] units.
+  map_bytes: usize,
 }
 
 impl Default for Index {
@@ -856,6 +845,7 @@ impl Index {
       text: None,
       properties: PropertyList::Empty,
       mergeinfo_count: 0,
+      children: children::EMPTY,
     };
     let created = HistoryEntry {
       revision: 0,
@@ -875,6 +865,8 @@ impl Index {
       }],
       youngest: 0,
       deletions: 0,
+      maps: Vec::new(),
+      map_bytes: 0,
     }
   }
 
@@ -892,9 +884,14 @@ impl Index {
     size_of::<HistoryEntry>()
   };
 
-  /// The entries the index holds, node rows and deletions: what the room given to [`Index::append`] bounds.
+  /// The entries the index holds, node rows and deletions, and the directory maps' bytes in [`Index::ENTRY_BYTES`]
+  /// units (A-759): what the room given to [`Index::append`] bounds.
   pub fn entries(&self) -> usize {
-    self.rows.len().saturating_add(self.deletions)
+    self
+      .rows
+      .len()
+      .saturating_add(self.deletions)
+      .saturating_add(map_units(self.map_bytes))
   }
 
   /// Applies the next revision's record and answers its number: [`Index::plan`], then [`Index::commit_planned`].
@@ -918,9 +915,14 @@ impl Index {
     }
     let plan = builder.finish()?;
     let needed = self
-      .entries()
-      .checked_add(plan.rows.len())
+      .rows
+      .len()
+      .checked_add(self.deletions)
+      .and_then(|entries| entries.checked_add(plan.rows.len()))
       .and_then(|entries| entries.checked_add(plan.deletions))
+      .and_then(|entries| {
+        entries.checked_add(map_units(self.map_bytes.checked_add(plan.map_bytes)?))
+      })
       .ok_or(IndexRefusal::Corrupt)?;
     if needed > room {
       return Err(IndexRefusal::Room { needed, room });
@@ -982,90 +984,52 @@ impl Index {
     }
   }
 
-  /// The names of the entries of the directory at `path` in `revision`, in byte order (`svn_fs_dir_entries`); `None`
-  /// where nothing, or a file, stands there. The index holds no directory listing: the names are those it named directly
-  /// beneath `path`, and beneath each copy's source that what stands beneath `path` comes from, down the chain of
-  /// copies `shape_above` decides for a name with no history of its own (module documentation, "Reading"), each kept
-  /// where its own path resolves to a node in `revision`. Each run of the path map passes a named child's subtree at
-  /// once, so a listing reads the names beneath the directory and its sources, never their descendants.
+  /// The names of the directory at `path` in `revision` in byte order (`svn_fs_dir_entries`' keys), none when no
+  /// directory stands there. A-759: the directory resolved once and its children map walked, O(live children).
   ///
   /// # Errors
-  /// [`IndexRefusal`] for a path out of canonical form, a revision past the youngest, or an index that contradicts
-  /// itself.
+  /// [`IndexRefusal`] for a path out of canonical form, a revision past the youngest, and an index whose map does
+  /// not hold together.
   pub fn children(
     &self,
     path: &str,
     revision: Revision,
   ) -> Result<Option<Vec<String>>, IndexRefusal> {
-    let path = checked_path(path)?;
-    self.check_revision(revision)?;
-    match self.resolve(path, revision)? {
-      Some(id) if self.node_revision(id)?.kind() == NodeKind::Directory => {}
-      _ => return Ok(None),
-    }
-    let mut names = BTreeSet::new();
-    let (mut directory, mut at) = (Cow::Borrowed(path), revision);
-    loop {
-      self.named_beneath(&directory, &mut names);
-      let probe = child_path(&directory, PROBE_NAME);
-      let Some((
-        ShapeEntry {
-          shape:
-            Shape::Copied {
-              from,
-              revision: source_revision,
-            },
-          ..
-        },
-        end,
-      )) = self.shape_above(&probe, at, None)
-      else {
-        break;
-      };
-      // A copy's source revision is before the copy's (refused otherwise at its append), so each step goes back.
-      let source = beneath(self.path_name(from)?, &directory, end)?;
-      directory = Cow::Owned(if source.is_empty() {
-        ROOT.to_owned()
-      } else {
-        source
-      });
-      at = source_revision;
-    }
-    let mut children = Vec::with_capacity(names.len());
-    for name in names {
-      if self.resolve(&child_path(path, &name), revision)?.is_some() {
-        children.push(name);
-      }
-    }
-    Ok(Some(children))
+    Ok(
+      self
+        .listing(path, revision)?
+        .map(|listed| listed.into_iter().map(|(name, _)| name).collect()),
+    )
   }
 
-  /// Every name the index named directly beneath `directory`, into `names`: one run of the path map from the
-  /// directory's own path on, a child's subtree passed at once ([`AFTER_SEPARATOR`]).
-  fn named_beneath(&self, directory: &str, names: &mut BTreeSet<String>) {
-    let prefix = child_path(directory, "");
-    let mut from = Bound::Included(prefix.clone());
-    while let Some((key, _)) = self
-      .numbers
-      .range::<str, _>((from.as_ref().map(String::as_str), Bound::Unbounded))
-      .next()
-    {
-      let Some(rest) = key.strip_prefix(prefix.as_str()) else {
-        break;
-      };
-      from = match rest.split_once(SEPARATOR) {
-        None => {
-          if !rest.is_empty() {
-            names.insert(rest.to_owned());
-          }
-          Bound::Excluded(key.to_string())
-        }
-        Some((name, _)) => {
-          names.insert(name.to_owned());
-          Bound::Included(format!("{prefix}{name}{AFTER_SEPARATOR}"))
-        }
-      };
+  /// The children of the directory at `path` in `revision` in byte order, each with its node-revision (A-759): what
+  /// a drive makes each child's entry from with no second resolve. None when no directory stands there.
+  ///
+  /// # Errors
+  /// [`Index::children`]'s.
+  pub fn listing(
+    &self,
+    path: &str,
+    revision: Revision,
+  ) -> Result<Option<Vec<(String, NodeRevisionId)>>, IndexRefusal> {
+    let path = checked_path(path)?;
+    self.check_revision(revision)?;
+    let Some(id) = self.resolve(path, revision)? else {
+      return Ok(None);
+    };
+    let row = self.rows.get(id.0).ok_or(IndexRefusal::Corrupt)?;
+    if row.kind != NodeKind::Directory {
+      return Ok(None);
     }
+    let held = children::entries(self, row.children).ok_or(IndexRefusal::Corrupt)?;
+    let mut listed = Vec::with_capacity(held.len());
+    for (key, child) in held {
+      let name =
+        children::MapRead::key_name(self, u32::try_from(key).map_err(|_| IndexRefusal::Corrupt)?)
+          .ok_or(IndexRefusal::Corrupt)?;
+      listed.push((name.to_owned(), child));
+    }
+    Ok(Some(listed))
   }
 
   /// The node-revision `id`, as [`Node::predecessor`] and [`Node::copy_root`] name one.
@@ -1299,6 +1263,8 @@ impl Index {
       });
     }
     self.rows.extend(plan.rows);
+    self.maps.extend(plan.maps);
+    self.map_bytes = self.map_bytes.saturating_add(plan.map_bytes);
     for (number, staged) in plan.events {
       if let Some(entry) = self.paths.get_mut(number) {
         entry.record(revision, staged);
@@ -1378,6 +1344,10 @@ struct Plan {
   events: Vec<(usize, Staged)>,
   /// The deletions it made.
   deletions: usize,
+  /// The children maps' nodes it made, numbered after the index's (A-759).
+  maps: Vec<children::MapNode>,
+  /// The bytes they cost.
+  map_bytes: usize,
 }
 
 /// How a node takes its copy identity when it is made mutable (`tree.c` `copy_id_inherit_t`).
@@ -1521,6 +1491,8 @@ struct Builder<'index> {
   next_copy: u64,
   /// The deletions made so far.
   deletions: usize,
+  /// The children maps' nodes made so far, numbered after the index's (A-759).
+  maps: Vec<children::MapNode>,
 }
 
 impl<'index> Builder<'index> {
@@ -1547,6 +1519,7 @@ impl<'index> Builder<'index> {
       next_node: 0,
       next_copy: 0,
       deletions: 0,
+      maps: Vec::new(),
     };
     let old_root = index
       .resolve(ROOT, previous)?
@@ -1585,11 +1558,14 @@ impl<'index> Builder<'index> {
     for (path, done) in staged {
       events.push((self.intern(&path)?, done));
     }
+    let map_bytes = self.maps.iter().map(children::MapNode::bytes).sum();
     Ok(Plan {
       rows: self.rows,
       paths: self.new_paths,
       events,
       deletions: self.deletions,
+      maps: self.maps,
+      map_bytes,
     })
   }
 
@@ -1635,6 +1611,8 @@ impl<'index> Builder<'index> {
     self.make_mutable(&change.path, ancestors)?;
     let count = self.row(own.node)?.mergeinfo_count;
     self.lower(ancestors, count)?;
+    let parent = ancestors.last().ok_or(IndexRefusal::Corrupt)?.node;
+    self.unset_child(parent, &change.path)?;
     let staged = self.staged.entry(change.path.clone()).or_default();
     staged.deleted = Some(own.node);
     staged.shape = Some(Shape::Deleted);
@@ -1679,6 +1657,8 @@ impl<'index> Builder<'index> {
     self.raise(ancestors, row.mergeinfo_count)?;
     // The row takes `id`: nothing was pushed since it was read.
     self.rows.push(row);
+    let parent_id = ancestors.last().ok_or(IndexRefusal::Corrupt)?.node;
+    self.set_child(parent_id, &change.path, id)?;
     let staged = self.staged.entry(change.path.clone()).or_default();
     staged.node = Some(id);
     staged.deleted = replaced;
@@ -1703,6 +1683,7 @@ impl<'index> Builder<'index> {
       text: change.text,
       properties,
       mergeinfo_count: u64::from(properties.has_mergeinfo()),
+      children: children::EMPTY,
     })
   }
 
@@ -1732,6 +1713,8 @@ impl<'index> Builder<'index> {
       text: change.text.or(source_row.text),
       properties,
       mergeinfo_count: recounted(source_row.mergeinfo_count, had, properties.has_mergeinfo())?,
+      // A copy's children are its source's, the very node-revisions resolution finds beneath it (A-759).
+      children: source_row.children,
     };
     Ok((
       row,
@@ -1951,7 +1934,31 @@ impl<'index> Builder<'index> {
     };
     let id = self.push(row)?;
     self.staged.entry(path.to_owned()).or_default().node = Some(id);
+    self.set_child(parent, path, id)?;
     Ok(id)
+  }
+
+  /// The mutable directory `parent`'s map with `path`'s name set to `id` (A-759).
+  fn set_child(
+    &mut self,
+    parent: NodeRevisionId,
+    path: &str,
+    id: NodeRevisionId,
+  ) -> Result<(), IndexRefusal> {
+    let key = self.intern(path)?;
+    let root = self.row(parent)?.children;
+    let made = children::set(self, root, key, id).ok_or(IndexRefusal::Corrupt)?;
+    self.row_mut(parent)?.children = made;
+    Ok(())
+  }
+
+  /// The mutable directory `parent`'s map with `path`'s name removed (A-759).
+  fn unset_child(&mut self, parent: NodeRevisionId, path: &str) -> Result<(), IndexRefusal> {
+    let name = path.rsplit(SEPARATOR).next().ok_or(IndexRefusal::Corrupt)?;
+    let root = self.row(parent)?.children;
+    let made = children::remove(self, root, name).ok_or(IndexRefusal::Corrupt)?;
+    self.row_mut(parent)?.children = made;
+    Ok(())
   }
 
   /// The node at `path` in the revision as built so far: made or deleted by this revision, beneath a shape change this
@@ -2102,6 +2109,62 @@ impl<'index> Builder<'index> {
     }
   }
 }
+
+/// The room units `bytes` of directory maps take: [`Index::ENTRY_BYTES`] bytes a unit, rounded up (A-759).
+fn map_units(bytes: usize) -> usize {
+  bytes.div_ceil(Index::ENTRY_BYTES)
+}
+
+impl children::MapRead for Index {
+  fn map_node(&self, handle: u32) -> Option<&children::MapNode> {
+    self.maps.get(usize::try_from(handle).ok()?)
+  }
+
+  fn key_path(&self, key: usize) -> Option<&str> {
+    self.paths.get(key).map(|entry| &*entry.path)
+  }
+}
+
+impl children::MapRead for Builder<'_> {
+  fn map_node(&self, handle: u32) -> Option<&children::MapNode> {
+    let at = usize::try_from(handle).ok()?;
+    match at.checked_sub(self.index.maps.len()) {
+      None => self.index.maps.get(at),
+      Some(made) => self.maps.get(made),
+    }
+  }
+
+  fn key_path(&self, key: usize) -> Option<&str> {
+    self.path_name(key).ok()
+  }
+}
+
+impl children::MapWrite for Builder<'_> {
+  fn push_map_node(&mut self, node: children::MapNode) -> Option<u32> {
+    let handle = u32::try_from(self.index.maps.len().checked_add(self.maps.len())?).ok()?;
+    if handle == children::EMPTY {
+      return None;
+    }
+    self.maps.push(node);
+    Some(handle)
+  }
+
+  fn staged(&self, handle: u32) -> bool {
+    usize::try_from(handle)
+      .ok()
+      .and_then(|at| at.checked_sub(self.index.maps.len()))
+      .is_some_and(|made| made < self.maps.len())
+  }
+
+  fn map_node_mut(&mut self, handle: u32) -> Option<&mut children::MapNode> {
+    let made = usize::try_from(handle)
+      .ok()?
+      .checked_sub(self.index.maps.len())?;
+    self.maps.get_mut(made)
+  }
+}
+
+mod children;
 
 #[cfg(test)]
 pub(crate) mod tests;
