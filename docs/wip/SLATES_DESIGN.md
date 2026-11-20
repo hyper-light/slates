@@ -12653,6 +12653,23 @@ engine: the verdict, rebase, position mapping, the register).
 > which decapsulates for itself, to hostile `C_INIT`s refused with `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`, and to
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
+> **Status (2026-11-19, A-684: the daemon starts the SSH edge).** `slates anchor|daemon --vcs-ssh ADDRESS` (a library
+> starter's `StartSpec::vcs_ssh`, contract 56) starts A-651's edge in the daemon beside the HTTP edge: its listener and
+> connection tasks on the control shard under the shard's seats, an edge state kept on every shard so a connection moves
+> to its repository's owner (A-651 part 4), keys proved by the credential record (A-651 part 3), and the services as
+> the server has them: git's upload-pack from each repository's store through A-682's lender (`ShardStores`) and
+> Mercurial's `serve --stdio` from its served view (`ServedViews`, A-679); receive-pack (A-683) and Subversion's tunnel
+> (A-688's `SvnServices`, which awaits a lender of its stores) refused as not served. Any
+> IPv4 address is taken: SSH encrypts every connection. The host key, on main's ruling: a fleet node presents its own
+> key from its plan when the key is Ed25519, the edge's one host key algorithm, and starts no SSH edge otherwise,
+> logged; any other anchor makes an Ed25519 key from the system's generator at its start and keeps its seed in the
+> segment's supervision block, on the page it locks (`SUP_SSH_HOST_SEED`), beside the listener it binds once and hands
+> over (`ENV_VCS_SSH`), so a daemon restart keeps the port and the key a client pinned; a daemon run alone makes its own
+> for its life. It adopts a held listener by the rule the HTTP edge's and svn:// listener's share
+> (`daemon::held_or_bound_listener`). The daemon's log names the
+> address and the key's OpenSSH fingerprint before it says it serves. The other services and main's live OpenSSH
+> interop are owed.
+>
 > **Status (2026-11-19, A-651 part 4: the SSH edge serves a repository from its owner shard).** An `exec` that names a
 > repository another shard's partition holds moves its connection there, as the HTTP edge moves one once a head names
 > its repository (main's ruling, A-625 part 3): the site locates the repository by its name's route (D-14), and the
@@ -12663,7 +12680,7 @@ engine: the verdict, rebase, position mapping, the register).
 > repository's record, policy and store are read with no crossing. Each shard keeps its own edge state, and only the
 > listener's holds the host key. Subversion's tunnel names its repository in its greeting, not its `exec`, so it is
 > served where it was accepted until its own move (A-688). Keeping an edge state on every shard as the daemon starts
-> the edge is A-684's.
+> the edge is A-684's (built).
 >
 > **Status (2026-11-19, A-651 part 3: the SSH edge proves a key by the credential record).** A key the session cannot
 > answer for at once waits for the record: the edge's key holders (`RecordKeys`, which replaced `NoKeyRecord`) answer
@@ -12674,7 +12691,8 @@ engine: the verdict, rebase, position mapping, the register).
 > record proves its principal only when it is an SSH key of the same bytes, live on the wall clock. As the HTTP edge
 > asks, a consumer's key proves the consumer only while it is enrolled and not revoked (§4.13). Anything else is nobody,
 > a lookup the record could not answer included, each counted by its reason. The user name plays no part. The daemon
-> starting the edge, the stores and main's live OpenSSH `git clone` with an enrolled key are owed.
+> starting the edge, the stores and main's live OpenSSH `git clone` with an enrolled key are owed (the daemon's start,
+> closed by A-684).
 >
 > **Status (2026-11-19, A-651 part 2: git's upload-pack behind the SSH edge).** `crates/server`'s `vcs_ssh::git` runs
 > A-640's one entry point over an SSH session's standard input and output, the store lent a step at a time by the HTTP
@@ -12702,7 +12720,7 @@ engine: the verdict, rebase, position mapping, the register).
 > connection with every seat taken, since an SSH connection waits on people (a key's passphrase after `PK_OK`, a host
 > key's confirmation) and on a push's compression. The key time is fed by authenticated connections' lifetimes. The
 > daemon starting the edge, the stores and the live OpenSSH `git clone` are owed (the key record, closed by A-651
-> part 3).
+> part 3; the daemon's start, by A-684).
 >
 > **Status (2026-11-19, A-608: piece 3 built, the pack reader).** `crates/git` (`unpack`) reads a pack as a stream
 > delivers it, in any cuts: the header through A-591's reader, then each entry's header (A-582 part 3), its data
@@ -52876,6 +52894,83 @@ Applied in the same change to:
 - **Owed.** The suffixes `~`, `^`, `^{...}`, `@{...}` and `:/<text>` (still refused by kind; the next slice: in a
   served repository a reflog form names nothing, `@{0}` alone names `HEAD`'s commit, `@{1}` dies of an empty log,
   `@{upstream}` and `@{push}` die in git's words); `sparse:oid` within `combine:`.
+
+### A-684 — The daemon starts the SSH edge: `--vcs-ssh ADDRESS`, the anchor holding its listener and its Ed25519 host key across daemon restarts, a fleet node presenting its own key, and the daemon's log naming the address and the key's fingerprint (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 2; A-651's owed start; A-625 part 3 continued's two pieces for HTTP, mirrored)
+Applied in the same change to: §4.17.2's status (A-684's block; the daemon's start closed in A-651's and A-651 part 3's);
+GAPS (the §4.17 entry: A-684's line, A-651's owed lists, the stock-hg tests' waits); `crates/anchor`
+(`layout::SUP_SSH_HOST_PRESENT`, `SUP_SSH_HOST_SEED`, `SSH_HOST_SEED_BYTES`, both declared in the segment's layout,
+AUD-29-09; `AnchorSegment::publish_ssh_host_seed` and `ssh_host_seed`; `ENV_VCS_SSH`, `Supervisor::hold_vcs_ssh_listener` and its handover at each start); `crates/server`
+(`config::VcsSshConfig`, `DaemonConfig::vcs_ssh`, `EdgeIdentity::ed25519_seed`; `vcs_ssh::daemon_edge`, new, and its
+tests, the start keeping an edge state on every shard as A-651 part 4 asks; `daemon::VcsSshEdge`, `Daemon::vcs_ssh`,
+`bind_vcs_ssh_listener`, and the doc of `held_or_bound_listener`, A-689's one rule for a held listener, which the SSH
+edge adopts by too; `vcs_http`'s `bounds_of` and `ShardRepositories` shared with the SSH edge); `crates/api` (`ProcessOptions::vcs_ssh`, `role::vcs_ssh_address`, the
+roles' grammar and arguments, the anchor role's `publish_ssh_host_key` and `hold_vcs_ssh_listener`, the daemon role's
+configuration and log line; `StartSpec::vcs_ssh`; `CONTRACT` 56, after A-689's 54 and A-652 part 3's 55); `crates/cli` (the grammar and usage; `tests/cli.rs`:
+an SSH host key reader and the restart test, and the doc of g083's `VCS_SSH_LINE`); `docs/cli.md`, `docs/library.md`,
+`README.md`.
+- **What.** A-651 built the SSH edge and left its start owed: nothing ran it outside tests. `--vcs-ssh ADDRESS` on the
+  anchor's and the daemon's grammar, and a library starter's `StartSpec::vcs_ssh`, now start it in the daemon beside the
+  HTTP edge: A-651's listener and connection tasks on the control shard under the shard's seats, an edge state kept on
+  every other shard (`EdgeState::arrivals`, no host key) so an `exec` naming a repository another shard holds moves its
+  connection there (A-651 part 4), the site proving keys by the credential record (A-651 part 3's `RecordKeys`) and
+  locating repositories by their names' routes (`ShardRepositories`), and the services as the server has them
+  (`ToolServices` over the HTTP edge's lenders, on main's word as A-682 and A-679 landed: git's upload-pack from each
+  repository's store, `ShardStores`, and Mercurial's `serve --stdio` from its served view, `ServedViews`, on its owner
+  shard, each request admitted the edge's room; receive-pack (A-683) and Subversion's tunnel refused as not served, in
+  their tools' own words: A-688's `SvnServices` waits for a lender of Subversion's stores over A-662's map).
+- **Decisions.** (1) Any IPv4 address, on a fleet node or not: SSH encrypts every connection and proves the server by
+  its host key before a client sends anything of its own (RFC 4253 §7-§8), and a client proves itself by a signature,
+  never a secret sent (RFC 4252 §7), so no address leaves anything in the clear, as `--vcs-http`'s off loopback would. A
+  privileged port is refused by the system where it is privileged, which ends the anchor's start by name (R10). (2) The
+  host key, on main's ruling: a fleet node presents the node's own key, from the identity its plan hands in, as the
+  HTTP edge's TLS presents the node's certificate, when that key is Ed25519 (a PKCS#8 document, RFC 8410 §7, read by
+  AWS-LC), the one host key algorithm the edge has (`ssh-ed25519`, RFC 8709; §4.17.2). A node whose key is of another
+  algorithm (the P-256 keys `rcgen` mints by default, the kind lane's among them) starts no SSH edge, logged, rather
+  than present a key that is not the node's. (3) Any other anchor makes an Ed25519 key from the system's generator at
+  its start and publishes its seed in the segment's supervision block before any daemon starts, as it publishes the
+  launcher's secret: `SUP_SSH_HOST_SEED`, the cache line after the launcher secret, on the page the anchor locks for the
+  sealing root, in a process excluded from core dumps. Every daemon reads it there, so a restart keeps the key a
+  client's `known_hosts` pinned, and the key lives as long as the anchor, as the RAM the edge serves does. No
+  environment variable carries it, since every child would inherit one. (4) A daemon run alone, which no anchor
+  outlives, makes its own for its own life, as it binds its own listener; so does one under an anchor that published
+  none (an older anchor). (5) The anchor binds the listener once with the edge's own backlog (`bind_vcs_ssh_listener`,
+  the HTTP edge's bounds) and hands it over (`ENV_VCS_SSH`), as the HTTP edge's; the daemon adopts it by the one rule
+  A-689 made shared (`daemon::held_or_bound_listener`, which this piece had made the same way and dropped at the
+  merge), so a listener held elsewhere is refused for every edge. (6) The daemon's line names the address and the key's fingerprint as OpenSSH prints one
+  (`SHA256:` and the blob's hash in base64 without padding), before the line that says it serves, so a person compares
+  it with what `ssh` shows on first contact; it begins with the words g083's stock-hg test reads (`VCS_SSH_LINE`), its
+  port's digits first. (7) Each reason the edge cannot start (a node key that is not Ed25519, an unread segment, a
+  generator that refused, an address that does not bind, a held listener elsewhere) leaves the daemon serving
+  everything else, logged, as the HTTP edge's does.
+- **Tests.** macOS arm64 (Mac Studio, `cargo test --locked`, debug; `cargo fmt --check` clean for `slates-anchor`,
+  `-api`, `-cli` and `-server`). Red first (kiln r302, 2026-11-19 22:42-22:59Z, over stubs: the anchor published no
+  key and handed no SSH listener over, the roles and the command refused `--vcs-ssh`, a starter's anchor was not asked
+  for it, the daemon started no edge and always drew its key): the anchor's child exited 2, no descriptor handed over;
+  `UnknownFlag("--vcs-ssh")` in the role's and the command's grammar, and `None` in the starter's role; the five
+  `vcs_ssh::daemon_edge` tests failing, the drawn key where the node's and the anchor's were expected and no edge on
+  the three daemons; the CLI test's anchor ending at the unknown flag; their 13 neighbours passing. The seed's test
+  failed at its first read, `LayoutRefused { offset: 4480, len: 8, reason: NotAWord }`, and the first green run met
+  it too (with the three daemon tests and the CLI test it starved): the segment declares its words and racy spans
+  (AUD-29-09), and the seed's were undeclared; they are declared now. Green before the merges with main (c1810019a, r365,
+  23:07-23:12Z; 80e8038a7 over main 0462bd922, r382, 23:12-23:20Z), and on the tree this commit lands as, over main
+  2c3fa2bcc with A-689 and A-682 (r445, 23:46-23:51Z): `-p slates-anchor --test anchor -- the_supervised_child_inherits
+  ssh_host_seed` 4 of 4; `-p slates-server --lib -- vcs_ssh::daemon_edge vcs_http::daemon_edge` 11 of 11 (a daemon over
+  a played anchor's segment presenting the anchor's key, its signature over the exchange checked by slates-ssh's RFC
+  client; a lone daemon its own key on two connections; an Ed25519 node identity's own key; a P-256 identity starting
+  no edge while the daemon serves; the HTTP edge's six over the shared adoption rule); `-p slates-api --lib --
+  role::tests start::tests contract_history` 10 of 10; `-p slates-cli --bin slates -- the_grammar` 15 of 15; `-p
+  slates-cli --test cli -- vcs_` 5 of 5 (g083's stock-hg SSH test ignored): the anchor's daemon named `127.0.0.1:62967
+  with the ED25519 host key SHA256:vg+qbVEBJ5vQY284R+Ciy61q1vRy3EclQoFRXjc7BsQ`, its edge presented that key, an exchange
+  begun while the killed daemon's successor started was answered by it with the same key at the same port, and the
+  successor named both again.
+- **Owed.** The other services wired into the daemon's site (A-683's receive-pack; A-688's tunnel, once its stores'
+  lender lands); a test of
+  the daemon's own SSH site running upload-pack and `serve --stdio` for an enrolled key (A-682's and A-679's tests run
+  its services alone); host keys in a fleet node's other key algorithms (ECDSA, RFC 5656;
+  RSA, RFC 8332), so a node with a P-256 identity presents its own key; Windows keeps no listener across a restart
+  (`docs/wip/platforms.md`, gap 2), though it keeps the key; main's live OpenSSH 10.2 interop against `--vcs-ssh`
+  (`ssh-keyscan`, a stock `git clone ssh://` and `hg clone ssh://` with an enrolled key) and the other platforms'
+  runs.
 
 ### A-647 part 4 — A version's reach sets kept as trees of nodes over fixed blocks of positions, so its value adds what it brought, never its reached set again (format 3) (2026-11-19, g294 from g302's draft, UI goal 93 (kiln 51cef9f7); A-645 "Derived data, one mechanism"; §4.17.2 "The repository in git's terms" item 3; after A-647 part 3)
 
