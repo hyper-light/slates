@@ -9195,6 +9195,73 @@ fn a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount
     pause();
     now = referenced();
   }
+  eprintln!("DIAG status after the mount's end:\n{}", run(&instance, &["status", &id]).1);
+  eprintln!("DIAG daemon status:\n{}", run(&instance, &["status"]).1);
+  assert_eq!(
+    now, before,
+    "the kept file's bytes come back once the mount that survived the takeover has ended"
+  );
+  drop(mount);
+  drop(anchor);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn diag_the_same_without_a_takeover() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-keptnt-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "kept", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "a volume: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let referenced = || -> u64 {
+    let (code, out, err) = run(&instance, &["status", &id]);
+    assert_eq!(code, 0, "status: {err}");
+    value_of(&out, "referenced_bytes").parse().unwrap()
+  };
+  let before = referenced();
+  let path = format!("{}/kept.bin", mount.path);
+  let barrier = format!("{}/barrier.bin", mount.path);
+  // The test's own files, written and unlinked through the slates mount: RAM, not disk.
+  #[allow(clippy::disallowed_methods)]
+  std::fs::write(&path, vec![0x5Au8; HELD_FILE_BYTES]).unwrap();
+  #[allow(clippy::disallowed_methods)]
+  std::fs::write(&barrier, b"publish").unwrap();
+  #[allow(clippy::disallowed_methods)]
+  std::fs::remove_file(&barrier).unwrap();
+  let uncounted = std::fs::File::open(&path).unwrap();
+  #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
+  std::fs::remove_file(&path).unwrap();
+  let held = u64::try_from(HELD_FILE_BYTES).unwrap();
+  eprintln!("DIAG after unlink, no takeover: referenced {} before {} held {}", referenced(), before, held);
+  let lazily = Command::new("fusermount3")
+    .args(["-u", "-z"])
+    .arg(&mount.path)
+    .output()
+    .unwrap();
+  assert!(lazily.status.success(), "the lazy unmount: {lazily:?}");
+  drop(uncounted);
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut now = referenced();
+  while now > before && Instant::now() < deadline {
+    pause();
+    now = referenced();
+  }
+  eprintln!("DIAG status after the mount's end:\n{}", run(&instance, &["status", &id]).1);
+  eprintln!("DIAG daemon status:\n{}", run(&instance, &["status"]).1);
   assert_eq!(
     now, before,
     "the kept file's bytes come back once the mount that survived the takeover has ended"

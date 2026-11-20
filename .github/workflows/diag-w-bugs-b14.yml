@@ -38,7 +38,7 @@ jobs:
           out="$RUNNER_TEMP/out"; mkdir -p "$out"
           echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD); $(uname -r)" > "$out/status.txt"
           for t in a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends \
-                   the_handles_a_dead_daemon_issued_give_back_their_references_at_release; do
+                   diag_the_same_without_a_takeover; do
             cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact "$t" > "$out/$t.txt" 2>&1
             echo "$t exit $?" >> "$out/status.txt"
           done
