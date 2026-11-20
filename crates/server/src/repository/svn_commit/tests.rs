@@ -1013,6 +1013,30 @@ fn t_a745_a_fetchs_hold_reads_the_records_it_began_on_across_a_rebuild() {
   });
 }
 
+/// `svn`'s head texts read through its sources' text source: the replacing text borrowed from `green`, an earlier one
+/// still read from the records.
+fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId, DbVolumeId)) {
+  let engine = state.greens.get(&green).expect("the green");
+  let records = state
+    .vcs_stores
+    .subversion_records(svn)
+    .expect("the records");
+  let texts = crate::vcs_store::svn_texts::HeadTexts {
+    green: Some(&engine),
+    records,
+  };
+  use slates_svn::migration::TextSource;
+  assert!(matches!(
+    texts.text(&identity(b"gamma\n")),
+    Some(std::borrow::Cow::Borrowed(b"gamma\n"))
+  ));
+  assert_eq!(
+    texts.text(&identity(b"alpha\n")).as_deref(),
+    Some(&b"alpha\n"[..]),
+    "an earlier text is read from the records"
+  );
+}
+
 /// S4 slice 2 c1 (the head's texts held by the green, `vcs_store::svn_texts`). Do: commit revision 1 (`/trunk/a.txt`,
 /// `/trunk/sub/b.txt`); 2, `branched` (a copy of `/trunk` with `a.txt` changed beneath it and `sub` deleted); 3,
 /// deleting `/trunk`; 4, replacing `/branches/b/a.txt` by another text; reading each text through the sources' text
@@ -1053,25 +1077,7 @@ fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
     );
     assert_eq!(commit(state, (&owner(), svn), replacing, None), answered(4));
     assert_eq!(held(state), (1, vec![false, false, false, true, false]));
-    let engine = state.greens.get(&green).expect("the green");
-    let records = state
-      .vcs_stores
-      .subversion_records(svn)
-      .expect("the records");
-    let texts = crate::vcs_store::svn_texts::HeadTexts {
-      green: Some(&engine),
-      records,
-    };
-    use slates_svn::migration::TextSource;
-    assert!(matches!(
-      texts.text(&identity(b"gamma\n")),
-      Some(std::borrow::Cow::Borrowed(b"gamma\n"))
-    ));
-    assert_eq!(
-      texts.text(&identity(b"alpha\n")).as_deref(),
-      Some(&b"alpha\n"[..]),
-      "an earlier text is read from the records"
-    );
+    assert_read_through_the_green(state, (svn, green));
   });
 }
 

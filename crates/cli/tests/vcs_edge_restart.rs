@@ -200,6 +200,33 @@ fn kill(pid: u32) {
   assert!(status.unwrap().success(), "the daemon {pid} was killed");
 }
 
+/// Each listener at `ports` (in [`EDGES`]' order) answers as a client is first answered there.
+fn assert_each_listener_answers(ports: &[u16; 3]) {
+  for (index, port) in ports.iter().enumerate() {
+    let ask = EDGES[index].2;
+    let answer = first_answer(*port, ask).expect("the listener answered");
+    assert!(
+      answer.starts_with(ask.answer()),
+      "{ask:?} at {port}: {}",
+      String::from_utf8_lossy(&answer)
+    );
+  }
+}
+
+/// Each port asked while no daemon ran was taken and answered as its listener answers.
+fn assert_answered_while_restarting(answers: Vec<(Ask, u16, std::io::Result<Vec<u8>>)>) {
+  for (ask, port, answer) in answers {
+    let answer = answer.unwrap_or_else(|error| {
+      panic!("{ask:?}'s port {port} was dropped while its daemon restarted: {error}")
+    });
+    assert!(
+      answer.starts_with(ask.answer()),
+      "{ask:?} at {port} while the daemon restarted: {}",
+      String::from_utf8_lossy(&answer)
+    );
+  }
+}
+
 /// A-748 with A-625 part 3, A-684 and A-689 (§4.6, every platform). Do: start an anchor with the HTTP edge, the SSH edge
 /// and the svn:// listener on loopback, each on a port the system picks (`127.0.0.1:0`); read the ports its daemon
 /// names and ask each; kill the daemon; once the anchor says it restarted it, ask each port again, before the successor
@@ -231,15 +258,7 @@ fn a_daemon_restart_keeps_every_version_control_listeners_port() {
   let serving = format!("{SERVING_LINE}{instance} serving on ");
   let ports =
     ports_until_served(&lines, &serving).map(|port| port.expect("each listener named its port"));
-  for (index, port) in ports.iter().enumerate() {
-    let ask = EDGES[index].2;
-    let answer = first_answer(*port, ask).expect("the listener answered");
-    assert!(
-      answer.starts_with(ask.answer()),
-      "{ask:?} at {port}: {}",
-      String::from_utf8_lossy(&answer)
-    );
-  }
+  assert_each_listener_answers(&ports);
   let killed = daemon_pid(&instance).expect("the daemon's pid");
   kill(killed);
   // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
@@ -271,16 +290,7 @@ fn a_daemon_restart_keeps_every_version_control_listeners_port() {
     served |= line.starts_with(&serving);
   }
   assert_ne!(successor, Some(killed), "the anchor started a new daemon");
-  for (ask, port, answer) in while_restarting {
-    let answer = answer.unwrap_or_else(|error| {
-      panic!("{ask:?}'s port {port} was dropped while its daemon restarted: {error}")
-    });
-    assert!(
-      answer.starts_with(ask.answer()),
-      "{ask:?} at {port} while the daemon restarted: {}",
-      String::from_utf8_lossy(&answer)
-    );
-  }
+  assert_answered_while_restarting(while_restarting);
   assert_eq!(
     again,
     ports.map(Some),

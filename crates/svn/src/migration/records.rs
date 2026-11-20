@@ -228,7 +228,7 @@ impl Repository {
     &mut self,
     revision: Revision,
     changes: &[ChangedPath],
-    mut fresh: BTreeMap<ContentIdentity, Vec<u8>>,
+    fresh: BTreeMap<ContentIdentity, Vec<u8>>,
   ) -> Result<u64, StepRefusal> {
     let mut saved = 0u64;
     for change in changes {
@@ -658,6 +658,7 @@ struct KeptText {
 
 /// The most deltas one read applies: a node's predecessor count is a `u64`, and the skip-delta rule halves the distance
 /// to the first version at every step (module docs, "Texts"), so a chain longer than this does not hold together.
+/// Derived: a `u64`'s 64 halvings, and the first version.
 const MAX_CHAIN: usize = 65;
 
 /// `target` as an svndiff of version 2 against `source`, each window's sections LZ4 blocks where that is shorter, as
