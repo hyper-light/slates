@@ -1749,6 +1749,54 @@ impl Volume {
     self.read_body(store, no, off, buf)
   }
 
+  /// Holds file `no`'s content as the head has it now for a reader that reads it over turns (A-768: a live log's whole
+  /// capture): appends each sealed extent that names a chunk to `out`, its chunk pinned ([`ChunkStore::pin_chunk`]), so
+  /// a write that replaces it, the publication that frees it and the deadlist walk leave its bytes readable until the
+  /// reader lets go ([`ChunkStore::unpin_extents`]); an open extent, which the next write changes in place, is copied.
+  /// `None`, appending nothing, for a body that holds no chunked content. Refused whole: what it pinned before a refusal
+  /// is unpinned.
+  pub fn pin_extents(
+    &self,
+    store: &mut Store,
+    no: InodeNo,
+    out: &mut Vec<Extent>,
+  ) -> Result<Option<PinnedFile>, VfsError> {
+    let inode = self.inode(store, no)?;
+    let size = inode.attrs.size;
+    let (sealed, open) = match &inode.body {
+      Body::Sealed(sealed) => (sealed, None),
+      Body::Open { open, sealed } => (
+        sealed,
+        Some((open.off, store.content.open_bytes(open).to_vec())),
+      ),
+      _ => return Ok(None),
+    };
+    let from = out.len();
+    out.extend(
+      sealed
+        .iter()
+        .filter(|extent| matches!(extent.src, ExtentSrc::Chunk { .. })),
+    );
+    for at in from..out.len() {
+      let pinned = match out.get(at).map(|extent| extent.src) {
+        Some(ExtentSrc::Chunk { chunk, .. }) => store.content.pin_chunk(chunk),
+        _ => Ok(()),
+      };
+      if let Err(refusal) = pinned {
+        let undone = out
+          .get(from..at)
+          .map_or(Ok(()), |held| store.content.unpin_extents(held));
+        out.truncate(from);
+        return Err(refusal.after_undo(undone));
+      }
+    }
+    Ok(Some(PinnedFile {
+      size,
+      extents: out.len().saturating_sub(from),
+      open,
+    }))
+  }
+
   /// Reads up to `buf.len()` bytes at `off` of file `no`, a referenced file's content pieces through `content` (A-645
   /// P3 ruling 2, [`crate::referenced`]); any other file reads as [`Volume::read`] reads it. Counted in
   /// [`Volume::referenced_counts`].
@@ -7615,6 +7663,18 @@ pub(crate) fn stamp_all(attrs: &mut Attrs, now: i64) {
 }
 
 /// Copies the overlap of `bytes` (at file offset `base`) into `out` (at file offset `off`).
+/// What [`Volume::pin_extents`] held of one file: its size then, how many sealed extents it appended (each chunk pinned),
+/// and a copy of its open extent with the offset it begins at.
+#[derive(Debug)]
+pub struct PinnedFile {
+  /// The file's size when it was pinned.
+  pub size: u64,
+  /// The sealed extents appended.
+  pub extents: usize,
+  /// The open extent's offset and bytes, copied.
+  pub open: Option<(u64, Vec<u8>)>,
+}
+
 pub(crate) fn copy_range(bytes: &[u8], base: u64, off: u64, out: &mut [u8]) {
   crate::content::copy_overlap(bytes, base, off, out);
 }
