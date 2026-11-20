@@ -15189,3 +15189,21 @@ Still one step each: the build and the entry apply are sliced under the step qua
   round for each repository with work beside it. What is left of every class's gap is where repositories sit, measured
   next (the busiest repository's shard mates).
 
+
+## A 500 MB Subversion commit after the drive streams its texts: taken, then the landing spins a shard and holds 12 times the text (§4.17.1 "A push's intake"; UI goal 93; 2026-11-20)
+
+Hardware: the big Mac Studio (32 cores, 96 GB, macOS arm64), load averages 5.3 to 7.6. Tree: main 2d8ab9f3d (intake part
+1: the commit drive applies each window into a sink, `HeldTexts` per connection). Command as in "A 500 MB Subversion
+commit over svn:// and DAV" above; two runs.
+
+| Scheme | Run 1 | Run 2 | Daemon RSS peak | Text |
+|---|---|---|---|---|
+| `svn://` | E210002 at "Committing transaction", 4.9 s | the same, 4.7 s | 6.0 to 6.2 GB | 500 MB |
+| `http://` (DAV) | Committed revision 1, 8.0 s | the shard spun, the daemon restarted | 6.2 GB | 500 MB |
+
+The request's room no longer refuses the commit (E210009 before), but the landing is one step: in run 2 shard 0 ran
+1,057 to 1,076 ms of CPU without a step at the landing (tasks `vcs_svn.rs:605` and `vcs_http.rs:837`) and the watchdog
+ended the daemon; run 1's DAV landing finished inside its window. Peak RSS is about 12 times the text: the sink's
+growing copy, `Revision::of_work`'s copy, the revision record's encoding into one log entry, the records' copy and the
+green's file. Owed (GAPS): the landing a slice at a time (rule 3) and the texts held once (rule 1: the green's staged
+blocks as the sink, the increment setting the path from the held identity, the record and log naming identities).
