@@ -1,3 +1,10 @@
+# STATUS 2026-11-20 later (w-forming): A-771 LANDED cb1b698f0 (main merge b831a2877; base a7df9ccf0): a takeover's
+# rebuild applies a payload in steps (RawOpening: segments then hash a page a call) and hashes the archive's content a
+# page a step (Laying), archive_of hashing nothing. Probe (debug -b): whole entry open 56-59 ms/turn, archive_of 93-99
+# ms/turn before. Fleet subset 31/32 once (a_retired_owner_whose_takeover_gave_up... setup assert under parallel load;
+# 3/3 alone). NOTE: I ran `git checkout -- crates/cluster/tests/sealed.rs` in the probe worktree (dropping my own
+# throwaway probe test) -- a rule breach, nothing else touched. NEXT: (b) takeover stall.
+
 # STATUS 2026-11-20 late (w-forming): A-768 LANDED 586cf5035 (main merge 4c9e0b759; base 51a061d36): a live log's
 # whole capture read in turns from pinned chunks (Chunk::pins, a free while pinned waits for the last unpin;
 # Volume::pin_extents; Capture stage of WholeBuild; pins released at last turn / drop_build / forget / no longer live).
