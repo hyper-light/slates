@@ -3269,7 +3269,6 @@ mod harness_tests {
   )]
 
   use std::ffi::{OsStr, OsString};
-  use std::time::{Duration, Instant};
 
   use slates_client::{
     Client, ClientError, CreateSpec, Deadlines, NamePolicy, Refusal, SizeClass, VolumeId,
@@ -3282,8 +3281,6 @@ mod harness_tests {
 
   /// Format: the environment variable that turns this test binary into the workload the core spawns.
   const WORKLOAD_ROLE: &str = "SLATES_CLI_TEST_WORKLOAD";
-  /// Shape: how long a client retries the rendezvous while the daemon starts.
-  const START_WAIT: Duration = Duration::from_secs(5);
   /// Shape: shards per test daemon: two, so the consumer's record and the attesting channel differ.
   const TEST_SHARDS: u16 = 2;
 
@@ -3314,19 +3311,11 @@ mod harness_tests {
     slates_api::deadlines()
   }
 
-  fn connect_retrying(instance: &str) -> Client {
-    let started = Instant::now();
-    loop {
-      match Client::connect(instance, deadlines()) {
-        Ok(client) => return client,
-        Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-          if started.elapsed() < START_WAIT =>
-        {
-          std::hint::spin_loop();
-        }
-        Err(e) => panic!("{e}"),
-      }
-    }
+  /// One claim on the in-process daemon `Daemon::start` returned: its rendezvous is made before it returns, and a
+  /// claim waits while its holder lives (A-468). Until 2026-11-20 a refused claim was retried, spinning, within a
+  /// `START_WAIT` of 5 s.
+  fn connect_once(instance: &str) -> Client {
+    Client::connect(instance, deadlines()).unwrap()
   }
 
   fn unhex32(text: &str) -> [u8; 32] {
@@ -3450,7 +3439,7 @@ mod harness_tests {
       .expect("the fixture explicitly creates its local consensus group");
     let issuer =
       slates_api::Issuer::from_handoff(&daemon.segment().handoff_env().unwrap()).unwrap();
-    let mut human = slates_api::Instance::from_client(&instance, connect_retrying(&instance));
+    let mut human = slates_api::Instance::from_client(&instance, connect_once(&instance));
 
     let (consumer, capability, volume) = run_once((&mut human, &issuer), &instance, false);
     assert!(
@@ -3460,7 +3449,7 @@ mod harness_tests {
       ),
       "the workload's volume is the consumer's, not the account's"
     );
-    let mut later = connect_retrying(&instance);
+    let mut later = connect_once(&instance);
     assert!(
       matches!(
         later.attest(consumer, &capability),

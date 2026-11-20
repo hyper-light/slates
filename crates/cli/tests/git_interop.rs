@@ -31,6 +31,9 @@
   clippy::string_slice
 )]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 use std::io::{BufRead, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -501,7 +504,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> Started {
   anchor.drain = Some(std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
   }));
-  settle(instance);
+  settle(instance, anchor.child.id());
   let (code, out, err) = slates(instance, &[], &["bootstrap", "root"]);
   assert_eq!(code, 0, "bootstrap root: {out}{err}");
   Started {
@@ -553,9 +556,10 @@ fn issuer_surface(line: &str) -> Option<Vec<(String, String)>> {
   )
 }
 
-/// Waits until the daemon answers [`STABLE_STREAK`] verbs in a row, within [`PATIENCE`].
-fn settle(instance: &str) {
-  let started = Instant::now();
+/// Waits until the daemon answers [`STABLE_STREAK`] verbs in a row, while the tree under its anchor `anchor` gains
+/// CPU ([`process_wait::Judged`]; until 2026-11-20 within [`PATIENCE`]).
+fn settle(instance: &str, anchor: u32) {
+  let mut judged = process_wait::Judged::of(anchor);
   let mut streak = 0;
   while streak < STABLE_STREAK {
     streak = if slates(instance, &[], &["volume", "list"]).0 == 0 {
@@ -563,10 +567,7 @@ fn settle(instance: &str) {
     } else {
       0
     };
-    assert!(
-      started.elapsed() < PATIENCE,
-      "the daemon answered {STABLE_STREAK} verbs in a row within {PATIENCE:?}"
-    );
+    judged.look("the daemon answered verbs in a row");
     pause();
   }
 }

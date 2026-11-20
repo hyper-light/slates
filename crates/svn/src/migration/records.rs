@@ -962,6 +962,24 @@ impl TextReading {
 }
 
 impl Repository {
+  /// The chain of kept texts `identity`'s is made from, its first delta first: none for a chain past [`MAX_CHAIN`] or
+  /// one naming a text not kept.
+  fn chain_of(&self, identity: &ContentIdentity) -> Option<Vec<ContentIdentity>> {
+    let mut chain = Vec::new();
+    let mut at = *identity;
+    loop {
+      let kept = self.texts.get(&at)?;
+      chain.push(at);
+      match kept.base {
+        Some(base) if chain.len() <= MAX_CHAIN => at = base,
+        Some(_) => return None,
+        None => break,
+      }
+    }
+    chain.reverse();
+    Some(chain)
+  }
+
   /// One step of reading the text held under `identity` into `reading` ([`TextSource::read_step`]): a property list's
   /// bytes copied a window's room a step; a kept text made from its chain one svndiff window a step, its first delta
   /// first, each level read against the one below it whole, as [`Repository::text`] makes it whole.
@@ -973,34 +991,11 @@ impl Repository {
         .map(|bytes| reading.copy_step(bytes));
     }
     if reading.chain.is_empty() {
-      let mut at = *identity;
-      loop {
-        let kept = self.texts.get(&at)?;
-        reading.chain.push(at);
-        match kept.base {
-          Some(base) if reading.chain.len() <= MAX_CHAIN => at = base,
-          Some(_) => return None,
-          None => break,
-        }
-      }
-      reading.chain.reverse();
+      reading.chain = self.chain_of(identity)?;
       reading.bytes.clear();
     }
     let kept = self.texts.get(reading.chain.get(reading.level)?)?;
-    let rest = kept.delta.get(reading.decoded..)?;
-    match reading.decoder.decode(rest).ok()? {
-      svndiff::Decoded::Header { consumed, .. } => {
-        reading.decoded = reading.decoded.checked_add(consumed)?;
-      }
-      svndiff::Decoded::Window { window, consumed } => {
-        let start = usize::try_from(window.source_offset).ok()?;
-        let end = start.checked_add(usize::try_from(window.source_len).ok()?)?;
-        let view = reading.below.get(start..end)?;
-        svndiff::apply(&window, view, &mut reading.bytes).ok()?;
-        reading.decoded = reading.decoded.checked_add(consumed)?;
-      }
-      svndiff::Decoded::NeedMore { .. } => return None,
-    }
+    decoded_step(reading, &kept.delta)?;
     if reading.decoded < kept.delta.len() {
       return Some(false);
     }
@@ -1015,6 +1010,26 @@ impl Repository {
     reading.below = std::mem::take(&mut reading.bytes);
     Some(false)
   }
+}
+
+/// The next piece of a level's `delta` decoded into `reading`: its header, or a window applied over the level below;
+/// none for a delta cut short or one that does not decode.
+fn decoded_step(reading: &mut TextReading, delta: &[u8]) -> Option<()> {
+  let rest = delta.get(reading.decoded..)?;
+  match reading.decoder.decode(rest).ok()? {
+    svndiff::Decoded::Header { consumed, .. } => {
+      reading.decoded = reading.decoded.checked_add(consumed)?;
+    }
+    svndiff::Decoded::Window { window, consumed } => {
+      let start = usize::try_from(window.source_offset).ok()?;
+      let end = start.checked_add(usize::try_from(window.source_len).ok()?)?;
+      let view = reading.below.get(start..end)?;
+      svndiff::apply(&window, view, &mut reading.bytes).ok()?;
+      reading.decoded = reading.decoded.checked_add(consumed)?;
+    }
+    svndiff::Decoded::NeedMore { .. } => return None,
+  }
+  Some(())
 }
 
 /// `text` from `offset` to its end: none past it, as a read's source answers.
