@@ -1604,12 +1604,27 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
           return Ok(!*done);
         }
         let (root, room) = (self.root.as_str(), to_usize(self.request_room));
+        let diag_before = out.len();
         let progress = self
           .stores
           .lend(self.repository, &self.principal, |lent| {
             report.resume(&served_of(lent, root), out, room)
           })
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+        // DIAG (w-bugs, never for main): each reply run's bytes against the room, and the shard's long polls so far.
+        let counters = slates_rt::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
+        let wrote = out.len().saturating_sub(diag_before);
+        if wrote > room || matches!(progress, ReportProgress::Done) {
+          slates_machine::log_line!(
+            "diag-svnfetch dav report run: wrote {wrote}, most a run {}, room {room}, done {}, quantum_ns {}, shard long_steps {}, longest_step_ns {}",
+            DIAG_MOST.get().max(wrote),
+            matches!(progress, ReportProgress::Done),
+            slates_rt::futures::step_budget_ns().unwrap_or(0),
+            counters.long_steps,
+            counters.longest_step_ns
+          );
+        }
+        DIAG_MOST.set(DIAG_MOST.get().max(wrote));
         match progress {
           ReportProgress::More => Ok(true),
           ReportProgress::Done => {
@@ -1625,6 +1640,11 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
       None => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
     }
   }
+}
+
+thread_local! {
+  /// DIAG (w-bugs): the most one report run wrote on this thread.
+  static DIAG_MOST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
