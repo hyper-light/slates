@@ -11318,6 +11318,13 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 >
 > **Status (2026-11-20, A-728 part 3: measured).** A 1,000-revision Subversion import: the history's heap 50.3 to
 > 2.0 MiB, `Green::commit`'s 285.1 to 200.0 MiB (BENCHMARKS.md).
+>
+> **Status (2026-11-20, A-728 part 4: the honest charge; main's ruling, A-714's rule).** The history's retention counts
+> every block it keeps whole; only the latest value's own block, the current file, is current (`Value::own`). A change
+> that supersedes a value adds its list and what it keeps of its own block (`Value::kept_when_superseded`: the whole
+> block when named whole or held elsewhere, else the runs it named), which `Green::history_reservation` charges before
+> the verdict whatever the ops (`Green::superseded_bytes`). A file's first small edit now charges the earlier file
+> whole, as it is kept; before, it was counted as the current value's and went uncharged.
 
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
@@ -52525,7 +52532,10 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (BUILT 2026-11-20 through A-636 part 2c-2: a successor's
   rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
-  `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
+  `paths::remake_green_sliced`), a push's whole build sliced by a task with submits parked until it ends (BUILT
+  2026-11-20, `paths::whole_build`), a submit's own whole build too, its commit owed durably in the submit's
+  transaction and made at the build's end from what it staged (BUILT 2026-11-20, `vcs_store::owed`), a whole map's
+  release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name; its copies and symbolic links owed); Mercurial's manifests by the
   same rule.
@@ -54845,6 +54855,20 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   stack (`crates/cli/bench/svn_history_mem.sh`, three runs each, identical): the content history 50.3 MiB before,
   2.0 MiB after; everything under `Green::commit` 285.1 MiB before, 200.0 MiB after (85.1 MiB, 30%, less). A-723's
   234.8 MiB was that `Green::commit` row, mostly the current files' blocks, which stay.
+- **Part 4, the honest charge (main's ruling of 2026-11-20).** A block chunk counts its whole block, and a value's own
+  block (`Value::own`, the current file's while the value is its path's latest) is the only part counted as current;
+  the seal now touches that block alone and clears it, and `seal_latest` moves its length from current to history. The
+  reservation is one rule (`Green::superseded_bytes`): the superseded value's list and what it keeps of its own block,
+  so it equals what the commit retains (`short_edits_and_unlinks_reserve_the_values_they_supersede`: a 1-byte edit of a
+  2 KiB file reserves and retains 2,072 bytes, 25 before). The small-edits test retains the earlier file once (at least
+  64 KiB, under two copies); folded to the head, 0. Measured on the 1,000-revision import: the owner shard's committed
+  bytes after it are 646,696,952 with and without part 4, three runs each, since the service folds this green's
+  history as it imports (no reader holds a version), so nothing is retained at rest either way; the charge rises only
+  where a reader holds history. `slates status --json` does not print a shard's `retained_bytes`, so the charge is not
+  readable from outside (owed). macOS arm64, Mac Studio, local: `slates-merge --lib` 223 of 223; integration `engine`,
+  `special`, `checkpoint`, `chain_replay`, `rebase`, `splice`, `verdict`, `base_for`, `derive`, `increment`, `identity`,
+  `map`, `origin`; `slates-server --test green_retention`, `--lib merge_service` 14 of 14; fmt clean.
+
 
 
 ### A-726 — `svn blame` and `svn diff` over HTTP: the `file-revs-report` and `get-locations` served through the DAV site (2026-11-20, w-reaper, UI goal 93; §4.17.4 item 5 "HTTP"; A-681, A-627, A-613)
@@ -54945,4 +54969,106 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   its_path_in_svnserves_words`, `a_lock_runs_pre_lock_for_its_token_and_post_lock_after_it_as_svnserve_does`,
   `an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` (a file committed from stock `svn`'s recorded delta);
   `slates-svn` `serve::` and `commit::` (stock `svnserve`'s recorded lock sessions replayed through the four calls).
-- **Owed.** Part 3: the `svn+ssh://` tunnel. The revprop hooks' calls with A-702 part 2 (w-svn). DAV's LOCK, UNLOCK and commits.
+- **Part 3 (same day): the `svn+ssh://` tunnel.** `vcs_svn::run_hook` takes a `HookSite`: the listener's connection
+  (its repository's policy read on the owner shard, `ClientGone` its hang-up) or the tunnel's repository policy (no
+  hang-up signal on the SSH edge yet). The tunnel's steps await its hooks: start-commit and pre-commit, post-commit,
+  and the lock verbs' through `vcs_svn::pre_lock_hooks` and `post_lock_hook`. Tests:
+  `vcs_ssh::svn::tests::a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`,
+  `a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them` (the tunnel driven on a runtime of its own).
+- **Owed.** The SSH edge's signal of the client gone, for a hook's run. The revprop hooks' calls with A-702 part 2
+  (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view.
+
+### A-664 live whole builds, part 1 — A push's whole map built in slices after its answer, the submits that need it parked (2026-11-20, w-shared for UI goal 93; main's ruling (a))
+- **Why.** A push that leaves a git green with no map of the version before (its first push, one past a copy) built
+  the whole head's map and trees in the push's own step: every file hashed as git's blob, then the map and trees. A
+  large repository's first push was one step as long as that build, which the watchdog judges a stuck shard (CLAUDE.md
+  §3 "Bounded work everywhere"). A push carries its own commits, so its answer needs no map.
+- **Change.** `paths::advance_after_push`, from the push's apply: a step that would build whole (`needs_whole`, read over
+  the change alone) begins a build instead (`paths::whole_build::start`): a record of the head's paths kept in the
+  store, one a green, driven by a task of the shard a slice at a time (each slice puts files, one a unit, lent the room
+  each brings, until the shard's step budget is spent, then yields), whose end builds the map and trees of what was put
+  (`Plan::Put`) and keeps them as the green's head. A push to the green meanwhile starts it again at the new head. A
+  submit to the green while it runs is parked (`verbs::ParkedSubmit`: an owner's step asked from a work's shard, or the
+  verb on the green's shard), its request deferred as a waiting acceptance is, a retry joining its entry, bounded by the
+  shard's client credit and refused `Overloaded` past it; the build's end runs each again in its own transaction, in
+  order, and answers it on its route (`verbs::resume_all`). Freeing the repository gives the build's holds back and
+  runs its parked submits.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::commits::tests::t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer` (answered with no map
+  and the build under way; more slices than one; the pushed tree kept, built once) and
+  `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build` (a recorded submit parked during the build, the green
+  still at the pushed version; at its end, run again: version 2, its commit made over the kept map). The push tests
+  drive a push's build to its end before reading the store (`whole_build::settle`). `cargo test --locked -p
+  slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities:: --test-threads=4`
+  143 of 143; fmt clean.
+- **Owed.** Part 2: a submit's own whole build (a green's first submit, one past a copy) with its made commit owed
+  durably in the submit's transaction (main's ruling: replay reads no clock, the completion settles the owed entry,
+  one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
+  restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
+  (main's).
+
+### A-719 part 4 — A push is decided a command a step (bug, 2026-11-20, w-git for UI goal 93; found by use by w-perf: stock git 2.50.1's push of all of git/git, 1,027 refs, into a release slates over `--vcs-http` spun shard 10, 1,046 ms of CPU without a step, the anchor killed the daemon and git hung on `unable to rewind rpc post data`; §4.17.1 "A push's intake", rule 3)
+- **Change.** `slates_git::receive::Deciding`: a checked push decided a command at a time; without `atomic` each step
+  judges one command and, accepted, appends it; under `atomic` each step judges one, then one step appends all or none.
+  `decide` runs the same machine whole. `Session::take_checked` hands a checked push over. The server's push answers
+  through `AnswerState::Deciding` (`git_push::DecidingPush`): one step of the decision an answer step, `Turned` between,
+  with or without hooks (`post-receive` follows the last).
+- **Tests.** `slates-server` `git_push::tests::t_a719_a_push_is_decided_a_command_a_step` (forty branch creates: every
+  one `ok`, at least a step a command while it is decided; red with the decision made whole, 0 such steps);
+  `vcs_http::daemon_edge::tests::a_push_of_a_long_history_and_many_branches_lands_every_ref_through_the_daemons_edge`
+  (3,000 commits and a hundred branches through the daemon's edge, every ref `ok`, the watchdog armed). A step's wall
+  time is not asserted: on this Mac at a load average of 71 it measured the host (a debug step of the whole decision
+  1.09 s; of the stepped one's checks 0.4 to 1.7 s).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- receive::
+  protected_fixtures store::` 138 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- git_push::
+  git_hooks:: git_protect vcs_http::git:: vcs_http::daemon_edge:: vcs_ssh::receive vcs_ssh::tests::receive
+  vcs_ssh::tests::git vcs_store::` 105 of 105; fmt clean.
+- **Owed (A-722, main's ruling 2026-11-20).** What still runs whole in one step, measured on a 9,000-object push
+  (debug): the first append's commit of every object into the index (159 ms), each append's moves' admission (54 ms)
+  and the seal (26 ms); the walk's propagation. A-722 stages the index rows a slice at a time as objects land, so the
+  append only makes them visible, and slices the moves' admission and the seal. git/git by use (w-perf's
+  `git_scale.sh`) after it.
+
+### A-664 live whole builds, part 2 — A submit whose map is built whole owes its commit durably, made at the build's end from what it staged (2026-11-20, w-shared for UI goal 93; main's ruling (a) and its three requirements)
+- **Why.** A green's first submit, or one past a copy, built the whole head's map in its own step, which part 1 moved
+  off the shard's steps for a push. A submit's commit is made over that map, so moving the build defers the commit past
+  the version's own transaction; what makes it (message, identity, the owner's second) lived only in the submit's step,
+  and a restart between the two would have left the version with no commit.
+- **Change.** `commits::after_submit`, from `verbs::judge_submission`: where the step would build whole
+  (`paths::needs_whole`), the submit stages an owed commit (`vcs_store::owed::Owed`: the green's key and version, the
+  second, the message and the identity; magic "SGOC", typed refusals) in its own transaction, as an entry of the register
+  holding it alone, then begins the build (`paths::whole_build::start`). The build's end keeps the map, then makes the
+  commit from the staged record alone, never the clock (`commits::make_owed`, in a transaction of its own), before the
+  submits parked behind it run. The made commit's move of the green to that version settles it (`commit_moves`, live and
+  in a replay alike). A replay restores an owed record no made commit settled (`replay_git`), and a store made again
+  (`make_whole`, a recovery) starts its build again, which, the map made again already, makes the commit alone
+  (`whole_build::resume_owed`). One owed a green: submits to a green whose build runs are parked (part 1).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `vcs_store::owed::tests::an_owed_commit_reads_back_whole_and_refuses_every_damaged_form` (every cut `Short` or
+  `Foreign`, a trailing byte, a push record's magic); `vcs_store::commits::tests::
+  t_a664_owed_a_first_submits_commit_is_owed_then_made_at_its_staged_second` (owed and staged, none made; then made at
+  the staged second with its message, nothing owed); `t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_record`
+  (main's determinism rule: two restarts before the build ends, then the commit's text exactly the staged record's
+  over its tree, and a store made again after it lists the same commit and owes nothing). The submit tests drive a
+  first submit's build to its end (`whole_build::settle`); a commit git refuses leaves its owed record in the register
+  until the next made commit settles it. `cargo test --locked -p slates-server --lib -- vcs_store:: repository::
+  git_push:: vcs_http::git work_home:: identities:: --test-threads=4` 148 of 148; fmt clean.
+- **Owed.** The push storm (a build moved to the newest head at a slice boundary, never restarted; main's next); a
+  parked submit's wait bounded by the failover delay; a whole map's release sliced.
+
+### A-722 part 1 — A repository's index adopts a fork whole (2026-11-20, w-git for UI goal 93; main's ruling on A-722's design, points 1 and 5; §4.17.1 "A push's intake", rules 1 and 4)
+- **The design (A-722, approved 2026-11-20).** A push stages its index rows in its own fork of the repository's index
+  as its objects land (concurrent pushes each their own fork), positions taken as each object arrives with readers
+  tolerating holes (no compaction at landing); commit rows and generation numbers in a sliced pass after the pack; the
+  moves' admission sliced before the append; the landing (the register append, ordered per repository) adopts the
+  fork's runs in O(runs) with the staged values, O(changes); a fork the parent outran is re-based in slices first;
+  admission the push's window and post-state on `vcs_share::room`. Then (ruling B) the index resolves an id to its
+  place in the stored pack and readers decode in place; head files come from the green.
+- **Change (this part).** `slates_vcs::Index::adopt`: a parent takes in a fork of itself whole, the fork's tail sealed
+  into tables of its own, its holds on the runs it took from the parent given back, and its own runs added as the
+  parent's newest: no row copied, no table written but the tail's. A fork records the runs it took and its parent's
+  count of rows taken in (`Index::fork`); a parent that took in rows since is refused `AdoptRefused::Stale` and an index
+  made by no fork `NotAFork`, the fork handed back whole.
+- **Tests.** `slates-vcs` `tests::a_parent_adopts_its_forks_rows_and_refuses_a_stale_fork`.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-vcs --lib` 92 of 92; fmt clean.
+- **Owed.** The rest of A-722 above.

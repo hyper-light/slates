@@ -116,6 +116,9 @@ pub(crate) fn version_saying(
     assert!(!matches!(reply, ReplyBody::Refused { .. }), "{reply:?}");
   }
   let submitted = ask(state, crate::identities::authored(work, message));
+  // A green's first submit owes its commit and builds its map in slices after it (A-664's live whole builds, part 2),
+  // by a task a test's step never runs: driven to its end here, so the test reads the store as the build leaves it.
+  super::whole_build::settle(state);
   let ReplyBody::Submitted {
     version: Some(version),
     ..

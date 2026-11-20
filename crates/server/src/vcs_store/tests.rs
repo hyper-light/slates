@@ -1302,13 +1302,42 @@ pub(crate) fn appended(
   changes: Vec<BranchChange>,
   sealed: (&mut super::SealedPush, &[StoreMove]),
 ) -> Result<Appended, crate::repository::push::AppendRefused> {
-  crate::repository::push::push_sealed(
+  let appended = crate::repository::push::push_sealed(
     state,
     (&owner(), repository),
     changes,
     EntryParts::default(),
     sealed,
+  );
+  // A push's whole map is built by a task of the shard (A-664's live whole builds), which a test's step never runs:
+  // driven to its end here, so the test reads the store as the build leaves it.
+  crate::vcs_store::paths::whole_build::settle(state);
+  appended
+}
+
+/// [`push_through`] with the push's whole map left to its build's task (A-664's live whole builds), as a push leaves it
+/// when it is answered: the build is under way, not driven.
+pub(crate) fn push_unsettled(
+  state: &mut ShardState,
+  (repository, green): (RepositoryId, DbVolumeId),
+  objects: &[Brought],
+  (base, head, tree_id): (Option<ObjectId>, ObjectId, ObjectId),
+) {
+  let push = begun(state, repository, objects);
+  let version = state.greens.get(&green).expect("the green's engine").head();
+  let built = work_of(state, (&push, green), (version, base), (head, tree_id));
+  let mut sealed = push.seal(state).expect("sealed");
+  let changes = vec![BranchChange::Update { green, work: built }];
+  let moves = [(Target::Green(green), Some(head))];
+  crate::repository::push::push_sealed(
+    state,
+    (&owner(), repository),
+    changes,
+    EntryParts::default(),
+    (&mut sealed, &moves),
   )
+  .expect("appended");
+  sealed.abandon(state);
 }
 
 /// One push through the shard: `objects` admitted, the work from `base` to the commit's tree, the push sealed with its

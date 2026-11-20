@@ -66,26 +66,22 @@ pub(crate) const PIECE_BYTES: usize = size_of::<Piece>();
 enum Source {
   /// Bytes the history owns.
   Owned(Vec<u8>),
-  /// A file's block, of which the chunk holds one holder, its length (a block never changes), and what the chunk is
-  /// charged.
+  /// A file's block, of which the chunk holds one holder, and its length (a block never changes): the bytes the chunk
+  /// keeps alive, all of which it counts (A-728 part 4, the honest charge).
   Block {
     /// The block.
     block: Block,
     /// Its length.
     len: usize,
-    /// The bytes the chunk counts in the history's charge: the runs of the block the value it was made for names (the
-    /// whole block for a value named whole, a splice's added runs otherwise), so a splice's chunk is charged what the
-    /// copy it replaces was, and admission's reservation (`Green::history_reservation`) is unchanged by it.
-    charge: usize,
   },
 }
 
 impl Source {
-  /// The bytes the chunk counts: an owned chunk's length, a block's charge.
+  /// The bytes the chunk counts: an owned chunk's length, a block's whole length.
   fn len(&self) -> usize {
     match self {
       Source::Owned(bytes) => bytes.len(),
-      Source::Block { charge, .. } => *charge,
+      Source::Block { len, .. } => *len,
     }
   }
 
@@ -242,6 +238,10 @@ pub(crate) struct Value {
   pieces: Vec<Piece>,
   /// The value's length.
   len: usize,
+  /// While the value is its path's latest, the chunk naming the file's current block and that block's length: the
+  /// bytes the value shares with the current file, counted as current, not history (A-728 part 4). Cleared when a
+  /// change supersedes it ([`Value::seal`]).
+  own: Option<(usize, usize)>,
 }
 
 /// A run of the value being built: one of the previous value's, or bytes of `next` the ops added.
@@ -335,16 +335,40 @@ impl Value {
       blocks.release(block);
       return Value::default();
     }
-    let chunk = chunks.add_source(Source::Block {
-      block,
-      len,
-      charge: len,
-    });
+    let chunk = chunks.add_source(Source::Block { block, len });
     chunks.retain(chunk);
     Value {
       pieces: vec![Piece { chunk, at: 0, len }],
       len,
+      own: Some((chunk, len)),
     }
+  }
+
+  /// The length of the file block the value shares while it is its path's latest, the bytes counted as current (none
+  /// once superseded, or for a value naming no block of its own).
+  pub(crate) fn own_len(&self) -> usize {
+    self.own.map_or(0, |(_, len)| len)
+  }
+
+  /// What the history keeps of the value's own block once a change supersedes it ([`Value::seal`]), as the reservation
+  /// counts it before the verdict: the whole block when the value names all of it or `others` (holders beyond the map
+  /// and the history) keep it, else the runs it names, which the seal copies out. None for no own block.
+  pub(crate) fn kept_when_superseded(&self, others: bool) -> usize {
+    let Some((chunk, len)) = self.own else {
+      return 0;
+    };
+    let named = self.named_of(chunk);
+    if others || named >= len { len } else { named }
+  }
+
+  /// The bytes of the value's pieces in `chunk`.
+  fn named_of(&self, chunk: usize) -> usize {
+    self
+      .pieces
+      .iter()
+      .filter(|piece| piece.chunk == chunk)
+      .map(|piece| piece.len)
+      .fold(0usize, usize::saturating_add)
   }
 
   /// Whether the value is `block` whole, named as its one chunk (A-728).
@@ -371,6 +395,7 @@ impl Value {
     Value {
       pieces: vec![Piece { chunk, at: 0, len }],
       len,
+      own: None,
     }
   }
 
@@ -567,20 +592,15 @@ impl Value {
         }
       }
     }
-    let added: usize = pending
+    let named = pending
       .iter()
-      .map(|run| match run {
-        Pending::Added { len, .. } => *len,
-        Pending::Shared(_) => 0,
-      })
-      .fold(0usize, usize::saturating_add);
-    let named = (added > 0).then(|| {
-      chunks.add_source(Source::Block {
-        block,
-        len: next.len(),
-        charge: added,
-      })
-    });
+      .any(|run| matches!(run, Pending::Added { .. }))
+      .then(|| {
+        chunks.add_source(Source::Block {
+          block,
+          len: next.len(),
+        })
+      });
     let mut value = Value::default();
     for run in pending {
       let piece = match run {
@@ -594,50 +614,39 @@ impl Value {
       };
       value.push(chunks, piece);
     }
+    value.own = named.map(|chunk| (chunk, next.len()));
     Some((value, named.is_some()))
   }
 
-  /// Seals this value as a later change supersedes it (module docs, "A splice's added bytes are the new block's"): each
-  /// chunk only this value names, whose block only the history holds, and of which it names less than the whole, is cut
-  /// to the runs it names, copied into one owned chunk, and its block let go. The bytes copied.
+  /// Seals this value as a later change supersedes it (module docs, "A splice's added bytes are the new block's"): its
+  /// own block, which the map has let go, is no longer the current file's, and when only the history holds it and the
+  /// value names less than the whole, it is cut to the runs the value names, copied into one owned chunk, and the block
+  /// let go. Kept otherwise (named whole, or held elsewhere). The bytes copied ([`Value::kept_when_superseded`] says
+  /// what stays).
   pub(crate) fn seal(&mut self, chunks: &mut Chunks, blocks: &mut Blocks) -> usize {
-    let mut copied = 0usize;
-    let mut distinct: Vec<usize> = self.pieces.iter().map(|piece| piece.chunk).collect();
-    distinct.sort_unstable();
-    distinct.dedup();
-    for chunk in distinct {
-      let mine = self
-        .pieces
-        .iter()
-        .filter(|piece| piece.chunk == chunk)
-        .count();
-      let named: usize = self
-        .pieces
-        .iter()
-        .filter(|piece| piece.chunk == chunk)
-        .map(|piece| piece.len)
-        .fold(0usize, usize::saturating_add);
-      let Some(Some((Source::Block { block, len, .. }, refs))) = chunks.slots.get(chunk) else {
-        continue;
-      };
-      if *refs != mine || named >= *len || blocks.holders(*block) != 1 {
-        continue;
-      }
-      let mut owned = Vec::with_capacity(named);
-      for piece in self.pieces.iter_mut().filter(|piece| piece.chunk == chunk) {
-        let at = owned.len();
-        owned.extend_from_slice(chunks.bytes_of(blocks, piece));
-        piece.at = at;
-      }
-      let cut = chunks.add(owned);
-      for piece in self.pieces.iter_mut().filter(|piece| piece.chunk == chunk) {
-        piece.chunk = cut;
-        chunks.retain(cut);
-        chunks.release(chunk, blocks);
-      }
-      copied = copied.saturating_add(named);
+    let Some((chunk, len)) = self.own.take() else {
+      return 0;
+    };
+    let named = self.named_of(chunk);
+    let Some(Some((Source::Block { block, .. }, _))) = chunks.slots.get(chunk) else {
+      return 0;
+    };
+    if named >= len || blocks.holders(*block) != 1 {
+      return 0;
     }
-    copied
+    let mut owned = Vec::with_capacity(named);
+    for piece in self.pieces.iter_mut().filter(|piece| piece.chunk == chunk) {
+      let at = owned.len();
+      owned.extend_from_slice(chunks.bytes_of(blocks, piece));
+      piece.at = at;
+    }
+    let cut = chunks.add(owned);
+    for piece in self.pieces.iter_mut().filter(|piece| piece.chunk == chunk) {
+      piece.chunk = cut;
+      chunks.retain(cut);
+      chunks.release(chunk, blocks);
+    }
+    named
   }
 
   /// Appends `piece`, merged into the last when it continues it in the same chunk, and takes its reference.
@@ -932,8 +941,8 @@ mod tests {
   /// W2, A-728. Do: a 1 MiB file, then 64 versions each overwriting 64 bytes of its own range, made as the engine
   /// makes them; then release everything. Expect: the chunks hold the first file's block once (every version shares
   /// it), the 63 superseded versions' 64 bytes each (sealed: copied out once they were history) and the current file's
-  /// block, which the latest names, charged its 64 added bytes; not 64 copies of the file, and no copy of the latest's
-  /// bytes. Nothing is left after the release.
+  /// block, which the latest names; not 64 copies of the file, and no copy of the latest's bytes. Nothing is left after
+  /// the release.
   #[test]
   fn small_overwrites_of_a_large_file_cost_what_they_wrote() {
     const FILE: usize = 1 << 20;
@@ -955,9 +964,8 @@ mod tests {
       bytes = next;
     }
     assert_eq!(chunks.owned_bytes(), (EDITS - 1) * EDIT as usize);
-    // Charged: the first block whole, and every version's 64 bytes (the latest's chunk is its block, charged what it
-    // added, as the copy it replaces was).
-    assert_eq!(chunks.bytes(), FILE + EDITS * EDIT as usize);
+    // Counted honestly (A-728 part 4): the first block, the 63 cut runs, and the current block the latest names.
+    assert_eq!(chunks.bytes(), 2 * FILE + (EDITS - 1) * EDIT as usize);
     assert_eq!(
       files.blocks().live(),
       2,
@@ -1024,31 +1032,41 @@ mod tests {
     third
   }
 
-  /// A-728 part 2. Do: splice a small edit into a file's block, let another holder keep that block (as the identity
-  /// table or a branch's map would), replace the file and seal the value; then let the other holder go and seal again.
-  /// Expect: the first seal copies nothing (the bytes live anyway), the second cuts the value to its 4 added bytes, and
-  /// the value reads back exactly both times.
+  /// A-728 parts 2 and 4. Do: twice, splice a small edit into a file's block and replace the file; the first time
+  /// another holder keeps the spliced block (as the identity table or a branch's map would). Expect what the
+  /// reservation predicts the history keeps (`kept_when_superseded`) to be what it keeps: with another holder, the
+  /// seal copies nothing and the whole 512-byte block stays; without, the seal cuts the value to its 4 added bytes.
+  /// Either way the value reads back and no longer counts a block as current.
   #[test]
   fn a_seal_keeps_a_block_another_holder_keeps() {
     let mut files = Files::default();
-    let first = vec![1u8; 512];
     let mut chunks = Chunks::default();
+    let first = vec![1u8; 512];
     let mut latest = first_value(&mut chunks, &mut files, &first);
     let ops = [op_of(0, 10, 4, 0)];
     let next = apply(&first, &ops, &[2u8; 4]);
-    let mut spliced = version(&mut chunks, &mut files, &mut latest, (&ops, &next));
+    let mut held_spliced = version(&mut chunks, &mut files, &mut latest, (&ops, &next));
     let held = files.hold_block_of("f").unwrap();
-    files.insert("f", vec![3u8; 8]);
-    assert_eq!(spliced.seal(&mut chunks, files.blocks_mut()), 0);
-    assert_eq!(chunks.owned_bytes(), 0);
-    assert_eq!(spliced.materialize(&chunks, files.blocks()), next);
+    files.insert("f", next.clone());
+    assert_eq!(held_spliced.kept_when_superseded(true), 512);
+    assert_eq!(held_spliced.seal(&mut chunks, files.blocks_mut()), 0);
+    assert_eq!((held_spliced.own_len(), chunks.owned_bytes()), (0, 0));
     files.blocks_mut().release(held);
+    let mut latest_again = first_value(&mut chunks, &mut files, &first);
+    let mut cut = version(&mut chunks, &mut files, &mut latest_again, (&ops, &next));
+    files.insert("f", vec![3u8; 8]);
+    assert_eq!(cut.kept_when_superseded(false), 4);
     assert_eq!(
-      spliced.seal(&mut chunks, files.blocks_mut()),
+      cut.seal(&mut chunks, files.blocks_mut()),
       4,
       "cut once nothing else holds it"
     );
-    assert_eq!(spliced.materialize(&chunks, files.blocks()), next);
-    release_all(&mut chunks, &mut files, vec![latest, spliced]);
+    assert_eq!(cut.materialize(&chunks, files.blocks()), next);
+    assert_eq!(held_spliced.materialize(&chunks, files.blocks()), next);
+    release_all(
+      &mut chunks,
+      &mut files,
+      vec![latest, held_spliced, latest_again, cut],
+    );
   }
 }
