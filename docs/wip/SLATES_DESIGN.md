@@ -7425,6 +7425,23 @@ instructions everywhere on the matrix), BLAKE3 identity on bulk chunks (already 
 
 ### 4.10 Distribution: replication under one rule, auto-seal, remote attach, ownership migration, mirroring, anti-entropy (D-14, D-16, D-17, D-18)
 
+**Content homed by identity (A-724 piece 6; main's ruling of 2026-11-20).** The rule below places what an owner
+keeps: a volume's or a repository's register, its ordered landing, its indexes' tails and fences, and its hot set, at
+the owner's candidates by its family (A-636 part 2b-2). A version-control repository's content outside its owner's hot
+set (cold, or past the repository's share, §4.17.5) is placed instead by its identity: rendezvous over the content id,
+by the same weight every placement ranks by (`register::rendezvous_weight_of`), across a node's shards (one home: a
+node's shards share its RAM) and across the region's members (f+1 homes, `candidates_for`'s ranking keyed by the
+content id, no family bit, so identical content across repositories lands on one home set). Such content is fetched by
+identity when read, and it is durable at its homes before any record naming it commits: the order below is unchanged.
+A move moves the register and the hot set only; cold content stays at its identity homes. A successor rebuilding a
+taken-over repository fetches each object by identity from its homes. Content homes follow membership as any id of no
+family does, never an owner's epoch. Homes are computed from the configuration version every message carries; no
+coordination call is added on a write's path (§2 ban 10).
+
+> **Status (2026-11-20).** The node's half is built (A-724 piece 5a, `crate::vcs_store::homes`). Owed: the region's
+> half (f+1 homes, the healer's re-offer keyed by content id) once the fault paths are agreed with w-fed-faults; the
+> read-through and durability seam with A-727's arena (proposed to w-perf).
+
 **Content replication.** Sealed chunks and manifests go to the owner's candidate holders under
 the rule of §4.8: f+1 first, hedged to the rest of the 2f+1 after the measured p95, committed at
 f+1 acknowledgements from any, the acknowledging set recorded in the head record; a chunk
@@ -54761,3 +54778,9 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed.** Part 2: the `mergeinfo-report` and `SVN-Repository-MergeInfo: yes` (`svn blame -g`, `svn merge`). Deltas in
   the svndiff version `Accept-Encoding` prefers. The interop harness copied into `svn_http_reports.rs` folded into one
   module with `svn_interop.rs` once that file's pieces land.
+- **Piece 6, §4.10 amended (2026-11-20, main's ruling).** §4.10 "Content homed by identity": the owner keeps its
+  register, landing, tails, fences and hot set by family placement; a repository's cold content is homed by identity
+  (one weight, a node's shards and f+1 of the region's members), fetched by identity, durable at its homes before any
+  record naming it. Agreed: w-shared (the ranking keyed by content id; a successor's rebuild fetches from homes), main
+  (a move leaves cold content at its homes; no coordination call). Owed: w-fed-faults' answer on fault paths, then the
+  region's half.
