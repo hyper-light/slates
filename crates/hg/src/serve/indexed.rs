@@ -295,6 +295,15 @@ impl<'a> Indexed<'a> {
       return Ok(None);
     };
     let text = match row.block {
+      // A manifest kept as a delta (A-729): its text rebuilt from its chain, charged to the room as a copy is.
+      None if row.base != NONE => {
+        room.charge(row.len)?;
+        let rebuilt = self.index.revision_text(self.store, log, rev);
+        if rebuilt.is_some() {
+          count_lend(&self.lends, false);
+        }
+        rebuilt.map(Cow::Owned)
+      }
       None => lend(self.store, &row.bytes, row.len, &self.lends, room)?,
       Some(block) => framed(self.store, [&block, &row.bytes], row.len, &self.lends, room)?,
     };

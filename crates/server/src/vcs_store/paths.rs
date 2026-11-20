@@ -59,8 +59,8 @@
 //! **Owed** (GAPS, A-664): a submit refused before its verdict when its post-state is one git cannot hold (a named
 //! pipe, a socket, a device, a `.git` name); a live whole build (a push's, a green's first submit's, past a copy) and a
 //! whole map's release sliced a unit at a time, and the map's and trees' build of the put files in slices of their
-//! own; and a copy made through a work, which no client verb makes yet (A-626 part 4), driven through this module's
-//! whole build by a test.
+//! own. A copy made through a work (`WorkOp::Copy`, A-626 part 4) is driven through this module's whole build by
+//! `tests::t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it`.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -195,7 +195,7 @@ pub(crate) fn advance(state: &mut ShardState, green: DbVolumeId, version: u64) {
 /// [`advance`] for a version a push committed (A-664's live whole builds): a version whose map must be built from the
 /// whole head is built in slices by a task of the shard ([`whole_build`]), since a push carries its own commits and
 /// nothing of its answer needs the map; a step over the change runs here, as [`advance`]'s does. A push to a green whose
-/// build is under way starts it again at the new head.
+/// build is under way leaves it alone: it moves to the newest head at its next slice's boundary.
 pub(crate) fn advance_after_push(state: &mut ShardState, green: DbVolumeId, version: u64) {
   if version == 0 {
     return;
@@ -203,7 +203,11 @@ pub(crate) fn advance_after_push(state: &mut ShardState, green: DbVolumeId, vers
   let Some(repository) = git_repository_of(state, green) else {
     return;
   };
-  if whole_build::building(state, green) || needs_whole(state, (repository, green), version) {
+  // A build under way moves to this version at its next slice's boundary ([`whole_build`], "A push meanwhile").
+  if whole_build::building(state, green) {
+    return;
+  }
+  if needs_whole(state, (repository, green), version) {
     whole_build::start(state, repository, green, version);
     return;
   }

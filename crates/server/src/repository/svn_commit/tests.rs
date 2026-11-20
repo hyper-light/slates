@@ -525,6 +525,7 @@ fn t_a655_the_records_are_made_again_from_the_log() {
       .copied()
       .unwrap_or(0);
     crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
     assert_eq!(state.vcs_stores.unrecovered(svn), None);
     assert_eq!(whole(state, (svn, green)), live);
     let count = u64::try_from(logged(state, svn).len()).unwrap();
@@ -626,7 +627,8 @@ const QUARTER_TEXT: usize = SMALL_MERGE_BUDGET / 4;
 /// [`SMALL_MERGE_BUDGET`], land revision 1, then eight revisions each bringing a text a quarter of that budget. Expect:
 /// every revision lands, the register's objects hold more than the merge budget, and the shard's budget charges them:
 /// a repository's content is bounded by what its owner shard can hold (A-662, `vcs_store::settle_objects`), never by
-/// the merge budget the partition's chains share. Before the fix each revision's record was charged to the merge
+/// the merge budget the partition's chains share; and a revision whose entry the chains had no room for checkpointed
+/// its green first and was appended once (A-742's counter moved). Before the fix each revision's record was charged to the merge
 /// budget, so the repository's whole content had to fit in it.
 #[test]
 fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget() {
@@ -646,16 +648,22 @@ fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget
       }
       let held = state.db.partition().repositories().objects_bytes(svn);
       let charged = state.vcs_stores.objects_charged(svn);
+      let checkpointed_first = state
+        .refusals
+        .get(super::CHAIN_ROOM_CHECKPOINTED)
+        .copied()
+        .unwrap_or(0);
       (
         answers,
         held > SMALL_MERGE_BUDGET,
         charged == u64::try_from(held).unwrap_or(0),
+        checkpointed_first > 0,
       )
     },
     |config| config.caps.green_chain_bytes = SMALL_MERGE_BUDGET,
   );
   let expected: Vec<_> = (1..10).map(answered).collect();
-  assert_eq!(landed, (expected, true, true));
+  assert_eq!(landed, (expected, true, true, true));
 }
 
 /// Found by use (w-perf, 2026-11-19, release b705a24c5: a 5,000-revision import's record 3,560 refused `Unpublished`,
@@ -746,6 +754,7 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
       .map(|bytes| matches!(Record::decode(bytes), Ok(Record::Locks(_))))
       .collect();
     crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
     (landed, held, kinds.last().copied(), owner_of(state))
   });
   let alice = Some("alice".to_owned());
@@ -820,4 +829,41 @@ fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
 /// `bytes` as the server's own revision names its text, with its real digests.
 fn real_text(bytes: &[u8]) -> Text {
   slates_svn::commit::drive::text_of(bytes).expect("the digests")
+}
+
+/// A-664's Subversion objects (symbolic links, main's ruling: as svnserve keeps them). Do: make a Subversion repository;
+/// submit a work making `/trunk/a.txt` and a symbolic link `/trunk/l` to `a.txt`. Expect: revision 1 adds `/trunk/l`
+/// as a file whose text is `link a.txt` and whose property list is `svn:special` set to `*` alone, which the records
+/// hold.
+#[test]
+fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "linked");
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let link = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Symlink {
+      path: "/trunk/l".to_owned(),
+      target: "a.txt".to_owned(),
+    });
+    let made = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
+    crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made, link]);
+    let special = b"K 11\nsvn:special\nV 1\n*\nEND\n";
+    let records = state
+      .vcs_stores
+      .subversion_records(svn)
+      .expect("the records");
+    let row = records
+      .index()
+      .changes(1)
+      .ok()
+      .and_then(|rows| rows.iter().find(|row| row.path == "/trunk/l").cloned());
+    let seen = row.map(|row| (row.action, row.kind, row.text, row.properties));
+    let expected = (
+      Action::Add,
+      NodeKind::File,
+      Some(real_text(b"link a.txt")),
+      Some(held(special)),
+    );
+    assert_eq!(seen, Some(expected));
+    assert_eq!(records.content(&identity(special)), Some(&special[..]));
+  });
 }

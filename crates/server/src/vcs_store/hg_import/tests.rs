@@ -67,7 +67,8 @@ fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
       name: name.to_owned(),
       tool,
       format: WireFormat::Sha1,
-      default_branch: "default".to_owned(),
+      // The root's name as the command line spells it (`repository::root_binding`): the first line of `default`.
+      default_branch: "branch:default:0".to_owned(),
       green: None,
     },
   );
@@ -568,7 +569,7 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
       RequestBody::CreateBranch {
         repository: "hg".to_owned(),
         name: "bookmark:one:".to_owned(),
-        from: "default".to_owned(),
+        from: "branch:default:0".to_owned(),
         version: None,
       },
     );
@@ -595,4 +596,51 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
     check_settled(state, id);
     assert_eq!(count(state, LANDING_REFUSED), 1);
   });
+}
+
+/// A-732 (a rebuild's replay: `vcs_store::rebuild` made a Mercurial store again from its records in one step, where a
+/// large repository's records held the shard past the watchdog's window). Do: on a running daemon, import and land the
+/// `states` repository, then rebuild its store; read the store's state at once, then again until the rebuild's task
+/// ends. Expect: at once, the store lent to nothing (rebuilding, not held for a read or a push); after, lent again and
+/// holding the rows the landing left, the replay counted.
+#[test]
+fn t_a732_a_rebuild_replays_a_mercurial_store_a_step_a_turn() {
+  let daemon = crate::daemon::audit_daemon();
+  let (id, landed, during) = crate::daemon::observe_first(&daemon, |state| {
+    let id = created(state, "hg", VcsTool::Mercurial);
+    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
+    let (_, ended) = to_its_end(state, id);
+    assert!(ended.is_ok(), "{ended:?}");
+    assert_eq!(land(state, id), Ok(()));
+    let landed = rows_of(state, id);
+    crate::vcs_store::rebuild(state, id);
+    let during = (
+      state.vcs_stores.rebuilding(id),
+      crate::vcs_store::hg_view::held_here(state, id),
+    );
+    (id, landed, during)
+  });
+  let began = Instant::now();
+  let rebuilding = loop {
+    let rebuilding =
+      crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.rebuilding(id));
+    if !rebuilding || began.elapsed() > TASK_WAIT {
+      break rebuilding;
+    }
+  };
+  let (rows, held) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      rows_of(state, id),
+      crate::vcs_store::hg_view::held_here(state, id),
+    )
+  });
+  daemon.stop();
+  assert_eq!(
+    during,
+    (true, false),
+    "the store was lent while it was made again"
+  );
+  assert!(!rebuilding, "still rebuilding after {TASK_WAIT:?}");
+  assert!(held);
+  assert_eq!(rows, landed);
 }

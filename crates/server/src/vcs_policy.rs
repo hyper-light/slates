@@ -1736,6 +1736,7 @@ mod tests {
     rules: Vec<slates_db::catalog::PolicyRule>,
   ) -> super::RepositoryRecord {
     super::RepositoryRecord {
+      index_bits: 0,
       id: slates_db::catalog::RepositoryId { bytes: [0; 16] },
       name: "repository".to_owned(),
       tool,

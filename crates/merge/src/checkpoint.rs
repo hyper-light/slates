@@ -254,11 +254,21 @@ impl Checkpoint {
     self.copied.canonicalize();
   }
 
-  /// The canonical bytes (module docs). Canonicalizes a copy first.
+  /// The canonical bytes (module docs). Canonicalizes a copy first; a caller done with the checkpoint calls
+  /// [`Checkpoint::into_encoded`], which copies nothing.
   pub fn encode(&self) -> Vec<u8> {
-    let mut canonical = self.clone();
-    canonical.canonicalize();
-    let mut out = Vec::new();
+    self.clone().into_encoded()
+  }
+
+  /// The canonical bytes of this checkpoint, given up: canonicalized in place and written into one buffer reserved at
+  /// the tables' exact size (A-742: a checkpoint is a green's whole changed state, and the copy and the growth
+  /// from an empty buffer were 314 MiB of large temporaries in a 1,000-revision import).
+  pub fn into_encoded(mut self) -> Vec<u8> {
+    let mut canonical = {
+      self.canonicalize();
+      self
+    };
+    let mut out = Vec::with_capacity(canonical.tables_len());
     out.extend_from_slice(&MAGIC.to_le_bytes());
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&canonical.version.to_le_bytes());
@@ -292,6 +302,66 @@ impl Checkpoint {
       None => out.push(ABSENT),
     }
     out
+  }
+
+  /// The bytes [`Checkpoint::into_encoded`] writes, exactly: the fixed words, the accepted and signature records, the
+  /// changed keys' tables (the most of a checkpoint by far), the copies' section and the sum.
+  fn tables_len(&self) -> usize {
+    let changed = tables_len(TableRefs {
+      files: &self.files,
+      dirs: &self.dirs,
+      modes: &self.modes,
+      symlinks: &self.symlinks,
+      hardlinks: &self.hardlinks,
+      specials: &self.specials,
+      xattrs: &self.xattrs,
+    });
+    let identity = size_of::<[u8; 32]>();
+    let accepted = self
+      .accepted
+      .len()
+      .saturating_mul(identity.saturating_add(size_of::<u64>()));
+    let signature = size_of::<u64>().saturating_add(2).saturating_add(identity);
+    let signatures = self.signatures.len().saturating_mul(signature);
+    // The copies' section past its presence byte, written only where the checkpoint holds a copy (`encode_copies_into`).
+    let none = self.copies.is_empty() && self.copied == Tables::default();
+    let copies = if none { 0 } else { self.copies_len() };
+    let sum = self.sum.as_ref().map_or(0, |sum| sum.bytes().len());
+    let head_check = self
+      .head_check
+      .map_or(0, |_| size_of::<u64>().saturating_add(identity));
+    [
+      changed,
+      accepted,
+      signatures,
+      copies,
+      sum,
+      head_check,
+      HEADER_BYTES,
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
+  }
+
+  /// The bytes of the copies' section past its presence byte: the records and the copied tables.
+  fn copies_len(&self) -> usize {
+    self
+      .copies
+      .iter()
+      .map(|record| {
+        [
+          WORD,
+          record.destination.len(),
+          size_of::<u64>(),
+          WORD,
+          record.source.len(),
+          size_of::<u64>(),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
+      })
+      .fold(WORD, usize::saturating_add)
+      .saturating_add(tables_len(TableRefs::of(&self.copied)))
   }
 
   /// The copies' section (module docs): a presence byte and, present, the copies' records and the copied tables. Written
@@ -488,6 +558,78 @@ fn put_table<K, V>(
       None => out.push(ABSENT),
     }
   }
+}
+
+/// Format: a count or length prefix, a `u32` ([`put_count`]).
+const WORD: usize = size_of::<u32>();
+
+/// Format: the fixed words around a checkpoint's tables: magic and version (two `u32`), the checkpoint's version (a
+/// `u64`), the accepted and signature counts (two `u32`), and the copies', the sum's and the head check's presence
+/// bytes.
+const HEADER_BYTES: usize = 4 + 4 + 8 + 4 + 4 + 1 + 1 + 1;
+
+/// The seven tables of keys, borrowed, whether a checkpoint's own fields or a [`Tables`].
+struct TableRefs<'a> {
+  files: &'a [Changed<String, Vec<u8>>],
+  dirs: &'a [Changed<String, ()>],
+  modes: &'a [Changed<String, u32>],
+  symlinks: &'a [Changed<String, String>],
+  hardlinks: &'a [Changed<String, String>],
+  specials: &'a [Changed<String, SpecialNode>],
+  xattrs: &'a [Changed<(String, String), Vec<u8>>],
+}
+
+impl<'a> TableRefs<'a> {
+  /// `tables`' seven tables.
+  fn of(tables: &'a Tables) -> TableRefs<'a> {
+    TableRefs {
+      files: &tables.files,
+      dirs: &tables.dirs,
+      modes: &tables.modes,
+      symlinks: &tables.symlinks,
+      hardlinks: &tables.hardlinks,
+      specials: &tables.specials,
+      xattrs: &tables.xattrs,
+    }
+  }
+}
+
+/// The bytes [`Tables::encode_into`] writes for `tables`.
+fn tables_len(tables: TableRefs<'_>) -> usize {
+  let text = |key: &String| WORD.saturating_add(key.len());
+  let bytes = |value: &Vec<u8>| WORD.saturating_add(value.len());
+  [
+    table_len(tables.files, text, bytes),
+    table_len(tables.dirs, text, |()| 0),
+    table_len(tables.modes, text, |mode: &u32| size_of_val(mode)),
+    table_len(tables.symlinks, text, text),
+    table_len(tables.hardlinks, text, text),
+    table_len(tables.specials, text, |node| node.encode().len()),
+    table_len(
+      tables.xattrs,
+      |(path, name): &(String, String)| text(path).saturating_add(text(name)),
+      bytes,
+    ),
+  ]
+  .into_iter()
+  .fold(0usize, usize::saturating_add)
+}
+
+/// The bytes [`put_table`] writes for `table`, given each key's and value's encoded length.
+fn table_len<K, V>(
+  table: &[Changed<K, V>],
+  key: impl Fn(&K) -> usize,
+  value: impl Fn(&V) -> usize,
+) -> usize {
+  table
+    .iter()
+    .map(|entry| {
+      key(&entry.key)
+        .saturating_add(size_of::<u64>())
+        .saturating_add(1)
+        .saturating_add(entry.value.as_ref().map_or(0, &value))
+    })
+    .fold(WORD, usize::saturating_add)
 }
 
 /// The inverse of [`put_table`]: a presence byte other than [`PRESENT`] or [`ABSENT`] is refused, and so is a key the

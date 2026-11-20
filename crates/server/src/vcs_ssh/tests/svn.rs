@@ -343,6 +343,7 @@ impl Repositories for Held {
       _ => return None,
     };
     Some(RepositoryRecord {
+      index_bits: 0,
       id,
       name: name.to_owned(),
       tool,
@@ -524,17 +525,17 @@ impl SvnStores for Lends {
     )
   }
 
-  fn land_locks(
+  fn land_record(
     &mut self,
     id: RepositoryId,
     _principal: &Principal,
-    entries: Vec<slates_svn::lock::LockEntry>,
+    record: slates_svn::commit::record::Record,
   ) -> Option<Result<(), Unlanded>> {
     if !self.holds(id) {
       return None;
     }
     let mut next = self.created.current.get().clone();
-    Some(match next.apply_lock_entries(&entries) {
+    Some(match next.commit_record(record) {
       Ok(()) => {
         self.created.current.set(Box::leak(Box::new(next)));
         Ok(())
@@ -1189,7 +1190,7 @@ fn commit_under_hooks(hooks: Vec<slates_db::catalog::HookConfig>) -> (Answered, 
     owner: principal(OWNER),
     hooks,
   };
-  let services = SvnServices::new(NotYet, held.clone(), lends.clone(), BOUNDS);
+  let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
   let mut site = ToolSite::new(NoKeys, held, services);
   let Dispatched::Run(mut command) = site.dispatch(&principal(OWNER), &Asked::Subversion, None)
   else {

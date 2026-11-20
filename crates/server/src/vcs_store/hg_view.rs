@@ -94,9 +94,17 @@ impl HgStores for ServedViews {
   }
 }
 
+/// [`held`], for the tests.
+#[cfg(test)]
+pub(crate) fn held_here(state: &ShardState, id: RepositoryId) -> bool {
+  held(state, id)
+}
+
 /// Whether repository `id`'s Mercurial store is held here with no import filling it.
 fn held(state: &ShardState, id: RepositoryId) -> bool {
-  state.vcs_stores.mercurial_ref(id).is_some() && !state.vcs_stores.importing(id)
+  state.vcs_stores.mercurial_ref(id).is_some()
+    && !state.vcs_stores.importing(id)
+    && !state.vcs_stores.rebuilding(id)
 }
 
 /// Runs `step` over repository `id`'s view, made within `room` from what `state` holds now; none when it is not lent

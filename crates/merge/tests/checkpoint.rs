@@ -104,6 +104,10 @@ proptest! {
     }
     let checkpoint = green.checkpoint(at).expect("a checkpoint at or below the head, at or above the floor");
     prop_assert_eq!(&Checkpoint::decode(&checkpoint.encode()).unwrap(), &checkpoint);
+    // A-742: given up, the same bytes in a buffer reserved at their exact length.
+    let given_up = checkpoint.clone().into_encoded();
+    prop_assert_eq!(given_up.capacity(), given_up.len());
+    prop_assert_eq!(given_up, checkpoint.encode());
     let mut restored = Green::restore(origin_of(&origin_rows), &checkpoint);
     prop_assert_eq!(restored.head(), at);
     for version in 0..=head {

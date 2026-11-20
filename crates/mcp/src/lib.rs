@@ -2160,6 +2160,33 @@ fn group_json(g: &GroupReport) -> Value {
   })
 }
 
+/// Format: the prefix of a shard's content-range figures among its counters (A-744; the server's
+/// `content_ranges::PREFIX`): `content_range.<range>.<figure>`.
+const CONTENT_RANGE_PREFIX: &str = "content_range.";
+
+/// A shard's slice of the anchor content object, range by range (A-744): `{range: {figure: bytes}}` from its
+/// `content_range.<range>.<figure>` counters, the figures `bytes`, `resident`, `modified` (where the OS says) and the arena's
+/// `allocated`.
+fn content_ranges_json(counters: &[slates_ipc::protocol::RefusalCount]) -> Value {
+  let mut ranges = serde_json::Map::new();
+  for counter in counters {
+    let Some(rest) = counter.kind.strip_prefix(CONTENT_RANGE_PREFIX) else {
+      continue;
+    };
+    let Some((range, figure)) = rest.split_once('.') else {
+      continue;
+    };
+    if let Some(entry) = ranges
+      .entry(range.to_owned())
+      .or_insert_with(|| json!({}))
+      .as_object_mut()
+    {
+      entry.insert(figure.to_owned(), json!(counter.count));
+    }
+  }
+  Value::Object(ranges)
+}
+
 /// One shard's block of the daemon's status as JSON (§4.14): the fields the text form prints per
 /// shard, its health signals, and its telemetry drain when gathered.
 fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
@@ -2168,7 +2195,13 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "clients": s.clients,
     "volumes": s.volumes,
     "served": s.served,
-    "refusals": s.refusals.iter().map(|r| json!({ "kind": r.kind, "count": r.count })).collect::<Vec<_>>(),
+    "refusals": s
+      .refusals
+      .iter()
+      .filter(|r| !r.kind.starts_with(CONTENT_RANGE_PREFIX))
+      .map(|r| json!({ "kind": r.kind, "count": r.count }))
+      .collect::<Vec<_>>(),
+    "content_ranges": content_ranges_json(&s.refusals),
     "replayed_records": s.replayed_records,
     "replay_ns": s.replay_ns,
     "torn_tail": s.torn_tail,
@@ -2176,8 +2209,10 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "locked_bytes": s.locked_bytes,
     "reserve_bytes": s.reserve_bytes,
     "committed_bytes": s.committed_bytes,
+    "retained_bytes": s.retained_bytes,
     "version_slots": s.version_slots,
     "committed_versions": s.committed_versions,
+    "retained_versions": s.retained_versions,
     "signals": s.signals.iter().map(signal_json).collect::<Vec<_>>(),
     "spans_held": s.spans_held,
     "spans_dropped": s.spans_dropped,

@@ -373,7 +373,7 @@ pub(super) fn before<P: PresentView>(
             room_of(&push.admission),
           );
           push.answer = AnswerState::Hooking(Box::new(hooking));
-          return Ok(Answering::Hook(call));
+          return Ok(Answering::Hook(Box::new(call)));
         }
         hooking.hooks.close(state, &mut push.presenter);
         not_run(
@@ -547,7 +547,7 @@ pub(super) fn observe<P: PresentView>(
         room_of(&push.admission),
       );
       push.answer = AnswerState::Observing(Box::new(observing));
-      Ok(Answering::Hook(call))
+      Ok(Answering::Hook(Box::new(call)))
     }
     Turn::NotRun(_) => {
       state.count(POST_RECEIVE_UNACCEPTED, 1);
@@ -559,7 +559,7 @@ pub(super) fn observe<P: PresentView>(
 /// The report's last flush, and the answer.
 fn finish(received: Received, out: &mut impl Out) -> Result<Answering, PushFailed> {
   write_report_end(&received, out).map_err(PushFailed::Exchange)?;
-  Ok(Answering::Answered(received))
+  Ok(Answering::Answered(Box::new(received)))
 }
 
 /// Takes what the hook the last step handed the edge answered (the module docs): its view's showing

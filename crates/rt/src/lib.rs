@@ -45,6 +45,7 @@ pub mod error;
 pub mod futures;
 pub mod held_turn;
 mod interest;
+pub mod label;
 mod netsys;
 pub mod parking;
 // A Windows pipe end on the runtime (A-179): its decisions are pure and tested on every host (`pipe_state`, public on

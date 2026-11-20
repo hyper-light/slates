@@ -200,6 +200,40 @@ fn a_published_ssh_host_seed_is_read_by_every_later_attachment() {
   assert_eq!(successor.issuer_secret().unwrap(), [0u8; 32]);
 }
 
+/// A-740: do record a stuck task as a daemon's watchdog does, through the daemon's attachment, then read it through the
+/// anchor's; then record one whose label passes the record's room with a character across its edge. Expect: none on the
+/// fresh segment; the anchor reading the shard, polls, label and pid the daemon wrote; the long label cut at a
+/// character boundary within the room; and the SSH host key beside it left alone.
+#[test]
+fn a_recorded_stuck_task_is_read_by_the_anchor() {
+  let id = identity();
+  let anchor =
+    AnchorSegment::create(&unique_name("slates-anchor-test-stuck"), &id, geometry()).unwrap();
+  assert_eq!(anchor.stuck_task().unwrap(), None);
+  let (handoff, len) = handoff_of(&anchor);
+  let daemon = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  let task = slates_anchor::StuckTask {
+    pid: 4242,
+    shard: 3,
+    polls: 17,
+    label: "hg_push::record".to_owned(),
+  };
+  daemon.record_stuck_task(&task).unwrap();
+  assert_eq!(anchor.stuck_task().unwrap(), Some(task));
+  let long = format!("{}é", "x".repeat(127));
+  daemon
+    .record_stuck_task(&slates_anchor::StuckTask {
+      pid: 4243,
+      shard: 0,
+      polls: 1,
+      label: long,
+    })
+    .unwrap();
+  let read = anchor.stuck_task().unwrap().unwrap();
+  assert_eq!((read.pid, read.label), (4243, "x".repeat(127)));
+  assert_eq!(anchor.ssh_host_seed().unwrap(), None);
+}
+
 /// A-299: do create a segment and read its launcher secret, publish one as the anchor does before its first daemon, then
 /// read it through a later attachment (a daemon re-attaching the anchor's segment); expect none on the fresh segment, the
 /// later attachment reading the very secret the anchor published, and the issuer secret and the session secret beside

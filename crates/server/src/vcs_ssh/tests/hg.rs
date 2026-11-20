@@ -432,6 +432,7 @@ impl StoreLender for NoGit {
 /// The Mercurial repository `id`, [`HOLDER`]'s, with no rules.
 fn record(id: RepositoryId, name: &str) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id,
     name: name.to_owned(),
     tool: VcsTool::Mercurial,
@@ -1021,7 +1022,7 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
   let terms = (false, HISTORY_PUSH, PUSH_ROOM);
   let prepared =
     hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land(state, (&owner(), id), prepared, &mut room);
+  let landed = hg_push::land(state, (&owner(), id), prepared);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),
     "{landed:?}"

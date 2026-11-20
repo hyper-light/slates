@@ -888,12 +888,26 @@ impl ContentStore {
     if index >= windows {
       return None;
     }
-    let mut height = 0_u32;
-    let mut nodes = windows;
-    while nodes > 1 {
-      nodes = nodes.div_ceil(fanout);
-      height = height.checked_add(1)?;
+    let height = list_levels(windows, fanout)?;
+    let identity = self.window_identity(root, (height, fanout), index)?;
+    let held = self
+      .entries
+      .get(&identity)
+      .filter(|held| held.form == Form::Window)?;
+    match held_window(held) {
+      Some(window) => self.storage.read(window),
+      None => held.here().map(Cow::Borrowed),
     }
+  }
+
+  /// The identity of window `index` under `root`, read down the one list a level of a tree `height` lists deep, each of
+  /// `fanout` children: at each level the child is that level's digit of `index` in the fanout's base.
+  fn window_identity(
+    &self,
+    root: &ContentId,
+    (height, fanout): (u32, u64),
+    index: u64,
+  ) -> Option<ContentId> {
     let mut identity = *root;
     for level in (0..height).rev() {
       let span = fanout.checked_pow(level)?;
@@ -906,14 +920,7 @@ impl ContentStore {
       let to = from.checked_add(IDENTITY_BYTES)?;
       identity = list.here()?.get(from..to).and_then(ContentId::from_slice)?;
     }
-    let held = self
-      .entries
-      .get(&identity)
-      .filter(|held| held.form == Form::Window)?;
-    match held_window(held) {
-      Some(window) => self.storage.read(window),
-      None => held.here().map(Cow::Borrowed),
-    }
+    Some(identity)
   }
 
   /// An object's bytes, read whole from its root, or `None` when the store does not hold its tree whole.
@@ -1109,6 +1116,17 @@ impl<'s> Iterator for Windows<'s> {
       self.stack.push((held.here()?, 0));
     }
   }
+}
+
+/// How many levels of lists sit above `windows` windows, each list naming `fanout` children: none for one window.
+fn list_levels(windows: u64, fanout: u64) -> Option<u32> {
+  let mut height = 0_u32;
+  let mut nodes = windows;
+  while nodes > 1 {
+    nodes = nodes.div_ceil(fanout);
+    height = height.checked_add(1)?;
+  }
+  Some(height)
 }
 
 #[cfg(test)]

@@ -3900,6 +3900,112 @@ impl Client {
     }
   }
 
+  /// Makes branch `name` of repository `repository` at `version` of branch `from`, its head when `None`, its owner asking
+  /// (A-575; `slates repository branch create`): the new branch's green. Refused typed (`NotFound`, `Forbidden`,
+  /// `AlreadyExists` for a name bound, and the version's own refusals).
+  pub fn create_branch(
+    &mut self,
+    repository: &str,
+    (name, from, version): (&str, &str, Option<u64>),
+  ) -> Result<VolumeId, ClientError> {
+    match self.call(&RequestBody::CreateBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      from: from.to_owned(),
+      version,
+    })? {
+      ReplyBody::GreenCreated { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create_branch",
+      }),
+    }
+  }
+
+  /// Binds branch `name` of repository `repository` to `green`, a member of its lineage no name binds (A-575; `slates
+  /// repository branch bind`): what restores a retired branch. Refused typed.
+  pub fn bind_branch(
+    &mut self,
+    repository: &str,
+    name: &str,
+    green: VolumeId,
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::BindBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      green,
+    })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "bind_branch",
+      }),
+    }
+  }
+
+  /// Retires branch `name` of repository `repository`: the name leaves the namespace and its green stays in the lineage
+  /// (A-575; `slates repository branch retire`). Refused typed.
+  pub fn retire_branch(&mut self, repository: &str, name: &str) -> Result<(), ClientError> {
+    match self.call(&RequestBody::RetireBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+    })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "retire_branch",
+      }),
+    }
+  }
+
+  /// Reads repository `repository`'s policy whole, its owner asking (A-622; `slates repository policy`): its version and
+  /// every part. Refused typed (`NotFound`, `Forbidden` for a principal but the owner).
+  pub fn describe_repository_policy(
+    &mut self,
+    repository: &str,
+  ) -> Result<RepositoryPolicy, ClientError> {
+    match self.call(&RequestBody::DescribeRepositoryPolicy {
+      repository: repository.to_owned(),
+    })? {
+      ReplyBody::RepositoryPolicy {
+        version,
+        rules,
+        hooks,
+        hooks_env,
+        signers,
+      } => Ok(RepositoryPolicy {
+        version,
+        rules,
+        hooks,
+        hooks_env,
+        signers,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "describe_repository_policy",
+      }),
+    }
+  }
+
+  /// Sets repository `repository`'s policy whole to `policy`, made from the version `policy.version` names, its owner
+  /// asking (A-622). Refused typed (`PolicyChanged` with the version now when the policy has moved since, `NotFound`,
+  /// `Forbidden`, `Database`, `BadRequest`).
+  pub fn set_repository_policy(
+    &mut self,
+    repository: &str,
+    policy: &RepositoryPolicy,
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::SetRepositoryPolicy {
+      repository: repository.to_owned(),
+      read: policy.version,
+      rules: policy.rules.clone(),
+      hooks: policy.hooks.clone(),
+      hooks_env: policy.hooks_env.clone(),
+      signers: policy.signers.clone(),
+    })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "set_repository_policy",
+      }),
+    }
+  }
+
   /// Re-pins a green attachment to `version`, or to the head (§4.16 `advance`): the version now
   /// pinned and the paths the move invalidated.
   pub fn advance(
@@ -5528,6 +5634,22 @@ fn fs_done(reply: ReplyBody, verb: &'static str) -> Result<u64, ClientError> {
     ReplyBody::FsDone { size } => Ok(size),
     _ => Err(ClientError::UnexpectedReply { verb }),
   }
+}
+
+/// A repository's policy as its owner reads and sets it ([`Client::describe_repository_policy`],
+/// [`Client::set_repository_policy`]; A-622): its version, and every part in the wire's forms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryPolicy {
+  /// The version read, which a set is made from.
+  pub version: u64,
+  /// The rules, in order.
+  pub rules: Vec<slates_ipc::protocol::PolicyRule>,
+  /// The hooks, in order.
+  pub hooks: Vec<slates_ipc::protocol::HookConfig>,
+  /// A Subversion repository's hooks-env sections.
+  pub hooks_env: Vec<slates_ipc::protocol::HooksEnvSection>,
+  /// A git repository's keys trusted to sign its commits.
+  pub signers: Vec<Vec<u8>>,
 }
 
 /// What a repository's import took ([`Client::import_repository`], A-710).

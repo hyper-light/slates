@@ -42,7 +42,7 @@ pub mod supervise;
 
 pub use error::AnchorError;
 pub use layout::{Geometry, RegionKind, RegionSpec};
-pub use segment::{AnchorSegment, Supervision};
+pub use segment::{AnchorSegment, StuckTask, Supervision};
 pub use supervise::{
   ENV_FLEET_SERVE, ENV_NFS_LISTENER, ENV_VCS_HTTP, ENV_VCS_SSH, ENV_VCS_SVN, RestartPolicy, Step,
   StopBounds, Stopping, Supervisor,

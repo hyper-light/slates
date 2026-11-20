@@ -64,6 +64,7 @@ use slates_db::catalog::{
   NameBinding, Principal, RepositoryCheck, RepositoryId, StateChange, StateLog, VcsTool,
   VolumeId as DbVolumeId,
 };
+use slates_hg::changegroup::Version;
 use slates_hg::import::record;
 use slates_hg::index::HgIndex;
 use slates_hg::push::check::{self, CheckRefusal, HeadsArgument, Moment, RACED};
@@ -78,7 +79,7 @@ use slates_hg::push::intake::{self, Intake, Intaken, Rebase, Refused as IntakeRe
 use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::tree::{self, Move};
 use slates_hg::push::verify::{Held, Unverified, Verified};
-use slates_hg::push::{Asks, ChangegroupPart, Outcome as PushOutcome, Unbundle, read_bundle};
+use slates_hg::push::{Asks, Outcome as PushOutcome, Unbundle, read_bundle};
 use slates_hg::serve::Repository;
 use slates_hg::{Admission, Node};
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
@@ -238,6 +239,17 @@ pub(crate) fn line_name(branch: &[u8], number: u32) -> String {
   let mut name = branch_prefix(branch);
   name.push_str(&number.to_string());
   name
+}
+
+/// The namespace's name of a branch the owner's verbs name in a Mercurial repository (A-575; §4.17.1's table: a slates
+/// branch is a bookmark, names one to one): a line's or a bookmark's name as the namespace spells it stays as it is, and
+/// any other name is the bookmark of that name.
+pub(crate) fn owner_name(name: &str) -> String {
+  if line_of(name).is_some() || bookmark_of(name).is_some() {
+    name.to_owned()
+  } else {
+    bookmark_name(name.as_bytes())
+  }
 }
 
 /// The name of the bookmark `name` (module docs).
@@ -1162,7 +1174,6 @@ pub(crate) fn land(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   prepared: Prepared,
-  admission: &mut Admission,
 ) -> Landed {
   let Prepared {
     changes,
@@ -1187,7 +1198,15 @@ pub(crate) fn land(
       released,
     };
   }
-  let Some(Forked { fork, intaken, .. }) = forked else {
+  let Some(Forked {
+    fork,
+    intaken,
+    record: written,
+    changegroup: (version, payload),
+    room,
+    ..
+  }) = forked
+  else {
     let appended = RepositoryLogs::append(state, principal, repository, changes, parts);
     return Landed {
       answer: appended
@@ -1198,11 +1217,14 @@ pub(crate) fn land(
   };
   // The push's record, the revisions it kept written from the fork in the order kept, within the room the landing runs
   // within (A-680 part 2c, A-720); a push that kept none records none.
-  let written = (!intaken.logs.is_empty()).then(|| {
-    vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores)
-      .stores
-      .mercurial_ref(repository)
-      .map(|(content, _)| record::write_kept(&fork, content, &intaken.logs, admission.left()))
+  let revisions = intaken.kept.saturating_add(intaken.passed_over);
+  let written = (!intaken.logs.is_empty()).then(|| match written {
+    Some(record) => Some(Ok(record)),
+    None => Some(record::write_changegroup(
+      room,
+      (version, &payload),
+      revisions,
+    )),
   });
   let record = match written {
     None => None,
@@ -1273,6 +1295,13 @@ pub(crate) struct Forked {
   pub(crate) intaken: Intaken,
   /// The generation of the index the fork was made from (`vcs_store::VcsStores::generation_of`).
   pub(crate) generation: u64,
+  /// Its record, the changegroup as it arrived, written a part a slice before its landing (A-732's writer, A-729 part
+  /// 2); none until written. A re-base keeps it: the changegroup is the same whatever the fork's numbers.
+  pub(crate) record: Option<Vec<u8>>,
+  /// The changegroup as it arrived, its version and bytes: the push's record (A-729 part 2).
+  pub(crate) changegroup: (Version, Vec<u8>),
+  /// The room the push's intake began within, which its record names so a replay's intake runs within it too.
+  pub(crate) room: u64,
 }
 
 /// One `unbundle` on `repository`'s owner shard (module docs, "The driver"; A-720): its `heads` argument judged and its
@@ -1285,18 +1314,20 @@ pub(crate) async fn unbundle(
   (principal, heads, bundle): Pushing<'_>,
   room: &mut Admission,
 ) -> Option<PushOutcome> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::unbundle");
   let fronted = crate::state::with_state(|state| {
     vcs_store::lent_state(state, |state| {
       front(state, repository, (heads, bundle), room)
     })
   });
-  let unbundle = match fronted.flatten()? {
+  let mut unbundle = match fronted.flatten()? {
     Ok(unbundle) => unbundle,
     Err(outcome) => return Some(outcome),
   };
-  let forked = match unbundle.changegroup() {
+  let forked = match unbundle.take_changegroup() {
     None => None,
-    Some((_, part)) => match take_sliced(repository, part, lend_of(bundle), room).await? {
+    Some(changegroup) => match take_sliced(repository, changegroup, lend_of(bundle), room).await? {
       Ok(forked) => Some(forked),
       Err(outcome) => return Some(outcome),
     },
@@ -1305,6 +1336,11 @@ pub(crate) async fn unbundle(
   // (A-720 part 2b), a slice at a time, and the landing tried again.
   let mut forked = forked;
   loop {
+    if let Some(taken) = forked.as_mut()
+      && let Err(outcome) = record_sliced(taken).await?
+    {
+      return Some(outcome);
+    }
     let tried = crate::state::with_state(|state| match forked.take() {
       Some(stale) if is_stale(state, repository, &stale) => Err(Box::new(stale)),
       fresh => Ok(landing(
@@ -1326,6 +1362,47 @@ pub(crate) async fn unbundle(
   }
 }
 
+/// Writes `forked`'s record a part at a time, a yield between slices (A-732's writer; written whole in the landing's one
+/// step, a large push's record held its shard past the watchdog's window): before its landing, so the landing appends
+/// it. Nothing to do where it is written or the push kept nothing; none when the store went away.
+async fn record_sliced(forked: &mut Forked) -> Option<Result<(), PushOutcome>> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::record");
+  if forked.record.is_some() || forked.intaken.logs.is_empty() {
+    return Some(Ok(()));
+  }
+  let unrecorded = || PushOutcome::refused(&abort(UNRECORDED.to_vec()));
+  let (version, payload) = &forked.changegroup;
+  let revisions = forked
+    .intaken
+    .kept
+    .saturating_add(forked.intaken.passed_over);
+  let Ok(mut writer) =
+    record::ChangegroupWriter::begin(forked.room, (*version, payload.len()), revisions)
+  else {
+    return Some(Err(unrecorded()));
+  };
+  loop {
+    let written = crate::state::with_state(|state| {
+      let quantum = vcs_store::hg_import::quantum_of(state);
+      let start = slates_rt::futures::now_ns();
+      loop {
+        match writer.step(payload) {
+          Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          other => break other,
+        }
+      }
+    });
+    match written? {
+      Ok(true) => slates_rt::futures::yield_now().await,
+      Ok(false) => break,
+      Err(_) => return Some(Err(unrecorded())),
+    }
+  }
+  forked.record = writer.finish();
+  Some(Ok(()))
+}
+
 /// Whether `forked` was made from an index another push has replaced since (A-720 part 2b).
 fn is_stale(state: &ShardState, repository: RepositoryId, forked: &Forked) -> bool {
   state.vcs_stores.generation_of(repository) != Some(forked.generation)
@@ -1337,6 +1414,12 @@ struct Rebasing {
   rebase: Option<Rebase>,
   /// The generation of the index it re-bases onto.
   generation: u64,
+  /// The push's changegroup as it arrived, carried to the re-based fork; taken by its finish.
+  changegroup: Option<(Version, Vec<u8>)>,
+  /// The room the push's intake began within.
+  room: u64,
+  /// The push's record, where written before the re-base.
+  record: Option<Vec<u8>>,
 }
 
 impl Rebasing {
@@ -1359,6 +1442,7 @@ impl Rebasing {
 
   /// The re-based fork, the stale one given back; none, counted, when its release is refused or the store is gone.
   fn finish_in(mut self, state: &mut ShardState) -> Option<Forked> {
+    let changegroup = self.changegroup.take()?;
     let rebase = self.rebase.take()?;
     let generation = self.generation;
     let finished = vcs_store::within_budget(state, 0, |stores| {
@@ -1369,6 +1453,9 @@ impl Rebasing {
         fork,
         intaken,
         generation,
+        record: self.record.take(),
+        changegroup,
+        room: self.room,
       }),
       _ => {
         state.count(vcs_store::RELEASE_REFUSED, 1);
@@ -1403,10 +1490,20 @@ fn begin_rebase(
   repository: RepositoryId,
   stale: Forked,
 ) -> Option<Result<Rebasing, PushOutcome>> {
-  let Forked { fork, intaken, .. } = stale;
+  let Forked {
+    fork,
+    intaken,
+    changegroup,
+    room,
+    record,
+    ..
+  } = stale;
   // A refusal hands the fork back, boxed: an index is far larger than the rebase begun.
   let begun = vcs_store::within_budget(state, 0, |stores| {
-    let Some(generation) = stores.generation_of(repository) else {
+    let Some(generation) = stores
+      .generation_of(repository)
+      .filter(|_| !stores.rebuilding(repository))
+    else {
       return Err(Box::new((None, fork)));
     };
     let Some((content, store)) = stores.mercurial(repository) else {
@@ -1416,6 +1513,9 @@ fn begin_rebase(
       .map(|rebase| Rebasing {
         rebase: Some(rebase),
         generation,
+        changegroup: Some(changegroup),
+        room,
+        record,
       })
       .map_err(|handed| {
         let (refused, fork) = *handed;
@@ -1439,6 +1539,8 @@ async fn rebase_sliced(
   repository: RepositoryId,
   stale: Forked,
 ) -> Option<Result<Forked, PushOutcome>> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::rebase");
   let begun = crate::state::with_state(|state| begin_rebase(state, repository, stale));
   let mut rebasing = match begun.flatten()? {
     Ok(rebasing) => rebasing,
@@ -1470,13 +1572,13 @@ pub(crate) fn unbundle_in(
   let fronted = vcs_store::lent_state(state, |state| {
     front(state, repository, (heads, bundle), room)
   });
-  let unbundle = match fronted? {
+  let mut unbundle = match fronted? {
     Ok(unbundle) => unbundle,
     Err(outcome) => return Some(outcome),
   };
-  let forked = match unbundle.changegroup() {
+  let forked = match unbundle.take_changegroup() {
     None => None,
-    Some((_, part)) => match take_whole(state, repository, part, room)? {
+    Some(changegroup) => match take_whole(state, repository, changegroup, room)? {
       Ok(forked) => Some(forked),
       Err(refused) => return Some(PushOutcome::refused(&refused)),
     },
@@ -1513,14 +1615,18 @@ fn front(
 
 /// A push's intake while it is taken (A-720), given back by its drop if it is not finished: a push whose connection
 /// ends mid-intake leaves the store as it was.
-pub(crate) struct Taking<'g> {
+pub(crate) struct Taking {
   /// The intake, until it is finished or given back.
-  intake: Option<Intake<'g>>,
+  intake: Option<Intake>,
+  /// The changegroup's version and bytes, lent to each step and kept for the push's record (A-729 part 2).
+  changegroup: Option<(Version, Vec<u8>)>,
+  /// The room the intake began within.
+  room: u64,
   /// The generation of the index it forked.
   generation: u64,
 }
 
-impl Taking<'_> {
+impl Taking {
   /// One slice: units taken until the intake is done or the shard's quantum is spent, within the room `lend` gives the
   /// stores; none when the content store is gone.
   fn slice(
@@ -1530,12 +1636,13 @@ impl Taking<'_> {
     room: &mut Admission,
   ) -> Option<Result<Stepped, IntakeRefused>> {
     let intake = self.intake.as_mut()?;
+    let (_, payload) = self.changegroup.as_ref()?;
     let quantum = vcs_store::hg_import::quantum_of(state);
     let start = slates_rt::futures::now_ns();
     vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
       Some(loop {
-        match intake.step(content, room) {
+        match intake.step(payload, content, room) {
           Ok(Stepped::More) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
           other => break other,
         }
@@ -1551,6 +1658,9 @@ impl Taking<'_> {
         fork,
         intaken,
         generation: self.generation,
+        record: None,
+        changegroup: self.changegroup.take()?,
+        room: self.room,
       }),
       Err(intake) => {
         self.intake = Some(*intake);
@@ -1567,7 +1677,7 @@ impl Taking<'_> {
   }
 }
 
-impl Drop for Taking<'_> {
+impl Drop for Taking {
   fn drop(&mut self) {
     if let Some(intake) = self.intake.take() {
       // Dropped mid-intake (its connection ended): given back on the shard that holds its store.
@@ -1577,7 +1687,7 @@ impl Drop for Taking<'_> {
 }
 
 /// Gives `intake`'s fork back, settling the shard's charge; a refused release counted.
-fn abandon(state: &mut ShardState, intake: Intake<'_>) {
+fn abandon(state: &mut ShardState, intake: Intake) {
   let released = vcs_store::within_budget(state, 0, |stores| {
     stores
       .content_mut()
@@ -1588,35 +1698,47 @@ fn abandon(state: &mut ShardState, intake: Intake<'_>) {
   }
 }
 
-/// Starts taking `part` into a fork of `repository`'s index (A-720); none when its store is not held here.
-fn begin_intake<'g>(
+/// Starts taking `changegroup` into a fork of `repository`'s index (A-720); none when its store is not held here.
+fn begin_intake(
   state: &mut ShardState,
   repository: RepositoryId,
-  part: &'g ChangegroupPart,
+  changegroup: (Version, Vec<u8>),
   lend: u64,
   room: &mut Admission,
-) -> Option<Result<Taking<'g>, Box<Refused>>> {
+) -> Option<Result<Taking, Box<Refused>>> {
   vcs_store::within_budget(state, lend, |stores| {
+    if stores.rebuilding(repository) {
+      return None;
+    }
     let generation = stores.generation_of(repository)?;
     let (content, store) = stores.mercurial(repository)?;
-    Some(match Intake::begin(part, &mut store.index, content, room) {
-      Ok(intake) => Ok(Taking {
-        intake: Some(intake),
-        generation,
-      }),
-      Err(refused) => Err(intake_refused(&refused)),
-    })
+    let (version, payload) = &changegroup;
+    let before = room.left();
+    Some(
+      match Intake::begin((*version, payload), &mut store.index, content, room) {
+        Ok(intake) => Ok(Taking {
+          intake: Some(intake),
+          changegroup: Some(changegroup),
+          room: before,
+          generation,
+        }),
+        Err(refused) => Err(intake_refused(&refused)),
+      },
+    )
   })
 }
 
-/// `part` taken into its fork a slice at a time, a yield between slices (A-720); none when the store went away.
+/// `changegroup` taken into its fork a slice at a time, a yield between slices (A-720); none when the store went away.
 async fn take_sliced(
   repository: RepositoryId,
-  part: &ChangegroupPart,
+  changegroup: (Version, Vec<u8>),
   lend: u64,
   room: &mut Admission,
 ) -> Option<Result<Forked, PushOutcome>> {
-  let begun = crate::state::with_state(|state| begin_intake(state, repository, part, lend, room));
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::take");
+  let begun =
+    crate::state::with_state(|state| begin_intake(state, repository, changegroup, lend, room));
   let mut taking = match begun.flatten()? {
     Ok(taking) => taking,
     Err(refused) => return Some(Err(PushOutcome::refused(&refused))),
@@ -1631,16 +1753,17 @@ async fn take_sliced(
   }
 }
 
-/// `part` taken into its fork every slice at once: [`take_sliced`]'s steps for a caller that holds the shard's state.
+/// `changegroup` taken into its fork every slice at once: [`take_sliced`]'s steps for a caller that holds the shard's
+/// state.
 #[cfg(test)]
 pub(crate) fn take_whole(
   state: &mut ShardState,
   repository: RepositoryId,
-  part: &ChangegroupPart,
+  changegroup: (Version, Vec<u8>),
   room: &mut Admission,
 ) -> Option<Result<Forked, Box<Refused>>> {
   let lend = u64::MAX;
-  let mut taking = match begin_intake(state, repository, part, lend, room)? {
+  let mut taking = match begin_intake(state, repository, changegroup, lend, room)? {
     Ok(taking) => taking,
     Err(refused) => return Some(Err(refused)),
   };
@@ -1793,10 +1916,12 @@ fn forked_whole(
   unbundle: &Unbundle,
   room: &mut Admission,
 ) -> Result<Option<Forked>, Box<Refused>> {
+  // The tests keep their unbundle whole, so its changegroup is copied rather than moved out as the driver moves it.
   let Some((_, part)) = unbundle.changegroup() else {
     return Ok(None);
   };
-  match take_whole(state, repository, part, room) {
+  let changegroup = (part.version, part.payload.clone());
+  match take_whole(state, repository, changegroup, room) {
     Some(Ok(forked)) => Ok(Some(forked)),
     Some(Err(refused)) => Err(refused),
     None => Err(abort(NO_STORE.to_vec())),
@@ -1887,7 +2012,7 @@ fn landing(
     }
   };
   prepared.forked = forked;
-  let landed = land(state, (principal, repository), prepared, room);
+  let landed = land(state, (principal, repository), prepared);
   if landed.released.is_err() {
     state.count(vcs_store::RELEASE_REFUSED, 1);
   }

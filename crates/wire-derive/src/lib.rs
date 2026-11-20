@@ -90,6 +90,19 @@ fn type_text(ty: &Type) -> String {
   quote!(#ty).to_string().replace(' ', "")
 }
 
+/// A struct's schema text: `struct Name{field:Type,...}`, its fields in declaration order.
+fn struct_reflection(name_text: &str, idents: &[&syn::Ident], types: &[&Type]) -> String {
+  format!(
+    "struct {name_text}{{{}}}",
+    idents
+      .iter()
+      .zip(types)
+      .map(|(i, t)| format!("{i}:{}", type_text(t)))
+      .collect::<Vec<_>>()
+      .join(",")
+  )
+}
+
 fn expand_struct(
   name: &syn::Ident,
   name_text: &str,
@@ -98,14 +111,8 @@ fn expand_struct(
   let fields = named(fields, "a struct")?;
   let idents: Vec<&syn::Ident> = fields.iter().map(|(i, _)| i).collect();
   let types: Vec<&Type> = fields.iter().map(|(_, t)| t).collect();
-  let reflection = format!(
-    "struct {name_text}{{{}}}",
-    fields
-      .iter()
-      .map(|(i, t)| format!("{i}:{}", type_text(t)))
-      .collect::<Vec<_>>()
-      .join(",")
-  );
+  let reflection = struct_reflection(name_text, &idents, &types);
+  let methods = struct_methods(&idents, &types);
   Ok(quote! {
     impl ::slates_wire::Wire for #name {
       const SCHEMA: &'static str = #reflection;
@@ -113,14 +120,24 @@ fn expand_struct(
         ::slates_wire::schema::fnv64(#reflection),
         &[#(<#types as ::slates_wire::Wire>::SCHEMA_HASH),*],
       );
-      fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
-        #(::slates_wire::Wire::encode(&self.#idents, out);)*
-      }
-      fn decode(input: &mut &[u8]) -> ::std::result::Result<Self, ::slates_wire::WireError> {
-        Ok(Self { #(#idents: <#types as ::slates_wire::Wire>::decode(input)?,)* })
-      }
+      #methods
     }
   })
+}
+
+/// A struct's `encode`, `encoded_len` and `decode`: its fields in declaration order.
+fn struct_methods(idents: &[&syn::Ident], types: &[&Type]) -> proc_macro2::TokenStream {
+  quote! {
+    fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
+      #(::slates_wire::Wire::encode(&self.#idents, out);)*
+    }
+    fn encoded_len(&self) -> usize {
+      0usize #(.saturating_add(::slates_wire::Wire::encoded_len(&self.#idents)))*
+    }
+    fn decode(input: &mut &[u8]) -> ::std::result::Result<Self, ::slates_wire::WireError> {
+      Ok(Self { #(#idents: <#types as ::slates_wire::Wire>::decode(input)?,)* })
+    }
+  }
 }
 
 /// One variant's contribution to the enum's impl.
@@ -128,6 +145,7 @@ struct VariantParts {
   reflection: String,
   tag_const: proc_macro2::TokenStream,
   encode_arm: proc_macro2::TokenStream,
+  len_arm: proc_macro2::TokenStream,
   decode_arm: proc_macro2::TokenStream,
   hashes: Vec<proc_macro2::TokenStream>,
 }
@@ -160,6 +178,15 @@ fn expand_variant(index: usize, variant: &syn::Variant) -> syn::Result<VariantPa
   } else {
     field_arms(vname, discriminant, &idents, &types, &bound)
   };
+  // The variant's encoded length: its `u32` discriminant, then its fields (A-742).
+  let len_arm = if fields.is_empty() {
+    quote! { Self::#vname => ::std::mem::size_of::<u32>(), }
+  } else {
+    quote! {
+      Self::#vname { #(#idents: #bound),* } => ::std::mem::size_of::<u32>()
+        #(.saturating_add(::slates_wire::Wire::encoded_len(#bound)))*,
+    }
+  };
   let tag_name = format_ident!("WIRE_TAG_{}", screaming_snake(&vname.to_string()));
   let tag_doc = format!(
     "Format: the wire discriminant of `{vname}` (its declaration index), for an encoder that writes the variant's \
@@ -173,6 +200,7 @@ fn expand_variant(index: usize, variant: &syn::Variant) -> syn::Result<VariantPa
     reflection,
     tag_const,
     encode_arm,
+    len_arm,
     decode_arm,
     hashes,
   })
@@ -220,6 +248,18 @@ fn field_arms(
   )
 }
 
+/// An enum's schema text: `enum Name{Variant...,...}`, its variants' own texts in declaration order.
+fn enum_reflection(name_text: &str, parts: &[VariantParts]) -> String {
+  format!(
+    "enum {name_text}{{{}}}",
+    parts
+      .iter()
+      .map(|p| p.reflection.as_str())
+      .collect::<Vec<_>>()
+      .join(",")
+  )
+}
+
 fn expand_enum(
   name: &syn::Ident,
   name_text: &str,
@@ -231,18 +271,10 @@ fn expand_enum(
     .enumerate()
     .map(|(index, variant)| expand_variant(index, variant))
     .collect::<syn::Result<Vec<_>>>()?;
-  let reflection = format!(
-    "enum {name_text}{{{}}}",
-    parts
-      .iter()
-      .map(|p| p.reflection.as_str())
-      .collect::<Vec<_>>()
-      .join(",")
-  );
-  let encode_arms = parts.iter().map(|p| &p.encode_arm);
+  let reflection = enum_reflection(name_text, &parts);
   let tag_consts = parts.iter().map(|p| &p.tag_const);
-  let decode_arms = parts.iter().map(|p| &p.decode_arm);
   let hashes = parts.iter().flat_map(|p| p.hashes.iter());
+  let methods = enum_methods(&parts);
   Ok(quote! {
     impl #name {
       #(#tag_consts)*
@@ -253,16 +285,29 @@ fn expand_enum(
         ::slates_wire::schema::fnv64(#reflection),
         &[#(#hashes),*],
       );
-      fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
-        match self { #(#encode_arms)* }
-      }
-      fn decode(input: &mut &[u8]) -> ::std::result::Result<Self, ::slates_wire::WireError> {
-        let discriminant = <u32 as ::slates_wire::Wire>::decode(input)?;
-        match discriminant {
-          #(#decode_arms)*
-          other => Err(::slates_wire::WireError::BadDiscriminant { got: other }),
-        }
-      }
+      #methods
     }
   })
+}
+
+/// An enum's `encode`, `encoded_len` and `decode`: one arm a variant, an unknown discriminant refused.
+fn enum_methods(parts: &[VariantParts]) -> proc_macro2::TokenStream {
+  let encode_arms = parts.iter().map(|p| &p.encode_arm);
+  let len_arms = parts.iter().map(|p| &p.len_arm);
+  let decode_arms = parts.iter().map(|p| &p.decode_arm);
+  quote! {
+    fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
+      match self { #(#encode_arms)* }
+    }
+    fn encoded_len(&self) -> usize {
+      match self { #(#len_arms)* }
+    }
+    fn decode(input: &mut &[u8]) -> ::std::result::Result<Self, ::slates_wire::WireError> {
+      let discriminant = <u32 as ::slates_wire::Wire>::decode(input)?;
+      match discriminant {
+        #(#decode_arms)*
+        other => Err(::slates_wire::WireError::BadDiscriminant { got: other }),
+      }
+    }
+  }
 }
