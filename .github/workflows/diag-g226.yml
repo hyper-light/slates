@@ -1,0 +1,55 @@
+name: DIAG g226 -- cli.rs' Linux-only judged waits, compiled and run (not for main)
+
+on:
+  push:
+    branches: ['agents/diag-g226-*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  waits:
+    name: cli.rs' FUSE and kill tests with the judged waits
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RESULTS_BRANCH: ${{ github.ref_name }}-results-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: The tests, published
+        shell: bash
+        run: |
+          set +e
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          echo "started $(date -u +%FT%TZ) at $(git rev-parse HEAD); $(uname -r); $(nproc) cpus" > "$out/status.txt"
+          cargo test -p slates-cli --test cli --test held_rendezvous --test merge_kill --test nfs_held --test nfs_v4_restart --no-run > "$out/build.txt" 2>&1
+          echo "build exit $?" >> "$out/status.txt"
+          SLATES_TEST_CLI=1 timeout 3000 cargo test -p slates-cli --test cli -- --test-threads=1 \
+            fuse dead_daemon generated_history write_in_flight closed_files journal kept_mount own_mounts \
+            deleted_files destroyed_volumes registry charged a_stuck_start a_frozen_daemon executable_is_replaced \
+            > "$out/cli.txt" 2>&1
+          echo "cli exit $?" >> "$out/status.txt"
+          grep -E "^test result" "$out/cli.txt" >> "$out/status.txt"
+          grep -E "^test .*(FAILED|ok)$|panicked" "$out/cli.txt" | head -80 > "$out/summary.txt"
+          echo "ended $(date -u +%FT%TZ)" >> "$out/status.txt"
+          entries=""
+          for f in "$out"/*; do
+            b=$(tail -c 3000000 "$f" | git hash-object -w --stdin)
+            entries="$entries$(printf '100644 blob %s\t%s' "$b" "$(basename "$f")")"$'\n'
+          done
+          tree=$(printf '%s' "$entries" | git mktree)
+          c=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID")
+          git push -q origin "$c:refs/heads/$RESULTS_BRANCH"
