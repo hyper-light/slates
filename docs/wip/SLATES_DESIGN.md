@@ -56566,10 +56566,33 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `_in_slices`, ignored measurements). Tests: `a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once`; the
   fleet sealed-in-turns test holds the hashing to at least a page a turn under the cut quantum (48 turns for 3 MiB),
   red before (0 turns: hashed in the append's turn).
-- **Owed.** Part 2b: a large delta, sealed and hashed in its publication's turn, as a build of its own. Part 3: the body
-  held once, by identity in the content store (A-727) or an arena handle, so the retained entry and the volume's whole
-  state name one copy.
+- **Part 2b (large deltas).** A delta over one archive page (`built_in_turns`), sealed or in the clear, is built in turns
+  of its own as a whole state is: the build carries `whole` and `clear`, seals its pieces when this node seals, hashes
+  in slices, waits for the delta credit (`Shipper::admits_delta`) and appends with `Shipper::append_hashed`; a whole
+  state keeps A-377's rule. Release, 2.4 MB, best and median of 9, three runs: the append turn 0.92 to 1.77 / 0.94 to
+  2.32 ms before, 0.42 to 0.88 / 0.46 to 1.46 us after; each 64 KiB hashing turn 27 to 54 / 30 to 68 us
+  (`measure_the_delta_append_turn`). Tests: `a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once`; the fleet
+  test `a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own` (a three-MiB staged write, one publication), red
+  before (no build, no hashing turn), at least 48 hashing turns after.
+- **Owed.** Part 3: the body held once, by identity in the content store (A-727) or an arena handle, so the retained
+  entry and the volume's whole state name one copy.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
+
+### A-756 — A volume made on a node by materialization is found there by its name: it claims its name's alias (bug, 2026-11-20, w-fed-move, kiln goal 91; found by use: kiln's live move of an agent's captured clone, its mount refused `NOENT` on the new owner in four runs of five; §4.8 "Lookup", §4.10 "Ownership follows the writer"; A-236, A-291)
+- **Why.** A clone named for another partition than its origin's lives beside its origin and is found by name only
+  through the alias its name's partition holds (A-236). A planned move releases the old owner's alias with its copy
+  (`moves::release`), and the new owner materializes the volume in the partition its id names (`fleet::make_taken`)
+  without one, so a `MNT` of the name, routed to the name's partition (`nfs::routed`), found nothing there unless the
+  name happened to hash to the clone's partition. A takeover's successor had the same gap.
+- **Change.** `verbs::claim_name_alias`: once `make_taken` has made a volume, where its name hashes to another
+  partition, the name's shard reserves and confirms the alias for it (the clone's own two steps, `Op::NameAliasReserved`
+  then `Op::NameAliasConfirmed`): nothing when it already names the volume confirmed, refused when the name or its
+  alias is another volume's; a claim not taken is counted `names.alias_step_untaken` and left to recovery's
+  reconciliation, as an alias step is.
+- **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
+  a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
+  captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
+  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.
