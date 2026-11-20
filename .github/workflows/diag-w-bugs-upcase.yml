@@ -1,0 +1,47 @@
+name: DIAG w-bugs -- Windows' own upcase table on both architectures (not for main)
+
+on:
+  push:
+    branches: ['diag-w-bugs-upcase-*']
+
+permissions:
+  contents: write
+
+jobs:
+  dump:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      RESULTS_BRANCH: ${{ github.ref_name }}-results-${{ github.run_id }}-${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every unit through RtlUpcaseUnicodeChar
+        shell: pwsh
+        run: |
+          $src = @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Up {
+            [DllImport("ntdll.dll")] public static extern ushort RtlUpcaseUnicodeChar(ushort c);
+          }
+          "@
+          Add-Type -TypeDefinition $src
+          $sb = New-Object System.Text.StringBuilder
+          for ($u = 0; $u -le 0xFFFF; $u++) {
+            $s = [int][Up]::RtlUpcaseUnicodeChar([uint16]$u)
+            if ($s -ne $u) { [void]$sb.Append(('{0:X4} {1:X4}' -f $u, $s)); [void]$sb.Append("`n") }
+          }
+          [IO.File]::WriteAllText("$PWD\map.txt", $sb.ToString())
+          (cmd /c ver | Out-String).Trim() | Out-File -FilePath ver.txt -Encoding ascii
+      - name: Publish
+        shell: bash
+        run: |
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          a=$(git hash-object -w map.txt); b=$(git hash-object -w ver.txt)
+          tree=$(printf '100644 blob %s\tmap.txt\n100644 blob %s\tver.txt\n' "$a" "$b" | git mktree)
+          c=$(git commit-tree "$tree" -m "results of run $GITHUB_RUN_ID")
+          git push -q origin "$c:refs/heads/$RESULTS_BRANCH"
