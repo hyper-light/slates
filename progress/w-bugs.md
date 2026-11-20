@@ -154,3 +154,8 @@
   names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two (branch agents/w-bugs-win, commit
   "wip: winfsp drive test...") + the workloads suite (A-498 hg byte-identity on stock WinFsp).
   A-551's drive tests already passed on both arches in b3-11 (22/22 winfsp_semantics).
+- A-498 hang: new test a_delete_racing_a_coherent_purge_returns_and_removes_the_file (crates/cli/tests/winfsp.rs; 60
+  rounds: SDK write, drive open+hold, SDK rewrite -> purge, close+delete at once; hang = 10 s). diag-w-bugs-race-new-1
+  (main with A-725) vs -old-1 (main just before A-725), 3 runs each, both arches. Patch: ~/.cache/w-bugs-msg/race.patch.
+- B-list for main: B6 has no record anywhere (state, repo, bug-claims); g079's rebuilt list (2026-11-19) lacked it with
+  B1/B7 (landed) -- likely closed before the wipe, unverifiable here.
