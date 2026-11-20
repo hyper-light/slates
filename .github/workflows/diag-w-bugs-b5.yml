@@ -130,15 +130,23 @@ jobs:
             Stop-Process $p -Force
           }
           $bin = "$env:GITHUB_WORKSPACE\target\release\slates.exe"
-          $anchor = Start-Process $bin -ArgumentList '--instance','b5','anchor','--quick','--shards','2' -PassThru -RedirectStandardError "$out\anchor.txt"
-          Start-Sleep 10
-          $vol = (& $bin --instance b5 volume create b5 --bounded 256MiB | Select-String 'id:').ToString().Split()[-1]
-          & $bin --instance b5 mount $vol S: | Out-Null
-          Start-Sleep 3
-          & "$env:RUNNER_TEMP\timing.ps1" "S:\" "slates" $res
-          & $bin --instance b5 status | Add-Content "$out\status-slates.txt"
-          & $bin --instance b5 unmount S: | Out-Null
-          Stop-Process $anchor -Force
+          $log = "$out\slates-steps.txt"
+          try {
+            $anchor = Start-Process $bin -ArgumentList '--instance','b5','anchor','--quick','--shards','2' -PassThru -RedirectStandardError "$out\anchor.txt" -RedirectStandardOutput "$out\anchor-out.txt"
+            for ($i = 0; $i -lt 60; $i++) { & $bin --instance b5 volume list *> $null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep 1 }
+            "volume list exit $LASTEXITCODE after $i s" | Add-Content $log
+            $created = (& $bin --instance b5 volume create b5 --bounded 256MiB 2>&1 | Out-String)
+            "volume create exit $LASTEXITCODE`n$created" | Add-Content $log
+            $vol = ($created -split "`n" | Where-Object { $_ -match '^id:' } | Select-Object -First 1).Split()[-1].Trim()
+            "volume id [$vol]" | Add-Content $log
+            $mounted = (& $bin --instance b5 mount $vol S: 2>&1 | Out-String)
+            "mount exit $LASTEXITCODE`n$mounted" | Add-Content $log
+            Start-Sleep 3
+            & "$env:RUNNER_TEMP\timing.ps1" "S:\" "slates" $res
+            & $bin --instance b5 status *>> "$out\status-slates.txt"
+            & $bin --instance b5 unmount S: *>> $log
+          } catch { "ERROR: $_" | Add-Content $log }
+          if ($anchor) { Stop-Process $anchor -Force -ErrorAction SilentlyContinue }
           "ended $((Get-Date).ToUniversalTime().ToString('o'))" | Add-Content "$out\status.txt"
       - name: Publish
         if: always()
