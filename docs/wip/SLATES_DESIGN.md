@@ -13279,8 +13279,9 @@ engine: the verdict, rebase, position mapping, the register).
 > `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
 > with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
 > and `protected_fixtures` 49 of 49, fmt clean). The HTTP edge's signal of a client gone ends a hook's run (A-665 part
-> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended). Owed: the
-> read-only attachment; the SSH edge's signal; the hooks' learned times; seals kept as derived data.
+> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended). Each hook's run
+> is held to the bound it learned on the owner shard and teaches it as it ends (A-665 part 4b, `ShardState::hook_times`).
+> Owed: the read-only attachment; the SSH edge's signal; seals kept as derived data.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -53902,3 +53903,18 @@ and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `c
   vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, the new test named in the output; fmt clean on the changed files.
 - **Owed.** The SSH edge's signal (the channel's close); a TLS client that sends `close_notify` before it closes is not
   seen gone; the hooks' learned times; the daemon's presenter (A-665 part 4, main's ruling: the read-only view volume).
+
+### A-665 part 4b — A git hook's run is held to the times its hook learned (2026-11-20, w-git for UI goal 93; §4.17.1 "Policy", A-622's table)
+- **Change.** `vcs_hooks::HookTimesTable` on each shard (`ShardState::hook_times`): one `HookTimes` per configured
+  hook, keyed by its repository and name, kept with the program it learned from (a hook set to run another program
+  starts unlearned); the times of hooks the repository's policy no longer configures are dropped as a run teaches.
+  git's push driver hands each hook call the bound its hook learned (none before a run finished) and teaches the run's
+  lesson as its answer comes back (`git_push`'s `PushHooks::{call, learn}`), so a hook past its learned bound is
+  ended and what it would have judged refused, `ran past its bound`.
+- **Tests.** `vcs_hooks::tests::t_a665_a_hooks_times_are_its_own_program_on_its_own_repository`;
+  `git_push::tests::t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` (each of its three
+  hooks taught one finished run).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_http::tests::
+  vcs_http::git:: git_push:: vcs_hooks::` 72 of 72, both tests named in the output; fmt clean on the changed files.
+- **Owed.** Forgetting a removed repository's hooks (the table drops them only as one of its hooks runs); Subversion's
+  and Mercurial's callers reading and teaching the same table; the daemon's presenter (A-665 part 4).
