@@ -559,6 +559,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
     state.store.budget.credit_retention(charged);
   }
   state.vcs_stores.unrecovered.remove(&id);
+  state.vcs_usage.forget(&id);
   if !release_charged(state, id) {
     state.count(RELEASE_REFUSED, 1);
   }

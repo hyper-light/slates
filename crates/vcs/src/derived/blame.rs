@@ -515,36 +515,60 @@ fn numbered(buffers: &[Vec<u8>]) -> Option<Vec<Vec<u32>>> {
 fn matched(old: &[u32], new: &[u32]) -> Option<Vec<(usize, usize)>> {
   let mut pairs = Vec::new();
   let mut pending = vec![(0, old.len(), 0, new.len())];
-  while let Some((old_start, old_end, new_start, new_end)) = pending.pop() {
-    let (mut x, mut y) = (old_start, new_start);
-    while x < old_end && y < new_end && old.get(x) == new.get(y) {
-      pairs.push((x, y));
-      x = x.checked_add(1)?;
-      y = y.checked_add(1)?;
-    }
-    let (mut u, mut v) = (old_end, new_end);
-    while u > x && v > y && old.get(u.checked_sub(1)?) == new.get(v.checked_sub(1)?) {
-      u = u.checked_sub(1)?;
-      v = v.checked_sub(1)?;
-      pairs.push((u, v));
-    }
-    if x < u
-      && y < v
-      && let Some((split_x, split_y)) = middle(old.get(x..u)?, new.get(y..v)?)?
-    {
-      let (split_x, split_y) = (x.checked_add(split_x)?, y.checked_add(split_y)?);
-      // Never a corner: the range's first lines differ and so do its last, so a shortest edit takes D >= 2 edits,
-      // and the split ends a path of D/2 edits (rounded up) from (x, y) that is part of a shortest one, with at least
-      // one edit left to (u, v) (Myers 1986, §4b). The check only keeps the loop finite were that ever not so.
-      let whole = (split_x, split_y) == (x, y) || (split_x, split_y) == (u, v);
-      if !whole {
-        pending.push((split_x, u, split_y, v));
-        pending.push((x, split_x, y, split_y));
-      }
-    }
+  while let Some(range) = pending.pop() {
+    let ends = common_ends(old, new, range, &mut pairs)?;
+    split_at_middle(old, new, ends, &mut pending)?;
   }
   pairs.sort_unstable();
   Some(pairs)
+}
+
+/// Keeps the lines a range `(old_start, old_end, new_start, new_end)` shares at its front and at its back, pushing
+/// their pairs, and gives what is left between them as `(x, y, u, v)`: from (x, y) to (u, v).
+fn common_ends(
+  old: &[u32],
+  new: &[u32],
+  (old_start, old_end, new_start, new_end): (usize, usize, usize, usize),
+  pairs: &mut Vec<(usize, usize)>,
+) -> Option<(usize, usize, usize, usize)> {
+  let (mut x, mut y) = (old_start, new_start);
+  while x < old_end && y < new_end && old.get(x) == new.get(y) {
+    pairs.push((x, y));
+    x = x.checked_add(1)?;
+    y = y.checked_add(1)?;
+  }
+  let (mut u, mut v) = (old_end, new_end);
+  while u > x && v > y && old.get(u.checked_sub(1)?) == new.get(v.checked_sub(1)?) {
+    u = u.checked_sub(1)?;
+    v = v.checked_sub(1)?;
+    pairs.push((u, v));
+  }
+  Some((x, y, u, v))
+}
+
+/// Splits what is left from (x, y) to (u, v) at its middle snake, pushing both halves onto `pending` (the front half
+/// last, so it is taken first).
+fn split_at_middle(
+  old: &[u32],
+  new: &[u32],
+  (x, y, u, v): (usize, usize, usize, usize),
+  pending: &mut Vec<(usize, usize, usize, usize)>,
+) -> Option<()> {
+  if x < u
+    && y < v
+    && let Some((split_x, split_y)) = middle(old.get(x..u)?, new.get(y..v)?)?
+  {
+    let (split_x, split_y) = (x.checked_add(split_x)?, y.checked_add(split_y)?);
+    // Never a corner: the range's first lines differ and so do its last, so a shortest edit takes D >= 2 edits,
+    // and the split ends a path of D/2 edits (rounded up) from (x, y) that is part of a shortest one, with at least
+    // one edit left to (u, v) (Myers 1986, §4b). The check only keeps the loop finite were that ever not so.
+    let whole = (split_x, split_y) == (x, y) || (split_x, split_y) == (u, v);
+    if !whole {
+      pending.push((split_x, u, split_y, v));
+      pending.push((x, split_x, y, split_y));
+    }
+  }
+  Some(())
 }
 
 /// A search's furthest reaching paths: for each diagonal, the furthest `x` its path has reached, or -1 for none yet

@@ -776,6 +776,11 @@ pub struct ShardState {
   /// repository's tool store with its derived values, made with its record and made again by a recovery from its
   /// entries' objects. Bounded by the shard's memory budget, which every byte of it is charged to.
   pub(crate) vcs_stores: crate::vcs_store::VcsStores,
+  /// Each of this shard's repositories' usage (A-724 piece 1, `slates_vcs::usage`): its intakes and fetches begun,
+  /// answered, stepped and timed, and its principals in a Space-Saving summary of `clients_per_shard` slots. One row a
+  /// repository with an event, dropped with the repository ([`crate::vcs_store::free`]), so bounded by the partition's
+  /// repositories.
+  pub(crate) vcs_usage: slates_vcs::Ledger<slates_db::catalog::RepositoryId, Principal>,
   /// The learned times of the hooks of this shard's repositories (A-622's table, `crate::vcs_hooks::HookTimesTable`):
   /// bounded by the hooks their policies configure.
   pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
