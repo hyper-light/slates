@@ -9,6 +9,7 @@
 #   SOURCE_REPOSITORY: a local Mercurial repository (a clone of hg's own, say); PUSH_REV (default every head) names
 #   what the first push sends, e.g. PUSH_REV=6.0 for a cut of its history.
 #   HG: the command that runs stock hg 7.2 (default `hg`).
+#   SSH_VERBOSE: when set, ssh runs with -vv, its trace in each SSH row's log.
 #   WORK_DIRECTORY: scratch, made empty first.
 # Exit: 0 when every row passes, 1 otherwise. Never writes outside WORK_DIRECTORY (the anchor's instance aside).
 set -u
@@ -72,7 +73,7 @@ slates.prefix = http://127.0.0.1:$HTTP/
 slates.username = slates
 slates.password = $TOKEN
 [ui]
-ssh = ssh -F /dev/null -i $WORK/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$WORK/known_hosts -o GlobalKnownHostsFile=/dev/null
+ssh = ssh ${SSH_VERBOSE:+-vv} -F /dev/null -i $WORK/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$WORK/known_hosts -o GlobalKnownHostsFile=/dev/null
 [extensions]
 rebase =
 EOF
