@@ -152,3 +152,10 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - Route: studio-2 synced runs time out; LAN bundle (http.server on 192.168.1.82) + unsynced fetch works.
 - Slip reported to main: one `git checkout --detach` in my scratch clone on studio-2.
 - NEXT: 2b (tree listing an entry a unit; drafted in ~/slates-work/w-engine-2b), then part 3 (apply).
+- 2b LANDED 23eb15b49 (git trees an entry a unit; longest build unit 1.12 -> 0.22 ms). 3a LANDED a5233e228 (paths
+  map's step after a push in slices via whole_build::start_change; update's longest step 94 -> 42 ms, debug 1,500).
+- From CLAUDE.md §8: focused tests only from here (I ran clippy and whole suites for part 2: over the line).
+- For w-git (via main): t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home fails ~1 in 3 in the
+  git_push group: it asserts the names' home differs from the owner shard, which depends on the shard the test lands on.
+- NEXT (part 3 rest): engine verdict in the ready turns (Green::compute resumable); recorded entry; retention secure;
+  engine commit (needs main's call). w-git's store record/commit (11.5 ms) theirs.

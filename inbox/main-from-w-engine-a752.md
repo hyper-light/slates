@@ -78,3 +78,10 @@ compose_volume_planned scanned every entity and base file per path. Indexed: fla
   turns (Green::compute resumable, judge_computed at the append). (3) The commit in turns: still need your call
   (green held out across its commit's turns, or staged and published whole). (4) w-git's two store parts are theirs.
   Going ahead with (1) and (2) unless you say otherwise.
+
+## ~10:50 LANDED part 3a a5233e228 (base 23eb15b49)
+- The paths map's step after a push runs a path a slice (whole_build::start_change, first path in the push's step):
+  the update's longest step 94 -> 42 ms (debug, 1,500 files). Map equal to the whole build, roots and all (t_a752_p3).
+- For w-git: t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home fails about 1 run in 3 in the
+  git_push group ("the names' home is the owner shard"): its premise depends on which shard the test lands on.
+- Next: the verdict in the ready turns, then the recorded entry and secure; the commit waits on your call above.
