@@ -83,3 +83,8 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 - Reported not built: Docker Desktop share check (settings key unverified; no Desktop on this Studio).
 ## NEXT: W10 home holder: workspace::Ask::{Hold, Release} (no proto change), workspace/held.rs map keyed by pod
    session id, slates::export wrapper (Instance::export), loops::workspace falls back to held map; then server side.
+
+## W10 home holder LANDED 2026-11-20 kiln main fce36c347 (workspace::held, Ask::{Hold,Release}, feature workspace.hold).
+## NEXT: W10 server side: pod start -> hold at home -> host/port from [slates_fleet.nodes] -> k8s::volume::objects ->
+   kubeapi create PV/claim/pod (new verbs) + chart RBAC (Role pvc create/delete in jobs ns; ClusterRole PV create/get/delete);
+   end/reaper: delete pod, claim, PV; release at home.
