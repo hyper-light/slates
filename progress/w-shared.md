@@ -1,5 +1,12 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: sweep family 1 (lent record sessions woken by their return) = c03a8953b (main 86e23c4ef; focused
+  tests local on 8ebf8a1c6 per Ada: fleet 25/25, lib 84/84, fmt). Local target deleted. Rules now: Ada says focused
+  tests run locally (no blocking on CI); main: build nothing here under 30 GiB free, delete target after each landing;
+  MEMORY SIZING (briefs/common.md) binds the lane/by-reference work: lend, don't copy, nothing allocated per shipment.
+  NEXT: family 2 (owner_location broadcast stragglers), family 3 (fuse mount-helper exit); exit 4 at 64 MiB; (1) B holds
+  its inputs; (4) lane throughput incl. exchanges' poll_interval reply polling; (2) content-plane-vs-lane A/B; f; A-658 3c.
+
 ## STOPPED 2026-11-20 after landing 1fc1da1fb (main 2eca76a9b), per CLAUDE.md §8 (supervisor starts the next piece).
   Reported to slates-72 (slates-7a is gone; slates-72 presumed the relaunched main). Worktrees: ~/slates-work/w-shared-lent-wake
   (fresh off origin/main 359da2388, no edits; for the lent-session wake piece), ~/slates-work/w-shared-state (my own
