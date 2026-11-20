@@ -702,7 +702,8 @@ fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
   judge: &mut J,
 ) {
   let at = deciding.at;
-  let unrefused = deciding.early.get(at).is_some_and(Option::is_none);
+  // A command no check refused: one with no early outcome, its slot empty or past the checks' table.
+  let unrefused = deciding.early.get(at).is_none_or(Option::is_none);
   if unrefused
     && let Some(command) = deciding.request.commands.get(at)
     && !judge.ready(command, pushed)

@@ -301,6 +301,8 @@ struct DecidingPush {
   deciding: Deciding<Entry>,
   /// The admission of the command under way's move, a turn at a time (A-722 part 4c).
   admitting: Option<slates_git::store::Admitting>,
+  /// The push's stage made again a turn at a time where a landing overtook it (A-722 part 4e).
+  restaging: Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time over the turns before its verdict (A-752).
   preparing: Option<slates_git::receive::works::Preparing>,
   /// The push's names homed in the region before its record names them (A-724 piece 8c, [`Homing`]).
@@ -659,6 +661,7 @@ impl<P> ReceivePack<P> {
       verdicts,
       deciding,
       admitting: None,
+      restaging: None,
       preparing: None,
       homing: if crate::vcs_store::write_version_3() {
         Homing::Due
@@ -691,6 +694,7 @@ impl<P> ReceivePack<P> {
         verdicts,
         deciding,
         admitting,
+        restaging,
         preparing,
         ..
       } = &mut decision;
@@ -702,6 +706,7 @@ impl<P> ReceivePack<P> {
         name: *name,
         hooks: verdicts,
         admitting,
+        restaging,
         preparing,
       };
       deciding
@@ -991,7 +996,13 @@ impl<P> Drop for ReceivePack<P> {
     // (A-722 part 4); one dropped mid-hooks gives back what its hooks hold.
     let held = match answer {
       AnswerState::Sealing(sealing) => Some(Held::Sealing(Box::new(sealing.sealing))),
-      AnswerState::Deciding(decision) => Some(Held::Sealed(Box::new(decision.sealed))),
+      AnswerState::Deciding(decision) => {
+        let decision = *decision;
+        Some(Held::Sealed(Box::new((
+          decision.sealed,
+          decision.restaging,
+        ))))
+      }
       #[cfg(unix)]
       other => {
         hooks::dropped(other);
@@ -1003,7 +1014,13 @@ impl<P> Drop for ReceivePack<P> {
     if let Some(held) = held {
       let given = crate::state::with_state(|state| match held {
         Held::Sealing(sealing) => sealing.abandon(state),
-        Held::Sealed(sealed) => sealed.abandon(state),
+        Held::Sealed(held) => {
+          let (sealed, restaging) = *held;
+          if let Some(staging) = restaging {
+            SealedPush::abandon_staging(state, staging);
+          }
+          sealed.abandon(state);
+        }
       });
       if given.is_none() {
         slates_machine::log_line!(
@@ -1019,8 +1036,8 @@ impl<P> Drop for ReceivePack<P> {
 enum Held {
   /// Its seal under way (boxed, as each of them: the two differ by hundreds of bytes).
   Sealing(Box<SealingPush>),
-  /// Its sealed push, its commands being decided.
-  Sealed(Box<SealedPush>),
+  /// Its sealed push, its commands being decided, and its stage being made again (A-722 part 4e).
+  Sealed(Box<(SealedPush, Option<slates_git::store::Staging>)>),
 }
 
 /// `repository`'s record on this shard's partition.
@@ -1556,6 +1573,8 @@ struct ServerJudge<'j> {
   hooks: &'j mut HookVerdicts,
   /// The admission of the command under way's move, a turn at a time (A-722 part 4c).
   admitting: &'j mut Option<slates_git::store::Admitting>,
+  /// The push's stage made again a turn at a time where a landing overtook it (A-722 part 4e).
+  restaging: &'j mut Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time before its verdict (A-752).
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
 }
@@ -1566,6 +1585,12 @@ impl Judge for ServerJudge<'_> {
   /// A turn of the admission of `command`'s move (A-722 part 4c), for the shard's step quantum and a unit at least: the
   /// walk of what it brings, which its append then takes whole ([`SealedPush::admit`]). A delete needs none.
   fn ready(&mut self, command: &Command, pushed: &Pushed<'_>) -> bool {
+    let ns = self.state.config.step_quantum_ns();
+    // A stage another push's landing overtook is made again first, a turn at a time, so the append's commit adopts it
+    // rather than staging the push again whole in its step (A-722 part 4e).
+    if !self.push.restage_turn(self.state, (self.restaging, ns)) {
+      return false;
+    }
     if command.is_delete() {
       return true;
     }
@@ -1578,7 +1603,6 @@ impl Judge for ServerJudge<'_> {
       born(state, (repository, &command.name), store).unwrap_or_else(|| unheld_key(repository))
     };
     let began = slates_rt::futures::now_ns();
-    let ns = self.state.config.step_quantum_ns();
     self
       .push
       .admission_turn(self.state, (green, command.new), (self.admitting, ns))

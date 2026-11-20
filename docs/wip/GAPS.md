@@ -84,6 +84,10 @@
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
+> **A-722 part 4e (2026-11-20, w-git).** BUILT: an overtaken stage made again in the judge's turns; a stage giving no
+> position never overtaken; `Judge::ready` asked for every unrefused command (part 4c's turns now run live). Owed: the
+> store commit's whole passes; the check's propagation in one unit (57.9 ms at 100 pushes).
+>
 > **A-753 (2026-11-20, w-git).** BUILT: a create at a commit another branch holds is made from it (empty work); a
 > resent object is read from the index; at the chains' cap a push checkpoints the repository's other members too.
 >
@@ -5166,6 +5170,8 @@
 > 0.16–0.40 s (main 1.16–1.85 s); the catch-up itself slower, 3.95–6.09 s on x86 and 9.38–13.34 s on arm (main
 > 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). Open: the arm catch-up time, and this flow on
 > today's main, whose byte bounds (`Bounds::of_whole`) the measured trees predate.
+> The flow is on main since 2026-11-20 (`a_resumed_holders_catch_up_beside_a_busy_volume`, command in BENCHMARKS),
+> and its interleaved A/B against the pair reverted is in main's run-request queue.
 
 > **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
 > predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement
@@ -7127,7 +7133,17 @@
 >   `edit_and_submit`, `merge_post_state`, `async_core`, `waits`, `consumer`, `client` and `lone_daemon` (a connect is
 >   one claim, a full ring is waited out, a listing, a reply, an edit, a seat and a returned id are waited for while the
 >   daemon lives, a child's tagged line while the child lives, `lone_daemon`'s role a clear memory level in the host's
->   place). Owed: the client's examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
+>   place), and its examples (`load_bench`'s stamp tests and `map_read_ab`, one claim each). In `api/tests` (`api.rs`) since 2026-11-20 (g226): the attach is one
+>   claim, its host reactor waits until the signal and through a live daemon's deadlines, its listings and attachment
+>   counts are waited for and its stream ends read without a timeout, its daemon in-process (A-232); `start.rs`'
+>   `NOBODY_WAIT` is the deadline its test proves, and stays. In `cli/tests` since 2026-11-20 (g226), judged in the waited-on processes' own CPU
+>   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone or stalled
+>   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`; `recovered::await_recovered_while_alive`):
+>   `held_rendezvous`, `merge_kill` (its killer's wait for the client's submit ends too at the client's end) and
+>   `nfs_v4_restart` (Linux's, compiled here). Owed in `cli/tests`: `cli`, `live_fleet`, `vm`, `nfs_held`,
+>   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
+>   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
+>   own platforms), `cli/src/verbs.rs`' test module
 >   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
 >   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the

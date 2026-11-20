@@ -8816,6 +8816,13 @@ is 4 to 9 times shorter. The catch-up itself is slower: 1.3 to 2.0 times main's 
 it streams 20,000 entries instead of sending one image. Landed for the owner shard's health (the neighbour's tail, no
 whole images on the shard), with the arm catch-up time owed a look.
 
+**The command on today's main** (since 2026-11-20; the diag flow was never on main): `SLATES_TEST_CLI=1
+SLATES_CATCH_UP_BACKLOG=20000 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture
+--test-threads=1 --exact a_resumed_holders_catch_up_beside_a_busy_volume`. It prints the same `LD-CU` lines, plus the
+backlog's change bytes and the catch-up's milliseconds per MiB behind. The baseline for an A/B on today's main is
+`agents/g227-catchup-baseline`, today's main at the flow's commit with the pair's three changes reverted. It is for
+measurement only and never lands.
+
 **Earlier A/Bs, recorded.** diag-73 measured the fold's cost (1.4 ms a reply 1,000 behind, 7.1 ms 5,000 behind; writes
 fell to about 210 a second; 6 of 24 x86 runs never within 50 entries). diag-76 (the flow, main against the fold fix) and
 diag-81 (the neighbour, at 5,000 and 20,000 behind) did not separate, because the stale tail sent most of the backlog as
@@ -15207,6 +15214,36 @@ ended the daemon; run 1's DAV landing finished inside its window. Peak RSS is ab
 growing copy, `Revision::of_work`'s copy, the revision record's encoding into one log entry, the records' copy and the
 green's file. Owed (GAPS): the landing a slice at a time (rule 3) and the texts held once (rule 1: the green's staged
 blocks as the sink, the increment setting the path from the held identity, the record and log naming identities).
+
+## A-722's proof: 19 and 100 concurrent large pushes to one repository, every one answered and the daemon alive (A-722, A-753; UI goal 93; 2026-11-20)
+
+- **The machine and builds.** adas-mac-studio.local-2 (M3 Ultra, 32 cores, 23 shards), release builds of main in
+  w-git's own clone and target (`~/.cache/w-git-clone`, `~/.cache/w-git-target.noindex`, `CARGO_INCREMENTAL=0`): main
+  c729cdea5 for (a) to (c) and the first (d), the diagnostic branch agents/w-git-diag (main 91a546972 with the append's
+  refusal logged) for the second, main 7ad7e19fc with A-753 for (e). Dataset `~/.cache/g309-scale/src.git` (git/git);
+  v1.5.0's pack 34,296 objects, 9.8 MB.
+- **The commands.** (a) `crates/cli/bench/multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0
+  --steps 100 --per-repository-cap 10`; (b) the same uncapped (its hot repository takes 19 v1.5.0 pushes); (c) to (e)
+  N concurrent v1.5.0 pushes to one repository, each creating its own branch with the whole pack, through
+  `multi_repo_load`'s own daemon and burst (a scratch driver, `~/.cache/w-git-runs/one_repo.py SLATES SOURCE v1.5.0 19
+  100`, on that machine, not in the tree).
+
+| run | load | pushes | answered | ok | daemon | wall | peak RSS (a push) | longest step (phase) |
+|---|---|---|---|---|---|---|---|---|
+| (a) R=100, cap 10 | 3.7 | 77 | 77 | 77 | alive | 29.4 s | 4,046 MiB | 72.8 ms (answer) |
+| (b) R=100, uncapped | 3.9 | 86 | 86 | 86 | alive | 56.5 s | 4,390 MiB | 76.5 ms (answer) |
+| (c) one repository, N=19 | 2.7 | 19 | 19 | 19 | alive | 58.7 s | 1,337 MiB (65.8 MiB) | 73.0 ms (answer) |
+| (d) one repository, N=100, before A-753 | 2.7, 3.3 | 100 | 100 | 80 | alive | 391 s, 372 s | 4,836 to 5,435 MiB (47 to 54 MiB) | 218.3 ms (answer) |
+| (e) one repository, N=100, A-753 | 6.3 to 7.3, not quiet | 100 | 100 | 100 | alive | 1,509 s | 2,969 MiB (28.8 MiB) | 73.7 ms (answer), 57.9 ms (check) |
+
+- **What it says.** No run ended the daemon: ten, nineteen and a hundred concurrent v1.5.0 pushes to one repository
+  are each answered. The 20 of 100 refused in (d) were the partition's green chains at their cap (the diagnostic build's
+  log: `TableAtCapacity { table: "green_chains" }`), each branch created from nothing holding the whole tree as its own
+  work; A-753 makes a branch at a commit another branch holds from that branch, and (e) answers all 100 with less than
+  half the memory a push. (e) ran with other agents' work on the machine (load 6 to 7, 9 GB free at its start), so its
+  wall is not comparable with (d)'s. The longest step, about 74 ms, is the answer's: a stage another landing overtook,
+  made again whole by the commit (A-722 part 4e moves it into the judge's turns).
+
 
 ## A push's work built over turns: the build no longer one step (A-752 part 2; main's order of 2026-11-20; 2026-11-20)
 

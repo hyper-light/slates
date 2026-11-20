@@ -3,7 +3,7 @@
 use slates_db::register::rendezvous_ranked_by_key;
 use slates_vcs::ContentId;
 
-use super::{HOMED, HomeRefused, LET_GO, home, home_of, let_go, read};
+use super::{HOMED, LET_GO, home, home_of, let_go, read};
 
 /// Shape: the windows the spread test homes: enough that every one of four shards is some window's home with
 /// overwhelming probability (each misses all with probability (3/4)^64, about 1e-8).
@@ -89,9 +89,17 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
           7u8;
           crate::state::with_state(|state| state.store.content.chunk_bytes()).unwrap_or(0) + 1
         ];
-      let refused = home(origin, &shards, past, budget).await;
-      if refused != Err(HomeRefused::PastWindow) {
-        outcome.push(format!("bytes past a window were not refused: {refused:?}"));
+      // An object past a window is homed whole under the BLAKE3 of its bytes (the identity rule), each home cutting its
+      // own windows; let go again, as the windows were.
+      let identity = ContentId::of(&past);
+      match home(origin, &shards, past, budget).await {
+        Ok((homed, _)) if homed == identity => {}
+        other => outcome.push(format!(
+          "an object past a window not homed by its BLAKE3: {other:?}"
+        )),
+      }
+      if let_go(origin, &shards, identity, budget).await.is_err() {
+        outcome.push("the object past a window not let go".to_owned());
       }
       let _ = sent.send(outcome);
     })
@@ -118,8 +126,8 @@ fn windows_are_homed_read_and_let_go_at_their_identitys_shard() {
   assert!(outcome.is_empty(), "{outcome:#?}");
   assert_eq!(
     homed,
-    u64::try_from(WINDOWS + 1).unwrap(),
-    "every window kept at a home, one twice"
+    u64::try_from(WINDOWS + 2).unwrap(),
+    "every window kept at a home, one twice, and the object past a window once"
   );
 }
 
@@ -630,4 +638,44 @@ async fn home_published(origin: u16, shard: u16, generation: u64, budget: u64) -
   )
   .await
   .unwrap_or(false)
+}
+
+/// A-724 piece 8c (main's ruling: across nodes the unit is the object keyed by the BLAKE3 of its bytes, each home
+/// cutting its own windows). Do: home in the region an object three windows long, then read it back from the region.
+/// Expect: homed under the BLAKE3 of its whole bytes (no window's identity), and read back byte for byte.
+#[test]
+fn an_object_longer_than_a_window_is_homed_and_read_back_by_its_blake3() {
+  use super::{home_in_region, read_in_region};
+  let daemon = crate::daemon::audit_daemon_of(2);
+  let (sent, answered) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let origin = state.shard;
+    let shards = state.shards.clone();
+    let window = state.store.content.chunk_bytes();
+    let task = slates_rt::futures::spawn(async move {
+      let budget = crate::daemon::LIVENESS_BUDGET_NS;
+      let full = slates_cluster::CommitBudget::hard(budget, (budget / 100).max(1));
+      let mut outcome: Vec<String> = Vec::new();
+      let bytes: Vec<u8> = (0..window * 3 + 17)
+        .map(|at| u8::try_from(at % 251).unwrap_or(0))
+        .collect();
+      let identity = ContentId::of(&bytes);
+      match home_in_region(origin, &shards, bytes.clone(), full).await {
+        Ok(homed) if homed == identity => {}
+        other => outcome.push(format!("not homed under its BLAKE3: {other:?}")),
+      }
+      match read_in_region(origin, &shards, identity, full).await {
+        Some(read) if read == bytes => {}
+        other => outcome.push(format!(
+          "not read back whole: {:?} bytes",
+          other.map(|read| read.len())
+        )),
+      }
+      let _ = sent.send(outcome);
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let outcome = answered.recv().unwrap();
+  assert!(outcome.is_empty(), "{outcome:?}");
 }

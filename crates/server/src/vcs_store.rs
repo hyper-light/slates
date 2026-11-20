@@ -1469,6 +1469,64 @@ impl SealedPush {
     abandon_push(state, self.push);
   }
 
+  /// One turn of the push's stage made again where a landing overtook it since its seal (A-722 part 4e), begun where
+  /// `staging` holds none, for `ns` of the shard's clock and a unit at least: whether it is current, so its append's
+  /// commit adopts it rather than staging it again whole. A refusal ends it, the commit staging it and answering the
+  /// refusal there.
+  pub(crate) fn restage_turn(
+    &mut self,
+    state: &mut ShardState,
+    (staging, ns): (&mut Option<slates_git::store::Staging>, u64),
+  ) -> bool {
+    let repository = self.repository;
+    let push = &mut self.push;
+    let room = state
+      .vcs_stores
+      .git_ref(repository)
+      .map_or(0, |(_, store)| store.repository.stage_room(push));
+    let turned = within_budget(state, room, |stores| {
+      let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
+      let mut begun = match staging.take() {
+        Some(begun) => begun,
+        None if !store.repository.needs_stage(push) => return Ok(true),
+        None => store
+          .repository
+          .staging(content, push)
+          .map_err(GitRefused::Store)?,
+      };
+      let mut clock = crate::git_push::ShardClock;
+      let quantum = slates_git::store::hook_view::Quantum {
+        clock: &mut clock,
+        ns,
+      };
+      let done = store
+        .repository
+        .stage_turn(content, push, &mut begun, quantum)
+        .map_err(GitRefused::Store)?;
+      if !done {
+        *staging = Some(begun);
+      }
+      // A stage that a landing overtook while it was made is made again from the next turn.
+      Ok::<bool, GitRefused>(done && !store.repository.needs_stage(push))
+    });
+    turned.unwrap_or(true)
+  }
+
+  /// Gives back what a stage under way ([`SealedPush::restage_turn`]) holds: a push dropped mid-decision.
+  pub(crate) fn abandon_staging(state: &mut ShardState, staging: slates_git::store::Staging) {
+    let given = {
+      let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+      lent
+        .stores
+        .content
+        .as_mut()
+        .map_or(Ok(()), |content| staging.abandon(content))
+    };
+    if given.is_err() {
+      state.count(RELEASE_REFUSED, 1);
+    }
+  }
+
   /// One turn of the admission of the move of the green keyed `green` to `to` (A-722 part 4c), begun where `admitting`
   /// holds none, for `ns` of the shard's clock and a unit at least: whether it is done, its move kept for its append
   /// ([`SealedPush::admit`]). A refusal ends it, the append admitting the move again and answering the refusal there.
