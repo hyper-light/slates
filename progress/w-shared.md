@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 part d = f253a8017 (main 04a69de57): hold_until_replica/replica_reached (control shard waits,
+  woken by merge_service::recompute; bound = parked verb); fixed part b test's counter race. NEXT: part e (recovery:
+  holder works after a restart -- unbuilt works whose green is elsewhere replayed via the replica / owner admission;
+  pending submits/creations resent over the fleet), then f (takeover + routing flip: delete the hook, real "replicated
+  here" rule, two-node e2e with taken-by-position counter). Holder rebase + copies still Unsupported (owed).
+
 ## LANDED 2026-11-20: A-697 part c = b8db5ba37 (main c729cdea5): SubmitComputed/ComputedSubmit; work_home::verdict_over_fleet,
   computed_request; verbs::submit_computed; Green::submit_computed. Holder rebase + copies refused Unsupported (owed).
   NEXT: part d (settle once the replica holds the version) -- ask main what (d) means precisely if unclear; then e, f.
