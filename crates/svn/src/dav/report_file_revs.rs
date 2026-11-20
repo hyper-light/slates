@@ -19,6 +19,7 @@ use super::locking::{convert_status, error_answer};
 use super::site::{ReportProgress, Served};
 use crate::dav::listing::FileRevsReport;
 use crate::reads::{DavFileRevs, DavLogProgress, Repository};
+use crate::report::exchange::Budget;
 
 /// The status a walk refused before its first byte is answered with, where `dav_svn__convert_err` maps no other.
 /// Format: `reports/file-revs.c` `dav_svn__file_revs_report`, `HTTP_INTERNAL_SERVER_ERROR`.
@@ -45,11 +46,12 @@ impl FileRevsWalk {
     &mut self,
     served: &Served<'_, R>,
     out: &mut Vec<u8>,
-    room: usize,
+    budget: Budget,
   ) -> ReportProgress {
-    let progress = self
-      .revisions
-      .resume(served.index, served.repository, served.rules, out, room);
+    let progress =
+      self
+        .revisions
+        .resume(served.index, served.repository, served.rules, out, budget);
     match progress {
       DavLogProgress::More => ReportProgress::More,
       DavLogProgress::Done => ReportProgress::Done,

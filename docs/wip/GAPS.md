@@ -168,8 +168,9 @@
 > within the owner's quantum, the answer the same bytes; piece 3a: sets in runs or bits, whichever is smaller, and packets
 > sized from the room (a clone within 4 KiB); piece 3b: both edges admit a fetch a request's room and answer it in turns
 > (the 3,000-commit clone by use over HTTP and SSH); rule 4: a fetch holds the generation it began on (a shared fork at
-> the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects). Owed:
-> protocol v0 in turns, `begin`'s walks in units, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> the repository's stamp, its refs as they stood; a push and tag mid-fetch leave its pack the start's objects);
+> `begin`'s walks in turns (`ready`'s search, the cut, `include-tag`'s scan: `begin` reads what the request names, each
+> step a unit). Owed: protocol v0 in turns, scattered plans; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -2928,7 +2929,13 @@
 >   volume's whole image in one turn, at every whole entry and install image; **the whole entry's half closed
 >   2026-11-18, A-377, g230:** captured in its publication's turn and sealed a piece a turn by a task of the owner
 >   shard, the publications made meanwhile queued behind it, each appended in order as the credit admits it; install
->   images (`refresh_image`) still one turn, owed); and, after A-347's open, the takeover's
+>   images (`refresh_image`) still one turn, owed; **since A-755 (2026-11-20, w-forming) a turn's pieces are sized to the
+>   seal rate measured in the build and the quantum left, a page to an archive chunk** (a turn had sealed a MiB at least
+>   however small its quantum, 87 to 302 ms of CPU against 14 to 784 us quanta, a debug fleet under `taskpolicy -b`);
+>   **still one turn, owed:** the append that ends a build (`append_build`: the sealed body joined and cloned into the
+>   shipper and the volume's whole state, 223 to 498 ms of CPU a turn for 1.8 to 2.5 MB in the same runs), and a
+>   shipper append of a large delta (128 to 331 ms for 1.8 to 2.5 MB; 29 ms for 4.8 KB, so not the payload's size
+>   alone)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -7021,11 +7028,14 @@
 >   while the daemon lives, the daemon's own watchdog ending a stuck or spinning shard, so the guest no longer judges
 >   the shards' CPU itself; an answer past the old five seconds is still counted, `Waits::extended`), its condition polls
 >   (`wait_until`, `wait_for_count`, the route's malformed count), its route and resync reads; and `common/client.rs`'s
->   `START_WAIT` and `TAKEN_WAIT`. Not in the part, found by its sweep: the same five- to sixty-second waits under other
->   names (`START_WAIT`, `TAKEN_WAIT`, `HOLD_START_WAIT`) in `server/tests` (`recovery`, `give_back`,
->   `cross_shard_wait`, `consumers`, `attachment_term`, `reply_room`, `forward_retry`), `client/tests` and its
->   examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module and `xtask`'s conformance and kind harnesses;
->   each is a test's wait on a live daemon on the wall. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   `START_WAIT` and `TAKEN_WAIT`. Found by its sweep, outside the part: the same five- to sixty-second waits under other
+>   names (`START_WAIT`, `TAKEN_WAIT`, `HOLD_START_WAIT`), each a test's wait on a live daemon on the wall. In
+>   `server/tests` since 2026-11-20 (g226, main's ruling): `recovery` (a connect, two create retries, a pool's return,
+>   a heartbeat's stop, a stop's end and nine condition loops), `give_back`, `cross_shard_wait`, `consumers`,
+>   `attachment_term`, `reply_room` and `forward_retry` wait on their event while the daemon lives, its watchdog the
+>   bound (A-232). Owed: `client/tests` and its examples, `api/tests`, `cli/tests`, `cli/src/verbs.rs`' test module
+>   and `xtask`'s conformance and kind harnesses, the out-of-process ones judged by their processes' own CPU as
+>   `live_chaos`' start wait is (b25a5b7a6). The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
 >   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
 >   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
 >   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the

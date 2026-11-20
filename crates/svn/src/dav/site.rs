@@ -298,7 +298,7 @@ impl Report {
     let room = budget.room;
     let log = match &mut self.walk {
       Walk::Log(log) => log,
-      Walk::FileRevs(revisions) => return revisions.resume(served, out, room),
+      Walk::FileRevs(revisions) => return revisions.resume(served, out, budget),
       Walk::Update(walk) => {
         let walked = Walked {
           index: served.index,

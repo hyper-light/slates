@@ -143,14 +143,15 @@ const STEP_WORK: usize = 256;
 /// microseconds), far short of a whole window's making there (milliseconds).
 const STEP_BUDGET: Duration = Duration::from_micros(500);
 
-/// How many timed runs the red test makes: a step the machine took away from the test (a preemption) is not the
-/// unit's, so the run with the fewest steps past the budget is the one judged.
-const TIMED_RUNS: usize = 3;
+/// How many more times a step past [`STEP_BUDGET`] is timed again from its state before it: a step's time is the least
+/// of its timings, so time the machine took away from the test (a preemption, measured up to 3.6 ms under the suite's
+/// load) is not charged to it, while a step whose own work is past the budget stays past it every time.
+const RETIMES: usize = 2;
 
 /// A-751, the red (main's: "a large text's window driven with the past-budget counter at 0, and the bytes equal to the
 /// whole window's"). Do: make a full 102,400-byte window of a text edited every 997 bytes against its source, in each
-/// encoding, [`STEP_WORK`] units a step, timing each step. Expect: in the best of [`TIMED_RUNS`] runs no step past
-/// [`STEP_BUDGET`] (the units-past-budget counter at 0), many steps, and the bytes the whole window's. Red before the
+/// encoding, [`STEP_WORK`] units a step, timing each step (a step past the budget timed again from its state before,
+/// [`RETIMES`]). Expect: no step past [`STEP_BUDGET`] (the units-past-budget counter at 0), many steps, and the bytes the whole window's. Red before the
 /// change: the window was made in one call, milliseconds in a debug build.
 #[test]
 fn a_large_texts_window_is_made_with_no_step_past_its_budget() {
@@ -158,41 +159,36 @@ fn a_large_texts_window_is_made_with_no_step_past_its_budget() {
   let target = edited(&source, 997);
   for encoding in ENCODINGS {
     let expected = whole(&source, &target, encoding);
-    let mut fewest_past = usize::MAX;
-    let mut runs = Vec::new();
-    for _ in 0..TIMED_RUNS {
-      let mut making =
-        WindowMaking::new((0, source.len()), target.len(), encoding.0, encoding.1).unwrap();
-      let (mut steps, mut past, mut longest) = (0usize, 0usize, Duration::ZERO);
-      loop {
-        let began = Instant::now();
-        let done = making.step(&source, &target, STEP_WORK).unwrap();
-        let took = began.elapsed();
-        steps += 1;
-        longest = longest.max(took);
-        past += usize::from(took > STEP_BUDGET);
-        if done {
+    let mut making =
+      WindowMaking::new((0, source.len()), target.len(), encoding.0, encoding.1).unwrap();
+    let (mut steps, mut past, mut longest) = (0usize, 0usize, Duration::ZERO);
+    loop {
+      let before = making.clone();
+      let began = Instant::now();
+      let done = making.step(&source, &target, STEP_WORK).unwrap();
+      let mut took = began.elapsed();
+      for _ in 0..RETIMES {
+        if took <= STEP_BUDGET {
           break;
         }
+        let mut again = before.clone();
+        let began = Instant::now();
+        again.step(&source, &target, STEP_WORK).unwrap();
+        took = took.min(began.elapsed());
       }
-      runs.push((steps, past, longest, making.made().map(|made| made.bytes())));
-      fewest_past = fewest_past.min(past);
+      steps += 1;
+      longest = longest.max(took);
+      past += usize::from(took > STEP_BUDGET);
+      if done {
+        break;
+      }
     }
-    let seen: Vec<_> = runs
-      .iter()
-      .map(|(steps, past, longest, _)| (steps, past, longest))
-      .collect();
-    assert_eq!(
-      fewest_past, 0,
-      "{encoding:?}: (steps, past, longest) {seen:?}"
+    assert_eq!(past, 0, "{encoding:?}: {steps} steps, longest {longest:?}");
+    assert!(making.made().unwrap().bytes() == expected, "{encoding:?}");
+    assert!(
+      steps > target.len() / STEP_WORK,
+      "{encoding:?}: {steps} steps"
     );
-    for (steps, _, _, bytes) in &runs {
-      assert!(bytes.as_ref() == Some(&expected), "{encoding:?}");
-      assert!(
-        *steps > target.len() / STEP_WORK,
-        "{encoding:?}: {steps} steps"
-      );
-    }
   }
 }
 

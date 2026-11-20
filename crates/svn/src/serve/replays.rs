@@ -21,9 +21,10 @@ use crate::index::Revision;
 use crate::ra_svn::{self, Value};
 use crate::reads;
 use crate::report::drive::Call;
-use crate::report::drive::replay::Replay;
+use crate::report::drive::replay::{Replay, Stepped};
 use crate::report::editor::EditorWriter;
 use crate::report::exchange::Budget;
+use crate::report::exchange::Slice;
 
 /// `replay`'s command word.
 const REPLAY: &str = "replay";
@@ -149,16 +150,25 @@ impl Connection {
   {
     let start = out.len();
     let mut steps = budget.steps;
+    let slice = Slice::begin(budget.quantum);
+    let mut taken = false;
     let capabilities = established.session.capabilities;
     let base = established.base.clone();
     let most_open = self.limits.most_open;
     let rules = established.compiled_read_rules(&sources.policy).cloned();
     loop {
-      if out.len().saturating_sub(start) >= budget.room || steps == 0 {
+      // A-751: a timed turn ends at the first step past its quantum; an untimed one after its steps.
+      let spent = if slice.timed() {
+        taken && slice.spent()
+      } else {
+        steps == 0
+      };
+      if out.len().saturating_sub(start) >= budget.room || spent {
         self.phase = Phase::Replaying(established, replaying);
         return Ok(super::Turn::Wrote);
       }
       steps = steps.saturating_sub(1);
+      taken = true;
       match std::mem::replace(&mut replaying.stage, Stage::Done) {
         Stage::Begin => {
           if replaying.range {
@@ -180,25 +190,28 @@ impl Connection {
               }
             }
           }
+          let (version, compression) = crate::report::editor::encoding_of(&capabilities);
           let replay = Replay::new(
             replaying.next,
             &base,
             replaying.low_water_mark,
             replaying.send_deltas,
-          );
+          )
+          .with_encoding(version, compression);
           let writer = EditorWriter::new(&capabilities, most_open);
           replaying.stage = Stage::Drive(Box::new((replay, writer)));
         }
         Stage::Drive(mut driving) => {
           let (replay, writer) = &mut *driving;
-          match replay.next(sources.index, sources.repository, rules.as_ref()) {
-            Ok(Some(call)) => {
+          match replay.next_within((sources.index, sources.repository), rules.as_ref(), 1) {
+            Ok(Stepped::Paused) => replaying.stage = Stage::Drive(driving),
+            Ok(Stepped::Call(call)) => {
               writer
                 .write(&call, out)
                 .map_err(|refused| Refused::Report(crate::report::Refused::Editor(refused)))?;
               replaying.stage = Stage::Drive(driving);
             }
-            Ok(None) => {
+            Ok(Stepped::Ended) => {
               let finish = Value::List(vec![Value::Word(FINISH_REPLAY), Value::List(Vec::new())]);
               ra_svn::write(&finish, out).map_err(Refused::Item)?;
               replaying.next = replaying.next.saturating_add(1);
