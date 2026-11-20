@@ -41,6 +41,7 @@
 - DONE sw48c (09:41Z end): formed+settled 48/48, fresh member rejoined 48/48, test 47/48 (run 21 = takeover spin).
   GAPS line landed 2add29641 (verified on origin/main). Reported to main for the forming goal.
 - ~10:50Z rp2 started: 40 runs throttled on agents/w-forming-repro (c685be2eb = origin/main + settled_holders diagnosis aid), spin-sampler on, A-740 (main) names a spinning task in the watchdog line. bg b420ae1gd, logs ~/.cache/w-forming-runs/rp2.
+- main: forming goal met at 143/143 formed-and-settled on main with A-735 (1-in-48 stall shows with 95% odds). Count: sw48c 48 + rp2 (up to 40) + rp3 (55 more, same flow, throttled, sampler on) -> then add the combined count to the GAPS sweep entry.
 - Queue after sw48c: run-7 stall chase; then run-25 spin (main 2026-11-20: name the unsliced task, fix failing-test
   first or hand main its location). Tool: ~/.cache/w-forming-scripts/spin-sampler.sh <runs-dir> samples every chaos
   daemon on a >=300 ms poll line; use with repro loops only, never during evidence runs.
