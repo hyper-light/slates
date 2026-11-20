@@ -54,6 +54,7 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{Principal, RepositoryId, VcsTool, VolumeId as DbVolumeId};
+use slates_ipc::protocol::Refusal;
 use slates_merge::engine::{Green, Increment};
 use slates_merge::ops_doc::{NODE_EXCLUSIVE, Op, OpKind, OpsDoc, REPLACE};
 use slates_svn::commit::drive::Work;
@@ -387,13 +388,39 @@ fn land(
     ..EntryParts::default()
   };
   let change = BranchChange::Update { green, work };
-  match RepositoryLogs::append(state, principal, repository, vec![change], parts) {
-    Ok(appended) => Ok(applied(state, repository, checked, &appended)),
+  let mut appended = RepositoryLogs::append(
+    state,
+    principal,
+    repository,
+    vec![change.clone()],
+    parts.clone(),
+  );
+  if at_capacity(&appended) {
+    // The chain at the partition's cap, as a push's admission meets it (A-238): checkpoint the green at its floor at
+    // once and append again.
+    crate::merge_service::checkpoint_green_when(state, green, crate::merge_service::Doubling::Now);
+    appended = RepositoryLogs::append(state, principal, repository, vec![change], parts);
+  }
+  match appended {
+    Ok(appended) => {
+      // Fold the green's chain by the merge service's doubling rule as every accepted version does (W3), so a
+      // repository's chain stays bounded however many revisions it takes.
+      crate::merge_service::checkpoint_green(state, green);
+      Ok(applied(state, repository, checked, &appended))
+    }
     Err(refused) => {
       crate::vcs_store::unreserve_svn(state, repository, growth);
       Err(Uncommitted::Append(refused))
     }
   }
+}
+
+/// Whether `appended` was refused for the partition's merge budget (`green_chains` at its cap).
+fn at_capacity<T>(appended: &Result<T, AppendRefused>) -> bool {
+  matches!(
+    appended,
+    Err(AppendRefused::Entry(Refusal::TableAtCapacity { table })) if table == "green_chains"
+  )
 }
 
 /// The records once the entry recorded the revision: applied, as the check made certain; the answer `commit-info`

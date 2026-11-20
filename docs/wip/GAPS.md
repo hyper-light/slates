@@ -470,6 +470,11 @@
 > then revision 1, on a two-shard daemon; macOS arm64, this Mac, local: server `vcs_svn::` 11 of 11 with
 > `repository::svn_commit::`, `vcs_ssh` 59 of 59, slates-svn 120 of 120). Owed: the tunnel's production lender in the
 > daemon's SSH site; a configured hook run; stock `svn` over `svn://` end to end (the interop leg).
+> Fixed 2026-11-19 (w-svn, found by w-perf's use): a Subversion landing never checkpointed its green, so an import of
+> git/git's newest 5,000 commits was refused `TableAtCapacity { table: "green_chains" }` after 1,685 revisions;
+> `svn_commit::land` now folds the green by the merge service's doubling rule after each revision and, at the cap,
+> checkpoints at once and appends again, as a push does (test
+> `subversion_revisions_fold_their_greens_chain_as_they_land`, red then green; macOS arm64, this Mac, local).
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -1317,6 +1322,14 @@
 > real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
 > (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
 > clone pass: 14 of 24 (main 9f51d75, debug, Mac Studio). The matrices' rows count a command that cannot start as failed.
+> **svn:// interop runs (w-interop, 2026-11-20):** `svn_interop.rs`'s svn:// round trip un-ignored: stock svn 1.15.0's
+> checkout, commits, update and log over the daemon's svn:// listener pass (main 4785858, Mac Studio). svn+ssh still
+> closes the tunnel (`E210002`), and the HTTP legs meet `'/project' path not found` (the DAV reads, A-681).
+> **Stock svn command matrix (w-interop, 2026-11-20):** `ci/interop/svn-matrix.sh` (27 rows; git/git's last 2,000
+> commits as a 458 MB dump, `repository import`ed in 21 s): over svn:// info, ls, cat, checkout, log, blame, diff,
+> export, update, commits, properties, server-side copies, switch, merge, delete and revert pass; `lock` is refused
+> (`Server doesn't support the lock command`), HTTP meets `path not found` (A-681) and the SSH edge answers
+> `svnserve -t is not served yet`: 22 of 27 (main 4785858, debug, Mac Studio).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
@@ -9894,6 +9907,9 @@ itself (`files.delegate_write(..) == Some(delegation)`), which is stronger. One 
   request, which is the exact condition entry invalidation exists to break. Nothing is dropped.
   Write-up, with the three edits a fix would make:
   `docs/bugs/2026-10-20-the-fuse-notify-rounds-wake-was-built-and-never-wired.md`.
+  **Fixed** by `7deddf549` (2026-10-21; the daemon's mount task waits on its `ChangeSignal`,
+  `fuse.rs` `change_signal` calls `wakes_with`); the record's Status set to fixed 2026-11-19
+  (goal-83 audit B16).
 
   While there, the Linux-only module itself was linted on Linux for the first time from this
   machine: `cargo clippy -p slates-bridge-fuse --all-targets -- -D warnings` is clean on a native
