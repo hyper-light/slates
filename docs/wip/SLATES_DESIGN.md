@@ -12467,6 +12467,9 @@ A-363's failover estimate is the pattern: its estimators keep learning from the 
 **The order-of-magnitude method.** Main measures and records it in `BENCHMARKS.md` under the rule of the project's
 §5: release builds, the hardware, the dataset's commit, the date, the load discipline, and the best of N with all N
 shown.
+> **Status (A-699, 2026-11-20, w-perf):** the stock baselines are recorded (`crates/cli/bench/{git,hg,svn}_scale.sh`,
+> BENCHMARKS.md): git/git, Mercurial's repository and git/git's newest 5,000 commits as svn, over `git daemon`,
+> `hg serve` and `svnserve`; slates' side and the remaining competitors and measures are owed.
 - Competitors: `git-http-backend` and Gitaly for git; `hg serve` for Mercurial; `svnserve` and `mod_dav_svn` for
   Subversion.
 - Dataset: the Linux kernel tree the load tests already hold, as a git repository, and its conversions to Mercurial

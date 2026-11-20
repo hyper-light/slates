@@ -70,10 +70,9 @@ timed() {
   if [ "$status" != ok ]; then tail -5 "$WORK/err.${name// /-}" | sed 's/^/    /'; fi
 }
 
-REVISIONS=$(grep -ac '^Revision-number: ' "$DUMP")
 git -C "$SOURCE" ls-tree -r --format='%(objectmode) %(objectname) %(path)' "$REF" | sed -n 's/^100[0-7]* //p' \
   | LC_ALL=C sort > "$WORK/source.files"
-echo "dataset: $DUMP, $(du -h "$DUMP" | cut -f1), $REVISIONS revisions; $SOURCE at $(git -C "$SOURCE" rev-parse "$REF"), $(wc -l < "$WORK/source.files" | tr -d ' ') regular files"
+echo "dataset: $DUMP, $(du -h "$DUMP" | cut -f1); $SOURCE at $(git -C "$SOURCE" rev-parse "$REF"), $(wc -l < "$WORK/source.files" | tr -d ' ') regular files"
 echo "svn: $(svn --version --quiet); svnserve: $(svnserve --version --quiet)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 

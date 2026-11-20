@@ -696,6 +696,11 @@
 > its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
 > exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
 > the daemon's edge is built since (stock git's interop tests, next).
+> **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
+> stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
+> commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
+> A-704), git-http-backend, Gitaly, mod_dav_svn, the Linux kernel dataset, server CPU and memory, concurrent clients.
+>
 > **Stock git's interop tests (2026-11-19, g309, UI goal 93):** `crates/cli/tests/git_interop.rs` drives stock git
 > (`SLATES_TEST_GIT`, else `git`, skipping loudly without it) against a real anchor and its daemon: a round trip (a
 > first commit pushed to an empty repository, cloned, an edit pushed from the clone and fetched back into the first

@@ -14608,3 +14608,63 @@ miniz_oxide, slower in both directions at both levels.
 Consequence for tests: two deflate engines need not write the same bytes for one input. A golden test holds what the
 inflated stream means (its bytes and its object id), never a stock tool's compressed bytes.
 
+
+## Stock git, Mercurial and Subversion servers at scale: the baselines slates is measured against (A-699; UI goal 93; 2026-11-20)
+
+The competitor's side of §4.17.1's order-of-magnitude method, each stock client against its stock server on loopback,
+a fresh server every run. Slates' side over the same datasets is the next record.
+
+- **Machine:** Mac Studio, Apple M3 Ultra (32 cores, 96 GiB), macOS 26.4 (25E246), 2026-11-20 04:21 to 04:47 UTC,
+  shared with agents' builds: load average 8.91 at the start, 57.26 at hg's end (a spike), 7.00 at the end. Not quiesced,
+  so the spread between runs is the box's, and each best is an upper bound.
+- **Clients and servers:** git 2.50.1 (Apple Git-155) and `git daemon` (receive-pack enabled, `uploadpack.allowFilter`);
+  Mercurial 7.2 (`uvx --from mercurial==7.2`) and `hg serve` over HTTP; Subversion 1.15.0 and `svnserve -d`.
+- **Datasets:** git: git/git bare at f7de81456940 (8 branches, 1,019 tags, 86,352 commits, 424,851 objects, a 324 MiB
+  pack). Mercurial: Mercurial's own repository (`hg clone -U https://www.mercurial-scm.org/repo/hg`) at 57035:a93340995
+  (57,036 changesets, 307 tags, 86 MiB store). Subversion: git/git's newest 5,000 first-parent commits of master to
+  f7de81456940 as a dump (`crates/cli/bench/git_to_svn_dump.py src.git master 5000`, 992 MiB, written in 247 s), the
+  oldest written whole as r1.
+- **Commands** (harness w-perf branch commit, landed with this entry):
+  `SERVERS=stock crates/cli/bench/git_scale.sh - src.git WORK 3 1800`;
+  `crates/cli/bench/hg_scale.sh HG hg-src WORK 3 1800`;
+  `crates/cli/bench/svn_scale.sh git-5000.dump src.git master WORK 3 3600`.
+- **Checks (first run):** git's mirror clone `fsck --full` clean, refs (1,027) and object ids (424,851) identical to the
+  source; hg's clone `hg verify` clean, changesets (57,036) and tags (307) identical; svn's log named all 5,000
+  revisions every run. The svn tree check over this run compared against `git archive`'s tree and differed in 7 lines,
+  all git's doing (three `eol=crlf` `.bat` files written with CRLF, and the two `subprojects` links' loops); the harness
+  now compares blob ids, and that check over a 20-commit dump to the same tip read 4,872 of 4,872 files identical.
+  Every incremental step's change arrived.
+
+Seconds, wall clock at the client, every run shown:
+
+| git (`git daemon`) | 1 | 2 | 3 | best |
+|---|---|---|---|---|
+| push, every branch and tag | 38.364 | 26.257 | 45.110 | 26.257 |
+| clone `--mirror` | 19.117 | 22.889 | 32.983 | 19.117 |
+| one-commit push | 0.328 | 0.201 | 0.180 | 0.180 |
+| fetch of it | 0.378 | 0.390 | 0.196 | 0.196 |
+| clone `--depth 1` | 2.412 | 4.672 | 1.502 | 1.502 |
+| clone `--filter=blob:none` | 18.260 | 15.221 | 7.075 | 7.075 |
+
+| Mercurial (`hg serve`) | 1 | 2 | 3 | best |
+|---|---|---|---|---|
+| push, every changeset | 42.127 | 15.786 | 48.823 | 15.786 |
+| clone `-U` | 62.158 | 29.113 | 23.028 | 23.028 |
+| one-changeset push | 0.379 | 0.504 | 0.196 | 0.196 |
+| pull of it | 0.359 | 0.537 | 0.158 | 0.158 |
+| clone `--stream` | 0.808 | 4.387 | 0.501 | 0.501 |
+
+| Subversion (`svnserve`) | 1 | 2 | 3 | best |
+|---|---|---|---|---|
+| `svnadmin load` (once) | 805.519 | | | 805.519 |
+| checkout of trunk | 4.034 | 3.311 | 4.216 | 3.311 |
+| `log -q`, whole history | 0.662 | 0.603 | 0.743 | 0.603 |
+| one-file commit | 4.162 | 3.795 | 3.685 | 3.685 |
+| update to it | 0.958 | 0.922 | 0.992 | 0.922 |
+| update across 1,000 revisions | 2.075 | 2.115 | 2.043 | 2.043 |
+
+What it means: the whole-history transfers (git push and clone, hg push and clone) are the 15 to 45 s operations where
+an order of magnitude is worth chasing; the one-commit steps are already 0.15 to 0.5 s, mostly client start-up and
+round trips. Subversion's load costs 0.16 s a revision (it flushes each), and its one-file commit 3.7 s, most of it the
+client walking a 4,872-file working copy. Owed against §4.17.1's method: git-http-backend and Gitaly, mod_dav_svn, the
+Linux kernel as the dataset, the server's CPU and peak memory, and N concurrent clients.
