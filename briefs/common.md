@@ -198,7 +198,7 @@ ideal." And on Mantle's code: "Copy into slates".
 - **New VCS storage code reads through one seam:** an in-flight change from RAM, landed content from disk. Owner of the
   seam, the vendored crates and the store: w-store. Until it lands, keep your designs to that seam; don't build a
   second store.
-- **One unit: the changeset (ADA ~13:35 PST: "More than even storing it as diffs, would it be better to store it as
+- **One unit: the changeset (ADA ~12:20 PST: "More than even storing it as diffs, would it be better to store it as
   *changesets*? This way we aren't introducing a second underlying unit.").** A repository's history on disk is the
   append-only log of its landed changesets: the same unit that is a change in RAM before it lands, so landing is an
   append. Everything else is derived data (A-645), computed from changesets and cached by identity within the memory
@@ -207,7 +207,7 @@ ideal." And on Mantle's code: "Copy into slates".
   a pack store, stored texts) as truth. A pack or bundle held while a push is judged is the change in flight, not
   history. Each version's full-text identity is recorded in metadata, so verification and content-once still hold.
 
-## CLAUDE.md §8 BINDS: WHAT AN AGENT RUNS (main 2026-11-20 ~14:10, correcting main's own earlier notes)
+## CLAUDE.md §8 BINDS: WHAT AN AGENT RUNS (main 2026-11-20 ~12:35, correcting main's own earlier notes)
 slates' CLAUDE.md §8 (Ada, 2026-11-18, "binding on every agent and subagent, forever"): an agent implements, runs its
 **focused** unit and integration tests, merges, and ends.
 - **Not the agent's to run:** clippy, the lint matrix, xtask, cross-target or other platforms' builds (Linux-only or
