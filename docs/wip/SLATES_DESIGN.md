@@ -55398,3 +55398,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed.** P3 (the presenter under SLATES_ROOT, after A-727 a2: the hook drivers handing the view's path as REPOS),
   P4, the root mount's publication.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
+
+### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Change.** A parked submit keeps the instant it parked (`verbs::ParkedSubmit::parked_ns`); at each slice of its
+  green's build, one that has waited past the node's failover delay (`ShardState::failover_ns`, the most a reply is
+  held, the bound `base_wait` keeps) is answered `Overloaded` on its route, unrecorded, so its retry runs, nothing of it
+  having run; counted `vcs_store.paths.whole_build.overdue` (zero is the healthy reading).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::commits::tests::
+  t_a664_live_a_parked_submit_waits_at_most_its_bound` (parked once; none answered within an unbounded wait; answered
+  overdue past a bound of none; the build's end runs nothing of it). `cargo test --locked -p slates-server --lib --
+  vcs_store:: repository:: git_push:: vcs_http::git work_home:: identities:: --test-threads=4` 153 of 153; fmt clean.
