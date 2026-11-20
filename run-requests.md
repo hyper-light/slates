@@ -6858,3 +6858,8 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - `cargo test -p slates-server --lib svn` (macOS arm64, this Mac, loaded, base 514500813 + A-766 part 1): 83/84,
   `vcs_svn::tests::an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` failed at tests.rs:1180 (the pre-unlock
   hook's recorded args); alone 3/3 green. Red would be the same assertion failing in a loaded full run.
+
+## 2026-11-20, w-forming: A-768 whole capture in turns from pinned chunks (main 4c9e0b759; commit 586cf5035, base 51a061d36)
+- clippy + xtask over `crates/vfs` (content.rs Pins/pin_chunk/unpin_chunk/unpin_extents, volume.rs pin_extents/PinnedFile) and `crates/server/src/live_ship.rs` (Capture, start_capture, advance_capture, read_capture, release_capture).
+- Flows (macOS arm64 debug, `SLATES_TEST_CLI=1`): `cargo test -p slates-cli --test live_fleet -- a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns a_live_write_ships_the_bytes_it_changed_not_its_window` and the takeover flows; `--test live_chaos a_member_that_never_held_the_log_never_stands_in_for_its_holder` under `taskpolicy -b`. Red: a rebuild refused (`fleet.live.refused.*`), `fleet.live.capture_unpin_refused` > 0, or a successor serving bytes other than the owner's.
+- Release A/B of the takeover's `published_before_served` turn (before: 21 ms debug, of which capture reads 4.5-6 ms); expect the reads gone from that turn, the image (2-3 ms debug) left.
