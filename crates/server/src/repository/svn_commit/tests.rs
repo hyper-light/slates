@@ -751,3 +751,63 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
   let alice = Some("alice".to_owned());
   assert_eq!(seen, (Ok(()), alice.clone(), Some(true), alice));
 }
+
+/// A-664's Subversion objects (bug, found by reading: a version a work submits to a Subversion repository's green made
+/// no revision, so the green passed its records' youngest revision and every later commit was refused). Do: make a
+/// Subversion repository; submit a work making `/trunk/a.txt` to its green; then commit a client's revision on the
+/// youngest revision adding `/trunk/b.txt`. Expect: the submit made revision 1, its rows adding `/trunk` and
+/// `/trunk/a.txt` with the file's text; the client's revision lands as revision 2, the green at version 2 holding both
+/// files.
+#[test]
+fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "submitted");
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let made = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
+    let version = crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made]);
+    assert_eq!(version, 1);
+    assert_eq!(kept(state, svn).0, 1, "the submit made no revision");
+    let rows: Vec<(String, Action, NodeKind, bool)> = state
+      .vcs_stores
+      .subversion_records(svn)
+      .and_then(|records| records.index().changes(1).ok().map(<[ChangedPath]>::to_vec))
+      .unwrap_or_default()
+      .into_iter()
+      .map(|row| {
+        (
+          row.path,
+          row.action,
+          row.kind,
+          row.text == Some(real_text(b"alpha\n")),
+        )
+      })
+      .collect();
+    let made = vec![
+      ("/trunk".to_owned(), Action::Add, NodeKind::Directory, false),
+      ("/trunk/a.txt".to_owned(), Action::Add, NodeKind::File, true),
+    ];
+    assert_eq!(rows, made);
+    let rows = vec![file("/trunk/b.txt", Action::Add, b"beta\n")];
+    let committed = commit(
+      state,
+      (&owner(), svn),
+      revision(1, rows, &[b"beta\n"]),
+      None,
+    );
+    assert_eq!(committed, answered(2));
+    let seen = (
+      green_head(state, green),
+      green_file(state, green, "trunk/a.txt"),
+      green_file(state, green, "trunk/b.txt"),
+    );
+    assert_eq!(
+      seen,
+      (Some(2), Some(b"alpha\n".to_vec()), Some(b"beta\n".to_vec()))
+    );
+  });
+}
+
+/// `bytes` as the server's own revision names its text, with its real digests.
+fn real_text(bytes: &[u8]) -> Text {
+  slates_svn::commit::drive::text_of(bytes).expect("the digests")
+}

@@ -15945,7 +15945,8 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
 > order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
 > dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3; its room built, below), the cold trigger (4; its choice and git's drop built:
-> `slates_vcs::cold::choose`, `Repository::kept_fragments`/`drop_fragments`; the server's trigger owed), intake off the owner
+> `slates_vcs::cold::choose`, `Repository::kept_fragments`/`drop_fragments`, and the server's trigger in
+> `vcs_share::room`; compression of cold content owed), intake off the owner
 > shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
 > amends §4.10's content placement), the many-repository load proof (7), the snapshot sized by its data (8) and a
 > giant repository's index across partitions (9), both designed below.
@@ -52440,8 +52441,9 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   rebuilt repository makes each member green's map and trees from its adopted head, `vcs_store::make_whole`); a
   recovery's whole builds sliced (BUILT 2026-11-20: the head's files put one a unit of its slices,
   `paths::remake_green_sliced`), the live whole builds and a whole map's release owed; a copy made through a work
-  driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
-  by the same rule.
+  driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
+  (BUILT 2026-11-20, `vcs_store::svn_made`; its copies, symbolic links and author owed); Mercurial's manifests by the
+  same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
   `vcs_store/tests.rs`; `crates/server/src/verbs.rs` (the submit's step); `crates/server/src/repository/push.rs` (the
@@ -54628,3 +54630,37 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   (the bytes given back exact, the version re-encoded to the same fragments, the pack read back whole). Owed (4b): the
   server's trigger (a repository whose grant `vcs_share::room` finds below what it holds drops by this choice, its
   reads from its usage row, its rebuild times measured), then compression of cold content.
+- **Piece 4b, the trigger (2026-11-20).** What a repository holds now counts its kept fragments (`vcs_share`'s
+  `held_by`); while repositories contend (`vcs_share::room`'s divided path), each claimant holding more than its grant
+  gives back what §4.11's cost model says to (`vcs_store::git_encode::relieve`, counted `vcs_store.git_encode.dropped`):
+  the rebuild of a byte priced at what this repository's own encodings took (its usage row learns `derive_ns` and
+  `derive_bytes` at every encoding turn), on each read its row expects (its fetches over its answered intakes). Nothing
+  is dropped while its encoding runs, or before one was measured. Test: `vcs_share::tests::t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room`
+  (stock git's pushes encoded; with no reads to come every fragment dropped, bytes given back exactly, encoded again;
+  with fetches a thousandfold its pushes, kept), with `vcs_share:: git_push:: vcs_store::upload::` 17 of 17 and
+  `slates-vcs` `usage` green. Owed: compression of cold content; a drop of many versions a turn at a time.
+
+
+### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
+- **What was there.** A submitted version moved a Subversion repository's one green and made no revision, so the
+  green passed its records' youngest revision: every later `svn commit` was refused (its step lands only while the
+  green is at the youngest revision), and no client saw the version (`docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`).
+- **Change.** `vcs_store::svn_made::make`, from `verbs::judge_submission` after git's made commit: the revision after
+  the youngest, its changed-path rows from each path the change index names between the two versions, read before from
+  the records (`Index::node`) and after from the green (`add`, `delete`, `replace` where the kind changed, `modify`
+  where the text or the property list did; a file's text with its real digests, `slates_svn::commit::drive::text_of`,
+  new; a node's property list the identity its reserved attribute names, held by the records; each directory above an
+  added node that did not stand added; a deletion beneath a deleted directory dropped); `svn:log` the submit's message
+  and `svn:date` the owner's instant. Landed by `svn_commit::land_made`: checked as an import's revision, its record
+  appended in the submit's own transaction in an entry holding it alone, then applied; a recovery replays it with every
+  other record. Not made, counted `vcs.svn.revision_unmade`, the version standing: a copy, a symbolic link or special
+  file, a property list the records lack, a refusal.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server`
+  `repository::svn_commit::tests::t_a664_svn_a_submitted_version_is_the_revision_the_server_makes` (a work making
+  `/trunk/a.txt` submitted, then a client's revision adding `/trunk/b.txt`): red first, the records' youngest left at
+  0; green, revision 1 adds `/trunk` and `/trunk/a.txt` with its real text, the client's revision lands as 2 and the
+  green holds both files. `cargo test --locked -p slates-server --lib -- repository::svn_commit:: vcs_svn
+  vcs_store::svn --test-threads=4` 21 of 21; fmt clean.
+- **Owed.** `svn:author` (the principal's Subversion name among its identities, A-664 part 1); a copy as a row with
+  its source; symbolic links as `svn:special` files; Mercurial's changesets of a submitted version; a stock `svn
+  update` over the made revision by use (main's).
