@@ -104,3 +104,11 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - Item 2: design note inbox/main-from-w-engine-greens-in-pool.md (premise corrected: greens hold files only in the
   engine; 241.5 MiB = 48.2 MiB current + ~193 MiB history); waiting for main's call before code.
 - Scratch kept: ~/.cache/w-engine-bench/*.sh, *.py (profile tools). Delete when item 2 is decided.
+
+## A-744 LANDED c3c581f87 (merge 65cb4c522), main's rulings of 2026-11-20 ~11:00
+- 581 MiB split: owner partition's anchor-segment log ring 355.2 MiB + snapshot slots 225.8 MiB; content object
+  2.3 MiB; greens' files are not in it. status --json content_ranges per shard (swept, bounded).
+- Leftovers: svn record exact length; svn commit checkpoint-first, one append; log decode-after-encode KEPT (A-420's
+  replay measure; removing needs a non-decoding replay measure: main's call).
+- Unsafe: large.rs every site SAFETY-directly-above; fold of unmap kept 79; +1 mincore -> 80; xtask unsafe ok.
+- ~/.cache/w-engine-bench deleted.
