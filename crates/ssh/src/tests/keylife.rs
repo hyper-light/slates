@@ -41,7 +41,8 @@ fn a_cap_only_lowers_the_limits() {
   assert_eq!(
     limits.capped(UsageCap {
       packets: Some(8),
-      blocks: None
+      blocks: None,
+      bytes: None,
     }),
     KeyLimits {
       packets: 8,
@@ -52,7 +53,8 @@ fn a_cap_only_lowers_the_limits() {
   assert_eq!(
     limits.capped(UsageCap {
       packets: Some(u64::MAX),
-      blocks: Some(1 << 40)
+      blocks: Some(1 << 40),
+      bytes: None,
     }),
     limits
   );
