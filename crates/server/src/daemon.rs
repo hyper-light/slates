@@ -7764,6 +7764,90 @@ mod tests {
     );
   }
 
+  /// A-729 part 2 (an import's record names its contents by identity; main's ruling: since A-727 a3 the content survives
+  /// a restart in the shard image, recovered before the records). Do: on a daemon over a retained anchor segment, import
+  /// the `states` repository into a Mercurial repository a unit a turn and land it; publish every shard; stop; start a
+  /// successor over the same segment. Expect the successor's index of the repository the first's row for row, made
+  /// again from its identity record over the windows the image restored: every window restored, none refused, none left
+  /// unheld once the records were replayed.
+  #[test]
+  fn t_a729_an_imported_mercurial_repository_survives_a_warm_restart_by_identity() {
+    use crate::vcs_store::hg_import::tests::{created, directory, rows_of, to_its_end};
+    use slates_anchor::AnchorSegment;
+    let profile = test_profile();
+    let instance = format!("a729-identities-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (id, before) = first
+      .observe(shard, |state| {
+        let id = created(state, "hg", slates_ipc::protocol::VcsTool::Mercurial);
+        let laid = directory(crate::hg_base::tests::STATES.iter().copied());
+        assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
+        assert!(to_its_end(state, id).1.is_ok(), "imported");
+        assert_eq!(crate::vcs_store::hg_import::land(state, id), Ok(()));
+        (id, rows_of(state, id))
+      })
+      .unwrap();
+    first.publish_every_shard().unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let read = || {
+      second
+        .observe(shard, move |state| {
+          let rows = if state.vcs_stores.mercurial(id).is_some() {
+            rows_of(state, id)
+          } else {
+            Vec::new()
+          };
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          (
+            rows,
+            count(crate::vcs_store::WINDOWS_RESTORED),
+            count(crate::vcs_store::WINDOWS_UNRESTORED),
+            count(crate::vcs_store::WINDOWS_UNHELD),
+          )
+        })
+        .ok()
+    };
+    let mut seen = read();
+    // Derived: 600 looks 50 ms apart, the wait the successor is given to replay the record.
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+      if seen.as_ref().is_some_and(|seen| seen.0 == before) {
+        break;
+      }
+      std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
+      seen = read();
+    }
+    let (after, restored, unrestored, unheld) = seen.expect("the successor answered");
+    second.stop();
+    assert!(!before.is_empty(), "the import kept rows");
+    assert_eq!(
+      after, before,
+      "the successor made the index again by identity"
+    );
+    assert!(restored > 0, "no window was restored");
+    assert_eq!((unrestored, unheld), (0, 0));
+  }
+
   /// §4.8 "Neighbourhood changes" (joint writes) and "Leases and reads" (the joint lease): while an owner's
   /// change is in flight its records go to both cohorts and its lease needs confirmations in both, so it keeps
   /// direct contact — the record session and the probe — with its settled neighbourhood's hosts, not only its

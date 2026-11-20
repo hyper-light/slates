@@ -2585,14 +2585,19 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
     return;
   }
   // A Mercurial repository's records replayed whole in one step held a large repository's shard past the watchdog's
-  // window (A-732): its store made empty now, lent to nothing, and its records replayed a step a turn by a task.
+  // window (A-732): its store made empty now, lent to nothing, and its records replayed a step a turn by a task. Its
+  // records name contents by identity (A-729 part 2), so the index it had is set aside, holding them, until the replay
+  // ends.
+  let aside = set_aside(state, id);
   free(state, id);
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
+    release_aside(state, aside);
     return;
   };
   make(state, &record);
   state.vcs_stores.rebuilding.insert(id);
-  let task = slates_rt::futures::spawn(replay_sliced(id)).and_then(slates_rt::futures::detach);
+  let task =
+    slates_rt::futures::spawn(replay_sliced(id, aside)).and_then(slates_rt::futures::detach);
   if task.is_err() {
     // No task to run it: the store stays lent to nothing, and the next recovery makes it again a unit at a time.
     state.count(REPLAY_REFUSED, 1);
@@ -2875,19 +2880,53 @@ pub(crate) fn rebuild_turn_once_within(state: &mut ShardState, id: RepositoryId,
     .is_some_and(|(generation, _)| rebuild_turn_within(state, (id, generation), ns))
 }
 
-/// [`rebuild`] in one step, every record replayed at once: the tests' and Mercurial's tests'.
+/// [`rebuild`] in one step, every record replayed at once: the tests' and Mercurial's tests'. A Mercurial index is set
+/// aside while its records replay, as [`rebuild`] sets it aside.
 pub(crate) fn rebuild_whole(state: &mut ShardState, id: RepositoryId) {
+  let aside = set_aside(state, id);
   free(state, id);
-  let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
+  if let Some(record) = state.db.partition().repositories().repository(id).cloned() {
+    make_whole(state, &record);
+    state.count(REBUILT, 1);
+  }
+  release_aside(state, aside);
+}
+
+/// Repository `id`'s Mercurial index taken out of its store, still holding every content it names (A-729 part 2): its
+/// records name contents by identity, never their bytes, so a rebuild that replays them must find them held, and this
+/// holds them until the replay ends ([`release_aside`]). None for another tool's store, or none at all.
+pub(crate) fn set_aside(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> Option<slates_hg::index::HgIndex> {
+  match state.vcs_stores.entries.get_mut(&id) {
+    Some(RepositoryStore::Mercurial(store)) => Some(core::mem::replace(
+      &mut store.index,
+      slates_hg::index::HgIndex::new(),
+    )),
+    _ => None,
+  }
+}
+
+/// Gives back an index [`set_aside`] kept, its holds released; a refused release counted.
+pub(crate) fn release_aside(state: &mut ShardState, aside: Option<slates_hg::index::HgIndex>) {
+  let Some(index) = aside else {
     return;
   };
-  make_whole(state, &record);
-  state.count(REBUILT, 1);
+  let released = within_budget(state, 0, |stores| {
+    stores
+      .content_mut()
+      .map_or(Ok(()), |content| index.release(content))
+  });
+  if released.is_err() {
+    state.count(RELEASE_REFUSED, 1);
+  }
+  settle(state);
 }
 
 /// Repository `id`'s Mercurial records replayed into its store a step a turn, a yield between (A-732: [`rebuild`]'s
 /// task); then the store lent again, its index's generation moved, so a push forked from the store before is re-based.
-async fn replay_sliced(id: RepositoryId) {
+async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex>) {
   let mut index = 0usize;
   let mut replay = None;
   loop {
@@ -2915,6 +2954,7 @@ async fn replay_sliced(id: RepositoryId) {
   crate::state::with_state(|state| {
     state.vcs_stores.rebuilding.remove(&id);
     state.vcs_stores.index_changed(id);
+    release_aside(state, aside);
   })
   .unwrap_or_default();
 }

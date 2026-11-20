@@ -68,7 +68,7 @@ use crate::repository::push::{AppendRefused, BranchChange, ChangeRefusal, EntryP
 use crate::state::ShardState;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Counter: an import started, its requirements and listing read. Format: a counter name in the status report.
 pub(crate) const STARTED: &str = "vcs_store.hg_import.started";
@@ -894,7 +894,16 @@ pub(crate) async fn run(id: RepositoryId) -> Option<Result<Box<Finished>, Import
     })??;
     match turned {
       Ok(Turned::More) => {}
-      Ok(Turned::Done(finished)) => return Some(Ok(finished)),
+      Ok(Turned::Done(finished)) => {
+        // Its record names its contents by identity (A-729 part 2), so its landing commits only once the shard's image
+        // holding them is published (durable before named); one not published gives the import back.
+        let shard = crate::state::with_state(|state| state.shard)?;
+        if super::homes::kept_here_durable(shard).await {
+          return Some(Ok(finished));
+        }
+        crate::state::with_state(|state| abandon(state, id))?;
+        return Some(Err(ImportFailed::Landing(Refusal::ContentUnavailable)));
+      }
       Err(failed) => return Some(Err(failed)),
     }
   }
