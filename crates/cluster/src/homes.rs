@@ -69,6 +69,7 @@ impl HomeRefusal {
     match self {
       HomeRefusal::NotAHome => 1,
       HomeRefusal::Misnamed => 2,
+      // Format: a refusal's wire byte, one a kind, 0 for none.
       HomeRefusal::NotHeld => 3,
       HomeRefusal::Room => 4,
       HomeRefusal::Unanswered => 5,
@@ -79,6 +80,7 @@ impl HomeRefusal {
     match byte {
       1 => Some(HomeRefusal::NotAHome),
       2 => Some(HomeRefusal::Misnamed),
+      // Format: a refusal's wire byte, as `byte` writes it.
       3 => Some(HomeRefusal::NotHeld),
       4 => Some(HomeRefusal::Room),
       5 => Some(HomeRefusal::Unanswered),
@@ -270,7 +272,8 @@ impl<'a> Reader<'a> {
   }
 
   fn long(&mut self) -> Result<u64, HomeWireError> {
-    let bytes = <[u8; 8]>::try_from(self.take(8)?).map_err(|_| HomeWireError::Truncated)?;
+    let bytes = <[u8; size_of::<u64>()]>::try_from(self.take(size_of::<u64>())?)
+      .map_err(|_| HomeWireError::Truncated)?;
     Ok(u64::from_le_bytes(bytes))
   }
 
