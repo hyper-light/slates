@@ -1538,3 +1538,99 @@ fn a_commit_call_out_of_turn_is_the_callers_error_and_changes_nothing() {
   let begun = "( success ( ( ) 0: ) ) ( success ( ) ) ";
   assert_eq!(String::from_utf8_lossy(&out), begun);
 }
+
+/// A failure as `svnserve` writes it, its errors outermost first, each with no file and line.
+fn failure_of(errors: &[(u32, &str)]) -> String {
+  let errors: Vec<String> = errors
+    .iter()
+    .map(|(code, message)| format!("( {code} {}:{message} 0: 0 ) ", message.len()))
+    .collect();
+  format!("( failure ( {}) ) ", errors.concat())
+}
+
+/// `svnserve`'s trivial authentication request.
+const TRIVIAL_AUTH: &str = "( success ( ( ) 0: ) ) ";
+
+/// A-702 part 1 (`serve.c` `change_rev_prop`, `change_rev_prop2`, `do_change_rev_prop`; `fs-wrap.c`
+/// `svn_repos_fs_change_rev_prop4`). Do: through alice's tunnel, change revision 1's `svn:log`; send `change-rev-prop2`
+/// naming both `dont-care` and a previous value; set `svn:log` to a value holding a carriage return; change revision
+/// 99's, past the head. Expect, in `svnserve`'s order: the trivial authentication request then "Repository has not been
+/// enabled to accept revision propchanges" (165006), as for a repository with no pre-revprop-change hook; the
+/// previous-value refusal (200004) with nothing before it; the trivial request then `svn_repos__validate_prop`'s chain
+/// (125005, 125017); the trivial request then "No such revision 99" (160006). Before A-702 each was "Unknown editor
+/// command" (210001).
+#[test]
+fn a_revision_property_change_is_answered_as_svnserve_answers_one_without_a_hook() {
+  let fixture = fixture();
+  let mut connection = established_on(&alices_tunnel(), EXTERNALLY);
+  let no_hook = "Repository has not been enabled to accept revision propchanges;\nask the administrator to create \
+                 a pre-revprop-change hook";
+  let both = "'previous-value' and 'dont-care' cannot both be set in 'change-rev-prop2' request";
+  let cases: [(&[u8], String); 4] = [
+    (
+      b"( change-rev-prop ( 1 7:svn:log 3:new ) ) ",
+      format!("{TRIVIAL_AUTH}{}", failure_of(&[(165_006, no_hook)])),
+    ),
+    (
+      b"( change-rev-prop2 ( 1 7:svn:log ( 3:new ) ( true 3:old ) ) ) ",
+      failure_of(&[(200_004, both)]),
+    ),
+    (
+      b"( change-rev-prop ( 1 7:svn:log 3:a\rb ) ) ",
+      format!(
+        "{TRIVIAL_AUTH}{}",
+        failure_of(&[
+          (125_005, "Invalid property value"),
+          (
+            125_017,
+            "Cannot accept non-LF line endings in 'svn:log' property"
+          ),
+        ])
+      ),
+    ),
+    (
+      b"( change-rev-prop ( 99 7:svn:log 3:new ) ) ",
+      format!(
+        "{TRIVIAL_AUTH}{}",
+        failure_of(&[(160_006, "No such revision 99")])
+      ),
+    ),
+  ];
+  for (command, expected) in cases {
+    let (out, turn) = send(&fixture, &mut connection, command);
+    let took = Turn::Took {
+      consumed: command.len(),
+    };
+    assert_eq!(
+      (out, turn),
+      (expected, Ok(format!("{took:?}"))),
+      "{}",
+      String::from_utf8_lossy(command)
+    );
+  }
+}
+
+/// A-702 part 1 (`must_have_access` for a write, no user needed). Do: on an anonymous session, which may read alone,
+/// change revision 1's `svn:log`; answer the authentication asked with alice's CRAM-MD5. Expect: CRAM-MD5 asked for the
+/// command, then, alice authenticated, the change run again with no trivial request and refused for the missing hook.
+#[test]
+fn an_anonymous_revision_property_change_authenticates_first() {
+  let fixture = fixture();
+  let mut connection = established();
+  let (asked, _) = send(
+    &fixture,
+    &mut connection,
+    b"( change-rev-prop ( 1 7:svn:log 3:new ) ) ",
+  );
+  assert_eq!(asked, cram_md5_request());
+  let (authenticated, verdict) = cram_md5(&mut connection, b"alice", ALICE_SECRET);
+  assert!(matches!(verdict, Verdict::Established(_)), "{verdict:?}");
+  let (rerun, _) = send(&fixture, &mut connection, b"");
+  let no_hook = "Repository has not been enabled to accept revision propchanges;\nask the administrator to create \
+                 a pre-revprop-change hook";
+  assert!(
+    authenticated.ends_with("( success ( ) ) "),
+    "{authenticated}"
+  );
+  assert_eq!(rerun, failure_of(&[(165_006, no_hook)]));
+}

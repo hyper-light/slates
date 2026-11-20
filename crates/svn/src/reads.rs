@@ -517,6 +517,57 @@ pub fn answer_lock_read<R: Repository + ?Sized>(
   })
 }
 
+/// `svn_repos_check_revision_access` (`repos.c`): how much of `revision` a session reading by `authz` may read. Without
+/// rules, or for a revision that changed nothing, all of it; else from each changed path and, for one a copy added, its
+/// source, until one of each kind is found.
+fn revision_access_in(
+  index: &Index,
+  authz: Option<&PrincipalRules>,
+  revision: Revision,
+) -> Result<RevisionAccess, Failure> {
+  if authz.is_none() {
+    return Ok(RevisionAccess::Full);
+  }
+  let changes = index
+    .changes(revision)
+    .map_err(|refusal| Failure::of_index(&refusal))?;
+  if changes.is_empty() {
+    return Ok(RevisionAccess::Full);
+  }
+  let (mut found_readable, mut found_unreadable) = (false, false);
+  for change in changes {
+    if may_read(authz, &change.path) {
+      found_readable = true;
+    } else {
+      found_unreadable = true;
+    }
+    if change
+      .copy_from
+      .as_ref()
+      .is_some_and(|source| !may_read(authz, &source.path))
+    {
+      found_unreadable = true;
+    }
+    if found_readable && found_unreadable {
+      break;
+    }
+  }
+  Ok(RevisionAccess::of(found_readable, found_unreadable))
+}
+
+/// Whether a session reading by `authz` may read all of `revision` (`svn_repos_check_revision_access`'s
+/// `svn_repos_revision_access_full`), what a revision property's change asks first (A-702); refused with the error
+/// number and words of a revision the index does not hold.
+pub(crate) fn revision_wholly_readable(
+  index: &Index,
+  authz: Option<&PrincipalRules>,
+  revision: Revision,
+) -> Result<bool, (u32, String)> {
+  revision_access_in(index, authz, revision)
+    .map(|access| matches!(access, RevisionAccess::Full))
+    .map_err(|failure| (failure.code, failure.message))
+}
+
 /// A refusal as `svnserve` writes it: Subversion's error number and its message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Failure {
@@ -1354,39 +1405,9 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
     Ok(Some(Outcome::Answered))
   }
 
-  /// `svn_repos_check_revision_access`: how much of `revision` the session may read. Without rules, or for a
-  /// revision that changed nothing, all of it; else from each changed path and, for one a copy added, its source, until
-  /// one of each kind is found.
+  /// `svn_repos_check_revision_access`: how much of `revision` the session may read ([`revision_access_in`]).
   fn revision_access(&self, revision: Revision) -> Result<RevisionAccess, Failure> {
-    if self.authz.is_none() {
-      return Ok(RevisionAccess::Full);
-    }
-    let changes = self
-      .index
-      .changes(revision)
-      .map_err(|refusal| Failure::of_index(&refusal))?;
-    if changes.is_empty() {
-      return Ok(RevisionAccess::Full);
-    }
-    let (mut found_readable, mut found_unreadable) = (false, false);
-    for change in changes {
-      if self.readable(&change.path) {
-        found_readable = true;
-      } else {
-        found_unreadable = true;
-      }
-      if change
-        .copy_from
-        .as_ref()
-        .is_some_and(|source| !self.readable(&source.path))
-      {
-        found_unreadable = true;
-      }
-      if found_readable && found_unreadable {
-        break;
-      }
-    }
-    Ok(RevisionAccess::of(found_readable, found_unreadable))
+    revision_access_in(self.index, self.authz, revision)
   }
 
   /// `trivial_auth_request`: `( success ( ( ) 0: ) )`.

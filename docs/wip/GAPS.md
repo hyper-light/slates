@@ -1901,6 +1901,11 @@
 > answered as `svnserve` answers them: stock `svn`'s recorded `lock-bob` and `lock-a` sessions byte for byte. macOS
 > arm64, this Mac, local: slates-svn 239 of 239, server `vcs_svn::` `vcs_ssh::svn::` `repository::svn_commit::`.
 > Owed: the pre-lock and post-lock hooks; a lock's expiry set by a client (ra_svn names none).
+> A-702 part 1, 2026-11-19 (w-svn): `change-rev-prop` and `change-rev-prop2` answered as `svnserve` answers a
+> repository with no pre-revprop-change hook (165006), after its checks in its order (the previous-value refusal,
+> write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
+> revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
+> its `Record::RevisionProperties` through the owner's step, post-revprop-change.
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
