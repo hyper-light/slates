@@ -6,10 +6,11 @@
 use slates_wire::Wire;
 
 use crate::catalog::{
-  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
-  GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
-  LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
-  PlacementState, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, BranchRecord, CompletionRecord,
+  ConsumerRecord, GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState,
+  LeaseRecord, LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  NfsOpenRecord, PlacementState, Principal, RepositoryId, RepositoryRecord, ReviewApprovalRecord,
+  ReviewCommentRecord, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
   VolumeState,
 };
 
@@ -460,6 +461,304 @@ pub enum Op {
     /// The version it waits for.
     version: u64,
   },
+  /// A volume's write policy was set by the launcher or the harness, through the issuer (A-285). Appended (2026-11-18).
+  VolumeWritePolicySet {
+    /// The volume.
+    id: VolumeId,
+    /// The policy.
+    policy: crate::catalog::WritePolicy,
+  },
+  /// An enrolled consumer's write policy was set by its launcher (A-285). Appended (2026-11-18).
+  ConsumerWritePolicySet {
+    /// The consumer.
+    consumer: u64,
+    /// The policy.
+    policy: crate::catalog::WritePolicy,
+  },
+  /// A work's base is held for it on its green's partition, wherever the work lives (A-247): made at the work's
+  /// creation, moved by its accept and rebase. Appended (2026-11-18), with the five after it: each variant's index is
+  /// its tag on the log, so A-247's records follow every variant main had when they landed.
+  WorkFloorSet {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+    /// The version the work is based on.
+    base: u64,
+  },
+  /// A work's creation waits for its green's owner to admit it, holding its name and its id (A-247). Appended.
+  WorkCreationPending {
+    /// The creation.
+    record: crate::catalog::PendingCreationRecord,
+  },
+  /// A work's pending creation ended: made, refused, or dropped at a start (A-247). Appended.
+  WorkCreationSettled {
+    /// The name.
+    name: String,
+  },
+  /// A work's submit went to its green's owner and waits to be settled on the work (A-247). Appended.
+  WorkSubmitPending {
+    /// The submit.
+    record: crate::catalog::PendingSubmitRecord,
+  },
+  /// A work's pending submit was settled (A-247). Appended.
+  WorkSubmitSettled {
+    /// The work.
+    work: VolumeId,
+  },
+  /// A work's floor is released: it was destroyed, or found gone at recovery (A-247). Appended.
+  WorkFloorDropped {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+  },
+  /// A volume's trusted signers were set by its launcher (signed work, A-321): the whole set, replacing the last.
+  /// Appended (2026-11-17).
+  VolumeSignersSet {
+    /// The volume.
+    id: VolumeId,
+    /// The public keys, in SSH wire form, in the order set.
+    keys: Vec<Vec<u8>>,
+  },
+  /// A volume this partition lost to a takeover is taken over here again (A-362): its stale record goes, with its
+  /// snapshots and lineage, so the state the takeover adopted is recorded in its place by the `VolumeCreated` that
+  /// follows. Unlike `VolumeDestroyed` it leaves no tombstone (the volume lives on, its registers adopted here) and erases
+  /// no key (the adopted lineage is the volume's own). Its attachments are ended before it. Appended (2026-11-18).
+  VolumeRelinquished {
+    /// The volume.
+    id: VolumeId,
+  },
+  /// A green this node took over from its departed owner, recorded here by adopting this node's own holder ledger of it
+  /// (§4.16 owner-loss recovery; A-333): the green's catalog record, and versions 0 to `version` as the merge records
+  /// this node accepted as one of the green's holders and the inputs it holds for them, which it keeps while the green
+  /// lives here. So the partition records neither the green's origin nor those versions' increments, and its chain holds
+  /// only the versions after `version`. A kernel-sized origin re-recorded as bytes was refused at the partition's merge
+  /// budget, which lost the green with its owner. One operation, so the green is never recorded without its adoption:
+  /// checked as a volume's creation is. Appended (2026-11-18).
+  GreenAdopted {
+    /// The green's catalog record, under its original id and name.
+    record: crate::catalog::VolumeRecord,
+    /// The adopted version: the green's head when this node took it over.
+    version: u64,
+    /// The green's head identity at `version`, which a replica rebuilt from the ledger must reproduce.
+    identity: [u8; 32],
+    /// Version 0's inputs manifest identity, as the ledger's version 0 record names it (the origin's canonical encoding,
+    /// archived); `None` for a green with no origin.
+    origin: Option<[u8; 32]>,
+  },
+  /// An audit record this partition owes the control partition (A-265's crossing, made durable 2026-11-18): kept in the
+  /// partition's outbox, numbered by its own crossing sequence in `apply`, until the control partition acknowledges it,
+  /// so it commits with the atom that made it and a crash before its batch arrives loses nothing. Appended.
+  AuditOwed {
+    /// The record; its `seq` is set in `apply`.
+    record: AuditRecord,
+  },
+  /// The control partition appended this partition's owed records before crossing sequence `through` (A-265): they
+  /// leave the outbox. Appended.
+  AuditDelivered {
+    /// The first crossing sequence the control partition has not appended.
+    through: u64,
+  },
+  /// On the control partition: a batch of the records partition `origin` owes, the first at crossing sequence `first`
+  /// (A-265). `apply` appends only those past what `origin` already delivered, and marks `origin` delivered through the
+  /// batch's end, so a batch sent again, after a crash or a lost acknowledgement, appends nothing twice. Appended.
+  AuditBatchAppended {
+    /// The partition that owed the records.
+    origin: u16,
+    /// The crossing sequence of the batch's first record.
+    first: u64,
+    /// The records, in crossing order.
+    records: Vec<AuditRecord>,
+  },
+  /// A volume moved to another fleet member left this node (§4.10 "Ownership follows the writer", A-291): its record,
+  /// snapshots, lineage and this node's copies of its keys go, as a destroy's do, but no tombstone stays. Its registers
+  /// belong to the member the configuration's moved-object exception names, which adopted them, so nothing here may
+  /// close them. Appended (2026-11-18).
+  VolumeReleased {
+    /// The volume.
+    id: VolumeId,
+  },
+  /// A snapshot was captured as a complete immutable base (§4.15 `capture_base`, A-291): its tree holds every name,
+  /// byte and attribute, none read from the host directory, so a clone of it is made with no base directory. Kept while
+  /// the snapshot and its volume are. Appended (2026-11-18).
+  BaseCaptured {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    snapshot: crate::catalog::SnapshotId,
+  },
+  /// A captured clone's move carried its capture (A-503): what the volume's catalog ships from now on, and the snapshot
+  /// here holding the head the move hands over (its mark, should the move thaw). Raises the catalog register's sequence,
+  /// so the catalog ships it before the move is reported. Replaces any carried capture the volume held. Appended
+  /// (2026-11-18).
+  CaptureCarried {
+    /// The volume.
+    volume: VolumeId,
+    /// What the move carries.
+    carried: crate::catalog::CarriedRecord,
+    /// The snapshot holding the head it is relative to.
+    mark: Option<crate::catalog::SnapshotId>,
+  },
+  /// A volume a move brought here was materialized with the carried capture its adopted catalog holds (A-503), its mark
+  /// the snapshot it was materialized as when that is the head the capture was carried against, else none. The catalog
+  /// is the adopted one, unchanged, so its sequence stays. Appended (2026-11-18).
+  CaptureAdopted {
+    /// The volume.
+    volume: VolumeId,
+    /// What its adopted catalog carries.
+    carried: crate::catalog::CarriedRecord,
+    /// Its snapshot holding that head, when it holds one.
+    mark: Option<crate::catalog::SnapshotId>,
+  },
+  /// A repository was created, its namespace empty (§4.17.1, A-515). Appended.
+  RepositoryCreated {
+    /// The record.
+    record: RepositoryRecord,
+  },
+  /// A branch name of a repository was bound to a green of its partition (§4.17.1, A-515). Appended.
+  RepositoryBranchAdded {
+    /// The binding.
+    record: BranchRecord,
+  },
+  /// A branch name left its repository's namespace; its green is untouched, so binding the name to it again restores
+  /// the branch (§4.17.1 "Deleting a branch", A-515). Appended.
+  RepositoryBranchRetired {
+    /// The repository.
+    repository: RepositoryId,
+    /// The name.
+    name: String,
+  },
+  /// A repository's default branch was set, or cleared with `None` (§4.17.1, A-515). Appended.
+  RepositoryDefaultSet {
+    /// The repository.
+    repository: RepositoryId,
+    /// The branch name, bound or not yet (an unborn default).
+    branch: Option<String>,
+  },
+  /// A repository left, with every name of its namespace; its greens are untouched, each destroyed by its own verb
+  /// (§4.17.1, A-515). Appended.
+  RepositoryDestroyed {
+    /// The repository.
+    repository: RepositoryId,
+  },
+  /// A host mount's attachment was seen mounted (A-540): the kernel's id of its mount, kept in the attachment's record
+  /// so a successor's start can judge whether the kernel let that mount go while no daemon ran. Appended.
+  AttachmentMountSeen {
+    /// The attachment.
+    id: u64,
+    /// The kernel's id of its mount, as its mount table names it.
+    mount: u64,
+  },
+  /// A green joined its repository's lineage (§4.17.1 item 4, A-575): the repository's first green as its root, or a
+  /// green made at a version of another member. Appended.
+  RepositoryGreenJoined {
+    /// The membership.
+    record: crate::catalog::MemberRecord,
+  },
+  /// A review comment was written on a request (§4.17.1 shared piece 6, A-596): anchored to a path, the whole lines a
+  /// byte range covers, and the version of the request's work it stands on. Appended.
+  ReviewCommented {
+    /// The comment.
+    record: ReviewCommentRecord,
+  },
+  /// A review comment moved with its request's work to a later version, its lines unchanged: now `len` bytes at `start`
+  /// of `version` (A-596). Appended.
+  ReviewCommentMoved {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// The comment's number.
+    id: u64,
+    /// Its lines' first byte at `version`.
+    start: u64,
+    /// The bytes they cover there.
+    len: u64,
+    /// The version it now stands on.
+    version: u64,
+  },
+  /// A change at `version` met a review comment's lines (A-596): it is outdated, where it last stood, never moved again.
+  /// Appended.
+  ReviewCommentOutdated {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// The comment's number.
+    id: u64,
+    /// The version whose change met its lines.
+    version: u64,
+  },
+  /// A request was approved at the version its approver saw; the approver's earlier approval, if any, is replaced
+  /// (A-596). Appended.
+  ReviewApproved {
+    /// The approval.
+    record: ReviewApprovalRecord,
+  },
+  /// A change at `version` met what the repository's policy says an approval covers: the approval is stale (A-596).
+  /// Appended.
+  ReviewApprovalStaled {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// Who approved.
+    approver: Principal,
+    /// The version whose change made it stale.
+    version: u64,
+  },
+  /// A request's review records left with it, its review merged or closed (A-596). Appended.
+  ReviewClosed {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+  },
+  /// An entry of a repository's register (§4.17.1 item 2, shared piece 2; A-603): one durable step committing several of
+  /// its greens' versions, greens joining its lineage, its namespace's changes and its own state's (Mercurial's phase
+  /// roots and obsolescence markers), its checks read at its position first; all of it or none. Every other operation
+  /// that changes a repository is an entry of one change and takes a position too. Appended.
+  RepositoryAdvanced {
+    /// The entry.
+    entry: crate::catalog::RepositoryEntry,
+  },
+  /// A repository's policy was set whole by its owner (§4.17.1 "Policy", A-622): its rules and hooks replaced, its
+  /// version the one after the version its setter read. An entry of the repository's register of this one change, so
+  /// it takes the register's next position (A-603). Appended.
+  RepositoryPolicySet {
+    /// The repository.
+    repository: RepositoryId,
+    /// The policy, its version the next.
+    policy: crate::catalog::RepositoryPolicy,
+  },
+  /// A principal's tool identities were set whole by its owner on the control channel (§4.13; §4.17.1 "A push is a
+  /// work" item 4; A-664), as the version after the one its setter read. Appended.
+  IdentitiesSet {
+    /// The record, its version the next.
+    record: crate::catalog::IdentityRecord,
+  },
+  /// A version-control credential was enrolled by the human surface (§4.13, §4.17.2 "Access"; A-625 part 3), on the
+  /// partition its id routes to. Appended.
+  CredentialEnrolled {
+    /// The record.
+    record: crate::catalog::CredentialRecord,
+  },
+  /// A version-control credential was revoked by the human surface: its record leaves (A-625 part 3). Appended.
+  CredentialRevoked {
+    /// The credential's id.
+    id: [u8; 32],
+  },
+  /// A repository taken over was recorded whole by its successor (A-636 part 2c-2): its adopted record and the parts of
+  /// its four state logs the successor kept by A-636 part 1's rule, each log's from its start, in log order
+  /// (`crate::repository::whole_parts`). Applied as if each part's changes were made again, taking no position a record
+  /// ships from, since every holder already holds them. Appended.
+  RepositoryRebuilt {
+    /// The record, as its own register held it (A-636 part 2c-1).
+    record: RepositoryRecord,
+    /// The kept parts, by log and then position.
+    parts: Vec<crate::catalog::StateLogRecord>,
+  },
 }
 
 impl Op {
@@ -491,6 +790,16 @@ impl Op {
       Op::AttachmentAdded { .. } => "attachment_added",
       Op::AttachmentRemoved { .. } => "attachment_removed",
       Op::AttachmentBound { .. } => "attachment_bound",
+      Op::AttachmentMountSeen { .. } => "attachment_mount_seen",
+      Op::RepositoryGreenJoined { .. } => "repository_green_joined",
+      Op::ReviewCommented { .. } => "review_commented",
+      Op::ReviewCommentMoved { .. } => "review_comment_moved",
+      Op::ReviewCommentOutdated { .. } => "review_comment_outdated",
+      Op::ReviewApproved { .. } => "review_approved",
+      Op::ReviewApprovalStaled { .. } => "review_approval_staled",
+      Op::ReviewClosed { .. } => "review_closed",
+      Op::RepositoryAdvanced { .. } => "repository_advanced",
+      Op::RepositoryPolicySet { .. } => "repository_policy_set",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",
@@ -502,6 +811,7 @@ impl Op {
       Op::AuditAppended { .. } => "audit_appended",
       Op::GreenAdvanced { .. } => "green_advanced",
       Op::GreenOriginated { .. } => "green_originated",
+      Op::GreenAdopted { .. } => "green_adopted",
       Op::ClientIdReserved { .. } => "client_id_reserved",
       Op::NfsOpenSet { .. } => "nfs_open_set",
       Op::NfsOpenCleared { .. } => "nfs_open_cleared",
@@ -526,11 +836,37 @@ impl Op {
       Op::NameAliasReserved { .. } => "name_alias_reserved",
       Op::NameAliasConfirmed { .. } => "name_alias_confirmed",
       Op::NameAliasReleased { .. } => "name_alias_released",
+      Op::WorkFloorSet { .. } => "work_floor_set",
+      Op::WorkFloorDropped { .. } => "work_floor_dropped",
+      Op::WorkCreationPending { .. } => "work_creation_pending",
+      Op::WorkCreationSettled { .. } => "work_creation_settled",
+      Op::WorkSubmitPending { .. } => "work_submit_pending",
+      Op::WorkSubmitSettled { .. } => "work_submit_settled",
       Op::AttachmentRenewed { .. } => "attachment_renewed",
       Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
       Op::CompletionAwaiting { .. } => "completion_awaiting",
+      Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
+      Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
+      Op::VolumeSignersSet { .. } => "volume_signers_set",
+      Op::VolumeRelinquished { .. } => "volume_relinquished",
+      Op::AuditOwed { .. } => "audit_owed",
+      Op::AuditDelivered { .. } => "audit_delivered",
+      Op::AuditBatchAppended { .. } => "audit_batch_appended",
+      Op::VolumeReleased { .. } => "volume_released",
+      Op::BaseCaptured { .. } => "base_captured",
+      Op::CaptureCarried { .. } => "capture_carried",
+      Op::CaptureAdopted { .. } => "capture_adopted",
+      Op::RepositoryCreated { .. } => "repository_created",
+      Op::RepositoryBranchAdded { .. } => "repository_branch_added",
+      Op::RepositoryBranchRetired { .. } => "repository_branch_retired",
+      Op::RepositoryDefaultSet { .. } => "repository_default_set",
+      Op::RepositoryDestroyed { .. } => "repository_destroyed",
+      Op::IdentitiesSet { .. } => "identities_set",
+      Op::CredentialEnrolled { .. } => "credential_enrolled",
+      Op::CredentialRevoked { .. } => "credential_revoked",
+      Op::RepositoryRebuilt { .. } => "repository_rebuilt",
     }
   }
 }

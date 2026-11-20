@@ -16,7 +16,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use slates_db::live::Shipper;
+use slates_db::live::{Bounds, Shipper};
 use slates_db::register::{HostEpoch, HostId, ObjectId, Quorum};
 
 struct Counting;
@@ -62,25 +62,31 @@ const LARGE: usize = 1024;
 const PAYLOAD: usize = 64;
 /// Shape: the bytes each payload holds.
 const FILL: u8 = 0;
-/// Shape: the owner's credit and retained-entry count, the daemon's own (`live_ship`'s `CREDIT` and `RETAIN`); the
-/// backlog lies past them, kept by bytes as an install's size keeps it in the daemon (`Shipper::retain_up_to`).
-const CREDIT: u64 = 2;
-/// See [`CREDIT`].
-const RETAIN: usize = 4;
+/// Derived: the bytes the owner retains for laggards, and its credit: every entry the large backlog appends (`LARGE`, the
+/// two the lagging holder acknowledges, and the one that measures an entry), each at its wire size, so the whole backlog
+/// lies inside the retained tail and is shipped as entries, never an install (`Bounds::of_whole`, the daemon's
+/// derivation, with the install as large as the backlog).
+fn retained_bytes(entry_wire_bytes: usize) -> usize {
+  (LARGE + 3) * entry_wire_bytes
+}
+
 /// Shape: the volume's number on its owner.
 const VOLUME: u64 = 7;
 
 /// The allocator calls the owner makes folding one reply of a holder that still lacks `backlog` entries after it.
 fn lagging_reply_allocations(backlog: usize) -> usize {
   let (owner, healthy, lagging) = (HostId(1), HostId(2), HostId(3));
+  // One delta is admitted with no credit while none is in flight: it measures an entry's wire size for the bounds.
   let mut shipper = Shipper::new(
     (owner, ObjectId::new(owner, VOLUME), HostEpoch(1)),
     Quorum { f: 1 },
     &[healthy, lagging],
     None,
-    (CREDIT, RETAIN),
+    Bounds::of_whole(0),
   );
-  shipper.retain_up_to(usize::MAX);
+  let first = shipper.append(vec![FILL; PAYLOAD]).unwrap();
+  shipper.set_bounds(Bounds::of_whole(retained_bytes(first.wire_bytes())));
+  assert_eq!(shipper.fold_reply(healthy, Ok(Some(first.head()))), None);
   let mut heads = Vec::new();
   for _ in 0..backlog + 2 {
     let entry = shipper.append(vec![FILL; PAYLOAD]).unwrap();
@@ -89,16 +95,18 @@ fn lagging_reply_allocations(backlog: usize) -> usize {
   }
   // The lagging holder holds the first entry, then acknowledges the second: `backlog` entries are still after it.
   assert_eq!(shipper.fold_reply(lagging, Ok(Some(heads[0]))), None);
-  let (calls, fenced) = counted(|| shipper.fold_reply(lagging, Ok(Some(heads[1]))));
+  let (folded, fenced) = counted(|| shipper.fold_reply(lagging, Ok(Some(heads[1]))));
   assert_eq!(fenced, None, "nothing fenced this owner");
   assert_eq!(
     shipper.held_by(lagging),
     Some(heads[1]),
     "the reply was folded"
   );
-  calls
+  folded
 }
 
+/// A-200: do fold one reply of a holder 16 entries behind and one 1,024 behind. Expect the same allocator calls for
+/// both. Before, each reply cloned every entry the holder lacked (21 calls at 16 behind, 1,035 at 1,024).
 #[test]
 fn a_lagging_holders_reply_costs_its_owner_the_same_whatever_it_lacks() {
   let small = lagging_reply_allocations(SMALL);

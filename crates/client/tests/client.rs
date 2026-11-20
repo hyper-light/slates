@@ -19,7 +19,7 @@ use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass, Submitted,
 };
 use slates_ipc::HeldRendezvous;
-use slates_ipc::protocol::{Refusal, RequestBody};
+use slates_ipc::protocol::{Refusal, RequestBody, VolumeRefusal};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::daemon::LIVENESS_BUDGET_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -1170,7 +1170,7 @@ const LONG_MAP_BYTES: usize = 16 << 20;
 /// as long as the file takes, and the client waits for them while its daemon lives, as it does for a read map's fill
 /// (A-171), never reporting a live daemon stalled. Do: on a one-shard daemon, attach a volume holding a 16 MiB file for
 /// writing; from a client whose reply deadline is [`IMPATIENT_REPLY_NS`], map the file read and write under that
-/// attachment, store a phrase, sync and release. Expect: each answers, none `Stalled`; the sync writes the phrase's
+/// attachment, store a phrase, sync and release. Expect: each answers; the sync writes the phrase's
 /// differing bytes and the file holds them. Found by CI's ThreadSanitizer lane, whose slowdown took a 4 MiB map's
 /// release past the one-second deadline (run 40816824486).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -1221,8 +1221,9 @@ fn a_long_writable_map_is_waited_for_while_the_daemon_lives() {
 
 /// AC-A-186: a writable map needs the caller's own write attachment, as a file verb does, and a regular file. Do: on a
 /// volume holding a file and a directory, ask `map_write` under an attachment that does not exist, under a read
-/// attachment, for the directory and for a missing file. Expect: `NotFound`, `Forbidden`, `BadRequest` and `NotFound`,
-/// and no copy made.
+/// attachment, for the directory and for a missing file. Expect: `NotFound`, `Forbidden`, the volume core's typed
+/// `IsDirectory` (A-299: a file verb's refusal reaches the consumer typed, never as words) and `NotFound`, and no copy
+/// made.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_writable_map_needs_a_write_attachment_and_a_file() {
@@ -1257,11 +1258,11 @@ fn a_writable_map_needs_a_write_attachment_and_a_file() {
     ),
     "a read attachment"
   );
-  assert!(
-    matches!(
-      refused(client.map_write((id, writing), "/d", slates_client::page_bytes().unwrap())),
-      Refusal::BadRequest { .. }
-    ),
+  assert_eq!(
+    refused(client.map_write((id, writing), "/d", slates_client::page_bytes().unwrap())),
+    Refusal::Volume {
+      refusal: VolumeRefusal::IsDirectory
+    },
     "a directory"
   );
   assert_eq!(
@@ -1276,6 +1277,74 @@ fn a_writable_map_needs_a_write_attachment_and_a_file() {
   assert_eq!(daemon.direct_map_copies().unwrap(), start, "no copy made");
   client.detach(reading).unwrap();
   client.detach(writing).unwrap();
+}
+
+/// A-299's sibling sweep (the integrator, 2026-11-18, after `a_writable_map_needs_a_write_attachment_and_a_file`): a read
+/// map of a directory is refused as the volume core's typed `IsDirectory`, as every file verb's is, never in words. Do:
+/// on a volume holding a directory, ask `map_read` for it. Expect: `Refusal::Volume { IsDirectory }` and no copy made.
+/// Until 2026-11-18 it was `BadRequest { "the path is a directory" }` (`crates/server/src/direct_map.rs`).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_read_map_of_a_directory_is_refused_typed() {
+  let (daemon, mut client, _instance) = one_shard_daemon("mapdir");
+  let id = client.create(&room_for("mapdir", 4 << 10)).unwrap();
+  let writing = client.attach(id, None, Intent::Write).unwrap().attachment;
+  client.fs_mkdir((id, writing), "/d", 0o755).unwrap();
+  let start = daemon.direct_map_copies().unwrap();
+  match client.map_read(id, "/d") {
+    Err(ClientError::Refused(refusal)) => assert_eq!(
+      refusal,
+      Refusal::Volume {
+        refusal: VolumeRefusal::IsDirectory
+      }
+    ),
+    Err(other) => panic!("a typed refusal expected: {other:?}"),
+    Ok(_) => panic!("a directory was mapped"),
+  }
+  assert_eq!(daemon.direct_map_copies().unwrap(), start, "no copy made");
+  client.detach(writing).unwrap();
+}
+
+/// A-299's sibling sweep (the integrator, 2026-11-18): a read of a directory is refused as the volume core's typed
+/// `IsDirectory`, never in words. Do: on a volume holding a directory, read it (`ReadRange`, which `Client::read` and
+/// the library send). Expect: `Refusal::Volume { IsDirectory }`. Until 2026-11-18 it was `BadRequest { "the path is a
+/// directory" }` (`crates/server/src/merge_service.rs`, `read_plain_range`). The whole-file `Read`, the other read the
+/// sweep typed, is retired (A-267): refused `Unsupported` whatever it names, in its published wire place
+/// (`crates/server/tests/base_read_pages.rs`).
+#[test]
+fn a_paged_read_of_a_directory_is_refused_typed() {
+  let (_daemon, mut client, _instance) = one_shard_daemon("readdir");
+  let id = client.create(&room_for("readdir", 4 << 10)).unwrap();
+  let writing = client.attach(id, None, Intent::Write).unwrap().attachment;
+  client.fs_mkdir((id, writing), "/d", 0o755).unwrap();
+  let typed = Refusal::Volume {
+    refusal: VolumeRefusal::IsDirectory,
+  };
+  match client.read(id, "/d", slates_client::ReadAt::Head) {
+    Err(ClientError::Refused(refusal)) => assert_eq!(refusal, typed, "a paged read"),
+    other => panic!("a typed refusal expected of a paged read: {other:?}"),
+  }
+  client.detach(writing).unwrap();
+}
+
+/// A-299's sibling sweep (the integrator, 2026-11-18): listing a file is refused as the volume core's typed
+/// `NotDirectory`, never in words. Do: on a volume holding a file, list it as if it were a directory. Expect:
+/// `Refusal::Volume { NotDirectory }`. Until 2026-11-18 it was `BadRequest { "the path is not a directory" }`
+/// (`crates/server/src/listing.rs`, `plain_page`).
+#[test]
+fn listing_a_file_is_refused_typed() {
+  let (_daemon, mut client, _instance) = one_shard_daemon("listfile");
+  let id = client.create(&room_for("listfile", 4 << 10)).unwrap();
+  write_file(&mut client, id, "/f.bin", &pattern(4 << 10, 7));
+  match client.list_dir(id, "/f.bin", slates_client::ReadAt::Head) {
+    Err(ClientError::Refused(refusal)) => assert_eq!(
+      refusal,
+      Refusal::Volume {
+        refusal: VolumeRefusal::NotDirectory
+      }
+    ),
+    other => panic!("a typed refusal expected: {other:?}"),
+  }
 }
 
 /// AC-A-173 (G-direct step 4), macOS: a copy released before its offer was claimed takes the offer with it, so no
@@ -1322,13 +1391,7 @@ fn a_released_maps_unclaimed_offer_is_withdrawn() {
     matches!(released, ReplyBody::MapReleased),
     "the release: {released:?}"
   );
-  let claimed = slates_ipc::route::claim(
-    &instance,
-    (OfferKind::Map, mapping_id),
-    &secret,
-    Duration::from_nanos(LIVENESS_BUDGET_NS),
-    &mut || false,
-  );
+  let claimed = slates_ipc::route::claim(&instance, (OfferKind::Map, mapping_id), &secret);
   assert!(
     matches!(
       claimed,
@@ -2222,12 +2285,15 @@ fn the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed() {
   assert_eq!(client.reconnects(), 0, "nothing made the client reconnect");
   let (parks, replies) = client.park_ratio();
   let unanswered = client.unanswered_wakes();
+  let at_looks = client.parks_ended_by_looks();
   assert!(replies >= 10, "every call was a reply: {replies}");
   // Every park ends in a reply, in a wake that brought none (a spurious return from the OS wait, or a
-  // previous reply's late wake landing on this park), or at the deadline (none here: nothing stalled).
+  // previous reply's late wake landing on this park), at a look at the daemon's life that found it alive (macOS,
+  // Windows: the park's timeout was the look's; A-506), or at the deadline (none here: nothing stalled).
   assert!(
-    parks <= replies + unanswered,
-    "every park is ended by a reply or counted as an unanswered wake: {parks} parks, {replies} replies, {unanswered} unanswered"
+    parks <= replies + unanswered + at_looks,
+    "every park is ended by a reply or counted as an unanswered wake or a look's: {parks} parks, {replies} replies, \
+     {unanswered} unanswered, {at_looks} ended by looks"
   );
   daemon.stop();
 }
@@ -3190,7 +3256,8 @@ fn a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_a
 /// its `stop` cannot fire the client's process-exit watch (the daemon is this very process); the client learns the
 /// daemon is gone only once the successor republishes the stamp (`daemon_gone` = the exit watch OR a changed start
 /// stamp). With a 1 ms reply deadline this raced the publish and the client reported `Stalled { after_ns: 1_000_000 }`
-/// instead of awaiting the restart (CI macOS `Test` + TSan lanes, run 38537130473). `SLATES_TEST_RESTART_SLOWDOWN`
+/// instead of awaiting the restart (CI macOS `Test` + TSan lanes, run 38537130473); since A-232 (2026-11-13) the client
+/// waits for a live daemon's late reply, so the race costs a re-armed deadline, not a failed call. `SLATES_TEST_RESTART_SLOWDOWN`
 /// (an integer ≥ 1, default 1) scales every restart timing together so a slow lane gives the publish room; the
 /// invariant the test rests on holds at any scale — publish ≪ reply ≪ recovery ≪ reconnect budget.
 static RESTART_SLOWDOWN: LazyLock<u64> = LazyLock::new(|| {
@@ -3703,5 +3770,55 @@ fn a_connect_is_answered_within_a_tenth_of_the_claim_wait() {
   assert!(
     quickest < Duration::from_nanos(slates_ipc::CLAIM_WAIT_NS / 10),
     "the quickest of {CONNECTS_TIMED} connects took {quickest:?}, a tenth of the claim wait or more"
+  );
+}
+
+/// Shape: the failover delay the hold test holds its daemon at (injected, A-384): a CLI attachment's term is at most this,
+/// so three of them with no verb would end an attachment nothing renews.
+const HOLD_CEILING: Duration = Duration::from_secs(2);
+
+/// A-384, the library's holder: a CLI attachment held by a `slates_client::Hold` outlives any idle time while the hold
+/// lives, and lapses once the hold is dropped. Do: on a one-shard daemon whose failover delay is held at
+/// [`HOLD_CEILING`], attach a volume for write in the CLI's form and hold it; leave it with no verb for three ceilings;
+/// write under it; drop the hold; wait two ceilings; write again. Expect the first write accepted (the hold's renewals
+/// alone kept the attachment through three ceilings), and the second refused `AttachmentExpired` naming it (dropping the
+/// hold ended the renewals, and no term outlasts the ceiling).
+#[test]
+fn a_hold_keeps_an_idle_cli_attachment_and_its_drop_lets_it_lapse() {
+  let (daemon, mut client, instance) = one_shard_daemon("hold");
+  daemon
+    .inject_failover(Some(u64::try_from(HOLD_CEILING.as_nanos()).unwrap()))
+    .expect("the failover delay is held");
+  let volume = client.create(&room_for("held", 64)).unwrap();
+  let attachment = client
+    .attach_with(
+      volume,
+      None,
+      Intent::Write,
+      slates_client::AttachRequest::Termed,
+    )
+    .unwrap()
+    .attachment;
+  let hold =
+    slates_client::Hold::new(&instance, deadlines(), attachment).expect("the attachment is held");
+  #[allow(clippy::disallowed_methods)] // three ceilings with no verb but the hold's renewals
+  std::thread::sleep(HOLD_CEILING.saturating_mul(3));
+  let held_write = client.fs_write((volume, attachment), "held.txt", b"held", 0o644);
+  drop(hold);
+  #[allow(clippy::disallowed_methods)] // two ceilings with no renewal
+  std::thread::sleep(HOLD_CEILING.saturating_mul(2));
+  let late = client.fs_write((volume, attachment), "late.txt", b"late", 0o644);
+  drop(client);
+  daemon.stop();
+  assert!(
+    held_write.is_ok(),
+    "the hold alone kept the attachment through three ceilings: {held_write:?}"
+  );
+  assert!(
+    matches!(
+      late,
+      Err(ClientError::Refused(Refusal::AttachmentExpired { attachment: named })) if named == attachment
+    ),
+    "the dropped hold let the attachment lapse: {late:?}"
   );
 }

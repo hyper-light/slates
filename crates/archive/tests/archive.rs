@@ -3,7 +3,7 @@
 //! or corrupt stream with a typed error rather than a panic — a flipped bit anywhere is detected
 //! and named, and a chunk whose payload does not match its declared identity is refused.
 
-use slates_archive::archive::Archive;
+use slates_archive::archive::{Archive, Decoding};
 use slates_archive::codec::{CodecPolicy, CodecRate, NEUTRAL_PERMILLE};
 use slates_archive::format::{ArchiveError, Chunk, Encoding};
 use slates_archive::manifest::{Entry, Node, NodeMeta};
@@ -199,6 +199,55 @@ fn a_short_stream_is_refused() {
   assert_eq!(Archive::decode(&[0u8; 8]), Err(ArchiveError::BadMagic));
 }
 
+/// `bytes` fed a byte a step and then checked a piece a step (A-494), and the steps it took.
+fn decoded_in_pieces(bytes: &[u8]) -> (Result<Archive, ArchiveError>, usize) {
+  let mut decoding = Decoding::new(bytes.len() as u64);
+  let mut steps = 0;
+  for byte in bytes.chunks(1) {
+    steps += 1;
+    if let Err(refusal) = decoding.feed(byte) {
+      return (Err(refusal), steps);
+    }
+  }
+  loop {
+    steps += 1;
+    match decoding.step(|| true) {
+      Ok(Some(archive)) => {
+        assert!(
+          matches!(decoding.step(|| true), Ok(None)),
+          "the archive is given once"
+        );
+        return (Ok(archive), steps);
+      }
+      Ok(None) => {}
+      Err(refusal) => return (Err(refusal), steps),
+    }
+  }
+}
+
+/// A-453, A-494: do decode an archive fed a byte a step and checked a piece a step. Expect the archive the one-call
+/// decode gives, its manifest identity the header's, and at least a step for every byte the whole-archive hash covers
+/// (the stepped path ran, not one call: a non-vacuity count).
+#[test]
+fn an_archive_decoded_in_pieces_is_the_archive_decoded_whole() {
+  let archive = sample();
+  let bytes = archive.encode();
+  let (decoded, steps) = decoded_in_pieces(&bytes);
+  assert_eq!(decoded, Ok(archive.clone()));
+  // The hash covers everything but its own 32 bytes and the trailer's 4-byte magic.
+  assert!(
+    steps >= bytes.len() - 36,
+    "{steps} steps for {} bytes",
+    bytes.len()
+  );
+  let mut decoding = Decoding::new(bytes.len() as u64);
+  decoding.feed(&bytes).unwrap();
+  assert_eq!(
+    decoding.manifest_identity(),
+    Some(archive.manifest_identity())
+  );
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
   /// T-7.4 (hostile): any truncation of a valid archive is refused with a typed error, never a
@@ -231,6 +280,25 @@ proptest! {
   fn arbitrary_bytes_do_not_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
     let _ = Archive::decode(&bytes);
     prop_assert!(true);
+  }
+
+  /// A-453 (hostile): do cut a valid archive anywhere, or flip any one of its bytes, and decode it a piece a step.
+  /// Expect what the one-call decode gives: the same refusal, typed, or (a flip in an informational field the hash
+  /// covers, which the hash refuses) never the original.
+  #[test]
+  fn a_cut_or_flipped_archive_decoded_in_pieces_is_refused_as_whole(at in 0usize..400, flip in any::<bool>()) {
+    let bytes = sample().encode();
+    let hostile = if flip {
+      prop_assume!(at < bytes.len());
+      let mut corrupt = bytes.clone();
+      corrupt[at] ^= 0x80;
+      corrupt
+    } else {
+      bytes[..at.min(bytes.len().saturating_sub(1))].to_vec()
+    };
+    let (in_pieces, _) = decoded_in_pieces(&hostile);
+    prop_assert_eq!(&in_pieces, &Archive::decode(&hostile));
+    prop_assert_ne!(in_pieces, Ok(sample()));
   }
 }
 

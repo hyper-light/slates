@@ -15,24 +15,33 @@
   clippy::panic,
   clippy::indexing_slicing
 )]
-#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use slates_land::engine::LandingReport;
 use slates_land::engine::{Degradation, LandingState, Outcome};
 use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::base::BaseConfig;
+#[cfg(windows)]
+use slates_vfs::host::OsCode;
 use slates_vfs::host::{HostError, HostFs, LandFs};
 use slates_vfs::volume::{Store, Volume};
+#[cfg(unix)]
 use slates_vfs::xattr::XattrSet;
 
 mod common;
 use common::{
-  LARGE, Session, Setup, config, mkdir, mkdir_with_mode, read_through, rename, request, rm_r,
-  scratch, store, symlink, unlink, write_file,
+  LARGE, Session, Setup, config, mkdir, read_through, rename, request, rm_r, scratch, store,
+  unlink, write_file,
 };
+// A link in the volume, which the Unix tests and the Windows link test land (A-438).
+use common::symlink;
+// The piece only the Unix tests use (a directory's recorded mode).
+#[cfg(unix)]
+use common::mkdir_with_mode;
 
 /// Format: the environment variable that turns this binary into the kill test's child.
 const CHILD_DIR: &str = "SLATES_LAND_CHILD_DIR";
@@ -133,6 +142,9 @@ fn edit_example(vol: &mut Volume, host: &mut OsLand, store: &mut Store) {
   unlink(vol, host, store, "/src/gone.rs");
   mkdir(vol, host, store, "/out");
   write_file(vol, host, store, "/out/inner", b"inner");
+  // Windows lands a link only where its account may make one (A-438): its own test,
+  // `a_symlink_in_a_landing_is_a_windows_symbolic_link`, which skips loudly where it may not.
+  #[cfg(unix)]
   symlink(vol, host, store, "/link", "src/lib.rs");
   rename(vol, host, store, "/moved", "/moved2");
   rm_r(vol, host, store, "/tree");
@@ -147,9 +159,12 @@ fn assert_example_on_disk(root: &Path) {
   assert_eq!(read(&root.join("moved2/m")).unwrap(), b"m");
   assert!(!root.join("moved").exists());
   assert!(!root.join("tree").exists());
-  #[allow(clippy::disallowed_methods)]
-  let link = std::fs::read_link(root.join("link")).unwrap();
-  assert_eq!(link, Path::new("src/lib.rs"));
+  #[cfg(unix)]
+  {
+    #[allow(clippy::disallowed_methods)]
+    let link = std::fs::read_link(root.join("link")).unwrap();
+    assert_eq!(link, Path::new("src/lib.rs"));
+  }
   assert!(
     !names_in(root).iter().any(|n| n.starts_with(".slates-")),
     "{:?}",
@@ -200,14 +215,35 @@ fn the_worked_example_lands_on_a_real_directory() {
   );
 }
 
-/// Containment: a symlink component and `..` are refused before the lease; a relative path too.
+/// A name at `alias` that redirects to the directory `real`, as an outsider makes one without privilege: a symbolic
+/// link on Unix, a junction on Windows (`mklink /J`, whose arguments take backslashes).
+fn redirect(real: &Path, alias: &Path) {
+  #[cfg(unix)]
+  {
+    #[allow(clippy::disallowed_methods)]
+    std::os::unix::fs::symlink(real, alias).unwrap();
+  }
+  #[cfg(windows)]
+  {
+    let backslashed = |path: &Path| path.to_string_lossy().replace('/', "\\");
+    let made = Command::new("cmd")
+      .args(["/C", "mklink", "/J"])
+      .arg(backslashed(alias))
+      .arg(backslashed(real))
+      .output()
+      .unwrap();
+    assert!(made.status.success(), "mklink /J: {made:?}");
+  }
+}
+
+/// Containment: a symlink (Unix) or junction (Windows) component and `..` are refused before the lease; a relative
+/// path too.
 #[test]
 fn a_target_path_that_escapes_is_refused() {
   let ram = build_output();
   let ws = Workspace::new(&ram, "escape");
   seed_dir(&ws.path.join("real"));
-  #[allow(clippy::disallowed_methods)]
-  std::os::unix::fs::symlink(ws.path.join("real"), ws.path.join("alias")).unwrap();
+  redirect(&ws.path.join("real"), &ws.path.join("alias"));
   assert_eq!(
     OsLand::open_target(&ws.path.join("alias"))
       .err()
@@ -313,6 +349,7 @@ fn a_landing_component_never_steps_out_of_the_target() {
 /// `"through/evil"`). Proven on a real directory with a symlink aimed at the parent that holds the secret:
 /// the walk step (open as a directory) and the leaf step (open as a file) both refuse, so a sibling entry
 /// keyed through it can never be created outside, and the secret keeps its bytes (R1, §4.15 containment).
+#[cfg(unix)]
 #[test]
 fn a_landing_never_walks_a_manifest_path_through_a_symlink() {
   let ram = build_output();
@@ -390,11 +427,556 @@ fn a_scratch_volume_into_an_empty_real_directory_preserves_the_target() {
   );
 }
 
+/// T-1.15's rounds as one test (A-185). Do: land a scratch volume holding `/f` into an empty real directory, write new
+/// bytes to `/f` in the volume and land again. Expect: both landings `Done`, the second `Written` over the file the first
+/// placed, and the disk holding the second bytes. On Windows the second replaces by moves (NTFS has no exchange), so the
+/// file the first placed is moved aside and checked against its witness: every bit the first landing's writes and
+/// renames left on it must read as the same object.
+#[test]
+fn a_file_a_landing_placed_is_replaced_by_the_next_landing() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "again");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  write_file(&mut vol, &mut host, &mut store, "/f", b"first landing");
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let first = setup.land(request(1)).unwrap();
+  assert_eq!(first.state, LandingState::Done, "{first:?}");
+  write_file(setup.vol, setup.host, setup.store, "/f", b"second landing");
+  let second = setup.land(request(2)).unwrap();
+  assert_eq!(second.state, LandingState::Done, "{second:?}");
+  assert_eq!(
+    second
+      .entries
+      .iter()
+      .map(|entry| entry.outcome.clone())
+      .collect::<Vec<_>>(),
+    vec![Some(Outcome::Written)],
+    "{second:?}"
+  );
+  assert_eq!(read(&ws.path.join("out/f")).unwrap(), b"second landing");
+}
+
+/// Format: `ERROR_PRIVILEGE_NOT_HELD` (winerror.h): what the writer's link set answers on an account without
+/// `SeCreateSymbolicLinkPrivilege` (A-568).
+#[cfg(windows)]
+const PRIVILEGE_NOT_HELD: u32 = 1314;
+
+/// Whether `path`'s entry in `report` failed for the link privilege this account does not hold (A-568): the writer is
+/// its own probe, so a test's expectation and the landing never disagree about whether a link may be made.
+#[cfg(windows)]
+fn failed_for_the_link_privilege(report: &LandingReport, path: &str) -> bool {
+  report.entries.iter().any(|entry| {
+    &*entry.path == path
+      && entry.outcome
+        == Some(Outcome::Failed {
+          code: Some(OsCode::Win32(PRIVILEGE_NOT_HELD)),
+        })
+  })
+}
+
+/// A landing whose link `path` failed alone for the link privilege (A-568): every other entry written, the landing
+/// `Partial` and never crashed.
+#[cfg(windows)]
+fn assert_only_the_link_failed(report: &LandingReport, path: &str) {
+  eprintln!(
+    "the link {path} failed alone: this account may not make a symbolic link through the writer's route (A-568)"
+  );
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert!(
+    !report
+      .degraded
+      .iter()
+      .any(|degraded| matches!(degraded, Degradation::Crashed { .. })),
+    "{report:?}"
+  );
+  assert!(
+    report
+      .entries
+      .iter()
+      .filter(|entry| &*entry.path != path)
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+}
+
+/// A-438, A-568 (a volume link in A-275's form, landed, or failed alone where this account may not make one). Do: land a
+/// scratch volume holding `/src/lib.rs` and the relative link `/lib/link` to `../src/lib.rs` into an empty real
+/// directory. Expect, where the writer may make the link (the privilege held: an administrator, CI's runner): the
+/// landing `Done` with every entry written; the link a Windows file symbolic link whose target reads `..\src\lib.rs`
+/// (the volume's `/` as `\`); the file's bytes read through it; and no hidden name left where the link was staged.
+/// Where it may not (a standard account, in Developer Mode or not: `CreateSymbolicLinkW`'s unprivileged flag is no route
+/// a handle-relative writer may take, measured on jupiter): the link's entry failed alone by `ERROR_PRIVILEGE_NOT_HELD`,
+/// the rest written, nothing at the link's name and no hidden name left; the branch taken is printed. Before A-568 a
+/// `CreateSymbolicLinkW` probe decided, which Developer Mode lets where the writer may not, and the landing ended
+/// `Aborted` there.
+#[cfg(windows)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_symlink_in_a_landing_is_a_windows_symbolic_link_or_fails_alone() {
+  use std::os::windows::fs::FileTypeExt;
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "link");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  mkdir(&mut vol, &mut host, &mut store, "/src");
+  write_file(&mut vol, &mut host, &mut store, "/src/lib.rs", b"lib");
+  mkdir(&mut vol, &mut host, &mut store, "/lib");
+  symlink(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/lib/link",
+    "../src/lib.rs",
+  );
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  let lib = ws.path.join("out").join("lib");
+  if failed_for_the_link_privilege(&report, "/lib/link") {
+    assert_only_the_link_failed(&report, "/lib/link");
+    assert!(
+      names_in(&lib).is_empty(),
+      "nothing at the link's name, no hidden name left"
+    );
+    return;
+  }
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  let kind = std::fs::symlink_metadata(lib.join("link"))
+    .unwrap()
+    .file_type();
+  assert!(kind.is_symlink_file(), "a file symbolic link: {kind:?}");
+  assert_eq!(
+    std::fs::read_link(lib.join("link")).unwrap(),
+    Path::new(r"..\src\lib.rs")
+  );
+  assert_eq!(
+    std::fs::read(lib.join("link")).unwrap(),
+    b"lib",
+    "read through the link"
+  );
+  assert_eq!(
+    names_in(&lib),
+    ["link"],
+    "nothing but the link: no staged name left"
+  );
+}
+
+/// Format: the environment variable naming a writable directory on a ReFS volume or a Dev Drive, where the reflink test
+/// lands (a runner makes one from a VHD it formats; without it the test skips, saying so).
+#[cfg(windows)]
+const REFS_DIR: &str = "SLATES_TEST_REFS_DIR";
+
+/// A-445 (a reflink in a Windows landing, ReFS block cloning). Do: land a scratch volume holding two files with the same
+/// bytes (three 64 KiB clusters and 17 bytes, so the last cluster is partial on either of ReFS's clusters) and one with
+/// other bytes, into a directory on a volume that shares clusters (`SLATES_TEST_REFS_DIR`; skipped loudly without one,
+/// or where the volume says it shares nothing). Expect the landing `Done`, every entry written, the second identical
+/// file cloned (`cloned` 1), both identical files whole at their exact length, and no hidden name left.
+#[cfg(windows)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_duplicate_file_is_cloned_on_a_volume_that_shares_clusters() {
+  let Some(refs) = std::env::var_os(REFS_DIR) else {
+    eprintln!("skipped: {REFS_DIR} names no directory on a ReFS volume or a Dev Drive");
+    return;
+  };
+  let ws = Workspace::new(Path::new(&refs), "clone");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  if !host.capabilities(target.dir).unwrap().reflink {
+    eprintln!(
+      "skipped: the volume under {} shares no clusters between files",
+      ws.path.display()
+    );
+    return;
+  }
+  let same: Vec<u8> = (0..3 * 65_536 + 17u32)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  write_file(&mut vol, &mut host, &mut store, "/a.bin", &same);
+  write_file(&mut vol, &mut host, &mut store, "/b.bin", &same);
+  write_file(&mut vol, &mut host, &mut store, "/c.bin", b"other");
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  assert_eq!(report.cloned, 1, "{report:?}");
+  let out = ws.path.join("out");
+  assert_eq!(read(&out.join("a.bin")).unwrap(), same);
+  assert_eq!(
+    read(&out.join("b.bin")).unwrap(),
+    same,
+    "the clone, whole at its exact length"
+  );
+  assert_eq!(read(&out.join("c.bin")).unwrap(), b"other");
+  assert_eq!(
+    names_in(&out),
+    ["a.bin", "b.bin", "c.bin"],
+    "no hidden name left"
+  );
+}
+
+/// Format: `FILE_ATTRIBUTE_READONLY` (winnt.h), as `MetadataExt::file_attributes` reads it.
+#[cfg(windows)]
+const READONLY: u32 = 0x1;
+/// Format: `FILE_ATTRIBUTE_ARCHIVE` (winnt.h): NTFS sets it on a file it makes or writes, and a backup clears it once it
+/// has copied the file.
+#[cfg(windows)]
+const ARCHIVE: u32 = 0x20;
+/// Format: a read-only regular file's mode (`S_IFREG | 0o444`).
+#[cfg(windows)]
+const READ_ONLY_FILE_MODE: u32 = 0o100_444;
+
+/// The attribute word of the entry at `path` itself (Windows).
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)]
+fn attributes_of(path: &Path) -> u32 {
+  use std::os::windows::fs::MetadataExt;
+  std::fs::symlink_metadata(path).unwrap().file_attributes()
+}
+
+/// Clears the `ARCHIVE` bit of the file at `path`, as a backup does once it has copied the file (`attrib -A`, whose
+/// argument takes backslashes).
+#[cfg(windows)]
+fn clear_archive(path: &Path) {
+  let cleared = Command::new("attrib")
+    .arg("-A")
+    .arg(path.to_string_lossy().replace('/', "\\"))
+    .output()
+    .unwrap();
+  assert!(cleared.status.success(), "attrib -A: {cleared:?}");
+  assert_eq!(
+    attributes_of(path) & ARCHIVE,
+    0,
+    "attrib -A cleared the bit"
+  );
+}
+
+/// A-185, A-262 (a file's read-only state is its mode). Do: land a scratch volume holding a writable file (0644) and a
+/// read-only one (0444) into an empty real directory on NTFS. Expect: both land, each holding `ARCHIVE`, as NTFS marks
+/// every file it writes for the next backup; the read-only one holds `READONLY` and the writable one does not. The rename
+/// that places a file sets `ARCHIVE` whatever its mode's write left (an attribute word written whole lands the same,
+/// run 44367207034), so what this holds is the mode's mapping and the bit a backup reads.
+#[cfg(windows)]
+#[test]
+fn a_landed_file_keeps_its_archive_bit_and_takes_read_only_from_its_mode() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "archive-kept");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  write_file(&mut vol, &mut host, &mut store, "/writable", b"writable");
+  common::write_file_with_mode(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/read-only",
+    b"read only",
+    READ_ONLY_FILE_MODE,
+  );
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  let writable = attributes_of(&ws.path.join("out/writable"));
+  let read_only = attributes_of(&ws.path.join("out/read-only"));
+  assert_eq!(
+    writable & (ARCHIVE | READONLY),
+    ARCHIVE,
+    "the writable file's attributes: {writable:#x}"
+  );
+  assert_eq!(
+    read_only & (ARCHIVE | READONLY),
+    ARCHIVE | READONLY,
+    "the read-only file's attributes: {read_only:#x}"
+  );
+}
+
+/// Format: `FILE_ATTRIBUTE_HIDDEN` (winnt.h).
+#[cfg(windows)]
+const HIDDEN: u32 = 0x2;
+/// Format: `FILE_ATTRIBUTE_SYSTEM` (winnt.h).
+#[cfg(windows)]
+const SYSTEM: u32 = 0x4;
+
+/// Lands into the empty real directory `out` a scratch volume holding a directory `/d` the drive made read-only and
+/// hidden, a file in it the drive made system and hidden, and the relative link `/to_d` to `d` that Windows made as a
+/// directory link (A-451).
+#[cfg(windows)]
+fn land_bits_and_a_directory_link(out: &Path) -> LandingReport {
+  use slates_vfs::inode::{Kind, WindowsAttributes};
+  let (mut host, target) = OsLand::open_target(out).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  mkdir(&mut vol, &mut host, &mut store, "/d");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/d/f.rs",
+    b"in a hidden directory",
+  );
+  symlink(&mut vol, &mut host, &mut store, "/to_d", "d");
+  for (path, bits, kind) in [
+    ("/d", READONLY | HIDDEN, Kind::Dir),
+    ("/d/f.rs", SYSTEM | HIDDEN, Kind::File),
+    (
+      "/to_d",
+      u32::from(WindowsAttributes::LINK_DIRECTORY),
+      Kind::Symlink,
+    ),
+  ] {
+    common::set_windows_bits(&mut vol, &mut host, &mut store, path, bits, kind);
+  }
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  setup.land(request(1)).unwrap()
+}
+
+/// The directory `out/d` holding `READONLY | HIDDEN`, and its file `SYSTEM | HIDDEN` and `ARCHIVE` (the rename that
+/// places it sets that bit) and not `READONLY` (its mode can write) (A-451).
+#[cfg(windows)]
+fn assert_the_bits_landed(out: &Path) {
+  let directory = attributes_of(&out.join("d"));
+  assert_eq!(
+    directory & (READONLY | HIDDEN | SYSTEM),
+    READONLY | HIDDEN,
+    "the directory's attributes: {directory:#x}"
+  );
+  let file = attributes_of(&out.join("d").join("f.rs"));
+  assert_eq!(
+    file & (READONLY | HIDDEN | SYSTEM | ARCHIVE),
+    SYSTEM | HIDDEN | ARCHIVE,
+    "the file's attributes: {file:#x}"
+  );
+}
+
+/// `out/to_d` a Windows directory symbolic link whose target reads `d`, the file listed through it (A-451).
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)]
+fn assert_the_directory_link_landed(out: &Path) {
+  use std::os::windows::fs::FileTypeExt;
+  let kind = std::fs::symlink_metadata(out.join("to_d"))
+    .unwrap()
+    .file_type();
+  assert!(kind.is_symlink_dir(), "a directory symbolic link: {kind:?}");
+  assert_eq!(
+    std::fs::read_link(out.join("to_d")).unwrap(),
+    Path::new("d")
+  );
+  assert_eq!(
+    names_in(&out.join("to_d")),
+    ["f.rs"],
+    "the directory listed through the link"
+  );
+}
+
+/// A-451, A-568 (the volume's Windows bits land, and a directory link as a directory link, or failed alone where this
+/// account may not make one). Do: land [`land_bits_and_a_directory_link`]'s volume into an empty real directory on NTFS.
+/// Expect the directory and its file to hold their bits ([`assert_the_bits_landed`]) either way. Where the writer may
+/// make the link: the landing `Done` with every entry written, the link a Windows directory symbolic link
+/// ([`assert_the_directory_link_landed`]), and no hidden name left. Where it may not (a standard account, in Developer
+/// Mode or not, A-568): the link's entry failed alone by `ERROR_PRIVILEGE_NOT_HELD`, the rest written, nothing at the
+/// link's name and no hidden name left; the branch taken is printed. Before A-451 the bits stayed in the volume and a
+/// directory link landed as a file link; before A-568 a `CreateSymbolicLinkW` probe decided, which Developer Mode lets
+/// where the writer may not.
+#[cfg(windows)]
+#[test]
+fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "windows-bits");
+  let out = ws.path.join("out");
+  seed_dir(&out);
+  let report = land_bits_and_a_directory_link(&out);
+  assert_the_bits_landed(&out);
+  if failed_for_the_link_privilege(&report, "/to_d") {
+    assert_only_the_link_failed(&report, "/to_d");
+    assert_eq!(names_in(&out), ["d"], "no link and no hidden name left");
+    return;
+  }
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  assert_the_directory_link_landed(&out);
+  assert_eq!(names_in(&out), ["d", "to_d"], "no hidden name left");
+}
+
+/// A-185. Do: on NTFS, seed a file and clear its `ARCHIVE` bit as a backup does; over the directory, write new bytes to
+/// the file in an overlay and land it. Expect: the landing replaces the file (`Done`, its entry `Written`, the disk
+/// holding the new bytes). NTFS has no exchange, so the engine moves the old file aside and checks it there against its
+/// witness, and the move may set `ARCHIVE` again (the attribute word after the move is printed): the check sets that
+/// bit aside, as it does the ctime and the birth time a move changes, and still compares the bytes.
+#[cfg(windows)]
+#[test]
+fn a_file_whose_archive_bit_a_backup_cleared_is_replaced_by_a_landing() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "archive-cleared");
+  seed_file(&ws.path.join("kept"), b"backed up");
+  clear_archive(&ws.path.join("kept"));
+  let (mut host, target) = OsLand::open_target(&ws.path).unwrap();
+  let mut store = store();
+  let mut vol = overlay_over(&mut host, target.dir, &mut store);
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/kept",
+    b"edited after the backup",
+  );
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  let after = attributes_of(&ws.path.join("kept"));
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "attributes after: {after:#x}; {report:?}"
+  );
+  assert_eq!(
+    read(&ws.path.join("kept")).unwrap(),
+    b"edited after the backup"
+  );
+}
+
+/// Sets the `READONLY` bit of the file at `path`, as a person's `attrib +R` does (its argument takes backslashes).
+#[cfg(windows)]
+fn set_read_only(path: &Path) {
+  let set = Command::new("attrib")
+    .arg("+R")
+    .arg(path.to_string_lossy().replace('/', "\\"))
+    .output()
+    .unwrap();
+  assert!(set.status.success(), "attrib +R: {set:?}");
+  assert_eq!(
+    attributes_of(path) & READONLY,
+    READONLY,
+    "attrib +R set the bit"
+  );
+}
+
+/// A-519 (a read-only file's metadata entry lands). Do: over a real directory on NTFS holding a file a person made
+/// read-only (`attrib +R`), mark the file hidden through an overlay, its bytes and mode untouched, and land. Expect the
+/// landing `Done` with its one entry written: the disk's file `HIDDEN` and still `READONLY`, its bytes as they were.
+/// Before A-519 the entry failed alone: NTFS refuses a read-only file the handle that may write (MS-FSA 2.1.5.1.2.1),
+/// which the barrier's `FlushFileBuffers` needed; the file is now opened to write its attributes alone, write-through.
+#[cfg(windows)]
+#[test]
+fn a_read_only_files_metadata_entry_lands() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "read-only-meta");
+  seed_file(&ws.path.join("locked"), b"read only");
+  set_read_only(&ws.path.join("locked"));
+  let (mut host, target) = OsLand::open_target(&ws.path).unwrap();
+  let mut store = store();
+  let mut vol = overlay_over(&mut host, target.dir, &mut store);
+  common::set_windows_bits(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/locked",
+    HIDDEN | ARCHIVE,
+    slates_vfs::inode::Kind::File,
+  );
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  let after = attributes_of(&ws.path.join("locked"));
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(
+    report
+      .entries
+      .iter()
+      .map(|entry| entry.outcome.clone())
+      .collect::<Vec<_>>(),
+    vec![Some(Outcome::Written)],
+    "attributes after: {after:#x}; {report:?}"
+  );
+  assert_eq!(
+    after & (READONLY | HIDDEN),
+    READONLY | HIDDEN,
+    "attributes after: {after:#x}"
+  );
+  assert_eq!(read(&ws.path.join("locked")).unwrap(), b"read only");
+}
+
 /// §4.15 step 6 (a directory's mode lands as recorded). Do: under the conventional umask 022, land a scratch
 /// volume holding `/shared` (0775), `/private` (0700) and a file in each into an empty real directory. Expect:
 /// each directory on the disk has exactly its recorded mode. Before 2026-10-01 the landed directory was made
 /// with `mkdirat(mode)` and nothing after it, so the process umask cleared bits the volume held: 0775 landed
 /// 0755 (found by the Linux container lane's hermeticity run, whose harness made its directories under umask 002).
+#[cfg(unix)]
 #[test]
 fn a_landed_directory_keeps_its_mode_whatever_the_umask() {
   // The conventional umask, so the test means the same on every host; the landing must not depend on it.
@@ -442,6 +1024,7 @@ fn a_landed_directory_keeps_its_mode_whatever_the_umask() {
 /// `04755`, land it, and read the disk file. Expect: owned by the process's euid, never the recorded uid; the
 /// setuid bit present. A regression against a future `fchown` added to `land` for "ownership fidelity", which
 /// would turn a recorded uid-0 setuid file into a setuid-root binary on disk.
+#[cfg(unix)]
 #[test]
 fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
   use std::os::unix::fs::MetadataExt;
@@ -524,6 +1107,7 @@ fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
 /// cousins. Do: write a file, set `security.capability` on it in the volume (asserting the volume holds it), land
 /// it, read the disk file back. Expect: the file's bytes land (non-vacuity: the landing ran to completion), and
 /// `security.capability` is absent on disk (reading it fails: no such attribute).
+#[cfg(unix)]
 #[test]
 fn a_landing_never_materializes_a_security_capability_xattr() {
   let ram = build_output();

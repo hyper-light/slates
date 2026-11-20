@@ -665,11 +665,11 @@ fn a_directory_rename_never_replaces_an_unread_base_directory_and_a_hostless_bri
       "target",
       RenameFlags::default()
     ),
-    Err(VfsError::BaseUnavailable(0))
+    Err(VfsError::BaseUnavailable(None))
   );
   assert_eq!(
     hostless.lookup(oid(fresh_root), &cx, "target").map(|_| ()),
-    Err(VfsError::BaseUnavailable(0))
+    Err(VfsError::BaseUnavailable(None))
   );
   drop(hostless);
   let target = fresh.lookup(fresh_root, "target").unwrap();

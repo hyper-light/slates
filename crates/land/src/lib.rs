@@ -27,11 +27,34 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+// The regions a ReFS block clone shares a file in (A-445): the Windows writer's, and pure, so its tests run on every host.
+#[cfg(any(windows, test))]
+mod block_clone;
+#[cfg(test)]
+mod captured_tests;
+#[cfg(test)]
+mod chmod_tests;
 pub mod engine;
 pub mod grant;
 pub mod manifest;
+// The landing manifest's golden vectors (A-469): the bytes a grant binds, pinned for each layout.
+#[cfg(test)]
+mod manifest_vectors;
 pub mod source;
+// The store and volume configuration the unit tests land over, one fixture for every suite.
+#[cfg(test)]
+mod test_store;
 pub mod verdict;
+// The Windows attribute word a landed object takes from the volume's bits (A-451): the Windows writer's, and pure.
+#[cfg(any(windows, test))]
+mod windows_bits;
+// The refusal a Win32 error code is at the write seam (A-527): the Windows writer's, and pure.
+#[cfg(any(windows, test))]
+mod windows_codes;
 
 #[cfg(unix)]
+pub mod os;
+// Windows' write seam, the same surface over NTFS handles (plan G-shards-windows step 5).
+#[cfg(windows)]
+#[path = "os_windows.rs"]
 pub mod os;

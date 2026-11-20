@@ -16,6 +16,9 @@
 //!
 //! Evidence for the primitives: `research/disk-source-of-truth.md` §4 (verified per
 //! platform), and the timestamp-granularity table there for the racy rule.
+//!
+//! An overlay's base may instead be the objects under an S3 base's prefix ([`s3`], §4.15 "An S3 base"): a volume's slot
+//! holds either kind as one [`BaseHost`] (A-555).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -24,7 +27,11 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod base_host;
+#[cfg(unix)]
+pub mod hint_set;
 pub mod own_mounts;
+pub mod s3;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -92,10 +99,13 @@ pub(crate) fn windows_mode_and_bits(attributes: u32) -> (u32, u16) {
   (mode, WindowsAttributes::kept(attributes, kind).bits())
 }
 
+pub use base_host::BaseHost;
+#[cfg(unix)]
+pub use hint_set::HintSet;
 #[cfg(unix)]
 pub use unix::OsHost;
 #[cfg(windows)]
-pub use windows::OsHost;
+pub use windows::{OsHost, WalkRefusal, walk_dir};
 
 /// Derived: the timestamp granularity in nanoseconds by filesystem type, from the cited table
 /// (`research/disk-source-of-truth.md` §4): ext4, XFS, Btrfs, tmpfs and APFS carry nanoseconds,
@@ -137,17 +147,19 @@ pub enum FsKind {
 mod tests {
   use super::*;
 
-  /// A-262. Do: map the attribute words of an ordinary file (`ARCHIVE`), a hidden read-only file, a hidden read-only
-  /// directory, and a directory symlink (a reparse point with the directory bit). Expect: `S_IFREG | 0o644` with
-  /// `ARCHIVE` kept; `S_IFREG | 0o444` with `HIDDEN | ARCHIVE` kept (the file's read-only state is its mode); `S_IFDIR |
-  /// 0o755` with `READONLY | HIDDEN` kept; `S_IFLNK | 0o777`. Before, the word itself was the mode (`0x20` read as
+  /// A-262, with A-275's link bit. Do: map the attribute words of an ordinary file (`ARCHIVE`), a hidden read-only file,
+  /// a hidden read-only directory, and a directory symlink (a reparse point with the directory bit). Expect:
+  /// `S_IFREG | 0o644` with `ARCHIVE` kept; `S_IFREG | 0o444` with `HIDDEN | ARCHIVE` kept (the file's read-only state is
+  /// its mode); `S_IFDIR | 0o755` with `READONLY | HIDDEN` kept; `S_IFLNK | 0o777` with the directory bit kept, since a
+  /// link keeps whether it is a directory link (A-275: `WindowsAttributes::LINK_DIRECTORY`; this test still expected
+  /// none after A-275 changed the mask, and failed on main). Before A-262, the word itself was the mode (`0x20` read as
   /// `0o040`), so an ordinary file read as one its owner may not write.
   #[test]
   fn a_windows_entrys_mode_is_drvfs_mapping_and_its_bits_are_kept_apart() {
     assert_eq!(windows_mode_and_bits(0x20), (0o100_644, 0x20));
     assert_eq!(windows_mode_and_bits(0x1 | 0x2 | 0x20), (0o100_444, 0x22));
     assert_eq!(windows_mode_and_bits(0x10 | 0x1 | 0x2), (0o040_755, 0x3));
-    assert_eq!(windows_mode_and_bits(0x400 | 0x10), (0o120_777, 0));
+    assert_eq!(windows_mode_and_bits(0x400 | 0x10), (0o120_777, 0x10));
   }
 
   /// §4.5's racy rule rests on this table, so the table is pinned here — in particular the arm every

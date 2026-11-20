@@ -1,0 +1,35 @@
+[package]
+name = "slates-hg"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Mercurial's exchange formats and objects (§4.17.3, A-514, A-545, A-569, A-588, A-598): bundle2, bundle1, changegroups and their deltas, part payloads, the wire protocol, changesets, manifests and file revisions with their nodes, decoded and encoded as pure functions over bytes, every length checked against the input and the caller's admission, and compressed bundles inflated within it."
+
+[dependencies]
+# The engines of compressed bundles (A-598; D-17): zlib through the workspace's flate2, whose backend the workspace
+# chose by measurement (A-607); bzip2 on its pure-Rust libbz2-rs-sys; zstd the workspace's (libzstd 1.5.7). zlib and
+# zstd also inflate a revlog's chunks (A-611).
+bzip2 = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+# The SHA-1 of a Mercurial node with collision detection, as 7.2's sha1dc computes it (A-588): the workspace's port of
+# sha1collisiondetection, which git's object names use (A-600; the workspace manifest says why this crate).
+sha1-checked = { workspace = true }
+# The shared object store's tables, which hold the repository's index (A-588 part 2, A-581).
+slates-vcs = { workspace = true }
+# The merge engine a push becomes a work in (§4.17.1 shared piece 4, A-618): a push's trees, laid out from its flat
+# manifests, read by its builder (A-641 part 2), as slates-git's store is.
+slates-merge = { workspace = true }
+# The names of the directories a flat manifest is laid out under (A-641 part 2): BLAKE3 in key-derivation mode, the
+# workspace's hash for identities (slates-merge's and slates-vcs's).
+blake3 = { workspace = true }
+
+[dev-dependencies]
+slates-test-seeds = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

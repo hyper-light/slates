@@ -20,7 +20,7 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 mod common;
 use common::nfs::{
   MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup, lookup_raw_status,
-  lookup_status, mkdir, mkdir_status, mount, mount_status, opaque, read, read_status,
+  lookup_status, mkdir, mkdir_status, mount, mount_status, opaque, read, read_status, readdirplus,
   readdirplus_status, readlink, remove_status, rmdir_status, status, symlink_status, write,
   write_at_status,
 };
@@ -44,6 +44,10 @@ const COUNTER_BITS: std::ops::Range<usize> = 152..200;
 const NFSPROC3_READ: u32 = 6;
 /// Format: NFSPROC3_WRITE (RFC 1813).
 const NFSPROC3_WRITE: u32 = 7;
+/// Format: `NFS3ERR_FBIG` (RFC 1813 §2.6): the file is too large, or a write would make it larger than the server keeps.
+const NFS3ERR_FBIG: u32 = 27;
+/// Format: NFSPROC3_READDIRPLUS (RFC 1813).
+const NFSPROC3_READDIRPLUS: u32 = 17;
 /// Format: the record marker's last-fragment bit (RFC 5531 §11).
 const LAST_FRAGMENT: u32 = 0x8000_0000;
 
@@ -1732,8 +1736,9 @@ fn a_forged_readdir_cookie_is_bounded_and_the_daemon_survives() {
 /// A WRITE at a colossal offset (§4.6; checked arithmetic, no unbounded allocation). A client controls the WRITE
 /// offset; `offset + count` overflowing `u64` must be a typed refusal, never a wrap to a small offset, and a
 /// colossal sparse offset must not drive the daemon to allocate the whole span (OOM). Over a live socket, the
-/// overflowing write is refused and a normal write/read round-trips afterwards — the daemon never wrapped, paniced
-/// or OOM'd.
+/// overflowing write is refused `NFS3ERR_FBIG`, RFC 1813 §3.3.7's status for a write past the largest file the server
+/// keeps (it was `NFS3ERR_SERVERFAULT`, the server's own failure, until 2026-11-11), and a normal write/read
+/// round-trips afterwards — the daemon never wrapped, paniced or OOM'd.
 #[test]
 fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
   let (daemon, instance) = single_shard_daemon("writeoverflow");
@@ -1748,9 +1753,9 @@ fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
   // a colossal (non-overflowing) sparse offset: whatever the policy, it must not OOM the daemon.
   let colossal = write_at_status(&mut s, &f, 1u64 << 60, b"x", 4);
   eprintln!("PROBE write offset: overflow(u64::MAX-5)={overflow} colossal(2^60)={colossal}");
-  assert_ne!(
-    overflow, 0,
-    "a WRITE whose offset+count overflows u64 is refused, not wrapped (FBIG)"
+  assert_eq!(
+    overflow, NFS3ERR_FBIG,
+    "a WRITE whose offset+count overflows u64 is refused NFS3ERR_FBIG, not wrapped and not SERVERFAULT"
   );
 
   // The colossal non-overflowing offset is a sparse write — normal POSIX (a hole costs no space; slates charges
@@ -1777,7 +1782,24 @@ fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
 /// this test's first MOUNT 3 of 3 times on `d61c3be2`, after 1.00 s (adacachy).
 #[test]
 fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused() {
-  let (daemon, instance) = two_shard_daemon("starved-owner");
+  common::supervised::run(
+    "a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role",
+    "srv-starved-owner",
+    2,
+  );
+}
+
+/// The role [`a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused`] runs as a supervised daemon's process: its second half wedges the owner shard past a window
+/// while the control shard answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused as a supervised child"]
+fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role() {
+  let Some((daemon, instance)) = common::supervised::daemon(
+    "a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role",
+  ) else {
+    return;
+  };
+  daemon.bootstrap(true).unwrap();
   let name = provision_remote_volume(&instance);
   let export = daemon.mount_capability(&name).unwrap().unwrap();
   let port = daemon.nfs_port().unwrap();
@@ -1796,6 +1818,83 @@ fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused() {
   );
   wedged.join().unwrap();
   drop(daemon);
+}
+
+/// A volume named `hostile-control-N` that the control shard (partition 0) owns, created through the client: a name's
+/// partition is its hash's, so names are tried until one lands there, as [`provision_remote_volume`] tries for the other.
+fn provision_control_volume(instance: &str) -> String {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let started = Instant::now();
+  let mut client = loop {
+    match slates_client::Client::connect(instance, deadlines) {
+      Ok(client) => break client,
+      Err(e) => assert!(started.elapsed() < SETTLE, "connect: {e}"),
+    }
+  };
+  for attempt in 0u32..32 {
+    let name = format!("hostile-control-{attempt}");
+    let id = client
+      .create(&slates_client::CreateSpec {
+        name: name.clone(),
+        size: SizeClass::Bounded { limit: 64 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap();
+    if slates_server::verbs::owner_of(id) == 0 {
+      return name;
+    }
+  }
+  panic!("no volume landed on the control shard in 32 attempts");
+}
+
+/// §4.13 (AUD-01), D-14 ("ids route to owners"). Do: on a two-shard daemon with a volume the control shard owns, mount
+/// the host root under that volume's capability, then hold the other shard in one starved poll for three liveness windows
+/// (on the CPU a fifth of the time, alive by A-232's rule: this daemon has no anchor, so a shard wedged past a window
+/// ends its process, exit 4, as it did on CI's Windows lane in diag-b13-1), and list the host root meanwhile. Expect: the
+/// listing answered (accept status 0) before the hold ends, and the volume's name in it once the hold is over. The old
+/// gather waited on the held shard in its own CPU time, which the hold spends slowly, so it answered only after the hold. A capability authorizes one attachment, which names the
+/// partition that holds it, and only that partition can list anything under it, so the listing asks that one shard.
+/// Before, a root `READDIR` asked every shard and waited on each, so a wedged shard the capability has nothing on
+/// failed the listing `SYSTEM_ERR` after a window, and any capability holder made every shard answer as often as it
+/// liked (GAPS: A-192's open list, found sweeping for the connection end's siblings).
+#[test]
+fn a_host_root_listing_asks_only_the_shard_its_capability_names() {
+  let (daemon, instance) = two_shard_daemon("root-listing");
+  let name = provision_control_volume(&instance);
+  let export = daemon.mount_capability(&name).unwrap().unwrap();
+  let (_, capability) = export.rsplit_once('@').unwrap();
+  let port = daemon.nfs_port().unwrap();
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &format!("/@{capability}"), 1);
+  let mut args = Vec::new();
+  opaque(&root, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes()); // cookie
+  args.extend_from_slice(&[0u8; 8]); // cookieverf
+  args.extend_from_slice(&512u32.to_be_bytes()); // dircount
+  args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
+  let starved = hold_shard(&daemon, 1, WINDOW * 3, true);
+  let started = Instant::now();
+  let accepted = call_accept_status(&mut stream, NFS_PROGRAM, NFSPROC3_READDIRPLUS, &args, 2);
+  let took = started.elapsed();
+  starved.join().unwrap();
+  let listed = readdirplus(&mut stream, &root, 3);
+  drop(daemon);
+  assert!(
+    accepted == 0 && took < WINDOW * 3,
+    "the host root listed under one volume's capability while another shard was held (status {accepted} after \
+     {took:?}, the hold {:?})",
+    WINDOW * 3
+  );
+  assert!(
+    listed.contains(&name),
+    "the listing holds the volume the capability authorizes: {listed:?}"
+  );
 }
 
 /// The pressure tests' scopes end on a failure (2026-11-07). Do: in a scope, start a thread that spins until a flag is

@@ -45,10 +45,26 @@ pub fn step_budget_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.quantum_ns())
 }
 
+/// The current shard's idle window in nanoseconds (`ShardContext::idle_window_ns`): what the daemon's serve
+/// loop keeps polling for after its last work. `None` off a shard thread.
+pub fn idle_window_ns() -> Option<u64> {
+  registry::with_current(|ctx| ctx.idle_window_ns())
+}
+
 /// The current shard's online wake estimate in nanoseconds (the configured step budget when it tracks
-/// none); what the daemon's own idle window scales. `None` off a shard thread.
+/// none). `None` off a shard thread.
 pub fn wake_cost_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.wake_cost_ns())
+}
+
+/// Asks shard `target` to tell the current task when its control channel next has room, after a send to it was refused
+/// `ControlFull` (§4.3 "admission limit": a refused spawn is kept and sent again, never dropped; [`crate::room`]). The
+/// task is woken once `target` drains a message after this call. Try the send again after this returns, and wait
+/// ([`idle`], or [`within`] a deadline) only if that try is refused too: the try either finds the room a drain made
+/// meanwhile, or that drain finds this ask, so no timer is needed for the wait. `ShardGone` when `target` has left its
+/// loop or its slot is free; `NotOnShardThread` outside a task on a shard.
+pub fn want_room(target: u16) -> Result<(), RtError> {
+  registry::with_current(|ctx| ctx.want_room(target)).ok_or(RtError::NotOnShardThread)?
 }
 
 /// The task being polled on this thread, if any.

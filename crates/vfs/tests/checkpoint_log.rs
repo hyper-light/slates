@@ -59,7 +59,7 @@ fn delta_of(vol: &mut Volume, store: &Store) -> ShardDelta {
   ShardDelta::new(
     vec![KeyedRecord { key: KEY, record }],
     Vec::new(),
-    None,
+    (Vec::new(), Vec::new()),
     None,
   )
 }
@@ -282,7 +282,21 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     unique: 5,
     reply: b"reply".to_vec(),
   }];
-  let held = b"held image".to_vec();
+  // Held pieces put and removed (A-270), each given out of key order, so the streamed encoder's sort is compared.
+  let held_put = vec![
+    slates_vfs::recover::HeldPiece {
+      key: [6; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"a later piece".to_vec(),
+    },
+    slates_vfs::recover::HeldPiece {
+      key: [3; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"an earlier piece".to_vec(),
+    },
+  ];
+  let held_removed = vec![
+    [9; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+    [1; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+  ];
 
   let mut streamed = Vec::new();
   let at = ShardDelta::encode_start(&mut streamed);
@@ -326,7 +340,7 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     at,
     2,
     &mut unsorted,
-    Some(&held),
+    (&mut held_put.clone(), &mut held_removed.clone()),
     Some(&replies),
     (&mut calls.clone(), &mut calls_removed.clone()),
     (
@@ -347,7 +361,7 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
       },
     ],
     removed,
-    Some(held),
+    (held_put, held_removed),
     Some(replies),
   )
   .with_calls(calls, calls_removed)
@@ -485,6 +499,26 @@ enum JournalStep {
   GiveBack { quarters: usize },
   /// The journal dropped and recovered from its memories, as a restarted daemon's is.
   Restart,
+  /// One held piece (A-270) put (`bytes` of the step) or removed, its delta appended (a checkpoint instead when the log
+  /// is full): the piece's key is `[key; HELD_PIECE_KEY_BYTES]`, from a few, so puts overwrite and removals find one.
+  Held { key: u8, remove: bool },
+}
+
+/// The shard's full image with `held`, the model's held pieces (A-270), carried.
+fn full_with(
+  vol: &Volume,
+  store: &Store,
+  held: &std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>,
+) -> ShardImage {
+  full(vol, store).with_held(
+    held
+      .iter()
+      .map(|(key, bytes)| slates_vfs::recover::HeldPiece {
+        key: *key,
+        bytes: bytes.clone(),
+      })
+      .collect(),
+  )
 }
 
 /// Checks the dead ranges against what a restart reads and what was written: every byte written since its last
@@ -548,20 +582,24 @@ proptest::proptest! {
     ..proptest::prelude::ProptestConfig::default()
   }))]
 
-  /// A-117 and A-226, the oracle: do run a generated history of checkpoints, appended deltas, give-backs and restarts
-  /// over memories that record each byte written; expect after every step that the dead ranges name every written
-  /// byte no restart reads, lie inside what no restart reads and end at the last such write, and that a restart
-  /// recovers the volume's full image whatever was given back.
+  /// A-117, A-226 and A-270, the oracle: do run a generated history of checkpoints, appended deltas, held pieces put and
+  /// removed, give-backs and restarts over memories that record each byte written; expect after every step that the
+  /// dead ranges name every written byte no restart reads, lie inside what no restart reads and end at the last such
+  /// write, and that a restart recovers the volume's full image and the model's held pieces whatever was given back.
   #[test]
   fn a_give_back_names_every_dead_written_byte_and_stops_at_the_last(
     steps in proptest::collection::vec(
-      // Weights 1 : 4 : 2 : 1 over eight draws (no `prop_oneof!`, which boxes its arms in an `Arc`).
-      proptest::strategy::Strategy::prop_map((0u8..8, 1usize..=4), |(draw, quarters)| match draw {
-        0 => JournalStep::Checkpoint,
-        1..=4 => JournalStep::ChangeAndAppend,
-        5 | 6 => JournalStep::GiveBack { quarters },
-        _ => JournalStep::Restart,
-      }),
+      // Weights 1 : 4 : 2 : 1 : 3 over eleven draws (no `prop_oneof!`, which boxes its arms in an `Arc`).
+      proptest::strategy::Strategy::prop_map(
+        (0u8..11, 1usize..=4, 0u8..4, proptest::bool::ANY),
+        |(draw, quarters, key, remove)| match draw {
+          0 => JournalStep::Checkpoint,
+          1..=4 => JournalStep::ChangeAndAppend,
+          5 | 6 => JournalStep::GiveBack { quarters },
+          7 => JournalStep::Restart,
+          _ => JournalStep::Held { key, remove },
+        },
+      ),
       1..40,
     )
   ) {
@@ -571,7 +609,8 @@ proptest::proptest! {
     let mut vol = seeded(&mut store);
     let (mut checkpoints, mut log) = (Recorded::new(ORACLE_MEMORY), Recorded::new(ORACLE_MEMORY));
     let mut journal = Journal::default();
-    journal.checkpoint(&mut checkpoints, &full(&vol, &store)).unwrap();
+    let mut held = std::collections::BTreeMap::new();
+    journal.checkpoint(&mut checkpoints, &full_with(&vol, &store, &held)).unwrap();
     vol.mark_published(&store);
     let mut tail = 0usize;
     let slot_offsets = [0, ORACLE_MEMORY / 2];
@@ -579,9 +618,30 @@ proptest::proptest! {
     for (at, step) in steps.into_iter().enumerate() {
       match step {
         JournalStep::Checkpoint => {
-          journal.checkpoint(&mut checkpoints, &full(&vol, &store)).unwrap();
+          journal.checkpoint(&mut checkpoints, &full_with(&vol, &store, &held)).unwrap();
           vol.mark_published(&store);
           tail = 0;
+        }
+        JournalStep::Held { key, remove } => {
+          let key = [key; slates_vfs::recover::HELD_PIECE_KEY_BYTES];
+          let change = if remove {
+            held.remove(&key);
+            (Vec::new(), vec![key])
+          } else {
+            let bytes = format!("piece at step {at}").into_bytes();
+            held.insert(key, bytes.clone());
+            (vec![slates_vfs::recover::HeldPiece { key, bytes }], Vec::new())
+          };
+          let delta = ShardDelta::new(Vec::new(), Vec::new(), change, None);
+          match journal.append(&mut log, &delta, &mut Vec::new()) {
+            Ok(total) => tail += total,
+            Err(slates_vfs::VfsError::NoSpace) => {
+              journal.checkpoint(&mut checkpoints, &full_with(&vol, &store, &held)).unwrap();
+              vol.mark_published(&store);
+              tail = 0;
+            }
+            Err(other) => panic!("append refused: {other:?}"),
+          }
         }
         JournalStep::ChangeAndAppend => {
           create(&mut vol, &mut store, &format!("step{at}"), format!("step {at}").as_bytes());
@@ -589,7 +649,7 @@ proptest::proptest! {
           match journal.append(&mut log, &delta, &mut Vec::new()) {
             Ok(total) => tail += total,
             Err(slates_vfs::VfsError::NoSpace) => {
-              journal.checkpoint(&mut checkpoints, &full(&vol, &store)).unwrap();
+              journal.checkpoint(&mut checkpoints, &full_with(&vol, &store, &held)).unwrap();
               tail = 0;
             }
             Err(other) => panic!("append refused: {other:?}"),
@@ -617,14 +677,305 @@ proptest::proptest! {
         }
         JournalStep::Restart => {
           let (image, recovered) = Journal::recover(&checkpoints, &log).unwrap();
-          proptest::prop_assert!(image.unwrap() == full(&vol, &store), "the restart recovered the full image");
+          proptest::prop_assert!(image.unwrap() == full_with(&vol, &store, &held), "the restart recovered the full image");
           journal = recovered;
           unknown = Unknown::all(slot_offsets);
         }
       }
       check_dead_ranges(&journal, &checkpoints, &log, tail, &unknown);
       let (image, _) = Journal::recover(&checkpoints, &log).unwrap();
-      proptest::prop_assert!(image.unwrap() == full(&vol, &store), "step {at} ({step:?}): a restart recovers the full image");
+      proptest::prop_assert!(
+        image.unwrap() == full_with(&vol, &store, &held),
+        "step {at} ({step:?}): a restart recovers the full image, its held pieces with it"
+      );
     }
   }
+}
+
+/// Format: where a recovery image's and a delta's version word sits, after its magic (a little-endian `u32`).
+const VERSION_AT: usize = size_of::<u32>();
+
+/// Overwrites the version word of the encoded image or delta `bytes` with `version`.
+fn with_version(mut bytes: Vec<u8>, version: u16) -> Vec<u8> {
+  bytes
+    .get_mut(VERSION_AT..VERSION_AT + size_of::<u16>())
+    .unwrap()
+    .copy_from_slice(&version.to_le_bytes());
+  bytes
+}
+
+/// A-270 and A-275 (§4.8 "Recovery"): do give recovery a shard image written in the version before this build's, its
+/// bytes otherwise this build's own. Expect it refused `RecoveryVersion`, naming both versions, before any field is
+/// decoded, and the same image at this build's version read: a layout this build does not know is never read as its
+/// own (A-270's held pieces), and neither is one whose fields may hold what an earlier reader drops without a word
+/// (A-275's directory link bit).
+#[test]
+fn an_image_of_another_version_is_refused_by_its_version() {
+  let mut store = store();
+  let vol = seeded(&mut store);
+  let older = slates_vfs::recover::IMAGE_VERSION - 1;
+  let bytes = with_version(full(&vol, &store).to_content(), older);
+  assert_eq!(
+    ShardImage::from_content(&bytes),
+    Err(slates_vfs::VfsError::RecoveryVersion {
+      found: older,
+      expected: slates_vfs::recover::IMAGE_VERSION,
+    })
+  );
+  assert!(ShardImage::from_content(&full(&vol, &store).to_content()).is_ok());
+}
+
+/// A-270 and A-275 (§4.8 "Recovery"): do commit a checkpoint, then append a CRC-valid delta frame written in the delta
+/// version before this build's, its bytes otherwise this build's own. Expect the recovery refused `RecoveryVersion`, not
+/// the delta replayed as this build's. Read as a torn frame instead, the replay would end there and recover the
+/// checkpoint without the acknowledged deltas after it.
+#[test]
+fn a_delta_of_another_version_is_refused_not_read_as_torn() {
+  use slates_wire::Wire;
+  let mut store = store();
+  let mut vol = seeded(&mut store);
+  let (mut checkpoints, mut log) = (vec![0u8; MEMORY], vec![0u8; MEMORY]);
+  let mut journal = Journal::default();
+  journal
+    .checkpoint(&mut checkpoints, &full(&vol, &store))
+    .unwrap();
+  vol.mark_published(&store);
+  create(&mut vol, &mut store, "after", b"after the checkpoint");
+  let older = slates_vfs::checkpoint_log::DELTA_VERSION - 1;
+  let body = with_version(delta_of(&mut vol, &store).to_bytes(), older);
+  journal.append_encoded(&mut log, &body).unwrap();
+  assert_eq!(
+    Journal::recover(&checkpoints, &log).map(|_| ()),
+    Err(slates_vfs::VfsError::RecoveryVersion {
+      found: older,
+      expected: slates_vfs::checkpoint_log::DELTA_VERSION,
+    })
+  );
+}
+
+/// A log memory that records every write in order (A-270's crash test), so a crash can be put after any byte of any of
+/// them, in the order the journal made them.
+struct WriteRecorder {
+  memory: Vec<u8>,
+  writes: Vec<(usize, Vec<u8>)>,
+}
+
+impl slates_vfs::recover::ImageRead for WriteRecorder {
+  fn image_len(&self) -> usize {
+    self.memory.len()
+  }
+
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), slates_vfs::VfsError> {
+    self.memory.image_read(offset, into)
+  }
+}
+
+impl ImageWrite for WriteRecorder {
+  fn image_write(&mut self, offset: usize, from: &[u8]) -> Result<(), slates_vfs::VfsError> {
+    self.memory.image_write(offset, from)?;
+    self.writes.push((offset, from.to_vec()));
+    Ok(())
+  }
+}
+
+/// A-270, a crash at every step of a held write (`crates/land/tests/oracle.rs`'s pattern): do commit a checkpoint
+/// holding piece A, append the delta that puts B and removes A into a log that records its writes, and for every write
+/// the journal made and every byte of it, rebuild the log as a crash just after that byte leaves it, and recover.
+/// Expect each recovery to hold A alone (the frame not committed) or B alone (it committed), never both, neither or
+/// anything else; A until the journal's last write is whole, and B once it is.
+#[test]
+fn a_crash_at_every_byte_of_a_held_delta_recovers_the_old_pieces_or_the_new() {
+  let mut store = store();
+  let vol = seeded(&mut store);
+  let piece = |key: u8, bytes: &[u8]| slates_vfs::recover::HeldPiece {
+    key: [key; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+    bytes: bytes.to_vec(),
+  };
+  let before = vec![piece(1, b"piece A")];
+  let after = vec![piece(2, b"piece B")];
+  let mut checkpoints = vec![0u8; MEMORY];
+  let mut journal = Journal::default();
+  journal
+    .checkpoint(
+      &mut checkpoints,
+      &full(&vol, &store).with_held(before.clone()),
+    )
+    .unwrap();
+  let delta = ShardDelta::new(
+    Vec::new(),
+    Vec::new(),
+    (
+      after.clone(),
+      vec![[1; slates_vfs::recover::HELD_PIECE_KEY_BYTES]],
+    ),
+    None,
+  );
+  let mut recorder = WriteRecorder {
+    memory: vec![0u8; MEMORY],
+    writes: Vec::new(),
+  };
+  journal
+    .append(&mut recorder, &delta, &mut Vec::new())
+    .unwrap();
+  assert!(
+    recorder.writes.len() > 1,
+    "the append is several writes, so a crash can fall between them"
+  );
+  let last = recorder.writes.len() - 1;
+  for (index, (offset, bytes)) in recorder.writes.iter().enumerate() {
+    for kept in 0..=bytes.len() {
+      let mut log = vec![0u8; MEMORY];
+      for (earlier, earlier_bytes) in &recorder.writes[..index] {
+        log[*earlier..*earlier + earlier_bytes.len()].copy_from_slice(earlier_bytes);
+      }
+      log[*offset..*offset + kept].copy_from_slice(&bytes[..kept]);
+      let (image, _) = Journal::recover(&checkpoints, &log).unwrap();
+      let held = image.unwrap().held;
+      let whole = index == last && kept == bytes.len();
+      assert_eq!(
+        held,
+        if whole { after.clone() } else { before.clone() },
+        "a crash after byte {kept} of write {index} of {}",
+        last + 1
+      );
+    }
+  }
+}
+
+/// Shape: the keys of the committed-record test's volumes, in key order, and one never published.
+const CARRIED_KEYS: [[u8; 16]; 5] = [[1; 16], [2; 16], [3; 16], [4; 16], [9; 16]];
+
+/// A volume in its own store holding [`SEEDED`] files and one named `marker`, so each volume's image is its own.
+fn marked(marker: &str) -> (Store, Volume) {
+  let mut store = store();
+  let mut vol = seeded(&mut store);
+  create(&mut vol, &mut store, marker, marker.as_bytes());
+  (store, vol)
+}
+
+/// A-430: the image a recovery would rebuild for one volume, read without rebuilding the others. Do: checkpoint three
+/// volumes; log a delta changing the first, one carrying the second whole, one removing the third and one adding a
+/// fourth; ask `committed_volume` for each key and for one never published. Expect: each the image `Journal::recover`
+/// rebuilds for that key (the oracle), the removed and the never-published ones none; and the first's is not its
+/// checkpointed image, so its delta was applied (non-vacuity).
+#[test]
+fn a_volumes_committed_record_is_what_a_recovery_rebuilds_for_it() {
+  use slates_vfs::checkpoint_log::committed_volume;
+  use slates_vfs::delta::VolumeRecord;
+  let [first_key, second_key, third_key, fourth_key, _] = CARRIED_KEYS;
+  let (first_store, mut first) = marked("first");
+  let (mut second_store, mut second) = marked("second");
+  let (third_store, third) = marked("third");
+  let (fourth_store, fourth) = marked("fourth");
+  let (mut checkpoints, mut log) = (vec![0u8; MEMORY], vec![0u8; MEMORY]);
+  let mut journal = Journal::default();
+  let checkpointed_first = first.to_image(&first_store, None).unwrap();
+  journal
+    .checkpoint(
+      &mut checkpoints,
+      &ShardImage::new(vec![
+        KeyedImage {
+          key: first_key,
+          image: checkpointed_first.clone(),
+        },
+        KeyedImage {
+          key: second_key,
+          image: second.to_image(&second_store, None).unwrap(),
+        },
+        KeyedImage {
+          key: third_key,
+          image: third.to_image(&third_store, None).unwrap(),
+        },
+      ]),
+    )
+    .unwrap();
+  first.mark_published(&first_store);
+  let mut first_store = first_store;
+  create(
+    &mut first,
+    &mut first_store,
+    "changed",
+    b"after the checkpoint",
+  );
+  let delta = |volumes: Vec<KeyedRecord>, removed: Vec<[u8; 16]>| {
+    ShardDelta::new(volumes, removed, (Vec::new(), Vec::new()), None)
+  };
+  let changed = first.publication(&first_store, None).unwrap();
+  assert!(
+    matches!(changed, VolumeRecord::Delta { .. }),
+    "the first volume's change is a delta"
+  );
+  journal
+    .append(
+      &mut log,
+      &delta(
+        vec![KeyedRecord {
+          key: first_key,
+          record: changed,
+        }],
+        Vec::new(),
+      ),
+      &mut Vec::new(),
+    )
+    .unwrap();
+  create(&mut second, &mut second_store, "whole", b"carried whole");
+  let whole = second.to_image(&second_store, None).unwrap();
+  journal
+    .append(
+      &mut log,
+      &delta(
+        vec![KeyedRecord {
+          key: second_key,
+          record: VolumeRecord::Full { image: whole },
+        }],
+        Vec::new(),
+      ),
+      &mut Vec::new(),
+    )
+    .unwrap();
+  journal
+    .append(
+      &mut log,
+      &delta(Vec::new(), vec![third_key]),
+      &mut Vec::new(),
+    )
+    .unwrap();
+  let added = fourth.to_image(&fourth_store, None).unwrap();
+  journal
+    .append(
+      &mut log,
+      &delta(
+        vec![KeyedRecord {
+          key: fourth_key,
+          record: VolumeRecord::Full { image: added },
+        }],
+        Vec::new(),
+      ),
+      &mut Vec::new(),
+    )
+    .unwrap();
+  let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
+  let recovered = recovered.unwrap();
+  for key in &CARRIED_KEYS {
+    let rebuilt = recovered
+      .volumes
+      .iter()
+      .find(|keyed| keyed.key == *key)
+      .map(|keyed| keyed.image.clone());
+    assert_eq!(
+      committed_volume(&checkpoints, &log, key).unwrap(),
+      rebuilt,
+      "the record of {key:?}"
+    );
+  }
+  assert_eq!(
+    committed_volume(&checkpoints, &log, &third_key).unwrap(),
+    None,
+    "the removed volume has no record"
+  );
+  assert_ne!(
+    committed_volume(&checkpoints, &log, &first_key).unwrap(),
+    Some(checkpointed_first),
+    "the first volume's delta was applied"
+  );
 }

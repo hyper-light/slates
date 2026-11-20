@@ -41,6 +41,12 @@ pub enum VfsError {
   TooManyLinks,
   /// `ENOSPC`: the quota, or the pressure source, refused the bytes; nothing changed.
   NoSpace,
+  /// `ENOSPC` at a mount, typed apart from the quota (§4.2 `RetentionBudgetExceeded`): keeping what a snapshot pins (a
+  /// retained inode version, or the bytes a change would let go of) would take capacity no admission left unpromised,
+  /// or go past the volume's retention allowance; nothing changed. Destroying a snapshot frees it. Until 2026-11-18 it
+  /// was `NoSpace`, which a consumer read as its quota: kiln's review of a snapshot was refused "a bound is reached:
+  /// Quota" when the bound was the shard's version slab (A-342).
+  RetentionExceeded,
   /// `EFBIG`: an offset or length beyond what the volume addresses.
   FileTooLarge,
   /// `EXDEV`: a move across volumes.
@@ -55,8 +61,9 @@ pub enum VfsError {
   /// mapping ends (Shards part 3, step 4): a guest's writable map over the file's backing holds stores not yet written
   /// back, which a `rewitness` would have to discard.
   DaxMapped,
-  /// The base beneath an overlay entry cannot be served: the host's errno.
-  BaseUnavailable(i32),
+  /// The base beneath an overlay entry cannot be served: the code the host named, typed by its numbering (A-539); none
+  /// where the volume met no host to ask (none lent, or one away).
+  BaseUnavailable(Option<crate::host::OsCode>),
   /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
   /// than return torn bytes; `status` lists the drift.
   BaseDrift,
@@ -101,6 +108,10 @@ pub enum VfsError {
   /// the change succeeds once the delegation is returned or revoked (the caller retries: `NFS3ERR_JUKEBOX`,
   /// `NFS4ERR_DELAY`, `EAGAIN`).
   Delegated,
+  /// The overlay's base is fetching what the operation reads (an S3 base's miss, `HostError::Pending`, A-524): nothing
+  /// changed, and the operation succeeds once the fetch lands, when the caller runs it again. It names the fetch the host
+  /// answered under (A-555), so the caller can park the request on that fetch alone.
+  BasePending(crate::host::FetchId),
   /// A sealed chunk's segment did not open (A-99): its bytes or its tag changed in RAM, or the key it names is gone.
   /// Nothing is returned for it, never bytes that did not authenticate.
   Integrity,
@@ -122,6 +133,15 @@ pub enum VfsError {
     needed: u64,
     /// The oldest sequence the journal still holds.
     oldest: u64,
+  },
+  /// A recovery image or journal frame was written in a format version this build does not read (§4.8 "Recovery"): a
+  /// predecessor of another build published it. It is refused by its version before any of it is decoded, never read
+  /// under this build's layout, and the shard starts without it.
+  RecoveryVersion {
+    /// The version the bytes carry.
+    found: u16,
+    /// The version this build reads.
+    expected: u16,
   },
 }
 
@@ -154,7 +174,7 @@ impl VfsError {
       Self::InvalidName => "EINVAL",
       Self::NameTooLong | Self::TreeTooDeep { .. } => "ENAMETOOLONG",
       Self::TooManyLinks => "EMLINK",
-      Self::NoSpace => "ENOSPC",
+      Self::NoSpace | Self::RetentionExceeded => "ENOSPC",
       Self::FileTooLarge => "EFBIG",
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",
@@ -163,10 +183,13 @@ impl VfsError {
       | Self::BaseDrift
       | Self::RecoveryIncomplete
       | Self::Integrity
-      | Self::JournalIncomplete { .. } => "EIO",
+      | Self::JournalIncomplete { .. }
+      | Self::RecoveryVersion { .. } => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
-      Self::DigestUnverified | Self::PublishNeeded | Self::Delegated => "EAGAIN",
+      Self::DigestUnverified | Self::PublishNeeded | Self::Delegated | Self::BasePending(_) => {
+        "EAGAIN"
+      }
       Self::DigestCacheFull => "ENOSPC",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",

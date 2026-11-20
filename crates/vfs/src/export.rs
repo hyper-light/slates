@@ -49,7 +49,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use slates_archive::format::Chunk as ArchiveChunk;
-use slates_archive::{Archive, CodecPolicy, Entry, Extent, Node, NodeMeta, Xattr};
+use slates_archive::{Archive, ChunkSink, CodecPolicy, Entry, Extent, Node, NodeMeta, Xattr};
 use slates_mem::Handle;
 
 use crate::dir::{Child, DirNode};
@@ -72,14 +72,31 @@ pub const MODE_SYMLINK: u32 = 0o120_000;
 pub const MODE_FIFO: u32 = 0o010_000;
 /// Format: POSIX S_IFSOCK, a metadata-only socket name.
 pub const MODE_SOCKET: u32 = 0o140_000;
+/// Format: POSIX `S_IFBLK`, a block device node, its number carried in the manifest metadata (A-294).
+pub const MODE_BLOCK_DEVICE: u32 = 0o060_000;
+/// Format: POSIX `S_IFCHR`, a character device node, its number carried in the manifest metadata (A-294).
+pub const MODE_CHAR_DEVICE: u32 = 0o020_000;
 
 /// Format: the archive header's name-policy id for byte-exact names.
 const POLICY_EXACT: u32 = 0;
 /// Format: the archive header's name-policy id for normalization- and case-insensitive names.
 const POLICY_FOLD: u32 = 1;
+/// Format: the archive header's name-policy id for names folded by Windows' upcase table (A-576).
+const POLICY_UPCASE: u32 = 2;
 /// Format: the archive header's Unicode version field when the exporter carries none — the volume
 /// core's names module fixes its own table and does not yet surface a version number (owed).
 const UNICODE_VERSION_UNSPECIFIED: u32 = 0;
+
+/// The name policy an archive header's name-policy id names, as the exporter writes it (A-453: a volume made from an
+/// archive takes its archive's policy), or `None` for an id the exporter never writes.
+pub fn name_equivalence_of_id(id: u32) -> Option<NameEquivalence> {
+  match id {
+    POLICY_EXACT => Some(NameEquivalence::Exact),
+    POLICY_FOLD => Some(NameEquivalence::Fold),
+    POLICY_UPCASE => Some(NameEquivalence::Upcase),
+    _ => None,
+  }
+}
 
 /// The kind a manifest mode's type bits name, or `None` for bits the exporter never writes.
 pub fn kind_of_mode(mode: u32) -> Option<Kind> {
@@ -89,7 +106,23 @@ pub fn kind_of_mode(mode: u32) -> Option<Kind> {
     MODE_SYMLINK => Some(Kind::Symlink),
     MODE_FIFO => Some(Kind::Fifo),
     MODE_SOCKET => Some(Kind::Socket),
+    MODE_BLOCK_DEVICE => Some(Kind::BlockDevice),
+    MODE_CHAR_DEVICE => Some(Kind::CharDevice),
     _ => None,
+  }
+}
+
+/// The type bits of a mode for an object of `kind` (POSIX `S_IFMT`): what a manifest, a FUSE attribute and an
+/// NFS mode carry beside the permission bits.
+pub const fn mode_of_kind(kind: Kind) -> u32 {
+  match kind {
+    Kind::Dir => MODE_DIRECTORY,
+    Kind::File => MODE_FILE,
+    Kind::Symlink => MODE_SYMLINK,
+    Kind::Fifo => MODE_FIFO,
+    Kind::Socket => MODE_SOCKET,
+    Kind::BlockDevice => MODE_BLOCK_DEVICE,
+    Kind::CharDevice => MODE_CHAR_DEVICE,
   }
 }
 
@@ -349,6 +382,7 @@ impl SnapshotArchiver {
     let name_policy_id = match volume.policy {
       NameEquivalence::Exact => POLICY_EXACT,
       NameEquivalence::Fold => POLICY_FOLD,
+      NameEquivalence::Upcase => POLICY_UPCASE,
     };
     let mut archiver = SnapshotArchiver {
       snapshot: id,
@@ -420,6 +454,39 @@ impl SnapshotArchiver {
     }
   }
 
+  /// [`advance`](SnapshotArchiver::advance), each new chunk handed to `sink` as the step that cut it ends (A-459): the
+  /// walk never holds more than one step's chunks, and the archive it finishes with carries none, every chunk having
+  /// gone to `sink` in the order the whole archive holds them. A streamed export walks a snapshot twice so: once into a
+  /// [`slates_archive::Measure`] to lay the archive out, once into a [`slates_archive::StreamWriter`] to write it. A
+  /// refusal by `sink` (a second walk that differs from the first) ends the walk [`VfsError::RecoveryIncomplete`].
+  pub fn advance_into(
+    &mut self,
+    volume: &Volume,
+    store: &Store,
+    byte_budget: u64,
+    sink: &mut dyn ChunkSink,
+  ) -> Result<Progress, VfsError> {
+    let mut spent: u64 = 0;
+    loop {
+      if spent >= byte_budget && spent > 0 {
+        return Ok(Progress::More);
+      }
+      let step = self.step(volume, store)?;
+      for chunk in self.chunks.drain(..) {
+        sink.take(chunk).map_err(|_| VfsError::RecoveryIncomplete)?;
+      }
+      match step {
+        Step::Worked(cost) => spent = spent.saturating_add(cost.max(1)),
+        Step::Finished(mut archive) => {
+          for chunk in archive.chunks.drain(..) {
+            sink.take(chunk).map_err(|_| VfsError::RecoveryIncomplete)?;
+          }
+          return Ok(Progress::Done(archive));
+        }
+      }
+    }
+  }
+
   /// One unit of the walk: a piece of the file in progress, or the next directory entry, or the close
   /// of a finished directory. Returns the work's cost in bytes.
   fn step(&mut self, volume: &Volume, store: &Store) -> Result<Step, VfsError> {
@@ -440,7 +507,9 @@ impl SnapshotArchiver {
       Kind::Dir => self.enter_directory(volume, store, dir, next)?,
       Kind::File => self.begin_file(volume, store, next)?,
       Kind::Symlink => self.take_symlink(volume, store, next)?,
-      Kind::Fifo | Kind::Socket => self.take_special(volume, store, next)?,
+      Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+        self.take_special(volume, store, next)?
+      }
     };
     Ok(Step::Worked(cost))
   }
@@ -686,19 +755,25 @@ impl SnapshotArchiver {
     Ok(len)
   }
 
-  /// Records only the type and metadata of an IPC name, never kernel state (A-26).
+  /// Records only the type and metadata of a name with no content, never kernel state (A-26): a FIFO or socket name,
+  /// or a device node with its number (A-294).
   fn take_special(
     &mut self,
     volume: &Volume,
     store: &Store,
     next: Pending,
   ) -> Result<u64, VfsError> {
-    let type_bits = if next.kind == Kind::Fifo {
-      MODE_FIFO
-    } else {
-      MODE_SOCKET
-    };
-    let meta = meta_of(volume, store, self.snapshot, next.inode, type_bits)?;
+    let mut meta = meta_of(
+      volume,
+      store,
+      self.snapshot,
+      next.inode,
+      mode_of_kind(next.kind),
+    )?;
+    if let Some(number) = volume.device_in(store, self.snapshot, next.inode)? {
+      meta.device_major = number.major;
+      meta.device_minor = number.minor;
+    }
     let queued = attributes_of(volume, store, self.snapshot, next.inode)?;
     self.start(
       volume,
@@ -877,6 +952,8 @@ fn node_meta(no: InodeNo, attrs: &Attrs, type_bits: u32) -> NodeMeta {
     nlink: attrs.nlink,
     uid: attrs.uid,
     gid: attrs.gid,
+    device_major: 0,
+    device_minor: 0,
     xattrs: Vec::new(),
   }
 }
@@ -886,6 +963,8 @@ mod tests {
   use slates_archive::restore;
   use slates_mem::arena::ChunkArena;
   use slates_mem::region::Region;
+
+  use proptest::prelude::*;
 
   use super::*;
   use crate::clock::StepClock;
@@ -1014,6 +1093,236 @@ mod tests {
     );
     let restored = restore(&archive, u64::MAX).unwrap();
     assert_restored_tree(&restored, &body);
+  }
+
+  /// A codec policy with measured points, as a profile measures them (a 10 GB/s memcpy, LZ4 and four zstd levels), so
+  /// an export's chunks are stored raw, LZ4 or zstd as the cost model chooses for each.
+  fn measured_codec() -> CodecPolicy {
+    use slates_archive::codec::{CodecRate, NEUTRAL_PERMILLE};
+    CodecPolicy {
+      byte_ns_scaled: CodecPolicy::byte_worth_from_memcpy(10_000_000_000),
+      lz4: Some(CodecRate::from_throughput(
+        0,
+        700_000_000,
+        3_000_000_000,
+        476,
+      )),
+      zstd: vec![
+        CodecRate::from_throughput(1, 400_000_000, 1_200_000_000, 346),
+        CodecRate::from_throughput(3, 250_000_000, 1_100_000_000, 320),
+        CodecRate::from_throughput(9, 60_000_000, 1_000_000_000, 300),
+        CodecRate::from_throughput(19, 4_000_000, 900_000_000, 280),
+      ],
+      value_of_byte_permille: NEUTRAL_PERMILLE,
+      value_of_cpu_permille: NEUTRAL_PERMILLE,
+      expected_reads: 1,
+    }
+  }
+
+  /// `id` archived whole under `codec`, the archive the whole-buffer encoder writes: the streamed export's oracle.
+  fn archive_whole(volume: &Volume, store: &Store, id: SnapshotId, codec: &CodecPolicy) -> Vec<u8> {
+    let mut archiver =
+      SnapshotArchiver::new(volume, store, id, VOLUME_ID, CREATED_UNIX, codec.clone()).unwrap();
+    loop {
+      if let Progress::Done(archive) = archiver.advance(volume, store, u64::MAX).unwrap() {
+        return archive.encode();
+      }
+    }
+  }
+
+  /// `id` exported as a stream (A-459), as the daemon's export runs it: a first walk measured a unit a step and the
+  /// archive laid out; then whatever the writer asks next for a stage emptied at `threshold` bytes
+  /// ([`slates_archive::StreamWriter::next`]): the stage written into the returned bytes, the second walk's next unit,
+  /// or the end. The writer, for its counts.
+  fn export_streamed(
+    volume: &Volume,
+    store: &Store,
+    id: SnapshotId,
+    codec: &CodecPolicy,
+    threshold: usize,
+  ) -> (Vec<u8>, slates_archive::StreamWriter) {
+    let mut measure = slates_archive::Measure::default();
+    let mut first =
+      SnapshotArchiver::new(volume, store, id, VOLUME_ID, CREATED_UNIX, codec.clone()).unwrap();
+    let shell = loop {
+      if let Progress::Done(shell) = first.advance_into(volume, store, 1, &mut measure).unwrap() {
+        break shell;
+      }
+    };
+    assert!(shell.chunks.is_empty(), "the first walk held no chunk");
+    let layout = slates_archive::Layout::new(&shell, measure).unwrap();
+    let mut writer = slates_archive::StreamWriter::new(layout);
+    let mut second =
+      SnapshotArchiver::new(volume, store, id, VOLUME_ID, CREATED_UNIX, codec.clone()).unwrap();
+    let mut bytes = Vec::new();
+    let mut walking = true;
+    loop {
+      match writer.next(threshold, walking).unwrap() {
+        slates_archive::Next::Write => {
+          let (at, staged) = writer.pending();
+          assert_eq!(at, u64::try_from(bytes.len()).unwrap(), "pieces in order");
+          let written = staged.len();
+          bytes.extend_from_slice(staged);
+          writer.consume(written);
+        }
+        slates_archive::Next::Walk => {
+          walking = matches!(
+            second.advance_into(volume, store, 1, &mut writer).unwrap(),
+            Progress::More
+          );
+        }
+        slates_archive::Next::Done => return (bytes, writer),
+      }
+    }
+  }
+
+  /// One generated file of [`a_streamed_export_of_a_generated_tree_is_the_whole_buffer_encoders`]: the directory it
+  /// lies in (of the tree's three), its bytes' kind and length, its mode, and whether it carries an attribute.
+  #[derive(Clone, Debug)]
+  struct GeneratedFile {
+    directory: usize,
+    bytes: Vec<u8>,
+    mode: u32,
+    attribute: bool,
+  }
+
+  /// A generated file's bytes: one byte repeated (every codec shrinks it), text-like lines (zstd and LZ4 do), or noise
+  /// (none does): up to a chunk and a half at the test store's chunk, so a file spans two chunks, and four such files
+  /// with their attributes stay within the test volume's quota. Generated as a plain tuple, its first part the kind, so
+  /// the strategy needs no `Arc`-backed `prop_oneof!` (R2).
+  fn generated_bytes() -> impl Strategy<Value = Vec<u8>> {
+    let chunk = PAGE * 16;
+    (
+      0u8..3,
+      (0..chunk * 3 / 2, any::<u8>()),
+      proptest::collection::vec(any::<u8>(), 0..chunk),
+    )
+      .prop_map(|(kind, (len, byte), noise)| match kind {
+        0 => vec![byte; len],
+        1 => b"fn main() { println!(\"slates\"); }\n"
+          .iter()
+          .copied()
+          .cycle()
+          .take(len)
+          .collect(),
+        _ => noise,
+      })
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config {
+      cases: 48,
+      ..proptest::test_runner::Config::default()
+    }))]
+
+    /// A-459 (the oracle and the determinism gate): do build a generated tree — up to four files of repeated,
+    /// text-like and noisy bytes up to a chunk and a half, in the root and two nested directories, some carrying an
+    /// attribute, and a symlink — snapshot it, and export the snapshot as a stream (two walks, the stage emptied at a
+    /// generated threshold) and whole, under measured codec points. Expect the stream's bytes to equal the whole-buffer
+    /// encoder's byte for byte, and the archive to decode.
+    #[test]
+    fn a_streamed_export_of_a_generated_tree_is_the_whole_buffer_encoders(
+      files in proptest::collection::vec(
+        (0usize..3, generated_bytes(), 0u32..0o1000, any::<bool>())
+          .prop_map(|(directory, bytes, mode, attribute)| GeneratedFile { directory, bytes, mode, attribute }),
+        0..4,
+      ),
+      threshold in 1usize..(PAGE * 40),
+    ) {
+      let mut store = store();
+      let mut volume = volume(&mut store);
+      let root = volume.root();
+      let outer = volume.mkdir(&mut store, root, "outer", 0o755).unwrap();
+      let inner = volume.mkdir(&mut store, outer, "inner", 0o700).unwrap();
+      for (at, file) in files.iter().enumerate() {
+        let directory = [root, outer, inner][file.directory];
+        let no = volume
+          .create_file(&mut store, directory, &format!("file-{at}"), file.mode)
+          .unwrap();
+        volume.write(&mut store, no, 0, &file.bytes).unwrap();
+        if file.attribute {
+          volume
+            .xattr_set(
+              &mut store,
+              no,
+              b"user.kind",
+              &file.bytes[..file.bytes.len().min(PAGE)],
+              crate::xattr::XattrSet::Create,
+            )
+            .unwrap();
+        }
+      }
+      volume.symlink(&mut store, inner, "link", "../file-0").unwrap();
+      let id = volume.snapshot(&mut store).unwrap();
+      let codec = measured_codec();
+      let (bytes, _) = export_streamed(&volume, &store, id, &codec, threshold);
+      prop_assert_eq!(&bytes, &archive_whole(&volume, &store, id, &codec));
+      prop_assert!(Archive::decode(&bytes).is_ok());
+    }
+  }
+
+  /// A-459 (the stage's bound): do export a snapshot several times larger than the stage's bound — `populate`'s
+  /// three-chunk file and `decorate`'s two-chunk attribute among the rest — as a stream emptied whenever the stage
+  /// holds one chunk. Expect the bytes to equal the whole-buffer encoder's, the stage never past
+  /// `StreamWriter::bound(threshold, chunk)`, and the stage emptied more often than the archive holds bounds (counted:
+  /// a stream handed out whole at its end is emptied once).
+  #[test]
+  fn a_snapshot_larger_than_the_stage_exports_with_the_stage_within_its_bound() {
+    let mut store = store();
+    let mut volume = volume(&mut store);
+    populate(&mut volume, &mut store);
+    decorate(&mut volume, &mut store);
+    let id = volume.snapshot(&mut store).unwrap();
+    let codec = CodecPolicy::raw_only();
+    let chunk = store.content.chunk_bytes();
+    let (bytes, writer) = export_streamed(&volume, &store, id, &codec, chunk);
+    assert_eq!(bytes, archive_whole(&volume, &store, id, &codec));
+    let bound = slates_archive::StreamWriter::bound(chunk, u32::try_from(chunk).unwrap());
+    assert!(
+      bytes.len() > 2 * bound,
+      "the snapshot's archive ({} bytes) is larger than the bound ({bound}) more than twice",
+      bytes.len()
+    );
+    assert!(
+      writer.high_water() <= bound,
+      "the stage reached {} of a {bound}-byte bound",
+      writer.high_water()
+    );
+    assert!(
+      writer.drained() > u64::try_from(bytes.len() / bound).unwrap(),
+      "the stage was emptied {} times for {} bytes",
+      writer.drained(),
+      bytes.len()
+    );
+  }
+
+  /// A-453, A-576: do export a snapshot of a byte-exact volume, of a folding one and of one that folds by Windows'
+  /// upcase table. Expect each archive's name-policy id to name its volume's policy back (`name_equivalence_of_id`), so
+  /// a volume made from the archive takes the policy its source had; and an id the exporter never writes to name none.
+  #[test]
+  fn an_archives_name_policy_names_its_volumes_back() {
+    for names in [
+      NameEquivalence::Exact,
+      NameEquivalence::Fold,
+      NameEquivalence::Upcase,
+    ] {
+      let mut store = store();
+      let mut volume = Volume::create(
+        &mut store,
+        VolumeConfig {
+          prefix: 1,
+          names,
+          quota: Quota::Bounded { limit: QUOTA },
+          journal_bytes: 1 << 16,
+          clock: Box::new(StepClock::new(0, 1)),
+        },
+      )
+      .unwrap();
+      let id = volume.snapshot(&mut store).unwrap();
+      let (archive, _) = archive_in_slices(&volume, &store, id, u64::MAX);
+      assert_eq!(name_equivalence_of_id(archive.name_policy_id), Some(names));
+    }
+    assert_eq!(name_equivalence_of_id(u32::MAX), None);
   }
 
   /// The tree [`populate`] built, as a restore must reproduce it: every file's bytes, the directory, the

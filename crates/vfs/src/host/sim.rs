@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
   Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind,
-  LandCapabilities, LandFs, WatchState,
+  LandCapabilities, LandFs, OsCode, WatchState,
 };
 use crate::inode::Fingerprint;
 
@@ -23,6 +23,9 @@ const SIM_EINVAL: i32 = 22;
 /// Format: the errno the simulated host reports for a name already taken (`EEXIST`, 17 on
 /// Linux and macOS).
 const SIM_EEXIST: i32 = 17;
+/// Format: the errno the simulated host refuses a clone with where it has no reflinks (`EOPNOTSUPP`, Linux's number),
+/// as a filesystem without them refuses `FICLONE`.
+const SIM_EOPNOTSUPP: i32 = 95;
 /// Format: the `st_mode` of a simulated directory: the `S_IFDIR` type bits over `rwxr-xr-x`,
 /// as `stat` reports it (the landing tells a removed directory from a removed file by them).
 const DIR_MODE: u32 = 0o040_755;
@@ -117,6 +120,11 @@ pub struct SimHost {
   exchange_supported: bool,
   /// Whether it offers unnamed temporaries.
   unnamed_temporaries: bool,
+  /// Whether it shares an earlier temporary's bytes with a new one (`LandFs::clone_temp`, A-445): off unless a test
+  /// turns it on, as on most filesystems.
+  reflink_supported: bool,
+  /// The temporaries made as clones so far ([`SimHost::clones`]).
+  clones: u64,
   /// The directories (by path) whose entries changed since their last `sync_dir`: what a power loss could take from
   /// their namespace ([`SimHost::unsynced_dir`]).
   unsynced_dirs: BTreeSet<Vec<Box<str>>>,
@@ -131,6 +139,9 @@ pub struct SimHost {
   /// when its outcome comes back, those still written out — unchanged since — are durable, and nothing else is, however
   /// it was written out meanwhile.
   barrier_covers: BTreeSet<u64>,
+  /// The files (by inode) whose mode or Windows bits a landing set in place (a metadata entry, A-458) and no barrier has
+  /// synced since: what a power loss could take back (A-472). A barrier that names the file covers it.
+  meta_set: BTreeSet<u64>,
   /// Every name a landing temporary became visible under, other than a hidden landing name, while it was not yet
   /// durable ([`SimHost::visible_before_durable`]): a power loss then could leave that name holding bytes or a mode the
   /// landing never wrote (§4.15 step 8: an entry is placed only after the barrier that covers it).
@@ -168,6 +179,14 @@ pub enum SimVerb {
   Unlink,
   /// `open_file`, by the file's path: a read the host refuses (an I/O error on the disk the volume overlays).
   OpenFile,
+  /// `rmdir`, by the directory's path: a removal the host refuses (A-539: POSIX lets `rmdir` answer a directory that
+  /// is not empty `EEXIST` as well as `ENOTEMPTY`).
+  Rmdir,
+  /// `open_to_chmod` and `open_dir_to_chmod`, by the object's path: a metadata entry's open the host refuses (A-539).
+  OpenToChmod,
+  /// `symlink`, by the link's path: a link the host refuses to make (A-568: a Windows account without the link
+  /// privilege).
+  Symlink,
 }
 
 /// A barrier the simulated host took (A-132): running it changes nothing — the host applies its durability when the
@@ -253,10 +272,13 @@ impl SimHost {
       crashed: false,
       exchange_supported: true,
       unnamed_temporaries: true,
+      reflink_supported: false,
+      clones: 0,
       unsynced_dirs: BTreeSet::new(),
       dirty_temps: BTreeSet::new(),
       written_out: BTreeSet::new(),
       barrier_covers: BTreeSet::new(),
+      meta_set: BTreeSet::new(),
       visible_unsynced: Vec::new(),
       calls: 0,
       armed: Vec::new(),
@@ -383,6 +405,16 @@ impl SimHost {
     self.unnamed_temporaries = supported;
   }
 
+  /// Gives the simulated filesystem reflinks (ReFS's block cloning, Btrfs's `FICLONE`; A-445), or takes them away.
+  pub fn set_reflink_supported(&mut self, supported: bool) {
+    self.reflink_supported = supported;
+  }
+
+  /// The temporaries made as clones of another (`LandFs::clone_temp`): what a test of the landing's clone path counts.
+  pub fn clones(&self) -> u64 {
+    self.clones
+  }
+
   /// Whether the directory at `path` had an entry added, removed or renamed since its last `sync_dir` (or since it
   /// was made): a power loss could still take that change. §4.15 step 9 advances an entry only once its directory,
   /// and a rename's source directory, are synced.
@@ -407,6 +439,27 @@ impl SimHost {
     self.written_out.remove(&ino);
     self.barrier_covers.remove(&ino);
     self.dirty_temps.insert(ino);
+  }
+
+  /// The inode a barrier taken now covers for `file`: a temporary's once written out since its last change, a file's whose
+  /// metadata a landing set in place (A-472); `None` for anything else; `StaleHandle` for no open file.
+  fn coverable(&self, file: HostFile) -> Result<Option<u64>, HostError> {
+    Ok(match self.opens.get(&file.0) {
+      Some(Open::Temp { node, .. }) => Some(node.ino).filter(|ino| self.written_out.contains(ino)),
+      Some(Open::File { ino, .. }) => Some(*ino).filter(|ino| self.meta_set.contains(ino)),
+      Some(_) => None,
+      None => return Err(HostError::StaleHandle),
+    })
+  }
+
+  /// The inode of an open temporary or file; `None` for a directory; `StaleHandle` for no open handle.
+  fn open_ino(&self, file: HostFile) -> Result<Option<u64>, HostError> {
+    match self.opens.get(&file.0) {
+      Some(Open::Temp { node, .. }) => Ok(Some(node.ino)),
+      Some(Open::File { ino, .. }) => Ok(Some(*ino)),
+      Some(_) => Ok(None),
+      None => Err(HostError::StaleHandle),
+    }
   }
 
   /// The inode of an open landing temporary; `None` for another open file; `StaleHandle` for no open file.
@@ -442,13 +495,13 @@ impl SimHost {
   fn write_step(&mut self) -> Result<(), HostError> {
     self.tick();
     if self.crashed {
-      return Err(HostError::Unavailable(SIM_EIO));
+      return Err(HostError::Unavailable(OsCode::Errno(SIM_EIO)));
     }
     if let Some(at) = self.crash_at
       && self.write_steps >= at
     {
       self.crashed = true;
-      return Err(HostError::Unavailable(SIM_EIO));
+      return Err(HostError::Unavailable(OsCode::Errno(SIM_EIO)));
     }
     self.write_steps = self.write_steps.saturating_add(1);
     Ok(())
@@ -743,6 +796,20 @@ impl SimHost {
     }
   }
 
+  /// Whether the file at `path` holds a mode or Windows bits a landing set in place that no barrier has synced since
+  /// (A-472): what a power loss could take back from a landing that reported it.
+  pub fn holds_unsynced_metadata(&self, path: &str) -> bool {
+    self
+      .node(&Self::split(path))
+      .is_some_and(|node| self.meta_set.contains(&node.ino))
+  }
+
+  /// An entry's Windows attribute bits as the simulated disk holds them (A-262), none for a missing one: what a test of
+  /// a landing's bits reads (A-451).
+  pub fn windows_attributes(&self, path: &str) -> Option<u16> {
+    self.node(&Self::split(path)).map(|n| n.windows)
+  }
+
   /// Changes a file's mode (a metadata-only change).
   pub fn chmod(&mut self, path: &str, mode: u32) {
     let parts = Self::split(path);
@@ -1023,9 +1090,40 @@ impl LandFs for SimHost {
     self.dir_parts(dir)?;
     Ok(LandCapabilities {
       exchange: self.exchange_supported,
-      reflink: false,
+      reflink: self.reflink_supported,
       unnamed_temporaries: self.unnamed_temporaries,
     })
+  }
+
+  /// A clone where the simulated filesystem has reflinks: a new temporary made as `create_temp` makes one (a write step),
+  /// then the first `len` bytes of `from` given to it (another), so a crash can land between the two as on a real
+  /// filesystem whose clone is not one call; refused `EOPNOTSUPP` before any step where it has none.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    from: HostFile,
+    len: u64,
+  ) -> Result<HostFile, HostError> {
+    if !self.reflink_supported {
+      self.dir_parts(dir)?;
+      return Err(HostError::Unsupported(OsCode::Errno(SIM_EOPNOTSUPP)));
+    }
+    let len =
+      usize::try_from(len).map_err(|_| HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
+    let shared = match self.opens.get(&from.0) {
+      Some(Open::Temp { node, .. }) => node
+        .bytes
+        .get(..len)
+        .ok_or(HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?
+        .to_vec(),
+      Some(Open::File { .. }) => return Err(HostError::Unavailable(OsCode::Errno(SIM_EINVAL))),
+      _ => return Err(HostError::StaleHandle),
+    };
+    let temp = self.create_temp(dir, name)?;
+    self.write_at(temp, 0, &shared)?;
+    self.clones = self.clones.saturating_add(1);
+    Ok(temp)
   }
 
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
@@ -1061,7 +1159,8 @@ impl LandFs for SimHost {
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError> {
     self.write_step()?;
     let now = self.now_ns;
-    let off = usize::try_from(off).map_err(|_| HostError::Unavailable(SIM_EINVAL))?;
+    let off =
+      usize::try_from(off).map_err(|_| HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
     let (node_ino, placed) = match self.opens.get_mut(&file.0) {
       Some(Open::Temp { node, placed }) => {
         write_into(&mut node.bytes, off, bytes)?;
@@ -1069,7 +1168,7 @@ impl LandFs for SimHost {
         node.ctime_ns = now;
         (node.ino, placed.clone())
       }
-      Some(Open::File { .. }) => return Err(HostError::Unavailable(SIM_EINVAL)),
+      Some(Open::File { .. }) => return Err(HostError::Unavailable(OsCode::Errno(SIM_EINVAL))),
       _ => return Err(HostError::StaleHandle),
     };
     self.temp_changed(node_ino);
@@ -1100,12 +1199,9 @@ impl LandFs for SimHost {
     self.fault(SimVerb::Barrier, "")?;
     let mut covers = BTreeSet::new();
     for file in files {
-      // Only a file written out since its last change is covered: a dirty one stays dirty.
-      covers.extend(
-        self
-          .temp_ino(*file)?
-          .filter(|ino| self.written_out.contains(ino)),
-      );
+      // Only a temporary written out since its last change is covered (a dirty one stays dirty), and a file whose
+      // metadata a landing set in place (A-472), which has no writeback to start.
+      covers.extend(self.coverable(*file)?);
     }
     self.barrier_covers = covers;
     let refusal = self.fault(SimVerb::BarrierRun, "").err();
@@ -1120,13 +1216,53 @@ impl LandFs for SimHost {
     let covers = std::mem::take(&mut self.barrier_covers);
     ran?;
     for file in files {
-      if let Some(ino) = self.temp_ino(*file)?
+      if let Some(ino) = self.open_ino(*file)?
         && covers.contains(&ino)
       {
         self.written_out.remove(&ino);
+        self.meta_set.remove(&ino);
       }
     }
     Ok(())
+  }
+
+  /// The file as [`HostFs::open_file`] opens it: the simulated disk keeps no access modes (A-458).
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let mut parts = self.dir_parts(dir)?;
+    parts.push(name.into());
+    self.fault(SimVerb::OpenToChmod, &format!("/{}", parts.join("/")))?;
+    HostFs::open_file(self, dir, name)
+  }
+
+  /// The directory opened as a file is (A-501): its mode and bits set in place, unsynced until a barrier names it, as a
+  /// file's are. The handle keeps the directory's own record, never a copy of the tree beneath it.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.tick();
+    let mut parts = self.dir_parts(dir)?;
+    parts.push(name.into());
+    self.fault(SimVerb::OpenDir, &format!("/{}", parts.join("/")))?;
+    self.fault(SimVerb::OpenToChmod, &format!("/{}", parts.join("/")))?;
+    let node = match self.node(&parts) {
+      Some(n) if n.kind == HostKind::Dir => SimNode {
+        children: BTreeMap::new(),
+        bytes: Vec::new(),
+        target: n.target.clone(),
+        ..*n
+      },
+      Some(_) => return Err(HostError::NotDirectory),
+      None => return Err(HostError::NotFound),
+    };
+    let h = self.next_handle;
+    self.next_handle = self.next_handle.saturating_add(1);
+    self.opens.insert(
+      h,
+      Open::File {
+        ino: node.ino,
+        snapshot: node,
+        path: parts,
+      },
+    );
+    Ok(HostFile(h))
   }
 
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
@@ -1153,6 +1289,41 @@ impl LandFs for SimHost {
           n.mode = mode;
           n.ctime_ns = now;
         }
+        // Set in place, as a landing's metadata entry sets it: unsynced until a barrier names the file (A-472).
+        self.meta_set.insert(ino);
+        Ok(())
+      }
+      _ => Err(HostError::StaleHandle),
+    }
+  }
+
+  /// The temporary's Windows bits, as a Windows disk keeps them (A-451): a write step, as a mode's change is.
+  fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError> {
+    self.write_step()?;
+    let now = self.now_ns;
+    match self.opens.get_mut(&file.0) {
+      Some(Open::Temp { node, placed }) => {
+        node.windows = windows;
+        node.ctime_ns = now;
+        let placed = placed.clone();
+        let ino = node.ino;
+        self.temp_changed(ino);
+        if let Some(parts) = placed
+          && let Some(n) = self.node_mut(&parts)
+          && n.ino == ino
+        {
+          n.windows = windows;
+        }
+        Ok(())
+      }
+      Some(Open::File { ino, .. }) => {
+        let ino = *ino;
+        if let Some(n) = self.node_by_ino_mut(ino) {
+          n.windows = windows;
+          n.ctime_ns = now;
+        }
+        // Set in place: unsynced until a barrier names the file (A-472).
+        self.meta_set.insert(ino);
         Ok(())
       }
       _ => Err(HostError::StaleHandle),
@@ -1177,9 +1348,13 @@ impl LandFs for SimHost {
       }
       Some(Open::File { ino, .. }) => {
         let ino = *ino;
+        let now = self.now_ns;
         if let Some(n) = self.node_by_ino_mut(ino) {
           n.mtime_ns = mtime_ns;
+          n.ctime_ns = now;
         }
+        // Set in place, as a landing's metadata entry sets a `touch` (A-501): unsynced until a barrier names the file.
+        self.meta_set.insert(ino);
         Ok(())
       }
       _ => Err(HostError::StaleHandle),
@@ -1204,7 +1379,7 @@ impl LandFs for SimHost {
       .node(&parts)
       .is_some_and(|p| p.children.contains_key(name))
     {
-      return Err(HostError::Unavailable(SIM_EEXIST));
+      return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     // A named temporary moves to `name` (the same inode, its one name after; the move changes its ctime, as a rename
     // does); an unnamed one is linked for the first time.
@@ -1238,7 +1413,7 @@ impl LandFs for SimHost {
   fn exchange(&mut self, dir: HostDir, a: &str, b: &str) -> Result<(), HostError> {
     self.write_step()?;
     if !self.exchange_supported {
-      return Err(HostError::Unavailable(SIM_EINVAL));
+      return Err(HostError::Unsupported(OsCode::Errno(SIM_EINVAL)));
     }
     let parts = self.dir_parts(dir)?;
     let now = self.now_ns;
@@ -1276,7 +1451,7 @@ impl LandFs for SimHost {
       return Err(HostError::NotFound);
     }
     if self.node(&t).is_some() {
-      return Err(HostError::Unavailable(SIM_EEXIST));
+      return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     let now = self.now_ns;
     SimHost::rename(
@@ -1315,16 +1490,18 @@ impl LandFs for SimHost {
     Ok(())
   }
 
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError> {
+  /// A directory with its mode and, as a Windows disk holds them, its Windows bits (A-451).
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, windows: u16) -> Result<(), HostError> {
     self.write_step()?;
     let parts = self.entry_parts(dir, name)?;
     if self.node(&parts).is_some() {
-      return Err(HostError::Unavailable(SIM_EEXIST));
+      return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     let path = format!("/{}", parts.join("/"));
     SimHost::mkdir(self, &path);
     if let Some(n) = self.node_mut(&parts) {
       n.mode = mode;
+      n.windows = windows;
     }
     Ok(())
   }
@@ -1335,22 +1512,38 @@ impl LandFs for SimHost {
     match self.node(&parts) {
       None => return Err(HostError::NotFound),
       Some(n) if n.kind != HostKind::Dir => return Err(HostError::NotDirectory),
-      Some(n) if !n.children.is_empty() => return Err(HostError::Unavailable(SIM_EINVAL)),
+      Some(n) if !n.children.is_empty() => {
+        return Err(HostError::Unavailable(OsCode::Errno(SIM_EINVAL)));
+      }
       Some(_) => {}
     }
     let path = format!("/{}", parts.join("/"));
+    self.fault(SimVerb::Rmdir, &path)?;
     self.remove(&path);
     Ok(())
   }
 
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError> {
+  /// One step, as `symlinkat` makes a link: `staged` is not used (see the seam); the link keeps its Windows bits, as a
+  /// Windows disk keeps a link's kind and attributes (A-451).
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    _staged: &str,
+    windows: u16,
+  ) -> Result<(), HostError> {
     self.write_step()?;
     let parts = self.entry_parts(dir, name)?;
     if self.node(&parts).is_some() {
-      return Err(HostError::Unavailable(SIM_EEXIST));
+      return Err(HostError::Exists(OsCode::Errno(SIM_EEXIST)));
     }
     let path = format!("/{}", parts.join("/"));
+    self.fault(SimVerb::Symlink, &path)?;
     SimHost::symlink(self, &path, target);
+    if let Some(n) = self.node_mut(&parts) {
+      n.windows = windows;
+    }
     Ok(())
   }
 
@@ -1393,13 +1586,13 @@ impl SimHost {
 fn write_into(file: &mut Vec<u8>, off: usize, bytes: &[u8]) -> Result<(), HostError> {
   let end = off
     .checked_add(bytes.len())
-    .ok_or(HostError::Unavailable(SIM_EINVAL))?;
+    .ok_or(HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?;
   if file.len() < end {
     file.resize(end, 0);
   }
   file
     .get_mut(off..end)
-    .ok_or(HostError::Unavailable(SIM_EINVAL))?
+    .ok_or(HostError::Unavailable(OsCode::Errno(SIM_EINVAL)))?
     .copy_from_slice(bytes);
   Ok(())
 }

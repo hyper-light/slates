@@ -86,11 +86,33 @@ pub fn hand_stream(stream: BorrowedHandle<'_>, pid: u32) -> Result<u64, IpcError
   duplicate_into(stream, pid)
 }
 
+/// Duplicates `stream`, the client end of a Shards stream's pipe, into the process `pid` only if that process was created
+/// at `started` (A-433): what a successor daemon does with a fresh stream's end, handing it to the process the dead
+/// daemon's session named as the stream's holder, never to a later process given the same id. The process is opened
+/// once, so its creation time and the duplicate are one process's. Refused `NotAHolder` for another process, and as
+/// [`hand_stream`] is otherwise.
+pub fn hand_stream_to(stream: BorrowedHandle<'_>, pid: u32, started: u64) -> Result<u64, IpcError> {
+  let process = open_process(pid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION)?;
+  if started_of(process.as_handle())? != started {
+    return Err(IpcError::NotAHolder { pid });
+  }
+  same_user(process.as_handle())?;
+  duplicate_into_process(stream, process.as_handle())
+}
+
 /// Duplicates `handle` into the process `pid`, with the access it has, once [`same_user`] has judged the process: the
 /// duplicate's value there, which only travels in a reply.
 fn duplicate_into(handle: BorrowedHandle<'_>, pid: u32) -> Result<u64, IpcError> {
   let process = open_process(pid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION)?;
   same_user(process.as_handle())?;
+  duplicate_into_process(handle, process.as_handle())
+}
+
+/// Duplicates `handle` into `process`, opened for duplication, with the access it has: the duplicate's value there.
+fn duplicate_into_process(
+  handle: BorrowedHandle<'_>,
+  process: BorrowedHandle<'_>,
+) -> Result<u64, IpcError> {
   let mut value: HANDLE = std::ptr::null_mut();
   // SAFETY: this process's pseudo-handle as the source process, a live handle of it, the client's process handle just
   // opened for duplication, and an out-pointer to a local; the duplicate lives in the client's table, not this one's.
@@ -393,6 +415,41 @@ fn denied_or_refused(call: &'static str) -> Result<bool, IpcError> {
   })
 }
 
+/// The creation time of the process `pid` (`GetProcessTimes`' 100-nanosecond count since 1601): with its id, it names one
+/// process for its whole life, since an id is given again only after its process has ended. What a Shards stream's
+/// held session keeps of the process a successor hands a fresh stream to (A-418, A-427), so a later process given the
+/// same id is never taken for it. Refused `OsRefused` where the process is gone or not this user's to query.
+pub fn process_started(pid: u32) -> Result<u64, IpcError> {
+  let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+  started_of(process.as_handle())
+}
+
+/// The creation time of `process`, opened with at least the limited query right (see [`process_started`]).
+fn started_of(process: BorrowedHandle<'_>) -> Result<u64, IpcError> {
+  use windows_sys::Win32::Foundation::FILETIME;
+  use windows_sys::Win32::System::Threading::GetProcessTimes;
+  let unset = FILETIME {
+    dwLowDateTime: 0,
+    dwHighDateTime: 0,
+  };
+  let (mut created, mut exited, mut kernel, mut user) = (unset, unset, unset, unset);
+  // SAFETY: a live process handle opened with the limited query right, which `GetProcessTimes` accepts, and four of this
+  // frame's own values for the call to write; the status is checked before any is read.
+  let timed = unsafe {
+    GetProcessTimes(
+      process.as_raw_handle(),
+      &mut created,
+      &mut exited,
+      &mut kernel,
+      &mut user,
+    )
+  };
+  if timed == 0 {
+    return Err(os("GetProcessTimes"));
+  }
+  Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
 /// The process `pid`, opened with `access`. Refused `OsRefused` where it is gone or not this user's to open.
 fn open_process(pid: u32, access: u32) -> Result<OwnedHandle, IpcError> {
   // SAFETY: opens a process by id; a null handle is refused, and a granted one is owned below.
@@ -471,4 +528,23 @@ fn token_user(process: BorrowedHandle<'_>) -> Result<Vec<u64>, IpcError> {
     return Err(os("GetTokenInformation"));
   }
   Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A-427. Do: read this process's creation time twice, and that of process id zero, the idle process, which no one
+  /// opens. Expect: the same nonzero time both times, and zero refused `OsRefused`.
+  #[test]
+  fn a_processs_creation_time_names_it_for_its_life() {
+    let pid = std::process::id();
+    let first = process_started(pid).unwrap();
+    assert_ne!(first, 0);
+    assert_eq!(process_started(pid).unwrap(), first);
+    assert!(matches!(
+      process_started(0),
+      Err(IpcError::OsRefused { .. })
+    ));
+  }
 }

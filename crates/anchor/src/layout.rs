@@ -1,15 +1,26 @@
-//! The segment's geometry and its regions (§4.8's `Partition` fields that live "in the anchor
-//! segment": the op log, the audit log, the landing manifests, plus the profile and the
-//! catalog snapshots). Every offset is a page multiple so a region can be locked or advised on
-//! its own, and every word two processes touch sits at an 8-byte offset.
+//! The segment's geometry and its regions (§4.8's `Partition` fields that live "in the anchor segment": the op log,
+//! which carries the audit log's records, the landing manifests, plus the profile and the catalog snapshots, which
+//! carry the audit's retained window). Every offset is a page multiple so a region can be locked or advised on its
+//! own, and every word two processes touch sits at an 8-byte offset.
 
 /// Format: the segment's magic, `SLAN` in little-endian ASCII.
 pub const MAGIC: u32 = 0x4E41_4C53;
-/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide monotonic
-/// origin, 4 the content pool's owner words (A-98), 5 every principal recorded with the host whose account it is
-/// (A-237), 6 a green's chain entries record what each version changed (A-257). An older segment is refused, never read
-/// under semantics it was not written with.
-pub const LAYOUT_VERSION: u32 = 6;
+/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide origin, 4 pool
+/// owner words (A-98), 5 host-scoped principals (A-237), 6 chain entries record each version's changes (A-257), 7 they
+/// and merge records carry the submit's completion key (A-255), 8 the submitting work beside it, and a completion record
+/// a green's successor adopted carries that work too (A-288), 9 the audit ring removed, whose records the op log and the
+/// snapshots held (A-265), 10 the audit's crossing durable: a partition's snapshot carries the records it owes the
+/// control partition and the control partition's marks of what each delivered (A-265, 2026-11-18), 11 a recorded reply's
+/// host code typed by its numbering: a completion record keeps its reply's bytes, whose errno fields a Windows daemon of
+/// layout 10 filled with Win32 error codes, now an errno alone beside an appended Win32 variant (A-539, 2026-11-19), 12
+/// a green's checkpoint carries its copies' records, their trees' keys and the identity's sum (version 4, A-626 part 3,
+/// 2026-11-19), so a version 3 checkpoint is never read: its segment is refused at adoption, before anything is served,
+/// 13 the copies' section and the sum each behind a presence byte, written beside a copy's record alone (checkpoint
+/// version 5, A-626 part 3, continued (1), 2026-11-19), 14 a work's logged journal may hold a copy (`LoggedOp::Copy`,
+/// A-626 part 4, 2026-11-19), 15 a token's credential record keeps its CRAM-MD5 keyed contexts beside its hash
+/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19). An older segment is refused, never misread.
+/// Format: this layout's number in the history above.
+pub const LAYOUT_VERSION: u32 = 15;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
@@ -23,7 +34,7 @@ const SNAPSHOT_SLOTS: usize = 2;
 /// Format: the node-wide consensus publications (regional and root).
 const CONSENSUS_PUBLICATIONS: usize = 2;
 /// Format: the header's size: magic (4), version (4), identity (32), generation (8), total
-/// length (8), then the encoded geometry (64), padded to two cache lines.
+/// length (8), then the encoded geometry (56), padded to two cache lines.
 pub const HEADER_BYTES: usize = 128;
 /// Format: the magic's offset.
 pub const AT_MAGIC: usize = 0;
@@ -40,7 +51,7 @@ pub const AT_TOTAL: usize = 48;
 /// Format: the encoded geometry's offset.
 pub const AT_GEOMETRY: usize = 56;
 /// Format: the encoded geometry's width.
-pub const GEOMETRY_BYTES: usize = 64;
+pub const GEOMETRY_BYTES: usize = 56;
 /// Format: the encoded geometry's fields, by offset: partitions (u16).
 const GEO_PARTITIONS: usize = 0;
 /// Format: the page (u64).
@@ -51,12 +62,10 @@ const GEO_PROFILE: usize = 16;
 const GEO_LOG: usize = 24;
 /// Format: one snapshot slot's bytes (u64).
 const GEO_SNAPSHOT: usize = 32;
-/// Format: the audit ring's bytes (u64).
-const GEO_AUDIT: usize = 40;
 /// Format: the landing slot count (u32).
-const GEO_LANDING_SLOTS: usize = 48;
+const GEO_LANDING_SLOTS: usize = 40;
 /// Format: one landing slot's bytes (u64).
-const GEO_LANDING_SLOT_BYTES: usize = 56;
+const GEO_LANDING_SLOT_BYTES: usize = 48;
 
 /// Format: the supervision block's words, by offset inside its region: the daemon's pid.
 pub const SUP_PID: usize = 0;
@@ -125,11 +134,36 @@ pub const SUP_HOLD_REFUSALS: usize = 192;
 /// Format: the byte offset inside the supervision block, the word after the hold refusals.
 pub const SUP_LOG_REFUSALS: usize = 200;
 /// The current daemon's **serving** word: when, in the heartbeat's host domain, it finished its start (recovery
-/// included) and began serving; zero until then, and zeroed at every start. An exit after it is a daemon that
-/// recovered, which the restart bound does not count (`supervise.rs`). Zero in a block an older daemon wrote, so every
-/// exit under it counts, as before.
+/// included) and began serving; zero until then, and zeroed at every start. The step that first sees it ends the
+/// daemon's start for the restart bound, and a daemon that has served as long as its start took has recovered
+/// (`SUP_RECOVERED`, A-311): an exit before then is a failed start (`supervise.rs`). Zero in a block an older daemon
+/// wrote, so every exit under it counts, as before.
 /// Format: the byte offset inside the supervision block, the word after the refused log lines.
 pub const SUP_SERVING: usize = 208;
+/// The current daemon's **looked** word (A-232): when, in the heartbeat's host domain, its watchdog last looked at its
+/// shards, written at every look whether the look beat or withheld the beat; zero until the first, and zeroed at every
+/// start. A beat that lapses while the looks go on is the watchdog's verdict (a stuck shard, or a control loop that
+/// ended), and the anchor kills; a beat that lapses because the watchdog itself has not looked is a daemon whose
+/// watchdog was kept off its CPU, which the anchor judges by its process's own CPU time, as it judges a start, and
+/// spares while it is starved.
+/// Format: the byte offset inside the supervision block, the word after the serving word.
+pub const SUP_LOOKED: usize = 216;
+/// The current daemon's **recovered** word (A-311): when, on the anchor's clock (the heartbeat's host domain), the
+/// anchor judged that the daemon has served as long as its start took, its start counted from the spawn to the step
+/// that first saw its serving word; zero until then, and zeroed at every start. Its exit before then is a failed start,
+/// which the restart bound counts as one before it served is; its exit after it is a recovered daemon's, restarted at
+/// once. The daemon reports it as `recovered` in `slates status`, so whoever ends a daemon on purpose (a test, an
+/// operator) can wait for the anchor's own verdict first. Zero in a block an older anchor wrote.
+/// Format: the byte offset inside the supervision block, the word after the looked word.
+pub const SUP_RECOVERED: usize = 224;
+/// The anchor's **lapse bound** word (A-574): the age, in nanoseconds, past which the anchor takes its daemon's beat for
+/// lapsed and kills it (A-467: the liveness window plus the anchor's own measured lateness p99, within the watchdog's
+/// ceiling), written by the anchor's observation loop whenever it moves. The daemon reads it as the anchor's part of its
+/// failover detection (`slates_cluster::failover::supervision`): a stuck daemon is found by its own watchdog, which then
+/// withholds the beat, and is killed once that beat is this old. Zero in a block no anchor wrote: a daemon run alone,
+/// which its own watchdog ends, or one under an older anchor.
+/// Format: the byte offset inside the supervision block, the word after the recovered word.
+pub const SUP_LAPSE_BOUND: usize = 232;
 /// The node's **client session secret** published word: `1` once a daemon has published the secret after it, `0` before
 /// (a fresh segment, or one an older anchor wrote). The secret is made by the first daemon under this anchor and adopted
 /// by every daemon after it, so a client's session key (`slates_server::session_key`), which only it and the daemon
@@ -144,6 +178,36 @@ pub const SUP_SESSION_SECRET: usize = 264;
 /// Format: the client session secret's width, a 256-bit random value, the width of the BLAKE3 key that derives each
 /// client's session key from it (BLAKE3 §2.3).
 pub const SESSION_SECRET_BYTES: usize = 32;
+/// The **launcher secret** published word (A-299): `1` once the anchor has published the secret after it, `0` before (an
+/// anchor whose starter provided none, or an older anchor). The launcher — the host that starts the instance and passes
+/// each agent its write mode (kiln) — provides the secret on the anchor's standard input at every start and keeps it
+/// itself, so its authority (approving what an ask mode holds, setting a write policy, enrolling) outlives a daemon
+/// restart and its own. The daemon verifies a launcher-class proof under it as under the issuer secret; unlike the
+/// issuer secret it is never minted, and nothing derives a per-boot name from it.
+/// Format: the byte offset inside the supervision block, the first cache line past the session secret (264 + 32 = 296,
+/// so 320).
+pub const SUP_LAUNCHER_PRESENT: usize = 320;
+/// Format: the launcher secret's offset, the word after its published word.
+pub const SUP_LAUNCHER_SECRET: usize = 328;
+/// Format: the launcher secret's width, a 256-bit random value: the BLAKE3 key the launcher-class proofs are keyed by,
+/// the width of the issuer secret's (`ISSUER_SECRET_BYTES`), so the same proof formulas take either.
+pub const LAUNCHER_SECRET_BYTES: usize = 32;
+/// The **SSH host key** published word (A-684): `1` once the anchor has published the seed of the version-control
+/// servers' SSH edge's host key after it, `0` before (an anchor asked for no SSH edge; a fleet node's anchor, whose edge
+/// presents the node's own key from its deployment plan; or an older anchor). The anchor makes the key from the system's
+/// generator at its start, before it starts any daemon, and every daemon under it serves its SSH edge with that key, so
+/// a daemon restart keeps the key a client pinned (its `known_hosts` line) beside the port the anchor holds. The key
+/// lives as long as the anchor, as the RAM the edge serves does; the page is the one the anchor locks for the sealing
+/// root (`AnchorSegment::protect_seal_page`), and the anchor's process is excluded from core dumps before it holds a
+/// byte. A daemon run alone, with no anchor, makes its own for its own life. Zero in a block an older anchor wrote.
+/// Format: the byte offset inside the supervision block, the first cache line past the launcher secret (328 + 32 = 360,
+/// so 384).
+pub const SUP_SSH_HOST_PRESENT: usize = 384;
+/// Format: the SSH host key's seed's offset, the word after its published word.
+pub const SUP_SSH_HOST_SEED: usize = 392;
+/// Format: the SSH host key's seed's width: an Ed25519 private key (RFC 8032 §5.1.5, 32 bytes), the one host key
+/// algorithm the SSH edge presents (`ssh-ed25519`, RFC 8709; §4.17.2 "Transports" item 2).
+pub const SSH_HOST_SEED_BYTES: usize = 32;
 
 /// Format: a published payload's words (the profile, a snapshot slot, a landing slot): the
 /// generation (odd while a writer is inside) then the length, then the bytes.
@@ -173,7 +237,8 @@ pub enum State {
   Stopped = 0,
   /// A daemon is running (its pid is in the block).
   Running = 1,
-  /// Supervision stopped restarting: the daemon failed faster than it could recover.
+  /// In a crash loop: the daemon's starts failed in a row, and its next start waits out a backoff (A-119, A-311);
+  /// supervision never stops restarting it.
   CrashLoop = 2,
 }
 
@@ -203,8 +268,6 @@ pub struct Geometry {
   /// Derived: one snapshot slot's bytes (the measured partition state size × the growth
   /// headroom); two slots per partition.
   pub snapshot_bytes: u64,
-  /// Derived: the audit ring's bytes (landing rate × audit horizon × record size).
-  pub audit_bytes: u64,
   /// Derived: landing slots (landings in flight the host allows).
   pub landing_slots: u32,
   /// Derived: one landing slot's bytes (the measured manifest size p99).
@@ -224,8 +287,6 @@ pub enum RegionKind {
   Snapshot(u16, u8),
   /// One of the two node-wide Raft publications, owned by the control shard.
   Consensus(u8),
-  /// The audit ring.
-  Audit,
   /// A landing slot.
   Landing(u32),
   /// The content pool's owner words (A-98): [`POOL_EXTENTS_PER_PARTITION`] per partition.
@@ -239,7 +300,6 @@ struct Runs {
   logs: (u64, u64),
   snapshots: (u64, u64),
   consensus: (u64, u64),
-  audit: (u64, u64),
   landings: (u64, u64),
   pool: (u64, u64),
 }
@@ -297,7 +357,6 @@ impl Geometry {
     }
     push(RegionKind::Consensus(0), self.consensus_bytes());
     push(RegionKind::Consensus(1), self.consensus_bytes());
-    push(RegionKind::Audit, self.audit_bytes);
     for slot in 0..self.landing_slots {
       push(RegionKind::Landing(slot), self.landing_slot_bytes);
     }
@@ -342,7 +401,6 @@ impl Geometry {
         runs.consensus,
         bounded(usize::from(c), CONSENSUS_PUBLICATIONS)?,
       )?,
-      RegionKind::Audit => runs.audit,
       RegionKind::Landing(slot) => nth(
         runs.landings,
         bounded(
@@ -385,14 +443,10 @@ impl Geometry {
       self.aligned(self.consensus_bytes()),
     );
     let publications = u64::try_from(CONSENSUS_PUBLICATIONS).ok()?;
-    let audit = run(
+    let landings = run(
       consensus
         .0
         .checked_add(publications.checked_mul(consensus.1)?)?,
-      self.aligned(self.audit_bytes),
-    );
-    let landings = run(
-      audit.0.checked_add(audit.1)?,
       self.aligned(self.landing_slot_bytes),
     );
     let pool = run(
@@ -407,7 +461,6 @@ impl Geometry {
       logs,
       snapshots,
       consensus,
-      audit,
       landings,
       pool,
     })
@@ -436,7 +489,6 @@ impl Geometry {
     put(&mut out, GEO_PROFILE, &self.profile_bytes.to_le_bytes());
     put(&mut out, GEO_LOG, &self.log_bytes.to_le_bytes());
     put(&mut out, GEO_SNAPSHOT, &self.snapshot_bytes.to_le_bytes());
-    put(&mut out, GEO_AUDIT, &self.audit_bytes.to_le_bytes());
     put(
       &mut out,
       GEO_LANDING_SLOTS,
@@ -458,7 +510,6 @@ impl Geometry {
       profile_bytes: word(bytes, GEO_PROFILE),
       log_bytes: word(bytes, GEO_LOG),
       snapshot_bytes: word(bytes, GEO_SNAPSHOT),
-      audit_bytes: word(bytes, GEO_AUDIT),
       landing_slots: u32::from_le_bytes([
         bytes[GEO_LANDING_SLOTS],
         bytes[GEO_LANDING_SLOTS + 1],
@@ -504,7 +555,6 @@ mod tests {
         profile_bytes: 8192,
         log_bytes: 1 << 16,
         snapshot_bytes: 8192,
-        audit_bytes: 4096,
         landing_slots,
         landing_slot_bytes: 4096,
       };
@@ -536,7 +586,6 @@ mod tests {
       profile_bytes: 10_000,
       log_bytes: 1 << 20,
       snapshot_bytes: 8192,
-      audit_bytes: 4096,
       landing_slots: 2,
       landing_slot_bytes: 100,
     };

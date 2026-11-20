@@ -1,89 +1,77 @@
-//! How the receive thread waits for the shard's reply (A-212, §4.6 Windows). A reply usually comes back in less time than
-//! parking and being woken costs: on CI's arm64 runner a quiet flush's whole shard hop took 19.4 µs at the p50 with the
-//! thread parked and 10.1 µs with it spinning, and an open's 18.4 µs against 8.0 µs (runs 42047111024 and 42049771150).
-//! So the thread spins for as long as a wake costs, then parks: the 2-competitive rule the shards use (§4.3), which never
-//! pays more than twice the better choice.
+//! How the receive thread waits for the shard's reply (A-212, A-560; §4.6 Windows). A reply usually comes back in less
+//! time than parking and being woken costs: on CI's arm64 runner a quiet flush's whole shard hop took 19.4 µs at the p50
+//! with the thread parked and 10.1 µs with it spinning, and an open's 18.4 µs against 8.0 µs (runs 42047111024 and
+//! 42049771150). So the thread spins for as long as a wake costs, then parks: the 2-competitive rule the shards use
+//! (§4.3), which never pays more than twice the better choice.
 //!
-//! The window is measured, not assumed. The machine profile's `wake.mean_ns` is 0.15–1.2 µs on these runners, far below
-//! what this channel's wake costs, so it cannot serve. The thread measures the wake it would otherwise pay, through the
-//! same channel, once as it starts, off every data path.
+//! The window is learned, not assumed, and keeps being learned (A-560, [`crate::spin_window`]). Every reply carries the
+//! instant it was sent ([`Stamped`]), so each reply the thread parked for is one of its own wakes, timed from the send to
+//! the thread running again. The machine profile's `wake.mean_ns` (0.15–1.2 µs on these runners) is far below what this
+//! channel's wake costs, so it cannot serve; until A-560 the thread timed fifteen probe wakes once as it started and kept
+//! their median for good, unbounded, which a noisy start set at 108 to 144 µs. The window is zero until the thread's
+//! wakes agree, and never longer than the step quantum of the shard that started the mount ([`start`]).
 
 use std::cell::Cell;
-use std::sync::mpsc::{Receiver, RecvError, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvError, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::host::WinFspError;
+use crate::spin_window::SpinWindow;
 
-/// Shape: wakes timed for the median: enough that one scheduling delay cannot set the window, few enough to cost a mount
-/// about a millisecond with [`PARK_PAUSE`].
-const SAMPLES: usize = 15;
-/// Shape: the pause before each timed send, so the other thread has stopped spinning in `recv` and parked: `std`'s channel
-/// spins for microseconds before it parks, and a send it caught spinning would time no wake.
-const PARK_PAUSE: Duration = Duration::from_micros(100);
-
-thread_local! {
-  /// This thread's spin before it parks for a reply. Zero, as on any thread that measured none, parks at once.
-  static WINDOW: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+/// A reply and the instant it was sent, so a thread that parked for it times its own wake (A-560).
+pub(crate) struct Stamped<T> {
+  /// The reply.
+  pub(crate) reply: T,
+  /// When the shard sent it.
+  pub(crate) sent: Instant,
 }
 
-/// How a wait for a reply ended, for the test that the fast path is taken.
+impl<T> Stamped<T> {
+  /// `reply`, sent now.
+  pub(crate) fn now(reply: T) -> Self {
+    Self {
+      reply,
+      sent: Instant::now(),
+    }
+  }
+}
+
+thread_local! {
+  /// This thread's spin window, learned from its own wakes. A thread that started none spins never: under a ceiling of
+  /// zero it parks at once.
+  static WINDOW: Cell<SpinWindow> = const { Cell::new(SpinWindow::new(0)) };
+}
+
+/// How a wait for a reply ended, for the tests that the fast path is taken and that only a park teaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Waited {
   /// The reply came within the window.
   Spun,
-  /// The window passed, and the thread parked.
-  Parked,
+  /// The window passed, and the thread parked at this instant.
+  Parked(Instant),
 }
 
-/// Measures this machine's one-way wake through a bounded channel and adopts it as this thread's window. A thread the OS
-/// refuses is a refused mount, as the receive thread's own would be.
-pub(crate) fn measure() -> Result<(), WinFspError> {
-  let window = one_way_wake()?;
-  slates_machine::log_line!(
-    "slates-winfsp: reply spin window = {} ns: the median one-way channel wake of {SAMPLES} (the 2-competitive spin)",
-    window.as_nanos()
-  );
-  WINDOW.set(window);
-  Ok(())
+/// Starts this thread's learning: a window of zero until its wakes agree, never longer than `ceiling`, the most the
+/// machine allows a spin (the step quantum of the shard that started the mount; zero off any shard).
+pub(crate) fn start(ceiling: Duration) {
+  WINDOW.set(SpinWindow::new(
+    u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX),
+  ));
 }
 
-/// The median time from a send to a parked thread having it.
-fn one_way_wake() -> Result<Duration, WinFspError> {
-  let (sends, arrivals) = sync_channel::<Instant>(SAMPLES);
-  std::thread::scope(|scope| {
-    let woken = std::thread::Builder::new()
-      .name("slates-winfsp-wake-probe".to_owned())
-      .spawn_scoped(scope, move || {
-        let mut wakes = Vec::with_capacity(SAMPLES);
-        while let Ok(sent) = arrivals.recv() {
-          wakes.push(sent.elapsed());
-        }
-        wakes
-      })
-      .map_err(|_| WinFspError::MountThread)?;
-    for _ in 0..SAMPLES {
-      let paused = Instant::now();
-      while paused.elapsed() < PARK_PAUSE {
-        std::hint::spin_loop();
-      }
-      sends
-        .send(Instant::now())
-        .map_err(|_| WinFspError::MountThread)?;
-    }
-    drop(sends);
-    let mut wakes = woken.join().map_err(|_| WinFspError::MountThread)?;
-    wakes.sort_unstable();
-    wakes
-      .get(wakes.len() / 2)
-      .copied()
-      .ok_or(WinFspError::MountThread)
-  })
-}
-
-/// Waits for the reply on `answer`, spinning for this thread's window and then parking. A closed channel is the same
-/// error from either.
-pub(crate) fn await_reply<T>(answer: &Receiver<T>) -> Result<T, RecvError> {
-  wait_within(answer, WINDOW.get()).0
+/// Waits for the reply on `answer`, spinning for this thread's window and then parking. A reply the thread parked for
+/// and that was sent after it parked is one of its wakes, folded into its window. A closed channel is the same error
+/// from either.
+pub(crate) fn await_reply<T>(answer: &Receiver<Stamped<T>>) -> Result<T, RecvError> {
+  let mut window = WINDOW.get();
+  let (stamped, waited) = wait_within(answer, Duration::from_nanos(window.window_ns()));
+  let stamped = stamped?;
+  if let Waited::Parked(parked_at) = waited
+    && stamped.sent >= parked_at
+  {
+    window.record(u64::try_from(stamped.sent.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    WINDOW.set(window);
+  }
+  Ok(stamped.reply)
 }
 
 fn wait_within<T>(answer: &Receiver<T>, window: Duration) -> (Result<T, RecvError>, Waited) {
@@ -95,16 +83,23 @@ fn wait_within<T>(answer: &Receiver<T>, window: Duration) -> (Result<T, RecvErro
       Err(TryRecvError::Empty) => std::hint::spin_loop(),
     }
   }
-  (answer.recv(), Waited::Parked)
+  let parked_at = Instant::now();
+  (answer.recv(), Waited::Parked(parked_at))
 }
 
 #[cfg(test)]
 mod tests {
   #![allow(clippy::unwrap_used, clippy::expect_used)]
+  use std::sync::mpsc::sync_channel;
+
   use super::*;
 
   /// Shape: a window no reply in these tests outlasts; a stuck test fails within it rather than passing by parking.
   const LONG: Duration = Duration::from_secs(10);
+  /// Shape: how long a replier waits after the receiver said it is waiting, so the receiver has parked by the send.
+  const PAUSE: Duration = Duration::from_millis(1);
+  /// Shape: the replies a learning thread parks for in the test.
+  const PARKED_REPLIES: u32 = 4;
 
   /// A-212. Do: send a reply from another thread while waiting with a long window. Expect: it is delivered without
   /// parking, so the fast path is taken and not merely present.
@@ -133,7 +128,7 @@ mod tests {
       waiting.send(()).unwrap();
       let (got, waited) = wait_within(&answer, Duration::ZERO);
       assert_eq!(got, Ok(7));
-      assert_eq!(waited, Waited::Parked);
+      assert!(matches!(waited, Waited::Parked(_)), "{waited:?}");
     });
   }
 
@@ -148,21 +143,44 @@ mod tests {
     }
   }
 
-  /// A-212. Do: measure, then wait on a thread that measured and one that did not. Expect: a positive wake within reason
-  /// is adopted only by the thread that measured it, so no other thread starts spinning.
+  /// A-560. Do: on a thread that started learning, take a reply already waiting, then park for replies sent after the
+  /// wait began; on another thread that never started, check its window. Expect: the waiting reply teaches nothing,
+  /// each parked-for reply is one wake folded in, and the other thread has learned nothing and spins never.
   #[test]
-  fn only_the_thread_that_measured_spins() {
+  fn a_thread_learns_its_window_only_from_the_replies_it_parked_for() {
     std::thread::scope(|scope| {
       scope
         .spawn(|| {
-          measure().unwrap();
-          let window = WINDOW.get();
-          assert!(!window.is_zero());
-          assert!(window < LONG, "{window:?}");
+          start(LONG);
+          let (reply, answer) = sync_channel(1);
+          reply.send(Stamped::now(7u32)).unwrap();
+          assert_eq!(await_reply(&answer), Ok(7));
+          assert_eq!(
+            WINDOW.get().samples(),
+            0,
+            "a reply already there is no wake"
+          );
+          for _ in 0..PARKED_REPLIES {
+            let (reply, answer) = sync_channel(1);
+            let (waiting, is_waiting) = sync_channel::<()>(1);
+            std::thread::scope(|inner| {
+              inner.spawn(move || {
+                is_waiting.recv().unwrap();
+                // The harness paces its replier, the stand-in for a slow reply; the code under test parks on its event.
+                #[allow(clippy::disallowed_methods)]
+                std::thread::sleep(PAUSE);
+                reply.send(Stamped::now(7u32)).unwrap();
+              });
+              waiting.send(()).unwrap();
+              assert_eq!(await_reply(&answer), Ok(7));
+            });
+          }
+          assert!(WINDOW.get().samples() > 0, "{:?}", WINDOW.get());
         })
         .join()
         .unwrap();
     });
-    assert_eq!(WINDOW.get(), Duration::ZERO);
+    assert_eq!(WINDOW.get().samples(), 0);
+    assert_eq!(WINDOW.get().window_ns(), 0);
   }
 }

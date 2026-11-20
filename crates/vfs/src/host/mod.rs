@@ -9,6 +9,9 @@
 //! lint wall refuses write-capable syscalls (R1).
 
 pub mod sim;
+/// A volume symlink as a Windows symbolic link (A-275): the reparse buffer the WinFsp drive shows and a Windows landing
+/// writes (A-438).
+pub mod windows_link;
 
 use crate::inode::Fingerprint;
 
@@ -78,7 +81,58 @@ pub enum WatchState {
   Unavailable,
 }
 
-/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy.
+/// The host's name of one fetch under way (an S3 base's, §4.15 "An S3 base", A-555): a directory's listing, every page of
+/// it, or a run of a file's chunks. Every call that misses on what the fetch brings is answered
+/// [`HostError::Pending`] under this one name, however many calls miss on it, and the fetch's landing settles it once, so a
+/// caller parks each request on the fetch it met and runs it again when that fetch lands. A name is the host's own: it
+/// means nothing to another host, and a host never names two fetches alike while either is under way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FetchId(pub u64);
+
+/// An operating system's number for a refusal, typed by the numbering it is in (A-527, A-539): an errno (Linux, macOS)
+/// or a Win32 error code (Windows). The two number their codes on their own, so a number is read only with its kind:
+/// 17 is `EEXIST` as an errno and `ERROR_NOT_SAME_DEVICE` as a Win32 code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsCode {
+  /// An errno.
+  Errno(i32),
+  /// A Win32 error code.
+  Win32(u32),
+}
+
+impl OsCode {
+  /// A number in this platform's own numbering, typed as its kind: an errno here.
+  #[cfg(not(windows))]
+  pub fn native(number: i32) -> Self {
+    Self::Errno(number)
+  }
+
+  /// A number in this platform's own numbering, typed as its kind: a Win32 error code here (a negative number names
+  /// none, read as zero).
+  #[cfg(windows)]
+  pub fn native(number: i32) -> Self {
+    Self::Win32(u32::try_from(number).unwrap_or(0))
+  }
+
+  /// An I/O error's OS number, in this platform's numbering (zero where it named none).
+  pub fn of_io(error: &std::io::Error) -> Self {
+    Self::native(error.raw_os_error().unwrap_or(0))
+  }
+}
+
+impl std::fmt::Display for OsCode {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Errno(errno) => write!(f, "errno {errno}"),
+      Self::Win32(code) => write!(f, "Win32 error {code}"),
+    }
+  }
+}
+
+/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. The kinds the landing tells apart
+/// are named here (A-539): a name that exists, no room, a verb the filesystem lacks; each writer reads its platform's
+/// numbers into them, so no reader compares a number across platforms. Every refusal the host gives a number carries it
+/// typed by its numbering ([`OsCode`], A-527).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostError {
   /// The entry does not exist (any more).
@@ -89,12 +143,30 @@ pub enum HostError {
   NotFile,
   /// A handle the host no longer holds.
   StaleHandle,
-  /// The host cannot serve it: the errno.
-  Unavailable(i32),
+  /// The name exists (`EEXIST`; Windows' `ERROR_FILE_EXISTS`, `ERROR_ALREADY_EXISTS`), by the code the host named it
+  /// with (A-539).
+  Exists(OsCode),
+  /// No room: the filesystem is full or its owner's quota spent (`ENOSPC`, `EDQUOT`; Windows' `ERROR_DISK_FULL`,
+  /// `ERROR_HANDLE_DISK_FULL`), by the code the host named it with (A-539).
+  NoSpace(OsCode),
+  /// The verb does not exist on this filesystem: an exchange or a clone it lacks (`EOPNOTSUPP`, `ENOTSUP`, a rename
+  /// flag's `EINVAL`; Windows' own), by the code the host named it with (A-539).
+  Unsupported(OsCode),
+  /// Anything else the host cannot serve, by the code it named, typed by its numbering (A-527, A-539).
+  Unavailable(OsCode),
+  /// The verb needs a privilege this process does not hold, and slates asks for none (R10): a symbolic link on a Windows
+  /// account whose token lacks `SeCreateSymbolicLinkPrivilege` (`ERROR_PRIVILEGE_NOT_HELD`), by the code the host named
+  /// it with (A-568).
+  Unprivileged(OsCode),
   /// The path lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon serves;
-  /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
-  /// deadlock avoided by.
-  OwnMount(i32),
+  /// A-227): nothing was opened, since the daemon would have waited on its own answer. The code the platform names a
+  /// deadlock avoided by, typed by its numbering (A-539): `EDEADLK`, or Windows' `ERROR_POSSIBLE_DEADLOCK`, a Win32 code
+  /// that before A-539 rode in an errno's place.
+  OwnMount(OsCode),
+  /// The host is fetching what the call needs and has not got it yet (an S3 base's miss, §4.15 "An S3 base", A-524):
+  /// nothing changed, and the same call is answered once the fetch lands. It names that fetch (A-555), so the caller
+  /// parks the request on it and runs it again when it lands; a host that reads a local disk never answers it.
+  Pending(FetchId),
 }
 
 impl std::fmt::Display for HostError {
@@ -104,13 +176,38 @@ impl std::fmt::Display for HostError {
       Self::NotDirectory => f.write_str("not a directory"),
       Self::NotFile => f.write_str("not a regular file"),
       Self::StaleHandle => f.write_str("stale host handle"),
-      Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
-      Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
+      Self::Exists(code) => write!(f, "the name exists ({code})"),
+      Self::NoSpace(code) => write!(f, "no room ({code})"),
+      Self::Unsupported(code) => write!(f, "not supported here ({code})"),
+      Self::Unavailable(code) => write!(f, "host unavailable ({code})"),
+      Self::Unprivileged(code) => write!(f, "a privilege this process does not hold ({code})"),
+      Self::OwnMount(code) => write!(f, "on a mount this daemon serves ({code})"),
+      Self::Pending(FetchId(fetch)) => write!(f, "the host's fetch {fetch} is pending"),
     }
   }
 }
 
 impl std::error::Error for HostError {}
+
+impl HostError {
+  /// The code a refusal names, typed by its numbering (A-539): every kind but the typed ones the host names no number
+  /// for (not found, not a directory, not a file, a stale handle) and a fetch under way (A-524).
+  pub fn code(&self) -> Option<OsCode> {
+    match self {
+      Self::Exists(code)
+      | Self::NoSpace(code)
+      | Self::Unsupported(code)
+      | Self::Unavailable(code)
+      | Self::Unprivileged(code)
+      | Self::OwnMount(code) => Some(*code),
+      Self::NotFound
+      | Self::NotDirectory
+      | Self::NotFile
+      | Self::StaleHandle
+      | Self::Pending(_) => None,
+    }
+  }
+}
 
 /// The seam. Every call is relative to a handle the host handed out, never to a path string,
 /// so a rename of the base directory by the user changes nothing (§4.4).
@@ -153,7 +250,8 @@ pub trait HostFs {
 pub struct LandCapabilities {
   /// An atomic exchange of two names exists (`RENAME_EXCHANGE`, `RENAME_SWAP`).
   pub exchange: bool,
-  /// Reflinks exist (`FICLONE`, `clonefile`).
+  /// Reflinks exist (`FICLONE`, `clonefile`, ReFS block cloning: A-445): [`LandFs::clone_temp`] shares an
+  /// earlier temporary's bytes instead of copying them.
   pub reflink: bool,
   /// Unnamed temporaries exist (`O_TMPFILE`); otherwise a hidden sibling name is used.
   pub unnamed_temporaries: bool,
@@ -180,17 +278,34 @@ pub trait LandFs: HostFs {
   /// A new, empty, writable file under `dir`: unnamed where the filesystem allows, else at the
   /// hidden sibling `name`; it becomes visible only through [`LandFs::place`].
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
+  /// A new temporary at the hidden sibling `name` under `dir` (named, as `create_temp` names one where the filesystem
+  /// has no unnamed ones) holding the first `len` bytes of `from`, an earlier temporary of the same landing whose bytes
+  /// are all written, shared with it rather than copied (§4.15 step 6, A-445): ReFS block cloning on Windows (Linux
+  /// `FICLONE` and macOS `clonefile` are owed). Asked only where [`LandCapabilities::reflink`] says the filesystem has
+  /// it; refused `EOPNOTSUPP` (`ENOTSUP` on macOS) where this pair cannot be shared (another volume, the volume's
+  /// limit on a cluster's sharers, a file attribute the two do not share), with nothing left behind, so the engine
+  /// writes the bytes as it would have.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    from: HostFile,
+    len: u64,
+  ) -> Result<HostFile, HostError>;
   /// Writes at an offset (the whole buffer, or a refusal).
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError>;
   /// The file is final — its bytes, mode and mtime written (§4.15 step 8, A-130) — and joins its batch: its writeback
   /// started where that never waits on the device (Linux `sync_file_range`), nothing more elsewhere. Never durability:
   /// the batch's barrier makes the file durable, off the shard (A-132). A change to the file after it needs another.
   fn write_out(&mut self, file: HostFile) -> Result<(), HostError>;
-  /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change,
-  /// taken to run elsewhere ([`Barrier::run`]): once it has run, every one is durable ahead of any write that follows,
-  /// so a placement after it never shows a name whose bytes a power loss could take (Linux the files' `fdatasync`s on
-  /// ⌈√n⌉ streams, merged by journal group commit; macOS each file's `fsync` and then one `F_BARRIERFSYNC` per device
-  /// among them; elsewhere every file's `fdatasync`). The outcome comes back through
+  /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change, and
+  /// of files whose metadata a landing's metadata entry set in place ([`LandFs::open_to_chmod`], A-472), each synced
+  /// whole (Linux `fsync`, since `fdatasync` need not write a mode; macOS `fsync`, which moves "all modified data and
+  /// attributes"; Windows `FlushFileBuffers`), taken to run elsewhere ([`Barrier::run`]): once it has run, every one is
+  /// durable ahead of any write that follows, so a placement after it never shows a name whose bytes a power loss could
+  /// take, and a metadata entry is reported only once its file is synced (Linux the temporaries' `fdatasync`s on ⌈√n⌉
+  /// streams, merged by journal group commit; macOS each file's `fsync` and then one `F_BARRIERFSYNC` per device among
+  /// them; elsewhere every temporary's `fdatasync`). The outcome comes back through
   /// [`LandFs::end_barrier`]; nothing of the batch may be placed before.
   fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError>;
   /// The outcome of the barrier [`LandFs::begin_barrier`] took for `files`, after it ran: the files are durable when it
@@ -200,8 +315,25 @@ pub trait LandFs: HostFs {
     files: &[HostFile],
     ran: Result<(), HostError>,
   ) -> Result<(), HostError>;
+  /// The existing file `name` under `dir`, opened so its mode and Windows bits can be set and nothing else (a landing's
+  /// metadata entry, A-458): never through a link, and refused `NotFile` for anything but a regular file. Unix opens it
+  /// to read, since `fchmod` asks for ownership, not write access; Windows asks its attributes and `FILE_WRITE_DATA`,
+  /// which its flush needs (A-472), and writes none of its data. It stays open for its batch's barrier
+  /// ([`LandFs::begin_barrier`]), then is closed with [`HostFs::close_file`].
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
+  /// The existing directory `name` under `dir`, opened as [`LandFs::open_to_chmod`] opens a file, to have its mode and
+  /// Windows bits set and its batch's barrier sync it whole (a base directory's metadata entry, A-501): never through a
+  /// link, and refused `NotDirectory` for anything but a directory. Unix opens it to read (`O_DIRECTORY|O_NOFOLLOW`), as a
+  /// listing does; Windows asks its attributes and `FILE_ADD_FILE`, a directory's `FILE_WRITE_DATA`, which its flush
+  /// needs. A file handle, closed with [`HostFs::close_file`]: `set_mode`, `set_windows`, `fstat` and the barrier take it
+  /// as they take a file's.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
+  /// Gives the file the Windows attribute bits the volume keeps for it (A-262, at Windows' values: hidden, system,
+  /// archive, offline, not indexed), where the filesystem holds them (A-451: Windows); its read-only state stays its
+  /// mode's ([`LandFs::set_mode`]). Linux and macOS hold none and keep the file as it is.
+  fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError>;
   /// Sets the file's modification time in nanoseconds.
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError>;
   /// Gives the temporary the name `name` under `dir`, refused `EEXIST` when the name exists, so that it holds that
@@ -228,12 +360,26 @@ pub trait LandFs: HostFs {
   fn entry_fingerprint(&mut self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError>;
   /// Removes a file or symlink.
   fn unlink(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
-  /// Creates a directory.
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError>;
+  /// Creates a directory, with the Windows attribute bits the volume keeps for it where the filesystem holds them
+  /// (A-451; a directory's read-only among them, which Windows gives no permission).
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, windows: u16) -> Result<(), HostError>;
   /// Removes an empty directory.
   fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
-  /// Creates a symlink.
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError>;
+  /// Creates the symlink `name` under `dir` to `target`, refused `EEXIST` when the name exists, so that `name` is never
+  /// seen holding anything but the whole link. A writer that makes a link in one step (`symlinkat`) makes it at `name`
+  /// and ignores `staged`; one that needs two (Windows: the empty object, then its reparse buffer, A-438) makes it at
+  /// `staged`, a hidden name the landing owns, and moves it to `name` without replacing, so a crash between the steps
+  /// leaves only a hidden sibling the landing's sweep removes. `windows` is the bits the volume keeps for the link
+  /// (A-451): on Windows its directory kind (`FILE_ATTRIBUTE_DIRECTORY`, A-275) makes it a directory link, and the other
+  /// bits are its attributes; Linux and macOS links have no kind and hold no bits.
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    staged: &str,
+    windows: u16,
+  ) -> Result<(), HostError>;
   /// Makes the directory's entries durable (`fsync` on its descriptor).
   fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError>;
   /// One media barrier on the target after the entries' data syncs (§4.15 step 8: macOS

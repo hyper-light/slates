@@ -26,6 +26,16 @@
 //! A device presents what its [`GuestView`] names (AUD-29-76): the head, one directory of it (served through
 //! `ScopedBridge`, so nothing outside is reached), or a snapshot read-only (its own view, admitted with no
 //! write, closed with the device).
+//!
+//! A device is a guest kernel's route (A-290): its guest reads and writes its own attribute namespaces, `trusted.` and
+//! `security.`, besides `user.`, kept in the volume as its data and shown to no host's mount.
+//!
+//! A write the guest is told succeeded outlives the daemon (A-358's rule, A-410): the bridge hands each `WRITE` to the
+//! shard's write log in the anchor's content object before the used element is published, as a FUSE mount and a Shards
+//! stream do (A-63, A-316), and a successor replays it. A write the log cannot keep (no room, a span the object
+//! refused) makes the bridge owe a publication, so the device holds the reply for the owner's barrier, which answers
+//! `EIO` if it does not capture the volume. Before A-410 a plain `WRITE` was answered with neither, so a write
+//! acknowledged after the last publication was lost at a daemon's death even where the volume outlived it.
 
 use std::future::Future;
 
@@ -171,8 +181,21 @@ impl BridgeAccess for ShardBridge {
         volumes,
         attachments,
         snapshot_views,
+        write_log,
+        content,
         ..
       } = s;
+      // Each write the guest is told succeeded is kept in the shard's write log before its used element is published,
+      // as a FUSE mount's and a Shards stream's are (A-63, A-410): a log with no room for it, or a span the content
+      // object refused, leaves it to the publication the device then runs before the reply (A-358's rule). Without a
+      // log (no anchor's content object) nothing outlives the daemon, and nothing is owed.
+      let mut log_write =
+        |inode: u64, offset: u64, bytes: &[u8]| match (write_log.as_mut(), content.as_mut()) {
+          (Some(log), Some(object)) => log
+            .append(object, (volume.bytes, inode), offset, bytes)
+            .is_ok(),
+          _ => true,
+        };
       // A snapshot device serves its read-only view (moved by `advance`); every other device, the head.
       let bridge = if presents_snapshot {
         let view = snapshot_views.get_mut(&attachment)?;
@@ -190,7 +213,11 @@ impl BridgeAccess for ShardBridge {
             .map(|host| host as &mut dyn slates_vfs::host::HostFs),
         )
       };
-      let mut bridge = bridge.offering_dax(offer);
+      // A guest's kernel: it keeps its own attribute namespaces on its files (A-290).
+      let mut bridge = bridge
+        .offering_dax(offer)
+        .serving_a_guest()
+        .logging_writes(&mut log_write);
       let mut scoped;
       let served: &mut dyn Bridge = match scope {
         Some(scope) => {
@@ -273,9 +300,10 @@ impl BridgeAccess for ShardBridge {
     crate::told::parked(self.volume, seq)
   }
 
-  /// Every writer's bound (`crate::told::TOLD_WAIT_NS`, A-191).
+  /// Every writer's bound, learned on the owner shard (`crate::told::bound_ns`, A-191, A-431); out of reach, the bound
+  /// with nothing learned, a liveness window.
   fn told_bound_ns(&mut self) -> u64 {
-    crate::told::TOLD_WAIT_NS
+    state::with_state(|s| crate::told::bound_ns(s)).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS)
   }
 
   /// On the writers' ledger (`fuse.told_waits`, `fuse.told_overdue`).
@@ -308,9 +336,33 @@ impl BridgeAccess for ShardBridge {
     crate::live_ship::DurableWait::new(self.volume, target)
   }
 
-  /// Every transport's bound on a durability claim (`crate::live_ship::durable_wait_ns`: the liveness budget).
-  fn durable_bound_ns(&mut self) -> u64 {
-    crate::live_ship::durable_wait_ns()
+  /// Every transport's rule for a durability claim (`crate::live_ship::begin_durable_bound`): windows of the liveness
+  /// budget, a silent one given up once an ask of the owner's has gone a window unanswered and the control shard has
+  /// read what came, at most the failover SLO from the hold.
+  fn durable_bound(&mut self, now_ns: u64) -> slates_bridge_core::durable_bound::DurableBound {
+    let volume = self.volume;
+    state::with_state(|s| crate::live_ship::begin_durable_bound(s, volume, now_ns)).unwrap_or_else(
+      || {
+        // The shard's state out of reach (its shutdown): one window, with nothing to hear, ending at its total bound.
+        let window_ns = crate::live_ship::durable_wait_ns();
+        slates_bridge_core::durable_bound::DurableBound::begin(
+          slates_bridge_core::durable_bound::Heard::default(),
+          now_ns,
+          slates_bridge_core::durable_bound::Spans {
+            window_ns,
+            total_ns: window_ns,
+            look_ns: window_ns,
+          },
+        )
+      },
+    )
+  }
+
+  /// What a held reply's wait is judged against now (`crate::live_ship::heard_now`): the volume's acknowledgements, the
+  /// control shard's idles and the owner's oldest unanswered ask.
+  fn durable_heard(&mut self) -> slates_bridge_core::durable_bound::Heard {
+    let volume = self.volume;
+    state::with_state(|s| crate::live_ship::heard_now(s, volume)).unwrap_or_default()
   }
 
   /// On the device's ledger (`virtiofs.live_fsync_waited`, `virtiofs.live_fsync_refused`).
@@ -513,6 +565,7 @@ fn guest_record(
     },
     // A guest presents no mount capability: the zero token is refused by every edge that checks one.
     token: [0; 16],
+    mount: None,
   }
 }
 
@@ -717,6 +770,9 @@ fn attach_handed(
     crate::shards::Handoff {
       attachment,
       stream: end,
+      // A vhost-user device's socket has no resync channel: its front end reconnects to a new back end itself.
+      #[cfg(target_os = "linux")]
+      resync: None,
     },
   );
   capability.read_write = if writable {

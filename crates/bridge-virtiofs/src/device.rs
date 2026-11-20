@@ -37,6 +37,7 @@
 //! cannot catch — shorter than the FUSE header, or a request-queue chain with no room for a reply
 //! header — faults the device (the VMM resets it), the same policy as a malformed chain.
 
+use slates_bridge_core::durable_bound::{DurableBound, Heard};
 use std::fmt;
 
 use slates_bridge_core::{Bridge, OpContext};
@@ -305,8 +306,9 @@ struct DurableHeld {
   owes: Option<u64>,
   /// The log position it waits to be durable at.
   target: u64,
-  /// When [`Device::settle_durable`] first saw it, the start of its bound; `None` until then.
-  since_ns: Option<u64>,
+  /// Its wait, in windows, begun when [`Device::settle_durable`] first saw it; `None` until then
+  /// (`slates_bridge_core::durable_bound`, the rule every transport's held durable reply is judged by).
+  bound: Option<DurableBound>,
 }
 
 /// The oldest `FSYNC` reply held for durability ([`Device::durable_oldest`]): what the device loop waits on.
@@ -314,8 +316,9 @@ struct DurableHeld {
 pub struct DurableOldest {
   /// The log position it waits to be durable at.
   pub target: u64,
-  /// When its bound began; `None` before the first [`Device::settle_durable`] saw it.
-  pub since_ns: Option<u64>,
+  /// When its wait is next judged (its open window's end, a look confirming a silence, or its total bound); `None`
+  /// before the first [`Device::settle_durable`] saw it.
+  pub next_look_ns: Option<u64>,
 }
 
 /// What one [`Device::settle_durable`] did.
@@ -326,7 +329,7 @@ pub struct DurableSettled {
   pub completed: Vec<Completed>,
   /// Replies released once their volume was durable, having waited at least one settle for it.
   pub waited: u64,
-  /// Replies answered `EIO`: not durable within the bound, or never to be.
+  /// Replies answered `EIO`: not durable within their bound, or never to be.
   pub refused: u64,
 }
 
@@ -368,6 +371,17 @@ enum DaxServed {
     /// Whether the window is mapped once the fill is done.
     sends: bool,
   },
+}
+
+/// What the device's `dispatch` did with a chain's request: wrote a reply of this many bytes, or (Unix) took a
+/// SETUPMAPPING and holds the chain while its window's backing is filled and its pieces mapped. The held case exists
+/// only where maps do, so no other platform names a variant it lacks (0754e4853 named `DaxMapHeld` on Windows).
+enum Dispatched {
+  /// A reply of this many bytes was written.
+  Written(usize),
+  /// A SETUPMAPPING is held for its window's fill and map (§4.6).
+  #[cfg(unix)]
+  MapHeld,
 }
 
 /// What `serve_chain` did: a reply of this many bytes was scattered, or the chain is held unanswered.
@@ -561,6 +575,10 @@ pub struct Device {
   /// never applied over another path's newer write (`slates_bridge_fuse::guest_writeback`).
   writeback: slates_bridge_fuse::guest_writeback::GuestWriteback,
   negotiated: Option<InitNegotiation>,
+  /// Whether the `INIT` reply this device sent kept `FUSE_SETXATTR_EXT` (A-378): its guest's kernel then sends the
+  /// extended `fuse_setxattr_in`, which the bridge must parse. Read from the reply the shared dispatch wrote, the
+  /// connection's truth; [`Device::negotiated`] is a host's negotiation of the same request and keeps no guest flag.
+  setxattr_ext: bool,
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
   counters: DeviceCounters,
@@ -606,6 +624,7 @@ impl Device {
       reply: Vec::new(),
       writeback: slates_bridge_fuse::guest_writeback::GuestWriteback::new(),
       negotiated: None,
+      setxattr_ext: false,
       fault: None,
       awaiting: None,
       counters: DeviceCounters::default(),
@@ -855,6 +874,7 @@ impl Device {
     }
     self.queues = queues;
     self.negotiated = None;
+    self.setxattr_ext = false;
     self.fault = None;
     Ok(())
   }
@@ -862,6 +882,12 @@ impl Device {
   /// The FUSE connection the guest negotiated, once `FUSE_INIT` has been served.
   pub fn negotiated(&self) -> Option<InitNegotiation> {
     self.negotiated
+  }
+
+  /// Whether the guest's kernel sends the extended `fuse_setxattr_in` (A-378): its `INIT` reply kept
+  /// `FUSE_SETXATTR_EXT`.
+  pub fn setxattr_ext(&self) -> bool {
+    self.setxattr_ext
   }
 
   /// The fault that stopped the device, if one has.
@@ -1145,7 +1171,7 @@ impl Device {
         unique: held.unique,
         owes: held.owes,
         target,
-        since_ns: None,
+        bound: None,
       });
       return Ok(None);
     }
@@ -1327,6 +1353,109 @@ impl Device {
     self.queues.get_mut(index).ok_or(DeviceError::NotConfigured)
   }
 
+  /// Dispatches a chain's gathered request: the bytes written into its reply, or none when a SETUPMAPPING was taken and
+  /// the chain is held while its window's backing is filled and its pieces mapped (no reply is scattered now; the turn,
+  /// and the message placer's acks, answer the guest). On Unix, FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING go through the
+  /// DAX placer when the VMM offered one (§4.6); every other opcode, and these when no window is offered, are answered
+  /// by the FUSE codec's dispatch.
+  fn dispatch(
+    &mut self,
+    queue: u16,
+    chain: &DescriptorChain,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+  ) -> Dispatched {
+    #[cfg(unix)]
+    {
+      match serve_dax(
+        &self.request,
+        bridge,
+        cx,
+        &mut self.dax_placer,
+        &mut self.backed,
+        &mut self.reply,
+      ) {
+        DaxServed::NotHandled => Dispatched::Written(self.writeback.serve(
+          &self.request,
+          bridge,
+          cx,
+          &mut self.reply,
+        )),
+        DaxServed::Replied(n) => Dispatched::Written(n),
+        DaxServed::MapHeld {
+          unique,
+          window,
+          sends,
+        } => {
+          self.backed.map = Some(crate::backed::HeldMap {
+            queue,
+            chain: chain.clone(),
+            unique,
+            window,
+            sends,
+            sent: false,
+            pieces_left: 0,
+            mapped: Vec::new(),
+            refused: false,
+          });
+          Dispatched::MapHeld
+        }
+      }
+    }
+    #[cfg(not(unix))]
+    {
+      // Only a held map names its queue and chain, and maps are Unix's (§4.6).
+      let _held_on = (queue, chain);
+      Dispatched::Written(
+        self
+          .writeback
+          .serve(&self.request, bridge, cx, &mut self.reply),
+      )
+    }
+  }
+
+  /// A write-back the volume refused before this request, answered where its asker reads an answer, so a guest's fsync
+  /// or close fails rather than claim its stores durable (A-163's rule): the error reply's length for an FSYNC, a FLUSH
+  /// or a READ, and none for any other request (a RELEASE's answer the kernel ignores, and a FORGET has none).
+  #[cfg(unix)]
+  fn refused_write_back_answer(
+    &mut self,
+    ingested: Option<&Ingested>,
+    opcode: Option<Opcode>,
+    header: Option<&InHeader>,
+  ) -> Option<usize> {
+    let errno = ingested?.refused?;
+    if !matches!(opcode, Some(Opcode::FSync | Opcode::Flush | Opcode::Read)) {
+      return None;
+    }
+    let unique = header?.unique;
+    Some(ReplyHeader::write_error(unique, errno, &mut self.reply).unwrap_or(0))
+  }
+
+  /// Holds, unserved, a chain whose request asks for the guest's stores through its maps to reach the volume first,
+  /// while they are written back ([`crate::backed`]): whether it was held. A chain already through its ingest (`fresh`
+  /// false) is served, with how the ingest came out.
+  #[cfg(unix)]
+  fn held_for_ingest(
+    &mut self,
+    queue: u16,
+    chain: &DescriptorChain,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    fresh: bool,
+  ) -> bool {
+    if !(fresh && self.hold_for_ingest(bridge, queue)) {
+      return false;
+    }
+    self.backed.request = Some(crate::backed::HeldRequest {
+      queue,
+      chain: chain.clone(),
+      mark: self.journal_mark(bridge, cx),
+    });
+    self.backed.counts.ingests_held = self.backed.counts.ingests_held.saturating_add(1);
+    true
+  }
+
   /// Serves one chain: the FUSE request is gathered, dispatched and its reply scattered; returns
   /// the bytes written into the chain's writable buffers (the used element's length). With a DAX placer, a request that
   /// asks for the guest's stores first is held unless `ingested` says how their ingest came out.
@@ -1339,23 +1468,8 @@ impl Device {
     cx: &OpContext,
     #[cfg(unix)] ingested: Option<Ingested>,
   ) -> Result<ChainOutcome, DeviceError> {
+    chain_has_room(queue, chain)?;
     let hiprio = queue == HIPRIO_QUEUE;
-    let header_len = u64::try_from(IN_HEADER_LEN).unwrap_or(u64::MAX);
-    if chain.readable_bytes < header_len {
-      return Err(DeviceError::RequestTooShort {
-        queue,
-        readable: chain.readable_bytes,
-        need: header_len,
-      });
-    }
-    let reply_header_len = u64::try_from(OUT_HEADER_LEN).unwrap_or(u64::MAX);
-    if !hiprio && chain.writable_bytes < reply_header_len {
-      return Err(DeviceError::ReplyBufferTooSmall {
-        queue,
-        writable: chain.writable_bytes,
-        need: reply_header_len,
-      });
-    }
     gather(
       memory,
       &chain.readable,
@@ -1373,16 +1487,13 @@ impl Device {
     // A request that asks for the guest's stores through its maps to reach the volume first is held, unserved, while
     // they are written back ([`crate::backed`]); the turn serves it when the ingest is done, with how it came out.
     #[cfg(unix)]
-    if ingested.is_none() && self.hold_for_ingest(bridge, queue) {
-      self.backed.request = Some(crate::backed::HeldRequest {
-        queue,
-        chain: chain.clone(),
-        mark: self.journal_mark(bridge, cx),
-      });
-      self.backed.counts.ingests_held = self.backed.counts.ingests_held.saturating_add(1);
+    if self.held_for_ingest(queue, chain, bridge, cx, ingested.is_none()) {
       return Ok(ChainOutcome::IngestHeld);
     }
     self.observe(header.as_ref());
+    // The bridge parses `SETXATTR` in the form the guest's last `INIT` reply kept (A-378), told before every chain, since
+    // one pass can serve the `INIT` and a request after it.
+    bridge.set_setxattr_ext(self.setxattr_ext);
     // The guest unmounting (FUSE_DESTROY) with live DAX windows: each is unmapped and its backing let go, the guest's
     // stores through its maps ingested while the unmount was held (§4.6 terminal teardown).
     #[cfg(unix)]
@@ -1398,63 +1509,20 @@ impl Device {
     let mut written = if room_short {
       0
     } else {
-      // On Unix, FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING go through the DAX placer when the VMM offered one (§4.6);
-      // every other opcode — and these when no window is offered — are answered by the FUSE codec's dispatch.
-      #[cfg(unix)]
-      {
-        match serve_dax(
-          &self.request,
-          bridge,
-          cx,
-          &mut self.dax_placer,
-          &mut self.backed,
-          &mut self.reply,
-        ) {
-          DaxServed::NotHandled => self
-            .writeback
-            .serve(&self.request, bridge, cx, &mut self.reply),
-          DaxServed::Replied(n) => n,
-          // A SETUPMAPPING was taken: hold the chain while its window's backing is filled and its pieces mapped. No
-          // reply is scattered now; the turn (and the message placer's acks) answer the guest.
-          DaxServed::MapHeld {
-            unique,
-            window,
-            sends,
-          } => {
-            self.backed.map = Some(crate::backed::HeldMap {
-              queue,
-              chain: chain.clone(),
-              unique,
-              window,
-              sends,
-              sent: false,
-              pieces_left: 0,
-              mapped: Vec::new(),
-              refused: false,
-            });
-            return Ok(ChainOutcome::DaxMapHeld);
-          }
-        }
-      }
-      #[cfg(not(unix))]
-      {
-        self
-          .writeback
-          .serve(&self.request, bridge, cx, &mut self.reply)
+      match self.dispatch(queue, chain, bridge, cx) {
+        Dispatched::Written(written) => written,
+        #[cfg(unix)]
+        Dispatched::MapHeld => return Ok(ChainOutcome::DaxMapHeld),
       }
     };
     // A write-back the volume refused before this request is answered where its asker reads an answer, so a guest's
     // fsync or close fails rather than claim its stores durable (A-163's rule; a RELEASE's answer the kernel ignores,
     // and a FORGET has none).
     #[cfg(unix)]
-    if let Some(Ingested {
-      refused: Some(errno),
-      ..
-    }) = ingested
-      && matches!(opcode, Some(Opcode::FSync | Opcode::Flush | Opcode::Read))
-      && let Some(h) = header.as_ref()
+    if let Some(answered) =
+      self.refused_write_back_answer(ingested.as_ref(), opcode, header.as_ref())
     {
-      written = ReplyHeader::write_error(h.unique, errno, &mut self.reply).unwrap_or(0);
+      written = answered;
     }
     if written == 0 && expects_reply(header.as_ref()) && reply_room >= OUT_HEADER_LEN {
       // The reply does not fit the guest's buffers (a driver posted less room than the ABI's reply
@@ -1463,6 +1531,14 @@ impl Device {
         .map(|h| ReplyHeader::write_error(h.unique, EIO, &mut self.reply).unwrap_or(0))
         .unwrap_or(0);
       self.counters.replies_truncated = self.counters.replies_truncated.saturating_add(1);
+    }
+    // The form of `SETXATTR` the guest's kernel sends from now on, as the `INIT` reply it reads kept it (A-378).
+    if matches!(opcode, Some(Opcode::Init)) {
+      self.setxattr_ext = self
+        .reply
+        .get(OUT_HEADER_LEN..written)
+        .and_then(slates_bridge_fuse::init::kept_flags)
+        .is_some_and(|kept| kept & slates_bridge_fuse::abi::flags::SETXATTR_EXT != 0);
     }
     let reply = self.reply.get(..written).unwrap_or(&[]);
     if let Err(e) = scatter(memory, &chain.writable, reply) {
@@ -1533,7 +1609,7 @@ impl Device {
   pub fn durable_oldest(&self) -> Option<DurableOldest> {
     self.durable.front().map(|held| DurableOldest {
       target: held.target,
-      since_ns: held.since_ns,
+      next_look_ns: held.bound.map(|bound| bound.next_look_ns()),
     })
   }
 
@@ -1543,26 +1619,28 @@ impl Device {
     self.durable.len()
   }
 
-  /// Settles every held `FSYNC` reply whose volume is durable at its position (`durability`), never will be, or has
-  /// waited `bound_ns` since this settle first saw it, as of `now_ns`: a durable one is released as served, the others
-  /// answered `EIO` in its place, and either then waits for the volume's FUSE mounts as every reply does
+  /// Settles every held `FSYNC` reply whose volume is durable at its position (`durability`), never will be, or whose
+  /// wait has given up as of `now_ns` (its [`DurableBound`], begun by `begin` the first time this settle sees it, judged
+  /// against `heard`: the volume's acknowledgements heard on its durability path and its receiver's idles): a durable
+  /// one is released as served,
+  /// the others answered `EIO` in its place, and either then waits for the volume's FUSE mounts as every reply does
   /// ([`Device::settle_told`]). The rest stay held.
   pub fn settle_durable(
     &mut self,
     memory: &mut dyn GuestMemory,
     durability: &mut dyn FnMut(u64) -> Durability,
-    (now_ns, bound_ns): (u64, u64),
+    (now_ns, heard, begin): (u64, Heard, &mut dyn FnMut() -> DurableBound),
     admission: &mut dyn ChainAdmission,
   ) -> Result<DurableSettled, DeviceError> {
     let mut settled = DurableSettled::default();
     let mut index = 0;
     while let Some(held) = self.durable.get_mut(index) {
-      let first_sight = held.since_ns.is_none();
-      let since = *held.since_ns.get_or_insert(now_ns);
+      let first_sight = held.bound.is_none();
+      let bound = held.bound.get_or_insert_with(&mut *begin);
       let refuse = match durability(held.target) {
         Durability::Durable => false,
         Durability::Never => true,
-        Durability::Pending if now_ns.saturating_sub(since) >= bound_ns => true,
+        Durability::Pending if bound.judge(heard, now_ns).is_some() => true,
         Durability::Pending => {
           index = index.saturating_add(1);
           continue;
@@ -2147,6 +2225,28 @@ impl Device {
 /// Whether a request of this header expects a reply: every opcode but the forgets ([`takes_reply`]).
 fn expects_reply(header: Option<&InHeader>) -> bool {
   takes_reply(header.and_then(|h| Opcode::from_wire(h.opcode)))
+}
+
+/// Whether a chain can hold its request's header and, unless it is the high-priority queue's (whose requests take no
+/// reply), its reply's header: a chain that cannot is refused before anything is gathered from it.
+fn chain_has_room(queue: u16, chain: &DescriptorChain) -> Result<(), DeviceError> {
+  let header_len = u64::try_from(IN_HEADER_LEN).unwrap_or(u64::MAX);
+  if chain.readable_bytes < header_len {
+    return Err(DeviceError::RequestTooShort {
+      queue,
+      readable: chain.readable_bytes,
+      need: header_len,
+    });
+  }
+  let reply_header_len = u64::try_from(OUT_HEADER_LEN).unwrap_or(u64::MAX);
+  if queue != HIPRIO_QUEUE && chain.writable_bytes < reply_header_len {
+    return Err(DeviceError::ReplyBufferTooSmall {
+      queue,
+      writable: chain.writable_bytes,
+      need: reply_header_len,
+    });
+  }
+  Ok(())
 }
 
 /// Copies the chain's readable ranges, in order, into one contiguous request buffer of `total`

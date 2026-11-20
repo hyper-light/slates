@@ -2711,7 +2711,7 @@ step, spin, park and send), and the probe's own overhead reversed the result: al
   one miss per round trip). Its window is the 2-competitive spin-then-park threshold (spin for the expected cost of
   parking; Karlin, Manasse, McGeoch and Owicki 1991), and that threshold took the startup profile's `wake.mean`
   (1.7 µs on macOS), well below the wakes actually paid under load.
-- **Measured in the daemon's configuration** (macOS, load 14–40). The spin window was ×100 (`IDLE_WINDOW_RATIO`)
+- **Measured in the daemon's configuration** (macOS, load 14–40). The spin window was ×100 (the daemon's idle ratio then)
   with the online estimate on, alternating, three rounds: always-kick 4,875–5,917 ns, the candidate 12,167–12,791 ns.
   Still rejected.
 - **The window is not the cause.** The shards' counters show 1–2 real driver waits per 2,000 round trips: nearly
@@ -2744,6 +2744,27 @@ own filesystem and tmpfs.
 - **The next lever is the create's own publication.** An intent log for namespace changes, as ZFS's ZIL does, would
   let a create reply after one append. It is a design change to §4.8's barrier, recorded in GAPS, not built.
 
+
+## A Shards stream's close no longer publishes what the write log holds (A-399; 2026-11-18)
+
+**Setup.** Apple M3 Ultra (Mac Studio, `Mac15,14`), one-minute load 19.6–22.3 from other sessions throughout. Two
+release test binaries, one built from main 89912e1e7 with the measurement added (`diag-g268-a399-before`), one with
+A-399 too (`diag-g268-a399-after`), run interleaved three times. Each run: one stream, one open file; 5 rounds of 200
+cycles, each cycle a 4 KiB write at the file's start and a `FLUSH` (the request every `close` sends), the `FLUSH`'s
+round trip timed alone. Command (from `crates/server`, each binary in turn):
+`cargo test --release -p slates-server --test shards -- --ignored --nocapture flush_cost`.
+
+| pass | before: best p50 / best p99 | after: best p50 / best p99 |
+|---|---|---|
+| 1 | 19.8 / 31.8 µs | 16.0 / 21.0 µs |
+| 2 | 20.0 / 30.1 µs | 16.0 / 20.8 µs |
+| 3 | 17.5 / 24.8 µs | 15.7 / 56.3 µs |
+
+- **Every `FLUSH` after the change published nothing** (`shards.flush_logged` 1,000 of 1,000; 0 before), and the write
+  it follows survives a death from the log alone (`shards_resync_restart`, A-399).
+- **The saving here is small, 2–4 µs at p50 (15–20%),** because each publication carried one changed chunk of one
+  file. A close after a burst of changes to many files publishes a delta as large as the burst; that is what the
+  stream no longer pays per close. p99 moves with the load, not with the change.
 
 ### 2026-10-06: the no-panic sweep costs nothing measurable on the hot paths
 
@@ -4654,6 +4675,38 @@ release build of `faad1562`.
 
 Every byte the writer wrote survived 80 SIGKILLs in all, each recovery replaying windowed patches. No fsync waited
 longer than 70 ms across a kill: the anchor restarts the daemon from its RAM in milliseconds.
+
+### Fsynced files through Apple's NFS client under daemon kills: one empty file per run until A-358 (2026-11-18)
+
+**Command:** `SLATES=<release slates> ROUNDS=1 KILLS=15 DURATION=30 SINK=<host:port> bash docs/wip/bench/kill_fsync_macos.sh`
+(new, `kill_fsync.sh`'s macOS counterpart).
+- The writer: files of 100 B to 300 KB written whole, fsynced and closed through `slates mount` (Apple's NFSv3 client,
+  `hard,intr`), each hashed only after both returned. Past 2,000 files an old one is deleted every other step.
+- The killer: the daemon `SIGKILL`ed `KILLS` times at random 0.4 to 1.6 s intervals; the anchor restarts it.
+- Afterwards the volume is unmounted while a daemon serves, mounted again, and every file is read back.
+- Machine: Adas-Mac-Studio-2 (kiln b24c5c95), Apple M4 Max, 14 cores, 36 GiB, macOS 26.2 (25C56), xnu-12377.61.12.
+  Load average 2–4; EXO and Docker Desktop running.
+- Release builds on d1323898.
+
+| binary | kills | files written | files checked | intact | empty | missing | resurrected | slowest file |
+|---|---|---|---|---|---|---|---|---|
+| main `1cd57d18b` | 2 | 4,050 | 3,025 | 3,024 | 1 | 0 | 0 | 25 ms |
+| main + a line per NFS call (`59c43709c`) | 15 | 11,214 | 6,607 | 6,606 | 1 | 0 | 0 | 27 ms |
+
+- The first row was meant to make no kill. BSD `seq 1 0` counts down, so it made two; the harness counts with a loop
+  now.
+- Each empty file was open across a kill, and its bytes were in one `UNSTABLE` WRITE that no publication carried before
+  the daemon died. Apple's client never wrote them again after the COMMIT answered a new verifier (A-358; the bug record
+  of 2026-11-18).
+- A-358's binary (`120c7d56`, every WRITE published before its reply) was started for eight rounds. The machine went
+  offline right after its first kill (GAPS, the A-113 entry). Its rounds and the A/B below are owed.
+
+Owed (the measurer's), on a Mac the kill run may panic only after its last panic is read:
+- the eight rounds again with A-358's binary;
+- the A/B of A-358's barrier per WRITE against its base: `bash docs/wip/bench/ab_write_macos.sh <base slates> <A-358
+  slates>` with `ROUNDS=3 DURATION=20 BIG_MIB=512`. It runs the writer above without kills, then one 512 MiB file in
+  1 MiB writes and an fsync, the binaries alternating on fresh anchors. Mounting without kills is safe on any Mac. Read
+  files a second, p50 and p99 file time, and the 512 MiB write's MiB/s.
 
 ### The hot-directory storm after the probe-storm fix: delegations granted again (condition 12; 2026-10-09)
 
@@ -8543,7 +8596,8 @@ and max about 100 ms, where the plain volume's p999 is 0.6 ms, on a box at load 
 cores. Measured inside the daemon at load 48 (temporary counters, removed): an entry costs 13.3 µs to build (read,
 encode, seal) and its dispatch round (owner shard to control shard, the exchange, back) 90.7 µs on average, against
 about 25 µs for the exchange alone (`replication_bench`): the cross-shard hops and the session borrow are most of it.
-Owed: the same command on a quiet machine; the round's hops measured apart; the rare 100 ms tail explained.
+Owed: the same command on a quiet machine; the round's hops measured apart (counted since 2026-11-18, `fleet.live.hop.*`:
+SLATES_DESIGN §4.10 status "The round, counted hop by hop"); the rare 100 ms tail explained.
 
 **The 100 ms tail, explained and removed (2026-11-05).** The same command, with the owner's `fleet.live.*` counters
 printed at the end. Two causes, each found by its counter and each a wait for the next record period (100 ms):
@@ -8645,8 +8699,42 @@ runs per row, 32 of 32 closed; the replacement answered 53 to 145 ms after the k
 is the old voter being confirmed dead and the replacement staged; a leader must not drop a voter it has not confirmed
 dead. No defect. From losing a voter to its replacement seated, the fleet has spent `f = 1`: a second failure inside
 that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
-for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
-it in 6 of 6 x86 runs.
+for the seat (`wait_recovered`, `crates/cli/tests/live_chaos.rs`; until 2026-11-09 `wait_council_seated`, which
+judged the joint flag and voter agreement alone: those hold before the change begins, so on CI it passed before the
+replacement was seated in 20 of 22 failed runs, diag-live-durability-77 and -78). diag-live-durability-66 killed the
+owner inside it in 6 of 6 x86 runs.
+
+### A live volume taken over by a node replaced at its own anchor (A-271; 2026-11-09, diag-live-durability-75, -79, -80)
+
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release. **Command (the contract),
+each run:** `SLATES_TEST_CLI=1 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture
+--test-threads=1 --exact a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover`, 12 runs a leg in
+one job, the runs one after another. **Flow:** a three-node anchored fleet streams writes to a live volume; one
+candidate's node has its store destroyed mid-stream and is started again at its anchor under a new member id; the flow
+waits for the fleet to recover, then kills the owner and waits for a survivor to serve the volume. Each run printed who
+served, how long after the owner's kill, and every survivor's takeover counters (the diag-only lines, never on main).
+
+| run | tree | passed | the replacement served | the other survivor served |
+|---|---|---|---|---|
+| diag-75 | A-271 + B9 + the recipient fix, the old wait | 3 of 48 | 1 | 2 |
+| diag-79 | main B10 + the fixed wait (no A-271) | 24 of 24 | 16 | 8 |
+| diag-80 | A-271 + main B10 + the fixed wait (1e44a57e) | 48 of 48 | 26 | 22 |
+
+Seconds from the owner's kill to the volume served, diag-80 (diag-79 in brackets):
+
+| arch | the replacement served | the other survivor served |
+|---|---|---|
+| x86 | 13 runs: min 2.003, median 2.014, max 2.386 (8: 2.001, 2.010, 2.998) | 11: 2.100, 2.255, 2.707 (4: 2.031, 2.094, 2.350) |
+| arm | 13 runs: min 1.997, median 2.009, max 2.481 (8: 2.004, 2.013, 3.005) | 11: 2.158, 2.356, 2.558 (4: 2.169, 2.257, 2.497) |
+
+**Reading.** The 45 failures of diag-75 were mode B, the flow's own wait (GAPS "the store-destroyed flow's mode B"),
+not A-271: with the wait fixed, the tree without A-271 passed 24 of 24 and the tree with it 48 of 48. In diag-80
+`takeover_waits_key`, `takeover_key_arrived`, `takeover_no_key_exhausted`, `takeover_refused.no_key`,
+`fleet.takeover.reclaimed` and `fleet.takeover.lost` read 0 on every survivor of every run, so no successor waited for
+a key: the flow kills the owner only once the replacement is seated, by which time it has accepted its pair. A-271's
+bounded wait covers the owner dying before that acceptance, which this flow does not reach. The ~2.0 s before a
+replacement serves is the owner's death being judged (fleet-transport §5); the other survivor served 0.08 to 0.35 s
+later at the median, by arch and run. Owed: the same flow on the merged main.
 
 ### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)
 
@@ -12072,6 +12160,680 @@ x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted
   µs, 9 of 10 runs, beyond the control); a quiet stat costs +8.1 µs on arm64 and +4.0 on x86_64 (above).
 - **The form:** main's separate receiver, one worker. A-215's combined transact and A-219's second worker are measured
   and rejected.
+- **Continued 2026-11-18 (goal g258, the next section):** cut (c)'s no-wake variant deadlocked over the one-request channel
+  and, over a channel of two (A-348, which lands), measured slower; cut (b), the per-kind spin choice, measured in two forms
+  and rejected; after cut (c) the receiver is within the DLL's spread on x86_64 but for a few microseconds, and on arm64
+  a stat, a rename and an unlink cost 40 to 82 µs more at the quiet p50 and a write 87 µs more loaded.
+
+## Step 7, continued: the no-wake variant, the request channel's bound, the per-kind spin choice, and what remains against the DLL (goal g258; audit step 7; 2026-11-18)
+
+**The question.** Ada (2026-11-07): keep cutting the WinFsp receiver's per-IRP costs, re-measured on both Windows runners,
+quiet and loaded, until it is within the DLL dispatcher's spread or she accepts what remains. After cut (c) (A-274): cut
+(c)'s no-wake variant against cut (c), with "a Create then a security query" a named op, then (b), the per-kind spin
+window.
+
+**How every A/B here was read.** As BENCHMARKS "The bench's own noise" and "Cut (c)" read theirs: the arms interleaved on
+one VM of each runner, quiet and loaded (two spinners a logical CPU), ten runs a lane, the list rotating each run, with
+windows-ab.sh's stall detector; a control arm (main's own binary copied, as diag-winfsp-overlap-48's identical arms); a cut
+called on its within-run differences from main against the range the control's own differences span. The command, each
+arm a build:
+
+```
+ARMS="main=ab-bin/main/slates.exe control=ab-bin/control/slates.exe <cut>=ab-bin/<cut>/slates.exe" \
+  BENCH=ab-bin/mount_bench.exe RUNS=10 SPINNERS_PER_CPU=2 bash docs/wip/bench/fsbench/windows-ab.sh
+```
+
+Hardware: windows-11-arm, image win11-vs2026-arm64 20261112.217.1, Windows 10.0.26200.9974, ARM64 Family 8 Model D49, 4
+CPUs; windows-latest, image win25-vs2026 20261103.298.1, Windows 10.0.26100.33674, AMD Family 25 or 26 (each lane names
+its own), 4 CPUs; 15 GiB each, shared VMs; WinFsp 2.1.25156. Main is `69cd38b2` throughout, with the bench's
+`create_security` (`f2a1eb25`, the main arm, its `slates.exe` main's). All runs 2026-11-18, 09:14 to 14:10 UTC. Every run's
+output is on the lane's `diag-results/g258-<run>-<lane>` branch.
+
+### The bench's create_security op (landed, `58c8b4f6`)
+
+`crates/cli/examples/mount_bench.rs` times, on Windows, an exclusive create then a security query on its handle
+(`GetSecurityInfo`, owner), from the create's start to the query's answer, on files of its own that are closed and
+removed untimed. The query reaches the receive worker as QuerySecurity, which WinFsp answers without calling the host (no
+GetSecurity callback): the request no shard call precedes, right after a Create. diag-winfsp-overlap-52 (run 43148071819)
+saw every such call reach the worker, 21,000 of 21,000 a daemon on arm64; a stream query never did (the kernel refused all
+10,000, error 87), so only the security query is timed. On windows-latest the worker also took 273,006 security queries no
+call of the bench's made, one for each of the 273,007 Cleanups but one, so that runner's lanes carry that traffic in every
+op. The op costs the DLL arm dearly there: 232 ms a call at the loaded p50 against main's 2.9 ms (diag-g258-3, run
+44274158769, cancelled), so the comparison with the DLL below uses the nine ops the earlier comparisons used.
+
+### Cut (c)'s no-wake variant, first form: a deadlock over a one-request channel
+
+**The variant.** Cut (c) (A-274) posts an open's confirmation and wakes the mount's task. The variant posts it without
+the wake, so the next request's own wake carries it to the shard: a stat's open and its info query cost the shard one
+wake, not two. A request WinFsp answers without the shard right after a Create (a security query; mount_bench's
+`create_security` times one) finds the confirmation unapplied and wakes the task and waits a round.
+
+**First form: it deadlocks.** Diag `diag-g258-1` (run 44271751211; main 69cd38b2 with the bench's `create_security`
+(`f2a1eb25`), a control, the variant `abffdfc9`) stalled in its first run on both runners, each lane failing on
+windows-ab.sh's stall detector (1,159 s with no step and no round):
+- windows-11-arm: the first look at the variant's new drive (`[ -d U:/ ]` after `slates mount`) never returned;
+- windows-latest: one whole warm-up round of 1,000 files ran, then the variant's quiet round 1 stalled 11.9 s in;
+- its live CLI suite hung on both runners (`a_cached_read_through_a_winfsp_mount_shows_another_paths_change` on x86_64
+  and `a_file_at_a_two_thousand_unit_path_is_served_across_a_killed_daemon` on arm64, 43 minutes each until cancelled),
+  where the bridge's 103 tests had passed.
+
+**The cause.** The mount's request channel held one request (`REQUEST_BOUND = 1`, "the one receiver waits for its current
+callback's answer before sending another request"), which cut (c) stopped being true: the posted confirmation stays in
+the channel, so the next call's post (`call_on`: post, then wake) waited for room until the shard took the confirmation.
+On main the confirmation's own wake brings the shard, so that post waits for a shard wake on the worker's path, which
+cut (c) meant to remove and diag-winfsp-overlap-52's count of waited-for confirmations did not see (it counted only waits
+for the answer). With no wake, nothing brought the shard: deadlock. On x86_64 a security query from no call of the
+bench's followed nearly every Create (273,006 of them, run 43148071819), and its save woke the shard, which is why a
+whole warm-up round ran there first.
+
+**The test, red first.** `host::channel::the_next_request_is_posted_while_a_confirmation_waits_untaken` posts a
+confirmation and then the next request with nothing taking either: at main's bound (`ca6738e2`) it fails on both
+runners (diag-g258-4, run 44278926773, `red` jobs), at the bound of two (`bb09e307`) it passes, the bridge's 104 tests
+with it, on both runners, and so does the variant over that bound (`685dd645`), whose live CLI suite no longer hangs.
+
+### A-348: the request channel holds the posted confirmation beside the next call (lands); the no-wake variant over it (rejected)
+
+**The arms.** Diag `diag-g258-4` (run 44278926773), four arms: main, the control, `bound` (`bb09e307`: `REQUEST_BOUND`
+two, derived from the worker's outstanding requests, one call it waits for and one confirmation it posted) and `nowake`
+(`685dd645`: the no-wake variant over that bound). Ten runs a lane, 0 failed, no stall, no heartbeat lapse;
+windows-11-arm 10:07–13:54 UTC, windows-latest (AMD Family 25 Model 1) 10:14–13:18 UTC. Its live jobs at both arms passed
+clippy -D warnings, the bridge's 104 tests (the channel test among them) and the CLI's WinFsp suite but two tests that
+fail on main itself on both runners (`a_refused_mount_time_hold_leaves_nothing_mounted` and
+`unmount_releases_every_healthy_drive_beside_a_volume_recovery_could_not_rebuild`: they read the CLI's refusal text, which
+now comes from `slates-api`); its red jobs at main's bound failed the channel test on both runners, as required.
+
+**Verdict, the bound: dead even, and it lands on A-274's rule.**
+- No p50 or p99 cell is beyond the control on windows-latest; on windows-11-arm only tails are, both ways: quiet p99
+  unlink +75.5 µs (4 of 10 faster) and p999 fsync slower, quiet max close faster.
+- It lands because it makes the code hold the design's rule, not for speed: A-274's worker "posts the confirmation, wakes
+  the mount's task, acknowledges and goes on", and with one request's room the next request's post waited for the shard
+  to take that confirmation. The derivation the constant stated ("the one receiver waits for its current callback's
+  answer before sending another request") stopped being true with cut (c), and the no-wake variant showed what the stale
+  bound does to a worker that posts without waking. At two the post never waits, at no measured cost.
+
+**Verdict, the no-wake variant over the bound: rejected.** Slower beyond the control on windows-11-arm: loaded write
+p50 +48.4 µs (0 of 10 runs faster), rename +14.6 (2 of 10), unlink +5.2 (1 of 10), create_security +9.5 (1 of 10, p99
++1,884 and p999 +9,467), quiet write +7.5 (0 of 10); faster only on loaded fsync −13.8 (10 of 10). On windows-latest its
+loaded p99 open is +636 µs (0 of 10 faster), and within the spread its p50s lean slower (loaded stat +5.1, 1 of 10 faster;
+open +4.6, 0 of 10; quiet open +14.3, 1 of 10; quiet create_security +27.5, 3 of 10). Against the bound within each run,
+its quiet create_security is +24.3 µs on arm64 (0 of 10 faster) and +0.0 on x86_64: the round its security query waits,
+and on x86_64 the round every Create's foreign security query already paid. The wake at the post is cut (c)'s reason and
+stays: the shard woken at the post serves the confirmation while the worker sends, and the request after an open finds it
+awake.
+
+arm64 (windows-11-arm), loaded, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 267.8 | -24.4 -10.6 -8.1 -6.1 -4.2 -0.6 +1.5 +6.7 +7.3 +24.8 | -0.6 (6/10 faster) | -22.0 -13.1 -7.4 -1.1 +0.1 +2.3 +12.3 +14.2 +18.9 +20.7 | +2.3 (4/10 faster) | within the control |
+| write | 137.7 | -29.5 -26.9 -8.6 -7.5 +1.2 +2.9 +6.7 +7.1 +13.5 +16.5 | +2.9 (4/10 faster) | -12.1 -11.2 -8.0 -6.7 +0.1 +1.1 +2.0 +5.3 +9.2 +15.4 | +1.1 (4/10 faster) | within the control |
+| fsync | 131.3 | -10.6 -8.8 -5.6 -2.2 -1.7 -0.8 +4.3 +5.6 +9.6 +10.4 | -0.8 (6/10 faster) | -5.7 -5.2 -4.3 +0.5 +0.9 +2.3 +2.7 +8.0 +10.2 +11.9 | +2.3 (3/10 faster) | within the control |
+| close | 5343.3 | -871.8 -613.8 -417.9 -417.3 -316.3 -297.6 -61.6 +254.9 +705.8 +902.9 | -297.6 (7/10 faster) | -819.0 -449.3 -325.1 -317.9 -215.4 +4.2 +444.2 +628.0 +761.8 +1459.2 | +4.2 (5/10 faster) | within the control |
+| stat | 149.9 | -11.1 -11.0 -2.7 -2.1 -1.7 -1.1 -1.0 -0.4 +0.4 +6.7 | -1.1 (8/10 faster) | -2.5 -2.5 -1.7 -1.6 -1.6 -1.6 -0.4 +0.0 +1.1 +7.1 | -1.6 (7/10 faster) | within the control |
+| open | 4562.7 | -3713.7 -349.6 -335.1 -261.7 -216.5 -89.8 +108.0 +139.7 +396.9 +681.5 | -89.8 (6/10 faster) | -3604.5 -461.2 -344.9 -275.5 -58.8 +130.0 +433.6 +595.4 +2548.4 +4296.8 | +130.0 (5/10 faster) | within the control |
+| read | 57.3 | -4.0 -2.6 -2.0 -1.0 -0.6 +0.4 +0.5 +1.8 +2.1 +5.1 | +0.4 (5/10 faster) | -3.0 -2.3 -2.0 -1.6 -1.0 +2.8 +2.9 +5.0 +5.3 +5.3 | +2.8 (5/10 faster) | within the control |
+| rename | 542.3 | -90.7 -17.0 -7.9 -6.7 -1.9 -1.9 -0.3 +0.3 +14.0 +825.9 | -1.9 (7/10 faster) | -89.5 -13.9 -11.9 -5.0 +0.6 +1.2 +2.3 +3.6 +3.8 +8.2 | +1.2 (4/10 faster) | within the control |
+| unlink | 341.9 | -279.0 -7.1 -5.8 -3.8 -0.8 +0.3 +2.6 +5.6 +1013.5 +1298.0 | +0.3 (5/10 faster) | -287.5 -3.4 +0.0 +1.6 +2.1 +3.2 +3.2 +3.3 +4.6 +4.8 | +3.2 (2/10 faster) | within the control |
+| create_security | 239.2 | -24.6 -5.4 -3.5 -1.8 -1.8 -0.2 +2.1 +3.8 +40.1 +41.5 | -0.2 (6/10 faster) | -32.9 -5.5 -2.8 -2.6 -2.0 +2.2 +2.3 +3.6 +4.1 +4.2 | +2.2 (5/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 237.0 | -14.9 -10.4 -8.8 -5.0 -4.4 +0.7 +4.8 +7.8 +9.5 +20.3 | +0.7 (5/10 faster) | -3.9 -3.3 -2.3 -1.6 +0.6 +2.7 +3.1 +8.8 +10.3 +21.6 | +2.7 (4/10 faster) | within the control |
+| write | 104.1 | -5.9 -3.4 -3.4 -0.6 +0.0 +0.2 +0.5 +1.2 +1.2 +1.8 | +0.2 (4/10 faster) | -3.3 -1.9 -1.2 -0.8 +1.3 +1.4 +1.9 +1.9 +3.7 +7.1 | +1.4 (4/10 faster) | within the control |
+| fsync | 115.5 | -7.9 -6.0 -4.3 -0.5 -0.4 +0.1 +0.3 +0.9 +1.0 +3.3 | +0.1 (5/10 faster) | -4.6 -3.2 -2.5 +1.2 +1.5 +1.6 +2.6 +4.4 +5.0 +8.7 | +1.6 (3/10 faster) | within the control |
+| close | 4325.0 | -339.1 -326.7 -84.7 -78.7 +62.9 +266.6 +267.5 +398.8 +436.5 +578.3 | +266.6 (4/10 faster) | -332.1 -257.5 -198.5 -179.2 -77.3 -12.4 +126.6 +246.8 +591.4 +608.2 | -12.4 (6/10 faster) | within the control |
+| stat | 178.7 | -3.1 -2.3 -2.2 -1.7 -0.7 -0.2 -0.2 +0.1 +1.8 +20.7 | -0.2 (7/10 faster) | -33.6 -19.9 -16.8 -15.9 -5.7 -4.7 +0.3 +2.2 +2.4 +21.4 | -4.7 (6/10 faster) | within the control |
+| open | 3885.7 | -543.8 -345.0 -171.3 +242.8 +296.8 +297.6 +442.6 +476.4 +476.6 +598.1 | +297.6 (3/10 faster) | -547.4 -538.2 -283.7 -220.9 +30.8 +254.8 +342.9 +493.6 +549.0 +747.9 | +254.8 (4/10 faster) | within the control |
+| read | 48.6 | -5.5 -0.4 +0.1 +0.1 +0.4 +0.8 +1.4 +2.1 +2.7 +3.0 | +0.8 (2/10 faster) | -2.8 -2.2 -1.6 -0.6 -0.1 +0.5 +1.2 +1.5 +1.7 +3.9 | +0.5 (5/10 faster) | within the control |
+| rename | 495.4 | -24.8 -14.5 -14.1 -9.4 -8.2 -8.2 -2.0 +0.7 +2.7 +4.5 | -8.2 (7/10 faster) | -13.9 -10.0 -7.6 -5.6 -4.5 -3.5 -3.2 +3.1 +6.4 +12.4 | -3.5 (7/10 faster) | within the control |
+| unlink | 305.3 | -22.2 -16.0 -5.1 -4.6 -2.2 -1.3 +0.5 +4.2 +6.2 +24.7 | -1.3 (6/10 faster) | -12.8 -5.3 -5.2 -3.1 -2.2 -1.0 +0.0 +0.7 +3.4 +18.0 | -1.0 (6/10 faster) | within the control |
+| create_security | 236.7 | -25.1 -23.8 -9.5 -6.9 -1.6 -0.2 +6.0 +7.5 +8.1 +22.4 | -0.2 (6/10 faster) | -6.5 -4.1 -1.2 +0.0 +3.9 +6.7 +9.0 +13.1 +17.3 +32.4 | +6.7 (3/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1416.8 | -94.7 -76.6 -65.1 -53.4 -16.8 -8.8 +0.3 +10.3 +28.7 +118.7 | -8.8 (6/10 faster) | -61.1 -41.1 -23.8 -12.8 -1.4 +3.5 +8.3 +10.5 +60.1 +66.1 | +3.5 (5/10 faster) | within the control |
+| write | 86.8 | -0.9 -0.6 -0.2 -0.2 -0.2 -0.1 -0.1 +0.0 +0.7 +3.3 | -0.1 (7/10 faster) | -0.7 -0.7 -0.7 -0.6 -0.5 -0.4 -0.3 -0.1 +0.7 +21.2 | -0.4 (8/10 faster) | within the control |
+| fsync | 130.7 | -20.1 -9.8 -0.9 -0.5 -0.4 -0.1 +0.1 +0.4 +1.1 +21.2 | -0.1 (6/10 faster) | -2.0 -2.0 -1.4 -0.8 -0.5 -0.2 +0.1 +0.1 +5.8 +15.7 | -0.2 (6/10 faster) | within the control |
+| close | 69.4 | -0.7 -0.6 -0.4 -0.2 -0.1 +0.0 +0.0 +0.0 +0.5 +0.8 | +0.0 (5/10 faster) | -0.5 -0.4 -0.2 -0.2 -0.2 -0.1 -0.1 -0.1 +0.5 +1.2 | -0.1 (8/10 faster) | within the control |
+| stat | 263.0 | -13.6 -10.0 -2.1 -2.1 -1.1 -0.4 -0.3 +0.4 +1.4 +28.6 | -0.4 (7/10 faster) | -2.5 -2.4 -1.9 -1.2 -1.2 -1.1 -1.0 -0.4 +8.4 +26.5 | -1.1 (8/10 faster) | within the control |
+| open | 193.5 | -25.8 -25.2 -1.4 -1.1 -0.6 +0.0 +0.0 +0.4 +19.3 +25.2 | +0.0 (5/10 faster) | -25.9 -2.2 -1.1 -0.7 -0.4 -0.4 +0.2 +1.0 +3.9 +22.7 | -0.4 (6/10 faster) | within the control |
+| read | 92.9 | -1.5 -1.4 -0.3 -0.3 -0.1 -0.1 +0.1 +0.6 +1.1 +1.3 | -0.1 (6/10 faster) | -1.4 -0.3 -0.3 -0.1 -0.1 -0.1 -0.1 +0.3 +1.2 +2.1 | -0.1 (7/10 faster) | within the control |
+| rename | 648.3 | -79.7 -66.1 -9.3 -6.9 -2.4 +1.7 +6.6 +6.8 +15.6 +110.2 | +1.7 (5/10 faster) | -59.5 -20.4 -7.1 -4.0 -1.8 +3.7 +5.5 +12.3 +76.0 +85.8 | +3.7 (5/10 faster) | within the control |
+| unlink | 364.8 | -55.9 -55.4 -13.5 -10.2 -0.3 +1.6 +4.0 +7.2 +9.5 +61.3 | +1.6 (5/10 faster) | -47.7 -8.7 -6.3 -1.1 -0.1 +1.2 +3.7 +9.7 +28.6 +33.1 | +1.2 (5/10 faster) | within the control |
+| create_security | 2417.2 | -113.7 -104.7 -104.5 -33.0 -32.0 -21.2 -17.0 -11.2 -8.6 +72.0 | -21.2 (9/10 faster) | -74.4 -42.7 -8.0 -7.2 -3.9 +6.3 +6.9 +12.3 +14.4 +52.5 | +6.3 (5/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 921.9 | -95.6 -58.1 -29.3 -28.8 -28.0 -7.6 +35.6 +35.8 +35.9 +91.6 | -7.6 (6/10 faster) | -132.4 -54.9 -39.8 -12.0 +4.9 +6.0 +7.5 +8.3 +25.7 +42.0 | +6.0 (4/10 faster) | within the control |
+| write | 90.0 | -28.6 -24.5 -18.3 -3.7 -1.0 +0.9 +2.4 +4.2 +11.2 +36.3 | +0.9 (5/10 faster) | -18.4 -8.4 -1.7 -0.8 -0.1 +2.1 +4.8 +8.8 +9.6 +11.9 | +2.1 (5/10 faster) | within the control |
+| fsync | 121.4 | -2.1 -1.3 -1.2 -1.2 -0.9 -0.3 +0.8 +1.0 +2.0 +11.7 | -0.3 (6/10 faster) | -1.8 -1.7 -1.4 -0.4 -0.4 +0.5 +0.6 +1.1 +1.7 +2.1 | +0.5 (5/10 faster) | within the control |
+| close | 67.1 | -1.3 -0.8 -0.7 -0.6 -0.6 -0.4 -0.3 -0.1 +0.3 +0.4 | -0.4 (8/10 faster) | -1.0 -0.8 -0.6 -0.5 -0.5 -0.3 -0.2 +0.1 +0.3 +0.4 | -0.3 (7/10 faster) | within the control |
+| stat | 263.1 | -19.3 -10.6 -4.7 -3.0 -2.9 -0.7 +4.7 +9.2 +18.3 +29.6 | -0.7 (6/10 faster) | -12.8 -8.6 -5.4 -3.4 +1.8 +4.8 +5.0 +6.2 +8.7 +13.2 | +4.8 (4/10 faster) | within the control |
+| open | 196.5 | -40.4 -19.7 -12.3 -8.9 -5.5 +0.7 +11.4 +18.2 +39.2 +46.2 | +0.7 (5/10 faster) | -32.5 -20.8 -1.0 +0.6 +2.8 +4.5 +5.1 +9.5 +17.7 +24.2 | +4.5 (3/10 faster) | within the control |
+| read | 94.2 | -18.8 -16.0 -12.9 -4.4 +0.3 +0.6 +3.9 +4.7 +10.1 +33.6 | +0.6 (4/10 faster) | -13.4 -5.3 -0.4 +0.5 +1.4 +1.9 +4.2 +8.8 +15.1 +15.7 | +1.9 (3/10 faster) | within the control |
+| rename | 605.5 | -60.4 -22.2 -20.5 -9.3 -6.1 -5.8 -3.4 +2.4 +17.9 +118.1 | -5.8 (7/10 faster) | -41.6 -22.5 +2.9 +4.3 +7.5 +9.5 +12.3 +24.2 +52.5 +74.6 | +9.5 (2/10 faster) | within the control |
+| unlink | 360.0 | -55.3 -36.3 -20.1 -12.4 -6.7 -2.5 +3.7 +5.9 +14.0 +78.6 | -2.5 (6/10 faster) | -44.9 -29.7 -10.5 -4.5 -1.9 +1.6 +11.1 +18.3 +33.7 +34.6 | +1.6 (5/10 faster) | within the control |
+| create_security | 1516.2 | -201.3 -75.3 -54.5 -13.9 -6.9 +4.6 +45.9 +80.2 +89.0 +115.8 | +4.6 (5/10 faster) | -183.4 -85.3 -68.4 -12.1 -10.2 +7.2 +7.3 +10.2 +30.9 +69.8 | +7.2 (5/10 faster) | within the control |
+
+arm64 (windows-11-arm), loaded, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 267.8 | -22.2 -10.3 -10.1 -6.4 -0.8 +0.2 +3.1 +5.1 +6.5 +6.5 | +0.2 (5/10 faster) | -22.0 -13.1 -7.4 -1.1 +0.1 +2.3 +12.3 +14.2 +18.9 +20.7 | +2.3 (4/10 faster) | within the control |
+| write | 137.7 | +20.5 +34.7 +35.1 +40.8 +43.9 +48.4 +50.3 +50.6 +55.0 +79.8 | +48.4 (0/10 faster) | -12.1 -11.2 -8.0 -6.7 +0.1 +1.1 +2.0 +5.3 +9.2 +15.4 | +1.1 (4/10 faster) | **slower** beyond the control |
+| fsync | 131.3 | -25.9 -19.2 -17.9 -15.2 -14.4 -13.8 -11.1 -10.4 -8.0 -3.8 | -13.8 (10/10 faster) | -5.7 -5.2 -4.3 +0.5 +0.9 +2.3 +2.7 +8.0 +10.2 +11.9 | +2.3 (3/10 faster) | **faster** beyond the control |
+| close | 5343.3 | -894.1 -527.0 -523.0 -332.2 -238.0 -145.3 -43.2 -35.4 -26.9 +438.6 | -145.3 (9/10 faster) | -819.0 -449.3 -325.1 -317.9 -215.4 +4.2 +444.2 +628.0 +761.8 +1459.2 | +4.2 (5/10 faster) | within the control |
+| stat | 149.9 | -8.7 -0.3 +0.2 +0.2 +0.7 +1.9 +7.6 +8.1 +8.6 +9.1 | +1.9 (2/10 faster) | -2.5 -2.5 -1.7 -1.6 -1.6 -1.6 -0.4 +0.0 +1.1 +7.1 | -1.6 (7/10 faster) | within the control |
+| open | 4562.7 | -3720.7 -608.3 -306.0 -254.7 -47.2 +29.9 +41.8 +81.6 +243.8 +301.1 | +29.9 (5/10 faster) | -3604.5 -461.2 -344.9 -275.5 -58.8 +130.0 +433.6 +595.4 +2548.4 +4296.8 | +130.0 (5/10 faster) | within the control |
+| read | 57.3 | -4.3 -3.9 -1.1 -0.7 +0.5 +1.4 +1.5 +1.8 +2.0 +2.6 | +1.4 (4/10 faster) | -3.0 -2.3 -2.0 -1.6 -1.0 +2.8 +2.9 +5.0 +5.3 +5.3 | +2.8 (5/10 faster) | within the control |
+| rename | 542.3 | -81.6 -2.5 +7.7 +8.5 +8.5 +14.6 +18.5 +19.7 +25.3 +1287.7 | +14.6 (2/10 faster) | -89.5 -13.9 -11.9 -5.0 +0.6 +1.2 +2.3 +3.6 +3.8 +8.2 | +1.2 (4/10 faster) | **slower** beyond the control |
+| unlink | 341.9 | -278.5 +1.2 +3.6 +3.7 +4.9 +5.2 +6.5 +11.0 +15.7 +1373.7 | +5.2 (1/10 faster) | -287.5 -3.4 +0.0 +1.6 +2.1 +3.2 +3.2 +3.3 +4.6 +4.8 | +3.2 (2/10 faster) | **slower** beyond the control |
+| create_security | 239.2 | -23.6 +0.4 +4.0 +4.4 +6.2 +9.5 +12.6 +12.7 +15.7 +1366.5 | +9.5 (1/10 faster) | -32.9 -5.5 -2.8 -2.6 -2.0 +2.2 +2.3 +3.6 +4.1 +4.2 | +2.2 (5/10 faster) | **slower** beyond the control |
+
+arm64 (windows-11-arm), quiet, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 237.0 | -12.3 -6.0 -5.4 -5.4 -1.1 -0.7 -0.6 +0.7 +5.3 +20.0 | -0.7 (7/10 faster) | -3.9 -3.3 -2.3 -1.6 +0.6 +2.7 +3.1 +8.8 +10.3 +21.6 | +2.7 (4/10 faster) | within the control |
+| write | 104.1 | +1.8 +2.6 +3.2 +5.5 +5.5 +7.5 +8.4 +9.6 +11.7 +12.5 | +7.5 (0/10 faster) | -3.3 -1.9 -1.2 -0.8 +1.3 +1.4 +1.9 +1.9 +3.7 +7.1 | +1.4 (4/10 faster) | **slower** beyond the control |
+| fsync | 115.5 | -6.9 -5.4 -4.2 -3.3 -1.5 -1.1 +0.8 +1.3 +2.3 +2.8 | -1.1 (6/10 faster) | -4.6 -3.2 -2.5 +1.2 +1.5 +1.6 +2.6 +4.4 +5.0 +8.7 | +1.6 (3/10 faster) | within the control |
+| close | 4325.0 | -395.9 -373.5 -95.6 -8.2 +111.4 +119.4 +197.8 +226.8 +295.9 +441.7 | +119.4 (4/10 faster) | -332.1 -257.5 -198.5 -179.2 -77.3 -12.4 +126.6 +246.8 +591.4 +608.2 | -12.4 (6/10 faster) | within the control |
+| stat | 178.7 | -8.3 -4.4 +1.0 +1.2 +1.2 +2.0 +3.5 +3.7 +3.8 +25.9 | +2.0 (2/10 faster) | -33.6 -19.9 -16.8 -15.9 -5.7 -4.7 +0.3 +2.2 +2.4 +21.4 | -4.7 (6/10 faster) | within the control |
+| open | 3885.7 | -1309.9 -546.6 -376.4 -321.4 -101.1 -77.9 +338.1 +376.5 +712.8 +903.9 | -77.9 (6/10 faster) | -547.4 -538.2 -283.7 -220.9 +30.8 +254.8 +342.9 +493.6 +549.0 +747.9 | +254.8 (4/10 faster) | within the control |
+| read | 48.6 | -2.7 -1.1 -0.6 -0.4 -0.4 +0.0 +0.3 +0.5 +1.6 +2.2 | +0.0 (5/10 faster) | -2.8 -2.2 -1.6 -0.6 -0.1 +0.5 +1.2 +1.5 +1.7 +3.9 | +0.5 (5/10 faster) | within the control |
+| rename | 495.4 | -21.6 -8.5 -6.8 -4.0 -3.3 -0.2 +0.3 +8.5 +10.2 +13.1 | -0.2 (6/10 faster) | -13.9 -10.0 -7.6 -5.6 -4.5 -3.5 -3.2 +3.1 +6.4 +12.4 | -3.5 (7/10 faster) | within the control |
+| unlink | 305.3 | -25.5 -6.3 -6.1 -5.3 -3.6 -1.1 +2.8 +4.1 +5.5 +25.7 | -1.1 (6/10 faster) | -12.8 -5.3 -5.2 -3.1 -2.2 -1.0 +0.0 +0.7 +3.4 +18.0 | -1.0 (6/10 faster) | within the control |
+| create_security | 236.7 | -16.7 +6.2 +13.7 +22.6 +24.1 +24.7 +30.4 +31.0 +44.7 +68.8 | +24.7 (1/10 faster) | -6.5 -4.1 -1.2 +0.0 +3.9 +6.7 +9.0 +13.1 +17.3 +32.4 | +6.7 (3/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1416.8 | -56.7 -34.0 -24.6 +3.0 +7.0 +25.0 +27.1 +27.4 +36.8 +36.9 | +25.0 (3/10 faster) | -61.1 -41.1 -23.8 -12.8 -1.4 +3.5 +8.3 +10.5 +60.1 +66.1 | +3.5 (5/10 faster) | within the control |
+| write | 86.8 | -0.5 -0.4 -0.2 -0.2 -0.1 +0.0 +0.1 +0.3 +0.3 +19.5 | +0.0 (5/10 faster) | -0.7 -0.7 -0.7 -0.6 -0.5 -0.4 -0.3 -0.1 +0.7 +21.2 | -0.4 (8/10 faster) | within the control |
+| fsync | 130.7 | -18.0 -0.9 -0.7 -0.5 -0.2 +0.1 +0.2 +1.3 +2.8 +4.1 | +0.1 (5/10 faster) | -2.0 -2.0 -1.4 -0.8 -0.5 -0.2 +0.1 +0.1 +5.8 +15.7 | -0.2 (6/10 faster) | within the control |
+| close | 69.4 | -0.7 -0.1 +0.1 +0.1 +0.1 +0.1 +0.1 +0.5 +0.6 +0.6 | +0.1 (2/10 faster) | -0.5 -0.4 -0.2 -0.2 -0.2 -0.1 -0.1 -0.1 +0.5 +1.2 | -0.1 (8/10 faster) | within the control |
+| stat | 263.0 | -1.4 +2.5 +2.7 +2.8 +4.5 +5.1 +8.1 +8.1 +21.4 +28.0 | +5.1 (1/10 faster) | -2.5 -2.4 -1.9 -1.2 -1.2 -1.1 -1.0 -0.4 +8.4 +26.5 | -1.1 (8/10 faster) | within the control |
+| open | 193.5 | +2.0 +3.0 +4.0 +4.2 +4.5 +4.6 +4.7 +5.0 +29.7 +30.2 | +4.6 (0/10 faster) | -25.9 -2.2 -1.1 -0.7 -0.4 -0.4 +0.2 +1.0 +3.9 +22.7 | -0.4 (6/10 faster) | within the control |
+| read | 92.9 | -0.9 -0.6 -0.3 -0.3 -0.2 -0.1 +0.2 +0.5 +1.0 +1.5 | -0.1 (6/10 faster) | -1.4 -0.3 -0.3 -0.1 -0.1 -0.1 -0.1 +0.3 +1.2 +2.1 | -0.1 (7/10 faster) | within the control |
+| rename | 648.3 | -9.4 +1.6 +3.3 +5.9 +10.0 +10.5 +44.9 +48.7 +66.4 +87.8 | +10.5 (1/10 faster) | -59.5 -20.4 -7.1 -4.0 -1.8 +3.7 +5.5 +12.3 +76.0 +85.8 | +3.7 (5/10 faster) | within the control |
+| unlink | 364.8 | -16.0 -2.4 -1.6 +0.5 +4.5 +5.9 +6.4 +19.9 +47.5 +68.0 | +5.9 (3/10 faster) | -47.7 -8.7 -6.3 -1.1 -0.1 +1.2 +3.7 +9.7 +28.6 +33.1 | +1.2 (5/10 faster) | within the control |
+| create_security | 2417.2 | -95.8 -40.7 -40.4 -31.4 -25.4 -18.5 -17.2 +0.7 +36.3 +46.1 | -18.5 (7/10 faster) | -74.4 -42.7 -8.0 -7.2 -3.9 +6.3 +6.9 +12.3 +14.4 +52.5 | +6.3 (5/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 921.9 | -105.5 -27.6 -26.1 +12.5 +20.9 +21.8 +27.9 +29.7 +36.4 +43.2 | +21.8 (3/10 faster) | -132.4 -54.9 -39.8 -12.0 +4.9 +6.0 +7.5 +8.3 +25.7 +42.0 | +6.0 (4/10 faster) | within the control |
+| write | 90.0 | -26.6 -26.6 -17.1 -10.4 -4.7 -4.1 -1.7 +0.3 +0.7 +1.0 | -4.1 (7/10 faster) | -18.4 -8.4 -1.7 -0.8 -0.1 +2.1 +4.8 +8.8 +9.6 +11.9 | +2.1 (5/10 faster) | within the control |
+| fsync | 121.4 | -4.7 -2.7 -1.6 -0.8 -0.8 +0.0 +1.3 +4.8 +7.7 +10.0 | +0.0 (5/10 faster) | -1.8 -1.7 -1.4 -0.4 -0.4 +0.5 +0.6 +1.1 +1.7 +2.1 | +0.5 (5/10 faster) | within the control |
+| close | 67.1 | -2.1 -0.9 -0.6 -0.3 -0.2 +0.0 +0.1 +0.2 +0.8 +0.8 | +0.0 (5/10 faster) | -1.0 -0.8 -0.6 -0.5 -0.5 -0.3 -0.2 +0.1 +0.3 +0.4 | -0.3 (7/10 faster) | within the control |
+| stat | 263.1 | -2.1 -1.7 +1.0 +3.5 +3.5 +5.5 +5.8 +15.1 +22.6 +25.1 | +5.5 (2/10 faster) | -12.8 -8.6 -5.4 -3.4 +1.8 +4.8 +5.0 +6.2 +8.7 +13.2 | +4.8 (4/10 faster) | within the control |
+| open | 196.5 | -2.9 +2.7 +3.7 +6.4 +12.5 +14.3 +16.5 +18.7 +25.8 +28.3 | +14.3 (1/10 faster) | -32.5 -20.8 -1.0 +0.6 +2.8 +4.5 +5.1 +9.5 +17.7 +24.2 | +4.5 (3/10 faster) | within the control |
+| read | 94.2 | -17.3 -17.2 -12.2 -7.9 -5.5 -2.5 -1.0 -0.7 +0.5 +1.1 | -2.5 (8/10 faster) | -13.4 -5.3 -0.4 +0.5 +1.4 +1.9 +4.2 +8.8 +15.1 +15.7 | +1.9 (3/10 faster) | within the control |
+| rename | 605.5 | -12.3 -2.1 -2.1 +2.4 +4.1 +4.2 +17.0 +18.0 +25.2 +42.1 | +4.2 (3/10 faster) | -41.6 -22.5 +2.9 +4.3 +7.5 +9.5 +12.3 +24.2 +52.5 +74.6 | +9.5 (2/10 faster) | within the control |
+| unlink | 360.0 | -30.0 -21.5 -6.2 -5.8 -4.2 -2.1 +4.6 +18.1 +40.3 +49.5 | -2.1 (6/10 faster) | -44.9 -29.7 -10.5 -4.5 -1.9 +1.6 +11.1 +18.3 +33.7 +34.6 | +1.6 (5/10 faster) | within the control |
+| create_security | 1516.2 | -145.9 -14.0 -6.9 +11.7 +15.0 +27.5 +28.1 +30.1 +43.2 +77.6 | +27.5 (3/10 faster) | -183.4 -85.3 -68.4 -12.1 -10.2 +7.2 +7.3 +10.2 +30.9 +69.8 | +7.2 (5/10 faster) | within the control |
+
+### Cut (b), the per-kind spin choice: the 2-competitive form and the median form, both rejected
+
+**The change.** A-212's worker spins every shard reply for its window (the median one-way wake it measured as it started)
+and then parks. One window for every kind spun where it could not pay: on arm64 quiet a Create's reply came within it for
+0.2 % of its waits and a Rename's for 0.1 %, each spinning about 9.4 µs of CPU before it slept, while an Info's came within
+it for 98.2 % (diag-winfsp-overlap-50, run 42506936806). The cut let each kind of request (a `host::Op` variant) choose
+between spinning the window and parking at once by its own recent replies, each reply stamped with the instant its shard
+sent it so a kind that parks keeps learning (`crates/bridge-winfsp/src/spin_choice.rs`; its six tests on every host and the
+wait test in `reply.rs` on both Windows runners; the bridge's 110 tests and, for the first form, the CLI's WinFsp suites
+passed on both runners). Two rules, each over about 1,600 replies (the wake estimate's own precision rule):
+- **the 2-competitive form** (`agents/g258-step-continued-ada-perkind`, `f638d2aa`, `95f97256`; diag `diag-g258-2`, run
+  44273781244, windows-11-arm 09:27–11:54 UTC, windows-latest AMD Family 25 Model 17 09:28–11:16 UTC): a spin costs the
+  time spun and a park one wake, the window; a kind spins while the weighted mean of what spinning cost its replies is at
+  most the window;
+- **the median form** (`agents/g258-step-continued-ada-perkind-median`, `1e9afce6`; diag `diag-g258-7`, run 44293352092,
+  windows-11-arm 11:32–14:09 UTC, windows-latest AMD Family 25 Model 1 11:35–13:52 UTC): a kind spins while at least half
+  of its replies came within the window, so the spin catches its median reply.
+
+Both lanes ten runs, 0 failed, no stall, no heartbeat lapse.
+
+**Verdict: both rejected. Each loses on x86_64 and trades on arm64.**
+- windows-latest, the 2-competitive form: 7 p50 cells slower beyond the control, none faster: loaded close +16.7 µs (0 of
+  10 runs faster; within 1 µs of that in every run: a wake added to each), unlink +27.4 (0 of 10), create_security +59.2
+  (0 of 10); quiet fsync +15.4, stat +19.1, rename +54.4, unlink +28.6. The rule parked kinds whose median reply the spin
+  caught (there a Release's came within the window for 63 % of its waits loaded and an Open's for 54 % quiet,
+  diag-winfsp-overlap-50).
+- windows-latest, the median form: slower beyond the control on loaded close +20.3 (0 of 10), stat +42.5 (2 of 10; p99
+  +5,818), read +20.0 (1 of 10), fsync +19.3, quiet stat +19.8, loaded p99 open and p999 rename; none faster. Parking
+  only kinds whose median reply missed did not spare this runner: each p50 that moved, moved by about one wake.
+- windows-11-arm, the 2-competitive form: faster beyond the control on loaded write p50 −19.6 µs (10 of 10) and rename
+  −25.2 (9 of 10; p99 −1,857); slower on loaded create +8.0 (1 of 10 faster), stat +20.2 (1 of 10; p99 +6,080), unlink
+  +16.1 (0 of 10), quiet fsync +15.7.
+- windows-11-arm, the median form: faster beyond the control on loaded write −42.3 µs (10 of 10) and rename −35.2 (10 of
+  10), about half of the loaded write's gap against the DLL below; slower on loaded stat +11.7 (1 of 10; p99 +7,160, 0 of
+  10), quiet write +4.3 and fsync +10.9.
+- So a spin that misses costs arm64's loaded shards a CPU they need, and a park costs x86_64 a wake it does not otherwise
+  pay. A choice that gets the first without the second needs a signal of contention, not of the kind alone: owed, below.
+- The per-kind count each worker logs as it ends was lost in these runs: the bench's teardown ends each anchor right after
+  its unmount answers, before the worker's last line. The Windows wait test holds the count instead
+  (`a_kind_whose_replies_came_late_is_waited_for_parked_at_once`).
+
+arm64 (windows-11-arm), loaded, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 206.8 | -6.4 +1.3 +7.2 +7.6 +7.7 +8.0 +8.2 +9.6 +13.7 +16.0 | +8.0 (1/10 faster) | -13.6 -9.2 -6.8 -6.1 -2.2 -1.1 +3.3 +3.9 +6.2 +6.9 | -1.1 (6/10 faster) | **slower** beyond the control |
+| write | 186.0 | -47.7 -43.6 -41.2 -26.8 -25.7 -19.6 -18.4 -14.9 -9.3 -8.2 | -19.6 (10/10 faster) | -5.9 -1.6 -1.0 -0.7 +0.7 +1.1 +3.5 +5.6 +6.0 +8.9 | +1.1 (4/10 faster) | **faster** beyond the control |
+| fsync | 108.5 | -1.5 +1.8 +2.1 +3.8 +4.5 +5.8 +8.7 +10.0 +10.2 +10.8 | +5.8 (1/10 faster) | -11.8 -10.7 -8.6 -4.0 -3.4 -2.5 -0.1 +8.6 +8.8 +9.2 | -2.5 (7/10 faster) | within the control |
+| close | 4638.2 | -313.9 -301.6 -104.4 -88.8 +35.2 +145.7 +221.1 +260.0 +271.2 +289.9 | +145.7 (4/10 faster) | -549.5 -523.5 -315.3 -240.9 -65.5 -4.6 +71.8 +110.6 +148.6 +165.7 | -4.6 (6/10 faster) | within the control |
+| stat | 152.9 | -9.4 +3.6 +4.2 +12.4 +15.0 +20.2 +20.9 +21.6 +22.8 +24.9 | +20.2 (1/10 faster) | -2.7 +0.2 +1.2 +1.4 +2.5 +2.6 +3.3 +4.1 +4.1 +4.5 | +2.6 (1/10 faster) | **slower** beyond the control |
+| open | 4059.0 | -336.7 -93.3 -80.1 -57.5 -50.7 -40.1 +52.4 +103.0 +160.9 +202.4 | -40.1 (6/10 faster) | -395.8 -191.1 -136.3 -124.9 -123.3 -94.4 +15.7 +44.6 +62.3 +106.8 | -94.4 (6/10 faster) | within the control |
+| read | 44.7 | -1.5 -1.2 -1.0 -0.5 -0.4 -0.1 +0.0 +0.1 +0.1 +0.5 | -0.1 (6/10 faster) | -2.4 -1.9 -1.6 -1.1 -0.8 -0.3 +0.0 +0.2 +0.2 +0.7 | -0.3 (6/10 faster) | within the control |
+| rename | 512.2 | -33.0 -30.8 -29.9 -27.1 -26.1 -25.2 -23.5 -8.7 -0.4 +11.6 | -25.2 (9/10 faster) | -3.7 +4.2 +4.2 +7.0 +7.3 +9.4 +10.0 +10.4 +11.9 +16.0 | +9.4 (1/10 faster) | **faster** beyond the control |
+| unlink | 341.4 | +10.8 +12.9 +14.1 +15.3 +15.9 +16.1 +16.6 +16.6 +20.1 +31.3 | +16.1 (0/10 faster) | -2.9 -1.0 +0.6 +1.9 +2.1 +2.1 +2.9 +3.5 +6.9 +9.5 | +2.1 (2/10 faster) | **slower** beyond the control |
+| create_security | 238.5 | -10.3 -9.2 -8.6 -6.6 -5.0 -4.7 -3.9 -2.0 +2.5 +9.0 | -4.7 (8/10 faster) | -6.2 -2.4 -1.3 -0.5 +2.3 +3.4 +4.0 +4.3 +5.7 +6.4 | +3.4 (4/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 203.1 | -8.5 -8.4 -4.1 +1.1 +2.8 +4.5 +4.6 +7.5 +9.4 +10.5 | +4.5 (3/10 faster) | -3.7 -0.8 -0.6 +0.7 +1.1 +1.8 +2.7 +7.1 +10.6 +13.8 | +1.8 (3/10 faster) | within the control |
+| write | 96.8 | +2.7 +4.2 +4.6 +4.8 +5.9 +7.2 +8.3 +9.5 +10.0 +12.0 | +7.2 (0/10 faster) | -4.3 -3.8 -1.3 -0.4 +2.5 +2.6 +3.5 +3.9 +4.1 +9.6 | +2.6 (4/10 faster) | within the control |
+| fsync | 110.3 | -1.4 +7.6 +9.8 +10.0 +13.1 +15.7 +17.1 +17.3 +21.8 +22.0 | +15.7 (1/10 faster) | -7.5 -5.7 -3.5 -1.9 -0.4 +1.5 +3.0 +5.9 +6.9 +9.1 | +1.5 (5/10 faster) | **slower** beyond the control |
+| close | 4083.9 | -58.7 -57.8 -52.0 -6.2 +21.1 +34.6 +35.2 +64.6 +147.9 +261.6 | +34.6 (4/10 faster) | -197.3 -145.0 -101.8 -56.0 -50.3 +31.1 +45.2 +99.9 +110.0 +132.8 | +31.1 (5/10 faster) | within the control |
+| stat | 169.0 | -7.6 -0.7 -0.4 +1.3 +1.7 +1.9 +2.8 +10.3 +20.8 +33.3 | +1.9 (3/10 faster) | -15.7 -3.5 +0.7 +1.0 +4.3 +5.6 +6.4 +12.2 +16.2 +25.9 | +5.6 (2/10 faster) | within the control |
+| open | 3838.3 | -39.8 +1.0 +3.9 +11.4 +12.1 +31.8 +32.0 +38.4 +59.5 +67.4 | +31.8 (1/10 faster) | -76.1 -56.2 -53.8 -38.2 -5.9 +15.2 +23.3 +43.8 +56.1 +103.1 | +15.2 (5/10 faster) | within the control |
+| read | 42.6 | -2.3 +0.1 +0.3 +0.3 +0.3 +0.5 +0.6 +0.7 +1.2 +1.5 | +0.5 (1/10 faster) | -0.7 -0.7 -0.4 -0.1 +0.0 +0.0 +0.1 +0.4 +0.8 +1.3 | +0.0 (4/10 faster) | within the control |
+| rename | 468.0 | -5.0 -3.7 -3.4 -0.5 -0.1 +0.5 +6.5 +25.5 +39.0 +40.6 | +0.5 (5/10 faster) | -5.7 -2.9 +0.6 +4.1 +4.5 +6.7 +7.3 +8.2 +8.2 +14.1 | +6.7 (2/10 faster) | within the control |
+| unlink | 286.2 | -6.9 -6.5 -3.7 -0.6 +3.4 +3.7 +10.6 +14.9 +19.3 +22.2 | +3.7 (4/10 faster) | -1.6 -0.6 +0.5 +1.3 +3.8 +4.5 +6.4 +7.7 +8.7 +12.2 | +4.5 (2/10 faster) | within the control |
+| create_security | 228.1 | -24.5 -17.8 -16.7 -15.4 -7.7 -5.7 -2.9 -1.8 +1.3 +11.6 | -5.7 (8/10 faster) | -16.3 -11.8 -8.1 -1.9 +2.1 +6.1 +7.4 +7.9 +10.3 +14.4 | +6.1 (4/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1105.1 | -2.9 +0.0 +2.1 +9.8 +41.9 +46.2 +53.6 +74.1 +80.2 +81.8 | +46.2 (1/10 faster) | -38.1 -28.7 -27.1 -23.6 -17.6 -12.4 +27.3 +27.3 +38.7 +54.4 | -12.4 (6/10 faster) | within the control |
+| write | 74.5 | +0.0 +4.6 +14.4 +14.5 +15.7 +16.0 +16.1 +17.2 +17.8 +18.1 | +16.0 (0/10 faster) | -1.2 -0.4 -0.4 -0.2 -0.1 +0.0 +0.4 +0.9 +15.0 +16.8 | +0.0 (5/10 faster) | within the control |
+| fsync | 105.7 | -0.9 +0.0 +13.4 +16.1 +16.9 +17.8 +28.9 +32.8 +33.2 +34.0 | +17.8 (1/10 faster) | -1.1 -0.9 -0.7 -0.3 -0.1 +0.0 +0.0 +1.1 +32.2 +33.0 | +0.0 (5/10 faster) | within the control |
+| close | 55.1 | +16.3 +16.4 +16.5 +16.7 +16.7 +16.7 +16.8 +16.8 +17.2 +17.3 | +16.7 (0/10 faster) | -0.6 -0.4 -0.2 -0.2 -0.1 -0.1 +0.1 +0.2 +1.0 +1.3 | -0.1 (6/10 faster) | **slower** beyond the control |
+| stat | 191.7 | +0.5 +16.9 +17.8 +33.7 +36.2 +36.4 +37.2 +73.3 +75.9 +76.8 | +36.4 (0/10 faster) | -1.0 -0.5 -0.3 -0.2 -0.2 +0.8 +0.9 +1.1 +34.9 +39.1 | +0.8 (5/10 faster) | within the control |
+| open | 153.9 | -1.1 +0.5 +1.0 +14.5 +17.8 +18.1 +19.0 +37.3 +37.3 +39.8 | +18.1 (1/10 faster) | -0.9 +0.5 +0.6 +0.7 +0.8 +1.2 +1.3 +3.1 +21.8 +22.8 | +1.2 (1/10 faster) | within the control |
+| read | 75.3 | -0.1 +0.2 +0.4 +0.5 +0.5 +1.1 +1.7 +17.3 +17.7 +18.7 | +1.1 (1/10 faster) | -0.3 -0.1 +0.2 +0.2 +0.5 +0.5 +0.5 +1.0 +17.2 +17.8 | +0.5 (2/10 faster) | within the control |
+| rename | 489.0 | +1.9 +5.4 +14.6 +38.4 +72.7 +75.3 +79.2 +195.8 +196.6 +209.9 | +75.3 (0/10 faster) | -2.7 -2.2 -0.8 -0.4 +2.5 +2.9 +5.1 +5.5 +107.1 +109.2 | +2.9 (4/10 faster) | within the control |
+| unlink | 326.4 | +4.1 +4.3 +11.2 +12.5 +18.4 +27.4 +29.1 +30.9 +34.5 +48.0 | +27.4 (0/10 faster) | -19.8 -8.7 -3.3 -3.1 +2.2 +2.7 +4.7 +14.6 +16.9 +18.2 | +2.7 (4/10 faster) | **slower** beyond the control |
+| create_security | 1829.1 | +44.9 +52.4 +54.2 +54.8 +55.6 +59.2 +72.7 +78.0 +86.4 +94.5 | +59.2 (0/10 faster) | -18.6 -11.0 -0.7 +5.5 +9.8 +12.0 +21.3 +25.1 +28.0 +36.0 | +12.0 (3/10 faster) | **slower** beyond the control |
+
+x86_64 (windows-latest), quiet, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 652.3 | -42.7 -41.8 +0.4 +1.5 +5.4 +16.7 +32.4 +34.7 +44.7 +50.9 | +16.7 (2/10 faster) | -43.3 -30.7 -6.9 +0.4 +2.7 +18.1 +20.2 +23.8 +36.0 +45.3 | +18.1 (3/10 faster) | within the control |
+| write | 64.8 | -30.8 -15.4 -12.7 -10.9 +4.4 +10.9 +17.4 +18.9 +22.3 +22.4 | +10.9 (4/10 faster) | -29.2 -25.6 -12.0 -6.4 -4.5 +18.8 +20.5 +21.1 +26.9 +28.7 | +18.8 (5/10 faster) | within the control |
+| fsync | 74.9 | -11.5 -6.9 -1.2 +4.3 +8.3 +15.4 +16.2 +17.2 +17.5 +23.6 | +15.4 (3/10 faster) | -8.2 -4.6 -2.4 -1.8 -0.2 +3.2 +4.4 +4.8 +6.7 +9.0 | +3.2 (5/10 faster) | **slower** beyond the control |
+| close | 39.5 | -0.5 -0.1 +0.1 +0.4 +0.5 +0.7 +0.8 +0.9 +1.0 +1.1 | +0.7 (2/10 faster) | -0.6 -0.2 -0.1 -0.1 +0.0 +0.1 +0.4 +0.5 +0.5 +0.9 | +0.1 (4/10 faster) | within the control |
+| stat | 158.3 | -24.9 -13.1 -5.7 +9.3 +14.0 +19.1 +20.9 +24.8 +27.3 +30.2 | +19.1 (3/10 faster) | -12.4 -10.0 -5.8 -4.1 -2.8 +7.8 +8.3 +10.7 +14.4 +17.9 | +7.8 (5/10 faster) | **slower** beyond the control |
+| open | 115.8 | -19.5 -19.5 -16.2 -11.0 -2.1 +0.8 +9.6 +10.1 +18.7 +20.2 | +0.8 (5/10 faster) | -19.9 -16.4 -4.1 -2.8 -2.0 +10.0 +12.7 +13.4 +18.2 +20.0 | +10.0 (5/10 faster) | within the control |
+| read | 9.1 | -0.5 -0.2 +0.0 +0.0 +0.0 +0.0 +0.1 +0.1 +0.2 +0.3 | +0.0 (2/10 faster) | -0.1 -0.1 -0.1 -0.1 +0.0 +0.0 +0.0 +0.1 +0.1 +0.5 | +0.0 (4/10 faster) | within the control |
+| rename | 354.6 | -52.0 -35.2 -17.0 +9.2 +36.6 +54.4 +55.4 +69.8 +73.9 +86.5 | +54.4 (3/10 faster) | -45.7 -40.6 -15.5 -12.3 -7.8 +28.8 +41.5 +42.4 +46.9 +46.9 | +28.8 (5/10 faster) | **slower** beyond the control |
+| unlink | 196.0 | -28.7 -18.4 -7.6 +11.5 +16.5 +28.6 +31.5 +34.4 +40.2 +43.1 | +28.6 (3/10 faster) | -18.3 -11.8 -7.6 +1.3 +1.5 +9.7 +20.1 +22.2 +22.8 +23.9 | +9.7 (3/10 faster) | **slower** beyond the control |
+| create_security | 1108.3 | -92.8 -44.7 +2.3 +17.0 +17.7 +23.9 +29.7 +39.3 +50.2 +73.4 | +23.9 (2/10 faster) | -66.9 -57.1 +15.1 +21.0 +23.7 +23.9 +31.3 +32.8 +43.5 +65.7 | +23.9 (2/10 faster) | within the control |
+
+arm64 (windows-11-arm), loaded, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 244.0 | -20.9 -4.1 -0.3 +3.4 +5.9 +6.2 +8.5 +11.4 +20.0 +23.7 | +6.2 (3/10 faster) | -20.6 -20.4 -13.5 -11.3 -4.6 -4.0 -3.7 +1.7 +9.6 +10.9 | -4.0 (7/10 faster) | within the control |
+| write | 183.3 | -52.7 -50.8 -49.3 -46.2 -43.6 -42.3 -35.3 -35.1 -18.7 -11.3 | -42.3 (10/10 faster) | -7.5 -2.2 -1.6 -0.7 +1.3 +2.2 +5.6 +6.6 +8.7 +12.9 | +2.2 (4/10 faster) | **faster** beyond the control |
+| fsync | 124.5 | -9.9 -3.5 -2.7 -2.6 -0.6 -0.5 +0.5 +5.6 +5.6 +8.6 | -0.5 (6/10 faster) | -13.0 -8.1 -7.8 -7.4 -6.6 -4.4 -3.4 -1.2 +6.6 +10.8 | -4.4 (8/10 faster) | within the control |
+| close | 5342.2 | -1671.3 -335.6 -248.5 -141.1 +17.4 +84.5 +148.8 +200.4 +655.8 +886.5 | +84.5 (4/10 faster) | -1329.7 -1312.2 -607.0 -457.4 -346.2 -219.7 +56.3 +165.6 +247.3 +629.7 | -219.7 (6/10 faster) | within the control |
+| stat | 154.5 | -1.1 +0.4 +6.9 +8.1 +10.9 +11.7 +18.7 +19.6 +20.0 +20.2 | +11.7 (1/10 faster) | -1.1 -0.1 +0.4 +0.5 +0.7 +0.8 +1.7 +1.8 +3.2 +4.3 | +0.8 (2/10 faster) | **slower** beyond the control |
+| open | 4425.7 | -4252.5 -179.1 -176.6 -162.4 -12.7 -9.4 -7.8 +108.9 +253.3 +486.5 | -9.4 (7/10 faster) | -3917.9 -943.0 -262.6 -204.6 -203.8 -156.7 +80.6 +125.1 +195.4 +545.6 | -156.7 (6/10 faster) | within the control |
+| read | 52.5 | -6.2 -3.0 -1.1 -1.0 -0.8 -0.2 +0.1 +0.5 +1.5 +2.5 | -0.2 (6/10 faster) | -6.3 -3.6 -1.9 -1.2 -1.1 -1.0 -0.1 +1.4 +1.7 +1.9 | -1.0 (7/10 faster) | within the control |
+| rename | 534.9 | -50.3 -47.2 -46.9 -43.6 -39.8 -35.2 -32.7 -30.5 -16.4 -7.9 | -35.2 (10/10 faster) | -2.6 +0.0 +3.2 +3.2 +4.4 +6.2 +7.3 +7.7 +10.1 +18.5 | +6.2 (1/10 faster) | **faster** beyond the control |
+| unlink | 354.4 | -8.5 -4.2 -3.1 -0.9 -0.3 -0.1 +0.1 +1.4 +3.8 +3.9 | -0.1 (6/10 faster) | -5.3 -3.1 -2.9 -0.9 +1.3 +1.9 +2.2 +3.4 +5.1 +10.1 | +1.9 (4/10 faster) | within the control |
+| create_security | 241.4 | -10.5 -10.2 -9.4 -4.2 -3.4 -3.2 -2.4 -2.2 -1.1 +0.4 | -3.2 (9/10 faster) | -8.0 -4.8 +0.9 +1.1 +2.8 +3.6 +4.8 +7.3 +8.6 +12.3 | +3.6 (2/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 235.2 | -5.8 -3.2 -2.6 -2.3 -1.0 +0.2 +0.7 +0.7 +1.5 +5.8 | +0.2 (5/10 faster) | -6.2 -6.1 -4.2 -3.8 -2.7 -1.6 -1.6 +1.3 +1.7 +3.3 | -1.6 (7/10 faster) | within the control |
+| write | 101.5 | -0.6 +2.9 +3.2 +3.9 +4.3 +4.3 +5.1 +5.3 +7.1 +7.6 | +4.3 (1/10 faster) | -5.1 -4.9 -3.8 -3.1 -1.5 -0.9 -0.4 -0.4 +0.9 +2.6 | -0.9 (8/10 faster) | **slower** beyond the control |
+| fsync | 118.0 | -1.5 +4.6 +6.2 +7.1 +10.5 +10.9 +13.2 +13.3 +16.2 +22.8 | +10.9 (1/10 faster) | -7.2 -6.2 -2.8 -2.2 -2.1 -0.6 -0.3 +2.4 +4.0 +4.0 | -0.6 (7/10 faster) | **slower** beyond the control |
+| close | 4295.1 | -210.7 -79.2 -66.7 -45.9 -37.0 -17.0 -15.9 -4.4 +53.0 +55.2 | -17.0 (8/10 faster) | -172.8 -134.6 -106.0 -102.2 -38.5 +26.0 +26.3 +36.6 +51.4 +83.9 | +26.0 (5/10 faster) | within the control |
+| stat | 187.7 | -22.4 -11.4 -8.2 -4.1 -3.7 -1.9 -0.6 -0.6 +1.2 +8.3 | -1.9 (8/10 faster) | -25.8 -3.5 -1.9 -1.7 -1.5 +0.6 +1.0 +1.3 +1.6 +23.8 | +0.6 (5/10 faster) | within the control |
+| open | 4111.5 | -178.3 -99.5 -34.8 -20.5 +3.6 +70.0 +102.3 +156.9 +191.8 +194.5 | +70.0 (4/10 faster) | -170.6 -97.2 -89.6 -77.3 +34.6 +44.3 +52.4 +106.3 +154.7 +161.6 | +44.3 (4/10 faster) | within the control |
+| read | 48.4 | -3.2 -2.7 -0.2 +0.0 +0.1 +0.5 +0.6 +0.6 +1.5 +3.4 | +0.5 (3/10 faster) | -1.4 -1.3 -0.8 -0.6 -0.2 +0.1 +1.5 +1.6 +1.7 +2.2 | +0.1 (5/10 faster) | within the control |
+| rename | 491.4 | -5.6 +2.8 +3.1 +6.5 +7.2 +8.4 +12.6 +18.7 +23.5 +70.1 | +8.4 (1/10 faster) | -13.1 -4.9 -1.4 -0.6 +0.0 +1.4 +2.9 +3.3 +4.9 +9.0 | +1.4 (4/10 faster) | within the control |
+| unlink | 299.7 | -6.7 -4.7 -4.6 -4.5 -3.8 -2.8 +0.7 +2.6 +4.9 +28.3 | -2.8 (6/10 faster) | -5.9 +1.2 +1.9 +2.3 +2.7 +4.3 +4.8 +6.1 +10.0 +10.7 | +4.3 (1/10 faster) | within the control |
+| create_security | 235.2 | -15.4 -11.4 -10.0 -6.4 -5.4 -1.6 +0.8 +1.1 +2.0 +5.2 | -1.6 (6/10 faster) | -7.9 -7.4 -5.8 -5.3 -0.7 -0.6 +0.5 +2.0 +4.9 +5.1 | -0.6 (6/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1436.3 | -85.3 -51.9 -49.3 -33.9 -24.3 +17.9 +35.8 +46.8 +55.8 +58.0 | +17.9 (5/10 faster) | -116.4 -52.8 -50.0 -29.8 -20.6 -18.2 -1.5 +31.7 +42.1 +77.2 | -18.2 (7/10 faster) | within the control |
+| write | 88.5 | -3.5 -0.3 -0.1 +0.0 +1.3 +1.4 +13.4 +19.1 +20.7 +21.2 | +1.4 (3/10 faster) | -19.0 -8.4 -4.2 -3.2 -0.3 -0.3 -0.3 -0.2 +0.9 +2.5 | -0.3 (8/10 faster) | within the control |
+| fsync | 130.8 | -8.4 -0.3 -0.2 +0.5 +1.5 +19.3 +21.1 +23.7 +41.6 +42.2 | +19.3 (3/10 faster) | -23.5 -21.2 -19.1 -7.7 -0.6 +0.1 +0.3 +0.5 +5.4 +18.0 | +0.1 (5/10 faster) | **slower** beyond the control |
+| close | 69.0 | +0.0 +0.2 +1.2 +19.5 +19.9 +20.3 +20.6 +20.9 +21.0 +21.1 | +20.3 (0/10 faster) | -1.5 -1.1 -1.0 -1.0 -0.5 -0.4 -0.4 -0.1 +0.0 +0.5 | -0.4 (8/10 faster) | **slower** beyond the control |
+| stat | 261.8 | -29.5 -0.2 +1.4 +2.6 +3.2 +42.5 +48.7 +49.1 +49.7 +85.5 | +42.5 (2/10 faster) | -29.5 -29.2 -4.2 -1.0 -0.7 -0.3 +0.6 +3.2 +3.4 +29.3 | -0.3 (6/10 faster) | **slower** beyond the control |
+| open | 192.7 | -24.6 -0.5 +0.0 +1.2 +4.3 +22.7 +22.9 +24.5 +25.7 +27.1 | +22.7 (2/10 faster) | -24.9 -23.5 -5.4 -1.2 -0.8 -0.3 -0.1 +22.5 +25.4 +26.7 | -0.3 (7/10 faster) | within the control |
+| read | 92.9 | -0.2 +0.0 +0.5 +0.8 +1.7 +20.0 +20.7 +21.5 +21.7 +22.2 | +20.0 (1/10 faster) | -1.8 -1.1 -0.3 -0.2 -0.1 -0.1 +0.0 +0.7 +1.1 +1.1 | -0.1 (6/10 faster) | **slower** beyond the control |
+| rename | 638.7 | -96.6 +0.0 +4.8 +20.4 +28.4 +94.7 +120.2 +150.8 +157.7 +189.5 | +94.7 (1/10 faster) | -97.5 -94.4 -32.1 -18.8 -3.2 +1.2 +3.3 +7.7 +38.6 +95.1 | +1.2 (5/10 faster) | within the control |
+| unlink | 358.6 | -42.2 -0.5 +3.6 +13.3 +13.9 +26.3 +29.0 +49.3 +65.5 +70.1 | +26.3 (2/10 faster) | -53.2 -29.1 -20.4 -8.1 -0.3 +1.5 +2.0 +29.6 +45.7 +64.7 | +1.5 (5/10 faster) | within the control |
+| create_security | 2402.5 | -112.2 -42.6 -35.5 -29.5 -25.6 -20.0 -6.0 -0.5 +32.6 +34.1 | -20.0 (8/10 faster) | -62.6 -61.5 -34.8 -12.0 -10.4 -3.0 +0.4 +8.6 +56.7 +60.6 | -3.0 (6/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 931.3 | -61.2 -35.1 -22.6 -15.1 +6.5 +23.2 +32.4 +38.2 +47.1 +49.1 | +23.2 (4/10 faster) | -40.8 -40.1 -29.4 -24.1 -22.2 -14.2 +19.0 +25.2 +29.8 +58.4 | -14.2 (6/10 faster) | within the control |
+| write | 105.2 | -27.1 -12.6 -4.1 -2.9 +3.2 +4.3 +7.2 +10.6 +11.3 +35.6 | +4.3 (4/10 faster) | -28.4 -25.2 -12.7 -12.3 -3.4 +0.1 +2.5 +6.4 +9.5 +15.9 | +0.1 (5/10 faster) | within the control |
+| fsync | 120.4 | -2.2 -1.8 +0.3 +2.3 +4.2 +8.8 +21.7 +22.1 +22.7 +46.0 | +8.8 (2/10 faster) | -4.5 -3.3 -1.6 +0.0 +0.2 +0.2 +0.5 +3.2 +5.0 +10.1 | +0.2 (3/10 faster) | within the control |
+| close | 65.3 | -0.6 +0.0 +0.1 +0.1 +0.7 +1.1 +1.1 +1.2 +2.2 +4.2 | +1.1 (1/10 faster) | -0.9 -0.5 -0.4 -0.2 -0.1 +0.0 +0.0 +0.1 +0.2 +1.2 | +0.0 (5/10 faster) | within the control |
+| stat | 263.0 | -14.0 -12.5 -4.1 -3.7 +18.7 +19.8 +24.9 +27.6 +28.4 +39.7 | +19.8 (4/10 faster) | -10.9 -9.8 -7.0 -5.7 -4.3 -0.7 +0.3 +3.1 +5.2 +15.1 | -0.7 (6/10 faster) | **slower** beyond the control |
+| open | 208.1 | -36.8 -12.8 -11.8 +0.4 +1.7 +9.5 +15.6 +18.1 +19.4 +40.6 | +9.5 (3/10 faster) | -28.6 -22.7 -14.1 -7.8 -6.3 -2.4 +1.2 +7.0 +22.0 +34.4 | -2.4 (6/10 faster) | within the control |
+| read | 110.8 | -25.4 -14.5 -4.0 -3.7 -0.9 -0.6 +2.7 +4.3 +16.3 +35.4 | -0.6 (6/10 faster) | -24.8 -21.2 -15.5 -12.0 -6.8 -2.8 -1.4 +2.6 +10.4 +30.1 | -2.8 (7/10 faster) | within the control |
+| rename | 605.4 | -59.6 -40.6 -27.4 +15.3 +35.6 +37.6 +47.9 +79.7 +96.5 +104.6 | +37.6 (3/10 faster) | -92.4 -38.4 -31.9 -21.3 -20.0 -17.6 +3.1 +23.7 +38.4 +66.7 | -17.6 (6/10 faster) | within the control |
+| unlink | 362.3 | -54.7 -27.7 -27.5 -16.8 -2.2 +24.3 +34.7 +40.8 +43.3 +48.3 | +24.3 (5/10 faster) | -65.3 -30.0 -28.2 -18.4 -12.9 -8.3 +11.0 +28.4 +31.8 +49.7 | -8.3 (6/10 faster) | within the control |
+| create_security | 1514.4 | -59.1 -19.6 -9.7 -7.2 +8.0 +17.0 +17.2 +39.8 +41.4 +96.8 | +17.0 (4/10 faster) | -57.3 -32.3 -30.7 -28.8 -24.7 -0.6 +6.8 +8.0 +32.2 +86.4 | -0.6 (6/10 faster) | within the control |
+
+### Main against main as cut (c) landed: nothing large lost since
+
+**The question.** `diag-g258-3`'s first arm64 run put main's quiet stat p50 51 µs over the DLL arm's, where the last
+comparison before cut (c) (diag-winfsp-overlap-41) put the receiver 17.7 µs over. Had main lost time since cut (c) landed
+(B11, `29ef4521`, 2026-11-11), 551 commits before main `69cd38b2`?
+
+**The A/B.** Diag `diag-g258-5` (run 44279316423): main (`69cd38b2` with the bench's `create_security`), a control
+(main's binary copied) and old (`29ef4521`), interleaved on one VM of each runner, quiet and loaded, ten runs a lane, 0
+failed, no stall, the list rotating each run. windows-11-arm: win11-vs2026-arm64 20261112.217.1, Windows 10.0.26200.9974;
+windows-latest: win25-vs2026 20261103.298.1, Windows 10.0.26100.33674, AMD Family 26 Model 2; 4 CPUs each, 2026-11-18
+09:50–12:46 UTC. The command is windows-ab.sh's with `ARMS="main=… control=… old=…"`, `RUNS=10 SPINNERS_PER_CPU=2`.
+
+**Verdict: nothing large.** One cell a runner is beyond the control's spread, each the old build faster: arm64 loaded
+create p50 by 3.6 µs (7 of 10 runs), x86_64 quiet create_security p50 by 25.9 µs (8 of 10). Within the spread, arm64's old
+build was faster in every run on a quiet rename (median 9.1 µs) and a loaded write (9.3 µs), and in 9 of 10 on a loaded
+stat (1.6 µs). The arm64 stat gap against the DLL is not a loss since cut (c): old and main stat alike (quiet p50 −1.2 µs,
+6 of 10).
+
+### What remains against the DLL dispatcher after cut (c)
+
+**The A/B.** Diag `diag-g258-6` (run 44292211799): main (`69cd38b2`, the bench as it was, nine ops), a control and the
+DLL arm (`71cf09ac`, built from its own tree as diag-winfsp-overlap-41 built it), ten runs a lane. windows-11-arm 11:24–
+13:50 UTC, 0 failed; windows-latest (AMD Family 26 Model 2) 11:22–13:15 UTC, 9 done and run 4 failed: the DLL arm's daemon
+missed its heartbeat under load ("the daemon's heartbeat lapsed; killing it") and its drive died, so that run's loaded
+pass is lost for every arm. Read by Step 7's rule (main is within the DLL's spread at an op's p50 or p99 when its median
+run is no slower than the DLL arm's slowest run), with each run's main − dll beside the control's.
+
+**Verdict.**
+- **windows-latest: 5 cells of 36 beyond the DLL's spread**, four of them by under 5 µs: quiet close p50 (main − dll +2.4
+  µs within each run), open p50 (+11.5), read p50 (+0.3), loaded close p50 (+1.3); and loaded rename p99 (+7,076). Loaded,
+  main is faster than the DLL arm at the p50 of every op but close and open (median within each run: create −34.4, write
+  −10.3, fsync −16.0, stat −10.1, read −44.0, rename −27.6, unlink −13.8 µs).
+- **windows-11-arm: 10 cells of 36 beyond it.** At the p50, within each run: quiet stat +42.4 µs, rename +81.5, unlink
+  +40.2, read +5.1; loaded write +86.9, rename +74.8, unlink +31.2, stat +6.7; and loaded open p99 and rename p99. The
+  control's differences sit within 3 µs of main's in every one, so these are the receiver's, not the bench's.
+- Against diag-winfsp-overlap-41 (before cut (c), A-215's combined form `comb2` against the DLL): arm64's quiet stat gap
+  +17.7 µs then, +42.4 now; rename +35.8 then, +81.5 now; loaded write +84.5 then, +86.9 now. Main lost no more than about
+  9 µs of it since cut (c) landed (the section above), and the main arm then was the combined form at two workers, which
+  does not ship, so the two runs do not separate what moved; the arm64 gap is what this run measures.
+
+#### arm64 (windows-11-arm), run 44292211799: 10 runs done, 0 failed
+
+arm64 (windows-11-arm), run 44292211799, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 208.1 | 214.5 | within | +17.5 +18.0 +19.0 +19.5 +20.1 +20.2 +20.7 +21.7 +22.1 +27.0 | +20.2 | +20.7 |
+| create | p99 | 421.3 | 582.1 | within | -138.5 -98.0 -66.0 -5.4 +14.7 +18.2 +31.2 +68.5 +72.6 +86.5 | +18.2 | +24.4 |
+| write | p50 | 92.8 | 103.2 | within | -6.5 -5.1 -5.0 -4.2 -4.2 -3.8 +0.2 +0.7 +1.3 +1.7 | -3.8 | -1.6 |
+| write | p99 | 293.0 | 653.2 | within | -41.5 -6.2 +2.7 +6.2 +18.4 +20.2 +23.8 +44.4 +62.4 +578.6 | +20.2 | -0.6 |
+| fsync | p50 | 109.7 | 114.7 | within | -2.0 -1.8 -1.7 +0.0 +0.5 +0.7 +0.9 +1.1 +1.2 +1.7 | +0.7 | +0.1 |
+| fsync | p99 | 211.5 | 355.7 | within | -101.3 -52.2 -38.8 -14.5 -12.2 +13.1 +13.2 +21.9 +22.9 +43.6 | +13.1 | +3.0 |
+| close | p50 | 4374.3 | 4487.9 | within | -14.6 +28.1 +78.4 +95.6 +100.5 +100.9 +114.3 +132.5 +163.2 +227.9 | +100.9 | +160.5 |
+| close | p99 | 6523.3 | 16471.5 | within | -9568.3 -9204.6 -5358.2 -3331.9 -1671.7 -1347.8 -1238.0 -1170.8 -604.8 -604.3 | -1347.8 | -1266.1 |
+| stat | p50 | 162.7 | 122.1 | **worse** by 40.6 | +35.9 +37.7 +41.4 +42.0 +42.3 +42.4 +43.1 +44.8 +47.6 +51.9 | +42.4 | +41.2 |
+| stat | p99 | 254.1 | 310.5 | within | -65.8 -50.4 -33.3 -30.8 +40.3 +54.7 +62.0 +89.3 +175.8 +212.8 | +54.7 | +51.2 |
+| open | p50 | 3835.2 | 4034.0 | within | +15.8 +29.8 +67.7 +76.8 +84.0 +124.0 +181.6 +226.6 +233.4 +264.2 | +124.0 | +122.3 |
+| open | p99 | 5679.2 | 6662.5 | within | +39.3 +103.9 +117.6 +126.7 +141.8 +182.0 +206.4 +223.9 +300.7 +433.4 | +182.0 | +322.2 |
+| read | p50 | 44.4 | 43.2 | **worse** by 1.2 | +4.5 +4.5 +4.6 +4.7 +4.9 +5.1 +5.7 +6.0 +6.1 +6.2 | +5.1 | +5.3 |
+| read | p99 | 72.0 | 77.8 | within | +0.7 +1.6 +3.4 +3.5 +3.6 +4.0 +4.5 +5.5 +5.9 +7.4 | +4.0 | +5.2 |
+| rename | p50 | 466.0 | 409.8 | **worse** by 56.2 | +66.4 +74.4 +77.7 +78.2 +79.5 +81.5 +81.9 +82.6 +84.0 +85.3 | +81.5 | +79.1 |
+| rename | p99 | 1427.7 | 1883.3 | within | -141.2 +31.9 +124.4 +147.9 +156.9 +238.5 +464.6 +503.8 +630.6 +667.4 | +238.5 | +48.8 |
+| unlink | p50 | 287.3 | 256.9 | **worse** by 30.4 | +31.5 +37.0 +37.9 +38.5 +40.1 +40.2 +41.6 +43.2 +44.3 +46.8 | +40.2 | +39.8 |
+| unlink | p99 | 626.5 | 731.7 | within | -105.2 +25.9 +61.9 +64.1 +67.7 +93.8 +108.9 +110.5 +149.9 +257.1 | +93.8 | +108.2 |
+
+arm64 (windows-11-arm), run 44292211799, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 230.5 | 240.4 | within | -16.6 -2.7 +4.1 +4.2 +6.1 +7.0 +8.1 +12.2 +15.0 +15.0 | +7.0 | +5.1 |
+| create | p99 | 1164.9 | 2489.1 | within | -1575.8 -644.2 -170.6 +52.5 +74.4 +90.0 +121.3 +234.8 +256.1 +386.0 | +90.0 | +209.8 |
+| write | p50 | 189.7 | 104.7 | **worse** by 85.0 | +83.7 +84.1 +84.5 +84.7 +86.6 +86.9 +87.8 +88.6 +90.0 +92.5 | +86.9 | +88.9 |
+| write | p99 | 694.8 | 1476.3 | within | -839.2 -56.7 -23.5 +56.6 +104.6 +114.2 +214.3 +283.2 +633.8 +732.6 | +114.2 | +208.6 |
+| fsync | p50 | 113.8 | 127.3 | within | -19.9 -12.4 -10.8 -9.5 -6.8 -6.4 -4.3 -2.9 -2.7 +0.1 | -6.4 | -6.7 |
+| fsync | p99 | 313.4 | 27623.4 | within | -27164.2 -14703.3 -12685.5 -9383.7 -8389.9 -5735.8 -4803.3 -2700.0 -1695.8 -227.3 | -5735.8 | -5762.9 |
+| close | p50 | 5146.8 | 5947.8 | within | -961.5 -257.5 -171.8 -157.0 -112.9 +30.8 +31.3 +193.6 +387.8 +515.8 | +30.8 | -238.4 |
+| close | p99 | 43719.3 | 46165.6 | within | -3873.7 -3451.9 -1973.6 -1878.9 -1279.6 -1096.5 -1075.1 -894.3 +550.6 +1581.6 | -1096.5 | -1354.6 |
+| stat | p50 | 158.6 | 153.5 | **worse** by 5.1 | +4.2 +4.4 +4.8 +5.9 +6.1 +6.7 +7.3 +8.6 +8.8 +9.9 | +6.7 | +6.6 |
+| stat | p99 | 2040.2 | 44885.3 | within | -42368.7 -34980.1 -34436.9 -33444.0 -33132.6 -32872.8 -32234.9 -31736.0 -26653.5 -19894.9 | -32872.8 | -32944.8 |
+| open | p50 | 4464.4 | 4741.7 | within | -462.3 +4.9 +126.2 +131.9 +158.0 +173.6 +199.4 +248.6 +303.8 +531.1 | +173.6 | +86.6 |
+| open | p99 | 47426.1 | 47091.6 | **worse** by 334.5 | +40.5 +976.0 +1565.0 +1569.5 +2280.6 +2649.9 +5679.9 +7269.9 +8170.0 +11113.2 | +2649.9 | +2921.9 |
+| read | p50 | 50.4 | 52.0 | within | -3.1 -0.5 -0.2 +0.8 +1.3 +1.6 +2.0 +2.8 +3.0 +4.6 | +1.6 | +0.8 |
+| read | p99 | 85.9 | 86.4 | within | -3.0 +0.1 +0.7 +1.3 +1.7 +4.1 +4.5 +4.7 +4.8 +5.5 | +4.1 | +2.2 |
+| rename | p50 | 524.4 | 456.7 | **worse** by 67.7 | +56.6 +69.1 +69.1 +69.7 +71.0 +74.8 +77.0 +86.0 +89.4 +90.0 | +74.8 | +76.9 |
+| rename | p99 | 35829.9 | 32744.2 | **worse** by 3085.7 | +2899.4 +6186.6 +6230.8 +7620.7 +8214.4 +9538.2 +9827.6 +10186.5 +10747.6 +11297.1 | +9538.2 | +8389.8 |
+| unlink | p50 | 348.4 | 320.2 | **worse** by 28.2 | +27.6 +28.1 +28.3 +28.9 +29.3 +31.2 +32.0 +32.4 +34.0 +36.7 | +31.2 | +32.0 |
+| unlink | p99 | 27545.5 | 45088.5 | within | -17426.8 -16561.6 -14076.9 -13814.5 -13267.9 -12761.8 -11337.4 -10654.5 -10594.9 -10061.2 | -12761.8 | -12561.2 |
+
+cells worse than the DLL's spread: 10 of 36
+
+#### x86_64 (windows-latest), run 44292211799: 9 runs done, 1 failed
+
+x86_64 (windows-latest), run 44292211799, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 484.3 | 493.6 | within | -5.2 -1.8 +1.3 +4.6 +8.6 +8.8 +20.2 +21.4 +35.8 | +8.6 | +12.9 |
+| create | p99 | 947.5 | 1002.3 | within | -174.2 -28.6 -26.9 +75.7 +81.2 +85.6 +158.2 +249.5 +512.6 | +81.2 | +44.9 |
+| write | p50 | 47.3 | 54.5 | within | -15.6 -10.7 -3.8 -3.5 +1.2 +2.0 +10.3 +11.2 +22.1 | +1.2 | +5.1 |
+| write | p99 | 209.9 | 295.7 | within | -58.5 -35.5 -34.6 -25.1 -15.7 +1.3 +49.5 +59.2 +87.1 | -15.7 | -5.3 |
+| fsync | p50 | 59.8 | 74.3 | within | -14.5 -10.9 -6.0 +0.9 +3.2 +3.7 +4.1 +5.6 +9.0 | +3.2 | +3.2 |
+| fsync | p99 | 133.4 | 186.6 | within | -50.4 -39.9 -39.3 -7.1 -6.1 -5.1 +6.5 +9.4 +39.0 | -6.1 | +1.0 |
+| close | p50 | 30.4 | 28.7 | **worse** by 1.7 | +1.7 +2.0 +2.0 +2.2 +2.4 +2.5 +2.5 +2.7 +3.0 | +2.4 | +2.4 |
+| close | p99 | 114.8 | 268.7 | within | -127.7 -79.3 -29.7 -23.9 +29.7 +30.5 +43.1 +43.5 +121.1 | +29.7 | +21.2 |
+| stat | p50 | 122.8 | 149.5 | within | -25.8 -24.6 -18.0 +2.5 +4.8 +4.8 +8.6 +19.3 +25.9 | +4.8 | +5.3 |
+| stat | p99 | 215.2 | 546.4 | within | -353.9 -10.2 -3.6 -1.4 +9.0 +33.4 +51.9 +181.8 +254.5 | +9.0 | +30.7 |
+| open | p50 | 79.1 | 74.5 | **worse** by 4.6 | -6.1 +0.9 +4.6 +8.1 +11.5 +14.4 +14.9 +19.0 +21.2 | +11.5 | +12.8 |
+| open | p99 | 157.4 | 162.5 | within | -11.3 -2.2 +4.1 +4.6 +18.3 +30.1 +35.5 +39.1 +48.0 | +18.3 | +10.7 |
+| read | p50 | 5.3 | 5.2 | **worse** by 0.1 | +0.1 +0.3 +0.3 +0.3 +0.3 +0.4 +0.4 +0.5 +0.5 | +0.3 | +0.4 |
+| read | p99 | 67.0 | 71.4 | within | -14.0 -8.1 -4.4 -2.8 +1.4 +1.7 +2.5 +16.9 +23.5 | +1.4 | +1.0 |
+| rename | p50 | 248.9 | 306.6 | within | -51.6 -48.8 -41.2 -6.6 +4.6 +7.4 +8.3 +32.3 +40.9 | +4.6 | +7.5 |
+| rename | p99 | 453.5 | 647.7 | within | -176.5 -128.5 -33.4 -14.2 -1.5 +12.6 +59.0 +106.0 +259.7 | -1.5 | +12.9 |
+| unlink | p50 | 150.8 | 165.3 | within | -9.1 -3.9 +0.1 +2.5 +2.8 +4.8 +10.8 +13.3 +23.8 | +2.8 | +6.9 |
+| unlink | p99 | 413.8 | 526.7 | within | -191.6 -65.8 -5.9 +7.9 +47.4 +64.9 +92.0 +96.3 +312.6 | +47.4 | +12.5 |
+
+x86_64 (windows-latest), run 44292211799, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 704.1 | 763.2 | within | -49.7 -44.0 -43.5 -36.4 -34.4 -32.0 -17.1 -7.2 +9.0 | -34.4 | -25.5 |
+| create | p99 | 64654.9 | 209578.9 | within | -157167.3 -147264.7 -144065.5 -143871.0 -141647.1 -140407.7 -139194.0 -133505.4 -127112.3 | -141647.1 | -139429.8 |
+| write | p50 | 43.1 | 56.3 | within | -11.5 -10.4 -10.4 -10.4 -10.3 -10.0 -9.5 -9.5 -9.1 | -10.3 | -9.8 |
+| write | p99 | 204.9 | 33802.2 | within | -33557.4 -33318.9 -1552.7 -144.3 -120.4 -86.0 -80.5 -64.3 +3875.4 | -120.4 | -121.3 |
+| fsync | p50 | 63.1 | 87.1 | within | -22.9 -18.3 -17.6 -17.2 -16.0 -10.5 -9.9 -9.7 -9.7 | -16.0 | -10.1 |
+| fsync | p99 | 178.7 | 32988.8 | within | -32790.7 -24292.5 -50.9 -14.9 -10.1 -6.2 -3.3 +22.8 +34.0 | -10.1 | -13.8 |
+| close | p50 | 31.7 | 31.4 | **worse** by 0.3 | +0.8 +1.1 +1.2 +1.2 +1.3 +1.4 +1.5 +1.5 +1.7 | +1.3 | +1.3 |
+| close | p99 | 84.9 | 146.4 | within | -48.8 -22.9 -11.5 -8.9 -7.3 -5.8 -2.7 -0.3 +7.6 | -7.3 | -6.2 |
+| stat | p50 | 129.1 | 142.8 | within | -12.0 -11.5 -10.4 -10.3 -10.1 -8.2 -8.1 -8.0 -3.2 | -10.1 | -9.3 |
+| stat | p99 | 313.6 | 121938.9 | within | -121625.4 -99042.9 -98900.7 -98876.5 -97477.1 -95208.4 -93254.9 -91855.5 -77648.0 | -97477.1 | -97481.6 |
+| open | p50 | 79.9 | 83.1 | within | -7.9 -7.0 -6.1 -0.9 +1.9 +2.5 +2.8 +2.9 +10.0 | +1.9 | -4.9 |
+| open | p99 | 209.2 | 45123.4 | within | -44914.7 -40826.0 -40716.8 -431.3 -85.4 -78.4 -78.1 -60.2 -20.9 | -85.4 | -94.6 |
+| read | p50 | 6.3 | 52.6 | within | -46.0 -44.6 -44.6 -44.5 -44.0 -43.2 -36.7 -11.7 -11.2 | -44.0 | -44.6 |
+| read | p99 | 81.6 | 153.0 | within | -80.5 -79.6 -73.4 -71.2 -61.4 -54.3 -51.0 -37.3 -35.5 | -61.4 | -66.3 |
+| rename | p50 | 290.0 | 321.9 | within | -38.3 -35.2 -34.9 -31.9 -27.6 -23.6 -22.5 -22.5 -21.5 | -27.6 | -22.4 |
+| rename | p99 | 8497.5 | 1653.0 | **worse** by 6844.5 | +93.2 +3033.3 +4832.5 +5150.9 +7076.1 +7266.6 +7321.9 +7647.3 +10569.0 | +7076.1 | +7433.2 |
+| unlink | p50 | 168.8 | 188.3 | within | -25.4 -23.9 -19.5 -17.5 -13.8 -10.4 -6.7 +2.6 +4.0 | -13.8 | -19.1 |
+| unlink | p99 | 826.4 | 116635.6 | within | -115643.0 -111465.5 -110790.7 -110007.1 -103431.6 -102131.0 -101294.5 -100697.9 -97209.6 | -103431.6 | -103067.9 |
+
+cells worse than the DLL's spread: 5 of 36
+
+**What is left to cut, and the decision for Ada.** On x86_64 main is within the DLL's spread but for a few microseconds at
+four quiet or loaded p50s and a loaded rename tail. On arm64 a stat, a rename and an unlink cost 40 to 82 µs more at the
+quiet p50, and a write, a rename and an unlink 31 to 87 µs more loaded. The levers measured and not yet tried:
+- **A spin choice that reads contention.** The median form took 42.3 µs off arm64's loaded write p50 and 35.2 off its
+  rename (10 of 10 runs each), and lost a wake on x86_64. A choice that parks only while the machine's CPUs are contended,
+  measured (for instance from each reply's way back after a park against the window), would keep the first without the
+  second. Unbuilt, unmeasured.
+- **Shard threads above normal priority on Windows** (run 42059294312, one instrumented arm64 run, 2026-11-05): a loaded
+  SetSize's hop 67.6 to 15.7 µs and a write's p50 238 to 100 µs. It changes how the whole daemon competes with the user's
+  own programs, so it is a decision for Ada, not a cut.
+- **A fresh per-phase profile of arm64's quiet stat, rename and unlink** (as diag-winfsp-overlap-46): the last one put 18
+  µs of a stat on crash safety's own work and 3 to 5 µs a request on the kernel inside the transaction call; it does not
+  account for 42.
+- Crash safety's price (the journal, the ledger, A-198's barriers) stays, as the supervisor decided on 2026-11-07 (R4).
+
+### Main after A-348 against the DLL and against 69cd38b2, and where Step 7, continued closes (2026-11-18)
+
+**The A/B.** Diag `diag-g258-9` (run 44325673298), four arms interleaved on one VM of each runner, quiet and loaded (two
+spinners a logical CPU), ten runs a lane planned: main (`093fef96`: A-348 landed, and A-223 and A-326 since 69cd38b2), a
+control (main's binary copied), the DLL arm (`71cf09ac`, built from its own tree as above) and before (`69cd38b2`, the
+main every A/B in this section measured), with 69cd38b2's `mount_bench` (nine operations). Read as diag-g258-6 above.
+- windows-11-arm, 14:56–16:20 UTC: 5 runs done, 0 failed, no daemon lapsed in any arm. Run 6 was lost with the runner
+  itself ("The hosted runner lost communication with the server", the job ended 17:21 UTC), so its numbers are none.
+- windows-latest (AMD Family 25 Model 1, image win25-vs2026 20261116.315.1; diag-g258-6's was Family 26 Model 2, so the
+  two lanes' microseconds do not compare), 15:02–17:25 UTC: 2 runs done (5 and 7), 5 failed (1–4 and 6); run 8 was
+  cancelled when the goal closed. Each failed run lost a drive when its daemon was killed under the loaded pass ("the
+  daemon's heartbeat lapsed (1121–1154 ms old, past 1077–1082 ms …); killing it"). Kills over the seven runs: main 5,
+  control 4, the DLL arm 1, before 0 (before's daemon exited 143 and was restarted once in runs 1 and 3–7; its older
+  anchor prints no lapse line). Main's and the control's are A-223's: its window, priced on a hundred times the wake
+  estimate, let a one-shard daemon spin for seconds after a WinFsp request until its watchdog withheld the beat; A-361
+  (goal g234, landed `519969ed9`) holds every idle spin under the watchdog's window. This lane measured main before A-361
+  under load, so its two runs are recorded and not read as a verdict.
+
+**Verdict.**
+- **windows-11-arm: 10 cells of 36 beyond the DLL's spread, as in diag-g258-6 (10 of 36).** At the p50, within each
+  run: quiet create +19.6 µs, stat +44.9, read +5.6, rename +76.3, unlink +41.1; loaded write +85.3, stat +2.7, rename
+  +43.4, unlink +21.3; and the loaded rename p99. The control's differences sit within 8 µs of main's at each p50 there.
+- **Main against 69cd38b2 on windows-11-arm** (before − main within each run, against the control's spread): within it in
+  32 of 36 p50 and p99 cells; 69cd38b2 slower at the loaded open p50 (+139.4 µs) and p99 (+5,544), faster at the quiet
+  create p99 (−113.5) and close p99 (−622.7). What main took since (A-223, A-326, A-348) neither closed nor widened the
+  arm64 gap at the p50.
+- **windows-latest: 13 cells of 36 beyond the DLL's slowest run, no verdict.** Each p50 among them is beyond it by under
+  50 µs (quiet close 5.4, read 1.6, unlink 8.1; loaded write 0.8, fsync 8.2, open 7.2, rename 49.8), but two runs make
+  each arm's spread two values wide, and main lapsed in the five runs that failed.
+
+**Where Step 7, continued closes** (the supervisor, 2026-11-18, for Ada: "close it at its stated condition"). The cuts
+were made and measured on both Windows runners, quiet and loaded, and every run's numbers are in this section: A-348 (the
+request channel's bound) landed; cut (c)'s no-wake variant and cut (b)'s two per-kind spin choices are measured and
+rejected; the bench's `create_security` op landed. What remains against the DLL is arm64's p50 gap above, unchanged
+since diag-g258-6, and its levers are the list just above (a spin choice that reads contention, shard threads above
+normal priority, a fresh per-phase profile), none started under this goal. Owed to whoever takes the next cut: the
+x86_64 lane again with A-361 in main.
+
+#### arm64 (windows-11-arm), run 44325673298: 5 runs done, 0 failed
+
+arm64 (windows-11-arm), run 44325673298, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 228.2 | 220.6 | **worse** by 7.6 | +16.3 +19.4 +19.6 +20.2 +26.4 | +19.6 | +21.9 |
+| create | p99 | 548.6 | 1049.6 | within | -16.9 +45.0 +76.0 +86.0 +154.3 | +76.0 | +72.9 |
+| write | p50 | 99.9 | 108.8 | within | -2.0 -0.3 +0.8 +2.8 +6.7 | +0.8 | +2.2 |
+| write | p99 | 278.4 | 1460.1 | within | +12.5 +16.4 +33.4 +79.6 +329.2 | +33.4 | +46.9 |
+| fsync | p50 | 114.8 | 118.9 | within | -0.8 -0.4 +0.6 +6.7 +7.0 | +0.6 | +2.0 |
+| fsync | p99 | 204.9 | 1317.2 | within | -731.6 +8.5 +9.7 +14.2 +37.6 | +9.7 | +17.1 |
+| close | p50 | 3931.4 | 4325.3 | within | -3000.5 -633.2 -137.9 +76.6 +483.6 | -137.9 | +207.0 |
+| close | p99 | 7132.6 | 16884.7 | within | -7670.8 -1258.1 -867.2 -522.1 -217.5 | -867.2 | -372.1 |
+| stat | p50 | 168.6 | 125.1 | **worse** by 43.5 | +28.9 +43.1 +44.9 +46.3 +65.7 | +44.9 | +50.2 |
+| stat | p99 | 247.5 | 303.8 | within | +36.8 +37.1 +37.9 +43.1 +182.0 | +37.9 | +114.1 |
+| open | p50 | 2110.4 | 4002.0 | within | -1726.0 -70.3 +4.3 +50.2 +2666.5 | +4.3 | +381.5 |
+| open | p99 | 6196.7 | 7153.3 | within | -216.0 -98.2 -6.9 +245.5 +2217.1 | -6.9 | +92.2 |
+| read | p50 | 49.2 | 47.5 | **worse** by 1.7 | -2.1 +2.2 +5.6 +5.7 +7.9 | +5.6 | +4.7 |
+| read | p99 | 78.6 | 82.1 | within | -2.5 +0.3 +2.0 +11.5 +12.2 | +2.0 | +4.8 |
+| rename | p50 | 480.2 | 450.0 | **worse** by 30.2 | +63.4 +74.6 +76.3 +78.6 +87.2 | +76.3 | +84.0 |
+| rename | p99 | 925.8 | 2916.5 | within | -333.7 -80.8 +16.0 +115.6 +1199.3 | +16.0 | +705.5 |
+| unlink | p50 | 297.0 | 271.0 | **worse** by 26.0 | +35.8 +38.5 +41.1 +41.4 +52.3 | +41.1 | +39.4 |
+| unlink | p99 | 585.3 | 591.2 | within | -7.0 +25.1 +139.7 +158.2 +980.9 | +139.7 | +156.4 |
+
+arm64 (windows-11-arm), run 44325673298, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 220.8 | 244.2 | within | -10.1 -4.0 -0.8 +1.8 +14.9 | -0.8 | -0.2 |
+| create | p99 | 1361.6 | 1770.3 | within | -889.4 -217.4 +571.4 +658.6 +2639.4 | +571.4 | +86.7 |
+| write | p50 | 186.9 | 105.5 | **worse** by 81.4 | +76.7 +83.3 +85.3 +85.6 +86.1 | +85.3 | +83.1 |
+| write | p99 | 590.0 | 638.9 | within | -119.4 +50.0 +146.4 +1186.7 +2359.5 | +146.4 | +1385.9 |
+| fsync | p50 | 115.2 | 135.7 | within | -17.7 -15.9 -15.1 -7.6 -4.6 | -15.1 | -11.2 |
+| fsync | p99 | 415.2 | 13004.2 | within | -12542.9 -3359.7 -2372.0 -1207.9 -277.0 | -2372.0 | -2401.5 |
+| close | p50 | 4571.5 | 5293.4 | within | -549.0 -484.0 -462.8 -423.9 +193.7 | -462.8 | -393.6 |
+| close | p99 | 41087.4 | 50972.1 | within | -9884.7 -8801.1 -6841.0 -3310.6 -1203.2 | -6841.0 | -7087.1 |
+| stat | p50 | 152.5 | 152.4 | **worse** by 0.1 | +0.1 +2.1 +2.7 +4.0 +6.9 | +2.7 | +3.2 |
+| stat | p99 | 769.2 | 37763.8 | within | -37060.3 -33527.5 -32417.1 -30189.9 -25042.9 | -32417.1 | -32918.4 |
+| open | p50 | 3964.8 | 4425.2 | within | -380.7 -278.4 -275.1 -162.0 -71.2 | -275.1 | -256.5 |
+| open | p99 | 40151.0 | 49127.7 | within | -8976.7 -6605.6 -5982.0 -3614.5 -2155.8 | -5982.0 | -4637.0 |
+| read | p50 | 47.3 | 51.5 | within | -4.4 -1.5 -1.2 -0.1 +0.0 | -1.2 | -1.2 |
+| read | p99 | 87.7 | 90.3 | within | -8.4 -4.2 -0.9 -0.5 +2.4 | -0.9 | -3.5 |
+| rename | p50 | 510.3 | 476.4 | **worse** by 33.9 | +33.1 +37.8 +43.4 +44.0 +55.4 | +43.4 | +46.4 |
+| rename | p99 | 36336.1 | 34345.6 | **worse** by 1990.5 | +2679.5 +3377.7 +3760.8 +4167.9 +7536.0 | +3760.8 | +3526.9 |
+| unlink | p50 | 347.8 | 332.4 | **worse** by 15.4 | +14.5 +19.7 +21.3 +25.6 +30.2 | +21.3 | +25.3 |
+| unlink | p99 | 28273.7 | 41467.2 | within | -12844.4 -12234.7 -11627.4 -11404.6 -10234.8 | -11627.4 | -12049.2 |
+
+cells worse than the DLL's spread: 10 of 36
+
+#### x86_64 (windows-latest), run 44325673298: 2 runs done, 5 failed
+
+x86_64 (windows-latest), run 44325673298, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 910.6 | 983.6 | within | -91.5 +9.5 | +9.5 | -3.9 |
+| create | p99 | 1647.2 | 1929.3 | within | -342.9 +10.3 | +10.3 | -17.9 |
+| write | p50 | 81.7 | 109.1 | within | -27.4 +5.3 | +5.3 | +5.2 |
+| write | p99 | 214.9 | 222.2 | within | -39.1 +32.0 | +32.0 | +30.6 |
+| fsync | p50 | 126.4 | 166.4 | within | -40.0 -3.1 | -3.1 | -2.2 |
+| fsync | p99 | 254.0 | 338.6 | within | -100.1 +22.4 | +22.4 | +17.2 |
+| close | p50 | 67.1 | 61.7 | **worse** by 5.4 | +5.2 +6.9 | +6.9 | +6.9 |
+| close | p99 | 140.5 | 147.9 | within | -13.2 +14.9 | +14.9 | +9.4 |
+| stat | p50 | 261.9 | 333.7 | within | -71.8 +9.8 | +9.8 | +9.4 |
+| stat | p99 | 391.6 | 520.6 | within | -129.0 +27.7 | +27.7 | +27.3 |
+| open | p50 | 168.1 | 189.3 | within | -21.2 +18.5 | +18.5 | +18.1 |
+| open | p99 | 289.1 | 303.1 | within | -14.0 -1.9 | -1.9 | +2.9 |
+| read | p50 | 14.0 | 12.4 | **worse** by 1.6 | +1.5 +1.9 | +1.9 | +1.9 |
+| read | p99 | 32.2 | 20.3 | **worse** by 11.9 | +6.0 +11.9 | +11.9 | +13.9 |
+| rename | p50 | 595.1 | 689.1 | within | -94.0 +50.9 | +50.9 | +53.1 |
+| rename | p99 | 1102.6 | 1396.3 | within | -293.7 +162.4 | +162.4 | +302.2 |
+| unlink | p50 | 378.3 | 370.2 | **worse** by 8.1 | +8.1 +57.1 | +57.1 | +58.2 |
+| unlink | p99 | 869.9 | 867.2 | **worse** by 2.7 | +2.7 +48.4 | +48.4 | +72.0 |
+
+x86_64 (windows-latest), run 44325673298, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 1609.0 | 1681.7 | within | -72.7 -22.0 | -22.0 | -14.7 |
+| create | p99 | 98278.9 | 234223.1 | within | -137034.3 -135944.2 | -135944.2 | -132828.6 |
+| write | p50 | 124.7 | 123.9 | **worse** by 0.8 | +0.8 +1.7 | +1.7 | +1.6 |
+| write | p99 | 398.5 | 22153.6 | within | -21755.5 -11.5 | -11.5 | -7.9 |
+| fsync | p50 | 200.2 | 192.0 | **worse** by 8.2 | +7.5 +9.4 | +9.4 | +8.9 |
+| fsync | p99 | 467.8 | 435.9 | **worse** by 31.9 | -9.5 +109.1 | +109.1 | +703.4 |
+| close | p50 | 81.1 | 97.1 | within | -16.4 -16.0 | -16.0 | -16.0 |
+| close | p99 | 213.7 | 170.9 | **worse** by 42.8 | +28.1 +42.8 | +42.8 | +43.6 |
+| stat | p50 | 356.3 | 361.8 | within | -6.3 -5.5 | -5.5 | -7.2 |
+| stat | p99 | 30476.5 | 114279.2 | within | -85470.2 -81569.4 | -81569.4 | -86485.8 |
+| open | p50 | 248.4 | 241.2 | **worse** by 7.2 | +7.2 +7.8 | +7.8 | +6.9 |
+| open | p99 | 1595.8 | 548.7 | **worse** by 1047.1 | +1047.1 +1078.8 | +1078.8 | +785.4 |
+| read | p50 | 107.6 | 125.5 | within | -20.0 -17.9 | -17.9 | -20.4 |
+| read | p99 | 243.6 | 226.8 | **worse** by 16.8 | +16.8 +28.6 | +28.6 | +859.1 |
+| rename | p50 | 880.1 | 830.3 | **worse** by 49.8 | +49.8 +50.6 | +50.6 | +49.7 |
+| rename | p99 | 62878.4 | 63484.4 | within | -1453.3 +4003.5 | +4003.5 | +6820.6 |
+| unlink | p50 | 477.3 | 494.1 | within | -17.7 -13.3 | -13.3 | -12.7 |
+| unlink | p99 | 33280.9 | 132952.3 | within | -100125.9 -93657.2 | -93657.2 | -93074.7 |
+
+cells worse than the DLL's spread: 13 of 36
 
 ## CreateGreen sliced: its shard and peak RSS over `fs/` and the whole kernel (2026-11-07)
 
@@ -12214,9 +12976,283 @@ one-minute load 11 to 191 at the start of each run, the Mac shared with other ag
 All 24 landings were `done` with 1,000 files written. Without the spinners, at load 80 to 110, the landing took 1.0 to 1.4 s
 with one step, so the cost needs a starved shard.
 
+## A green's works on the shards their names hash to (A-247 step one; 2026-11-08)
+
+**Command.** `load_bench --tree <linux-v7.4-rc1>/kernel --clients <n> --hot-files <0.8 n> --per-connection 32 --rounds 3
+--reply-patience 60 --think-us 0`, release builds, the daemon in-process (no `--instance`): on main 92dcd16c
+`slates anchor --quick` never comes up on this machine (the anchor kills each start for 1.6 s of whole-process CPU
+before its first beat, 23 shards × about 70 ms of init; reported). Main 92dcd16c against agents/perf-w1, interleaved,
+reversed on alternate rounds, 4 rounds each. adas-mac-studio.local-2 (32 CPUs, Apple silicon, 23 shards), 2026-11-08,
+one-minute load 3.0 to 15.5. Oracle failures 0 in every run. Milliseconds, the range over the 4 runs:
+
+| Clients | Kind | main p50 | W1 p50 | main p99 | W1 p99 |
+|---|---|---|---|---|---|
+| 1,000 | wall (s) | 1.33–1.34 | 0.83–0.87 | | |
+| 1,000 | CreateWork | 9.1–10.5 | 7.0–8.4 | 15.4–24.5 | 12.0–14.2 |
+| 1,000 | Edit | 10.0–10.3 | 2.9–3.3 | 24.1–37.0 | 19.6–37.0 |
+| 1,000 | SubmitAccepted | 9.6–9.7 | 9.8–10.0 | 30.2–35.6 | 35.7–45.0 |
+| 1,000 | ReadHead | 10.4–10.6 | 5.5–5.6 | 32.8–37.2 | 9.4–30.5 |
+| 1,000 | Rebase | 10.4–10.6 | 9.7–10.0 | 23.3–37.2 | 36.1–44.7 |
+| 3,000 | wall (s) | 7.94–8.03 | 4.54–4.58 | | |
+| 3,000 | CreateWork | 101.5–103.8 | 9.3–16.9 | 110.4–115.9 | 17.5–28.5 |
+| 3,000 | Edit | 30.9–31.8 | 0.5 | 57.1–61.7 | 54.3–59.5 |
+| 3,000 | SubmitAccepted | 28.1–28.6 | 23.9–24.4 | 42.6–46.2 | 57.1–70.7 |
+| 3,000 | SubmitConflict | 32.3–32.6 | 34.8–35.2 | 43.3–58.4 | 79.5–80.9 |
+| 3,000 | ReadHead | 32.2–32.7 | 11.1–11.2 | 43.4–56.5 | 23.1–24.5 |
+| 3,000 | Rebase | 32.1–32.6 | 34.2–34.8 | 43.4–61.0 | 64.8–66.9 |
+
+- Everything off the verdict got faster, and the rung finishes in 57% of main's time at 3,000 clients.
+- **The verdict's tail got worse:** SubmitAccepted p99 at 3,000 clients 57–71 ms against 43–46, SubmitConflict
+  80–81 against 43–58, Rebase 65–67 against 43–61. The verdict is still the owner's one serialized step, and the
+  clients, no longer waiting on their edits, reach it more often at once (Little's law over one owner). The owner's cost
+  per verdict is the next lever.
+- Before the asks were batched, every 3,000-client run stalled (see `crates/server/src/work_home.rs`, "Asks are
+  batched").
+
+**Measured and rejected the same day: a smaller batch of asks.** The verdict's tail might have been a batch of 32 asks
+holding the owner for one step. W1 with the batch bound at 32 (the client region's credit, shipped), 8 and 2, 3,000
+clients, the same command and machine, 4 interleaved rounds each (one-minute load 1.6 to 17.4; the first round of each
+arm is the coldest), oracle 0. Milliseconds, p50 / p99:
+
+| Bound | Wall (s) | SubmitAccepted | SubmitConflict | Rebase | ReadHead | Edit |
+|---|---|---|---|---|---|---|
+| 32 (shipped) | 4.48–5.20 | 23.6–27.3 / 67.5–78.7 | 34.3–39.8 / 78.1–86.3 | 33.7–39.5 / 63.6–71.4 | 10.9–12.7 / 22.5–26.1 | 0.5–0.6 / 59.1–66.4 |
+| 8 | 4.42–4.87 | 28.7–31.2 / 75.0–80.1 | 41.8–46.1 / 92.6–98.4 | 42.0–46.4 / 84.9–90.9 | 2.7–3.0 / 6.6–7.0 | 0.3 / 51.3–62.0 |
+| 2 | 5.05–6.06 | 33.2–43.9 / 79.6–93.6 | 48.9–59.6 / 101.5–124.0 | 49.5–60.1 / 99.4–124.2 | 0.8–1.0 / 1.8–2.2 | 0.2 / 65.9–77.1 |
+
+A smaller batch makes every verdict's tail worse, so the batch is not what holds it back: reads gain (they stop riding
+with verdicts), and the verdicts lose the batching. Rejected.
+
+**Where the owner's time goes** (`sample`, 2 s in the middle of one 3,000-client run, W1 b4936073, shard 19, the green's
+owner, 1,121 samples): 799 (71%) in the batches of asks. Of those, `map_rebase` 333, `judge_submission` 226, and
+`build_increment` 241 inside those two. Rebases, 60,000 a run against 34,000 submits, cost the owner more than the
+verdicts do.
+
+**The same A/B by the anchor recipe, with lost replies counted (2026-11-08/09).** Main 80be552a (whose start judgment
+lets `slates anchor --quick` come up on this machine) against agents/perf-w1 492ad3c3 (W1 merged onto it), loadtest-scale's
+`rung.sh` (a single-node anchored daemon, the release harness against it), the same harness flags, interleaved and
+reversed on alternate rounds: 4 rounds at 1,000 clients, 10 at 3,000. adas-mac-studio.local-2, one-minute load 3.3 to
+21.0. Every run finished, oracle 0. `lost` is the sum of the harness's `lost` rows (the daemon's counters of a reply or
+an ask lost for want of room: `xshard.reply_dropped`, `lease.wait.undelivered`, `merge.acceptance_undelivered`,
+`merge.work.ask_unanswered`, `park_full`, `pending_stuck`, `floor_not_sent`). Milliseconds, the range over the runs:
+
+| Clients | | main | W1 |
+|---|---|---|---|
+| 1,000 | wall (s) | 1.28–1.33 | 0.78–0.82 |
+| 1,000 | lost | 0 | 0 |
+| 1,000 | CreateWork p50 / p99 | 7.3–8.7 / 21.8–22.3 | 3.2–4.4 / 6.9–9.5 |
+| 1,000 | Edit p50 / p99 | 10.0–10.1 / 21.7–22.3 | 3.0–3.3 / 17.7–23.1 |
+| 1,000 | SubmitAccepted p50 / p99 | 9.6–9.9 / 27.0–31.4 | 9.1–9.8 / 25.1–40.6 |
+| 1,000 | ReadHead p50 / p99 | 10.4–10.5 / 26.7–30.6 | 4.9–5.4 / 12.6–16.6 |
+| 3,000 | wall (s) | 7.96–8.07 | 4.31–4.62 |
+| 3,000 | lost | 4,074–4,439 (all `xshard.reply_dropped`) | 0 in 10 of 10 |
+| 3,000 | CreateWork p50 / p99 | 89.3–96.8 / 102.7–119.6 | 11.2–16.5 / 20.9–26.5 |
+| 3,000 | Edit p50 / p99 | 31.2–32.0 / 55.6–64.8 | 0.5 / 50.1–60.8 |
+| 3,000 | SubmitAccepted p50 / p99 | 28.6–29.3 / 42.4–62.4 | 23.3–24.5 / 56.4–72.3 |
+| 3,000 | SubmitConflict p50 / p99 | 31.9–33.1 / 43.3–63.4 | 33.4–35.5 / 73.8–79.5 |
+| 3,000 | ReadHead p50 / p99 | 32.2–33.3 / 42.4–64.4 | 10.5–11.3 / 22.3–23.5 |
+| 3,000 | Rebase p50 / p99 | 32.1–33.1 / 42.3–64.1 | 32.7–35.1 / 61.5–70.6 |
+
+- Main drops about 4,300 replies a 3,000-client run (`xshard.reply_dropped`, a forwarded verb's result carried home
+  past a full channel); the harness's resend under the same id answers each from its record after the reply deadline,
+  so the oracle stays 0. W1 drops none.
+- W1's verdict tail is still worse than main's: SubmitAccepted p99 56–72 ms against 42–62, SubmitConflict 74–80
+  against 43–63, Rebase 62–71 against 42–64.
+
+**A work composes its own increment (2026-11-09).** The owner composed every remote submit's and rebase's increment,
+about a third of its time in asks. agents/perf-w1 7d6e7d80 composes it on the work's shard from base entries fetched
+with the paths it touched (`Green::path_base`, `Base::for_names`) and sends the increment alone. Main 80be552a, W1
+before it (492ad3c3) and after (7d6e7d80), the anchor recipe, 3,000 clients, interleaved in reversed order on alternate
+rounds, 6 rounds each, adas-mac-studio.local-2, load 3.5 to 24.7, oracle 0 everywhere. `composed` counts the work's
+increments composed on its own shard against those left to the owner. Milliseconds, p50 / p99, the range over the runs:
+
+| Build | Wall (s) | lost | composed | SubmitAccepted | SubmitConflict | Rebase | Edit | ReadHead |
+|---|---|---|---|---|---|---|---|---|
+| main 80be552a | 7.79–8.24 | 4,116–4,374 | — | 28.2–29.8 / 41.3–46.4 | 31.2–33.9 / 42.6–49.3 | 31.2–33.8 / 42.8–49.4 | 30.7–33.0 / 48.3–62.0 | 31.3–33.9 / 42.8–60.3 |
+| W1 492ad3c3 | 4.59–4.78 | 0 | — | 24.3–27.5 / 67.6–75.8 | 35.2–36.0 / 78.6–86.7 | 34.5–35.6 / 64.5–74.9 | 0.5–0.6 / 59.4–66.2 | 11.1–11.4 / 23.4–28.6 |
+| W1 7d6e7d80 | 3.52–3.89 | 0 | 119,500–120,744 / 0 | 18.3–21.1 / 55.2–64.2 | 26.3–28.3 / 59.3–66.6 | 26.2–27.8 / 52.0–62.5 | 0.6–0.7 / 44.0–48.2 | 8.3–8.9 / 15.4–17.6 |
+
+- Every latency and the wall fell against W1 before it. Against main, every p50 and the wall are better (wall 44–48% of
+  main's), and the verdict's p99 is still 10–20 ms worse.
+- Measured on the way, rejected: composing on the work but clearing its entries at a rebase made each resubmit fetch them
+  again first, and SubmitAccepted p99 rose to 84–90 ms (6 rounds, 2026-11-09); the rebase now answers the entries.
+
+**Where the verdict's tail waits, measured (2026-11-09).** An instrumented build of W1 8cf40742 (in-process daemon,
+3,000 clients, 2 runs, adas-mac-studio.local-2 at load 22 to 26; the instrumentation roughly doubles the latencies, so
+the shares are the finding). The owner (partition 19) ran 12,058 and 12,942 batches a run, of 28 to 32 asks at the
+median and 32 at most, one batch a step: step wall p50 283–311 µs, p99 1.9–2.6 ms, max 10.4–22 ms; step CPU p50
+278–299 µs, p99 818–824 µs. An ask's own CPU: a verdict p50 29–32 µs, p99 101–122; a rebase p50 17–19, p99 42–53. The
+slowest 1% of verdict asks, mean per asking shard: 86–99 ms waiting in their shard's outbox for its last batch to come
+back, 23–50 ms in transit and queued behind the owner's other work, 0.13–0.23 ms behind the other asks of their batch,
+0.02–0.05 ms in their own verdict, 0.5–26 ms coming back. A long step holding the verdicts in it is not the tail; the
+owner being busy (step CPU about its wall at the median) and a shard's backlog draining 32 asks a round trip is.
+
+**Measured and rejected the same day: a whole outbox a message, answered in slices of the step budget.** One message
+carried everything a shard had waiting; the owner answered it a slice at a time, as many asks as the step budget held
+at its measured cost of an ask, yielding between slices, each slice's answers sent home as it finished. The step budget
+here (about 4.5 µs) is below one ask's cost (about 20 to 30 µs), so every slice was one ask and every answer its own
+message. Main 80be552a, W1 8cf40742 and this, the anchor recipe, 3,000 clients, interleaved, 6 rounds each, load 12 to
+30 (other agents' builds), oracle 0 in every run. SubmitAccepted p99, every round, ms: main 118.4, 50.7, 51.6, 72.2,
+49.4, 40.5; W1 77.2, 71.0, 55.0, 59.0, 53.8, 55.5; this 130.7, 493.0, 95.4, 194.6, 75.3, 76.3. Wall: main 7.79–12.62 s,
+W1 3.59–5.40, this 4.66–8.45. Kept as `w4-sliced-batches.patch` in perf's scratch; not landed.
+
+**Like for like: the whole cycle, and equal offered load (2026-11-09, the supervisor's two measurements).** At a fixed
+3,000 clients with one request each in flight W1 serves about 1.6 times main's verdict rate, so the one owner holds a
+longer queue and a verdict waits longer by Little's law. Two comparisons that take the rate out. Main 80be552a against
+agents/perf-w1 f3d2f5c5, each with a temporary owner-CPU diagnostic (thread CPU per verdict and per rebase run on the
+green's owner shard, `perf/tools/owner_cpu_patch.py`, not committed), the same harness (`load_bench` with the new `Cycle`
+and `Round` rows), the anchor recipe, interleaved and reversed on alternate rounds, 5 rounds each,
+adas-mac-studio.local-2, load 9.6 to 22.5, oracle 0 in every run. `Cycle` is a round from sending its first edit to its
+submit's first verdict (4 edits, the append, the submit); `Round` is to its accept, conflicts resolved. Milliseconds, p99
+in every round:
+
+| | main | W1 |
+|---|---|---|
+| 1,000 clients, Cycle p99 | 93.7, 77.2, 91.5, 96.0, 89.1 | 129.2, 86.8, 87.0, 115.0, 99.1 |
+| 1,000 clients, Cycle p50 | 69.4, 68.2, 68.5, 71.9, 71.5 | 43.2, 45.3, 44.7, 48.9, 49.1 |
+| 1,000 clients, Round p99 | 1,231.6, 1,175.9, 1,187.0, 1,225.3, 1,234.2 | 617.0, 627.0, 604.8, 686.4, 673.9 |
+| 1,000 clients, owner µs a verdict / a rebase | 35.6–39.5 / 25.7–26.7 | 21.9–24.8 / 12.3–13.7 |
+| 3,000 clients, Cycle p99 | 402.3, 419.7, 380.7, 401.5, 435.9 | 279.8, 231.1, 257.8, 239.9, 239.3 |
+| 3,000 clients, Cycle p50 | 218.6, 207.9, 208.3, 224.8, 217.5 | 147.6, 138.3, 143.6, 140.0, 139.5 |
+| 3,000 clients, Round p99 | 8,159.9, 7,324.4, 7,465.3, 7,746.0, 7,961.8 | 3,761.9, 3,463.5, 3,692.8, 3,652.6, 3,489.0 |
+| 3,000 clients, owner µs a verdict / a rebase | 47.9–52.2 / 27.0–30.6 | 21.5–22.5 / 11.8–12.8 |
+
+Since 2026-11-18 (g231, the load test's `bound` row, Ada's decision of that day) a paced level's `Cycle` and `Round`
+leave out the client's own think pauses. The paced figures in this section and the two after it hold them: a pause
+after every reply, five in each cycle (a fixed `--think-us` until 2026-11-17, then an exponential draw of that mean).
+The unpaced figures are unchanged by it.
+
+**Equal offered load.** Main unpaced; W1's clients paced with `--think-us 19000`, found by trying 1,000 to 22,000 µs
+(think time 22,000 gave 5,673 verdicts/s, 16,000 gave 8,217), so both run main's verdict rate at 3,000 clients. 5 rounds
+each, interleaved, load 19.0 to 22.5. Verdicts a second: main 6,018, 6,739, 6,662, 6,308, 6,973; W1 6,880, 7,182, 6,913,
+6,824, 6,907 (W1 slightly the higher). p99 in every round, milliseconds:
+
+| | main | W1 |
+|---|---|---|
+| SubmitAccepted | 52.7, 48.6, 44.5, 55.2, 43.0 | 26.2, 22.9, 22.4, 26.3, 22.3 |
+| SubmitConflict | 53.6, 50.6, 44.9, 61.8, 46.5 | 33.3, 32.6, 35.2, 32.2, 32.6 |
+| Rebase | 54.1, 59.0, 63.0, 63.8, 42.7 | 5.2, 4.1, 3.5, 24.2, 5.5 |
+| owner µs a verdict / a rebase | 48.7–53.7 / 27.5–31.0 | 23.5–24.7 / 12.8–14.0 |
+
+- At the same verdict rate W1's verdicts are faster at p99 than main's, and the owner spends 46–52% of main's CPU on a
+  verdict and 44–48% on a rebase: its per-verdict cost has not regressed, it fell.
+- At a fixed number of clients the verdict's p99 rose because throughput rose (3,000 clients: 1.6 times main's verdicts a
+  second) and the owner's queue with it.
+- The whole cycle's p99 is better at 3,000 clients (231–280 ms against 381–436). At 1,000 clients it is not: 86.8–129.2
+  against 77.2–96.0, the medians of the rounds 99.1 against 91.5, though its median and the round to accept are far
+  better (Round p99 605–686 against 1,176–1,234).
+
+**Per attempt and end to end (2026-11-09, the supervisor's third measurement).** The harness timed each attempt: a request
+refused `AcknowledgementOwed` and sent again as new started a fresh latency, so main's figures left out the wait of the
+operations whose replies went astray. It now also prints `operation` rows, each logical operation from its first attempt
+to its final answer, refusals for now, pauses and resends included. Main 80be552a against agents/perf-w1 (with the
+`operation` rows), the anchor recipe, interleaved, 5 rounds each, adas-mac-studio.local-2 busy with other agents (8 to 11
+of 32 cores idle), oracle 0 in every run. Per run: main's dropped replies (`xshard.reply_dropped`) and its
+`AcknowledgementOwed` resends (`backpressure`); W1 had 0 of each in every run. Milliseconds, p99, per attempt / end to
+end (`SubmitAccepted`'s end-to-end row holds every submit, accepted or not):
+
+| 3,000 clients | main | W1 |
+|---|---|---|
+| dropped / backpressure | 3,636 / 12,912; 4,191 / 27,019; 4,518 / 22,227; 4,245 / 23,967; 4,208 / 25,700 | 0 / 0 in every run |
+| Submit | 54.7/94.6, 50.1/96.6, 56.3/112.3, 53.6/113.4, 45.0/106.6 | 54.9/58.7, 60.3/63.5, 63.2/71.2, 57.1/62.8, 56.8/64.1 |
+| Rebase | 52.3/63.2, 59.6/69.2, 61.1/71.6, 56.0/75.5, 45.5/68.2 | 54.0/54.0, 53.3/53.3, 63.2/63.2, 55.1/55.1, 57.0/57.0 |
+| Edit | 63.0/80.9, 60.6/83.7, 62.6/84.8, 57.9/89.2, 60.0/85.4 | 45.2/45.2, 46.9/46.9, 58.8/58.8, 46.1/46.1, 46.3/46.3 |
+| Cycle | 405.2, 427.6, 447.7, 409.9, 424.8 | 226.4, 240.1, 288.5, 234.6, 239.0 |
+
+| 1,000 clients | main | W1 |
+|---|---|---|
+| dropped / backpressure | 0 / 0 in four runs, 0 / 6 in one | 0 / 0 in every run |
+| Submit | 33.6/35.4, 32.3/32.4, 27.9/28.0, 30.3/30.3, 34.9/36.6 | 20.1/61.6, 39.1/39.6, 34.8/35.0, 18.7/39.1, 23.9/24.3 |
+| Rebase | 24.4, 22.5, 38.4, 22.5, 22.9 | 61.7, 39.5, 35.0, 39.2, 27.6 |
+| Cycle | 87.9, 93.6, 106.8, 95.6, 99.5 | 114.2, 106.5, 94.7, 95.4, 116.6 |
+
+- At 3,000 clients main drops about 4,200 replies a run, and the acknowledgements those leave unanswered refuse 12,912 to
+  27,019 requests `AcknowledgementOwed`, each sent again: end to end, main's submit p99 is 94.6–113.4 ms against its
+  45.0–56.3 per attempt. W1 drops none and resends none: 58.7–71.2 ms end to end. Every verb's end-to-end p99 and the
+  cycle's are better on W1.
+- At 1,000 clients main drops none and the two figures agree; W1's submit, rebase and cycle p99 are worse there.
+- Main's drops are fixed on their own branch (agents/perf-replies); the comparison against main with that fix is owed.
+- These tables' end-to-end submit figure holds every submit, accepted or not, beside a per-attempt figure of accepted
+  submits alone. Since 2026-11-09 (after them) the harness files an operation under its outcome, as it files an attempt,
+  so `operation SubmitAccepted` and `operation SubmitConflict` compare with their `latency` rows; the comparison owed
+  above uses them.
+
+**End to end and at equal offered load, on main db9c514e (2026-11-09, the supervisor's two deciding measurements).**
+Main db9c514e against agents/perf-w1 88a6f6e5 (main merged in), each with the owner-CPU diagnostic
+(`tools/owner_cpu_patch.py`), one harness in both (W1's `load_bench.rs`, filing operations by outcome; `cmp` identical).
+The anchor recipe (`rung.sh`: a single-node anchored daemon over the 7.4-rc1 kernel tree, `--hot-files` 0.8 n
+`--per-connection 32 --rounds 3 --reply-patience 60`), interleaved by `tools/ab-e2e.sh <tag> <clients> 5 <main think>
+<W1 think>`, 5 rounds an arm, adas-mac-studio.local-2 (32 CPUs, macOS), 15:21 to 15:28, load 4.4 to 25.6 (others' agents
+started during it), oracle 0 in all 50 runs, `resent` 0 in all. p99 in milliseconds, per attempt / end to end (first send
+to final answer, resends included); one number where the two are equal.
+
+| 3,000 clients, unpaced | main | W1 |
+|---|---|---|
+| verdicts a second | 4,856, 4,531, 4,782, 4,510, 4,593 | 13,368, 13,072, 13,814, 13,538, 11,366 |
+| dropped replies / `AcknowledgementOwed` resends | 4,250 / 28,686; 4,252 / 26,835; 4,202 / 27,969; 4,422 / 27,285; 4,301 / 26,137 | 0 / 0 in every run |
+| SubmitAccepted | 39.8/65.6, 56.9/68.8, 43.9/71.2, 47.1/69.1, 45.6/68.7 | 56.7, 58.1, 56.4, 58.6, 64.7 |
+| SubmitConflict | 40.5/106.1, 58.0/114.2, 45.5/100.7, 48.0/117.9, 46.1/127.5 | 63.8, 64.5, 62.0, 66.2, 67.9 |
+| Rebase | 40.3/62.9, 64.9/68.7, 60.1/70.4, 48.7/69.0, 46.5/67.0 | 57.7, 58.0, 58.3, 55.9, 66.6 |
+| Edit | 58.5/80.5, 65.5/85.0, 60.5/82.3, 62.8/84.1, 61.1/81.4 | 46.1, 49.0, 44.9, 48.2, 60.6 |
+| Cycle | 403.0, 428.7, 382.3, 439.7, 375.9 | 238.6, 244.7, 232.6, 239.1, 268.6 |
+| owner µs a verdict / a rebase | 47.8–49.8 / 26.5–27.8 | 21.0–24.5 / 11.9–14.2 |
+
+| 1,000 clients, unpaced | main | W1 |
+|---|---|---|
+| verdicts a second | 6,047, 6,257, 5,993, 6,496, 6,422 | 12,961, 13,694, 13,224, 12,995, 13,971 |
+| dropped / resends | 0 / 0 in every run | 0 / 0 in every run |
+| SubmitAccepted | 33.8, 32.3, 37.5, 32.5, 32.4 | 43.9, 39.2, 37.0, 38.9, 34.9 |
+| SubmitConflict | 33.8, 32.6, 37.6, 32.5, 33.5 | 44.3, 39.6, 37.0, 39.4, 35.8 |
+| Rebase | 22.3, 22.8, 37.4, 20.7, 21.3 | 44.0, 39.4, 36.9, 39.3, 35.7 |
+| Cycle | 102.5, 90.8, 104.8, 90.4, 80.9 | 91.3, 93.8, 90.0, 95.4, 87.9 |
+
+Equal offered load: main unpaced, W1's clients paced to main's verdict rate (`--think-us` 6,000 at 1,000 clients, found
+by trying 6,000, 9,000 and 12,000: 6,238, 4,066 and 3,196 verdicts a second; 19,000 at 3,000, as before). The 3,000-client
+set ran twice: in the first, W1's fifth round met the load's rise from 19 to 25 and read 181.1 ms accepted, 264.9
+conflict, 122.4 rebase; the second set, all ten runs, is below, and that excursion did not recur in it.
+
+| equal load | main | W1 |
+|---|---|---|
+| 1,000: verdicts a second | 6,229, 6,571, 6,276, 6,497, 6,174 | 5,796, 6,212, 6,004, 6,055, 6,144 |
+| 1,000: SubmitAccepted | 34.0, 28.7, 31.1, 30.9, 34.3 | 32.3, 26.3, 23.8, 15.1, 13.9 |
+| 1,000: SubmitConflict | 34.7, 29.7, 31.8, 32.4, 34.8 | 27.6, 14.9, 26.5, 24.2, 16.5 |
+| 1,000: Rebase | 21.9, 20.5, 21.2, 21.1, 35.0 | 35.1, 30.7, 32.7, 26.5, 26.3 |
+| 1,000: Cycle | 94.1, 94.0, 82.8, 79.2, 95.6 | 76.0, 68.7, 71.2, 65.4, 66.0 |
+| 3,000: verdicts a second | 4,833, 4,615, 4,659, 4,728, 4,766 | 4,631, 4,956, 4,832, 4,808, 4,802 |
+| 3,000: dropped / resends | 4,106 / 28,984; 4,474 / 27,986; 4,293 / 28,079; 4,283 / 28,995; 4,326 / 28,365 | 0 / 0 in every run |
+| 3,000: SubmitAccepted | 40.8/68.6, 45.7/70.2, 44.7/72.8, 44.1/70.3, 41.5/84.9 | 24.2, 22.1, 23.0, 21.8, 22.3 |
+| 3,000: SubmitConflict | 41.7/99.0, 60.8/105.3, 45.6/109.9, 49.3/103.4, 41.0/120.6 | 35.3, 35.2, 32.8, 33.5, 34.3 |
+| 3,000: Rebase | 41.7/67.9, 64.1/66.9, 57.1/71.1, 58.5/70.1, 41.5/69.8 | 4.3, 6.2, 5.0, 4.0, 5.2 |
+| 3,000: Cycle | 399.0, 391.7, 400.6, 406.4, 418.3 | 148.2, 149.0, 147.8, 150.2, 147.3 |
+
+- **End to end, the verdict is better on W1 wherever main drops replies.** At 3,000 clients main drops 4,106 to 4,474
+  replies a run and is refused `AcknowledgementOwed` 25,868 to 28,995 times, each sent again. Its accepted submit reads
+  39.8–56.9 ms per attempt and 65.6–84.9 end to end, and its conflicting submit 40.5–61.0 per attempt and 99.0–127.5 end
+  to end. W1 drops and resends nothing, so its two figures are one: 56.4–64.7 accepted and 62.0–67.9 conflicting,
+  unpaced, at 2.3 to 3.1 times main's verdicts a second (the figures span all three 3,000-client sets).
+- **At equal offered load W1's verdicts are faster at both sizes**, and so is the cycle; at 3,000 clients every verb is.
+- **One verb is worse at equal load: the rebase at 1,000 clients**, 26.3–35.1 ms against main's 20.5–35.0 (the rounds'
+  medians 30.7 against 21.2). Unpaced at 1,000 clients, where main drops nothing, W1's submit and rebase are worse too
+  (accepted 34.9–43.9 against 32.3–37.5; rebase 35.7–44.0 against 20.7–37.4), at 2.0 to 2.3 times main's verdicts a second, and
+  its cycle is even (medians 91.3 against 90.8). A rebase from a work's shard crosses to the owner and waits in the
+  ask batch; on main it runs where its work is. That is the next lever's target: the rebase mapped on the work's shard.
+- The owner's CPU a verdict is 21.0–26.9 µs on W1 against 37.6–50.9 on main, and a rebase 11.9–14.7 against 25.8–27.8.
+
+**Why main's two figures differ: what it drops (2026-11-09).** A diagnostic build of main db9c514e (never committed;
+`tools/drop_site_patch.py`) counted each result `send_back` drops under its sender: a client's reply carried home
+(`send_reply_home`), a cross-shard call's answer, or an acknowledgement scatter's part (`scatter_acknowledge`'s release
+from another shard). Two 3,000-client runs of the same rung: 4,364 and 4,418 dropped, **every one an acknowledgement's
+part**; no verb's reply and no call's answer. The client is answered its acknowledgement at once by its own shard, so
+nothing waits on a part. Its loss leaves that shard's release unsettled, and the client's next requests are refused
+`AcknowledgementOwed` (27,345 and 27,146 those runs) until a later acknowledgement settles it: each refusal is a pause
+and a resend under a new request. That is the whole gap between main's per-attempt and end-to-end figures. No client
+waited out a reply deadline: the longest operation of any kind in main's three 3,000-client runs above took 263.0 ms,
+`resent` (a resend after a reply deadline) was 0, and the oracle found no outcome unknown. So main's end-to-end p99 is
+65.6–84.9 ms accepted and 99.0–127.5 conflicting, not a reply deadline.
+
 ## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
 
-**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
+**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × the daemon's idle ratio (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
 
 **Rows.** `provision_bench`'s `provision.paced_1_1000us_cpu_<N>_shards`: the process's CPU over each run of the parked form, one client paced every 1 ms, 500 creates a run, in thousandths of one core, the client's own CPU included. `provision.rest_cpu_<N>_shards`: the same daemon over 3 s with no client, after its boot window has passed. `provision.spinning_1_p99`: the single-client p99.
 
@@ -12257,6 +13293,333 @@ with one step, so the cost needs a starved shard.
 - **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
 - **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
 - **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
+
+## The idle window's rule, measured: main, x100, and three rules against it (A-223; R9; CI; 2026-11-09)
+
+**What was asked.** A-223 measures a real Windows wake, which made the idle window (the shard's wake estimate × the daemon's idle ratio, 100) span a 1 ms pause and feed on its own spinning's queueing. The same rule already spun through a 1 ms pause on main on Linux (the window rule's baseline, above). The supervisor asked for a rule priced on something load cannot grow, judged by (a) the paced client's CPU, (b) quiet single-client p99, (c) loaded single-client p99 and (d) parks in the paced form above 0.
+
+**Measured and rejected: the floor of confirmed wakes** (605ec524, 2389b0d9, diag-liveness-33). The window priced on the smallest confirmed wake over the last one to two windows of 2^shift wakes. Under two spinners a logical CPU at 2 shards the floor itself queued: largest shard floor 33.8 ms on windows-latest, 17.3 ms on windows-11-arm, 0.90 ms on ubuntu-latest and 0.33 ms on ubuntu-24.04-arm, against at most 15 µs quiet.
+
+**Measured and rejected: option 1, the floor less the thread's run-queue time (Linux only).** The floor sample was each wake less the thread's `run_delay` across the wait (`/proc/thread-self/schedstat`). On fedora-2 (32 CPUs, 64 spinners, load 68) at 2 shards every shard floor read 0-1.75 µs, nearly all 0. Owner parks rose to 1,639-2,318 per 1,000 single-client creates, the loaded single-client p99 was 2.5-3.1 ms, and paced CPU was 238-243 thousandths of a core. A Linux wake's kick-to-running time is run-queue time, so subtracting it removes the wake itself. Windows reports no such time.
+
+**The comparison** (diag-liveness-35). Command: `provision_bench` with `PROVISION_BENCH_SHARDS=2`, built from main 1c49c33f and from the branch at 843cc514 with a diagnostic selector (`SLATES_DIAG_WINDOW_RULE`, f4f48b1b), on every CI runner. Arms: main; x100 (the window on the live mean × 100, A-223 alone); option 2, W = max(F, the boot probe's smallest confirmed wake), where F = 50 µs is R9's provisioning floor (AC-2.1, T-2.6); option 3, the live floor × 100 capped at 4F (the 4 is a bare factor, not derived). Quiet is the runner alone. Loaded is two spinning shell loops per logical CPU, with the daemon booting beside them. Three rounds, the arms alternating, 24 runs per runner.
+
+### windows-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 45: 29, 33, 39, 42, 45, 45, 46, 53, 69 | med 749: 706, 740, 742, 743, 749, 751, 752, 755, 759 | med 79.7: 46.8, 49.1, 50.0, 51.9, 79.7, 80.7, 86.7, 88.7, 216.6 | med 129.1: 51.0, 87.3, 94.1, 97.1, 129.1, 65.1ms, 73.2ms, 86.8ms, 89.4ms | 1169, 1440, 1588, 1628, 1830, 1896 | 28, 36, 38, 51, 58, 62 |
+| x100 (mean) | med 232: 177, 180, 203, 223, 232, 241, 242, 250, 254 | med 775: 766, 769, 773, 774, 775, 776, 777, 779, 782 | med 35.9: 31.4, 33.2, 33.7, 35.6, 35.9, 36.1, 37.7, 39.3, 39.9 | med 127.1: 81.9, 86.8, 105.8, 106.4, 127.1, 133.3, 140.4, 43.5ms, 74.7ms | 1039, 1149, 1153, 1312, 1396, 1419 | 2, 2, 4, 4, 8, 10 |
+| option 2 | med 45: 20, 31, 39, 40, 45, 48, 49, 50, 67 | med None: - | med 41.2: 39.5, 40.3, 40.5, 40.6, 41.2, 42.6, 42.6, 43.0, 43.3 | med 98.8ms: 96.9ms, 97.2ms, 98.2ms, 98.8ms, 98.8ms, 98.8ms, 99.4ms, 100.2ms, 100.5ms | 1351, 1380, 1526, 1796, 1798, 1830 | - |
+| option 3 | med 64: 37, 50, 61, 63, 64, 67, 69, 69, 69 | med 12: 10, 12, 15 | med 38.0: 31.3, 33.4, 34.9, 35.6, 38.0, 38.4, 38.6, 38.9, 39.0 | med 97.1ms: 92.8ms, 93.1ms, 94.8ms, 96.5ms, 97.1ms, 97.6ms, 100.8ms, 137.1ms, 163.9ms | 1160, 1161, 1200, 1427, 1430, 1485 | 1890, 2314 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 3.1, 6.4, 6.4 µs; loaded 10.1, 10.1, 10.1 µs
+All rules-binary boots: quiet floor 3.1, 6.4, 6.4, 6.4, 6.4, 6.4, 6.5, 6.5, 6.5 µs (N=9); loaded floor 10.0, 10.0, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1 µs (N=9)
+Problems: ['== exit 124', '== exit 124', '== exit 124', '== exit 124', '== exit 124']
+
+### windows-11-arm
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 37: 29, 29, 31, 35, 37, 38, 41, 44, 50 | med 702: 162, 176, 181, 666, 702, 707, 725, 733, 737 | med 30.2: 27.9, 27.9, 29.5, 29.9, 30.2, 30.3, 34.8, 36.7, 40.7 | med 36.0ms: 44.8, 83.6, 129.0, 10.8ms, 36.0ms, 41.3ms, 48.3ms, 49.2ms, 51.9ms | 1172, 1266, 1412, 1570, 1612, 1882 | 4, 6, 8, 10, 1301, 1473 |
+| x100 (mean) | med 274: 225, 256, 260, 274, 274, 280, 284, 290, 435 | med 736: 693, 716, 718, 730, 736, 740, 741, 741, 756 | med 31.2: 25.7, 29.2, 29.5, 30.5, 31.2, 32.2, 33.7, 35.5, 76.1 | med 125.2: 72.6, 85.7, 91.5, 93.8, 125.2, 126.0, 131.2, 25.8ms, 36.9ms | 1163, 1170, 1180, 1386, 1387, 1393 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 39: 33, 33, 35, 35, 39, 44, 48, 54, 56 | med 11: 8, 10, 10, 11, 11, 12, 12, 12, 13 | med 42.6: 25.0, 29.9, 31.6, 31.7, 42.6, 42.9, 43.6, 93.8, 161.7 | med 48.2ms: 47.8ms, 48.0ms, 48.1ms, 48.1ms, 48.2ms, 48.2ms, 52.2ms, 54.7ms, 56.2ms | 1782, 1800, 1810, 1973, 1976, 2010 | 1863, 1864, 1864, 2221, 2226, 2231 |
+| option 3 | med 54: 40, 46, 50, 50, 54, 54, 58, 62, 68 | med 17: 12, 12, 13, 17, 17, 17, 18, 18, 22 | med 30.0: 27.5, 27.5, 27.9, 29.4, 30.0, 30.5, 33.5, 34.4, 36.2 | med 48.3ms: 47.9ms, 48.0ms, 48.0ms, 48.1ms, 48.3ms, 48.4ms, 48.6ms, 50.8ms, 66.8ms | 1186, 1190, 1251, 1398, 1408, 1421 | 1849, 1849, 1858, 2206, 2212, 2213 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 5.8, 6.4, 7.1 µs; loaded 4.9, 5.1, 5.1 µs
+All rules-binary boots: quiet floor 5.4, 5.6, 5.7, 5.8, 5.8, 5.8, 6.0, 6.4, 7.1 µs (N=9); loaded floor 4.7, 4.9, 4.9, 5.0, 5.1, 5.1, 5.1, 5.2, 5.2 µs (N=9)
+
+### ubuntu-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 1502: 1451, 1462, 1467, 1481, 1502, 1512, 1552, 1908, 1980 | med 980: 905, 938, 945, 978, 980, 1011, 1029, 1043, 1051 | med 19.3: 17.8, 18.1, 18.7, 19.0, 19.3, 19.3, 19.3, 19.6, 19.6 | med 8.0ms: 7.0ms, 7.1ms, 8.0ms, 8.0ms, 8.0ms, 8.1ms, 9.1ms, 9.9ms, 10.0ms | 0, 0, 182, 709, 717, 784 | 0, 0, 0, 0, 0, 0 |
+| x100 (mean) | med 1619: 1467, 1468, 1475, 1482, 1619, 1884, 2023, 2024, 2025 | med 943: 858, 900, 933, 934, 943, 956, 958, 1020, 1029 | med 18.3: 16.4, 17.2, 17.5, 18.1, 18.3, 18.4, 19.2, 20.0, 20.4 | med 8.5ms: 6.9ms, 7.0ms, 7.4ms, 8.2ms, 8.5ms, 9.9ms, 9.9ms, 9.9ms, 9.9ms | 0, 0, 0, 177, 673, 802 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 162: 155, 157, 160, 161, 162, 162, 163, 168, 170 | med 343: 299, 302, 315, 331, 343, 379, 421, 430, 434 | med 19.0: 17.1, 17.5, 17.6, 18.8, 19.0, 19.2, 19.4, 19.6, 20.1 | med 4.0ms: 2.9ms, 3.2ms, 3.9ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms | 754, 765, 888, 891, 911, 1013 | 1537, 1553, 1644, 2120, 2175, 2200 |
+| option 3 | med 361: 356, 358, 359, 361, 361, 361, 366, 369, 369 | med 447: 420, 420, 426, 439, 447, 451, 452, 452, 469 | med 19.5: 17.2, 18.4, 18.7, 19.1, 19.5, 19.7, 19.9, 24.0, 36.0 | med 4.0ms: 3.6ms, 3.7ms, 3.7ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 5.0ms, 5.0ms | 740, 788, 878, 882, 936, 988 | 1652, 1740, 1812, 2145, 2194, 2420 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 5.9, 6.2, 6.2 µs; loaded 21.7, 50.1, 258.8 µs
+All rules-binary boots: quiet floor 5.9, 5.9, 5.9, 6.0, 6.0, 6.0, 6.2, 6.2, 6.2 µs (N=9); loaded floor 6.8, 21.7, 42.8, 48.8, 50.1, 67.3, 73.0, 74.5, 258.8 µs (N=9)
+
+### ubuntu-24.04-arm
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 2017: 1626, 1637, 1732, 2001, 2017, 2021, 2022, 2022, 2023 | med 950: 859, 864, 918, 928, 950, 952, 966, 972, 1002 | med 23.3: 23.1, 23.1, 23.1, 23.1, 23.3, 23.7, 23.7, 23.9, 24.0 | med 9.8ms: 7.9ms, 9.0ms, 9.1ms, 9.8ms, 9.8ms, 9.9ms, 10.0ms, 10.0ms, 10.0ms | 0, 0, 0, 16, 172, 362 | 0, 0, 0, 0, 0, 0 |
+| x100 (mean) | med 1610: 1584, 1590, 1608, 1609, 1610, 1707, 2005, 2020, 2022 | med 965: 813, 907, 940, 941, 965, 989, 1028, 1042, 1058 | med 23.4: 22.9, 23.3, 23.3, 23.3, 23.4, 23.9, 24.4, 25.1, 26.0 | med 8.0ms: 6.9ms, 6.9ms, 7.0ms, 7.7ms, 8.0ms, 8.9ms, 9.9ms, 9.9ms, 12.1ms | 0, 0, 12, 315, 341, 398 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 198: 193, 194, 194, 195, 198, 198, 202, 203, 224 | med 318: 289, 289, 295, 306, 318, 360, 440, 516, 524 | med 24.1: 23.1, 23.5, 23.9, 23.9, 24.1, 24.3, 24.9, 24.9, 25.2 | med 4.0ms: 2.9ms, 3.0ms, 3.1ms, 3.1ms, 4.0ms, 4.0ms, 6.2ms, 6.4ms, 6.7ms | 808, 908, 909, 947, 1018, 1044 | 1606, 1836, 1843, 1848, 2344, 2535 |
+| option 3 | med 396: 383, 391, 394, 395, 396, 398, 399, 405, 408 | med 406: 362, 388, 394, 401, 406, 410, 414, 446, 452 | med 24.0: 22.9, 23.4, 23.6, 23.9, 24.0, 24.1, 24.3, 25.2, 26.0 | med 3.7ms: 3.6ms, 3.7ms, 3.7ms, 3.7ms, 3.7ms, 4.0ms, 4.6ms, 5.0ms, 5.8ms | 844, 844, 863, 952, 984, 988 | 1560, 1652, 1822, 1994, 2030, 2250 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 6.3, 6.5, 6.6 µs; loaded 12.0, 19.3, 346.0 µs
+All rules-binary boots: quiet floor 5.4, 6.3, 6.4, 6.4, 6.4, 6.4, 6.5, 6.6, 6.6 µs (N=9); loaded floor 8.2, 12.0, 19.3, 43.9, 45.3, 70.6, 87.4, 323.8, 346.0 µs (N=9)
+
+### macos-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 304: 105, 121, 129, 275, 304, 310, 317, 332, 333 | med 172: 64, 68, 72, 148, 172, 176, 353, 397, 510 | med 350.8: 273.7, 281.4, 287.6, 292.9, 350.8, 355.4, 584.4, 608.3, 690.3 | med 3.9ms: 3.2ms, 3.3ms, 3.7ms, 3.9ms, 3.9ms, 3.9ms, 4.0ms, 4.1ms, 4.1ms | 459, 587, 589, 665, 1158, 1230 | 0, 30, 639, 860, 1093, 1212 |
+| x100 (mean) | med 328: 153, 210, 293, 309, 328, 337, 337, 348, 384 | med 132: 82, 90, 108, 131, 132, 133, 501, 503, 536 | med 298.5: 242.7, 262.0, 269.8, 273.5, 298.5, 299.1, 312.3, 350.8, 589.8 | med 3.8ms: 3.4ms, 3.4ms, 3.7ms, 3.7ms, 3.8ms, 3.9ms, 3.9ms, 3.9ms, 4.1ms | 490, 628, 707, 712, 722, 769 | 0, 90, 804, 884, 1000, 1147 |
+| option 2 | med 95: 85, 88, 90, 92, 95, 96, 98, 106, 112 | med 84: 60, 71, 73, 74, 84, 88, 94, 98, 99 | med 273.7: 242.2, 245.4, 246.7, 266.9, 273.7, 274.0, 284.8, 299.5, 527.8 | med 3.7ms: 3.0ms, 3.5ms, 3.5ms, 3.6ms, 3.7ms, 3.8ms, 3.8ms, 3.8ms, 3.9ms | 1390, 1400, 1498, 1640, 1658, 1756 | 1301, 1318, 1338, 1690, 1736, 1775 |
+| option 3 | med 97: 75, 83, 92, 95, 97, 104, 104, 109, 123 | med 81: 36, 48, 68, 75, 81, 82, 85, 95, 96 | med 282.1: 260.3, 268.1, 273.2, 282.0, 282.1, 302.5, 517.9, 569.5, 709.0 | med 3.8ms: 2.2ms, 2.6ms, 3.5ms, 3.6ms, 3.8ms, 3.8ms, 3.9ms, 4.0ms, 4.0ms | 1343, 1404, 1453, 1552, 1583, 1656 | 1146, 1251, 1426, 1456, 1646, 1670 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 0.9, 1.0, 1.0 µs; loaded 0.7, 0.8, 0.8 µs
+All rules-binary boots: quiet floor 0.9, 0.9, 1.0, 1.0, 1.0, 1.3, 1.3, 2.3, 2.8 µs (N=9); loaded floor 0.7, 0.7, 0.8, 0.8, 0.8, 1.0, 1.0, 1.2, 1.2 µs (N=9)
+
+**What it shows.**
+- **Linux and macOS: option 2 meets (a)-(d).** Paced CPU quiet fell from main's 1,451-2,023 to 155-224 thousandths of a core on Linux. Quiet p99 stays within main's spread. Loaded p99 halved (8.0 → 4.0 ms on x86_64, 9.8 → 4.0 ms on arm64). The owner parks under the paced form while loaded (1,537-2,535 per 1,000), where main's never does.
+- **Option 3 is measured and rejected.** It is no better than option 2 on any criterion, and its paced CPU on Linux is about twice option 2's (356-408 against 155-224 quiet).
+- **The loaded boot inflates option 2's input.** A Linux daemon booted beside two spinners a CPU read the probe's smallest wake at 6.8-259 µs (x86_64) and 8.2-346 µs (arm64), past F in 5 of 9 boots on each runner, against 5.4-6.6 µs quiet. So the boot minimum cannot be trusted under load, and option 2 becomes W = F alone. Windows' loaded boots read 4.7-10.1 µs and macOS's 0.7-2.8 µs.
+- **Windows: option 2 fails (c).** A shard parked under two spinners a CPU pays a wake of 50-100 ms on every request. On windows-latest the loaded single-client p99 was 97-100 ms in all nine runs, against x100's median 127 µs and main's 129 µs. Every loaded option 2 run, and two of three loaded option 3 runs, ran past the bench's 1,500 s limit before the paced form. On windows-11-arm the loaded p99 was 47.8-56.2 ms, against x100's median 125 µs. Windows' paced CPU was already low on main (29-69 quiet), and option 2 keeps it there (20-67 quiet), so a short window buys little on Windows and costs its loaded tail. This repeats A-218's Windows finding.
+- **The rule for Windows is the supervisor's decision** (A-223 plan, 2026-11-09). The choices are W = F on Linux and macOS with x100 kept on Windows, W = F everywhere, or a Windows window measured first.
+- **Decided (the supervisor, 2026-11-11): the first choice, with Windows' own window as the follow-up.** The idle window is `max(F, wake estimate × loaded_wake_ratio())`, F = R9's 50 µs (`config::PROVISION_FLOOR`) and the multiple 0 on Linux and macOS, 100 on Windows (`config::idle_window_ns`; SLATES_DESIGN, A-223's window rule). Option 2's boot-floor term is measured and rejected, by the loaded boots above. Option 3 is measured and rejected, by its paced CPU.
+
+## The idle window's rule as built: F on Linux and macOS, ×100 kept on Windows (A-223 step 4; R9; CI; 2026-11-12)
+
+**What it is.** The rule above as built (`config::idle_window_ns`, `max(F, wake estimate × loaded_wake_ratio())`, F = 50 µs), measured on its own tree: the plan's bar for step 4 was a 1 ms-paced client at two shards, quiet, costing at most 150 thousandths of a core on Linux and Windows.
+
+**Command** (diag-liveness-37, the branch at 8adeaf04 plus the rule): `provision_bench` built `--release`, `PROVISION_BENCH_SHARDS=2`, three rounds quiet then three with two spinning shell loops per logical CPU, each round three runs; the same job ran fmt, `cargo xtask check`, clippy, the machine and rt suites, the rule's table test, `wake_estimate`, `forward_retry` and the paced-client test (`crates/server/tests/idle_window.rs`, three times, Linux and macOS). Every CI runner has 4 CPUs.
+
+| runner | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet single-client p99 µs (N=9) | loaded single-client p99 (N=9) |
+|---|---|---|---|---|
+| ubuntu-latest | 197, 219, 188, 198, 196, 206, 196, 208, 214 | 325, 310, 317, 353, 336, 330, 325, 336, 330 | 28.7, 28.8, 27.9, 29.2, 28.6, 27.8, 31.5, 29.9, 28.6 | 4.00, 4.00, 3.08, 4.00, 2.91, 0.36, 4.06, 3.37, 4.00 ms |
+| ubuntu-24.04-arm | 198, 217, 192, 204, 210, 193, 197, 201, 214 | 306, 361, 337, 314, 302, 293, 337, 365, 303 | 24.9, 23.5, 22.3, 23.6, 24.4, 25.8, 24.9, 25.8, 24.1 | 5.60, 3.11, 3.81, 4.00, 3.12, 0.34, 4.00, 3.01, 3.22 ms |
+| windows-latest | 208, 341, 291, 178, 251, 221, 227, 334, 307 | 785, 779, 777, 772, 774, 774, 775, 776, 774 | 82.2, 82.2, 53.8, 84.2, 78.5, 59.2, 84.2, 86.7, 59.2 | 56.8 ms, 127 µs, 128 µs, 79.0 ms, 124 µs, 148 µs, 85.1 ms, 111 µs, 145 µs |
+| windows-11-arm | 156, 148, 166, 137, 146, 131, 283, 257, 287 | 743, 734, 740, 728, 744, 752, 744, 743, 731 | 1,313.0, 76.8, 155.8, 38.8, 30.3, 28.7, 35.4, 30.2, 32.4 | 30.6 ms, 90 µs, 26.3 ms, 26.1 ms, 140 µs, 37.1 ms, 92 µs, 128 µs, 128 µs |
+| macos-latest (3 CPUs) | 121, 89, 93, 78, 88, 90, 101, 97, 102 | 119, 90, 60, 75, 83, 68, 85, 80, 74 | 287.0, 450.4, 289.7, 278.1, 248.6, 258.9, 382.5, 292.5, 220.8 | 3.77, 3.95, 3.80, 3.70, 3.77, 3.63, 3.55, 3.48, 1.90 ms |
+
+The paced-client test failed 6 of 6 on Linux before the rule (diag-liveness-36: each shard's window 27.4–84.4 ms against 0.69–1.53 ms at boot, its estimate 274–844 µs against a 6.9–15.3 µs prior) and passed 6 of 6 with it. Every gate and suite above passed on all four runners.
+
+**What it shows.**
+- **The 150-thousandths bar is not met, on Linux or on Windows.** Linux reads 188–219 quiet, as step 3's option 2 read 155–224: on a quiet boot that rule's window was F too, so this is the same window measured again. Two shards spinning F after each request (with the forward to the other shard), plus the client's own spin, cost about 0.2 core at a 1 ms pace; the bar's own bound, 2 shards × (W + B) / 1 ms, is 0.11 core before the client. What a shorter window gives up in p99 is step 6's sweep.
+- **Linux's loaded cost fell by two thirds.** Loaded paced CPU 293–365 against main's 859–1,051 (step 3), and the loaded single-client p99 0.34–5.60 ms against main's 7.0–10.0 ms.
+- **macOS meets the bar**: 60–121 thousandths of a core quiet or loaded. Its quiet p99 (221–450 µs) is main's (274–690 µs in step 3): macOS's idle spin naps about 15 µs a harvest (A-218), which neither rule changes.
+- **The paced-client test's non-vacuity bound is the estimate passing its boot prior, not a multiple of it.** At ten times the prior one macOS run of three missed (5.9 times, diag-liveness-37); at four, three of ten missed (1.06–1.8 times, diag-liveness-38), every window held at F. With the window at F the shards stop spinning and stop queueing each other's wakes, so the estimate rises far less than under ×100 (23–200 times). A window priced on the estimate passes its boot value as soon as the estimate passes the prior, so that is the bound that tells the rules apart.
+- **Windows is ×100, unchanged.** Its window is the estimate's multiple wherever that passes F (a 7–18 µs estimate gives 0.7–1.8 ms), so it computes what step 3's ×100 arm did, and its paced CPU sits in that arm's spread (177–435 quiet, 693–782 loaded). windows-latest's quiet p99, 53.8–86.7 µs against the ×100 arm's 31.4–39.9 µs, comes from identical window arithmetic; it is recorded as the runner's, and step 6 measures the arms interleaved on one runner.
+
+## Windows' own window: the raised wait and R9's floor (A-361; R9; CI; 2026-11-18)
+
+**Why a parked Windows shard woke late under load** (`diag-g234-wake-1`, run 44325923565; the probe
+`crates/rt/examples/wake_load.rs` on that branch only, release; a TIME_CRITICAL kicker on CPU 0, the waiter on CPU 1
+unless unpinned, 200 wakes an arm, two rounds; loaded = two `while :; do :; done` shell loops per logical CPU at the
+job's own BelowNormal level). Priority after the wake, then the wake's median and p99, rounds 1 · 2:
+
+| arm | windows-latest (Server 2025, 4 vCPU) | windows-11-arm (Win11 26200, 4 vCPU) |
+|---|---|---|
+| completion port (the shard's wait) | 6; 29.1 · 29.1 ms, p99 102 · 108 ms | 6; 14.0 · 14.0 ms, p99 48 · 48 ms |
+| completion port, unpinned | 6; 43.5 · 41.1 ms, p99 65 · 62 ms | 6; 20.0 · 20.6 ms, p99 27 · 31 ms |
+| completion port, boost disabled | 6; 29.5 · 29.1 ms | 6; 14.0 · 14.0 ms |
+| completion port, base one level up | 7; 19 · 15 µs | 7; 6 · 7 µs |
+| completion port, raised for the wait alone | 7; 17 · 15 µs | 7; 6 · 7 µs |
+| event | 7; 17 · 15 µs | 7; 6 · 6 µs |
+| event, boost disabled | 6; 29.2 · 29.1 ms | 6; 14.0 · 14.0 ms |
+| WaitOnAddress | 7; 15 · 15 µs | 7; 7 · 7 µs |
+| the runtime's shard | 6; 29.6 · 25.5 ms, p99 112 · 95 ms | 6; 14.0 · 14.0 ms, p99 32 · 32 ms |
+| the runtime's shard, one level up | 7; 16 · 16 µs | 7; 8 · 8 µs |
+
+Quiet, every arm's median was 6–15 µs. Two threads at one level on one CPU took turns of 31.6–32.2 ms (gaps' median),
+quiet, on both. A raise and its restore cost 0.77–0.88 µs a pair quiet, 1.3–5.5 µs loaded (x86_64).
+
+**The test** (`cargo test -p slates-rt --test wake_estimate a_parked_shard_wakes_beside_spinners -- --nocapture`, debug,
+two spinning threads per logical CPU in the test, 32 wakes of each kind; `diag-g234-loadedwake-{red,green}-{1,2}`):
+median shard wake against a parked thread's, three rounds a run, two runs:
+
+| tree | windows-latest | windows-11-arm |
+|---|---|---|
+| main (red, 6 of 6 failed) | 38.0 / 42.0 / 40.7 ms, 38.7 / 41.5 / 39.4 ms against 20–23 µs | 21.5 / 23.4 / 21.5 ms, 23.5 / 33.8 / 21.7 ms against 11–13 µs |
+| the raise (green, 6 of 6) | 57.7 / 56.5 / 59.2 µs, 46.9 / 51.9 / 47.5 µs against 18–23 µs | 32.8 / 33.6 / 33.4 µs, 35.4 / 36.0 / 36.3 µs against 10–11 µs |
+
+**The rule, by provision_bench** (`diag-g234-winbench-1`, run 44338692795: `PROVISION_BENCH_SHARDS=2
+PROVISION_BENCH_FORMS=spinning_1,parked_1 provision_bench`, release, each arm in its own tree and target, three rounds
+interleaved, loaded as above; main = a2693b1eb with the x100 multiple; raise = the raised wait with it; raiseF = the
+raised wait and R9's floor alone). Each cell the median of nine runs (three rounds of the bench's three):
+
+| runner | cond | arm | spinning_1 p50 | spinning_1 p99 (runs past 1 ms) | paced CPU, thousandths of a core | paced p99 |
+|---|---|---|---|---|---|---|
+| windows-latest | quiet | main | 11.2 µs | 26.4 µs | 94 (0–656) | 189 µs |
+| windows-latest | quiet | raise | 11.9 µs | 23.5 µs | 210 (3–299) | 199 µs |
+| windows-latest | quiet | raiseF | 12.7 µs | 24.4 µs | 7 (0–81) | 176 µs |
+| windows-latest | loaded | main | 13.5 µs | 157 µs (4 of 9: 56.3, 57.1, 79.9, 82.9 ms) | 756 (617–792) | 125.6 ms |
+| windows-latest | loaded | raise | 13.3 µs | 54.1 µs (0) | 732 (157–823) | 59.1 ms |
+| windows-latest | loaded | raiseF | 13.9 µs | 130.5 µs (0; max 151) | 20 (8–30) | 49.9 ms |
+| windows-11-arm | quiet | main | 15.7 µs | 31.7 µs | 199 (116–253) | 356 µs |
+| windows-11-arm | quiet | raise | 15.1 µs | 29.9 µs | 225 (146–312) | 355 µs |
+| windows-11-arm | quiet | raiseF | 15.3 µs | 31.4 µs | 25 (15–40) | 323 µs |
+| windows-11-arm | loaded | main | 17.2 µs | 108 µs (1 of 9: 31.9 ms) | 787 (761–800) | 63.2 ms |
+| windows-11-arm | loaded | raise | 16.4 µs | 89.5 µs (0) | 777 (707–795) | 57.1 ms |
+| windows-11-arm | loaded | raiseF | 16.7 µs | 147.6 µs (0; max 192) | 20 (10–34) | 27.7 ms |
+
+raiseF is the rule landed: the paced cost falls ten- to forty-fold, the loaded p99's millisecond runs are gone, and the
+quiet rows stay within main's spread. The raise alone holds the loaded p99 lower (54 and 90 µs) at main's paced cost,
+which the window's multiple spends. The paced p99 under load, 28–126 ms in every arm, is not explained by these runs
+(the bench's paced client pauses in a timed `park_timeout`, whose own wake was not measured).
+
+## The closed-loop hold on macOS: a held shard naps, so macOS holds none (A-387; R9; Mac Studios; 2026-11-18)
+
+**What was asked.** The measurer's quiet-gated A/B on the Mac Studio d1323898 (Apple M3 Ultra, 32 CPUs, its derived 23
+shards; each invocation started once a 2 s `top` sample read at least 85% idle, load 8–19; logs
+`~/.cache/measurer-logs/g234q-*.log` there, 2026-11-18 14:41–16:11 UTC) found the spinning single client slower once
+A-223's window rule and A-326's hold landed together (`3d7a36ab8` against `0db7ea28a`), one invocation of the bench's
+three runs a round:
+
+| commit | spinning_1 p50, µs | spinning_1 p99, µs | CPU, thousandths of a core |
+|---|---|---|---|
+| 3d7a36ab8, before | 48.7 · 86.9 · 48.5 | 200.3 · 251.3 · 226.7 | 2,430–3,825 |
+| 0db7ea28a, after | 97.6 · 105.8 · 102.0 | 262.1 · 298.1 · 296.2 | 1,991–5,913 |
+| 3915879e3, main then | 103.2 · 105.5 · 98.2 | 280.4 · 300.6 · 324.0 | 1,908–5,487 |
+
+At 15 shards the p50 went 90.4 · 52.3 · 47.8 → 93.7 · 105.2 · 95.7 µs and the p99 200.0 · 160.1 · 163.2 → 179.8 · 212.8
+· 215.7 µs. A-326 was the first suspect.
+
+**The A/B.** Adas-Mac-Studio-4 (kiln 2768d0d5, Apple M4 Max, 14 CPUs of which 10 performance, macOS 26.2), the
+quietest Mac that day. Four arms built on main `cef0f520e` on d1323898, each in its own tree and target directory
+(`agents/g234-macos-ab-*`, `agents/g234-macos-ab2-*`), release, copied over with their sha256 checked; every arm carries
+the same diagnostics, a form filter (`PROVISION_BENCH_FORMS=spinning_1`) and the process's context switches per 1,000
+creates (`getrusage`). Arms: **main**; **holdoff**, main with the hold set to none (what A-387 does on macOS);
+**window100**, main with A-223's window rule undone (100 times the estimate) and the hold kept; **truespin**, main with
+A-218's rejected true spin (every poll a `kevent64` with `KEVENT_FLAG_IMMEDIATE`). Three rounds, the arms interleaved,
+at 3 shards (`PROVISION_BENCH_SHARDS=3`) and the derived 9; scripts `mac-ab-run.sh` and `mac-ab-loaded.sh`
+(`~/.cache/slates-scratch/g234/xfer`), logs `~/.cache/g234-ab2/` on the Studio.
+
+**The noise floor** (the bench's jitter probe: the longest gap between two clock reads in 100 ms with nothing between,
+`jitter.rs` beside the scripts): before the rounds one thread read 14.9–115.2 µs over 10 probes and ten threads at once
+151.8–856.2 µs (each thread's worst); after them 10.2–60.8 and 23.2–155.6 µs. Before each invocation three probes read
+at worst 17.5–76.4 µs. Load 1.08–1.94 (one minute), free and inactive memory 12,466–12,687 MiB, `top` idle 80.9–96.3%,
+across the quiet invocations.
+
+**Quiet** (17:54–17:57 UTC). Each cell is the median and the range of nine runs (three invocations of the bench's three);
+CPU includes the client; switches and parks are per 1,000 creates, the parks per shard:
+
+| shards | arm | p50, µs | p99, µs | p999, µs | CPU, thousandths of a core | involuntary switches | parks |
+|---|---|---|---|---|---|---|---|
+| 3 | main | 42.1 (41.5–43.0) | 80.8 (73.8–141.2) | 124.5 (78.9–415.9) | 1,565–1,644 | 16,740–16,877 | 1–2 |
+| 3 | holdoff | 41.3 (41.0–42.4) | 65.6 (64.6–117.9) | 78.0 (74.0–365.5) | 1,500–1,566 | 11,942–11,962 | 200–214 |
+| 3 | window100 | 41.5 (41.3–42.8) | 74.2 (72.5–120.8) | 81.4 (78.1–382.0) | 1,577–1,672 | 16,646–16,799 | 0–1 |
+| 3 | truespin | 8.1 (7.3–14.4) | 21.8 (11.6–152.0) | 28.1 (13.1–471.8) | 3,528–3,969 | 50–62 | 1–10 |
+| 9 | main | 57.1 (51.4–60.0) | 92.0 (89.8–173.6) | 108.6 (102.8–416.2) | 2,859–3,046 | 63,395–63,678 | 1–4 |
+| 9 | holdoff | 41.8 (41.3–43.3) | 92.3 (84.6–152.5) | 128.6 (112.3–445.4) | 1,645–1,696 | 16,561–16,762 | 152–237 |
+| 9 | window100 | 58.5 (55.0–61.5) | 100.4 (91.3–175.7) | 133.5 (101.6–403.0) | 2,944–3,166 | 63,580–64,019 | 0–3 |
+| 9 | truespin | 17.1 (12.7–23.6) | 49.9 (24.3–169.8) | 143.4 (30.9–461.8) | 7,885–9,982 | 98–511 | 1–27 |
+
+Each invocation's first run starts cold (in every arm but truespin the median of its first 200 creates was 73.6–108.2
+µs, of its last 200 40.9–60.3 µs), and every p99 of main and holdoff above 100 µs is a first run's. Pairing every
+holdoff run with every main run (81 pairs), at nine shards holdoff's p50 was lower in all 81, its p99 in 50 and its p999
+in 22; at three shards its p99 was lower in 61 and its p999 in 58.
+
+**Beside two spinners a logical CPU** (17:59–18:00 UTC: 28 `while :; do :; done` shell loops, the script's own
+children, started 2 s before the first invocation, killed by PID at the end and 0 left; the one-minute load rose from
+4.0 at the first invocation to 22.4 at the last as its average caught up). Main and holdoff only, interleaved; CPU under
+load is what the scheduler gives and is not compared:
+
+| shards | arm | p50, µs | p99, ms | p999, ms | involuntary switches | parks |
+|---|---|---|---|---|---|---|
+| 3 | main | 83.0 (68.3–157.2) | 2.25 (1.30–2.73) | 3.26 (2.37–3.90) | 14,712–16,075 | 175–372 |
+| 3 | holdoff | 111.1 (41.4–147.4) | 2.43 (1.36–3.10) | 3.41 (2.57–4.26) | 12,413–12,818 | 334–464 |
+| 9 | main | 81.5 (62.3–92.8) | 1.87 (1.63–2.29) | 3.17 (2.84–3.52) | 53,320–59,727 | 90–196 |
+| 9 | holdoff | 73.0 (71.5–73.9) | 1.34 (0.85–1.80) | 2.69 (1.99–3.12) | 17,713–19,188 | 195–335 |
+
+At nine shards holdoff's p99 was lower in 75 of the 81 pairs and its p50 in 69; at three shards its p99 in 32 and its
+p50 in 39, which is even.
+
+**What it shows.** A held macOS shard is not polling. Each turn of its idle spin is a `kevent` with a zero timeout, which
+sleeps 12–15 µs with an involuntary switch (A-218), and a hold keeps every shard the loop goes round in that state: at
+nine shards main's process made 63 involuntary switches a create against holdoff's 17 and spent 2.9 cores against
+1.65. Unheld, an owner parks between the loop's returns (152–237 times per 1,000 creates at nine shards) and wakes on a
+kick in 3.1–6.0 µs (the bench's wake). The cost grows with the shards held: nothing in the p50 at three shards (three
+of ten performance cores), 15 µs at nine, and 57 µs at 23 (medians 101.7 against 44.9 µs on the 32-CPU Studio, below).
+Read with the
+switch counts, the held shards' naps crowd the cores the loop runs on; no probe here told that apart from the nap a
+request lands in, which ends before the shard reads its rings, since only a parked shard is kicked. The window rule is
+not the cause: window100 reads as main. The true spin would make a hold pay (p50 8–17 µs, R9 met in 5 of 6
+invocations), but at 3.5–10 cores quiet; A-218 measured and rejected it for its tails once the host has no idle core,
+and it stays rejected.
+
+**Decision (A-387).** A hold is kept only where a held shard sees a request sooner than a parked one: its first form
+fixed the hold at none on macOS, and the rule now learns it per shard (the idle turn a request meets, E[T²]/E[T] over
+every idle turn, against the shard's wake estimate, `slates_rt::held_turn`), so a macOS shard's napping turns decline
+and Linux's and Windows' polling ones hold. The one adverse number in these rows is the quiet nine-shard p999, 108.6
+against 128.6 µs at the median, with the spreads overlapping (102.8–416.2 against 112.3–445.4 µs). The learned rule's own
+A/B against main is owed (run request of 2026-11-18); `provision_bench` now prints each shard's learned turn beside its
+wake.
+
+**At 23 shards on the 32-CPU Studio** (d1323898, Apple M3 Ultra, 32 CPUs of which 24 performance, macOS 26.4; the same
+main and holdoff binaries; 18:09–18:31 UTC; `studio23-ab.sh` beside the other scripts, log `~/.cache/g234-ab/studio23.log`
+there). Each invocation waited up to 600 s for a 2 s `top` sample at least 85% idle, as the measurer's runs did, and ran
+anyway if none came. The box was shared: before the rounds `top` read 26% idle at load 22.9, one thread's jitter probe
+25.5–300.9 µs and 24 threads' at once 10.1–27.2 ms; after them 58% idle at load 29.4, 30.2–75.2 µs and 0.97–3.08 ms;
+before each invocation three probes read at worst 60.4–73.8 µs, and free and inactive memory was 27,596–29,056 MiB.
+Each invocation's three runs:
+
+| round | arm | at its start | p50, µs | p99, µs | p999, µs | CPU, thousandths of a core | involuntary switches | parks |
+|---|---|---|---|---|---|---|---|---|
+| 1 | main | 45% idle (bar unmet), load 21.7 | 99.3 · 102.3 · 101.7 | 284.3 · 290.8 · 319.2 | 326.5 · 3,082.7 · 3,620.3 | 4,372–5,284 | 88,606 | 78–125 |
+| 1 | holdoff | 89% idle, load 14.1 | 44.9 · 44.8 · 44.8 | 182.8 · 147.6 · 154.5 | 250.9 · 216.6 · 237.7 | 1,861–1,940 | 21,017 | 115–183 |
+| 2 | main | 88% idle, load 13.1 | 96.5 · 94.8 · 94.4 | 265.8 · 267.1 · 256.0 | 385.9 · 301.0 · 461.3 | 5,673–5,774 | 102,362 | 68–109 |
+| 2 | holdoff | 83% idle, load 11.3 | 45.3 · 44.7 · 44.8 | 187.4 · 168.0 · 160.6 | 330.5 · 251.0 · 262.1 | 1,891–2,021 | 21,260 | 117–185 |
+| 3 | main | 84% idle, load 10.3 | 115.2 · 112.7 · 114.7 | 376.0 · 343.0 · 337.2 | 531.2 · 450.2 · 405.6 | 3,433–3,584 | 56,638 | 110–163 |
+| 3 | holdoff | 38% idle (bar unmet; another agent's `load_bench` at 682% of a core), load 28.9 | 64.5 · 62.6 · 60.8 | 249.3 · 216.5 · 223.5 | 319.0 · 269.2 · 324.2 | 2,038–2,169 | 21,300 | 126–197 |
+
+Every holdoff run, the loaded one among them, beat every main run on the p50 (44.7–64.5 against 94.4–115.2 µs) and the
+p99 (147.6–249.3 against 256.0–376.0 µs), at 1.9–2.2 cores against 3.4–5.8. Unheld, the 23 shards read at or under the
+measurer's before arm of the afternoon (`3d7a36ab8`: p50 48.5–86.9 µs, p99 200.3–251.3 µs). Neither arm meets R9's 50 µs
+at 23 shards on this Mac (GAPS, A-223's entry).
+
+## The idle window's rule at three and more shards: R9's floor alone fails a closed loop; a fixed S-scaled window fails a paced client (A-223 step 6, A-326; R9; CI and adacachy2; 2026-11-12)
+
+**What it is.** The plan's step 6 ran the rule as built (`adb383f26`) against main (`29ef4521`) at each runner's
+derived shard count as well as two, and then two shard-scaled windows, on CI and on adacachy2. It found what A-326
+fixes. Recorded by goal g234 (2026-11-18) from liveness's notes, which keep every table whole
+(`~/.cache/slates-agents-scratch/a223/step6-*.md` on the supervisor's Mac).
+
+**Command.** `provision_bench` built `--release` for each arm, `PROVISION_BENCH_SHARDS` unset (derived) or 2; three
+rounds, arms interleaved, quiet and then with two spinning shell loops per logical CPU, each round three runs a job
+(diag-liveness-42, -43, -44: ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, 4 CPUs, 3 on
+macOS). The shard-scaled arms are the rule's tree with a diagnostics-only `SLATES_DIAG_WINDOW_PER_SHARD=k` setting the
+floor to `k × F × shards` (15add74a, never on main). adacachy2: `abc-adacachy2.sh` (kiln r11, 32 CPUs, Linux,
+2026-11-12 19:47–19:57 UTC, the machine shared, load 3.8 to 16 in the quiet rounds), at its 15 derived shards.
+
+ubuntu-24.04-arm at its 3 derived shards, quiet (diag-liveness-42; µs):
+
+| arm | single-client p99 (N=9) | paced CPU, thousandths of a core (N=9) |
+|---|---|---|
+| main | 25.1, 26.5, 27.0, 27.0, 27.1, 27.1, 27.2, 27.5, 29.0 | 1776, 1788, 1853, 1950, 1977, 2108, 2203, 2414, 2556 |
+| ×100 (A-223 alone) | 26.9, 27.2, 27.5, 27.6, 28.0, 28.3, 29.0, 30.6, 32.4 | 1765, 1766, 1778, 1804, 1947, 2148, 2154, 2420, 2620 |
+| the rule (F) | 41.0, 43.6, 44.4, 113.9, 116.4, 118.3, 119.1, 119.3, 121.9 | 202, 204, 212, 217, 221, 228, 238, 239, 246 |
+
+The same runner, quiet, the shard-scaled windows (diag-liveness-43 and -44; spinning-form parks per 1,000 creates summed
+over the shards: 144–331 at F, 3–7 at `F × S`):
+
+| arm | single-client p99 (N=9) | paced CPU (N=9) |
+|---|---|---|
+| main (-43) | 25.6, 25.8, 26.6, 26.8, 27.5, 28.7, 28.8, 31.5, 32.4 | 1713, 1734, 1762, 1765, 1848, 1869, 1872, 1944, 1998 |
+| F (-43) | 44.8, 47.2, 113.3, 113.9, 114.7, 116.1, 121.8, 122.2, 140.1 | 203, 218, 221, 222, 223, 225, 235, 239, 249 |
+| F × S (-44) | 30.0, 33.7, 36.2, 36.4, 36.8, 37.1, 40.5, 212.6, 214.7 | 353, 357, 359, 364, 365, 369, 377, 380, 384 |
+| 2F × S (-44) | 26.7, 27.4, 29.0, 29.0, 29.5, 29.6, 31.0, 34.9, 363.7 | 567, 567, 571, 581, 584, 589, 597, 599, 604 |
+| 4F × S (-44) | 25.0, 25.4, 25.6, 26.2, 28.2, 30.6, 30.9, 31.9, 33.6 | 999, 1008, 1013, 1016, 1017, 1023, 1030, 1032, 1035 |
+
+adacachy2 at 15 derived shards, quiet (N=9 each; paced CPU in thousandths of a core):
+
+| arm | single-client p99 µs | paced CPU |
+|---|---|---|
+| main | 26.5, 34.4, 35.8, 47.2, 102.0, 113.2, 123.2, 126.9, 311.4 | 298, 352, 357, 640, 664, 728, 788, 794, 910 |
+| F | 83.4, 89.6, 105.1, 105.5, 106.7, 107.1, 108.4, 110.4, 116.8 | 171, 180, 194, 199, 222, 224, 226, 232, 237 |
+| F × S | 21.2, 22.0, 24.2, 24.6, 24.6, 26.1, 38.0, 41.0, 89.1 | 1349, 1350, 1354, 1356, 1386, 1389, 1399, 1400, 1407 |
+| 2F × S | 21.5, 23.9, 24.6, 25.0, 25.3, 27.8, 30.3, 34.3, 57.0 | 2265, 2266, 2272, 2288, 2289, 2291, 2313, 2320, 2325 |
+
+**What it shows.**
+- **R9's floor alone fails a closed loop over three or more shards.** At three shards the rule's p99 split into runs of
+  41–44 and 114–122 µs against main's 25–32. A create goes to the partition its name hashes to, so an owner hears from
+  the loop only after it has gone round the others, past F, and parks; main's window (the estimate × 100) kept every
+  owner polling. At two shards the bench's sequential names alternate the two partitions, so every owner returns within
+  F there and the failure did not show; arbitrary names would have shown it.
+- **A fixed shard-scaled window fixes the loop and spends it on a paced client too.** `2F × S` held main's spread at
+  three shards (29.5 µs), but a 1 ms-paced client then cost 584 thousandths of a core there and 2,289 at fifteen shards,
+  against main's 664 and F's 222. No fixed window met every criterion; the shard that reads a request is the one place
+  that can tell a closed loop from a paced client.
+- **Main fails R9 at fifteen shards already** (p99 median 102 µs); `F × S` brought it to 24.6 µs there.
+- **A-326** (§4.7) holds only a closed loop's shards, for its return at R9's percentile, never longer than the loop had
+  run (1.2 ms at three shards, 6.7 ms at fifteen, `2F × k`). Owed, the supervisor's runs on main: these tables again on
+  the built rule, with the spinning form's parks per 1,000 at three shards and the paced form's CPU, against main's
+  rows above (GAPS, A-223's entry).
 
 ## A-228 step 5: two weight-1 rungs on main, invalid, frozen (2026-11-09, fixtures)
 
@@ -12368,3 +13731,1100 @@ both arms hit at similar rates, so slicing does not stretch a takeover. The step
 floor: hyper-swim's RFC 6298 timer starts at, and never falls below, 1 s (`INITIAL_RTO_NS`, `MINIMUM_RTO_NS`) for a
 pair judged by its timer until the pool covers it, and it doubles on expiry. It is joined by an election when the dead
 owner led the council.
+
+## A candidate's acknowledgement carries the piece it changed: what persisting live copies adds to a stable write (A-270; 2026-11-08)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 42–113 on 32 threads
+(other agents' builds). Each run in one `systemd-run --user` unit capped at a quarter of the cores. **Command (the
+contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 <live_fleet release test binary> measure_what_live_shipping
+--nocapture`, the binary built with `cargo test --release -p slates-cli --test live_fleet --no-run` at each arm's commit.
+Arms interleaved round by round (`ab3.sh`, `ab3b.sh` in the agent's scratch):
+
+- **main** at 92dcd16c: a candidate's live copies are not in its recovery image, so its acknowledgement publishes nothing.
+- **whole** at c07d1de6 (raft-5): every acknowledgement publishes the whole held image.
+- **pieces** at eeb4a6ee (agents/raft-7): every acknowledgement publishes the held pieces it changed.
+
+Microseconds, what live shipping adds to a stable 4 KiB write at the median (live p50 less plain p50), and the live p99:
+
+| arm | runs | added at the median | live p99 |
+|---|---|---|---|
+| main | 4 | 65.3, 75.5, 71.4, 73.0 | 146.5, 197.2, 162.4, 636.3 |
+| whole | 3 | 206.7 (alone, load 86), 224.8, 220.2 | 670.4, 824.8, 776.5 |
+| pieces | 6 | 76.0, 72.7, 79.1, 71.2, 69.2, 65.3 | 275.7, 247.5, 208.5, 233.3, 199.0, 151.4 |
+
+Seven arm runs printed no figures (each of the three in the second A/B's first round at load 98–145, and main in its
+second and third), and are left out. No arm's run passed the test's own bound on writes over 50 ms at this load (3 to 5
+each), so the test reports failure after printing; the figures stand.
+
+**On raft-7's tip after B11 (2026-11-11, load 11–13, adacachy, the same command and arms: main at 29ef4521, whole at
+c07d1de6, pieces at 2c93f4c9, where the register piece carries A-251's `PersistedAcceptor`).** Every round, interleaved.
+Microseconds: added at the median; live p99.
+
+| round | main | whole | pieces |
+|---|---|---|---|
+| 1 | 70.9; 284.8 | 231.2; 900.6 | 92.9; 525.4 |
+| 2 | 99.5; 471.7 | 225.3; 774.1 | 85.5; 467.8 |
+| 3 | 90.0; 443.8 | 325.4; 1,456.1 | 92.2; 387.0 |
+| 4 | 87.5; 300.0 | 241.2; 1,123.0 | 86.0; 464.8 |
+| 5 | 88.5; 498.8 | 230.7; 800.6 | 91.6; 511.6 |
+
+Medians of the rounds: main 88.5, pieces 91.6, whole 231.2. The pieces sit inside main's own spread (70.9–99.5); the
+whole image is about 140 µs above both, and its p99 is about twice theirs.
+
+**Reading.** Persisting every acknowledged live entry costs nothing at the median that main's own spread can show: pieces
+65–79 µs against main's 65–76 µs. The whole held image cost 207–225 µs, 140 µs more, and its p99 670–825 µs. The
+pieces' p99, 151–276 µs, sits about 50 µs above main's typical 146–197 µs: the publication a candidate makes before it
+answers.
+
+## What a verdict compares and copies, and what the owner spends a verdict on (§4.16 "The verdict"; 2026-11-11)
+
+**The question (the supervisor's, 2026-11-11):** `Green::decide` is about half the green owner's CPU, and `memcmp` and
+`memmove` lead its self time. Is that work proportional to the change, the file, or the green?
+
+**The engine alone: `crates/merge/examples/verdict_bench.rs`.** One slot replacement (a delete and an insert of 16
+bytes, as an SDK edit composes) submitted to a green of one measured file among 754, 7,540 or 75,400 small ones, in
+three cases: overlapping an intervening replacement with other bytes (conflict), with the same bytes (converges), and a
+disjoint edit at the head (accepted). Fastest of 7 rounds of 2,000 submits, each outcome checked. `cargo run --release -p
+slates-merge --example verdict_bench`, adas-mac-studio.local-2, load 2.3 to 3.3, main db9c514e against perf-decide
+63d63b23 (the whole-file identity check compared run by run in the content history), alternated, 3 rounds a side, the
+range over the rounds. Nanoseconds a submit:
+
+| paths | file | conflict, main → cut | converge, main → cut | accept (both) |
+|---|---|---|---|---|
+| 754 | 4 KiB | 684–1,121 → 466–660 | 723–830 → 462–493 | 1,156–1,187 |
+| 754 | 21 KiB | 1,467–1,504 → 420–447 | 1,805–1,854 → 447–458 | 2,001–2,050 |
+| 754 | 1 MiB | 40,819–41,508 → 417–447 | 50,252–51,283 → 444–457 | 37,198–37,824 |
+| 75,400 | 21 KiB | 1,660–1,693 → 557–590 | 2,041–2,078 → 584–618 | 2,470–2,582 |
+| 75,400 | 1 MiB | 41,445–42,102 → 571–601 | 50,810–51,812 → 584–625 | 39,102–39,666 |
+
+- The verdict's cost does not follow the green: a hundred times the paths adds about 0.15 µs (the maps' searches).
+- It followed the edited file twice over: the whole-file identity check of a length-changing edit that overlaps an
+  intervening change (rebuild the base, apply the ops to a copy, compare the copy with the head), and every accept
+  (`apply` writes the new file; the history checks its splice against it byte for byte). The first now follows the
+  change (a 1 MiB file: 41–51 µs to 0.42–0.63 µs); the accept still follows the file.
+
+**The daemon: not moved.** The owner's thread CPU per verdict and per rebase (`tools/owner_cpu_patch.py`, not
+committed), the anchor recipe, interleaved, 5 rounds a side, oracle 0 in all 40 runs:
+
+| | main db9c514e | + the cut | W1 c349a42a | + the cut |
+|---|---|---|---|---|
+| 3,000 clients, µs a verdict | 48.9–51.0 | 49.2–51.1 | 21.3–22.0 | 21.1–22.1 |
+| 3,000 clients, µs a rebase | 27.2–27.8 | 27.3–28.2 | 12.1–12.5 | 12.0–12.5 |
+| 1,000 clients, µs a verdict | 37.1–39.3 | 37.0–38.7 | 23.0–23.6 | 22.1–23.0 |
+
+At the rung's files (21 KiB on average, the slots in their first 512 bytes) the identity check costs a few µs of a verdict,
+so the cut is even there. It landed on 2026-11-17 (g222) on the engine's A/B above, which is not even: faster at every
+file size measured, 4 KiB to 1 MiB, and by two orders of magnitude at 1 MiB. **Owed (the supervisor's measurement):** the
+daemon's owner CPU a verdict and the loaded edit-and-merge p99/p999 at a rung whose hot files are large (256 KiB to 1 MiB),
+main before and after this merge, interleaved.
+
+**Where W1's owner spends a verdict (a second diagnostic, `tools/engine_split_patch.py`, the engine call timed apart by
+the thread's CPU clock).** 3,000 clients, 3 runs, oracle 0: a verdict 21.4–21.7 µs, of it the engine (`submit_resolved`)
+13.0–13.1 and the rest (composing the admission, the chain's admission, retention, the span, the durable records)
+8.3–8.7; a rebase 12.3–12.4 µs, the engine (`Green::rebase`) 9.5–9.6 and the rest 2.7–2.8. Verdicts and rebases are
+51–53% of the owner's wall (`merge-util`), the engine 68% of that. A rung verdict costs the engine 13 µs where the bench's
+one-path verdict costs under 2.5 µs, and 82% of the rung's verdicts are conflicts: what in a rung increment costs the
+engine the difference is the next measurement (a line-table build, `sample`'s call sites resolved by `atos`).
+
+## The 1,000-client bound on main: met at no offered load on a shared Mac Studio (goal 231; A-297; 2026-11-18)
+
+**What it is.** Goal 231's measurement of the bound Ada stated on 2026-11-18 (A-297): every kind's p99 under 1 ms while
+1,000 clients offer at least 10³ verdicts a second, with no oracle failure and no client given up or starved. One run is
+one level of `load_bench`, whose `bound` row is the verdict. Main `7d760c4ea` carries W1 (A-247 step one), A-298,
+A-307, the `bound` row (A-297) and the reply carrier (A-296).
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4, Darwin 25.4.0),
+release (LTO) binaries of main `7d760c4ea` built there with Rust 1.98.1. Not quiet: other agents' test suites and
+builds ran throughout, the one-minute load average at each run's start was 11.5 to 57.2, and the run itself took about
+10 to 16 cores (the daemon, by its CPU time over the wall) and 8 more (the harness's workers). Linux v7.4-rc1
+(6628e7d4) `kernel/`, 754 files, 16.3 MB.
+
+**Command.** A fresh single-node anchored daemon per run (`slates --instance <i> anchor --quick`, then `slates
+--instance <i> bootstrap root`; it derived 23 shards), then `load_bench --instance <i> --tree <linux-v7.4-rc1>/kernel
+--clients 1000 --hot-files 800 --rounds 20 --reply-patience 60 --per-connection 32 --think-us Z` for Z = 200, 100, 50
+and 20 ms, and Z = 200 ms with `--per-connection 1`. Three rounds, the five points interleaved in each, 2026-11-18
+09:10 to 09:40 UTC; loadtest-scale's `rung.sh` with every bench.log kept whole. All 15 runs:
+
+| Z (ms), round | load at start | verdicts/s | held | p99 ms: Edit / Accepted / Conflict / ReadHead / Rebase | Cycle p99 ms | Round p99 ms | gave up | harness max sweep ms | oracle failures |
+|---|---|---|---|---|---|---|---|---|---|
+| 200, 1 | 11.5 | 280 | 2.0 | 28.4 / 30.6 / 35.2 / 24.9 / 35.9 | 173 | 888 | 19 | 113 | 0 |
+| 100, 1 | 24.7 | 556 | 3.1 | 20.7 / 26.8 / 26.5 / 19.0 / 27.8 | 130 | 587 | 16 | 79 | 0 |
+| 50, 1 | 34.5 | 1,105 | 5.9 | 25.2 / 29.2 / 32.8 / 23.0 / 34.5 | 160 | 670 | 16 | 156 | 0 |
+| 20, 1 | 35.5 | 2,409 | 16.9 | 44.5 / 76.4 / 72.7 / 28.1 / 58.5 | 540 | 2,593 | 20 | 263 | 0 |
+| 200 pc 1, 1 | 36.5 | 268 | 10.6 | 94.9 / 109.8 / 116.6 / 80.8 / 121.7 | 574 | 2,984 | 21 | 211 | 0 |
+| 200, 2 | 42.1 | 281 | 7.5 | 40.1 / 44.3 / 47.9 / 34.1 / 50.1 | 195 | 1,623 | 29 | 133 | 0 |
+| 100, 2 | 32.5 | 562 | 0.0 | **0.59 / 0.94 / 0.88 / 0.48 / 0.88** | 5.4 | 58.8 | 17 | 9.0 | 0 |
+| 50, 2 | 32.6 | 1,106 | 0.5 | 3.67 / 4.55 / 6.40 / 4.32 / 7.79 | 41 | 174 | 24 | 31 | 0 |
+| 20, 2 | 34.7 | 2,732 | 0.5 | 3.83 / 4.84 / 4.96 / 3.35 / 5.19 | 21 | 148 | 24 | 9.4 | 0 |
+| 200 pc 1, 2 | 34.0 | 269 | 11.8 | 62.5 / 76.5 / 72.9 / 54.2 / 74.1 | 272 | 2,562 | 29 | 167 | 0 |
+| 200, 3 | 37.9 | 283 | 0.8 | 10.1 / 12.4 / 13.0 / 9.4 / 13.2 | 62 | 295 | 22 | 77 | 0 |
+| 100, 3 | 28.3 | 486 | 26.4 | 100.9 / 126.6 / 114.8 / 80.5 / 118.7 | 740 | 3,473 | 28 | 305 | **1** |
+| 50, 3 | 47.0 | 1,053 | 6.8 | 19.8 / 51.1 / 42.2 / 18.7 / 27.7 | 298 | 1,356 | 25 | 300 | 0 |
+| 20, 3 | 55.7 | 2,019 | 69.5 | 94.2 / 111.1 / 119.9 / 76.6 / 120.0 | 616 | 3,683 | 29 | 213 | **1** |
+| 200 pc 1, 3 | 57.2 | 272 | 11.0 | 95.1 / 107.6 / 128.2 / 81.1 / 133.6 | 691 | 3,523 | 25 | 250 | 0 |
+
+The p50 of every request kind was 0.07 to 2.13 ms at every point. The daemon's peak RSS was 2.17 to 2.51 GiB. Every
+`lost` counter read 0 at all 15 points (`xshard.reply_dropped` among them) and so did every room wait; the works
+composed 133,017 to 138,446 submissions on their own shards and none on the owner. The `per-connection 1` runs' harness
+went up to 2.71 s between two drains of a ring.
+
+**What it means.**
+- **Not met, and not meetable at this shape.** No run read `met yes`; `worst` named the Round's p99 at all 15. Every
+  level also had 16 to 29 clients give up: twenty rounds over 800 hot picks runs some clients past the harness's 64
+  resolutions a round, and the bound admits none. So the shape decides `met no` before the latency does (goal 231's
+  open decision 2, whether the Round is judged, comes after it).
+- **The offered load is lower than the think time suggests.** A round is about 13 requests with a pause after each, so
+  Z = 200 ms offers 268 to 283 verdicts a second, not 10³. The floor is reached from Z = 50 ms (1,053 to 1,106 a
+  second); Z = 20 ms offers 2,019 to 2,732.
+- **The tails follow the box, not the offered load.** Each request kind's p99 was under 1 ms in one run only, Z = 100 ms
+  round 2 (562 verdicts a second, nobody held, the harness sweeping within 9.0 ms). The three best runs swept within
+  9 to 31 ms; the three worst took 213 to 305 ms a sweep with 26 to 70 clients held. On this box the tail is shared
+  CPU until shown otherwise: the run on a quiet host is owed.
+- **No reply was lost** in 15 runs at 1,000 clients (A-296's counters, all zero).
+- **Two oracle failures, at the two most loaded runs** (Z = 100 ms and 20 ms of round 3). Each is a conflict naming a
+  window touched by the version one past the head window the oracle allowed it: v3803 against 3800..=3802, v8171
+  against 8169..=8170. A hypothesis under test, not a finding: the harness stamps a request's send after
+  `Client::begin` returns (`Worker::send` in `load_bench.rs`), so a worker descheduled between the two records a
+  submit as sent after a verdict that already reflects it, which narrows the oracle's window by one version.
+- **The hypothesis, tested the same day (11:00 UTC).** 22 more runs at Z = 20 ms with `--events` (6 on the Studio, 16 on
+  GitHub's 4-vCPU runners under two spinning loops a CPU) swept within 7 to 23 ms and reported nothing. With the
+  harness clamped to background QoS (`taskpolicy -c background load_bench ...`, the daemon unclamped), the second run
+  reported one failure, a window missing rather than extra: a conflict (base 6) without `irq/ipi.c@384`, touched by
+  v115, whose reply the harness had taken before this submit's send stamp. That submit's own event records a round
+  trip of 5 µs (sent 100,336,833 ns, replied 100,341,833 ns) where the run's submits took 374 to 399 µs at the median:
+  its send was stamped long after the request went out, so the oracle's bound came from the late stamp. The failures
+  read as the harness's, and stamping before `begin` is the test of it (reported to goal 231).
+- **The harness was fixed the same day (goal 257's agent g083).** A send is now stamped before its request is handed to
+  the ring and a reply after its ring was read, so the oracle's bounds are sound by construction; the reply's own
+  stamp had the second fault (read before the ring), which a preempted drain turns into a reply recorded before it
+  came. Each attempt also prints a `floor`, a lower bound on what the daemon and the ring took, so a later run tells a
+  tail the harness may have added from one it cannot have. No run of the fixed harness is recorded yet.
+
+## Many writers on one large live volume: the byte credit keeps the owner up in 5 of 8 runs, and two whole records still ship (AC-8.9; A-200; goal 230; 2026-11-18)
+
+**What it is.** Goal 230's piece 1 replaced the live credit of two entries by the bytes of the volume's whole state
+(85e54bd12), so that a burst of stable writes ships changes, not the volume. The measurement the goal owed: many writers
+on one live volume of 100 MB or more, before and after, with `fleet.live.whole`, `fleet.live.refused.no_credit` and the
+write's p50, p99 and p999.
+
+**Environment.** GitHub runners, diagnostics run 44281929450 (branch `diag-measurer-7`, never merged), 2026-11-18
+10:14 to 10:23 UTC: `ubuntu-latest` (x86_64, 4 vCPUs) and `ubuntu-24.04-arm` (arm64, 4 vCPUs), each running both arms;
+load average 1.4 to 2.0 at each run's start. Before is `3c0af9399`, main just before the stack landed (the second parent
+of its landing); after is `8c81d2655`, the landing. Each arm's `live_fleet` test binary built release, each in its own
+target directory.
+
+**Command.** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 SLATES_MEASURE_WRITERS=32 SLATES_MEASURE_PREFILL_MIB=128
+SLATES_MEASURE_WRITES=200 <live_fleet> measure_many_writers_on_one_large_live_volume --exact --nocapture`, with the
+measurer's harness appended to `crates/cli/tests/live_fleet.rs` in both arms and never committed (it is in the
+branch's `.github/measurer/g230_harness.rs`): `start_fleet` (three daemons, `f = 1`, no anchor), one live-shipped volume
+on the owner bounded at 512 MiB, one file filled to 128 MiB by 64 KiB `FILE_SYNC` writes, then 32 writers, each its own
+NFS connection with its own `MOUNT` and `LOOKUP`, each sending 200 4 KiB `FILE_SYNC` writes to pages drawn across the
+file; a retry-later answer is sent again as a client does, for at most 10 s. Round 0 starts the writers together,
+rounds 1 to 3 start them 50 ms apart; the arms ran A B, A B, B A, A B on each runner.
+
+| runner, round | before `3c0af9399` | after `8c81d2655`: write p50 / p99 / p999 / max | after: writes a second |
+|---|---|---|---|
+| x86_64, 0 | daemon ended, 32 of 32 writers failed | daemon ended, 32 of 32 writers failed | |
+| x86_64, 1 | daemon ended (21 writers first answered `NFS3ERR_JUKEBOX` past 10 s) | daemon ended, 32 of 32 failed | |
+| x86_64, 2 | daemon ended, 32 of 32 failed | 58.3 ms / 1.94 s / 3.28 s / 3.70 s | 77 |
+| x86_64, 3 | daemon ended, 32 of 32 failed | 223.2 ms / 2.04 s / 3.72 s / 4.03 s | 65 |
+| arm64, 0 | daemon ended, 32 of 32 failed | 67.5 ms / 406 ms / 1.93 s / 1.94 s | 353 |
+| arm64, 1 | daemon ended, 32 of 32 failed | daemon ended, 32 of 32 failed | |
+| arm64, 2 | daemon ended, 32 of 32 failed | 67.1 ms / 294 ms / 1.94 s / 1.94 s | 351 |
+| arm64, 3 | daemon ended, 32 of 32 failed | 149.9 ms / 1.05 s / 2.02 s / 2.05 s | 120 |
+
+"Daemon ended" is the watchdog of a daemon run with no anchor ending its process (exit 4) on "shard 0 is spinning,
+1000 ms of CPU without a step" (1,000 to 1,099 ms); the writers' connections were then reset or refused. Across the
+writers in every completed run the owner's counters went `whole` 1 to 3 (`whole_bytes` 837 to 271,093,469: two whole
+records of about 135.5 MB), `held_back.whole` 11 to 16, `batches` 5 to 102 carrying 20 to 304 entries, `durable_late`
+1 in one run; `refused.no_credit` never appeared.
+
+**What it means.**
+- **The byte credit helps:** before it, every run lost the owner to one step of a second of CPU; after it, 5 of 8 runs
+  wrote all 6,400 writes.
+- **It does not yet do what it promised under 32 writers:** two whole records of the 128 MiB volume still shipped in
+  every completed run, against "no whole records after the log's first", and a write's p99 was 0.29 to 2.04 s, its
+  p999 1.93 to 3.72 s.
+- **A step of a second of CPU still ends the daemon in 3 of 8 runs.** Which step was not measured; the whole record's
+  build over the volume in one turn is the candidate (GAPS records the live log's whole entry as a one-turn walk of a
+  whole volume, and `install_built` and `install_image` rose with it). Under an anchor the daemon would be restarted,
+  which is still an outage of every writer's connection.
+
+## Where a 1,000-client request's time goes, and a client's ring that wakes only its shard: parks down 59%, daemon CPU down 20-34%, latency moving with the box (A-381; goals 231 and 257; 2026-11-18)
+
+**What it is.** Goal 257's agent (g083) profiled the 1,000-client rung's loaded tail, the harness against the product,
+then cut the first thing the profile named. The profile is a diagnostic build never on main (branch `diag-g083-trace`):
+each shard's span sink sized to hold a whole run (`SLATES_DIAG_SPAN_CAPACITY`), the owner's answer to each ask and each
+resumed verb spanned under its request's id, and `load_bench --trace` joining every attempt it timed with every span of
+its request. The harness on main since `f6d37937b` stamps a send before it reaches the ring and a reply after its ring
+was read, and prints each attempt's `floor` (the daemon and the ring's share, whatever the harness's sweep did).
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, macOS 26.4), release (LTO) `load_bench`
+with the daemon in its process (23 shards derived), Linux v7.4-rc1 `kernel/`. Shared: other agents' builds and tests
+ran throughout, and the one-minute load at the runs' starts went from 14 to 52.
+
+**Command.** `[SLATES_DIAG_SPAN_CAPACITY=1500000] load_bench --tree <linux-v7.4-rc1>/kernel --clients 1000 --hot-files
+800 --per-connection 32 --rounds 20 --reply-patience 60 --think-us Z [--trace]`, the scripts `diag_run.sh` and `ab.sh` of
+`~/.cache/slates-scratch/g083/scripts/` (the measuring agent's), every bench.log kept whole on the Studio in
+`~/.cache/g083-runs/`.
+
+**The profile (2026-11-18 17:05 UTC, load 14 to 17, the diagnostic on main `f6d37937b`).** Each leg of an attempt's
+time, p50 / p99 / p999 in µs: the request in the client's ring until its shard read it (`to_read`), the hop to the
+work's shard (`hop_in`), the verb's own steps (`ops`), an ask's wait to reach the green's owner, its batch and queue
+(`ask_out`), the owner's answer (`ask_serve`), the answer back (`ask_back`), the reply home (`hop_out`), and the
+harness taking the reply (`to_take`).
+
+| Z, verdicts/s | kind | to_read | hop_in | ops | ask_out | ask_serve | ask_back | hop_out | to_take | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 50 ms, 1,121 | Edit | 35 / 634 / 4,666 | 17 / 267 / 2,417 | 12 / 54 / 102 | 0 / 397 / 3,532 | 0 / 13 / 42 | 0 / 127 / 1,034 | 33 / 238 / 2,023 | 1 / 25 / 2,744 | 141 / 2,218 / 20,449 |
+| 50 ms, 1,121 | Accepted | 35 / 513 / 4,326 | 16 / 271 / 2,000 | 50 / 138 / 227 | 34 / 786 / 5,837 | 51 / 135 / 224 | 16 / 214 / 2,253 | 11 / 187 / 1,465 | 1 / 23 / 2,246 | 240 / 2,684 / 16,994 |
+| 50 ms, 1,121 | ReadHead | 34 / 589 / 4,483 | 19 / 599 / 6,217 | 4 / 26 / 61 | | | | 39 / 261 / 2,410 | 1 / 25 / 1,479 | 114 / 1,863 / 14,024 |
+| 20 ms, 2,682 | Edit | 28 / 421 / 6,027 | 23 / 351 / 3,440 | 13 / 68 / 120 | 0 / 1,028 / 13,563 | 0 / 15 / 47 | 0 / 188 / 1,118 | 39 / 358 / 2,586 | 1 / 51 / 37,916 | 178 / 3,308 / 46,533 |
+| 20 ms, 2,682 | Accepted | 29 / 389 / 3,934 | 21 / 312 / 2,148 | 53 / 167 / 261 | 74 / 1,935 / 31,262 | 49 / 150 / 250 | 24 / 271 / 1,766 | 18 / 320 / 1,677 | 1 / 48 / 45,177 | 329 / 5,021 / 46,865 |
+
+The floor's p99 was 1.6 to 2.7 ms at 50 ms (every kind) against a latency p99 of 1.9 to 3.7 ms, and 2.2 to 4.6 ms at
+20 ms. Every shard parked and woke 344,631 to 379,811 times in the 49.3 s level (about 7,500 a second), alike on shards
+serving one connection and two; the owner ran 33% of a core at 50 ms and 51% at 20 ms, every other shard 13 to 28%.
+
+**The A/B of A-381 (17:40 to 17:49 UTC).** Before is main `79aee2a17` with the diagnostic (`diag-g083-base`), after is
+A-381's branch on it (`diag-g083-a381`); no span sink enlarged and no `--trace`. Back to back, the order alternating by
+round. `waits` is every shard's parks summed over the level (49 to 55 s at 50 ms, 23 to 30 s at 20 ms), `CPU` the
+shards' CPU summed, in thousandths of a core; latencies in ms.
+
+| Z, round | arm | load before → after | verdicts/s | waits | CPU | Edit p50 / p99 | Edit floor p99 | Accepted p99 |
+|---|---|---|---|---|---|---|---|---|
+| 50, 1 | before | 14.5 → 31.0 | 1,058 | 5,240,411 | 4,936 | 0.51 / 29.2 | 26.8 | 36.8 |
+| 50, 1 | after | 31.0 → 28.4 | 1,031 | 1,777,236 | 3,445 | 0.40 / 23.4 | 15.3 | 30.2 |
+| 50, 2 | after | 40.0 → 43.7 | 1,038 | 1,816,524 | 2,945 | 0.48 / 22.0 | 11.7 | 29.2 |
+| 50, 2 | before | 43.7 → 51.9 | 1,101 | 4,281,536 | 3,891 | 0.67 / 15.1 | 9.4 | 22.2 |
+| 50, 3 | before | 47.0 → 46.3 | 1,080 | 4,602,849 | 4,024 | 0.49 / 15.1 | 7.8 | 32.4 |
+| 50, 3 | after | 46.3 → 31.7 | 1,095 | 2,157,207 | 2,097 | 0.11 / 1.48 | 1.31 | 2.04 |
+| 20, 1 | before | 28.4 → 37.7 | 2,165 | 2,325,470 | 6,224 | 2.26 / 40.6 | 35.2 | 45.3 |
+| 20, 1 | after | 37.7 → 40.0 | 2,208 | 1,151,770 | 5,004 | 1.00 / 31.3 | 28.7 | 35.6 |
+| 20, 2 | after | 51.9 → 49.6 | 2,166 | 1,049,246 | 5,203 | 1.75 / 33.0 | 28.3 | 38.7 |
+| 20, 2 | before | 49.6 → 47.0 | 2,471 | 2,885,394 | 6,510 | 0.82 / 23.0 | 20.5 | 26.7 |
+| 20, 3 | before | 31.7 → 28.8 | 2,703 | 3,021,147 | 6,979 | 0.19 / 1.32 | 1.23 | 2.24 |
+| 20, 3 | after | 28.8 → 31.2 | 2,627 | 1,190,604 | 5,498 | 0.23 / 2.57 | 2.36 | 3.33 |
+
+Every run's oracle had 0 failures; 11 to 44 clients a run gave up (starved past 64 resolutions a round, the shape's).
+
+**What it means.**
+- **The p99 is the product's, the p999 partly the harness's.** At the p99 the harness took 25 to 51 µs to take a reply,
+  and the floor was 85% of the latency or more; past the p99 a worker kept off its CPU for up to 96 to 126 ms (the
+  `max_sweep_ns` of every run) shows in `to_take` (a p999 of 2.7 to 45 ms).
+- **The product's time is waiting, not work.** A verb's own steps took 12 to 50 µs at the median and the owner's answer
+  13 to 135 µs at the p99; the rest of a slow request was its turn at four or five thread hand-offs: the client's shard
+  reading the ring, the hop to the work's shard, the ask's way to the owner, its way back, and the reply home, each with
+  a p99 of 127 to 786 µs at 50 ms and up to 1.9 ms at 20 ms. The ask to the owner grows fastest with load.
+- **A-381 cut what it was for and moved no latency this box can show.** Each shard's parks fell by 59% at both loads
+  (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms, means of three) and the shards' CPU by 34% at
+  50 ms and 20% at 20 ms. The latencies swung by ten to twenty times with the box's load within each arm (Edit p99 1.3
+  to 40.6 ms), so these six pairs cannot tell the two apart; the round at the lowest load favoured A-381 at 50 ms and
+  main at 20 ms.
+
+## Two batches of asks out to an owner: the ask's wait for the batch before it gone, every request kind's p99 at 50 ms 40 to 50% lower in five of six pairs (A-388; goals 231 and 257; 2026-11-18)
+
+**What it is.** The trace above, extended with a span from each ask's queueing in its shard's outbox to its batch's
+sending (`diag-g083-v2`, never on main), split an ask's way to the green's owner in two: the wait in the outbox for the
+one batch then allowed out to come back (`outbox`), and the batch's way to the owner and its turn there (`transit`). At
+1,000 clients, a think mean of 50 ms, the Mac Studio at load 25 to 35 (main `731763108` with the diagnostic,
+2026-11-18 18:05 UTC): submits' outbox p50 36 µs / p99 1.65 ms against transit 71 µs / 2.41 ms, rebases' 32 µs /
+2.13 ms against 84 µs / 2.70 ms; in the slowest 1% of edits, submits and rebases the outbox's mean was 3.5, 6.2 and
+8.5 ms against transit's 3.6, 6.5 and 8.1. A-388 keeps two batches out.
+
+**Environment and command.** As the entry above: Mac Studio, release (LTO) `load_bench` with the daemon in its process
+(23 shards), `kernel/`, 1,000 clients, 800 hot picks, 20 rounds, `--per-connection 32`, both arms with the diagnostic
+(no span sink enlarged, no `--trace`): before is main `a1d99b6e0` (`diag-g083-obbase`), after is A-388 on it
+(`diag-g083-ob`), back to back, the order alternating by round, 2026-11-18 18:21 to 18:29 UTC. p99 in ms.
+
+| Z, round | arm | load before → after | verdicts/s | Edit | Accepted | Conflict | ReadHead | Rebase | Edit floor |
+|---|---|---|---|---|---|---|---|---|---|
+| 50, 1 | before | 10.3 → 38.8 | 1,068 | 28.3 | 40.3 | 47.7 | 32.7 | 48.6 | 19.2 |
+| 50, 1 | after | 38.8 → 25.5 | 1,021 | 2.05 | 3.27 | 5.06 | 2.09 | 4.08 | 1.62 |
+| 50, 2 | after | 30.9 → 24.1 | 1,127 | 1.27 | 1.97 | 1.87 | 0.98 | 1.73 | 1.14 |
+| 50, 2 | before | 24.1 → 31.5 | 1,129 | 8.51 | 10.6 | 10.9 | 7.49 | 11.2 | 7.33 |
+| 50, 3 | before | 32.4 → 29.9 | 1,086 | 0.94 | 1.55 | 1.84 | 0.82 | 1.73 | 0.89 |
+| 50, 3 | after | 29.9 → 29.8 | 1,119 | 0.55 | 0.80 | 1.10 | 0.46 | 0.81 | 0.53 |
+| 20, 1 | before | 25.5 → 31.2 | 2,778 | 4.78 | 7.95 | 7.64 | 3.97 | 7.70 | 3.94 |
+| 20, 1 | after | 31.2 → 30.9 | 2,730 | 3.54 | 4.75 | 5.77 | 3.72 | 5.84 | 2.81 |
+| 20, 2 | after | 31.5 → 33.1 | 2,600 | 1.05 | 1.42 | 2.09 | 1.00 | 1.39 | 1.00 |
+| 20, 2 | before | 33.1 → 32.4 | 2,763 | 0.95 | 1.22 | 1.73 | 0.71 | 1.25 | 0.93 |
+| 20, 3 | before | 29.8 → 29.2 | 2,743 | 1.91 | 2.67 | 3.76 | 1.54 | 2.82 | 1.68 |
+| 20, 3 | after | 29.2 → 30.0 | 2,682 | 1.36 | 2.00 | 3.71 | 1.16 | 1.90 | 1.23 |
+
+The p50s were alike in each pair (Edit 0.11 to 0.20 ms); the shards' parks and CPU were alike (CPU 1,895 to 2,342
+thousandths of a core summed over the shards at 50 ms, 5,375 to 5,893 at 20 ms, in both arms). Every run's oracle had
+0 failures.
+
+**The mechanism, traced (18:29 to 18:31 UTC, load 25 to 29, the same binaries with `--trace` and the span sinks
+enlarged).** p50 / p99 / p999 in µs, after against before: an accepted submit's outbox 27 / 111 / 1,366 against 24 / 178
+/ 12,891, its transit 17 / 303 / 2,166 against 14 / 403 / 2,616, and the whole submit's p99 1,011 against 1,241 and its
+p999 7,658 against 23,341; a rebase's outbox 25 / 120 / 1,824 against 23 / 183 / 14,738 (the rebase's p999 11,248
+against 22,544); an edit's outbox p999 502 against 1,222 (the edit's p999 5,124 against 17,525). The wait for the batch
+before is what went: the outbox's p999 fell eightfold to tenfold; its median, about 25 µs in both, is the sender's
+first turn on the shard.
+
+**What it means.**
+- **Faster in five of six pairs.** Every request kind's p99 was lower with two batches out in every pair at 50 ms, by
+  40 to 50% in the pair whose loads matched best (round 3, load 30: an accepted submit 1.55 to 0.80 ms, a rebase 1.73
+  to 0.81), and at 20 ms in two of three (round 2, at load 32 to 33, by 10 to 16% the other way).
+- **The bound at 50 ms nearly held in that pair:** after A-388 every kind but the conflicted submit (1.10 ms) was under
+  1 ms at 1,119 verdicts a second, at a load of 30 from other work.
+
+## A work on its client's shard, priced before it was built: an edit's p50 40% lower and its p99 about halved at 1,000 clients (A-400's pricing; goals 231 and 257; 2026-11-18)
+
+**What it is.** The price of the hop A-247 put between a client and its work, measured before A-400 moved the work: the
+same diagnostic `load_bench` (`diag-g083-v3` on main `57ff29e53`, never on main) run with each client's work named
+`load-<id>-<n>`, the first `n` whose name hashes to the client's own shard (`--local-names`), against the plain names,
+which hash anywhere. Named so, a work lives where A-400 now puts it, with nothing else changed.
+
+**Environment and command.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, macOS 26.4), release (LTO),
+the daemon in the harness's process (23 shards), `kernel/`, 1,000 clients, 800 hot picks, 20 rounds,
+`--per-connection 32`; one binary, the two forms back to back, the order alternating by round, 2026-11-18 18:38 to 18:46
+UTC, load 23 to 34. p99 in ms, Edit p50 in µs.
+
+| Z, round | form | load before → after | Edit p50 | Edit | Accepted | Conflict | ReadHead | Rebase |
+|---|---|---|---|---|---|---|---|---|
+| 50, 1 | hashed | 22.9 → 26.3 | 112 | 0.90 | 1.34 | 1.52 | 0.78 | 1.43 |
+| 50, 1 | local | 26.3 → 26.5 | 69 | 0.47 | 1.04 | 1.33 | 0.55 | 0.97 |
+| 50, 2 | local | 27.6 → 26.6 | 70 | 0.61 | 1.16 | 1.61 | 0.68 | 1.09 |
+| 50, 2 | hashed | 26.6 → 25.0 | 116 | 2.04 | 2.96 | 4.38 | 2.23 | 3.30 |
+| 50, 3 | hashed | 27.2 → 34.2 | 137 | 5.38 | 6.72 | 8.52 | 5.89 | 8.45 |
+| 50, 3 | local | 32.3 → 30.6 | 81 | 1.07 | 1.51 | 2.21 | 1.26 | 1.91 |
+| 20, 1 | hashed | 26.5 → 27.9 | 166 | 1.97 | 3.34 | 4.70 | 2.00 | 3.61 |
+| 20, 1 | local | 27.9 → 27.6 | 87 | 0.69 | 0.93 | 1.59 | 0.68 | 1.06 |
+| 20, 2 | local | 25.0 → 26.9 | 96 | 0.83 | 1.25 | 2.99 | 0.84 | 1.20 |
+| 20, 2 | hashed | 26.9 → 27.2 | 176 | 1.63 | 2.19 | 3.67 | 1.43 | 2.39 |
+| 20, 3 | hashed | 30.6 → 32.9 | 186 | 2.19 | 3.29 | 3.73 | 1.91 | 3.21 |
+| 20, 3 | local | 32.9 → 32.7 | 106 | 6.09 | 10.6 | 16.2 | 8.96 | 13.2 |
+
+The shards' CPU, summed: hashed 2,176 to 2,482 thousandths of a core at 50 ms and 5,492 to 6,108 at 20 ms; local 1,666
+to 1,978 and 4,206 to 4,737. Every run's oracle had 0 failures.
+
+**What it means.** Living on its client's shard took about 40% off an edit's median in all six pairs and about half its
+p99 in five (the sixth, 20 ms round 3, went the other way with every kind, at the same load), and 20 to 25% off the
+shards' CPU. A-400 builds it; its own A/B against main is filed with the supervisor.
+
+## A work on its client's shard, the A/B: an edit's p50 lower in six of six pairs and its p99 in four, the bound still not met (A-400; goals 231 and 257; 2026-11-18)
+
+**What it is.** The supervisor's A/B of A-400 (a work lives on the shard that serves its creation, its client's own):
+main just before it (`1a1e6627c`, branch `agents/g083-a400-before`) against that commit with A-400 alone (`4765813fe`,
+`agents/g083-w1-under-1ms-placement`). Both builds predate A-416, so their hot sets were drawn with replacement, and
+the given-up clients below are largely that (GAPS, A-416).
+
+**Environment and command.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, macOS 26.4), release (LTO),
+the daemon in the harness's process (23 shards), `kernel/` of linux v7.4-rc1, kiln run r77, 2026-11-18, load 8 to 27:
+`ROUNDS_PER_LEVEL=20 bash ~/.cache/g083-scripts/ab.sh a400before agents/g083-a400-before a400
+agents/g083-w1-under-1ms-placement 3 50000 20000` (1,000 clients, `--hot-files 800 --per-connection 32 --rounds 20
+--reply-patience 60 --think-us <Z>`, the arms back to back, the order alternating by round). p50 / p99 in µs.
+
+| Z µs, round | Edit before | Edit after | Accepted before | Accepted after | given up before / after |
+|---|---|---|---|---|---|
+| 50,000, 1 | 119 / 7,292 | 60 / 262 | 230 / 9,366 | 209 / 414 | 14 / 22 |
+| 20,000, 1 | 160 / 2,775 | 100 / 1,460 | 321 / 6,684 | 295 / 2,274 | 26 / 20 |
+| 50,000, 2 | 118 / 6,456 | 82 / 3,694 | 219 / 8,929 | 210 / 7,451 | 14 / 21 |
+| 20,000, 2 | 507 / 17,804 | 94 / 857 | 1,397 / 20,390 | 300 / 4,306 | 25 / 22 |
+| 50,000, 3 | 128 / 10,912 | 91 / 12,091 | 239 / 14,171 | 226 / 17,951 | 30 / 19 |
+| 20,000, 3 | 161 / 651 | 125 / 1,791 | 321 / 921 | 390 / 2,611 | 20 / 22 |
+
+Every one of the 12 runs had 0 oracle failures and exited 0.
+
+**What it means.** A-400 stays: its edit p50 was lower in all six pairs and its p99 in four, as the pricing said. The
+1,000-client bound was not met by either arm: the edit's and the accepted submit's p99 were both under 1 ms in 2 of
+the 12 runs (after, 50,000 round 1; before, 20,000 round 3), and 14 to 30 clients gave up in every run. The given-up clients are the next point to read (the fs/ rung under A-416's set rule is filed); the owner's
+one thread for verdicts and rebases is the next wall (A-273).
+
+## A load-test worker that parks between replies: measured and rejected (A-421; goals 231 and 257; 2026-11-18)
+
+**What it was.** A-421: a `load_bench` worker whose sweep took no reply and sent nothing swept on for the daemon's
+published spin window, then armed its connections' completions and parked (`poll(2)`) until a reply or its next
+deadline, waking early by the spin window and its parks' measured lateness. The workers had spun for the whole level
+(eight of the Studio's 32 cores), and under load their sweeps had taken 25 to 127 ms with clients held (g083's trace).
+
+**Environment and command.** The supervisor's A/B, kiln run r155: Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra,
+32 cores, macOS 26.4), release, the daemon in the harness's process, `fs/` of linux v7.4-rc1 (2,210 files long enough
+to edit), 1,000 clients, `--hot-files 800 --per-connection 32 --rounds 20 --reply-patience 60 --think-us <Z>`
+(`ab2.sh`, `~/.cache/g083-scripts/` on the Studio). Spin is main just before A-421 (`3f4700745`), park is that commit
+with A-421 alone (`656826e26`), run back to back with the order alternating by round; the load rose from 6 to 27 over
+the run. p50 / p99 in µs.
+
+| Z µs, round (load) | Edit spin | Edit park | Submit spin | Submit park | max sweep ms, spin / park | parks |
+|---|---|---|---|---|---|---|
+| 50,000, 1 (6-8) | 118 / 299 | 95 / 312 | 220 / 429 | 200 / 1,307 | 2.6 / 4.3 | 113,003 |
+| 20,000, 1 (9-10) | 146 / 579 | 140 / 578 | 284 / 719 | 280 / 795 | 3.7 / 4.3 | 14,514 |
+| 50,000, 2 (10-11) | 123 / 290 | 93 / 250 | 226 / 407 | 193 / 355 | 3.2 / 2.8 | 113,101 |
+| 20,000, 2 (11-14) | 203 / 3,410 | 186 / 3,972 | 497 / 5,221 | 425 / 5,161 | 6.5 / 17.7 | 11,122 |
+| 50,000, 3 (17-25) | 125 / 4,501 | 180 / 8,263 | 318 / 9,220 | 417 / 11,264 | 30.8 / 42.8 | 93,432 |
+| 20,000, 3 (25-28) | 442 / 8,612 | 623 / 26,863 | 1,164 / 11,320 | 1,901 / 34,586 | 18.6 / 39.4 | 6,760 |
+
+No client was held in any of the twelve runs (0.0), and none gave up, with 0 oracle failures (A-416's hot set).
+
+**Why rejected.** The workers parked (113,003 times in a 50 ms run) and bought nothing the A/B could see: the longest
+sweep was shorter in 1 pair of 6, the held clients were the same (none either way), and once the box was loaded the
+p99 was worse (an edit's 26.9 ms against 8.6 ms at load 25 to 28). A dead-even or worse A/B does not land, so the
+workers spin again (`load_bench.rs`, "Workers spin"); A-421's lint fixes stay (the stamp tests' preemption is a
+yielding wait, and the span drain keeps no name it never reads).
+
+**What it says about goals 231 and 257.** At the lightest load (50,000 µs, rounds 1 and 2, load 6 to 11) the edit's
+p99 was 250 to 312 µs and the submit's 355 to 429 µs in three of the four runs (park's first round: 1,307 µs); from
+load 11 to 28 the p99 was 3 to 35 ms. The gap left is the p99 under load, which A-273's replicas target.
+
+## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
+
+**What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,
+never dropped): the many-client rung on main just before the carrier landed (`8c9f05404`) against its landing
+(`d0e737b8d`). Both carry W1, so a green's works are served on the shards their names hash to.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), release (LTO)
+`load_bench` of each commit built there with Rust 1.98.1, 2026-11-18 10:11 to 10:34 UTC. Shared with other agents' work:
+the one-minute load average at each run's start is in the table. Linux v7.4-rc1 (6628e7d4) `kernel/`, 754 files.
+
+**Command.** `load_bench --tree <linux-v7.4-rc1>/kernel --clients N --hot-files 0.8N --per-connection 32 --rounds 3
+--reply-patience 60` (think time 0, the in-process daemon, which derived 23 shards), under `/usr/bin/time -l`. The
+`lost` rows are the daemon's counters read at the end of the run; `room` is the carrier's waits for room. Every run:
+
+| clients | build, round | load at start | wall s | verdicts/s | `xshard.reply_dropped` | room waits begun / ended (peak) | p99 ms: Edit / Accepted / Conflict / Rebase |
+|---|---|---|---|---|---|---|---|
+| 3,000 | before, 1 | 12.9 | 10 | 7,832 | 0 | (none in this build) | 91.3 / 106.7 / 114.6 / 110.8 |
+| 3,000 | after, 1 | 15.2 | 9 | 11,447 | 0 | 0 / 0 | 46.8 / 62.8 / 64.2 / 64.2 |
+| 3,000 | after, 2 | 18.0 | 6 | 13,427 | 0 | 0 / 0 | 41.8 / 49.5 / 63.3 / 53.2 |
+| 3,000 | before, 2 | 17.7 | 5 | 13,702 | 0 | | 49.8 / 61.8 / 71.8 / 59.9 |
+| 3,000 | before, 3 | 18.8 | 5 | 12,591 | 0 | | 44.0 / 48.6 / 64.9 / 51.3 |
+| 3,000 | after, 3 | 20.8 | 5 | 13,729 | 0 | 0 / 0 | 49.0 / 63.4 / 69.7 / 63.2 |
+| 10,000 | before, 1 | 15.9 | 31 | 12,213 | 0 | | 170.5 / 175.1 / 197.0 / 187.8 |
+| 10,000 | after, 1 | 25.2 | 62 | 5,440 | 0 | 6,576 / 6,576 (106) | 443.8 / 440.8 / 495.4 / 491.9 |
+| 10,000 | after, 2 | 41.0 | 32 | 11,446 | 0 | 6,358 / 6,358 (41) | 208.7 / 213.6 / 247.0 / 232.0 |
+| 10,000 | before, 2 | 37.6 | hung | | **57** (read live) | | |
+
+Every other `lost` counter read 0 in every completed run, and the oracle found nothing in any. The 10,000-client runs
+had 1,737 to 1,908 clients starved past the harness's resolutions (10,000 clients over 8,000 hot picks). The hung run
+progressed as its sibling did until about 40 s; from then to 545 s seven of its eight harness workers sat 2 to 6 agents
+short of done with their requests unanswered (one worker stopped reporting at 35 s), and the live daemon's
+`slates status`, read with `8c9f05404`'s own CLI built for it, counted `xshard.reply_dropped` 57. The harness was then
+ended (its own process, so no end-of-run rows).
+
+**What it means.**
+- **After the carrier, no reply was lost in 5 runs** at 3,000 and 10,000 clients; at 10,000 the carrier waited for room
+  6,358 and 6,576 times a run and ended every wait.
+- **Before it, the 3,000-client rung no longer drops** once W1 is in (0 in three runs), so the "about 4,200 a run" of
+  main `db9c514e` is not reproduced at this rung; at 10,000 clients one run of two lost 57 replies and hung, each lost
+  reply a client waiting for good (A-232).
+- The latencies above move with the box's load (one after-run met load 41 and took twice the wall), not with the
+  build: the carrier's cost does not show at this resolution.
+
+## A many-shard start under load, and where the starting thread's time goes at 407 shards (A-311, A-312; goal 254; 2026-11-18)
+
+**What it is.** Goal 254's owed runs: `a_start_whose_shards_sum_past_a_window_comes_up` (`crates/cli/tests/cli.rs`) under
+load on main before A-311 and A-312 (`f5b85d27b`) and after them (`7d760c4ea`), and the starting thread's CPU by phase
+at 407 shards, which the goal's notes held to be `connect_pairs` by arithmetic alone.
+
+**The test under load.** Release `cli` test binaries of each commit, each in its own target directory,
+`SLATES_TEST_CLI=1 <cli> a_start_whose_shards_sum_past_a_window_comes_up --exact --nocapture`, the arms run A B B A A B.
+The test measures one shard's share of a start and asks enough shards to sum past three liveness windows, so the shard
+count is the machine's:
+
+| where (2026-11-18 UTC) | load | shards asked | before `f5b85d27b` | after `7d760c4ea` |
+|---|---|---|---|---|
+| GitHub `ubuntu-latest`, 4 vCPU, two spinning loops a CPU (diag run 44279195223, 10:02) | 2.8-4.4 | 64-73 | 3 of 3 pass | 3 of 3 pass |
+| GitHub `ubuntu-24.04-arm`, 4 vCPU, the same (09:58) | 2.4-13.6 | 48-140 | 3 of 3 pass | 3 of 3 pass |
+| Mac Studio adas-mac-studio.local-2, 32 cores, the box's own load (10:40) | 12.1-12.6 | 30-35 | 3 of 3 pass | 3 of 3 pass |
+| GitHub `macos-latest`, 3 vCPU (10:39) | 6.3-13.1 | 756-1,959 | 0 of 3 (1,346-1,959 shards) | 1 of 3 (756 passed; 1,308 and 1,356 failed) |
+
+A shard's share of a start was 42 to 63 ms of CPU on the Linux runners, 86 to 101 ms on the Studio and 1.5 to 4.0 ms on
+`macos-latest`. Every `macos-latest` failure is the runtime's own limit, not a start kill: "start: runtime: too many
+shards: at most 1024 per process", the daemon's exit 4 and the anchor's crash loop, then "served false, the anchor's
+start kills []". The test does not cap the count it derives at the runtime's 1,024 shards a process.
+
+**The starting thread at 407 shards.** `slates daemon --quick --shards 407` of `7d760c4ea`, five starts on the Studio at
+load 17 to 47, with an uncommitted diagnostic that read the starting thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`)
+and the wall at slates-rt's phase boundaries. Milliseconds of that thread's CPU:
+
+| phase | starts 1 / 2 / 3 / 4 / 5 |
+|---|---|
+| registrations | 1.37 / 1.83 / 1.34 / 1.65 / 1.24 |
+| `connect_pairs` (407 × 406 rings) | 43.9 / 119.2 / 73.9 / 120.9 / 29.0 |
+| spawn | 4.6 / 6.5 / 5.5 / 4.7 / 4.2 |
+| readiness | 0.06 / 0.10 / 0.06 / 0.04 / 0.05 |
+
+Wall followed CPU within 2% in each phase. The start beat 166,873 times (S² + 3S + 3) before the watchdog took the beat
+over. Each start served 2.25 to 2.75 s after launch, by when the process had run 31.5 to 55.6 s of CPU, the 407 shard
+threads' own starts.
+
+**What it means.**
+- **`connect_pairs` is the starting thread's long unit:** 80 to 94% of its start, 29 to 121 ms here, inside the 1 s
+  window by an order of magnitude on this Mac.
+- **No run here reproduced the red these changes fixed** (B10's start kills at 367 to 407 shards on a 32-thread Linux
+  box at load 70): the machines that ran asked 30 to 140 shards, or more than the runtime allows. That run is still owed
+  on a 32-thread Linux box under load.
+- **The test is unrunnable where a shard starts cheaply:** past 1,024 shards it fails on the runtime's limit, both
+  before and after the change (reported to goal 254).
+
+## The verdict cut on large files, measured in the daemon: even, because the rung never takes the path it cut (g222's perf-decide; 2026-11-18)
+
+**What it is.** The daemon A/B owed since perf-decide landed (0b14033e7; "What a verdict compares and copies" above):
+the owner's CPU a verdict and the loaded p99 at a rung whose hot files are 256 KiB to 1 MiB, main before the cut
+(`9b6b35fb3`) against its merge (`b7c294959`). Both predate W1, so every work is served on its green's owner shard.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), 2026-11-18 10:12 to
+10:15 UTC, shared (load 19.4 to 36.9). Release (LTO) `slates` and `load_bench` of each commit built there, each with the
+same temporary owner-CPU diagnostic (perf's `owner_cpu_patch.py`, never committed: the thread's CPU around each submit
+and rebase served on the green's owner shard, logged as `OWNERCPU` at each reap tick). The tree: every file of Linux
+v7.4-rc1 between 256 KiB and 1 MiB (249 files, mostly AMD register headers), three times over in `a/`, `b/` and `c/`
+(APFS clones), 747 files of 262,291 to 1,013,732 bytes, median 372,461, 346,959,825 bytes in all.
+
+**Command.** The anchored recipe (`rung.sh`: a fresh `slates anchor --quick` per run, root bootstrapped), then
+`load_bench --instance <i> --tree <large> --clients 1000 --hot-files 800 --per-connection 32 --rounds 3
+--reply-patience 60 --think-us 0`; the arms A B, B A, A B, B A, A B. Every run:
+
+| run | build | wall s | verdicts/s | accepted / conflicts | owner µs a verdict | owner µs a rebase | p99 ms: Edit / Accepted / Conflict | `TableAtCapacity` refusals: Edit / Rebase / Submit |
+|---|---|---|---|---|---|---|---|---|
+| 1 | before | 19 | 1,555 | 2,217 / 3,253 | 102.0 | 110.1 | 227.0 / 227.7 / 227.8 | 67 / 225 / 15 |
+| 1 | after | 16 | 1,699 | 1,835 / 2,525 | 103.2 | 118.8 | 152.5 / 140.4 / 141.4 | |
+| 2 | after | 19 | 2,031 | 383 / 897 | 93.1 | 149.4 | 148.7 / 72.9 / 73.4 | 828 / 139 / 1 |
+| 2 | before | 17 | 2,026 | 386 / 889 | 100.3 | 152.2 | 146.0 / 86.6 / 87.1 | 876 / 77 / 15 |
+| 3 | before | 16 | 1,930 | 386 / 897 | 87.1 | 152.6 | 143.1 / 93.4 / 93.1 | |
+| 3 | after | 16 | 1,434 | 2,058 / 2,998 | 109.5 | 113.6 | 207.0 / 199.5 / 203.9 | |
+| 4 | after | 18 | 1,349 | 2,346 / 3,675 | 104.2 | 113.7 | 193.8 / 195.1 / 194.9 | |
+| 4 | before | 17 | 1,896 | 2,276 / 3,404 | 95.3 | 94.5 | 130.6 / 122.8 / 122.7 | |
+| 5 | before | 14 | 2,334 | 413 / 894 | 84.0 | 118.0 | 127.6 / 82.0 / 82.7 | |
+| 5 | after | 13 | 1,814 | 1,528 / 2,086 | 94.6 | 104.0 | 128.4 / 126.4 / 126.2 | |
+
+Blank refusal cells were not read out for that run; every run's level ended early on capacity: 1,000 works writing
+256 KiB-to-1 MiB files filled a table of the owner's shard, edits were refused `TableAtCapacity`, and the level either
+stopped at about 385 accepted versions (wall about 0.6 s of level) or ran to about 2,000 (about 3.5 s). The oracle found
+nothing in any run; no reply was lost (the anchored daemon's counters).
+
+**What it means.**
+- **Even.** The owner spent 84.0 to 102.0 µs a verdict before the cut and 93.1 to 109.5 µs after it: no gain, at about
+  2.5 times what a verdict costs at `kernel/`'s 21 KiB files (37.1 to 39.3 µs on main, the table above).
+- **Why even: the rung never takes the cut path** (read from the engine, not measured): `Green::merge_content` sends an
+  overlapping overwrite to pass two's byte compare and only a length-changing op to the whole-file identity check
+  (`lands_on_head`) that perf-decide made follow the change; `load_bench`'s edits are slot-aligned overwrites. The
+  engine bench (`verdict_bench`, a delete and an insert) is the only measurement of the cut until a workload makes
+  length-changing edits.
+- **The large-file rung is capacity-bound before it is CPU-bound** on one owner shard: its first wall is the table its
+  works fill, not the verdict.
+
+## A full edit and merge after W1 and the reply carrier: even on one shard, slower on every runner with more (goal 222; A-247, A-296; 2026-11-18)
+
+**What it is.** Goal 222's owed A/B: the loaded p99 and p999 of a single client's full edit and merge (`edit_merge_bench`,
+an edit of 64 bytes of a 4 KiB file and its submit to the green's verdict) on main before W1 and the reply carrier
+(`8dff8fcad`) and after both (`d0e737b8d`), on Linux, macOS and Windows, interleaved. Where the A/B moved, a second run
+with four arms named the landing: `8dff8fcad`, `3c0af9399` (W1 landed), `d0e737b8d` (A-296 landed) and `7d760c4ea`
+(main at the time).
+
+**Environment.** GitHub runners from diagnostics branches never merged, 2026-11-18 09:07 to 10:52 UTC: run 44272914208
+(two arms, all five runner kinds), 44279913406 (four arms, `ubuntu-24.04-arm` and `windows-11-arm`), 44283060368 (four
+arms, `macos-latest`). Every runner has 4 vCPUs (`macos-latest` 3); the in-process daemon derived 1 shard on the x86_64
+runners, 3 on the arm64 ones and 2 on `macos-latest`. Each arm's harness built release from its own source extract.
+Loaded on Linux is the controlled load of A-224: a `systemd-run --user --scope` capped at two CPUs and 256 MB, two
+spinning threads per core of the machine (8), and a sibling writer that fsyncs 16 MiB again and again; on macOS and
+Windows, the harness's own two spinning threads a core. Quiet ran right after, nothing else on the runner.
+
+**Command.** `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict` and
+`edit_merge_bench --quiet-only --files 10 --files 1000 --form accept --form conflict`. Each invocation is 3 runs of up to
+1,000 samples; each cell below is the invocation's median over its 3 runs, as its `goal` line prints it; the arms were
+rotated each round, three rounds, and every round is inside the ranges shown. `--files 10`, microseconds unless marked:
+
+| runner (shards) | form | `8dff8fcad` p50 / p99 | `3c0af9399` (W1) | `d0e737b8d` (+ A-296) | `7d760c4ea` (main) |
+|---|---|---|---|---|---|
+| Linux x86_64 (1) | loaded accept | 14-15 / 4.3-9.0 ms | | 15-17 / 6.2-8.5 ms | |
+| Linux x86_64 (1) | quiet accept | 13 / 21-31 | | 13-17 / 21-30 | |
+| Windows x86_64 (1) | loaded accept | 33-35 / 70-71 | | 34-35 / 66-70 | |
+| Windows x86_64 (1) | quiet accept | 28-29 / 66-71 | | 28-31 / 65 | |
+| Linux arm64 (3) | loaded accept | 4.0-8.1 ms / 21.0-21.3 ms | 12.1-19.0 ms / 38.9-45.0 ms | 16.0-19.1 ms / 39.0-41.9 ms | 14.0-18.9 ms / 37.0-41.0 ms |
+| Linux arm64 (3) | quiet accept | 18 / 36-40 | 53-54 / 76-88 | 50-52 / 77-82 | 51-52 / 78-85 |
+| Linux arm64 (3) | quiet conflict | 15 / 34-35 | 55-58 / 82-88 | 51-55 / 75-81 | 49-55 / 76-84 |
+| Windows arm64 (3) | loaded accept | 29-32 / 106-129 | 71-72 / 23.4-42.6 ms | 66-78 / 46.7-164.8 ms | 67-78 / 45.2-162.8 ms |
+| Windows arm64 (3) | quiet accept | 24-28 / 55-62 | 67-80 / 117-152 | 61-78 / 107-132 | 65-70 / 110-118 |
+| macOS arm64 (2) | loaded accept | 70-76 / 5.7-7.9 ms | 306-319 / 14.6-16.1 ms | 260-349 / 13.6-21.2 ms | 238-279 / 13.1-14.7 ms |
+| macOS arm64 (2) | quiet accept | 105-108 / 221-231 | 97-106 / 233-240 | 106-128 / 238-344 | 93-109 / 220-241 |
+| macOS arm64 (2) | quiet conflict | 103-110 / 219-265 | 246-328 / 769-918 | 248-254 / 681-728 | 247-271 / 671-806 |
+
+The p999s follow the p99s: Linux x86_64 loaded 9.0-12.0 ms on both arms, Windows x86_64 loaded 0.11-10.2 ms before and
+31.8 ms in every after round, Linux arm64 loaded 24-27 ms before and 39-48 ms with W1. Under the 256 MB cap the arm64
+runners refused the 1,000-file green at capacity (`TableAtCapacity { table: "green_chains" }`), so their loaded rows are
+10 files only; the quiet 1,000-file rows moved as the 10-file ones did. No answer was wrong in any run.
+
+**On a 32-core Mac.** adas-mac-studio.local-2 (Apple M3 Ultra, 23 shards derived), 2026-11-18 10:15 to 10:19 UTC, load
+19.4 to 26.9, `--quiet-only` only (the box is shared), A B B A A B: accept p50 117-129 µs and p99 280-334 µs before,
+465-727 µs and 721-4,836 µs after; conflict p50 93-122 and p99 253-299 µs before, 353-515 and 558-805 µs after. The same
+two builds' 1,000-client rung (`load_bench --clients 1000 --hot-files 800 --rounds 3 --think-us 0`, in-process, 10:11
+UTC) went the other way: 5,177 to 5,933 verdicts a second before and 9,044 to 12,714 after, with the accept p99
+27.9-35.4 ms before and 19.0-39.5 ms after, no reply lost.
+
+**What it means.**
+- **W1 slowed the single client wherever the daemon has more than one shard**, and the reply carrier added nothing
+  measurable: a work on a shard other than its green's owner pays the hop at every edit and submit. Quiet, a 3-shard
+  runner's accept went from 18 to about 52 µs at the median (Linux arm64) and 24-28 to 61-80 µs (Windows arm64), and
+  macOS's 2-shard conflict tripled while its accept held; loaded, the p99 doubled on Linux arm64 and macOS and went from
+  about 0.1 ms to 23-165 ms on Windows arm64. On one shard the arms are even. Main still carries it.
+- **Many clients gain from W1 what one client loses:** at 1,000 clients the same build answers 1.7 to 2.2 times the
+  verdicts a second.
+- **The goal is met on no platform under load:** loaded p99 4.3-45 ms on Linux, 5.7-21 ms on macOS, 23-165 ms on Windows
+  arm64 after W1; only Windows x86_64's single shard holds its p99 near 70 µs, with a p999 of 31.8 ms.
+
+## The f = 1 launcher with a server node killed: a replica rebuilds, a primary over the whole kernel loses its green (A-313, goal 232's seeding fix; 2026-11-18)
+
+**What it is.** Goal 232's two owed chaos flows on the f = 1 topology (`crates/cli/tests/load_scale.rs`: a primary and two
+replica nodes in region 0, a client node in region 1, every verb a forward): a replica's daemon killed partway through
+the rung (`SLATES_LOADTEST_KILL_NODE=1`, A-313's rebuild of a restarted holder's replica), and the primary's
+(`SLATES_LOADTEST_KILL_NODE=0` over the whole kernel, the recovering green's origin seeded a share at a time). Each
+node is a `slates anchor --quick --fleet`, so a killed daemon is restarted by its anchor at once.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), 2026-11-18 10:47 to
+10:56 UTC, load 9.6 to 23.7. Release `load_scale` test binary of main `7d760c4ea` with the measurer's uncommitted
+addition (each server node's `slates status` merge and recovery counters printed at the rung's end), and that commit's
+release `load_bench`. Linux v7.4-rc1 (6628e7d4).
+
+**Command.** `SLATES_LOADTEST_TREE=<tree> SLATES_LOADTEST_BENCH=<load_bench> SLATES_LOADTEST_CLIENTS=1000
+SLATES_LOADTEST_ARGS="--hot-files 800 --per-connection 32 --rounds 20 --reply-patience 60 --think-us 50000"
+SLATES_LOADTEST_KILL_NODE=<n> SLATES_LOADTEST_KILL_MS=<ms> <load_scale>
+many_clients_through_client_nodes_against_one_primary_and_two_replicas --exact --nocapture`, one client node.
+
+**A replica killed (node 1, 30 s into the rung, `kernel/`, 754 files).** Passed: the harness exited 0 with no oracle
+failure after 384.8 s, 19,461 versions accepted and 45,593 conflicts (169 verdicts a second through the client node).
+The restarted replica counted `merge.replica.rebuilt` 1, `merge.replica.rebuilt_versions` 2,810 (the versions it had
+accepted before the kill), `merge.replica.seed_slices` 6,270 and `merge.replica.seeded` 1, then carried 16,685
+versions' inputs to its partner's 19,355; neither replica counted `merge.out_of_order`. Through the forward: Edit p50 238
+ms and p99 906 ms; an accepted submit p50 1.94 s and p99 6.57 s.
+
+**The primary killed (node 0, 60 s into the rung, the whole kernel, 97,254 files, 1.99 GB).** Failed. The harness's walk
+of the green through the client node took 52.5 s; the primary was killed at 60 s and restarted, and its recovery logged:
+`partition 0: volume tree not rebuilt: ResourcesUnavailable { reason: "recovered inode allowance exceeds the version
+slab: budget exceeded: 648393 bytes requested, 642045 available" }`, then `green tree-green fenced, its recovered history
+is not what was acknowledged: OriginUnavailable`. Its shard 0 initialized in 620.5 ms of wall (602.7 ms of CPU, 8 slices,
+the longest 454.5 ms), no watchdog end. The harness's next read was refused `ContentUnavailable` and it stopped; no
+`merge.recovery.origin_load_steps` was counted, since the green was fenced before any seeding. The replicas had not yet
+held version 0's inputs (`merge.inputs_unheld` 709 each).
+
+**What it means.**
+- **A-313 works under the launcher:** a replica killed mid-rung rebuilt its replica from its hold, 2,810 versions in
+  6,270 slices, and went on taking versions.
+- **A primary's crash over the whole kernel loses its green on that node:** the base tree volume no longer fits the
+  inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. A second run (11:02 UTC) logged
+  the same two lines with the same byte counts, so it is deterministic here. The seeding fix could not be exercised;
+  the run is owed again once the volume recovers. Reported to goal 232.
+
+## A GiB volume's seal and a holder's return over thousands of live volumes, after the turns: both under the window, the seal 14 minutes long, one step at its end that grows with the volume (A-323, A-324; goal 230's landing; 2026-11-18)
+
+**What it is.** The two bounds goal 230's landing (`ca216dbf8`) owed at scale, measured on main by the measurer's
+uncommitted harness: two tests appended to `crates/server/tests/fleet.rs` in a scratch copy only (never on main), each
+a three-node `f = 1` fleet in one process (`formed_mesh`; a fleet test node has one shard, so the owner shard is its
+control shard), nothing injected, so the shard's own quantum slices the work.
+- *The seal (A-323).* On node a, a volume of 1,024 MiB (and of 256 MiB) of bytes no chunk repeats, written over a's NFS
+  port in 16 MiB files of 64 KiB `FILE_SYNC` writes, then sealed by a snapshot. Read: the wall time from the snapshot
+  to `AwaitPlaced` answering placed (polled every 20 ms), the wrap's turns (`fleet.seal.wrap_slices`), the record
+  periods the seal walk ran (`fleet.seal.walks`), each node's longest step (the shard pulse's `longest_step_ns`, a
+  maximum since the node started) before the snapshot and after placement, and in a fourth run each moment the owner's
+  longest step rose while the seal ran.
+- *The return (A-324).* On a, 1,000 (and 4,000) live-shipped volumes bounded at 64 KiB, made by 16 clients at once,
+  each written once at durability; b settled (it holds every log, the same positions at two reads in a row); then, as
+  `a_holders_return_is_walked_in_turns_and_it_takes_every_log` does, b's control shard held for two liveness budgets
+  while one client writes the volumes again in order, one at a time, until the hold's span has passed. Read: the time
+  from the hold's end until b holds every volume written again one entry past where it settled (each read one volume
+  at a time through `Daemon::fleet_live_held`, since a status report of thousands of live logs is past a test client's
+  status capacity), a's walk turns (`fleet.live.reached_slices`), and each node's longest step before the hold and
+  after the catch-up.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4, 16 KiB pages, so a
+256 KiB chunk), 2026-11-18 12:30 to 14:08 UTC, load 5.1 to 19.1 from other work (no quieter host was free). Release
+`fleet` test binary of main `1eca77263` with the harness appended.
+
+**Command.** `SLATES_TEST_MEASURE=1 SLATES_MEASURE_DEADLINE_SECS=3600 SLATES_MEASURE_SEAL_MIB=<1024|256> fleet --exact
+measure_a_large_volume_seals_in_turns --nocapture`, and `SLATES_MEASURE_LIVE_VOLUMES=<1000|4000> fleet --exact
+measure_a_holders_return_over_thousands_of_live_volumes --nocapture`, each its own process, one at a time.
+
+**The seal.**
+
+| Volume | Run | Placed after the snapshot | Wrap turns | Record periods | a's longest step, before → after | b's, c's after |
+|---|---|---|---|---|---|---|
+| 1,024 MiB | 1 | 845.7 s | 4,096 | 8,310 | 2.2 → 230.5 ms | 20.7, 18.9 ms |
+| 1,024 MiB | 2 | 847.3 s | 4,096 | 8,314 | 1.8 → 272.2 ms | 18.1, 9.5 ms |
+| 1,024 MiB | 3 | 847.9 s | 4,096 | 8,318 | 2.2 → 233.2 ms | 10.5, 11.8 ms |
+| 1,024 MiB | 4 | 847.6 s | 4,096 | 8,321 | 2.1 → 243.4 ms | 13.7, 21.0 ms |
+| 256 MiB | 1 | 211.4 s | 1,024 | 2,079 | 3.6 → 42.7 ms | 2.2, 2.3 ms |
+| 256 MiB | 2 | 211.1 s | 1,024 | 2,078 | 0.6 → 23.6 ms | 7.9, 2.2 ms |
+| 256 MiB | 3 | 213.4 s | 1,024 | 2,089 | 0.6 → 27.6 ms | 4.4, 31.8 ms |
+
+The volume was written in 1.7 to 2.5 s (1,024 MiB) and 0.4 to 0.7 s (256 MiB), no write refused. Where the owner's
+longest step rose (runs 4 and 3): at 1,024 MiB it stayed at or under 5.6 ms through the archive walk and all 4,096
+wrap turns; then, at 838.17 to 838.72 s, with the wrap complete and the content not yet placed, it rose to 9.0, then
+152.9, then 243.4 ms; placed 8.9 s later. At 256 MiB it stayed at or under 9.8 ms until 210.06 s, then rose to 27.6 ms,
+3.4 s before placed.
+
+**The return.**
+
+| Live volumes | Run | Written again in the hold | b caught up after the hold ended | a's walk turns | a's longest step, before → after |
+|---|---|---|---|---|---|
+| 1,000 | 1 | 1,000 in 0.92 s | 0.279 s | 285 | 8.2 → 12.0 ms |
+| 1,000 | 2 | 1,000 in 1.07 s | 0.322 s | 338 | 11.2 → 11.2 ms (no rise) |
+| 1,000 | 3 | 1,000 in 1.01 s | 0.315 s | 270 | 7.3 → 11.0 ms |
+| 1,000 | 4 | 1,000 in 1.04 s | 0.250 s | 223 | 7.1 → 11.6 ms |
+| 1,000 | 5 | 1,000 in 0.93 s | 0.149 s | 173 | 10.2 → 11.4 ms |
+| 4,000 | 1 | 857 in 2.02 s | 0.237 s | 450 | 28.9 → 40.1 ms |
+| 4,000 | 2 | 979 in 2.00 s | 0.330 s | 458 | 46.8 → 46.8 ms (no rise) |
+| 4,000 | 3 | 1,071 in 2.00 s | 0.350 s | 391 | 29.8 → 37.8 ms |
+| 4,000 | 4 | 999 in 2.00 s | 0.308 s | 262 | 28.8 → 42.0 ms |
+| 4,000 | 5 | 960 in 2.00 s | 0.376 s | 405 | 51.8 → 51.8 ms (no rise) |
+
+The volumes were made in 13.9 to 14.1 s (1,000) and 62.9 to 66.0 s (4,000), none refused; b's hold was measured at
+2.000 to 2.139 s, so b's own longest step after is the hold itself. In every run a's `fleet.live.appended` rose by
+exactly the writes made, b's `fleet.live.held` by one more than that, and nothing stayed behind. Where a's longest step
+did not rise, no step of the return was longer than the step the setup had already taken (46.8 and 51.8 ms, made while
+4,000 volumes were created).
+
+**What it means.**
+- **Both bounds hold at this scale, on this Mac.** No owner step reached the 1 s watchdog window: 230 to 272 ms during
+  a GiB seal, at most 42 ms (or, where it did not rise, the setup's 52 ms) during a return over 4,000 live volumes on
+  one shard. The return's walk ran in 173 to 458 turns, and b held every log 0.15 to 0.38 s after its hold ended.
+- **The wrap is in turns, but the step after it is not.** The owner's longest step through the archive walk and the
+  4,096 wrap turns stayed at or under 5.6 ms; the steps of 153 and 243 ms came once the wrap was complete, before the
+  content placed. It grows with the volume: 23.6 to 42.7 ms at 256 MiB, 230 to 272 ms at 1,024 MiB, about a quarter of
+  a millisecond a MiB on this Mac, so a volume of about 4 GiB would reach the window here (an extrapolation, not
+  measured). Which step it is (the envelope's completion, or the first content round's put) the trace cannot say.
+  Reported to goal 230.
+- **A GiB seal takes fourteen minutes.** The seal walk advances each volume's seal one slice a record period
+  (`run_record_period`, 100 ms): 8,310 to 8,321 periods for 1,024 MiB, 2,078 to 2,089 for 256 MiB, linear in the
+  volume (101.7 ms a period). About half are the archive walk (about 259 KB a slice here) and half the wrap, which seals
+  one chunk a turn at this quantum: 4,096 turns for 4,096 chunks of 256 KiB. On a host with 4 KiB pages the chunk is
+  64 KiB, so the same wrap would be 16,384 periods, about 27 minutes on its own (computed here, not measured). Before
+  A-323 the wrap was one turn, and about a GiB ran past the window; now it places, slowly. Reported to
+  goal 230.
+
+## A green's replicas on the shards that hold its works: measured and rejected (A-273, A-457, A-465, A-473, A-502; removed by A-528; goal 87; 2026-11-18 and 19)
+
+**What it was.** A-273: every shard holding works of a green kept a replica of the green's engine, made from its
+owner's, so a work's rebase and its base reads were answered on the work's own shard with no hop to the owner, whose
+one thread A-273 had measured at 51 to 53% of its wall on verdicts and rebases at the 3,000-client rung. In the engine
+(steps 1 to 4): the green's content in sealed blocks its replicas read in place, a feed of each version and fold by
+position, and derived bounds. On the shards: A-457 (a replica on every other shard, made before the green's first
+change, fed over the cross-shard carrier), A-465 (a work's base reads and rebase answered by its shard's replica),
+A-473 (an unused replica given back) and A-502 (a turn's changes fed in one message after the turn's replies).
+
+**Environment and command.** The supervisor's A/B on the Mac Studio adas-mac-studio.local-2 (d1323898, Apple M3 Ultra,
+32 cores, macOS 26.4), release builds, the daemon in the harness's process, `fs/` of linux v7.4-rc1, 1,000 clients:
+`load_bench --tree <linux-v7.4-rc1>/fs --clients 1000 --hot-files 800 --per-connection 32 --rounds 20
+--reply-patience 60 --think-us <Z>` at Z = 50,000 and 20,000 µs, three rounds of each, the two arms back to back with
+their order alternating by round (`ab2.sh <labelA> <branchA> <labelB> <branchB> 3 50000 20000`,
+`~/.cache/g083-scripts/` on the Studio). Without the replicas, "norepl": 95bbed246, which is ef82f7340 less A-457's and
+A-465's code. With them: ef82f7340 in r406 (A-457 and A-465), and in r100 6d9115aa4 (`agents/main-ab-a502`: A-457,
+A-465, A-473 and A-502). r406 ran at load 11 to 22. Milliseconds; none given up and no oracle failure in any run.
+
+r406 (2026-11-18), p99 by round:
+
+| Z µs | kind | norepl | replicas |
+|---|---|---|---|
+| 50,000 | Edit | 1.98, 2.03, 3.30 | 3.68, 0.48, 0.26 |
+| 50,000 | ReadHead | 2.01, 1.89, 3.98 | 8.53, 2.48, 0.67 |
+| 50,000 | Rebase | 3.63, 3.42, 6.68 | 5.94, 0.64, 0.38 |
+| 50,000 | SubmitAccepted | 3.09, 4.32, 6.96 | 12.48, 10.70, 9.75 |
+| 50,000 | SubmitConflict | 3.52, 3.14, 5.62 | 12.68, 26.04, 20.22 |
+| 20,000 | Edit | 0.62, 2.79, 11.30 | 1.23, 14.03, 5.24 |
+| 20,000 | ReadHead | 0.56, 3.02, 10.52 | 26.73, 58.66, 24.96 |
+| 20,000 | Rebase | 0.80, 4.73, 16.70 | 1.65, 17.55, 6.44 |
+| 20,000 | SubmitAccepted | 0.81, 3.88, 13.61 | 60.78, 88.90, 77.99 |
+| 20,000 | SubmitConflict | 0.77, 3.79, 14.57 | 74.52, 101.66, 89.57 |
+
+The offered verdicts a second matched (50,000: 1,469, 1,520, 1,458 against 1,517, 1,503, 1,467; 20,000: 3,651, 3,615,
+3,565 against 3,603, 3,323, 3,381).
+
+r100 (2026-11-19, about 00:50 UTC), p50 / p99 by round:
+
+| Z µs | kind | norepl | replicas (with A-502) |
+|---|---|---|---|
+| 20,000 | Edit | 0.20 / 21.56, 0.15 / 0.78, 0.38 / 14.81 | 0.11 / 177.61, 0.11 / 171.97, 0.15 / 159.98 |
+| 20,000 | ReadHead | 0.24 / 23.25, 0.15 / 3.04, 1.00 / 14.14 | 30.82 / 181.06, 29.74 / 155.00, 27.40 / 181.64 |
+| 20,000 | Rebase | 0.41 / 32.89, 0.29 / 10.22, 1.36 / 24.14 | 0.24 / 223.78, 0.22 / 211.89, 0.45 / 230.72 |
+| 20,000 | SubmitAccepted | 0.42 / 29.21, 0.31 / 2.70, 1.14 / 22.92 | 40.04 / 267.14, 40.51 / 223.95, 34.27 / 287.42 |
+| 20,000 | SubmitConflict | 0.39 / 31.05, 0.28 / 6.67, 1.27 / 21.02 | 40.36 / 252.63, 38.98 / 216.22, 37.11 / 301.99 |
+| 50,000 | Edit | 0.12 / 1.15, 0.12 / 3.54, 0.12 / 0.30 | 0.10 / 160.52, 0.10 / 111.66, 0.10 / 163.39 |
+| 50,000 | ReadHead | 0.09 / 1.32, 0.09 / 4.13, 0.09 / 0.23 | 32.28 / 151.84, 26.32 / 109.90, 43.27 / 151.30 |
+| 50,000 | Rebase | 0.20 / 3.21, 0.21 / 7.45, 0.21 / 0.43 | 0.21 / 201.76, 0.20 / 133.67, 0.23 / 188.24 |
+| 50,000 | SubmitAccepted | 0.23 / 2.81, 0.23 / 7.08, 0.23 / 0.41 | 42.82 / 272.35, 35.91 / 180.42, 56.86 / 242.01 |
+| 50,000 | SubmitConflict | 0.20 / 2.83, 0.20 / 5.07, 0.20 / 0.39 | 42.39 / 234.78, 33.89 / 159.03, 56.47 / 223.60 |
+
+**Why rejected.** With the feed inside the submit (r406), the replicas made both kinds of submit slower at p99 in
+every round (accepted at a 20 ms think: 60.78, 88.90 and 77.99 ms against 0.81, 3.88 and 13.61) and head reads in five
+rounds of six, and the rebases they served were better in three rounds of six. With the feed after the turn (A-502,
+r100), they lost everywhere but two p50s: an edit's, lower in every round (0.10 to 0.15 against 0.12 to 0.38 ms), and
+a rebase's, lower at a 20 ms think (0.22 to 0.45 against 0.29 to 1.36 ms) and even at 50 ms. Head reads and submits,
+which the owner still answers, waited 26.3 to 56.9 ms at p50 against 0.09 to 1.27 ms, and every kind's p99 was 110 to
+302 ms against 0.23 to 32.9 ms. A losing A/B does not land: A-528 removed the replicas whole, and a work's rebase and base reads are the
+owner's again (the owner-shard path as it is).
+
+**A hypothesis, not measured: eviction and remake churn.** The pattern points at the owner, since the kinds it answers
+(head reads, submits) waited tens of milliseconds at p50 while the rebases the replicas answered and the edits on the
+work's own shard did not. An owner kept the blocks it released for its slowest replica only up to `held_limit`, its
+per-green budget less its own retention, and the settle folds the retention only as far as the budget needs, so under
+load the limit sat near zero and the first release evicted the slowest replica. An evicted replica refused its next
+message and left, and A-465 made it again before the owner's next change, inside that change's submit, by cloning every
+index of the engine on the owner's one thread; a submit that paid a remake, and every request queued behind it there,
+waited for the clone. A-502 may have made it worse, since a turn's messages held to the turn's end kept the released
+blocks for the replicas longer. The counters that would have tested it (`merge.replica.remade` and
+`merge.replica.route_evicted` on the shards, the owner's evictions for lagging replicas) were not in the runs' logs,
+and it was not chased (A-528).
+
+**What it leaves.** Without the replicas, the p99 at 1,000 clients is still 0.23 to 32.9 ms across these rounds: the
+contended rounds, not the replicas' target, are goal 87's next piece.
+
+## The deflate engine for the version-control servers: zlib-rs over miniz_oxide, both pure Rust (A-607; goal 93; 2026-11-19)
+
+§4.17.2 piece 3 names a deflate implementation "chosen by measurement": git's packs, smart HTTP's gzip request bodies
+and Mercurial's GZ streams and zlib revlog chunks all inflate and deflate through it. Both candidates sit behind
+flate2's one API, so the choice is a feature of the workspace's `flate2` entry and no server code depends on it.
+
+- **Machine:** Mac Studio, Apple M3 Ultra (32 cores), macOS, 2026-11-19 03:35 UTC; load average 3.40 at the start and
+  3.56 at the end (agents' builds on the same box).
+- **Data:** every file of slates' tree at e85c17f9f (`.git` and `target` skipped), each compressed and inflated as its
+  own zlib stream, the way git stores each object: 4,742 files, 132.1 MB.
+- **Command:** a scratch program outside the tree (`~/.cache/main-deflate-ab` on the Studio): one source, built once per
+  backend with `--features miniz` (flate2's `rust_backend`) and `--features zlibrs` (flate2's `zlib-rs`) into separate
+  target directories, `cargo build --release`; each run reuses one stream per direction with `reset()` and checks
+  every round trip (all passed). Runs alternate between the two binaries, five pairs at level 6, then five at level 1.
+- **zlib-ng was not measured:** its build needs cmake, which the Studio lacks. It is C, and the pure-Rust zlib-rs is
+  the one that entered.
+
+| level 6, run | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| zlib-rs deflate MB/s | 135.0 | 124.5 | 133.2 | 125.2 | 126.5 |
+| miniz_oxide deflate MB/s | (66.9)* | 79.4 | 76.4 | 77.7 | 76.5 |
+| zlib-rs inflate MB/s | 956.4 | 853.5 | 925.6 | 879.3 | 876.1 |
+| miniz_oxide inflate MB/s | (390.7)* | 475.8 | 462.6 | 482.4 | 497.5 |
+
+Output against input: zlib-rs 0.255, miniz_oxide 0.257.
+
+\* miniz_oxide's first level-6 run read 2,027 files of a checkout still being written, so it is shown, not compared.
+
+Best of five: zlib-rs deflates 1.70 times as fast (135.0 against 79.4 MB/s) and inflates 1.92 times as fast (956.4
+against 497.5 MB/s), with slightly smaller output. The level-1 runs met the same checkout still being written
+(1,449 to 1,976 files, 34.9 to 37.4 MB, each pair on nearly the same files). zlib-rs deflated at 310.8 to 316.8 against
+229.5 to 235.9 MB/s and inflated at 765.6 to 779.5 against 334.5 to 340.7 MB/s; miniz_oxide's level 1 compressed
+smaller, 0.401 against 0.435.
+
+Decision: zlib-rs, through flate2's `zlib-rs` feature in the workspace's `flate2` entry (A-607). Measured and rejected:
+miniz_oxide, slower in both directions at both levels.
+
+Consequence for tests: two deflate engines need not write the same bytes for one input. A golden test holds what the
+inflated stream means (its bytes and its object id), never a stock tool's compressed bytes.
+
+
+## Stock git, Mercurial and Subversion servers at scale: the baselines slates is measured against (A-699; UI goal 93; 2026-11-20)
+
+The competitor's side of §4.17.1's order-of-magnitude method, each stock client against its stock server on loopback,
+a fresh server every run. Slates' side over the same datasets is the next record.
+
+- **Machine:** Mac Studio, Apple M3 Ultra (32 cores, 96 GiB), macOS 26.4 (25E246), 2026-11-20 04:21 to 04:47 UTC,
+  shared with agents' builds: load average 8.91 at the start, 57.26 at hg's end (a spike), 7.00 at the end. Not quiesced,
+  so the spread between runs is the box's, and each best is an upper bound.
+- **Clients and servers:** git 2.50.1 (Apple Git-155) and `git daemon` (receive-pack enabled, `uploadpack.allowFilter`);
+  Mercurial 7.2 (`uvx --from mercurial==7.2`) and `hg serve` over HTTP; Subversion 1.15.0 and `svnserve -d`.
+- **Datasets:** git: git/git bare at f7de81456940 (8 branches, 1,019 tags, 86,352 commits, 424,851 objects, a 324 MiB
+  pack). Mercurial: Mercurial's own repository (`hg clone -U https://www.mercurial-scm.org/repo/hg`) at 57035:a93340995
+  (57,036 changesets, 307 tags, 86 MiB store). Subversion: git/git's newest 5,000 first-parent commits of master to
+  f7de81456940 as a dump (`crates/cli/bench/git_to_svn_dump.py src.git master 5000`, 992 MiB, written in 247 s), the
+  oldest written whole as r1.
+- **Commands** (harness w-perf branch commit, landed with this entry):
+  `SERVERS=stock crates/cli/bench/git_scale.sh - src.git WORK 3 1800`;
+  `crates/cli/bench/hg_scale.sh HG hg-src WORK 3 1800`;
+  `crates/cli/bench/svn_scale.sh git-5000.dump src.git master WORK 3 3600`.
+- **Checks (first run):** git's mirror clone `fsck --full` clean, refs (1,027) and object ids (424,851) identical to the
+  source; hg's clone `hg verify` clean, changesets (57,036) and tags (307) identical; svn's log named all 5,000
+  revisions every run. The svn tree check over this run compared against `git archive`'s tree and differed in 7 lines,
+  all git's doing (three `eol=crlf` `.bat` files written with CRLF, and the two `subprojects` links' loops); the harness
+  now compares blob ids, and that check over a 20-commit dump to the same tip read 4,872 of 4,872 files identical.
+  Every incremental step's change arrived.
+
+Seconds, wall clock at the client, every run shown:
+
+| git (`git daemon`) | 1 | 2 | 3 | best |
+|---|---|---|---|---|
+| push, every branch and tag | 38.364 | 26.257 | 45.110 | 26.257 |
+| clone `--mirror` | 19.117 | 22.889 | 32.983 | 19.117 |
+| one-commit push | 0.328 | 0.201 | 0.180 | 0.180 |
+| fetch of it | 0.378 | 0.390 | 0.196 | 0.196 |
+| clone `--depth 1` | 2.412 | 4.672 | 1.502 | 1.502 |
+| clone `--filter=blob:none` | 18.260 | 15.221 | 7.075 | 7.075 |
+
+| Mercurial (`hg serve`) | 1 | 2 | 3 | best |
+|---|---|---|---|---|
+| push, every changeset | 42.127 | 15.786 | 48.823 | 15.786 |
+| clone `-U` | 62.158 | 29.113 | 23.028 | 23.028 |
+| one-changeset push | 0.379 | 0.504 | 0.196 | 0.196 |
+| pull of it | 0.359 | 0.537 | 0.158 | 0.158 |
+| clone `--stream` | 0.808 | 4.387 | 0.501 | 0.501 |
+
+| Subversion (`svnserve`) | 1 | 2 | 3 | best |
+|---|---|---|---|---|
+| `svnadmin load` (once) | 805.519 | | | 805.519 |
+| checkout of trunk | 4.034 | 3.311 | 4.216 | 3.311 |
+| `log -q`, whole history | 0.662 | 0.603 | 0.743 | 0.603 |
+| one-file commit | 4.162 | 3.795 | 3.685 | 3.685 |
+| update to it | 0.958 | 0.922 | 0.992 | 0.922 |
+| update across 1,000 revisions | 2.075 | 2.115 | 2.043 | 2.043 |
+
+What it means: the whole-history transfers (git push and clone, hg push and clone) are the 15 to 45 s operations where
+an order of magnitude is worth chasing; the one-commit steps are already 0.15 to 0.5 s, mostly client start-up and
+round trips. Subversion's load costs 0.16 s a revision (it flushes each), and its one-file commit 3.7 s, most of it the
+client walking a 4,872-file working copy. Owed against §4.17.1's method: git-http-backend and Gitaly, mod_dav_svn, the
+Linux kernel as the dataset, the server's CPU and peak memory, and N concurrent clients.
+
+## Slates against svnserve over svn://, and what stops git's and Mercurial's whole histories (A-699; UI goal 93; 2026-11-20)
+
+- **Machine and builds:** the Mac Studio of the stock entry above, 2026-11-20 ~06:10 UTC, load average 19.16 at the
+  start and 34.04 at the end (agents' builds; not quiesced). slates: release build of main bc2803d66 (`slates anchor
+  --vcs-svn 127.0.0.1:0`, 23 shards derived, a minted token as CRAM-MD5's credentials).
+- **Data:** git/git's newest 1,000 first-parent commits to f7de81456940 as a dump (`git_to_svn_dump.py src.git master
+  1000`, 223 MiB). Both servers hold the same 1,000 revisions: each first checkout's 4,872 files' blob ids equal git's
+  tree, and each log names 1,000 revisions.
+- **Command:** `KEEP_LOGS=DIR SERVERS="stock slates" SLATES=slates crates/cli/bench/svn_scale.sh git-1000.dump src.git
+  master WORK 3 1800`, runs interleaved, stock first.
+
+| svn:// | stock 1 | 2 | 3 | best | slates 1 | 2 | 3 | best |
+|---|---|---|---|---|---|---|---|---|
+| fill (`svnadmin load`, once / `slates repository import`) | 62.817 | | | 62.817 | 1.874 | 1.958 | 1.878 | 1.874 |
+| checkout of trunk | 4.904 | 4.989 | 6.354 | 4.904 | 5.089 | 5.238 | 5.454 | 5.089 |
+| `log -q`, whole history | 0.140 | 0.227 | 0.197 | 0.140 | 0.071 | 0.083 | 0.062 | 0.062 |
+| one-file commit | 4.376 | 5.033 | 5.008 | 4.376 | 4.020 | 3.698 | 4.226 | 3.698 |
+| update to it | 1.009 | 0.993 | 0.985 | 0.985 | 1.022 | 0.986 | 0.990 | 0.986 |
+
+The import fills the repository 33 times as fast as stock's load, and `log` is 2.3 times as fast. Checkout, commit and
+update are even, within this loaded box's noise. Those three are client-bound: the client walks and writes a
+4,872-file working copy. The daemon held 2,561 to 2,582 MiB after each import. (The run's update-across step reached
+r0, which holds no trunk, so it is left out. The harness now takes a short history back to r1.)
+
+What stops the larger datasets (each found by use, reported to its owner, and owed before slates' numbers on it):
+- git/git whole push (main 9f0851ea0, A-704 in): shard 10 spins 1,046 ms without a step, the watchdog kills the
+  daemon, and git hangs after "unable to rewind rpc post data" (w-git).
+- Mercurial's repository (57,036 changesets) whole push: 413 at the edge's 278,528 B room (main 9f0851ea0). After
+  A-711 (main bc2803d66) the 413 is gone, but shard 10 spins 1,152 ms, the daemon is killed, and hg aborts after 7.6 s.
+  `slates repository import` of the same repository is refused `PastRoom { room: 278528 }` (w-hg).
+- Subversion 5,000-revision dump: the import stops at 1,685 revisions, `TableAtCapacity { table: "green_chains" }`,
+  with the daemon at 3,390 MiB (main 9ea6e1311; w-svn).
+
+## Where the svn server's time and memory go, ranked (A-699 piece 3; UI goal 93; 2026-11-20)
+
+Mac Studio (as above), release main bc2803d66, git/git's newest 250 and 1,000 first-parent commits as dumps (85 and
+223 MiB). Time: `/usr/bin/time -p` on the client and the server process's CPU before and after (`ps -o time`;
+`svnserve -T`, one process). Memory: `footprint`, and the live heap by allocation stack (`MallocStackLogging=1` on the
+anchor, which the daemon inherits; `malloc_history PID -allBySize` after the import). `slates status` has no memory
+counters.
+
+**Time: checkout, commit and update are client-bound.** A 1,000-revision trunk checkout (4,872 files) takes about
+4.2 s of wall time against either server: the client spends 0.48 s in user time and 2.78 s in the kernel writing its
+working copy. The server's share is 0.12 s of slates CPU against 0.56 s of `svnserve` CPU, 4.7 times less. A whole
+`log -q` costs neither server measurable CPU (0.00 against 0.02 s). Ten times at the client's wall clock is out of
+reach on these operations; the server's share is what slates is measured on there.
+
+**Memory: footprint after the import.** 250 revisions: about 920 MB. 500: about 2,060 MB. 1,000: about 2,430 MB
+(MALLOC_LARGE 867, MALLOC_SMALL 842, VM_ALLOCATE 585, MALLOC_REALLOC 136 MB). Live heap by stack, 250 to 1,000
+revisions:
+
+| Holder | 250 | 1,000 | Shape |
+|---|---|---|---|
+| svn records' texts (`Repository.contents`, allocated in `Importer::import`) | 120.1 MiB | 305.6 MiB | 1.37x the dump; every text whole |
+| register's repository records (`Repositories::apply_advanced`) | 86.5 MiB | 244.7 MiB | ~245 KB a revision |
+| merge engine, svn commits (`Green::commit`) | 67.1 MiB | 234.8 MiB | ~235 KB a revision |
+| merge history (`Value::whole`) | 51.9 MiB | 50.3 MiB | flat |
+| green checkpoint (`apply_green_checkpoint`, 2 allocations) | 46.8 MiB | 46.5 MiB | flat |
+| `Partition::apply_repository` | 39.7 MiB | 45.2 MiB | flat |
+
+Virtual only (reserved, not dirty): the timer wheels, 898 MiB (39 MiB a shard); the segment's and content pool's maps.
+The content pool's dirty pages are the files the greens hold: 222 MB at 250 revisions and 585 MB at 1,000.
+
+Ranked plan, each owed:
+- M1, the register's ~245 KB a revision. Linear, not quadratic; it is data for w-svn's charging of a repository's
+  content to its shard, and needs no separate fix.
+- M2, every svn text held twice: whole in the svn records (`crates/svn/src/migration/records.rs`, `contents`) and
+  again as the green's files in the content pool. One store would save about 1.4 times the dump's bytes. Main's ruling
+  is owed.
+- M3, the merge engine's ~235 KB a revision under `Green::commit`, likely retention of work already durable.
+- M4, the green checkpoint's whole-green copy (47 MiB in two allocations).
+- M5, fixed per daemon: the timer wheels' 898 MiB reservation, the segment's 43 MiB unit set, 47 MiB of thread stacks.
+
+## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
+
+- **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
+  end (shared; not quiesced). slates: release build of main 82d3538b0 (A-713's clone room in).
+- **Data:** git/git cut at v1.0.0 (`git push cut.git 'v1.0.0^{commit}:refs/heads/master' refs/tags/v1.0.0`): 2,930
+  commits, 12,233 objects, a 3.46 MiB pack. Both servers' first mirror clones: `fsck --full` clean, refs (2) and object
+  ids (12,233) identical to the source.
+- **Command:** `KEEP_LOGS=DIR SERVERS="stock slates" crates/cli/bench/git_scale.sh slates cut-1.0.git WORK 3 900`,
+  interleaved, stock first.
+
+| git | stock 1 | 2 | 3 | best | slates 1 | 2 | 3 | best |
+|---|---|---|---|---|---|---|---|---|
+| push, both refs | 0.368 | 0.319 | 0.310 | 0.310 | 0.665 | 1.369 | 0.689 | 0.665 |
+| clone `--mirror` | 0.321 | 0.305 | 0.300 | 0.300 | 2.983 | 2.853 | 2.816 | 2.816 |
+| one-commit push | 0.080 | 0.088 | 0.099 | 0.080 | 0.058 | 0.089 | 0.060 | 0.058 |
+| fetch of it | 0.068 | 0.085 | 0.082 | 0.068 | 0.080 | 0.083 | 0.087 | 0.080 |
+| clone `--depth 1` | 0.115 | 0.144 | 0.111 | 0.111 | 0.165 | 0.171 | 0.160 | 0.160 |
+| clone `--filter=blob:none` | 0.180 | 0.195 | 0.189 | 0.180 | 1.120 | 1.136 | 1.092 | 1.092 |
+
+The daemon held 383 to 395 MiB.
+
+Where a clone's time goes (macOS `sample PID 4 1` on the daemon during one clone): the clone took 3.51 s at the client
+and 5.15 s of the daemon's CPU; of the daemon's samples on CPU, about 72% (1,522 of about 2,100) are in
+`slates_git::store::deltas::Search::step`. Every clone searches the whole store for deltas again, where `git daemon`
+sends the deltas its pack already holds. T4, owed and first for git's time: keep and reuse deltas (the pushed pack's
+bases, or the search's result at the repository's version), so a clone streams deltas it already has.
+
+## A pushed version's fragments encoded once, before a fetch: a second clone 3.0 times as fast, the first 1.5 times as slow (A-718; UI goal 93; 2026-11-20)
+
+- **Machine:** Mac Studio (as above), 2026-11-20 ~07:30 UTC, load average 6.6 to 10.0 (shared; not quiesced).
+- **Builds:** after: release of branch agents/w-perf-a718 at 6ab6d6662 (A-718 over main b705a24c5); before: release of
+  main b705a24c5. Run one after the other, each interleaved with stock `git daemon`.
+- **Data and command:** git/git cut at v1.0.0 (2,930 commits, 12,233 objects, a 3.46 MiB pack); `KEEP_LOGS=DIR
+  SERVERS="stock slates" crates/cli/bench/git_scale.sh slates cut-1.0.git WORK 3 900`, the harness now cloning a second
+  time (`clone-again`), as every clone after the first meets. Both builds' first clones: `fsck --full` clean, refs (2)
+  and object ids (12,233) identical to the source.
+
+Best of three, seconds (every run in the logs: `~/.cache/w-perf/logs/git-cut10-{a718,before}.log` on the Studio):
+
+| git | stock | slates before | slates after |
+|---|---|---|---|
+| push, both refs | 0.346 / 0.351 | 0.672 | 0.684 |
+| first clone `--mirror` | 0.356 / 0.318 | 2.791 | 4.293 |
+| second clone `--mirror` | 0.312 / 0.342 | 2.766 | 0.912 |
+| one-commit push | 0.086 / 0.070 | 0.051 | 0.050 |
+| fetch of it | 0.074 / 0.073 | 0.068 | 0.071 |
+| clone `--depth 1` | 0.115 / 0.119 | 0.154 | 0.118 |
+| clone `--filter=blob:none` | 0.190 / 0.222 | 1.076 | 0.558 |
+
+(Stock's two figures are its runs beside each build.) The daemon's resident set after the push: 383 to 389 MiB both;
+at the end of a run: 384 to 388 MiB before, 482 to 513 MiB after, the kept fragments and the content store's arena
+grown for them.
+
+What it means: every clone after the first is 3.0 times as fast, a partial clone 1.9 times, and a shallow one even
+with `git daemon`. The first clone after a push now pays the version's whole encoding, 4.293 s against the old search's
+2.791 s, since the encoding tries the learned window's candidates for every object where the old stream searched only
+what no part covered. A second clone is still 2.7 times `git daemon`'s. Owed, measured next: where the first clone's
+encoding and the second clone's 0.91 s go; the encoding moved to the push's own intake (the deltas the client sent kept,
+git's pack reuse; w-git's streaming intake), so no fetch pays it; and the arena's 100 to 125 MiB more for a 3.5 MiB pack.
+
+## Concurrent large pushes into one daemon: every push keeps about 67 times its pack, so 1,000 cannot fit (UI goal 93; Ada's tens-of-thousands requirement; 2026-11-20)
+
+- **Machine and build:** Mac Studio (as above), 2026-11-20 ~09:30 UTC, load average 5.1 to 7.1. slates: release build
+  of main 7b46fbdcd (`slates anchor --vcs-http 127.0.0.1:0`, 23 shards derived).
+- **The client:** `crates/cli/bench/push_load.py SLATES cut-1.0.git 'v1.0.0^{commit}' --max 100`. It is a slim
+  smart-HTTP client, since stock git cannot run thousands of pushes on one box. It makes git's receive-pack request
+  once in memory: a create of `refs/heads/main` with `report-status`, then a pack from `git pack-objects --revs
+  --stdout` (3,434,551 bytes, 12,232 objects of git/git cut at v1.0.0). It sends N of them at once, each to its own
+  fresh repository, and reads every answer whole. The steps are powers of ten up to the client's open-file room, less a
+  tenth (derived from the machine; 221,184 here, capped at 100 for this run).
+
+| N | ok | wall | p50 | p99 | daemon RSS before → peak | per push |
+|---|---|---|---|---|---|---|
+| 1 | 1/1 | 0.792 s | 0.789 s | 0.789 s | 85 → 386 MiB | 300.8 MiB |
+| 10 | 10/10 | 0.955 s | 0.919 s | 0.952 s | 386 → 3,285 MiB | 289.9 MiB |
+| 100 | 100/100 | 4.795 s | 2.825 s | 4.790 s | 3,286 → 28,164 MiB | 248.8 MiB |
+
+None of it goes back once a push completes (each step starts at the last one's peak), so 1,000 pushes would need about
+250 GB, past the box's 96 GiB; the 1,000 and 10,000 steps were not run on the shared machine.
+
+Where one push's 229 MiB goes (`MallocStackLogging=1`, `malloc_history -allBySize`, `footprint` before and after):
+69.1 MiB in `slates_vcs::ContentStore::put_object` (every object kept inflated and whole: about 20 times the pack);
+63.5 MiB in `slates_db::Partition::apply_repository` (the register entry's copy of the push's objects); 63.7 MiB of
+the content store's arena regions grown for them. Owed, and what the next run measures: the intake keeping the
+client's deltas compressed and naming blobs in the green's identity table (w-git's streaming intake; A-716 slice 1a's
+`Green::hold_bytes`), and the register entries naming objects by identity rather than holding them.

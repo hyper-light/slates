@@ -30,7 +30,7 @@ gap, slates does not inherit it.
 | **R7 Plain English.** A human implementer can act on every sentence. | Module docs and comments are written for the next engineer, in prose, citing the design section. |
 | **R8 Laptop ≡ fleet, one code path.** | Every subsystem has a laptop-degenerate section; the N=1 differential test in CI asserts identical semantics with one node and with the simulated fleet. No mode switches, ever. |
 | **R9 Sub-50 µs provisioning.** | The provisioning histogram (p50/p99/p999/max, spinning and parked) is a permanent, ratcheted CI gate. |
-| **R10 Disk writes happen only on a user permission grant; no privilege is ever required.** | Grants exist only through the CLI or a confirmation surface; the MCP and SDK channels have no grant verb (refused by kind). The daemon never requests `CAP_SYS_ADMIN` or root; the only privileged pieces are OS-shipped brokers installed once. |
+| **R10 Disk writes happen only on a user permission grant, which follows the mode the user gave the agent; no privilege is ever required.** | The launcher or the harness sets a session's or volume's write policy and an agent can never raise its own (A-285): bypass merges and lands at once; ask answers a typed approval request bound to the manifest, which the harness presents; a forbidding mode is refused. Signatures are signed-work provenance, never the permission gate. The daemon never requests `CAP_SYS_ADMIN` or root; the only privileged pieces are OS-shipped brokers installed once. |
 
 ## 2. Banned (explicit authorization required, per item, in the conversation)
 
@@ -51,7 +51,9 @@ the tree, flag it for removal.
 10. Consensus, a lock service, or a coordination call on a per-write path; the configuration group is touched only on membership, takeover, neighbourhood and home changes (D-14).
 11. An inferred merge (diff3, three-way text merge, OT, LLM resolution) anywhere; the verdict is accept, identical, or conflict (D-27, D-26).
 12. A global catalog or index for lookups; ids route to owners (D-14).
-13. Adding non-Rust tooling, a JDK, TLA+ tools, model checking, or any long-running job to the project's CI or to Ada's machine. The TLA+ models under `docs/wip/models/` are architecture artifacts re-run only by whoever changes §4.8, never by CI.
+13. *(Removed by Ada, 2026-11-18.)* TLA+ model checking (TLC, Apalache, with the JDK they need) and long-running CI
+    lanes (nightly chaos, model checks, soak runs) are allowed and expected. Re-run the models under `docs/wip/models/`
+    whenever a change touches what they model; CI may run them. Install such tools in user space, never with root.
 14. Subagents, background jobs, tool installs, or system-state changes during any task unless Ada asks for that specific thing.
 
 ## 3. Code shape (the vorpal habits, made mandatory)
@@ -247,7 +249,8 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     leaked 8 of 8 rounds' keepers before).
   - A defence the host may decline, counted and remembered: `ShardsBackings::place` in
     `crates/vfs/src/shards_backing.rs` (each range a guest maps placed in huge pages as its fill finishes, A-193),
-    re-armed on the daemon's reap tick (`rearm_placement`); and the guard rows around it, a layout the
+    re-armed by the shard's deadline keeper a retry window after the decline (`rearm_placement`, A-570); and the guard
+    rows around it, a layout the
     object's offsets go through (`DaxLayout` in `crates/mem/src/dax_object.rs`, A-194): slates' own device maps each
     window as two pieces from page interiors. Gotchas, each found by a run or a review:
     - a guard needs no physical neighbour you cannot see: put it inside the page and map the window around it, since the
@@ -286,6 +289,9 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     200 through crosvm and 0 of 200 in QEMU, since the guest's close and the console give the mount's round time), so
     the counted waits are the check that cannot miss. A real-system kill rarely lands inside a hold of about 82 µs (1
     of 36 did): hold that case with the stand-in.
+  - A test that drives a future no timer wakes: `LocalRuntime::run_until_idle` returns at its first zero-timeout poll
+    when no timer is armed, so a test awaiting such an answer waits forever (A-657 part 4's hooks test hung 29 minutes
+    on the Studio). Drive it under `futures::within`, as the hook tests do, so a hang becomes a failure.
 - **Keep design docs in sync with code.** Changing a subsystem's behaviour updates its design section, its status blockquote and the ledger in the same commit.
 - **Commit everything, in imperative area-prefixed summaries that carry the measured fact**, in vorpal's style: `merge: one graph tool over seven relations; deferred-schema cost measured`. Always `git add -A && git commit -m "<message>"`. Never `git checkout`, `git stash`, `git reset`, or any destructive git command.
 - **Debugging protocol.** Add logging to file first; consult the design section rather than assuming from code; confirm scope, intended behaviour, timing and frequency with Ada; after root cause is confirmed by logs and analysis, write `docs/bugs/<date>-<slug>.md` with description, root cause, impact and exact edits; fix in plan mode; touch nothing beyond the fix, but report every sibling inconsistency found; never preserve the behaviour that caused the bug.
@@ -297,3 +303,30 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
 - Answer the question asked; when challenged, give the maximal solution with evidence, not a hedge. Say "wrong" about your own earlier answer when it was.
 - Every claim carries a number, a date, and a command or a citation. "From memory" is flagged as such and listed for verification.
 - Plain English in every document and comment; no jargon that a careful engineer new to the project cannot act on.
+
+## 8. Every agent: implement, run its focused unit and integration tests, merge, and end (Ada, 2026-11-18, binding on every agent and subagent, forever; "the LAST time I'm going to remind you")
+
+An agent does exactly four things, then stops:
+
+1. **Implement** one piece: the change, its tests (a bug's failing test first), and the design, GAPS and docs lines it
+   makes true, in one commit in the style above.
+2. **Run its focused unit and integration tests:** `cargo test -p <crate> --lib <filter>` and
+   `cargo test -p <crate> --test <target> <filter>` for what it changed, plus `cargo fmt` (Ada, 2026-11-19, stated
+   repeatedly: "implement, run their focused unit + integration tests, then land"). That is the only compiling an agent
+   does. Nothing heavier, ever: no clippy (one crate or many), no `xtask`, no cross-target or other platforms' checks
+   (`cargo xwin check`, `--target ...`), no doc builds, no whole integration suites, fleet, e2e, chaos or live
+   flows, conformance suites, diag CI branches, A/B or benchmark rounds, repeated runs, seed replays, TLC, kernel-scale or
+   load runs, and no waiting on CI or a queued machine. Main builds: clippy, the lint matrix, `xtask`, cross-target and
+   Windows builds, docs, suites and CI, and sends a finding back as a new piece. (Ada, 2026-11-18, again: "Why are ANY of
+   these compiling?" -- a gate list main added that afternoon was withdrawn the same evening.)
+3. **Merge it itself:** `git fetch origin && git merge origin/main`; read `git diff --stat origin/main HEAD` (its files
+   alone); `git push origin HEAD:main` as its own command. If refused, fetch, merge and push again. Never force-push,
+   rewrite main, or land a commit built with `git commit-tree` (on 2026-11-18 one removed 40 files of main).
+4. **End:** record what landed and what is left in its progress file, put any heavier test it wants in the supervisor's
+   run-request queue (the exact command, the platform, what red would look like), report in a few lines, and stop. It
+   does not start its next piece; the supervisor starts it.
+
+Main (the supervisor) runs everything heavier (clippy, the cross-target lint matrix, `xtask`, every build beyond an
+agent's own unit tests, the full suites, cross-platform builds and runs, e2e, chaos, CI, measurement and A/B) on main
+after merges, does the fixes, and sends a breakage it cannot fix in place back to the
+commit's author as a new piece. This section overrides older instructions in this file about gates, testing and landing.

@@ -31,6 +31,9 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/recovered.rs"]
+mod recovered;
+
 /// Shape: how long the daemon may take to come up, and to be replaced after a kill.
 const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the poll interval of the waits.
@@ -274,12 +277,15 @@ fn an_nfs_connection_outlives_its_daemons_kill_and_every_request_is_answered() {
   // Kills that landed with requests still unsent, so a successor answered requests the dead daemon never read: the
   // non-vacuity evidence that a request outlived a daemon in the connection, not merely that the connection did.
   let mut kills_inside_a_burst = 0usize;
-  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  // Each daemon is killed once the anchor has judged it recovered (A-311): a daemon killed sooner is a failed start,
+  // and the second in a row is a crash loop the anchor backs off, which this flow does not test.
+  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
   for round in 0..KILLS {
     let (waited, inside) = held.kill_inside_a_burst(round, pid);
     longest_wait = longest_wait.max(waited);
     kills_inside_a_burst += usize::from(inside);
-    pid = await_new_daemon(&instance, pid, round);
+    let killed = pid;
+    pid = recovered::await_recovered(&instance, &|next| next != killed, POLL, START_WAIT);
   }
   let whole = read_whole(&mut held.stream, &held.file, held.model.len(), held.xid);
   eprintln!(
@@ -557,7 +563,8 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
   let instance = format!("nfs-commit-{}", std::process::id());
   let _anchor = start_anchor(&instance);
   let mut held = HeldSession::open(&instance);
-  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  // Each daemon is killed once the anchor has judged it recovered (A-311), as in the held-connection flow.
+  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
   let mut xid = 10_000u32;
   let mut committed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
   let mut rewrites = 0usize;
@@ -586,7 +593,8 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
       committed.push((file, pieces.concat()));
     }
     if killed {
-      pid = await_new_daemon(&instance, pid, round);
+      let killed = pid;
+      pid = recovered::await_recovered(&instance, &|next| next != killed, POLL, START_WAIT);
     }
   }
   // One more kill: every file is now read from what the restarted daemon recovered.
@@ -617,6 +625,159 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
   assert!(
     rewrites > 0,
     "a kill changed the verifier under the client at least once"
+  );
+}
+
+/// Shape: the files the unrewritten-write flow writes, each across its own daemon kill.
+const UNREWRITTEN_FILES: usize = 6;
+/// Shape: the bytes of each: the size of the first file measured empty (2026-11-18), inside one WRITE of the macOS mount's
+/// 128 KiB transfer, as Apple's client sends a file of that size.
+const UNREWRITTEN_BYTES: usize = 52_177;
+
+/// One file as Apple's NFSv3 client writes and `fsync`s it (macOS 26.2, measured 2026-11-18 with a per-call server log
+/// under `docs/wip/bench/kill_fsync_macos.sh`): every byte in one UNSTABLE WRITE, then one COMMIT that starts where the
+/// bytes end, with count 0 (17,631 of 17,631 COMMITs took that form). `kill` runs between the WRITE's reply and the
+/// COMMIT. Returns the verifiers the WRITE and the COMMIT were answered with. Nothing is written again, whatever the COMMIT
+/// answers: when it answers a verifier other than the WRITE's, RFC 1813 §3.3.7 has a client write the bytes again, and
+/// Apple's sent nothing (0 of 4 such COMMITs).
+fn fsync_like_apples_client(
+  stream: &mut TcpStream,
+  file: &[u8],
+  bytes: &[u8],
+  xid: &mut u32,
+  kill: impl FnOnce(),
+) -> ([u8; 8], [u8; 8]) {
+  let mut args = Vec::new();
+  nfs::opaque(file, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes());
+  args.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+  args.extend_from_slice(&UNSTABLE.to_be_bytes());
+  nfs::opaque(bytes, &mut args);
+  let written = verifier_of(&call_once(stream, WRITE, &args, *xid), WRITE);
+  *xid += 1;
+  kill();
+  let mut args = Vec::new();
+  nfs::opaque(file, &mut args);
+  args.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+  args.extend_from_slice(&0u32.to_be_bytes());
+  let committed = verifier_of(&call_once(stream, COMMIT, &args, *xid), COMMIT);
+  *xid += 1;
+  (written, committed)
+}
+
+/// READs `file` from its start over `stream` until `length` bytes or its end, whichever comes first: what the file holds,
+/// short when bytes were lost.
+fn read_what_is_there(
+  stream: &mut TcpStream,
+  file: &[u8],
+  length: usize,
+  xid: &mut u32,
+) -> Vec<u8> {
+  let mut out = Vec::new();
+  while out.len() < length {
+    let count = (length - out.len()).min(SIZES[SIZES.len() - 1]);
+    let results = call_once(
+      stream,
+      READ,
+      &read_args(file, out.len() as u64, count),
+      *xid,
+    );
+    *xid += 1;
+    assert_eq!(nfs::status(&results), 0, "READ at {}", out.len());
+    // READ3resok: status, post_op_attr (follows + its attributes), count, eof, data.
+    let attributes = if u32::from_be_bytes(results[4..8].try_into().unwrap()) == 1 {
+      FATTR3_BYTES
+    } else {
+      0
+    };
+    let (data, _) = nfs::read_opaque(&results, 8 + attributes + 8);
+    if data.is_empty() {
+      break;
+    }
+    out.extend_from_slice(&data);
+  }
+  out
+}
+
+/// A-358 (GAPS 2026-10-06, "two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount").
+/// Do: under `slates anchor`, on one held NFS connection, for each of several files: CREATE it, then write and `fsync`
+/// it as Apple's client does ([`fsync_like_apples_client`]), killing the daemon as soon as the WRITE is answered, so its
+/// successor answers the COMMIT; then kill once more and read every file back. Expect: every COMMIT met a successor (it
+/// answered a verifier other than the WRITE's: the non-vacuity evidence), and every file holds its bytes, though the
+/// client never wrote them again: a WRITE is answered only once it survives its daemon's death.
+#[test]
+fn an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the unrewritten-write flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemons)"
+    );
+    return;
+  }
+  if cfg!(target_os = "linux") {
+    eprintln!(
+      "skipping the unrewritten-write flow: Linux does not hold NFS connections yet (A-113, GAPS)"
+    );
+    return;
+  }
+  let instance = format!("nfs-unrewritten-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let mut held = HeldSession::open(&instance);
+  // Each daemon is killed once the anchor has judged it recovered (A-311), as in the commit oracle.
+  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
+  let mut xid = 20_000u32;
+  let mut written: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+  let mut met_a_successor = 0usize;
+  for index in 0..UNREWRITTEN_FILES {
+    let dir = held.root.clone();
+    let file = nfs::create(&mut held.stream, &dir, &format!("unrewritten-{index}"), xid);
+    xid += 1;
+    let bytes: Vec<u8> = (0..UNREWRITTEN_BYTES)
+      .map(|k| u8::try_from((index * 37 + k) % 251).unwrap() + 1)
+      .collect();
+    let target = pid;
+    let (write_verifier, commit_verifier) =
+      fsync_like_apples_client(&mut held.stream, &file, &bytes, &mut xid, || {
+        let status = Command::new("kill")
+          .args(["-9", &target.to_string()])
+          .status()
+          .unwrap();
+        assert!(status.success(), "kill the daemon");
+      });
+    met_a_successor += usize::from(write_verifier != commit_verifier);
+    written.push((file, bytes));
+    pid = recovered::await_recovered(&instance, &|next| next != target, POLL, START_WAIT);
+  }
+  // One more kill: every file is read from what a restarted daemon recovered.
+  let status = Command::new("kill")
+    .args(["-9", &pid.to_string()])
+    .status()
+    .unwrap();
+  assert!(status.success(), "the final kill");
+  await_new_daemon(&instance, pid, UNREWRITTEN_FILES);
+  let mut lost = Vec::new();
+  for (index, (file, bytes)) in written.iter().enumerate() {
+    let back = read_what_is_there(&mut held.stream, file, bytes.len(), &mut xid);
+    if back != *bytes {
+      lost.push(format!(
+        "unrewritten-{index}: {} of {} bytes",
+        back.len(),
+        bytes.len()
+      ));
+    }
+  }
+  eprintln!(
+    "unrewritten-write flow: {} files, {met_a_successor} COMMITs answered by a successor, {} lost",
+    written.len(),
+    lost.len()
+  );
+  assert_eq!(
+    met_a_successor,
+    written.len(),
+    "every COMMIT met a successor's verifier: each WRITE's daemon was killed before it"
+  );
+  assert!(
+    lost.is_empty(),
+    "acknowledged writes the client never wrote again came back short: {lost:?}"
   );
 }
 
@@ -694,7 +855,8 @@ fn a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again() {
     kills_inside_a_burst: 0,
     answered_from_held: 0,
   };
-  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  // Each daemon is killed once the anchor has judged it recovered (A-311), as in the held-connection flow.
+  let mut pid = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
   let mut round = 0usize;
   while round < MUTATION_KILLS || (run.answered_from_held == 0 && round < MUTATION_KILLS_MAX) {
     run.kill_inside_a_mkdir_burst(round, pid);
@@ -711,6 +873,14 @@ fn a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again() {
       );
     }
     run.answered_from_held += answered;
+    // The successor's counters are read as soon as it answers; it is killed in the next round once it has recovered.
+    let successor = pid;
+    recovered::await_recovered(
+      &instance,
+      &|answering| answering == successor,
+      POLL,
+      START_WAIT,
+    );
     round += 1;
   }
   run.assert_each_applied_once(round);

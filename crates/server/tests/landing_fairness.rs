@@ -10,8 +10,8 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// The daemon's NFS loopback transport and a real landing target: macOS and Linux.
-#![cfg(unix)]
+// The daemon's NFS loopback transport (served on Windows too, A-184) and a real landing target, on every platform since
+// the Windows writer (A-185).
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -413,7 +413,8 @@ fn term_for_gap(gap_ns: u64) -> u64 {
     .max(SHORT_TERM_NS)
 }
 
-/// A daemon whose landing lease term (its failover bound) is `term_ns`, bootstrapped, and a client to it.
+/// A daemon whose landing lease term (its failover delay, A-414: injected, since nothing sets the estimate) is
+/// `term_ns`, bootstrapped, and a client to it.
 fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
   let profile = common::machine_profile();
   let instance = format!(
@@ -422,10 +423,6 @@ fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
     term_ns.unwrap_or(0)
   );
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let config = match term_ns {
-    Some(term_ns) => config.with_failover_slo(term_ns),
-    None => config,
-  };
   let daemon = Daemon::start(
     &profile,
     config,
@@ -437,6 +434,11 @@ fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+  if let Some(term_ns) = term_ns {
+    daemon
+      .inject_failover(Some(term_ns))
+      .expect("the failover delay is held");
+  }
   let client = connect(&instance);
   (daemon, client)
 }
@@ -588,14 +590,14 @@ fn drive(client: &mut Client, driver: &mut Driver, tickets: &[Ticket]) -> Ended 
   ended
 }
 
-/// The async driver's patient path (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
+/// The async driver's wait for long work (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
 /// to a landing still at work). Do: land two volumes, each sized by a calibration landing to last twice the reply
-/// deadline, under grants through one async driver, driven by an event loop as an SDK drives it — one call submitted
-/// patient (`submit_patient`, as both SDKs' `land` is), the other plain — both landings outlasting the reply deadline.
-/// Expect: both are waited for past it and end with their landing done and every file written. A granted landing
-/// defers its reply (`defers_reply`), and since 2026-10-07 the driver derives patience from the request
-/// (`Client::defers`), as the synchronous call does, so a plain submission of a deferring verb is waited for too;
-/// until then the plain call ended `Stalled` at its deadline, the control this test used to keep.
+/// deadline, under grants through one async driver, driven by an event loop as an SDK drives it, both landings
+/// outlasting the reply deadline. Expect: both are waited for past it and end with their landing done and every file
+/// written, since a call waits while its daemon lives (A-232). Until 2026-11-13 one call was submitted patient
+/// (`submit_patient`, as both SDKs' `land` was) and the other plain, which the driver waited for only because a
+/// granted landing was a request the daemon defers (`Client::defers`, since 2026-10-07); before that the plain call
+/// ended `Stalled` at its deadline. Both are plain submissions now, the driver's one path.
 #[test]
 fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
   let profile = common::machine_profile();
@@ -697,7 +699,7 @@ fn patient_and_plain(
   );
   let mut driver = Driver::new(client);
   let patient = driver
-    .submit_patient(
+    .submit(
       client,
       land_begin(patient_volume, patient_target.path.clone(), patient_grant),
     )

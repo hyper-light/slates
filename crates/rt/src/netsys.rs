@@ -18,6 +18,8 @@
 // caller names a bind address without depending on the socket backend.
 pub(crate) use core::net::{Ipv4Addr, SocketAddrV4};
 
+use crate::error::RtError;
+
 /// The outcome of a non-blocking receive: bytes and a sender, or a signal to await readiness and retry.
 pub(crate) enum Io<T> {
   /// The operation completed with this value.
@@ -26,6 +28,304 @@ pub(crate) enum Io<T> {
   WouldBlock,
   /// The call was interrupted before doing anything (`EINTR`); retry at once.
   Interrupted,
+}
+
+// ============================================================================== the bytes a stream handed its kernel
+
+/// Format: where Linux's `struct tcp_info` keeps `tcpi_bytes_acked`, a `__u64` in the kernel's byte order: after eight
+/// one-byte fields, twenty-four `__u32`s and the two `__u64` pacing rates (`include/uapi/linux/tcp.h`, the same through
+/// `tcpi_bytes_received` in v6.12 and mainline, read 2026-11-19).
+const TCP_INFO_BYTES_ACKED_AT: usize = 120;
+
+/// Format: the bytes of Linux's `struct tcp_info` read for `tcpi_bytes_acked`, through its end ([`TCP_INFO_BYTES_ACKED_AT`]
+/// and its eight bytes). A kernel whose record is shorter (before Linux 4.1, which added the field) copies fewer, and
+/// the read is refused.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const TCP_INFO_THROUGH_BYTES_ACKED: usize = 128;
+
+/// `tcpi_bytes_acked` from the first [`TCP_INFO_THROUGH_BYTES_ACKED`] bytes of a Linux `struct tcp_info` (A-550).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn bytes_acked_in(info: &[u8; TCP_INFO_THROUGH_BYTES_ACKED]) -> Option<u64> {
+  let word = info.get(TCP_INFO_BYTES_ACKED_AT..TCP_INFO_THROUGH_BYTES_ACKED)?;
+  Some(u64::from_ne_bytes(
+    <[u8; size_of::<u64>()]>::try_from(word).ok()?,
+  ))
+}
+
+// ============================================================================== a connection's round trip, as its kernel measured it
+
+/// Format: where Linux's `struct tcp_info` keeps `tcpi_rtt`, the smoothed round trip in microseconds, a `__u32` in the
+/// kernel's byte order: after eight one-byte fields and fifteen `__u32`s (`include/uapi/linux/tcp.h`, unchanged from
+/// 2.6 through mainline, read 2026-11-19).
+const TCP_INFO_RTT_AT: usize = 68;
+
+/// Format: the bytes of Linux's `struct tcp_info` read for `tcpi_rtt`, through its end ([`TCP_INFO_RTT_AT`] and its four
+/// bytes).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const TCP_INFO_THROUGH_RTT: usize = 72;
+
+/// Format: where macOS's `struct tcp_connection_info` keeps `tcpi_srtt`, the smoothed round trip in milliseconds, a
+/// `u_int32_t` in the kernel's byte order: after four one-byte fields and ten `u_int32_t`s (xnu `bsd/netinet/tcp.h`).
+const TCP_CONNECTION_INFO_SRTT_AT: usize = 44;
+
+/// Format: the bytes of macOS's `struct tcp_connection_info` read for `tcpi_srtt`, through its end
+/// ([`TCP_CONNECTION_INFO_SRTT_AT`] and its four bytes).
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+pub(crate) const TCP_CONNECTION_INFO_THROUGH_SRTT: usize = 48;
+
+/// Format: the clock Linux measures `tcpi_rtt` with, and Windows `RttUs`: microseconds, in nanoseconds.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) const MICROSECOND_NS: u64 = 1_000;
+
+/// Format: the clock macOS measures `tcpi_srtt` with: milliseconds (xnu's `TCP_RETRANSHZ`, 1000 a second), in
+/// nanoseconds.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+const MILLISECOND_NS: u64 = 1_000_000;
+
+/// The `u32` at `at` in `record`, in the kernel's byte order.
+fn word_at(record: &[u8], at: usize) -> Option<u32> {
+  let end = at.checked_add(size_of::<u32>())?;
+  let word = record.get(at..end)?;
+  Some(u32::from_ne_bytes(
+    <[u8; size_of::<u32>()]>::try_from(word).ok()?,
+  ))
+}
+
+/// The round trip in the first [`TCP_INFO_THROUGH_RTT`] bytes of a Linux `struct tcp_info`: `tcpi_rtt`, microseconds.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn linux_round_trip_in(
+  info: &[u8; TCP_INFO_THROUGH_RTT],
+) -> Option<crate::tcp::RoundTrip> {
+  let micros = word_at(info, TCP_INFO_RTT_AT)?;
+  Some(crate::tcp::RoundTrip {
+    ns: u64::from(micros).saturating_mul(MICROSECOND_NS),
+    resolution_ns: MICROSECOND_NS,
+  })
+}
+
+/// The round trip in the first [`TCP_CONNECTION_INFO_THROUGH_SRTT`] bytes of a macOS `struct tcp_connection_info`:
+/// `tcpi_srtt`, milliseconds.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+pub(crate) fn macos_round_trip_in(
+  info: &[u8; TCP_CONNECTION_INFO_THROUGH_SRTT],
+) -> Option<crate::tcp::RoundTrip> {
+  let millis = word_at(info, TCP_CONNECTION_INFO_SRTT_AT)?;
+  Some(crate::tcp::RoundTrip {
+    ns: u64::from(millis).saturating_mul(MILLISECOND_NS),
+    resolution_ns: MILLISECOND_NS,
+  })
+}
+
+/// The bytes a stream's writers have handed its kernel since the connection was made, from the kernel's two counters
+/// (A-550): the bytes acknowledged (`acked`; none where the kernel keeps no such count) and the bytes queued and not yet
+/// acknowledged (`queued`). Their sum is the count only when both describe one instant, and they are read apart, so the
+/// acknowledged count is read on both sides of the queue's reading and a round is kept only when the two agree: an
+/// acknowledgement in between moves the count, and the queue was read on one side of it.
+///
+/// Nothing writes while this runs (the caller reads a stream no task sends on), so every byte acknowledged after the
+/// first reading was outstanding at it, and a round that disagrees has seen at least one of them acknowledged. The
+/// outstanding bytes at the first reading were at most those the first round's queue reading found plus those its two
+/// count readings saw acknowledged, so the rounds end within that many: past it, a writer ran, and no instant was read.
+/// That is refused, as is a count that falls (a reset connection's) and a sum past the counter's range.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn settle_handed(
+  mut acked: impl FnMut() -> Result<Option<u64>, RtError>,
+  mut queued: impl FnMut() -> Result<u64, RtError>,
+) -> Result<Option<u64>, RtError> {
+  let Some(mut before) = acked()? else {
+    return Ok(None);
+  };
+  // The bytes that may still be acknowledged, learned in the first round that disagrees.
+  let mut outstanding: Option<u64> = None;
+  loop {
+    let waiting = queued()?;
+    let Some(after) = acked()? else {
+      return Ok(None);
+    };
+    if after == before {
+      return before
+        .checked_add(waiting)
+        .map(Some)
+        .ok_or(RtError::DriverRefused {
+          call: "the bytes handed: past the counter's range",
+          code: None,
+        });
+    }
+    let moved = after.checked_sub(before).ok_or(RtError::DriverRefused {
+      call: "the bytes handed: the acknowledged count fell",
+      code: None,
+    })?;
+    let left = outstanding.get_or_insert(waiting.saturating_add(moved));
+    *left = left.checked_sub(moved).ok_or(RtError::DriverRefused {
+      call: "the bytes handed: more acknowledged than was outstanding",
+      code: None,
+    })?;
+    before = after;
+  }
+}
+
+#[cfg(test)]
+mod handed_tests {
+  use super::{TCP_INFO_THROUGH_BYTES_ACKED, bytes_acked_in, settle_handed};
+  use crate::error::RtError;
+
+  /// A-550, golden vector: `tcpi_bytes_acked` is the eight bytes ending the 128 Linux's `struct tcp_info` is read for.
+  /// Do: fill a record with 0xFF and put 0x0102_0304_0506_0708 at bytes 120..128 in native order. Expect that value; a
+  /// read one word early or late would take 0xFF bytes into it.
+  #[test]
+  fn the_acknowledged_count_is_read_where_linux_keeps_it() {
+    let mut info = [0xFFu8; TCP_INFO_THROUGH_BYTES_ACKED];
+    let value: u64 = 0x0102_0304_0506_0708;
+    for (slot, byte) in info[120..].iter_mut().zip(value.to_ne_bytes()) {
+      *slot = byte;
+    }
+    assert_eq!(bytes_acked_in(&info), Some(value));
+  }
+
+  /// A kernel model for [`settle_handed`]: `written` bytes handed, `acked` of them acknowledged, and before each reading
+  /// the next number of `arrivals` acknowledged (none once the script ends).
+  struct Kernel {
+    written: u64,
+    acked: u64,
+    arrivals: Vec<u64>,
+    next: usize,
+  }
+
+  impl Kernel {
+    fn arrive(&mut self) {
+      let more = self.arrivals.get(self.next).copied().unwrap_or(0);
+      self.next += 1;
+      self.acked = (self.acked + more).min(self.written);
+    }
+  }
+
+  /// Runs [`settle_handed`] over `kernel`, each reading preceded by its scripted acknowledgements.
+  fn settle(kernel: Kernel) -> Result<Option<u64>, RtError> {
+    let kernel = std::cell::RefCell::new(kernel);
+    settle_handed(
+      || {
+        let mut kernel = kernel.borrow_mut();
+        kernel.arrive();
+        Ok(Some(kernel.acked))
+      },
+      || {
+        let mut kernel = kernel.borrow_mut();
+        kernel.arrive();
+        Ok(kernel.written - kernel.acked)
+      },
+    )
+  }
+
+  /// Every way of acknowledging `outstanding` bytes over `readings` readings, as the number acknowledged before each.
+  fn schedules(outstanding: u64, readings: usize) -> Vec<Vec<u64>> {
+    if readings == 0 {
+      return vec![Vec::new()];
+    }
+    let mut all = Vec::new();
+    for first in 0..=outstanding {
+      for mut rest in schedules(outstanding - first, readings - 1) {
+        rest.insert(0, first);
+        all.push(rest);
+      }
+    }
+    all
+  }
+
+  /// §4.6, A-113's Linux half, A-550: the count settles on the bytes handed however acknowledgements fall between its
+  /// readings. Do: for every stream of 1,000 bytes handed with 0 to 4 of them outstanding, run the readings under every
+  /// schedule of those acknowledgements arriving before any of the first nine readings. Expect exactly 1,000 every time.
+  /// Read naively (the count and the queue once each), a schedule acknowledging bytes between the two reads 999 or less.
+  #[test]
+  fn the_bytes_handed_settle_however_acknowledgements_fall_between_the_readings() {
+    let written = 1_000;
+    let mut runs = 0;
+    for outstanding in 0..=4 {
+      for arrivals in schedules(outstanding, 9) {
+        let kernel = Kernel {
+          written,
+          acked: written - outstanding,
+          arrivals,
+          next: 0,
+        };
+        assert_eq!(settle(kernel), Ok(Some(written)));
+        runs += 1;
+      }
+    }
+    assert!(runs > 700, "the schedules ran: {runs}");
+  }
+
+  /// A-550: what the count cannot settle on is refused, never guessed. Do: settle where the kernel keeps no acknowledged
+  /// count; where the count falls; where a writer keeps adding bytes that are acknowledged as fast; and where the sum
+  /// passes the counter. Expect none, then three refusals.
+  #[test]
+  fn a_count_that_cannot_settle_is_refused() {
+    assert_eq!(settle_handed(|| Ok(None), || Ok(0)), Ok(None));
+    let falling = std::cell::Cell::new(10);
+    let fell = settle_handed(
+      || {
+        let now = falling.get();
+        falling.set(now - 1);
+        Ok(Some(now))
+      },
+      || Ok(0),
+    );
+    assert!(matches!(
+      fell,
+      Err(RtError::DriverRefused { code: None, .. })
+    ));
+    let racing = std::cell::Cell::new(0);
+    let raced = settle_handed(
+      || {
+        let now = racing.get();
+        racing.set(now + 5);
+        Ok(Some(now))
+      },
+      || Ok(0),
+    );
+    assert!(matches!(
+      raced,
+      Err(RtError::DriverRefused { code: None, .. })
+    ));
+    let past = settle_handed(|| Ok(Some(u64::MAX)), || Ok(1));
+    assert!(matches!(
+      past,
+      Err(RtError::DriverRefused { code: None, .. })
+    ));
+  }
+}
+
+#[cfg(test)]
+mod round_trip_tests {
+  use super::{
+    TCP_CONNECTION_INFO_THROUGH_SRTT, TCP_INFO_THROUGH_RTT, linux_round_trip_in,
+    macos_round_trip_in,
+  };
+  use crate::tcp::RoundTrip;
+
+  /// A-625 part 2, golden vectors: Linux keeps `tcpi_rtt` (microseconds) in bytes 68..72 of `struct tcp_info`, macOS
+  /// `tcpi_srtt` (milliseconds) in bytes 44..48 of `struct tcp_connection_info`. Do: fill each record with 0xFF and put a
+  /// round trip in native order where its kernel keeps it. Expect it read in nanoseconds with its clock's resolution; a
+  /// read one word early or late would take 0xFF bytes into it.
+  #[test]
+  fn each_kernels_round_trip_is_read_where_it_keeps_it() {
+    let mut linux = [0xFFu8; TCP_INFO_THROUGH_RTT];
+    linux[68..72].copy_from_slice(&1_234u32.to_ne_bytes());
+    let mut macos = [0xFFu8; TCP_CONNECTION_INFO_THROUGH_SRTT];
+    macos[44..48].copy_from_slice(&7u32.to_ne_bytes());
+    assert_eq!(
+      (linux_round_trip_in(&linux), macos_round_trip_in(&macos)),
+      (
+        Some(RoundTrip {
+          ns: 1_234_000,
+          resolution_ns: 1_000
+        }),
+        Some(RoundTrip {
+          ns: 7_000_000,
+          resolution_ns: 1_000_000
+        })
+      )
+    );
+  }
 }
 
 // ============================================================================== Unix (rustix)
@@ -504,6 +804,83 @@ mod imp {
     Ok(state == [TCP_ESTABLISHED])
   }
 
+  /// The connection's round trip as its kernel measured it (`crate::tcp::RoundTrip`), from the record
+  /// [`established`] reads: Linux `TCP_INFO`'s `tcpi_rtt`.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    let mut info = [0u8; super::TCP_INFO_THROUGH_RTT];
+    get_option(&socket.fd, libc::IPPROTO_TCP, libc::TCP_INFO, &mut info)
+      .map_err(|e| refused("getsockopt(TCP_INFO)", e))?;
+    super::linux_round_trip_in(&info).ok_or_else(|| invalid("getsockopt(TCP_INFO)"))
+  }
+
+  /// See the Linux arm: macOS `TCP_CONNECTION_INFO`'s `tcpi_srtt`.
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    let mut info = [0u8; super::TCP_CONNECTION_INFO_THROUGH_SRTT];
+    get_option(
+      &socket.fd,
+      libc::IPPROTO_TCP,
+      libc::TCP_CONNECTION_INFO,
+      &mut info,
+    )
+    .map_err(|e| refused("getsockopt(TCP_CONNECTION_INFO)", e))?;
+    super::macos_round_trip_in(&info).ok_or_else(|| invalid("getsockopt(TCP_CONNECTION_INFO)"))
+  }
+
+  /// The bytes this stream's writers have handed the kernel since the connection was made (A-550): `tcpi_bytes_acked`
+  /// plus `SIOCOUTQ`, settled against acknowledgements arriving between the two readings ([`super::settle_handed`]).
+  ///
+  /// The first is `snd_una`'s progress from its start (`tcp_snd_una_update` adds `ack - snd_una` and nothing else
+  /// does, net/ipv4/tcp_input.c; `tcp_disconnect` zeroes it, net/ipv4/tcp.c) and the second `write_seq - snd_una`
+  /// (`tcp_ioctl`, net/ipv4/tcp.c; `SIOCOUTQ` is `TIOCOUTQ`, include/uapi/linux/sockios.h), so their sum is `write_seq`'s
+  /// progress: every byte written, and one more once a FIN is queued (`tcp_send_fin`, net/ipv4/tcp_output.c). An
+  /// accepted connection counts no SYN: its socket starts with `snd_una` and `write_seq` both one past the SYN-ACK's
+  /// sequence number (`tcp_create_openreq_child`, net/ipv4/tcp_minisocks.c), its count is its listener's, copied
+  /// (`sk_clone`, net/core/sock.c) from a zeroed allocation (`sk_alloc`) that sends nothing, and the handshake's last ACK
+  /// moves `snd_una` by nothing (the `TCP_SYN_RECV` step writes it directly). Read 2026-11-19 at v6.12 and mainline.
+  /// `None` where the kernel's record ends before the count (before Linux 4.1).
+  #[cfg(target_os = "linux")]
+  pub(crate) fn bytes_handed(socket: &Socket) -> Result<Option<u64>, RtError> {
+    super::settle_handed(|| bytes_acked(socket), || send_queue(socket))
+  }
+
+  /// `tcpi_bytes_acked` of the stream's connection, or none where the kernel's record ends before it: `get_option`
+  /// refuses a copy shorter than it asked, which is how such a kernel answers.
+  #[cfg(target_os = "linux")]
+  fn bytes_acked(socket: &Socket) -> Result<Option<u64>, RtError> {
+    let mut info = [0u8; super::TCP_INFO_THROUGH_BYTES_ACKED];
+    match get_option(&socket.fd, libc::IPPROTO_TCP, libc::TCP_INFO, &mut info) {
+      Ok(()) => Ok(super::bytes_acked_in(&info)),
+      Err(rustix::io::Errno::INVAL) => Ok(None),
+      Err(e) => Err(refused("getsockopt(TCP_INFO)", e)),
+    }
+  }
+
+  /// The bytes queued on the stream's connection and not yet acknowledged, sent or not (`SIOCOUTQ`).
+  #[cfg(target_os = "linux")]
+  fn send_queue(socket: &Socket) -> Result<u64, RtError> {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: `socket.fd` is a live socket this stream owns for the call; `SIOCOUTQ` (`TIOCOUTQ`) writes one `int`
+    // through its argument (`tcp_ioctl`, net/ipv4/tcp.c), which points at `queued`, live on this frame for the call.
+    let result = unsafe { libc::ioctl(socket.fd.as_raw_fd(), libc::TIOCOUTQ, &raw mut queued) };
+    if result != 0 {
+      return Err(refused(
+        "ioctl(SIOCOUTQ)",
+        rustix::io::Errno::from_io_error(&std::io::Error::last_os_error())
+          .unwrap_or(rustix::io::Errno::INVAL),
+      ));
+    }
+    u64::try_from(queued).map_err(|_| refused("ioctl(SIOCOUTQ)", rustix::io::Errno::RANGE))
+  }
+
+  /// No count on macOS and the BSDs: their sends of a record are made whole instead ([`make_sends_whole`]), so a held
+  /// connection needs none (A-113).
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn bytes_handed(_socket: &Socket) -> Result<Option<u64>, RtError> {
+    Ok(None)
+  }
+
   /// Ends both directions of the connection, whoever else holds a copy of its descriptor.
   pub(crate) fn shutdown(socket: &Socket) -> Result<(), RtError> {
     rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Both)
@@ -545,6 +922,54 @@ mod imp {
   /// A call that would have had to wait where the caller knew it would not (`EAGAIN`).
   pub(crate) fn would_block(call: &'static str) -> RtError {
     refused(call, rustix::io::Errno::AGAIN)
+  }
+
+  #[cfg(test)]
+  #[cfg(target_os = "linux")]
+  mod tests {
+    use std::os::fd::OwnedFd;
+
+    use super::{Socket, bytes_handed, local_addr};
+
+    /// A blocking loopback connection: the accepted end and the dialling end.
+    fn pair() -> (OwnedFd, OwnedFd) {
+      use rustix::net::{AddressFamily, SocketType};
+      let listener = Socket {
+        fd: rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap(),
+      };
+      let loopback = core::net::SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, 0);
+      rustix::net::bind(&listener.fd, &loopback).unwrap();
+      rustix::net::listen(&listener.fd, 1).unwrap();
+      let address = local_addr(&listener).unwrap();
+      let dialler = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+      rustix::net::connect(&dialler, &address).unwrap();
+      let accepted = rustix::net::accept(&listener.fd).unwrap();
+      (accepted, dialler)
+    }
+
+    /// §4.6, A-113's Linux half, A-550: an accepted connection's count is every byte its writer handed the kernel and
+    /// no SYN. Do: accept a loopback connection and read its count; write 1,000 bytes its peer has not read and read
+    /// it; let the peer read them all and read it again. Expect 0, then 1,000, then 1,000: the bytes move from the
+    /// queue to the acknowledged count, and their sum stays.
+    #[test]
+    fn an_accepted_connection_counts_every_byte_written_and_no_syn() {
+      let (accepted, dialler) = pair();
+      let socket = Socket { fd: accepted };
+      assert_eq!(bytes_handed(&socket), Ok(Some(0)), "fresh: no SYN counted");
+      let written = rustix::io::write(&socket.fd, &[7u8; 1_000]).unwrap();
+      assert_eq!(written, 1_000);
+      assert_eq!(
+        bytes_handed(&socket),
+        Ok(Some(1_000)),
+        "queued or acknowledged"
+      );
+      let mut read = 0;
+      let mut buffer = [0u8; 1_000];
+      while read < 1_000 {
+        read += rustix::io::read(&dialler, &mut buffer[read..]).unwrap();
+      }
+      assert_eq!(bytes_handed(&socket), Ok(Some(1_000)), "read by the peer");
+    }
   }
 }
 
@@ -1178,6 +1603,12 @@ mod imp {
     Ok(false)
   }
 
+  /// No count on Windows (A-550): no anchor holds a Windows connection across a restart (`docs/wip/platforms.md`,
+  /// gap 2), so nothing judges one.
+  pub(crate) fn bytes_handed(_socket: &Socket) -> Result<Option<u64>, RtError> {
+    Ok(None)
+  }
+
   /// Sets the receive low-water mark (`SO_RCVLOWAT`) to `bytes` and reads it back. Microsoft Learn says Windows' TCP
   /// provider refuses the option (`WSAEINVAL` since Vista); Windows' own answer is what the caller gets, typed.
   pub(crate) fn want_bytes(socket: &Socket, bytes: usize) -> Result<(), RtError> {
@@ -1199,9 +1630,22 @@ mod imp {
     Ok(())
   }
 
-  /// Whether the connection is still established, from Windows' own record of it (`SIO_TCP_INFO`, version 0, Windows
-  /// 10 1703 and later): its state is `TCPSTATE_ESTABLISHED`.
+  /// Whether the connection is still established, from Windows' own record of it ([`tcp_info`]): its state is
+  /// `TCPSTATE_ESTABLISHED`.
   pub(crate) fn established(socket: &Socket) -> Result<bool, RtError> {
+    Ok(tcp_info(socket)?.State == TCPSTATE_ESTABLISHED)
+  }
+
+  /// The connection's round trip as Windows measured it ([`tcp_info`]'s `RttUs`, microseconds).
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    Ok(crate::tcp::RoundTrip {
+      ns: u64::from(tcp_info(socket)?.RttUs).saturating_mul(super::MICROSECOND_NS),
+      resolution_ns: super::MICROSECOND_NS,
+    })
+  }
+
+  /// Windows' own record of the connection (`SIO_TCP_INFO`, version 0, Windows 10 1703 and later).
+  fn tcp_info(socket: &Socket) -> Result<TCP_INFO_v0, RtError> {
     let version: u32 = 0;
     let mut info = TCP_INFO_v0::default();
     let mut returned = 0u32;
@@ -1223,7 +1667,7 @@ mod imp {
     if rc == SOCKET_ERROR {
       return Err(last("WSAIoctl(SIO_TCP_INFO)"));
     }
-    Ok(info.State == TCPSTATE_ESTABLISHED)
+    Ok(info)
   }
 
   /// Ends both directions of the connection, whoever else holds a copy of the socket.
@@ -1321,9 +1765,10 @@ mod imp {
 pub(crate) use imp::as_fd;
 pub(crate) use imp::{OwnedDatagram, OwnedStream, Socket};
 pub(crate) use imp::{
-  accept, adopt_listener, adopt_stream, broken_pipe, connect, connected, discard, established,
-  into_owned, invalid, listen, make_sends_whole, peek, read, reserve_buffers, set_nodelay,
-  shutdown, shutdown_write, stream_socket, want_bytes, would_block, write, write_vectored,
+  accept, adopt_listener, adopt_stream, broken_pipe, bytes_handed, connect, connected, discard,
+  established, into_owned, invalid, listen, make_sends_whole, peek, read, reserve_buffers,
+  round_trip, set_nodelay, shutdown, shutdown_write, stream_socket, want_bytes, would_block, write,
+  write_vectored,
 };
 pub(crate) use imp::{
   adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,

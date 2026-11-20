@@ -1,0 +1,524 @@
+From 16b57a4807e49ba7b7741b7dca136d188f2463af Mon Sep 17 00:00:00 2001
+From: Ada Lundhe <adalundhe@lundhe.audio>
+Date: Wed, 18 Nov 2026 07:57:03 -0800
+Subject: [PATCH 1/2] sys: FileLinkInformation: forward hard links to a file
+ system that declares VolumeParams.HardLinks
+
+A volume that sets HardLinks now receives FileLinkInformation and FileLinkInformationEx as a SetInformation request
+in the rename request's layout: Info.Rename.NewFileName is the new name, Info.RenameEx.Flags carries ReplaceIfExists
+(bit 0) and, for FileLinkInformationEx where SupportsPosixUnlinkRename is set, FILE_LINK_POSIX_SEMANTICS and
+FILE_LINK_IGNORE_READONLY_ATTRIBUTE, and Info.Rename.AccessToken is the requestor's token when a name may be replaced.
+A directory answers STATUS_FILE_IS_A_DIRECTORY, a deleted file STATUS_ACCESS_DENIED, a stream STATUS_INVALID_PARAMETER;
+a name that may be replaced must have no open handle (FspFileNodeRenameCheck, as a rename's target).
+
+On success the file's cached information is invalidated (its link count changed), a replaced name's file node leaves
+the name table as FspFileNodeRename makes one leave, the new name's directory listing is invalidated and its watchers
+are told FILE_ACTION_ADDED. The completion runs on the file system's answering thread, so it acquires no other file
+node.
+
+NumberOfLinks (FileStandardInformation, FileAllInformation, FileStatInformation, FileStatLxInformation) is the file
+system's FSP_FSCTL_FILE_INFO.HardLinks where the volume declares HardLinks and the count is nonzero; otherwise 1, and
+always 1 for a directory, as on NTFS. The file node keeps the count beside the rest of the information it caches
+(FspFileNodeSetFileInfo, FspFileNodeGetFileInfo), so a query answered from the cache reads it too. A volume that does not declare HardLinks answers as before:
+FileLinkInformation STATUS_NOT_SUPPORTED, FileLinkInformationEx STATUS_INVALID_PARAMETER.
+---
+ inc/winfsp/fsctl.h |   4 +-
+ src/sys/driver.h   |  15 +++
+ src/sys/file.c     |   6 +-
+ src/sys/fileinfo.c | 296 +++++++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 310 insertions(+), 11 deletions(-)
+
+diff --git a/inc/winfsp/fsctl.h b/inc/winfsp/fsctl.h
+index 94ade4a9..8f4bd0df 100644
+--- a/inc/winfsp/fsctl.h
++++ b/inc/winfsp/fsctl.h
+@@ -210,7 +210,7 @@ enum
+     UINT32 ReparsePoints:1;             /* file system supports reparse points */\
+     UINT32 ReparsePointsAccessCheck:1;  /* file system performs reparse point access checks */\
+     UINT32 NamedStreams:1;              /* file system supports named streams */\
+-    UINT32 HardLinks:1;                 /* unimplemented; set to 0 */\
++    UINT32 HardLinks:1;                 /* file system supports hard links (FileLinkInformation) */\
+     UINT32 ExtendedAttributes:1;        /* file system supports extended attributes */\
+     UINT32 ReadOnlyVolume:1;\
+     /* kernel-mode flags */\
+@@ -285,7 +285,7 @@ typedef struct
+     UINT64 LastWriteTime;
+     UINT64 ChangeTime;
+     UINT64 IndexNumber;
+-    UINT32 HardLinks;                   /* unimplemented: set to 0 */
++    UINT32 HardLinks;                   /* number of hard links; 0 reads as 1 (needs VolumeParams.HardLinks) */
+     UINT32 EaSize;
+ } FSP_FSCTL_FILE_INFO;
+ FSP_FSCTL_STATIC_ASSERT(72 == sizeof(FSP_FSCTL_FILE_INFO),
+diff --git a/src/sys/driver.h b/src/sys/driver.h
+index 0822d3df..319657c8 100644
+--- a/src/sys/driver.h
++++ b/src/sys/driver.h
+@@ -1673,6 +1673,7 @@ typedef struct FSP_FILE_NODE
+     UINT64 LastWriteTime;
+     UINT64 ChangeTime;
+     UINT32 EaSize;
++    UINT32 HardLinks;                   /* the file system's link count (VolumeParams.HardLinks) */
+     ULONG FileInfoChangeNumber;
+     ULONG SecurityChangeNumber;
+     ULONG DirInfoChangeNumber;
+@@ -1851,6 +1852,8 @@ ULONG FspFileNodeDirInfoChangeNumber(FSP_FILE_NODE *FileNode)
+ {
+     return FileNode->DirInfoChangeNumber;
+ }
++VOID FspFileNodeInvalidateDirInfoByName(PDEVICE_OBJECT FsvolDeviceObject,
++    PUNICODE_STRING FileName);
+ VOID FspFileNodeInvalidateParentDirInfo(FSP_FILE_NODE *FileNode);
+ BOOLEAN FspFileNodeReferenceStreamInfo(FSP_FILE_NODE *FileNode, PCVOID *PBuffer, PULONG PSize);
+ VOID FspFileNodeSetStreamInfo(FSP_FILE_NODE *FileNode, PCVOID Buffer, ULONG Size);
+@@ -2038,6 +2041,18 @@ LOGICAL RtlEqualMemory(const VOID *Source1, const VOID *Source2, SIZE_T Length)
+     return Length == RtlCompareMemory(Source1, Source2, Length);
+ }
+ 
++/* FileLinkInformationEx's FILE_LINK_INFORMATION (Flags in place of ReplaceIfExists) and its flags are missing on
++ * some WDK's (ntifs.h guards them by _WIN32_WINNT_WIN10_RS5). The layout is FILE_LINK_INFORMATION's. */
++typedef struct
++{
++    ULONG Flags;
++    HANDLE RootDirectory;
++    ULONG FileNameLength;
++    WCHAR FileName[1];
++} FSP_FILE_LINK_INFORMATION_EX, *PFSP_FILE_LINK_INFORMATION_EX;
++#define FSP_FILE_LINK_POSIX_SEMANTICS           0x00000002
++#define FSP_FILE_LINK_IGNORE_READONLY_ATTRIBUTE 0x00000040
++
+ /* FILE_STAT_INFORMATION and FILE_STAT_LX_INFORMATION are missings on some WDK's. */
+ typedef struct
+ {
+diff --git a/src/sys/file.c b/src/sys/file.c
+index 34539052..7f70d3d4 100644
+--- a/src/sys/file.c
++++ b/src/sys/file.c
+@@ -83,7 +83,7 @@ VOID FspFileNodeSetDirInfo(FSP_FILE_NODE *FileNode, PCVOID Buffer, ULONG Size);
+ BOOLEAN FspFileNodeTrySetDirInfo(FSP_FILE_NODE *FileNode, PCVOID Buffer, ULONG Size,
+     ULONG DirInfoChangeNumber);
+ static VOID FspFileNodeInvalidateDirInfo(FSP_FILE_NODE *FileNode);
+-static VOID FspFileNodeInvalidateDirInfoByName(PDEVICE_OBJECT FsvolDeviceObject,
++VOID FspFileNodeInvalidateDirInfoByName(PDEVICE_OBJECT FsvolDeviceObject,
+     PUNICODE_STRING FileName);
+ VOID FspFileNodeInvalidateParentDirInfo(FSP_FILE_NODE *FileNode);
+ BOOLEAN FspFileNodeReferenceStreamInfo(FSP_FILE_NODE *FileNode, PCVOID *PBuffer, PULONG PSize);
+@@ -1698,6 +1698,7 @@ VOID FspFileNodeGetFileInfo(FSP_FILE_NODE *FileNode, FSP_FSCTL_FILE_INFO *FileIn
+     FileInfo->LastWriteTime = FileNode->LastWriteTime;
+     FileInfo->ChangeTime = FileNode->ChangeTime;
+     FileInfo->EaSize = FileNode->EaSize;
++    FileInfo->HardLinks = FileNode->HardLinks;
+ }
+ 
+ BOOLEAN FspFileNodeTryGetFileInfo(FSP_FILE_NODE *FileNode, FSP_FSCTL_FILE_INFO *FileInfo)
+@@ -1846,6 +1847,7 @@ VOID FspFileNodeSetFileInfo(FSP_FILE_NODE *FileNode, PFILE_OBJECT CcFileObject,
+     MainFileNode->LastWriteTime = FileInfo->LastWriteTime;
+     MainFileNode->ChangeTime = FileInfo->ChangeTime;
+     MainFileNode->EaSize = FileInfo->EaSize;
++    MainFileNode->HardLinks = FileInfo->HardLinks;
+ 
+     if (0 != CcFileObject)
+     {
+@@ -2115,7 +2117,7 @@ static VOID FspFileNodeInvalidateDirInfo(FSP_FILE_NODE *FileNode)
+     FspMetaCacheInvalidateItem(FsvolDeviceExtension->DirInfoCache, DirInfo);
+ }
+ 
+-static VOID FspFileNodeInvalidateDirInfoByName(PDEVICE_OBJECT FsvolDeviceObject,
++VOID FspFileNodeInvalidateDirInfoByName(PDEVICE_OBJECT FsvolDeviceObject,
+     PUNICODE_STRING FileName)
+ {
+     PAGED_CODE();
+diff --git a/src/sys/fileinfo.c b/src/sys/fileinfo.c
+index a5b74bde..dd50a112 100644
+--- a/src/sys/fileinfo.c
++++ b/src/sys/fileinfo.c
+@@ -89,6 +89,10 @@ static NTSTATUS FspFsvolSetRenameInformation(
+     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+ static NTSTATUS FspFsvolSetRenameInformationSuccess(
+     PIRP Irp, const FSP_FSCTL_TRANSACT_RSP *Response);
++static NTSTATUS FspFsvolSetLinkInformation(
++    PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
++static NTSTATUS FspFsvolSetLinkInformationSuccess(
++    PIRP Irp, const FSP_FSCTL_TRANSACT_RSP *Response);
+ static NTSTATUS FspFsvolSetInformation(
+     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+ FSP_IOPREP_DISPATCH FspFsvolSetInformationPrepare;
+@@ -130,6 +134,8 @@ FAST_IO_QUERY_OPEN FspFastIoQueryOpen;
+ #pragma alloc_text(PAGE, FspFsvolSetDispositionInformationFailure)
+ #pragma alloc_text(PAGE, FspFsvolSetRenameInformation)
+ #pragma alloc_text(PAGE, FspFsvolSetRenameInformationSuccess)
++#pragma alloc_text(PAGE, FspFsvolSetLinkInformation)
++#pragma alloc_text(PAGE, FspFsvolSetLinkInformationSuccess)
+ #pragma alloc_text(PAGE, FspFsvolSetInformation)
+ #pragma alloc_text(PAGE, FspFsvolSetInformationPrepare)
+ #pragma alloc_text(PAGE, FspFsvolSetInformationComplete)
+@@ -142,6 +148,18 @@ FAST_IO_QUERY_OPEN FspFastIoQueryOpen;
+ #pragma alloc_text(PAGE, FspFastIoQueryOpen)
+ #endif
+ 
++/*
++ * The number of names a file has: the file system's own count where the volume declares hard links and the file
++ * system reports one; otherwise 1, as before hard links, and always 1 for a directory.
++ */
++static inline ULONG FspFsvolNumberOfLinks(FSP_FILE_NODE *FileNode, const FSP_FSCTL_FILE_INFO *FileInfo)
++{
++    /* a directory has one name, as on NTFS, whatever a POSIX file system counts for it */
++    return !FileNode->IsDirectory &&
++        FspFsvolDeviceExtension(FileNode->FsvolDeviceObject)->VolumeParams.HardLinks &&
++        0 != FileInfo->HardLinks ? FileInfo->HardLinks : 1;
++}
++
+ enum
+ {
+     /* QueryInformation */
+@@ -188,7 +206,7 @@ static NTSTATUS FspFsvolQueryAllInformation(PFILE_OBJECT FileObject,
+ 
+     Info->StandardInformation.AllocationSize.QuadPart = FileInfo->AllocationSize;
+     Info->StandardInformation.EndOfFile.QuadPart = FileInfo->FileSize;
+-    Info->StandardInformation.NumberOfLinks = 1;
++    Info->StandardInformation.NumberOfLinks = FspFsvolNumberOfLinks(FileNode, FileInfo);
+     Info->StandardInformation.DeletePending = DeletePending || FileObject->DeletePending;
+     Info->StandardInformation.Directory = FileNode->IsDirectory;
+ 
+@@ -425,7 +443,7 @@ static NTSTATUS FspFsvolQueryStandardInformation(PFILE_OBJECT FileObject,
+ 
+     Info->AllocationSize.QuadPart = FileInfo->AllocationSize;
+     Info->EndOfFile.QuadPart = FileInfo->FileSize;
+-    Info->NumberOfLinks = 1;
++    Info->NumberOfLinks = FspFsvolNumberOfLinks(FileNode, FileInfo);
+     Info->DeletePending = DeletePending || FileObject->DeletePending;
+     Info->Directory = FileNode->IsDirectory;
+ 
+@@ -461,7 +479,7 @@ static NTSTATUS FspFsvolQueryStatBaseInformation(PFILE_OBJECT FileObject,
+     Info->FileAttributes = 0 != FileInfo->FileAttributes ?
+         FileInfo->FileAttributes : FILE_ATTRIBUTE_NORMAL;
+     Info->ReparseTag = FileInfo->ReparseTag;
+-    Info->NumberOfLinks = 1;
++    Info->NumberOfLinks = FspFsvolNumberOfLinks(FileNode, FileInfo);
+ 
+     *PBuffer = (PVOID)(Info + 1);
+ 
+@@ -495,7 +513,7 @@ static NTSTATUS FspFsvolQueryStatLxBaseInformation(PFILE_OBJECT FileObject,
+     Info->FileAttributes = 0 != FileInfo->FileAttributes ?
+         FileInfo->FileAttributes : FILE_ATTRIBUTE_NORMAL;
+     Info->ReparseTag = FileInfo->ReparseTag;
+-    Info->NumberOfLinks = 1;
++    Info->NumberOfLinks = FspFsvolNumberOfLinks(FileNode, FileInfo);
+ 
+     *PBuffer = (PVOID)(Info + 1);
+ 
+@@ -1978,6 +1996,260 @@ static NTSTATUS FspFsvolSetRenameInformationSuccess(
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS FspFsvolSetLinkInformation(
++    PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
++{
++    PAGED_CODE();
++
++    /*
++     * A hard link: a new name for an open file, made by the user-mode file system. The request reuses the rename
++     * request's layout: Info.Rename.NewFileName is the new name, Info.RenameEx.Flags carries ReplaceIfExists (bit 0)
++     * and, for FileLinkInformationEx on a volume that supports POSIX semantics, FILE_LINK_POSIX_SEMANTICS and
++     * FILE_LINK_IGNORE_READONLY_ATTRIBUTE, and Info.Rename.AccessToken is the requestor's token when a name may be
++     * replaced. Unlike a rename, no open file node changes its name: the file keeps the name it was opened by, and
++     * only the target name is checked for open handles, when it may be replaced.
++     */
++
++    NTSTATUS Result;
++    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
++    PFILE_OBJECT FileObject = IrpSp->FileObject;
++    PFILE_OBJECT TargetFileObject = IrpSp->Parameters.SetFile.FileObject;
++    FILE_INFORMATION_CLASS FileInformationClass = IrpSp->Parameters.SetFile.FileInformationClass;
++    BOOLEAN ReplaceIfExists = IrpSp->Parameters.SetFile.ReplaceIfExists;
++    UINT32 LinkFlags = !!ReplaceIfExists;
++    PFILE_LINK_INFORMATION Info = (PFILE_LINK_INFORMATION)Irp->AssociatedIrp.SystemBuffer;
++    ULONG Length = IrpSp->Parameters.SetFile.Length;
++    FSP_FILE_NODE *FileNode = FileObject->FsContext;
++    FSP_FILE_DESC *FileDesc = FileObject->FsContext2;
++    FSP_FILE_NODE *TargetFileNode = 0 != TargetFileObject ?
++        TargetFileObject->FsContext : 0;
++    FSP_FSCTL_TRANSACT_REQ *Request = 0;
++    UNICODE_STRING Remain, Suffix;
++    UNICODE_STRING NewFileName;
++    PUINT8 NewFileNameBuffer;
++    BOOLEAN AppendBackslash;
++    PSECURITY_SUBJECT_CONTEXT SecuritySubjectContext = 0;
++
++    ASSERT(FileNode == FileDesc->FileNode);
++    ASSERT(
++        FileLinkInformation == FileInformationClass ||
++        72/*FileLinkInformationEx*/ == FileInformationClass);
++    ASSERT(FsvolDeviceExtension->VolumeParams.HardLinks);
++
++    if (sizeof(FILE_LINK_INFORMATION) > Length)
++        return STATUS_INVALID_PARAMETER;
++    if (sizeof(WCHAR) > Info->FileNameLength)
++        return STATUS_INVALID_PARAMETER;
++    if (72/*FileLinkInformationEx*/ == FileInformationClass)
++    {
++        if (!FsvolDeviceExtension->VolumeParams.SupportsPosixUnlinkRename)
++            return STATUS_INVALID_PARAMETER;
++        LinkFlags |= ((PFSP_FILE_LINK_INFORMATION_EX)Info)->Flags &
++            (FSP_FILE_LINK_POSIX_SEMANTICS | FSP_FILE_LINK_IGNORE_READONLY_ATTRIBUTE);
++    }
++    if (FileNode->IsDirectory)
++        /* a directory has one name (MS-FSA 2.1.5.15.7) */
++        return STATUS_FILE_IS_A_DIRECTORY;
++    if (!FspFileNameIsValid(&FileNode->FileName,
++        FsvolDeviceExtension->VolumeParams.MaxComponentLength,
++        0, 0))
++        /* cannot link streams (WinFsp limitation, as rename) */
++        return STATUS_INVALID_PARAMETER;
++
++    if (0 != TargetFileNode)
++    {
++        if (!FspFileNodeIsValid(TargetFileNode))
++            return STATUS_INVALID_PARAMETER;
++
++        ASSERT(TargetFileNode->IsDirectory);
++    }
++
++retry:
++    FspFsvolDeviceFileRenameAcquireExclusive(FsvolDeviceObject);
++    FspFileNodeAcquireExclusive(FileNode, Full);
++
++    if (FileNode->PosixDelete || FspFileNodeDeletePending(FileNode))
++    {
++        /* a deleted file takes no new name (MS-FSA 2.1.5.15.7) */
++        Result = STATUS_ACCESS_DENIED;
++        goto unlock_exit;
++    }
++
++    if (0 == Request)
++    {
++        if (0 != TargetFileNode)
++            Remain = TargetFileNode->FileName;
++        else
++            FspFileNameSuffix(&FileNode->FileName, &Remain, &Suffix);
++
++        Suffix.Length = (USHORT)Info->FileNameLength;
++        Suffix.Buffer = Info->FileName;
++        /* remove any trailing backslash, as rename does */
++        if (sizeof(WCHAR) * 2/* not empty or root */ <= Suffix.Length &&
++            L'\\' == Suffix.Buffer[Suffix.Length / sizeof(WCHAR) - 1])
++            Suffix.Length -= sizeof(WCHAR);
++        /* if there is a backslash anywhere in the NewFileName get its suffix */
++        for (PWSTR P = Suffix.Buffer, EndP = P + Suffix.Length / sizeof(WCHAR); EndP > P; P++)
++            if (L'\\' == *P)
++            {
++                Suffix.Length = (USHORT)((EndP - P - 1) * sizeof(WCHAR));
++                Suffix.Buffer = P + 1;
++            }
++        Suffix.MaximumLength = Suffix.Length;
++
++        if (!FspFileNameIsValid(&Remain,
++                FsvolDeviceExtension->VolumeParams.MaxComponentLength,
++                0, 0) ||
++            !FspFileNameIsValid(&Suffix,
++                FsvolDeviceExtension->VolumeParams.MaxComponentLength,
++                0, 0))
++        {
++            /* cannot link to a stream name (WinFsp limitation, as rename) */
++            Result = STATUS_INVALID_PARAMETER;
++            goto unlock_exit;
++        }
++
++        AppendBackslash = sizeof(WCHAR) < Remain.Length;
++        NewFileName.Length = NewFileName.MaximumLength =
++            Remain.Length + AppendBackslash * sizeof(WCHAR) + Suffix.Length;
++
++        Result = FspIopCreateRequestEx(Irp, &FileNode->FileName,
++            NewFileName.Length + sizeof(WCHAR),
++            FspFsvolSetInformationRequestFini, &Request);
++        if (!NT_SUCCESS(Result))
++            goto unlock_exit;
++
++        NewFileNameBuffer = Request->Buffer + Request->FileName.Size;
++        NewFileName.Buffer = (PVOID)NewFileNameBuffer;
++
++        RtlCopyMemory(NewFileNameBuffer, Remain.Buffer, Remain.Length);
++        *(PWSTR)(NewFileNameBuffer + Remain.Length) = L'\\';
++        RtlCopyMemory(NewFileNameBuffer + Remain.Length + AppendBackslash * sizeof(WCHAR),
++            Suffix.Buffer, Suffix.Length);
++        *(PWSTR)(NewFileNameBuffer + NewFileName.Length) = L'\0';
++
++        Request->Kind = FspFsctlTransactSetInformationKind;
++        Request->Req.SetInformation.UserContext = FileNode->UserContext;
++        Request->Req.SetInformation.UserContext2 = FileDesc->UserContext2;
++        Request->Req.SetInformation.FileInformationClass = FileInformationClass;
++        Request->Req.SetInformation.Info.Rename.NewFileName.Offset = Request->FileName.Size;
++        Request->Req.SetInformation.Info.Rename.NewFileName.Size = NewFileName.Length + sizeof(WCHAR);
++        Request->Req.SetInformation.Info.RenameEx.Flags = LinkFlags;
++    }
++
++    /*
++     * A name that may be replaced cannot have open handles (MS-FSA 2.1.5.15.7), as for a rename's target. A name that
++     * may not be replaced is the file system's to refuse when it exists (STATUS_OBJECT_NAME_COLLISION).
++     */
++    if (ReplaceIfExists && 0 != FspFileNameCompare(&FileNode->FileName, &NewFileName, !FileDesc->CaseSensitive, 0))
++    {
++        Result = FspFileNodeRenameCheck(FsvolDeviceObject, Irp,
++            FileNode, FspFileNodeAcquireFull,
++            &NewFileName, FALSE,
++            0 != (FSP_FILE_LINK_POSIX_SEMANTICS & LinkFlags));
++        /* FspFileNodeRenameCheck releases FileNode and rename lock on failure */
++        if (STATUS_OPLOCK_BREAK_IN_PROGRESS == Result)
++            goto retry;
++        if (!NT_SUCCESS(Result))
++        {
++            if (STATUS_SHARING_VIOLATION != Result)
++                Result = STATUS_ACCESS_DENIED;
++            goto exit;
++        }
++    }
++
++    /* capture the security context: the file system checks the requestor may replace the name */
++    if (ReplaceIfExists)
++    {
++        SecuritySubjectContext = FspAlloc(sizeof *SecuritySubjectContext);
++        if (0 == SecuritySubjectContext)
++        {
++            Result = STATUS_INSUFFICIENT_RESOURCES;
++            goto unlock_exit;
++        }
++        SeCaptureSubjectContext(SecuritySubjectContext);
++    }
++
++    FspFsvolDeviceFileRenameSetOwner(FsvolDeviceObject, Request);
++    FspFileNodeSetOwner(FileNode, Full, Request);
++    FspIopRequestContext(Request, RequestFileNode) = FileNode;
++    FspIopRequestContext(Request, RequestDeviceObject) = FsvolDeviceObject;
++    FspIopRequestContext(Request, RequestSubjectContextOrAccessToken) = SecuritySubjectContext;
++
++    return FSP_STATUS_IOQ_POST;
++
++unlock_exit:
++    FspFileNodeRelease(FileNode, Full);
++    FspFsvolDeviceFileRenameRelease(FsvolDeviceObject);
++
++exit:
++    return Result;
++}
++
++static NTSTATUS FspFsvolSetLinkInformationSuccess(
++    PIRP Irp, const FSP_FSCTL_TRANSACT_RSP *Response)
++{
++    PAGED_CODE();
++
++    /*
++     * This completion runs on the file system's own thread, in its response, so it acquires no other file node: a
++     * request on that node may be waiting for that very thread (a file system may serve with one).
++     */
++
++    PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
++    PDEVICE_OBJECT FsvolDeviceObject = IrpSp->DeviceObject;
++    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
++    PFILE_OBJECT FileObject = IrpSp->FileObject;
++    FSP_FILE_NODE *FileNode = FileObject->FsContext;
++    FSP_FSCTL_TRANSACT_REQ *Request = FspIrpRequest(Irp);
++    FSP_FILE_NODE *ReplacedFileNode;
++    UNICODE_STRING NewFileName, Parent, Suffix;
++    BOOLEAN Deleted;
++
++    NewFileName.Length = NewFileName.MaximumLength =
++        Request->Req.SetInformation.Info.Rename.NewFileName.Size - sizeof(WCHAR);
++    NewFileName.Buffer = (PVOID)
++        (Request->Buffer + Request->Req.SetInformation.Info.Rename.NewFileName.Offset);
++
++    /* the file's link count changed: its next query asks the file system */
++    FspFileNodeInvalidateFileInfo(FileNode);
++
++    /*
++     * A name the link replaced may still have a file node, kept by a mapping (an open handle was refused by
++     * FspFileNodeRenameCheck); it no longer names the file at NewFileName. It leaves the name table as
++     * FspFileNodeRename makes a replaced name's leave it, under the table's lock alone.
++     */
++    FspFsvolDeviceLockContextTable(FsvolDeviceObject);
++    ReplacedFileNode = FspFsvolDeviceLookupContextByName(FsvolDeviceObject, &NewFileName);
++    if (0 != ReplacedFileNode && FileNode != ReplacedFileNode)
++    {
++        ReplacedFileNode->OpenCount = 0;
++        FspFsvolDeviceDeleteContextByName(FsvolDeviceObject, &ReplacedFileNode->FileName, &Deleted);
++        ASSERT(Deleted);
++        FspFileNodeDereference(ReplacedFileNode);
++    }
++    FspFsvolDeviceUnlockContextTable(FsvolDeviceObject);
++
++    /* the new name's directory: its cached listing is stale, and its watchers learn of the name */
++    FspFileNameSuffix(&NewFileName, &Parent, &Suffix);
++    FspFsvolDeviceInvalidateVolumeInfo(FsvolDeviceObject);
++    FspFileNodeInvalidateDirInfoByName(FsvolDeviceObject, &Parent);
++    FspNotifyReportChange(
++        FsvolDeviceExtension->NotifySync, &FsvolDeviceExtension->NotifyList,
++        &NewFileName,
++        (USHORT)((PUINT8)Suffix.Buffer - (PUINT8)NewFileName.Buffer),
++        0, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_ACTION_ADDED);
++
++    FspIopRequestContext(Request, RequestFileNode) = 0;
++    FspIopRequestContext(Request, RequestDeviceObject) = 0;
++    FspFileNodeReleaseOwner(FileNode, Full, Request);
++    FspFsvolDeviceFileRenameReleaseOwner(FsvolDeviceObject, Request);
++
++    Irp->IoStatus.Information = 0;
++
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS FspFsvolSetInformation(
+     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+ {
+@@ -1998,6 +2270,11 @@ static NTSTATUS FspFsvolSetInformation(
+     case FileRenameInformation:
+     case FileRenameInformationEx:
+         return FspFsvolSetRenameInformation(FsvolDeviceObject, Irp, IrpSp);
++    case FileLinkInformation:
++    case 72/*FileLinkInformationEx*/:
++        if (FspFsvolDeviceExtension(FsvolDeviceObject)->VolumeParams.HardLinks)
++            return FspFsvolSetLinkInformation(FsvolDeviceObject, Irp, IrpSp);
++        break;
+     }
+ 
+     NTSTATUS Result;
+@@ -2021,7 +2298,7 @@ static NTSTATUS FspFsvolSetInformation(
+             Result = FspFsvolSetEndOfFileInformation(FileObject, Buffer, Length, 0, 0);
+         break;
+     case FileLinkInformation:
+-        Result = STATUS_NOT_SUPPORTED;  /* no hard link support */
++        Result = STATUS_NOT_SUPPORTED;  /* the volume declares no hard links */
+         return Result;
+     case FilePositionInformation:
+         Result = FspFsvolSetPositionInformation(FileObject, Buffer, Length);
+@@ -2126,7 +2403,9 @@ NTSTATUS FspFsvolSetInformationPrepare(
+     FILE_INFORMATION_CLASS FileInformationClass = IrpSp->Parameters.SetFile.FileInformationClass;
+ 
+     if ((FileRenameInformation != FileInformationClass &&
+-        FileRenameInformationEx != FileInformationClass) ||
++        FileRenameInformationEx != FileInformationClass &&
++        FileLinkInformation != FileInformationClass &&
++        72/*FileLinkInformationEx*/ != FileInformationClass) ||
+         0 == FspIopRequestContext(Request, RequestSubjectContextOrAccessToken))
+         return STATUS_SUCCESS;
+ 
+@@ -2205,7 +2484,7 @@ NTSTATUS FspFsvolSetInformationComplete(
+         FSP_RETURN();
+     }
+ 
+-    /* special case FileDispositionInformation/FileRenameInformation */
++    /* special case FileDispositionInformation/FileRenameInformation/FileLinkInformation */
+     switch (FileInformationClass)
+     {
+     case FileDispositionInformation:
+@@ -2214,6 +2493,9 @@ NTSTATUS FspFsvolSetInformationComplete(
+     case FileRenameInformation:
+     case FileRenameInformationEx:
+         FSP_RETURN(Result = FspFsvolSetRenameInformationSuccess(Irp, Response));
++    case FileLinkInformation:
++    case 72/*FileLinkInformationEx*/:
++        FSP_RETURN(Result = FspFsvolSetLinkInformationSuccess(Irp, Response));
+     }
+ 
+     PFILE_OBJECT FileObject = IrpSp->FileObject;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,2696 @@
+//! The read commands' tests (A-613, §4.17.4 "4. Reads" and piece 7's second part). The golden vectors are transcripts
+//! of stock `svnserve` 1.15.0 answering stock `svn` 1.15.0 and scripted clients, recorded by
+//! `crates/svn/fixtures/reads/make-fixtures.py` (each file's SHA-256 in `SHA256SUMS`): the repository is rebuilt from
+//! the recorder's own record of it (`repository.txt`), every client command of a session is answered, and the answers
+//! must be `svnserve`'s, item for item, a property list's order aside (APR seeds `svnserve`'s hash order per table, so
+//! three recordings gave three orders; module documentation). Then the parameters, the dates and the refusals the
+//! transcripts do not reach, case by case, and hostile commands, which never panic.
+
+use super::*;
+use crate::authz::{Authz, Principal};
+use crate::handshake::ClientCapabilities;
+use crate::index::{Action, ChangedPath, CopySource, RevisionRecord, Text};
+use crate::ra_svn::{Bounds, Parsed, Parser};
+use crate::report::drive::{Call, Facts};
+use crate::report::editor::EditorWriter;
+use crate::svndiff::decode_all;
+use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
+use std::collections::BTreeMap;
+
+/// A transaction name of the form §4.17.4 item 3.1 gives.
+const TRANSACTION: &str = "0-1z";
+
+/// The recorded repository's UUID (`make-fixtures.py` `UUID`).
+const UUID: &str = "00000000-0000-4000-8000-00000000a613";
+
+/// The relay's address in every recorded URL (`make-fixtures.py` `PORT`): past it, a repository's name, then the
+/// session's base.
+const HOST: &str = "svn://127.0.0.1:36913/";
+
+/// The second recorded repository (`make-fixtures.py` `LOCKED`): the same history, read by an anonymous user under the
+/// authorization rules [`AUTHZ`].
+const LOCKED: &str = "locked";
+
+/// The rules the `locked` repository serves, as the recorder wrote them beside the transcripts.
+const AUTHZ: &str = include_str!("../../fixtures/reads/authz");
+
+/// The recorder's record of the repository the transcripts were made against.
+const REPOSITORY: &str = include_str!("../../fixtures/reads/repository.txt");
+
+/// One node of the green: its kind and its property list.
+type GreenNode = (NodeKind, PropertyList);
+
+/// The green the transcripts' repository holds: every revision's tree, the property lists, the texts and the revision
+/// properties.
+#[derive(Debug, Default)]
+struct Green {
+  /// Every revision's whole tree.
+  trees: Vec<BTreeMap<String, GreenNode>>,
+  /// The property lists, by identity.
+  lists: BTreeMap<ContentIdentity, PropertyPairs>,
+  /// The texts, by identity.
+  texts: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// Every revision's properties.
+  revisions: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
+/// The most bytes of a text the test green hands over at once: less than one of `get-file`'s strings, so each string
+/// is gathered from several pieces, as from a chunked text.
+const PIECE: usize = 1_000;
+
+impl Contents for Green {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    let tree = self.trees.get(usize::try_from(revision).ok()?)?;
+    if tree.get(directory)?.0 != NodeKind::Directory {
+      return None;
+    }
+    Some(
+      tree
+        .keys()
+        .filter(|place| place.as_str() != directory && parent(place) == Some(directory))
+        .filter_map(|place| Some(place.rsplit('/').next()?.to_owned()))
+        .collect(),
+    )
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self
+      .lists
+      .get(properties)?
+      .iter()
+      .find(|(name, _)| name == b"svn:mergeinfo")
+      .map(|(_, value)| value.as_slice())
+  }
+}
+
+impl Repository for Green {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    let properties = self.revisions.get(usize::try_from(revision).ok()?)?;
+    Some(
+      properties
+        .iter()
+        .map(|(name, value)| (name.as_slice(), value.as_slice()))
+        .collect(),
+    )
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    let list = self.lists.get(identity)?;
+    Some(
+      list
+        .iter()
+        .map(|(name, value)| (name.as_slice(), value.as_slice()))
+        .collect(),
+    )
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    let text = self.texts.get(identity)?;
+    let start = usize::try_from(offset).ok()?;
+    text.get(start..start.saturating_add(PIECE).min(text.len()))
+  }
+}
+
+/// The index and the green of the transcripts' repository.
+struct Fixture {
+  /// The index.
+  index: Index,
+  /// The green.
+  green: Green,
+}
+
+/// Bytes from hex.
+fn unhex(text: &str) -> Vec<u8> {
+  (0..text.len())
+    .step_by(2)
+    .map(|at| u8::from_str_radix(text.get(at..at + 2).unwrap(), 16).unwrap())
+    .collect()
+}
+
+/// A content identity counted from `number`.
+fn identity(number: usize) -> ContentIdentity {
+  let mut identity = [0_u8; 32];
+  identity[..8].copy_from_slice(&u64::try_from(number).unwrap().to_le_bytes());
+  identity
+}
+
+/// Whether `place` is `path` or beneath it.
+fn at_or_beneath(place: &str, path: &str) -> bool {
+  place == path
+    || path == "/"
+    || place
+      .strip_prefix(path)
+      .is_some_and(|rest| rest.starts_with('/'))
+}
+
+impl Fixture {
+  /// The repository `repository.txt` records, rebuilt revision by revision.
+  fn new() -> Self {
+    let mut fixture = Self {
+      index: Index::new(),
+      green: Green::default(),
+    };
+    let root = (NodeKind::Directory, PropertyList::Empty);
+    fixture
+      .green
+      .trees
+      .push(BTreeMap::from([("/".to_owned(), root)]));
+    fixture.green.revisions.push(Vec::new());
+    let mut rows: BTreeMap<u64, Vec<&str>> = BTreeMap::new();
+    for line in REPOSITORY.lines() {
+      let words: Vec<&str> = line.split(' ').collect();
+      match words[0] {
+        "revision" if words[1] == "0" => fixture.green.revisions[0]
+          .push((words[2].as_bytes().to_vec(), words[3].as_bytes().to_vec())),
+        "revision" => {
+          let revision = usize::try_from(words[1].parse::<u64>().unwrap()).unwrap();
+          while fixture.green.revisions.len() <= revision {
+            fixture.green.revisions.push(Vec::new());
+          }
+          fixture.green.revisions[revision].push((words[2].as_bytes().to_vec(), unhex(words[3])));
+        }
+        "row" => rows
+          .entry(words[1].parse().unwrap())
+          .or_default()
+          .push(line),
+        other => panic!("an unknown record {other}"),
+      }
+    }
+    for lines in rows.values() {
+      fixture.commit(lines);
+    }
+    fixture
+  }
+
+  /// Commits one revision's rows to the index and to the green's trees.
+  fn commit(&mut self, lines: &[&str]) {
+    let mut tree = self.green.trees.last().unwrap().clone();
+    let changes: Vec<ChangedPath> = lines.iter().map(|line| self.row(line, &mut tree)).collect();
+    self
+      .index
+      .append(
+        RevisionRecord {
+          transaction: TRANSACTION.to_owned(),
+          changes,
+        },
+        usize::MAX,
+      )
+      .unwrap();
+    self.green.trees.push(tree);
+  }
+
+  /// One row: its changed-path record, applied to `tree`.
+  fn row(&mut self, line: &str, tree: &mut BTreeMap<String, GreenNode>) -> ChangedPath {
+    let words: Vec<&str> = line.split(' ').collect();
+    let (path, kind) = (
+      words[2].to_owned(),
+      if words[3] == "dir" {
+        NodeKind::Directory
+      } else {
+        NodeKind::File
+      },
+    );
+    let action = match words[4] {
+      "add" => Action::Add,
+      "change" => Action::Modify,
+      "delete" => Action::Delete,
+      "replace" => Action::Replace,
+      other => panic!("an unknown action {other}"),
+    };
+    let field = |name: &str| {
+      words
+        .iter()
+        .position(|word| *word == name)
+        .map(|at| words[at + 1])
+    };
+    let copy_from = field("copy").map(|source| CopySource {
+      path: source.to_owned(),
+      revision: words[words.iter().position(|word| *word == "copy").unwrap() + 2]
+        .parse()
+        .unwrap(),
+    });
+    let had = tree.get(&path).is_some_and(|node| node.1.has_mergeinfo());
+    // FSFS records no property change for a node added with an empty property block (recorded: `/trunk A` with
+    // `( dir false false )` in the `log` session), so such a row carries no property list.
+    let properties = field("props").map(|list| self.list(list)).filter(|list| {
+      !(matches!(action, Action::Add | Action::Replace) && *list == PropertyList::Empty)
+    });
+    let text = field("text").map(|text| {
+      let bytes = unhex(text);
+      let (md5, sha1) = (unhex(field("md5").unwrap()), unhex(field("sha1").unwrap()));
+      let mut identity = [0_u8; 32];
+      identity[..16].copy_from_slice(&md5);
+      let size = u64::try_from(bytes.len()).unwrap();
+      self.green.texts.insert(identity, bytes);
+      Text {
+        identity,
+        md5: md5.try_into().unwrap(),
+        sha1: sha1.try_into().unwrap(),
+        size,
+      }
+    });
+    if matches!(action, Action::Delete | Action::Replace) {
+      tree.retain(|place, _| !at_or_beneath(place, &path));
+    }
+    match action {
+      Action::Delete => {}
+      _ if copy_from.is_some() => {
+        let source = copy_from.as_ref().unwrap();
+        let from = self.green.trees[usize::try_from(source.revision).unwrap()].clone();
+        for (place, node) in from
+          .iter()
+          .filter(|(place, _)| at_or_beneath(place, &source.path))
+        {
+          let moved = format!("{path}{}", place.get(source.path.len()..).unwrap());
+          tree.insert(moved, *node);
+        }
+      }
+      _ => {
+        let held = tree.get(&path).map_or(PropertyList::Empty, |node| node.1);
+        tree.insert(path.clone(), (kind, properties.unwrap_or(held)));
+      }
+    }
+    let has = properties.is_some_and(PropertyList::has_mergeinfo);
+    ChangedPath {
+      path,
+      action,
+      kind,
+      copy_from,
+      text,
+      properties,
+      mergeinfo_modified: properties.is_some() && (had || has),
+    }
+  }
+
+  /// A property list from its record, held under a fresh identity; an empty list is none.
+  fn list(&mut self, record: &str) -> PropertyList {
+    let properties: Vec<(Vec<u8>, Vec<u8>)> = record
+      .split(',')
+      .filter(|pair| !pair.is_empty())
+      .map(|pair| {
+        let (name, value) = pair.split_once('=').unwrap();
+        (unhex(name), unhex(value))
+      })
+      .collect();
+    if properties.is_empty() {
+      return PropertyList::Empty;
+    }
+    let has_mergeinfo = properties.iter().any(|(name, _)| name == b"svn:mergeinfo");
+    let identity = identity(self.green.lists.len() + 1);
+    self.green.lists.insert(identity, properties);
+    PropertyList::Held {
+      identity,
+      has_mergeinfo,
+    }
+  }
+}
+
+/// Every item of a transcript, as the item codec reads them.
+fn items(bytes: &[u8]) -> Vec<Value<'_>> {
+  let bounds = Bounds {
+    item_bytes: bytes.len(),
+    word_bytes: 64,
+    depth: 16,
+    nodes: bytes.len(),
+  };
+  let mut parser = Parser::new(bounds);
+  let mut found = Vec::new();
+  let mut at = 0;
+  while bytes[at..].iter().any(|byte| !byte.is_ascii_whitespace()) {
+    match parser.parse(&bytes[at..]).unwrap() {
+      Parsed::Item { value, consumed } => {
+        found.push(value);
+        at += consumed;
+      }
+      Parsed::NeedMore { .. } => panic!("a transcript ends inside an item"),
+    }
+  }
+  found
+}
+
+/// An answer written out with its property lists in name order, so `svnserve`'s seeded hash order compares as a set.
+fn normalized(value: &Value<'_>) -> String {
+  match value {
+    Value::List(items) => {
+      let pairs = !items.is_empty() && items.iter().all(|item| matches!(item, Value::List(_)));
+      let mut written: Vec<String> = items.iter().map(normalized).collect();
+      if pairs {
+        written.sort();
+      }
+      format!("( {}) ", written.concat())
+    }
+    other => {
+      let mut out = Vec::new();
+      write(other, &mut out).unwrap();
+      String::from_utf8_lossy(&out).into_owned()
+    }
+  }
+}
+
+/// The commands whose answers hold property lists, compared as sets.
+const PROPERTY_LISTS: [&str; 5] = [
+  "rev-proplist",
+  "get-iprops",
+  "get-dir",
+  "get-locations",
+  "get-file",
+];
+
+/// The room each slice of a streamed answer is given in the replays: one byte, so each slice is the least a slice
+/// may be, one item.
+const SLICE_ROOM: usize = 1;
+
+/// A command's outcome with a streamed answer written whole, a slice of [`SLICE_ROOM`] at a time; [`Outcome::Close`]
+/// where the stream ends the connection.
+fn drained(
+  outcome: Outcome,
+  fixture: &Fixture,
+  session: &Session<'_>,
+  out: &mut Vec<u8>,
+) -> Outcome {
+  let Outcome::Streaming(mut stream) = outcome else {
+    return outcome;
+  };
+  loop {
+    match stream
+      .resume(&fixture.index, &fixture.green, session, out, SLICE_ROOM)
+      .unwrap()
+    {
+      Progress::More => {}
+      Progress::Done => return Outcome::Answered,
+      Progress::Close => return Outcome::Close,
+    }
+  }
+}
+
+/// Replays a recorded session through the handler: each client command after the handshake answered, each answer
+/// `svnserve`'s, the commands in `elsewhere` (another piece's) skipped with their two items, a malformed command ending
+/// the session as `svnserve` ended it; answers how many commands were answered here.
+fn replay(name: &str, client: &[u8], server: &[u8], elsewhere: &[&str]) -> usize {
+  let fixture = Fixture::new();
+  // The recorded repositories hold no lock.
+  let no_locks = LockTable::new();
+  let answers = items(server);
+  let commands = items(client);
+  let (repository, mut base) = session_place(&commands[0]);
+  let capabilities = session_capabilities(&commands[0]);
+  let rules = locked_rules();
+  let authz = (repository == LOCKED).then_some(&rules);
+  let mut at = 4;
+  let mut answered = 0;
+  for command in commands.iter().skip(2) {
+    let word = command_word(name, command);
+    let session = Session {
+      base: &base,
+      uuid: UUID,
+      capabilities,
+      authz,
+      authentication: Authentication::Settled,
+    };
+    let mut out = Vec::new();
+    let locks = (&no_locks, AprTime(0));
+    let outcome = answer_lock_read(
+      &fixture.index,
+      &fixture.green,
+      locks,
+      &session,
+      command,
+      &mut out,
+    )
+    .unwrap_or_else(|| answer(&fixture.index, &fixture.green, &session, command, &mut out))
+    .unwrap();
+    match drained(outcome, &fixture, &session, &mut out) {
+      Outcome::Streaming(_) => panic!("{name}: a drained stream streams"),
+      Outcome::Answered => {
+        at = same_answer(name, word, &items(&out), &answers, at);
+        answered += 1;
+      }
+      Outcome::Elsewhere => {
+        assert!(
+          elsewhere.contains(&word),
+          "{name}: {word} is another piece's"
+        );
+        if word == "reparent" {
+          base = reparented(command);
+        }
+        at += 2;
+      }
+      Outcome::Close => {
+        at = same_answer(name, word, &items(&out), &answers, at);
+        return closed(name, word, at, answers.len(), answered);
+      }
+      Outcome::Authenticate => panic!("{name}: {word} asked for an authentication"),
+    }
+  }
+  assert_eq!(
+    at,
+    answers.len(),
+    "{name}: svnserve answered more than was replayed"
+  );
+  answered
+}
+
+/// The repository a recorded URL names and the session's base in it: the path past [`HOST`], its first name the
+/// repository's, the rest the base (`/` for none).
+fn repository_and_base(url: &[u8]) -> (String, String) {
+  let path = std::str::from_utf8(url)
+    .unwrap()
+    .strip_prefix(HOST)
+    .unwrap();
+  let (repository, rest) = path.split_once('/').unwrap_or((path, ""));
+  (repository.to_owned(), format!("/{rest}"))
+}
+
+/// The session's repository and base: the client's URL (its greeting's third item) as [`repository_and_base`] reads
+/// it.
+fn session_place(greeting: &Value<'_>) -> (String, String) {
+  let Value::List(parts) = greeting else {
+    panic!("a greeting that is no list");
+  };
+  let Some(Value::String(url)) = parts.get(2) else {
+    panic!("a greeting without its URL");
+  };
+  repository_and_base(url)
+}
+
+/// The rules the `locked` repository gives an anonymous reader, compiled as `svnserve` asks them (A-606): the
+/// repository's name, no user.
+fn locked_rules() -> PrincipalRules {
+  let rules = AUTHZ.as_bytes();
+  Authz::parse(rules, None, crate::authz::Bounds::of(rules, None))
+    .unwrap()
+    .rules(LOCKED.as_bytes(), Principal::Anonymous)
+}
+
+/// The session's base after a `reparent`, which another piece answers: the path of its URL past the repository's.
+fn reparented(command: &Value<'_>) -> String {
+  let Value::List(parts) = command else {
+    panic!("a reparent that is no command");
+  };
+  let Some(Value::List(params)) = parts.get(1) else {
+    panic!("a reparent without parameters");
+  };
+  let Some(Value::String(url)) = params.first() else {
+    panic!("a reparent without its URL");
+  };
+  repository_and_base(url).1
+}
+
+/// The capabilities the client's greeting announces (its second item, a list of words).
+fn session_capabilities(greeting: &Value<'_>) -> ClientCapabilities {
+  let Value::List(parts) = greeting else {
+    panic!("a greeting that is no list");
+  };
+  let Some(Value::List(words)) = parts.get(1) else {
+    panic!("a greeting without its capabilities");
+  };
+  let words: Vec<&str> = words
+    .iter()
+    .filter_map(|word| match word {
+      Value::Word(word) => Some(*word),
+      _ => None,
+    })
+    .collect();
+  ClientCapabilities::of(&words)
+}
+
+/// A `get-file-revs` answer as the tests compare it: each item written out with its property lists as sets, and each
+/// delta, its strings up to the empty one, as [`delta_normalized`] writes it.
+fn file_revs_normalized(items: &[Value<'_>]) -> Vec<String> {
+  let mut normalized_items = Vec::new();
+  let mut delta: Vec<&[u8]> = Vec::new();
+  for item in items {
+    match item {
+      Value::String([]) => {
+        normalized_items.push(delta_normalized(&delta));
+        delta.clear();
+      }
+      Value::String(bytes) => delta.push(bytes),
+      other => normalized_items.push(normalized(other)),
+    }
+  }
+  normalized_items
+}
+
+/// One delta's strings as the tests compare them: none is no delta; svndiff 0's are compared byte for byte, each
+/// string a write `svndiff.c` makes; svndiff 2's by how many strings there are and the version and windows they decode
+/// to, since an LZ4 section is `lz4_flex`'s where `svnserve`'s is liblz4's and may differ in bytes while it makes the
+/// same window.
+fn delta_normalized(strings: &[&[u8]]) -> String {
+  match strings.first() {
+    None => String::from("no delta"),
+    Some(header) if header.starts_with(b"SVN\x02") => format!(
+      "{} strings of {:?}",
+      strings.len(),
+      decode_all(&strings.concat())
+    ),
+    Some(_) => format!("{strings:?}"),
+  }
+}
+
+/// A client command's word.
+fn command_word<'a>(name: &str, command: &'a Value<'_>) -> &'a str {
+  match command {
+    Value::List(parts) => match parts.first() {
+      Some(Value::Word(word)) => word,
+      _ => panic!("{name}: a command without its word"),
+    },
+    _ => panic!("{name}: a client item that is no command"),
+  }
+}
+
+/// Holds one answer to `svnserve`'s items from `at`, property lists as sets for the commands that hold them; answers
+/// where the next answer starts, counted in items as written: a normalized answer may hold fewer entries than items
+/// (`get-file-revs` folds each delta's strings into one).
+fn same_answer(
+  name: &str,
+  word: &str,
+  mine: &[Value<'_>],
+  answers: &[Value<'_>],
+  at: usize,
+) -> usize {
+  let next = at + mine.len();
+  let theirs = &answers[at..next];
+  let (mine, theirs): (Vec<String>, Vec<String>) = if word == "get-file-revs" {
+    (file_revs_normalized(mine), file_revs_normalized(theirs))
+  } else if PROPERTY_LISTS.contains(&word) {
+    (
+      sorted(mine.iter().map(normalized).collect()),
+      sorted(theirs.iter().map(normalized).collect()),
+    )
+  } else {
+    (
+      mine.iter().map(|value| format!("{value:?}")).collect(),
+      theirs.iter().map(|value| format!("{value:?}")).collect(),
+    )
+  };
+  assert_eq!(mine, theirs, "{name}: {word}");
+  next
+}
+
+/// Items in byte order of their written form: an answer `svnserve` writes in hash order, compared as a set.
+fn sorted(mut written: Vec<String>) -> Vec<String> {
+  written.sort();
+  written
+}
+
+/// A malformed command: `svnserve` wrote nothing after it; answers the commands answered before it.
+fn closed(name: &str, word: &str, at: usize, answers: usize, answered: usize) -> usize {
+  assert_eq!(
+    at, answers,
+    "{name}: svnserve wrote after the malformed {word}"
+  );
+  answered
+}
+
+/// A recorded session's two transcripts.
+macro_rules! transcript {
+  ($name:literal) => {
+    (
+      $name,
+      include_bytes!(concat!("../../fixtures/reads/", $name, ".1.client.bin")).as_slice(),
+      include_bytes!(concat!("../../fixtures/reads/", $name, ".1.server.bin")).as_slice(),
+    )
+  };
+}
+
+/// One connection of a recorded session that made several.
+macro_rules! transcript_of {
+  ($name:literal, $connection:literal) => {
+    (
+      concat!($name, ".", $connection),
+      include_bytes!(concat!(
+        "../../fixtures/reads/",
+        $name,
+        ".",
+        $connection,
+        ".client.bin"
+      ))
+      .as_slice(),
+      include_bytes!(concat!(
+        "../../fixtures/reads/",
+        $name,
+        ".",
+        $connection,
+        ".server.bin"
+      ))
+      .as_slice(),
+    )
+  };
+}
+
+/// A-613 part 2: stock `svn mergeinfo --show-revs eligible` and `merged`, which the client computes itself from the
+/// server's `get-mergeinfo`, location segments and `log` over two and three connections: each connection answered as
+/// `svnserve` answered it, its `reparent` another piece's, the base it names taken as `svnserve` takes it.
+#[test]
+fn stock_mergeinfo_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript_of!("svn-mergeinfo-eligible", "1"), 2),
+    (transcript_of!("svn-mergeinfo-eligible", "2"), 5),
+    (transcript_of!("svn-mergeinfo-merged", "1"), 2),
+    (transcript_of!("svn-mergeinfo-merged", "2"), 2),
+    (transcript_of!("svn-mergeinfo-merged", "3"), 1),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(
+      replay(name, client, server, &["reparent"]),
+      commands,
+      "{name}"
+    );
+  }
+}
+
+/// A-613: the scripted sessions: every command answered as `svnserve` answered it (`get-latest-rev`, `get-dated-rev`
+/// at, between, before and after the revisions' dates and refusing two bogus dates; `rev-proplist` and `rev-prop`,
+/// one absent and one past the youngest; `check-path` and `stat` of the root, files, directories, absent paths, a
+/// deleted file before and after, a path to canonicalize, a revision past the youngest; `get-mergeinfo` inherited,
+/// explicit, nearest-ancestor, with descendants, through a copy, with no path, with a word Subversion does not know and
+/// of an absent path; `get-iprops` through a copy, of the root, of an absent path and without a revision), an unknown
+/// command refused with the session going on, and a malformed one ending it.
+#[test]
+fn the_scripted_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript!("latest-and-dated"), 7),
+    (transcript!("revision-properties"), 7),
+    (transcript!("check-path"), 8),
+    (transcript!("stat"), 7),
+    (transcript!("get-mergeinfo"), 9),
+    (transcript!("get-iprops"), 6),
+    (transcript!("get-dir"), 7),
+    (transcript!("get-locations"), 8),
+    (transcript!("hostile-locations"), 0),
+    (transcript!("get-file"), 18),
+    (transcript!("hostile-get-file"), 0),
+    (transcript!("list"), 16),
+    (transcript!("hostile-list"), 0),
+    (transcript!("get-location-segments"), 16),
+    (transcript!("get-deleted-rev"), 15),
+    (transcript!("log"), 16),
+    (transcript!("log-merged"), 7),
+    (transcript!("get-file-revs"), 13),
+    (transcript!("hostile-log-word"), 0),
+    (transcript!("hostile-log-path"), 0),
+    (transcript!("hostile-log-seven"), 0),
+    (transcript!("unknown-command"), 2),
+    (transcript!("hostile-malformed"), 0),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
+  }
+}
+
+/// A-613: stock `svn` 1.15.0's own sessions, `info` of the root and at a date, and a revision property read and
+/// listed, answered as `svnserve` answered them, the locks it asks for among them (A-693 part 1: none held).
+#[test]
+fn stock_svn_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript!("svn-info"), 4),
+    (transcript!("svn-info-dated"), 5),
+    (transcript!("svn-revprop-get"), 1),
+    (transcript!("svn-revprop-list"), 1),
+    (transcript!("svn-info-file"), 6),
+    (transcript!("svn-proplist-inherited"), 4),
+    (transcript!("svn-cat"), 4),
+    (transcript!("svn-cat-big"), 3),
+    (transcript!("svn-ls"), 3),
+    (transcript!("svn-log"), 4),
+    (transcript!("svn-log-g"), 4),
+    (transcript!("svn-blame"), 5),
+    (transcript!("svn-blame-g"), 5),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
+  }
+}
+
+/// A-613 part 2 (read access, A-606): stock `svn` 1.15.0's own sessions against the `locked` repository, read by an
+/// anonymous user under its rules (`ls -v -R`, `log -v` and `log -g` of `/trunk`, `blame -g` of `/trunk/a.txt`, `cat`
+/// of the readable `/trunk/dir/b.txt` and of the hidden `/branches/b1/a.txt`, `proplist -v --show-inherited-props` of
+/// `/trunk/dir/b.txt`), answered as `svnserve` answered them, `log -g` refused "Item is not readable" (220001) and the
+/// hidden file's `cat` "Authorization failed" (170001) among them, and the locks `ls` asks for (A-693 part 1: none held).
+#[test]
+fn stock_locked_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript!("locked-svn-ls"), 3),
+    (transcript!("locked-svn-log"), 4),
+    (transcript!("locked-svn-log-g"), 4),
+    (transcript!("locked-svn-blame-g"), 5),
+    (transcript!("locked-svn-cat"), 3),
+    (transcript!("locked-svn-cat-denied"), 2),
+    (transcript!("locked-svn-proplist"), 4),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
+  }
+}
+
+/// A-613: the recorder's `SHA256SUMS` names every transcript the tests read, the recorder's record of the repository
+/// and the `locked` repository's rules; each sum is held to its file's bytes by `crate::fixture_sums`.
+#[test]
+fn every_fixture_has_its_recorded_sum() {
+  let sums = include_str!("../../fixtures/reads/SHA256SUMS");
+  for name in [
+    "locked-reads",
+    "locked-log",
+    "locked-file-revs",
+    "locked-file-revs-abort",
+    "locked-svn-ls",
+    "locked-svn-log",
+    "locked-svn-log-g",
+    "locked-svn-blame-g",
+    "locked-svn-cat",
+    "locked-svn-cat-denied",
+    "locked-svn-proplist",
+    "get-file-revs",
+    "get-file-revs-svndiff0",
+    "svn-blame",
+    "svn-blame-g",
+    "svn-mergeinfo-eligible",
+    "svn-mergeinfo-merged",
+    "log-merged",
+    "svn-log-g",
+    "log",
+    "hostile-log-word",
+    "hostile-log-path",
+    "hostile-log-seven",
+    "svn-log",
+    "get-deleted-rev",
+    "get-location-segments",
+    "list",
+    "hostile-list",
+    "svn-ls",
+    "get-file",
+    "hostile-get-file",
+    "svn-cat",
+    "svn-cat-big",
+    "get-dir",
+    "get-locations",
+    "hostile-locations",
+    "svn-info-file",
+    "svn-proplist-inherited",
+    "latest-and-dated",
+    "revision-properties",
+    "check-path",
+    "stat",
+    "get-mergeinfo",
+    "get-iprops",
+    "unknown-command",
+    "hostile-malformed",
+    "svn-info",
+    "svn-info-dated",
+    "svn-revprop-get",
+    "svn-revprop-list",
+  ] {
+    for side in ["client", "server"] {
+      let file = format!("  {name}.1.{side}.bin");
+      assert!(
+        sums
+          .lines()
+          .any(|line| line.ends_with(&file) && line.len() == 64 + file.len()),
+        "{file}"
+      );
+    }
+  }
+  for file in [
+    "svn-mergeinfo-eligible.2.client.bin",
+    "svn-mergeinfo-eligible.2.server.bin",
+    "svn-mergeinfo-merged.2.client.bin",
+    "svn-mergeinfo-merged.2.server.bin",
+    "svn-mergeinfo-merged.3.client.bin",
+    "svn-mergeinfo-merged.3.server.bin",
+  ] {
+    assert!(
+      sums
+        .lines()
+        .any(|line| line.ends_with(&format!("  {file}"))),
+      "{file}"
+    );
+  }
+  assert!(sums.lines().any(|line| line.ends_with("  repository.txt")));
+  assert!(sums.lines().any(|line| line.ends_with("  authz")));
+}
+
+/// One command's answer against the fixture's repository.
+fn answered(command: &[u8]) -> (Outcome, Vec<u8>) {
+  let fixture = Fixture::new();
+  let value = items(command).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(
+    &fixture.index,
+    &fixture.green,
+    &ROOT_SESSION,
+    &value,
+    &mut out,
+  )
+  .unwrap();
+  (outcome, out)
+}
+
+/// A-613: parameters as `svn_ra_svn__parse_tuple` reads them: missing or of the wrong kind ends the connection, nothing
+/// written; parameters past the prototype are ignored; a C string ends at its first NUL; a number past 2^63 - 1 is a
+/// negative revision, refused as invalid after the authentication request.
+#[test]
+fn parameters_are_read_as_svn_ra_svn_parse_tuple_reads_them() {
+  for malformed in [
+    b"( check-path ( ) ) ".as_slice(),
+    b"( check-path ( 5:trunk ) ) ",
+    b"( check-path ( 5:trunk 3 ) ) ",
+    b"( check-path ( 5:trunk ( word ) ) ) ",
+    b"( stat ( 7 ( ) ) ) ",
+    b"( rev-prop ( 1 ) ) ",
+    b"( get-dated-rev ( word ) ) ",
+    b"( get-mergeinfo ( ( 5 ) ( ) inherited false ) ) ",
+    b"( get-mergeinfo ( ( 5:trunk ) ( ) inherited maybe ) ) ",
+    b"( get-iprops ( 5:trunk ) ) ",
+    b"( get-latest-rev ) ",
+    b"word ",
+    b"( 5:check ( ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+  let (_, extra) = answered(b"( check-path ( 5:trunk ( 1 ) extra 7 ( ) ) ) ");
+  assert_eq!(extra, b"( success ( ( ) 0: ) ) ( success ( dir ) ) ");
+  let (_, nul) = answered(b"( check-path ( 11:trunk\0a.txt ( ) ) ) ");
+  assert_eq!(nul, b"( success ( ( ) 0: ) ) ( success ( dir ) ) ");
+  let (_, huge) = answered(b"( rev-proplist ( 18446744073709551615 ) ) ");
+  assert_eq!(
+    huge,
+    b"( success ( ( ) 0: ) ) ( failure ( ( 160006 28:Invalid revision number '-1' 0: 0 ) ) ) "
+  );
+}
+
+/// A-613: commands another piece answers are handed back untouched, and the main set's every other command name is
+/// unknown, refused with no authentication request first.
+#[test]
+fn other_pieces_commands_are_handed_back_and_unknown_ones_refused() {
+  for name in ELSEWHERE {
+    let command = format!("( {name} ( ) ) ");
+    assert_eq!(
+      answered(command.as_bytes()),
+      (Outcome::Elsewhere, Vec::new()),
+      "{name}"
+    );
+  }
+  let (outcome, out) = answered(b"( get-latest ( ) ) ");
+  assert_eq!(outcome, Outcome::Answered);
+  assert_eq!(
+    out,
+    b"( failure ( ( 210001 35:Unknown editor command 'get-latest' 0: 0 ) ) ) "
+  );
+}
+
+/// A-613: dates as `svn_time_from_cstring` and APR read them and `svn_time_to_cstring` writes them: the format's
+/// fields in any width, digits alone (no sign, no space), a month outside 1-12 or a time before 1970 refused, every
+/// other field taken as it is (the 32nd of January is the 1st of February), microseconds kept; and the dated revision
+/// search's edges.
+#[test]
+fn dates_are_read_and_written_as_subversion_reads_and_writes_them() {
+  let read: [(&str, Option<&str>); 15] = [
+    (
+      "1970-01-01T00:00:00.000000Z",
+      Some("1970-01-01T00:00:00.000000Z"),
+    ),
+    (
+      "1970-01-01T00:00:01.000002Z",
+      Some("1970-01-01T00:00:01.000002Z"),
+    ),
+    (
+      "2026-01-03T03:00:00.000000Z",
+      Some("2026-01-03T03:00:00.000000Z"),
+    ),
+    ("2026-1-3T3:0:0.5Z", Some("2026-01-03T03:00:00.000005Z")),
+    (
+      "2026-01-32T00:00:00.000000Z",
+      Some("2026-02-01T00:00:00.000000Z"),
+    ),
+    (
+      "2024-02-29T23:59:59.999999Z",
+      Some("2024-02-29T23:59:59.999999Z"),
+    ),
+    (
+      "2100-03-01T00:00:00.000000Z",
+      Some("2100-03-01T00:00:00.000000Z"),
+    ),
+    ("2026-00-01T00:00:00.000000Z", None),
+    ("2026-13-01T00:00:00.000000Z", None),
+    ("1969-12-31T23:59:59.000000Z", None),
+    ("2026-01-04", None),
+    ("2026-01-04T00:00:00Z", None),
+    (" 2026-01-04T00:00:00.000000Z", None),
+    ("+2026-01-04T00:00:00.000000Z", None),
+    ("", None),
+  ];
+  for (text, written) in read {
+    assert_eq!(
+      parse_time(text.as_bytes()).map(format_time).as_deref(),
+      written,
+      "{text}"
+    );
+  }
+  assert_eq!(parse_time(b"1970-01-01T00:00:01.000002Z"), Some(1_000_002));
+  let dated = [
+    ("2026-01-01T00:00:00.000000Z", 0),
+    ("2026-01-01T01:00:00.000000Z", 1),
+    ("2026-01-07T07:00:00.000000Z", 7),
+    ("2026-01-06T06:00:00.000001Z", 6),
+  ];
+  for (date, revision) in dated {
+    let command = format!("( get-dated-rev ( {}:{date} ) ) ", date.len());
+    let (_, out) = answered(command.as_bytes());
+    let expected = format!("( success ( ( ) 0: ) ) ( success ( {revision} ) ) ");
+    assert_eq!(String::from_utf8(out).unwrap(), expected, "{date}");
+  }
+}
+
+/// The session at the repository's root.
+const ROOT_SESSION: Session<'static> = Session {
+  base: "/",
+  uuid: UUID,
+  capabilities: STOCK_CAPABILITIES,
+  authz: None,
+  authentication: Authentication::Settled,
+};
+
+/// What stock `svn` 1.15.0 announces (recorded: every session's greeting): `svndiff1`, `accepts-svndiff2`,
+/// `absent-entries`, `depth`, `mergeinfo` and `log-revprops` among them.
+const STOCK_CAPABILITIES: ClientCapabilities = ClientCapabilities {
+  svndiff1: true,
+  accepts_svndiff2: true,
+  absent_entries: true,
+  depth: true,
+  mergeinfo: true,
+  log_revprops: true,
+};
+
+/// One command's whole answer against `repository`, a streamed rest resumed in `room` until it is whole and once more;
+/// answers the outcome, the answer and how many slices the stream took.
+fn streamed<R: Repository>(
+  fixture: &Fixture,
+  repository: &R,
+  command: &[u8],
+  room: usize,
+) -> (Outcome, Vec<u8>, usize) {
+  let value = items(command).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(&fixture.index, repository, &ROOT_SESSION, &value, &mut out).unwrap();
+  let Outcome::Streaming(mut stream) = outcome.clone() else {
+    return (outcome, out, 0);
+  };
+  let mut slices = 1;
+  while stream
+    .resume(&fixture.index, repository, &ROOT_SESSION, &mut out, room)
+    .unwrap()
+    == Progress::More
+  {
+    slices += 1;
+  }
+  let whole = out.len();
+  let again = stream.resume(&fixture.index, repository, &ROOT_SESSION, &mut out, room);
+  assert_eq!((again, out.len()), (Ok(Progress::Done), whole));
+  (outcome, out, slices)
+}
+
+/// The lengths of an answer's strings, in order.
+fn string_lengths(answer: &[u8]) -> Vec<usize> {
+  items(answer)
+    .iter()
+    .filter_map(|item| match item {
+      Value::String(bytes) => Some(bytes.len()),
+      _ => None,
+    })
+    .collect()
+}
+
+/// A-613 part 2 (`get-file`, item 11): a file's text streams a slice at a time in the room the caller gives, one
+/// string a slice in a room of one byte and the end in one more, the whole answer in one slice in a room past its
+/// size, the same bytes either way; a finished stream writes nothing more.
+#[test]
+fn a_files_text_streams_a_slice_at_a_time_in_the_room_given() {
+  let fixture = Fixture::new();
+  let command = b"( get-file ( 13:trunk/big.txt ( 9 ) false true ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(narrow, wide);
+  assert_eq!((narrow_slices, wide_slices), (4, 1));
+  assert_eq!(string_lengths(&wide), [4_096, 4_096, 1_818, 0]);
+}
+
+/// A-613 part 2 (`get-file`): a file added without a text has the MD5 of no bytes, the checksum
+/// `svn_fs_file_checksum` computes when forced to, and its text is the empty string alone.
+#[test]
+fn a_file_without_a_text_has_the_md5_of_no_bytes() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/blank.txt file add"]);
+  let command = b"( get-file ( 15:trunk/blank.txt ( ) false true ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, 1);
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    concat!(
+      "( success ( ( ) 0: ) ) ",
+      "( success ( ( 32:d41d8cd98f00b204e9800998ecf8427e ) 12 ( ) ) ) ",
+      "0: ( success ( ) ) "
+    )
+  );
+}
+
+/// The fixture's green with every text lost past its first `kept` bytes.
+struct Torn<'green> {
+  /// The green.
+  green: &'green Green,
+  /// The bytes of each text still held.
+  kept: u64,
+}
+
+impl Contents for Torn<'_> {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    self.green.entries(directory, revision)
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self.green.mergeinfo_value(properties)
+  }
+}
+
+impl Repository for Torn<'_> {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    self.green.revision_properties(revision)
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    self.green.properties(identity)
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    let left = usize::try_from(self.kept.checked_sub(offset)?).ok()?;
+    let piece = self.green.text(identity, offset)?;
+    if left == 0 {
+      return None;
+    }
+    piece.get(..piece.len().min(left))
+  }
+}
+
+/// A-613 part 2 (`get-file`): a text the index names and the green does not hold ends after what was read with the
+/// empty string and a refusal, `Filesystem is corrupt`, as `svnserve` ends a read that fails.
+#[test]
+fn a_text_the_green_does_not_hold_ends_with_a_refusal() {
+  let fixture = Fixture::new();
+  let torn = Torn {
+    green: &fixture.green,
+    kept: 5_000,
+  };
+  let command = b"( get-file ( 13:trunk/big.txt ( 9 ) false true ) ) ";
+  let (_, out, _) = streamed(&fixture, &torn, command, usize::MAX);
+  assert_eq!(string_lengths(&out), [4_096, 0]);
+  assert!(out.ends_with(b"0: ( failure ( ( 160004 21:Filesystem is corrupt 0: 0 ) ) ) "));
+}
+
+/// A-613 part 2 (`get-file`): its parameters as `svn_ra_svn__parse_tuple(params, "c(?r)bb?B")` reads them: a missing
+/// boolean, a fifth item that is no boolean, a revision that is no list, each end the connection with nothing written.
+#[test]
+fn get_file_parameters_are_read_as_svn_ra_svn_parse_tuple_reads_them() {
+  for malformed in [
+    b"( get-file ( 11:trunk/a.txt ( ) true ) ) ".as_slice(),
+    b"( get-file ( 11:trunk/a.txt ( ) true true maybe ) ) ",
+    b"( get-file ( 11:trunk/a.txt ( ) true true 1 ) ) ",
+    b"( get-file ( 11:trunk/a.txt ( ) 1 true ) ) ",
+    b"( get-file ( 11:trunk/a.txt 2 true true ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+}
+
+/// The fixture's green with one revision's `svn:date` replaced by a value that does not parse.
+struct Garbled<'green> {
+  /// The green.
+  green: &'green Green,
+  /// The revision whose date is garbled.
+  revision: Revision,
+}
+
+impl Contents for Garbled<'_> {
+  fn entries(&self, directory: &str, revision: Revision) -> Option<Vec<String>> {
+    self.green.entries(directory, revision)
+  }
+
+  fn mergeinfo_value(&self, properties: &ContentIdentity) -> Option<&[u8]> {
+    self.green.mergeinfo_value(properties)
+  }
+}
+
+impl Repository for Garbled<'_> {
+  fn revision_properties(&self, revision: Revision) -> Option<Vec<(&[u8], &[u8])>> {
+    let properties = self.green.revision_properties(revision)?;
+    if revision != self.revision {
+      return Some(properties);
+    }
+    let garbled: &[u8] = b"not a date";
+    Some(
+      properties
+        .into_iter()
+        .map(|(name, value)| (name, if name == b"svn:date" { garbled } else { value }))
+        .collect(),
+    )
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    self.green.properties(identity)
+  }
+
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    self.green.text(identity, offset)
+  }
+}
+
+/// A-613 part 2 (`list`): a listing streams a slice at a time, each slice ending once what it wrote and the entries it
+/// visited reach the room: the same bytes in a room of one byte as in one past the answer.
+#[test]
+fn a_listing_streams_a_slice_at_a_time_in_the_room_given() {
+  let fixture = Fixture::new();
+  let command = b"( list ( 0: ( ) infinity ( kind size ) ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(narrow, wide);
+  assert_eq!(wide_slices, 1);
+  let dirents = items(&wide).len().saturating_sub(3);
+  assert!(
+    narrow_slices > dirents,
+    "{narrow_slices} slices, {dirents} dirents"
+  );
+}
+
+/// A-613 part 2 (`list`): an empty pattern list answers at once, as `svn_repos_list` returns before any walk ("We
+/// don't want the server to waste time here"): one slice even in a room of one byte, nothing but `done` and the
+/// answer.
+#[test]
+fn an_empty_pattern_list_answers_without_a_walk() {
+  let fixture = Fixture::new();
+  let command = b"( list ( 0: ( ) infinity ( kind ) ( ) ) ) ";
+  let (_, out, slices) = streamed(&fixture, &fixture.green, command, 1);
+  assert_eq!(
+    (out.as_slice(), slices),
+    (
+      b"( success ( ( ) 0: ) ) done ( success ( ) ) ".as_slice(),
+      1
+    )
+  );
+}
+
+/// A-613 part 2 (`list`): `fill_dirent` parses each created revision's date, and one that does not parse refuses the
+/// listing after the dirents before it, with `done` then "Bogus date"; with no field beyond the kind asked no date is
+/// read and the listing is whole.
+#[test]
+fn a_date_that_does_not_parse_refuses_the_listing_after_done() {
+  let fixture = Fixture::new();
+  let garbled = Garbled {
+    green: &fixture.green,
+    revision: 8,
+  };
+  let command = b"( list ( 5:trunk ( 11 ) immediates ( kind time ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &garbled, command, usize::MAX);
+  let out = String::from_utf8(out).unwrap();
+  assert!(
+    out.ends_with(
+      "( 6:/trunk dir ( ) ( ) ( ) ( 27:2026-01-10T10:00:00.000000Z ) ( ) ) done \
+       ( failure ( ( 125003 10:Bogus date 0: 0 ) ) ) "
+    ),
+    "{out}"
+  );
+  let command = b"( list ( 5:trunk ( 11 ) immediates ( kind ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &garbled, command, usize::MAX);
+  assert!(out.ends_with(b"( 16:/trunk/empty.txt file ) done ( success ( ) ) "));
+}
+
+/// A-613 part 2 (`list`): its parameters as `svn_ra_svn__parse_tuple(params, "c(?r)w?l?l")`, `parse_dirent_fields`
+/// and the pattern loop read them: no depth word, a depth that is a string, fields or patterns that are no list, a
+/// field that is no word and a pattern that is no string each end the connection with nothing written; a pattern is
+/// read to its first NUL.
+#[test]
+fn list_parameters_are_read_as_svnserve_reads_them() {
+  for malformed in [
+    b"( list ( 5:trunk ( ) ) ) ".as_slice(),
+    b"( list ( 5:trunk ( ) 8:infinity ) ) ",
+    b"( list ( 5:trunk ( ) infinity kind ) ) ",
+    b"( list ( 5:trunk ( ) infinity ( kind ) 3:a.* ) ) ",
+    b"( list ( 5:trunk ( ) infinity ( kind ) ( pattern ) ) ) ",
+    b"( list ( 5:trunk ( ) infinity ( 4:kind ) ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+  let fixture = Fixture::new();
+  let command = b"( list ( 5:trunk ( ) immediates ( kind ) ( 7:read*\0x ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    out,
+    b"( success ( ( ) 0: ) ) ( 17:/trunk/README.TXT file ) done ( success ( ) ) "
+  );
+}
+
+/// A-613 part 2 (`get-location-segments`): its parameters as `svn_ra_svn__parse_tuple(params, "c(?r)(?r)(?r)")`
+/// reads them, a missing or bare revision ending the connection with nothing written; and its walk streams a turn a
+/// slice in a room of one byte, the same bytes as in a room past the answer.
+#[test]
+fn location_segments_are_read_as_svnserve_reads_them_and_stream() {
+  for malformed in [
+    b"( get-location-segments ( 11:trunk/a.txt ( ) ( ) ) ) ".as_slice(),
+    b"( get-location-segments ( 11:trunk/a.txt 5 ( ) ( ) ) ) ",
+    b"( get-location-segments ( 11:trunk/a.txt ( ) ( 3 ) 0 ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+  let fixture = Fixture::new();
+  let command = b"( get-location-segments ( 17:branches/b1/a.txt ( 11 ) ( 11 ) ( 0 ) ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!((narrow, narrow_slices, wide_slices), (wide, 3, 1));
+}
+
+/// A-613 part 2 (`get-deleted-rev`): its parameters as `svn_ra_svn__parse_tuple(params, "crr")` reads them: a missing
+/// revision, a revision in a list and a path that is no string each end the connection with nothing written.
+#[test]
+fn deleted_revision_parameters_are_read_as_svnserve_reads_them() {
+  for malformed in [
+    b"( get-deleted-rev ( 15:trunk/dir/b.txt 5 ) ) ".as_slice(),
+    b"( get-deleted-rev ( 15:trunk/dir/b.txt ( 5 ) 11 ) ) ",
+    b"( get-deleted-rev ( 5 1 11 ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+}
+
+/// A-613 part 2 (`log`): its parameters as `vparse_tuple` reads `"l(?r)(?r)bb?n?Bwl"`: four, seven or eight items, a
+/// limit that is no number, a word for the merged flag that is no boolean, a revision-property name that is no string
+/// and a word that is neither `all-revprops` nor `revprops` each end the connection with nothing written.
+#[test]
+fn log_parameters_are_read_as_vparse_tuple_reads_them() {
+  for malformed in [
+    b"( log ( ( 5:trunk ) ( ) ( ) false ) ) ".as_slice(),
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 false ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 false revprops ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false word ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 maybe revprops ( ) ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 false revprops ( name ) ) ) ",
+    b"( log ( ( 5:trunk ) ( ) ( ) false false 0 false props ( ) ) ) ",
+  ] {
+    assert_eq!(
+      answered(malformed),
+      (Outcome::Close, Vec::new()),
+      "{}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+}
+
+/// A-613 part 2 (`log`): the log streams a revision a step, the same bytes in a room of one byte as in a room past the
+/// answer, with merged revisions as without.
+#[test]
+fn a_log_streams_a_revision_a_step() {
+  let fixture = Fixture::new();
+  let command = b"( log ( ( 0: ) ( 11 ) ( 0 ) false false 0 false revprops ( ) ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(narrow, wide);
+  assert!(narrow_slices > 12 && wide_slices == 1, "{narrow_slices}");
+  let command =
+    b"( log ( ( 7:tags/t1 5:trunk ) ( 11 ) ( 0 ) true false 0 true all-revprops ( ) ) ) ";
+  let (_, narrow, narrow_slices) = streamed(&fixture, &fixture.green, command, 1);
+  let (_, wide, wide_slices) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(narrow, wide);
+  assert!(narrow_slices > 10 && wide_slices == 1, "{narrow_slices}");
+}
+
+/// A-613 part 2 (`log`): `fill_log_entry` hands over every revision property when the names asked are as many as the
+/// revision's and each is among them (`log.c`: `revprops->nelts == apr_hash_count(r_props)`, then each name looked up),
+/// so a request naming `svn:log` twice and `svn:author` once gets `svn:date` too; naming one of them alone, the others
+/// are left out.
+#[test]
+fn revision_properties_are_gathered_as_fill_log_entry_gathers_them() {
+  let fixture = Fixture::new();
+  let twice = b"( log ( ( 0: ) ( 1 ) ( 1 ) false false 0 false revprops ( 7:svn:log 7:svn:log 10:svn:author ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, twice, usize::MAX);
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    concat!(
+      "( success ( ( ) 0: ) ) ( ( ) 1 ( 5:alice ) ( 27:2026-01-01T01:00:00.000000Z ) ",
+      "( 15:the first trees ) false false 0 ( ) false ) done ( success ( ) ) "
+    )
+  );
+  let once = b"( log ( ( 0: ) ( 1 ) ( 1 ) false false 0 false revprops ( 7:svn:log ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, once, usize::MAX);
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    concat!(
+      "( success ( ( ) 0: ) ) ( ( ) 1 ( ) ( ) ( 15:the first trees ) false false 0 ( ) false ) ",
+      "done ( success ( ) ) "
+    )
+  );
+}
+
+/// The revisions of a log's entries in order, each with whether it closes a revision's children (`invalid-revnum`).
+fn entry_revisions(out: &[u8]) -> Vec<(u64, bool)> {
+  items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match (parts.get(1), parts.get(6)) {
+        (Some(Value::Number(revision)), Some(Value::Word(invalid))) => {
+          Some((*revision, *invalid == "true"))
+        }
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect()
+}
+
+/// A-613 part 2 (`log`, `send_log`'s `nested_merges`): oldest first no search is recorded, so r4, merged into trunk
+/// in r5 and taken from the tag in r11, is reached twice; it is sent once, as the first child of r5, and r11's walk of
+/// it ends with the entry closing its children alone.
+#[test]
+fn a_merged_revision_is_sent_once() {
+  let fixture = Fixture::new();
+  let command = b"( log ( ( 7:tags/t1 5:trunk ) ( 0 ) ( 11 ) false false 0 true revprops ( ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  let revisions = entry_revisions(&out);
+  let fours = revisions
+    .iter()
+    .filter(|entry| **entry == (4, false))
+    .count();
+  assert_eq!(fours, 1, "{revisions:?}");
+  let eleven = revisions
+    .iter()
+    .position(|entry| *entry == (11, false))
+    .unwrap();
+  assert_eq!(revisions.get(eleven + 1), Some(&(0, true)), "{revisions:?}");
+}
+
+/// A-613 part 2 (`log`, `handle_merged_revisions`): a revision merging two separate runs from one source, here r12
+/// adding r3 and r9 of `/branches/b1` to trunk's `/branches/b1:4`, has its runs sorted and walked from the last: r9's
+/// entry before r3's, then the entry closing them.
+#[test]
+fn a_merge_of_two_runs_walks_the_younger_run_first() {
+  let mut fixture = Fixture::new();
+  let name = "svn:mergeinfo"
+    .bytes()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+  let value = "/branches/b1:3-4,9"
+    .bytes()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+  fixture.commit(&[format!("row 12 /trunk dir change props {name}={value}").as_str()]);
+  let command = b"( log ( ( 5:trunk ) ( 12 ) ( 12 ) false false 0 true revprops ( ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    entry_revisions(&out),
+    [(12, false), (9, false), (3, false), (0, true)]
+  );
+}
+
+/// A-613 part 2 (`log`): a path past `MAX_OPEN_HISTORIES` has its history opened again at each step
+/// (`get_history`), one step past the last location and two after the first time; its log is the same as the same
+/// path's with its history kept open, across a copy.
+#[test]
+fn a_history_opened_again_at_each_step_walks_as_one_kept_open() {
+  let fixture = Fixture::new();
+  let mut many = String::new();
+  for _ in 0..32 {
+    many.push_str("9:trunk/dir ");
+  }
+  let reopened = format!(
+    "( log ( ( {many}11:tags/t1/dir ) ( 11 ) ( 0 ) true false 0 false all-revprops ( ) ) ) "
+  );
+  let kept =
+    b"( log ( ( 11:tags/t1/dir 9:trunk/dir ) ( 11 ) ( 0 ) true false 0 false all-revprops ( ) ) ) ";
+  let (_, reopened, _) = streamed(&fixture, &fixture.green, reopened.as_bytes(), usize::MAX);
+  let (_, kept, _) = streamed(&fixture, &fixture.green, kept, usize::MAX);
+  assert_eq!(
+    String::from_utf8(reopened).unwrap(),
+    String::from_utf8(kept).unwrap()
+  );
+}
+
+/// A `get-file-revs` answer's revisions in order, each with the strings sent after it, its closing empty one last.
+fn file_revisions_sent(out: &[u8]) -> Vec<(u64, Vec<Vec<u8>>)> {
+  let mut sent: Vec<(u64, Vec<Vec<u8>>)> = Vec::new();
+  for item in items(out) {
+    match item {
+      Value::List(parts) => {
+        if let [Value::String(_), Value::Number(revision), ..] = parts.as_slice() {
+          sent.push((*revision, Vec::new()));
+        }
+      }
+      Value::String(bytes) => {
+        if let Some((_, strings)) = sent.last_mut() {
+          strings.push(bytes.to_vec());
+        }
+      }
+      _ => {}
+    }
+  }
+  sent
+}
+
+/// A-613 part 2 (`get-file-revs`, `send_path_revision`'s `svn_fs_contents_different`): a file added without a text and
+/// then given an empty one has the same text in both revisions (`svn_fs_fs__file_text_rep_equal` counts both empty), so
+/// the revision that gave it sends no delta, nor does a later change of its properties alone; the first revision sends
+/// its delta from no text, the header alone, since an empty target makes no window.
+#[test]
+fn a_text_made_empty_from_none_is_the_same_text() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/none.txt file add props "]);
+  fixture.commit(&[
+    "row 13 /trunk/none.txt file change text  md5 d41d8cd98f00b204e9800998ecf8427e sha1 \
+     da39a3ee5e6b4b0d3255bfef95601890afd80709",
+  ]);
+  fixture.commit(&["row 14 /trunk/none.txt file change props 6e=31"]);
+  let command = b"( get-file-revs ( 14:trunk/none.txt ( 12 ) ( 14 ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    file_revisions_sent(&out),
+    [
+      (12, vec![b"SVN\x02".to_vec(), Vec::new()]),
+      (13, vec![Vec::new()]),
+      (14, vec![Vec::new()]),
+    ]
+  );
+}
+
+/// A client that announces neither `svndiff1` nor `accepts-svndiff2`, at the repository's root: answered in svndiff 0.
+const SVNDIFF0_SESSION: Session<'static> = Session {
+  base: "/",
+  uuid: UUID,
+  capabilities: ClientCapabilities {
+    svndiff1: false,
+    accepts_svndiff2: false,
+    ..STOCK_CAPABILITIES
+  },
+  authz: None,
+  authentication: Authentication::Settled,
+};
+
+/// A-613 part 2 (`get-file-revs` in svndiff 0, `svndiff.c`): a window of new data alone, the first revision's, is
+/// written as `send_simple_insertion_window` writes it, the header, the window's integers and its instruction in one
+/// string, then the new data; a window with a source copy, the second revision's, as `window_handler` writes it, the
+/// header alone, then the integers, the instructions and the new data. The bytes are svndiff 0's, uncompressed:
+/// `/trunk/a.txt` is `alpha\n` in r1, and r2 copies those six bytes and adds `more\n`.
+#[test]
+fn svndiff_0_strings_are_the_writes_svndiff_c_makes() {
+  let fixture = Fixture::new();
+  let command = items(b"( get-file-revs ( 11:trunk/a.txt ( 1 ) ( 2 ) ) ) ").remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(
+    &fixture.index,
+    &fixture.green,
+    &SVNDIFF0_SESSION,
+    &command,
+    &mut out,
+  )
+  .unwrap();
+  assert!(matches!(
+    drained(outcome, &fixture, &SVNDIFF0_SESSION, &mut out),
+    Outcome::Answered
+  ));
+  assert_eq!(
+    file_revisions_sent(&out),
+    [
+      (
+        1,
+        vec![
+          b"SVN\0\x00\x00\x06\x01\x06\x86".to_vec(),
+          b"alpha\n".to_vec(),
+          Vec::new(),
+        ]
+      ),
+      (
+        2,
+        vec![
+          b"SVN\0".to_vec(),
+          b"\x00\x06\x0b\x03\x05".to_vec(),
+          b"\x06\x00\x85".to_vec(),
+          b"more\n".to_vec(),
+          Vec::new(),
+        ]
+      ),
+    ]
+  );
+}
+
+/// The nodes the report editor holds open while it writes one added file's delta.
+/// Shape: the root directory and the file.
+const DELTA_NODES_OPEN: usize = 2;
+
+/// A-616 continued (7) (one writer of an svndiff stream's writes, `svndiff.c`, which `svnserve` sends a string each, a
+/// delta string of `get-file-revs` and a `textdelta-chunk` of an edit alike): replay `svnserve`'s
+/// `get-file-revs-svndiff0` session, whose client takes svndiff 0 alone, through `get-file-revs`; then write each delta
+/// `svnserve` sent there, its windows decoded from its strings, through the report editor for the same client. Expect
+/// both callers of the one writer to send `svnserve`'s strings byte for byte, the editor's as its `textdelta-chunk`s,
+/// over the session's 14 deltas: 4 that open with a window of new data alone (the header, its integers and its
+/// instruction one string), 9 that open with the header alone, and an empty text's header with nothing after it.
+#[test]
+fn both_callers_of_the_one_delta_writer_send_svnserves_svndiff_0_writes() {
+  let (name, client, server) = transcript!("get-file-revs-svndiff0");
+  assert_eq!(replay(name, client, server, &[]), 5, "{name}");
+  let deltas = recorded_deltas(server);
+  assert_eq!(delta_shapes(&deltas), (14, 4, 9, 1), "{name}");
+  for strings in &deltas {
+    assert_eq!(&editor_chunks(strings), strings, "{name}");
+  }
+}
+
+/// Each delta a `get-file-revs` answer sends, its strings before the closing empty one; a revision that sends none is
+/// left out.
+fn recorded_deltas(server: &[u8]) -> Vec<Vec<Vec<u8>>> {
+  file_revisions_sent(server)
+    .into_iter()
+    .filter_map(|(_, mut strings)| {
+      strings.pop();
+      (!strings.is_empty()).then_some(strings)
+    })
+    .collect()
+}
+
+/// How many deltas there are, and how many open with the header joined to a window of new data alone, with the header
+/// alone and more after it, and with the header alone and nothing else.
+fn delta_shapes(deltas: &[Vec<Vec<u8>>]) -> (usize, usize, usize, usize) {
+  let header = b"SVN\0".as_slice();
+  let joined = deltas
+    .iter()
+    .filter(|strings| {
+      first_string(strings)
+        .is_some_and(|bytes| bytes.len() > header.len() && bytes.starts_with(header))
+    })
+    .count();
+  let alone_then_more = deltas
+    .iter()
+    .filter(|strings| first_string(strings) == Some(header) && strings.len() > 1)
+    .count();
+  let alone = deltas
+    .iter()
+    .filter(|strings| first_string(strings) == Some(header) && strings.len() == 1)
+    .count();
+  (deltas.len(), joined, alone_then_more, alone)
+}
+
+/// A delta's first string, if it has one.
+fn first_string(strings: &[Vec<u8>]) -> Option<&[u8]> {
+  strings.first().map(Vec::as_slice)
+}
+
+/// The `textdelta-chunk`s the report editor writes, to a client that takes svndiff 0 alone, for an added file whose
+/// delta is the windows `strings` hold.
+fn editor_chunks(strings: &[Vec<u8>]) -> Vec<Vec<u8>> {
+  let (_, windows) = decode_all(&strings.concat()).unwrap();
+  let node = Facts {
+    repository_path: "/trunk/a.txt",
+    created_revision: 1,
+    sha1: None,
+  };
+  let mut drive = vec![
+    Call::TargetRevision(1),
+    Call::OpenRoot {
+      base: Some(1),
+      node,
+    },
+    Call::Add {
+      kind: NodeKind::File,
+      path: "a.txt",
+      copy_from: None,
+      node,
+    },
+    Call::ApplyTextDelta { base_md5: None },
+  ];
+  drive.extend(windows.iter().map(Call::Window));
+  drive.extend([
+    Call::TextDeltaEnd,
+    Call::CloseFile { md5: [0; 16] },
+    Call::CloseDirectory,
+    Call::CloseEdit,
+  ]);
+  let mut writer = EditorWriter::new(&SVNDIFF0_SESSION.capabilities, DELTA_NODES_OPEN);
+  let mut out = Vec::new();
+  for call in &drive {
+    writer.write(call, &mut out).unwrap();
+  }
+  items(&out).iter().filter_map(textdelta_chunk).collect()
+}
+
+/// A `textdelta-chunk` command's chunk.
+fn textdelta_chunk(item: &Value<'_>) -> Option<Vec<u8>> {
+  let Value::List(parts) = item else {
+    return None;
+  };
+  let [Value::Word("textdelta-chunk"), Value::List(params)] = parts.as_slice() else {
+    return None;
+  };
+  let [_, Value::String(chunk)] = params.as_slice() else {
+    return None;
+  };
+  Some(chunk.to_vec())
+}
+
+/// A `get-file-revs` answer's revisions in order, each its path, its number and whether it came in by a merge.
+fn file_revisions_listed(out: &[u8]) -> Vec<(String, u64, bool)> {
+  items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match parts.as_slice() {
+        [
+          Value::String(path),
+          Value::Number(revision),
+          _,
+          _,
+          Value::Word(merged),
+        ] => Some((
+          String::from_utf8_lossy(path).into_owned(),
+          *revision,
+          *merged == "true",
+        )),
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect()
+}
+
+/// A `get-file-revs` answer's property changes, each revision's written as the tests compare them, as a set.
+fn property_changes_sent(out: &[u8]) -> Vec<(u64, String)> {
+  items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::String(_), Value::Number(revision), _, changes, _] => {
+          Some((*revision, normalized(changes)))
+        }
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect()
+}
+
+/// A-613 part 2 (`get-file-revs`, `svn_prop_diffs`): a revision that keeps one of a file's properties, changes one,
+/// takes one away and adds one sends those three changes, the one taken away with an empty value list, and nothing for
+/// the one kept; the first revision sends each of its properties as added.
+#[test]
+fn a_property_taken_away_is_sent_as_a_change_without_a_value() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/p.txt file add props 6d=32,6e=31,6f=33"]);
+  fixture.commit(&["row 13 /trunk/p.txt file change props 6d=39,6e=31,70=34"]);
+  let command = b"( get-file-revs ( 11:trunk/p.txt ( 12 ) ( 13 ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    property_changes_sent(&out),
+    [
+      (
+        12,
+        String::from("( ( 1:m ( 1:2 ) ) ( 1:n ( 1:1 ) ) ( 1:o ( 1:3 ) ) ) ")
+      ),
+      (
+        13,
+        String::from("( ( 1:m ( 1:9 ) ) ( 1:o ( ) ) ( 1:p ( 1:4 ) ) ) ")
+      ),
+    ]
+  );
+}
+
+/// A-613 part 2 (`get-file-revs` with merged revisions, `svn_repos_get_file_revs2`): a mainline revision and a merged
+/// one of the same number are sent mainline first (`main_pr->revnum <= merged_pr->revnum`). `/c.txt` records in r13
+/// that it merged `/d.txt`'s r13, a revision that changed both, so the merged range's walk, r13 back to its exclusive
+/// start r12, finds two revisions of `/d.txt` numbered as the two of `/c.txt`.
+#[test]
+fn a_mainline_revision_goes_before_a_merged_one_of_the_same_number() {
+  let mut fixture = Fixture::new();
+  let name = "svn:mergeinfo"
+    .bytes()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+  let value = "/d.txt:13"
+    .bytes()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+  fixture.commit(&["row 12 /c.txt file add", "row 12 /d.txt file add"]);
+  fixture.commit(&[
+    format!("row 13 /c.txt file change props {name}={value}").as_str(),
+    "row 13 /d.txt file change props 6e=31",
+  ]);
+  let command = b"( get-file-revs ( 5:c.txt ( 0 ) ( 13 ) true ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, command, usize::MAX);
+  assert_eq!(
+    file_revisions_listed(&out),
+    [
+      (String::from("/c.txt"), 12, false),
+      (String::from("/d.txt"), 12, true),
+      (String::from("/c.txt"), 13, false),
+      (String::from("/d.txt"), 13, true),
+    ]
+  );
+}
+
+/// A-613 part 2 (read access, A-606): the scripted sessions against the `locked` repository, read by an anonymous user
+/// under its rules (the root and `/branches` hidden, `/trunk/dir` hidden save `dir/b.txt`), answered as `svnserve`
+/// answered them: revision properties as much as each revision is readable; `check-path`, `stat`, `get-dir`,
+/// `get-file` and `get-iprops` of a hidden path refused "Authorization failed" with nothing before it; hidden entries,
+/// ancestors and requested mergeinfo paths left out; locations and segments refused at a hidden peg path and ended at
+/// a hidden copy source; `list` passing a hidden directory by; `log` censored, refused at a hidden path or root, ended
+/// at a hidden location, and refused where a merge source is hidden; `get-file-revs` ended at a hidden location, and
+/// the connection ended where `svnserve` aborts.
+#[test]
+fn the_locked_sessions_are_answered_as_svnserve_answered_them() {
+  let sessions = [
+    (transcript!("locked-reads"), 29),
+    (transcript!("locked-log"), 8),
+    (transcript!("locked-file-revs"), 4),
+    (transcript!("locked-file-revs-abort"), 0),
+  ];
+  for ((name, client, server), commands) in sessions {
+    assert_eq!(replay(name, client, server, &[]), commands, "{name}");
+  }
+}
+
+/// A-613 part 2 (read access, `svn_repos_check_revision_access` and `detect_changed`): a readable path copied from a
+/// hidden one keeps its change and loses its copy source, and the revision is readable in part, so its author and date
+/// alone show, in `rev-proplist`, `rev-prop` and `log`.
+#[test]
+fn a_copy_from_a_hidden_source_shows_no_source_and_the_author_and_date_alone() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&["row 12 /trunk/c.txt file add copy /branches/b1/a.txt 9 props "]);
+  let properties = [
+    ("svn:author", "carol"),
+    ("svn:date", "2026-01-12T12:00:00.000000Z"),
+    ("svn:log", "a copy of a hidden file"),
+  ];
+  fixture.green.revisions.push(
+    properties
+      .iter()
+      .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+      .collect(),
+  );
+  let rules_text = b"[/]\n* = r\n\n[/branches]\n* =\n";
+  let rules = Authz::parse(rules_text, None, crate::authz::Bounds::of(rules_text, None))
+    .unwrap()
+    .rules(b"repo", Principal::Anonymous);
+  let session = Session {
+    authz: Some(&rules),
+    ..ROOT_SESSION
+  };
+  let answer_of = |command: &[u8]| {
+    let value = items(command).remove(0);
+    let mut out = Vec::new();
+    let outcome = answer(&fixture.index, &fixture.green, &session, &value, &mut out).unwrap();
+    assert!(matches!(
+      drained(outcome, &fixture, &session, &mut out),
+      Outcome::Answered
+    ));
+    String::from_utf8(out).unwrap()
+  };
+  assert_eq!(
+    answer_of(b"( rev-proplist ( 12 ) ) "),
+    "( success ( ( ) 0: ) ) ( success ( ( ( 10:svn:author 5:carol ) ( 8:svn:date 27:2026-01-12T12:00:00.000000Z ) ) \
+     ) ) "
+  );
+  assert_eq!(
+    answer_of(b"( rev-prop ( 12 7:svn:log ) ) "),
+    "( success ( ( ) 0: ) ) ( success ( ( ) ) ) "
+  );
+  assert_eq!(
+    answer_of(b"( log ( ( 11:trunk/c.txt ) ( 12 ) ( 12 ) true false 0 false all-revprops ( ) ) ) "),
+    "( success ( ( ) 0: ) ) ( ( ( 12:/trunk/c.txt A ( ) ( 4:file false false ) ) ) 12 ( 5:carol ) \
+     ( 27:2026-01-12T12:00:00.000000Z ) ( ) false false 0 ( ) false ) done ( success ( ) ) "
+  );
+}
+
+/// The paths a listing's answer names, in byte order.
+fn listed_paths(out: &[u8]) -> Vec<String> {
+  let mut paths: Vec<String> = items(out)
+    .iter()
+    .filter_map(|item| match item {
+      Value::List(parts) => match parts.as_slice() {
+        [Value::String(path), Value::Word(_), ..] => {
+          Some(String::from_utf8_lossy(path).into_owned())
+        }
+        _ => None,
+      },
+      _ => None,
+    })
+    .collect();
+  paths.sort();
+  paths
+}
+
+/// A-613 part 2, step 7 (`svn_repos_list` with patterns, `svn_utf__fuzzy_glob_match`): commit `Ärger.txt` and
+/// `Straße` beneath `/trunk`, then list `/trunk`'s entries with the patterns `arger*` and `strasse`, then with `Ärger*`
+/// alone; expect both entries named by the first listing, each name folded as utf8proc folds it before it is matched,
+/// and none by the second, a pattern the client did not fold, since the server folds the names alone.
+#[test]
+fn a_listing_matches_names_beyond_ascii_folded_as_utf8proc_folds_them() {
+  let mut fixture = Fixture::new();
+  fixture.commit(&[
+    "row 12 /trunk/Ärger.txt file add",
+    "row 12 /trunk/Straße file add",
+  ]);
+  let folded = "( list ( 5:trunk ( 12 ) immediates ( kind ) ( 6:arger* 7:strasse ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, folded.as_bytes(), usize::MAX);
+  assert_eq!(
+    listed_paths(&out),
+    [
+      String::from("/trunk/Straße"),
+      String::from("/trunk/Ärger.txt")
+    ]
+  );
+  let unfolded = "( list ( 5:trunk ( 12 ) immediates ( kind ) ( 7:Ärger* ) ) ) ";
+  let (_, out, _) = streamed(&fixture, &fixture.green, unfolded.as_bytes(), usize::MAX);
+  assert_eq!(listed_paths(&out), Vec::<String>::new());
+}
+
+/// The anonymous principal's rules over a root it reads whole but `/branches` (A-606).
+fn branches_hidden() -> PrincipalRules {
+  let rules_text = b"[/]\n* = r\n\n[/branches]\n* =\n";
+  Authz::parse(rules_text, None, crate::authz::Bounds::of(rules_text, None))
+    .unwrap()
+    .rules(b"repo", Principal::Anonymous)
+}
+
+/// One command answered at the root under `rules` with `authentication`: its outcome, a streamed answer drained, and
+/// what was written.
+fn answered_with(
+  rules: &PrincipalRules,
+  authentication: Authentication,
+  command: &[u8],
+) -> (Outcome, String) {
+  let fixture = Fixture::new();
+  let session = Session {
+    authz: Some(rules),
+    authentication,
+    ..ROOT_SESSION
+  };
+  let value = items(command).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(&fixture.index, &fixture.green, &session, &value, &mut out).unwrap();
+  let outcome = drained(outcome, &fixture, &session, &mut out);
+  (outcome, String::from_utf8(out).unwrap())
+}
+
+/// A-613 part 2, step 7 (`must_have_access` 829-834, where the client could authenticate): ask for each of the six
+/// reads that check their path first, of a path the anonymous rules hide, in a session whose client could
+/// authenticate; expect each to answer that an authentication is to be asked for, with nothing written, so the
+/// connection can ask before any word of the command's answer.
+#[test]
+fn a_hidden_path_asks_for_an_authentication_where_the_client_could_give_one() {
+  let rules = branches_hidden();
+  for command in [
+    b"( check-path ( 8:branches ( ) ) ) ".as_slice(),
+    b"( stat ( 8:branches ( ) ) ) ",
+    b"( get-dir ( 8:branches ( ) true true ) ) ",
+    b"( get-file ( 17:branches/b1/a.txt ( ) true false ) ) ",
+    b"( get-iprops ( 8:branches ( ) ) ) ",
+    b"( list ( 8:branches ( ) infinity ( kind ) ) ) ",
+  ] {
+    let answered = answered_with(&rules, Authentication::Available, command);
+    assert_eq!(
+      answered,
+      (Outcome::Authenticate, String::new()),
+      "{}",
+      String::from_utf8_lossy(command)
+    );
+  }
+}
+
+/// A-613 part 2, step 7 (`must_have_access` after its `auth_request`): run `check-path` again once the client has
+/// authenticated for it, of a path the new principal may read and of one it may not; expect the first answered with no
+/// trivial authentication request before it, and the second refused "Authorization failed" (170001) with nothing
+/// before it; and a readable path asked where the client could authenticate answered as ever, the trivial request
+/// first.
+#[test]
+fn a_read_run_again_after_its_authentication_has_no_trivial_request() {
+  let rules = branches_hidden();
+  let refusal = "( failure ( ( 170001 20:Authorization failed 0: 0 ) ) ) ";
+  let trunk = b"( check-path ( 5:trunk ( ) ) ) ";
+  assert_eq!(
+    answered_with(&rules, Authentication::Done, trunk),
+    (Outcome::Answered, String::from("( success ( dir ) ) "))
+  );
+  assert_eq!(
+    answered_with(
+      &rules,
+      Authentication::Done,
+      b"( check-path ( 8:branches ( ) ) ) "
+    ),
+    (Outcome::Answered, String::from(refusal))
+  );
+  assert_eq!(
+    answered_with(&rules, Authentication::Available, trunk),
+    (
+      Outcome::Answered,
+      String::from("( success ( ( ) 0: ) ) ( success ( dir ) ) ")
+    )
+  );
+}
+
+/// The bounds a hostile command is read within.
+fn hostile_bounds() -> Bounds {
+  Bounds {
+    item_bytes: 4096,
+    word_bytes: 32,
+    depth: 6,
+    nodes: 256,
+  }
+}
+
+/// One hostile parameter: one of the shapes the commands read, or a number, or a short string of path bytes and NUL.
+fn hostile_param() -> impl Strategy<Value = String> {
+  let shapes = prop::sample::select(vec![
+    "( ) ",
+    "( 3 ) ",
+    "( 18446744073709551615 ) ",
+    "5:trunk ",
+    "0: ",
+    "true ",
+    "inherited ",
+    "( 5:trunk 1:x ) ",
+    "27:2026-01-03T03:00:00.000000Z ",
+    "11:trunk/a.txt ",
+    "false ",
+    "infinity ",
+    "( kind size ) ",
+  ]);
+  (0_u8..3, shapes, any::<u64>(), "[a-z/.\\x00]{0,12}").prop_map(|(pick, shape, number, text)| {
+    match pick {
+      0 => shape.to_owned(),
+      1 => format!("{number} "),
+      _ => format!("{}:{text} ", text.len()),
+    }
+  })
+}
+
+/// Whether an item is a command response, `( success ... )` or `( failure ... )`.
+fn is_response(item: &Value<'_>) -> bool {
+  matches!(item, Value::List(parts) if matches!(parts.first(), Some(Value::Word("success" | "failure"))))
+}
+
+/// Holds one hostile command's answer to what `svnserve` can answer: nothing for a command that ends the connection or
+/// is another piece's; the authentication request then a response, or a refusal alone; and for a streamed answer, a
+/// stream that ends, whose answer is the authentication request first and a response last, three items at the least
+/// (the request, `done`, the refusal: `list`'s refusal of a depth word it does not know, recorded).
+fn hostile_command_holds(command: &str) -> Result<(), TestCaseError> {
+  let mut parser = Parser::new(hostile_bounds());
+  let Ok(Parsed::Item { value, .. }) = parser.parse(command.as_bytes()) else {
+    return Ok(());
+  };
+  let fixture = Fixture::new();
+  let mut out = Vec::new();
+  let outcome = answer(
+    &fixture.index,
+    &fixture.green,
+    &ROOT_SESSION,
+    &value,
+    &mut out,
+  )
+  .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?;
+  let mut stream = match outcome {
+    Outcome::Close | Outcome::Elsewhere | Outcome::Authenticate => {
+      prop_assert!(out.is_empty());
+      return Ok(());
+    }
+    Outcome::Answered => {
+      let answers = items(&out);
+      prop_assert!(!answers.is_empty() && answers.len() <= 2);
+      return Ok(());
+    }
+    Outcome::Streaming(stream) => stream,
+  };
+  let mut slices = 0_usize;
+  while stream
+    .resume(&fixture.index, &fixture.green, &ROOT_SESSION, &mut out, 1)
+    .map_err(|refusal| TestCaseError::fail(format!("{refusal:?}")))?
+    == Progress::More
+  {
+    slices += 1;
+    prop_assert!(slices < 1_024, "a stream that does not end");
+  }
+  let answers = items(&out);
+  let request = items(b"( success ( ( ) 0: ) ) ");
+  prop_assert!(answers.len() >= 3, "{}", String::from_utf8_lossy(&out));
+  prop_assert_eq!(answers.first(), request.first());
+  prop_assert!(answers.last().is_some_and(is_response));
+  Ok(())
+}
+
+/// A-613 part 2: the hostile input g264 found on main (a5dffc913, seed `cc 8c15aaa6...` in this test's seed file): a
+/// `list` whose depth is the word `true`, which `svn_depth_from_word` reads as unknown, is answered with the
+/// authentication request, `done` and "Invalid depth '-2' in svn_repos_list", three items, as `svnserve` answers a
+/// depth word it does not know (recorded, session `list`); the test had required four of every stream.
+#[test]
+fn a_list_with_a_word_for_its_depth_is_three_items_as_svnserve_answers_it() {
+  if let Err(error) = hostile_command_holds("( list ( 5:trunk ( ) true ) ) ") {
+    panic!("{error}");
+  }
+  let (_, out, _) = answered_streamed(b"( list ( 5:trunk ( ) true ) ) ");
+  assert_eq!(
+    String::from_utf8(out).unwrap(),
+    "( success ( ( ) 0: ) ) done ( failure ( ( 165002 36:Invalid depth '-2' in svn_repos_list 0: 0 ) ) ) "
+  );
+}
+
+/// One command's whole answer against the fixture, its stream resumed in a room past it.
+fn answered_streamed(command: &[u8]) -> (Outcome, Vec<u8>, usize) {
+  let fixture = Fixture::new();
+  streamed(&fixture, &fixture.green, command, usize::MAX)
+}
+
+proptest! {
+  #![proptest_config(
+    slates_test_seeds::seeded(ProptestConfig::default(), include_str!("tests.proptest-regressions")).unwrap()
+  )]
+
+  /// A-613: hostile commands, a known command's name with parameters of any shape: never a panic, and an answer as
+  /// [`hostile_command_holds`] holds it.
+  #[test]
+  fn hostile_commands_are_answered_or_end_the_connection(
+    name in prop::sample::select(vec![
+      "get-latest-rev", "get-dated-rev", "rev-proplist", "rev-prop", "check-path", "stat",
+      "get-mergeinfo", "get-iprops", "get-file", "list", "get-location-segments", "get-deleted-rev",
+      "log", "get-file-revs", "no-such-command",
+    ]),
+    params in prop::collection::vec(hostile_param(), 0..5),
+  ) {
+    let command = format!("( {name} ( {}) ) ", params.concat());
+    hostile_command_holds(&command)?;
+  }
+}
+
+/// A log request both writers answer in [`a_log_report_answers_the_entries_svnserve_answers`]: the paths, relative to
+/// the root; the start and the end (none: the youngest); whether changed paths are sent; strict history; the limit (0:
+/// none); merged revisions; and the revision properties asked for (none: every one).
+#[derive(Debug)]
+struct LogCase {
+  /// The paths.
+  paths: &'static [&'static str],
+  /// The start.
+  start: Option<u64>,
+  /// The end.
+  end: Option<u64>,
+  /// Whether changed paths are sent.
+  changed: bool,
+  /// Whether histories stop at copies.
+  strict: bool,
+  /// The limit.
+  limit: u64,
+  /// Whether merged revisions are included.
+  merged: bool,
+  /// The revision properties named; none for every one.
+  revprops: Option<&'static [&'static str]>,
+}
+
+/// The standard three revision properties a stock client names.
+const STANDARD_THREE: &[&str] = &["svn:author", "svn:date", "svn:log"];
+
+/// The cases, each with whether it is read by the `locked` repository's anonymous rules: the root's shortcut over every
+/// revision, the youngest first, with every property; a file's history with its merged revisions; a branch oldest first with a limit,
+/// crossing its copy; the branch's history stopping at its copy, no property; two paths with a custom property named;
+/// under the rules, the root refused and the trunk's whole history censored; a missing path and a revision past the youngest refused.
+const DAV_LOG_CASES: [(LogCase, bool); 9] = [
+  (
+    LogCase {
+      paths: &[""],
+      start: None,
+      end: Some(0),
+      changed: true,
+      strict: false,
+      limit: 0,
+      merged: false,
+      revprops: None,
+    },
+    false,
+  ),
+  (
+    LogCase {
+      paths: &["trunk/a.txt"],
+      start: None,
+      end: Some(1),
+      changed: true,
+      strict: false,
+      limit: 0,
+      merged: true,
+      revprops: Some(STANDARD_THREE),
+    },
+    false,
+  ),
+  (
+    LogCase {
+      paths: &["branches/b1"],
+      start: Some(1),
+      end: None,
+      changed: true,
+      strict: false,
+      limit: 3,
+      merged: false,
+      revprops: Some(STANDARD_THREE),
+    },
+    false,
+  ),
+  (
+    LogCase {
+      paths: &["branches/b1"],
+      start: None,
+      end: Some(0),
+      changed: false,
+      strict: true,
+      limit: 0,
+      merged: false,
+      revprops: Some(&[]),
+    },
+    false,
+  ),
+  (
+    LogCase {
+      paths: &["trunk/a.txt", "tags/t1"],
+      start: Some(11),
+      end: Some(2),
+      changed: true,
+      strict: false,
+      limit: 0,
+      merged: false,
+      revprops: Some(&["svn:author", "x-ticket"]),
+    },
+    false,
+  ),
+  (
+    LogCase {
+      paths: &[""],
+      start: None,
+      end: None,
+      changed: true,
+      strict: false,
+      limit: 0,
+      merged: false,
+      revprops: None,
+    },
+    true,
+  ),
+  (
+    LogCase {
+      paths: &["trunk"],
+      start: None,
+      end: Some(0),
+      changed: true,
+      strict: false,
+      limit: 0,
+      merged: false,
+      revprops: None,
+    },
+    true,
+  ),
+  (
+    LogCase {
+      paths: &["missing.txt"],
+      start: None,
+      end: None,
+      changed: true,
+      strict: false,
+      limit: 0,
+      merged: false,
+      revprops: None,
+    },
+    false,
+  ),
+  (
+    LogCase {
+      paths: &["trunk"],
+      start: Some(99),
+      end: None,
+      changed: false,
+      strict: false,
+      limit: 0,
+      merged: false,
+      revprops: None,
+    },
+    false,
+  ),
+];
+
+/// What a log came to, written the same way whichever writer wrote it: each entry (its revision, -1 for one closing a
+/// run of merged revisions; its changed paths; its revision properties in name order; its two flags), then the error
+/// number and message of a refusal.
+type LogAnswer = (Vec<String>, Option<(u64, String)>);
+
+/// One entry as [`LogAnswer`] writes it.
+fn log_line(
+  revision: i64,
+  changed: &[String],
+  revprops: &BTreeMap<String, String>,
+  flags: (bool, bool),
+) -> String {
+  let (children, subtractive) = flags;
+  format!("r{revision} {changed:?} {revprops:?} children={children} subtractive={subtractive}")
+}
+
+/// An ra_svn item's text: a string's bytes, lossily, a word or a number.
+fn item_text(value: &Value<'_>) -> String {
+  match value {
+    Value::String(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+    Value::Word(word) => (*word).to_owned(),
+    Value::Number(number) => number.to_string(),
+    Value::List(_) => String::from("( )"),
+  }
+}
+
+/// `svnserve`'s changed path `( path action ( copy-path copy-rev ) ( kind text-mod prop-mod ) )` as [`LogAnswer`]
+/// writes it.
+fn items_changed(change: &Value<'_>) -> String {
+  let Value::List(parts) = change else {
+    panic!("not a changed path: {change:?}");
+  };
+  let [path, action, Value::List(copy), Value::List(flags)] = parts.as_slice() else {
+    panic!("not a changed path: {change:?}");
+  };
+  let copy = match copy.as_slice() {
+    [source, revision] => format!("{}@{}", item_text(source), item_text(revision)),
+    _ => String::new(),
+  };
+  let flags: Vec<String> = flags.iter().map(item_text).collect();
+  format!(
+    "{} {} {} {copy}",
+    item_text(action),
+    item_text(path),
+    flags.join(" ")
+  )
+}
+
+/// One of `svnserve`'s log entries as [`LogAnswer`] writes it.
+fn items_line(entry: &[Value<'_>]) -> String {
+  let [
+    Value::List(changed),
+    revision,
+    Value::List(author),
+    Value::List(date),
+    Value::List(message),
+    children,
+    invalid,
+    _,
+    Value::List(rest),
+    subtractive,
+  ] = entry
+  else {
+    panic!("not a log entry: {entry:?}");
+  };
+  let mut revprops = BTreeMap::new();
+  for (name, value) in [
+    ("svn:author", author),
+    ("svn:date", date),
+    ("svn:log", message),
+  ] {
+    if let Some(value) = value.first() {
+      revprops.insert(name.to_owned(), item_text(value));
+    }
+  }
+  for pair in rest {
+    if let Value::List(pair) = pair
+      && let [name, value] = pair.as_slice()
+    {
+      revprops.insert(item_text(name), item_text(value));
+    }
+  }
+  let revision = if item_text(invalid) == "true" {
+    -1
+  } else {
+    item_text(revision).parse().unwrap()
+  };
+  let changed: Vec<String> = changed.iter().map(items_changed).collect();
+  let flags = (
+    item_text(children) == "true",
+    item_text(subtractive) == "true",
+  );
+  log_line(revision, &changed, &revprops, flags)
+}
+
+/// `svnserve`'s whole `log` answer (its authentication request, the entries, `done` and its answer) as [`LogAnswer`].
+fn items_answer(out: &[u8]) -> LogAnswer {
+  let (mut entries, mut refusal) = (Vec::new(), None);
+  for value in items(out).iter().skip(1) {
+    let Value::List(parts) = value else {
+      continue;
+    };
+    match parts.first() {
+      Some(Value::Word("success")) => {}
+      Some(Value::Word("failure")) => {
+        let error = &parts[1];
+        let Value::List(errors) = error else {
+          panic!("{error:?}")
+        };
+        let Value::List(first) = &errors[0] else {
+          panic!("{error:?}")
+        };
+        refusal = Some((item_text(&first[0]).parse().unwrap(), item_text(&first[1])));
+      }
+      _ => entries.push(items_line(parts)),
+    }
+  }
+  (entries, refusal)
+}
+
+/// `case` as `svnserve`'s `log` command.
+fn items_log_command(case: &LogCase) -> String {
+  let string = |text: &str| format!("{}:{text}", text.len());
+  let revision =
+    |revision: Option<u64>| revision.map_or_else(|| String::from("( )"), |r| format!("( {r} )"));
+  let paths: Vec<String> = case.paths.iter().map(|path| string(path)).collect();
+  let (word, names) = match case.revprops {
+    None => ("all-revprops", Vec::new()),
+    Some(names) => ("revprops", names.iter().map(|name| string(name)).collect()),
+  };
+  format!(
+    "( log ( ( {} ) {} {} {} {} {} {} {word} ( {} ) ) ) ",
+    paths.join(" "),
+    revision(case.start),
+    revision(case.end),
+    case.changed,
+    case.strict,
+    case.limit,
+    case.merged,
+    names.join(" ")
+  )
+}
+
+/// `case` as `svnserve` answers it at the root, with `rules`, resumed in the smallest room.
+fn items_log(fixture: &Fixture, case: &LogCase, rules: Option<&PrincipalRules>) -> LogAnswer {
+  let session = Session {
+    authz: rules,
+    ..ROOT_SESSION
+  };
+  let command = items_log_command(case);
+  let value = items(command.as_bytes()).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer(&fixture.index, &fixture.green, &session, &value, &mut out).unwrap();
+  let Outcome::Streaming(mut stream) = outcome else {
+    panic!("log streams: {outcome:?}");
+  };
+  while stream
+    .resume(
+      &fixture.index,
+      &fixture.green,
+      &session,
+      &mut out,
+      SLICE_ROOM,
+    )
+    .unwrap()
+    == Progress::More
+  {}
+  items_answer(&out)
+}
+
+/// `case` as the `log-report` stock svn sends.
+fn dav_log_body(case: &LogCase) -> String {
+  let mut body = String::from("<S:log-report xmlns:S=\"svn:\">");
+  let mut element = |name: &str, text: Option<String>| match text {
+    Some(text) => body.push_str(&format!("<S:{name}>{text}</S:{name}>")),
+    None => body.push_str(&format!("<S:{name}/>")),
+  };
+  for (name, revision) in [("start-revision", case.start), ("end-revision", case.end)] {
+    if let Some(revision) = revision {
+      element(name, Some(revision.to_string()));
+    }
+  }
+  if case.limit > 0 {
+    element("limit", Some(case.limit.to_string()));
+  }
+  for (name, set) in [
+    ("discover-changed-paths", case.changed),
+    ("strict-node-history", case.strict),
+    ("include-merged-revisions", case.merged),
+  ] {
+    if set {
+      element(name, None);
+    }
+  }
+  match case.revprops {
+    None => element("all-revprops", None),
+    Some([]) => element("no-revprops", None),
+    Some(names) => names
+      .iter()
+      .for_each(|name| element("revprop", Some((*name).to_owned()))),
+  }
+  for path in case.paths {
+    element("path", Some((*path).to_owned()));
+  }
+  body.push_str("</S:log-report>");
+  body
+}
+
+/// What the DAV log's tests read a body or an answer of `bytes` with.
+fn dav_bounds(bytes: usize) -> crate::dav::Bounds {
+  crate::dav::Bounds {
+    body_bytes: bytes,
+    depth: 8,
+    name_bytes: 64,
+    attributes: 8,
+    elements: bytes,
+  }
+}
+
+/// A `log-report`'s changed path as [`LogAnswer`] writes it.
+fn dav_changed(change: &crate::dav::xml::Element) -> String {
+  let action = match change.name.as_str() {
+    "added-path" => "A",
+    "replaced-path" => "R",
+    "deleted-path" => "D",
+    _ => "M",
+  };
+  let copy = match (
+    change.attribute("copyfrom-path"),
+    change.attribute("copyfrom-rev"),
+  ) {
+    (Some(source), Some(revision)) => format!("{source}@{revision}"),
+    _ => String::new(),
+  };
+  let flags =
+    ["node-kind", "text-mods", "prop-mods"].map(|name| change.attribute(name).unwrap_or_default());
+  format!("{action} {} {} {copy}", change.text(), flags.join(" "))
+}
+
+/// A `log-report`'s item as [`LogAnswer`] writes it.
+fn dav_line(item: &crate::dav::xml::Element) -> String {
+  let (mut changed, mut revprops) = (Vec::new(), BTreeMap::new());
+  let (mut revision, mut children, mut subtractive) = (0, false, false);
+  for child in item.elements() {
+    let name = match child.name.as_str() {
+      "version-name" => {
+        revision = child.text().parse().unwrap();
+        continue;
+      }
+      "has-children" => {
+        children = true;
+        continue;
+      }
+      "subtractive-merge" => {
+        subtractive = true;
+        continue;
+      }
+      "creator-displayname" => "svn:author",
+      "date" => "svn:date",
+      "comment" => "svn:log",
+      "revprop" => child.attribute("name").unwrap(),
+      _ => {
+        changed.push(dav_changed(child));
+        continue;
+      }
+    };
+    revprops.insert(name.to_owned(), child.text());
+  }
+  log_line(revision, &changed, &revprops, (children, subtractive))
+}
+
+/// `case` as a `log-report` answers it at the root with `rules`, a slice of the smallest room at a time; a refusal must
+/// come before any of the answer is written.
+fn dav_log(fixture: &Fixture, case: &LogCase, rules: Option<&PrincipalRules>) -> LogAnswer {
+  let body = dav_log_body(case);
+  let asked = crate::dav::request::report(body.as_bytes(), &dav_bounds(body.len())).unwrap();
+  let crate::dav::request::Report::Log(report) = asked else {
+    panic!("not a log-report: {asked:?}");
+  };
+  let mut log = DavLog::new(&report, ROOT).unwrap();
+  let mut out = Vec::new();
+  loop {
+    match log.resume(&fixture.index, &fixture.green, rules, &mut out, SLICE_ROOM) {
+      DavLogProgress::More => {}
+      DavLogProgress::Done => break,
+      DavLogProgress::Refused { code, message } => {
+        assert!(
+          out.is_empty() && !log.begun(),
+          "{case:?} refused after its first byte"
+        );
+        return (Vec::new(), Some((u64::from(code), message)));
+      }
+    }
+  }
+  let root = crate::dav::xml::parse(&out, &dav_bounds(out.len())).unwrap();
+  assert!(root.is("svn:", "log-report"), "{root:?}");
+  (root.elements().map(dav_line).collect(), None)
+}
+
+/// A-681 (`reports/log.c` over `svn_repos_get_logs5`, part 1's second slice): do run each of [`DAV_LOG_CASES`] as
+/// `svnserve`'s `log` (held to its transcripts above) and as a `log-report`, each resumed in the smallest room; expect
+/// the same entries, changed paths, revision properties and flags from both, the report well formed, and each refusal
+/// the same error, the report's before any of it is written.
+#[test]
+fn a_log_report_answers_the_entries_svnserve_answers() {
+  let fixture = Fixture::new();
+  let rules = locked_rules();
+  let mut shapes = Vec::new();
+  for (case, locked) in &DAV_LOG_CASES {
+    let rules = locked.then_some(&rules);
+    let (expected, found) = (
+      items_log(&fixture, case, rules),
+      dav_log(&fixture, case, rules),
+    );
+    assert_eq!(found, expected, "{case:?}");
+    shapes.push((found.0.len(), found.1.map(|(code, _)| code)));
+  }
+  assert_eq!(dav_log_shapes(&shapes), DAV_LOG_SHAPES);
+}
+
+/// What each case came to, so the comparison is never of two empty answers: the root's twelve revisions; entries for
+/// each other walk; the root refused under the rules (`SVN_ERR_AUTHZ_UNREADABLE`); a missing path and a revision past
+/// the youngest refused (`SVN_ERR_FS_NOT_FOUND`, `SVN_ERR_FS_NO_SUCH_REVISION`).
+const DAV_LOG_SHAPES: [&str; 9] = [
+  "12 entries",
+  "entries",
+  "entries",
+  "entries",
+  "entries",
+  "refused 220001",
+  "entries",
+  "refused 160013",
+  "refused 160006",
+];
+
+/// Each case's entry count (exact for the root's walk, `entries` for any other) or its refusal's number.
+fn dav_log_shapes(shapes: &[(usize, Option<u64>)]) -> Vec<String> {
+  shapes
+    .iter()
+    .enumerate()
+    .map(|(at, shape)| match shape {
+      (count, None) if at == 0 => format!("{count} entries"),
+      (count, None) if *count > 0 => String::from("entries"),
+      (_, Some(code)) => format!("refused {code}"),
+      (_, None) => String::from("no entry"),
+    })
+    .collect()
+}
+
+/// A-681 (`dav_svn__log_report`; the module doc's departure): do ask a `log-report` with a negative `S:limit`, which
+/// `svn_repos_get_logs5` would read as two limits; expect no walk, the site refusing it as malformed.
+#[test]
+fn a_negative_log_limit_is_no_walk() {
+  let body =
+    b"<S:log-report xmlns:S=\"svn:\"><S:limit>-1</S:limit><S:path></S:path></S:log-report>";
+  let asked = crate::dav::request::report(body, &dav_bounds(body.len())).unwrap();
+  let crate::dav::request::Report::Log(report) = asked else {
+    panic!("not a log-report: {asked:?}");
+  };
+  assert_eq!(DavLog::new(&report, ROOT), None);
+}
+
+/// A lock alice holds on `path`, made at one second past the epoch, with a comment, expiring at `expires`.
+fn alices_lock(path: &str, expires: Option<AprTime>) -> crate::lock::Lock {
+  crate::lock::Lock {
+    path: path.to_owned(),
+    token: crate::lock::LockToken::drawn([0x5a; crate::lock::UUID_BYTES]),
+    owner: String::from("alice"),
+    comment: Some(String::from("note")),
+    is_dav_comment: false,
+    created: AprTime(1_000_000),
+    expires,
+  }
+}
+
+/// What `get-lock` or `get-locks` answers to `command` at `now`, the session anonymous under the `locked` rules.
+fn lock_read(locks: &LockTable, now: AprTime, command: &[u8]) -> String {
+  let fixture = Fixture::new();
+  let rules = locked_rules();
+  let session = Session {
+    authz: Some(&rules),
+    ..ROOT_SESSION
+  };
+  let command = items(command).remove(0);
+  let mut out = Vec::new();
+  let outcome = answer_lock_read(
+    &fixture.index,
+    &fixture.green,
+    (locks, now),
+    &session,
+    &command,
+    &mut out,
+  );
+  assert!(matches!(outcome, Some(Ok(Outcome::Answered))));
+  String::from_utf8(out).unwrap()
+}
+
+/// A-693 part 1 (`serve.c` 3366-3446): `get-lock` and `get-locks` write a held lock as `write_lock` does
+/// (`ccc(?c)c(?c)`, each date by `svn_time_to_cstring`), leave out an expired lock and one on a path the session may
+/// not read, and refuse a depth `get_locks` does not take in its words, the connection going on.
+#[test]
+fn the_lock_reads_answer_from_the_lock_table_as_svnserve_writes_them() {
+  let mut locks = LockTable::new();
+  let readable = alices_lock("/trunk/a.txt", Some(AprTime(2_000_000)));
+  let hidden = alices_lock("/branches/b1/a.txt", None);
+  for lock in [&readable, &hidden] {
+    locks
+      .apply(&crate::lock::LockEntry::Set(lock.clone()))
+      .unwrap();
+  }
+  let token = readable.token.as_str();
+  let held = format!(
+    "( {}:/trunk/a.txt {}:{token} 5:alice ( 4:note ) 27:1970-01-01T00:00:01.000000Z ( \
+     27:1970-01-01T00:00:02.000000Z ) ) ",
+    "/trunk/a.txt".len(),
+    token.len()
+  );
+  let trivial = "( success ( ( ) 0: ) ) ";
+  let before = AprTime(1_500_000);
+  let after = AprTime(3_000_000);
+  let get_lock = b"( get-lock ( 11:trunk/a.txt ) ) ";
+  let get_locks = b"( get-locks ( 0: ( infinity ) ) ) ";
+  let answers = [
+    lock_read(&locks, before, get_lock),
+    lock_read(&locks, before, get_locks),
+    lock_read(&locks, after, get_lock),
+    lock_read(&locks, before, b"( get-locks ( 0: ( exclude ) ) ) "),
+  ];
+  let refusal = "Invalid 'depth' specified in get-locks request";
+  let expected = [
+    format!("{trivial}( success ( ( {held}) ) ) "),
+    format!("{trivial}( success ( ( {held}) ) ) "),
+    format!("{trivial}( success ( ( ) ) ) "),
+    format!(
+      "( failure ( ( 200004 {}:{refusal} 0: 0 ) ) ) ",
+      refusal.len()
+    ),
+  ];
+  assert_eq!(answers, expected);
+}

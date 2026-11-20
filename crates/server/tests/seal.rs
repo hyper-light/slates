@@ -20,7 +20,11 @@ use slates_cluster::sealed::{SealedChunk, SealedError, open_chunk, seal_chunk};
 use slates_db::catalog::VolumeId;
 use slates_ipc::HeldRendezvous;
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
-use slates_server::seal_keys::{lineage, namer};
+use slates_server::head::{HeadKey, HeadNaming, HeadSealing};
+use slates_server::seal_keys::{
+  SealKeyError, accept_handed_lineage, accept_pair, adopt_lineage, hand_lineage, lineage,
+  lineage_recorded, namer, recorded_lineage, recorded_namer,
+};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: the per-probe budget of the test's machine profile (a quick measurement, no codecs or core matrix).
@@ -239,4 +243,160 @@ fn destroying_a_volume_erases_its_sealed_content() {
     opened,
     Err(SealedError::Seal(hyper_seal::SealError::Unwrap))
   );
+}
+
+/// A-271: a successor that reads a volume's keys before they reach it records none, and adopts the right one when it
+/// arrives. Do ask a daemon whose partition holds no keys for a volume for its recorded lineage and namer, then hand it
+/// a lineage wrapped under its root, as `successor_lineage` does. Expect nothing read and nothing recorded by the reads,
+/// and the handed key's id recorded after. Before, the read path made a key: a live takeover's successor that could not
+/// unwrap the log's key made one, failed to open the log under it, and kept it, so the right key was never adopted.
+#[test]
+fn a_reader_without_the_key_records_none_and_adopts_the_right_one() {
+  let instance = format!("seal-reader-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile(), &instance, Some(SHARDS));
+  let anchor = played_anchor(&config, "seal-reader");
+  let daemon = start_over(&config, &anchor);
+  let owner = slates_db::catalog::Principal::Uid {
+    host: slates_db::HostId(1),
+    uid: 501,
+  };
+  let account = owner.tenant();
+  let handed = [9; 16];
+  let (read, recorded_by_reads, adopted) = daemon
+    .observe_control(OBSERVE_NS, move |state| {
+      let read = (
+        recorded_lineage(state, VOLUME, account).unwrap().is_some(),
+        recorded_namer(state, VOLUME, account).unwrap().is_some(),
+      );
+      let recorded_by_reads = lineage_recorded(state, VOLUME);
+      let root = state.seal_root.as_ref().unwrap();
+      let (secret, _) = root.make_child().unwrap();
+      let wrapped = root.wrap(&secret).unwrap().encode().to_vec();
+      adopt_lineage(state, VOLUME, &owner, (handed, wrapped), None).unwrap();
+      let adopted = recorded_lineage(state, VOLUME, account)
+        .unwrap()
+        .map(|key| key.id().0);
+      (read, recorded_by_reads, adopted)
+    })
+    .unwrap();
+  daemon.stop();
+  assert_eq!(
+    read,
+    (false, false),
+    "no lineage or namer recorded: none read"
+  );
+  assert!(!recorded_by_reads, "and none made by the reads");
+  assert_eq!(
+    adopted,
+    Some(handed),
+    "the key handed over is the one recorded"
+  );
+}
+
+/// Format: the generation the test's hand-made pair and lineage keys carry, as the daemon makes its own (seal.md §3.4).
+const GENERATION: u32 = 1;
+
+/// A-295, the hand-off of a volume's key between candidates, on one daemon's control shard. Do record a pair key from an
+/// owner's anchor (delivered to this node's recipient, as `deliver_pairs` and `accept_pair` do); build that owner's
+/// sealing of a volume (the lineage key for this node's anchor under the pair, the volume's naming key under the lineage
+/// key); hand the lineage key from that sealing to this node's own recipient key and take the hand-off back. Then take a
+/// wrong key under the same id, the right key for a sealing with no naming record, and bytes that are no hand-off; and
+/// hand from a sealing with no entry for this node. Expect the hand-off kept, the key kept (opened under the node's root)
+/// the lineage key itself; every other refused, the unnamed one as `Unchecked`; and nothing handed without an entry.
+#[test]
+fn a_lineage_key_is_handed_from_a_candidates_own_entry_and_kept_only_when_it_checks() {
+  use hyper_seal::keys::{KeyId, Wrapped, WrappingKey};
+  use hyper_seal::recipient::{Mode, wrap_to};
+  let instance = format!("seal-hand-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile(), &instance, Some(SHARDS));
+  let anchor = played_anchor(&config, "seal-hand");
+  let daemon = start_over(&config, &anchor);
+  let outcome = daemon
+    .observe_control(OBSERVE_NS, move |state| {
+      let public = state.seal_recipient.as_ref().unwrap().public();
+      let (owner_anchor, partition, pair_id, lineage_id) = (77_u64, 0_u16, [6; 16], [3; 16]);
+      // Keys made under this node's root, each kept as its record so a copy can be opened again.
+      let (pair_secret, pair_record, lineage_record, wrong_record) = {
+        let root = state.seal_root.as_ref().unwrap();
+        let (pair_secret, pair_record) = root.make_child().unwrap();
+        let (_, lineage_record) = root.make_child().unwrap();
+        let (_, wrong_record) = root.make_child().unwrap();
+        (pair_secret, pair_record, lineage_record, wrong_record)
+      };
+      let pair_delivery = wrap_to(&public, Mode::Hybrid, KeyId(pair_id), &pair_secret).unwrap();
+      accept_pair(state, (owner_anchor, partition), pair_id, &pair_delivery).unwrap();
+      let root = state.seal_root.as_ref().unwrap();
+      let opened = |record: &Wrapped| root.unwrap(record).unwrap();
+      let pair = WrappingKey::new(KeyId(pair_id), GENERATION, opened(&pair_record));
+      let lineage = WrappingKey::new(KeyId(lineage_id), GENERATION, opened(&lineage_record));
+      let (_, naming_record) = lineage.make_child().unwrap();
+      let sealing = HeadSealing {
+        owner_anchor,
+        partition,
+        lineage: lineage_id,
+        keys: vec![HeadKey {
+          anchor: state.origin_anchor.0,
+          wrapped: pair
+            .wrap(&opened(&lineage_record))
+            .unwrap()
+            .encode()
+            .to_vec(),
+        }],
+        naming: Some(HeadNaming {
+          id: [4; 16],
+          wrapped: naming_record.encode().to_vec(),
+        }),
+      };
+      let handed = hand_lineage(state, &sealing, &public);
+      let kept = handed
+        .as_ref()
+        .and_then(|delivery| accept_handed_lineage(state, &sealing, delivery).ok())
+        .map(|(id, record)| {
+          let key = opened(&Wrapped::decode(&record).unwrap());
+          (id, key.bytes() == opened(&lineage_record).bytes())
+        });
+      let wrong_delivery = wrap_to(
+        &public,
+        Mode::Hybrid,
+        KeyId(lineage_id),
+        &opened(&wrong_record),
+      )
+      .unwrap();
+      let wrong_refused = accept_handed_lineage(state, &sealing, &wrong_delivery).is_err();
+      let unnamed = HeadSealing {
+        naming: None,
+        ..sealing.clone()
+      };
+      let unchecked = handed.as_ref().is_some_and(|delivery| {
+        matches!(
+          accept_handed_lineage(state, &unnamed, delivery),
+          Err(SealKeyError::Unchecked)
+        )
+      });
+      let garbage_refused = accept_handed_lineage(state, &sealing, &[0; 64]).is_err();
+      let no_entry = HeadSealing {
+        keys: Vec::new(),
+        ..sealing
+      };
+      let none_handed = hand_lineage(state, &no_entry, &public).is_none();
+      (kept, wrong_refused, unchecked, garbage_refused, none_handed)
+    })
+    .unwrap();
+  daemon.stop();
+  let (kept, wrong_refused, unchecked, garbage_refused, none_handed) = outcome;
+  assert_eq!(
+    kept,
+    Some(([3; 16], true)),
+    "the hand-off is kept, and the key kept is the volume's lineage key"
+  );
+  assert!(
+    wrong_refused,
+    "a wrong key under the volume's key id is refused"
+  );
+  assert!(
+    unchecked,
+    "a sealing with no naming record cannot check a key: refused Unchecked"
+  );
+  assert!(garbage_refused, "bytes that are no hand-off are refused");
+  assert!(none_handed, "a node with no entry of its own hands nothing");
 }

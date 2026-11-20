@@ -15,11 +15,12 @@ use crate::init::negotiate_offering;
 use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, StatfsOut, WriteOut};
 use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
-pub use slates_bridge_core::{Bridge, DirEntry};
+use slates_bridge_core::posix_acl::{self, AclRefusal, Toward};
 use slates_bridge_core::{
-  CacheCoherence, CacheLifetime, DaxOffer, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags,
-  SetAttr, whole_cookie_groups,
+  AttributeNamespaces, CacheLifetime, DaxOffer, FsStat, GroupRule, NodeAttr, ObjectId, OpContext,
+  OwnerView, RenameFlags, SetAttr, whole_cookie_groups,
 };
+pub use slates_bridge_core::{Bridge, DirEntry};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -45,21 +46,26 @@ const DT_LNK: u32 = 10;
 const DT_FIFO: u32 = 1;
 /// Format: POSIX directory entry type for a socket.
 const DT_SOCK: u32 = 12;
+/// Format: POSIX directory entry type for a block device (A-294).
+const DT_BLK: u32 = 6;
+/// Format: POSIX directory entry type for a character device (A-294).
+const DT_CHR: u32 = 2;
 /// Format: Linux EOPNOTSUPP, a refused special-file operation.
 pub(crate) const EOPNOTSUPP: i32 = 95;
 /// Format: Linux ENODATA, the attribute a get or remove names is not set (`getxattr(2)`'s ENOATTR).
 const ENODATA: i32 = 61;
 /// Format: Linux ERANGE, the caller's buffer is too small for the attribute value or name list.
 const ERANGE: i32 = 34;
-/// Format: Linux EAGAIN, an operation to try again (A-64: the arena waits on the shard's next publication).
-const EAGAIN: i32 = 11;
+/// Format: Linux EAGAIN, an operation to try again (A-64: the arena waits on the shard's next publication). Public for
+/// the daemon's FUSE transport, which keeps a request answered so because its base was still fetching (A-555).
+pub const EAGAIN: i32 = 11;
 // The Linux errno values the volume core's refusals map to (the FUSE ABI is Linux, so the
 // numbers are the kernel's regardless of the host the codec is tested on; the dispatch negates
 // them). Each is a Format constant.
 /// Format: ENOENT, no such file or directory.
 const ENOENT: i32 = 2;
 /// Format: EPERM, operation not permitted.
-const EPERM: i32 = 1;
+pub(crate) const EPERM: i32 = 1;
 /// Format: EROFS, a read-only file system: a change asked of an attachment that may not write, or of a snapshot.
 const EROFS: i32 = 30;
 /// Format: Linux EACCES, a symlink out of the volume refused to a caller who does not own it (A-107), and a Windows
@@ -72,7 +78,7 @@ const ENOTDIR: i32 = 20;
 /// Format: EISDIR, is a directory.
 const EISDIR: i32 = 21;
 /// Format: EINVAL, invalid argument.
-const EINVAL: i32 = 22;
+pub(crate) const EINVAL: i32 = 22;
 /// Format: EFBIG, file too large.
 const EFBIG: i32 = 27;
 /// Format: ENOSPC, no space left.
@@ -122,12 +128,19 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
   }
   // A creating request stamps the creating process's uid and gid on what it makes (AUD-29-81): ownership
   // metadata from the kernel's request header, never authority — the attachment's enrolled subject is
-  // unchanged, and the shared seam applies the set-group-ID parent rule.
+  // unchanged, and the shared seam applies the set-group-ID parent rule, System V's, since every kernel a FUSE
+  // request comes from is Linux's (a host's /dev/fuse, a virtio-fs guest, a Shards guest), whatever this host's own
+  // rule (A-328). A guest whose run named its owner names ids the volume keeps as another's (A-281): they are kept as
+  // the volume's, as a chown's are. Its umask goes with them for the seam to apply, which a parent's default ACL
+  // replaces (A-314).
   let creator;
   let cx = if creates(opcode) {
+    let view = bridge.owner_view();
     creator = OpContext {
-      owner_uid: Some(request.header.uid),
-      owner_gid: Some(request.header.gid),
+      owner_uid: Some(view.kept_uid(request.header.uid)),
+      owner_gid: Some(view.kept_gid(request.header.gid)),
+      umask: creation_umask(opcode, request.body),
+      group_rule: GroupRule::SystemV,
       ..cx.clone()
     };
     &creator
@@ -135,7 +148,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     cx
   };
   match opcode {
-    Opcode::Init => serve_init(request.body, unique, cx.coherence, bridge.dax_offer(), out),
+    Opcode::Init => serve_init(request.body, unique, cx, bridge, out),
     Opcode::Lookup => serve_lookup(bridge, &request, cx, out),
     Opcode::GetAttr => serve_getattr(bridge, &request, cx, out),
     Opcode::Open => serve_open(bridge, &request, cx, Opcode::Open, out),
@@ -228,11 +241,15 @@ pub fn success_reply_bytes(opcode: Opcode) -> Option<usize> {
 }
 
 /// Whether a request that answered `error` changed the volume in a way its caller is promised survives a
-/// daemon restart once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, an allocation (A-108), and the commit
-/// points of data — `fsync` and the `flush` every close sends — succeeded. A plain `write` is not one: like an
-/// NFS `UNSTABLE` write, its bytes are in the daemon when it returns and are made stable by the `flush` or
-/// `fsync` that follows. Every transport that serves this dispatch (the kernel's `/dev/fuse`, a virtio-fs
-/// guest) holds such a reply until its owner's barrier has captured the volume (AUD-29-82).
+/// daemon restart once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, an extended
+/// attribute set or removed (as NFSv4.2's `SETXATTR` and `REMOVEXATTR` are; until 2026-11-18 these two were missing,
+/// so an acknowledged `setcap` died with its daemon), an allocation (A-108), and the commit points of data — `fsync`
+/// and the `flush` every close sends — succeeded. A plain `write` is not one: every transport that serves this dispatch
+/// keeps it in the shard's write log before its reply, for a successor to replay (a mount A-63, a Shards stream A-316,
+/// a virtio-fs guest A-410), and one the log has no room for is published before its reply instead (a virtio-fs
+/// guest's through [`Bridge::awaits_publication`]). Every transport that serves this dispatch (the kernel's
+/// `/dev/fuse`, a virtio-fs guest, a Shards stream) holds such a reply until its owner's barrier has captured the
+/// volume (AUD-29-82).
 pub fn needs_barrier(opcode: Option<Opcode>, error: i32) -> bool {
   error == 0
     && matches!(
@@ -252,6 +269,8 @@ pub fn needs_barrier(opcode: Option<Opcode>, error: i32) -> bool {
           | Opcode::FSyncDir
           | Opcode::Flush
           | Opcode::Fallocate
+          | Opcode::SetXattr
+          | Opcode::RemoveXattr
       )
     )
 }
@@ -607,13 +626,22 @@ fn creates(opcode: Opcode) -> bool {
   )
 }
 
-/// A creation mode with the request's umask applied (AUD-29-80): the permission bits less the umask's.
-/// Under `FUSE_DONT_MASK` the kernel sends the mode unmasked and the umask beside it; without it the kernel
-/// masked the mode already and masking again changes nothing (`m & !u & !u == m & !u`), so the creation
-/// policy is applied exactly once in effect on either negotiated path. A body too short to carry the umask
-/// is refused before this (`EIO`).
-fn masked(mode: u32, umask: u32) -> u32 {
-  permission_bits(mode) & !umask
+/// The umask a creating request carries beside its mode (AUD-29-80): third in `fuse_create_in` (`FUSE_TMPFILE`'s too)
+/// and `fuse_mknod_in`, second in `fuse_mkdir_in`; none for any other request. Under `FUSE_DONT_MASK` the kernel sends
+/// the mode unmasked and the umask beside it, for the server to apply, which the shared seam does unless the parent's
+/// default ACL governs instead (Linux's `posix_acl_create`; A-314). A kernel that did not take `FUSE_DONT_MASK` masked
+/// the mode already, and masking again changes nothing (`m & !u & !u == m & !u`). A body too short to carry the umask
+/// is refused by its handler before any effect (`EIO`), so the `None` this gives one is never used.
+fn creation_umask(opcode: Opcode, body: &[u8]) -> Option<u32> {
+  /// Format: the umask's offset in `fuse_create_in` (after flags and mode) and `fuse_mknod_in` (after mode and rdev).
+  const THIRD_WORD: usize = 2 * size_of::<u32>();
+  /// Format: its offset in `fuse_mkdir_in` (after mode).
+  const SECOND_WORD: usize = size_of::<u32>();
+  match opcode {
+    Opcode::Create | Opcode::TmpFile | Opcode::MkNod => body_u32(body, THIRD_WORD),
+    Opcode::MkDir => body_u32(body, SECOND_WORD),
+    _ => None,
+  }
 }
 
 /// The little-endian `u32` at `at` in a request body, if the body holds it.
@@ -651,7 +679,7 @@ pub fn errno(e: VfsError) -> i32 {
     VfsError::NotDirectory => ENOTDIR,
     VfsError::IsDirectory => EISDIR,
     VfsError::NotEmpty => ENOTEMPTY,
-    VfsError::NoSpace => ENOSPC,
+    VfsError::NoSpace | VfsError::RetentionExceeded => ENOSPC,
     VfsError::FileTooLarge => EFBIG,
     VfsError::TooManyLinks => EMLINK,
     VfsError::NotPermitted => EPERM,
@@ -661,12 +689,17 @@ pub fn errno(e: VfsError) -> i32 {
     VfsError::NoAttribute => ENODATA,
     VfsError::Invalid | VfsError::InvalidName => EINVAL,
     VfsError::NameTooLong => ENAMETOOLONG,
-    VfsError::BaseUnavailable(code) => code,
+    // The host's errno where it named one (A-539); none, or a Win32 code no FUSE kernel reads, is `EIO`.
+    VfsError::BaseUnavailable(Some(slates_vfs::host::OsCode::Errno(errno))) if errno > 0 => errno,
     // The bridge's open-handle table is full (audit BUG-4); the kernel's errno for it is EMFILE.
     VfsError::Memory(slates_mem::MemError::SlabFull { .. }) => EMFILE,
     VfsError::PublishNeeded => EAGAIN,
     // The file is delegated to an NFSv4 client; its recall was asked for (A-79).
     VfsError::Delegated => EAGAIN,
+    // An S3 base's fetch of what the request reads is under way (A-555): nothing changed, and the request succeeds once
+    // it lands. A transport that parks the request answers it then; this answers one it could not park (the shard's
+    // waits at their bound, or the fetch still pending at the held-reply bound), as a retry. Until A-555 it fell to `EIO`.
+    VfsError::BasePending(_) => EAGAIN,
     // Until A-151 (2026-10-22) this fell to `EIO`, against A-61's text and the volume core's own name for it.
     VfsError::StaleHandle => ESTALE,
     _ => EIO,
@@ -707,6 +740,8 @@ fn dtype(kind: Kind) -> u32 {
     Kind::Symlink => DT_LNK,
     Kind::Fifo => DT_FIFO,
     Kind::Socket => DT_SOCK,
+    Kind::BlockDevice => DT_BLK,
+    Kind::CharDevice => DT_CHR,
   }
 }
 
@@ -719,11 +754,11 @@ fn split_ns(ns: i64) -> (u64, u32) {
   (ns / NS_PER_SEC, u32::try_from(ns % NS_PER_SEC).unwrap_or(0))
 }
 
-/// A FUSE `fuse_attr` from neutral attributes: each wire time is the neutral time of the same
-/// name. (Until the GAP-A9-3 sweep of 2026-09-14 the wire change time was taken from the
+/// A FUSE `fuse_attr` from neutral attributes, its owner as `owners` shows it to the guest (A-281): each wire time is
+/// the neutral time of the same name. (Until the GAP-A9-3 sweep of 2026-09-14 the wire change time was taken from the
 /// modification time, so a `stat` through a FUSE mount reported `ctime == mtime` — a chmod, which
 /// moves only the change time, was invisible to a tool watching it.)
-fn fuse_attr(node: &NodeAttr, dax: bool) -> Attr {
+fn fuse_attr(node: &NodeAttr, dax: bool, owners: OwnerView) -> Attr {
   Attr {
     dax,
     ino: node.ino,
@@ -734,18 +769,23 @@ fn fuse_attr(node: &NodeAttr, dax: bool) -> Attr {
     atime: split_ns(node.atime),
     mode: wire_mode(node.kind, node.mode),
     nlink: node.nlink,
-    uid: node.uid,
-    gid: node.gid,
+    uid: owners.shown_uid(node.uid),
+    gid: owners.shown_gid(node.gid),
+    rdev: wire_rdev(node),
     blksize: BLKSIZE,
   }
 }
 
-/// Format: `S_IFREG`, the `<sys/stat.h>` file-type bits of `st_mode` for a regular file.
-const S_IFREG: u32 = 0o100_000;
-/// Format: `S_IFDIR`, the file-type bits for a directory.
-const S_IFDIR: u32 = 0o040_000;
-/// Format: `S_IFLNK`, the file-type bits for a symbolic link.
-const S_IFLNK: u32 = 0o120_000;
+/// A device node's number as the FUSE wire carries it, the Linux kernel's encoding (A-294); zero for every other kind.
+/// A number past the kernel's 12-bit major and 20-bit minor, which the volume keeps as an NFS client made it, reads as
+/// zero, as Linux's own NFS client reads one (`fs/nfs/nfs3xdr.c` `xdr_decode_specdata3`).
+fn wire_rdev(node: &NodeAttr) -> u32 {
+  node
+    .device
+    .and_then(slates_vfs::inode::DeviceNumber::to_linux)
+    .unwrap_or(0)
+}
+
 /// Format: the permission bits below the type bits (`07777`: the permission triads and the set-id
 /// and sticky bits).
 const PERMISSION_BITS: u32 = 0o7777;
@@ -758,14 +798,7 @@ const PERMISSION_BITS: u32 = 0o7777;
 /// permission bits alone, so the root's first `GETATTR` made the mount unusable on a real kernel
 /// (`docs/bugs/2026-09-19-fuse-attribute-replies-carry-no-file-type-bits.md`).
 fn wire_mode(kind: Kind, permissions: u32) -> u32 {
-  let kind_bits = match kind {
-    Kind::File => S_IFREG,
-    Kind::Dir => S_IFDIR,
-    Kind::Symlink => S_IFLNK,
-    Kind::Fifo => slates_vfs::export::MODE_FIFO,
-    Kind::Socket => slates_vfs::export::MODE_SOCKET,
-  };
-  kind_bits | (permissions & PERMISSION_BITS)
+  slates_vfs::export::mode_of_kind(kind) | (permissions & PERMISSION_BITS)
 }
 
 /// The permission bits of a mode the kernel sent (`fuse_create_in.mode` carries `S_IFREG`, a
@@ -776,9 +809,12 @@ fn permission_bits(mode: u32) -> u32 {
 }
 
 /// Format: the set-user-id, set-group-id and group-execute mode bits (`<sys/stat.h>` `S_ISUID`,
-/// `S_ISGID`, `S_IXGRP`), for `FATTR_KILL_SUIDGID`.
+/// `S_ISGID`, `S_IXGRP`), for `FATTR_KILL_SUIDGID` (and the set-group-id bit for
+/// `FUSE_SETXATTR_ACL_KILL_SGID`, [`kill_sgid`]).
 const S_ISUID: u32 = 0o4000;
+/// Format: `<sys/stat.h>`'s set-group-id bit.
 const S_ISGID: u32 = 0o2000;
+/// Format: `<sys/stat.h>`'s group-execute bit.
 const S_IXGRP: u32 = 0o010;
 
 /// The mode `FATTR_KILL_SUIDGID` asks for: the set-user-id bit cleared, and the set-group-id bit
@@ -833,8 +869,8 @@ fn dax_for(bridge: &mut dyn Bridge, node: &NodeAttr) -> bool {
   }
 }
 
-/// A FUSE `fuse_entry_out` from neutral attributes with the object's cache lifetime.
-fn entry_out(node: &NodeAttr, valid: (u64, u32), dax: bool) -> EntryOut {
+/// A FUSE `fuse_entry_out` from neutral attributes with the object's cache lifetime, its owner as `owners` shows it.
+fn entry_out(node: &NodeAttr, valid: (u64, u32), dax: bool, owners: OwnerView) -> EntryOut {
   EntryOut {
     nodeid: node.ino,
     generation: node.generation,
@@ -842,7 +878,7 @@ fn entry_out(node: &NodeAttr, valid: (u64, u32), dax: bool) -> EntryOut {
     attr_valid: valid.0,
     entry_valid_nsec: valid.1,
     attr_valid_nsec: valid.1,
-    attr: fuse_attr(node, dax),
+    attr: fuse_attr(node, dax, owners),
   }
 }
 
@@ -856,7 +892,7 @@ fn entry_reply(
   let node = result?;
   let valid = valid_for(bridge, cx, node.ino);
   let dax = dax_for(bridge, &node);
-  Ok(entry_out(&node, valid, dax))
+  Ok(entry_out(&node, valid, dax, bridge.owner_view()))
 }
 
 /// An attribute reply (`GETATTR`/`SETATTR`) with the object's cache lifetime.
@@ -871,7 +907,7 @@ fn attr_reply(
   Ok(AttrOut {
     attr_valid,
     attr_valid_nsec,
-    attr: fuse_attr(&node, dax),
+    attr: fuse_attr(&node, dax, bridge.owner_view()),
   })
 }
 
@@ -906,14 +942,21 @@ fn recover_unique(message: &[u8]) -> Option<u64> {
     .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
 }
 
+/// `FUSE_INIT`: negotiated for the transport `bridge` serves, which says whether it offers per-inode DAX and whether its
+/// kernel is a guest's, asked to check the guest's ACLs (A-314).
 fn serve_init(
   body: &[u8],
   unique: u64,
-  coherence: CacheCoherence,
-  dax: DaxOffer,
+  cx: &OpContext,
+  bridge: &mut dyn Bridge,
   out: &mut [u8],
 ) -> usize {
-  match negotiate_offering(body, coherence, dax) {
+  match negotiate_offering(
+    body,
+    cx.coherence,
+    bridge.dax_offer(),
+    bridge.attribute_namespaces(),
+  ) {
     Ok(n) => write_or_drop(ReplyHeader::write_ok(unique, &n.to_bytes(), out), out),
     Err(_) => write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
   }
@@ -1238,7 +1281,7 @@ fn serve_readdirplus(
     let valid = valid_for(bridge, cx, entry.ino);
     let dax = dax_for(bridge, &node);
     if !dir.push_plus(
-      &entry_out(&node, valid, dax),
+      &entry_out(&node, valid, dax, bridge.owner_view()),
       entry.cookie,
       dtype(entry.kind),
       &entry.name,
@@ -1267,10 +1310,7 @@ fn serve_create(
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
   let flags = body_u32(req.body, 0).unwrap_or_default();
-  let mode = masked(
-    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
-    body_u32(req.body, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
-  );
+  let mode = permission_bits(body_u32(req.body, size_of::<u32>()).unwrap_or_default());
   let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
     Ok(name) => name,
     Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
@@ -1290,7 +1330,7 @@ fn serve_create(
       let valid = valid_for(bridge, cx, node.ino);
       let dax = dax_for(bridge, &node);
       let open_flags = open_flags_for(bridge, cx, ObjectId::new(node.ino, 0), false, flags);
-      let mut body = entry_out(&node, valid, dax).to_bytes();
+      let mut body = entry_out(&node, valid, dax, bridge.owner_view()).to_bytes();
       body.extend_from_slice(&OpenOut { fh, open_flags }.to_bytes());
       write_or_drop(ReplyHeader::write_ok(req.header.unique, &body, out), out)
     }
@@ -1318,10 +1358,7 @@ fn serve_tmpfile(
     return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
   }
   let flags = body_u32(req.body, 0).unwrap_or_default();
-  let mode = masked(
-    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
-    body_u32(req.body, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
-  );
+  let mode = permission_bits(body_u32(req.body, size_of::<u32>()).unwrap_or_default());
   let parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
     Err(e) => return reply_err(unique, e, out),
@@ -1345,7 +1382,7 @@ fn serve_tmpfile(
   let valid = valid_for(bridge, cx, node.ino);
   let dax = dax_for(bridge, &node);
   let open_flags = open_flags_for(bridge, cx, ObjectId::new(node.ino, 0), false, flags);
-  let mut body = entry_out(&node, valid, dax).to_bytes();
+  let mut body = entry_out(&node, valid, dax, bridge.owner_view()).to_bytes();
   body.extend_from_slice(&OpenOut { fh, open_flags }.to_bytes());
   write_or_drop(ReplyHeader::write_ok(unique, &body, out), out)
 }
@@ -1446,7 +1483,9 @@ fn serve_destroy(
   )
 }
 
-/// Linux fuse_mknod_in (four u32 words), followed by the NUL-terminated name (A-26).
+/// Linux fuse_mknod_in (four u32 words), followed by the NUL-terminated name: a FIFO or socket name (A-26), or a
+/// device node whose number is kept as metadata (A-294); the mount is `nodev`, so the kernel opens none of them as a
+/// device.
 fn serve_mknod(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
@@ -1465,9 +1504,16 @@ fn serve_mknod(
       .try_into()
       .unwrap_or_default(),
   );
-  let kind = match slates_vfs::export::kind_of_mode(mode) {
-    Some(kind @ (Kind::Fifo | Kind::Socket)) => kind,
-    _ => return reply_err(req.header.unique, VfsError::SpecialFileOperation, out),
+  // The kernel sends a device's number in its own encoding (`fuse_mknod`: `new_encode_dev`), zero for any other kind.
+  let device = slates_vfs::inode::DeviceNumber::from_linux(
+    body_u32(head, size_of::<u32>()).unwrap_or_default(),
+  );
+  let node = match slates_vfs::export::kind_of_mode(mode)
+    .and_then(|kind| slates_vfs::inode::SpecialNode::of(kind, device))
+  {
+    Some(node) => node,
+    // A regular file is made by `CREATE`, which this mount serves; any other type here is refused.
+    None => return reply_err(req.header.unique, VfsError::SpecialFileOperation, out),
   };
   let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
     Ok(name) => name,
@@ -1478,16 +1524,7 @@ fn serve_mknod(
     Err(error) => return reply_err(req.header.unique, error, out),
   };
   let result = bridge
-    .mknod(
-      parent,
-      cx,
-      name,
-      masked(
-        mode,
-        body_u32(head, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
-      ),
-      kind,
-    )
+    .mknod(parent, cx, name, permission_bits(mode), node)
     .and_then(|node| referenced(bridge, cx, node));
   let result = entry_reply(bridge, cx, result);
   reply(req.header.unique, result, |entry| entry.to_bytes(), out)
@@ -1504,10 +1541,7 @@ fn serve_mkdir(
   if req.body.len() < HEAD {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
-  let mode = masked(
-    body_u32(req.body, 0).unwrap_or_default(),
-    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
-  );
+  let mode = permission_bits(body_u32(req.body, 0).unwrap_or_default());
   let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
     Ok(name) => name,
     Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
@@ -1711,6 +1745,8 @@ fn setattr_changes(
   s: &SetAttrIn,
 ) -> Result<SetAttr, VfsError> {
   let set = |bit: u32| s.valid & bit != 0;
+  // A chown names ids as the guest sees them: kept as the volume's (A-281).
+  let owners = bridge.owner_view();
   let now = if set(SetAttrIn::FATTR_ATIME_NOW) || set(SetAttrIn::FATTR_MTIME_NOW) {
     Some(bridge.now())
   } else {
@@ -1729,8 +1765,8 @@ fn setattr_changes(
   Ok(SetAttr {
     size: set(SetAttrIn::FATTR_SIZE).then_some(s.size),
     mode,
-    uid: set(SetAttrIn::FATTR_UID).then_some(s.uid),
-    gid: set(SetAttrIn::FATTR_GID).then_some(s.gid),
+    uid: set(SetAttrIn::FATTR_UID).then_some(owners.kept_uid(s.uid)),
+    gid: set(SetAttrIn::FATTR_GID).then_some(owners.kept_gid(s.gid)),
     atime: match now {
       Some(now) if set(SetAttrIn::FATTR_ATIME_NOW) => Some(now),
       _ => set(SetAttrIn::FATTR_ATIME).then_some(s.atime),
@@ -1747,26 +1783,48 @@ fn setattr_changes(
   })
 }
 
-/// Format: the only attribute namespace a volume stores through a Linux mount, as the NFSv4.2 bridge stores it
-/// (RFC 8276 names are `user.` attributes). `security.`, `trusted.` and `system.` belong to the host's LSM, its
-/// administrator and its ACLs, none of which a volume carries.
-const USER_NAMESPACE: &[u8] = b"user.";
 /// Format: `setxattr(2)`'s `XATTR_CREATE` (fail if the name is set) and `XATTR_REPLACE` (fail unless it is).
 const XATTR_CREATE: u32 = 1;
 /// Format: see [`XATTR_CREATE`].
 const XATTR_REPLACE: u32 = 2;
 
-/// The name an attribute request carries (NUL-terminated after the fixed part), when it is a `user.` name.
-fn user_attribute(body: &[u8]) -> Option<&[u8]> {
+/// The name an attribute request carries (NUL-terminated after the fixed part), when it lies in a namespace the
+/// transport reaches (A-290): `user.` through a host's mount, as the NFSv4.2 bridge stores RFC 8276's names, since a
+/// host's `security.`, `trusted.` and `system.` belong to its own LSM, administrator and ACLs; and the guest's own
+/// `trusted.` and `security.` as well on a guest kernel's route, where they are the guest's data.
+fn reached_attribute(body: &[u8], namespaces: AttributeNamespaces) -> Option<&[u8]> {
   let end = body.iter().position(|b| *b == 0)?;
-  body
-    .get(..end)
-    .filter(|name| name.starts_with(USER_NAMESPACE) && name.len() > USER_NAMESPACE.len())
+  body.get(..end).filter(|name| namespaces.reaches(name))
+}
+
+/// `value`, attribute `name`'s, turned `toward` the volume's ids or the guest's when it is a POSIX ACL (A-302): an ACL
+/// names owners, kept and shown through the bridge's [`OwnerView`] as a chown's and a stat's are. `None` for any other
+/// attribute, whose value is as it is; the ACL's refusal for a value no ACL parse takes.
+fn acl_turned(
+  bridge: &mut dyn Bridge,
+  name: Option<&[u8]>,
+  value: &[u8],
+  toward: Toward,
+) -> Result<Option<Vec<u8>>, AclRefusal> {
+  if !name.is_some_and(slates_bridge_core::is_posix_acl) {
+    return Ok(None);
+  }
+  posix_acl::translated(value, bridge.owner_view(), toward).map(Some)
+}
+
+/// The errno a set of an ACL Linux would refuse is answered with, as `posix_acl_from_xattr` and `posix_acl_valid` answer
+/// it (`fs/posix_acl.c`): `EOPNOTSUPP` for another format version, `EINVAL` for anything else malformed.
+fn acl_refusal_errno(refusal: AclRefusal) -> i32 {
+  match refusal {
+    AclRefusal::Version => EOPNOTSUPP,
+    AclRefusal::Invalid => EINVAL,
+  }
 }
 
 /// `GETXATTR` (and, `list`, `LISTXATTR`): `fuse_getxattr_in` is the caller's buffer size and padding, then for a
 /// get the name. A size of zero asks for the length (`fuse_getxattr_out`); a buffer too small is `ERANGE`; a name
-/// outside `user.` is not set (`ENODATA`); a listing names only `user.` attributes, each NUL-terminated.
+/// outside the namespaces the transport reaches is not set (`ENODATA`); a listing names only the attributes in them,
+/// each NUL-terminated.
 fn serve_getxattr(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
@@ -1784,23 +1842,34 @@ fn serve_getxattr(
     Ok(object) => object,
     Err(e) => return reply_err(unique, e, out),
   };
-  let value = if list {
-    bridge.xattr_list(object, cx).map(|names| {
-      names
-        .iter()
-        .filter(|name| name.starts_with(USER_NAMESPACE))
-        .flat_map(|name| name.iter().copied().chain(std::iter::once(0)))
-        .collect::<Vec<u8>>()
-    })
+  let namespaces = bridge.attribute_namespaces();
+  let name = if list {
+    None
   } else {
-    match user_attribute(req.body.get(HEAD..).unwrap_or_default()) {
-      Some(name) => bridge.xattr_get(object, cx, name),
+    match reached_attribute(req.body.get(HEAD..).unwrap_or_default(), namespaces) {
+      Some(name) => Some(name),
       None => return write_or_drop(ReplyHeader::write_error(unique, ENODATA, out), out),
     }
+  };
+  let value = match name {
+    None => bridge.xattr_list(object, cx).map(|names| {
+      names
+        .iter()
+        .filter(|name| namespaces.reaches(name))
+        .flat_map(|name| name.iter().copied().chain(std::iter::once(0)))
+        .collect::<Vec<u8>>()
+    }),
+    Some(name) => bridge.xattr_get(object, cx, name),
   };
   let value = match value {
     Ok(value) => value,
     Err(e) => return reply_err(unique, e, out),
+  };
+  // A stored ACL no ACL parse takes is the volume's fault, never the caller's: EIO.
+  let value = match acl_turned(bridge, name, &value, Toward::Shown) {
+    Ok(Some(shown)) => shown,
+    Ok(None) => value,
+    Err(_) => return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
   };
   let length = u32::try_from(value.len()).unwrap_or(u32::MAX);
   if size == 0 {
@@ -1815,24 +1884,34 @@ fn serve_getxattr(
   write_or_drop(ReplyHeader::write_ok(unique, &value, out), out)
 }
 
-/// `SETXATTR`: `fuse_setxattr_in` is the value's size and the `setxattr(2)` flags (slates does not negotiate
-/// `FUSE_SETXATTR_EXT`, so the short form), then the name, then the value. Only `user.` names are stored; any other
-/// is `EOPNOTSUPP`, what a filesystem without that namespace answers.
+/// `SETXATTR`: `fuse_setxattr_in` is the value's size and the `setxattr(2)` flags, and on a connection whose kernel
+/// sends the extended form (`FUSE_SETXATTR_EXT`, a guest's route, A-378) the setter's flags and a pad; then the name,
+/// then the value. Only a name in a namespace the transport reaches is stored; any other is `EOPNOTSUPP`, what a
+/// filesystem without that namespace answers. A POSIX ACL is checked as Linux checks one and kept with its named owners
+/// turned through the bridge's view (A-302), and the seam keeps the file's mode with an access ACL (A-314); an access
+/// ACL whose setter the kernel says is outside the file's group (`FUSE_SETXATTR_ACL_KILL_SGID`) clears the file's
+/// set-group-ID bit as it is set ([`kill_sgid`]).
 fn serve_setxattr(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
   cx: &OpContext,
   out: &mut [u8],
 ) -> usize {
-  /// Format: `fuse_setxattr_in` — size, flags — before the name.
-  const HEAD: usize = 2 * size_of::<u32>();
   let unique = req.header.unique;
   let (Some(size), Some(flags)) = (body_u32(req.body, 0), body_u32(req.body, size_of::<u32>()))
   else {
     return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
   };
-  let rest = req.body.get(HEAD..).unwrap_or_default();
-  let Some(name) = user_attribute(rest) else {
+  let (head, setter_flags) = if bridge.setxattr_ext() {
+    match body_u32(req.body, crate::abi::COMPAT_SETXATTR_IN_BYTES) {
+      Some(setter_flags) => (crate::abi::SETXATTR_IN_BYTES, setter_flags),
+      None => return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
+    }
+  } else {
+    (crate::abi::COMPAT_SETXATTR_IN_BYTES, 0)
+  };
+  let rest = req.body.get(head..).unwrap_or_default();
+  let Some(name) = reached_attribute(rest, bridge.attribute_namespaces()) else {
     return write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out);
   };
   let value_at = name.len().saturating_add(1);
@@ -1850,15 +1929,73 @@ fn serve_setxattr(
     Ok(object) => object,
     Err(e) => return reply_err(unique, e, out),
   };
-  reply(
-    unique,
-    bridge.xattr_set(object, cx, name, value, how),
-    |()| Vec::new(),
-    out,
-  )
+  if let Some(errno) = default_acl_refused(bridge, cx, object, name) {
+    return write_or_drop(ReplyHeader::write_error(unique, errno, out), out);
+  }
+  let value = match acl_turned(bridge, Some(name), value, Toward::Kept) {
+    Ok(Some(kept)) => std::borrow::Cow::Owned(kept),
+    Ok(None) => std::borrow::Cow::Borrowed(value),
+    Err(refusal) => {
+      return write_or_drop(
+        ReplyHeader::write_error(unique, acl_refusal_errno(refusal), out),
+        out,
+      );
+    }
+  };
+  let set = bridge
+    .xattr_set(object, cx, name, &value, how)
+    .and_then(|()| {
+      if setter_flags & crate::abi::SETXATTR_ACL_KILL_SGID != 0
+        && name == slates_bridge_core::POSIX_ACL_ACCESS
+      {
+        kill_sgid(bridge, cx, object)
+      } else {
+        Ok(())
+      }
+    });
+  reply(unique, set, |()| Vec::new(), out)
 }
 
-/// `REMOVEXATTR`: the body is the name. A name outside `user.` is `EOPNOTSUPP`; an unset one `ENODATA`.
+/// Clears `object`'s set-group-ID bit, if it has one, as Linux's own filesystems do when a setter outside the file's
+/// group without `CAP_FSETID` sets its access ACL (`posix_acl_update_mode`); a FUSE kernel says so by
+/// `FUSE_SETXATTR_ACL_KILL_SGID` and leaves the clearing to its server (A-378). The permission bits stay as the ACL's set
+/// just left them. It follows a set that succeeded, so a refused set changes nothing, as Linux keeps neither the mode it
+/// computed nor the ACL on a refusal; and that set made the inode current, so this chmod needs no room.
+fn kill_sgid(bridge: &mut dyn Bridge, cx: &OpContext, object: ObjectId) -> Result<(), VfsError> {
+  let mode = bridge.getattr(object, cx)?.mode;
+  if mode & S_ISGID == 0 {
+    return Ok(());
+  }
+  bridge
+    .setattr(
+      object,
+      cx,
+      slates_bridge_core::SetAttr {
+        mode: Some(mode & !S_ISGID),
+        ..slates_bridge_core::SetAttr::default()
+      },
+    )
+    .map(drop)
+}
+
+/// The errno a default ACL set on anything but a directory is refused with (A-302): `EACCES`, as Linux's
+/// `set_posix_acl` refuses one, since only a directory's new entries inherit it. `None` for any other attribute, and
+/// for a node whose kind cannot be read, which the set that follows refuses itself.
+fn default_acl_refused(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  name: &[u8],
+) -> Option<i32> {
+  if name != slates_bridge_core::POSIX_ACL_DEFAULT {
+    return None;
+  }
+  let node = bridge.getattr(object, cx).ok()?;
+  (node.kind != Kind::Dir).then_some(EACCES)
+}
+
+/// `REMOVEXATTR`: the body is the name. A name outside the namespaces the transport reaches is `EOPNOTSUPP`; an unset
+/// one `ENODATA`.
 fn serve_removexattr(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
@@ -1866,7 +2003,7 @@ fn serve_removexattr(
   out: &mut [u8],
 ) -> usize {
   let unique = req.header.unique;
-  let Some(name) = user_attribute(req.body) else {
+  let Some(name) = reached_attribute(req.body, bridge.attribute_namespaces()) else {
     return write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out);
   };
   let object = match resolve(bridge, cx, req.header.nodeid) {
@@ -1897,4 +2034,175 @@ fn serve_statfs(
     |s| s.to_bytes(),
     out,
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_bridge_core::{Attachments, OpContext, Rights, View};
+  use slates_db::catalog::{Principal, VolumeId};
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+  use slates_vfs::base::BaseConfig;
+  use slates_vfs::clock::HostClock;
+  use slates_vfs::host::{
+    BaseEntry, FetchId, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, WatchState,
+  };
+  use slates_vfs::inode::Fingerprint;
+  use slates_vfs::names::NameEquivalence;
+  use slates_vfs::quota::Quota;
+  use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
+
+  use super::{EAGAIN, EIO, dispatch};
+  use crate::abi::{IN_HEADER_LEN, Opcode};
+  use crate::volume_bridge::VolumeBridge;
+
+  /// Shape: the store's page and the pages its region maps: room for an overlay's root.
+  const PAGE: usize = 4096;
+  /// Shape: see [`PAGE`].
+  const REGION_PAGES: usize = 64;
+  /// Shape: the fetch the base's host has under way, whose name every pending answer gives.
+  const FETCH: FetchId = FetchId(7);
+
+  /// A base host whose every read waits on one fetch under way, as an S3 base's does before its first listing lands
+  /// (§4.15 "An S3 base").
+  struct Fetching;
+
+  impl HostFs for Fetching {
+    fn facts(&mut self, _dir: HostDir) -> Result<HostFacts, HostError> {
+      Ok(HostFacts {
+        timestamp_granularity_ns: 1,
+      })
+    }
+    fn fingerprint_dir(&mut self, _dir: HostDir) -> Result<Fingerprint, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn list(&mut self, _dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn open_dir(&mut self, _parent: HostDir, _name: &str) -> Result<HostDir, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn open_file(&mut self, _dir: HostDir, _name: &str) -> Result<HostFile, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn fstat(&mut self, _file: HostFile) -> Result<Fingerprint, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn read_at(&mut self, _file: HostFile, _off: u64, _buf: &mut [u8]) -> Result<usize, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn read_link(&mut self, _dir: HostDir, _name: &str) -> Result<Box<str>, HostError> {
+      Err(HostError::Pending(FETCH))
+    }
+    fn close_file(&mut self, _file: HostFile) {}
+    fn close_dir(&mut self, _dir: HostDir) {}
+    fn watch(&mut self, _dir: HostDir) -> WatchState {
+      WatchState::Unavailable
+    }
+    fn hints(&mut self) -> Vec<Hint> {
+      Vec::new()
+    }
+    fn now_ns(&mut self) -> i64 {
+      0
+    }
+  }
+
+  /// A store with room for an overlay's root.
+  fn store() -> Store {
+    let mut arena = ChunkArena::new(PAGE);
+    arena
+      .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    Store::new(
+      &StoreConfig {
+        page: PAGE,
+        cache_line: 128,
+        max_dirs: 16,
+        max_inodes: 64,
+        max_chunks: REGION_PAGES,
+        max_dir_blocks: 16,
+        dir_cutover: 16,
+      },
+      arena,
+      0,
+    )
+  }
+
+  /// A read-write context on the volume the tests' bridge serves.
+  fn context() -> OpContext {
+    let mut attachments = Attachments::new();
+    let attachment = attachments
+      .attach(
+        VolumeId { bytes: [0; 16] },
+        View::Current,
+        Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        Rights {
+          read: true,
+          write: true,
+        },
+      )
+      .unwrap();
+    attachments.context(attachment).unwrap()
+  }
+
+  /// The errno a FUSE `LOOKUP` of `name` in the root of an overlay over [`Fetching`] is answered with, as the kernel
+  /// reads it from the reply's header.
+  fn lookup_errno(name: &str) -> i32 {
+    let mut store = store();
+    let mut volume = Volume::create_overlay(
+      &mut store,
+      VolumeConfig {
+        prefix: 1,
+        names: NameEquivalence::Exact,
+        quota: Quota::Bounded { limit: 1 << 30 },
+        journal_bytes: 1 << 16,
+        clock: Box::new(HostClock::default()),
+      },
+      BaseConfig {
+        root: HostDir(1),
+        facts: HostFacts {
+          timestamp_granularity_ns: 1,
+        },
+        large_class_bytes: 1 << 20,
+      },
+    )
+    .unwrap();
+    let mut bridge = VolumeBridge::with_base(
+      VolumeId { bytes: [0; 16] },
+      &mut volume,
+      &mut store,
+      Box::new(Fetching),
+    );
+    let mut body = name.as_bytes().to_vec();
+    body.push(0);
+    let mut message = vec![0u8; IN_HEADER_LEN];
+    message[0..4].copy_from_slice(
+      &u32::try_from(IN_HEADER_LEN + body.len())
+        .unwrap()
+        .to_le_bytes(),
+    );
+    message[4..8].copy_from_slice(&Opcode::Lookup.to_wire().to_le_bytes());
+    message[8..16].copy_from_slice(&1u64.to_le_bytes());
+    message[16..24].copy_from_slice(&1u64.to_le_bytes());
+    message.extend_from_slice(&body);
+    let mut out = vec![0u8; PAGE];
+    dispatch(&message, &mut bridge, &context(), &mut out);
+    -i32::from_le_bytes(out[4..8].try_into().unwrap())
+  }
+
+  /// A-555 (§4.15 "An S3 base"): do look a name up in the root of an overlay whose base is still fetching its root's
+  /// listing. Expect `EAGAIN`, the retry a delegated file's recall is answered with: nothing changed, and the same
+  /// request succeeds once the fetch lands. A daemon parks the request on its fetch where it can; this is the answer
+  /// for one it could not park. Before A-555 a pending base fell to `EIO`, which tells a program its store failed.
+  #[test]
+  fn a_lookup_in_a_base_still_fetching_is_answered_a_retry_never_eio() {
+    let errno = lookup_errno("a.txt");
+    assert_eq!(
+      errno, EAGAIN,
+      "the base is fetching, not failed (EIO is {EIO})"
+    );
+  }
 }

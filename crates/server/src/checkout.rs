@@ -143,7 +143,7 @@ impl Head {
     Head {
       files: green
         .files()
-        .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
+        .map(|(path, bytes)| (path, bytes.to_vec()))
         .collect(),
       dirs: base.dirs.iter().cloned().collect(),
       modes: base.modes.iter().cloned().collect(),
@@ -268,6 +268,34 @@ fn mode_steps(
   }
 }
 
+/// A green's origin as its partition records it, which a checkout's base must still give (A-201).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedOrigin {
+  /// The BLAKE3 of the origin's canonical encoding: a reference to the base snapshot (A-217), or the bytes a green taken
+  /// over before A-333 recorded.
+  Identity([u8; 32]),
+  /// The manifest identity of version 0's inputs, the origin's canonical encoding archived: a green its takeover adopted
+  /// from this node's holder ledger (A-333).
+  Inputs([u8; 32]),
+}
+
+/// How `green`'s partition records its origin, `None` for a green with none (a scratch green's).
+fn recorded_origin(
+  partition: &slates_db::partition::Partition,
+  green: slates_db::catalog::VolumeId,
+) -> Option<RecordedOrigin> {
+  if let Some(held) = partition.green_origin_ref(green) {
+    return Some(RecordedOrigin::Identity(held.identity));
+  }
+  if let Some(bytes) = partition.green_origin(green) {
+    return Some(RecordedOrigin::Identity(*blake3::hash(bytes).as_bytes()));
+  }
+  partition
+    .green_adoption(green)
+    .and_then(|adoption| adoption.origin)
+    .map(RecordedOrigin::Inputs)
+}
+
 /// Checks a checkout at once and defers its steps to a task (the module doc). `attachment` is the caller's write
 /// attachment of `base.volume`.
 pub(crate) fn checkout_verb(
@@ -291,17 +319,12 @@ pub(crate) fn checkout_verb(
   if !rights_of(&base_record, principal).write {
     return forbidden("checkout");
   }
-  // The origin's identity as the green recorded it: a based green holds a reference to its base snapshot with the
-  // identity (A-217); a green taken over by another host still records the origin's bytes. A scratch green has neither
-  // and no base to write into.
-  let partition = state.db.partition();
-  let recorded = match (
-    partition.green_origin_ref(record.id),
-    partition.green_origin(record.id),
-  ) {
-    (Some(held), _) => held.identity,
-    (None, Some(bytes)) => *blake3::hash(bytes).as_bytes(),
-    (None, None) => return refused(Refusal::ConsistentBaseUnavailable),
+  // The origin as the green recorded it: a based green holds a reference to its base snapshot with the origin's
+  // identity (A-217); a green taken over before A-333 recorded the origin's bytes; one adopted by its takeover names
+  // version 0 by the manifest of its inputs, the origin's canonical bytes archived (A-333). A scratch green has none of
+  // them and no base to write into.
+  let Some(recorded) = recorded_origin(state.db.partition(), record.id) else {
+    return refused(Refusal::ConsistentBaseUnavailable);
   };
   let unchanged = match state.volumes.get(handle) {
     Ok(slot) => slot.volume.unchanged_since(core_snapshot(base.snapshot)),
@@ -322,14 +345,27 @@ pub(crate) fn checkout_verb(
     Ok(origin) => origin,
     Err(refusal) => return refused(refusal),
   };
-  if crate::merge_service::origin_identity(&origin) != recorded {
+  let unchanged_origin = match recorded {
+    RecordedOrigin::Identity(identity) => {
+      crate::merge_service::origin_identity(&origin) == identity
+    }
+    RecordedOrigin::Inputs(manifest) => {
+      crate::merge_origin::inputs_manifest_identity(&origin.encode()) == manifest
+    }
+  };
+  if !unchanged_origin {
     return refused(Refusal::ConsistentBaseUnavailable);
   }
-  let Some(engine) = state.greens.get(&record.id) else {
+  // The green is lent for its head and the plan, then given back before the checkout's steps change anything.
+  let Some((version, planned)) = state.greens.get(&record.id).map(|engine| {
+    (
+      engine.head(),
+      plan(&Head::of_origin(&origin), &Head::of_green(&engine)),
+    )
+  }) else {
     return refused(Refusal::NotFound);
   };
-  let version = engine.head();
-  let (steps, report) = match plan(&Head::of_origin(&origin), &Head::of_green(engine)) {
+  let (steps, report) = match planned {
     Ok(planned) => planned,
     Err(path) => {
       return refused(Refusal::Unsupported {
@@ -344,6 +380,12 @@ pub(crate) fn checkout_verb(
       feature: "a checkout outside a recorded request".to_owned(),
     });
   };
+  // On a live-shipped volume the checkout's reply waits for durability (`run`), so it is seated among the shard's held
+  // replies before its first step writes: the bound met now, with nothing written, never after (A-200;
+  // `crate::live_ship::take_seat`).
+  if let Err(refusal) = crate::live_ship::take_seat(state, to_db_volume(base.volume), request) {
+    return refused(refusal);
+  }
   let job = Job {
     request,
     principal: principal.clone(),
@@ -353,7 +395,11 @@ pub(crate) fn checkout_verb(
     report,
     steps: steps.into_iter(),
   };
-  crate::image::defer(state, run(job))
+  let reply = crate::image::defer(state, run(job));
+  if matches!(reply, ReplyBody::Refused { .. }) {
+    crate::live_ship::release_seat(state, request);
+  }
+  reply
 }
 
 /// A checkout between its slices.

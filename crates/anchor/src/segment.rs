@@ -8,12 +8,14 @@ use slates_mem::{Handoff, SparseObject, Width, WordRun, Words};
 use crate::error::AnchorError;
 use crate::layout::{
   AT_GENERATION, AT_GEOMETRY, AT_IDENTITY, AT_MAGIC, AT_TOTAL, AT_VERSION, GEOMETRY_BYTES,
-  Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAYOUT_VERSION, MAGIC,
-  PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE,
-  RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES, SESSION_SECRET_BYTES,
-  SUP_GENERATION, SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_LOG_REFUSALS, SUP_PID,
-  SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SERVING, SUP_SESSION_PRESENT,
-  SUP_SESSION_SECRET, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
+  Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAUNCHER_SECRET_BYTES,
+  LAYOUT_VERSION, MAGIC, PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD,
+  RING_SEQ_BASE, RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES,
+  SESSION_SECRET_BYTES, SSH_HOST_SEED_BYTES, SUP_GENERATION, SUP_HEARTBEAT, SUP_HOLD_REFUSALS,
+  SUP_ISSUER, SUP_LAPSE_BOUND, SUP_LAUNCHER_PRESENT, SUP_LAUNCHER_SECRET, SUP_LOG_REFUSALS,
+  SUP_LOOKED, SUP_PID, SUP_RECOVERED, SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SERVING,
+  SUP_SESSION_PRESENT, SUP_SESSION_SECRET, SUP_SSH_HOST_PRESENT, SUP_SSH_HOST_SEED, SUP_STARTED,
+  SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
 };
 
 /// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
@@ -78,6 +80,9 @@ fn segment_words(geometry: &Geometry) -> Words {
           Width::U64,
         ))
         .with(WordRun::one(at.saturating_add(SUP_SERVING), Width::U64))
+        .with(WordRun::one(at.saturating_add(SUP_LOOKED), Width::U64))
+        .with(WordRun::one(at.saturating_add(SUP_RECOVERED), Width::U64))
+        .with(WordRun::one(at.saturating_add(SUP_LAPSE_BOUND), Width::U64))
         .with(WordRun::one(
           at.saturating_add(SUP_SESSION_PRESENT),
           Width::U64,
@@ -85,6 +90,24 @@ fn segment_words(geometry: &Geometry) -> Words {
         .with(WordRun::racy(
           at.saturating_add(SUP_SESSION_SECRET),
           SESSION_SECRET_BYTES,
+        ))
+        .with(WordRun::one(
+          at.saturating_add(SUP_LAUNCHER_PRESENT),
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(SUP_LAUNCHER_SECRET),
+          LAUNCHER_SECRET_BYTES,
+        ))
+        // The SSH edge's host key (A-684): its published word, and its seed, written once by the anchor before any
+        // daemon reads it.
+        .with(WordRun::one(
+          at.saturating_add(SUP_SSH_HOST_PRESENT),
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(SUP_SSH_HOST_SEED),
+          SSH_HOST_SEED_BYTES,
         )),
       // The content pool's owner words (A-98), each claimed by compare-and-swap.
       RegionKind::Pool => words.with(WordRun::strided(
@@ -93,7 +116,7 @@ fn segment_words(geometry: &Geometry) -> Words {
         usize::from(geometry.partitions).saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION),
         Width::U64,
       )),
-      RegionKind::Log(_) | RegionKind::Audit => words.with(WordRun::strided(
+      RegionKind::Log(_) => words.with(WordRun::strided(
         at.saturating_add(RING_HEAD),
         size_of::<u64>(),
         RING_WORDS,
@@ -151,6 +174,9 @@ pub struct Supervision<'a> {
   hold_refusals: &'a AtomicU64,
   log_refusals: &'a AtomicU64,
   serving: &'a AtomicU64,
+  looked: &'a AtomicU64,
+  recovered: &'a AtomicU64,
+  lapse_bound: &'a AtomicU64,
 }
 
 impl Supervision<'_> {
@@ -195,9 +221,31 @@ impl Supervision<'_> {
     self.serving.store(now_ns.max(1), Ordering::Release);
   }
 
+  /// The daemon's watchdog marks a look at its shards (`layout::SUP_LOOKED`), at every look, beating or not.
+  pub fn look(&self, now_ns: u64) {
+    self.looked.store(now_ns.max(1), Ordering::Release);
+  }
+
+  /// When the current daemon's watchdog last looked at its shards, if it has since its start.
+  pub fn looked_ns(&self) -> Option<u64> {
+    Some(self.looked.load(Ordering::Acquire)).filter(|at| *at != 0)
+  }
+
   /// When the current daemon began serving, if it has since its start.
   pub fn serving_since(&self) -> Option<u64> {
     Some(self.serving.load(Ordering::Acquire)).filter(|at| *at != 0)
+  }
+
+  /// The anchor marks its verdict that the current daemon has served as long as its start took
+  /// (`layout::SUP_RECOVERED`, A-311): `now_ns` on the anchor's clock, never zero.
+  pub fn mark_recovered(&self, now_ns: u64) {
+    self.recovered.store(now_ns.max(1), Ordering::Release);
+  }
+
+  /// When the anchor judged the current daemon recovered, if it has since its start: from then on its exit is no failed
+  /// start (A-311).
+  pub fn recovered_since(&self) -> Option<u64> {
+    Some(self.recovered.load(Ordering::Acquire)).filter(|at| *at != 0)
   }
 
   /// The anchor asks the daemon to stop gracefully (`layout::SUP_STOP`): `now_ns` in the heartbeat's host
@@ -225,6 +273,8 @@ impl Supervision<'_> {
   /// The anchor records a start. A new daemon starts with no stop requested or declared.
   pub fn record_start(&self, pid: u64, now_ns: u64, restart: bool) {
     self.serving.store(0, Ordering::Release);
+    self.looked.store(0, Ordering::Release);
+    self.recovered.store(0, Ordering::Release);
     self.stop.store(0, Ordering::Release);
     self.stop_by.store(0, Ordering::Release);
     self.pid.store(pid, Ordering::Release);
@@ -255,6 +305,18 @@ impl Supervision<'_> {
   /// The log lines the anchor could not write over its life, as it last published them (A-213).
   pub fn log_refusals(&self) -> u64 {
     self.log_refusals.load(Ordering::Acquire)
+  }
+
+  /// The anchor publishes the age past which it takes its daemon's beat for lapsed (`layout::SUP_LAPSE_BOUND`, A-574).
+  pub fn record_lapse_bound(&self, bound_ns: u64) {
+    self.lapse_bound.store(bound_ns, Ordering::Release);
+  }
+
+  /// The age past which the anchor takes its daemon's beat for lapsed, as it last published it (A-574); `None` where no
+  /// anchor published one (a daemon run alone, or one under an older anchor).
+  pub fn lapse_bound_ns(&self) -> Option<u64> {
+    std::num::NonZeroU64::new(self.lapse_bound.load(Ordering::Acquire))
+      .map(std::num::NonZeroU64::get)
   }
 
   /// The anchor records an exit.
@@ -580,6 +642,9 @@ impl AnchorSegment {
       hold_refusals: self.word_at(spec, SUP_HOLD_REFUSALS)?,
       log_refusals: self.word_at(spec, SUP_LOG_REFUSALS)?,
       serving: self.word_at(spec, SUP_SERVING)?,
+      looked: self.word_at(spec, SUP_LOOKED)?,
+      recovered: self.word_at(spec, SUP_RECOVERED)?,
+      lapse_bound: self.word_at(spec, SUP_LAPSE_BOUND)?,
     })
   }
 
@@ -655,6 +720,89 @@ impl AnchorSegment {
     let mut secret = [0u8; SESSION_SECRET_BYTES];
     self.object.read_racy(at, &mut secret)?;
     Ok(Some(secret))
+  }
+
+  /// Publishes the launcher secret (`layout::SUP_LAUNCHER_PRESENT`, A-299): the secret, then the published word,
+  /// released after it, so a reader that sees the word sees the whole secret. The anchor publishes it once, before it
+  /// starts any daemon, from what its starter provided; every daemon under the anchor reads it.
+  pub fn publish_launcher_secret(
+    &mut self,
+    secret: &[u8; LAUNCHER_SECRET_BYTES],
+  ) -> Result<(), AnchorError> {
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_LAUNCHER_SECRET,
+      LAUNCHER_SECRET_BYTES,
+    )?;
+    self.object.write_racy(at, secret)?;
+    let spec = self.spec(RegionKind::Supervision)?;
+    self
+      .word_at(spec, SUP_LAUNCHER_PRESENT)?
+      .store(1, Ordering::Release);
+    Ok(())
+  }
+
+  /// The launcher secret, if this anchor's starter provided one (A-299): what a launcher-class proof may be keyed by
+  /// beside the issuer secret.
+  pub fn launcher_secret(&self) -> Result<Option<[u8; LAUNCHER_SECRET_BYTES]>, AnchorError> {
+    let spec = self.spec(RegionKind::Supervision)?;
+    if self
+      .word_at(spec, SUP_LAUNCHER_PRESENT)?
+      .load(Ordering::Acquire)
+      != 1
+    {
+      return Ok(None);
+    }
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_LAUNCHER_SECRET,
+      LAUNCHER_SECRET_BYTES,
+    )?;
+    let mut secret = [0u8; LAUNCHER_SECRET_BYTES];
+    self.object.read_racy(at, &mut secret)?;
+    Ok(Some(secret))
+  }
+
+  /// Publishes the seed of the version-control SSH edge's host key (`layout::SUP_SSH_HOST_PRESENT`, A-684): the seed,
+  /// then the published word, released after it, so a reader that sees the word sees the whole seed. The anchor
+  /// publishes it once, before it starts any daemon, from the system's generator; every daemon under the anchor serves
+  /// its SSH edge with it, so a restart keeps the key a client pinned.
+  pub fn publish_ssh_host_seed(
+    &mut self,
+    seed: &[u8; SSH_HOST_SEED_BYTES],
+  ) -> Result<(), AnchorError> {
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SSH_HOST_SEED,
+      SSH_HOST_SEED_BYTES,
+    )?;
+    self.object.write_racy(at, seed)?;
+    let spec = self.spec(RegionKind::Supervision)?;
+    self
+      .word_at(spec, SUP_SSH_HOST_PRESENT)?
+      .store(1, Ordering::Release);
+    Ok(())
+  }
+
+  /// The seed of the SSH edge's host key, if this segment's anchor published one (A-684): none on a fresh segment, under
+  /// an anchor asked for no SSH edge or a fleet node's, and under an older anchor. The caller wipes its copy when done.
+  pub fn ssh_host_seed(&self) -> Result<Option<[u8; SSH_HOST_SEED_BYTES]>, AnchorError> {
+    let spec = self.spec(RegionKind::Supervision)?;
+    if self
+      .word_at(spec, SUP_SSH_HOST_PRESENT)?
+      .load(Ordering::Acquire)
+      != 1
+    {
+      return Ok(None);
+    }
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SSH_HOST_SEED,
+      SSH_HOST_SEED_BYTES,
+    )?;
+    let mut seed = [0u8; SSH_HOST_SEED_BYTES];
+    self.object.read_racy(at, &mut seed)?;
+    Ok(Some(seed))
   }
 
   /// Publishes the node's sealing root (A-92): its key id and bytes, then the published word, released after
@@ -869,7 +1017,7 @@ impl AnchorSegment {
       .regions()
       .iter()
       .map(|r| r.kind)
-      .filter(|k| matches!(k, RegionKind::Log(_) | RegionKind::Audit))
+      .filter(|k| matches!(k, RegionKind::Log(_)))
       .collect();
     for kind in kinds {
       if let (Ok(spec), Ok(words)) = (self.spec(kind), self.ring_words(kind)) {

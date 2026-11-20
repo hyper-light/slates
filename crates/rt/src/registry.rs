@@ -102,6 +102,14 @@ pub struct Entry {
   /// a sender that finds one full stops spinning and counts the wake stale instead of waiting for a
   /// consumer that is gone (the livelock the registry stress test found on 2026-09-14).
   pub exited: AtomicBool,
+  /// The shards a full control channel of this shard refused that asked to be told when it next has room
+  /// ([`crate::shard::ShardContext::want_room`]): marked by each of them, taken by this shard after each drain that
+  /// took a message and at its exit, and each told ([`give_room`]; the protocol: [`crate::room`]).
+  pub room_wanted: crate::room::ShardSet,
+  /// The shards whose control channels have drained since this shard asked them for room: marked by each of them
+  /// ([`give_room`]), taken by this shard where it drains its own control channel, which wakes its tasks waiting on
+  /// each ([`crate::room`]).
+  pub room_given: crate::room::ShardSet,
 }
 
 /// A shard's forward-progress pulse, readable from any thread with no shard round-trip (§4.14; the same
@@ -138,6 +146,12 @@ pub struct Pulse {
   /// The shard's online wake estimate (`ShardContext::wake_cost_ns`), mirrored at each wake it folds
   /// in, for a reader on another thread (the daemon's status, a stall diagnosis).
   wake_cost_ns: AtomicU64,
+  /// The shard's idle spin window (`ShardContext::counters`' `idle_window_ns`), mirrored beside the wake estimate
+  /// it may be priced on, so a reader on another thread can tell whether the window follows the estimate (A-223).
+  idle_window_ns: AtomicU64,
+  /// What an idle turn costs a request that lands in it, as the shard has learned it (`ShardContext::counters`'
+  /// `held_turn_ns`), mirrored at the end of each idle spin beside the wake estimate it is weighed against (A-387).
+  held_turn_ns: AtomicU64,
 }
 
 impl Pulse {
@@ -162,6 +176,28 @@ impl Pulse {
   /// [`Pulse::record_wake_cost`]).
   pub fn wake_cost_ns(&self) -> u64 {
     self.wake_cost_ns.load(Ordering::Relaxed)
+  }
+
+  /// The owning shard mirrors its idle spin window after folding a wake into its estimate.
+  pub fn record_idle_window(&self, idle_window_ns: u64) {
+    self.idle_window_ns.store(idle_window_ns, Ordering::Relaxed);
+  }
+
+  /// The shard's idle spin window, nanoseconds, as of its last measured wake; 0 until its first (see
+  /// [`Pulse::record_idle_window`]).
+  pub fn idle_window_ns(&self) -> u64 {
+    self.idle_window_ns.load(Ordering::Relaxed)
+  }
+
+  /// The owning shard mirrors what an idle turn costs a request, as it has learned it, at the end of an idle spin.
+  pub fn record_held_turn(&self, held_turn_ns: u64) {
+    self.held_turn_ns.store(held_turn_ns, Ordering::Relaxed);
+  }
+
+  /// What an idle turn costs a request that lands in it, nanoseconds, as of the shard's last idle spin; 0 until its
+  /// first measured turn (see [`Pulse::record_held_turn`]).
+  pub fn held_turn_ns(&self) -> u64 {
+    self.held_turn_ns.load(Ordering::Relaxed)
   }
 
   /// The owning shard's application loop marks one period of forward progress.
@@ -299,6 +335,22 @@ impl Registration {
   pub fn shard(&self) -> u16 {
     self.shard
   }
+
+  /// Tells every shard that asked this slot for room ([`crate::shard::ShardContext::want_room`]) that its control
+  /// channel has room now, as a shard's drain that took a message tells them ([`crate::room`]): for a holder that takes
+  /// messages off the slot's control channel itself (a test's stand-in for a shard), called after each take. The fence
+  /// orders the take before the look at who asked, as the drain's does, so either an asker's second try finds the room
+  /// or this finds its mark.
+  pub fn tell_room(&self) {
+    let _ = with_entry(self.shard, |entry| {
+      fence(Ordering::SeqCst);
+      if entry.room_wanted.maybe_any() {
+        entry
+          .room_wanted
+          .take_each(|origin| give_room(origin, self.shard));
+      }
+    });
+  }
 }
 
 impl Drop for Registration {
@@ -389,6 +441,8 @@ pub(crate) fn register_slot(
       parking: Parking::new(),
       pulse: Pulse::default(),
       exited: AtomicBool::new(false),
+      room_wanted: crate::room::ShardSet::new(),
+      room_given: crate::room::ShardSet::new(),
     });
     entry.kick = match kick {
       RegisterKick::Kick(kick) => kick,
@@ -665,9 +719,10 @@ pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> 
 /// [`shard_cpu`] over a window, it tells a starved shard (runnable, its clock barely moving) from one blocked in a call.
 ///
 /// A shard blocked on another thread of the process ([`waiting_on`]) reads as that thread does when that thread is
-/// runnable: blocked on a thread waiting for a CPU, it is starved, not stuck (A-228's transitive wait). A shard blocked on
-/// a thread that is itself blocked still reads blocked, so a deadlock is still found. One batch reads both: the shards'
-/// threads and the threads they wait on.
+/// runnable: blocked on a thread waiting for a CPU, it is starved, not stuck (A-228's transitive wait). So it does when
+/// that thread is held in the kernel past signals (Linux `D`, [`crate::RunReading::uninterruptible`]): a join on a
+/// thread waiting on a page-in waits on memory too (A-336). A shard blocked on a thread that is itself asleep still reads
+/// blocked, so a deadlock is still found. One batch reads both: the shards' threads and the threads they wait on.
 pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_clock::RunReading>> {
   let marks: Vec<(u64, u64)> = holders
     .iter()
@@ -688,6 +743,7 @@ pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_cl
   let starting = crate::thread_clock::RunReading {
     state: crate::thread_clock::RunState::Runnable,
     waited_ns: None,
+    uninterruptible: Some(false),
   };
   let handles: Vec<u64> = marks
     .iter()
@@ -716,13 +772,25 @@ pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_cl
     .map(|(shard, waited)| match (shard, waited) {
       (Some(shard), Some(waited))
         if shard.state == crate::thread_clock::RunState::Blocked
-          && waited.state == crate::thread_clock::RunState::Runnable =>
+          && (waited.state == crate::thread_clock::RunState::Runnable
+            || waited.uninterruptible == Some(true)) =>
       {
         Some(waited)
       }
       (shard, _) => shard,
     })
     .collect()
+}
+
+/// The kernel function the shard `holder` names waits in, for a log line that names its wait (A-336): Linux's `wchan`;
+/// `None` elsewhere, for a registration no longer in its slot, or where the kernel names none.
+pub fn shard_kernel_wait_name(holder: SlotHolder) -> Option<String> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+  })
+  .flatten()
+  .filter(|handle| *handle != 0)
+  .and_then(crate::thread_clock::kernel_wait_name)
 }
 
 /// The scheduler state of the shard `holder` names at this instant ([`shard_run_readings`]).
@@ -769,7 +837,37 @@ fn read_counted<R>(slot: &Slot, f: impl FnOnce(&Entry) -> R) -> Option<R> {
 /// Marks `shard`'s entry exited (the shard's own thread, at its loop's exit): a sender that finds its
 /// ring full stops spinning, since nothing will drain it again.
 pub fn note_exited(shard: u16) {
-  let _ = with_entry(shard, |entry| entry.exited.store(true, Ordering::Release));
+  let _ = with_entry(shard, |entry| {
+    entry.exited.store(true, Ordering::Release);
+    // A shard that exits will never drain its channel again: every shard waiting for room in it is told now, and its
+    // next send is refused `ShardGone`. The fence orders the exit before the look at who asked; an asker fences between
+    // its mark and its look at `exited` (`ShardContext::want_room`), so one of the two sees the other ([`crate::room`]).
+    fence(Ordering::SeqCst);
+    entry
+      .room_wanted
+      .take_each(|origin| give_room(origin, shard));
+  });
+}
+
+/// Tells shard `origin` that shard `target`'s control channel has room, or that `target` left its loop: `target`'s mark
+/// in `origin`'s `room_given`, a `SeqCst` fence, then `origin`'s control flag published and `origin` kicked if it is
+/// parked, a control message's own publication, so `origin` finds the mark where it drains its channel
+/// ([`crate::room`]). A free slot is told nothing: the shard that asked is gone.
+///
+/// The fence is for a publication that lands while `origin` drains a whole batch: `origin` then re-arms its flag with a
+/// plain store, which ends this publication's release sequence, so the take that reads the re-arm does not synchronize
+/// with it. `origin` fences after every drain that took a message, the re-arm's too; this fence against that one means
+/// `origin`'s next look at `room_given` finds the mark. A message needs no such fence: the channel's own claim of a slot
+/// is a `SeqCst` operation. The argument is the standard's fence rules ([B: C++20 `[atomics.order]` p4]): loom passes
+/// `a_shard_told_of_room_while_it_rearms_its_flag_learns_it` with this fence and without it (75 and 81 interleavings,
+/// 2026-11-18), so the model records the path but does not reach the miss.
+pub(crate) fn give_room(origin: u16, target: u16) {
+  let _ = with_entry(origin, |entry| {
+    entry.room_given.insert(target);
+    fence(Ordering::SeqCst);
+    entry.control_pending.publish();
+    entry.parking.kick_if_parked(|| entry.kick.kick());
+  });
 }
 
 /// The entry of a live shard, unguarded: for the shard's **own** thread (its context keeps the

@@ -18,6 +18,12 @@
 //!   export (§4.6, AUD-29-75) on `base` over TCP, a separate port namespace from the UDP planes, so the block stays
 //!   two numbers wide. A base at the very end of the port range is refused
 //!   (`PortBlockOverflows`), never wrapped.
+//! - **Binding elsewhere than advertised (A-277).** A node's advertised address is where its peers dial it,
+//!   and by default where it binds. A node behind a port mapping (a NAT's port forward, a container runtime's
+//!   published ports, the chaos harness's fault relay in `crates/cli/tests/live_chaos.rs`) also names its own
+//!   `bind` address: an IPv4 literal and the base of the same two-port block. It binds there; every peer still
+//!   dials the advertised ports, and the mapping between them is the operator's. A bind block past the port
+//!   range is refused as the advertised one is.
 //! - **Addresses by IP or by name.** A node's advertised address is an IPv4 literal or a DNS name
 //!   ([`NodeAddress`]). A name is resolved by the dialer at every fresh dial ([`crate::dns`]), never here:
 //!   in the Kubernetes deployment (`docs/deploy.md`) each node is its per-pod DNS name, whose address is not
@@ -140,6 +146,11 @@ pub struct FleetNodeEntry {
   /// The node's advertised address: the IP or DNS name its peers dial, and the **base** of its two ports
   /// (see the module doc: probes on it, records on the next).
   pub address: NodeAddress,
+  /// Where the node binds its own two serve sockets when that is not its advertised address (A-277): an IPv4
+  /// literal and the base of the two ports. Set only where something between the node and its peers maps the
+  /// advertised ports there (a NAT's port forward, a container runtime's published ports, the chaos harness's
+  /// relay). `None`, the default, binds the advertised address ([`NodeAddress::bind`]).
+  pub bind: Option<SocketAddrV4>,
   /// The node's operator-provisioned certificate (DER): what its peers pin, and what its member id is
   /// derived from.
   pub certificate: CertificateDer<'static>,
@@ -186,6 +197,10 @@ pub struct FleetPlan {
   /// This node's identity, the fleet's TLS name, each peer with its dial addresses, and this node's own
   /// serve addresses — bound by [`FleetTransport::bind`] when the daemon starts, never by planning.
   pub transport: FleetTransport<ServeAddresses>,
+  /// This node's identity as the version-control servers' shared HTTP edge presents it (§4.17.2 "Transports" item 1;
+  /// A-625 part 3): the certificate and key its transport and its RPC-with-TLS export present, for the daemon role to
+  /// hand `DaemonConfig::vcs_http` when the operator starts an edge, so the daemon reads no file (R1).
+  pub edge_identity: crate::config::EdgeIdentity,
 }
 
 /// Which of a node's two serve sockets: the SWIM probe plane or the register record plane (the two ride
@@ -236,8 +251,9 @@ pub enum DeployError {
   },
   /// The manifest lists no node at all.
   NoNodes,
-  /// A node is addressed by a DNS name, but no resolver configuration was given (the host has no usable
-  /// `/etc/resolv.conf`, or the caller passed none), so the name could never be dialed.
+  /// A node is addressed by a DNS name, but no resolver configuration was given (the host gave no IPv4 nameserver:
+  /// on Unix in `/etc/resolv.conf`, on Windows on no network adapter that is up with a gateway, A-490; or the caller
+  /// passed none), so the name could never be dialed.
   NoResolver {
     /// The first named node.
     node: String,
@@ -377,6 +393,16 @@ fn validate(
         needed: PORTS_PER_NODE,
       });
     }
+    // A node that binds elsewhere (A-277) needs the same block there: its bind's `base + 1` must exist too.
+    if let Some(bind) = entry.bind
+      && serve_port(bind.port(), Plane::Record).is_none()
+    {
+      return Err(DeployError::PortBlockOverflows {
+        node: entry.node.clone(),
+        base: bind.port(),
+        needed: PORTS_PER_NODE,
+      });
+    }
   }
   manifest
     .nodes
@@ -394,10 +420,13 @@ fn serve_address(server: &FleetNodeEntry, plane: Plane) -> Option<NodeAddress> {
   serve_port(server.address.port(), plane).map(|port| server.address.with_port(port))
 }
 
-/// Where manifest entry `server` binds its own serve socket for `plane`: its literal address, or every
-/// interface when it is known by a name.
+/// Where manifest entry `server` binds its own serve socket for `plane`: its `bind` block when it names one
+/// (A-277), else its literal address, or every interface when it is known by a name.
 fn bind_address(server: &FleetNodeEntry, plane: Plane) -> Option<SocketAddrV4> {
-  serve_port(server.address.port(), plane).map(|port| server.address.bind(port))
+  match server.bind {
+    Some(bind) => serve_port(bind.port(), plane).map(|port| SocketAddrV4::new(*bind.ip(), port)),
+    None => serve_port(server.address.port(), plane).map(|port| server.address.bind(port)),
+  }
 }
 
 /// Checks, once, that the TLS stack can build this node's server side from its identity with every
@@ -456,6 +485,16 @@ pub fn plan(
     bind_address(entry, Plane::Probe),
     bind_address(entry, Plane::Record),
   ) else {
+    // The block that did not fit is the one the node binds: its `bind` when it names one (A-277).
+    return Err(DeployError::PortBlockOverflows {
+      node: entry.node.clone(),
+      base: entry.bind.map_or(entry.address.port(), |bind| bind.port()),
+      needed: PORTS_PER_NODE,
+    });
+  };
+  // Where its peers dial its record plane, as they dial its probes: its advertised block, never its bind (A-277).
+  // Discovery announces it, and every later dial of a peer prefers the announcement (A-330).
+  let Some(advertise_record) = serve_address(entry, Plane::Record) else {
     return Err(overflow(entry));
   };
   let mut peers = Vec::with_capacity(manifest.nodes.len().saturating_sub(1));
@@ -529,6 +568,10 @@ pub fn plan(
       reason,
     })?;
   }
+  // The version-control edge presents what the transport and the RPC-with-TLS export present (A-625 part 3): the
+  // node's certificate and key, copied before the key moves into the transport's identity, which keeps it private.
+  let edge_identity =
+    crate::config::EdgeIdentity::new(vec![entry.certificate.to_vec()], key.secret_der().to_vec());
   let identity = Identity::from_der(entry.certificate.clone(), key);
   let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
   check_identity(&entry.node, &identity, &entry.certificate, &pins)?;
@@ -545,6 +588,7 @@ pub fn plan(
     },
     transport: FleetTransport {
       advertise: entry.address.clone(),
+      advertise_record,
       enrollment_roots: manifest.enrollment_roots.clone(),
       identity,
       name: manifest.name.clone(),
@@ -558,6 +602,7 @@ pub fn plan(
       peers,
       resolver,
     },
+    edge_identity,
   })
 }
 
@@ -618,6 +663,8 @@ mod tests {
     FleetNodeEntry {
       node: node.to_owned(),
       address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(),
+      // Bound where advertised by default; the A-277 test sets a bind block explicitly.
+      bind: None,
       certificate,
       // Undeclared by default (unique-per-host); a test that exercises domains sets it explicitly.
       domain: None,
@@ -819,6 +866,114 @@ mod tests {
     assert_eq!(serve_port(u16::MAX, Plane::Record), None);
   }
 
+  /// A-277, A-330, §4.8 "Deployment": a node that names a `bind` block serves its two sockets there, while every peer
+  /// still dials its advertised address and the next port, as through a NAT's port forward or the chaos harness's relay.
+  /// Do: give node b a bind block apart from its advertised one, and named node a one too. Expect: b binds
+  /// 127.0.0.1:51000 and :51001 and advertises :41000 for its probes and :41001 for its records (what its discovery
+  /// announces, and so what every redial of a peer dials); a and c dial b at :41000 and :41001, never at the bind; named
+  /// a binds its block, not every interface, and is still dialed and advertised by name; c, with no bind, binds where it
+  /// advertises.
+  #[test]
+  fn a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises() {
+    let (mut manifest, keys) = manifest();
+    let b_bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51_000);
+    manifest.nodes[1].bind = Some(b_bind);
+    manifest.nodes[0].address = NodeAddress::Name {
+      host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+      port: 7000,
+    };
+    let a_bind = SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 9000);
+    manifest.nodes[0].bind = Some(a_bind);
+
+    let b = plan(&manifest, "b", key_of(&keys, "b"), Some(resolver())).expect("b's plan");
+    assert_eq!(b.transport.serve.probe, b_bind, "b's probes bind its block");
+    assert_eq!(
+      b.transport.serve.record,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51_001),
+      "b's records bind the next port of its block"
+    );
+    assert_eq!(
+      b.transport.advertise,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
+      "b still advertises where its peers dial it"
+    );
+    assert_eq!(
+      b.transport.advertise_record,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_001).into(),
+      "b advertises its records at its advertised block's next port, never at its bind"
+    );
+
+    expect_b_dialed_where_it_advertises(&manifest, &keys);
+
+    let a = plan(&manifest, "a", key_of(&keys, "a"), Some(resolver())).expect("a's plan");
+    assert_eq!(
+      a.transport.serve.probe, a_bind,
+      "a named node with a bind block binds it, not every interface"
+    );
+    assert_eq!(
+      a.transport.serve.record,
+      SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 9001)
+    );
+    assert_eq!(
+      a.transport.advertise_record,
+      NodeAddress::Name {
+        host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+        port: 7001
+      },
+      "a named node advertises its records by name too"
+    );
+    let c = plan(&manifest, "c", key_of(&keys, "c"), Some(resolver())).expect("c's plan");
+    let a_host = member_id(host_id_of_certificate(&manifest.nodes[0].certificate), 0);
+    let to_a = c
+      .transport
+      .peers
+      .iter()
+      .find(|peer| peer.host == a_host)
+      .expect("a is a peer");
+    assert_eq!(
+      to_a.address,
+      NodeAddress::Name {
+        host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+        port: 7000
+      },
+      "a is still dialed by its advertised name"
+    );
+    assert_eq!(
+      c.transport.serve.probe,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42_000),
+      "a node without a bind binds where it advertises"
+    );
+  }
+
+  /// The dialers of `a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises`. Do: plan nodes a
+  /// and c from `manifest`, in which node b binds elsewhere than it advertises. Expect each to dial b at its advertised
+  /// probe port (41000) and record port (41001), never at its bind.
+  fn expect_b_dialed_where_it_advertises(
+    manifest: &FleetManifest,
+    keys: &[PrivateKeyDer<'static>],
+  ) {
+    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    for dialer in ["a", "c"] {
+      let theirs = plan(manifest, dialer, key_of(keys, dialer), Some(resolver())).expect("a plan");
+      let to_b = theirs
+        .transport
+        .peers
+        .iter()
+        .find(|peer| peer.host == b_host)
+        .expect("b is a peer");
+      assert_eq!(
+        to_b.address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
+        "{dialer} dials b's advertised probe port, never its bind"
+      );
+      assert_eq!(
+        to_b.record_address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_001).into(),
+        "{dialer} dials b's advertised record port, never its bind"
+      );
+    }
+  }
+
   /// A resolver for the named-address tests: one nameserver, the documented defaults.
   fn resolver() -> Resolver {
     Resolver {
@@ -974,6 +1129,18 @@ mod tests {
         needed: 2
       })
     );
+    // A-277: a bind block past the port range is refused as an advertised one is, naming the bind's base, though
+    // the advertised block fits.
+    let (mut bind_overflow, keys) = manifest();
+    bind_overflow.nodes[1].bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, u16::MAX));
+    assert_eq!(
+      plan(&bind_overflow, "a", key_of(&keys, "a"), None).err(),
+      Some(DeployError::PortBlockOverflows {
+        node: "b".to_owned(),
+        base: u16::MAX,
+        needed: 2
+      })
+    );
     let (mut too_few, keys) = manifest();
     too_few.quorum = Quorum { f: 3 };
     assert_eq!(
@@ -1030,5 +1197,68 @@ mod tests {
     assert!(plan.transport.peers.is_empty());
     assert!(plan.membership.peers.is_empty());
     assert_eq!(plan.membership.quorum, Quorum { f: 0 });
+  }
+
+  /// Shape: the passes, each way, a TLS 1.3 handshake takes in memory (RFC 8446 §2: a round trip and a half), with room;
+  /// a handshake still going after them has stalled.
+  const HANDSHAKE_PASSES: usize = 4;
+
+  /// Moves every TLS record `from` has to send into `to`, which reads and processes them.
+  fn pass(from: &mut rustls::Connection, to: &mut rustls::Connection) {
+    let mut records = Vec::new();
+    while from.wants_write() {
+      from.write_tls(&mut records).expect("records written");
+    }
+    let mut unread = records.as_slice();
+    while !unread.is_empty() {
+      to.read_tls(&mut unread).expect("records read");
+      to.process_new_packets().expect("records processed");
+    }
+  }
+
+  /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: plan node b, make the TLS server of its version-control HTTP edge
+  /// from the plan, and shake hands in memory with a client that trusts b's certificate under the fleet's name. Expect:
+  /// the handshake completes and the client was shown b's own certificate, the one its peers pin and its RPC-with-TLS
+  /// export presents: the plan hands the edge the node's identity, so the daemon reads no file for it (R1).
+  #[test]
+  fn a_plan_hands_the_http_edge_the_nodes_own_identity() {
+    let (manifest, keys) = manifest();
+    let plan = plan(&manifest, "b", key_of(&keys, "b"), None).expect("b's plan");
+    let certificate = manifest.nodes[1].certificate.clone();
+    let server = plan
+      .edge_identity
+      .serving()
+      .expect("the edge's TLS identity")
+      .connection()
+      .expect("a server connection");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+      .add(certificate.clone())
+      .expect("b's certificate trusted");
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+      .with_safe_default_protocol_versions()
+      .expect("TLS's versions")
+      .with_root_certificates(roots)
+      .with_no_client_auth();
+    let client = rustls::ClientConnection::new(
+      std::sync::Arc::new(config),
+      rustls::pki_types::ServerName::try_from(NAME).expect("the fleet's name"),
+    )
+    .expect("a client connection");
+    let mut client = rustls::Connection::Client(client);
+    let mut server = rustls::Connection::Server(server);
+    for _ in 0..HANDSHAKE_PASSES {
+      pass(&mut client, &mut server);
+      pass(&mut server, &mut client);
+    }
+    assert!(
+      !client.is_handshaking() && !server.is_handshaking(),
+      "the handshake completes"
+    );
+    assert_eq!(
+      client.peer_certificates(),
+      Some(std::slice::from_ref(&certificate))
+    );
   }
 }

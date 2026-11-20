@@ -92,6 +92,10 @@ const LOCAL_SHIFT: u32 = 8;
 
 /// Format: the id a fetch carries (`msgh_id`), so a message of another kind is never read as one.
 const FETCH_ID: i32 = 0x534c_4643;
+/// Format: `MACH_NOTIFY_SEND_ONCE` (`<mach/notify.h>`: `MACH_NOTIFY_FIRST`, 0100, plus 007): the kernel's notice to a
+/// port that a send-once right made for it was destroyed unused, as a fetch's is when its owner goes away holding it
+/// or with the fetch still queued (A-452).
+const NOTIFY_SEND_ONCE: i32 = 0o107;
 /// Format: the id of an answer carrying the region.
 const DELIVERED_ID: i32 = 0x534c_4644;
 /// Format: the id of an answer that carries nothing: no delivery waits for this claim and this process.
@@ -459,26 +463,7 @@ fn sender_pid(message: &Received) -> Option<u32> {
 
 /// The parent of process `pid`, from the kernel's process table; `None` when the kernel answers nothing for it.
 fn parent_of(pid: u32) -> Option<u32> {
-  let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-  let size = c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
-  // SAFETY: `info` is a live, writable, zero-initialized `proc_bsdinfo` of `size` bytes; the call writes at most
-  // `size` bytes into it and returns how many it wrote.
-  let written = unsafe {
-    libc::proc_pidinfo(
-      c_int::try_from(pid).ok()?,
-      libc::PROC_PIDTBSDINFO,
-      0,
-      info.as_mut_ptr().cast(),
-      size,
-    )
-  };
-  if written != size {
-    return None;
-  }
-  // SAFETY: zero-initialized and then written whole by the kernel (`written == size`); every field is a plain integer
-  // or byte array, for which any bytes are a value.
-  let info = unsafe { info.assume_init() };
-  Some(info.pbi_ppid)
+  crate::exit_watch::bsd_info(pid).map(|info| info.pbi_ppid)
 }
 
 /// Format: the audit token's offset in `mach_msg_audit_trailer_t`: after its type, size, sequence (4 bytes each) and
@@ -664,15 +649,14 @@ fn answer(reply: MachPort, found: Option<OwnedFd>) -> bool {
   true
 }
 
-/// Fetches the region kept for claim slot `slot` from the owner of the token `owner_name`, waiting up to
-/// `timeout_ms` for the answer; the region's descriptor. Refused `DaemonUnavailable` when no owner holds the token, the
-/// owner keeps nothing for this claim, or no answer comes in time.
-pub(crate) fn fetch(
-  instance: &str,
-  owner_name: &str,
-  slot: usize,
-  timeout_ms: u32,
-) -> Result<OwnedFd, IpcError> {
+/// Fetches the region kept for claim slot `slot` from the owner of the token `owner_name`; the region's descriptor.
+/// Waits while the owner lives, never by a clock (A-452; R3's class C, as a claim waits, A-443): the send waits for room
+/// in the owner's queue until its port dies, and the receive for the owner's answer until the kernel's send-once
+/// notification says the owner went away holding the fetch, or with it still queued. Refused `DaemonUnavailable` when no
+/// owner holds the token, the owner went away before answering, or it keeps nothing for this claim. It waited a fixed
+/// second for each, so an owner alive and slow to answer (its thread descheduled on a busy machine) was reported gone,
+/// and an owner that went away was reported as keeping nothing.
+pub(crate) fn fetch(instance: &str, owner_name: &str, slot: usize) -> Result<OwnedFd, IpcError> {
   let unavailable = |why: &'static str| IpcError::DaemonUnavailable {
     endpoint: instance.to_owned(),
     why,
@@ -692,42 +676,51 @@ pub(crate) fn fetch(
     word: u32::try_from(slot).unwrap_or(u32::MAX),
   };
   // SAFETY: `message` is a live fetch: its remote port is a send right this process was given (copied, not moved), its
-  // local port a receive right this process holds, from which a send-once right is made; the send waits at most
-  // `timeout_ms`.
+  // local port a receive right this process holds, from which a send-once right is made; with no timeout the send waits
+  // for room in the owner's queue until it is queued or the owner's port dies (`MACH_SEND_INVALID_DEST`).
   let sent = unsafe {
     mach_msg(
       &mut message.header,
-      SEND_MSG | SEND_TIMEOUT,
+      SEND_MSG,
       message.header.size,
       0,
       PORT_NULL,
-      timeout_ms,
+      0,
       PORT_NULL,
     )
   };
   if sent != MSG_SUCCESS {
     return Err(unavailable(
-      "the instance's owner did not take the region's fetch",
+      "the instance's owner went away before it took the region's fetch",
     ));
   }
   let mut answer = DeliveredReceived::default();
   let rcv_size = u32::try_from(size_of::<DeliveredReceived>()).unwrap_or(0);
   // SAFETY: `answer` is a live, writable buffer of `rcv_size` bytes; the receive is on the reply port whose receive
-  // right this process holds, waiting at most `timeout_ms`; a larger message is refused and destroyed by the kernel.
+  // right this process holds, waiting with no timeout for the owner's answer or the kernel's send-once notification;
+  // a larger message is refused and destroyed by the kernel.
   let received = unsafe {
     mach_msg(
       &mut answer.delivered.header,
-      RCV_MSG | RCV_TIMEOUT,
+      RCV_MSG,
       0,
       rcv_size,
       reply.port,
-      timeout_ms,
+      0,
       PORT_NULL,
     )
   };
   if received != MSG_SUCCESS {
     return Err(unavailable(
-      "the instance's owner did not answer the region's fetch in time",
+      "the region's fetch received no message of its owner's",
+    ));
+  }
+  if answer.delivered.header.id == NOTIFY_SEND_ONCE {
+    // SAFETY: `answer` holds the notification the kernel just delivered whole into this buffer; destroying it gives back
+    // whatever it carried, once.
+    unsafe { mach_msg_destroy(&mut answer.delivered.header) };
+    return Err(unavailable(
+      "the instance's owner went away before answering the region's fetch",
     ));
   }
   let delivered = answer.delivered;
@@ -801,8 +794,6 @@ mod tests {
   const SLOTS: usize = 4;
   /// Shape: how long a delivery may wait in these tests: past any test's own wait, in nanoseconds (a minute).
   const STALE_NS: u64 = 60_000_000_000;
-  /// Shape: a fetch's wait in these tests, in milliseconds.
-  const WAIT_MS: u32 = 2_000;
   /// Format: the byte a planted region carries, so a fetch that returns it shows the plant took.
   const PLANTED: u8 = 0x5a;
 
@@ -834,13 +825,13 @@ mod tests {
     let (name, _service) = token("once");
     let kept = region("once", 7);
     keep(&name, 1, std::process::id(), kept.as_fd()).unwrap();
-    let fd = fetch("test", &name, 1, WAIT_MS).unwrap();
+    let fd = fetch("test", &name, 1).unwrap();
     let fetched = SharedObject::from_descriptor(fd, REGION_BYTES, Words::new()).unwrap();
     let mut first = [0u8; 16];
     fetched.read(0, &mut first).unwrap();
     assert_eq!(first, [7u8; 16], "the fetched region is the kept one");
     assert!(
-      fetch("test", &name, 1, WAIT_MS).is_err(),
+      fetch("test", &name, 1).is_err(),
       "a delivery is handed over once"
     );
   }
@@ -852,7 +843,7 @@ mod tests {
     let (name, _service) = token("other");
     let kept = region("other", 9);
     keep(&name, 2, std::process::id() + 1, kept.as_fd()).unwrap();
-    assert!(fetch("test", &name, 2, WAIT_MS).is_err());
+    assert!(fetch("test", &name, 2).is_err());
   }
 
   /// GAP-A9-9 (the keep's sender). Do: from a stranger, a process that is neither the token's holder nor its child (this
@@ -863,6 +854,9 @@ mod tests {
   fn a_stranger_cannot_plant_a_region_for_a_client() {
     let (name, _service) = token("plant");
     let exe = std::env::current_exe().unwrap();
+    // The stranger runs for as long as a test binary starts: a descriptor another test made in its close-on-exec
+    // window would go with it for that long ([`crate::descriptor_test_gate`]).
+    let _gate = crate::descriptor_test_gate();
     let status = std::process::Command::new("sh")
       .arg("-c")
       .arg(format!(
@@ -874,11 +868,78 @@ mod tests {
       .status()
       .unwrap();
     assert!(status.success(), "the stranger ran and sent its keep");
-    let fetched = fetch("test", &name, 0, WAIT_MS);
+    let fetched = fetch("test", &name, 0);
     assert!(
       fetched.is_err(),
       "a region the stranger kept was handed to its victim"
     );
+  }
+
+  /// Shape: how long the late-answer test holds its fetch unanswered: half again the claim wait, past the second a
+  /// fetch gave up at before A-452.
+  const LATE_NS: u64 = crate::rendezvous::CLAIM_WAIT_NS + crate::rendezvous::CLAIM_WAIT_NS / 2;
+  /// Shape: how long the departure test lets its fetch reach the owner's queue before the owner goes: a tenth of the
+  /// claim wait, far past a local Mach send.
+  const QUEUED_NS: u64 = crate::rendezvous::CLAIM_WAIT_NS / 10;
+
+  /// A-452 (R3's class C). Do: hold the token with nothing serving it, keep a region for slot 1, fetch slot 1 from
+  /// another thread, and only after half again the claim wait start the owner's service on the token. Expect: the fetch
+  /// answered with the region kept, after more than the claim wait. Before, the fetch gave up at a second with its owner
+  /// alive and slow to answer.
+  #[test]
+  // The test thread stands for an owner slow to serve its token: it waits before serving.
+  #[allow(clippy::disallowed_methods)]
+  fn a_fetch_answered_past_the_claim_wait_is_served() {
+    let name = format!("com.slates.test.mach-claim.late.{}", std::process::id());
+    let held = crate::owner_name::claim(&name)
+      .unwrap()
+      .expect("the test's token is free");
+    let kept = region("late", 9);
+    keep(&name, 1, std::process::id(), kept.as_fd()).unwrap();
+    let fetching = name.clone();
+    let started = std::time::Instant::now();
+    let fetcher = std::thread::spawn(move || {
+      let fetched = fetch("test", &fetching, 1).map(|fd| {
+        let fetched = SharedObject::from_descriptor(fd, REGION_BYTES, Words::new()).unwrap();
+        let mut bytes = [0u8; 16];
+        fetched.read(0, &mut bytes).unwrap();
+        bytes
+      });
+      (fetched, started.elapsed())
+    });
+    std::thread::sleep(std::time::Duration::from_nanos(LATE_NS));
+    let _service = OwnerService::start(held, SLOTS, STALE_NS).unwrap();
+    let (fetched, waited) = fetcher.join().unwrap();
+    println!("a fetch answered late: {fetched:?} after {waited:?}");
+    assert_eq!(fetched.unwrap(), [9; 16], "the region kept, fetched late");
+    assert!(waited > std::time::Duration::from_nanos(crate::rendezvous::CLAIM_WAIT_NS));
+  }
+
+  /// A-452 (R3's class C). Do: hold the token with nothing serving it, fetch slot 1 from another thread, and let the
+  /// token go once the fetch has reached its queue, as an owner that exits does. Expect: the fetch refused for an owner
+  /// that went away, within the claim wait of its going. Before, the departure read as an owner keeping nothing for the
+  /// claim, or waited out the second.
+  #[test]
+  // The test thread stands for an owner that exits with a fetch queued: it lets the fetch reach the queue first.
+  #[allow(clippy::disallowed_methods)]
+  fn a_fetch_whose_owner_went_away_is_refused_by_its_departure() {
+    let name = format!("com.slates.test.mach-claim.gone.{}", std::process::id());
+    let held = crate::owner_name::claim(&name)
+      .unwrap()
+      .expect("the test's token is free");
+    let fetching = name.clone();
+    let fetcher = std::thread::spawn(move || fetch("test", &fetching, 1).map(drop));
+    std::thread::sleep(std::time::Duration::from_nanos(QUEUED_NS));
+    let gone = std::time::Instant::now();
+    drop(held);
+    let refused = fetcher.join().unwrap();
+    let waited = gone.elapsed();
+    println!("a fetch whose owner went away: {refused:?} {waited:?} after the departure");
+    assert!(
+      matches!(&refused, Err(IpcError::DaemonUnavailable { why, .. }) if why.contains("went away")),
+      "{refused:?}"
+    );
+    assert!(waited < std::time::Duration::from_nanos(crate::rendezvous::CLAIM_WAIT_NS));
   }
 
   /// The stranger of `a_stranger_cannot_plant_a_region_for_a_client`: does nothing unless run as one.

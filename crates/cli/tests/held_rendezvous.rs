@@ -11,18 +11,18 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+#[path = "support/recovered.rs"]
+mod recovered;
+
 /// Shape: how long the daemon may take to come up.
 const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the poll interval of the waits.
 const POLL: Duration = Duration::from_millis(20);
 /// Shape: consecutive answered verbs before the daemon counts as settled.
 const STABLE_STREAK: u32 = 10;
-/// Shape: kills, each followed at once by a client's connect, spaced by [`BETWEEN_KILLS`] so they stay inside the
-/// anchor's restart policy (at most `recovery budget / start p99` restarts a window; ten kills in two seconds is, by
-/// design, a crash loop the anchor stops restarting).
+/// Shape: kills, each followed at once by a client's connect, each of a daemon the anchor has judged recovered (A-311):
+/// a daemon killed sooner is a failed start, and the second in a row is a crash loop the anchor backs off.
 const KILLS: usize = 6;
-/// Shape: the pause between rounds.
-const BETWEEN_KILLS: Duration = Duration::from_millis(300);
 /// Format: the client's claim wait (`slates_ipc::rendezvous::CLAIM_WAIT_NS`): what a connect to a dead daemon waited
 /// before failing; a connect answered by the next daemon finishes well inside it.
 const CLAIM_WAIT: Duration = Duration::from_nanos(slates_ipc::rendezvous::CLAIM_WAIT_NS);
@@ -50,7 +50,7 @@ fn pause() {
   std::thread::sleep(POLL);
 }
 
-/// Format: the start of the line a daemon prints once it serves (`crates/cli/src/daemon.rs`); the instance follows.
+/// Format: the start of the line a daemon prints once it serves (`crates/api/src/role/daemon.rs`); the instance follows.
 const SERVING_LINE: &str = "slates daemon: instance ";
 
 /// The anchor, killed and reaped on drop, so a failed assertion leaves no daemon behind; each of its daemons' serving
@@ -129,23 +129,8 @@ fn kill_hard(pid: u32) {
   assert_ne!(ended, 0, "kill the daemon");
 }
 
-/// The daemon's pid, from `status --json`, or `None` while no daemon answers.
-fn daemon_pid(instance: &str) -> Option<u32> {
-  let (code, out, _) = run(instance, &["status", "--json"]);
-  if code != 0 {
-    return None;
-  }
-  let after = out.split("\"pid\":").nth(1)?;
-  after
-    .trim_start()
-    .split(|c: char| !c.is_ascii_digit())
-    .next()?
-    .parse()
-    .ok()
-}
-
-/// A-114, T-2.16. Do: under `slates anchor`, six times end the daemon at once (`kill -9`, `TerminateProcess`) and at
-/// once run `slates status --json`. Expect: every one exits 0, answered by a daemon other than the one killed, within a
+/// A-114, T-2.16. Do: under `slates anchor`, six times wait for the anchor to judge its daemon recovered (A-311), end it
+/// at once (`kill -9`, `TerminateProcess`) and at once run `slates status --json`. Expect: every one exits 0, answered by a daemon other than the one killed, within a
 /// claim wait of that daemon's serving (before A-114 each waited the whole claim wait and exited 3).
 ///
 /// The bound is counted from the successor's serving line, not from the kill: a client of a live anchor waits out the
@@ -165,7 +150,9 @@ fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
   let anchor = start_anchor(&instance);
   let mut longest = Duration::ZERO;
   for round in 0..KILLS {
-    let killed = daemon_pid(&instance).expect("a daemon answers");
+    // Each daemon is killed once the anchor has judged it recovered, so no kill here is a failed start (A-311). Until
+    // 2026-11-17 the rounds were spaced by a fixed 300 ms, which a loaded machine's slower starts outran.
+    let killed = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
     while anchor.served.try_recv().is_ok() {}
     kill_hard(killed);
     let started = Instant::now();
@@ -200,8 +187,6 @@ fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
       took < served_after + CLAIM_WAIT,
       "round {round}: answered in {took:?}, the next daemon serving after {served_after:?}: within a claim wait of it"
     );
-    #[allow(clippy::disallowed_methods)] // the test keeps its kills inside the restart policy
-    std::thread::sleep(BETWEEN_KILLS);
   }
   eprintln!(
     "held rendezvous: {KILLS} connects at a kill, all answered by the next daemon, longest {longest:?}"

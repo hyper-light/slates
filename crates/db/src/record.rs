@@ -53,11 +53,32 @@ impl LogEntry {
   }
 }
 
+/// A record's body, encoded and not yet written ([`LogRing::encode`]): a commit decodes it as the replay will
+/// ([`Encoded::decode_as_replayed`]) before writing it ([`LogRing::write`]), and charges the three as the replay work
+/// the record costs (A-420).
+pub struct Encoded {
+  body: Vec<u8>,
+}
+
+impl Encoded {
+  /// Decodes the body as a replay of its record will: the work a replay repeats for the record beside its checksum, its
+  /// copy and its apply (A-420). A body that does not decode is refused `Corrupt` before anything is written, since a
+  /// replay would cut the record there as torn, and every record after it with it.
+  pub fn decode_as_replayed(&self, seq: u64) -> Result<(), DbError> {
+    LogEntry::from_bytes(&self.body)
+      .map(drop)
+      .map_err(|_| DbError::Corrupt {
+        seq,
+        reason: "the record does not decode as written",
+      })
+  }
+}
+
 /// What a replay found.
 #[derive(Debug)]
 pub struct Replayed {
-  /// The records in sequence order, from the first at or after the requested sequence.
-  pub ops: Vec<(u64, LogEntry)>,
+  /// The records handed to the replay's apply: those at or after the requested sequence.
+  pub records: u64,
   /// The bytes walked.
   pub bytes: u64,
   /// Whether the walk ended at a record that did not verify (the torn tail); the ring's tail
@@ -123,16 +144,23 @@ impl LogRing {
     body.saturating_add(u64::try_from(RECORD_HEADER).unwrap_or(u64::MAX))
   }
 
-  /// Appends `op` as record `seq`; refuses `LogFull` with nothing written when the ring cannot
-  /// hold it. Returns the bytes appended.
-  pub fn append(
+  /// Encodes `entry` for a record, ready to write ([`LogRing::write`]).
+  pub fn encode(entry: &LogEntry) -> Encoded {
+    Encoded {
+      body: entry.to_bytes(),
+    }
+  }
+
+  /// Writes `encoded` as record `seq`: its header, checksum and body; refuses `LogFull` with nothing written when the
+  /// ring cannot hold it. Returns the bytes appended.
+  pub fn write(
     &self,
     segment: &mut AnchorSegment,
     seq: u64,
-    entry: &LogEntry,
+    encoded: &Encoded,
   ) -> Result<u64, DbError> {
     let w = self.words(segment)?;
-    let body = entry.to_bytes();
+    let body = &encoded.body;
     let total = u64::try_from(RECORD_HEADER.saturating_add(body.len())).unwrap_or(u64::MAX);
     let free = w.capacity.saturating_sub(w.tail.saturating_sub(w.head));
     if total > free {
@@ -153,7 +181,7 @@ impl LogRing {
     put(
       &mut header,
       AT_CRC,
-      &checksum(seq, LogEntry::SCHEMA_HASH, &body).to_le_bytes(),
+      &checksum(seq, LogEntry::SCHEMA_HASH, body).to_le_bytes(),
     );
     self.write_wrapping(segment, w.capacity, w.tail, &header)?;
     self.write_wrapping(
@@ -161,7 +189,7 @@ impl LogRing {
       w.capacity,
       w.tail
         .saturating_add(u64::try_from(RECORD_HEADER).unwrap_or(u64::MAX)),
-      &body,
+      body,
     )?;
     let words = segment.ring_words(self.kind)?;
     if w.head == w.tail {
@@ -171,19 +199,29 @@ impl LogRing {
     Ok(total)
   }
 
-  /// Walks the ring from its head, verifying every record, collecting those with a sequence
-  /// at or after `from_seq`; stops at the first record that does not verify.
-  pub fn replay(&self, segment: &AnchorSegment, from_seq: u64) -> Result<Replayed, DbError> {
+  /// Walks the ring from its head, verifying and decoding one record at a time and handing each with a sequence at or
+  /// after `from_seq` to `apply` before the next is read; stops at the first record that does not verify, and at the
+  /// first refusal of `apply`, which it returns. A record is dropped once applied, so a replay holds one decoded
+  /// record, never the whole tail, and repeats for each the work its commit timed (its read, checksum, decode and
+  /// apply; A-420). It collected every decoded record before applying the first, a tail's worth of live allocations
+  /// that no commit had measured.
+  pub fn replay(
+    &self,
+    segment: &AnchorSegment,
+    from_seq: u64,
+    mut apply: impl FnMut(&LogEntry) -> Result<(), DbError>,
+  ) -> Result<Replayed, DbError> {
     let w = self.words(segment)?;
     let mut at = w.head;
-    let mut ops = Vec::new();
+    let mut records = 0u64;
     let mut next_seq = w.seq_base;
     let mut torn = false;
     while at < w.tail {
       match self.record_at(segment, w, at, next_seq) {
-        Ok((seq, op, size)) => {
+        Ok((seq, entry, size)) => {
           if seq >= from_seq {
-            ops.push((seq, op));
+            apply(&entry)?;
+            records = records.saturating_add(1);
           }
           next_seq = seq.saturating_add(1);
           at = at.saturating_add(size);
@@ -195,7 +233,7 @@ impl LogRing {
       }
     }
     Ok(Replayed {
-      ops,
+      records,
       bytes: at.saturating_sub(w.head),
       torn,
       verified_end: at,

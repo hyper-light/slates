@@ -1,7 +1,7 @@
 //! A volume's catalog register (§4.8 "volume heads, chain versions, landing leases and catalog entries are
 //! registers the owner writes under that epoch"; AUD-29-17). The catalog register holds what a successor needs
 //! to serve a taken-over volume *as it was*: its mount name, size class, name policy, owner, whether it must
-//! live in locked RAM, and the access list. Its object is the volume's id with the register-class bit set
+//! live in locked RAM, the access list, and its write policy and trusted signers (A-285, A-321). Its object is the volume's id with the register-class bit set
 //! (`ObjectId::catalog`), placed and taken over exactly as the volume is, and its sequence is the volume
 //! record's `catalog_version`, which every catalog-changing op raises — so each change ships as a newer record
 //! and a takeover adopts the newest.
@@ -11,8 +11,14 @@
 //! no locked policy.
 //!
 //! Every register value this daemon writes leads with a **class byte** ([`HEAD_CLASS`], [`MERGE_CLASS`],
-//! [`CATALOG_CLASS`]), so a holder or a successor reads a record's class from the record, never by trying
-//! decoders in turn.
+//! [`CATALOG_CLASS`], [`TOMBSTONE_CLASS`], [`STATE_LOG_CLASS`], [`REPOSITORY_CLASS`]), so a holder or a successor reads a
+//! record's class from the record, never by trying decoders in turn.
+//!
+//! **A repository's record** (A-636 part 2c-1) is its own register's value, as a volume's catalog is its catalog
+//! register's: its name, tool, object format, default branch at creation, owner and policy ([`repository_value`]),
+//! placed and taken over by its family (`slates_db::register::ObjectId::line_key`, A-636 part 2b-2), at the sequence
+//! [`repository_sequence`] names, which every policy setting and every move of its names log raises. A successor rebuilds
+//! the repository from it and its four state logs (part 2c-2).
 
 use slates_db::catalog::{AccessEntry, NamePolicy, Principal, SizeClass, VolumeRecord};
 use slates_wire::Wire;
@@ -25,13 +31,50 @@ pub const MERGE_CLASS: u8 = 2;
 pub const CATALOG_CLASS: u8 = 3;
 /// Format: the class byte of a destroyed volume's tombstone value (`crate::tombstone::TombstoneValue`).
 pub const TOMBSTONE_CLASS: u8 = 4;
+/// Format: the class byte of a repository's state log's record (`crate::state_log`, A-636 part 2b).
+pub const STATE_LOG_CLASS: u8 = 5;
+/// Format: the class byte of a repository's own register's value, its record ([`repository_value`], A-636 part 2c-1).
+pub const REPOSITORY_CLASS: u8 = 6;
+
+/// A repository's record as its own register's value (A-636 part 2c-1): its class byte, then the record's encoding.
+pub(crate) fn repository_value(record: &slates_db::catalog::RepositoryRecord) -> Vec<u8> {
+  let mut body = Vec::new();
+  record.encode(&mut body);
+  tagged(REPOSITORY_CLASS, body)
+}
+
+/// The repository's record a register value holds, or `None` for a value of another class or one that does not decode
+/// whole.
+pub(crate) fn repository_of(bytes: &[u8]) -> Option<slates_db::catalog::RepositoryRecord> {
+  let mut body = untagged(REPOSITORY_CLASS, bytes)?;
+  let record = slates_db::catalog::RepositoryRecord::decode(&mut body).ok()?;
+  body.is_empty().then_some(record)
+}
+
+/// The sequence a repository's own register holds `record` at (A-636 part 2c-1), `names` its names log's position: one
+/// past the sum of its policy's version and that position. A repository's record changes after its creation only by a
+/// policy setting, which raises the version, or a default branch moved, which moves the names log, so each change ships
+/// as a newer record a takeover adopts, and one sequence never names two values. Its first record is at 1 past the
+/// names its creation bound.
+pub(crate) fn repository_sequence(
+  record: &slates_db::catalog::RepositoryRecord,
+  names: u64,
+) -> u64 {
+  record
+    .policy
+    .version
+    .saturating_add(names)
+    .saturating_add(1)
+}
 
 /// Whether a register value of this class is a **single value** a holder keeps only at its newest position
 /// (a head, a catalog, a tombstone: phase one adopts only the highest), as opposed to a **ledger** it keeps
-/// whole (a green's merge chain, which a successor replays) — AUD-29-43's compaction rule, read from the
-/// value's own class byte.
+/// whole (a green's merge chain, which a successor replays; a repository's state log, which a successor rebuilds the
+/// repository's state from, A-636 part 2b) — AUD-29-43's compaction rule, read from the value's own class byte.
 pub(crate) fn is_single_value(bytes: &[u8]) -> bool {
-  bytes.first().is_some_and(|class| *class != MERGE_CLASS)
+  bytes
+    .first()
+    .is_some_and(|class| *class != MERGE_CLASS && *class != STATE_LOG_CLASS)
 }
 
 /// `body` behind its class byte: a register value's canonical bytes.
@@ -67,11 +110,32 @@ pub struct CatalogValue {
   pub live_shipped: bool,
   /// The live shipper's committed holder set (A-240): the hosts a takeover's phase one counts reports from. Appended.
   pub live_holders: Option<slates_db::catalog::LiveHolders>,
+  /// For a work, the green it is a work of (A-255): what the work's successor knows of its green once the work's owner
+  /// is gone. A work is never brought back (its head is never placed), so a request that names it is sent on to its
+  /// green's owner, which holds the submit's completion in the green's merge records. `None` for any other volume.
+  /// Appended.
+  pub work_of: Option<slates_db::catalog::VolumeId>,
+  /// The volume's write policy (A-285), its signed-merge requirement with it (A-321): a successor holds the volume's
+  /// merges and landings to the modes the launcher set. `None` while unset. Appended.
+  pub write: Option<slates_db::catalog::WritePolicy>,
+  /// How many times the write policy or the trusted signers were set (A-285, A-321): the version a launcher's proof
+  /// names, so a successor refuses a captured setting as the owner did. Appended.
+  pub write_version: u64,
+  /// The keys trusted to sign the volume's work (A-321), in SSH wire form, in the order the launcher set them: a
+  /// successor judges signed work under the same signers. Appended.
+  pub signers: Vec<Vec<u8>>,
+  /// What a captured clone's move carried of its capture (A-503): the member it moves to judges its landings against the
+  /// capture from it and the head it adopts. `None` for any volume no move carried a capture for. Appended.
+  pub carried: Option<slates_db::catalog::CarriedRecord>,
 }
 
 impl CatalogValue {
-  /// The catalog of the volume `record` describes.
-  pub fn of(record: &VolumeRecord) -> CatalogValue {
+  /// The catalog of the volume `record` describes, with what its move carried of its capture (`carried`, the
+  /// partition's record of it).
+  pub fn of(
+    record: &VolumeRecord,
+    carried: Option<&slates_db::catalog::CarriedRecord>,
+  ) -> CatalogValue {
     CatalogValue {
       name: record.name.clone(),
       size: record.policy.size,
@@ -81,6 +145,14 @@ impl CatalogValue {
       access: record.access.clone(),
       live_shipped: record.policy.live_shipped,
       live_holders: record.policy.live_holders.clone(),
+      work_of: match record.policy.role {
+        slates_db::catalog::Role::Work { green, .. } => Some(green),
+        slates_db::catalog::Role::Plain | slates_db::catalog::Role::Green { .. } => None,
+      },
+      write: record.policy.write,
+      write_version: record.policy.write_version,
+      signers: record.policy.signers.clone(),
+      carried: carried.cloned(),
     }
   }
 
@@ -125,6 +197,18 @@ mod tests {
       }],
       live_shipped: false,
       live_holders: None,
+      work_of: Some(slates_db::catalog::VolumeId { bytes: [9; 16] }),
+      write: Some(slates_db::catalog::WritePolicy {
+        merge: slates_db::catalog::WriteMode::Bypass,
+        land: slates_db::catalog::WriteMode::Forbid,
+        require_signed_merges: true,
+      }),
+      write_version: 2,
+      signers: vec![vec![7; 51]],
+      carried: Some(slates_db::catalog::CarriedRecord {
+        head: [5; 32],
+        entries: vec![1, 2, 3],
+      }),
     }
   }
 

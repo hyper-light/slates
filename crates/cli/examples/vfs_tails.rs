@@ -132,15 +132,24 @@ mod unix {
     }
   }
 
-  /// A live kernel mount, unmounted and its mount point removed on drop.
+  /// A live kernel mount, unmounted (by force if the plain unmount is refused: the mount is hard since A-229, so one
+  /// left behind once its in-process daemon is gone hangs whatever touches it) and its mount point removed on drop.
   struct Mounted {
     path: String,
   }
 
+  /// Unmounts `path`, by force if the plain unmount is refused (a file on it still open), then removes it.
+  fn unmount(path: &str) {
+    let plain = Command::new("umount").arg(path).output();
+    if !plain.is_ok_and(|out| out.status.success()) {
+      let _ = Command::new("umount").arg("-f").arg(path).output();
+    }
+    let _ = Command::new("rmdir").arg(path).output();
+  }
+
   impl Drop for Mounted {
     fn drop(&mut self) {
-      let _ = Command::new("umount").arg(&self.path).output();
-      let _ = Command::new("rmdir").arg(&self.path).output();
+      unmount(&self.path);
     }
   }
 
@@ -407,7 +416,7 @@ mod unix {
         gid: rustix::process::getgid().as_raw(),
         gids: Vec::new(),
       };
-      let root = slates_bridge_nfs::client::fetch_root_handle(port, &caller, export, CONNECT_WAIT)
+      let root = slates_bridge_nfs::client::fetch_root_handle(port, &caller, export)
         .unwrap()
         .0;
       let mut credential = slates_bridge_nfs::xdr::XdrWriter::new();
@@ -611,8 +620,7 @@ mod unix {
     let mount_path = mounted.path.clone();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-      let _ = Command::new("umount").arg(&mount_path).output();
-      let _ = Command::new("rmdir").arg(&mount_path).output();
+      unmount(&mount_path);
       previous(info);
     }));
     println!(

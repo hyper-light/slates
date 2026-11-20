@@ -42,6 +42,85 @@ thread_local! {
   static TERMINAL_REFUSAL: Cell<i32> = const { Cell::new(0) };
   /// Set while recovery runs a dead daemon's captured Cleanup or Close again, so the shard can find its effect done.
   static REPLAYING: Cell<bool> = const { Cell::new(false) };
+  /// A-275: whether the current Create opens a reparse point from user mode for a caller whose token holds
+  /// `SeCreateSymbolicLinkPrivilege`, read from the request's token while WinFsp keeps it live.
+  static CREATOR_MAY_LINK: Cell<bool> = const { Cell::new(false) };
+  /// A-275: the opens made so, by context, until their Close. Every member is a live open of the ledger, so the ledger's
+  /// bound is this set's; a symbolic link set through any other open is judged by Developer Mode alone.
+  static OPENS_THAT_MAY_LINK: RefCell<std::collections::BTreeSet<u64>> =
+    const { RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Records an open just made (`context`) as one whose caller holds `SeCreateSymbolicLinkPrivilege`, when the current
+/// Create's token held it (A-275).
+pub(crate) fn opened(context: u64) {
+  if CREATOR_MAY_LINK.get() {
+    OPENS_THAT_MAY_LINK.with_borrow_mut(|opens| opens.insert(context));
+  }
+}
+
+/// Forgets a closed open's privilege (A-275).
+pub(crate) fn closed(context: u64) {
+  OPENS_THAT_MAY_LINK.with_borrow_mut(|opens| opens.remove(&context));
+}
+
+/// Whether the open `context` was made by a caller holding `SeCreateSymbolicLinkPrivilege` (A-275).
+pub(crate) fn may_link(context: u64) -> bool {
+  OPENS_THAT_MAY_LINK.with_borrow(|opens| opens.contains(&context))
+}
+
+/// Format: the most entries a token's privileges hold, one per well-known privilege (`SE_MAX_WELL_KNOWN_PRIVILEGE`,
+/// 36, `wdm.h`), each a `LUID_AND_ATTRIBUTES` of three words, after the count's one word.
+const PRIVILEGE_WORDS: usize = 1 + 36 * 3;
+
+/// Whether `request` is a Create or Open that could become a symbolic link (`Request::could_become_a_link`) for a caller
+/// whose token holds `SeCreateSymbolicLinkPrivilege` (A-275). A token the query refuses
+/// holds nothing, so such a caller is judged as one without the privilege.
+fn creator_may_link(request: &Request<'_>) -> Result<bool, WinFspError> {
+  use windows_sys::Win32::Security::{GetTokenInformation, TokenPrivileges};
+  if !request
+    .could_become_a_link()
+    .map_err(WinFspError::Capture)?
+  {
+    return Ok(false);
+  }
+  let value = usize::try_from(request.access_token().map_err(WinFspError::Capture)?)
+    .map_err(|_| WinFspError::Capture(Refusal::Length))?;
+  if value == 0 {
+    return Ok(false);
+  }
+  let mut words = [0u32; PRIVILEGE_WORDS];
+  let mut returned = 0u32;
+  let length =
+    u32::try_from(size_of_val(&words)).map_err(|_| WinFspError::Capture(Refusal::Length))?;
+  // SAFETY: this fresh Create's token handle was opened into this receiver's process by WinFsp, which keeps it live
+  // until the request is answered (as `PrivateOpens::authenticate` reads it); `words` is live, aligned storage of exactly
+  // `length` bytes, and `returned` a live word.
+  let queried = unsafe {
+    GetTokenInformation(
+      value as *mut _,
+      TokenPrivileges,
+      words.as_mut_ptr().cast(),
+      length,
+      &mut returned,
+    )
+  };
+  if queried == 0 {
+    slates_machine::log_line!(
+      "slates-winfsp: a link-making open's token refused its privileges' query"
+    );
+    return Ok(false);
+  }
+  let bytes: Vec<u8> = words
+    .iter()
+    .flat_map(|word| word.to_ne_bytes())
+    .take(usize::try_from(returned).unwrap_or(0))
+    .collect();
+  Ok(crate::symlink::holds_enabled_privilege(
+    &bytes,
+    u32::try_from(windows_sys::Wdk::System::SystemServices::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE)
+      .unwrap_or(0),
+  ))
 }
 
 /// Whether this worker is replaying a dead daemon's captured Cleanup or Close (`crate::host::Request`).
@@ -124,10 +203,13 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+  /// Starts the receive thread. `bound` is the open bound, and `spin_ceiling` the most the thread may spin for a reply
+  /// (the step quantum of the shard that started the mount, A-560): the thread learns its window from its own wakes
+  /// under it ([`crate::reply::start`]).
   pub(crate) fn start(
     file_system: usize,
     section: OwnedHandle,
-    bound: usize,
+    (bound, spin_ceiling): (usize, std::time::Duration),
     outcomes: std::sync::mpsc::SyncSender<crate::host::Outcome>,
     wake: std::task::Waker,
     confirmations: SyncSender<crate::host::Request>,
@@ -137,20 +219,19 @@ impl Worker {
     let thread = std::thread::Builder::new()
       .name("slates-winfsp-receive".to_owned())
       .spawn(move || {
-        if let Err(error) = crate::reply::measure().and_then(|()| {
-          receive_loop(
-            file_system,
-            section,
-            bound,
-            Receive {
-              stopped,
-              confirmations: &confirmations,
-              wake: &wake,
-              outcomes: &outcomes,
-              private,
-            },
-          )
-        }) {
+        crate::reply::start(spin_ceiling);
+        if let Err(error) = receive_loop(
+          file_system,
+          section,
+          bound,
+          Receive {
+            stopped,
+            confirmations: &confirmations,
+            wake: &wake,
+            outcomes: &outcomes,
+            private,
+          },
+        ) {
           slates_machine::log_line!("slates-winfsp: receive worker ended: {error}");
           if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
             slates_machine::log_line!(
@@ -394,7 +475,8 @@ impl inflight::settle::Edges for Dll<'_> {
 /// One DLL operation on the worker's reused packets. The request is copied whole into the working packet, and the
 /// callbacks read nothing past its own size. Only the response's fixed part is cleared, as the header the callback
 /// fills: a callback writes whatever it returns past that part and sets the size over it, and
-/// [`inflight::finish_response`] clears the padding up to the aligned length, so no byte of an earlier response is sent.
+/// [`inflight::finish_response`] clears the padding up to the aligned length, and what a successful Create's size
+/// counts besides its normalized name and open descriptor (A-551), so no byte of an earlier response is sent.
 /// `response` is the worker's own [`Packet`], lent through the protocol; any other buffer is refused.
 fn operation(
   file_system: *mut FileSystem,
@@ -440,15 +522,21 @@ fn operation(
   };
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
-  // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
-  // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
-  // throughout the synchronous call.
-  let callback_status = unsafe {
-    callback(
-      file_system,
-      working.0.as_mut_ptr().cast(),
-      response.as_mut_ptr().cast(),
-    )
+  CREATOR_MAY_LINK.set(creator_may_link(request)?);
+  let callback_status = match request.link().map_err(WinFspError::Capture)? {
+    // A hard link a patched driver forwards (A-360): the DLL has no case for it, so the worker serves it itself.
+    // SAFETY: file_system is the live file system the owner keeps until this worker joins.
+    Some(link) => unsafe { crate::host::link(file_system, &link) },
+    // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
+    // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
+    // throughout the synchronous call.
+    None => unsafe {
+      callback(
+        file_system,
+        working.0.as_mut_ptr().cast(),
+        response.as_mut_ptr().cast(),
+      )
+    },
   };
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {
@@ -458,6 +546,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(None);
   CURRENT_HINT.set(0);
+  CREATOR_MAY_LINK.set(false);
   inflight::finish_response(response, status).map_err(WinFspError::Capture)
 }
 

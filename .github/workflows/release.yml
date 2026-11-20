@@ -13,16 +13,24 @@
 #      runtime.
 #      Every target is built twice, each copy on a runner of its own (`copy: build` and `copy: rebuild`), and the
 #      release is refused unless the two are byte for byte the same (AC-9.5: reproducible from the tag).
-#   3. `release` (tags only) — the artifacts task (`--bin release -- artifacts`) refuses a release missing a target or carrying bytes no
-#      smoke test ran, and writes SHA256SUMS, slates-provenance.json and the notes; GitHub's artifact attestation signs
-#      SLSA build provenance for every binary (Sigstore, through this job's OIDC identity: no key or secret exists); and
-#      the binaries, the checksums, the provenance and the attestation bundle are attached to a DRAFT release.
+#   3. `stage` (every run, read-only) — the artifacts task (`--bin release -- artifacts`) refuses a release missing a
+#      target, carrying bytes no smoke test ran, or whose two copies differ, and writes SHA256SUMS,
+#      slates-provenance.json, the draft's notes and the publish plan; `sha256sum --check` holds the staged binaries to
+#      SHA256SUMS; everything is kept as the run's `release-staged` artifact, and the plan is the job's summary.
+#   4. `release` (tags only; the one job holding write permissions) — takes the `release-staged` artifact, checks it
+#      against SHA256SUMS again, has GitHub's artifact attestation sign SLSA build provenance for every binary
+#      (Sigstore, through this job's OIDC identity: no key or secret exists), and attaches the binaries, the checksums,
+#      the provenance and the attestation bundle to a DRAFT release.
 #
 # Nothing here publishes. A draft is visible only to the repository's maintainers until one of them publishes it
 # (`gh release edit vX.Y.Z --draft=false`, or "Publish release" on the draft) — that is the one approved step. A test
 # tag's draft is a pre-release titled as a test, and is never published.
 #
-# workflow_dispatch runs guard and build as a dry run (no tag, so no release job).
+# workflow_dispatch is the DRY RUN (A-320): guard, build and stage run as on a tag, with `--dry-run` for the tag, so
+# the checksums, the comparison of each target's two copies and the provenance are made and checked, and the staged
+# release is kept as the run's `release-staged` artifact. The `release` job does not run: a dry run signs nothing (on
+# this public repository a Sigstore signature is a public record) and makes no release, and none of its jobs holds a
+# permission that could. `gh workflow run release.yml --ref <branch>` starts one.
 name: Release
 
 on:
@@ -67,9 +75,9 @@ jobs:
           - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest, asset: slates-linux-x64-musl, musl: true }
           - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, asset: slates-linux-arm64-musl, musl: true }
           # windows-2025, not windows-latest: Nano Server ltsc2025 runs process-isolated only on a 2025 host.
-          - { target: x86_64-pc-windows-msvc, runner: windows-2025, asset: slates-windows-x64.exe, windows: true, nasm: true }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2025, asset: slates-windows-x64.exe, windows: true, nasm: true, msvc_arch: x64 }
           # Native arm64 Windows (GitHub's windows-11-arm image), where aws-lc-sys builds with clang-cl.
-          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, asset: slates-windows-arm64.exe, windows: true, clang_cl: true }
+          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, asset: slates-windows-arm64.exe, windows: true, clang_cl: true, msvc_arch: arm64 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
@@ -84,6 +92,21 @@ jobs:
         with:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           targets: ${{ matrix.target }}
+      # The MSVC toolset is pinned, so a tag's Windows bytes do not depend on the runner's image (A-411). Visual Studio's
+      # default toolset moves with every image update, and its linker and its C runtime objects, which `+crt-static`
+      # links in, went into the binary: the tag v0.1.0's two x86_64 copies, on windows-2025 20261103.298.1 and
+      # 20261116.315.1, differed in 2,559,679 bytes, and their Rich headers differed only in those tools (linker 14.51
+      # build 36260 against 14.52 build 37029; runtime objects 35721 against 36815), the Windows SDK's 204 objects alike
+      # (build 33145). Both images, and the arm64 one, carry VS 2022 17.14's toolset 14.44 beside the default
+      # (`Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64` and `.ARM64`; actions/runner-images' readmes,
+      # 2026-11-18), and a side-by-side toolset is serviced apart from the default; the SDK is pinned to its one version.
+      - name: MSVC toolset 14.44 and Windows SDK 10.0.26100.0, pinned
+        if: ${{ matrix.windows }}
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ matrix.msvc_arch }}
+          toolset: "14.44"
+          sdk: 10.0.26100.0
       # As CI's windows-arm64 lane: aws-lc-sys refuses cl.exe for aarch64-pc-windows-msvc and builds with clang-cl.
       - name: clang-cl for the C the binary links (arm64 Windows)
         if: ${{ matrix.clang_cl }}
@@ -149,17 +172,16 @@ jobs:
           --binary ${{ matrix.copy == 'rebuild' && 'rebuild' || 'dist' }}/${{ matrix.asset }} --target ${{ matrix.target }}
           --record records/${{ matrix.asset }}${{ matrix.copy == 'rebuild' && '.rebuild' || '' }}.record.json
       # Nano Server has no Visual C++ runtime, so a binary that starts there carries its C runtime (GAPS, "The Windows
-      # binary needs the Visual C++ runtime"). Process isolation needs a host of the image's own build: windows-2025.
+      # binary needs the Visual C++ runtime"), and imports nothing Nano Server's DLLs lack (A-357). The action starts
+      # Docker's engine when a runner left it stopped, and names a Docker failure apart from the binary's.
+      # Shape: the step took 22-45 s on 2026-11-18 (runs 44326428333, 44332283768, 44338576506); ten minutes is over ten
+      # times its longest, so only a runner whose Docker cannot start or pull meets the bound.
       - name: The Windows binary starts in Nano Server
         if: ${{ matrix.nasm && matrix.copy == 'build' }}
-        shell: pwsh
-        run: |
-          docker pull --quiet mcr.microsoft.com/windows/nanoserver:ltsc2025
-          $dist = (Resolve-Path dist).Path
-          $answer = docker run --rm --isolation=process -v "${dist}:C:\dist:ro" mcr.microsoft.com/windows/nanoserver:ltsc2025 "C:\dist\${{ matrix.asset }}" version
-          if ($LASTEXITCODE -ne 0) { throw "slates version exited $LASTEXITCODE in Nano Server" }
-          Write-Output "Nano Server: $answer"
-          if (-not ("$answer" -like "slates *")) { throw "unexpected answer: $answer" }
+        timeout-minutes: 10
+        uses: ./.github/actions/nano-server-start
+        with:
+          binary: dist/${{ matrix.asset }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.copy == 'rebuild' && 'rebuild-' || '' }}${{ matrix.asset }}
@@ -168,15 +190,12 @@ jobs:
             records/${{ matrix.asset }}${{ matrix.copy == 'rebuild' && '.rebuild' || '' }}.record.json
           if-no-files-found: error
 
-  release:
-    name: draft release
-    if: ${{ github.ref_type == 'tag' }}
+  # Every run, a tag's and a dry run's alike, with the workflow's read-only permissions: everything a release needs short
+  # of the signature and the draft (A-320). The release job below takes these exact files.
+  stage:
+    name: stage (checksums, provenance, every copy reproduced)
     needs: [build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # create the draft release and attach its files
-      id-token: write # the OIDC identity Sigstore signs the provenance with (no key, no secret)
-      attestations: write # store the attestation with the repository
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -186,12 +205,45 @@ jobs:
         with:
           path: gathered
           merge-multiple: true
-      - name: Checksums, provenance and notes (every target, only tested bytes, each rebuilt byte for byte)
-        run: >-
-          cargo run --locked -p xtask --bin release -- artifacts --dist gathered/dist --rebuild gathered/rebuild
-          --records gathered/records --notes notes
-          --tag "${GITHUB_REF_NAME}" --commit "${GITHUB_SHA}"
-          --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+      - name: Checksums, provenance, notes and plan (every target, only tested bytes, each rebuilt byte for byte)
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then staging=(--tag "${GITHUB_REF_NAME}"); else staging=(--dry-run); fi
+          cargo run --locked -p xtask --bin release -- artifacts --dist gathered/dist --rebuild gathered/rebuild \
+            --records gathered/records --notes gathered/notes "${staging[@]}" --commit "${GITHUB_SHA}" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+      - name: The staged binaries are the checksummed bytes
+        working-directory: gathered/dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: The plan is this job's summary
+        run: cat gathered/notes/plan.md >> "$GITHUB_STEP_SUMMARY"
+      # The binaries, SHA256SUMS and the provenance under dist/, the draft's notes, title, kind and the plan under
+      # notes/: the release job attaches exactly these.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-staged
+          path: |
+            gathered/dist
+            gathered/notes
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    if: ${{ github.ref_type == 'tag' }}
+    needs: [stage]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the draft release and attach its files
+      id-token: write # the OIDC identity Sigstore signs the provenance with (no key, no secret)
+      attestations: write # store the attestation with the repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-staged
+          path: gathered
+      - name: The staged binaries are still the checksummed bytes
+        working-directory: gathered/dist
+        run: sha256sum --check --strict SHA256SUMS
       - name: Sign build provenance for every binary
         id: attest
         uses: actions/attest-build-provenance@v2
@@ -203,9 +255,9 @@ jobs:
         run: |
           cp "${{ steps.attest.outputs.bundle-path }}" gathered/dist/slates-attestation.sigstore.json
           prerelease=""
-          if [ "$(cat notes/prerelease)" = "true" ]; then prerelease="--prerelease"; fi
+          if [ "$(cat gathered/notes/prerelease)" = "true" ]; then prerelease="--prerelease"; fi
           gh release create "${GITHUB_REF_NAME}" --draft --verify-tag $prerelease \
-            --title "$(cat notes/title)" --notes-file notes/notes.md \
+            --title "$(cat gathered/notes/title)" --notes-file gathered/notes/notes.md \
             gathered/dist/slates-* gathered/dist/SHA256SUMS
           gh release view "${GITHUB_REF_NAME}" --json name,isDraft,isPrerelease,assets \
             --jq '{name, isDraft, isPrerelease, assets: [.assets[] | {name, size}]}'

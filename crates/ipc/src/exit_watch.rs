@@ -19,7 +19,8 @@
 //! - Linux: a pidfd (`pidfd_open(2)`, Linux 5.3), bound to the process as the kqueue note is, readable once it
 //!   exits.
 //!
-//! A stopped process has not exited, so a stall stays a stall. A Linux client needs no watch (the control socket's
+//! A stopped process has not exited, so a call to it waits (A-232: a call waits while its daemon lives, and a stuck one
+//! is ended by its supervisor or its own watchdog, which this watch then sees). A Linux client needs no watch (the control socket's
 //! peer end closes with the daemon's process); the supervising anchor does, to restart a daemon the moment it dies
 //! rather than at its next observation (A-113's follow-up): on Unix the watch's descriptor
 //! (`ExitWatch::readiness`, the Unix arm) becomes readable at the exit, so the anchor waits on it beside its hold channel. For a
@@ -52,6 +53,67 @@ impl ExitWatch {
     })
   }
 
+  /// A watch on the process `pid` names only if it is the one created at `created` (`GetProcessTimes`' creation time,
+  /// in 100 ns intervals since 1601): a process exited and its pid reused by another is never taken for it, and the watch
+  /// reads exited at once. The handle is opened for `SYNCHRONIZE` and `PROCESS_QUERY_LIMITED_INFORMATION` alone, the
+  /// least that reads the creation time: it keeps the process object (and so its pid) but none of the objects the process
+  /// named, so a bootstrap object or an owner's token it made dies with it (A-176, A-447).
+  #[cfg(windows)]
+  pub fn on_created(pid: u32, created: u64) -> Result<ExitWatch, IpcError> {
+    Ok(ExitWatch {
+      inner: platform::ExitWatch::on_created(pid, created)?,
+    })
+  }
+
+  /// A watch on the process `pid` names only if it is the one that started at `started`, the mark a claimant names
+  /// itself by beside its pid (`ExitWatch::own_start`; A-522): a pid whose process ended and was reused by another is
+  /// never taken for it, and the watch reads exited at once. A claim carries both because its pid is only the claimant's
+  /// word until its watch is taken, and a pid is reused once its process is gone. macOS registers the exit note first and
+  /// reads the start after, so the right process's exit between the two is never missed: the note is bound to the process
+  /// it was registered on (kqueue(2)), and a start that does not match says that process is not the claimant. Windows
+  /// judges the creation time (`ExitWatch::on_created`), on a handle that keeps the pid while it is open.
+  #[cfg(any(target_os = "macos", windows))]
+  pub fn on_started(pid: u32, started: u64) -> Result<ExitWatch, IpcError> {
+    if pid == 0 {
+      return Err(IpcError::Layout {
+        reason: "the claim names no process",
+      });
+    }
+    Ok(ExitWatch {
+      inner: platform::ExitWatch::on_started(pid, started)?,
+    })
+  }
+
+  /// When this process started, the mark it names itself by beside its pid (A-522): on macOS the start time the kernel
+  /// keeps for it (`proc_pidinfo(PROC_PIDTBSDINFO)`'s `pbi_start_tvsec` and `pbi_start_tvusec`, in microseconds since
+  /// 1970); on Windows its creation time (`GetProcessTimes`, in 100 ns intervals since 1601). Two processes that held
+  /// one pid never share it: the second starts after the first has ended.
+  #[cfg(any(target_os = "macos", windows))]
+  pub fn own_start() -> Result<u64, IpcError> {
+    platform::own_start()
+  }
+
+  /// When process `pid` started, read as `ExitWatch::own_start` reads this process's; `None` when the system answers
+  /// nothing for it (no such process).
+  #[cfg(any(target_os = "macos", windows))]
+  pub fn start_of(pid: u32) -> Result<Option<u64>, IpcError> {
+    platform::start_of(pid)
+  }
+
+  /// The watched process's handle, to wait on beside another object (`crate::wake::Event::wait_or_exit`); `None` when
+  /// the process was already gone at the watch.
+  #[cfg(windows)]
+  pub fn handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+    self.inner.handle()
+  }
+
+  /// This process's creation time (`GetProcessTimes`, 100 ns intervals since 1601): what a claimant judges a pid by
+  /// ([`ExitWatch::on_created`]).
+  #[cfg(windows)]
+  pub fn own_creation() -> Result<u64, IpcError> {
+    platform::own_creation()
+  }
+
   /// Whether the watched process has exited, without waiting. A watch that can no longer be read
   /// answers exited, as an unusable control socket does on Linux: either way the daemon cannot be
   /// vouched for, and the caller's recovery reconnects to whichever daemon holds the instance now.
@@ -66,6 +128,11 @@ impl ExitWatch {
     self.inner.readiness()
   }
 }
+
+/// The kernel's BSD record of a process (macOS), read by the claim service for a sender's parent too
+/// (`crate::mach_claim`).
+#[cfg(target_os = "macos")]
+pub(crate) use platform::bsd_info;
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -148,6 +215,64 @@ mod platform {
     pub(super) fn readiness(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
       (!self.exited.get()).then(|| std::os::fd::AsFd::as_fd(&self.queue))
     }
+
+    pub(super) fn on_started(pid: u32, started: u64) -> Result<ExitWatch, IpcError> {
+      let watch = Self::on(pid)?;
+      // The note first, then the start: the note holds the process it was registered on, so if that process is the
+      // claimant its exit is caught however late, and if the start read after does not match, the process the note
+      // holds is another (the claimant's pid reused) and the claimant is gone.
+      if !watch.exited.get() && start_of(pid)? != Some(started) {
+        watch.exited.set(true);
+      }
+      Ok(watch)
+    }
+  }
+
+  /// Format: microseconds per second, the unit the start's two fields combine in.
+  const MICROS_PER_SECOND: u64 = 1_000_000;
+
+  pub(super) fn start_of(pid: u32) -> Result<Option<u64>, IpcError> {
+    Ok(bsd_info(pid).map(|info| {
+      info
+        .pbi_start_tvsec
+        .saturating_mul(MICROS_PER_SECOND)
+        .saturating_add(info.pbi_start_tvusec)
+    }))
+  }
+
+  pub(super) fn own_start() -> Result<u64, IpcError> {
+    let own = rustix::process::getpid()
+      .as_raw_nonzero()
+      .get()
+      .unsigned_abs();
+    start_of(own)?.ok_or(IpcError::OsRefused {
+      call: "proc_pidinfo(PROC_PIDTBSDINFO) of this process",
+      code: None,
+    })
+  }
+
+  /// The kernel's BSD record of process `pid` (`proc_pidinfo(PROC_PIDTBSDINFO)`, `<libproc.h>`): its parent and its
+  /// start among the rest; `None` when the kernel answers nothing for it (no such process, or none this user may read).
+  pub(crate) fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::ffi::c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` is a live, writable, zero-initialized `proc_bsdinfo` of `size` bytes; the call writes at most
+    // `size` bytes into it and returns how many it wrote.
+    let written = unsafe {
+      libc::proc_pidinfo(
+        std::ffi::c_int::try_from(pid).ok()?,
+        libc::PROC_PIDTBSDINFO,
+        0,
+        info.as_mut_ptr().cast(),
+        size,
+      )
+    };
+    if written != size {
+      return None;
+    }
+    // SAFETY: zero-initialized and then written whole by the kernel (`written == size`); every field is a plain integer
+    // or byte array, for which any bytes are a value.
+    Some(unsafe { info.assume_init() })
   }
 }
 
@@ -210,9 +335,10 @@ mod platform {
 mod platform {
   use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-  use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_TIMEOUT};
+  use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_TIMEOUT};
   use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, WaitForSingleObject,
   };
 
   use crate::error::IpcError;
@@ -224,24 +350,36 @@ mod platform {
 
   impl ExitWatch {
     pub(super) fn on(pid: u32) -> Result<ExitWatch, IpcError> {
-      // SAFETY: plain values; a null return is the failure, read from the thread's last error below.
-      let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
-      if raw.is_null() {
-        let error = std::io::Error::last_os_error();
-        // No such process: it exited between its answer and this watch.
-        if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
-          return Ok(ExitWatch { process: None });
-        }
-        return Err(IpcError::OsRefused {
-          call: "OpenProcess(SYNCHRONIZE)",
-          code: error.raw_os_error(),
-        });
+      Ok(ExitWatch {
+        process: open(pid, PROCESS_SYNCHRONIZE, "OpenProcess(SYNCHRONIZE)")?,
+      })
+    }
+
+    pub(super) fn on_created(pid: u32, created: u64) -> Result<ExitWatch, IpcError> {
+      let Some(process) = open(
+        pid,
+        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+        "OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)",
+      )?
+      else {
+        return Ok(ExitWatch { process: None });
+      };
+      // Another process created at another time holds the pid now: the process watched for is gone, its pid reused.
+      if creation_of(process.as_raw_handle())? != created {
+        return Ok(ExitWatch { process: None });
       }
-      // SAFETY: `raw` is the open handle `OpenProcess` just returned, owned by nothing else.
-      let process = unsafe { OwnedHandle::from_raw_handle(raw) };
       Ok(ExitWatch {
         process: Some(process),
       })
+    }
+
+    pub(super) fn on_started(pid: u32, started: u64) -> Result<ExitWatch, IpcError> {
+      Self::on_created(pid, started)
+    }
+
+    pub(super) fn handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+      use std::os::windows::io::AsHandle;
+      self.process.as_ref().map(AsHandle::as_handle)
     }
 
     pub(super) fn exited(&self) -> bool {
@@ -253,6 +391,70 @@ mod platform {
       // Signalled (exited) or failed (unusable): not vouched for.
       waited != WAIT_TIMEOUT
     }
+  }
+
+  /// The creation time of the process `process` names, a handle with a query right.
+  fn creation_of(process: HANDLE) -> Result<u64, IpcError> {
+    let mut times = [FILETIME {
+      dwLowDateTime: 0,
+      dwHighDateTime: 0,
+    }; 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: `process` is a live handle with a query right for the call, and the four out-parameters are live records
+    // the call writes and nothing else reads meanwhile.
+    let read = unsafe { GetProcessTimes(process, creation, exit, kernel, user) };
+    if read == 0 {
+      return Err(IpcError::OsRefused {
+        call: "GetProcessTimes",
+        code: std::io::Error::last_os_error().raw_os_error(),
+      });
+    }
+    let [creation, ..] = times;
+    Ok((u64::from(creation.dwHighDateTime) << u32::BITS) | u64::from(creation.dwLowDateTime))
+  }
+
+  /// This process's creation time.
+  pub(super) fn own_creation() -> Result<u64, IpcError> {
+    // SAFETY: the pseudo-handle of the calling process, always valid and never closed.
+    creation_of(unsafe { GetCurrentProcess() })
+  }
+
+  /// This process's start: its creation time.
+  pub(super) fn own_start() -> Result<u64, IpcError> {
+    own_creation()
+  }
+
+  /// Process `pid`'s start, its creation time, read on a handle opened for the query alone; `None` when no such
+  /// process is there.
+  pub(super) fn start_of(pid: u32) -> Result<Option<u64>, IpcError> {
+    let Some(process) = open(
+      pid,
+      PROCESS_QUERY_LIMITED_INFORMATION,
+      "OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)",
+    )?
+    else {
+      return Ok(None);
+    };
+    creation_of(process.as_raw_handle()).map(Some)
+  }
+
+  /// Process `pid`, opened for `rights` and owned; `None` when no such process exists (`ERROR_INVALID_PARAMETER`, the
+  /// answer for a pid no process holds), and any other refusal typed with `call`.
+  fn open(pid: u32, rights: u32, call: &'static str) -> Result<Option<OwnedHandle>, IpcError> {
+    // SAFETY: plain values; a null return is the failure, read from the thread's last error below.
+    let raw = unsafe { OpenProcess(rights, 0, pid) };
+    if raw.is_null() {
+      let error = std::io::Error::last_os_error();
+      if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
+        return Ok(None);
+      }
+      return Err(IpcError::OsRefused {
+        call,
+        code: error.raw_os_error(),
+      });
+    }
+    // SAFETY: `raw` is the open handle `OpenProcess` just returned, owned by nothing else.
+    Ok(Some(unsafe { OwnedHandle::from_raw_handle(raw) }))
   }
 }
 
@@ -351,6 +553,46 @@ mod tests {
       "it returned at the kill ({waited:?}), not its timeout"
     );
     assert!(watch.exited(), "the watch reads exited");
+  }
+
+  /// A-522 (a claim's pid bound to its process). Do: watch a live child by its pid and its own start, and again by its
+  /// pid and a start one later, another process's, as a pid reused before the watch would name it. Expect: the first not
+  /// exited while the child runs and exited once it is killed; the second exited at once, though a process holds the
+  /// pid; and this process's own start read as any process's is.
+  #[cfg(any(target_os = "macos", windows))]
+  #[test]
+  fn a_watch_by_pid_and_start_takes_no_other_process_for_its_own() {
+    let _gate = crate::descriptor_test_gate();
+    #[cfg(target_os = "macos")]
+    let mut child = std::process::Command::new("/bin/sleep")
+      .arg("30")
+      .spawn()
+      .unwrap();
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+      .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+      .spawn()
+      .unwrap();
+    let started = ExitWatch::start_of(child.id())
+      .unwrap()
+      .expect("a live child has a start");
+    let watch = ExitWatch::on_started(child.id(), started).unwrap();
+    let reused = ExitWatch::on_started(child.id(), started.wrapping_add(1)).unwrap();
+    assert!(
+      !watch.exited(),
+      "the claimant's own process was taken for gone"
+    );
+    assert!(
+      reused.exited(),
+      "a process started at another time was taken for the claimant"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(watch.exited(), "a killed claimant has exited");
+    assert_eq!(
+      ExitWatch::own_start().unwrap(),
+      ExitWatch::start_of(std::process::id()).unwrap().unwrap()
+    );
   }
 
   /// AUD-29-20 (Windows). Do: watch a child process, then kill it and reap it. Expect: not exited while

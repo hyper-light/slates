@@ -259,6 +259,108 @@ fn is_test_tree(path: &Path) -> bool {
   path.components().any(|c| {
     let s = c.as_os_str();
     s == "tests" || s == "benches" || s == "examples"
+  }) || is_out_of_line_test_module(path)
+}
+
+/// Whether `path` is a module file its parent declares under `#[cfg(test)]` (`#[cfg(test)] mod tests;` in
+/// `svndiff.rs`, its body in `svndiff/tests.rs`): a test module kept in a file of its own, which is test code as an
+/// inline `#[cfg(test)] mod tests { ... }` is. Until 2026-11-19 only the inline form was seen, and A-500's golden
+/// vectors in `crates/svn/src/svndiff/tests.rs` read as 124 tuning literals. The declaring file is the parent module's:
+/// `mod.rs`, `lib.rs` or `main.rs` in the module's directory, or the `<dir>.rs` beside it.
+fn is_out_of_line_test_module(path: &Path) -> bool {
+  let (Some(file_name), Some(parent)) = (path.file_name(), path.parent()) else {
+    return false;
+  };
+  let (name, module_dir) = if file_name == "mod.rs" {
+    match (parent.file_name(), parent.parent()) {
+      (Some(dir_name), Some(grandparent)) => (dir_name.to_string_lossy().into_owned(), grandparent),
+      _ => return false,
+    }
+  } else {
+    match path.file_stem() {
+      Some(stem) => (stem.to_string_lossy().into_owned(), parent),
+      None => return false,
+    }
+  };
+  let declaring = [
+    module_dir.join("mod.rs"),
+    module_dir.join("lib.rs"),
+    module_dir.join("main.rs"),
+    module_dir.with_extension("rs"),
+  ];
+  declaring
+    .iter()
+    .filter(|candidate| candidate.as_path() != path)
+    .any(|candidate| {
+      std::fs::read_to_string(candidate).is_ok_and(|source| declared_under_cfg_test(&source, &name))
+    })
+    || is_test_module_by_path(path, &file_name.to_string_lossy())
+}
+
+/// Whether a file beside `path` declares it, by `#[path = "<file_name>"]`, as a module under `#[cfg(test)]`
+/// (`#[cfg(test)] #[path = "getbundle_tests.rs"] mod tests;` in `crates/hg/src/serve/getbundle.rs`): a module's
+/// `#[path]` is read from the directory of the file declaring it. Until 2026-11-20 only a file named for its module was
+/// seen, and hg's seven `*_tests.rs` files read as 125 tuning literals.
+fn is_test_module_by_path(path: &Path, file_name: &str) -> bool {
+  let Some(Ok(siblings)) = path.parent().map(std::fs::read_dir) else {
+    return false;
+  };
+  siblings
+    .filter_map(Result::ok)
+    .map(|entry| entry.path())
+    .filter(|candidate| {
+      candidate.as_path() != path && candidate.extension().is_some_and(|ext| ext == "rs")
+    })
+    .any(|candidate| {
+      std::fs::read_to_string(&candidate)
+        .is_ok_and(|source| declared_by_path_under_cfg_test(&source, file_name))
+    })
+}
+
+/// Whether `source` declares the module `name` out of line (`mod name;`, any visibility) under a `#[cfg(...)]` that
+/// names `test` and not `not(test)`, with only attributes, comments and blank lines between: the same lexical reading
+/// [`lines_with_test_flag`] gives an inline test module.
+fn declared_under_cfg_test(source: &str, name: &str) -> bool {
+  out_of_line_cfg_test_modules(source).any(|(_, module)| module == name)
+}
+
+/// Whether `source` declares a module out of line under `#[cfg(test)]` (read as [`declared_under_cfg_test`] reads it)
+/// whose `#[path = "..."]` is `file_name`.
+fn declared_by_path_under_cfg_test(source: &str, file_name: &str) -> bool {
+  out_of_line_cfg_test_modules(source).any(|(path, _)| path == Some(file_name))
+}
+
+/// The modules `source` declares out of line under a `#[cfg(...)]` naming `test` and not `not(test)`, each with the
+/// `#[path = "..."]` among its attributes, if any.
+fn out_of_line_cfg_test_modules(source: &str) -> impl Iterator<Item = (Option<&str>, &str)> {
+  let mut armed = false;
+  let mut path_attr = None;
+  source.lines().filter_map(move |line| {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("#[cfg(") {
+      armed = trimmed.contains("test") && !trimmed.contains("not(test");
+      return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("#[path") {
+      path_attr = rest.split('"').nth(1);
+      return None;
+    }
+    if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
+      return None;
+    }
+    let declared = trimmed
+      .trim_start_matches("pub(crate) ")
+      .trim_start_matches("pub(super) ")
+      .trim_start_matches("pub ");
+    let module = declared
+      .strip_prefix("mod ")
+      .and_then(|rest| rest.strip_suffix(';'))
+      .map(str::trim)
+      .filter(|_| armed)
+      .map(|module| (path_attr, module));
+    armed = false;
+    path_attr = None;
+    module
   })
 }
 
@@ -304,26 +406,82 @@ fn lines_with_test_flag(source: &str) -> Vec<(usize, &str, bool)> {
 
 /// Strips string literals and comments from a code line so a word inside them cannot match.
 fn code_only(line: &str) -> String {
+  code_only_carrying(line, &mut StringState::Code)
+}
+
+/// Where a line of a file read in order starts and ends: in code, in a string literal, or in a raw string literal
+/// closed by a quote and that many `#`s. A string that spans lines (`"text \` continued below) leaves its later
+/// lines inside it, and those lines are string, not code (2026-11-18: three continuation lines of log and profile
+/// text were read as code and their amendment numbers and an Ubuntu release flagged as tuning literals).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StringState {
+  Code,
+  Plain,
+  Raw(usize),
+}
+
+/// [`code_only`] for a line of a file read in order: `state` says whether the line starts inside a string an earlier
+/// line opened, and is left saying whether it ends inside one. A character literal of a quote (`'"'`, `b'"'`, `'\"'`)
+/// opens nothing, and a raw string closes only at a quote followed by its own count of `#`s.
+fn code_only_carrying(line: &str, state: &mut StringState) -> String {
   let mut out = String::with_capacity(line.len());
-  let mut chars = line.chars().peekable();
-  let mut in_string = false;
-  while let Some(c) = chars.next() {
-    if in_string {
-      if c == '\\' {
-        chars.next();
-      } else if c == '"' {
-        in_string = false;
-        out.push('"');
+  let chars: Vec<char> = line.chars().collect();
+  let mut at = 0;
+  while let Some(&c) = chars.get(at) {
+    at += 1;
+    match *state {
+      StringState::Plain => {
+        if c == '\\' {
+          at += 1;
+        } else if c == '"' {
+          *state = StringState::Code;
+          out.push('"');
+        }
       }
-      continue;
-    }
-    if c == '"' {
-      in_string = true;
-      out.push('"');
-    } else if c == '/' && chars.peek() == Some(&'/') {
-      break;
-    } else {
-      out.push(c);
+      StringState::Raw(hashes) => {
+        let closes = c == '"' && (0..hashes).all(|offset| chars.get(at + offset) == Some(&'#'));
+        if closes {
+          at += hashes;
+          *state = StringState::Code;
+          out.push('"');
+        }
+      }
+      StringState::Code => {
+        if c == '\'' && chars.get(at) == Some(&'"') && chars.get(at + 1) == Some(&'\'') {
+          at += 2;
+          out.push_str("''");
+        } else if c == '\''
+          && chars.get(at) == Some(&'\\')
+          && chars.get(at + 1) == Some(&'"')
+          && chars.get(at + 2) == Some(&'\'')
+        {
+          at += 3;
+          out.push_str("''");
+        } else if c == 'r'
+          && !chars
+            .get(at.wrapping_sub(2))
+            .is_some_and(|before| before.is_alphanumeric() || *before == '_')
+          && matches!(chars.get(at), Some('"' | '#'))
+        {
+          let hashes = chars.get(at..).map_or(0, |rest| {
+            rest.iter().take_while(|next| **next == '#').count()
+          });
+          if chars.get(at + hashes) == Some(&'"') {
+            at += hashes + 1;
+            *state = StringState::Raw(hashes);
+            out.push('"');
+          } else {
+            out.push(c);
+          }
+        } else if c == '"' {
+          *state = StringState::Plain;
+          out.push('"');
+        } else if c == '/' && chars.get(at) == Some(&'/') {
+          break;
+        } else {
+          out.push(c);
+        }
+      }
     }
   }
   out
@@ -368,7 +526,8 @@ mod structural {
   const HOST_PATH_ALLOWED: &[(&str, &str)] = &[
     (
       "slates-machine",
-      "reads the kernel's pseudo-files (/proc, /sys) as queries; never writes",
+      "reads the kernel's pseudo-files (/proc, /sys) as queries, and writes one: a pressure-stall trigger to \
+       /proc/pressure/memory, the kernel's own interface (A-570, psi.rst); never a host path",
     ),
     (
       "slates-base",
@@ -395,7 +554,11 @@ mod structural {
     ("slates-bridge-winfsp", "the volume (§4.6)"),
     (
       "slates-cli",
-      "the launcher's namespace setup and mount install (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed",
+      "the launcher's namespace setup (§4.12), and a container bind's source resolved to the real path the kernel records, a read",
+    ),
+    (
+      "slates-api",
+      "the host mount (§4.6; moved from slates-cli by A-278): a mount point resolved to the real path the kernel records, a read, never a write; and the anchor and daemon roles' reads of the operator's fleet manifest, certificate, key and recovery-key files (moved from slates-cli with the roles), defects against A-50's zero disk access, to be removed",
     ),
   ];
 
@@ -902,6 +1065,71 @@ mod structural {
   }
 
   #[cfg(test)]
+  mod out_of_line_test_modules {
+    use crate::{declared_by_path_under_cfg_test, declared_under_cfg_test};
+
+    /// 2026-11-20 (R3). Do: read declaring files that put a module under `#[cfg(test)]` with a `#[path]` naming a file,
+    /// before or after the `cfg`, and files whose `#[path]` module is not under `cfg(test)` or names another file.
+    /// Expect: only the first two declare that file a test module.
+    #[test]
+    fn a_module_whose_path_names_the_file_under_cfg_test_is_test_code() {
+      let file = "getbundle_tests.rs";
+      assert!(declared_by_path_under_cfg_test(
+        "#[cfg(test)]\n#[path = \"getbundle_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+      assert!(declared_by_path_under_cfg_test(
+        "#[path = \"getbundle_tests.rs\"]\n#[cfg(test)]\nmod tests;\n",
+        file
+      ));
+      assert!(!declared_by_path_under_cfg_test(
+        "#[path = \"getbundle_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+      assert!(!declared_by_path_under_cfg_test(
+        "#[cfg(test)]\n#[path = \"other_tests.rs\"]\nmod tests;\n",
+        file
+      ));
+    }
+
+    /// 2026-11-19 (R3, A-500). Do: read declaring files that put `tests` under `#[cfg(test)]` out of line, with an
+    /// attribute between and with a visibility, and files that declare it plainly, under `cfg(not(test))`, after a
+    /// test-only function, or declare another module. Expect: only the first three are test modules.
+    #[test]
+    fn a_module_declared_under_cfg_test_in_its_parent_is_test_code() {
+      assert!(declared_under_cfg_test(
+        "#[cfg(test)]\nmod tests;\n",
+        "tests"
+      ));
+      assert!(declared_under_cfg_test(
+        "#[cfg(test)]\n#[path = \"t.rs\"]\n// golden vectors\nmod tests;\n",
+        "tests"
+      ));
+      assert!(declared_under_cfg_test(
+        "#[cfg(all(test, unix))]\npub(crate) mod tests;\n",
+        "tests"
+      ));
+      assert!(!declared_under_cfg_test("mod tests;\n", "tests"));
+      assert!(!declared_under_cfg_test(
+        "#[cfg(not(test))]\nmod tests;\n",
+        "tests"
+      ));
+      assert!(!declared_under_cfg_test(
+        "#[cfg(test)]\nfn helper() {}\nmod tests;\n",
+        "tests"
+      ));
+      assert!(!declared_under_cfg_test(
+        "#[cfg(test)]\nmod other;\n",
+        "tests"
+      ));
+      assert!(!declared_under_cfg_test(
+        "#[cfg(test)]\nmod tests {\n}\n",
+        "tests"
+      ));
+    }
+  }
+
+  #[cfg(test)]
   mod fixtures {
     use super::source_violations;
 
@@ -1142,8 +1370,8 @@ mod structural {
 
 mod literals {
   use super::{
-    Failure, cargo_metadata, code_only, is_test_tree, lines_with_test_flag, rust_sources,
-    workspace_root,
+    Failure, StringState, cargo_metadata, code_only_carrying, is_test_tree, lines_with_test_flag,
+    rust_sources, workspace_root,
   };
   use std::path::Path;
 
@@ -1198,12 +1426,14 @@ mod literals {
     let lines = lines_with_test_flag(&source);
     let mut cover_until: usize = 0;
     let mut derived_depth: i64 = 0;
+    // Carried across every line, test lines too, so a string that spans lines is read as one.
+    let mut string_state = StringState::Code;
     for (line_no, line, in_test) in &lines {
       let trimmed = line.trim_start();
       if MARKERS.iter().any(|m| trimmed.contains(m)) {
         cover_until = line_no + MARKER_REACH;
       }
-      let code = code_only(line);
+      let code = code_only_carrying(line, &mut string_state);
       // A `derived!(` call covers every line until its parentheses close.
       let in_derived = derived_depth > 0 || code.contains("derived!(");
       if in_derived {
@@ -1245,6 +1475,16 @@ mod literals {
     while i < bytes.len() {
       let c = bytes[i];
       let prev_is_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+      // A tuple field's index (`top.3`, `pair.0.1`) is a position, as an array index is, never a quantity.
+      let tuple_field = i > 1
+        && bytes[i - 1] == b'.'
+        && (bytes[i - 2].is_ascii_alphanumeric() || matches!(bytes[i - 2], b'_' | b')' | b']'));
+      if c.is_ascii_digit() && tuple_field {
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+          i += 1;
+        }
+        continue;
+      }
       if c.is_ascii_digit() && !prev_is_ident {
         let start = i;
         let radix_prefix =
@@ -1284,8 +1524,9 @@ mod literals {
 
   /// 0, 1 and 2 are arithmetic, not tuning: halves, doubles, increments, sentinels.
   fn is_trivial(literal: &str) -> bool {
+    // A `_` before a type suffix (`0_usize`) separates; it is no digit of the value.
     matches!(
-      literal.trim_end_matches('.'),
+      literal.trim_end_matches(['.', '_']),
       "0" | "1" | "2" | "0.0" | "1.0" | "2.0"
     )
   }
@@ -1303,5 +1544,83 @@ mod literals {
       || before.ends_with("align(")
       || after.starts_with(']')
       || before.ends_with("u8")
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::{is_trivial, numeric_literals};
+
+    /// Do: read typed zeros and ones written with a separator before the suffix. Expect each judged as the value it is:
+    /// `0_usize` is 0, never the literal `0_`.
+    #[test]
+    fn a_separator_before_a_type_suffix_is_no_digit() {
+      for literal in numeric_literals("let (a, b, c) = (0_usize, 1_u64, 0_u32); (1_u64..)") {
+        assert!(is_trivial(&literal), "{literal}");
+      }
+      assert!(
+        !numeric_literals("let n = 7_usize;")
+          .iter()
+          .all(|literal| is_trivial(literal))
+      );
+    }
+
+    /// Do: read tuple fields by position, then a range and a float beside them. Expect the fields' indexes not read as
+    /// literals, and the range's end and the float still read.
+    #[test]
+    fn a_tuple_fields_index_is_a_position_not_a_literal() {
+      assert!(numeric_literals("top.3 = true; pair.0.1; f().4; v[i].5").is_empty());
+      assert_eq!(
+        numeric_literals("let r = 0..7; let x = 3.5;"),
+        vec!["0", "7", "3.5"]
+      );
+    }
+  }
+}
+
+#[cfg(test)]
+mod string_state_tests {
+  use super::{StringState, code_only, code_only_carrying};
+
+  /// Every line of `text` read in order, as the literal check reads a file: each line's code alone.
+  fn code_of(text: &str) -> Vec<String> {
+    let mut state = StringState::Code;
+    text
+      .lines()
+      .map(|line| code_only_carrying(line, &mut state))
+      .collect()
+  }
+
+  /// Do: read a string that spans three lines, then code after it. Expect the middle line's digits and the
+  /// first line's tail inside the string gone, and the code after the string's close kept.
+  #[test]
+  fn a_string_spanning_lines_hides_its_continuation_lines() {
+    let lines = code_of("log!(\"held to this build \\\n   in 4 places, A-318)\", 64);\nlet x = 7;");
+    assert_eq!(lines, vec!["log!(\"", "\", 64);", "let x = 7;"]);
+  }
+
+  /// Do: read a character literal of a quote, then a number, on one line and the next. Expect the quote to open
+  /// nothing: both numbers stay code.
+  #[test]
+  fn a_quote_character_literal_opens_no_string() {
+    let lines = code_of("if c == '\"' { 42 }\nlet y = b'\"'; 43\nlet z = '\\\"'; 44");
+    assert!(lines[0].contains("42"), "{lines:?}");
+    assert!(lines[1].contains("43"), "{lines:?}");
+    assert!(lines[2].contains("44"), "{lines:?}");
+  }
+
+  /// Do: read a raw string holding a quote, closed on a later line, then code. Expect the inner quote not to close it
+  /// and the code after its `\"#` kept.
+  #[test]
+  fn a_raw_string_closes_only_at_its_own_hashes() {
+    let lines = code_of("let r = r#\"say \"5\" \nstill 6 inside\"#; let w = 9;");
+    assert!(!lines[0].contains('5'), "{lines:?}");
+    assert!(!lines[1].contains('6'), "{lines:?}");
+    assert!(lines[1].contains("let w = 9;"), "{lines:?}");
+  }
+
+  /// Do: strip one line on its own, as the structural check does. Expect a comment and a whole string gone.
+  #[test]
+  fn one_line_alone_strips_its_comment_and_string() {
+    assert_eq!(code_only("let s = \"7\"; // 8"), "let s = \"\"; ");
   }
 }

@@ -3,7 +3,16 @@
 - Date: 2026-10-20
 - Area: §4.6 bridges, cache posture; the fix recorded in
   `docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md` (landed `b9935dfe`)
-- Status: open — root cause confirmed, fix not attempted here (see "Why not fixed in this change")
+- Status: fixed in `7deddf549` (2026-10-21), whole, both paths at once as "Why not fixed in this
+  change" asked: the daemon's mount task now waits on its device, its `ChangeSignal` and the
+  volume (`crates/server/src/fuse.rs` `change_signal` calls `ServeState::wakes_with`, so a
+  finished round wakes the task), and `Volume::record` wakes every parked task on a change.
+  Tests: `crates/vfs/tests/change_waiters.rs` `a_parked_task_is_woken_by_a_change_and_not_by_a_read`
+  (passed on main 8eeb004bd, macOS arm64, Mac Studio, 2026-11-19, goal-83 audit B16) and the
+  Linux mount tests `crates/cli/tests/cli.rs`
+  `a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change` and
+  `a_shared_map_through_a_mount_follows_every_change_in_a_generated_sequence` (red without the
+  wake, per `7deddf549`). The text below is the record as found on 2026-10-20.
 - Found by: sweeping `crates/bridge-fuse` for public functions nothing calls.
 
 ## Description

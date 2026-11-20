@@ -236,9 +236,9 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: slates_vfs::inode::Kind,
+    node: slates_vfs::inode::SpecialNode,
   ) -> Result<NodeAttr, VfsError> {
-    self.inner.mknod(parent, cx, name, mode, kind)
+    self.inner.mknod(parent, cx, name, mode, node)
   }
 
   fn mkdir(
@@ -331,12 +331,13 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     cx: &OpContext,
     cursor: InvalidationCursor,
     out: &mut Vec<Invalidation>,
+    more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
   ) -> Result<InvalidationCursor, VfsError> {
     if self.refuse_gathers > 0 {
       self.refuse_gathers -= 1;
       return Err(VfsError::Invalid);
     }
-    self.inner.invalidations(cx, cursor, out)
+    self.inner.invalidations(cx, cursor, out, more)
   }
 
   fn seen(&mut self, cx: &OpContext) -> InvalidationCursor {

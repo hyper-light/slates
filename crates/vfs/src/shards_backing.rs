@@ -52,13 +52,14 @@
 //! offsets, which its protocol fixes (A-163). [`ShardsBackings::placed_pages`] counts the pages placed now, and
 //! [`ShardsBackings::placements`] reads where each lies. A range is placed only once it is filled and counted, and a filled range stays filled while its backing lives,
 //! so the bytes the placed ranges hold never exceed what the backings count against the budget. A decline likely to
-//! hold is remembered until the daemon's reap tick re-arms it ([`ShardsBackings::place`]), since a declined collapse
+//! hold is remembered until the shard's deadline keeper re-arms it a retry window on (A-570; [`ShardsBackings::place`]), since a declined collapse
 //! costs the shard milliseconds of the kernel's compaction effort.
 //!
 //! Bounded by the slab's capacity: the shard's chunk count, as the in-process DAX registry's. The registry also keeps
 //! its fill budget ([`ShardsBackings::set_budget`]), which the server sets from the shard's content reserve: a backing
-//! counts a range for each range it has filled, and at least one. A range is longer than a chunk, so the budget refuses
-//! long before the slab is full. Until the budget is set it is zero, and nothing is backed.
+//! counts a range for each range it has filled or a fill left uncleared ([`ShardsBacking::mark_uncleared`], A-419), and
+//! at least one. A range is longer than a chunk, so the budget refuses long before the slab is full. Until the budget is
+//! set it is zero, and nothing is backed.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -157,6 +158,20 @@ impl BackingObject {
     }
   }
 
+  /// What the anchor holds of a VMM's object across this daemon's death (Windows, A-448): a duplicate of its section in
+  /// this process that maps it read and write and may ask its size (`slates_mem::DaxObject::held`), for the anchor to
+  /// duplicate out and a successor to adopt. A peer's copy is never a stream's, so it is refused.
+  #[cfg(windows)]
+  pub fn held(&self) -> Result<std::os::windows::io::OwnedHandle, MemError> {
+    match self {
+      BackingObject::Vmm(object) => object.held(),
+      BackingObject::Peer(_) => Err(MemError::OsRefused {
+        call: "the anchor's hold of a peer's copy",
+        code: None,
+      }),
+    }
+  }
+
   /// Readies range `range` of a VMM's object for the VMM's map before its ask is answered (Windows commits it; see
   /// `slates_mem::DaxObject::prepare_range`). A peer's copy is whole from its making, so nothing is done for one.
   pub fn prepare_range(&mut self, range: u64) -> Result<(), MemError> {
@@ -247,16 +262,24 @@ pub struct PagePlacement {
   pub pmd_bytes: Option<u64>,
 }
 
-/// One file's backing for one holder: its object, the ranges filled from the volume, the ranges asked writable, and
-/// whether the disk has changed the file beneath it since.
+/// One file's backing for one holder: its object, the ranges filled from the volume, the ranges a fill began and did not
+/// finish, the ranges asked writable, and whether the disk has changed the file beneath it since.
 pub struct ShardsBacking {
   object: BackingObject,
   /// The prefix of the volume whose file it backs: the attachment's volume's own.
   volume: u16,
   inode: InodeNo,
   filled: BTreeSet<u64>,
+  /// Ranges a fill began and did not finish (A-419): no write reaches them, and the object may hold bytes there that
+  /// the file no longer has, so each is counted as a filled range is and cleared before a fill of it begins.
+  uncleared: BTreeSet<u64>,
   writable: BTreeSet<u64>,
   stale: bool,
+  /// Whether its object was taken back from a dead daemon (A-365, [`ShardsBackings::adopt_vmm`]): that daemon's range
+  /// table names a range only once its ask was answered, so a range it was filling when it died, or one whose fill it
+  /// had refused, is named by nothing and may hold that fill's bytes. Every range not filled is cleared before a fill of
+  /// it begins (A-526).
+  inherited: bool,
 }
 
 impl std::fmt::Debug for ShardsBacking {
@@ -265,8 +288,10 @@ impl std::fmt::Debug for ShardsBacking {
       .field("volume", &self.volume)
       .field("inode", &self.inode)
       .field("filled", &self.filled.len())
+      .field("uncleared", &self.uncleared.len())
       .field("writable", &self.writable.len())
       .field("stale", &self.stale)
+      .field("inherited", &self.inherited)
       .finish()
   }
 }
@@ -299,8 +324,10 @@ impl ShardsBacking {
       volume,
       inode,
       filled: BTreeSet::new(),
+      uncleared: BTreeSet::new(),
       writable: BTreeSet::new(),
       stale: false,
+      inherited: false,
     }
   }
 
@@ -338,9 +365,37 @@ impl ShardsBacking {
     self.filled.insert(range);
   }
 
-  /// Unmarks range `range`: a fill that did not complete.
+  /// Unmarks range `range`: a fill refused before it stored anything (its charge refused).
   pub fn unmark_filled(&mut self, range: u64) {
     self.filled.remove(&range);
+  }
+
+  /// Range `range`'s fill began and did not finish (A-419). It is no longer filled, so no write reaches it, but the
+  /// slices done may have stored bytes the file will not hold by the time the range is asked again, and a fill skips
+  /// holes and pages of zeros. So it stays counted against the fill budget, as a filled range is, until a fill of it
+  /// clears it first ([`ShardsBacking::cleared`]) or the backing goes.
+  pub fn mark_uncleared(&mut self, range: u64) {
+    self.filled.remove(&range);
+    self.uncleared.insert(range);
+  }
+
+  /// The ranges a fill began and did not finish, by index: each is cleared before a fill of it begins.
+  #[must_use]
+  pub fn uncleared(&self) -> &BTreeSet<u64> {
+    &self.uncleared
+  }
+
+  /// Range `range` was cleared: the object reads zero there again, as over a range never filled.
+  pub fn cleared(&mut self, range: u64) {
+    self.uncleared.remove(&range);
+  }
+
+  /// Whether range `range` must be cleared before a fill of it begins: a fill here began it and did not finish (A-419),
+  /// or the object came from a dead daemon and the range is not filled, so that daemon's fill may have left bytes there
+  /// (A-526). A fill copies only the volume's data and pages that are not zeros, so bytes left there would outlive it.
+  #[must_use]
+  pub fn owes_clear(&self, range: u64) -> bool {
+    self.uncleared.contains(&range) || (self.inherited && !self.filled.contains(&range))
   }
 
   /// The ranges a mapping asked to write, by index: what an ingest compares.
@@ -364,6 +419,23 @@ impl ShardsBacking {
   pub fn take_stale(&mut self) -> bool {
     std::mem::take(&mut self.stale)
   }
+}
+
+/// Why a VMM's backing a successor took back was not kept again ([`ShardsBackings::adopt_vmm`], A-365); nothing was kept
+/// or counted.
+#[derive(Debug)]
+pub enum VmmRefusal {
+  /// The fill budget has no room for what its filled ranges count.
+  Budget {
+    /// What its filled ranges count against the budget.
+    charge: u64,
+    /// What the backings count now.
+    charged: u64,
+    /// The budget.
+    budget: u64,
+  },
+  /// The registry has no slot for it at its handle: past its slots, or out of order.
+  Full(MemError),
 }
 
 /// Why a same-kernel client's backing was not kept ([`ShardsBackings::insert_peer`]); nothing was kept or counted.
@@ -394,7 +466,8 @@ pub struct ShardsBackings {
   refused: u64,
   /// Backings marked stale, monotone: the non-vacuity counter of the overlay's refill.
   marked_stale: u64,
-  /// The bytes the backings count against the budget: a range for each range each has filled, at least one each.
+  /// The bytes the backings count against the budget: a range for each range each has filled or left uncleared, at
+  /// least one each.
   charged: u64,
   /// The most they may count: the shard's content reserve, set by the server ([`ShardsBackings::set_budget`]).
   budget: u64,
@@ -404,6 +477,9 @@ pub struct ShardsBackings {
   /// The host declined a placement since the last re-arm in a way likely to hold, so ranges are served unplaced
   /// without asking again ([`ShardsBackings::place`]).
   placement_declined: bool,
+  /// A decline remembered since the daemon last asked ([`ShardsBackings::take_declined`], A-570): what tells the
+  /// shard's deadline keeper to arm the re-arm a window on.
+  declined_noted: bool,
   /// Collapses asked of the kernel, monotone: the non-vacuity counter that the memo above spares it.
   placements_asked: u64,
 }
@@ -441,6 +517,7 @@ impl ShardsBackings {
       peers: 0,
       peer_bytes: 0,
       placement_declined: false,
+      declined_noted: false,
       placements_asked: 0,
     }
   }
@@ -526,6 +603,13 @@ impl ShardsBackings {
   /// before any other backing is kept, in ascending `index` order (the slab's [`Slab::insert_at`] contract). Refused, with
   /// nothing kept or counted, past the budget, past the registry's slots, or out of order.
   ///
+  /// **Kept dormant until woken** ([`ShardsBackings::wake`]), as [`ShardsBackings::adopt_vmm`] keeps a VMM's (A-389): no
+  /// write reaches it meanwhile. The copy already holds every write the dead daemon made to its file, in order with its
+  /// client's stores, so the write log's replay, which runs between its adoption and its wake, must not write a logged
+  /// write over a store the client made after it. Measured: kept awake, the replay wrote a logged write over the store
+  /// that followed it in the client's own map, and the client's sync then found nothing to write
+  /// (`a_clients_store_after_a_logged_write_outlives_that_writes_replay`, 2026-11-18).
+  ///
   /// [`Slab::insert_at`]: slates_mem::Slab::insert_at
   pub fn adopt_peer(
     &mut self,
@@ -544,10 +628,8 @@ impl ShardsBackings {
     let mut backing = ShardsBacking::for_peer(object, volume, inode);
     let ranges = object_bytes.div_ceil(DAX_RANGE_BYTES);
     backing.filled.extend(0..ranges);
-    let file = (volume, inode);
     match self.slab.insert_at(index, generation, backing) {
       Ok(handle) => {
-        self.by_file.entry(file).or_default().push(handle);
         self.peers = self.peers.saturating_add(1);
         self.peer_bytes = self.peer_bytes.saturating_add(object_bytes);
         Ok(handle)
@@ -557,6 +639,71 @@ impl ShardsBackings {
         Err(PeerRefusal::Full(full))
       }
     }
+  }
+
+  /// Keeps a VMM's backing a successor daemon took back from its anchor (A-365) at the exact `(index, generation)` its
+  /// backing had in the dead daemon, so the copy id the anchor holds its object under names it again and no backing made
+  /// later can meet that id. Its ranges are filled and asked writable as the dead daemon's range table recorded them
+  /// (`filled`, `writable`), and it counts `charge` against the budget (the transport's rule for what its filled ranges
+  /// count). Called while recovery rebuilds the shard, beside [`ShardsBackings::adopt_peer`], in one ascending `index`
+  /// order (the slab's [`Slab::insert_at`] contract). Refused, nothing kept or counted, past the budget, past the
+  /// registry's slots, or out of order.
+  ///
+  /// **Kept dormant until woken** ([`ShardsBackings::wake`]): no write reaches it meanwhile. Its object already holds
+  /// every write the dead daemon made to its ranges, in order with its guest's stores, so the write log's replay, which
+  /// runs between its adoption and its stream's, must not write a logged write over a store its guest made after it.
+  /// Measured: kept awake through the replay, a guest's unsynced store was written over by the replay of the write it
+  /// followed and never reached the file (`a_streams_dax_map_outlives_its_daemon_with_its_unsynced_stores`, 2026-11-18).
+  ///
+  /// **Inherited** ([`ShardsBacking::owes_clear`]): a range the table does not name may hold bytes of a fill the dead
+  /// daemon began and never answered, so each such range is cleared before its first fill here (A-526). Those bytes are
+  /// counted by nothing until then: at most the ranges the dead daemon's fills had begun and not finished.
+  ///
+  /// [`Slab::insert_at`]: slates_mem::Slab::insert_at
+  pub fn adopt_vmm(
+    &mut self,
+    object: DaxObject,
+    (volume, inode): (u16, InodeNo),
+    (index, generation): (u32, u32),
+    (filled, writable): (BTreeSet<u64>, BTreeSet<u64>),
+    charge: u64,
+  ) -> Result<Handle<ShardsBacking>, VmmRefusal> {
+    if !self.charge(charge) {
+      return Err(VmmRefusal::Budget {
+        charge,
+        charged: self.charged,
+        budget: self.budget,
+      });
+    }
+    let mut backing = ShardsBacking::new(object, volume, inode);
+    backing.filled = filled;
+    backing.writable = writable;
+    backing.inherited = true;
+    match self.slab.insert_at(index, generation, backing) {
+      Ok(handle) => Ok(handle),
+      Err(full) => {
+        self.uncharge(charge);
+        Err(VmmRefusal::Full(full))
+      }
+    }
+  }
+
+  /// Wakes a backing [`ShardsBackings::adopt_vmm`] or [`ShardsBackings::adopt_peer`] kept dormant: from now on every
+  /// change of its file reaches it, as it reaches every backing. Whether there was such a backing (a stale handle, or one
+  /// awake already, changes nothing).
+  pub fn wake(&mut self, handle: Handle<ShardsBacking>) -> bool {
+    let Ok(backing) = self.slab.get(handle) else {
+      return false;
+    };
+    let handles = self
+      .by_file
+      .entry((backing.volume, backing.inode))
+      .or_default();
+    if handles.contains(&handle) {
+      return false;
+    }
+    handles.push(handle);
+    true
   }
 
   /// How many same-kernel clients' backings are held, and their objects' bytes.
@@ -598,14 +745,29 @@ impl ShardsBackings {
       self.placements_asked = self.placements_asked.saturating_add(1);
     }
     if placement == (Placement::Declined { transient: false }) {
-      self.placement_declined = true;
+      self.remember_decline();
     }
     Ok(placement)
   }
 
-  /// Forgets that the host declined a placement, so the next range asks the kernel again: the daemon calls it on its
-  /// reap tick, the cadence the arena's zones re-arm at (`DaxZones::rearm_refusals`), so a host that frees memory
-  /// places ranges again within one tick.
+  /// Remembers a decline likely to hold, as a placement the host declined that way does ([`ShardsBackings::place`]):
+  /// ranges are served unplaced until the re-arm, and the daemon is told ([`ShardsBackings::take_declined`]).
+  pub fn remember_decline(&mut self) {
+    if !self.placement_declined {
+      self.placement_declined = true;
+      self.declined_noted = true;
+    }
+  }
+
+  /// Whether a decline was remembered since the last call, taken (A-570): the shard's deadline keeper arms the re-arm a
+  /// window after it.
+  pub fn take_declined(&mut self) -> bool {
+    std::mem::take(&mut self.declined_noted)
+  }
+
+  /// Forgets that the host declined a placement, so the next range asks the kernel again: the daemon calls it at the
+  /// deadline its keeper armed a retry window after the decline (A-570; the reap loop's tick until then), so a host
+  /// that frees memory places ranges again a window after it declined, and nothing wakes while no decline is held.
   pub fn rearm_placement(&mut self) {
     self.placement_declined = false;
   }

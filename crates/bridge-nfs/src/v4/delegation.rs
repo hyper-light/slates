@@ -386,6 +386,13 @@ impl Delegations {
     plan
   }
 
+  /// When the earliest recall still unreturned began: it lapses once more than a lease has passed since
+  /// ([`Self::revoke_lapsed`]), so its holder's revocation is due a lease and a nanosecond after this; `None` while no
+  /// recall is outstanding (A-709: the shard's deadline keeper sleeps to it).
+  pub fn earliest_recall_ns(&self) -> Option<u64> {
+    self.recalls.first().map(|(at, _)| *at)
+  }
+
   /// Revokes every delegation whose recall began more than `lease_ns` before `now_ns` (§10.4.5); their `other`s,
   /// for the caller to journal and tell the holders (`SEQ4_STATUS_RECALLABLE_STATE_REVOKED`). Prunes file recall
   /// times older than the quiet period `quiet_ns` too.

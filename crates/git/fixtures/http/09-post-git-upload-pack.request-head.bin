@@ -1,0 +1,7 @@
+POST /many.git/git-upload-pack HTTP/1.1
+Host: 127.0.0.1:53711
+User-Agent: git/2.50.1
+Content-Type: application/x-git-upload-pack-request
+Accept: application/x-git-upload-pack-result
+Content-Length: 4
+

@@ -1,0 +1,730 @@
+//! The anchor and daemon roles (§2.5 "The anchor process", §2.6 "Boot order", §4.12 "Embedding", A-278): what a
+//! process of an instance runs, served by whichever executable the instance was started from — the `slates` binary, or
+//! an embedding host's own (kiln's), so a host runs no slates binary at all.
+//!
+//! - **The anchor** measures the machine profile, creates the shared segment, publishes the profile, and supervises the
+//!   daemon as its child, restarting it under the derived bound and killing it when its heartbeat lapses (§4.14
+//!   `daemon.alive`). Its daemon is the anchor's own executable started again, from the image the anchor runs (A-145),
+//!   with the **prefix** the anchor itself was started with, then the daemon role's arguments: `slates --instance NAME
+//!   daemon`, or `kiln slates-role --instance NAME daemon`. Every process of an instance carries `--instance NAME` in
+//!   its arguments, so a test or a host finds exactly its instance's processes.
+//! - **The daemon** attaches the anchor's segment from its environment (or, run alone, measures and creates one), reads
+//!   the published profile, derives its configuration and serves; it leaves when its anchor does.
+//! - **The WinFsp purge client** (Windows) is a child the daemon starts from the same executable and prefix, since no
+//!   daemon thread opens a volume it serves (§4.6).
+//! - **The chosen-path launcher** (`exec`, §4.6 "The launcher", A-370) runs one command with a volume at a path it
+//!   names, in a namespace of its own; it is served here so slates' AppArmor profile can attach to the host's own
+//!   executable ([`crate::exec`]).
+//!
+//! A host serves the roles from its `main`: when its arguments begin with the prefix it chose, it hands the rest to
+//! [`main`], which never returns to the host's own code paths. [`crate::StartSpec`] builds the anchor's command with the
+//! same program and prefix.
+//!
+//! Moved here from the `slates` binary on 2026-11-18 (A-278): `anchor.rs`, `daemon.rs`, `parent.rs`, `dumps.rs`,
+//! `fleet.rs`, `recovery_key.rs` and the stop flag of `signal.rs`, unchanged in what they do; the binary's `anchor` and
+//! `daemon` verbs call [`serve`] with no prefix. A role's failure ends its process, so [`Failure`] carries the sentence
+//! its log line prints and the exit code it maps to, and nothing else reads it.
+
+use std::fmt;
+use std::process::ExitCode;
+
+pub(crate) mod anchor;
+pub(crate) mod daemon;
+mod dumps;
+pub(crate) mod fleet;
+pub use fleet::{FleetCheck, check_fleet};
+// A-232 step 5: the liveness bound against this crate's own anchor (the test binary re-invoked as the anchor and
+// daemon). Unix only: the Windows anchor hands its daemon an explicit handle list, so the roles' shared standard input
+// is owed there.
+#[cfg(test)]
+mod liveness_tests;
+// A-510: a stop asked by a sender that then exits completes within its bound (the liveness tests' roles, re-invoked).
+mod parent;
+pub(crate) mod recovery_key;
+mod signal;
+#[cfg(test)]
+mod stop_tests;
+
+/// Format: the exit code of a role that failed (a refused or failed start, a daemon its own watchdog ended, A-232):
+/// the server's one constant, as the `slates` command's.
+pub const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
+/// Format: the exit code of a role refused before it started for a configuration the operator gave (an unreadable or
+/// malformed recovery key), as the `slates` command's refusals.
+pub const EXIT_REFUSED: u8 = 1;
+/// Format: the exit code of role arguments that do not parse, as the `slates` command's usage errors.
+pub const EXIT_USAGE: u8 = 2;
+/// Format: the exit code of an anchor started `StartSpec::until_served` that stopped because none of its daemons ever
+/// served (A-366): the first past the `slates` command's own (1 refused, 2 usage, 3 no daemon) and a failed role's (4),
+/// so a starter tells it from every other end ([`crate::StartFault::NeverServed`]).
+pub const EXIT_NEVER_SERVED: u8 = 5;
+
+/// Format: the role arguments [`Role::parse`] takes, for its usage message.
+pub const ROLE_USAGE: &str = "[--instance NAME] (anchor | daemon) [--shards N] [--quick] [--fleet PATH --node NAME] \
+   [--vcs-http ADDRESS] [--vcs-ssh ADDRESS] [--vcs-svn ADDRESS]";
+
+/// Options of the anchor and the daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessOptions {
+  /// The instance.
+  pub instance: String,
+  /// Measure the quick profile (tests; a full profile takes seconds).
+  pub quick: bool,
+  /// Shards, when the caller overrides the derivation (tests).
+  pub shards: Option<u16>,
+  /// The fleet to join, when this daemon is a fleet node (§2.6 boot step 6); a laptop has none.
+  pub fleet: Option<FleetSelection>,
+  /// Where the version-control servers' shared HTTP edge listens, when the operator starts one (`--vcs-http ADDRESS`,
+  /// §4.17.2 "Transports" item 1; A-625 part 3): HTTPS presenting a fleet node's own identity, or cleartext on a
+  /// loopback address for a daemon that is no fleet node ([`vcs_address`]). None starts no edge.
+  pub vcs_http: Option<slates_rt::tcp::SocketAddrV4>,
+  /// Where the version-control servers' SSH edge listens, when the operator starts one (`--vcs-ssh ADDRESS`, §4.17.2
+  /// "Transports" item 2; A-684): its host key the fleet node's own, or one the anchor makes at its start and keeps
+  /// across its daemons' restarts ([`vcs_ssh_address`]). None starts no edge.
+  pub vcs_ssh: Option<slates_rt::tcp::SocketAddrV4>,
+  /// Where the svn:// listener listens, when the operator starts one (`--vcs-svn ADDRESS`, §4.17.4 piece 7; A-656 part
+  /// 2): A-656's connection on each connection, ra_svn being cleartext, on a loopback address alone for a daemon that
+  /// is no fleet node ([`vcs_address`]). None starts no listener.
+  pub vcs_svn: Option<slates_rt::tcp::SocketAddrV4>,
+}
+
+/// Which fleet node this process is: the operator's shared manifest and this node's name in it
+/// (`--fleet PATH --node NAME`; `slates_server::deploy` derives everything else from the two).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FleetSelection {
+  /// The path of the shared manifest.
+  pub manifest: String,
+  /// This node's name in it.
+  pub node: String,
+}
+
+/// A role a process of an instance runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+  /// The anchor: the segment's owner and the daemon's supervisor.
+  Anchor(ProcessOptions),
+  /// The daemon.
+  Daemon(ProcessOptions),
+}
+
+/// How a role ended other than well: the sentence its log line prints, and so its exit code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Failure {
+  /// A configuration the operator gave was refused before the role started (exit [`EXIT_REFUSED`]).
+  Refused(String),
+  /// The role failed ([`EXIT_FAILED`]).
+  Failed(String),
+  /// An anchor started `StartSpec::until_served` stopped, since its daemons crash-looped and none of them ever served
+  /// ([`EXIT_NEVER_SERVED`], A-366).
+  NeverServed,
+}
+
+impl Failure {
+  /// The exit code the failure maps to.
+  pub fn exit_code(&self) -> u8 {
+    match self {
+      Self::Refused(_) => EXIT_REFUSED,
+      Self::Failed(_) => EXIT_FAILED,
+      Self::NeverServed => EXIT_NEVER_SERVED,
+    }
+  }
+}
+
+impl fmt::Display for Failure {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Refused(text) => write!(f, "refused: {text}"),
+      Self::Failed(text) => f.write_str(text),
+      Self::NeverServed => f.write_str(
+        "its daemons failed their starts in a row and none of them served, and its starter asked it to stop then: \
+         stopping",
+      ),
+    }
+  }
+}
+
+/// Why role arguments do not parse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoleArgsError {
+  /// No `anchor` or `daemon` word.
+  NoRole,
+  /// A word past the role's.
+  Extra(String),
+  /// A flag the roles do not take.
+  UnknownFlag(String),
+  /// A flag that takes a value was given none.
+  MissingValue(String),
+  /// A value that does not parse.
+  BadValue {
+    /// The flag.
+    flag: &'static str,
+    /// Why.
+    reason: String,
+  },
+  /// `--fleet` without `--node`, or `--node` without `--fleet`: a fleet node is named by both.
+  HalfAFleet,
+}
+
+impl fmt::Display for RoleArgsError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::NoRole => f.write_str("no role: expected `anchor` or `daemon`"),
+      Self::Extra(word) => write!(f, "unexpected argument `{word}`"),
+      Self::UnknownFlag(flag) => write!(f, "unknown flag `{flag}`"),
+      Self::MissingValue(flag) => write!(f, "`{flag}` takes a value"),
+      Self::BadValue { flag, reason } => write!(f, "bad {flag}: {reason}"),
+      Self::HalfAFleet => f.write_str(
+        "a fleet node is named by both `--fleet PATH` (the manifest) and `--node NAME` (which node it is)",
+      ),
+    }
+  }
+}
+
+impl std::error::Error for RoleArgsError {}
+
+/// Format: the role words.
+const ANCHOR_WORD: &str = "anchor";
+const DAEMON_WORD: &str = "daemon";
+
+/// The role's parse state: the flags as given, the role word.
+#[derive(Default)]
+struct Given {
+  instance: Option<String>,
+  shards: Option<String>,
+  fleet: Option<String>,
+  node: Option<String>,
+  vcs_http: Option<String>,
+  vcs_ssh: Option<String>,
+  vcs_svn: Option<String>,
+  quick: bool,
+  word: Option<String>,
+}
+
+impl Given {
+  /// Takes `flag` with `value` (a flag that takes one).
+  fn take_value(&mut self, flag: &str, value: String) -> Result<(), RoleArgsError> {
+    let slot = match flag {
+      "--instance" => &mut self.instance,
+      "--shards" => &mut self.shards,
+      "--fleet" => &mut self.fleet,
+      "--node" => &mut self.node,
+      "--vcs-http" => &mut self.vcs_http,
+      "--vcs-ssh" => &mut self.vcs_ssh,
+      "--vcs-svn" => &mut self.vcs_svn,
+      other => return Err(RoleArgsError::UnknownFlag(other.to_owned())),
+    };
+    *slot = Some(value);
+    Ok(())
+  }
+
+  /// The options the flags name.
+  fn options(self) -> Result<ProcessOptions, RoleArgsError> {
+    let shards = self
+      .shards
+      .map(|text| {
+        shard_count(&text).map_err(|reason| RoleArgsError::BadValue {
+          flag: "--shards",
+          reason,
+        })
+      })
+      .transpose()?;
+    let fleet = match (self.fleet, self.node) {
+      (Some(manifest), Some(node)) => Some(FleetSelection { manifest, node }),
+      (None, None) => None,
+      _ => return Err(RoleArgsError::HalfAFleet),
+    };
+    let vcs_http = edge_address(self.vcs_http, "--vcs-http", fleet.is_some())?;
+    let vcs_ssh = self
+      .vcs_ssh
+      .map(|text| {
+        vcs_ssh_address(&text).map_err(|reason| RoleArgsError::BadValue {
+          flag: "--vcs-ssh",
+          reason,
+        })
+      })
+      .transpose()?;
+    let vcs_svn = edge_address(self.vcs_svn, "--vcs-svn", fleet.is_some())?;
+    Ok(ProcessOptions {
+      instance: self.instance.unwrap_or_else(slates_ipc::instance_from_env),
+      quick: self.quick,
+      shards,
+      fleet,
+      vcs_http,
+      vcs_ssh,
+      vcs_svn,
+    })
+  }
+}
+
+/// The address a version-control flag `flag` gave, `text`, read by [`vcs_address`]: none where the flag was not given.
+fn edge_address(
+  text: Option<String>,
+  flag: &'static str,
+  fleet_node: bool,
+) -> Result<Option<slates_rt::tcp::SocketAddrV4>, RoleArgsError> {
+  text
+    .map(|text| {
+      vcs_address(&text, fleet_node).map_err(|reason| RoleArgsError::BadValue { flag, reason })
+    })
+    .transpose()
+}
+
+/// Reads a `--shards` count: a number no larger than the most shards one process registers
+/// (`slates_rt::registry::MAX_SHARDS`), or why it is not one. The runtime refuses a registration past its registry, and it
+/// does so in the daemon, after the anchor has started it: every start failed, and the anchor, which gives no daemon up
+/// (A-311), restarted it, backed off, for good. CI asked 1,417 and 1,574 shards of 4-CPU runners that way (runs
+/// 44298844583 and 44310013691, "too many shards: at most 1024 per process"). So the count is refused where it is given,
+/// before anything starts: by the roles here and by the `slates` command, which reads its flags with this.
+pub fn shard_count(text: &str) -> Result<u16, String> {
+  let shards = text.parse::<u16>().map_err(|e| e.to_string())?;
+  if usize::from(shards) > slates_rt::registry::MAX_SHARDS {
+    return Err(format!(
+      "{shards} shards: one process runs at most {}, the runtime's registry of shards",
+      slates_rt::registry::MAX_SHARDS
+    ));
+  }
+  Ok(shards)
+}
+
+/// Reads the address of a version-control listener, `--vcs-http`'s (the servers' shared HTTP edge, §4.17.2 "Transports"
+/// item 1; A-625 part 3) or `--vcs-svn`'s (the svn:// listener, §4.17.4 piece 7; A-656 part 2): an IPv4 address and
+/// port, `127.0.0.1:8080`, port 0 taking one the system picks, which the daemon logs; or why it is not one. A daemon
+/// that is no fleet node (`fleet_node` false) serves either in cleartext, which it does on a loopback address alone:
+/// its HTTP edge has no identity to present (Basic's password and a bearer token would cross in the clear, RFC 7617 §4
+/// and RFC 6750 §5.3), and ra_svn has no TLS at all. Any other address is refused here, before anything starts, as a
+/// shard count past the registry is ([`shard_count`]), rather than by a daemon that would start without the listener.
+/// A fleet node's HTTP edge presents the node's own identity, the one its RPC-with-TLS export presents, and its
+/// operator may publish either at any address. The roles here and the `slates` command read both flags with this.
+pub fn vcs_address(text: &str, fleet_node: bool) -> Result<slates_rt::tcp::SocketAddrV4, String> {
+  let address = text
+    .parse::<slates_rt::tcp::SocketAddrV4>()
+    .map_err(|error| {
+      format!("{text}: {error}; an IPv4 address and port, such as 127.0.0.1:8080")
+    })?;
+  if !fleet_node && !address.ip().is_loopback() {
+    return Err(format!(
+      "{address}: a daemon that is no fleet node serves version control in cleartext, on a loopback address alone; a \
+       fleet node (--fleet PATH --node NAME) serves HTTPS with its own identity, and svn:// where its operator says"
+    ));
+  }
+  Ok(address)
+}
+
+/// Reads a `--vcs-ssh` address, the version-control servers' SSH edge's (§4.17.2 "Transports" item 2; A-684): an IPv4
+/// address and port, `127.0.0.1:2222`, port 0 taking one the system picks, which the daemon logs with its host key's
+/// fingerprint; or why it is not one. Any address is taken, on a fleet node or not: SSH encrypts every connection and
+/// proves the server by its host key before a client sends anything of its own (RFC 4253 §7-§8), and authenticates a
+/// client by a signature, never a secret sent (RFC 4252 §7), so no address is left to cleartext as `--vcs-http`'s
+/// off loopback would be. The edge listens on an unprivileged port (R10): a privileged one is refused by the system
+/// where it is privileged, which ends the anchor's start by name. The roles here and the `slates` command read the flag
+/// with this.
+pub fn vcs_ssh_address(text: &str) -> Result<slates_rt::tcp::SocketAddrV4, String> {
+  text
+    .parse::<slates_rt::tcp::SocketAddrV4>()
+    .map_err(|error| format!("{text}: {error}; an IPv4 address and port, such as 127.0.0.1:2222"))
+}
+
+/// Whether `flag` takes a value.
+fn takes_value(flag: &str) -> bool {
+  matches!(
+    flag,
+    "--instance" | "--shards" | "--fleet" | "--node" | "--vcs-http" | "--vcs-ssh" | "--vcs-svn"
+  )
+}
+
+impl Role {
+  /// Parses a role's arguments, as [`Role::args`] makes them and a person types them: [`ROLE_USAGE`], flags in any
+  /// order, each value after its flag or joined by `=`; with no `--instance`, the environment's instance
+  /// (`SLATES_ENDPOINT`), else `default`, as the `slates` command takes it.
+  pub fn parse(args: &[String]) -> Result<Role, RoleArgsError> {
+    let mut given = Given::default();
+    let mut words = args.iter();
+    while let Some(argument) = words.next() {
+      if argument.starts_with("--") {
+        let (flag, inline) = match argument.split_once('=') {
+          Some((flag, value)) => (flag, Some(value.to_owned())),
+          None => (argument.as_str(), None),
+        };
+        if flag == "--quick" && inline.is_none() {
+          given.quick = true;
+        } else if takes_value(flag) {
+          let value = match inline {
+            Some(value) => value,
+            None => words
+              .next()
+              .cloned()
+              .ok_or_else(|| RoleArgsError::MissingValue(flag.to_owned()))?,
+          };
+          given.take_value(flag, value)?;
+        } else {
+          return Err(RoleArgsError::UnknownFlag(argument.clone()));
+        }
+      } else if given.word.is_none() {
+        given.word = Some(argument.clone());
+      } else {
+        return Err(RoleArgsError::Extra(argument.clone()));
+      }
+    }
+    match given.word.take().as_deref() {
+      Some(ANCHOR_WORD) => Ok(Role::Anchor(given.options()?)),
+      Some(DAEMON_WORD) => Ok(Role::Daemon(given.options()?)),
+      Some(other) => Err(RoleArgsError::Extra(other.to_owned())),
+      None => Err(RoleArgsError::NoRole),
+    }
+  }
+
+  /// The arguments that name this role, which [`Role::parse`] reads back to it: `--instance NAME`, the role's word,
+  /// then its flags.
+  pub fn args(&self) -> Vec<String> {
+    let (word, options) = match self {
+      Role::Anchor(options) => (ANCHOR_WORD, options),
+      Role::Daemon(options) => (DAEMON_WORD, options),
+    };
+    let mut args = vec![
+      "--instance".to_owned(),
+      options.instance.clone(),
+      word.to_owned(),
+    ];
+    if options.quick {
+      args.push("--quick".to_owned());
+    }
+    if let Some(shards) = options.shards {
+      args.push("--shards".to_owned());
+      args.push(shards.to_string());
+    }
+    // A fleet node's daemon joins the fleet; the anchor only passes the selection through (the daemon reads the
+    // manifest, so a restart re-reads an operator's edit).
+    if let Some(fleet) = &options.fleet {
+      args.push("--fleet".to_owned());
+      args.push(fleet.manifest.clone());
+      args.push("--node".to_owned());
+      args.push(fleet.node.clone());
+    }
+    // The shared HTTP edge is the daemon's; the anchor passes the address through to the daemon it starts.
+    if let Some(address) = options.vcs_http {
+      args.push("--vcs-http".to_owned());
+      args.push(address.to_string());
+    }
+    // So is the SSH edge (A-684): the anchor holds its listener and host key, and passes the address on.
+    if let Some(address) = options.vcs_ssh {
+      args.push("--vcs-ssh".to_owned());
+      args.push(address.to_string());
+    }
+    // So is the svn:// listener (A-656 part 2).
+    if let Some(address) = options.vcs_svn {
+      args.push("--vcs-svn".to_owned());
+      args.push(address.to_string());
+    }
+    args
+  }
+
+  /// The role's options.
+  pub fn options(&self) -> &ProcessOptions {
+    match self {
+      Role::Anchor(options) | Role::Daemon(options) => options,
+    }
+  }
+
+  /// The role's word, as its log lines name it.
+  fn word(&self) -> &'static str {
+    match self {
+      Role::Anchor(_) => ANCHOR_WORD,
+      Role::Daemon(_) => DAEMON_WORD,
+    }
+  }
+}
+
+/// Runs `role` in this process until it ends: the anchor until a stop is requested (it starts its daemon as this
+/// process's own executable with `prefix`, then the daemon role's arguments), the daemon until a stop is requested or
+/// its anchor is gone. `prefix` is what the host's `main` recognised before the role's arguments (empty for the
+/// `slates` binary).
+pub fn serve(prefix: &[String], role: &Role) -> Result<(), Failure> {
+  match role {
+    Role::Anchor(options) => anchor::run(prefix, options),
+    Role::Daemon(options) => daemon::run(prefix, options),
+  }
+}
+
+/// The role entry of a host's own executable: `args` are what followed the host's `prefix` in its arguments (the
+/// WinFsp purge client's word, on Windows; the chosen-path launcher's, beginning `exec`, which
+/// [`crate::exec::command`] builds; or a role [`Role::parse`] reads); the role runs, and its exit code comes back for
+/// the host's `main` to return. The launcher never returns on success: it becomes its command. A usage error prints
+/// [`ROLE_USAGE`]; a failure prints one line naming the role.
+///
+/// ```no_run
+/// fn main() -> std::process::ExitCode {
+///   let args: Vec<String> = std::env::args().skip(1).collect();
+///   if args.first().map(String::as_str) == Some("slates-role") {
+///     return slates_api::role::main(&args[..1], &args[1..]);
+///   }
+///   // ... the host's own commands ...
+///   std::process::ExitCode::SUCCESS
+/// }
+/// ```
+pub fn main(prefix: &[String], args: &[String]) -> ExitCode {
+  #[cfg(windows)]
+  if args.first().map(String::as_str) == Some(slates_bridge_winfsp::purge_client::ROLE_ARG) {
+    let code = slates_bridge_winfsp::purge_client::serve_from_env();
+    return ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX));
+  }
+  // The chosen-path launcher (A-370), served by the host's own executable so slates' AppArmor profile can attach to it.
+  if args.first().map(String::as_str) == Some(slates_client::exec::EXEC_WORD) {
+    return crate::exec::serve(args);
+  }
+  let role = match Role::parse(args) {
+    Ok(role) => role,
+    Err(error) => {
+      slates_machine::log_line!("slates: {error}\nusage: {ROLE_USAGE}");
+      return ExitCode::from(EXIT_USAGE);
+    }
+  };
+  match serve(prefix, &role) {
+    Ok(()) => ExitCode::SUCCESS,
+    Err(failure) => {
+      slates_machine::log_line!("slates {}: {failure}", role.word());
+      ExitCode::from(failure.exit_code())
+    }
+  }
+}
+
+/// Measures the machine profile as the roles do (§4.1): full, or quick (tests). A probe that could not measure at all
+/// within its bound is the failure, named, never a profile carrying a fabricated value.
+pub fn measure(quick: bool) -> Result<slates_machine::MachineProfile, Failure> {
+  daemon::measure(quick)
+}
+
+/// The operator's recovery key (§4.8, AUD-07), when `SLATES_RECOVERY_KEY` names one: what confirms a consensus
+/// recovery on an instance whose operator holds one. Refused when it is named but unreadable or malformed.
+pub fn recovery_key() -> Result<Option<slates_server::RecoveryKey>, Failure> {
+  recovery_key::load()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn words(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_owned).collect()
+  }
+
+  /// §2.5, A-278. Do: parse an anchor's and a daemon's arguments in any order, with values after their flags and
+  /// joined by `=`, then make each role's arguments and parse them back. Expect: the roles named, and every role equal
+  /// to its own arguments read back — the anchor starts its daemon from exactly what this pair agrees on.
+  #[test]
+  fn a_roles_arguments_parse_and_read_back_to_the_same_role() {
+    let anchor = Role::parse(&words("--quick anchor --shards=2 --instance z")).unwrap();
+    assert_eq!(
+      anchor,
+      Role::Anchor(ProcessOptions {
+        instance: "z".into(),
+        quick: true,
+        shards: Some(2),
+        fleet: None,
+        vcs_http: None,
+        vcs_ssh: None,
+        vcs_svn: None,
+      })
+    );
+    let daemon = Role::parse(&words("daemon --instance a --fleet /f.json --node a")).unwrap();
+    assert_eq!(
+      daemon,
+      Role::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: Some(FleetSelection {
+          manifest: "/f.json".into(),
+          node: "a".into(),
+        }),
+        vcs_http: None,
+        vcs_ssh: None,
+        vcs_svn: None,
+      })
+    );
+    for role in [anchor, daemon] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+      assert_eq!(role.args().first().map(String::as_str), Some("--instance"));
+    }
+  }
+
+  /// §2.5, A-278. Do: parse arguments that name no role, two roles, a flag the roles do not take, a flag with no value,
+  /// a bad shard count, and half a fleet selection. Expect: each refused by its own variant, never a role.
+  #[test]
+  fn arguments_that_name_no_role_or_a_bad_one_are_refused_by_kind() {
+    assert_eq!(Role::parse(&words("--quick")), Err(RoleArgsError::NoRole));
+    assert_eq!(
+      Role::parse(&words("anchor daemon")),
+      Err(RoleArgsError::Extra("daemon".into()))
+    );
+    assert_eq!(
+      Role::parse(&words("volume")),
+      Err(RoleArgsError::Extra("volume".into()))
+    );
+    assert_eq!(
+      Role::parse(&words("anchor --json")),
+      Err(RoleArgsError::UnknownFlag("--json".into()))
+    );
+    assert_eq!(
+      Role::parse(&words("anchor --shards")),
+      Err(RoleArgsError::MissingValue("--shards".into()))
+    );
+    assert!(matches!(
+      Role::parse(&words("anchor --shards many")),
+      Err(RoleArgsError::BadValue {
+        flag: "--shards",
+        ..
+      })
+    ));
+    assert_eq!(
+      Role::parse(&words("daemon --node a")),
+      Err(RoleArgsError::HalfAFleet)
+    );
+  }
+
+  /// A-684 (§4.17.2 "Transports" item 2). Do: parse a daemon asked for the version-control SSH edge on a loopback
+  /// address (its value joined by `=`), and an anchor that is no fleet node asked for one on an address any interface
+  /// reaches, beside the HTTP edge; make each role's arguments and parse them back. Then give the flag a name where an
+  /// address belongs, and an address with no port. Expect: each address read, and carried back whole through the
+  /// arguments an anchor starts its daemon with (SSH encrypts every connection, so any address is taken without a
+  /// fleet); the name and the bare address refused as a bad `--vcs-ssh` that says what an address is, before anything
+  /// starts.
+  #[test]
+  fn a_roles_vcs_ssh_edge_reads_back_on_any_address_and_a_name_is_refused() {
+    let daemon = Role::parse(&words("daemon --vcs-ssh=127.0.0.1:2222")).unwrap();
+    assert_eq!(
+      daemon.options().vcs_ssh,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::LOCALHOST,
+        2222
+      ))
+    );
+    let anchor = Role::parse(&words(
+      "anchor --vcs-http 127.0.0.1:8080 --vcs-ssh 0.0.0.0:2222",
+    ))
+    .unwrap();
+    assert_eq!(
+      anchor.options().vcs_ssh,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::UNSPECIFIED,
+        2222
+      ))
+    );
+    for role in [daemon, anchor] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+    }
+    for refused in [
+      "daemon --vcs-ssh localhost:2222",
+      "anchor --vcs-ssh 127.0.0.1",
+    ] {
+      let parsed = Role::parse(&words(refused));
+      assert!(
+        matches!(&parsed, Err(RoleArgsError::BadValue { flag: "--vcs-ssh", reason }) if reason.contains("IPv4 address and port")),
+        "{refused}: {parsed:?}"
+      );
+    }
+  }
+
+  /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: parse a daemon asked for the version-control HTTP edge on a
+  /// loopback address (its value joined by `=`), and a fleet node's anchor asked for one on an address any interface
+  /// reaches; make each role's arguments and parse them back. Then ask a daemon that is no fleet node for an edge off
+  /// loopback, and give the flag a name where an address belongs. Expect: each address read, and carried back whole
+  /// through the arguments an anchor starts its daemon with; the edge off loopback without a fleet refused as a bad
+  /// `--vcs-http` that names loopback (it would serve cleartext there), and the name refused as a bad `--vcs-http`,
+  /// both before anything starts.
+  #[test]
+  fn a_roles_vcs_http_edge_reads_back_and_cleartext_off_loopback_is_refused() {
+    let daemon = Role::parse(&words("daemon --vcs-http=127.0.0.1:8080")).unwrap();
+    assert_eq!(
+      daemon.options().vcs_http,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::LOCALHOST,
+        8080
+      ))
+    );
+    let anchor = Role::parse(&words(
+      "anchor --fleet /f.json --node b --vcs-http 0.0.0.0:443",
+    ))
+    .unwrap();
+    assert_eq!(
+      anchor.options().vcs_http,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::UNSPECIFIED,
+        443
+      ))
+    );
+    for role in [daemon, anchor] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+    }
+    let cleartext = Role::parse(&words("daemon --vcs-http 10.0.0.7:8080"));
+    assert!(
+      matches!(&cleartext, Err(RoleArgsError::BadValue { flag: "--vcs-http", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
+    let named = Role::parse(&words("daemon --vcs-http localhost:8080"));
+    assert!(
+      matches!(
+        &named,
+        Err(RoleArgsError::BadValue {
+          flag: "--vcs-http",
+          ..
+        })
+      ),
+      "{named:?}"
+    );
+  }
+
+  /// A-656 part 2 (§4.17.4 piece 7). Do: parse a daemon asked for the svn:// listener on loopback (its value joined by
+  /// `=`) beside the HTTP edge, and a fleet node's anchor asked for one on an address any interface reaches; make each
+  /// role's arguments and parse them back; then ask a daemon that is no fleet node for the listener off loopback. Expect:
+  /// each address read, and carried back whole through the arguments an anchor starts its daemon with; the listener off
+  /// loopback without a fleet refused as a bad `--vcs-svn` naming loopback (ra_svn is cleartext), before anything starts.
+  #[test]
+  fn a_roles_svn_listener_reads_back_and_off_loopback_without_a_fleet_is_refused() {
+    let svn = |ip, port| Some(slates_rt::tcp::SocketAddrV4::new(ip, port));
+    let daemon = Role::parse(&words(
+      "daemon --vcs-http 127.0.0.1:8080 --vcs-svn=127.0.0.1:3690",
+    ))
+    .unwrap();
+    assert_eq!(
+      daemon.options().vcs_svn,
+      svn(slates_rt::tcp::Ipv4Addr::LOCALHOST, 3690)
+    );
+    let anchor = Role::parse(&words(
+      "anchor --fleet /f.json --node b --vcs-svn 0.0.0.0:3690",
+    ))
+    .unwrap();
+    assert_eq!(
+      anchor.options().vcs_svn,
+      svn(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 3690)
+    );
+    for role in [daemon, anchor] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+    }
+    let cleartext = Role::parse(&words("daemon --vcs-svn 10.0.0.7:3690"));
+    assert!(
+      matches!(&cleartext, Err(RoleArgsError::BadValue { flag: "--vcs-svn", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
+  }
+
+  /// The integrator's report of 2026-11-18 (CI runs 44298844583 and 44310013691): a start asked for more shards than one
+  /// process registers. Do: parse each role with the registry's most shards, and with one more. Expect: the most parses,
+  /// one more is refused as a bad `--shards` naming the bound, so the anchor never starts a daemon the runtime refuses at
+  /// registration (it restarted it, backed off, for good: "too many shards: at most 1024 per process", 1,417 and 1,574
+  /// shards asked).
+  #[test]
+  fn a_shard_count_past_the_runtimes_registry_is_refused_before_any_start() {
+    let most = slates_rt::registry::MAX_SHARDS;
+    for role in ["anchor", "daemon"] {
+      let fits = Role::parse(&words(&format!("{role} --shards {most}")));
+      assert!(
+        matches!(&fits, Ok(Role::Anchor(options) | Role::Daemon(options)) if options.shards.map(usize::from) == Some(most)),
+        "{role}: {fits:?}"
+      );
+      let past = Role::parse(&words(&format!("{role} --shards {}", most + 1)));
+      assert!(
+        matches!(&past, Err(RoleArgsError::BadValue { flag: "--shards", reason }) if reason.contains(&most.to_string())),
+        "{role}: {past:?}"
+      );
+    }
+  }
+}

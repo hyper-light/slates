@@ -34,32 +34,40 @@
 pub mod client;
 pub mod driver;
 pub mod error;
+pub mod exec;
+pub mod hold;
 
 pub use client::{
-  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
-  LAST_SEQUENCE, Landing, Rebased, SESSION_KEY_BYTES, Session, ShardsStream, StreamEnd, Submitted,
-  VhostUserDevice, defers_reply,
+  Advanced, ArchiveExported, ArchiveImported, Attachment, Client, Connecting, CreateSpec,
+  Deadlines, Digest, DriftedPage, EntriesPage, ImageBuilt, Imported, LAST_SEQUENCE, Landing,
+  MergeRecord, MergeStatement, MoveState, Page, Rebased, RepositorySpec, Rewitnessed,
+  SESSION_KEY_BYTES, Session, ShardsStream, SignedLanding, StreamEnd, Submitted, VhostUserDevice,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
 #[cfg(any(unix, windows))]
 pub use client::{MappedRead, MappedWrite, page_bytes};
 pub use error::ClientError;
+/// A CLI attachment held alive by its holder (A-384).
+pub use hold::Hold;
 /// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a
 /// workload on an inherited descriptor, and the typed faults of a delivery a consumer cannot take.
 pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};
 pub use slates_ipc::protocol::{
-  AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability, AuditEntry,
-  CauseRecord, CheckoutReport, ChokepointReport, Conformance, DaemonReport, DeleteWhileOpen,
-  DetectorPeerReport, DetectorPoolReport, DetectorRelayReport, DirEntry, EntryKind, Established,
-  Filter, FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer,
-  HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport,
-  KernelCache, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
-  LearnerReport, NamePolicy, OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy,
-  RecoveryCause, Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport,
-  ShardReport, SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId,
+  ARCHIVE_FILE, AbsenceIs, ActionCount, ArchiveFault, AttachRequest, AttachTransport,
+  AttachmentCapability, AuditEntry, CauseRecord, ChangedCursor, CheckoutReport, ChokepointReport,
+  ConflictClass, Conformance, DaemonReport, DeleteWhileOpen, DetectorPeerReport,
+  DetectorPoolReport, DetectorRelayReport, DirEntry, EntriesCursor, EntryKind, Established, Filter,
+  FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence,
+  HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport, KernelCache,
+  LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, LearnerReport, NamePolicy,
+  ObjectFormat, OciBinding, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
+  PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal, RefusalCount,
+  Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport, SharingSemantics, Signal,
+  SignatureFault, Signer, SignerKey, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId,
   SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+  UnsupportedReason, VcsTool, Verification, VolumeId, VolumeSummary, WorkOp, WriteAct, WriteMode,
+  WritePolicy,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

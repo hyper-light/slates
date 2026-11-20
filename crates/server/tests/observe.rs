@@ -35,9 +35,14 @@ const WEDGE_BUDGETS: u64 = 5;
 /// the shard ran the task's start there), the window that shows no CPU, and one more for the deadline's lateness under
 /// a loaded runner; still two budgets short of the wedge.
 const ENDED_WITHIN_BUDGETS: u64 = 3;
-/// Derived: how much of its shard's own CPU time a deliberately slow question spins ([`spin_shard_time`]) — twice the short budget, so its
-/// answer is late by construction.
-const SLOW_QUESTION_NS: u64 = 2 * SHORT_BUDGET_NS;
+/// Derived: how much of its shard's own CPU time a deliberately slow question spins ([`spin_shard_time`]) — twice the short
+/// budget held to this build, the CPU an observation gives its shard in any build (A-356: the budget scaled by how much
+/// slower the build runs compiled code than machine code, `slates_machine::build_cost`), so its answer is late by
+/// construction. Twice the bare budget was not, once a slower build's budget grew: an unoptimized build gives 3.4 of them.
+fn slow_question_ns() -> u64 {
+  2 * slates_machine::build_cost::build_cost()
+    .map_or(SHORT_BUDGET_NS, |cost| cost.scale(SHORT_BUDGET_NS))
+}
 /// Spins on the calling shard until it has run `ns` of its own CPU time — the clock an observation's budget is
 /// counted in (A-65) — so a question is late by construction however little CPU a loaded machine gives the shard.
 /// Spinning by the wall clock was not: a shard given under half a core finished a two-budget wall spin having run
@@ -127,7 +132,23 @@ fn late_replies_reach(daemon: &Daemon, expected: u64) -> u64 {
 #[test]
 fn a_full_control_channel_is_retried_then_named_by_the_deadline() {
   let _serial = serialize();
-  let daemon = laptop("control-full");
+  common::supervised::run(
+    "a_full_control_channel_is_retried_then_named_by_the_deadline_role",
+    "observe-control-full",
+    1,
+  );
+}
+
+/// The role [`a_full_control_channel_is_retried_then_named_by_the_deadline`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_full_control_channel_is_retried_then_named_by_the_deadline as a supervised child"]
+fn a_full_control_channel_is_retried_then_named_by_the_deadline_role() {
+  let Some((daemon, _)) =
+    common::supervised::daemon("a_full_control_channel_is_retried_then_named_by_the_deadline_role")
+  else {
+    return;
+  };
   // Wedged, the shard drains nothing: the flood fills its control channel to the bound.
   let hold = daemon
     .wedge_control_shard(HOLD_NS)
@@ -271,7 +292,23 @@ fn a_stopped_target_terminates_its_pending_question_and_its_reused_slot_never_an
 #[test]
 fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted() {
   let _serial = serialize();
-  let daemon = laptop("late-reply");
+  common::supervised::run(
+    "a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role",
+    "observe-late-reply",
+    1,
+  );
+}
+
+/// The role [`a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted as a supervised child"]
+fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role() {
+  let Some((daemon, _)) = common::supervised::daemon(
+    "a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role",
+  ) else {
+    return;
+  };
   let hold = daemon
     .wedge_control_shard(HOLD_NS)
     .expect("the hold is admitted");
@@ -298,7 +335,7 @@ fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_coun
   // Admitted at once on the idle shard, the slow question is still running at the deadline.
   let slow = daemon
     .observation_on_control(SHORT_BUDGET_NS, |_state: &mut ShardState| {
-      spin_shard_time(SLOW_QUESTION_NS);
+      spin_shard_time(slow_question_ns());
       9u8
     })
     .expect("the slow observation begins")
@@ -331,7 +368,23 @@ fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_coun
 #[test]
 fn an_unavailable_shard_is_told_apart_from_an_observed_zero() {
   let _serial = serialize();
-  let daemon = laptop("zero");
+  common::supervised::run(
+    "an_unavailable_shard_is_told_apart_from_an_observed_zero_role",
+    "observe-zero",
+    1,
+  );
+}
+
+/// The role [`an_unavailable_shard_is_told_apart_from_an_observed_zero`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by an_unavailable_shard_is_told_apart_from_an_observed_zero as a supervised child"]
+fn an_unavailable_shard_is_told_apart_from_an_observed_zero_role() {
+  let Some((daemon, _)) =
+    common::supervised::daemon("an_unavailable_shard_is_told_apart_from_an_observed_zero_role")
+  else {
+    return;
+  };
   let repairs = |state: &mut ShardState| state.repairs;
   let observed = daemon.observe_control(OBSERVE_BUDGET_NS, repairs);
   assert_eq!(
@@ -420,7 +473,23 @@ fn a_starved_but_working_shard_is_answered_past_the_wall_budget() {
 #[test]
 fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does() {
   let _serial = serialize();
-  let daemon = laptop("wedged");
+  common::supervised::run(
+    "a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role",
+    "observe-wedged",
+    1,
+  );
+}
+
+/// The role [`a_wedged_shard_ends_the_observation_long_before_its_wedge_does`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_wedged_shard_ends_the_observation_long_before_its_wedge_does as a supervised child"]
+fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role() {
+  let Some((daemon, _)) = common::supervised::daemon(
+    "a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role",
+  ) else {
+    return;
+  };
   let switches_before = slates_machine::bench::involuntary_switches();
   let started = std::time::Instant::now();
   // The wedge reports the moment it took the shard. The claim is about what happens *from there* — how long

@@ -29,6 +29,10 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+// A request that meets a pending S3 base waits for the fetch it met (§4.15 "An S3 base", A-555).
+mod base_hints;
+mod base_wait;
+mod carry;
 pub mod catalog;
 pub mod config;
 mod consensus;
@@ -37,11 +41,13 @@ mod content_cipher;
 mod content_holder;
 mod content_pool;
 pub mod content_retention;
+mod idle_sweep;
 pub use consensus_recovery::{RecoveryKey, recovery_proof};
 pub mod daemon;
 pub mod deploy;
 mod direct_map;
 pub mod discovery;
+mod pressure;
 mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
 // A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.
@@ -60,28 +66,52 @@ mod forward_lane;
 mod fs_verbs;
 #[cfg(target_os = "linux")]
 mod fuse;
-#[cfg(target_os = "linux")]
+// The descriptors the anchor holds for this daemon's attachments: FUSE devices (Linux) and Shards streams' resync ends
+// (Linux, macOS; A-316, A-339).
+#[cfg(unix)]
 mod fuse_hold;
 // The macOS NFS mounts this daemon serves, recorded as its own (A-227).
 #[cfg(target_os = "macos")]
 mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
+// A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
+mod green_adopt;
+pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
+// A held NFS connection's send ledger and the judgment its adoption takes (A-550): kept on Linux alone; elsewhere its
+// pure parts are compiled and held by every host's tests, and only its no-op seams are called.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod held_send;
 pub mod histogram;
+mod identities;
 mod image;
 pub mod landing;
+mod landing_entries;
 pub mod lease;
 mod lease_wait;
+mod lfs;
+mod live_hold;
 mod live_ship;
 mod member_task;
+// Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
+mod merge_origin;
 pub mod merge_service;
 mod mirror;
+/// The planned move of a volume to another fleet member (§4.10, A-291).
+mod moves;
+// A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
+mod readmission;
 mod remote_attach;
-#[cfg(target_os = "linux")]
+mod work_home;
+// The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
+// stream's (every platform; A-316, A-339, A-402).
 mod write_log;
+// Each range a Shards stream's held DAX backing has answered, kept in anchor RAM for a successor (A-365; Windows'
+// sections, A-448).
+mod dax_ranges;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
 #[cfg(windows)]
 mod winfsp;
@@ -90,6 +120,12 @@ mod winfsp;
 // rides the runtime's TCP, which every platform has since A-182.
 mod callback;
 mod delegation;
+// A wait whose bound is learned from the waits it measured (RFC 6298, Karn's rule, back-off; A-431, A-442).
+mod learned_wait;
+// The helper processes a shard waits on (the FUSE helpers), each wait learned as `learned_wait` learns one (A-525).
+mod helper_runs;
+// The anchor's answers on the Windows hold channel, each exchange's wait learned as `learned_wait` learns one (A-552).
+mod anchor_answers;
 mod listing;
 mod lock_ledger;
 pub mod nfs;
@@ -104,17 +140,111 @@ mod staging;
 mod work_charge;
 pub mod work_files;
 mod work_log;
+// A work's route after its owner's takeover ends once the green's owner holds none of its completions (A-288); public
+// for `nudge`, which a test planting a route calls as a takeover's adoption does.
+pub mod work_route;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;
-pub mod peer;
+// The deadlines of what a shard's clients leave behind (staging buffers, status captures), kept on the shard's timing
+// wheel by one keeper task (A-522).
+mod deadlines;
+// A client's hang-up, the event its death is seen at (A-475): its control socket's end of stream (Linux) or its
+// process's exit (macOS, Windows), awaited through the shard's driver.
+mod hangup;
 mod reap;
+// The repository verbs (§4.17.1; A-575). What a client's create names by default is public (A-685, `slates repository
+// create`): each tool's object formats and the namespace name a new repository's root is bound to.
+mod repository;
+pub use repository::{RootRefused, object_formats, root_binding};
+// git's `dowild` transcribed line for line, the oracle `vcs_policy`'s tests hold its glob rules to (A-597): the file
+// that `slates_vcs::wildmatch`'s own tests read as their `reference`, compiled into this crate's tests too, so both
+// crates' tests hold one transcription and no product build links it (A-671). The matcher is `slates_vcs::wildmatch`.
+#[cfg(test)]
+#[path = "../../vcs/src/wildmatch/reference.rs"]
+mod wildmatch_reference;
+// §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597), and the push's check point over the
+// policy the repository's record holds (`admit`, A-622). git's receive-pack asks it through the push driver the
+// daemon's HTTP site calls (A-654 part 3), and upload-pack's lender which refs a reader may read through the same
+// driver's hidden refs (A-682); Subversion's commit editor and Mercurial's unbundle are their pieces.
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_policy;
+// A protected git branch, the server's half (A-644 part 2): what a ref's change brings, read from A-614's store, for
+// the policy's check point; A-321's verifier under git's namespace; the check point's refusals in git's words. Asked by
+// git's push driver (`git_push`, A-654), which the daemon's HTTP site calls (A-654 part 3).
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_protect;
+// §4.17.1's hooks: the points, their inputs, each hook's learned deadline and the runner (A-597). No caller outside
+// tests until the servers' push paths start hooks (their pieces).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_hooks;
+// A hook run as a process of its own over a read-only view of the work, held to `vcs_hooks`' runner (A-622 part 3):
+// Unix alone until its Windows part (a job object, `slates_ipc::win_spawn`). No caller outside tests until the servers'
+// push paths start hooks (their pieces).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod hook_driver;
+// The version-control credentials a human enrolls for a principal (A-625 part 3): SSH keys by fingerprint and HTTP tokens
+// by their hash, on the partition each id routes to; the enroll and revoke verbs the issuer proves, and the lookup the
+// HTTP and SSH edges authenticate through. Public for the issuer's proofs, the token's text and the key line's reading.
+pub mod credentials;
+// Subversion's hooks as the server runs them (A-661): the glue between the Subversion server's call points and the hook
+// driver, Unix alone with it. No caller outside tests until the commit drive and the svn:// connection task call it
+// (A-655, A-656) and DAV's LOCK and UNLOCK (A-661's next part).
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod svn_hooks;
+// git's hooks as the server runs them (A-665 parts 2 and 3): the read-only bare repository a hook
+// runs in, opened on the owner shard over the repository's store, sealed there in slices, shown at
+// a path by a presenter and handed to the hook driver with receive-pack's variables; Unix alone
+// with the driver. git's push driver (`git_push`) calls it; the daemon's presenter shows no view
+// until the read-only attachment lands, so the reads a presentation serves have no caller outside
+// tests.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_hooks;
+// The version-control servers' HTTP edge on the runtime's TCP (A-625 parts 2 and 3): the listener, one connection a task,
+// each phase's wait learned, the bounds derived from the shard's budget, git's site, Mercurial's (A-650), a connection
+// moved to its repository's shard, and the daemon's start, whose git site serves upload-pack from each repository's
+// store on its owner shard (A-682) and receive-pack through the push driver (A-654 part 3).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_http;
+mod vcs_svn;
+// §4.17.2's SSH edge (A-651): the listener on the runtime's TCP, one connection a task driving slates-ssh's session, each
+// phase's wait learned and an overdue connection reaped only for a new one, keys proved to principals and each exec
+// dispatched by its tool, git's receive-pack through the push driver (A-683). The daemon starts it with `--vcs-ssh`
+// (A-684, `vcs_ssh::daemon_edge`); the services' parts whose entry points have not landed (`site::NotYet`) are reached
+// by tests alone.
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_ssh;
+// git's push on its repository's owner shard (A-654 part 2): the one driver both edges call a step at a time (the
+// advertisement, the request and pack as they arrive, then the answer: the hook gate, the quarantine, the policy, the
+// verdicts over the shard's greens and A-635's append with A-662's store, git's report). The daemon's HTTP site calls
+// it for receive-pack (A-654 part 3), and the SSH site for its git-receive-pack (A-683).
+#[cfg_attr(not(test), allow(dead_code))]
+mod git_push;
+// The version-control servers' stores on their owner shard (A-662): one content store and one entry a repository, its
+// tool's store with its derived values, made with its record, charged to the shard's budget and replayed by a recovery
+// from its entries' objects; its git stores lent to upload-pack by the HTTP edge's site (A-682). Its push steps are
+// called by git's push driver (A-654), and its Mercurial import (A-675) by no one outside tests until the verb that asks
+// for one (its piece).
+#[cfg_attr(not(test), allow(dead_code))]
+mod vcs_store;
+// A repository's `.hg` read through the base's host seam, as Mercurial's import reads it (A-649 part 4). Its caller is
+// the store map's import (`vcs_store::hg_import`, A-675), which has none outside tests until its verb.
+#[cfg_attr(not(test), allow(dead_code))]
+mod hg_base;
+// A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
+// (A-548).
+mod reader_patience;
 // Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
 pub mod local_dumps;
 mod recovery_slices;
 pub mod seal_keys;
 // A client's session key (GAP-A9-9's threat model): what a client resuming under its id proves before its seat is served.
 pub mod session_key;
+// Signed work (A-321): SSH signatures over a merge's or a landing's statement, verified as provenance, never a permission.
+pub mod signed_work;
 mod snapshot_view;
 // The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
 // stream, on the volume's owning shard: a socket pair on Unix, a duplex named pipe on Windows served by the runtime's
@@ -124,12 +254,15 @@ pub mod shards;
 #[cfg(target_os = "macos")]
 mod shards_route;
 pub mod state;
+// A repository's state logs shipped to their holders a log at a time (A-636 part 2b).
+mod state_log;
 mod status_pages;
 pub mod takeover;
 pub mod telemetry;
 // A writer outside FUSE answered once every FUSE mount of its volume was told (AC-3.3).
 mod told;
 pub mod tombstone;
+mod tracked;
 // The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
 // on this host); pure over one platform seam, so it compiles and tests everywhere.
 pub mod transports;

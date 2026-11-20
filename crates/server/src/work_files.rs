@@ -16,8 +16,38 @@ use std::collections::BTreeMap;
 
 use slates_merge::engine::Green;
 
-/// What a work changed since its base: per path, the file's bytes, or `None` for a file of the base it removed.
+/// A page of one base file the green's owner answered (A-247).
+#[derive(Debug)]
+pub struct FetchedPage {
+  /// The file.
+  pub path: String,
+  /// The offset the page starts at.
+  pub offset: u64,
+  /// Its bytes and the file's whole length; `None` when the base has no such file.
+  pub answer: Option<(Vec<u8>, u64)>,
+}
+
+/// What the green's owner answered for the one verb now running on a work's shard, when the green lives on another
+/// shard (A-247): the base's files the verb asked for, the page of a paged read, or the base's files and lengths.
+/// Taken by that verb and gone with it, so a base's bytes are never held for a work between verbs: nothing to
+/// invalidate and nothing to charge. What the verb did not ask for reads as [`BaseGone`], which `crate::work_home`'s
+/// gate rules out by asking for every path a verb reads.
 #[derive(Debug, Default)]
+pub struct FetchedBase {
+  /// The green no longer exists.
+  pub gone: bool,
+  /// The files asked for, `None` for one the base does not have.
+  pub files: BTreeMap<String, Option<Vec<u8>>>,
+  /// A page of one file, when one was asked for.
+  pub page: Option<FetchedPage>,
+  /// Every file of the base with its length, when asked for.
+  pub sizes: Option<Vec<(String, u64)>>,
+  /// The base entries of the files asked for (`Green::path_base`), which the work keeps to compose its increment.
+  pub entries: BTreeMap<String, slates_merge::increment::Base>,
+}
+
+/// What a work changed since its base: per path, the file's bytes, or `None` for a file of the base it removed.
+#[derive(Clone, Debug, Default)]
 pub struct WorkFiles {
   changed: BTreeMap<String, Option<Vec<u8>>>,
 }
@@ -25,8 +55,10 @@ pub struct WorkFiles {
 /// A work's base: its green, when the green still exists, and the version the work is based on.
 #[derive(Clone, Copy)]
 pub struct Base<'a> {
-  /// The green, `None` once it is destroyed.
+  /// The green, when it lives on this shard; `None` once it is destroyed or when it lives on another.
   pub green: Option<&'a Green>,
+  /// What the green's owner answered for this verb, when the green lives on another shard (A-247).
+  pub fetched: Option<&'a FetchedBase>,
   /// The base version.
   pub version: u64,
 }
@@ -35,10 +67,32 @@ impl<'a> Base<'a> {
   /// The base's bytes of `path`: `Ok(None)` when the base has no such file, `Err(BaseGone)` when the green is gone
   /// and the base cannot be read.
   fn file(self, path: &str) -> Result<Option<Cow<'a, [u8]>>, BaseGone> {
-    match self.green {
-      Some(green) => Ok(green.content_ref_at(path, self.version)),
-      None => Err(BaseGone),
+    if let Some(green) = self.green {
+      return Ok(green.content_ref_at(path, self.version));
     }
+    match self.fetched {
+      Some(fetched) if !fetched.gone => match fetched.files.get(path) {
+        Some(file) => Ok(file.as_deref().map(Cow::Borrowed)),
+        None => Err(BaseGone),
+      },
+      _ => Err(BaseGone),
+    }
+  }
+
+  /// The page of `path` the owner answered, cut to `want` bytes, when this verb asked for one at `offset`.
+  fn fetched_page(self, path: &str, (offset, want): (u64, u64)) -> Option<Option<(Vec<u8>, u64)>> {
+    let page = self
+      .fetched
+      .filter(|fetched| !fetched.gone)?
+      .page
+      .as_ref()?;
+    if page.path != path || page.offset != offset {
+      return None;
+    }
+    Some(page.answer.as_ref().map(|(bytes, total)| {
+      let keep = usize::try_from(want).unwrap_or(usize::MAX).min(bytes.len());
+      (bytes.get(..keep).unwrap_or_default().to_vec(), *total)
+    }))
   }
 }
 
@@ -65,16 +119,17 @@ impl WorkFiles {
   }
 
   /// Every file the work sees, sorted by path: the base's files it did not change and the files it holds. Without
-  /// the base (its green gone) only the files the work holds are known.
-  pub fn files<'a>(&'a self, base: Base<'a>) -> Vec<(&'a str, Cow<'a, [u8]>)> {
-    let mut files: BTreeMap<&str, Cow<'a, [u8]>> = base
+  /// the base (its green gone) only the files the work holds are known. The paths are owned, as the green's walk gives
+  /// them (its maps are persistent radix trees, A-534).
+  pub fn files<'a>(&'a self, base: Base<'a>) -> Vec<(String, Cow<'a, [u8]>)> {
+    let mut files: BTreeMap<String, Cow<'a, [u8]>> = base
       .green
       .map(|green| green.files_at(base.version).into_iter().collect())
       .unwrap_or_default();
     for (path, entry) in &self.changed {
       match entry {
         Some(bytes) => {
-          files.insert(path.as_str(), Cow::Borrowed(bytes.as_slice()));
+          files.insert(path.clone(), Cow::Borrowed(bytes.as_slice()));
         }
         None => {
           files.remove(path.as_str());
@@ -105,14 +160,14 @@ impl WorkFiles {
       Some(None) => Ok(None),
       None => match base.green {
         Some(green) => Ok(green.content_page_at(path, base.version, (offset, want))),
-        None => Err(BaseGone),
+        None => base.fetched_page(path, (offset, want)).ok_or(BaseGone),
       },
     }
   }
 
   /// Every file the work sees with its length, sorted by path: [`WorkFiles::files`] without the bytes.
-  pub fn sizes<'a>(&'a self, base: Base<'a>) -> Vec<(&'a str, u64)> {
-    let mut sizes: BTreeMap<&str, u64> = base
+  pub fn sizes(&self, base: Base<'_>) -> Vec<(String, u64)> {
+    let mut sizes: BTreeMap<String, u64> = base
       .green
       .map(|green| {
         green
@@ -121,14 +176,20 @@ impl WorkFiles {
           .map(|(path, len)| (path, u64::try_from(len).unwrap_or(u64::MAX)))
           .collect()
       })
+      .or_else(|| {
+        let fetched = base.fetched?.sizes.as_ref()?;
+        Some(
+          fetched
+            .iter()
+            .map(|(path, len)| (path.clone(), *len))
+            .collect(),
+        )
+      })
       .unwrap_or_default();
     for (path, entry) in &self.changed {
       match entry {
         Some(bytes) => {
-          sizes.insert(
-            path.as_str(),
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-          );
+          sizes.insert(path.clone(), u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         }
         None => {
           sizes.remove(path.as_str());
@@ -278,6 +339,11 @@ impl WorkFiles {
       _ => {}
     }
     Ok(())
+  }
+
+  /// Whether the work holds its own entry at `path`, changed or removed, so no verb needs the base's file there.
+  pub fn holds(&self, path: &str) -> bool {
+    self.changed.contains_key(path)
   }
 
   /// A work's delta as a clean rebase leaves it (`Rebased::changed`), or as a restatement in its log replays it

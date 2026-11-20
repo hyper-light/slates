@@ -30,7 +30,7 @@ use std::marker::PhantomData;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
-use slates_rt::{Admission, RtError, SlotHolder, TaskId};
+use slates_rt::{Admission, CpuReading, RtError, RunReading, RunState, SlotHolder, TaskId};
 
 use crate::daemon::HEARTBEAT_NS;
 use crate::fleet::POLL_PER_PERIOD;
@@ -255,7 +255,7 @@ pub struct Admitted<T> {
 /// the observation at the end of the first whole window it spends so (one window if it was wedged when the observation
 /// began, two if it wedged partway through the first); a busy one that never answers ends it once it has run
 /// the budget, which an uncontended shard does at the wall clock's pace. A reading at or below the mark (a thread id the
-/// OS reused once the shard's thread had ended, which reads lower) ends it too. Under Miri, which has no thread
+/// OS reused once the shard's thread had ended, which reads lower) counts as no progress. Under Miri, which has no thread
 /// clock, the wall budget stands alone.
 ///
 /// A cross-shard call's wait judged in its target's own time uses the same rule (`crate::xshard::within_shard_time`,
@@ -263,11 +263,35 @@ pub struct Admitted<T> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ShardTime {
   holder: SlotHolder,
+  /// The rule, apart from the shard it reads.
+  own: OwnTime,
+}
+
+/// What [`ShardTime`] judges each window's end by, apart from the shard it reads: the budget, the CPU time the shard had
+/// run when the wait began, and its progress at the last window's end. Its rule takes its readings through closures, in
+/// the order [`OwnTime::next_window_ns`] states, so its tests run it over scripted readings with no thread under it, as
+/// the watchdog's replays run `crate::watchdog::ShardWatch::judge`.
+#[derive(Clone, Copy, Debug)]
+struct OwnTime {
+  /// The wait's budget on the wall: no window is longer, so a shard that stops is judged within it.
   budget_ns: u64,
+  /// The CPU the shard may run before a busy one that never answers ends the wait: the budget held to this build
+  /// ([`held_to_this_build`], A-318's rule for a poll's CPU).
+  cpu_budget_ns: u64,
   /// The CPU time the shard had run when the observation began.
   began: Option<u64>,
   /// The shard's progress at the last window's end (first: at the observation's start); it only rises.
   mark: Option<u64>,
+}
+
+/// `ns` of CPU held to the build this process runs (A-318): scaled by how much slower it runs compiled code than the
+/// machine runs the same work in machine code, measured once a process (`slates_machine::build_cost::build_cost`), never
+/// below `ns`; where the cost was not measured (Miri, a refused measure), `ns` itself. A wait judged in a shard's own CPU
+/// gives the shard its budget of work, and a build that runs every poll slower needs more CPU for the same work: under
+/// ThreadSanitizer (17.9 to 35.3 times machine code on CI's runners) a shard busy with a second's worth of native work
+/// runs tens of seconds of CPU, and a bare budget gave up on it as a busy shard that would never answer.
+pub(crate) fn held_to_this_build(ns: u64) -> u64 {
+  slates_machine::build_cost::build_cost().map_or(ns, |cost| cost.scale(ns))
 }
 
 impl ShardTime {
@@ -275,9 +299,12 @@ impl ShardTime {
     let began = slates_rt::registry::shard_cpu(holder);
     ShardTime {
       holder,
-      budget_ns,
-      began: began.map(|reading| reading.spent_ns),
-      mark: began.map(|reading| reading.progress),
+      own: OwnTime {
+        budget_ns,
+        cpu_budget_ns: held_to_this_build(budget_ns),
+        began: began.map(|reading| reading.spent_ns),
+        mark: began.map(|reading| reading.progress),
+      },
     }
   }
 
@@ -289,41 +316,98 @@ impl ShardTime {
 
   /// The next window's wall length when the shard worked through the window just ended within its budget, or waited for
   /// a CPU through it: the budget it has not yet run. `None` ends the wait: the shard made no progress in the window and
-  /// waited on no CPU, it has run its budget, or its clock cannot be read.
+  /// waited on no CPU, it has run its budget, or its clock cannot be read. The shard's CPU clock is
+  /// `slates_rt::registry::shard_cpu`; what the scheduler says of it is `slates_rt::registry::shard_run_readings`, the
+  /// watchdog's source, whose state decides on every platform: a thread held off its CPU stays runnable, and Linux
+  /// credits a run-queue wait only once the thread reaches a CPU (A-228's notes). No reading (Miri, or a source that
+  /// cannot be read) says not runnable, as before A-228.
   pub(crate) fn next_window_ns(&mut self) -> Option<u64> {
-    let now = slates_rt::registry::shard_cpu(self.holder)?;
-    let unspent = self
-      .budget_ns
-      .checked_sub(now.spent_ns.checked_sub(self.began?)?)
-      .filter(|unspent| *unspent > 0)?;
-    if self.mark.is_none_or(|mark| now.progress <= mark) {
-      // No CPU in the window. Starved is not stuck (A-228): a shard the scheduler has runnable, waiting for a CPU, is
-      // given the window again; only one that waits on something else, a deadlock or a call that never returns, ends the
-      // wait. On adacachy2 an observation of a shard held off its CPU for 3.0 s ended at its one-window deadline 3 of 3
-      // before this.
-      return self.runnable().then_some(unspent);
+    let holder = self.holder;
+    self.own.next_window_ns(
+      || slates_rt::registry::shard_cpu(holder),
+      || {
+        slates_rt::registry::shard_run_readings(&[holder])
+          .pop()
+          .flatten()
+      },
+    )
+  }
+}
+
+impl OwnTime {
+  /// The rule at a window's end, over the shard's CPU `clock` and what the `scheduler` says of its thread, read in this
+  /// order: the clock; when it shows no progress since the mark, the scheduler; then the clock again.
+  ///
+  /// The second read is what makes the scheduler's answer mean anything. A thread leaves the run queue for a block only
+  /// by running first, which its clock shows: so a shard the scheduler finds blocked, whose clock read after that answer
+  /// still shows no progress, was blocked or waiting for a CPU through the whole window, never running, and the answer
+  /// stands for the window. A clock read only before the answer cannot say so. A starved shard released between the two
+  /// reads runs, answers and parks before the scheduler looks, and the old order judged it wedged and gave up on an
+  /// observation already answered. On CI's Windows runner, where one look at the scheduler is a whole-system snapshot of
+  /// about 3 ms, `an_observation_of_a_starved_shard_is_answered` ended so: its failing tree, rerun with every decision
+  /// logged, ended `Deadline { stage: Admission }` 3.019 s after it asked in 1 of 32 runs, the clock read at the mark and
+  /// the scheduler finding the shard parked (`ThreadState` 5, `WrQueue`) within 4 ms of its poll's end
+  /// (`docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`).
+  fn next_window_ns(
+    &mut self,
+    mut clock: impl FnMut() -> Option<CpuReading>,
+    scheduler: impl FnOnce() -> Option<RunReading>,
+  ) -> Option<u64> {
+    let first = clock()?;
+    if self.progressed_by(first) {
+      return self.worked_to(first);
     }
-    self.mark = Some(now.progress);
-    // The budget the shard has not yet run, as wall time: an uncontended shard runs at the wall clock's pace and has
-    // next to none left; a starved one has most of it.
-    Some(unspent)
+    // No CPU in the window at that read. Starved is not stuck (A-228): a shard the scheduler has runnable, waiting for a
+    // CPU, is given the window again; only one that waits on something else, a deadlock or a call that never returns,
+    // ends the wait. On adacachy2 an observation of a shard held off its CPU for 3.0 s ended at its one-window deadline
+    // 3 of 3 before A-228's sibling fix.
+    let runnable = scheduler().is_some_and(|run| run.state == RunState::Runnable);
+    let after = clock()?;
+    if self.progressed_by(after) {
+      return self.worked_to(after);
+    }
+    if runnable {
+      self.unspent_at(after)
+    } else {
+      None
+    }
   }
 
-  /// Whether the scheduler has the shard runnable at this look: on a CPU or waiting for one
-  /// (`slates_rt::registry::shard_run_readings`, the watchdog's source). The state decides on every platform: a thread
-  /// held off its CPU stays runnable, and Linux credits a run-queue wait only once the thread reaches a CPU (A-228's
-  /// notes). No reading (Miri, or a source that cannot be read) says no, as before A-228.
-  fn runnable(&self) -> bool {
-    slates_rt::registry::shard_run_readings(&[self.holder])
-      .pop()
-      .flatten()
-      .is_some_and(|run| run.state == slates_rt::RunState::Runnable)
+  /// Whether the shard's clock rose past the mark: it ran since the last window's end.
+  fn progressed_by(&self, reading: CpuReading) -> bool {
+    self.mark.is_some_and(|mark| reading.progress > mark)
+  }
+
+  /// The budget the shard has not yet run at `reading`, as wall time: an uncontended shard runs at the wall clock's pace
+  /// and has next to none left; a starved one has most of it. `None` once it has run its CPU budget (the budget held to
+  /// this build), or without a start. Never longer than the budget on the wall: a slower build runs more CPU before the
+  /// wait ends, but a shard that stops is still judged within a budget of its stopping, as A-318 leaves the wedged and
+  /// starved judgments on the wall.
+  fn unspent_at(&self, reading: CpuReading) -> Option<u64> {
+    self
+      .cpu_budget_ns
+      .checked_sub(reading.spent_ns.checked_sub(self.began?)?)
+      .filter(|unspent| *unspent > 0)
+      .map(|unspent| unspent.min(self.budget_ns))
+  }
+
+  /// The next window for a shard that ran in the one just ended, its progress marked: the budget it has not yet run.
+  fn worked_to(&mut self, reading: CpuReading) -> Option<u64> {
+    let unspent = self.unspent_at(reading)?;
+    self.mark = Some(reading.progress);
+    Some(unspent)
   }
 }
 
 /// What one attempt of an observation established: an end (an admitted task, or a final refusal), or
 /// a capacity refusal to retry inside the budget — kept, so a deadline reached by a later attempt that
 /// met no refusal of its own still names the refusal that held the observation up.
+/// Why an observation's task was not admitted: it ended (refused for good, or past its deadline), or it is asked again.
+enum NotAdmitted {
+  Ended(ObserveError),
+  Retry(RtError),
+}
+
 enum Attempt<T> {
   Ended(Result<Admitted<T>, ObserveError>),
   Retry(RtError),
@@ -451,7 +535,8 @@ where
         attempts,
         time: *time,
       })),
-      Err(attempt) => attempt,
+      Err(NotAdmitted::Ended(error)) => Attempt::Ended(Err(error)),
+      Err(NotAdmitted::Retry(refusal)) => Attempt::Retry(refusal),
     }
   }
 
@@ -490,13 +575,13 @@ where
     attempts: u32,
     began: Instant,
     deadline: Instant,
-  ) -> Result<TaskId, Attempt<T>> {
-    Err(Attempt::Ended(Err(match admission {
+  ) -> Result<TaskId, NotAdmitted> {
+    Err(NotAdmitted::Ended(match admission {
       Some(Admission::Admitted(task)) => return Ok(task),
       Some(Admission::Refused(refusal @ RtError::TooManyTasks { .. }))
         if Instant::now() < deadline =>
       {
-        return Err(Attempt::Retry(refusal));
+        return Err(NotAdmitted::Retry(refusal));
       }
       Some(Admission::Refused(refusal @ RtError::TooManyTasks { .. })) => {
         self.deadline(ObserveStage::Admission, attempts, began, Some(refusal))
@@ -511,7 +596,7 @@ where
         attempts,
       },
       None => self.deadline(ObserveStage::Admission, attempts, began, None),
-    })))
+    }))
   }
 
   /// The deadline error for `stage`.
@@ -609,5 +694,146 @@ mod tests {
     assert!(!ObserveError::State(StateAccess::Borrowed).is_terminal());
     assert_eq!(starved.stage(), Some(ObserveStage::Submission));
     assert_eq!(ObserveError::NoTarget.stage(), None);
+  }
+
+  /// Shape: the budget the rule's replays run with, the liveness window an observation of a starved shard is given in
+  /// `crates/server/tests/liveness.rs`.
+  const BUDGET_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+  /// Shape: the CPU time the shard had run when the wait began: two of Windows' 15.625 ms ticks, as CI's runner read.
+  const BEGAN_NS: u64 = 31_250_000;
+  /// Shape: the shard's progress count when the wait began.
+  const MARK: u64 = 1_000;
+  /// Shape: the CPU one run of the shard is charged: one Windows tick.
+  const RUN_NS: u64 = 15_625_000;
+
+  /// The rule as a wait begins, in a build that runs compiled code at machine code's speed.
+  fn begun() -> OwnTime {
+    OwnTime {
+      budget_ns: BUDGET_NS,
+      cpu_budget_ns: BUDGET_NS,
+      began: Some(BEGAN_NS),
+      mark: Some(MARK),
+    }
+  }
+
+  /// A-318's sibling, §4.14. Do: in a build measured three times as slow as machine code (its CPU budget three wall
+  /// budgets), end windows whose clock shows the shard ran a budget and a half of CPU, then a further budget, then the
+  /// rest of its three. Expect: past the bare budget the shard is given another window, never longer than the wall budget,
+  /// and the wait ends once it has run its three budgets. Before, the bare budget was its CPU too, and a busy shard in a
+  /// slower build was given up on at one budget of CPU, as a shard that would never answer.
+  #[test]
+  fn a_shard_in_a_slower_build_is_given_its_budget_held_to_the_build() {
+    let slowdown = 3;
+    let mut own = OwnTime {
+      cpu_budget_ns: slowdown * BUDGET_NS,
+      ..begun()
+    };
+    let half = BUDGET_NS / 2;
+    let first = own.next_window_ns(
+      scripted(vec![at(BEGAN_NS + BUDGET_NS + half, MARK + 1)]),
+      || seen(RunState::Runnable),
+    );
+    assert_eq!(
+      first,
+      Some(BUDGET_NS),
+      "past the bare budget, within the build's: a whole window, the wall budget at most"
+    );
+    let second = own.next_window_ns(
+      scripted(vec![at(BEGAN_NS + 2 * BUDGET_NS + half, MARK + 2)]),
+      || seen(RunState::Runnable),
+    );
+    assert_eq!(second, Some(half), "the CPU budget it has not yet run");
+    let third = own.next_window_ns(
+      scripted(vec![at(BEGAN_NS + slowdown * BUDGET_NS, MARK + 3)]),
+      || seen(RunState::Runnable),
+    );
+    assert_eq!(third, None, "it ran the budget held to its build");
+  }
+
+  /// A clock reading: `spent_ns` of CPU run in all, progress count `progress`.
+  fn at(spent_ns: u64, progress: u64) -> CpuReading {
+    CpuReading { spent_ns, progress }
+  }
+
+  /// A clock that answers `readings` in turn, one a read, and nothing once they are spent.
+  fn scripted(readings: Vec<CpuReading>) -> impl FnMut() -> Option<CpuReading> {
+    let mut readings = readings.into_iter();
+    move || readings.next()
+  }
+
+  /// The scheduler's answer of `state`, with no wait time and no kind of wait (macOS and Windows keep neither).
+  fn seen(state: RunState) -> Option<RunReading> {
+    Some(RunReading {
+      state,
+      waited_ns: None,
+      uninterruptible: None,
+    })
+  }
+
+  /// §4.14, A-65. Do: end a window whose first clock read shows the shard ran a tick of CPU in it. Expect: the next
+  /// window is the budget it has not yet run, and the scheduler is never asked: a shard that progresses costs no look.
+  #[test]
+  fn a_shard_that_ran_in_the_window_is_given_the_budget_it_has_not_run() {
+    let asked = std::cell::Cell::new(0u32);
+    let mut own = begun();
+    let window = own.next_window_ns(scripted(vec![at(BEGAN_NS + RUN_NS, MARK + 1)]), || {
+      asked.set(asked.get() + 1);
+      seen(RunState::Blocked)
+    });
+    assert_eq!(window, Some(BUDGET_NS - RUN_NS));
+    assert_eq!(asked.get(), 0);
+  }
+
+  /// §4.14, A-228. Do: end a window in which the shard's clock stood still at both reads, once with the scheduler
+  /// finding it waiting for a CPU, once blocked, once with nothing read. Expect: the starved shard is given its whole
+  /// unspent budget again; the blocked one and the unread one end the wait.
+  #[test]
+  fn a_starved_shard_is_given_the_window_again_and_a_blocked_one_ends_the_wait() {
+    let still = || scripted(vec![at(BEGAN_NS, MARK), at(BEGAN_NS, MARK)]);
+    assert_eq!(
+      begun().next_window_ns(still(), || seen(RunState::Runnable)),
+      Some(BUDGET_NS)
+    );
+    assert_eq!(
+      begun().next_window_ns(still(), || seen(RunState::Blocked)),
+      None
+    );
+    assert_eq!(begun().next_window_ns(still(), || None), None);
+  }
+
+  /// §4.14, A-228; CI's Windows runner, diag run 42671057142. Do: end a window in which the shard's clock stood still at
+  /// the first read, then the shard ran (released, it answered and parked) before the scheduler looked, so the scheduler
+  /// finds it blocked and the clock read after shows the run; then end the next window with its clock standing still at
+  /// the new mark and the scheduler finding it blocked. Expect: the first window gives the shard its unspent budget again,
+  /// since it ran; the second ends the wait, since it then sat a window blocked. Before, the rule read the clock only
+  /// before the scheduler and gave up on the shard at the first window: an observation already answered was given up.
+  #[test]
+  fn a_shard_that_runs_and_blocks_between_the_reads_is_given_the_window() {
+    let mut own = begun();
+    let ran = at(BEGAN_NS + RUN_NS, MARK + 1);
+    let window = own.next_window_ns(scripted(vec![at(BEGAN_NS, MARK), ran]), || {
+      seen(RunState::Blocked)
+    });
+    assert_eq!(window, Some(BUDGET_NS - RUN_NS));
+    let window = own.next_window_ns(scripted(vec![ran, ran]), || seen(RunState::Blocked));
+    assert_eq!(window, None);
+  }
+
+  /// §4.14, A-65. Do: end a window in which a busy shard ran past its budget, once seen at the first clock read, once
+  /// only at the read after the scheduler's answer. Expect: both end the wait: a shard that has run the budget is not
+  /// given more, whichever read shows it.
+  #[test]
+  fn a_shard_that_has_run_its_budget_ends_the_wait() {
+    let spent = at(BEGAN_NS + BUDGET_NS, MARK + 1);
+    assert_eq!(
+      begun().next_window_ns(scripted(vec![spent]), || seen(RunState::Runnable)),
+      None
+    );
+    assert_eq!(
+      begun().next_window_ns(scripted(vec![at(BEGAN_NS, MARK), spent]), || {
+        seen(RunState::Runnable)
+      }),
+      None
+    );
   }
 }

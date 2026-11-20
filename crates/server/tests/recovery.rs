@@ -261,6 +261,53 @@ fn refused_unpublished_create(daemon: &Daemon, client: &mut Client) -> RequestId
   create_id
 }
 
+/// GAPS (an open sibling found by reading `reconcile_unpublished_effects`, 2026-10-24; proven here 2026-11-18): a clone
+/// whose transaction is rolled back gives back its pin on its origin's snapshot. Do: create a volume and snapshot it; with
+/// the next publication refused before its append, clone the snapshot (refused `Unpublished`, the transaction rolled back
+/// and the orphaned clone torn down); then destroy the snapshot. Expect the clone refused typed, one rollback counted, and
+/// the snapshot destroyed. Before, the teardown kept the clone's pin on the snapshot, and its destroy was refused
+/// `Pinned` until the daemon restarted.
+#[test]
+fn a_clone_rolled_back_unpublished_gives_back_its_pin_on_the_origins_snapshot() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-clone-pin-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("clone-pin", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let origin = client.create(&scratch("pin-origin")).unwrap();
+  let snapshot = client.snapshot(origin).unwrap();
+  daemon
+    .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend))
+    .expect("the fault is installed");
+  let cloned = client.clone_snapshot(origin, snapshot, "pin-clone");
+  let rollbacks = rollbacks_of(&daemon);
+  daemon
+    .inject_publication_fault(None)
+    .expect("the faults still pending on the other shards are cleared");
+  let destroyed = client.destroy_snapshot(origin, snapshot);
+  daemon.stop();
+  drop(anchor);
+  assert!(
+    matches!(
+      cloned,
+      Err(ClientError::Refused(Refusal::Unpublished { .. }))
+    ),
+    "the clone is refused typed as unpublished: {cloned:?}"
+  );
+  assert_eq!(
+    rollbacks, 1,
+    "the shard rolled the clone's transaction back"
+  );
+  assert!(
+    destroyed.is_ok(),
+    "the origin's snapshot is destroyed, no pin left by the rolled-back clone: {destroyed:?}"
+  );
+}
+
 /// The volume names the daemon lists, sorted.
 fn names_listed(client: &mut Client) -> Vec<String> {
   let mut names: Vec<String> = client
@@ -1280,6 +1327,170 @@ fn an_acknowledged_held_record_survives_a_warm_daemon_restart() {
   );
 }
 
+/// Shape: the held records the incremental-image test holds, one publication each.
+const HELD_RECORDS: u64 = 64;
+/// Shape: how many of the first and of the last holds the incremental-image test compares (a median over each, so the
+/// periodic checkpoint, which carries everything held, sits apart).
+const HELD_WINDOW: usize = 16;
+/// Shape: one held record's value, bytes.
+const HELD_VALUE_BYTES: usize = 1024;
+
+/// §4.8 "persistence before reply", raft-5's incremental held image: a holder publishes before it acknowledges a
+/// record, and what that publication carries must be the record, not everything the holder already holds. Do: hold
+/// [`HELD_RECORDS`] records of distinct objects on a daemon through the holder's production path, reading after each
+/// the held bytes its publication's delta carried, then restart the daemon warm over the same anchor. Expect the
+/// median carried by the last [`HELD_WINDOW`] holds to be within twice that of the first (after the first, which
+/// starts the journal), and every record held after the restart. Before: each delta carried the whole held image, so
+/// the cost of an acknowledgement grew with what the holder held (raft-4's c6e178aa: +193–196 µs a live write).
+#[test]
+fn a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_holds() {
+  use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-held-delta-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("held-delta", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let owner = first.member_identity().unwrap();
+  let carried = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("publish.delta_held_bytes")
+      .copied()
+      .unwrap_or(0)
+  };
+  let mut per_hold = Vec::new();
+  for sequence in 1..=HELD_RECORDS {
+    let before = carried(&first);
+    let record = Record {
+      owner,
+      object: ObjectId::new(HostId(owner.0), sequence),
+      sequence,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value: vec![u8::try_from(sequence % 251).unwrap(); HELD_VALUE_BYTES],
+    };
+    let reply = first.hold_record_as_authorized(owner, record).unwrap();
+    assert!(!reply.is_empty(), "record {sequence} acknowledged");
+    per_hold.push(carried(&first).saturating_sub(before));
+  }
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let held_after: Vec<bool> = (1..=HELD_RECORDS)
+    .map(|sequence| {
+      matches!(
+        second.fleet_held_record(ObjectId::new(HostId(owner.0), sequence)),
+        Ok(Some(held)) if held.sequence == sequence
+      )
+    })
+    .collect();
+  second.stop();
+  drop(anchor);
+
+  let median = |window: &[u64]| {
+    let mut sorted = window.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0)
+  };
+  let early = median(&per_hold[1..=HELD_WINDOW]);
+  let late = median(&per_hold[per_hold.len() - HELD_WINDOW..]);
+  assert!(
+    early > 0,
+    "a delta carries the record it holds: {per_hold:?}"
+  );
+  assert!(
+    late <= 2 * early,
+    "a delta's held bytes do not grow with what is held: early median {early}, late {late}: {per_hold:?}"
+  );
+  assert!(
+    held_after.iter().all(|held| *held),
+    "every acknowledged record is held after a warm restart: {held_after:?}"
+  );
+}
+
+/// Shape: the positions of one ledger the per-position test holds, one publication each: enough that a delta carrying
+/// the whole ledger would carry tens of times what one position is.
+const LEDGER_POSITIONS: u64 = 64;
+
+/// §4.8 "persistence before reply", A-367: a holder of a green keeps every version's merge record, a ledger that is
+/// never compacted, and publishes before it acknowledges each; what that publication carries must be the record it
+/// acknowledges, never the ledger it already carries. Do: hold [`LEDGER_POSITIONS`] records of one ledger register (a
+/// merge record's class byte, so no position is compacted) at its next sequence each, through the holder's production
+/// path, reading after each the held bytes its publication's delta carried; then restart the daemon warm over the same
+/// anchor. Expect every delta after the first to carry the same bytes (the register's head and the one position; a hold
+/// a checkpoint published carries none in a delta), and every position held after the restart at its sequence. Before:
+/// the register was one piece, so each delta carried every position held, and a green's commit at `f > 0` grew by a
+/// position's bytes a version (about 10 µs a version in a debug build, `a_submit_late_in_a_greens_history_...`).
+#[test]
+fn a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger() {
+  use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-held-ledger-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("held-ledger", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let owner = first.member_identity().unwrap();
+  let ledger = ObjectId::new(HostId(owner.0), 1);
+  let carried = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("publish.delta_held_bytes")
+      .copied()
+      .unwrap_or(0)
+  };
+  let mut per_hold = Vec::new();
+  for sequence in 1..=LEDGER_POSITIONS {
+    let before = carried(&first);
+    let mut value = vec![slates_server::catalog::MERGE_CLASS];
+    value.resize(HELD_VALUE_BYTES, u8::try_from(sequence % 251).unwrap());
+    let record = Record {
+      owner,
+      object: ledger,
+      sequence,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value,
+    };
+    let reply = first.hold_record_as_authorized(owner, record).unwrap();
+    assert!(!reply.is_empty(), "position {sequence} acknowledged");
+    per_hold.push(carried(&first).saturating_sub(before));
+  }
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let held_after = second.fleet_held_positions(ledger);
+  second.stop();
+  let deltas: std::collections::BTreeSet<u64> = per_hold
+    .iter()
+    .skip(1)
+    .copied()
+    .filter(|bytes| *bytes > 0)
+    .collect();
+  assert_eq!(
+    deltas.len(),
+    1,
+    "every delta after the first carries the register's head and one position, whatever the ledger holds: {per_hold:?}"
+  );
+  assert_eq!(
+    held_after.map(|positions| positions
+      .into_iter()
+      .map(|(sequence, _)| sequence)
+      .collect::<Vec<_>>()),
+    Ok((1..=LEDGER_POSITIONS).collect::<Vec<_>>()),
+    "every acknowledged position is held after a warm restart"
+  );
+}
+
 // -------------------------------------------- crash injection at every durable step (AC-2.3, AC-2.12)
 //
 // A scenario of single-transaction steps, so each crash point is a real state a kill can leave. Two
@@ -1707,15 +1918,41 @@ fn approve(
     .expect("the approval issues a grant")
 }
 
+/// Presents single-use grant `once` for `volume` at its snapshot again: refused `GrantInvalid`, as spent.
+fn assert_spent(
+  client: &mut slates_client::Client,
+  (volume, snapshot): (slates_client::VolumeId, slates_client::SnapshotId),
+  target: &str,
+  once: u64,
+) {
+  let again = client.land(
+    volume,
+    Some(snapshot),
+    target,
+    Filter::default(),
+    Some(once),
+  );
+  assert!(
+    matches!(
+      again,
+      Err(slates_client::ClientError::Refused(
+        slates_client::Refusal::GrantInvalid
+      ))
+    ),
+    "the single-use grant stays spent across the restart: {again:?}"
+  );
+}
+
 /// AUD-29-06 (§4.15 step 3: a session grant covers later landings for its session; §4.8 recovery): a session
 /// grant covers its binding across a daemon restart, a single-use grant stays spent across one, and a grant
 /// issued after a restart takes an id no earlier grant had. Before 2026-09-29 a restarted shard rebuilt no
 /// runtime grant (every grant was lost at a restart, and the first grant after it re-minted a recorded id,
 /// refused `AlreadyExists`), and every landing recorded its grant consumed, a session grant included. Do:
 /// land under a single-use grant; approve a session grant for another volume; restart the daemon over the
-/// same segment; land twice under the session grant; list the grants; approve a new landing. Expect: both
-/// session landings land; the single-use grant is listed consumed and the session grant issued; the new
-/// grant's id is neither earlier one.
+/// same segment; land twice under the session grant; list the grants; present the single-use grant again;
+/// approve a new landing. Expect: both session landings land; the session grant is listed issued, and the
+/// single-use grant, used up, is not listed (A-266: the table holds live grants) and is refused `GrantInvalid`;
+/// the new grant's id is neither earlier one.
 #[test]
 fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
   use slates_ipc::protocol::GrantScope;
@@ -1784,11 +2021,9 @@ fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
     .into_iter()
     .map(|grant| (grant.id, grant.state))
     .collect();
-  assert_eq!(
-    states.get(&once).map(String::as_str),
-    Some("consumed"),
-    "{states:?}"
-  );
+  // A used-up grant leaves the table (A-266): it is not listed, and presented again it is still refused as spent.
+  assert_eq!(states.get(&once), None, "{states:?}");
+  assert_spent(&mut client, (spent, spent_snapshot), &target.path, once);
   assert_eq!(
     states.get(&session).map(String::as_str),
     Some("issued"),
@@ -1827,6 +2062,7 @@ fn present_landing(
     target: target.to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   }) {
     Ok(ReplyBody::GrantRequired { landing, .. }) => landing,
     other => panic!("the landing was not presented: {other:?}"),
@@ -2013,7 +2249,11 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
-      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest { reason })) if reason == "Pinned"
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::Volume {
+          refusal: slates_ipc::protocol::VolumeRefusal::Pinned
+        }
+      ))
     ),
     "the recovered snapshot is still pinned by the recovered clone (a lost pin would let it be destroyed): {:?}",
     client.destroy_snapshot(kept, snapshot)
@@ -2095,7 +2335,11 @@ fn an_image_volumes_pin_on_its_snapshot_reconciles_across_a_restart() {
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
-      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest { reason })) if reason == "Pinned"
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::Volume {
+          refusal: slates_ipc::protocol::VolumeRefusal::Pinned
+        }
+      ))
     ),
     "the recovered snapshot is still pinned by the recovered image volume: {:?}",
     client.destroy_snapshot(kept, snapshot)
@@ -2548,24 +2792,16 @@ const FILL_FILES: u64 = 34;
 /// Shape: one file of that test.
 const FILL_FILE: usize = 1 << 20;
 
-/// Reads `name` at the head, asking again while the client answers `Stalled` (the daemon alive but not yet answering:
-/// the typed refusal a caller retries; a read is idempotent) for up to the recovery budget a restart is bounded by.
-/// CI's TSan lane met it 3 runs of 3 on 2026-10-06: a read after the restart past the 1 s reply deadline, the runner's
-/// four vCPUs shared by the suite's parallel tests under the sanitizer's slowdown; alone, or in the whole suite on a
-/// 4-CPU container here, it never stalled (6 runs).
+/// Reads `name` at the head, once: the client waits for the reply while the daemon lives (A-232). Until 2026-11-13 the
+/// client failed a live daemon's late reply `Stalled`, and this asked again for up to the recovery budget: CI's TSan
+/// lane met it 3 runs of 3 on 2026-10-06, a read after the restart past the 1 s reply deadline, the runner's four vCPUs
+/// shared by the suite's parallel tests under the sanitizer's slowdown.
 fn read_answered(
   client: &mut Client,
   volume: VolumeId,
   name: &str,
 ) -> Result<Vec<u8>, slates_client::ClientError> {
-  let began = Instant::now();
-  loop {
-    match client.read(volume, name, slates_ipc::protocol::ReadAt::Head) {
-      Err(slates_client::ClientError::Stalled { .. })
-        if began.elapsed() < Duration::from_nanos(slates_db::replay::RECOVERY_BUDGET_NS) => {}
-      answered => return answered,
-    }
-  }
+  client.read(volume, name, slates_ipc::protocol::ReadAt::Head)
 }
 
 /// §4.2 capacity (2026-10-05): a shard's reserve is RAM ÷ shards ÷ classes, rarely a power of two, and the buddy
@@ -2970,25 +3206,40 @@ fn a_shard_whose_start_outlasts_a_liveness_window_while_working_does_not_stop_th
 /// restarts a daemon whose heartbeat lapses, restarts it) instead of beating on while it can never serve.
 #[test]
 fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon() {
-  let profile = common::machine_profile();
-  let instance = format!("srv-stuck-start-{}", std::process::id());
-  let config =
-    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_boot_fault(BootFault {
-      partition: 1,
-      kind: BootFaultKind::Stuck,
-      for_ns: HELD_START_NS,
-    });
-  let anchor = held_anchor("stuck-start", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  common::supervised::run(
+    "a_shard_stuck_in_its_start_stops_the_heartbeat_role",
+    "stuck-start",
+    TEST_SHARDS,
+  );
+}
+
+/// The role [`a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon`] runs as a supervised
+/// daemon's process (A-232): the test plays the anchor across the spawn, as the claim is the anchor's. Over a segment it
+/// made, or one an anchor in its own process handed over, the daemon would end itself on the refused boot instead.
+#[test]
+#[ignore = "a role: run by a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon"]
+fn a_shard_stuck_in_its_start_stops_the_heartbeat_role() {
+  let Some((daemon, _)) = common::supervised::daemon_with(
+    "a_shard_stuck_in_its_start_stops_the_heartbeat_role",
+    |config| {
+      config.with_boot_fault(BootFault {
+        partition: 1,
+        kind: BootFaultKind::Stuck,
+        for_ns: HELD_START_NS,
+      })
+    },
+  ) else {
+    return;
+  };
   let quiet = Duration::from_nanos(2 * slates_server::daemon::HEARTBEAT_NS);
   let started = Instant::now();
   let mut stopped = false;
   while started.elapsed() < START_WAIT {
-    let before = anchor.segment.supervision().unwrap().heartbeat_ns();
-    // The test plays the anchor, which watches the heartbeat from its own thread across time.
+    let before = daemon.segment().supervision().unwrap().heartbeat_ns();
+    // The role reads the beat the anchor reads, from its own mapping of the same segment.
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(quiet);
-    let after = anchor.segment.supervision().unwrap().heartbeat_ns();
+    let after = daemon.segment().supervision().unwrap().heartbeat_ns();
     if before > 0 && before == after {
       stopped = true;
       break;
@@ -2999,7 +3250,6 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_dae
     "the heartbeat stopped after the stuck shard was refused"
   );
   daemon.stop();
-  drop(anchor);
 }
 
 /// Boot (A-100): do start a daemon whose second shard spends two liveness windows on the CPU in its start, and stop the
@@ -3238,7 +3488,7 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 /// (the non-vacuity count) and nothing more given back once it had finished. The probes' latencies are printed and not
 /// judged: a probe's wall time on a loaded host says what the host did (10.4 ms against 2.2 ms at load 65 on Linux,
 /// with nothing of the shard's own in it). Then do restart the daemon over the same anchor and give its recovery memory
-/// back a step at a time, as the idle tick does; expect the p99 step to have held its shard no more than `STEP_QUANTA`
+/// back a step at a time, as an idle sweep pass does; expect the p99 step to have held its shard no more than `STEP_QUANTA`
 /// step quanta of the shard thread's own CPU, which load does not inflate. That judge runs wherever a thread clock is
 /// fine enough to time a step by: CI's `gates` job (`cargo test --workspace` on `ubuntu-latest` and `macos-latest`,
 /// `.github/workflows/ci.yml`), and every Linux and macOS development machine whatever its load; it skips loudly on
@@ -3247,9 +3497,9 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 /// reached the shard waited.
 #[test]
 fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
-  /// Shape: a probe window, in reap ticks (`LIVENESS_BUDGET_NS` each): the first tick after the volume's create sees
-  /// allocations, the second finds the shard idle and gives back, and two more cover the give-back's slices.
-  const WINDOW_TICKS: u64 = 4;
+  /// Shape: a probe window, in sweep intervals (`LIVENESS_BUDGET_NS` each): the first pass after the volume's create
+  /// sees allocations, the second finds the shard idle and gives back, and two more cover the give-back's slices.
+  const WINDOW_INTERVALS: u64 = 4;
   let profile = common::machine_profile();
   let instance = format!("srv-recovery-slices-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
@@ -3260,8 +3510,9 @@ fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let volume = client.create(&scratch("probed")).unwrap();
-  let window =
-    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(WINDOW_TICKS));
+  let window = Duration::from_nanos(
+    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(WINDOW_INTERVALS),
+  );
   let returned = |daemon: &Daemon| {
     daemon
       .refusals_on_every_shard()
@@ -3302,25 +3553,25 @@ fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
 
 /// Leaves the shard alone until its give-back has finished: until the journal has no dead recovery memory left to give
 /// back, which is the give-back's own completion. Until 2026-11-08 this waited for the bytes given back to stand still
-/// over a window, and on a loaded host (load 41 to 62) a give-back between two reap ticks stood still with some left: 2
+/// over a window, and on a loaded host (load 41 to 62) a give-back between two sweep passes stood still with some left: 2
 /// of 7 runs then gave back the rest in the quiet window. Each look is itself a task on the shard, which ends the
-/// give-back for that tick, so they are a reap tick apart. Fails only if `STALLED_TICKS` pass with nothing more given
+/// give-back for that pass, so they are a sweep interval apart. Fails only if `STALLED_INTERVALS` pass with nothing more given
 /// back.
 fn give_back_finished(daemon: &Daemon) {
-  /// Shape: the reap ticks with no progress before the test calls the give-back stuck: well past a loaded host's gaps
-  /// between ticks that find the shard idle.
-  const STALLED_TICKS: u32 = 60;
-  let tick = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  /// Shape: the sweep intervals with no progress before the test calls the give-back stuck: well past a loaded host's
+  /// gaps between passes that find the shard idle.
+  const STALLED_INTERVALS: u32 = 60;
+  let interval = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
   let mut left = daemon.recovery_left_to_give_back().unwrap();
   let mut stalled = 0;
   while left > 0 {
     assert!(
-      stalled < STALLED_TICKS,
-      "the give-back made no progress for {STALLED_TICKS} reap ticks, {left} bytes left"
+      stalled < STALLED_INTERVALS,
+      "the give-back made no progress for {STALLED_INTERVALS} sweep intervals, {left} bytes left"
     );
     #[allow(clippy::disallowed_methods)]
     // a test leaving the shard alone, which is the state it needs
-    std::thread::sleep(tick);
+    std::thread::sleep(interval);
     let now = daemon.recovery_left_to_give_back().unwrap();
     stalled = if now < left { 0 } else { stalled + 1 };
     left = now;
@@ -3512,7 +3763,7 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
 }
 
 /// A-214 (VFS plan step 11). Do: on a one-shard daemon over a held anchor, write a file of many chunks (the shard's
-/// write burst), publish, and leave the shard idle for two reap ticks (`content.ticks.idle`), by which its idle work, the
+/// write burst), publish, and leave the shard idle for two idle purge steps (`content.ticks.idle`), by which its idle work, the
 /// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the
 /// content object's allocated bytes across each write. Expect the second burst to land on pages already resident: the
 /// object grows by less than half of what the first burst, on fresh pages, grew it, and the idle pre-fault is counted
@@ -3527,7 +3778,7 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
   const MARKER: &[u8] = b"SLATES-PREFAULT-A214-3c0d";
   /// Shape: each file is this many chunk-sized blocks, so its pages dwarf the faults of anything else in the process.
   const CHUNKS: usize = 256;
-  /// Shape: the bound on the idle shard's pre-fault: several reap ticks (one to see no allocation, the next to refill).
+  /// Shape: the bound on the idle shard's pre-fault: several sweep passes (one to see no allocation, the next to refill).
   const PREFAULT_WAIT: Duration = Duration::from_secs(20);
   let profile = common::machine_profile();
   let instance = format!("srv-prefault-{}", std::process::id());
@@ -3570,8 +3821,8 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
       .unwrap_or(0)
   };
   let file = u64::try_from(body.len()).unwrap();
-  // The refill is the shard's idle work, so once the shard has been idle a whole reap tick it has finished: wait for two
-  // idle ticks after the first write (`content.ticks.idle`), or the bound.
+  // The refill is the shard's idle work, so once the shard has been idle a whole sweep pass it has finished: wait for
+  // two idle purge steps after the first write (`content.ticks.idle`), or the bound.
   let idle_ticks = || {
     daemon
       .refusals_on_every_shard()
@@ -3619,7 +3870,7 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
 }
 
 /// A-214 with A-105 and A-205 (VFS plan steps 11 and 12). Do: on a one-shard daemon over a held anchor, write a file of
-/// many chunks, publish, and leave the shard idle for two reap ticks, so the burst closes and its reserve is pre-faulted;
+/// many chunks, publish, and leave the shard idle for two idle purge steps, so the burst closes and its reserve is pre-faulted;
 /// then delete the file, publish, and leave the shard idle. Expect the content object to fall back to within a quarter of
 /// the file of what it held before the write, within the bound: the delete's busy period nets the burst away, so the
 /// reserve goes and every page goes back. Before this was fixed the burst ended only when the arena's allocation count
@@ -3631,7 +3882,7 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
   const MARKER: &[u8] = b"SLATES-RESERVE-RETURNED-9b41";
   /// Shape: the file is this many chunk-sized blocks, so its pages dwarf the object's metadata and image pages.
   const CHUNKS: usize = 256;
-  /// Shape: the bound on the idle shard's work: several reap ticks.
+  /// Shape: the bound on the idle shard's work: several sweep passes.
   const IDLE_WAIT: Duration = Duration::from_secs(20);
   let profile = common::machine_profile();
   let instance = format!("srv-reserve-back-{}", std::process::id());
@@ -3756,8 +4007,8 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   #[cfg(target_os = "linux")]
   let written = allocated_in_content(&content);
   client.fs_remove((volume, attachment), "big").unwrap();
-  // The block is zeroed when its free is released; its pages go back when the shard is next idle at a reap tick (one
-  // tick to see no allocation, the next to purge), so the count is watched until it covers most of the file or the
+  // The block is zeroed when its free is released; its pages go back when the shard is next idle at a sweep pass (one
+  // pass to see no allocation, the next to purge), so the count is watched until it covers most of the file or the
   // bound passes.
   let file = u64::try_from(body.len()).unwrap();
   let started = Instant::now();
@@ -3793,14 +4044,14 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   }
 }
 
-/// Shape: the reap ticks an idle shard is watched for further publications once its plaintext has gone.
+/// Shape: the sweep intervals an idle shard is watched for further publications once its plaintext has gone.
 #[cfg(target_os = "linux")]
-const IDLE_TICKS_WATCHED: u64 = 3;
+const IDLE_INTERVALS_WATCHED: u64 = 3;
 
 /// Condition 9, a deleted file, and the cost of the rule that scrubs it. Do: write a marker file, publish every shard (as
 /// a transport's barrier does), delete the file, and leave the volume idle; then watch the shards' publications for a
-/// few ticks. Expect: the marker gone from the content object within the bound, and then no further publication: the
-/// reap tick publishes only while a free is deferred, so an idle shard costs nothing. The deletion's own scrub through a
+/// few sweep intervals. Expect: the marker gone from the content object within the bound, and then no further publication: the
+/// idle sweep publishes only while a free is deferred, so an idle shard costs nothing. The deletion's own scrub through a
 /// kernel mount is proven, mutation-checked, by `a_deleted_files_plaintext_leaves_the_daemons_memory`
 /// (`crates/cli/tests/cli.rs`); on this verb path the block is scrubbed with or without the rule.
 #[cfg(target_os = "linux")]
@@ -3844,10 +4095,10 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
       .unwrap_or(0)
   };
   let before = published(&daemon);
-  // A test may sleep (the lint's stated exception): the watch is wall time over the daemon's own reap ticks.
+  // A test may sleep (the lint's stated exception): the watch is wall time over the daemon's own sweep passes.
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(Duration::from_nanos(
-    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(IDLE_TICKS_WATCHED),
+    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(IDLE_INTERVALS_WATCHED),
   ));
   let after = published(&daemon);
   daemon.stop();
@@ -4764,6 +5015,213 @@ fn a_created_and_pinned_overlay_survives_a_restart() {
   second.stop();
 }
 
+/// §4.2 accounting through recovery, §4.8 (A-395; `docs/bugs/2026-11-05-a-volume-promised-the-whole-version-slab-is-refused-at-recovery.md`).
+/// A snapshot shares with the head every directory the head has not changed since, as it shares the files; recovery
+/// rebuilt each of a snapshot's directories privately, an inode version on its deadlist the live daemon never held,
+/// charged to the version slab, so a restart took a slot a directory more than the live daemon had, and a volume
+/// promised the whole slab was refused (the whole kernel's base volume: 6,348 slots short, its 6,348 directories). Do:
+/// create an overlay over a directory holding `f` and `d1/d2/g`, pin its whole base, snapshot it, read every shard's
+/// committed and snapshot-retained version slots, and restart the daemon over the same segment. Expect the overlay
+/// served after the restart with both files read back over the mount, and every shard's committed and retained version
+/// slots what they were before the restart.
+#[test]
+fn a_snapshots_unchanged_directories_take_no_version_slot_after_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-helddirs-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("helddirs", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  // The base's nested directories: the test's own temporary directory, which it removes.
+  #[allow(clippy::disallowed_methods)]
+  std::fs::create_dir_all(format!("{}/d1/d2", target.path)).unwrap();
+  target.seed("f", BEFORE);
+  target.seed("d1/d2/g", BEFORE);
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch("held-dirs")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    2,
+    "both base files pinned"
+  );
+  client.snapshot(overlay).unwrap();
+  let versions = |client: &mut Client| -> Vec<(u64, u64)> {
+    client
+      .daemon_status()
+      .unwrap()
+      .shards
+      .iter()
+      .map(|shard| (shard.committed_versions, shard.retained_versions))
+      .collect()
+  };
+  let before = versions(&mut client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let served = client.status(overlay).is_ok();
+  let after = versions(&mut client);
+  let read_back = served.then(|| {
+    let (mut stream, root) = mounted_on(&second, "held-dirs");
+    let f = lookup(&mut stream, &root, "f", 2);
+    let d1 = lookup(&mut stream, &root, "d1", 3);
+    let d2 = lookup(&mut stream, &d1, "d2", 4);
+    let g = lookup(&mut stream, &d2, "g", 5);
+    (read(&mut stream, &f, 6), read(&mut stream, &g, 7))
+  });
+  drop(client);
+  second.stop();
+  eprintln!(
+    "version slots (committed, retained) by shard: before the restart {before:?}, after {after:?}"
+  );
+  assert!(served, "the overlay is served after the restart");
+  assert_eq!(
+    read_back,
+    Some((BEFORE.to_vec(), BEFORE.to_vec())),
+    "both pinned files read back"
+  );
+  assert_eq!(
+    after, before,
+    "recovery takes the version slots the live daemon held, no slot for a directory the snapshot shares"
+  );
+}
+
+/// A clone name for an origin named `origin_name` that hashes to a partition other than the origin's (A-236's alias
+/// path), or `stem` itself when every candidate lands on the origin's.
+fn clone_name_on_another_partition(origin_name: &str, stem: &str) -> String {
+  let partitions = usize::from(TEST_SHARDS);
+  let origin = slates_server::verbs::owner_of_name(origin_name, partitions);
+  (0..16)
+    .map(|suffix| format!("{stem}-{suffix}"))
+    .find(|candidate| slates_server::verbs::owner_of_name(candidate, partitions) != origin)
+    .unwrap_or_else(|| stem.to_owned())
+}
+
+/// AC-1.16 and AC-2.12 (GAPS 2026-11-05, "The daemon cannot clone an overlay volume": `admit_clone` gave every clone
+/// no host, so an overlay's clone could not image its base and `volume clone` was refused `ContentUnavailable`, pinned
+/// or not; kiln's agentic.md W3 and W7 wait on it). Do: an overlay over a directory holding `base.txt` and `edit.txt`;
+/// through the volume rewrite `edit.txt` and create `new.txt`; snapshot; clone the snapshot twice, one name on the
+/// origin's partition and one on the other (A-236's alias path); write `clone.txt` into the first clone; restart the
+/// daemon over the same segment. Expect both clones made; each reads `base.txt` from the directory and the snapshot's
+/// `edit.txt` and `new.txt`; `clone.txt` is in the clone that wrote it and in neither the origin nor the other clone;
+/// and after the restart the same, every base byte read again from the directory.
+#[test]
+fn an_overlays_snapshot_clones_and_each_clone_reads_its_base_across_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-overlayclone-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("overlayclone", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  target.seed("base.txt", BEFORE);
+  target.seed("edit.txt", b"edit.txt as the disk holds it");
+  let mut client = connect(&instance);
+  let origin = client
+    .create(&CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch("overlay-origin")
+    })
+    .unwrap();
+  let attachment = client
+    .attach(origin, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write((origin, attachment), "edit.txt", AFTER, 0o644)
+    .unwrap();
+  client
+    .fs_write((origin, attachment), "new.txt", DIVERGED, 0o644)
+    .unwrap();
+  let snapshot = client.snapshot(origin).unwrap();
+  let near = clone_name_on_origin_partition("overlay-origin", "overlay-clone");
+  let far = clone_name_on_another_partition("overlay-origin", "overlay-far");
+  let clone = client.clone_snapshot(origin, snapshot, &near);
+  assert!(
+    clone.is_ok(),
+    "an overlay's snapshot clones on its own partition: {clone:?}"
+  );
+  let clone = clone.unwrap();
+  let other = client.clone_snapshot(origin, snapshot, &far);
+  assert!(
+    other.is_ok(),
+    "an overlay's snapshot clones under a name held on another partition: {other:?}"
+  );
+  let other = other.unwrap();
+  let clone_attachment = client
+    .attach(clone, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write(
+      (clone, clone_attachment),
+      "clone.txt",
+      b"the clone's own",
+      0o644,
+    )
+    .unwrap();
+  overlay_clones_read(&mut client, origin, (clone, other), "before the restart");
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  overlay_clones_read(&mut client, origin, (clone, other), "after the restart");
+  drop(client);
+  second.stop();
+}
+
+/// What the overlay-clone test expects each volume to read, `when` naming the moment for a failure's message.
+fn overlay_clones_read(
+  client: &mut Client,
+  origin: VolumeId,
+  (clone, other): (VolumeId, VolumeId),
+  when: &str,
+) {
+  for volume in [clone, other] {
+    for (name, expected) in [
+      ("base.txt", BEFORE),
+      ("edit.txt", AFTER),
+      ("new.txt", DIVERGED),
+    ] {
+      let held = read_answered(client, volume, name);
+      assert!(
+        matches!(held.as_deref(), Ok(bytes) if bytes == expected),
+        "{when}: clone {volume:?} reads {name} from its base or snapshot: {held:?}"
+      );
+    }
+  }
+  let own = read_answered(client, clone, "clone.txt");
+  assert!(
+    matches!(own.as_deref(), Ok(bytes) if bytes == b"the clone's own"),
+    "{when}: the clone reads its own file: {own:?}"
+  );
+  clones_own_file_reads_in_no_other_volume(client, [origin, other], when);
+}
+
+/// The other half of `overlay_clones_read`: expect the file one clone wrote refused `NotFound` in each of `volumes`,
+/// `when` naming the moment for a failure's message.
+fn clones_own_file_reads_in_no_other_volume(
+  client: &mut Client,
+  volumes: [VolumeId; 2],
+  when: &str,
+) {
+  for volume in volumes {
+    let absent = read_answered(client, volume, "clone.txt");
+    assert!(
+      matches!(absent, Err(ClientError::Refused(Refusal::NotFound))),
+      "{when}: a file one clone wrote is in no other volume: {absent:?}"
+    );
+  }
+}
+
 /// A-217 (a green's origin is a reference to its base snapshot, held while the green lives; §4.16, D-18). Do: a green
 /// over a bounded overlay's snapshot (two files), one accepted increment; destroy the snapshot, and destroy the overlay;
 /// restart the daemon over the same segment; read the green and destroy both again; then destroy the green and the
@@ -4812,6 +5270,86 @@ fn a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it() {
     .expect("with the green gone nothing holds the snapshot");
   drop(client);
   second.stop();
+}
+
+/// §4.8 "Recovery", §4.16 "Green owner restart: Masked", §4.3 "Bounded work everywhere" (A-217's owed item; 2026-11-18,
+/// goal g232): a restarted owner seeds a green's engine from its held origin a share at a time, a recovery unit each. The
+/// whole origin was seeded in one step, hashing and copying every file: over the Linux kernel's 1.67 GB that is seconds
+/// of one poll, so a restarted owner of a kernel-sized green was ended by its watchdog inside its own recovery, again at
+/// every restart. Do: a green over a pinned overlay's snapshot of four files of a hashing share each; restart the daemon
+/// over the same segment. Expect: the recovery counted its seeding of the origin over more than one share
+/// (`merge.recovery.origin_load_steps`), and the green reads each file's bytes at version 0.
+#[test]
+fn a_restarted_owner_seeds_a_greens_origin_a_share_at_a_time() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-originload-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  // A file a share: each is its own unit of the seeding, so the origin cannot seed in one.
+  let share = usize::try_from(config.archive_slice_bytes())
+    .unwrap()
+    .max(1);
+  let anchor = held_anchor("originload", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  let files: Vec<(String, Vec<u8>)> = (0..4u8)
+    .map(|file| (format!("file-{file}"), vec![file.wrapping_add(1); share]))
+    .collect();
+  for (name, bytes) in &files {
+    target.seed(name, bytes);
+  }
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 1 << 30 },
+      base: Some(target.path.clone()),
+      ..scratch("origin-load-base")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    u64::try_from(files.len()).unwrap(),
+    "every base file pinned"
+  );
+  let snapshot = client.snapshot(overlay).unwrap();
+  let green = client
+    .create_green_over(
+      "origin-load-green",
+      false,
+      slates_client::GreenBase {
+        volume: overlay,
+        snapshot,
+      },
+    )
+    .unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let reads: Vec<bool> = files
+    .iter()
+    .map(|(name, bytes)| {
+      client
+        .read(green, name, slates_client::ReadAt::Version { version: 0 })
+        .is_ok_and(|read| read == *bytes)
+    })
+    .collect();
+  let counters = second.refusals_on_every_shard().unwrap();
+  let seeded_in = counters
+    .get("merge.recovery.origin_load_steps")
+    .copied()
+    .unwrap_or(0);
+  drop(client);
+  second.stop();
+  assert!(
+    seeded_in > 1,
+    "the recovery seeded the origin over {seeded_in} shares: {counters:?}"
+  );
+  assert!(
+    reads.iter().all(|read| *read),
+    "every file reads its bytes at version 0: {reads:?}"
+  );
 }
 
 /// A sibling of a removed base directory at recovery (found by liveness while slicing recovery, 2026-11-08): after a
@@ -5191,8 +5729,9 @@ fn a_file_removed_while_open_over_nfsv4_is_freed_when_its_clients_lease_lapses()
   const LEASE: Duration = Duration::from_secs(2);
   let profile = common::machine_profile();
   let instance = format!("srv-v4-unlinked-lease-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance, Some(1))
-    .with_failover_slo(u64::try_from(LEASE.as_nanos()).unwrap());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  // The NFSv4 lease held short (A-425: derived from the idle Linux client's renewal floor otherwise).
+  config.nfs_v4.lease_ns = u64::try_from(LEASE.as_nanos()).unwrap();
   // One client at a time, so a second client's EXCHANGE_ID expires the lapsed first (the courteous server's rule).
   config.nfs_v4.clients = 1;
   let anchor = held_anchor("v4unlinkedlease", &profile, &config);

@@ -212,54 +212,16 @@ impl Origin {
   /// Decodes [`Origin::encode`]'s bytes — the inverse a recovery or a holder uses. Every count is
   /// checked against the bytes that remain (at the smallest entry size) before a table is allocated,
   /// every length against what remains before it is read, and the result must consume the bytes
-  /// exactly; each failure is a typed [`DocDecodeError`].
+  /// exactly; each failure is a typed [`DocDecodeError`]. It is [`DecodeCursor`] run in one share, so the
+  /// whole decode and the sliced one are one grammar.
   pub fn decode(bytes: &[u8]) -> Result<Origin, DocDecodeError> {
-    let mut reader = Reader::new(bytes);
-    if reader.u32()? != MAGIC {
-      return Err(DocDecodeError::BadMagic);
+    let mut cursor = DecodeCursor::new();
+    loop {
+      // A share past any length decodes to the end or to the first refusal.
+      if let Some(origin) = cursor.step(bytes, usize::MAX)? {
+        return Ok(origin);
+      }
     }
-    if reader.u32()? != VERSION {
-      return Err(DocDecodeError::BadVersion);
-    }
-    let mut origin = Origin::default();
-    for _ in 0..take_count(&mut reader)? {
-      let path = take_str(&mut reader)?;
-      let bytes = reader_bytes(&mut reader)?.to_vec();
-      origin.files.push((path, bytes));
-    }
-    for _ in 0..take_count(&mut reader)? {
-      origin.dirs.push(take_str(&mut reader)?);
-    }
-    for _ in 0..take_count(&mut reader)? {
-      let path = take_str(&mut reader)?;
-      let mode = reader.u32()?;
-      origin.modes.push((path, mode));
-    }
-    for _ in 0..take_count(&mut reader)? {
-      let path = take_str(&mut reader)?;
-      let target = take_str(&mut reader)?;
-      origin.symlinks.push((path, target));
-    }
-    for _ in 0..take_count(&mut reader)? {
-      let path = take_str(&mut reader)?;
-      let target = take_str(&mut reader)?;
-      origin.hardlinks.push((path, target));
-    }
-    for _ in 0..take_count(&mut reader)? {
-      let path = take_str(&mut reader)?;
-      let name = take_str(&mut reader)?;
-      let value = reader_bytes(&mut reader)?.to_vec();
-      origin.xattrs.push((path, name, value));
-    }
-    for _ in 0..take_count(&mut reader)? {
-      let path = take_str(&mut reader)?;
-      let node = crate::special::SpecialNode::decode(reader.bytes(crate::special::ENCODED_BYTES)?)?;
-      origin.specials.push((path, node));
-    }
-    if !reader.is_empty() {
-      return Err(DocDecodeError::TrailingBytes);
-    }
-    Ok(origin)
   }
 }
 
@@ -339,6 +301,197 @@ impl IdentityCursor {
       }
     }
     (self.at == Cursor::Done).then(|| *self.hasher.finalize().as_bytes())
+  }
+}
+
+/// An origin's canonical bytes written a share at a time (§4.16 "Commit": a green's version-0 inputs are its encoded
+/// origin, placed at `f + 1` before the record names them; §4.3 "Bounded work everywhere"): the units
+/// [`Origin::encode`] writes, from where the last share stopped, handed to the caller's sink, so a kernel-sized origin
+/// (97,229 files, 1.67 GB) is cut into its inputs archive over many of a shard's steps, never gathered into one buffer
+/// in one poll. It borrows nothing between shares; its owner keeps the origin unchanged until the last unit is out.
+#[derive(Debug)]
+pub struct EncodeCursor {
+  at: Cursor,
+}
+
+impl EncodeCursor {
+  /// A cursor at the start of `origin`'s canonical bytes; `None` when the origin is not canonical, since its bytes as
+  /// it stands would not be the canonical ones ([`Origin::canonicalize`] first).
+  pub fn new(origin: &Origin) -> Option<EncodeCursor> {
+    origin
+      .is_canonical()
+      .then_some(EncodeCursor { at: Cursor::Header })
+  }
+
+  /// Writes `origin`'s next units to `sink` until at least `budget_bytes` have gone out or the encoding ends (a unit
+  /// is one entry, so a share overruns its budget by at most one file's bytes); `true` once the last unit is out.
+  pub fn step(
+    &mut self,
+    origin: &Origin,
+    budget_bytes: usize,
+    sink: &mut impl FnMut(&[u8]),
+  ) -> bool {
+    let mut written = 0usize;
+    while self.at != Cursor::Done {
+      self.at = origin
+        .emit(self.at, &mut |bytes| {
+          written = written.saturating_add(bytes.len());
+          sink(bytes);
+        })
+        .unwrap_or(Cursor::Done);
+      if written >= budget_bytes {
+        break;
+      }
+    }
+    self.at == Cursor::Done
+  }
+}
+
+/// What a [`DecodeCursor`] reads next: the canonical grammar's places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expect {
+  /// The magic and the version.
+  Header,
+  /// A table's count.
+  Count(Table),
+  /// A table's entries, this many still to read.
+  Entries(Table, usize),
+  /// Past the last table: the bytes must end here.
+  End,
+}
+
+/// [`Origin::decode`] a share at a time (§4.16 "Apply on holders": a holder seeds its replica's version 0 from the
+/// inputs it holds; §4.3 "Bounded work everywhere"): the one grammar, with every check and typed refusal the whole
+/// decode makes in the same order, read from where the last share stopped, so a kernel-sized origin decodes over many
+/// of a holder shard's steps. It keeps the bytes' offset, never the bytes: its owner passes the same bytes, unchanged,
+/// to every share. A refusal ends it; a share after one starts nowhere new.
+#[derive(Debug)]
+pub struct DecodeCursor {
+  /// Where the next unit starts in the bytes.
+  at: usize,
+  /// What the next unit is.
+  expect: Expect,
+  /// The origin read so far.
+  origin: Origin,
+}
+
+impl Default for DecodeCursor {
+  fn default() -> DecodeCursor {
+    DecodeCursor::new()
+  }
+}
+
+impl DecodeCursor {
+  /// A cursor at the start of an origin's bytes.
+  pub fn new() -> DecodeCursor {
+    DecodeCursor {
+      at: 0,
+      expect: Expect::Header,
+      origin: Origin::default(),
+    }
+  }
+
+  /// Reads `bytes`' next units until at least `budget_bytes` of them are read or the bytes end (a unit is the header,
+  /// a table's count or one entry, so a share overruns its budget by at most one file's bytes): the origin once the
+  /// last unit is read and nothing trails it, `None` while units remain, or the first refusal [`Origin::decode`]
+  /// would make. Every unit reads at least a length's four bytes, so each share advances.
+  pub fn step(
+    &mut self,
+    bytes: &[u8],
+    budget_bytes: usize,
+  ) -> Result<Option<Origin>, DocDecodeError> {
+    let rest = bytes.get(self.at..).ok_or(DocDecodeError::Truncated)?;
+    let mut reader = Reader::new(rest);
+    loop {
+      if self.expect == Expect::End {
+        if !reader.is_empty() {
+          return Err(DocDecodeError::TrailingBytes);
+        }
+        self.at = bytes.len();
+        return Ok(Some(std::mem::take(&mut self.origin)));
+      }
+      self.expect = self.unit(&mut reader)?;
+      let read = rest.len().saturating_sub(reader.remaining());
+      if read >= budget_bytes {
+        self.at = self.at.saturating_add(read);
+        return Ok(None);
+      }
+    }
+  }
+
+  /// Reads the unit the cursor expects; what it expects after it.
+  fn unit(&mut self, reader: &mut Reader<'_>) -> Result<Expect, DocDecodeError> {
+    match self.expect {
+      Expect::Header => {
+        if reader.u32()? != MAGIC {
+          return Err(DocDecodeError::BadMagic);
+        }
+        if reader.u32()? != VERSION {
+          return Err(DocDecodeError::BadVersion);
+        }
+        Ok(Expect::Count(Table::Files))
+      }
+      Expect::Count(table) => {
+        let count = take_count(reader)?;
+        Ok(entries_or_next(table, count))
+      }
+      Expect::Entries(table, left) => {
+        self.entry(table, reader)?;
+        Ok(entries_or_next(table, left.saturating_sub(1)))
+      }
+      Expect::End => Ok(Expect::End),
+    }
+  }
+
+  /// Reads one entry of `table` into the origin.
+  fn entry(&mut self, table: Table, reader: &mut Reader<'_>) -> Result<(), DocDecodeError> {
+    let origin = &mut self.origin;
+    match table {
+      Table::Files => {
+        let path = take_str(reader)?;
+        let bytes = reader_bytes(reader)?.to_vec();
+        origin.files.push((path, bytes));
+      }
+      Table::Dirs => origin.dirs.push(take_str(reader)?),
+      Table::Modes => {
+        let path = take_str(reader)?;
+        let mode = reader.u32()?;
+        origin.modes.push((path, mode));
+      }
+      Table::Symlinks => {
+        let path = take_str(reader)?;
+        let target = take_str(reader)?;
+        origin.symlinks.push((path, target));
+      }
+      Table::Hardlinks => {
+        let path = take_str(reader)?;
+        let target = take_str(reader)?;
+        origin.hardlinks.push((path, target));
+      }
+      Table::Xattrs => {
+        let path = take_str(reader)?;
+        let name = take_str(reader)?;
+        let value = reader_bytes(reader)?.to_vec();
+        origin.xattrs.push((path, name, value));
+      }
+      Table::Specials => {
+        let path = take_str(reader)?;
+        let node = crate::special::SpecialNode::read(reader)?;
+        origin.specials.push((path, node));
+      }
+    }
+    Ok(())
+  }
+}
+
+/// `table`'s entries while `left` remain, else the next table's count, else the end.
+fn entries_or_next(table: Table, left: usize) -> Expect {
+  if left > 0 {
+    return Expect::Entries(table, left);
+  }
+  match table.next() {
+    Some(next) => Expect::Count(next),
+    None => Expect::End,
   }
 }
 

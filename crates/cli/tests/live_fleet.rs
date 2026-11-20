@@ -100,17 +100,7 @@ fn run(instance: &str, args: &[&str]) -> (i32, String, String) {
 }
 
 fn run_with_stdin(instance: &str, args: &[&str], input: &[u8]) -> (i32, String) {
-  use std::io::Write;
-  let mut child = slates()
-    .arg("--instance")
-    .arg(instance)
-    .args(args)
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
-  child.stdin.take().unwrap().write_all(input).unwrap();
+  let child = spawned_with_stdin(instance, args, input, Stdio::piped());
   let output = child.wait_with_output().unwrap();
   (
     output.status.code().unwrap_or(-1),
@@ -1525,17 +1515,20 @@ fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
   );
 }
 
-/// A-200, AC-8.9: a live log ships a write's change, not the volume. Do make `WRITES` stable NFS writes, one at a time,
-/// to a live-shipped volume. Expect one whole record, the log's first: a whole record copies every byte of the volume.
-/// Until 2026-11-05 every local checkpoint shipped one, and a shard checkpoints once its deltas reach the size of its
-/// metadata, so one write in four copied the volume's content (532 whole records in 2,050 writes, and the ones behind
-/// them refused for credit, 431).
+/// A-200, AC-8.9: a live log ships a write's change, not the volume, and a whole record only once the changes since
+/// the last are as large as it. Do grow a live volume's file to `PRELOAD` pages with stable NFS writes, then rewrite its
+/// first page `WRITES` times. Expect the whole records' bytes to be at most the changes' and one whole record, which the
+/// rule makes them. Until 2026-11-05 every local checkpoint shipped one whatever the changes, and a shard checkpoints once
+/// its deltas reach the size of its metadata (68 whole records in 201 writes to a one-page file). A page's change ships
+/// the content chunk it lies in, 64 KiB, so the changes are not page-sized.
 #[test]
 fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
   /// Shape: enough writes for the shard's journal to checkpoint many times over.
   const WRITES: u32 = 200;
   /// Shape: each write's bytes, a page.
   const WRITE_BYTES: usize = 4096;
+  /// Shape: the file's pages before the rewrites: whole records far larger than one write's change.
+  const PRELOAD: u32 = 64;
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
     eprintln!(
       "skipping the live-shipping change-only flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
@@ -1545,9 +1538,25 @@ fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
   let fleet = start_fleet("live-changes");
   let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
   let (mut live, file, _) = stable_session(owner, "changes", true);
-  let data = vec![0x5a_u8; WRITE_BYTES];
+  // Every page and every rewrite distinct: content is kept by identity, so identical pages would make a whole record
+  // no larger than one change.
+  let page_of = |seed: u32| -> Vec<u8> {
+    (0..WRITE_BYTES)
+      .map(|at| {
+        u8::try_from((seed.wrapping_mul(2_654_435_761) ^ u32::try_from(at).unwrap()) & 0xff)
+          .unwrap()
+      })
+      .collect()
+  };
+  for page in 0..PRELOAD {
+    let offset = u64::from(page) * u64::try_from(WRITE_BYTES).unwrap();
+    assert_eq!(
+      nfs::write_at_status(&mut live, &file, offset, &page_of(page), 10 + page),
+      0
+    );
+  }
   for write in 0..WRITES {
-    nfs::write(&mut live, &file, &data, 100 + write);
+    nfs::write(&mut live, &file, &page_of(PRELOAD + write), 1_000 + write);
   }
   let counters = live_counters(owner);
   drop(live);
@@ -1559,10 +1568,13 @@ fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
     of("appended") >= u64::from(WRITES),
     "every write reached the log: {counters:?}"
   );
-  assert_eq!(
-    of("whole"),
-    1,
-    "only the log's first record is whole: {counters:?}"
+  // The rule: a whole record is appended once the changes since the last are as large as it, so every whole record but
+  // the last was followed by at least its own size in changes. A whole record here is at most the file, twice over
+  // for its record and seal.
+  let file_bound = 2 * u64::from(PRELOAD) * u64::try_from(WRITE_BYTES).unwrap();
+  assert!(
+    of("whole_bytes") <= of("change_bytes") + file_bound,
+    "the whole records' bytes are at most the changes' and one whole record: {counters:?}"
   );
   assert_eq!(
     of("refused"),
@@ -1901,6 +1913,141 @@ fn a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   );
 }
 
+/// Shape: how long each slow candidate is stopped in its cycle ([`a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly`]):
+/// seven tenths of the liveness budget, so every window of a held reply's wait holds one of the candidates' running
+/// spells.
+#[cfg(target_os = "linux")]
+const SLOW_STOPPED_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 10 * 7;
+/// Shape: how long each slow candidate runs in its cycle: a tenth of the liveness budget, room for an answer in each
+/// window of a held reply's wait but not for every exchange a first `fsync` waits on (its head's placement took about
+/// 105 ms of running candidates on adacachy2), so it waits through two cycles, past the liveness budget.
+#[cfg(target_os = "linux")]
+const SLOW_RUNNING_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 10;
+
+/// Shape: the most rounds made while the candidates are slow, each a fresh live volume whose first `fsync` waits for its
+/// head's placement as well as its log: until one outlasts the liveness budget, which a first `fsync` did in 6 of 9
+/// runs of this shape on adacachy2.
+#[cfg(target_os = "linux")]
+const SLOW_ROUNDS: usize = 6;
+
+/// Cycles the processes `pids` between stopped for [`SLOW_STOPPED_NS`] and running for [`SLOW_RUNNING_NS`] until `stop`
+/// is dropped, then leaves them running. Each spell is a wait on the channel, so the cycle ends at once.
+#[cfg(target_os = "linux")]
+fn cycle_slowly(pids: Vec<i32>, stopped: std::sync::mpsc::Receiver<()>) {
+  let each = |signal: rustix::process::Signal| {
+    for pid in &pids {
+      if let Some(pid) = rustix::process::Pid::from_raw(*pid) {
+        let _ = rustix::process::kill_process(pid, signal);
+      }
+    }
+  };
+  let spell = |ns: u64| {
+    matches!(
+      stopped.recv_timeout(Duration::from_nanos(ns)),
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+  };
+  loop {
+    each(rustix::process::Signal::STOP);
+    let on = spell(SLOW_STOPPED_NS);
+    each(rustix::process::Signal::CONT);
+    if !on || !spell(SLOW_RUNNING_NS) {
+      return;
+    }
+  }
+}
+
+/// One round of [`a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly`]: a fresh live volume on
+/// `owner`, mounted, a file written, then `fsync`ed while the candidates `pids` cycle slowly. The `fsync`'s answer and how
+/// long it took.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // the test's own files, under the fleet's scratch and the slates mount
+fn slow_round(
+  fleet: &Fleet,
+  owner: &str,
+  pids: &[i32],
+  round: usize,
+) -> (std::io::Result<()>, Duration) {
+  use std::io::Write;
+  let id = create_live_volume(owner, &format!("slowly{round}"));
+  let mount = format!("{}/mount{round}", fleet.scratch.path);
+  std::fs::create_dir_all(&mount).unwrap();
+  let (code, _, err) = run(owner, &["mount", &id, &mount]);
+  assert_eq!(code, 0, "mount: {err}");
+  let mut file = std::fs::File::create(format!("{mount}/slow")).unwrap();
+  file.write_all(b"held by a slow candidate").unwrap();
+  let (stop, stopped) = std::sync::mpsc::channel::<()>();
+  let cycled = pids.to_vec();
+  let cycler = std::thread::spawn(move || cycle_slowly(cycled, stopped));
+  let began = Instant::now();
+  let synced = file.sync_all();
+  let took = began.elapsed();
+  drop(stop);
+  cycler.join().unwrap();
+  drop(file);
+  let unmounted = Command::new("fusermount3").args(["-u", &mount]).status();
+  if !unmounted.is_ok_and(|status| status.success()) {
+    let _ = Command::new("fusermount3")
+      .args(["-u", "-z", &mount])
+      .status();
+  }
+  (synced, took)
+}
+
+/// A-200 under load (2026-11-09; the supervisor's order after a healthy `fsync` answered `EIO` 1 in 6 runs on main and
+/// 2 in 9 on raft-7): do, round by round, make a live-shipped volume, mount it and write a file, then `fsync` it with both
+/// candidates' processes cycling between stopped (seven tenths of the liveness budget) and running (three twentieths);
+/// stop after the round whose `fsync` took longer than the liveness budget, or after six. The candidates are alive and
+/// answer, slowly, as a loaded machine's are. Expect every `fsync` to succeed, and one to have taken more than the
+/// liveness budget (or the shape did not slow them enough to tell). Before, a held `fsync` gave up at one wall-clock
+/// deadline of the liveness budget from its hold, however its candidates were answering: red 3 of 3 here on adacachy2,
+/// each first `fsync` `EIO` after 1.0013–1.0037 s with its head's placement still in flight (its bytes held by a
+/// candidate in two of them), as under load. After, 6 of 6 succeeded in 1.50–1.59 s.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the slow-candidates FUSE fsync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  if !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("skipping the slow-candidates FUSE fsync flow: no /dev/fuse on this host");
+    return;
+  }
+  let fleet = start_fleet("live-slow");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let pids: Vec<i32> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .map(|index| i32::try_from(fleet.daemons[index].child.id()).unwrap())
+    .collect();
+  let budget = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let mut rounds = Vec::new();
+  for round in 0..SLOW_ROUNDS {
+    let (synced, took) = slow_round(&fleet, &owner, &pids, round);
+    let past = took > budget;
+    rounds.push((synced, took));
+    if past {
+      break;
+    }
+  }
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("slow fsync: {rounds:?}; owner's live counters {counters:?}");
+  assert!(
+    rounds.iter().all(|(synced, _)| synced.is_ok()),
+    "every fsync its slow but answering candidates hold succeeds: {rounds:?}"
+  );
+  assert!(
+    rounds.iter().any(|(_, took)| *took > budget),
+    "the slow candidates kept an fsync past the liveness budget, or the test shows nothing: {rounds:?}"
+  );
+}
+
 /// The survivor among `hosts` (each member id with its instance) that takes `volume` over, as [`successor_of`] ranks it.
 fn successor_among(hosts: &[(slates_db::register::HostId, String)], volume: &str) -> String {
   let mut bytes = [0u8; 16];
@@ -2042,6 +2189,401 @@ fn a_successor_that_holds_no_copy_still_takes_a_live_volume_over() {
     Some(&successor),
     "the successor, which held no copy, served every acknowledged write: {counters:?}"
   );
+}
+
+/// The pid of `instance`'s daemon, as its `status` reports it (under an anchor, the anchor's child).
+fn daemon_pid(instance: &str) -> String {
+  value_of(&run_ready(instance, &["status"]), "pid")
+}
+
+/// Sends the signal `flag` (`-STOP`, `-CONT`, `-KILL`) to the process `pid`.
+fn signal_pid(pid: &str, flag: &str) {
+  let sent = Command::new("kill").args([flag, pid]).status().unwrap();
+  assert!(sent.success(), "kill {flag} {pid}");
+}
+
+/// Waits until `a` and `b` each hold the other a live member (`fleet_members`), within the fleet wait.
+fn wait_see_each_other(a: &str, b: &str) {
+  let started = Instant::now();
+  loop {
+    let host_of = |instance: &str| value_of(&run_ready(instance, &["status"]), "fleet_host");
+    let members_of = |instance: &str| value_of(&run_ready(instance, &["status"]), "fleet_members");
+    let (host_a, host_b) = (host_of(a), host_of(b));
+    if members_of(a)
+      .split_whitespace()
+      .any(|member| member == host_b)
+      && members_of(b)
+        .split_whitespace()
+        .any(|member| member == host_a)
+    {
+      return;
+    }
+    assert!(
+      started.elapsed() < FLEET_WAIT,
+      "{a} and {b} saw each other again"
+    );
+    pause();
+  }
+}
+
+/// Restarts `instance`'s daemon as a crash does, its anchor kept (a warm restart): kills the daemon's process (SIGKILL)
+/// and waits until its replacement answers.
+fn restart_warm(instance: &str) {
+  let pid = value_of(&run_ready(instance, &["status"]), "pid");
+  let killed = Command::new("kill").args(["-KILL", &pid]).status().unwrap();
+  assert!(killed.success(), "kill {instance}'s daemon {pid}");
+  let started = Instant::now();
+  loop {
+    let (code, out, _) = run(instance, &["status"]);
+    if code == 0 && value_of(&out, "pid") != pid {
+      return;
+    }
+    assert!(
+      started.elapsed() < FLEET_WAIT,
+      "the anchor replaced {instance}'s daemon"
+    );
+    pause();
+  }
+}
+
+/// A-200; §4.8 "Recovery" (a warm restart keeps every replica the node acknowledged): do stop one candidate (Y) while
+/// the owner writes, so the writes are held by the owner and the other candidate (X) alone; stop the owner, so it cannot
+/// ship to X again; then restart X's daemon as a crash does, its anchor kept. Expect X to hold the same copy after its
+/// restart as before. Until 2026-11-06 the copies were not in the holder's recovery image and X held nothing after it,
+/// though it had acknowledged every write.
+#[test]
+fn a_candidates_copy_survives_its_own_daemons_restart() {
+  restart_flow(false);
+}
+
+/// The takeover leg of [`a_candidates_copy_survives_its_own_daemons_restart`]: then resume Y, wait until the survivors
+/// see each other, and kill the owner. Expect a survivor to serve every write, from X's restored copy. The volume is shared
+/// with every node first (A-237), so a survivor serving it is the proof the share reached it. Ignored until 2026-11-08:
+/// no takeover began while X, leading the council, could not condemn an owner already stopped at its restart (fixed by
+/// A-250's f + 1 rule), and then each survivor refused the reads `NotShared` until the test shared the volume.
+#[test]
+fn a_candidates_restored_copy_serves_its_owners_takeover() {
+  restart_flow(true);
+}
+
+/// The flow of the two tests above; `take_over` runs the takeover leg.
+fn restart_flow(take_over: bool) {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping candidate-restart flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  // Each flow its own fleet name: instance names are `{tag}-{node}-{pid}`, and the two tests share one process, so a
+  // shared tag gave both flows the same daemons' names (each refused the other's, at `run_ready`, once the takeover
+  // flow ran beside the restart flow).
+  let tag = if take_over {
+    "live-restart-takeover"
+  } else {
+    "live-restart"
+  };
+  let mut fleet = start_fleet_as(tag, "anchor");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates: Vec<usize> = (0..fleet.instances.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  let (x, y) = (candidates[0], candidates[1]);
+  let id = create_live_volume(&owner, "restarted");
+  // A read through a survivor is its own principal (A-237: a principal carries the host it connects through), so the
+  // volume is shared with each node before any of them must serve it; the catalog register carrying the share ships
+  // to the candidates with the volume's head, and the takeover rebuilds the volume with that access list.
+  if take_over {
+    share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
+  }
+  write_files(&owner, &id, 0..1);
+  let y_daemon = daemon_pid(&fleet.instances[y]);
+  let owner_daemon = daemon_pid(&owner);
+  // A node is stopped whole, its anchor first: an anchor left running would replace its stopped daemon.
+  signal(&fleet.daemons[y], rustix::process::Signal::STOP);
+  signal_pid(&y_daemon, "-STOP");
+  write_files(&owner, &id, 1..FILES);
+  let x_instance = fleet.instances[x].clone();
+  let (caught_up, _, held) = wait_caught_up(&owner, &[&x_instance], &id);
+  assert!(
+    caught_up,
+    "X held the owner's head before its restart: {held:?}"
+  );
+  let held_before_restart = held.into_iter().next().flatten();
+  signal(&fleet.daemons[owner_index], rustix::process::Signal::STOP);
+  signal_pid(&owner_daemon, "-STOP");
+  restart_warm(&x_instance);
+  let held_after_restart = live_line(&x_instance, "held", &id);
+  let restored = live_counters(&x_instance)
+    .get("restored")
+    .copied()
+    .unwrap_or(0);
+  if !take_over {
+    drop(fleet.daemons);
+    drop(fleet.scratch);
+    eprintln!(
+      "live restart: X's copy before its restart {held_before_restart:?}, after {held_after_restart:?}; restored \
+       {restored}"
+    );
+    assert_eq!(
+      held_after_restart, held_before_restart,
+      "X holds the same copy after its warm restart"
+    );
+    assert!(
+      restored >= 1,
+      "the copy came from the recovery image: {restored}"
+    );
+    return;
+  }
+  // Y resumes, still without the writes (the owner is stopped), and the two survivors see each other again before the
+  // owner dies: a takeover begins only once they hold it dead together. Killed with Y stopped and X just restarted,
+  // neither listed any member alive after 40 s and no takeover began (2026-11-06).
+  signal_pid(&y_daemon, "-CONT");
+  signal(&fleet.daemons[y], rustix::process::Signal::CONT);
+  let y_instance = fleet.instances[y].clone();
+  wait_see_each_other(&x_instance, &y_instance);
+  // The owner dies whole: its daemon, then its anchor.
+  signal_pid(&owner_daemon, "-KILL");
+  drop(fleet.daemons.remove(owner_index));
+  let survivors: Vec<String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .cloned()
+    .collect();
+  let served = std::panic::catch_unwind(|| {
+    let refs: Vec<&String> = survivors.iter().collect();
+    wait_served_whole(&refs, &id, FILES).0
+  })
+  .ok();
+  let counters: Vec<_> = survivors
+    .iter()
+    .map(|survivor| (survivor.clone(), live_counters(survivor)))
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live restart: X's copy before its restart {held_before_restart:?}, after {held_after_restart:?}; served by \
+     {served:?}; {counters:?}"
+  );
+  assert_eq!(
+    held_after_restart, held_before_restart,
+    "X's copy is the same after its warm restart: {counters:?}"
+  );
+  assert!(
+    served.is_some(),
+    "a survivor served every write X acknowledged before its restart: {counters:?}"
+  );
+}
+/// A live line's head position, `None` while the log has none.
+fn head_position(line: Option<&LiveLine>) -> Option<u64> {
+  line.and_then(|(head, _, _)| head.parse().ok())
+}
+
+/// A-344 across real processes (§4.10 live shipping, §4.8 "Recovery"; goal g229, the supervisor's request of
+/// 2026-11-18): do write [`FILES`] files to a live volume through its owner, restart the owner's daemon as a crash does,
+/// its anchor kept (a warm restart), write [`FILES`] more through the restarted owner, then kill the owner whole. Expect
+/// the daemon replaced, every write answered on both sides of the restart, the restarted owner's log resumed past the
+/// head it had shipped before the restart, and a survivor serving every file byte for byte, the writes made after the
+/// restart among them. The resume is held by the head after the restart's writes: each write is its own entry, since
+/// each waits for its durability before the next, so a log that went on past the shipped head `h` ends past `h` plus
+/// those writes, where one begun again at position 0 (a second chain under the same epoch, which a takeover's phase one
+/// loses to the first) ends at their count. Before A-344 a restarted owner answered no write within the client's
+/// deadline and began its log again at genesis; this flow is the real-process leg of the in-process
+/// `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover` (`crates/server/tests/fleet.rs`). Two
+/// versions were written the same day (63b31d5b3, one write after the restart, and goal g229's); this is the one flow,
+/// with g229's bounded writes, which fail where a log begun at genesis left the first version's run waiting for good.
+#[test]
+fn a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping owner-restart flow: set SLATES_TEST_CLI=1 to run it (three anchored daemons)"
+    );
+    return;
+  }
+  let mut fleet = start_fleet_as("live-owner-restart", "anchor");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let others: Vec<String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .cloned()
+    .collect();
+  let id = create_live_volume(&owner, "owner-restarted");
+  // A read through a survivor is its own principal (A-237), so the volume is shared with each node before any of them
+  // must serve it.
+  share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
+  write_files(&owner, &id, 0..FILES);
+  let other_refs: Vec<&String> = others.iter().collect();
+  let (caught_up, before, _) = wait_caught_up(&owner, &other_refs, &id);
+  assert!(
+    caught_up,
+    "both candidates held the owner's head before its restart: {before:?}"
+  );
+  let daemon_before = daemon_pid(&owner);
+  restart_warm(&owner);
+  let daemon_after = daemon_pid(&owner);
+  for other in &others {
+    wait_see_each_other(&owner, other);
+  }
+  let refusals = write_files_through_transient(&owner, &id, FILES..2 * FILES);
+  let after = live_line(&owner, "shipping", &id);
+  // The owner dies whole: its anchor stopped first, so the daemon's death starts no replacement, then its daemon, then
+  // the anchor.
+  signal(&fleet.daemons[owner_index], rustix::process::Signal::STOP);
+  signal_pid(&daemon_after, "-KILL");
+  drop(fleet.daemons.remove(owner_index));
+  let served = std::panic::catch_unwind(|| wait_served_whole(&other_refs, &id, 2 * FILES).0).ok();
+  let counters: Vec<_> = others
+    .iter()
+    .map(|survivor| (survivor.clone(), live_counters(survivor)))
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live owner restart: daemon {daemon_before} -> {daemon_after}; log before the restart {before:?}, after the writes \
+     through the restarted owner {after:?}; transient refusals {refusals:?}; served by {served:?}; {counters:?}"
+  );
+  assert_ne!(
+    daemon_before, daemon_after,
+    "the anchor replaced the owner's daemon"
+  );
+  let written_after = u64::try_from(FILES).unwrap();
+  assert!(
+    matches!(
+      (head_position(before.as_ref()), head_position(after.as_ref())),
+      (Some(shipped), Some(resumed)) if resumed > shipped + written_after
+    ),
+    "the restarted owner's log went on past the head it shipped before the restart, {written_after} writes on: \
+     {before:?} then {after:?}"
+  );
+  assert!(
+    served.is_some(),
+    "a survivor served every write, those made through the restarted owner among them: {counters:?}"
+  );
+}
+
+/// Format: the refusals [`write_files_through_transient`] sends again: the owner's lease not confirmed yet, which a
+/// restarted daemon meets until its candidates answer its probes again (§4.8 "Leases and reads"; it parks a verb for the
+/// lease bound first and refuses it only past that).
+const TRANSIENT_REFUSALS: [&str; 1] = ["LeaseUnconfirmed"];
+
+/// [`write_files`] through an owner whose daemon just restarted: each file's attach and write are made again while they
+/// are refused for now ([`TRANSIENT_REFUSALS`]), within the fleet wait; every refusal met, in order.
+fn write_files_through_transient(
+  owner: &str,
+  id: &str,
+  files: std::ops::Range<usize>,
+) -> Vec<String> {
+  let mut refusals = Vec::new();
+  for file in files {
+    let deadline = Instant::now() + FLEET_WAIT;
+    loop {
+      let (code, out, err) = run(owner, &["attach", id, "--write"]);
+      let transient = |err: &str| {
+        TRANSIENT_REFUSALS
+          .iter()
+          .any(|refusal| err.contains(refusal))
+      };
+      if code != 0 {
+        assert!(
+          transient(&err) && Instant::now() < deadline,
+          "attach for /file-{file}: {err}"
+        );
+        refusals.push(err.trim().to_owned());
+        pause();
+        continue;
+      }
+      let attachment = value_of(&out, "attachment");
+      let path = format!("/file-{file}");
+      let answered = run_with_stdin_within(
+        owner,
+        &["write", id, &attachment, &path],
+        live_body(file).as_bytes(),
+        FLEET_WAIT,
+      );
+      let Some((code, err)) = answered else {
+        panic!(
+          "a write of {path} through the restarted owner was never answered within {FLEET_WAIT:?}: {:?}",
+          live_line(owner, "shipping", id)
+        );
+      };
+      let (detached, _, detach_err) = run(owner, &["detach", &attachment]);
+      assert!(
+        detached == 0 || detach_err.contains("refused: NotFound"),
+        "detach: {detach_err}"
+      );
+      if code == 0 {
+        break;
+      }
+      assert!(
+        transient(&err) && Instant::now() < deadline,
+        "write {path}: {err}"
+      );
+      refusals.push(err.trim().to_owned());
+      pause();
+    }
+  }
+  refusals
+}
+
+/// [`run_with_stdin`] given `within` to exit: its exit code and standard error, or `None` once `within` has passed, the
+/// command then killed and reaped, so a reply the daemon never sends fails the flow rather than holding it for good (a
+/// restarted owner's log begun again at genesis held its first write past 23 minutes, the red run of 2026-11-18).
+fn run_with_stdin_within(
+  instance: &str,
+  args: &[&str],
+  input: &[u8],
+  within: Duration,
+) -> Option<(i32, String)> {
+  let mut child = spawned_with_stdin(instance, args, input, Stdio::null());
+  let deadline = Instant::now() + within;
+  loop {
+    match child.try_wait() {
+      Ok(Some(status)) => return Some((status.code().unwrap_or(-1), stderr_of(&mut child))),
+      Ok(None) => {}
+      Err(error) => panic!("waiting on `slates {}`: {error}", args.join(" ")),
+    }
+    if Instant::now() >= deadline {
+      let _ = child.kill();
+      let _ = child.wait();
+      return None;
+    }
+    pause();
+  }
+}
+
+/// `slates --instance <instance> <args>` started with `input` written to its standard input, its standard error piped
+/// and its standard output as `stdout` says.
+fn spawned_with_stdin(
+  instance: &str,
+  args: &[&str],
+  input: &[u8],
+  stdout: Stdio,
+) -> std::process::Child {
+  use std::io::Write;
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(stdout)
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child.stdin.take().unwrap().write_all(input).unwrap();
+  child
+}
+
+/// What an exited child wrote to its standard error.
+fn stderr_of(child: &mut std::process::Child) -> String {
+  use std::io::Read;
+  let mut err = String::new();
+  if let Some(mut stderr) = child.stderr.take() {
+    stderr.read_to_string(&mut err).unwrap();
+  }
+  err
 }
 
 // ── Every transport's durability claim on a live volume (A-200, AC-8.3): FUSE `fsync` and the NFS stable write and
@@ -2866,6 +3408,100 @@ fn a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
   assert_eq!(resumed.0, 0, "once the candidates are back, FSYNC succeeds");
 }
 
+/// Each instance's members as its `status` lists them (`fleet_members`, itself included).
+fn members_of_each(instances: &[String]) -> Vec<(String, Vec<String>)> {
+  instances
+    .iter()
+    .map(|instance| {
+      let (_, out, _) = run(instance, &["status"]);
+      let members = value_of(&out, "fleet_members")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+      (instance.clone(), members)
+    })
+    .collect()
+}
+
+/// §4.8 membership across an owner's warm restart: do restart, as a crash does, the daemon of the node that owns a
+/// volume (its anchor kept, so its member id is kept), then wait. Expect one membership again: every node lists every
+/// member, within four of the detector's membership horizons (`lease::horizon_ns`) after the restarted daemon
+/// answers: one to condemn what the others believed of the old process, one to spread its refutation, one to key a
+/// session afresh, and one for the load of the box the flows run on. Found by fixtures' primary-kill rungs (2026-11-07):
+/// after the primary restarted, the client node and the primary listed only each other and the two replicas only each
+/// other, never healing, so the owner could not commit and its lease never reconfirmed.
+#[test]
+fn a_fleet_is_one_membership_again_after_its_owners_warm_restart() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the membership-after-restart flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet_as("member-restart", "anchor");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "owned");
+  write_files(&owner, &id, 0..1);
+  let hosts: Vec<String> = fleet
+    .instances
+    .iter()
+    .map(|instance| value_of(&run_ready(instance, &["status"]), "fleet_host"))
+    .collect();
+  restart_warm(&owner);
+  let hosts_after: Vec<String> = fleet
+    .instances
+    .iter()
+    .map(|instance| value_of(&run_ready(instance, &["status"]), "fleet_host"))
+    .collect();
+  eprintln!("member restart: hosts before {hosts:?}, after {hosts_after:?} (owner {owner})");
+  let bound = Duration::from_nanos(slates_server::lease::horizon_ns().saturating_mul(4));
+  let began = Instant::now();
+  let whole = loop {
+    let views = members_of_each(&fleet.instances);
+    let one = views
+      .iter()
+      .all(|(_, members)| hosts.iter().all(|host| members.contains(host)));
+    if one || began.elapsed() > bound {
+      break (one, views);
+    }
+    pause();
+  };
+  let took = began.elapsed();
+  // Every node's whole status, for the record of a failing run.
+  for instance in &fleet.instances {
+    let (_, out, _) = run(instance, &["status"]);
+    let path = format!("{}/{instance}.status", env!("CARGO_TARGET_TMPDIR"));
+    #[allow(clippy::disallowed_methods)]
+    let _ = std::fs::write(&path, out);
+    eprintln!("member restart: status of {instance} at {path}");
+  }
+  let counters: Vec<_> = fleet
+    .instances
+    .iter()
+    .map(|instance| {
+      let (_, out, _) = run(instance, &["status"]);
+      let detector: Vec<String> = out
+        .lines()
+        .filter(|line| line.starts_with("fleet_detector ") || line.starts_with("restarts:"))
+        .map(|line| line.chars().take(160).collect())
+        .collect();
+      (instance.clone(), detector)
+    })
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "member restart: one membership {} after {took:?} (bound {bound:?}); members {:?}; {counters:?}",
+    whole.0, whole.1
+  );
+  assert!(
+    whole.0,
+    "every node lists every member within {bound:?} of the owner's warm restart: {:?}",
+    whole.1
+  );
+}
+
 /// This node's council voters, as `status` reports them (`None` while it does not answer).
 fn council_voters(instance: &str) -> Option<usize> {
   let (code, out, _) = run(instance, &["status"]);
@@ -3239,31 +3875,6 @@ fn a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates() {
 /// The pid of `instance`'s daemon, as its `status` reports it (under an anchor, the anchor's child).
 fn daemon_pid_of(instance: &str) -> String {
   value_of(&run_ready(instance, &["status"]), "pid")
-}
-
-/// Sends the signal `flag` (`-STOP`, `-CONT`, `-KILL`) to the process `pid`.
-fn signal_pid(pid: &str, flag: &str) {
-  let sent = Command::new("kill").args([flag, pid]).status().unwrap();
-  assert!(sent.success(), "kill {flag} {pid}");
-}
-
-/// Restarts `instance`'s daemon as a crash does, its anchor kept (a warm restart): kills the daemon's process (SIGKILL)
-/// and waits until its replacement answers.
-fn restart_warm(instance: &str) {
-  let pid = daemon_pid_of(instance);
-  signal_pid(&pid, "-KILL");
-  let started = Instant::now();
-  loop {
-    let (code, out, _) = run(instance, &["status"]);
-    if code == 0 && value_of(&out, "pid") != pid {
-      return;
-    }
-    assert!(
-      started.elapsed() < FLEET_WAIT,
-      "the anchor replaced {instance}'s daemon"
-    );
-    pause();
-  }
 }
 
 /// §4.8 "Promotion and takeover" across a voter's warm restart: do write a live volume's files (held by the owner and

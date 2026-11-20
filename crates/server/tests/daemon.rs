@@ -222,6 +222,23 @@ fn daemon(name: &str) -> (Daemon, String) {
   (daemon, instance)
 }
 
+/// §2.6 boot step 2 (A-312). Do: start a daemon of [`TEST_SHARDS`] shards and ask how often its start beat. Expect at least
+/// once for every ordered pair of its shards (the runtime's pair rings, the start's work that grows fastest) and once for
+/// each shard, before its watchdog took the beat over. A start beats as it goes, so the anchor, which kills a start whose
+/// one thread runs a window of CPU without a beat, never kills one that progresses, however many shards it starts.
+/// Before, nothing beat until the watchdog ran, and the anchor killed every 407-shard start on B10's Linux gate at load 70.
+#[test]
+fn a_daemons_start_beats_at_every_unit_of_its_work() {
+  let (daemon, _) = daemon("start-beats");
+  let shards = u64::from(TEST_SHARDS);
+  let least = shards * (shards - 1) + shards;
+  assert!(
+    daemon.start_beats() >= least,
+    "a start of {shards} shards beat {} times, under its {least} units",
+    daemon.start_beats()
+  );
+}
+
 /// A-254, under A-176 and A-178's rule. Do: start a daemon that creates its own segment (run alone, with no anchor); start a
 /// second daemon for the same instance and segment name. Expect the second refused and the first's segment still there
 /// to attach by its handoff: a refused start leaves a running instance untouched. Before, on macOS, the second start
@@ -354,7 +371,7 @@ fn choosing_fewer_shards_keeps_the_hosts_capacity_available_for_admission() {
       "create {sequence}: {reply:?}"
     );
   }
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list the admitted volumes");
   };
   assert_eq!(volumes.len(), SDK_CREATE_COUNT);
@@ -434,7 +451,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
   );
   let cancelled = status_cursor(&first.call_once(&RequestBody::DaemonStatus));
   assert!(matches!(
-    first.call(&RequestBody::List),
+    first.call(&RequestBody::List { after: None }),
     ReplyBody::Listed { .. }
   ));
   assert_eq!(
@@ -587,7 +604,7 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
   for _ in 0..TEST_SHARDS {
     let mut client = Client::connect(&instance);
     assert!(matches!(
-      client.call(&RequestBody::List),
+      client.call(&RequestBody::List { after: None }),
       ReplyBody::Listed { .. }
     ));
   }
@@ -670,7 +687,7 @@ fn an_idle_daemon_parks_once_its_clients_windows_have_passed() {
   for _ in 0..TEST_SHARDS {
     let mut client = Client::connect(&instance);
     assert!(matches!(
-      client.call(&RequestBody::List),
+      client.call(&RequestBody::List { after: None }),
       ReplyBody::Listed { .. }
     ));
   }
@@ -771,7 +788,7 @@ fn a_write_the_declared_durability_cannot_cover_is_refused_typed() {
     "the failure count is the one the policy was stated under"
   );
   // Reads continue: the listing answers (empty — nothing was created), and the status counts the refusal.
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     strict.stop();
     panic!("a read is served while writes are refused");
   };
@@ -885,7 +902,7 @@ fn attach_and_status(client: &mut Client, id: slates_ipc::protocol::VolumeId) ->
 
 /// List shows both volumes; detach releases the lease.
 fn list_and_detach(client: &mut Client, id: slates_ipc::protocol::VolumeId, attachment: u64) {
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list");
   };
   let mut names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
@@ -925,7 +942,7 @@ fn resize_and_destroy(client: &mut Client, id: slates_ipc::protocol::VolumeId) {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     let names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
@@ -970,7 +987,7 @@ fn rifl_scenario() {
     panic!("retry");
   };
   assert_eq!(again, volume);
-  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
     panic!("list");
   };
   assert_eq!(volumes.len(), 1, "the retry did not execute again");
@@ -1066,6 +1083,7 @@ fn grant_scenario() {
       target: elsewhere.path.clone(),
       filter: Filter::default(),
       grant: Some(grant),
+      signature: None,
     }),
     ReplyBody::Refused {
       refusal: Refusal::GrantMismatch
@@ -1076,23 +1094,34 @@ fn grant_scenario() {
     0,
     "a grant for one target wrote into another"
   );
-  // The landing runs under its grant, and `grants` lists it — across shards (the grant record lives on
-  // the volume's owner shard, not necessarily the client's).
+  // The landing runs under its grant. A grant once used is consumed, and a consumed grant leaves the table (A-266):
+  // `grants`, across shards (the record lives on the volume's owner shard), lists none, and its history is the audit's.
   let landed = client.call(&RequestBody::Land {
     volume: id,
     snapshot: Some(snapshot),
     target: target.path.clone(),
     filter: Filter::default(),
     grant: Some(grant),
+    signature: None,
   });
   let ReplyBody::Landed { outcome } = landed else {
     panic!("the granted landing lands: {landed:?}")
   };
   assert_landed_reply_carries_what_it_achieved(&outcome);
   assert!(matches!(
-    client.call(&RequestBody::Grants),
-    ReplyBody::Grants { grants } if grants.len() == 1 && grants[0].id == grant
+    client.call(&RequestBody::Grants { after: None }),
+    ReplyBody::Grants { grants, .. } if grants.is_empty()
   ));
+  let ReplyBody::Audit { records, .. } = client.call(&RequestBody::Audit { since: 0 }) else {
+    panic!("the audit");
+  };
+  assert!(
+    records
+      .iter()
+      .any(|r| r.kind == "grant_issued" && r.grant == Some(grant))
+      && records.iter().any(|r| r.kind == "landing_finished"),
+    "the consumed grant's history is the audit's: {records:?}"
+  );
   daemon.stop();
 }
 
@@ -1159,6 +1188,7 @@ fn present_landing(
     target: target.to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   });
   let ReplyBody::GrantRequired {
     landing, manifest, ..
@@ -1195,6 +1225,7 @@ fn present_named(
     target: target.to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   });
   let ReplyBody::GrantRequired {
     landing, manifest, ..
@@ -1239,6 +1270,7 @@ fn a_granted_landing_consumes_its_presentation() {
       target: target.path.clone(),
       filter: Filter::default(),
       grant: Some(grant),
+      signature: None,
     });
     assert!(matches!(landed, ReplyBody::Landed { .. }), "{landed:?}");
     assert_eq!(
@@ -1309,6 +1341,7 @@ fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
     target: target.path.clone(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   });
   let ReplyBody::GrantRequired {
     landing,
@@ -1333,6 +1366,7 @@ fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
     target: target.path.clone(),
     filter: Filter::default(),
     grant: Some(grant),
+    signature: None,
   });
   #[allow(clippy::disallowed_methods)] // reading the target back, read-only
   let on_disk = std::fs::read(format!("{}/b.txt", target.path)).unwrap();
@@ -1341,7 +1375,7 @@ fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
   assert!(
     matches!(
       &landed,
-      ReplyBody::Refused { refusal: Refusal::LandingConflict { entries } } if entries == &["/b.txt".to_owned()]
+      ReplyBody::Refused { refusal: Refusal::LandingConflict { entries, .. } } if entries == &["/b.txt".to_owned()]
     ),
     "the conflict names /b.txt alone: {landed:?}"
   );
@@ -1371,8 +1405,8 @@ fn forged_approval_is_refused(client: &mut Client, landing: u64, manifest: [u8; 
   );
   assert!(
     matches!(
-      client.call(&RequestBody::Grants),
-      ReplyBody::Grants { grants } if grants.is_empty()
+      client.call(&RequestBody::Grants { after: None }),
+      ReplyBody::Grants { grants, .. } if grants.is_empty()
     ),
     "a forged approval issued nothing"
   );
@@ -1421,19 +1455,22 @@ fn landing_refusal_scenario() {
       target: "/nonexistent/slates/land/target".to_owned(),
       filter: slates_ipc::protocol::Filter::default(),
       grant: None,
+      signature: None,
     }),
     ReplyBody::Refused {
-      refusal: Refusal::TargetUnavailable { .. }
+      refusal: Refusal::Target {
+        refusal: slates_ipc::protocol::TargetRefusal::Missing
+      }
     }
   ));
   // The caller has no grants and the audit log is empty (the refused landing recorded nothing).
   assert!(matches!(
-    client.call(&RequestBody::Grants),
-    ReplyBody::Grants { grants } if grants.is_empty()
+    client.call(&RequestBody::Grants { after: None }),
+    ReplyBody::Grants { grants, .. } if grants.is_empty()
   ));
   assert!(matches!(
     client.call(&RequestBody::Audit { since: 0 }),
-    ReplyBody::Audit { records } if records.is_empty()
+    ReplyBody::Audit { records, .. } if records.is_empty()
   ));
   daemon.stop();
 }
@@ -1477,12 +1514,7 @@ fn bulk_and_overlay_scenario() {
   }) else {
     panic!("create overlay");
   };
-  let ReplyBody::BaseBytes { bytes } = client.call(&RequestBody::ReadBase {
-    volume: overlay,
-    path: "/lib.rs".into(),
-  }) else {
-    panic!("read_base");
-  };
+  let bytes = read_base_whole(&mut client, overlay, "/lib.rs");
   assert!(
     bytes.starts_with(b"//! `slates-server`"),
     "the base is read from the disk"
@@ -1501,7 +1533,8 @@ fn bulk_and_overlay_scenario() {
   assert!(matches!(
     client.call(&RequestBody::ReadBase {
       volume: id,
-      path: "/x".into()
+      path: "/x".into(),
+      offset: 0,
     }),
     ReplyBody::Refused {
       refusal: Refusal::Unsupported { .. }
@@ -1620,7 +1653,7 @@ fn a_consumer_lists_the_shared_volume_and_not_an_unshared_one(
   let ReplyBody::Created { id: private } = owner.call(&scratch("owner-kept-private")) else {
     panic!("create the owner-only volume");
   };
-  let ReplyBody::Listed { volumes } = workload.call(&RequestBody::List) else {
+  let ReplyBody::Listed { volumes, .. } = workload.call(&RequestBody::List { after: None }) else {
     panic!("the consumer lists its accessible volumes");
   };
   let ids: Vec<VolumeId> = volumes.iter().map(|v| v.id).collect();
@@ -1799,7 +1832,7 @@ fn once_revoked_every_verb_refuses_before_any_effect(
     }
   ));
   assert!(matches!(
-    workload.call(&RequestBody::List),
+    workload.call(&RequestBody::List { after: None }),
     ReplyBody::Refused {
       refusal: Refusal::ConsumerRevoked
     }
@@ -1984,12 +2017,7 @@ fn digest_scenario() {
   }) else {
     panic!("create overlay");
   };
-  let ReplyBody::BaseBytes { bytes } = client.call(&RequestBody::ReadBase {
-    volume: overlay,
-    path: "/lib.rs".into(),
-  }) else {
-    panic!("read_base");
-  };
+  let bytes = read_base_whole(&mut client, overlay, "/lib.rs");
   let digest = RequestBody::Digest {
     volume: overlay,
     path: "/lib.rs".into(),
@@ -2060,10 +2088,11 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
-/// small enough that one big-quota volume's inode allowance reserves all of it above the copy-up
-/// headroom. So a further volume is refused by the §4.2 *reservation* while physical slots plainly
-/// remain — the honesty the reservation adds over the bare per-volume cap (a raw `SlabFull` would
-/// only fire once the slab were physically exhausted, which it is not here).
+/// small enough that a bounded claim's allowance and a dynamic volume's inodes take all of it above
+/// the copy-up headroom. So a further volume is refused by the §4.2 *reservation* while physical slots
+/// plainly remain (the claim's reserved slots it has not used yet) — the honesty the reservation adds
+/// over the bare per-volume cap (a raw `SlabFull` would only fire once the slab were physically
+/// exhausted, which it is not here).
 const SMALL_VERSION_SLAB: usize = 64;
 /// Shape: refused-create attempts against a full version budget — enough that, were a partial volume
 /// allocated and leaked on each refusal (the pre-reorder bug), the trie slab would physically fill
@@ -2073,11 +2102,14 @@ const LEAK_PROBES: usize = 24;
 /// Shape: the capped daemon's arena, sized with its slab so a slot is about 1 MiB of quota (A-109: a volume's inode
 /// allowance is its quota's share of the slab, the arena over the slab per inode).
 const SLAB_RESERVE: u64 = 64 << 20;
-/// Shape: a dynamic maximum of twice the arena, so its inode allowance is every reservable slot (the bytes per inode
-/// round up, so the arena itself would leave one). Being dynamic, it reserves no bytes, so a refusal after it is the
-/// version reservation's alone.
+/// Shape: a dynamic maximum of twice the arena, so its derived inode allowance is every reservable slot: a ceiling it
+/// reserves nothing of (A-342), as a kiln agent volume's quarter of the machine's memory is. Being dynamic, it reserves
+/// no bytes either.
 const SLAB_FILLER_MAX: u64 = 2 * SLAB_RESERVE;
-/// Shape: a probe's dynamic maximum: one byte, one slot, no bytes reserved.
+/// Shape: a bounded claim of a quarter of the arena: about a quarter of the slab reserved whole, the rest left
+/// unpromised, and its bytes well inside what the capped arena admits.
+const CLAIM_LIMIT: u64 = SLAB_RESERVE / 4;
+/// Shape: a probe's maximum (or a claim shrunk to it): one byte, one slot.
 const PROBE_MAX: u64 = 1;
 
 /// A test daemon whose inode-version slab is `max_inodes` slots, on a single shard so every volume
@@ -2103,37 +2135,107 @@ fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
   (daemon, instance)
 }
 
-/// The §4.2 inode-dimension *reservation*, through the real create and destroy verbs (no mount): a
-/// volume's inode allowance is reserved against the shard's version slab at create, so a second
-/// volume whose allowance the slab cannot also back is refused (`BudgetExceeded`) even though byte
-/// space plainly remains — the disjoint reservation the bare per-volume cap does not give — and the
-/// slab returns on destroy so a later volume is admitted again. Non-vacuous: the byte budget is far
-/// larger than these small quotas, so only the version reservation can refuse the second volume;
-/// without it, both would be created.
-fn version_reservation_scenario() {
-  let (daemon, instance) = capped_daemon("versions", SMALL_VERSION_SLAB);
-  let mut client = Client::connect(&instance);
-  let sized = |name: &str, max: u64| RequestBody::Create {
+fn sized(name: &str, size: SizeClass) -> RequestBody {
+  RequestBody::Create {
     name: name.to_owned(),
-    size: SizeClass::Dynamic { max },
+    size,
     names: NamePolicy::Exact,
     require_locked: false,
     base: None,
+  }
+}
+
+/// Acknowledges every completion `client` was answered so far, so the records it leaves unacknowledged stay a small
+/// window (the raw test client never acknowledges on its own).
+fn acknowledge(client: &mut Client) {
+  let up_to = client.sequence;
+  let ReplyBody::Acknowledged = client.call(&RequestBody::Acknowledge {
+    up_to,
+    owed: Vec::new(),
+  }) else {
+    panic!("acknowledge");
   };
-  // The first volume's inode allowance fills the version slab (less the one-slot copy-up headroom).
-  let first = client.call(&sized("first", SLAB_FILLER_MAX));
-  let ReplyBody::Created { id: first } = first else {
-    panic!("first create: {first:?}");
+}
+
+/// Makes empty files in `volume` until one is refused: how many were made, and the refusal. Empty files cost no bytes,
+/// so only the inode dimension refuses them. Every [`ACK_EVERY`] files the completions are acknowledged.
+fn fill_with_empty_files(client: &mut Client, volume: VolumeId) -> (u64, Refusal) {
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach");
   };
+  let slab = u64::try_from(SMALL_VERSION_SLAB).unwrap();
+  let mut made = 0u64;
+  loop {
+    assert!(made <= slab, "more empty files than the slab has slots");
+    match client.call(&RequestBody::FsWrite {
+      volume,
+      attachment,
+      path: format!("f{made}"),
+      bytes: Vec::new(),
+      mode: 0o644,
+    }) {
+      ReplyBody::Refused { refusal } => {
+        acknowledge(client);
+        return (made, refusal);
+      }
+      _ => made += 1,
+    }
+    if made.is_multiple_of(u64::try_from(ACK_EVERY).unwrap()) {
+      acknowledge(client);
+    }
+  }
+}
+
+/// The slab with no slot left unpromised: a bounded claim of [`CLAIM_LIMIT`] reserved whole, and a dynamic volume grown
+/// into every other slot, a slot per empty file, until its next file is refused `NoSpace` (A-342). The claim and the
+/// dynamic volume.
+fn fill_the_slab(client: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::Created { id: claim } =
+    client.call(&sized("claim", SizeClass::Bounded { limit: CLAIM_LIMIT }))
+  else {
+    panic!("the claim");
+  };
+  let ReplyBody::Created { id: grower } = client.call(&sized(
+    "grower",
+    SizeClass::Dynamic {
+      max: SLAB_FILLER_MAX,
+    },
+  )) else {
+    panic!("the dynamic volume");
+  };
+  let (made, refusal) = fill_with_empty_files(client, grower);
+  assert!(
+    made > 0 && matches!(refusal, Refusal::NoSpace),
+    "a dynamic volume grows into the unpromised slots, then ENOSPC: {made} files, {refusal:?}"
+  );
+  (claim, grower)
+}
+
+/// The §4.2 inode dimension through the real create, write and destroy verbs (no mount): a bounded
+/// claim's inode allowance is reserved against the shard's version slab at create, and a dynamic volume
+/// holds a slot for each inode it makes from what no claim was promised (A-342); with none left, a
+/// further volume is refused (`BudgetExceeded`) even though byte space and physical slots plainly
+/// remain — the disjoint reservation the bare per-volume cap does not give — and the slots return on
+/// destroy so a later volume is admitted again. Non-vacuous: the byte budget is far larger than these
+/// empty files and probes need, so only the version slab can refuse them.
+fn version_reservation_scenario() {
+  let (daemon, instance) = capped_daemon("versions", SMALL_VERSION_SLAB);
+  let mut client = Client::connect(&instance);
+  let (_claim, grower) = fill_the_slab(&mut client);
   // Many further creates cannot be backed by the slab, so admission refuses each — not for want of
   // bytes. Every one must refuse at the *reservation* (`BudgetExceeded`), never with `SlabFull`:
-  // that is the leak proof. The reservation is taken before `Volume::create`, so a refusal allocates
-  // no root inode, trie or dir. Were a partial volume leaked on each refusal instead, these probes
-  // would physically exhaust the trie slab within a handful of attempts and later refusals would
-  // become `SlabFull` (a `BadRequest`) — which this asserts never happens.
+  // that is the leak proof. The slot is taken before `Volume::create` returns a volume to publish, so
+  // a refusal leaks no root inode, trie or dir. Were a partial volume leaked on each refusal instead,
+  // these probes would physically exhaust the trie slab within a handful of attempts and later
+  // refusals would become `SlabFull` (a `BadRequest`) — which this asserts never happens.
   for probe in 0..LEAK_PROBES {
     let name = format!("probe-{probe}");
-    match client.call(&sized(&name, PROBE_MAX)) {
+    match client.call(&sized(&name, SizeClass::Dynamic { max: PROBE_MAX })) {
       ReplyBody::Refused {
         refusal: Refusal::BudgetExceeded { .. },
       } => {}
@@ -2142,17 +2244,17 @@ fn version_reservation_scenario() {
       }
     }
   }
-  // Destroy the first; its reserved slots return to the slab as the destroy completes in slices.
+  // Destroy the dynamic volume; its hold returns to the slab as the destroy completes in slices.
   assert!(matches!(
-    client.call(&RequestBody::Destroy { volume: first }),
+    client.call(&RequestBody::Destroy { volume: grower }),
     ReplyBody::Destroyed
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
-    if volumes.is_empty() {
+    if !volumes.iter().any(|v| v.id == grower) {
       break;
     }
     assert!(
@@ -2160,40 +2262,28 @@ fn version_reservation_scenario() {
       "destroy completes in slices: {volumes:?}"
     );
   }
-  // With the slab returned, a fresh volume is admitted again — the reservation is released on teardown.
+  // With the hold returned, a fresh volume is admitted again — the hold is released on teardown.
   assert!(
     matches!(
-      client.call(&sized("third", PROBE_MAX)),
+      client.call(&sized("third", SizeClass::Dynamic { max: PROBE_MAX })),
       ReplyBody::Created { .. }
     ),
-    "the slab freed by destroy backs a new volume's allowance"
+    "the slots freed by destroy back a new volume"
   );
   daemon.stop();
 }
 
-/// The inode reservation moves with the policy on resize (§4.2): a volume whose allowance fills the
-/// version slab, resized down, returns slots so another volume is admitted — proof the reservation
-/// tracks the resized allowance, not the create-time one. Non-vacuous: without the re-derivation the
-/// resized volume keeps its old (larger) reservation and the second volume stays refused.
+/// A bounded claim's inode reservation moves with its policy on resize (§4.2): with every slot the claim
+/// left held by a dynamic volume's inodes, a further volume is refused; the claim resized down returns
+/// slots, and the further volume is admitted — proof the reservation tracks the resized allowance, not
+/// the create-time one. Non-vacuous: without the re-derivation the claim keeps its old (larger)
+/// reservation and the further volume stays refused.
 fn version_reservation_moves_on_resize_scenario() {
   let (daemon, instance) = capped_daemon("resize-versions", SMALL_VERSION_SLAB);
   let mut client = Client::connect(&instance);
-  let sized = |name: &str, size: SizeClass| RequestBody::Create {
-    name: name.to_owned(),
-    size,
-    names: NamePolicy::Exact,
-    require_locked: false,
-    base: None,
-  };
   let tiny = SizeClass::Dynamic { max: PROBE_MAX };
-  // A big-maximum volume's allowance fills the version slab.
-  let filler_size = SizeClass::Dynamic {
-    max: SLAB_FILLER_MAX,
-  };
-  let ReplyBody::Created { id: filler } = client.call(&sized("filler", filler_size)) else {
-    panic!("filler create");
-  };
-  // A second volume, however small, cannot be backed while the filler holds the whole slab.
+  let (claim, _grower) = fill_the_slab(&mut client);
+  // A further volume, however small, cannot be backed while the claim and the grower hold the slab.
   assert!(
     matches!(
       client.call(&sized("tenant", tiny)),
@@ -2201,14 +2291,14 @@ fn version_reservation_moves_on_resize_scenario() {
         refusal: Refusal::BudgetExceeded { .. }
       }
     ),
-    "the version slab is full while the filler holds its whole allowance"
+    "the version slab is full while the claim holds its whole allowance"
   );
-  // Resize the filler down to a tiny quota: its inode allowance shrinks and returns slots.
+  // Resize the claim down to a tiny quota: its inode allowance shrinks and returns slots.
   assert!(
     matches!(
       client.call(&RequestBody::Resize {
-        volume: filler,
-        size: SizeClass::Dynamic { max: PROBE_MAX }
+        volume: claim,
+        size: SizeClass::Bounded { limit: PROBE_MAX }
       }),
       ReplyBody::Resized
     ),
@@ -2225,9 +2315,10 @@ fn version_reservation_moves_on_resize_scenario() {
   daemon.stop();
 }
 
-/// The shard's version-slab reservation is observable in the daemon status (§4.2 "statfs includes
+/// The shard's version-slab commitments are observable in the daemon status (§4.2 "statfs includes
 /// backed inode availability", at the shard level): the reported slab capacity is the configured
-/// one, and committed version slots move as a volume's inode allowance is reserved.
+/// one, and committed version slots move as a volume's are committed — a bounded claim's allowance,
+/// a dynamic volume's hold for its root (A-342).
 fn version_stats_scenario() {
   let (daemon, instance) = capped_daemon("version-stats", SMALL_VERSION_SLAB);
   let mut client = Client::connect(&instance);
@@ -2251,19 +2342,14 @@ fn version_stats_scenario() {
     "the reported version slab is the configured capacity"
   );
   assert_eq!(before, 0, "no volumes yet, nothing committed to the slab");
-  let ReplyBody::Created { .. } = client.call(&RequestBody::Create {
-    name: "vol".into(),
-    size: SizeClass::Dynamic { max: 1 << 20 },
-    names: NamePolicy::Exact,
-    require_locked: false,
-    base: None,
-  }) else {
+  let ReplyBody::Created { .. } = client.call(&sized("vol", SizeClass::Dynamic { max: 1 << 20 }))
+  else {
     panic!("create");
   };
   let (_, after) = stats(&mut client);
   assert!(
     after > before,
-    "a volume's inode allowance is committed against the version slab: {after}"
+    "a volume's slots are committed against the version slab: {after}"
   );
   daemon.stop();
 }
@@ -2600,7 +2686,7 @@ fn snapshot_destroy_scenario() {
   ));
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     if volumes.iter().all(|v| v.name != "clone") {
@@ -2737,16 +2823,13 @@ fn a_foreign_principal_cannot_drive_another_accounts_merge() {
       path: "d".to_owned(),
     },
   }));
-  assert_foreign_merge_refused(intruder.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::submit(work, Vec::new())));
   assert_foreign_merge_refused(intruder.call(&RequestBody::Rebase { work }));
   // The green never advanced under the foreign calls; the owner still drives its own submit to success.
-  let ReplyBody::Submitted { version, conflicts } = owner.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = owner.call(&RequestBody::submit(work, Vec::new()))
+  else {
     panic!("the owner submits its own work");
   };
   assert!(
@@ -2782,10 +2865,7 @@ fn a_shared_green_is_read_and_worked_by_the_principal_it_names() {
   ));
   let (green, work) = owner_green_and_work(&mut owner);
   assert!(matches!(
-    owner.call(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    }),
+    owner.call(&RequestBody::submit(work, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -2823,14 +2903,8 @@ fn the_sharer_reads_and_works_the_green(sharer: &mut Client, green: VolumeId) {
     ReplyBody::Versions { head: 1 }
   );
   assert_eq!(
-    sharer.call(&RequestBody::Read {
-      volume: green,
-      path: "f".to_owned(),
-      at: ReadAt::Head,
-    }),
-    ReplyBody::ReadBytes {
-      bytes: b"owned".to_vec()
-    }
+    read(sharer, green, "f", ReadAt::Head),
+    Ok(b"owned".to_vec())
   );
   let ReplyBody::WorkCreated { id: own, base } = sharer.call(&RequestBody::CreateWork {
     green,
@@ -2849,10 +2923,7 @@ fn the_sharer_reads_and_works_the_green(sharer: &mut Client, green: VolumeId) {
     }),
     ReplyBody::Edited
   ));
-  let submitted = sharer.call(&RequestBody::Submit {
-    work: own,
-    evidence: Vec::new(),
-  });
+  let submitted = sharer.call(&RequestBody::submit(own, Vec::new()));
   assert!(
     matches!(
       submitted,
@@ -2908,10 +2979,10 @@ fn merge_submit_scenario() {
   declare(&mut client, b, b"world");
 
   // A merges on the fast path; the chain advances.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
-    work: a,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::submit(a, Vec::new()))
+  else {
     panic!("submit a");
   };
   assert!(
@@ -2925,15 +2996,19 @@ fn merge_submit_scenario() {
   assert_eq!(head, 1, "the green advanced to version 1");
 
   // The chain's read side: the file A committed changed after version 0, but not after version 1.
-  let ReplyBody::ChangedSince { paths } =
-    client.call(&RequestBody::ChangedSince { green, version: 0 })
-  else {
+  let ReplyBody::ChangedSince { paths, .. } = client.call(&RequestBody::ChangedSince {
+    green,
+    version: 0,
+    from: None,
+  }) else {
     panic!("changed_since");
   };
   assert_eq!(paths, vec!["f".to_owned()], "f changed after version 0");
-  let ReplyBody::ChangedSince { paths } =
-    client.call(&RequestBody::ChangedSince { green, version: 1 })
-  else {
+  let ReplyBody::ChangedSince { paths, .. } = client.call(&RequestBody::ChangedSince {
+    green,
+    version: 1,
+    from: None,
+  }) else {
     panic!("changed_since");
   };
   assert!(
@@ -2942,10 +3017,10 @@ fn merge_submit_scenario() {
   );
 
   // B, still based on version 0, touched the same file — it conflicts rather than clobbering A.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
-    work: b,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::submit(b, Vec::new()))
+  else {
     panic!("submit b");
   };
   assert_eq!(version, None, "B is not accepted");
@@ -2990,10 +3065,7 @@ fn merge_modify_scenario() {
   };
   edit(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3008,10 +3080,10 @@ fn merge_modify_scenario() {
   };
   assert_eq!(base, 1, "the work is based on the green's head, version 1");
   edit(&mut client, modw, 0, 5, b"world");
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
-    work: modw,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::submit(modw, Vec::new()))
+  else {
     panic!("submit");
   };
   assert!(
@@ -3060,10 +3132,7 @@ fn merge_lagging_scenario() {
   let (seed, _) = work(&mut client, "seed");
   create_file(&mut client, seed, "base", b"x");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3077,20 +3146,17 @@ fn merge_lagging_scenario() {
   create_file(&mut client, b, "b", b"b-content");
   // B submits first, advancing the green to version 2; A now lags at base 1.
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: b,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(b, Vec::new())),
     ReplyBody::Submitted {
       version: Some(2),
       ..
     }
   ));
   // A, based on version 1, touched a different file — it merges past version 2 as version 3.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
-    work: a,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::submit(a, Vec::new()))
+  else {
     panic!("submit a");
   };
   assert!(
@@ -3149,7 +3215,9 @@ fn green_head(client: &mut Client, green: slates_ipc::protocol::VolumeId) -> u64
 fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId) {
   let tail = work_over(client, green, "tail");
   edit_f(client, tail, 8, 2, b"YY");
-  let ReplyBody::Rebased { version, conflicts } = client.call(&RequestBody::Rebase { work: tail })
+  let ReplyBody::Rebased {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Rebase { work: tail })
   else {
     panic!("rebase");
   };
@@ -3160,10 +3228,10 @@ fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId)
   assert_eq!(version, Some(2), "the work is rebased onto the head");
   assert_eq!(green_head(client, green), 2, "a rebase commits nothing");
 
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
-    work: tail,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::submit(tail, Vec::new()))
+  else {
     panic!("submit");
   };
   assert!(
@@ -3182,16 +3250,15 @@ fn rebase_conflict_part(client: &mut Client, green: slates_ipc::protocol::Volume
   edit_f(client, winner, 0, 2, b"PP");
   edit_f(client, loser, 0, 2, b"QQ");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: winner,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(winner, Vec::new())),
     ReplyBody::Submitted {
       version: Some(4),
       ..
     }
   ));
-  let ReplyBody::Rebased { version, conflicts } = client.call(&RequestBody::Rebase { work: loser })
+  let ReplyBody::Rebased {
+    version, conflicts, ..
+  } = client.call(&RequestBody::Rebase { work: loser })
   else {
     panic!("rebase loser");
   };
@@ -3227,10 +3294,7 @@ fn merge_rebase_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"0123456789");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3239,10 +3303,7 @@ fn merge_rebase_scenario() {
   let front = work_over(&mut client, green, "front");
   edit_f(&mut client, front, 0, 0, b"AB");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: front,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(front, Vec::new())),
     ReplyBody::Submitted {
       version: Some(2),
       ..
@@ -3294,10 +3355,10 @@ fn declare_metadata_part(client: &mut Client, green: slates_ipc::protocol::Volum
       mode: 0o644,
     },
   );
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
-    work: meta,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::submit(meta, Vec::new()))
+  else {
     panic!("submit meta");
   };
   assert!(
@@ -3335,19 +3396,17 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   let other = set(client, "xattr-c", b"BB");
 
   // The first sets the attribute; it advances the green to version 3, storing "AA".
-  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::Submit {
-    work: first,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::submit(first, Vec::new()))
+  else {
     panic!("submit xattr-a");
   };
   assert_eq!(version, Some(3), "the first xattr set is version 3");
 
   // The second, based on 2, sets a different value — it conflicts against the stored "AA".
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
-    work: other,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&RequestBody::submit(other, Vec::new()))
+  else {
     panic!("submit xattr-c");
   };
   assert_eq!(
@@ -3357,6 +3416,51 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   assert!(
     conflicts.iter().any(|w| w.path == "f"),
     "the conflict names the file: {conflicts:?}"
+  );
+}
+
+/// A-290: a guest's own attribute namespaces are its kernel's to set, and a declaration is a host's channel. Do: on a
+/// work, declare `security.capability` and `trusted.overlay.opaque` set, then `trusted.overlay.opaque` removed, then a
+/// `user.` attribute set. Expect each of the guest's names refused `Unsupported`, naming the attribute, and the
+/// `user.` one declared on the same work.
+fn declare_guest_attribute_part(client: &mut Client, green: slates_ipc::protocol::VolumeId) {
+  use slates_ipc::protocol::WorkOp;
+  let work = work_over(client, green, "guest-attributes");
+  for op in [
+    WorkOp::SetXattr {
+      path: "f".to_owned(),
+      name: "security.capability".to_owned(),
+      value: vec![1, 0, 0, 2],
+    },
+    WorkOp::SetXattr {
+      path: "f".to_owned(),
+      name: "trusted.overlay.opaque".to_owned(),
+      value: b"y".to_vec(),
+    },
+    WorkOp::RemoveXattr {
+      path: "f".to_owned(),
+      name: "trusted.overlay.opaque".to_owned(),
+    },
+  ] {
+    let name = match &op {
+      WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } => name.clone(),
+      _ => panic!("only attribute declarations are made here"),
+    };
+    match client.call(&RequestBody::Declare { work, op }) {
+      ReplyBody::Refused {
+        refusal: Refusal::Unsupported { feature },
+      } => assert!(feature.contains(&name), "{feature}"),
+      other => panic!("a host's channel declared {name}: {other:?}"),
+    }
+  }
+  declare(
+    client,
+    work,
+    WorkOp::SetXattr {
+      path: "f".to_owned(),
+      name: "user.kept".to_owned(),
+      value: b"v".to_vec(),
+    },
   );
 }
 
@@ -3377,10 +3481,7 @@ fn merge_declare_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3388,6 +3489,7 @@ fn merge_declare_scenario() {
   ));
   declare_metadata_part(&mut client, green);
   declare_xattr_part(&mut client, green);
+  declare_guest_attribute_part(&mut client, green);
   daemon.stop();
 }
 
@@ -3423,7 +3525,7 @@ fn declared_ipc_metadata_merges_over_the_wire_and_retains_its_old_version() {
   submit_accepted(&mut client, first, 1);
   let reply = client.call(&submit_of(other));
   assert!(
-    matches!(reply, ReplyBody::Submitted { version: None, ref conflicts }
+    matches!(reply, ReplyBody::Submitted { version: None, ref conflicts, .. }
     if conflicts.iter().any(|window| window.path == "pipe")),
     "metadata differs: {reply:?}"
   );
@@ -3572,7 +3674,7 @@ fn create_until_the_ledger_refuses(client: &mut Client) -> Vec<slates_ipc::proto
 fn wait_for_volume_count(client: &mut Client, count: usize) {
   let started = Instant::now();
   loop {
-    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
     };
     if volumes.len() == count {
@@ -3618,14 +3720,58 @@ fn read(
   path: &str,
   at: ReadAt,
 ) -> Result<Vec<u8>, Refusal> {
-  match client.call(&RequestBody::Read {
+  // One page from the start: every file these tests read fits one (`ReadRange`; the whole-file `Read` is gone, A-267).
+  match client.call(&RequestBody::ReadRange {
     volume,
     path: path.to_owned(),
     at,
+    offset: 0,
+    max: u64::MAX,
   }) {
-    ReplyBody::ReadBytes { bytes } => Ok(bytes),
+    ReplyBody::ReadPage { bytes, total, .. } => {
+      assert_eq!(
+        usize::try_from(total).ok(),
+        Some(bytes.len()),
+        "{path} fits one page"
+      );
+      Ok(bytes)
+    }
     ReplyBody::Refused { refusal } => Err(refusal),
     other => panic!("read: {other:?}"),
+  }
+}
+
+/// A base entry's bytes as `read_base` walks them (§4.4, A-267): a page at a time to the file's size, every page of one
+/// stamp.
+fn read_base_whole(
+  client: &mut Client,
+  volume: slates_ipc::protocol::VolumeId,
+  path: &str,
+) -> Vec<u8> {
+  let mut bytes = Vec::new();
+  let mut first_stamp = None;
+  loop {
+    let ReplyBody::BaseBytes {
+      bytes: page,
+      total,
+      stamp,
+    } = client.call(&RequestBody::ReadBase {
+      volume,
+      path: path.to_owned(),
+      offset: u64::try_from(bytes.len()).unwrap(),
+    })
+    else {
+      panic!("read_base");
+    };
+    assert_eq!(
+      *first_stamp.get_or_insert(stamp),
+      stamp,
+      "one state of {path}"
+    );
+    bytes.extend_from_slice(&page);
+    if u64::try_from(bytes.len()).unwrap() >= total || page.is_empty() {
+      return bytes;
+    }
   }
 }
 
@@ -3658,14 +3804,12 @@ fn edit_at(
 
 /// Submits `work` with no evidence and asserts it was accepted as `version`.
 fn submit_accepted(client: &mut Client, work: slates_ipc::protocol::VolumeId, version: u64) {
-  let reply = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let reply = client.call(&RequestBody::submit(work, Vec::new()));
   match reply {
     ReplyBody::Submitted {
       version: Some(got),
       conflicts,
+      ..
     } if got == version && conflicts.is_empty() => {}
     other => panic!("submit expected version {version}: {other:?}"),
   }
@@ -3673,10 +3817,7 @@ fn submit_accepted(client: &mut Client, work: slates_ipc::protocol::VolumeId, ve
 
 /// A `Submit` request with no evidence.
 fn submit_of(work: slates_ipc::protocol::VolumeId) -> RequestBody {
-  RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  }
+  RequestBody::submit(work, Vec::new())
 }
 
 /// An `Edit` request creating `f` on `work`.
@@ -3732,6 +3873,7 @@ fn advance(client: &mut Client, attachment: u64, version: Option<u64>) -> (u64, 
   let ReplyBody::Advanced {
     version,
     invalidated,
+    ..
   } = client.call(&RequestBody::Advance {
     attachment,
     version,
@@ -3794,6 +3936,7 @@ fn role_kind_mismatch_part(
   let changed_since_plain = RequestBody::ChangedSince {
     green: p,
     version: 0,
+    from: None,
   };
   assert_eq!(refusal_of(client, &changed_since_plain), Refusal::NotGreen);
   let work_over_plain = RequestBody::CreateWork {
@@ -3824,6 +3967,7 @@ fn role_store_verbs_part(
     target: "/nonexistent".to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   };
   let Refusal::Unsupported { feature } = refusal_of(client, &land) else {
     panic!("land of a green");
@@ -3870,10 +4014,7 @@ fn role_evidence_part(client: &mut Client) {
     refusal_of(client, &submit_of(sw)),
     Refusal::EvidenceRequired
   );
-  let reply = client.call(&RequestBody::Submit {
-    work: sw,
-    evidence: vec![[7u8; 32]],
-  });
+  let reply = client.call(&RequestBody::submit(sw, vec![[7u8; 32]]));
   assert!(
     matches!(
       reply,
@@ -4127,7 +4268,10 @@ fn barrier_part(
     b"hello",
     "the sealed version holds only what was declared before the seal"
   );
-  let ReplyBody::Submitted { version, conflicts } = client.call(&submit_of(w)) else {
+  let ReplyBody::Submitted {
+    version, conflicts, ..
+  } = client.call(&submit_of(w))
+  else {
     panic!("second submit");
   };
   assert!(
@@ -4354,7 +4498,7 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
   edit_at(&mut client, lagging, "big", 0, 4, b"LAGS");
   let reply = client.call(&submit_of(lagging));
   assert!(
-    matches!(&reply, ReplyBody::Submitted { version: None, conflicts } if !conflicts.is_empty()),
+    matches!(&reply, ReplyBody::Submitted { version: None, conflicts, .. } if !conflicts.is_empty()),
     "the lagging edit conflicts with the writer's: {reply:?}"
   );
   let with_conflict = daemon.merge_retention(g).unwrap();
@@ -4379,13 +4523,17 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
 }
 
 /// The merge-retention balance: what the green charged equals what the engine holds beyond its
-/// files (history plus the rejected cache), the running history total equals its recount, and the
-/// fold floor is where the oldest reachable version stands.
+/// files (history, the change index and the rejected cache), the running history and index totals equal their
+/// recounts, and the fold floor is where the oldest reachable version stands.
 fn assert_balanced(retention: &slates_server::merge_service::MergeRetention, floor: u64) {
   assert_eq!(
     retention.charged,
-    retention.history + retention.rejected,
+    retention.history + retention.changes + retention.rejected,
     "the charge is exactly the retained bytes: {retention:?}"
+  );
+  assert_eq!(
+    retention.changes, retention.changes_recounted,
+    "the change index's running total is its recount: {retention:?}"
   );
   assert_eq!(
     retention.history, retention.history_recounted,
@@ -4461,7 +4609,6 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
 /// a volume's growth, never kept for free.
 #[test]
 fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them() {
-  use slates_ipc::protocol::ReadAt;
   let (daemon, instance) = daemon("work-charge");
   let mut client = Client::connect(&instance);
   let ReplyBody::GreenCreated { id: green, .. } = client.call(&RequestBody::CreateGreen {
@@ -4488,10 +4635,7 @@ fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them(
   };
   assert_eq!(edit(&mut client, b"before"), ReplyBody::Edited);
   // Submitted, so the green holds the file and a new work's seeded copy of it costs bytes.
-  let submitted = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = client.call(&RequestBody::submit(work, Vec::new()));
   assert!(
     matches!(
       submitted,
@@ -4513,16 +4657,9 @@ fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them(
     ),
     "an edit the budget cannot hold is refused: {refused:?}"
   );
-  let read = client.call(&RequestBody::Read {
-    volume: work,
-    path: "f.txt".to_owned(),
-    at: ReadAt::Head,
-  });
   assert_eq!(
-    read,
-    ReplyBody::ReadBytes {
-      bytes: b"before".to_vec()
-    },
+    read_f(&mut client, work),
+    b"before".to_vec(),
     "the refused edit changed nothing"
   );
   let second = a_new_work_under_the_hold(&mut client, green);
@@ -4545,12 +4682,8 @@ fn edit_first_byte(client: &mut Client, work: slates_ipc::protocol::VolumeId) ->
 }
 
 /// `f.txt` as `work` sees it.
-fn read_f(client: &mut Client, work: slates_ipc::protocol::VolumeId) -> ReplyBody {
-  client.call(&RequestBody::Read {
-    volume: work,
-    path: "f.txt".to_owned(),
-    at: slates_ipc::protocol::ReadAt::Head,
-  })
+fn read_f(client: &mut Client, work: slates_ipc::protocol::VolumeId) -> Vec<u8> {
+  read(client, work, "f.txt", slates_ipc::protocol::ReadAt::Head).unwrap()
 }
 
 /// Under the pressure hold: a new work of `green` is created (it holds nothing of its own), and its first edit of the
@@ -4577,9 +4710,7 @@ fn a_new_work_under_the_hold(
   );
   assert_eq!(
     read_f(client, second),
-    ReplyBody::ReadBytes {
-      bytes: b"before".to_vec()
-    },
+    b"before".to_vec(),
     "the new work sees the green's file, unchanged by the refused edit"
   );
   second
@@ -4590,9 +4721,7 @@ fn the_new_works_edit_once_released(client: &mut Client, second: slates_ipc::pro
   assert_eq!(edit_first_byte(client, second), ReplyBody::Edited);
   assert_eq!(
     read_f(client, second),
-    ReplyBody::ReadBytes {
-      bytes: b"xbefore".to_vec()
-    },
+    b"xbefore".to_vec(),
     "the new work's edit spliced the green's file"
   );
 }

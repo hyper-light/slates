@@ -37,7 +37,9 @@ proof recorded for this lane. The design is §2.4 and §4.12 of
    - `publish-node.yml` — the addon for the seven shipped targets and the eight packages to npm.
 5. `workflow_dispatch` on any of the three lanes is a dry run: it builds every artifact and runs every
    check (the npm lane assembles every platform package and refuses one without its binary; the PyPI lane
-   runs `twine check --strict` over every artifact), and nothing is published without a tag.
+   runs `twine check --strict` over every artifact), and nothing is published without a tag. The binary
+   lane's dry run stages the whole release, short of the signature and the draft (A-320; "The binary
+   release" below): `gh workflow run release.yml --ref <branch>`.
 6. Publish the binary release: check the draft (its seven binaries, `SHA256SUMS`,
    `slates-provenance.json`, `slates-attestation.sigstore.json`), then
    `gh release edit v0.2.0 --draft=false --latest` or "Publish release" on the draft. That is
@@ -58,8 +60,13 @@ binary per platform, no archive (Appendix B.2):
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `windows-2025` | `slates-windows-x64.exe` |
 | Windows arm64 | `aarch64-pc-windows-msvc` | `windows-11-arm` | `slates-windows-arm64.exe` |
 
+`cargo binstall --git https://github.com/hyper-light/slates slates-cli` installs the binary a release attached for
+the machine's target (A-413): the CLI manifest names each shipped target's asset, and `cargo xtask version` refuses an
+override that drifts from the shipped targets.
+
 Every target is built natively on its own runner. The Windows binaries link the C runtime
-statically (`+crt-static`), so they need no Visual C++ runtime. The musl binaries are static.
+statically (`+crt-static`), so they need no Visual C++ runtime. They are built with MSVC toolset 14.44 and Windows SDK
+10.0.26100.0, pinned, not the runner image's default toolset, which moves with each image update (A-411). The musl binaries are static.
 The glibc binaries need the glibc of the runner's Ubuntu or newer.
 
 For each built binary, the release smoke task (`cargo run -p xtask --bin release -- smoke`) runs on the same runner and does what a person
@@ -74,37 +81,116 @@ installing it would do:
 7. When the anchor is stopped, the daemon leaves with it.
 
 Every target is built twice, each copy on a runner of its own, and the release is refused unless the two copies are
-the same bytes (AC-9.5). The Windows binaries are linked with `/Brepro`, so MSVC's linker takes its timestamps and
+the same bytes (AC-9.5). The Windows binaries link their MSVC toolset's C runtime, so before the toolset was pinned
+(A-411) two runner images built two binaries from one tag. A pair from two images that differs is refused with both
+images named (A-407): run one copy again (`gh run rerun <run> --job <job>`) until the pair shares an image, and
+report it, since the pinned toolset should make two images agree. The Windows binaries are linked with `/Brepro`, so MSVC's linker takes its timestamps and
 PDB GUID from the content, not the clock.
 
 The smoke test records the binary's SHA-256 and BLAKE3, its `rustc -vV`, the runner image and
 each step's time. Two more checks run on some targets. The musl binaries must pass a staticness
 gate (`ldd`). The Windows x86_64 binary must start in a process-isolated
-`nanoserver:ltsc2025` container, which has no Visual C++ runtime.
+`nanoserver:ltsc2025` container, which has no Visual C++ runtime. CI's Windows lane starts its own debug build there
+on every push too, so an import Nano Server lacks fails the push that adds it, not the next tag (A-357).
 
-On a tag, the release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release that lacks a target, or whose binary
-is not the one its smoke test digested. It writes:
+In every run, a tag's or a dry run's, the `stage` job runs the release artifacts task
+(`cargo run -p xtask --bin release -- artifacts`, with `--tag TAG` or `--dry-run`). It refuses a release that lacks a
+target, whose binary is not the one its smoke test digested, or whose two copies differ. It writes:
 
 - `SHA256SUMS`, in `sha256sum`'s format.
-- `slates-provenance.json`: the tag, the commit, the run, and every target's record.
+- `slates-provenance.json`: the tag (none on a dry run, which says `"dry_run": true`), the commit, the run, and every
+  target's record with its rebuild's.
+- The draft's notes, title and kind, and `plan.md`: every staged file with its size and SHA-256, then what follows.
+  The plan is the job's summary on the run's page.
 
-GitHub's artifact attestation (`actions/attest-build-provenance`) then signs SLSA build
+`sha256sum --check --strict SHA256SUMS` then holds the staged binaries to the checksums, and the job keeps the
+binaries, `SHA256SUMS`, the provenance and the notes as the run's **`release-staged`** artifact. The job runs with the
+workflow's read-only permissions.
+
+On a tag, the `draft release` job, the only job with write permissions, takes `release-staged` and checks it against
+`SHA256SUMS` again. GitHub's artifact attestation (`actions/attest-build-provenance`) then signs SLSA build
 provenance for every binary named in `SHA256SUMS`. It signs keylessly through Sigstore with the
-job's OIDC identity, so no key or secret exists. Everything is attached to a **draft** release.
+job's OIDC identity, so no key or secret exists; on this public repository Sigstore also records the signature in its
+public transparency log. Everything is attached to a **draft** release.
 Verify a download with `sha256sum -c SHA256SUMS --ignore-missing` (on macOS
 `shasum -a 256 -c`) and `gh attestation verify <file> --repo hyper-light/slates`.
+
+**The dry run** is `workflow_dispatch` (`gh workflow run release.yml --ref <branch>`; A-320). Guard, the fourteen
+builds and their smoke tests, and `stage` run exactly as on a tag. The staged files are labelled a dry run: the title
+and notes say "not a release", and the provenance has no tag. The `draft release` job does not run, so a dry run
+signs nothing and makes no release. Its plan says what the tag `v<version>` would do with the same files. Before
+A-320 a dry run stopped after the builds, and only the two test tags had ever checked the checksums, the copies'
+comparison and the provenance.
 
 **Proven 2026-11-05 on the test tag `v0.1.0-test.1`** (run 41983664060): all seven binaries built and passed their
 smoke test, and the draft carried them with `SHA256SUMS` (all seven `OK` after download), the provenance and the
 attestation bundle (`gh attestation verify` exits 0, and 1 for a tampered copy). Details: A-210 in
 [the design](wip/SLATES_DESIGN.md).
 
+**The dry run proven 2026-11-18** (run 44261010043, `workflow_dispatch` at commit 44c7cc17, 40 minutes). All fourteen
+copies passed their smoke tests, and `stage` passed in 63 s: the seven pairs were byte for byte the same,
+`sha256sum --check --strict` answered OK seven times, and the staged release was kept as `release-staged`. The draft
+job did not run. No tag, draft or attestation was made. Its `SHA256SUMS`:
+
+```
+fc53d4c9ed2cd59b0a78bf092df683a7d0f04f94febc1a4a331e38462fa8f0ad  slates-macos-arm64
+5e3d51c6d4572b4175481aa0371b0815cf3cc80d795316bb096ae4222ba9815a  slates-linux-x64
+46bba07ff638c7910ca6cc1bb623c29783eee36829f78645f9ae02b7cc4e5687  slates-linux-arm64
+69395796e317958ec07e2db6f31294bb0f131cc176dbefb9c758a0fc3e4f05e8  slates-linux-x64-musl
+05f4724df922383c978c83b833a400525b39ca653195eafa38c824167c4e7ad4  slates-linux-arm64-musl
+e689e299f08a7ba9c4aa19bdead07751f5426c5d42273ab690fd67e5a58a5f93  slates-windows-x64.exe
+e35ff7594d4cac6a394a98f3eccad54996e76babbcf6f225a1d34abd735a9ba4  slates-windows-arm64.exe
+```
+
+Downloaded with `gh run download 44261010043 --name release-staged`, the seven verified with `shasum -a 256 -c`. The
+macOS binary answered `slates 0.1.0`. Each step's time is in A-320 in [the design](wip/SLATES_DESIGN.md).
+
 **A test of the lane** is a tag `v<version>-test.<N>` (e.g. `v0.1.0-test.1`). The release lane's
 guard accepts it (`cargo xtask version --expect-tag TAG --allow-test-tag`) and makes a draft
 pre-release titled `TEST … not a release`. Two things keep the SDK publish lanes from publishing
 on a test tag. Their triggers exclude `v*-test.*`, and their guard (without `--allow-test-tag`)
-refuses such a tag. A test's draft is never published. Delete it with
-`gh release delete <tag> --yes` when it is no longer needed.
+refuses such a tag. A test's draft is never published. Delete it and its tag with
+`gh release delete <tag> --cleanup-tag --yes` when it is no longer needed.
+
+## The publish step: what it does and what it needs
+
+Publishing is a maintainer's act, never a lane's, as a landing is a grant's (R10). For `v0.1.0`, in order:
+
+1. **A dry run of the commit to release has passed:** `gh workflow run release.yml --ref main`. Its `stage` summary
+   names each of the seven binaries with its SHA-256, and `release-staged` holds them. The commit is the run's
+   (`gh run view <run> --json headSha`), not main's head later, since main moves.
+2. **The tag:** `git tag v0.1.0 <that commit> && git push origin v0.1.0`. This is the first outward act, and it
+   starts three lanes:
+   - `release.yml` runs the dry run's steps again from the tag. Its `draft release` job then signs the provenance,
+     which puts a public record in Sigstore's transparency log. It creates the draft `v0.1.0`, titled
+     "slates 0.1.0", with the seven binaries, `SHA256SUMS`, `slates-provenance.json` and
+     `slates-attestation.sigstore.json`. Only the repository's maintainers see a draft.
+   - `publish-python.yml` and `publish-node.yml` build the SDKs and publish them to PyPI and npm straight away,
+     with no draft, through trusted publishing. Until a registry's one-time setup below is done, its publish
+     step is refused and publishes nothing; a run whose npm setup is only partly done publishes only part.
+   - On 2026-11-17 the repository had no GitHub environments, so the first tag would create `pypi` and `npm`
+     with no required reviewer.
+3. **Check the draft:** `gh release download v0.1.0 --dir <an empty directory>`, then `shasum -a 256 -c
+   SHA256SUMS` (seven `OK`) and `gh attestation verify <binary> --repo hyper-light/slates` for each binary.
+4. **Publish the draft:** `gh release edit v0.1.0 --draft=false --latest`. This step makes the binaries public.
+5. **Say so in the README:** remove "No release is published yet" from its Install section and the "no release
+   yet" notice above its capabilities table, in a commit on main.
+
+What it needs from Ada; no agent can supply these:
+
+- Her go for the tag (step 2) and for publishing the draft (step 4).
+- Whether the SDKs ship with the binary. If they do, the one-time setup below comes first. If they do not, add
+  `pypi` and `npm` environments with a required reviewer (Settings → Environments) before the tag, and reject
+  their jobs. Otherwise expect both lanes to fail at their publish step.
+- Whether the test drafts `v0.1.0-test.1` and `v0.1.0-test.2` are deleted first, with their tags:
+  `gh release delete <tag> --cleanup-tag --yes`.
+- Whether `v0.1.0` ships unsigned. The binaries carry no Apple Developer ID signature or notarization, and no
+  Windows Authenticode signature (B.7; each needs Ada's identity). The macOS binary carries only the linker's
+  ad-hoc signature (`codesign -dv`: `adhoc,linker-signed`, no team identifier; 2026-11-18). Fetched with
+  `gh run download`, it carried no quarantine attribute and ran. Expected but not measured here: macOS
+  Gatekeeper refuses to run a browser-downloaded binary that carries the quarantine attribute until
+  `xattr -d com.apple.quarantine <file>`, and Windows SmartScreen warns when a browser-downloaded `.exe` is
+  opened from Explorer.
 
 ## What the tag does
 

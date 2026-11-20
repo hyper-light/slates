@@ -181,6 +181,9 @@ fn refusal_of(error: ClientError) -> Answer {
 fn submitted(result: Result<Submitted, ClientError>) -> Answer {
   match result {
     Ok(Submitted::Accepted(version)) => Answer::Accepted(version),
+    Ok(Submitted::ApprovalRequired { .. }) => {
+      panic!("no write policy is set here, so no merge awaits approval")
+    }
     Ok(Submitted::Conflict(windows)) => Answer::Conflict(
       windows
         .into_iter()
@@ -403,6 +406,7 @@ fn an_edit_and_submit_retried_across_a_restart_answers_its_record_once() {
       bytes: b"XY".to_vec(),
     },
     evidence: Vec::new(),
+    authorship: Default::default(),
   };
   let id = client.begin(&request).unwrap();
   committed_unread(&mut client, &instance, (green, 2), id);

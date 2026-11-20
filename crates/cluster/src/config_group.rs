@@ -128,6 +128,42 @@ pub enum ConfigCommand {
     /// The reporting successor.
     successor: HostId,
   },
+  /// An owner moves one of its objects to another member (§4.8 "Authority scope": a moved-object exception; §4.10
+  /// "operators keep an explicit move"), once the object is placed as it leaves it
+  /// ([`RegionalConfiguration::move_object`]).
+  Move {
+    /// The object moved.
+    object: ObjectId,
+    /// Its owner, the reporter.
+    from: HostId,
+    /// The member it moves to.
+    to: HostId,
+    /// The cohort its head and catalog are placed at `f + 1` of, the reporter among them (A-291): where the new
+    /// owner's phase one finds them.
+    cohort: Vec<HostId>,
+  },
+  /// A moved object's owner reports it destroyed, and its exception is dropped
+  /// ([`RegionalConfiguration::forget_moved`]).
+  MovedForgotten {
+    /// The object destroyed.
+    object: ObjectId,
+    /// Its owner, the reporter.
+    owner: HostId,
+  },
+  /// The leader records the voters the council's last committed seat change left (A-380;
+  /// [`RegionalConfiguration::seat`]), so a learner learns who votes by the configuration's version.
+  Seat {
+    /// The voters, in id order.
+    voters: Vec<HostId>,
+  },
+  /// A moved object's new owner reports it adopted and placed under its own placement, so the member the move left
+  /// may let its copy go ([`RegionalConfiguration::adopt_move`], A-291).
+  MoveAdopted {
+    /// The object adopted.
+    object: ObjectId,
+    /// Its new owner, the reporter.
+    owner: HostId,
+  },
 }
 
 /// Format: a config command is a one-byte tag followed by its little-endian fields; these are the tags.
@@ -142,6 +178,16 @@ const COMMAND_CONFIRM: u8 = 4;
 const COMMAND_MIRROR_ADOPT: u8 = 5;
 /// Format: the tag of a successor's report that it serves an adopted object ([`ConfigCommand::MirrorAdopted`]).
 const COMMAND_MIRROR_ADOPTED: u8 = 6;
+/// Format: the tag of an owner's move of one object ([`ConfigCommand::Move`]).
+const COMMAND_MOVE: u8 = 7;
+/// Format: the tag of a moved object's owner's report that it is destroyed ([`ConfigCommand::MovedForgotten`]).
+const COMMAND_MOVED_FORGOTTEN: u8 = 8;
+/// Format: the tag of the leader's record of the council's voters ([`ConfigCommand::Seat`]): a little-endian u64 count,
+/// then each voter's id.
+const COMMAND_SEAT: u8 = 9;
+/// Format: the tag of a moved object's new owner's report that it adopted it ([`ConfigCommand::MoveAdopted`]): 10, since
+/// A-380's record of the seated voters took 9 on main first.
+const COMMAND_MOVE_ADOPTED: u8 = 10;
 /// Format: an admission's domain is a presence byte — absent (unique-per-host) or present, in which case
 /// the domain id follows as a little-endian u64.
 const DOMAIN_ABSENT: u8 = 0;
@@ -208,6 +254,42 @@ impl ConfigCommand {
         out.extend_from_slice(&object.0);
         out.extend_from_slice(&successor.0.to_le_bytes());
       }
+      ConfigCommand::Move {
+        object,
+        from,
+        to,
+        cohort,
+      } => {
+        out.push(COMMAND_MOVE);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&from.0.to_le_bytes());
+        out.extend_from_slice(&to.0.to_le_bytes());
+        // The cohort last, every host a word to the end: its count is the bytes that remain.
+        for host in cohort {
+          out.extend_from_slice(&host.0.to_le_bytes());
+        }
+      }
+      ConfigCommand::MovedForgotten { object, owner } => {
+        out.push(COMMAND_MOVED_FORGOTTEN);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&owner.0.to_le_bytes());
+      }
+      ConfigCommand::Seat { voters } => {
+        out.push(COMMAND_SEAT);
+        out.extend_from_slice(
+          &u64::try_from(voters.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+        );
+        for voter in voters {
+          out.extend_from_slice(&voter.0.to_le_bytes());
+        }
+      }
+      ConfigCommand::MoveAdopted { object, owner } => {
+        out.push(COMMAND_MOVE_ADOPTED);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&owner.0.to_le_bytes());
+      }
     }
     out
   }
@@ -247,7 +329,67 @@ impl ConfigCommand {
         })
       }
       COMMAND_MIRROR_ADOPT | COMMAND_MIRROR_ADOPTED => decode_mirror(tag, rest),
+      COMMAND_MOVE | COMMAND_MOVED_FORGOTTEN | COMMAND_MOVE_ADOPTED => decode_move(tag, rest),
+      COMMAND_SEAT => decode_seat(rest),
       _ => None,
+    }
+  }
+}
+
+/// Decodes the leader's record of the voters (`COMMAND_SEAT`) after its tag: a count, then each id, the count checked
+/// against the bytes that follow before anything is allocated, or `None` for malformed bytes or trailing ones.
+fn decode_seat(rest: &[u8]) -> Option<ConfigCommand> {
+  let (count, mut rest) = take_word(rest)?;
+  let count = usize::try_from(count).ok()?;
+  if count.checked_mul(size_of::<u64>())? != rest.len() {
+    return None;
+  }
+  let mut voters = Vec::with_capacity(count);
+  for _ in 0..count {
+    let (voter, tail) = take_host(rest)?;
+    voters.push(voter);
+    rest = tail;
+  }
+  Some(ConfigCommand::Seat { voters })
+}
+
+/// Decodes a move command (`COMMAND_MOVE`, `COMMAND_MOVED_FORGOTTEN`, `COMMAND_MOVE_ADOPTED`) after its tag, or `None`
+/// for malformed bytes or trailing ones. A move's cohort is every word that remains, at least one: a remainder that is
+/// not whole words is refused, and the bytes bound the count, so nothing is allocated past what arrived.
+fn decode_move(tag: u8, rest: &[u8]) -> Option<ConfigCommand> {
+  let (object, rest) = take_object(rest)?;
+  let (first, rest) = take_host(rest)?;
+  match tag {
+    COMMAND_MOVED_FORGOTTEN => rest.is_empty().then_some(ConfigCommand::MovedForgotten {
+      object,
+      owner: first,
+    }),
+    COMMAND_MOVE_ADOPTED => rest.is_empty().then_some(ConfigCommand::MoveAdopted {
+      object,
+      owner: first,
+    }),
+    _ => {
+      let (to, mut rest) = take_host(rest)?;
+      if rest.is_empty() || !rest.len().is_multiple_of(core::mem::size_of::<u64>()) {
+        return None;
+      }
+      let mut cohort = Vec::with_capacity(
+        rest
+          .len()
+          .checked_div(core::mem::size_of::<u64>())
+          .unwrap_or(0),
+      );
+      while !rest.is_empty() {
+        let (host, tail) = take_host(rest)?;
+        cohort.push(host);
+        rest = tail;
+      }
+      Some(ConfigCommand::Move {
+        object,
+        from: first,
+        to,
+        cohort,
+      })
     }
   }
 }
@@ -326,6 +468,9 @@ pub enum ReportOutcome {
   /// Not a report a member makes about itself: a membership change, a report naming another host, or bytes
   /// that are no command at all.
   Refused,
+  /// A move the configuration has no room for: it holds as many moved-object exceptions as the leader's bound
+  /// ([`RegionalCouncil::report`]). Not proposed; the owner refuses its move typed.
+  Full,
 }
 
 /// Format: the one-byte wire tags of a [`ReportOutcome`].
@@ -336,6 +481,8 @@ const OUTCOME_UNCHANGED: u8 = 1;
 const OUTCOME_NOT_LEADER: u8 = 2;
 /// Format: the tag of [`ReportOutcome::Refused`].
 const OUTCOME_REFUSED: u8 = 3;
+/// Format: the tag of [`ReportOutcome::Full`].
+const OUTCOME_FULL: u8 = 4;
 
 impl ReportOutcome {
   /// The outcome's one-byte wire form.
@@ -345,6 +492,7 @@ impl ReportOutcome {
       ReportOutcome::Unchanged => OUTCOME_UNCHANGED,
       ReportOutcome::NotLeader => OUTCOME_NOT_LEADER,
       ReportOutcome::Refused => OUTCOME_REFUSED,
+      ReportOutcome::Full => OUTCOME_FULL,
     }]
   }
 
@@ -355,6 +503,7 @@ impl ReportOutcome {
       [OUTCOME_UNCHANGED] => Some(ReportOutcome::Unchanged),
       [OUTCOME_NOT_LEADER] => Some(ReportOutcome::NotLeader),
       [OUTCOME_REFUSED] => Some(ReportOutcome::Refused),
+      [OUTCOME_FULL] => Some(ReportOutcome::Full),
       _ => None,
     }
   }
@@ -407,6 +556,33 @@ pub enum Reconfiguration {
     object: ObjectId,
     /// The reporting successor.
     successor: HostId,
+  },
+  /// Move an object to another member at its owner's report ([`ConfigCommand::Move`]).
+  Move {
+    /// The object.
+    object: ObjectId,
+    /// Its owner.
+    from: HostId,
+    /// The member it moves to.
+    to: HostId,
+    /// The cohort its records are placed in.
+    cohort: Vec<HostId>,
+  },
+  /// Drop a destroyed object's exception at its owner's report ([`ConfigCommand::MovedForgotten`]).
+  MovedForgotten {
+    /// The object.
+    object: ObjectId,
+    /// Its owner.
+    owner: HostId,
+  },
+  /// Record the voters the council's last committed seat change left ([`ConfigCommand::Seat`], A-380).
+  Seat(Vec<HostId>),
+  /// Record a moved object adopted at its new owner's report ([`ConfigCommand::MoveAdopted`]).
+  MoveAdopted {
+    /// The object.
+    object: ObjectId,
+    /// Its new owner.
+    owner: HostId,
   },
 }
 
@@ -517,10 +693,6 @@ pub struct RegionalCouncil {
   /// A changed learner view must survive before it is published to serving shards.
   view_pending: bool,
   learned: Option<RegionalConfiguration>,
-  /// The council's voters as the last fetched view named them, while this node is a learner. A learner's Raft state
-  /// is its join state's and nothing updates it, so these are how it knows who votes now; empty until a fetch has told
-  /// it. Bounded by the council's voters. Held in RAM: a restart fetches again.
-  learned_voters: Vec<HostId>,
   scatter: u64,
   /// Monotone count of the events that defer this node's own election — a leader's append answered here, or a
   /// vote this node granted a candidate (Raft Figure 2's two follower timer-resets). The drive loop's election
@@ -685,7 +857,6 @@ impl RegionalCouncil {
       raft,
       fold: Fold::new(configuration),
       learned: None,
-      learned_voters: Vec::new(),
       view_pending: false,
       scatter,
       leader_contact: 0,
@@ -1069,6 +1240,35 @@ impl RegionalCouncil {
         ConfigCommand::MirrorAdopted { object, successor },
         self.fold.state().owes_adopted(object, successor),
       ),
+      Reconfiguration::Move {
+        object,
+        from,
+        to,
+        cohort,
+      } => {
+        let would = self.fold.state().moves(object, from, to) && cohort.contains(&from);
+        (
+          ConfigCommand::Move {
+            object,
+            from,
+            to,
+            cohort,
+          },
+          would,
+        )
+      }
+      Reconfiguration::MovedForgotten { object, owner } => (
+        ConfigCommand::MovedForgotten { object, owner },
+        self.fold.state().forgets_moved(object, owner),
+      ),
+      Reconfiguration::Seat(voters) => {
+        let would = self.fold.state().seats(&voters);
+        (ConfigCommand::Seat { voters }, would)
+      }
+      Reconfiguration::MoveAdopted { object, owner } => (
+        ConfigCommand::MoveAdopted { object, owner },
+        self.fold.state().adopts_move(object, owner),
+      ),
     };
     if !would_change {
       return false;
@@ -1101,25 +1301,30 @@ impl RegionalCouncil {
   /// Only a caught-up leader proposes it ([`caught_up`](RegionalCouncil::caught_up)), and only when it would
   /// change the configuration, so a report the member repeats while its proposal is in flight is not
   /// appended twice; any other node answers [`ReportOutcome::NotLeader`] and the member sends it again.
-  pub fn report(&mut self, reporter: HostId, command: ConfigCommand) -> ReportOutcome {
-    let change = match command {
-      ConfigCommand::Settle { owner, generation } if owner == reporter => {
-        Reconfiguration::Settle { owner, generation }
-      }
-      ConfigCommand::Confirm {
-        departed,
-        successor,
-      } if successor == reporter => Reconfiguration::Confirm {
-        departed,
-        successor,
-      },
-      ConfigCommand::MirrorAdopted { object, successor } if successor == reporter => {
-        Reconfiguration::MirrorAdopted { object, successor }
-      }
-      _ => return ReportOutcome::Refused,
+  ///
+  /// A member may also move one of its own objects to another member, and report one it moved destroyed (§4.8
+  /// "Authority scope": the moved-object exceptions). A move that would add an exception while the configuration
+  /// already holds `moved_bound` of them is answered [`ReportOutcome::Full`] and not proposed (banned item 8: the
+  /// exceptions are bounded, the bound derived by the leader's daemon, `slates_server::fleet::moved_bound`); a move of
+  /// an object already moved adds none. A move back to an object's creator adds one like any other (A-291).
+  pub fn report(
+    &mut self,
+    reporter: HostId,
+    command: ConfigCommand,
+    moved_bound: usize,
+  ) -> ReportOutcome {
+    let Some(change) = reported_change(reporter, command) else {
+      return ReportOutcome::Refused;
     };
     if !self.is_leader() || !self.caught_up() {
       return ReportOutcome::NotLeader;
+    }
+    if let Reconfiguration::Move { object, .. } = &change {
+      let configuration = self.fold.state();
+      let adds = !configuration.moved.contains_key(&object.placement_key());
+      if adds && configuration.moved.len() >= moved_bound {
+        return ReportOutcome::Full;
+      }
     }
     if self.propose(change) {
       ReportOutcome::Proposed
@@ -1165,33 +1370,26 @@ impl RegionalCouncil {
     proposed
   }
 
-  /// Who this node knows to vote now: the Raft voter set on a voter, and on a learner the voters its last fetched view
-  /// named, or its join state's voters before any fetch has told it. A learner's Raft state never moves after its join,
-  /// so reading it alone left a learner contacting a voter long gone and dropping the leader it needed.
+  /// Who this node knows to vote now: the Raft voter set on a voter, and on a learner the voters its configuration
+  /// records (A-380, [`RegionalConfiguration::voters`]), or its join state's before any is recorded. A learner's Raft
+  /// state never moves after its join, so reading it alone left a learner contacting a voter long gone and dropping the
+  /// leader it needed.
   pub fn known_voters(&self) -> Vec<HostId> {
-    if self.learned_voters.is_empty() || self.raft.is_voter(self.raft.id()) {
+    let recorded = &self.configuration().voters;
+    if recorded.is_empty() || self.raft.is_voter(self.raft.id()) {
       self.voters()
     } else {
-      self.learned_voters.clone()
+      recorded.clone()
     }
   }
 
   /// Whether this node knows `node` to be a voter now ([`known_voters`](RegionalCouncil::known_voters)).
   pub fn known_voter(&self, node: HostId) -> bool {
-    if self.learned_voters.is_empty() || self.raft.is_voter(self.raft.id()) {
+    let recorded = &self.configuration().voters;
+    if recorded.is_empty() || self.raft.is_voter(self.raft.id()) {
       self.is_voter(node)
     } else {
-      self.learned_voters.contains(&node)
-    }
-  }
-
-  /// Records the voters a fetched configuration's answerer named, on a learner ([`known_voters`]). An empty list changes
-  /// nothing, so an answer that names none cannot erase what is known.
-  ///
-  /// [`known_voters`]: RegionalCouncil::known_voters
-  pub fn learn_voters(&mut self, voters: Vec<HostId>) {
-    if !voters.is_empty() {
-      self.learned_voters = voters;
+      recorded.contains(&node)
     }
   }
 
@@ -1268,6 +1466,20 @@ impl RegionalCouncil {
       }
       CatchUp::Pending | CatchUp::NotLeader => false,
     }
+  }
+
+  /// **DRIVE** (leader): records the voters in force in the configuration once they differ from the ones it records
+  /// (A-380, [`RegionalConfiguration::seat`]): only while no change is in flight — this leader caught up and its voters
+  /// out of any joint configuration, so they are the ones the council's last committed seat change left. A learner
+  /// takes no part in the council's Raft and learns a change by the configuration's version, and a seat change is a
+  /// Raft configuration entry that moves no version, so without this record a learner knew only the voters of its join
+  /// and of whatever answered its last fetch, and kept a voter long gone as its only one. Returns whether it proposed.
+  pub fn record_voters(&mut self) -> bool {
+    if !self.is_leader() || !self.caught_up() || self.raft.in_joint_configuration() {
+      return false;
+    }
+    let sitting = self.raft.all_voters();
+    self.propose(Reconfiguration::Seat(sitting))
   }
 
   /// The voter set [`reconcile_voters`](Self::reconcile_voters) moves toward from `sitting`: [`council_voters`] of the
@@ -1426,7 +1638,64 @@ fn apply_command(configuration: &mut RegionalConfiguration, command: &[u8], scat
     Some(ConfigCommand::MirrorAdopted { object, successor }) => {
       configuration.adopted(object, successor);
     }
+    Some(ConfigCommand::Move {
+      object,
+      from,
+      to,
+      cohort,
+    }) => {
+      configuration.move_object(object, from, to, &cohort);
+    }
+    Some(ConfigCommand::MovedForgotten { object, owner }) => {
+      configuration.forget_moved(object, owner);
+    }
+    Some(ConfigCommand::Seat { voters }) => {
+      configuration.seat(&voters);
+    }
+    Some(ConfigCommand::MoveAdopted { object, owner }) => {
+      configuration.adopt_move(object, owner);
+    }
     None => {}
+  }
+}
+
+/// The change a member's report asks for, when the member may report it (§4.8): a settle or a confirm of its own share,
+/// a mirror adoption it made, a move of an object it owns, a moved object it destroyed, or a move it adopted (A-291).
+/// `None` for a report about another member's state, or for a membership change, which only the leader's own
+/// reconciliation proposes.
+fn reported_change(reporter: HostId, command: ConfigCommand) -> Option<Reconfiguration> {
+  match command {
+    ConfigCommand::Settle { owner, generation } if owner == reporter => {
+      Some(Reconfiguration::Settle { owner, generation })
+    }
+    ConfigCommand::Confirm {
+      departed,
+      successor,
+    } if successor == reporter => Some(Reconfiguration::Confirm {
+      departed,
+      successor,
+    }),
+    ConfigCommand::MirrorAdopted { object, successor } if successor == reporter => {
+      Some(Reconfiguration::MirrorAdopted { object, successor })
+    }
+    ConfigCommand::Move {
+      object,
+      from,
+      to,
+      cohort,
+    } if from == reporter => Some(Reconfiguration::Move {
+      object,
+      from,
+      to,
+      cohort,
+    }),
+    ConfigCommand::MovedForgotten { object, owner } if owner == reporter => {
+      Some(Reconfiguration::MovedForgotten { object, owner })
+    }
+    ConfigCommand::MoveAdopted { object, owner } if owner == reporter => {
+      Some(Reconfiguration::MoveAdopted { object, owner })
+    }
+    _ => None,
   }
 }
 
@@ -1436,6 +1705,8 @@ mod tests {
 
   /// Shape: an append budget no batch reaches, for the tests of every rule but batching and compaction.
   const UNBOUNDED: usize = usize::MAX;
+  /// Shape: a moved-object bound no test reaches, for the report tests of every rule but the bound's.
+  const MOVES_UNBOUNDED: usize = usize::MAX;
 
   /// AC-8.1, §4.8, AUD-07: a replacement imports the original fold base, becomes a voter
   /// through joint consensus, then refuses an initial-state replay that would erase its vote.
@@ -1565,6 +1836,23 @@ mod tests {
         object: ObjectId::new(OWNER, 9),
         successor: A,
       },
+      ConfigCommand::Move {
+        object: ObjectId::new(OWNER, 9),
+        from: A,
+        to: B,
+        cohort: vec![A, OWNER, HostId(7)],
+      },
+      ConfigCommand::MovedForgotten {
+        object: ObjectId::new(OWNER, 9),
+        owner: B,
+      },
+      ConfigCommand::Seat {
+        voters: vec![OWNER, A, B],
+      },
+      ConfigCommand::MoveAdopted {
+        object: ObjectId::new(OWNER, 9),
+        owner: B,
+      },
     ];
     for command in commands {
       assert_eq!(
@@ -1580,6 +1868,10 @@ mod tests {
           | ConfigCommand::Confirm { .. }
           | ConfigCommand::MirrorAdopt { .. }
           | ConfigCommand::MirrorAdopted { .. }
+          | ConfigCommand::Move { .. }
+          | ConfigCommand::MovedForgotten { .. }
+          | ConfigCommand::MoveAdopted { .. }
+          | ConfigCommand::Seat { .. }
       ) {
         assert_eq!(
           ConfigCommand::decode(&trailing),
@@ -1600,9 +1892,18 @@ mod tests {
       "empty bytes decode to nothing"
     );
     assert_eq!(
-      ConfigCommand::decode(&[9, 9, 9]),
+      ConfigCommand::decode(&[u8::MAX, 9, 9]),
       None,
       "an unknown tag decodes to nothing"
+    );
+    // A-380: a record of the voters whose count lies about the ids that follow is refused before anything is allocated.
+    let mut lying = vec![COMMAND_SEAT];
+    lying.extend_from_slice(&u64::MAX.to_le_bytes());
+    lying.extend_from_slice(&OWNER.0.to_le_bytes());
+    assert_eq!(
+      ConfigCommand::decode(&lying),
+      None,
+      "a count past the bytes decodes to nothing"
     );
   }
 
@@ -1648,12 +1949,12 @@ mod tests {
       .unwrap();
     let leader = groups.get_mut(&OWNER).unwrap();
     assert_eq!(
-      leader.report(other, settle.clone()),
+      leader.report(other, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::Refused,
       "no member reports for another"
     );
     assert_eq!(
-      leader.report(moved, ConfigCommand::Retire(A)),
+      leader.report(moved, ConfigCommand::Retire(A), MOVES_UNBOUNDED),
       ReportOutcome::Refused,
       "a membership change is never a report"
     );
@@ -1671,17 +1972,17 @@ mod tests {
     };
     let leader = groups.get_mut(&OWNER).unwrap();
     assert_eq!(
-      leader.report(moved, settle.clone()),
+      leader.report(moved, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::Proposed
     );
     assert_eq!(
-      leader.report(moved, settle.clone()),
+      leader.report(moved, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::NotLeader,
       "while its proposal is in flight the leader is not caught up, so it is not appended twice"
     );
     let follower = groups.get_mut(&A).unwrap();
     assert_eq!(
-      follower.report(moved, settle.clone()),
+      follower.report(moved, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::NotLeader
     );
     replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
@@ -1697,9 +1998,197 @@ mod tests {
       groups
         .get_mut(&OWNER)
         .unwrap()
-        .report(moved, settle.clone()),
+        .report(moved, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::Unchanged,
       "a report already recorded changes nothing"
+    );
+  }
+
+  /// §4.8 "Authority scope", §4.10 "operators keep an explicit move" (T-8.14's council half; A-291). Do: on a three-voter
+  /// council, report a move of one of `A`'s objects to `B` from `B`, then from `A` with a cohort that leaves `A` out,
+  /// then from `A` with its cohort; replicate; report the move adopted from `A`, then from `B`, twice; report another
+  /// object's move from `A` with the bound at the one exception already held, then that first object's move back to `A`
+  /// (its creator) at the same bound, then report it destroyed, twice. Expect the report naming another host refused,
+  /// the cohort without its mover not proposed, `A`'s proposed once and committed on every voter as `B`'s ownership
+  /// with `A` and the cohort recorded; the adoption refused from `A`, proposed once from `B` and committed as the
+  /// exception letting `A` go, the second unchanged; the second move answered `Full` and not proposed, the move back
+  /// proposed since it replaces the object's exception (one naming the creator, which adopts it back), the destroyed
+  /// object's first report dropping it, and the second changing nothing once it is back on its creator's line.
+  #[test]
+  fn a_move_report_is_proposed_by_its_owner_and_held_to_the_bound() {
+    let mut groups = councils(&[OWNER, A, B]);
+    elect_among(&mut groups, OWNER, &[OWNER, A, B]);
+    // The new leader's own first entry commits before it is caught up and takes a report.
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    let object = ObjectId::new(A, 7);
+    let cohort = vec![OWNER, A, B];
+    expect_only_the_owners_move_proposed(&mut groups, object, &cohort);
+    expect_only_the_new_owner_to_adopt(&mut groups, object);
+    expect_the_bound_held_and_the_move_back_proposed(&mut groups, object, &cohort);
+    expect_a_destroy_report_to_drop_the_exception_once(&mut groups, object);
+  }
+
+  /// The councils of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`, by member.
+  type Councils = std::collections::BTreeMap<HostId, RegionalCouncil>;
+
+  /// Two rounds of the leader's replication, as each report needs to commit on every voter.
+  fn commit_on_every_voter(groups: &mut Councils) {
+    replicate_round(groups, OWNER, &[OWNER, A, B]);
+    replicate_round(groups, OWNER, &[OWNER, A, B]);
+  }
+
+  /// The first part of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`. Do: report `object`'s move to
+  /// `B` from `B`, then from `A` with a cohort that leaves `A` out, then from `A` with `cohort`; commit. Expect the
+  /// report naming another host refused, the cohort without its mover not proposed, `A`'s proposed and committed on
+  /// every voter as `B`'s ownership with `A` and the cohort recorded.
+  fn expect_only_the_owners_move_proposed(
+    groups: &mut Councils,
+    object: ObjectId,
+    cohort: &[HostId],
+  ) {
+    let move_it = ConfigCommand::Move {
+      object,
+      from: A,
+      to: B,
+      cohort: cohort.to_vec(),
+    };
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert_eq!(
+      leader.report(B, move_it.clone(), MOVES_UNBOUNDED),
+      ReportOutcome::Refused,
+      "only an object's owner reports its move"
+    );
+    let without_its_mover = ConfigCommand::Move {
+      object,
+      from: A,
+      to: B,
+      cohort: vec![OWNER, B],
+    };
+    assert_eq!(
+      leader.report(A, without_its_mover, MOVES_UNBOUNDED),
+      ReportOutcome::Unchanged,
+      "a cohort without its mover places nothing of the mover's"
+    );
+    assert_eq!(
+      leader.report(A, move_it, MOVES_UNBOUNDED),
+      ReportOutcome::Proposed
+    );
+    commit_on_every_voter(groups);
+    for voter in [OWNER, A, B] {
+      let configuration = groups[&voter].configuration();
+      assert_eq!(
+        configuration.owner_of(object),
+        Some(B),
+        "the committed move names B the owner on {voter:?}"
+      );
+      assert_eq!(
+        configuration
+          .moved
+          .get(&object)
+          .map(|moved| (moved.from, moved.cohort.clone())),
+        Some((Some(A), cohort.to_vec())),
+        "the member it left and the cohort its records sit in, on {voter:?}"
+      );
+    }
+  }
+
+  /// The adoption of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`. Do: report `object`'s move adopted
+  /// from `A`, then from `B`, commit, then from `B` again. Expect `A`'s refused, `B`'s proposed and committed as the
+  /// exception letting `A` go, and the second unchanged.
+  fn expect_only_the_new_owner_to_adopt(groups: &mut Councils, object: ObjectId) {
+    let adopted = ConfigCommand::MoveAdopted { object, owner: B };
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert_eq!(
+      leader.report(A, adopted.clone(), MOVES_UNBOUNDED),
+      ReportOutcome::Refused,
+      "only the new owner reports its adoption"
+    );
+    assert_eq!(
+      leader.report(B, adopted.clone(), MOVES_UNBOUNDED),
+      ReportOutcome::Proposed
+    );
+    commit_on_every_voter(groups);
+    assert_eq!(
+      groups[&OWNER]
+        .configuration()
+        .moved
+        .get(&object)
+        .map(|moved| (moved.owner, moved.from)),
+      Some((B, None)),
+      "adopted: the member it left may let its copy go"
+    );
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert_eq!(
+      leader.report(B, adopted, MOVES_UNBOUNDED),
+      ReportOutcome::Unchanged,
+      "a move is adopted once"
+    );
+  }
+
+  /// The bound of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`. Do: with one exception held, report
+  /// another object's move from `A` at a bound of one, then `object`'s move back to `A` (its creator) at the same
+  /// bound; commit. Expect the second move answered `Full` and not proposed, and the move back proposed since it
+  /// replaces the object's exception (one naming the creator, which adopts it back).
+  fn expect_the_bound_held_and_the_move_back_proposed(
+    groups: &mut Councils,
+    object: ObjectId,
+    cohort: &[HostId],
+  ) {
+    let leader = groups.get_mut(&OWNER).unwrap();
+    let another = ConfigCommand::Move {
+      object: ObjectId::new(A, 8),
+      from: A,
+      to: B,
+      cohort: cohort.to_vec(),
+    };
+    assert_eq!(
+      leader.report(A, another, 1),
+      ReportOutcome::Full,
+      "a second exception past a bound of one is not proposed"
+    );
+    let back = ConfigCommand::Move {
+      object,
+      from: B,
+      to: A,
+      cohort: cohort.to_vec(),
+    };
+    assert_eq!(
+      leader.report(B, back, 1),
+      ReportOutcome::Proposed,
+      "a move back to the creator replaces the object's exception, adding none"
+    );
+    commit_on_every_voter(groups);
+    assert_eq!(
+      groups[&OWNER]
+        .configuration()
+        .moved
+        .get(&object)
+        .map(|moved| (moved.owner, moved.from)),
+      Some((A, Some(B))),
+      "the creator adopts it back under an exception naming it and the member it left"
+    );
+  }
+
+  /// The end of `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound`. Do: report `object` destroyed by its
+  /// owner `A`, commit, and report it again. Expect the first report to drop the exception and the second to change
+  /// nothing once the object is back on its creator's line.
+  fn expect_a_destroy_report_to_drop_the_exception_once(groups: &mut Councils, object: ObjectId) {
+    let forgotten = ConfigCommand::MovedForgotten { object, owner: A };
+    assert_eq!(
+      groups
+        .get_mut(&OWNER)
+        .unwrap()
+        .report(A, forgotten.clone(), 1),
+      ReportOutcome::Proposed,
+      "its owner reports it destroyed"
+    );
+    commit_on_every_voter(groups);
+    assert!(groups[&OWNER].configuration().moved.is_empty());
+    assert_eq!(
+      groups.get_mut(&OWNER).unwrap().report(A, forgotten, 1),
+      ReportOutcome::Unchanged,
+      "an object on its creator's line has no exception to forget"
     );
   }
 
@@ -1711,6 +2200,7 @@ mod tests {
       ReportOutcome::Unchanged,
       ReportOutcome::NotLeader,
       ReportOutcome::Refused,
+      ReportOutcome::Full,
     ] {
       assert_eq!(ReportOutcome::decode(&outcome.encode()), Some(outcome));
     }
@@ -2451,6 +2941,96 @@ mod tests {
     assert_eq!(councils[&OWNER].voters(), vec![OWNER, A, C]);
   }
 
+  /// A-380 (§4.8 learners): the leader records the voters in force in the configuration once no change is in flight, and
+  /// a learner knows who votes by the configuration it adopts, through a seat change too. Do: five members at `f = 1`
+  /// (three voters, two learners); elect the first; record the voters and commit; let the last member, a learner, adopt
+  /// the leader's configuration; take a voter over and drive the voter change that refills its seat; record again and
+  /// let the learner adopt again. Expect each record to advance the version by one, a record with nothing new to propose
+  /// nothing, and the learner to name the leader's voters after each adoption, the second time the changed set. Before,
+  /// a seat change moved no version, so the learner kept the voters of its join and named a voter taken over.
+  #[test]
+  fn a_learner_names_the_voters_the_configuration_records_through_a_seat_change() {
+    const D: HostId = HostId(5);
+    let members = [OWNER, A, B, C, D];
+    let mut councils = councils(&members);
+    elect_among(&mut councils, OWNER, &members);
+    settle(&mut councils, OWNER, &members, 2);
+    let first = record_and_commit(&mut councils, &members);
+    assert!(
+      !councils
+        .get_mut(&OWNER)
+        .is_some_and(RegionalCouncil::record_voters),
+      "nothing new to record proposes nothing"
+    );
+    assert_eq!(
+      learner_names_after_adopting(&mut councils, D),
+      first,
+      "the learner names the voters recorded"
+    );
+    let survivors = [OWNER, A, C, D];
+    let declared: Vec<(HostId, Option<DomainId>)> =
+      survivors.iter().map(|host| (*host, None)).collect();
+    assert!(
+      councils
+        .get_mut(&OWNER)
+        .is_some_and(|leader| leader.reconcile_alive(&declared, &[B]))
+    );
+    settle(&mut councils, OWNER, &survivors, 2);
+    let change = drive_voter_change(&mut councils, OWNER, &survivors, &survivors);
+    assert!(change.moved_once(), "B's seat was refilled: {change:?}");
+    let second = record_and_commit(&mut councils, &survivors);
+    assert!(
+      second != first && !second.contains(&B),
+      "the seat change left other voters: {first:?} then {second:?}"
+    );
+    assert_eq!(
+      learner_names_after_adopting(&mut councils, D),
+      second,
+      "the learner names the changed voters"
+    );
+  }
+
+  /// Has the leader `OWNER` record its voters and commits the record over `reachable`. Expect the record proposed and
+  /// committed one version on, naming the voters in force. Those voters.
+  fn record_and_commit(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    reachable: &[HostId],
+  ) -> Vec<HostId> {
+    let before = councils[&OWNER].configuration().version;
+    let proposed = councils
+      .get_mut(&OWNER)
+      .is_some_and(RegionalCouncil::record_voters);
+    settle(councils, OWNER, reachable, 2);
+    let voters = councils[&OWNER].voters();
+    assert!(proposed, "the leader recorded the voters in force");
+    assert_eq!(
+      (
+        councils[&OWNER].configuration().version,
+        councils[&OWNER].configuration().voters.clone()
+      ),
+      (before + 1, voters.clone()),
+      "the record committed one version on"
+    );
+    voters
+  }
+
+  /// Has `learner` adopt the leader's configuration, as its fetch does. The voters it names after.
+  fn learner_names_after_adopting(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    learner: HostId,
+  ) -> Vec<HostId> {
+    let configuration = councils[&OWNER].configuration().clone();
+    let Some(council) = councils.get_mut(&learner) else {
+      return Vec::new();
+    };
+    assert!(!council.is_voter(learner), "{learner:?} is a learner");
+    assert!(
+      council.adopt(configuration),
+      "the learner adopts the newer view"
+    );
+    council.known_voters()
+  }
+
   /// Shape: leader periods the test below allows: a stalled staging is judged at the second CheckQuorum tick
   /// (`STALLED_WINDOWS` whole windows after the baseline), then the joint change and `C_new` each take a
   /// period to commit; twelve is several times that.
@@ -2820,6 +3400,23 @@ mod tests {
       }
       Reconfiguration::MirrorAdopted { object, successor } => {
         oracle.adopted(*object, *successor);
+      }
+      Reconfiguration::Move {
+        object,
+        from,
+        to,
+        cohort,
+      } => {
+        oracle.move_object(*object, *from, *to, cohort);
+      }
+      Reconfiguration::MovedForgotten { object, owner } => {
+        oracle.forget_moved(*object, *owner);
+      }
+      Reconfiguration::Seat(voters) => {
+        oracle.seat(voters);
+      }
+      Reconfiguration::MoveAdopted { object, owner } => {
+        oracle.adopt_move(*object, *owner);
       }
     }
   }

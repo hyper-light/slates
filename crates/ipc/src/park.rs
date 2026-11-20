@@ -60,6 +60,33 @@ pub fn reply_waiting_for_armed(
   armed() && waiting()
 }
 
+/// Whether the client's parked flag, read as `parked`, is a synchronous call's park: either stamp slot's value
+/// (`crate::region::PARKED_STAMP_SLOT_ZERO`, `PARKED_STAMP_SLOT_ONE`), never the async arm's own
+/// (`crate::region::PARKED_ASYNC`) and never zero. Such a park waits where a macOS or Windows completion bridge waits
+/// (the wake word, the named Event), and the daemon wakes one waiter a reply, so a bridge woken while this holds may
+/// have taken the park's wake and passes it on (`crate::completion`). The flag is the whole mark: until 2026-11-18 the
+/// park raised a second one, an `AtomicBool` each bridge start leaked to share it with its thread.
+pub fn parks_synchronously(parked: u32) -> bool {
+  parked == crate::region::PARKED_STAMP_SLOT_ZERO || parked == crate::region::PARKED_STAMP_SLOT_ONE
+}
+
+#[cfg(test)]
+mod tests {
+  use super::parks_synchronously;
+  use crate::region::{PARKED_ASYNC, PARKED_STAMP_SLOT_ONE, PARKED_STAMP_SLOT_ZERO};
+
+  /// §4.7 (D-19): a bridge tells a synchronous park from the async arm by the parked flag alone. Do: ask of each value
+  /// the flag takes. Expect a park that stamps either slot to be a synchronous one, and neither the async arm nor no
+  /// park at all.
+  #[test]
+  fn a_synchronous_park_is_told_from_the_async_arm_by_the_flag_alone() {
+    assert!(parks_synchronously(PARKED_STAMP_SLOT_ZERO));
+    assert!(parks_synchronously(PARKED_STAMP_SLOT_ONE));
+    assert!(!parks_synchronously(PARKED_ASYNC), "the async arm");
+    assert!(!parks_synchronously(0), "no park");
+  }
+}
+
 // Two attributes rather than `all(test, loom)`: clippy's test-context rule (unwrap allowed in tests)
 // recognizes only a bare `cfg(test)`, and an unwrap here is a failed model, as it should be.
 #[cfg(test)]

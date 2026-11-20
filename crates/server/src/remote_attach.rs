@@ -9,8 +9,9 @@
 //! **How a remote attachment ends.** A detach routed by its volume (`DetachOf`; an attachment id names its owner
 //! partition, not its host); its host's reap of the dead client (`RemoteReap`, which B sends the owner of each volume
 //! it remembers the client attached, a set bounded per client); its host's retirement from the fleet (`end_retired`);
-//! and the volume's destroy, as every attachment. A silent holder's write lease ends at its term, `failover_slo_ns`
-//! (`verbs::take_write_lease`, D-16), whatever ends its record.
+//! and the volume's destroy, as every attachment. The volume's write lease stays its holder's while the record lives,
+//! renewed at each lapse, and lasts one term (the node's failover delay) after the record ends, whatever ends it
+//! (`verbs::lease_kept_until`, D-16, A-414).
 //!
 //! **R8.** At one node nothing is forwarded, no attachment is `Remote`, and every rule here holds the same way for a
 //! local requester: the requester's host is this node's, and a local attachment is its own.
@@ -85,6 +86,48 @@ pub(crate) fn foreign_attach(
     1,
   );
   Some(refusal)
+}
+
+/// The refusal, on the volume's shard, of an attach in a form other than the record form of a volume this node lost to
+/// a successor (A-334's sibling, goal g229): by its kind, as [`foreign_attach`] refuses another host's volume on the
+/// client's shard. That check cannot see the loss: a node admitted again lost every volume it created, and the client's
+/// shard knows only the id's creator, while the yield and the fence live on the volume's shard
+/// (`verbs::lost_to_a_successor`). So it is asked here, before the volume's verb is served or sent to its owner. `None`
+/// for every other request.
+pub(crate) fn lost_attach(
+  state: &mut ShardState,
+  body: &slates_ipc::protocol::RequestBody,
+) -> Option<Refusal> {
+  let slates_ipc::protocol::RequestBody::Attach { volume, form, .. } = body else {
+    return None;
+  };
+  let refusal = foreign_form(form)?;
+  if !crate::verbs::lost_to_a_successor(state, crate::verbs::to_db_volume(*volume)) {
+    return None;
+  }
+  state.count(FOREIGN_REFUSED_LOST, 1);
+  Some(refusal)
+}
+
+/// Counter: an attach refused by its kind on the volume's shard because this node lost the volume to a successor.
+const FOREIGN_REFUSED_LOST: &str = "attach.foreign_refused.lost_to_successor";
+
+/// Whether `body` is an attach in the record form of a volume this node lost to a successor: the one attach of such a
+/// volume that is sent to its owner (`verbs::owned_by_another_host`), which the client's node must remember for its
+/// reap before it is sent ([`remember_volume`]).
+pub(crate) fn lost_record_attach(
+  state: &ShardState,
+  body: &slates_ipc::protocol::RequestBody,
+) -> Option<slates_ipc::protocol::VolumeId> {
+  let slates_ipc::protocol::RequestBody::Attach {
+    volume,
+    form: AttachRequest::Root,
+    ..
+  } = body
+  else {
+    return None;
+  };
+  crate::verbs::lost_to_a_successor(state, crate::verbs::to_db_volume(*volume)).then_some(*volume)
 }
 
 /// Counter: an attach refused by its kind because this shard's routing names another host as the volume's owner.
@@ -253,9 +296,36 @@ pub(crate) fn end_hosts(state: &mut ShardState, anchors: &[u64]) -> Result<u64, 
   end_all(state, &ended)
 }
 
-/// The reap loop's look at departures (A-222), run on the control shard each liveness budget: the departed anchors,
-/// then their attachments ended on every shard, each through a call bounded by the budget. Owed again at the next look
-/// unless every shard answered.
+/// Asks the control shard's reaper for a look at departures (A-222, A-554): the fleet's members or a member's anchor
+/// changed (an install that changed the members, `FleetNode::take_members_changed`; an anchor learned or restarted; a
+/// peer's plane started), so a host may have left, and the look counts the members' anchors anew. Nothing off the
+/// control shard, which alone keeps the learned identities and looks. Until A-554 the reap loop's tick looked once a
+/// liveness window, whether anything had changed or not.
+pub(crate) fn look_for_departures(state: &mut ShardState) {
+  if !crate::verbs::is_control_shard(state) {
+    return;
+  }
+  state.departures_owed = true;
+  if let Some(reaper) = state.reaper_task {
+    slates_rt::registry::wake(reaper.0);
+  }
+}
+
+/// Owes the departed anchors' ends to a look a retry window on (A-554): a shard did not answer this one. Kept by the
+/// deadline keeper, which asks the reaper for the look then ([`look_for_departures`]).
+fn retry_departures(state: &mut ShardState) {
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  let at = now.saturating_add(crate::deadlines::retry_window_ns());
+  state.departures_retry_at = Some(state.departures_retry_at.map_or(at, |due| due.min(at)));
+  crate::deadlines::noted(state, at);
+}
+
+/// The reaper's look at departures (A-222), run on the control shard when one is asked for ([`look_for_departures`]):
+/// the departed anchors, then their attachments ended on every shard, each through a call judged in that shard's own
+/// time (`xshard::call_in_shard_time`, A-65, A-408), whose budget is the window every such wait takes: one liveness
+/// window on the wall, then more while the shard runs or waits for a CPU, so a starved shard's end is heard and a
+/// wedged one's given up (A-449, R3's class B, item B-f: the departure itself was decided by the fleet's membership,
+/// its own estimators, A-363). Owed again a retry window on unless every shard answered ([`retry_departures`]).
 pub(crate) async fn sweep_departed() {
   let Some((control, shards, gone)) = crate::state::with_state(|state| {
     let control = state.shards.first().copied()?;
@@ -273,7 +343,7 @@ pub(crate) async fn sweep_departed() {
   let mut settled = true;
   for shard in shards {
     let anchors = gone.clone();
-    let ended = crate::xshard::call_within(
+    let ended = crate::xshard::call_in_shard_time(
       control,
       shard,
       move |state| end_hosts(state, &anchors),
@@ -286,6 +356,8 @@ pub(crate) async fn sweep_departed() {
   }
   if settled {
     let _ = crate::state::with_state(settle_departed);
+  } else {
+    let _ = crate::state::with_state(retry_departures);
   }
 }
 
@@ -347,22 +419,57 @@ pub(crate) fn remember(
   else {
     return Ok(());
   };
-  // Only another host's volume is remembered; the reap skips one this node owns by then.
+  // Only another host's volume is remembered; the reap skips one this node owns by then. A volume this node created and
+  // lost to a successor is remembered on its own shard, where the loss is known ([`remember_volume`]).
   if !elsewhere(state, *volume) {
     return Ok(());
   }
+  remember_volume(state, client, *volume)
+}
+
+/// Remembers, on the client's node, that `client` attached `volume` at another host, so its reap reaches that host
+/// ([`reap_at_owners`]); refused `RemoteAttachmentsFull` past [`bound`]. Asked by [`remember`] for a volume another host
+/// created, and on the volume's shard for one this node lost to a successor ([`lost_record_attach`]), before the attach
+/// is sent there. A client whose slot is gone remembers nothing.
+pub(crate) fn remember_volume(
+  state: &mut ShardState,
+  client: slates_mem::Handle<crate::state::ClientSlot>,
+  volume: slates_ipc::protocol::VolumeId,
+) -> Result<(), Refusal> {
   let bound = bound(state);
   let Ok(slot) = state.clients.get_mut(client) else {
     return Ok(());
   };
-  if slot.remote_volumes.contains(volume) {
+  if slot.remote_volumes.contains(&volume) {
     return Ok(());
   }
   if u64::try_from(slot.remote_volumes.len()).unwrap_or(u64::MAX) >= bound {
     return Err(Refusal::RemoteAttachmentsFull { bound });
   }
-  slot.remote_volumes.push(*volume);
+  slot.remote_volumes.push(volume);
   Ok(())
+}
+
+/// [`remember_volume`] for the client at `client_index` on this (its) shard, asked from the volume's shard by a
+/// cross-shard call before the attach is sent to the volume's owner: only while that slot still holds the client
+/// `client_id` that asked, so a slot reused since remembers nothing of the old client's.
+pub(crate) fn remember_volume_at(
+  state: &mut ShardState,
+  (client_index, client_id): (u32, u32),
+  volume: slates_ipc::protocol::VolumeId,
+) -> Result<(), Refusal> {
+  let Some(generation) = state.clients.generation_at(client_index) else {
+    return Ok(());
+  };
+  let client = slates_mem::Handle::from_raw(client_index, generation);
+  let current = state
+    .clients
+    .get(client)
+    .is_ok_and(|slot| slot.client_id == client_id);
+  if !current {
+    return Ok(());
+  }
+  remember_volume(state, client, volume)
 }
 
 /// The reap of a dead client, at the owners of the volumes it attached from this node (`RemoteReap`, routed by each
@@ -378,14 +485,18 @@ pub(crate) async fn reap_at_owners(
     let slot = state.clients.get(handle).ok()?;
     let principal = slot.principal.clone();
     let local = state.fleet.host();
-    // A volume this node owns by now (a takeover) has its attachments ended by the local reap.
+    // A volume this node owns by now (a takeover) has its attachments ended by the local reap. Only its routing says so:
+    // a volume this node created and lost to a successor is remembered too (A-334's sibling), and the creator rule
+    // would take it for this node's own, which the re-admission that yielded it ended (it forgot the host's routing).
     let volumes: Vec<slates_ipc::protocol::VolumeId> = slot
       .remote_volumes
       .iter()
       .copied()
       .filter(|volume| {
-        let object = slates_db::register::ObjectId(volume.bytes);
-        object.creator() != local && state.fleet.object_owner(object) != Some(local)
+        state
+          .fleet
+          .object_owner(slates_db::register::ObjectId(volume.bytes))
+          != Some(local)
       })
       .collect();
     let control = state.shards.first().copied()?;
@@ -412,6 +523,10 @@ pub(crate) async fn reap_at_owners(
   if requests.is_empty() {
     return Ok(());
   }
+  // A wall bound, by its reason (A-440): the task's own waits are on remote owners, each held to the forward lane's
+  // bound (class B), so the control shard's own time would judge the wrong clock; and the remote reap is idempotent at
+  // its owners (`serve_unforwardable`: it ends what the client still holds there and keeps no completion record), so a
+  // reap this wait gives up on is sent again by the next sweep at no cost but the asking.
   crate::xshard::task_within(
     origin,
     control,

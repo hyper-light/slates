@@ -1,17 +1,32 @@
 //! Supervision of the daemon (§2.5 "supervises and restarts the daemon", §2.6 step 1, §4.14
 //! "the anchor observes the daemon"): start it with the segment handed over, observe its exit,
-//! restart it, and stop when it fails faster than it can recover.
+//! restart it, and back off when it fails faster than it can recover.
 //!
-//! The restart bound is derived, not a retry count: a daemon that has failed more times inside
-//! the recovery budget than that budget holds daemon starts is not recovering, and restarting
-//! it again is a busy loop; supervision then records `CrashLoop` in the segment and refuses.
-//! A failure is an exit before the daemon's start was done (`layout::SUP_SERVING`, which the
-//! daemon marks once it serves): an exit after it is a daemon that recovered, restarted at once.
+//! **The rule (A-119, A-311).** A start fails when its daemon exits before it has served as long
+//! as its start took: its start runs from the spawn to the step that first sees its serving mark
+//! (`layout::SUP_SERVING`, which the daemon writes once its start, recovery included, is done),
+//! and its service from there. A daemon that served that long recovered: the supervisor publishes
+//! the verdict (`layout::SUP_RECOVERED`, which `slates status` reports), its exit is restarted at
+//! once, and the count starts again. The first failed start is restarted at once. A second in a
+//! row is a crash loop: recorded as `CrashLoop` in the segment, and restarted after a backoff of at
+//! least the failed daemon's own life, doubling with each further failure up to the policy's cap
+//! ([`RestartPolicy`], the NFSv4 lease its daemon grants, A-525), and never shorter than the failed start took.
+//! So a loop spends at most half its time starting, however long each start takes and whether or
+//! not each daemon served a moment first, and supervision never gives up: every hard mount waits
+//! on the daemon.
+//!
+//! Until 2026-11-17 the bound was a count of restarts inside a window of the recovery budget (a
+//! second) against the starts that budget holds. A start that took longer than the window fell
+//! in a window of its own every time, so it was never a crash loop, and was restarted at once for
+//! good: B10's Linux gate on adacachy2 (load 67-73) restarted a 407-shard start every second for
+//! 27 minutes, each killed after 1,009-1,037 ms of one thread's CPU. And any exit after the
+//! serving mark was restarted at once, however soon it came, so a daemon that died a moment after
+//! it served was never backed off.
+//!
 //! The supervisor is driven by its owner (the `slates anchor` command loop): `step` polls the
 //! child once and never blocks, so the owner interleaves it with heartbeat observation and its
 //! control channel.
 
-use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(unix)]
@@ -50,38 +65,103 @@ pub const ENV_NFS_LISTENER: &str = "SLATES_ANCHOR_NFS";
 /// its plan says. Unix, as the NFS listener's descriptor is.
 pub const ENV_FLEET_SERVE: &str = "SLATES_ANCHOR_FLEET_SERVE";
 
-/// Format: the longest a crash loop's backoff grows to: the major timeout of a hard Linux NFS mount over TCP
-/// (`nfs(5)`: `timeo` defaults to 600 deciseconds, 60 s), the cadence a mounted client retries a silent server at, so
-/// a longer wait gains it nothing (A-119).
-pub const RETRY_CAP_NS: u64 = 60_000_000_000;
+/// Format: the environment variable carrying the descriptor of the version-control servers' shared HTTP edge's listener
+/// the anchor holds (§4.17.2 "Transports" item 1; A-625 part 3), bound once at the address the operator gave
+/// (`--vcs-http`) and inherited by every daemon across its spawn, so the edge's port never drops while a daemon
+/// restarts: a client that connects then waits in the listener's queue for the next daemon. Set only when the anchor
+/// holds one (Unix, as the NFS listener's descriptor is), and a daemon without it binds its own. The daemon adopts it
+/// through `slates_rt::tcp::TcpListener::from_owned`.
+pub const ENV_VCS_HTTP: &str = "SLATES_ANCHOR_VCS_HTTP";
 
-/// The restart policy.
+/// Format: the environment variable carrying the descriptor of the version-control servers' SSH edge's listener the
+/// anchor holds (§4.17.2 "Transports" item 2; A-684), bound once at the address the operator gave (`--vcs-ssh`) and
+/// inherited by every daemon across its spawn, as [`ENV_VCS_HTTP`]'s is, so the edge's port never drops while a daemon
+/// restarts. Its host key is held beside it, in the segment (`layout::SUP_SSH_HOST_SEED`). Set only when the anchor
+/// holds one (Unix), and a daemon without it binds its own.
+pub const ENV_VCS_SSH: &str = "SLATES_ANCHOR_VCS_SSH";
+
+/// Format: the environment variable carrying the descriptor of the svn:// listener the anchor holds (§4.17.4 piece 7;
+/// A-689), bound once at the address the operator gave (`--vcs-svn`) and inherited by every daemon across its spawn, as
+/// [`ENV_VCS_HTTP`]'s is, so the listener's port never drops while a daemon restarts: a client that connects then waits
+/// in the listener's queue for the next daemon. Set only when the anchor holds one (Unix, as the NFS listener's
+/// descriptor is), and a daemon without it binds its own. The daemon adopts it through
+/// `slates_rt::tcp::TcpListener::from_owned`.
+pub const ENV_VCS_SVN: &str = "SLATES_ANCHOR_VCS_SVN";
+
+/// Shape: the failed starts in a row that make a crash loop (A-311): two, the first repeat. One failure is an event, and
+/// restarting it at once is the quickest recovery there is; a second in a row says the next start may fail the same way,
+/// so it waits.
+const CRASH_LOOP_FAILURES: u32 = 2;
+
+/// The restart policy (A-119, A-311): how long a crash loop's backoff may grow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartPolicy {
-  /// The window over which restarts are counted: the recovery budget.
-  pub window_ns: u64,
-  /// Restarts allowed inside the window.
-  pub max_restarts: u32,
+  /// The longest a crash loop's doubling takes the backoff to. A backoff is never shorter than the failed start's own
+  /// life, which may exceed this.
+  pub backoff_cap_ns: u64,
 }
 
 impl RestartPolicy {
-  /// Derived: the window is the recovery budget; the restarts allowed inside it are how many
-  /// daemon starts (at the measured start p99) the budget holds, at least one, so a daemon
-  /// failing faster than it can start is a loop and one that recovers is not.
-  pub fn derive(recovery_budget_ns: u64, daemon_start_p99_ns: u64) -> Derived<RestartPolicy> {
-    let starts = recovery_budget_ns
-      .checked_div(daemon_start_p99_ns.max(1))
-      .unwrap_or(0);
-    let max_restarts = u32::try_from(starts).unwrap_or(u32::MAX).max(1);
+  /// Derived: the cap is the NFSv4 lease the daemon grants every client (`lease_ns`: the server's
+  /// `config::NfsV4Caps::lease_ns`, A-425, an idle Linux client's renewal floor and a liveness window, in whole seconds).
+  /// Capped there, a crash-looping daemon is started again within one lease of its last failure (and never sooner than
+  /// the failed start took), so once the cause clears it serves again before a client that renews at its floor has seen
+  /// its lease run out, and the client keeps its opens, locks and delegations instead of losing them to the outage. The
+  /// lease is the term the daemon's own clients hold it to; nothing about the cap is a setting. Until A-525 the cap was
+  /// the operator's ten-second failover placeholder, past the lease, and until 2026-11-17 60 s, a hard Linux NFS
+  /// mount's major timeout (`nfs(5)`, `timeo` 600), which no mount slates makes sets.
+  pub fn derive(lease_ns: u64) -> Derived<RestartPolicy> {
     derived!(
       RestartPolicy {
-        window_ns: recovery_budget_ns,
-        max_restarts,
+        backoff_cap_ns: lease_ns.max(1),
       },
-      "max_restarts = max(1, recovery_budget_ns / daemon_start_p99_ns); window_ns = recovery_budget_ns",
-      ["recovery_budget_ns", "daemon_start_p99_ns"]
+      "backoff_cap_ns = nfs_v4_lease_ns: a crash loop's doubling stops at the NFSv4 lease the daemon grants, so a \
+       client renewing at its floor finds the daemon back before its lease runs out",
+      ["nfs_v4_lease_ns"]
     )
   }
+}
+
+/// When a daemon whose start ran from `started_ns` to `serving_seen_ns` (the step that first saw its serving mark) has
+/// served as long as its start took (A-311): its exit from then on is no failed start. Pure, so every case tests on any
+/// host.
+pub fn recovered_at(started_ns: u64, serving_seen_ns: u64) -> u64 {
+  serving_seen_ns.saturating_add(serving_seen_ns.saturating_sub(started_ns))
+}
+
+/// The backoff before the next start of a crash loop (A-311): the failed daemon's own `life_ns` for the loop's first,
+/// then twice the last backoff, doubled no further than `cap_ns`, and never shorter than the failed start's own life. So
+/// the loop spends at most half its time starting, however long each start takes. Pure, so every case tests on any host.
+pub fn crash_loop_backoff(life_ns: u64, last_backoff_ns: Option<u64>, cap_ns: u64) -> u64 {
+  last_backoff_ns
+    .map_or(life_ns, |last| last.saturating_mul(2))
+    .min(cap_ns)
+    .max(life_ns)
+    .max(1)
+}
+
+/// The bounds a graceful stop holds its daemon to ([`Supervisor::stop_step`], A-461), each derived by the owner from what
+/// it waits for; none is a fixed second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopBounds {
+  /// The age past which the daemon's beat has lapsed and it is killed: the owner's lapse bound for a running daemon
+  /// (the `slates anchor` loop's: its liveness window plus its own measured lateness, A-228).
+  pub lapse_ns: u64,
+  /// How much of its own beating the daemon is given to acknowledge the request, and to exit once past the deadline it
+  /// declared ([`stop_overdue`]): the owner's liveness window.
+  pub window_ns: u64,
+}
+
+/// Whether a stopping daemon is overdue (A-461), judged by its own beating, not by the owner's clock: it has beaten a
+/// window (`window_ns`) past the request (`requested_ns`) without acknowledging it, or a window past the deadline it
+/// declared (`stop_by`); `beat_ns` is its last beat. A daemon's control loop reads the request at each of its turns, and
+/// the turns are what its beats show, so one that has beaten a window since the request has had a window of turns to
+/// see it and is deaf; one held off its CPUs beats late and is waited for, and one that stops beating is the lapse's to
+/// end ([`StopBounds::lapse_ns`]), so every stop ends. Before, both were counted on the owner's clock from the request
+/// (or the deadline) by the bare liveness budget, and a daemon held off its CPUs past it was killed mid-drain, a planned
+/// handoff of its leadership cut short. Pure, so every case tests on any host.
+pub fn stop_overdue(requested_ns: u64, stop_by: Option<u64>, beat_ns: u64, window_ns: u64) -> bool {
+  beat_ns > stop_by.unwrap_or(requested_ns).saturating_add(window_ns)
 }
 
 /// What one supervision step found.
@@ -93,12 +173,12 @@ pub enum Step {
   Restarted {
     /// The exit code, when the OS reports one (a signal death has none).
     exit_code: Option<i32>,
-    /// Restarts inside the window after this one.
-    in_window: u32,
+    /// The starts that have failed in a row, the one that ended now included: 0 after a daemon that served, 1 after a
+    /// first failure, restarted at once.
+    failed_in_a_row: u32,
   },
-  /// The daemon exited faster than it could recover, past the policy's bound: a crash loop, recorded for the health
-  /// plane, with a restart scheduled after a backoff (A-119; supervision never gives up, since every hard mount waits
-  /// on the daemon).
+  /// A second start failed in a row: a crash loop, recorded for the health plane, with a restart scheduled after a
+  /// backoff (A-119, A-311; supervision never gives up, since every hard mount waits on the daemon).
   CrashLoop {
     /// The exit code.
     exit_code: Option<i32>,
@@ -117,15 +197,15 @@ pub enum Step {
 /// What one step of a graceful stop found ([`Supervisor::stop_step`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Stopping {
-  /// The daemon is still stopping: it acknowledged the request and is inside its declared deadline, or the
-  /// liveness budget has not yet passed without an acknowledgement.
+  /// The daemon is still stopping: it beats, and it is neither deaf to the request nor past its declared deadline by a
+  /// window of its own beating ([`stop_overdue`]).
   Draining,
   /// The daemon has exited and the stop is recorded (nothing restarts it).
   Exited {
     /// The exit code, when the OS reports one (a signal death has none).
     exit_code: Option<i32>,
-    /// Whether the anchor had to kill it: no acknowledgement within the liveness budget, a heartbeat that
-    /// lapsed, or a declared deadline overrun by the budget.
+    /// Whether the anchor had to kill it: a heartbeat that lapsed, or a window of its own beating with no
+    /// acknowledgement or past its declared deadline ([`StopBounds`]).
     killed: bool,
   },
 }
@@ -145,13 +225,20 @@ pub struct Supervisor {
   args: Vec<String>,
   policy: RestartPolicy,
   child: Option<Child>,
-  restarts_at_ns: VecDeque<u64>,
+  /// The starts that have failed in a row: exits before the daemon served as long as its start took (A-311).
+  failed_in_a_row: u32,
+  /// When a step first saw the current daemon's serving mark, on this supervisor's clock: its start's end. `None` until
+  /// then, and again at every start, since a start zeroes the mark.
+  serving_seen_ns: Option<u64>,
+  /// Whether any daemon this supervisor started has reached its serving mark (`layout::SUP_SERVING`): from then a
+  /// client may hold a mount on the instance, so supervision never gives up on it (A-119). Never cleared.
+  ever_served: bool,
   /// When a crash loop's backed-off restart is due (A-119); `None` outside a crash loop.
   retry_at_ns: Option<u64>,
-  /// The backoff the next crash loop waits: the window, doubled by each crash loop to [`RETRY_CAP_NS`], and back to
-  /// the window once a daemon outlives it.
-  backoff_ns: u64,
-  /// When the current daemon was started.
+  /// The backoff the last crash loop waited, doubled by the next ([`crash_loop_backoff`]); `None` until a crash loop,
+  /// and again once a daemon serves.
+  backoff_ns: Option<u64>,
+  /// When the current daemon was started: its life, at its exit, is what a crash loop's backoff starts from.
   started_at_ns: u64,
   /// Ties the daemon's life to the anchor's where the OS offers it (Windows: a job object
   /// that kills its processes when its last handle closes; Linux: the daemon asks for the
@@ -174,6 +261,20 @@ pub struct Supervisor {
   /// restart. Inheritable, as the NFS listener is.
   #[cfg(unix)]
   fleet_serve: Option<(OwnedFd, OwnedFd, Option<OwnedFd>)>,
+  /// The version-control edge's listener the anchor holds, if any (A-625 part 3): bound once at the operator's address
+  /// and handed to each daemon it spawns (via [`ENV_VCS_HTTP`]), so the edge's port survives a restart. Inheritable, as
+  /// the NFS listener is.
+  #[cfg(unix)]
+  vcs_http_listener: Option<OwnedFd>,
+  /// The version-control SSH edge's listener the anchor holds, if any (A-684): handed to each daemon it spawns (via
+  /// [`ENV_VCS_SSH`]), as the HTTP edge's is.
+  #[cfg(unix)]
+  vcs_ssh_listener: Option<OwnedFd>,
+  /// The svn:// listener the anchor holds, if any (A-689): bound once at the operator's address and handed to each
+  /// daemon it spawns (via [`ENV_VCS_SVN`]), so the listener's port survives a restart. Inheritable, as the NFS
+  /// listener is.
+  #[cfg(unix)]
+  vcs_svn_listener: Option<OwnedFd>,
   /// The FUSE devices the anchor holds across daemon restarts, and the channel daemons send them on (A-61;
   /// [`crate::held`]). Linux only, as FUSE is.
   #[cfg(unix)]
@@ -196,6 +297,18 @@ struct DeviceHold {
   refused: u64,
   /// Which refusals the log has said, so that the log stays bounded while the count goes on (A-213).
   logged: crate::handles::RefusalLog<crate::held::HoldRefusal>,
+}
+
+/// What a spawn is handed of the anchor's holdings (A-462): the environment naming the handoff table, and the table's
+/// sealed object, which the caller keeps until the spawn holds its own copy of its descriptor. Nothing of either where
+/// the anchor holds no device channel.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct HeldHandoff {
+  /// The variables to set: the table's pointer.
+  env: Vec<(String, String)>,
+  /// The table's object.
+  table: Option<crate::held::TableObject>,
 }
 
 /// The most messages one drain applies per device the bound allows: a hold, its session and its release are
@@ -249,9 +362,11 @@ impl Supervisor {
       args: args.to_vec(),
       policy,
       child: None,
-      restarts_at_ns: VecDeque::new(),
+      failed_in_a_row: 0,
+      serving_seen_ns: None,
+      ever_served: false,
       retry_at_ns: None,
-      backoff_ns: policy.window_ns,
+      backoff_ns: None,
       started_at_ns: 0,
       lifetime: lifetime::Tie::new(),
       environment: Vec::new(),
@@ -259,6 +374,12 @@ impl Supervisor {
       nfs_listener: None,
       #[cfg(unix)]
       fleet_serve: None,
+      #[cfg(unix)]
+      vcs_http_listener: None,
+      #[cfg(unix)]
+      vcs_ssh_listener: None,
+      #[cfg(unix)]
+      vcs_svn_listener: None,
       #[cfg(unix)]
       devices: None,
       #[cfg(windows)]
@@ -288,16 +409,21 @@ impl Supervisor {
     Ok(())
   }
 
-  /// Opens the Windows hold channel before the first child is spawned. `bound` is the number of live attachments
-  /// this daemon can admit, as for Unix's device bound (A-198). Acknowledgement follows duplication into the anchor.
+  /// Opens the Windows hold channel before the first child is spawned. `bounds` holds each class of entry to its own
+  /// bound: the live attachments this daemon can admit, as for Unix's device bound (A-198), and the DAX sections its
+  /// shards' fill budgets can count, as for Unix's copy bound (A-365, A-448). Acknowledgement follows duplication into
+  /// the anchor.
   #[cfg(windows)]
-  pub fn hold_handles(&mut self, bound: usize) -> Result<(), crate::handles::HandleRefusal> {
+  pub fn hold_handles(
+    &mut self,
+    bounds: crate::handles::HoldBounds,
+  ) -> Result<(), crate::handles::HandleRefusal> {
     if self.child.is_some() || self.windows_handles.is_some() {
       return Err(crate::handles::HandleRefusal::Malformed {
         reason: "the Windows hold must be configured once before starting",
       });
     }
-    self.windows_handles = Some(windows::Hold::new(bound)?);
+    self.windows_handles = Some(windows::Hold::new(bounds)?);
     Ok(())
   }
 
@@ -458,14 +584,18 @@ impl Supervisor {
     self.devices.as_ref().map_or(0, |hold| hold.refused)
   }
 
-  /// The environment handing the device channel and every held device to a daemon about to be spawned, each
-  /// descriptor made inheritable. A descriptor that cannot be made inheritable is left out (and counted): handing
-  /// a number the daemon does not inherit would have it adopt whatever that number names in its own table.
+  /// The handoff to a daemon about to be spawned (A-462): the device channel and every held device, connection and copy,
+  /// each descriptor made inheritable, in one table written into a sealed, read-only object whose descriptor the spawn
+  /// inherits too ([`crate::held::TableObject`]), and the environment naming it ([`crate::held::ENV_HELD`]). The caller
+  /// keeps the object until the spawn holds its own copy. A descriptor that cannot be made inheritable is left out (and
+  /// counted): handing a number the daemon does not inherit would have it adopt whatever that number names in its own
+  /// table. A table that cannot be made refuses the spawn ([`AnchorError::Handoff`]): a daemon started without it would
+  /// take every held entry for none.
   #[cfg(unix)]
-  fn device_env(&mut self) -> Vec<(String, String)> {
+  fn device_env(&mut self) -> Result<HeldHandoff, AnchorError> {
     self.drain_devices();
     let Some(hold) = self.devices.as_mut() else {
-      return Vec::new();
+      return Ok(HeldHandoff::default());
     };
     let inheritable = |fd: &OwnedFd| rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty());
     if let Err(e) = inheritable(&hold.daemon_end) {
@@ -473,7 +603,7 @@ impl Supervisor {
         call: "fcntl(F_SETFD) on the channel",
         code: e.raw_os_error(),
       });
-      return Vec::new();
+      return Ok(HeldHandoff::default());
     }
     let mut lost = Vec::new();
     for (attachment, held) in hold.held.iter() {
@@ -513,20 +643,24 @@ impl Supervisor {
         reason: "a held copy could not be made inheritable",
       });
     }
-    let value = hold
-      .held
-      .env_value(std::os::fd::AsFd::as_fd(&hold.daemon_end));
-    vec![
-      (crate::held::ENV_DEVICES.to_owned(), value),
-      (
-        crate::held::ENV_CONNECTIONS.to_owned(),
-        hold.held.connections_env_value(),
-      ),
-      (
-        crate::held::ENV_COPIES.to_owned(),
-        hold.held.copies_env_value(),
-      ),
-    ]
+    let table = crate::held::Table {
+      devices: hold
+        .held
+        .devices_part(std::os::fd::AsFd::as_fd(&hold.daemon_end)),
+      connections: hold.held.connections_part(),
+      copies: hold.held.copies_part(),
+    };
+    let object = crate::held::TableObject::new(&table).map_err(AnchorError::Handoff)?;
+    rustix::io::fcntl_setfd(object.descriptor(), rustix::io::FdFlags::empty()).map_err(|e| {
+      AnchorError::Handoff(crate::held::HoldRefusal::Os {
+        call: "fcntl(F_SETFD) on the handoff table",
+        code: e.raw_os_error(),
+      })
+    })?;
+    Ok(HeldHandoff {
+      env: vec![(crate::held::ENV_HELD.to_owned(), object.pointer())],
+      table: Some(object),
+    })
   }
 
   /// Hands `name=value` to every daemon this supervisor spawns: the handoff of an endpoint the owner holds across
@@ -554,13 +688,28 @@ impl Supervisor {
     self.fleet_serve = Some((probe, record, export));
   }
 
-  /// Replaces the policy (the anchor re-derives it as daemon starts are measured).
-  pub fn set_policy(&mut self, policy: RestartPolicy) {
-    // A backoff under way keeps its length; the next one starts from the new window.
-    if self.retry_at_ns.is_none() {
-      self.backoff_ns = policy.window_ns;
-    }
-    self.policy = policy;
+  /// Holds `fd` — a bound, listening socket at the address the operator gave the version-control edge — as the edge's
+  /// listener handed to every daemon this supervisor spawns, so its port is stable across restarts (A-625 part 3). It
+  /// must be inheritable, as [`Supervisor::hold_nfs_listener`]'s is; the supervisor owns it for its life.
+  #[cfg(unix)]
+  pub fn hold_vcs_http_listener(&mut self, fd: OwnedFd) {
+    self.vcs_http_listener = Some(fd);
+  }
+
+  /// Holds `fd` — a bound, listening socket at the address the operator gave the version-control SSH edge — as the
+  /// edge's listener handed to every daemon this supervisor spawns, so its port is stable across restarts (A-684). It
+  /// must be inheritable, as [`Supervisor::hold_vcs_http_listener`]'s is; the supervisor owns it for its life.
+  #[cfg(unix)]
+  pub fn hold_vcs_ssh_listener(&mut self, fd: OwnedFd) {
+    self.vcs_ssh_listener = Some(fd);
+  }
+
+  /// Holds `fd` — a bound, listening socket at the address the operator gave the svn:// listener — as the listener
+  /// handed to every daemon this supervisor spawns, so its port is stable across restarts (A-689). It must be
+  /// inheritable, as [`Supervisor::hold_nfs_listener`]'s is; the supervisor owns it for its life.
+  #[cfg(unix)]
+  pub fn hold_vcs_svn_listener(&mut self, fd: OwnedFd) {
+    self.vcs_svn_listener = Some(fd);
   }
 
   /// The segment.
@@ -579,6 +728,7 @@ impl Supervisor {
       return Ok(());
     }
     self.started_at_ns = now_ns;
+    self.serving_seen_ns = None;
     let mut env = self.segment.handoff_env()?;
     env.push((ENV_ANCHOR_PID.to_owned(), std::process::id().to_string()));
     // Hand the held NFS listener's descriptor over: it is inheritable (not close-on-exec), so the
@@ -596,10 +746,32 @@ impl Supervisor {
       }
       env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
-    // And the hold channel with every FUSE device (A-61) and NFS connection (A-113) held: the daemon takes back the
-    // mounts it recovers and answers the connections the dead daemon left.
+    // And the held version-control edge's listener, the same way: the daemon adopts it rather than binding (A-625 part
+    // 3), so the edge's port never drops while a daemon restarts.
     #[cfg(unix)]
-    env.extend(self.device_env());
+    if let Some(fd) = &self.vcs_http_listener {
+      env.push((ENV_VCS_HTTP.to_owned(), fd.as_raw_fd().to_string()));
+    }
+    // And the SSH edge's, the same way (A-684).
+    #[cfg(unix)]
+    if let Some(fd) = &self.vcs_ssh_listener {
+      env.push((ENV_VCS_SSH.to_owned(), fd.as_raw_fd().to_string()));
+    }
+    // And the held svn:// listener, the same way (A-689).
+    #[cfg(unix)]
+    if let Some(fd) = &self.vcs_svn_listener {
+      env.push((ENV_VCS_SVN.to_owned(), fd.as_raw_fd().to_string()));
+    }
+    // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
+    // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the
+    // dead daemon left. The table's object is kept until the spawn holds its own copy.
+    #[cfg(unix)]
+    let HeldHandoff {
+      env: held_env,
+      table: _table,
+    } = self.device_env()?;
+    #[cfg(unix)]
+    env.extend(held_env);
     env.extend(self.environment.iter().cloned());
     // The daemon before this one may have died inside its republication of the profile; the anchor's is whole again
     // before the next reads it. No daemon runs now, so nothing else writes it.
@@ -652,7 +824,7 @@ impl Supervisor {
       .map_err(|error| AnchorError::Hold(crate::handles::HandleRefusal::Ipc(error)))
   }
 
-  /// Polls the daemon once: running, restarted after an exit, or refused as a crash loop.
+  /// Polls the daemon once: running, restarted after an exit, or backed off as a crash loop (the module's rule).
   pub fn step(&mut self, now_ns: u64) -> Result<Step, AnchorError> {
     // Every step takes what the daemon sent, so a device it established is held within a step of its send,
     // and everything a dead daemon sent is applied before its successor starts.
@@ -669,7 +841,7 @@ impl Supervisor {
       self.start(now_ns)?;
       return Ok(Step::Restarted {
         exit_code: None,
-        in_window: u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX),
+        failed_in_a_row: self.failed_in_a_row,
       });
     }
     let Some(child) = self.child.as_mut() else {
@@ -678,9 +850,11 @@ impl Supervisor {
     let status = match child.try_wait() {
       Ok(Some(status)) => status,
       Ok(None) => {
-        // A daemon that outlived the window recovered: the next crash loop backs off from the window again.
-        if now_ns.saturating_sub(self.started_at_ns) > self.policy.window_ns {
-          self.backoff_ns = self.policy.window_ns;
+        // A daemon that served as long as its start took has recovered: the next failure starts a new count, and a new
+        // loop backs off from its own failed start again.
+        if self.recovered(now_ns)? {
+          self.failed_in_a_row = 0;
+          self.backoff_ns = None;
         }
         return Ok(Step::Running);
       }
@@ -692,37 +866,33 @@ impl Supervisor {
     };
     self.child = None;
     let exit_code = status.code();
-    // Only a daemon that exited before its start was done counts toward the bound: one that served had recovered, so
-    // restarting it is not a busy loop (the module's rule). Its own mark says so (`layout::SUP_SERVING`), not its first
-    // beat, since a recovering daemon beats (its recovery runs in slices). Until 2026-11-09 every exit counted, and a
-    // daemon killed while serving more often than the window holds starts was backed off as a crash loop (the WinFsp
-    // drive test, backed off 16 s at its twentieth kill on both Windows runners).
-    if self.segment.supervision()?.serving_since().is_some() {
-      self.backoff_ns = self.policy.window_ns;
+    // Only a daemon that exited before it served as long as its start took failed: one that served that long had
+    // recovered, so restarting it is no busy loop, and one that died sooner spent more of its life starting than serving.
+    // Its serving mark (`layout::SUP_SERVING`) ends its start, not its first beat, since a recovering daemon beats (its
+    // recovery runs in slices). Until 2026-11-09 every exit counted, and a daemon killed while serving more often than
+    // the window held starts was backed off as a crash loop (the WinFsp drive test, backed off 16 s at its twentieth kill
+    // on both Windows runners); until 2026-11-17 every exit after the mark was restarted at once, however soon it came.
+    if self.recovered(now_ns)? {
+      self.failed_in_a_row = 0;
+      self.backoff_ns = None;
       self.segment.supervision()?.record_exit(false);
       self.start(now_ns)?;
       return Ok(Step::Restarted {
         exit_code,
-        in_window: u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX),
+        failed_in_a_row: 0,
       });
     }
-    self.restarts_at_ns.push_back(now_ns);
-    while self
-      .restarts_at_ns
-      .front()
-      .is_some_and(|t| now_ns.saturating_sub(*t) > self.policy.window_ns)
-    {
-      self.restarts_at_ns.pop_front();
-    }
-    let in_window = u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX);
-    if in_window > self.policy.max_restarts {
-      // Not given up on (A-119): the loop is recorded, and the daemon restarted after a backoff that doubles each time
-      // to the cap, as Kubernetes backs off a crash-looping container. Every hard NFS mount on this daemon waits for
-      // it; a supervisor that stopped restarting left them hung for good (2026-10-08: two kills 0.3 s apart on a
-      // loaded host, whose recovery had stretched to 160-490 ms, ended supervision).
+    self.failed_in_a_row = self.failed_in_a_row.saturating_add(1);
+    if self.failed_in_a_row >= CRASH_LOOP_FAILURES {
+      // Not given up on (A-119): the loop is recorded, and the daemon restarted after a backoff that starts from the
+      // failed start's own life and doubles to the cap (A-311), as Kubernetes backs off a crash-looping container. Every
+      // hard NFS mount on this daemon waits for it; a supervisor that stopped restarting left them hung for good
+      // (2026-10-08: two kills 0.3 s apart on a loaded host, whose recovery had stretched to 160-490 ms, ended
+      // supervision).
+      let life_ns = now_ns.saturating_sub(self.started_at_ns);
+      let retry_in_ns = crash_loop_backoff(life_ns, self.backoff_ns, self.policy.backoff_cap_ns);
+      self.backoff_ns = Some(retry_in_ns);
       self.segment.supervision()?.record_exit(true);
-      let retry_in_ns = self.backoff_ns;
-      self.backoff_ns = self.backoff_ns.saturating_mul(2).min(RETRY_CAP_NS);
       self.retry_at_ns = Some(now_ns.saturating_add(retry_in_ns));
       return Ok(Step::CrashLoop {
         exit_code,
@@ -733,8 +903,51 @@ impl Supervisor {
     self.start(now_ns)?;
     Ok(Step::Restarted {
       exit_code,
-      in_window,
+      failed_in_a_row: self.failed_in_a_row,
     })
+  }
+
+  /// Whether the current daemon has served as long as its start took (A-311), on this supervisor's clock: its start
+  /// from the spawn to the step that first saw its serving mark, its service from that step to `now_ns`
+  /// ([`recovered_at`]). The first time it holds, the verdict is published (`layout::SUP_RECOVERED`). A step that finds
+  /// no mark forgets any it saw, since a start zeroes the mark.
+  fn recovered(&mut self, now_ns: u64) -> Result<bool, AnchorError> {
+    let supervision = self.segment.supervision()?;
+    if supervision.serving_since().is_none() {
+      self.serving_seen_ns = None;
+      return Ok(false);
+    }
+    self.ever_served = true;
+    if supervision.recovered_since().is_some() {
+      return Ok(true);
+    }
+    let seen = *self.serving_seen_ns.get_or_insert(now_ns);
+    let recovered = now_ns >= recovered_at(self.started_at_ns, seen);
+    if recovered {
+      supervision.mark_recovered(now_ns);
+    }
+    Ok(recovered)
+  }
+
+  /// Whether any daemon this supervisor started has reached its serving mark, its exit step included (a daemon that
+  /// marked and died at once is seen at its exit). From then a client may have attached to the instance and hold a
+  /// mount on it, which waits on a daemon, so nothing gives the instance up (A-119); before, none could have, and an
+  /// owner whose starter asked for it may stop the anchor when its daemons crash-loop without ever serving (A-366).
+  pub fn ever_served(&self) -> bool {
+    self.ever_served
+  }
+
+  /// Whether the current daemon has been judged recovered (`layout::SUP_RECOVERED`): until then its owner looks at it
+  /// every beat, so the verdict comes within a beat of being due.
+  pub fn has_recovered(&self) -> Result<bool, AnchorError> {
+    Ok(self.segment.supervision()?.recovered_since().is_some())
+  }
+
+  /// How long the current daemon's start took, spawn to the step that first saw its serving mark; `None` before.
+  pub fn start_took_ns(&self) -> Option<u64> {
+    self
+      .serving_seen_ns
+      .map(|seen| seen.saturating_sub(self.started_at_ns))
   }
 
   /// Kills the daemon without taking it (the anchor found its heartbeat lapsed, §4.14
@@ -761,16 +974,11 @@ impl Supervisor {
   }
 
   /// One step of a graceful stop, never blocking. `Exited` once the daemon has exited — the stop is recorded,
-  /// so no later step restarts it. Otherwise the anchor **kills** the daemon, and reports it killed, when it
-  /// has not acknowledged the request within `liveness_budget_ns`, when its heartbeat is older than that
-  /// budget (a wedged daemon), or when it has run past its own declared deadline by that budget; while none
-  /// of these holds it is `Draining`. Every bound is one the daemon declared or the liveness budget the
-  /// anchor already holds it to — none is new.
-  pub fn stop_step(
-    &mut self,
-    now_ns: u64,
-    liveness_budget_ns: u64,
-  ) -> Result<Stopping, AnchorError> {
+  /// so no later step restarts it. Otherwise the anchor **kills** the daemon, and reports it killed, when its
+  /// heartbeat is older than `bounds.lapse_ns` (a wedged daemon), or when it has beaten `bounds.window_ns` past the
+  /// request without acknowledging it or past its own declared deadline ([`stop_overdue`]); while none of these holds
+  /// it is `Draining`. Every bound is one the daemon declared or one the owner derives (A-461) — none is new.
+  pub fn stop_step(&mut self, now_ns: u64, bounds: StopBounds) -> Result<Stopping, AnchorError> {
     // A stop ends a crash loop's backoff too: nothing restarts the daemon after it.
     self.retry_at_ns = None;
     let Some(child) = self.child.as_mut() else {
@@ -799,12 +1007,14 @@ impl Supervisor {
     let give_up = {
       let supervision = self.segment.supervision()?;
       let requested = supervision.stop_requested_at().unwrap_or(now_ns);
-      let (alive, _) = supervision.alive(now_ns, liveness_budget_ns);
-      let overdue = match supervision.stop_by() {
-        None => now_ns.saturating_sub(requested) > liveness_budget_ns,
-        Some(deadline) => now_ns > deadline.saturating_add(liveness_budget_ns),
-      };
-      !alive || overdue
+      let (alive, _) = supervision.alive(now_ns, bounds.lapse_ns);
+      !alive
+        || stop_overdue(
+          requested,
+          supervision.stop_by(),
+          supervision.heartbeat_ns(),
+          bounds.window_ns,
+        )
     };
     if !give_up {
       return Ok(Stopping::Draining);
@@ -1005,5 +1215,125 @@ impl DeviceHold {
     if self.logged.first_sighting(refusal) {
       slates_machine::log_line!("slates anchor: a hold message was refused: {refusal}");
     }
+  }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+  use super::*;
+
+  /// Shape: the lease the tests derive their cap from: ten seconds, many lives long.
+  const LEASE_NS: u64 = 10_000_000_000;
+  /// Shape: a failed start's life, many times under the lease: 300 ms.
+  const LIFE_NS: u64 = 300_000_000;
+
+  /// A-311, §2.6 step 1. Do: follow a crash loop's backoffs over failed starts of one life, under the cap the anchor
+  /// derives from a lease many lives long. Expect the first backoff the failed start's own life, each next twice
+  /// the last, and the cap once the doubling passes it, held there.
+  #[test]
+  fn a_crash_loops_backoff_starts_at_the_failed_starts_life_and_doubles_to_the_cap() {
+    let cap = RestartPolicy::derive(LEASE_NS).get().backoff_cap_ns;
+    let mut last = None;
+    let mut backoffs = Vec::new();
+    for _ in 0..8 {
+      let backoff = crash_loop_backoff(LIFE_NS, last, cap);
+      backoffs.push(backoff);
+      last = Some(backoff);
+    }
+    assert_eq!(
+      backoffs,
+      [
+        LIFE_NS,
+        2 * LIFE_NS,
+        4 * LIFE_NS,
+        8 * LIFE_NS,
+        16 * LIFE_NS,
+        32 * LIFE_NS,
+        LEASE_NS,
+        LEASE_NS
+      ]
+    );
+  }
+
+  /// A-311. Do: ask when daemons have served as long as their starts took: a start of a life from the clock's zero, one
+  /// from later, one of no time, and one whose serving mark the clock saw before its start (a clock that went back).
+  /// Expect each recovered a start's length after its mark was seen, at the mark itself for a start of no time, and
+  /// never before the mark.
+  #[test]
+  fn a_daemon_has_recovered_once_it_has_served_as_long_as_its_start_took() {
+    assert_eq!(recovered_at(0, LIFE_NS), 2 * LIFE_NS);
+    assert_eq!(
+      recovered_at(LEASE_NS, LEASE_NS + LIFE_NS),
+      LEASE_NS + 2 * LIFE_NS
+    );
+    assert_eq!(recovered_at(LEASE_NS, LEASE_NS), LEASE_NS);
+    assert_eq!(recovered_at(LEASE_NS, LIFE_NS), LIFE_NS);
+  }
+
+  /// A-311. Do: back off failed starts longer than the cap, and a loop whose starts grow longer mid-way. Expect every
+  /// backoff at least the failed start's own life, so a loop never spends more than half its time starting, whatever
+  /// the cap; and a start that takes no measurable time still waits a nanosecond, never none.
+  #[test]
+  fn a_backoff_is_never_shorter_than_the_failed_starts_own_life() {
+    let cap = RestartPolicy::derive(LEASE_NS).get().backoff_cap_ns;
+    let long = 3 * LEASE_NS;
+    assert_eq!(crash_loop_backoff(long, None, cap), long);
+    assert_eq!(crash_loop_backoff(long, Some(long), cap), long);
+    assert_eq!(crash_loop_backoff(long, Some(LIFE_NS), cap), long);
+    assert_eq!(crash_loop_backoff(0, None, cap), 1);
+    assert_eq!(
+      RestartPolicy::derive(0).get().backoff_cap_ns,
+      1,
+      "no lease still caps at a nanosecond, never at zero"
+    );
+  }
+}
+
+#[cfg(test)]
+mod stop_tests {
+  use super::*;
+
+  /// Shape: the window the stop is judged by in these cases: a second, the liveness window on a quiet anchor.
+  const WINDOW_NS: u64 = 1_000_000_000;
+  /// Shape: the request's time on the host's clock.
+  const ASKED_NS: u64 = 50 * WINDOW_NS;
+  /// Shape: the deadline a daemon declares, a few windows past the request.
+  const DEADLINE_NS: u64 = ASKED_NS + 3 * WINDOW_NS;
+
+  /// A-461, §2.5 "supervises and restarts the daemon". Do: judge a stopping daemon by its last beat: one that has not
+  /// acknowledged and was held off its CPUs, so its last beat came just after the request while the owner's clock ran
+  /// two windows on; one that beat a window past the request and is deaf; one that acknowledged and beats inside its
+  /// deadline and its window after it; and one beating past both. Expect: the held daemon waited for (the owner's clock
+  /// alone, as before, killed it mid-drain), the deaf one overdue, the draining one waited for, the overrunning one
+  /// overdue.
+  #[test]
+  fn a_stopping_daemon_is_overdue_by_its_own_beating_not_by_the_owners_clock() {
+    let held_beat = ASKED_NS + WINDOW_NS / 10;
+    assert!(
+      !stop_overdue(ASKED_NS, None, held_beat, WINDOW_NS),
+      "a daemon held off its CPUs since the request has beaten no window of it"
+    );
+    assert!(
+      stop_overdue(ASKED_NS, None, ASKED_NS + WINDOW_NS + 1, WINDOW_NS),
+      "a window of its own beating with no acknowledgement is deaf"
+    );
+    assert!(
+      !stop_overdue(
+        ASKED_NS,
+        Some(DEADLINE_NS),
+        DEADLINE_NS + WINDOW_NS,
+        WINDOW_NS
+      ),
+      "inside its deadline and a window past it, it drains"
+    );
+    assert!(
+      stop_overdue(
+        ASKED_NS,
+        Some(DEADLINE_NS),
+        DEADLINE_NS + WINDOW_NS + 1,
+        WINDOW_NS
+      ),
+      "a window of its own beating past the deadline it declared is overdue"
+    );
   }
 }

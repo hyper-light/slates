@@ -30,6 +30,9 @@ use std::time::{Duration, Instant};
 
 use slates_client::{Client, ClientError, Deadlines, ReadAt, Submitted, VolumeId};
 
+#[path = "support/recovered.rs"]
+mod recovered;
+
 /// Shape: how long the anchor's daemon, or its successor after a kill, may take to answer.
 const START_WAIT: Duration = Duration::from_secs(60);
 /// Shape: the kills, each landing as a submit leaves the client.
@@ -44,6 +47,8 @@ const BLOCK: usize = 16;
 const ROUNDS_BETWEEN_KILLS: u64 = 20;
 /// Shape: the shards the anchor's daemon runs, two so the client's shard and the green's can differ.
 const SHARDS: &str = "2";
+/// Shape: the pause between two polls of the test's waits.
+const POLL: Duration = Duration::from_millis(20);
 
 fn slates() -> Command {
   Command::new(env!("CARGO_BIN_EXE_slates"))
@@ -66,7 +71,7 @@ fn run(instance: &str, args: &[&str]) -> (i32, String) {
 fn pause() {
   // The test harness paces its polls; shipped code parks on its driver (D-9).
   #[allow(clippy::disallowed_methods)]
-  std::thread::sleep(Duration::from_millis(20));
+  std::thread::sleep(POLL);
 }
 
 /// The anchor: killed and reaped when dropped, so a failed assertion leaves nothing behind.
@@ -85,7 +90,7 @@ impl Drop for AnchorProcess {
   }
 }
 
-/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`).
+/// Format: the start of the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`).
 const SERVING_LINE: &str = "slates daemon: instance ";
 
 /// Starts `slates anchor --quick`, waits for its daemon to serve and answer, and bootstraps the consensus group.
@@ -217,11 +222,12 @@ struct Shared {
   done: AtomicBool,
 }
 
-/// The killer: each time the client is about to submit, after enough rounds since the last kill, `SIGKILL` the daemon
-/// at once, then wait for the anchor's successor.
+/// The killer: each time the client is about to submit, after enough rounds since the last kill and once the anchor has
+/// judged the daemon recovered (A-311: a daemon killed sooner is a failed start, and a second in a row is a crash loop
+/// the anchor backs off), `SIGKILL` the daemon at once, then wait for the anchor's successor.
 fn killer(instance: &str, shared: &Shared) {
   for _ in 0..KILLS {
-    let pid = daemon_pid(instance).expect("the daemon answers");
+    let pid = recovered::await_recovered(instance, &|_| true, POLL, START_WAIT);
     let after = shared.rounds.load(Ordering::SeqCst) + ROUNDS_BETWEEN_KILLS;
     let started = Instant::now();
     while !(shared.aim.load(Ordering::SeqCst) && shared.rounds.load(Ordering::SeqCst) >= after) {

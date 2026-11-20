@@ -45,7 +45,7 @@ const SERVER_TARGETS: [&str; 4] = [
 
 /// Shape: the tests the lane leaves out, each with why. A skipped test still runs in every other lane;
 /// only its assertion is one the instrumentation itself falsifies.
-const SKIPPED: [(&str, &str); 5] = [
+const SKIPPED: [(&str, &str); 7] = [
   (
     "region::tests::locking_a_small_region_is_reported_by_the_os_within_one_page",
     "ThreadSanitizer ignores mlock (its runtime prints `ThreadSanitizer ignores mlock/mlockall/munlock/\
@@ -76,10 +76,28 @@ const SKIPPED: [(&str, &str); 5] = [
      instrumented, 0 of 10 plain); that the slower instrumented step crossed the quantum is the hypothesis",
   ),
   (
+    "a_poll_the_host_kept_off_its_cpu_is_not_its_tasks",
+    "the sibling of the entry above: it pins the shard and a spinner to one CPU and classifies each held step by \
+     its measured CPU time against the 1 ms quantum; under instrumentation main 7cc0a13a5's run 44397328424 (x86, \
+     2026-11-18) judged its three long polls one the task's, one blocked and one the host's, (1, 1, 1, 1) where it \
+     wants (0, 0, 2, 1), while e418f5cd2's run that day passed it with no runtime change between them that touches \
+     the classification; that the instrumented poll's own CPU crossed the quantum is the hypothesis",
+  ),
+  (
     "a_client_learns_its_wake_from_the_parks_a_reply_ended",
     "it counts parks whose wake was confirmed against a measured sleep; under instrumentation one CI run \
      (37142294661, 2026-10-03) counted 12 of 32 where it needs 16. Not reproduced here (0 of 40 across plain, \
      instrumented, alone and at 4 CPUs); that the slower instrumented client was not yet asleep is the hypothesis",
+  ),
+  (
+    "thread_clock::tests::a_thread_the_kernel_holds_reads_uninterruptible_and_a_sleeping_one_does_not",
+    "it holds a thread in a vfork's wait by `clone(CLONE_VM | CLONE_VFORK)`, and ThreadSanitizer models every \
+     clone as a fork: its interceptor runs `ForkChildAfter` in the child, whose `ThreadRegistry::OnFork` erases \
+     every other thread's `pthread_t` from the registry (compiler-rt `tsan_interceptors_posix.cpp`, \
+     `sanitizer_thread_registry.cpp`). The child shares the parent's memory, so the erase is the parent's, and \
+     the next `pthread_detach` of a test thread fails `CHECK(t)` in `ConsumeThreadUserId`: main 5a930fc64's run \
+     44347203376 aborted there, at the second scoped thread's handle (thread_clock.rs:907). The test reads kernel \
+     thread states and shares no memory to race on; it runs in every other Linux lane",
   ),
 ];
 

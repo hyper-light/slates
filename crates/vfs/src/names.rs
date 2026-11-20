@@ -1,7 +1,9 @@
 //! Names and the per-volume equivalence policy (D-4): byte-exact, or folded by Unicode
 //! normalization and case the way APFS does, so `README` and `readme`, or a precomposed and a
 //! decomposed `é`, are one entry on a folding volume (`EEXIST` for the second) and two on an
-//! exact one [B: Apple APFS FAQ; B: git-config `core.ignoreCase`, `core.precomposeUnicode`].
+//! exact one [B: Apple APFS FAQ; B: git-config `core.ignoreCase`, `core.precomposeUnicode`], or
+//! folded unit by unit through Windows' upcase table as NTFS, exFAT and WinFsp's driver fold them,
+//! so a WinFsp drive and its volume take the same names for one (A-576, [`crate::upcase`]).
 //!
 //! A lookup hashes the folded form and compares folded forms on a hash hit; the entry stores its
 //! name as given, so `readdir` returns what was created.
@@ -18,14 +20,21 @@ pub enum NameEquivalence {
   Exact,
   /// Normalization-insensitive and case-insensitive (APFS's default).
   Fold,
+  /// Case-insensitive by Windows' upcase table, unit by unit, with no normalization: how NTFS, exFAT and WinFsp's
+  /// driver compare names (A-576, [`crate::upcase`]). A WinFsp drive that declares no `CaseSensitiveSearch` takes two
+  /// names for one exactly when such a volume does, so final sigma `ς` and `σ` are one name (`EEXIST` for the second,
+  /// where `Fold` keeps two files one file node of the driver's would join) and a decomposed and a precomposed `é` are
+  /// two, as on NTFS.
+  Upcase,
 }
 
 /// Format: the longest name a volume accepts, the POSIX `NAME_MAX` every target shares.
 pub const NAME_MAX: usize = 255;
 
 /// The folded characters of a name: the bytes as they are for the exact policy, the
-/// ASCII-lowercased bytes for an ASCII name under folding (NFC is the identity on ASCII), and
-/// the NFC-normalized, lowercased characters otherwise. No allocation on any path, so a lookup
+/// ASCII-lowercased bytes for an ASCII name under folding (NFC is the identity on ASCII), the
+/// NFC-normalized, lowercased characters otherwise, and under `Upcase` each character through
+/// Windows' upcase table (A-576). No allocation on any path, so a lookup
 /// costs the scan and nothing else (measured: the allocating fold cost 1.2 µs per lookup on
 /// 49-byte names, 2026-09-05, `cargo run --release -p slates-vfs --example vfs_bench`).
 pub enum Folded<'a> {
@@ -36,6 +45,8 @@ pub enum Folded<'a> {
   /// NFC then full Unicode lowercase; boxed because the recomposition buffer is large and
   /// this path is the rare one (a non-ASCII name).
   Unicode(Box<UnicodeFold<'a>>),
+  /// Each character as Windows' upcase table maps it ([`crate::upcase::upcase_char`]).
+  Upcase(UpcaseFold<'a>),
 }
 
 /// NFC recomposition followed by full lowercase, character by character.
@@ -45,6 +56,9 @@ pub type UnicodeFold<'a> = std::iter::FlatMap<
   fn(char) -> std::char::ToLowercase,
 >;
 
+/// Each character through Windows' upcase table, one for one.
+pub type UpcaseFold<'a> = std::iter::Map<std::str::Chars<'a>, fn(char) -> char>;
+
 impl Iterator for Folded<'_> {
   type Item = char;
 
@@ -53,14 +67,16 @@ impl Iterator for Folded<'_> {
       Self::Exact(c) => c.next(),
       Self::Ascii(b) => b.next().map(|b| char::from(b.to_ascii_lowercase())),
       Self::Unicode(u) => u.next(),
+      Self::Upcase(u) => u.next(),
     }
   }
 }
 
 impl NameEquivalence {
   /// Whether the policy distinguishes names that differ only in case (or normalization). `Exact`
-  /// does — bytes must match — so it is case-sensitive; `Fold` treats such names as one, so it is
-  /// not. A transport reports this to a client (NFS `PATHCONF`'s `case_insensitive`, WinFsp, FSKit).
+  /// does — bytes must match — so it is case-sensitive; `Fold` and `Upcase` treat such names as one,
+  /// so they are not. A transport reports this to a client (NFS `PATHCONF`'s `case_insensitive`,
+  /// WinFsp, FSKit).
   pub const fn case_sensitive(self) -> bool {
     matches!(self, NameEquivalence::Exact)
   }
@@ -71,6 +87,7 @@ impl NameEquivalence {
       Self::Exact => Folded::Exact(name.chars()),
       Self::Fold if name.is_ascii() => Folded::Ascii(name.bytes()),
       Self::Fold => Folded::Unicode(Box::new(name.nfc().flat_map(char::to_lowercase))),
+      Self::Upcase => Folded::Upcase(name.chars().map(crate::upcase::upcase_char)),
     }
   }
 
@@ -79,7 +96,7 @@ impl NameEquivalence {
   pub fn fold(self, name: &str) -> std::borrow::Cow<'_, str> {
     match self {
       Self::Exact => std::borrow::Cow::Borrowed(name),
-      Self::Fold => std::borrow::Cow::Owned(self.folded(name).collect()),
+      Self::Fold | Self::Upcase => std::borrow::Cow::Owned(self.folded(name).collect()),
     }
   }
 
@@ -94,12 +111,8 @@ impl NameEquivalence {
           h.write_u8(b.to_ascii_lowercase());
         }
       }
-      Folded::Unicode(chars) => {
-        let mut utf8 = [0u8; 4];
-        for c in chars {
-          h.write(c.encode_utf8(&mut utf8).as_bytes());
-        }
-      }
+      Folded::Unicode(chars) => write_utf8(&mut h, chars),
+      Folded::Upcase(chars) => write_utf8(&mut h, chars),
     }
     h.finish()
   }
@@ -108,30 +121,45 @@ impl NameEquivalence {
   pub fn same(self, a: &str, b: &str) -> bool {
     match self {
       Self::Exact => a == b,
-      Self::Fold if a.is_ascii() && b.is_ascii() => a.eq_ignore_ascii_case(b),
-      Self::Fold => self.folded(a).eq(self.folded(b)),
+      Self::Fold | Self::Upcase if a.is_ascii() && b.is_ascii() => a.eq_ignore_ascii_case(b),
+      Self::Fold | Self::Upcase => self.folded(a).eq(self.folded(b)),
     }
   }
 
   /// The order of two names' folded forms — exactly `self.folded(a).cmp(self.folded(b))` — without an iterator step per
   /// character in the common cases: an exact name compares as bytes (UTF-8's byte order is its code-point order), and
-  /// two ASCII names under folding compare as lowercased bytes, then by length. A replayed delta binary-searches its
+  /// two ASCII names under folding compare as lowercased bytes (upcased under `Upcase`), then by length. A replayed delta
+  /// binary-searches its
   /// directory's entries with this, and the iterator form was a fifth of a recovery's replay (2026-10-06,
   /// `recover_bench`).
   pub fn compare(self, a: &str, b: &str) -> std::cmp::Ordering {
     match self {
       Self::Exact => a.as_bytes().cmp(b.as_bytes()),
-      Self::Fold if a.is_ascii() && b.is_ascii() => {
-        for (x, y) in a.bytes().zip(b.bytes()) {
-          let (x, y) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
-          if x != y {
-            return x.cmp(&y);
-          }
-        }
-        a.len().cmp(&b.len())
-      }
-      Self::Fold => self.folded(a).cmp(self.folded(b)),
+      Self::Fold if a.is_ascii() && b.is_ascii() => ascii_order(a, b, u8::to_ascii_lowercase),
+      // Windows' table upcases ASCII's `a` to `z` and maps nothing past ASCII into it, so an ASCII name's folded
+      // form is its bytes upcased (`crate::upcase`'s tests).
+      Self::Upcase if a.is_ascii() && b.is_ascii() => ascii_order(a, b, u8::to_ascii_uppercase),
+      Self::Fold | Self::Upcase => self.folded(a).cmp(self.folded(b)),
     }
+  }
+}
+
+/// The order of two ASCII names' folded forms, each byte folded by `fold`, then by length.
+fn ascii_order(a: &str, b: &str, fold: fn(&u8) -> u8) -> std::cmp::Ordering {
+  for (x, y) in a.bytes().zip(b.bytes()) {
+    let (x, y) = (fold(&x), fold(&y));
+    if x != y {
+      return x.cmp(&y);
+    }
+  }
+  a.len().cmp(&b.len())
+}
+
+/// Feeds a folded form's characters to `hasher` as their UTF-8 bytes, as every folded hash is taken.
+fn write_utf8(hasher: &mut Fnv, chars: impl Iterator<Item = char>) {
+  let mut utf8 = [0u8; 4];
+  for c in chars {
+    hasher.write(c.encode_utf8(&mut utf8).as_bytes());
   }
 }
 
@@ -209,6 +237,40 @@ mod tests {
     assert_eq!(NameEquivalence::Fold.fold("Stra\u{df}e"), "stra\u{df}e");
   }
 
+  /// A-576, §4.4 name policy, T-4.6. Do: compare names under `Upcase` and under `Fold`: two cases of ASCII, two cases of
+  /// `é`, final and medial sigma, a precomposed and a decomposed `é`, the Kelvin sign and `k`, and `ß`. Expect: `Upcase`
+  /// takes the cases and the sigmas for one name, with one hash, as Windows' upcase table does, and keeps the two `é`
+  /// spellings and the Kelvin sign apart, as NTFS does; `Fold` the opposite at each of the last three; `ß` kept as it is
+  /// by both. Before A-576 no policy folded as a WinFsp drive does.
+  #[test]
+  fn upcase_folds_names_as_windows_upcase_table_does() {
+    use NameEquivalence::{Fold, Upcase};
+    for (a, b) in [
+      ("README", "readme"),
+      ("CAF\u{c9}.TXT", "caf\u{e9}.txt"),
+      ("\u{3c3}.txt", "\u{3c2}.txt"),
+      ("\u{3a3}", "\u{3c2}"),
+    ] {
+      assert!(Upcase.same(a, b), "{a:?} {b:?}");
+      assert_eq!(Upcase.hash(a), Upcase.hash(b), "{a:?} {b:?}");
+      assert_eq!(
+        Upcase.compare(a, b),
+        std::cmp::Ordering::Equal,
+        "{a:?} {b:?}"
+      );
+    }
+    assert!(
+      !Fold.same("\u{3c3}.txt", "\u{3c2}.txt"),
+      "lowercasing keeps final sigma apart"
+    );
+    for (a, b) in [("caf\u{e9}", "cafe\u{301}"), ("\u{212a}", "k")] {
+      assert!(!Upcase.same(a, b), "{a:?} {b:?}");
+      assert!(Fold.same(a, b), "{a:?} {b:?}");
+    }
+    assert_eq!(Upcase.fold("Stra\u{df}e"), "STRA\u{df}E");
+    assert!(!Upcase.case_sensitive());
+  }
+
   #[test]
   fn names_are_checked_for_shape() {
     assert!(check("ok.txt").is_ok());
@@ -228,21 +290,25 @@ mod tests {
   fn name() -> impl Strategy<Value = String> {
     prop_oneof![
       "[a-zA-Z0-9._-]{0,12}",
-      "[a-zA-Z\u{e9}\u{301}\u{c5}\u{3a3}\u{3c3}]{0,8}",
+      "[a-zA-Z\u{e9}\u{301}\u{c5}\u{3a3}\u{3c3}\u{3c2}\u{212a}\u{df}]{0,8}",
     ]
   }
 
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(4000), .. ProptestConfig::default() }))]
 
-    /// The ordering oracle (2026-10-06, the comparison fast paths). Do: compare and equate generated names under both
-    /// policies. Expect: `compare` equals the folded iterators' order and `same` their equality, every time — the fast
-    /// paths change the cost, never the answer the tree's and the image's order rely on.
+    /// The ordering oracle (2026-10-06, the comparison fast paths; `Upcase` A-576). Do: compare and equate generated
+    /// names under every policy. Expect: `compare` equals the folded iterators' order and `same` their equality, and two
+    /// names the policy takes for one have one hash, every time — the fast paths change the cost, never the answer the
+    /// tree's and the image's order rely on, and a directory finds every spelling of a name in the bucket its hash names.
     #[test]
     fn compare_and_same_agree_with_the_folded_forms(a in name(), b in name()) {
-      for policy in [NameEquivalence::Exact, NameEquivalence::Fold] {
+      for policy in [NameEquivalence::Exact, NameEquivalence::Fold, NameEquivalence::Upcase] {
         prop_assert_eq!(policy.compare(&a, &b), policy.folded(&a).cmp(policy.folded(&b)), "{:?} {:?} {:?}", policy, a, b);
         prop_assert_eq!(policy.same(&a, &b), policy.folded(&a).eq(policy.folded(&b)), "{:?} {:?} {:?}", policy, a, b);
+        if policy.same(&a, &b) {
+          prop_assert_eq!(policy.hash(&a), policy.hash(&b), "{:?} {:?} {:?}", policy, a, b);
+        }
       }
     }
   }

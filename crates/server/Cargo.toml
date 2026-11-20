@@ -9,6 +9,9 @@ readme.workspace = true
 description = "The daemon: shards over the runtime, the control shard's rendezvous, the lifecycle verbs of §4.4 with completion records, leases, attachments and quotas, recovery through the anchor segment (design §2.5, §2.6, §4.4, §4.7, §4.8, §4.13; Phase 2 task 4)."
 
 [dependencies]
+# A grant's SSH signature (R10, D-22; `crate::grant_signature`): Ed25519 and SHA-2 from AWS-LC, the one crypto library
+# (A-66), which rustls already links here on every platform.
+aws-lc-rs = { workspace = true }
 # The membership plane's exporter label and key types (A-67 H-2).
 hyper-datagram = { workspace = true }
 # Sealing at rest (A-92): the node root, tenant and lineage keys in locked memory.
@@ -30,6 +33,27 @@ slates-ipc = { workspace = true }
 slates-land = { workspace = true }
 slates-merge = { workspace = true }
 slates-bridge-core = { workspace = true }
+# The version-control servers' HTTP edge (§4.17.2 "Transports" item 1, A-625 part 2; `crate::vcs_http`): HTTP/1.1's
+# request codec (A-595), the edge's engine over it (A-625 part 1), and git's routes and replies (A-595).
+slates-http = { workspace = true }
+slates-http-edge = { workspace = true }
+slates-git = { workspace = true }
+# SSH's sans-io core: the daemon's SSH edge drives it (`crate::vcs_ssh`, A-651), and the version-control credentials
+# enroll an SSH key only when its user authentication takes it (`crate::credentials`, A-625 part 3; A-633's parser).
+slates-ssh = { workspace = true }
+# Mercurial (§4.17.3): slates-hg answers HTTP version 1 for the edge (A-650, `crate::vcs_http::hg`), and reads, verifies
+# and places a push landed on the repository's logs (A-657, `crate::repository::hg_push`); its index and content
+# store are slates-vcs's. The repositories' stores on their owner shard (A-662, `crate::vcs_store`): the content store
+# every tool's store holds its objects in, and Mercurial's and Subversion's indexes beside git's. A repository's `.hg`
+# is read through the base plane's host seam for Mercurial's import (§4.17.3 piece 3, A-649 part 4; `crate::hg_base`).
+slates-hg = { workspace = true }
+# The version-control servers' shared crate (§4.17.1 shared piece 3): Mercurial's index and content store (A-657);
+# git's wildmatch glob, which the policy (`crate::vcs_policy`) reads ref and path patterns by (A-597, A-671); the
+# content store git's object store rides on, through which a protected branch's questions read A-614's store
+# (`crate::git_protect`, A-644); and, in tests, the content store an upload-pack test's empty repository is kept in
+# (A-625 part 3; `crate::vcs_http::git::upload`).
+slates-vcs = { workspace = true }
+slates-svn = { workspace = true }
 blake3 = { workspace = true }
 rustls = { workspace = true }
 

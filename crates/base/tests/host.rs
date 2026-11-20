@@ -503,10 +503,13 @@ fn a_real_directory_shows_descriptor_semantics_nofollow_and_hints() {
 /// A junction at `link` to `target`, as a user makes one (`mklink /J`, no privilege needed).
 #[cfg(windows)]
 fn junction(link: &std::path::Path, target: &std::path::Path) {
+  // `mklink` reads a `/` in a path as a switch ("Invalid switch - \"Users\"" for `C:/Users/...`, which
+  // `CARGO_TARGET_TMPDIR` can be), so the paths go to it with backslashes.
+  let backslashed = |path: &std::path::Path| path.to_string_lossy().replace('/', "\\");
   let made = std::process::Command::new("cmd")
     .args(["/C", "mklink", "/J"])
-    .arg(link)
-    .arg(target)
+    .arg(backslashed(link))
+    .arg(backslashed(target))
     .output()
     .unwrap();
   assert!(made.status.success(), "mklink /J: {made:?}");
@@ -582,6 +585,41 @@ fn base_and_outside(slug: &str) -> (BuildOutputDir, PathBuf, PathBuf) {
     std::fs::write(outside.join(name), SENTINEL).unwrap();
   }
   (owned, base, outside)
+}
+
+/// AC-1.16 (§4.4 clone), the daemon's half: a clone of an overlay reads its base through a host holding its origin
+/// host's directories under the same handles. Do: open a base and its subdirectory; duplicate the host's directories;
+/// move the subdirectory away and make another at its name. Expect the duplicate to list the root and, under the
+/// origin's handle, the moved subdirectory's entries and bytes, never the newcomer's; and to keep them after the origin
+/// closes its own, each host closing only what it holds.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_hosts_directories_duplicate_under_the_same_handles_to_the_same_directories() {
+  let (owned, base, _outside) = base_and_outside("clone-dirs");
+  let (mut host, root) = OsHost::open_root(&base).unwrap();
+  let sub = host.open_dir(root, "sub").unwrap();
+  let mut clone = host.try_clone_dirs().unwrap();
+  std::fs::rename(base.join("sub"), owned.0.join("sub-moved")).unwrap();
+  std::fs::create_dir(base.join("sub")).unwrap();
+  std::fs::write(base.join("sub").join("newcomer.txt"), SENTINEL).unwrap();
+  assert_eq!(listed(&mut clone, root), ["f.txt", "sub"]);
+  assert_eq!(
+    listed(&mut clone, sub),
+    ["inner.txt"],
+    "the handle names the directory it was opened on, not the one now at its path"
+  );
+  assert_eq!(read_named(&mut clone, sub, "inner.txt"), INSIDE);
+  host.close_dir(sub);
+  host.close_dir(root);
+  assert_eq!(host.open_handles(), 0);
+  assert_eq!(
+    listed(&mut clone, sub),
+    ["inner.txt"],
+    "the duplicate outlives the origin's handles"
+  );
+  clone.close_dir(sub);
+  clone.close_dir(root);
+  assert_eq!(clone.open_handles(), 0);
 }
 
 /// AUD-29-62 (root swapped; junction on Windows, symbolic link on Unix since 2026-10-06). Do: open a base, then move the base away and put a junction to a directory

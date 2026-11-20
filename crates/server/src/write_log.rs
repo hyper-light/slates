@@ -1,5 +1,5 @@
 //! The FUSE writes acknowledged since the shard's last publication, kept whole in anchor-owned RAM (A-63; A-61;
-//! §4.6 "Linux"; §4.8; D-18).
+//! §4.6 "Linux"; §4.8; D-18): a FUSE mount's (Linux) and a Shards stream's (every platform: A-316, A-339, A-402).
 //!
 //! A plain `write` through a FUSE mount is answered before the shard's recovery image is published: the image is
 //! the shard's whole state, re-imaged at each barrier, far too costly per write. Before A-61 a daemon's death ended
@@ -16,17 +16,36 @@
 //! does the log record that it overflowed: the next daemon then cannot replay every write, and reports every file a
 //! taken-over mount had open as having lost writes (`slates_bridge_core::LostWrites`), never a silent hole.
 //!
-//! The log holds the `FORGET`s since the last publication too: a `FORGET` gives back lookup references the kernel
-//! held, takes no reply, and is never resent, so one served after the last publication and lost with its daemon left
-//! the references counted for good (GAPS, A-154's sibling). A successor gives back each logged `FORGET` after the
+//! A publication that leaves a volume out (one it cannot image: an overlay whose base host a landing holds) commits a
+//! newer generation that does not carry that volume's writes since its last capture. So the log keeps exactly the
+//! records of the volumes it left out, under that publication's stamp, and drops the rest, which its image carries and
+//! whose replay over it could undo a later change ([`WriteLog::retain`], A-422). Before A-422 the log was left under
+//! its older stamp, a restarted daemon found that stamp older than the committed image and replayed nothing, and the
+//! left-out volume lost every write acknowledged since its last capture. The restamp follows the commit, so it is owed
+//! from before the commit until it is done ([`WriteLog::owe_restamp`]): a daemon that dies between the two leaves a
+//! stamp older than the committed image with the restamp owed, and the next one reports the writes lost rather than
+//! drop them in silence.
+//!
+//! The log holds the `FORGET`s since the last publication too, a FUSE mount's and a Shards stream's whose resync end the
+//! anchor holds (A-390): a `FORGET` gives back lookup references the kernel held, takes no reply, and is never resent,
+//! so one served after the last publication and lost with its daemon left the references counted for good (GAPS, A-154's
+//! sibling). A successor gives back each logged `FORGET` after the
 //! writes logged before it. A `FORGET` the log cannot take forces a publication as a write does; a refused one is
 //! counted, never marked as an overflow, since no write was lost.
 //!
-//! Layout (little-endian): the stamp (`u64`), the record bytes in use (`u64`), the overflow flag (`u32`), padding,
-//! then the records, each its kind (`u32`), the inode (`u64`), the offset (`u64`), the length (`u32`) and that many
-//! bytes: a write's bytes, or a `FORGET`'s attachment (`u64`) and count (`u64`) with the offset unused. A record is
-//! written before the length that covers it, so a daemon killed mid-append leaves it uncovered, never half-read. A
-//! daemon reads only the log its own image wrote: the anchor restarts its own executable (A-145).
+//! Every record names the volume it was written through, and a replay goes to that volume. An inode number does not name
+//! its volume: a clone inherits its origin's inode numbers, the origin's prefix in their top bits, so a write a dead
+//! daemon logged to a clone's inherited file, routed by its number's prefix, was replayed into the origin (or another clone
+//! of it), and the clone lost it (A-166's sibling sweep; proven by
+//! `a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone`, 2026-11-18).
+//!
+//! Layout (little-endian): the stamp (`u64`), the record bytes in use (`u64`), the overflow word (`u64`: [`OVERFLOWED`]
+//! and [`RESTAMP_OWED`]), the layout ([`LAYOUT`], `u64`), then the records, each its kind (`u32`), the inode (`u64`),
+//! the offset (`u64`), the length (`u32`) and that many bytes: the volume's id (16 bytes), then a write's bytes, or a
+//! `FORGET`'s attachment (`u64`) and count (`u64`) with the offset unused. A record is written before the length that
+//! covers it, so a daemon killed mid-append leaves it uncovered, never half-read. A daemon reads only the log its own
+//! image wrote: the anchor restarts its own executable (A-145); a log of another layout that holds records (an
+//! upgrade's) is reported as lost writes, never misread.
 
 use slates_mem::SparseObject;
 
@@ -34,18 +53,37 @@ use slates_mem::SparseObject;
 const AT_STAMP: usize = 0;
 /// Format: where the bytes in use sit.
 const AT_USED: usize = size_of::<u64>();
-/// Format: where the overflow flag sits.
+/// Format: where the overflow word sits.
 const AT_OVERFLOW: usize = 2 * size_of::<u64>();
-/// Format: the header's bytes, the three fields padded to a whole word.
-const HEADER_BYTES: usize = 3 * size_of::<u64>();
+/// Format: the overflow word's bit saying an acknowledged write went unlogged since the last clear (the log overflowed
+/// and the publication that would have emptied it was refused, or the content object refused a span): the next daemon
+/// reports every taken-over file as having lost writes. The word's only bit before A-422, so an older log reads the
+/// same.
+const OVERFLOWED: u64 = 1;
+/// Format: the overflow word's bit saying a publication that leaves a volume out may have committed past the stamp,
+/// and the restamp that keeps that volume's records under the new stamp is not yet done (A-422,
+/// [`WriteLog::owe_restamp`]). Read only with a stamp older than the recovered image: the writes the left-out volume
+/// owed are then unknown, so they are reported lost. With a current stamp the bit says nothing (the publication was
+/// refused, or its restamp was done and the bit not yet cleared).
+const RESTAMP_OWED: u64 = 2;
+/// Format: where the layout word sits.
+const AT_LAYOUT: usize = 3 * size_of::<u64>();
+/// Format: the header's bytes, its four words.
+const HEADER_BYTES: usize = 4 * size_of::<u64>();
+/// Format: the layout this daemon writes, "WLOG" and version 2: every record names its volume (2026-11-18). The layout
+/// before it had no such word, and its first record began where this word sits, its kind (1 or 2) in the low half; this
+/// word's low half is no record kind, so such a log is never read as this one's.
+const LAYOUT: u64 = u64::from_le_bytes(*b"WLOG\x02\x00\x00\x00");
 /// Format: a record's head: the kind, the inode, the offset and the length.
 const RECORD_HEAD: usize = 2 * size_of::<u32>() + 2 * size_of::<u64>();
 /// Format: a write record's kind.
 const KIND_WRITE: u32 = 1;
 /// Format: a `FORGET` record's kind.
 const KIND_FORGET: u32 = 2;
-/// Format: a `FORGET` record's bytes: the attachment and the count.
-const FORGET_BYTES: usize = 2 * size_of::<u64>();
+/// Format: a volume's id in a record, its catalog id's bytes.
+const VOLUME_BYTES: usize = 16;
+/// Format: a `FORGET` record's bytes: the volume, the attachment and the count.
+const FORGET_BYTES: usize = VOLUME_BYTES + 2 * size_of::<u64>();
 
 /// The content object refused a span of the log (it would not back the memory): the caller counts it, and treats
 /// the write as unlogged.
@@ -75,6 +113,8 @@ pub(crate) struct Purged {
 /// One logged write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Record {
+  /// The volume it was written through, its catalog id: where it is replayed.
+  pub(crate) volume: [u8; VOLUME_BYTES],
   /// The file.
   pub(crate) inode: u64,
   /// Where the write began.
@@ -86,6 +126,8 @@ pub(crate) struct Record {
 /// One logged `FORGET`: lookups the kernel gave back on a file through an attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Forgotten {
+  /// The volume the lookups were given back on, its catalog id.
+  pub(crate) volume: [u8; VOLUME_BYTES],
   /// The attachment, by its durable id: the owner of the references given back.
   pub(crate) attachment: u64,
   /// The file.
@@ -121,7 +163,11 @@ pub(crate) struct WriteLog {
   used: usize,
   stamp: u64,
   /// Whether an acknowledged write has gone unlogged since the last clear: then only a publication makes it survive.
+  /// Read by the flush rule ([`WriteLog::holds_every_write`]) of a FUSE mount (Linux) and of a Shards stream (A-399).
   overflowed: bool,
+  /// Whether a publication that leaves a volume out is about to commit, or has, and its restamp is not yet done
+  /// ([`RESTAMP_OWED`], A-422).
+  restamp_owed: bool,
   /// How far into the record area pages may be resident since they were last given back ([`WriteLog::purge`]): the
   /// furthest any record reached, or the whole area for a log opened over memory a predecessor may have written.
   written: usize,
@@ -164,15 +210,19 @@ fn head_at(object: &SparseObject, base: usize) -> Option<RecordHead> {
 /// The record `head` introduces, holding `bytes`. `None` for a kind this daemon does not write or a `FORGET` of the
 /// wrong length.
 fn logged_of(head: &RecordHead, bytes: Vec<u8>) -> Option<Logged> {
+  let (volume, rest) = bytes.split_at_checked(VOLUME_BYTES)?;
+  let volume: [u8; VOLUME_BYTES] = volume.try_into().ok()?;
   match head.kind {
     KIND_WRITE => Some(Logged::Write(Record {
+      volume,
       inode: head.inode,
       offset: head.offset,
-      bytes,
+      bytes: rest.to_vec(),
     })),
     KIND_FORGET if head.length == FORGET_BYTES => {
-      let (attachment, count) = bytes.split_at_checked(size_of::<u64>())?;
+      let (attachment, count) = rest.split_at_checked(size_of::<u64>())?;
       Some(Logged::Forget(Forgotten {
+        volume,
         attachment: u64::from_le_bytes(attachment.try_into().ok()?),
         inode: head.inode,
         count: u64::from_le_bytes(count.try_into().ok()?),
@@ -200,40 +250,58 @@ impl WriteLog {
       used: 0,
       stamp: image_generation,
       overflowed: false,
+      restamp_owed: false,
     };
-    let recovered = log.read(object, image_generation);
+    let (recovered, restamp_lost) = log.read(object, image_generation);
     log.overflowed = recovered.everything_lost;
-    if recovered.records.is_empty() && !recovered.everything_lost {
+    if restamp_lost {
+      // The records are of an image older than the recovered one, which left a volume out and committed before they
+      // were restamped (A-422): unknown now, so reported lost. The log starts again under the recovered image's stamp,
+      // the loss kept until a publication captures every volume, so a further restart reports it too.
+      let _restarted = log.clear(object, image_generation);
+      let _marked = log.overflow(object);
+    } else if recovered.records.is_empty() && !recovered.everything_lost {
       let _ = log.clear(object, image_generation);
     }
     Some((log, recovered))
   }
 
   /// Reads the previous daemon's records when its stamp is `image_generation`, leaving `used` at their end so new
-  /// writes follow them.
-  fn read(&mut self, object: &SparseObject, image_generation: u64) -> Recovered {
+  /// writes follow them; with whether the stamp was older and its restamp owed ([`RESTAMP_OWED`], A-422), when the
+  /// records are reported lost and the log must start again.
+  fn read(&mut self, object: &SparseObject, image_generation: u64) -> (Recovered, bool) {
     let lost = Recovered {
       records: Vec::new(),
       everything_lost: true,
     };
     let at = |offset: usize| self.start.checked_add(offset);
-    let (Some(stamp), Some(used), Some(overflow)) = (
+    let (Some(stamp), Some(used), Some(overflow), Some(layout)) = (
       at(AT_STAMP).and_then(|at| word(object, at)),
       at(AT_USED).and_then(|at| word(object, at)),
       at(AT_OVERFLOW).and_then(|at| word(object, at)),
+      at(AT_LAYOUT).and_then(|at| word(object, at)),
     ) else {
-      return lost;
+      return (lost, false);
     };
     if stamp != image_generation {
-      // A log from before the recovered publication: that image already carries its writes.
-      return Recovered::default();
+      // A log from before the recovered publication: that image already carries its writes, unless it left a volume out
+      // and its daemon died before the log kept that volume's records under its stamp (A-422).
+      return if overflow & RESTAMP_OWED == 0 {
+        (Recovered::default(), false)
+      } else {
+        (lost, true)
+      };
     }
     let Some(used) = usize::try_from(used)
       .ok()
       .filter(|used| *used <= self.capacity)
     else {
-      return lost;
+      return (lost, false);
     };
+    if used > 0 && layout != LAYOUT {
+      // Records of another layout (a daemon before every record named its volume): never misread as this one's.
+      return (lost, false);
+    }
     let mut records = Vec::new();
     let mut cursor = 0usize;
     while cursor < used {
@@ -242,14 +310,19 @@ impl WriteLog {
           records.push(record);
           cursor = next;
         }
-        None => return lost,
+        None => return (lost, false),
       }
     }
     self.used = used;
-    Recovered {
-      records,
-      everything_lost: overflow != 0,
-    }
+    // A restamp owed under a current stamp says nothing: its publication was refused, or the restamp was done and its
+    // bit not yet cleared (A-422).
+    (
+      Recovered {
+        records,
+        everything_lost: overflow & OVERFLOWED != 0,
+      },
+      false,
+    )
   }
 
   /// The record at `cursor` of the records region and where the next begins, when it lies whole within `used` and is
@@ -273,15 +346,16 @@ impl WriteLog {
     Some((logged_of(&head, bytes)?, next))
   }
 
-  /// Appends a write of `bytes` to `inode` at `offset`, before its reply: the record, then the length that covers it.
+  /// Appends a write of `bytes` to `inode` at `offset` through `volume`, before its reply: the record, then the length
+  /// that covers it.
   pub(crate) fn append(
     &mut self,
     object: &mut SparseObject,
-    inode: u64,
+    (volume, inode): ([u8; VOLUME_BYTES], u64),
     offset: u64,
     bytes: &[u8],
   ) -> Result<(), Refused> {
-    self.append_record(object, KIND_WRITE, (inode, offset), bytes)
+    self.append_record(object, KIND_WRITE, (volume, inode, offset), bytes)
   }
 
   /// Appends a `FORGET` of `count` lookups on `inode` through `attachment`, once it is served.
@@ -290,23 +364,30 @@ impl WriteLog {
     object: &mut SparseObject,
     forgotten: Forgotten,
   ) -> Result<(), Refused> {
-    let mut bytes = [0u8; FORGET_BYTES];
+    let mut bytes = [0u8; FORGET_BYTES - VOLUME_BYTES];
     let (attachment, count) = bytes.split_at_mut(size_of::<u64>());
     attachment.copy_from_slice(&forgotten.attachment.to_le_bytes());
     count.copy_from_slice(&forgotten.count.to_le_bytes());
-    self.append_record(object, KIND_FORGET, (forgotten.inode, 0), &bytes)
+    self.append_record(
+      object,
+      KIND_FORGET,
+      (forgotten.volume, forgotten.inode, 0),
+      &bytes,
+    )
   }
 
-  /// Appends a record of `kind` for `(inode, offset)` with `bytes`: the record, then the length that covers it.
+  /// Appends a record of `kind` for `(volume, inode, offset)` with `bytes` after the volume's id: the record, then the
+  /// length that covers it.
   fn append_record(
     &mut self,
     object: &mut SparseObject,
     kind: u32,
-    (inode, offset): (u64, u64),
+    (volume, inode, offset): ([u8; VOLUME_BYTES], u64, u64),
     bytes: &[u8],
   ) -> Result<(), Refused> {
-    let length = u32::try_from(bytes.len()).map_err(|_| Refused::Full)?;
-    let record = RECORD_HEAD.checked_add(bytes.len()).ok_or(Refused::Full)?;
+    let payload = VOLUME_BYTES.checked_add(bytes.len()).ok_or(Refused::Full)?;
+    let length = u32::try_from(payload).map_err(|_| Refused::Full)?;
+    let record = RECORD_HEAD.checked_add(payload).ok_or(Refused::Full)?;
     let end = self.used.checked_add(record).ok_or(Refused::Full)?;
     if end > self.capacity {
       return Err(Refused::Full);
@@ -317,13 +398,17 @@ impl WriteLog {
     head.extend_from_slice(&offset.to_le_bytes());
     head.extend_from_slice(&length.to_le_bytes());
     let at = HEADER_BYTES.checked_add(self.used).ok_or(Refused::Full)?;
+    let at_volume = at.checked_add(RECORD_HEAD).ok_or(Refused::Full)?;
     self
       .store(object, at, &head)
       .map_err(|_| Refused::Unwritten)?;
     self
+      .store(object, at_volume, &volume)
+      .map_err(|_| Refused::Unwritten)?;
+    self
       .store(
         object,
-        at.checked_add(RECORD_HEAD).ok_or(Refused::Full)?,
+        at_volume.checked_add(VOLUME_BYTES).ok_or(Refused::Full)?,
         bytes,
       )
       .map_err(|_| Refused::Unwritten)?;
@@ -340,11 +425,146 @@ impl WriteLog {
   /// writes rather than replaying an incomplete log.
   pub(crate) fn overflow(&mut self, object: &mut SparseObject) -> Result<(), Unwritten> {
     self.overflowed = true;
-    self.store(object, AT_OVERFLOW, &1u64.to_le_bytes())
+    self.store(object, AT_OVERFLOW, &self.overflow_word().to_le_bytes())
+  }
+
+  /// Owes the log its restamp before a publication that leaves a volume out commits (A-422): until [`WriteLog::retain`]
+  /// keeps that volume's records under the publication's stamp, or [`WriteLog::forgive_restamp`] says it was refused, a
+  /// daemon that dies past the commit leaves its successor a stamp older than the committed image with the restamp
+  /// owed, and the successor reports the writes lost instead of finding the log merely stale and dropping them.
+  pub(crate) fn owe_restamp(&mut self, object: &mut SparseObject) -> Result<(), Unwritten> {
+    self.restamp_owed = true;
+    self.store(object, AT_OVERFLOW, &self.overflow_word().to_le_bytes())
+  }
+
+  /// The publication that owed the restamp was refused (A-422): nothing committed, so the log stands as it was.
+  pub(crate) fn forgive_restamp(&mut self, object: &mut SparseObject) -> Result<(), Unwritten> {
+    self.restamp_owed = false;
+    self.store(object, AT_OVERFLOW, &self.overflow_word().to_le_bytes())
+  }
+
+  /// The overflow word this log's flags make ([`OVERFLOWED`], [`RESTAMP_OWED`]).
+  fn overflow_word(&self) -> u64 {
+    let overflowed = if self.overflowed { OVERFLOWED } else { 0 };
+    let owed = if self.restamp_owed { RESTAMP_OWED } else { 0 };
+    overflowed | owed
+  }
+
+  /// Keeps only the records of the volumes `kept` names, in their order, and stamps the log with `stamp`: what a
+  /// publication of generation `stamp` that left those volumes out leaves owed to the next daemon (A-422). Every other
+  /// record's write or `FORGET` is in that image, and replaying a write over it could undo a later change (a truncate
+  /// after it); a left-out volume's are in no image since its last capture. In place, front to back: each kept record
+  /// is copied down over the dropped ones before it, then the length that covers the kept ones is stored, the layout,
+  /// then the stamp, and the restamp owed is cleared last. A daemon that dies before the stamp leaves it older than the
+  /// committed image with the restamp owed ([`WriteLog::owe_restamp`]), which its successor reports as lost writes,
+  /// never a half-moved log replayed. The bytes past the kept records (the dropped records and the old places of the
+  /// moved ones) are then scrubbed and their whole pages given back, as a clear's are (condition 9, A-99). An unlogged
+  /// write marked before stays marked: it may be a left-out volume's. Bounded by the bytes in use, walked once. A span
+  /// the content object refuses before the stamp is stored leaves no record covered and the overflow marked, so nothing
+  /// half-moved is ever replayed and the loss is reported.
+  pub(crate) fn retain(
+    &mut self,
+    object: &mut SparseObject,
+    stamp: u64,
+    kept: impl Fn(&[u8; VOLUME_BYTES]) -> bool,
+  ) -> Result<(), Unwritten> {
+    let logged = self.used;
+    let restamped = match self.compact(object, &kept) {
+      Ok(to) => self.restamp(object, to, stamp).map(|()| to),
+      Err(unwritten) => Err(unwritten),
+    };
+    let to = match restamped {
+      Ok(to) => to,
+      Err(unwritten) => {
+        // The first refusal is the one returned: uncovering the records and marking the loss are what can still be done
+        // after it, and either refused as well tells the caller nothing more.
+        self.used = 0;
+        let _uncovered = self.store(object, AT_USED, &0u64.to_le_bytes());
+        let _marked = self.overflow(object);
+        return Err(unwritten);
+      }
+    };
+    self.restamp_owed = false;
+    let settled = self.store(object, AT_OVERFLOW, &self.overflow_word().to_le_bytes());
+    let scrubbed = match logged.checked_sub(to) {
+      Some(tail) if tail > 0 => self
+        .start
+        .checked_add(HEADER_BYTES)
+        .and_then(|at| at.checked_add(to))
+        .ok_or(Unwritten)
+        .and_then(|at| object.zero(at, tail).map_err(|_| Unwritten)),
+      _ => Ok(()),
+    };
+    settled.and(scrubbed)
+  }
+
+  /// [`WriteLog::retain`]'s walk: each record `kept` names copied down over the dropped ones before it, in order; the
+  /// bytes the kept records take. The header is not touched.
+  fn compact(
+    &self,
+    object: &mut SparseObject,
+    kept: &impl Fn(&[u8; VOLUME_BYTES]) -> bool,
+  ) -> Result<usize, Unwritten> {
+    let (mut from, mut to) = (0usize, 0usize);
+    let mut record = Vec::new();
+    while from < self.used {
+      let base = self
+        .start
+        .checked_add(HEADER_BYTES)
+        .and_then(|at| at.checked_add(from))
+        .ok_or(Unwritten)?;
+      let head = head_at(object, base).ok_or(Unwritten)?;
+      let whole = RECORD_HEAD.checked_add(head.length).ok_or(Unwritten)?;
+      let next = from
+        .checked_add(whole)
+        .filter(|next| *next <= self.used)
+        .ok_or(Unwritten)?;
+      record.clear();
+      record.resize(whole, 0);
+      object.read(base, &mut record).map_err(|_| Unwritten)?;
+      let volume = record
+        .get(RECORD_HEAD..)
+        .and_then(|payload| payload.get(..VOLUME_BYTES))
+        .and_then(|volume| <[u8; VOLUME_BYTES]>::try_from(volume).ok())
+        .ok_or(Unwritten)?;
+      if kept(&volume) {
+        if to != from {
+          let at = HEADER_BYTES.checked_add(to).ok_or(Unwritten)?;
+          self.store(object, at, &record)?;
+        }
+        to = to.checked_add(whole).ok_or(Unwritten)?;
+      }
+      from = next;
+    }
+    Ok(to)
+  }
+
+  /// [`WriteLog::retain`]'s header: the length that covers the `to` bytes kept, the layout, then `stamp`, in that
+  /// order.
+  fn restamp(&mut self, object: &mut SparseObject, to: usize, stamp: u64) -> Result<(), Unwritten> {
+    let covered = u64::try_from(to).map_err(|_| Unwritten)?;
+    self.store(object, AT_USED, &covered.to_le_bytes())?;
+    self.used = to;
+    self.store(object, AT_LAYOUT, &LAYOUT.to_le_bytes())?;
+    self.store(object, AT_STAMP, &stamp.to_le_bytes())?;
+    self.stamp = stamp;
+    Ok(())
+  }
+
+  /// The log as a restarted daemon finds it ([`WriteLog::open`] over this log's region) against a recovered image of
+  /// `image_generation`: what it would replay. Test support: a unit test reads what recovery reads without a restart.
+  #[cfg(test)]
+  pub(crate) fn reopened(
+    &self,
+    object: &mut SparseObject,
+    image_generation: u64,
+  ) -> Option<Recovered> {
+    let bytes = self.capacity.checked_add(HEADER_BYTES)?;
+    WriteLog::open(object, self.start, bytes, image_generation).map(|(_, recovered)| recovered)
   }
 
   /// Whether every write acknowledged since the last publication is in the log, so a successor replays them all: then
-  /// a `close`'s `flush` owes no publication of its own (A-63).
+  /// a `close`'s `flush` owes no publication of its own, a FUSE mount's (A-63) or a Shards stream's (A-399).
   pub(crate) fn holds_every_write(&self) -> bool {
     !self.overflowed
   }
@@ -360,12 +580,14 @@ impl WriteLog {
     self.used = 0;
     self.stamp = stamp;
     self.overflowed = false;
+    self.restamp_owed = false;
     // The header first (a crash mid-scrub then replays nothing), but the scrub runs whatever the header's writes
     // answered: the records are plaintext, and a refused header write that returned early left them in place while
     // this log already counted itself empty, so nothing would scrub them (2026-10-07). The first refusal is returned.
     let header = self
       .store(object, AT_USED, &0u64.to_le_bytes())
       .and(self.store(object, AT_OVERFLOW, &0u64.to_le_bytes()))
+      .and(self.store(object, AT_LAYOUT, &LAYOUT.to_le_bytes()))
       .and(self.store(object, AT_STAMP, &stamp.to_le_bytes()));
     let scrubbed = if logged > 0 {
       self
@@ -413,6 +635,96 @@ impl WriteLog {
   }
 }
 
+/// Keeps one record with `append`, an acknowledged write's or a `FORGET`'s through `volume`, before its reply (A-63):
+/// whether it is kept, by the log or by an image; `None` without a log (no content object, so nothing outlives the
+/// daemon). A log with no room forces a publication, which settles the record by its own volume (A-436). One that
+/// captured the volume carries the record, the effect already applied. One that left the volume out kept that
+/// volume's records under its stamp and gave back the room the others' took (A-422), so the record is appended again.
+/// Before A-436 any volume left out counted the record unkept, so a captured volume's write marked the log overflowed
+/// and every file a taken-over mount had open was reported as having lost writes, though the image held it.
+fn keep_record(
+  s: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  mut append: impl FnMut(&mut WriteLog, &mut SparseObject) -> Result<(), Refused>,
+) -> Option<bool> {
+  let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
+    (Some(log), Some(object)) => append(log, object),
+    _ => return None,
+  };
+  Some(match appended {
+    Ok(()) => true,
+    Err(Refused::Full) => match crate::verbs::publish_shard(s) {
+      Ok(published) if published.captured(volume) => true,
+      Ok(_) => match (s.write_log.as_mut(), s.content.as_mut()) {
+        (Some(log), Some(object)) => append(log, object).is_ok(),
+        _ => false,
+      },
+      Err(_) => false,
+    },
+    Err(Refused::Unwritten) => false,
+  })
+}
+
+/// Logs a write the volume took before its reply (A-63), `data` at `offset` of `inode` through `volume`, where a replay
+/// puts it (an inode number alone names the origin of a clone's inherited file): a FUSE mount's and a Shards stream's.
+/// Logged before the reply, so a write applied and never answered is resent, not replayed twice over a later write. One
+/// neither the log nor an image keeps ([`keep_record`]: a refused publication, or a span the content object refused)
+/// marks the log overflowed, so the next daemon reports the loss rather than replay around it; counted.
+pub(crate) fn log_acknowledged_write(
+  s: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  (inode, offset): (u64, u64),
+  data: &[u8],
+) {
+  let kept = keep_record(s, volume, |log, object| {
+    log.append(object, (volume.bytes, inode), offset, data)
+  });
+  if kept != Some(false) {
+    return;
+  }
+  s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
+  if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut())
+    && log.overflow(object).is_err()
+  {
+    s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
+  }
+}
+
+/// Format: the counter of a `FORGET` the write log could not take and no publication carried: its lookups stay
+/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write. Every platform's, as
+/// `log_forgets` is (A-433).
+const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
+
+/// Logs the lookups `forgotten` (each a file and a count) gave back through `attachment` on `volume` in the shard's
+/// write log (GAPS, A-154's sibling): a FUSE mount's `FORGET`s, and a Shards stream's whose resync end the anchor holds
+/// (A-390). A `FORGET` takes no reply and is never resent, so one served after the last publication would otherwise
+/// leave its references counted in the image for good. A log with no room forces a publication, which carries the
+/// `FORGET` (already applied) when it captured the volume, and gives back room for it again when it left the volume out
+/// ([`keep_record`], A-436); one still unkept is counted, and never marks the log overflowed, which would report every
+/// taken-over file as having lost writes. A FUSE mount is Linux's; a stream whose resync end the anchor holds is every
+/// platform's (Windows since A-433).
+pub(crate) fn log_forgets(
+  s: &mut crate::state::ShardState,
+  (volume, attachment): (slates_db::catalog::VolumeId, u64),
+  forgotten: Vec<(u64, u64)>,
+) {
+  for (inode, count) in forgotten {
+    let forgotten = Forgotten {
+      volume: volume.bytes,
+      attachment,
+      inode,
+      count,
+    };
+    match keep_record(s, volume, |log, object| {
+      log.append_forget(object, forgotten)
+    }) {
+      None => return,
+      Some(true) => {}
+      Some(false) => s.count(FORGET_UNLOGGED, 1),
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -423,6 +735,10 @@ mod tests {
   const LOG_BYTES: usize = 16 * 1024;
   /// Shape: where the log starts.
   const LOG_AT: usize = 4096;
+  /// Shape: the volume a test's records are written through.
+  const VOLUME: [u8; VOLUME_BYTES] = [7; VOLUME_BYTES];
+  /// Shape: another volume, a test's `FORGET`'s.
+  const OTHER: [u8; VOLUME_BYTES] = [9; VOLUME_BYTES];
 
   fn object(tag: &str) -> SparseObject {
     SparseObject::create(
@@ -443,7 +759,9 @@ mod tests {
     const MARKER: &[u8] = b"PLAINTEXT-MARKER-AT-REST";
     let mut shared = object("scrub");
     let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 1).unwrap();
-    log.append(&mut shared, 1, 0, &MARKER.repeat(8)).unwrap();
+    log
+      .append(&mut shared, (VOLUME, 1), 0, &MARKER.repeat(8))
+      .unwrap();
     log.clear(&mut shared, 2).unwrap();
     let mut region = vec![0u8; LOG_BYTES];
     shared.read(LOG_AT, &mut region).unwrap();
@@ -478,7 +796,9 @@ mod tests {
       calls > 1,
       "the predecessor's log was given back a slice at a time"
     );
-    log.append(&mut shared, 1, 0, b"one small write").unwrap();
+    log
+      .append(&mut shared, (VOLUME, 1), 0, b"one small write")
+      .unwrap();
     log.clear(&mut shared, 2).unwrap();
     let returned = log.purge(&mut shared, usize::MAX);
     assert!(
@@ -499,24 +819,33 @@ mod tests {
   fn the_writes_since_the_recovered_publication_are_replayed_in_order() {
     let mut shared = object("replay");
     let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 7).unwrap();
-    log.append(&mut shared, 1, 0, b"alpha").unwrap();
-    log.append(&mut shared, 2, 4096, b"beta").unwrap();
-    log.append(&mut shared, 1, 5, b"gamma").unwrap();
+    log.append(&mut shared, (VOLUME, 1), 0, b"alpha").unwrap();
+    log.append(&mut shared, (VOLUME, 2), 4096, b"beta").unwrap();
+    log.append(&mut shared, (VOLUME, 1), 5, b"gamma").unwrap();
     let (mut next, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 7).unwrap();
-    let written: Vec<(u64, u64, &[u8])> = recovered
+    let written: Vec<([u8; VOLUME_BYTES], u64, u64, &[u8])> = recovered
       .records
       .iter()
       .filter_map(|logged| match logged {
-        Logged::Write(record) => Some((record.inode, record.offset, record.bytes.as_slice())),
+        Logged::Write(record) => Some((
+          record.volume,
+          record.inode,
+          record.offset,
+          record.bytes.as_slice(),
+        )),
         Logged::Forget(_) => None,
       })
       .collect();
     assert_eq!(
       written,
-      [(1, 0, &b"alpha"[..]), (2, 4096, b"beta"), (1, 5, b"gamma")]
+      [
+        (VOLUME, 1, 0, &b"alpha"[..]),
+        (VOLUME, 2, 4096, b"beta"),
+        (VOLUME, 1, 5, b"gamma")
+      ]
     );
     assert!(!recovered.everything_lost);
-    next.append(&mut shared, 3, 0, b"delta").unwrap();
+    next.append(&mut shared, (VOLUME, 3), 0, b"delta").unwrap();
     let (_, again) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 7).unwrap();
     assert_eq!(
       again.records.len(),
@@ -533,25 +862,28 @@ mod tests {
   fn a_forget_is_replayed_in_its_place_among_the_writes() {
     let mut shared = object("forget");
     let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
-    log.append(&mut shared, 1, 0, b"alpha").unwrap();
+    log.append(&mut shared, (VOLUME, 1), 0, b"alpha").unwrap();
     let forgotten = Forgotten {
+      volume: OTHER,
       attachment: 9,
       inode: 1,
       count: 3,
     };
     log.append_forget(&mut shared, forgotten).unwrap();
-    log.append(&mut shared, 2, 0, b"beta").unwrap();
+    log.append(&mut shared, (VOLUME, 2), 0, b"beta").unwrap();
     let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
     assert_eq!(
       recovered.records,
       vec![
         Logged::Write(Record {
+          volume: VOLUME,
           inode: 1,
           offset: 0,
           bytes: b"alpha".to_vec(),
         }),
         Logged::Forget(forgotten),
         Logged::Write(Record {
+          volume: VOLUME,
           inode: 2,
           offset: 0,
           bytes: b"beta".to_vec(),
@@ -559,7 +891,8 @@ mod tests {
       ]
     );
     let forget_length =
-      LOG_AT + HEADER_BYTES + RECORD_HEAD + b"alpha".len() + RECORD_HEAD - size_of::<u32>();
+      LOG_AT + HEADER_BYTES + RECORD_HEAD + VOLUME_BYTES + b"alpha".len() + RECORD_HEAD
+        - size_of::<u32>();
     shared.write(forget_length, &1u32.to_le_bytes()).unwrap();
     let (_, torn) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
     assert!(
@@ -575,7 +908,7 @@ mod tests {
     let mut shared = object("stale");
     let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 7).unwrap();
     log
-      .append(&mut shared, 1, 0, b"in the image already")
+      .append(&mut shared, (VOLUME, 1), 0, b"in the image already")
       .unwrap();
     let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 8).unwrap();
     assert_eq!(recovered, Recovered::default());
@@ -590,13 +923,13 @@ mod tests {
   fn an_uncovered_record_is_ignored_a_full_log_refuses_and_an_overflow_is_reported() {
     let mut shared = object("edges");
     let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 3).unwrap();
-    log.append(&mut shared, 1, 0, b"covered").unwrap();
-    let uncovered = LOG_AT + HEADER_BYTES + RECORD_HEAD + b"covered".len();
+    log.append(&mut shared, (VOLUME, 1), 0, b"covered").unwrap();
+    let uncovered = LOG_AT + HEADER_BYTES + RECORD_HEAD + VOLUME_BYTES + b"covered".len();
     shared.write(uncovered, &9u64.to_le_bytes()).unwrap();
     let (mut next, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 3).unwrap();
     assert_eq!(recovered.records.len(), 1);
     assert_eq!(
-      next.append(&mut shared, 1, 0, &vec![0u8; LOG_BYTES]),
+      next.append(&mut shared, (VOLUME, 1), 0, &vec![0u8; LOG_BYTES]),
       Err(Refused::Full)
     );
     next.overflow(&mut shared).unwrap();
@@ -614,5 +947,167 @@ mod tests {
       .unwrap();
     let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 5).unwrap();
     assert!(recovered.everything_lost);
+  }
+
+  /// The record layout's change (2026-11-18: every record names its volume). Do: lay down a log as the layout before it
+  /// wrote one, a header of three words and a write record right after it, under generation 6; open it as a daemon whose
+  /// image is generation 6. Expect: reported as lost writes, never read as records of this layout; and an empty log of
+  /// that layout reported nothing lost.
+  #[test]
+  fn a_log_of_the_layout_before_is_reported_lost_never_misread() {
+    let mut shared = object("old-layout");
+    let mut old = Vec::new();
+    old.extend_from_slice(&6u64.to_le_bytes());
+    let record_bytes = u64::try_from(RECORD_HEAD + b"old".len()).unwrap();
+    old.extend_from_slice(&record_bytes.to_le_bytes());
+    old.extend_from_slice(&0u64.to_le_bytes());
+    old.extend_from_slice(&KIND_WRITE.to_le_bytes());
+    old.extend_from_slice(&1u64.to_le_bytes());
+    old.extend_from_slice(&0u64.to_le_bytes());
+    old.extend_from_slice(&u32::try_from(b"old".len()).unwrap().to_le_bytes());
+    old.extend_from_slice(b"old");
+    shared.write(LOG_AT, &old).unwrap();
+    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 6).unwrap();
+    assert!(
+      recovered.records.is_empty() && recovered.everything_lost,
+      "an old layout's records are reported lost: {recovered:?}"
+    );
+    let mut empty = object("old-layout-empty");
+    empty.write(LOG_AT, &6u64.to_le_bytes()).unwrap();
+    let (_, nothing) = WriteLog::open(&mut empty, LOG_AT, LOG_BYTES, 6).unwrap();
+    assert_eq!(nothing, Recovered::default(), "an empty one loses nothing");
+  }
+
+  /// The writes `recovered` hands back, as (volume, inode, bytes).
+  fn writes(recovered: &Recovered) -> Vec<([u8; VOLUME_BYTES], u64, Vec<u8>)> {
+    recovered
+      .records
+      .iter()
+      .filter_map(|logged| match logged {
+        Logged::Write(record) => Some((record.volume, record.inode, record.bytes.clone())),
+        Logged::Forget(_) => None,
+      })
+      .collect()
+  }
+
+  /// A-422. Do: under generation 3, log a write through a kept volume, a `FORGET` and a write through another volume
+  /// (the latter carrying a marker), and two more writes through the kept one; keep the kept volume's records under
+  /// generation 4, as a publication that left it out does; open the log as a restarted daemon whose image is generation
+  /// 4; then append one more write and open again. Expect: the kept volume's three writes, in order, nothing else and
+  /// nothing lost; the other volume's marker scrubbed from the log's region; the new write after the kept ones.
+  #[test]
+  fn a_log_keeps_the_left_out_volumes_records_in_order_under_the_new_stamp() {
+    const MARKER: &[u8] = b"CARRIED-BY-THE-IMAGE-MARKER";
+    let mut shared = object("retain");
+    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 3).unwrap();
+    log.append(&mut shared, (VOLUME, 1), 0, b"alpha").unwrap();
+    log
+      .append_forget(
+        &mut shared,
+        Forgotten {
+          volume: OTHER,
+          attachment: 9,
+          inode: 1,
+          count: 2,
+        },
+      )
+      .unwrap();
+    log.append(&mut shared, (OTHER, 2), 0, MARKER).unwrap();
+    log.append(&mut shared, (VOLUME, 3), 7, b"beta").unwrap();
+    log.append(&mut shared, (VOLUME, 1), 5, b"gamma").unwrap();
+    log.owe_restamp(&mut shared).unwrap();
+    log
+      .retain(&mut shared, 4, |volume| *volume == VOLUME)
+      .unwrap();
+    let (mut next, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    assert!(!recovered.everything_lost, "{recovered:?}");
+    assert_eq!(
+      recovered.records.len(),
+      3,
+      "only the kept volume's records: {recovered:?}"
+    );
+    assert_eq!(
+      writes(&recovered),
+      [
+        (VOLUME, 1, b"alpha".to_vec()),
+        (VOLUME, 3, b"beta".to_vec()),
+        (VOLUME, 1, b"gamma".to_vec())
+      ]
+    );
+    let mut region = vec![0u8; LOG_BYTES];
+    shared.read(LOG_AT, &mut region).unwrap();
+    assert!(
+      !region.windows(MARKER.len()).any(|window| window == MARKER),
+      "a dropped record's bytes are scrubbed"
+    );
+    next.append(&mut shared, (OTHER, 4), 0, b"delta").unwrap();
+    let (_, again) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 4).unwrap();
+    assert_eq!(
+      writes(&again).last(),
+      Some(&(OTHER, 4, b"delta".to_vec())),
+      "a new write follows the kept ones"
+    );
+    assert_eq!(again.records.len(), 4);
+  }
+
+  /// A-422, the death between a publication's commit and the log's restamp. Do: log a write under generation 5 and owe
+  /// the restamp, as a publication that leaves a volume out does before it commits; open the log as a restarted daemon
+  /// whose image is generation 6 (the publication committed, the restamp never ran), then log a write and open again at
+  /// 6; and, apart, owe the restamp and open at 5 (the daemon died before the commit), and owe it, forgive it (the
+  /// publication was refused) and open at 6 (a later publication that captured every volume committed before its
+  /// clear). Expect: at 6 with the restamp owed, the write reported lost and none replayed; the next write replayed
+  /// after it under the new stamp, the loss still reported until a publication captures every volume; at 5 the write
+  /// replayed and nothing lost; forgiven and stale, nothing replayed and nothing lost, as before A-422.
+  #[test]
+  fn a_restamp_owed_at_a_death_reports_the_left_out_writes_lost_never_drops_them_in_silence() {
+    let mut shared = object("owed");
+    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 5).unwrap();
+    log.append(&mut shared, (VOLUME, 1), 0, b"owed").unwrap();
+    log.owe_restamp(&mut shared).unwrap();
+    let (mut next, lost) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 6).unwrap();
+    assert!(lost.everything_lost && lost.records.is_empty(), "{lost:?}");
+    next.append(&mut shared, (VOLUME, 2), 0, b"after").unwrap();
+    let (_, later) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 6).unwrap();
+    assert_eq!(writes(&later), [(VOLUME, 2, b"after".to_vec())]);
+    assert!(later.everything_lost, "the loss is reported again");
+
+    let mut before_commit = object("owed-uncommitted");
+    let (mut log, _) = WriteLog::open(&mut before_commit, LOG_AT, LOG_BYTES, 5).unwrap();
+    log
+      .append(&mut before_commit, (VOLUME, 1), 0, b"owed")
+      .unwrap();
+    log.owe_restamp(&mut before_commit).unwrap();
+    let (_, kept) = WriteLog::open(&mut before_commit, LOG_AT, LOG_BYTES, 5).unwrap();
+    assert_eq!(writes(&kept), [(VOLUME, 1, b"owed".to_vec())]);
+    assert!(!kept.everything_lost, "{kept:?}");
+
+    let mut forgiven = object("owed-forgiven");
+    let (mut log, _) = WriteLog::open(&mut forgiven, LOG_AT, LOG_BYTES, 5).unwrap();
+    log
+      .append(&mut forgiven, (VOLUME, 1), 0, b"in the image")
+      .unwrap();
+    log.owe_restamp(&mut forgiven).unwrap();
+    log.forgive_restamp(&mut forgiven).unwrap();
+    let (_, stale) = WriteLog::open(&mut forgiven, LOG_AT, LOG_BYTES, 6).unwrap();
+    assert_eq!(stale, Recovered::default());
+  }
+
+  /// A-422: an overflow marked before a publication that leaves a volume out stays marked through its restamp. Do: log
+  /// a write, mark the log overflowed (an acknowledged write went unlogged), owe the restamp and keep the write's
+  /// volume under generation 2; open at 2. Expect: the write replayed and the loss still reported, since the unlogged
+  /// write may have been the left-out volume's.
+  #[test]
+  fn an_overflow_marked_before_a_restamp_stays_reported() {
+    let mut shared = object("retain-overflow");
+    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 1).unwrap();
+    log.append(&mut shared, (VOLUME, 1), 0, b"kept").unwrap();
+    log.overflow(&mut shared).unwrap();
+    log.owe_restamp(&mut shared).unwrap();
+    log
+      .retain(&mut shared, 2, |volume| *volume == VOLUME)
+      .unwrap();
+    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 2).unwrap();
+    assert_eq!(writes(&recovered), [(VOLUME, 1, b"kept".to_vec())]);
+    assert!(recovered.everything_lost, "{recovered:?}");
   }
 }

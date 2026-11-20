@@ -145,6 +145,18 @@ pub(crate) enum LoggedOp {
     /// The name it links to.
     target: String,
   },
+  /// [`VolumeOp::Copy`] (A-626 part 4): appended last, so every variant before it keeps its wire tag; the anchor's
+  /// layout 13 refuses a segment of an earlier layout, whose log never held one.
+  Copy {
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from.
+    version: u64,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
+  },
 }
 
 /// A file a work holds of its own, in a restatement: its bytes, or `None` for a file it removed.
@@ -227,6 +239,17 @@ impl LoggedOp {
       VolumeOp::SetXattr { path, name, value } => LoggedOp::SetXattr { path, name, value },
       VolumeOp::RemoveXattr { path, name } => LoggedOp::RemoveXattr { path, name },
       VolumeOp::Link { path, target } => LoggedOp::Link { path, target },
+      VolumeOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      } => LoggedOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      },
     }
   }
 
@@ -253,6 +276,17 @@ impl LoggedOp {
       LoggedOp::SetXattr { path, name, value } => VolumeOp::SetXattr { path, name, value },
       LoggedOp::RemoveXattr { path, name } => VolumeOp::RemoveXattr { path, name },
       LoggedOp::Link { path, target } => VolumeOp::Link { path, target },
+      LoggedOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      } => VolumeOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      },
     })
   }
 }
@@ -373,7 +407,11 @@ pub(crate) fn replay(
         delete_len,
         bytes,
       } => {
-        let base = Base { green, version };
+        let base = Base {
+          green,
+          fetched: None,
+          version,
+        };
         let old = files.get(base, &path)?.map(std::borrow::Cow::into_owned);
         let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let ops = edit_ops(&path, old.as_deref(), (at, delete_len, inserted));
@@ -387,7 +425,11 @@ pub(crate) fn replay(
       WorkLogEntry::Declared { op } => {
         apply_declare(
           (&mut files, &mut journal),
-          Base { green, version },
+          Base {
+            green,
+            fetched: None,
+            version,
+          },
           op.op()?,
         )?;
       }
@@ -446,6 +488,18 @@ mod tests {
         node,
         mode: 0o640,
       },
+      // A device node's number rides in its node (A-294).
+      VolumeOp::Mknod {
+        path: "dev".to_owned(),
+        node: SpecialNode {
+          kind: slates_merge::special::SpecialKind::BlockDevice {
+            major: 259,
+            minor: 1 << 20,
+          },
+          ..node
+        },
+        mode: 0o600,
+      },
       VolumeOp::Unlink { path: p() },
       VolumeOp::Rename {
         from: p(),
@@ -477,6 +531,12 @@ mod tests {
       VolumeOp::Link {
         path: "h".to_owned(),
         target: p(),
+      },
+      VolumeOp::Copy {
+        from: p(),
+        to: "c".to_owned(),
+        version: 3,
+        replace: true,
       },
     ]
   }

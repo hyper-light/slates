@@ -246,6 +246,123 @@ fn a_guest_writes_a_file_into_a_daemon_volume_that_the_host_reads_back_over_nfs(
   drop(daemon);
 }
 
+/// A SETXATTR body (`fuse_setxattr_in`: the value's size, flags; then the name, its NUL, the value).
+fn setxattr_body(name: &[u8], value: &[u8]) -> Vec<u8> {
+  let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  body.extend_from_slice(name);
+  body.push(0);
+  body.extend_from_slice(value);
+  body
+}
+
+/// A GETXATTR body (`fuse_getxattr_in`: the caller's buffer size, padding; then the name and its NUL).
+fn getxattr_body(name: &[u8]) -> Vec<u8> {
+  let mut body = 256u32.to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  body.extend_from_slice(name);
+  body.push(0);
+  body
+}
+
+/// A-290: slates' own virtio-fs device is a guest kernel's route. Do: through an in-process guest device, create a
+/// file, give it `security.capability` and `trusted.overlay.origin`, and read both back; then list the file's
+/// attributes over the daemon's NFSv4.2 port, a host's mount. Expect the sets and reads served with the values the
+/// guest set, and the host's listing empty.
+#[test]
+fn a_guest_devices_own_attributes_are_kept_and_no_hosts_mount_lists_them() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-attributes");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("attributes")) else {
+    panic!("the volume was not created");
+  };
+  /// A file capability as `setcap` writes one (`vfs_cap_data` revision 2, `CAP_NET_BIND_SERVICE` permitted).
+  const CAPABILITY: &[u8] = &[1, 0, 0, 2, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  let (outcome, answers) = run_guest(
+    &daemon,
+    id,
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
+    |kick_write, call_read| {
+      Box::pin(async move {
+        let created = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Create.to_wire(), 1, 1, &create_body("bin")),
+        )
+        .await;
+        let ino = u64_at(&created, OUT_HEADER_LEN);
+        let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+        let mut answers = vec![reply_error(&created)];
+        let attributes: [(&[u8], &[u8]); 2] = [
+          (b"security.capability", CAPABILITY),
+          (b"trusted.overlay.origin", b"origin"),
+        ];
+        for (unique, (name, value)) in (2u64..).zip(attributes) {
+          let set = round_trip(
+            &kick_write,
+            &call_read,
+            &message(
+              Opcode::SetXattr.to_wire(),
+              unique,
+              ino,
+              &setxattr_body(name, value),
+            ),
+          )
+          .await;
+          let got = round_trip(
+            &kick_write,
+            &call_read,
+            &message(
+              Opcode::GetXattr.to_wire(),
+              unique + 10,
+              ino,
+              &getxattr_body(name),
+            ),
+          )
+          .await;
+          answers.push(reply_error(&set));
+          answers.push(reply_error(&got));
+          answers.push(i32::from(got.get(OUT_HEADER_LEN..) == Some(value)));
+        }
+        let released = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Release.to_wire(), 30, ino, &release_body(fh)),
+        )
+        .await;
+        answers.push(reply_error(&released));
+        drop(kick_write);
+        answers
+      })
+    },
+  );
+  assert_eq!(
+    answers,
+    vec![0, 0, 0, 1, 0, 0, 1, 0],
+    "the create, each set and read (its value the guest's), and the release"
+  );
+  let GuestDeviceOutcome::Ended(end) = outcome else {
+    panic!("the device did not serve: {outcome:?}");
+  };
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let capability_path = daemon
+    .mount_capability("attributes")
+    .expect("the owner shard answers")
+    .expect("the volume is served");
+  let mut host = common::nfs4::Session::open(port, b"virtiofs-attributes");
+  assert_eq!(
+    host.xattrs(&capability_path, &["bin"]),
+    Vec::<(Vec<u8>, Vec<u8>)>::new(),
+    "a host's mount lists none of the guest's own"
+  );
+  drop(client);
+  drop(daemon);
+}
+
 /// §4.13: a guest whose enrolled consumer is not on the volume's access list is authenticated and
 /// admitted with no rights, so its every effect is refused at the seam — a CREATE through the
 /// device is answered `EPERM`, and nothing lands in the volume.
@@ -368,6 +485,89 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
     read(&mut stream, &file, 3),
     PAYLOAD,
     "the bytes the guest closed survived the restart"
+  );
+  drop(stream);
+  second.stop();
+  drop(anchor);
+}
+
+/// A-410 (A-358's rule for a guest device, kept by A-63's write log). Do: under a daemon whose anchor segment the test
+/// holds, a guest creates a file, whose barrier publishes it, and writes bytes into it, the write acknowledged after
+/// that last publication and never flushed or closed; with the guest still attached, kill the daemon (a fenced stop,
+/// which publishes nothing, as a killed process does) and start a second one over the same segment. Expect: the second
+/// daemon reads the guest's bytes back over NFS, replayed from the shard's write log. Before A-410 the device neither
+/// logged nor published a write before its reply, so the file came back as its create's publication left it, empty.
+#[test]
+fn a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-guest-write-log-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("guest-write-log", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("guest-write-log")) else {
+    panic!("the volume was not created");
+  };
+  let guest = common::guest::start_guest(
+    &first,
+    id,
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
+    slates_server::virtiofs::GuestView::default(),
+    |kick_write, call_read| {
+      Box::pin(async move {
+        let created = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Create.to_wire(), 1, 1, &create_body("logged.txt")),
+        )
+        .await;
+        let ino = u64_at(&created, OUT_HEADER_LEN);
+        let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+        let written = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Write.to_wire(), 2, ino, &write_body(fh, PAYLOAD)),
+        )
+        .await;
+        // The guest's ends come back to the test, open: a hang-up would end the device before the death.
+        (
+          [reply_error(&created), reply_error(&written)],
+          kick_write,
+          call_read,
+        )
+      })
+    },
+  );
+  let (errors, kick_write, call_read) = guest
+    .script
+    .recv_timeout(common::guest::WAIT)
+    .expect("the guest script finished");
+  assert_eq!(errors, [0, 0], "the create and the write succeeded");
+  first.inject_consensus_failure().unwrap();
+  first.stop();
+  drop(kick_write);
+  drop(call_read);
+  drop(client);
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let capability = second
+    .mount_capability("guest-write-log")
+    .expect("the owner shard answers")
+    .expect("the volume was recovered");
+  let port = second.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let file = lookup(&mut stream, &root, "logged.txt", 2);
+  assert_eq!(
+    read(&mut stream, &file, 3),
+    PAYLOAD,
+    "the guest's acknowledged write outlived its daemon, replayed from the write log"
   );
   drop(stream);
   second.stop();
@@ -2255,31 +2455,137 @@ fn run_qemu_with(
     ])
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
-  let mut child = spawn_vm_command(command, socket);
-  let started = Instant::now();
-  let mut timed_out = false;
-  while child.try_wait().unwrap().is_none() {
+  let child = spawn_vm_command(command, socket);
+  let (console, timed_out) = wait_reading(child, bound, &mut || {
     sample(&guest_memory_mappings());
-    if started.elapsed() > bound {
-      let _ = child.kill();
-      timed_out = true;
-      break;
-    }
-    // The test thread polls its child QEMU process; no runtime wheel serves this thread (D-9 allows a test).
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_millis(50));
-  }
-  let output = child.wait_with_output().unwrap();
-  let console = format!(
-    "{}{}",
-    String::from_utf8_lossy(&output.stdout),
-    String::from_utf8_lossy(&output.stderr)
-  );
+  });
   if timed_out {
     format!("(the guest did not power off within {bound:?})\n{console}")
   } else {
     console
   }
+}
+
+/// Shape: how often a live guest's wait looks at its VM (and samples the guest's mappings).
+const VM_POLL: Duration = Duration::from_millis(50);
+
+/// Shape: the bytes of each of a VM's output streams a live guest's wait keeps. The workload guest's console had
+/// reached 64 KiB five runs into the roster's 24 (CI run 44247840584), so a whole roster's is a few hundred KiB; 64 MiB
+/// is over a hundred times that and small beside the test container's memory. Past it the stream is still read, and
+/// what it carries dropped with a note, so the VM never waits on its console and the test never grows without bound.
+const CONSOLE_KEPT: u64 = 64 << 20;
+
+/// Reads a child's output stream to its end on a thread of its own: up to [`CONSOLE_KEPT`] bytes kept, the rest read
+/// and counted, so the child never blocks writing to it.
+fn read_on_a_thread<R: std::io::Read + Send + 'static>(
+  mut stream: R,
+) -> std::thread::JoinHandle<(Vec<u8>, u64)> {
+  std::thread::spawn(move || {
+    use std::io::Read;
+    let mut kept = Vec::new();
+    // A read error ends the stream as its end does: the child is gone or the pipe broken, and what was read is kept.
+    let _ = (&mut stream).take(CONSOLE_KEPT).read_to_end(&mut kept);
+    let dropped = std::io::copy(&mut stream, &mut std::io::sink()).unwrap_or(0);
+    (kept, dropped)
+  })
+}
+
+/// A stream read by [`read_on_a_thread`], as text, with a note of what was read past [`CONSOLE_KEPT`] and dropped.
+fn text_of(reader: Option<std::thread::JoinHandle<(Vec<u8>, u64)>>) -> String {
+  let Some(reader) = reader else {
+    return String::new();
+  };
+  let (kept, dropped) = reader.join().unwrap();
+  let text = String::from_utf8_lossy(&kept);
+  if dropped == 0 {
+    return text.into_owned();
+  }
+  format!(
+    "{text}\n(the stream went on {dropped} bytes past the {CONSOLE_KEPT} kept; they were read and dropped)\n"
+  )
+}
+
+/// Waits for `child` to exit, killing it once `bound` has passed, and calls `between` at each look; then its standard
+/// output followed by its standard error, and whether it was killed. A thread for each stream reads it while the child
+/// runs: a pipe holds only what fits its capacity until it is read (64 KiB on Linux), and a child writing past that
+/// waits in its write. Read only after the exit, the workload guest's console stopped at exactly 65,536 bytes, mid-line,
+/// and the guest, waiting on its console, was killed at its 1500 s bound (CI run 44247840584, 2026-11-18).
+fn wait_reading(
+  mut child: std::process::Child,
+  bound: Duration,
+  between: &mut dyn FnMut(),
+) -> (String, bool) {
+  let stdout = child.stdout.take().map(read_on_a_thread);
+  let stderr = child.stderr.take().map(read_on_a_thread);
+  let started = Instant::now();
+  let mut timed_out = false;
+  while child.try_wait().unwrap().is_none() {
+    between();
+    if started.elapsed() > bound {
+      let _ = child.kill();
+      timed_out = true;
+      break;
+    }
+    // The test thread polls its child process; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(VM_POLL);
+  }
+  child.wait().unwrap();
+  let console = format!("{}{}", text_of(stdout), text_of(stderr));
+  (console, timed_out)
+}
+
+/// Shape: the bytes the pipe test's child writes to each of its standard output and error: 1 MiB, sixteen times a
+/// Linux pipe's default capacity (64 KiB) and past any other host's default, so a wait that does not read its child
+/// while it runs leaves the child blocked in a write.
+const PIPE_PROOF_BYTES: usize = 1 << 20;
+
+/// Shape: how long the pipe test's child may take: writing 2 MiB into pipes that are read takes milliseconds, so a
+/// minute is a bound only a child blocked on an unread pipe meets.
+const PIPE_PROOF_BOUND: Duration = Duration::from_secs(60);
+
+/// Harness (the live guests' wait, A-289's virtio-fs leg; CI run 44247840584, 2026-11-18, where the workload guest's
+/// console stopped at exactly 65,536 bytes, mid-line, and the guest was killed at its 1500 s bound). Do: run a child
+/// that writes [`PIPE_PROOF_BYTES`] to its standard output, then as many to its standard error, then exits, under
+/// [`wait_reading`] with [`PIPE_PROOF_BOUND`]. Expect: the child exits by itself, never killed at the bound, and both
+/// writes are read whole, the output's before the error's.
+#[test]
+fn a_child_writing_past_its_pipes_capacity_is_read_while_it_runs() {
+  let script = format!("yes | head -c {PIPE_PROOF_BYTES}; yes n | head -c {PIPE_PROOF_BYTES} >&2");
+  let child = std::process::Command::new("sh")
+    .args(["-c", &script])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  let started = Instant::now();
+  let (console, timed_out) = wait_reading(child, PIPE_PROOF_BOUND, &mut || {});
+  assert!(
+    !timed_out,
+    "the child was killed at the {PIPE_PROOF_BOUND:?} bound after {:?}: it blocked writing to a pipe nobody read; \
+     {} bytes were read",
+    started.elapsed(),
+    console.len()
+  );
+  let (output, error) = console.split_at(console.len().min(PIPE_PROOF_BYTES));
+  assert_eq!(
+    output.len(),
+    PIPE_PROOF_BYTES,
+    "the standard output was not read whole"
+  );
+  assert!(
+    output.bytes().all(|byte| byte == b'y' || byte == b'\n'),
+    "the standard output is not the child's"
+  );
+  assert_eq!(
+    error.len(),
+    PIPE_PROOF_BYTES,
+    "the standard error was not read whole"
+  );
+  assert!(
+    error.bytes().all(|byte| byte == b'n' || byte == b'\n'),
+    "the standard error is not the child's"
+  );
 }
 
 /// Starts the VM with its socket inherited at its existing number, the number in QEMU's `fd=` argument.
@@ -2727,6 +3033,7 @@ fn assert_the_view_advances(
     ReplyBody::Advanced {
       version: second.value,
       invalidated: vec!["/f".to_owned()],
+      invalidated_elided: 0,
     }
   );
   let _ = advanced.send(());
@@ -2921,24 +3228,23 @@ fn the_volume_goes(client: &mut Client, volume: slates_ipc::protocol::VolumeId) 
 #[cfg(target_os = "linux")]
 const WORKLOAD_GUEST_RAM: &str = "1G";
 
-/// Shape: how long the workload guest may run — the boot, then each roster tool twice (nine on Linux, a cargo
-/// build of a one-file crate among them) under software emulation. Measured at 364 s and 317 s on Docker
-/// Desktop's Apple Silicon VM (2026-10-01), so about four times that, still failing a hung guest in bounded time.
+/// Shape: how long the workload guest may run — the boot, then each roster tool twice (twelve on Linux since A-289,
+/// a cargo build of a one-file crate among them) under software emulation. Measured at 364 s and 317 s with the
+/// nine before A-289 on Docker Desktop's Apple Silicon VM (2026-10-01), so about four times that, still failing a
+/// hung guest in bounded time; the twelve ran in 247 s on CI's runner (CI run 44260193629, 2026-11-18).
 #[cfg(target_os = "linux")]
 const WORKLOAD_RUN: Duration = Duration::from_secs(1500);
 
 /// Format: the guest's script, run inside the host container's root (`/` over 9p, read-only) with the slates tag
 /// at `/mnt` and a RAM `/tmp`. For each roster tool the guest holds, the workload runs on the guest's RAM and on
-/// the slates mount under one fixed environment, and each run's output and resulting tree are printed between
-/// markers: kind, permission bits, size, SHA-256 (or link target) and path per entry.
+/// the slates mount under one fixed environment — the roster's own (`slates_conformance::workload::ENVIRONMENT`,
+/// exported ahead of this script by [`place_workloads`]) and the guest's paths below — and each run's output and
+/// resulting tree are printed between markers: kind, permission bits, size, SHA-256 (or link target) and path per
+/// entry.
 #[cfg(target_os = "linux")]
 const GUEST_WORKLOADS: &str = r#"
 export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/tmp/home CARGO_HOME=/tmp/cargo-home RUSTUP_HOME=/usr/local/rustup
-export GIT_AUTHOR_NAME=slates GIT_AUTHOR_EMAIL=slates@example.invalid
-export GIT_COMMITTER_NAME=slates GIT_COMMITTER_EMAIL=slates@example.invalid
-export GIT_AUTHOR_DATE=2026-09-14T00:00:00Z GIT_COMMITTER_DATE=2026-09-14T00:00:00Z
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 TZ=UTC LC_ALL=C
 mkdir -p "$HOME" "$CARGO_HOME"
 while read -r name tool; do
   if ! command -v "$tool" >/dev/null 2>&1; then echo "=== SKIP $name $tool"; continue; fi
@@ -2984,9 +3290,10 @@ fn put(stream: &mut TcpStream, dir: &[u8], name: &str, bytes: &[u8], xid: u32) {
 /// Places the guest's script, the roster and each workload's script in the volume behind `root`.
 #[cfg(target_os = "linux")]
 fn place_workloads(stream: &mut TcpStream, root: &[u8]) {
-  // The roster's bounds, the very values every other leg runs it under.
+  // The roster's environment and bounds, the very values every other leg runs it under.
   let script = format!(
-    "export {}={} {}={}\n{GUEST_WORKLOADS}",
+    "{}export {}={} {}={}\n{GUEST_WORKLOADS}",
+    slates_conformance::workload::environment_exports(),
     slates_conformance::workload::ENV_SQLITE_BUSY_MS,
     slates_conformance::workload::SQLITE_BUSY_MS,
     slates_conformance::workload::ENV_WATCH_SECONDS,

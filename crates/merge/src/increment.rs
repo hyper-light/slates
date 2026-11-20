@@ -19,6 +19,14 @@
 //! - A new file renamed over a base file is the write-and-rename pattern: it composes to the base
 //!   file's content being replaced (a delete and the new bytes), not a rename — the destination
 //!   file simply has new content (§4.16).
+//! - A base file written to and then removed, or replaced by renaming another base file onto it,
+//!   while a hard link the base had to it still names its node, leaves the node to that link with
+//!   the writes (A-669; A-646's decision, the heir takes the node as the work left it): the writes
+//!   are declared at the link, where the node stands at seal and the seal reads them, beside the
+//!   removal, and the engine makes the link the node's home with them. When only a link the work
+//!   made still names the node, or the work made the file again at its name, the composition is
+//!   owed: `Unsupported`, never the writes dropped. Until A-669 they were dropped, and the link
+//!   kept the head's bytes.
 //!
 //! Composition is arithmetic on the declared operations, never a comparison of file states
 //! (D-27's never-diff clause).
@@ -34,8 +42,9 @@
 //! the mode of a file or directory (`SetMode`), symbolic links (`Symlink`; the target is stored
 //! in the path table), and extended attributes (`SetXattr`/`RemoveXattr`, composed against the
 //! base value; the value is laid out in the post-state after the file content, the name in the
-//! path table), and hard links (`Link`, composed like symlinks; the target file is named in the
-//! path table). IPC creations (`Mknod`, A-26) carry canonical metadata without content; their
+//! path table), and hard links (`Link`, composed like symlinks; the node a link names is a record
+//! of the node table, the node at the target at the base or the one the increment makes there,
+//! A-646). IPC creations (`Mknod`, A-26) carry canonical metadata without content; their
 //! modes compose independently and a create/unlink cancels. IPC renames, metadata declarations
 //! through aliases, and primary-name removal while aliases exist are typed refusals pending
 //! an inode-aware namespace journal. The remaining edges — a
@@ -47,7 +56,7 @@
 //! never a panic. This module is pure: no I/O, no clock, no randomness.
 
 use crate::derive::{ContentOp, compose_content_sized};
-use crate::ops_doc::{Op, OpKind, OpsDoc};
+use crate::ops_doc::{NodeOrigin, NodeRef, Op, OpKind, OpsDoc};
 
 /// One declared operation, as the journal records it (§4.5). Content coordinates are current-file
 /// at the moment the operation happened.
@@ -169,6 +178,19 @@ pub enum VolumeOp {
     /// The existing file it links to.
     target: String,
   },
+  /// A path's tree at a committed version copied to another path by reference (A-586; A-626 part 4; Subversion's copy
+  /// with history): `from`'s tree as version `version` of the green held it, at `to`, replacing what `to` holds when
+  /// `replace` (A-626's `REPLACE`). What the work does in `to`'s tree after it composes against what it brings.
+  Copy {
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from.
+    version: u64,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
+  },
 }
 
 impl VolumeOp {
@@ -187,7 +209,9 @@ impl VolumeOp {
       | VolumeOp::Mkdir { path }
       | VolumeOp::Rmdir { path }
       | VolumeOp::SetMode { path, .. } => path.len(),
-      VolumeOp::Rename { from, to } => from.len().saturating_add(to.len()),
+      VolumeOp::Rename { from, to } | VolumeOp::Copy { from, to, .. } => {
+        from.len().saturating_add(to.len())
+      }
       VolumeOp::Symlink { path, target } | VolumeOp::Link { path, target } => {
         path.len().saturating_add(target.len())
       }
@@ -220,7 +244,8 @@ impl VolumeOp {
       | VolumeOp::SetXattr { .. }
       | VolumeOp::RemoveXattr { .. }
       | VolumeOp::Link { .. }
-      | VolumeOp::Mknod { .. } => None,
+      | VolumeOp::Mknod { .. }
+      | VolumeOp::Copy { .. } => None,
     }
   }
 
@@ -244,7 +269,7 @@ impl VolumeOp {
       | VolumeOp::Symlink { path, .. }
       | VolumeOp::SetXattr { path, .. }
       | VolumeOp::RemoveXattr { path, .. } => [Some(path), None],
-      VolumeOp::Rename { from, to } => [Some(from), Some(to)],
+      VolumeOp::Rename { from, to } | VolumeOp::Copy { from, to, .. } => [Some(from), Some(to)],
       VolumeOp::Link { path, target } => [Some(path), Some(target)],
     }
   }
@@ -283,7 +308,8 @@ impl VolumeOp {
       | VolumeOp::SetXattr { .. }
       | VolumeOp::RemoveXattr { .. }
       | VolumeOp::Link { .. }
-      | VolumeOp::Mknod { .. } => None,
+      | VolumeOp::Mknod { .. }
+      | VolumeOp::Copy { .. } => None,
     }
   }
 }
@@ -374,6 +400,36 @@ pub struct Base {
 }
 
 impl Base {
+  /// The restricted base of the paths `named` (`Green::base_for`), assembled from each path's own entries as
+  /// `Green::path_base` gives them (A-247: a work's shard keeps the entries of the paths it touched, so it composes its
+  /// increment without the green). In `base_for`'s order: each named path's entries in path order, then the hard links
+  /// whose link or target is named, by link. `None` when a named path's entries are not in `per_path`: a base not
+  /// known, never a smaller one.
+  pub fn for_names(
+    named: &std::collections::BTreeSet<&str>,
+    per_path: &std::collections::BTreeMap<String, Base>,
+  ) -> Option<Base> {
+    let mut base = Base::of_files(Vec::new());
+    let mut links: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for path in named {
+      let entries = per_path.get(*path)?;
+      base.files.extend(entries.files.iter().cloned());
+      base.specials.extend(entries.specials.iter().cloned());
+      base.dirs.extend(entries.dirs.iter().cloned());
+      base.modes.extend(entries.modes.iter().cloned());
+      base.symlinks.extend(entries.symlinks.iter().cloned());
+      base.xattrs.extend(entries.xattrs.iter().cloned());
+      for (link, target) in &entries.hardlinks {
+        links.insert(link.as_str(), target.as_str());
+      }
+    }
+    base.hardlinks = links
+      .into_iter()
+      .map(|(link, target)| (link.to_owned(), target.to_owned()))
+      .collect();
+    Some(base)
+  }
+
   /// A base with the given files and no directories or recorded modes (the common file-only case).
   pub fn of_files(files: Vec<(String, u64)>) -> Base {
     Base {
@@ -549,7 +605,9 @@ fn apply_create(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(
   Ok(())
 }
 
-/// An `Unlink`: kills the live (or materialized-base) entity at `path`.
+/// An `Unlink`: kills the live (or materialized-base) entity at `path`. Its writes stay with it: a hard link may still
+/// name its node, and then the seal declares them there ([`heirs_of_writes`], A-669). Until A-669 they were cleared
+/// here, and the green handed the link the head's bytes, so a write was lost with its file's name.
 fn apply_unlink(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(), DeriveError> {
   let index = live_index(entities, path)
     .or_else(|| materialize_base(entities, base, path))
@@ -558,7 +616,6 @@ fn apply_unlink(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(
     .get_mut(index)
     .ok_or_else(|| DeriveError::UnlinkMissing(path.to_owned()))?;
   unlinked.live = false;
-  unlinked.content.clear();
   Ok(())
 }
 
@@ -622,11 +679,15 @@ fn resolve_rename_target(
   Ok(None)
 }
 
-/// The directories present at seal: the base directories, with the journal's mkdir/rmdir applied.
-/// (Validity — no mkdir over an existing directory, no rmdir of an absent one — is checked by
-/// [`compose_directories`], which runs first.)
+/// The directories present at seal: the base directories, with the journal's mkdir/rmdir applied,
+/// and the root. (Validity — no mkdir over an existing directory, no rmdir of an absent one — is
+/// checked by [`compose_directories`], which runs first.)
 fn present_directories(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeSet<String> {
   let mut present: std::collections::BTreeSet<String> = base.dirs.iter().cloned().collect();
+  // The root, the empty path (the server keys a volume's `/` so), is always present: nothing makes or removes it, and
+  // its mode and attributes compose as any directory's (A-618: a push's head is an attribute of the root, §4.17.1 "A
+  // push is a work" item 3; and an agent's `chmod` or `setxattr` of a mount's root declares the same).
+  present.insert(String::new());
   for op in journal {
     match op {
       VolumeOp::Mkdir { path } => {
@@ -643,8 +704,10 @@ fn present_directories(base: &Base, journal: &[VolumeOp]) -> std::collections::B
 
 /// Composes the `SetMode` operations into a mode per path (last one wins), emitting a `SetMode`
 /// only where the mode differs from the base and the path is present at seal (a surviving file or
-/// a present directory). A mode set on a renamed-away path (chmod then rename) is a typed
-/// `Unsupported` refusal (owed); a mode on a path present nowhere is `SetModeMissing`.
+/// a present directory). A file's mode moves with its `Rename`, as POSIX `rename` keeps it: a mode set
+/// before the rename, or a base file's own mode, is declared at the new path (2026-11-20: keyed by its
+/// path alone, chmod then rename was refused and a renamed base file lost its mode). A mode left on a
+/// renamed-away path is a typed `Unsupported` refusal; a mode on a path present nowhere is `SetModeMissing`.
 fn compose_modes(
   base: &Base,
   journal: &[VolumeOp],
@@ -653,6 +716,8 @@ fn compose_modes(
   present_dirs: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<(String, u32)>, DeriveError> {
   let mut final_mode: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+  // Paths a rename moved a file from or over: a base mode there no longer names the base's file.
+  let mut moved: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
   for op in journal {
     match op {
       VolumeOp::SetMode { path, mode } => {
@@ -660,6 +725,19 @@ fn compose_modes(
       }
       VolumeOp::Mknod { path, mode, .. } if survivors.contains(path) => {
         final_mode.insert(path.clone(), *mode);
+      }
+      VolumeOp::Rename { from, to } if from != to => {
+        let carried = final_mode.remove(from).or_else(|| {
+          (!moved.contains(from.as_str()))
+            .then(|| base_mode_of(base, from))
+            .flatten()
+        });
+        final_mode.remove(to);
+        if let Some(mode) = carried {
+          final_mode.insert(to.clone(), mode);
+        }
+        moved.insert(from);
+        moved.insert(to);
       }
       _ => {}
     }
@@ -741,31 +819,31 @@ fn compose_xattrs(
 
 /// A `SetXattr` op: `path` is the file's index, `at` the name's index into the table, and the
 /// value is `len` bytes at post-state offset `src`.
-fn set_xattr_op(path: u16, name: u16, value_offset: u64, value_len: u64) -> Op {
+fn set_xattr_op(path: u64, name: u64, value_offset: u64, value_len: u64) -> Op {
   Op {
     kind: OpKind::SetXattr,
     flags: 0,
     path,
-    at: u64::from(name),
+    at: name,
     len: value_len,
     src: value_offset,
   }
 }
 
 /// A `RemoveXattr` op: `path` is the file's index, `at` the name's index into the table.
-fn remove_xattr_op(path: u16, name: u16) -> Op {
+fn remove_xattr_op(path: u64, name: u64) -> Op {
   Op {
     kind: OpKind::RemoveXattr,
     flags: 0,
     path,
-    at: u64::from(name),
+    at: name,
     len: 0,
     src: u64::MAX,
   }
 }
 
 /// A `SetMode` op: the new mode is carried in `len` (§4.16 `OpRecord`).
-fn set_mode_op(path: u16, mode: u32) -> Op {
+fn set_mode_op(path: u64, mode: u32) -> Op {
   Op {
     kind: OpKind::SetMode,
     flags: 0,
@@ -849,23 +927,63 @@ fn compose_symlinks(
 }
 
 /// A `Symlink` op: `path` is the link's index, `src` the target string's index into the table.
-fn symlink_op(link: u16, target: u16) -> Op {
+fn symlink_op(link: u64, target: u64) -> Op {
   Op {
     kind: OpKind::Symlink,
     flags: 0,
     path: link,
     at: 0,
     len: 0,
-    src: u64::from(target),
+    src: target,
   }
 }
 
 /// A hard link the increment declares.
 enum LinkEmission {
-  /// A hard link at this path to this target (a new or retargeted link).
-  Made(String, String),
+  /// A hard link at this path to the node at this target, the one at the base or the one the
+  /// increment makes there (A-646): a new or retargeted link.
+  Made(String, String, NodeOrigin),
   /// A base hard link removed at this path.
   Removed(String),
+}
+
+/// A link path's state as the journal composes it: whether a link stands there, the target it
+/// names, and where that target's node is (A-646).
+type LinkState = (bool, String, NodeOrigin);
+
+/// Notes the paths a journal operation makes (A-646): a file created, an IPC node made, a rename's
+/// destination, a link made; and forgets a path removed or renamed away.
+fn note_made(op: &VolumeOp, made: &mut std::collections::BTreeSet<String>) {
+  match op {
+    VolumeOp::Create { path } | VolumeOp::Mknod { path, .. } | VolumeOp::Link { path, .. } => {
+      made.insert(path.clone());
+    }
+    VolumeOp::Rename { from, to } => {
+      made.remove(from);
+      made.insert(to.clone());
+    }
+    VolumeOp::Unlink { path } => {
+      made.remove(path);
+    }
+    _ => {}
+  }
+}
+
+/// The path a journal operation removes or moves, or moves something onto, when a link the
+/// increment made earlier names the node the increment made there (A-646): that link's node record
+/// names the path, so its later move is a composition owed (`DeriveError::Unsupported`).
+fn made_target_moved<'a>(
+  op: &'a VolumeOp,
+  linked_made: &std::collections::BTreeSet<String>,
+) -> Option<&'a str> {
+  match op {
+    VolumeOp::Unlink { path } => linked_made.contains(path).then_some(path.as_str()),
+    VolumeOp::Rename { from, to } => [from, to]
+      .into_iter()
+      .find(|path| linked_made.contains(*path))
+      .map(String::as_str),
+    _ => None,
+  }
 }
 
 /// The paths this increment treats as hard links: those a `Link` op names, and the base hard
@@ -887,30 +1005,44 @@ fn hardlink_paths(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeS
 /// Composes the hard link operations — `Link`, and `Unlink` on a hard link path — per link path,
 /// exactly as [`compose_symlinks`] does for symlinks: a new or retargeted link is one `Link`; a
 /// base link removed is one `Unlink`; a link created then unlinked, or a base link removed then
-/// recreated to the same target, is nothing. Whether the shared content survives an unlink is the
-/// merge's concern at apply time, not the composition's.
-fn compose_hardlinks(
+/// recreated to the same target, is nothing ([`link_emissions`] over these states). Whether the
+/// shared content survives an unlink is the merge's concern at apply time, not the composition's;
+/// the writes a removed file leaves to a link are the seal's ([`heirs_of_writes`], A-669). The
+/// states are each link path the journal touched, from its base state.
+fn link_states(
   base: &Base,
   journal: &[VolumeOp],
   paths: &std::collections::BTreeSet<String>,
-) -> Result<Vec<LinkEmission>, DeriveError> {
-  let mut state: std::collections::BTreeMap<String, (bool, String)> =
-    std::collections::BTreeMap::new();
-  let initial = |path: &str| -> (bool, String) {
+) -> Result<std::collections::BTreeMap<String, LinkState>, DeriveError> {
+  let mut state: std::collections::BTreeMap<String, LinkState> = std::collections::BTreeMap::new();
+  let initial = |path: &str| -> LinkState {
     match base_hardlink_target(base, path) {
-      Some(target) => (true, target.to_owned()),
-      None => (false, String::new()),
+      Some(target) => (true, target.to_owned(), NodeOrigin::Base),
+      None => (false, String::new(), NodeOrigin::Base),
     }
   };
+  // The paths the increment has made so far, and the targets of the links it made to a node it
+  // made (A-646): a link names the node at its target when it is made, the increment's own or the
+  // base's.
+  let mut made = std::collections::BTreeSet::new();
+  let mut linked_made = std::collections::BTreeSet::new();
   for op in journal {
+    if let Some(moved) = made_target_moved(op, &linked_made) {
+      return Err(DeriveError::Unsupported(moved.to_owned()));
+    }
     match op {
       VolumeOp::Link { path, target } => {
         let here = state.entry(path.clone()).or_insert_with(|| initial(path));
         if here.0 {
           return Err(DeriveError::LinkOverExisting(path.clone()));
         }
-        here.0 = true;
-        here.1 = target.clone();
+        let origin = if made.contains(target) {
+          linked_made.insert(target.clone());
+          NodeOrigin::Made
+        } else {
+          NodeOrigin::Base
+        };
+        *here = (true, target.clone(), origin);
       }
       VolumeOp::Unlink { path } if paths.contains(path) => {
         let here = state.entry(path.clone()).or_insert_with(|| initial(path));
@@ -921,35 +1053,155 @@ fn compose_hardlinks(
       }
       _ => {}
     }
+    note_made(op, &mut made);
   }
+  Ok(state)
+}
+
+/// Where the writes of a removed or replaced base file go, by its entity's index (A-669; A-646's decision: a removed
+/// or replaced home leaves its node to its least surviving link, and the node is as the work left it). A base file the
+/// journal wrote to and then removed, or replaced by renaming another file onto it, keeps its node while a hard link
+/// still names it, and a volume reads the writes at that link. So the seal declares them at the link ([`classify`]),
+/// where the seal's reader finds the node's bytes, beside the file's removal, and the engine makes the link the node's
+/// home with them (`Green::merge_handed`). The heir is the least of the base's links to the file that the journal left
+/// as they were. Refused, typed (`Unsupported`, owed), never accepted without the writes: writes whose node only links
+/// the journal made still name, and writes to a file the journal made again at its own name, whose new node is
+/// composed as an edit of the old one (GAPS). Until A-669 the writes were dropped with the file, and the green handed
+/// the link the head's bytes.
+fn heirs_of_writes(
+  base: &Base,
+  entities: &[Entity],
+  links: (&std::collections::BTreeMap<String, LinkState>, &LinkedNodes),
+) -> Result<std::collections::BTreeMap<usize, String>, DeriveError> {
+  let mut heirs = std::collections::BTreeMap::new();
+  for (index, entity) in entities.iter().enumerate() {
+    let Some(origin) = entity.origin.as_deref().filter(|_| !entity.live) else {
+      continue;
+    };
+    let (writes, _) = compose_content_sized(entity.base_len, &entity.content);
+    if writes.is_empty() {
+      continue;
+    }
+    let (kept, made) = node_names(base, links, origin);
+    if kept.is_empty() && made.is_empty() {
+      // The node goes with its last name, and its writes with it.
+      continue;
+    }
+    let made_again = entities
+      .iter()
+      .any(|other| other.live && other.origin.as_deref() == Some(origin));
+    match kept.into_iter().next() {
+      Some(heir) if !made_again => {
+        heirs.insert(index, heir);
+      }
+      _ => return Err(DeriveError::Unsupported(origin.to_owned())),
+    }
+  }
+  Ok(heirs)
+}
+
+/// The link paths standing at the seal that name `origin`'s base node (`nodes`, [`linked_nodes`]): those the base had
+/// to the file and the journal left as they were (`links`, each link path the journal touched), the first set, and the
+/// others.
+fn node_names(
+  base: &Base,
+  (links, nodes): (&std::collections::BTreeMap<String, LinkState>, &LinkedNodes),
+  origin: &str,
+) -> (
+  std::collections::BTreeSet<String>,
+  std::collections::BTreeSet<String>,
+) {
+  let as_based = |path: &&String| {
+    base_hardlink_target(base, path) == Some(origin)
+      && links
+        .get(path.as_str())
+        .is_none_or(|(here, target, node)| *here && target == origin && *node == NodeOrigin::Base)
+  };
+  let (kept, made): (Vec<&String>, Vec<&String>) = nodes
+    .iter()
+    .filter(|(_, node)| node.as_deref() == Some(origin))
+    .map(|(path, _)| path)
+    .partition(as_based);
+  (
+    kept.into_iter().cloned().collect(),
+    made.into_iter().cloned().collect(),
+  )
+}
+
+/// Each hard link standing at the seal and the base node it names, by link path: `None` for a node the journal made
+/// or moved.
+type LinkedNodes = std::collections::BTreeMap<String, Option<String>>;
+
+/// The node each hard link standing at the seal names (A-646: a link names the node at its target when it is made, so
+/// a link made to a link names that link's node then, whatever becomes of that link after). A link the base had names
+/// its base target's node until the journal removes it; a link the journal makes names what its target named then:
+/// the node a standing link named, a base file's own, or a node the journal made or moved there (`None`, whose later
+/// move or removal the deriver refuses, `made_target_moved`). A-669's first green run found a link resolved through
+/// the links standing at the seal: `ln h l; rm h` lost `l`'s node, and with it a write handed on to `l`.
+fn linked_nodes(base: &Base, journal: &[VolumeOp]) -> LinkedNodes {
+  let mut nodes: LinkedNodes = base
+    .hardlinks
+    .iter()
+    .map(|(link, target)| (link.clone(), Some(target.clone())))
+    .collect();
+  let mut made = std::collections::BTreeSet::new();
+  for op in journal {
+    match op {
+      VolumeOp::Link { path, target } => {
+        let node = match nodes.get(target) {
+          Some(named) => named.clone(),
+          None if made.contains(target) => None,
+          None => Some(target.clone()),
+        };
+        nodes.insert(path.clone(), node);
+      }
+      VolumeOp::Unlink { path } => {
+        nodes.remove(path);
+      }
+      _ => {}
+    }
+    note_made(op, &mut made);
+  }
+  nodes
+}
+
+/// The links a composed state declares: a link standing where the base had none, or another, or
+/// one naming a node the increment made (another node, whatever its path); a base link no longer
+/// standing, removed.
+fn link_emissions(
+  base: &Base,
+  state: std::collections::BTreeMap<String, LinkState>,
+) -> Vec<LinkEmission> {
   let mut emissions = Vec::new();
-  for (path, (here, target)) in state {
+  for (path, (here, target, origin)) in state {
     let base_target = base_hardlink_target(base, &path);
     if here {
-      if base_target != Some(target.as_str()) {
-        emissions.push(LinkEmission::Made(path, target));
+      let unchanged = origin == NodeOrigin::Base && base_target == Some(target.as_str());
+      if !unchanged {
+        emissions.push(LinkEmission::Made(path, target, origin));
       }
     } else if base_target.is_some() {
       emissions.push(LinkEmission::Removed(path));
     }
   }
-  Ok(emissions)
+  emissions
 }
 
-/// A `Link` op: `path` is the link's index, `src` the target file's index into the table.
-fn link_op(link: u16, target: u16) -> Op {
+/// A `Link` op: `path` is the link's index, `src` the index of the node it names in the node table
+/// (A-646).
+fn link_op(link: u64, node: u64) -> Op {
   Op {
     kind: OpKind::Link,
     flags: 0,
     path: link,
     at: 0,
     len: 0,
-    src: u64::from(target),
+    src: node,
   }
 }
 
 /// A namespace op with a path index and empty coordinates.
-fn namespace_op(kind: OpKind, path: u16) -> Op {
+fn namespace_op(kind: OpKind, path: u64) -> Op {
   Op {
     kind,
     flags: 0,
@@ -961,14 +1213,14 @@ fn namespace_op(kind: OpKind, path: u16) -> Op {
 }
 
 /// A `Rename` op: `path` is the destination index, `src` the source path index into the table.
-fn rename_op(destination: u16, source: u16) -> Op {
+fn rename_op(destination: u64, source: u64) -> Op {
   Op {
     kind: OpKind::Rename,
     flags: 0,
     path: destination,
     at: 0,
     len: 0,
-    src: u64::from(source),
+    src: source,
   }
 }
 
@@ -1001,15 +1253,19 @@ pub fn compose_volume_planned(
   journal: &[VolumeOp],
 ) -> Result<(OpsDoc, PostStatePlan), DeriveError> {
   let specials = crate::special::Composition::of(base, journal)?;
+  check_copies(journal)?;
   check_no_file_directory_collision(base, journal)?;
   let directories = compose_directories(base, journal)?;
   let sym_paths = symlink_paths(base, journal);
   let symlinks = compose_symlinks(base, journal, &sym_paths)?;
   let link_paths = hardlink_paths(base, journal);
-  let hardlinks = compose_hardlinks(base, journal, &link_paths)?;
+  let link_state = link_states(base, journal, &link_paths)?;
   let mut entities: Vec<Entity> = Vec::new();
   for op in journal {
-    if op.is_directory() || op.is_symlink() || op.is_link() || matches!(op, VolumeOp::Mknod { .. })
+    if op.is_directory()
+      || op.is_symlink()
+      || op.is_link()
+      || matches!(op, VolumeOp::Mknod { .. } | VolumeOp::Copy { .. })
     {
       continue;
     }
@@ -1051,14 +1307,80 @@ pub fn compose_volume_planned(
   let present_dirs = present_directories(base, journal);
   let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
   let xattrs = compose_xattrs(base, journal, &survivors, &renamed_away, &present_dirs)?;
+  let nodes = linked_nodes(base, journal);
+  let heirs = heirs_of_writes(base, &entities, (&link_state, &nodes))?;
+  let hardlinks = link_emissions(base, link_state);
   let mut plan = PostStatePlan::new();
   let mut doc = seal(
-    entities,
+    (entities, &heirs),
     (directories, modes, symlinks, xattrs, hardlinks),
     &mut plan,
   );
   specials.emit(&mut doc);
+  emit_copies(&mut doc, journal);
   Ok((doc, plan))
+}
+
+/// Whether `path` lies in `root`'s tree: `root` itself or beneath it; every path, for the root (the empty path).
+fn within(path: &str, root: &str) -> bool {
+  root.is_empty()
+    || path == root
+    || path
+      .strip_prefix(root)
+      .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Refuses a journal that names a path in a copy's destination tree before the copy (A-626 part 4). The base a
+/// journal holding copies is composed against holds each copied tree where its copy puts it (`Green::base_for`), so an
+/// earlier operation there would be composed against what the copy brings, not what it changed: owed
+/// (`DeriveError::Unsupported`), as the deriver's other compositions over a reused name are.
+fn check_copies(journal: &[VolumeOp]) -> Result<(), DeriveError> {
+  for (index, op) in journal.iter().enumerate() {
+    let VolumeOp::Copy { to, .. } = op else {
+      continue;
+    };
+    let earlier = journal.get(..index).unwrap_or_default();
+    if let Some(name) = earlier
+      .iter()
+      .flat_map(VolumeOp::names)
+      .flatten()
+      .find(|name| within(name, to))
+    {
+      return Err(DeriveError::Unsupported(name.to_owned()));
+    }
+  }
+  Ok(())
+}
+
+/// Emits the journal's copies (A-626 part 4) by destination, so their order is not the journal's: each one `Copy`,
+/// its destination the op's path, its source the `src`, the source's version the `at`, and `REPLACE` where it replaces
+/// what its destination holds.
+fn emit_copies(doc: &mut OpsDoc, journal: &[VolumeOp]) {
+  let mut copies: Vec<(&str, &str, u64, bool)> = journal
+    .iter()
+    .filter_map(|op| match op {
+      VolumeOp::Copy {
+        from,
+        to,
+        version,
+        replace,
+      } => Some((to.as_str(), from.as_str(), *version, *replace)),
+      _ => None,
+    })
+    .collect();
+  copies.sort_unstable();
+  for (to, from, version, replace) in copies {
+    let path = doc.paths.intern(to);
+    let src = doc.paths.intern(from);
+    doc.ops.push(Op {
+      kind: OpKind::Copy,
+      flags: if replace { crate::ops_doc::REPLACE } else { 0 },
+      path,
+      at: version,
+      len: 0,
+      src,
+    });
+  }
 }
 
 /// A directory the increment declares: a create or a remove.
@@ -1221,12 +1543,26 @@ struct Emission {
 /// Classifies the sealed entity set into the surviving files' emissions and the base paths to
 /// unlink. A base file edited to no net change is dropped (so a touched-then-reverted file leaves
 /// no trace and the identity stays minimal); a gone base path is unlinked only when no surviving
-/// file occupies it (a rename or content replacement onto that path covers its removal).
-fn classify(entities: Vec<Entity>) -> (Vec<Emission>, Vec<String>) {
+/// file occupies it (a rename or content replacement onto that path covers its removal). A gone
+/// base file whose writes a link inherits (`heirs`, by entity index, [`heirs_of_writes`]) is also an
+/// emission at that link: the writes, which the seal reads there (A-669).
+fn classify(
+  entities: Vec<Entity>,
+  heirs: &std::collections::BTreeMap<usize, String>,
+) -> (Vec<Emission>, Vec<String>) {
   let mut emissions: Vec<Emission> = Vec::new();
   let mut survivors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
   let mut gone: Vec<String> = Vec::new();
-  for entity in entities {
+  for (index, entity) in entities.into_iter().enumerate() {
+    if let Some(heir) = heirs.get(&index) {
+      let (ops, _) = compose_content_sized(entity.base_len, &entity.content);
+      emissions.push(Emission {
+        final_path: heir.clone(),
+        source: None,
+        created: false,
+        ops,
+      });
+    }
     if entity.live {
       survivors.insert(entity.final_path.clone());
       let (ops, _) = compose_content_sized(entity.base_len, &entity.content);
@@ -1303,7 +1639,7 @@ fn document_names(
   }
   for link in hardlinks {
     match link {
-      LinkEmission::Made(path, target) => {
+      LinkEmission::Made(path, target, _) => {
         names.push(path.clone());
         names.push(target.clone());
       }
@@ -1326,11 +1662,13 @@ fn emit_namespace(
   symlinks: Vec<SymlinkEmission>,
   hardlinks: Vec<LinkEmission>,
 ) {
-  let index_of = |name: &str| -> u16 {
+  // A name's index is its place among the sorted names; one not among them is `u64::MAX`, which names no path, never
+  // another's (A-621: a 16-bit index answered `u16::MAX`, the 65,536th name's, for both).
+  let index_of = |name: &str| -> u64 {
     names
       .binary_search_by(|candidate| candidate.as_str().cmp(name))
-      .map_or(u16::MAX, |position| {
-        u16::try_from(position).unwrap_or(u16::MAX)
+      .map_or(u64::MAX, |position| {
+        u64::try_from(position).unwrap_or(u64::MAX)
       })
   };
   for origin in removed {
@@ -1361,8 +1699,12 @@ fn emit_namespace(
   }
   for link in hardlinks {
     match link {
-      LinkEmission::Made(path, target) => {
-        doc.ops.push(link_op(index_of(&path), index_of(&target)));
+      LinkEmission::Made(path, target, origin) => {
+        let node = doc.nodes.intern(NodeRef {
+          path: index_of(&target),
+          origin,
+        });
+        doc.ops.push(link_op(index_of(&path), node));
       }
       LinkEmission::Removed(path) => {
         doc.ops.push(namespace_op(OpKind::Unlink, index_of(&path)));
@@ -1381,11 +1723,11 @@ type Namespace = (
 );
 
 fn seal(
-  entities: Vec<Entity>,
+  (entities, heirs): (Vec<Entity>, &std::collections::BTreeMap<usize, String>),
   (directories, modes, symlinks, xattrs, hardlinks): Namespace,
   plan: &mut PostStatePlan,
 ) -> OpsDoc {
-  let (mut emissions, removed) = classify(entities);
+  let (mut emissions, removed) = classify(entities, heirs);
   let names = document_names(
     &emissions,
     &removed,
@@ -1400,11 +1742,13 @@ fn seal(
   for name in &names {
     doc.paths.intern(name);
   }
-  let index_of = |name: &str| -> u16 {
+  // A name's index is its place among the sorted names; one not among them is `u64::MAX`, which names no path, never
+  // another's (A-621: a 16-bit index answered `u16::MAX`, the 65,536th name's, for both).
+  let index_of = |name: &str| -> u64 {
     names
       .binary_search_by(|candidate| candidate.as_str().cmp(name))
-      .map_or(u16::MAX, |position| {
-        u16::try_from(position).unwrap_or(u16::MAX)
+      .map_or(u64::MAX, |position| {
+        u64::try_from(position).unwrap_or(u64::MAX)
       })
   };
 
@@ -1463,7 +1807,7 @@ fn seal(
 fn push_content(
   doc: &mut OpsDoc,
   ops: Vec<Op>,
-  index: u16,
+  index: u64,
   (cursor, plan): (&mut u64, &mut PostStatePlan),
 ) {
   for mut op in ops {
@@ -1476,3 +1820,6 @@ fn push_content(
     doc.ops.push(op);
   }
 }
+
+#[cfg(test)]
+mod tests;

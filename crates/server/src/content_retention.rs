@@ -137,16 +137,77 @@ fn keeps(
     || (ahead(newest, placed.sequence) && placed.sequence >= newest_placed)
 }
 
-/// Applies the retention rule to what this holder holds for `object` now; returns how many manifests went.
+/// The status count of held manifests the retention rule judged (A-372): one a manifest each run asks about, so a test
+/// can hold the rule's work to the content an event can change rather than to everything held.
+/// Format: a counter name in the daemon's status report.
+pub const CONTENT_JUDGED: &str = "fleet.content.retention_judged";
+
+/// The sequence the retention rule must judge content from (A-372). A green's ledger accepts its versions in order and
+/// never rewrites an accepted position, so the inputs placed below its newest accepted version were judged when their
+/// own records came: named then, named for good; not named, released then. Only the content placed at or past it can
+/// change. A head, a tombstone or no record at all is judged whole: a head's register keeps one position, so its object
+/// holds little, and a tombstone releases everything once.
+fn judged_from(newest: &Newest<'_>) -> u64 {
+  match newest {
+    Newest::Ledger(accepted, _) => *accepted,
+    Newest::Nothing | Newest::Head(..) | Newest::Tombstone | Newest::Other(_) => 0,
+  }
+}
+
+/// Applies the retention rule to what this holder holds for `object` now, judging what an event can have changed
+/// ([`judged_from`]); returns how many manifests went. Before A-372 every held manifest of the object was judged at
+/// every record and put, each by its ledger position's decode: a green's every version re-decoded every version before
+/// it, a fifth of a holder's time at a thousand versions (`sample` of the late-submit test, Mac Studio, 2026-11-18).
 pub(crate) fn retain_object(state: &mut ShardState, object: ObjectId) -> usize {
+  retain_object_from(state, object, None)
+}
+
+/// [`retain_object`], judging the content placed from `from` on where it is given (A-404): a holder that compacted its
+/// green's ledger below a durable checkpoint releases the inputs of the versions it dropped, which the rule judged
+/// named when their records came and never judges again on its own.
+pub(crate) fn retain_object_from(
+  state: &mut ShardState,
+  object: ObjectId,
+  from: Option<u64>,
+) -> usize {
   let local = state.fleet.host();
-  let newest = newest(&state.holder_records, object);
+  let newest = newest(state.holder_records.as_map(), object);
+  let newest_placed = state.held_content.newest_placed(object).unwrap_or(0);
+  let space = &mut crate::content_holder::hold_space(&mut state.store);
+  let mut judged: u64 = 0;
+  let released = state.held_content.retain_placed_from(
+    space,
+    object,
+    from.unwrap_or_else(|| judged_from(&newest)),
+    |manifest, placed| {
+      judged = judged.saturating_add(1);
+      keeps(&newest, object, local, (manifest, placed), newest_placed)
+    },
+  );
+  if judged > 0 {
+    let count = state.refusals.entry(CONTENT_JUDGED).or_insert(0);
+    *count = count.saturating_add(judged);
+  }
+  if released > 0 {
+    let count = state.refusals.entry(CONTENT_RELEASED).or_insert(0);
+    *count = count.saturating_add(u64::try_from(released).unwrap_or(u64::MAX));
+  }
+  released
+}
+
+/// [`retain_object`] for a stale copy judged on a takeover whose confirmations certify their content (A-538): its
+/// successor serves the volume from its own placement (A-529), so no head it serves names this holder for what this
+/// holder's own stale records name, and that goes; returns how many manifests went. Content placed for a sequence ahead
+/// of those records stays while it is the newest placement ahead: it may be the successor's own re-placement, made
+/// while this holder was among its candidates, which its republished head names.
+pub(crate) fn release_certified(state: &mut ShardState, object: ObjectId) -> usize {
+  let newest = newest(state.holder_records.as_map(), object);
   let newest_placed = state.held_content.newest_placed(object).unwrap_or(0);
   let space = &mut crate::content_holder::hold_space(&mut state.store);
   let released = state
     .held_content
-    .retain(space, object, |manifest, placed| {
-      keeps(&newest, object, local, (manifest, placed), newest_placed)
+    .retain_placed_from(space, object, 0, |_, placed| {
+      ahead(&newest, placed.sequence) && placed.sequence >= newest_placed
     });
   if released > 0 {
     let count = state.refusals.entry(CONTENT_RELEASED).or_insert(0);
@@ -229,5 +290,89 @@ mod tests {
     assert!(!keeps(&newest, object(), LOCAL, (&other, at(6)), 7));
     assert!(!keeps(&newest, object(), LOCAL, (&other, at(5)), 5));
     assert!(keeps(&newest, object(), LOCAL, (&named_manifest, at(5)), 7));
+  }
+
+  /// Shape: the versions of the green whose retention the judged-content test runs: enough that judging every held
+  /// input at each version would ask about tens of manifests at the last.
+  const LEDGER_VERSIONS: u64 = 64;
+
+  /// §4.10 retention, A-372: a green's holder judges, at each version it accepts, only the inputs that version can
+  /// change. Do: on a shard, for each version 1 to [`LEDGER_VERSIONS`] of a green, hold its inputs placed for it, accept
+  /// the merge record naming them, and run the retention rule, reading how many manifests it judged. Expect the last run
+  /// to judge one manifest (the newest version's inputs) and every version's inputs still held. Before, every run judged
+  /// every input held, each by decoding its ledger position.
+  #[test]
+  fn a_greens_retention_judges_only_the_inputs_its_newest_version_can_change() {
+    let (judged_last, held) = crate::daemon::audit_on_shard(|state| {
+      let green = ObjectId::new(OWNER, 9);
+      let local = state.fleet.host();
+      let mut judged_last = 0;
+      for version in 1..=LEDGER_VERSIONS {
+        let archive =
+          crate::merge_origin::InputsBuilder::whole(&version.to_le_bytes()).finish(version, 4096);
+        let manifest = archive.manifest_identity();
+        state
+          .held_content
+          .hold(
+            &mut crate::content_holder::hold_space(&mut state.store),
+            green,
+            Placed { sequence: version },
+            archive,
+          )
+          .unwrap();
+        let value = MergeRecordValue {
+          version,
+          increment: [0; 32],
+          base: version - 1,
+          inputs: Some(manifest),
+          identity: [0; 32],
+          evidence: Vec::new(),
+          name: "green".to_owned(),
+          require_evidence: false,
+          owner: slates_db::catalog::Principal::Uid {
+            host: slates_db::HostId(OWNER.0),
+            uid: 0,
+          },
+          completion: None,
+          signature: None,
+          folded_below: 0,
+          checkpoint_floor: 0,
+        };
+        state
+          .holder_records
+          .entry(green)
+          .or_insert_with(|| {
+            Acceptor::new(
+              local,
+              Authority {
+                generation: 0,
+                owner: OWNER,
+              },
+            )
+          })
+          .accept(&Record {
+            owner: OWNER,
+            object: green,
+            sequence: version,
+            epoch: HostEpoch(1),
+            generation: 0,
+            value: value.to_record_bytes(),
+          })
+          .unwrap();
+        let before = state.refusals.get(CONTENT_JUDGED).copied().unwrap_or(0);
+        retain_object(state, green);
+        judged_last = state.refusals.get(CONTENT_JUDGED).copied().unwrap_or(0) - before;
+      }
+      (judged_last, state.held_content.manifest_count())
+    });
+    assert_eq!(
+      judged_last, 1,
+      "the last version judged its own inputs only"
+    );
+    assert_eq!(
+      held,
+      usize::try_from(LEDGER_VERSIONS).unwrap(),
+      "every version's inputs are still held"
+    );
   }
 }

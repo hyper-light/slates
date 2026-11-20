@@ -12,6 +12,14 @@ on:
   schedule:
     - cron: "17 3 * * *"
 
+# One run per ref and event at a time, and at most one waiting behind it (2026-11-18: 24 runs queued behind each other
+# on main starved the runner pool, and the release's builds waited). A waiting run is replaced by a newer push's, never
+# the run in progress: cancelling in progress on main left no run finishing at all when pushes came every few minutes.
+# The nightly schedule has its own group, so a push never displaces it.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   # WinFsp, pinned (A-206): the receiver is written from this version and refuses any other, so an unpinned install would
@@ -28,6 +36,15 @@ env:
   DOWNLOAD_RETRIES: "20"
   DOWNLOAD_RETRY_SECONDS: "60"
   DOWNLOAD_TRY_SECONDS: "120"
+  # Mercurial and Subversion for the Windows lanes' version-control workloads over the WinFsp drive (A-300), pinned:
+  # Mercurial from PyPI, whose 7.2.4 release publishes win_amd64 and win_arm64 wheels; Subversion's command-line build
+  # from VisualSVN (Apache Subversion 1.15.0: svn, svnadmin and svnlook in each zip's bin), each zip with the SHA-256 of
+  # the file downloaded on 2026-11-17. Git for Windows, whose `sh` runs the scripts, is the runner image's own.
+  MERCURIAL_VERSION: "7.2.4"
+  SUBVERSION_X64_URL: https://www.visualsvn.com/files/Apache-Subversion-1.15.0-x64.zip
+  SUBVERSION_X64_SHA256: 98bb798dd6c70cc875b9bdacd600594351cf88f0a39a831a5055df061c871bb5
+  SUBVERSION_ARM64_URL: https://www.visualsvn.com/files/Apache-Subversion-1.15.0-ARM64.zip
+  SUBVERSION_ARM64_SHA256: 65bf60ed3d01e55912cab14a1f60a373a7689edf73023c071b3fb587871033d4
   # kind and kubectl, pinned, each with the SHA-256 its release publishes (kind-linux-amd64.sha256sum, kubectl.sha256; read
   # 2026-11-08). They are installed by a step of this workflow, not helm/kind-action, whose installer runs curl without
   # --fail: a 504 wrote an error page over the checksum file and the step failed with "no properly formatted checksum
@@ -190,9 +207,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      # SLATES_TEST_CONTAINER turns on fs_server's container lane (fs-server plan step 2): on Linux the server node runs
+      # in its own Docker container and lands the client node's merge into a volume attached to it; the lane is compiled
+      # on Linux only (Docker Desktop's containers are not reachable by address from a macOS host).
       - name: The slates CLI flow (anchor + daemon)
         env:
           SLATES_TEST_CLI: "1"
+          SLATES_TEST_CONTAINER: "1"
         run: |
           cargo test -p slates-cli --test cli --test fs_server -- --test-threads=1 --nocapture
       # `slates exec`'s FUSE flow (§4.6 "The launcher") on a host whose AppArmor does not confine unprivileged user
@@ -216,6 +237,32 @@ jobs:
           cat exec.log
           if grep -q "SKIP" exec.log; then echo "the exec flow skipped where it must run"; exit 1; fi
           grep -q "test result: ok. 2 passed" exec.log
+          exit "$status"
+      # `slates exec --apparmor-profile` (A-370) on the runner's default policy, which restricts unprivileged user
+      # namespaces. First with no slates profile loaded for the test build's binary: the refusals, the one without the
+      # option word for word as before. Then with that binary's profile loaded by this step as root, as an administrator
+      # loads it: the launcher makes its namespace only when asked, and its command runs outside the profile. Each run
+      # demands its regime (`SLATES_TEST_APPARMOR_PROFILE`), so a load or unload that failed fails the step, and the
+      # profile is unloaded whatever the tests answer. Loading it is test setup modelling an administrator's choice, not a
+      # privilege the product asks for (R10).
+      - name: The slates exec AppArmor profile, opted into (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo test -p slates-cli --test cli --no-run
+          exe=$(readlink -f target/debug/slates)
+          "$exe" apparmor profile > "$RUNNER_TEMP/slates.apparmor"
+          tests="the_launcher_uses_slates_apparmor_profile_only_when_asked apparmor_prints_the_profile_and_checks_the_host"
+          status=0
+          SLATES_TEST_APPARMOR_PROFILE=absent cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture \
+            --exact $tests > apparmor.log 2>&1 || status=$?
+          sudo apparmor_parser -r "$RUNNER_TEMP/slates.apparmor" || status=$?
+          SLATES_TEST_APPARMOR_PROFILE=loaded cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture \
+            --exact $tests >> apparmor.log 2>&1 || status=$?
+          sudo apparmor_parser -R "$RUNNER_TEMP/slates.apparmor" || status=$?
+          cat apparmor.log
+          if grep -q "SKIP" apparmor.log; then echo "the AppArmor flow skipped where it must run"; exit 1; fi
+          test "$(grep -c 'test result: ok. 2 passed' apparmor.log)" -eq 2 || exit 1
           exit "$status"
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
       # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
@@ -311,6 +358,9 @@ jobs:
           # A skipped live guest is a vacuous pass here: the image provides its environment, so a skip fails.
           if grep -q "SKIP: the live guest" live-guest.log; then echo "the live guest was skipped"; exit 1; fi
           grep -q "guest workload git: Identical" live-guest.log
+          grep -q "guest workload git-history: Identical" live-guest.log
+          grep -q "guest workload mercurial: Identical" live-guest.log
+          grep -q "guest workload subversion: Identical" live-guest.log
           grep -q "guest suite fsx: ok" live-guest.log
           grep -q "guest suite fsstress: ok" live-guest.log
           grep -q "guest suite pjdfstest: ok" live-guest.log
@@ -379,16 +429,42 @@ jobs:
           # local install needs, and the publish lane builds the manylinux wheels in the containers.
           - { os: ubuntu-latest, maturin_compatibility: "--compatibility linux" }
           - { os: macos-latest, maturin_compatibility: "" }
+          # Windows, both arches: the Node suites and the packaged smoke test only. The Python steps below assume a
+          # Unix venv (`venv/bin`), so the Python leg there is owed (GAPS, "The Node SDK suites on Windows"). Until
+          # 2026-11-18 the Node suites had never run on Windows, and there every teardown's process-group kill was
+          # refused and swallowed, so a suite waited on its live anchor for good (over 70 minutes, diag run
+          # 44384411115); `crates/sdk-node/tests/anchor.mjs` now ends an anchor the platform's way and fails a test it
+          # cannot end.
+          - { os: windows-latest, node_only: true }
+          - { os: windows-11-arm, node_only: true }
     runs-on: ${{ matrix.os }}
     env:
       NAPI_CLI_VERSION: 3.7.2 # keep in sync with publish-node.yml
+      # AWS-LC's x86_64 Windows assembly is built from source (`windows-lint` says why); read on that target alone.
+      AWS_LC_SYS_PREBUILT_NASM: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      # aws-lc-sys builds its C and its arm64 assembly with clang-cl on this target (`windows-arm64` says why).
+      - name: clang-cl for the C the daemon and the addon link (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/setup-python@v5
+        if: ${{ !matrix.node_only }}
         with:
           python-version: "3.11"
       - uses: actions/setup-node@v4
@@ -397,6 +473,7 @@ jobs:
       - name: The daemon both SDK suites spawn
         run: cargo build -p slates-cli
       - name: Build the wheel and the sdist, check their metadata, install the wheel into a fresh venv
+        if: ${{ !matrix.node_only }}
         run: |
           set -euo pipefail
           python -m venv "$RUNNER_TEMP/venv"
@@ -412,32 +489,47 @@ jobs:
       # at 10 under the same load: five of five. The loop-responsiveness bound deliberately does not
       # scale with it, so this cannot mask the held-loop failure it is there to catch.
       - name: The Python suites (sync and async) against the installed wheel over a live daemon
+        if: ${{ !matrix.node_only }}
         env:
           SLATES_TEST_RESTART_SLOWDOWN: "10"
         run: SLATES_DAEMON="$PWD/target/debug/slates" "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s crates/sdk-python/tests -v
+      # Paths a native program reads: on Windows Git Bash's `pwd -W` and `cygpath -m` name the drive (`D:/a/...`), where
+      # `$PWD` is a POSIX path Node would misread; elsewhere `pwd` and the variable as it is. The daemon is
+      # `slates.exe` on Windows. A step's timeout bounds a suite that cannot end (the 70-minute wait above).
       - name: Build the napi addon and run the Node suites (sync and async) over a live daemon
+        shell: bash
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
           (cd crates/sdk-node && npm run build)
+          root=$(pwd -W 2>/dev/null || pwd)
+          daemon="$root/target/debug/slates"
+          if [ -e "$daemon.exe" ]; then daemon="$daemon.exe"; fi
           addon=$(ls crates/sdk-node/slates.*.node)
-          SLATES_NODE_ADDON="$PWD/$addon" SLATES_DAEMON="$PWD/target/debug/slates" \
+          SLATES_NODE_ADDON="$root/$addon" SLATES_DAEMON="$daemon" \
             node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs
       - name: Pack the main and platform packages, install them into a fresh project, run the packaged smoke test
+        shell: bash
+        timeout-minutes: 30
         run: |
           set -euo pipefail
+          root=$(pwd -W 2>/dev/null || pwd)
+          temp=$(cygpath -m "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")
+          daemon="$root/target/debug/slates"
+          if [ -e "$daemon.exe" ]; then daemon="$daemon.exe"; fi
           binary=$(basename "$(ls crates/sdk-node/slates.*.node)")
           platform=${binary#slates.}
           platform=${platform%.node}
           cp "crates/sdk-node/$binary" "crates/sdk-node/npm/$platform/"
-          (cd "crates/sdk-node/npm/$platform" && npm pack --pack-destination "$RUNNER_TEMP")
-          (cd crates/sdk-node && npm pack --pack-destination "$RUNNER_TEMP")
-          mkdir "$RUNNER_TEMP/project"
-          cd "$RUNNER_TEMP/project"
+          (cd "crates/sdk-node/npm/$platform" && npm pack --pack-destination "$temp")
+          (cd crates/sdk-node && npm pack --pack-destination "$temp")
+          mkdir "$temp/project"
+          cd "$temp/project"
           npm init -y >/dev/null
-          npm install "$RUNNER_TEMP"/hyper-light-slates-*.tgz
-          cp "$GITHUB_WORKSPACE/crates/sdk-node/tests/packaged.test.mjs" .
-          SLATES_DAEMON="$GITHUB_WORKSPACE/target/debug/slates" node --test packaged.test.mjs
+          npm install "$temp"/hyper-light-slates-*.tgz
+          cp "$root/crates/sdk-node/tests/packaged.test.mjs" "$root/crates/sdk-node/tests/anchor.mjs" .
+          SLATES_DAEMON="$daemon" node --test packaged.test.mjs
 
   # The Windows cfg branches (the Win32 rendezvous, the IOCP driver, the Win32 machine facts, the
   # WinFsp bridge) lint on a NATIVE Windows runner — each platform builds and lints on its own OS, so
@@ -480,6 +572,10 @@ jobs:
           if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
           $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          # A-369: every slates WinFsp drive is a Mount Manager drive WinFsp's driver makes for an unprivileged daemon,
+          # so Windows resolves its files' final paths; the machine allows that once, as an Administrator does when
+          # installing WinFsp (WinFsp's MountUseMountmgrFromFSD, read by its driver from this key).
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       # `--workspace` cannot build here: the NFS-mount and FUSE/FSKit crates (bridge-nfs, cli,
       # bridge-fuse, bridge-fskit) are macOS/Linux-only — Windows mounts through WinFsp, and the fleet
@@ -493,8 +589,8 @@ jobs:
       # had never been compiled for Windows — which is where §4.6's DAX suite lives, with its paired `#[cfg]`
       # arms and its `huge_page_bytes` probe that answers `None` off Linux. Cross-linted clean against
       # `x86_64-pc-windows-gnu` before being added here. **`slates-mcp` joined on 2026-10-26** with its HTTP edge on Windows
-      # (A-183); its test runs here once landing does, since `slates.land.materialize` answers `Unsupported` on Windows
-      # until then. **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
+      # (A-183); its test runs here since landing does (A-185, 2026-11-18): until then `slates.land.materialize` answered
+      # `Unsupported` on Windows. **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
       # tests and examples, which asked `rustix::param` for the page size (configured out on Windows), never compiled for
       # Windows; they ask `slates_machine::facts::Facts::page_bytes` now (`cargo xwin clippy` red before, clean after).
       # **`slates-bridge-virtiofs` joined on 2026-11-07**: the daemon builds it, but only listed crates are
@@ -539,7 +635,7 @@ jobs:
       - name: Documentation (every reference names something Windows can see)
         env:
           RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
-        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp --no-deps --document-private-items
+        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp -p slates-land --no-deps --document-private-items
       # Run the tests whose Win32 cfg branches only a native Windows runner can exercise: the shared
       # memory (`CreateFileMappingW`); the cross-process wake (the named auto-reset Event — §4.7's
       # `WaitOnAddress`-is-process-local case, so the park/late-reply wake in `rings` goes through the
@@ -621,6 +717,16 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-base
+      # Landing on Windows (§4.15, A-185): the writer over NTFS handles, the oracle, a real kill mid-landing on NTFS
+      # (T-1.15), an outsider's junction and hard-link swaps before every seam call, real outsider saves during every
+      # kind of removal, and NTFS's own renames (a landed file keeps its ARCHIVE bit; a file a backup cleared is
+      # replaced); the symbolic-link cases are Unix's (Windows makes none without a privilege). In debug: the suite took
+      # 62 s with its build on windows-latest (diag-g085-4, run 44371955995, 2026-11-18), where a release build took 151 s
+      # (diag-g085-3, run 44367197015).
+      - name: Test landing on Windows (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-land
       - name: Test the AFD readiness over loopback UDP (native Windows)
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
@@ -666,6 +772,15 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test observe
+      # The daemon's liveness beat (§4.14 `daemon.alive`, A-228): a starved shard keeps the beat, a wedged or spinning one
+      # stops it, on Windows' own thread clock and scheduler readings. No lane ran it on Windows until 2026-11-18, when
+      # only g243's diagnostic runs caught a starved-shard bug there. One test at a time, as the other in-process daemon
+      # suites here run: 12 tests (6 child roles ignored) in 51-52 s, the binary built in 173 s from cold, every one of
+      # three runs passing (diag-integrator-liveness-1, run 44290078113, windows-latest, 2026-11-18).
+      - name: Test the liveness beat, one test at a time (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test liveness -- --test-threads=1
       # A-205: a deleted file's pages leave the working set and read back through the files recreated over them.
       - name: Test a deleted file's memory going back to the OS (native Windows)
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
@@ -677,6 +792,33 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         run: cargo test -p slates-server --test recovery_slicing -- --nocapture
+      # The daemon's own unit tests, which no Windows lane ran until the Windows landing writer (A-185): two of them asked
+      # for a landing, which the Windows arm refused `Unsupported { feature: "landing" }` (they have since moved to
+      # `presentations.rs`, the next step). One test at a time: each test daemon sizes itself from the whole machine, and
+      # Windows charges commit when memory is made, so at 4 threads the suite met the commit limit on jupiter and at 32 it
+      # aborted (GAPS, the client binary's oversubscription entry). 368 passed and 3 ignored in 9.68 s, 148 s with the
+      # build, on windows-latest (diag-g085-4, run 44371955995, 2026-11-18).
+      - name: Test the daemon's unit tests, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --lib -- --test-threads=1
+      # Landings through the daemon (§4.15, A-185), Unix-only until the Windows writer: presentations (the two landing
+      # tests the unit tests once held among them), a target's one lease, a named snapshot's landing, landing fairness,
+      # the write policies (A-285), a green's checkout, signed landings (A-321), a presentation's fairness, a principal's
+      # grants in pages and the replies' bounds, one test at a time as the other in-process daemon suites here.
+      # presentations.rs's 10 tests passed in 2.35 s and the other nine suites' 46 in 73 s with their build on
+      # windows-latest, `landing_fairness` the longest at 17.4 s (diag-g085-4, run 44371955995, 2026-11-18).
+      - name: Test landings through the daemon, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p slates-server --test presentations --test lease --test snapshot_landing --test landing_fairness --test write_policy --test checkout --test signed_work --test presentation_fairness --test grants_pages --test reply_bounds -- --test-threads=1
+      # The MCP surface over a live in-process daemon (§4.12), one serial test: the handshake, the merge loop, the volume
+      # lifecycle, typed errors, and `slates.land.materialize`, which answered `Unsupported` on Windows until A-185.
+      # One test, 2.13 s on windows-latest (diag-g085-4, run 44371955995).
+      - name: Test the MCP surface, landing included (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mcp --test mcp
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
@@ -716,6 +858,13 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
+      # A presented landing goes with the client that presented it (AUD-29-07): the test binary re-invoked as the
+      # presenter and killed (`TerminateProcess`). Unix-only until the Windows landing writer (A-185); 2.60 s on
+      # windows-latest (diag-g085-4, run 44371955995).
+      - name: Test a killed client's presented landing going with it (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test presentation
       # The Shards form (§4.6, A-161, A-179) by the handle route: an in-process daemon duplicates the client end of the
       # attachment's named pipe into the test, which speaks FUSE through it in Shards' framing; hostile frames, a
       # destroy and a revocation each end the attachment; a second process is refused the pipe `ERROR_PIPE_BUSY`.
@@ -749,6 +898,18 @@ jobs:
           SLATES_TEST_CLI: "1"
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+      # The binary the step above built starts in Nano Server, on every push (A-357): Windows refuses to start a binary
+      # that imports a function its DLLs lack, and A-223's three imports Nano Server lacks showed first on the release's
+      # test tag. This debug build's C runtime is a DLL, so the action puts the Visual C++ runtime's DLLs beside it, and
+      # every other import must resolve from Nano Server's own. release.yml holds the release binary to the same start.
+      # Shape: the step's bound is release.yml's for the same action (its runs took 22-45 s; ten minutes).
+      - name: The binary starts in Nano Server (every function it imports from Windows is there)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 10
+        uses: ./.github/actions/nano-server-start
+        with:
+          binary: target/debug/slates.exe
+          c-runtime-beside: "true"
       # `slates shards` on Windows (§4.6, A-181; G-shards-windows step 2): a real anchor and daemon, and the command
       # starting this test binary as a probe that holds the stream end as the handle `{handle}` named, mounts the
       # attachment over it and reads a file; the command exiting with its program; the attachment standing while the
@@ -799,6 +960,53 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 30
         run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      # A-300 (Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route): the roster's version-control
+      # workloads over the drive, each script run by Git for Windows' `sh` in an NTFS folder and on the drive and compared
+      # byte for byte under the roster's exclusions and the drive's one stated difference (it makes no hard link, so a
+      # local clone copies there where NTFS links). Mercurial and Subversion are installed pinned (the `env` above), and
+      # Git for Windows' `bin`, which holds `sh`, joins the PATH.
+      - name: Python for Mercurial (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Mercurial and Subversion for the workloads (native Windows)
+        id: vcs-tools
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 45
+        run: |
+          python -m pip install --disable-pip-version-check --no-input "mercurial==$env:MERCURIAL_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "pip could not install Mercurial $env:MERCURIAL_VERSION" }
+          python -c "import sysconfig; print(sysconfig.get_path('scripts'))" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $zip = Join-Path $env:RUNNER_TEMP 'subversion.zip'
+          try {
+            Invoke-WebRequest -Uri $env:SUBVERSION_X64_URL -OutFile $zip -MaximumRetryCount $env:DOWNLOAD_RETRIES -RetryIntervalSec $env:DOWNLOAD_RETRY_SECONDS -TimeoutSec $env:DOWNLOAD_TRY_SECONDS
+          } catch {
+            throw "Subversion could not be downloaded from $env:SUBVERSION_X64_URL after $env:DOWNLOAD_RETRIES retries ($($_.Exception.Message))."
+          }
+          $found = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($found -ne $env:SUBVERSION_X64_SHA256) { throw "Subversion's zip hashes $found, not $env:SUBVERSION_X64_SHA256" }
+          $svn = Join-Path $env:RUNNER_TEMP 'subversion'
+          Expand-Archive -Path $zip -DestinationPath $svn -Force
+          foreach ($tool in 'svn', 'svnadmin', 'svnlook') {
+            $exe = Join-Path $svn "bin\$tool.exe"
+            if (-not (Test-Path $exe)) { throw "Subversion's zip holds no bin\$tool.exe" }
+            & $exe --version --quiet
+            if ($LASTEXITCODE -ne 0) { throw "$tool --version answered $LASTEXITCODE" }
+          }
+          (Join-Path $svn 'bin') | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # The workloads' shared environment under Git for Windows' `sh`: pip's `hg`, a `#!` script naming `python.exe`,
+      # starts, and Subversion's `^/trunk` reaches a Windows program as written (A-327's `MSYS_NO_PATHCONV` broke the
+      # first, CI run 44271637767; no setting at all the second, 44260193629).
+      - name: The workloads' environment under Git for Windows' sh (native Windows)
+        if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-conformance --lib under_the_environment_git_for_windows_sh -- --nocapture
+      - name: git, Mercurial and Subversion over the WinFsp drive (native Windows)
+        if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite workloads --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the Windows conformance records (native Windows)
         if: always()
         uses: actions/upload-artifact@v4
@@ -994,6 +1202,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
+      # A presented landing goes with the client that presented it (AUD-29-07), as on x86_64 (A-185); 2.47 s (diag-g085-4,
+      # run 44371955995).
+      - name: Test a killed client's presented landing going with it (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test presentation
       - name: Test the Shards form over the handle route (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
@@ -1003,6 +1217,38 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
+      # The liveness beat (A-228), as on x86_64: 12 tests in 57-58 s one at a time, three runs of three passing
+      # (diag-integrator-liveness-1, run 44290078113, windows-11-arm, 2026-11-18).
+      - name: Test the liveness beat, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test liveness -- --test-threads=1
+      # Landing on arm64 Windows (§4.15, A-185), as on x86_64: the writer over NTFS handles, the oracle, the real kill
+      # mid-landing (T-1.15), the escape and removal oracles, NTFS's own renames: 87 s with its build (diag-g085-4, run
+      # 44371955995, 2026-11-18).
+      - name: Test landing on Windows (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-land
+      # The daemon's own unit tests, one test at a time, as on x86_64 (no Windows lane ran them until the landing writer,
+      # A-185). 368 passed and 3 ignored in 16.64 s, 158 s with the build (diag-g085-4, run 44371955995, 2026-11-18).
+      - name: Test the daemon's unit tests, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --lib -- --test-threads=1
+      # Landings through the daemon, one test at a time, as on x86_64 (A-185): presentations.rs's 10 tests passed
+      # in 2.69 s and the other nine suites' 46 in 113 s with their build, `landing_fairness` the longest at 23.0 s
+      # (diag-g085-4, run 44371955995).
+      - name: Test landings through the daemon, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p slates-server --test presentations --test lease --test snapshot_landing --test landing_fairness --test write_policy --test checkout --test signed_work --test presentation_fairness --test grants_pages --test reply_bounds -- --test-threads=1
+      # The MCP surface over a live in-process daemon, landing included, as on x86_64 (A-185); 2.08 s (diag-g085-4, run
+      # 44371955995).
+      - name: Test the MCP surface, landing included (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mcp --test mcp
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
@@ -1077,6 +1323,10 @@ jobs:
           if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
           $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          # A-369: every slates WinFsp drive is a Mount Manager drive WinFsp's driver makes for an unprivileged daemon,
+          # so Windows resolves its files' final paths; the machine allows that once, as an Administrator does when
+          # installing WinFsp (WinFsp's MountUseMountmgrFromFSD, read by its driver from this key).
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       # A-198: retain a real taken request through a kill, then require its counted settlement and a fresh read.
       # The same native suite covers captured batches, torn records, private-intent progress and kernel names.
@@ -1115,6 +1365,49 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 30
         run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      # A-300: the roster's version-control workloads over the drive, as on the x86_64 lane, with Subversion's ARM64 build.
+      - name: Python for Mercurial (native arm64 Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Mercurial and Subversion for the workloads (native arm64 Windows)
+        id: vcs-tools
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 45
+        run: |
+          python -m pip install --disable-pip-version-check --no-input "mercurial==$env:MERCURIAL_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "pip could not install Mercurial $env:MERCURIAL_VERSION" }
+          python -c "import sysconfig; print(sysconfig.get_path('scripts'))" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $zip = Join-Path $env:RUNNER_TEMP 'subversion.zip'
+          try {
+            Invoke-WebRequest -Uri $env:SUBVERSION_ARM64_URL -OutFile $zip -MaximumRetryCount $env:DOWNLOAD_RETRIES -RetryIntervalSec $env:DOWNLOAD_RETRY_SECONDS -TimeoutSec $env:DOWNLOAD_TRY_SECONDS
+          } catch {
+            throw "Subversion could not be downloaded from $env:SUBVERSION_ARM64_URL after $env:DOWNLOAD_RETRIES retries ($($_.Exception.Message))."
+          }
+          $found = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($found -ne $env:SUBVERSION_ARM64_SHA256) { throw "Subversion's zip hashes $found, not $env:SUBVERSION_ARM64_SHA256" }
+          $svn = Join-Path $env:RUNNER_TEMP 'subversion'
+          Expand-Archive -Path $zip -DestinationPath $svn -Force
+          foreach ($tool in 'svn', 'svnadmin', 'svnlook') {
+            $exe = Join-Path $svn "bin\$tool.exe"
+            if (-not (Test-Path $exe)) { throw "Subversion's zip holds no bin\$tool.exe" }
+            & $exe --version --quiet
+            if ($LASTEXITCODE -ne 0) { throw "$tool --version answered $LASTEXITCODE" }
+          }
+          (Join-Path $svn 'bin') | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # The workloads' shared environment under Git for Windows' `sh`: pip's `hg`, a `#!` script naming `python.exe`,
+      # starts, and Subversion's `^/trunk` reaches a Windows program as written (A-327's `MSYS_NO_PATHCONV` broke the
+      # first, CI run 44271637767; no setting at all the second, 44260193629).
+      - name: The workloads' environment under Git for Windows' sh (native arm64 Windows)
+        if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-conformance --lib under_the_environment_git_for_windows_sh -- --nocapture
+      - name: git, Mercurial and Subversion over the WinFsp drive (native arm64 Windows)
+        if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite workloads --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the Windows conformance records (native arm64 Windows)
         if: always()
         uses: actions/upload-artifact@v4
@@ -1294,6 +1587,10 @@ jobs:
           if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
           $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          # A-369: every slates WinFsp drive is a Mount Manager drive WinFsp's driver makes for an unprivileged daemon,
+          # so Windows resolves its files' final paths; the machine allows that once, as an Administrator does when
+          # installing WinFsp (WinFsp's MountUseMountmgrFromFSD, read by its driver from this key).
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Clippy the Windows-buildable crates
         run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-bridge-virtiofs -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp -p slates-cluster -p slates-land --all-targets -- -D warnings
@@ -1419,9 +1716,10 @@ jobs:
   # by SHA-256 and built with the system cc inside the runner's temp — not vendored (fsx is APSL 2.0 and
   # fsstress GPL-2.0; licences do not enter this MIT tree by a lane's hand) and not installed. They are the
   # only non-Rust tooling of this lane, and the design itself names them (Part 6). macOS runs the daemon's
-  # NFS loopback mount as shipped (`slates mount`, no privilege); Linux reaches the same export through a root
-  # `mount -t nfs` by the OS client, recorded LIMITED because no daemon transport serves the FUSE bridge yet;
-  # the tracer is strace on Linux and `sudo fs_usage` on macOS. The daemon never runs as root (R10).
+  # NFS loopback mount as shipped (`slates mount`, no privilege); Linux runs the workload roster over the daemon's
+  # own FUSE mount (`slates mount`, no privilege; A-293) and reaches the same export through a root `mount -t nfs`
+  # by the OS client for the other suites, recorded LIMITED, since those over the FUSE mount run in the container
+  # lane; the tracer is strace on Linux and `sudo fs_usage` on macOS. The daemon never runs as root (R10).
   # Records go to the runner's temp and are uploaded as artifacts; the tracked matrix is regenerated from
   # them deliberately (`cargo xtask conformance matrix --write`), never by CI, so a run's date cannot drift
   # the doc-truth test. A suite that does not meet its verdict fails the step after writing its record.
@@ -1440,10 +1738,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # strace for the tracer; the NFS client for the root-mount adapter; fuse3 (fusermount3) for the FUSE
       # and container (`oci-linux`) transports; the workload tools the design names that the image lacks
-      # (inotify-tools for the watcher, ripgrep, sqlite3, vim). Docker Engine ships with the image.
+      # (inotify-tools for the watcher, ripgrep, sqlite3, vim), and Mercurial and Subversion for the
+      # version-control workloads (Ada's goal of 2026-11-18: git, Mercurial and Subversion covered by workload
+      # tests in CI; the image has Mercurial and no Subversion). Docker Engine ships with the image.
       - name: Suite tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim
+        run: sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim mercurial subversion
       # The container transport binds a FUSE mount shared with Docker's processes (`slates mount --shared`,
       # allow_other), which the host's operator grants (Ada authorized it on the CI runner, 2026-10-01;
       # AUD-29-67/74/78). Its hermeticity leg's tracer runs as root (`sudo strace -u runner`), because an
@@ -1452,10 +1752,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
-      # ripgrep for the rg workload and fswatch for the watcher; the rest ships with the image.
+      # ripgrep for the rg workload, fswatch for the watcher, and Mercurial and Subversion for the version-control
+      # workloads (the image has neither); the rest ships with the image.
       - name: Suite tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install ripgrep fswatch
+        run: brew install ripgrep fswatch mercurial subversion
       - name: Linux mount authority and traced startup regressions
         if: runner.os == 'Linux'
         run: |
@@ -1484,20 +1785,61 @@ jobs:
         env:
           SLATES_TEST_FSX: "1"
         run: cargo test -p xtask --bin xtask a_forced_fsx_failure_keeps_its_failure_line_and_its_logs_beside_the_record -- --nocapture
+      # The plain run is the live-shipped pair's plain arm below, so it is a run directory as `compare` reads one:
+      # `<dir>/records` and `<dir>/scratch`.
       - name: Plan, then run every suite this runner can (each verdict gates the step; records kept)
-        run: cargo xtask conformance all --records target/conformance-records --scratch target/conformance-scratch --keep
+        run: cargo xtask conformance all --records target/conformance/plain/records --scratch target/conformance/plain/scratch --keep
+      # A-200's conformance (the supervisor's task of 2026-11-05: a live-shipped volume conforms exactly as a plain one
+      # does): fsx, fsstress and pjdfstest again, each over a volume live-shipped on an f = 1 fleet (three anchors from one
+      # manifest over loopback, the volume created and mounted on node a, `slates live-ship ID`), over every transport
+      # the plain run used. A live run fails its verdict unless the owner's log ends durable at its head with both
+      # candidates holding it, so a fleet that stopped shipping cannot pass. `plan` gives the live arm the skip records
+      # the plain `all` wrote, so both arms name the same cells. Each suite is its own step, so a hung one is bounded alone
+      # and the next still runs.
+      # Each live step's bound is about three times the slowest that step measured on the lane's runners and a Mac
+      # Studio (diagnostics runs 44362281881 and 44371380372, kiln r56; 2026-11-18): fsx 3 min 46 s, fsstress 1 min 44 s,
+      # pjdfstest 10 min 0 s, all on ubuntu-24.04-arm; the stopped-candidates test 2 min 36 s on the Studio, its
+      # candidates held for 120 s. A hang (a live fsstress ran three hours on 2026-11-06) is bounded alone.
+      - name: Plan the live-shipped arm
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance plan --records target/conformance/live/records
+      - name: Live-shipped fsx (its verdict gates the step; records kept)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: cargo xtask conformance run --suite fsx --live-ship --records target/conformance/live/records --scratch target/conformance/live/scratch --keep
+      - name: Live-shipped fsstress (its verdict gates the step; records kept)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: cargo xtask conformance run --suite fsstress --live-ship --records target/conformance/live/records --scratch target/conformance/live/scratch --keep
+      - name: Live-shipped pjdfstest (its verdict gates the step; records kept)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite pjdfstest --live-ship --records target/conformance/live/records --scratch target/conformance/live/scratch --keep
+      # Every kept pjdfstest case by its verdict's kind and every record's outcome, plain against live, over the three
+      # suites the live arm ran: any difference fails (`docs/wip/conformance.md`, the live-shipped pair).
+      - name: Compare the live-shipped runs with the plain ones (any difference fails)
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance compare --plain target/conformance/plain --live target/conformance/live --suites fsx,fsstress,pjdfstest
+      # A-200's backpressure: with both candidates of a live-shipped volume stopped (SIGSTOP), a size change through the
+      # mount waits for them and then succeeds, where a soft mount once failed it `ETIMEDOUT` (A-229).
+      - name: A writer waits for stopped candidates (A-200, A-229)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        env:
+          SLATES_TEST_LIVE_CONFORMANCE: "1"
+        run: SLATES_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/slates" cargo test -p xtask --bin xtask a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail -- --nocapture
       - name: Upload the records
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: conformance-records-${{ matrix.os }}
-          path: target/conformance-records
+          path: target/conformance/plain/records
       - name: Upload pjdfstest's per-file output (the expected-failure review input)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pjdfstest-output-${{ matrix.os }}
-          path: target/conformance-scratch/*/pjdfstest-output
+          path: target/conformance/plain/scratch/*/pjdfstest-output
           if-no-files-found: ignore
       # The anchor logs: a daemon that stopped answering mid-suite (the macOS runner's fsstress run of
       # 2026-09-16) explains itself only there; the record carries their tail, the artifact the whole.
@@ -1506,7 +1848,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: conformance-anchor-logs-${{ matrix.os }}
-          path: target/conformance-scratch/*/*.log
+          path: target/conformance/plain/scratch/*/*.log
+          if-no-files-found: ignore
+      # The live-shipped arm whole: its records (each carries the owner's and the candidates' live logs and the
+      # fleet.live counters), pjdfstest's per-file output, fsstress's output and the three nodes' anchor logs.
+      - name: Upload the live-shipped arm
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-live-${{ matrix.os }}
+          path: |
+            target/conformance/live/records
+            target/conformance/live/scratch/*/pjdfstest-output
+            target/conformance/live/scratch/*/*.log
+            target/conformance/live/scratch/*/*.txt
           if-no-files-found: ignore
 
   # Part 6 "Concurrency", nightly: shuttle's randomized schedules over the pure cores — T-1.6 (two
@@ -1527,6 +1882,59 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
         run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
+
+  # live_chaos every night (Ada, 2026-11-18: long CI lanes are allowed; CLAUDE.md §2 item 13 removed): every flow of
+  # crates/cli/tests/live_chaos.rs across real processes, injected latency, loss, partitions, kills and the nemesis,
+  # with every register invariant judged (TotalOrder, Continuity, StaleNeverCommits, ReadSafety, NoLoss). Each flow runs
+  # on its own, capped, with its log kept, so one hung flow (a takeover reported, then nothing, seen twice on
+  # 2026-11-18) cannot hide the others. The cap is four times the slowest passing flow recorded (425 s under load,
+  # 2026-11-18). Nightly only: a full run takes hours on a hosted runner.
+  live-chaos-nightly:
+    name: live_chaos (every flow, capped; nightly)
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the chaos binary (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: live_chaos, each flow on its own, capped, logs kept
+        env:
+          SLATES_TEST_CLI: "1"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+          echo "nofile $(ulimit -n); cores $(nproc); $(free -g | sed -n 2p); load $(cat /proc/loadavg)"
+          mkdir -p target/chaos
+          bin=$(cargo test --locked --release -p slates-cli --test live_chaos --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "live_chaos") | .executable' | tail -1)
+          slowest_pass_s=425
+          cap_s=$((slowest_pass_s * 4))
+          failed=0
+          for flow in $("$bin" --list --format terse 2>/dev/null | sed -n 's/: test$//p'); do
+            echo "=== ${flow}"
+            if ! timeout "${cap_s}" "$bin" --exact "${flow}" --test-threads=1 --nocapture > "target/chaos/${flow}.log" 2>&1; then
+              echo "FAILED (or past ${cap_s} s): ${flow}"
+              tail -60 "target/chaos/${flow}.log"
+              failed=$((failed + 1))
+            fi
+          done
+          echo "flows failed: ${failed}"
+          [ "${failed}" -eq 0 ]
+      - name: Upload the chaos logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-chaos-nightly-${{ matrix.os }}
+          path: target/chaos/
 
   # Part 6 "Concurrency", nightly: ThreadSanitizer over the crates whose tests run real threads against
   # shared state (mem, rt, ipc, client), with the standard library rebuilt instrumented. `cargo xtask tsan`
@@ -1620,6 +2028,19 @@ jobs:
       # leg runs on its own cluster, deleted at the end, and fails rather than skips on a kernel without TLS.
       - name: The kernel's TLS record layer and NFS client (for the export leg)
         run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
+      # kind's nodes are privileged containers whose processes all run as the host's root, so the six nodes share root's
+      # inotify instances. Ubuntu 26.04's runner image (ubuntu26 20261101.186.1) leaves fs.inotify.max_user_instances at the
+      # kernel's 128, where 24.04's image (ubuntu24 20261101.360.1) set 1280. At 128, kube-proxy exited 1 and crash-looped on
+      # 4 of 5 workers, so a pod there could not reach the cluster's DNS and the fleet never formed (`peers_probed=0`,
+      # diag-release-13 and -14). Derived: kind's documented limits for this failure (kind's Known Issues, "Pod errors due
+      # to too many open files"), raised only, never lowered; with them 6 of 6 kube-proxies ran with 0 restarts on 26.04
+      # (diag-release-14).
+      - name: Room for the nodes' inotify instances (kind's known issue; 26.04's image keeps the kernel's 128)
+        run: |
+          set -euo pipefail
+          at_least() { now=$(sysctl -n "$1"); if [ "$now" -lt "$2" ]; then sudo sysctl -w "$1=$2"; else echo "$1 = $now"; fi; }
+          at_least fs.inotify.max_user_instances 512
+          at_least fs.inotify.max_user_watches 524288
       - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
         run: cargo xtask kind export --require-kernel-tls
       # The DAX matrix's Kubernetes socket-route cell (docs/wip/virtiofs.md §8; `xtask/src/kind_direct.rs`): a process in

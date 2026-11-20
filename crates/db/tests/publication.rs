@@ -60,7 +60,6 @@ fn segment(name: &str) -> AnchorSegment {
       profile_bytes: PAGE,
       log_bytes: LOG_BYTES,
       snapshot_bytes: SNAPSHOT_BYTES,
-      audit_bytes: PAGE,
       landing_slots: 1,
       landing_slot_bytes: PAGE,
     },
@@ -77,6 +76,7 @@ fn caps() -> PartitionCaps {
     timers: 1 << 12,
     tick_ns: 1_000,
     green_chain_bytes: 1 << 20,
+    audit_records: 1 << 12,
   }
 }
 
@@ -107,6 +107,9 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
       role: Role::Plain,
       live_shipped: false,
       live_holders: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },
@@ -122,6 +125,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
     access: Vec::new(),
     created_ns: NOW_NS,
     catalog_version: 0,
+    taken_over: None,
   }
 }
 
@@ -145,6 +149,7 @@ fn recorded_create(db: &mut Db, segment: &mut AnchorSegment, n: u64, name: &str)
         client: CLIENT,
         sequence: sequence_of(n),
         result: name.as_bytes().to_vec(),
+        work: None,
       },
     },
     NOW_NS,

@@ -28,17 +28,16 @@ use slates_mem::{Handle, MemError, Slab};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 use slates_vfs::ids::{InodeNo, RefOwner};
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{Kind, SpecialNode};
 
-/// Format: the set-group-ID mode bit (`<sys/stat.h>` `S_ISGID`): on a directory, what is created in it takes
-/// the directory's group, and a directory created in it takes the bit too.
-const S_ISGID: u32 = 0o2000;
 use slates_vfs::journal::Op;
 use slates_vfs::volume::{Observed, Store, Volume};
 
+use crate::access::S_ISGID;
+use crate::posix_acl::{Acl, MODE_PERMISSION_BITS};
 use crate::{
   Bridge, CacheLifetime, CachedBytes, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr,
-  ObjectId, OpContext, RenameFlags, SetAttr, View,
+  ObjectId, OpContext, POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT, RenameFlags, SetAttr, View,
 };
 
 /// Shape: the read cap, one arena chunk (256 KiB), matched to the INIT negotiation; here it
@@ -59,6 +58,10 @@ pub const MAX_OPEN_HANDLES: usize = 1 << 16;
 /// Shape: the handle slab's segment size — about one page of slots, so the table grows a page at
 /// a time up to [`MAX_OPEN_HANDLES`] and an idle bridge holds one small segment.
 const HANDLE_SEGMENT: usize = 256;
+
+/// A transport's write log (A-410): handed the inode, the offset and the bytes a write took, it says whether it kept
+/// them.
+pub type WriteLogger<'v> = &'v mut dyn FnMut(u64, u64, &[u8]) -> bool;
 
 /// The `Bridge` over one volume.
 pub struct VolumeBridge<'v> {
@@ -89,6 +92,22 @@ pub struct VolumeBridge<'v> {
   /// Whether the transport serving through this bridge offers its guest per-inode DAX ([`crate::DaxOffer`]): withheld
   /// unless the Shards route's serve task says otherwise ([`VolumeBridge::offering_dax`]).
   dax: crate::DaxOffer,
+  /// How the transport shows its guest the volume's owners ([`crate::OwnerView`]): the identity unless the Shards route's
+  /// serve task says otherwise ([`VolumeBridge::viewing_owners`]; A-281).
+  owners: crate::OwnerView,
+  /// Which attribute namespaces the transport reaches ([`crate::AttributeNamespaces`]): a host's mount's unless a guest
+  /// kernel's route says otherwise ([`VolumeBridge::serving_a_guest`]; A-290).
+  namespaces: crate::AttributeNamespaces,
+  /// Whether the transport's kernel sends the extended `fuse_setxattr_in` (A-378), as the transport last said
+  /// ([`Bridge::set_setxattr_ext`]): a guest connection that kept `FUSE_SETXATTR_EXT`.
+  setxattr_ext: bool,
+  /// Where a transport whose writes outlive its daemon only through the shard's write log keeps each write this bridge
+  /// takes (A-410; [`VolumeBridge::logging_writes`]): handed the inode, the offset and the bytes written, it says
+  /// whether it kept them. None for a transport that keeps its writes otherwise, or not at all.
+  write_log: Option<WriteLogger<'v>>,
+  /// Whether a write this bridge took was not kept by its [`VolumeBridge::logging_writes`] log, so the reply must wait
+  /// for the publication that carries it ([`Bridge::awaits_publication`]; A-410).
+  write_unlogged: bool,
 }
 
 /// The files whose acknowledged writes a daemon's death lost, for a mount the anchor held across it (A-61;
@@ -247,7 +266,7 @@ fn host_for<'h>(
   overlay: bool,
 ) -> Result<Option<&'h mut dyn HostFs>, VfsError> {
   match host.as_mut() {
-    None if overlay => Err(VfsError::BaseUnavailable(0)),
+    None if overlay => Err(VfsError::BaseUnavailable(None)),
     served => Ok(served),
   }
 }
@@ -306,6 +325,11 @@ impl<'v> VolumeBridge<'v> {
       max_read: MAX_READ,
       lost: None,
       dax: crate::DaxOffer::Withheld,
+      owners: crate::OwnerView::IDENTITY,
+      namespaces: crate::AttributeNamespaces::Host,
+      setxattr_ext: false,
+      write_log: None,
+      write_unlogged: false,
     }
   }
 
@@ -327,6 +351,11 @@ impl<'v> VolumeBridge<'v> {
       max_read: MAX_READ,
       lost: None,
       dax: crate::DaxOffer::Withheld,
+      owners: crate::OwnerView::IDENTITY,
+      namespaces: crate::AttributeNamespaces::Host,
+      setxattr_ext: false,
+      write_log: None,
+      write_unlogged: false,
     }
   }
 
@@ -354,6 +383,11 @@ impl<'v> VolumeBridge<'v> {
       max_read: MAX_READ,
       lost: None,
       dax: crate::DaxOffer::Withheld,
+      owners: crate::OwnerView::IDENTITY,
+      namespaces: crate::AttributeNamespaces::Host,
+      setxattr_ext: false,
+      write_log: None,
+      write_unlogged: false,
     }
   }
 
@@ -364,10 +398,35 @@ impl<'v> VolumeBridge<'v> {
     self
   }
 
+  /// This bridge, every write it takes kept by `log` before its reply (A-410): `log` is handed the inode, the offset and
+  /// the bytes the volume took, and answers whether it kept them, as the shard's write log does for slates' own virtio-fs
+  /// device (A-63's rule, A-358's for a reply). One it did not keep makes the bridge owe a publication, which a transport
+  /// reads as [`Bridge::awaits_publication`] and runs before the reply.
+  #[must_use]
+  pub fn logging_writes(mut self, log: WriteLogger<'v>) -> VolumeBridge<'v> {
+    self.write_log = Some(log);
+    self
+  }
+
   /// This bridge, its transport offering its guest per-inode DAX as `dax` says (the Shards route, part 3).
   #[must_use]
   pub fn offering_dax(mut self, dax: crate::DaxOffer) -> VolumeBridge<'v> {
     self.dax = dax;
+    self
+  }
+
+  /// This bridge, its transport showing its guest the volume's owners as `owners` says (the Shards route, A-281).
+  #[must_use]
+  pub fn viewing_owners(mut self, owners: crate::OwnerView) -> VolumeBridge<'v> {
+    self.owners = owners;
+    self
+  }
+
+  /// This bridge, its transport a guest kernel's (a Shards stream, slates' own virtio-fs device): it reaches the guest's
+  /// own attribute namespaces as well as `user.` (A-290).
+  #[must_use]
+  pub fn serving_a_guest(mut self) -> VolumeBridge<'v> {
+    self.namespaces = crate::AttributeNamespaces::Guest;
     self
   }
 
@@ -574,10 +633,12 @@ impl<'v> VolumeBridge<'v> {
 
   /// Stamps a freshly created inode `new` with the owner a mount must show: its uid is the mounting
   /// user — the request's Unix uid, or its enrolled account without a Unix credential — and its
-  /// gid is the request's own group when its credential
-  /// named one (an NFS `AUTH_SYS` gid, carried on [`OpContext::owner_gid`]), matching what a native
-  /// NFS server stamps; otherwise it inherits the parent directory `parent`'s group, the BSD/macOS
-  /// create rule (a new object takes the creating user and the parent's group). Without this the
+  /// group is what the request's rule gives it ([`OpContext::group_rule`], A-328): under System V's
+  /// rule (a Linux kernel's request, and a Linux host's NFS export) the request's own group when its
+  /// credential names one (an NFS `AUTH_SYS` gid or a FUSE header's, on [`OpContext::owner_gid`]),
+  /// unless the parent directory `parent` is set-group-ID, whose group it takes and whose bit a new
+  /// directory takes too (AUD-29-81); under BSD's (a macOS host's NFS export, as APFS gives it) the
+  /// parent's group always and no inherited bit. Without this the
   /// object keeps the volume core's born default (uid 0, gid 0), so a file an ordinary user made
   /// listed as `root wheel` regardless of who made it (§4.13 "each request runs as the mounting user";
   /// the root:wheel mount bug fixed in docs/bugs/2026-09-09-root-wheel-mount.md). A subject that is
@@ -590,32 +651,214 @@ impl<'v> VolumeBridge<'v> {
     parent: InodeNo,
     cx: &OpContext,
   ) -> Result<(), VfsError> {
-    let uid = match (cx.owner_uid, &cx.subject) {
-      (Some(uid), _) => uid,
-      (None, Principal::Uid { uid, .. }) => *uid,
-      // An enrolled consumer is a workload *within* its host account (§4.13): what it creates is the
-      // account's, as the host filesystem will report it.
-      (None, Principal::Consumer { account, .. }) => *account,
-      (None, Principal::Sid { .. } | Principal::Certificate { .. }) => return Ok(()),
+    let Some(uid) = creating_uid(cx) else {
+      return Ok(());
     };
     let parent_attrs = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self.volume.with_host(host).stat(self.store, parent),
       None => self.volume.stat(self.store, parent),
     }?;
-    // The POSIX creation rule (AUD-29-81): a set-group-ID parent gives its group to what is made in it, and
-    // a directory made there takes the bit too; otherwise the creator's group, where the request names one,
-    // else the parent's (the BSD rule, for a credential without a group).
-    let setgid_parent = parent_attrs.mode & S_ISGID != 0;
-    let gid = match (setgid_parent, cx.owner_gid) {
-      (false, Some(gid)) => gid,
-      _ => parent_attrs.gid,
-    };
-    self.volume.chown(self.store, new, uid, gid)?;
-    if setgid_parent && self.volume.kind(self.store, new)? == Kind::Dir {
+    // The route's rule (A-328): System V's, the creator's group unless a set-group-ID parent gives its own and its bit
+    // to a directory (AUD-29-81); or BSD's, the parent's group and no bit.
+    let directory = self.volume.kind(self.store, new)? == Kind::Dir;
+    let created =
+      cx.group_rule
+        .created(parent_attrs.mode, parent_attrs.gid, cx.owner_gid, directory);
+    self.volume.chown(self.store, new, uid, created.gid)?;
+    if created.set_group_id {
       let made = self.volume.stat(self.store, new)?;
       self.volume.chmod(self.store, new, made.mode | S_ISGID)?;
     }
     Ok(())
+  }
+
+  /// What a node asked for with `mode` by a creator whose umask is `umask` takes from directory `parent`, `directory`
+  /// saying whether the node is one (A-314; Linux's `posix_acl_create`, `fs/posix_acl.c`). Under a default ACL the umask is not applied: the
+  /// mode keeps only what the default's owner, mask and other entries grant, and the node is given the default's
+  /// entries as its access ACL when they say more than its mode, a directory the default as well. Without one, the
+  /// mode less the umask, and no ACL. A default ACL the volume keeps that no parse takes is refused `Integrity`: only a
+  /// guest's route sets one, and it sets only what parses.
+  fn creation(
+    &mut self,
+    parent: InodeNo,
+    mode: u32,
+    umask: Option<u32>,
+    directory: bool,
+  ) -> Result<Creation, VfsError> {
+    let masked = Creation {
+      mode: mode & !umask.unwrap_or(0),
+      access: None,
+      default: None,
+    };
+    // The parent as a namespace object first, so a number that names none (an attribute's value among them) is refused
+    // as the create itself refuses it, never as the attribute verbs would; and only a directory holds a default ACL,
+    // the create refusing anything else itself.
+    if self.volume.kind(self.store, parent)? != Kind::Dir {
+      return Ok(masked);
+    }
+    let value = match self.attribute(parent, POSIX_ACL_DEFAULT) {
+      Ok(value) => value,
+      Err(VfsError::NoAttribute) => return Ok(masked),
+      Err(refusal) => return Err(refusal),
+    };
+    let default = Acl::parse(&value).map_err(|_| VfsError::Integrity)?;
+    if default.is_empty() {
+      return Ok(masked);
+    }
+    let (mode, access) = default.given(mode);
+    Ok(Creation {
+      mode,
+      access: access.map(|access| access.to_bytes()),
+      default: directory.then_some(value),
+    })
+  }
+
+  /// Gives node `no`, just made, the ACLs its [`Creation`] names (A-314). The caller takes the node back out of its
+  /// directory if this is refused, so a create either makes the node with what its directory gives it or makes
+  /// nothing, as Linux's does.
+  fn give_acls(&mut self, no: InodeNo, creation: &Creation) -> Result<(), VfsError> {
+    for (name, value) in [
+      (POSIX_ACL_ACCESS, &creation.access),
+      (POSIX_ACL_DEFAULT, &creation.default),
+    ] {
+      if let Some(value) = value {
+        self.volume.xattr_set(
+          self.store,
+          no,
+          name,
+          value,
+          slates_vfs::xattr::XattrSet::Either,
+        )?;
+      }
+    }
+    Ok(())
+  }
+
+  /// The value of attribute `name` on inode `no`, whole (`NoAttribute` when it has none).
+  fn attribute(&mut self, no: InodeNo, name: &[u8]) -> Result<Vec<u8>, VfsError> {
+    let len = self.volume.xattr_len(self.store, no, name)?;
+    let mut value = vec![0u8; usize::try_from(len).map_err(|_| VfsError::FileTooLarge)?];
+    let read = self
+      .volume
+      .xattr_read(self.store, no, name, 0, &mut value)?;
+    value.truncate(read);
+    Ok(value)
+  }
+
+  /// `value`, `owner`'s access ACL as the volume keeps it, as a reader is shown it (A-314): its owner, mask and other
+  /// entries (the owning group's where it has no mask) taken from the mode now, so a chmod through any route, which
+  /// changes only the mode, is the ACL's change too (what Linux's `posix_acl_chmod` writes into a stored ACL). A kept
+  /// value no parse takes is refused `Integrity`, as a kept default ACL is.
+  fn access_acl_shown(&mut self, owner: InodeNo, value: Vec<u8>) -> Result<Vec<u8>, VfsError> {
+    let mut acl = Acl::parse(&value).map_err(|_| VfsError::Integrity)?;
+    if acl.is_empty() {
+      return Ok(value);
+    }
+    acl.showing(self.attr_of(owner.0)?.mode);
+    Ok(acl.to_bytes())
+  }
+
+  /// Sets `owner`'s ACL `name` to `value` as Linux keeps one (A-314; `set_posix_acl`), whatever `XATTR_CREATE` or
+  /// `XATTR_REPLACE` asked, as Linux's own attribute path ignores them for an ACL: an access ACL with the mode
+  /// ([`VolumeBridge::set_access_acl`]), a default ACL as it is. A value no ACL parse takes is refused `Invalid`: a
+  /// guest's route checks one before it gets here.
+  fn set_acl(&mut self, owner: InodeNo, name: &[u8], value: &[u8]) -> Result<(), VfsError> {
+    let acl = Acl::parse(value).map_err(|_| VfsError::Invalid)?;
+    if name == POSIX_ACL_ACCESS {
+      self.set_access_acl(owner, &acl, value)
+    } else {
+      self.keep_acl(owner, name, &acl, value)
+    }
+  }
+
+  /// Keeps `acl` (whose bytes are `value`) as `owner`'s ACL `name`, or none for the empty ACL, which a kernel reads as
+  /// none (`posix_acl_from_xattr` of no entries).
+  fn keep_acl(
+    &mut self,
+    owner: InodeNo,
+    name: &[u8],
+    acl: &Acl,
+    value: &[u8],
+  ) -> Result<(), VfsError> {
+    if acl.is_empty() {
+      return self.remove_attribute_if_set(owner, name);
+    }
+    self.volume.xattr_set(
+      self.store,
+      owner,
+      name,
+      value,
+      slates_vfs::xattr::XattrSet::Either,
+    )
+  }
+
+  /// Sets `owner`'s access ACL to `acl` (whose bytes are `value`) as `posix_acl_update_mode` does (A-314): the mode's
+  /// three classes from its owner, mask (or owning group) and other entries, and the ACL kept only when it says more
+  /// than a mode can, removed otherwise. The mode changes first, through the overlay rules, which may need room; if
+  /// the attribute then cannot be kept, the mode is put back, which needs none, the inode being current by then.
+  fn set_access_acl(&mut self, owner: InodeNo, acl: &Acl, value: &[u8]) -> Result<(), VfsError> {
+    let before = self.attr_of(owner.0)?.mode;
+    let mode = if acl.is_empty() {
+      before
+    } else {
+      (before & !MODE_PERMISSION_BITS) | acl.permission_bits()
+    };
+    if mode != before {
+      self.chmod_through_overlay(owner, mode)?;
+    }
+    let kept = if acl.exceeds_a_mode() {
+      self.keep_acl(owner, POSIX_ACL_ACCESS, acl, value)
+    } else {
+      self.remove_attribute_if_set(owner, POSIX_ACL_ACCESS)
+    };
+    match kept {
+      Err(refusal) if mode != before => self.chmod_through_overlay(owner, before).and(Err(refusal)),
+      kept => kept,
+    }
+  }
+
+  /// Removes attribute `name` from `owner`, and is done if it had none: an ACL set to say no more than a mode, or to
+  /// nothing, is kept as none (`posix_acl_update_mode`; `posix_acl_from_xattr` of no entries).
+  fn remove_attribute_if_set(&mut self, owner: InodeNo, name: &[u8]) -> Result<(), VfsError> {
+    match self.volume.xattr_remove(self.store, owner, name) {
+      Ok(()) | Err(VfsError::NoAttribute) => Ok(()),
+      Err(refusal) => Err(refusal),
+    }
+  }
+
+  /// Sets inode `no`'s mode through the overlay rules, as a `setattr` does: an untouched base entry's witness is copied
+  /// up first, so the live-disk stat that follows it cannot undo the change.
+  fn chmod_through_overlay(&mut self, no: InodeNo, mode: u32) -> Result<(), VfsError> {
+    match host_for(&mut self.host, self.volume.is_overlay())? {
+      Some(host) => self.volume.with_host(host).chmod(self.store, no, mode),
+      None => self.volume.chmod(self.store, no, mode),
+    }
+  }
+}
+
+/// What a node made in a directory takes from it (A-314; Linux's `posix_acl_create`): the mode it is made with, and
+/// the ACLs it is given once made.
+struct Creation {
+  /// The mode it is made with: the asked mode cut by the directory's default ACL, or less the creator's umask where
+  /// the directory has none.
+  mode: u32,
+  /// The access ACL it is given: the default's entries cut to its mode, where they say more than the mode can.
+  access: Option<Vec<u8>>,
+  /// The default ACL it is given: a directory made under one takes it as its own.
+  default: Option<Vec<u8>>,
+}
+
+/// The uid request `cx` creates as: the transport's per-request caller (an NFS `AUTH_SYS` uid, a FUSE request
+/// header's), else the enrolled subject's own Unix account; `None` for a subject that is no Unix user (a Windows SID, a
+/// certificate — never on the POSIX mount path), whose platform's own ownership model governs.
+fn creating_uid(cx: &OpContext) -> Option<u32> {
+  match (cx.owner_uid, &cx.subject) {
+    (Some(uid), _) => Some(uid),
+    (None, Principal::Uid { uid, .. }) => Some(*uid),
+    // An enrolled consumer is a workload *within* its host account (§4.13): what it creates is the
+    // account's, as the host filesystem will report it.
+    (None, Principal::Consumer { account, .. }) => Some(*account),
+    (None, Principal::Sid { .. } | Principal::Certificate { .. }) => None,
   }
 }
 
@@ -638,6 +881,7 @@ fn node_attr(no: u64, observed: &Observed) -> NodeAttr {
     btime: attrs.btime,
     windows: observed.windows.bits(),
     change: observed.change,
+    device: observed.device,
   }
 }
 
@@ -667,7 +911,7 @@ impl Bridge for VolumeBridge<'_> {
   }
 
   fn awaits_publication(&self) -> bool {
-    self.volume.awaits_publication()
+    self.volume.awaits_publication() || self.write_unlogged
   }
 
   fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError> {
@@ -706,6 +950,25 @@ impl Bridge for VolumeBridge<'_> {
     // No implicit reference: a transport that owns lookup references (FUSE) takes one explicitly
     // through `reference`; NFS takes none (§3). Fixes the NFS lookup-reference leak.
     Ok(attr)
+  }
+
+  fn stored_entry(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+  ) -> Result<(String, NodeAttr), VfsError> {
+    // Looked up first, through the base plane on an overlay, so an untouched base entry is in the directory with the
+    // name its host gave it (`lookup` materializes a hit). `.` and `..` are no entries a directory stores: they are named
+    // as asked.
+    let attr = self.lookup(parent, cx, name)?;
+    if name == "." || name == ".." {
+      return Ok((name.to_owned(), attr));
+    }
+    let stored = self
+      .volume
+      .stored_name_no(self.store, InodeNo(parent.inode), name)?;
+    Ok((stored, attr))
   }
 
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError> {
@@ -793,12 +1056,10 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<Vec<u8>, VfsError> {
     self.authorize_read(cx)?;
     let owner = self.xattr_owner(object)?;
-    let len = self.volume.xattr_len(self.store, owner, name)?;
-    let mut value = vec![0u8; usize::try_from(len).map_err(|_| VfsError::FileTooLarge)?];
-    let read = self
-      .volume
-      .xattr_read(self.store, owner, name, 0, &mut value)?;
-    value.truncate(read);
+    let value = self.attribute(owner, name)?;
+    if name == POSIX_ACL_ACCESS {
+      return self.access_acl_shown(owner, value);
+    }
     Ok(value)
   }
 
@@ -812,6 +1073,9 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<(), VfsError> {
     self.authorize_write(cx)?;
     let owner = self.xattr_owner(object)?;
+    if crate::is_posix_acl(name) {
+      return self.set_acl(owner, name, value);
+    }
     self.volume.xattr_set(self.store, owner, name, value, how)
   }
 
@@ -878,6 +1142,13 @@ impl Bridge for VolumeBridge<'_> {
         .write(self.store, inode, offset, data),
       None => self.volume.write(self.store, inode, offset, data),
     }?;
+    // Kept before the reply where the transport keeps its writes in the shard's write log (A-410); a write the log did
+    // not keep owes a publication before its reply instead.
+    if let Some(log) = self.write_log.as_mut()
+      && !log(inode.0, offset, data.get(..written).unwrap_or(data))
+    {
+      self.write_unlogged = true;
+    }
     u32::try_from(written).map_err(|_| VfsError::FileTooLarge)
   }
 
@@ -1012,18 +1283,24 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<(NodeAttr, u64), VfsError> {
     self.authorize_write(cx)?;
     let parent_no = InodeNo(parent.inode);
+    let creation = self.creation(parent_no, mode, cx.umask, false)?;
     // Through the overlay rules for an overlay volume: a name the base holds is `EEXIST`, not a
     // second file shadowing the disk's (§4.6; AC-1.17).
     let no = match host_for(&mut self.host, self.volume.is_overlay())? {
-      Some(host) => self
-        .volume
-        .with_host(host)
-        .create_file_no(self.store, parent_no, name, mode),
+      Some(host) => {
+        self
+          .volume
+          .with_host(host)
+          .create_file_no(self.store, parent_no, name, creation.mode)
+      }
       None => self
         .volume
-        .create_file_no(self.store, parent_no, name, mode),
+        .create_file_no(self.store, parent_no, name, creation.mode),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
+    if let Err(refusal) = self.give_acls(no, &creation) {
+      return self.unlink(parent, cx, name).and(Err(refusal));
+    }
     let entry = node_attr(no.0, &self.volume.observe(self.store, no)?);
     // A create takes only an open reference (dropped by release); it does not implicitly take a
     // lookup reference — a transport that owns lookup references (FUSE) takes one through
@@ -1141,20 +1418,32 @@ impl Bridge for VolumeBridge<'_> {
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
+    // A device node other than a whiteout is made for a caller acting as root alone (A-294,
+    // `crate::access::needs_superuser`): a kernel asks `CAP_MKNOD` before a FUSE or virtio-fs request reaches here, and
+    // this holds every other transport to the same rule.
+    if crate::access::needs_superuser(node) && creating_uid(cx) != Some(crate::access::ROOT_UID) {
+      return Err(VfsError::NotPermitted);
+    }
     let parent_no = InodeNo(parent.inode);
+    let creation = self.creation(parent_no, mode, cx.umask, false)?;
     let no = match host_for(&mut self.host, self.volume.is_overlay())? {
-      Some(host) => self
-        .volume
-        .with_host(host)
-        .mknod_no(self.store, parent_no, name, mode, kind),
+      Some(host) => {
+        self
+          .volume
+          .with_host(host)
+          .mknod_no(self.store, parent_no, name, creation.mode, node)
+      }
       None => self
         .volume
-        .mknod_no(self.store, parent_no, name, mode, kind),
+        .mknod_no(self.store, parent_no, name, creation.mode, node),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
+    if let Err(refusal) = self.give_acls(no, &creation) {
+      return self.unlink(parent, cx, name).and(Err(refusal));
+    }
     Ok(node_attr(no.0, &self.volume.observe(self.store, no)?))
   }
 
@@ -1167,17 +1456,25 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
     let parent_no = InodeNo(parent.inode);
+    let creation = self.creation(parent_no, mode, cx.umask, true)?;
     // Through the overlay rules for an overlay volume: a name the base holds is `EEXIST`, and the
     // new directory is opaque (only overlay entries show), so it is in the diverged set the landing
     // plans from (§4.5 "Mutation"; AC-1.10).
     let no = match host_for(&mut self.host, self.volume.is_overlay())? {
-      Some(host) => self
+      Some(host) => {
+        self
+          .volume
+          .with_host(host)
+          .mkdir_no(self.store, parent_no, name, creation.mode)
+      }
+      None => self
         .volume
-        .with_host(host)
-        .mkdir_no(self.store, parent_no, name, mode),
-      None => self.volume.mkdir_no(self.store, parent_no, name, mode),
+        .mkdir_no(self.store, parent_no, name, creation.mode),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
+    if let Err(refusal) = self.give_acls(no, &creation) {
+      return self.rmdir(parent, cx, name).and(Err(refusal));
+    }
     let attr = node_attr(no.0, &self.volume.observe(self.store, no)?);
     // No implicit lookup reference (see `lookup`): FUSE takes one through `reference`, NFS none.
     Ok(attr)
@@ -1342,10 +1639,7 @@ impl Bridge for VolumeBridge<'_> {
       }?;
     }
     if let Some(mode) = changes.mode {
-      match host_for(&mut self.host, self.volume.is_overlay())? {
-        Some(host) => self.volume.with_host(host).chmod(self.store, inode, mode),
-        None => self.volume.chmod(self.store, inode, mode),
-      }?;
+      self.chmod_through_overlay(inode, mode)?;
     }
     // Ownership fills the unset half of the pair from the current attributes, so setting only the
     // uid leaves the gid unchanged; the current attributes are read host-aware.
@@ -1399,6 +1693,22 @@ impl Bridge for VolumeBridge<'_> {
     self.dax
   }
 
+  fn owner_view(&mut self) -> crate::OwnerView {
+    self.owners
+  }
+
+  fn attribute_namespaces(&mut self) -> crate::AttributeNamespaces {
+    self.namespaces
+  }
+
+  fn setxattr_ext(&mut self) -> bool {
+    self.setxattr_ext
+  }
+
+  fn set_setxattr_ext(&mut self, extended: bool) {
+    self.setxattr_ext = extended;
+  }
+
   fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {
     let volume = self.volume.prefix();
     let store = &mut *self.store;
@@ -1436,6 +1746,7 @@ impl Bridge for VolumeBridge<'_> {
     cx: &OpContext,
     cursor: InvalidationCursor,
     out: &mut Vec<Invalidation>,
+    more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
   ) -> Result<InvalidationCursor, VfsError> {
     self.authorize_read(cx)?;
     // 1. The journal: every record since the cursor is a change this transport did not make (it
@@ -1455,7 +1766,8 @@ impl Bridge for VolumeBridge<'_> {
     if matches!(cx.view, View::Current) {
       // What waited for this round is the journal budget's input (§4.5: mutation rate × lag × record size, measured as
       // the backlog itself). This is the journal's only consuming round in production, and its start is the earliest
-      // record this attachment's reader may read again, so an open reader's point moves to it.
+      // record this attachment's reader may read again, so an open reader's point moves to it. Each slice of a round
+      // sliced across turns is one, measured from its own start in a segment's records at most (A-562).
       self
         .volume
         .note_journal_round(cx.attachment.key(), cursor.journal_seq);
@@ -1463,12 +1775,30 @@ impl Bridge for VolumeBridge<'_> {
       if cursor.journal_seq.saturating_add(1) < log.oldest_seq() {
         out.push(Invalidation::Everything);
       } else {
-        let records: Vec<(Op, Box<str>, Option<InodeNo>)> = log
-          .since(cursor.journal_seq)
-          .map(|r| (r.op.clone(), r.path.clone(), r.inode))
-          .collect();
-        for (op, path, inode) in records {
+        // One record at a time, taken out of the log before it is resolved, so the gather stops where its slice ends
+        // (A-562): `more` is asked before each record after the first, and at its `Break` the transport is handed the
+        // cursor through the last record taken, the base plane's half left for a gather that reaches the head.
+        let mut through = cursor.journal_seq;
+        let mut first = true;
+        loop {
+          let next = self
+            .volume
+            .op_log()
+            .since(through)
+            .next()
+            .map(|r| (r.seq, r.op.clone(), r.path.clone(), r.inode));
+          let Some((seq, op, path, inode)) = next else {
+            break;
+          };
+          if !first && more().is_break() {
+            return Ok(InvalidationCursor {
+              journal_seq: through,
+              ..cursor
+            });
+          }
+          first = false;
           self.journal_invalidations(&op, &path, inode, out);
+          through = seq;
         }
       }
     }
@@ -1545,7 +1875,13 @@ impl Bridge for VolumeBridge<'_> {
     after: Option<u64>,
     visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
   ) -> bool {
-    self.volume.visit_takeover_inodes(cx.owner, after, visit)
+    // A mount of the head may hold, from a lookup no image recorded, what the dead daemon showed and this daemon never
+    // had: every inode of the head is named (A-573). A pinned view's version takes no head change: its references and
+    // the replay (A-158).
+    match cx.view {
+      View::Current => self.volume.visit_head_inodes(self.store, after, visit),
+      View::Version(_) => self.volume.visit_takeover_inodes(cx.owner, after, visit),
+    }
   }
 
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {

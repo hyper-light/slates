@@ -52,6 +52,8 @@
 #   with it, since a mapping is its bytes whoever made it (`region.rs` `lock_bytes_whole`/`lock_bytes_range`):
 #   the whole-map lock on fault and its macOS arm (2) and the range lock with `MADV_DONTDUMP` (2), less the two
 #   that took a memmap2 map and are now thin callers (−2): +2. 37 → 45.
+#   Sealed blocks (`sealed.rs`, A-273 step 3, +5 on 2026-11-18: 63 → 68) went with the A-273 replicas, measured and
+#   rejected (2026-11-19, A-528): 68 → 63.
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -113,10 +115,14 @@
 #   the gathering `WSASend`, `WSAIoctl(SIO_TCP_INFO)` for the peer's close, `shutdown`, and the
 #   `OwnedSocket::from_raw_socket` that hands a socket over (12). The Unix stream calls moved from `tcp.rs` into the
 #   seam unchanged in number. 84 → 96.
+#   A blocked wait one level up (`iocp.rs` `move_level`, 2026-11-18, A-361): one block that reads and sets the calling
+#   thread's own priority level (`GetThreadPriority`, `SetThreadPriority`), Win32 without a safe wrapper, so a shard
+#   blocked in its completion port is woken as Windows wakes an event's waiter (1). 101 → 102.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
-# slates-base (11): rustix marks kevent unsafe because the kernel fills the output list; one
-#   registration and one drain of the macOS/BSD directory watcher (2); the Windows fingerprint
+# slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
+#   zero-timeout call (`hint_set::kevent_now`, 1; 2 -> 1 on 2026-11-19, A-709) shared by the macOS/BSD directory
+#   watcher's registrations and drains and the shard's hint set; the Windows fingerprint
 #   through the stable Win32 file-information calls (2), since the standard library's handle
 #   metadata is unstable on 1.98 (its two zeroed records are now built as literals); and the
 #   Windows contained opens (AUD-29-62, 2026-10-01: 6) — `NtCreateFile` relative to a retained
@@ -179,7 +185,8 @@
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
 #   NFS-listener descriptor (`daemon.rs`, added 2026-09-09 for the anchor-held listener, §4.6):
-#   `OwnedFd::from_raw_fd` on the number the anchor handed over across the spawn (1, Unix only);
+#   `OwnedFd::from_raw_fd` on the number the anchor handed over across the spawn (1, Unix only; since
+#   2026-11-19 the one site `held_listener` adopts the version-control edge's held listener too, A-625 part 3);
 #   and the daemon adopting a fleet node's inherited serve sockets (`fleet.rs` `adopt_inherited`,
 #   added 2026-09-28 with the anchor-held fleet ports, §4.8): the same `OwnedFd::from_raw_fd` on each
 #   number in `SLATES_ANCHOR_FLEET_SERVE`, one site called per plane (1, Unix only).
@@ -187,6 +194,9 @@
 #   `RegGetValueW` of a DWORD into a local, unprivileged (1, Windows only). 7 → 8.
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
+
+# slates-hg (0): Mercurial's bundle2, bundle1, changegroup and delta codecs (A-514) are bounds-checked byte slices
+#   read through a cursor and written into vectors; safe Rust throughout.
 # slates-client (0): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
 #   same-kernel zero-copy read (§4.6, A-135): `MappedRead` mapped the daemon's arena block into this process
 #   (rustix `mmap`, `munmap`, and `slice::from_raw_parts` over the mapped bytes). Lowered 3 → 0 on 2026-10-25
@@ -198,7 +208,26 @@
 #   signature and its registration (2); the launcher's `unshare_unsafe` (`exec.rs`, Linux),
 #   marked unsafe because it changes every thread's namespace, sound in the single-threaded
 #   pre-exec launcher (1); and the macOS mount (`mount.rs`, added 2026-09-26, §4.6 A-34):
-#   `mount(2)` with the XDR NFS arguments, which rustix does not wrap on macOS (1).
+#   `mount(2)` with the XDR NFS arguments, which rustix does not wrap on macOS (1) — moved to
+#   slates-api on 2026-11-18 (A-278), lowering this crate 7 → 6; then the stop flag's three, moved
+#   to slates-api with the anchor and daemon roles (A-278 piece 2), lowering it 6 → 3; then the
+#   launcher's `unshare_unsafe`, moved to slates-api with the launcher (A-370), lowering it 3 → 2.
+# slates-api (4): the macOS mount moved from slates-cli (A-278, 2026-11-18): `mount(2)` with the XDR
+#   NFS arguments, which rustix does not wrap on macOS (1); and the roles' stop flag moved with the
+#   anchor and daemon roles (`role/signal.rs`, A-278 piece 2): `signal(2)` for SIGINT and SIGTERM on
+#   Unix (1), and on Windows the console control handler, an `unsafe extern` function by signature
+#   and its registration (2). The same blocks, not new sites. Raised 4 → 5 on 2026-11-18 (A-370) by
+#   the chosen-path launcher moved from slates-cli (`exec.rs`, Linux): its `unshare_unsafe`, marked
+#   unsafe because it changes every thread's namespace, sound in the single-threaded pre-exec
+#   launcher (1). The same block, not a new site; slates-cli lowered 3 → 2 in the same change.
+#   Raised 5 → 9 on 2026-11-18 (A-490, `role/fleet/windows_dns.rs`, compiled only for Windows): a fleet node's
+#   nameservers on Windows, which has no `/etc/resolv.conf`, are the DNS servers its network adapters list, and Win32
+#   has no safe wrapper for reading them: the `GetAdaptersAddresses` call (1), and the walk over what it writes, each
+#   read made only once the link or address is checked to lie wholly inside the call's buffer, aligned: an adapter
+#   entry (1), a DNS server entry (1), and a server's socket address with its address word read through the union (1).
+#   Raised 9 → 10 on 2026-11-19 (A-507, `mount.rs` `ask_unmount`, compiled for macOS and the BSDs): an unmount calls
+#   `unmount(2)` itself rather than running `umount` from the `PATH`, and neither rustix nor std wraps it there: the
+#   call on the mount point's C string (1).
 # slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
 #   mount (Unix, added later) will carry their own budgeted sites.
@@ -215,12 +244,43 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 70
+slates-machine = 97
+# 2026-11-19 (+11, A-570; 86 -> 97): the host's memory-pressure reports (`memory_pressure.rs`), the kernel's own event
+#   in place of the reap loop's once-a-window sample. macOS (+7): libdispatch's memory-pressure source, which no crate
+#   the workspace takes wraps: the `unsafe extern` block, the global queue, the source's creation, the block that sets
+#   its context and handlers and resumes it, the report handler's read of its context, the cancel handler's free of
+#   it, and the drop's cancel and release. Windows (+4): `CreateMemoryResourceNotification`, the handle taken into an
+#   `OwnedHandle`, `QueryMemoryResourceNotification` at the open, and `GetLastError` for a refusal. Linux: none
+#   (rustix's safe epoll and file calls).
+# 2026-11-18 (+1, A-456, Linux only; 85 -> 86): `switches::switches_now`'s Linux arm, one `libc::getrusage` with
+#   `RUSAGE_THREAD` into a zeroed, fully sized `rusage` this frame owns (rustix has no `getrusage`). A client's park that
+#   waits on its daemon's departure beside its reply polls a descriptor, so the daemon's futex wake cannot confirm it
+#   found the client asleep; the client judges its own sleep by this count, as Windows' parks do, or its wake estimate
+#   learns nothing on Linux. `slates-rt`'s attribution reads the same call for the shards (its own block): folding it
+#   into this one is owed (one block fewer there).
+# 2026-11-18 (+4, A-357, Windows only; 81 -> 85): the thread-profiling calls of A-223 (`switches.rs`) are found in kernel32
+#   at run time, never imported: three typed function-pointer aliases (`Enable`, `Read`, `Disable`) and the block that
+#   looks them up with `GetModuleHandleW` and `GetProcAddress`; the three calls' blocks were counted already. Nano Server's
+#   kernel32 exports none of the three, and the binary that imported them exited 0xC0000139 there before any of its code
+#   ran (release run 44326428333; docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md).
+# 2026-11-18 (+2, A-336, Windows only; 79 -> 81): the host's memory stall (`memory_stall.rs`), Windows' low-memory resource
+#   notification: `CreateMemoryResourceNotification` once a process and `QueryMemoryResourceNotification` at each look
+#   that suspects a shard, Win32 FFI with no safe wrapper. The watchdog and the anchor tell a shard waiting on memory
+#   from a wedged one by it; Linux reads `/proc/pressure/memory` and macOS a sysctl through the existing helper (none).
+# 2026-11-18 (+2, A-318, one compiled per target): the build-cost chain in machine code (`build_cost.rs`,
+#   `machine_chain`), an `asm!` block for x86-64 and one for AArch64, each reading a slice it is handed and writing only
+#   its own registers. Machine code is the point: it is the one form of the work no compiler flag instruments or
+#   deoptimizes, so the compiled chain's time against it is this build's slowdown, which the watchdog holds a poll's
+#   CPU to. No safe form of inline assembly exists.
 # 2026-11-08 (+7, the start judgment per thread): another process's threads, each one's CPU (`process_clock.rs`,
 #   `busiest_of` and `busiest_thread_ns`): on macOS `proc_pidinfo(PROC_PIDLISTTHREADS)` and `proc_pidinfo
 #   (PROC_PIDTHREADINFO)` (the thread record built field by field, not zeroed); on Windows `CreateToolhelp32Snapshot`,
 #   `Thread32First`, `Thread32Next`, `OpenThread` with the limited query right and `GetThreadTimes`. Linux reads `/proc`
 #   (none). None has a safe wrapper.
+# 2026-11-06 (+7, A-223, compiled only for Windows): the wake probe confirms its waiter asleep by its cycle count
+#   (`wake.rs`, `platform::Watch`): `GetCurrentThreadId`, `OpenThread` with query rights, `QueryThreadCycleTime` and
+#   the handle's `CloseHandle`; and a thread reads its own context switches (`switches.rs`): `EnableThreadProfiling`,
+#   `ReadThreadProfilingData` and `DisableThreadProfiling`. None has a safe wrapper.
 # 2026-11-07 (+2, compiled only for Linux): the process clock reads the whole process's CPU-time clock,
 #   `clock_getcpuclockid` and `clock_gettime`; `/proc/<pid>/schedstat`, which it read before, is the main thread's alone.
 #   Neither call has a safe wrapper in rustix.
@@ -337,13 +397,44 @@ slates-mem = 63
 #   macOS): whether any thread of another process is runnable, from `proc_pidinfo(PROC_PIDTASKALLINFO)`'s
 #   `pti_numrunning`: the zeroed record and the call that fills it. Linux reads `/proc` and Windows reuses the snapshot
 #   above, so neither adds a site. A start held off its CPUs was killed as stuck without it.
-slates-rt = 101
+# 2026-11-18 (+4, A-475, `handle_wait.rs`, compiled only for Windows): a client's process handle awaited through the shard,
+#   which the completion port alone cannot hear: the wait registered with the thread pool (`RegisterWaitForSingleObject`,
+#   1), unregistered at the future's drop with every callback finished (`UnregisterWaitEx(INVALID_HANDLE_VALUE)`, 1), the
+#   handle asked with a zero timeout for the register-then-test and each wake's attribution (`WaitForSingleObject`, 1),
+#   and the callback's read of the context its registration boxed (1). The callback's post shares the kick's one
+#   `PostQueuedCompletionStatus` block (`iocp::post`, 0). None has a safe wrapper.
+# 2026-11-19 (+1, A-550, `netsys.rs` `send_queue`, compiled only for Linux): `ioctl(SIOCOUTQ)`, the bytes a held NFS
+#   connection queued and the peer has not acknowledged, which with `tcpi_bytes_acked` (read through the existing
+#   `getsockopt` helper) tells a successor whether the stream a dead daemon left stands on a record's boundary. rustix
+#   wraps `FIONREAD` but not `SIOCOUTQ`, and no other call reads it.
+slates-rt = 107
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
-slates-base = 11
+slates-base = 10
 slates-vfs = 0
-slates-land = 4
+# 2026-11-18 (+19, §4.15 A-185, landing on Windows, `os_windows.rs` compiled only for Windows; built 2026-10-26 by
+#   another session with 18, the owner check grown by one when it was landed): Win32 and the NT layer have no safe
+#   wrapper for a write relative to a directory handle. The create relative to a handle (`NtCreateFile` with
+#   `FILE_CREATE`, and its handle owned, 2) and the directory reopened to flush it (`NtCreateFile` with an empty name,
+#   owned, 2); the rename that never replaces (`NtSetInformationFile(FileRenameInformationEx)` and the variable record
+#   written into its buffer, 2); the removal (`FileDispositionInfoEx`, 1), the attributes and times (`FileBasicInfo`,
+#   1) and an entry's attributes read (`FileAttributeTagInfo`, 1); `FlushFileBuffers` (1); the two error translations
+#   (`GetLastError`, `RtlNtStatusToDosError`, 2); and the target's owner check (`GetSecurityInfo`, the process token
+#   opened and owned, a token record read and its SID taken for the user and for the default owner, the SIDs compared,
+#   the descriptor freed: 7).
+# 2026-11-18 (+6, A-438, a symbolic link in a Windows landing, `os_windows.rs` only; 23 -> 29): NTFS sets a link's
+#   reparse buffer only through `FSCTL_SET_REPARSE_POINT` on a handle (`DeviceIoControl`, 1), for a caller with
+#   `SeCreateSymbolicLinkPrivilege` enabled, which an administrator's token holds disabled; `CreateSymbolicLinkW` enables
+#   it around its own call but takes a path, which the handle-relative writer never resolves. So the set runs on its
+#   thread under a copy of the process token with the privilege enabled: the token opened and owned (1), duplicated for
+#   impersonation and owned (1), the privilege enabled in the copy (`AdjustTokenPrivileges`, 1), the thread's token set
+#   (`SetThreadToken`, 1) and reverted (`RevertToSelf`, 1). None has a safe wrapper.
+# 2026-11-18 (+4, A-445, a reflink in a Windows landing, `os_windows.rs` only; 29 -> 33): ReFS's block cloning has no
+#   safe wrapper: the volume's word on sharing clusters (`GetVolumeInformationByHandleW`, 1), its cluster
+#   (`NtQueryVolumeInformationFile(FileFsSizeInformation)`, 1), a file's end set (`FileEndOfFileInfo`, 1) and a region
+#   cloned (`DeviceIoControl(FSCTL_DUPLICATE_EXTENTS_TO_FILE)`, 1).
+slates-land = 33
 # 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
 # attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
 # event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.
@@ -359,7 +450,22 @@ slates-db = 0
 # 2026-11-02 (+3, A-198 Step 9.4): the holder's process descriptor is converted from SDDL, applied before acquiring
 # held objects, and freed with LocalFree (`process_access.rs`). CreateProcessW borrows that same descriptor at birth;
 # these Win32 security calls have no safe wrapper and add no file or privilege requirement.
-slates-ipc = 139
+# 2026-11-18 (+5, A-447): a Windows claim waits on its daemon's exit. The claimant opens the daemon's process for
+# SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION (OpenProcess, the handle adopted), reads its creation time
+# (GetProcessTimes, also of the daemon's own pseudo-handle, GetCurrentProcess) to tell it from a process given its pid
+# after it, and waits on the claim's Event and the process at once (WaitForMultipleObjects); compiled only for Windows.
+slates-ipc = 147
+# 2026-11-18 (+1, A-452, `mach_claim.rs` compiled only for macOS; the budget raised by g251b, which found it over): the
+#   region fetch's receive ends on the kernel's send-once notification when the owner went away holding the fetch's
+#   reply right, and `fetch` destroys that notification with `mach_msg_destroy` (1), as every other refused or
+#   unexpected message is, so whatever it carried is given back once. A-452 added the site on 2026-11-18 without raising
+#   the budget, and `cargo xtask unsafe` counted 147 against 146 from then.
+# 2026-11-18 (+1, §4.6 A-433, a Windows Shards stream's resync, `stream_pipe.rs` compiled only for Windows): `write_now`
+#   cancels a pipe write the reader has no room for (`CancelIoEx`, 1), so a successor's `Resync` to a device that
+#   reads nothing never holds its shard; the write and its settling are the waited write's sites.
+# 2026-11-18 (+1, §4.6 A-427, a Windows Shards stream's resync holder, `handle_route.rs` compiled only for Windows):
+#   `process_started` reads a process's creation time with `GetProcessTimes` (1), which has no safe wrapper, so a
+#   successor hands a fresh stream only to the process the session named, never to a later one given its id.
 # 2026-11-06 (+26, GAP-A9-9, `mach_claim.rs` and one in `owner_name.rs`, compiled only for macOS): a client's region is
 #   handed over as a Mach fileport, never by a name a same-uid stranger could open. The Mach message calls the SDK
 #   wraps nothing for: `mach_msg` for the owner thread's receive, each answer (a refusal, a delivery), the client's fetch
@@ -417,9 +523,12 @@ slates-ipc = 139
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 # 2026-11-02 (+1, A-198 Step 9.3): `anchor_hold_windows::adopted` takes unique ownership of an explicitly inherited
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
-slates-server = 8
+# 2026-11-18 (-3, A-475): the Windows liveness probe of a client's process (`peer.rs`'s open, zero-timeout wait and close)
+#   is gone with the poll it served; a client's process exit is awaited through the shard (`slates-rt`'s `handle_wait`).
+slates-server = 5
 slates-client = 0
-slates-cli = 7
+slates-api = 10
+slates-cli = 2
 # 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
 #   its VMM's pidfd and on its signals together, so its signals arrive as bytes in a self-pipe: the handler's one
 #   `write(2)`, async-signal-safe, into the pipe's write end (1), and `signal(2)` installing that handler for SIGUSR1,
@@ -434,6 +543,7 @@ slates-bridge-fuse = 0
 # `TcpStream` (the socket unsafe lives in slates-rt) — no unsafe in this crate.
 slates-bridge-nfs = 0
 slates-merge = 0
+slates-hg = 0
 # slates-transport (0): the control-datagram codec is byte slices read and written in field order
 # through a bounded reader, never a cast; the owned QUIC dialect and the AEAD seal (later slices, §4.10a)
 # will carry their own budgeted sites (the rt UDP driver's unsafe lives in slates-rt).
@@ -457,6 +567,39 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp raised 156 -> 159 on 2026-11-19 (A-551, a folding volume's drive names each open by the spelling
+# Windows holds or the volume stores; counted by hand, for main's `cargo xtask unsafe` to confirm): in `host.rs` the
+# call of ntdll's `RtlUpcaseUnicodeChar` in `system_upcase`, the system's upcase table the driver compares names by,
+# which no safe wrapper offers, 1; and `put_normalized_name` (an `unsafe fn`, as `put_info` is, and its block: WinFsp's
+# `FSP_FSCTL_OPEN_FILE_INFO` behind Create's and Open's `FileInfo`, its name buffer written when the name fits), 2.
+# The rule that picks the name, and the response's clear, are safe Rust (`crate::normalized`, `crate::inflight`).
+# slates-bridge-winfsp lowered 158 -> 156 on 2026-11-18 (A-369, the drive a Mount Manager drive WinFsp's driver makes):
+# `held.rs` loses the drive's `DefineDosDeviceW` and its removal, the temporary link's open, ownership and
+# `NtMakeTemporaryObject` (5) and gains the `FSP_FSCTL_MOUNTMGR` request and the `QueryDosDeviceW` check (2); `host.rs`
+# borrows the control handle for the request (1).
+# slates-bridge-winfsp raised 155 -> 158 on 2026-11-18 (A-360, hard links through WinFsp's patched driver), measured
+# by `cargo xtask unsafe` (kiln r3529, 158 against 155): in `host.rs` the link's entry (`link`, an `unsafe fn` as every
+# callback the dispatcher calls with the file system's pointer) and its handler's read from that pointer, 2; in
+# `dispatcher.rs` the forwarded link served before the DLL's callback, one more block beside the callback's, 1.
+# slates-bridge-winfsp raised 148 -> 155 on 2026-11-18 (A-350, the drive reports its account as every object's owner, so
+# git trusts a repository on it): the `GetSecurity` slot's callback signature in `ffi.rs`, 1; in `host.rs` the
+# `get_security` callback's two blocks (the handler and the descriptor's copy, as `get_security_by_name`'s), the
+# daemon's own token in `drive_security_descriptor` (`OpenProcessToken` and owning its handle), and
+# `token_information`'s two `GetTokenInformation` calls (the size, then the read), 6. The SIDs' text and the descriptor's
+# SDDL are safe Rust (`crate::account`, tested on every host).
+# slates-bridge-winfsp raised 146 -> 148 on 2026-11-09 (A-275, NTFS's rule for who may make a link, judged by the drive
+# since WinFsp's own check refuses Developer Mode, diagnostics run 42712321599): the `GetTokenInformation(TokenPrivileges)`
+# query of a link-making Create's token in `dispatcher.rs` (`creator_may_link`), and the `RegGetValueW` read of
+# Developer Mode in `ffi.rs` (`developer_mode`), 2.
+# slates-bridge-winfsp raised 130 -> 146 on 2026-11-09 (A-275, Windows symbolic links), each new site measured by `cargo
+# xtask unsafe`: in `ffi.rs` the four reparse slots' callback signatures and the three new export types
+# (`GetReparsePointByName`'s callback, `FspFileSystemResolveReparsePoints`, `FspFileSystemFindReparsePoint`), 7; in
+# `host.rs` the call of `FspFileSystemFindReparsePoint` with its index write in `get_security_by_name`, the call of
+# `FspFileSystemResolveReparsePoints`, `reparse_out` (an unsafe fn and its block: WinFsp's in/out reparse buffer as a
+# slice), `reparse_request` (an unsafe fn and its block: the set's or delete's name and bytes), and one block in each
+# of `link_by_name`, `get_reparse_point`, `set_reparse_point` and `delete_reparse_point` taking the handler and
+# buffers, 9. Every other step of the reparse work (the buffer's encoding and decoding, `crate::symlink`; the shard's
+# link operations) is safe Rust.
 # slates-bridge-winfsp (131 since 2026-11-04: A-206's `FspVersion` export type and its one call in `checked_dll`, the DLL's
 # version check, replacing the read of the reserved field that check once looked at, so a net one more).
 # slates-bridge-winfsp (104): the VfsError->NTSTATUS refusal taxonomy and the notification records stay safe Rust
@@ -509,7 +652,7 @@ slates-bridge-fskit = 9
 # channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
 # intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
 # go (-3). Measured by `cargo xtask unsafe`.
-slates-bridge-winfsp = 130
+slates-bridge-winfsp = 159
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25
@@ -531,7 +674,11 @@ slates-bridge-virtiofs = 3
 # (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a
 # `statfs` of the path would touch the very mount the daemon serves. The Linux read of
 # `/proc/self/mountinfo` is safe rustix; the parser, verification and entry are pure.
-slates-bridge-oci = 1
+# Raised to 2 on 2026-11-18 (A-511, g232): the macOS unmount watch's one `kevent` call (`kevent_now` in
+# `mount_table.rs`), which registers the `EVFILT_FS` filter on `VQ_UNMOUNT` and reads its event. rustix's
+# `kevent` cannot name `EVFILT_FS` (its `EventFilter` has no such variant), so the call is libc's; the queue
+# itself is made through rustix, and the Linux watch (an epoll instance over `/proc/self/mountinfo`) is safe rustix.
+slates-bridge-oci = 2
 # slates-conformance (0): pure parsers and records; no FFI, no I/O.
 slates-conformance = 0
 # slates-test-seeds (0): a proptest persistence over compiled seed text; no FFI, no I/O.
@@ -552,3 +699,22 @@ slates-image = 0
 # 2026-10-29, when `cargo xtask unsafe` found the crate unbudgeted since A-187 added it (CI runs the structural and
 # literal checks, not the budget).
 slates-seal = 0
+# slates-svn (0): the Subversion server's pure pieces (A-500, §4.17.4): svndiff's integers, windows and sections read
+# and written by checked offsets and `get`, LZ4 through lz4_flex's safe codec; no casts, no maps, no FFI.
+slates-svn = 0
+# slates-vcs (0): the version-control servers' object store (A-581, §4.17.1 shared piece 3): content by BLAKE3 identity in
+# an ordered map, tables read by checked offsets and `get`; no casts, no maps, no FFI.
+slates-vcs = 0
+# slates-ssh (0): SSH's transport (A-594, §4.17.2): the wire types read by checked offsets and `get`, the cryptography
+#   through aws-lc-rs's safe API (X25519, Ed25519, SHA-256, AES-256-GCM, OpenSSH's ChaCha20-Poly1305); no FFI of its own.
+slates-ssh = 0
+# slates-git (0): git's codecs and pack reader (A-582, A-590, A-591, A-600, A-608, §4.17.2) are bounds-checked byte
+#   slices read through length checks and written into vectors; hashing through sha1-checked and aws-lc-rs's safe API;
+#   safe Rust throughout. (Moved into [budget] 2026-11-19: it sat above the table header, so the check never read it.)
+slates-git = 0
+# slates-http (0): the shared HTTP/1.1 request codec (A-595, §4.17.2 piece 8): heads and bodies read by checked offsets
+#   and `get`, gzip through flate2's safe API; no casts, no maps, no FFI.
+slates-http = 0
+# slates-http-edge (0): the HTTP edge's engine (A-625, §4.17.2): a state machine over bytes through slates-http's safe
+#   codec and rustls's safe API over aws-lc-rs; no FFI, no casts, no maps of its own.
+slates-http-edge = 0

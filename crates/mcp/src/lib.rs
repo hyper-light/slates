@@ -7,12 +7,12 @@
 //! namespace operations, submit, rebase, read the chain), the volume lifecycle (create, list, stat,
 //! snapshot, clone, resize, destroy), attach and
 //! detach, the base operations (read_base, digest, rewitness, pin), `slates.status`, and `slates.land`
-//! (materialize, which returns `GrantRequired`). Owed toward the full §4.12: `slates.fs` (the mount
+//! (materialize, which lands as the volume's write policy allows, A-285). Owed toward the full §4.12: `slates.fs` (the mount
 //! path), Streamable HTTP, resources and prompts.
 //!
-//! **No grant, ever (R10).** No tool here creates a landing grant; the grant is a human-only act on
-//! the CLI or a confirmation surface. The server has no grant verb to refuse — it simply does not
-//! offer one, and any `slates.land` tool added later returns `GrantRequired`, never a grant.
+//! **No grant, ever (R10).** No tool here creates or approves a landing grant: the write mode the user gave the
+//! agent decides (A-285) — bypass lands at once, ask returns `GrantRequired` for the launcher to approve, a forbidding
+//! mode is refused — and the launcher, never the agent, sets that mode and approves.
 //!
 //! The wire is JSON-RPC 2.0. A request with an `id` gets a reply; a notification (no `id`) gets none.
 //! A tool call returns `structuredContent` (the machine-readable result) alongside a text `content`
@@ -123,7 +123,7 @@ const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 const CACHE_TTL_MS: u64 = 0;
 /// The guidance `server/discover` gives a model about this server (MCP 2026-07-28 `DiscoverResult.instructions`):
 /// what the tools do together, not what each does.
-const INSTRUCTIONS: &str = "slates gives each agent its own copy-on-write volume, kept in RAM: create or clone a volume, attach it (a mount path, or read and write through slates.fs), work in it, and bring work together through the merge loop (slates.merge.*). Nothing reaches the host's disk until a human grants a landing; slates.land.materialize only plans one and answers GrantRequired. Volume ids are opaque hex: pass back exactly what a tool returned. A refusal is typed in structuredContent.error; call slates.help for the workflow.";
+const INSTRUCTIONS: &str = "slates gives each agent its own copy-on-write volume, kept in RAM: create or clone a volume, attach it (a mount path, or read and write through slates.fs), work in it, and bring work together through the merge loop (slates.merge.*). What reaches the host's disk follows the write mode your user gave you: under bypass slates.land.materialize writes at once; under ask it answers GrantRequired and writes nothing until your harness approves; a mode that forbids writing is refused. Volume ids are opaque hex: pass back exactly what a tool returned. A refusal is typed in structuredContent.error; call slates.help for the workflow.";
 
 /// JSON-RPC error codes (the standard set plus two in the implementation-defined server range for a
 /// typed refusal from the daemon and an unreachable daemon). These are the JSON-RPC 2.0 wire values,
@@ -526,6 +526,13 @@ impl McpServer {
         Submitted::Conflict(windows) => {
           json!({ "accepted": false, "conflicts": windows_json(&windows) })
         }
+        // A merge an ask write policy holds (A-285): what the launcher's approval binds.
+        Submitted::ApprovalRequired { identity, paths } => json!({
+          "accepted": false,
+          "approval_required": true,
+          "identity": hex32(&identity),
+          "paths": paths,
+        }),
       },
     )
   }
@@ -536,7 +543,11 @@ impl McpServer {
     let attachment = u64_arg(args, "attachment")?;
     let version = args.get("version").and_then(Value::as_u64);
     let advanced = self.client.advance(attachment, version).map_err(refusal)?;
-    Ok(json!({ "version": advanced.version, "invalidated": advanced.invalidated }))
+    Ok(json!({
+      "version": advanced.version,
+      "invalidated": advanced.invalidated,
+      "invalidated_elided": advanced.invalidated_elided,
+    }))
   }
 
   /// Reads a file at a view (§4.12 `slates.fs.read`): a green's head, its `version`, or the version
@@ -817,11 +828,14 @@ impl McpServer {
 
   fn rewitness(&mut self, args: &Value) -> Result<Value, McpError> {
     let volume = volume_arg(args, "volume")?;
-    let paths = self
+    let rewitnessed = self
       .client
       .rewitness(volume, paths_opt(args))
       .map_err(refusal)?;
-    Ok(json!({ "rewitnessed": paths }))
+    Ok(json!({
+      "rewitnessed": rewitnessed.paths,
+      "rewitnessed_elided": rewitnessed.paths_elided,
+    }))
   }
 
   fn pin(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -835,10 +849,10 @@ impl McpServer {
     Ok(daemon_json(&report, &telemetry))
   }
 
-  /// Plans a landing onto a host directory (§4.15). MCP never passes a grant (R10), so the reply is
-  /// `GrantRequired` — the manifest and summary a human reviews, and the `slates grant` command that
-  /// authorizes it — or `Landed` when there is nothing diverged to write. The grant itself is a
-  /// human-only act on the CLI; this tool cannot make one.
+  /// Lands onto a host directory (§4.15) as the volume's write policy allows (A-285). MCP never passes a grant (R10):
+  /// under bypass the daemon grants and lands at once (`Landed`); under ask the reply is `GrantRequired`, the
+  /// manifest and summary the launcher approves; a forbidding mode is refused `PolicyForbids`. The approval is the
+  /// launcher's act; this tool cannot make one.
   fn land_materialize(&mut self, args: &Value) -> Result<Value, McpError> {
     let volume = volume_arg(args, "volume")?;
     let target = string_arg(args, "target")?;
@@ -860,12 +874,14 @@ impl McpServer {
         manifest,
         summary,
         conflicts,
+        conflicts_elided,
       } => Ok(json!({
         "grant_required": true,
         "landing": landing,
         "manifest": hex32(&manifest),
         "summary": landing_summary_json(&summary),
         "conflicts": conflicts,
+        "conflicts_elided": conflicts_elided,
         "grant_with": format!("slates grant {landing}"),
       })),
       Landing::Landed(outcome) => Ok(json!({
@@ -1116,7 +1132,8 @@ fn tool_list() -> Vec<Value> {
     tool(
       "slates.merge.advance",
       "Re-pin a green attachment to `version` (or the head): the version pinned and the paths \
-       invalidated. An attachment's view never moves otherwise.",
+       invalidated, as many as one reply holds; `invalidated_elided` counts the rest, and then every path \
+       counts as invalidated. An attachment's view never moves otherwise.",
       json!({ "attachment": integer, "version": integer }),
       json!(["attachment"]),
     ),
@@ -1258,7 +1275,8 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.base.rewitness",
-      "Re-witness a volume's base entries (given `paths`, or all); the paths whose base drifted.",
+      "Re-witness a volume's base entries (given `paths`, or all); the paths whose base drifted, as many as \
+       one reply holds, and `rewitnessed_elided` counting the rest, which were re-witnessed too.",
       json!({ "volume": string, "paths": { "type": "array", "items": string } }),
       json!(["volume"]),
     ),
@@ -1270,8 +1288,11 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.land.materialize",
-      "Plan a landing of a volume's diverged entries onto a host directory. Returns the manifest and \
-       the `slates grant` command a human runs to authorize it — this tool never grants (R10).",
+      concat!(
+        "Land a volume's diverged entries onto a host directory, as the write mode your user gave you allows ",
+        "(A-285): under bypass it writes at once; under ask it returns the manifest for your harness to approve and ",
+        "writes nothing; a forbidding mode is refused. This tool never approves (R10).",
+      ),
       json!({
         "volume": string,
         "target": string,
@@ -1493,6 +1514,11 @@ pub fn summary_json(v: &VolumeSummary) -> Value {
   })
 }
 
+/// One part of a takeover past tolerance as JSON (A-332): the hosts its recovery needed and how many of them remained.
+fn shortfall_json(shortfall: &slates_ipc::protocol::Shortfall) -> Value {
+  json!({ "needed": shortfall.needed, "remaining": shortfall.remaining })
+}
+
 /// A volume status report as JSON. Public so the CLI's `--json` emits the same schema as the MCP
 /// surface (§4.12 schema parity — one definition, two surfaces).
 pub fn status_json(r: &StatusReport) -> Value {
@@ -1510,10 +1536,25 @@ pub fn status_json(r: &StatusReport) -> Value {
       .collect::<Vec<_>>(),
     "mounts_elided": r.mounts_elided,
     "takeover_kept": r.takeover_kept,
+    "loss": {
+      "at_risk_ns": r.loss.at_risk_ns,
+      "placed_sequence": r.loss.placed_sequence,
+      "live_shipped": r.loss.live_shipped,
+      "taken_over": r.loss.taken_over.as_ref().map(|taken| json!({
+        "epoch": taken.epoch,
+        "head_sequence": taken.head_sequence,
+        "from_live_log": taken.from_live_log,
+        "past_tolerance": taken.past_tolerance.as_ref().map(|past| json!({
+          "registers": past.registers.as_ref().map(shortfall_json),
+          "live_log": past.live_log.as_ref().map(shortfall_json),
+        })),
+      })),
+    },
     "head": r.head.value,
     "snapshots": r.snapshots,
     "watcher": r.watcher,
     "drifted": r.drifted,
+    "drifted_elided": r.drifted_elided,
     "nfs_port": r.nfs_port,
     "placed": {
       "region": r.placed.region,
@@ -1816,6 +1857,7 @@ pub fn outcome_json(o: &LandingOutcome) -> Value {
       "dirs": o.durability.dirs,
     },
     "degraded": o.degraded.iter().map(degradation_json).collect::<Vec<_>>(),
+    "degraded_elided": o.degraded_elided,
     "barriers": o.barriers,
   })
 }
@@ -1842,10 +1884,12 @@ pub fn degradation_json(d: &LandingDegradation) -> Value {
       json!({"kind": "unswept", "dir": dir, "answer": answer_json(answer)})
     }
     LandingDegradation::Kept { path, kept } => json!({"kind": "kept", "path": path, "kept": kept}),
+    // A Win32 error code by its own name, never an errno's (A-539).
+    LandingDegradation::CrashedWin32 { code } => json!({"kind": "crashed", "win32": code}),
   }
 }
 
-/// A host's answer as JSON: a typed refusal's name, or `{"errno": n}`.
+/// A host's answer as JSON: a typed refusal's name, or `{"errno": n}`, or `{"win32": n}` (A-539).
 fn answer_json(answer: &HostAnswer) -> Value {
   match answer {
     HostAnswer::NotFound => json!("not_found"),
@@ -1853,6 +1897,7 @@ fn answer_json(answer: &HostAnswer) -> Value {
     HostAnswer::NotFile => json!("not_file"),
     HostAnswer::StaleHandle => json!("stale_handle"),
     HostAnswer::Errno { errno } => json!({"errno": errno}),
+    HostAnswer::Win32 { code } => json!({"win32": code}),
   }
 }
 
@@ -2047,11 +2092,24 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "bytes_consumed": session.bytes_consumed,
         "path_mtu": session.path_mtu,
       })).collect::<Vec<_>>(),
+      // The failover delay as the daemon estimates it now, each term with the measurements behind it (A-363).
+      "failover": json!({
+        "total_ns": r.fleet.failover.total_ns,
+        "detection_ns": r.fleet.failover.detection_ns,
+        "detection_samples": r.fleet.failover.detection_samples,
+        "confirmation_ns": r.fleet.failover.confirmation_ns,
+        "confirmation_samples": r.fleet.failover.confirmation_samples,
+        "recovery_ns": r.fleet.failover.recovery_ns,
+        "takeovers_timed": r.fleet.failover.takeovers_timed,
+        "volumes_timed": r.fleet.failover.volumes_timed,
+      }),
     },
   });
   // Inserted after: one more key in the literal passes `json!`'s macro recursion limit.
   if let Some(fields) = report.as_object_mut() {
     fields.insert("dumps_local_full".to_owned(), json!(r.dumps_local_full));
+    // Whether the anchor has judged the daemon recovered (A-311): what a caller that ends a daemon on purpose waits for.
+    fields.insert("recovered".to_owned(), json!(r.recovered));
   }
   report
 }

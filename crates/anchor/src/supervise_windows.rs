@@ -100,12 +100,12 @@ pub(super) struct Hold {
 }
 
 impl Hold {
-  pub(super) fn new(bound: usize) -> Result<Hold, HandleRefusal> {
+  pub(super) fn new(bounds: crate::handles::HoldBounds) -> Result<Hold, HandleRefusal> {
     let (anchor, daemon) = channel()?;
     Ok(Hold {
       anchor: ReadingEnd::new(anchor),
       daemon,
-      held: Held::new(bound),
+      held: Held::new(bounds),
       pending: None,
       channel_refusals: 0,
       logged: RefusalLog::default(),
@@ -136,7 +136,13 @@ impl Hold {
   /// own wait ends at its deadline, a typed refusal there. Nothing a daemon sends ends supervision.
   pub(super) fn drain(&mut self, daemon: HANDLE) -> usize {
     let mut applied = 0usize;
-    for _ in 0..self.held.bound().saturating_mul(MESSAGES_PER_ENTRY).max(1) {
+    for _ in 0..self
+      .held
+      .bounds()
+      .total()
+      .saturating_mul(MESSAGES_PER_ENTRY)
+      .max(1)
+    {
       if !self.reply() {
         break;
       }
@@ -205,5 +211,6 @@ impl Hold {
   }
 }
 
-/// Derived: one hold and one release per entry admitted by the attachment-derived bound.
+/// Derived: one hold and one release per entry admitted by the bounds of every class (A-448). A record's replacement
+/// (A-423) waits for its answer as a hold does, a daemon's exchanges one at a time, so it adds no message waiting at once.
 const MESSAGES_PER_ENTRY: usize = 2;

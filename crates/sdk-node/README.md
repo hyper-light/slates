@@ -44,8 +44,10 @@ const status = await async.status(volume);
 ```
 
 Connecting where no daemon answers throws (`AsyncClient.connect` rejects; it never holds the event
-loop while the daemon answers). Every async call ends: answered, refused typed, `Stalled` at its reply
-deadline, `DaemonGone` when the daemon is gone and no restart answers within the reconnect budget, or
+loop while the daemon answers). A call waits while its daemon lives, however long a busy machine keeps
+the daemon off its CPU: a daemon that will never answer is ended (by its anchor, or by its own watchdog
+when it runs alone), and its calls are then resent to the restarted daemon. Every async call ends: answered,
+refused typed, `DaemonGone` when the daemon is gone and no restart answers within the reconnect budget, or
 `CompletionLost` when the completion reader fails; `client.cancel(promise)` releases a waiting call
 and rejects it with an `AbortError`. Calls past the client's bound (its outstanding limit in
 flight, as many again queued) are refused `TooManyOutstanding` at once. Use a client from the thread that connected it.
@@ -93,6 +95,39 @@ if (outcome.ok) {
 console.log(client.versions(green));            // the green's head version
 console.log(client.changedSince(green, 0));     // paths changed since a version
 ```
+
+## A volume at a path for one command (`slates exec`, Linux)
+
+`execCommand` builds the command that runs slates' chosen-path launcher: the volume shown at an existing directory for
+one command, in a namespace of its own. Spawn it as any command; the launcher finds the volume under `SLATES_ROOT` in
+the environment you give it (the daemon's root mount):
+
+```js
+import { spawn } from 'node:child_process';
+import { execCommand, apparmorProfile } from '@hyper-light/slates';
+
+const argv = execCommand('scratch', '/home/u/proj/build', ['cargo', 'build']);
+// ['slates', 'exec', '--volume=scratch', '--at=/home/u/proj/build', '--', 'cargo', 'build']
+spawn(argv[0], argv.slice(1), { env: { ...process.env, SLATES_ROOT: '/run/user/1000/slates' }, stdio: 'inherit' });
+```
+
+`{ program }` names the `slates` binary when it is not the one on the `PATH`.
+
+**AppArmor (Ubuntu 24.04 and later).** Where AppArmor restricts unprivileged user namespaces
+(`kernel.apparmor_restrict_unprivileged_userns=1`), the launcher needs slates' AppArmor profile for the binary, which an
+administrator loads once, as root, and you opt into it per command with `{ apparmorProfile: true }` (off unless set):
+
+```js
+console.log(apparmorProfile('/usr/local/bin/slates')); // the profile: save it as /etc/apparmor.d/usr.local.bin.slates
+const asked = execCommand('scratch', '/home/u/proj/build', ['cargo', 'build'], {
+  apparmorProfile: true,
+  program: '/usr/local/bin/slates',
+});
+```
+
+With the option, the launcher makes its namespace under the profile and runs the command outside it. Without it, the
+launcher never uses the profile, even where it is loaded. `slates apparmor check` on the host says which applies and
+prints the root commands that load or remove the profile (`docs/cli.md`, "The launcher and AppArmor").
 
 ## No grants (R10)
 

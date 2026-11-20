@@ -18,10 +18,26 @@ export interface VolumeStatus {
   snapshots: number
   watcher: string
   drifted: string[]
+  /** Drifted paths the report did not carry; `slates status --drift` walks them (A-267). */
+  driftedElided: number
   nfsPort: number | null
   placed: boolean
   mirrorAgeNs: number | null
   hostEpoch: number
+}
+
+/** One drifted entry of an overlay: its path and what the disk did to it. */
+export interface DriftEntry {
+  path: string
+  kind: 'Modified' | 'Deleted' | 'Replaced' | 'TypeChanged'
+}
+
+/** An overlay's whole drift, read a page at a time (A-267): `unverified` holds the entries whose re-check the host
+ * refused now, `oversized` counts the entries too long for any reply. */
+export interface DriftedResult {
+  drifted: DriftEntry[]
+  unverified: string[]
+  oversized: number
 }
 
 /** A volume in a listing. `notRecovered` is null, or for a volume recovery could not rebuild its cause's kind. */
@@ -67,9 +83,15 @@ export class Client {
   static connect(instance: string, replyNs: number, reconnectNs: number): Client
   clientId(): number
   reconnects(): number
+  /** Spins this long (nanoseconds) for a synchronous call's reply before parking; `null` restores the wake estimate. */
+  spinFor(spinNs: number | null): void
+  /** `[parks, replies]`: the synchronous calls that parked for their reply, and the replies taken. */
+  parkRatio(): [number, number]
   create(name: string, sizeBytes: number, dynamic?: boolean, fold?: boolean, requireLocked?: boolean, base?: string): string
   snapshot(volume: string): number
   status(volume: string): VolumeStatus
+  /** Every drifted entry of an overlay, past what a status carries (A-267). */
+  drifted(volume: string): DriftedResult
   list(): VolumeEntry[]
   resize(volume: string, sizeBytes: number, dynamic?: boolean): void
   destroy(volume: string): void
@@ -95,9 +117,10 @@ export class Client {
 /**
  * The async-primary client (R6, D-19): every verb returns a Promise resolved by the completion fd's
  * readiness (a libuv-polled socket/pipe), never blocking the event loop. The fast path resolves within
- * the daemon's spin window without touching the loop. Every call ends: answered, refused typed, failed
- * `Stalled` at its reply deadline, `DaemonGone` when recovery finds no daemon, or `CompletionLost` when
- * the completion reader fails (AUD-29-20). Calls past the outstanding bound are refused
+ * the daemon's spin window without touching the loop. A call waits while its daemon lives; a daemon that
+ * will never answer is ended by its anchor or its own watchdog (A-232). Every call ends: answered, refused
+ * typed, `DaemonGone` when recovery finds no daemon, or `CompletionLost` when the completion reader fails
+ * (AUD-29-20). Calls past the outstanding bound are refused
  * `TooManyOutstanding` at once.
  */
 export class AsyncClient {
@@ -137,3 +160,30 @@ export class AsyncClient {
   removeXattr(work: string, path: string, name: string): Promise<void>
   land(volume: string, target: string, snapshot?: number, include?: string[], exclude?: string[], grant?: number): Promise<LandingResult>
 }
+
+/** What `execCommand` takes beside the request (A-370). */
+export interface ExecOptions {
+  /**
+   * The launcher's AppArmor option, off unless `true`: on a host whose AppArmor restricts unprivileged user namespaces
+   * (Ubuntu 24.04 and later), the launcher makes its namespace under slates' AppArmor profile for `program`, which an
+   * administrator loads as root (`apparmorProfile`); off, it never uses that profile.
+   */
+  apparmorProfile?: boolean
+  /** The executable that serves the launcher: `slates` (found on the `PATH`) unless named. */
+  program?: string
+}
+
+/**
+ * The command that runs slates' chosen-path launcher (`slates exec`, §4.6; A-370): `volume` shown at the existing
+ * directory `at` for `command`, in a namespace of its own (Linux), as an argument list for
+ * `child_process.spawn(argv[0], argv.slice(1))`. The launcher finds the volume under `SLATES_ROOT` in the environment it
+ * is given. Throws for an empty command.
+ */
+export function execCommand(volume: string, at: string, command: string[], options?: ExecOptions): string[]
+
+/**
+ * slates' AppArmor profile for `executable`, the absolute real path of the binary that runs the launcher (A-370): the
+ * text an administrator saves under `/etc/apparmor.d` and loads with `apparmor_parser -r`, as root. Throws for a path
+ * the profile cannot name exactly.
+ */
+export function apparmorProfile(executable: string): string

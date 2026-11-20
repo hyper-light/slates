@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 /// Shape: how long the anchor and its daemon get to come up (a quick profile plus two
 /// starts), and how long the daemon gets to leave after its anchor dies.
 const START_WAIT: Duration = Duration::from_secs(20);
-/// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's `UMNT` to show in
+/// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's unmount (A-511) to show in
 /// `status` — ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s; a client is asked about once silent for
 /// one budget, so a death shows within two).
 const WAIT_FOR: Duration = Duration::from_secs(10);
@@ -191,11 +191,11 @@ fn spawn_anchor_from(
   (AnchorProcess { child, drain: None }, stderr)
 }
 
-/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`), after its shards
+/// Format: the start of the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`), after its shards
 /// started and its rendezvous was published; the instance name follows.
 const SERVING_LINE: &str = "slates daemon: instance ";
 
-/// Format: the anchor's line when its supervision finds the daemon in a crash loop (`crates/cli/src/anchor.rs`,
+/// Format: the anchor's line when its supervision finds the daemon in a crash loop (`crates/api/src/role/anchor.rs`,
 /// A-119). The anchor never gives up on a daemon, so a daemon that can never serve shows here, not as an exit.
 const CRASH_LOOP_LINE: &str = "slates anchor: the daemon is in a crash loop";
 
@@ -267,7 +267,7 @@ fn await_stable_daemon(instance: &str, bootstrap: bool) {
     };
     if streak >= STABLE_STREAK {
       if bootstrap {
-        bootstrap_through_stalls(instance, &mut progress);
+        bootstrap_once(instance);
       }
       return;
     }
@@ -542,23 +542,20 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
   None
 }
 
-/// §4.14 `daemon.alive` (2026-10-10, when the anchor began waiting for the lapse instead of looking every beat): a daemon
-/// that stops beating is killed at its heartbeat lapse and restarted. Do: start an anchor, freeze its daemon
-/// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
-/// anchor's own kill line to say the beat it judged was at least its lapse bound old (the liveness window plus the
-/// anchor's lateness p99), never less than the window; and the new daemon answering within the suite's start wait past
-/// that bound.
+/// §4.14 `daemon.alive`, A-232: a daemon frozen whole is killed by its process judgment once its heartbeat lapses, and
+/// restarted. Do: start an anchor, freeze its daemon (`SIGSTOP`: alive and silent), and wait for another daemon to
+/// answer. Expect the frozen one gone, killed once, and the anchor's kill line to be its process judgment, never a
+/// withheld beat's: the line names a beat at least a window old and a process that made no progress for at least the
+/// window and at most one more, the window being the anchor's (the liveness budget, raised to how late the anchor's own
+/// waits ran where that is longer, A-461); and the new daemon answering within the suite's start wait.
 ///
-/// The lower bound is the anchor's own predicate, read from its kill line, because the test cannot see how old the last
-/// beat was when it stopped the daemon. Since A-228 the beat is the watchdog's, and on a loaded machine a beat can come
-/// late (0.26 s measured on a starved shard), so the lapse can end sooner after the stop than a window less one beat.
-/// Main CI run 42184319025 (macOS, 2026-11-07) replaced the daemon 869.8 ms after the stop, with the anchor right, and
-/// failed the old bound of the window less a beat (900 ms).
-///
-/// Since A-228 the beat is the daemon's watchdog thread's, and a frozen process stops every thread at once, the watchdog
-/// with them, so nothing in the daemon can say it is only starved. A stopped process is indistinguishable from a hung one,
-/// and the kill here is the intended outcome: measured 2026-11-06 on macOS arm64 at load 54, killed at 1,045 ms against a
-/// 1,044 ms bound (the liveness window plus the anchor's own lateness p99 of 44 ms over 15 waits).
+/// A frozen process stops its watchdog with every other thread, so the watchdog's silence cannot say whether the daemon
+/// is stuck or only starved; since A-232 the anchor then judges the process by the start's rule, sparing a starved one
+/// and killing a frozen one a window after the lapse (`crates/api/src/role/anchor.rs` `on_lapse`). Until A-232 it killed at
+/// the lapse itself, as a withheld beat: measured 2026-11-06 on macOS arm64 at load 54, 1,045 ms against a 1,044 ms
+/// bound (the liveness window plus the anchor's lateness p99 of 44 ms over 15 waits). Still waiting for those words, this
+/// test timed out on the landing of A-232 (CI's ubuntu-latest, 2026-11-17), whose kill line read "has not looked for
+/// 2004 ms, its heartbeat 2004 ms old; its process made no progress for 1004 ms (the 1000 ms liveness window)".
 #[test]
 fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -574,7 +571,7 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   anchor.drain = Some(std::thread::spawn(move || {
     for line in std::io::BufRead::lines(stderr).map_while(Result::ok) {
       eprintln!("{line}");
-      if line.contains(LAPSE_KILL_LINE) {
+      if line.contains(PROCESS_KILL_LINE) || line.contains(LAPSE_KILL_LINE) {
         let _ = kills.send(line);
       }
     }
@@ -602,48 +599,61 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     .recv_timeout(START_WAIT)
     .expect("the anchor said why it killed the daemon");
   drop(anchor);
-  let (age, bound, window) = lapse_of(&line);
+  assert!(
+    line.contains(PROCESS_KILL_LINE) && !line.contains(LAPSE_KILL_LINE),
+    "the anchor killed the frozen daemon by its process judgment, not as a withheld beat: {line}"
+  );
+  let (age, still, window) = frozen_kill_of(&line);
   println!(
-    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old against its {bound:?} bound"
+    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old, its process still for {still:?} \
+     against its {window:?} window"
   );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
-  assert_eq!(
-    window,
-    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
-    "the anchor's window is the liveness budget"
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the anchor's window is the liveness budget, or longer where its own waits ran later (A-461): {window:?} ({line})"
   );
   assert!(
-    age >= bound && age >= window,
-    "not killed before its heartbeat lapsed: the beat was {age:?} old against a {bound:?} bound ({line})"
+    age >= window && still >= window,
+    "not killed before its heartbeat lapsed and its process made no progress for a window: the beat was {age:?} old, \
+     the process still for {still:?} ({line})"
   );
-  // Killed at the lapse: within one more window of it. How soon the successor then answers is the machine's, and
+  // Killed by the judgment: within one more window of it. How soon the successor then answers is the machine's, and
   // `await_daemon` judges it by the successor's progress.
   assert!(
-    age <= bound + window,
-    "killed within a window of the lapse: the beat was {age:?} old against a {bound:?} bound ({line})"
+    still <= window + window,
+    "killed within a window of the judgment: the process was still for {still:?} against a {window:?} window ({line})"
   );
 }
 
-/// Format: the words of the anchor's kill line for a lapsed beat (`crates/cli/src/anchor.rs`).
+/// Format: the words of the anchor's kill line for a beat its watchdog withheld while looking (`crates/api/src/role/anchor.rs`
+/// `on_lapse`): never a frozen daemon's, whose watchdog is frozen with it.
 const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
 
-/// The beat's age, the lapse bound and the window the anchor's kill line names, in that order: "(N ms old, past B ms: the
-/// W ms window …".
-fn lapse_of(line: &str) -> (Duration, Duration, Duration) {
-  let (_, rest) = line.split_once(LAPSE_KILL_LINE).expect("a kill line");
+/// Format: the words of the anchor's kill line for a daemon whose watchdog has gone silent and whose process the start's
+/// rule finds stuck (`on_lapse`, A-232): "the daemon's watchdog has not looked for L ms, its heartbeat A ms old; its
+/// process made no progress for F ms (its W ms window); killing it" (A-461: the window the anchor judged it by).
+const PROCESS_KILL_LINE: &str = "; its process made no progress for ";
+
+/// The beat's age, how long the process made no progress, and the window the anchor's process kill line names: its
+/// four numbers are the watchdog's silence, the beat's age, the process's stillness and the window, in that order.
+fn frozen_kill_of(line: &str) -> (Duration, Duration, Duration) {
+  let (_, rest) = line
+    .split_once("the daemon's watchdog has not looked for ")
+    .expect("a process kill line");
   let numbers: Vec<u64> = rest
     .split(|c: char| !c.is_ascii_digit())
     .filter(|word| !word.is_empty())
-    .take(3)
+    .take(4)
     .map(|word| word.parse().unwrap())
     .collect();
-  let [age, bound, window] = numbers[..] else {
-    panic!("the kill line names the age, the bound and the window: {line}");
+  let [_silent, age, still, window] = numbers[..] else {
+    panic!("the kill line names the silence, the beat's age, the stillness and the window: {line}");
   };
   (
     Duration::from_millis(age),
-    Duration::from_millis(bound),
+    Duration::from_millis(still),
     Duration::from_millis(window),
   )
 }
@@ -657,7 +667,7 @@ const STARVED_PERIOD: Duration = Duration::from_nanos(slates_server::daemon::HEA
 /// this Mac under 144 spinners (16-18 ms of CPU across about 1.15 s of wall time from its first instruction to its
 /// profile read, 2026-11-07).
 const STARVED_RUNS_ONE_IN: u32 = 64;
-/// Format: the anchor's kill of a start (`crates/cli/src/anchor.rs`): "the starting daemon made no progress …" or "…
+/// Format: the anchor's kill of a start (`crates/api/src/role/anchor.rs`): "the starting daemon made no progress …" or "…
 /// ran … ms of CPU without beating …". Until 2026-11-07 it read "the daemon never beat inside the recovery budget";
 /// the test also holds the starved successor to be the one that answers, so a kill under any wording fails it.
 const START_KILL_LINE: &str = "slates anchor: the starting daemon";
@@ -758,12 +768,30 @@ fn a_stuck_start_is_killed_and_restarted() {
   drop(anchor);
   assert_ne!(answered, stuck);
   assert!(!stuck_alive, "the stuck start was killed");
-  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-  let still_for = kill_line
+  // The stillness and the window the line names (A-461: the anchor's window, the liveness budget or, where its own waits
+  // ran later, longer): "made no progress for F ms (its W ms window)".
+  let named: Vec<u64> = kill_line
     .split_once(STUCK_WORDS)
-    .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-    .and_then(|ms| ms.parse().ok())
-    .map(Duration::from_millis);
+    .map(|(_, rest)| {
+      rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .take(2)
+        .filter_map(|word| word.parse().ok())
+        .collect()
+    })
+    .unwrap_or_default();
+  let (still_for, window) = match named[..] {
+    [still, window] => (
+      Some(Duration::from_millis(still)),
+      Duration::from_millis(window),
+    ),
+    _ => (None, Duration::ZERO),
+  };
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the start was judged by the anchor's window, never under the liveness budget: {kill_line:?}"
+  );
   assert!(
     still_for.is_some_and(|still| still >= window && still < window * 2),
     "killed as a start within a window of its last progress: {kill_line:?}"
@@ -791,9 +819,13 @@ fn start_cpu_ns(instance: &str, shards: usize) -> u64 {
 /// A-228, §2.6 boot step 1: a start is judged by the watchdog's rule, one thread at a time, never by the sum of its threads.
 /// Do: measure what one shard adds to a start's CPU (a start of as many shards as the machine runs at once, less a start of
 /// one, over the shards between), then start an anchor with enough shards that their starts sum past three liveness
-/// windows. Expect: the daemon serves, and the anchor killed no start. On main 92dcd16c the anchor read the process's
-/// summed CPU, held it to one window, and killed every start of 48 shards on an 18-CPU Mac and of 23 on a 32-CPU Studio,
-/// though no thread came near a window.
+/// windows, or with the most one process runs where that is fewer (`slates_rt::registry::MAX_SHARDS`). Expect: the daemon
+/// serves, and the anchor killed no start. On main 92dcd16c the anchor read the process's summed CPU, held it to one
+/// window, and killed every start of 48 shards on an 18-CPU Mac and of 23 on a 32-CPU Studio, though no thread came near
+/// a window. On CI's 4-CPU runners a shard's start was cheap enough that three windows asked 1,417 and 1,574 shards
+/// (runs 44298844583 and 44310013691), past the registry: the daemon could never register them, and the anchor
+/// restarted it for good. The count is bounded by the registry now, and a start of the most shards whose sum does not
+/// pass one window is skipped, loudly, as a machine the premise cannot be met on.
 #[cfg(unix)]
 #[test]
 fn a_start_whose_shards_sum_past_a_window_comes_up() {
@@ -814,10 +846,21 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
     per_shard > 0,
     "a shard costs its start something: {one} ns, {many} ns"
   );
-  let shards = usize::try_from((3 * window).div_ceil(per_shard)).unwrap();
+  let past_three = usize::try_from((3 * window).div_ceil(per_shard)).unwrap();
+  let most = slates_rt::registry::MAX_SHARDS;
+  let shards = past_three.min(most);
+  let summed_ns = u64::try_from(shards).unwrap().saturating_mul(per_shard);
   eprintln!(
-    "a start of 1 shard ran {one} ns, of {at_once} {many} ns: {per_shard} ns a shard, so {shards} shards sum past three windows"
+    "a start of 1 shard ran {one} ns, of {at_once} {many} ns: {per_shard} ns a shard, so {past_three} shards sum past \
+     three windows; one process runs at most {most}, and {shards} sum {summed_ns} ns against a window of {window} ns"
   );
+  if summed_ns <= window {
+    eprintln!(
+      "skipping the many-shard start: the most shards one process runs ({most}) sum {summed_ns} ns on this machine, \
+       not past one window ({window} ns)"
+    );
+    return;
+  }
   let instance = format!("cli-sum-{}", std::process::id());
   let (anchor, mut stderr) = spawn_anchor_from(
     env!("CARGO_BIN_EXE_slates"),
@@ -836,8 +879,12 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
     if read == 0 || line.contains(CRASH_LOOP_LINE) || line.contains(&serving_line) {
       break;
     }
+    // The test's bound is the anchor's own verdict: it expects no start killed, so the first kill ends the watch and fails
+    // it with the anchor's line. Before 2026-11-11 the watch read on, and with no back-off for starts that each fail past
+    // the window it read for good: B10's Linux gate restarted the start every second for 27 minutes.
     if line.contains(START_KILL_LINE) {
       kills.push(line.trim_end().to_owned());
+      break;
     }
   }
   let served = line.contains(&serving_line);
@@ -848,7 +895,7 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
   );
 }
 
-/// Format: the anchor's restart line names the daemon it started after this (`crates/cli/src/anchor.rs`).
+/// Format: the anchor's restart line names the daemon it started after this (`crates/api/src/role/anchor.rs`).
 const RESTARTED_AS: &str = "restarted as pid ";
 
 /// The pid the anchor's next restart line names, from its forwarded lines, within [`START_CEILING`].
@@ -868,7 +915,7 @@ fn restarted_pid(lines: &std::sync::mpsc::Receiver<String>) -> u32 {
   }
 }
 
-/// Format: the anchor's words for a start that made no progress (`crates/cli/src/anchor.rs`, `start_stuck`), before
+/// Format: the anchor's words for a start that made no progress (`crates/api/src/role/anchor.rs`, `start_stuck`), before
 /// the milliseconds.
 const STUCK_WORDS: &str = "made no progress for ";
 
@@ -1294,6 +1341,55 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   drop(anchor);
 }
 
+/// Shape: the volumes the paged-listing test creates through the CLI: about five listing pages' worth, at about 50 bytes
+/// a summary (`paged-NNNNN`, its id and counters) in a 4,096-byte reply chunk; past the 100 that one reply held.
+const PAGED_VOLUMES: usize = 400;
+
+/// §4.4 `list`, by use. Do: on a real anchor (two shards) create [`PAGED_VOLUMES`] volumes with `slates volume
+/// create`, then run `slates volume list` and `slates volume list --json`. Expect: both exit 0 and hold every volume
+/// exactly once. Before 2026-11-08 both were refused "reply too large for the bulk area" at 100 volumes (2,000 tried by
+/// hand: refused at every count from 100).
+#[test]
+fn volume_list_answers_a_listing_longer_than_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the paged volume listing: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
+    );
+    return;
+  }
+  let instance = format!("cli-paged-list-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let mut ids = Vec::new();
+  for n in 0..PAGED_VOLUMES {
+    let name = format!("paged-{n:05}");
+    let (code, out, err) = run(&instance, &["volume", "create", &name, "--bounded", "1MiB"]);
+    assert_eq!(code, 0, "create {name}: {err}");
+    ids.push(value_of(&out, "id"));
+  }
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "volume list: {err}");
+  for id in &ids {
+    assert_eq!(
+      out
+        .lines()
+        .filter(|line| line.starts_with(id.as_str()))
+        .count(),
+      1,
+      "volume {id} listed once"
+    );
+  }
+  let (code, out, err) = run(&instance, &["volume", "list", "--json"]);
+  assert_eq!(code, 0, "volume list --json: {err}");
+  for id in &ids {
+    assert_eq!(
+      out.matches(&format!("\"id\":\"{id}\"")).count(),
+      1,
+      "volume {id} in the JSON once"
+    );
+  }
+  drop(anchor);
+}
+
 #[test]
 fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor() {
   // This spawns a real anchor and daemon (subprocesses with spinning shards) and a `slates`
@@ -1435,9 +1531,9 @@ fn the_macos_mount_is_nosuid_and_nodev(path: &str) {
   }
 }
 
-/// Shape: how long a forged `UMNT` is watched for effect: three times the daemon's one-liveness-budget
-/// confirmation deadline (`crates/server/src/nfs.rs`, `UNMOUNT_CONFIRM_NS`), so a loaded box's delay
-/// cannot hide an ended attachment.
+/// Shape: how long a forged `UMNT` is watched for effect: three times the longest a `UMNT` ever led the daemon to wait
+/// (one liveness window, the first bound of the timed confirmation A-511 removed), so a regression that brings a
+/// `UMNT`'s effect back cannot hide behind a loaded box's delay.
 #[cfg(target_os = "macos")]
 const FORGED_UNMOUNT_WATCH: Duration = Duration::from_secs(3);
 
@@ -1490,9 +1586,9 @@ fn an_export_names_the_port_the_kernel_mount_uses(instance: &str, id: &str, path
   assert_eq!(code, 0, "detach: {err}");
 }
 
-/// §4.6 A-34: a `UMNT` proves nothing by itself, since any local process can send one. Do send the
-/// daemon a forged `UMNT /<name>` while the volume is mounted, as another user could; expect the mount's
-/// attachment to survive past the daemon's confirmation deadline, and the mount to keep serving.
+/// §4.6 A-34, A-511: a `UMNT` proves nothing by itself, since any local process can send one, so it ends nothing; only
+/// the kernel's own unmount event does. Do send the daemon a forged `UMNT /<name>` while the volume is mounted, as
+/// another user could; expect the mount's attachment to survive the whole watch, and the mount to keep serving.
 #[cfg(target_os = "macos")]
 fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &str) {
   use slates_bridge_nfs::client::{Credentials, exchange, umnt_call};
@@ -1502,13 +1598,9 @@ fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &st
     gid: 0,
     gids: Vec::new(),
   };
-  exchange(
-    port,
-    &umnt_call(1, &caller, &format!("/{name}")),
-    Duration::from_secs(5),
-  )
-  .expect("the daemon answers the forged UMNT");
-  // Watched past the daemon's confirmation deadline (one liveness budget), with room for a loaded box:
+  exchange(port, &umnt_call(1, &caller, &format!("/{name}")))
+    .expect("the daemon answers the forged UMNT");
+  // Watched past the longest a `UMNT` ever led the daemon to wait (one liveness budget), with room for a loaded box:
   // the attachment must hold the whole time.
   let watch_until = Instant::now() + FORGED_UNMOUNT_WATCH;
   while Instant::now() < watch_until {
@@ -1690,11 +1782,11 @@ fn unmount_and_check(instance: &str, id: &str, path: &str) {
     !is_mounted(path),
     "the kernel mount table no longer lists it"
   );
-  // The kernel's own `UMNT` ended the mount's attachment (AUD-01): the volume reports none, and no
-  // bound mount point remains.
+  // The kernel's unmount ended the mount's attachment (AUD-01), seen through the kernel's own event on macOS (A-511)
+  // and the FUSE device's close on Linux: the volume reports none, and no bound mount point remains.
   assert!(
     wait_for(|| attachments_of(instance, id) == "0"),
-    "the kernel's UMNT ended the mount's attachment: {}",
+    "the kernel's unmount ended the mount's attachment: {}",
     attachments_of(instance, id)
   );
   let (code, out, err) = run(instance, &["status", id]);
@@ -2899,7 +2991,7 @@ fn mint_identity(dir: &str, node: &str) {
   std::fs::write(format!("{dir}/{node}.key.der"), key.serialize_der()).unwrap();
 }
 
-/// The shared manifest (the documented shape, `crates/cli/src/fleet.rs`): every node with its loopback
+/// The shared manifest (the documented shape, `crates/api/src/role/fleet.rs`): every node with its loopback
 /// base port and its DER files, written into `dir`; returns its path.
 #[allow(clippy::disallowed_methods)]
 fn write_manifest(dir: &str, bases: &[u16]) -> String {
@@ -3439,34 +3531,13 @@ fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
   }
 }
 
-/// Format: the client's words when a live daemon has not answered inside its reply deadline (`ClientError::Stalled`,
-/// `crates/client/src/error.rs`).
-const STALLED_WORDS: &str = "no reply within";
-
-/// Bootstraps the consensus group, waiting out a reply that stalls while the daemon progresses ([`StartProgress`]). At 8
-/// spinners a CPU (2026-11-07) `bootstrap root` was refused "no reply within 1000000000 ns" in five of fifteen runs: the
-/// client's reply deadline is a wall second against a daemon that was alive and starved (the client's deadlines are
-/// clients' A-232). A stalled bootstrap may still land, so after a stall the group being already initialized is the
-/// bootstrap done; any other refusal fails the test.
-fn bootstrap_through_stalls(instance: &str, progress: &mut StartProgress) {
-  let mut stalled = false;
-  loop {
-    let (code, _, error) = run(instance, &["bootstrap", "root"]);
-    if code == 0 {
-      return;
-    }
-    let squashed = error.to_ascii_lowercase().replace('_', "");
-    if stalled && squashed.contains("consensusalreadyinitialized") {
-      return;
-    }
-    assert!(
-      error.contains(STALLED_WORDS),
-      "explicit first-time bootstrap: {error}"
-    );
-    stalled = true;
-    progress.check(instance, "the bootstrap's reply");
-    pause();
-  }
+/// Bootstraps the consensus group once; the bootstrap must succeed. The client waits for the reply while the daemon
+/// lives (A-232), so a live daemon starved past its reply deadline answers late, never refused. Until 2026-11-13 the
+/// client failed that late reply `Stalled` ("no reply within 1000000000 ns", five of fifteen runs at 8 spinners a CPU,
+/// 2026-11-07) and this asked again, taking `ConsensusAlreadyInitialized` after a stall as the bootstrap done.
+fn bootstrap_once(instance: &str) {
+  let (code, _, error) = run(instance, &["bootstrap", "root"]);
+  assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
 }
 
 /// Derived: the longest any wait for a daemon runs, however it progresses: the start wait at the slowest share of a
@@ -3719,6 +3790,9 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.accept.replaced",
     "fleet.fan.sent",
     "fleet.fan.unchanged",
+    // The beat's fan of the failover delay to a shard whose last received delay it no longer was (A-574,
+    // `fleet::FAILOVER_FAN_SENT`), the configuration fan's former part; its refusals still fail here.
+    "fleet.failover_fan.sent",
     // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
     // discovery pages sent, the learner's configuration fetches and those its backoff skipped, and the
     // announcement pass's lent sessions and sends.
@@ -3730,8 +3804,8 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.learner.no_session",
     "fleet.plane.announce_lends",
     "fleet.plane.announcements_sent",
-    // The reap tick's events, named by the constants the daemon counts them under, so one added there is not missed
-    // here: the idle purge's freed bytes, what a shard was doing at each tick (A-214: sealing, deferred, busy, idle),
+    // The idle sweep's events (`slates_server::idle_sweep`, A-715), named by the constants the daemon counts them under, so one added there is not missed
+    // here: the idle purge's freed bytes, what a shard was doing at each pass (A-214: sealing, deferred, busy, idle),
     // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
     // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
     // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
@@ -3747,17 +3821,39 @@ fn formation_counter_allowed(line: &str) -> bool {
     // superseded link work — exactly what this assertion permits — and it is counted during formation
     // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
     "fleet.link.invalid.member_changed",
+    // Events and readings of formation's normal work that the counter map has carried since 2026-11-17, which the
+    // three-process flows met the first time CI's ubuntu lane reached this step again (run 44298844583, 2026-11-18;
+    // every earlier run had stopped at a red `Test` step): the serve sockets' sessions opened and their pool's
+    // high-water mark (`fleet::SERVE_OPENED`, `SERVE_HIGH_WATER`), the record links' dials, readings at the report
+    // and the calls made (`fleet::DIAL_RECORD_*`, 96eda8992), the period's seal and mirror walks and their turns
+    // (`fleet::SEAL_WALKS`, `MIRROR_WALKS` and their slices, 8636d8510), and the record period's live work and a
+    // returned holder's walk in turns (`live_ship::LIVE_PERIODS`, `LIVE_PERIOD_SLICES`, bdd767167;
+    // `LIVE_REACHED_SLICES`, A-324). The serve sockets' refusals (`fleet.serve.setup_refused`,
+    // `peer_sessions_refused`, `peers_refused`) are not among them, and still fail here.
+    "fleet.serve.opened",
+    "fleet.serve.high_water",
+    "fleet.dial.record.dialing",
+    "fleet.dial.record.longest_call_ms",
+    "fleet.dial.record.longest_enroll_ms",
+    "fleet.dial.record.calls",
+    "fleet.seal.walks",
+    "fleet.seal.walk_slices",
+    "fleet.mirror.walks",
+    "fleet.mirror.walk_slices",
+    "fleet.live.periods",
+    "fleet.live.period_slices",
+    "fleet.live.reached_slices",
   ]
   .contains(&counter)
 }
 
-/// The formation check ([`formation_counter_allowed`]) knows every reap-tick event the daemon counts: do judge a refusal
-/// line for each counter `slates_server::daemon` exports for its reap ticks, as status prints it. Expect each allowed.
+/// The formation check ([`formation_counter_allowed`]) knows every idle-sweep event the daemon counts: do judge a refusal
+/// line for each counter `slates_server::daemon` exports for its idle sweep, as status prints it. Expect each allowed.
 /// Found on diag-slabs-40 (run 42506866309, Linux) and bug-sweep-27 (run 42515180074, arm64): forming three processes,
 /// one counted `content.give_back.left_for_next_tick` (c2d87528, A-226's give-back making way for other tasks), which
 /// the check did not know, so it failed "only superseded link work may end during formation" with nothing refused.
 #[test]
-fn the_formation_check_allows_every_reap_tick_event() {
+fn the_formation_check_allows_every_idle_sweep_event() {
   use slates_server::daemon::{
     CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
     TICKS_SEALING,
@@ -4015,10 +4111,11 @@ fn wait_successor(instances: &[String], id: &str) -> String {
   }
 }
 
-/// A-222 and §4.8: a kernel mount of a volume asked of a node that does not own it is refused by its kind
-/// (`AttachmentUnsupported { NfsLoopback, OwnedByAnotherHost }`), never served from a copy that node holds: the mount
-/// would hand the client something of this host's for another host's volume. Where `mount_nfs` exists; elsewhere it
-/// skips loudly.
+/// A-222 and §4.8: a kernel mount of a volume asked of a node that does not own it is refused by its kind (the wire's
+/// `AttachmentUnsupported { NfsLoopback, OwnedByAnotherHost }`, which the command renders through the consumer contract
+/// as `not offered here: Attachment { transport: NfsLoopback, reason: OwnedByAnotherHost }`), never served from a copy
+/// that node holds: the mount would hand the client something of this host's for another host's volume. Where
+/// `mount_nfs` exists; elsewhere it skips loudly.
 fn mount_refused_by_kind(instance: &str, id: &str, mountable: bool) {
   if !mountable {
     eprintln!("mount_nfs is not on this host: skipping the bystander's refused mount");
@@ -4029,7 +4126,10 @@ fn mount_refused_by_kind(instance: &str, id: &str, mountable: bool) {
   };
   let (code, _, err) = run(instance, &["mount", id, &mount_point.path]);
   assert!(
-    code != 0 && err.contains("AttachmentUnsupported") && err.contains("OwnedByAnotherHost"),
+    code != 0
+      && err.contains("Attachment {")
+      && err.contains("NfsLoopback")
+      && err.contains("OwnedByAnotherHost"),
     "a node that does not own the volume refuses its mount by kind: exit {code}: {err}"
   );
   assert!(
@@ -7325,7 +7425,7 @@ fn shell(script: &str) -> String {
 }
 
 /// Format: the variable naming the daemon's root mount, where a volume appears as `<root>/<volume>`
-/// (`crates/cli/src/exec.rs`); the launcher has no default and refuses without it.
+/// (`crates/api/src/exec.rs`); the launcher has no default and refuses without it.
 #[cfg(target_os = "linux")]
 const ROOT_ENV: &str = "SLATES_ROOT";
 
@@ -7466,6 +7566,247 @@ fn the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it() {
     );
   }
   assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// Format: the variable a CI step sets to the AppArmor regime it arranged for this binary before the launcher's
+/// AppArmor test: `absent`, no slates profile loaded for it, or `loaded`, its profile loaded by the step as root. Unset,
+/// the test takes the regime the host has; set, a host in another regime fails it, so a profile the step failed to load
+/// or to unload is never passed off as the other case.
+#[cfg(target_os = "linux")]
+const APPARMOR_REGIME_ENV: &str = "SLATES_TEST_APPARMOR_PROFILE";
+
+/// Format: the launcher's refusal on a host whose AppArmor confines unprivileged user namespaces, word for word as it
+/// read before A-370, which it still reads with the option off and no profile loaded.
+#[cfg(target_os = "linux")]
+const CONFINED_REFUSAL: &str = "this host's AppArmor confines unprivileged user namespaces \
+  (kernel.apparmor_restrict_unprivileged_userns=1), so the launcher's namespace has no capability to bind the volume; an \
+  administrator can allow it with an AppArmor profile for the slates binary that grants `userns,`, or set the sysctl \
+  to 0";
+
+/// What one run of the launcher answered: its exit code, standard output and standard error.
+#[cfg(target_os = "linux")]
+struct Launched {
+  code: i32,
+  out: String,
+  err: String,
+}
+
+/// Runs `slates exec` over `root/vol` at `at`, with the AppArmor option on or off, running a command that reports what
+/// it sees, one line each: the volume's marker through the bind, its own AppArmor label, and whether a user namespace it
+/// makes itself gets the capability to mount (`grant-held`) or not (`grant-withheld`).
+#[cfg(target_os = "linux")]
+fn launch_reporting(root: &str, at: &str, apparmor: bool) -> Launched {
+  let script = format!(
+    "cat {at}/marker; echo; cat /proc/self/attr/apparmor/current 2>/dev/null || echo none; \
+     if unshare -Urm true 2>/dev/null; then echo grant-held; else echo grant-withheld; fi"
+  );
+  let mut command = slates();
+  command.args(["exec", "--volume", "vol", "--at", at]);
+  if apparmor {
+    command.arg("--apparmor-profile");
+  }
+  let output = command
+    .args(["--", "sh", "-c", &script])
+    .env(ROOT_ENV, root)
+    .output()
+    .unwrap();
+  Launched {
+    code: output.status.code().unwrap_or(-1),
+    out: String::from_utf8_lossy(&output.stdout).into_owned(),
+    err: String::from_utf8_lossy(&output.stderr).into_owned(),
+  }
+}
+
+/// A-370 (§4.6 "The launcher"; GAPS `8a-launcher-ci`), with no daemon: a plain directory stands in for the root mount.
+/// Do: ask `slates apparmor check --json` what the launcher will meet, then run `slates exec` with and without
+/// `--apparmor-profile`, its command reporting the volume's marker, its own AppArmor label, and whether a user namespace
+/// it makes itself gets the mount capability. Expect, by the host:
+/// - where AppArmor restricts unprivileged user namespaces and slates' profile is loaded for this binary: with the
+///   option, the command reads the volume, runs `unconfined`, and its own namespace is refused the capability, so it
+///   holds nothing the host withholds; without it, a refusal (exit 4) naming the option, the launcher having left the
+///   loaded profile;
+/// - where it restricts them and no profile is loaded: without the option, the refusal word for word as before A-370;
+///   with it, a refusal naming this binary's profile file and the command that loads it;
+/// - elsewhere (no restriction): the command reads the volume either way.
+///
+/// The host sees nothing at the chosen path after any of them. CI runs it on GitHub's Ubuntu runners in both regimes
+/// (`APPARMOR_REGIME_ENV`), loading the profile as root between them.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
+  let check = slates()
+    .args(["apparmor", "check", "--json"])
+    .output()
+    .unwrap();
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout)
+    .unwrap_or_else(|e| panic!("apparmor check --json: {e}: {check:?}"));
+  let readiness = report["readiness"].as_str().unwrap_or_default().to_owned();
+  assert_the_ci_regime(&readiness, &report);
+  let root = build_output_dir("slates-apparmor-root");
+  let at = build_output_dir("slates-apparmor-at");
+  shell(&format!(
+    "mkdir -p {root}/vol && printf through-the-bind > {root}/vol/marker"
+  ));
+  let off = launch_reporting(&root, &at, false);
+  let on = launch_reporting(&root, &at, true);
+  let left = shell(&format!("ls -A {at}"));
+  shell(&format!("rm -rf {root} {at}"));
+  judge_apparmor_launches(&readiness, &report, &off, &on);
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// When CI names this run's AppArmor regime (`APPARMOR_REGIME_ENV`), the check's readiness must be that regime's.
+#[cfg(target_os = "linux")]
+fn assert_the_ci_regime(readiness: &str, report: &serde_json::Value) {
+  match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
+    Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),
+    Ok("absent") => assert_eq!(readiness, "profile-missing", "{report}"),
+    Ok(other) => panic!("{APPARMOR_REGIME_ENV}={other}: expected `loaded` or `absent`"),
+    Err(_) => {}
+  }
+}
+
+/// The launches with the option off and on, judged by the host's readiness: under a loaded profile only the option's
+/// launch runs, unconfined and holding no grant; with the profile missing both are refused, the option's naming how to
+/// load it; on a host that refuses user namespaces outright, a loud skip; elsewhere both read the volume.
+#[cfg(target_os = "linux")]
+fn judge_apparmor_launches(
+  readiness: &str,
+  report: &serde_json::Value,
+  off: &Launched,
+  on: &Launched,
+) {
+  let executable = report["executable"].as_str().unwrap_or_default();
+  match readiness {
+    "profile-loaded" => judge_launches_under_a_loaded_profile(off, on, executable),
+    "profile-missing" => judge_launches_with_the_profile_missing(off, on, report, executable),
+    _ if off.err.contains("cannot create a user+mount namespace") => {
+      eprintln!(
+        "SKIP: this host refuses unprivileged user namespaces outright: {}",
+        off.err
+      );
+    }
+    _ => {
+      for launched in [&off, &on] {
+        assert_eq!(launched.code, 0, "{}", launched.err);
+        assert_eq!(launched.out.lines().next(), Some("through-the-bind"));
+      }
+    }
+  }
+}
+
+/// Under a loaded profile only the option's launch runs, outside the profile and holding no user-namespace grant; the
+/// launch without the option is refused, naming the option and the loaded profile's `executable`.
+#[cfg(target_os = "linux")]
+fn judge_launches_under_a_loaded_profile(off: &Launched, on: &Launched, executable: &str) {
+  assert_eq!(
+    on.code, 0,
+    "the profile's launcher runs the command: {}",
+    on.err
+  );
+  assert_eq!(
+    on.out.lines().collect::<Vec<_>>(),
+    ["through-the-bind", "unconfined", "grant-withheld"],
+    "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
+  );
+  assert_eq!(
+    off.code, 4,
+    "without the option the launcher leaves the profile: {}",
+    off.err
+  );
+  assert!(
+    off.err.contains("--apparmor-profile") && off.err.contains(executable),
+    "the refusal names the option and the loaded profile: {}",
+    off.err
+  );
+}
+
+/// With the profile missing both launches are refused: the one without the option as it read before A-370, the option's
+/// naming this binary's profile file from `report` and how to load it.
+#[cfg(target_os = "linux")]
+fn judge_launches_with_the_profile_missing(
+  off: &Launched,
+  on: &Launched,
+  report: &serde_json::Value,
+  executable: &str,
+) {
+  assert_eq!(off.code, 4, "{}", off.err);
+  assert_eq!(
+    off.err.trim(),
+    format!("slates: {CONFINED_REFUSAL}"),
+    "without the option, the refusal as it read before A-370"
+  );
+  assert_eq!(on.code, 4, "{}", on.err);
+  let file = report["profile_file"].as_str().unwrap_or_default();
+  assert!(
+    !file.is_empty()
+      && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
+      && on.err.contains(executable),
+    "with the option, the refusal names this binary's profile and how to load it: {}",
+    on.err
+  );
+}
+
+/// A-370. Do: print slates' AppArmor profile for an installed path, and for a path it cannot name. Expect: the profile
+/// names the path and grants `userns,` in unconfined mode; a path the profile cannot name exactly is refused (exit 1)
+/// naming why.
+#[test]
+fn apparmor_prints_the_profile_and_checks_the_host() {
+  let printed = slates()
+    .args([
+      "apparmor",
+      "profile",
+      "--executable",
+      "/usr/local/bin/slates",
+    ])
+    .output()
+    .unwrap();
+  assert!(printed.status.success(), "{printed:?}");
+  let text = String::from_utf8_lossy(&printed.stdout);
+  assert!(
+    text.contains("\nprofile /usr/local/bin/slates flags=(unconfined) {\n  userns,\n}"),
+    "{text}"
+  );
+  let refused = slates()
+    .args([
+      "apparmor",
+      "profile",
+      "--executable",
+      "/opt/my tools/slates",
+    ])
+    .output()
+    .unwrap();
+  assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+  assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot name exactly"));
+}
+
+/// A-370. Do: check this host, and print this binary's own profile. Expect: the check reports the binary's path as the
+/// kernel records it, succeeding exactly where `exec` can make its namespace, and the profile names that path; off
+/// Linux the check answers `unsupported`.
+#[test]
+fn apparmor_check_reports_this_binary_and_this_host() {
+  let check = slates()
+    .args(["apparmor", "check", "--json"])
+    .output()
+    .unwrap();
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+  let readiness = report["readiness"].as_str().unwrap_or_default();
+  assert_eq!(
+    check.status.success(),
+    matches!(readiness, "unrestricted" | "profile-loaded"),
+    "{report}"
+  );
+  if cfg!(target_os = "linux") {
+    let own = std::fs::canonicalize(env!("CARGO_BIN_EXE_slates")).unwrap();
+    assert_eq!(report["executable"].as_str(), own.to_str(), "{report}");
+    let mine = slates().args(["apparmor", "profile"]).output().unwrap();
+    assert!(
+      String::from_utf8_lossy(&mine.stdout).contains(&format!("profile {} flags", own.display())),
+      "{mine:?}"
+    );
+  } else {
+    assert_eq!(readiness, "unsupported", "{report}");
+  }
 }
 
 /// AUD-29-76 (`slates mount --subtree`). Do: through the real binary against a real anchor-supervised daemon,
@@ -12012,8 +12353,11 @@ const GARBLED_HOLD_MESSAGES: usize = 20;
 const UNKNOWN_HOLD_KIND: u8 = 0xff;
 /// Format: the daemon status line carrying the anchor's hold refusals (A-213).
 const HOLD_REFUSALS_LINE: &str = "anchor_hold_refusals: ";
+/// Shape: the bounds the garbling daemon reads its handoff table against, each: past what the anchor holds for this test's
+/// one instance, which holds nothing at the garbler's start, so only the table's frame is read.
+const HANDED_BOUND: usize = 1 << 16;
 /// Shape: the quick profile's probe budget (milliseconds), as `slates anchor --quick` measures it
-/// (`crates/cli/src/daemon.rs`, `QUICK_PROBE_MS`).
+/// (`crates/api/src/role/daemon.rs`, `QUICK_PROBE_MS`).
 const QUICK_PROBE_MS: u64 = 5;
 
 /// The garbling daemon: spawned by a real supervisor ([`a_real_anchors_hold_refusals_show_in_slates_status`]), it sends
@@ -12028,11 +12372,23 @@ fn garbling_daemon() {
   let Ok(instance) = std::env::var(GARBLING_DAEMON_INSTANCE) else {
     return;
   };
-  let handed =
-    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
-  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
-  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment. It is
-  // borrowed, never owned, so it stays open across the exec below for the real daemon to adopt.
+  let pointer =
+    std::env::var(slates_anchor::held::ENV_HELD).expect("the anchor handed its table over");
+  let bounds = slates_anchor::held::TableBounds {
+    devices: HANDED_BOUND,
+    connections: HANDED_BOUND,
+    copies: HANDED_BOUND,
+  };
+  let (table, len) = slates_anchor::held::parse_pointer(&pointer, bounds).unwrap();
+  // SAFETY: the anchor made the table's object inheritable and named its number in the environment (A-462). It is
+  // borrowed, never owned: a copy is read here, and the object stays open across the exec below for the real daemon.
+  let object = unsafe { BorrowedFd::borrow_raw(table) };
+  let text = slates_anchor::held::read_table(object.try_clone_to_owned().unwrap(), len).unwrap();
+  let inherited =
+    slates_anchor::held::parse_devices(&slates_anchor::held::decode_table(&text).unwrap().devices)
+      .unwrap();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in its table. It is borrowed,
+  // never owned, so it stays open across the exec below for the real daemon to adopt.
   let channel = unsafe { BorrowedFd::borrow_raw(inherited.channel) };
   let short = vec![0u8; slates_anchor::held::MESSAGE_BYTES / 2];
   let mut unknown = vec![0u8; slates_anchor::held::MESSAGE_BYTES];
@@ -12103,10 +12459,7 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
     .publish(RegionKind::Profile, profile.to_json().unwrap().as_bytes())
     .unwrap();
   let args = ["--ignored", "--exact", "garbling_daemon", "--nocapture"].map(str::to_owned);
-  let policy = RestartPolicy::derive(
-    slates_db::replay::RECOVERY_BUDGET_NS,
-    slates_db::replay::RECOVERY_BUDGET_NS,
-  );
+  let policy = RestartPolicy::derive(config.nfs_v4.lease_ns);
   let mut anchor = SupervisingTest(Supervisor::new(segment, &args, policy.get()).unwrap());
   anchor
     .0
@@ -12822,6 +13175,167 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
 }
 
+/// A path under `root` exactly `bytes` long: components of at most 200 bytes, under the 255-byte name limit, so only
+/// the whole path's length is at stake.
+#[cfg(unix)]
+fn path_of_length(root: &str, bytes: usize) -> String {
+  let mut path = root.to_owned();
+  while path.len() < bytes {
+    let room = bytes - path.len() - 1;
+    path.push('/');
+    path.push_str(&"d".repeat(room.clamp(1, 200)));
+  }
+  assert_eq!(
+    path.len(),
+    bytes,
+    "a path of exactly {bytes} bytes under {root}"
+  );
+  path
+}
+
+/// §4.8, §4.4 `create` and `status` (A-263 on B9: the supervisor's bound on a recorded cause). A recovery cause names an
+/// overlay's base as recorded, so the base a volume records is bounded: the platform's path maximum, and no longer than
+/// the refusal every verb on an unrecovered volume answers holds whole (`slates_server::verbs::longest_recordable_base`).
+/// Do: create an overlay over a base of exactly that length, and try one a byte longer; snapshot the first, make its base
+/// unreadable to the daemon, and restart it in order. Expect: the longer base is refused `BaseUnavailable` before
+/// anything is made; the volume's `status` is refused `NotRecovered` naming `BaseUnavailable`, the whole base path and
+/// the host's refusal.
+#[cfg(unix)]
+#[test]
+fn the_longest_recorded_base_is_named_whole_by_status() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the longest recorded base: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-longbase-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-longbase"),
+  };
+  let longest = slates_server::verbs::longest_recordable_base();
+  let base = path_of_length(&scratch.path, longest);
+  shell(&format!("mkdir -p '{base}'"));
+  // Never made: it is refused before the daemon looks at the disk (on macOS no such directory can be made at all).
+  let longer = path_of_length(&scratch.path, longest + 1);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "too-long",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &longer,
+    ],
+  );
+  assert_ne!(code, 0, "a base past the bound is refused: {out}");
+  assert!(err.contains("BaseUnavailable"), "refused by kind: {err}");
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "longest",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "a base of {longest} bytes is recorded: {err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("chmod 000 '{base}'"));
+  restart_in_order(&instance);
+  let (code, out, err) = run(&instance, &["status", &id]);
+  shell(&format!("chmod 755 '{base}'"));
+  assert_ne!(code, 0, "the volume was not rebuilt: {out}");
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseUnavailable") && err.contains(&base),
+    "status names the {longest}-byte base whole, by kind: {err}"
+  );
+}
+
+/// Shape: the base files the drift test changes on disk after pinning: several replies' worth of drift.
+#[cfg(unix)]
+const CLI_DRIFTED: usize = 600;
+
+/// §4.4 `status`, A-267, by use. Do: overlay a host directory of 600 files, pin them, change every file on disk, and
+/// run `slates status ID --drift` until the drift is seen. Expect: it names all 600, once each, though the status reply
+/// carries only the first that fit; and `slates status ID` counts 600. Before, `--drift` printed the status's own list,
+/// and the text form counted only those.
+#[cfg(unix)]
+#[test]
+fn status_drift_names_every_drifted_entry_past_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping status --drift past one reply: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-drift-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-drift"),
+  };
+  let base = format!("{}/base", scratch.path);
+  shell(&format!(
+    "mkdir -p '{base}' && cd '{base}' && for n in $(seq -w 0 {}); do echo before > drifting-$n.txt; done",
+    CLI_DRIFTED - 1
+  ));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "drifting",
+      "--bounded",
+      "64MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["base", "pin", &id]);
+  assert_eq!(code, 0, "{err}");
+  shell(&format!(
+    "cd '{base}' && for f in drifting-*.txt; do echo 'after, and longer' > \"$f\"; done"
+  ));
+  let started = std::time::Instant::now();
+  let named = loop {
+    let (code, out, err) = run(&instance, &["status", &id, "--drift"]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+    if lines.len() >= CLI_DRIFTED || started.elapsed() > std::time::Duration::from_secs(30) {
+      break lines;
+    }
+    // A test waiting on the base's watcher between asks; the daemon is another process.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_millis(200));
+  };
+  assert_eq!(
+    named.len(),
+    CLI_DRIFTED,
+    "every drifted entry, once: {} named",
+    named.len()
+  );
+  let distinct: std::collections::BTreeSet<&String> = named.iter().collect();
+  assert_eq!(distinct.len(), CLI_DRIFTED, "each once");
+  let (code, out, err) = run(&instance, &["status", &id]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out
+      .lines()
+      .any(|line| line == format!("drifted: {CLI_DRIFTED}")),
+    "the status counts every drifted entry: {out}"
+  );
+}
+
 /// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
 /// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
 /// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon
@@ -12872,5 +13386,1458 @@ fn assert_gone(instance: &str, id: &str) {
   assert!(
     err.contains("NotFound"),
     "the destroyed volume is not found: {err}"
+  );
+}
+
+/// Shape: how long the hold flow leaves its held attachment with no verb: several of the bare term a laptop daemon gives a
+/// CLI attachment nothing renews (its failover delay there, the recovery budget, A-363 and A-384), so only the hold kept
+/// it, and long enough after the hold's end for any term to lapse.
+const HOLD_IDLE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A-384, the CLI's holder: `slates attach --hold` keeps a CLI attachment alive from its process, and its end lets the
+/// attachment lapse. Do: on an anchored daemon, create a volume; run `attach ID --write --hold` in the background and
+/// read the attachment it names; leave the attachment with no verb for [`HOLD_IDLE`]; write a file under it from another
+/// `slates` process; kill the holding process; wait [`HOLD_IDLE`] again; write under it once more. Expect the holding
+/// process still running before its kill, the first write accepted (the hold kept the attachment through several bare
+/// terms), and the last refused `AttachmentExpired` (exit 1: the process's end ended the renewals). Gated like the CLI
+/// flow (`SLATES_TEST_CLI=1`): an anchor, its daemon and a process per verb.
+#[test]
+fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
+  use std::io::BufRead;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the attach --hold flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-hold-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "held", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mut holder = slates()
+    .arg("--instance")
+    .arg(&instance)
+    .args(["attach", &id, "--write", "--hold"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  let named = {
+    let stdout = holder.stdout.take().expect("the holder's output");
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    lines.find_map(|line| {
+      line
+        .ok()
+        .and_then(|line| line.strip_prefix("attachment: ").map(str::to_owned))
+    })
+  };
+  let Some(attachment) = named else {
+    // The holder ended without naming one: what it said is the reason.
+    let output = holder.wait_with_output().unwrap();
+    panic!(
+      "the holder named no attachment: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+  };
+  #[allow(clippy::disallowed_methods)] // the held attachment with no verb, past several bare terms
+  std::thread::sleep(HOLD_IDLE);
+  let still_holding = holder.try_wait().unwrap().is_none();
+  let (written, _, written_err) =
+    run_with_stdin(&instance, &["write", &id, &attachment, "held.txt"], b"held");
+  let _killed = holder.kill();
+  let _reaped = holder.wait();
+  #[allow(clippy::disallowed_methods)] // the hold ended: any term lapses
+  std::thread::sleep(HOLD_IDLE);
+  let (late, _, late_err) =
+    run_with_stdin(&instance, &["write", &id, &attachment, "late.txt"], b"late");
+  drop(anchor);
+  assert!(
+    still_holding,
+    "the holding process was still running before its kill"
+  );
+  assert_eq!(
+    written, 0,
+    "the hold kept the attachment through several bare terms: {written_err}"
+  );
+  assert_eq!(
+    late, 1,
+    "the attachment lapsed once its holder ended: {late_err}"
+  );
+  assert!(late_err.contains("AttachmentExpired"), "{late_err}");
+}
+
+/// Format: the start of the daemon's line naming where its version-control HTTP edge serves cleartext
+/// (`crates/api/src/role/daemon.rs`), here on the loopback address the test asks for; the port follows.
+const VCS_HTTP_CLEARTEXT_LINE: &str =
+  "slates daemon: the version-control HTTP edge serves cleartext on 127.0.0.1:";
+
+/// A-625 part 3 (§4.17.2 "Transports" item 1), A-629 part 2c and A-686. Do: start an anchor whose daemon is asked for
+/// the version-control HTTP edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the
+/// daemon names; ask that port for a repository's refs with no credentials, then for its Git LFS locks. Expect: the
+/// daemon names the edge's port before it says it serves, and the edge answers each `401` with Basic's challenge first
+/// and Bearer's after it (main's ruling, 2026-11-19: Basic's password is taken on the loopback edge as over TLS, and
+/// stock Mercurial reads the first challenge alone), the LFS request's in `LFS-Authenticate` too: the flag went from the
+/// anchor to its daemon, which started the shared edge, and git's site routes Git LFS through its authentication.
+#[test]
+fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
+  use std::io::{BufRead, Write};
+  let instance = format!("cli-vcs-http-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-http",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let mut port = None;
+  let mut line = String::new();
+  loop {
+    line.clear();
+    let read = stderr.read_line(&mut line).unwrap();
+    assert!(
+      read > 0,
+      "the anchor ended before its daemon served (its lines are above)"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
+      port = rest.trim().parse::<u16>().ok();
+    }
+    if line.starts_with(&serving_line) {
+      break;
+    }
+  }
+  anchor.drain = Some(echo_the_rest(stderr));
+  let port = port.expect("the daemon named its edge's port before it served");
+  let refs = bare_request(port, WAIT_FOR).expect("the edge answered");
+  assert!(basic_then_bearer(&refs, "www-authenticate"), "{refs}");
+  let locks = answer_head(port, LFS_LOCKS_REQUEST, WAIT_FOR).expect("the edge answered LFS");
+  assert!(basic_then_bearer(&locks, "lfs-authenticate"), "{locks}");
+}
+
+/// Shape: a Git LFS locks listing of `r.git` with no credentials, as git-lfs asks it (A-629 part 2c).
+const LFS_LOCKS_REQUEST: &str = "GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n";
+
+/// Whether `head`, in lower case, is a `401` whose `field` offers Basic's challenge first and Bearer's after it (A-686).
+fn basic_then_bearer(head: &str, field: &str) -> bool {
+  let basic = head.find(&format!("{field}: basic realm="));
+  let bearer = head.find(&format!("{field}: bearer realm="));
+  head.starts_with("http/1.1 401 ")
+    && matches!((basic, bearer), (Some(basic), Some(bearer)) if basic < bearer)
+}
+
+/// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
+/// each read: the answer's head, lowercased, or why there was none (a refused connection among them).
+fn bare_request(port: u16, patience: Duration) -> std::io::Result<String> {
+  answer_head(
+    port,
+    "GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    patience,
+  )
+}
+
+/// Asks the version-control edge at loopback `port` for `target` with `token` as a bearer token, waiting [`WAIT_FOR`]
+/// for each read: the answer's head, lowercased, or why there was none.
+fn bearer_request(port: u16, target: &str, token: &str) -> std::io::Result<String> {
+  answer_head(
+    port,
+    &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"),
+    WAIT_FOR,
+  )
+}
+
+/// Sends `request` to the version-control edge at loopback `port`, waiting `patience` for each read: the answer's head,
+/// lowercased, or why there was none (a refused connection among them).
+fn answer_head(port: u16, request: &str, patience: Duration) -> std::io::Result<String> {
+  use std::io::{Read, Write};
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  stream.write_all(request.as_bytes())?;
+  let mut head = Vec::new();
+  let mut chunk = [0u8; 1024];
+  while !head.windows(4).any(|end| end == b"\r\n\r\n") {
+    let read = stream.read(&mut chunk)?;
+    if read == 0 {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!(
+          "the edge closed before its head ended: {}",
+          String::from_utf8_lossy(&head)
+        ),
+      ));
+    }
+    head.extend_from_slice(chunk.get(..read).unwrap_or_default());
+  }
+  Ok(String::from_utf8_lossy(&head).to_ascii_lowercase())
+}
+
+/// The port the next daemon of an anchor names for a version-control edge on the line that starts `port_line`, from
+/// the anchor's forwarded `lines`, read until that daemon says it serves (`serving_line`); none if it named none first.
+fn edge_port_before_serving(
+  lines: &std::sync::mpsc::Receiver<String>,
+  port_line: &str,
+  serving_line: &str,
+) -> Option<u16> {
+  let mut port = None;
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the daemon served within the start's ceiling");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    if let Some(rest) = line.strip_prefix(port_line) {
+      port = rest.trim().parse::<u16>().ok();
+    }
+    if line.starts_with(serving_line) {
+      return port;
+    }
+  }
+}
+
+/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: start an anchor with the version-control HTTP edge on loopback
+/// (`--vcs-http 127.0.0.1:0`); read the port its daemon names and ask it for a repository's refs; kill the daemon; once
+/// the anchor says it restarted it, ask the same port again, before its successor serves; read the port the successor
+/// names. Expect: the request made while the daemon was gone is taken and answered `401` by the successor, and the
+/// successor names the same port: the anchor holds the edge's listener, so a restart never drops its port.
+#[test]
+fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
+  let instance = format!("cli-vcs-http-held-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-http",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let port = edge_port_before_serving(&lines, VCS_HTTP_CLEARTEXT_LINE, &serving_line)
+    .expect("the daemon named its edge's port before it served");
+  let first = bare_request(port, WAIT_FOR).expect("the edge answered");
+  assert!(first.starts_with("http/1.1 401 "), "{first}");
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
+  let mut successor = None;
+  let mut while_restarting = None;
+  let mut again = None;
+  let mut served = false;
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served again: {line}"
+    );
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(bare_request(port, START_CEILING));
+    }
+    if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
+      again = rest.trim().parse::<u16>().ok();
+    }
+    served |= line.starts_with(&serving_line);
+  }
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let head = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the edge's port was dropped while its daemon restarted: {error}")
+    });
+  assert!(head.starts_with("http/1.1 401 "), "{head}");
+  assert_eq!(
+    again,
+    Some(port),
+    "the restarted daemon serves the edge on the port its anchor holds"
+  );
+}
+
+/// Shape: the variable naming the command that runs stock Mercurial 7.2, its words split at spaces: on the Mac Studio
+/// `uvx --quiet --python 3.12 --from mercurial==7.2 hg`, as `crates/hg/fixtures/make-fixtures.sh` runs it. Unset, `hg`
+/// on the path.
+const STOCK_HG: &str = "SLATES_TEST_HG";
+
+/// Format: the start of the daemon's line naming its SSH edge's address, in the words of the HTTP edge's line (main's
+/// ruling, 2026-11-19); the port follows, and the line names the host key's SHA256 fingerprint too, so [`port_on`]
+/// reads the port's digits alone. The daemon role writes it when started with `--vcs-ssh <addr>` (A-684,
+/// `crates/api/src/role/daemon.rs`): the port, then [`VCS_SSH_KEY_WORDS`] and the key's fingerprint.
+const VCS_SSH_LINE: &str = "slates daemon: the version-control SSH edge serves on 127.0.0.1:";
+
+/// Format: the user name stock hg gives, over SSH and as Basic's user name. It proves nothing: the key the test
+/// enrolled proves the principal over SSH, and the token, Basic's password, over HTTP.
+const HG_USER: &str = "slates";
+
+/// Format: why a test that mints a credential skips where the anchor names no issuer surface through the environment
+/// ([`PRINTS_ISSUER_SURFACE`]): the issuer's verbs (`credential token|key`) prove the human's authority with it.
+const NO_ISSUER_SURFACE: &str = "this platform publishes no issuer surface through the environment, so a separate \
+  process cannot mint a credential (on Linux it is a descriptor only the anchor's children hold)";
+
+/// Stock Mercurial 7.2's command, or `None` when this host runs none, which the caller skips loudly: the words
+/// [`STOCK_HG`] names, answering `--version` with 7.2's line.
+fn stock_hg() -> Option<Vec<String>> {
+  let line = std::env::var(STOCK_HG).unwrap_or_else(|_| "hg".to_owned());
+  let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+  let (program, leading) = words.split_first()?;
+  let version = Command::new(program)
+    .args(leading)
+    .arg("--version")
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .output()
+    .ok()?;
+  let text = String::from_utf8_lossy(&version.stdout);
+  (version.status.success() && text.contains("(version 7.2")).then_some(words)
+}
+
+/// Runs stock hg with `args` in `dir`, outside any user's configuration (`HGRCPATH` empty), in its plain words
+/// (`HGPLAIN`), committing as one test user, with no terminal to prompt on: its exit code and both outputs.
+fn hg_in(hg: &[String], dir: &str, args: &[&str]) -> (i32, String, String) {
+  let output = Command::new(&hg[0])
+    .args(&hg[1..])
+    .args(args)
+    .current_dir(dir)
+    .env("HGPLAIN", "1")
+    .env("HGRCPATH", "")
+    .env("HGUSER", "Test <test@example.com>")
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
+  (
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
+/// Runs stock hg as [`hg_in`] does, failing the test unless it succeeds: its standard output.
+fn hg_ok(hg: &[String], dir: &str, args: &[&str]) -> String {
+  let (code, out, err) = hg_in(hg, dir, args);
+  assert_eq!(code, 0, "hg {args:?} in {dir}: {out}{err}");
+  out
+}
+
+/// `args`, then the `--config` words `config` holds.
+fn with_config<'a>(args: &[&'a str], config: &'a [String]) -> Vec<&'a str> {
+  args
+    .iter()
+    .copied()
+    .chain(config.iter().map(String::as_str))
+    .collect()
+}
+
+/// The changesets of the working copy at `dir`, newest first.
+fn hg_nodes(hg: &[String], dir: &str) -> Vec<String> {
+  hg_ok(hg, dir, &["log", "--template", "{node}\\n"])
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Starts an anchor whose daemon is asked for `edges` (`--vcs-http`, `--vcs-ssh`) and waits until it serves: the
+/// anchor, and the lines read until its daemon served, which name the edges' ports.
+fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<String>) {
+  let (anchor, lines, _) = anchor_with_edges_as(instance, edges, false);
+  (anchor, lines)
+}
+
+/// [`anchor_with_edges`] for a test that mints a credential, which the issuer's verbs do (`credential token|key`):
+/// read on until the anchor has named its issuer surface too, where this platform names one
+/// ([`PRINTS_ISSUER_SURFACE`]), and its daemon then answering verbs steadily with its consensus group bootstrapped, as
+/// [`start_anchor_with_vcs_http`] waits (A-685's test): the anchor, the lines read, and the surface's exports, none
+/// where this platform names none.
+fn anchor_with_edges_and_issuer(
+  instance: &str,
+  edges: &[&str],
+) -> (AnchorProcess, Vec<String>, Option<Vec<(String, String)>>) {
+  anchor_with_edges_as(instance, edges, true)
+}
+
+/// Starts an anchor whose daemon is asked for `edges` and reads its lines, echoing each, until the daemon serves and,
+/// when `issuer` is asked on a platform that names one, the anchor has named its issuer surface, the two processes'
+/// lines taken in whichever order they arrive ([`await_serving`]'s rule); with `issuer`, then waits for the daemon as
+/// [`start_anchor_with_issuer_surface`] does. The anchor, the lines read and the surface's exports when asked.
+fn anchor_with_edges_as(
+  instance: &str,
+  edges: &[&str],
+  issuer: bool,
+) -> (AnchorProcess, Vec<String>, Option<Vec<(String, String)>>) {
+  use std::io::{BufRead, Write};
+  let mut child = slates()
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .args(edges)
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let wants_issuer = issuer && PRINTS_ISSUER_SURFACE;
+  let (mut lines, mut exports, mut served) = (Vec::new(), None, false);
+  while !served || (wants_issuer && exports.is_none()) {
+    let mut line = String::new();
+    let read = stderr.read_line(&mut line).unwrap();
+    assert!(
+      read > 0,
+      "the anchor ended before its daemon served (its lines are above)"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    served |= line.starts_with(&serving_line);
+    exports = exports.or_else(|| issuer_exports(&line));
+    lines.push(line);
+  }
+  anchor.drain = Some(echo_the_rest(stderr));
+  if issuer {
+    await_stable_daemon(instance, true);
+  }
+  (anchor, lines, exports.filter(|_| wants_issuer))
+}
+
+/// The port named on the line of `lines` that begins with `prefix`: the digits right after it, so what the line names
+/// after the port (the SSH edge's host key, A-684) is never read as part of it.
+fn port_on(lines: &[String], prefix: &str) -> Option<u16> {
+  lines.iter().find_map(|line| {
+    line
+      .strip_prefix(prefix)?
+      .split(|character: char| !character.is_ascii_digit())
+      .next()?
+      .parse()
+      .ok()
+  })
+}
+
+/// Makes a Mercurial repository `name` through the CLI: `slates repository create <name> --tool hg`, A-685 (g305),
+/// `CreateRepository`'s fields as its flags (main's ruling, 2026-11-19). Until it lands no client verb sends
+/// `CreateRepository`: the server's tests and the Subversion migration alone do.
+fn create_hg_repository(instance: &str, name: &str) {
+  let (code, out, err) = run(instance, &["repository", "create", name, "--tool", "hg"]);
+  assert_eq!(code, 0, "repository create: {out}{err}");
+}
+
+/// Stock hg's round trip through slates at `url`, `config` its `--config` words (credentials, the SSH command): a
+/// history made in a fresh working copy and pushed, the repository's first; cloned into a second copy; a changeset made
+/// there and pushed; pulled back into the first. Fails the test unless every step succeeds and both copies end with the
+/// same two changesets.
+#[allow(clippy::disallowed_methods)]
+fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
+  let (local, clone) = (format!("{scratch}/local"), format!("{scratch}/clone"));
+  hg_ok(hg, scratch, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(hg, &local, &["commit", "--addremove", "--message", "first"]);
+  hg_ok(hg, &local, &with_config(&["push", url], config));
+  hg_ok(hg, scratch, &with_config(&["clone", url, &clone], config));
+  assert_eq!(
+    hg_nodes(hg, &clone),
+    hg_nodes(hg, &local),
+    "the clone holds what was pushed"
+  );
+  std::fs::write(format!("{clone}/file"), "first\nsecond\n").unwrap();
+  hg_ok(hg, &clone, &["commit", "--message", "second"]);
+  hg_ok(hg, &clone, &with_config(&["push"], config));
+  hg_ok(hg, &local, &with_config(&["pull", url], config));
+  let nodes = hg_nodes(hg, &local);
+  assert_eq!(
+    (nodes.len(), &nodes),
+    (2, &hg_nodes(hg, &clone)),
+    "the pull brought the clone's push back"
+  );
+  // `identify` asks the server's `lookup` (stock 7.2 aborted "remote repository does not support the 'lookup'
+  // capability" before g258's fix): the tip it names is the one both copies hold, as its short id.
+  let identified = hg_ok(
+    hg,
+    scratch,
+    &with_config(&["identify", "-r", "tip", url], config),
+  );
+  assert_eq!(
+    Some(identified.trim()),
+    nodes.first().and_then(|tip| tip.get(..12)),
+    "identify named the tip"
+  );
+}
+
+/// A-650 part 1, A-680 part 2a and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a
+/// Basic challenge, which 7.2's client reads). Do: start an anchor with its HTTP edge on loopback; ask stock Mercurial
+/// 7.2, given no credentials and no terminal, to clone a repository there. Expect it refused in its own words (`abort:
+/// http authorization required for`, `url.py` lines 92-93, exit 255), never with its crash report. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]). Its waits, as they ended: the daemon's edge served git's site alone, so hg's request
+/// met `404` (`abort: HTTP Error 404: Not Found`; Mac Studio, kiln r174), until A-680 part 2a put Mercurial's site
+/// beside it; that site's `401` offered Bearer alone, which crashed 7.2 ("** unknown exception encountered",
+/// `ValueError: AbstractDigestAuthHandler does not support the following scheme: 'Bearer'`, raised at Python 3.12's
+/// `urllib/request.py` line 1129 through hg's `url.py` line 418; exit 1), since urllib's digest handler reads the first
+/// challenge alone, until A-686 put Basic's challenge first on every connection.
+#[test]
+fn stock_hg_without_credentials_is_refused_in_its_own_words() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's refusal: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("cli-hg-refused-{}", std::process::id());
+  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port =
+    port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-hg-refused"),
+  };
+  let url = format!("http://127.0.0.1:{port}/r");
+  let (code, out, err) = hg_in(&hg, &scratch.path, &["clone", &url, "clone"]);
+  assert!(
+    !err.contains("unknown exception"),
+    "stock hg crashed on the edge's refusal: {err}"
+  );
+  assert_eq!(code, 255, "{out}{err}");
+  assert!(
+    err.contains("abort: http authorization required for"),
+    "{err}"
+  );
+}
+
+/// A-650 part 1 and A-686 (§4.17.3 "Access": Basic with a token as the password, over TLS or the loopback edge, main's
+/// ruling of 2026-11-19). Do: start an anchor with its HTTP edge on loopback (`--vcs-http 127.0.0.1:0`); make a
+/// Mercurial repository through the CLI ([`create_hg_repository`]) and a token (`credential token`, the issuer's verb,
+/// run with the anchor's issuer surface: [`anchor_with_edges_and_issuer`]); with the token as Basic's password
+/// (`auth.*`), push a fresh history to the repository, clone it, push a changeset from the clone and pull it back
+/// ([`hg_round_trip`]). Expect each step done and both copies holding the same two changesets. Skips loudly without
+/// stock hg 7.2 ([`STOCK_HG`]), and where the platform names no issuer surface ([`NO_ISSUER_SURFACE`]). Everything
+/// it needs is built: `slates repository create` (A-685), the hg site on the daemon's edge (A-680 part 2a), its pushes
+/// (`unbundle` through `hg_push`, A-680 part 2b) and the edge's Basic, its challenge first and taken on the loopback
+/// edge (A-686, [`stock_hg_without_credentials_is_refused_in_its_own_words`]).
+#[test]
+fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg over the HTTP edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("cli-hg-http-{}", std::process::id());
+  let (_anchor, lines, issuer) =
+    anchor_with_edges_and_issuer(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port =
+    port_on(&lines, VCS_HTTP_CLEARTEXT_LINE).expect("the daemon named its HTTP edge's port");
+  let Some(issuer) = issuer else {
+    eprintln!("SKIP stock hg over the HTTP edge: {NO_ISSUER_SURFACE}");
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "token"]);
+  assert_eq!(code, 0, "credential token: {out}{err}");
+  let token = out
+    .lines()
+    .find_map(|line| line.strip_prefix("token: "))
+    .expect("credential token names its token")
+    .trim()
+    .to_owned();
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-hg-http"),
+  };
+  hg_round_trip(&hg, &scratch.path, &format!("{prefix}r"), &config);
+}
+
+/// A-650 and A-679 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo> serve
+/// --stdio` in Mercurial's quoting). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make a
+/// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`, the issuer's
+/// verb, run with the anchor's issuer surface: [`anchor_with_edges_and_issuer`]); run [`hg_round_trip`] over `ssh://`
+/// with OpenSSH holding that key alone. Expect each step done and both copies holding the same two changesets. Skips
+/// loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`, and where the platform names no issuer surface
+/// ([`NO_ISSUER_SURFACE`]). Everything it needs is built: the SSH edge (`--vcs-ssh <addr>`, A-684), the edge's
+/// Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`) and its pushes (A-696: `unbundle` in
+/// the stdio session, through `hg_push` as the HTTP site's are since A-680 part 2b).
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg over the SSH edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-hg-ssh"),
+  };
+  let key = format!("{}/key", scratch.path);
+  let Ok(made) = Command::new("ssh-keygen")
+    .args([
+      "-q",
+      "-t",
+      "ed25519",
+      "-N",
+      "",
+      "-C",
+      "slates-hg-test",
+      "-f",
+      &key,
+    ])
+    .output()
+  else {
+    eprintln!("skipping stock hg over the SSH edge: no ssh-keygen here");
+    return;
+  };
+  assert!(made.status.success(), "ssh-keygen: {made:?}");
+  let public = std::fs::read_to_string(format!("{key}.pub")).unwrap();
+  let instance = format!("cli-hg-ssh-{}", std::process::id());
+  let (_anchor, lines, issuer) =
+    anchor_with_edges_and_issuer(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let port = port_on(&lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+  let Some(issuer) = issuer else {
+    eprintln!("SKIP stock hg over the SSH edge: {NO_ISSUER_SURFACE}");
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "key", public.trim()]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let ssh = format!(
+    "ui.ssh=ssh -i {key} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no \
+     -o UserKnownHostsFile=/dev/null"
+  );
+  let config = vec!["--config".to_owned(), ssh];
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
+  hg_round_trip(&hg, &scratch.path, &url, &config);
+}
+
+/// A fresh ed25519 key for OpenSSH in `scratch`, made by `ssh-keygen`: its path and its public line, or `None` (the
+/// caller skips loudly) on a host without `ssh-keygen`.
+#[allow(clippy::disallowed_methods)]
+fn hg_ssh_key(scratch: &str) -> Option<(String, String)> {
+  let key = format!("{scratch}/key");
+  let made = Command::new("ssh-keygen")
+    .args([
+      "-q",
+      "-t",
+      "ed25519",
+      "-N",
+      "",
+      "-C",
+      "slates-hg-test",
+      "-f",
+      &key,
+    ])
+    .output()
+    .ok()?;
+  assert!(made.status.success(), "ssh-keygen: {made:?}");
+  let public = std::fs::read_to_string(format!("{key}.pub")).unwrap();
+  Some((key, public.trim().to_owned()))
+}
+
+/// A `known_hosts` file in `scratch` holding the host key the SSH edge at loopback `port` presents, made as a user
+/// makes one: `ssh-keyscan` reads the key, and `ssh-keygen -l` fingerprints the file it wrote. Fails the test unless
+/// that fingerprint is `fingerprint`, the one the daemon printed. The file's path.
+#[allow(clippy::disallowed_methods)]
+fn hg_known_hosts(scratch: &str, port: u16, fingerprint: &str) -> String {
+  let path = format!("{scratch}/known_hosts");
+  let scanned = Command::new("ssh-keyscan")
+    .args([
+      "-p",
+      &port.to_string(),
+      "-t",
+      "ed25519",
+      "-T",
+      "10",
+      "127.0.0.1",
+    ])
+    .output()
+    .unwrap();
+  let lines = String::from_utf8_lossy(&scanned.stdout).into_owned();
+  assert!(
+    scanned.status.success() && !lines.trim().is_empty(),
+    "ssh-keyscan read no host key at port {port}: {scanned:?}"
+  );
+  std::fs::write(&path, &lines).unwrap();
+  let listed = Command::new("ssh-keygen")
+    .args(["-l", "-E", "sha256", "-f", &path])
+    .output()
+    .unwrap();
+  let listing = String::from_utf8_lossy(&listed.stdout).into_owned();
+  let fingerprints: Vec<&str> = listing
+    .lines()
+    .filter_map(|line| line.split_whitespace().nth(1))
+    .collect();
+  assert_eq!(
+    fingerprints,
+    [fingerprint],
+    "the key ssh-keyscan read at port {port} is the one the daemon named: {lines}"
+  );
+  path
+}
+
+/// A-650, A-679 and A-684 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo>
+/// serve --stdio`). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make a Mercurial
+/// repository through the CLI ([`create_hg_repository`]); enroll a fresh key for its owner (`credential key`); clone
+/// it with stock hg over `ssh://`, OpenSSH holding that key alone and trusting only the host key the daemon named
+/// ([`hg_known_hosts`], `StrictHostKeyChecking=yes`); pull into the clone. Expect the clone made, empty (nothing has
+/// been pushed: the pushes over `serve --stdio` are A-696, [`stock_hg_clones_pulls_and_pushes_over_the_ssh_edge`]),
+/// its default path the edge's URL, and the pull finding no changes. Skips loudly without stock hg 7.2 ([`STOCK_HG`])
+/// or `ssh-keygen`, and where the platform names no issuer surface ([`NO_ISSUER_SURFACE`]).
+#[test]
+fn stock_hg_clones_over_the_ssh_edge() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's clone over the SSH edge: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-hg-ssh-clone"),
+  };
+  let Some((key, public)) = hg_ssh_key(&scratch.path) else {
+    eprintln!("skipping stock hg's clone over the SSH edge: no ssh-keygen here");
+    return;
+  };
+  let instance = format!("cli-hg-ssh-clone-{}", std::process::id());
+  let (_anchor, lines, issuer) =
+    anchor_with_edges_and_issuer(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (port, fingerprint) = lines
+    .iter()
+    .find_map(|line| ssh_edge_of(line))
+    .expect("the daemon named its SSH edge's port and host key");
+  let Some(issuer) = issuer else {
+    eprintln!("SKIP stock hg's clone over the SSH edge: {NO_ISSUER_SURFACE}");
+    return;
+  };
+  let known_hosts = hg_known_hosts(&scratch.path, port, &fingerprint);
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "key", &public]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let ssh = format!(
+    "ui.ssh=ssh -F /dev/null -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
+     -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts} -o GlobalKnownHostsFile=/dev/null"
+  );
+  let config = vec!["--config".to_owned(), ssh];
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
+  let clone = format!("{}/clone", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", &url, &clone], &config),
+  );
+  assert_eq!(
+    hg_nodes(&hg, &clone),
+    Vec::<String>::new(),
+    "the clone is empty"
+  );
+  assert_eq!(hg_ok(&hg, &clone, &["paths", "default"]).trim(), url);
+  let (code, out, err) = hg_in(&hg, &clone, &with_config(&["pull"], &config));
+  assert!(
+    code == 0 && out.contains("no changes found"),
+    "hg pull over the SSH edge: {code} {out}{err}"
+  );
+}
+
+/// Starts an anchor whose daemon serves the version-control HTTP edge on loopback, on a port the system picks
+/// (`--vcs-http 127.0.0.1:0`), and waits for it as [`start_anchor_with_issuer_surface`] does, its consensus group
+/// bootstrapped: the anchor, the issuer surface's exports where this platform prints them ([`PRINTS_ISSUER_SURFACE`]),
+/// and the edge's port, which the daemon names before it says it serves.
+fn start_anchor_with_vcs_http(
+  instance: &str,
+) -> (AnchorProcess, Option<Vec<(String, String)>>, u16) {
+  use std::io::{BufRead, Write};
+  let mut child = slates()
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-http",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let (mut port, mut exports, mut serving) = (None, None, false);
+  let mut line = String::new();
+  while !serving || (PRINTS_ISSUER_SURFACE && exports.is_none()) {
+    line.clear();
+    let read = stderr.read_line(&mut line).unwrap();
+    assert!(
+      read > 0,
+      "the anchor ended before its daemon served (its lines are above)"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    port = port.or_else(|| {
+      line
+        .strip_prefix(VCS_HTTP_CLEARTEXT_LINE)
+        .and_then(|rest| rest.trim().parse::<u16>().ok())
+    });
+    serving |= line.starts_with(&serving_line);
+    exports = exports.or_else(|| issuer_exports(&line));
+  }
+  anchor.drain = Some(echo_the_rest(stderr));
+  await_stable_daemon(instance, true);
+  let port = port.expect("the daemon named its edge's port before it served");
+  (anchor, exports, port)
+}
+
+/// A-685 (§4.17.1 "The repository and its greens"; §4.17.2 "Transports" item 1): `slates repository create` against
+/// a real anchor. Do: start an anchor whose daemon serves the version-control HTTP edge on loopback; create git
+/// repository `NAME` from the command line; create `NAME` again, for Mercurial; create one repository of each other
+/// tool with its defaults, and one with `--json`; enroll an HTTP token for this account (`slates credential token`, the
+/// issuer's verb) and ask the edge, with it as a bearer token, for `NAME`'s receive-pack advertisement and for a name
+/// no repository has. Expect: the create answers the repository and its root green's id; the second create is refused
+/// `AlreadyExists` (exit 1), a name being taken whatever the tool; each tool's create answers with its defaults; the
+/// edge answers `200` for the repository by its name and `404` for the unknown name. Where this platform publishes no
+/// issuer surface (Linux: a descriptor only the anchor's children hold) the token's leg is skipped, loudly; the creates
+/// run everywhere.
+#[test]
+fn a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge() {
+  let instance = format!("cli-repository-{}", std::process::id());
+  let (anchor, issuer, port) = start_anchor_with_vcs_http(&instance);
+  let name = "made-by-the-cli";
+  let (code, out, err) = run(&instance, &["repository", "create", name, "--tool", "git"]);
+  assert_eq!(code, 0, "the create answers: {err}");
+  assert_eq!(value_of(&out, "repository"), name, "{out}");
+  assert_eq!(value_of(&out, "id").len(), 32, "the root green's id: {out}");
+  the_name_is_taken_whatever_the_tool(&instance, name);
+  each_tool_creates_with_its_defaults(&instance);
+  let Some(issuer) = issuer else {
+    println!(
+      "SKIP the edge's leg: this platform publishes no issuer surface through the environment, so a separate process \
+       cannot enroll a token (on Linux the anchor's segment is a descriptor its children hold). The creates ran."
+    );
+    return;
+  };
+  let (code, out, err) = run_as_issuer(&instance, &issuer, &["credential", "token"]);
+  assert_eq!(code, 0, "a token for this account: {err}");
+  let token = value_of(&out, "token");
+  let found = bearer_request(
+    port,
+    &format!("/{name}/info/refs?service=git-receive-pack"),
+    &token,
+  )
+  .expect("the edge answered for the repository");
+  let unknown = bearer_request(
+    port,
+    "/no-such-repository/info/refs?service=git-receive-pack",
+    &token,
+  )
+  .expect("the edge answered for the unknown name");
+  drop(anchor);
+  assert!(found.starts_with("http/1.1 200 "), "found by name: {found}");
+  assert!(
+    unknown.starts_with("http/1.1 404 "),
+    "no repository of that name: {unknown}"
+  );
+}
+
+/// `repository create NAME` again, for another tool than the first: refused `AlreadyExists`, exit 1 (a repository's
+/// name is unique whatever its tool, §4.17.1 item 1).
+fn the_name_is_taken_whatever_the_tool(instance: &str, name: &str) {
+  let (code, out, err) = run(instance, &["repository", "create", name, "--tool", "hg"]);
+  assert_eq!(code, 1, "the name is taken: {out}{err}");
+  assert!(err.contains("AlreadyExists"), "{err}");
+}
+
+/// A repository of each tool, with its defaults, and one created with `--json`: each answers (exit 0), the JSON one with
+/// its name and its root green's id.
+fn each_tool_creates_with_its_defaults(instance: &str) {
+  for (name, tool) in [("an-hg-one", "hg"), ("an-svn-one", "svn")] {
+    let (code, out, err) = run(instance, &["repository", "create", name, "--tool", tool]);
+    assert_eq!(code, 0, "{tool}'s create answers: {err}");
+    assert_eq!(value_of(&out, "repository"), name, "{out}");
+  }
+  let (code, out, err) = run(
+    instance,
+    &[
+      "repository",
+      "create",
+      "a-sha256-one",
+      "--tool",
+      "git",
+      "--format",
+      "sha256",
+      "--json",
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("\"repository\":\"a-sha256-one\"") && out.contains("\"id\":\""),
+    "{out}"
+  );
+}
+
+/// Format: the start of the daemon's line naming where its svn:// listener serves (`crates/api/src/role/daemon.rs`),
+/// here on the loopback address the tests ask for; the port follows.
+const VCS_SVN_LINE: &str = "slates daemon: the svn:// listener serves on 127.0.0.1:";
+/// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`SVN_RECORDED_URL`] under a root
+/// holding no repository: its greeting, then its refusal (recorded on the Mac Studio, 2026-11-19).
+const SVNSERVE_NO_REPOSITORY: &[u8] =
+  include_bytes!("../../svn/fixtures/handshake/no-repository.server.bin");
+/// Format: what that client wrote: its answer to the greeting, naming [`SVN_RECORDED_URL`].
+const SVN_NO_REPOSITORY: &[u8] =
+  include_bytes!("../../svn/fixtures/handshake/no-repository.client.bin");
+/// Format: the URL the recorded client named, at `svnserve`'s default port; a client of the listener names its port.
+const SVN_RECORDED_URL: &str = "svn://127.0.0.1/missing";
+/// Format: where the recorded server's refusal starts, after its greeting.
+const SVN_REFUSAL_START: &[u8] = b"( failure ";
+/// Format: the capability `svnserve`'s greeting announces and slates' does not, its word and the space after it: a
+/// sender uses zlib only with a peer that announced `svndiff1` (`marshal.c`), so slates never receives zlib (§4.17.4
+/// "5. The wire"; `slates_svn::handshake`).
+const SVN_SVNDIFF1: &str = "svndiff1 ";
+
+/// The URL a client of the svn:// listener at loopback `port` names for the repository `missing`, as
+/// [`SVN_RECORDED_URL`] did.
+fn svn_url_at(port: u16) -> String {
+  format!("svn://127.0.0.1:{port}/missing")
+}
+
+/// ra_svn's string item holding `text`: its length, a colon, its bytes (`marshal.c`).
+fn svn_string(text: &str) -> String {
+  format!("{}:{text}", text.len())
+}
+
+/// `svnserve`'s words refusing `url` under a root that holds no repository (`serve.c` `find_repos`).
+fn svn_no_repository(url: &str) -> String {
+  format!("No repository found in '{url}'")
+}
+
+/// `recorded` with its one item `item` written as `replacement`: the recording must hold `item` exactly once, so the
+/// replacement keeps every other byte as stock Subversion wrote it.
+fn svn_replaced(recorded: &[u8], item: &str, replacement: &str) -> Vec<u8> {
+  let item = item.as_bytes();
+  let places: Vec<usize> = recorded
+    .windows(item.len())
+    .enumerate()
+    .filter(|(_, window)| *window == item)
+    .map(|(place, _)| place)
+    .collect();
+  assert_eq!(places.len(), 1, "the recording holds the item once");
+  let place = places[0];
+  let mut bytes = recorded[..place].to_vec();
+  bytes.extend_from_slice(replacement.as_bytes());
+  bytes.extend_from_slice(&recorded[place + item.len()..]);
+  bytes
+}
+
+/// What the svn:// listener at loopback `port` must send, as `svnserve` sent it: the greeting, its `svndiff1` taken out
+/// ([`SVN_SVNDIFF1`]), then the refusal of the recorded client's URL naming that port.
+fn svnserves_answers(port: u16) -> (Vec<u8>, Vec<u8>) {
+  let refusal = SVNSERVE_NO_REPOSITORY
+    .windows(SVN_REFUSAL_START.len())
+    .position(|window| window == SVN_REFUSAL_START)
+    .expect("the recorded server refused");
+  (
+    svn_replaced(&SVNSERVE_NO_REPOSITORY[..refusal], SVN_SVNDIFF1, ""),
+    svn_replaced(
+      &SVNSERVE_NO_REPOSITORY[refusal..],
+      &svn_string(&svn_no_repository(SVN_RECORDED_URL)),
+      &svn_string(&svn_no_repository(&svn_url_at(port))),
+    ),
+  )
+}
+
+/// Speaks to the svn:// listener at loopback `port` as stock `svn` 1.15.0 spoke to `svnserve`, waiting `patience` for
+/// each read: reads as many bytes as the greeting holds, answers with the recorded client's answer naming that port,
+/// and reads until the listener closes. What it read before answering and after, or why there was none (a refused
+/// connection among them, or a silence past `patience`, which names the bytes read before it).
+fn svn_exchange(port: u16, patience: Duration) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+  use std::io::{Read, Write};
+  let (greeting, _) = svnserves_answers(port);
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  let mut greeted = Vec::new();
+  let mut chunk = [0u8; 4096];
+  while greeted.len() < greeting.len() {
+    let read = stream.read(&mut chunk).map_err(|error| {
+      std::io::Error::new(
+        error.kind(),
+        format!(
+          "{error}, the greeting read so far {:?}",
+          String::from_utf8_lossy(&greeted)
+        ),
+      )
+    })?;
+    if read == 0 {
+      break;
+    }
+    greeted.extend_from_slice(&chunk[..read]);
+  }
+  stream.write_all(&svn_replaced(
+    SVN_NO_REPOSITORY,
+    &svn_string(SVN_RECORDED_URL),
+    &svn_string(&svn_url_at(port)),
+  ))?;
+  let mut rest = Vec::new();
+  stream.read_to_end(&mut rest)?;
+  Ok((greeted, rest))
+}
+
+/// Asserts that `exchanged`, what [`svn_exchange`] read from the listener at `port`, is what `svnserve` sent: its
+/// greeting byte for byte but for `svndiff1`, then its refusal of the URL, "No repository found" (210005), and the
+/// connection's end.
+fn assert_svnserves_answers(exchanged: &(Vec<u8>, Vec<u8>), port: u16) {
+  let (greeting, refusal) = svnserves_answers(port);
+  assert_eq!(
+    String::from_utf8_lossy(&exchanged.0),
+    String::from_utf8_lossy(&greeting),
+    "the listener greets as svnserve does, svndiff1 aside"
+  );
+  assert_eq!(
+    String::from_utf8_lossy(&exchanged.1),
+    String::from_utf8_lossy(&refusal),
+    "the URL is refused as svnserve refuses it"
+  );
+}
+
+/// A-689 (§4.17.4 piece 7). Do: start an anchor whose daemon is asked for the svn:// listener on loopback, on a port
+/// the system picks (`--vcs-svn 127.0.0.1:0`); read the port the daemon names; connect, read the greeting, answer it as
+/// stock `svn` 1.15.0 answered `svnserve`, naming the repository `missing` at that port
+/// (`crates/svn/fixtures/handshake/no-repository.client.bin`), and read until the connection ends. Expect: the daemon
+/// names the listener's port before it says it serves; the greeting is `svnserve`'s byte for byte but for `svndiff1`
+/// (§4.17.4 "5. The wire"); the answer is refused as `svnserve` refuses a URL no repository holds, "No repository
+/// found" (210005), and the connection ends: the flag went from the anchor to its daemon, which runs A-656's
+/// connection on each connection it accepts.
+#[test]
+fn an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener() {
+  let instance = format!("cli-vcs-svn-{}", std::process::id());
+  let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let port = port_on(&lines, VCS_SVN_LINE)
+    .expect("the daemon named its svn:// listener's port before it served");
+  let exchanged = svn_exchange(port, WAIT_FOR).expect("the listener answered");
+  assert_svnserves_answers(&exchanged, port);
+}
+
+/// A-689 (§4.17.4 piece 7). Do: start an anchor with the svn:// listener on loopback (`--vcs-svn 127.0.0.1:0`); read
+/// the port its daemon names and speak to it as stock `svn` does; kill the daemon; once the anchor says it restarted
+/// it, connect to the same port again, before its successor serves; read the port the successor names. Expect: the
+/// connection made while the daemon was gone is greeted and answered by the successor as `svnserve` answers, and the
+/// successor names the same port: the anchor holds the listener, so a restart never drops its port.
+#[test]
+fn a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again() {
+  let instance = format!("cli-vcs-svn-held-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-svn",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let port = edge_port_before_serving(&lines, VCS_SVN_LINE, &serving_line)
+    .expect("the daemon named its svn:// listener's port before it served");
+  let first = svn_exchange(port, WAIT_FOR).expect("the listener answered");
+  assert_svnserves_answers(&first, port);
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  // The anchor's restart line and the successor's own lines come from two processes, in whichever order they arrive.
+  let mut successor = None;
+  let mut while_restarting = None;
+  let mut again = None;
+  let mut served = false;
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served again: {line}"
+    );
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(svn_exchange(port, START_CEILING));
+    }
+    if let Some(rest) = line.strip_prefix(VCS_SVN_LINE) {
+      again = rest.trim().parse::<u16>().ok();
+    }
+    served |= line.starts_with(&serving_line);
+  }
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let exchanged = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the svn:// listener's port was dropped while its daemon restarted: {error}")
+    });
+  assert_svnserves_answers(&exchanged, port);
+  assert_eq!(
+    again,
+    Some(port),
+    "the restarted daemon serves the svn:// listener on the port its anchor holds"
+  );
+}
+
+/// Format: the words between the port and the host key's fingerprint in the daemon's SSH edge line, after
+/// [`VCS_SSH_LINE`] (`crates/api/src/role/daemon.rs`).
+const VCS_SSH_KEY_WORDS: &str = " with the ED25519 host key ";
+/// Format: SSH's messages the host key reader sends or reads (RFC 4250 §4.1.2; RFC 5656 §7.1): a disconnect, KEXINIT,
+/// the client's ephemeral key and the server's reply.
+const SSH_MSG_DISCONNECT: u8 = 1;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEXINIT: u8 = 20;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
+/// Format: see [`SSH_MSG_DISCONNECT`].
+const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
+/// Format: the most bytes of a packet the reader takes: RFC 4253 §6.1's 35000, which every implementation processes.
+const SSH_PACKET_CAP: usize = 35_000;
+/// Format: the longest identification line, carriage return and line feed included (RFC 4253 §4.2).
+const SSH_LINE_CAP: usize = 255;
+/// Format: the block a cleartext packet's length aligns to, and its least padding (RFC 4253 §6: "or 8, whichever is
+/// larger"; "at least four bytes of padding").
+const SSH_CLEAR_BLOCK: usize = 8;
+/// Format: see [`SSH_CLEAR_BLOCK`].
+const SSH_LEAST_PADDING: usize = 4;
+/// Format: X25519's base point, u = 9 (RFC 7748 §4.1), as the reader's ephemeral public key: any 32 bytes are one (§5),
+/// and the reader keeps nothing the exchange derives, so its own key needs no secret half.
+const X25519_BASE_POINT: [u8; 32] = {
+  let mut point = [0u8; 32];
+  point[0] = 9;
+  point
+};
+
+/// The port and host key fingerprint `line` names, when it is a daemon's SSH edge line.
+fn ssh_edge_of(line: &str) -> Option<(u16, String)> {
+  let rest = line.strip_prefix(VCS_SSH_LINE)?;
+  let (port, fingerprint) = rest.trim().split_once(VCS_SSH_KEY_WORDS)?;
+  Some((port.parse().ok()?, fingerprint.to_owned()))
+}
+
+/// `bytes` as an SSH string (RFC 4251 §5): its length, then itself.
+fn put_ssh_string(out: &mut Vec<u8>, bytes: &[u8]) {
+  out.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+  out.extend_from_slice(bytes);
+}
+
+/// The SSH string at `at` in `bytes`, and where the next field starts; none past the end.
+fn ssh_string(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
+  let start = at.checked_add(4)?;
+  let length = u32::from_be_bytes(bytes.get(at..start)?.try_into().ok()?);
+  let end = start.checked_add(usize::try_from(length).ok()?)?;
+  Some((bytes.get(start..end)?, end))
+}
+
+/// `payload` as a cleartext SSH packet (RFC 4253 §6): its length, its padding's length, itself and its padding.
+fn ssh_packet(payload: &[u8]) -> Vec<u8> {
+  let unpadded = 4 + 1 + payload.len();
+  let mut padding = SSH_CLEAR_BLOCK - unpadded % SSH_CLEAR_BLOCK;
+  if padding < SSH_LEAST_PADDING {
+    padding += SSH_CLEAR_BLOCK;
+  }
+  let mut packet = Vec::new();
+  packet.extend_from_slice(
+    &u32::try_from(1 + payload.len() + padding)
+      .unwrap()
+      .to_be_bytes(),
+  );
+  packet.push(u8::try_from(padding).unwrap());
+  packet.extend_from_slice(payload);
+  packet.resize(packet.len() + padding, 0);
+  packet
+}
+
+/// The reader's KEXINIT (RFC 4253 §7.1): `curve25519-sha256` (RFC 8731) and `ssh-ed25519` (RFC 8709) alone, an AEAD
+/// cipher each way (whose MAC lists are not negotiated), no compression, no guess.
+fn ssh_kexinit() -> Vec<u8> {
+  let mut payload = vec![SSH_MSG_KEXINIT];
+  payload.extend_from_slice(&[0u8; 16]);
+  for list in [
+    "curve25519-sha256",
+    "ssh-ed25519",
+    "chacha20-poly1305@openssh.com",
+    "chacha20-poly1305@openssh.com",
+    "hmac-sha2-256",
+    "hmac-sha2-256",
+    "none",
+    "none",
+    "",
+    "",
+  ] {
+    put_ssh_string(&mut payload, list.as_bytes());
+  }
+  payload.push(0);
+  payload.extend_from_slice(&0u32.to_be_bytes());
+  payload
+}
+
+/// An error of the reader's, for what the server sent it.
+fn ssh_refusal(what: String) -> std::io::Error {
+  std::io::Error::new(std::io::ErrorKind::InvalidData, what)
+}
+
+/// Reads the server's identification line (RFC 4253 §4.2), passing over the lines a server may send before it.
+fn ssh_identification(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+  use std::io::Read;
+  loop {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while line.last() != Some(&b'\n') {
+      stream.read_exact(&mut byte)?;
+      line.extend_from_slice(&byte);
+      if line.len() > SSH_LINE_CAP {
+        return Err(ssh_refusal(format!("a line past {SSH_LINE_CAP} bytes")));
+      }
+    }
+    if line.starts_with(b"SSH-") {
+      return Ok(());
+    }
+  }
+}
+
+/// The payload of the next cleartext packet `stream` brings (RFC 4253 §6), one past [`SSH_PACKET_CAP`] refused.
+fn ssh_payload(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+  use std::io::Read;
+  let mut length = [0u8; 4];
+  stream.read_exact(&mut length)?;
+  let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+  if length > SSH_PACKET_CAP {
+    return Err(ssh_refusal(format!("a packet of {length} bytes")));
+  }
+  let mut packet = vec![0u8; length];
+  stream.read_exact(&mut packet)?;
+  let padding = usize::from(packet.first().copied().unwrap_or_default());
+  packet
+    .get(1..length.saturating_sub(padding))
+    .map(<[u8]>::to_vec)
+    .ok_or_else(|| ssh_refusal(format!("a packet of {length} bytes padded {padding}")))
+}
+
+/// The host key blob the SSH edge at loopback `port` sends in its first key exchange, waiting `patience` for each read:
+/// RFC 5656 §4's `K_S` in the server's `SSH_MSG_KEX_ECDH_REPLY`, cleartext before the keys are taken; or why there was
+/// none (a refused connection among them). A reader written for this test from the RFCs: it offers what
+/// [`ssh_kexinit`] lists, sends its ephemeral key once the server's KEXINIT came, and reads up to the server's reply.
+/// It checks no signature: the edge's own tests do, with slates-ssh's client written from the RFCs
+/// (`crates/server/src/vcs_ssh/tests/daemon_edge.rs`).
+fn ssh_host_key(port: u16, patience: Duration) -> std::io::Result<Vec<u8>> {
+  use std::io::Write;
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+  stream.set_read_timeout(Some(patience))?;
+  stream.write_all(b"SSH-2.0-slates_cli_test\r\n")?;
+  stream.write_all(&ssh_packet(&ssh_kexinit()))?;
+  ssh_identification(&mut stream)?;
+  loop {
+    let payload = ssh_payload(&mut stream)?;
+    match payload.first().copied() {
+      Some(SSH_MSG_KEXINIT) => {
+        let mut init = vec![SSH_MSG_KEX_ECDH_INIT];
+        put_ssh_string(&mut init, &X25519_BASE_POINT);
+        stream.write_all(&ssh_packet(&init))?;
+      }
+      Some(SSH_MSG_KEX_ECDH_REPLY) => {
+        return ssh_string(&payload, 1)
+          .map(|(key, _)| key.to_vec())
+          .ok_or_else(|| ssh_refusal("a reply without its host key".to_owned()));
+      }
+      Some(SSH_MSG_DISCONNECT) => {
+        return Err(ssh_refusal("the edge disconnected".to_owned()));
+      }
+      _ => {}
+    }
+  }
+}
+
+/// The port and host key fingerprint the next daemon of an anchor names for its SSH edge, from the anchor's forwarded
+/// `lines`, read until that daemon says it serves (`serving_line`); none if it named none first.
+fn ssh_edge_before_serving(
+  lines: &std::sync::mpsc::Receiver<String>,
+  serving_line: &str,
+) -> Option<(u16, String)> {
+  let mut edge = None;
+  loop {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the daemon served within the start's ceiling");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    edge = ssh_edge_of(&line).or(edge);
+    if line.starts_with(serving_line) {
+      return edge;
+    }
+  }
+}
+
+/// What an anchor's forwarded `lines` show of its daemon's restart after a kill, its SSH edge at `port`: the
+/// successor's pid; the host key the edge presents at `port` once the anchor said it restarted the daemon, asked
+/// before the successor served; and the port and fingerprint the successor names before it serves (`serving_line`).
+fn ssh_edge_across_a_restart(
+  lines: &std::sync::mpsc::Receiver<String>,
+  serving_line: &str,
+  port: u16,
+) -> (
+  Option<u32>,
+  Option<std::io::Result<Vec<u8>>>,
+  Option<(u16, String)>,
+) {
+  let (mut successor, mut while_restarting, mut again, mut served) = (None, None, None, false);
+  while successor.is_none() || !served {
+    let line = lines
+      .recv_timeout(START_CEILING)
+      .expect("the anchor restarted its daemon and the successor served");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served again: {line}"
+    );
+    if successor.is_none()
+      && let Some(after) = line.split(RESTARTED_AS).nth(1)
+    {
+      successor = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+      // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
+      while_restarting = Some(ssh_host_key(port, START_CEILING));
+    }
+    again = ssh_edge_of(&line).or(again);
+    served |= line.starts_with(serving_line);
+  }
+  (successor, while_restarting, again)
+}
+
+/// A-684 (§4.17.2 "Transports" item 2). Do: start an anchor with the version-control SSH edge on loopback
+/// (`--vcs-ssh 127.0.0.1:0`); read the port and host key fingerprint its daemon names; take the edge's host key from a
+/// key exchange; kill the daemon; once the anchor says it restarted it, take the key again at the same port, before the
+/// successor serves; read what the successor names. Expect: the daemon names the edge's port and its key's fingerprint
+/// before it says it serves; the key the edge presents is the one the fingerprint names; the exchange begun while the
+/// daemon was gone is answered by its successor with the same key; and the successor names the same port and
+/// fingerprint: the anchor holds the edge's listener and its host key, so a restart keeps both and a client's
+/// `known_hosts` line stays good.
+#[test]
+fn an_anchors_vcs_ssh_edge_names_its_host_key_and_a_restart_keeps_port_and_key() {
+  let instance = format!("cli-vcs-ssh-{}", std::process::id());
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--vcs-ssh",
+      "127.0.0.1:0",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let (port, fingerprint) = ssh_edge_before_serving(&lines, &serving_line)
+    .expect("the daemon named its SSH edge's port and host key before it served");
+  let key = ssh_host_key(port, WAIT_FOR).expect("the edge's host key");
+  assert_eq!(
+    slates_server::credentials::key_fingerprint(&key),
+    fingerprint,
+    "the edge presents the key its daemon names"
+  );
+  let killed = daemon_pid(&instance).expect("the daemon's pid");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let (successor, while_restarting, again) = ssh_edge_across_a_restart(&lines, &serving_line, port);
+  assert_ne!(successor, Some(killed), "the anchor started a new daemon");
+  let restarted = while_restarting
+    .expect("asked while the daemon restarted")
+    .unwrap_or_else(|error| {
+      panic!("the edge's port was dropped while its daemon restarted: {error}")
+    });
+  assert_eq!(restarted, key, "the successor presents the anchor's key");
+  assert_eq!(
+    again,
+    Some((port, fingerprint)),
+    "the restarted daemon serves the edge on the port its anchor holds, with the key it holds"
   );
 }

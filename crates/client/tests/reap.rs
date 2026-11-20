@@ -30,8 +30,8 @@ const ROLE_INSTANCE: &str = "SLATES_REAP_TEST_INSTANCE";
 const ROLE_VOLUME: &str = "SLATES_REAP_TEST_VOLUME";
 /// Shape: the probe budget of the quick profile (milliseconds).
 const PROBE_MS: u64 = 5;
-/// Shape: the lease term for this test (nanoseconds): three seconds, longer than the reclaim
-/// takes (two liveness budgets at most) so the lease is seen surviving the reclaim, and short
+/// Shape: the lease term for this test (nanoseconds), the failover delay the daemon is held at (A-414): three seconds,
+/// longer than the reclaim takes (two liveness budgets at most) so the lease is seen surviving the reclaim, and short
 /// enough to see it expire.
 const LEASE_TERM_NS: u64 = 3_000_000_000;
 /// Shape: how long to wait for each observed transition: five liveness budgets.
@@ -204,7 +204,7 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
   })
   .expect("the machine profile measures");
   let instance = format!("cl-reap-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(2)).with_failover_slo(LEASE_TERM_NS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(2));
   let daemon = Daemon::start(
     &profile,
     config,
@@ -216,6 +216,10 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+  // The write lease's term is the node's failover delay (A-414), held at the test's term: nothing sets the estimate.
+  daemon
+    .inject_failover(Some(LEASE_TERM_NS))
+    .expect("the failover delay is held");
   let mut observer = Client::connect(&instance, deadlines()).unwrap();
   let volume = observer
     .create(&slates_client::CreateSpec {

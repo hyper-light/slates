@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
-use slates_vfs::base::{BaseConfig, Divergence, DriftKind};
+use slates_vfs::base::{BaseConfig, Diverged, Divergence, DriftKind};
 use slates_vfs::clock::StepClock;
 use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
@@ -267,7 +267,9 @@ fn answers_without_src(vol: &mut Volume, host: &mut SimHost, store: &mut Store) 
   for path in ["/src/lib.rs", "/src/mod.rs"] {
     assert_eq!(
       read_all(vol, host, store, path),
-      Err(VfsError::BaseUnavailable(GONE_ERRNO)),
+      Err(VfsError::BaseUnavailable(Some(
+        slates_vfs::host::OsCode::native(GONE_ERRNO)
+      ))),
       "{path}, an untouched base entry of the gone directory, refuses typed"
     );
   }
@@ -279,10 +281,12 @@ fn answers_without_src(vol: &mut Volume, host: &mut SimHost, store: &mut Store) 
   let Child::Dir(src) = src.child else {
     panic!("/src is a directory");
   };
+  // `OsCode::native` builds the code in this platform's numbering (A-539), so it is compared, not matched.
+  let gone = slates_vfs::host::OsCode::native(GONE_ERRNO);
   assert!(
     matches!(
       vol.with_host(host).readdir(store, src),
-      Err(VfsError::BaseUnavailable(GONE_ERRNO))
+      Err(VfsError::BaseUnavailable(Some(code))) if code == gone
     ),
     "listing the gone directory refuses rather than show part of it"
   );
@@ -376,7 +380,9 @@ fn an_overlay_whose_base_directory_another_replaced_never_serves_the_other() {
   let mut recovered = recovered.expect("a replaced base directory costs only its own entries");
   assert_eq!(
     read_all(&mut recovered, &mut host, &mut after, "/src/lib.rs"),
-    Err(VfsError::BaseUnavailable(GONE_ERRNO)),
+    Err(VfsError::BaseUnavailable(Some(
+      slates_vfs::host::OsCode::native(GONE_ERRNO)
+    ))),
     "the other directory's file is never served as the recorded one"
   );
 }
@@ -637,7 +643,7 @@ fn a_drift_recheck_the_host_refuses_is_reported_unverified() {
   host.fail(
     slates_vfs::host::sim::SimVerb::OpenFile,
     "/src/lib.rs",
-    slates_vfs::host::HostError::Unavailable(5),
+    slates_vfs::host::HostError::Unavailable(slates_vfs::host::OsCode::Errno(5)),
     u32::MAX,
   );
   let status = vol.with_host(&mut host).status(&mut store).unwrap();
@@ -655,6 +661,87 @@ fn a_drift_recheck_the_host_refuses_is_reported_unverified() {
   host.clear_faults();
   let status = vol.with_host(&mut host).status(&mut store).unwrap();
   assert!(status.unverified.is_empty(), "{:?}", status.unverified);
+}
+
+/// A-501 (a base directory's mode alone is witnessed). Do: `chmod` the base directory `/src` through the overlay; take
+/// the status; let an outsider add a file inside it and take the status again; image the volume and recover it; let an
+/// outsider change the directory's mode, take the status and rewitness. Expect `/src` diverged by its witness alone, a
+/// divergence the recovery keeps; no drift while the disk keeps the directory's own metadata (a file made inside it
+/// moves its times, which the volume follows); `Modified` drift once the disk's mode moved, which `rewitness` clears,
+/// the volume's mode left as it set it. Before A-501 a base directory's chmod took no witness; a witness with no home
+/// would have refused the image (`RecoveryIncomplete`), and a directory re-checked as a file reported `TypeChanged`.
+#[test]
+fn a_base_directorys_mode_change_is_witnessed_and_drifts_only_by_its_own_metadata() {
+  /// Shape: the directory's mode on the disk, the volume's, and an outsider's later one.
+  const DISK_MODE: u32 = 0o040_755;
+  /// Shape: see `DISK_MODE`.
+  const VOLUME_MODE: u32 = 0o040_700;
+  /// Shape: see `DISK_MODE`.
+  const OUTSIDER_MODE: u32 = 0o040_750;
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.chmod("/src", DISK_MODE);
+  host.replace_file("/src/lib.rs", b"pub fn lib() {}");
+  host.advance_ns(2);
+  let mut before = store();
+  let mut vol = overlay(&mut host, &mut before);
+  let src = vol
+    .with_host(&mut host)
+    .resolve(&mut before, "/src")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut before, src, VOLUME_MODE)
+    .unwrap();
+  let divergence = vol.diverged(&before);
+  assert_eq!(
+    divergence,
+    vec![Diverged {
+      path: "/src".to_owned(),
+      kind: Divergence::Witnessed,
+    }]
+  );
+  let quiet =
+    |status: slates_vfs::base::BaseStatus| status.drift.is_empty() && status.unverified.is_empty();
+  assert!(quiet(vol.with_host(&mut host).status(&mut before).unwrap()));
+  host.advance_ns(1_000_000_000);
+  host.replace_file("/src/new.rs", b"an outsider's file");
+  assert!(
+    quiet(vol.with_host(&mut host).status(&mut before).unwrap()),
+    "a file made inside the directory is no drift of its own"
+  );
+  let image = vol.to_image(&before, Some(&mut host)).unwrap();
+  let image = slates_vfs::recover::VolumeImage::from_content(&image.to_content()).unwrap();
+  let mut after = common::surviving(&before);
+  let root = host.root();
+  let claims = common::claims(&mut after, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut after,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
+  )
+  .unwrap();
+  assert_eq!(recovered.diverged(&after), divergence);
+  host.chmod("/src", OUTSIDER_MODE);
+  let status = recovered.with_host(&mut host).status(&mut after).unwrap();
+  assert_eq!(status.drift, vec![("/src".to_owned(), DriftKind::Modified)]);
+  let redone = recovered
+    .with_host(&mut host)
+    .rewitness(&mut after, None)
+    .unwrap();
+  assert_eq!(redone, vec!["/src".to_owned()]);
+  assert!(quiet(
+    recovered.with_host(&mut host).status(&mut after).unwrap()
+  ));
+  assert_eq!(
+    recovered.stat(&after, src).unwrap().mode & 0o7777,
+    VOLUME_MODE & 0o7777,
+    "the volume's mode left as it set it"
+  );
 }
 
 /// The worked example, second half: `git pull` replaces both files on the host; drift is
@@ -1882,6 +1969,212 @@ fn a_clone_of_an_overlay_snapshot_reads_the_same_base() {
   let _ = HostKind::File;
 }
 
+/// The clone's volume config the base-binding test makes its clones with.
+fn clone_config(prefix: u16) -> VolumeConfig {
+  VolumeConfig {
+    prefix,
+    names: NameEquivalence::Exact,
+    quota: Quota::Bounded { limit: 1 << 30 },
+    journal_bytes: 1 << 20,
+    clock: Box::new(StepClock::new(0, 1)),
+  }
+}
+
+/// AC-1.16 (a clone keeps its origin's complete base reference, and its untouched entries stay live). Do: an overlay over
+/// `/f` and `/sub/g`, with `/f` written through it, so the root's listing, `sub` among it, is loaded; snapshot and clone;
+/// then put `/late` on the disk. Expect the clone to read the snapshot's `Base`, the disk's `under` beneath the base
+/// subdirectory its snapshot already held, and `late` from the disk. Before 2026-11-18 a clone kept only a root listing,
+/// keyed by its own root number where its root directory keeps its origin's, so `/sub/g` refused `NotOverlay`.
+#[test]
+fn a_clones_base_subdirectory_reads_as_the_disk_holds_it() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"base");
+  host.mkdir("/sub");
+  host.replace_file("/sub/g", b"under");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let f = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/f")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .write(&mut store, f, 0, b"B")
+    .unwrap();
+  let s = vol.snapshot(&mut store).unwrap();
+  let mut clone = Volume::clone_of(&store, &mut vol, s, clone_config(8)).unwrap();
+  host.replace_file("/late", b"late");
+  assert_eq!(
+    read_all(&mut clone, &mut host, &mut store, "/f").unwrap(),
+    b"Base"
+  );
+  assert_eq!(
+    read_all(&mut clone, &mut host, &mut store, "/sub/g").unwrap(),
+    b"under"
+  );
+  assert_eq!(
+    read_all(&mut clone, &mut host, &mut store, "/late").unwrap(),
+    b"late"
+  );
+}
+
+/// Walks `walk` over `vol` to its end, returning the files and links it made the volume's own.
+fn walk_to_end(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  walk: &mut slates_vfs::base::PinWalk,
+) -> Result<usize, VfsError> {
+  loop {
+    if let Some(done) = vol.with_host(host).pin_unit(store, walk)? {
+      return Ok(done);
+    }
+  }
+}
+
+/// A-291 (§4.15 `capture_base`): a capture makes every byte the volume's own, and a clone of its snapshot needs no base
+/// directory. Do: an overlay over a small file, a large file of three windows (past the large class) in a subdirectory
+/// and a link; walk a capture of the whole base to its end; snapshot; then rewrite the large file and add a file on the
+/// disk; clone the snapshot with no base and read, list and readlink the clone with no host at all; write through the
+/// clone. Expect the snapshot judged complete; the clone reading the snapshot's bytes, never the disk's later ones;
+/// listing exactly the captured names; the link's target; the write landing in the clone alone; and the capture's
+/// snapshot archiving whole, where a pin of the same tree, which leaves the large file on its descriptor, refuses
+/// `RecoveryIncomplete`, its bytes not all in the volume.
+#[test]
+fn a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory() {
+  let big: Vec<u8> = (0..LARGE * 3).map(|index| (index % 251) as u8).collect();
+  let mut host = SimHost::new();
+  host.replace_file("/small", b"a small file");
+  host.mkdir("/sub");
+  host.replace_file("/sub/big", &big);
+  host.symlink("/link", "sub/big");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let taken = walk_to_end(
+    &mut vol,
+    &mut host,
+    &mut store,
+    &mut slates_vfs::base::PinWalk::capture(),
+  )
+  .unwrap();
+  assert_eq!(taken, 3, "two files and a link");
+  let s = vol.snapshot(&mut store).unwrap();
+  assert!(
+    vol
+      .with_host(&mut host)
+      .snapshot_is_complete(&store, s)
+      .unwrap(),
+    "the capture's snapshot is the whole tree"
+  );
+  host.replace_file("/sub/big", b"rewritten on the disk");
+  host.replace_file("/late", b"added on the disk");
+  let mut clone = Volume::clone_without_base(&store, &mut vol, s, clone_config(9)).unwrap();
+  expect_the_clone_to_hold_the_capture(&clone, &store, &big);
+  let small = clone.resolve(&store, "/small").unwrap().inode;
+  clone.write(&mut store, small, 0, b"A").unwrap();
+  assert_eq!(read_clone(&clone, &store, "/small"), b"A small file");
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/small").unwrap(),
+    b"a small file",
+    "the clone's write is the clone's alone"
+  );
+  expect_a_pin_to_archive_short_where_the_capture_archives_whole(&mut store, &vol, s, &big);
+}
+
+/// Reads `path` of `clone` whole, with no host.
+fn read_clone(clone: &Volume, store: &Store, path: &str) -> Vec<u8> {
+  let no = clone.resolve(store, path).unwrap().inode;
+  let size = clone.stat(store, no).unwrap().size;
+  let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+  let n = clone.read(store, no, 0, &mut buf).unwrap();
+  buf.truncate(n);
+  buf
+}
+
+/// The clone of `a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory`, read with no host at all.
+/// Expect the captured bytes of both files (the disk's later ones never), the link's target, and exactly the captured
+/// names at the root.
+fn expect_the_clone_to_hold_the_capture(clone: &Volume, store: &Store, big: &[u8]) {
+  assert_eq!(read_clone(clone, store, "/small"), b"a small file");
+  assert_eq!(
+    read_clone(clone, store, "/sub/big"),
+    big,
+    "the large file's captured bytes"
+  );
+  let link = clone.resolve(store, "/link").unwrap().inode;
+  assert_eq!(&*clone.readlink(store, link).unwrap(), "sub/big");
+  let root = clone.resolve(store, "/").unwrap();
+  let Child::Dir(root) = root.child else {
+    panic!("the root is a directory");
+  };
+  let names: BTreeSet<String> = clone
+    .readdir(store, root)
+    .unwrap()
+    .iter()
+    .map(|row| row.name.to_owned())
+    .collect();
+  assert_eq!(
+    names,
+    ["link", "small", "sub"]
+      .into_iter()
+      .map(str::to_owned)
+      .collect(),
+    "the captured names, never the disk's later one"
+  );
+}
+
+/// The end of `a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory`. Do: pin a tree holding the
+/// same large file and snapshot it; archive both snapshots. Expect the pin's refused `RecoveryIncomplete` (it keeps the
+/// large file on its descriptor, its bytes not all in the volume) and the capture's snapshot `captured` of `captured_vol`
+/// archived whole, so a fleet member can serve it from its holders.
+fn expect_a_pin_to_archive_short_where_the_capture_archives_whole(
+  store: &mut Store,
+  captured_vol: &Volume,
+  captured: slates_vfs::ids::SnapshotId,
+  big: &[u8],
+) {
+  let mut pinned_host = SimHost::new();
+  pinned_host.mkdir("/sub");
+  pinned_host.replace_file("/sub/big", big);
+  let mut pinned = overlay(&mut pinned_host, store);
+  walk_to_end(
+    &mut pinned,
+    &mut pinned_host,
+    store,
+    &mut slates_vfs::base::PinWalk::new(None),
+  )
+  .unwrap();
+  let p = pinned.snapshot(store).unwrap();
+  assert!(
+    matches!(
+      archive_whole(&pinned, store, p),
+      Err(VfsError::RecoveryIncomplete)
+    ),
+    "a pin keeps the large file on its descriptor, so its snapshot cannot be archived whole"
+  );
+  assert!(
+    archive_whole(captured_vol, store, captured).is_ok(),
+    "the capture's snapshot archives whole, so a fleet member can serve it from its holders"
+  );
+}
+
+/// Archives snapshot `snapshot` of `volume` to completion, or its refusal.
+fn archive_whole(
+  volume: &Volume,
+  store: &Store,
+  snapshot: slates_vfs::ids::SnapshotId,
+) -> Result<slates_archive::Archive, VfsError> {
+  use slates_archive::codec::CodecPolicy;
+  use slates_vfs::export::{Progress, SnapshotArchiver};
+  let mut archiver = SnapshotArchiver::new(volume, store, snapshot, 0, 0, CodecPolicy::raw_only())?;
+  loop {
+    if let Progress::Done(archive) = archiver.advance(volume, store, u64::MAX)? {
+      return Ok(archive);
+    }
+  }
+}
+
 /// A-38: an outsider's edit beneath an overlay moves the file's change counter when a stat takes the
 /// disk's new attributes, and a stat of an unchanged file leaves it where it is, so a client caching
 /// by the counter sees the edit and keeps its cache otherwise.
@@ -2191,12 +2484,19 @@ fn a_rename_over_a_base_directory_sees_outsider_children_and_refuses_on_a_host_f
     .with_host(&mut faulty)
     .mkdir(&mut fresh_store, fresh_root, "src", 0o755)
     .unwrap();
-  faulty.fail(SimVerb::OpenDir, "/target", HostError::Unavailable(5), 1);
+  faulty.fail(
+    SimVerb::OpenDir,
+    "/target",
+    HostError::Unavailable(slates_vfs::host::OsCode::Errno(5)),
+    1,
+  );
   assert_eq!(
     fresh
       .with_host(&mut faulty)
       .rename(&mut fresh_store, fresh_root, "src", fresh_root, "target"),
-    Err(VfsError::BaseUnavailable(5))
+    Err(VfsError::BaseUnavailable(Some(
+      slates_vfs::host::OsCode::Errno(5)
+    )))
   );
   assert!(
     fresh
@@ -2538,7 +2838,7 @@ fn an_untouched_base_directory_the_disk_made_a_file_shows_the_file() {
   assert_eq!(vol.diverged(&store), Vec::new());
 }
 /// §4.6 cache posture: an outsider's change beneath a base directory reaches the kernel caches of the volume's
-/// transports through the watcher's hints, drained each reap tick. Do: load a base directory, park a counting waker on
+/// transports through the watcher's hints, drained at the kernel's report (A-709). Do: load a base directory, park a counting waker on
 /// the overlay volume, edit a file beneath it from outside, and drain the hints. Expect the parked task woken, so a FUSE
 /// mount delivers the stale marks without waiting for its kernel's next request — and a drain with no hints to wake no one.
 #[test]
@@ -2818,4 +3118,128 @@ fn an_untouched_base_file_reports_the_disks_windows_attribute_bits_and_follows_t
     after.attrs.mode, first.attrs.mode,
     "the mode is the disk's own"
   );
+}
+
+/// One drift walk's pages, as they came: each inode with its entries.
+type DriftWalk = Vec<(
+  slates_vfs::ids::InodeNo,
+  Vec<slates_vfs::base::DriftPageEntry>,
+)>;
+
+/// An overlay of 40 files in four directories, all pinned; then, outside the volume, a third of them replaced, a
+/// seventh removed, and five armed to refuse their open with an I/O error.
+fn drifting_overlay() -> (SimHost, Store, Volume) {
+  let mut host = SimHost::new();
+  let mut store = store();
+  populate(&mut host, 4, 40);
+  let mut vol = overlay(&mut host, &mut store);
+  vol.with_host(&mut host).pin(&mut store, None).unwrap();
+  host.advance_ns(1_000_000_000);
+  for f in (0..40).step_by(3) {
+    host.replace_file(&format!("/d{}/f{f}", f % 4), b"changed outside");
+  }
+  for f in (1..40).step_by(7) {
+    host.remove(&format!("/d{}/f{f}", f % 4));
+  }
+  for f in [2, 5, 8, 11, 14] {
+    host.fail(
+      slates_vfs::host::sim::SimVerb::OpenFile,
+      &format!("/d{}/f{f}", f % 4),
+      slates_vfs::host::HostError::Unavailable(slates_vfs::host::OsCode::Errno(5)),
+      u32::MAX,
+    );
+  }
+  (host, store, vol)
+}
+
+/// Walks `vol`'s drift `limit` inodes a page at most, each page's slice spent after every `every` visits, holding that a
+/// page keeps to its limit, moves the walk and that the walk ends: every page's entries, in the order they came.
+fn walk_drift(
+  (host, store, vol): (&mut SimHost, &mut Store, &mut Volume),
+  limit: usize,
+  every: usize,
+) -> DriftWalk {
+  let mut walked = DriftWalk::new();
+  let mut after = None;
+  for _ in 0..1_000 {
+    let mut visits = 0usize;
+    let mut spent = || {
+      visits += 1;
+      visits.is_multiple_of(every)
+    };
+    let page = vol
+      .with_host(host)
+      .drift_page(store, after, limit, &mut spent)
+      .unwrap();
+    assert!(
+      page.entries.len() <= limit,
+      "a page holds at most its limit"
+    );
+    assert!(
+      page
+        .next
+        .zip(after)
+        .is_none_or(|(next, before)| next > before),
+      "a page moves the walk"
+    );
+    walked.extend(page.entries);
+    match page.next {
+      None => return walked,
+      next => after = next,
+    }
+  }
+  panic!("the walk ends");
+}
+
+/// A walk's entries as a status lists them: the drifted with their kinds, and the unverified paths, each sorted.
+fn as_status_lists(walked: DriftWalk) -> (Vec<(String, DriftKind)>, Vec<String>) {
+  let mut drifted: Vec<(String, DriftKind)> = Vec::new();
+  let mut unverified: Vec<String> = Vec::new();
+  for entry in walked.into_iter().flat_map(|(_, entries)| entries) {
+    match entry {
+      slates_vfs::base::DriftPageEntry::Drifted { path, kind } => drifted.push((path, kind)),
+      slates_vfs::base::DriftPageEntry::Unverified { path, .. } => unverified.push(path),
+    }
+  }
+  drifted.sort();
+  unverified.sort();
+  (drifted, unverified)
+}
+
+/// A-267 (§4.4 `status`, `Drifted`). Do: overlay a base of 40 files in four directories, pin them all, then outside the
+/// volume replace a third of them, remove a seventh, and arm the host to refuse opening five (an I/O error); walk the
+/// drift a page at a time — pages of 1, 3 and 64 inodes, with the page's slice spent after every visit, every second
+/// visit, or never — and take a status. Expect: every walk's entries, in inode order and each inode once, are exactly
+/// what the status lists, drifted with their kinds and unverified apart; a walk always moves (a page visits one inode
+/// before its slice is asked) and ends. Reading the whole status each page made a walk cost its square.
+#[test]
+fn a_drift_walk_a_page_at_a_time_lists_what_a_status_lists() {
+  for (limit, every) in [(1, 1), (3, 2), (3, usize::MAX), (64, 1), (64, usize::MAX)] {
+    let (mut host, mut store, mut vol) = drifting_overlay();
+    let walked = walk_drift((&mut host, &mut store, &mut vol), limit, every);
+    assert!(
+      walked.windows(2).all(|pair| pair[0].0 < pair[1].0),
+      "inode order, each once (limit {limit}, every {every})"
+    );
+    let status = vol.with_host(&mut host).status(&mut store).unwrap();
+    let (drifted, unverified) = as_status_lists(walked);
+    let mut listed: Vec<String> = status
+      .unverified
+      .iter()
+      .map(|(path, _)| path.clone())
+      .collect();
+    listed.sort();
+    assert!(
+      !status.drift.is_empty() && !listed.is_empty(),
+      "the test drifts and refuses"
+    );
+    assert_eq!(
+      drifted, status.drift,
+      "drifted (limit {limit}, every {every})"
+    );
+    assert_eq!(
+      unverified, listed,
+      "unverified (limit {limit}, every {every})"
+    );
+  }
 }

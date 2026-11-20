@@ -2,13 +2,14 @@
 //! written through it and read back — no privilege, no kernel extension, no Apple entitlement (§4.6,
 //! R10). It starts an in-process daemon (the same `Daemon` the `slates` binary supervises), provisions
 //! a volume through the real client, and then does exactly what `slates mount ID DIR` does: runs
-//! `mount_nfs` against the daemon's loopback NFS port with the options `crates/cli/src/mount.rs`
+//! `mount_nfs` against the daemon's loopback NFS port with the options `crates/api/src/mount.rs`
 //! builds. Where `crates/bridge-nfs/examples/nfs_loopback.rs` prints a port for a human to mount by
 //! hand, this drives the whole lifecycle to a real kernel mount and back, automatically.
 //!
-//! It cannot call the `slates mount` code directly — that lives in the `slates` binary crate, reachable
-//! only as the built command — so it mirrors the command's mechanism here and names the source. The
-//! integration test `crates/cli/tests/cli.rs` drives the actual binary end to end.
+//! It drives the `mount_nfs` program form of the mount (the BSDs'), where `slates mount` on macOS calls
+//! `mount(2)` through the library (`slates_api::Instance::mount`, A-34) so that no capability shows in
+//! `ps`; it names the source it mirrors. The integration test `crates/cli/tests/cli.rs` drives the actual
+//! binary end to end.
 //!
 //! Run (macOS/BSD): `cargo run -p slates-cli --example slates_mount`
 
@@ -31,16 +32,20 @@ const PROBE_MS: u64 = 5;
 /// up — `Daemon::start` returns as the shards come up, a beat before the rendezvous is connectable.
 const CONNECT_WAIT_SECS: u64 = 5;
 
-/// A live kernel mount, torn down (`umount` then `rmdir`) when dropped, so even a panic mid-demo leaves
-/// no mount or temp directory behind. Both steps are best-effort — a leftover mount is worse than a
-/// swallowed teardown error.
+/// A live kernel mount, torn down (`umount`, forced if refused, then `rmdir`) when dropped, so even a panic
+/// mid-demo leaves no mount or temp directory behind. Both steps are best-effort — a leftover mount is worse than a
+/// swallowed teardown error, and since A-229 the mount is hard, so one left behind once its daemon is gone hangs
+/// whatever touches it; a plain unmount is refused while a file on it is open.
 struct Mounted {
   path: String,
 }
 
 impl Drop for Mounted {
   fn drop(&mut self) {
-    let _ = Command::new("umount").arg(&self.path).output();
+    let plain = Command::new("umount").arg(&self.path).output();
+    if !plain.is_ok_and(|out| out.status.success()) {
+      let _ = Command::new("umount").arg("-f").arg(&self.path).output();
+    }
     let _ = Command::new("rmdir").arg(&self.path).output();
   }
 }
@@ -100,7 +105,7 @@ fn connect(instance: &str) -> Client {
   }
 }
 
-/// The exact `mount_nfs` options `slates mount` builds (`crates/cli/src/mount.rs::mount_args`): NFSv3
+/// The exact `mount_nfs` options `slates mount` builds (`crates/api/src/mount.rs::mount_args`): NFSv3
 /// over TCP, the daemon's port for both NFS and MOUNT (one server), `noresvport` for the unprivileged
 /// mount (R10), `hard,intr` so a call waits as long as the daemon asks and a signal still ends the wait, `locallocks,nosuid,nodev,rdirplus`, and
 /// `actimeo=1` (the derived attribute-cache timeout).

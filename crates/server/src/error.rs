@@ -6,7 +6,7 @@ use std::fmt;
 use slates_anchor::AnchorError;
 use slates_db::DbError;
 use slates_ipc::IpcError;
-use slates_ipc::protocol::Refusal;
+use slates_ipc::protocol::{DatabaseRefusal, Refusal, TargetRefusal, VolumeRefusal};
 use slates_mem::MemError;
 use slates_rt::RtError;
 use slates_vfs::error::VfsError;
@@ -120,6 +120,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       existing: slates_ipc::protocol::VolumeId::default(),
     },
     VfsError::NoSpace => Refusal::NoSpace,
+    // A snapshot's retention, typed apart from the quota (§4.2 `RetentionBudgetExceeded`; until 2026-11-18 `NoSpace`).
+    VfsError::RetentionExceeded => volume(VolumeRefusal::RetentionExceeded),
     VfsError::RecoveryIncomplete | VfsError::Integrity => Refusal::ContentUnavailable,
     // The wire's taxonomy names one kind for a name the volume will not take, whatever the reason.
     VfsError::InvalidName | VfsError::NameTooLong => Refusal::InvalidName,
@@ -128,10 +130,7 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::PolicyMismatch => Refusal::PolicyMismatch,
     // A read-only attachment's or a snapshot view's change, on the wire as the read-only volume it is.
     VfsError::ReadOnly => Refusal::ReadOnlyVolume,
-    VfsError::BaseUnavailable(errno) => Refusal::BaseUnavailable {
-      path: String::new(),
-      errno: *errno,
-    },
+    VfsError::BaseUnavailable(code) => base_unavailable(String::new(), *code),
     VfsError::Memory(MemError::BudgetExceeded { available, .. }) => Refusal::BudgetExceeded {
       available: *available,
     },
@@ -150,13 +149,63 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::Delegated => Refusal::Unpublished {
       reason: "the file is delegated to an NFSv4 client; its recall is under way".to_owned(),
     },
+    // Retryable under the same id: an S3 base's fetch of what the request reads is under way (A-524).
+    VfsError::BasePending(_) => Refusal::Unpublished {
+      reason: "the overlay's base is fetching what the request reads".to_owned(),
+    },
     VfsError::TreeTooDeep { limit } => Refusal::Unsupported {
       feature: format!("archiving a tree deeper than {limit} path components"),
     },
-    other => Refusal::BadRequest {
-      reason: format!("{other:?}"),
+    VfsError::BarrierIncomplete {
+      attachment,
+      generation,
+    } => Refusal::BarrierIncomplete {
+      attachment: *attachment,
+      generation: *generation,
     },
+    // Every other refusal of the volume core, typed by its class (A-299): until 2026-11-18 each reached a client as
+    // `BadRequest` carrying its name. No catch-all: a new volume-core refusal does not compile until it is named.
+    VfsError::Memory(_) => volume(VolumeRefusal::Memory),
+    VfsError::NotDirectory => volume(VolumeRefusal::NotDirectory),
+    VfsError::IsDirectory => volume(VolumeRefusal::IsDirectory),
+    VfsError::NotEmpty => volume(VolumeRefusal::NotEmpty),
+    VfsError::Invalid => volume(VolumeRefusal::Invalid),
+    VfsError::NoAttribute => volume(VolumeRefusal::NoAttribute),
+    VfsError::NotPermitted => volume(VolumeRefusal::NotPermitted),
+    VfsError::LinkProtected => volume(VolumeRefusal::LinkProtected),
+    VfsError::SpecialFileOperation => volume(VolumeRefusal::SpecialFileOperation),
+    VfsError::TooManyLinks => volume(VolumeRefusal::TooManyLinks),
+    VfsError::FileTooLarge => volume(VolumeRefusal::FileTooLarge),
+    VfsError::CrossVolumeMove => volume(VolumeRefusal::CrossVolumeMove),
+    VfsError::StaleHandle => volume(VolumeRefusal::StaleHandle),
+    VfsError::Pinned => volume(VolumeRefusal::Pinned),
+    VfsError::DaxMapped => volume(VolumeRefusal::DaxMapped),
+    VfsError::BaseDrift => volume(VolumeRefusal::BaseDrift),
+    VfsError::NotOverlay => volume(VolumeRefusal::NotOverlay),
+    VfsError::DigestCacheFull => volume(VolumeRefusal::DigestCacheFull),
+    VfsError::JournalIncomplete { needed, oldest } => volume(VolumeRefusal::JournalIncomplete {
+      needed: *needed,
+      oldest: *oldest,
+    }),
+    VfsError::RecoveryVersion { found, expected } => volume(VolumeRefusal::RecoveryVersion {
+      found: *found,
+      expected: *expected,
+    }),
   }
+}
+
+/// A volume-core refusal no other variant names, typed (A-299).
+fn volume(refusal: VolumeRefusal) -> Refusal {
+  Refusal::Volume { refusal }
+}
+
+/// The wire refusal for a memory refusal met outside the volume core: a reservation's at admission (bytes, version
+/// slots, the metadata ledger) or a registry's (§4.2). The volume core's own table types it, as it types
+/// `VfsError::Memory`: the budget's refusal names what is available, the lock's what it locked, and every other is the
+/// typed memory refusal. Until 2026-11-18 eleven admission arms and a full registry answered in words, `BadRequest`
+/// carrying the error's text (A-299's sibling sweep).
+pub fn refusal_of_mem(e: &MemError) -> Refusal {
+  refusal_of_vfs(&VfsError::Memory(e.clone()))
 }
 
 /// The wire refusal for a database refusal.
@@ -183,8 +232,243 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
         reason: format!("{unpublished}"),
       }
     }
-    other => Refusal::BadRequest {
-      reason: format!("{other}"),
+    DbError::Memory(e) => refusal_of_mem(e),
+    // Every other database refusal, typed by its class (A-299): until 2026-11-18 each reached a client as `BadRequest`
+    // carrying its words. No catch-all: a new database refusal does not compile until it is named.
+    DbError::Corrupt { seq, .. } => database(DatabaseRefusal::Corrupt { seq: *seq }),
+    DbError::NfsInstanceRegressed { current } => {
+      database(DatabaseRefusal::NfsInstanceRegressed { current: *current })
+    }
+    DbError::CheckpointOutOfRange {
+      version,
+      held,
+      head,
+    } => database(DatabaseRefusal::CheckpointOutOfRange {
+      version: *version,
+      held: *held,
+      head: *head,
+    }),
+    DbError::SealKeyMalformed { len } => database(DatabaseRefusal::SealKeyMalformed {
+      len: u64::try_from(*len).unwrap_or(u64::MAX),
+    }),
+    DbError::Wire(_) => database(DatabaseRefusal::Encoding),
+    // A moved volume's release refused while it holds attachment records (A-291): the move's own refusal of an
+    // attached volume, since a writer must detach before the volume leaves.
+    DbError::Attached { .. } => Refusal::MoveRefused {
+      reason: slates_ipc::protocol::MoveRefusal::Attached,
     },
+    // A repository's namespace binds greens only, under non-empty names without NUL bytes (§4.17.1, A-515).
+    DbError::NotGreen => Refusal::NotGreen,
+    DbError::InvalidName => Refusal::InvalidName,
+    // A green live members of its lineage were made from is pinned by them, as a snapshot by its clones (A-575).
+    DbError::BranchedFrom { .. } => volume(VolumeRefusal::Pinned),
+    // A review record's change its rules refuse (§4.17.1 shared piece 6, A-596): an argument the change does not take
+    // (a version not after the record's, an approval bound back, an outdated comment moved). No verb records review
+    // operations yet; the review verbs (owed) type their refusals on the wire, as A-299 did the database's.
+    DbError::Review(_) => volume(VolumeRefusal::Invalid),
+    // An entry of a repository's logs refused (A-603, A-642): a green moved from the position the push read, named; a
+    // check that no longer holds; or a state change made against another state. Each server answers its tool's words
+    // for a repository that moved under the push.
+    DbError::Moved { green, read, at } => database(DatabaseRefusal::Moved {
+      green: slates_ipc::protocol::VolumeId { bytes: *green },
+      read: *read,
+      at: *at,
+    }),
+    DbError::CheckFailed { index } => database(DatabaseRefusal::CheckFailed { index: *index }),
+    DbError::StateChanged { index } => database(DatabaseRefusal::StateChanged { index: *index }),
+    // A repository's policy set from a version it has moved past, or one its repository cannot hold (A-622).
+    DbError::PolicyChanged { current } => Refusal::PolicyChanged { current: *current },
+    DbError::PolicyRuleMalformed { index } => {
+      database(DatabaseRefusal::PolicyRuleMalformed { index: *index })
+    }
+    DbError::PolicyHookMalformed { index } => {
+      database(DatabaseRefusal::PolicyHookMalformed { index: *index })
+    }
+    DbError::PolicyHooksEnvMalformed { index } => {
+      database(DatabaseRefusal::PolicyHooksEnvMalformed { index: *index })
+    }
+  }
+}
+
+/// A database refusal no other variant names, typed (A-299).
+fn database(refusal: DatabaseRefusal) -> Refusal {
+  Refusal::Database { refusal }
+}
+
+/// The wire refusal for a target the verb cannot use (§4.15 step 4, §4.6), typed (A-299): until 2026-11-18 each was
+/// `TargetUnavailable` carrying words.
+pub fn target(refusal: TargetRefusal) -> Refusal {
+  Refusal::Target { refusal }
+}
+
+/// A host's refusal of a target path (a landing's directory, a mount point), typed.
+pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
+  use slates_vfs::host::HostError as H;
+  match e {
+    H::NotFound => TargetRefusal::Missing,
+    H::NotDirectory => TargetRefusal::NotDirectory,
+    H::NotFile => TargetRefusal::NotFile,
+    H::StaleHandle => TargetRefusal::Stale,
+    // The code in the variant of its numbering (A-539): an errno in `Host`, a Win32 code in `HostWin32`.
+    H::Exists(code)
+    | H::NoSpace(code)
+    | H::Unsupported(code)
+    | H::Unavailable(code)
+    | H::Unprivileged(code)
+    | H::OwnMount(code) => match code {
+      slates_vfs::host::OsCode::Win32(code) => TargetRefusal::HostWin32 { code: *code },
+      slates_vfs::host::OsCode::Errno(errno) => TargetRefusal::Host { errno: *errno },
+    },
+    // A target is a directory host's, which never answers a pending fetch (an S3 base's, A-524); were one to, it is a
+    // refusal no code names.
+    H::Pending(_) => TargetRefusal::Host { errno: 0 },
+  }
+}
+
+/// A base directory unavailable at `path`, by the code its host named, in the variant of its numbering (A-539): an
+/// errno in `BaseUnavailable` (0 where the host named none), a Win32 code in `BaseUnavailableWin32`.
+pub fn base_unavailable(path: String, code: Option<slates_vfs::host::OsCode>) -> Refusal {
+  match code {
+    Some(slates_vfs::host::OsCode::Win32(code)) => Refusal::BaseUnavailableWin32 { path, code },
+    Some(slates_vfs::host::OsCode::Errno(errno)) => Refusal::BaseUnavailable { path, errno },
+    None => Refusal::BaseUnavailable { path, errno: 0 },
+  }
+}
+
+/// Why a mount was not recorded as this daemon's own (A-227), typed.
+#[cfg(unix)]
+pub fn target_of_unrecorded(why: slates_base::own_mounts::Unrecorded) -> TargetRefusal {
+  use slates_base::own_mounts::Unrecorded;
+  match why {
+    Unrecorded::NotMounted => TargetRefusal::NotMounted,
+    Unrecorded::Full(full) => records_full(full),
+  }
+}
+
+/// The refusal of a mount past the most this daemon records as its own (A-227).
+pub fn records_full(full: slates_base::own_mounts::Full) -> TargetRefusal {
+  TargetRefusal::RecordsFull {
+    capacity: u64::try_from(full.capacity).unwrap_or(u64::MAX),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_ipc::protocol::{Refusal, VolumeRefusal};
+  use slates_mem::MemError;
+
+  use super::{refusal_of_db, refusal_of_mem};
+  use slates_db::DbError;
+  use slates_ipc::protocol::DatabaseRefusal;
+
+  /// A-299's sibling sweep (2026-11-18): do map a memory refusal of each shape admission meets (the budget's, the
+  /// lock's, a full slab or registry, an exhausted arena, an OS refusal). Expect each typed: the budget's with what is
+  /// available, the lock's with what it locked, the rest the volume core's memory refusal; none in words.
+  #[test]
+  fn every_memory_refusal_at_admission_is_typed() {
+    assert_eq!(
+      refusal_of_mem(&MemError::BudgetExceeded {
+        requested: 6,
+        available: 7
+      }),
+      Refusal::BudgetExceeded { available: 7 }
+    );
+    assert_eq!(
+      refusal_of_mem(&MemError::LockRefused {
+        requested: 8,
+        locked: 9,
+        code: None
+      }),
+      Refusal::BudgetExceeded { available: 9 }
+    );
+    for memory in [
+      MemError::SlabFull { capacity: 3 },
+      MemError::ArenaExhausted {
+        requested: 4,
+        largest_free: 5,
+      },
+      MemError::OsRefused {
+        call: "mmap",
+        code: None,
+      },
+    ] {
+      assert_eq!(
+        refusal_of_mem(&memory),
+        Refusal::Volume {
+          refusal: VolumeRefusal::Memory
+        },
+        "{memory:?}"
+      );
+    }
+  }
+
+  /// A-596 (§4.17.1 shared piece 6). Do: map each rule a review record's change can break. Expect each typed as the
+  /// volume core's `Invalid`, an argument the change does not take, never words.
+  #[test]
+  fn every_review_refusal_is_typed() {
+    use slates_db::error::ReviewRefusal;
+    for rule in [
+      ReviewRefusal::Outdated,
+      ReviewRefusal::Stale,
+      ReviewRefusal::NotAfter,
+      ReviewRefusal::Behind,
+      ReviewRefusal::Ended,
+      ReviewRefusal::Empty,
+    ] {
+      assert_eq!(
+        refusal_of_db(&DbError::Review(rule)),
+        Refusal::Volume {
+          refusal: VolumeRefusal::Invalid
+        },
+        "{rule:?}"
+      );
+    }
+  }
+
+  /// A-299's sibling sweep (2026-11-18): do map each database refusal `refusal_of_db` answered in words before (a
+  /// corrupt record, a regressed NFSv4 instance, a checkpoint out of range, a malformed sealing key, a refused
+  /// encoding). Expect each typed as `Refusal::Database` with its fields, none `BadRequest`.
+  #[test]
+  fn every_database_refusal_is_typed() {
+    let cases = [
+      (
+        DbError::Corrupt {
+          seq: 3,
+          reason: "checksum",
+        },
+        DatabaseRefusal::Corrupt { seq: 3 },
+      ),
+      (
+        DbError::NfsInstanceRegressed { current: 4 },
+        DatabaseRefusal::NfsInstanceRegressed { current: 4 },
+      ),
+      (
+        DbError::CheckpointOutOfRange {
+          version: 5,
+          held: 6,
+          head: 7,
+        },
+        DatabaseRefusal::CheckpointOutOfRange {
+          version: 5,
+          held: 6,
+          head: 7,
+        },
+      ),
+      (
+        DbError::SealKeyMalformed { len: 8 },
+        DatabaseRefusal::SealKeyMalformed { len: 8 },
+      ),
+      (
+        DbError::Wire(slates_wire::error::WireError::Truncated { needed: 9 }),
+        DatabaseRefusal::Encoding,
+      ),
+    ];
+    for (error, typed) in cases {
+      assert_eq!(
+        refusal_of_db(&error),
+        Refusal::Database { refusal: typed },
+        "{error:?}"
+      );
+    }
   }
 }

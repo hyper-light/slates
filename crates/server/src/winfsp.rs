@@ -14,11 +14,11 @@
 //! request over a bounded channel and wake it (§4.3 "Drivers": "WinFsp requests arrive on WinFsp's threads and are
 //! routed to the owning shard by handle"); each turn serves one request whole with a transient `VolumeBridge` over the
 //! shard's slot, admitted under the mount's registry attachment so a barrier over the volume sees it in flight. A request
-//! that changed what survives a restart (a namespace or size change, a flush, the close of a handle that wrote)
-//! publishes the shard's recovery image before its reply (§4.8, D-18), as the FUSE and NFS transports' do; a refused
-//! publication answers `STATUS_UNEXPECTED_IO_ERROR`. The task yields between requests so a busy mount never holds its
-//! shard. While the owner may not serve the volume's latest state (the live-tree fence, AUD-29-83) no request is
-//! taken: WinFsp's dispatcher waits, asked again each heartbeat.
+//! that changed what survives a restart (a namespace or size change, a write (A-379), a flush, the close of a handle
+//! that wrote) publishes the shard's recovery image before its reply (§4.8, D-18), as the FUSE and NFS transports' do;
+//! a refused publication answers `STATUS_UNEXPECTED_IO_ERROR`. The task yields between requests so a busy mount never
+//! holds its shard. While the owner may not serve the volume's latest state (the live-tree fence, AUD-29-83) no request
+//! is taken: WinFsp's dispatcher waits, asked again each heartbeat.
 //!
 //! **Coherence (§4.6 "Cache posture").** Windows keeps what it fetched for as long as the mount does not say otherwise
 //! (`FileInfoTimeout` infinite), so the mount tells it of every change made through any other path — the SDK, another
@@ -41,8 +41,9 @@
 //!
 //! **The file system is deleted only after the anchor released its hold.** The anchor's copies keep the volume and the
 //! drive whoever else closes theirs, so a file system deleted first leaves a drive nobody serves. A `detach` therefore
-//! asks the anchor while the mount goes on serving, repeating the request for [`crate::anchor_hold::RELEASE_BOUND_NS`],
-//! and only an answer ends the attachment and removes the drive. Past the bound the detach is answered a typed refusal:
+//! asks the anchor while the mount goes on serving, repeating the request within the bound the anchor's answers are
+//! waited for ([`crate::anchor_hold::release_bound_ns`], learned from them, A-552), and only an answer ends the
+//! attachment and removes the drive. Past the bound the detach is answered a typed refusal:
 //! the drive stays served and held. The request stands, since it may already be waiting in the pipe for the anchor's
 //! next turn, so it goes on being repeated, and the anchor's answer ends the mount then. Every other end (a destroy, a
 //! revocation, a mount refused or lost) has already ended the attachment, so it stops serving and waits for the same
@@ -50,8 +51,8 @@
 //! holds one task and one message per mount, and ends at the answer or at the shard's stop. A daemon with no anchor
 //! holds nothing, so nothing waits; its mount is refused at the hold.
 //!
-//! Across a killed daemon the anchor holds the control, drive-link and ledger
-//! objects (A-198); recovery retains a matching catalog attachment, builds a successor dispatcher for that held volume,
+//! Across a killed daemon the anchor holds the control and ledger objects (A-198), and the held volume keeps its Mount
+//! Manager drive (A-369); recovery retains a matching catalog attachment, builds a successor dispatcher for that held volume,
 //! and seeds its coherence names from the ledger's live opens. An old context resolves by stable file identity, with
 //! the old process's bridge handle suppressed. The 20-kill CLI oracle also requires a counted uncached read through
 //! the old handle, so cached bytes cannot stand in for a successor serving it.
@@ -67,8 +68,11 @@ use slates_bridge_core::{
 };
 use slates_bridge_winfsp::held::{Record as HeldRecord, windows::Inherited};
 use slates_bridge_winfsp::host::Ready;
-use slates_bridge_winfsp::host::{MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request};
-use slates_bridge_winfsp::notify::{NotifyRound, OpenNames};
+use slates_bridge_winfsp::host::{
+  MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request, Sibling, WinFspError,
+};
+use slates_bridge_winfsp::normalized::NameSearch;
+use slates_bridge_winfsp::notify::{NotifyRound, OpenNames, spanning};
 use slates_bridge_winfsp::opens::{Ledger, Open};
 use slates_bridge_winfsp::purge::{Purge, purge_range};
 use slates_bridge_winfsp::retry::{PurgeRetries, REQUEST_TIMEOUT_NS, Recorded};
@@ -92,8 +96,9 @@ const BARRIER_REFUSED: &str = "winfsp.barrier_refused";
 const REPLY_UNDELIVERED: &str = "winfsp.reply_undelivered";
 /// Counter: flush replies held until their live-shipped volume was durable (A-200).
 const LIVE_FLUSH_HELD: &str = "winfsp.live_flush_held";
-/// Counter: held flush replies answered `STATUS_UNEXPECTED_IO_ERROR`: the wait passed, the volume was destroyed or its
-/// owner superseded, or the mount already held its bound of them.
+/// Counter: held flush replies answered `STATUS_UNEXPECTED_IO_ERROR`: the wait gave up (a window with nothing heard, or
+/// its total bound; `slates_bridge_core::durable_bound`), the volume was destroyed or its owner superseded, or the mount
+/// already held its bound of them.
 const LIVE_FLUSH_REFUSED: &str = "winfsp.live_flush_refused";
 /// Format: see [`MOUNT_REFUSED`] — a mount's thread ended without being asked (its file system is gone).
 const MOUNT_LOST: &str = "winfsp.mount_lost";
@@ -111,6 +116,11 @@ const ROUNDS_REFUSED: &str = "winfsp.rounds_refused";
 /// Format: rounds that found the mount behind its volume journal's retention and told Windows of every name it holds
 /// open (A-141's overrun). Zero is the healthy reading.
 const JOURNAL_OVERRUNS: &str = "winfsp.journal_overruns";
+/// Format: rounds whose gather ran out of its turn with records still owed, sent over several turns (A-562): the signal
+/// that a mount's rounds outgrow the shard's step.
+const ROUNDS_OUTGROWN: &str = "winfsp.rounds_outgrown";
+/// Format: gathers that resumed a round where an earlier one stopped (A-562): the sliced rounds' non-vacuity counter.
+const SLICES_RESUMED: &str = "winfsp.slices_resumed";
 /// Format: names left out of a round for being longer than any WinFsp path. Zero is the healthy reading.
 const NAMES_TOO_LONG: &str = "winfsp.names_too_long";
 /// Format: files whose changed ranges the mount thread purged from Windows' cache and every view mapped of them
@@ -169,6 +179,12 @@ pub(crate) struct WinFspMount {
   round_out: Option<Option<InvalidationCursor>>,
   /// A round is owed although the volume's generation has not moved since: the last one was put back.
   owed: bool,
+  /// Changes through one name of a file that has others (A-360), owed to its other open names at the next round: for
+  /// each file and the name the change came through, the bytes changed. At most one entry an open handle Windows holds
+  /// ([`owe_siblings`]); past that, [`WinFspMount::siblings_widened`] tells every open name instead.
+  siblings: BTreeMap<(u64, String), CachedBytes>,
+  /// The changes owed through [`WinFspMount::siblings`] outgrew its bound: the next round tells every open name.
+  siblings_widened: bool,
   /// The volume's change generation as of the mount's last delivered round (`Volume::change_generation`).
   seen: u64,
   /// The mount is to end at its task's next turn: its attachment ended (`end_if_mounted`).
@@ -192,6 +208,9 @@ pub(crate) struct WinFspMount {
   /// Flush replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
   /// first ([`settle_held`]); bounded by `live_ship::reply_hold_bound`. WinFsp's dispatcher waits on each meanwhile.
   held: VecDeque<HeldFlush>,
+  /// What this mount's journal reader's rounds have shown of Windows' pace (A-548): the reader's patience is learned
+  /// from them after every turn (`crate::reader_patience`).
+  patience: crate::learned_wait::LearnedWait,
 }
 
 /// A WinFsp volume's id in the process's set of its own mounts (`slates_base::own_mounts`, A-227): its kernel name's,
@@ -202,12 +221,8 @@ struct OwnVolumeRecord(u64);
 impl OwnVolumeRecord {
   fn of(volume: &[u16]) -> Result<Self, Refusal> {
     let id = slates_base::own_mounts::volume_id(volume);
-    slates_base::own_mounts::record(id).map_err(|full| Refusal::TargetUnavailable {
-      reason: format!(
-        "the WinFsp volume is past the {} mounts this daemon records as its own",
-        full.capacity
-      ),
-    })?;
+    slates_base::own_mounts::record(id)
+      .map_err(|full| crate::error::target(crate::error::records_full(full)))?;
     Ok(Self(id))
   }
 }
@@ -218,11 +233,14 @@ impl Drop for OwnVolumeRecord {
   }
 }
 
-/// A flush's reply held for durability (A-200): the reply, the log position it waits for and when it gives up.
+/// A flush's reply held for durability (A-200): the reply, the log position it waits for, when it was held, and its wait.
 struct HeldFlush {
   served: slates_bridge_winfsp::host::Served,
   target: u64,
-  deadline_ns: u64,
+  held_at_ns: u64,
+  /// When it gives up: a window with nothing heard on the volume's durability path, or its total bound
+  /// (`slates_bridge_core::durable_bound`, the rule every transport's held durable reply is judged by).
+  bound: slates_bridge_core::durable_bound::DurableBound,
 }
 
 /// The bounded held-ledger/image merge, one inode per owner turn. The held map has at most MAX_OPEN_HANDLES entries.
@@ -259,15 +277,28 @@ pub(crate) struct PendingAttach {
   pub(crate) token: [u8; 16],
 }
 
+/// How the drive of `volume` compares names, as the volume's name policy calls for (A-551): an exact volume's drive
+/// declares `CaseSensitiveSearch`, and a folding one's compares names by the system's upcase table, as NTFS does, so
+/// every spelling of a file is one of WinFsp's file nodes. A held drive keeps the search its record names
+/// (`slates_bridge_winfsp::host::MountThread::start`). Refused `NotFound` for a volume this shard does not serve.
+fn name_search(s: &ShardState, volume: VolumeId) -> Result<NameSearch, Refusal> {
+  let handle = *s.by_id.get(&volume).ok_or(Refusal::NotFound)?;
+  let slot = s.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+  Ok(NameSearch::of(
+    slot.volume.policy(),
+    slates_bridge_winfsp::host::system_upcase,
+  ))
+}
+
 /// Checks a WinFsp mount point before any effect: a drive letter and its colon (`S:`). A directory is refused, as §4.6
 /// decides (a directory mount is an NTFS reparse point, which leaves a directory beneath the mount).
 pub(crate) fn check_mount_point(path: &str) -> Result<(), Refusal> {
   let mut chars = path.chars();
   match (chars.next(), chars.next(), chars.next()) {
     (Some(letter), Some(':'), None) if letter.is_ascii_alphabetic() => Ok(()),
-    _ => Err(Refusal::TargetUnavailable {
-      reason: format!("the WinFsp mount point {path} is not a drive letter (`S:`)"),
-    }),
+    _ => Err(crate::error::target(
+      slates_ipc::protocol::TargetRefusal::NotADriveLetter,
+    )),
   }
 }
 
@@ -278,6 +309,10 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
     return crate::verbs::refused(Refusal::Unsupported {
       feature: "a WinFsp mount outside a recorded request".to_owned(),
     });
+  };
+  let search = match name_search(state, pending.record.volume) {
+    Ok(search) => search,
+    Err(refusal) => return crate::verbs::refused(refusal),
   };
   let route = state.reply_route.take();
   let cause = state.current_span;
@@ -294,35 +329,42 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
     let (sender, requests) = sync_channel::<Request>(REQUEST_BOUND);
     let mounted = match MountThread::start(
       &mount_point,
-      !pending.rights.write,
+      (!pending.rights.write, search),
       sender,
       waker.clone(),
       MAX_OPEN_HANDLES,
       None,
     ) {
       Ok(thread) => await_mounted(thread).await,
-      Err(error) => Err((error.to_string(), None)),
+      Err(error) => Err((mount_refusal(&error), error.to_string(), None)),
     };
     // A hold the anchor may yet read names this process's objects, so a refused one keeps them until it is released.
+    // Each refusal is typed for the reply (A-299) and keeps its words for the log.
+    let refused_mount = slates_ipc::protocol::TargetRefusal::MountRefused { errno: None };
     let mut _unheld = None;
     let mounted = match mounted {
       Ok((thread, ready)) => {
         let held = match (ready.handle_values(), ready.offer.record.encode()) {
           (Ok(values), Ok(record)) => crate::anchor_hold::hold_mount(attachment, values, record)
             .await
-            .map_err(|error| format!("the anchor's hold: {error}")),
-          (Err(error), _) => Err(error.to_string()),
-          (_, Err(error)) => Err(format!("held mount record: {error:?}")),
+            .map_err(|error| {
+              (
+                slates_ipc::protocol::TargetRefusal::AnchorHold,
+                format!("the anchor's hold: {error}"),
+              )
+            }),
+          (Err(error), _) => Err((refused_mount, error.to_string())),
+          (_, Err(error)) => Err((refused_mount, format!("held mount record: {error:?}"))),
         };
         match held {
           Ok(()) => Ok((thread, ready)),
-          Err(error) => {
+          Err((refusal, why)) => {
             _unheld = Some(ready);
-            Err((error, Some(thread)))
+            Err((refusal, why, Some(thread)))
           }
         }
       }
-      Err(error) => Err(error),
+      Err((refusal, why, thread)) => Err((refusal, why, thread)),
     };
     let served = state::with_state_counted(|s| {
       let mut reaped = None;
@@ -332,13 +374,14 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
           reaped = refused_thread;
           reply
         }
-        Err((why, thread)) => {
+        Err((refusal, why, thread)) => {
           s.count(MOUNT_REFUSED, 1);
           crate::verbs::release_unrecorded_lease(s, &pending.record);
           reaped = thread;
-          crate::verbs::refused(Refusal::TargetUnavailable {
-            reason: format!("the WinFsp mount at {mount_point} was refused: {why}"),
-          })
+          slates_machine::log_line!(
+            "slates-server: the WinFsp mount at {mount_point} was refused: {why}"
+          );
+          crate::verbs::refused(crate::error::target(refusal))
         }
       });
       deliver(s, reply, route);
@@ -367,12 +410,9 @@ pub(crate) fn defer_detach(state: &mut ShardState, record: &AttachmentRecord) ->
   let request = state.current_request?;
   let mount = state.winfsp_mounts.get_mut(&attachment)?;
   if mount.detaching {
-    return Some(crate::verbs::refused(Refusal::TargetUnavailable {
-      reason: format!(
-        "the drive {} waits for the anchor to release its hold; a detach already asked for this",
-        mount.mount_point
-      ),
-    }));
+    return Some(crate::verbs::refused(crate::error::target(
+      slates_ipc::protocol::TargetRefusal::DetachPending,
+    )));
   }
   mount.detaching = true;
   let route = state.reply_route.take();
@@ -380,18 +420,20 @@ pub(crate) fn defer_detach(state: &mut ShardState, record: &AttachmentRecord) ->
   let shard = state.shard;
   let record = record.clone();
   let task = async move {
-    let answered = release_within(attachment, crate::anchor_hold::RELEASE_BOUND_NS).await;
+    let answered = release_within(attachment, crate::anchor_hold::release_bound_ns()).await;
     let refused = answered.is_err();
     let _ = state::with_state_counted(|s| {
       let reply = complete(s, request, cause, attachment, |s| match &answered {
         Ok(()) => end_released(s, &record),
         Err(error) => {
           s.count(DETACH_REFUSED, 1);
-          crate::verbs::refused(Refusal::TargetUnavailable {
-            reason: format!(
-              "the anchor has not released the drive it holds, so the file system still serves it: {error}"
-            ),
-          })
+          slates_machine::log_line!(
+            "slates-server: the anchor has not released the drive it holds, so the file system still serves it: \
+             {error}"
+          );
+          crate::verbs::refused(crate::error::target(
+            slates_ipc::protocol::TargetRefusal::AnchorHold,
+          ))
         }
       });
       deliver(s, reply, route);
@@ -435,19 +477,38 @@ fn end_released(s: &mut ShardState, record: &AttachmentRecord) -> ReplyBody {
   }
 }
 
+/// The typed refusal a mount's failure is answered (A-299, A-369): a machine that does not let WinFsp's driver make a
+/// Mount Manager drive and a letter another volume has by name, an OS refusal by its number, anything else as a
+/// refused mount whose words are in the daemon's log.
+fn mount_refusal(error: &WinFspError) -> slates_ipc::protocol::TargetRefusal {
+  use slates_ipc::protocol::TargetRefusal;
+  match error {
+    WinFspError::MountManagerNotAllowed => TargetRefusal::MountManagerNotAllowed,
+    WinFspError::DriveLetterTaken => TargetRefusal::DriveLetterTaken,
+    WinFspError::Os { code, .. } => TargetRefusal::MountRefused { errno: *code },
+    _ => TargetRefusal::MountRefused { errno: None },
+  }
+}
+
+/// A mount that did not come up: its typed refusal, its words for the log, and the thread to reap.
+type Unmounted = (
+  slates_ipc::protocol::TargetRefusal,
+  String,
+  Option<MountThread>,
+);
+
 /// Waits, without holding the shard, for the mount thread's first outcome: the thread when the drive is mounted, or why
 /// not with the thread to reap.
-async fn await_mounted(
-  mut thread: MountThread,
-) -> Result<(MountThread, Ready), (String, Option<MountThread>)> {
+async fn await_mounted(mut thread: MountThread) -> Result<(MountThread, Ready), Unmounted> {
   loop {
     match thread.outcome() {
       Some(Outcome::Mounted(Ok(ready))) => return Ok((thread, *ready)),
       Some(Outcome::Mounted(Err(error)) | Outcome::Failed(error)) => {
-        return Err((error.to_string(), Some(thread)));
+        return Err((mount_refusal(&error), error.to_string(), Some(thread)));
       }
       Some(Outcome::Stopped) => {
         return Err((
+          slates_ipc::protocol::TargetRefusal::MountRefused { errno: None },
           "the mount thread ended before mounting".to_owned(),
           Some(thread),
         ));
@@ -624,10 +685,12 @@ fn keep(
       registry,
       volume: record.volume,
       mount_point: record.form.mount_point().unwrap_or_default().to_owned(),
-      names: OpenNames::new(),
+      names: OpenNames::searching(ready.search),
       coherence: Coherence::new(),
       round_out: None,
       owed: takeover,
+      siblings: BTreeMap::new(),
+      siblings_widened: false,
       seen: 0,
       ending: false,
       waker,
@@ -638,6 +701,7 @@ fn keep(
       released: false,
       _own: own,
       held: VecDeque::new(),
+      patience: crate::learned_wait::LearnedWait::default(),
     },
   );
   open_journal_reader(s, record.volume, registry);
@@ -718,17 +782,15 @@ fn checked_inherited(mount: crate::anchor_hold::HandedMount) -> Option<Inherited
     }
   };
   let mut handles = mount.handles.into_iter();
-  let (Some(volume), Some(link), Some(ledger)) = (handles.next(), handles.next(), handles.next())
-  else {
+  let (Some(volume), Some(ledger)) = (handles.next(), handles.next()) else {
     slates_machine::log_line!(
-      "slates-server: held mount {} has fewer than three handles",
+      "slates-server: held mount {} has fewer than its two handles",
       mount.attachment
     );
     return None;
   };
   Some(Inherited {
     volume,
-    link,
     ledger,
     record,
   })
@@ -771,18 +833,27 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
     release_hold(attachment).await;
     return;
   };
+  let search = match state::with_state(|s| name_search(s, record.volume)) {
+    Some(Ok(search)) => search,
+    found => {
+      let why = format!("the held mount's volume is not served here: {found:?}");
+      let _ = state::with_state_counted(|s| refuse_adoption(s, &record, &why));
+      release_hold(attachment).await;
+      return;
+    }
+  };
   let waker = std::future::poll_fn(|cx| std::task::Poll::Ready(cx.waker().clone())).await;
   let (sender, requests) = sync_channel(REQUEST_BOUND);
   let mounted = match MountThread::start(
     record.form.mount_point().unwrap_or_default(),
-    !record.rights.write,
+    (!record.rights.write, search),
     sender,
     waker.clone(),
     MAX_OPEN_HANDLES,
     Some(held),
   ) {
     Ok(thread) => await_mounted(thread).await,
-    Err(error) => Err((error.to_string(), None)),
+    Err(error) => Err((mount_refusal(&error), error.to_string(), None)),
   };
   let adopted = state::with_state_counted(|s| match mounted {
     Ok((thread, ready)) => match keep(s, &record, thread, requests, waker, (ready, own), true) {
@@ -795,7 +866,7 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
         Err(Some(thread))
       }
     },
-    Err((why, thread)) => {
+    Err((_, why, thread)) => {
       refuse_adoption(s, &record, &why);
       Err(thread)
     }
@@ -895,6 +966,9 @@ enum Turned {
   Idle,
   /// A request was served.
   Served,
+  /// A round's gather stopped where its slice ended and no round went out whose return would wake the task (A-562): it
+  /// yields and turns again for the rest.
+  Continued,
   /// A rename held WinFsp's lock, so the owed round waits a tick.
   RoundDeferred,
   /// Nothing waited but a purge owed again, due in this many nanoseconds: the task waits that long or until it is woken.
@@ -928,6 +1002,9 @@ async fn wait_after(turned: Turned) {
       // A served request is client activity, as a FUSE request is (§4.3, §4.7): the shard spins out its idle window
       // after it, so a burst's next request is taken without a wake.
       slates_rt::registry::with_current(|ctx| ctx.note_activity());
+      let _ = futures::yield_now().await;
+    }
+    Turned::Continued => {
       let _ = futures::yield_now().await;
     }
     // `Ended` never reaches here: the loop ends the mount before it waits.
@@ -1026,6 +1103,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   let Ok(cx) = s.attachments.begin(mount.registry) else {
     return Turned::Ended;
   };
+  // A round's gather runs a slice a turn (A-562), timed against the shard's live quantum as every clock-bounded slice is.
+  let slice_ns = s.config.copy_slice_ns();
   let turned = {
     let ShardState { store, volumes, .. } = &mut *s;
     volumes.get_mut(handle).ok().map(|slot| {
@@ -1038,6 +1117,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
         round_out,
         purge_out,
         owed,
+        siblings,
+        siblings_widened,
         thread,
         told,
         volume,
@@ -1059,13 +1140,24 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
           round_out,
           purge_out: *purge_out,
           owed,
+          siblings: Siblings {
+            owed: siblings,
+            widened: siblings_widened,
+          },
           thread,
           told,
           takeover,
         },
+        slice_ns,
       );
       let served = request.map(|request| {
         let served = request.serve(&mut bridge, &cx, names, ledger);
+        if let Some(sibling) = served.sibling_change() {
+          // The file's other names have file nodes and caches of their own (A-360): the next round tells them. Telling
+          // them before this reply would make the receive worker wait on a notification whose purge may need it.
+          owe_siblings(siblings, siblings_widened, names, sibling);
+          *owed = true;
+        }
         coherence.served_own_request(&mut bridge, &cx, delivered.delivered);
         served
       });
@@ -1077,6 +1169,11 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     return Turned::Ended;
   };
   s.count(JOURNAL_OVERRUNS, delivered.overruns);
+  let (outgrown, resumed) = mount.coherence.take_sliced_counts();
+  s.count(ROUNDS_OUTGROWN, outgrown);
+  s.count(SLICES_RESUMED, resumed);
+  // What the journal reader's rounds found this turn teaches its patience (A-548).
+  crate::reader_patience::learn(s, mount.volume, mount.registry.key(), &mut mount.patience);
   s.count(RECORDS_TOLD, std::mem::take(&mut mount.told));
   s.count(NAMES_TOO_LONG, delivered.too_long);
   // What this turn delivered is behind it, so the task waits past the generation as it now stands; another path's
@@ -1097,6 +1194,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
       Turned::Served
     }
     None if deferred => Turned::RoundDeferred,
+    // The rest of a cut gather is owed now, and no round is out to wake the task when it returns (A-562).
+    None if mount.owed && mount.round_out.is_none() && !mount.purge_out => Turned::Continued,
     None => retry_in.map_or(Turned::Idle, Turned::RetryIn),
   }
 }
@@ -1262,23 +1361,55 @@ struct Rounds<'m> {
   /// A purge-only command is out, so no round is sent until its outcome is read.
   purge_out: bool,
   owed: &'m mut bool,
+  siblings: Siblings<'m>,
   thread: &'m MountThread,
   told: &'m mut u64,
   takeover: &'m mut bool,
 }
 
-/// Delivers the owed round when none is out: every invalidation since the cursor, as records naming what Windows holds
-/// open, handed to the mount thread. While a round is out nothing new is gathered (the gather consumes) and the round is
-/// reported refused, so the cursor does not move past what Windows has not been told — the FUSE mount's rule.
+/// A round's view of [`WinFspMount::siblings`] and [`WinFspMount::siblings_widened`] (A-360).
+struct Siblings<'m> {
+  owed: &'m mut BTreeMap<(u64, String), CachedBytes>,
+  widened: &'m mut bool,
+}
+
+/// Owes `sibling` to the next round (A-360), its bytes widened into an entry for the same file and name. A new entry past
+/// one an open handle widens the round to every open name instead, so the record never outgrows what Windows holds.
+fn owe_siblings(
+  owed: &mut BTreeMap<(u64, String), CachedBytes>,
+  widened: &mut bool,
+  names: &OpenNames,
+  sibling: &Sibling,
+) {
+  let key = (sibling.ino, sibling.through.clone());
+  if let Some(bytes) = owed.get_mut(&key) {
+    *bytes = spanning(*bytes, sibling.bytes);
+    return;
+  }
+  if owed.len() >= names.len().max(1) {
+    *widened = true;
+    owed.clear();
+    return;
+  }
+  owed.insert(key, sibling.bytes);
+}
+
+/// Delivers the owed round when none is out: the invalidations since the cursor that `slice_ns` of the serving thread
+/// allows, at least one record's (A-562), as records naming what Windows holds open, handed to the mount thread. A
+/// gather its slice cut leaves the rest owed at once (`WinFspMount::owed`). While a round is out nothing new is
+/// gathered (the gather consumes) and the round is reported refused, so the cursor does not move past what Windows has
+/// not been told — the FUSE mount's rule.
 fn deliver_owed(
   bridge: &mut VolumeBridge<'_>,
   cx: &slates_bridge_core::OpContext,
   mount: Rounds<'_>,
+  slice_ns: u64,
 ) -> Round {
   let refused = Round {
     delivered: Delivered {
       written: 0,
       gather_refused: true,
+      cut: false,
     },
     overruns: 0,
     too_long: 0,
@@ -1291,34 +1422,54 @@ fn deliver_owed(
   let mut overruns = 0u64;
   let mut changed: Vec<(u64, CachedBytes)> = Vec::new();
   let names = mount.names;
-  let Ok(delivered) = mount
-    .coherence
-    .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
-      match invalidation {
-        Invalidation::Everything => overruns = overruns.saturating_add(1),
-        Invalidation::Inode { ino, data } => changed.push((*ino, *data)),
-        Invalidation::Entry { .. } => {}
-      }
-      round.add(invalidation, names);
-      Ok::<(), std::convert::Infallible>(())
-    });
+  let began = std::time::Instant::now();
+  let budget = std::time::Duration::from_nanos(slice_ns);
+  let mut more = || {
+    if began.elapsed() >= budget {
+      std::ops::ControlFlow::Break(())
+    } else {
+      std::ops::ControlFlow::Continue(())
+    }
+  };
+  let Ok(delivered) =
+    mount
+      .coherence
+      .deliver(bridge, cx, &mut more, &mut |invalidation: &Invalidation| {
+        match invalidation {
+          Invalidation::Everything => overruns = overruns.saturating_add(1),
+          Invalidation::Inode { ino, data } => changed.push((*ino, *data)),
+          Invalidation::Entry { .. } => {}
+        }
+        round.add(invalidation, names);
+        Ok::<(), std::convert::Infallible>(())
+      });
   if delivered.gather_refused {
     return refused;
   }
-  if *mount.takeover {
+  if *mount.takeover || *mount.siblings.widened {
     round.add(&Invalidation::Everything, names);
   }
-  *mount.owed = false;
+  for (ino, through) in mount.siblings.owed.keys() {
+    round.add_siblings(*ino, through, names);
+  }
+  // A gather its slice cut owes the rest at once (A-562).
+  *mount.owed = delivered.cut;
   let too_long = round.too_long();
   if !round.is_empty() {
     let purges = purges_owed(
       bridge,
       cx,
       names,
-      (&changed, overruns > 0 || *mount.takeover),
+      (
+        &changed,
+        overruns > 0 || *mount.takeover || *mount.siblings.widened,
+      ),
+      mount.siblings.owed,
     );
     if mount.thread.notify(round.bytes().to_vec(), purges).is_ok() {
       *mount.round_out = Some(before);
+      mount.siblings.owed.clear();
+      *mount.siblings.widened = false;
       *mount.told = mount
         .told
         .saturating_add(u64::try_from(round.records()).unwrap_or(u64::MAX));
@@ -1328,6 +1479,11 @@ fn deliver_owed(
       *mount.owed = true;
       return refused;
     }
+  }
+  if round.is_empty() {
+    // No other name of a changed file is open: nothing caches what it changed.
+    mount.siblings.owed.clear();
+    *mount.siblings.widened = false;
   }
   Round {
     delivered,
@@ -1345,6 +1501,7 @@ fn purges_owed(
   cx: &slates_bridge_core::OpContext,
   names: &OpenNames,
   (changed, everything): (&[(u64, CachedBytes)], bool),
+  siblings: &BTreeMap<(u64, String), CachedBytes>,
 ) -> Vec<Purge> {
   let sector = slates_bridge_winfsp::host::sector_bytes();
   let owed: Vec<(u64, CachedBytes)> = if everything {
@@ -1387,6 +1544,27 @@ fn purges_owed(
       });
     }
   }
+  // A change through one name of a file (A-360): its other names' pages, never the name it came through, whose own
+  // cache saw it; a purge opens the file through the drive with write access, which an open sharing only reads is
+  // refused while it lasts.
+  for ((ino, through), bytes) in siblings {
+    let Ok(attr) = bridge.getattr(ObjectId::new(*ino, 0), cx) else {
+      continue;
+    };
+    let Some((offset, len)) = purge_range(bytes, attr.size, sector) else {
+      continue;
+    };
+    for name in names.open_names(*ino) {
+      if name != through.as_str() {
+        purges.push(Purge {
+          object: ObjectId::new(*ino, 0),
+          path: name.to_owned(),
+          offset,
+          len,
+        });
+      }
+    }
+  }
   purges
 }
 
@@ -1399,8 +1577,9 @@ fn earliest(first: Option<u64>, second: Option<u64>) -> Option<u64> {
 }
 
 /// Answers each held flush of `mount` that is settled: as served once its volume is durable at its position,
-/// `STATUS_UNEXPECTED_IO_ERROR` once its wait has passed or it never will be (destroyed, superseded). The rest stay
-/// held, the mount's task parked on the volume: how long until the soonest gives up, if one is held.
+/// `STATUS_UNEXPECTED_IO_ERROR` once its wait has given up (`slates_bridge_core::durable_bound`) or it never will be
+/// (destroyed, superseded). The rest stay held, the mount's task parked on the volume: how long until the soonest's open
+/// window ends, if one is held, when its wait is judged again.
 fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
   let now = futures::now_ns();
   let mut kept = VecDeque::new();
@@ -1409,7 +1588,23 @@ fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
     let refuse = match settled {
       crate::live_ship::Durability::Durable => false,
       crate::live_ship::Durability::Never => true,
-      crate::live_ship::Durability::Pending if now >= held.deadline_ns => true,
+      crate::live_ship::Durability::Pending
+        if let Some(why) =
+          crate::live_ship::judge_durable_bound(s, mount.volume, &mut held.bound, now) =>
+      {
+        // What durability still lacked when the wait gave up: logged, since the error tells the application its data
+        // may be lost (as the FUSE `fsync`'s, `crate::fuse`).
+        slates_machine::log_line!(
+          "slates-server: a held WinFsp flush gave up after {} ms and {} windows of {} ms, {} (shard {}): {}",
+          now.saturating_sub(held.held_at_ns) / crate::live_ship::NS_PER_MS,
+          held.bound.windows(),
+          crate::live_ship::durable_wait_ns() / crate::live_ship::NS_PER_MS,
+          why.named(),
+          s.shard,
+          crate::live_ship::durability_report(s, mount.volume, held.target)
+        );
+        true
+      }
       crate::live_ship::Durability::Pending => {
         kept.push_back(held);
         continue;
@@ -1427,7 +1622,7 @@ fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
   mount
     .held
     .iter()
-    .map(|held| held.deadline_ns.saturating_sub(now))
+    .map(|held| held.bound.next_look_ns().saturating_sub(now))
     .min()
 }
 
@@ -1458,10 +1653,12 @@ fn answer(
     && let Some(target) = crate::live_ship::durable_target(s, mount.volume)
   {
     if mount.held.len() < crate::live_ship::reply_hold_bound(s) {
+      let now = futures::now_ns();
       mount.held.push_back(HeldFlush {
         served,
         target,
-        deadline_ns: futures::now_ns().saturating_add(crate::live_ship::durable_wait_ns()),
+        held_at_ns: now,
+        bound: crate::live_ship::begin_durable_bound(s, mount.volume, now),
       });
       s.count(LIVE_FLUSH_HELD, 1);
       return;
@@ -1534,15 +1731,10 @@ pub(crate) fn drop_all(s: &mut ShardState) {
 }
 
 /// Opens the journal reader of a mount that now serves `volume` under registry attachment `registry` (§4.5): from here
-/// the volume keeps the records after the head for it, and each of its rounds moves its point.
+/// the volume keeps the records after the head for it, and each of its rounds moves its point. Its patience is learned
+/// from its rounds after every turn, from the learned wait's prior (`crate::reader_patience`, A-548).
 fn open_journal_reader(s: &mut ShardState, volume: VolumeId, registry: AttachmentId) {
-  if let Some(&handle) = s.by_id.get(&volume)
-    && let Ok(slot) = s.volumes.get_mut(handle)
-  {
-    slot
-      .volume
-      .open_journal_reader(registry.key(), crate::daemon::LIVENESS_BUDGET_NS);
-  }
+  crate::reader_patience::open(s, volume, registry.key());
 }
 
 /// Closes the journal reader of `mount`, removed for good. A volume already gone took its readers with it.

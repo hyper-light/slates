@@ -17,7 +17,7 @@ mod common;
 
 use common::generated::{Raw, increment_of, origin_of, raw};
 use proptest::prelude::*;
-use slates_merge::checkpoint::{Changed, Checkpoint};
+use slates_merge::checkpoint::{Changed, Checkpoint, CopyRecord, Sum, Tables};
 use slates_merge::engine::{Green, Increment, Outcome};
 use slates_merge::ops_doc::DocDecodeError;
 
@@ -42,6 +42,34 @@ fn chain_of(origin_rows: &[Raw], chain: &[Raw]) -> (Green, Vec<(Increment, u64)>
   (green, accepted)
 }
 
+/// Where the change index of `green` answers otherwise than the model walking its histories
+/// (`changed_between_by_histories`): `changed_since(v)` and `changed_between(v, head)` at every version, and
+/// `changed_between(a, b)` over every span ending at or above the fold floor (a span ending below it is not read:
+/// `advance` refuses a version below the floor). The first difference, or nothing.
+fn changes_match_the_model(green: &Green) -> Result<(), String> {
+  let head = green.head();
+  let floor = green.folded_below();
+  for from in 0..=head {
+    let model = green.changed_between_by_histories(from, head);
+    if green.changed_since(from) != model {
+      return Err(format!(
+        "changed_since({from}): {:?}, the model {model:?}",
+        green.changed_since(from)
+      ));
+    }
+    for to in floor.max(from)..=head {
+      let model = green.changed_between_by_histories(from, to);
+      if green.changed_between(from, to) != model {
+        return Err(format!(
+          "changed_between({from}, {to}): {:?}, the model {model:?}",
+          green.changed_between(from, to)
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
 
@@ -50,8 +78,9 @@ proptest! {
   /// `F`; submit one more generated increment based in `[F, head]` to both. Expect: the checkpoint round-trips through
   /// its encoding; the two greens have one head and one head identity (and the restored one's equals its identity from
   /// scratch); they hold the same files at every version from `F` to the head; they give the further increment the same
-  /// verdict; a base below `F` is refused `BaseUnavailable` by the restored green; and a retry of an increment accepted
-  /// at or before `F` is answered with its version.
+  /// verdict; a base below `F` is refused `BaseUnavailable` by the restored green; a retry of an increment accepted
+  /// at or before `F` is answered with its version; and every signed version's verdict at or before `F` is kept, none
+  /// after it, which a version's chain entry carries (A-321).
   #[test]
   fn a_green_restored_from_its_checkpoint_answers_as_the_green_it_was(
     origin_rows in prop::collection::vec(raw(), 0..12),
@@ -63,6 +92,12 @@ proptest! {
   ) {
     let (mut green, accepted) = chain_of(&origin_rows, &chain);
     let head = green.head();
+    // Every other version a signed submit made (A-321): its verdict is the version's provenance, which the checkpoint
+    // keeps once it folds the entry that carried it.
+    for version in (1..=head).filter(|version| version % 2 == 1) {
+      prop_assert!(green.record_signature(version, signature_of(version)));
+    }
+    prop_assert!(!green.record_signature(head + 1, signature_of(head + 1)), "no verdict for a version never committed");
     let at = u64::from(pick) % (head + 1);
     if fold {
       green.fold_history_before(at);
@@ -71,6 +106,10 @@ proptest! {
     prop_assert_eq!(&Checkpoint::decode(&checkpoint.encode()).unwrap(), &checkpoint);
     let mut restored = Green::restore(origin_of(&origin_rows), &checkpoint);
     prop_assert_eq!(restored.head(), at);
+    for version in 0..=head {
+      let kept = if version <= at { green.signature(version) } else { None };
+      prop_assert_eq!(restored.signature(version), kept, "version {}'s verdict", version);
+    }
     for (increment, version) in accepted.iter().filter(|(_, version)| *version > at) {
       prop_assert_eq!(restored.submit(increment), Outcome::Accepted { version: *version });
     }
@@ -79,6 +118,13 @@ proptest! {
     prop_assert_eq!(restored.head_identity(), restored.head_identity_from_scratch());
     for version in at..=head {
       prop_assert_eq!(restored.files_at(version), green.files_at(version), "files at {}", version);
+    }
+    // What changed between two versions, read from the change index (`changed_between`, what `advance` invalidates by,
+    // and `changed_since`), is what the model walking the histories finds (A-264): in the green and its restoration,
+    // since every version, below the checkpoint and the fold too, and over every span that ends at or above the floor.
+    for green in [&green, &restored] {
+      prop_assert!(changes_match_the_model(green).is_ok(), "{:?}", changes_match_the_model(green));
+      prop_assert_eq!(green.changes_recounted(), green.changes_bytes());
     }
     if let Some((increment, version)) = accepted.iter().find(|(_, version)| *version <= at) {
       prop_assert_eq!(restored.submit(increment), Outcome::Accepted { version: *version });
@@ -96,6 +142,55 @@ proptest! {
     prop_assert_eq!(restored.submit(&further), original);
     prop_assert_eq!(restored.head_identity(), green.head_identity());
   }
+
+  /// §4.8 "Recovery", §4.3 "Bounded work everywhere": a recovery seeds a green from its origin a share at a time
+  /// (`OriginLoad`) and then applies its checkpoint (`Green::with_checkpoint`), where `Green::restore` does both in one
+  /// call. Do: build a green from a generated origin and chain, take its checkpoint at a generated `F`, and restore it
+  /// twice: in one call, and seeded in shares of a generated size before the checkpoint is applied. Expect: one head, one
+  /// head identity, the same files at every version from `F` to the head once both replay the chain past `F`, and the
+  /// same verdict on a further increment.
+  #[test]
+  fn a_green_seeded_in_shares_then_given_its_checkpoint_is_the_restored_green(
+    origin_rows in prop::collection::vec(raw(), 0..12),
+    chain in prop::collection::vec(raw(), 1..24),
+    extra in raw(),
+    pick in any::<u16>(),
+    share in 1usize..64,
+  ) {
+    let (green, accepted) = chain_of(&origin_rows, &chain);
+    let head = green.head();
+    let at = u64::from(pick) % (head + 1);
+    let checkpoint = green.checkpoint(at).expect("a checkpoint at or below the head");
+    let mut whole = Green::restore(origin_of(&origin_rows), &checkpoint);
+    let mut load = slates_merge::engine::OriginLoad::new(origin_of(&origin_rows));
+    let seeded = loop {
+      if let Some(seeded) = load.step(share) {
+        break seeded;
+      }
+    };
+    let mut in_shares = seeded.with_checkpoint(&checkpoint);
+    for (increment, version) in accepted.iter().filter(|(_, version)| *version > at) {
+      prop_assert_eq!(whole.submit(increment), Outcome::Accepted { version: *version });
+      prop_assert_eq!(in_shares.submit(increment), Outcome::Accepted { version: *version });
+    }
+    prop_assert_eq!(in_shares.head(), whole.head());
+    prop_assert_eq!(in_shares.head_identity(), whole.head_identity());
+    for version in at..=head {
+      prop_assert_eq!(in_shares.files_at(version), whole.files_at(version), "files at {}", version);
+    }
+    let further = increment_of(&extra).with_id(id(0, 0xD0), head);
+    prop_assert_eq!(in_shares.submit(&further), whole.submit(&further));
+    prop_assert_eq!(in_shares.head_identity(), whole.head_identity());
+  }
+}
+
+/// The signature verdict a test records for `version` (A-321): every field a function of the version.
+fn signature_of(version: u64) -> slates_merge::chain_entry::Signature {
+  slates_merge::chain_entry::Signature {
+    kind: u8::try_from(version % 251).unwrap(),
+    detail: u8::try_from(version % 7).unwrap(),
+    fingerprint: [u8::try_from(version % 253).unwrap(); 32],
+  }
 }
 
 /// A checkpoint touching every table, for the codec's tests.
@@ -104,6 +199,7 @@ fn every_table() -> Checkpoint {
     head_check: Some((9, [4; 32])),
     version: 7,
     accepted: vec![([3; 32], 2), ([1; 32], 5)],
+    signatures: vec![(5, signature_of(5)), (2, signature_of(2))],
     files: vec![
       Changed {
         key: "b".to_owned(),
@@ -146,6 +242,21 @@ fn every_table() -> Checkpoint {
       at: 6,
       value: Some(vec![9]),
     }],
+    copies: vec![CopyRecord {
+      destination: "tags/1".to_owned(),
+      version: 6,
+      source: "b".to_owned(),
+      source_version: 5,
+    }],
+    copied: Tables {
+      files: vec![Changed {
+        key: "tags/1".to_owned(),
+        at: 6,
+        value: Some(b"bytes".to_vec()),
+      }],
+      ..Tables::default()
+    },
+    sum: Some(Sum::default()),
   }
 }
 
@@ -157,6 +268,7 @@ fn a_checkpoint_encodes_to_one_byte_sequence_whatever_its_order() {
   let mut reordered = checkpoint.clone();
   reordered.files.reverse();
   reordered.accepted.reverse();
+  reordered.signatures.reverse();
   assert_eq!(checkpoint.encode(), reordered.encode());
   let mut canonical = checkpoint.clone();
   canonical.canonicalize();
@@ -195,9 +307,11 @@ fn a_hostile_checkpoint_is_refused_typed() {
   }
   .encode();
   let mut presence = empty_tables.clone();
-  // The files table's one entry ends with its presence byte, after its key and version; the six empty tables and the
-  // head check's own presence byte follow.
-  let presence_at = empty_tables.len() - 1 - 1 - 6 * size_of::<u32>();
+  // The files table's one entry ends with its presence byte, after its key and version; the six empty changed tables
+  // (a count each) follow, then three presence bytes, each absent: the copies' section, the identity's sum and the head
+  // check (version 5, A-626 part 3, continued (1)).
+  let after_files = 6 * size_of::<u32>() + 3;
+  let presence_at = empty_tables.len() - after_files - 1;
   presence[presence_at] = 7;
   assert_eq!(Checkpoint::decode(&presence), Err(DocDecodeError::BadKind));
   let mut head_check = empty_tables.clone();

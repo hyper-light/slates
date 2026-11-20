@@ -1,4 +1,5 @@
-//! A-26 / §4.16: IPC namespace metadata is versioned without creating a file-content path.
+//! A-26, A-294 / §4.16: FIFO and socket names and device nodes are versioned as metadata, a device node with its
+//! number, without creating a file-content path.
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -25,6 +26,13 @@ fn node(kind: SpecialKind) -> SpecialNode {
     btime: 0,
   }
 }
+
+/// A block device node numbered 8:1 and a character device node whose minor uses its high bits (A-294).
+const BLOCK: SpecialKind = SpecialKind::BlockDevice { major: 8, minor: 1 };
+const CHAR: SpecialKind = SpecialKind::CharDevice {
+  major: 0x123,
+  minor: 0x4_5678,
+};
 
 fn make(path: &str, kind: SpecialKind) -> VolumeOp {
   VolumeOp::Mknod {
@@ -90,6 +98,9 @@ fn an_ipc_origin_preserves_metadata_and_changes_identity_with_kind_or_owner() {
       uid: 789,
       ..node(SpecialKind::Fifo)
     },
+    // A device node at the same path is another node, and so is one renumbered (A-294).
+    node(BLOCK),
+    node(SpecialKind::BlockDevice { major: 8, minor: 2 }),
   ] {
     let different = Origin {
       specials: vec![("pipe".into(), replacement)],
@@ -125,6 +136,11 @@ fn ipc_aliases_share_metadata_and_are_invalidated_with_their_inode() {
   assert_eq!(green.submit(&inc), Outcome::Accepted { version: 1 });
   assert_eq!(green.mode("alias"), Some(0o600));
   assert_eq!(green.changed_between(0, 1), vec!["alias", "pipe"]);
+  assert_eq!(
+    green.changed_since(0),
+    vec!["alias", "pipe"],
+    "the change index counts the link with its special"
+  );
 }
 
 /// AC-6.2 / A-26: equal mode bits cannot make a stale IPC chmod apply to a replacement file.
@@ -220,13 +236,20 @@ fn declared_ipc_creations_replay_without_file_contents() {
   let journal = [
     make("socket", SpecialKind::Socket),
     make("pipe", SpecialKind::Fifo),
+    make("disk", BLOCK),
+    make("char", CHAR),
   ];
   let inc = increment(&Base::default(), 0, &journal);
   let replay = Increment::decode(&inc.encode()).unwrap();
   assert_eq!(owner.submit(&inc), Outcome::Accepted { version: 1 });
   assert_eq!(holder.submit(&replay), Outcome::Accepted { version: 1 });
   assert_eq!(owner.head_identity(), holder.head_identity());
-  for (path, kind) in [("pipe", SpecialKind::Fifo), ("socket", SpecialKind::Socket)] {
+  for (path, kind) in [
+    ("pipe", SpecialKind::Fifo),
+    ("socket", SpecialKind::Socket),
+    ("disk", BLOCK),
+    ("char", CHAR),
+  ] {
     assert_eq!(owner.special(path), Some(node(kind)));
     assert_eq!(owner.mode(path), Some(0o640));
     assert_eq!(owner.content(path), None);
@@ -234,7 +257,12 @@ fn declared_ipc_creations_replay_without_file_contents() {
   let reverse = increment(
     &Base::default(),
     0,
-    &[journal[1].clone(), journal[0].clone()],
+    &[
+      journal[3].clone(),
+      journal[2].clone(),
+      journal[1].clone(),
+      journal[0].clone(),
+    ],
   );
   assert_eq!(inc.encode(), reverse.encode());
 }
@@ -250,6 +278,7 @@ fn ipc_creation_conflicts_with_files_directories_and_other_ipc_kinds() {
       path: "pipe".into(),
     }],
     vec![make("pipe", SpecialKind::Socket)],
+    vec![make("pipe", CHAR)],
   ] {
     let mut green = Green::new();
     let pipe = increment(&Base::default(), 0, &[make("pipe", SpecialKind::Fifo)]);
@@ -346,16 +375,22 @@ fn short_edits_and_unlinks_reserve_the_values_they_supersede() {
 
 fn assert_reserved_history_covers_apply(green: &mut Green, inc: &Increment) {
   let reserved = green.history_reservation(inc);
+  let index_reserved = green.changes_reservation(inc);
   let before = green.retained_bytes().history;
+  let index_before = green.changes_bytes();
   assert!(matches!(green.submit(inc), Outcome::Accepted { .. }));
   let added = green.retained_bytes().history - before;
+  assert!(
+    green.changes_bytes() - index_before <= index_reserved,
+    "the change index grew by no more than was reserved for it"
+  );
   assert!(
     added > inc.post_state.len(),
     "the incoming payload does not bound retention"
   );
   assert_eq!(reserved, added);
   assert_eq!(
-    green.history_reservation(inc),
+    green.history_reservation(inc) + green.changes_reservation(inc),
     0,
     "an accepted retry retains nothing new"
   );
@@ -419,6 +454,56 @@ fn an_ipc_creation_rebases_without_becoming_an_empty_file() {
   assert_eq!(green.mode("pipe"), Some(0o640));
 }
 
+/// AC-6.2 / A-294: two works that make one device node at one path with different numbers conflict, and the same
+/// node made twice converges, so a device's number is part of the verdict, never merged.
+#[test]
+fn device_nodes_at_one_path_conflict_unless_their_numbers_agree() {
+  let mut green = Green::new();
+  let disk = increment(&Base::default(), 0, &[make("disk", BLOCK)]);
+  assert_eq!(green.submit(&disk), Outcome::Accepted { version: 1 });
+  let identity = green.head_identity();
+  let renumbered = increment(
+    &Base::default(),
+    0,
+    &[make(
+      "disk",
+      SpecialKind::BlockDevice { major: 8, minor: 2 },
+    )],
+  );
+  assert!(matches!(
+    green.submit(&renumbered),
+    Outcome::Conflict { .. }
+  ));
+  assert_eq!(green.head_identity(), identity);
+  assert_eq!(green.submit(&disk), Outcome::Accepted { version: 1 });
+  assert_eq!(green.special("disk"), Some(node(BLOCK)));
+}
+
+/// AC-6.13 / A-294, hostile input: a device node's encoding is refused at every truncation, its numbers included, and
+/// with a trailing byte; a FIFO's encoding followed by a device's numbers is trailing bytes, never a device.
+#[test]
+fn hostile_device_metadata_refuses_every_truncation() {
+  for kind in [BLOCK, CHAR] {
+    let bytes = node(kind).encode();
+    assert_eq!(SpecialNode::decode(&bytes), Ok(node(kind)));
+    for cut in 0..bytes.len() {
+      assert!(SpecialNode::decode(&bytes[..cut]).is_err(), "cut at {cut}");
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert_eq!(
+      SpecialNode::decode(&trailing),
+      Err(DocDecodeError::TrailingBytes)
+    );
+  }
+  let mut fifo_with_numbers = node(SpecialKind::Fifo).encode();
+  fifo_with_numbers.extend_from_slice(&[8, 0, 0, 0, 1, 0, 0, 0]);
+  assert_eq!(
+    SpecialNode::decode(&fifo_with_numbers),
+    Err(DocDecodeError::TrailingBytes)
+  );
+}
+
 /// AC-6.13: corrupted IPC metadata is refused before any holder can apply it.
 #[test]
 fn hostile_ipc_metadata_refuses_unknown_kinds_and_every_truncation() {
@@ -457,7 +542,7 @@ fn an_ipc_creation_with_an_invalid_path_reference_is_refused() {
     .iter_mut()
     .find(|op| op.kind == OpKind::Mknod)
     .unwrap()
-    .path = u16::MAX;
+    .path = u64::MAX;
   assert_eq!(
     Increment::decode(&bad_path.encode()),
     Err(DocDecodeError::BadPath)
@@ -480,6 +565,45 @@ fn ipc_metadata_matches_its_canonical_golden_vector() {
     hex,
     "017b000000c8010000ffffffffffffffff020000000000000003000000000000000000000000000000"
   );
+}
+
+/// AC-6.13 / A-294: a device node's encoding is a socket's with its own kind byte and its major and minor after it,
+/// byte for byte portable; the FIFO and socket encodings, and every identity over them, are unchanged by it.
+#[test]
+fn device_metadata_matches_its_canonical_golden_vector() {
+  let hex = |kind: SpecialKind| -> String {
+    node(kind)
+      .encode()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect()
+  };
+  assert_eq!(
+    hex(BLOCK),
+    "027b000000c8010000ffffffffffffffff0200000000000000030000000000000000000000000000000800000001000000"
+  );
+  assert_eq!(
+    hex(CHAR),
+    "037b000000c8010000ffffffffffffffff0200000000000000030000000000000000000000000000002301000078560400"
+  );
+}
+
+/// AC-6.8 / A-294: an origin holding device nodes decodes to the same nodes, numbers included, and seeds a green with them.
+#[test]
+fn device_nodes_round_trip_through_an_origin() {
+  let origin = Origin {
+    specials: vec![
+      ("char".into(), node(CHAR)),
+      ("disk".into(), node(BLOCK)),
+      ("pipe".into(), node(SpecialKind::Fifo)),
+    ],
+    ..Origin::default()
+  };
+  let decoded = Origin::decode(&origin.encode()).unwrap();
+  assert_eq!(decoded.specials, origin.specials);
+  let green = Green::with_origin(decoded);
+  assert_eq!(green.special("disk"), Some(node(BLOCK)));
+  assert_eq!(green.special("char"), Some(node(CHAR)));
 }
 
 /// AC-6.13: adding sorted IPC names cannot redirect a symlink through a stale path-table index.

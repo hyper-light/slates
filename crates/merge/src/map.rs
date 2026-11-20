@@ -40,8 +40,10 @@ pub enum Mapped {
 
 /// The content effect of one op on this path, as `(at, old_len, new_len)` in the op's version
 /// coordinates: `old_len` base bytes at `at` become `new_len` bytes. A namespace op (create,
-/// rename, mode, xattr) has no byte-coordinate effect and returns `None`.
-fn effect_of(op: &Op) -> Option<(u64, u64, u64)> {
+/// rename, mode, xattr) has no byte-coordinate effect and returns `None`. A review comment's step
+/// sums these to judge whether a delta accounts for its file's change of length
+/// (`crate::review::move_through`, A-596).
+pub(crate) fn effect_of(op: &Op) -> Option<(u64, u64, u64)> {
   match op.kind {
     OpKind::Overwrite => Some((op.at, op.len, op.len)),
     OpKind::Insert | OpKind::Extend => Some((op.at, 0, op.len)),
@@ -56,7 +58,8 @@ fn effect_of(op: &Op) -> Option<(u64, u64, u64)> {
     | OpKind::SetMode
     | OpKind::SetXattr
     | OpKind::RemoveXattr
-    | OpKind::Mknod => None,
+    | OpKind::Mknod
+    | OpKind::Copy => None,
   }
 }
 
@@ -78,15 +81,25 @@ fn map_through_one(ops: &[Op], range: Range) -> Mapped {
     if at.saturating_add(old_len) <= range.start {
       // Entirely before the range (or ending exactly at its start): it shifts the range.
       shift = shift.saturating_add(i128::from(new_len).saturating_sub(i128::from(old_len)));
-    } else if at >= range.end() {
+    } else if lies_past(at, range) {
       // Entirely after the range; every later op is further still (sorted), so stop.
       break;
     }
-    // Otherwise it touches a boundary without overlapping (the edge rule): no shift, no stop.
+    // Otherwise it touches a boundary without overlapping (the edge rule), or starts at a point: no shift, no stop.
   }
   let shifted = i128::from(range.start).saturating_add(shift);
   let start = u64::try_from(shifted.max(0)).unwrap_or(0);
   Mapped::Shifted(Range::new(start, range.len))
+}
+
+/// Whether an operation starting at `at` lies past `range`, so a walk through a canonical delta stops at it: it starts
+/// at or after the range's end, except that a point (an insert's empty range) is not passed by an operation starting at
+/// it. Canonical order puts an overwrite or a truncate before an insert at one offset, so the walk goes on past them to
+/// meet an insert at the point: two inserts at one point meet in both orders (D-27, A-668). Until A-668 the walk
+/// stopped at the overwrite, so an insert landed after a work that overwrote or truncated and inserted there was
+/// accepted ahead of it, while the other order conflicted, and accepting one ahead of the other is choosing an order.
+pub(crate) fn lies_past(at: u64, range: Range) -> bool {
+  at > range.end() || (at == range.end() && range.len > 0)
 }
 
 /// Maps `range` from the increment's base version forward through the canonical deltas in
@@ -103,3 +116,6 @@ pub fn map_range(deltas: &[&[Op]], range: Range) -> Mapped {
   }
   Mapped::Shifted(current)
 }
+
+#[cfg(test)]
+mod tests;

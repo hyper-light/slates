@@ -17,15 +17,13 @@
 // the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).
 #![cfg(unix)]
 
-use std::time::{Duration, Instant};
-
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, Direction,
   Established, HostPathReason, Intent, KernelCache, NamePolicy, ReadWritePolicy, Refusal,
   ReplyBody, RequestBody, Residency, SizeClass, StatusReport, TargetPathConstraint,
   TransportReport, UnsupportedReason, VolumeId, pack, unpack,
 };
-use slates_ipc::{ClientEnd, IpcError, connect};
+use slates_ipc::{ClientEnd, connect};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
@@ -33,8 +31,6 @@ mod common;
 
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
-/// Shape: how long a client waits for the daemon or a full ring before giving up.
-const CREDIT_WAIT: Duration = Duration::from_secs(5);
 
 // --- The client side of the daemon's own rendezvous (as in tests/daemon.rs). ---
 
@@ -45,23 +41,16 @@ struct Client {
 }
 
 impl Client {
+  /// A client of `instance`, whose daemon started before this, its rendezvous held and published by then: the claim
+  /// waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait (A-571; until
+  /// then a five-second retry, `CREDIT_WAIT`).
   fn connect(instance: &str) -> Client {
-    let started = Instant::now();
-    loop {
-      match connect(instance) {
-        Ok(connected) => {
-          let client = connected.region.client_id();
-          return Client {
-            end: ClientEnd::connected(connected),
-            client,
-            sequence: 0,
-          };
-        }
-        Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-          std::hint::spin_loop();
-        }
-        Err(e) => panic!("{e}"),
-      }
+    let connected = connect(instance).unwrap_or_else(|e| panic!("{e}"));
+    let client = connected.region.client_id();
+    Client {
+      end: ClientEnd::connected(connected),
+      client,
+      sequence: 0,
     }
   }
 
@@ -80,14 +69,16 @@ impl Client {
       body,
     )
     .unwrap();
-    let started = Instant::now();
-    loop {
-      match self.end.send(&slot) {
-        Ok(()) => break,
-        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::hint::spin_loop(),
-        Err(e) => panic!("{e}"),
-      }
-    }
+    // A full ring is waited out while the daemon lives, as every client end waits (A-571).
+    let roomed = self
+      .end
+      .send_when_room(|end| end.send(&slot))
+      .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+      roomed,
+      slates_ipc::room::Roomed::Sent,
+      "the daemon went away while its ring was full"
+    );
     let reply = self.end.wait(Some(DEADLINE_NS)).unwrap();
     unpack(self.end.region(), reply.kind, &reply.payload).unwrap()
   }
@@ -993,6 +984,7 @@ fn advance(
     ReplyBody::Advanced {
       version,
       invalidated,
+      ..
     } => Ok((version, invalidated)),
     ReplyBody::Refused { refusal, .. } => Err(refusal),
     other => panic!("advance answered {other:?}"),

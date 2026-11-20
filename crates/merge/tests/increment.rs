@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_merge::increment::{Base, DeriveError, VolumeOp, compose_volume};
-use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
+use slates_merge::ops_doc::{NodeOrigin, Op, OpKind, OpsDoc};
 
 use proptest::prelude::*;
 
@@ -199,7 +199,7 @@ fn apply_net(base: &[u8], net: &[Op], post_state: &[u8], base_len: u64) -> Vec<u
 }
 
 /// The ops of the document that target the path at `index`.
-fn ops_for(doc: &OpsDoc, index: u16) -> Vec<Op> {
+fn ops_for(doc: &OpsDoc, index: u64) -> Vec<Op> {
   doc
     .ops
     .iter()
@@ -216,7 +216,7 @@ fn ops_for(doc: &OpsDoc, index: u16) -> Vec<Op> {
 fn post_state_of(base: &[(String, u64)], doc: &OpsDoc, model: &Model) -> Vec<u8> {
   let mut post_state = Vec::new();
   for (path_index, name) in doc.paths.paths().iter().enumerate() {
-    let index = u16::try_from(path_index).unwrap_or(u16::MAX);
+    let index = u64::try_from(path_index).unwrap();
     let ops = ops_for(doc, index);
     let (Some(final_bytes), Some(base_len)) =
       (model.get(name), base_len_for(base, doc, &ops, name))
@@ -262,10 +262,7 @@ fn base_len_for(base: &[(String, u64)], doc: &OpsDoc, ops: &[Op], name: &str) ->
     return None;
   }
   if let Some(op) = ops.iter().find(|op| op.kind == OpKind::Rename) {
-    let source = doc
-      .paths
-      .path(u16::try_from(op.src).unwrap_or(u16::MAX))
-      .unwrap_or("");
+    let source = doc.paths.path(op.src).unwrap_or("");
     return Some(base_of(base, source).len() as u64);
   }
   if ops.iter().any(|op| op.kind == OpKind::Create) {
@@ -279,7 +276,7 @@ fn base_len_for(base: &[(String, u64)], doc: &OpsDoc, ops: &[Op], name: &str) ->
 fn reconstruct_path(
   base: &[(String, u64)],
   doc: &OpsDoc,
-  index: u16,
+  index: u64,
   name: &str,
   post_state: &[u8],
 ) -> Option<Vec<u8>> {
@@ -290,10 +287,7 @@ fn reconstruct_path(
   let rename = ops.iter().find(|op| op.kind == OpKind::Rename);
   let created = ops.iter().any(|op| op.kind == OpKind::Create);
   let (base_bytes, base_len) = if let Some(op) = rename {
-    let source = doc
-      .paths
-      .path(u16::try_from(op.src).unwrap_or(u16::MAX))
-      .unwrap_or("");
+    let source = doc.paths.path(op.src).unwrap_or("");
     let bytes = base_of(base, source);
     let len = bytes.len() as u64;
     (bytes, len)
@@ -320,7 +314,7 @@ fn check(base: &[(String, u64)], doc: &OpsDoc, model: &Model) {
   let mut renamed_away: BTreeSet<String> = BTreeSet::new();
   for op in &doc.ops {
     if op.kind == OpKind::Rename
-      && let Some(source) = doc.paths.path(u16::try_from(op.src).unwrap_or(u16::MAX))
+      && let Some(source) = doc.paths.path(op.src)
     {
       renamed_away.insert(source.to_owned());
     }
@@ -328,7 +322,7 @@ fn check(base: &[(String, u64)], doc: &OpsDoc, model: &Model) {
 
   let mut reconstructed: Model = BTreeMap::new();
   for (path_index, name) in doc.paths.paths().iter().enumerate() {
-    let index = u16::try_from(path_index).unwrap_or(u16::MAX);
+    let index = u64::try_from(path_index).unwrap();
     if let Some(content) = reconstruct_path(base, doc, index, name, &post_state) {
       reconstructed.insert(name.clone(), content);
     }
@@ -453,13 +447,7 @@ fn renaming_a_base_file_to_a_fresh_path() {
     .find(|op| op.kind == OpKind::Rename)
     .expect("a rename");
   assert_eq!(doc.paths.path(rename.path), Some("z"), "destination");
-  assert_eq!(
-    doc
-      .paths
-      .path(u16::try_from(rename.src).unwrap_or(u16::MAX)),
-    Some("a"),
-    "source"
-  );
+  assert_eq!(doc.paths.path(rename.src), Some("a"), "source");
   let mut model: Model = BTreeMap::new();
   model.insert("z".to_owned(), base_of(&base, "a"));
   check(&base, &doc, &model);
@@ -512,7 +500,7 @@ fn write_and_rename_replaces_the_destination_content() {
     .ops
     .iter()
     .copied()
-    .filter(|op| op.path == u16::try_from(index).unwrap_or(u16::MAX))
+    .filter(|op| op.path == u64::try_from(index).unwrap())
     .collect();
   let rebuilt = apply_net(&base_of(&base, "out"), &ops, &post_state, 10);
   assert_eq!(rebuilt, model["out"]);
@@ -929,9 +917,19 @@ fn set_mode_on_a_missing_path_refuses() {
   ));
 }
 
-/// A mode set then the path renamed away is the owed chmod-then-rename case, refused.
+/// The mode the document sets at `path`, if it sets one.
+fn mode_set_at(doc: &OpsDoc, path: &str) -> Option<u64> {
+  doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::SetMode && doc.paths.path(op.path) == Some(path))
+    .map(|op| op.len)
+}
+
+/// A mode set then the path renamed away moves with its file, as POSIX `rename` keeps a file's mode (until 2026-11-20
+/// refused `Unsupported`: the mode was keyed by its path).
 #[test]
-fn set_mode_then_rename_refuses() {
+fn set_mode_then_rename_sets_the_mode_at_the_new_path() {
   let base = Base {
     specials: Vec::new(),
     files: vec![("a".to_owned(), 4)],
@@ -941,7 +939,7 @@ fn set_mode_then_rename_refuses() {
     xattrs: Vec::new(),
     hardlinks: Vec::new(),
   };
-  let result = compose_volume(
+  let doc = compose_volume(
     &base,
     &[
       VolumeOp::SetMode {
@@ -953,15 +951,77 @@ fn set_mode_then_rename_refuses() {
         to: "b".to_owned(),
       },
     ],
-  );
-  assert!(matches!(result, Err(DeriveError::Unsupported(_))));
+  )
+  .expect("chmod then mv composes");
+  assert_eq!(mode_set_at(&doc, "b"), Some(0o600));
+  assert_eq!(mode_set_at(&doc, "a"), None);
+}
+
+/// A new file made executable then moved keeps its mode at its new path (by use: `chmod +x d/a; mv d/a x/a` in one
+/// work was refused `SetModeMissing("d/a")`).
+#[test]
+fn a_new_executable_file_moved_keeps_its_mode() {
+  let doc = compose_volume(
+    &Base::default(),
+    &[
+      VolumeOp::Mkdir {
+        path: "d".to_owned(),
+      },
+      VolumeOp::Create {
+        path: "d/a".to_owned(),
+      },
+      VolumeOp::SetMode {
+        path: "d/a".to_owned(),
+        mode: 0o755,
+      },
+      VolumeOp::Mkdir {
+        path: "x".to_owned(),
+      },
+      VolumeOp::Rename {
+        from: "d/a".to_owned(),
+        to: "x/a".to_owned(),
+      },
+    ],
+  )
+  .expect("chmod then mv composes");
+  assert_eq!(mode_set_at(&doc, "x/a"), Some(0o755));
+  assert_eq!(mode_set_at(&doc, "d/a"), None);
+}
+
+/// A base file's mode moves with it when it is renamed in a later version: the moved file is declared its mode at its
+/// new path (the green keys a mode by its path, so a rename alone left `y/b` at the default mode).
+#[test]
+fn a_base_files_mode_moves_with_its_rename() {
+  let base = Base {
+    specials: Vec::new(),
+    files: vec![("e/b".to_owned(), 4)],
+    dirs: vec!["e".to_owned()],
+    modes: vec![("e/b".to_owned(), 0o755)],
+    symlinks: Vec::new(),
+    xattrs: Vec::new(),
+    hardlinks: Vec::new(),
+  };
+  let doc = compose_volume(
+    &base,
+    &[
+      VolumeOp::Mkdir {
+        path: "y".to_owned(),
+      },
+      VolumeOp::Rename {
+        from: "e/b".to_owned(),
+        to: "y/b".to_owned(),
+      },
+    ],
+  )
+  .expect("mv composes");
+  assert_eq!(mode_set_at(&doc, "y/b"), Some(0o755));
 }
 
 // --- Symlink composition ---
 
 /// The target string a Symlink op names (via its `src` index into the path table).
 fn symlink_target<'a>(doc: &'a OpsDoc, op: &Op) -> Option<&'a str> {
-  doc.paths.path(u16::try_from(op.src).unwrap_or(u16::MAX))
+  doc.paths.path(op.src)
 }
 
 /// Creating a symlink is one `Symlink` op naming its target.
@@ -1193,10 +1253,7 @@ fn setting_an_xattr_to_a_new_value() {
     .find(|op| op.kind == OpKind::SetXattr)
     .expect("a set-xattr");
   assert_eq!(doc.paths.path(op.path), Some("f"));
-  assert_eq!(
-    doc.paths.path(u16::try_from(op.at).unwrap_or(u16::MAX)),
-    Some("user.a")
-  );
+  assert_eq!(doc.paths.path(op.at), Some("user.a"));
   assert_eq!(op.len, 5, "the value length");
 }
 
@@ -1234,10 +1291,7 @@ fn removing_a_base_xattr() {
     .find(|op| op.kind == OpKind::RemoveXattr)
     .expect("a remove-xattr");
   assert_eq!(doc.paths.path(op.path), Some("f"));
-  assert_eq!(
-    doc.paths.path(u16::try_from(op.at).unwrap_or(u16::MAX)),
-    Some("user.a")
-  );
+  assert_eq!(doc.paths.path(op.at), Some("user.a"));
 }
 
 /// Setting a new xattr not present at base emits a `SetXattr`, and its value is at the declared
@@ -1322,11 +1376,12 @@ fn creating_a_hard_link_is_one_link() {
     .find(|op| op.kind == OpKind::Link)
     .expect("a link");
   assert_eq!(doc.paths.path(op.path), Some("b"), "the new name");
-  assert_eq!(
-    doc.paths.path(u16::try_from(op.src).unwrap_or(u16::MAX)),
-    Some("a"),
-    "the target"
-  );
+  let node = doc
+    .nodes
+    .node(op.src)
+    .expect("the link's node record (A-646)");
+  assert_eq!(doc.paths.path(node.path), Some("a"), "the target");
+  assert_eq!(node.origin, NodeOrigin::Base, "the base file's node");
 }
 
 /// A hard link created then unlinked cancels.

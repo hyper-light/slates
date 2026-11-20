@@ -55,9 +55,32 @@ fn daemon(name: &str) -> (Daemon, ShardId, ShardId) {
   (daemon, control, other)
 }
 
+/// The daemon of the supervised role `role` (A-232): this test binary re-invoked, its daemon attached from the
+/// environment its anchor, the parent test, gave it, so a stuck shard withholds the beat and the daemon lives on, as an
+/// anchored daemon does until its anchor kills it. `None` outside that child. A lone daemon (`Create`) would end its own
+/// process on the stuck verdict, so every test here that keeps a shard stuck runs its body in such a role.
+fn supervised(role: &str) -> Option<(Daemon, ShardId, ShardId)> {
+  let (daemon, _) = common::supervised::daemon(role)?;
+  let control = daemon.shards()[0];
+  let other = daemon.shards()[1];
+  Some((daemon, control, other))
+}
+
 /// The anchor's heartbeat word now.
 fn beat(daemon: &Daemon) -> u64 {
   daemon.segment().supervision().unwrap().heartbeat_ns()
+}
+
+/// The window the watchdog judges `shard` by now (A-455, `watchdog::watch_window_ns`): the liveness window, raised to the
+/// scheduler overrun the shard measured where that is longer, read from its pulse as the watchdog reads it. A shard held
+/// in one poll waits no more, so read during a hold this is the window its verdict comes after.
+fn window_of(daemon: &Daemon, shard: ShardId) -> Duration {
+  let overrun_ns = daemon
+    .shard_pulses()
+    .into_iter()
+    .find(|pulse| pulse.shard == shard.0)
+    .map_or(0, |pulse| pulse.scheduler_overrun_ns);
+  Duration::from_nanos(slates_server::watchdog::watch_window_ns(overrun_ns))
 }
 
 /// Waits until the daemon serves and has beaten twice, so a test starts from a booted, beating daemon; the returned
@@ -186,9 +209,23 @@ fn block_in_a_read(held: Duration) {
 /// on the shard, and holds the beat to stopping — a gap of a whole window — no later than a window and three beats after
 /// the block began. The stop is timed from the block's own start, since under load the observation reaches the shard
 /// some time after it is sent, and the beat resumes once the block ends, so only the first window-long gap counts.
-fn a_blocked_shard_stops_the_beat(name: &str, block: fn(Duration)) {
-  let (daemon, _, other) = daemon(name);
+fn a_blocked_shard_stops_the_beat(role: &str, name: &str, block: fn(Duration)) {
+  a_blocked_shard_stops_the_beat_while(role, name, block, None);
+}
+
+/// [`a_blocked_shard_stops_the_beat`] with the host's memory reading the watchdog takes put in its place first:
+/// `Some(true)` a host reporting a memory stall throughout (A-336), `None` the host's own.
+fn a_blocked_shard_stops_the_beat_while(
+  role: &str,
+  name: &str,
+  block: fn(Duration),
+  memory_stalled: Option<bool>,
+) {
+  let Some((daemon, _, other)) = supervised(role) else {
+    return;
+  };
   let _serving = beating(&daemon);
+  assert!(daemon.inject_memory_stall(memory_stalled));
   let held = WINDOW * 3;
   let base = Instant::now();
   let began_us = &*Box::leak(Box::new(AtomicU64::new(0)));
@@ -207,6 +244,8 @@ fn a_blocked_shard_stops_the_beat(name: &str, block: fn(Duration)) {
   let mut last = beat(&daemon);
   let mut last_seen = base.elapsed();
   let mut stopped_at = None;
+  // The held shard's window, read while it is held (A-455): the liveness window unless its host overran that.
+  let mut window = WINDOW;
   loop {
     let answered = worker.is_finished();
     let began = began_us.load(Ordering::Acquire);
@@ -223,6 +262,7 @@ fn a_blocked_shard_stops_the_beat(name: &str, block: fn(Duration)) {
       && base.elapsed().saturating_sub(last_seen) >= WINDOW
     {
       stopped_at = Some(last_seen);
+      window = window_of(&daemon, other);
       break;
     }
   }
@@ -237,11 +277,12 @@ fn a_blocked_shard_stops_the_beat(name: &str, block: fn(Duration)) {
   });
   let after = stopped_at.saturating_sub(began);
   println!(
-    "wedged shard ({name}): the block began {began:?} in, and the beat stopped {after:?} after it"
+    "wedged shard ({name}): the block began {began:?} in, and the beat stopped {after:?} after it, judged by its \
+     {window:?} window"
   );
   assert!(
-    after <= WINDOW + BEAT * 3,
-    "the beat stopped {after:?} after the shard wedged, past a window and three beats"
+    after <= window + BEAT * 3,
+    "the beat stopped {after:?} after the shard wedged, past its {window:?} window and three beats"
   );
   daemon.stop();
 }
@@ -251,7 +292,18 @@ fn a_blocked_shard_stops_the_beat(name: &str, block: fn(Duration)) {
 /// Before A-228 the control shard went on beating, so the anchor never saw the wedged shard.
 #[test]
 fn a_wedged_shard_stops_the_beat() {
-  a_blocked_shard_stops_the_beat("wedged", block_on_a_channel);
+  common::supervised::run("a_wedged_shard_stops_the_beat_role", "liveness-wedged", 2);
+}
+
+/// The role [`a_wedged_shard_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by a_wedged_shard_stops_the_beat as a supervised child"]
+fn a_wedged_shard_stops_the_beat_role() {
+  a_blocked_shard_stops_the_beat(
+    "a_wedged_shard_stops_the_beat_role",
+    "wedged",
+    block_on_a_channel,
+  );
 }
 
 /// A-228, §4.14, the stuck extreme of starved-is-not-stuck. Do: block one poll in a real syscall, a read of a pipe nobody
@@ -259,7 +311,194 @@ fn a_wedged_shard_stops_the_beat() {
 /// sees the thread runnable, so a shard stuck in the kernel is still found.
 #[test]
 fn a_shard_blocked_in_a_syscall_stops_the_beat() {
-  a_blocked_shard_stops_the_beat("syscall", block_in_a_read);
+  common::supervised::run(
+    "a_shard_blocked_in_a_syscall_stops_the_beat_role",
+    "liveness-syscall",
+    2,
+  );
+}
+
+/// The role [`a_shard_blocked_in_a_syscall_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by a_shard_blocked_in_a_syscall_stops_the_beat as a supervised child"]
+fn a_shard_blocked_in_a_syscall_stops_the_beat_role() {
+  a_blocked_shard_stops_the_beat(
+    "a_shard_blocked_in_a_syscall_stops_the_beat_role",
+    "syscall",
+    block_in_a_read,
+  );
+}
+
+/// Shape: the stack the held shard's child runs its two calls on (a read and an exit).
+#[cfg(target_os = "linux")]
+const CHILD_STACK: usize = 64 * 1024;
+
+/// The child of [`hold_where_memory_holds`]: reads one byte from the pipe whose read end `fd` points at, then exits. It
+/// runs on its own stack in the daemon's memory, so it makes no allocation and takes no lock: two system calls.
+#[cfg(target_os = "linux")]
+extern "C" fn read_one_byte_then_exit(fd: *mut libc::c_void) -> libc::c_int {
+  let mut byte = 0_u8;
+  // SAFETY: `fd` points at the parent's descriptor number, on the parent's frame, which stays put while the parent waits
+  // for this child (`CLONE_VFORK`); `byte` is this frame's own.
+  unsafe {
+    libc::syscall(
+      libc::SYS_read,
+      libc::c_long::from(*fd.cast::<libc::c_int>()),
+      (&raw mut byte).cast::<libc::c_void>(),
+      1_usize,
+    );
+    libc::_exit(0)
+  }
+}
+
+/// Holds the calling thread (a shard's) where a thread waiting on memory is, until a byte arrives on `reader`: on Linux
+/// in a wait the kernel holds it in past signals (`D`), as a page-in does, the wait a vfork's parent is kept in
+/// (`CLONE_VM | CLONE_VFORK`, as `slates_rt`'s `thread_clock` tests hold one) while its child reads the pipe.
+#[cfg(target_os = "linux")]
+fn hold_where_memory_holds(reader: &std::io::PipeReader) {
+  use std::os::fd::AsRawFd;
+  let mut stack = vec![0_u8; CHILD_STACK];
+  let top = stack.as_mut_ptr().wrapping_add(CHILD_STACK);
+  let mut fd = reader.as_raw_fd();
+  // SAFETY: the child runs `read_one_byte_then_exit` on `stack`, which outlives it (the call returns only once the child
+  // has exited, `CLONE_VFORK`), and reads `fd` on this frame, which stays put meanwhile; `reader`, borrowed for the
+  // call, keeps the descriptor open until then. The child touches nothing else.
+  let child = unsafe {
+    libc::clone(
+      read_one_byte_then_exit,
+      top.cast(),
+      libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+      (&raw mut fd).cast(),
+    )
+  };
+  assert!(child > 0, "the held shard's child was cloned");
+  let mut status = 0;
+  // SAFETY: reaps this thread's own child; `status` is this frame's own.
+  unsafe { libc::waitpid(child, &raw mut status, 0) };
+  drop(stack);
+}
+
+/// Holds the calling thread (a shard's) where a thread waiting on memory is, until a byte arrives on `reader`: off the
+/// CPU in a wait, which is all macOS and Windows tell of a page-in's thread.
+#[cfg(not(target_os = "linux"))]
+fn hold_where_memory_holds(mut reader: &std::io::PipeReader) {
+  use std::io::Read;
+  let mut byte = [0_u8];
+  let _ = reader.read(&mut byte);
+}
+
+/// Format: the role of [`a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after`].
+const MEMORY_HOLD_ROLE: &str =
+  "a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after_role";
+
+/// A-336, §4.14, the watchdog's own loop. Do: on the shard that is not the control shard, hold one poll where a thread
+/// waiting on memory is (on Linux in the kernel past signals, `D`; elsewhere blocked off the CPU), with the host's
+/// memory reading the watchdog takes put in its place as a stall; watch three windows; then clear the reading and watch
+/// until the beat stops. Expect: the watchdog withholds no look while the host stalls, three windows of a shard that
+/// neither runs nor is runnable; the beat stops within a window and three beats of the clearing. Before, the beat
+/// stopped a window into the hold, and a lone daemon at a few hundred megabytes free ended itself (g231, 2026-11-17).
+#[test]
+fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after() {
+  common::supervised::run(MEMORY_HOLD_ROLE, "liveness-memory", 2);
+}
+
+/// The role [`a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after`] runs as a
+/// supervised daemon's process: anchored, so a stuck verdict withholds the beat rather than ending the process.
+#[test]
+#[ignore = "a role: run by a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after"]
+fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after_role()
+{
+  let Some((daemon, _, other)) = supervised(MEMORY_HOLD_ROLE) else {
+    return;
+  };
+  let _serving = beating(&daemon);
+  assert!(daemon.inject_memory_stall(Some(true)));
+  let (reader, mut writer) = std::io::pipe().unwrap();
+  // Leaked, as the role's other shared state is: the poll the observation runs is a cloneable closure, and the role's
+  // process ends with the test.
+  let reader: &'static std::io::PipeReader = Box::leak(Box::new(reader));
+  let held = &*Box::leak(Box::new(AtomicBool::new(false)));
+  let worker = on_shard(&daemon, other, move || {
+    held.store(true, Ordering::Release);
+    hold_where_memory_holds(reader);
+  });
+  while !held.load(Ordering::Acquire) {
+    wait(SAMPLE);
+  }
+  let before = daemon.watchdog_turns().unwrap();
+  let (largest_while_stalled, _) = watch_beat(&daemon, WINDOW * 3);
+  let during = daemon.watchdog_turns().unwrap();
+  assert!(daemon.inject_memory_stall(Some(false)));
+  let cleared = Instant::now();
+  let mut stopped_after = None;
+  let mut last = beat(&daemon);
+  let mut last_seen = cleared.elapsed();
+  // The held shard's window, read while it is held (A-455): the liveness window unless its host overran that.
+  let mut window = WINDOW;
+  while cleared.elapsed() < WINDOW * 3 {
+    wait(SAMPLE);
+    let now = beat(&daemon);
+    if now != last {
+      last = now;
+      last_seen = cleared.elapsed();
+    } else if cleared.elapsed().saturating_sub(last_seen) >= WINDOW {
+      stopped_after = Some(last_seen);
+      window = window_of(&daemon, other);
+      break;
+    }
+  }
+  let after = daemon.watchdog_turns().unwrap();
+  {
+    use std::io::Write;
+    writer.write_all(b"x").unwrap();
+  }
+  worker.join().unwrap();
+  let (looks, withheld) = (during.0 - before.0, during.1 - before.1);
+  println!(
+    "a shard waiting on memory: while the host stalled the watchdog looked {looks} times and withheld the beat at \
+     {withheld}, the largest gap {largest_while_stalled:?}; after the clearing it withheld {} more, the beat stopping \
+     {stopped_after:?} in",
+    after.1 - during.1
+  );
+  assert_eq!(
+    withheld, 0,
+    "the beat was withheld at {withheld} of {looks} looks while the host stalled"
+  );
+  let stopped_after = stopped_after.unwrap_or_else(|| {
+    panic!("the beat never stopped for a whole window after the stall cleared (last advanced {last_seen:?} in)")
+  });
+  assert!(
+    stopped_after <= window + BEAT * 3,
+    "the beat stopped {stopped_after:?} after the stall cleared, past its {window:?} window and three beats"
+  );
+  daemon.stop();
+}
+
+/// A-336, §4.14, the stuck extreme where the kernel tells the wait (Linux). Do: with the host's memory reading put in
+/// its place as a stall throughout, block one poll on a channel nobody sends on, a futex sleep (`S`), for three windows.
+/// Expect: the beat stops within a window and three beats of the block: a thread whose own state says it is not waiting
+/// on memory is not excused, however the host stalls.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_shard_asleep_while_the_host_stalls_stops_the_beat() {
+  common::supervised::run(
+    "a_shard_asleep_while_the_host_stalls_stops_the_beat_role",
+    "liveness-asleep-stalled",
+    2,
+  );
+}
+
+/// The role [`a_shard_asleep_while_the_host_stalls_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "a role: run by a_shard_asleep_while_the_host_stalls_stops_the_beat as a supervised child"]
+fn a_shard_asleep_while_the_host_stalls_stops_the_beat_role() {
+  a_blocked_shard_stops_the_beat_while(
+    "a_shard_asleep_while_the_host_stalls_stops_the_beat_role",
+    "asleep while the host stalls",
+    block_on_a_channel,
+    Some(true),
+  );
 }
 
 /// Shape: spinners at nice 0 on the starved shard's CPU: 63, the most measured, which held a SCHED_IDLE thread off its
@@ -698,17 +937,35 @@ fn spinner_nice_shown() -> i32 {
 /// bound; a sixtieth leaves six times that.
 const LEAST_CPU_SHARE_WINDOWS: u32 = 60;
 
-/// A-228, §4.14. Do: on the shard that is not the control shard, spin one poll on the CPU without yielding. Wait on the
-/// shard's own CPU clock, the quantity the rule reads, until the spin has run a window of it; then watch the beat for a
-/// window of wall from its last beat. Expect: the beat stops, as the rule says once a shard has run a window of CPU without
-/// a step. How long the CPU takes is the machine's: a window of wall on a free core, ten at load 185 on the 18-CPU Mac,
+/// A-228, A-318, §4.14. Do: on the shard that is not the control shard, spin one poll on the CPU without yielding. Wait
+/// on the shard's own CPU clock, the quantity the rule reads, until the spin has run the spin window of it (the budget
+/// held to this build, the daemon's own); then watch the beat for a window of wall from its last beat. Expect: the beat
+/// stops, as the rule says once a shard has run the spin window of CPU without a step. How long the CPU takes is the machine's: a window of wall on a free core, ten at load 185 on the 18-CPU Mac,
 /// where the old test's ten windows of wall were about one window of the shard's CPU and failed. Before A-228 nothing
 /// saw a spinning shard.
 #[test]
 fn a_spinning_shard_stops_the_beat() {
-  let (daemon, _, other) = daemon("spinning");
+  common::supervised::run(
+    "a_spinning_shard_stops_the_beat_role",
+    "liveness-spinning",
+    2,
+  );
+}
+
+/// The role [`a_spinning_shard_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by a_spinning_shard_stops_the_beat as a supervised child"]
+fn a_spinning_shard_stops_the_beat_role() {
+  let Some((daemon, _, other)) = supervised("a_spinning_shard_stops_the_beat_role") else {
+    return;
+  };
   let _serving = beating(&daemon);
-  let backstop = WINDOW * LEAST_CPU_SHARE_WINDOWS;
+  // The least CPU a poll may run before the rule calls it spinning: the budget held to this build (A-318), several
+  // budgets in an unoptimized build, one in an optimized one. A shard whose host overran the budget before it began to
+  // spin is held to its own window's, longer (A-455), which phase two waits out within its backstop.
+  let spin_window_ns = daemon.spin_window_ns().unwrap();
+  let spin_window = Duration::from_nanos(spin_window_ns);
+  let backstop = spin_window * LEAST_CPU_SHARE_WINDOWS;
   let running = &*Box::leak(Box::new(AtomicBool::new(true)));
   let spinning = &*Box::leak(Box::new(AtomicBool::new(false)));
   let worker = on_shard(&daemon, other, move || {
@@ -726,9 +983,8 @@ fn a_spinning_shard_stops_the_beat() {
   }
   let at_spin = spent();
   let started = Instant::now();
-  let window_ns = u64::try_from(WINDOW.as_nanos()).unwrap();
-  // Phase one: the spin runs a window of the shard's CPU, the rule's own measure.
-  while spent().saturating_sub(at_spin) < window_ns && started.elapsed() < backstop {
+  // Phase one: the spin runs the spin window of the shard's CPU, the rule's own measure.
+  while spent().saturating_sub(at_spin) < spin_window_ns && started.elapsed() < backstop {
     wait(SAMPLE);
   }
   let cpu_at_window = Duration::from_nanos(spent().saturating_sub(at_spin));
@@ -756,19 +1012,125 @@ fn a_spinning_shard_stops_the_beat() {
   running.store(false, Ordering::Relaxed);
   worker.join().unwrap();
   println!(
-    "spinning shard: a window of its CPU ({cpu_at_window:?}) took {wall_to_window:?} of wall; {beats_after} beat(s) \
-     after; the beat stopped {stopped}; its CPU by the end {cpu_at_end:?}"
+    "spinning shard: the spin window of its CPU ({spin_window:?} held to this build; {cpu_at_window:?} read) took \
+     {wall_to_window:?} of wall; {beats_after} beat(s) after; the beat stopped {stopped}; its CPU by the end \
+     {cpu_at_end:?}"
   );
   assert!(
-    cpu_at_window >= WINDOW,
-    "the spinning shard's CPU clock reached {cpu_at_window:?} in {wall_to_window:?}, under a window: it got less than a \
-     {LEAST_CPU_SHARE_WINDOWS}th of a CPU, which this test does not judge"
+    cpu_at_window >= spin_window,
+    "the spinning shard's CPU clock reached {cpu_at_window:?} in {wall_to_window:?}, under the spin window \
+     {spin_window:?}: it got less than a {LEAST_CPU_SHARE_WINDOWS}th of a CPU, which this test does not judge"
   );
   assert!(
     stopped,
     "a shard that ran {cpu_at_end:?} of CPU without a step never stopped the beat ({beats_after} beat(s) after its \
      window of CPU, in {:?})",
     watching.elapsed()
+  );
+  daemon.stop();
+}
+
+/// Shape: the CPU the slow poll of [`a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`] runs,
+/// in half budgets: three, half a budget past the one budget of CPU a poll had before A-318, and a whole budget short of
+/// the least spin window the test judges ([`LEAST_SPIN_HALF_BUDGETS`]), so the look cadence and the clocks' grain cannot
+/// carry it over. An unoptimized build measured 3.5 budgets on a Mac Studio (2026-11-18).
+const SLOW_POLL_HALF_BUDGETS: u32 = 3;
+/// Shape: the least spin window, in half budgets, under which the slow-poll test runs; a build measured nearer machine
+/// code's speed would rightly call its poll spinning, and the test says so and skips.
+const LEAST_SPIN_HALF_BUDGETS: u32 = 5;
+
+/// The calling thread's CPU time, read from its own clock (every platform the watchdog judges by it).
+fn own_cpu_spent() -> Duration {
+  Duration::from_nanos(
+    slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns),
+  )
+}
+
+/// A-318, §4.14. Do: on the shard that is not the control shard, run one poll on the CPU for a budget and a half of its
+/// own CPU, then end it; watch the beat until a window after it ends. Expect, where this build's spin window (the budget
+/// held to the build, the daemon's own) is at least two and a half budgets, as an unoptimized build's is: the beat never
+/// gaps a window and no look withholds it, since a poll this build runs slower is no spin. Before A-318 a window of CPU was the budget
+/// alone, and the beat stopped one budget into the poll, as ThreadSanitizer's 1,054 ms poll ended a test binary on CI.
+/// A build measured nearer machine code skips, loudly.
+#[test]
+fn a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat() {
+  common::supervised::run(
+    "a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat_role",
+    "liveness-slow-poll",
+    2,
+  );
+}
+
+/// The role [`a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`] runs as a supervised
+/// daemon's process: anchored, so a spinning verdict withholds the beat rather than ending the process.
+#[test]
+#[ignore = "a role: run by a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat as a supervised child"]
+fn a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat_role() {
+  let Some((daemon, _, other)) =
+    supervised("a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat_role")
+  else {
+    return;
+  };
+  let _serving = beating(&daemon);
+  let spin_window = Duration::from_nanos(daemon.spin_window_ns().unwrap());
+  let least = WINDOW * LEAST_SPIN_HALF_BUDGETS / 2;
+  let poll_cpu = WINDOW * SLOW_POLL_HALF_BUDGETS / 2;
+  if spin_window < least {
+    println!(
+      "SKIP: this build's spin window is {spin_window:?}, under {least:?}: it runs compiled code near machine code's \
+       speed, so a poll of {poll_cpu:?} of CPU would rightly be judged spinning"
+    );
+    daemon.stop();
+    return;
+  }
+  let ended = &*Box::leak(Box::new(AtomicBool::new(false)));
+  let backstop = spin_window * LEAST_CPU_SHARE_WINDOWS;
+  let before = daemon.watchdog_turns().unwrap();
+  let worker = on_shard(&daemon, other, move || {
+    let started = own_cpu_spent();
+    let wall = Instant::now();
+    while own_cpu_spent().saturating_sub(started) < poll_cpu && wall.elapsed() < backstop {
+      std::hint::spin_loop();
+    }
+    ended.store(true, Ordering::Release);
+  });
+  let watching = Instant::now();
+  let mut last = beat(&daemon);
+  let mut last_seen = Instant::now();
+  let mut largest = Duration::ZERO;
+  let mut ended_at = None;
+  while watching.elapsed() < backstop {
+    wait(SAMPLE);
+    let now = beat(&daemon);
+    if now != last {
+      largest = largest.max(last_seen.elapsed());
+      last = now;
+      last_seen = Instant::now();
+    }
+    if ended.load(Ordering::Acquire) {
+      let at = *ended_at.get_or_insert_with(Instant::now);
+      if at.elapsed() >= WINDOW {
+        break;
+      }
+    }
+  }
+  largest = largest.max(last_seen.elapsed());
+  let after = daemon.watchdog_turns().unwrap();
+  worker.join().unwrap();
+  let (looks, withheld) = (after.0 - before.0, after.1 - before.1);
+  println!(
+    "a poll of {poll_cpu:?} of CPU under a spin window of {spin_window:?}: ended {}; the watchdog looked {looks} times \
+     and withheld the beat at {withheld}; largest beat gap {largest:?}",
+    ended_at.is_some()
+  );
+  assert!(
+    ended_at.is_some(),
+    "the slow poll ended within {backstop:?}"
+  );
+  assert!(
+    looks > 0 && withheld == 0 && largest < WINDOW,
+    "a poll of {poll_cpu:?} of CPU, within this build's spin window of {spin_window:?}, was judged stuck: the beat \
+     withheld at {withheld} of {looks} looks, the largest gap {largest:?}"
   );
   daemon.stop();
 }
@@ -925,7 +1287,22 @@ fn a_shard_waiting_on_a_starved_thread_keeps_the_beat() {
 /// deadlock however the wait is marked.
 #[test]
 fn a_shard_waiting_on_a_blocked_thread_stops_the_beat() {
-  let (daemon, _, other) = daemon("waits-on-blocked");
+  common::supervised::run(
+    "a_shard_waiting_on_a_blocked_thread_stops_the_beat_role",
+    "liveness-waits-on-blocked",
+    2,
+  );
+}
+
+/// The role [`a_shard_waiting_on_a_blocked_thread_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[ignore = "a role: run by a_shard_waiting_on_a_blocked_thread_stops_the_beat as a supervised child"]
+fn a_shard_waiting_on_a_blocked_thread_stops_the_beat_role() {
+  let Some((daemon, _, other)) =
+    supervised("a_shard_waiting_on_a_blocked_thread_stops_the_beat_role")
+  else {
+    return;
+  };
   let _serving = beating(&daemon);
   let holder: &'static std::sync::OnceLock<Option<slates_rt::registry::ThreadHandle>> =
     Box::leak(Box::default());

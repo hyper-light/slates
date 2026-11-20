@@ -220,6 +220,7 @@ mod tests {
     timers: 4,
     tick_ns: 1,
     green_chain_bytes: 1,
+    audit_records: 4,
   };
   /// Shape: the mounting user and another.
   const OWNER: Principal = Principal::Uid {
@@ -249,6 +250,9 @@ mod tests {
         role: Role::Plain,
         live_shipped: false,
         live_holders: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
       },
       base: BaseRecord::Scratch,
       head: SnapshotId { value: 0 },
@@ -261,6 +265,7 @@ mod tests {
       access: vec![],
       created_ns: 0,
       catalog_version: 0,
+      taken_over: None,
     }
   }
 
@@ -292,6 +297,7 @@ mod tests {
             admin: false,
           },
           token: [1; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -384,6 +390,7 @@ mod tests {
             admin: false,
           },
           token: [1; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -426,6 +433,7 @@ mod tests {
             admin: false,
           },
           token: [2; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -503,6 +511,7 @@ mod tests {
             principal,
             rights: Rights { read: true, write: write_rights, admin: false },
             token: [1; 16],
+            mount: None,
           },
         })
         .unwrap();

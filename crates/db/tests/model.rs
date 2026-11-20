@@ -60,7 +60,6 @@ fn segment(name: &str, log_bytes: u64) -> AnchorSegment {
       profile_bytes: PAGE,
       log_bytes,
       snapshot_bytes: SNAPSHOT_BYTES,
-      audit_bytes: PAGE,
       landing_slots: 1,
       landing_slot_bytes: PAGE,
     },
@@ -77,6 +76,7 @@ fn caps() -> PartitionCaps {
     timers: 1 << 12,
     tick_ns: 1_000,
     green_chain_bytes: 1 << 20,
+    audit_records: 1 << 12,
   }
 }
 
@@ -112,6 +112,7 @@ fn removing_a_source_mount_removes_its_bindings_and_recovery_agrees() {
       admin: false,
     },
     token: [1; 16],
+    mount: None,
   };
   for record in [
     parent.clone(),
@@ -244,6 +245,7 @@ fn binding_a_bound_mount_keeps_its_identity_and_recovery_agrees() {
       admin: false,
     },
     token: [1; 16],
+    mount: None,
   };
   db.mutate(&mut segment, &Op::AttachmentAdded { record }, 0)
     .unwrap();
@@ -273,6 +275,71 @@ fn binding_a_bound_mount_keeps_its_identity_and_recovery_agrees() {
   }
 }
 
+/// Shape: the works a generated history's adopted completions route to (A-288): a few, so routes share works.
+const ROUTED_WORKS: u8 = 3;
+
+/// The work a generated adopted completion routes to: an id no generated volume takes (its bytes are all the same high
+/// value, where `vid` counts up from the low end).
+fn routed_work(index: u8) -> VolumeId {
+  VolumeId {
+    bytes: [u8::MAX.saturating_sub(index); 16],
+  }
+}
+
+/// A-288: every work's routed count equals the retained completions the partition's snapshot carries under that work,
+/// so a route is kept exactly while a completion it leads to is retained, never past its acknowledgement.
+fn routes_match_their_records(db: &Db) -> Result<(), TestCaseError> {
+  let snapshot = db.partition().to_snapshot(0);
+  for index in 0..ROUTED_WORKS {
+    let work = routed_work(index);
+    let tagged = snapshot
+      .completions
+      .iter()
+      .flat_map(|client| &client.records)
+      .filter(|record| record.work == Some(work))
+      .count();
+    prop_assert_eq!(
+      db.partition().completions_routed_by(work),
+      tagged,
+      "work {}'s routed count against the records that carry it",
+      index
+    );
+  }
+  Ok(())
+}
+
+/// A-288, the model's own rule: a completion just recorded that its window retains carries exactly the work it was
+/// recorded with (none for a completion a verb ran), so a route is never lost while its completion is held.
+fn a_retained_completion_carries_its_route(
+  db: &Db,
+  record: &CompletionRecord,
+) -> Result<(), TestCaseError> {
+  if !matches!(
+    db.partition()
+      .completion(record.origin, record.client, record.sequence),
+    Seen::Completed(_)
+  ) {
+    return Ok(());
+  }
+  let carried = db
+    .partition()
+    .to_snapshot(0)
+    .completions
+    .iter()
+    .filter(|client| client.origin == record.origin && client.client == record.client)
+    .flat_map(|client| &client.records)
+    .find(|held| held.sequence == record.sequence)
+    .map(|held| held.work);
+  prop_assert_eq!(
+    carried,
+    Some(record.work),
+    "client {} sequence {}'s route",
+    record.client,
+    record.sequence
+  );
+  Ok(())
+}
+
 fn vid(n: u64) -> VolumeId {
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&n.to_be_bytes());
@@ -298,6 +365,9 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
       role: Role::Plain,
       live_shipped: false,
       live_holders: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },
@@ -310,6 +380,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
     access: vec![],
     created_ns: 0,
     catalog_version: 0,
+    taken_over: None,
   }
 }
 
@@ -325,6 +396,8 @@ enum Step {
   Access(usize),
   LiveShip(usize, bool),
   Destroy(usize),
+  /// A live volume relinquished to its re-adoption (A-362): gone with no tombstone.
+  Relinquish(usize),
   Snapshot(usize),
   Place(usize, usize),
   DropSnapshot(usize, usize),
@@ -333,7 +406,8 @@ enum Step {
   Release(usize),
   Attach(usize, u32),
   Detach(usize),
-  Complete(u32, u32),
+  /// A completion recorded: the client, the sequence, and the work it routes to when a successor adopted it (A-288).
+  Complete(u32, u32, Option<u8>),
   Acknowledge(u32, u32, Vec<u32>),
   Grant(usize),
   GrantState(usize, u8),
@@ -345,6 +419,9 @@ enum Step {
   GreenOriginate(usize),
   /// A green's checkpoint (W3) at a version, which folds the increments up to it.
   GreenCheckpoint(usize, u64),
+  /// A green recorded by its takeover successor's adoption of its holder ledger (A-333): the version it was adopted at,
+  /// and whether it has an origin.
+  GreenAdopt(u64, bool),
   NfsOpen(u8, u8, u32),
   NfsOpenClear(usize),
   NfsLock(usize, u64, u64, bool),
@@ -384,6 +461,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize).prop_map(Step::Access),
     1 => (0..8usize, proptest::bool::ANY).prop_map(|(v, on)| Step::LiveShip(v, on)),
     1 => (0..8usize).prop_map(Step::Destroy),
+    1 => (0..8usize).prop_map(Step::Relinquish),
     2 => (0..8usize).prop_map(Step::Snapshot),
     1 => (0..8usize, 0..4usize).prop_map(|(v, s)| Step::Place(v, s)),
     1 => (0..8usize, 0..4usize).prop_map(|(v, s)| Step::DropSnapshot(v, s)),
@@ -392,7 +470,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize).prop_map(Step::Release),
     1 => (0..8usize, 0..3u32).prop_map(|(v, c)| Step::Attach(v, c)),
     1 => (0..8usize).prop_map(Step::Detach),
-    2 => (0..3u32, 0..16u32).prop_map(|(c, s)| Step::Complete(c, s)),
+    2 => (0..3u32, 0..16u32, proptest::option::of(0..ROUTED_WORKS)).prop_map(|(c, s, w)| Step::Complete(c, s, w)),
     1 => (0..3u32, 0..16u32, proptest::collection::vec(0..16u32, 0..4)).prop_map(|(c, s, owed)| Step::Acknowledge(c, s, owed)),
     1 => (0..8usize).prop_map(Step::Grant),
     1 => (0..8usize, 0..4u8).prop_map(|(g, s)| Step::GrantState(g, s)),
@@ -403,6 +481,7 @@ fn step() -> impl Strategy<Value = Step> {
     2 => (0..8usize).prop_map(Step::GreenAdvance),
     1 => (0..8usize).prop_map(Step::GreenOriginate),
     1 => (0..8usize, 0..6u64).prop_map(|(v, at)| Step::GreenCheckpoint(v, at)),
+    1 => (0..6u64, any::<bool>()).prop_map(|(at, origin)| Step::GreenAdopt(at, origin)),
     2 => (0..4u8, 0..8u8, 1..4u32).prop_map(|(c, f, a)| Step::NfsOpen(c, f, a)),
     1 => (0..8usize).prop_map(Step::NfsOpenClear),
     2 => (0..8usize, 0..1_000u64, 1..1_000u64, any::<bool>()).prop_map(|(o, a, l, w)| Step::NfsLock(o, a, l, w)),
@@ -539,6 +618,9 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     Step::Destroy(v) => Op::VolumeDestroyed {
       id: vid(pick(&ids.live, *v)?),
     },
+    Step::Relinquish(v) => Op::VolumeRelinquished {
+      id: vid(pick(&ids.live, *v)?),
+    },
     Step::Snapshot(v) => {
       let volume = pick(&ids.live, *v)?;
       let id = ids
@@ -612,18 +694,20 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
             admin: false,
           },
           token: [0u8; 16],
+          mount: None,
         },
       }
     }
     Step::Detach(a) => Op::AttachmentRemoved {
       id: pick(&ids.attachments, *a)?,
     },
-    Step::Complete(c, s) => Op::CompletionRecorded {
+    Step::Complete(c, s, routed) => Op::CompletionRecorded {
       record: CompletionRecord {
         origin: 0,
         client: *c,
         sequence: *s,
         result: vec![u8::try_from(*s).unwrap_or(0); 3],
+        work: routed.map(routed_work),
       },
     },
     Step::Acknowledge(c, s, owed) => Op::CompletionsAcknowledged {
@@ -640,7 +724,8 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::Audit(..)
     | Step::GreenAdvance(..)
     | Step::GreenOriginate(..)
-    | Step::GreenCheckpoint(..)) => return op_for_service(step, ids, now_ns),
+    | Step::GreenCheckpoint(..)
+    | Step::GreenAdopt(..)) => return op_for_service(step, ids, now_ns),
     step @ (Step::NfsOpen(..)
     | Step::NfsOpenClear(..)
     | Step::NfsLock(..)
@@ -735,6 +820,14 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
           landing: None,
           manifest: None,
           outcome: None,
+          // Every other record carries a verdict, so recovery is held to keep it (A-321).
+          signature: k
+            .is_multiple_of(2)
+            .then_some(slates_db::catalog::SignatureVerdict {
+              kind: 1,
+              detail: *k,
+              fingerprint: [*k; 32],
+            }),
         },
       }
     }
@@ -757,6 +850,18 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
       version: *at,
       checkpoint: at.to_be_bytes().to_vec(),
     },
+    // An adoption records a new green with its version 0 and every version up to the adopted one; the steps after it
+    // advance, checkpoint and destroy it as any green, and a later origin of it is refused, never recorded.
+    Step::GreenAdopt(at, origin) => {
+      let n = ids.next_volume;
+      ids.next_volume += 1;
+      Op::GreenAdopted {
+        record: volume(n, &format!("v{n}")),
+        version: *at,
+        identity: [u8::try_from(*at).unwrap_or(u8::MAX); 32],
+        origin: origin.then_some([7; 32]),
+      }
+    }
     _ => return None,
   })
 }
@@ -952,10 +1057,10 @@ fn note_applied(op: &Op, ids: &mut Ids) {
     Op::NfsLockSet { record } => ids.nfs_locks.push(record.other),
     Op::NfsLockCleared { other } => ids.nfs_locks.retain(|o| o != other),
     Op::NfsInstanceAdvanced { instance } => ids.nfs_instance = *instance,
-    Op::VolumeCreated { record } => ids
+    Op::VolumeCreated { record } | Op::GreenAdopted { record, .. } => ids
       .live
       .push(u64::from_be_bytes(record.id.bytes[..8].try_into().unwrap())),
-    Op::VolumeDestroyed { id } => {
+    Op::VolumeDestroyed { id } | Op::VolumeRelinquished { id } => {
       let n = u64::from_be_bytes(id.bytes[..8].try_into().unwrap());
       ids.live.retain(|v| *v != n);
       ids.snapshots.retain(|(v, _)| *v != n);
@@ -1025,6 +1130,7 @@ fn every_recovery_equals_the_live_partition_under(
       );
       prop_assert_eq!(recovered.next_seq(), seq);
       prop_assert!(!stats.torn, "a clean crash has no torn tail");
+      routes_match_their_records(&recovered)?;
       db = recovered;
       hold_to(&mut db, cadence);
       continue;
@@ -1036,6 +1142,15 @@ fn every_recovery_equals_the_live_partition_under(
       Ok(_) => {
         note_applied(&op, &mut ids);
         applied += 1;
+        if matches!(
+          op,
+          Op::CompletionRecorded { .. } | Op::CompletionsAcknowledged { .. }
+        ) {
+          routes_match_their_records(&db)?;
+        }
+        if let Op::CompletionRecorded { record } = &op {
+          a_retained_completion_carries_its_route(&db, record)?;
+        }
       }
       Err(
         DbError::NotFound
@@ -1060,6 +1175,7 @@ fn every_recovery_equals_the_live_partition_under(
   prop_assert_eq!(recovered.partition().to_snapshot(0), live);
   prop_assert_eq!(recovered.next_seq(), seq);
   prop_assert!(usize::try_from(seq).map_err(failed)? >= applied);
+  routes_match_their_records(&recovered)?;
   Ok(())
 }
 
@@ -1335,6 +1451,7 @@ fn completions_are_exactly_once_across_recovery() {
         client: 7,
         sequence: 3,
         result: vec![1, 2, 3],
+        work: None,
       },
     },
     0,
@@ -1348,6 +1465,7 @@ fn completions_are_exactly_once_across_recovery() {
         client: 7,
         sequence: 4,
         result: vec![4],
+        work: None,
       },
     },
     0,
@@ -1375,6 +1493,76 @@ fn completions_are_exactly_once_across_recovery() {
   assert_eq!(db.partition().completion(0, 7, 4), Seen::Completed(vec![4]));
 }
 
+/// A-288: the completions a green's successor adopted are counted under the work whose submit each completes, durably,
+/// until the client acknowledges them. Do: record two adopted completions of one work and a third a verb ran, recover,
+/// acknowledge the first, recover again, then acknowledge the second. Expect: the work's count follows exactly the adopted
+/// completions retained (2, 2 after the recovery, 1, 1 after the next, 0), the verb's completion counts for no work, and
+/// another work counts nothing throughout.
+#[test]
+fn a_works_adopted_completions_are_counted_until_acknowledged_across_recovery() {
+  let mut seg = segment("slates-db-routed-completions", LOG_BYTES);
+  let mut db = open(&mut seg);
+  let (work, other) = (routed_work(0), routed_work(1));
+  let record = |sequence: u32, work: Option<VolumeId>| Op::CompletionRecorded {
+    record: CompletionRecord {
+      origin: 0,
+      client: 7,
+      sequence,
+      result: vec![u8::try_from(sequence).unwrap()],
+      work,
+    },
+  };
+  for op in [
+    record(3, Some(work)),
+    record(4, Some(work)),
+    record(5, None),
+  ] {
+    db.mutate(&mut seg, &op, 0).unwrap();
+  }
+  let acknowledge = |up_to: u32| Op::CompletionsAcknowledged {
+    origin: 0,
+    client: 7,
+    up_to,
+    owed: Vec::new(),
+  };
+  let mut counts = vec![(
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  )];
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, caps(), 0).unwrap();
+  counts.push((
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  ));
+  db.mutate(&mut seg, &acknowledge(3), 0).unwrap();
+  counts.push((
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  ));
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, caps(), 0).unwrap();
+  counts.push((
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  ));
+  db.mutate(&mut seg, &acknowledge(5), 0).unwrap();
+  counts.push((
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  ));
+  assert_eq!(
+    counts,
+    vec![(2, 0), (2, 0), (1, 0), (1, 0), (0, 0)],
+    "the work's adopted completions, counted while retained"
+  );
+  assert_eq!(
+    db.partition().completion(0, 7, 4),
+    Seen::Acknowledged,
+    "the last adopted completion was released by the acknowledgement that ended its count"
+  );
+}
+
 /// The idempotency key is globally unique: two **distinct origin hosts** with the *same* (client, sequence)
 /// keep independent completions, so a cross-node forwarded write (keyed by its authenticated origin) never
 /// returns — or is deduplicated against — a local client that happens to share its per-node id (§4.8, task
@@ -1393,6 +1581,7 @@ fn completions_from_distinct_origins_do_not_collide() {
           client: 7,
           sequence: 3,
           result,
+          work: None,
         },
       },
       0,
@@ -1476,6 +1665,7 @@ const CHECKPOINT_GREEN: u64 = 1;
 fn checkpoint_caps() -> PartitionCaps {
   PartitionCaps {
     green_chain_bytes: BUDGET_INCREMENTS * INCREMENT_BYTES,
+    audit_records: 1 << 12,
     ..caps()
   }
 }
@@ -1596,6 +1786,204 @@ fn a_green_checkpoint_folds_its_chain_and_recovery_holds_it() {
     live,
     "a snapshot carries the checkpoint"
   );
+}
+
+/// The adoption test's green, adopted at [`ADOPTED_AT`].
+const ADOPTED_GREEN: u64 = 2;
+/// Shape: the version the adoption test's green is adopted at by its takeover successor.
+const ADOPTED_AT: u64 = 3;
+
+/// The adoption test's green recorded by its adoption at `version` from a ledger whose version 0 names inputs `[7; 32]`.
+fn adopted_at(version: u64) -> Op {
+  Op::GreenAdopted {
+    record: volume(ADOPTED_GREEN, "adopted"),
+    version,
+    identity: [9; 32],
+    origin: Some([7; 32]),
+  }
+}
+
+/// Records the adoption test's green by its adoption at [`ADOPTED_AT`], then asks for a second adoption, a creation
+/// under its id and an origin: each refused `AlreadyExists`, none recorded.
+fn adopt_and_refuse_a_second_version_zero(seg: &mut AnchorSegment, db: &mut Db) {
+  let green = vid(ADOPTED_GREEN);
+  db.mutate(seg, &adopted_at(ADOPTED_AT), 0).unwrap();
+  assert!(
+    db.partition().volume(green).is_some(),
+    "recorded by its adoption"
+  );
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT);
+  assert!(db.partition().green_chain(green).is_empty());
+  let seq = db.next_seq();
+  for late in [
+    adopted_at(ADOPTED_AT + 1),
+    Op::VolumeCreated {
+      record: volume(ADOPTED_GREEN, "another"),
+    },
+    Op::GreenOriginated {
+      green,
+      origin: vec![1],
+    },
+  ] {
+    let refused = db.mutate(seg, &late, 0);
+    assert!(
+      matches!(refused, Err(DbError::AlreadyExists { .. })),
+      "{late:?}: {refused:?}"
+    );
+  }
+  assert_eq!(db.next_seq(), seq, "no refused version 0 was recorded");
+}
+
+/// Advances the adopted green two increments, asks for checkpoints at its adoption, below it and past its head (each
+/// refused with the adoption as the floor held, none recorded), then checkpoints it at version 4: version 5 alone stays in
+/// the chain.
+fn checkpoint_past_the_adoption(seg: &mut AnchorSegment, db: &mut Db) {
+  let green = vid(ADOPTED_GREEN);
+  for n in 0..2u8 {
+    db.mutate(
+      seg,
+      &Op::GreenAdvanced {
+        green,
+        increment: vec![n; INCREMENT_BYTES],
+      },
+      0,
+    )
+    .unwrap();
+  }
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT + 2);
+  let seq = db.next_seq();
+  for version in [ADOPTED_AT, ADOPTED_AT - 1, ADOPTED_AT + 3] {
+    let refused = db.mutate(
+      seg,
+      &Op::GreenCheckpointed {
+        green,
+        version,
+        checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+      },
+      0,
+    );
+    assert_eq!(
+      refused.err(),
+      Some(DbError::CheckpointOutOfRange {
+        version,
+        held: ADOPTED_AT,
+        head: ADOPTED_AT + 2,
+      }),
+      "a checkpoint at {version} is refused"
+    );
+  }
+  assert_eq!(db.next_seq(), seq, "no refused checkpoint was recorded");
+  db.mutate(
+    seg,
+    &Op::GreenCheckpointed {
+      green,
+      version: ADOPTED_AT + 1,
+      checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+    },
+    0,
+  )
+  .unwrap();
+  assert_eq!(
+    db.partition().green_chain(green),
+    &[vec![1; INCREMENT_BYTES]],
+    "version 5 alone is past the checkpoint at 4"
+  );
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT + 2);
+}
+
+/// §4.16 owner-loss recovery (A-333). Do: record a green by its adoption at version 3 (its successor's holder ledger
+/// holds versions 0 to 3), adopt it again, create a volume under its id and give it an origin; advance it two increments;
+/// checkpoint it at its adoption, below it and past its head, then at version 4; recover from the log and from a
+/// snapshot. Expect: the green recorded with a head of 3 and an empty chain; the second adoption, the creation and the
+/// origin refused `AlreadyExists`, never recorded; the two increments versions 4 and 5; the three checkpoints refused
+/// `CheckpointOutOfRange` with the adoption as the floor held, and the one at 4 leaving version 5 alone in the chain;
+/// both recoveries holding the adoption, the checkpoint and the chain.
+#[test]
+fn an_adopted_greens_chain_begins_after_its_adoption_and_recovery_holds_it() {
+  let green = vid(ADOPTED_GREEN);
+  let mut seg = segment("slates-db-adoption", LOG_BYTES);
+  let mut db = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap().0;
+  adopt_and_refuse_a_second_version_zero(&mut seg, &mut db);
+  checkpoint_past_the_adoption(&mut seg, &mut db);
+  let live = db.partition().to_snapshot(0);
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().to_snapshot(0),
+    live,
+    "the log holds the adoption"
+  );
+  db.snapshot(&mut seg).unwrap();
+  drop(db);
+  let (recovered, stats) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert!(stats.snapshot.is_some());
+  assert_eq!(
+    recovered.partition().to_snapshot(0),
+    live,
+    "a snapshot carries the adoption"
+  );
+  assert_eq!(
+    recovered.partition().green_adoption(green).copied(),
+    Some(slates_db::partition::GreenAdoption {
+      green,
+      version: ADOPTED_AT,
+      identity: [9; 32],
+      origin: Some([7; 32]),
+    })
+  );
+}
+
+/// AUD-29-43, A-238, A-333: a destroyed green's tombstone is written one past every sequence its register held, and a
+/// green's register holds a merge record at every version up to its head, whatever its chain still holds. Do: destroy a
+/// green checkpointed at 3 with a head of 5, and one adopted at 3 with a head of 4. Expect each tombstone's sequence past
+/// its head: 6 and 5. Before, it was one past the chain's length (3 and 2), below versions its holders had accepted.
+#[test]
+fn a_destroyed_greens_tombstone_is_past_its_head_whatever_its_chain_holds() {
+  let mut seg = segment("slates-db-green-tombstone", LOG_BYTES);
+  let mut db = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap().0;
+  let (checkpointed, adopted) = (vid(CHECKPOINT_GREEN), vid(ADOPTED_GREEN));
+  db.mutate(
+    &mut seg,
+    &Op::VolumeCreated {
+      record: volume(CHECKPOINT_GREEN, "checkpointed"),
+    },
+    0,
+  )
+  .unwrap();
+  for n in 0..5u8 {
+    db.mutate(&mut seg, &advance(n), 0).unwrap();
+    if n == 2 {
+      db.mutate(&mut seg, &checkpoint_at(3), 0).unwrap();
+    }
+  }
+  db.mutate(&mut seg, &adopted_at(ADOPTED_AT), 0).unwrap();
+  db.mutate(
+    &mut seg,
+    &Op::GreenAdvanced {
+      green: adopted,
+      increment: vec![1; INCREMENT_BYTES],
+    },
+    0,
+  )
+  .unwrap();
+  for id in [checkpointed, adopted] {
+    for op in [
+      Op::VolumeStateChanged {
+        id,
+        state: VolumeState::Destroying,
+      },
+      Op::VolumeDestroyed { id },
+    ] {
+      db.mutate(&mut seg, &op, 0).unwrap();
+    }
+  }
+  let sequences = [checkpointed, adopted].map(|id| {
+    db.partition()
+      .tombstone(id)
+      .map(|tombstone| tombstone.sequence)
+  });
+  assert_eq!(sequences, [Some(6), Some(ADOPTED_AT + 2)]);
+  assert_eq!(db.partition().green_adoption(adopted), None);
 }
 
 /// §4.8 recovery, §2.6 boot step 2: recovery takes the newest snapshot slot that decodes. Do: take snapshots until both
@@ -1831,6 +2219,258 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
 }
 
+/// A-291 (§4.10 "Ownership follows the writer"): do create a volume, record a snapshot of it and an attachment, release
+/// it, end the attachment, release it again, and recover the database. Expect the first release refused `Attached`
+/// with nothing changed; the second to take the volume's record, its snapshot and its name with it and to leave no
+/// tombstone, since its registers are the member's it moved to and no holder may be told to close them; a later create
+/// under the same name admitted; and the recovered database to agree.
+#[test]
+fn a_moved_volume_is_released_whole_and_leaves_no_tombstone() {
+  let mut segment = segment("slates-db-move-release", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let moved = volume(1, "moved");
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: moved.clone(),
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::SnapshotTaken {
+      record: SnapshotRecord {
+        id: SnapshotId { value: 1 },
+        volume: moved.id,
+        epoch: 1,
+        identity: None,
+        placed: PlacementState::Local,
+        taken_ns: 0,
+      },
+    },
+    0,
+  )
+  .unwrap();
+  let attachment = AttachmentRecord {
+    id: 1,
+    volume: moved.id,
+    consumer: Consumer::Bridge,
+    snapshot: None,
+    form: AttachForm::Root,
+    principal: principal(0),
+    rights: Rights {
+      read: true,
+      write: true,
+      admin: false,
+    },
+    token: [1; 16],
+    mount: None,
+  };
+  db.mutate(&mut segment, &Op::AttachmentAdded { record: attachment }, 0)
+    .unwrap();
+  assert_eq!(
+    db.mutate(&mut segment, &Op::VolumeReleased { id: moved.id }, 0),
+    Err(DbError::Attached { attachments: 1 }),
+    "a volume leaves only whole"
+  );
+  assert!(db.partition().volume(moved.id).is_some());
+  db.mutate(&mut segment, &Op::AttachmentRemoved { id: 1 }, 0)
+    .unwrap();
+  db.mutate(&mut segment, &Op::VolumeReleased { id: moved.id }, 0)
+    .unwrap();
+  let released = |db: &Db| {
+    db.partition().volume(moved.id).is_none()
+      && db.partition().volume_by_name("moved").is_none()
+      && db.partition().snapshots_of(moved.id).is_empty()
+      && db.partition().tombstone(moved.id).is_none()
+      && db.partition().tombstones().next().is_none()
+  };
+  assert!(
+    released(&db),
+    "record, snapshot and name gone, no tombstone"
+  );
+  drop(db);
+  let mut recovered = open(&mut segment);
+  assert!(released(&recovered), "the recovered database agrees");
+  recovered
+    .mutate(
+      &mut segment,
+      &Op::VolumeCreated {
+        record: volume(2, "moved"),
+      },
+      0,
+    )
+    .unwrap();
+}
+
+/// A-291 (§4.15 `capture_base`): do record a volume's snapshot, capture it as a complete base, refuse a capture of a
+/// snapshot the partition does not hold, recover the database, destroy the captured snapshot, capture a second snapshot
+/// and release the volume, and recover again. Expect the captured snapshot named so before and after the first recovery
+/// and the unheld one refused `NotFound` with nothing recorded; the capture gone with its snapshot's destroy, and with
+/// its volume's release; and the second recovery to agree.
+#[test]
+fn a_captured_base_is_kept_with_its_snapshot_and_goes_with_it() {
+  let mut segment = segment("slates-db-captured-base", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let base = volume(1, "base");
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: base.clone(),
+    },
+    0,
+  )
+  .unwrap();
+  let taken = |value: u64| Op::SnapshotTaken {
+    record: SnapshotRecord {
+      id: SnapshotId { value },
+      volume: base.id,
+      epoch: value,
+      identity: None,
+      placed: PlacementState::Local,
+      taken_ns: 0,
+    },
+  };
+  let (first, second) = (SnapshotId { value: 1 }, SnapshotId { value: 2 });
+  db.mutate(&mut segment, &taken(1), 0).unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::BaseCaptured {
+      volume: base.id,
+      snapshot: first,
+    },
+    0,
+  )
+  .unwrap();
+  assert!(db.partition().is_captured(base.id, first));
+  assert_eq!(
+    db.mutate(
+      &mut segment,
+      &Op::BaseCaptured {
+        volume: base.id,
+        snapshot: second,
+      },
+      0,
+    ),
+    Err(DbError::NotFound),
+    "a capture names a snapshot the partition holds"
+  );
+  assert!(!db.partition().is_captured(base.id, second));
+  drop(db);
+  let mut db = open(&mut segment);
+  assert!(
+    db.partition().is_captured(base.id, first),
+    "the capture survives a recovery"
+  );
+  db.mutate(
+    &mut segment,
+    &Op::SnapshotDestroyed {
+      volume: base.id,
+      id: first,
+    },
+    0,
+  )
+  .unwrap();
+  assert!(
+    !db.partition().is_captured(base.id, first),
+    "the capture goes with its snapshot"
+  );
+  db.mutate(&mut segment, &taken(2), 0).unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::BaseCaptured {
+      volume: base.id,
+      snapshot: second,
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(&mut segment, &Op::VolumeReleased { id: base.id }, 0)
+    .unwrap();
+  assert!(
+    !db.partition().is_captured(base.id, second),
+    "the capture goes with its volume"
+  );
+  drop(db);
+  let recovered = open(&mut segment);
+  assert!(!recovered.partition().is_captured(base.id, first));
+  assert!(!recovered.partition().is_captured(base.id, second));
+}
+
+/// A-362 (§4.8 "Promotion and takeover"): a volume relinquished to its re-adoption leaves no tombstone and erases no key,
+/// so the adopted state is made again under its id and name, and recovery agrees. Do: make a volume and record its
+/// lineage key; relinquish it; make it again under the same id and name, as the takeover that names this node again
+/// records it; then recover the database; and alongside, destroy a second volume and try to make it again. Expect the
+/// relinquish to leave the volume made again, its lineage key kept and no tombstone, the recovered database the same;
+/// and the destroyed volume refused `AlreadyExists` (its tombstone holds the id).
+#[test]
+fn a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key() {
+  let mut segment = segment("slates-db-relinquish", LOG_BYTES);
+  let mut db = open(&mut segment);
+  for n in [1, 2] {
+    db.mutate(
+      &mut segment,
+      &Op::VolumeCreated {
+        record: volume(n, &format!("v{n}")),
+      },
+      0,
+    )
+    .unwrap();
+  }
+  let lineage = slates_db::catalog::SealKeyOwner::Lineage { volume: vid(1) };
+  db.mutate(
+    &mut segment,
+    &Op::SealKeySet {
+      record: slates_db::catalog::SealKeyRecord {
+        owner: lineage,
+        id: [1; 16],
+        record: vec![2; slates_db::catalog::SEAL_KEY_RECORD_BYTES],
+      },
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(&mut segment, &Op::VolumeRelinquished { id: vid(1) }, 0)
+    .unwrap();
+  assert!(
+    db.partition().volume(vid(1)).is_none(),
+    "the stale record went"
+  );
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: volume(1, "v1"),
+    },
+    0,
+  )
+  .expect("the volume is made again under its id and name: no tombstone holds them");
+  assert!(
+    db.partition().seal_key(&lineage).is_some(),
+    "its lineage key is kept, unlike a destroy's"
+  );
+  db.mutate(&mut segment, &Op::VolumeDestroyed { id: vid(2) }, 0)
+    .unwrap();
+  let again = db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: volume(2, "v2"),
+    },
+    0,
+  );
+  assert!(
+    matches!(again, Err(slates_db::DbError::AlreadyExists { .. })),
+    "a destroyed volume's tombstone holds its id: {again:?}"
+  );
+  drop(db);
+  let recovered = open(&mut segment);
+  assert!(
+    recovered.partition().volume(vid(1)).is_some()
+      && recovered.partition().seal_key(&lineage).is_some(),
+    "recovery agrees: the volume made again, its key kept"
+  );
+}
+
 // ---------------------------------------------------------------- acknowledgements that name owed ids
 
 /// One step of a client whose acknowledgements name the ids it still owes (§4.9), and of their delivery to the
@@ -1910,6 +2550,7 @@ fn owed_step_applied(
       client: OWING_CLIENT,
       sequence,
       result: sequence.to_le_bytes().to_vec(),
+      work: None,
     },
   };
   match step {
@@ -2040,6 +2681,7 @@ fn a_wait_and_its_transaction_are_one_durable_step() {
       client: OWING_CLIENT,
       sequence: 1,
       result: b"other".to_vec(),
+      work: None,
     },
   };
   db.begin();
@@ -2070,6 +2712,7 @@ fn a_wait_and_its_transaction_are_one_durable_step() {
         client: OWING_CLIENT,
         sequence: 3,
         result: b"seven".to_vec(),
+        work: None,
       },
     },
     0,
@@ -2081,4 +2724,103 @@ fn a_wait_and_its_transaction_are_one_durable_step() {
     db.partition().completion(0, OWING_CLIENT, 3),
     Seen::Completed(b"seven".to_vec())
   );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// A-694: volume ids minted per record.
+
+/// One step of a minting history (A-694).
+#[derive(Clone, Debug)]
+enum MintStep {
+  /// Volumes created in one record, each id minted at its own offset before any of them is recorded, as an append's new
+  /// branches are.
+  Together(u8),
+  /// A volume created in a record of its own.
+  Alone,
+  /// A record that creates no volume.
+  Other,
+  /// The database dropped and recovered from the segment.
+  Crash,
+}
+
+/// A minting step: mostly creations, alone or several to a record, beside other records and crashes.
+fn mint_step() -> impl Strategy<Value = MintStep> {
+  (0u8..8, 1u8..5).prop_map(|(kind, count)| match kind {
+    0 => MintStep::Crash,
+    1 | 2 => MintStep::Alone,
+    3 => MintStep::Other,
+    _ => MintStep::Together(count),
+  })
+}
+
+/// A volume whose id the server's layout mints: host and partition zero, and `counter` in its last six bytes.
+fn minted_volume(counter: u64) -> VolumeRecord {
+  let mut record = volume(0, &format!("m{counter}"));
+  let mut bytes = [0u8; 16];
+  bytes[10..].copy_from_slice(&counter.to_be_bytes()[2..]);
+  record.id = VolumeId { bytes };
+  record
+}
+
+/// Runs a minting history (A-694): every id minted is new, whether minted alone or several before one record, and after
+/// every crash the recovered partition equals the live one and mints the next id the live database would.
+fn every_mint_is_new_and_a_recovery_mints_alike(steps: &[MintStep]) -> Result<(), TestCaseError> {
+  let mut seg = segment("slates-db-model-mint", LOG_BYTES);
+  let mut db = open(&mut seg);
+  let mut minted = std::collections::BTreeSet::new();
+  let mut instance = 0u32;
+  for step in steps {
+    match step {
+      MintStep::Crash => {
+        let (live, next) = (db.partition().to_snapshot(0), db.volume_counter_at(0));
+        drop(db);
+        let (recovered, _) = recover(&mut seg, 0, caps(), 0).map_err(failed)?;
+        prop_assert_eq!(recovered.partition().to_snapshot(0), live);
+        prop_assert_eq!(recovered.volume_counter_at(0), next);
+        db = recovered;
+      }
+      MintStep::Alone => {
+        let counter = db
+          .volume_counter_at(0)
+          .ok_or_else(|| failed("ids exhausted"))?;
+        let record = minted_volume(counter);
+        db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+          .map_err(failed)?;
+        prop_assert!(minted.insert(counter), "{} minted twice", counter);
+      }
+      MintStep::Together(count) => {
+        let counters: Vec<u64> = (0..u64::from(*count))
+          .map(|offset| db.volume_counter_at(offset))
+          .collect::<Option<_>>()
+          .ok_or_else(|| failed("ids exhausted"))?;
+        db.begin();
+        for counter in &counters {
+          let record = minted_volume(*counter);
+          db.mutate(&mut seg, &Op::VolumeCreated { record }, 0)
+            .map_err(failed)?;
+          prop_assert!(minted.insert(*counter), "{} minted twice", counter);
+        }
+        db.commit(&mut seg).map_err(failed)?;
+      }
+      MintStep::Other => {
+        instance += 1;
+        db.mutate(&mut seg, &Op::NfsInstanceAdvanced { instance }, 0)
+          .map_err(failed)?;
+      }
+    }
+  }
+  Ok(())
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(60), ..ProptestConfig::default() }))]
+
+  /// A-694 (§4.8 "Recovery"; guard then apply): do run generated histories of volumes created alone and several to one
+  /// record, each id minted from the database's counter at its offset before its record (as an append mints its new
+  /// branches'), beside records that create none, dropping and recovering the database at random points. Expect every
+  /// id minted new, and every recovery equal to the live partition, minting the next id the live database would.
+  #[test]
+  fn t_a694_every_mint_is_new_and_a_recovery_mints_alike(steps in proptest::collection::vec(mint_step(), 1..120)) {
+    every_mint_is_new_and_a_recovery_mints_alike(&steps)?;
+  }
 }

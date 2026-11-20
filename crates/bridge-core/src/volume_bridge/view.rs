@@ -18,7 +18,9 @@
 //!   representable attribute it no longer names is removed.
 //!
 //! Attributes the format cannot carry (a name longer than 254 bytes, a value past 4 GiB) are neither
-//! shown nor removed. A change through any other path (FUSE, the SDK, a merge) drops the working copy,
+//! shown nor removed. Nor are a guest's own (`trusted.`, `security.`: A-290), which a macOS host's
+//! file may not name either: a write that would set one is refused `NotPermitted` and its working
+//! copy dropped. A change through any other path (FUSE, the SDK, a merge) drops the working copy,
 //! so the next read encodes afresh. The view's size and times move with each change, which is what an
 //! NFSv3 client revalidates its cache by.
 //!
@@ -185,6 +187,14 @@ impl VolumeBridge<'_> {
     }) else {
       return Ok(false);
     };
+    // As a write to a view is, an orphan naming a guest's own attribute is refused whole (A-290): nothing is merged.
+    if layout
+      .attributes
+      .iter()
+      .any(|(attribute, _)| crate::guest_only(attribute))
+    {
+      return Err(VfsError::NotPermitted);
+    }
     for (attribute, span) in &layout.attributes {
       let (Ok(start), Ok(end)) = (usize::try_from(span.offset), usize::try_from(span.end())) else {
         return Err(VfsError::FileTooLarge);
@@ -342,6 +352,7 @@ impl VolumeBridge<'_> {
       btime: owner_attrs.btime,
       windows: 0,
       change: self.volume.view_change(self.store, owner)?,
+      device: None,
     })
   }
 
@@ -354,7 +365,8 @@ impl VolumeBridge<'_> {
         name: name.to_vec(),
         len,
       };
-      if appledouble::representable(&entry) {
+      // A guest's own attribute is no host's to see or to remove (A-290).
+      if appledouble::representable(&entry) && !crate::guest_only(&entry.name) {
         held.push((name, len));
       }
     }
@@ -449,6 +461,16 @@ impl VolumeBridge<'_> {
     let Decoded::Complete(after) = self.decode_copy(owner)? else {
       return Ok(());
     };
+    // A host's mount sets none of a guest's own attributes (A-290): the file that names one is refused whole, and its
+    // working copy dropped, so the view reads the attributes as they stand and nothing the host wrote is half kept.
+    if after
+      .attributes
+      .iter()
+      .any(|(name, _)| crate::guest_only(name))
+    {
+      self.volume.sidecar_drop(self.store, owner)?;
+      return Err(VfsError::NotPermitted);
+    }
     if let (Decoded::Complete(before), Some(written)) = (&before, written)
       && *before == after
       && written.offset >= after.header.end()

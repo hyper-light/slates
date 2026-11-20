@@ -890,8 +890,9 @@ fn assert_land(server: &mut McpServer) {
   );
 }
 
-/// R10, the real run: `slates.land.materialize` over MCP only *plans* a landing — it never writes the host disk
-/// without a human grant, not even when the agent writes real content and sneaks a `grant` argument. The target
+/// R10, the real run: under the default policy (ask, A-285), `slates.land.materialize` over MCP only *plans* a landing — it
+/// never writes the host disk without the launcher's grant, not even when the agent writes real content and sneaks a
+/// `grant` argument. The target
 /// is a real, writable, empty host directory (under `CARGO_TARGET_TMPDIR`); after the call it is still empty, and
 /// the tool answered `grant_required`. This is the agent-surface half of R10: the grant is a human-only CLI act,
 /// and no MCP argument can forge one (`land_materialize` hardcodes no grant).
@@ -943,6 +944,78 @@ fn assert_materialize_never_writes_without_a_grant(server: &mut McpServer) {
   assert_eq!(
     wrote, 0,
     "no bytes reached the host disk without a grant — the target is still empty"
+  );
+  let _ = std::fs::remove_dir_all(&target);
+}
+
+/// A-285, the real run: under a bypass write policy, which the launcher sets and the agent cannot, the agent's own
+/// `slates.land.materialize` writes at once. Do: write a file into a volume over MCP, set the volume's landing mode to
+/// bypass through the launcher's issuer proof, and land it over MCP into a real empty directory. Expect
+/// `grant_required` false and the file on disk with the agent's bytes.
+// The test is the outsider reading the host directory, as above.
+#[allow(clippy::disallowed_methods)]
+fn assert_materialize_lands_under_a_bypass_policy(
+  server: &mut McpServer,
+  instance: &str,
+  secret: &[u8; 32],
+) {
+  let volume = call(
+    server,
+    "slates.volume.create",
+    json!({ "name": "bypass-landed", "bounded": 1u64 << 20 }),
+  )["volume"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let writer = call(
+    server,
+    "slates.attach.attach",
+    json!({ "volume": volume, "write": true }),
+  )["attachment"]
+    .as_u64()
+    .unwrap();
+  call(
+    server,
+    "slates.fs.write",
+    json!({ "volume": volume, "attachment": writer, "path": "landed.txt", "text": "the agent's work\n" }),
+  );
+  let mut launcher = connect(instance);
+  let id = launcher
+    .list()
+    .unwrap()
+    .into_iter()
+    .find(|summary| summary.name == "bypass-landed")
+    .unwrap()
+    .id;
+  let subject = slates_client::PolicySubject::Volume { volume: id };
+  let bypass = slates_client::WritePolicy {
+    merge: slates_client::WriteMode::Bypass,
+    land: slates_client::WriteMode::Bypass,
+    require_signed_merges: false,
+  };
+  launcher
+    .set_policy(
+      subject,
+      (bypass, 0),
+      slates_server::landing::policy_proof(secret, &subject, &bypass, 0),
+    )
+    .unwrap();
+  let target = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    .join(format!("slates-bypass-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&target);
+  std::fs::create_dir(&target).unwrap();
+  let structured = call(
+    server,
+    "slates.land.materialize",
+    json!({ "volume": volume, "target": target.to_str().unwrap() }),
+  );
+  assert_eq!(
+    structured["grant_required"], false,
+    "a bypass landing is written at once: {structured}"
+  );
+  assert_eq!(
+    std::fs::read_to_string(target.join("landed.txt")).unwrap(),
+    "the agent's work\n"
   );
   let _ = std::fs::remove_dir_all(&target);
 }
@@ -1067,6 +1140,8 @@ fn the_mcp_surface_serves_the_tools() {
   assert_attach_base(&mut server);
   assert_land(&mut server);
   assert_materialize_never_writes_without_a_grant(&mut server);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  assert_materialize_lands_under_a_bypass_policy(&mut server, &instance, &secret);
   assert_malformed(&mut server);
   assert_http_transport(&profile, &instance);
 
@@ -1167,8 +1242,8 @@ fn assert_listen_bounds(instance: &str, server: &mut McpServer) {
   assert!(opened > 0, "subscriptions open up to the bound");
 }
 
-/// The edge's bound on one request's arrival, as `slates mcp --http` derives it: the client's reply deadline.
-fn edge_deadline_ns() -> u64 {
+/// The client's reply deadline, from which `slates mcp --http` derives a listen stream's keep-alive period.
+fn reply_deadline_ns() -> u64 {
   Deadlines::derive(
     slates_server::daemon::LIVENESS_BUDGET_NS,
     slates_db::replay::RECOVERY_BUDGET_NS,
@@ -1177,42 +1252,32 @@ fn edge_deadline_ns() -> u64 {
   .reply_ns
 }
 
-/// Asserts what the edge's rule says of `stream`, a connection opened at `opened` whose request never finishes, now:
-/// open and unanswered while its deadline has not passed. Judged only then, since a slow machine can bring the check
-/// past the deadline, where the edge rightly closes it (the next check holds that).
-fn assert_held_open_inside_its_deadline(stream: &std::net::TcpStream, opened: Instant, what: &str) {
+/// Asserts the edge holds `stream`, a token holder's connection whose request never finishes, open and unanswered
+/// now: a connection that has shown the bearer is waited on while it lives (A-523), whatever time has passed.
+fn assert_held_open(stream: &std::net::TcpStream, opened: Instant, what: &str) {
   use std::io::Read;
   let mut probe = [0u8; 1];
   stream.set_nonblocking(true).unwrap();
   let read = (&*stream).read(&mut probe);
-  let at = opened.elapsed();
   stream.set_nonblocking(false).unwrap();
-  if at < Duration::from_nanos(edge_deadline_ns()) {
-    assert!(
-      matches!(read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
-      "{what} is still open, unanswered, {at:?} after it opened: {read:?}"
-    );
-  } else {
-    eprintln!("{what}: past its deadline {at:?} after it opened, so not judged open here");
-  }
+  assert!(
+    matches!(read, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+    "{what} is still open, unanswered, {:?} after it opened: {read:?}",
+    opened.elapsed()
+  );
 }
 
-/// Asserts the edge ended `stream`, a connection opened at `opened` whose request never finished, once its deadline
-/// passed, answering nothing: the client reads its end (or a reset) and no byte, within [`HTTP_READ_WAIT`] of the
-/// deadline. A slow client holds a connection's slot no longer than a request may (the module's bound).
-fn assert_closed_unanswered_after_its_deadline(
-  stream: &std::net::TcpStream,
-  opened: Instant,
-  what: &str,
-) {
+/// Asserts the edge ended `stream`, a connection opened at `opened` that never showed the bearer, answering nothing:
+/// the client reads its end (or a reset) and no byte within [`HTTP_READ_WAIT`]. Such a connection holds its slot no
+/// longer than the edge has learned an honest client takes to show the bearer (A-523; the module's bound), whose
+/// value only the edge knows, so the test prints when the end came.
+fn assert_ended_unanswered(stream: &std::net::TcpStream, opened: Instant, what: &str) {
   use std::io::Read;
-  let deadline = Duration::from_nanos(edge_deadline_ns());
-  let (_hold, rx) = std::sync::mpsc::channel::<()>();
-  let _ = rx.recv_timeout(deadline.saturating_sub(opened.elapsed()));
   stream.set_read_timeout(Some(HTTP_READ_WAIT)).unwrap();
   let mut seen = Vec::new();
   let ended = (&*stream).read_to_end(&mut seen);
-  // Its end, or a reset: not a read still waiting when the bound ran out.
+  let at = opened.elapsed();
+  // Its end, or a reset: not a read still waiting when the wait ran out.
   let closed = match &ended {
     Ok(_) => true,
     Err(error) => !matches!(
@@ -1222,18 +1287,18 @@ fn assert_closed_unanswered_after_its_deadline(
   };
   assert!(
     closed && seen.is_empty(),
-    "{what} was ended past its {deadline:?} deadline, unanswered: {ended:?}, {:?} after it opened, read {:?}",
-    opened.elapsed(),
+    "{what} was ended unanswered: {ended:?}, {at:?} after it opened, read {:?}",
     String::from_utf8_lossy(&seen)
   );
+  eprintln!("{what}: ended unanswered, seen {at:?} after it opened");
 }
 
 /// Shape: the edge's bearer token in this test (the command mints one from the platform's secure random).
 const TEST_BEARER: [u8; slates_mcp::http::BEARER_BYTES] = [0x5c; slates_mcp::http::BEARER_BYTES];
 
 /// Starts the HTTP edge for `instance` on its own shard thread, as `slates mcp --http` runs it (the runtime
-/// and connection bound derived for one shard of this machine, the client's reply deadline), and returns
-/// the port it listens on. The thread serves until the process ends.
+/// and connection bound derived for one shard of this machine, its timer tick, the keep-alive period from the
+/// client's reply deadline), and returns the port it listens on. The thread serves until the process ends.
 fn start_http_edge(profile: &MachineProfile, instance: &str) -> u16 {
   use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
   let config = DaemonConfig::derive(profile, instance, Some(1));
@@ -1247,7 +1312,8 @@ fn start_http_edge(profile: &MachineProfile, instance: &str) -> u16 {
     let edge = slates_mcp::http::HttpEdge {
       port,
       bearer: TEST_BEARER,
-      deadline_ns: edge_deadline_ns(),
+      tick_ns: config.runtime.timer_tick_ns,
+      keep_alive_ns: slates_mcp::http::listen_keep_alive_ns(reply_deadline_ns()),
       connections: config.clients_per_shard,
     };
     port_tx.send(port).unwrap();
@@ -1327,13 +1393,14 @@ fn send_past_the_bound(
   (read.map_err(|e| e.kind()), response)
 }
 
-/// AUD-29-23 and AUD-29-24 (§4.12, §4.13; R6): the loopback HTTP edge over real sockets. Do: open hostile
-/// connections and leave them open — an unterminated line past the bound, too many headers, a body that
-/// never finishes, an idle kept-alive connection, and one reset mid-head — then, while they are open, send
-/// a valid `initialize`; then send a volume-creating tool call from a foreign origin, under a rebound host
-/// name, and with no token. Expect the oversized heads refused (`414`/`431`), the valid client answered
-/// `200` while the slow and idle connections are still open, and each unauthorized call refused (`403`,
-/// `421`, `401`) with no volume created.
+/// AUD-29-23, AUD-29-24 and A-523 (§4.12, §4.13; R6): the loopback HTTP edge over real sockets. Do: open
+/// hostile connections — an unterminated line past the bound, too many headers, a token holder's body that
+/// never finishes, an idle connection, a head that never shows the bearer, and one reset mid-head — then, with
+/// them open, send a valid `initialize`; then send a volume-creating tool call from a foreign origin, under a
+/// rebound host name, and with no token. Expect the oversized heads refused (`414`/`431`), the valid client
+/// answered `200` while the token holder's slow connection is open, each unauthorized call refused (`403`,
+/// `421`, `401`) with no volume created, the idle and bearerless connections ended unanswered (cut off at the
+/// bound the edge learned), and the token holder's still waited on while it lives.
 fn assert_http_transport(profile: &MachineProfile, instance: &str) {
   use std::io::Write;
   let port = start_http_edge(profile, instance);
@@ -1372,7 +1439,8 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
     (oversized.0, &oversized.1[..oversized.1.len().min(80)])
   );
 
-  // Held open while the valid client runs: a body that never finishes, an idle connection, a reset one.
+  // Open while the valid client runs: a token holder's body that never finishes, an idle connection, a head that never
+  // shows the bearer, a reset one.
   let mut slow = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
   slow
     .write_all(
@@ -1385,6 +1453,10 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
     .unwrap();
   let opened = Instant::now();
   let idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let mut bearerless = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  bearerless
+    .write_all(format!("POST /mcp HTTP/1.1\r\nHost: {ours}\r\nX-Slow: ").as_bytes())
+    .unwrap();
   let mut reset = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
   reset.write_all(b"POST /mcp HTTP/1.1\r\nHo").unwrap();
   drop(reset);
@@ -1399,7 +1471,7 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
     "a valid client is served: {valid}"
   );
   // The valid client was not held behind the slow one: served while that one was still open.
-  assert_held_open_inside_its_deadline(&slow, opened, "the slow connection");
+  assert_held_open(&slow, opened, "the token holder's slow connection");
   assert!(
     valid.contains("\"protocolVersion\":\"2025-11-25\""),
     "a legacy initialize is answered in the newest legacy revision: {valid}"
@@ -1409,12 +1481,14 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
   assert_listen_over_http(port, &ours, &token);
   assert_unauthorized_calls_have_no_effect(port, instance, &token);
 
-  // The slow and idle connections hold their slots no longer than a request may: past the edge's deadline, each is
-  // ended unanswered. Before 2026-11-07 the test held the slow one open here, after the HTTP checks above, which take
-  // half the deadline on an idle machine (the listen check waits for a keep-alive comment); under load they took the
-  // rest, and the edge had closed it by its rule (1 of 4 runs at load ~14).
-  assert_closed_unanswered_after_its_deadline(&slow, opened, "the slow connection");
-  assert_closed_unanswered_after_its_deadline(&idle, opened, "the idle connection");
+  // The idle and bearerless connections hold their slots no longer than the edge has learned an honest client takes to
+  // show the bearer: each is ended unanswered. The token holder's is waited on while it lives, however long the checks
+  // above took (A-523). Until A-523 the edge ended all three at the client's reply deadline, a second, and before
+  // 2026-11-07 the test required the slow one open here, which a loaded machine's checks outlasted (1 of 4 runs at load
+  // ~14).
+  assert_ended_unanswered(&bearerless, opened, "the bearerless connection");
+  assert_ended_unanswered(&idle, opened, "the idle connection");
+  assert_held_open(&slow, opened, "the token holder's slow connection");
 }
 
 /// AUD-29-24: a volume-creating tool call from a foreign origin, under a rebound host name and without the
@@ -1541,11 +1615,11 @@ fn open_listen(port: u16, host: &str, token: &str) -> (std::net::TcpStream, Stri
 const HTTP_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// MCP Streamable HTTP 2026-07-28, `subscriptions/listen` (condition 13; it was refused `-32601` here). Do: open a listen
-/// stream on the HTTP edge; wait past half the edge's idle deadline; open more streams than the server has
-/// notification sources; close one and listen again. Expect: an SSE response (`text/event-stream`, `X-Accel-Buffering:
-/// no`) whose first event is the acknowledgement, naming the listen's id and the honoured filters; a keep-alive comment
-/// line within the deadline; a listen past the bound answered with `-32602`; and the closed stream's slot back, since
-/// closing the stream is the cancellation.
+/// stream on the HTTP edge; wait past its keep-alive period (half the client's reply deadline); open more streams than
+/// the server has notification sources; close one and listen again. Expect: an SSE response (`text/event-stream`,
+/// `X-Accel-Buffering: no`) whose first event is the acknowledgement, naming the listen's id and the honoured filters; a
+/// keep-alive comment line within the reply deadline; a listen past the bound answered with `-32602`; and the closed
+/// stream's slot back, since closing the stream is the cancellation.
 fn assert_listen_over_http(port: u16, host: &str, token: &str) {
   use std::io::Read;
   let (mut first, response) = open_listen(port, host, token);
@@ -1572,14 +1646,8 @@ fn assert_listen_over_http(port: u16, host: &str, token: &str) {
     acknowledged["params"]["notifications"]["toolsListChanged"],
     true
   );
-  let deadline = Deadlines::derive(
-    slates_server::daemon::LIVENESS_BUDGET_NS,
-    slates_db::replay::RECOVERY_BUDGET_NS,
-  )
-  .get()
-  .reply_ns;
   first
-    .set_read_timeout(Some(std::time::Duration::from_nanos(deadline)))
+    .set_read_timeout(Some(std::time::Duration::from_nanos(reply_deadline_ns())))
     .unwrap();
   let mut keep_alive = [0u8; 3];
   first.read_exact(&mut keep_alive).unwrap();

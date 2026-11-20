@@ -86,6 +86,13 @@ pub(crate) const VOLUME_FLAG_CASE_PRESERVED_NAMES: u32 = 1 << 1;
 pub(crate) const VOLUME_FLAG_UNICODE_ON_DISK: u32 = 1 << 2;
 /// Format: `PersistentAcls` — bit 3 (the file system enforces access-control lists).
 pub(crate) const VOLUME_FLAG_PERSISTENT_ACLS: u32 = 1 << 3;
+/// Format: `ReparsePoints` — bit 4: the file system serves reparse points, so WinFsp calls the reparse slots and
+/// follows a symbolic link it finds while opening a path (A-275; `fsctl.h` v2.1, `FSP_FSCTL_VOLUME_PARAMS_V0_FIELD_DEFN`).
+pub(crate) const VOLUME_FLAG_REPARSE_POINTS: u32 = 1 << 4;
+/// Format: `HardLinks` — bit 7: the file system makes hard links. WinFsp's driver as released ignores it (it answers
+/// `FileLinkInformation` `STATUS_NOT_SUPPORTED` itself and advertises no link support, `src/sys/fileinfo.c`,
+/// `volinfo.c`, v2.1 to v2.2); a driver with `docs/wip/winfsp-patches` applied forwards the link (A-360).
+pub(crate) const VOLUME_FLAG_HARD_LINKS: u32 = 1 << 7;
 /// Format: `ReadOnlyVolume` — bit 9: Windows refuses every write to the volume before it reaches the shard.
 pub(crate) const VOLUME_FLAG_READ_ONLY_VOLUME: u32 = 1 << 9;
 /// Format: `FlushAndPurgeOnCleanup` — bit 14: at a file's last handle's cleanup the kernel writes its cached pages back
@@ -122,6 +129,24 @@ pub(crate) struct FileInfo {
   pub(crate) hard_links: u32,
   pub(crate) ea_size: u32,
 }
+
+/// `FSP_FSCTL_OPEN_FILE_INFO` (`inc/winfsp/fsctl.h` 293-298) — what the `FileInfo` WinFsp's DLL hands Create and Open
+/// opens (`winfsp.h` 1495-1541, `FspFileSystemGetOpenFileInfo`): the file's information, then the buffer the open's
+/// normalized name may be copied into, `NormalizedName`, pointing into the response, and its size in bytes,
+/// `NormalizedNameSize`, which the open sets to the bytes it copied, with no terminator (A-551). The header asserts no
+/// size; on the 64-bit targets slates ships it is 72 + 8 + 2 bytes, padded to 88.
+#[repr(C)]
+pub(crate) struct OpenFileInfo {
+  pub(crate) file_info: FileInfo,
+  pub(crate) normalized_name: Pwstr,
+  pub(crate) normalized_name_size: u16,
+}
+
+// Format: the layout above, checked when the crate compiles: the name's buffer right after the 72-byte FileInfo, its
+// size after that pointer, and the whole padded to eight bytes.
+const _: () = assert!(std::mem::offset_of!(OpenFileInfo, normalized_name) == 72);
+const _: () = assert!(std::mem::offset_of!(OpenFileInfo, normalized_name_size) == 80);
+const _: () = assert!(size_of::<OpenFileInfo>() == 88);
 
 /// `FSP_FSCTL_DIR_INFO`'s fixed head (104 bytes; the variable `FileNameBuf` follows). The host fills
 /// one per directory entry and hands it to `FspFileSystemAddDirInfo` ([`Api::add_dir_info`]), which copies it plus the name.
@@ -211,15 +236,36 @@ pub(crate) struct Interface {
   pub(crate) can_delete: Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr) -> Ntstatus>,
   pub(crate) rename:
     Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pwstr, Boolean) -> Ntstatus>,
-  pub(crate) get_security: OpaqueCallback,
+  /// `GetSecurity(FileSystem, FileContext, SecurityDescriptor, PSecurityDescriptorSize)`.
+  pub(crate) get_security: Option<
+    unsafe extern "C" fn(*mut FileSystem, Pvoid, PSecurityDescriptor, *mut usize) -> Ntstatus,
+  >,
   pub(crate) set_security: OpaqueCallback,
   pub(crate) read_directory: Option<
     unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pwstr, Pvoid, u32, *mut u32) -> Ntstatus,
   >,
-  pub(crate) resolve_reparse_points: OpaqueCallback,
-  pub(crate) get_reparse_point: OpaqueCallback,
-  pub(crate) set_reparse_point: OpaqueCallback,
-  pub(crate) delete_reparse_point: OpaqueCallback,
+  /// `ResolveReparsePoints(FileSystem, FileName, ReparsePointIndex, ResolveLastPathComponent, PIoStatus, Buffer,
+  /// PSize)`; the status block is passed through to [`ResolveReparsePointsFn`] unread.
+  pub(crate) resolve_reparse_points: Option<
+    unsafe extern "C" fn(
+      *mut FileSystem,
+      Pwstr,
+      u32,
+      Boolean,
+      Pvoid,
+      Pvoid,
+      *mut usize,
+    ) -> Ntstatus,
+  >,
+  /// `GetReparsePoint(FileSystem, FileContext, FileName, Buffer, PSize)`.
+  pub(crate) get_reparse_point:
+    Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pvoid, *mut usize) -> Ntstatus>,
+  /// `SetReparsePoint(FileSystem, FileContext, FileName, Buffer, Size)`.
+  pub(crate) set_reparse_point:
+    Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pvoid, usize) -> Ntstatus>,
+  /// `DeleteReparsePoint(FileSystem, FileContext, FileName, Buffer, Size)`.
+  pub(crate) delete_reparse_point:
+    Option<unsafe extern "C" fn(*mut FileSystem, Pvoid, Pwstr, Pvoid, usize) -> Ntstatus>,
   pub(crate) get_stream_info: OpaqueCallback,
   pub(crate) get_dir_info_by_name: OpaqueCallback,
   pub(crate) control: OpaqueCallback,
@@ -315,6 +361,40 @@ pub(crate) type NotifyFn = unsafe extern "system" fn(
   size: usize,
 ) -> Ntstatus;
 
+/// The `GetReparsePointByName` callback WinFsp's reparse helpers take (`winfsp.h` v2.1): the reparse buffer of the
+/// object at `FileName` (`IsDirectory` when more of the path follows), `STATUS_NOT_A_REPARSE_POINT` for another object,
+/// `STATUS_OBJECT_NAME_NOT_FOUND` for none; a null `Buffer` asks only whether it is one.
+pub(crate) type ReparsePointByNameFn = unsafe extern "C" fn(
+  file_system: *mut FileSystem,
+  context: Pvoid,
+  file_name: Pwstr,
+  is_directory: Boolean,
+  buffer: Pvoid,
+  size: *mut usize,
+) -> Ntstatus;
+/// `FspFileSystemResolveReparsePoints` (`winfsp.h` v2.1; `src/dll/fsop.c`): follows the links in `FileName` from the
+/// component at `ReparsePointIndex`, asking each by name, and leaves the path Windows opens instead in `Buffer`.
+pub(crate) type ResolveReparsePointsFn = unsafe extern "system" fn(
+  file_system: *mut FileSystem,
+  by_name: ReparsePointByNameFn,
+  context: Pvoid,
+  file_name: Pwstr,
+  reparse_point_index: u32,
+  resolve_last_path_component: Boolean,
+  io_status: Pvoid,
+  buffer: Pvoid,
+  size: *mut usize,
+) -> Ntstatus;
+/// `FspFileSystemFindReparsePoint` (`winfsp.h` v2.1): whether a component of `FileName` before its last is a reparse
+/// point, and the index of the first.
+pub(crate) type FindReparsePointFn = unsafe extern "system" fn(
+  file_system: *mut FileSystem,
+  by_name: ReparsePointByNameFn,
+  context: Pvoid,
+  file_name: Pwstr,
+  reparse_point_index: *mut u32,
+) -> Boolean;
+
 /// `FspVersion` (`winfsp.h`): the DLL's file version, major in the high 16 bits and minor in the low.
 pub(crate) type VersionFn = unsafe extern "system" fn(version: *mut u32) -> Ntstatus;
 
@@ -332,6 +412,8 @@ pub(crate) struct Api {
   pub(crate) notify_end: NotifyEndFn,
   pub(crate) notify: NotifyFn,
   pub(crate) version: VersionFn,
+  pub(crate) resolve_reparse_points: ResolveReparsePointsFn,
+  pub(crate) find_reparse_point: FindReparsePointFn,
 }
 
 /// Format: the library's name for this architecture (`FSP_DLLNAME`: `winfsp-` and `FSP_FSCTL_PRODUCT_FILE_ARCH`).
@@ -370,6 +452,8 @@ fn load() -> Result<Api, Ntstatus> {
     notify_end: symbol(module, c"FspFileSystemNotifyEnd")?,
     notify: symbol(module, c"FspFileSystemNotify")?,
     version: symbol(module, c"FspVersion")?,
+    resolve_reparse_points: symbol(module, c"FspFileSystemResolveReparsePoints")?,
+    find_reparse_point: symbol(module, c"FspFileSystemFindReparsePoint")?,
   })
 }
 
@@ -389,6 +473,58 @@ fn load_library() -> Option<windows_sys::Win32::Foundation::HMODULE> {
   // SAFETY: as above, for the full path.
   let module = unsafe { LoadLibraryW(by_path.as_ptr()) };
   (!module.is_null()).then_some(module)
+}
+
+/// Format: the registry key and value Developer Mode sets (`AllowDevelopmentWithoutDevLicense`, 1 when on), which
+/// `CreateSymbolicLinkW`'s `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` requires (Microsoft Learn, CreateSymbolicLinkW).
+const DEVELOPER_MODE_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock";
+/// Format: see [`DEVELOPER_MODE_KEY`].
+const DEVELOPER_MODE_VALUE: &str = "AllowDevelopmentWithoutDevLicense";
+/// Format: the word [`DEVELOPER_MODE_VALUE`] holds while Developer Mode is on.
+const DEVELOPER_MODE_ON: u32 = 1;
+/// Format: the value WinFsp's driver reads under [`REGISTRY_KEY`] (its `FSP_REGKEY`, `\Registry\Machine\Software\
+/// WOW6432Node\WinFsp` on every 64-bit Windows, arm64 included: WinFsp v2.1 `src/sys/driver.h`) each time a volume asks
+/// it for a Mount Manager drive (`FspVolumeUseMountmgr`, `src/sys/volume.c`), the request every slates mount makes
+/// (A-369).
+const MOUNT_MANAGER_VALUE: &str = "MountUseMountmgrFromFSD";
+/// Format: the one word [`MOUNT_MANAGER_VALUE`] lets the drive be made at: the driver refuses `STATUS_ACCESS_DENIED`
+/// when the read fails, the value is not a `REG_DWORD`, or it is anything but 1 (`src/sys/volume.c`).
+const MOUNT_MANAGER_ALLOWED: u32 = 1;
+
+/// Whether Developer Mode is on (A-275), read at each symbolic link set, which is rare: a link may be made without
+/// `SeCreateSymbolicLinkPrivilege` while it is. An unreadable value is off.
+pub(crate) fn developer_mode() -> bool {
+  machine_word(DEVELOPER_MODE_KEY, DEVELOPER_MODE_VALUE) == Some(DEVELOPER_MODE_ON)
+}
+
+/// Whether this machine lets WinFsp's driver make a Mount Manager drive for a volume that an unprivileged process
+/// serves (A-369, A-417): the driver's own rule over the value it reads at every such mount, so the answer is the one
+/// the mount would meet. Read at each call, since an Administrator may set it while a host runs.
+pub(crate) fn mount_manager_allowed() -> bool {
+  machine_word(REGISTRY_KEY, MOUNT_MANAGER_VALUE) == Some(MOUNT_MANAGER_ALLOWED)
+}
+
+/// The `REG_DWORD` named `name` under `key` in `HKEY_LOCAL_MACHINE`, or `None` when it cannot be read: missing, of
+/// another type (`RRF_RT_REG_DWORD` refuses every other, as WinFsp's driver does), or refused.
+fn machine_word(key: &str, name: &str) -> Option<u32> {
+  use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
+  let key = wide(key);
+  let name = wide(name);
+  let mut word = 0u32;
+  let mut bytes = u32::try_from(size_of::<u32>()).ok()?;
+  // SAFETY: `key` and `name` are NUL-terminated; `word` holds `bytes` bytes, the most the call writes.
+  let status = unsafe {
+    RegGetValueW(
+      HKEY_LOCAL_MACHINE,
+      key.as_ptr(),
+      name.as_ptr(),
+      RRF_RT_REG_DWORD,
+      std::ptr::null_mut(),
+      std::ptr::from_mut(&mut word).cast(),
+      &mut bytes,
+    )
+  };
+  (status == 0).then_some(word)
 }
 
 /// The install directory WinFsp's installer recorded (with its trailing separator), or `None`.
@@ -445,6 +581,8 @@ impl Export for NotifyBeginFn {}
 impl Export for NotifyEndFn {}
 impl Export for NotifyFn {}
 impl Export for VersionFn {}
+impl Export for ResolveReparsePointsFn {}
+impl Export for FindReparsePointFn {}
 
 /// The export `name` of `module`, as the function-pointer type `T` the header gives it; refused when the library does not
 /// export it.

@@ -51,6 +51,12 @@ pub enum DbError {
     /// Which table.
     table: &'static str,
   },
+  /// A volume released to the member it moved to (A-291) still has attachment records: it leaves only whole, so none
+  /// is left naming a volume this node no longer holds. Never entered in the log.
+  Attached {
+    /// How many attachment records it has.
+    attachments: u32,
+  },
   /// An NFSv4 instance advance named an instance at or below the current one (§4.6 A-37): ids minted
   /// under it could repeat ids an earlier life minted.
   NfsInstanceRegressed {
@@ -89,6 +95,99 @@ pub enum DbError {
   Anchor(AnchorError),
   /// The memory crate refused.
   Memory(MemError),
+  /// A repository's namespace names greens only (§4.17.1, A-515): the volume named is not one.
+  NotGreen,
+  /// A repository's or a branch's name is empty or holds a NUL byte (§4.17.1, A-515).
+  InvalidName,
+  /// A green that live members of its lineage were made from cannot be destroyed while they live: each would lose the
+  /// version it was made at, which its rebuild branches from again (§4.17.1 item 4, A-575). Never entered in the log.
+  BranchedFrom {
+    /// The live members made from it.
+    members: u64,
+  },
+  /// A green an entry moves or checks is not at the position the push read (§4.17.1 shared piece 2; A-603 rebuilt by
+  /// A-642): it moved since, so the entry is refused whole, naming the green. Never entered in the log.
+  Moved {
+    /// The green.
+    green: [u8; 16],
+    /// The position the push read.
+    read: u64,
+    /// The position the green is at.
+    at: u64,
+  },
+  /// An entry's check does not hold at the entry's register position (A-603): what it checks moved since it was read.
+  /// Never entered in the log.
+  CheckFailed {
+    /// The check's index among the entry's checks.
+    index: u32,
+  },
+  /// An entry's change of its repository's own state was made against another state (A-603): a phase root it adds is
+  /// one already, one it removes is not, or a marker it adds is held. Never entered in the log.
+  StateChanged {
+    /// The change's index among the entry's state changes.
+    index: u32,
+  },
+  /// A review record's change the review rules refuse (§4.17.1 shared piece 6, A-596), by the rule
+  /// (`crate::review`). Never entered in the log.
+  Review(ReviewRefusal),
+  /// A repository policy's setting named a version its policy has moved past, or a repository created already holding a
+  /// policy, which only its own setting gives (A-622); or a principal's tool identities' setting named a version they
+  /// have moved past (A-664). Read the record again and set it from there. Never entered in the log.
+  PolicyChanged {
+    /// The policy's version now.
+    current: u64,
+  },
+  /// A repository policy's rule the log must never record (A-622): its pattern names what the repository's tool does
+  /// not have, is empty, holds a NUL, or is a Subversion path not from the root. Never entered in the log.
+  PolicyRuleMalformed {
+    /// The rule's index among the policy's rules.
+    index: u32,
+  },
+  /// A repository policy's hook the log must never record (A-622): at another tool's point, named other than its point
+  /// allows or named twice there, or running a program that is not an absolute path or holds a NUL. Never entered in
+  /// the log.
+  PolicyHookMalformed {
+    /// The hook's index among the policy's hooks.
+    index: u32,
+  },
+  /// A repository policy's hooks-env section the log must never record (A-648): in a repository that is not
+  /// Subversion's, named by nothing or holding a NUL, or with a variable that is not one variable of a hook's
+  /// environment (a name empty or holding `=` or a NUL, a value holding a NUL). Never entered in the log.
+  PolicyHooksEnvMalformed {
+    /// The section's index among the policy's hooks-env sections.
+    index: u32,
+  },
+}
+
+/// The rule a review record's change broke (§4.17.1 "Works over works", shared piece 6; A-596; `crate::review`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRefusal {
+  /// The comment is outdated: it never moves, and is never outdated again.
+  Outdated,
+  /// The approval is stale already.
+  Stale,
+  /// The change names a version not after the one the record stands on: a record moves forward only.
+  NotAfter,
+  /// The approval names a version before its approver's standing one, or before the change that made it stale: an
+  /// approval binds to the version its approver saw, never back.
+  Behind,
+  /// A new record that is already outdated or stale.
+  Ended,
+  /// A comment's lines span no bytes: an empty range, or one whose end is past the largest byte position.
+  Empty,
+}
+
+impl fmt::Display for ReviewRefusal {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Outdated => "the comment is outdated",
+      Self::Stale => "the approval is stale",
+      Self::NotAfter => "the version is not after the record's",
+      Self::Behind => "the approval is behind its approver's standing one",
+      Self::Ended => "a new record already outdated or stale",
+      Self::Empty => "the comment's lines span no bytes",
+    })
+  }
 }
 
 impl fmt::Display for DbError {
@@ -107,6 +206,9 @@ impl fmt::Display for DbError {
       Self::LogFull { needed, free } => write!(f, "log full: {needed} bytes needed, {free} free"),
       Self::Corrupt { seq, reason } => write!(f, "record {seq} corrupt: {reason}"),
       Self::Capacity { table } => write!(f, "{table} at capacity"),
+      Self::Attached { attachments } => {
+        write!(f, "the volume still has {attachments} attachment records")
+      }
       Self::NfsInstanceRegressed { current } => {
         write!(f, "NFSv4 instance must advance past {current}")
       }
@@ -128,6 +230,45 @@ impl fmt::Display for DbError {
       Self::Wire(e) => write!(f, "encoding: {e}"),
       Self::Anchor(e) => write!(f, "segment: {e}"),
       Self::Memory(e) => write!(f, "memory: {e}"),
+      Self::NotGreen => f.write_str("not a green volume"),
+      Self::InvalidName => f.write_str("an empty name, or one holding a NUL byte"),
+      Self::BranchedFrom { members } => write!(
+        f,
+        "{members} live members of its lineage were made from this green"
+      ),
+      Self::Review(rule) => write!(f, "review: {rule}"),
+      // Shape: a green named by its first 4 bytes, enough to tell one from another in a message.
+      Self::Moved { green, read, at } => write!(
+        f,
+        "green {:02x?} moved from {read}, read by the push, to {at}",
+        green.get(..4).unwrap_or_default()
+      ),
+      Self::CheckFailed { index } => {
+        write!(
+          f,
+          "a register entry's check {index} does not hold at its position"
+        )
+      }
+      Self::StateChanged { index } => write!(
+        f,
+        "a register entry's state change {index} was made against another state"
+      ),
+      Self::PolicyChanged { current } => write!(
+        f,
+        "a repository policy set from a version it has moved past (version {current} now)"
+      ),
+      Self::PolicyRuleMalformed { index } => {
+        write!(f, "a repository policy's rule {index} is malformed")
+      }
+      Self::PolicyHookMalformed { index } => {
+        write!(f, "a repository policy's hook {index} is malformed")
+      }
+      Self::PolicyHooksEnvMalformed { index } => {
+        write!(
+          f,
+          "a repository policy's hooks-env section {index} is malformed"
+        )
+      }
     }
   }
 }

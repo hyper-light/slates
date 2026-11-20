@@ -14,7 +14,7 @@ use hyper_seal::keys::WrappingKey;
 use hyper_seal::name::Namer;
 use slates_archive::format::Chunk;
 use slates_archive::{Archive, Entry, Extent, Node, NodeMeta};
-use slates_cluster::envelope::{EnvelopeError, is_envelope, open, wrap};
+use slates_cluster::envelope::{EnvelopeError, Opening, Wrapping, is_envelope, open, wrap};
 
 /// Shape: keys the tests may hold at once in the process's locked region (a few per test, tests in parallel).
 const KEYS: usize = 256;
@@ -191,6 +191,271 @@ fn equal_content_seals_to_equal_bytes_and_holders_deduplicate_it() {
     shared.len(),
     1,
     "the shared chunk is one sealed chunk in both"
+  );
+}
+
+/// Shape: the distinct chunks of the many-chunk snapshot: enough that a scan per chunk, the shape the wrap and the open
+/// had until 2026-11-17, is the most of their work, and few enough to seal in a test's time.
+const MANY_CHUNKS: u32 = 2048;
+/// Shape: the files of the many-chunk snapshot that repeat a chunk an earlier file holds.
+const REPEATED_FILES: u32 = 512;
+/// Shape: a small chunk's length: a quarter of a segment, so thousands seal quickly.
+const SMALL_CHUNK_LEN: usize = 1024;
+
+/// A raw chunk of `SMALL_CHUNK_LEN` bytes distinct for `seed`.
+fn small_chunk(seed: u32) -> Chunk {
+  Archive::raw_chunk(
+    seed
+      .to_le_bytes()
+      .iter()
+      .copied()
+      .cycle()
+      .take(SMALL_CHUNK_LEN)
+      .enumerate()
+      .map(|(at, byte)| byte ^ u8::try_from(at % 251).unwrap())
+      .collect(),
+  )
+}
+
+/// A-92 3b at scale: do wrap a snapshot of 2,048 distinct chunks, 512 more files repeating some of them, then open the
+/// envelope after it travels as an encoded archive. Expect the very archive back, every chunk in manifest order; and
+/// the envelope to store each sealed chunk once: the distinct chunks and the manifest, no identity twice. The wrap and
+/// the open find a sealed chunk by a set and an index, where a scan per chunk made each `n²` in the chunks.
+#[test]
+fn an_envelope_of_thousands_of_chunks_opens_to_the_very_archive() {
+  let tenant = new_tenant();
+  let chunks: Vec<Chunk> = (0..MANY_CHUNKS).map(small_chunk).collect();
+  let mut entries: Vec<Entry> = (0..MANY_CHUNKS)
+    .map(|at| {
+      file(
+        &format!("f{at:05}"),
+        &chunks[usize::try_from(at).unwrap()],
+        i64::from(at),
+      )
+    })
+    .chain((0..REPEATED_FILES).map(|at| {
+      let repeated = &chunks[usize::try_from(at * 3 % MANY_CHUNKS).unwrap()];
+      file(&format!("r{at:05}"), repeated, i64::from(at))
+    }))
+    .collect();
+  entries.sort_by(|a, b| a.name.cmp(&b.name));
+  let original = Archive {
+    manifest: Node::Directory(entries),
+    chunks: chunks.clone(),
+    ..snapshot(&[chunk(1), chunk(2)], 7)
+  };
+  let envelope = wrap(&original, &tenant.lineage, &tenant.namer, SEGMENT).unwrap();
+  let carried = Archive::decode(&envelope.encode()).unwrap();
+  let identities: std::collections::BTreeSet<[u8; 32]> =
+    carried.chunks.iter().map(|chunk| chunk.identity).collect();
+  assert_eq!(
+    (carried.chunks.len(), identities.len()),
+    (
+      usize::try_from(MANY_CHUNKS).unwrap() + 1,
+      usize::try_from(MANY_CHUNKS).unwrap() + 1
+    ),
+    "each distinct chunk and the manifest, stored once"
+  );
+  assert_eq!(
+    open(&carried, &tenant.lineage, &tenant.namer).unwrap(),
+    Archive {
+      created_unix: 0,
+      ..original
+    }
+  );
+}
+
+/// Shape: the distinct chunks of the sliced-wrap snapshot: enough that the slices fall in many places.
+const SLICED_CHUNKS: u32 = 64;
+
+/// A snapshot of `count` files, each over its own distinct small chunk, and one file repeating the first chunk.
+fn many_chunk_snapshot(count: u32) -> Archive {
+  let chunks: Vec<Chunk> = (0..count).map(small_chunk).collect();
+  let mut entries: Vec<Entry> = chunks
+    .iter()
+    .enumerate()
+    .map(|(at, chunk)| file(&format!("f{at:05}"), chunk, i64::try_from(at).unwrap()))
+    .chain(std::iter::once(file("repeat", &chunks[0], 0)))
+    .collect();
+  entries.sort_by(|a, b| a.name.cmp(&b.name));
+  Archive {
+    manifest: Node::Directory(entries),
+    chunks,
+    ..snapshot(&[chunk(1), chunk(2)], 11)
+  }
+}
+
+/// A-323: do wrap one snapshot of 64 distinct chunks a slice at a time, at budgets of one byte (a chunk a slice), a
+/// chunk and a half, five chunks, more than the whole archive, and the whole budget; expect every one the very envelope
+/// `wrap` makes, byte for byte, and the one-byte budget to take a slice a chunk: 64 slices, the chunks left falling by
+/// one each, the manifest sealed in the slice that seals the last chunk. A wrap's slices change where the work falls,
+/// never what it makes.
+#[test]
+fn an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte() {
+  let tenant = new_tenant();
+  let original = many_chunk_snapshot(SLICED_CHUNKS);
+  let whole = wrap(&original, &tenant.lineage, &tenant.namer, SEGMENT)
+    .unwrap()
+    .encode();
+  let chunk_bytes = u64::try_from(SMALL_CHUNK_LEN).unwrap();
+  for budget in [
+    1,
+    chunk_bytes * 3 / 2,
+    chunk_bytes * 5,
+    chunk_bytes * 1000,
+    u64::MAX,
+  ] {
+    let mut wrapping = Wrapping::new(original.clone(), SEGMENT);
+    let mut slices = 0u32;
+    let mut left = Vec::new();
+    let envelope = loop {
+      slices += 1;
+      let made = wrapping
+        .advance(&tenant.lineage, &tenant.namer, budget)
+        .unwrap();
+      left.push(wrapping.chunks_left());
+      if let Some(envelope) = made {
+        break envelope;
+      }
+    };
+    assert_eq!(
+      envelope.encode(),
+      whole,
+      "the envelope wrapped in slices of {budget} bytes is the whole wrap's"
+    );
+    if budget == 1 {
+      assert_eq!(slices, SLICED_CHUNKS, "a slice a chunk");
+      let expected: Vec<usize> = (0..usize::try_from(SLICED_CHUNKS).unwrap()).rev().collect();
+      assert_eq!(left, expected, "the chunks left fall by one a slice");
+    }
+  }
+}
+
+/// A-323: do advance a wrap past its envelope, and a wrap whose seal refuses (a segment of no bytes, which the seal
+/// refuses); expect the envelope once and then `Spent`, and the refusal once and then `Spent`: a wrap that ended is never
+/// advanced into a second envelope or a half-sealed one.
+#[test]
+fn a_wrap_ends_at_its_envelope_or_its_refusal() {
+  let tenant = new_tenant();
+  let original = snapshot(&[chunk(1), chunk(2)], 1);
+  let mut wrapping = Wrapping::new(original.clone(), SEGMENT);
+  assert!(
+    wrapping
+      .advance(&tenant.lineage, &tenant.namer, u64::MAX)
+      .unwrap()
+      .is_some(),
+    "the whole budget makes the envelope in one advance"
+  );
+  assert_eq!(
+    wrapping.advance(&tenant.lineage, &tenant.namer, u64::MAX),
+    Err(EnvelopeError::Spent),
+    "a wrap past its envelope"
+  );
+  let mut refused = Wrapping::new(original, 0);
+  assert!(
+    matches!(
+      refused.advance(&tenant.lineage, &tenant.namer, 1),
+      Err(EnvelopeError::Sealed(_))
+    ),
+    "a segment of no bytes is refused by the seal"
+  );
+  assert_eq!(
+    refused.advance(&tenant.lineage, &tenant.namer, 1),
+    Err(EnvelopeError::Spent),
+    "a wrap past its refusal"
+  );
+}
+
+/// A-347: do open one envelope of 64 distinct chunks a slice at a time, at budgets of one byte (a chunk a slice), a
+/// chunk and a half, five chunks, more than the whole archive, and the whole budget; expect every one the very archive
+/// `open` makes, byte for byte, and the one-byte budget to take a slice a chunk: 64 slices, the chunks left falling by
+/// one each. An open's slices change where the work falls, never what it makes.
+#[test]
+fn an_envelope_opened_in_slices_is_the_whole_opens_archive() {
+  let tenant = new_tenant();
+  let original = many_chunk_snapshot(SLICED_CHUNKS);
+  let envelope = wrap(&original, &tenant.lineage, &tenant.namer, SEGMENT).unwrap();
+  let whole = open(&envelope, &tenant.lineage, &tenant.namer)
+    .unwrap()
+    .encode();
+  let chunk_bytes = u64::try_from(SMALL_CHUNK_LEN).unwrap();
+  for budget in [
+    1,
+    chunk_bytes * 3 / 2,
+    chunk_bytes * 5,
+    chunk_bytes * 1000,
+    u64::MAX,
+  ] {
+    let mut opening = Opening::new(envelope.clone(), &tenant.lineage, &tenant.namer).unwrap();
+    let mut slices = 0u32;
+    let mut left = Vec::new();
+    let archive = loop {
+      slices += 1;
+      let opened = opening
+        .advance(&tenant.lineage, &tenant.namer, budget)
+        .unwrap();
+      left.push(opening.chunks_left());
+      if let Some(archive) = opened {
+        break archive;
+      }
+    };
+    assert_eq!(
+      archive.encode(),
+      whole,
+      "the archive opened in slices of {budget} bytes is the whole open's"
+    );
+    if budget == 1 {
+      assert_eq!(slices, SLICED_CHUNKS, "a slice a chunk");
+      let expected: Vec<usize> = (0..usize::try_from(SLICED_CHUNKS).unwrap()).rev().collect();
+      assert_eq!(left, expected, "the chunks left fall by one a slice");
+    }
+  }
+}
+
+/// A-347: do advance an open past its archive, and an open under another tenant's keys, which its sealed manifest
+/// refuses; expect the archive once and then `Spent`, and the refusal at the start; and an open whose first chunk is
+/// refused (the envelope's chunk entries named under another tenant's namer) refused once and then `Spent`: an open
+/// that ended never hands back a second archive or a partial one.
+#[test]
+fn an_open_ends_at_its_archive_or_its_refusal() {
+  let tenant = new_tenant();
+  let stranger = new_tenant();
+  let original = snapshot(&[chunk(1), chunk(2)], 1);
+  let envelope = wrap(&original, &tenant.lineage, &tenant.namer, SEGMENT).unwrap();
+  let mut opening = Opening::new(envelope.clone(), &tenant.lineage, &tenant.namer).unwrap();
+  assert_eq!(
+    opening
+      .advance(&tenant.lineage, &tenant.namer, u64::MAX)
+      .map(|archive| archive.map(|archive| archive.encode())),
+    Ok(Some(
+      Archive {
+        created_unix: 0,
+        ..original.clone()
+      }
+      .encode()
+    )),
+    "the whole budget opens the archive, its creation time zeroed, in one advance"
+  );
+  assert_eq!(
+    opening.advance(&tenant.lineage, &tenant.namer, u64::MAX),
+    Err(EnvelopeError::Spent),
+    "an open past its archive"
+  );
+  assert!(
+    Opening::new(envelope.clone(), &stranger.lineage, &stranger.namer).is_err(),
+    "another tenant's keys do not open the sealed manifest"
+  );
+  let mut misnamed = Opening::new(envelope, &tenant.lineage, &tenant.namer).unwrap();
+  assert!(
+    misnamed
+      .advance(&tenant.lineage, &stranger.namer, 1)
+      .is_err(),
+    "a chunk looked up under another tenant's namer is refused"
+  );
+  assert_eq!(
+    misnamed.advance(&tenant.lineage, &tenant.namer, 1),
+    Err(EnvelopeError::Spent),
+    "an open past its refusal"
   );
 }
 

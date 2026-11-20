@@ -1,8 +1,9 @@
 //! Driving the real `slates` binary: build it, run an anchor that supervises a daemon (the
 //! `AnchorProcess` discipline of `crates/cli/tests/cli.rs`: killed and reaped on drop), provision
-//! a volume through the CLI, establish a real kernel mount (`slates mount` on macOS; on Linux a
-//! root `mount -t nfs` by the OS client of the daemon's loopback export, the lane's recorded
-//! adapter), and issue a grant the way the anchor's own children can — with the anchor handoff
+//! a volume through the CLI, establish a real kernel mount (`slates mount` on macOS; on Linux the
+//! daemon's own FUSE mount where the cell names no adapter, else a root `mount -t nfs` by the OS client
+//! of the daemon's loopback export, the lane's recorded adapter; see [`Reach`]), and issue a grant the
+//! way the anchor's own children can — with the anchor handoff
 //! taken from the daemon's environment (a shared-memory name on macOS; on Linux a memfd reopened
 //! through `/proc/<pid>/fd` and inherited by the `slates grant` child). The daemon stays
 //! unprivileged throughout (R10); only the OS mount client and the suite's own processes ever run
@@ -12,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use slates_conformance::capability::HostOs;
+use slates_conformance::Suite;
+use slates_conformance::capability::{Availability, HostOs, LINUX_NFS_ADAPTER, availability};
 use slates_conformance::record::Transport;
 
 use super::{Run, create_dir, pause, stdout_of};
@@ -534,15 +536,44 @@ fn nfs_port(binary: &SlatesBinary, instance: &str, id: &str) -> Result<u16, Fail
     .ok_or_else(|| Failure(format!("the daemon reports no nfs_port: {status}")))
 }
 
+/// How a cell reaches its volume, from the capability table's adapter column
+/// (`slates_conformance::capability`): through the transport's own mount, or through the adapter the table names in
+/// its stead. One decision per cell, made from the table where the cell is run ([`Reach::of`]); a run that measures a
+/// mount of its own (the NFS bench) names its reach outright.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+  /// The transport's own mount: `slates mount` (the NFS loopback mount on macOS, the daemon's FUSE mount on Linux,
+  /// its `--shared` form for the container transport, a WinFsp drive on Windows), or the kernel's NFSv4.2 client
+  /// for the Linux NFSv4.2 transport, which is that transport.
+  Own,
+  /// The Linux kernel's NFSv3 client as root, standing in for the FUSE transport
+  /// ([`LINUX_NFS_ADAPTER`], recorded LIMITED).
+  LinuxNfsAdapter,
+}
+
+impl Reach {
+  /// The reach of a cell: the Linux NFS adapter where the table names it, else the transport's own mount. The table
+  /// names no other adapter (`the_linux_nfs_adapter_is_the_only_adapter`).
+  pub(crate) fn of(transport: Transport, suite: Suite) -> Reach {
+    match availability(transport, suite) {
+      Availability::Runnable {
+        adapter: Some(adapter),
+        ..
+      } if adapter == LINUX_NFS_ADAPTER => Reach::LinuxNfsAdapter,
+      _ => Reach::Own,
+    }
+  }
+}
+
 /// How a mount was made, which decides how it is unmade.
 enum MountMethod {
-  /// `slates mount`; unmade with `umount` (as the CLI test's guard).
+  /// `slates mount`; unmade with `umount`, forced if refused (as the CLI tests' guards).
   Slates,
   /// A root `mount -t nfs`; unmade with `sudo umount -l`.
   LinuxRoot,
-  /// `slates mount --shared` on Linux: the daemon's FUSE mount a container runtime binds; unmade with
-  /// `fusermount3 -u -z` (no privilege).
-  SharedFuse,
+  /// `slates mount` on Linux: the daemon's FUSE mount, the user's own, or with `--shared` one a container runtime
+  /// binds; unmade with `fusermount3 -u -z` (no privilege).
+  Fuse,
   /// `slates mount ID E:` on Windows: the daemon's WinFsp drive; unmade with `slates unmount E:`.
   WinFsp {
     /// The binary that made it.
@@ -571,8 +602,14 @@ impl Mount {
 impl Drop for Mount {
   fn drop(&mut self) {
     match self.method {
+      // A plain unmount first, forced if refused (a file still open on it, as a suite killed mid-run leaves its
+      // files), as the CLI tests' guards do (`MountPoint`, `KernelMount`): the macOS mount is hard (A-229), so one left
+      // behind once its daemon is gone hangs whatever touches it (on CI, the cache's walk of `target/`).
       MountMethod::Slates => {
-        let _ = Command::new("umount").arg(&self.path).output();
+        let plain = Command::new("umount").arg(&self.path).output();
+        if !plain.is_ok_and(|out| out.status.success()) {
+          let _ = Command::new("umount").arg("-f").arg(&self.path).output();
+        }
       }
       MountMethod::LinuxRoot => {
         let _ = Command::new("sudo")
@@ -580,7 +617,7 @@ impl Drop for Mount {
           .arg(&self.path)
           .output();
       }
-      MountMethod::SharedFuse => {
+      MountMethod::Fuse => {
         let _ = Command::new("fusermount3")
           .args(["-u", "-z"])
           .arg(&self.path)
@@ -606,7 +643,7 @@ impl Drop for Mount {
 /// Whether the drive answers: Windows keeps no mount table a user lists, and a WinFsp drive's root answers a look-up
 /// once it serves (`crates/cli/tests/winfsp.rs`, `wait_ready`).
 #[cfg(windows)]
-fn is_mounted(path: &Path) -> bool {
+pub(super) fn is_mounted(path: &Path) -> bool {
   std::fs::metadata(path).is_ok()
 }
 
@@ -620,7 +657,7 @@ fn free_drive() -> Result<String, Failure> {
 
 /// Whether the mount table lists `path`.
 #[cfg(unix)]
-fn is_mounted(path: &Path) -> bool {
+pub(super) fn is_mounted(path: &Path) -> bool {
   let listed = stdout_of("mount", &[]);
   listed
     .lines()
@@ -635,17 +672,29 @@ fn fresh_mount_point() -> Result<PathBuf, Failure> {
   super::build_output(&format!("slates-mount-{}-{serial}", std::process::id()))
 }
 
-/// Mounts the volume: `slates mount` on macOS; the root NFS client on Linux, or for the Linux container form
-/// the daemon's shared FUSE mount. With `read_only`, a read attachment under a writable kernel mount, so each change
-/// reaches slates and is answered there: only the Linux NFS export allows that, since every other `--read-only` mount is
-/// read-only at the kernel too, and a suite over it would measure the kernel's refusal, not slates'.
+/// Whether `run` reaches its volume through the Linux kernel's NFS client as root: the NFSv4.2 transport, and the
+/// FUSE transport's cells that name the NFS adapter.
+fn over_linux_nfs(run: &Run<'_>) -> bool {
+  run.os == HostOs::Linux
+    && match run.transport {
+      Transport::NativeLinuxNfs4 => true,
+      Transport::NativeLinuxFuse => run.reach == Reach::LinuxNfsAdapter,
+      _ => false,
+    }
+}
+
+/// Mounts the volume: `slates mount` on macOS; on Linux the daemon's own FUSE mount where the cell reaches it so
+/// ([`Reach::Own`]; `--shared` for the container form), else the root NFS client. With `read_only`, a read
+/// attachment under a writable kernel mount, so each change reaches slates and is answered there: only the Linux
+/// NFS export allows that, since every other `--read-only` mount is read-only at the kernel too, and a suite over it
+/// would measure the kernel's refusal, not slates'.
 pub(crate) fn mount_volume(
   run: &Run<'_>,
   binary: &SlatesBinary,
   (instance, id, name): (&str, &str, &str),
   read_only: bool,
 ) -> Result<Mount, Failure> {
-  let linux_nfs = run.os == HostOs::Linux && run.transport != Transport::OciLinux;
+  let linux_nfs = over_linux_nfs(run);
   if read_only && !linux_nfs {
     return Err(Failure(format!(
       "--read-only runs over the Linux NFS export only: {}'s read-only mount is read-only at the kernel, which would \
@@ -692,7 +741,19 @@ pub(crate) fn mount_volume(
         .expect_ok("slates mount --shared")?;
       Mount {
         path: point,
-        method: MountMethod::SharedFuse,
+        method: MountMethod::Fuse,
+        export: None,
+      }
+    }
+    // The daemon's own FUSE mount, the user's: no privilege, no adapter (A-293).
+    HostOs::Linux if !linux_nfs => {
+      let point = fresh_mount_point()?;
+      binary
+        .run(instance, &["mount", id, &point.display().to_string()])?
+        .expect_ok("slates mount")?;
+      Mount {
+        path: point,
+        method: MountMethod::Fuse,
         export: None,
       }
     }
@@ -1130,6 +1191,80 @@ mod tests {
       "",
       "no daemon of the instance outlived the stop"
     );
+  }
+
+  /// A-293 (the workload roster over Linux FUSE, Ada's goal of 2026-11-18). Do: open the workloads cell's session on
+  /// the Linux FUSE transport as `conformance run --suite workloads` opens it, its reach taken from the capability
+  /// table, as a user with no root; write a file through the mount and give it a second name, as a local git or
+  /// Mercurial clone links its objects. Expect: the kernel lists the session's mount as a FUSE mount (no NFS
+  /// adapter), the file reads back through its second name, and both names report two links. Skips loudly without a
+  /// built CLI or `fusermount3`.
+  #[cfg(target_os = "linux")]
+  #[test]
+  #[allow(clippy::unwrap_used)]
+  #[allow(clippy::disallowed_methods)] // the calls are a program's on the slates mount, the point of the test
+  fn the_workloads_cell_reaches_linux_fuse_through_the_daemons_own_mount() {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(binary) = std::env::var_os("SLATES_TEST_BINARY") else {
+      eprintln!(
+        "SKIP: set SLATES_TEST_BINARY to a built slates CLI to mount the workloads cell over FUSE"
+      );
+      return;
+    };
+    if !crate::conformance::tool_on_path("fusermount3") {
+      eprintln!("SKIP: the workloads cell over FUSE: fusermount3 is absent");
+      return;
+    }
+    let root = crate::workspace_root().unwrap();
+    let options = crate::conformance::parse(&root, &["run".to_owned()]).unwrap();
+    let transport = Transport::NativeLinuxFuse;
+    let run = Run {
+      root: &root,
+      options: &options,
+      os: HostOs::Linux,
+      transport,
+      root_available: false,
+      reach: Reach::of(transport, Suite::Workloads),
+      scratch: crate::conformance::Scratch::open(&options, transport).unwrap(),
+    };
+    assert_eq!(
+      run.reach,
+      Reach::Own,
+      "the table names no adapter for the cell"
+    );
+    let session = Session::open_with(
+      &run,
+      SlatesBinary::at(PathBuf::from(binary)),
+      ("fuse-reach", crate::conformance::VOLUME_SIZE, false),
+      None,
+    )
+    .unwrap();
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+    let point = session.mount.path().display().to_string();
+    let kind = mounts
+      .lines()
+      .map(|line| line.split(' ').collect::<Vec<_>>())
+      .find(|fields| fields.get(1) == Some(&point.as_str()))
+      .and_then(|fields| fields.get(2).map(|kind| (*kind).to_owned()))
+      .unwrap_or_else(|| panic!("{point} is not in /proc/self/mounts:\n{mounts}"));
+    assert!(
+      kind.starts_with("fuse"),
+      "the workloads cell's mount is {kind}, not FUSE"
+    );
+    let dir = session.workdir("reach").unwrap();
+    std::fs::write(dir.join("first"), b"linked\n").unwrap();
+    std::fs::hard_link(dir.join("first"), dir.join("second")).unwrap();
+    assert_eq!(std::fs::read(dir.join("second")).unwrap(), b"linked\n");
+    for name in ["first", "second"] {
+      assert_eq!(
+        std::fs::metadata(dir.join(name)).unwrap().nlink(),
+        2,
+        "{name}'s link count over FUSE"
+      );
+    }
+    eprintln!("the workloads cell mounted {point} as {kind}; a linked file reports two names");
   }
 
   /// The refusal the CI macOS runner's daemon printed (2026-09-16) yields its available bytes; any

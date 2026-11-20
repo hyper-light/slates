@@ -375,15 +375,31 @@ fn mkdir_args(directory: &[u8], name: &str) -> Vec<u8> {
   args
 }
 
-/// A Unix caller owns its new directory, can populate it, and excludes other callers.
+/// The group a directory made over the export by a caller whose credential names `caller_gid` takes in a plain parent
+/// of group `parent_gid`, by this host's own rule (A-328): BSD's on macOS, the parent's group, as APFS gives it.
+#[cfg(target_os = "macos")]
+fn group_made_in(parent_gid: u32, _caller_gid: u32) -> u32 {
+  parent_gid
+}
+
+/// The group a directory made over the export by a caller whose credential names `caller_gid` takes in a plain parent
+/// of group `parent_gid`, by this host's own rule (A-328): System V's elsewhere, the caller's group, as Linux gives it.
+#[cfg(not(target_os = "macos"))]
+fn group_made_in(_parent_gid: u32, caller_gid: u32) -> u32 {
+  caller_gid
+}
+
+/// A Unix caller owns its new directory, which takes its group by this host's rule (A-328), can populate it, and
+/// excludes other callers. `call_as` names the uid as the credential's gid too.
 fn assert_creation_as(stream: &mut TcpStream, root: &[u8], uid: u32) {
   use common::nfs::{NFS_PROGRAM, owner_and_mode, read_opaque};
+  let (_, _, root_gid) = owner_and_mode(stream, root, 7);
   let args = mkdir_args(root, &format!("user-{uid}"));
   let reply = call_as(stream, NFS_PROGRAM, 9, &args, 3, uid);
   assert_eq!(status(&reply), 0, "first MKDIR by uid {uid}");
   let directory = read_opaque(&reply, 8).0;
   let ownership = owner_and_mode(stream, &directory, 4);
-  assert_eq!(ownership, (0o700, uid, uid));
+  assert_eq!(ownership, (0o700, uid, group_made_in(root_gid, uid)));
   let nested = mkdir_args(&directory, "child");
   assert_eq!(status(&call_as(stream, NFS_PROGRAM, 9, &nested, 5, uid)), 0);
   assert_eq!(
@@ -401,7 +417,8 @@ fn assert_creation_as(stream: &mut TcpStream, root: &[u8], uid: u32) {
 }
 
 /// AC-3.10 / §4.6: each creation takes the requesting Unix user's ownership, even when MOUNT
-/// admitted the shared attachment under another identity. The same mount serves multiple users;
+/// admitted the shared attachment under another identity, and its group by this host's rule (A-328: the caller's
+/// on Linux, the parent's on macOS, as each host's own file system gives it). The same mount serves multiple users;
 /// nested creation must work and another user must still be refused by its directory's mode.
 #[test]
 fn a_mount_preserves_each_requests_unix_owner_across_shards() {
@@ -714,9 +731,10 @@ fn the_host_root_listing_gathers_volumes_from_every_shard() {
 /// through, the mount's requests ride a registry attachment: the barrier closes it (one attachment) and
 /// the snapshot is **server-visible** — the NFS client may still hold acknowledged writes before its
 /// `COMMIT`, which the reply must not claim. The mount keeps serving after the barrier (a write lands in
-/// the next generation), and the mount's end — its bound mount point confirmed empty after the
-/// kernel's `UMNT` on macOS, a `detach` elsewhere (§4.6 A-34) — ends the registry attachment with the
-/// catalog's: the next snapshot closes none again. Non-vacuous: the closed count moves 0 → 1 → 0 with the mount's life.
+/// the next generation), and the mount's end — a `detach`, after a `UMNT` that ends nothing (A-511: only the
+/// kernel's own unmount event ends a mount's attachment, and no kernel mount is made here) — ends the registry
+/// attachment with the catalog's: the next snapshot closes none again. Non-vacuous: the closed count moves 0 → 1 → 0
+/// with the mount's life.
 #[test]
 fn a_snapshot_over_a_mounted_volume_reports_the_barrier_it_closed() {
   let (daemon, instance) = single_shard_daemon("snapbarrier");
@@ -939,10 +957,10 @@ fn root_capability_path(daemon: &Daemon, name: &str) -> String {
 /// presenting the attachment's token is served, a file written through it reads back on a connection
 /// that presented no token (the handle carries the capability), and the root scoped to the capability
 /// lists exactly that volume. The mount's attachment is the mount's: it holds the write lease, survives
-/// a `UMNT` of the scoped root and a `UMNT` presenting the capability, and ends the platform's way
-/// (§4.6 A-34: the kernel's `UMNT` of `/<name>` with the bound mount point confirmed empty on macOS, a
-/// `detach` elsewhere) — the handle refused, the attachment gone, the lease released. Non-vacuous: this
-/// same private volume serves once the capability is presented, and stops once the mount has ended.
+/// a `UMNT` of the scoped root, a `UMNT` presenting the capability and the kernel's form of `UMNT` (`/<name>`; §4.6
+/// A-34, A-511: a `UMNT` ends nothing), and ends with a `detach` — the handle refused, the attachment gone, the lease
+/// released. Non-vacuous: this same private volume serves once the capability is presented, and stops once the mount
+/// has ended.
 #[test]
 fn a_consumer_private_volume_is_served_over_nfs_only_through_its_attachment_capability() {
   let (daemon, instance) = single_shard_daemon("aud01");
@@ -1121,7 +1139,7 @@ fn authorized_round_trip(port: u16, capability_path: &str, payload: &[u8]) -> Au
   Authorized { got, listed, file }
 }
 
-/// How the mount's attachment ends (AUD-01): with the kernel's `UMNT` of the mount path, not before.
+/// How the mount's attachment ends (AUD-01): not with any `UMNT` (A-511), but with its `detach`.
 struct Unmounted {
   /// The volume's attachment count and write-lease epoch while mounted.
   attachments_mounted: u32,
@@ -1185,12 +1203,12 @@ fn attachment_of(capability: &str) -> u64 {
   u64::from_str_radix(attachment, 16).expect("a hexadecimal attachment id")
 }
 
-/// Ends a host mount's `attachment` the platform's way (§4.6 A-34). The attachment is bound to a mount
-/// point that holds no mount (a path this test never creates), and the kernel's `UMNT` of `/<name>` —
-/// the only form the kernel sends, the mount source carrying no capability — is sent. On macOS the
-/// daemon confirms against the kernel's mount table that the point no longer holds the mount, and the
-/// attachment ends. Elsewhere a `UMNT` is never proof of an unmount (a FUSE mount ends when the kernel
-/// closes the device), so the attachment still serves and is ended by a `detach`.
+/// Ends a host mount's `attachment` with a `detach` after the kernel's form of `UMNT` ended nothing (§4.6 A-34,
+/// A-511). The attachment is bound to a mount point that holds no mount (a path this test never creates), and the
+/// kernel's `UMNT` of `/<name>` — the only form the kernel sends, the mount source carrying no capability — is sent.
+/// A `UMNT` is a hint any local process can send, so on every platform it ends nothing: a mount's attachment ends at
+/// the kernel's own unmount event (macOS, `own_nfs::watch` in the server), when its FUSE device closes (Linux), or with
+/// a `detach`. No kernel mount is made here, so the `detach` ends it.
 fn end_host_mount(
   owner: &mut Client,
   stream: &mut TcpStream,
@@ -1211,34 +1229,23 @@ fn end_host_mount(
   );
   let (attachments, _) = attachments_and_lease(owner, volume);
   umnt(stream, name, 90);
-  if cfg!(target_os = "macos") {
-    let started = Instant::now();
-    while attachments_and_lease(owner, volume).0 >= attachments {
-      assert!(
-        started.elapsed() < CREDIT_WAIT,
-        "a UMNT whose bound mount point holds no mount ends its attachment"
-      );
-      std::thread::yield_now();
-    }
-  } else {
-    assert_eq!(
-      attachments_and_lease(owner, volume).0,
-      attachments,
-      "off macOS a UMNT alone ends nothing"
-    );
-    assert!(
-      matches!(
-        owner.call(&RequestBody::Detach { attachment }),
-        ReplyBody::Detached
-      ),
-      "the owner detaches its mount"
-    );
-  }
+  assert_eq!(
+    attachments_and_lease(owner, volume).0,
+    attachments,
+    "a UMNT alone ends nothing (A-511)"
+  );
+  assert!(
+    matches!(
+      owner.call(&RequestBody::Detach { attachment }),
+      ReplyBody::Detached
+    ),
+    "the owner detaches its mount"
+  );
 }
 
 /// The mount's attachment is the mount's: one attachment holding the write lease while mounted, still
-/// serving after the root browse is unmounted, and ended — the handle refused, the attachment gone, the
-/// lease released — by the `UMNT` of the mount path.
+/// serving after every `UMNT`, and ended — the handle refused, the attachment gone, the lease released — by its
+/// `detach`.
 fn assert_unmounted(unmounted: &Unmounted) {
   assert_eq!(
     unmounted.attachments_mounted, 1,
@@ -2711,7 +2718,7 @@ impl V4Client {
 #[test]
 fn a_write_from_another_client_recalls_the_read_delegation_first() {
   let (daemon, instance) = two_shard_daemon_with("recall", |config| {
-    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+    config.nfs_v4.lease_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
   });
   let mut client = Client::connect(&instance);
   let name = local_volume_name(&mut client);
@@ -2771,7 +2778,7 @@ fn delegated_to_a(
   Vec<u8>,
 ) {
   let (daemon, instance) = two_shard_daemon_with(name, |config| {
-    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+    config.nfs_v4.lease_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
   });
   let mut client = Client::connect(&instance);
   let volume = local_volume_name(&mut client);
@@ -2900,7 +2907,7 @@ const WANT_WRITE_DELEG: u32 = 0x0200;
 /// its instance's client, the holder, the other client, and the volume's component.
 fn holder_and_other(name: &str) -> (Daemon, Client, V4Client, V4Client, String) {
   let (daemon, instance) = two_shard_daemon_with(name, |config| {
-    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+    config.nfs_v4.lease_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
   });
   let mut client = Client::connect(&instance);
   let volume = local_volume_name(&mut client);
@@ -3635,7 +3642,7 @@ fn a_granted_landing_waits_out_an_unreturned_delegation_and_lands() {
 #[test]
 fn recalls_asked_together_reach_the_one_slot_in_turn() {
   let (daemon, instance) = two_shard_daemon_with("recall-burst", |config| {
-    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+    config.nfs_v4.lease_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
   });
   let mut client = Client::connect(&instance);
   let volume = local_volume_name(&mut client);

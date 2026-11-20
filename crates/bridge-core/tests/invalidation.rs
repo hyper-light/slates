@@ -24,6 +24,7 @@ use slates_vfs::base::BaseConfig;
 use slates_vfs::clock::StepClock;
 use slates_vfs::host::HostFs;
 use slates_vfs::host::sim::SimHost;
+use slates_vfs::journal::Patience;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
@@ -155,7 +156,11 @@ impl Overlay {
     let cursor = self.cursor;
     let (owed, next, result) = self.bridge(|b, cx| {
       let mut owed = Vec::new();
-      let next = b.invalidations(cx, cursor, &mut owed).unwrap();
+      let next = b
+        .invalidations(cx, cursor, &mut owed, &mut || {
+          std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
       let result = f(b, cx);
       (owed, next, result)
     });
@@ -220,7 +225,9 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   };
   let mut owed = Vec::new();
   let cursor = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert!(
     owed.is_empty(),
@@ -232,7 +239,9 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   vol.write(&mut store, f_no, 0, b"hello").unwrap();
   vol.truncate(&mut store, f_no, 2).unwrap();
   let cursor = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     owed,
@@ -248,7 +257,9 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   vol.rename(&mut store, root_h, "f", root_h, "g").unwrap();
   vol.create_file(&mut store, root_h, "h", 0o644).unwrap();
   let cursor = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     owed,
@@ -266,7 +277,9 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   // A chmod through the SDK is attributes only: the pages stay.
   vol.chmod(&mut store, f_no, 0o600).unwrap();
   let _ = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(owed, vec![inode(f, CachedBytes::Kept)]);
 }
@@ -345,7 +358,9 @@ fn a_content_change_owes_its_kernel_the_bytes_it_touched_not_the_whole_file() {
       &mut handles,
       None,
     )
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
     let expected: Vec<Invalidation> = expected
       .into_iter()
@@ -393,7 +408,9 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
   vol.write(&mut store, a, 0, b"new").unwrap();
   let mut owed = Vec::new();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     owed,
@@ -406,7 +423,9 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
     vol.write(&mut store, b, 0, &[round]).unwrap();
   }
   let next = bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     owed,
@@ -418,7 +437,9 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
 
   owed.clear();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, next, &mut owed)
+    .invalidations(&cx, next, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert!(owed.is_empty(), "caught up: {owed:?}");
 }
@@ -452,7 +473,9 @@ fn each_current_round_records_what_waited_for_it_and_a_pinned_round_records_noth
 
   let mut owed = Vec::new();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&cx, cursor, &mut owed)
+    .invalidations(&cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   let measure = vol.op_log().measure();
   assert_eq!(measure.rounds, 1, "one current round, one measurement");
@@ -483,7 +506,9 @@ fn each_current_round_records_what_waited_for_it_and_a_pinned_round_records_noth
   attachments.set_coherence(pinned_id, slates_bridge_core::CacheCoherence::Invalidated);
   let pinned = attachments.context(pinned_id).unwrap();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&pinned, cursor, &mut owed)
+    .invalidations(&pinned, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     vol.op_log().measure().rounds,
@@ -527,8 +552,8 @@ fn a_current_round_moves_its_readers_point_and_a_pinned_round_moves_none() {
   };
   let current = context(View::Current, true);
   let pinned = context(View::Version(1), false);
-  vol.open_journal_reader(current.attachment.key(), u64::MAX);
-  vol.open_journal_reader(pinned.attachment.key(), u64::MAX);
+  vol.open_journal_reader(current.attachment.key(), Patience::WhileOpen);
+  vol.open_journal_reader(pinned.attachment.key(), Patience::WhileOpen);
   let opened_at = vol.op_log().head_seq();
   assert_eq!(
     (vol.op_log().readers(), vol.op_log().slowest_reader()),
@@ -541,10 +566,14 @@ fn a_current_round_moves_its_readers_point_and_a_pinned_round_moves_none() {
   assert!(cursor.journal_seq > opened_at, "the changes were journaled");
   let mut owed = Vec::new();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&current, cursor, &mut owed)
+    .invalidations(&current, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   bridge(&mut vol, &mut store, &mut handles)
-    .invalidations(&pinned, cursor, &mut owed)
+    .invalidations(&pinned, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
     .unwrap();
   assert_eq!(
     vol.op_log().slowest_reader(),
@@ -567,9 +596,12 @@ const TWO_RECORDS: usize = 2 * std::mem::size_of::<slates_vfs::journal::OpRecord
 /// Shape: the files the retention tests create without a round: each create journals a record, far past the floor.
 const CREATES: usize = 12;
 
-/// A volume with a two-record journal floor, a current attachment's context and its reader open with `patience_ns`,
-/// and the round's cursor before any change.
-fn reading_volume(store: &mut Store, patience_ns: u64) -> (Volume, OpContext, InvalidationCursor) {
+/// A volume with a two-record journal floor, a current attachment's context and its reader open with `patience`, and
+/// the round's cursor before any change.
+fn reading_volume(
+  store: &mut Store,
+  patience: Patience,
+) -> (Volume, OpContext, InvalidationCursor) {
   let mut volume = Volume::create(
     store,
     VolumeConfig {
@@ -579,7 +611,7 @@ fn reading_volume(store: &mut Store, patience_ns: u64) -> (Volume, OpContext, In
   )
   .unwrap();
   let cx = rw_cx();
-  volume.open_journal_reader(cx.attachment.key(), patience_ns);
+  volume.open_journal_reader(cx.attachment.key(), patience);
   let mut handles = new_handle_store();
   let cursor = VolumeBridge::attached(
     VolumeId { bytes: [0; 16] },
@@ -608,19 +640,21 @@ fn round(
     &mut handles,
     None,
   )
-  .invalidations(cx, cursor, &mut owed)
+  .invalidations(cx, cursor, &mut owed, &mut || {
+    std::ops::ControlFlow::Continue(())
+  })
   .unwrap();
   owed
 }
 
 /// A-157 (the journal keeps what a live reader still needs, growing from the ledger). Do: give a volume a two-record
-/// journal floor and a reader whose patience outlasts the test; create files far past the floor before the reader's
+/// journal floor and a reader held while it is open (A-548); create files far past the floor before the reader's
 /// round. Expect no overrun (the round names the changes, not Everything), the budget grown past the floor by exactly
 /// what the shard's metadata ledger committed, and no growth refused.
 #[test]
 fn a_live_readers_records_are_kept_by_growing_from_the_ledger() {
   let mut store = store();
-  let (mut volume, cx, cursor) = reading_volume(&mut store, u64::MAX);
+  let (mut volume, cx, cursor) = reading_volume(&mut store, Patience::WhileOpen);
   let root = volume.root();
   for file in 0..CREATES {
     volume
@@ -656,7 +690,7 @@ fn a_reader_past_its_patience_pins_nothing_and_overruns() {
   /// Shape: a patience of five steps of the test clock.
   const PATIENCE_NS: u64 = 5_000;
   let mut store = store();
-  let (mut volume, cx, cursor) = reading_volume(&mut store, PATIENCE_NS);
+  let (mut volume, cx, cursor) = reading_volume(&mut store, Patience::Bounded(PATIENCE_NS));
   let root = volume.root();
   for file in 0..CREATES {
     volume
@@ -677,13 +711,13 @@ fn a_reader_past_its_patience_pins_nothing_and_overruns() {
 }
 
 /// A-157: a growth the ledger refuses keeps the budget and drops the record a live reader still owed. Do: as above with a
-/// patience that outlasts the test, on a shard whose metadata ledger has no room; create files past the floor before the
+/// reader held while it is open, on a shard whose metadata ledger has no room; create files past the floor before the
 /// reader's round. Expect the refusals counted, the budget still the floor, and the round owing Everything (an overrun).
 #[test]
 fn a_growth_the_ledger_refuses_overruns_its_reader_and_is_counted() {
   let mut store = store();
   store.metadata = slates_mem::budget::MetadataBudget::new(0);
-  let (mut volume, cx, cursor) = reading_volume(&mut store, u64::MAX);
+  let (mut volume, cx, cursor) = reading_volume(&mut store, Patience::WhileOpen);
   let root = volume.root();
   for file in 0..CREATES {
     volume
@@ -816,7 +850,10 @@ fn a_scoped_view_filters_an_out_of_scope_base_plane_hint() {
   let cursor = base.cursor;
   let unscoped = base.bridge(|b, cx| {
     let mut owed = Vec::new();
-    b.invalidations(cx, cursor, &mut owed).unwrap();
+    b.invalidations(cx, cursor, &mut owed, &mut || {
+      std::ops::ControlFlow::Continue(())
+    })
+    .unwrap();
     owed
   });
   assert!(
@@ -830,7 +867,11 @@ fn a_scoped_view_filters_an_out_of_scope_base_plane_hint() {
   let owed = f.bridge(|b, cx| {
     let mut scoped = ScopedBridge::new(b, scope_ino);
     let mut owed = Vec::new();
-    scoped.invalidations(cx, cursor, &mut owed).unwrap();
+    scoped
+      .invalidations(cx, cursor, &mut owed, &mut || {
+        std::ops::ControlFlow::Continue(())
+      })
+      .unwrap();
     owed
   });
   assert!(

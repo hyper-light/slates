@@ -183,8 +183,16 @@ pod's `rw,relatime`. So a pod's mount flags cannot be the guard.
 
 `allowPrivilegeEscalation: false` sets `no_new_privs`, under which the kernel ignores setuid and setgid bits on exec
 whatever the mount says. The KIND lane proves it by use: a planted setuid-root `id` ran as 0 in a pod without the
-setting and as 65534 in one with it. `nodev` needs no pod setting, because slates refuses device nodes in a volume
-outright. The mounts slates makes itself (`slates mount`, the OCI binding) carry both flags.
+setting and as 65534 in one with it.
+
+A volume keeps device nodes as metadata: an unpacked root filesystem's `/dev` entries, overlayfs's whiteouts (A-294).
+In a pod nothing opens one as a device, whatever the mount says: the container runtime's device cgroup lets a
+container open only the standard character devices (runc's `AllowedDevices`: `null`, `zero`, `full`, `random`,
+`urandom`, `tty`, `ptmx`, the pseudo-terminals and `net/tun`) and refuses every other open `EPERM`, so a device node
+one root pod makes in the volume opens nothing in another. A privileged pod already holds every host device, so a node
+in the volume gives it nothing more. The KIND lane checks the refusal by use (`device_probe` in
+`xtask/src/kind_export.rs`: `/dev/null`'s number opens, `/dev/mem`'s is refused `EPERM`); its first run is owed (GAPS). The mounts slates
+makes itself (`slates mount`, the OCI binding) carry both flags, and there the kernel refuses the open `EACCES`.
 
 `slates detach` of the export's attachment, or the volume's destroy, ends what the path reaches. The KIND
 lane's `cargo xtask kind export` runs this whole flow on a cluster.
@@ -220,3 +228,21 @@ For recovery, provision a distinct 32-byte recovery key for each node and set
 `SLATES_RECOVERY_KEY` to its read-only secret path in both the anchor environment and the
 operator's recovery CLI. It grants no landing or consumer authority. The exact commands and
 required fencing acknowledgements are in [cli.md](cli.md#recovering-a-lost-consensus-quorum).
+
+### What a node's firewall must let through
+
+A node serves its peers on two UDP sockets at its manifest's base port, so a firewall needs only inbound rules, from
+the other nodes of the fleet:
+
+- **UDP `base`**: the probe plane (membership, its sealed datagrams).
+- **UDP `base + 1`**: the record plane (records and content).
+- **TCP `base`**, only when the fleet serves its network export (the manifest has an operator authority), from the
+  export's clients.
+
+The answers to a node's own dials come back to the socket it sent from, which a stateful firewall (`ufw`, `nftables`
+with connection tracking) passes on its own. A node that may dial a name (a node is named, or the manifest trusts an
+enrollment root) also needs UDP 53 out to its nameservers: those of its `/etc/resolv.conf` on Linux and macOS, and on
+Windows the DNS servers of its network adapters that are up and have a gateway. Nothing else: the MCP and SDK channels are local to the host. With `ufw`, a fleet on
+`192.168.1.0/24` at base port 7000 needs, on every node,
+`ufw allow proto udp from 192.168.1.0/24 to any port 7000:7001`. slates holds no privilege (R10), so the rule is
+the operator's, made once per host.

@@ -23,6 +23,10 @@
 //! - **What Windows is told** ([`notify`]): the names Windows holds open and the `FspFileSystemNotify`
 //!   records a change made through another path owes them, host-buildable and tested on any host.
 //!
+//! - **What an open is named** ([`normalized`]): on a drive over a folding volume, which declares no
+//!   `CaseSensitiveSearch`, the name each open answers WinFsp with, so every spelling of a file is one of the driver's
+//!   file nodes under the spelling it was made with (A-551), host-buildable and tested on any host.
+//!
 //! - **What a mapped view is purged of** ([`purge`]): the range an unbuffered write through the drive must cover so
 //!   WinFsp's coherent purge invalidates a process's view of a file another path changed (A-190, an experiment),
 //!   host-buildable and tested on any host.
@@ -44,6 +48,9 @@ use slates_vfs::inode::Kind;
 mod ffi;
 #[cfg(windows)]
 pub mod host;
+// The account a drive is served for, as every object's owner and group: a SID's text from its token bytes and the
+// drive's one descriptor (A-350). Pure, so it is tested on every host.
+pub mod account;
 // What a mount tells Windows of another path's change: the names Windows holds open and the notification records
 // (§4.6 "Windows"). Pure, so it is tested on every host.
 #[cfg(windows)]
@@ -53,6 +60,9 @@ mod dispatcher;
 pub mod dll_version;
 pub mod held;
 pub mod inflight;
+// The name WinFsp's driver gives the file node an open makes on a drive over a folding volume, and how the driver
+// compares a drive's names (A-551). Pure, so it is tested on every host.
+pub mod normalized;
 pub mod notify;
 pub mod opens;
 pub mod purge;
@@ -63,12 +73,19 @@ mod purge_intents;
 pub mod purge_slot;
 #[cfg(windows)]
 mod purge_token;
-// How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212).
+// How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212), the window learned
+// from the thread's own wakes (A-560).
 #[cfg(windows)]
 mod reply;
 // The purges Windows did not take, made again on a doubling wait until each takes or the volume's request timeout
 // passes (A-190 as amended 2026-11-01). Pure, so it is tested on every host.
 pub mod retry;
+// The receive thread's spin window, learned from its own wakes, agreed before it is trusted and bounded by the shard's
+// step quantum (A-560). Pure, so it is tested on every host.
+pub mod spin_window;
+// Windows symbolic links: the map between the volume's link target and the reparse buffer Windows reads and sets
+// (A-275). Pure, so it is tested on every host.
+pub mod symlink;
 
 /// An `NTSTATUS` code — the 32-bit status WinFsp hands the kernel for a request (§4.6). Held as the raw
 /// `u32` the constants are written in; the Windows FFI casts it to the `NTSTATUS`/`LONG` (`i32`) the API
@@ -160,7 +177,10 @@ pub fn node_attributes(attr: &slates_bridge_core::NodeAttr) -> Result<u32, VfsEr
     Kind::Symlink => FILE_ATTRIBUTE_REPARSE_POINT | kept,
     Kind::File if attr.mode & OWNER_WRITE == 0 => kept | FILE_ATTRIBUTE_READONLY,
     Kind::File => kept,
-    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+    // Windows has no FIFO, socket or device node (A-26, A-294): refused as unsupported, never shown as a file.
+    Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+      return Err(VfsError::SpecialFileOperation);
+    }
   };
   Ok(if word == 0 {
     FILE_ATTRIBUTE_NORMAL
@@ -256,8 +276,18 @@ pub fn file_attributes(kind: Kind) -> Result<u32, VfsError> {
     Kind::Dir => FILE_ATTRIBUTE_DIRECTORY,
     Kind::File => FILE_ATTRIBUTE_NORMAL,
     Kind::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+    Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+      return Err(VfsError::SpecialFileOperation);
+    }
   })
+}
+
+/// Whether the drive lists an entry of `kind` (A-26, A-294): Windows has no FIFO, socket or device node, so the drive
+/// leaves each out of its directory's listing, as it refuses to open one ([`file_attributes`]), and the rest of the
+/// directory lists. Before, one such entry failed the whole listing `STATUS_NOT_SUPPORTED`, so a `dir` of an unpacked
+/// root filesystem's `/dev` listed nothing at all.
+pub fn listed(kind: Kind) -> bool {
+  !kind.is_special()
 }
 
 /// The `NTSTATUS` WinFsp returns for a volume refusal (§4.6). The common, well-defined codes map
@@ -272,7 +302,7 @@ pub fn ntstatus(error: &VfsError) -> Ntstatus {
     VfsError::NotDirectory => STATUS_NOT_A_DIRECTORY,
     VfsError::IsDirectory => STATUS_FILE_IS_A_DIRECTORY,
     VfsError::NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
-    VfsError::NoSpace => STATUS_DISK_FULL,
+    VfsError::NoSpace | VfsError::RetentionExceeded => STATUS_DISK_FULL,
     VfsError::NotPermitted | VfsError::LinkProtected => STATUS_ACCESS_DENIED,
     VfsError::Invalid | VfsError::InvalidName => STATUS_INVALID_PARAMETER,
     VfsError::NameTooLong => STATUS_NAME_TOO_LONG,
@@ -358,6 +388,7 @@ mod tests {
       btime: 0,
       windows,
       change: 0,
+      device: None,
     }
   }
 
@@ -412,10 +443,35 @@ mod tests {
     assert!(!refuses_replacement(&node(Kind::Dir, 0o555, 0x1)));
   }
 
-  /// AC-3.10 / A-26: an IPC inode is refused as unsupported, never projected as a disk file.
+  /// AC-3.10 / A-294: do ask whether the drive lists an entry of each kind. Expect a directory, a file and a symlink
+  /// listed, each with its attribute word, and a FIFO, a socket and both device kinds left out, each of which the
+  /// drive refuses to open: a directory holding one still lists the rest.
+  #[test]
+  fn a_listing_leaves_out_the_kinds_windows_has_none_of() {
+    for kind in [Kind::Dir, Kind::File, Kind::Symlink] {
+      assert!(listed(kind), "{kind:?} is listed");
+      assert!(file_attributes(kind).is_ok());
+    }
+    for kind in [
+      Kind::Fifo,
+      Kind::Socket,
+      Kind::BlockDevice,
+      Kind::CharDevice,
+    ] {
+      assert!(!listed(kind), "{kind:?} is left out");
+      assert!(file_attributes(kind).is_err());
+    }
+  }
+
+  /// AC-3.10 / A-26, A-294: a FIFO, socket or device node is refused as unsupported, never projected as a disk file.
   #[test]
   fn ipc_names_report_unsupported() {
-    for kind in [Kind::Fifo, Kind::Socket] {
+    for kind in [
+      Kind::Fifo,
+      Kind::Socket,
+      Kind::BlockDevice,
+      Kind::CharDevice,
+    ] {
       let error = file_attributes(kind).unwrap_err();
       // Format: MS-ERREF STATUS_NOT_SUPPORTED.
       assert_eq!(ntstatus(&error), Ntstatus(0xC000_00BB));
@@ -433,6 +489,7 @@ mod tests {
       (VfsError::IsDirectory, STATUS_FILE_IS_A_DIRECTORY),
       (VfsError::NotEmpty, STATUS_DIRECTORY_NOT_EMPTY),
       (VfsError::NoSpace, STATUS_DISK_FULL),
+      (VfsError::RetentionExceeded, STATUS_DISK_FULL),
       (VfsError::NotPermitted, STATUS_ACCESS_DENIED),
       (VfsError::ReadOnly, STATUS_MEDIA_WRITE_PROTECTED),
       (VfsError::Invalid, STATUS_INVALID_PARAMETER),

@@ -29,6 +29,13 @@
 //!   take a later write into it (`docs/bugs/2026-10-25-a-range-mapped-past-the-files-end-missed-later-writes.md`).
 //! - A range is marked filled when its fill starts, so a change written through meanwhile lands on it and the rest of
 //!   the fill reads the volume as changed.
+//! - A fill refused or given up part-way leaves its range uncleared (A-419): no longer filled, so no change reaches it,
+//!   and still counted, since the slices done stored bytes. The next fill of the range clears it first. Unmarked and
+//!   uncounted instead, as before, its stored pages outlived the refusal, and where the file had since become a hole or
+//!   zeros a later fill skipped them, so a guest's map showed the old bytes
+//!   (`docs/bugs/2026-11-18-a-dax-fill-refused-part-way-left-its-bytes-for-a-later-fill-to-show.md`). A backing taken
+//!   back from a dead daemon's object clears each range not filled before its first fill (A-526): that daemon's range
+//!   table names only the ranges it answered, not one it was filling when it died.
 //! - The fill done, the answer is a new descriptor of the backing's object (on Windows, a section handle of the ask's
 //!   access, which the transport duplicates into the VMM's process). Every ask of the node is answered with the same
 //!   object, so every range of the file stays coherent however the device maps them.
@@ -43,7 +50,8 @@
 //!   behind it as surely as its stores (Kim et al., ISCA 2014), so a placed range lies on 2 MiB of contiguous memory of
 //!   its own, beside foreign rows only at its two ends where 2 MiB spans several DRAM rows of each bank (§4.6 says where
 //!   it buys less). A placement the kernel declines is counted, and the range is served on base
-//!   pages; a decline likely to hold is remembered until the daemon's reap tick (`ShardsBackings::place`), since each
+//!   pages; a decline likely to hold is remembered until the shard's deadline keeper re-arms it a retry window on (A-570;
+//!   `ShardsBackings::place`), since each
 //!   costs the shard milliseconds of the kernel's compaction. A range is placed only once it is filled and counted, so
 //!   the placed bytes stay within the fill budget.
 //!
@@ -63,8 +71,8 @@
 //! the transport's choosing (its shard's copy slice), one per turn.
 //!
 //! **Bounds.** The store's backings count against its fill budget (`ShardsBackings::set_budget`): a range for each range
-//! a backing has filled, and at least one, what write-through can touch. A backing past the budget is refused, and files
-//! stop being offered DAX before that ([`offer`]).
+//! a backing has filled or left uncleared, and at least one, what write-through can touch and what a part-way fill
+//! stored. A backing past the budget is refused, and files stop being offered DAX before that ([`offer`]).
 //!
 //! Proven through the Shards route by `crates/server/tests/shards.rs` (a real guest on macOS, A-163) and through
 //! slates' own virtio-fs device by `crates/bridge-virtiofs/tests/device.rs`.
@@ -149,7 +157,7 @@ pub struct Counts {
   pub refill_writable: u64,
   /// Ranges placed in one huge page each as their fills finished (§4.6, the backed route's L1; A-193).
   pub placed: u64,
-  /// Ranges whose placement the kernel declined, or that a decline remembered since the daemon's last reap tick passed
+  /// Ranges whose placement the kernel declined, or that a decline remembered until the deadline keeper's re-arm passed
   /// over: they are served on base pages.
   pub placement_refused: u64,
 }
@@ -175,6 +183,9 @@ pub enum Then {
   Serve(u64),
   /// The attachment ends next.
   End,
+  /// Nothing waits on it: the transport goes on as before once the stores are in (a resynced stream's adopted
+  /// backings, ingested before it serves anything, A-365).
+  Resume,
 }
 
 /// A finished ingest.
@@ -198,10 +209,9 @@ struct Fill {
   /// The range being filled, by index, and the last the fill covers.
   next: u64,
   last: u64,
-  /// How far into the range being filled the fill has got, in bytes.
+  /// How far into the range being filled the fill has got, in bytes: more than none once the range's fill began and
+  /// until it finishes.
   progress: u64,
-  /// What the range being filled was charged when its fill began, given back if the fill fails.
-  range_charge: u64,
 }
 
 /// An ingest under way: the guest's stores through its maps of some files compared with the volume over the ranges
@@ -293,19 +303,30 @@ pub fn guarded_layout() -> DaxLayout {
   })
 }
 
-/// Derived: the views of its object a backing may hold at once: the fill budget in pages, the most it can fill.
-fn most_views(backings: &ShardsBackings) -> usize {
+/// Derived: the views of its object a backing may hold at once: the fill budget in pages, the most it can fill. Public
+/// for a backing kept again from a dead daemon's object (A-365), which holds views as one made here does.
+#[must_use]
+pub fn most_views(backings: &ShardsBackings) -> usize {
   usize::try_from(backings.budget().checked_div(DAX_RANGE_BYTES).unwrap_or(0)).unwrap_or(usize::MAX)
 }
 
 /// What a backing counts against the fill budget: a page for each page its filled ranges lie in (one a range under the
 /// identity; under a guard two for a range alone and sixteen for fifteen in a row), at least one. That is what its
-/// placed pages hold resident, so a placement never takes memory the budget does not count.
+/// placed pages hold resident, so a placement never takes memory the budget does not count. A range a fill began and
+/// did not finish counts as a filled one until it is cleared (A-419): its object may hold what the fill stored.
 fn charge_of(backing: &ShardsBacking) -> u64 {
-  backing
-    .object()
-    .layout()
-    .pages_holding(backing.filled().iter().copied())
+  filled_charge(
+    backing.object().layout(),
+    backing.filled().union(backing.uncleared()).copied(),
+  )
+}
+
+/// What a backing in `layout` whose ranges `filled` are filled counts against the fill budget ([`charge_of`]'s rule),
+/// for a backing kept again before it is made (a successor's adoption, A-365).
+#[must_use]
+pub fn filled_charge(layout: DaxLayout, filled: impl IntoIterator<Item = u64>) -> u64 {
+  layout
+    .pages_holding(filled)
     .max(1)
     .saturating_mul(DAX_RANGE_BYTES)
 }
@@ -419,6 +440,33 @@ impl DaxBackingSession {
     self.backings.len()
   }
 
+  /// The inode of the fill under way, if one: the ask its answer will be for.
+  #[must_use]
+  pub fn pending_inode(&self) -> Option<u64> {
+    self.pending.as_ref().map(|pending| pending.inode)
+  }
+
+  /// The backing it holds for `inode`, if one: its handle in the store's registry, which the anchor's hold of its object
+  /// is named by (A-365).
+  #[must_use]
+  pub fn backing_of(&self, inode: u64) -> Option<Handle<ShardsBacking>> {
+    self.backings.get(&inode).copied()
+  }
+
+  /// Takes `handle`, a backing of `inode` kept again in the store (a resynced stream's, adopted from the anchor's hold,
+  /// A-365), as this session's: every ask of the node is answered with its object from now on, and its ranges asked
+  /// writable are what an ingest compares. A backing it holds already for `inode` is kept, and `handle` is not taken.
+  /// Whether it was taken.
+  pub fn adopt(&mut self, inode: u64, handle: Handle<ShardsBacking>) -> bool {
+    match self.backings.entry(inode) {
+      Entry::Vacant(vacant) => {
+        vacant.insert(handle);
+        true
+      }
+      Entry::Occupied(_) => false,
+    }
+  }
+
   /// Whether it backs file `inode`.
   #[must_use]
   pub fn backs(&self, inode: u64) -> bool {
@@ -494,13 +542,13 @@ impl DaxBackingSession {
       next,
       last,
       progress: 0,
-      range_charge: 0,
     });
     Ok(inode)
   }
 
   /// One slice of the pending fill, of at most `slice_bytes`. When the fill is done, the answer is a new descriptor of
-  /// the backing's object. A refusal mid-fill leaves the range unfilled and uncounted, and nothing pending.
+  /// the backing's object. A refusal mid-fill leaves the range uncleared (counted, and cleared before its next fill
+  /// begins; A-419), and nothing pending.
   pub fn fill_step(
     &mut self,
     bridge: &mut dyn Bridge,
@@ -526,19 +574,17 @@ impl DaxBackingSession {
     }
   }
 
-  /// Gives up the pending fill (its attachment is gone): the range being filled is unmarked and its charge given back.
+  /// Gives up the pending fill (its attachment is gone): a range whose fill began is left uncleared, as a refused fill
+  /// leaves it (A-419).
   pub fn abandon_fill(&mut self, backings: &mut ShardsBackings) {
     if let Some(pending) = self.pending.take()
-      && (pending.progress > 0 || pending.range_charge > 0)
-    {
-      if let Some(target) = self
+      && pending.progress > 0
+      && let Some(target) = self
         .backings
         .get(&pending.inode)
         .and_then(|handle| backings.get_mut(*handle))
-      {
-        target.unmark_filled(pending.next);
-      }
-      backings.uncharge(pending.range_charge);
+    {
+      target.mark_uncleared(pending.next);
     }
   }
 
@@ -567,36 +613,31 @@ impl DaxBackingSession {
         return Ok(true);
       }
       if pending.progress == 0 {
-        // The range's fill begins: it is counted, then marked filled, so write-through reaches it from now on.
-        let target = state.backings.get_mut(handle).ok_or(Refused::Object)?;
-        // Readied for the VMM's map first: a Windows section's range is committed whole, past the file's end and over
-        // its holes too, where the fill copies nothing and the VMM's touch would otherwise fault.
-        target
-          .object_mut()
-          .prepare_range(pending.next)
-          .map_err(|_| Refused::Object)?;
-        let before = charge_of(target);
-        target.mark_filled(pending.next);
-        let after = charge_of(target);
-        let delta = after.saturating_sub(before);
-        if !state.backings.charge(delta) {
-          if let Some(target) = state.backings.get_mut(handle) {
-            target.unmark_filled(pending.next);
-          }
-          return Err(Refused::Budget);
-        }
-        pending.range_charge = delta;
+        // The range's fill begins ([`begin_range`]): what an earlier fill owes it is read before it is marked filled.
+        let owed = state
+          .backings
+          .get(handle)
+          .ok_or(Refused::Object)?
+          .owes_clear(pending.next);
+        begin_range(&mut StartingRange {
+          backings: &mut *state.backings,
+          handle,
+          range: pending.next,
+          owed,
+          delta: 0,
+        })?;
       }
     }
     match fill_slice(bridge, cx, handle, pending, slice_bytes) {
       Ok(placement) => self.count_placement(placement),
       Err(refused) => {
-        // A fill that failed part-way leaves the range unfilled and uncounted; the next ask fills it again.
-        if let Some(state) = bridge.dax_state() {
-          if let Some(target) = state.backings.get_mut(handle) {
-            target.unmark_filled(pending.next);
-          }
-          state.backings.uncharge(pending.range_charge);
+        // A fill that failed part-way may have stored bytes the file will not hold when its range is asked again, and
+        // no write reaches a range not filled: it is left uncleared, still counted, and cleared before the next fill
+        // of it begins (A-419).
+        if let Some(state) = bridge.dax_state()
+          && let Some(target) = state.backings.get_mut(handle)
+        {
+          target.mark_uncleared(pending.next);
         }
         return Err(refused);
       }
@@ -1147,6 +1188,104 @@ fn checked(bridge: &mut dyn Bridge, cx: &OpContext, ask: Ask) -> Result<(u64, u6
   Ok((inode, attr.size))
 }
 
+/// The steps that begin one range's fill ([`begin_range`]), each on the range's backing.
+trait RangeStart {
+  /// Marks the range filled, so write-through reaches it from now on, and counts it against the fill budget: whether
+  /// the budget took it. Refused, the range is unmarked and nothing is counted.
+  fn charge(&mut self) -> bool;
+  /// Readies the range for the VMM's map (`DaxObject::prepare_range`: a Windows section's range is committed whole,
+  /// past the file's end and over its holes too, where the fill copies nothing and the VMM's touch would otherwise
+  /// fault): whether the OS took it.
+  fn prepare(&mut self) -> bool;
+  /// Clears what an earlier fill may have left in the range, where one owes it (A-419, A-526), and nothing where none
+  /// does: whether the range reads as one never filled.
+  fn clear(&mut self) -> bool;
+  /// Undoes [`RangeStart::charge`]: the range unmarked and what it took given back.
+  fn uncharge(&mut self);
+}
+
+/// Begins one range's fill, its charge first (A-530): the range is counted against the fill budget before anything is
+/// made for it, so a range the budget refuses is refused `Budget` with nothing readied, cleared or held; then it is
+/// readied for the VMM's map, then cleared where an earlier fill owes it. A readying or a clear the OS refuses gives the
+/// charge back and refuses `Object`. Windows commits a range as it readies it and never gives a section's committed page
+/// back, so a range readied first and then refused its charge stayed committed and counted by nothing, one more range
+/// for every ask the budget refused. A clear refused after a readying is no such leak: only a range A-419 left uncleared
+/// owes a clear on Windows (a backing taken back from a dead daemon, A-526, is a Unix stream's), and it stays counted.
+fn begin_range(start: &mut impl RangeStart) -> Result<(), Refused> {
+  if !start.charge() {
+    return Err(Refused::Budget);
+  }
+  if !start.prepare() || !start.clear() {
+    start.uncharge();
+    return Err(Refused::Object);
+  }
+  Ok(())
+}
+
+/// One range's fill beginning on its backing in the store: [`begin_range`]'s steps for real.
+struct StartingRange<'a> {
+  backings: &'a mut ShardsBackings,
+  handle: Handle<ShardsBacking>,
+  range: u64,
+  /// Whether an earlier fill owes the range a clear ([`ShardsBacking::owes_clear`]), read before the range is marked.
+  owed: bool,
+  /// What the charge took, given back by [`RangeStart::uncharge`].
+  delta: u64,
+}
+
+impl RangeStart for StartingRange<'_> {
+  fn charge(&mut self) -> bool {
+    let Some(target) = self.backings.get_mut(self.handle) else {
+      return false;
+    };
+    // Counted with what it holds before and after: an uncleared range is counted already, so it adds nothing.
+    let before = charge_of(target);
+    target.mark_filled(self.range);
+    let after = charge_of(target);
+    let delta = after.saturating_sub(before);
+    if self.backings.charge(delta) {
+      self.delta = delta;
+      return true;
+    }
+    if let Some(target) = self.backings.get_mut(self.handle) {
+      target.unmark_filled(self.range);
+    }
+    false
+  }
+
+  fn prepare(&mut self) -> bool {
+    self
+      .backings
+      .get_mut(self.handle)
+      .is_some_and(|target| target.object_mut().prepare_range(self.range).is_ok())
+  }
+
+  fn clear(&mut self) -> bool {
+    if !self.owed {
+      return true;
+    }
+    let Some(target) = self.backings.get_mut(self.handle) else {
+      return false;
+    };
+    let cleared = target
+      .object_mut()
+      .zero(self.range.saturating_mul(DAX_RANGE_BYTES), DAX_RANGE_BYTES)
+      .is_ok();
+    if cleared {
+      target.cleared(self.range);
+    }
+    cleared
+  }
+
+  fn uncharge(&mut self) {
+    if let Some(target) = self.backings.get_mut(self.handle) {
+      target.unmark_filled(self.range);
+    }
+    self.backings.uncharge(self.delta);
+    self.delta = 0;
+  }
+}
+
 /// Copies file `inode` up through the bridge before a writable map of it is filled: its size afterwards, the witnessed
 /// file's.
 fn witnessed(bridge: &mut dyn Bridge, cx: &OpContext, inode: u64) -> Result<u64, Refused> {
@@ -1162,8 +1301,8 @@ fn witnessed(bridge: &mut dyn Bridge, cx: &OpContext, inode: u64) -> Result<u64,
 
 /// One slice of the range `pending` is on: read from the volume (holes skipped), stored into the object (pages of zeros
 /// skipped), and the range placed and finished when it is done: how its placement came out, if it finished. A placement
-/// the OS refuses the range's view for fails the slice, the range not yet finished, so the caller unmarks it and gives
-/// its charge back as for any failed slice.
+/// the OS refuses the range's view for fails the slice, the range not yet finished, so the caller leaves it uncleared as
+/// for any failed slice (A-419).
 fn fill_slice(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
@@ -1215,8 +1354,8 @@ fn fill_slice(
 
 /// Places the range a fill has just copied, then moves the fill to its next range (the one done stays marked filled):
 /// how the placement came out (§4.6, the backed route's L1; A-193). Placed once the range is filled, never before: a
-/// fill that fails part-way unmarks its range and gives its charge back, and a huge page placed before it would stay
-/// resident and uncounted. The collapse copies the pages the fill stored.
+/// fill that fails part-way leaves its range uncleared (A-419), and a huge page placed in it would stay resident whole
+/// through its clear, since a placed range is zeroed by stores. The collapse copies the pages the fill stored.
 fn finish_range(
   bridge: &mut dyn Bridge,
   handle: Handle<ShardsBacking>,
@@ -1229,7 +1368,6 @@ fn finish_range(
     .map_err(|_| Refused::Object)?;
   pending.next = pending.next.saturating_add(1);
   pending.progress = 0;
-  pending.range_charge = 0;
   Ok(placement)
 }
 
@@ -1314,6 +1452,446 @@ mod tests {
         (3 * COMPARE_CHUNK - 1, 3 * COMPARE_CHUNK)
       ],
       "a run across a chunk boundary is one run, and an equal chunk between runs parts them"
+    );
+  }
+
+  /// Shape: the store's page in the fill tests.
+  const PAGE: usize = 4096;
+  /// Shape: the pages the store's region maps: room for the files the fill tests write.
+  const REGION_PAGES: usize = 2048;
+  /// Shape: a journal that holds every record the fill tests make.
+  const JOURNAL: usize = 1 << 16;
+  /// Shape: the fill budget, in ranges: more than any fill test counts.
+  const BUDGET_RANGES: u64 = 8;
+  /// Shape: the bytes one fill slice copies: a host page on any host these tests run on (4 KiB to 16 KiB), so a fill of
+  /// a range is part-way after its first slice.
+  const SLICE: u64 = 16 * 1024;
+  /// Shape: the bytes the fill tests write into a range: four slices.
+  const WRITTEN: usize = 4 * 16 * 1024;
+  /// Format: the byte the fill tests' files hold.
+  const BYTE: u8 = 0x41;
+
+  /// A store with the fill budget set, and a plain volume in it of prefix 1.
+  fn store_and_volume() -> (slates_vfs::volume::Store, slates_vfs::volume::Volume) {
+    let mut arena = slates_mem::arena::ChunkArena::new(PAGE);
+    arena
+      .add_region(slates_mem::region::Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    let mut store = slates_vfs::volume::Store::new(
+      &slates_vfs::volume::StoreConfig {
+        page: PAGE,
+        cache_line: 128,
+        max_dirs: 64,
+        max_inodes: 256,
+        max_chunks: REGION_PAGES,
+        max_dir_blocks: 64,
+        dir_cutover: 16,
+      },
+      arena,
+      0,
+    );
+    store
+      .shards_backings
+      .set_budget(BUDGET_RANGES * DAX_RANGE_BYTES);
+    let volume = slates_vfs::volume::Volume::create(
+      &mut store,
+      slates_vfs::volume::VolumeConfig {
+        prefix: 1,
+        names: slates_vfs::names::NameEquivalence::Exact,
+        quota: slates_vfs::quota::Quota::Bounded { limit: 1 << 30 },
+        journal_bytes: JOURNAL,
+        clock: Box::new(slates_vfs::clock::HostClock::default()),
+      },
+    )
+    .unwrap();
+    (store, volume)
+  }
+
+  /// A read-write context of an attachment to the volume `id` names.
+  fn context(id: slates_db::catalog::VolumeId) -> OpContext {
+    let mut attachments = crate::Attachments::new();
+    let attachment = attachments
+      .attach(
+        id,
+        crate::View::Current,
+        slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        crate::Rights {
+          read: true,
+          write: true,
+        },
+      )
+      .unwrap();
+    attachments.context(attachment).unwrap()
+  }
+
+  /// The id the fill tests' bridges serve their volume as.
+  fn volume_id() -> slates_db::catalog::VolumeId {
+    slates_db::catalog::VolumeId { bytes: [0; 16] }
+  }
+
+  /// Asks range `range` of file `node`, read-only, through `session`.
+  fn ask_range(
+    session: &mut DaxBackingSession,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    node: u64,
+    range: u64,
+  ) {
+    let asked = Ask {
+      node,
+      writable: false,
+      range: Some((range * DAX_RANGE_BYTES, DAX_RANGE_BYTES)),
+    };
+    assert_eq!(session.ask(bridge, cx, asked), Ok(node), "the ask is taken");
+  }
+
+  /// Runs the session's pending fill to its end.
+  fn fill_whole(session: &mut DaxBackingSession, bridge: &mut dyn Bridge, cx: &OpContext) {
+    loop {
+      match session.fill_step(bridge, cx, SLICE) {
+        FillStep::Filling => {}
+        FillStep::Done(_) => return,
+        other => panic!("the fill did not complete: {other:?}"),
+      }
+    }
+  }
+
+  /// `len` bytes of file `node`'s object from `at`, read through the store as slates reads it.
+  fn object_bytes(
+    store: &mut slates_vfs::volume::Store,
+    session: &DaxBackingSession,
+    node: u64,
+    (at, len): (u64, usize),
+  ) -> Vec<u8> {
+    let handle = session.backing_of(node).unwrap();
+    let mut bytes = vec![0u8; len];
+    store
+      .shards_backings
+      .get_mut(handle)
+      .unwrap()
+      .object_mut()
+      .load(at, &mut bytes)
+      .unwrap();
+    bytes
+  }
+
+  /// How a test leaves a fill part-way, after its first slice.
+  #[derive(Clone, Copy, Debug)]
+  enum PartWay {
+    /// The bridge refuses the next slice.
+    Refused,
+    /// The transport gives the fill up ([`DaxBackingSession::abandon_fill`]: the Shards route's step when the
+    /// attachment's bridge is gone).
+    Abandoned,
+  }
+
+  /// The fill tests' common course: a file whose range `range` holds [`WRITTEN`] bytes of [`BYTE`]; the range asked and
+  /// filled one slice, then left part-way as `how` says; zeros written over those bytes through the bridge, as another
+  /// path writes them; the range asked again and filled whole. Returns the store, the session and the file's node, and
+  /// what the object held over the bytes written after the first slice (the non-vacuity read: the part-way fill did
+  /// store bytes).
+  fn left_part_way_then_zeroed(
+    range: u64,
+    how: PartWay,
+  ) -> (slates_vfs::volume::Store, DaxBackingSession, u64, Vec<u8>) {
+    let (mut store, mut volume) = store_and_volume();
+    let cx = context(volume_id());
+    let at = range * DAX_RANGE_BYTES;
+    let mut session = DaxBackingSession::new();
+    let node = {
+      let mut bridge = crate::VolumeBridge::new(volume_id(), &mut volume, &mut store);
+      let root = bridge.root(&cx).unwrap();
+      let (file, _) = bridge
+        .create(ObjectId::new(root, 0), &cx, "f", 0o644, 0)
+        .unwrap();
+      bridge
+        .write(ObjectId::new(file.ino, 0), &cx, at, &[BYTE; WRITTEN])
+        .unwrap();
+      if range > 0 {
+        // The ranges before it filled whole first, so the part-way range is counted beyond the backing's floor.
+        ask_range(&mut session, &mut bridge, &cx, file.ino, 0);
+        fill_whole(&mut session, &mut bridge, &cx);
+      }
+      ask_range(&mut session, &mut bridge, &cx, file.ino, range);
+      assert!(
+        matches!(
+          session.fill_step(&mut bridge, &cx, SLICE),
+          FillStep::Filling
+        ),
+        "the first slice is filled and the fill goes on"
+      );
+      file.ino
+    };
+    let first_slice = object_bytes(
+      &mut store,
+      &session,
+      node,
+      (at, usize::try_from(SLICE).unwrap()),
+    );
+    {
+      let mut bridge = crate::VolumeBridge::new(volume_id(), &mut volume, &mut store);
+      match how {
+        PartWay::Refused => {
+          // A context of another volume's attachment, which the bridge refuses as it refuses any read it cannot serve:
+          // the stand-in for a disk's I/O error beneath an overlay part-way through a fill.
+          let foreign = context(slates_db::catalog::VolumeId { bytes: [1; 16] });
+          assert!(
+            matches!(
+              session.fill_step(&mut bridge, &foreign, SLICE),
+              FillStep::Refused(Refused::Object)
+            ),
+            "the bridge refuses the next slice, and the fill with it"
+          );
+        }
+        PartWay::Abandoned => {
+          let state = bridge.dax_state().unwrap();
+          session.abandon_fill(state.backings);
+        }
+      }
+      bridge
+        .write(ObjectId::new(node, 0), &cx, at, &[0; WRITTEN])
+        .unwrap();
+      ask_range(&mut session, &mut bridge, &cx, node, range);
+      fill_whole(&mut session, &mut bridge, &cx);
+    }
+    (store, session, node, first_slice)
+  }
+
+  /// §4.6, the backed route's fill (A-163; A-419): a fill refused part-way leaves its range holding nothing a later fill
+  /// of it shows. Do: write a range of a file with `A`; ask the range, read-only, and fill one slice; have the bridge
+  /// refuse the next slice; write zeros over those bytes through the bridge, as another path writes them; ask the range
+  /// again and fill it whole. Expect the object to read zeros there, as the file does. Before A-419 the slice the
+  /// refused fill stored still read `A` after the second fill: the refusal unmarked the range, so the zeros were never
+  /// written through, and a fill skips the volume's holes and pages of zeros, so the stale page stayed.
+  #[test]
+  fn a_fill_refused_part_way_leaves_nothing_a_later_fill_shows() {
+    let (mut store, session, node, first_slice) = left_part_way_then_zeroed(0, PartWay::Refused);
+    assert!(
+      first_slice.iter().all(|byte| *byte == BYTE),
+      "the refused fill's first slice stored the file's bytes"
+    );
+    assert!(
+      object_bytes(&mut store, &session, node, (0, WRITTEN))
+        .iter()
+        .all(|byte| *byte == 0),
+      "the object shows the file's zeros, not the bytes the refused fill stored"
+    );
+  }
+
+  /// §4.6 (A-419): a fill given up part-way, as the Shards route gives one up when its attachment's bridge is gone,
+  /// leaves its range as a refused fill does. Do: as the refused case, but give the fill up after its first slice. Expect
+  /// the object to read zeros where the file was zeroed.
+  #[test]
+  fn a_fill_abandoned_part_way_leaves_nothing_a_later_fill_shows() {
+    let (mut store, session, node, first_slice) = left_part_way_then_zeroed(0, PartWay::Abandoned);
+    assert!(
+      first_slice.iter().all(|byte| *byte == BYTE),
+      "the abandoned fill's first slice stored the file's bytes"
+    );
+    assert!(
+      object_bytes(&mut store, &session, node, (0, WRITTEN))
+        .iter()
+        .all(|byte| *byte == 0),
+      "the object shows the file's zeros, not the bytes the abandoned fill stored"
+    );
+  }
+
+  /// §4.6, the fill budget (A-419): what a part-way fill stored is counted until its range is filled again or the
+  /// backing goes, so the backings never hold more than the budget counts. Do: fill a file's first range whole; ask its
+  /// second, fill one slice, have the bridge refuse the next; read the count; ask the second range again and fill it
+  /// whole; read the count; let every backing go. Expect two ranges counted after the refusal (the first filled, the
+  /// second holding the slice it stored), two after the second fill, which clears the range rather than count it again,
+  /// and none once let go. Before A-419 the refusal gave the second range's charge back while its slice stayed stored.
+  #[test]
+  fn a_part_way_fill_stays_counted_until_its_range_is_filled_again() {
+    let (mut store, mut volume) = store_and_volume();
+    let cx = context(volume_id());
+    let foreign = context(slates_db::catalog::VolumeId { bytes: [1; 16] });
+    let mut session = DaxBackingSession::new();
+    let mut bridge = crate::VolumeBridge::new(volume_id(), &mut volume, &mut store);
+    let root = bridge.root(&cx).unwrap();
+    let (file, _) = bridge
+      .create(ObjectId::new(root, 0), &cx, "f", 0o644, 0)
+      .unwrap();
+    bridge
+      .write(
+        ObjectId::new(file.ino, 0),
+        &cx,
+        DAX_RANGE_BYTES,
+        &[BYTE; WRITTEN],
+      )
+      .unwrap();
+    ask_range(&mut session, &mut bridge, &cx, file.ino, 0);
+    fill_whole(&mut session, &mut bridge, &cx);
+    ask_range(&mut session, &mut bridge, &cx, file.ino, 1);
+    assert!(matches!(
+      session.fill_step(&mut bridge, &cx, SLICE),
+      FillStep::Filling
+    ));
+    assert!(matches!(
+      session.fill_step(&mut bridge, &foreign, SLICE),
+      FillStep::Refused(Refused::Object)
+    ));
+    let charged =
+      |bridge: &mut crate::VolumeBridge<'_>| bridge.dax_state().unwrap().backings.charged();
+    assert_eq!(
+      charged(&mut bridge),
+      2 * DAX_RANGE_BYTES,
+      "the refused range is still counted: its first slice is stored"
+    );
+    ask_range(&mut session, &mut bridge, &cx, file.ino, 1);
+    fill_whole(&mut session, &mut bridge, &cx);
+    assert_eq!(
+      charged(&mut bridge),
+      2 * DAX_RANGE_BYTES,
+      "filled again, the range is counted once"
+    );
+    let state = bridge.dax_state().unwrap();
+    session.release_all(state.backings);
+    assert_eq!(charged(&mut bridge), 0, "let go, nothing is counted");
+  }
+
+  /// A-526 (A-365's adoption; A-419's sibling): a backing taken back from a dead daemon's object fills a range its
+  /// range table does not name from the volume as it is, whatever that daemon's fill left there. The table names a range
+  /// only once its ask is answered, so the range a daemon was filling when it died, or one whose fill it had refused, is
+  /// not named, and its object may hold that fill's bytes. Do: make an object and store `A` over a range's first slice,
+  /// as a fill does before its daemon dies; take it back into the store with no range named, as a successor does; write
+  /// zeros over the file's bytes there through the bridge; ask the range through the session that took the backing
+  /// back, and fill it whole. Expect the object to read zeros there, as the file does. Before, the fill skipped the
+  /// volume's pages of zeros, and the dead daemon's bytes stayed for the guest's map.
+  #[test]
+  fn a_range_a_dead_daemons_fill_left_part_way_reads_the_volume_once_filled_again() {
+    let (mut store, mut volume) = store_and_volume();
+    let cx = context(volume_id());
+    let node = {
+      let mut bridge = crate::VolumeBridge::new(volume_id(), &mut volume, &mut store);
+      let root = bridge.root(&cx).unwrap();
+      let (file, _) = bridge
+        .create(ObjectId::new(root, 0), &cx, "f", 0o644, 0)
+        .unwrap();
+      bridge
+        .write(ObjectId::new(file.ino, 0), &cx, 0, &[BYTE; WRITTEN])
+        .unwrap();
+      file.ino
+    };
+    let mut object =
+      DaxObject::create(most_views(&store.shards_backings), DaxLayout::Identity).unwrap();
+    let slice = usize::try_from(SLICE).unwrap();
+    object.store(0, &vec![BYTE; slice]).unwrap();
+    let handle = store
+      .shards_backings
+      .adopt_vmm(
+        object,
+        (volume.prefix(), InodeNo(node)),
+        (0, 0),
+        (Default::default(), Default::default()),
+        filled_charge(DaxLayout::Identity, []),
+      )
+      .unwrap();
+    assert!(
+      store.shards_backings.wake(handle),
+      "the backing takes changes again"
+    );
+    let mut session = DaxBackingSession::new();
+    assert!(
+      session.adopt(node, handle),
+      "the session takes the backing back"
+    );
+    assert!(
+      object_bytes(&mut store, &session, node, (0, WRITTEN))[..slice]
+        .iter()
+        .all(|byte| *byte == BYTE),
+      "the object holds the dead daemon's fill"
+    );
+    {
+      let mut bridge = crate::VolumeBridge::new(volume_id(), &mut volume, &mut store);
+      bridge
+        .write(ObjectId::new(node, 0), &cx, 0, &[0; WRITTEN])
+        .unwrap();
+      ask_range(&mut session, &mut bridge, &cx, node, 0);
+      fill_whole(&mut session, &mut bridge, &cx);
+    }
+    assert!(
+      object_bytes(&mut store, &session, node, (0, WRITTEN))
+        .iter()
+        .all(|byte| *byte == 0),
+      "the object shows the file's zeros, not the bytes the dead daemon's fill left"
+    );
+  }
+
+  /// A run of [`begin_range`]'s steps, each answering as the test says, recorded in the order they ran.
+  struct Recorded {
+    steps: Vec<&'static str>,
+    takes: bool,
+    prepares: bool,
+    clears: bool,
+  }
+
+  impl RangeStart for Recorded {
+    fn charge(&mut self) -> bool {
+      self.steps.push("charge");
+      self.takes
+    }
+
+    fn prepare(&mut self) -> bool {
+      self.steps.push("prepare");
+      self.prepares
+    }
+
+    fn clear(&mut self) -> bool {
+      self.steps.push("clear");
+      self.clears
+    }
+
+    fn uncharge(&mut self) {
+      self.steps.push("uncharge");
+    }
+  }
+
+  /// A-530 (§4.6, the fill budget; A-419's sibling): a range's fill is charged before anything is made for it, on every
+  /// host. Do: begin a range whose charge the budget refuses; one whose readying the OS refuses; one whose clear it
+  /// refuses; one that begins whole. Expect the refused charge to stop the start `Budget` before any readying or clear;
+  /// a readying or a clear refused after the charge to give the charge back and refuse `Object`; and a whole start to
+  /// charge, ready and clear, in that order. Windows commits a range as it readies it and never gives a section's
+  /// committed page back, so before, a range readied first and then refused `Budget` stayed committed and counted by
+  /// nothing: one more range for every ask the budget refused, up to the object's size.
+  #[test]
+  fn a_range_is_charged_before_anything_is_made_for_it() {
+    let started = |takes, prepares, clears| {
+      let mut recorded = Recorded {
+        steps: Vec::new(),
+        takes,
+        prepares,
+        clears,
+      };
+      let outcome = begin_range(&mut recorded);
+      (outcome, recorded.steps)
+    };
+    assert_eq!(
+      started(false, true, true),
+      (Err(Refused::Budget), vec!["charge"]),
+      "a range the budget refuses has nothing made for it"
+    );
+    assert_eq!(
+      started(true, false, true),
+      (Err(Refused::Object), vec!["charge", "prepare", "uncharge"]),
+      "a readying the OS refuses gives the charge back"
+    );
+    assert_eq!(
+      started(true, true, false),
+      (
+        Err(Refused::Object),
+        vec!["charge", "prepare", "clear", "uncharge"]
+      ),
+      "a clear the OS refuses gives the charge back"
+    );
+    assert_eq!(
+      started(true, true, true),
+      (Ok(()), vec!["charge", "prepare", "clear"]),
+      "a whole start charges, readies and clears, in that order"
     );
   }
 }

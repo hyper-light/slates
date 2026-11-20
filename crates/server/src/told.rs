@@ -35,8 +35,15 @@
 //!
 //! **The bound.** A mount whose round cannot complete — its notification waiting in its kernel on a request the shard
 //! cannot answer yet, a kernel that never processes it — must not hold its writers for ever (A-141 weighed exactly this).
-//! A writer waits at most [`TOLD_WAIT_NS`], then is answered anyway, its change already applied and published, and the
-//! late mount counted (`fuse.told_overdue`, zero the healthy reading).
+//! A writer waits at most [`bound_ns`], then is answered anyway, its change already applied and published, and the late
+//! mount counted (`fuse.told_overdue`, zero the healthy reading). The bound is learned (A-431), as RFC 6298 learns a
+//! retransmission timeout: the tail of the told waits the shard measured, plus a liveness window, the lateness a live
+//! party may show before it is judged (A-228); a wait cut short at its bound is not a sample (Karn's rule) but doubles the
+//! bound for the next (RFC 6298 §5.5), up to the node's failover delay, the most a reply is held (A-354, A-375); the next
+//! wait that completes ends the back-off. So a machine whose mounts are told slowly is waited for at its own pace, and a
+//! mount that never answers holds each writer at most a failover delay. Until A-431 the bound was half a liveness window
+//! on the wall, so that a writer held to it kept half its client's reply deadline; since 2026-11-13 a client waits for a
+//! live daemon's answer however long (A-232).
 //!
 //! **What waits on nothing.** A writer that made no record, a volume with no FUSE mount, a mount whose kernel holds
 //! nothing yet, and every platform but Linux (its FUSE mounts are the only kernel caches told this way; [`told`]).
@@ -56,19 +63,22 @@ use slates_ipc::protocol::ReplyBody;
 use crate::merge_service::ReplyRoute;
 use crate::state::{self, ShardState};
 
-/// Derived: how long a writer outside FUSE waits for every FUSE mount of its volume to have been told of its change
-/// (AC-3.3) before it is answered anyway, counted: half the liveness budget (`daemon::LIVENESS_BUDGET_NS /
-/// daemon::LATE_BEAT_SHARE`). That is the longest the daemon lets one of its own shards go unheard before it logs the
-/// gap as a near miss, so a live mount told late on a loaded machine still holds its writer. And a writer held to the
-/// bound keeps the other half of its client's reply deadline, which is the same liveness budget
-/// (`slates_client::Deadlines`): past that deadline the client reports the verb stalled.
-pub(crate) const TOLD_WAIT_NS: u64 =
-  crate::daemon::LIVENESS_BUDGET_NS / crate::daemon::LATE_BEAT_SHARE;
+/// The told waits a shard measured (AC-3.3, A-431): the shared learner (`crate::learned_wait::LearnedWait`, A-442),
+/// per shard, so a busy host's mounts, told late but told, are waited for at their pace.
+pub(crate) type ToldTimes = crate::learned_wait::LearnedWait;
+
+/// The bound a writer on this shard waits for its volume's FUSE mounts now (`LearnedWait::bound_ns`), backed off no
+/// further than the node's failover delay (`ShardState::failover_ns`, A-363): a reply held for its mounts is a held
+/// reply, whose total is the failover delay (A-354, A-375). Read by every writer's wait ([`wait`]), a guest device's held
+/// reply (`crate::virtiofs`, A-196) and a revocation's wait for its fenced mounts (`crate::verbs`).
+pub(crate) fn bound_ns(s: &ShardState) -> u64 {
+  s.told_times.bound_ns(s.failover_ns)
+}
 
 /// Format: the counter of writers whose reply waited for their volume's FUSE mounts to be told (AC-3.3): the wait's
 /// non-vacuity count.
 const WAITED: &str = "fuse.told_waits";
-/// Format: the counter of waits that reached [`TOLD_WAIT_NS`] with a FUSE mount still untold, the writer answered
+/// Format: the counter of waits that reached their bound ([`bound_ns`]) with a FUSE mount still untold, the writer answered
 /// anyway. Zero is the healthy reading; movement means a mount's notifications stalled.
 const OVERDUE: &str = "fuse.told_overdue";
 /// Format: the counter of writers answered without waiting although a FUSE mount had not been told: no task could be
@@ -94,7 +104,7 @@ pub(crate) struct Owed {
 pub(crate) enum Waited {
   /// Every FUSE mount of the volume was told.
   Told,
-  /// [`TOLD_WAIT_NS`] passed first, or no deadline could be armed.
+  /// The bound ([`bound_ns`]) passed first, or no deadline could be armed.
   Overdue,
 }
 
@@ -183,6 +193,9 @@ pub(crate) fn count_settled(s: &mut ShardState, waited: u64, overdue: u64) {
   s.count(WAITED, waited.saturating_add(overdue));
   if overdue > 0 {
     s.count(OVERDUE, overdue);
+    // A device's reply published at the bound backs it off as a writer's overdue wait does; its told replies carry no
+    // duration, so they are no samples.
+    s.told_times.ran_out();
   }
 }
 
@@ -209,17 +222,26 @@ pub(crate) fn wake(s: &ShardState, volume: VolumeId) {
   }
 }
 
-/// Waits on this shard — the volume's owner — until every FUSE mount of the owed volume has been told, or
-/// [`TOLD_WAIT_NS`] has passed, without blocking the shard. Counted.
+/// Waits on this shard — the volume's owner — until every FUSE mount of the owed volume has been told, or the bound
+/// ([`bound_ns`]) has passed, without blocking the shard. Counted, and learned from: a told wait is a sample of the
+/// shard's told times, an overdue one backs the bound off ([`ToldTimes`]).
 pub(crate) async fn wait(owed: Owed) -> Waited {
-  let late = match slates_rt::futures::within(TOLD_WAIT_NS, Parked { owed, id: None }).await {
+  let bound = state::with_state(|s| bound_ns(s)).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  let began = slates_rt::futures::now_ns();
+  let late = match slates_rt::futures::within(bound, Parked { owed, id: None }).await {
     Ok(Some(())) => None,
     Ok(None) => Some(OVERDUE),
     // No deadline could be armed (off a shard): the writer is answered at once.
     Err(_) => Some(UNWAITED),
   };
+  let waited_ns = slates_rt::futures::now_ns().saturating_sub(began);
   let _ = state::with_state_counted(|s| {
     s.count(WAITED, 1);
+    match late {
+      None => s.told_times.completed(waited_ns),
+      Some(OVERDUE) => s.told_times.ran_out(),
+      Some(_) => {}
+    }
     if let Some(kind) = late {
       s.count(kind, 1);
     }
@@ -251,7 +273,7 @@ pub(crate) fn hold_until_told(
     let _ = wait(owed).await;
     let held = state::with_state_counted(|s| s.told_waiters.held.remove(&id)).flatten();
     if let Some((route, reply)) = held {
-      deliver_to(route, reply, here).await;
+      deliver_to(route, reply, here);
     }
   };
   match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
@@ -266,15 +288,14 @@ pub(crate) fn hold_until_told(
 
 /// Delivers a held reply where its request waits: on this shard's ring when its client is served here, else as a task
 /// on the client's shard, waiting for room as every reply carried home does (`crate::xshard::send_back`).
-async fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
+pub(crate) fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
   if route.shard == here {
     state::deliver(route.client_index, route.request, reply, true);
     return;
   }
   crate::xshard::send_reply_home(route.shard, move || {
     state::deliver(route.client_index, route.request, reply, true);
-  })
-  .await;
+  });
 }
 
 /// One writer's wait: ready once every FUSE mount of the owed volume has been told; parked in the shard's

@@ -781,7 +781,7 @@ fn retained_versions_counts_the_snapshot_pinned_inode_versions() {
 }
 
 /// AC (§4.2 retention charge): a diverging write that would pin an inode version past the retention
-/// allowance is refused with `NoSpace` before the copy-up — so one volume's snapshots cannot consume
+/// allowance is refused `RetentionExceeded` (once `NoSpace`) before the copy-up — so one volume's snapshots cannot consume
 /// the shared version slab past their bound — and the refused write changes nothing. Below the
 /// allowance a diverging write succeeds; destroying the snapshot releases the pinned versions. The
 /// allowance is unbounded by default, so only a volume an owner has bounded is affected.
@@ -803,7 +803,10 @@ fn the_retention_allowance_refuses_a_diverging_write_past_the_bound() {
 
   // Diverging `b` would pin a second — refused, and nothing changes.
   assert!(
-    matches!(vol.write(&mut src, b, 0, b"b2"), Err(VfsError::NoSpace)),
+    matches!(
+      vol.write(&mut src, b, 0, b"b2"),
+      Err(VfsError::RetentionExceeded)
+    ),
     "a diverging write past the retention allowance is refused"
   );
   assert_eq!(
@@ -1090,6 +1093,11 @@ fn dropping_a_recovered_snapshot_frees_its_tree() {
     .write(&mut src, f, 0, b"content the snapshot keeps")
     .unwrap();
   let snap = vol.snapshot(&mut src).unwrap();
+  // The head rewrites `f` after the snapshot, so the snapshot holds its own version of it; the directory is unchanged
+  // and shared with the head, as the live volume shares it (A-395).
+  vol
+    .write(&mut src, f, 0, b"content the head rewrote after it")
+    .unwrap();
 
   let image = vol.to_image(&src, None).unwrap();
   let mut fresh = common::surviving(&src);
@@ -1104,8 +1112,8 @@ fn dropping_a_recovered_snapshot_frees_its_tree() {
   )
   .unwrap();
 
-  // The recovered snapshot is an independent tree (its own root and file inode), so dropping it must
-  // free those inode slab slots. An empty deadlist (the bug) would free nothing.
+  // The recovered snapshot holds its own version of `f`, so dropping it must free that inode's slab slot. An empty
+  // deadlist (the bug) would free nothing.
   let before = fresh.inodes.len();
   recovered.destroy_snapshot(&mut fresh, snap).unwrap();
   let after = fresh.inodes.len();
@@ -1169,8 +1177,9 @@ fn dropping_a_recovered_snapshot_leaves_the_head_readable() {
 
 /// AC (§4.2/§4.8): a recovered snapshot shares an unchanged file's inode with the head rather than
 /// rebuilding a private copy, so the store holds it once. Head = root, a, b (3 inodes); the snapshot
-/// adds its own root and its own older `b` (2), and shares `a` with the head — so five inodes, not
-/// six. With sharing disabled this would be six, which makes the test non-vacuous.
+/// adds its own older `b` (1), and shares `a` and the root directory with the head, which the head did not change
+/// (rewriting `b` changes `b` alone) — so four inodes, as the live volume holds them. With no sharing this would be six,
+/// and with the root rebuilt privately, as it was until A-395, five.
 #[test]
 fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
   let mut src = store();
@@ -1197,8 +1206,69 @@ fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
   .unwrap();
   assert_eq!(
     fresh.inodes.len(),
-    5,
-    "the snapshot shares the unchanged file's inode with the head (six without sharing)"
+    4,
+    "the snapshot shares the unchanged file and directory with the head (six without sharing)"
+  );
+}
+
+/// §4.2, §4.8 (A-395): a recovered snapshot shares with the head the directories the head has not changed, as the live
+/// volume does, and the head's first change to one after recovery copies it, so the snapshot never sees the change and
+/// keeps the old version, retained, exactly as the live volume would. Do: a volume holding `d/x`; snapshot it; recover
+/// it; then create `d/y` in the live volume and in the recovered one. Expect recovery to hold the inodes the live volume
+/// held (none for the snapshot's directories, which it shares); `d/y` in the recovered head and not in its snapshot,
+/// which still holds `d/x`; and the recovered volume's retained versions equal to the live volume's after the same
+/// change, and more than none. Red before A-395: recovery held a private root and `d` for the snapshot.
+#[test]
+fn a_head_change_after_recovery_copies_a_directory_the_snapshot_shares() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let d = vol.mkdir_no(&mut src, root, "d", 0o755).unwrap();
+  let x = vol.create_file_no(&mut src, d, "x", 0o644).unwrap();
+  vol.write(&mut src, x, 0, b"x").unwrap();
+  let snap = vol.snapshot(&mut src).unwrap();
+  let live_inodes = src.inodes.len();
+
+  let image = vol.to_image(&src, None).unwrap();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  let recovered_inodes = fresh.inodes.len();
+
+  vol.create_file_no(&mut src, d, "y", 0o644).unwrap();
+  recovered.create_file_no(&mut fresh, d, "y", 0o644).unwrap();
+  assert_eq!(
+    recovered_inodes, live_inodes,
+    "recovery holds the inodes the live volume held: the snapshot's directories are the head's"
+  );
+  assert!(
+    recovered.resolve(&fresh, "/d/y").is_ok(),
+    "the recovered head holds the new file"
+  );
+  assert!(
+    recovered.resolve_in(&fresh, snap, "/d/y").is_err(),
+    "the snapshot never sees the head's change to a directory it shared"
+  );
+  assert!(
+    recovered.resolve_in(&fresh, snap, "/d/x").is_ok(),
+    "the snapshot still holds its own file"
+  );
+  assert_eq!(
+    recovered.retained_versions(),
+    vol.retained_versions(),
+    "the snapshot retains the old directories as the live volume's does"
+  );
+  assert!(
+    vol.retained_versions() > 0,
+    "the change copied directories the snapshot holds (the case meant)"
   );
 }
 
@@ -1302,9 +1372,10 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
   );
   assert_eq!(
     fresh.inodes.len(),
-    5,
-    "the shared version is one inode across both snapshots (head root, head f, root a, shared f, \
-     root b); an independent copy per snapshot would be six"
+    3,
+    "the shared version is one inode across both snapshots, and the root, which the head never changed, is the \
+     head's in both (head root, head f, shared f), as the live volume holds them; a private root per snapshot made it \
+     five until A-395, and an independent copy per snapshot six"
   );
   let mut buf = vec![0u8; 16];
   let n = recovered.read_in(&fresh, snap_a, f, 0, &mut buf).unwrap();
@@ -1330,6 +1401,70 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
     "dropping snapshot a does not free snapshot b's copy of the shared version"
   );
   recovered.destroy_snapshot(&mut fresh, snap_b).unwrap();
+}
+
+/// §4.8, the cross-snapshot dedup, and A-294: a version is shared with an earlier snapshot's only when it is that
+/// version, never because its bytes match. Do: make a file, a FIFO and a device node; snapshot; change only each one's
+/// mode; snapshot again; change each mode once more in the head, so both snapshots hold versions that diverged from the
+/// head with the bytes (or the empty body, or the device number) of the first; recover. Expect each snapshot's own
+/// modes and the head's, and the rebuilt volume to image as the original did.
+#[test]
+fn a_version_that_differs_only_in_its_attributes_keeps_them_through_recovery() {
+  use slates_vfs::inode::{DeviceNumber, SpecialNode};
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let file = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, file, 0, b"stable-value").unwrap();
+  let pipe = vol
+    .mknod_no(&mut src, root, "p", 0o644, SpecialNode::Fifo)
+    .unwrap();
+  let disk = vol
+    .mknod_no(
+      &mut src,
+      root,
+      "d",
+      0o644,
+      SpecialNode::BlockDevice(DeviceNumber::new(8, 1)),
+    )
+    .unwrap();
+  let nodes = [file, pipe, disk];
+  let snap_a = vol.snapshot(&mut src).unwrap();
+  for no in nodes {
+    vol.chmod(&mut src, no, 0o600).unwrap();
+  }
+  let snap_b = vol.snapshot(&mut src).unwrap();
+  for no in nodes {
+    vol.chmod(&mut src, no, 0o640).unwrap();
+  }
+  let image = vol.to_image(&src, None).unwrap();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  for no in nodes {
+    assert_eq!(
+      (
+        recovered.stat_in(&fresh, snap_a, no).unwrap().mode,
+        recovered.stat_in(&fresh, snap_b, no).unwrap().mode,
+        recovered.stat(&fresh, no).unwrap().mode
+      ),
+      (0o644, 0o600, 0o640),
+      "inode {no:?}: each snapshot's mode and the head's survive recovery"
+    );
+  }
+  assert_eq!(
+    recovered.to_image(&fresh, None).unwrap(),
+    image,
+    "the rebuilt volume images as the original"
+  );
 }
 
 /// AC (§4.8): a version shared across a chain of snapshots recovers as one inode and survives being
@@ -1365,8 +1500,9 @@ fn a_shared_version_survives_newest_first_drops_with_slot_reuse() {
   .unwrap();
   assert_eq!(
     fresh.inodes.len(),
-    6,
-    "one shared version, not one per snapshot: head root, head f, three snapshot roots, one shared f"
+    3,
+    "one shared version, not one per snapshot, and the root the head never changed shared by all three: head root, \
+     head f, one shared f (a private root per snapshot made it six until A-395)"
   );
 
   let mut buf = vec![0u8; 16];
@@ -2245,13 +2381,24 @@ fn streamed_shard(store: &mut Store) -> StreamedShard {
       reply: b"r4".to_vec(),
     },
   ];
-  (volumes, b"held replica image bytes".to_vec(), replies)
+  // Two held pieces (A-270), out of key order, so the streamed encoder's sort is compared too.
+  let held = vec![
+    slates_vfs::recover::HeldPiece {
+      key: [7; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"a later held piece".to_vec(),
+    },
+    slates_vfs::recover::HeldPiece {
+      key: [2; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"an earlier held piece".to_vec(),
+    },
+  ];
+  (volumes, held, replies)
 }
 
-/// A streamed shard's volumes by key, its held bytes and its replies.
+/// A streamed shard's volumes by key, its held pieces and its replies.
 type StreamedShard = (
   Vec<([u8; 16], Volume)>,
-  Vec<u8>,
+  Vec<slates_vfs::recover::HeldPiece>,
   Vec<slates_vfs::recover::HeldReply>,
 );
 
@@ -2267,7 +2414,7 @@ fn stream_into(
   slots: &mut Vec<u8>,
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &[u8],
+  held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
@@ -2294,7 +2441,7 @@ fn stream_into(
 fn shard_of(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &[u8],
+  held: &[slates_vfs::recover::HeldPiece],
   (replies, calls, nfs_replies, nfs_states): (
     &[slates_vfs::recover::HeldReply],
     &[slates_vfs::recover::HeldCall],
@@ -2395,7 +2542,7 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
     &mut slots,
     &store,
     &volumes,
-    &held,
+    &mut held.clone(),
     (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
   )
   .unwrap();
@@ -2437,7 +2584,7 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     &mut slots,
     &store,
     &small_sorted,
-    &[],
+    &mut Vec::new(),
     (
       &mut Vec::new(),
       &mut Vec::new(),
@@ -2558,7 +2705,7 @@ fn a_writes_accounting_equals_a_recount_after_every_step() {
 
 /// A-262. Do: create a file (the volume marks it `ARCHIVE`, as NTFS does), set `HIDDEN | SYSTEM` on a second and
 /// `READONLY | HIDDEN` on a directory, ask for a third file's `READONLY` (dropped: a file's read-only state is its
-/// mode), then image the volume, decode the image from its bytes and rebuild a volume from it. Expect: the image
+/// mode), and `HIDDEN | DIRECTORY` on a symlink (a Windows directory link, A-275), then image the volume, decode the image from its bytes and rebuild a volume from it. Expect: the image
 /// carries each inode's bits at Windows' values, and the rebuilt volume reports the same bits.
 #[test]
 fn windows_attributes_survive_an_image_and_a_rebuild() {
@@ -2575,6 +2722,7 @@ fn windows_attributes_survive_an_image_and_a_rebuild() {
     .create_file_no(&mut store, root, "readonly", 0o644)
     .unwrap();
   let dir = vol.mkdir_no(&mut store, root, "dir", 0o755).unwrap();
+  let link = vol.symlink_no(&mut store, root, "link", "dir").unwrap();
   let set = |bits: u32, kind| WindowsAttributes::kept(bits, kind);
   let file = slates_vfs::inode::Kind::File;
   vol
@@ -2590,11 +2738,19 @@ fn windows_attributes_survive_an_image_and_a_rebuild() {
       set(0x1 | 0x2 | 0x10, slates_vfs::inode::Kind::Dir),
     )
     .unwrap();
+  vol
+    .set_windows_attributes(
+      &mut store,
+      link,
+      set(0x2 | 0x10 | 0x400, slates_vfs::inode::Kind::Symlink),
+    )
+    .unwrap();
   let expected = [
     (archived, 0x20),
     (hidden, 0x2 | 0x4),
     (readonly, 0x20),
     (dir, 0x1 | 0x2),
+    (link, 0x2 | 0x10),
     (root, 0),
   ];
   let image = vol.to_image(&store, None).unwrap();

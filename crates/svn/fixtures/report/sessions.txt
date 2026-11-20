@@ -1,0 +1,68 @@
+checkout-r1: checkout -r1 svn://127.0.0.1/repo/trunk wc-a
+  exit 0
+update-to-head: update wc-a
+  exit 0
+switch-to-branch: switch svn://127.0.0.1/repo/branches/b1 wc-a
+  exit 0
+checkout-depth-empty: checkout --depth empty svn://127.0.0.1/repo/trunk wc-b
+  exit 0
+update-set-depth-infinity: update --set-depth infinity wc-b
+  exit 0
+checkout-depth-immediates: checkout --depth immediates svn://127.0.0.1/repo/trunk wc-h
+  exit 0
+update-depth-files: update --depth files wc-h
+  exit 0
+checkout-head: checkout svn://127.0.0.1/repo/trunk wc-c
+  exit 0
+update-file-to-r2: update -r2 wc-c/a.txt
+  exit 0
+update-mixed-revisions: update wc-c
+  exit 0
+checkout-r2: checkout -r2 svn://127.0.0.1/repo/trunk wc-d
+  exit 0
+status-u: status -u wc-d
+  exit 0
+diff-r1-r6: diff -r 1:6 svn://127.0.0.1/repo/trunk
+  exit 0
+checkout-for-switch: checkout svn://127.0.0.1/repo/trunk wc-e
+  exit 0
+switch-subtree: switch svn://127.0.0.1/repo/branches/b1/dir wc-e/dir
+  exit 0
+update-with-link: update wc-e
+  exit 0
+checkout-for-not-present: checkout svn://127.0.0.1/repo/trunk wc-f
+  exit 0
+update-subtree-to-r1: update -r1 wc-f/dir/sub
+  exit 0
+update-with-not-present: update wc-f
+  exit 0
+checkout-for-lock: checkout svn://127.0.0.1/repo/trunk wc-g
+  exit 0
+lock-a: lock --username alice --password secret -m held wc-g/a.txt
+  exit 0
+update-with-lock: update wc-g
+  exit 0
+update-with-broken-lock: update wc-g
+  exit 0
+hostile-report-unknown-command: (written by this script)
+hostile-report-first-not-root: (written by this script)
+hostile-report-missing-path: (written by this script)
+hostile-report-bad-depth: (written by this script)
+hostile-report-link-elsewhere: (written by this script)
+hostile-report-abort: (written by this script)
+hostile-update-depth-exclude: (written by this script)
+hostile-report-delete-root: (written by this script)
+hostile-report-revision-past-head: (written by this script)
+hostile-update-target-absent: (written by this script)
+hostile-report-malformed-set-path: (written by this script)
+hostile-report-early-edit-response: (written by this script)
+hostile-report-client-refuses-the-edit: (written by this script)
+hostile-update-copy-sources: (written by this script)
+hostile-checkout-copy-sources: (written by this script)
+read-auth-cat: cat --username alice --password secret svn://127.0.0.1/repo/trunk/secret/s.txt
+  exit 0
+read-auth-ls: ls --username alice --password secret svn://127.0.0.1/repo/trunk/secret
+  exit 0
+read-auth-cat-bob: cat --username bob --password bob's secret svn://127.0.0.1/repo/trunk/secret/s.txt
+  exit 1
+  stderr: svn: E170001: Authorization failed

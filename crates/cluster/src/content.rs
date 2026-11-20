@@ -825,6 +825,31 @@ pub struct ContentHold {
   /// Set while a refused rebuild gives everything back ([`ContentHold::abandon`]): its blocks are claims of content
   /// that survived the restart, so they go back with their bytes ([`ChunkArena::give_back`]), never scrubbed.
   giving_back: bool,
+  /// The pieces of the hold's image changed since [`ContentHold::clear_changes`] (A-376): every chunk stored or
+  /// released, every manifest held, placed again or forgotten, every stage opened, grown or closed. A holder's
+  /// publication carries these and nothing else of the hold. Bounded by what changed since its last committed
+  /// publication, which clears them.
+  changed: BTreeSet<HoldPiece>,
+}
+
+/// One piece of a hold's image (A-376): a stored chunk by its identity, a held manifest by its object and identity, or
+/// an object's stage. A holder's recovery image carries each as its own piece, so a publication carries what changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HoldPiece {
+  /// A stored chunk.
+  Chunk([u8; 32]),
+  /// A manifest held for an object.
+  Manifest(ObjectId, [u8; 32]),
+  /// An object's transfer in progress.
+  Stage(ObjectId),
+}
+
+/// The image of one held manifest as its own piece (A-376): its identity, which orders the pieces back into the
+/// canonical image, and its [`ManifestImage`].
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+struct ManifestPiece {
+  identity: [u8; 32],
+  image: ManifestImage,
 }
 
 /// What a claimed block holds, as the image names it (A-64): a chunk's payload by its identity, or a manifest-only
@@ -874,10 +899,16 @@ enum Opened {
   Missing(Vec<[u8; 32]>),
 }
 
-/// One object's held content: its manifests and how many of them reference each chunk.
+/// One object's held content: its manifests, the same manifests by the sequence each was placed for, and how many of
+/// them reference each chunk.
 #[derive(Debug, Default)]
 struct Held {
   manifests: BTreeMap<[u8; 32], HeldManifest>,
+  /// Each manifest's placed sequence and identity (A-372): what lets the retention rule judge only the content placed at
+  /// or past a sequence ([`ContentHold::retain_placed_from`]) and read the newest placement in one step
+  /// ([`ContentHold::newest_placed`]), where both walked every manifest the object held. Changed wherever `manifests`
+  /// is, and charged with it ([`manifest_entry_bytes`]).
+  by_sequence: BTreeSet<(u64, [u8; 32])>,
   chunks: BTreeMap<[u8; 32], u64>,
 }
 
@@ -900,21 +931,58 @@ pub struct Placed {
   pub sequence: u64,
 }
 
+/// A held manifest's image (AUD-29-59, A-64): its object, the sequence it was last placed for, its archive's block.
+fn manifest_image(object: ObjectId, record: &HeldManifest) -> ManifestImage {
+  ManifestImage {
+    object: object.0,
+    sequence: record.placed.sequence,
+    archive: BlockRef::of(&record.extent, record.len),
+  }
+}
+
+/// A stored chunk's image (AUD-29-59, A-64): its fields and its payload's block.
+fn chunk_image(identity: &[u8; 32], stored: &StoredChunk) -> ChunkImage {
+  ChunkImage {
+    identity: *identity,
+    raw_len: stored.raw_len,
+    stored_len: stored.stored_len,
+    encoding: stored.encoding.to_wire(),
+    level: stored.level,
+    dictionary: stored.dictionary,
+    payload: BlockRef::of(
+      &stored.extent,
+      usize::try_from(stored.stored_len).unwrap_or(usize::MAX),
+    ),
+  }
+}
+
+/// A stage's image (AUD-29-55, A-64): its object, its placement, its manifest's block and the chunks it has verified.
+fn stage_image(object: ObjectId, stage: &Stage) -> StageImage {
+  StageImage {
+    object: object.0,
+    sequence: stage.placed.sequence,
+    archive: BlockRef::of(&stage.extent, stage.len),
+    staged: stage.staged.iter().copied().collect(),
+  }
+}
+
 /// The index cost of a new stored chunk.
 fn chunk_entry_bytes() -> u64 {
   btree_entry_bytes::<[u8; 32], StoredChunk>()
 }
 
-/// The index cost of a new object: its entry and the roots of its two maps.
+/// The index cost of a new object: its entry and the roots of its three maps.
 fn object_entry_bytes() -> u64 {
   btree_entry_bytes::<ObjectId, Held>()
     .saturating_add(btree_map_bytes::<[u8; 32], HeldManifest>())
+    .saturating_add(btree_map_bytes::<(u64, [u8; 32]), ()>())
     .saturating_add(btree_map_bytes::<[u8; 32], u64>())
 }
 
-/// The index cost of a new manifest for an object.
+/// The index cost of a new manifest for an object: its entry and its entry by placed sequence (A-372).
 fn manifest_entry_bytes() -> u64 {
   btree_entry_bytes::<[u8; 32], HeldManifest>()
+    .saturating_add(btree_entry_bytes::<(u64, [u8; 32]), ()>())
 }
 
 /// The index cost of an object's reference to a chunk.
@@ -1178,12 +1246,13 @@ impl ContentHold {
     manifest: &Archive,
   ) -> Result<(Opened, bool), ContentRefusal> {
     let identity = manifest.manifest_identity();
-    if let Some(record) = self
-      .objects
-      .get_mut(&object)
-      .and_then(|held| held.manifests.get_mut(&identity))
+    if let Some(held) = self.objects.get_mut(&object)
+      && let Some(record) = held.manifests.get_mut(&identity)
     {
+      held.by_sequence.remove(&(record.placed.sequence, identity));
+      held.by_sequence.insert((placed.sequence, identity));
       record.placed = placed;
+      self.changed.insert(HoldPiece::Manifest(object, identity));
       return Ok((Opened::Held, false));
     }
     let referenced: BTreeSet<[u8; 32]> = manifest.referenced_chunks().into_iter().collect();
@@ -1216,6 +1285,7 @@ impl ContentHold {
       }
     };
     let listed: Vec<[u8; 32]> = missing.iter().copied().collect();
+    self.changed.insert(HoldPiece::Stage(object));
     self.stages.insert(
       object,
       Stage {
@@ -1264,6 +1334,7 @@ impl ContentHold {
     }
     let listed: Vec<[u8; 32]> = missing.iter().copied().collect();
     if let Some(stage) = self.stages.get_mut(&object) {
+      self.changed.insert(HoldPiece::Stage(object));
       stage.placed = Placed {
         sequence: stage.placed.sequence.max(placed.sequence),
       };
@@ -1324,7 +1395,9 @@ impl ContentHold {
     stage.missing.remove(&identity);
     stage.staged.insert(identity);
     stage.index = stage.index.saturating_add(entry);
-    Ok(as_count(stage.missing.len()))
+    let left = as_count(stage.missing.len());
+    self.changed.insert(HoldPiece::Stage(object));
+    Ok(left)
   }
 
   /// Verifies and stores a chunk no stage or object has stored yet, as one stage's reference: its block, its
@@ -1357,6 +1430,7 @@ impl ContentHold {
         return Err(refusal);
       }
     };
+    self.changed.insert(HoldPiece::Chunk(chunk.identity));
     self.chunks.insert(
       chunk.identity,
       StoredChunk {
@@ -1435,6 +1509,8 @@ impl ContentHold {
       self.give(space, 0, 0, index);
       return Err(ContentRefusal::Unstaged);
     };
+    self.changed.insert(HoldPiece::Stage(object));
+    self.changed.insert(HoldPiece::Manifest(object, identity));
     let held = self.objects.entry(object).or_default();
     for chunk_identity in &referenced {
       let references = held.chunks.entry(*chunk_identity).or_insert(0);
@@ -1445,7 +1521,7 @@ impl ContentHold {
       }
       *references = references.saturating_add(1);
     }
-    held.manifests.insert(
+    let replaced = held.manifests.insert(
       identity,
       HeldManifest {
         extent: stage.extent,
@@ -1453,6 +1529,12 @@ impl ContentHold {
         placed: stage.placed,
       },
     );
+    if let Some(replaced) = replaced {
+      held
+        .by_sequence
+        .remove(&(replaced.placed.sequence, identity));
+    }
+    held.by_sequence.insert((stage.placed.sequence, identity));
     for chunk_identity in &stage.staged {
       if let Some(chunk) = self.chunks.get_mut(chunk_identity) {
         chunk.staged = chunk.staged.saturating_sub(1);
@@ -1469,6 +1551,7 @@ impl ContentHold {
     let Some(stage) = self.stages.remove(&object) else {
       return false;
     };
+    self.changed.insert(HoldPiece::Stage(object));
     let mut bytes = as_count(stage.extent.len());
     let mut index = stage.index;
     let _ = release(space.arena, stage.extent, self.giving_back);
@@ -1478,6 +1561,7 @@ impl ContentHold {
         chunk.objects == 0 && chunk.staged == 0
       });
       if gone && let Some(chunk) = self.chunks.remove(chunk_identity) {
+        self.changed.insert(HoldPiece::Chunk(*chunk_identity));
         bytes = bytes.saturating_add(as_count(chunk.extent.len()));
         index = index.saturating_add(chunk_entry_bytes());
         let _ = release(space.arena, chunk.extent, self.giving_back);
@@ -1575,6 +1659,20 @@ impl ContentHold {
     &mut self,
     space: &mut HoldSpace<'_>,
     object: ObjectId,
+    keep: impl FnMut(&[u8; 32], Placed) -> bool,
+  ) -> usize {
+    self.retain_placed_from(space, object, 0, keep)
+  }
+
+  /// [`retain`](Self::retain) over the manifests placed for `from` or a later sequence only, and the stage (A-372): the
+  /// content an event can change the judgment of, when everything placed before `from` was judged already and nothing
+  /// since can change it (a ledger's accepted positions are never rewritten, so its inputs named once stay named).
+  /// One step to find them, where judging every manifest made each judgment cost the object's history.
+  pub fn retain_placed_from(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    from: u64,
     mut keep: impl FnMut(&[u8; 32], Placed) -> bool,
   ) -> usize {
     let stage_released = self
@@ -1587,10 +1685,10 @@ impl ContentHold {
       .get(&object)
       .map(|held| {
         held
-          .manifests
-          .iter()
-          .filter(|(identity, record)| !keep(identity, record.placed))
-          .map(|(identity, _)| *identity)
+          .by_sequence
+          .range((from, [0; 32])..)
+          .filter(|&&(sequence, identity)| !keep(&identity, Placed { sequence }))
+          .map(|&(_, identity)| identity)
           .collect()
       })
       .unwrap_or_default();
@@ -1601,15 +1699,15 @@ impl ContentHold {
       .saturating_add(usize::from(stage_released))
   }
 
-  /// The newest sequence any manifest held for `object` was placed for, or `None` when nothing is held for it.
+  /// The newest sequence any manifest held for `object` was placed for, or `None` when nothing is held for it: one read
+  /// of its manifests by placed sequence (A-372).
   pub fn newest_placed(&self, object: ObjectId) -> Option<u64> {
     self
       .objects
       .get(&object)?
-      .manifests
-      .values()
-      .map(|record| record.placed.sequence)
-      .max()
+      .by_sequence
+      .last()
+      .map(|&(sequence, _)| sequence)
   }
 
   /// Forgets a manifest held for `object` in `space`: its block is freed and its charge given back, and each
@@ -1632,6 +1730,10 @@ impl ContentHold {
     let Some(record) = held.manifests.remove(identity) else {
       return false;
     };
+    held
+      .by_sequence
+      .remove(&(record.placed.sequence, *identity));
+    self.changed.insert(HoldPiece::Manifest(object, *identity));
     let referenced: BTreeSet<[u8; 32]> = Self::manifest_of(space.arena, &record)
       .map(|archive| archive.referenced_chunks().into_iter().collect())
       .unwrap_or_default();
@@ -1653,6 +1755,7 @@ impl ContentHold {
         chunk.objects == 0 && chunk.staged == 0
       });
       if gone && let Some(chunk) = self.chunks.remove(&chunk_identity) {
+        self.changed.insert(HoldPiece::Chunk(chunk_identity));
         bytes = bytes.saturating_add(u64::try_from(chunk.extent.len()).unwrap_or(u64::MAX));
         index = index.saturating_add(chunk_entry_bytes());
         let _ = release(space.arena, chunk.extent, self.giving_back);
@@ -1760,6 +1863,33 @@ impl ContentHold {
     Some(with_chunks(&archive, chunks))
   }
 
+  /// The manifest of a manifest held for `object` — the archive's header and tree, with no chunks — or `None` if it is
+  /// not held for that object: what a reader that takes the chunks one at a time ([`ContentHold::held_chunk`]) walks,
+  /// so a large held manifest is never copied out whole in one call, as [`ContentHold::archive_of`] copies it (a
+  /// holder seeding a kernel-sized green's version 0 a share at a time, §4.16 "Apply on holders", A-286).
+  pub fn held_manifest(
+    &self,
+    arena: &ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+  ) -> Option<Archive> {
+    let record = self.objects.get(&object)?.manifests.get(identity)?;
+    Self::manifest_of(arena, record)
+  }
+
+  /// One chunk of a manifest held for `object`, as stored, copied out of `arena`: `None` unless the object holds that
+  /// manifest and its held content references the chunk (AUD-29-45: never another object's bytes, the rule a chunk
+  /// fetch is served by). The other half of [`ContentHold::held_manifest`] (A-286).
+  pub fn held_chunk(
+    &self,
+    arena: &ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+    chunk: &[u8; 32],
+  ) -> Option<Chunk> {
+    self.piece_of(arena, object, identity, chunk)
+  }
+
   /// The manifest-only archive bytes of a manifest held for `object`, as stored, or `None` if not held for it.
   fn manifest_bytes(
     &self,
@@ -1838,38 +1968,18 @@ impl ContentHold {
     let mut manifests = Vec::new();
     for (object, held) in &self.objects {
       for record in held.manifests.values() {
-        manifests.push(ManifestImage {
-          object: object.0,
-          sequence: record.placed.sequence,
-          archive: BlockRef::of(&record.extent, record.len),
-        });
+        manifests.push(manifest_image(*object, record));
       }
     }
     let chunks = self
       .chunks
       .iter()
-      .map(|(identity, stored)| ChunkImage {
-        identity: *identity,
-        raw_len: stored.raw_len,
-        stored_len: stored.stored_len,
-        encoding: stored.encoding.to_wire(),
-        level: stored.level,
-        dictionary: stored.dictionary,
-        payload: BlockRef::of(
-          &stored.extent,
-          usize::try_from(stored.stored_len).unwrap_or(usize::MAX),
-        ),
-      })
+      .map(|(identity, stored)| chunk_image(identity, stored))
       .collect();
     let stages = self
       .stages
       .iter()
-      .map(|(object, stage)| StageImage {
-        object: object.0,
-        sequence: stage.placed.sequence,
-        archive: BlockRef::of(&stage.extent, stage.len),
-        staged: stage.staged.iter().copied().collect(),
-      })
+      .map(|(object, stage)| stage_image(*object, stage))
       .collect();
     HoldImage {
       chunks,
@@ -1877,6 +1987,105 @@ impl ContentHold {
       stages,
     }
     .to_bytes()
+  }
+
+  /// The pieces of the hold's image changed since [`ContentHold::clear_changes`] (A-376), each held now or gone.
+  pub fn changed_pieces(&self) -> &BTreeSet<HoldPiece> {
+    &self.changed
+  }
+
+  /// Forgets what changed of the hold's image: the holder's publication carrying it committed, or the hold was rebuilt
+  /// from the image that carries all of it (A-376).
+  pub fn clear_changes(&mut self) {
+    self.changed.clear();
+  }
+
+  /// The bytes of `piece` as the hold holds it now, or `None` when it holds no such thing (A-376): a chunk's
+  /// [`ChunkImage`], a manifest's identity and [`ManifestImage`], a stage's [`StageImage`], each its `Wire` encoding.
+  /// [`ContentHold::image_from_pieces`] puts them back into the image [`ContentHold::to_image`] makes.
+  pub fn piece_bytes(&self, piece: &HoldPiece) -> Option<Vec<u8>> {
+    match piece {
+      HoldPiece::Chunk(identity) => self
+        .chunks
+        .get(identity)
+        .map(|stored| chunk_image(identity, stored).to_bytes()),
+      HoldPiece::Manifest(object, identity) => self
+        .objects
+        .get(object)
+        .and_then(|held| held.manifests.get(identity))
+        .map(|record| {
+          ManifestPiece {
+            identity: *identity,
+            image: manifest_image(*object, record),
+          }
+          .to_bytes()
+        }),
+      HoldPiece::Stage(object) => self
+        .stages
+        .get(object)
+        .map(|stage| stage_image(*object, stage).to_bytes()),
+    }
+  }
+
+  /// Every piece of the hold's image, each with its bytes ([`ContentHold::piece_bytes`]): what a whole publication
+  /// carries (A-376).
+  pub fn pieces(&self) -> Vec<(HoldPiece, Vec<u8>)> {
+    let chunks = self
+      .chunks
+      .keys()
+      .map(|identity| HoldPiece::Chunk(*identity));
+    let manifests = self.objects.iter().flat_map(|(object, held)| {
+      held
+        .manifests
+        .keys()
+        .map(|identity| HoldPiece::Manifest(*object, *identity))
+    });
+    let stages = self.stages.keys().map(|object| HoldPiece::Stage(*object));
+    chunks
+      .chain(manifests)
+      .chain(stages)
+      .filter_map(|piece| self.piece_bytes(&piece).map(|bytes| (piece, bytes)))
+      .collect()
+  }
+
+  /// The hold's image ([`ContentHold::to_image`]'s bytes) from its pieces' bytes (A-376), as a recovery read them: each
+  /// decoded and put back in the image's order (chunks by identity, manifests by object then identity, stages by
+  /// object), so a hold whose pieces were all published images exactly as it did. No pieces make the empty image; a
+  /// piece that does not decode refuses the whole image.
+  pub fn image_from_pieces(
+    chunks: &[Vec<u8>],
+    manifests: &[Vec<u8>],
+    stages: &[Vec<u8>],
+  ) -> Result<Vec<u8>, HoldImageError> {
+    let mut chunks: Vec<ChunkImage> = chunks
+      .iter()
+      .map(|bytes| ChunkImage::from_bytes(bytes))
+      .collect::<Result<_, _>>()
+      .map_err(|_| HoldImageError::Malformed)?;
+    let mut manifests: Vec<ManifestPiece> = manifests
+      .iter()
+      .map(|bytes| ManifestPiece::from_bytes(bytes))
+      .collect::<Result<_, _>>()
+      .map_err(|_| HoldImageError::Malformed)?;
+    let mut stages: Vec<StageImage> = stages
+      .iter()
+      .map(|bytes| StageImage::from_bytes(bytes))
+      .collect::<Result<_, _>>()
+      .map_err(|_| HoldImageError::Malformed)?;
+    if manifests.is_empty() && stages.is_empty() {
+      return Ok(Vec::new());
+    }
+    chunks.sort_by_key(|chunk| chunk.identity);
+    manifests.sort_by_key(|piece| (piece.image.object, piece.identity));
+    stages.sort_by_key(|stage| stage.object);
+    Ok(
+      HoldImage {
+        chunks,
+        manifests: manifests.into_iter().map(|piece| piece.image).collect(),
+        stages,
+      }
+      .to_bytes(),
+    )
   }
 
   /// The first half of rebuilding a hold from its image (A-64): the image decoded and every block it names claimed
@@ -3750,6 +3959,67 @@ mod tests {
     assert_eq!(archive.referenced_chunks(), identities);
   }
 
+  /// §4.16 "Apply on holders" (A-286): a holder seeding a green's version 0 a share at a time reads the inputs it holds
+  /// one chunk at a time rather than as one copy of the whole archive. Do: hold a two-chunk archive for one object, then
+  /// read its manifest and each of its chunks back one at a time, for that object and for another. Expect: the manifest
+  /// is the archive's with no chunks, and its chunks, read one at a time in reference order and put back in, make the
+  /// archive the hold gives whole, byte for byte; another object, a manifest not held, and a chunk the manifest does not
+  /// reference are each answered nothing.
+  #[test]
+  fn a_held_manifest_is_read_back_a_chunk_at_a_time() {
+    let archive = two_chunk_archive();
+    let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
+    let manifest = hold
+      .hold(
+        &mut room.space(),
+        OBJECT,
+        Placed::default(),
+        archive.clone(),
+      )
+      .unwrap();
+    let held = hold.held_manifest(&room.arena, OBJECT, &manifest).unwrap();
+    assert_eq!(
+      held.encode(),
+      with_chunks(&archive, Vec::new()).encode(),
+      "the held manifest is the archive's header and tree, no chunks"
+    );
+    let chunks: Vec<Chunk> = held
+      .referenced_chunks()
+      .iter()
+      .map(|chunk| {
+        hold
+          .held_chunk(&room.arena, OBJECT, &manifest, chunk)
+          .unwrap()
+      })
+      .collect();
+    let whole = hold.archive_of(&room.arena, OBJECT, &manifest).unwrap();
+    assert_eq!(
+      with_chunks(&held, chunks).encode(),
+      whole.encode(),
+      "a chunk at a time reassembles what the hold gives whole"
+    );
+    let first = archive.chunks[0].identity;
+    assert!(hold.held_manifest(&room.arena, OTHER, &manifest).is_none());
+    assert!(
+      hold
+        .held_chunk(&room.arena, OTHER, &manifest, &first)
+        .is_none()
+    );
+    assert!(hold.held_manifest(&room.arena, OBJECT, &hash(9)).is_none());
+    assert!(
+      hold
+        .held_chunk(&room.arena, OBJECT, &hash(9), &first)
+        .is_none()
+    );
+    assert!(
+      hold
+        .held_chunk(&room.arena, OBJECT, &manifest, &hash(9))
+        .is_none(),
+      "a chunk the manifest does not reference is not read"
+    );
+  }
+
   /// The holder side served end to end in-process: an offer to a hold with one chunk already present
   /// answers the one missing identity; that chunk, corrupted (a flipped bit), is refused with an empty reply
   /// and nothing stored; the chunk itself completes the stage and is acknowledged bound to the object,
@@ -5013,6 +5283,49 @@ mod ownership_oracle {
   }
 
   /// Runs one shape and history on a fresh hold against the model, recording the cases met.
+  /// A-376: folds the hold's changed pieces over `published` as a holder's delta does (each held piece put, each gone one
+  /// removed), clears them as the delta's commit does, and checks that what was published is every piece the hold holds.
+  fn fold_changed(
+    hold: &mut ContentHold,
+    published: &mut BTreeMap<HoldPiece, Vec<u8>>,
+  ) -> Result<(), String> {
+    let changed: Vec<HoldPiece> = hold.changed_pieces().iter().copied().collect();
+    for piece in changed {
+      match hold.piece_bytes(&piece) {
+        Some(bytes) => {
+          published.insert(piece, bytes);
+        }
+        None => {
+          published.remove(&piece);
+        }
+      }
+    }
+    hold.clear_changes();
+    let whole: BTreeMap<HoldPiece, Vec<u8>> = hold.pieces().into_iter().collect();
+    if &whole != published {
+      return Err(
+        "the pieces folded from the hold's changes are not the pieces it holds".to_owned(),
+      );
+    }
+    Ok(())
+  }
+
+  /// A recovery's pieces by kind: the chunks', the manifests' and the stages' bytes.
+  type PiecesByKind = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+  /// The published pieces' bytes by kind, as a recovery reads them.
+  fn split_pieces(published: &BTreeMap<HoldPiece, Vec<u8>>) -> PiecesByKind {
+    let (mut chunks, mut manifests, mut stages) = (Vec::new(), Vec::new(), Vec::new());
+    for (piece, bytes) in published {
+      match piece {
+        HoldPiece::Chunk(_) => chunks.push(bytes.clone()),
+        HoldPiece::Manifest(..) => manifests.push(bytes.clone()),
+        HoldPiece::Stage(_) => stages.push(bytes.clone()),
+      }
+    }
+    (chunks, manifests, stages)
+  }
+
   fn run(
     manifests: &[BTreeSet<usize>],
     steps: &[Step],
@@ -5021,6 +5334,8 @@ mod ownership_oracle {
     let mut hold = ContentHold::new();
     let mut room = TestSpace::new();
     let mut model = Model::default();
+    // A-376: the pieces a holder's publications carried, each step's changed pieces folded over the last.
+    let mut published: BTreeMap<HoldPiece, Vec<u8>> = BTreeMap::new();
     for step in steps {
       let step = &resolve(step, manifests, &model);
       let Some(expected) = model_apply(&mut model, manifests, step, census) else {
@@ -5032,6 +5347,8 @@ mod ownership_oracle {
           "{step:?}: the hold answered {got:?}, the model {expected:?}"
         ));
       }
+      fold_changed(&mut hold, &mut published)
+        .map_err(|disagreement| format!("after {step:?}: {disagreement}"))?;
       check(&hold, &room.arena, &model, manifests)
         .map_err(|disagreement| format!("after {step:?}: {disagreement}"))?;
       // AUD-29-43: what the hold says it is charged is exactly what the shard's budget and ledger hold.
@@ -5053,6 +5370,13 @@ mod ownership_oracle {
     // A-64: the image names blocks, so the restart carries the arena's bytes, and the recovered hold adopts the very
     // blocks it names (its image is the same bytes) and charges exactly what the live hold did.
     let image = hold.to_image();
+    // A-376: the pieces every publication carried put back together are the hold's image, byte for byte.
+    let (chunk_pieces, manifest_pieces, stage_pieces) = split_pieces(&published);
+    if ContentHold::image_from_pieces(&chunk_pieces, &manifest_pieces, &stage_pieces)
+      != Ok(image.clone())
+    {
+      return Err("the published pieces do not make the hold's image".to_owned());
+    }
     let mut restarted = room.restarted();
     let mut recovered = restarted
       .recover(&image)
@@ -5215,6 +5539,46 @@ mod ownership_oracle {
       .unwrap();
     assert_eq!(room.budget.replicated(), 3 * page);
     assert_eq!(hold.charged_bytes(), 3 * page);
+  }
+
+  /// §4.10 retention, A-372: the rule judges only the content placed at or past a sequence, and the newest placement is
+  /// one read. Do: hold six manifests of one object, placed for sequences 1 to 6; retain from sequence 4 with a rule
+  /// that keeps nothing and lists what it was asked; read the newest placement; forget the rest. Expect the rule asked of
+  /// the manifests placed at 4, 5 and 6 only, in sequence order, those three released and the three below kept, the
+  /// newest placement 3 after it, and the hold charging nothing once everything is forgotten.
+  #[test]
+  fn a_retention_from_a_sequence_judges_only_the_content_placed_at_or_past_it() {
+    let a = object(0);
+    let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
+    for at in 1..=6usize {
+      let content = BTreeSet::from([at]);
+      hold
+        .hold(
+          &mut room.space(),
+          a,
+          Placed {
+            sequence: u64::try_from(at).unwrap(),
+          },
+          archive(&content, &content),
+        )
+        .unwrap();
+    }
+    let mut asked = Vec::new();
+    let released = hold.retain_placed_from(&mut room.space(), a, 4, |_, placed| {
+      asked.push(placed.sequence);
+      false
+    });
+    let (kept, newest) = (hold.manifest_count(), hold.newest_placed(a));
+    hold.forget_all(&mut room.space());
+    assert_eq!(asked, vec![4, 5, 6], "only the content placed at or past 4");
+    assert_eq!((released, kept), (3, 3));
+    assert_eq!(newest, Some(3));
+    assert_eq!(
+      (room.budget.replicated(), room.metadata.committed()),
+      (0, 0),
+      "every byte and every index entry given back"
+    );
   }
 
   /// Hostile input (§4.9) on the hold image (AUD-29-59, A-64): do: image a hold of two overlapping manifests,

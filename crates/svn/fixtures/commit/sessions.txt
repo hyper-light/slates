@@ -1,0 +1,42 @@
+mkdir	user alice	exit 0	svn mkdir -m the trunk svn+fixture://fixture/repo/trunk
+import	user alice	exit 0	svn import -m the project WORK/import svn+fixture://fixture/repo/trunk/project
+checkout-alice	user alice	exit 0	svn checkout svn+fixture://fixture/repo/trunk/project WORK/wc-alice
+checkout-stale	user alice	exit 0	svn checkout svn+fixture://fixture/repo/trunk/project WORK/wc-stale
+edit	user alice	exit 0	svn commit -m an edit WORK/wc-alice
+edit-large	user alice	exit 0	svn commit -m an edit of the large file WORK/wc-alice
+propset-dir	user alice	exit 0	svn propset colour blue WORK/wc-alice/sub
+propset-file	user alice	exit 0	svn propset flavour sweet WORK/wc-alice/a.txt
+propset	user alice	exit 0	svn commit -m properties WORK/wc-alice
+propdel-file	user alice	exit 0	svn propdel flavour WORK/wc-alice/a.txt
+propdel	user alice	exit 0	svn commit -m a property deleted WORK/wc-alice
+propset-root	user alice	exit 0	svn propset rootprop on the session root WORK/wc-alice
+root-prop-stale	user alice	exit 1	svn commit -m a property of a stale root WORK/wc-alice
+	svn: E160028: Commit failed (details follow):
+	svn: E160028: Directory '/trunk/project' is out of date
+update-for-root	user alice	exit 0	svn update WORK/wc-alice
+root-prop	user alice	exit 0	svn commit -m a property of the root WORK/wc-alice
+add-new	user alice	exit 0	svn add WORK/wc-alice/new.txt WORK/wc-alice/newdir
+rm-old	user alice	exit 0	svn rm WORK/wc-alice/sub/b.txt WORK/wc-alice/gone
+add-delete	user alice	exit 0	svn commit -m additions and deletions WORK/wc-alice
+rm-replaced	user alice	exit 0	svn rm WORK/wc-alice/c.txt
+add-replacement	user alice	exit 0	svn add WORK/wc-alice/c.txt
+replace	user alice	exit 0	svn commit -m a replacement WORK/wc-alice
+copy-url	user alice	exit 0	svn copy -m a branch --parents svn+fixture://fixture/repo/trunk svn+fixture://fixture/repo/branches/b1
+copy-wc	user alice	exit 0	svn copy WORK/wc-alice/a.txt WORK/wc-alice/a-copy.txt
+copy-modify	user alice	exit 0	svn commit -m a copy changed as it is made WORK/wc-alice
+out-of-date	user alice	exit 1	svn commit -m from a stale working copy WORK/wc-stale
+	svn: E160028: Commit failed (details follow):
+	svn: E160028: File '/trunk/project/a.txt' is out of date
+checkout-bob	user bob	exit 0	svn checkout svn+fixture://fixture/repo/trunk/project WORK/wc-bob
+lock-bob	user bob	exit 0	svn lock -m bob's WORK/wc-bob/a.txt
+update-alice	user alice	exit 0	svn update WORK/wc-alice
+locked-by-other	user alice	exit 1	svn commit -m against a lock WORK/wc-alice
+	svn: E160039: Commit failed (details follow):
+	svn: E160039: User 'alice' does not own lock on path '/trunk/project/a.txt' (currently locked by 'bob')
+revert-alice	user alice	exit 0	svn revert WORK/wc-alice/a.txt
+commit-with-lock	user bob	exit 0	svn commit -m with the lock's token WORK/wc-bob
+update-alice-again	user alice	exit 0	svn update WORK/wc-alice
+update-bob	user bob	exit 0	svn update WORK/wc-bob
+conflict	user alice	exit 1	svn commit -m meets the race WORK/wc-alice
+	svn: E160024: Commit failed (details follow):
+	svn: E160024: Conflict at '/trunk/project/sub/deeper/d.txt'

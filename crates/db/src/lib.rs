@@ -16,6 +16,7 @@
 //! other slot and the log intact.
 //!
 //! Modules: [`art`] (the adaptive radix tree of the indexes), [`catalog`] (the records),
+//! [`credentials`] (the version-control credentials a human enrolled, by the hash a client presents, A-625 part 3),
 //! [`op`] (the operations), [`partition`] (the state and its deterministic `apply`),
 //! [`record`] (the log record format over the segment's ring), [`register`] (the register
 //! primitives of §4.8 — the quorum, the fence, rendezvous placement, the configuration oracle),
@@ -23,7 +24,9 @@
 //! by phase-one adoption), [`live`] (live shipping's fenced, hash-chained log of an owner's publications, A-200), [`mirror`] (asynchronous mirroring of the committed prefix to a second
 //! region in epoch order with an exposed lag), [`reconfig`] (changing a register's holder set by
 //! joint consensus, preserving ReadSafety and NoLoss), [`replay`] (recovery and the snapshot
-//! policy), [`error`].
+//! policy), [`repository`] (the repositories a partition holds, their namespaces and registers, §4.17.1),
+//! [`review`] (their review records: comments moved with the code, approvals bound to the version they saw,
+//! §4.17.1 shared piece 6), [`error`].
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -35,6 +38,7 @@
 pub mod alias;
 pub mod art;
 pub mod catalog;
+pub mod credentials;
 pub mod error;
 pub mod ledger;
 pub mod live;
@@ -44,7 +48,12 @@ pub mod partition;
 pub mod reconfig;
 pub mod record;
 pub mod register;
+// Goal 81's chaos part, its network half: the fenced register under a network nemesis, its invariants as history checks.
+#[cfg(test)]
+mod register_nemesis;
 pub mod replay;
+pub mod repository;
+pub mod review;
 pub mod takeover;
 
 pub use art::Art;

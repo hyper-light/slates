@@ -266,8 +266,9 @@ pub(crate) struct Module {
   pub(crate) bytes: Vec<u8>,
 }
 
-/// The guest's initramfs in the `newc` cpio format the kernel unpacks: the directories the probe mounts over, the probe
-/// itself as `/init`, and `modules` under `/modules`, where the probe loads them from.
+/// The guest's initramfs in the `newc` cpio format the kernel unpacks: the directories the probe mounts over (`bare`
+/// for its control mount, the share again without `nosuid,nodev`), the probe itself as `/init`, and `modules` under
+/// `/modules`, where the probe loads them from.
 pub(crate) fn initramfs(init: &[u8], modules: &[Module]) -> Vec<u8> {
   let mut archive = Vec::new();
   let mut inode = 0usize;
@@ -275,7 +276,7 @@ pub(crate) fn initramfs(init: &[u8], modules: &[Module]) -> Vec<u8> {
     inode = inode.saturating_add(1);
     inode
   };
-  for name in ["dev", "proc", "sys", "mnt", "modules"] {
+  for name in ["dev", "proc", "sys", "mnt", "bare", "modules"] {
     cpio_entry(&mut archive, next_inode(), name, DIRECTORY_MODE, &[]);
   }
   cpio_entry(&mut archive, next_inode(), "init", EXECUTABLE_MODE, init);

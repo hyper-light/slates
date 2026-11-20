@@ -750,8 +750,11 @@ fn real_state(vol: &Volume, store: &Store) -> AbstractState {
           }
         }
         Kind::Symlink => {}
-        #[allow(clippy::panic)] // Harness invariant: these generated operations never create IPC.
-        Kind::Fifo | Kind::Socket => panic!("this history creates no IPC names"),
+        #[allow(clippy::panic)]
+        // Harness invariant: these generated operations never create IPC names or devices.
+        Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+          panic!("this history creates no IPC names or device nodes")
+        }
       }
     }
   }
@@ -994,6 +997,19 @@ fn check_publication(
     published.as_ref(),
     Some(&vol.to_image(store, None).unwrap()),
     "the published image after {step:?}"
+  );
+  // A-578: the publication records the volume's live counter beside its reserved ceiling, which a successor names the
+  // numbers between. Under the model's nonzero reserve the two are apart (A-150's gotcha: with none they coincide, and
+  // an encoding that wrote one for the other would pass unseen).
+  let image = published.as_ref().expect("an image was published");
+  assert_eq!(
+    (image.live_counter, image.next_counter),
+    (vol.issued_below().counter(), vol.recorded_counter(store)),
+    "the publication's live counter and reserved ceiling after {step:?}"
+  );
+  assert!(
+    image.live_counter < image.next_counter,
+    "a nonzero reserve keeps the live counter below the ceiling after {step:?}"
   );
   vol.mark_published(store);
   delta

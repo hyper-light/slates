@@ -25,8 +25,8 @@
 //!   daemon already uses; the pending map is thread-local, so it needs no lock.
 //!
 //! The whole browse spans shards: `mount /<name>@<capability>` (or `/@<capability>` for the host root
-//! scoped to that capability), `ls /` (a `READDIR` of the host root scatters an entry-gather to every
-//! shard and lists the volume the capability authorizes by its friendly name), `cd <name>` (a root
+//! scoped to that capability), `ls /` (a `READDIR` of the host root asks the shard that owns the
+//! capability's attachment, and lists the volume the capability authorizes by its friendly name), `cd <name>` (a root
 //! `LOOKUP` routes across shards by `owner_of_name`), read/write. Each request runs as the mounting user
 //! ([`auth_sys_identity`] reads the uid from the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root)
 //! for the POSIX permission rules — but **authorization is the mount capability, never the uid**
@@ -35,8 +35,10 @@
 //! path, stamped into the root handle and every handle derived from it, and validated against the
 //! attachment record on every request. A bare `/` lists nothing and enters nothing. The attachment a
 //! host mount rides on is the **mount's** (`Consumer::Bridge`): it outlives the client that attached
-//! and a daemon restart (the kernel's handles must keep validating), and it ends with the kernel's
-//! `UMNT` of the mount path ([`unmount_capability`]), a `detach`, or the volume's destroy.
+//! and a daemon restart (the kernel's handles must keep validating), and it ends when the kernel unmounts the mount
+//! (seen through the kernel's own unmount event on the shard that holds it, A-511; on macOS, `own_nfs::watch`), with a
+//! `detach`, or with the volume's destroy. A `UMNT` ends nothing: it is a hint any local process can send, and the
+//! kernel sends none at a forced unmount.
 //!
 //! A volume appears under its **provisioned name** (§4.6 "Chosen path"): the slot carries the name
 //! ([`crate::state::VolumeSlot`]), [`ShardVolumeSet::entries`] lists it, and a root `LOOKUP`/`MNT` of a
@@ -60,11 +62,17 @@
 //! procedure that succeeded therefore runs [`crate::verbs::publish_shard`] on the owner shard
 //! *before* its reply is sent ([`barrier`]), so the reply's stability claim — a `FILE_SYNC` write, a
 //! COMMIT, a create or a rename the protocol defines as stable — is true for daemon-restart survival.
-//! The one exception is an `UNSTABLE` write, answered `UNSTABLE` and made stable by the client's
-//! later COMMIT; the write verifier ([`crate::state::ShardState::write_verifier`], per boot) is how a
-//! client learns a restart lost the unstable writes it still holds and re-sends them (RFC 1813
-//! §3.3.7). A refused publish replaces the reply with `NFS3ERR_IO` — the effect is in the volume but
-//! not stable, and the client is told so rather than promised survival.
+//! An `UNSTABLE` write is published before its reply too, though it is answered `UNSTABLE` (A-358):
+//! left to the client's COMMIT, its bytes died with the daemon, and a client learns that only from the
+//! per-boot write verifier ([`crate::state::ShardState::write_verifier`]), after which RFC 1813 §3.3.7
+//! has it write them again. Apple's client does not: in a traced kill run on macOS 26.2 its COMMIT met
+//! a new verifier 3 times and it wrote nothing again, and the file whose bytes no publication had
+//! carried came back empty
+//! (docs/bugs/2026-11-18-an-fsynced-file-came-back-empty-after-a-daemon-kill-under-the-macos-mount.md).
+//! What `UNSTABLE` still leaves to the COMMIT is durability past the daemon: only a reply that claims
+//! stability waits for a live-shipped volume's candidates (A-200). A refused publish replaces the reply
+//! with `NFS3ERR_IO` — the effect is in the volume but not stable, and the client is told so rather than
+//! promised survival.
 //!
 //! **NFSv4.1/4.2 (A-35).** Version 4 of the NFS program is served on the same listener: the v4 state
 //! (clients, sessions, opens) lives on the listener's shard, created with the first v4 call under the
@@ -101,7 +109,7 @@ use slates_bridge_nfs::{
   AcceptStatus, MultiExport, Nfsstat3, UnixGroups, VolumeSet, auth_sys_identity, parse_call,
   reply_record, request_volume, root_volume, serve_call,
 };
-use slates_db::catalog::{AttachForm, Consumer, Principal, VolumeId};
+use slates_db::catalog::{Principal, VolumeId};
 use slates_db::register::ObjectId;
 use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
@@ -195,6 +203,15 @@ impl VolumeSet for ShardVolumeSet {
       let Some((capability, rights)) = authorized_rights(s, volume, capability) else {
         return Some(Some(status_failure_reply(Nfsstat3::Acces, procedure)));
       };
+      // A volume this node lost to a successor (`verbs::lost_to_a_successor`: its log fenced at a later epoch, A-338, kept
+      // across a restart, A-344; or yielded when this host was admitted again under its id, A-334) is answered as one this
+      // node does not hold: `NFS3ERR_STALE`, as a non-owner node's mount answers its handles, so the mount learns of the
+      // takeover (A-346). Before, the lease gate below answered its requests retry-later for good, or, its lease confirmed
+      // again, they were served from the copy the successor's writes had passed.
+      if s.by_id.contains_key(&volume) && crate::verbs::lost_to_a_successor(s, volume) {
+        s.count(SUPERSEDED_STALE, 1);
+        return Some(Some(status_failure_reply(Nfsstat3::Stale, procedure)));
+      }
       // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): the mount serves the volume's **live tree**
       // — its latest state — so while this node's authority over the object is unconfirmed (cut off, paused
       // past the lease bound, or superseded by a newer configuration) every procedure answers `NFS3ERR_JUKEBOX`,
@@ -241,6 +258,11 @@ impl VolumeSet for ShardVolumeSet {
       // volume's capability gets no root handle, so no volume can be mounted or entered without it. The
       // root handle returned carries the capability, so every later request self-authorizes.
       let (capability, rights) = authorized_rights(s, volume, capability)?;
+      // A volume this node lost to a successor gives no root, as one it does not hold gives none (A-346, as `serve`).
+      if crate::verbs::lost_to_a_successor(s, volume) {
+        s.count(SUPERSEDED_STALE, 1);
+        return None;
+      }
       let requester = (subject, groups, dialect);
       let (handle, attr) = with_export(s, volume, requester, rights, capability, |export| {
         export.root_object()
@@ -342,48 +364,61 @@ fn with_export<R>(
     attachments,
     nfs_v4_files,
     snapshot_views,
+    nfs_pending_base,
     ..
   } = s;
   let mut handles = new_handle_store();
-  // A snapshot mount serves its attachment's read-only view; every other mount, the volume's head.
-  let mut bridge = match snapshot_views.get_mut(&capability.0) {
-    Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
-    None => {
-      let slot = volumes.get_mut(handle).ok()?;
-      VolumeBridge::attached(
-        volume,
-        &mut slot.volume,
-        store,
-        &mut handles,
-        slot.host.as_mut().map(|host| host as &mut dyn HostFs),
-      )
+  // The slot's base host is lent through a lens that notes the fetch a host call of this request met pending (A-555):
+  // the bridge answers the refusal on the wire, and the call then parks on that fetch (`serve_local_held`).
+  let mut lens = None;
+  let served = {
+    // A snapshot mount serves its attachment's read-only view; every other mount, the volume's head.
+    let mut bridge = match snapshot_views.get_mut(&capability.0) {
+      Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
+      None => {
+        let slot = volumes.get_mut(handle).ok()?;
+        lens = slot
+          .host
+          .as_mut()
+          .map(|host| crate::base_wait::Lens::over(host));
+        VolumeBridge::attached(
+          volume,
+          &mut slot.volume,
+          store,
+          &mut handles,
+          lens.as_mut().map(|lens| lens as &mut dyn HostFs),
+        )
+      }
+    };
+    attachments.begin(admitted).ok()?;
+    let mut scoped;
+    let served: &mut dyn slates_bridge_core::Bridge = match scope {
+      Some(scope) => {
+        scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
+        &mut scoped
+      }
+      None => &mut bridge,
+    };
+    let mut export = Export::over(served, volume, subject, attachments, admitted);
+    export.set_groups(groups);
+    if stranger {
+      export.set_stranger();
     }
-  };
-  attachments.begin(admitted).ok()?;
-  let mut scoped;
-  let served: &mut dyn slates_bridge_core::Bridge = match scope {
-    Some(scope) => {
-      scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
-      &mut scoped
+    export.set_dialect(dialect);
+    // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
+    // learn whether unstable writes were lost; each is published before its reply (A-358), so none are.
+    export.set_write_verifier(write_verifier);
+    export.set_capability(capability);
+    if let Some(files) = nfs_v4_files.as_mut() {
+      export.lend_file_state(files);
     }
-    None => &mut bridge,
+    let served = f(&mut export);
+    drop(export);
+    attachments.end(admitted);
+    served
   };
-  let mut export = Export::over(served, volume, subject, attachments, admitted);
-  export.set_groups(groups);
-  if stranger {
-    export.set_stranger();
-  }
-  export.set_dialect(dialect);
-  // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
-  // learn its unstable writes were lost and re-send them.
-  export.set_write_verifier(write_verifier);
-  export.set_capability(capability);
-  if let Some(files) = nfs_v4_files.as_mut() {
-    export.lend_file_state(files);
-  }
-  let served = f(&mut export);
-  drop(export);
-  attachments.end(admitted);
+  let met = lens.as_ref().and_then(crate::base_wait::Lens::met);
+  *nfs_pending_base = met.map(|fetch| (volume, fetch)).or(*nfs_pending_base);
   Some(served)
 }
 
@@ -422,10 +457,13 @@ fn admit_mount(
 }
 
 /// Whether a served call's effect must be in the shard's recovery image before its reply goes out
-/// (the §4.8 barrier, D-18): a mutating NFS procedure that succeeded — every one except an `UNSTABLE`
-/// write, which its client makes stable with a later COMMIT (itself a barrier). A refused call
-/// changed nothing, and a read never needs one.
-fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> bool {
+/// (the §4.8 barrier, D-18): a mutating NFS procedure that succeeded, a WRITE whatever stability it
+/// asked for included (A-358: its client cannot be relied on to write it again after a restart). A
+/// refused call changed nothing, and a read never needs one. It is also what changed what a shard
+/// publication makes durable (A-127): a recorded call rides the publication its barrier makes.
+/// Whether the reply then also waits for a live-shipped volume's candidates is [`unstable_write`]'s
+/// to say.
+fn needs_barrier(program: u32, procedure: u32, results: &[u8]) -> bool {
   if program != NFS_PROGRAM || !nfs_ok(results) {
     return false;
   }
@@ -435,14 +473,12 @@ fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> b
     let Some(inner_results) = results.get(size_of::<u32>()..) else {
       return false;
     };
-    return needs_barrier(program, inner, args, inner_results);
+    return needs_barrier(program, inner, inner_results);
   }
   match procedure {
-    NFSPROC3_WRITE => {
-      write_stable_how(&mut XdrReader::new(args)).is_none_or(|stable| !is_unstable(stable))
-    }
-    NFSPROC3_SETATTR | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK | NFSPROC3_MKNOD
-    | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK | NFSPROC3_COMMIT => true,
+    NFSPROC3_WRITE | NFSPROC3_SETATTR | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
+    | NFSPROC3_MKNOD | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK
+    | NFSPROC3_COMMIT => true,
     // The v4 front end's attribute changes (A-35) publish as any mutation does.
     slates_bridge_nfs::procedures::extension::XATTR_SET
     | slates_bridge_nfs::procedures::extension::XATTR_REMOVE => true,
@@ -450,17 +486,25 @@ fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> b
   }
 }
 
-/// Whether a served call changed what a shard publication makes durable (A-127): every call [`needs_barrier`] names,
-/// and an `UNSTABLE` write, whose change a later publication carries.
-fn changes_volume(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> bool {
-  let write = slates_bridge_nfs::procedures::state_io_inner(procedure).unwrap_or(procedure);
-  needs_barrier(program, procedure, args, results)
-    || (program == NFS_PROGRAM && write == NFSPROC3_WRITE && nfs_ok(results))
+/// Whether a call is a WRITE that asked for no stability (`UNSTABLE`), a state-carrying one (A-36) included: published
+/// before its reply as every write is (A-358), it claims nothing past its daemon, so its reply waits for no live-shipped
+/// volume's candidates (A-200); the client's COMMIT does. A WRITE whose arguments do not decode that far claims
+/// stability, as before A-358.
+fn unstable_write(program: u32, procedure: u32, args: &[u8]) -> bool {
+  let inner = slates_bridge_nfs::procedures::state_io_inner(procedure).unwrap_or(procedure);
+  program == NFS_PROGRAM
+    && inner == NFSPROC3_WRITE
+    && write_stable_how(&mut XdrReader::new(args)).is_some_and(is_unstable)
 }
 
 /// Counter: NFSv3 requests a dead daemon applied and left unanswered on a held connection, answered by its successor
 /// from the reply published with the effect instead of being applied again (A-128).
 const HELD_REPLY_ANSWERED: &str = "nfs.held_reply.answered";
+
+/// Counter: a request on a volume this node lost to a takeover, answered `NFS3ERR_STALE` (a root not given) as one on a
+/// volume it does not hold (A-346).
+/// Format: a counter name in the daemon's status report.
+const SUPERSEDED_STALE: &str = "nfs.superseded_stale";
 
 /// Counter: held NFSv3 replies a restarted shard took back from its image (A-128), each waiting for its request to be
 /// read again.
@@ -529,17 +573,21 @@ fn nfs_ok(results: &[u8]) -> bool {
 /// survival). A publish that committed without the touched `volume` (a volume it could not image: its
 /// base unreadable, or the image refused) is counted as a
 /// refused barrier ([`crate::daemon::BARRIER_UNCAPTURED`]) and returns `NFS3ERR_IO`. No volume id
-/// or no publication also refuses: absence of a proof never becomes a stability guarantee.
+/// or no publication also refuses: absence of a proof never becomes a stability guarantee. A reply that
+/// `claims_stability` (all but an `UNSTABLE` write's, [`unstable_write`]) then waits for a live-shipped
+/// volume's candidates (A-200).
 fn barrier(
   procedure: u32,
   volume: Option<VolumeId>,
   reply: (AcceptStatus, Vec<u8>),
+  claims_stability: bool,
 ) -> (AcceptStatus, Vec<u8>) {
   let outcome = state::with_state(crate::verbs::publish_shard);
   let reply = publication_reply(procedure, volume, outcome, reply);
   // A live-shipped volume's stable reply waits until `f` candidates hold the publication (A-200): noted here, waited
-  // for by the serve's task (`stable_once_durable`), never inside this synchronous step.
-  if let Some(volume) = volume {
+  // for by the serve's task (`stable_once_durable`), never inside this synchronous step. An `UNSTABLE` write's reply
+  // claims no stability, so it waits for none (A-358): its publication is for its daemon's death alone.
+  if claims_stability && let Some(volume) = volume {
     let _ = state::with_state(|s| crate::live_ship::note_barrier(s, volume));
   }
   reply
@@ -742,7 +790,7 @@ async fn routed(this: u16, program: u32, procedure: u32, args: &[u8]) -> Option<
     state::with_state(|s| served_partition(s, &name))?
   } else {
     let name_shard = name_shard?;
-    crate::xshard::call_within(
+    crate::xshard::call_in_shard_time(
       this,
       name_shard,
       move |s| served_partition(s, &name),
@@ -819,8 +867,8 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
       let _dir = Nfsfh3::decode(&mut reader).ok()?;
       Some(reader.string(NFS_MAXNAMELEN).ok()?.to_owned())
     }
-    // A `MNT` and the kernel's `UMNT` of the same path both route to the name's owner: the mount is served
-    // there, and the unmount ends the mount's attachment there (AUD-01).
+    // A `MNT` routes to the name's owner, where the mount is served; the kernel's `UMNT` of the same path goes there
+    // too and is answered void (it ends nothing: the kernel's own unmount event does, A-511).
     MOUNT_PROGRAM if is_mount_request(program, procedure) => {
       let path = XdrReader::new(args).string(MNT_PATH_MAX).ok()?;
       let name = path.trim_matches('/');
@@ -838,136 +886,6 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
 /// (§4.13; AUD-01): the mount to be served under it, the unmount to end its attachment.
 fn is_mount_request(program: u32, procedure: u32) -> bool {
   program == MOUNT_PROGRAM && (procedure == MOUNTPROC3_MNT || procedure == MOUNTPROC3_UMNT)
-}
-
-/// The kernel's `UMNT` of `/<name>` ends the attachment of the mount it unmounts (§4.6, §4.13; AUD-01),
-/// once the kernel's mount table confirms that mount is gone. The path is the mount's source name, with
-/// no capability (§4.6 A-34), so a `UMNT` alone proves nothing: any local process could send one. On the
-/// name's owner shard every host mount (`Consumer::Bridge`) of the named volume bound to a mount point is
-/// watched by [`confirm_unmount`]: an attachment ends (as a `detach` would, `verbs::end_attachment`) when
-/// its mount point no longer holds this volume's mount, and one whose mount is still there when the
-/// deadline passes is a mount nobody unmounted, left as it is. `UMNT` has no status (RFC 1813 §5.2.3),
-/// so the reply is void; `args` is `/<name>`.
-fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
-  let Ok(path) = XdrReader::new(args).string(MNT_PATH_MAX) else {
-    return;
-  };
-  let name = path.trim_matches('/').to_owned();
-  if name.is_empty() || name.contains('@') {
-    return;
-  }
-  let mounts: Vec<(u64, String)> = state::with_state(|s| {
-    let Some(volume) = s.db.partition().volume_by_name(&name).map(|v| v.id) else {
-      return Vec::new();
-    };
-    s.db
-      .partition()
-      .attachments_of(volume)
-      .into_iter()
-      .filter_map(|record| match (&record.consumer, &record.form) {
-        (Consumer::Bridge, AttachForm::ChosenPath { path })
-        | (
-          Consumer::Bridge,
-          AttachForm::ScopedMount {
-            mount_point: Some(path),
-            ..
-          }
-          | AttachForm::BoundMount {
-            mount_point: Some(path),
-            ..
-          },
-        ) => Some((record.id, path.clone())),
-        _ => None,
-      })
-      .collect()
-  })
-  .unwrap_or_default();
-  if mounts.is_empty() {
-    let _ = state::with_state_counted(|s| s.count("nfs.unmount_refused", 1));
-    return;
-  }
-  match futures::spawn(confirm_unmount(name, mounts)) {
-    Ok(task) => {
-      let _ = futures::detach(task);
-    }
-    Err(_) => {
-      crate::fleet::count_refusal("nfs.unmount_refused");
-    }
-  }
-}
-
-/// Derived: how long a `UMNT` waits for its mount to leave the kernel's mount table: one liveness
-/// budget ([`crate::daemon::LIVENESS_BUDGET_NS`]). The kernel sends `UMNT` while it unmounts, so the
-/// mount leaves the table within the unmount's own few steps; one still there after the budget the
-/// anchor gives the daemon to beat was not being unmounted.
-const UNMOUNT_CONFIRM_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
-
-/// Ends each of `mounts` (attachment, mount point) whose point no longer holds `name`'s mount, checking at
-/// the fleet's poll interval for at most [`UNMOUNT_CONFIRM_NS`] ([`unmount_capability`]). The check stops
-/// early once one mount has gone: a `UMNT` is one unmount.
-async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
-  let began = futures::now_ns();
-  let poll = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-  loop {
-    let gone: Vec<u64> = mounts
-      .iter()
-      .filter(|(_, point)| !holds_mount_of(point, &name))
-      .map(|(attachment, _)| *attachment)
-      .collect();
-    if !gone.is_empty() {
-      let _ = state::with_state_counted(|s| {
-        for attachment in gone {
-          let ended = s
-            .db
-            .partition()
-            .attachment(attachment)
-            .cloned()
-            .is_some_and(|record| {
-              crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_ok()
-            });
-          if !ended {
-            s.count("nfs.unmount_refused", 1);
-          }
-        }
-      });
-      return;
-    }
-    if futures::now_ns().saturating_sub(began) >= UNMOUNT_CONFIRM_NS {
-      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
-      return;
-    }
-    if futures::sleep(poll).await.is_err() {
-      // Off a shard no poll can be timed: the confirmation is given up, counted, never spun on.
-      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
-      return;
-    }
-  }
-}
-
-/// Whether `mount_point` is still where `name`'s loopback mount is: the kernel's mount table
-/// (`getfsstat(MNT_NOWAIT)`, `slates_bridge_oci::mount_table`) lists a mount exactly there whose source is
-/// `slates:/<name>` (§4.6 A-34). The table is read, never the mount: a `statfs` of the point would send
-/// an NFS request to this very daemon, and on a single shard the shard that must answer is the one
-/// waiting (the hazard `slates-bridge-oci`'s module doc records). A table that cannot be read counts as
-/// the mount still being there, so nothing ends on a read error.
-#[cfg(target_os = "macos")]
-fn holds_mount_of(mount_point: &str, name: &str) -> bool {
-  let Ok(entries) = slates_bridge_oci::mount_table::mount_table() else {
-    return true;
-  };
-  let source = format!("slates:/{name}");
-  entries
-    .iter()
-    .rev()
-    .find(|entry| entry.mount_point.trim_end_matches('/') == mount_point.trim_end_matches('/'))
-    .is_some_and(|entry| entry.source == source)
-}
-
-/// Off macOS a loopback NFS mount is not how volumes are mounted (Linux uses FUSE, which ends its
-/// attachment when the kernel closes the device); a `UMNT` there is never taken as proof of an unmount.
-#[cfg(not(target_os = "macos"))]
-fn holds_mount_of(_mount_point: &str, _name: &str) -> bool {
-  true
 }
 
 /// Splits a mount path of the form `<name>@<attachment_hex>.<token_hex>` — or `@<attachment_hex>.<token_hex>`
@@ -1017,8 +935,8 @@ fn presented_capability(
 ) -> (Option<MountCapability>, Option<Vec<u8>>) {
   if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
     // The kernel's `UMNT` names the volume by the mount's source (`slates:/<name>` gives `/<name>`), with
-    // no capability (§4.6 A-34); it presents none, and the unmount is confirmed against the kernel's
-    // mount table before anything ends ([`unmount_capability`]).
+    // no capability (§4.6 A-34); it presents none, and it ends nothing: the kernel's own unmount event ends a
+    // mount's attachment (A-511).
     return (None, None);
   }
   if is_mount_request(program, procedure) {
@@ -1119,11 +1037,6 @@ fn serve_local(
     s.tracer
       .open_root(request, Chokepoint::BridgeRequest, start_ns)
   });
-  // The kernel's unmount ends the mount's attachment here, on the name's owner shard (AUD-01); the
-  // bridge then answers the void `UMNT` reply.
-  if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
-    unmount_capability(requester.capability, args);
-  }
   let requester_dialect = requester.dialect;
   let mut service = MultiExport::new(
     ShardVolumeSet {
@@ -1140,6 +1053,7 @@ fn serve_local(
   let _ = state::with_state_counted(|s| {
     s.store.recall_gate.act_as(requester.client);
     s.nfs_call = call;
+    s.nfs_pending_base = None;
   });
   // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
@@ -1288,7 +1202,7 @@ fn answered_or_refused(
 
 /// A served call's record and barrier:
 /// - a recorded compound's call is recorded before the barrier, so the publication that makes its effect durable
-///   carries what it answered (A-127): a change to a volume rides that publication (an UNSTABLE write's, the next one);
+///   carries what it answered (A-127): a change to a volume rides that publication;
 /// - the barrier (§4.8, D-18) publishes a mutation's effect into anchor-owned RAM before its reply leaves this shard,
 ///   so the reply's stability claim is true for daemon-restart survival;
 /// - a held connection's mutation holds its reply before the barrier, so the publication carries both (A-128);
@@ -1302,7 +1216,7 @@ fn record_and_publish(
   if let Some(call) = call.as_ref()
     && matches!(served.0, AcceptStatus::Success)
   {
-    let changed = changes_volume(program, procedure, args, &served.1);
+    let changed = needs_barrier(program, procedure, &served.1);
     let _ = state::with_state_counted(|s| {
       crate::nfs_replay::record(s, call, procedure, &served.1, changed);
     });
@@ -1313,14 +1227,19 @@ fn record_and_publish(
     .and_then(|volume| state::with_state(|s| crate::verbs::awaits_publication(s, volume)))
     .unwrap_or(false);
   if !matches!(served.0, AcceptStatus::Success)
-    || !(needs_barrier(program, procedure, args, &served.1) || awaits_publication)
+    || !(needs_barrier(program, procedure, &served.1) || awaits_publication)
   {
     return served;
   }
   if let Some(connection) = held {
     let _ = state::with_state_counted(|s| hold_reply(s, (connection, xid), &served));
   }
-  let barriered = barrier(procedure, target_volume(program, procedure, args), served);
+  let barriered = barrier(
+    procedure,
+    target_volume(program, procedure, args),
+    served,
+    !unstable_write(program, procedure, args),
+  );
   if let Some(connection) = held {
     let _ = state::with_state_counted(|s| hold_reply(s, (connection, xid), &barriered));
   }
@@ -1355,7 +1274,8 @@ async fn serve_remote(
     origin,
     owner,
     move || async move {
-      let (served, owed) = serve_local(requester, xid, program, procedure, &args, port);
+      let ((served, owed), _) =
+        serve_local_fetched(requester, xid, program, procedure, &args, port).await;
       let served = stable_once_durable(procedure, served).await;
       if let Some(owed) = owed {
         let _ = crate::told::wait(owed).await;
@@ -1426,15 +1346,31 @@ impl VolumeSet for GatheredVolumeSet {
   }
 }
 
-/// Gathers every owner's entries, each waited for in its owner's own time up to the liveness budget of its CPU
-/// (`xshard::within_shard_time`, R3 class A; before, one wall second for them all, and a listing failed while a starved
-/// shard was still answering). Any failed admission, missing reply or owner given up refuses the entire listing. Calls own their registrations, so early return
-/// or cancellation also releases the gathers still in flight (AUD-04/AUD-17).
+/// Gathers the host root's entries from the one shard that can list any: the partition the capability's attachment
+/// names (its high bits, `verbs::owner_of_attachment`; D-14, ids route to owners). A shard lists only volumes it serves
+/// whose attachment record its own partition holds ([`listable`]), so no other shard has an entry to give. Without a
+/// capability, or with one naming no partition of this daemon, nothing is listed and no shard is asked (AUD-01). Before,
+/// every shard was asked, so a capability holder made every shard answer, and a wedged shard the capability had nothing
+/// on failed the listing. The owner is waited for in its own time up to the liveness budget of its CPU
+/// (`xshard::within_shard_time`, R3 class A); a failed admission, a missing reply or an owner given up refuses the
+/// listing. Calls own their registrations, so early return or cancellation also releases a gather still in flight
+/// (AUD-04/AUD-17).
 async fn gather_all_entries(
   capability: Option<MountCapability>,
 ) -> Option<Vec<(String, VolumeId)>> {
-  let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone()))?;
-  gather_entries(origin, &shards, capability).await
+  let Some((attachment, _)) = capability else {
+    return Some(Vec::new());
+  };
+  let (origin, owner) = state::with_state(|s| {
+    (
+      s.shard,
+      crate::verbs::shard_of_partition(s, crate::verbs::owner_of_attachment(attachment)),
+    )
+  })?;
+  let Some(owner) = owner else {
+    return Some(Vec::new());
+  };
+  gather_entries(origin, &[owner], capability).await
 }
 
 async fn gather_entries(
@@ -1461,15 +1397,15 @@ async fn gather_entries(
   Some(all)
 }
 
-/// Whether a call is a `READDIR`/`READDIRPLUS` of the synthetic host root (which must list every
-/// shard's volumes, not just this shard's).
+/// Whether a call is a `READDIR`/`READDIRPLUS` of the synthetic host root (which lists the volume its capability
+/// authorizes, from the shard that owns the capability's attachment, [`gather_all_entries`]).
 fn is_root_listing(program: u32, procedure: u32, args: &[u8]) -> bool {
   program == NFS_PROGRAM
     && (procedure == NFSPROC3_READDIR || procedure == NFSPROC3_READDIRPLUS)
     && request_volume(&XdrReader::new(args)) == Some(root_volume())
 }
 
-/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries of every shard, as `requester`
+/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries, as `requester`
 /// (the listing is read-only, so the group only rides for uniformity — the root creates nothing).
 fn serve_root_listing(
   requester: Requester,
@@ -1563,7 +1499,7 @@ async fn reply_for(
 }
 
 /// Serves one NFSv3, MOUNT or portmap call, routing it locally, to a volume's owner shard over the
-/// bridge queue, or (a host-root listing) across every shard, all as `requester` (the mounting user,
+/// bridge queue, or (a host-root listing) from the shard its capability names, all as `requester` (the mounting user,
 /// §4.13). The v4 front end serves each of its operations through here too, so both versions route,
 /// authorize and publish alike.
 async fn serve_v3(
@@ -1621,6 +1557,61 @@ async fn serve_v3(
   served
 }
 
+/// Serves one call locally ([`serve_local`]) on the volume's owner shard, waiting while what it reads is fetched from an
+/// S3 base (§4.15 "An S3 base", A-555): a call answered `NFS3ERR_JUKEBOX` after a host call of it met a pending fetch
+/// changed nothing, so it waits for that fetch (`crate::base_wait`) and is served again from its start once it lands,
+/// within the failover delay from its first wait, the most a reply is held. A call that cannot wait (the shard's waits
+/// at their bound, the delay passed) is answered the retry it was given. With the answer goes the recall gate's
+/// refusals as they stood just before the run that answered, which a delegation's hold judges by (A-79).
+async fn serve_local_fetched(
+  requester: Requester,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  port: u16,
+) -> (
+  ((AcceptStatus, Vec<u8>), Option<crate::told::Owed>),
+  Option<u64>,
+) {
+  let mut until = None;
+  loop {
+    let seen = state::with_state(|s| s.store.recall_gate.refusals());
+    let answered = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let Some(key) = met_pending_base(&answered.0) else {
+      return (answered, seen);
+    };
+    if !waited_for_base(key, &mut until).await {
+      return (answered, seen);
+    }
+  }
+}
+
+/// The fetch a call just served waits for (A-555): the one a host call of it met pending
+/// (`ShardState::nfs_pending_base`, taken here so it never outlives its call), when the call was answered the retry a
+/// pending base's refusal is on this wire (`NFS3ERR_JUKEBOX`). `None` for every other call.
+fn met_pending_base(served: &(AcceptStatus, Vec<u8>)) -> Option<crate::base_wait::Key> {
+  let met = state::with_state(|s| s.nfs_pending_base.take()).flatten()?;
+  (served.0 == AcceptStatus::Success && leading_status(&served.1) == Some(Nfsstat3::Jukebox as u32))
+    .then_some(met)
+}
+
+/// Waits for the fetch `key` names to land, until the call's deadline: `until`, the failover delay from its first wait,
+/// set then. Whether the call runs again.
+async fn waited_for_base(key: crate::base_wait::Key, until: &mut Option<u64>) -> bool {
+  let deadline = match *until {
+    Some(deadline) => deadline,
+    None => {
+      let failover =
+        state::with_state(|s| s.failover_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+      let deadline = futures::now_ns().saturating_add(failover);
+      *until = Some(deadline);
+      deadline
+    }
+  };
+  crate::base_wait::wait(key, deadline).await == crate::base_wait::Waited::Landed
+}
+
 /// Counter: NFSv3 calls the recall gate refused that were held for the delegation's return rather than answered
 /// `NFS3ERR_JUKEBOX` (A-79), one per wait.
 const V3_HELD: &str = "nfs.v3.held_for_recall";
@@ -1645,8 +1636,8 @@ async fn serve_local_held(
   let holdable = program == NFS_PROGRAM && matches!(requester.dialect, Dialect::Nfs3 { .. });
   let mut deadline: Option<u64> = None;
   loop {
-    let seen = state::with_state(|s| s.store.recall_gate.refusals());
-    let (served, owed) = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let ((served, owed), seen) =
+      serve_local_fetched(requester.clone(), xid, program, procedure, args, port).await;
     let served = stable_once_durable(procedure, served).await;
     // A change the call recorded is told to every FUSE mount of its volume before the reply (AC-3.3). A call the
     // recall gate refused changed nothing, so it owes nothing and is not held here.
@@ -1657,7 +1648,7 @@ async fn serve_local_held(
       (
         s.store.recall_gate.refusals(),
         s.store.recall_gate.generation(),
-        s.config.failover_slo_ns,
+        v4_lease_ns(s),
       )
     });
     let (Some(seen), Some((refusals, generation, lease))) = (seen, gate) else {
@@ -1952,7 +1943,9 @@ fn with_v4_sessions<R>(
 
 /// Sends `work` to shard `to` and awaits its outcome in a detached task of this shard, counting `lost` when it could
 /// not be delivered or did not answer while `to` was working, up to the liveness budget of its CPU
-/// (`xshard::within_shard_time`, R3 class A), never a silent drop (banned item 9).
+/// (`xshard::within_shard_time`, R3 class A), never a silent drop (banned item 9). Derived (A-442): the budget is the
+/// liveness window every cross-shard wait judged in its target's own time takes as its window (A-65): a wall window,
+/// then more while `to` runs or waits for a CPU, so a starved shard's answer is heard and a wedged one's given up.
 fn send_note(
   this: u16,
   to: u16,
@@ -2086,9 +2079,50 @@ impl compound::Backend for PurgeBackend {
   }
 }
 
-/// Sends the purges this shard's NFSv4 table owes its owners, if it owes any (2026-10-10): at the reap loop's cadence,
-/// so a purge an owner could not take, and every purge a restart left owed, goes out without waiting for a client. A
-/// table that is not built yet is built when its partition owes purges, as its first compound would build it.
+/// Keeps the deadline of this shard's next purge round (A-570), as each access to the NFSv4 table closes
+/// (`crate::nfs_state::record_clients`): while the table owes a purge, a round a retry window on
+/// (`crate::deadlines::retry_window_ns`), so one an owner could not take goes again then; none once it owes nothing. A
+/// round in flight, a client's own included, settles what its owners took before the deadline comes. Until A-570 the
+/// reap loop's tick sent what was owed once a liveness window, whether anything was owed or not.
+pub(crate) fn note_purges(state: &mut ShardState) {
+  let owes = state
+    .nfs_v4
+    .as_ref()
+    .is_some_and(|server| server.sessions.owes());
+  if !owes {
+    state.nfs_purge_at = None;
+    return;
+  }
+  if state.nfs_purge_at.is_none() {
+    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    let at = now.saturating_add(crate::deadlines::retry_window_ns());
+    state.nfs_purge_at = Some(at);
+    crate::deadlines::noted(state, at);
+  }
+}
+
+/// Owes a purge round at once when the shard's partition starts owing purges a predecessor journaled (A-570): every
+/// purge a restart left owed goes out at the start, not a tick later.
+pub(crate) fn arm_purges_at_start(state: &mut ShardState, now: u64) {
+  if state.db.partition().nfs_purges().next().is_some() {
+    state.nfs_purge_at = Some(now);
+  }
+}
+
+/// Hands a purge round to the shard's reaper (A-570), from the deadline keeper's pass at `nfs_purge_at`: the round
+/// awaits its owners' answers, so the keeper does not run it.
+pub(crate) fn owe_purge_round(state: &mut ShardState) {
+  state.nfs_purge_at = None;
+  state.nfs_purge_owed = true;
+  if let Some(reaper) = state.reaper_task {
+    slates_rt::registry::wake(reaper.0);
+  }
+}
+
+/// Sends the purges this shard's NFSv4 table owes its owners, if it owes any (2026-10-10): run by the shard's reaper
+/// when the deadline keeper hands it a round (A-570: at a start that owes purges, and a retry window after a round left
+/// any owed), so a purge an owner could not take, and every purge a restart left owed, goes out without waiting for a
+/// client. A table that is not built yet is built when its partition owes purges, as its first compound would build it.
 pub(crate) async fn purge_owed_here() {
   let owes = state::with_state(|s| {
     if s.nfs_v4.is_none() && s.db.partition().nfs_purges().next().is_some() {
@@ -2308,11 +2342,19 @@ impl compound::Backend for RoutedBackend {
 /// which authorizes nothing.
 const NO_CAPABILITY: MountCapability = (0, [0u8; 16]);
 
-/// The NFSv4 limits this shard's listener runs under (§4.6 A-35, `config::nfs_v4_caps`): the lease the
-/// operator's failover SLO (a client silent through a whole failover may be evicted when the table is
-/// full); requests and replies up to the v3 transfer ceiling plus one compound header, and a kept reply
-/// up to one compound header (a larger reply is an idempotent READ or READDIR, whose retry is resent as
-/// new).
+/// The NFSv4 lease (RFC 8881 §8.3; A-425): what the listener grants every client and advertises as `FATTR4_LEASE_TIME`,
+/// the wait a recalled delegation is owed before it is revoked and after which a recalled file may be delegated again
+/// (§10.4.5, §10.4), the wait an NFSv3 write the recall gate refused gives the delegation's return, and the wait a
+/// landing gives it (`landing::recall_before_finish`). Every one of them reads this, so they are one number by
+/// construction: `config::NfsV4Caps::lease_ns`, derived from the idle Linux client's renewal floor and a liveness window.
+pub(crate) fn v4_lease_ns(s: &ShardState) -> u64 {
+  s.config.nfs_v4.lease_ns
+}
+
+/// The NFSv4 limits this shard's listener runs under (§4.6 A-35, `config::nfs_v4_caps`): the lease
+/// ([`v4_lease_ns`]: a client silent past it may be evicted when the table is full); requests and replies up to the
+/// v3 transfer ceiling plus one compound header, and a kept reply up to one compound header (a larger reply is an
+/// idempotent READ or READDIR, whose retry is resent as new).
 pub(crate) fn v4_limits(s: &ShardState) -> Limits {
   let caps = s.config.nfs_v4;
   let size = slates_bridge_nfs::procedures::MAX_TRANSFER + compound::COMPOUND_HEADER_BYTES;
@@ -2327,7 +2369,7 @@ pub(crate) fn v4_limits(s: &ShardState) -> Limits {
       max_operations: size / compound::MIN_OPERATION_BYTES,
       max_requests: caps.slots,
     },
-    lease_ns: s.config.failover_slo_ns,
+    lease_ns: v4_lease_ns(s),
   }
 }
 
@@ -2616,16 +2658,20 @@ pub(crate) fn next_connection_id() -> u64 {
   })
 }
 
-/// What ends a connection the anchor holds: its id, if held. Ending one shuts it down (so the client sees it close
-/// though the anchor still holds a copy) and releases the anchor's copy.
+/// What ends a connection the anchor holds: its id, if held, and its ledger slot, if its sends are recorded (A-550).
+/// Ending one shuts it down (so the client sees it close though the anchor still holds a copy) and releases the
+/// anchor's copy.
 #[derive(Clone, Copy, Debug)]
 struct Ending {
   held: Option<u64>,
+  slot: Option<usize>,
 }
 
 impl Ending {
-  /// Releases the anchor's copy and the hold's place under the bound; without a hold, nothing.
+  /// Frees the ledger slot, then releases the anchor's copy and the hold's place under the bound; without a hold,
+  /// nothing more. A death between the two leaves a held connection no ledger records, which a successor ends.
   fn release(self) {
+    crate::held_send::free(self.slot);
     let Some(connection) = self.held else {
       return;
     };
@@ -2639,12 +2685,50 @@ impl Ending {
   }
 }
 
+/// The status refusal count of accepted connections a kept ledger could not hold because the kernel did not count their
+/// bytes handed from zero (A-550): each is served unheld, as every Linux connection was before.
+const COUNT_REFUSED: &str = "nfs.held_send.count_refused";
+
+/// How an accepted connection is held across a restart (A-113, A-550).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holding {
+  /// Not held: no anchor, or a connection whose stream a successor could not tell stands on a record's boundary.
+  Unheld,
+  /// Held, every send of a record all or nothing (macOS, the BSDs).
+  Whole,
+  /// Held, every send recorded in this daemon's ledger, judged against the kernel's count at a successor's adoption
+  /// (Linux).
+  Ledgered,
+}
+
+/// How `stream`, just accepted and written nothing, is held: under an anchor, with whole sends where the kernel makes
+/// them, else under the ledger where this daemon keeps one and the kernel counts the bytes handed, which must read zero
+/// here as an accepted connection's does (no SYN counted, `slates_rt::tcp::TcpStream::bytes_handed`); a count that
+/// reads otherwise or not at all holds nothing and is counted ([`COUNT_REFUSED`]).
+fn holding(stream: &TcpStream, whole: slates_rt::tcp::WholeSends) -> Holding {
+  if !crate::anchor_hold::anchored() {
+    return Holding::Unheld;
+  }
+  if whole == slates_rt::tcp::WholeSends::Guaranteed {
+    return Holding::Whole;
+  }
+  if !crate::held_send::kept() {
+    return Holding::Unheld;
+  }
+  if stream.bytes_handed() == Ok(Some(0)) {
+    return Holding::Ledgered;
+  }
+  crate::fleet::count_refusal(COUNT_REFUSED);
+  Holding::Unheld
+}
+
 /// Admits an accepted connection (A-113): sizes its kernel buffers to [`CONNECTION_BUFFER_BYTES`] (a request must sit
 /// whole in the receive queue to be peeked), makes its sends of up to [`RECORD_WIRE_BYTES`] whole where the kernel
-/// offers that, and — under a supervising anchor that can hold it — hands the anchor a duplicate before its first
-/// request is read. A connection whose buffers or low-water mark the kernel refuses, or that the hold bound or the
-/// channel refuses, is shut down and counted ([`HOLD_REFUSED`]); the client reconnects. Where the kernel cannot make a
-/// send whole (Linux), a connection is served unheld: holding it would let a successor resume mid-record (GAPS, A-113).
+/// offers that, and — under a supervising anchor that can hold it ([`holding`]) — hands the anchor a duplicate before
+/// its first request is read. Where the kernel cannot make a send whole (Linux), the connection is held only under this
+/// daemon's ledger: its slot is claimed before the anchor holds it, so a held connection always has a record (A-550).
+/// A connection whose buffers or low-water mark the kernel refuses, or that the hold bound, the ledger's slots or the
+/// channel refuses, is shut down and counted ([`HOLD_REFUSED`]); the client reconnects.
 fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
   let refuse = |stream: &TcpStream| {
     crate::fleet::count_refusal(HOLD_REFUSED);
@@ -2661,7 +2745,10 @@ fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
       return None;
     }
   };
-  let held = if whole == slates_rt::tcp::WholeSends::Guaranteed && crate::anchor_hold::anchored() {
+  let holding = holding(&stream, whole);
+  let (held, slot) = if holding == Holding::Unheld {
+    (None, None)
+  } else {
     let admitted = HELD_CONNECTIONS
       .fetch_update(
         std::sync::atomic::Ordering::Relaxed,
@@ -2674,34 +2761,54 @@ fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
       return None;
     }
     let connection = next_connection_id();
+    let slot = if holding == Holding::Ledgered {
+      let Some(slot) = crate::held_send::claim(connection) else {
+        HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        refuse(&stream);
+        return None;
+      };
+      Some(slot)
+    } else {
+      None
+    };
     if !matches!(
       crate::anchor_hold::hold_connection(connection, &stream),
       Some(Ok(()))
     ) {
+      crate::held_send::free(slot);
       HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
       refuse(&stream);
       return None;
     }
-    Some(connection)
-  } else {
-    None
+    (Some(connection), slot)
   };
-  Some(Connection::new(stream, port, held))
+  let mut connection = Connection::new(stream, port, held);
+  connection.slot = slot;
+  Some(connection)
 }
 
 /// Serves again the connections a dead daemon left (A-113), each handed back by the anchor
 /// ([`crate::anchor_hold::adopt`]): the socket and its buffers and low-water marks are as the dead daemon left them;
-/// every request it had not answered is still queued, since a request is consumed only after its reply's send. A
-/// connection that cannot be adopted is released, so the anchor closes the last copy and the client reconnects.
+/// every request it had not answered is still queued, since a request is consumed only after its reply's send. Where a
+/// send may have stopped mid-record (Linux), each is first judged by the newest ledger the anchor handed back
+/// (`inherited`) and the kernel's count of the bytes handed, and served on only on a record's boundary
+/// ([`crate::held_send::Handover`], A-550); this daemon's own ledger, shaped for `bound` connections and the machine's
+/// `cache_line`, is held before any adopted connection sends. A connection that cannot be adopted is shut down and
+/// released, so the anchor closes the last copy and the client reconnects.
 pub(crate) fn adopt_held(
   handed: Vec<crate::anchor_hold::HandedConnection>,
+  inherited: crate::held_send::Inherited,
   port: u16,
   bound: usize,
+  cache_line: usize,
 ) {
+  let handover = crate::held_send::Handover::start(inherited, bound, cache_line);
+  let mut adopted = Vec::new();
   for crate::anchor_hold::HandedConnection { connection, socket } in handed {
     LAST_CONNECTION_ID.with(|last| last.set(last.get().max(connection)));
     let ending = Ending {
       held: Some(connection),
+      slot: None,
     };
     let previously = HELD_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(stream) = TcpStream::from_owned(socket) else {
@@ -2716,10 +2823,22 @@ pub(crate) fn adopt_held(
       ending.release();
       continue;
     }
+    let crate::held_send::Verdict::Serve(slot) = handover.judge(connection, &stream) else {
+      // Its stream cannot be shown to stand on a record's boundary (A-550, counted by its reason): it ends.
+      let _ = stream.shutdown();
+      ending.release();
+      continue;
+    };
     note(NFS_CONNECTIONS_ADOPTED);
-    let mut adopted = Connection::new(stream, port, Some(connection));
-    adopted.inherited = true;
-    spawn_connection(adopted);
+    let mut adoption = Connection::new(stream, port, Some(connection));
+    adoption.slot = slot;
+    adoption.inherited = true;
+    adopted.push(adoption);
+  }
+  // The fresh ledger is held and the inherited ones let go before any adopted connection sends (A-550).
+  handover.finish();
+  for adoption in adopted {
+    spawn_connection(adoption);
   }
 }
 
@@ -2761,6 +2880,9 @@ struct Connection {
   carry: Option<(SessionId, DepartedSession)>,
   /// The connection's id while the anchor holds it.
   held: Option<u64>,
+  /// Its slot in this daemon's send ledger, where a held connection's sends may stop mid-record (Linux, A-550): every
+  /// send on it is recorded there before and after ([`send_ledgered`]).
+  slot: Option<usize>,
   /// Handed to this daemon by its anchor at its start (A-231; `Requester::inherited`).
   inherited: bool,
   /// The receive low-water mark last set, so it is set only when it changes (0: not known on this shard).
@@ -2782,6 +2904,7 @@ impl Connection {
       home: registry::current_shard().unwrap_or(0),
       carry: None,
       held,
+      slot: None,
       inherited: false,
       #[cfg(unix)]
       wanted: 0,
@@ -2792,7 +2915,10 @@ impl Connection {
 
   /// What ends this connection, kept apart from it for the paths that lose the socket.
   fn ending(&self) -> Ending {
-    Ending { held: self.held }
+    Ending {
+      held: self.held,
+      slot: self.slot,
+    }
   }
 
   /// Ends the connection while this daemon lives: shuts it down, so the client sees it close although the anchor's copy
@@ -3272,7 +3398,7 @@ async fn send_run(
   consumed: &mut usize,
 ) -> bool {
   if !run.is_empty() {
-    match connection.stream.send_records_vectored(run).await {
+    match send_ledgered(connection, run).await {
       Ok(slates_rt::tcp::Sent::Whole) => {}
       Ok(slates_rt::tcp::Sent::Completed) => note(NFS_SEND_COMPLETED),
       Err(_) => return false,
@@ -3289,14 +3415,34 @@ async fn send_callbacks(connection: &Connection, records: &[Vec<u8>]) -> bool {
   let mut run: Vec<u8> = Vec::new();
   for record in records {
     if !run.is_empty() && run.len().saturating_add(record.len()) > RECORD_WIRE_BYTES {
-      if connection.stream.send_records(&run).await.is_err() {
+      if send_ledgered(connection, &[&run]).await.is_err() {
         return false;
       }
       run.clear();
     }
     run.extend_from_slice(record);
   }
-  run.is_empty() || connection.stream.send_records(&run).await.is_ok()
+  run.is_empty() || send_ledgered(connection, &[&run]).await.is_ok()
+}
+
+/// Sends `records` on `connection` as one run of whole records, its ledger slot told the run's length before and that
+/// the run is in the kernel after (A-550). It is the only writer of a connection's stream, so a held connection's
+/// ledger always says where its stream stands: a byte sent past it would leave the record behind the stream. A send
+/// that fails ends the connection with its record naming the run, which a successor judges by the kernel's count.
+async fn send_ledgered(
+  connection: &Connection,
+  records: &[&[u8]],
+) -> Result<slates_rt::tcp::Sent, slates_rt::RtError> {
+  let len = records
+    .iter()
+    .map(|record| record.len())
+    .fold(0usize, usize::saturating_add);
+  crate::held_send::begin(connection.slot, len);
+  let sent = connection.stream.send_records_vectored(records).await;
+  if sent.is_ok() {
+    crate::held_send::commit(connection.slot);
+  }
+  sent
 }
 
 /// A connection's registration in its shard's back-channel table, ended when the serve loop ends (any path, a
@@ -3392,12 +3538,14 @@ fn bind_back_channel(sessionid: SessionId, id: u64, minor: Option<u32>) {
 const NFS4_CALLBACK_PROBES: &str = "nfs4.callback.probes";
 
 /// Probes `sessionid`'s back channel with `CB_SEQUENCE` alone and records whether the client answered `NFS4_OK`
-/// within a liveness budget.
+/// within the back channel's learned round trip (`callback::bound_ns`, A-442).
 async fn probe_back_channel(sessionid: SessionId) {
+  let bound = state::with_state(|s| crate::callback::bound_ns(s, &sessionid))
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   let outcome = crate::callback::call_on_slot(
     sessionid,
     |next| slates_bridge_nfs::v4::callback::probe(&sessionid, next.minor, next.sequence),
-    crate::daemon::LIVENESS_BUDGET_NS,
+    bound,
   )
   .await;
   if let Err(error) = outcome {
@@ -3453,6 +3601,7 @@ fn migrate(owner: u16, connection: Connection) {
     home,
     carry,
     held,
+    slot,
     inherited,
     #[cfg(windows)]
     inbox,
@@ -3483,6 +3632,8 @@ fn migrate(owner: u16, connection: Connection) {
         home,
         carry: None,
         held,
+        // Its ledger slot goes with it: the owner's shard records its sends from here (A-550).
+        slot,
         inherited,
         #[cfg(unix)]
         wanted: 0,
@@ -3757,5 +3908,131 @@ mod tests {
       .unwrap();
     runtime.run_until_idle();
     assert_eq!(received.try_recv().unwrap(), None);
+  }
+
+  /// RFC 8881 §8.3, A-425. Do: on a shard whose failover delay is one liveness window, take the limits its NFSv4
+  /// listener runs under and a client table of one under them; register a client, then have a second client
+  /// ask the full table for room just before the first's next renewal were it an idle Linux client (its renewal floor
+  /// after its last renewal, delivered within a liveness window), and again once the first has been silent a whole
+  /// lease. Expect: the first ask refused `NFS4ERR_DELAY` with the idle client kept, and the second granted in its
+  /// place. Before A-425, the lease was the operator's failover placeholder (gone since A-525), so with a short one
+  /// every idle Linux client lapsed between two of its renewals, and a full table dropped a live client's state.
+  #[test]
+  fn an_idle_linux_client_keeps_its_nfs_v4_lease_whatever_the_failover_delay() {
+    use slates_bridge_nfs::v4::session::{ExchangeId, Sessions};
+    use slates_bridge_nfs::v4::types::VERIFIER_SIZE;
+    let limits = crate::daemon::audit_on_shard(|s| {
+      s.failover_ns = crate::daemon::LIVENESS_BUDGET_NS;
+      v4_limits(s)
+    });
+    let mut table = Sessions::new(
+      1,
+      Limits {
+        max_clients: 1,
+        ..limits
+      },
+    );
+    let ask = |owner: &[u8]| ExchangeId {
+      verifier: [1; VERIFIER_SIZE],
+      owner: owner.to_vec(),
+      principal: 0,
+    };
+    // The table's clock starts anywhere; the client's last renewal is its registration.
+    let born = 0;
+    let idle = table.exchange_id(&ask(b"idle"), born).unwrap();
+    let before_its_renewal =
+      born + crate::config::NFS_V4_CLIENT_RENEWAL_FLOOR_NS + crate::daemon::LIVENESS_BUDGET_NS - 1;
+    assert_eq!(
+      table.exchange_id(&ask(b"second"), before_its_renewal),
+      Err(Nfsstat4::Delay),
+      "the full table kept the idle client: its lease outlasts the gap between its renewals"
+    );
+    assert!(table.holds_client(idle.clientid));
+    let past_its_lease = born + limits.lease_ns + 1;
+    assert!(
+      table.exchange_id(&ask(b"second"), past_its_lease).is_ok(),
+      "a client silent a whole lease makes room"
+    );
+    assert!(!table.holds_client(idle.clientid));
+  }
+}
+
+#[cfg(test)]
+mod purge_round_tests {
+  use std::time::{Duration, Instant};
+
+  use slates_bridge_nfs::v4::session::ExchangeId;
+  use slates_bridge_nfs::v4::types::VERIFIER_SIZE;
+  use slates_vfs::clock::Clock;
+
+  use crate::daemon::LIVENESS_BUDGET_NS;
+
+  /// Shape: how long past a window after the refused round the test waits for the next round: half a window.
+  const AGAIN_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
+  /// Shape: the pause between the test's looks.
+  const LOOK_PAUSE_NS: u64 = 1_000_000;
+  /// Shape: the NFSv4 client the test makes and drops: any owner and uid.
+  const OWNER: &[u8] = b"purge-round-test";
+
+  /// A-570 (the NFS purge off the tick). Do: on a one-shard daemon, its owners refusing
+  /// every purge (`Daemon::inject_nfs_purge_refusal`'s flag), make and drop an NFSv4 client, so its table owes the
+  /// purge, and run a purge round as a client's call would, refused; then watch for the next round. Expect: the next
+  /// round no sooner than a window after the refused one and within half a window more, at the deadline the table's
+  /// debt set. The reap loop's tick sent what was owed at its looks, half a window after the refused round here.
+  #[test]
+  fn a_refused_purge_goes_again_a_window_after_its_round() {
+    let daemon = crate::daemon::audit_daemon_of(1);
+    let refused_at = Instant::now();
+    crate::daemon::observe_first(&daemon, |state| {
+      state.nfs_purges_refused = true;
+      if state.nfs_v4.is_none() {
+        state.nfs_v4 = crate::nfs_state::server(state);
+      }
+      let now = state.clock.monotonic_ns();
+      let server = state.nfs_v4.as_mut().unwrap();
+      let granted = server
+        .sessions
+        .exchange_id(
+          &ExchangeId {
+            verifier: [1; VERIFIER_SIZE],
+            owner: OWNER.to_vec(),
+            principal: 0,
+          },
+          now,
+        )
+        .unwrap();
+      server.sessions.destroy_clientid(granted.clientid).unwrap();
+      assert!(crate::nfs_state::record_clients(state));
+      let round = slates_rt::futures::spawn(super::purge_owed_here()).unwrap();
+      let _ = slates_rt::futures::detach(round);
+    });
+    let refusals = |daemon: &crate::daemon::Daemon| {
+      crate::daemon::observe_first(daemon, |state| {
+        state
+          .refusals
+          .get(super::NFS4_PURGES_REFUSED_INJECTED)
+          .copied()
+          .unwrap_or(0)
+      })
+    };
+    let again = loop {
+      if refusals(&daemon) >= 2 {
+        break Some(refused_at.elapsed());
+      }
+      if refused_at.elapsed() > Duration::from_nanos(LIVENESS_BUDGET_NS + AGAIN_WITHIN_NS) {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test waits on its wheel.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_nanos(LOOK_PAUSE_NS));
+    };
+    daemon.stop();
+    let again = again
+      .expect("the refused purge went again within half a window past a window after its round");
+    println!("a refused purge went again {again:?} after its round");
+    assert!(
+      again >= Duration::from_nanos(LIVENESS_BUDGET_NS),
+      "not sent again before a window after the refused round: {again:?}"
+    );
   }
 }

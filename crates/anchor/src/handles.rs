@@ -1,6 +1,6 @@
 //! The Windows hold channel's formats (A-198; §4.6 "Windows", A-61's counterpart): the messages a daemon and the anchor
-//! exchange to hold a daemon's handles across its death, and the environment variable that hands every held handle to
-//! the next daemon. Windows has no `SCM_RIGHTS`, so a handle cannot travel with its message: a hold names the daemon's
+//! exchange to hold a daemon's handles across its death, and the handoff that hands every held handle to the next
+//! daemon. Windows has no `SCM_RIGHTS`, so a handle cannot travel with its message: a hold names the daemon's
 //! handle values, the anchor duplicates each out of its child (it holds the child's process handle from the spawn) and
 //! answers, and the daemon commits the record that names the hold only once the anchor has answered that it holds it.
 //! A daemon that dies before the anchor took its handles leaves nothing held (the duplicate out of a dead process is
@@ -8,24 +8,131 @@
 //! committed record never names a hold the anchor was not given, the guarantee `SCM_RIGHTS` gives the Unix channel
 //! (`crate::held`).
 //!
+//! Three kinds of entry are held ([`admits`]): a WinFsp mount's handles (A-198); a Shards stream's resync end (A-423,
+//! for A-418's Windows resync), whose record is the stream's session: its token, the owner view its guest named, its
+//! kernel's form and the process that holds the stream; and a Shards stream's DAX section (A-448, A-365's object on
+//! Windows), whose record names the stream's attachment and the file. A session moves while the stream lives (the guest
+//! names its owner, its `INIT` is answered, a restore runs, a holder is named), so a daemon replaces a held entry's
+//! record with [`HandleMessage::Record`], answered as a hold is, where the Unix channel sends a new session
+//! (`crate::held`'s `Session`); the record names no handle, so nothing is duplicated for it.
+//!
+//! **Each kind its own bound** ([`HoldBounds`], A-448): the entries an attachment holds (a mount, a resync end) one per
+//! live attachment, and the DAX sections one per range a shard's fill budget can count. A guest that maps many files
+//! is refused [`Reason::Bound`] at its own bound and never crowds a mount or a stream's resync end out of the anchor.
+//!
+//! **The handoff rides a section, never the environment alone** (A-460). A user-defined environment variable holds at
+//! most 32,767 characters ("The maximum size of a user-defined environment variable is 32,767 characters":
+//! Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue` and "Environment Variables", read 2026-11-18), and the table
+//! the anchor hands a spawned daemon ([`encode_env`]) reaches that at a few dozen mounts: an entry takes up to
+//! [`ENTRY_TEXT_CAP`] characters, about 1,100 for a mount's longest record, and the bounds admit `shards × 4096` of them.
+//! So the table's text is written into a read-only section of its own length, which the spawn hands the child as it
+//! hands the held handles, and [`ENV_HANDLES`] names only that section and the text's length ([`encode_handoff`], at
+//! most [`HANDOFF_TEXT_CAP`] characters whatever the table holds). The caps stay what the daemon can make, never what
+//! a variable can carry.
+//!
 //! Every message is [`MESSAGE_BYTES`] long, checksum-verified and checked by kind, counts and lengths before anything is kept: the channel
-//! crosses a process boundary, so its bytes are external input, and so is the environment a daemon parses. The
-//! transport is `crate::held_windows`; this module is pure and cfg-free, so it is tested on every host.
+//! crosses a process boundary, so its bytes are external input, and so are the environment and the table a daemon
+//! parses. The transport is `crate::held_windows`; this module is pure and cfg-free, so it is tested on every host.
 
-/// Format: the environment variable carrying the hold channel's daemon end and every held entry to a spawned daemon:
-/// `CHANNEL_HEX` then, for each entry, `;ID_HEX:WHAT_HEX:H1_HEX,H2_HEX,...:RECORD_HEX` (`-` for an empty record), then
-/// `#CRC32C_HEX` over the preceding text. Handles are inherited across the spawn at the values named.
+/// Format: the environment variable pointing a spawned daemon at its handoff table (A-460): `TABLE_HEX:LEN_HEX`, the
+/// value in the daemon of the inherited, read-only section holding the table's text, and the text's length in bytes
+/// ([`encode_handoff`]). The table is the hold channel's daemon end and every held entry: `CHANNEL_HEX` then, for each
+/// entry, `;ID_HEX:WHAT_HEX:H1_HEX,H2_HEX,...:RECORD_HEX` (`-` for an empty record), then `#CRC32C_HEX` over the
+/// preceding text ([`encode_env`]). Handles are inherited across the spawn at the values named.
 pub const ENV_HANDLES: &str = "SLATES_ANCHOR_HANDLES";
 
-/// Format: what a hold holds, its `what` byte: a WinFsp mount's volume control handle, drive link and ledger (A-198).
+/// Format: the most characters [`ENV_HANDLES`] takes ([`encode_handoff`]): two `u64`s in hexadecimal and the colon
+/// between them, whatever the table holds, far inside a user-defined environment variable's 32,767 characters.
+pub const HANDOFF_TEXT_CAP: usize = 2 * U64_HEX_DIGITS + 1;
+
+/// Format: what a hold holds, its `what` byte: a WinFsp mount's volume control handle and ledger (A-198), the volume
+/// keeping its Mount Manager drive (A-369).
 pub const WHAT_WINFSP_MOUNT: u8 = 1;
 
-/// Format: the most handles one hold names: a WinFsp mount's three (A-198).
+/// Format: the handles a WinFsp mount's hold names: its volume control handle and its ledger (A-369; A-198's held a
+/// third, the drive's temporary link, which a Mount Manager drive does not have).
+pub const WINFSP_MOUNT_HANDLES: usize = 2;
+
+/// Format: what a hold holds, its `what` byte: a Shards stream's resync end (A-423; A-316's channel on Windows, A-418):
+/// the daemon's end of the stream's message-mode resync pipe, its record the stream's session, which a successor reads
+/// to hand the device a fresh stream.
+pub const WHAT_SHARDS_RESYNC: u8 = 2;
+
+/// Format: the handles a Shards stream's resync hold names: the daemon's end of its resync pipe.
+pub const SHARDS_RESYNC_HANDLES: usize = 1;
+
+/// A Shards stream's DAX section (A-448; A-365's object on Windows): a duplicate of the confined section one file of the
+/// stream's guest is mapped from, mapping read and write and asking its size, its record the stream's attachment and the
+/// file, by which a successor adopts it. Its id is its backing's, named apart from every attachment's (the server's
+/// `dax_hold::marked`), since a release and an answer name an entry by id alone.
+/// Format: what a hold holds, its `what` byte, the third kind.
+pub const WHAT_SHARDS_DAX: u8 = 3;
+
+/// Format: the handles a Shards stream's DAX section hold names: the section.
+pub const SHARDS_DAX_HANDLES: usize = 1;
+
+/// Format: the room one hold's message has for handles: three, A-198's WinFsp mount, kept since A-369 so the message's
+/// layout, which an anchor and a daemon built apart across an upgrade both read, does not move; a hold names one to
+/// this many.
 pub const MAX_HANDLES: usize = 3;
 
 /// Format: a WinFsp mount's largest handoff record: `FSP_FSCTL_VOLUME_NAME_SIZEMAX` (64 + 192 UTF-16 units), its
-/// two-unit drive name (`X:`), and one access-flags byte. The record is opaque to the anchor.
+/// two-unit drive name (`X:`), and one access-flags byte. The record is opaque to the anchor. It bounds every kind's
+/// record: a Shards stream's session is far shorter (A-418).
 pub const RECORD_CAP: usize = (64 + 192 + 2) * size_of::<u16>() + size_of::<u8>();
+
+/// Whether the anchor admits a hold of `what` naming `count` handles: a WinFsp mount one to [`MAX_HANDLES`] (its
+/// daemon names [`WINFSP_MOUNT_HANDLES`]; the room stays as A-198 left it, for a daemon built apart across an upgrade),
+/// a Shards stream's resync end exactly [`SHARDS_RESYNC_HANDLES`], a DAX section exactly [`SHARDS_DAX_HANDLES`], and no
+/// other kind at all.
+pub fn admits(what: u8, count: usize) -> bool {
+  match what {
+    WHAT_WINFSP_MOUNT => (1..=MAX_HANDLES).contains(&count),
+    WHAT_SHARDS_RESYNC => count == SHARDS_RESYNC_HANDLES,
+    WHAT_SHARDS_DAX => count == SHARDS_DAX_HANDLES,
+    _ => false,
+  }
+}
+
+/// The anchor's bounds on the entries it holds for a daemon on Windows (A-198, A-448), one for each class of entry,
+/// each derived by the daemon's configuration and refused [`Reason::Bound`] at its own: so a guest that maps many files
+/// never crowds a mount or a stream's resync end out of the anchor, and no class grows past what its daemon can make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldBounds {
+  /// The entries an attachment holds, a WinFsp mount's or a Shards stream's resync end: one per live attachment the
+  /// daemon's shards can hold (the server's `held_device_bound`).
+  pub attachments: usize,
+  /// The Shards streams' DAX sections: one per range the daemon's shards' fill budgets can count, since each section
+  /// held counts at least one range against its shard's (the server's `held_dax_bound`, A-365's derivation).
+  pub sections: usize,
+}
+
+impl HoldBounds {
+  /// The bound entries of `what` are held against: a DAX section's own, and every other kind's the attachments'.
+  pub fn of(&self, what: u8) -> usize {
+    if what == WHAT_SHARDS_DAX {
+      self.sections
+    } else {
+      self.attachments
+    }
+  }
+
+  /// Whether `what` is held against the same bound as `other`.
+  pub fn shared(what: u8, other: u8) -> bool {
+    (what == WHAT_SHARDS_DAX) == (other == WHAT_SHARDS_DAX)
+  }
+
+  /// Every entry the anchor may hold at once, of every class: the most a handoff names, which a daemon parses at most
+  /// ([`parse_env`]'s bound), and the most messages one drain of the channel may meet.
+  pub fn total(&self) -> usize {
+    self.attachments.saturating_add(self.sections)
+  }
+
+  /// Whether one more entry of `what` fits, `held` of its class being held already.
+  pub fn admits_another(&self, what: u8, held: usize) -> bool {
+    held < self.of(what)
+  }
+}
 
 /// Format: the channel's magic, distinguishing these messages from another inherited protocol.
 const MAGIC: &[u8; 4] = b"SLHD";
@@ -42,6 +149,9 @@ const KIND_HELD: u8 = 3;
 const KIND_REFUSED: u8 = 4;
 /// Format: the anchor's acknowledgement after closing every handle of an entry (A-198).
 const KIND_RELEASED: u8 = 5;
+/// Format: a daemon's replacement of a held entry's record (A-423), laid out as a hold whose kind, count and handle
+/// slots are zero.
+const KIND_RECORD: u8 = 6;
 
 /// Format: where the entry's id starts (after the kind byte).
 const AT_ID: usize = AT_KIND + 1;
@@ -218,6 +328,14 @@ pub enum HandleMessage {
     /// The entry's id.
     id: u64,
   },
+  /// A daemon replaces held entry `id`'s record with `record` (A-423: a Shards stream's session as it moves), answered
+  /// [`HandleMessage::Held`] once the anchor keeps it, or [`HandleMessage::Refused`] for an entry it does not hold.
+  Record {
+    /// The entry's id.
+    id: u64,
+    /// The new record, at most [`RECORD_CAP`] bytes.
+    record: Vec<u8>,
+  },
   /// The anchor holds entry `id`.
   Held {
     /// The entry's id.
@@ -243,6 +361,7 @@ pub fn encode(message: &HandleMessage) -> Result<[u8; MESSAGE_BYTES], HandleRefu
   let mut bytes = [0u8; MESSAGE_BYTES];
   let (kind, id) = match message {
     HandleMessage::Hold { id, .. } => (KIND_HOLD, *id),
+    HandleMessage::Record { id, .. } => (KIND_RECORD, *id),
     HandleMessage::Release { id } => (KIND_RELEASE, *id),
     HandleMessage::Held { id } => (KIND_HELD, *id),
     HandleMessage::Released { id } => (KIND_RELEASED, *id),
@@ -274,6 +393,15 @@ pub fn encode(message: &HandleMessage) -> Result<[u8; MESSAGE_BYTES], HandleRefu
           .ok_or_else(|| malformed("handle offset"))?;
         put(&mut bytes, at, &value.to_le_bytes())?;
       }
+      put(&mut bytes, AT_RECORD_LEN, &record_len.to_le_bytes())?;
+      put(&mut bytes, AT_RECORD, record)?;
+    }
+    // A record's replacement names no kind, count or handle: those bytes stay zero.
+    HandleMessage::Record { record, .. } => {
+      if record.len() > RECORD_CAP {
+        return Err(malformed("a record past RECORD_CAP"));
+      }
+      let record_len = u16::try_from(record.len()).map_err(|_| malformed("record length"))?;
       put(&mut bytes, AT_RECORD_LEN, &record_len.to_le_bytes())?;
       put(&mut bytes, AT_RECORD, record)?;
     }
@@ -341,6 +469,7 @@ pub fn decode(bytes: &[u8]) -> Result<HandleMessage, HandleRefusal> {
   let id = u64_at(bytes, AT_ID)?;
   let (message, used) = match kind {
     KIND_HOLD => decode_hold(bytes, id)?,
+    KIND_RECORD => decode_record(bytes, id)?,
     KIND_RELEASE => (HandleMessage::Release { id }, AT_WHAT),
     KIND_RELEASED => (HandleMessage::Released { id }, AT_WHAT),
     KIND_HELD => (HandleMessage::Held { id }, AT_WHAT),
@@ -381,6 +510,38 @@ fn decode_hold(bytes: &[u8], id: u64) -> Result<(HandleMessage, usize), HandleRe
       return Err(malformed("a handle slot past the count"));
     }
   }
+  let (record, used) = decode_record_field(bytes)?;
+  Ok((
+    HandleMessage::Hold {
+      id,
+      what,
+      values,
+      record,
+    },
+    used,
+  ))
+}
+
+/// A record's replacement (A-423), and how many of the message's bytes it uses: its kind, count and handle slots must
+/// be zero, since it names no handle, and its record is read as a hold's.
+fn decode_record(bytes: &[u8], id: u64) -> Result<(HandleMessage, usize), HandleRefusal> {
+  let unnamed = AT_RECORD_LEN
+    .checked_sub(AT_WHAT)
+    .ok_or_else(|| malformed("record offsets"))?;
+  if field(bytes, AT_WHAT, unnamed)?
+    .iter()
+    .any(|byte| *byte != 0)
+  {
+    return Err(malformed(
+      "a record's replacement names a kind, a count or a handle",
+    ));
+  }
+  let (record, used) = decode_record_field(bytes)?;
+  Ok((HandleMessage::Record { id, record }, used))
+}
+
+/// The record a hold or a record's replacement carries, at most [`RECORD_CAP`] bytes, and the end of the bytes it uses.
+fn decode_record_field(bytes: &[u8]) -> Result<(Vec<u8>, usize), HandleRefusal> {
   let raw: [u8; 2] = field(bytes, AT_RECORD_LEN, RECORD_LEN_BYTES)?
     .try_into()
     .map_err(|_| malformed("record length"))?;
@@ -392,15 +553,7 @@ fn decode_hold(bytes: &[u8], id: u64) -> Result<(HandleMessage, usize), HandleRe
   let used = AT_RECORD
     .checked_add(record_len)
     .ok_or_else(|| malformed("record end"))?;
-  Ok((
-    HandleMessage::Hold {
-      id,
-      what,
-      values,
-      record,
-    },
-    used,
-  ))
+  Ok((record, used))
 }
 
 /// One held entry as the environment hands it to a spawned daemon: its id, what it is, the handle values the daemon
@@ -417,7 +570,8 @@ pub struct HandedEntry {
   pub record: Vec<u8>,
 }
 
-/// The [`ENV_HANDLES`] value handing `channel` (the daemon's end, inherited) and `entries` to a spawned daemon.
+/// The handoff table's text handing `channel` (the daemon's end, inherited) and `entries` to a spawned daemon, which
+/// rides a section of its own length that [`ENV_HANDLES`] names ([`encode_handoff`], A-460).
 pub fn encode_env(channel: u64, entries: &[HandedEntry]) -> String {
   let mut value = format!("{channel:x}");
   for entry in entries {
@@ -445,15 +599,12 @@ fn checked_env(value: &str) -> String {
   )
 }
 
-/// Parses an [`ENV_HANDLES`] value: the channel's value and at most `bound` entries, each checked against the caps
-/// before anything is kept. A value that is not exactly the shape [`encode_env`] writes is refused whole.
+/// Parses a handoff table's text: the channel's value and at most `bound` entries, each checked against the caps before
+/// anything is kept. A text that is not exactly the shape [`encode_env`] writes is refused whole.
 pub fn parse_env(value: &str, bound: usize) -> Result<(u64, Vec<HandedEntry>), HandleRefusal> {
   // At most a channel and `bound` entries, each with bounded hexadecimal fields, plus the checksum suffix. Check
   // before hashing or allocating anything from the input.
-  let cap = bound
-    .checked_mul(ENTRY_TEXT_CAP)
-    .and_then(|entries| entries.checked_add(U64_HEX_DIGITS + CHECKSUM_HEX_DIGITS + 1))
-    .ok_or_else(|| malformed("environment capacity"))?;
+  let cap = table_cap(bound).ok_or_else(|| malformed("handoff capacity"))?;
   if value.len() > cap {
     return Err(malformed("handoff exceeds its entry-derived capacity"));
   }
@@ -518,6 +669,70 @@ fn parse_entry(part: &str) -> Result<HandedEntry, HandleRefusal> {
     values,
     record,
   })
+}
+
+/// Derived: the most bytes a handoff table of `bound` entries takes ([`encode_env`]): the channel's value, `bound`
+/// entries of at most [`ENTRY_TEXT_CAP`] characters each, and the checksum with its `#`. None where it overflows.
+pub fn table_cap(bound: usize) -> Option<usize> {
+  bound
+    .checked_mul(ENTRY_TEXT_CAP)
+    .and_then(|entries| entries.checked_add(U64_HEX_DIGITS + CHECKSUM_HEX_DIGITS + 1))
+}
+
+/// The [`ENV_HANDLES`] value pointing a spawned daemon at its handoff table (A-460): `TABLE_HEX:LEN_HEX`, the value in the
+/// daemon of the inherited read-only section holding the table's text ([`encode_env`]), and the text's length in bytes.
+pub fn encode_handoff(table: u64, len: usize) -> String {
+  format!("{table:x}:{len:x}")
+}
+
+/// Parses an [`ENV_HANDLES`] value: the table section's value and the text's length. Refused unless it is exactly the
+/// shape [`encode_handoff`] writes, in lowercase hexadecimal, names a handle (never zero), and a length from one byte to
+/// the most a table of `bound` entries takes ([`table_cap`]), all checked before anything is mapped or allocated.
+pub fn parse_handoff(value: &str, bound: usize) -> Result<(u64, usize), HandleRefusal> {
+  if value.len() > HANDOFF_TEXT_CAP {
+    return Err(malformed("a handoff pointer past HANDOFF_TEXT_CAP"));
+  }
+  let (table, len) = value
+    .split_once(':')
+    .ok_or_else(|| malformed("a handoff pointer is TABLE:LEN"))?;
+  let table = Some(table)
+    .filter(|text| lower_hex(text))
+    .and_then(hex_u64)
+    .filter(|table| *table != 0)
+    .ok_or_else(|| malformed("the handoff table's value"))?;
+  let len = Some(len)
+    .filter(|text| lower_hex(text))
+    .and_then(hex_u64)
+    .and_then(|len| usize::try_from(len).ok())
+    .filter(|len| *len > 0)
+    .ok_or_else(|| malformed("the handoff table's length"))?;
+  let cap = table_cap(bound).ok_or_else(|| malformed("handoff capacity"))?;
+  if len > cap {
+    return Err(malformed("a handoff table past its entry-derived capacity"));
+  }
+  Ok((table, len))
+}
+
+/// Refuses a handoff whose table names its own section `table` again, as the channel's value or an entry's handle: one
+/// inherited handle has one owner, and the daemon owns the section from the moment it reads the table.
+pub fn check_owners(
+  table: u64,
+  channel: u64,
+  entries: &[HandedEntry],
+) -> Result<(), HandleRefusal> {
+  if channel == table || entries.iter().any(|entry| entry.values.contains(&table)) {
+    return Err(malformed("the handoff table's handle has two owners"));
+  }
+  Ok(())
+}
+
+/// Whether `text` is lowercase hexadecimal digits alone, the only form [`encode_handoff`] writes: so one pointer has one
+/// encoding, with no sign and no capitals.
+fn lower_hex(text: &str) -> bool {
+  !text.is_empty()
+    && text
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn hex_u64(text: &str) -> Option<u64> {
@@ -811,5 +1026,328 @@ mod tests {
       parse_env(&duplicate, 2).is_err(),
       "entries cannot share a handle value"
     );
+  }
+
+  /// The session a Shards stream's resync hold carries in the tests: opaque to the anchor, the length of a Windows
+  /// stream's session (A-418: the token, the owner view, the form, the holder's id and start time).
+  fn session(fill: u8) -> Vec<u8> {
+    vec![fill; 52]
+  }
+
+  /// A-423: golden vector. Do: encode a record's replacement for a held entry. Expect: the magic, the record kind, the
+  /// id, zero where a hold names its kind, count and handles, then the record's length and bytes as a hold's, zero to
+  /// the checksum and the CRC32C; and the message back whole.
+  #[test]
+  fn a_record_encodes_to_its_golden_bytes_and_back() {
+    let message = HandleMessage::Record {
+      id: 0x0102_0304_0506_0708,
+      record: session(0x5a),
+    };
+    let mut expected = MAGIC.to_vec();
+    expected.push(6);
+    expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+    expected.extend_from_slice(&[0, 0]);
+    expected.extend_from_slice(&[0; MAX_HANDLES * size_of::<u64>()]);
+    expected.extend_from_slice(&52u16.to_le_bytes());
+    expected.extend_from_slice(&session(0x5a));
+    expected.resize(AT_CHECKSUM, 0);
+    let checksum = slates_wire::crc32c::crc32c(&expected);
+    expected.extend_from_slice(&checksum.to_le_bytes());
+    let bytes = encode(&message).unwrap();
+    assert_eq!(bytes.to_vec(), expected);
+    assert_eq!(decode(&bytes).unwrap(), message);
+  }
+
+  /// A-423. Do: encode then decode a Shards stream's resync hold (one handle, a session as its record), a record's
+  /// replacement, and one with an empty record. Expect: each back whole, the kind's byte kept.
+  #[test]
+  fn a_resync_hold_and_a_record_round_trip() {
+    for message in [
+      HandleMessage::Hold {
+        id: 11,
+        what: WHAT_SHARDS_RESYNC,
+        values: vec![0x2c4],
+        record: session(1),
+      },
+      HandleMessage::Record {
+        id: 11,
+        record: session(2),
+      },
+      HandleMessage::Record {
+        id: u64::MAX,
+        record: Vec::new(),
+      },
+    ] {
+      let bytes = encode(&message).unwrap();
+      assert_eq!(decode(&bytes).unwrap(), message);
+    }
+  }
+
+  /// A-423: hostile input. Do: decode a record's replacement naming a kind, a count or a handle, one whose record runs
+  /// past the cap, and one with a bit changed anywhere; and encode one whose record is past the cap. Expect: every one
+  /// refused, none accepted, and the long record refused at encoding rather than cut.
+  #[test]
+  fn a_record_names_no_handle_and_stays_within_the_cap() {
+    let good = encode(&HandleMessage::Record {
+      id: 3,
+      record: session(7),
+    })
+    .unwrap();
+    let mut cases = Vec::new();
+    for at in [AT_WHAT, AT_COUNT, AT_HANDLES, AT_RECORD_LEN - 1] {
+      let mut named = good;
+      named[at] = 1;
+      cases.push(named);
+    }
+    let mut long = good;
+    long[AT_RECORD_LEN..AT_RECORD].copy_from_slice(&u16::MAX.to_le_bytes());
+    cases.push(long);
+    for mut case in cases {
+      // Re-signed, so each is refused by its shape and not by its checksum.
+      let checksum = slates_wire::crc32c::crc32c(&case[..AT_CHECKSUM]);
+      case[AT_CHECKSUM..].copy_from_slice(&checksum.to_le_bytes());
+      assert!(
+        matches!(decode(&case), Err(HandleRefusal::Malformed { .. })),
+        "accepted a record beginning {:?}",
+        case.get(..AT_RECORD)
+      );
+    }
+    for offset in 0..good.len() {
+      let mut changed = good;
+      changed[offset] ^= 1;
+      assert!(
+        decode(&changed).is_err(),
+        "accepted a change at byte {offset}"
+      );
+    }
+    assert!(matches!(
+      encode(&HandleMessage::Record {
+        id: 3,
+        record: vec![0; RECORD_CAP + 1],
+      }),
+      Err(HandleRefusal::Malformed { .. })
+    ));
+  }
+
+  /// A-423, A-448. Do: ask whether the anchor admits a hold of each kind naming each count of handles from none to one
+  /// past the message's room, and of kinds no daemon sends. Expect: a WinFsp mount one to the room (its daemon names
+  /// two, the room kept since A-369), a Shards stream's resync end exactly one, a DAX section exactly one, and nothing of
+  /// any other kind.
+  #[test]
+  fn the_anchor_admits_each_kind_at_its_handle_counts_alone() {
+    for count in 0..=MAX_HANDLES + 1 {
+      assert_eq!(
+        admits(WHAT_WINFSP_MOUNT, count),
+        (1..=MAX_HANDLES).contains(&count),
+        "a WinFsp mount naming {count}"
+      );
+      assert_eq!(
+        admits(WHAT_SHARDS_RESYNC, count),
+        count == SHARDS_RESYNC_HANDLES,
+        "a resync end naming {count}"
+      );
+      assert_eq!(
+        admits(WHAT_SHARDS_DAX, count),
+        count == SHARDS_DAX_HANDLES,
+        "a DAX section naming {count}"
+      );
+      for what in [0, 4, u8::MAX] {
+        assert!(!admits(what, count), "kind {what} naming {count}");
+      }
+    }
+  }
+
+  /// A-448. Do: fill each class of a hold's bounds in turn, asking after each entry whether one more of each kind fits.
+  /// Expect: DAX sections refused at their own bound while a mount and a resync end still fit, those refused at theirs
+  /// whatever the sections hold, nothing fitting bounds of none, and the handoff bound the two classes together.
+  #[test]
+  fn each_class_of_entry_is_refused_at_its_own_bound() {
+    let bounds = HoldBounds {
+      attachments: 2,
+      sections: 3,
+    };
+    assert_eq!(bounds.total(), 5);
+    sections_fill_their_own_bound(bounds);
+    attachments_fill_theirs_beside_full_sections(bounds);
+    kinds_share_a_bound_by_class();
+    nothing_fits_bounds_of_none();
+  }
+
+  /// Sections fit `bounds` one by one up to their own bound, and the next is refused.
+  fn sections_fill_their_own_bound(bounds: HoldBounds) {
+    for held in 0..bounds.sections {
+      assert!(
+        bounds.admits_another(WHAT_SHARDS_DAX, held),
+        "section {held}"
+      );
+    }
+    assert!(
+      !bounds.admits_another(WHAT_SHARDS_DAX, bounds.sections),
+      "past the sections' bound"
+    );
+  }
+
+  /// Mounts and resync ends fit `bounds` up to the attachments' bound, whatever the sections hold, and the next is
+  /// refused.
+  fn attachments_fill_theirs_beside_full_sections(bounds: HoldBounds) {
+    for what in [WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC] {
+      let fitting = (0..bounds.attachments)
+        .filter(|held| bounds.admits_another(what, *held))
+        .count();
+      assert_eq!(
+        fitting, bounds.attachments,
+        "kind {what} beside full sections"
+      );
+      assert!(
+        !bounds.admits_another(what, bounds.attachments),
+        "kind {what} past its bound"
+      );
+    }
+  }
+
+  /// A mount and a resync end share a bound; a DAX section shares one with its own kind alone.
+  fn kinds_share_a_bound_by_class() {
+    assert!(HoldBounds::shared(WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC));
+    assert!(!HoldBounds::shared(WHAT_SHARDS_DAX, WHAT_SHARDS_RESYNC));
+    assert!(HoldBounds::shared(WHAT_SHARDS_DAX, WHAT_SHARDS_DAX));
+  }
+
+  /// No kind fits bounds of none.
+  fn nothing_fits_bounds_of_none() {
+    let none = HoldBounds {
+      attachments: 0,
+      sections: 0,
+    };
+    for what in [WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC, WHAT_SHARDS_DAX] {
+      assert!(!none.admits_another(what, 0), "kind {what} with no room");
+    }
+  }
+
+  /// Format: a user-defined environment variable's most characters, as Microsoft documents it: "The maximum size of a
+  /// user-defined environment variable is 32,767 characters" (Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue`,
+  /// and "Environment Variables", both read 2026-11-18).
+  const ENVIRONMENT_VARIABLE_CHARACTERS: usize = 32_767;
+  /// Shape: the mounts of the full table below, each with a record of the whole cap: past the limit above on their own.
+  const FULL_MOUNTS: u64 = 48;
+  /// Shape: the DAX sections of the full table below.
+  const FULL_SECTIONS: u64 = 512;
+  /// Format: a DAX section's record, the server's attachment-and-file record, three words.
+  const SECTION_RECORD_BYTES: usize = 3 * size_of::<u64>();
+  /// Format: the handle values the full table names: mounts' two each and sections' one, all distinct.
+  const VALUE_STRIDE: u64 = 4;
+
+  /// A table full at its bounds: [`FULL_MOUNTS`] mounts with records of [`RECORD_CAP`] bytes and [`FULL_SECTIONS`] DAX
+  /// sections, every handle value distinct.
+  fn full_table() -> (HoldBounds, Vec<HandedEntry>) {
+    let mut entries = Vec::new();
+    for index in 0..FULL_MOUNTS {
+      entries.push(HandedEntry {
+        id: index + 1,
+        what: WHAT_WINFSP_MOUNT,
+        values: vec![
+          0x1_0000 + index * 2 * VALUE_STRIDE,
+          0x1_0000 + (index * 2 + 1) * VALUE_STRIDE,
+        ],
+        record: vec![u8::try_from(index).unwrap(); RECORD_CAP],
+      });
+    }
+    for index in 0..FULL_SECTIONS {
+      entries.push(HandedEntry {
+        id: (1 << 63) | index,
+        what: WHAT_SHARDS_DAX,
+        values: vec![0x10_0000 + index * VALUE_STRIDE],
+        record: vec![0xD4; SECTION_RECORD_BYTES],
+      });
+    }
+    let bounds = HoldBounds {
+      attachments: usize::try_from(FULL_MOUNTS).unwrap(),
+      sections: usize::try_from(FULL_SECTIONS).unwrap(),
+    };
+    (bounds, entries)
+  }
+
+  /// A-460. Do: encode a table full at its bounds, far past what an environment variable holds, point a spawn at it by
+  /// a section and the text's length, and read the pointer and the table back; then point at a table of the most bytes
+  /// those bounds allow, and one byte more. Expect the table past 32,767 characters, the pointer within
+  /// [`HANDOFF_TEXT_CAP`], itself far inside the limit, and the table read back whole, every entry as it was handed, its
+  /// section owned once; the cap's length taken and one past it refused, before anything is read.
+  #[test]
+  fn a_table_past_an_environment_variables_limit_rides_the_handoff_whole() {
+    let (bounds, entries) = full_table();
+    let channel = 0x2c4;
+    let table = encode_env(channel, &entries);
+    assert!(
+      table.len() > ENVIRONMENT_VARIABLE_CHARACTERS,
+      "a full table of {} characters",
+      table.len()
+    );
+    let section = 0x2d8;
+    let pointer = encode_handoff(section, table.len());
+    assert!(pointer.len() <= HANDOFF_TEXT_CAP && pointer.len() < ENVIRONMENT_VARIABLE_CHARACTERS);
+    let (named, len) = parse_handoff(&pointer, bounds.total()).unwrap();
+    assert_eq!((named, len), (section, table.len()));
+    let (handed_channel, handed) = parse_env(table.get(..len).unwrap(), bounds.total()).unwrap();
+    assert_eq!(handed_channel, channel);
+    assert_eq!(handed, entries);
+    check_owners(named, handed_channel, &handed).unwrap();
+    let cap = table_cap(bounds.total()).unwrap();
+    assert_eq!(
+      parse_handoff(&encode_handoff(section, cap), bounds.total()).unwrap(),
+      (section, cap)
+    );
+    assert!(matches!(
+      parse_handoff(&encode_handoff(section, cap + 1), bounds.total()),
+      Err(HandleRefusal::Malformed { .. })
+    ));
+  }
+
+  /// A-460: hostile input. Do: parse pointers of no text, no colon, an empty field, a zero section or length, a sign,
+  /// capitals, a third field, a field of seventeen digits, and one past [`HANDOFF_TEXT_CAP`]. Expect each refused as
+  /// malformed, none read.
+  #[test]
+  fn hostile_handoff_pointers_are_refused() {
+    let long = format!("{}:{}", "1".repeat(U64_HEX_DIGITS + 1), "1");
+    let past = "1".repeat(HANDOFF_TEXT_CAP + 1);
+    for pointer in [
+      "",
+      "2c4",
+      ":10",
+      "2c4:",
+      "0:10",
+      "2c4:0",
+      "+2c4:10",
+      "2c4:+10",
+      "2C4:10",
+      "2c4:10:1",
+      "2c4;10",
+      long.as_str(),
+      past.as_str(),
+    ] {
+      assert!(
+        matches!(
+          parse_handoff(pointer, 8),
+          Err(HandleRefusal::Malformed { .. })
+        ),
+        "pointer {pointer:?}"
+      );
+    }
+  }
+
+  /// A-460. Do: check a table that names its own section as the channel, as one of an entry's handles, and as nothing.
+  /// Expect the first two refused, the section having two owners, and the third taken.
+  #[test]
+  fn a_tables_own_section_is_never_named_again() {
+    let (_, entries) = full_table();
+    let named = entries
+      .last()
+      .and_then(|entry| entry.values.first())
+      .copied()
+      .unwrap();
+    assert!(
+      check_owners(0x2c4, 0x2c4, &entries).is_err(),
+      "as the channel"
+    );
+    assert!(check_owners(named, 0x2c4, &entries).is_err(), "as a handle");
+    assert!(check_owners(0x2d8, 0x2c4, &entries).is_ok());
   }
 }

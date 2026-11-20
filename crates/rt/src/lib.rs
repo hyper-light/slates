@@ -23,10 +23,13 @@
 //! costs nothing to clone, which is what `LocalWaker` would have saved (Phase 0 task 6).
 //!
 //! Modules: [`error`], [`control`], [`waker`], [`registry`], [`parking`] (the kick-if-parked
-//! protocol and its loom model), [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
+//! protocol and its loom model), [`room`] (a sender told when a full control channel has room, and its loom model),
+//! [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`], [`held_turn`] (what a held shard's idle turn costs a
+//! request, learned online, and whether a hold pays),
 //! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
 //! sockets ([`udp`] everywhere and `tcp` on Unix — the NFS mount server's, over one shared readiness
-//! future), and the OS drivers.
+//! future), `handle_wait` (Windows: a kernel object's signal, a client's process ending, waited on by the system thread
+//! pool and posted to the shard's port), and the OS drivers.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -40,6 +43,7 @@ pub mod control;
 pub mod driver;
 pub mod error;
 pub mod futures;
+pub mod held_turn;
 mod interest;
 mod netsys;
 pub mod parking;
@@ -52,12 +56,13 @@ pub mod pipe_state;
 pub mod queue;
 pub mod readiness;
 pub mod registry;
+pub mod room;
 pub mod runtime;
 pub mod shard;
 pub mod sim;
 pub mod task;
 mod thread_clock;
-pub use thread_clock::{CpuReading, RunReading, RunState, process_runnable};
+pub use thread_clock::{CpuReading, RunReading, RunState, process_run_reading};
 // Async TCP on every platform, through the socket seam (`netsys`): the NFS servers, the MCP HTTP edge and the
 // network export ride it (`docs/wip/platforms.md`, gap 1).
 pub mod tcp;
@@ -69,6 +74,10 @@ pub mod waker;
 mod afd;
 #[cfg(target_os = "linux")]
 pub mod epoll;
+// A kernel object's signal awaited through the shard (A-475): a client's process handle, waited on by the system thread
+// pool and posted to the shard's completion port.
+#[cfg(target_os = "windows")]
+pub mod handle_wait;
 #[cfg(target_os = "windows")]
 pub mod iocp;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]

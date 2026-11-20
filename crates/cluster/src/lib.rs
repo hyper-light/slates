@@ -41,6 +41,7 @@
 pub mod config_group;
 pub mod content;
 pub mod envelope;
+pub mod failover;
 pub mod fleet;
 mod fold;
 pub mod lease_renewal;
@@ -838,6 +839,11 @@ pub struct Committed {
   /// caller refreshes its configuration toward it and retries within the operation's budget; `None` when no
   /// holder was ahead. Purely a hint off the reply — it never affects whether the record placed.
   pub stale_version: Option<u64>,
+  /// What each holder that answered without a binding acknowledgement answered, by holder, in arrival order, for a
+  /// caller whose message carries more than the record: a green's merge shipment, which a holder that cannot accept
+  /// the record yet answers with what it holds of the record's inputs (§4.16 "Commit", A-286). Only replies judged
+  /// before the commit returned; a straggler's is its own. Never affects whether the record placed.
+  pub answers: Vec<(HostId, Vec<u8>)>,
 }
 
 /// Commits `record` across its `candidates` (§4.8 "records are sent to all candidates; committed at
@@ -941,6 +947,7 @@ pub async fn commit_record_sent_as(
       reusable: Vec::new(),
       stragglers: Stragglers::none(),
       stale_version: None,
+      answers: Vec::new(),
     };
   }
 
@@ -974,6 +981,9 @@ pub async fn commit_record_sent_as(
   // this local, which is read after the round; a plain `&mut` capture (not a `Cell`) so the future the sim
   // runtime drives stays `Send` across the collection's await.
   let mut stale_seen: Option<u64> = None;
+  // What every holder that did not acknowledge answered, kept the same way, for a caller whose message carries more
+  // than the record (`Committed::answers`).
+  let mut answers: Vec<(HostId, Vec<u8>)> = Vec::new();
   // The record class's acknowledgement latencies are gathered too; the record commit re-ships
   // idempotently every period, so nothing here hedges on them yet (the content class is the hedged one).
   let Collected {
@@ -995,6 +1005,7 @@ pub async fn commit_record_sent_as(
       if let Some(Refusal::ConfigurationStale { version }) = decode_refusal(reply) {
         stale_seen = Some(stale_seen.map_or(version, |seen| seen.max(version)));
       }
+      answers.push((host, reply.to_vec()));
       false
     },
   )
@@ -1029,6 +1040,7 @@ pub async fn commit_record_sent_as(
     reusable,
     stragglers,
     stale_version: stale_seen,
+    answers,
   }
 }
 
@@ -1071,6 +1083,7 @@ fn spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Committed {
     reusable: Vec::new(),
     stragglers: Stragglers::none(),
     stale_version: None,
+    answers: Vec::new(),
   }
 }
 
@@ -1086,8 +1099,9 @@ fn spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Committed {
 
 /// The stream a *ledger* phase-one prepare rides on a holder connection — distinct from every other RPC kind on
 /// the connection, so a holder serving several tells them apart.
-/// Format: one stream id per RPC kind on a connection; the holder's serve accepts whichever arrives.
-const LEDGER_PROMOTE_STREAM: u64 = 3;
+/// Format: one stream id per RPC kind on a connection; the holder's serve accepts whichever arrives. Public so the
+/// daemon's check that every kind on its record session is its own lists it.
+pub const LEDGER_PROMOTE_STREAM: u64 = 3;
 
 /// A confirmed ledger promotion: the holders that promised, and the log the new owner adopts — per
 /// position, the identity carried under the highest epoch across the phase-one quorum ([`ledger::adopt`]).

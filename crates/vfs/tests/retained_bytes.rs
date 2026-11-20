@@ -6,7 +6,8 @@
 //! admitted entitlement finds the arena exhausted — the "retained bytes can defeat the cap" finding.
 //! Retention is now charged from unpromised capacity by the operation that causes it (a write's
 //! reopen, a truncate's cut, an unlink's last name, an edit's splice), secured before the mutation
-//! and refused `NoSpace` with nothing changed when the shard cannot back it, and credited back as
+//! and refused `RetentionExceeded` (once `NoSpace`, which read as the quota) with nothing changed when the shard
+//! cannot back it, and credited back as
 //! the retained chunks are freed. These tests drive a bare store (no server-side reservation), so
 //! the budget's committed bytes are the retention charge alone and must equal the drift-free
 //! `retained_bytes` at every step.
@@ -129,7 +130,7 @@ fn destroying_a_volume_returns_its_byte_retention_charge() {
 /// AC-2.11 (T-2.13): an admitted bounded claim remains spendable against a snapshotting neighbour.
 /// Do: B reserves a quarter of the shard; A (a quarter too) snapshots and overwrites its content
 /// repeatedly — each cycle retains another quarter of the arena. Expect: A's retention draws only
-/// the unpromised half, the cycle that would spend B's reservation is refused `NoSpace` before
+/// the unpromised half, the cycle that would spend B's reservation is refused `RetentionExceeded` before
 /// anything changes (the refusal counter moves), and B then writes its whole allowance with every
 /// chunk landing. Non-vacuous: with retention uncharged, A's third cycle succeeds and B's write
 /// meets an exhausted arena.
@@ -164,7 +165,7 @@ fn a_bounded_volume_keeps_its_entitlement_against_a_snapshotting_neighbour() {
   let block = vec![b'x'; usize::try_from(chunk).unwrap()];
   assert_eq!(
     a.write(&mut store, f, 0, &block),
-    Err(VfsError::NoSpace),
+    Err(VfsError::RetentionExceeded),
     "a retention into promised space is refused"
   );
   assert_eq!(
@@ -193,7 +194,7 @@ fn a_bounded_volume_keeps_its_entitlement_against_a_snapshotting_neighbour() {
 }
 
 /// T-A9 (byte retention): the last name of a snapshot-pinned file retains its windows, charged at
-/// the unlink; when no unpromised capacity remains the unlink is refused `NoSpace` with the name
+/// the unlink; when no unpromised capacity remains the unlink is refused `RetentionExceeded` with the name
 /// still present (as a full OpenZFS pool refuses a delete whose blocks a snapshot holds), and it
 /// succeeds once capacity returns.
 #[test]
@@ -222,7 +223,7 @@ fn an_unlink_retains_the_pinned_windows_and_is_refused_typed_without_unpromised_
   let promise = store.budget.reserve(store.budget.admittable()).unwrap();
   assert_eq!(
     vol.unlink_no(&mut store, root, "g"),
-    Err(VfsError::NoSpace),
+    Err(VfsError::RetentionExceeded),
     "an unlink that would retain into promised space is refused"
   );
   assert_eq!(
@@ -542,7 +543,7 @@ fn refused_unchanged(
 ) {
   assert_eq!(
     outcome,
-    Err(VfsError::NoSpace),
+    Err(VfsError::RetentionExceeded),
     "the {what} is refused typed"
   );
   assert_eq!(

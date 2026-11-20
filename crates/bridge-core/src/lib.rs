@@ -28,7 +28,10 @@ pub mod authority;
 pub mod changed;
 pub mod dax_backing;
 pub mod delivery;
+pub mod durable_bound;
+pub mod group_rule;
 pub mod links;
+pub mod posix_acl;
 pub mod scoped;
 pub mod volume_bridge;
 
@@ -36,10 +39,11 @@ pub use authority::{
   AttachmentId, Attachments, Barrier, CacheCoherence, ObjectId, OpContext, Rights, View,
 };
 pub use changed::{DataChange, TO_THE_END};
+pub use group_rule::GroupRule;
 pub use volume_bridge::{LostWrites, VolumeBridge, new_handle_store};
 
 use slates_vfs::error::VfsError;
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
 
 /// The neutral POSIX attributes of a filesystem object, independent of any transport's wire form.
 /// Times are nanoseconds since the Unix epoch (the volume core's native form); each transport
@@ -79,6 +83,9 @@ pub struct NodeAttr {
   /// The change counter: it moves on every change to the object and never repeats, whatever the
   /// wall clock does (A-38). A transport with a change attribute (NFSv4 `change`) serves it.
   pub change: u64,
+  /// A device node's number (A-294), which each transport reports in its own encoding (FUSE's `rdev`, NFSv3's
+  /// `rdev`, NFSv4's `rawdev`); `None` for every other kind.
+  pub device: Option<DeviceNumber>,
 }
 
 /// One entry of a directory listing: the child's inode number, its kind, its name, and the cookie that
@@ -223,6 +230,147 @@ pub enum DaxOffer {
   },
 }
 
+/// How a guest's run sees the owners of the volume's files (§4.6, the Shards route; A-281): the identity on every
+/// transport but a Shards stream whose guest named its run's owner with Shards' owner word (`trusted.shards.owner`).
+/// There the owner the volume keeps for what its host made (the stream's root's owner when the word came) is shown to
+/// the guest as the run's owner, and the run's owner as that one, uid and gid each: a swap of two ids, so it is its own
+/// inverse. A chown the guest asks and the stat it reads back agree, two ids never collapse into one, and every other
+/// route (a host mount, NFS, the SDK, a landing) sees the owners the volume keeps.
+///
+/// Why a swap and not Shards' own rule (its server shows every file "the host made" as the run's): slates keeps a real
+/// owner on every file, the host's for a base file and the creator's for the rest, where Shards' server keeps the
+/// guest's owner in an attribute beside a host file the host user owns. A one-way rule (the host's id shown as the
+/// run's) would show the run's own files and the host's alike, and leave nothing for a chown to the host's id to store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnerView {
+  /// The two owners swapped, none for the identity.
+  swap: Option<OwnerSwap>,
+}
+
+/// The two owners an [`OwnerView`] swaps: the volume's and the run's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnerSwap {
+  /// The owner (uid, gid) the volume keeps for what its host made.
+  kept: (u32, u32),
+  /// The owner (uid, gid) the run named.
+  run: (u32, u32),
+}
+
+impl OwnerView {
+  /// The view every transport has until a guest names its run's owner: each id shown as the volume keeps it.
+  pub const IDENTITY: OwnerView = OwnerView { swap: None };
+
+  /// The view that shows the volume's owner `kept` (uid, gid) as the run's owner `run`, and `run` as `kept`.
+  pub const fn swapping(kept: (u32, u32), run: (u32, u32)) -> OwnerView {
+    OwnerView {
+      swap: Some(OwnerSwap { kept, run }),
+    }
+  }
+
+  /// The uid the guest is shown for a file the volume keeps as `kept`'s.
+  pub fn shown_uid(&self, kept: u32) -> u32 {
+    self.swap.map_or(kept, |s| swapped(kept, s.kept.0, s.run.0))
+  }
+
+  /// The gid the guest is shown for a file the volume keeps as `kept`'s.
+  pub fn shown_gid(&self, kept: u32) -> u32 {
+    self.swap.map_or(kept, |s| swapped(kept, s.kept.1, s.run.1))
+  }
+
+  /// The uid the volume keeps for an id the guest names (a caller, a creator, a chown): the inverse of
+  /// [`OwnerView::shown_uid`], which, a swap being its own inverse, is the same exchange.
+  pub fn kept_uid(&self, shown: u32) -> u32 {
+    self.shown_uid(shown)
+  }
+
+  /// The gid the volume keeps for a gid the guest names: the inverse of [`OwnerView::shown_gid`].
+  pub fn kept_gid(&self, shown: u32) -> u32 {
+    self.shown_gid(shown)
+  }
+
+  /// The two owners swapped, the volume's (uid, gid) then the run's, none for the identity: what a stream's tables keep
+  /// so that a restored stream shows its guest the owners the saved one did (A-303), as
+  /// [`OwnerView::swapping`] makes the view again.
+  pub fn swapped(&self) -> Option<((u32, u32), (u32, u32))> {
+    self.swap.map(|swap| (swap.kept, swap.run))
+  }
+}
+
+/// `id` with `a` and `b` exchanged: `b` for `a`, `a` for `b`, any other unchanged.
+fn swapped(id: u32, a: u32, b: u32) -> u32 {
+  if id == a {
+    b
+  } else if id == b {
+    a
+  } else {
+    id
+  }
+}
+
+/// Format: the attribute namespace every route reads and writes: Linux's user namespace (xattr(7)), and what RFC
+/// 8276's names are stored under.
+pub const USER_NAMESPACE: &[u8] = b"user.";
+
+/// Format: the attribute namespaces a guest's kernel keeps on its files and no host's mount reaches (xattr(7), A-290):
+/// its administrator's (`trusted.`, which its kernel lets only a process with `CAP_SYS_ADMIN` read or set) and its
+/// security modules' (`security.`: `security.capability` from `setcap`, an SELinux label, an IMA hash).
+pub const GUEST_NAMESPACES: [&[u8]; 2] = [b"trusted.", b"security."];
+
+/// Format: the two names under which a Linux kernel keeps a file's POSIX ACLs (acl(5), `include/uapi/linux/xattr.h`
+/// `XATTR_NAME_POSIX_ACL_ACCESS` and `_DEFAULT`): the access ACL, and a directory's default ACL its new entries
+/// inherit. A guest's `setfacl` sets them; they are the guest's own like [`GUEST_NAMESPACES`]' names (A-302), while
+/// every other `system.` name stays refused on every route.
+pub const POSIX_ACL_NAMES: [&[u8]; 2] = [POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT];
+/// Format: a file's access ACL (`XATTR_NAME_POSIX_ACL_ACCESS`), one of [`POSIX_ACL_NAMES`].
+pub const POSIX_ACL_ACCESS: &[u8] = b"system.posix_acl_access";
+/// Format: a directory's default ACL (`XATTR_NAME_POSIX_ACL_DEFAULT`), which its new entries inherit; Linux refuses
+/// one on anything but a directory (`EACCES`). One of [`POSIX_ACL_NAMES`].
+pub const POSIX_ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
+
+/// Which extended-attribute namespaces a transport's caller reaches (§4.5 "Extended attributes", §4.6; A-290, A-302).
+///
+/// Every route reads and writes `user.` names. A guest kernel's route (a Shards stream, slates' own virtio-fs device)
+/// also reaches the guest's own namespaces, [`GUEST_NAMESPACES`], and its POSIX ACLs, [`POSIX_ACL_NAMES`]: what a
+/// microVM keeps there (`security.capability` on a binary it gave a capability, `trusted.overlay.*` on an overlayfs
+/// upper directory it made on its share, an ACL its `setfacl` set) is the guest's data, kept in the volume like any
+/// attribute. A host's mount (a FUSE or NFS mount, the AppleDouble view of a macOS NFSv3 mount) neither shows nor sets
+/// them: there the host's own kernel would act on them, a capability on a binary the host runs, an overlay's whiteout
+/// on a directory the host reads, an ACL naming the guest's users.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttributeNamespaces {
+  /// A host's mount: `user.` alone.
+  #[default]
+  Host,
+  /// A guest kernel's route: `user.`, the guest's own namespaces and its POSIX ACLs.
+  Guest,
+}
+
+impl AttributeNamespaces {
+  /// Whether a caller of this kind reaches attribute `name`: a name in a namespace it reads and writes, with
+  /// something after the namespace's prefix, or, on a guest's route, one of [`POSIX_ACL_NAMES`].
+  pub fn reaches(self, name: &[u8]) -> bool {
+    let named_in = |prefix: &[u8]| name.len() > prefix.len() && name.starts_with(prefix);
+    named_in(USER_NAMESPACE)
+      || (self == AttributeNamespaces::Guest
+        && (GUEST_NAMESPACES.iter().any(|prefix| named_in(prefix)) || is_posix_acl(name)))
+  }
+}
+
+/// Whether attribute `name` is a guest's own (A-290, A-302): in one of [`GUEST_NAMESPACES`] or one of
+/// [`POSIX_ACL_NAMES`], which no host's mount shows or sets, whatever that mount's own rule for names (the AppleDouble
+/// view's are any of macOS's).
+pub fn guest_only(name: &[u8]) -> bool {
+  GUEST_NAMESPACES
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+    || is_posix_acl(name)
+}
+
+/// Whether attribute `name` is one of [`POSIX_ACL_NAMES`] (A-302).
+pub fn is_posix_acl(name: &[u8]) -> bool {
+  POSIX_ACL_NAMES.contains(&name)
+}
+
 /// The store's parts a backed DAX session works with, lent by a bridge that has a store ([`Bridge::dax_state`]).
 pub struct DaxState<'a> {
   /// The store's DAX backings, which the volume's write boundary writes every change of a backed file through.
@@ -310,6 +458,29 @@ pub struct InvalidationCursor {
   pub hint_seq: u64,
 }
 
+/// The path `path` (`\`-separated from the volume's root, as a WinFsp drive names a file) with each component named as
+/// the volume stores it (§4.4's name policy; A-543): every component looked up from the root and named as its directory
+/// stores it ([`Bridge::stored_entry`]). On a folding volume every spelling of one file answers one path, the spellings it
+/// was made with; on an exact volume, the path as asked. Refused as the first component that cannot be looked up is.
+pub fn stored_path(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  path: &str,
+) -> Result<String, VfsError> {
+  let mut parent = ObjectId::new(bridge.root(cx)?, 0);
+  let mut stored = String::with_capacity(path.len());
+  for component in path.split('\\').filter(|component| !component.is_empty()) {
+    let (name, attr) = bridge.stored_entry(parent, cx, component)?;
+    stored.push('\\');
+    stored.push_str(&name);
+    parent = ObjectId::new(attr.ino, 0);
+  }
+  if stored.is_empty() {
+    stored.push('\\');
+  }
+  Ok(stored)
+}
+
 /// The one VFS operation layer (§4.6). Every request identifies its object by [`ObjectId`] (a
 /// real inode number and a generation, §4.6 `(no, gen)`) and rides an authenticated [`OpContext`]
 /// built by the owner from a validated attachment: the seam checks the context's volume, granted
@@ -322,7 +493,9 @@ pub trait Bridge {
   /// FUSE resolves node id 1 to it; NFS mints the export's root file handle from it.
   fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError>;
   /// Whether an effect a client keeps across a restart waits for the volume's next publication
-  /// ([`slates_vfs::volume::Volume::awaits_publication`]): a transport's reply then waits for the owner's barrier (D-18).
+  /// ([`slates_vfs::volume::Volume::awaits_publication`]), or a write this bridge took was not kept by the write log
+  /// its transport keeps writes in (A-410, [`VolumeBridge::logging_writes`]): a transport's reply then waits for the
+  /// owner's barrier (D-18).
   fn awaits_publication(&self) -> bool;
   /// Whether `cx` may change this volume at all (`ReadOnly` for an attachment that may read but not write or a
   /// snapshot's view, `NotPermitted` for one with no rights or of another volume), asked before a transport grants
@@ -330,6 +503,21 @@ pub trait Bridge {
   fn authorize_change(&self, cx: &OpContext) -> Result<(), VfsError>;
   /// Look `name` up in directory `parent` under `cx`; the child's attributes.
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError>;
+  /// Look `name` up in directory `parent` under `cx` as [`Bridge::lookup`] does, answering besides the child's
+  /// attributes its name as the volume stores it (§4.4's name policy; A-543): the asked spelling on an exact volume, and
+  /// on a folding one the spelling the entry was made with, which every spelling that folds alike finds. A WinFsp drive
+  /// names each open by the stored spelling of every component ([`stored_path`]), so two spellings of one file are one
+  /// file to Windows. The default answers the name as asked, as an exact volume stores it.
+  fn stored_entry(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+  ) -> Result<(String, NodeAttr), VfsError> {
+    self
+      .lookup(parent, cx, name)
+      .map(|attr| (name.to_owned(), attr))
+  }
   /// The attributes of `object` under `cx`.
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError>;
   /// Open `object` under `cx`; the file handle. `flags` are the open's flags as the FUSE protocol carries them (Linux
@@ -434,14 +622,17 @@ pub trait Bridge {
     mode: u32,
     flags: u32,
   ) -> Result<(NodeAttr, u64), VfsError>;
-  /// Creates a FIFO/socket name, with no open reference or kernel endpoint (A-26).
+  /// Creates a name with no content under `cx`, with no open reference or kernel endpoint: a FIFO or socket name
+  /// (A-26), or a device node whose number is metadata that nothing slates serves opens (A-294). A device node other
+  /// than a whiteout (a character device 0/0) is made only for a caller acting as root, as a local file system makes
+  /// one only for a caller holding `CAP_MKNOD`; any other caller is refused `NotPermitted` (`EPERM`).
   fn mknod(
     &mut self,
     parent: ObjectId,
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<NodeAttr, VfsError>;
   /// Release handle `fh` of `object`, under `cx`.
   fn release(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError>;
@@ -597,6 +788,31 @@ pub trait Bridge {
     DaxOffer::Withheld
   }
 
+  /// How this bridge's transport shows its guest the owners of the volume's files ([`OwnerView`]): the identity by
+  /// default, a swap only on a Shards stream whose guest named its run's owner (A-281).
+  fn owner_view(&mut self) -> OwnerView {
+    OwnerView::IDENTITY
+  }
+
+  /// Which extended-attribute namespaces this bridge's transport reaches ([`AttributeNamespaces`]): a host's mount's
+  /// by default, a guest's only on a guest kernel's route (A-290).
+  fn attribute_namespaces(&mut self) -> AttributeNamespaces {
+    AttributeNamespaces::Host
+  }
+
+  /// Whether this bridge's transport's kernel sends FUSE's extended `fuse_setxattr_in`, its setter's flags beside the
+  /// size and the `setxattr(2)` flags: a guest kernel's connection that kept `FUSE_SETXATTR_EXT` at its `INIT` (A-378),
+  /// as the transport last said ([`Bridge::set_setxattr_ext`]). No by default.
+  fn setxattr_ext(&mut self) -> bool {
+    false
+  }
+
+  /// Tells this bridge whether its transport's kernel sends the extended `fuse_setxattr_in` ([`Bridge::setxattr_ext`]),
+  /// before the transport hands it a request (A-378). The transport reads it from the `INIT` reply its connection kept,
+  /// so it can change between two requests one bridge serves: a virtio-fs device serves its guest's `INIT` and the
+  /// requests after it in one pass over one bridge. A bridge that keeps no form ignores it.
+  fn set_setxattr_ext(&mut self, _extended: bool) {}
+
   /// The store's DAX backings and its in-process DAX registry, lent to a backed DAX session (`dax_backing`) that a
   /// transport drives over this bridge. `None` for a bridge with no store.
   fn dax_state(&mut self) -> Option<DaxState<'_>> {
@@ -615,11 +831,18 @@ pub trait Bridge {
   /// named by `cx` did not make itself — and returns the cursor to pass next time. Bounded by the
   /// journal's retention budget and by the entries loaded under the hinted directories. The
   /// default reports nothing, for a bridge that changes only through its own transport.
+  ///
+  /// **Slices** (A-562). The gather runs on the serving thread, so it takes what its turn allows: `more` is asked
+  /// before each journal record after the first, and at [`std::ops::ControlFlow::Break`] the gather stops there and
+  /// returns the cursor through the last record it took, the rest owed to the next gather, which resumes from it. A
+  /// gather that `more` never stops reports everything owed. The changes beneath a base directory are gathered only once
+  /// the journal's are whole, in the same gather.
   fn invalidations(
     &mut self,
     _cx: &OpContext,
     cursor: InvalidationCursor,
     _out: &mut Vec<Invalidation>,
+    _more: &mut dyn FnMut() -> std::ops::ControlFlow<()>,
   ) -> Result<InvalidationCursor, VfsError> {
     Ok(cursor)
   }
@@ -661,12 +884,15 @@ pub trait Bridge {
   fn restored_open_files(&mut self, _cx: &OpContext) -> Vec<u64> {
     Vec::new()
   }
-  /// Visits the inodes whose cached state this attachment's kernel may hold older than the volume's after a takeover
-  /// (A-158), in inode order and each once, starting after `after`, until `visit` breaks; whether every one was
-  /// visited. The set is the references the recovery gave back to the attachment, with any taken since, and the inodes
-  /// the write-log replay wrote. A mount taken over by this daemon invalidates them in slices from its first turn, so
-  /// nothing the dead daemon changed and never told the kernel of outlives the takeover. The default, none, is a bridge
-  /// with nothing restored.
+  /// Visits the inodes whose cached state this attachment's kernel may hold otherwise than the volume does after a
+  /// takeover (A-158, A-573), each once, starting after `after`, until `visit` breaks; whether every one was visited.
+  /// For a view of the head the set is every inode of the head, in the table's order: a lookup made after the last
+  /// publication is in no image, and such a kernel can hold bytes a mutation showed before the publication the death
+  /// lost, or a base file's pages an outsider changed while no daemon ran. For a pinned view it is the references the
+  /// recovery gave back to the attachment, with any taken since, and the inodes the write-log replay wrote, in inode
+  /// order. A mount taken over by this daemon invalidates them in slices from its first turn, so nothing the dead
+  /// daemon showed or changed and never told the kernel of outlives the takeover. The default, none, is a bridge with
+  /// nothing restored.
   fn takeover_inodes(
     &mut self,
     _cx: &OpContext,
@@ -674,5 +900,243 @@ pub trait Bridge {
     _visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
   ) -> bool {
     true
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{AttributeNamespaces, OwnerView, guest_only};
+
+  /// A-281. Do: swap the host's owner (501:20) with a run's (1000:1001), and read every id through the view both ways.
+  /// Expect each of the two shown as the other, uid and gid apart, every other id (root's among them) as it is, the way
+  /// back the same exchange so a chown and a stat agree, and the identity changing nothing.
+  #[test]
+  fn an_owner_view_swaps_the_hosts_owner_with_the_runs_and_leaves_every_other_id() {
+    let view = OwnerView::swapping((501, 20), (1000, 1001));
+    assert_eq!((view.shown_uid(501), view.shown_gid(20)), (1000, 1001));
+    assert_eq!((view.shown_uid(1000), view.shown_gid(1001)), (501, 20));
+    assert_eq!((view.shown_uid(0), view.shown_gid(0)), (0, 0));
+    assert_eq!(
+      (view.shown_uid(20), view.shown_gid(501)),
+      (20, 501),
+      "uid and gid swap apart"
+    );
+    expect_each_id_back_the_way_it_came(view);
+    let same = OwnerView::swapping((1000, 1000), (1000, 1000));
+    assert_eq!(
+      (same.shown_uid(1000), same.kept_gid(1000)),
+      (1000, 1000),
+      "a run of the host's own owner changes nothing"
+    );
+    // A-303: the pair a stream's tables keep makes the same view again, and the identity keeps none.
+    let (kept, run) = view.swapped().unwrap();
+    assert_eq!(OwnerView::swapping(kept, run), view);
+    assert_eq!(OwnerView::IDENTITY.swapped(), None);
+  }
+
+  /// A-290, A-302. Do: ask a host's mount and a guest's route about names in each namespace, the two ACL names, bare
+  /// prefixes, names that only begin like one, and macOS names. Expect `user.` names reached by both; `trusted.` and
+  /// `security.` names and the two ACL names by the guest's alone and marked a guest's own; a bare prefix reached by
+  /// neither; every other `system.` name and every macOS name by neither and no guest's own.
+  #[test]
+  fn a_guests_namespaces_are_reached_by_its_route_alone() {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for name in [&b"user.x"[..], b"user.trusted.y"] {
+      assert!(host.reaches(name) && guest.reaches(name), "{name:?}");
+      assert!(!guest_only(name), "{name:?}");
+    }
+    expect_a_guests_own(&[
+      &b"trusted.overlay.opaque"[..],
+      b"security.capability",
+      b"security.selinux",
+    ]);
+    for name in [&b"user."[..], b"trusted.", b"security."] {
+      assert!(
+        !host.reaches(name) && !guest.reaches(name),
+        "a bare prefix: {name:?}"
+      );
+    }
+    expect_a_guests_own(&[&b"system.posix_acl_access"[..], b"system.posix_acl_default"]);
+    expect_reached_by_neither_and_no_guests_own(&[
+      &b"system.posix_acl_accessx"[..],
+      b"system.sockprotoname",
+      b"system.",
+      b"trustedx",
+      b"securityx",
+      b"com.apple.FinderInfo",
+      b"",
+    ]);
+    assert_eq!(AttributeNamespaces::default(), host);
+  }
+
+  /// The round trips of `an_owner_view_swaps_the_hosts_owner_with_the_runs_and_leaves_every_other_id`: expect every id,
+  /// the swapped pair's and others, read back through `view` the way it came, and the identity changing none.
+  fn expect_each_id_back_the_way_it_came(view: OwnerView) {
+    for id in [0, 20, 501, 1000, 1001, 4242, u32::MAX] {
+      assert_eq!(view.kept_uid(view.shown_uid(id)), id);
+      assert_eq!(view.kept_gid(view.shown_gid(id)), id);
+      assert_eq!(OwnerView::IDENTITY.shown_uid(id), id);
+      assert_eq!(OwnerView::IDENTITY.kept_gid(id), id);
+    }
+  }
+
+  /// A guest's own names in `a_guests_namespaces_are_reached_by_its_route_alone`: expect each of `names` reached by the
+  /// guest's route alone, never by a host's mount, and marked a guest's own.
+  fn expect_a_guests_own(names: &[&[u8]]) {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for &name in names {
+      assert!(!host.reaches(name), "{name:?}");
+      assert!(guest.reaches(name), "{name:?}");
+      assert!(guest_only(name), "{name:?}");
+    }
+  }
+
+  /// The names no route reaches in `a_guests_namespaces_are_reached_by_its_route_alone`: expect each of `names` reached
+  /// by neither a host's mount nor a guest's route, and no guest's own.
+  fn expect_reached_by_neither_and_no_guests_own(names: &[&[u8]]) {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for &name in names {
+      assert!(!host.reaches(name) && !guest.reaches(name), "{name:?}");
+      assert!(!guest_only(name), "{name:?}");
+    }
+  }
+}
+
+#[cfg(test)]
+mod stored_path_tests {
+  use super::*;
+
+  /// Shape: the store's page in the test.
+  const PAGE: usize = 4096;
+  /// Shape: the pages the store's region maps: room for the test's few entries.
+  const REGION_PAGES: usize = 256;
+  /// Shape: a journal that holds every record the test makes.
+  const JOURNAL: usize = 1 << 16;
+
+  /// A store and a volume in it whose names follow `names`.
+  fn store_and_volume(
+    names: slates_vfs::names::NameEquivalence,
+  ) -> (slates_vfs::volume::Store, slates_vfs::volume::Volume) {
+    let mut arena = slates_mem::arena::ChunkArena::new(PAGE);
+    arena
+      .add_region(slates_mem::region::Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    let mut store = slates_vfs::volume::Store::new(
+      &slates_vfs::volume::StoreConfig {
+        page: PAGE,
+        cache_line: 128,
+        max_dirs: 16,
+        max_inodes: 64,
+        max_chunks: REGION_PAGES,
+        max_dir_blocks: 16,
+        dir_cutover: 16,
+      },
+      arena,
+      0,
+    );
+    let volume = slates_vfs::volume::Volume::create(
+      &mut store,
+      slates_vfs::volume::VolumeConfig {
+        prefix: 1,
+        names,
+        quota: slates_vfs::quota::Quota::Bounded { limit: 1 << 30 },
+        journal_bytes: JOURNAL,
+        clock: Box::new(slates_vfs::clock::HostClock::default()),
+      },
+    )
+    .unwrap();
+    (store, volume)
+  }
+
+  /// A read-write context of an attachment to the volume of id zero.
+  fn context() -> OpContext {
+    let mut attachments = Attachments::new();
+    let attachment = attachments
+      .attach(
+        slates_db::catalog::VolumeId { bytes: [0; 16] },
+        View::Current,
+        slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        Rights {
+          read: true,
+          write: true,
+        },
+      )
+      .unwrap();
+    attachments.context(attachment).unwrap()
+  }
+
+  /// The volume `names` makes, with `\Src\Main.RS` made in it through a bridge. A step that fails stops the test here,
+  /// so a refused setup can never pass for the `NotFound` a test expects from the path it names.
+  fn with_main_rs(
+    names: slates_vfs::names::NameEquivalence,
+  ) -> (slates_vfs::volume::Store, slates_vfs::volume::Volume) {
+    let (mut store, mut volume) = store_and_volume(names);
+    {
+      let cx = context();
+      let mut bridge = VolumeBridge::new(
+        slates_db::catalog::VolumeId { bytes: [0; 16] },
+        &mut volume,
+        &mut store,
+      );
+      let root = bridge.root(&cx).unwrap();
+      let dir = bridge
+        .mkdir(ObjectId::new(root, 0), &cx, "Src", 0o755)
+        .unwrap();
+      bridge
+        .create(ObjectId::new(dir.ino, 0), &cx, "Main.RS", 0o644, 0)
+        .unwrap();
+    }
+    (store, volume)
+  }
+
+  /// `path` named as the volume `names` makes, with `\Src\Main.RS` in it, stores each component: the answer under test
+  /// alone, through a bridge made afresh as the daemon's serve paths make one per request.
+  fn stored_in(names: slates_vfs::names::NameEquivalence, path: &str) -> Result<String, VfsError> {
+    let (mut store, mut volume) = with_main_rs(names);
+    let cx = context();
+    let mut bridge = VolumeBridge::new(
+      slates_db::catalog::VolumeId { bytes: [0; 16] },
+      &mut volume,
+      &mut store,
+    );
+    stored_path(&mut bridge, &cx, path)
+  }
+
+  /// §4.4 name policy, T-4.6, A-543 (B2): a WinFsp drive names each open by the path its volume stores, so on a folding
+  /// volume every spelling of a file is one file to Windows. Do: on a folding volume and on an exact one, make `\Src` and
+  /// `\Src\Main.RS`, then name paths as the volume stores them: the made spelling, two others, the root, and a missing
+  /// file. Expect the folding volume to answer `\Src\Main.RS` for every spelling, the exact one only for the spelling it
+  /// was made with and `NotFound` for the others, the root as itself, and a missing file `NotFound` on both. Before,
+  /// nothing named an open's path as stored, so a folding volume's two spellings were two files to WinFsp's driver.
+  #[test]
+  fn every_spelling_of_a_file_on_a_folding_volume_names_the_path_it_was_made_with() {
+    use slates_vfs::names::NameEquivalence::{Exact, Fold};
+    let made = Ok("\\Src\\Main.RS".to_owned());
+    assert_eq!(stored_in(Fold, "\\Src\\Main.RS"), made);
+    assert_eq!(
+      stored_in(Fold, "\\src\\MAIN.rs"),
+      made,
+      "another spelling folds to it"
+    );
+    assert_eq!(stored_in(Fold, "\\SRC\\main.rs"), made, "and a third");
+    assert_eq!(
+      stored_in(Fold, "\\"),
+      Ok("\\".to_owned()),
+      "the root as itself"
+    );
+    assert_eq!(stored_in(Fold, "\\src\\gone.rs"), Err(VfsError::NotFound));
+    assert_eq!(
+      stored_in(Exact, "\\Src\\Main.RS"),
+      made,
+      "an exact volume's own spelling"
+    );
+    assert_eq!(
+      stored_in(Exact, "\\src\\MAIN.rs"),
+      Err(VfsError::NotFound),
+      "an exact volume finds no other spelling"
+    );
   }
 }

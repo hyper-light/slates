@@ -11,11 +11,18 @@ guarantee. A daemon restart under the same anchor keeps acknowledged content and
 (`acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte`); the anchor's own death
 loses RAM by design.
 `attach` returns an attachment record without creating a mounted path. A CLI attachment outlives the `slates attach`
-that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach ATTACHMENT`, `advance`). It lasts one
-term, the daemon's failover SLO (10 s unless `slates anchor` is given another), and every verb that names it renews the
-term. It ends at the term's lapse with the write lease it held. A verb that names it after is refused
+that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach ATTACHMENT`, `advance`). Its term is its
+holder's (design A-384): every verb that names it renews it, and `slates attach ID --write --hold` keeps it alive from
+that process until the process ends, however long the attachment sits idle. One that nothing renews lasts at most the
+daemon's failover delay after its last use (about three seconds on a quiet laptop: the window its watchdog judges a
+stuck daemon by, then the lapse its anchor waits before replacing it, both measured on that machine, then the recovery;
+a few seconds in a fleet; `slates status` shows the delay as `fleet_failover`); one renewed at a steady pace ends about one and a third seconds after its renewals stop.
+It ends at the term's lapse, releasing the volume's write lease unless the same user still holds another write
+attachment of it: a write lease stays its holder's while any of its write attachments lives (design A-414). A verb
+that names an ended attachment is refused
 `AttachmentExpired`, never `NotFound`: attach again. An SDK client's attachments end with the client instead. `exec` is Linux-only
-and currently expects an externally supplied `SLATES_ROOT` naming an established root mount.
+and currently expects an externally supplied `SLATES_ROOT` naming an established root mount; on a host whose AppArmor
+restricts unprivileged user namespaces it needs slates' AppArmor profile and `--apparmor-profile` (below).
 There is no implemented CLI/MCP virtio-fs or OCI attachment flow; the MCP server (`slates mcp`)
 and the Python and Node SDKs are implemented (§4.12). On macOS a volume can be mounted for real
 over the loopback NFS bridge (`slates mount`) with no privilege, kernel extension or Apple
@@ -24,15 +31,59 @@ entitlement. These limitations are open correctness/integration work, not option
 ## Running a daemon
 
 ```
-slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME]
+slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME] [--vcs-http ADDRESS]
+              [--vcs-ssh ADDRESS] [--vcs-svn ADDRESS]
 ```
 
 The anchor measures the machine profile (seconds; `--quick` for tests), creates the shared
 segment in RAM, publishes the profile into it, and supervises `slates daemon` as a child with
 the segment handed over in its environment. It restarts a daemon that exits, kills one whose
-heartbeat lapses, and gives up on a crash loop (the bound is derived from the recovery budget
-and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
+heartbeat lapses because a shard is stuck (never one whose shards are only starved: kept off their
+CPUs, or waiting on memory while the host reports a memory stall), and gives up on a crash loop
+(the bound is derived from the recovery budget and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
 an anonymous shared segment alone does not establish locked residency or no swapping.
+
+`--shards N` overrides the derived shard count (tests). One process runs at most 1,024 shards (the
+runtime's registry of shards); a larger count is refused as a usage error before anything starts, since
+the daemon could never register its shards and the anchor would restart it for good.
+
+`--vcs-http ADDRESS` serves git over HTTP at ADDRESS, an IPv4 address and port (port 0 lets the system
+pick one); the daemon logs where it serves (`slates daemon: the version-control HTTP edge serves HTTPS on
+IP:PORT`). A fleet node's edge serves HTTPS with the node's own certificate and key, the ones its fleet
+manifest names. A daemon that is no fleet node has no certificate, so it serves plain HTTP, on a loopback
+address alone: any other address is refused as a usage error before anything starts. Clients sign in with
+a token from `slates credential token`, as a bearer token or, over HTTPS, as Basic's password. Over `svn://`
+the same token is CRAM-MD5's password, its id (the `id:` line) the user name: the daemon keeps the token's
+CRAM-MD5 keyed contexts beside its hash, never the token. The anchor
+binds the address once and hands its listener to every daemon it supervises (on Linux and macOS), so a
+daemon's restart never drops the port: a client that connects meanwhile is answered by the next daemon.
+An address the anchor cannot bind ends its start with an error naming it.
+
+`--vcs-ssh ADDRESS` starts the SSH edge git, Mercurial and Subversion are served over, at ADDRESS, an IPv4
+address and port (port 0 lets the system pick one), on any address: SSH encrypts every connection. git's
+fetch and clone and Mercurial's `hg clone` and `hg pull` are served; the other commands land one server at
+a time, and until a command's server has, the edge refuses it in its tool's own words (`fatal:
+git-receive-pack is not served yet`). The daemon logs where it serves and its host key's fingerprint
+(`slates daemon: the version-control SSH edge serves on IP:PORT with the ED25519 host key SHA256:...`),
+which is what `ssh` shows the first time it meets the key: compare the two before trusting it. A fleet
+node's edge presents the node's own key, the one its fleet manifest names, when that key is Ed25519; a
+node whose key is of another algorithm starts no SSH edge, and says so. Otherwise the anchor makes an
+Ed25519 host key in its memory when it starts and keeps it, with the listener, for every daemon it
+supervises, so a daemon's restart keeps both the port and the key, and a client's `known_hosts` line stays
+good for as long as the anchor runs. Clients sign in with a key a person enrolled with `slates credential
+key`. Use a port above 1023: slates needs no privilege, and a host that wants port 22 forwards it.
+
+`--vcs-svn ADDRESS` serves Subversion's own protocol, `svn://`, at ADDRESS, an IPv4 address and port (port 0
+lets the system pick one; `svnserve`'s is 3690); the daemon logs where it serves (`slates daemon: the svn://
+listener serves on IP:PORT`). `svn://` has no encryption, so a daemon that is no fleet node serves it on a
+loopback address alone: any other address is refused as a usage error before anything starts. The anchor
+binds the address once and hands its listener to every daemon it supervises (on Linux and macOS), so a
+daemon's restart never drops the port: a client that connects meanwhile is answered by the next daemon. An
+address the anchor cannot bind ends its start with an error naming it. A URL names a repository by the leading
+part of its path, as `svnserve` finds one (`svn://HOST:PORT/NAME/...`, NAME as `slates repository create NAME
+--tool svn` made it, slashes included), wherever in the daemon it lives; a URL naming none is answered "No
+repository found". For now every
+repository answers "No access allowed to this repository": signing in with a token (CRAM-MD5) is the next step.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 
@@ -145,11 +196,13 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   Every node computes the same map from the same file. A name
   (`slates-0.slates.default.svc.cluster.local:7000` — the Kubernetes deployment of
   [deploy.md](deploy.md) names each node by its per-pod DNS name) is resolved by the daemon at every
-  fresh dial through the nameservers of this host's `/etc/resolv.conf`, so a peer that came back
-  under a new address (a rescheduled pod) is reached on the next re-dial; a name that does not
+  fresh dial through this host's nameservers: those of `/etc/resolv.conf` on Linux and macOS, and on
+  Windows the DNS servers of its network adapters that are up and have a gateway. So a peer that came
+  back under a new address (a rescheduled pod) is reached on the next re-dial; a name that does not
   resolve is counted under the `fleet.resolve` refusal in `status` and dialed again next period. A
-  named node binds its own two sockets on every interface. A manifest that names a node on a host
-  with no IPv4 nameserver in `/etc/resolv.conf` stops the boot naming the file. Both sockets are
+  named node binds its own two sockets on every interface. A manifest that names a node, or trusts an
+  enrollment root (a peer enrolled under it may announce a name), on a host with no IPv4 nameserver
+  stops the boot naming where it looked. Both sockets are
   taken up before the daemon starts: an address already in use stops the boot with
   `fleet serve: the probe serve socket could not be taken up at ADDRESS` (or `record`). Under
   `slates anchor --fleet`, the anchor binds the two ports once and keeps them across daemon restarts,
@@ -157,6 +210,14 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   pass the two bound sockets as inherited descriptors and name them in
   `SLATES_ANCHOR_FLEET_SERVE=PROBE_FD,RECORD_FD`. A socket bound anywhere but the node's planned
   address is refused by name.
+- `bind` is optional: an IPv4 address and base port, like `"0.0.0.0:7000"`, where the node's own two
+  sockets bind when that is not its `address`. Set it only when something between the node and its peers
+  maps the advertised ports there: a NAT's port forward, a container runtime's published ports
+  (`-p 17000-17001:7000-7001/udp` with `"address": "HOST:17000", "bind": "0.0.0.0:7000"`), or the fault
+  relay the chaos tests put between real daemons. The node serves probes on the bind's port and records on
+  the next; every peer still dials `address` and the port after it. A name or port 0 is refused, and so
+  is a bind block past the port range. Unset, the node binds `address` (every interface when it is a
+  name).
 - `domain` and `region` are optional per-node non-negative integers, both unset by default and set
   only for a real topology. `domain` is the node's failure domain (a rack or zone id): placement forms
   each object's copyset across distinct domains, so nodes that share a `domain` are treated as
@@ -283,7 +344,7 @@ slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
 slates export ID [--read-only] [--subtree DIR] [--uid UID]
-slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+slates land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
 slates image build ID SNAPSHOT NAME --capacity SIZE [--json]
 slates image merge IMAGE NAME [--json]
 slates grants [--json]
@@ -291,12 +352,17 @@ slates grant LANDING MANIFEST [--session] [--term SECONDS] [--json]
 slates audit [--since N] [--json]
 slates enroll [--account UID] [--json]
 slates revoke CONSUMER [--json]
+slates repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN] [--json]
+slates repository import NAME PATH [--json]
 slates share ID PRINCIPAL [--read] [--write] [--admin] [--json]
+slates move ID --to HOST [--json]
 slates run [--keep] [--json] -- CMD [ARG ...]
-slates exec --volume V --at PATH -- CMD [ARG ...]
+slates exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
+slates apparmor profile [--executable PATH]
+slates apparmor check [--json]
 slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
 slates vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
-slates attach ID [--read | --write] [--snapshot N] [--json]
+slates attach ID [--read | --write] [--snapshot N] [--hold] [--json]
 slates detach ATTACHMENT [--json]
 slates status [--json]
 slates status ID [--drift] [--json]
@@ -304,6 +370,7 @@ slates promote-region REGION [--json]
 slates base read ID PATH
 slates base rewitness ID [PATH ...] [--json]
 slates base pin ID [PATH ...] [--json]
+slates base capture ID [--json]
 slates profile [--quick] [--json]
 slates mcp [--instance NAME] [--http PORT]
 ```
@@ -311,6 +378,36 @@ slates mcp [--instance NAME] [--http PORT]
 `slates live-ship ID [--off]` turns a volume's live shipping on (or off): in a fleet each of its publications
 is then shipped to its candidates, and a sync is answered once the owner and `f` of them hold it (design A-200).
 It needs `admin` on the volume, as `share` does.
+
+`slates move ID --to HOST [--json]` asks the volume's owner to move it to another fleet member, named by the host id
+`status` gives its members (design A-291). The owner freezes the volume, places its records and reports the move; from
+the switch every node forwards its verbs to the member, which adopts the volume, serves it and seals it under its own
+placement, and only then does the old owner let its copy go. One call is one ask: it prints `moving HOST` while the move
+is under way and `moved HOST` once the member owns it, so call it again until it says `moved`; the member answers
+`Overloaded` (retry) until it serves the volume. The volume must be a plain volume (no base directory) with no
+attachment (detach first), no clones of its own, and no snapshot but its head (a move carries the head), and the member
+must be in the owner's neighbourhood; otherwise it is refused `MoveRefused` naming why (`NotPlain`, `Attached`,
+`Lineage`, `Snapshots`, `Target`, `Neighbourhood`, `Unplaced`, `Pending`). A clone moves when it reads no base
+directory. Share the volume with the account that will use it on the member before moving it. It needs `admin` on the
+volume.
+
+`slates base capture ID [--json]` captures an overlay's whole base directory into the volume (design §4.15
+`capture_base`, A-291) and prints the snapshot that holds it: every file's bytes and every link's target become the
+volume's own, so `slates volume clone ID SNAPSHOT NAME` makes clones that read no directory at all, outlive it, and move
+between fleet members with `slates move`. Capture only a directory nothing writes while it runs (a commit checked out
+for it): a file that changes while it is read is refused `DigestUnverified` (ask again), and a capture the directory
+moved under `ConsistentBaseUnavailable`. A volume with no base directory is refused. It needs `write` on the volume and
+holds the whole directory in memory.
+
+`slates repository create NAME --tool git|hg|svn` creates a version-control repository and its root green, the green
+its default branch is bound to (design §4.17.1, A-685), and prints `repository: NAME` and `id: ROOT` (`{"repository",
+"id"}` with `--json`). A git repository names its objects by SHA-1 unless `--format sha256`, a Mercurial one by SHA-1,
+a Subversion one by revision numbers. `--default-branch BRANCH` names git's default branch (`main` when not given; a
+branch name as `git init --initial-branch` takes it, never `refs/heads/...`) or Mercurial's (`default`); a Subversion
+repository takes none, its branches being directories in it. `--root GREEN` makes a green you administer the root as it
+stands, instead of a new empty one. A name another repository holds is refused `AlreadyExists` (exit 1), whatever its
+tool; a format or a branch the tool cannot have is a usage error (exit 2). The `--vcs-http` edge serves a git
+repository named `NAME` at `/NAME/info/refs`.
 
 Sizes take a binary unit (`512MiB`, `4GiB`; `B`, `KiB`, `MiB`, `GiB`, `TiB`) or plain bytes.
 Ids are 32 hexadecimal characters as `create` prints them.
@@ -408,6 +505,10 @@ human saw, the scope and the term — which the daemon recomputes before issuing
 not verify (a forged, replayed or modified-plan approval) is refused `GrantIssuerUnverified` and
 counted; the MCP server and the SDKs carry no proof by construction and are refused by kind.
 Passing `--grant N` to `land` then consumes the grant; the landing must present the same manifest.
+`land --include P` and `--exclude P` each take a path prefix of the volume (`/.git`), as often as given: an entry
+lands when it lies under an included prefix (or none is given) and under no excluded one. Until 2026-11-17 each
+flag kept its last value alone, so a harness could leave out one prefix
+(`docs/bugs/2026-11-17-land-kept-only-the-last-exclude.md`).
 `land --snapshot N` lands that snapshot exactly as it was taken, whatever the volume has become since; the
 volume's later edits stay private, and a later `land` without `--snapshot` lands them over it.
 One landing at a time writes into a directory, whichever volume lands and however its path is
@@ -436,7 +537,7 @@ sets a principal's rights on a volume (`uid:N`, `consumer:N` under your account,
 `consumer:ACCOUNT/N`; no switch removes the entry). `enroll`, `revoke` and `run` are the anchor user's
 surface like `grant` and need its variables; `share` is the volume owner's.
 
-`slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]` hands a program a Shards
+`slates shards ID [--subtree DIR] [--read-only] --fd N [--resync-fd M] [--json] -- CMD [ARG ...]` hands a program a Shards
 microVM's filesystem device: it attaches the volume (or only `DIR` of it; for writing unless `--read-only`, as
 `mount` attaches), announces the attachment (`attachment: N`, or `{"attachment": N}` under `--json`), and
 replaces itself with `CMD`, one end of a socket pair at descriptor `N` — the end the daemon serves that attachment
@@ -446,6 +547,24 @@ the copy at `N` goes into the command, so the attachment lasts exactly as long a
 command, and anything the command handed the end to, closes it (or on `detach`, a revocation, the volume's destroy).
 The process you started is the command — its pid, its signals, its exit code — so ending it ends the attachment; a
 command that cannot run is a failure (exit 4), its attachment ended with the end it never got.
+With `--resync-fd M` the command also gets the stream's resync channel at descriptor `M` (Linux and macOS): a
+socket whose first message, 28 bytes, names the attachment and a secret token, and over which, if the daemon dies and
+its successor recovers the attachment, the successor hands a fresh stream end naming the same token. On Linux each
+message is one packet; on macOS the channel is a stream, so read each message whole by its 28 bytes. Reading the
+channel's end means no such stream will come (the attachment ended, or the daemon could not keep it); a platform that
+makes no channel yet hands one already ended. A program that ends its share closes the channel's end with the
+stream's. On Windows, name the channel where `{resync}` stands in the command's arguments, as the stream where `{handle}`
+stands: the command inherits a handle of a message-mode pipe, each message one read, whose `Resync` (40 bytes) names
+the fresh stream end's handle in the process holding the stream (the command, which `slates shards` names to the
+daemon), where the successor put it.
+A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
+made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
+so every other route shows those files as the host's.
+A guest's own attributes (`trusted.`, `security.`) and its POSIX ACLs are kept in the volume as its data, on this
+route and on `vhost-user`'s, and no host's mount shows them. The guest's kernel enforces its ACLs, so what its
+`setfacl` grants or denies holds for its accesses; a file's mode keeps step with its ACL (a chmod from the host
+changes the ACL's mask), an access ACL set by someone outside a set-group-ID file's group clears that bit, and what
+anyone makes in a directory with a default ACL takes it, as on Linux.
 Linux sends the end over the client's control socket; macOS claims it on the daemon's socket route, an encrypted
 exchange keyed by a single-use secret. Windows refuses the form by kind (`AttachmentUnsupported`,
 `DescriptorRouteNotBuilt`) until a route hands a client a handle.
@@ -470,8 +589,11 @@ slates vhost-user ID --dax-window 8MiB -- qemu-system-x86_64 -machine q35,memory
   -device vhost-user-test-device-pci,chardev=slates,virtio-id=26,num_vqs=2,config_size=40 ...
 ```
 
-and the guest mounts `mount -t virtiofs slates /mnt -o dax=always` (`--tag` names another tag). No socket file exists
-anywhere. A VMM with neither `{socket}` nor `{fd}` in its arguments is usage (exit 2): the device is reached through
+and the guest mounts `mount -t virtiofs slates /mnt -o dax=always,nosuid,nodev` (`--tag` names another tag). Mount
+it `nosuid,nodev`, as every mount slates makes itself is: a volume is shared, and keeps device nodes and set-id bits as
+any writer made them (A-94, A-294), so a guest mount without the flags would let one writer's `/dev/mem`-numbered node
+or setuid binary act for another of the guest's users. The device cannot set the guest's flags; the guest's kernel
+applies them. No socket file exists anywhere. A VMM with neither `{socket}` nor `{fd}` in its arguments is usage (exit 2): the device is reached through
 that end alone. QEMU's vhost-user-fs-pci has no DAX window, so use the generic device for DAX; QEMU before 11.1 offers
 no window on either.
 `--dax-window SIZE` offers the guest a DAX window of that size (a power of two of at least 2MiB); through it the guest
@@ -485,6 +607,47 @@ a map). While the VM runs, `slates status` counts what its window does: maps sen
 (`virtiofs.dax_maps_sent`), runs of the guest's stores written into the volume (`virtiofs.dax_runs_ingested`), and the
 rest of the `virtiofs.dax_` counters. macOS and Windows refuse the form by kind (`AttachmentUnsupported`,
 `BindingNotBuilt`).
+
+## The launcher (`slates exec`) and AppArmor
+
+`slates exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]` runs `CMD` with the volume `V` shown at the
+existing directory `PATH`, in a user and mount namespace of its own (Linux; design §4.6 "The launcher"). The volume's
+directory is `$SLATES_ROOT/V`, under the daemon's root mount, which you name in `SLATES_ROOT` for now. Nothing outside
+the command sees the bind, and nothing is created: a `PATH` that does not exist is refused, naming it. No privilege is
+needed where unprivileged user namespaces are allowed, as Fedora, Debian and Arch allow them by default.
+
+Ubuntu 24.04 and later restrict them through AppArmor (`kernel.apparmor_restrict_unprivileged_userns=1`): the namespace
+gets no capability, and `exec` is refused, naming the setting. slates ships an AppArmor profile that lifts the
+restriction for its own binary alone (A-370), and the launcher uses it only when you ask:
+
+1. **Check the host.** `slates apparmor check` prints whether the host restricts user namespaces (`restricted:`),
+   whether this process is exempt (`privileged:`, root or `CAP_SYS_ADMIN`), the label this binary runs under, its path
+   as the kernel records it, and `readiness:`. Readiness is `unrestricted`
+   (nothing to do), `profile-loaded` (use `--apparmor-profile`), `profile-missing` or `unsupported` (not Linux). It
+   exits 0 where `exec` can make its namespace and 1 where it cannot; `--json` prints the same fields.
+2. **Load the profile, once, as root.** `check` prints the exact line for this binary, for example:
+   ```
+   /usr/local/bin/slates apparmor profile | sudo tee /etc/apparmor.d/usr.local.bin.slates >/dev/null && sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.slates
+   ```
+   `slates apparmor profile` prints the profile for this binary's own path; `--executable PATH` names another. The
+   profile grants that path `userns,` and nothing else, so a copy of the binary at another path is not covered. The
+   file under `/etc/apparmor.d` keeps the profile loaded across reboots. slates never loads it itself: that needs root,
+   which slates never asks for.
+3. **Ask for it.** `slates exec --apparmor-profile --volume V --at PATH -- CMD`. The launcher makes its namespace under
+   the profile, then runs `CMD` outside it, so `CMD` runs unconfined and holds nothing the host withholds from other
+   programs.
+
+Without `--apparmor-profile` the launcher never uses the profile, even where it is loaded. It leaves the profile first,
+and is refused as on a host without it, the refusal naming the switch. With the switch and no profile loaded, the
+refusal names this binary's profile file and the command that loads it. Loading the profile is an administrator's
+choice: anyone on the host may then create user namespaces through it (by running the binary, and on Ubuntu 24.04 by
+entering the profile by name with `aa-exec`), as every program may on a host without the restriction. `slates apparmor check` prints the line that removes it
+(`sudo apparmor_parser -R /etc/apparmor.d/usr.local.bin.slates && sudo rm /etc/apparmor.d/usr.local.bin.slates`).
+
+The same option, off unless set, is `ExecSpec::apparmor` (`AppArmor::Profile`) in slates-api, whose `exec::command`
+builds the launcher's command for an embedding host's own executable (whose path the profile then names). It is
+`apparmor_profile=True` in the Python SDK's `slates.exec_command` and `{ apparmorProfile: true }` in the Node SDK's
+`execCommand`; each SDK renders the profile too (`apparmor_profile(path)`, `apparmorProfile(path)`).
 
 ## Planned interface corrections
 

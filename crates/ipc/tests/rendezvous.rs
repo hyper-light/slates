@@ -80,7 +80,7 @@ fn rendezvous_client_unsealed() {
   let Ok(instance) = std::env::var(CHILD_UNSEALED_ROLE) else {
     return;
   };
-  let outcome = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).map(|_| ());
+  let outcome = begin_connect_as(&instance, 0).map(|_| ());
   assert!(
     matches!(outcome, Err(IpcError::Unsupported { .. })),
     "a process with no seal installed claims nothing: {outcome:?}"
@@ -279,35 +279,36 @@ fn poll_bound() -> Duration {
   Duration::from_nanos(CLAIM_WAIT_NS / 10)
 }
 
-/// AUD-29-19 (§4.7 "Rendezvous", R6): a connect never holds its caller. Do: open a daemon end that does
-/// not accept, begin a claim on it and poll until it ends, timing every poll; then begin a second claim
-/// and let the daemon end accept it while the claim is polled. Expect: every poll returns at once (within
-/// [`poll_bound`]) and the claim is polled more than once (non-vacuous: its answer was outstanding); the
-/// unanswered claim refused `DaemonUnavailable` no sooner than the claim wait; the second claim connected
-/// once the daemon answered it. Before this change the connect waited for the answer inside one call — up
-/// to the claim wait on macOS and Windows, and without any bound on Linux.
+/// AUD-29-19 (§4.7 "Rendezvous", R6), A-443, A-447: a connect never holds its caller, and a claim ends with its daemon.
+/// Do: open a daemon end that does not accept, begin a claim on it with no restart bound and poll it through a claim
+/// wait, timing every poll; let the daemon end go and poll the claim until it ends; then open a daemon end again, begin
+/// a second claim and let it accept while the claim is polled. Expect: every poll returns at once (within
+/// [`poll_bound`]) and the claim is polled more than once (non-vacuous: its answer was outstanding); the unanswered
+/// claim still due before the daemon end goes, on every platform (it waits while its daemon lives), and refused
+/// `DaemonUnavailable` once it has gone (on Windows by the start stamp the stopped daemon end takes back, its process
+/// being this one); the second claim connected once the daemon answered it. Before AUD-29-19 the connect waited for the
+/// answer inside one call; before A-443 the claim was refused at the claim wait with its daemon alive.
 #[test]
-fn a_claim_is_polled_without_waiting_and_refused_at_the_claim_wait() {
+fn a_claim_is_polled_without_waiting_and_refused_once_its_daemon_is_gone() {
   toy_seal::install();
   let instance = format!("test-claim-{}", std::process::id());
-  let mut listener = Listener::open(&instance, None).unwrap();
-  let started = Instant::now();
-  let (refusal, polls, longest) =
-    poll_until_refused(begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap());
+  let listener = Listener::open(&instance, None).unwrap();
+  let mut claim = begin_connect_as(&instance, 0).unwrap();
+  let (mut polls, longest) = poll_through_a_claim_wait(&mut claim);
+  drop(listener);
+  let (refusal, more, gone_longest) = poll_until_refused(claim);
+  polls += more;
   assert!(
     matches!(refusal, IpcError::DaemonUnavailable { .. }),
     "{refusal:?}"
   );
-  assert!(
-    started.elapsed() >= Duration::from_nanos(CLAIM_WAIT_NS),
-    "refused only at the claim wait"
-  );
   assert!(polls > 1, "non-vacuous: the answer was outstanding");
   // The unanswered claim may still sit in the daemon's queue (Linux: a closed connection in the
-  // backlog); the daemon end drains it, and the second claim is answered.
+  // backlog); a new daemon end opens the instance again, and the second claim is answered.
+  let mut listener = Listener::open(&instance, None).unwrap();
   let (connected, served_longest) = poll_while_serving(&mut listener, &instance);
   assert!(connected.region.client_id() > 0);
-  for longest in [longest, served_longest] {
+  for longest in [longest, gone_longest, served_longest] {
     println!(
       "claim poll: longest {:?}, bound {:?}, involuntary switches during it {:?}",
       longest.took,
@@ -335,6 +336,33 @@ fn a_claim_is_polled_without_waiting_and_refused_at_the_claim_wait() {
   }
 }
 
+/// Polls `claim` through a claim wait, at once each time, timing every poll: the polls made and the longest. The claim
+/// is due all the while, since a claim waits while its daemon lives (A-443, A-447); any end fails the test.
+fn poll_through_a_claim_wait(claim: &mut slates_ipc::Claim) -> (u64, Longest) {
+  let started = Instant::now();
+  let mut polls = 0u64;
+  let mut longest = Longest::default();
+  while started.elapsed() < Duration::from_nanos(CLAIM_WAIT_NS) {
+    let at = Instant::now();
+    let switches = slates_machine::bench::involuntary_switches();
+    let polled = claim.poll();
+    longest.note(
+      at.elapsed(),
+      slates_machine::bench::involuntary_switches_since(switches),
+    );
+    polls += 1;
+    match polled {
+      Ok(None) => std::hint::spin_loop(),
+      Ok(Some(_)) => panic!("no daemon answered the claim"),
+      Err(refusal) => panic!(
+        "refused with its daemon alive, {:?} after its start: {refusal:?}",
+        started.elapsed()
+      ),
+    }
+  }
+  (polls, longest)
+}
+
 /// Polls `claim` until it ends, which must be a refusal: the refusal, the polls made, the longest poll.
 fn poll_until_refused(mut claim: slates_ipc::Claim) -> (IpcError, u64, Longest) {
   let mut polls = 0u64;
@@ -359,7 +387,7 @@ fn poll_until_refused(mut claim: slates_ipc::Claim) -> (IpcError, u64, Longest) 
 /// Begins a claim and polls it while the daemon end serves, until it connects within the claim wait: the
 /// connection and the longest poll.
 fn poll_while_serving(listener: &mut Listener, instance: &str) -> (slates_ipc::Connected, Longest) {
-  let claim = begin_connect_as(instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(instance, 0).unwrap();
   let (connected, longest, accepted) = serve_until_connected(listener, claim);
   // The daemon's ends go with the test; the client's mapping keeps the region it opened.
   drop(accepted);
@@ -427,7 +455,7 @@ fn a_claim_whose_daemon_died_before_answering_is_unavailable_not_refused() {
   toy_seal::install();
   let instance = format!("test-claim-reset-{}", std::process::id());
   let listener = Listener::open(&instance, None).unwrap();
-  let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
   drop(listener);
   let (refusal, _, _) = poll_until_refused(claim);
   assert!(
@@ -451,7 +479,7 @@ fn rendezvous_restart_child() {
   assert!(adoption.is_some(), "the parent hands its held rendezvous");
   let first = Listener::open(&instance, adoption.as_ref()).unwrap();
   let first_opened = SystemTime::now();
-  let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
   // A daemon killed with the claim unanswered: nothing it published is taken back, its start stamp included.
   drop(first);
   // A daemon's start stamp is the wall clock when it opens. Wait until the clock has passed the first daemon's
@@ -470,7 +498,8 @@ fn rendezvous_restart_child() {
 }
 
 /// GAPS §8a-sdk-stamp, A-143 (found 2026-10-22: on macOS an async SDK call to a stopped daemon, restarted once,
-/// ended `DaemonGone` where it must end `Stalled`). Do: hold the rendezvous as an anchor does, and run in a child
+/// ended `DaemonGone` though its daemon lived: then it had to end `Stalled`, and since A-232 it waits and is answered
+/// once the daemon runs). Do: hold the rendezvous as an anchor does, and run in a child
 /// under it: daemon A, a client's claim begun while A is published, A dropped unanswered (a killed daemon), then
 /// daemon B, which answers the claim. Expect: the client judges B alive. Before A-143 the client kept the start stamp
 /// it saw when its claim began, A's, while it watched B's process, and so judged the live B gone. Linux passes by
@@ -504,8 +533,8 @@ fn a_refused_claim_does_not_cost_its_round_the_client_it_accepted() {
   toy_seal::install();
   let instance = format!("test-round-{}", std::process::id());
   let mut listener = Listener::open(&instance, None).unwrap();
-  let mut first = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
-  let mut second = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let mut first = begin_connect_as(&instance, 0).unwrap();
+  let mut second = begin_connect_as(&instance, 0).unwrap();
   exchange_keys(&mut listener, [&mut first, &mut second]);
   let pid = std::process::id();
   let mut regions_asked = 0;
@@ -636,13 +665,13 @@ fn a_fresh_rendezvous_opens_while_a_client_of_a_dead_daemon_lives() {
   toy_seal::install();
   let instance = format!("test-fresh-{}", std::process::id());
   let mut dead = Listener::open(&instance, None).unwrap();
-  let claim = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
   let (old_client, _, old_accepted) = serve_until_connected(&mut dead, claim);
   drop(old_accepted);
   drop(dead);
   let mut fresh = once_released(|| Listener::open(&instance, None))
     .expect("a fresh rendezvous opens while a client of the dead daemon still maps the old one");
-  let claim = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
   let (new_client, _, accepted) = serve_until_connected(&mut fresh, claim);
   assert!(
     old_client.liveness.daemon_gone(),
@@ -1033,7 +1062,7 @@ fn a_listener_of_another_user_is_refused_by_the_client() {
     .lines()
     .map_while(Result::ok)
     .find(|line| line.contains(IMPOSTOR_TAG));
-  let claimed = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).map(|_| ());
+  let claimed = begin_connect_as(&instance, 0).map(|_| ());
   impostor.kill().unwrap();
   impostor.wait().unwrap();
   assert!(
@@ -1154,10 +1183,8 @@ fn a_socket_file_a_dead_owner_left_is_replaced_and_a_live_ones_is_not() {
   rustix::net::bind(&dead, &SocketAddrUnix::new(node.as_str()).unwrap()).unwrap();
   drop(dead);
   let mut listener = Listener::open(&instance, None).unwrap();
-  let (connected, _, _accepted) = serve_until_connected(
-    &mut listener,
-    begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap(),
-  );
+  let (connected, _, _accepted) =
+    serve_until_connected(&mut listener, begin_connect_as(&instance, 0).unwrap());
   assert!(
     connected.region.client_id() > 0,
     "a claim connects through the replaced node"

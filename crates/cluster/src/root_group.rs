@@ -54,7 +54,7 @@ impl Snapshotted for RootConfiguration {
 /// [`LogEntry`](crate::raft::LogEntry) carries, decoded and applied to the [`RootConfiguration`] in commit
 /// order so every voter reaches the same configuration. The Raft core treats it as opaque bytes; this is the
 /// root group's interpretation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RootCommand {
   /// Admit a region to the fleet (a region joins).
   AdmitRegion(RegionId),
@@ -76,6 +76,12 @@ pub enum RootCommand {
     /// The region it moves to.
     to: RegionId,
   },
+  /// The leader records the voters the root group's last committed seat change left (A-406;
+  /// [`RootConfiguration::seat`]), so a root learner learns who votes by the configuration's version.
+  Seat {
+    /// The voters, in id order.
+    voters: Vec<HostId>,
+  },
 }
 
 /// Format: a root command is a one-byte tag followed by its little-endian fields; these are the tags.
@@ -83,6 +89,9 @@ const COMMAND_ADMIT_REGION: u8 = 0;
 const COMMAND_RETIRE_REGION: u8 = 1;
 const COMMAND_PROMOTE_REGION: u8 = 2;
 const COMMAND_MOVE_HOME: u8 = 3;
+/// Format: the tag of the leader's record of the root group's voters ([`RootCommand::Seat`]): a little-endian u64
+/// count, then each voter's id.
+const COMMAND_SEAT: u8 = 4;
 
 impl RootCommand {
   /// The command's canonical bytes for the log: the tag, then its fields little-endian (a region id is a
@@ -108,6 +117,17 @@ impl RootCommand {
         out.extend_from_slice(&volume.0);
         out.extend_from_slice(&to.0.to_le_bytes());
       }
+      RootCommand::Seat { voters } => {
+        out.push(COMMAND_SEAT);
+        out.extend_from_slice(
+          &u64::try_from(voters.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+        );
+        for voter in voters {
+          out.extend_from_slice(&voter.0.to_le_bytes());
+        }
+      }
     }
     out
   }
@@ -129,9 +149,27 @@ impl RootCommand {
         let (to, _) = take_region(rest)?;
         Some(RootCommand::MoveHome { volume, to })
       }
+      COMMAND_SEAT => decode_seat(rest),
       _ => None,
     }
   }
+}
+
+/// Decodes the leader's record of the root voters (`COMMAND_SEAT`) after its tag: a count, then each id, the count
+/// checked against the bytes that follow before anything is allocated, or `None` for malformed bytes or trailing ones.
+fn decode_seat(rest: &[u8]) -> Option<RootCommand> {
+  let (count, mut rest) = take_region(rest)?;
+  let count = usize::try_from(count.0).ok()?;
+  if count.checked_mul(size_of::<u64>())? != rest.len() {
+    return None;
+  }
+  let mut voters = Vec::with_capacity(count);
+  for _ in 0..count {
+    let (voter, tail) = take_region(rest)?;
+    voters.push(HostId(voter.0));
+    rest = tail;
+  }
+  Some(RootCommand::Seat { voters })
 }
 
 /// Reads a u64 region id at the front of `bytes`, returning it and the remainder, or `None` if truncated.
@@ -368,6 +406,42 @@ impl RootGroup {
   /// joint change is in flight — who elections ask and learners fetch from.
   pub fn voters(&self) -> Vec<HostId> {
     self.raft.all_voters()
+  }
+
+  /// Who this node knows to vote now: the Raft voter set on a voter, and on a root learner the voters its configuration
+  /// records (A-406, [`RootConfiguration::voters`]), or its join state's before any is recorded. A learner's Raft state
+  /// never moves after its join, so reading it alone left a root learner naming a voter its group had long replaced.
+  pub fn known_voters(&self) -> Vec<HostId> {
+    let recorded = &self.configuration().voters;
+    if recorded.is_empty() || self.raft.is_voter(self.raft.id()) {
+      self.voters()
+    } else {
+      recorded.clone()
+    }
+  }
+
+  /// Whether this node knows `node` to be a root voter now ([`known_voters`](RootGroup::known_voters)).
+  pub fn known_voter(&self, node: HostId) -> bool {
+    let recorded = &self.configuration().voters;
+    if recorded.is_empty() || self.raft.is_voter(self.raft.id()) {
+      self.is_voter(node)
+    } else {
+      recorded.contains(&node)
+    }
+  }
+
+  /// **DRIVE** (leader): records the voters in force in the configuration once they differ from the ones it records
+  /// (A-406, [`RootConfiguration::seat`]): only while no change is in flight — this leader caught up and its voters out
+  /// of any joint configuration, so they are the ones the group's last committed seat change left. A root learner takes
+  /// no part in the group's Raft and learns a change by the configuration's version, and a seat change is a Raft
+  /// configuration entry that moves no version, so without this record a root learner knew only the voters of its join.
+  /// Returns whether it proposed.
+  pub fn record_voters(&mut self) -> bool {
+    if !self.is_leader() || !self.caught_up() || self.raft.in_joint_configuration() {
+      return false;
+    }
+    let sitting = self.raft.all_voters();
+    self.propose(RootCommand::Seat { voters: sitting })
   }
 
   /// The peers the drive loop replicates to ([`RaftNode::replication_targets`]): the voters, plus — while a
@@ -617,17 +691,18 @@ impl RootGroup {
   /// the leader appended it (a non-leader, or a change already reflected in the configuration, returns
   /// `false`, so the log grows only for real changes).
   pub fn propose(&mut self, command: RootCommand) -> bool {
-    let would_change = match command {
-      RootCommand::AdmitRegion(region) => !self.fold.state().regions.contains(&region),
-      RootCommand::RetireRegion(region) => self.fold.state().regions.contains(&region),
+    let would_change = match &command {
+      RootCommand::AdmitRegion(region) => !self.fold.state().regions.contains(region),
+      RootCommand::RetireRegion(region) => self.fold.state().regions.contains(region),
       RootCommand::PromoteRegion { lost, mirror } => {
         lost != mirror
-          && self.fold.state().regions.contains(&lost)
-          && self.fold.state().regions.contains(&mirror)
+          && self.fold.state().regions.contains(lost)
+          && self.fold.state().regions.contains(mirror)
       }
       RootCommand::MoveHome { volume, to } => {
-        self.fold.state().regions.contains(&to) && self.fold.state().homes.get(&volume) != Some(&to)
+        self.fold.state().regions.contains(to) && self.fold.state().homes.get(volume) != Some(to)
       }
+      RootCommand::Seat { voters } => self.fold.state().seats(voters),
     };
     if !would_change {
       return false;
@@ -856,6 +931,9 @@ fn apply_command(configuration: &mut RootConfiguration, command: &[u8]) {
     }
     Some(RootCommand::MoveHome { volume, to }) => {
       configuration.move_home(volume, to);
+    }
+    Some(RootCommand::Seat { voters }) => {
+      configuration.seat(&voters);
     }
     None => {}
   }
@@ -1209,6 +1287,95 @@ mod tests {
     );
   }
 
+  /// A-406 (§4.8 root learners): the root leader records the voters in force in the configuration once no change is in
+  /// flight, and a root learner knows who votes by the configuration it adopts, through a seat change too. Do: three
+  /// representatives P0-P2, P0 elected; a learner joins from P0's state; P0 records its voters and commits; the learner
+  /// adopts P0's configuration; region R2 is retired and the voter change drops P2; P0 records again and the learner
+  /// adopts again. Expect each record one version on, a record with nothing new to propose nothing, and the learner to
+  /// name P0's voters after each adoption, the second time without P2. Before, the learner named its join's voters,
+  /// P2 among them, for good.
+  #[test]
+  fn a_root_learner_names_the_voters_the_configuration_records_through_a_seat_change() {
+    const LEARNER: HostId = HostId(9);
+    let mut groups = groups();
+    elect_among(&mut groups, P0, &[P0, P1, P2]);
+    replicate_round(&mut groups, P0, &[P0, P1, P2]);
+    replicate_round(&mut groups, P0, &[P0, P1, P2]);
+    let (saved, base) = groups[&P0].join_state().unwrap();
+    let mut learner = RootGroup::learner(LEARNER);
+    learner.join_from(saved, base).unwrap();
+    assert!(!learner.is_voter(LEARNER), "the learner does not vote");
+    let first = record_root_voters(&mut groups, &[P0, P1, P2]);
+    assert_eq!(first, vec![P0, P1, P2]);
+    assert!(
+      !groups.get_mut(&P0).is_some_and(RootGroup::record_voters),
+      "nothing new to record proposes nothing"
+    );
+    assert!(learner.adopt(groups[&P0].configuration().clone()));
+    assert_eq!(
+      learner.known_voters(),
+      first,
+      "the learner names the voters recorded"
+    );
+
+    let survivors = [P0, P1];
+    retire_region_two(&mut groups, &survivors);
+    let second = record_root_voters(&mut groups, &survivors);
+    assert_eq!(second, vec![P0, P1], "the seat change left P0 and P1");
+    assert!(learner.adopt(groups[&P0].configuration().clone()));
+    assert_eq!(
+      (learner.known_voters(), learner.known_voter(P2)),
+      (second, false),
+      "the learner names the changed voters"
+    );
+  }
+
+  /// Retires region R2 at the root leader `P0` and drops its voter P2 by the voter change, each committed over
+  /// `survivors` (P0 and P1).
+  fn retire_region_two(groups: &mut BTreeMap<HostId, RootGroup>, survivors: &[HostId]) {
+    assert!(
+      groups
+        .get_mut(&P0)
+        .is_some_and(|leader| leader.reconcile_regions(&[R0, R1], &BTreeMap::new()))
+    );
+    replicate_round(groups, P0, survivors);
+    replicate_round(groups, P0, survivors);
+    let representatives: BTreeMap<RegionId, HostId> = [(R0, P0), (R1, P1)].into_iter().collect();
+    for rounds in [1, 2] {
+      assert!(
+        groups
+          .get_mut(&P0)
+          .is_some_and(|leader| leader.reconcile_voters(&representatives))
+      );
+      for _ in 0..rounds {
+        replicate_round(groups, P0, survivors);
+      }
+    }
+  }
+
+  /// Has the root leader `P0` record its voters and commits the record over `reachable`. Expect the record proposed and
+  /// committed one version on, naming the voters in force. Those voters.
+  fn record_root_voters(
+    groups: &mut BTreeMap<HostId, RootGroup>,
+    reachable: &[HostId],
+  ) -> Vec<HostId> {
+    let before = groups[&P0].configuration().version;
+    let proposed = groups.get_mut(&P0).is_some_and(RootGroup::record_voters);
+    replicate_round(groups, P0, reachable);
+    replicate_round(groups, P0, reachable);
+    let voters = groups[&P0].voters();
+    assert!(proposed, "the leader recorded the voters in force");
+    assert_eq!(
+      (
+        groups[&P0].configuration().version,
+        groups[&P0].configuration().voters.clone()
+      ),
+      (before + 1, voters.clone()),
+      "the record committed one version on"
+    );
+    voters
+  }
+
   /// Each root command round-trips through encode/decode, and a malformed entry decodes to `None` (applied as
   /// a safe no-op rather than panicking).
   #[test]
@@ -1223,6 +1390,9 @@ mod tests {
       RootCommand::MoveHome {
         volume: ObjectId::new(P0, 7),
         to: R1,
+      },
+      RootCommand::Seat {
+        voters: vec![P0, P2],
       },
     ];
     for command in commands {
@@ -1241,6 +1411,15 @@ mod tests {
       RootCommand::decode(&[9, 9, 9]),
       None,
       "an unknown tag decodes to nothing"
+    );
+    // A-406: a record of the voters whose count lies about the ids that follow is refused before anything is allocated.
+    let mut lying = vec![COMMAND_SEAT];
+    lying.extend_from_slice(&u64::MAX.to_le_bytes());
+    lying.extend_from_slice(&P0.0.to_le_bytes());
+    assert_eq!(
+      RootCommand::decode(&lying),
+      None,
+      "a count past the bytes decodes to nothing"
     );
   }
 

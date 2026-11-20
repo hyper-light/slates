@@ -113,7 +113,7 @@ pub(crate) fn with_writer<T>(
     Err(reply) => return Err(refusal_in(*reply)),
   };
   // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
-  crate::verbs::use_attachment(state, attachment)?;
+  crate::verbs::use_attachment(state, principal, attachment)?;
   let Some(catalog) = state.db.partition().attachment(attachment).cloned() else {
     return Err(Refusal::NotFound);
   };
@@ -177,7 +177,10 @@ pub(crate) fn writable_file(
       match found.kind {
         Kind::File => Ok(found.ino),
         Kind::Dir => Err(VfsError::IsDirectory),
-        Kind::Symlink | Kind::Fifo | Kind::Socket => Err(VfsError::Invalid),
+        // A device node is never mapped as content (A-294), as a FIFO or socket name is not.
+        Kind::Symlink | Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+          Err(VfsError::Invalid)
+        }
       }
     },
   )?

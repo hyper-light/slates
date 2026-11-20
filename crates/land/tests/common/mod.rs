@@ -335,12 +335,24 @@ pub(crate) fn write_file<H: HostFs>(
   path: &str,
   bytes: &[u8],
 ) {
+  write_file_with_mode(vol, host, store, path, bytes, FILE_MODE);
+}
+
+/// [`write_file`] with the mode a file it creates is given (an existing file keeps its own).
+pub(crate) fn write_file_with_mode<H: HostFs>(
+  vol: &mut Volume,
+  host: &mut H,
+  store: &mut Store,
+  path: &str,
+  bytes: &[u8],
+  mode: u32,
+) {
   let (dir, name) = split(path);
   let d = dir_of(vol, host, store, dir);
   let mut o = vol.with_host(host);
   let no = match o.lookup(store, d, name) {
     Ok(l) => l.inode,
-    Err(_) => o.create_file(store, d, name, FILE_MODE).unwrap(),
+    Err(_) => o.create_file(store, d, name, mode).unwrap(),
   };
   o.truncate(store, no, 0).unwrap();
   if !bytes.is_empty() {
@@ -404,6 +416,28 @@ pub(crate) fn symlink<H: HostFs>(
   let (dir, name) = split(path);
   let d = dir_of(vol, host, store, dir);
   vol.with_host(host).symlink(store, d, name, target).unwrap();
+}
+
+/// Sets the Windows attribute bits `bits` (a Win32 word) on the object of `kind` at `path` through the overlay, as the
+/// WinFsp drive's `SetFileAttributes` does (A-262); the volume keeps the bits that kind keeps.
+pub(crate) fn set_windows_bits<H: HostFs>(
+  vol: &mut Volume,
+  host: &mut H,
+  store: &mut Store,
+  path: &str,
+  bits: u32,
+  kind: Kind,
+) {
+  let (dir, name) = split(path);
+  let d = dir_of(vol, host, store, dir);
+  let mut o = vol.with_host(host);
+  let no = o.lookup(store, d, name).unwrap().inode;
+  o.set_windows_attributes(
+    store,
+    no,
+    slates_vfs::inode::WindowsAttributes::kept(bits, kind),
+  )
+  .unwrap();
 }
 
 /// Removes a tree through the overlay the way `rm -r` does: files first, directories bottom-up.

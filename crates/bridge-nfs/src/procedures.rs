@@ -31,7 +31,7 @@ use slates_bridge_core::{
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
 use slates_vfs::xattr::XattrSet;
 
 use crate::v4::files::{FileState, IoAuthority, IoWant};
@@ -289,8 +289,12 @@ const ACCESS3_EXECUTE: u32 = 0x20;
 /// Format: `UNSTABLE` (`stable_how` = 0, RFC 1813 §3.3.7): the server may reply before the data is
 /// stable; the client keeps its copy until a COMMIT (or a later stable WRITE) answers with the same
 /// write verifier, and re-sends it when the verifier changed (the server restarted in between).
-/// An `UNSTABLE` write is answered `UNSTABLE` — the bytes are in the volume, not yet in the
-/// recovery image — and the client's COMMIT is the barrier that publishes them.
+/// An `UNSTABLE` write is answered `UNSTABLE`, and the host publishes it into the recovery image
+/// before the reply all the same (A-358), so it survives the daemon's death without the client's
+/// help: a client may never write it again, and Apple's sends nothing after a COMMIT answered a new
+/// verifier (docs/bugs/2026-11-18-an-fsynced-file-came-back-empty-after-a-daemon-kill-under-the-macos-mount.md).
+/// What `UNSTABLE` leaves to the COMMIT is durability past the daemon: a live-shipped volume's
+/// candidates (A-200).
 const UNSTABLE: u32 = 0;
 /// Format: `FILE_SYNC` (`stable_how` = 2, RFC 1813 §3.3.7): the data and its metadata are stable
 /// before the reply. slates makes a write stable by publishing the shard's recovery image into
@@ -743,7 +747,14 @@ impl<'b> Export<'b> {
       gid: node.gid,
       size: node.size,
       used: node.size,
-      rdev: Specdata3::default(),
+      // A device node's number, as NFS carries it (A-294): `rdev` describes the device of an `NF3CHR` or `NF3BLK`
+      // (RFC 1813 §2.6), and is zero for every other kind.
+      rdev: node
+        .device
+        .map_or(Specdata3::default(), |number| Specdata3 {
+          specdata1: number.major,
+          specdata2: number.minor,
+        }),
       fsid: self.fsid(),
       fileid: node.ino,
       atime: nfstime_of(node.atime),
@@ -1404,8 +1415,9 @@ impl<'b> Export<'b> {
 
   /// NFSPROC3_WRITE: write the request's data at `offset` to the file a handle names, over the
   /// shared interface under the export's context. The reply's `committed` level is what the write
-  /// asked for, made true by the host: an `UNSTABLE` write is answered `UNSTABLE` (the bytes are in
-  /// the volume; the client's later COMMIT publishes them), and a `DATA_SYNC` or `FILE_SYNC` write is
+  /// asked for, made true by the host: an `UNSTABLE` write is answered `UNSTABLE` (the host publishes
+  /// its bytes before the reply too, A-358, and the client's later COMMIT is what waits for a
+  /// live-shipped volume's candidates, A-200), and a `DATA_SYNC` or `FILE_SYNC` write is
   /// answered `FILE_SYNC` because the host's barrier publishes the shard's recovery image before it
   /// sends the reply (§4.8) — and replaces this reply with `NFS3ERR_IO` when that barrier is refused
   /// ([`io_failure_reply`]). A write against a read-only export or a pinned view is refused by the
@@ -1488,11 +1500,12 @@ impl<'b> Export<'b> {
     Ok((wcc, written, committed))
   }
 
-  /// NFSPROC3_COMMIT: make a file's unstable writes stable (RFC 1813 §3.3.21). The bytes an
-  /// `UNSTABLE` write left in the volume become stable when the shard's recovery image is published
-  /// into anchor-owned RAM (§4.8); the host that runs this export does that at its barrier after the
-  /// commit and before it sends the reply (and answers a refused barrier with `NFS3ERR_IO`,
-  /// [`io_failure_reply`]). The commit itself resolves the handle and returns the file's current
+  /// NFSPROC3_COMMIT: make a file's unstable writes stable (RFC 1813 §3.3.21). Each write's bytes are
+  /// already in the shard's recovery image in anchor-owned RAM, published before the write was
+  /// answered (§4.8; A-358); the host that runs this export runs its barrier after the commit and
+  /// before it sends the reply all the same, which on a live-shipped volume waits until its
+  /// candidates hold the publication (A-200), and answers a refused barrier with `NFS3ERR_IO`
+  /// ([`io_failure_reply`]). The commit itself resolves the handle and returns the file's current
   /// `wcc_data` and the same `writeverf3` a write returns, so a client `fsync` (which the kernel
   /// issues as COMMIT) succeeds over the mount, as the git, sqlite and editor workloads require.
   /// Without this a COMMIT is `PROC_UNAVAIL` and the client's `fsync` fails.
@@ -2321,7 +2334,8 @@ impl<'b> Export<'b> {
     }
   }
 
-  /// Creates only FIFO/socket namespace metadata; the kernel owns transient IPC (A-26).
+  /// Makes a name with no content: a FIFO or socket name, whose stream belongs to the client's kernel (A-26), or a
+  /// device node, whose number is metadata no route slates serves opens as a device (A-294).
   pub fn mknod(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
     let (status, made, dir_post) = self.do_mknod(args);
     let mut writer = XdrWriter::new();
@@ -2329,6 +2343,13 @@ impl<'b> Export<'b> {
     writer.into_bytes()
   }
 
+  /// MKNOD, its checks taken in the order Linux's `mknodat` takes them on a local file system (A-268, kept by A-294): a
+  /// taken name is `NFS3ERR_EXIST` (an exclusive create over NFS skips the client's own lookup, so only the server can
+  /// say so), a directory the caller may not write is `NFS3ERR_ACCES`, and a device node other than a whiteout asked by
+  /// a caller who is not root is `NFS3ERR_PERM`, which a client reports as `EPERM`: `vfs_mknod` asks `CAP_MKNOD`, and
+  /// `nfsd` drops it from every uid but root's (`access::needs_superuser`). Before A-294 every block
+  /// or character device was refused `NFS3ERR_PERM` after the first two checks; before A-268, `NFS3ERR_BADTYPE`, which
+  /// the Linux client turned into its internal `EBADTYPE` (errno 527).
   fn do_mknod(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
     // MKNOD3args: where, type and the type-specific attributes (RFC 1813 §3.3.11).
     let dir_fh = match Nfsfh3::decode(args) {
@@ -2339,12 +2360,12 @@ impl<'b> Export<'b> {
       Ok(n) => n.to_owned(),
       Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
-    // A block or character device is read whole, as any MKNOD is, then refused after the name and the directory are
-    // checked (A-268). Any other type is not one MKNOD makes (RFC 1813 §3.3.11): `NFS3ERR_BADTYPE`.
+    // Any other type is not one MKNOD makes (RFC 1813 §3.3.11): `NFS3ERR_BADTYPE`.
     let kind = match args.u32().map(Ftype3::from_wire) {
-      Ok(Some(Ftype3::Fifo)) => Some(Kind::Fifo),
-      Ok(Some(Ftype3::Sock)) => Some(Kind::Socket),
-      Ok(Some(Ftype3::Blk | Ftype3::Chr)) => None,
+      Ok(Some(Ftype3::Fifo)) => Kind::Fifo,
+      Ok(Some(Ftype3::Sock)) => Kind::Socket,
+      Ok(Some(Ftype3::Blk)) => Kind::BlockDevice,
+      Ok(Some(Ftype3::Chr)) => Kind::CharDevice,
       Ok(_) => return (Nfsstat3::Badtype, None, Wcc::default()),
       Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
@@ -2352,10 +2373,18 @@ impl<'b> Export<'b> {
       Ok(decoded) => decoded,
       Err(status) => return (status, None, Wcc::default()),
     };
-    // A device's `specdata3`, its major and minor numbers: read so a truncated request is refused as one.
-    if kind.is_none() && (args.u32().is_err() || args.u32().is_err()) {
-      return (Nfsstat3::Inval, None, Wcc::default());
-    }
+    // A device's `specdata3` follows its attributes: its major and minor numbers, kept as the client sent them.
+    let device = if kind.is_device() {
+      match (args.u32(), args.u32()) {
+        (Ok(major), Ok(minor)) => DeviceNumber::new(major, minor),
+        _ => return (Nfsstat3::Inval, None, Wcc::default()),
+      }
+    } else {
+      DeviceNumber::default()
+    };
+    let Some(node) = SpecialNode::of(kind, device) else {
+      return (Nfsstat3::Badtype, None, Wcc::default());
+    };
     let dir_identity = match self.resolve_handle(&dir_fh) {
       Ok(id) => id,
       Err(status) => return (status, None, Wcc::default()),
@@ -2365,22 +2394,34 @@ impl<'b> Export<'b> {
       Err(e) => return (nfsstat_of(&e), None, Wcc::default()),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
-    // POSIX: adding an entry needs write and search permission on the directory.
-    let Some(kind) = kind else {
-      return self.refuse_device_node(&dir_identity, parent, &cx, &name);
-    };
+    // POSIX: adding an entry needs write and search permission on the directory; a taken name is told first, as a
+    // lookup comes before `may_create`.
     let dir_pre = match self.writable_directory(&dir_identity) {
       Ok(node) => Some(self.wcc_attr(&node)),
-      Err((status, dir_post)) => return (status, None, self.refused(dir_post)),
+      Err((status, dir_post)) => {
+        let status = if self.bridge.lookup(parent, &cx, &name).is_ok() {
+          Nfsstat3::Exist
+        } else {
+          status
+        };
+        return (status, None, self.refused(dir_post));
+      }
     };
+    if access::needs_superuser(node) && !self.caller.is_root() {
+      let status = match self.bridge.lookup(parent, &cx, &name) {
+        Ok(_) => Nfsstat3::Exist,
+        Err(_) => Nfsstat3::Perm,
+      };
+      return (status, None, self.wcc_after(dir_pre, &dir_identity));
+    }
     let mode = changes.mode.unwrap_or(DEFAULT_FILE_MODE);
-    let object = match self.bridge.mknod(parent, &cx, &name, mode, kind) {
+    let object = match self.bridge.mknod(parent, &cx, &name, mode, node) {
       Ok(node) => ObjectId::new(node.ino, node.generation),
       Err(e) => {
         return (nfsstat_of(&e), None, self.wcc_after(dir_pre, &dir_identity));
       }
     };
-    // An IPC name has no size to set; apply the remaining fields (uid/gid/times).
+    // A name with no content has no size to set; apply the remaining fields (uid/gid/times).
     let post_changes = SetAttr {
       mode: None,
       size: None,
@@ -2394,39 +2435,6 @@ impl<'b> Export<'b> {
       post_changes,
       explicit_times,
     )
-  }
-
-  /// The answer to a MKNOD of a block or character device (§4.6 A-26, A-268): slates makes no device nodes, so it is
-  /// refused as a local file system that cannot hold one refuses it, in the order Linux's `vfs_mknod` takes its checks.
-  /// A taken name is `NFS3ERR_EXIST` (an exclusive create over NFS skips the client's own lookup, so the server must
-  /// say so); a directory the caller may not write is `NFS3ERR_ACCES`; then `NFS3ERR_PERM`, which a client reports as
-  /// `EPERM`, what `mknod(2)` answers when "the filesystem containing pathname does not support the type of node
-  /// requested". It was `NFS3ERR_BADTYPE`, the status RFC 1813 §3.3.11 names, which the Linux client turns into its
-  /// internal `EBADTYPE` (errno 527) and every program prints as an unknown error.
-  fn refuse_device_node(
-    &mut self,
-    dir_identity: &FileHandle,
-    parent: ObjectId,
-    cx: &OpContext,
-    name: &str,
-  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
-    let dir_pre = match self.writable_directory(dir_identity) {
-      Ok(node) => Some(self.wcc_attr(&node)),
-      Err((status, dir_post)) => {
-        // A taken name is told before the directory's permission, as a lookup comes before `may_create`.
-        let status = if self.bridge.lookup(parent, cx, name).is_ok() {
-          Nfsstat3::Exist
-        } else {
-          status
-        };
-        return (status, None, self.refused(dir_post));
-      }
-    };
-    let status = match self.bridge.lookup(parent, cx, name) {
-      Ok(_) => Nfsstat3::Exist,
-      Err(_) => Nfsstat3::Perm,
-    };
-    (status, None, self.wcc_after(dir_pre, dir_identity))
   }
 
   /// NFSPROC3_READLINK: read the target path of a symbolic link a handle names, over the shared
@@ -2905,9 +2913,9 @@ fn encode_wcc(writer: &mut XdrWriter, wcc: Wcc) {
 
 /// The `stable_how` a WRITE call asks for (RFC 1813 §3.3.7: `UNSTABLE`, `DATA_SYNC` or
 /// `FILE_SYNC`), decoded from its arguments — the file handle, the offset and the count precede
-/// it — or `None` for a call that does not decode that far. The host's barrier reads it to decide
-/// whether the write's reply may go out before the shard's recovery image is published: only an
-/// `UNSTABLE` write may (its client commits later); any other level is published first.
+/// it — or `None` for a call that does not decode that far. The host reads it to decide what the
+/// write's reply waits for: every write is published before its reply (A-358), and one that asked for
+/// more than `UNSTABLE` also waits for a live-shipped volume's candidates (A-200).
 pub fn write_stable_how(args: &mut XdrReader<'_>) -> Option<u32> {
   Nfsfh3::decode(args).ok()?;
   args.u64().ok()?;
@@ -2915,7 +2923,8 @@ pub fn write_stable_how(args: &mut XdrReader<'_>) -> Option<u32> {
   args.u32().ok()
 }
 
-/// Whether a WRITE's decoded `stable_how` asks for a reply before the data is stable (`UNSTABLE`).
+/// Whether a WRITE's decoded `stable_how` claims no stability (`UNSTABLE`): its reply waits for no
+/// live-shipped volume's candidates, though the host publishes it before the reply (A-358).
 pub fn is_unstable(stable_how: u32) -> bool {
   stable_how == UNSTABLE
 }
@@ -3101,6 +3110,8 @@ fn ftype3_of(kind: Kind) -> Ftype3 {
     Kind::Symlink => Ftype3::Lnk,
     Kind::Fifo => Ftype3::Fifo,
     Kind::Socket => Ftype3::Sock,
+    Kind::BlockDevice => Ftype3::Blk,
+    Kind::CharDevice => Ftype3::Chr,
   }
 }
 
@@ -3131,7 +3142,10 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::NotDirectory => Nfsstat3::Notdir,
     VfsError::IsDirectory => Nfsstat3::Isdir,
     VfsError::NotEmpty => Nfsstat3::Notempty,
-    VfsError::NoSpace => Nfsstat3::Nospc,
+    VfsError::NoSpace | VfsError::RetentionExceeded => Nfsstat3::Nospc,
+    // An offset or length past what the volume addresses: the file would be too large (RFC 1813 §2.6), never the
+    // server's own fault.
+    VfsError::FileTooLarge => Nfsstat3::Fbig,
     VfsError::NotPermitted => Nfsstat3::Perm,
     // A read-only attachment or a snapshot's view is a read-only file system (`NFS3ERR_ROFS`; v4's `NFS4ERR_ROFS` by
     // `Nfsstat4::of_v3`).
@@ -3148,6 +3162,11 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     // RFC 8881 §10.2: the file is delegated to an NFSv4 client, whose recall was asked for; the change proceeds once
     // the delegation is returned or revoked, so the caller retries (A-79).
     VfsError::Delegated => Nfsstat3::Jukebox,
+    // RFC 1813 §2.6, `NFS3ERR_JUKEBOX`: "The server initiated the request, but was not able to complete it in a timely
+    // fashion": an S3 base's fetch of what the call reads is under way (A-555). The daemon parks the call on that fetch
+    // and serves it again when it lands; a call it could not park is answered this, and the client retries it. Until
+    // A-555 it fell to `NFS3ERR_SERVERFAULT`.
+    VfsError::BasePending(_) => Nfsstat3::Jukebox,
     _ => Nfsstat3::ServerFault,
   }
 }
@@ -3320,4 +3339,26 @@ fn other_state(
   };
   files.check_io(&stateid, handle, clientid, want, acting)?;
   Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_vfs::error::VfsError;
+  use slates_vfs::host::FetchId;
+
+  use super::nfsstat_of;
+  use crate::nfs::Nfsstat3;
+
+  /// A-555 (§4.15 "An S3 base"; RFC 1813 §2.6): do answer a procedure whose volume refused it because the overlay's base
+  /// is fetching what it reads. Expect `NFS3ERR_JUKEBOX`, "the server initiated the request, but was not able to
+  /// complete it in a timely fashion", which the client retries, as a delegated file's recall is answered: nothing
+  /// changed. The daemon parks the call on its fetch where it can; this is the answer for one it could not park. Before
+  /// A-555 it fell to `NFS3ERR_SERVERFAULT`, which a client takes for a failure.
+  #[test]
+  fn a_call_on_a_base_still_fetching_is_answered_jukebox_never_a_server_fault() {
+    assert_eq!(
+      nfsstat_of(&VfsError::BasePending(FetchId(7))),
+      Nfsstat3::Jukebox
+    );
+  }
 }

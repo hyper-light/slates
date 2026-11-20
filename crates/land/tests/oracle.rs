@@ -18,12 +18,13 @@ use slates_land::verdict::{ConflictClass, Verdict};
 use slates_vfs::base::BaseConfig;
 use slates_vfs::host::sim::SimHost;
 use slates_vfs::host::{HostFs, HostKind};
+use slates_vfs::inode::{Kind, WindowsAttributes};
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
 use common::{
   LARGE, Session, Setup, TERM_NS, config, mkdir, read_through, rename, request, rm_r, scratch,
-  split, store, symlink, unlink, write_file,
+  set_windows_bits, split, store, symlink, unlink, write_file,
 };
 
 fn overlay(host: &mut SimHost, store: &mut Store) -> Volume {
@@ -71,12 +72,17 @@ fn disk(host: &SimHost) -> Disk {
     .collect()
 }
 
-/// T-1.12 / A-26: planning a landing with IPC names refuses before any host write.
+/// T-1.12 / A-26, A-294: planning a landing with an IPC name or a device node refuses before any host write: a grant
+/// authorizes file content, never a host endpoint or device node, and making a device node on the host would need a
+/// privilege slates never holds (R10).
 #[test]
 fn ipc_names_refuse_landing_before_an_ordinary_file_can_be_written() {
+  use slates_vfs::inode::{DeviceNumber, SpecialNode};
   for kind in [
-    slates_vfs::inode::Kind::Fifo,
-    slates_vfs::inode::Kind::Socket,
+    SpecialNode::Fifo,
+    SpecialNode::Socket,
+    SpecialNode::BlockDevice(DeviceNumber::new(8, 1)),
+    SpecialNode::CharDevice(DeviceNumber::new(0, 0)),
   ] {
     let mut store = store();
     let mut volume = scratch(&mut store);
@@ -1780,33 +1786,19 @@ fn a_session_grant_covers_the_next_landing() {
   assert_eq!(finished, 2);
 }
 
-/// Sets the Windows attribute bits `bits` (a Win32 word) on the file at `path` through the overlay, as the WinFsp
-/// drive's `SetFileAttributes` does (A-262).
-fn set_windows_bits(
-  vol: &mut Volume,
-  host: &mut SimHost,
-  store: &mut Store,
-  path: &str,
-  bits: u32,
-) {
-  let (dir, name) = split(path);
-  let d = common::dir_of(vol, host, store, dir);
-  let mut o = vol.with_host(host);
-  let no = o.lookup(store, d, name).unwrap().inode;
-  o.set_windows_attributes(
-    store,
-    no,
-    slates_vfs::inode::WindowsAttributes::kept(bits, slates_vfs::inode::Kind::File),
-  )
-  .unwrap();
-}
-
-/// A-262, stage 1 (no landing applies the bits yet). Do: run §4.15's worked example twice over the same base, the second
-/// time with Windows attribute bits set (`HIDDEN | SYSTEM`) on an edited file, on a created one, and on a base file the
-/// work never otherwise touched. Expect: both landings are `Done` with nothing refused, and they leave the same disk,
-/// byte for byte and kind for kind: a landing carries the bits nowhere and fails on none of them.
+/// A-262, A-451, A-458. Do: run §4.15's worked example twice over the same base, the second time with Windows attribute
+/// bits set (`HIDDEN | SYSTEM`) on an edited file, on a created one, and on a base file the work never otherwise
+/// touched. Expect: both landings are `Done` with nothing refused and leave the same disk, byte for byte and kind for
+/// kind; the edited, the created and the untouched file hold the bits on the disk, and without them what the volume
+/// kept (the base files' none, a created file's `ARCHIVE`). The untouched file's bits land as a metadata entry, its
+/// bytes never rewritten, so the second landing writes one entry more. Before A-458 a change of a base file's bits
+/// alone landed nothing.
 #[test]
-fn a_landing_ignores_windows_attribute_bits_without_error() {
+fn a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes() {
+  /// Format: `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`.
+  const HIDDEN_SYSTEM: u32 = 0x2 | 0x4;
+  /// The files the bits are set on: an edited one, a created one, and an untouched base file.
+  const MARKED: [&str; 3] = ["/src/lib.rs", "/src/new1.rs", "/src/f12.rs"];
   let land = |with_bits: bool| {
     let mut host = SimHost::new();
     example_base(&mut host, 16);
@@ -1814,10 +1806,18 @@ fn a_landing_ignores_windows_attribute_bits_without_error() {
     let mut vol = overlay(&mut host, &mut store);
     example_edits(&mut vol, &mut host, &mut store);
     if with_bits {
-      for path in ["/src/lib.rs", "/src/new1.rs", "/src/f12.rs"] {
-        set_windows_bits(&mut vol, &mut host, &mut store, path, 0x2 | 0x4);
+      for path in MARKED {
+        set_windows_bits(
+          &mut vol,
+          &mut host,
+          &mut store,
+          path,
+          HIDDEN_SYSTEM,
+          Kind::File,
+        );
       }
     }
+    let untouched = host.fingerprint("/src/f12.rs").unwrap();
     let target = root_target(&mut host);
     let mut session = Session::new();
     let mut setup = Setup {
@@ -1829,16 +1829,138 @@ fn a_landing_ignores_windows_attribute_bits_without_error() {
     };
     let report = setup.land(example_request(1)).unwrap();
     assert_eq!(report.state, LandingState::Done, "{report:?}");
-    (disk(&host), report.written)
+    assert_eq!(
+      host.fingerprint("/src/f12.rs").unwrap().ino,
+      untouched.ino,
+      "the untouched file is never rewritten"
+    );
+    let bits = MARKED.map(|path| host.windows_attributes(path));
+    (disk(&host), report.written, bits)
   };
-  let (with_bits, written_with_bits) = land(true);
-  let (without, written_without) = land(false);
+  let (with_bits, written_with_bits, bits_with) = land(true);
+  let (without, written_without, bits_without) = land(false);
   assert_eq!(
     with_bits, without,
-    "the bits change nothing a landing writes, and refuse nothing"
+    "the bits change no byte and no kind a landing writes, and refuse nothing"
   );
   assert_eq!(
-    written_with_bits, written_without,
-    "nor how many entries it writes ({written_without})"
+    written_with_bits,
+    written_without + 1,
+    "one entry more: the untouched file's bits, as a metadata entry"
   );
+  let hidden_system = Some(u16::try_from(HIDDEN_SYSTEM).unwrap());
+  assert_eq!(
+    bits_with, [hidden_system; 3],
+    "every marked file lands with the bits the volume keeps"
+  );
+  assert_eq!(
+    bits_without,
+    [Some(0), Some(WindowsAttributes::ARCHIVE), Some(0)],
+    "without them, what the volume kept: a base file's none, a created file's ARCHIVE"
+  );
+}
+
+/// A-451 (a directory link lands as one). Do: land a scratch volume holding a directory the drive made hidden and
+/// read-only, a file in it the drive made system, a link to the directory Windows made as a directory link and hidden,
+/// a link to the file with no bits, and a plain file. Expect each landed object to hold on the disk the bits the volume
+/// keeps for it, every one: the directory its read-only and hidden bits, the directory link its kind and its hidden bit,
+/// the file link none, and a file the drive never touched the `ARCHIVE` a new file is made with.
+#[test]
+fn a_landing_gives_each_object_the_bits_the_volume_keeps_and_a_directory_link_its_kind() {
+  let mut host = SimHost::new();
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  mkdir(&mut vol, &mut host, &mut store, "/d");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/d/f.rs",
+    b"in a hidden directory",
+  );
+  write_file(&mut vol, &mut host, &mut store, "/plain.rs", b"plain");
+  symlink(&mut vol, &mut host, &mut store, "/to_d", "d");
+  symlink(&mut vol, &mut host, &mut store, "/to_f", "d/f.rs");
+  let hidden = u32::from(WindowsAttributes::HIDDEN);
+  let marks = [
+    (
+      "/d",
+      u32::from(WindowsAttributes::READONLY) | hidden,
+      Kind::Dir,
+    ),
+    ("/d/f.rs", u32::from(WindowsAttributes::SYSTEM), Kind::File),
+    (
+      "/to_d",
+      u32::from(WindowsAttributes::LINK_DIRECTORY) | hidden,
+      Kind::Symlink,
+    ),
+  ];
+  for (path, bits, kind) in marks {
+    set_windows_bits(&mut vol, &mut host, &mut store, path, bits, kind);
+  }
+  let mut session = Session::new();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(request(1))
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  let landed = |path: &str| host.windows_attributes(path);
+  assert_eq!(
+    landed("/d"),
+    Some(WindowsAttributes::READONLY | WindowsAttributes::HIDDEN),
+    "a directory's read-only and hidden bits"
+  );
+  assert_eq!(landed("/d/f.rs"), Some(WindowsAttributes::SYSTEM));
+  assert_eq!(
+    landed("/to_d"),
+    Some(WindowsAttributes::LINK_DIRECTORY | WindowsAttributes::HIDDEN),
+    "a directory link's kind and its hidden bit"
+  );
+  assert_eq!(landed("/to_f"), Some(0), "a file link, no bit");
+  assert_eq!(landed("/plain.rs"), Some(WindowsAttributes::ARCHIVE));
+}
+
+/// §4.15 step 6, A-445 (a reflink in a landing). Do: land a scratch volume holding two files with the same bytes and a
+/// third with other bytes, onto a simulated filesystem with reflinks and onto one without. Expect, with them: the second
+/// identical file shared from the first's staged temporary (one clone on the host, `cloned` 1 in the report) and all
+/// three files whole on the disk; without them, no clone asked and the same disk.
+#[test]
+fn a_file_whose_bytes_its_batch_already_staged_is_cloned_where_the_target_can() {
+  let same: Vec<u8> = (0..10_000u32)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  for reflink in [true, false] {
+    let mut host = SimHost::new();
+    host.set_reflink_supported(reflink);
+    let target = root_target(&mut host);
+    let mut store = store();
+    let mut vol = scratch(&mut store);
+    write_file(&mut vol, &mut host, &mut store, "/a.bin", &same);
+    write_file(&mut vol, &mut host, &mut store, "/b.bin", &same);
+    write_file(&mut vol, &mut host, &mut store, "/c.bin", b"other");
+    let mut session = Session::new();
+    let report = Setup {
+      host: &mut host,
+      target: &target,
+      vol: &mut vol,
+      store: &mut store,
+      session: &mut session,
+    }
+    .land(request(1))
+    .unwrap();
+    assert_eq!(report.state, LandingState::Done, "{report:?}");
+    assert_eq!(report.written, 3, "{report:?}");
+    let expected = if reflink { (1, 1) } else { (0, 0) };
+    assert_eq!((report.cloned, host.clones()), expected, "{report:?}");
+    assert_eq!(host.bytes("/a.bin").unwrap(), same);
+    assert_eq!(host.bytes("/b.bin").unwrap(), same);
+    assert_eq!(host.bytes("/c.bin").unwrap(), b"other");
+    assert!(hidden_names(&host).is_empty(), "{:?}", hidden_names(&host));
+  }
 }

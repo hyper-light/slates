@@ -47,13 +47,35 @@
 //! One thread per async client, owned by the [`crate::endpoint::ClientEnd`] and joined on drop (no
 //! fire-and-forget, banned item 9). It is the `DoorbellThread` pattern from `slates-server`: the
 //! thread holds its own second mapping of the region, so a stop wakes it to unpark it; there is no
-//! `Arc` (R2) — the stop flag is a `Box::leak`'d `&'static AtomicBool` the thread and the owner
-//! share, exactly as the doorbell's is, and it lives for the client's own lifetime.
+//! `Arc` (R2). The macOS and Windows threads stop on a channel: the owner holds its sender and drops
+//! it, then wakes the thread, which finds its receiver disconnected; the channel is freed with the
+//! last of its two ends, so nothing outlives the bridge. Until 2026-11-18 the stop was a
+//! `Box::leak`'d `&'static AtomicBool`, as the doorbell's is, and so was the synchronous park's mark
+//! below: two blocks every start kept for good, so a client turning its async completion on and off
+//! (a host's `AsyncInstance` handing its client back, an SDK's `completionFd()`) grew without bound
+//! (`tests/completion_memory.rs`). A thread the OS refuses refuses the bridge's start, typed: before
+//! 2026-11-18 the refusal was dropped, and the bridge started with no thread, its descriptor never
+//! readable, so every async wait ran to its deadline.
+//!
+//! **A wake the bridge takes from a parked synchronous call is passed on** (macOS, Windows). The
+//! macOS bridge waits on the wake word, and the Windows one on the named Event. A synchronous call on
+//! the same client parks there too, and the daemon wakes one waiter per reply. So the kernel could
+//! hand the parked call's wake to the bridge, and the call slept to its reply deadline: 16 to 19 of 20
+//! parked calls did, on the Mac Studio (2026-11-18). The parked flag says which: a synchronous park
+//! names a stamp slot in it (1 or 2), and the async arm has a value of its own
+//! ([`crate::region::PARKED_ASYNC`]). A bridge woken while the flag reads a synchronous park
+//! ([`crate::park::parks_synchronously`]) wakes once more, and the only waiter left is the parked
+//! call. On Linux a synchronous call that waits on its daemon's departure parks on a descriptor (A-456): the eventfd
+//! when no bridge runs, and the bridge's pipe while one does, since the bridge is then the eventfd's only reader and
+//! writes its pipe after every read. So the Linux bridge takes no wake from a parked call either; the call gives the
+//! pipe's level back when it has read it ([`crate::endpoint::ClientEnd::wait_while_daemon_lives`]).
 
-// The wake-word/Event bridges (macOS, Windows) hold a `&'static AtomicBool` stop flag and park on the
-// region; the Linux bridge stops through a pipe and waits on the eventfd, so it needs neither.
+// The wake-word/Event bridges (macOS, Windows) park on the region and stop on a channel; the Linux bridge stops
+// through a pipe and waits on the eventfd, so it needs neither.
 #[cfg(any(target_os = "macos", windows))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+#[cfg(any(target_os = "macos", windows))]
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 
 use crate::error::IpcError;
@@ -83,6 +105,41 @@ const POLL_NS: u64 = 1_000_000_000;
 /// `1` matches the eventfd add-one convention the Linux path uses for the same purpose.
 const NUDGE: [u8; 8] = 1u64.to_ne_bytes();
 
+/// How a bridge's thread is started: the OS's own spawn ([`os_spawn`]) in the product; in the test of its refusal, one
+/// that refuses, since an OS refuses a thread only under an exhaustion no test arranges alone.
+pub(crate) type Spawn = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>;
+
+/// The OS's spawn of a bridge's thread, named for the bridge.
+pub(crate) fn os_spawn(run: Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> {
+  std::thread::Builder::new()
+    .name("slates-completion".to_owned())
+    .spawn(run)
+}
+
+/// Starts a bridge's thread through `spawn`; the OS's refusal is refused typed, so no bridge stands without its thread.
+fn bridge_thread(spawn: Spawn, run: Box<dyn FnOnce() + Send>) -> Result<JoinHandle<()>, IpcError> {
+  spawn(run).map_err(|error| IpcError::OsRefused {
+    call: "spawn the completion bridge's thread",
+    code: error.raw_os_error(),
+  })
+}
+
+/// Whether the owner has stopped a wake-word or Event bridge: it drops the stop channel's sender, on which nothing is
+/// ever sent, so anything but an empty, connected channel is the stop.
+#[cfg(any(target_os = "macos", windows))]
+fn stopped(stop: &Receiver<()>) -> bool {
+  !matches!(stop.try_recv(), Err(TryRecvError::Empty))
+}
+
+/// Whether a synchronous call of the client is parked where the bridge waits, read from the client's parked flag after
+/// the bridge's wait returned ([`crate::park::parks_synchronously`]): a wake the bridge took then may be the call's.
+#[cfg(any(target_os = "macos", windows))]
+fn synchronous_park_waiting(region: &ClientRegion) -> bool {
+  region
+    .client_parked()
+    .is_ok_and(|parked| crate::park::parks_synchronously(parked.load(Ordering::SeqCst)))
+}
+
 // ------------------------------------------------------------------- macOS: self-pipe over the word
 
 /// The client-side completion bridge on macOS, whose rendezvous passes no completion fd. Owns the
@@ -91,8 +148,8 @@ const NUDGE: [u8; 8] = 1u64.to_ne_bytes();
 pub struct CompletionBridge {
   /// The self-pipe's read end: the descriptor an async SDK event loop polls.
   read: OwnedFd,
-  /// The thread's stop flag, shared as `&'static` (the doorbell pattern); set on drop.
-  stop: &'static AtomicBool,
+  /// The stop channel's sender, whose receiver the thread holds: dropped on drop to stop it (see the module doc).
+  stop: Option<Sender<()>>,
   /// The bridge thread, joined on drop.
   handle: Option<JoinHandle<()>>,
   /// A second mapping of the region, so [`Self::stop`] can bump and wake the word the thread parks
@@ -106,23 +163,28 @@ impl CompletionBridge {
   /// reply, whose read end the SDK polls. The thread parks on the region's wake word through its
   /// own mapping.
   pub fn start(region: &ClientRegion) -> Result<CompletionBridge, IpcError> {
+    Self::start_with(region, os_spawn)
+  }
+
+  /// [`Self::start`] with its thread started through `spawn`: refused typed when the OS refuses the thread.
+  pub(crate) fn start_with(
+    region: &ClientRegion,
+    spawn: Spawn,
+  ) -> Result<CompletionBridge, IpcError> {
     // Two independent second mappings of the one shared region: the thread waits on one, the owner
     // wakes the other to stop it. Both see the same physical wake word (the doorbell pattern). Each maps a
     // duplicate of the region's descriptor, since the region has no name to open (GAP-A9-9).
     let waiter = region.open_again()?;
     let waker = region.open_again()?;
     let (read, write) = self_pipe()?;
-    // The flag lives for the client: the thread holds it as `&'static` and the owner stops the
-    // thread through it, as the daemon's doorbell thread does. No `Arc` (R2).
-    let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
-    let handle = std::thread::Builder::new()
-      .name("slates-completion".to_owned())
-      .spawn(move || run(waiter, write, stop))
-      .ok();
+    // The stop is a channel the two ends own and free: the thread takes the receiver, the owner keeps the sender. No
+    // `Arc` (R2), and nothing kept past the bridge.
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let handle = bridge_thread(spawn, Box::new(move || run(waiter, write, stopped)))?;
     Ok(CompletionBridge {
       read,
-      stop,
-      handle,
+      stop: Some(stop),
+      handle: Some(handle),
       waker,
     })
   }
@@ -150,10 +212,10 @@ impl CompletionBridge {
     let _ = rustix::io::read(&self.read, &mut scratch);
   }
 
-  /// Stops the thread and joins it: set the flag, then bump and wake the word so a parked thread
-  /// returns and sees the flag.
+  /// Stops the thread and joins it: drop the stop channel's sender, then bump and wake the word so a parked thread
+  /// returns and finds its receiver disconnected.
   fn stop(&mut self) {
-    self.stop.store(true, Ordering::Release);
+    drop(self.stop.take());
     if let Ok(word) = self.waker.wake_word() {
       word.fetch_add(1, Ordering::AcqRel);
       let _ = wake::wake_one(word);
@@ -169,7 +231,7 @@ impl CompletionBridge {
 /// (`armed_with_reply_waiting`, a level). A fast-path reply, taken during the spin, finds the client
 /// unarmed, so the async fast path never wakes the event loop.
 #[cfg(target_os = "macos")]
-fn run(region: ClientRegion, write: OwnedFd, stop: &'static AtomicBool) {
+fn run(region: ClientRegion, write: OwnedFd, stop: Receiver<()>) {
   let Ok(word) = region.wake_word() else {
     return;
   };
@@ -177,12 +239,19 @@ fn run(region: ClientRegion, write: OwnedFd, stop: &'static AtomicBool) {
   // wake raised while this thread is between waits is not missed (the daemon advances the word before
   // every wake; `crate::park`).
   let mut seen = word.load(Ordering::Acquire);
-  while !stop.load(Ordering::Acquire) {
+  while !stopped(&stop) {
     let _ = wake::wait(word, seen, Some(POLL_NS));
-    if stop.load(Ordering::Acquire) {
+    if stopped(&stop) {
       break;
     }
-    seen = word.load(Ordering::Acquire);
+    let moved = word.load(Ordering::Acquire);
+    // The word moved, so the daemon may have woken this thread with the wake a parked synchronous call waits for: pass
+    // it on. The parked call is the only waiter left, and a wake it did not need costs it one look at its ring. A
+    // refused wake leaves the call to its deadline's re-check, as a lost wake would.
+    if moved != seen && synchronous_park_waiting(&region) {
+      let _ = wake::wake_one(word);
+    }
+    seen = moved;
     if armed_with_reply_waiting(&region) {
       // Non-blocking: a full pipe is already readable, so a dropped nudge only means the SDK's next
       // poll finds the reply, never a lost one — the same best-effort as the Linux eventfd nudge.
@@ -275,16 +344,21 @@ impl CompletionBridge {
   /// when the eventfd is readable — a reply to a parked client — it drains it and writes the
   /// self-pipe, whose read end the SDK polls.
   pub fn start_from_eventfd(eventfd: OwnedFd) -> Result<CompletionBridge, IpcError> {
+    Self::start_from_eventfd_with(eventfd, os_spawn)
+  }
+
+  /// [`Self::start_from_eventfd`] with its thread started through `spawn`: refused typed when the OS refuses the thread.
+  pub(crate) fn start_from_eventfd_with(
+    eventfd: OwnedFd,
+    spawn: Spawn,
+  ) -> Result<CompletionBridge, IpcError> {
     let (read, write) = self_pipe()?;
     let (stop_read, stop_write) = self_pipe()?;
-    let handle = std::thread::Builder::new()
-      .name("slates-completion".to_owned())
-      .spawn(move || run(eventfd, write, stop_read))
-      .ok();
+    let handle = bridge_thread(spawn, Box::new(move || run(eventfd, write, stop_read)))?;
     Ok(CompletionBridge {
       read,
       stop_write,
-      handle,
+      handle: Some(handle),
     })
   }
 
@@ -292,6 +366,13 @@ impl CompletionBridge {
   /// Node stream.
   pub fn completion_fd(&self) -> RawFd {
     self.read.as_raw_fd()
+  }
+
+  /// The pipe's read end, borrowed for a synchronous park's own wait (A-456): while the bridge runs it is the eventfd's
+  /// only reader and writes this pipe after every read, so a park that waits here meets every nudge, where one that
+  /// waited on the eventfd beside the bridge could find its nudge already read.
+  pub(crate) fn level(&self) -> std::os::fd::BorrowedFd<'_> {
+    std::os::fd::AsFd::as_fd(&self.read)
   }
 
   /// A dup of the read end the caller owns and closes (Node's `net.Socket` adopts and closes the fd it
@@ -369,8 +450,8 @@ pub struct CompletionBridge {
   /// The read end of the loopback pair: the socket an async SDK event loop polls (`uv_poll` / a
   /// selector). Held so [`Self::drain`] can clear its readiness and [`Self::dup_socket`] clone it.
   read: TcpStream,
-  /// The thread's stop flag, shared as `&'static` (the doorbell pattern); set on drop.
-  stop: &'static AtomicBool,
+  /// The stop channel's sender, whose receiver the thread holds: dropped on drop to stop it (see the module doc).
+  stop: Option<Sender<()>>,
   /// The bridge thread, joined on drop.
   handle: Option<JoinHandle<()>>,
   /// A second mapping of the region, so [`Self::stop`] can signal the named Event the thread parks
@@ -385,23 +466,28 @@ impl CompletionBridge {
   /// Event through its own mapping (the daemon signals that Event on a reply to a parked client,
   /// because `WaitOnAddress` on the word is process-local, D-10).
   pub fn start(region: &ClientRegion) -> Result<CompletionBridge, IpcError> {
+    Self::start_with(region, os_spawn)
+  }
+
+  /// [`Self::start`] with its thread started through `spawn`: refused typed when the OS refuses the thread.
+  pub(crate) fn start_with(
+    region: &ClientRegion,
+    spawn: Spawn,
+  ) -> Result<CompletionBridge, IpcError> {
     let (handoff, len) = region.handoff()?;
     // Two independent second mappings of the one shared region: the thread waits on the Event
     // through one, the owner signals it through the other to stop the thread (the doorbell pattern).
     let waiter = ClientRegion::open(&handoff, len)?;
     let waker = ClientRegion::open(&handoff, len)?;
     let (read, write) = loopback_pair()?;
-    // The flag lives for the client: the thread holds it as `&'static` and the owner stops the
-    // thread through it, as the daemon's doorbell thread does. No `Arc` (R2).
-    let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
-    let handle = std::thread::Builder::new()
-      .name("slates-completion".to_owned())
-      .spawn(move || run(waiter, write, stop))
-      .ok();
+    // The stop is a channel the two ends own and free: the thread takes the receiver, the owner keeps the sender. No
+    // `Arc` (R2), and nothing kept past the bridge.
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let handle = bridge_thread(spawn, Box::new(move || run(waiter, write, stopped)))?;
     Ok(CompletionBridge {
       read,
-      stop,
-      handle,
+      stop: Some(stop),
+      handle: Some(handle),
       waker,
     })
   }
@@ -437,10 +523,10 @@ impl CompletionBridge {
     let _ = (&self.read).read(&mut scratch);
   }
 
-  /// Stops the thread and joins it: set the flag, then signal the named Event so a parked thread
-  /// returns and sees the flag.
+  /// Stops the thread and joins it: drop the stop channel's sender, then signal the named Event so a parked thread
+  /// returns and finds its receiver disconnected.
   fn stop(&mut self) {
-    self.stop.store(true, Ordering::Release);
+    drop(self.stop.take());
     let _ = self.waker.wake_signal();
     if let Some(handle) = self.handle.take() {
       let _ = handle.join();
@@ -453,13 +539,19 @@ impl CompletionBridge {
 /// (`armed_with_reply_waiting`, a level). A fast-path reply, taken during the spin, finds the client
 /// unarmed, so the async fast path never wakes the event loop.
 #[cfg(windows)]
-fn run(region: ClientRegion, mut write: TcpStream, stop: &'static AtomicBool) {
+fn run(region: ClientRegion, mut write: TcpStream, stop: Receiver<()>) {
   // The auto-reset Event holds a signal until a waiter consumes it, so a wake raised while this thread
   // is between waits returns the next `wake_wait` at once.
-  while !stop.load(Ordering::Acquire) {
-    let _ = region.wake_wait(Some(POLL_NS));
-    if stop.load(Ordering::Acquire) {
+  while !stopped(&stop) {
+    let signaled = region.wake_wait(Some(POLL_NS)).unwrap_or(false);
+    if stopped(&stop) {
       break;
+    }
+    // This thread consumed the Event's one signal, which may have been a parked synchronous call's: pass it on. The
+    // parked call is the only waiter left, and a signal it did not need costs it one look at its ring. A refused
+    // signal leaves the call to its deadline's re-check, as a lost wake would.
+    if signaled && synchronous_park_waiting(&region) {
+      let _ = region.wake_signal();
     }
     if armed_with_reply_waiting(&region) {
       // Non-blocking: a full send buffer means the socket is already readable at the peer, so a
@@ -504,5 +596,75 @@ impl std::fmt::Debug for CompletionBridge {
 impl Drop for CompletionBridge {
   fn drop(&mut self) {
     self.stop();
+  }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+  use std::thread::JoinHandle;
+
+  use super::CompletionBridge;
+  use crate::error::IpcError;
+
+  /// Format: the errno an OS answers a thread past its limit with (`pthread_create`'s `EAGAIN`).
+  const THREAD_LIMIT: rustix::io::Errno = rustix::io::Errno::AGAIN;
+
+  /// A spawn the OS refuses, as it does at its thread limit.
+  fn refused(_run: Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> {
+    Err(std::io::Error::from_raw_os_error(
+      THREAD_LIMIT.raw_os_error(),
+    ))
+  }
+
+  /// Expect `started` refused typed, naming the spawn and the OS's errno.
+  fn expect_refused_typed(started: Result<CompletionBridge, IpcError>) {
+    assert!(
+      matches!(
+        &started,
+        Err(IpcError::OsRefused {
+          call: "spawn the completion bridge's thread",
+          code: Some(code),
+        }) if *code == THREAD_LIMIT.raw_os_error()
+      ),
+      "{started:?}"
+    );
+  }
+
+  /// CLAUDE.md §2 item 9 (§4.7, D-19): a completion bridge whose thread the OS refuses is refused typed. Do: start the
+  /// macOS bridge over a region with a spawn that refuses `EAGAIN`. Expect the start refused `OsRefused` naming the
+  /// spawn and the errno. Before 2026-11-18 the refusal was dropped, and the bridge started with no thread: its
+  /// descriptor never became readable, and every async wait ran to its deadline.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn a_bridge_whose_thread_the_os_refuses_is_refused_typed() {
+    use crate::region::{ClientRegion, RegionGeometry};
+    let geometry = RegionGeometry {
+      slots: 8,
+      spin_ns: 200_000,
+      spin_shift: 4,
+      bulk_bytes: 4096,
+      page: 4096,
+    };
+    let region = ClientRegion::create(
+      &format!("slates-completion-refused-{}", std::process::id()),
+      7,
+      0,
+      geometry,
+    )
+    .unwrap();
+    expect_refused_typed(CompletionBridge::start_with(&region, refused));
+  }
+
+  /// CLAUDE.md §2 item 9 (§4.7, D-19): the Linux bridge over the completion eventfd, whose thread the OS refuses, is
+  /// refused typed. Do: start it over an eventfd with a spawn that refuses `EAGAIN`. Expect the start refused
+  /// `OsRefused` naming the spawn and the errno, where the bridge once started with no thread.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn a_bridge_whose_thread_the_os_refuses_is_refused_typed() {
+    use rustix::event::{EventfdFlags, eventfd};
+    let completion = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
+    expect_refused_typed(CompletionBridge::start_from_eventfd_with(
+      completion, refused,
+    ));
   }
 }

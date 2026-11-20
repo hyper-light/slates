@@ -35,7 +35,7 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use slates_base::OsHost;
 use slates_vfs::host::{
   Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, LandCapabilities,
-  LandFs, WatchState,
+  LandFs, OsCode, WatchState,
 };
 use slates_vfs::inode::Fingerprint;
 
@@ -99,13 +99,42 @@ impl std::fmt::Debug for OsLand {
   }
 }
 
+/// The seam's refusal for an errno (A-539): the typed refusals, then the kinds the landing tells apart, each named by
+/// this platform's own numbers (`EEXIST`; `ENOSPC` and `EDQUOT`, 122 on Linux and 69 on macOS; `EOPNOTSUPP` and
+/// `ENOTSUP`, one number on Linux and two on macOS), so the engine compares no number; anything else as the errno it is.
 fn refusal(e: rustix::io::Errno) -> HostError {
-  match e {
-    rustix::io::Errno::NOENT => HostError::NotFound,
-    rustix::io::Errno::NOTDIR => HostError::NotDirectory,
-    rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR => HostError::NotFile,
-    other => HostError::Unavailable(other.raw_os_error()),
+  use rustix::io::Errno;
+  let code = OsCode::Errno(e.raw_os_error());
+  if e == Errno::NOENT {
+    HostError::NotFound
+  } else if e == Errno::NOTDIR {
+    HostError::NotDirectory
+  } else if e == Errno::LOOP || e == Errno::ISDIR {
+    HostError::NotFile
+  } else if e == Errno::EXIST {
+    HostError::Exists(code)
+  } else if e == Errno::NOSPC || e == Errno::DQUOT {
+    HostError::NoSpace(code)
+  } else if e == Errno::OPNOTSUPP || e == Errno::NOTSUP {
+    HostError::Unsupported(code)
+  } else {
+    HostError::Unavailable(code)
   }
+}
+
+/// An exchange's refusal (A-539): a filesystem without one answers Linux's `renameat2(RENAME_EXCHANGE)` `EINVAL` and
+/// macOS's `renameatx_np(RENAME_SWAP)` `ENOTSUP`, the verb it lacks; anything else as [`refusal`] reads it.
+fn exchange_refusal(e: rustix::io::Errno) -> HostError {
+  if e == rustix::io::Errno::INVAL {
+    HostError::Unsupported(OsCode::Errno(e.raw_os_error()))
+  } else {
+    refusal(e)
+  }
+}
+
+/// An errno the writer names itself, as the seam's refusal of anything it could not serve.
+fn unavailable(e: rustix::io::Errno) -> HostError {
+  HostError::Unavailable(OsCode::Errno(e.raw_os_error()))
 }
 
 /// The directory flags every containment step uses.
@@ -332,22 +361,21 @@ impl OsLand {
 
   #[cfg(not(target_os = "linux"))]
   fn link_unnamed(&self, _file: HostFile, _dir: HostDir, _name: &str) -> Result<(), HostError> {
-    Err(HostError::Unavailable(
-      rustix::io::Errno::OPNOTSUPP.raw_os_error(),
-    ))
+    Err(refusal(rustix::io::Errno::OPNOTSUPP))
   }
 }
 
 /// The exchange: Linux `renameat2(RENAME_EXCHANGE)`.
 #[cfg(target_os = "linux")]
 fn exchange_names(dir: BorrowedFd<'_>, a: &str, b: &str) -> Result<(), HostError> {
-  rustix::fs::renameat_with(dir, a, dir, b, rustix::fs::RenameFlags::EXCHANGE).map_err(refusal)
+  rustix::fs::renameat_with(dir, a, dir, b, rustix::fs::RenameFlags::EXCHANGE)
+    .map_err(exchange_refusal)
 }
 
 /// The exchange: macOS `renameatx_np(RENAME_SWAP)`.
 #[cfg(target_os = "macos")]
 fn exchange_names(dir: BorrowedFd<'_>, a: &str, b: &str) -> Result<(), HostError> {
-  renameatx(dir, a, dir, b, libc::RENAME_SWAP)
+  renameatx(dir, a, dir, b, libc::RENAME_SWAP).map_err(exchange_refusal)
 }
 
 /// A rename that never replaces (AUD-29-04): Linux `renameat2(RENAME_NOREPLACE)`, refused `EEXIST` when
@@ -371,7 +399,7 @@ fn rename_without_replacing(
   to_dir: BorrowedFd<'_>,
   to: &str,
 ) -> Result<(), HostError> {
-  renameatx(dir, from, to_dir, to, libc::RENAME_EXCL)
+  renameatx(dir, from, to_dir, to, libc::RENAME_EXCL).map_err(refusal)
 }
 
 /// A named temporary moved from `from` to `to`, refused `EEXIST` when `to` exists, holding the one name after: the
@@ -409,13 +437,11 @@ fn rename_without_replacing(
   _to_dir: BorrowedFd<'_>,
   _to: &str,
 ) -> Result<(), HostError> {
-  Err(HostError::Unavailable(
-    rustix::io::Errno::OPNOTSUPP.raw_os_error(),
-  ))
+  Err(refusal(rustix::io::Errno::OPNOTSUPP))
 }
 
 /// macOS `renameatx_np` from `a` under `dir` to `b` under `to_dir`, with `flag` (`RENAME_SWAP` or
-/// `RENAME_EXCL`).
+/// `RENAME_EXCL`): the errno it refused with, which the caller reads (an exchange its own way, A-539).
 #[cfg(target_os = "macos")]
 fn renameatx(
   dir: BorrowedFd<'_>,
@@ -423,11 +449,9 @@ fn renameatx(
   to_dir: BorrowedFd<'_>,
   b: &str,
   flag: libc::c_uint,
-) -> Result<(), HostError> {
-  let a = std::ffi::CString::new(a)
-    .map_err(|_| HostError::Unavailable(rustix::io::Errno::INVAL.raw_os_error()))?;
-  let b = std::ffi::CString::new(b)
-    .map_err(|_| HostError::Unavailable(rustix::io::Errno::INVAL.raw_os_error()))?;
+) -> Result<(), rustix::io::Errno> {
+  let a = std::ffi::CString::new(a).map_err(|_| rustix::io::Errno::INVAL)?;
+  let b = std::ffi::CString::new(b).map_err(|_| rustix::io::Errno::INVAL)?;
   // SAFETY: `dir` and `to_dir` are directory descriptors this host owns for the call's duration; `a` and
   // `b` are NUL-terminated C strings that outlive the call; `renameatx_np` reads them and
   // writes nothing to memory the caller holds.
@@ -443,17 +467,15 @@ fn renameatx(
   if rc == 0 {
     Ok(())
   } else {
-    Err(refusal(rustix::io::Errno::from_raw_os_error(
+    Err(rustix::io::Errno::from_raw_os_error(
       std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-    )))
+    ))
   }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn exchange_names(_dir: BorrowedFd<'_>, _a: &str, _b: &str) -> Result<(), HostError> {
-  Err(HostError::Unavailable(
-    rustix::io::Errno::OPNOTSUPP.raw_os_error(),
-  ))
+  Err(refusal(rustix::io::Errno::OPNOTSUPP))
 }
 
 /// A file's write-out on Linux: its writeback started (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, which neither waits
@@ -487,17 +509,35 @@ fn write_out_file(_fd: BorrowedFd<'_>) -> Result<(), HostError> {
 /// runs, and the platform's syncs over them when it runs — each file synced ([`sync_file`]) on ⌈√n⌉ streams for n
 /// files, then the syncs ordered ahead of every later write ([`order_synced`]).
 struct OsBarrier {
-  files: Vec<OwnedFd>,
+  files: Vec<(OwnedFd, Durability)>,
+}
+
+/// What a batch's barrier makes durable of one file (A-472). A temporary's data (`Data`): its name and inode reach the
+/// disk with the directory sync its placement is followed by. A file whose metadata alone a landing set in place
+/// (`Whole`): its inode, which `fsync` flushes ("as well as flushing the file data, fsync() also flushes the metadata
+/// information associated with the file", fsync(2)) and `fdatasync` need not ("does not flush modified metadata unless
+/// that metadata is needed in order to allow a subsequent data retrieval", the same page), nor any directory's sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Durability {
+  /// A temporary's data.
+  Data,
+  /// A file's metadata with its data.
+  Whole,
 }
 
 impl Barrier for OsBarrier {
   fn run(self: Box<Self>) -> Result<(), HostError> {
-    let fds: Vec<BorrowedFd<'_>> = self.files.iter().map(AsFd::as_fd).collect();
-    let streams = fds
+    let files: Vec<(BorrowedFd<'_>, Durability)> = self
+      .files
+      .iter()
+      .map(|(fd, durability)| (fd.as_fd(), *durability))
+      .collect();
+    let fds: Vec<BorrowedFd<'_>> = files.iter().map(|(fd, _)| *fd).collect();
+    let streams = files
       .len()
       .isqrt()
-      .saturating_add(usize::from(!is_square(fds.len())));
-    sync_on_streams(&fds, streams).and_then(|()| order_synced(&fds))
+      .saturating_add(usize::from(!is_square(files.len())));
+    sync_on_streams(&files, streams).and_then(|()| order_synced(&fds))
   }
 }
 
@@ -518,7 +558,7 @@ fn is_square(n: usize) -> bool {
 /// CPU quota. An online ramp over the count was tried the same day and rejected: a barrier's time varies about 6× at
 /// one count on a shared disk, so two samples mismeasured the noise and the ramp settled on one stream in 9,620 of
 /// 9,690 barriers.
-fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostError> {
+fn sync_on_streams(fds: &[(BorrowedFd<'_>, Durability)], streams: usize) -> Result<(), HostError> {
   let streams = streams.clamp(1, fds.len().max(1));
   std::thread::scope(|scope| {
     let mut started = Vec::with_capacity(streams.saturating_sub(1));
@@ -536,9 +576,9 @@ fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostErr
       synced = synced.and(sync_stream(fds, stream, streams));
     }
     for thread in started {
-      let joined = thread.join().unwrap_or(Err(HostError::Unavailable(
-        rustix::io::Errno::IO.raw_os_error(),
-      )));
+      let joined = thread
+        .join()
+        .unwrap_or(Err(unavailable(rustix::io::Errno::IO)));
       synced = synced.and(joined);
     }
     synced
@@ -547,27 +587,37 @@ fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostErr
 
 /// One stream's share of a batch: files `stream`, `stream + streams`, and so on, each synced in turn; the first refusal
 /// (the rest are still synced).
-fn sync_stream(fds: &[BorrowedFd<'_>], stream: usize, streams: usize) -> Result<(), HostError> {
+fn sync_stream(
+  fds: &[(BorrowedFd<'_>, Durability)],
+  stream: usize,
+  streams: usize,
+) -> Result<(), HostError> {
   let mut synced = Ok(());
-  for fd in fds.iter().skip(stream).step_by(streams.max(1)) {
-    synced = synced.and(sync_file(*fd));
+  for (fd, durability) in fds.iter().skip(stream).step_by(streams.max(1)) {
+    synced = synced.and(sync_file(*fd, *durability));
   }
   synced
 }
 
-/// One file of a batch made durable on Linux and the other unixes: `fdatasync` (on Linux its writeback was started at
-/// the write-out, and the journal's group commit merges the syncs in flight together: ext4's jbd2 joins every sync
-/// waiting on the running transaction to its commit).
+/// One file of a batch made durable on Linux and the other unixes: a temporary's data by `fdatasync` (on Linux its
+/// writeback was started at the write-out, and the journal's group commit merges the syncs in flight together: ext4's
+/// jbd2 joins every sync waiting on the running transaction to its commit); a file whose metadata alone a landing set,
+/// whole by `fsync`, since `fdatasync` need not write a mode (fsync(2), A-472).
 #[cfg(not(target_os = "macos"))]
-fn sync_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
-  rustix::fs::fdatasync(fd).map_err(refusal)
+#[allow(clippy::disallowed_methods)] // the write seam's own barrier (R1, D-26; AUD-29-31).
+fn sync_file(fd: BorrowedFd<'_>, durability: Durability) -> Result<(), HostError> {
+  match durability {
+    Durability::Data => rustix::fs::fdatasync(fd).map_err(refusal),
+    Durability::Whole => rustix::fs::fsync(fd).map_err(refusal),
+  }
 }
 
-/// One file of a batch handed to the device on macOS: `fsync`, its data and attributes (not a media flush); the
-/// batch's barrier after every one orders them ahead of every later write ([`order_synced`]).
+/// One file of a batch handed to the device on macOS: `fsync`, which "causes all modified data and attributes of fildes
+/// to be moved to a permanent storage device" (Apple's fsync(2)), a temporary's and a set mode's alike (not a media
+/// flush); the batch's barrier after every one orders them ahead of every later write ([`order_synced`]).
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)] // the write seam's own barrier (R1, D-26; AUD-29-31).
-fn sync_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+fn sync_file(fd: BorrowedFd<'_>, _durability: Durability) -> Result<(), HostError> {
   rustix::fs::fsync(fd).map_err(refusal)
 }
 
@@ -702,6 +752,19 @@ impl LandFs for OsLand {
     })
   }
 
+  /// No reflink here yet (`capabilities` says so, so the engine never asks): Linux's `FICLONE` and macOS's
+  /// `clonefile` are owed (A-445); refused `ENOTSUP`, nothing made.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    _name: &str,
+    _from: HostFile,
+    _len: u64,
+  ) -> Result<HostFile, HostError> {
+    self.dir(dir)?;
+    Err(refusal(rustix::io::Errno::NOTSUP))
+  }
+
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
     if let Some(file) = self.create_unnamed(dir)? {
       return Ok(file);
@@ -717,7 +780,7 @@ impl LandFs for OsLand {
       let n =
         rustix::io::pwrite(fd, bytes.get(written..).unwrap_or_default(), at).map_err(refusal)?;
       if n == 0 {
-        return Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()));
+        return Err(unavailable(rustix::io::Errno::IO));
       }
       written = written.saturating_add(n);
     }
@@ -728,14 +791,22 @@ impl LandFs for OsLand {
     write_out_file(self.file(file)?)
   }
 
+  /// The batch's barrier over its own descriptor of each file: a temporary synced for its data, any other file (one whose
+  /// metadata alone a landing set in place) synced whole (A-472).
   fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
     let files = files
       .iter()
       .map(|file| {
+        let durability = if self.temps.contains_key(&file.0) {
+          Durability::Data
+        } else {
+          Durability::Whole
+        };
         self
           .file(*file)?
           .try_clone_to_owned()
-          .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+          .map(|fd| (fd, durability))
+          .map_err(|error| HostError::Unavailable(OsCode::of_io(&error)))
       })
       .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(OsBarrier { files }))
@@ -749,8 +820,33 @@ impl LandFs for OsLand {
     ran
   }
 
+  /// The file opened to read, never through a link (`O_NOFOLLOW`; a regular file alone): `fchmod` asks ownership, not
+  /// write access (A-458). A file its owner may not read is refused `EACCES`, typed, and the entry fails.
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.host.open_file(dir, name)
+  }
+
+  /// The directory opened as the host opens one (`O_DIRECTORY|O_NOFOLLOW`, its name checked and never on one of this
+  /// daemon's own mounts, A-227) and held as a file handle (A-501): `fchmod`, `fstat` and the barrier's `fsync` take any
+  /// descriptor, and `fsync` of a directory's descriptor writes its inode, its mode among it.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let opened = self.host.open_dir(dir, name)?;
+    let held = self.host.dir_fd(opened).and_then(|fd| {
+      fd.try_clone_to_owned()
+        .map_err(|error| HostError::Unavailable(OsCode::of_io(&error)))
+    });
+    self.host.close_dir(opened);
+    self.host.adopt_file(held?)
+  }
+
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     rustix::fs::fchmod(self.file(file)?, mode_bits(mode)).map_err(refusal)
+  }
+
+  /// Linux and macOS hold no Windows attribute bits (A-262: their landings carry them in the volume and apply none), so
+  /// the file is kept as it is (A-451).
+  fn set_windows(&mut self, file: HostFile, _windows: u16) -> Result<(), HostError> {
+    self.file(file).map(drop)
   }
 
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {
@@ -821,7 +917,8 @@ impl LandFs for OsLand {
   /// never a symlink swapped in under the name) and given the recorded mode exactly with `fchmod`,
   /// as a file's temporary is by `set_mode`. Before 2026-10-01 the umask cleared bits the volume
   /// held (0775 landed 0755; docs/bugs/2026-10-01-landed-directory-mode-umask.md).
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError> {
+  /// A directory with its mode; a Unix directory holds no Windows bits (A-451).
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, _windows: u16) -> Result<(), HostError> {
     let parent = self.dir(dir)?;
     rustix::fs::mkdirat(parent, name, mode_bits(mode)).map_err(refusal)?;
     let made = rustix::fs::openat(parent, name, dir_flags(), Mode::empty()).map_err(refusal)?;
@@ -832,7 +929,16 @@ impl LandFs for OsLand {
     rustix::fs::unlinkat(self.dir(dir)?, name, AtFlags::REMOVEDIR).map_err(refusal)
   }
 
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError> {
+  /// `symlinkat` makes the link whole at `name` in one step, so `staged` is not used (the seam's contract); a Unix link
+  /// has no kind and holds no Windows bits (A-451).
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    _staged: &str,
+    _windows: u16,
+  ) -> Result<(), HostError> {
     rustix::fs::symlinkat(target, self.dir(dir)?, name).map_err(refusal)
   }
 
@@ -842,5 +948,46 @@ impl LandFs for OsLand {
 
   fn sync_media(&mut self, dir: HostDir) -> Result<(), HostError> {
     media_barrier(self.dir(dir)?)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use rustix::io::Errno;
+
+  /// A-539 (the seam names the kinds the engine tells apart). Do: read through the Unix writer's rule the errnos of a
+  /// name that exists, a full disk and a spent quota, a verb the filesystem lacks, and an exchange the filesystem lacks
+  /// (Linux's `EINVAL`, macOS's `ENOTSUP`). Expect each named as its kind by its own errno: the engine compares no number,
+  /// so none is read across platforms (Linux numbers `EDQUOT` 122 and `ENOTSUP` 95, macOS 69 and 45).
+  #[test]
+  fn the_writer_names_each_kind_the_engine_tells_apart() {
+    let code = |e: Errno| OsCode::Errno(e.raw_os_error());
+    assert_eq!(refusal(Errno::EXIST), HostError::Exists(code(Errno::EXIST)));
+    for full in [Errno::NOSPC, Errno::DQUOT] {
+      assert_eq!(refusal(full), HostError::NoSpace(code(full)), "{full:?}");
+    }
+    for lacking in [Errno::OPNOTSUPP, Errno::NOTSUP] {
+      assert_eq!(
+        refusal(lacking),
+        HostError::Unsupported(code(lacking)),
+        "{lacking:?}"
+      );
+    }
+    for lacking in [Errno::INVAL, Errno::NOTSUP] {
+      assert_eq!(
+        exchange_refusal(lacking),
+        HostError::Unsupported(code(lacking)),
+        "{lacking:?}"
+      );
+    }
+    for other in [Errno::INVAL, Errno::IO, Errno::ACCESS] {
+      assert_eq!(
+        refusal(other),
+        HostError::Unavailable(code(other)),
+        "{other:?}"
+      );
+    }
+    assert_eq!(refusal(Errno::NOENT), HostError::NotFound);
   }
 }

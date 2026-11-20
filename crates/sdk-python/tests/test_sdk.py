@@ -22,6 +22,7 @@ BOUND_VERBS = {
     "create",
     "snapshot",
     "status",
+    "drifted",
     "list",
     "resize",
     "destroy",
@@ -47,12 +48,19 @@ BOUND_VERBS = {
 }
 # Test deadlines in nanoseconds — generous on purpose. This is a functional round-trip that spawns a real
 # anchor+daemon on a shared, often-loaded CI runner, not a latency gate (the provisioning histogram is that);
-# a tight 5 ms reply deadline flaked with `Stalled` when a verb's reply crossed it under load. A production
-# caller derives these from the machine's budgets.
+# a tight 5 ms reply deadline flaked with `Stalled` when a verb's reply crossed it under load (before A-232,
+# 2026-11-13; a live daemon's late reply is now waited for). A production caller derives these from the
+# machine's budgets.
 REPLY_NS = 1_000_000_000
 RECONNECT_NS = 2_000_000_000
+# How much slower this lane is than a dev machine: the knob the async suite and the Rust client tests read
+# (SLATES_TEST_RESTART_SLOWDOWN; CI's sdk lane sets 10 on the step that runs this file too). An integer >= 1,
+# default 1. Until 2026-11-13 this file read no knob: on this Mac at load 72 to 98 beside a cargo build, 33
+# connects took up to 20.792 s from the anchor's spawn, 3 of them past the flat 20 s wall (each began just
+# before it), and one suite run of four failed two tests "the rendezvous object is not there".
+SLOWDOWN = max(1, int(os.environ.get("SLATES_TEST_RESTART_SLOWDOWN") or 1))
 # How long to wait for a freshly spawned anchor+daemon to answer, and the pause between polls.
-STARTUP_SECS = 20.0
+STARTUP_SECS = 20.0 * SLOWDOWN
 POLL_SECS = 0.02
 # A small bounded RAM volume for the round-trip.
 VOLUME_BYTES = 8 * 1024 * 1024
@@ -197,6 +205,8 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             self.assertIsNone(status["mirror_age_ns"])
             self.assertIn("nfs_port", status)
             self.assertEqual(status["drifted"], [])
+            # drifted → every drifted entry, past what a status carries (A-267): a scratch volume has none.
+            self.assertEqual(client.drifted(volume), {"drifted": [], "unverified": [], "oversized": 0})
 
             # list → the volume appears with its fields (a scratch volume is not an overlay).
             listed = client.list()

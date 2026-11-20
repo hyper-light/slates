@@ -44,6 +44,8 @@ use crate::register::{
   RegisterError, candidates_for,
 };
 
+pub mod logs;
+
 /// One entry in a holder's log. Its position is its index in the log (dense, `0`-based); it carries
 /// the payload's identity (the `blake3` of a merge record's declared work, a head, a lease — the
 /// register class does not change the protocol) and the host epoch it was last accepted under, so a
@@ -63,6 +65,11 @@ pub struct Record {
 struct Holder {
   fence: Fence,
   log: Vec<Record>,
+  /// Whether this holder's store was lost under its id (A-585): it holds nothing it once acknowledged, its fence
+  /// included, so it answers no phase-one read and accepts no record as this candidate. A host whose store is lost
+  /// starts again under a fresh member id (`Daemon::member_identity` in the server: each start's identity is fresh), a
+  /// new member no cohort names until it is placed, never this candidate answering with nothing.
+  lost: bool,
 }
 
 impl Holder {
@@ -99,6 +106,8 @@ impl Holder {
 /// position has committed to; it never proposes.
 #[derive(Clone, Debug)]
 pub struct Cohort {
+  /// The register the cohort holds: what a holder's promise names (A-636 part 2a).
+  object: ObjectId,
   quorum: Quorum,
   candidates: Vec<HostId>,
   holders: BTreeMap<HostId, Holder>,
@@ -121,6 +130,7 @@ impl Cohort {
       holders.insert(*candidate, Holder::default());
     }
     Cohort {
+      object,
       quorum,
       candidates,
       holders,
@@ -132,9 +142,104 @@ impl Cohort {
     self.quorum
   }
 
+  /// The register this cohort holds.
+  pub fn object(&self) -> ObjectId {
+    self.object
+  }
+
+  /// `holder`'s answer to a takeover's phase one as it puts it on the wire (A-636 part 2a; §4.8 "Promotion and
+  /// takeover"): its fence raised to the prepare's epoch, then its whole log in a [`LedgerPromise`] naming this
+  /// register, so a holder of several registers (a repository's state logs share their holders) never has one
+  /// register's promise counted for another's round ([`PhaseOne`]). A holder fenced above the epoch refuses with the
+  /// empty reply a live holder gives (`slates_cluster::serve_ledger_promotion`). No reply at all from a holder out of
+  /// reach, from one whose store was lost (A-585: it answers no read), or from a host that is no candidate. The
+  /// simulation has no configuration, so the promise echoes the prepare's generation; a live holder refuses a round
+  /// under another (`LedgerAcceptor::prepare`).
+  pub fn promise(
+    &mut self,
+    holder: HostId,
+    prepare: &Prepare,
+    reachable: &Reach,
+  ) -> Option<Vec<u8>> {
+    if !reachable.can_reach(holder) {
+      return None;
+    }
+    let object = self.object;
+    let stored = self.holders.get_mut(&holder)?;
+    if stored.lost {
+      return None;
+    }
+    if stored.fence.accept(prepare.epoch).is_err() {
+      return Some(Vec::new());
+    }
+    let promise = LedgerPromise {
+      holder,
+      object,
+      epoch: prepare.epoch,
+      generation: prepare.generation,
+      log: stored.log.clone(),
+    };
+    Some(promise.encode())
+  }
+
+  /// The fault of a volume's store failing suddenly under a replica (A-585): `host`'s log and fence are gone, and it
+  /// answers no read and accepts no record under its id from then on ([`Holder::lost`]), as a host that restarts
+  /// without its store does under a fresh id. A takeover then counts its quorum among the holders that still hold what
+  /// they acknowledged. Answering a read with the nothing it now holds let a phase one's quorum miss a committed record
+  /// (`a_holder_whose_store_is_lost_answers_nothing_under_its_old_id`). Whether `host` is a candidate.
+  pub fn lose_store(&mut self, host: HostId) -> bool {
+    let Some(holder) = self.holders.get_mut(&host) else {
+      return false;
+    };
+    holder.log.clear();
+    holder.fence = Fence::default();
+    holder.lost = true;
+    true
+  }
+
   /// The candidate host ids, owner first.
   pub fn candidates(&self) -> &[HostId] {
     &self.candidates
+  }
+
+  /// What `host` holds of the register, by position (A-636): its log, or `None` for a host that is no candidate. A
+  /// replica answers a read from it.
+  pub fn held(&self, host: HostId) -> Option<&[Record]> {
+    self.holders.get(&host).map(|holder| holder.log.as_slice())
+  }
+
+  /// A takeover's phase one before it fences anything: the reachable candidates that still hold what they
+  /// acknowledged, refused below `f + 1`, and the epoch that fences the superseded owner.
+  fn phase_one(&self, reachable: &Reach) -> Result<(Vec<HostId>, HostEpoch), TakeoverError> {
+    // A holder whose store was lost answers no read (A-585): its nothing would count towards the quorum as a promise.
+    let reachable_candidates: Vec<HostId> = self
+      .candidates
+      .iter()
+      .copied()
+      .filter(|candidate| {
+        reachable.can_reach(*candidate)
+          && self
+            .holders
+            .get(candidate)
+            .is_some_and(|holder| !holder.lost)
+      })
+      .collect();
+    let needed = self.quorum().commit();
+    if reachable_candidates.len() < needed {
+      return Err(TakeoverError::NoQuorum {
+        reachable: reachable_candidates.len(),
+        needed,
+      });
+    }
+    // The next epoch fences every holder the round reaches; it is the successor of the highest
+    // epoch seen, not a tuning constant (structural increment, as `2f+1` and `f+1` are).
+    let new_epoch = HostEpoch(
+      self
+        .highest_epoch()
+        .checked_add(1)
+        .ok_or(TakeoverError::EpochExhausted)?,
+    );
+    Ok((reachable_candidates, new_epoch))
   }
 
   /// The highest epoch any holder has accepted under; a takeover's new epoch is its successor.
@@ -163,7 +268,8 @@ impl Cohort {
       let Some(holder) = self.holders.get_mut(candidate) else {
         continue;
       };
-      if holder.fence.accept(epoch).is_err() {
+      // A holder whose store was lost accepts nothing under its id (A-585).
+      if holder.lost || holder.fence.accept(epoch).is_err() {
         continue;
       }
       holder.reconcile(epoch, log);
@@ -302,6 +408,32 @@ impl Owner {
     self.log.is_empty()
   }
 
+  /// The records the owner holds, by position: what it proposed and what it adopted (A-636).
+  pub fn log(&self) -> &[[u8; 32]] {
+    &self.log
+  }
+
+  /// Drops the owner's positions from `len` on (A-636). Sound only for a tail no quorum committed: a takeover over a
+  /// repository's logs ([`logs`]) drops a record not held whole by every log it moves, and what follows it. The holders
+  /// drop the tail when this owner next offers its log ([`Owner::offer_again`]).
+  pub fn truncate(&mut self, len: usize) {
+    self.log.truncate(len);
+  }
+
+  /// Offers the owner's whole log again to the reachable holders under its epoch, proposing nothing (A-636): a lagging
+  /// holder catches up, a tail beyond the log is dropped, and every position takes this owner's epoch (BUG-12). The
+  /// acknowledging holders hold the whole log; it commits at `f + 1` of them.
+  pub fn offer_again(&mut self, cohort: &mut Cohort, reachable: &Reach) -> Commit {
+    let position = u64::try_from(self.log.len().saturating_sub(1)).unwrap_or(u64::MAX);
+    let acked = cohort.offer(self.epoch, &self.log, reachable);
+    let committed = cohort.quorum().committed(acked.len());
+    Commit {
+      position,
+      acked,
+      committed,
+    }
+  }
+
   /// Proposes a record carrying `identity` at the next position, offering the whole log to the
   /// reachable holders under this owner's epoch. Commits when `f + 1` acknowledge. A superseded
   /// owner (its epoch below the holders' fences) reaches at most `f` holders and does not commit;
@@ -337,45 +469,127 @@ impl Owner {
   /// it read. Refused if fewer than `f + 1` candidates are reachable. The returned owner's log
   /// begins with every record that had committed (Continuity), because the read quorum intersects
   /// every commit quorum.
+  ///
+  /// The read runs on the wire (A-636 part 2a): each reachable candidate answers the round's [`Prepare`] for this
+  /// register with its promise's bytes ([`Cohort::promise`]), and the round counts and adopts them as a successor
+  /// counts what reaches it ([`PhaseOne`]), so the simulation is the oracle of the live round's counting.
   pub fn take_over(
     cohort: &mut Cohort,
     new_id: HostId,
     reachable: &Reach,
   ) -> Result<Owner, TakeoverError> {
-    let reachable_candidates: Vec<HostId> = cohort
-      .candidates
-      .iter()
-      .copied()
-      .filter(|candidate| reachable.can_reach(*candidate))
-      .collect();
-    let needed = cohort.quorum().commit();
-    if reachable_candidates.len() < needed {
-      return Err(TakeoverError::NoQuorum {
-        reachable: reachable_candidates.len(),
-        needed,
-      });
-    }
-    // The next epoch fences every holder the round reaches; it is the successor of the highest
-    // epoch seen, not a tuning constant (structural increment, as `2f+1` and `f+1` are).
-    let new_epoch = HostEpoch(
-      cohort
-        .highest_epoch()
-        .checked_add(1)
-        .ok_or(TakeoverError::EpochExhausted)?,
-    );
-    let mut logs: Vec<Vec<Record>> = Vec::new();
+    let (reachable_candidates, new_epoch) = cohort.phase_one(reachable)?;
+    let prepare = Prepare {
+      owner: new_id,
+      object: cohort.object,
+      epoch: new_epoch,
+      generation: SIMULATED_GENERATION,
+    };
+    let mut round = PhaseOne::new(prepare, &cohort.candidates, cohort.quorum);
     for candidate in &reachable_candidates {
-      if let Some(holder) = cohort.holders.get_mut(candidate) {
-        // Raising the fence to a strictly higher epoch always succeeds; it fences the old owner.
-        let _ = holder.fence.accept(new_epoch);
-        logs.push(holder.log.clone());
+      // A reply the round does not count adds nothing to its quorum, which decides below.
+      if let Some(reply) = cohort.promise(*candidate, &prepare, reachable) {
+        round.hear(*candidate, &reply);
       }
     }
+    let log = round.adopted().ok_or(TakeoverError::NoQuorum {
+      reachable: round.promised(),
+      needed: cohort.quorum.commit(),
+    })?;
     Ok(Owner {
       id: new_id,
       epoch: new_epoch,
-      log: adopt(&logs),
+      log,
     })
+  }
+}
+
+/// Shape: the configuration generation the simulation's takeovers run under. The simulation has no configuration
+/// group, so every round runs under this one; a live holder refuses a round under a generation it has not installed
+/// (`LedgerAcceptor::prepare`).
+const SIMULATED_GENERATION: u64 = 0;
+
+/// One register's phase one as its successor counts it from the wire (A-636 part 2a; §4.8 "Promotion and takeover"):
+/// the prepare it asked, the register's candidates and quorum, and the whole log of each distinct candidate whose
+/// promise binds the prepare, in the order heard. Once `f + 1` have promised, it adopts per position the identity under
+/// the highest epoch ([`adopt`], the cluster plane's rule too). A takeover of several registers (a repository's logs,
+/// [`logs`]) runs one round a register, a log at a time; a holder of several answers each round with that register's
+/// log, and a promise naming another register is never counted ([`Heard::Unbound`]).
+#[derive(Clone, Debug)]
+pub struct PhaseOne {
+  /// The question asked.
+  prepare: Prepare,
+  /// The register's candidates.
+  candidates: Vec<HostId>,
+  /// The quorum the register commits under.
+  quorum: Quorum,
+  /// Each counted candidate's whole log, in the order heard.
+  promised: Vec<(HostId, Vec<Record>)>,
+}
+
+/// What a round made of one reply ([`PhaseOne::hear`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Heard {
+  /// A promise from a candidate not counted before: counted toward the quorum.
+  Counted,
+  /// No promise: a refusal's empty reply, or bytes cut short or padded.
+  Malformed,
+  /// A promise naming another holder than the one it came from.
+  Forged,
+  /// A promise for another round: another register (another log the holder keeps), epoch or generation.
+  Unbound,
+  /// A promise from a host that is none of the register's candidates.
+  NotCandidate,
+  /// A second promise from a candidate counted already.
+  Twice,
+}
+
+impl PhaseOne {
+  /// The round of `prepare` over a register's `candidates` at `quorum`, nothing heard yet.
+  pub fn new(prepare: Prepare, candidates: &[HostId], quorum: Quorum) -> PhaseOne {
+    PhaseOne {
+      prepare,
+      candidates: candidates.to_vec(),
+      quorum,
+      promised: Vec::new(),
+    }
+  }
+
+  /// Hears `from`'s reply `bytes`: counts it when it decodes to a promise naming `from` that binds the prepare and
+  /// comes from a candidate not counted before; otherwise says why not and counts nothing.
+  pub fn hear(&mut self, from: HostId, bytes: &[u8]) -> Heard {
+    let Ok(promise) = LedgerPromise::decode(bytes) else {
+      return Heard::Malformed;
+    };
+    if promise.holder != from {
+      return Heard::Forged;
+    }
+    if !promise.binds(&self.prepare) {
+      return Heard::Unbound;
+    }
+    if !self.candidates.contains(&from) {
+      return Heard::NotCandidate;
+    }
+    if self.promised.iter().any(|(holder, _)| *holder == from) {
+      return Heard::Twice;
+    }
+    self.promised.push((from, promise.log));
+    Heard::Counted
+  }
+
+  /// How many distinct candidates promised.
+  pub fn promised(&self) -> usize {
+    self.promised.len()
+  }
+
+  /// The log the round adopts once `f + 1` distinct candidates promised, per position the identity under the highest
+  /// epoch they hold ([`adopt`]); `None` before.
+  pub fn adopted(&self) -> Option<Vec<[u8; 32]>> {
+    if !self.quorum.committed(self.promised.len()) {
+      return None;
+    }
+    let logs: Vec<Vec<Record>> = self.promised.iter().map(|(_, log)| log.clone()).collect();
+    Some(adopt(&logs))
   }
 }
 
@@ -643,5 +857,137 @@ mod tests {
       Owner::take_over(&mut cohort, HostId(2), &Reach::All),
       Err(TakeoverError::EpochExhausted)
     ));
+  }
+
+  /// A cohort of five candidates at `f = 2` (owner first) and its bootstrap owner.
+  fn five_at_f2() -> (Cohort, Owner, Vec<HostId>) {
+    let owner = HostId(1);
+    let members: Vec<HostId> = (1..=5).map(HostId).collect();
+    let cohort = Cohort::new(
+      owner,
+      &members,
+      &BTreeMap::new(),
+      ObjectId::new(owner, 1),
+      Quorum { f: 2 },
+    );
+    let candidates = cohort.candidates().to_vec();
+    let first = Owner::bootstrap(&cohort);
+    (cohort, first, candidates)
+  }
+
+  /// A reach of exactly `hosts`.
+  fn only(hosts: &[HostId]) -> Reach {
+    Reach::Only(hosts.iter().copied().collect())
+  }
+
+  /// A-585, red before it (goal 81, chaos across real processes: a volume's store failing suddenly under a replica): a
+  /// holder whose store is lost answers no read and accepts no record under its old id, so a takeover never counts the
+  /// nothing it holds as a promise. Do: at `f = 2` commit a record on the owner and two holders, `f + 1` of the five;
+  /// lose the store of one of those two; with the owner gone and the other unreachable, take the register over from
+  /// the store-lost holder and the two that never held the record; then with the other holder reachable instead of the
+  /// store-lost one. Expect the first takeover refused (two holders that still hold what they acknowledged, short of
+  /// `f + 1`), the second to adopt the record (NoLoss, Continuity), the new owner's next record to commit after it at
+  /// the next position (TotalOrder), the superseded owner's next record never to commit (StaleNeverCommits), and no
+  /// position ever held by a quorum with two values (Agreement). Before, the store-lost holder answered with nothing,
+  /// the first takeover read three empty logs, and the committed record was gone with one store lost and one host down,
+  /// within `f = 2`.
+  #[test]
+  fn a_holder_whose_store_is_lost_answers_nothing_under_its_old_id() {
+    let (mut cohort, mut first, candidates) = five_at_f2();
+    let [owner, kept, lost, empty_a, empty_b] = <[HostId; 5]>::try_from(candidates).unwrap();
+    let record = [7u8; 32];
+    let commit = first.propose(&mut cohort, record, &only(&[owner, kept, lost]));
+    assert!(commit.committed, "committed on f + 1 = 3 of 5");
+    assert!(
+      cohort.lose_store(lost),
+      "the store-lost host is a candidate"
+    );
+    let refused = Owner::take_over(&mut cohort, empty_a, &only(&[lost, empty_a, empty_b]));
+    assert_eq!(
+      refused.as_ref().map(Owner::len).map_err(|error| *error),
+      Err(TakeoverError::NoQuorum {
+        reachable: 2,
+        needed: 3
+      }),
+      "the store-lost holder answers no read, so its nothing never completes a quorum"
+    );
+    let mut successor =
+      Owner::take_over(&mut cohort, empty_a, &only(&[kept, empty_a, empty_b])).unwrap();
+    assert_eq!(
+      successor.log.first(),
+      Some(&record),
+      "the committed record is adopted (NoLoss, Continuity)"
+    );
+    let next = successor.propose(&mut cohort, [8u8; 32], &only(&[kept, empty_a, empty_b]));
+    assert_eq!(
+      (next.position, next.committed),
+      (1, true),
+      "the next record commits after it (TotalOrder)"
+    );
+    let stale = first.propose(&mut cohort, [9u8; 32], &Reach::All);
+    assert!(
+      !stale.committed,
+      "the superseded owner commits nothing more (StaleNeverCommits)"
+    );
+    assert!(
+      (0..3).all(|position| !cohort.diverges_at(position)),
+      "no position held by a quorum with two values (Agreement)"
+    );
+    assert_eq!(
+      cohort.committed_prefix(),
+      vec![record, [8u8; 32]],
+      "the committed records, densely, in order"
+    );
+  }
+
+  /// A-585 (goal 81: a client disconnecting mid-write): a write its client left before it reached `f + 1` holders is
+  /// kept or dropped whole by the next owner, never split, and every committed write survives. Do: at `f = 1` commit a
+  /// record on every holder; propose a second that reaches the owner alone, its client gone and nothing offering it
+  /// again; lose the owner; take over from the other two and write a third. Then the same with the second reaching the
+  /// owner and one holder, `f + 1`. Expect, first, the second dropped and the third committed at its position; then the
+  /// second kept, committed, and the third after it; the first always kept, and no position ever split.
+  #[test]
+  fn a_write_its_client_left_is_kept_or_dropped_whole() {
+    for reached_one_holder in [false, true] {
+      let owner = HostId(1);
+      let members: Vec<HostId> = (1..=3).map(HostId).collect();
+      let mut cohort = Cohort::new(
+        owner,
+        &members,
+        &BTreeMap::new(),
+        ObjectId::new(owner, 1),
+        Quorum { f: 1 },
+      );
+      let [owner, a, b] = <[HostId; 3]>::try_from(cohort.candidates().to_vec()).unwrap();
+      let mut first = Owner::bootstrap(&cohort);
+      assert!(first.propose(&mut cohort, [1u8; 32], &Reach::All).committed);
+      let reached: Vec<HostId> = if reached_one_holder {
+        vec![owner, a]
+      } else {
+        vec![owner]
+      };
+      let left = first.propose(&mut cohort, [2u8; 32], &only(&reached));
+      assert_eq!(
+        left.committed, reached_one_holder,
+        "committed only at f + 1"
+      );
+      let mut successor = Owner::take_over(&mut cohort, a, &only(&[a, b])).unwrap();
+      let third = successor.propose(&mut cohort, [3u8; 32], &only(&[a, b]));
+      let expected = if reached_one_holder {
+        vec![[1u8; 32], [2u8; 32], [3u8; 32]]
+      } else {
+        vec![[1u8; 32], [3u8; 32]]
+      };
+      assert!(third.committed, "the next owner's write commits");
+      assert_eq!(
+        cohort.committed_prefix(),
+        expected,
+        "the client's write kept whole or dropped whole, every committed write kept, in order"
+      );
+      assert!(
+        (0..3).all(|position| !cohort.diverges_at(position)),
+        "no position split"
+      );
+    }
   }
 }

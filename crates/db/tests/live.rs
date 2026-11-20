@@ -6,6 +6,12 @@
 //! - **Agreement**: no position is ever durable with two values, whichever owner made it durable.
 //! - **NoLoss**: every takeover adopts a head whose state holds every durable entry, at its position, unchanged.
 //! - **StaleNeverCommits**: whatever a superseded owner still makes durable lies inside the head that superseded it.
+//! - **ReadSafety** (A-601; `FencedLedger.tla`'s rule, as `crates/db/src/register_nemesis.rs` judges the register):
+//!   every read phase one could make were the current owner lost, through whichever live holders it asks, adopts a head
+//!   whose state holds every durable write, at its position, unchanged, however far the other holders lag or whatever
+//!   superseded chain they hold. NoLoss judges the one read each takeover makes; this judges every read one could make,
+//!   after every step and every settling delivery. A violation is reported at the run's end, after the other checks, so
+//!   a history another check breaks is named by that check.
 //! - **Convergence**: once the network heals, every live holder holds exactly the owner's state, and every durable
 //!   write is in it.
 //!
@@ -23,8 +29,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::live::{
-  Admitted, Entry, Head, Install, LiveError, Next, Replica, Shipper, adopt, decode_reply,
-  encode_reply,
+  Admitted, Bounds, Entry, Head, Install, LiveError, Next, PastTolerance, Replica, Shipper, adopt,
+  adopt_past_tolerance, decode_reply, encode_reply, past_tolerance,
 };
 use slates_db::register::{HostEpoch, HostId, ObjectId, Quorum};
 
@@ -136,6 +142,47 @@ enum EmptyReport {
   CountWithoutFence,
 }
 
+/// How an owner restarted over its own log resumes it (A-344): its daemon restarts warm, its memory gone, its recovery
+/// image kept, and its shipper is made again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Restart {
+  /// The design: the image kept the log's epoch and the greatest position the owner may have shipped (the position its
+  /// last imaged publication took, or would have taken had the crash not come first), and its first entry takes the
+  /// next position under the same epoch (`Shipper::resumed`).
+  PastShipped,
+  /// A mutation, the daemon before A-344: the shipper is made again from nothing under the same epoch, so its chain
+  /// begins again at position 0 (the owner's state with it, since the model's state is one value a position).
+  FromGenesis,
+  /// A mutation: the chain resumes past the position the owner knew durable, using again the positions it shipped past
+  /// that.
+  PastDurable,
+}
+
+/// Shape: the chance, per mille, that a step of a restarting run restarts the current owner: about nine restarts in a
+/// run's 3,000 steps.
+const RESTART_PER_MILLE: u64 = 3;
+/// Shape: the chance, per mille, that a restart falls between a publication's image and its entry's append.
+const BETWEEN_PER_MILLE: u64 = 500;
+
+/// The bounds that hold `credit` entries in flight and `retain` retained, each entry of `payload` bytes counted at its
+/// wire size as the shipper counts it ([`Entry::wire_bytes`]): the model's and the unit tests' entries are of one size,
+/// so a count of them is exact.
+fn bounds_of(credit: usize, retain: usize, payload: usize) -> Bounds {
+  let entry = Entry {
+    owner: HostId(1),
+    object: OBJECT,
+    position: 0,
+    epoch: HostEpoch(1),
+    previous: [0; 32],
+    payload: vec![0; payload],
+  }
+  .wire_bytes();
+  Bounds {
+    credit: credit * entry,
+    retain: retain * entry,
+  }
+}
+
 fn encode_state(state: &[u64]) -> Vec<u8> {
   state.iter().flat_map(|value| value.to_le_bytes()).collect()
 }
@@ -218,6 +265,21 @@ struct Run {
   chained: u64,
   /// Whether the history is printed as it happens ([`Run::traced`]): what each step did that bears on the invariants.
   traced: bool,
+  /// How the current owner resumes its log when its daemon restarts (`None`: owners never restart; A-344).
+  restart: Option<Restart>,
+  /// The owner restarts made.
+  restarts: u64,
+  /// Of those, the ones that fell between a publication's image and its entry's append.
+  restarts_between: u64,
+  /// The steps taken, for a ReadSafety violation's message.
+  steps_taken: usize,
+  /// ReadSafety's first violation ([`Run::read_safety`]), reported by [`Run::settle`] after the run's other checks.
+  read_safety_broken: Option<String>,
+  /// The judgements ReadSafety made with a durable write to hold: its non-vacuity counter.
+  reads_judged: u64,
+  /// Of those, the ones where a host phase one would ask lacked a durable write (it lagged, or held a superseded
+  /// owner's chain) and every head a read could adopt held them all: the case the rule is about.
+  reads_past_a_stale_holder: u64,
 }
 
 impl Run {
@@ -246,7 +308,7 @@ impl Run {
       },
       &hosts,
       None,
-      (8, 16),
+      bounds_of(8, 16, 8),
     );
     Run {
       f,
@@ -284,6 +346,13 @@ impl Run {
       joined: 0,
       chained: 0,
       traced: false,
+      restart: None,
+      restarts: 0,
+      restarts_between: 0,
+      steps_taken: 0,
+      read_safety_broken: None,
+      reads_judged: 0,
+      reads_past_a_stale_holder: 0,
     }
   }
 
@@ -318,7 +387,7 @@ impl Run {
       },
       &self.configuration,
       None,
-      (8, 16),
+      bounds_of(8, 16, 8),
     );
     self.owners[0].recorded.clone_from(&self.configuration);
     self
@@ -333,6 +402,12 @@ impl Run {
   /// This run with fresh members joining the candidates at an owner's loss ([`Run::newcomers`]).
   fn with_newcomers(mut self) -> Run {
     self.newcomers = true;
+    self
+  }
+
+  /// This run with the current owner's daemon restarting now and then, its log resumed by `restart` (A-344).
+  fn restarting(mut self, restart: Restart) -> Run {
+    self.restart = Some(restart);
     self
   }
 
@@ -690,9 +765,20 @@ impl Run {
     let successor_holder = self.holders.remove(&successor).unwrap();
     // With `following`, the successor's holders are the set the takeover counted, less itself: what the durable
     // writes are held by. The configuration's candidates may be a set the old owner was still moving to, which holds
-    // none of them; the successor moves to it by a transition of its own.
+    // none of them; the successor moves to it by a transition of its own. Without it, they are the holders the
+    // superseded shipper committed, as the daemon's successor ships to the record's holders (`live_ship`'s
+    // `live_holders`), never a member that joined since: it holds none of the log, and named here it let a later phase
+    // one count `f + 1` holders none of which held a durable write (A-601's ReadSafety, 2026-11-19).
     let mut holders: Vec<HostId> = match self.following {
-      None => self.holders.keys().copied().collect(),
+      None => {
+        let committed = self.owners[old].shipper.holders().to_vec();
+        self
+          .holders
+          .keys()
+          .copied()
+          .filter(|host| committed.contains(host))
+          .collect()
+      }
       Some(Following::Joint) => self.owners[old].recorded.clone(),
       Some(Following::RecordAtOnce | Following::Fixed) => self.configuration.clone(),
     };
@@ -724,7 +810,7 @@ impl Run {
       },
       &holders,
       head,
-      (8, 16),
+      bounds_of(8, 16, 8),
     );
     self.owners.push(Owner {
       host: successor,
@@ -953,6 +1039,96 @@ impl Run {
     }
   }
 
+  /// The current owner's daemon restarts warm over its own log (A-344): its shipper is made again by the run's
+  /// [`Restart`] rule, under the same epoch, shipping to the holder set the volume's record names (the shipper's own
+  /// without `following`). Half the time the crash fell between a publication's image and its entry's append: the value
+  /// is in the owner's state and the image counted its position, but no holder was sent it.
+  fn restart_owner(&mut self) {
+    let Some(rule) = self.restart else {
+      return;
+    };
+    let index = self.current;
+    if self.owners[index].fenced {
+      return;
+    }
+    let between = self.rng.chance(BETWEEN_PER_MILLE);
+    let quorum = Quorum {
+      f: u32::try_from(self.f).unwrap(),
+    };
+    let value = self.next_value;
+    let following = self.following.is_some();
+    let owner = &mut self.owners[index];
+    let (host, epoch) = (owner.host, owner.shipper.epoch());
+    let holders = if following {
+      owner.recorded.clone()
+    } else {
+      owner.shipper.holders().to_vec()
+    };
+    let head = owner.shipper.head().map(|head| head.position);
+    let next = owner.shipper.next_position().unwrap();
+    let durable = owner.shipper.durable();
+    if between {
+      owner.state.push(value);
+    }
+    owner.shipper = match rule {
+      Restart::PastShipped => {
+        // The image kept the position its last publication's entry took (one before the next), or, when the crash fell
+        // between the image and the append, the one it would have taken (the next): what the daemon's kept piece holds,
+        // whether or not this incarnation appended anything.
+        let past = if between {
+          Some(next)
+        } else {
+          next.checked_sub(1)
+        };
+        Shipper::resumed(
+          (host, OBJECT, epoch),
+          quorum,
+          &holders,
+          past,
+          bounds_of(8, 16, 8),
+        )
+        .unwrap()
+      }
+      Restart::FromGenesis => {
+        owner.state.clear();
+        Shipper::new(
+          (host, OBJECT, epoch),
+          quorum,
+          &holders,
+          None,
+          bounds_of(8, 16, 8),
+        )
+      }
+      Restart::PastDurable => {
+        owner
+          .state
+          .truncate(durable.map_or(0, |durable| usize::try_from(durable + 1).unwrap()));
+        Shipper::resumed(
+          (host, OBJECT, epoch),
+          quorum,
+          &holders,
+          durable,
+          bounds_of(8, 16, 8),
+        )
+        .unwrap()
+      }
+    };
+    if between {
+      self.next_value += 1;
+      self.restarts_between += 1;
+    }
+    self.restarts += 1;
+    self.note(|| {
+      format!(
+        "owner {index} (host {}, epoch {}) restarts {rule:?}, head {head:?}, durable {durable:?}, between {between}",
+        host.0, epoch.0
+      )
+    });
+    if following {
+      self.follow();
+    }
+  }
+
   /// A superseded owner keeps writing and re-shipping.
   fn stale_owner_step(&mut self) {
     let stale: Vec<usize> = (0..self.owners.len())
@@ -967,7 +1143,144 @@ impl Run {
     }
   }
 
+  /// ReadSafety (A-601; `FencedLedger.tla`'s rule, §4.8 "Leases and reads"), judged now over every read phase one
+  /// could make were the current owner lost within the failures the run tolerates (`lost < f`, the nemesis's own
+  /// guard for a takeover; past it phase one waits for every surviving holder, `adopt_past_tolerance`). Phase one asks
+  /// the live candidates and adopts the greatest head among their reports once `f + 1` come from the holders it counts
+  /// ([`adopt`]), so a host's head can be adopted whenever `f + 1` counted holders, the host itself if it is one,
+  /// report no greater head (one with no copy reports nothing). Every such head's state must hold every durable write,
+  /// at its position, unchanged: a read adopting a stale chain would hand the successor, and every read it then
+  /// answers, a state older than a write already acknowledged. The first violation is kept with its step, and
+  /// [`Run::settle`] reports it after the run's other checks, so a history one of those breaks is still named by it.
+  fn read_safety(&mut self) {
+    if self.durable.is_empty() || self.read_safety_broken.is_some() || self.lost >= self.f {
+      return;
+    }
+    let (asked, counted) = self.phase_one_now();
+    let needed = usize::try_from(self.f + 1).unwrap();
+    if counted.len() < needed {
+      return;
+    }
+    self.reads_judged += 1;
+    // The durable writes are every position from 0 to the greatest durable one (`note_durable` records each).
+    let durable: Vec<u64> = self.durable.values().copied().collect();
+    let mut past_a_stale_holder = false;
+    for host in asked {
+      let lacking = self.first_lacking(host, &durable);
+      past_a_stale_holder |= lacking.is_some();
+      if let (Some(read), Some(position)) = (self.read_adopting(host, &counted, needed), lacking) {
+        self.read_safety_broken = Some(format!(
+          "ReadSafety: at step {}, phase one asking {read:?} adopts host {}'s head {:?}, which lacks durable \
+           position {position}",
+          self.steps_taken,
+          host.0,
+          self.reported_head(host)
+        ));
+        return;
+      }
+    }
+    if past_a_stale_holder {
+      self.reads_past_a_stale_holder += 1;
+    }
+  }
+
+  /// The holder set phase one would count toward `f + 1` were the current owner lost now (A-240), by the run's rules
+  /// ([`Run::phase_one_hosts`], [`Run::phase_one_asked`]): `None` under the mutation that counts any `f + 1`
+  /// candidates.
+  fn counted_set_now(&self) -> Option<Vec<HostId>> {
+    let owner = &self.owners[self.current];
+    match (self.following, self.counting) {
+      (None, Counting::Holders) => Some(owner.shipper.holders().to_vec()),
+      (None, Counting::AnyCandidate) => None,
+      (Some(Following::Joint), _) => Some(owner.recorded.clone()),
+      (Some(Following::RecordAtOnce | Following::Fixed), _) => Some(self.configuration.clone()),
+    }
+  }
+
+  /// The live hosts phase one would ask were the current owner lost now, every one of them reachable, and those of them
+  /// whose reports count toward `f + 1`.
+  fn phase_one_now(&self) -> (Vec<HostId>, Vec<HostId>) {
+    let owner = self.owners[self.current].host;
+    let counted_set = self.counted_set_now();
+    let named = |host: &HostId| {
+      self.following.is_none()
+        || self.configuration.contains(host)
+        || counted_set.as_ref().is_some_and(|set| set.contains(host))
+    };
+    let live = |host: &HostId| self.holders.get(host).is_some_and(|holder| holder.alive);
+    let asked: Vec<HostId> = self
+      .hosts
+      .iter()
+      .copied()
+      .filter(|host| *host != owner && named(host) && live(host))
+      .collect();
+    let counted = asked
+      .iter()
+      .copied()
+      .filter(|host| counted_set.as_ref().is_none_or(|set| set.contains(host)))
+      .collect();
+    (asked, counted)
+  }
+
+  /// The head `host` would report to phase one now: `None` while it holds no copy.
+  fn reported_head(&self, host: HostId) -> Option<Head> {
+    self
+      .holders
+      .get(&host)
+      .and_then(|holder| holder.replica.as_ref())
+      .and_then(Replica::head)
+  }
+
+  /// A read through which phase one would adopt `host`'s head: `host` with `needed` of the `counted` holders whose
+  /// heads rank no higher (itself among them when it is one), or `None` when fewer than `needed` do. A head of equal
+  /// rank may be the one adopted, so it counts.
+  fn read_adopting(&self, host: HostId, counted: &[HostId], needed: usize) -> Option<Vec<HostId>> {
+    let rank = |host: HostId| self.reported_head(host).map(|head| head.rank());
+    let ceiling = rank(host);
+    let mut read: Vec<HostId> = counted
+      .iter()
+      .copied()
+      .filter(|other| rank(*other) <= ceiling)
+      .take(needed)
+      .collect();
+    if read.len() < needed {
+      return None;
+    }
+    if !read.contains(&host) {
+      read.push(host);
+    }
+    Some(read)
+  }
+
+  /// The first durable position `host`'s state lacks or holds another value at, or `None` when it holds every one.
+  fn first_lacking(&self, host: HostId, durable: &[u64]) -> Option<usize> {
+    let state = self
+      .holders
+      .get(&host)
+      .map(|holder| holder.state.as_slice())
+      .unwrap_or_default();
+    if state.get(..durable.len()) == Some(durable) {
+      return None;
+    }
+    (0..durable.len()).find(|position| state.get(*position) != durable.get(*position))
+  }
+
+  /// One step of the nemesis ([`Run::act`]), then ReadSafety judged over what it left.
   fn step(&mut self) {
+    self.act();
+    self.steps_taken += 1;
+    self.read_safety();
+  }
+
+  /// One step's choice, drawn from the run's seed: a write, a delivery, a loss or duplicate, a period, a cut or heal, a
+  /// superseded owner's step, a takeover, a holder learning the owner, a crash, a reconfiguration, a record, an
+  /// activation, or an owner's restart.
+  fn act(&mut self) {
+    // An owner restart now and then (A-344), drawn only in runs that restart owners, so every other run replays as before.
+    if self.restart.is_some() && self.rng.chance(RESTART_PER_MILLE) {
+      self.restart_owner();
+      return;
+    }
     let roll = self.rng.below(100);
     match roll {
       0..=29 => self.write(self.current),
@@ -1013,10 +1326,37 @@ impl Run {
   fn settle(&mut self) {
     self.cut.clear();
     self.everyone_learns();
+    self.publish_after_a_restart();
     while self.following.is_some() && u64::try_from(self.configuration.len()).unwrap() < 2 * self.f
     {
       self.reconfigure();
     }
+    self.deliver_until_converged();
+    if !self.converged() {
+      self.note(|| self.convergence_state());
+    }
+    assert!(
+      self.converged(),
+      "Convergence: live holders never caught up"
+    );
+    let owner = &self.owners[self.current];
+    for (position, value) in &self.durable {
+      assert_eq!(
+        owner.state.get(usize::try_from(*position).unwrap()),
+        Some(value),
+        "NoLoss at the end: durable position {position}"
+      );
+    }
+    // ReadSafety, judged after every step and every delivery here, is reported last, so a history another check breaks
+    // is named by that check.
+    if let Some(broken) = self.read_safety_broken.take() {
+      panic!("{broken}");
+    }
+  }
+
+  /// Delivers the network's messages, the daemon's period after each, until the live holders converge or the budget
+  /// runs out.
+  fn deliver_until_converged(&mut self) {
     // Messages of superseded owners are still delivered: they must change nothing. The budget covers the backlog in
     // flight at the heal on top of the steps to converge: a run whose candidates changed often heals with thousands of
     // re-sends in flight (6,160 in one f = 2 run), which a bare 10,000 never drained.
@@ -1035,24 +1375,18 @@ impl Run {
       self.record();
       self.activate();
       self.follow();
+      self.read_safety();
       if self.converged() {
         break;
       }
     }
-    if !self.converged() {
-      self.note(|| self.convergence_state());
-    }
-    assert!(
-      self.converged(),
-      "Convergence: live holders never caught up"
-    );
-    let owner = &self.owners[self.current];
-    for (position, value) in &self.durable {
-      assert_eq!(
-        owner.state.get(usize::try_from(*position).unwrap()),
-        Some(value),
-        "NoLoss at the end: durable position {position}"
-      );
+  }
+
+  /// A restarted owner ships its log again at its next publication (A-344), as the daemon makes its shipper again then:
+  /// one write, if the current owner made none since its restart.
+  fn publish_after_a_restart(&mut self) {
+    if self.restarts > 0 && self.owners[self.current].shipper.head().is_none() {
+      self.write(self.current);
     }
   }
 
@@ -1140,8 +1474,12 @@ impl Run {
   }
 }
 
-fn run_seeds(f: u64, rule: EmptyReport) -> (u64, u64, u64, u64, u64) {
-  let mut totals = (0, 0, 0, 0, 0);
+/// What [`run_seeds`] counted over its seeds: takeovers, installs, stale refusals, durable positions, empty reports
+/// counted, ReadSafety's judgements, and those of them past a holder without a durable write.
+type NemesisCounts = (u64, u64, u64, u64, u64, u64, u64);
+
+fn run_seeds(f: u64, rule: EmptyReport) -> NemesisCounts {
+  let mut totals = (0, 0, 0, 0, 0, 0, 0);
   for seed in 0..SEEDS {
     let mut run = Run::new(f, seed, rule);
     for _ in 0..STEPS {
@@ -1153,25 +1491,106 @@ fn run_seeds(f: u64, rule: EmptyReport) -> (u64, u64, u64, u64, u64) {
     totals.2 += run.stale_refusals;
     totals.3 += u64::try_from(run.durable.len()).unwrap();
     totals.4 += run.empty_reports;
+    totals.5 += run.reads_judged;
+    totals.6 += run.reads_past_a_stale_holder;
   }
   totals
 }
 
 /// A-200, AC-8.3: under loss, duplication, reordering, partitions, holder crashes, owner loss with takeover and a
-/// superseded owner shipping on, at `f = 1` and `f = 2`, every history holds Agreement, NoLoss, StaleNeverCommits and
-/// Convergence. The counters are the non-vacuity check: takeovers happened, installs caught holders up, superseded
-/// owners were refused by fences, and writes became durable.
+/// superseded owner shipping on, at `f = 1` and `f = 2`, every history holds Agreement, NoLoss, StaleNeverCommits,
+/// ReadSafety (A-601) and Convergence. The counters are the non-vacuity check: takeovers happened, installs caught
+/// holders up, superseded owners were refused by fences, writes became durable, and ReadSafety judged reads, some of
+/// them past a holder that lacked a durable write.
 #[test]
 fn the_live_log_holds_the_register_invariants_under_the_nemesis() {
   for f in [1, 2] {
-    let (takeovers, installs, stale_refusals, durable, empty) =
+    let (takeovers, installs, stale_refusals, durable, empty, judged, past_stale) =
       run_seeds(f, EmptyReport::FenceAndCount);
     eprintln!(
       "f={f}: {SEEDS} seeds x {STEPS} steps: {takeovers} takeovers, {installs} installs, {stale_refusals} stale \
-       refusals, {durable} durable positions, {empty} empty reports counted"
+       refusals, {durable} durable positions, {empty} empty reports counted; ReadSafety judged {judged} times, \
+       {past_stale} of them past a holder without a durable write"
     );
     assert!(takeovers > 0 && installs > 0 && stale_refusals > 0 && durable > 0 && empty > 0);
+    assert!(
+      judged > 0 && past_stale > 0,
+      "ReadSafety judged {judged} times, {past_stale} past a stale holder"
+    );
   }
+}
+
+/// A-601, ReadSafety's own red check (`FencedLedger.tla`'s rule): a write durable at position 0 under the first owner
+/// (epoch 1) on one holder, and the other holder holding position 0 from a later owner (epoch 2) that wrote another
+/// value there, as a holder would if a takeover had adopted a head without the durable write. Do: judge the run's state
+/// at `f = 1`, where phase one counts both holders. Expect: a ReadSafety violation naming position 0, since phase one
+/// adopts the later owner's head, the greater. The nemesis's mutations break other checks first or alongside, so this
+/// is where the rule itself is shown to tell.
+#[test]
+fn the_read_safety_check_finds_a_read_that_adopts_a_head_without_a_durable_write() {
+  let mut run = Run::new(1, 0, EmptyReport::FenceAndCount);
+  let first = run.owners[0]
+    .shipper
+    .append(1_u64.to_le_bytes().to_vec())
+    .unwrap();
+  hold(&mut run, HostId(2), Replica::new(HostId(1), OBJECT), &first);
+  run.durable.insert(0, 1);
+  let later_owner = HostId(4);
+  let mut later = Shipper::new(
+    (later_owner, OBJECT, HostEpoch(2)),
+    Quorum { f: 1 },
+    &[HostId(3)],
+    None,
+    bounds_of(8, 16, 8),
+  );
+  let other = later.append(9_u64.to_le_bytes().to_vec()).unwrap();
+  hold(
+    &mut run,
+    HostId(3),
+    Replica::new(later_owner, OBJECT),
+    &other,
+  );
+  run.read_safety();
+  let broken = run.read_safety_broken.unwrap_or_default();
+  assert!(
+    broken.contains("ReadSafety") && broken.contains("lacks durable position 0"),
+    "the read adopting host 3's epoch-2 head is named: {broken:?}"
+  );
+}
+
+/// A-601, the rule's other side: a holder that lacks the durable write (here it holds no copy at all) is no violation
+/// while every read phase one could make adopts a head that holds it. Do: hold position 0's durable value on one of the
+/// `f = 1` run's two holders, the other holding nothing, and judge. Expect: no violation, and the judgement counted as
+/// one past a holder without the durable write, since a holder with no copy reports nothing and never ranks above one
+/// that holds the write.
+#[test]
+fn a_read_past_a_holder_without_a_durable_write_adopts_the_head_that_holds_it() {
+  let mut run = Run::new(1, 0, EmptyReport::FenceAndCount);
+  let first = run.owners[0]
+    .shipper
+    .append(1_u64.to_le_bytes().to_vec())
+    .unwrap();
+  hold(&mut run, HostId(2), Replica::new(HostId(1), OBJECT), &first);
+  run.durable.insert(0, 1);
+  run.read_safety();
+  assert_eq!(
+    (
+      run.read_safety_broken,
+      run.reads_judged,
+      run.reads_past_a_stale_holder
+    ),
+    (None, 1, 1)
+  );
+}
+
+/// Hands `host` the copy `replica` with `entry` accepted and its value applied, as a holder's delivery does.
+fn hold(run: &mut Run, host: HostId, mut replica: Replica, entry: &Entry) {
+  replica.accept(entry).unwrap();
+  let holder = run.holders.get_mut(&host).unwrap();
+  holder.state.push(u64::from_le_bytes(
+    entry.payload.as_slice().try_into().unwrap(),
+  ));
+  holder.replica = Some(replica);
 }
 
 /// A-200 phase one, the rule for a candidate that holds no copy (2026-11-05): its empty report counts toward `f + 1`
@@ -1224,8 +1643,256 @@ fn an_empty_report_without_a_fence_lets_a_superseded_owner_commit() {
   );
 }
 
-/// AC-8.9: the owner holds at most `credit` entries that are not durable; past it a write is refused `NoCredit`, and
-/// an acknowledgement gives the credit back.
+/// What a restarting nemesis run counted ([`run_restarting`]): restarts, restarts between an image and its append,
+/// installs, takeovers and durable positions.
+type RestartCounts = (u64, u64, u64, u64, u64);
+
+/// Runs the nemesis with the current owner's daemon restarting now and then over its own log under `restart` (A-344),
+/// at `f = 1` and `f = 2` over every seed, the candidates fixed and following a joint transition: the broken seeds with
+/// their messages, and the totals of the passing ones.
+fn run_restarting(restart: Restart) -> (Vec<BrokenSeed>, RestartCounts) {
+  let mut broken = Vec::new();
+  let mut totals = (0, 0, 0, 0, 0);
+  for following in [None, Some(Following::Joint)] {
+    for f in [1, 2] {
+      for seed in 0..SEEDS {
+        let outcome = std::panic::catch_unwind(|| {
+          let mut run = Run::new(f, seed, EmptyReport::FenceAndCount);
+          if let Some(following) = following {
+            run = run.following(following);
+          }
+          let mut run = run.restarting(restart);
+          for _ in 0..STEPS {
+            run.step();
+          }
+          run.settle();
+          (
+            run.restarts,
+            run.restarts_between,
+            run.installs,
+            run.takeovers,
+            u64::try_from(run.durable.len()).unwrap(),
+          )
+        });
+        match outcome {
+          Ok(counts) => {
+            totals.0 += counts.0;
+            totals.1 += counts.1;
+            totals.2 += counts.2;
+            totals.3 += counts.3;
+            totals.4 += counts.4;
+          }
+          Err(panic) => {
+            let message = panic
+              .downcast_ref::<String>()
+              .cloned()
+              .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+              .unwrap_or_default();
+            broken.push((f, seed, format!("{following:?}: {message}")));
+          }
+        }
+      }
+    }
+  }
+  eprintln!(
+    "{restart:?}: {} broken seeds, first {:?}; passing seeds: {} restarts ({} between an image and its append), {} \
+     installs, {} takeovers, {} durable positions",
+    broken.len(),
+    broken.first(),
+    totals.0,
+    totals.1,
+    totals.2,
+    totals.3,
+    totals.4
+  );
+  (broken, totals)
+}
+
+/// A-344 (§4.10, §4.8 "Recovery"): do run the nemesis with the current owner's daemon restarting warm now and then over
+/// its own log, its shipper made again past the greatest position its recovery image says it may have shipped, under
+/// the same epoch (half the restarts falling between a publication's image and its entry's append), at `f = 1` and
+/// `f = 2`, with the candidates fixed and following a joint transition. Expect every history to hold Agreement, NoLoss,
+/// StaleNeverCommits and Convergence; and, so the run is not vacuous, restarts made, some of them between an image and
+/// its append, holders installed, owners taken over and writes durable.
+#[test]
+fn a_live_log_resumed_past_every_position_it_may_have_shipped_holds_the_invariants() {
+  let (broken, (restarts, between, installs, takeovers, durable)) =
+    run_restarting(Restart::PastShipped);
+  assert!(
+    broken.is_empty(),
+    "resumed past what it shipped: {broken:?}"
+  );
+  assert!(
+    restarts > 0 && between > 0 && installs > 0 && takeovers > 0 && durable > 0,
+    "restarts {restarts}, between {between}, installs {installs}, takeovers {takeovers}, durable {durable}"
+  );
+}
+
+/// A-344, the daemon before it as a mutation: do run the restarting nemesis with each restarted owner's shipper made
+/// again from nothing under the same epoch. Expect a broken seed: two chains at one epoch, so a position durable with two
+/// values (Agreement) or a takeover adopting the old chain's greater head without what the new one made durable
+/// (NoLoss).
+#[test]
+fn a_live_log_begun_again_at_genesis_under_the_same_epoch_breaks_agreement() {
+  let (broken, _) = run_restarting(Restart::FromGenesis);
+  let (agreement, no_loss) = broken_by_invariant(&broken);
+  assert!(
+    agreement + no_loss > 0,
+    "a chain begun again at genesis broke Agreement or NoLoss: {broken:?}"
+  );
+}
+
+/// Of `broken` seeds, how many broke Agreement and how many NoLoss, printed with the total.
+fn broken_by_invariant(broken: &[BrokenSeed]) -> (usize, usize) {
+  let count = |name: &str| {
+    broken
+      .iter()
+      .filter(|(_, _, message)| message.contains(name))
+      .count()
+  };
+  let (agreement, no_loss) = (count("Agreement"), count("NoLoss"));
+  eprintln!(
+    "{} broken seeds: {agreement} Agreement, {no_loss} NoLoss, the rest Convergence",
+    broken.len()
+  );
+  (agreement, no_loss)
+}
+
+/// A-344, the rule's other half as a mutation: do run the restarting nemesis with each restarted owner resuming past the
+/// position it knew durable rather than past every position it may have shipped. Expect a broken seed: a position it
+/// shipped past its durable one and a holder kept is used again with another value (Agreement), or adopted over the
+/// new chain's durable writes (NoLoss).
+#[test]
+fn a_live_log_resumed_past_its_durable_position_alone_breaks_agreement() {
+  let (broken, _) = run_restarting(Restart::PastDurable);
+  let (agreement, no_loss) = broken_by_invariant(&broken);
+  assert!(
+    agreement + no_loss > 0,
+    "a chain resumed past its durable position alone broke Agreement or NoLoss: {broken:?}"
+  );
+}
+
+/// A-344: do make an owner's shipper, ship positions 0 to 5 to holder 2 (holder 3 holds nothing), restart it as
+/// resumed past position 5 under the same epoch, and append once. Expect its next position 6 before the append and the
+/// entry at 6 after it, one entry in flight and nothing durable before any holder acknowledges this chain; holder 2, on
+/// the old chain at 5, and holder 3, holding nothing, each refuse the entry and are owed an install, which each
+/// applies; the entry durable at 6 once one of them reports it.
+#[test]
+fn a_resumed_owners_first_entry_is_past_every_position_it_may_have_shipped() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut old = holder_of_an_old_chain(&hosts, 6);
+  let mut resumed = Shipper::resumed(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    Some(5),
+    bounds_of(8, 16, 1),
+  )
+  .unwrap();
+  assert_eq!(resumed.next_position(), Some(6));
+  assert_eq!(resumed.durable(), None);
+  let entry = resumed.append(vec![6]).unwrap();
+  assert_eq!(
+    entry.position, 6,
+    "the first entry is past every position shipped"
+  );
+  assert_eq!(resumed.next_position(), Some(7));
+  assert_eq!(resumed.durable(), None, "no holder holds this chain yet");
+  assert_eq!(
+    resumed.in_flight(),
+    1,
+    "only the entry appended here is in flight, not the positions before it"
+  );
+  let mut empty = Replica::new(hosts[0], OBJECT);
+  for (holder, replica) in [(hosts[1], &mut old), (hosts[2], &mut empty)] {
+    installed_past_its_chain(&mut resumed, holder, replica, &entry);
+  }
+  assert_eq!(
+    resumed.on_reply(hosts[1], Ok(old.head())),
+    Next::Nothing,
+    "an installed holder is on the new chain"
+  );
+  assert_eq!(resumed.durable(), Some(6));
+}
+
+/// A-344 with A-240's joint transition: do resume an owner's shipper past position 5 (holders 2 and 3), begin a
+/// transition to holders 4 and 5, and ask whether the target holds the log before any entry, after the first entry is
+/// appended, and after holder 4 installs it. Expect it short until `f` of the target hold that first entry, which carries
+/// every write made durable on the chain before the restart. Judged at once, nothing being durable on the new chain yet,
+/// the record could name a set that holds none of those writes, and a takeover counting it would lose them.
+#[test]
+fn a_resumed_owners_new_holders_count_only_once_they_hold_its_first_entry() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut resumed = Shipper::resumed(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    Some(5),
+    bounds_of(8, 16, 1),
+  )
+  .unwrap();
+  assert!(resumed.begin_transition(&[HostId(4), HostId(5)]));
+  assert!(
+    !resumed.transferred(),
+    "no member of the target holds anything of the resumed chain"
+  );
+  let entry = resumed.append(vec![6]).unwrap();
+  assert!(
+    !resumed.transferred(),
+    "the first entry is appended and no member of the target holds it"
+  );
+  let mut four = Replica::new(hosts[0], OBJECT);
+  installed_past_its_chain(&mut resumed, HostId(4), &mut four, &entry);
+  assert_eq!(resumed.on_reply(HostId(4), Ok(four.head())), Next::Nothing);
+  assert!(
+    resumed.transferred(),
+    "f of the target hold the first entry, and with it every write durable before the restart"
+  );
+}
+
+/// A holder's copy of a chain of `entries` entries host `hosts[0]` shipped at epoch 1, positions 0 on.
+fn holder_of_an_old_chain(hosts: &[HostId; 3], entries: u8) -> Replica {
+  let mut before = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    hosts,
+    None,
+    bounds_of(8, 16, 1),
+  );
+  let mut old = Replica::new(hosts[0], OBJECT);
+  for value in 0..entries {
+    let entry = before.append(vec![value]).unwrap();
+    old.accept(&entry).unwrap();
+  }
+  old
+}
+
+/// Expects `holder`'s copy (`replica`) to refuse `entry`, the resumed shipper's first, as off its chain, the shipper to
+/// owe it an install, and the copy to apply that install at the entry's head; then commits it.
+fn installed_past_its_chain(
+  resumed: &mut Shipper,
+  holder: HostId,
+  replica: &mut Replica,
+  entry: &Entry,
+) {
+  let refused = replica.check(entry);
+  assert!(
+    matches!(refused, Err(LiveError::Behind { .. })),
+    "holder {holder:?} refuses an entry off its chain: {refused:?}"
+  );
+  let reply = refused.map(|_| replica.head());
+  assert_eq!(resumed.on_reply(holder, reply), Next::Install);
+  let install = resumed.install(vec![0; 7]).unwrap();
+  assert_eq!(
+    replica.check_install(&install),
+    Ok(Admitted::Apply(entry.head())),
+    "the install at position 6 ranks above the old chain"
+  );
+  replica.commit(install.epoch, install.head);
+}
+
+/// AC-8.9: the owner holds at most its credit's bytes of entries that are not durable; past it a write is refused
+/// `NoCredit`, and an acknowledgement gives the credit back.
 #[test]
 fn a_writer_past_its_credit_waits_for_acknowledgements() {
   let hosts = [HostId(1), HostId(2), HostId(3)];
@@ -1234,7 +1901,7 @@ fn a_writer_past_its_credit_waits_for_acknowledgements() {
     Quorum { f: 1 },
     &hosts,
     None,
-    (2, 4),
+    bounds_of(2, 4, 1),
   );
   let first = shipper.append(vec![1]).unwrap();
   let second = shipper.append(vec![2]).unwrap();
@@ -1248,6 +1915,217 @@ fn a_writer_past_its_credit_waits_for_acknowledgements() {
   assert_eq!(shipper.on_reply(hosts[1], Ok(held)), Next::Nothing);
   assert_eq!(shipper.durable(), Some(1));
   assert!(shipper.append(vec![3]).is_ok());
+}
+
+/// A shipper at `f = 1` from host 1 to holders 2 and 3, bounded by a whole state of `whole` bytes as the daemon bounds
+/// it ([`Bounds::of_whole`]).
+fn shipper_bounded_by_whole(whole: usize) -> Shipper {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    Bounds::of_whole(whole),
+  )
+}
+
+/// AC-8.9, A-200 amended 2026-11-17: the credit is the whole state's bytes, not a count of entries. Do bound a shipper by
+/// a whole state of 64 KiB and append a burst of 4 KiB deltas with nothing acknowledged, as a burst of barriers on one
+/// volume does inside one round trip. Expect every delta whose bytes keep what is in flight within the whole state to be
+/// admitted (fifteen of them, each 4 KiB and its prefix), the next refused `NoCredit`, a whole state then admitted one
+/// past the credit and nothing after it, and the bytes in flight given back at the holders' acknowledgement. With the
+/// daemon's old credit of two entries the third delta was refused, and the volume shipped its whole state next.
+#[test]
+fn a_burst_of_deltas_within_the_whole_state_is_admitted_and_one_past_it_waits() {
+  const WHOLE: usize = 64 << 10;
+  const DELTA: usize = 4 << 10;
+  let mut shipper = shipper_bounded_by_whole(WHOLE);
+  let delta_bytes = Entry {
+    owner: HostId(1),
+    object: OBJECT,
+    position: 0,
+    epoch: HostEpoch(1),
+    previous: [0; 32],
+    payload: vec![0; DELTA],
+  }
+  .wire_bytes();
+  let admitted = WHOLE / delta_bytes;
+  let mut appended = Vec::new();
+  for value in 0..admitted {
+    let payload = vec![u8::try_from(value % 256).unwrap(); DELTA];
+    appended.push(
+      shipper
+        .append(payload)
+        .unwrap_or_else(|refusal| panic!("delta {value} of {admitted}: {refusal:?}")),
+    );
+  }
+  assert_eq!(
+    admitted, 15,
+    "fifteen 4 KiB deltas and their prefixes fit 64 KiB"
+  );
+  assert_eq!(shipper.in_flight(), 15);
+  assert_eq!(shipper.in_flight_bytes(), admitted * delta_bytes);
+  assert_eq!(
+    shipper.append(vec![0; DELTA]),
+    Err(LiveError::NoCredit { durable: None }),
+    "the delta that would pass the whole state's bytes waits"
+  );
+  appended.push(expect_a_whole_state_admitted_one_past_the_credit(
+    &mut shipper,
+    WHOLE,
+  ));
+  let held = held_after(HostId(1), &appended);
+  assert_eq!(shipper.on_reply(HostId(2), Ok(held)), Next::Nothing);
+  assert_eq!(
+    (
+      shipper.durable(),
+      shipper.in_flight(),
+      shipper.in_flight_bytes()
+    ),
+    (Some(15), 0, 0),
+    "the acknowledgement settles every entry and gives its bytes back"
+  );
+  assert!(shipper.append(vec![3; DELTA]).is_ok());
+}
+
+/// The whole state of `a_burst_of_deltas_within_the_whole_state_is_admitted_and_one_past_it_waits`. Do: with what is
+/// in flight within the credit, append a whole state of `whole` bytes, then another. Expect the first admitted one past
+/// the credit and the second refused `NoCredit`. Returns the admitted entry.
+fn expect_a_whole_state_admitted_one_past_the_credit(shipper: &mut Shipper, whole: usize) -> Entry {
+  assert!(
+    shipper.admits_checkpoint(),
+    "what is in flight is within the credit"
+  );
+  let admitted = shipper.append_checkpoint(vec![1; whole]).unwrap();
+  assert!(
+    !shipper.admits_checkpoint(),
+    "a checkpoint goes one past the credit, and no further"
+  );
+  assert_eq!(
+    shipper.append_checkpoint(vec![2; whole]),
+    Err(LiveError::NoCredit { durable: None })
+  );
+  admitted
+}
+
+/// A-371 (AC-8.9; A-200 amended): a whole state in flight rides one past the credit and never counts against the
+/// deltas behind it. Do: bound a shipper by a whole state of 64 KiB, append that whole state as the daemon does
+/// (`append_checkpoint`, then `mark_checkpoint` and the bounds set again from it), and with nothing acknowledged append
+/// 4 KiB deltas. Expect every delta whose bytes keep the deltas in flight within the credit admitted, as with no whole
+/// state in flight, the next refused `NoCredit`, no second whole state admitted while the first and the deltas are
+/// in flight, and the acknowledgement settling all of them. Before, the whole state's own bytes filled the credit, so
+/// every delta after a whole entry was refused until the whole was durable, and the daemon, owing a whole state for each
+/// refusal, shipped the volume whole again (the measurer's 32 writers on a 128 MiB volume: 1 whole record became 3).
+#[test]
+fn deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit() {
+  const WHOLE: usize = 64 << 10;
+  const DELTA: usize = 4 << 10;
+  let mut shipper = shipper_bounded_by_whole(WHOLE);
+  let whole = shipper.append_checkpoint(vec![7; WHOLE]).unwrap();
+  shipper.mark_checkpoint(whole.head());
+  shipper.set_bounds(Bounds::of_whole(whole.wire_bytes()));
+  let delta_bytes = Entry {
+    payload: vec![0; DELTA],
+    ..whole.clone()
+  }
+  .wire_bytes();
+  let admitted = whole.wire_bytes() / delta_bytes;
+  let mut appended = vec![whole];
+  for value in 0..admitted {
+    let payload = vec![u8::try_from(value % 256).unwrap(); DELTA];
+    appended.push(shipper.append(payload).unwrap_or_else(|refusal| {
+      panic!("delta {value} of {admitted} behind the whole state: {refusal:?}")
+    }));
+  }
+  assert_eq!(
+    shipper.append(vec![0; DELTA]),
+    Err(LiveError::NoCredit { durable: None }),
+    "the delta that would pass the credit waits"
+  );
+  assert!(
+    !shipper.admits_checkpoint(),
+    "no second whole state while the first and the deltas are in flight"
+  );
+  let held = held_after(HostId(1), &appended);
+  assert_eq!(shipper.on_reply(HostId(2), Ok(held)), Next::Nothing);
+  assert_eq!(
+    (shipper.in_flight(), shipper.in_flight_bytes()),
+    (0, 0),
+    "the acknowledgement settles the whole state and every delta"
+  );
+}
+
+/// AC-8.9: the credit counts what each entry costs. Do bound a shipper at three small entries' bytes and put one small
+/// entry in flight. Expect a second small entry admitted, an entry larger than what is left refused though only one
+/// is in flight, and, once nothing is in flight, that same large entry admitted whatever its size (the log never
+/// stops at a bound).
+#[test]
+fn the_credit_counts_each_entrys_bytes_and_never_stops_the_log() {
+  let small = bounds_of(1, 1, 1).credit;
+  let mut shipper = shipper_bounded_by_whole(3 * small);
+  let first = shipper.append(vec![1]).unwrap();
+  let second = shipper.append(vec![2]).unwrap();
+  let large = vec![9; 4 * small];
+  assert_eq!(
+    shipper.append(large.clone()),
+    Err(LiveError::NoCredit { durable: None }),
+    "two small entries and a large one pass three small entries' bytes"
+  );
+  shipper.on_reply(HostId(3), Ok(held_after(HostId(1), &[first, second])));
+  assert_eq!(shipper.in_flight_bytes(), 0);
+  assert!(
+    shipper.append(large).is_ok(),
+    "with nothing in flight an entry larger than the credit is admitted"
+  );
+}
+
+/// AC-8.9: the retained tail is bounded in bytes too, never below the newest entry. Do retain two small entries' bytes
+/// (the credit wide), have holder 2 acknowledge position 2 of five small entries while holder 3 hears nothing, then
+/// position 4, then append one entry larger than the bound. Expect holder 3 installed (it lacks position 0, behind the
+/// two entries the bytes keep), holder 2 sent the last two while they fit, and after the large entry pushed them out,
+/// holder 2 sent the large one alone (kept though it alone passes the bound) and holder 3 still installed.
+#[test]
+fn the_retained_tail_is_held_to_its_bytes_and_keeps_the_newest_entry() {
+  let small = bounds_of(1, 1, 1).credit;
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    Bounds {
+      credit: 100 * small,
+      retain: 2 * small,
+    },
+  );
+  let mut entries: Vec<Entry> = (0..3u8)
+    .map(|value| shipper.append(vec![value]).unwrap())
+    .collect();
+  shipper.on_reply(hosts[1], Ok(held_after(hosts[0], &entries)));
+  entries.extend((3..5u8).map(|value| shipper.append(vec![value]).unwrap()));
+  assert_eq!(
+    shipper.pending(hosts[2]),
+    Next::Install,
+    "a holder that lacks position 0 is behind the two entries the bytes keep"
+  );
+  assert_eq!(
+    shipper.pending(hosts[1]),
+    Next::Entries(entries[3..].to_vec()),
+    "the last two are retained"
+  );
+  shipper.on_reply(hosts[1], Ok(held_after(hosts[0], &entries)));
+  let large = shipper.append(vec![7; 8 * small]).unwrap();
+  assert_eq!(
+    shipper.pending(hosts[1]),
+    Next::Entries(vec![large]),
+    "the newest entry is kept though it alone passes the bound"
+  );
+  assert_eq!(
+    shipper.pending(hosts[2]),
+    Next::Install,
+    "a holder behind it is installed"
+  );
 }
 
 /// A-200: a holder repeating the head it last acknowledged is on the chain, though the tail has since passed it. Do have
@@ -1264,7 +2142,7 @@ fn a_holder_repeating_a_head_the_tail_has_passed_is_sent_the_entries_after_it() 
     Quorum { f: 1 },
     &hosts,
     None,
-    (8, 8),
+    bounds_of(8, 8, 1),
   );
   let entries: Vec<_> = (0..4).map(|at| shipper.append(vec![at]).unwrap()).collect();
   let mut replica = Replica::new(hosts[0], OBJECT);
@@ -1296,7 +2174,7 @@ fn shipper_to_three_holders(retain: usize) -> Shipper {
     Quorum { f: 1 },
     &hosts,
     None,
-    (16, retain),
+    bounds_of(16, retain, 1),
   )
 }
 
@@ -1385,7 +2263,7 @@ fn a_refused_entry_is_never_counted_as_held() {
     Quorum { f: 1 },
     &hosts,
     None,
-    (4, 8),
+    bounds_of(4, 8, 1),
   );
   let first = shipper.append(vec![1]).unwrap();
   let second = shipper.append(vec![2]).unwrap();
@@ -1440,7 +2318,7 @@ fn a_shipper_made_before_its_candidates_were_known_ships_to_them_once_named() {
     Quorum { f: 1 },
     &hosts[..1],
     None,
-    (4, 8),
+    bounds_of(4, 8, 1),
   );
   let first = shipper.append(vec![1]).unwrap();
   let second = shipper.append(vec![2]).unwrap();
@@ -1501,7 +2379,7 @@ fn a_new_holder_set_counts_only_once_it_holds_every_durable_entry() {
     Quorum { f: 1 },
     &hosts[..3],
     None,
-    (8, 8),
+    bounds_of(8, 8, 1),
   );
   let entries = [
     shipper.append(vec![1]).unwrap(),
@@ -1686,7 +2564,13 @@ fn dropping_the_old_holders_before_the_record_names_the_new_loses_durable_writes
   let owner = HostId(1);
   let (old, new) = ([HostId(2), HostId(3)], [HostId(4), HostId(5)]);
   let quorum = Quorum { f: 1 };
-  let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, &old, None, (4, 8));
+  let mut shipper = Shipper::new(
+    (owner, OBJECT, HostEpoch(1)),
+    quorum,
+    &old,
+    None,
+    bounds_of(4, 8, 1),
+  );
   let first = shipper.append(vec![1]).unwrap();
   shipper.on_reply(old[0], Ok(held_after(owner, std::slice::from_ref(&first))));
   assert!(shipper.begin_transition(&new));
@@ -1755,7 +2639,7 @@ fn a_successor_that_starts_from_the_configuration_loses_durable_writes() {
     quorum,
     &recorded,
     None,
-    (4, 8),
+    bounds_of(4, 8, 1),
   );
   let first = shipper.append(vec![1]).unwrap();
   shipper.on_reply(
@@ -1818,7 +2702,13 @@ fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
   let owner = HostId(1);
   let quorum = Quorum { f: 1 };
   let ship = |holders: &[HostId]| {
-    let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, holders, None, (4, 8));
+    let mut shipper = Shipper::new(
+      (owner, OBJECT, HostEpoch(1)),
+      quorum,
+      holders,
+      None,
+      bounds_of(4, 8, 1),
+    );
     let entry = shipper.append(vec![1]).unwrap();
     (shipper, held_after(owner, &[entry]))
   };
@@ -1850,7 +2740,13 @@ fn a_write_is_durable_only_where_every_takeover_quorum_meets_it() {
   assert_eq!(shipper.durable(), None, "no holder: never durable");
   // At f = 2 with three holders, `n − f` = 1 would count the owner and one holder: two copies, which two failures lose.
   let quorum = Quorum { f: 2 };
-  let mut shipper = Shipper::new((owner, OBJECT, HostEpoch(1)), quorum, &three, None, (4, 8));
+  let mut shipper = Shipper::new(
+    (owner, OBJECT, HostEpoch(1)),
+    quorum,
+    &three,
+    None,
+    bounds_of(4, 8, 1),
+  );
   let held = held_after(owner, &[shipper.append(vec![1]).unwrap()]);
   shipper.on_reply(three[0], Ok(held));
   assert_eq!(
@@ -1880,7 +2776,7 @@ fn a_holder_set_of_f_or_fewer_is_never_moved_to() {
         Quorum { f },
         &others[..current],
         None,
-        (4, 8),
+        bounds_of(4, 8, 1),
       );
       let target: Vec<HostId> = others[others.len() - size..].to_vec();
       assert_eq!(
@@ -1907,7 +2803,7 @@ fn the_laptop_is_durable_at_its_own_append() {
     Quorum { f: 0 },
     &[HostId(1)],
     None,
-    (1, 1),
+    bounds_of(1, 1, 1),
   );
   for value in 0..100u8 {
     let entry = shipper.append(vec![value]).unwrap();
@@ -1949,12 +2845,185 @@ fn hostile_bytes_are_refused_not_trusted() {
   }
 }
 
+/// Three consecutive entries of one owner's log under epoch 2, and their encodings.
+fn three_batched() -> (Vec<Entry>, Vec<Vec<u8>>) {
+  let mut previous = [9; 32];
+  let entries: Vec<Entry> = (0..3u8)
+    .map(|value| {
+      let entry = Entry {
+        owner: HostId(1),
+        object: OBJECT,
+        position: 3 + u64::from(value),
+        epoch: HostEpoch(2),
+        previous,
+        payload: vec![value; 4],
+      };
+      previous = entry.identity();
+      entry
+    })
+    .collect();
+  let encoded = entries.iter().map(Entry::encode).collect();
+  (entries, encoded)
+}
+
+/// A-200 amended 2026-11-17, hostile input on a batch: a batch round-trips to its entries, in order, and its header names
+/// its object and epoch; every truncation, a count over-claiming the bytes that follow (`u32::MAX`), a count of zero,
+/// trailing bytes, an entry's payload over the cap, and an entry of another epoch inside it are each refused; every
+/// single-bit flip decodes to other entries or is refused, never a panic.
+#[test]
+fn hostile_batches_are_refused_not_trusted() {
+  use slates_db::live::{decode_batch, encode_batch, epoch_of_batch, object_of};
+  let (entries, encoded) = three_batched();
+  let slices: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+  let bytes = encode_batch(&slices).unwrap();
+  assert_eq!(decode_batch(&bytes, CAP), Ok(entries.clone()));
+  assert_eq!(object_of(&bytes), Some(OBJECT));
+  assert_eq!(epoch_of_batch(&bytes), Some(HostEpoch(2)));
+  assert_eq!(encode_batch(&[]), None, "an empty batch is never made");
+  expect_every_truncation_and_lying_count_refused(&bytes);
+  let mut longer = bytes.clone();
+  longer.push(0);
+  assert_eq!(decode_batch(&longer, CAP), Err(LiveError::Malformed));
+  assert_eq!(
+    decode_batch(&bytes, 3),
+    Err(LiveError::Malformed),
+    "an entry's payload over the cap"
+  );
+  let foreign = Entry {
+    epoch: HostEpoch(3),
+    ..entries[1].clone()
+  }
+  .encode();
+  let mixed = encode_batch(&[slices[0], foreign.as_slice()]).unwrap();
+  assert_eq!(
+    decode_batch(&mixed, CAP),
+    Err(LiveError::Malformed),
+    "an entry of another epoch than the batch's"
+  );
+  expect_every_bit_flip_refused_or_seen(&bytes, &entries);
+}
+
+/// The truncations and lying counts of `hostile_batches_are_refused_not_trusted`. Expect a batch's `bytes` cut short
+/// anywhere, and the batch with its count over-claiming the bytes that follow (`u32::MAX`), zero, or one more than it
+/// holds, each refused `Malformed`.
+fn expect_every_truncation_and_lying_count_refused(bytes: &[u8]) {
+  use slates_db::live::decode_batch;
+  for length in 0..bytes.len() {
+    assert_eq!(
+      decode_batch(&bytes[..length], CAP),
+      Err(LiveError::Malformed),
+      "truncated at {length}"
+    );
+  }
+  let count_at = 8 + 16 + 8;
+  for count in [u32::MAX, 0, 4] {
+    let mut lying = bytes.to_vec();
+    lying[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
+    assert_eq!(
+      decode_batch(&lying, CAP),
+      Err(LiveError::Malformed),
+      "a count of {count}"
+    );
+  }
+}
+
+/// The bit flips of `hostile_batches_are_refused_not_trusted`. Expect every single-bit flip of a batch's `bytes`
+/// refused, or decoded to entries other than `entries` as the chain sees them, never a panic.
+fn expect_every_bit_flip_refused_or_seen(bytes: &[u8], entries: &[Entry]) {
+  use slates_db::live::decode_batch;
+  let identities: Vec<_> = entries.iter().map(Entry::identity).collect();
+  for bit in 0..bytes.len() * 8 {
+    let mut flipped = bytes.to_vec();
+    flipped[bit / 8] ^= 1 << (bit % 8);
+    if let Ok(decoded) = decode_batch(&flipped, CAP) {
+      let decoded: Vec<_> = decoded.iter().map(Entry::identity).collect();
+      assert_ne!(
+        decoded, identities,
+        "bit {bit} changed nothing the chain would see"
+      );
+    }
+  }
+}
+
 /// Hostile input: a reply that is empty, of an unknown kind, short of its head or fence, or longer than its kind is
 /// refused.
 #[test]
 fn hostile_replies_are_refused() {
   for reply in [vec![], vec![9], vec![1, 0], vec![3, 1, 2], vec![2, 0]] {
     assert_eq!(decode_reply(&reply), Err(LiveError::Malformed));
+  }
+}
+
+/// §4.2 (a candidate's admission of a live log, g229): a holder that cannot admit the volume's claim answers `NoRoom`
+/// with what it could admit, so the owner can refuse typed. Do: encode a `NoRoom` reply at zero, a middle value and
+/// `u64::MAX`, then decode it whole, cut short at every length and with a byte too many. Expect: the same refusal back,
+/// whole; `Malformed` for every cut and for the extra byte; never a panic.
+#[test]
+fn a_holders_no_room_crosses_the_wire_with_what_it_could_admit() {
+  for available in [0, 1 << 20, u64::MAX] {
+    let refusal = Err(LiveError::NoRoom { available });
+    let bytes = encode_reply(&refusal);
+    assert_eq!(decode_reply(&bytes), refusal, "{available} back whole");
+    for length in 0..bytes.len() {
+      assert_eq!(
+        decode_reply(&bytes[..length]),
+        Err(LiveError::Malformed),
+        "{available} cut at {length}"
+      );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert_eq!(decode_reply(&longer), Err(LiveError::Malformed));
+  }
+}
+
+/// §4.2 (A-401): an owner's ask that a candidate make a volume's admission names the volume's size class and its locked
+/// guarantee exactly. Do: encode a bounded, a dynamic and a locked ask, decode each whole, cut each short at every
+/// length, give each a byte too many, and give each an unknown size kind and locked flag. Expect: each back whole and
+/// read as an admission; `Malformed` for every cut, the extra byte and the unknown values; never a panic.
+#[test]
+fn an_owners_admission_ask_crosses_the_wire_whole_and_hostile_ones_are_refused() {
+  use slates_db::catalog::SizeClass;
+  use slates_db::live::{Admit, is_admit};
+  for admit in [
+    Admit {
+      object: OBJECT,
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      require_locked: false,
+    },
+    Admit {
+      object: OBJECT,
+      size: SizeClass::Dynamic { max: u64::MAX },
+      require_locked: false,
+    },
+    Admit {
+      object: OBJECT,
+      size: SizeClass::Bounded { limit: 0 },
+      require_locked: true,
+    },
+  ] {
+    let bytes = admit.encode();
+    assert!(is_admit(&bytes), "{admit:?} read as an admission");
+    assert_eq!(Admit::decode(&bytes), Ok(admit), "{admit:?} back whole");
+    for length in 0..bytes.len() {
+      assert_eq!(
+        Admit::decode(&bytes[..length]),
+        Err(LiveError::Malformed),
+        "{admit:?} cut at {length}"
+      );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert_eq!(Admit::decode(&longer), Err(LiveError::Malformed));
+    let kind_at = 1 + OBJECT.0.len();
+    let mut unknown_kind = bytes.clone();
+    unknown_kind[kind_at] = 2;
+    assert_eq!(Admit::decode(&unknown_kind), Err(LiveError::Malformed));
+    let mut unknown_flag = bytes.clone();
+    if let Some(flag) = unknown_flag.last_mut() {
+      *flag = 2;
+    }
+    assert_eq!(Admit::decode(&unknown_flag), Err(LiveError::Malformed));
   }
 }
 
@@ -2089,28 +3158,70 @@ fn hostile_report_answers_are_refused() {
   }
 }
 
-/// Hostile input on a fetched reply: it round-trips; a payload over the cap is refused, and no cut of it decodes whole.
+/// Hostile input on a fetched reply (g251: its payloads read in place, one at a time): it round-trips, its payloads in
+/// order; a payload over the cap is refused when it is reached, and the log is spent after it; a length of `u32::MAX`
+/// is refused before anything is read for it; and no cut of the reply reads whole.
 #[test]
 fn hostile_fetched_replies_are_refused() {
-  use slates_db::live::{decode_fetched, encode_fetched};
+  use slates_db::live::{FetchedLog, fetched_reply, push_fetched};
   let head = Head {
     epoch: HostEpoch(2),
     position: 7,
     identity: [4; 32],
   };
-  let payloads = vec![vec![1, 2, 3], vec![9; 40]];
-  let reply = encode_fetched(&Ok(Some(head)), &payloads);
+  let payloads = vec![vec![1, 2, 3], vec![9; 100]];
+  let mut reply = fetched_reply(&Ok(Some(head)), 0);
+  for payload in &payloads {
+    push_fetched(&mut reply, payload);
+  }
+  let read_all = |log: &mut FetchedLog| -> Vec<Result<Vec<u8>, LiveError>> {
+    std::iter::from_fn(|| {
+      log
+        .next_payload()
+        .map(|payload| payload.map(<[u8]>::to_vec))
+    })
+    .collect()
+  };
+  let (decoded, mut log) = FetchedLog::decode(reply.clone(), CAP).unwrap();
+  assert_eq!(decoded, Some(head));
   assert_eq!(
-    decode_fetched(&reply, CAP),
-    Ok((Some(head), payloads.clone()))
+    log.first(),
+    Some(&payloads[0][..]),
+    "the first is read in place"
   );
-  assert_eq!(decode_fetched(&reply, 8), Err(LiveError::Malformed));
+  assert_eq!(
+    read_all(&mut log),
+    payloads.iter().cloned().map(Ok).collect::<Vec<_>>()
+  );
+  assert!(log.is_spent() && log.taken() == payloads.len());
+  // The cap admits the reply's head (a tag and 48 bytes) and the first payload, never the second.
+  let (_, mut capped) = FetchedLog::decode(reply.clone(), 64).unwrap();
+  assert_eq!(
+    read_all(&mut capped),
+    vec![Ok(payloads[0].clone()), Err(LiveError::Malformed)],
+    "the payload over the cap is refused when reached, and nothing follows it"
+  );
+  let mut huge = fetched_reply(&Ok(Some(head)), 0);
+  huge.extend_from_slice(&u32::MAX.to_le_bytes());
+  huge.extend_from_slice(&[0; 16]);
+  let (_, mut huge) = FetchedLog::decode(huge, CAP).unwrap();
+  assert_eq!(read_all(&mut huge), vec![Err(LiveError::Malformed)]);
+  assert_no_cut_reads_whole(&reply, payloads.len());
+}
+
+/// Every cut of a fetched `reply` short of its end: none that decodes reads all of its `payloads` whole.
+fn assert_no_cut_reads_whole(reply: &[u8], payloads: usize) {
+  use slates_db::live::FetchedLog;
   for length in 0..reply.len() {
-    if let Ok((_, decoded)) = decode_fetched(&reply[..length], CAP) {
-      assert!(
-        decoded.len() < payloads.len(),
-        "a cut reply never decodes whole"
-      );
+    if let Ok((_, mut cut)) = FetchedLog::decode(reply[..length].to_vec(), CAP) {
+      let whole = std::iter::from_fn(|| {
+        cut
+          .next_payload()
+          .map(|payload| payload.map(<[u8]>::to_vec))
+      })
+      .filter(Result::is_ok)
+      .count();
+      assert!(whole < payloads, "a cut reply never reads whole");
     }
   }
 }
@@ -2211,5 +3322,62 @@ fn counting_any_candidate_lets_a_fresh_member_stand_in_for_a_holder() {
         || message.contains("Agreement")
     }),
     "a fresh member's report stood in for a holder: {broken:?}"
+  );
+}
+
+/// A head at `position` under `epoch`, its identity the position's bytes.
+fn head_at(epoch: u64, position: u64) -> Head {
+  let mut identity = [0u8; 32];
+  identity[..8].copy_from_slice(&position.to_le_bytes());
+  Head {
+    epoch: HostEpoch(epoch),
+    position,
+    identity,
+  }
+}
+
+/// A-309 piece 3, the store-destroyed takeover's live log: the recorded holders {A, old B} at `f = 1`, old B destroyed,
+/// so A-240's count of `f + 1` recorded holders can never be met (g240's finding: the takeover waited for good); the
+/// replacement B' caught up on the log through the joint transition and holds the newest head. Do: judge whether phase
+/// one is past tolerance with B' and A members and old B gone, then walk the reports in: A's, then B''s. Expect past
+/// tolerance; A-240's rule adopting nothing whatever is reported; the past-tolerance rule waiting until B' reports and
+/// then adopting B''s head, the newest any surviving holder keeps; and within tolerance (old B a member) not past it.
+#[test]
+fn a_live_log_past_its_tolerance_is_taken_from_every_surviving_holder() {
+  let (a, old_b, fresh_b) = (HostId(1), HostId(2), HostId(3));
+  let quorum = Quorum { f: 1 };
+  let holders = [a, old_b];
+  let members = [a, fresh_b];
+  let is_member = |host: HostId| members.contains(&host);
+  assert!(past_tolerance(&holders, is_member, quorum));
+  assert!(
+    !past_tolerance(&holders, |host| host != fresh_b, quorum),
+    "both recorded holders members: within tolerance"
+  );
+  // Every surviving member that may hold the log: the recorded holders still members, and the cohorts' members.
+  let wait = [a, fresh_b];
+  let older = head_at(1, 5);
+  let newer = head_at(1, 9);
+  let from_a = [(a, Some(older))];
+  assert_eq!(adopt(&from_a, &holders, quorum), None);
+  assert_eq!(
+    adopt_past_tolerance(&from_a, &wait),
+    PastTolerance::Waiting,
+    "the replacement holding the newest head has not reported"
+  );
+  let from_both = [(a, Some(older)), (fresh_b, Some(newer))];
+  assert_eq!(
+    adopt(&from_both, &holders, quorum),
+    None,
+    "A-240's rule never counts the replacement"
+  );
+  assert_eq!(
+    adopt_past_tolerance(&from_both, &wait),
+    PastTolerance::Adopt(Some((fresh_b, newer)))
+  );
+  assert_eq!(
+    adopt_past_tolerance(&[(a, None), (fresh_b, None)], &wait),
+    PastTolerance::Adopt(None),
+    "nobody holds any of the log: nothing to adopt"
   );
 }

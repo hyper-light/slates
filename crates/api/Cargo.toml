@@ -1,0 +1,104 @@
+[package]
+name = "slates-api"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The library an embedding host drives slates through, and its typed consumer contract (§4.12 \"Embedding\", A-278; A-299): start or attach to an instance, provision, snapshot and destroy volumes, serve them as a host mount or as a descriptor a VMM takes, read their drift, land and merge under the write mode the user granted, and observe the daemon; every answer a typed outcome, every failure a closed typed error."
+
+[features]
+# Forwards blake3's pure-Rust backend (no C build script) so a downstream crate can cross-lint for a Windows target from
+# a host that has no MSVC assembler. Off by default; production uses the SIMD C path. See `crates/machine`'s
+# `pure-hash`.
+pure-hash = ["slates-client/pure-hash"]
+
+[dependencies]
+# The typed client of the ring protocol (§4.7): every verb this crate offers is one of its calls.
+slates-client = { workspace = true }
+# The wire's report and refusal types this crate's API speaks (`Refusal`, `StatusReport`, `Filter`, ...), and the
+# rendezvous the anchor role holds for its daemons (§4.7, A-114).
+slates-ipc = { workspace = true }
+# The issuer authority (§4.13 "Grants"): the anchor's segment, where the daemon publishes the issuer secret; and the
+# anchor role's segment and supervisor (§2.5).
+slates-anchor = { workspace = true }
+slates-mem = { workspace = true }
+# The codec probe is asked for here, as the `slates` binary asks for it, because this crate runs the anchor role that
+# measures the profile (A-278): without it a host's instance derives `CodecPolicy::raw_only()` and stores every archive
+# chunk raw (`docs/bugs/2026-10-20-the-ratio-codec-was-compiled-out-of-every-build.md`). This crate reaches
+# aws-lc-sys through the server anyway, so it is not in the C-free cross-lint set.
+slates-machine = { workspace = true, features = ["codecs"] }
+# The proofs a grant, an enrollment, a revocation and a consensus recovery carry, the anchor's liveness budget the
+# client's deadlines derive from, and the daemon the daemon role runs (§2.6).
+slates-server = { workspace = true }
+# The recovery budget the client's reconnect deadline and the anchor's restart policy derive from.
+slates-db = { workspace = true }
+# The anchor role's held NFS listener and fleet sockets, and its judgment of a starting daemon's runnable state.
+slates-rt = { workspace = true }
+# The anchor role's monotonic clock.
+slates-vfs = { workspace = true }
+# The fleet manifest the roles read (`role::fleet`).
+serde_json = { workspace = true }
+# An S3 base as the library names it (A-524): the naming, its addressing and its credential's type. The server links it
+# already.
+slates-base = { workspace = true }
+# The merge engine's conflict classes, which a merge window names by discriminant on the wire (§4.16, D-27): the
+# contract reads them against the engine's own enum (A-299). The server links it already.
+slates-merge = { workspace = true }
+# The launcher secret (A-299): its record's CRC32C (`slates-wire`), and a fresh secret from the TLS provider's secure
+# random (`slates-transport`, A-66), as the daemon mints its own. The server links both already.
+slates-wire = { workspace = true }
+slates-transport = { workspace = true }
+# The kernel's mount table an unmount is judged by (A-507): `getfsstat(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo` on
+# Linux, neither touching a mount; and the container handoff's judge and check (A-520: `container`, `container_engine`),
+# whose verdicts and refusals are the contract's types on every platform. Every platform links it: where it builds no
+# table query (Windows) its table, identity and watch answer `Unsupported`, which the contract carries.
+slates-bridge-oci = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+rustix = { workspace = true }
+# The macOS mount fetches the root handle over loopback and passes it to mount(2) (§4.6 A-34).
+slates-bridge-nfs = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# The roles' stop flag: the console control handler (`role::signal`). And a fleet node's nameservers, the DNS servers
+# its network adapters list (`role::fleet::windows_dns`, A-490): IP Helper's `GetAdaptersAddresses`, whose adapter
+# entry needs NDIS's interface types.
+windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+# The WinFsp mounts' purge client, a role of the executable the daemon runs from (§4.6: no daemon thread opens a volume
+# it serves).
+slates-bridge-winfsp = { workspace = true }
+
+[dev-dependencies]
+slates-server = { workspace = true }
+slates-machine = { workspace = true }
+slates-db = { workspace = true }
+# The Shards stream test speaks FUSE through the end the library hands a VMM (A-161), with the codec's ABI constants.
+slates-bridge-fuse = { workspace = true }
+# The landing test checks each listed file's bytes against the BLAKE3 its plan's entry names (A-287).
+blake3 = { workspace = true }
+# The archive export test decodes and restores the archive it reads back, as a consumer that keeps it would (A-441).
+slates-archive = { workspace = true }
+# The signed-merge test signs with a software Ed25519 key as `ssh-keygen -Y sign` signs (A-321), through the one
+# cryptographic library slates builds on (A-66), which the server links already.
+aws-lc-rs = { workspace = true }
+# The fleet manifest's planning test mints its nodes' certificates as the server's deployment tests do (contract 39).
+rcgen = { workspace = true }
+
+# The vhost-user test plays the VMM over the device's end the library hands (§4.6, G-vhost): the daemon's own test
+# front end and guest driver (`crates/server/tests/common/`), which speak through the device's protocol types. Linux
+# alone serves the form; the server links the crate already.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+slates-bridge-virtiofs = { workspace = true }
+
+# Instance start by use: the test binary is an embedding host whose own `main` serves the roles when its arguments
+# begin with its prefix, as kiln's does, so it runs without libtest's harness (A-278).
+[[test]]
+name = "start"
+path = "tests/start.rs"
+harness = false
+
+[lints]
+workspace = true

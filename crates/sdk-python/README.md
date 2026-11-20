@@ -49,8 +49,10 @@ client = await slates.AsyncClient.connect("default", 5_000_000, 10_000_000)
 volumes = await client.list()
 ```
 
-Every async call ends: answered, refused typed, `Stalled` at its reply deadline, `DaemonGone` when the
-daemon is gone and no restart answers within the reconnect budget, or `CompletionLost` when the
+A call waits while its daemon lives, however long a busy machine keeps the daemon off its CPU: a daemon
+that will never answer is ended (by its anchor, or by its own watchdog when it runs alone), and its calls
+are then resent to the restarted daemon. Every async call ends: answered, refused typed, `DaemonGone` when
+the daemon is gone and no restart answers within the reconnect budget, or `CompletionLost` when the
 completion reader fails; a call cancelled by its task is released. Calls past the client's bound (its
 `outstanding_limit()` in flight, as many again queued) raise `TooManyOutstanding` at once. **On Windows** the completion channel is a socket
 (D-10), and `add_reader` on a socket needs a `SelectorEventLoop` — the default `ProactorEventLoop`
@@ -108,6 +110,38 @@ else:
 print(client.versions(green))              # the green's head version
 print(client.changed_since(green, 0))      # paths changed since a version
 ```
+
+## A volume at a path for one command (`slates exec`, Linux)
+
+`slates.exec_command` builds the command that runs slates' chosen-path launcher: the volume shown at an existing
+directory for one command, in a namespace of its own. Spawn it as any command; the launcher finds the volume under
+`SLATES_ROOT` in the environment you give it (the daemon's root mount):
+
+```python
+import asyncio, os, subprocess
+import slates
+
+argv = slates.exec_command("scratch", "/home/u/proj/build", ["cargo", "build"])
+# ["slates", "exec", "--volume=scratch", "--at=/home/u/proj/build", "--", "cargo", "build"]
+subprocess.run(argv, env={**os.environ, "SLATES_ROOT": "/run/user/1000/slates"}, check=True)
+# or, on a running loop: await asyncio.create_subprocess_exec(*argv, env=...)
+```
+
+`program=` names the `slates` binary when it is not the one on the `PATH`.
+
+**AppArmor (Ubuntu 24.04 and later).** Where AppArmor restricts unprivileged user namespaces
+(`kernel.apparmor_restrict_unprivileged_userns=1`), the launcher needs slates' AppArmor profile for the binary, which an
+administrator loads once, as root, and you opt into it per command with `apparmor_profile=True` (off unless set):
+
+```python
+print(slates.apparmor_profile("/usr/local/bin/slates"))   # the profile: save it as /etc/apparmor.d/usr.local.bin.slates
+argv = slates.exec_command("scratch", "/home/u/proj/build", ["cargo", "build"],
+                           apparmor_profile=True, program="/usr/local/bin/slates")
+```
+
+With the option, the launcher makes its namespace under the profile and runs the command outside it. Without it, the
+launcher never uses the profile, even where it is loaded. `slates apparmor check` on the host says which applies and
+prints the root commands that load or remove the profile (`docs/cli.md`, "The launcher and AppArmor").
 
 ## No grants (R10)
 

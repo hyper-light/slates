@@ -197,7 +197,7 @@ fn journal_of(files: usize) -> (Vec<u8>, Vec<u8>, usize) {
                 record: VolumeRecord::Delta { delta },
               }],
               Vec::new(),
-              None,
+              (Vec::new(), Vec::new()),
               None,
             ),
             &mut scratch,

@@ -8,6 +8,9 @@
 //! - `slates daemon` is the daemon: it attaches the segment from its environment (or, run
 //!   alone, measures and creates one), reads the published profile, derives its
 //!   configuration and serves; it leaves when its anchor does.
+//!
+//!   Both roles are the library's (`slates_api::role`, A-278), which an embedding host serves from
+//!   its own executable too; this binary serves them with no prefix.
 //! - Every other verb is a client: the rendezvous, one request, one reply, printed in a
 //!   stable plain form (one `key: value` per line, or one record per line), with the refusal
 //!   taxonomy mapped to exit codes.
@@ -25,21 +28,15 @@
 
 use std::process::ExitCode;
 
-mod anchor;
+mod apparmor;
 mod args;
-mod daemon;
-mod dumps;
-#[cfg(target_os = "linux")]
-mod exec;
-mod fleet;
 mod format;
-mod mount;
-// The handshake asks a container engine's CLI over a poll loop (`rustix`) and judges the answer with
-// `slates-bridge-oci`; both are `cfg(unix)` dependencies, so the module is too.
+// The handshake is the library's (`slates_api::container_engine`, A-520), which asks an engine only on Unix, where
+// its poll loop runs; this module prints its answer there, and Windows keeps its refusal (`run_oci_runtime`).
 #[cfg(unix)]
 mod oci_runtime;
-mod parent;
-mod recovery_key;
+// The self-pipe `slates pmem` reads its signals from, Linux's alone.
+#[cfg(target_os = "linux")]
 mod signal;
 mod verbs;
 
@@ -51,16 +48,17 @@ const EXIT_REFUSED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 /// Format: the exit code when no daemon answers at the instance.
 const EXIT_UNAVAILABLE: u8 = 3;
-/// Format: the exit code when the anchor or the daemon itself failed.
-const EXIT_FAILED: u8 = 4;
+/// Format: the exit code when the anchor or the daemon itself failed; a daemon its own watchdog ends exits with it too
+/// (A-232), so it is the server's one constant.
+const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
 
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
-  // The daemon's WinFsp purge client, a role only a daemon starts (no daemon thread opens its own volume, §4.6).
+  // The daemon's WinFsp purge client, a role only a daemon starts (no daemon thread opens its own volume, §4.6), served
+  // by the library's role entry as a host's executable serves it.
   #[cfg(windows)]
   if arguments.first().map(String::as_str) == Some(slates_bridge_winfsp::purge_client::ROLE_ARG) {
-    let code = slates_bridge_winfsp::purge_client::serve_from_env();
-    return ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX));
+    return slates_api::role::main(&[], &arguments);
   }
   let command = match args::parse(&arguments) {
     Ok(command) => command,
@@ -81,11 +79,16 @@ fn main() -> ExitCode {
     Command::Shards(request) => request.json,
     Command::VhostUser(request) => request.json,
     Command::Pmem(request) => request.json,
+    Command::AppArmor(args::AppArmorRequest::Check { json }) => *json,
     _ => false,
   };
   let outcome = match command {
-    Command::Anchor(options) => anchor::run(&options),
-    Command::Daemon(options) => daemon::run(&options),
+    Command::Anchor(options) => {
+      slates_api::role::serve(&[], &slates_api::role::Role::Anchor(options)).map_err(Failure::from)
+    }
+    Command::Daemon(options) => {
+      slates_api::role::serve(&[], &slates_api::role::Role::Daemon(options)).map_err(Failure::from)
+    }
     Command::Profile(options) => verbs::profile(&options),
     Command::Version => {
       slates_machine::out_line!("slates {}", env!("CARGO_PKG_VERSION"));
@@ -93,7 +96,11 @@ fn main() -> ExitCode {
     }
     Command::Mcp(options) => verbs::mcp(&options),
     Command::Client(request) => verbs::run(&request),
-    Command::Exec(request) => run_exec(&request),
+    Command::Exec(spec) => run_exec(&spec),
+    Command::AppArmor(args::AppArmorRequest::Profile { executable }) => {
+      apparmor::profile(executable.as_deref())
+    }
+    Command::AppArmor(args::AppArmorRequest::Check { json }) => apparmor::check(json),
     Command::Run(request) => verbs::run_consumer(&request),
     Command::Shards(request) => verbs::run_shards(&request),
     Command::VhostUser(request) => verbs::run_vhost_user(&request),
@@ -140,6 +147,7 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
     Failure::Refused(_) => (EXIT_REFUSED, "refused"),
     Failure::Unavailable { .. } => (EXIT_UNAVAILABLE, "unavailable"),
     Failure::Failed(_) | Failure::ChildExited { .. } => (EXIT_FAILED, "failed"),
+    Failure::NeverServed => (slates_api::role::EXIT_NEVER_SERVED, "never_served"),
   };
   if json {
     let message = match failure {
@@ -148,6 +156,7 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
         format!("no daemon at instance {instance}: {cause}")
       }
       Failure::ChildExited { code } => format!("the command exited with code {code}"),
+      Failure::NeverServed => slates_api::role::Failure::NeverServed.to_string(),
     };
     slates_machine::log_line!(
       "{}",
@@ -165,24 +174,22 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
       Failure::ChildExited { code } => {
         slates_machine::log_line!("slates: the command exited with code {code}")
       }
+      Failure::NeverServed => {
+        slates_machine::log_line!("slates anchor: {}", slates_api::role::Failure::NeverServed)
+      }
     }
   }
   ExitCode::from(code)
 }
 
-/// Runs the launcher on Linux; elsewhere the namespaces it needs do not exist.
-#[cfg(target_os = "linux")]
-fn run_exec(request: &args::ExecRequest) -> Result<(), Failure> {
-  exec::run(request)
-}
-
-/// The launcher is Linux-only (user and mount namespaces); other platforms refuse it.
-#[cfg(not(target_os = "linux"))]
-fn run_exec(_request: &args::ExecRequest) -> Result<(), Failure> {
-  Err(Failure::Failed(
-    "slates exec needs Linux user and mount namespaces; it is not available on this platform"
-      .to_owned(),
-  ))
+/// Runs the launcher, the library's (`slates_api::exec`, A-370), which an embedding host's executable serves too. On
+/// Linux it never returns on success: it becomes the command. Every refusal is a failure (exit 4) printing its sentence;
+/// off Linux it is refused there, since the namespaces it needs do not exist.
+fn run_exec(spec: &slates_client::exec::ExecSpec) -> Result<(), Failure> {
+  match slates_api::exec::run(spec) {
+    Ok(never) => match never {},
+    Err(fault) => Err(Failure::Failed(fault.to_string())),
+  }
 }
 
 /// Runs the consuming runtime's handshake on Unix, where the engine's CLI can be polled and judged.
@@ -191,9 +198,9 @@ fn run_oci_runtime(runtime: &str) -> Result<(), Failure> {
   oci_runtime::oci_runtime(runtime)
 }
 
-/// The handshake is Unix-only: it polls the engine's CLI through `rustix` and judges the answer with
-/// `slates-bridge-oci`, both `cfg(unix)` dependencies. Windows refuses it rather than pretending to check,
-/// because a bind source this verb has not judged is exactly what it exists to catch.
+/// The handshake is Unix-only: the library polls the engine's CLI there alone (`slates_api::container_engine`, A-520,
+/// which answers `EngineFault::Unsupported` elsewhere). Windows refuses it rather than pretending to check, because a
+/// bind source this verb has not judged is exactly what it exists to catch.
 #[cfg(not(unix))]
 fn run_oci_runtime(_runtime: &str) -> Result<(), Failure> {
   Err(Failure::Failed(
@@ -201,6 +208,17 @@ fn run_oci_runtime(_runtime: &str) -> Result<(), Failure> {
      it is not available here"
       .to_owned(),
   ))
+}
+
+/// A role's failure as the command's: the same sentence, and the same exit code (1 refused, 4 failed, 5 never served).
+impl From<slates_api::role::Failure> for Failure {
+  fn from(failure: slates_api::role::Failure) -> Failure {
+    match failure {
+      slates_api::role::Failure::Refused(text) => Failure::Refused(text),
+      slates_api::role::Failure::Failed(text) => Failure::Failed(text),
+      slates_api::role::Failure::NeverServed => Failure::NeverServed,
+    }
+  }
 }
 
 /// How a command ends other than well; each maps to one exit code.
@@ -223,4 +241,7 @@ pub(crate) enum Failure {
     /// The workload's exit code.
     code: i32,
   },
+  /// The anchor, whose starter asked it to (`slates_api::StartSpec::until_served`), stopped: its daemons crash-looped
+  /// and none of them ever served (A-366); exits `slates_api::role::EXIT_NEVER_SERVED`, as the role does in a host.
+  NeverServed,
 }

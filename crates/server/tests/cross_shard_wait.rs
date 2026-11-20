@@ -223,8 +223,24 @@ fn a_bootstrap_whose_control_shard_is_starved_is_acknowledged_past_a_wall_window
 /// the wedge ends: a shard that makes no progress for a window is not waited for.
 #[test]
 fn a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window() {
+  common::supervised::run(
+    "a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role",
+    "xwait-boot-wedged",
+    2,
+  );
+}
+
+/// The role [`a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window`] runs as a supervised daemon's process: its shard stays wedged past a window while the
+/// daemon answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window as a supervised child"]
+fn a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role() {
   static BEGUN: AtomicBool = AtomicBool::new(false);
-  let (daemon, instance) = daemon("boot-wedged");
+  let Some((daemon, instance)) = common::supervised::daemon(
+    "a_bootstrap_whose_control_shard_is_wedged_is_refused_after_a_window_role",
+  ) else {
+    return;
+  };
   let (control, other) = (daemon.shards()[0], daemon.shards()[1]);
   let (mut client, _others) = client_on(&daemon, &instance, other);
   let member = daemon.member_identity().unwrap().0;
@@ -329,8 +345,24 @@ fn a_revoke_with_a_starved_shard_is_revoked_past_a_wall_window() {
 /// throughout (wedged). Expect: refused `NotFound` after a window and before the wedge ends.
 #[test]
 fn a_revoke_with_a_wedged_shard_is_refused_after_a_window() {
+  common::supervised::run(
+    "a_revoke_with_a_wedged_shard_is_refused_after_a_window_role",
+    "xwait-revoke-wedged",
+    2,
+  );
+}
+
+/// The role [`a_revoke_with_a_wedged_shard_is_refused_after_a_window`] runs as a supervised daemon's process: its shard stays wedged past a window while the
+/// daemon answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_revoke_with_a_wedged_shard_is_refused_after_a_window as a supervised child"]
+fn a_revoke_with_a_wedged_shard_is_refused_after_a_window_role() {
   static BEGUN: AtomicBool = AtomicBool::new(false);
-  let (daemon, instance) = daemon("revoke-wedged");
+  let Some((daemon, instance)) =
+    common::supervised::daemon("a_revoke_with_a_wedged_shard_is_refused_after_a_window_role")
+  else {
+    return;
+  };
   let mut client = connect(&instance);
   let (consumer, _, secret) = enrolled(&daemon, &mut client, ACCOUNT);
   let wedged = other_than(&daemon, serving(&daemon, client.client_id()));
@@ -493,15 +525,18 @@ const RPC_SUCCESS: u32 = 0;
 /// Shape: the listing's `dircount` and `maxcount`: a page, far more than one volume's entry needs.
 const LISTING_DIRCOUNT: u32 = 512;
 const LISTING_MAXCOUNT: u32 = 8192;
-/// Shape: the volumes created while looking for one the control shard owns; with two shards a run that finds none in
+/// Shape: the volumes created while looking for one the other shard owns; with two shards a run that finds none in
 /// this many is a fault of the placement, not luck.
 const VOLUME_TRIES: usize = 48;
 
-/// R3 class A, the NFS bridge (`nfs.rs` `gather_entries`, the host root's listing gathered from every shard), A-65,
-/// §4.3, §4.6. Do: create a volume the control shard owns, mount the host root scoped to its capability over NFSv3 (the
-/// connection stays on the control shard, where it was accepted), and list the root while the other shard runs one
-/// starved poll for a window and a half. Expect: the listing succeeds, naming the volume, after more than a wall
-/// window. On main the gather gave up on the starved shard at the wall second and the listing failed.
+/// R3 class A, the NFS bridge (`nfs.rs` `gather_entries`, the host root's listing gathered from the shard the
+/// capability's attachment names), A-65, §4.3, §4.6. Do: create a volume the other shard owns, so its attachment's
+/// partition is there, mount the host root scoped to its capability over NFSv3 (the connection stays on the control
+/// shard, where it was accepted), and list the root while the other shard runs one starved poll for a window and a
+/// half. Expect: the listing succeeds, naming the volume, after more than a wall window. Before class A the gather gave
+/// up on the starved shard at the wall second and the listing failed. The volume was the control shard's until the
+/// listing asked only the capability's shard (fs-server-13), after which it asked no other shard and answered in 44 ms
+/// (diag-b13-1), so the volume is now on the starved shard.
 #[test]
 fn a_host_root_listing_with_a_starved_shard_lists_past_a_wall_window() {
   static BEGUN: AtomicBool = AtomicBool::new(false);
@@ -512,9 +547,9 @@ fn a_host_root_listing_with_a_starved_shard_lists_past_a_wall_window() {
     .map(|attempt| format!("listed-{attempt}"))
     .find(|name| {
       let id = client.create(&common::client::scratch(name)).unwrap();
-      slates_server::verbs::owner_of(id) == 0
+      slates_server::verbs::owner_of(id) == 1
     })
-    .expect("a volume the control shard owns");
+    .expect("a volume the other shard owns");
   let path = daemon.mount_capability(&name).unwrap().unwrap();
   let (_, capability) = path.rsplit_once('@').expect("a capability path");
   let port = daemon.nfs_port().expect("the daemon is serving NFS");

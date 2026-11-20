@@ -44,6 +44,14 @@ const SEAL_KEY_BYTES: usize = 32;
 const FLEET_RECEIVE_SHARE_PERMILLE: u64 = 250;
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
+/// Derived: the NFS send ledgers an anchor may hold for a daemon at once (A-550, Linux): the one in force, and at a
+/// start the fresh one, held before the newest inherited one is let go (every older one is let go first,
+/// `crate::held_send::Handover`). None elsewhere, where no ledger is kept.
+#[cfg(target_os = "linux")]
+const LEDGER_COPIES: usize = 2;
+/// See the Linux arm.
+#[cfg(not(target_os = "linux"))]
+const LEDGER_COPIES: usize = 0;
 /// Shape: the archive walk's slice as a share of the shard's step budget, parts per thousand: half,
 /// so a seal in progress never takes the whole step from the clients (the share a cooperative destroy
 /// takes, `verbs::DESTROY_SLICE_PERMILLE`).
@@ -67,11 +75,13 @@ const MAPPINGS_PER_COPY: u64 = 3;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// Shape: tasks a client may need across shards at once: its request forwarded to the owner
 /// and the reply carried back (a synchronous client has one request in flight; an
-/// asynchronous one is bounded by its ring's credit, which the ring's slots cap).
-const TASKS_PER_CLIENT: usize = 2;
-/// Shape: the shard's own perpetual tasks: the server loop, the reap loop, the control loop
-/// and the heartbeat, plus a spare for a shutdown message.
-const LOOP_TASKS_PER_SHARD: usize = 5;
+/// asynchronous one is bounded by its ring's credit, which the ring's slots cap), and the watch
+/// on its hang-up for its whole seat (A-475, `crate::reap::watch`).
+const TASKS_PER_CLIENT: usize = 3;
+/// Shape: the shard's own perpetual tasks: the server loop, the idle sweep (A-715), the client reaper
+/// (A-475), the deadline keeper (A-522), the pressure sampler (A-570), the hint watcher (A-709),
+/// the control loop and the heartbeat, plus a spare for a shutdown message.
+const LOOP_TASKS_PER_SHARD: usize = 9;
 /// Shape: the fleet's perpetual tasks per peer on the control shard: the probe loop and the record
 /// link (`fleet::probe_peer`, `fleet::establish_record_link`).
 const FLEET_LOOPS_PER_PEER: usize = 2;
@@ -83,11 +93,118 @@ const FLEET_PLANES: usize = 2;
 /// `fleet::accept_records`), plus the one coordinator (`fleet::run_record_plane`, which also drives
 /// the configuration council and the root group in its period).
 const FLEET_LOOPS_PER_SHARD: usize = FLEET_PLANES * 2 + 1;
-/// Shape: the idle window as a multiple of the spin window (the measured wake cost): a shard
-/// keeps polling this long after its last work, so a client that pauses to think between
-/// requests finds it awake; ratified in GAPS §5 until the spin-to-park ratio is measured
-/// against the histogram's parked form.
-pub const IDLE_WINDOW_RATIO: u64 = 100;
+/// F, R9's provisioning floor (AC-2.1, T-2.6): a create's single-client p99 is held to fifty microseconds. The idle
+/// window is at least this long, so a closed-loop client that meets R9 (its next request within F of its last reply)
+/// finds its own shard still polling (A-223), and the other shards its loop goes round are held for its return
+/// ([`closed_loop_hold`], A-326, by a shard whose idle turns poll faster than it wakes, A-387). It is the requirement
+/// itself, not a measurement, so no load moves it; the boot probe's smallest wake, the other input weighed, was
+/// measured at up to 259-346 µs on a loaded boot (BENCHMARKS, the idle window's rule). `provision_bench` gates on the
+/// same constant.
+pub const PROVISION_FLOOR: Derived<u64> = derived!(
+  50_000,
+  "R9: a create's single-client p99 at most 50 µs",
+  ["R9", "AC-2.1"]
+);
+/// F in nanoseconds ([`PROVISION_FLOOR`]), for arithmetic and the bench's gate.
+pub const PROVISION_FLOOR_NS: u64 = PROVISION_FLOOR.get();
+/// The idle window's multiple of the shard's wake estimate, on every platform: none, so no estimate, which load
+/// lengthens, prices the window (A-223 (i), A-361). Linux and macOS took R9's floor alone on 2026-11-11, when two shards
+/// beside two spinners a logical CPU parked between a 1 ms-paced client's requests and their loaded single-client p99
+/// halved (8.0 to 4.0 ms on ubuntu-latest, 9.8 to 4.0 ms on ubuntu-24.04-arm, macOS even). Windows kept the hundred it
+/// had before A-223, since a shard parked there beside spinners waited 50-100 ms to run again; that wait was a wake
+/// without the priority boost Windows gives every other waiter (A-361, which raises a blocked wait a level), and the
+/// hundred, priced on an estimate that counted it, made idle windows of seconds: a daemon on CI's windows-latest beside
+/// two spinners a CPU spun past its watchdog's window after a WinFsp request and was killed for a lapsed beat in 3 of 3
+/// runs (g258's now-x86 lane, 2026-11-18).
+pub const NO_ESTIMATE_MULTIPLE: Derived<u64> = derived!(
+  0,
+  "none: the window is R9's floor alone on every platform",
+  ["A-223", "A-361"]
+);
+
+/// The longest one idle spin may run, nanoseconds, whatever its window, its estimate or a hold asks: the liveness budget
+/// less one beat. The watchdog judges a shard spinning once it has run its spin window of CPU with no step and no park
+/// (`crate::watchdog::spin_window_ns`, the shard's window held to the build and never below the budget, A-318, A-455),
+/// and an idle spin is neither: it follows a step that found nothing and ends in a step, a park or one idle slice of a
+/// step's quantum. A spin held under the budget by a beat can therefore never reach the verdict, on any platform and in
+/// any build: an idle shard polling for work is not a wedged one. The ceiling binds no rule in use, whose windows are
+/// R9's floor and a closed loop's hold of at most 2F × the cycles of 1,024 shards (471 ms, [`closed_loop_hold`]); it is
+/// what keeps a rule's mistake, or an estimate gone wild, from killing a live daemon, as the Windows multiple did
+/// (A-361).
+pub const IDLE_SPIN_CEILING: Derived<u64> = derived!(
+  crate::daemon::LIVENESS_BUDGET_NS.saturating_sub(crate::daemon::HEARTBEAT_NS),
+  "liveness budget − one beat: under the least spin window the watchdog judges by",
+  ["LIVENESS_BUDGET_NS", "HEARTBEAT_NS", "A-318", "A-361"]
+);
+/// The idle spin's ceiling in nanoseconds ([`IDLE_SPIN_CEILING`]).
+pub const IDLE_SPIN_CEILING_NS: u64 = IDLE_SPIN_CEILING.get();
+// By construction (A-361): an idle spin ends before the least CPU the watchdog judges spinning, the liveness budget (its
+// spin window is the budget held to the build, never below it), with a beat to spare for the empty step before it and the
+// idle slice after it.
+const _: () = assert!(
+  IDLE_SPIN_CEILING_NS > 0
+    && IDLE_SPIN_CEILING_NS < crate::daemon::LIVENESS_BUDGET_NS
+    && IDLE_SPIN_CEILING_NS + crate::daemon::HEARTBEAT_NS <= crate::daemon::LIVENESS_BUDGET_NS
+);
+
+/// Format: R9 holds a create's p99 (AC-2.1), so one request in this many may fall in the tail: the share of a closed
+/// loop's requests a held window may leave to find their shard parked ([`loop_revisit_cycles`]).
+pub const PROVISION_TAIL: u64 = 100;
+/// Format: the floors one cycle of a closed loop takes at most: its request, within F at R9's percentile, and its think
+/// time, within F by the loop's definition (its next request within F of its last reply; A-223's window rule).
+const CLOSED_LOOP_CYCLE_FLOORS: u64 = 2;
+/// The longest cycle of a closed loop that meets R9, nanoseconds: [`CLOSED_LOOP_CYCLE_FLOORS`] × F (A-326).
+pub const CLOSED_LOOP_CYCLE_NS: u64 = PROVISION_FLOOR_NS.saturating_mul(CLOSED_LOOP_CYCLE_FLOORS);
+/// Format: one whole, in the fixed point the revisit walk keeps its probability in ([`loop_revisit_cycles`]): 64
+/// fractional bits, so a step's product with the shard count (at most 16 bits) fits 128 bits.
+const REVISIT_ONE: u128 = 1 << 64;
+
+/// How many cycles a closed loop over `shards` shards may go without returning to one of them, at R9's percentile: the
+/// least `k` with `((S − 1) / S)^k ≤ 1 / PROVISION_TAIL` (A-326). A create goes to the partition its name hashes to
+/// and every later verb to its volume's owner (`verbs::owner_of_name`, `verbs::owner_of`), so a request of the loop
+/// lands on a given shard with probability `1/S`, the cycles until it does are geometric, and more than `k` of them
+/// pass with probability `((S − 1) / S)^k`. One shard is revisited every cycle. Integer arithmetic: the probability is
+/// kept in fixed point and rounded up at each step, so `k` is never short of the bound; the walk ends within
+/// `S × PROVISION_TAIL` steps, since `((S − 1) / S)^(S × 100) < e^−100`.
+pub fn loop_revisit_cycles(shards: u16) -> u64 {
+  let shards = u128::from(shards.max(1));
+  let stay = shards.saturating_sub(1);
+  let tail = REVISIT_ONE
+    .checked_div(u128::from(PROVISION_TAIL))
+    .unwrap_or(0);
+  let most = u64::try_from(shards)
+    .unwrap_or(u64::MAX)
+    .saturating_mul(PROVISION_TAIL);
+  let mut missed = REVISIT_ONE;
+  for cycles in 1..=most {
+    missed = missed.saturating_mul(stay).div_ceil(shards);
+    if missed <= tail {
+      return cycles;
+    }
+  }
+  most
+}
+
+/// The idle window a forward holds its shards open for when it is made for a client in R9's closed loop (§4.7; A-326):
+/// the loop's return at R9's percentile, `CLOSED_LOOP_CYCLE_FLOORS × F × loop_revisit_cycles(S)`. A loop that meets R9
+/// sends its next request within F of its last reply, which F covers on the client's own shard (A-223's window rule),
+/// but over `S` shards its next request for a given shard comes only after the loop has gone round the others, as many
+/// cycles of at most `2F` as [`loop_revisit_cycles`] allows at R9's percentile. Measured (step 6 of the A-223 plan,
+/// 2026-11-12): at R9's floor alone a quiet single client's p99 on ubuntu-24.04-arm's three shards was 116.4 µs against
+/// main's 27.1, its shards parking 144 to 331 times per 1,000 creates; at `F × S`, 36.8 µs and 3 to 7 parks; at
+/// `2F × S`, 29.5 µs. Its inputs are R9's floor and percentile and the shard count, so no load moves it. A forward
+/// holds no longer than its loop had run, and a paced client, whose next request comes later than F, starts no loop
+/// (`verbs::loop_hold`). Whether the owner keeps the hold is its own decision, by what it measures: it holds only while
+/// the idle turn a request would meet is shorter than its wake estimate (A-387, `slates_rt::held_turn::hold_pays`), so
+/// a macOS shard, whose zero-timeout `kevent` naps 12–15 µs a turn (A-218), parks instead.
+pub fn closed_loop_hold(shards: u16) -> Derived<u64> {
+  derived!(
+    CLOSED_LOOP_CYCLE_NS.saturating_mul(loop_revisit_cycles(shards)),
+    "2 × provision_floor_ns × the least k with ((shards − 1) / shards)^k ≤ 1 / PROVISION_TAIL",
+    ["provision_floor_ns", "shards", "PROVISION_TAIL (R9's p99)"]
+  )
+}
+
 /// The divisor between a shard's metadata class and one slab dimension's units. The class is split
 /// among the inode dimension (a version slot and a table slot per inode), the directory dimension
 /// (a node and a block per directory) and the volume records (journals and objects) — three parts
@@ -108,9 +225,6 @@ pub(crate) const fn bulk_chunk_bytes() -> u64 {
 /// Shape: the landing slots the segment holds: landings in flight per daemon, one per shard
 /// plus one for the control shard's presentation.
 const LANDING_SLOTS_PER_SHARD: u32 = 1;
-/// Shape: the audit ring: a page per shard; the audit rate is measured from the first landings
-/// (§4.15's derived table) and the ring re-sized at the next start.
-const AUDIT_PAGES_PER_SHARD: u64 = 1;
 
 /// The store's caps per shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,8 +400,9 @@ pub struct DaemonConfig {
   pub discard_from_bytes: usize,
   /// The rendezvous instance name.
   pub instance: String,
-  /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
-  pub failover_slo_ns: u64,
+  /// Derived: the idle window a forward holds its shards open for when it is made for a client in R9's closed loop
+  /// ([`closed_loop_hold`], §4.7; A-326); the owner keeps it only while its idle turns poll faster than it wakes (A-387).
+  pub closed_loop_hold_ns: u64,
   /// The operator's stated per-node **re-replication bandwidth** in bytes/second, the anchor `B` of the
   /// scatter-width derivation (§4.8 "Placement", D-14): how fast this node restores a lost host's copies.
   /// `0` — the default — leaves the scatter width at the candidate floor (one copyset); a deployment states
@@ -361,13 +476,135 @@ pub struct DaemonConfig {
   /// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter, so a reply may hand one
   /// out with no barrier of its own while a successor still starts past it ([`inode_reserve`]).
   pub inode_reserve: u64,
+  /// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3), when the operator starts one:
+  /// none from [`DaemonConfig::derive`].
+  pub vcs_http: Option<VcsHttpConfig>,
+  /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684), when the operator starts one: none from
+  /// [`DaemonConfig::derive`].
+  pub vcs_ssh: Option<VcsSshConfig>,
+  /// Where the svn:// listener listens, when the operator starts one (`--vcs-svn ADDRESS`; §4.17.4 piece 7, A-656 part
+  /// 2): A-656's connection on every connection it accepts, on a loopback address alone for a daemon that is no fleet
+  /// node, since ra_svn is cleartext; none from [`DaemonConfig::derive`].
+  pub vcs_svn: Option<slates_rt::tcp::SocketAddrV4>,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
 
-/// Shape: the operator's failover SLO (Gray & Cheriton: seconds): ten seconds until the
-/// operator gives `slates anchor` a value.
-pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
+/// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3): where it listens and the identity
+/// its HTTPS presents. Its connections, seats and request room are derived from each shard's budget, never configured
+/// (`crate::vcs_http::Bounds::of_shard`).
+#[derive(Clone, Debug)]
+pub struct VcsHttpConfig {
+  /// Where the edge listens. Without an identity it serves cleartext, which it does only on a loopback address (RFC 7617
+  /// §4, RFC 6750 §5.3).
+  pub address: slates_rt::tcp::SocketAddrV4,
+  /// The certificate chain and key its HTTPS presents: the node's own, the identity its RPC-with-TLS export presents
+  /// (§4.6, AUD-29-75), handed in by the command that read the operator's files (R1: the daemon reads none).
+  pub identity: Option<EdgeIdentity>,
+}
+
+/// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684): where it listens and whose key it presents.
+/// Its connections, seats and channel window are derived from the shard's budget, as the HTTP edge's are, never
+/// configured (`crate::vcs_http::Bounds::of_shard`).
+#[derive(Clone, Debug)]
+pub struct VcsSshConfig {
+  /// Where the edge listens: any address, since SSH encrypts every connection and proves the server by its host key.
+  pub address: slates_rt::tcp::SocketAddrV4,
+  /// A fleet node's own identity, whose key the edge presents as its host key when it is Ed25519
+  /// (`EdgeIdentity::ed25519_seed`); none for any other daemon, which serves with the key its anchor made at its start
+  /// and keeps in the segment (`slates_anchor::layout::SUP_SSH_HOST_SEED`), or, run alone, one it makes itself.
+  pub identity: Option<EdgeIdentity>,
+}
+
+/// An HTTPS identity as the operator's command hands it in: the certificate chain, leaf first, and the leaf's private
+/// key, each DER. Its `Debug` never shows the key.
+#[derive(Clone)]
+pub struct EdgeIdentity {
+  /// The chain, leaf first.
+  chain: Vec<Vec<u8>>,
+  /// The leaf's private key (PKCS#8, PKCS#1 or SEC1).
+  key: Vec<u8>,
+}
+
+impl EdgeIdentity {
+  /// The identity presenting `chain`, leaf first, with the leaf's private key `key`, each DER.
+  pub fn new(chain: Vec<Vec<u8>>, key: Vec<u8>) -> EdgeIdentity {
+    EdgeIdentity { chain, key }
+  }
+
+  /// The edge's serving identity, refused when the key is no key rustls reads or the chain and key make no server
+  /// configuration.
+  pub(crate) fn serving(
+    &self,
+  ) -> Result<slates_http_edge::tls::ServingIdentity, slates_http_edge::tls::TlsRefused> {
+    let chain = self
+      .chain
+      .iter()
+      .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
+      .collect();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(self.key.clone()).map_err(|reason| {
+      slates_http_edge::tls::TlsRefused::Setup(rustls::Error::General(reason.to_owned()))
+    })?;
+    slates_http_edge::tls::ServingIdentity::new(chain, key)
+  }
+
+  /// The key's seed as the SSH edge's host key takes it (A-684): the key's own 32 bytes (RFC 8032 §5.1.5) when it is an
+  /// Ed25519 key, which RFC 8410 §7 writes as a PKCS#8 document, read by AWS-LC; none for a key of any other algorithm,
+  /// which no `ssh-ed25519` host key can be (RFC 8709), the one host key algorithm the edge presents.
+  pub(crate) fn ed25519_seed(&self) -> Option<[u8; slates_ssh::hostkey::ED25519_SEED_LEN]> {
+    use aws_lc_rs::encoding::AsBigEndian;
+    let pair = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&self.key).ok()?;
+    // AWS-LC's buffer wipes its bytes when dropped.
+    let seed = pair.seed().ok()?.as_be_bytes().ok()?;
+    let bytes: &[u8] = seed.as_ref();
+    <[u8; slates_ssh::hostkey::ED25519_SEED_LEN]>::try_from(bytes).ok()
+  }
+}
+
+impl std::fmt::Debug for EdgeIdentity {
+  /// The chain's length, never the key.
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("EdgeIdentity")
+      .field("certificates", &self.chain.len())
+      .finish_non_exhaustive()
+  }
+}
+
+/// The liveness window on this machine ([`liveness_window`]): the derived window and the floor the machine measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LivenessWindow {
+  /// The derived window `W` (`crate::daemon::LIVENESS_BUDGET_NS`).
+  pub window_ns: u64,
+  /// The machine's floor, measured at boot: the wake probe's p99, how long a parked thread waits to run again once
+  /// woken (`slates_machine::wake::WakeLatency::p99_ns`).
+  pub floor_ns: u64,
+  /// The window this machine needs: the longer of the two.
+  pub needed_ns: u64,
+  /// Whether the floor passes the window: a live shard can then be kept off its CPU longer than a window, so on this
+  /// machine the daemon cannot meet its window, and its boot log says so.
+  pub floor_past_window: bool,
+}
+
+/// Derived: the liveness window this daemon runs on and the floor its machine measured at boot (A-359): `W` is the
+/// recovery budget `T` (`crate::daemon::LIVENESS_BUDGET_NS`, rent or buy); its floor is `floor_ns`, the wake probe's
+/// p99. Where the floor passes the window the daemon cannot meet its window on this machine: the window it needs is
+/// the floor, and the boot log names both (`DaemonConfig::derivations`). A-228 already judges a shard starved, not
+/// stuck, while it is kept off its CPU, so the window's verdicts stay safe there; what the floor bounds is how soon.
+pub fn liveness_window(floor_ns: u64) -> Derived<LivenessWindow> {
+  let window_ns = crate::daemon::LIVENESS_BUDGET_NS;
+  derived!(
+    LivenessWindow {
+      window_ns,
+      floor_ns,
+      needed_ns: window_ns.max(floor_ns),
+      floor_past_window: floor_ns > window_ns,
+    },
+    "W = T, the recovery budget (rent or buy: a verdict waits as long as the recovery it starts costs); floor = the \
+     wake probe's p99; past W the daemon cannot meet its window on this machine and needs the floor",
+    ["RECOVERY_BUDGET_NS", "wake.p99_ns"]
+  )
+}
 
 /// Where each part of a shard's slice of the content object lies, relative to the slice's start, as
 /// `(start, end)` or `(start, len)` ranges ([`DaemonConfig::shard_content_layout`]).
@@ -381,9 +618,18 @@ pub struct ShardContentLayout {
   pub images: (usize, usize),
   /// The delta log, `(start, end)` (A-68): what each barrier appends over the committed checkpoint.
   pub delta_log: (usize, usize),
+  /// The DAX range table, `(start, end)` (A-365): each range a Shards stream's held DAX backing has answered, so a
+  /// successor knows what of each object to ingest and never refills.
+  pub dax_ranges: (usize, usize),
   /// The arena range, `(start, len)`, its start on the mapping granule (A-64).
   pub arena: (usize, usize),
 }
+
+/// Format: one slot of a shard's DAX range table (A-365): the attachment, the inode, the range's index and its flags, a
+/// little-endian `u64` each.
+pub(crate) const DAX_RANGE_SLOT_BYTES: usize = 4 * size_of::<u64>();
+/// Format: the DAX range table's header: its layout word and its slot count, a little-endian `u64` each.
+pub(crate) const DAX_RANGE_HEADER_BYTES: usize = 2 * size_of::<u64>();
 
 /// Format: the smallest base page of any supported target (x86-64's 4 KiB; aarch64 hosts run 4, 16 or 64 KiB): the
 /// block every host's file cache and every transport (NFS, FUSE, virtio-fs, WinFsp) moves file bytes in.
@@ -429,11 +675,12 @@ impl DaemonConfig {
   }
 
   /// Derived: where each part of one shard's slice of the anchor's content object lies, relative to the slice's
-  /// start. In order: the FUSE write log (A-63); the two reserve-sized image slots, the committed recovery image
-  /// and the one being written (§4.8); and the shard's arena range, its chunk arena's one region (A-64), the
-  /// reserve's length, starting on the mapping granule so it can be mapped on its own. The slice's length is a
-  /// granule multiple too, so every shard's arena starts on one. The slots are sized as before the arena moved
-  /// in: an image now carries metadata, not content, and only the pages it reaches are backed.
+  /// start. In order: the write log (A-63); the two reserve-sized image slots, the committed recovery image
+  /// and the one being written (§4.8); the delta log (A-68); the DAX range table (A-365); and the shard's arena range,
+  /// its chunk arena's one region (A-64), the reserve's length, starting on the mapping granule so it can be mapped on
+  /// its own. The slice's length is a granule multiple too, so every shard's arena starts on one. The slots are sized
+  /// as before the arena moved in: an image now carries metadata, not content, and only the pages it reaches are
+  /// backed.
   pub fn shard_content_layout(&self) -> ShardContentLayout {
     /// Format: the double buffer's slots: the committed image and the one being written.
     const PUBLISH_SLOTS: usize = 2;
@@ -450,7 +697,9 @@ impl DaemonConfig {
     // deltas since the last checkpoint reach that checkpoint's size, which a slot bounds, so a log of one slot's
     // size is never what forces a checkpoint early. Lazily backed: only the pages a delta reaches cost RAM.
     let delta_end = images_end.saturating_add(reserve);
-    let arena_start = delta_end
+    // The DAX range table (A-365): its header and a slot for each range the fill budget can count. Lazily backed.
+    let dax_ranges_end = delta_end.saturating_add(self.dax_range_table_bytes());
+    let arena_start = dax_ranges_end
       .checked_next_multiple_of(granule)
       .unwrap_or(usize::MAX);
     let stride = arena_start
@@ -462,6 +711,7 @@ impl DaemonConfig {
       write_log: (0, log),
       images: (log, images_end),
       delta_log: (images_end, delta_end),
+      dax_ranges: (delta_end, dax_ranges_end),
       arena: (arena_start, reserve),
     }
   }
@@ -492,10 +742,37 @@ impl DaemonConfig {
     usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
   }
 
-  /// Derived: the writable direct maps' copies an anchor may hold for this daemon across a restart (A-197): every copy
-  /// its shards may hold at once, `shards × direct_maps_per_shard`, of which the writable ones are some.
+  /// Derived: the copies an anchor may hold for this daemon across a restart: every writable direct map's copy its shards
+  /// may hold at once (A-197), `shards × direct_maps_per_shard`, of which the writable ones are some; every Shards
+  /// stream's DAX object ([`DaemonConfig::held_dax_bound`]); and the NFS send ledgers ([`LEDGER_COPIES`]).
   pub fn held_copy_bound(&self) -> usize {
-    usize::from(self.runtime.shards).saturating_mul(self.direct_maps_per_shard)
+    usize::from(self.runtime.shards)
+      .saturating_mul(self.direct_maps_per_shard)
+      .saturating_add(self.held_dax_bound())
+      .saturating_add(LEDGER_COPIES)
+  }
+
+  /// Derived: the Shards streams' DAX objects an anchor may hold for this daemon across a restart (A-365; Windows' DAX
+  /// sections, A-448): `shards × dax_range_slots`, since each backing counts at least one range against its shard's fill
+  /// budget, so no shard ever has more backings than slots.
+  pub fn held_dax_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(self.dax_range_slots())
+  }
+
+  /// Derived (A-365): the slots of each shard's DAX range table, one for each range its fill budget can count: the
+  /// shard's reserve over a range, since every range a backing has filled counts a range against the budget (the
+  /// identity layout's rule, `slates_bridge_core::dax_backing::filled_charge`), so the ranges filled never outnumber the
+  /// slots.
+  pub fn dax_range_slots(&self) -> usize {
+    usize::try_from(self.reserve_per_shard / slates_mem::DAX_RANGE_BYTES).unwrap_or(usize::MAX)
+  }
+
+  /// Derived (A-365): each shard's DAX range table's bytes: its header and [`DaemonConfig::dax_range_slots`] slots.
+  pub fn dax_range_table_bytes(&self) -> usize {
+    self
+      .dax_range_slots()
+      .saturating_mul(DAX_RANGE_SLOT_BYTES)
+      .saturating_add(DAX_RANGE_HEADER_BYTES)
   }
 
   /// The configuration from a profile, for `instance`. An explicit shard count is selected
@@ -503,6 +780,10 @@ impl DaemonConfig {
   /// Explicit counts are unpinned, as several daemons may share those cores in a test or VM.
   pub fn derive(profile: &MachineProfile, instance: &str, shards: Option<u16>) -> DaemonConfig {
     let mut derivations = Vec::new();
+    derivations.push(note(
+      "liveness_budget_ns",
+      &liveness_window(profile.wake.p99_ns),
+    ));
     let d = profile.derived();
     let admission = admission_limit(ASSUMED_REQUESTS_PER_SECOND, ASSUMED_SERVICE_P99_NS);
     derivations.push(note("requests_in_flight_per_shard", &admission));
@@ -573,6 +854,24 @@ impl DaemonConfig {
       ["table_bytes"]
     );
     derivations.push(note("volumes_per_shard", &volumes));
+    // The audit's window (§4.15's derived table; A-265): what the partition's table bytes hold of its records, the
+    // memory ceiling that bounds it whatever the landing rate. The design's `landing rate × operator audit horizon ×
+    // record size` may lower it once a landing rate is measured; none is yet, so the horizon is not applied.
+    let audit_record_bytes =
+      u64::try_from(size_of::<slates_db::catalog::AuditRecord>()).unwrap_or(1);
+    let audit_records: Derived<usize> = derived!(
+      usize::try_from(
+        tables
+          .get()
+          .checked_div(audit_record_bytes.max(1))
+          .unwrap_or(0)
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
+      "table_bytes / size_of::<AuditRecord>()",
+      ["table_bytes"]
+    );
+    derivations.push(note("audit_records_per_shard", &audit_records));
     // §4.7 "Derived constants": a client ring holds what one client may have in flight — Little's law
     // on the request rate × p99 service time (`requests_in_flight_per_shard`, the admission value that
     // sizes one client's in-flight work) — rounded up to a power of two. Until 2026-09-22 it was the
@@ -691,9 +990,6 @@ impl DaemonConfig {
         .max(page),
       log_bytes: log_bytes.get(),
       snapshot_bytes: snapshot_bytes.get(),
-      audit_bytes: AUDIT_PAGES_PER_SHARD
-        .saturating_mul(page)
-        .saturating_mul(shards),
       landing_slots: LANDING_SLOTS_PER_SHARD
         .saturating_mul(runtime.shards.max(1).into())
         .saturating_add(1),
@@ -712,6 +1008,7 @@ impl DaemonConfig {
       // bytes the records draw from, so a green's persisted chain is bounded by measured memory, not
       // a magic count. Checkpointing to fold old chain entries (the design's optimization) is owed.
       green_chain_bytes: usize::try_from(tables.get()).unwrap_or(usize::MAX),
+      audit_records: audit_records.get(),
     };
     // The store's tables (§4.2 metadata dimension): each slab's bound is the metadata class — the
     // shard's second memory class, one reserve — over the true slot cost of the dimension's unit
@@ -855,20 +1152,28 @@ impl DaemonConfig {
     // The shard polls for the idle window after its last work before parking (§4.7 "Shards
     // poll rings while any client has activity within the measured idle window"), so a
     // request from an active client, or a forward from another shard, never pays a wake.
+    derivations.push(note("provision_floor_ns", &PROVISION_FLOOR));
+    derivations.push(note("idle_estimate_multiple", &NO_ESTIMATE_MULTIPLE));
     let idle_window: Derived<u64> = derived!(
-      d.spin_before_park_ns
-        .get()
-        .saturating_mul(IDLE_WINDOW_RATIO),
-      "spin_before_park_ns × IDLE_WINDOW_RATIO",
-      ["wake.mean_ns", "IDLE_WINDOW_RATIO"]
+      PROVISION_FLOOR_NS,
+      "provision_floor_ns: R9's floor alone, which no wake estimate moves on any platform",
+      ["provision_floor_ns", "idle_estimate_multiple"]
     );
     derivations.push(note("idle_window_ns", &idle_window));
+    derivations.push(note("idle_spin_ceiling_ns", &IDLE_SPIN_CEILING));
     runtime.spin_ns = idle_window.get();
-    // A shard's spin follows its online wake estimate at the same multiple (§4.3); `spin_ns` is the boot
-    // value, kept by a runtime that tracks no estimate.
+    // A shard that tracks its wake keeps the same window (§4.3): no multiple of the estimate, R9's floor, and every spin
+    // under the watchdog's window whatever a hold asks. `spin_ns` is the window of a runtime that tracks no estimate.
     if let Some(tracking) = runtime.wake_tracking.as_mut() {
-      tracking.idle_ratio = IDLE_WINDOW_RATIO;
+      tracking.idle_ratio = NO_ESTIMATE_MULTIPLE.get();
+      tracking.idle_floor_ns = PROVISION_FLOOR_NS;
+      tracking.idle_ceiling_ns = IDLE_SPIN_CEILING_NS;
     }
+    // A client in R9's closed loop finds the shards it goes round still polling: a forward made for it holds them for
+    // the loop's revisit at R9's percentile (§4.7; A-326), each owner keeping the hold only while its idle turns poll
+    // faster than it wakes (A-387).
+    let loop_hold = closed_loop_hold(runtime.shards);
+    derivations.push(note("closed_loop_hold_ns", &loop_hold));
     #[cfg(unix)]
     let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
     let inode_reserve = inode_reserve(&mut derivations);
@@ -897,7 +1202,7 @@ impl DaemonConfig {
       page: usize::try_from(page).unwrap_or(1).max(1),
       discard_from_bytes: usize::try_from(d.discard_from_bytes.get()).unwrap_or(usize::MAX),
       instance: instance.to_owned(),
-      failover_slo_ns: FAILOVER_SLO_NS,
+      closed_loop_hold_ns: loop_hold.get(),
       // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,
@@ -920,6 +1225,9 @@ impl DaemonConfig {
       guest_credits,
       nfs_v4,
       inode_reserve,
+      vcs_http: None,
+      vcs_ssh: None,
+      vcs_svn: None,
       derivations,
     }
     .with_control_shard_noted()
@@ -964,14 +1272,48 @@ impl DaemonConfig {
     )
   }
 
-  /// This configuration with its control shard's capacity in the boot log, in place of any earlier line for it (the
-  /// capacity follows `runtime`'s, which [`Self::with_fleet`] raises).
+  /// Derived: the most messages one shard keeps at once for other shards whose control channels are full
+  /// (`crate::xshard::carrier`, §4.3). Each kept message is a reply or a result another shard waits for: every request
+  /// this node's clients may hold in flight owes one reply, and every acknowledgement part one result
+  /// (`2 × forward_lane_bound`); every other message a shard carries (a call's result, a connection's end) is awaited
+  /// or sent by a task, at most the daemon's task arenas. The requests in flight never reach it; past it a message is
+  /// refused to its sender, which counts the loss (`xshard.keep_refused`).
+  pub fn kept_bound(&self) -> Derived<usize> {
+    let in_flight = forward_lane_bound(
+      self.clients_per_shard,
+      self.region.slots,
+      self.runtime.shards,
+    )
+    .get();
+    let arenas = self.control_shard_capacity().get().tasks.saturating_add(
+      self
+        .runtime
+        .tasks_per_shard
+        .saturating_mul(usize::from(self.runtime.shards.saturating_sub(1))),
+    );
+    derived!(
+      in_flight.saturating_mul(2).saturating_add(arenas),
+      "2 × forward_lane_bound + control_shard_capacity.tasks + tasks_per_shard × (shards − 1)",
+      [
+        "clients_per_shard",
+        "region.slots",
+        "shards",
+        "tasks_per_shard",
+        "fleet.peers"
+      ]
+    )
+  }
+
+  /// This configuration with its control shard's capacity and its shards' kept bound in the boot log, in place of any
+  /// earlier lines for them (both follow `runtime`'s, which [`Self::with_fleet`] raises).
   fn with_control_shard_noted(mut self) -> DaemonConfig {
-    let line = note("control_shard_capacity", &self.control_shard_capacity());
-    self
-      .derivations
-      .retain(|kept| !kept.starts_with("control_shard_capacity "));
-    self.derivations.push(line);
+    let capacity = note("control_shard_capacity", &self.control_shard_capacity());
+    let kept = note("kept_bound", &self.kept_bound());
+    self.derivations.retain(|line| {
+      !line.starts_with("control_shard_capacity ") && !line.starts_with("kept_bound ")
+    });
+    self.derivations.push(capacity);
+    self.derivations.push(kept);
     self
   }
 }
@@ -1028,7 +1370,16 @@ pub struct NfsV4Caps {
   /// Derived: the bytes of call records a shard holds at once (A-127): what answers a compound retried after a
   /// restart, bounded beside the slot caches it is the durable twin of.
   pub record_bytes: usize,
+  /// Derived: the lease the listener grants every client and advertises (`FATTR4_LEASE_TIME`, RFC 8881 §8.3), which
+  /// is also the wait a recalled delegation is owed before it is revoked (§10.4.5) and every wait on that (A-425). Read
+  /// only through `nfs::v4_lease_ns`, so the lease told and the waits on it are one number.
+  pub lease_ns: u64,
 }
+
+/// Format: how long an idle Linux NFSv4 client goes between two renewals of its lease however short the lease it is
+/// told: `nfs4_schedule_state_renewal` waits two thirds of the lease, never less than five seconds (`if (timeout < 5 *
+/// HZ) timeout = 5 * HZ;`, fs/nfs/nfs4renewd.c, Linux master, read 2026-11-18). The served client's fact, not a tunable.
+pub const NFS_V4_CLIENT_RENEWAL_FLOOR_NS: u64 = 5_000_000_000;
 
 /// Shape: the holders the NFSv4 client share of a shard's reserve is split between (A-127): the slot caches (a kept
 /// reply per slot) and the call records (what a kept reply becomes across a restart, published with its effects).
@@ -1105,12 +1456,27 @@ fn nfs_v4_caps(
     ["max_inodes", "shards"]
   );
   derivations.push(note("nfs_v4_locks", &locks));
+  // The lease (A-425) outlasts the longest an idle client goes between two renewals, the Linux client's floor, by the
+  // lateness a live party may show before it is judged (A-228's window), for the renewal's delivery; in the whole seconds
+  // `FATTR4_LEASE_TIME` carries, so the lease a client is told is the lease it holds. Not the failover delay, which is
+  // shorter: below the floor a live idle client's lease lapses between its renewals, and a full table drops its state.
+  let lease_ns: Derived<u64> = derived!(
+    NFS_V4_CLIENT_RENEWAL_FLOOR_NS
+      .saturating_add(crate::daemon::LIVENESS_BUDGET_NS)
+      .div_ceil(NANOS_PER_SECOND)
+      .saturating_mul(NANOS_PER_SECOND),
+    "ceil((NFS_V4_CLIENT_RENEWAL_FLOOR_NS + LIVENESS_BUDGET_NS) / 1 s) s: an idle Linux client's longest gap between \
+     renewals and the lateness a live party may show, in the whole seconds FATTR4_LEASE_TIME carries",
+    ["NFS_V4_CLIENT_RENEWAL_FLOOR_NS", "LIVENESS_BUDGET_NS"]
+  );
+  derivations.push(note("nfs_v4_lease_ns", &lease_ns));
   NfsV4Caps {
     slots: slots.get(),
     clients: clients.get(),
     opens: opens.get(),
     locks: locks.get(),
     record_bytes: record_bytes.get(),
+    lease_ns: lease_ns.get(),
   }
 }
 
@@ -1164,6 +1530,14 @@ fn archive_slice_bytes(blake3_bytes_per_second: u64, quantum_ns: u64) -> u64 {
   (blake3_bytes_per_second.saturating_mul(quantum_ns) / NANOS_PER_SECOND)
     .saturating_mul(ARCHIVE_SLICE_PERMILLE)
     / PERMILLE
+}
+
+/// Derived: how long one turn may spend wrapping a seal's envelope (A-323) within a turn of `quantum_ns`: the archive
+/// walk's share of a step, `quantum_ns × ARCHIVE_SLICE_PERMILLE / 1000`. The wrap seals a chunk at least whatever it is,
+/// and has no measured rate of its own in the boot profile (it costs a seal and three BLAKE3 passes a byte, where the
+/// walk's slice is sized by one), so it is held to the shard's clock rather than to a byte count.
+pub fn wrap_slice_ns(quantum_ns: u64) -> u64 {
+  quantum_ns.saturating_mul(ARCHIVE_SLICE_PERMILLE) / PERMILLE
 }
 
 /// The direct maps' copies one shard may hold at once, handed or being filled (§4.6, A-171): the direct maps' share of
@@ -1220,7 +1594,13 @@ impl DaemonConfig {
   /// The content bytes one slice of copy-bound work (a DAX backing's fill, an image's build) may move on the calling
   /// shard now: half its live step quantum at the machine's measured memcpy rate.
   pub fn copy_slice_bytes(&self) -> u64 {
-    copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
+    self.copy_slice_bytes_within(self.step_quantum_ns())
+  }
+
+  /// [`DaemonConfig::copy_slice_bytes`] for a turn of `quantum_ns` (a takeover's turns, whose quantum a test may cut,
+  /// `fleet::seal_quantum_ns`): half of it at the machine's measured memcpy rate.
+  pub fn copy_slice_bytes_within(&self, quantum_ns: u64) -> u64 {
+    copy_slice_bytes(self.memcpy_bytes_per_second, quantum_ns)
   }
 
   /// Derived: the pages an idle shard pre-faults in one slice of its reserve's refill now (A-214): its step quantum
@@ -1264,7 +1644,8 @@ impl DaemonConfig {
 
   /// The time one slice of such work may take on the calling shard now: half its live step quantum. Work whose units
   /// are not bytes copied — an image's walk, layout, writing and merge (A-160), where an entry costs tens of times its
-  /// bytes — is bounded by it against the clock, one unit at a time.
+  /// bytes, and a mount's coherence rounds (A-158, A-562), where a record or a name costs a message — is bounded by it
+  /// against the clock, one unit at a time.
   pub fn copy_slice_ns(&self) -> u64 {
     self.step_quantum_ns().saturating_mul(COPY_SLICE_PERMILLE) / PERMILLE
   }
@@ -1272,12 +1653,6 @@ impl DaemonConfig {
   /// This configuration with `fault` injected into a shard's start (the boot tests).
   pub fn with_boot_fault(mut self, fault: BootFault) -> DaemonConfig {
     self.boot_fault = Some(fault);
-    self
-  }
-
-  /// The same configuration with the operator's failover SLO (the lease term's ceiling).
-  pub fn with_failover_slo(mut self, failover_slo_ns: u64) -> DaemonConfig {
-    self.failover_slo_ns = failover_slo_ns.max(1);
     self
   }
 
@@ -1505,6 +1880,61 @@ fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-359: do derive the liveness window over a quiet machine's floor (a wake p99 of 400 µs) and over one kept so busy
+  /// at boot that a woken thread waits longer than a window. Expect the quiet one within its window and needing no
+  /// more; the busy one reported past it, needing its floor.
+  #[test]
+  fn a_machine_whose_scheduling_delay_passes_the_window_is_reported_needing_its_floor() {
+    let quiet = liveness_window(400_000).get();
+    assert!(!quiet.floor_past_window, "{quiet:?}");
+    assert_eq!(quiet.needed_ns, quiet.window_ns);
+    let busy_floor = crate::daemon::LIVENESS_BUDGET_NS + crate::daemon::HEARTBEAT_NS;
+    let busy = liveness_window(busy_floor).get();
+    assert!(busy.floor_past_window, "{busy:?}");
+    assert_eq!(busy.needed_ns, busy_floor);
+    assert_eq!(
+      busy.window_ns, quiet.window_ns,
+      "the derived window is the machine's, not the load's"
+    );
+  }
+
+  /// A-326, §4.7. Do: derive the closed-loop hold for every shard count from one to [`MOST_SHARDS_TESTED`]. Expect: the
+  /// hold is whole cycles of 2F (R9's floor for a request and for the think time before the next); its cycles cover a
+  /// loop's return to one shard at R9's percentile, more of them passing without a return with probability
+  /// `((S − 1) / S)^k` of at most one in a hundred, while one cycle fewer would leave more than that; one shard, which
+  /// the loop returns to every cycle, holds one cycle; the hold never shrinks as shards are added; and at three shards it
+  /// is at least `2F × S`, the shortest window step 6 measured within main's spread there (29.5 µs, diag-liveness-44).
+  #[test]
+  fn a_closed_loops_hold_covers_its_return_to_a_shard_at_r9s_percentile() {
+    /// Shape: the shard counts derived, past the 23 of the widest machine measured (fedora-2, 32 CPUs).
+    const MOST_SHARDS_TESTED: u16 = 128;
+    /// Shape: the three shards of ubuntu-24.04-arm, where R9's floor alone failed (step 6, diag-liveness-42).
+    const STEP_SIX_SHARDS: u16 = 3;
+    let tail = 1.0 / f64::from(u32::try_from(PROVISION_TAIL).unwrap());
+    let mut last = 0;
+    for shards in 1..=MOST_SHARDS_TESTED {
+      let hold = closed_loop_hold(shards).get();
+      assert_eq!(hold % CLOSED_LOOP_CYCLE_NS, 0, "{shards} shards: {hold} ns");
+      let cycles = i32::try_from(hold / CLOSED_LOOP_CYCLE_NS).unwrap();
+      let stay = f64::from(shards - 1) / f64::from(shards);
+      assert!(
+        stay.powi(cycles) <= tail,
+        "{shards} shards: {cycles} cycles leave {} of returns uncovered",
+        stay.powi(cycles)
+      );
+      assert!(
+        cycles == 1 || stay.powi(cycles - 1) > tail,
+        "{shards} shards: {cycles} cycles, one more than R9's percentile needs"
+      );
+      assert!(hold >= last, "{shards} shards: {hold} ns after {last} ns");
+      last = hold;
+    }
+    assert_eq!(closed_loop_hold(1).get(), CLOSED_LOOP_CYCLE_NS);
+    assert!(
+      closed_loop_hold(STEP_SIX_SHARDS).get() >= CLOSED_LOOP_CYCLE_NS * u64::from(STEP_SIX_SHARDS)
+    );
+  }
 
   /// AC-A-171 (G-direct step 2): the direct maps' copies a shard may hold follow the process's limits. Do: derive it for
   /// a host with Linux's default limits (1,024 descriptors soft, 65,530 mappings) over one and four shards; for one whose
@@ -1835,12 +2265,7 @@ mod tests {
         let rings: u64 = geometry
           .regions()
           .iter()
-          .filter(|region| {
-            matches!(
-              region.kind,
-              slates_anchor::RegionKind::Log(_) | slates_anchor::RegionKind::Audit
-            )
-          })
+          .filter(|region| matches!(region.kind, slates_anchor::RegionKind::Log(_)))
           .map(|region| region.len)
           .sum();
         assert!(

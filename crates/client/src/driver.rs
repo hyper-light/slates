@@ -10,14 +10,29 @@
 //! for a ticket (the binding decodes it with its verb's poll and calls [`Driver::finish`]), or the call
 //! failed, typed.
 //!
-//! **Every call ends (AUD-29-20).** A reply overdue past the client's reply deadline asks the daemon's
-//! liveness once: a live daemon's silence fails the call `Stalled` (the synchronous path's rule), a gone
-//! daemon starts recovery — single reconnect attempts paced as the synchronous reconnect paces them, the
-//! channel bound to the consumer without a blocking round trip, then every call still awaited resent under
-//! its own id (the daemon answers a call it already served from its completion record) and the queue
-//! admitted. Past the reconnect budget every call fails `DaemonGone`. A binding whose reader fails, or whose
-//! descriptor closes, fails every call with [`Driver::fail_all`]; a cancelled call is released with
-//! [`Driver::cancel`]. Nothing is left waiting on a reply that cannot come.
+//! **Every call ends (AUD-29-20), and waits while its daemon lives (A-232).** The client's one rule, which the
+//! synchronous round trip and its wait for a ring slot keep too (`crate::client`): a call, sent and unanswered or queued
+//! unsent, asks the daemon's liveness on A-443's doubling (`slates_ipc::looks`, A-523): first once it has waited twice
+//! the longer of its wait when the driver first judged it and the client's wake estimate, then at twice the time waited.
+//! The loop learns of a reply from the completion descriptor but of nothing about the daemon's departure, so it asks;
+//! the looks cost the logarithm of the wait, and a departure is seen within the time already waited. A live daemon's
+//! call goes on waiting: a daemon answers every call it is given, a long one (a granted landing, a forward across the
+//! fleet) and a starved one alike, and a daemon judged stuck is ended by its supervisor, or by its own watchdog when it
+//! runs alone, which this client then sees as gone. Until A-523 a call asked at every reply deadline, the anchor's
+//! liveness budget (a fixed second), so a call whose daemon died waited up to that second to learn it.
+//! A gone daemon starts recovery — single reconnect steps, a claim polled as an async connect polls it, the
+//! channel bound to the consumer without a blocking round trip, then every call still awaited resent under its own id
+//! (the daemon answers a call it already served from its completion record) and the queue admitted. Recovery goes on
+//! while the instance's rendezvous has a holder, its anchor restarting the daemon; with none every call fails
+//! `DaemonGone` at once (A-468). A binding whose reader fails, or whose descriptor closes, fails
+//! every call with [`Driver::fail_all`]; a cancelled call is released at once with [`Driver::cancel`]. Nothing is left
+//! waiting on a reply that cannot come.
+//!
+//! Until A-232 (2026-11-13) a live daemon's overdue call failed `Stalled`, and only a call submitted patient
+//! (`submit_patient`, a landing) or one whose request the daemon may defer (`defers_reply`) waited. A daemon at
+//! `cpu.weight` 1 beside spinners, alive by its own watchdog, had calls failed `Stalled` in 10 of 10 runs on both of
+//! CI's Linux runners (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the second path is
+//! gone with the failure.
 //!
 //! Until 2026-10-01 `begin` spun on a full ring until the reply deadline and could reconnect through a
 //! parking loop on the event loop's thread, and the SDKs had no deadline, no failure path and no cancel: a
@@ -25,6 +40,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
+
+use slates_ipc::looks::Looks;
 
 use crate::{Client, ClientError, RequestId};
 
@@ -61,22 +78,29 @@ struct Call {
   begin: Option<Begin>,
   /// Its request id word once sent; `None` while queued.
   word: Option<u64>,
-  /// When it was last sent, the base of its reply deadline.
-  sent: Instant,
+  /// When its wait began: when it was submitted, last sent, or continued.
+  armed: Instant,
+  /// When it next asks the daemon's liveness, from `armed` ([`Looks`], A-523): fixed at the first tick that judges it,
+  /// each later look at twice the time waited.
+  looks: Looks,
   /// Whether it must be sent again under its id on the current channel (after a reconnect).
   resend: bool,
-  /// Whether it is waited for while the daemon lives ([`crate::defers_reply`]): its deadline asks
-  /// the daemon's liveness and restarts, never fails it `Stalled`.
-  patient: bool,
   /// Whether its reply was reported [`Event::Ready`] and the binding has not finished it yet: the client
   /// holds a reply until it is taken, so a pump would otherwise report it again — twice in one loop step when
   /// the step's tick pumps after its pump, the second event finding the reply already taken.
   reported: bool,
 }
 
+impl Call {
+  /// Starts the call's wait again at `now`: its clock, and a look schedule the next tick fixes afresh.
+  fn rearm(&mut self, now: Instant) {
+    self.armed = now;
+    self.looks = Looks::default();
+  }
+}
+
 /// A lost channel's recovery.
 struct Lost {
-  since: Instant,
   next_attempt: Instant,
   pause_ns: u64,
 }
@@ -93,6 +117,35 @@ pub struct Driver {
 
 fn elapsed_ns(since: Instant) -> u64 {
   u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The calls whose look at the daemon's life is due now (A-523), a call `answered` this step and one awaiting its resend
+/// excepted: each call's schedule ([`Looks`]) is fixed at the first judgment, `wake_ns` being the client's wake
+/// estimate, so a call answered before twice the longer of that wait and the wake never asks.
+fn looks_due(
+  calls: &mut BTreeMap<Ticket, Call>,
+  answered: &std::collections::BTreeSet<Ticket>,
+  wake_ns: u64,
+) -> Vec<Ticket> {
+  calls
+    .iter_mut()
+    .filter(|(ticket, call)| !answered.contains(*ticket) && !call.resend)
+    .filter_map(|(ticket, call)| {
+      call
+        .looks
+        .due(elapsed_ns(call.armed), wake_ns)
+        .then_some(*ticket)
+    })
+    .collect()
+}
+
+/// How long until the earliest look a call makes at the daemon's life (A-523), every call sent or queued: a schedule not
+/// yet judged is read as its first judgment would fix it, and none is moved. `None` with no call.
+fn next_look_ns(calls: &BTreeMap<Ticket, Call>, wake_ns: u64) -> Option<u64> {
+  calls
+    .values()
+    .map(|call| call.looks.until_or_first(elapsed_ns(call.armed), wake_ns))
+    .min()
 }
 
 /// Whether `error` means "not sent yet; try again once the channel can take it".
@@ -132,26 +185,7 @@ impl Driver {
 
   /// Submits `body`: sent at once when the client admits it, else queued. Refused `TooManyOutstanding` when
   /// the queue is full, or with the client's typed error when the call cannot be sent at all.
-  pub fn submit(&mut self, client: &mut Client, begin: Begin) -> Result<Ticket, ClientError> {
-    self.submit_with(client, begin, false)
-  }
-
-  /// [`submit`](Self::submit) for a call whose reply the daemon defers until long work ends (a granted
-  /// landing): once sent it is waited for while the daemon lives, its deadline only asking the liveness.
-  pub fn submit_patient(
-    &mut self,
-    client: &mut Client,
-    begin: Begin,
-  ) -> Result<Ticket, ClientError> {
-    self.submit_with(client, begin, true)
-  }
-
-  fn submit_with(
-    &mut self,
-    client: &mut Client,
-    mut begin: Begin,
-    patient: bool,
-  ) -> Result<Ticket, ClientError> {
+  pub fn submit(&mut self, client: &mut Client, mut begin: Begin) -> Result<Ticket, ClientError> {
     let ticket = self.next_ticket;
     let sent = if self.lost.is_none() && self.queued.is_empty() {
       match begin(client) {
@@ -183,10 +217,10 @@ impl Driver {
       Call {
         begin: if sent.is_none() { Some(begin) } else { None },
         word: sent,
-        sent: Instant::now(),
+        armed: Instant::now(),
+        looks: Looks::default(),
         resend: false,
         reported: false,
-        patient,
       },
     );
     Ok(ticket)
@@ -198,6 +232,18 @@ impl Driver {
       && let Some(word) = call.word
     {
       self.by_word.remove(&word);
+    }
+  }
+
+  /// Keeps a call whose reply the binding took by its verb's poll and that is not over: a chained call (a listing's
+  /// page, a large edit's step, a `changed_since` page) answered `None` while the client sent its next request under
+  /// the same word. Its next reply is reported again, and its wait counts from now: each step looks at the daemon's
+  /// life as a call does. Before 2026-11-09 a call was reported once until it was finished, so a chain's second reply
+  /// was never reported and the call failed `Stalled` at the deadline.
+  pub fn continued(&mut self, ticket: Ticket) {
+    if let Some(call) = self.calls.get_mut(&ticket) {
+      call.reported = false;
+      call.rearm(Instant::now());
     }
   }
 
@@ -240,8 +286,8 @@ impl Driver {
     events
   }
 
-  /// The timer's turn: recovery when the channel is lost, else the reply deadlines — an overdue call fails
-  /// `Stalled` while the daemon lives, and starts recovery when it is gone — then the queue admitted.
+  /// The timer's turn: recovery when the channel is lost, else the reply deadlines — an overdue call starts
+  /// recovery when the daemon is gone, and has its deadline re-armed while the daemon lives — then the queue admitted.
   pub fn tick(&mut self, client: &mut Client) -> Vec<Event> {
     if self.lost.is_some() {
       let mut events = Vec::new();
@@ -258,57 +304,31 @@ impl Driver {
         Event::Failed { .. } => None,
       })
       .collect();
-    let reply_ns = client.deadlines().reply_ns;
-    // Overdue: a call sent and unanswered past the reply deadline, or one still queued that long (a ring
-    // that never frees is a stall too, as the synchronous `begin` finds it after the same deadline).
-    let overdue: Vec<(Ticket, Option<u64>, bool)> = self
-      .calls
-      .iter()
-      .filter(|(ticket, call)| {
-        !answered.contains(ticket) && !call.resend && elapsed_ns(call.sent) >= reply_ns
-      })
-      .map(|(ticket, call)| {
-        // Patient when submitted so (a granted landing) or when its request is one the daemon may defer past the
-        // deadline, the synchronous call's rule (`Client::defers`): before 2026-10-07 a forwarded verb through an
-        // SDK was failed `Stalled` while its daemon was still answering within its bounds.
-        let patient = call
-          .word
-          .is_some_and(|word| call.patient || client.defers(word));
-        (*ticket, call.word, patient)
-      })
-      .collect();
-    if !overdue.is_empty() && client.daemon_gone() {
+    let (wake_ns, _) = client.wake_estimate();
+    // Due: a call sent and unanswered, or one still queued (a ring that does not free while the daemon lives is waited
+    // on, as the synchronous send waits on it), whose look at the daemon's life has come (A-523).
+    let due = looks_due(&mut self.calls, &answered, wake_ns);
+    if due.is_empty() {
+      self.resend_and_admit(client, &mut events);
+      return events;
+    }
+    if client.daemon_gone() {
       self.start_recovery();
       self.recover(client, &mut events);
       return events;
     }
-    for (ticket, word, patient) in overdue {
-      if patient {
-        // Its daemon lives: the deferred reply is still being worked for; the next deadline asks again.
-        if let Some(call) = self.calls.get_mut(&ticket) {
-          call.sent = Instant::now();
-        }
-        continue;
+    // The daemon lives: every due call goes on waiting, and looks again at twice the time it has waited (A-232, A-523).
+    for ticket in due {
+      if let Some(call) = self.calls.get_mut(&ticket) {
+        call.looks.looked(elapsed_ns(call.armed));
       }
-      self.calls.remove(&ticket);
-      match word {
-        Some(word) => {
-          self.by_word.remove(&word);
-          client.abandon(word);
-        }
-        None => self.queued.retain(|queued| *queued != ticket),
-      }
-      events.push(Event::Failed {
-        ticket,
-        error: ClientError::Stalled { after_ns: reply_ns },
-      });
     }
     self.resend_and_admit(client, &mut events);
     events
   }
 
   /// When the binding should call [`tick`](Self::tick) next, in nanoseconds from now: the next reconnect
-  /// attempt while recovering, else the earliest reply deadline; `None` when idle.
+  /// attempt while recovering, else the earliest look a call makes at the daemon's life (A-523); `None` when idle.
   pub fn next_wake_ns(&self, client: &Client) -> Option<u64> {
     if self.calls.is_empty() {
       return None;
@@ -324,13 +344,8 @@ impl Driver {
         .unwrap_or(u64::MAX),
       );
     }
-    let reply_ns = client.deadlines().reply_ns;
-    // Every call — sent or queued — has a reply deadline from when it was sent or submitted.
-    self
-      .calls
-      .values()
-      .map(|call| reply_ns.saturating_sub(elapsed_ns(call.sent)))
-      .min()
+    let (wake_ns, _) = client.wake_estimate();
+    next_look_ns(&self.calls, wake_ns)
   }
 
   /// Fails every call with `error` (the binding's reader failed, or its descriptor closed): each in-flight
@@ -359,7 +374,6 @@ impl Driver {
     if self.lost.is_none() {
       let now = Instant::now();
       self.lost = Some(Lost {
-        since: now,
         next_attempt: now,
         pause_ns: 1,
       });
@@ -368,8 +382,9 @@ impl Driver {
 
   /// One recovery step, when due: a single reconnect step (never waiting on the daemon); connected, every
   /// call in flight is marked to resend under its id, the queue's clocks restart, and the queue is
-  /// admitted; still no daemon, the next attempt is paced (doubling, at most a tenth of the budget, as the
-  /// synchronous reconnect paces); past the reconnect budget, every call fails `DaemonGone`.
+  /// admitted; the claim still due, or refused for now while the instance's rendezvous has a holder, the next step is
+  /// paced as an async connect's polls are (doubling, at most a tenth of the claim wait); with no holder, every call
+  /// fails `DaemonGone` (A-468).
   fn recover(&mut self, client: &mut Client, events: &mut Vec<Event>) {
     let Some(lost) = &self.lost else {
       return;
@@ -377,7 +392,6 @@ impl Driver {
     if Instant::now() < lost.next_attempt {
       return;
     }
-    let budget = client.deadlines().reconnect_ns;
     match client.try_reconnect() {
       Ok(true) => {
         self.lost = None;
@@ -389,13 +403,13 @@ impl Driver {
             call.resend = true;
             call.reported = false;
           } else {
-            call.sent = now;
+            call.rearm(now);
           }
         }
         self.resend_and_admit(client, events);
       }
-      Ok(false) if elapsed_ns(lost.since) < budget => {
-        let pause_ns = crate::client::next_pause_ns(lost.pause_ns, budget);
+      Ok(false) => {
+        let pause_ns = crate::client::next_pause_ns(lost.pause_ns, slates_ipc::CLAIM_WAIT_NS);
         if let Some(lost) = self.lost.as_mut() {
           lost.pause_ns = pause_ns;
           let now = Instant::now();
@@ -403,9 +417,6 @@ impl Driver {
             .checked_add(std::time::Duration::from_nanos(pause_ns))
             .unwrap_or(now);
         }
-      }
-      Ok(false) => {
-        events.extend(self.fail_all(client, &ClientError::DaemonGone { after_ns: budget }))
       }
       Err(error) => events.extend(self.fail_all(client, &error)),
     }
@@ -434,7 +445,7 @@ impl Driver {
         Ok(true) => {
           if let Some(call) = self.calls.get_mut(&ticket) {
             call.resend = false;
-            call.sent = Instant::now();
+            call.rearm(Instant::now());
           }
         }
         Ok(false) => return,
@@ -472,7 +483,7 @@ impl Driver {
           self.by_word.insert(id.word(), ticket);
           if let Some(call) = self.calls.get_mut(&ticket) {
             call.word = Some(id.word());
-            call.sent = Instant::now();
+            call.rearm(Instant::now());
             call.begin = None;
           }
         }
@@ -489,5 +500,93 @@ impl Driver {
         }
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::{BTreeMap, BTreeSet};
+  use std::time::{Duration, Instant};
+
+  use slates_ipc::looks::{Looks, first_look_ns};
+
+  use super::{Call, Ticket, looks_due, next_look_ns};
+
+  /// Shape: the client's wake estimate the schedule is judged with: 3 µs, a wake measured on Apple silicon.
+  const WAKE_NS: u64 = 3_000;
+  /// Shape: how long the call has waited when the driver's first tick judges it: 30 ms, far inside the reply deadline.
+  const FIRST_JUDGED_NS: u64 = 30_000_000;
+  /// Shape: the reply deadline the driver first asked at before A-523: the anchor's liveness budget, a second.
+  const OLD_REPLY_DEADLINE_NS: u64 = 1_000_000_000;
+
+  /// A call sent `waited_ns` ago, its schedule not yet judged.
+  fn call_waiting(waited_ns: u64) -> Call {
+    Call {
+      begin: None,
+      word: Some(1),
+      armed: Instant::now()
+        .checked_sub(Duration::from_nanos(waited_ns))
+        .unwrap(),
+      looks: Looks::default(),
+      resend: false,
+      reported: false,
+    }
+  }
+
+  /// Moves `call`'s wait back by `ns`, as if that much more time had passed.
+  fn age(call: &mut Call, ns: u64) {
+    call.armed = call.armed.checked_sub(Duration::from_nanos(ns)).unwrap();
+  }
+
+  /// A-523 (R3's class C). Do: hold one call sent 30 ms ago; ask the driver's timer when it next wakes, tick, age the
+  /// call to the look the tick fixed and tick again, then record the look and ask again. Expect: the timer wakes about
+  /// the call's own wait from now (its first look at twice it), far before the old reply deadline; no look due at the
+  /// first tick; the look due once the call has waited twice its first judgment's time; and the next look at twice the
+  /// time waited. Before A-523 the timer named the old reply deadline's remainder and nothing was due before it.
+  #[test]
+  fn a_call_looks_at_the_daemons_life_at_twice_its_wait_not_at_the_old_reply_deadline() {
+    let ticket: Ticket = 1;
+    let mut calls = BTreeMap::from([(ticket, call_waiting(FIRST_JUDGED_NS))]);
+    let answered = BTreeSet::new();
+    let timer = next_look_ns(&calls, WAKE_NS).unwrap();
+    assert!(
+      (FIRST_JUDGED_NS..OLD_REPLY_DEADLINE_NS / 10).contains(&timer),
+      "the timer wakes {timer} ns on, the call's own wait, not the old deadline's remainder"
+    );
+    assert!(
+      looks_due(&mut calls, &answered, WAKE_NS).is_empty(),
+      "no look at the first judgment"
+    );
+    let until = next_look_ns(&calls, WAKE_NS).unwrap();
+    age(calls.get_mut(&ticket).unwrap(), until);
+    assert_eq!(
+      looks_due(&mut calls, &answered, WAKE_NS),
+      vec![ticket],
+      "the look is due"
+    );
+    let call = calls.get_mut(&ticket).unwrap();
+    let waited = u64::try_from(call.armed.elapsed().as_nanos()).unwrap();
+    assert!(waited >= first_look_ns(FIRST_JUDGED_NS, WAKE_NS));
+    call.looks.looked(waited);
+    let next = next_look_ns(&calls, WAKE_NS).unwrap();
+    assert!(
+      next <= waited && next + WAKE_NS >= waited / 2,
+      "the next look at twice the wait: {next} ns after {waited} ns"
+    );
+  }
+
+  /// A-523. Do: hold a call answered this step and one awaiting its resend, both past any look, then an empty driver.
+  /// Expect: neither is due (an answered call is done, a resent one's clock restarts when it goes), and an empty driver
+  /// names no wake.
+  #[test]
+  fn an_answered_or_resending_call_never_looks_and_no_call_names_no_wake() {
+    let mut calls = BTreeMap::from([
+      (1, call_waiting(OLD_REPLY_DEADLINE_NS)),
+      (2, call_waiting(OLD_REPLY_DEADLINE_NS)),
+    ]);
+    calls.get_mut(&2).unwrap().resend = true;
+    let answered = BTreeSet::from([1]);
+    assert!(looks_due(&mut calls, &answered, WAKE_NS).is_empty());
+    assert_eq!(next_look_ns(&BTreeMap::new(), WAKE_NS), None);
   }
 }

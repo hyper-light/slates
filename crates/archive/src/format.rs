@@ -28,9 +28,10 @@ pub const FORMAT_MAJOR: u16 = 1;
 /// of an older minor is not decoded: archives live in RAM within one fleet release. Minor 3
 /// (2026-09-30, AUD-29-56) made the metadata's times signed, added the access and birth times, and
 /// replaced the "has extended attributes" flag with the attributes themselves (each name and its value's
-/// extents over the archive's chunks), all covered by the manifest identity.
-/// Format: minor 3 is the version this writer emits.
-pub const FORMAT_MINOR: u16 = 3;
+/// extents over the archive's chunks), all covered by the manifest identity. Minor 4 (2026-11-17, A-294) appended a
+/// device node's major and minor to every node's metadata (zero for any other node), covered by the identity too.
+/// Format: minor 4 is the version this writer emits.
+pub const FORMAT_MINOR: u16 = 4;
 
 /// Format: header flags. Bit 0 the manifest is compressed; bit 1 dictionaries are present; bit 2
 /// a seek table is present.
@@ -172,13 +173,17 @@ pub enum ArchiveError {
   BadName,
   /// Two entries restore to one path.
   DuplicatePath,
-  /// Restoring needs more bytes than the caller admitted, refused before any allocation.
+  /// Restoring needs more bytes than the caller admitted, refused before any allocation; or the allocator refused the
+  /// room a decode admitted for a payload or a manifest (`budget` zero: no budget was named).
   OverBudget {
-    /// The bytes the restore needs: every file's length and one chunk's decode space.
+    /// The bytes the restore needs: every file's length and one chunk's decode space; or the room a decode asked.
     needed: u64,
     /// The bytes the caller admitted.
     budget: u64,
   },
+  /// A section does not lie where the trailer's index names it: the chunk records not at the header's end, or the
+  /// manifest or the seek table not where the section before it ends. A layout no writer makes (A-494).
+  BadLayout,
 }
 
 impl core::fmt::Display for ArchiveError {
@@ -214,6 +219,7 @@ impl core::fmt::Display for ArchiveError {
           "restoring needs {needed} bytes, past the {budget} admitted"
         )
       }
+      Self::BadLayout => f.write_str("archive sections do not lie where its index names them"),
     }
   }
 }

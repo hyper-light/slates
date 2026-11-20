@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use slates_client::{GrantScope, GreenBase, Intent, NamePolicy, ReadAt, Rights, SizeClass};
+use slates_client::{
+  GrantScope, GreenBase, Intent, NamePolicy, ObjectFormat, ReadAt, RepositorySpec, Rights,
+  SizeClass, VcsTool,
+};
 
 use crate::format::{parse_size, parse_snapshot, parse_volume_id};
 
@@ -12,6 +15,12 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
 
   anchor   [--quick] [--shards N] [--fleet PATH --node NAME]   run the anchor: own the segment, supervise the daemon
   daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
+           [--vcs-http ADDRESS]                                either role: serve git over HTTP(S) at ADDRESS; loopback
+                                                               alone unless --fleet gives the node's HTTPS identity
+           [--vcs-ssh ADDRESS]                                 either role: serve git, hg and svn over SSH at ADDRESS;
+                                                               the daemon logs the host key's SHA256 fingerprint
+           [--vcs-svn ADDRESS]                                 either role: serve svn:// (cleartext) at ADDRESS; loopback
+                                                               alone unless --fleet
   profile  [--quick] [--json]                      measure and print the machine profile
   version                                          print this binary's version (`slates VERSION`)
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
@@ -36,7 +45,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
-  attach ID [--read | --write] [--snapshot N]
+  attach ID [--read | --write] [--snapshot N] [--hold]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
   detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
   bootstrap (root | region) [--json]             explicitly create a new consensus group
@@ -50,7 +59,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   base digest ID PATH [--json]                     a clean base file's verified content digest
   base rewitness ID [PATH ...] [--json]
   base pin ID [PATH ...] [--json]
-  land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+  base capture ID [--json]                         capture an overlay's whole base: a snapshot whose clones move
+  land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
   image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
   image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
   grants [--json]
@@ -58,14 +68,31 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   audit [--since N] [--json]
   enroll [--account UID] [--json]                  enroll a consumer; its capability is shown once
   revoke CONSUMER [--json]                         revoke a consumer's enrollment
+  credential key LINE [--principal PRINCIPAL] [--expires SECONDS] [--json]
+            enroll an SSH public key (its .pub line) for git over SSH; PRINCIPAL is you unless given
+  credential token [--principal PRINCIPAL] [--expires SECONDS] [--json]
+            mint a token for git over HTTPS (Basic's password or a bearer token) and svn:// (CRAM-MD5's
+            password, its id the user name); shown once
+  credential revoke ID [--json]                    revoke a credential by its id (a key's SHA256:... or hex)
+  repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN] [--json]
+            create a repository and its root green, a new empty one unless GREEN; FORMAT is sha1 (git's
+            default) or sha256 for git, sha1 for hg, revisions for svn; BRANCH is git's (main when not
+            given) or Mercurial's (default), none for svn; prints the repository and its root green's id
+  repository import NAME PATH [--json]               import a history into a new repository's empty store: PATH
+            (absolute) is a Mercurial repository's directory (its .hg) for an hg repository or a
+            Subversion dump file for an svn one; answered when the import ends, with what it took
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
-  exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
-  shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
+  exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
+            run CMD with the volume at PATH (Linux); --apparmor-profile makes its namespace under slates'
+            AppArmor profile where the host restricts unprivileged user namespaces (off unless given)
+  apparmor profile [--executable PATH]            print slates' AppArmor profile for this binary (or PATH)
+  apparmor check [--json]                         can `exec` make its namespace here; how to load the profile
+  shards ID [--subtree DIR] [--read-only] --fd N [--resync-fd M] [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
   shards ID [--subtree DIR] [--read-only] [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume as a handle: {handle} in its arguments names its value,
-            e.g. `shards run --slates-fs-handle {handle} ...` (Windows)
+            e.g. `shards run --slates-fs-handle {handle} ...`, and {resync}, where it stands, its resync end's (Windows)
   vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
             run VMM with slates' own virtio-fs device of the volume: {socket} in its arguments names the device's
             socket end (/proc/self/fd/N) and {fd} its descriptor (N), e.g. `crosvm run --vhost-user
@@ -124,28 +151,9 @@ impl std::fmt::Display for ParseError {
   }
 }
 
-/// Options of the anchor and the daemon.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProcessOptions {
-  /// The instance.
-  pub instance: String,
-  /// Measure the quick profile (tests; a full profile takes seconds).
-  pub quick: bool,
-  /// Shards, when the caller overrides the derivation (tests).
-  pub shards: Option<u16>,
-  /// The fleet to join, when this daemon is a fleet node (§2.6 boot step 6); a laptop has none.
-  pub fleet: Option<FleetSelection>,
-}
-
-/// Which fleet node this process is: the operator's shared manifest and this node's name in it
-/// (`--fleet PATH --node NAME`; `slates_server::deploy` derives everything else from the two).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FleetSelection {
-  /// The path of the shared manifest.
-  pub manifest: String,
-  /// This node's name in it.
-  pub node: String,
-}
+// The anchor's and the daemon's options are the library's (`slates_api::role`, A-278): the roles run there, for this
+// command and for an embedding host's executable alike.
+pub(crate) use slates_api::role::{FleetSelection, ProcessOptions};
 
 /// Options of `profile`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -399,6 +407,17 @@ pub(crate) enum Verb {
     /// `--oci-source` to `--oci-destination` (§4.6 A-9).
     form: slates_client::AttachRequest,
   },
+  /// Attach in the CLI's form and keep the attachment alive from this process until it ends (`slates attach --hold`,
+  /// A-384): a renewer of its own renews it at the cadence the daemon names; the process ending ends the renewals, and
+  /// the attachment lapses at its holder's pace.
+  Hold {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The intent.
+    intent: Intent,
+  },
   /// Detach.
   Detach {
     /// The attachment.
@@ -434,6 +453,12 @@ pub(crate) enum Verb {
     volume: slates_client::VolumeId,
     /// The paths, or the whole base.
     paths: Option<Vec<String>>,
+  },
+  /// Capture an overlay's whole base into a complete immutable snapshot (`base capture ID`, §4.15 `capture_base`,
+  /// A-291), whose clones need no base directory and move between fleet members.
+  CaptureBase {
+    /// The overlay.
+    volume: slates_client::VolumeId,
   },
   /// Build a snapshot's disk image (`image build`, A-160).
   ImageBuild {
@@ -496,6 +521,43 @@ pub(crate) enum Verb {
     /// The consumer.
     consumer: u64,
   },
+  /// Enroll an SSH public key for a principal (`credential key LINE`, A-625 part 3): the human surface's verb, proven
+  /// under the anchor's issuer secret (§4.13); the key's id is its OpenSSH fingerprint.
+  CredentialKey {
+    /// The key's `.pub` line, as `ssh-keygen` writes it.
+    line: String,
+    /// The principal it proves, or the caller's own account when none is given.
+    principal: Option<SharePrincipal>,
+    /// How many seconds from now it proves the principal; for good when none is given.
+    expires_s: Option<u64>,
+  },
+  /// Mint an HTTP token for a principal and enroll it by its hash (`credential token`, A-625 part 3): the human
+  /// surface's verb; the token is shown once.
+  CredentialToken {
+    /// The principal it proves, or the caller's own account when none is given.
+    principal: Option<SharePrincipal>,
+    /// How many seconds from now it proves the principal; for good when none is given.
+    expires_s: Option<u64>,
+  },
+  /// Revoke a version-control credential by its id (`credential revoke ID`, A-625 part 3): the human surface's verb.
+  CredentialRevoke {
+    /// The credential's id.
+    id: [u8; 32],
+  },
+  /// Create a version-control repository (`repository create NAME --tool git|hg|svn`, §4.17.1; A-685): its record and
+  /// its root green, on the partition its name hashes to.
+  RepositoryCreate {
+    /// `CreateRepository`'s fields, each the tool's default where the command line names none.
+    spec: RepositorySpec,
+  },
+  /// Import a history into a repository's empty store (`repository import NAME PATH`, A-710 over A-678's and A-652
+  /// part 3's `ImportRepository`): a Mercurial repository's directory or a Subversion dump, read by the daemon.
+  RepositoryImport {
+    /// The repository's name.
+    repository: String,
+    /// The host path the daemon reads, absolute.
+    path: String,
+  },
   /// Set a principal's rights on a volume (`share ID PRINCIPAL [--read] [--write] [--admin]`).
   Share {
     /// The volume.
@@ -511,6 +573,14 @@ pub(crate) enum Verb {
     volume: slates_client::VolumeId,
     /// Whether it is live-shipped from now on.
     live_shipped: bool,
+  },
+  /// Move a volume to another fleet member (`move ID --to HOST`, §4.10, A-291): asks its owner until the configuration
+  /// names the member.
+  Move {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The member's host id, as `status` names the members.
+    to: u64,
   },
 }
 
@@ -537,11 +607,6 @@ pub(crate) enum SharePrincipal {
   },
 }
 
-/// Derived: a grant's default validity, in nanoseconds — one hour, the span §4.15's session scope
-/// names as the longest a human's single approval should stand without renewal (an agent that lands
-/// later than that re-presents its manifest for a fresh look). `--term SECONDS` overrides it.
-pub(crate) const GRANT_TERM_NS: u64 = 3_600 * 1_000_000_000;
-
 /// A client request: the instance and the verb.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientRequest {
@@ -554,15 +619,19 @@ pub(crate) struct ClientRequest {
   pub json: bool,
 }
 
-/// A `slates exec` request: the volume, the path to show it at, and the command to run.
+/// A `slates apparmor` request (A-370): print slates' AppArmor profile, or check whether `exec` can make its namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExecRequest {
-  /// The volume to make visible.
-  pub volume: String,
-  /// The path to make it visible at.
-  pub at: String,
-  /// The command and its arguments.
-  pub command: Vec<String>,
+pub(crate) enum AppArmorRequest {
+  /// Print the profile for `executable`, else for this binary's own path.
+  Profile {
+    /// The executable the profile attaches to, when not this binary.
+    executable: Option<String>,
+  },
+  /// Report the host's restriction, this binary's profile, and how to load it.
+  Check {
+    /// Emit machine-readable JSON.
+    json: bool,
+  },
 }
 
 /// A `slates run` request: the harness verb (§4.13) — enroll a consumer, deliver its capability to
@@ -594,6 +663,12 @@ pub(crate) struct ShardsRequest {
   pub read_only: bool,
   /// Where the command finds its end.
   pub handed: HandOff,
+  /// Where the command finds its stream's resync end (`--resync-fd M`, Unix; A-316), when it asked for one: the channel
+  /// a successor daemon hands it a fresh stream on (`slates_bridge_fuse::shards_resync`).
+  pub resync_at: Option<i32>,
+  /// Whether the command's arguments name its stream's resync end where `{resync}` stands (Windows; A-433), as a handle
+  /// it inherits.
+  pub resync_named: bool,
   /// Announce the attachment as JSON.
   pub json: bool,
   /// The command and its arguments.
@@ -644,8 +719,10 @@ pub(crate) struct PmemRequest {
 /// The parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
-  /// The launcher.
-  Exec(ExecRequest),
+  /// The launcher (its request is every surface's, A-370).
+  Exec(slates_client::exec::ExecSpec),
+  /// slates' AppArmor profile for the launcher: print it, or check the host (A-370).
+  AppArmor(AppArmorRequest),
   /// The harness verb.
   Run(RunRequest),
   /// A command run with a Shards stream end.
@@ -695,6 +772,9 @@ const VALUES: &[&str] = &[
   "--shards",
   "--fleet",
   "--node",
+  "--vcs-http",
+  "--vcs-ssh",
+  "--vcs-svn",
   "--bounded",
   "--dynamic",
   "--base",
@@ -715,8 +795,16 @@ const VALUES: &[&str] = &[
   "--account",
   "--uid",
   "--fd",
+  "--resync-fd",
   "--tag",
   "--dax-window",
+  "--executable",
+  "--principal",
+  "--expires",
+  "--tool",
+  "--format",
+  "--default-branch",
+  "--root",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -736,6 +824,8 @@ const SWITCHES: &[&str] = &[
   "--session",
   "--require-evidence",
   "--keep",
+  "--apparmor-profile",
+  "--hold",
 ];
 
 /// Takes the untouched command after `--` (`exec` and `run` share this boundary).
@@ -769,13 +859,14 @@ fn parse_run(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError>
   }))
 }
 
-/// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
+/// Parses `exec --volume V --at PATH [--apparmor-profile] -- CMD ...`: the flags before `--`, the command after it. The
+/// AppArmor option is off unless `--apparmor-profile` is given (A-370).
 fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
   let command = command_after(arguments)?;
   refuse_extra_command_words(taken)?;
   taken.only(&Spec {
     values: &["--volume", "--at"],
-    switches: &[],
+    switches: &["--apparmor-profile"],
   })?;
   let volume = taken
     .value("--volume")
@@ -785,11 +876,40 @@ fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError
     .value("--at")
     .ok_or(ParseError::Missing("--at"))?
     .to_owned();
-  Ok(Command::Exec(ExecRequest {
+  let apparmor = if taken.switch("--apparmor-profile") {
+    slates_client::exec::AppArmor::Profile
+  } else {
+    slates_client::exec::AppArmor::Off
+  };
+  Ok(Command::Exec(slates_client::exec::ExecSpec {
     volume,
     at,
     command,
+    apparmor,
   }))
+}
+
+/// Parses `apparmor profile [--executable PATH]` and `apparmor check [--json]` (A-370).
+fn parse_apparmor(taken: &Taken, rest: &[&str]) -> Result<Command, ParseError> {
+  match rest {
+    ["profile"] => {
+      taken.only(&Spec {
+        values: &["--executable"],
+        switches: &[],
+      })?;
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: taken.value("--executable").map(str::to_owned),
+      }))
+    }
+    ["check"] => {
+      taken.only(&NONE)?;
+      Ok(Command::AppArmor(AppArmorRequest::Check {
+        json: taken.json(),
+      }))
+    }
+    [] => Err(ParseError::Missing("`profile` or `check`")),
+    [other, ..] => Err(ParseError::UnknownCommand(format!("apparmor {other}"))),
+  }
 }
 
 /// Format: the lowest descriptor number `shards --fd` takes: standard input, output and error are 0, 1 and 2, which a
@@ -800,6 +920,10 @@ const FIRST_HANDED_FD: i32 = 3;
 /// Format: where a `shards` command's arguments name its stream end on Windows: each occurrence becomes the handle's
 /// value in the command's process, in decimal, as Shards' `--slates-fs-handle V` takes it (A-179).
 pub(crate) const HANDLE_PLACEHOLDER: &str = "{handle}";
+
+/// Format: where a `shards` command's arguments name its stream's resync end on Windows (A-433): each occurrence becomes
+/// the end's handle value in the command's process, in decimal. Unix places the end at a number instead (`--resync-fd`).
+pub(crate) const RESYNC_PLACEHOLDER: &str = "{resync}";
 
 /// How a platform hands a `shards` command its stream end: Unix places a descriptor at a number the command is told
 /// with `--fd N` before it replaces itself with the command; Windows starts the command inheriting a handle whose value
@@ -843,12 +967,18 @@ fn parse_shards(
   let handed = match kind {
     HandOffKind::Descriptor => {
       taken.only(&Spec {
-        values: &["--subtree", "--fd"],
+        values: &["--subtree", "--fd", "--resync-fd"],
         switches: &["--read-only"],
       })?;
       HandOff::Descriptor(handed_fd(taken)?)
     }
     HandOffKind::Handle => {
+      if taken.value("--resync-fd").is_some() {
+        return Err(ParseError::BadValue {
+          what: "--resync-fd",
+          reason: "Windows hands no resync end yet: Shards specifies its handle path".to_owned(),
+        });
+      }
       if taken.value("--fd").is_some() {
         return Err(ParseError::BadValue {
           what: "--fd",
@@ -879,15 +1009,50 @@ fn parse_shards(
       "{handle} in the command's arguments, where the stream end's handle goes (e.g. --slates-fs-handle {handle})",
     ));
   }
+  let resync_at = resync_fd(taken, handed)?;
+  let resync_named = command
+    .iter()
+    .skip(1)
+    .any(|argument| argument.contains(RESYNC_PLACEHOLDER));
+  if resync_named && handed != HandOff::Handle {
+    return Err(ParseError::BadValue {
+      what: "{resync}",
+      reason: "this platform places the resync end at a descriptor number: --resync-fd M"
+        .to_owned(),
+    });
+  }
   Ok(Command::Shards(ShardsRequest {
     instance: taken.instance(),
     volume: volume(id)?,
     subtree: taken.value("--subtree").map(str::to_owned),
     read_only: taken.switch("--read-only"),
     handed,
+    resync_at,
+    resync_named,
     json: taken.json(),
     command,
   }))
+}
+
+/// The descriptor number `--resync-fd M` names, when given (A-316): past standard input, output and error, and not the
+/// stream's own number.
+fn resync_fd(taken: &Taken, handed: HandOff) -> Result<Option<i32>, ParseError> {
+  let Some(value) = taken.value("--resync-fd") else {
+    return Ok(None);
+  };
+  let fd = value.parse::<i32>().map_err(|e| ParseError::BadValue {
+    what: "--resync-fd",
+    reason: e.to_string(),
+  })?;
+  if fd < FIRST_HANDED_FD || handed == HandOff::Descriptor(fd) {
+    return Err(ParseError::BadValue {
+      what: "--resync-fd",
+      reason: format!(
+        "{fd} is standard input, output or error, or the stream's own number; the resync end needs a number of its own from {FIRST_HANDED_FD}"
+      ),
+    });
+  }
+  Ok(Some(fd))
 }
 
 /// The descriptor number `--fd N` names: required, and past standard input, output and error.
@@ -1027,16 +1192,27 @@ struct Spec {
   switches: &'static [&'static str],
 }
 
-/// The arguments with the flags taken out: the words in order, the flags by name.
+/// The arguments with the flags taken out: the words in order, the flags by name, each with every value it was given,
+/// in order.
 struct Taken {
   words: Vec<String>,
-  values: BTreeMap<&'static str, String>,
+  values: BTreeMap<&'static str, Vec<String>>,
   switches: BTreeMap<&'static str, bool>,
 }
 
 impl Taken {
+  /// The value of a flag that takes one: the last given.
   fn value(&self, flag: &str) -> Option<&str> {
-    self.values.get(flag).map(String::as_str)
+    self
+      .values
+      .get(flag)
+      .and_then(|given| given.last())
+      .map(String::as_str)
+  }
+
+  /// Every value of a flag that may be given again (a landing's `--include` and `--exclude`), in the order given.
+  fn every(&self, flag: &str) -> Vec<String> {
+    self.values.get(flag).cloned().unwrap_or_default()
   }
 
   fn switch(&self, flag: &str) -> bool {
@@ -1108,7 +1284,7 @@ fn take(arguments: &[String]) -> Result<Taken, ParseError> {
           .cloned()
           .ok_or_else(|| ParseError::MissingValue(full.clone()))?,
       };
-      taken.values.insert(key, value);
+      taken.values.entry(key).or_default().push(value);
     } else if let Some(key) = known(SWITCHES, &full) {
       if inline.is_some() {
         return Err(ParseError::BadValue {
@@ -1124,13 +1300,15 @@ fn take(arguments: &[String]) -> Result<Taken, ParseError> {
   Ok(taken)
 }
 
+/// `--shards N`, read as the roles read it (`slates_api::role::shard_count`): a count past the runtime's registry is
+/// refused as usage before anything starts.
 fn shards_of(taken: &Taken) -> Result<Option<u16>, ParseError> {
   taken
     .value("--shards")
     .map(|s| {
-      s.parse::<u16>().map_err(|e| ParseError::BadValue {
+      slates_api::role::shard_count(s).map_err(|reason| ParseError::BadValue {
         what: "--shards",
-        reason: e.to_string(),
+        reason,
       })
     })
     .transpose()
@@ -1150,6 +1328,39 @@ fn fleet_of(taken: &Taken) -> Result<Option<FleetSelection>, ParseError> {
     (None, Some(_)) => Err(ParseError::Missing("--fleet PATH (the fleet manifest)")),
     (None, None) => Ok(None),
   }
+}
+
+/// A version-control listener's address, `flag`'s: `--vcs-http ADDRESS`, the servers' shared HTTP edge (A-625 part 3),
+/// or `--vcs-svn ADDRESS`, the svn:// listener (A-656 part 2), read as the roles read them
+/// (`slates_api::role::vcs_address`): an address off loopback on a daemon that is no fleet node (`fleet_node` false)
+/// would serve cleartext there, so it is refused as usage before anything starts.
+fn vcs_address_of(
+  taken: &Taken,
+  flag: &'static str,
+  fleet_node: bool,
+) -> Result<Option<slates_rt::tcp::SocketAddrV4>, ParseError> {
+  taken
+    .value(flag)
+    .map(|text| {
+      slates_api::role::vcs_address(text, fleet_node)
+        .map_err(|reason| ParseError::BadValue { what: flag, reason })
+    })
+    .transpose()
+}
+
+/// `--vcs-ssh ADDRESS`, the version-control servers' SSH edge (A-684), read as the roles read it
+/// (`slates_api::role::vcs_ssh_address`): any IPv4 address and port, since SSH encrypts every connection; a name or an
+/// address without its port is refused as usage before anything starts.
+fn vcs_ssh_of(taken: &Taken) -> Result<Option<slates_rt::tcp::SocketAddrV4>, ParseError> {
+  taken
+    .value("--vcs-ssh")
+    .map(|text| {
+      slates_api::role::vcs_ssh_address(text).map_err(|reason| ParseError::BadValue {
+        what: "--vcs-ssh",
+        reason,
+      })
+    })
+    .transpose()
 }
 
 fn size_of(taken: &Taken) -> Result<SizeClass, ParseError> {
@@ -1268,6 +1479,214 @@ fn share_principal(text: &str) -> Result<SharePrincipal, ParseError> {
   }
 }
 
+/// A credential's id as a human names it (A-625 part 3): an SSH key's fingerprint as `ssh-keygen -l` prints it
+/// (`SHA256:` and the hash in base64 without padding), or 64 hexadecimal characters as `credential` prints a token's.
+fn credential_id(text: &str) -> Result<[u8; MANIFEST_BYTES], ParseError> {
+  let bad = || ParseError::BadValue {
+    what: "ID",
+    reason: format!("{text} (SHA256:... as ssh-keygen -l prints it, or 64 hexadecimal characters)"),
+  };
+  let Some(encoded) = text.strip_prefix("SHA256:") else {
+    return manifest_hash(text).map_err(|_| bad());
+  };
+  let mut padded = encoded.to_owned();
+  while !padded.len().is_multiple_of(BASE64_GROUP) {
+    padded.push('=');
+  }
+  let bytes = slates_server::signed_work::base64_decode(&padded).map_err(|_| bad())?;
+  <[u8; MANIFEST_BYTES]>::try_from(bytes.as_slice()).map_err(|_| bad())
+}
+
+/// Format: the characters of one base64 group (RFC 4648 §4), to which an unpadded fingerprint is padded.
+const BASE64_GROUP: usize = 4;
+
+/// The flags a credential's enrollment takes: `--principal PRINCIPAL` and `--expires SECONDS`.
+fn credential_flags(taken: &Taken) -> Result<(Option<SharePrincipal>, Option<u64>), ParseError> {
+  taken.only(&Spec {
+    values: &["--principal", "--expires"],
+    switches: &[],
+  })?;
+  let principal = taken
+    .value("--principal")
+    .map(share_principal)
+    .transpose()?;
+  let expires_s = taken.value("--expires").map(number).transpose()?;
+  Ok((principal, expires_s))
+}
+
+/// The verbs of the version-control credentials (A-625 part 3): `credential key`, `credential token`, `credential
+/// revoke`.
+fn parse_credential(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
+  match words {
+    ["credential", "key", line] => {
+      let (principal, expires_s) = credential_flags(taken)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialKey {
+          line: (*line).to_owned(),
+          principal,
+          expires_s,
+        },
+      )))
+    }
+    ["credential", "token"] => {
+      let (principal, expires_s) = credential_flags(taken)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialToken {
+          principal,
+          expires_s,
+        },
+      )))
+    }
+    ["credential", "revoke", id] => {
+      taken.only(&NONE)?;
+      Ok(Some(client(
+        taken,
+        Verb::CredentialRevoke {
+          id: credential_id(id)?,
+        },
+      )))
+    }
+    ["credential", ..] => Err(ParseError::Missing(
+      "credential key LINE | credential token | credential revoke ID",
+    )),
+    _ => Ok(None),
+  }
+}
+
+/// Format: `--tool`'s words, each tool's own command's name.
+const TOOL_NAMES: [(&str, VcsTool); 3] = [
+  ("git", VcsTool::Git),
+  ("hg", VcsTool::Mercurial),
+  ("svn", VcsTool::Subversion),
+];
+
+/// Format: `--format`'s words: git's own for its two (`git init --object-format`), and Subversion's revision numbers.
+const FORMAT_NAMES: [(&str, ObjectFormat); 3] = [
+  ("sha1", ObjectFormat::Sha1),
+  ("sha256", ObjectFormat::Sha256),
+  ("revisions", ObjectFormat::Revisions),
+];
+
+/// The version-control repository verbs (§4.17.1; A-685, A-710): `repository create` and `repository import`.
+fn parse_repository(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
+  match words {
+    ["repository", "create", name] => repository_create(taken, name).map(Some),
+    ["repository", "import", name, path] => repository_import(taken, name, path).map(Some),
+    ["repository", ..] => Err(ParseError::Missing(REPOSITORY_FORMS)),
+    _ => Ok(None),
+  }
+}
+
+/// The repository verbs' forms, named by a usage error.
+const REPOSITORY_FORMS: &str =
+  "repository create NAME --tool git|hg|svn | repository import NAME PATH";
+
+/// `repository import NAME PATH` (A-710): the daemon reads PATH, so it must be absolute, since the daemon's working
+/// directory is not the caller's; a relative one is a usage error before the daemon is asked.
+fn repository_import(taken: &Taken, name: &str, path: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &[],
+    switches: &[],
+  })?;
+  if !std::path::Path::new(path).is_absolute() {
+    return Err(ParseError::BadValue {
+      what: "PATH",
+      reason: format!("{path}: the daemon reads it, so it must be absolute"),
+    });
+  }
+  Ok(client(
+    taken,
+    Verb::RepositoryImport {
+      repository: name.to_owned(),
+      path: path.to_owned(),
+    },
+  ))
+}
+
+/// `repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN]` (A-685):
+/// `CreateRepository`'s fields, the tool's defaults where none is named, as the server crate decides them
+/// (`slates_server::object_formats`, `slates_server::root_binding`); a format or a branch the tool cannot have is a
+/// usage error before the daemon is asked.
+fn repository_create(taken: &Taken, name: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--tool", "--format", "--default-branch", "--root"],
+    switches: &[],
+  })?;
+  let tool = vcs_tool(
+    taken
+      .value("--tool")
+      .ok_or(ParseError::Missing("--tool git|hg|svn"))?,
+  )?;
+  let format = object_format(tool, taken.value("--format"))?;
+  let branch = taken.value("--default-branch");
+  let default_branch =
+    slates_server::root_binding(tool, branch).map_err(|refused| ParseError::BadValue {
+      what: "--default-branch",
+      reason: format!("{}: {refused}", branch.unwrap_or_default()),
+    })?;
+  let green = taken.value("--root").map(volume).transpose()?;
+  Ok(client(
+    taken,
+    Verb::RepositoryCreate {
+      spec: RepositorySpec {
+        name: name.to_owned(),
+        tool,
+        format,
+        default_branch,
+        green,
+      },
+    },
+  ))
+}
+
+/// `--tool`'s value ([`TOOL_NAMES`]).
+fn vcs_tool(text: &str) -> Result<VcsTool, ParseError> {
+  TOOL_NAMES
+    .iter()
+    .find(|(word, _)| *word == text)
+    .map(|(_, tool)| *tool)
+    .ok_or_else(|| ParseError::BadValue {
+      what: "--tool",
+      reason: format!("{text} (git, hg or svn)"),
+    })
+}
+
+/// `--format`'s value for `tool`: one of the formats the tool names its objects in (`slates_server::object_formats`),
+/// that list's first, the tool's own default, when none is given.
+fn object_format(tool: VcsTool, given: Option<&str>) -> Result<ObjectFormat, ParseError> {
+  let formats = slates_server::object_formats(tool);
+  let chosen = match given {
+    None => formats.first().copied(),
+    Some(text) => FORMAT_NAMES
+      .iter()
+      .find(|(word, format)| *word == text && formats.contains(format))
+      .map(|(_, format)| *format),
+  };
+  chosen.ok_or_else(|| ParseError::BadValue {
+    what: "--format",
+    reason: format!(
+      "{} ({} names its objects by {})",
+      given.unwrap_or_default(),
+      word_of(&TOOL_NAMES, tool),
+      formats
+        .iter()
+        .map(|format| word_of(&FORMAT_NAMES, *format))
+        .collect::<Vec<_>>()
+        .join(" or ")
+    ),
+  })
+}
+
+/// The word `names` gives `value`.
+fn word_of<T: PartialEq>(names: &[(&'static str, T)], value: T) -> &'static str {
+  names
+    .iter()
+    .find(|(_, named)| *named == value)
+    .map_or("", |(word, _)| *word)
+}
+
 /// The verbs of the enrollment surface (§4.13): `enroll`, `revoke`, `share`.
 fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
   match words {
@@ -1319,9 +1738,31 @@ fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
         },
       )))
     }
+    ["move", id] => {
+      taken.only(&Spec {
+        values: &["--to"],
+        switches: &[],
+      })?;
+      let to = taken
+        .value("--to")
+        .ok_or(ParseError::Missing("move ID --to HOST"))?
+        .parse::<u64>()
+        .map_err(|e| ParseError::BadValue {
+          what: "--to",
+          reason: e.to_string(),
+        })?;
+      Ok(Some(client(
+        taken,
+        Verb::Move {
+          volume: volume(id)?,
+          to,
+        },
+      )))
+    }
     ["revoke"] => Err(ParseError::Missing("CONSUMER")),
     ["share", ..] => Err(ParseError::Missing("share ID PRINCIPAL")),
     ["live-ship", ..] => Err(ParseError::Missing("live-ship ID")),
+    ["move", ..] => Err(ParseError::Missing("move ID --to HOST")),
     _ => Ok(None),
   }
 }
@@ -1497,21 +1938,38 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     _ if boundary.is_some() => return Err(ParseError::UnknownFlag("--".to_owned())),
     _ => {}
   }
+  if let Some(command) = parse_credential(&taken, &words)? {
+    return Ok(command);
+  }
   if let Some(command) = parse_enrollment(&taken, &words)? {
+    return Ok(command);
+  }
+  if let Some(command) = parse_repository(&taken, &words)? {
     return Ok(command);
   }
   match words.as_slice() {
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
-        values: &["--shards", "--fleet", "--node"],
+        values: &[
+          "--shards",
+          "--fleet",
+          "--node",
+          "--vcs-http",
+          "--vcs-ssh",
+          "--vcs-svn",
+        ],
         switches: &["--quick"],
       })?;
+      let fleet = fleet_of(&taken)?;
       let options = ProcessOptions {
         instance: taken.instance(),
         quick: taken.switch("--quick"),
         shards: shards_of(&taken)?,
-        fleet: fleet_of(&taken)?,
+        vcs_http: vcs_address_of(&taken, "--vcs-http", fleet.is_some())?,
+        vcs_ssh: vcs_ssh_of(&taken)?,
+        vcs_svn: vcs_address_of(&taken, "--vcs-svn", fleet.is_some())?,
+        fleet,
       };
       Ok(if words.first() == Some(&"anchor") {
         Command::Anchor(options)
@@ -1567,10 +2025,11 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       }))
     }
     ["volume", rest @ ..] => parse_volume(&taken, rest),
+    ["apparmor", rest @ ..] => parse_apparmor(&taken, rest),
     ["attach", id] => {
       taken.only(&Spec {
         values: &["--snapshot", "--oci-source", "--oci-destination"],
-        switches: &["--read", "--write"],
+        switches: &["--read", "--write", "--hold"],
       })?;
       let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
       let intent = if taken.switch("--write") {
@@ -1578,6 +2037,22 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       } else {
         Intent::Read
       };
+      // `--hold`: this process keeps the CLI attachment alive until it ends (A-384); a container bind has its own life.
+      if taken.switch("--hold") {
+        if taken.value("--oci-source").is_some() || taken.value("--oci-destination").is_some() {
+          return Err(ParseError::Missing(
+            "no --oci-source or --oci-destination with --hold: a container bind is not held",
+          ));
+        }
+        return Ok(client(
+          &taken,
+          Verb::Hold {
+            volume: volume(id)?,
+            snapshot,
+            intent,
+          },
+        ));
+      }
       let form = match (
         taken.value("--oci-source"),
         taken.value("--oci-destination"),
@@ -1763,17 +2238,11 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           })
         })
         .transpose()?;
+      // Each prefix as often as given (§4.15 step 1): the wire's filter takes several, and a harness leaves out more
+      // than one (git's own directory and what git ignores).
       let filter = slates_client::Filter {
-        include: taken
-          .value("--include")
-          .map(str::to_owned)
-          .into_iter()
-          .collect(),
-        exclude: taken
-          .value("--exclude")
-          .map(str::to_owned)
-          .into_iter()
-          .collect(),
+        include: taken.every("--include"),
+        exclude: taken.every("--exclude"),
       };
       Ok(client(
         &taken,
@@ -1814,7 +2283,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
             reason: e.to_string(),
           })?
           .saturating_mul(NANOS_PER_SECOND),
-        None => GRANT_TERM_NS,
+        None => slates_api::GRANT_TERM_NS,
       };
       Ok(client(
         &taken,
@@ -2145,9 +2614,15 @@ fn parse_base(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
         paths: paths(&rest.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>()),
       },
     )),
+    ["capture", id] => Ok(client(
+      taken,
+      Verb::CaptureBase {
+        volume: volume(id)?,
+      },
+    )),
     [] => Err(ParseError::Missing("base subcommand")),
     ["read" | "digest", ..] => Err(ParseError::Missing("ID PATH")),
-    ["rewitness" | "pin"] => Err(ParseError::Missing("volume ID")),
+    ["rewitness" | "pin" | "capture"] => Err(ParseError::Missing("volume ID")),
     [other, ..] => Err(ParseError::UnknownCommand(format!("base {other}"))),
   }
 }
@@ -2158,6 +2633,14 @@ mod tests {
 
   fn args(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_owned).collect()
+  }
+
+  /// The client request a command line parses to; a test fails if it parses to anything else.
+  fn client_request(text: &str) -> ClientRequest {
+    let Command::Client(request) = parse(&args(text)).unwrap() else {
+      panic!("not a client verb: {text}");
+    };
+    request
   }
 
   /// AC-8.1, §4.8: recovery requires an exact plan and both explicit acknowledgements;
@@ -2186,6 +2669,35 @@ mod tests {
       assert!(parse(&args(&format!("recover {scope} --fenced --accept-loss"))).is_err());
     }
     assert!(parse(&args("recover root --confirm wrong --fenced --accept-loss")).is_err());
+  }
+
+  /// §4.15 step 1 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a landing's `--include` and `--exclude` each keep
+  /// every prefix given, in order, as the wire's filter takes them; before, each kept its last value alone, so
+  /// `--exclude /.git --exclude /target` landed `/target`. A flag that takes one value keeps the last.
+  #[test]
+  fn a_landing_keeps_every_include_and_exclude_given() {
+    let id = "ab".repeat(16);
+    let Ok(Command::Client(request)) = parse(&args(&format!(
+      "land {id} /dir --exclude /.git --include /src --exclude /target --include /docs --grant 1 --grant 7"
+    ))) else {
+      panic!("land is a client request");
+    };
+    let Verb::Land { filter, grant, .. } = request.verb else {
+      panic!("land parses as a landing");
+    };
+    assert_eq!(filter.exclude, ["/.git", "/target"]);
+    assert_eq!(filter.include, ["/src", "/docs"]);
+    assert_eq!(grant, Some(7), "a flag that takes one value keeps the last");
+    let Ok(Command::Client(plain)) = parse(&args(&format!("land {id} /dir"))) else {
+      panic!("land is a client request");
+    };
+    let Verb::Land { filter, .. } = plain.verb else {
+      panic!("land parses as a landing");
+    };
+    assert!(
+      filter.include.is_empty() && filter.exclude.is_empty(),
+      "no filter keeps everything"
+    );
   }
 
   /// §4.6 (AUD-29-75): `export` names one volume, optionally read-only and scoped to a subtree; anything else is
@@ -2237,16 +2749,30 @@ mod tests {
     assert!(parse(&args("bootstrap")).is_err());
   }
 
+  /// A-291 (§4.15 `capture_base`): `base capture` names one overlay; a capture of nothing, or of paths (a capture is
+  /// always the whole base), is refused rather than guessed.
+  #[test]
+  fn base_capture_names_one_overlay_and_no_paths() {
+    let id = "ab".repeat(16);
+    let Command::Client(request) = parse(&args(&format!("base capture {id}"))).unwrap() else {
+      panic!("base capture is a client request");
+    };
+    assert!(matches!(request.verb, Verb::CaptureBase { .. }));
+    assert!(
+      parse(&args("base capture")).is_err(),
+      "an overlay is required"
+    );
+    assert!(
+      parse(&args(&format!("base capture {id} /src"))).is_err(),
+      "a capture is the whole base"
+    );
+  }
+
   /// The grammar: a create with its flags in any order, a global instance before or after
   /// the verb, the process verbs' options.
   #[test]
   fn the_grammar_parses_the_documented_forms() {
-    let Command::Client(request) = parse(&args(
-      "volume create scratch --bounded 4GiB --fold --instance x",
-    ))
-    .unwrap() else {
-      panic!("client");
-    };
+    let request = client_request("volume create scratch --bounded 4GiB --fold --instance x");
     assert_eq!(request.instance, "x");
     assert_eq!(
       request.verb,
@@ -2258,17 +2784,10 @@ mod tests {
         base: None,
       }
     );
-    let Command::Client(request) = parse(&args("--instance y volume list")).unwrap() else {
-      panic!("client");
-    };
+    let request = client_request("--instance y volume list");
     assert_eq!(request.instance, "y");
     assert_eq!(request.verb, Verb::List);
-    let Command::Client(request) = parse(&args(
-      "attach 00000000000000000000000000000001 --write --snapshot 3",
-    ))
-    .unwrap() else {
-      panic!("client");
-    };
+    let request = client_request("attach 00000000000000000000000000000001 --write --snapshot 3");
     assert_eq!(
       request.verb,
       Verb::Attach {
@@ -2278,6 +2797,28 @@ mod tests {
         form: slates_client::AttachRequest::Termed,
       }
     );
+    // `--hold` keeps the CLI attachment alive from this process (A-384); a container bind is not held.
+    let request = client_request("attach 00000000000000000000000000000001 --write --hold");
+    assert_eq!(
+      request.verb,
+      Verb::Hold {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        snapshot: None,
+        intent: Intent::Write,
+      }
+    );
+    assert!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --hold --oci-source /a --oci-destination /b",
+      ))
+      .is_err(),
+      "a container bind is not held"
+    );
+  }
+
+  /// The process verbs' grammar: the anchor's and the MCP server's options, a global instance among them.
+  #[test]
+  fn the_grammar_parses_the_process_verbs() {
     assert_eq!(
       parse(&args("anchor --quick --shards 2 --instance z")),
       Ok(Command::Anchor(ProcessOptions {
@@ -2285,6 +2826,9 @@ mod tests {
         quick: true,
         shards: Some(2),
         fleet: None,
+        vcs_http: None,
+        vcs_ssh: None,
+        vcs_svn: None,
       }))
     );
     assert_eq!(
@@ -2392,6 +2936,9 @@ mod tests {
           manifest: "/etc/slates/fleet.json".into(),
           node: "a".into(),
         }),
+        vcs_http: None,
+        vcs_ssh: None,
+        vcs_svn: None,
       }))
     );
     assert!(matches!(
@@ -2402,6 +2949,121 @@ mod tests {
       parse(&args("anchor --node a")),
       Err(ParseError::Missing(_))
     ));
+  }
+
+  /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: parse `daemon --vcs-http` on a loopback address, a fleet node's
+  /// `anchor --vcs-http` on an address every interface reaches, a daemon that is no fleet node asking for an edge off
+  /// loopback, and an address that is a name. Expect: the edge's address read on the daemon and on the fleet node's
+  /// anchor (which hands it to its daemon); the edge off loopback without a fleet refused as a bad `--vcs-http` naming
+  /// loopback, since it would serve cleartext there; the name refused as a bad `--vcs-http`.
+  #[test]
+  fn the_grammar_parses_the_daemons_vcs_http_edge() {
+    let loopback = slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 8080);
+    assert_eq!(
+      parse(&args("daemon --instance a --vcs-http 127.0.0.1:8080")),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: None,
+        vcs_http: Some(loopback),
+        vcs_ssh: None,
+        vcs_svn: None,
+      }))
+    );
+    let anchor = parse(&args(
+      "anchor --fleet /etc/slates/fleet.json --node b --vcs-http 0.0.0.0:443",
+    ));
+    assert!(
+      matches!(&anchor, Ok(Command::Anchor(options)) if options.vcs_http
+        == Some(slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 443))),
+      "{anchor:?}"
+    );
+    let cleartext = parse(&args("daemon --vcs-http 10.0.0.7:8080"));
+    assert!(
+      matches!(&cleartext, Err(ParseError::BadValue { what: "--vcs-http", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
+    assert!(matches!(
+      parse(&args("daemon --vcs-http localhost:8080")),
+      Err(ParseError::BadValue {
+        what: "--vcs-http",
+        ..
+      })
+    ));
+  }
+
+  /// A-684 (§4.17.2 "Transports" item 2). Do: parse `daemon --vcs-ssh` on a loopback address, an `anchor --vcs-ssh` that
+  /// is no fleet node on an address every interface reaches, beside `--vcs-http`, and an address that is a name. Expect:
+  /// the edge's address read on the daemon and on the anchor (which hands it to its daemon), any address taken without a
+  /// fleet since SSH encrypts every connection, and the name refused as a bad `--vcs-ssh`.
+  #[test]
+  fn the_grammar_parses_the_daemons_vcs_ssh_edge() {
+    let loopback = slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 2222);
+    assert_eq!(
+      parse(&args("daemon --instance a --vcs-ssh 127.0.0.1:2222")),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: None,
+        vcs_http: None,
+        vcs_ssh: Some(loopback),
+        vcs_svn: None,
+      }))
+    );
+    let anchor = parse(&args(
+      "anchor --vcs-http 127.0.0.1:8080 --vcs-ssh 0.0.0.0:2222",
+    ));
+    assert!(
+      matches!(&anchor, Ok(Command::Anchor(options)) if options.vcs_ssh
+        == Some(slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 2222))),
+      "{anchor:?}"
+    );
+    assert!(matches!(
+      parse(&args("daemon --vcs-ssh localhost:2222")),
+      Err(ParseError::BadValue {
+        what: "--vcs-ssh",
+        ..
+      })
+    ));
+  }
+
+  /// A-656 part 2 (§4.17.4 piece 7). Do: parse `daemon --vcs-svn` on a loopback address beside `--vcs-http`, a fleet
+  /// node's `anchor --vcs-svn` on an address every interface reaches, and a daemon that is no fleet node asking for the
+  /// svn:// listener off loopback. Expect: each address read, the daemon's beside its HTTP edge's; the listener off
+  /// loopback without a fleet refused as a bad `--vcs-svn` naming loopback, since ra_svn is cleartext.
+  #[test]
+  fn the_grammar_parses_the_daemons_svn_listener() {
+    let loopback =
+      |port| slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, port);
+    assert_eq!(
+      parse(&args(
+        "daemon --instance a --vcs-http 127.0.0.1:8080 --vcs-svn 127.0.0.1:3690"
+      )),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: None,
+        vcs_http: Some(loopback(8080)),
+        vcs_ssh: None,
+        vcs_svn: Some(loopback(3690)),
+      }))
+    );
+    let anchor = parse(&args(
+      "anchor --fleet /etc/slates/fleet.json --node b --vcs-svn 0.0.0.0:3690",
+    ));
+    assert!(
+      matches!(&anchor, Ok(Command::Anchor(options)) if options.vcs_svn
+        == Some(slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 3690))),
+      "{anchor:?}"
+    );
+    let cleartext = parse(&args("daemon --vcs-svn 10.0.0.7:3690"));
+    assert!(
+      matches!(&cleartext, Err(ParseError::BadValue { what: "--vcs-svn", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
   }
 
   /// The merge service's grammar (§4.16 as a service): a green over a complete immutable base with
@@ -2630,6 +3292,221 @@ mod tests {
     assert_eq!(parse(&args("revoke")), Err(ParseError::Missing("CONSUMER")));
   }
 
+  /// A-625 part 3. Do: parse `credential key` with a whole `.pub` line as its one word and an expiry; `credential token`
+  /// for a consumer; `credential revoke` by the fingerprint `ssh-keygen -l` printed for slates-ssh's RSA fixture, then by
+  /// the same id in hex; a fingerprint cut short; a bare `credential`. Expect: each verb with what was given (the key's
+  /// line whole, no principal, the expiry; the consumer; one id both ways); `BadValue` naming ID; `Missing` naming the
+  /// three forms.
+  #[test]
+  fn the_grammar_parses_the_credential_verbs() {
+    let line =
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl me@host";
+    let words: Vec<String> = ["credential", "key", line, "--expires", "3600"]
+      .iter()
+      .map(|word| (*word).to_owned())
+      .collect();
+    let Command::Client(request) = parse(&words).unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::CredentialKey {
+        line: line.to_owned(),
+        principal: None,
+        expires_s: Some(3600),
+      }
+    );
+    assert_eq!(
+      client_verb("credential token --principal consumer:7 --json"),
+      Verb::CredentialToken {
+        principal: Some(SharePrincipal::Consumer {
+          account: None,
+          consumer: 7,
+          host: None,
+        }),
+        expires_s: None,
+      }
+    );
+    let Verb::CredentialRevoke { id } =
+      client_verb("credential revoke SHA256:Wymbjagh5qjwNh2R9f44I8A1HSB7TrTf6LdcnH26LQ8")
+    else {
+      panic!("revoke");
+    };
+    let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+      client_verb(&format!("credential revoke {hex}")),
+      Verb::CredentialRevoke { id }
+    );
+    assert!(matches!(
+      parse(&args("credential revoke SHA256:Wymbjagh5qjw")),
+      Err(ParseError::BadValue { what: "ID", .. })
+    ));
+    assert_eq!(
+      parse(&args("credential")),
+      Err(ParseError::Missing(
+        "credential key LINE | credential token | credential revoke ID"
+      ))
+    );
+  }
+
+  /// The repository a `repository create` text parses to; a test fails if it parses to anything else.
+  fn repository_spec(text: &str) -> RepositorySpec {
+    let Verb::RepositoryCreate { spec } = client_verb(text) else {
+      panic!("not a repository create: {text}");
+    };
+    spec
+  }
+
+  /// A repository's fields as a test names them.
+  fn spec(
+    name: &str,
+    (tool, format): (VcsTool, ObjectFormat),
+    default_branch: &str,
+    green: Option<slates_client::VolumeId>,
+  ) -> RepositorySpec {
+    RepositorySpec {
+      name: name.to_owned(),
+      tool,
+      format,
+      default_branch: default_branch.to_owned(),
+      green,
+    }
+  }
+
+  /// A-685 (§4.17.1 "The repository and its greens"). Do: parse `repository create` for each tool with no other
+  /// flag; a git repository in SHA-256 on a named branch with a root green, and `--json`; a Mercurial repository on a
+  /// named branch; Subversion's one format named. Expect: each tool's defaults (git: SHA-1, its root bound to `main`;
+  /// Mercurial: SHA-1, bound to its `default` branch's first line, the name its push reads, `branch:default:0`;
+  /// Subversion: revision numbers, bound to `root`), the flags taken as given (Mercurial's branch by its first line).
+  #[test]
+  fn the_grammar_parses_the_repository_verb() {
+    use VcsTool::{Git, Mercurial, Subversion};
+    let id = "00000000000000000000000000000001";
+    let root = parse_volume_id(id).unwrap();
+    assert_eq!(
+      repository_spec("repository create shared --tool git"),
+      spec("shared", (Git, ObjectFormat::Sha1), "main", None)
+    );
+    assert_eq!(
+      repository_spec("repository create shared --tool hg"),
+      spec(
+        "shared",
+        (Mercurial, ObjectFormat::Sha1),
+        "branch:default:0",
+        None
+      )
+    );
+    assert_eq!(
+      repository_spec("repository create shared --tool svn"),
+      spec(
+        "shared",
+        (Subversion, ObjectFormat::Revisions),
+        "root",
+        None
+      )
+    );
+    assert_eq!(
+      repository_spec(&format!(
+        "repository create big --tool git --format sha256 --default-branch dev --root {id} --json"
+      )),
+      spec("big", (Git, ObjectFormat::Sha256), "dev", Some(root))
+    );
+    assert_eq!(
+      repository_spec("repository create shared --tool hg --default-branch stable --format sha1"),
+      spec(
+        "shared",
+        (Mercurial, ObjectFormat::Sha1),
+        "branch:stable:0",
+        None
+      )
+    );
+    assert_eq!(
+      repository_spec("repository create shared --tool svn --format revisions"),
+      spec(
+        "shared",
+        (Subversion, ObjectFormat::Revisions),
+        "root",
+        None
+      )
+    );
+  }
+
+  /// A-685. Do: parse `repository create` with no tool, with a tool slates serves no repository of, with a format
+  /// each tool cannot name its objects in, with a git branch git cannot name (its ref spelled whole, `..` inside), with
+  /// a branch for Subversion, with a root that is no id, and `repository` alone or with no name. Expect: each refused
+  /// as usage before anything is asked, naming what it refuses: the tool missing, `--tool`, `--format`,
+  /// `--default-branch`, the volume id, and the verb's own form.
+  #[test]
+  fn the_grammar_refuses_a_repository_its_tool_cannot_have() {
+    let form = REPOSITORY_FORMS;
+    assert_eq!(
+      parse(&args("repository create shared")),
+      Err(ParseError::Missing("--tool git|hg|svn"))
+    );
+    for (text, refused) in [
+      ("repository create r --tool cvs", "--tool"),
+      (
+        "repository create r --tool git --format revisions",
+        "--format",
+      ),
+      ("repository create r --tool hg --format sha256", "--format"),
+      ("repository create r --tool svn --format sha1", "--format"),
+      ("repository create r --tool git --format md5", "--format"),
+      (
+        "repository create r --tool git --default-branch refs/heads/main",
+        "--default-branch",
+      ),
+      (
+        "repository create r --tool git --default-branch a..b",
+        "--default-branch",
+      ),
+      (
+        "repository create r --tool svn --default-branch trunk",
+        "--default-branch",
+      ),
+      ("repository create r --tool git --root nothex", "volume ID"),
+    ] {
+      assert!(
+        matches!(parse(&args(text)), Err(ParseError::BadValue { what, .. }) if what == refused),
+        "{text}: {:?}",
+        parse(&args(text))
+      );
+    }
+    assert_eq!(parse(&args("repository")), Err(ParseError::Missing(form)));
+    assert_eq!(
+      parse(&args("repository create")),
+      Err(ParseError::Missing(form))
+    );
+  }
+
+  /// A-710. Do: parse `repository import` with an absolute path, with `--json`, with a relative path, and with no
+  /// path. Expect: the name and the path taken as given; a relative path refused as a bad `PATH` before the daemon is
+  /// asked, since the daemon reads it from its own working directory; no path the verbs' forms.
+  #[test]
+  fn the_grammar_parses_the_repository_import_verb() {
+    for text in [
+      "repository import hg-src /srv/hg/hg-src",
+      "repository import hg-src /srv/hg/hg-src --json",
+    ] {
+      assert_eq!(
+        client_verb(text),
+        Verb::RepositoryImport {
+          repository: "hg-src".to_owned(),
+          path: "/srv/hg/hg-src".to_owned(),
+        },
+        "{text}"
+      );
+    }
+    assert!(matches!(
+      parse(&args("repository import r dumps/git.dump")),
+      Err(ParseError::BadValue { what: "PATH", .. })
+    ));
+    assert_eq!(
+      parse(&args("repository import r")),
+      Err(ParseError::Missing(REPOSITORY_FORMS))
+    );
+  }
+
   /// A-237: a share names another host's account by the anchor that host's `slates status` prints (`@ANCHOR`), and
   /// without one this daemon's own host.
   #[test]
@@ -2726,10 +3603,11 @@ mod tests {
       parse(&args(
         "--instance outer exec --volume scratch --at /p -- child --volume inner --help"
       )),
-      Ok(Command::Exec(ExecRequest {
+      Ok(Command::Exec(slates_client::exec::ExecSpec {
         volume: "scratch".into(),
         at: "/p".into(),
         command: args("child --volume inner --help"),
+        apparmor: slates_client::exec::AppArmor::Off,
       }))
     );
   }
@@ -2781,6 +3659,84 @@ mod tests {
     ));
   }
 
+  /// A-370, the flag's plumbing in the CLI. Do: parse `exec` with and without `--apparmor-profile`, then parse the
+  /// arguments every other surface builds for a request (`ExecSpec::arguments`: slates-api's command, the SDKs') with the
+  /// option on and off. Expect: the option off unless the switch is given, on when it is, and every surface's arguments
+  /// read back by this grammar to the request they were built from, so the CLI and the library never disagree on it.
+  #[test]
+  fn exec_takes_the_apparmor_option_off_unless_named_and_reads_every_surfaces_arguments() {
+    use slates_client::exec::{AppArmor, ExecSpec};
+    let Command::Exec(plain) = parse(&args("exec --volume v --at /p -- true")).unwrap() else {
+      panic!("exec");
+    };
+    assert_eq!(plain.apparmor, AppArmor::Off, "off unless named");
+    let Command::Exec(asked) = parse(&args(
+      "--instance i exec --apparmor-profile --volume v --at /p -- true",
+    ))
+    .unwrap() else {
+      panic!("exec");
+    };
+    assert_eq!(asked.apparmor, AppArmor::Profile);
+    for apparmor in [AppArmor::Off, AppArmor::Profile] {
+      let spec = ExecSpec {
+        volume: "-scratch".into(),
+        at: "/home/u/build=1".into(),
+        command: args("cargo build -- --apparmor-profile --help"),
+        apparmor,
+      };
+      assert_eq!(parse(&spec.arguments()), Ok(Command::Exec(spec)));
+    }
+    assert_eq!(
+      parse(&args(
+        "exec --apparmor-profile=yes --volume v --at /p -- true"
+      )),
+      Err(ParseError::BadValue {
+        what: "switch",
+        reason: "`--apparmor-profile` takes no value".into()
+      })
+    );
+    assert_eq!(
+      parse(&args("volume list --apparmor-profile")),
+      Err(ParseError::UnknownFlag("--apparmor-profile".into())),
+      "the switch is exec's alone"
+    );
+  }
+
+  /// A-370. Do: parse `apparmor profile` with and without `--executable`, `apparmor check` with `--json`, and the verb
+  /// with no or an unknown word. Expect: the profile for the named path or this binary's own, the check's JSON switch,
+  /// and refusals naming the words it takes.
+  #[test]
+  fn apparmor_prints_the_profile_or_checks_the_host() {
+    assert_eq!(
+      parse(&args("apparmor profile")),
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: None
+      }))
+    );
+    assert_eq!(
+      parse(&args("apparmor profile --executable /usr/local/bin/slates")),
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: Some("/usr/local/bin/slates".into())
+      }))
+    );
+    assert_eq!(
+      parse(&args("apparmor check --json")),
+      Ok(Command::AppArmor(AppArmorRequest::Check { json: true }))
+    );
+    assert_eq!(
+      parse(&args("apparmor")),
+      Err(ParseError::Missing("`profile` or `check`"))
+    );
+    assert_eq!(
+      parse(&args("apparmor install")),
+      Err(ParseError::UnknownCommand("apparmor install".into()))
+    );
+    assert_eq!(
+      parse(&args("apparmor check --executable /x")),
+      Err(ParseError::UnknownFlag("--executable".into()))
+    );
+  }
+
   /// A-161 (Shards part 1 step 4). Do: parse `shards` as Unix hands its end, with every flag and with the fewest.
   /// Expect the instance, the volume, the subtree, the intent, the number, the JSON switch and the command after `--`
   /// untouched.
@@ -2810,6 +3766,89 @@ mod tests {
       (fewest.subtree, fewest.read_only, fewest.json),
       (None, false, false)
     );
+  }
+
+  /// A-316. Do: parse `shards` as Unix hands its end with a resync end at its own number, without one, at a number
+  /// below three, at the stream's own number, and not a number; and as Windows hands its end with one. Expect the
+  /// number taken, none when not asked, each wrong one refused as usage naming `--resync-fd`, and Windows refusing it.
+  /// A-433. Do: parse `shards` as Windows hands its end with `{resync}` beside `{handle}` in the command's arguments, and
+  /// without it; and as Unix hands its end with `{resync}` in the arguments. Expect the resync end named where it
+  /// stands, none when not named, and Unix refusing the placeholder as usage naming `{resync}` (its resync end is
+  /// placed at a number, `--resync-fd`).
+  #[test]
+  fn shards_names_the_resync_end_where_resync_stands_on_windows_alone() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let windows = |line: &str| parse_on(&args(line), HandOffKind::Handle);
+    let Command::Shards(named) = windows(&format!(
+      "shards {id} -- shards run --slates-fs-handle {{handle}} --slates-fs-resync-handle {{resync}}"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert!(named.resync_named, "{{resync}} names the resync end");
+    let Command::Shards(unnamed) = windows(&format!(
+      "shards {id} -- shards run --slates-fs-handle {{handle}}"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert!(!unnamed.resync_named);
+    assert!(matches!(
+      parse_on(
+        &args(&format!("shards {id} --fd 5 -- reader --resync {{resync}}")),
+        HandOffKind::Descriptor
+      ),
+      Err(ParseError::BadValue {
+        what: "{resync}",
+        ..
+      })
+    ));
+  }
+
+  #[test]
+  fn shards_takes_a_resync_end_at_a_number_of_its_own_on_unix_alone() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let unix = |line: &str| parse_on(&args(line), HandOffKind::Descriptor);
+    let Command::Shards(request) = unix(&format!(
+      "shards {id} --fd 5 --resync-fd 6 -- shards run --slates-fs-fd 5 --slates-resync-fd 6"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (request.handed, request.resync_at),
+      (HandOff::Descriptor(5), Some(6))
+    );
+    let Command::Shards(without) = unix(&format!("shards {id} --fd 5 -- reader")).unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(without.resync_at, None);
+    for line in [
+      format!("shards {id} --fd 5 --resync-fd 2 -- reader"),
+      format!("shards {id} --fd 5 --resync-fd 5 -- reader"),
+      format!("shards {id} --fd 5 --resync-fd six -- reader"),
+    ] {
+      assert!(
+        matches!(
+          unix(&line),
+          Err(ParseError::BadValue {
+            what: "--resync-fd",
+            ..
+          })
+        ),
+        "{line}"
+      );
+    }
+    assert!(matches!(
+      parse_on(
+        &args(&format!("shards {id} --resync-fd 6 -- reader {{handle}}")),
+        HandOffKind::Handle
+      ),
+      Err(ParseError::BadValue {
+        what: "--resync-fd",
+        ..
+      })
+    ));
   }
 
   /// A-179 (G-shards-windows step 2). Do: parse `shards` as Windows hands its end, with every flag and with the fewest.
@@ -2969,6 +4008,27 @@ mod tests {
     ] {
       let refused = refusal(&line);
       assert!(refused.contains(mentions), "{line}: {refused}");
+    }
+  }
+
+  /// The integrator's report of 2026-11-18 (CI runs 44298844583 and 44310013691). Do: parse `anchor` and `daemon` with
+  /// the runtime registry's most shards, and with one more. Expect: the most parses; one more is refused as a bad
+  /// `--shards` naming the bound, as the roles refuse it (`slates_api::role`), so no anchor starts a daemon its runtime
+  /// refuses at registration and restarts it for good.
+  #[test]
+  fn a_shard_count_past_the_runtimes_registry_is_refused_as_usage() {
+    let most = slates_rt::registry::MAX_SHARDS;
+    for role in ["anchor", "daemon"] {
+      let fits = parse(&args(&format!("{role} --shards {most} --instance z")));
+      assert!(
+        matches!(&fits, Ok(Command::Anchor(options) | Command::Daemon(options)) if options.shards.map(usize::from) == Some(most)),
+        "{role}: {fits:?}"
+      );
+      let past = parse(&args(&format!("{role} --shards {} --instance z", most + 1)));
+      assert!(
+        matches!(&past, Err(ParseError::BadValue { what: "--shards", reason }) if reason.contains(&most.to_string())),
+        "{role}: {past:?}"
+      );
     }
   }
 

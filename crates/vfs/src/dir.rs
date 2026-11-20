@@ -16,6 +16,7 @@ use crate::dirblocks::{BlockRef, BlockStore};
 use crate::dirtree::{Retired, Tree, TreeCursor};
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo};
+use crate::inode::Kind;
 use crate::names::NameEquivalence;
 
 /// Measured: the entry count up to which the sorted array beats the map. The bench probes
@@ -66,8 +67,54 @@ pub enum Child {
   Fifo(InodeNo),
   /// A socket name (A-26).
   Socket(InodeNo),
+  /// A block device node (A-294).
+  BlockDevice(InodeNo),
+  /// A character device node (A-294).
+  CharDevice(InodeNo),
   /// A whiteout over a base-backed name (§4.5).
   Whiteout,
+}
+
+impl Child {
+  /// The inode a leaf entry names: a file, symlink, FIFO, socket or device node's; `None` for a directory (its node
+  /// names its inode) and a whiteout.
+  pub const fn leaf(self) -> Option<InodeNo> {
+    match self {
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => Some(no),
+      Child::Dir(_) | Child::Whiteout => None,
+    }
+  }
+
+  /// The entry naming leaf inode `no` of kind `kind`; `None` for a directory, which an entry names by its node.
+  pub const fn of_leaf(kind: Kind, no: InodeNo) -> Option<Child> {
+    match kind {
+      Kind::File => Some(Child::File(no)),
+      Kind::Symlink => Some(Child::Symlink(no)),
+      Kind::Fifo => Some(Child::Fifo(no)),
+      Kind::Socket => Some(Child::Socket(no)),
+      Kind::BlockDevice => Some(Child::BlockDevice(no)),
+      Kind::CharDevice => Some(Child::CharDevice(no)),
+      Kind::Dir => None,
+    }
+  }
+
+  /// The kind of a leaf entry's inode; `None` for a directory and a whiteout.
+  pub const fn leaf_kind(self) -> Option<Kind> {
+    match self {
+      Child::File(_) => Some(Kind::File),
+      Child::Symlink(_) => Some(Kind::Symlink),
+      Child::Fifo(_) => Some(Kind::Fifo),
+      Child::Socket(_) => Some(Kind::Socket),
+      Child::BlockDevice(_) => Some(Kind::BlockDevice),
+      Child::CharDevice(_) => Some(Kind::CharDevice),
+      Child::Dir(_) | Child::Whiteout => None,
+    }
+  }
 }
 
 /// An inline entry: the hash, the child, and where the name sits in the inline bytes.
@@ -696,6 +743,17 @@ impl DirNode {
     if let DirEntries::Indexed(t) = &self.entries {
       t.blocks_since(blocks, since, out);
     }
+  }
+
+  /// Stamps this node and every block of its entries born at `born` (A-395): a recovered directory the head shares
+  /// with a snapshot takes its directory inode's own birth epoch, so the head copies it (and a block of it) before
+  /// changing it, as live copy-on-write did, and a retired copy goes to the deadlist of the snapshot that holds it.
+  pub fn restamp(&mut self, blocks: &mut BlockStore, born: Epoch) -> Result<(), VfsError> {
+    self.born = born;
+    if let DirEntries::Indexed(t) = &self.entries {
+      t.restamp(blocks, born)?;
+    }
+    Ok(())
   }
 }
 

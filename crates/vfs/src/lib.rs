@@ -20,8 +20,8 @@
 //! Nothing here names a host path: the base plane (`slates-base`) reads the disk and the landing
 //! engine (`slates-land`) writes it, both behind this crate's `Body::Base` hooks.
 //!
-//! Modules: [`ids`], [`names`], [`clock`], [`error`], [`trie`], [`dir`], [`inode`], [`content`],
-//! [`snapshot`], [`quota`], [`journal`], [`volume`].
+//! Modules: [`ids`], [`names`] (with [`upcase`], Windows' upcase table), [`clock`], [`error`], [`trie`], [`dir`],
+//! [`inode`], [`content`], [`snapshot`], [`quota`], [`journal`], [`volume`].
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -32,6 +32,7 @@
 
 pub mod algebra;
 pub mod base;
+pub mod captured;
 pub mod checkpoint_log;
 pub mod clock;
 pub mod content;
@@ -55,6 +56,7 @@ pub mod recover;
 pub mod shards_backing;
 pub mod snapshot;
 pub mod trie;
+pub mod upcase;
 pub mod volume;
 pub mod xattr;
 

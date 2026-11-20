@@ -57,6 +57,10 @@ const KIND_BLOCK: u8 = 4;
 const KIND_FIFO: u8 = 5;
 /// Format: entry kind, socket inode (A-26).
 const KIND_SOCKET: u8 = 6;
+/// Format: entry kind, block device inode (A-294).
+const KIND_BLOCK_DEVICE: u8 = 7;
+/// Format: entry kind, character device inode (A-294).
+const KIND_CHAR_DEVICE: u8 = 8;
 
 /// Format: bytes of one little-endian word of the entry layout.
 const WORD_BYTES: usize = 8;
@@ -168,6 +172,8 @@ impl Slot {
       KIND_SYMLINK => Child::Symlink(InodeNo(self.child)),
       KIND_FIFO => Child::Fifo(InodeNo(self.child)),
       KIND_SOCKET => Child::Socket(InodeNo(self.child)),
+      KIND_BLOCK_DEVICE => Child::BlockDevice(InodeNo(self.child)),
+      KIND_CHAR_DEVICE => Child::CharDevice(InodeNo(self.child)),
       _ => Child::Whiteout,
     }
   }
@@ -179,6 +185,8 @@ impl Slot {
       Child::Symlink(no) => (KIND_SYMLINK, no.0),
       Child::Fifo(no) => (KIND_FIFO, no.0),
       Child::Socket(no) => (KIND_SOCKET, no.0),
+      Child::BlockDevice(no) => (KIND_BLOCK_DEVICE, no.0),
+      Child::CharDevice(no) => (KIND_CHAR_DEVICE, no.0),
       Child::Whiteout => (KIND_WHITEOUT, 0),
     };
     Self {
@@ -738,6 +746,18 @@ impl Tree {
         }
       }
     }
+  }
+
+  /// Stamps every block of the tree born at `born` (A-395): what a recovered directory the head shares with a snapshot
+  /// takes, so the head copies a block before it changes one, as the live volume's copy-on-write did, and never writes
+  /// a block the snapshot reads. Its blocks were all just built, so none is shared with anything yet.
+  pub fn restamp(&self, blocks: &mut BlockStore, born: Epoch) -> Result<(), VfsError> {
+    let mut all = Vec::new();
+    self.blocks(blocks, &mut all);
+    for (block, _) in all {
+      edit(blocks, block)?.set_born(born);
+    }
+    Ok(())
   }
 
   /// Every block of the tree with its size and the size of the class that fits its live bytes, for the oracles

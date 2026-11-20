@@ -44,6 +44,7 @@ pub mod error;
 pub mod exit_watch;
 #[cfg(windows)]
 pub mod handle_route;
+pub mod looks;
 /// The owner's token on macOS (A-176, A-178): a Mach bootstrap name that ends with its holder, so one live process
 /// owns an instance's rendezvous, as Windows's named Event token and Linux's abstract address make it there. A
 /// registration made once per owner's life; no message crosses it, so D-10's refusal of Mach messages as the request
@@ -58,8 +59,12 @@ pub mod park;
 #[cfg(target_os = "linux")]
 pub mod peer;
 pub mod protocol;
+// The wire form of a host's refusal code, pinned (A-539).
+#[cfg(test)]
+mod os_code_vectors;
 pub mod region;
 pub mod rendezvous;
+pub mod room;
 pub mod seal;
 // The stand-in seal this crate's own tests rendezvous under (A-187), one file shared with the integration tests, which
 // name this crate as `slates_ipc`; so do the module tests, through the alias.
@@ -89,20 +94,31 @@ pub mod process_access;
 pub mod win_spawn;
 
 pub use delivery::{Capability, Delivered, Delivery, DeliveryFault};
-pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request};
+pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request, Waited};
 pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};
 pub use rendezvous::{
   Accepted, Adoption, CLAIM_WAIT_NS, Claim, Connected, Doorbell, HeldRendezvous, Listener,
-  Liveness, Prepared, begin_connect_as, connect, connect_as, instance_from_env,
+  Liveness, Prepared, begin_connect_as, connect, connect_as, holder_lives, instance_from_env,
 };
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};
 
-/// Serializes the tests that hold a pipe they expect to close against the tests that spawn a child process. On Apple
-/// a pipe is made close-on-exec by an `fcntl` after `pipe` (no `pipe2`), and a child spawned by a parallel test inside
-/// that window inherits the read end for its whole life: `a_whole_record_takes_once_and_the_descriptor_is_closed`
-/// then wrote into a pipe that still had a reader, 2 of 80 runs beside `exit_watch`'s `/bin/sleep 30`, 0 of 80 without
-/// it (2026-10-06). The same window binds a harness, as `delivery`'s `pipe_close_on_exec` says.
+/// Serializes the tests that hold a descriptor they expect to close against the tests that spawn a child process. On
+/// Apple a pipe or a socket pair is made close-on-exec by an `fcntl` after `pipe` or `socketpair` (no `pipe2`, no
+/// `SOCK_CLOEXEC`), and a child spawned by a parallel test inside that window inherits the end for its whole life:
+/// `a_whole_record_takes_once_and_the_descriptor_is_closed` then wrote into a pipe that still had a reader, 2 of 80
+/// runs beside `exit_watch`'s `/bin/sleep 30`, 0 of 80 without it (2026-10-06). On Linux the ends are close-on-exec
+/// from birth, but a spawned child holds a copy of every descriptor until its `exec` closes them, and since Linux v6.11
+/// its parent may go on before that (A-183). The same window binds a harness, as `delivery`'s `pipe_close_on_exec`
+/// says.
+///
+/// So every test in this binary that spawns a process holds the gate across the spawn (`exit_watch`'s, `mach_claim`'s
+/// stranger, and `endpoint`'s departure tests on macOS and Windows), and so does every test that asserts a descriptor's
+/// last close: an `EPIPE`, a zero read, or a hangup (`delivery`'s descriptor tests, `stream`'s, the Linux rendezvous's
+/// refused delivery, and `endpoint`'s departure tests on Linux). Until 2026-11-18 the
+/// stranger's `sh` and `stream`'s two tests went without it, and the lib's tests failed 2 of 4 runs on a loaded Mac,
+/// each time while the stranger's child ran: the pipe's write answered `Ok(1)`, the stream's send `EAGAIN`, where
+/// `EPIPE` was due.
 #[cfg(test)]
 #[allow(clippy::disallowed_types)]
 pub(crate) fn descriptor_test_gate() -> std::sync::MutexGuard<'static, ()> {

@@ -14,6 +14,9 @@
 //! Where the platforms differ, each answers for itself rather than pretending:
 //! - **Whole sends** ([`TcpStream::make_sends_whole`]): macOS and the BSDs make a send of up to the record bound
 //!   all or none (`SO_SNDLOWAT`); Linux and Windows do not, and say so ([`WholeSends::NotOffered`]).
+//! - **The bytes handed** ([`TcpStream::bytes_handed`]): Linux counts every byte a stream's writers handed it
+//!   (`tcpi_bytes_acked` plus `SIOCOUTQ`), so where a send may stop mid-record a successor can still tell where its
+//!   stream stands (A-550); the others keep no such count.
 //! - **A receive low-water mark** ([`TcpStream::want_bytes`]): Unix keeps one; Windows' TCP provider refuses
 //!   `SO_RCVLOWAT` (Microsoft Learn, SOL_SOCKET options), and its refusal reaches the caller typed.
 //! - **Handing a stream to another process** (`SCM_RIGHTS` of the borrowed descriptor) is Unix's; Windows
@@ -32,6 +35,17 @@ pub use core::net::{Ipv4Addr, SocketAddrV4};
 /// The owned OS handle a listener or a stream is handed over as: a file descriptor on Unix, a Winsock socket on
 /// Windows ([`TcpListener::into_owned`], [`TcpStream::from_owned`]).
 pub type OwnedStream = netsys::OwnedStream;
+
+/// A connection's round trip as its kernel measured it ([`TcpStream::round_trip`]), and the resolution of the clock it
+/// measured it by, RFC 6298 §2.3's clock granularity for that measurement: Linux's `tcpi_rtt` and Windows' `RttUs` count
+/// microseconds, macOS's `tcpi_srtt` milliseconds (xnu's `TCP_RETRANSHZ`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoundTrip {
+  /// The smoothed round trip, in nanoseconds.
+  pub ns: u64,
+  /// The resolution of the clock that measured it, in nanoseconds.
+  pub resolution_ns: u64,
+}
 
 /// What [`TcpStream::send_records`] did with a run of records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +335,23 @@ impl TcpStream {
     })
   }
 
+  /// How many bytes this stream's writers have handed the kernel since the connection was made, where the kernel keeps
+  /// that count (Linux, A-550): every byte written, acknowledged or still queued, and one more once a FIN is queued. An
+  /// accepted connection reads zero before anything is written to it. `None` elsewhere: macOS and the BSDs make a send
+  /// whole instead ([`TcpStream::make_sends_whole`]), and no anchor holds a Windows connection. Read it only of a stream
+  /// no task writes to (a connection just accepted, or one a dead daemon left): a write between its readings is refused.
+  pub fn bytes_handed(&self) -> Result<Option<u64>, RtError> {
+    netsys::bytes_handed(&self.socket)
+  }
+
+  /// The connection's round trip as its kernel measured it, with the resolution of the clock it measured it by
+  /// ([`RoundTrip`]): Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`, Windows `SIO_TCP_INFO`, the records
+  /// [`TcpStream::peer_closed`] reads. An accepted connection's is its handshake's, the kernel's time from its SYN-ACK to
+  /// the client's ACK (RFC 6298 §2.2's first measurement), which nothing in user space can time: accept returns after it.
+  pub fn round_trip(&self) -> Result<RoundTrip, RtError> {
+    netsys::round_trip(&self.socket)
+  }
+
   /// Sets the receive low-water mark (`SO_RCVLOWAT`): readability is reported once `bytes` are queued (or at end of
   /// stream), so a reader waiting for a whole record is woken once, not for every segment of it.
   /// The kernel caps the mark without saying so (Linux at half of `tcp_rmem[2]`, BSD at the receive buffer); a mark it
@@ -376,5 +407,35 @@ impl TcpStream {
       }
     }
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod round_trip_tests {
+  use std::future::Future;
+  use std::task::{Context, Poll, Waker};
+
+  use super::{Ipv4Addr, SocketAddrV4, TcpListener};
+
+  /// A-625 part 2. Do: accept a loopback connection a client made, and read its round trip. Expect the kernel's
+  /// measurement of the handshake, under a second on loopback, at its clock's resolution: milliseconds on macOS,
+  /// microseconds on Linux and Windows.
+  #[test]
+  fn an_accepted_connection_carries_its_handshakes_round_trip() {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 1).unwrap();
+    let address = listener.local_addr().unwrap();
+    let _client = std::net::TcpStream::connect(address).unwrap();
+    let mut context = Context::from_waker(Waker::noop());
+    let Poll::Ready(Ok(stream)) = std::pin::pin!(listener.accept()).poll(&mut context) else {
+      panic!("the established connection must be ready to accept");
+    };
+    let round_trip = stream.round_trip().unwrap();
+    let resolution_ns = if cfg!(target_os = "macos") {
+      1_000_000
+    } else {
+      1_000
+    };
+    assert_eq!(round_trip.resolution_ns, resolution_ns);
+    assert!(round_trip.ns < 1_000_000_000, "{round_trip:?}");
   }
 }

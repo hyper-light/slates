@@ -17,7 +17,9 @@ use std::io::Read;
 use std::os::windows::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
-use slates_anchor::handles::{ENV_HANDLES, HandleMessage, WHAT_WINFSP_MOUNT, parse_env};
+use slates_anchor::handles::{
+  ENV_HANDLES, HandleMessage, HoldBounds, WHAT_WINFSP_MOUNT, parse_env,
+};
 use slates_anchor::held_windows::{Channel, Held, channel, handle_from_value, handle_value};
 use slates_bridge_core::{Attachments, Rights, View, VolumeBridge};
 use slates_db::catalog::{Principal, VolumeId};
@@ -33,6 +35,13 @@ use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+
+/// Shape: what the anchor holds in these fixtures: one WinFsp drive's handles and no Shards DAX section, as the
+/// anchor's own tests bound a mount-only hold (`held_windows`'s `attachments(1)`; A-448 split the one bound in two).
+const ONE_MOUNT: HoldBounds = HoldBounds {
+  attachments: 1,
+  sections: 0,
+};
 
 /// Format: the role selected by this fixture, the inherited channel's hex handle and its drive text.
 const ROLE: &str = "SLATES_WINFSP_REQUEST_ROLE";
@@ -210,7 +219,7 @@ fn a_read_taken_before_the_kill_is_settled_after_takeover() {
   let value = format!("{:x}", handle_value(inherited.raw()));
   let mut scenario = Scenario {
     servers: Vec::with_capacity(2),
-    held: Some(Held::new(1)),
+    held: Some(Held::new(ONE_MOUNT)),
     reader: None,
     probe: None,
   };
@@ -284,7 +293,7 @@ fn a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction
   let value = format!("{:x}", handle_value(inherited.raw()));
   let mut scenario = Scenario {
     servers: Vec::with_capacity(1),
-    held: Some(Held::new(1)),
+    held: Some(Held::new(ONE_MOUNT)),
     reader: None,
     probe: None,
   };
@@ -380,7 +389,6 @@ fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
     let mut values = entry.values.into_iter();
     let inherited = Inherited {
       volume: inherited_handle(values.next().unwrap()),
-      link: inherited_handle(values.next().unwrap()),
       ledger: inherited_handle(values.next().unwrap()),
       record: Record::decode(&entry.record).unwrap(),
     };
@@ -414,7 +422,7 @@ fn serve(role: &str, drive: &str) -> ! {
   let (send, receive) = sync_channel(REQUEST_BOUND);
   let mut mount = MountThread::start(
     drive,
-    true,
+    (true, NameSearch::CaseSensitive),
     send,
     Waker::noop().clone(),
     slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
@@ -722,6 +730,351 @@ fn a_rename_with_one_open_name_takes_one_shard_turn() {
   );
 }
 
+/// What each name of a link test's volume holds after its shard served the test's requests: the inode and its link
+/// count, `None` where the name is gone.
+type LinkedNames = std::collections::BTreeMap<&'static str, Option<(u64, u32)>>;
+
+/// The names a link test looks at.
+const LINK_TEST_NAMES: [&str; 5] = ["file", "second", "sentinel", "dir", "readonly"];
+
+/// A shard over the fixed volume (`file` and `sentinel`, a page each), with a directory `dir`, a read-only file
+/// `readonly` and an open of `opened`, serving each request in its own turn (A-360). `ask` sends its requests with the
+/// open's context and that file's identity. Answers what each name holds once the requests are served.
+fn linked(
+  opened: &'static str,
+  ask: impl FnOnce(&SyncSender<Request>, u64, ObjectId),
+) -> LinkedNames {
+  let (send, receive) = sync_channel::<Request>(REQUEST_BOUND);
+  let (told, open) = sync_channel::<(u64, ObjectId)>(1);
+  let shard = std::thread::spawn(move || {
+    let mut store = fixed_store();
+    let (mut volume, cx) = fixed_volume(&mut store);
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+    let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+    bridge.mkdir(root, &cx, "dir", 0o755).unwrap();
+    let (readonly, handle) = bridge.create(root, &cx, "readonly", 0o444, 0).unwrap();
+    bridge
+      .release(
+        ObjectId::new(readonly.ino, readonly.generation),
+        &cx,
+        handle,
+      )
+      .unwrap();
+    let file = bridge.lookup(root, &cx, opened).unwrap();
+    let object = ObjectId::new(file.ino, file.generation);
+    let fh = if file.kind == Kind::Dir {
+      bridge.opendir(object, &cx).unwrap()
+    } else {
+      bridge.open(object, &cx, 0).unwrap()
+    };
+    let memory =
+      SparseObject::unnamed(crate::opens::bytes(2).unwrap(), slates_mem::Words::new()).unwrap();
+    let mut ledger = Ledger::create(memory, 2).unwrap();
+    let path = format!("\\{opened}");
+    let context = ledger
+      .opened(
+        Open {
+          object,
+          fh,
+          purge: false,
+        },
+        &path,
+      )
+      .unwrap();
+    let mut names = OpenNames::new();
+    names.opened(context, file.ino, &path);
+    told.send((context, object)).unwrap();
+    while let Ok(request) = receive.recv() {
+      assert!(
+        request
+          .serve(&mut bridge, &cx, &mut names, &mut ledger)
+          .send()
+      );
+    }
+    LINK_TEST_NAMES
+      .into_iter()
+      .map(|name| {
+        let held = bridge
+          .lookup(root, &cx, name)
+          .ok()
+          .map(|attr| (attr.ino, attr.nlink));
+        (name, held)
+      })
+      .collect::<LinkedNames>()
+  });
+  let (context, object) = open.recv().unwrap();
+  ask(&send, context, object);
+  drop(send);
+  shard.join().unwrap()
+}
+
+/// Sends the open `context`'s hard link to `path` as the receive worker does for a patched driver (A-360), and answers
+/// its status.
+fn link_status(send: &SyncSender<Request>, context: u64, path: &str, replace: bool) -> Ntstatus {
+  match call_on(
+    send,
+    Waker::noop(),
+    Op::Link {
+      object: context,
+      path: path.to_owned(),
+      replace,
+    },
+  ) {
+    Reply::Ok => STATUS_SUCCESS.as_i32(),
+    Reply::Err(status) => status,
+    _ => panic!("a link answered neither success nor a status"),
+  }
+}
+
+/// The status a volume refusal reaches Windows as.
+fn status_of(error: &VfsError) -> Ntstatus {
+  crate::ntstatus(error).as_i32()
+}
+
+/// A-360. Do: give the open file `file` the free name `\second`, as a patched driver forwards `CreateHardLinkW`
+/// (git's local clone links its objects so). Expect: success; both names are the one inode, counted twice.
+#[test]
+fn a_forwarded_link_gives_the_open_file_a_second_name() {
+  let mut status = None;
+  let names = linked("file", |send, context, _| {
+    status = Some(link_status(send, context, "\\second", false));
+  });
+  assert_eq!(status, Some(STATUS_SUCCESS.as_i32()));
+  let file = names["file"].unwrap();
+  assert_eq!(names["second"], Some(file), "the second name is the file's");
+  assert_eq!(file.1, 2, "the file has two names");
+}
+
+/// A-360. Do: link `file` to the taken name `\sentinel`, first without ReplaceIfExists, then with it. Expect: the first
+/// refused `STATUS_OBJECT_NAME_COLLISION` with nothing changed; the second makes `sentinel` a name of `file`, counted
+/// twice, and the file `sentinel` named before has no name left.
+#[test]
+fn a_link_to_a_taken_name_replaces_it_only_when_asked() {
+  let mut statuses = Vec::new();
+  let names = linked("file", |send, context, _| {
+    statuses.push(link_status(send, context, "\\sentinel", false));
+    statuses.push(link_status(send, context, "\\sentinel", true));
+  });
+  assert_eq!(
+    statuses,
+    [status_of(&VfsError::AlreadyExists), STATUS_SUCCESS.as_i32()]
+  );
+  let file = names["file"].unwrap();
+  assert_eq!(names["sentinel"], Some(file));
+  assert_eq!(file.1, 2);
+}
+
+/// A-360. Do: link `file` with ReplaceIfExists onto the directory `\dir` and onto the read-only file `\readonly`. Expect:
+/// `STATUS_ACCESS_DENIED` each, as a rename's replace is answered (A-209, A-262), and both names as they were.
+#[test]
+fn a_link_never_replaces_a_directory_or_a_read_only_file() {
+  let mut statuses = Vec::new();
+  let before = linked("file", |_, _, _| {});
+  let names = linked("file", |send, context, _| {
+    statuses.push(link_status(send, context, "\\dir", true));
+    statuses.push(link_status(send, context, "\\readonly", true));
+  });
+  let denied = status_of(&VfsError::NotPermitted);
+  assert_eq!(statuses, [denied, denied]);
+  assert_eq!(names, before, "a refused link changed a name");
+}
+
+/// A-360. Do: give `file` the name `\second`, then link it onto `\second` again with ReplaceIfExists. Expect: success
+/// with nothing changed: the file still has two names.
+#[test]
+fn a_link_onto_a_name_of_the_file_itself_changes_nothing() {
+  let mut statuses = Vec::new();
+  let names = linked("file", |send, context, _| {
+    statuses.push(link_status(send, context, "\\second", false));
+    statuses.push(link_status(send, context, "\\second", true));
+  });
+  assert_eq!(statuses, [STATUS_SUCCESS.as_i32(); 2]);
+  assert_eq!(names["second"], names["file"]);
+  assert_eq!(names["file"].unwrap().1, 2);
+}
+
+/// A-360. Do: link an open of the directory `dir` to `\second`. Expect: `STATUS_FILE_IS_A_DIRECTORY`, as NTFS answers
+/// (MS-FSA 2.1.5.15.7), and no name made.
+#[test]
+fn a_directory_takes_no_second_name() {
+  let mut status = None;
+  let names = linked("dir", |send, context, _| {
+    status = Some(link_status(send, context, "\\second", false));
+  });
+  assert_eq!(status, Some(status_of(&VfsError::IsDirectory)));
+  assert_eq!(names["second"], None);
+}
+
+/// A-360 (a replace refused part way). Do: take the name a replacing link of `file` is made under (`staging_name`),
+/// then link `file` onto `\sentinel` with ReplaceIfExists. Expect: `STATUS_OBJECT_NAME_COLLISION`, and `sentinel` still
+/// the file it was: a replace changes the taken name only once its new link exists.
+#[test]
+fn a_replacing_link_refused_part_way_leaves_the_taken_name_as_it_was() {
+  let before = linked("file", |_, _, _| {});
+  let mut status = None;
+  let names = linked("file", |send, context, object| {
+    // The staging name, taken by a request of its own: a rename of `readonly` onto it.
+    let parked = format!("\\{}", staging_name(object));
+    let moved = call_on(
+      send,
+      Waker::noop(),
+      Op::Rename {
+        from: "\\readonly".to_owned(),
+        to: parked,
+        replace: false,
+      },
+    );
+    assert!(matches!(moved, Reply::Ok), "the staging name was not taken");
+    status = Some(link_status(send, context, "\\sentinel", true));
+  });
+  assert_eq!(status, Some(status_of(&VfsError::AlreadyExists)));
+  assert_eq!(names["sentinel"], before["sentinel"]);
+  assert_eq!(names["file"], before["file"]);
+}
+
+/// A-360. Do: through an open of `file`, serve a write while it has one name, a link to `\second`, a write once it has
+/// two, the delete of `\second`, and a write once one name is left. Expect: the link, the write to a file with two names
+/// and the delete of one of two names each leave the file's other names owed a word (with the name it came through,
+/// `\file`, and the bytes it changed); the writes to a file with one name leave none.
+#[test]
+fn a_change_to_a_file_with_another_name_is_kept_for_the_other_names() {
+  let mut store = fixed_store();
+  let (mut volume, cx) = fixed_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+  let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+  let file = bridge.lookup(root, &cx, "file").unwrap();
+  let object = ObjectId::new(file.ino, file.generation);
+  let fh = bridge.open(object, &cx, 0).unwrap();
+  let memory =
+    SparseObject::unnamed(crate::opens::bytes(2).unwrap(), slates_mem::Words::new()).unwrap();
+  let mut ledger = Ledger::create(memory, 2).unwrap();
+  let context = ledger
+    .opened(
+      Open {
+        object,
+        fh,
+        purge: false,
+      },
+      "\\file",
+    )
+    .unwrap();
+  let mut names = OpenNames::new();
+  names.opened(context, file.ino, "\\file");
+  let write = || Op::Write {
+    object: context,
+    offset: 0,
+    data: b"x".to_vec(),
+    append: false,
+    constrained: false,
+  };
+  let through = |bytes| {
+    Some(Sibling {
+      ino: file.ino,
+      through: "\\file".to_owned(),
+      bytes,
+    })
+  };
+  let cases = [
+    (write(), None, "a write to a file with one name"),
+    (
+      Op::Link {
+        object: context,
+        path: "\\second".to_owned(),
+        replace: false,
+      },
+      through(CachedBytes::Kept),
+      "a link",
+    ),
+    (
+      write(),
+      through(CachedBytes::Range { at: 0, len: 1 }),
+      "a write to a file with two names",
+    ),
+    (
+      Op::Cleanup {
+        object: context,
+        delete: Some("\\second".to_owned()),
+      },
+      through(CachedBytes::Kept),
+      "the delete of one of two names",
+    ),
+    (write(), None, "a write once one name is left"),
+  ];
+  for (op, expected, what) in cases {
+    let (reply, _answer) = sync_channel(1);
+    let served = Request {
+      op,
+      reply,
+      hint: 0,
+      replayed: false,
+    }
+    .serve(&mut bridge, &cx, &mut names, &mut ledger);
+    assert_eq!(served.sibling_change(), expected.as_ref(), "{what}");
+  }
+}
+
+/// A-190, A-360. Do: give `file` a second name, hold it open as a coherent purge's open is held, and serve the cleanup
+/// WinFsp sends when that purge's handle is the file's last while a delete is pending: WinFsp hands the delete to the last
+/// handle's cleanup, whoever made it (`FspCleanupDelete`, v2.1 `src/sys/file.c` `FspFileNodeCleanup`). Expect: the name
+/// is gone from the volume, as the deleter was told when its own close returned, and the file's other name is owed the
+/// change. Before, a purge's cleanup was answered without its delete: the name stayed, and the live hard-link test on the
+/// test-signing VM saw the other name count two links for good.
+#[test]
+fn a_delete_a_purges_last_handle_carries_is_made() {
+  let mut store = fixed_store();
+  let (mut volume, cx) = fixed_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+  let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+  let file = bridge.lookup(root, &cx, "file").unwrap();
+  let object = ObjectId::new(file.ino, file.generation);
+  bridge.link(object, root, &cx, "second").unwrap();
+  let fh = bridge.open(object, &cx, 0).unwrap();
+  let memory =
+    SparseObject::unnamed(crate::opens::bytes(2).unwrap(), slates_mem::Words::new()).unwrap();
+  let mut ledger = Ledger::create(memory, 2).unwrap();
+  let context = ledger
+    .opened(
+      Open {
+        object,
+        fh,
+        purge: true,
+      },
+      "\\file",
+    )
+    .unwrap();
+  let mut names = OpenNames::new();
+  names.opened(context, file.ino, "\\file");
+  let (reply, _answer) = sync_channel(1);
+  let served = Request {
+    op: Op::Cleanup {
+      object: context,
+      delete: Some("\\file".to_owned()),
+    },
+    reply,
+    hint: 0,
+    replayed: false,
+  }
+  .serve(&mut bridge, &cx, &mut names, &mut ledger);
+  let owed = served.sibling_change().cloned();
+  assert!(served.send());
+  assert!(
+    bridge.lookup(root, &cx, "file").is_err(),
+    "the delete the purge's last handle carried was not made"
+  );
+  let second = bridge.lookup(root, &cx, "second").unwrap();
+  assert_eq!((second.ino, second.nlink), (file.ino, 1));
+  assert_eq!(
+    owed,
+    Some(Sibling {
+      ino: file.ino,
+      through: "\\file".to_owned(),
+      bytes: CachedBytes::Kept,
+    }),
+    "the file's other name is owed the delete"
+  );
+  bridge.release(object, &cx, fh).unwrap();
+}
+
 /// A-198. Do: replay an open's delete cleanup after its first cleanup unlinked the name and an SDK created a new file
 /// there. Expect: the replacement still has its name and bytes; cleanup belongs to the old file's identity.
 #[test]
@@ -818,7 +1171,7 @@ fn purges_the_kernel_refuses_on_an_idle_drive_do_not_wait_out_the_transaction_ti
   let (send, receive) = sync_channel(REQUEST_BOUND);
   let mut mount = MountThread::start(
     &drive,
-    false,
+    (false, NameSearch::CaseSensitive),
     send,
     Waker::noop().clone(),
     slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES,
@@ -992,7 +1345,7 @@ fn a_close_served_before_the_kill_is_answered_done_after_takeover() {
   let value = format!("{:x}", handle_value(inherited.raw()));
   let mut scenario = Scenario {
     servers: Vec::with_capacity(2),
-    held: Some(Held::new(1)),
+    held: Some(Held::new(ONE_MOUNT)),
     reader: None,
     probe: None,
   };
@@ -1078,7 +1431,7 @@ fn a_handle_open_across_the_kill_closes_through_the_successor() {
   let value = format!("{:x}", handle_value(inherited.raw()));
   let mut scenario = Scenario {
     servers: Vec::with_capacity(2),
-    held: Some(Held::new(1)),
+    held: Some(Held::new(ONE_MOUNT)),
     reader: None,
     probe: None,
   };

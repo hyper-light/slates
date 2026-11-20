@@ -1,10 +1,10 @@
-//! AUD-29-07 (§4.15 step 3; D-16): a landing presented and never landed expires with the client that
-//! presented it — the reaper, retiring a dead client on every owner shard, drops its presentations there. The
-//! test binary re-invoked is the presenter (an environment variable selects the role), so the death is a real
-//! `SIGKILL` of a real process: an in-process client never reads as gone, because the reaper retires only a
-//! silent client whose process or control socket has gone. Its own binary, so no other test's reaping moves
-//! the daemon's process-wide counters under it.
-
+//! AUD-29-07 (§4.15 step 3; D-16): a landing presented and never landed expires with the client that presented it — the
+//! reaper, retiring a dead client on every owner shard, drops its presentations there. The test binary re-invoked is
+//! the presenter (an environment variable selects the role), so the death is a real kill of a real process (`SIGKILL`;
+//! `TerminateProcess` on Windows): an in-process client never reads as gone, because the reaper retires only a silent
+//! client whose process or control socket has gone. Its own binary, so no other test's reaping moves the daemon's
+//! process-wide counters under it. On every platform since the Windows writer (A-185): until then a Windows daemon
+//! refused the verb `Unsupported { feature: "landing" }`, so there was nothing to present there.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

@@ -18,7 +18,9 @@
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use slates_mem::{DAX_RANGE_BYTES, DaxLayout, DaxObject, dax_object_bytes};
+use slates_mem::{
+  DAX_RANGE_BYTES, DaxLayout, DaxObject, MemError, PeerAccess, PeerObject, dax_object_bytes,
+};
 use windows_sys::Win32::Foundation::{
   CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, GetLastError, HANDLE,
 };
@@ -30,6 +32,10 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// Shape: the views slates may hold at once in these tests.
 const MOST_VIEWS: usize = 4;
+/// Shape: a guarded layout's guard, which Windows refuses whatever it is: a quarter of a range.
+const GUARD_BYTES: u64 = DAX_RANGE_BYTES / 4;
+/// Shape: the file a peer's copy holds here, far short of a DAX object: two 4 KiB pages.
+const PEER_FILE_BYTES: u64 = 8192;
 
 /// A view of one range of a section through a handed handle, as a VMM maps it; unmapped on drop.
 struct VmmRange(MEMORY_MAPPED_VIEW_ADDRESS);
@@ -187,4 +193,82 @@ fn a_handed_dax_section_cannot_be_widened() {
     Some(ERROR_ACCESS_DENIED)
   );
   assert!(VmmRange::map(&writable, FILE_MAP_READ | FILE_MAP_WRITE, 0).is_ok());
+}
+
+/// T-shards-windows-5.3 (A-448). Do: make a DAX object, store into its first and last ranges, let a VMM's writable map
+/// store into the first, take the duplicate the anchor would hold, end the object (its maker's death), and adopt the
+/// held duplicate; then try to adopt a read-only duplicate, a peer copy's section and a guarded layout, and widen what
+/// the adopted object hands. Expect the adopted object whole: the machine's size, and every byte its maker and the VMM
+/// stored, the VMM's map seeing a store the adopted object makes; each other adoption refused `NotADaxObject` (the
+/// layout `OsRefused`); and a duplicate of the adopted section that may rewrite its descriptor refused
+/// `ERROR_ACCESS_DENIED`, so the adopted handle conveys no more than it was held with.
+#[test]
+fn a_held_section_is_adopted_whole_and_never_widened() {
+  let mut object = DaxObject::create(MOST_VIEWS, DaxLayout::Identity).unwrap();
+  let last = dax_object_bytes() / DAX_RANGE_BYTES - 1;
+  for range in [0, last] {
+    object.prepare_range(range).unwrap();
+  }
+  object.store(5, b"first").unwrap();
+  object.store(last * DAX_RANGE_BYTES + 7, b"last").unwrap();
+  let vmm = object.handed(true).unwrap();
+  let first = VmmRange::map(&vmm, FILE_MAP_READ | FILE_MAP_WRITE, 0).unwrap();
+  for (at, byte) in b"guest".iter().enumerate() {
+    first.byte(100 + at).store(*byte, Ordering::Relaxed);
+  }
+  let held = object.held().unwrap();
+  let read_only = object.handed(false).unwrap();
+  drop(object);
+
+  let mut adopted = DaxObject::adopt(held, MOST_VIEWS, DaxLayout::Identity).unwrap();
+  assert_adopted_whole(&mut adopted, &first, last);
+  assert_other_adoptions_refused(&adopted, read_only);
+  for handle in [adopted.held().unwrap(), adopted.handed(true).unwrap()] {
+    assert_eq!(duplicate(&handle, WRITE_DAC), Err(ERROR_ACCESS_DENIED));
+  }
+}
+
+/// A-448's adopted object: the machine's size, every byte its maker and the VMM stored in the first and `last` ranges,
+/// and a store it makes seen through the VMM's map `first`.
+fn assert_adopted_whole(adopted: &mut DaxObject, first: &VmmRange, last: u64) {
+  assert_eq!(adopted.len(), dax_object_bytes());
+  let mut loaded = [0u8; 5];
+  adopted.load(5, &mut loaded).unwrap();
+  assert_eq!(&loaded, b"first");
+  adopted.load(100, &mut loaded).unwrap();
+  assert_eq!(&loaded, b"guest");
+  let mut end = [0u8; 4];
+  adopted.load(last * DAX_RANGE_BYTES + 7, &mut end).unwrap();
+  assert_eq!(&end, b"last");
+  adopted.store(200, b"after").unwrap();
+  let seen: Vec<u8> = (200..205)
+    .map(|at| first.byte(at).load(Ordering::Relaxed))
+    .collect();
+  assert_eq!(seen, b"after", "the VMM's map is the adopted section");
+}
+
+/// A-448's refusals: a read-only duplicate and a peer copy's section are no DAX object, and the adopted section under a
+/// guarded layout is refused by the OS.
+fn assert_other_adoptions_refused(adopted: &DaxObject, read_only: OwnedHandle) {
+  assert!(matches!(
+    DaxObject::adopt(read_only, MOST_VIEWS, DaxLayout::Identity),
+    Err(MemError::NotADaxObject { .. })
+  ));
+  let peer = PeerObject::create("peer", PEER_FILE_BYTES, PeerAccess::ReadWrite).unwrap();
+  assert!(matches!(
+    DaxObject::adopt(
+      peer.read_write_handle().unwrap(),
+      MOST_VIEWS,
+      DaxLayout::Identity
+    ),
+    Err(MemError::NotADaxObject { .. })
+  ));
+  assert!(matches!(
+    DaxObject::adopt(
+      adopted.held().unwrap(),
+      MOST_VIEWS,
+      DaxLayout::Guarded { guard: GUARD_BYTES }
+    ),
+    Err(MemError::OsRefused { .. })
+  ));
 }

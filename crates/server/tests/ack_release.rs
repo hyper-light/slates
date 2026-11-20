@@ -18,18 +18,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, pack, unpack};
-use slates_ipc::{ClientEnd, IpcError, connect};
-use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
+use slates_ipc::{ClientEnd, connect};
+use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS, starve_this_thread};
 use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any hold here.
 const DEADLINE_NS: u64 = 5_000_000_000;
-/// Shape: how long a client waits for the daemon to come up or a full ring to drain.
-const CREDIT_WAIT: Duration = Duration::from_secs(5);
 /// Shape: how long the other shard is held: one liveness budget. A reply that waited for it took at least that; one
-/// that did not comes in microseconds.
+/// that did not comes in microseconds. [`hold`] runs it starved, not asleep ([`starve_this_thread`]): this daemon has no
+/// anchor, and a shard asleep for a whole window can be judged wedged before the sleep returns, which ends the daemon's
+/// process and this test binary with it (A-232). The whole window stays: [`check_typed_refusal`] reads half of it as the
+/// part's half-window wait for room.
 const HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
 /// Shape: how often a hold that lasts until the client's answer looks whether it may end: a hundredth of the hold the
 /// other tests use, so it ends promptly once the answer is in.
@@ -46,23 +47,16 @@ struct Client {
 }
 
 impl Client {
+  /// A client of `instance`, whose daemon started before this, its rendezvous held and published by then: the claim
+  /// waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait (A-571; until
+  /// then a five-second retry, `CREDIT_WAIT`).
   fn connect(instance: &str) -> Client {
-    let started = Instant::now();
-    loop {
-      match connect(instance) {
-        Ok(connected) => {
-          let client = connected.region.client_id();
-          return Client {
-            end: ClientEnd::connected(connected),
-            client,
-            sequence: 0,
-          };
-        }
-        Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-          std::thread::yield_now();
-        }
-        Err(e) => panic!("{e}"),
-      }
+    let connected = connect(instance).unwrap_or_else(|e| panic!("{e}"));
+    let client = connected.region.client_id();
+    Client {
+      end: ClientEnd::connected(connected),
+      client,
+      sequence: 0,
     }
   }
 
@@ -92,14 +86,16 @@ impl Client {
       body,
     )
     .unwrap();
-    let started = Instant::now();
-    loop {
-      match self.end.send(&slot) {
-        Ok(()) => break,
-        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::thread::yield_now(),
-        Err(e) => panic!("{e}"),
-      }
-    }
+    // A full ring is waited out while the daemon lives, as every client end waits (A-571).
+    let roomed = self
+      .end
+      .send_when_room(|end| end.send(&slot))
+      .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+      roomed,
+      slates_ipc::room::Roomed::Sent,
+      "the daemon went away while its ring was full"
+    );
     let reply = self
       .end
       .wait(Some(DEADLINE_NS))
@@ -182,14 +178,21 @@ fn hold(
   let observation = daemon
     .observation(Some(shard), OBSERVE_BUDGET_NS, move |_: &mut ShardState| {
       held.store(true, Ordering::Release);
-      #[allow(clippy::disallowed_methods)]
-      std::thread::sleep(hold);
+      let _ = starve_this_thread(u64::try_from(hold.as_nanos()).unwrap());
     })
     .unwrap();
   let waiter = std::thread::spawn(move || observation.wait().unwrap());
-  let started = Instant::now();
+  // The hold begins when the shard runs the observation, which ends otherwise by its own answer or its typed refusal past
+  // the daemon's observe budget (A-571; until then a fixed five seconds, `CREDIT_WAIT`).
   while !held.load(Ordering::Acquire) {
-    assert!(started.elapsed() < CREDIT_WAIT, "the hold began");
+    if waiter.is_finished() {
+      // The flag is set before the observation ends, so a hold that began and ended since the first read shows here.
+      assert!(
+        held.load(Ordering::Acquire),
+        "the hold's observation ended before the hold began"
+      );
+      break;
+    }
     std::thread::yield_now();
   }
   waiter
@@ -224,9 +227,17 @@ fn hold_until_answered(
     })
     .unwrap();
   let waiter = std::thread::spawn(move || observation.wait().unwrap());
-  let started = Instant::now();
+  // The hold begins when the shard runs the observation, which ends otherwise by its own answer or its typed refusal past
+  // the daemon's observe budget (A-571; until then a fixed five seconds, `CREDIT_WAIT`).
   while !held.load(Ordering::Acquire) {
-    assert!(started.elapsed() < CREDIT_WAIT, "the hold began");
+    if waiter.is_finished() {
+      // The flag is set before the observation ends, so a hold that began and ended since the first read shows here.
+      assert!(
+        held.load(Ordering::Acquire),
+        "the hold's observation ended before the hold began"
+      );
+      break;
+    }
     std::thread::yield_now();
   }
   (waiter, holding)
@@ -518,7 +529,7 @@ fn check_typed_refusal(verb: &str, (other, reply, took): (usize, ReplyBody, Dura
 fn a_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
   check_typed_refusal(
     "list",
-    scattered_with_the_other_shard_full("list-full", &RequestBody::List),
+    scattered_with_the_other_shard_full("list-full", &RequestBody::List { after: None }),
   );
 }
 
@@ -528,7 +539,7 @@ fn a_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
 fn a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
   check_typed_refusal(
     "grants",
-    scattered_with_the_other_shard_full("grants-full", &RequestBody::Grants),
+    scattered_with_the_other_shard_full("grants-full", &RequestBody::Grants { after: None }),
   );
 }
 

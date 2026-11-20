@@ -50,12 +50,21 @@ pub(crate) async fn pace(ns: u64) {
 /// A perpetual loop's sleep refused ([`pace`]): a tripwire, never an expected count.
 const SLEEP_REFUSED: &str = "runtime.sleep_refused";
 
-/// Shape: the heartbeat cadence the control shard beats the anchor's word at (§4.14
-/// `daemon.alive`): a tenth of the anchor's liveness budget, so nine beats fit inside it.
-pub const HEARTBEAT_NS: u64 = 100_000_000;
-/// Shape: the anchor's liveness budget for `daemon.alive` (a second; the supervisor's
-/// input until the CLI takes the operator's value).
-pub const LIVENESS_BUDGET_NS: u64 = 1_000_000_000;
+/// Derived: the heartbeat, the fleet's coordinator period and the cadence the watchdog looks at its shards in (§4.14
+/// `daemon.alive`): the liveness window over the election margin, `W / ELECTION_MARGIN` (A-129 item 1, the leader beats
+/// ten times per election timeout, and item 2, the death-confirmation window is the election timeout; A-359), so nine
+/// beats fit inside a window. 100 ms.
+pub const HEARTBEAT_NS: u64 = LIVENESS_BUDGET_NS / slates_cluster::timing::ELECTION_MARGIN;
+/// Derived: the liveness window `W` (A-228, A-359): how long a daemon, a shard or a peer may show no progress before it
+/// is judged stuck or silent and its recovery begins. It is the recovery budget `T`
+/// (`slates_db::replay::RECOVERY_BUDGET_NS`, ratified, GAPS §5): the verdict starts a recovery that costs `T`, so
+/// waiting less risks paying `T` for a stall shorter than `T`, and waiting as long as the recovery costs is the
+/// deterministic online choice within twice the best (rent or buy [A: Karlin, Manasse, Rudolph & Sleator, "Competitive
+/// snoopy caching", Algorithmica 1988], the rule the wake probe's spin-then-park already follows). A second. Not
+/// derived from the failover SLO: the fleet's detection and confirmation timers are multiples of this window's
+/// heartbeat, so a failover SLO derived from them (Ada's rule, 2026-11-18) cannot also set it. The machine's measured
+/// scheduling delay is its floor, checked and logged at boot (`config::liveness_window`).
+pub const LIVENESS_BUDGET_NS: u64 = slates_db::replay::RECOVERY_BUDGET_NS;
 /// How long an out-of-band observation ([`Daemon::observation`]) has, from its submission through its
 /// admission to its answer, before it ends with a deadline naming the stage it reached
 /// ([`crate::observe::ObserveError::Deadline`]). A live shard answers within a few coordinator periods
@@ -66,15 +75,18 @@ pub const LIVENESS_BUDGET_NS: u64 = 1_000_000_000;
 /// Derived: ten liveness budgets ([`LIVENESS_BUDGET_NS`]).
 pub const OBSERVE_BUDGET_NS: u64 = 10 * LIVENESS_BUDGET_NS;
 
-/// Shape: how long [`Daemon::hold_record_session`] waits for a record session that is not in its link — one
-/// liveness budget. A live peer's session is out only for a dispatch, a discovery page or a re-dial, each far
-/// shorter; one still absent after a liveness budget names a real absence, which the hold reports rather than
-/// waits out. Derived: [`LIVENESS_BUDGET_NS`], a tenth of [`OBSERVE_BUDGET_NS`], so the report arrives
-/// inside the observation's budget.
-pub const SESSION_WAIT_NS: u64 = LIVENESS_BUDGET_NS;
+/// Derived: how long test support ([`Daemon::hold_record_session`], [`Daemon::ask_live_reports`]) waits for a record
+/// session that is not in its link (A-449): the span of one record-plane exchange (`fleet::record_exchange_budget_ns`,
+/// the record plane's round budget over the slowest measured path, its whole span), the bound every borrower of a record
+/// session runs its exchange under, so a lent session comes back within it; the span a location round gives a lent
+/// session (A-437), as the supervisor ruled on 2026-11-07. One still absent after it names a real absence, which the
+/// hold reports rather than waits out. Until A-449 it was one liveness window.
+pub fn session_wait_ns() -> u64 {
+  crate::fleet::record_exchange_budget_ns()
+}
 
 /// What [`Daemon::hold_record_session`] found: the session taken (and how long it waited for it), or, after
-/// [`SESSION_WAIT_NS`], why there was none — a link for the peer whose session never came back to it, or no
+/// [`session_wait_ns`], why there was none — a link for the peer whose session never came back to it, or no
 /// link for the peer at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionHold {
@@ -110,7 +122,8 @@ pub enum LinkAfter {
 /// A-114), or nothing.
 #[derive(Clone, Debug)]
 pub enum SegmentSource {
-  /// Create a fresh segment and a fresh rendezvous (tests, a daemon run alone without an anchor).
+  /// Create a fresh segment and a fresh rendezvous (tests, a daemon run alone without an anchor). Nobody reads such a
+  /// daemon's beat, so its watchdog ends its process on a stuck verdict (A-232, [`SegmentSource::supervision`]).
   Create {
     /// The object's name.
     name: String,
@@ -134,6 +147,66 @@ pub enum SegmentSource {
   },
 }
 
+/// Derived: the CPU a [`Daemon::starve_control_shard`] hold runs each beat over `span_ns` on a shard the watchdog judges
+/// by `window_ns` (its own window, A-455: the liveness window raised to the scheduler overrun the shard measured,
+/// [`crate::watchdog::shard_window_ns`]): one beat times half that window over the span, at most the whole beat. So the
+/// hold's whole CPU is at most half the shard's window and the watchdog, judging the shard spinning only after a whole
+/// window of CPU held to the build (never less than the window), never finds it spinning, while each beat's share shows
+/// CPU progress at every look, so it is never judged still either (A-228's rule). Until A-552 the share was half the
+/// liveness window whatever window the watchdog judged the shard by.
+pub fn starved_share_ns(span_ns: u64, window_ns: u64) -> u64 {
+  HEARTBEAT_NS
+    .saturating_mul(window_ns / 2)
+    .checked_div(span_ns)
+    .unwrap_or(HEARTBEAT_NS)
+    .min(HEARTBEAT_NS)
+}
+
+/// Test support: runs the calling thread for `span_ns` as a starved thread runs, a little CPU at a time (A-232): each
+/// beat it spins for its share ([`starved_share_ns`]) of the window its shard is judged by, read as the hold begins
+/// ([`crate::watchdog::own_window_ns`]; a shard folds its overrun in only when it waits, and a hold inside one poll
+/// waits for nothing, so the window stands for the span), and sleeps the rest, so the shard it runs on steps nothing else
+/// for the span while the watchdog sees it move every look, alive and never stuck. Returns the span it measured,
+/// nanoseconds. [`Daemon::starve_control_shard`] runs it on the control shard; a test that keeps another shard silent
+/// past a window runs it in that shard's observation, where a sleep would be a wedge that ends a daemon no anchor
+/// supervises (`tests/fleet.rs`, `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
+pub fn starve_this_thread(span_ns: u64) -> u64 {
+  let share_ns = starved_share_ns(span_ns, crate::watchdog::own_window_ns());
+  let begin = slates_rt::futures::now_ns();
+  let end = begin.saturating_add(span_ns);
+  let mut beat_began = begin;
+  while slates_rt::futures::now_ns() < end {
+    let share_ends = beat_began.saturating_add(share_ns).min(end);
+    while slates_rt::futures::now_ns() < share_ends {
+      std::hint::spin_loop();
+    }
+    let beat_ends = beat_began.saturating_add(HEARTBEAT_NS).min(end);
+    let rest = beat_ends.saturating_sub(slates_rt::futures::now_ns());
+    // The point of the fixture: off the CPU for the rest of the beat, as a starved thread is.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_nanos(rest));
+    beat_began = beat_ends;
+  }
+  slates_rt::futures::now_ns().saturating_sub(begin)
+}
+
+impl SegmentSource {
+  /// Whether an anchor reads the beat of a daemon started over this source (A-232), which decides what the watchdog does
+  /// on a stuck verdict ([`crate::watchdog::decide`]). `FromEnv` is the anchor across the spawn, which kills a daemon
+  /// whose beat lapses. `Handoff` is an anchor in this process: it may read the beat, but it cannot end a stuck daemon
+  /// without ending itself, so nothing would, and its watchdog ends the process as a lone daemon's does. `Create` has no
+  /// anchor at all. A test that needs a supervised daemon to live on stuck plays the anchor across a spawn
+  /// (`crates/server/tests/common/supervised.rs`).
+  pub fn supervision(&self) -> crate::watchdog::Supervision {
+    match self {
+      SegmentSource::FromEnv => crate::watchdog::Supervision::Anchored,
+      SegmentSource::Create { .. } | SegmentSource::Handoff { .. } => {
+        crate::watchdog::Supervision::Alone
+      }
+    }
+  }
+}
+
 /// A held register record as a holder keeps it ([`Daemon::fleet_held_record`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeldRecordView {
@@ -147,6 +220,27 @@ pub struct HeldRecordView {
   pub fence: u64,
 }
 
+/// One peer's record dial at the read ([`Daemon::fleet_record_dials`], `crate::state::RecordDial`): how long the link has
+/// been dialing for the session it lacks, how long its current handshake call and its fresh session's first discovery
+/// page have run, the handshake budgets its dialer has spent and why its last ended, and the calls made since boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordDialReport {
+  /// The peer the link addresses.
+  pub peer: slates_db::HostId,
+  /// How long the link has been dialing, while it lacks a session.
+  pub dialing_for_ns: Option<u64>,
+  /// How long its current handshake call has run, while one runs.
+  pub call_for_ns: Option<u64>,
+  /// How long its fresh session's first discovery page has waited, while it does.
+  pub enroll_for_ns: Option<u64>,
+  /// Handshake budgets its dialer has spent without establishing.
+  pub budgets_spent: u32,
+  /// Why its dialer's last budget ended, while that dialer is kept for another call.
+  pub stall: Option<slates_transport::endpoint::HandshakeStall>,
+  /// Handshake calls made since boot.
+  pub calls: u64,
+}
+
 /// The daemon.
 pub struct Daemon {
   runtime: Option<Runtime>,
@@ -154,11 +248,62 @@ pub struct Daemon {
   doorbell: Option<DoorbellThread>,
   /// The liveness watchdog (A-228): the beat's writer, stopped after the shards.
   watchdog: Option<crate::watchdog::Watchdog>,
+  /// The writer of the shards' log lines (A-305), stopped after the shards, so it writes every line they queued.
+  log_writer: Option<slates_machine::log::LogWriter>,
   config: DaemonConfig,
   shards: Vec<ShardId>,
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
   /// listener could not be bound. A client mounts `nfs://localhost:PORT`.
   nfs_port: Option<u16>,
+  /// The port the version-control servers' HTTP edge listens on, when the configuration asked for one and it started
+  /// (A-625 part 3).
+  vcs_http_port: Option<u16>,
+  /// The version-control servers' SSH edge, when the configuration asked for one and it started (A-684).
+  vcs_ssh: Option<VcsSshEdge>,
+  /// The port the svn:// listener listens on, when the configuration asked for one and it started (A-656 part 2).
+  vcs_svn_port: Option<u16>,
+  /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
+  start_beats: u64,
+}
+
+/// The version-control servers' SSH edge as a daemon started it (§4.17.2 "Transports" item 2; A-684): the port it
+/// listens on, and its host key's fingerprint as OpenSSH prints one (`ssh-keygen -l -E sha256`, and `ssh` on a key it has
+/// not seen): `SHA256:` and the key blob's SHA-256 in base64 without padding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VcsSshEdge {
+  /// The port.
+  pub port: u16,
+  /// The host key's fingerprint.
+  pub fingerprint: String,
+}
+
+/// The start's beat (§2.6 boot step 2, A-312): the supervision block's heartbeat, written by the starting thread after
+/// each unit of its work, until the watchdog thread takes the beat over and becomes its one writer
+/// ([`crate::watchdog::Watchdog::start`]). The anchor judges a start in its own CPU time until its first beat, and kills
+/// one whose thread runs a liveness window of CPU without beating; a beat is the start's progress. Until 2026-11-17
+/// nothing beat until the watchdog ran, after the runtime had made a ring for every ordered pair of shards, and on B10's
+/// Linux gate at load 70 the anchor killed every start of 407 shards ("ran 1009-1037 ms of CPU on one thread without
+/// beating"). Each unit is microseconds, so a start that progresses keeps beating however many shards it starts; one
+/// stuck in a unit stops beating, and the anchor judges its process by its CPU from the lapse (A-232). Counted, so the
+/// boot log says how often a start beat.
+struct StartBeat {
+  clock: HostClock,
+  beats: u64,
+}
+
+impl StartBeat {
+  fn new() -> StartBeat {
+    StartBeat {
+      clock: HostClock::new(),
+      beats: 0,
+    }
+  }
+
+  /// Beats `supervision` now.
+  fn beat(&mut self, supervision: &slates_anchor::Supervision<'_>) {
+    supervision.beat(slates_vfs::clock::Clock::monotonic_ns(&mut self.clock));
+    self.beats = self.beats.saturating_add(1);
+  }
 }
 
 impl std::fmt::Debug for Daemon {
@@ -296,6 +441,13 @@ pub struct ShardPulse {
   /// parks it paid (§4.3), which its step quantum and idle windows follow; 0 until its first measured
   /// wake.
   pub wake_cost_ns: u64,
+  /// The shard's idle spin window, nanoseconds, as of its last measured wake (`ShardContext::counters`); 0 until its
+  /// first. Beside `wake_cost_ns` it shows whether the window follows the estimate (A-223).
+  pub idle_window_ns: u64,
+  /// What an idle turn costs a request that lands in it, nanoseconds, as the shard has learned it from its own spins,
+  /// as of its last idle spin; 0 until its first measured turn. The shard keeps a closed loop's hold only while this is
+  /// below `wake_cost_ns` (A-387, `slates_rt::held_turn::hold_pays`).
+  pub held_turn_ns: u64,
 }
 
 /// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
@@ -331,17 +483,95 @@ pub(crate) const NFS_BACKLOG: i32 = 16;
 /// anchor's descriptor is the only path that keeps the port stable across restarts.
 #[cfg(unix)]
 fn nfs_listener() -> Result<TcpListener, RtError> {
-  if let Some(raw) = std::env::var(ENV_NFS_LISTENER)
+  held_listener(ENV_NFS_LISTENER)
+    .unwrap_or_else(|| TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG))
+}
+
+/// The listener a supervising anchor holds and handed over under the environment variable `variable` (the NFS
+/// listener's, §4.6, the version-control edge's, A-625 part 3, or the svn:// listener's, A-689), adopted so its port
+/// survives a daemon restart; none when no anchor handed one over (a standalone start, or tests).
+#[cfg(unix)]
+pub(crate) fn held_listener(variable: &str) -> Option<Result<TcpListener, RtError>> {
+  let raw = std::env::var(variable)
     .ok()
-    .and_then(|value| value.parse::<RawFd>().ok())
-  {
-    // SAFETY: the anchor bound this listening socket and handed its descriptor to us across the spawn,
-    // inherited at this number; ownership is ours now (the anchor keeps its own copy), so wrapping it
-    // in an `OwnedFd` gives it a single owner that closes it on drop.
-    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-    return TcpListener::from_owned(owned);
+    .and_then(|value| value.parse::<RawFd>().ok())?;
+  // SAFETY: the anchor bound this listening socket and handed its descriptor to us across the spawn,
+  // inherited at this number; ownership is ours now (the anchor keeps its own copy), so wrapping it
+  // in an `OwnedFd` gives it a single owner that closes it on drop.
+  let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+  Some(TcpListener::from_owned(owned))
+}
+
+/// See the Unix arm: no anchor holds a listener for its daemons on Windows (`docs/wip/platforms.md`, gap 2).
+#[cfg(windows)]
+pub(crate) fn held_listener(_variable: &str) -> Option<Result<TcpListener, RtError>> {
+  None
+}
+
+/// Binds the version-control servers' shared HTTP edge's listener at `address` as the daemon binds its own, its backlog
+/// the edge's seats on a shard of `config` (A-625 part 3): what a supervising anchor binds once and holds across its
+/// daemons' restarts ([`slates_anchor::ENV_VCS_HTTP`]), so the edge's port never drops while a daemon restarts.
+pub fn bind_vcs_http_listener(
+  config: &DaemonConfig,
+  address: SocketAddrV4,
+) -> Result<TcpListener, RtError> {
+  crate::vcs_http::bind(config, address)
+}
+
+/// Binds the version-control servers' SSH edge's listener at `address` as the daemon binds its own, its backlog the
+/// edge's seats on a shard of `config` (A-684): what a supervising anchor binds once and holds across its daemons'
+/// restarts ([`slates_anchor::ENV_VCS_SSH`]), beside the host key it keeps in the segment.
+pub fn bind_vcs_ssh_listener(
+  config: &DaemonConfig,
+  address: SocketAddrV4,
+) -> Result<TcpListener, RtError> {
+  crate::vcs_ssh::bind(config, address)
+}
+
+/// Binds the svn:// listener at `address` as the daemon binds its own, its backlog the listener's seats on a shard of
+/// `config` (A-689): what a supervising anchor binds once and holds across its daemons' restarts
+/// ([`slates_anchor::ENV_VCS_SVN`]), so the listener's port never drops while a daemon restarts.
+pub fn bind_vcs_svn_listener(
+  config: &DaemonConfig,
+  address: SocketAddrV4,
+) -> Result<TcpListener, RtError> {
+  crate::vcs_svn::bind(config, address)
+}
+
+/// A version-control server's listener (the HTTP edge's, A-625 part 3, the SSH edge's, A-684, or the svn:// listener's,
+/// A-689): the one a supervising anchor holds and handed over under `variable`, adopted so the port never drops while a
+/// daemon restarts (a client that connects then waits in its queue), when it listens where the configuration's
+/// `address` says ([`listens_at`]); else, with none handed over, one bound here at `address` with `backlog`. Why there is
+/// none, otherwise: a held listener elsewhere is refused, never served, since the server would then answer somewhere the
+/// operator did not ask.
+pub(crate) fn held_or_bound_listener(
+  variable: &str,
+  address: SocketAddrV4,
+  backlog: i32,
+) -> Result<TcpListener, String> {
+  match held_listener(variable) {
+    Some(Ok(held)) => {
+      let at = held
+        .local_addr()
+        .map_err(|error| format!("the anchor's listener's address is unread: {error}"))?;
+      if listens_at(at, address) {
+        Ok(held)
+      } else {
+        Err(format!(
+          "the anchor's listener is at {at}, not at {address}"
+        ))
+      }
+    }
+    Some(Err(error)) => Err(format!("the anchor's listener was not adopted: {error}")),
+    None => TcpListener::bind(address, backlog)
+      .map_err(|error| format!("{address} did not bind: {error}")),
   }
-  TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG)
+}
+
+/// Whether a listener bound at `at` listens where `address` says: at its address, and at its port unless it asks for
+/// any (port 0, the system's pick, which an anchor makes once for every daemon it starts).
+pub(crate) fn listens_at(at: SocketAddrV4, address: SocketAddrV4) -> bool {
+  at.ip() == address.ip() && (address.port() == 0 || at.port() == address.port())
 }
 
 /// The NFS loopback listener to serve on Windows: a fresh ephemeral bind, since no anchor holds one there across a
@@ -446,7 +676,7 @@ pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 
 /// The status refusal count under which the daemon records a perpetual loop of its own that the control
 /// shard's arena refused — the mount listener's serve loop, the anchor heartbeat — counted, never silent
-/// (banned item 9); a shard's serve and reap loops are a typed initialization failure instead
+/// (banned item 9); a shard's serve loop and idle sweep are a typed initialization failure instead
 /// (`init_shard`), since a shard without them serves nothing.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const LOOP_SPAWN_REFUSED: &str = "daemon.loop_spawn";
@@ -493,7 +723,7 @@ pub struct ReplicaAccount {
   pub hold: u64,
 }
 
-/// Clients found dead and reclaimed (a health signal; T-2.3).
+/// Clients found dead and reclaimed: retirements the reaper finished after their hang-up (a health signal; T-2.3, A-475).
 pub static CLIENTS_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The loopback port the NFS transport serves on (§4.6), 0 until the listener is bound. Published as
 /// a process-global word (like the health signals) so a verb handler on any shard can report it to a
@@ -571,7 +801,7 @@ impl Daemon {
   }
 
   /// Who this node knows to vote in its region's council now ([`RegionalCouncil::known_voters`]): on a learner, the voters
-  /// its last fetched view named. A one-shot control-shard observation.
+  /// its configuration records (A-380). A one-shot control-shard observation.
   ///
   /// [`RegionalCouncil::known_voters`]: slates_cluster::config_group::RegionalCouncil::known_voters
   pub fn council_known_voters(&self) -> Result<Vec<slates_db::HostId>, ObserveError> {
@@ -659,13 +889,11 @@ impl Daemon {
     // This daemon's own mounts (A-227), recorded as each is made, so no daemon thread opens a path on one; room for one
     // a live attachment the shards can hold, the bound the anchor's device holds take.
     slates_base::own_mounts::install(config.held_device_bound()).map_err(|error| {
-      ServerError::Vfs(slates_vfs::error::VfsError::BaseUnavailable(match error {
-        slates_vfs::host::HostError::Unavailable(code)
-        | slates_vfs::host::HostError::OwnMount(code) => code,
-        _ => 0,
-      }))
+      // The code as the host named it, typed by its numbering (A-539).
+      ServerError::Vfs(slates_vfs::error::VfsError::BaseUnavailable(error.code()))
     })?;
     let identity = profile.facts.identity.clone();
+    let supervision = source.supervision();
     // The rendezvous comes from wherever the segment does (A-114): an anchor across the spawn names both in the
     // environment, an anchor in this process hands both over, and a daemon with no anchor makes its own.
     let adoption = match &source {
@@ -704,6 +932,9 @@ impl Daemon {
         segment
       }
     };
+    // The start beats from here until the watchdog takes the beat over (§2.6 boot step 2, A-312; [`StartBeat`]).
+    let mut start_beat = StartBeat::new();
+    start_beat.beat(&segment.supervision()?);
     if let Ok(json) = profile.to_json() {
       segment.publish(RegionKind::Profile, json.as_bytes())?;
     }
@@ -732,31 +963,87 @@ impl Daemon {
       slates_machine::log_line!("slates-server: descriptor limit raised from {was} to {now}");
     }
     let retained = crate::retention::load(&segment)?;
-    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits.
-    let runtime = Runtime::start_sized(&config.runtime, &[config.control_shard_capacity().get()])?;
+    // The writer every shard's log lines go through (A-305): a shard never waits on standard error, where a thread
+    // starved while it held the lock every line takes, or a reader slow to take a line, held a shard a window and the
+    // watchdog called it wedged. Started before the shards, stopped after them.
+    let log_writer = slates_machine::log::LogWriter::start().map_err(|error| {
+      ServerError::Ipc(slates_ipc::IpcError::OsRefused {
+        call: "spawn the log writer thread",
+        code: error.raw_os_error(),
+      })
+    })?;
+    // The block the start beats, held across the runtime's start (`supervision` above says who reads the beat).
+    let beat_block = segment.supervision()?;
+    start_beat.beat(&beat_block);
+    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits. The start
+    // beats after each unit of the runtime's work, its pair rings above all, N(N-1) of them (`slates_rt::runtime`).
+    let runtime = Runtime::start_sized(
+      &config.runtime,
+      &[config.control_shard_capacity().get()],
+      &mut || start_beat.beat(&beat_block),
+    )?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
-    // What the anchor held across the restart (A-61, A-113): the FUSE devices, each moved to the shard that owns its
-    // mount, and the NFS loopback connections, served again on the listener's shard below.
-    let handed = crate::anchor_hold::adopt(config.held_device_bound());
+    // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
+    // ends on Linux and macOS, A-316, A-339), each moved to the shard that owns its attachment, and the NFS loopback
+    // connections, served again on the listener's shard below. Each platform reads the handoff table against every
+    // entry its anchor may hold, as the configuration derives the anchor's bounds (A-448, A-460, A-462).
+    let handed = crate::anchor_hold::adopt(&config);
+    #[cfg(unix)]
+    let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
+    // The held copies: the Shards streams' DAX objects (A-365; Windows' sections, A-448), each moved to the shard that
+    // owns its attachment; and the writable direct maps' copies (A-197), each to the shard that holds its map, which
+    // Linux alone sends the anchor.
+    let (other_copies, inherited_dax) = crate::shards::dax_hold::split(handed.copies, shards.len());
+    let mut inherited_dax = inherited_dax.into_iter();
+    // The NFS send ledgers (A-550, Linux), each judging the held connections on the listener's shard below.
     #[cfg(target_os = "linux")]
-    let mut inherited_fuse = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
+    let (other_copies, inherited_ledgers) = crate::held_send::split_ledgers(other_copies);
+    #[cfg(not(target_os = "linux"))]
+    let inherited_ledgers = crate::held_send::Inherited::default();
+    #[cfg(target_os = "linux")]
+    let mut inherited_copies = crate::held_copy::split(other_copies, shards.len()).into_iter();
     #[cfg(all(unix, not(target_os = "linux")))]
-    release_devices_without_fuse(handed.devices);
-    // The writable copies (A-197), each moved to the shard that holds its map: Linux alone sends the anchor one.
-    #[cfg(target_os = "linux")]
-    let mut inherited_copies = crate::held_copy::split(handed.copies, shards.len()).into_iter();
+    for copy in other_copies {
+      // No other kind of copy is held here: one is let go at once, its record no shard's.
+      let _released = crate::anchor_hold::release_copy(copy.copy);
+    }
+    // No other kind of copy is held on Windows: a section whose record is no DAX record is an entry no shard adopts,
+    // which the control shard releases with the refused mounts (its release is an exchange only a shard can make).
     #[cfg(windows)]
-    let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
+    let mut held_mounts = handed.mounts;
+    #[cfg(windows)]
+    held_mounts.extend(
+      other_copies
+        .into_iter()
+        .map(|copy| crate::anchor_hold::HandedMount {
+          attachment: copy.copy,
+          handles: Vec::new(),
+          record: copy.record,
+          adoptable: false,
+        }),
+    );
+    #[cfg(windows)]
+    let mut inherited_winfsp = crate::winfsp::split_held(held_mounts, shards.len()).into_iter();
+    // The Shards streams' resync ends (A-433), each to the shard that owns its attachment.
+    #[cfg(windows)]
+    let mut inherited_resync =
+      crate::shards::split_held_resync(handed.resync_ends, shards.len()).into_iter();
     #[cfg(windows)]
     let mut windows_channel = handed.channel;
     #[cfg(windows)]
     configure_windows_hold_owner(windows_channel.is_some(), &shards)?;
     let handed_connections = handed.connections;
-    // This daemon's learning gate (A-227): its shards' crossing checks wait on its own shards' learning alone.
+    // This daemon's learning gate (A-227): its shards' crossing checks wait on its own shards' learning alone, while it
+    // goes on (A-552): a check gives the learning its own shard's window (the one its watchdog judges it by, A-455) to
+    // end one more shard's, and parks a beat between looks, so its watchdog sees it move at every look of its own.
     #[cfg(unix)]
-    let gate = slates_base::own_mounts::Gate::new(LIVENESS_BUDGET_NS);
+    let gate = slates_base::own_mounts::Gate::new(
+      shards.len(),
+      crate::watchdog::own_window_ns,
+      HEARTBEAT_NS,
+    );
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();
@@ -764,30 +1051,40 @@ impl Daemon {
       let partition = u16::try_from(index).unwrap_or(u16::MAX);
       let all: Vec<u16> = shards.iter().map(|s| s.0).collect();
       let retained = retained.clone();
-      #[cfg(target_os = "linux")]
-      let held = inherited_fuse.next().unwrap_or_default();
-      #[cfg(target_os = "linux")]
-      let copies = inherited_copies.next().unwrap_or_default();
+      #[cfg(unix)]
+      let holds = ShardHolds {
+        devices: inherited_devices.next().unwrap_or_default(),
+        #[cfg(target_os = "linux")]
+        copies: inherited_copies.next().unwrap_or_default(),
+        dax: inherited_dax.next().unwrap_or_default(),
+      };
       #[cfg(windows)]
-      let windows_holds = (
-        inherited_winfsp.next().unwrap_or_default(),
-        if index == 0 {
+      let holds = ShardHolds {
+        winfsp: inherited_winfsp.next().unwrap_or_default(),
+        channel: if index == 0 {
           windows_channel.take()
         } else {
           None
         },
-      );
+        resync: inherited_resync.next().unwrap_or_default(),
+        dax: inherited_dax.next().unwrap_or_default(),
+      };
       // This shard's learning of the mounts it keeps, taken before it starts so none of the daemon's crossings is
       // judged before the shard has recorded them (A-227). A Linux shard the anchor handed no FUSE device keeps no mount
       // that could wait on it (a kept mount with no device answers `ENOTCONN`), so it counts as learned at once. A
       // macOS shard learns its kept NFS mounts from its catalog, which it reads only as it starts.
       #[cfg(target_os = "linux")]
-      let learning = (!held.is_empty()).then(|| gate.learning());
+      let learning = (!holds.devices.is_empty()).then(|| gate.learning());
       #[cfg(target_os = "macos")]
       let learning = Some(gate.learning());
       #[cfg(windows)]
       let learning = ();
+      let log_route = log_writer.route();
       runtime.spawn_on(*shard, async move {
+        // Before anything this shard logs: its lines go to the daemon's log writer from here on (A-305).
+        if let Some(route) = log_route {
+          route.install();
+        }
         // This daemon's learning gate is entered on the shard's own thread before its start (A-227).
         #[cfg(unix)]
         gate.enter();
@@ -801,10 +1098,7 @@ impl Daemon {
           (partition, sealing, learning),
           all,
           retained,
-          #[cfg(target_os = "linux")]
-          (held, copies),
-          #[cfg(windows)]
-          windows_holds,
+          holds,
         ));
         if let Err(e) = start.and_then(futures::detach) {
           INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
@@ -813,11 +1107,13 @@ impl Daemon {
           );
         }
       })?;
+      start_beat.beat(&beat_block);
     }
-    // The doorbell, on the rendezvous opened above.
-    let kicks: Vec<slates_rt::driver::Kick> = shards
+    // The doorbell, on the rendezvous opened above: each shard's kick by the id a client's region names it by (A-381),
+    // the control shard first.
+    let kicks: Vec<(u16, slates_rt::driver::Kick)> = shards
       .iter()
-      .filter_map(|s| registry::with_entry(s.0, |e| e.kick))
+      .filter_map(|s| registry::with_entry(s.0, |e| (s.0, e.kick)))
       .collect();
     let doorbell = match (listener.doorbell_waiter()?, listener.doorbell_waiter()?) {
       (Some(waiter), Some(waker)) => Some(DoorbellThread::start(
@@ -838,10 +1134,18 @@ impl Daemon {
       .iter()
       .filter_map(|shard| registry::holder_of(shard.0))
       .collect();
+    // The start's last beat, then the watchdog's thread takes the beat over: one writer at a time.
+    start_beat.beat(&beat_block);
+    slates_machine::log_line!(
+      "slates-server: the start beat {} times over {} shards before the watchdog took the beat over",
+      start_beat.beats,
+      shards.len()
+    );
     let watchdog = crate::watchdog::Watchdog::start(
       AnchorSegment::attach(&watch_handoff, watch_len, &identity)?,
       holders,
       control_alive,
+      supervision,
     )
     .map_err(|error| {
       ServerError::Ipc(slates_ipc::IpcError::OsRefused {
@@ -882,17 +1186,38 @@ impl Daemon {
         crate::fleet::run_membership(transport).await;
       })?;
     }
-    let nfs_port = start_nfs_transport(&runtime, control, &config, handed_connections)?;
+    let nfs_port = start_nfs_transport(
+      &runtime,
+      control,
+      &config,
+      handed_connections,
+      inherited_ledgers,
+    )?;
     #[cfg(target_os = "macos")]
     start_shards_route(&runtime, control, &config)?;
+    // The version-control servers' HTTP edge, when the operator asked for one (§4.17.2 "Transports" item 1, A-625 part 3):
+    // its listener on the control shard beside the NFS transport, every shard keeping its seats.
+    let vcs_http_port = crate::vcs_http::start(&runtime, control, &shards, &config)?;
+    // And its SSH edge (§4.17.2 "Transports" item 2, A-684): its listener on the control shard, every shard seating the
+    // connections that move to it; its host key the fleet node's own, else the one the anchor keeps in the segment, else
+    // this lone daemon's own.
+    let vcs_ssh = crate::vcs_ssh::start(&runtime, control, &shards, &config, &segment)?;
+    // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-689, A-695): on the control shard too,
+    // every shard keeping its seats for the connections that move to their repository's owner.
+    let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &shards, &config)?;
     Ok(Daemon {
       runtime: Some(runtime),
       segment,
       doorbell,
       watchdog: Some(watchdog),
+      log_writer: Some(log_writer),
       config,
       shards,
       nfs_port,
+      vcs_http_port,
+      vcs_ssh,
+      vcs_svn_port,
+      start_beats: start_beat.beats,
     })
   }
 
@@ -900,6 +1225,30 @@ impl Daemon {
   /// `nfs://localhost:PORT` to reach this daemon's volumes (those on its accepting shard, R8).
   pub fn nfs_port(&self) -> Option<u16> {
     self.nfs_port
+  }
+
+  /// The port the version-control servers' HTTP edge listens on (§4.17.2 "Transports" item 1, A-625 part 3), when the
+  /// configuration asked for one and it started.
+  pub fn vcs_http_port(&self) -> Option<u16> {
+    self.vcs_http_port
+  }
+
+  /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2, A-684), when the configuration asked for one
+  /// and it started: its port and its host key's fingerprint.
+  pub fn vcs_ssh(&self) -> Option<&VcsSshEdge> {
+    self.vcs_ssh.as_ref()
+  }
+
+  /// The port the svn:// listener listens on (§4.17.4 piece 7, A-656 part 2), when the configuration asked for one and it
+  /// started.
+  pub fn vcs_svn_port(&self) -> Option<u16> {
+    self.vcs_svn_port
+  }
+
+  /// How many times this daemon's start beat before its watchdog took the beat over (§2.6 boot step 2, A-312): at least
+  /// once a unit of the start's work, so at least once for every ordered pair of its shards.
+  pub fn start_beats(&self) -> u64 {
+    self.start_beats
   }
 
   /// The configuration.
@@ -1035,6 +1384,29 @@ impl Daemon {
   /// Test support: [`Self::flood_control_channel`] on the shard at `partition` (A-216's refused release: a spawn sent to
   /// a full control channel is refused `ControlFull`). The flood clears by itself once that shard runs.
   pub fn flood_control_channel_of(&self, partition: usize) -> Result<usize, ObserveError> {
+    self.flood_with(partition, || async {})
+  }
+
+  /// Test support: [`Self::flood_control_channel_of`], each queued task adding one to `ran` when the shard runs it. The
+  /// shard runs its channel's messages in the order it took them, so `ran` is its progress through the flood, and a
+  /// message sent once the channel has room runs after the flood's last task (a whole channel: 41,125 tasks on an
+  /// 18-CPU Mac, drained in 64 ms to 4.33 s under 36 spinning threads, 2026-11-17).
+  pub fn flood_control_channel_counting(
+    &self,
+    partition: usize,
+    ran: &'static AtomicU64,
+  ) -> Result<usize, ObserveError> {
+    self.flood_with(partition, move || async move {
+      ran.fetch_add(1, Ordering::Relaxed);
+    })
+  }
+
+  /// Spawns `task()` on the shard at `partition` until its control channel refuses one as full; how many were queued.
+  fn flood_with<F: Future<Output = ()> + Send + 'static>(
+    &self,
+    partition: usize,
+    task: impl Fn() -> F,
+  ) -> Result<usize, ObserveError> {
     let shard = self
       .shards
       .get(partition)
@@ -1043,7 +1415,7 @@ impl Daemon {
     let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
     let mut queued: usize = 0;
     loop {
-      match runtime.spawn_on(shard, async {}) {
+      match runtime.spawn_on(shard, task()) {
         Ok(()) => queued = queued.saturating_add(1),
         Err(slates_rt::RtError::ControlFull { .. }) => return Ok(queued),
         Err(slates_rt::RtError::ShardGone { shard }) => {
@@ -1151,7 +1523,7 @@ impl Daemon {
   /// control shard, where the record sessions live, and it sleeps on the shard's timer, so the shard keeps
   /// serving meanwhile. A session that is not in its link when the hold starts (out on a dispatch or a
   /// discovery page, or being established by its link task after a membership change) is waited for, paced
-  /// at the fleet's poll interval, for at most [`SESSION_WAIT_NS`], as a forward waits for it
+  /// at the fleet's poll interval, for at most [`session_wait_ns`], as a forward waits for it
   /// (`fleet::forward_over_leader_session`); taking only what is there at the first look made the hold a race
   /// against those (CI run 36275755772, docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md). Returns
   /// once the hold has run its take, with what it found ([`SessionHold`]); the typed refusal when the control
@@ -1174,7 +1546,7 @@ impl Daemon {
           if !sessions.is_empty() {
             break (sessions, SessionHold::Took { waited_ns });
           }
-          if waited_ns >= SESSION_WAIT_NS {
+          if waited_ns >= session_wait_ns() {
             let linked =
               crate::state::with_state(|s| s.record_sessions.contains_key(&peer)).unwrap_or(false);
             let outcome = if linked {
@@ -1238,7 +1610,7 @@ impl Daemon {
   /// (`live_ship::ask_reports`), each under a budget of `budget_ns`, then waits `settle_ns` (a record period or more,
   /// so queued stragglers are drained) and reports what is left of this node's record link to each peer
   /// ([`LinkAfter`]), with how many rounds found a peer's session in its link to ask over. A round waits for the
-  /// session as [`Self::hold_record_session`] does, for at most the longer of [`SESSION_WAIT_NS`] and `settle_ns`, since
+  /// session as [`Self::hold_record_session`] does, for at most the longer of [`session_wait_ns`] and `settle_ns`, since
   /// a link an earlier round dropped is dialed afresh meanwhile; a round that finds none ends the asking. Runs on the control shard, where the record sessions live. A budget too short for any reply makes each
   /// question unanswered, as a reply past the liveness budget is on a lossy path (KIND's wan-loss profile, CI
   /// diag-raft-chaos-final-41).
@@ -1257,7 +1629,7 @@ impl Daemon {
       .spawn_on_with_receipt(shard, async move {
         let poll_ns = (HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).max(1);
         // A link dropped by an earlier round is dialed afresh by its task, which can take longer than a session wait.
-        let session_wait_ns = SESSION_WAIT_NS.max(settle_ns);
+        let session_wait_ns = session_wait_ns().max(settle_ns);
         let mut asked = 0usize;
         for _ in 0..rounds {
           let began = slates_rt::futures::now_ns();
@@ -1340,7 +1712,7 @@ impl Daemon {
     // Every round's session wait and question, and the settle, on top of the observe budget.
     let rounds_ns = u64::try_from(rounds)
       .unwrap_or(u64::MAX)
-      .saturating_mul(SESSION_WAIT_NS.max(settle_ns).saturating_add(budget_ns));
+      .saturating_mul(session_wait_ns().max(settle_ns).saturating_add(budget_ns));
     let bound_ns = OBSERVE_BUDGET_NS
       .saturating_add(rounds_ns)
       .saturating_add(settle_ns);
@@ -1481,6 +1853,8 @@ impl Daemon {
           ring_full_events: entry.ring_full_events.load(Ordering::Relaxed),
           scheduler_overrun_ns: entry.pulse.scheduler_overrun_ns(),
           wake_cost_ns: entry.pulse.wake_cost_ns(),
+          idle_window_ns: entry.pulse.idle_window_ns(),
+          held_turn_ns: entry.pulse.held_turn_ns(),
         })
       })
       .collect()
@@ -2207,10 +2581,16 @@ impl Daemon {
   /// Test support: **starves** this daemon's control shard for `span_ns` — the CPU starvation a shared,
   /// oversubscribed box inflicts on a live daemon (measured here at load average 41: a live root voter was
   /// retired and re-admitted in a loop), injected deterministically so the fleet's tolerance of it is a
-  /// test, not a hope. The hold is a task spawned onto the control shard that spins on the shard clock
-  /// until the span has passed: the shard is cooperative, so while the hold runs nothing else on that shard
+  /// test, not a hope. The hold is a task spawned onto the control shard that runs until the span has passed:
+  /// the shard is cooperative, so while the hold runs nothing else on that shard
   /// does — its probe serve tasks (so its acknowledgements to every peer's probes stop for the whole span,
-  /// then resume), its own probes, its record plane and its consensus loops. Admission is retried while the
+  /// then resume), its own probes, its record plane and its consensus loops.
+  ///
+  /// It runs as a starved thread runs, a little CPU at a time (A-232): each beat it spins for its share and sleeps the
+  /// rest, its share being what keeps its whole CPU over the span to half the window the watchdog judges the control
+  /// shard by ([`starved_share_ns`], A-552). Until A-232 it spun the whole span, and the watchdog's own rule (A-228) calls a window of
+  /// CPU without a step a spinning, stuck shard, not a starved one: an anchor would kill that daemon, and since A-232 a
+  /// lone one ends itself. So a span past a window was a stuck daemon, not the live, starved one this models. Admission is retried while the
   /// control channel is full ([`Self::observation`]); the typed refusal when there is no control shard or
   /// the hold was not admitted within the observe budget, otherwise the **admitted** hold, whose answer
   /// ([`Admitted::answer`]) is its **measured span** (nanoseconds) once it ends — so a test proves the
@@ -2230,12 +2610,7 @@ impl Daemon {
         OBSERVE_BUDGET_NS.saturating_add(span_ns),
         move || {
           let _ = spinning.send(());
-          let begin = slates_rt::futures::now_ns();
-          let end = begin.saturating_add(span_ns);
-          while slates_rt::futures::now_ns() < end {
-            std::hint::spin_loop();
-          }
-          Ok(slates_rt::futures::now_ns().saturating_sub(begin))
+          Ok(starve_this_thread(span_ns))
         },
       )?
       .admit()?;
@@ -2376,6 +2751,57 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-270): whether the held pieces this node's committed recovery journal carries are exactly what it
+  /// holds now (`crate::verbs::committed_held_agrees`), on the shard that holds for other owners.
+  pub fn held_journal_agrees(&self) -> Result<bool, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      crate::verbs::committed_held_agrees(s)
+    })
+  }
+
+  /// Test support (A-367): every position this node holds of `object` as a holder, as its sequence and the epoch it was
+  /// accepted at, in sequence order.
+  pub fn fleet_held_positions(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Vec<(u64, u64)>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.holder_records
+        .get(&object)
+        .map(|acceptor| {
+          acceptor
+            .positions()
+            .filter(|(held, ..)| *held == object)
+            .map(|(_, sequence, epoch, _)| (sequence, epoch.0))
+            .collect()
+        })
+        .unwrap_or_default()
+    })
+  }
+
+  /// Test support: the record this node holds of `object` at ledger position `sequence`, with the epoch its fence has
+  /// seen; `None` when it holds none there. A test reads what a takeover adopted at a position whatever the successor
+  /// wrote after it.
+  pub fn fleet_held_record_at(
+    &self,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+  ) -> Result<Option<HeldRecordView>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let acceptor = s.holder_records.get(&object)?;
+      let (promised, accepted) = acceptor.persisted();
+      accepted
+        .into_iter()
+        .find(|(held, at, _, _)| *held == object && *at == sequence)
+        .map(|(_, sequence, epoch, value)| HeldRecordView {
+          sequence,
+          epoch: epoch.0,
+          value,
+          fence: promised.0,
+        })
+    })
+  }
+
   /// The newest record this node holds of `object` as a holder, with the epoch its fence has seen: what a takeover's
   /// phase one would read from it.
   pub fn fleet_held_record(
@@ -2480,6 +2906,30 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-385): how far this node has folded `green`'s histories and what they hold — the engine where this
+  /// node serves the green, else its replica as a holder — as the version below which they are folded and their bytes
+  /// (`Green::retained_bytes`'s history); `None` where it has neither. Runs a one-shot question on the shard that serves
+  /// the green, then on the control shard that holds the replicas; the typed refusal when either could not be observed.
+  pub fn merge_history(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<Option<(u64, usize)>, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
+    let history = |engine: &slates_merge::engine::Green| {
+      (engine.folded_below(), engine.retained_bytes().history)
+    };
+    let served = self.observe(self.shard_of_object(object), move |s| {
+      s.greens.get(&volume).map(|engine| history(&engine))
+    })?;
+    if served.is_some() {
+      return Ok(served);
+    }
+    self.observe(self.shards.first().copied(), move |s| {
+      s.merge.replicas.get(&object).map(history)
+    })
+  }
+
   /// The chain of `green` as the shard that serves it holds it: each version's increment identity in
   /// order (§4.16; AUD-14), those folded into its checkpoint (W3) as the checkpoint keeps them — what a test compares between the departed owner and its successor to prove
   /// the full ledger prefix and the original results were preserved through the takeover. Empty for a
@@ -2490,41 +2940,54 @@ impl Daemon {
   ) -> Result<Vec<(u64, [u8; 32])>, ObserveError> {
     let object = slates_db::register::ObjectId(green.bytes);
     let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
-    self.observe(self.shard_of_object(object), move |s| {
-      // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
-      // holds the versions after it.
-      let partition = s.db.partition();
-      let (held, mut identities) =
-        partition
+    let (adopted_through, mut identities) =
+      self.observe(self.shard_of_object(object), move |s| {
+        // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
+        // holds the versions after the green's floor: its checkpoint, else its adoption (A-333), else 0.
+        let partition = s.db.partition();
+        let held = partition.green_floor(volume);
+        let mut identities: Vec<(u64, [u8; 32])> = partition
           .green_checkpoint(volume)
-          .map_or((0, Vec::new()), |(held, bytes)| {
-            let accepted = slates_merge::checkpoint::Checkpoint::decode(bytes)
+          .map(|(_, bytes)| {
+            slates_merge::checkpoint::Checkpoint::decode(bytes)
               .map(|checkpoint| checkpoint.accepted)
-              .unwrap_or_default();
-            (
-              held,
-              accepted
-                .into_iter()
-                .map(|(id, version)| (version, id))
-                .collect(),
-            )
-          });
-      identities.sort_unstable();
-      identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
-        |(index, bytes)| {
-          slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
-            (
-              u64::try_from(index)
-                .unwrap_or(u64::MAX)
-                .saturating_add(held)
-                .saturating_add(1),
-              entry.increment.id,
-            )
+              .unwrap_or_default()
+              .into_iter()
+              .map(|(id, version)| (version, id))
+              .collect()
           })
-        },
-      ));
-      identities
-    })
+          .unwrap_or_default();
+        identities.sort_unstable();
+        identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
+          |(index, bytes)| {
+            slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
+              (
+                u64::try_from(index)
+                  .unwrap_or(u64::MAX)
+                  .saturating_add(held)
+                  .saturating_add(1),
+                entry.increment.id,
+              )
+            })
+          },
+        ));
+        // A green its takeover adopted from this node's holder ledger, with no checkpoint past the adoption, names the
+        // versions up to it by the ledger's records, which the control shard holds.
+        let adopted = partition
+          .green_adoption(volume)
+          .filter(|_| partition.green_checkpoint(volume).is_none())
+          .map(|adoption| adoption.version);
+        (adopted, identities)
+      })?;
+    if let Some(through) = adopted_through {
+      // Its ledger's, with the versions its durable checkpoint stands for (A-404, A-476).
+      let mut ledger = self.observe(self.shards.first().copied(), move |s| {
+        crate::merge_origin::ledger_identities(s, object, through)
+      })?;
+      ledger.append(&mut identities);
+      identities = ledger;
+    }
+    Ok(identities)
   }
 
   /// The bytes the snapshot of `green`'s partition encodes to now (§4.8): what every snapshot taken when its log
@@ -2584,6 +3047,13 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
   }
 
+  /// Test support: loses the next verdict or admission the work's shard for `partition` is answered by its green's
+  /// owner (A-247; never reachable from the wire), as a crash between the owner's step and the work's would.
+  pub fn lose_next_owner_answer(&self, partition: u16) -> Result<(), ObserveError> {
+    let shard = self.shards.get(usize::from(partition)).copied();
+    self.observe(shard, |s| s.work_home.lose_next_answer = true)
+  }
+
   /// Test support: holds every discovery reply this node's record serve side would send (never reachable
   /// from the wire) while `withhold` is set, so a peer's refresh exchange to this node stays pending with
   /// its record endpoint borrowed by that exchange — the interrupted-discovery restart the
@@ -2594,6 +3064,114 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| {
       s.discovery_withhold_replies = withhold;
     })
+  }
+
+  /// Test support: while `withhold` is set, every shard's Shards streams make their replies, publishing those that
+  /// wait for a barrier with their effect as always, and write none, as when a daemon dies between a barrier and its
+  /// reply (A-316). `Ok` once every shard has it, else the first typed refusal.
+  pub fn withhold_shards_replies(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.shards_withhold_replies = withhold)?;
+    }
+    Ok(())
+  }
+
+  /// Test support: while `withhold` is set, no shard sends the control partition what it owes the audit (A-265's
+  /// crossing; `LandingState::crossing_withheld`): an owed record stays between its atom's commit and its batch, where a
+  /// daemon that died used to lose it. A daemon started over the same anchor sends it from its recovered outbox.
+  /// Delivered like [`Self::withhold_shards_replies`]; `Ok` once installed, else the typed refusal.
+  pub fn withhold_audit_crossing(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.landing.crossing_withheld = withhold)?;
+    }
+    Ok(())
+  }
+
+  /// Test support: while `withhold` is set, no shard records the control partition's acknowledgement of its appended
+  /// audit records (A-265; `LandingState::acknowledgement_withheld`), as if each were lost: the outbox keeps them, and
+  /// the deadline keeper's look sends them again (A-554), which the control partition must append nothing twice of.
+  /// Delivered like
+  /// [`Self::withhold_audit_crossing`]; `Ok` once installed, else the typed refusal.
+  pub fn withhold_audit_acknowledgement(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.landing.acknowledgement_withheld = withhold;
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), and
+  /// a returned holder's walk's turns (`live_ship::reached_slice`), in place of the shard's own step quantum; `None` gives
+  /// the shard its own back. Zero ends each slice after one volume, so
+  /// a test sees the slicing whatever the machine's wake cost. Delivered like [`Self::inject_live_state_withhold`]; `Ok`
+  /// once installed, else the typed refusal.
+  pub fn inject_live_period_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.live.period_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Test support: the quantum a seal's turns are cut by on every shard (the record period's seal walk and envelope wrap,
+  /// `fleet::seal_walk_slice`, and a takeover's envelope open, `fleet::open_slice`), in place of the shard's own step
+  /// quantum; `None` gives the shard its own back. Zero ends each turn after one volume or one chunk, so a test sees the
+  /// slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
+  /// once installed, else the typed refusal.
+  pub fn inject_seal_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.seal_walk_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Test support: the quantum an install's walk over the held register copies is cut by on every shard
+  /// (`fleet::install_slice`, A-398), in place of the shard's own step quantum; `None` gives the shard its own back.
+  /// Zero ends each turn after one copy, so a test sees the slicing whatever the machine's speed. `Ok` once installed
+  /// on every shard, else the first typed refusal.
+  pub fn inject_install_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.install_walk_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Test support: every shard waits `pause_ns` between the turns of a live takeover's rebuild it makes
+  /// (`fleet::rebuild_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
+  /// attempts meet it running; `None` lifts it. `Ok` once installed on every shard, else the first typed refusal.
+  pub fn inject_live_turn_pause(&self, pause_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.live_turn_pause_ns = pause_ns;
+      })?;
+    }
+    Ok(())
+  }
+
+  /// Test support: this node is superseded on `volume` at `epoch` (`live_ship::inject_superseded`, never reachable from
+  /// the wire): `learned` now, as a holder's answer with a later fence finds it and its mounts and streams are told, or as
+  /// a restart over a kept fence finds it, telling none (A-344). So a mount's or a Shards stream's answer to a takeover
+  /// (A-346, A-584) is driven without a fleet, each path alone. Delivered on the volume's owner shard; `Ok` once
+  /// installed, else the typed refusal.
+  pub fn inject_superseded(
+    &self,
+    volume: slates_ipc::protocol::VolumeId,
+    epoch: u64,
+    learned: bool,
+  ) -> Result<(), ObserveError> {
+    let id = slates_db::catalog::VolumeId {
+      bytes: volume.bytes,
+    };
+    self.observe(
+      self.shard_of_object(slates_db::register::ObjectId(volume.bytes)),
+      move |s| crate::live_ship::inject_superseded(s, id, epoch, learned),
+    )
   }
 
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
@@ -2612,21 +3190,33 @@ impl Daemon {
 
   /// Test support: the host memory available that this daemon's pressure sampler reads from now on, in
   /// place of the platform's reading (§4.2; admission.md §5.5) — so a test drives the sampler's
-  /// arithmetic (its baseline and shortfall) deterministically. Installed on every shard, since the
-  /// sampling shard is the reaper's.
+  /// arithmetic (its baseline and shortfall) deterministically. Installed on every shard; each reading is a report to
+  /// the sampler, as the kernel's would be (A-570), and the first replaces the source the baseline was taken from, so
+  /// the baseline is taken again from it.
   pub fn inject_available_memory(&self, bytes: u64) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
-      self.observe(Some(shard), move |s| s.injected_available = Some(bytes))?;
+      self.observe(Some(shard), move |s| {
+        if s.injected_available.replace(bytes).is_none() {
+          s.pressure_baseline = None;
+        }
+        crate::pressure::ask(s);
+      })?;
     }
     Ok(())
   }
 
   /// Test support: this process's own resident memory as the pressure sampler reads it from now on, in place of the
   /// platform's reading (§4.2): with [`Daemon::inject_available_memory`], a test drives the sampler's split between
-  /// the daemon's own growth and pressure from elsewhere. Installed on every shard, as the available reading is.
+  /// the daemon's own growth and pressure from elsewhere. Installed on every shard, as the available reading is, a
+  /// report to the sampler as that is, and the first replaces the resident baseline's source as that does.
   pub fn inject_resident_memory(&self, bytes: u64) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
-      self.observe(Some(shard), move |s| s.injected_resident = Some(bytes))?;
+      self.observe(Some(shard), move |s| {
+        if s.injected_resident.replace(bytes).is_none() {
+          s.pressure_resident_baseline = None;
+        }
+        crate::pressure::ask(s);
+      })?;
     }
     Ok(())
   }
@@ -2683,13 +3273,13 @@ impl Daemon {
     Ok(())
   }
 
-  /// Test support: gives back every shard's dead recovery memory now, as an idle shard's reap tick does
-  /// (`return_dead_recovery`, A-117), rather than waiting for the tick to find the shard idle: the bytes given back
+  /// Test support: gives back every shard's dead recovery memory now, as an idle shard's sweep pass does
+  /// (`return_dead_recovery`, A-117), rather than waiting for a sweep pass to find the shard idle: the bytes given back
   /// over every shard.
   pub fn give_back_recovery_on_every_shard(&self) -> Result<u64, ObserveError> {
     let mut returned = 0u64;
     for shard in self.shards.iter().copied() {
-      // Slice after slice, as the idle tick takes them (one quantum a step), until nothing is left.
+      // Slice after slice, as an idle sweep pass takes them (one quantum a step), until nothing is left.
       loop {
         let (bytes, more) = self.observe(Some(shard), return_dead_recovery)?;
         returned = returned.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
@@ -2723,7 +3313,7 @@ impl Daemon {
     Ok(left)
   }
 
-  /// Test support: gives back every shard's dead recovery memory a slice at a time, as an idle shard's reap tick does
+  /// Test support: gives back every shard's dead recovery memory a slice at a time, as an idle shard's sweep pass does
   /// (`return_dead_recovery`, A-226), timing each step on the shard thread's own CPU clock, which a loaded host does
   /// not inflate: the bytes given back, the steps, the CPU each step held its shard, and the step quantum the shard
   /// holds its work to. `None` for the CPU where the shard's thread clock cannot be read (Windows' thread times tick
@@ -2782,7 +3372,7 @@ impl Daemon {
     Ok(report)
   }
 
-  /// Test support: runs one idle give-back of the first shard's dead recovery memory, as a reap tick does, from a page
+  /// Test support: runs one idle give-back of the first shard's dead recovery memory, as a sweep pass does, from a page
   /// slice and over the whole of that memory as after a restart, with `neighbour` another task taking turns on the
   /// shard the whole time: how many idle steps it took, `None` if the shard could not be asked or did not finish within
   /// the budget. A neighbour that allocates nothing looks idle to the arena, as a granted landing does (A-226). The
@@ -2795,7 +3385,7 @@ impl Daemon {
         // Only a shard with a committed image has dead memory to give back.
         let _ = crate::verbs::publish_shard(s);
         s.journal.forget_what_was_given_back();
-        s.give_back_slice_bytes = 0;
+        s.give_back_rate = GiveBackRate::default();
         s.purge_seen_allocations = s.store.content.arena().allocations();
         if let Ok(task) = futures::spawn(probe_give_back(neighbour)) {
           let _ = futures::detach(task);
@@ -2817,7 +3407,8 @@ impl Daemon {
 
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
-  /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
+  /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at each report of the host's
+  /// memory pressure (A-570, `crate::pressure`); this
   /// drives it directly so a test proves the mechanism without a real low-memory host: a raised hold
   /// refuses a new reservation while an admitted volume's within-entitlement writes still land. The
   /// injected hold is pinned: the sampler leaves those shards' holds alone from then on, so the test is
@@ -2863,6 +3454,26 @@ impl Daemon {
       debt = debt.max(owed);
     }
     Ok(pooled.map(|pool| pool.saturating_add(held).saturating_add(debt)))
+  }
+
+  /// Test support (A-393): every shard's write log is marked overflowed, as a log is when it could not take an
+  /// acknowledged write and the publication that would have emptied it was refused (A-63): the next daemon then reports
+  /// every file a taken-over attachment had open as having lost writes. A test of what a successor tells its guest sets
+  /// the very predicate the log keeps, rather than starving a publication. Whether every shard holding a log marked
+  /// it, or the first shard's typed refusal.
+  #[cfg(unix)]
+  pub fn inject_write_log_overflow(&self) -> Result<bool, ObserveError> {
+    let mut marked = true;
+    for shard in self.shards.iter().copied() {
+      let this = self.observe(Some(shard), |s| {
+        match (s.write_log.as_mut(), s.content.as_mut()) {
+          (Some(log), Some(object)) => log.overflow(object).is_ok(),
+          _ => true,
+        }
+      })?;
+      marked = marked && this;
+    }
+    Ok(marked)
   }
 
   /// Test support: every shard refuses (or takes again) the NFSv4 purges sent to it, as an owner that cannot make a
@@ -2945,6 +3556,43 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node, as a content holder, hold each acknowledgement of a placement `delay_ns` before it
+  /// leaves (`None` restores immediate answers). The hold has already taken the content, so an owner whose round stops
+  /// collecting at its hedge delay first receives the acknowledgement as a straggler's, as it does from a holder whose
+  /// refill outlasts the round under load. A missing set or a refusal goes at once. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_content_ack_delay(&self, delay_ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_content_ack_delay_ns = delay_ns;
+    })
+  }
+
+  /// Test support: while `Some(ns)`, this node publishes `ns` as its failover delay in place of its estimate, on every
+  /// shard at once (A-363, A-414): the bound of every wait that bounds a failover (a forward, the location round, a held
+  /// reply, a takeover's attempts) and the term of the leases that read it (the write lease, a landing's target lease,
+  /// a staging buffer), for a test whose subject is that bound's or term's rule. `None` returns to the estimate at the
+  /// control shard's next beat, which its fan carries to the others (A-574).
+  pub fn inject_failover(&self, ns: Option<u64>) -> Result<(), ObserveError> {
+    // On every shard at once, so a wait on any shard reads it before the control shard's next beat fans the same value
+    // (A-574).
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.injected_failover_ns = ns;
+        if let Some(ns) = ns {
+          s.failover_ns = ns;
+        }
+      })?;
+    }
+    Ok(())
+  }
+
+  /// The failover delay this node's waits read now, nanoseconds (A-363): the control shard's estimate in whole
+  /// coordinator periods, or a test's injection. A one-shot control-shard question; an observation the daemon could not
+  /// make is its typed refusal.
+  pub fn failover_ns(&self) -> Result<u64, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.failover_ns)
+  }
+
   /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
   /// never takes that session from its slot (`None` lifts it). Delivered like [`Self::inject_serve_delay`].
   pub fn inject_discovery_hold(&self, peer: Option<slates_db::HostId>) -> Result<(), ObserveError> {
@@ -2963,7 +3611,7 @@ impl Daemon {
       // Only a drop after this one counts toward the recovery a test reads: formation's own failed pages drop sessions
       // too, and their recovery would read as this one's.
       s.dead_session_dropped_at.clear();
-      s.dead_session_recovered_ns = None;
+      s.dead_session_recovered = None;
     })
   }
 
@@ -2977,6 +3625,29 @@ impl Daemon {
   ) -> Result<(), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
       s.injected_forward_silence = volume;
+    })
+  }
+
+  /// Test support: while `withheld` is set, this node sends no confirmation of a takeover share it has finished
+  /// (counted `fleet.takeover.confirmation_withheld_by_fault`), as a confirmation late to commit leaves its share owed
+  /// while the other survivors confirm theirs, each confirmation a new configuration (A-353). Lifting it lets the next
+  /// period confirm. Delivered like [`Self::inject_takeover_silence`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_confirmation_withheld(&self, withheld: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_confirmation_withheld = withheld;
+    })
+  }
+
+  /// Test support: leaves unanswered every takeover page and question by name this node, as a holder, is asked by one of
+  /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), and every planned move's question by name
+  /// (A-291; counted `fleet.move.silenced_by_fault`), while it answers everything else on the same
+  /// sessions: a holder cut off from one successor alone, which the council never retires since every other member hears
+  /// it. Replaces any earlier set; an empty `askers` restores full service. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_takeover_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
+    let askers: std::collections::BTreeSet<slates_db::HostId> = askers.iter().copied().collect();
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_takeover_silence = askers;
     })
   }
 
@@ -3019,6 +3690,28 @@ impl Daemon {
       }
     }
     Ok(())
+  }
+
+  /// Test support: while `anchor` is set, this node's owner shards deliver no pair key to the node at that stable anchor,
+  /// as a delivery whose recipient answer never comes back fails each period (`fleet.seal.pair_recipient_unknown`);
+  /// every other delivery goes on and no pair delivered is forgotten (unlike [`Self::inject_pair_withhold`]), so a
+  /// node replaced at that anchor never receives this node's pairs while the rest of the fleet does. `None` lifts it.
+  /// `Ok` once installed on the control shard, where deliveries are made.
+  pub fn inject_pair_withhold_to(&self, anchor: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_pair_withhold_to = anchor;
+    })
+  }
+
+  /// Test support: the position of the newest entry of the live log this node holds for `object` as a candidate
+  /// (A-200), or `None` while it holds none; read on the control shard, where held logs live.
+  pub fn fleet_live_held(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<u64>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      crate::live_ship::held_position(s, object)
+    })
   }
 
   /// Test support: makes each of this node's campaigns count the record sessions of `voters` as out of their
@@ -3097,6 +3790,7 @@ impl Daemon {
           principal: record.owner.clone(),
           rights: verbs::rights_of(&record, &record.owner),
           token,
+          mount: None,
         },
       };
       // One durable transaction, as the verb path writes it (`Db::begin` … `commit`, AC-2.3): the
@@ -3133,6 +3827,28 @@ impl Daemon {
       s.record_sessions
         .iter()
         .map(|(host, link)| (*host, link.endpoint.is_none()))
+        .collect()
+    })
+  }
+
+  /// This node's record dials at the read ([`RecordDialReport`], `ShardState::record_dials`): what a fleet test whose
+  /// formation failed prints, so a link that never came up names whether its dialer sits inside one handshake call, waits
+  /// on its first discovery page, keeps failing, or idles. Empty on a laptop; the typed refusal when the control shard
+  /// could not be observed.
+  pub fn fleet_record_dials(&self) -> Result<Vec<RecordDialReport>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      let now = slates_rt::futures::now_ns();
+      s.record_dials
+        .iter()
+        .map(|(peer, dial)| RecordDialReport {
+          peer: *peer,
+          dialing_for_ns: dial.dialing_since_ns.map(|since| now.saturating_sub(since)),
+          call_for_ns: dial.call_since_ns.map(|since| now.saturating_sub(since)),
+          enroll_for_ns: dial.enroll_since_ns.map(|since| now.saturating_sub(since)),
+          budgets_spent: dial.budgets_spent,
+          stall: dial.stall,
+          calls: dial.calls,
+        })
         .collect()
     })
   }
@@ -3211,6 +3927,30 @@ impl Daemon {
       .map(|watchdog| watchdog.turns().read())
   }
 
+  /// Test support: puts a memory-pressure level in place of the host's reading the watchdog takes at its looks (A-336,
+  /// [`crate::watchdog::MemoryStallSource`]): `Some(true)` the host reports a memory stall, `Some(false)` none, `None`
+  /// the host's own reading again. In production the watchdog reads the host (`slates_machine::memory_stall`); this
+  /// drives that very reading, as [`Daemon::inject_pressure_hold`] drives admission's, so a test proves the rule without
+  /// a host short of memory. `false` once the daemon has stopped its watchdog.
+  pub fn inject_memory_stall(&self, pressed: Option<bool>) -> bool {
+    self
+      .watchdog
+      .as_ref()
+      .map(|watchdog| watchdog.memory_stall().inject(pressed))
+      .is_some()
+  }
+
+  /// The least CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness window
+  /// held to this build (A-318, [`crate::watchdog::spin_window_ns`]); a shard whose host overruns that window is held to
+  /// its own window's, which is longer (A-455, [`crate::watchdog::watch_window_ns`]). `None` once the daemon has stopped
+  /// its watchdog.
+  pub fn spin_window_ns(&self) -> Option<u64> {
+    self
+      .watchdog
+      .as_ref()
+      .map(crate::watchdog::Watchdog::spin_window_ns)
+  }
+
   /// The shards.
   pub fn shards(&self) -> &[ShardId] {
     &self.shards
@@ -3238,6 +3978,11 @@ impl Daemon {
   /// daemon's error stream, which its anchor keeps (every worker is still joined and every slot given back,
   /// AUD-29-12); with `panic = "abort"` a release build never reaches here after a worker's panic.
   fn stop_parts(&mut self) {
+    // The window the log writer's drain is judged by (A-552): the widest this daemon's shards are judged by now (A-455),
+    // read while they still run. A host that keeps the shards off their CPUs that long keeps the writer's thread off its
+    // own as long, so a narrower window would give up a writer that is only starved.
+    let shard_ids: Vec<u16> = self.shards.iter().map(|shard| shard.0).collect();
+    let log_window_ns = crate::watchdog::widest_window_ns(&shard_ids);
     // The FUSE mounts end with each shard's serve loop (`EndMounts`), on the shard's own thread as the
     // shutdown cancels it — never as a question queued behind the shard's work, which would answer every
     // question already waiting there instead of terminating it (§4.6; AUD-29-64).
@@ -3257,6 +4002,13 @@ impl Daemon {
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
+    }
+    // After the shards, whose ended threads let their routes go, so the writer has every line they queued. It is waited
+    // for while it writes lines (A-552). A shard that never ended still holds its route, and a standard error that takes
+    // nothing holds the writer still: it is given up a window after its last line, then left to the process's end,
+    // never waited for without end.
+    if let Some(mut log_writer) = self.log_writer.take() {
+      log_writer.stop(std::time::Duration::from_nanos(log_window_ns));
     }
   }
 }
@@ -3439,21 +4191,10 @@ fn image_range(
   }
 }
 
-/// This shard's content range for its recovery images (§4.8).
-#[cfg(not(target_os = "linux"))]
-fn content_slice(
-  config: &DaemonConfig,
-  partition: u16,
-  content: Option<&slates_mem::SparseObject>,
-) -> (usize, usize) {
-  image_range(config, partition, content)
-}
-
-/// This shard's content range for its recovery images (§4.8), and the FUSE write log at the slice's front with what
-/// the previous daemon left in it to replay (A-63, `crate::write_log`), opened against the generation of the
-/// committed image, before anything this daemon does can publish and clear it. No log and nothing to replay without
-/// a content object.
-#[cfg(target_os = "linux")]
+/// This shard's content range for its recovery images (§4.8), and the write log at the slice's front with what the
+/// previous daemon left in it to replay (A-63, `crate::write_log`: a FUSE mount's writes on Linux, a Shards stream's on
+/// every platform, A-316, A-339, A-402), opened against the generation of the committed image, before anything this
+/// daemon does can publish and clear it. No log and nothing to replay without a content object.
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
@@ -3491,6 +4232,22 @@ fn content_slice(
   }
 }
 
+/// The DAX range table in this shard's slice of the content object (A-365; Windows' sections, A-448), with what the
+/// previous daemon recorded in it; none without a content object holding the shard's images (`images`,
+/// [`content_slice`]'s range).
+fn dax_range_table(
+  config: &DaemonConfig,
+  partition: u16,
+  images: (usize, usize),
+  content: Option<&mut slates_mem::SparseObject>,
+) -> Option<crate::dax_ranges::RangeTable> {
+  let object = content.filter(|_| images.1 > images.0)?;
+  let layout = config.shard_content_layout();
+  let ranges_start = slice_start(config, partition).saturating_add(layout.dax_ranges.0);
+  let ranges_bytes = layout.dax_ranges.1.saturating_sub(layout.dax_ranges.0);
+  crate::dax_ranges::RangeTable::open(object, ranges_start, ranges_bytes)
+}
+
 /// This shard's chunk arena (A-98): the pool extents its partition holds from a previous daemon, added under their
 /// ids before recovery claims the blocks its image names, and the pool as the source it grows from. Also the capacity
 /// of one slice, the scale the operation headroom is derived against.
@@ -3516,6 +4273,34 @@ fn shard_arena(
   Ok((arena, slice))
 }
 
+/// What the anchor handed back for one shard's partition (Unix): its held devices, FUSE devices (Linux) and Shards
+/// streams' resync ends (A-61, A-316, A-339), and on Linux its held writable copies (A-197).
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct ShardHolds {
+  /// The held devices.
+  devices: Vec<crate::fuse_hold::HeldDevice>,
+  /// The held writable copies.
+  #[cfg(target_os = "linux")]
+  copies: Vec<crate::held_copy::InheritedCopy>,
+  /// The held Shards streams' DAX objects (A-365).
+  dax: Vec<crate::shards::dax_hold::InheritedDax>,
+}
+
+/// What the anchor handed back for one shard's partition (Windows): its WinFsp mounts (A-198), the hold channel (the
+/// control shard's alone), and its Shards streams' resync ends (A-433) and DAX sections (A-448).
+#[cfg(windows)]
+struct ShardHolds {
+  /// The held WinFsp mounts.
+  winfsp: Vec<crate::winfsp::InheritedMount>,
+  /// The hold channel's daemon end: the control shard installs it.
+  channel: Option<std::os::windows::io::OwnedHandle>,
+  /// The held Shards streams' resync ends (A-433).
+  resync: Vec<crate::anchor_hold::HandedResync>,
+  /// The held Shards streams' DAX sections (A-448).
+  dax: Vec<crate::shards::dax_hold::InheritedDax>,
+}
+
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
 /// [`init_shard`], and the boot log's line of how long it took and in how many slices.
 async fn start_shard(
@@ -3525,14 +4310,7 @@ async fn start_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   all: Vec<u16>,
   retained: Option<crate::retention::Retained>,
-  #[cfg(target_os = "linux")] held: (
-    Vec<crate::fuse_hold::HeldDevice>,
-    Vec<crate::held_copy::InheritedCopy>,
-  ),
-  #[cfg(windows)] windows_holds: (
-    Vec<crate::winfsp::InheritedMount>,
-    Option<std::os::windows::io::OwnedHandle>,
-  ),
+  holds: ShardHolds,
 ) {
   // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to each
   // shard queues behind it (GAPS, boot, 2026-10-05).
@@ -3541,7 +4319,7 @@ async fn start_shard(
     .boot_fault
     .filter(|fault| fault.partition == partition)
   {
-    hold_start(fault);
+    hold_start(fault, config.copy_slice_ns()).await;
   }
   let outcome = init_shard(
     &config,
@@ -3550,10 +4328,7 @@ async fn start_shard(
     (partition, sealing, learning),
     &all,
     retained,
-    #[cfg(target_os = "linux")]
-    held,
-    #[cfg(windows)]
-    windows_holds,
+    holds,
   )
   .await;
   let took_us = started.elapsed().as_micros();
@@ -3586,7 +4361,12 @@ const NANOS_PER_MICRO: u64 = 1_000;
 
 /// Holds a shard's start as a [`crate::config::BootFault`] says: on the CPU (a long recovery) or asleep (a stuck
 /// shard), for its duration. Only the boot tests set one.
-fn hold_start(fault: crate::config::BootFault) {
+///
+/// A long recovery runs in slices that each end a step ([`crate::recovery_slices`], A-228), so the busy hold runs in the
+/// same slices, under the same budget. Until A-232 it spun its whole span as one poll, which the watchdog's rule calls a
+/// spinning, stuck shard, and which an anchor kills: since A-232 a daemon with no anchor in another process ends itself on
+/// it, so a hold past a window modelled a stuck start, not the long recovery its tests are about.
+async fn hold_start(fault: crate::config::BootFault, slice_ns: u64) {
   let duration = std::time::Duration::from_nanos(fault.for_ns);
   match fault.kind {
     // A stuck shard is a thread blocked without using CPU, which only a blocking wait models (D-9's exception for
@@ -3595,9 +4375,12 @@ fn hold_start(fault: crate::config::BootFault) {
     crate::config::BootFaultKind::Stuck => std::thread::sleep(duration),
     crate::config::BootFaultKind::Busy => {
       let started = std::time::Instant::now();
+      let mut slices = crate::recovery_slices::RecoverySlices::begin(slice_ns);
       while started.elapsed() < duration {
         std::hint::spin_loop();
+        slices.unit_done().await;
       }
+      let _report = slices.finish();
     }
   }
 }
@@ -3670,15 +4453,23 @@ async fn init_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
-  #[cfg(target_os = "linux")] (inherited_fuse, inherited_copies): (
-    Vec<crate::fuse_hold::HeldDevice>,
-    Vec<crate::held_copy::InheritedCopy>,
-  ),
-  #[cfg(windows)] (inherited_winfsp, windows_channel): (
-    Vec<crate::winfsp::InheritedMount>,
-    Option<std::os::windows::io::OwnedHandle>,
-  ),
+  holds: ShardHolds,
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
+  #[cfg(windows)]
+  let ShardHolds {
+    winfsp: inherited_winfsp,
+    channel: windows_channel,
+    resync: inherited_resync,
+    dax: inherited_dax,
+  } = holds;
+  #[cfg(unix)]
+  let inherited_dax = holds.dax;
+  // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
+  // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
+  // failure, as a refused serve loop is below.
+  futures::spawn(crate::xshard::carrier(config.kept_bound().get()))
+    .and_then(futures::detach)
+    .map_err(ServerError::Runtime)?;
   let mut slices = crate::recovery_slices::RecoverySlices::begin(config.copy_slice_ns());
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -3785,16 +4576,14 @@ async fn init_shard(
   let (root, node_regions, region_mirrors) = build_root_group(config, host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
-  #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
   let mut content = match AnchorSegment::open_content(env) {
     Some(result) => Some(result?),
     None => None,
   };
-  #[cfg(target_os = "linux")]
   let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
-  #[cfg(not(target_os = "linux"))]
-  let content_range = content_slice(config, partition, content.as_ref());
+  // The DAX range table (A-365; Windows' sections, A-448), with what the previous daemon recorded in it.
+  let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
@@ -3803,9 +4592,24 @@ async fn init_shard(
   // before the segment moves into the state; every shard reads the same value, so a `Grant` verifies on
   // whichever shard serves the client.
   let issuer_secret = segment.issuer_secret()?;
+  // The launcher secret its starter handed the anchor (A-285), published before the first daemon: a launcher-class
+  // proof verifies under it as under the issuer secret. `None` when the starter gave none.
+  let launcher_secret = segment.launcher_secret()?;
   // The client session secret (`crate::session_key`), published before any shard starts: a client's key is checked
   // on the shard that serves it.
   let session_secret = crate::session_key::secret_of(&segment)?;
+  // The detection this node's anchor gives it, read at boot as the control shard reads it at every beat (A-574,
+  // `fleet::refresh_supervision`): the widest window the watchdog judges this daemon's shards by, then the lapse bound
+  // the anchor publishes. Before any peer's detector judges the node, its failover delay is that and the recovery.
+  let mut failover = slates_cluster::failover::Failover::new();
+  failover.supervise(
+    crate::watchdog::widest_window_ns(config_shards),
+    segment
+      .supervision()
+      .ok()
+      .and_then(|supervision| supervision.lapse_bound_ns()),
+  );
+  let failover_ns = crate::fleet::failover_in_periods(failover.estimate().total_ns());
   // The attachment counter starts past every attachment recovered with the partition — a host mount's
   // survives a restart (AUD-01) — so a fresh mint never meets a kept record's id.
   let next_attachment = verbs::next_attachment_counter(db.partition());
@@ -3815,6 +4619,7 @@ async fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
+    launcher_secret,
     session_secret,
     seal_root,
     seal_state: sealing,
@@ -3827,23 +4632,22 @@ async fn init_shard(
     burst_seen: None,
     last_burst: 0,
     refill_settled: None,
-    give_back_slice_bytes: 0,
+    give_back_rate: GiveBackRate::default(),
     content_range,
     delta_range: delta_range(config, partition, content_range),
     journal: slates_vfs::checkpoint_log::Journal::default(),
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
-    published_held: Vec::new(),
-    #[cfg(target_os = "linux")]
+    deferred_kept: false,
+    published_held: crate::content_holder::PublishedHeld::default(),
     write_log,
-    #[cfg(target_os = "linux")]
     writes_lost: recovered_writes.everything_lost,
-    #[cfg(target_os = "linux")]
     replay: recovered_writes.records,
-    #[cfg(target_os = "linux")]
     pending_replies: std::collections::BTreeMap::new(),
-    #[cfg(target_os = "linux")]
     recovered_replies: std::collections::BTreeMap::new(),
+    dax_ranges,
+    inherited_dax,
+    adopted_dax: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
     nfs_v4_files: None,
@@ -3851,6 +4655,7 @@ async fn init_shard(
     nfs_v4_instance: None,
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
     nfs_call: None,
+    nfs_pending_base: None,
     held_nfs_replies: std::collections::BTreeMap::new(),
     held_nfs_replies_changed: false,
     recovered_nfs_replies: std::collections::BTreeMap::new(),
@@ -3862,6 +4667,10 @@ async fn init_shard(
     image: crate::image::ImageState::default(),
     configured_members: Vec::new(),
     departed_owed: Vec::new(),
+    departures_owed: false,
+    departures_retry_at: None,
+    #[cfg(target_os = "linux")]
+    held_copies_owed: false,
     direct_map: crate::direct_map::DirectMapState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
@@ -3874,12 +4683,19 @@ async fn init_shard(
     attachments: slates_bridge_core::Attachments::new(),
     mount_attachments: std::collections::BTreeMap::new(),
     unrecovered: std::collections::BTreeMap::new(),
+    yielded: std::collections::BTreeSet::new(),
+    relinquished: Vec::new(),
+    candidate_claims: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     learned_fuse: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "linux")]
+    fuse_helpers: crate::helper_runs::HelperRuns::default(),
     #[cfg(target_os = "macos")]
     own_nfs_mounts: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "macos")]
+    unmount_watch: false,
     #[cfg(windows)]
     winfsp_mounts: std::collections::BTreeMap::new(),
     #[cfg(windows)]
@@ -3887,12 +4703,15 @@ async fn init_shard(
     #[cfg(windows)]
     adopt_winfsp: Vec::new(),
     stale_fuse_mounts: Vec::new(),
+    #[cfg(unix)]
+    inherited_fuse: holds.devices,
     #[cfg(target_os = "linux")]
-    inherited_fuse,
-    #[cfg(target_os = "linux")]
-    inherited_copies,
+    inherited_copies: holds.copies,
     #[cfg(target_os = "linux")]
     adopt_fuse: Vec::new(),
+    adopt_shards: Vec::new(),
+    #[cfg(windows)]
+    inherited_resync,
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     guest_devices: Vec::new(),
@@ -3909,6 +4728,13 @@ async fn init_shard(
     refusals: std::collections::BTreeMap::new(),
     deferred: Vec::new(),
     server_task: None,
+    dead_clients: std::collections::VecDeque::new(),
+    reaper_task: None,
+    capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
+    deadline_task: None,
+    base_hints: crate::base_hints::BaseHints::default(),
+    deadline_armed: None,
+    destroy_retry_at: None,
     scatters: std::collections::BTreeMap::new(),
     grant_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
@@ -3917,7 +4743,7 @@ async fn init_shard(
     status_scatters: std::collections::BTreeMap::new(),
     last_work_ns: now,
     pending_forwards: std::collections::VecDeque::new(),
-    greens: std::collections::BTreeMap::new(),
+    greens: crate::greens::Greens::default(),
     works: std::collections::BTreeMap::new(),
     merge: crate::merge_service::MergeShardState::default(),
     ack_scatters: std::collections::BTreeMap::new(),
@@ -3927,17 +4753,25 @@ async fn init_shard(
     // span id it mints is distinct across the daemon and the fleet without coordination (§4.14).
     tracer: slates_wire::observe::Tracer::new(host.0, partition),
     current_span: None,
+    forward_hold_ns: 0,
+    loop_run: 0,
+    last_client_io_ns: 0,
+    loop_io: false,
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
+    told_times: crate::told::ToldTimes::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
+    base_waits: crate::base_wait::BaseWaits::default(),
+    work_home: crate::work_home::WorkHome::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
     placed_heads: std::collections::BTreeMap::new(),
+    state_logs: crate::state_log::StateLogs::default(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     plane: crate::member_task::PlaneState::default(),
     nfs_service: crate::nfs::ServiceTimes::default(),
@@ -3950,32 +4784,50 @@ async fn init_shard(
     death_reports: std::collections::BTreeMap::new(),
     death_watch_started_ns: None,
     returned_members: std::collections::BTreeMap::new(),
+    dialed_in: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
     enrolled: Vec::new(),
     demuxes: Vec::new(),
-    holder_records: std::collections::BTreeMap::new(),
+    holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
+    seal_walk_quantum_ns: None,
+    install_walk: None,
+    install_walk_quantum_ns: None,
+    live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
+    moves_out: std::collections::BTreeMap::new(),
+    carries: std::collections::BTreeMap::new(),
+    move_adoptions: std::collections::BTreeMap::new(),
+    move_records: std::collections::BTreeMap::new(),
+    moves_forgotten: std::collections::BTreeSet::new(),
+    releasing: Vec::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),
     learner_fetch: crate::fleet::LearnerFetchLog::default(),
     root_learner_pace: crate::fleet::LearnerPace::default(),
+    root_newer_seen: None,
     record_sessions: std::collections::BTreeMap::new(),
+    record_dials: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
     discovery_withhold_replies: false,
+    shards_withhold_replies: false,
     live_state_withhold_replies: false,
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
+    injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
+    injected_takeover_silence: std::collections::BTreeSet::new(),
+    injected_confirmation_withheld: false,
     injected_deaf_session: None,
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),
-    dead_session_recovered_ns: None,
+    dead_session_recovered: None,
     injected_pair_withhold: false,
+    injected_pair_withhold_to: None,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),
@@ -3993,14 +4845,28 @@ async fn init_shard(
     injected_resident: None,
     pressure_resident_baseline: None,
     pressure_sent: vec![(0, 0); config_shards.len()],
+    pressure_task: None,
+    pressure_asked: false,
     stop_watch: None,
     nfs_purges_refused: false,
+    nfs_purge_at: None,
+    nfs_purge_owed: false,
+    delegation_lapse_at: None,
+    idle_sweep_at: None,
+    idle_sweeper: None,
+    idle_sweep_running: false,
+    idle_sweep_seen: (0, 0),
+    placement_rearm_at: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
+    failover,
+    failover_ns,
+    injected_failover_ns: None,
+    attachment_paces: std::collections::BTreeMap::new(),
     council,
     consensus_ready: false,
     consensus_generation: 0,
@@ -4014,6 +4880,7 @@ async fn init_shard(
     region_mirrors,
     held_content: slates_cluster::content::ContentHold::new(),
     pending_tombstones: std::collections::BTreeMap::new(),
+    work_routes: crate::work_route::WorkRoutes::default(),
     seals: std::collections::BTreeMap::new(),
     mirror_seals: std::collections::BTreeMap::new(),
     mirror_neighbourhood: Vec::new(),
@@ -4026,10 +4893,16 @@ async fn init_shard(
     put_outcomes: crate::fleet::PutOutcomes::default(),
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
-    pending_materializations: std::collections::BTreeMap::new(),
+    pending_materializations: crate::state::PendingMaterializations::default(),
+    making_taken_over: std::collections::BTreeMap::new(),
+    making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
+    vcs_stores: crate::vcs_store::VcsStores::default(),
+    vcs_usage: slates_vcs::Ledger::new(config.clients_per_shard),
+    hook_times: crate::vcs_hooks::HookTimesTable::default(),
     pending_green_materializations: std::collections::BTreeMap::new(),
+    pending_repositories: std::collections::BTreeMap::new(),
   };
   // The mounts a predecessor kept that this partition's catalog names, recorded as this daemon's own before anything
   // below reacquires a base or resumes a landing (A-227); then this shard's learning ends, and the process's crossing
@@ -4048,6 +4921,12 @@ async fn init_shard(
   state.landing.next_landing = verbs::next_landing_counter(state.db.partition());
   // The runtime grants, rebuilt from the durable ones in their recorded states (AUD-29-06).
   crate::landing::restore_grants(&mut state);
+  // What the partition owed the audit when its predecessor stopped (a batch a crash cut off) is looked at a retry
+  // window into the start, by the deadline keeper (A-265, A-554).
+  let started_ns = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  crate::landing::arm_owed_audit_look(&mut state, started_ns);
+  // The NFSv4 purges a predecessor journaled and its owners never took go out at once (A-570).
+  crate::nfs::arm_purges_at_start(&mut state, started_ns);
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
   }
@@ -4081,18 +4960,42 @@ async fn init_shard(
   // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
   #[cfg(target_os = "linux")]
   crate::fuse::adopt_held();
+  // The Shards streams whose resync ends the anchor held, served again on fresh streams (A-316, A-339), and every held
+  // device no record claimed released.
+  crate::shards::adopt_held();
   #[cfg(windows)]
   crate::winfsp::adopt_held();
   #[cfg(target_os = "linux")]
   crate::fuse::leave_stale();
+  // A holder could not renew while this daemon was not serving: every CLI attachment starts a fresh term now, before
+  // the serve loop answers its first request and before the reaper's first sweep (A-384).
+  let _ = state::with_state_counted(verbs::renew_termed_at_start);
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
-  // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure
+  // A shard whose serve loop or idle sweep the arena refuses serves nothing: a typed initialization failure
   // (surfaced by the boot as `INIT_FAILURES`), never a silently loop-less shard (banned item 9).
   let serve = futures::spawn(serve_loop()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(serve);
-  let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
-  let _ = futures::detach(reap);
+  // The idle sweep (A-715): one pass a sweep's interval after what owes it, none while nothing does.
+  let sweeper = futures::spawn(crate::idle_sweep::sweeper()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(sweeper);
+  // The reaper of the clients whose watches saw them hang up (A-475): idle until the first report.
+  let reaper = futures::spawn(crate::reap::reaper()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(reaper);
+  // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
+  let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(keeper);
+  // The hint watcher (A-709): drains each overlay's base hints when the shard's set reports its watcher ready.
+  let hints = futures::spawn(crate::base_hints::watcher()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(hints);
+  // The pressure hold's sampler (A-570): on the control shard it samples at its start and at each report of the host's
+  // memory pressure; elsewhere it ends at once.
+  let sampler = futures::spawn(crate::pressure::sampler()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(sampler);
+  // The NFS mounts this shard learned from its predecessor end their attachments when the kernel lets them go, as a
+  // mount bound later does (A-511): the shard's watch of the kernel's unmounts starts once it holds an own mount.
+  #[cfg(target_os = "macos")]
+  let _ = state::with_state_counted(crate::own_nfs::watch);
   Ok(slices.finish())
 }
 
@@ -4140,119 +5043,20 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's sweep for dead clients and expired leases, at the liveness cadence: the same
-/// budget the anchor allows the daemon's own heartbeat, so a peer silent that long is asked
-/// about (§4.7 "Failure matrix"). Derived: the cadence is the budget; a client is asked about
-/// once silent for the budget, so a death is seen within two budgets at most.
-async fn reap_loop() {
-  let cadence = derived!(
-    LIVENESS_BUDGET_NS,
-    "the liveness budget (the anchor's question of the daemon, asked of the daemon's clients)",
-    ["LIVENESS_BUDGET_NS"]
-  )
-  .get();
-  loop {
-    pace(cadence).await;
-    state::with_state(|s| {
-      let _ = verbs::expire_leases(s);
-      // A CLI attachment whose term lapsed ends here, within a term and a sweep of its last use (A-230).
-      let _ = verbs::expire_lapsed_attachments(s);
-      // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
-      // (`verbs::step_destroys`), rather than in a busy serve round.
-      let _ = verbs::step_destroys(s);
-    });
-    // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
-    crate::remote_attach::sweep_departed().await;
-    let reaped = crate::reap::sweep(cadence).await;
-    // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
-    #[cfg(target_os = "linux")]
-    let _reclaimed = crate::held_copy::reclaim_unclaimed().await;
-    if reaped > 0 {
-      CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
-    }
-    refresh_pressure_hold().await;
-    crate::nfs::purge_owed_here().await;
-    state::with_state(|s| {
-      process_base_hints(s);
-      // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
-      crate::delegation::drain(s);
-    });
-    seal_idle_content().await;
-    // §4.6, the backed route's L1 (A-193): ask the host once more for the placements it declined in a way likely to
-    // hold. A declined collapse costs milliseconds of compaction (1,954 and 2,832 µs a step on adacachy at load 90), so
-    // a host out of huge pages is asked once a tick, not once a range; the reap tick is the cadence the shard already
-    // does cold work at, so a host that frees memory has its ranges placed again within one tick.
-    state::with_state(|s| s.store.shards_backings.rearm_placement());
-  }
-}
-
-/// Counter: overlay volumes whose watcher hints the reap tick could not process (the host refused a re-check); the
-/// hints are taken again at the next tick's listing, so none is lost, but a refusal is never silent.
-const BASE_HINTS_REFUSED: &str = "base.hints_refused";
-/// Counter: watcher hints the reap tick drained, over every overlay volume (the drain's non-vacuity counter).
-const BASE_HINTS_DRAINED: &str = "base.hints_drained";
-/// Counter: delegation recalls an outsider's edit beneath an untouched base entry asked for (A-122).
-const OUTSIDE_RECALLS: &str = "nfs4.recall.outside_asked";
-
-/// Drains every overlay volume's watcher hints, once a reap tick (§4.5, §4.15; RFC 8881 §10.2): a changed base
-/// directory has its listing invalidated, its witnessed entries re-checked for drift, and every delegation held on an
-/// untouched entry in it asked to be recalled, so an outsider's edit reaches a delegation holder within a tick and a
-/// round trip. Before 2026-10-08 hints were drained only by `status` and the FUSE coherence path, so over NFS a client
-/// holding a read delegation kept serving its cached bytes after an outsider changed the file.
-///
-/// Derived: the cadence is the reap loop's (the liveness budget), which already wakes the shard, so draining adds one
-/// non-blocking read of each watcher per tick and no wakeup. A client without a delegation sees an outsider's edit only
-/// after its attribute cache times out (`acregmin`, 3 s by default on Linux, nfs(5)), so the tick bounds the delegated
-/// client inside that. Rejected for now: a task per volume awaiting its watcher's descriptor, whose descriptor a
-/// destroy closes while the task may still be waiting on it.
-fn process_base_hints(s: &mut ShardState) {
-  let mut refused = 0u64;
-  let mut drained = 0u64;
-  let recalls_before = s.store.recall_gate.outside_recalls();
-  for (_, slot) in s.volumes.iter_mut_all() {
-    let Some(host) = slot.host.as_mut() else {
-      continue;
-    };
-    let seq_before = slot.volume.base_plane().map_or(0, |plane| plane.hint_seq());
-    if slot
-      .volume
-      .with_host(host)
-      .process_hints(&mut s.store)
-      .is_err()
-    {
-      refused = refused.saturating_add(1);
-    }
-    let seq_after = slot.volume.base_plane().map_or(0, |plane| plane.hint_seq());
-    drained = drained.saturating_add(seq_after.saturating_sub(seq_before));
-  }
-  let asked = s
-    .store
-    .recall_gate
-    .outside_recalls()
-    .saturating_sub(recalls_before);
-  if refused > 0 {
-    s.count(BASE_HINTS_REFUSED, refused);
-  }
-  if drained > 0 {
-    s.count(BASE_HINTS_DRAINED, drained);
-  }
-  if asked > 0 {
-    s.count(OUTSIDE_RECALLS, asked);
-  }
-}
-
-/// The idle sweep of this shard's volumes (A-99), once a reap tick: every volume ages its writes, then the open extents
-/// of files idle a whole tick are sealed in cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in
-/// the shard's step quantum; AES-256-GCM seals at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's
-/// 9–10 here), yielding between slices so the shard keeps serving, until none is left.
-async fn seal_idle_content() {
+/// One pass of the idle sweep of this shard's volumes (A-99; run by `crate::idle_sweep` since A-715, by the reap loop's
+/// tick before): every volume ages its writes, then the open extents of files idle a whole pass are sealed in
+/// cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in the shard's step quantum; AES-256-GCM seals
+/// at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's 9–10 here), yielding between slices so the shard
+/// keeps serving, until none is left. Whether the pass settled the shard: it reached an idle purge that finished, and no
+/// volume owes another pass; otherwise the sweep arms its next.
+pub(crate) async fn seal_idle_content() -> bool {
   let aged = state::with_state(|s| {
     for (_, slot) in s.volumes.iter_mut_all() {
       slot.volume.age_writes();
     }
   });
   if aged.is_none() {
-    return;
+    return true;
   }
   let mut sealed_this_tick = 0u64;
   loop {
@@ -4304,55 +5108,110 @@ async fn seal_idle_content() {
         1,
       );
     });
-    return;
+    return false;
   }
-  purge_if_idle().await;
+  let purged = purge_if_idle().await;
+  let owes = state::with_state(|s| {
+    s.volumes
+      .iter_mut_all()
+      .any(|(_, slot)| slot.volume.sweep_owes())
+  })
+  .unwrap_or(false);
+  purged && !owes
 }
 
-/// The idle shard's emptied FUSE write log, its pages given back (`crate::write_log::WriteLog::purge`).
-#[cfg(target_os = "linux")]
+/// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
 fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
+  purge_write_log_timed(s, &mut shard_thread_cpu_ns)
+}
+
+/// [`purge_write_log`], its step timed by `cpu`, the shard thread's own CPU clock ([`shard_thread_cpu_ns`]; a
+/// controlled one in the unit tests).
+fn purge_write_log_timed(
+  s: &mut ShardState,
+  cpu: &mut impl FnMut() -> Option<u64>,
+) -> (usize, bool) {
   let slice = give_back_slice(s);
-  let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+  let started = cpu();
   let purged = match (s.content.as_mut(), s.write_log.as_mut()) {
     (Some(object), Some(log)) => log.purge(object, slice),
     _ => crate::write_log::Purged::default(),
   };
-  learn_give_back_rate(s, purged.walked, started);
+  learn_give_back_rate(s, purged.walked, spent_since(started, cpu()));
   (purged.bytes, purged.more)
 }
 
-/// No write log off Linux (A-63 logs the FUSE mount's writes).
-#[cfg(not(target_os = "linux"))]
-fn purge_write_log(_s: &mut ShardState) -> (usize, bool) {
-  (0, false)
-}
-
-/// The bytes one give-back step may walk (A-226): what the OS gave back in one step quantum the last time
-/// (`give_back_slice_bytes`), at least a page, so a step holds the shard about one quantum whatever the memory.
+/// The bytes one give-back step may walk (A-226): what the shard gave back in one step quantum of its own CPU, as the
+/// steps before measured it ([`GiveBackRate`]), at least a page, so a step holds the shard about one quantum whatever
+/// the memory and whatever the host's load.
 fn give_back_slice(s: &ShardState) -> usize {
   let page = usize::try_from(s.config.geometry.page).unwrap_or(1).max(1);
-  s.give_back_slice_bytes.max(page)
+  s.give_back_rate.slice_bytes.max(page)
 }
 
-/// Learns the next give-back slice from this step's: `walked` bytes since `started` (the shard clock), scaled to one
-/// step quantum. A step that walked nothing teaches nothing.
-fn learn_give_back_rate(s: &mut ShardState, walked: usize, started: u64) {
-  if walked == 0 {
-    return;
+/// The shard thread's own CPU clock now, nanoseconds (`slates_rt::registry::calling_thread_cpu`, the clock the
+/// watchdog reads): what a give-back step is timed by, since a loaded host stretches the wall time a step takes and
+/// not the CPU it spends. `None` where the platform reads none.
+fn shard_thread_cpu_ns() -> Option<u64> {
+  registry::calling_thread_cpu().map(|reading| reading.spent_ns)
+}
+
+/// The CPU a step spent between the readings `started` and `ended`, `None` unless both were read.
+fn spent_since(started: Option<u64>, ended: Option<u64>) -> Option<u64> {
+  started
+    .zip(ended)
+    .map(|(started, ended)| ended.saturating_sub(started))
+}
+
+/// Learns the next give-back slice from this step's: `walked` bytes for the `spent` nanoseconds of its shard thread's
+/// own CPU, scaled to one step quantum ([`GiveBackRate::fold`]). A step that walked nothing, or whose CPU could not be
+/// read, teaches nothing.
+fn learn_give_back_rate(s: &mut ShardState, walked: usize, spent: Option<u64>) {
+  let quantum = futures::step_budget_ns().unwrap_or(s.config.runtime.step_budget_ns);
+  s.give_back_rate.fold(walked, spent, quantum);
+}
+
+/// The rate the idle give-back has learned of its own steps (A-226, A-491): the bytes one step may walk, and what the
+/// steps folded since that slice was learned walked and spent. A step is timed by its shard thread's own CPU, which a
+/// loaded host does not stretch, as the per-iteration budget holds a step to its quantum of that CPU. Timed by the wall
+/// clock until A-491, a step the host descheduled read as slow by every moment it waited and cut the next slice short
+/// by as much, so under load the slice followed the host's scheduling rather than the shard's work (the recovery
+/// test's give-back case failed once under load on adacachy and passed on its rerun).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GiveBackRate {
+  /// The bytes one step may walk: zero until a rate is learned, when a step takes a page.
+  pub(crate) slice_bytes: usize,
+  /// The bytes the steps folded since the slice was learned walked.
+  walked: u64,
+  /// The CPU those steps spent, nanoseconds.
+  spent_ns: u64,
+}
+
+impl GiveBackRate {
+  /// Folds one step that walked `walked` bytes and spent `spent` nanoseconds of its shard thread's CPU (`None` where
+  /// the thread's clock reads nothing), learning the slice, the bytes one `quantum_ns` of that CPU walks, once the
+  /// steps folded since the last have spent CPU the clock shows. A clock coarser than a step (Windows charges thread
+  /// time a scheduler tick at a time) shows most steps' CPU as none and one step's as a whole tick, so the steps are
+  /// folded until one shows any: their bytes over the CPU shown.
+  pub(crate) fn fold(&mut self, walked: usize, spent: Option<u64>, quantum_ns: u64) {
+    let Some(spent) = spent.filter(|_| walked > 0) else {
+      return;
+    };
+    self.walked = self
+      .walked
+      .saturating_add(u64::try_from(walked).unwrap_or(u64::MAX));
+    self.spent_ns = self.spent_ns.saturating_add(spent);
+    if self.spent_ns == 0 {
+      return;
+    }
+    let per_quantum = u128::from(self.walked)
+      .saturating_mul(u128::from(quantum_ns.max(1)))
+      .checked_div(u128::from(self.spent_ns))
+      .unwrap_or(0);
+    self.slice_bytes = usize::try_from(per_quantum).unwrap_or(usize::MAX);
+    self.walked = 0;
+    self.spent_ns = 0;
   }
-  let quantum = futures::step_budget_ns()
-    .unwrap_or(s.config.runtime.step_budget_ns)
-    .max(1);
-  let took = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock)
-    .saturating_sub(started)
-    .max(1);
-  let per_quantum = u128::try_from(walked)
-    .unwrap_or(u128::MAX)
-    .saturating_mul(u128::from(quantum))
-    .checked_div(u128::from(took))
-    .unwrap_or(0);
-  s.give_back_slice_bytes = usize::try_from(per_quantum).unwrap_or(usize::MAX);
 }
 
 /// The idle steps taken so far on this shard.
@@ -4371,7 +5230,7 @@ async fn probe_give_back(neighbour: bool) {
     let _ = futures::detach(task);
   }
   let before = state::with_state(|s| idle_ticks(s)).unwrap_or(0);
-  purge_if_idle().await;
+  let _settled = purge_if_idle().await;
   let after = state::with_state(|s| idle_ticks(s)).unwrap_or(before);
   GIVE_BACK_PROBE.store(after.saturating_sub(before), Ordering::Release);
 }
@@ -4411,6 +5270,15 @@ pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
 /// step, not 18 to 21 ms. A busy shard never runs this. A range the object refuses stays owed and is asked for at the
 /// next give-back. The bytes given back, and whether any is left.
 fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
+  return_dead_recovery_timed(s, &mut shard_thread_cpu_ns)
+}
+
+/// [`return_dead_recovery`], its step timed by `cpu`, the shard thread's own CPU clock ([`shard_thread_cpu_ns`]; a
+/// controlled one in the unit tests).
+fn return_dead_recovery_timed(
+  s: &mut ShardState,
+  cpu: &mut impl FnMut() -> Option<u64>,
+) -> (usize, bool) {
   let (slots_start, slots_end) = s.content_range;
   let (log_start, log_end) = s.delta_range;
   let Some(dead) = s.journal.dead_ranges(
@@ -4420,7 +5288,7 @@ fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
     return (0, false);
   };
   let slice = give_back_slice(s);
-  let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+  let started = cpu();
   let Some(object) = s.content.as_mut() else {
     return (0, false);
   };
@@ -4443,7 +5311,7 @@ fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
     stale_slot.map(|(from, _)| from.saturating_sub(dead.stale_slot.0)),
     log_past_tail.map(|(from, _)| from),
   );
-  learn_give_back_rate(s, slice.saturating_sub(left), started);
+  learn_give_back_rate(s, slice.saturating_sub(left), spent_since(started, cpu()));
   let returned = stale_slot
     .map_or(0, |(_, bytes)| bytes)
     .saturating_add(log_past_tail.map_or(0, |(_, bytes)| bytes));
@@ -4457,7 +5325,7 @@ fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
 }
 
 /// Gives an idle shard's resident free content, and its emptied write log's pages, back to the OS (A-105): when the
-/// content arena allocated nothing since the last reap tick, its free blocks are purged a slice at a time, yielding
+/// content arena allocated nothing since the last sweep pass (`crate::idle_sweep`), its free blocks are purged a slice at a time, yielding
 /// between slices so a request that arrives meanwhile is served first. Decay-based, as jemalloc purges dirty pages after
 /// a quiet interval: a busy shard keeps its zeroed free blocks resident for the allocations that follow, an idle one
 /// stops costing RAM for what it no longer holds. Before 2026-10-06 nothing ever went back: a deleted 128 MiB file left
@@ -4468,7 +5336,7 @@ fn return_dead_recovery(s: &mut ShardState) -> (usize, bool) {
 /// refill faults in those of them not resident, a slice of `quantum / page_fault_ns` pages at a time, so a burst after
 /// idle writes onto resident pages: a large write over fresh pages spent 41.5% of the shard faulting them in (CI run
 /// 41986870989). The work stops as soon as a request makes the shard allocate.
-async fn purge_if_idle() {
+async fn purge_if_idle() -> bool {
   loop {
     let step = state::with_state(|s| {
       let allocations = s.store.content.arena().allocations();
@@ -4515,7 +5383,8 @@ async fn purge_if_idle() {
     })
     .flatten();
     if step != Some(true) {
-      return;
+      // Settled once a step found the shard idle and left nothing; a busy shard owes the next pass.
+      return step == Some(false);
     }
     // Whatever ran across this yield is work of the shard's, and this is only keeping RAM tidy: the rest waits for the
     // next tick (one step a tick, at the worst). The arena's idle test cannot see such work when it allocates nothing,
@@ -4528,29 +5397,29 @@ async fn purge_if_idle() {
       .is_some_and(|(before, after)| after.saturating_sub(before) > 1);
     if others_ran {
       let _ = state::with_state_counted(|s| s.count(GIVE_BACK_LEFT, 1));
-      return;
+      return false;
     }
   }
 }
 
-/// Counter: give-backs that left the rest for the next reap tick because another task ran on the shard (A-226), the
+/// Counter: give-backs that left the rest for the next sweep pass because another task ran on the shard (A-226), the
 /// non-vacuity count of the check in [`purge_if_idle`].
 pub const GIVE_BACK_LEFT: &str = "content.give_back.left_for_next_tick";
 
-/// Counter: reap ticks whose idle sweep sealed content, and so published and left the purge for a later tick (A-105).
+/// Counter: sweep passes that sealed content, and so published and left the purge for a later pass (A-105).
 pub const TICKS_SEALING: &str = "content.ticks.sealing";
-/// Counter: reap ticks that found frees deferred behind the committed image, and so published and left the purge for a
+/// Counter: sweep passes that found frees deferred behind the committed image, and so published and left the purge for a
 /// later tick (A-64, A-105).
 pub const TICKS_DEFERRED: &str = "content.ticks.deferred";
-/// Counter: reap ticks that reached the purge and found the arena had allocated since the previous tick (A-105).
+/// Counter: purge steps that found the arena had allocated since the previous sweep pass (A-105).
 pub const TICKS_BUSY: &str = "content.ticks.busy";
-/// Counter: reap ticks that found the shard idle: the purge ran, and the reserve's refill (A-105, A-214).
+/// Counter: purge steps that found the shard idle: the purge ran, and the reserve's refill (A-105, A-214).
 pub const TICKS_IDLE: &str = "content.ticks.idle";
 
 /// Counter: free content bytes an idle shard faulted in for its reserve (A-214), the refill's non-vacuity count.
 pub const CONTENT_PREFAULTED: &str = "content.prefaulted_bytes";
 
-/// Ends a busy period at an idle reap tick (A-214): when the arena allocated or freed since the last idle tick, the
+/// Ends a busy period at an idle sweep pass (A-214): when the arena allocated or freed since the last idle pass, the
 /// period's net change of allocated bytes decides the reserve. A period that grew the content is the last write burst,
 /// its net growth; one that shrank it takes what it freed off the burst, so a written file deleted later takes its
 /// reserve with it. Before 2026-11-05 a period ended only when the allocation count moved, which a free does not move:
@@ -4592,14 +5461,14 @@ fn register_idle_refill(shard: u16) {
     registry::with_current(|ctx| ctx.set_idle_work(Box::new(refill_slice)))
   {
     slates_machine::log_line!(
-      "slates-server: shard {shard}: the reserve's idle refill was refused ({refusal}); it refills at reap ticks only"
+      "slates-server: shard {shard}: the reserve's idle refill was refused ({refusal}); it refills at idle sweep passes only"
     );
   }
 }
 
 /// The shard's idle work (A-214, registered with the runtime at the shard's start): one slice of its reserve's refill,
 /// `quantum / page_fault_ns` pages, whenever the shard has nothing else to do and its idle spin has run out, so a
-/// burst's pages are faulted in the moment the shard goes quiet rather than at the next reap tick, which the incumbent
+/// burst's pages are faulted in the moment the shard goes quiet rather than at the next idle sweep pass, which the incumbent
 /// harness's second-long pauses never reached (A-105's test needs a whole quiet tick). Whether it faulted anything or
 /// has more to fault; once it finds nothing it stays quiet until the arena allocates again.
 fn refill_slice() -> bool {
@@ -4630,7 +5499,7 @@ fn refill_slice() -> bool {
 fn prefault_reserve(s: &ShardState) -> Vec<slates_mem::arena::KeptRun> {
   let arena = s.store.content.arena();
   // The busy period under way counts as soon as it has grown past the last one: an idle moment inside it, or right
-  // after it, comes before the reap tick that closes it.
+  // after it, comes before the sweep pass that closes it.
   let running = s.burst_seen.map_or(0, |(_, before)| {
     arena.allocated_bytes().saturating_sub(before)
   });
@@ -4666,9 +5535,10 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 }
 
 /// Samples the host's available memory and withholds the daemon's pressure hold from admission (§4.2; admission.md
-/// §5.5), run by the control shard's reap loop at the liveness cadence — the design's "cheap-refresh", one sampler a
-/// daemon (every shard runs a reap loop; before 2026-10-09 each sampled and sent its own reading to every shard, N²
-/// cross-shard messages a second on a daemon at rest, each waking a parked shard).
+/// §5.5), run by the control shard's sampler at its start and at each report of the host's memory pressure
+/// (`crate::pressure`, A-570; the reap loop's tick ran it once a liveness window until then) — the design's
+/// "cheap-refresh", one sampler a daemon (before 2026-10-09 every shard sampled and sent its own reading to every
+/// shard, N² cross-shard messages a second on a daemon at rest, each waking a parked shard).
 ///
 /// The hold is the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that
 /// is committed content, charged already), and never more than the daemon's unfilled room exceeds the host's free
@@ -4687,7 +5557,7 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 /// (`memory_available_now` is `None` on an unsupported platform) leaves the hold at zero — the budget then admits
 /// exactly as before, no worse than not sampling. The read is one cheap syscall or `/proc` line per cadence, not per
 /// request; the shards are asked for their free room only while the pool cannot cover the hold.
-async fn refresh_pressure_hold() {
+pub(crate) async fn refresh_pressure_hold() {
   let Some((origin, shards, hold)) = sample_pressure_hold() else {
     return;
   };
@@ -4762,6 +5632,10 @@ fn sample_pressure_hold() -> Option<(u16, Vec<u16>, u64)> {
 async fn free_room_of(origin: u16, shards: &[u16]) -> Vec<u64> {
   let mut free = Vec::with_capacity(shards.len());
   for &shard in shards {
+    // A wall bound, by its reason (A-435): the sampler's question (`crate::pressure`, A-570); a shard that does not
+    // answer within a heartbeat reads as no room (counted), and the hold it would have taken goes to the others or to
+    // the debt the next growth takes on, so nothing is lost, while a wait in the shard's own time would hold the
+    // sample behind one busy shard, past the report that asked for it.
     let room = crate::xshard::call_within(
       origin,
       shard,
@@ -4925,9 +5799,9 @@ impl Drop for EndStreams {
 
 /// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
 /// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
-/// any client has activity within the window), and idles past it. The window is a multiple of what a
-/// wake costs the shard now — its online wake estimate (§4.3) — so it follows the wakes the shard
-/// actually pays rather than the boot probe's first guess.
+/// any client has activity within the window), and idles past it. The window is the shard's own
+/// (`ShardContext::idle_window_ns`): R9's floor on every platform, no estimate pricing it, and never past the idle spin's
+/// ceiling (`config::NO_ESTIMATE_MULTIPLE`, `config::IDLE_SPIN_CEILING`; A-223, A-361).
 async fn serve_loop() {
   #[cfg(target_os = "linux")]
   let _end_mounts = EndMounts;
@@ -4941,11 +5815,9 @@ async fn serve_loop() {
   }
   loop {
     let idle_window_ns = derived!(
-      futures::wake_cost_ns()
-        .unwrap_or(0)
-        .saturating_mul(crate::config::IDLE_WINDOW_RATIO),
-      "the shard's wake estimate × IDLE_WINDOW_RATIO",
-      ["rt.wake_cost_ns", "IDLE_WINDOW_RATIO"]
+      futures::idle_window_ns().unwrap_or(crate::config::PROVISION_FLOOR_NS),
+      "the shard's idle window: provision_floor_ns, no estimate's multiple, under idle_spin_ceiling_ns",
+      ["rt.idle_window_ns"]
     )
     .get();
     let (did, within_window) = state::with_state(|s| {
@@ -4969,18 +5841,17 @@ async fn serve_loop() {
       // pending is served now; one published later is rung, and the ring wakes this poller.
       let serve_instead = state::with_state(verbs::announce_idle).unwrap_or(false);
       // A forward its owner's full control channel refused is kept for the next round (§4.3, "backpressure, never a
-      // drop"), but no ring or kick says the channel has room: the owner drains it without a word to the shards that
-      // wait. So while one is kept the loop idles at most the idle window, then serves a round that sends it again.
-      // Idling until a ring woke it, a shard whose clients all waited on kept forwards slept until some other
-      // request came: at 10,000 clients over one green, requests waited 10 to 42 s with the daemon idle
-      // (`crates/server/tests/forward_retry.rs`).
-      let kept = state::with_state(|s| !s.pending_forwards.is_empty()).unwrap_or(false);
+      // drop"). Before idling, the loop asks that owner to tell it when the channel has room and tries once more; it
+      // idles only if that try is refused too, and the owner's next drain wakes it (`slates_rt::room`). Until
+      // 2026-11-07 a kept forward had no wake at all, and a shard whose clients all waited on kept forwards slept
+      // until some other request came: at 10,000 clients over one green, requests waited 10 to 42 s with the daemon
+      // idle. Until 2026-11-17 the loop polled for the room once per idle window, a timer a window that grows with
+      // the wake estimate
+      // (`docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`).
+      let serve_instead = serve_instead
+        || state::with_state_counted(verbs::ask_room_for_kept_forwards).unwrap_or(false);
       if !serve_instead {
-        if kept {
-          let _ = futures::within(idle_window_ns.max(1), futures::idle()).await;
-        } else {
-          futures::idle().await;
-        }
+        futures::idle().await;
       }
       state::with_state(verbs::announce_polling);
     }
@@ -5006,6 +5877,217 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   true
 }
 
+/// Recovers what spans partitions, before any client is admitted: the names' aliases (A-236), the works off their
+/// green's shard, then every floor against the work it holds for (A-247).
+async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
+  let reconciled = reconcile_name_aliases(origin, shards).await;
+  if reconciled > 0 {
+    slates_machine::log_line!(
+      "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
+    );
+  }
+  let owed = rebuild_remote_works(origin, shards).await;
+  if owed > 0 {
+    slates_machine::log_line!(
+      "slates-server: {owed} work(s) left unbuilt at recovery: their shards did not answer twice; their records are kept, answering Unpublished, and asked for again as clients are let in"
+    );
+  }
+  drop_pending_creations(origin, shards).await;
+  let floors = reconcile_work_floors(origin, shards).await;
+  if floors > 0 {
+    slates_machine::log_line!(
+      "slates-server: {floors} work floor(s) reconciled with their works at recovery"
+    );
+  }
+}
+
+/// Replays each work whose green lives on another partition through that green's owner (A-247), its log being read
+/// from the work's partition, and installs the outcome on the work's shard. Every ask is made once more when its answer
+/// was lost ([`ask_once_more`], A-513): the list is read from the work's shard, never taken
+/// (`verbs::unbuilt_works`), and the install ends the work's record there (`verbs::install_replayed_work`), so a
+/// second ask behind a first that ran finds what the first left. Taken, one lost answer left every work of that shard
+/// unbuilt for the daemon's life: unserved, every change it acknowledged out of reach, and its floor holding its green's
+/// checkpoint at its base. A work whose asks went unanswered twice keeps its record, answers `Unpublished`, and is asked
+/// for again as clients are let in ([`ask_again_for_unbuilt_works`], A-533). Returns how many works were left so.
+async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) -> usize {
+  let mut owed = 0usize;
+  for shard in shards.iter().copied() {
+    let Some(unbuilt) = ask_once_more(origin, shard.0, |s| crate::verbs::unbuilt_works(s)).await
+    else {
+      slates_machine::log_line!(
+        "slates-server: shard {} did not list its works to rebuild at recovery",
+        shard.0
+      );
+      continue;
+    };
+    for work in unbuilt {
+      if !rebuild_remote_work(origin, shards, shard, work).await {
+        owed = owed.saturating_add(1);
+      }
+    }
+  }
+  owed
+}
+
+/// One work of [`rebuild_remote_works`]: its log read on its shard, replayed through its green's owner, the outcome
+/// installed on its shard. Whether every ask was answered.
+async fn rebuild_remote_work(
+  origin: u16,
+  shards: &[ShardId],
+  shard: ShardId,
+  work: crate::work_home::Unbuilt,
+) -> bool {
+  let id = work.work;
+  let Some(entries) = ask_once_more(origin, shard.0, move |s| {
+    s.db.partition().work_log(id).to_vec()
+  })
+  .await
+  else {
+    return false;
+  };
+  let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
+  let Some(owner) = shards.get(usize::from(partition)) else {
+    return false;
+  };
+  let (green, created_at) = (work.green, work.created_at);
+  let Some(replayed) = ask_once_more(origin, owner.0, move |s| {
+    crate::verbs::owner_replay(s, green, created_at, &entries)
+  })
+  .await
+  else {
+    return false;
+  };
+  ask_once_more(origin, shard.0, move |s| {
+    crate::verbs::install_replayed_work(s, &work, replayed);
+  })
+  .await
+  .is_some()
+}
+
+/// Format: the refusal-ledger name of a shard the retry of unbuilt works could not reach ([`ask_again_for_unbuilt_works`]):
+/// the shard gone, or the carrier refusing the message.
+const UNBUILT_ASK_REFUSED: &str = "merge.work_unbuilt_ask_refused";
+
+/// As clients are let in (A-533): tells every shard to ask its works still recorded unbuilt of their greens' owners
+/// again (`verbs::ask_owners_to_replay`), by a message each runs when it next runs. A work whose rebuild asks went
+/// unanswered twice at recovery is so rebuilt when its shard and its green's owner run again, each run the event, and
+/// answers `Unpublished` meanwhile; nothing waits, so the admission is not held, and no timer runs. A shard with no such
+/// work does nothing.
+fn ask_again_for_unbuilt_works(origin: u16, shards: &[ShardId]) {
+  for shard in shards.iter().copied() {
+    crate::xshard::run_on_waiting(
+      origin,
+      shard.0,
+      crate::verbs::ask_owners_to_replay,
+      UNBUILT_ASK_REFUSED,
+    );
+  }
+}
+
+/// Asks `shard` to run `work` in its own time, and once more when no answer came back (A-513, as A-505 asks a map's
+/// send): the second ask runs behind the first on the shard's channel, so a first ask that ran is answered from what it
+/// left there. Only for work that reads, or whose second run finds the record its first left.
+async fn ask_once_more<T: Send + 'static>(
+  origin: u16,
+  shard: u16,
+  work: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+) -> Option<T> {
+  match crate::xshard::call_in_shard_time(origin, shard, work.clone(), LIVENESS_BUDGET_NS).await {
+    Some(answer) => Some(answer),
+    None => crate::xshard::call_in_shard_time(origin, shard, work, LIVENESS_BUDGET_NS).await,
+  }
+}
+
+/// Ends every work creation a restart caught waiting for its green's owner (A-247): its name and id go back, and the
+/// client's retry, finding no completion, creates it afresh. Any floor its admission left is dropped by the reconcile
+/// after, its work never having been made.
+async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
+  for shard in shards.iter().copied() {
+    let _ = crate::xshard::call_in_shard_time(
+      origin,
+      shard.0,
+      |s| {
+        let names: Vec<String> = s
+          .db
+          .partition()
+          .pending_creations()
+          .map(|pending| pending.name.clone())
+          .collect();
+        for name in names {
+          s.db.begin();
+          let settled = crate::verbs::settle_creation(s, &name);
+          if settled.is_err() || s.db.commit(&mut s.segment).is_err() {
+            crate::verbs::reconcile_unpublished_effects(s);
+          }
+        }
+      },
+      LIVENESS_BUDGET_NS,
+    )
+    .await;
+  }
+}
+
+/// Compares every work floor with the work it holds for (A-247): one whose work is gone is dropped, and one that names
+/// a base the work no longer holds is moved to the work's. Only a crash between a work's step and its green's leaves
+/// either. Run before any client is admitted. Returns how many it changed.
+async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
+  let mut reconciled = 0usize;
+  for shard in shards.iter().copied() {
+    let Some(floors) = crate::xshard::call_in_shard_time(
+      origin,
+      shard.0,
+      |s| s.db.partition().work_floors().collect::<Vec<_>>(),
+      LIVENESS_BUDGET_NS,
+    )
+    .await
+    else {
+      continue;
+    };
+    for floor in floors {
+      let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(floor.work));
+      let Some(home) = shards.get(usize::from(partition)) else {
+        continue;
+      };
+      let work = floor.work;
+      let Some((exists, holds)) = crate::xshard::call_in_shard_time(
+        origin,
+        home.0,
+        move |s| {
+          (
+            s.db.partition().volume(work).is_some(),
+            s.works.get(&work).map(|w| w.base_version),
+          )
+        },
+        LIVENESS_BUDGET_NS,
+      )
+      .await
+      else {
+        continue;
+      };
+      let change = match (exists, holds) {
+        (false, _) => Some(None),
+        (true, Some(base)) if base != floor.base => Some(Some(base)),
+        // A record whose work could not be rebuilt keeps its floor: its base may yet be read.
+        _ => None,
+      };
+      if let Some(base) = change {
+        let (green, work) = (floor.green, floor.work);
+        let moved = crate::xshard::call_in_shard_time(
+          origin,
+          shard.0,
+          move |s| crate::verbs::owner_floor(s, green, work, base),
+          LIVENESS_BUDGET_NS,
+        )
+        .await;
+        if moved.is_some() {
+          reconciled = reconciled.saturating_add(1);
+        }
+      }
+    }
+  }
+  reconciled
+}
+
 /// A recovery's reconciliation of every name alias (A-236, `slates_db::alias::reconcile`): each shard's aliases asked
 /// for, the volume each names asked of its partition, and the alias confirmed when that volume holds the name, released
 /// when it does not. Run before any client is admitted, when no clone is between its steps. An alias whose question is
@@ -5013,7 +6095,7 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
 async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
   let mut reconciled = 0usize;
   for shard in shards {
-    let Some(aliases) = crate::xshard::call_within(
+    let Some(aliases) = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| s.db.partition().name_aliases().cloned().collect::<Vec<_>>(),
@@ -5030,7 +6112,7 @@ async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
       let id = alias.volume;
       let volume = match shards.get(usize::from(partition)) {
         Some(owner) => {
-          let Some(volume) = crate::xshard::call_within(
+          let Some(volume) = crate::xshard::call_in_shard_time(
             origin,
             owner.0,
             move |s| s.db.partition().volume(id).cloned(),
@@ -5054,7 +6136,7 @@ async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
           slates_db::Op::NameAliasReleased { name: alias.name }
         }
       };
-      let settled = crate::xshard::call_within(
+      let settled = crate::xshard::call_in_shard_time(
         origin,
         shard.0,
         move |s| crate::verbs::alias_step(s, &op).is_ok(),
@@ -5196,12 +6278,13 @@ async fn control_loop(
   }
   // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
   // reconciled with the clones they name (A-236).
-  let reconciled = reconcile_name_aliases(control, &shards).await;
-  if reconciled > 0 {
-    slates_machine::log_line!(
-      "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
-    );
-  }
+  // Every green a partition holds by its takeover's adoption is rebuilt from this node's ledger first (A-333), so no
+  // client meets one half built and every work over one is replayed after it.
+  crate::green_adopt::readopt_at_boot(control, &shards).await;
+  // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
+  // green's owner, and only then is every floor compared with the work it holds for (A-247).
+  recover_works_across_partitions(control, &shards).await;
+  ask_again_for_unbuilt_works(control, &shards);
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the
@@ -5318,6 +6401,7 @@ async fn control_loop(
         let completion = a.completion_dup();
         let control = a.control;
         let pid = a.pid;
+        let started = a.started;
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut end = slates_ipc::DaemonEnd::new(a.region);
         #[cfg(unix)]
@@ -5327,24 +6411,43 @@ async fn control_loop(
             // The server task may be idle with its parked flags set on the clients it knew;
             // a wake makes it mark the new client too before it idles again.
             let server = state::with_state(|s| {
-              let last_seen_ns = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+              // Its hang-up is watched from its seat on (A-475). A client whose hang-up cannot be watched is not seated,
+              // since nothing would reclaim it: its control closes with this task, which its client reads as the daemon
+              // gone, and the admission gives its id back.
+              let hangup = match crate::hangup::Hangup::of_client(control.as_ref(), pid, started) {
+                Ok(hangup) => hangup,
+                Err(refusal) => {
+                  s.count(crate::reap::UNWATCHABLE, 1);
+                  slates_machine::log_line!(
+                    "slates-server: client {client_id} is not seated: its hang-up cannot be watched ({refusal})"
+                  );
+                  return None;
+                }
+              };
               match s.clients.insert(ClientSlot {
                 status_pages: crate::status_pages::StatusPages::default(),
                 end,
                 principal,
                 client_id,
                 pid,
-                last_seen_ns,
                 retiring: false,
+                watch: None,
                 proven: false,
                 control,
                 revoked: false,
+                consumer_policy: None,
+                identities: None,
                 owner_route: None,
                 read_ahead: None,
                 read_ahead_pending: 0,
                 remote_volumes: Vec::new(),
+                maps_sent: std::collections::BTreeSet::new(),
               }) {
-                Ok(_) => admission.seat(),
+                Ok(seat) => {
+                  if crate::reap::start_watch(s, seat, client_id, hangup) {
+                    admission.seat();
+                  }
+                }
                 Err(e) => {
                   slates_machine::log_line!(
                     "slates-server: client {client_id} refused by the shard's table: {e}"
@@ -5498,9 +6601,9 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
       log_late_beat(now.saturating_sub(beat), &before, &counters);
     }
     last = Some((now, counters));
-    let requested = match segment.supervision() {
-      Ok(sup) => sup.stop_requested_at().is_some(),
-      Err(_) => false,
+    let (requested, lapse_bound_ns) = match segment.supervision() {
+      Ok(sup) => (sup.stop_requested_at().is_some(), sup.lapse_bound_ns()),
+      Err(_) => (false, None),
     };
     state::with_state(|s| {
       if let Some(watch) = s.stop_watch.as_ref()
@@ -5509,7 +6612,12 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
         // Bounded by one: a reason already sent and not yet taken is the same news.
         let _full_or_gone = watch.wake.try_send(());
       }
+      // This node's detection by its anchor (A-574): the watchdog's widest window and the anchor's published lapse bound,
+      // read at every beat on every node, laptop or fleet, and the failover delay published from them.
+      crate::fleet::refresh_supervision(s, lapse_bound_ns);
     });
+    // The delay to every shard where it moved: a laptop's other shards read it as a fleet's do (A-574).
+    crate::fleet::fan_failover();
     pace(HEARTBEAT_NS).await;
   }
 }
@@ -5523,9 +6631,10 @@ pub(crate) struct StopWatch {
   wake: std::sync::mpsc::SyncSender<()>,
 }
 
-/// Logs a beat that came [`LATE_BEAT_SHARE`] of the liveness budget or more after the one before (§4.14
-/// `daemon.alive`): the shard went that long without running its heartbeat task, and past the budget the anchor
-/// kills it. With the gap goes what the shard did in it, from its counters `before` and `after`: its steps and
+/// Logs a beat that came late, [`LATE_BEAT_SHARE`] of the window the watchdog judges the control shard by or more after
+/// the one before ([`beat_is_late`], A-470; §4.14 `daemon.alive`): the shard went that long without running its heartbeat
+/// task, and past its window the watchdog judges it. With the gap goes what the shard did in it, from its counters
+/// `before` and `after`: its steps and
 /// polls, each long poll by what held it (a task's own CPU past the quantum, the thread blocked in the kernel,
 /// the host keeping a runnable thread off the CPU, or unattributed), the timers it fired, the times it waited,
 /// the tasks it spawned and finished and those live, its longest poll and its measured timer overrun. So a near
@@ -5537,19 +6646,19 @@ fn log_late_beat(
   before: &slates_rt::shard::Counters,
   after: &slates_rt::shard::Counters,
 ) {
-  if gap < LIVENESS_BUDGET_NS / LATE_BEAT_SHARE {
+  if !beat_is_late(gap, after.scheduler_overrun_ns) {
     return;
   }
   let delta =
     |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
   slates_machine::log_line!(
-    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against a {} ms window; \
+    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against its {} ms window; \
      the anchor's beat is the watchdog's now): in the gap the shard \
      ran {} steps and {} polls ({} long in a task, {} blocked in the kernel, {} preempted by the host, {} \
      unattributed), fired {} timers, waited {} times, spawned {} tasks and finished {}; {} tasks live; its \
      longest poll is {} ms and its timer overrun {} ms",
     gap / NS_PER_MS,
-    LIVENESS_BUDGET_NS / NS_PER_MS,
+    crate::watchdog::watch_window_ns(after.scheduler_overrun_ns) / NS_PER_MS,
     delta(|c| c.steps),
     delta(|c| c.polls),
     delta(|c| c.long_steps),
@@ -5566,10 +6675,172 @@ fn log_late_beat(
   );
 }
 
-/// Shape: a beat that late — this share of the liveness budget or more after the last — is logged as a near
-/// miss ([`log_late_beat`]): half the budget, so the stalls that stop short of a kill are seen too. A writer waits for
-/// its volume's FUSE mounts no longer than that ([`crate::told::TOLD_WAIT_NS`], AC-3.3).
+/// Shape: a beat that late — this share of the shard's window or more after the last — is logged as a near
+/// miss ([`log_late_beat`]): half the window, so the stalls that stop short of a kill are seen too. A scatter's part
+/// waits for room a window of that share at a time (`crate::verbs::PART_ROOM_BUDGET_NS`, A-426).
 pub(crate) const LATE_BEAT_SHARE: u64 = 2;
+
+/// Whether the control shard's beat task, run `gap_ns` after its last turn, ran late ([`log_late_beat`], A-470): a
+/// [`LATE_BEAT_SHARE`] or more of the window the watchdog judges that shard by now (A-455,
+/// `crate::watchdog::watch_window_ns` over `overrun_ns`, the scheduler overrun the shard measured). A gap is a near miss
+/// against the verdict the watchdog would reach, and the watchdog reaches it at the shard's own window: on a host that
+/// holds the shard off its CPU longer than the liveness window, a gap that window explains is no near miss, and before
+/// A-470 every such turn was logged as one, against a window the watchdog no longer judged the shard by. Pure, so the
+/// rule is tested on every host.
+pub(crate) fn beat_is_late(gap_ns: u64, overrun_ns: u64) -> bool {
+  gap_ns >= crate::watchdog::watch_window_ns(overrun_ns) / LATE_BEAT_SHARE
+}
+
+#[cfg(test)]
+mod late_beat_tests {
+  use super::{LIVENESS_BUDGET_NS, beat_is_late};
+
+  /// A-470, A-455, §4.14. Do: judge the control shard's beat gaps against the shard's own window, on a quiet shard (no
+  /// overrun measured), on one the host held off its CPU two and a half liveness windows, and on one whose reading ran
+  /// away (an hour, a process stopped whole and continued). Expect: on the quiet shard a gap of three fifths of the
+  /// liveness window late and two fifths not, as before; on the held one three fifths not late, since its window is two
+  /// and a half and the watchdog judges it there, and thirteen tenths late; on the runaway one the ceiling's half the
+  /// line, four windows not late and five late. Before A-470 every gap past half the liveness window was logged as a
+  /// near miss, whatever window the watchdog judged the shard by.
+  #[test]
+  fn a_beat_is_late_against_the_shards_own_window() {
+    let window = LIVENESS_BUDGET_NS;
+    let quiet = 0;
+    assert!(beat_is_late(3 * window / 5, quiet), "a quiet shard's gap");
+    assert!(
+      !beat_is_late(2 * window / 5, quiet),
+      "a quiet shard's short gap"
+    );
+    let held = 5 * window / 2;
+    assert!(
+      !beat_is_late(3 * window / 5, held),
+      "a gap the held shard's window explains"
+    );
+    assert!(
+      beat_is_late(13 * window / 10, held),
+      "past half the held shard's window"
+    );
+    let runaway = 3_600 * window;
+    assert!(
+      !beat_is_late(4 * window, runaway),
+      "under the ceiling's half"
+    );
+    assert!(beat_is_late(5 * window, runaway), "at the ceiling's half");
+  }
+}
+
+#[cfg(test)]
+mod starved_share_tests {
+  use super::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, starved_share_ns};
+  use crate::watchdog::watch_window_ns;
+
+  /// Shape: a hold's span: ten liveness windows, a whole number of beats, past every window judged here.
+  const SPAN_NS: u64 = 10 * LIVENESS_BUDGET_NS;
+
+  /// A hold's whole CPU over `span_ns` on a shard judged by `window_ns`, as `starve_this_thread` spends it: its share
+  /// each beat, over the span's beats.
+  fn whole_cpu_ns(span_ns: u64, window_ns: u64) -> u64 {
+    span_ns.div_ceil(HEARTBEAT_NS) * starved_share_ns(span_ns, window_ns)
+  }
+
+  /// A-552 (R3's class D, `starved_share_ns`; A-232, A-455). Do: take a starved hold's share over ten liveness windows on
+  /// a quiet shard and on one whose host held it off its CPU two and a half windows, each judged by the window the
+  /// watchdog gives its measured overrun; then over a span shorter than a beat. Expect the hold's whole CPU to be half
+  /// the shard's own window in both, so the watchdog judging the shard by that window finds it neither spinning nor
+  /// still, and no beat's share past a beat. Before, the hold's whole CPU was half the liveness window whatever window
+  /// the watchdog judged its shard by.
+  #[test]
+  fn a_starved_holds_cpu_is_half_the_window_its_shard_is_judged_by() {
+    let quiet = watch_window_ns(0);
+    assert_eq!(
+      whole_cpu_ns(SPAN_NS, quiet),
+      quiet / 2,
+      "a quiet shard's hold"
+    );
+    let held = watch_window_ns(5 * LIVENESS_BUDGET_NS / 2);
+    assert_eq!(
+      whole_cpu_ns(SPAN_NS, held),
+      held / 2,
+      "a held shard's hold spins half the window the watchdog judges it by"
+    );
+    assert_eq!(
+      starved_share_ns(HEARTBEAT_NS / 2, held),
+      HEARTBEAT_NS,
+      "a span under a beat spins a beat at most"
+    );
+  }
+}
+
+#[cfg(test)]
+mod laptop_failover_tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used)]
+  use super::{LIVENESS_BUDGET_NS, audit_daemon_of, observe_at, observe_first};
+
+  /// Shape: the lapse bound the test publishes as the daemon's anchor does: four liveness windows, as an anchor whose own
+  /// waits ran three windows late measures it, far from any delay the daemon held before.
+  const LAPSE_NS: u64 = 4 * LIVENESS_BUDGET_NS;
+  /// Shape: how long the test looks for every shard to read the delay: ten seconds, a hundred of the control shard's
+  /// beats, far past the beat that reads the bound and the fan that carries the delay.
+  const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+  /// Shape: the pause between the test's looks, half a beat.
+  const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+
+  /// A-574 (A-405's laptop detection, derived; R8). Do: start a two-shard daemon with no fleet (`f = 0`, a laptop's),
+  /// publish a lapse bound in its supervision block as its anchor does, and look at both shards' failover delay until
+  /// they agree. Expect each to be at least the liveness window, then the published lapse and the recovery prior, in
+  /// whole periods, and the control shard's detection term to be the watchdog's widest window (from the liveness window
+  /// to its ceiling) and then exactly the lapse, read from what was measured: the laptop's detection read on the control
+  /// shard's beat from what its watchdog and its anchor measure, and fanned to every shard. Before, a laptop's delay was
+  /// the liveness window and the recovery prior, set at boot and never read again.
+  #[test]
+  fn a_laptops_failover_delay_follows_its_watchdogs_window_and_its_anchors_lapse() {
+    let daemon = audit_daemon_of(2);
+    daemon
+      .segment()
+      .supervision()
+      .unwrap()
+      .record_lapse_bound(LAPSE_NS);
+    let floor = crate::fleet::failover_in_periods(
+      LIVENESS_BUDGET_NS + LAPSE_NS + slates_db::replay::RECOVERY_BUDGET_NS,
+    );
+    let began = std::time::Instant::now();
+    let read = loop {
+      let control = observe_first(&daemon, |s| {
+        (s.failover_ns, s.failover.estimate().detection)
+      });
+      let other = observe_at(&daemon, 1, |s| s.failover_ns);
+      if control.0 >= floor && other == control.0 {
+        break Some(control);
+      }
+      if began.elapsed() > WAIT {
+        break None;
+      }
+      // The harness paces its looks; the daemon under test reads on its own beat.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(LOOK);
+    };
+    daemon.stop();
+    let (failover_ns, detection) =
+      read.expect("every shard read a delay with the anchor's lapse in it");
+    let detection = detection.expect("its anchor detects it");
+    let window = detection
+      .ns
+      .checked_sub(LAPSE_NS)
+      .expect("the detection holds the lapse");
+    assert!(
+      (LIVENESS_BUDGET_NS..=crate::watchdog::WINDOW_CEILING_NS).contains(&window),
+      "the watchdog's widest window, then the lapse: {window} ns"
+    );
+    assert!(
+      detection.samples > 0,
+      "read from what was measured: {detection:?}"
+    );
+    println!(
+      "a laptop's failover delay {failover_ns} ns: the watchdog's widest window {window} ns, the anchor's lapse \
+       {LAPSE_NS} ns, then the recovery"
+    );
+  }
+}
 
 /// Format: nanoseconds per millisecond, for the late-beat log.
 const NS_PER_MS: u64 = 1_000_000;
@@ -5591,14 +6862,17 @@ fn kick_fd_of(_shard: ShardId) -> Option<i32> {
 /// listener and hands its descriptor over in the environment, so its port survives a daemon restart; the daemon adopts
 /// that when present, or binds a fresh ephemeral one when it runs standalone (tests). Either way the port is known
 /// here, before the serve task moves the listener onto the shard, and the cross-shard bridge queue reaches volumes on
-/// other shards. The connections the anchor held across the restart (A-113) are served first there; without a listener
-/// nothing could serve them, so each is released — the anchor closes the last copy and the kernel client reconnects to
-/// whatever listener comes next, rather than wait on a connection nobody reads. The port, if the listener bound.
+/// other shards. The connections the anchor held across the restart (A-113) are served first there, each judged by the
+/// newest send ledger it handed back where a send may stop mid-record (`inherited`, Linux, A-550); without a listener
+/// nothing could serve them, so each is released, and the ledgers with them — the anchor closes the last copy and the
+/// kernel client reconnects to whatever listener comes next, rather than wait on a connection nobody reads. The port,
+/// if the listener bound.
 fn start_nfs_transport(
   runtime: &Runtime,
   control: ShardId,
   config: &DaemonConfig,
   handed: Vec<crate::anchor_hold::HandedConnection>,
+  inherited: crate::held_send::Inherited,
 ) -> Result<Option<u16>, RtError> {
   let listener = nfs_listener().ok();
   let port = listener
@@ -5607,14 +6881,16 @@ fn start_nfs_transport(
     .map(|address| address.port());
   let (Some(listener), Some(port)) = (listener, port) else {
     crate::nfs::release_handed(handed);
+    inherited.release();
     return Ok(None);
   };
   // Publish the port for a verb handler to report to a client (`slates mount`).
   NFS_PORT.store(u32::from(port), Ordering::Release);
   let bound = config.held_connection_bound();
+  let cache_line = config.cache_line;
   runtime.spawn_on(control, async move {
     // The connections a dead daemon left are answered first (A-113): their kernel clients are waiting.
-    crate::nfs::adopt_held(handed, port, bound);
+    crate::nfs::adopt_held(handed, inherited, port, bound, cache_line);
     match futures::spawn(crate::nfs::serve(listener, port, bound)) {
       Ok(task) => {
         let _ = futures::detach(task);
@@ -5664,30 +6940,6 @@ fn start_shards_route(
 /// Counter: the Shards stream route that did not bind its socket (macOS): the Shards form is refused while it stands.
 #[cfg(target_os = "macos")]
 const SHARDS_ROUTE_UNBOUND: &str = "shards.route_unbound";
-
-/// Releases and closes FUSE devices the anchor handed back to a daemon on a platform without FUSE: there is no mount to
-/// serve them, and an anchor that keeps them would hand them to every daemon after. Reported, since a device here means
-/// an anchor shared with another platform's daemon or a corrupted handoff.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn release_devices_without_fuse(devices: Vec<crate::anchor_hold::HandedDevice>) {
-  for crate::anchor_hold::HandedDevice {
-    attachment,
-    device,
-    session,
-  } in devices
-  {
-    slates_machine::log_line!(
-      "slates-server: the anchor handed back FUSE device {attachment:x} ({}), which this platform cannot serve; released",
-      if session.is_some() {
-        "negotiated"
-      } else {
-        "not negotiated"
-      }
-    );
-    drop(device);
-    let _ = crate::anchor_hold::send(&slates_anchor::held::Outgoing::Release { attachment });
-  }
-}
 
 /// Raises this process's soft descriptor limit to the hard one (no privilege needed); `(before, after)` when it changed.
 /// The daemon calls it at start; the anchor too, since it holds a duplicate of every FUSE device and NFS connection
@@ -5749,7 +7001,8 @@ mod limits {
 
 #[cfg(test)]
 pub(crate) use tests::{
-  audit_daemon, audit_on_shard, audit_on_shard_configured, observe_first, test_profile,
+  audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
+  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -5929,6 +7182,14 @@ mod tests {
   /// A running one-shard audit daemon, bootstrapped, for a test whose work outlives one observation (a task it spawns
   /// that must still run after the observation returns); the test stops it.
   pub(crate) fn audit_daemon() -> super::Daemon {
+    audit_daemon_configured(|_| {})
+  }
+
+  /// [`audit_daemon`] with its derived configuration changed by `configure` before it starts, as
+  /// [`audit_on_shard_configured`] changes an audit's: a test that must reach a derived bound shrinks what derives it.
+  pub(crate) fn audit_daemon_configured(
+    configure: impl FnOnce(&mut crate::DaemonConfig),
+  ) -> super::Daemon {
     let profile = test_profile();
     static NEXT_KEPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let instance = format!(
@@ -5936,8 +7197,47 @@ mod tests {
       std::process::id(),
       NEXT_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    configure(&mut config);
     audit_daemon_with(&profile, config, instance)
+  }
+
+  /// A running audit daemon of `shards` shards, bootstrapped, for a test of one shard's call to another (a wait judged
+  /// in its target's own time, A-432); the test stops it.
+  pub(crate) fn audit_daemon_of(shards: u16) -> super::Daemon {
+    let profile = test_profile();
+    static NEXT_OF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let instance = format!(
+      "audit-of-{}-{}",
+      std::process::id(),
+      NEXT_OF.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(shards));
+    audit_daemon_with(&profile, config, instance)
+  }
+
+  /// Shape: a busy poll's cycle ([`hold_busy`]): ten milliseconds.
+  const BUSY_CYCLE_NS: u64 = 10_000_000;
+  /// Shape: the part of each cycle a busy poll runs on its CPU: a fifth, so the shard runs about a fifth of the poll's
+  /// wall time, as a shard starved by its neighbours does (`crates/server/tests/cross_shard_wait.rs`'s control shard).
+  const BUSY_ON_CPU_NS: u64 = BUSY_CYCLE_NS / 5;
+
+  /// Holds the calling shard in one poll for `wall_ns`: a fifth of each cycle spinning on its CPU, the rest asleep, so
+  /// the shard makes progress at a fifth of the wall's pace while every message on its channel waits for the poll's end
+  /// (a busy or starved target, which a wait judged in its own time waits for, A-432).
+  // The busy poll stands for a shard held off its CPU most of each cycle: it must sleep on the shard's thread.
+  #[allow(clippy::disallowed_methods)]
+  pub(crate) fn hold_busy(wall_ns: u64) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_nanos(wall_ns) {
+      let cycle = std::time::Instant::now();
+      while cycle.elapsed() < std::time::Duration::from_nanos(BUSY_ON_CPU_NS) {
+        std::hint::spin_loop();
+      }
+      std::thread::sleep(std::time::Duration::from_nanos(
+        BUSY_CYCLE_NS - BUSY_ON_CPU_NS,
+      ));
+    }
   }
 
   /// Runs `history` on `daemon`'s first shard (an [`audit_daemon`]'s one), as [`audit_on_shard`] does, leaving the
@@ -5948,6 +7248,17 @@ mod tests {
   ) -> T {
     daemon
       .observe(daemon.shards.first().copied(), history)
+      .expect("the observation completed")
+  }
+
+  /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
+  pub(crate) fn observe_at<T: Send + 'static>(
+    daemon: &super::Daemon,
+    partition: usize,
+    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  ) -> T {
+    daemon
+      .observe(daemon.shards.get(partition).copied(), history)
       .expect("the observation completed")
   }
 
@@ -6191,6 +7502,98 @@ mod tests {
     );
   }
 
+  /// A-337 (§4.8 direct contact and the plane's keying; the formation flake of
+  /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
+  /// 2026-11-18): the pair's canonical dialer keeps contact with a peer that holds a record session it dialed to it, and
+  /// only the canonical dialer does. Do: make this node a non-voting member of seven at `f = 1`, scatter three, all held
+  /// alive, and take a member its role rule drops (no neighbour, no holder, no voter); learn that member under an anchor
+  /// above this node's and then below, each with no session it dialed here and with one. Expect `Dialed`, kept, only
+  /// with the session and this node the lower anchor (the pair's canonical dialer); `OutsideNeighbourhood`, dropped,
+  /// otherwise, so two nodes never keep each other by their sessions alone. Before, the learner in the flake, the pair's
+  /// lower anchor and told stale voters, dropped a voter that kept it, and the pair's plane was never keyed.
+  #[test]
+  fn the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it() {
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_cluster::membership::{Liveness, MemberState};
+    use slates_cluster::root_group::RootGroup;
+    use slates_db::register::{HostId, Quorum, RegionId};
+    let (dropped, readings) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let others: Vec<HostId> = (1..=6u64).map(|n| HostId(local.0 ^ (n << 16))).collect();
+      let voter = others[0];
+      let mut all = vec![local];
+      all.extend_from_slice(&others);
+      state.council = RegionalCouncil::new(
+        voter,
+        all,
+        vec![voter],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      state.root = RootGroup::new(voter, vec![RegionId(0)], vec![voter]);
+      install_council(state);
+      let alive = MemberState {
+        liveness: Liveness::Alive,
+        incarnation: 0,
+      };
+      for peer in &others {
+        slates_cluster::fleet::apply_peer_state(&mut state.fleet, *peer, Some(alive));
+      }
+      let Some(peer) = others
+        .iter()
+        .copied()
+        .find(|peer| crate::fleet::direct_contact_reason(state, *peer) == "OutsideNeighbourhood")
+      else {
+        return (None, Vec::new());
+      };
+      let origin = state.origin_anchor;
+      let mut readings = Vec::new();
+      for anchor in [
+        HostId(origin.0.saturating_add(1)),
+        HostId(origin.0.saturating_sub(1)),
+      ] {
+        state.learned_members.clear();
+        state.learned_members.insert(
+          anchor,
+          crate::state::LearnedMember {
+            boot_nonce: 1,
+            host: peer,
+            previous: None,
+          },
+        );
+        for sessions in [0u32, 1] {
+          state.dialed_in.clear();
+          if sessions > 0 {
+            state.dialed_in.insert(anchor, sessions);
+          }
+          readings.push((
+            anchor > origin,
+            sessions,
+            crate::fleet::direct_contact_reason(state, peer),
+            crate::fleet::keeps_direct_contact_with(state, peer),
+          ));
+        }
+      }
+      (Some(peer), readings)
+    });
+    assert!(
+      dropped.is_some(),
+      "a member of seven at scatter three falls outside this node's role rule"
+    );
+    let expected: Vec<(bool, u32, String, bool)> = vec![
+      (true, 0, "OutsideNeighbourhood".to_owned(), false),
+      (true, 1, "Dialed".to_owned(), true),
+      (false, 0, "OutsideNeighbourhood".to_owned(), false),
+      (false, 1, "OutsideNeighbourhood".to_owned(), false),
+    ];
+    assert_eq!(
+      readings, expected,
+      "(the peer's anchor above this node's, sessions it dialed here, the reason, kept)"
+    );
+  }
+
   /// §4.8 Lookup, AC-8.14: a node whose placement has not yet installed its council's newest configuration
   /// still claims an object it owns — ownership moves only when the owner is retired, and the claim is judged
   /// against the council's own membership, so the lag cannot make a claim false. Do: commit a change on this
@@ -6215,7 +7618,7 @@ mod tests {
       }));
       assert!(state.council.configuration().version > installed);
       let query = crate::owner_location::Query::new(state, object, 0);
-      crate::owner_location::serve(state, &query.to_bytes())
+      crate::owner_location::serve(state, HostId(local.0 ^ 1), &query.to_bytes())
     });
     assert!(
       matches!(claimed, Ok((_, None))),
@@ -6409,6 +7812,10 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
+        signature: None,
+        folded_below: 0,
+        checkpoint_floor: 0,
       };
       let record = Record {
         owner,
@@ -6445,6 +7852,406 @@ mod tests {
     state
       .fleet
       .install_configuration(configuration, &regional.members);
+  }
+
+  /// Shape: the content puts the content-delta test holds, one publication each: enough that a delta carrying the whole
+  /// hold's image would carry tens of times what one put is.
+  const CONTENT_PUTS: u64 = 64;
+
+  /// §4.8 "persistence before reply", A-376: a holder publishes before it acknowledges each content put, and what that
+  /// publication carries must be the content it put, never the hold it already carries. Do: on a shard, hold
+  /// [`CONTENT_PUTS`] inputs of one green, each placed for its own version and of one size, building after each the delta
+  /// a publication would carry and committing it. Expect every delta to carry the same bytes (the put's manifest and its
+  /// one new chunk), and the pieces every delta carried, folded in order, to be the hold's whole image. Before: the hold's
+  /// image was one piece, re-encoded at every publication and re-put whenever it changed, so the n-th put carried every
+  /// input held before it.
+  #[test]
+  fn a_holders_publication_carries_the_content_it_puts_not_the_whole_hold() {
+    let (carried, folded_whole) = audit_on_shard(|state| {
+      use slates_db::register::{HostId, ObjectId};
+      let green = ObjectId::new(HostId(9), 1);
+      state.published_held = crate::content_holder::PublishedHeld::default();
+      crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
+      let mut folded: std::collections::BTreeMap<
+        [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+        Vec<u8>,
+      > = crate::content_holder::held_image(state)
+        .into_iter()
+        .map(|piece| (piece.key, piece.bytes))
+        .collect();
+      let mut carried = std::collections::BTreeSet::new();
+      for version in 1..=CONTENT_PUTS {
+        let archive =
+          crate::merge_origin::InputsBuilder::whole(&version.to_le_bytes()).finish(version, 4096);
+        state
+          .held_content
+          .hold(
+            &mut crate::content_holder::hold_space(&mut state.store),
+            green,
+            slates_cluster::content::Placed { sequence: version },
+            archive,
+          )
+          .unwrap();
+        let changes = crate::content_holder::held_changes(state);
+        carried.insert(
+          changes
+            .put
+            .iter()
+            .map(|piece| piece.bytes.len())
+            .sum::<usize>(),
+        );
+        for piece in &changes.put {
+          folded.insert(piece.key, piece.bytes.clone());
+        }
+        for key in &changes.removed {
+          folded.remove(key);
+        }
+        crate::content_holder::held_committed(state, changes.whole, false);
+      }
+      let whole: std::collections::BTreeMap<_, _> = crate::content_holder::held_image(state)
+        .into_iter()
+        .map(|piece| (piece.key, piece.bytes))
+        .collect();
+      (carried, folded == whole)
+    });
+    assert_eq!(
+      carried.len(),
+      1,
+      "every put's delta carries its manifest and its chunk, whatever the hold holds: {carried:?}"
+    );
+    assert!(folded_whole, "the folded deltas are the hold's whole image");
+  }
+
+  /// One step of the held-pieces oracle's history (A-270): a change to what the shard holds, or a publication.
+  #[derive(Clone, Copy, Debug)]
+  enum HeldStep {
+    /// An entry kept after the last of live copy `copy` (made when it holds none).
+    Push(u8),
+    /// Live copy `copy`'s entries dropped, as a whole entry does.
+    Clear(u8),
+    /// Live copy `copy` let go.
+    Drop(u8),
+    /// A register put in place for object `object`: a fresh acceptor that keeps no changes, holding one position.
+    Hold(u8),
+    /// Object `object`'s register dropped.
+    Forget(u8),
+    /// The next position of object `object`'s register accepted, its acceptor made, keeping its changes, when none is
+    /// held (A-367: the ledger a holder of a green keeps).
+    Accept(u8),
+    /// Object `object`'s newest position accepted again at a newer epoch, as a takeover re-commits it (A-367).
+    Again(u8),
+    /// Object `object`'s register compacted below its newest position, as a single-value register is (A-367).
+    Compact(u8),
+    /// A fresh acceptor that keeps its changes put in place of object `object`'s, holding one position (A-367): its
+    /// changes do not account for the published positions it replaced.
+    Renew(u8),
+    /// Content held for object `object`, placed for the step's index (A-376).
+    Put(u8),
+    /// Everything held for object `object` released, as a tombstone releases it (A-376).
+    Release(u8),
+    /// A delta published: what `held_changes` carries, folded over the model.
+    Delta,
+    /// A checkpoint published: everything held.
+    Checkpoint,
+  }
+
+  /// Accepts into `acceptor` a record of `object` from the owner its authority names, under its generation: at
+  /// `again`, its value unchanged at an epoch one past its fence (a takeover's re-commit); else at the position after its
+  /// highest, at its fence's epoch, valued by `at`. Whether it was accepted.
+  fn held_accept(
+    acceptor: &mut slates_db::register::Acceptor,
+    object: slates_db::register::ObjectId,
+    at: usize,
+    again: Option<u64>,
+  ) -> bool {
+    use slates_db::register::{HostEpoch, Record};
+    let (promised, _) = acceptor.persisted();
+    let (sequence, epoch, value) = match again {
+      Some(sequence) => {
+        let Some(value) = acceptor.value_at(object, sequence).map(<[u8]>::to_vec) else {
+          return false;
+        };
+        (sequence, HostEpoch(promised.0.saturating_add(1)), value)
+      }
+      None => {
+        let next = acceptor
+          .highest(object)
+          .map_or(1, |(sequence, _)| sequence.saturating_add(1));
+        (next, promised, format!("value {at}").into_bytes())
+      }
+    };
+    acceptor
+      .accept(&Record {
+        owner: acceptor.owner(),
+        object,
+        sequence,
+        epoch,
+        generation: acceptor.generation(),
+        value,
+      })
+      .is_ok()
+  }
+
+  /// A-270, A-367, the oracle of the incremental held image: do run a generated history of live copies kept, cleared,
+  /// let go and made again, and registers held, dropped, grown a position at a time, accepted again at a newer epoch,
+  /// compacted and replaced, publishing deltas and checkpoints between them. Expect after every publication the pieces a
+  /// restart would fold (each checkpoint's, each delta's put and removed applied in order) to equal everything the shard
+  /// holds (`held_image`). A change the tracked maps or an acceptor's changes missed, a live slot reused by a copy made
+  /// again, or a key both put and removed fails here as a difference, before it is a record a restart lost.
+  #[test]
+  fn folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds() {
+    use proptest::strategy::Strategy;
+    let failures = audit_on_shard(|state| {
+      use slates_db::register::{Acceptor, Authority, HostId, ObjectId};
+      type Model =
+        std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>;
+      let local = state.fleet.host();
+      let step = (0u8..14, 0u8..3).prop_map(|(kind, which)| match kind {
+        0 | 1 => HeldStep::Push(which),
+        2 => HeldStep::Clear(which),
+        3 => HeldStep::Drop(which),
+        4 => HeldStep::Hold(which),
+        5 => HeldStep::Forget(which),
+        6 | 7 => HeldStep::Accept(which),
+        8 => HeldStep::Again(which),
+        9 => HeldStep::Compact(which),
+        10 => HeldStep::Renew(which),
+        12 => HeldStep::Put(which),
+        13 => HeldStep::Release(which),
+        _ if which == 0 => HeldStep::Checkpoint,
+        _ => HeldStep::Delta,
+      });
+      let mut runner = proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(
+        proptest::test_runner::Config {
+          cases: slates_test_seeds::cases(64),
+          ..proptest::test_runner::Config::default()
+        },
+      ));
+      // The runner's case is an `Fn`, so each case borrows the one shard's state through a cell.
+      let cell = std::cell::RefCell::new(state);
+      let outcome = runner.run(&proptest::collection::vec(step, 1..60), |steps| {
+        let mut borrowed = cell.borrow_mut();
+        let state: &mut crate::state::ShardState = &mut borrowed;
+        state.holder_records.clear();
+        state.live.held.clear();
+        state
+          .held_content
+          .forget_all(&mut crate::content_holder::hold_space(&mut state.store));
+        state.published_held = crate::content_holder::PublishedHeld::default();
+        crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
+        let mut model: Model = Model::new();
+        let object = |which: u8| ObjectId([which.saturating_add(1); 16]);
+        for (at, step) in steps.iter().enumerate() {
+          match *step {
+            HeldStep::Push(which) => {
+              let first = state.live.slot_floor;
+              state
+                .live
+                .held
+                .entry(object(which))
+                .or_insert_with(|| crate::live_ship::Held::for_test(local, object(which), first))
+                .push_for_test(format!("entry {at}").into_bytes());
+            }
+            HeldStep::Clear(which) => {
+              if let Some(held) = state.live.held.get_mut(&object(which)) {
+                held.clear_for_test();
+              }
+            }
+            HeldStep::Drop(which) => {
+              state.live.held.remove(&object(which));
+            }
+            HeldStep::Hold(which) => {
+              let mut fresh = Acceptor::new(
+                local,
+                Authority {
+                  generation: u64::try_from(at).unwrap(),
+                  owner: HostId(local.0 ^ 1),
+                },
+              );
+              held_accept(&mut fresh, object(which), at, None);
+              state.holder_records.insert(object(which), fresh);
+            }
+            HeldStep::Forget(which) => {
+              state.holder_records.remove(&object(which));
+            }
+            HeldStep::Accept(which) => {
+              let acceptor = state
+                .holder_records
+                .entry(object(which))
+                .or_insert_with(|| {
+                  Acceptor::new(
+                    local,
+                    Authority {
+                      generation: 0,
+                      owner: HostId(local.0 ^ 1),
+                    },
+                  )
+                  .tracking_changes()
+                });
+              held_accept(acceptor, object(which), at, None);
+            }
+            HeldStep::Again(which) => {
+              if let Some(acceptor) = state.holder_records.get_mut(&object(which))
+                && let Some((sequence, _)) = acceptor.highest(object(which))
+              {
+                held_accept(acceptor, object(which), at, Some(sequence));
+              }
+            }
+            HeldStep::Compact(which) => {
+              if let Some(acceptor) = state.holder_records.get_mut(&object(which))
+                && let Some((sequence, _)) = acceptor.highest(object(which))
+              {
+                acceptor.compact_below(object(which), sequence);
+              }
+            }
+            HeldStep::Put(which) => {
+              let index = u64::try_from(at).unwrap();
+              let archive =
+                crate::merge_origin::InputsBuilder::whole(&index.to_le_bytes()).finish(index, 4096);
+              let _ = state.held_content.hold(
+                &mut crate::content_holder::hold_space(&mut state.store),
+                object(which),
+                slates_cluster::content::Placed { sequence: index },
+                archive,
+              );
+            }
+            HeldStep::Release(which) => {
+              state.held_content.forget_object(
+                &mut crate::content_holder::hold_space(&mut state.store),
+                object(which),
+              );
+            }
+            HeldStep::Renew(which) => {
+              let mut fresh = Acceptor::new(
+                local,
+                Authority {
+                  generation: u64::try_from(at).unwrap(),
+                  owner: HostId(local.0 ^ 1),
+                },
+              )
+              .tracking_changes();
+              held_accept(&mut fresh, object(which), at, None);
+              state.holder_records.insert(object(which), fresh);
+            }
+            HeldStep::Delta => {
+              let changes = crate::content_holder::held_changes(state);
+              for piece in &changes.put {
+                proptest::prop_assert!(
+                  !changes.removed.contains(&piece.key),
+                  "step {at}: a key both put and removed"
+                );
+                model.insert(piece.key, piece.bytes.clone());
+              }
+              for key in &changes.removed {
+                model.remove(key);
+              }
+              crate::content_holder::held_committed(state, changes.whole, false);
+            }
+            HeldStep::Checkpoint => {
+              let image = crate::content_holder::held_image(state);
+              let whole = crate::content_holder::whole_of(&image);
+              model = image
+                .into_iter()
+                .map(|piece| (piece.key, piece.bytes))
+                .collect();
+              crate::content_holder::held_committed(state, whole, true);
+            }
+          }
+          if matches!(step, HeldStep::Delta | HeldStep::Checkpoint) {
+            let held: Model = crate::content_holder::held_image(state)
+              .into_iter()
+              .map(|piece| (piece.key, piece.bytes))
+              .collect();
+            proptest::prop_assert_eq!(&model, &held, "step {} ({:?}) of {:?}", at, step, steps);
+          }
+        }
+        Ok(())
+      });
+      outcome.err().map(|failure| format!("{failure}"))
+    });
+    assert_eq!(
+      failures, None,
+      "the folded held pieces equal what the shard holds"
+    );
+  }
+
+  /// What [`a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock`] saw after each step: the slice
+  /// learned, and whether dead memory was left (so the step walked a whole slice).
+  #[derive(Debug)]
+  struct Learned {
+    /// The shard's step quantum and page.
+    quantum: u64,
+    page: usize,
+    /// After each step: the slice learned, and whether dead memory was left.
+    steps: Vec<(usize, bool)>,
+  }
+
+  /// Takes one give-back step of `state`'s dead recovery memory, its CPU clock reading `started` before it and
+  /// `ended` after it: the slice then learned, and whether dead memory was left.
+  fn give_back_step_timed(
+    state: &mut crate::state::ShardState,
+    started: u64,
+    ended: u64,
+  ) -> (usize, bool) {
+    let mut readings = [Some(started), Some(ended)].into_iter();
+    let mut clock = || readings.next().flatten();
+    let (_, more) = super::return_dead_recovery_timed(state, &mut clock);
+    (state.give_back_rate.slice_bytes, more)
+  }
+
+  /// A-491 (A-226's slice; CLAUDE.md "Bounded work everywhere": a step is held to its shard's quantum of its own CPU).
+  /// Do: on a shard whose recovery memory is all dead (an image committed, the journal's record of what it gave back
+  /// forgotten, as after a restart), take give-back steps timed by a controlled CPU clock: one spending a quantum, one
+  /// half a quantum, then three timed as Windows' coarse thread clock times them, the first two showing no CPU and the
+  /// third a quantum. Expect each slice learned to be the bytes the steps walked per quantum of the CPU they spent: a
+  /// page, then two, then two still while the clock shows nothing, then the three steps' six pages, whatever wall time
+  /// the steps took. Before, a step was timed by the wall clock, so the slice followed the host's scheduling (here the
+  /// steps' real wall time, microseconds, not the quantum the clock says they spent).
+  #[test]
+  fn a_give_back_step_learns_its_slice_from_its_own_cpu_not_the_wall_clock() {
+    let seen = audit_on_shard(|state| {
+      let _ = crate::verbs::publish_shard(state);
+      state.journal.forget_what_was_given_back();
+      state.give_back_rate = super::GiveBackRate::default();
+      let quantum = slates_rt::futures::step_budget_ns()
+        .unwrap_or(state.config.runtime.step_budget_ns)
+        .max(2);
+      let page = usize::try_from(state.config.geometry.page)
+        .unwrap_or(1)
+        .max(1);
+      let half = quantum / 2;
+      let steps = vec![
+        give_back_step_timed(state, 0, quantum),
+        give_back_step_timed(state, quantum, quantum + half),
+        give_back_step_timed(state, 2 * quantum, 2 * quantum),
+        give_back_step_timed(state, 2 * quantum, 2 * quantum),
+        give_back_step_timed(state, 2 * quantum, 3 * quantum),
+      ];
+      Learned {
+        quantum,
+        page,
+        steps,
+      }
+    });
+    let per_quantum = |walked: usize, spent: u64| -> usize {
+      usize::try_from(
+        u128::try_from(walked).unwrap() * u128::from(seen.quantum) / u128::from(spent),
+      )
+      .unwrap()
+    };
+    let half = seen.quantum / 2;
+    let two = per_quantum(seen.page, half);
+    let expected = [seen.page, two, two, two, per_quantum(3 * two, seen.quantum)];
+    assert!(
+      seen.steps.iter().all(|(_, more)| *more),
+      "every step left dead memory, so each walked a whole slice: {seen:?}"
+    );
+    let learned: Vec<usize> = seen.steps.iter().map(|(slice, _)| *slice).collect();
+    assert_eq!(
+      learned, expected,
+      "each slice is the bytes walked per quantum of the CPU spent, steps a coarse clock shows none of folded into the \
+       next it shows: {seen:?}"
+    );
   }
 
   /// §4.8 "Promotion and takeover", the f + 1 rule: do make the audit node the leader-to-be of a three-voter `f = 1`
@@ -6556,11 +8363,28 @@ mod tests {
     object: slates_db::register::ObjectId,
     sequence: u64,
   ) -> (slates_db::HostId, slates_db::HostId) {
-    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
-    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, Quorum, Record};
     let local = state.fleet.host();
-    let departed = HostId(local.0 ^ 1);
-    let third = HostId(local.0 ^ 2);
+    retire_a_named_owner_of_a_held_record(
+      state,
+      object,
+      sequence,
+      (
+        slates_db::HostId(local.0 ^ 1),
+        slates_db::HostId(local.0 ^ 2),
+      ),
+    )
+  }
+
+  /// [`retire_the_owner_of_a_held_record`] with the other two members named: `departed`, the owner retired, and `third`.
+  fn retire_a_named_owner_of_a_held_record(
+    state: &mut crate::state::ShardState,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+    (departed, third): (slates_db::HostId, slates_db::HostId),
+  ) -> (slates_db::HostId, slates_db::HostId) {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, Quorum, Record};
+    let local = state.fleet.host();
     state.council = RegionalCouncil::new(
       local,
       vec![local, departed, third],
@@ -6681,6 +8505,62 @@ mod tests {
     assert!(
       HostPromise::decode(&lapsed).is_ok(),
       "once its answers can no longer feed the owner's lease, the holder promises"
+    );
+  }
+
+  /// A-351 (§4.8 "Leases and reads", AUD-08; the chaos nemesis's deafened owner, seed 6876545201569229162): a holder that
+  /// keeps answering a retired owner's probes still promises the owner's objects once its last answer under the owner's
+  /// membership is past the horizon. Do: learn a peer on contact; make it the owner of a record this node holds, this
+  /// node's last answer to it while it was a member past the horizon; retire it; answer its probe, announcing an older
+  /// configuration, as the probes of an owner deaf to every answer keep coming; then answer the successor's takeover
+  /// page. Expect: the probe answered with no standing, and the page promising the record. Before, every answer to the
+  /// retired owner closed the gate again, so a holder deferred every page for as long as the owner probed, and the
+  /// takeover gave the owner's objects up.
+  #[test]
+  fn a_holder_answering_a_retired_owners_probes_still_promises_its_objects() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let (answered, page) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let anchor = slates_db::HostId(local.0 ^ 0x40);
+      let owner = crate::deploy::member_id(anchor, 1);
+      crate::fleet::learn_member(state, anchor, 1, owner);
+      let object = ObjectId([31; 16]);
+      let (departed, successor) = retire_a_named_owner_of_a_held_record(
+        state,
+        object,
+        0,
+        (owner, slates_db::HostId(local.0 ^ 2)),
+      );
+      let now = slates_machine::clock::monotonic_ns();
+      state
+        .answers_given
+        .alive_answers
+        .insert(departed, now - crate::lease::horizon_ns() - 1);
+      let older = state.council.configuration().version.saturating_sub(1);
+      let answered = crate::member_task::answer_probe(state, departed, 1, older);
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      }
+      .encode();
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare);
+      (answered, page)
+    });
+    assert_eq!(
+      answered.map(|(_, standing)| standing),
+      Some(None),
+      "the retired owner is answered, with no standing"
+    );
+    let promise = HostPromise::decode(&page);
+    assert!(
+      promise
+        .as_ref()
+        .is_ok_and(|promise| promise.entries.len() == 1),
+      "the holder promises the retired owner's record: {promise:?}"
     );
   }
 
@@ -6922,6 +8802,100 @@ mod tests {
       "listed by the owner it moved from: {page:?}"
     );
     assert_eq!(counted, 1);
+  }
+
+  /// A-270 with A-251 (b), the moved case reaching the journal only in a delta: a copy whose authority moves after the
+  /// last checkpoint is restored from that checkpoint and the delta after it, the move with it. Do: retire the owner of
+  /// a record this node holds and publish a checkpoint of the held pieces before the move; run the authority reconcile
+  /// (the move); build the delta's held pieces (`held_changes`) and fold them over the checkpoint's as recovery does;
+  /// drop the acceptors, routing and lineage and restore them from the folded pieces; answer the successor's page.
+  /// Expect: no move at the checkpoint, the register's piece carried by the delta, the restored acceptor naming the
+  /// retired owner it moved from, and the page listing the copy. A move whose mark the tracked map missed would leave
+  /// the checkpoint's piece in place, and the restored copy would name no move and go unlisted.
+  #[test]
+  fn a_copy_moved_after_the_checkpoint_is_restored_from_its_delta_and_still_listed() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let object = ObjectId([47; 16]);
+    let (before_move, in_delta, restored_from, departed, page) = audit_on_shard(move |state| {
+      let local = state.fleet.host();
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let before_move = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.moved_from());
+      // The checkpoint, before the move.
+      let checkpoint = crate::content_holder::held_image(state);
+      crate::content_holder::held_committed(
+        state,
+        crate::content_holder::whole_of(&checkpoint),
+        true,
+      );
+      let mut journal: std::collections::BTreeMap<_, _> = checkpoint
+        .into_iter()
+        .map(|piece| (piece.key, piece.bytes))
+        .collect();
+      // The move, then the delta after it, folded as recovery folds it (`ShardImage::apply`: puts, then removals).
+      crate::fleet::reconcile_held_authority(state);
+      let changes = crate::content_holder::held_changes(state);
+      let in_delta = changes.put.len();
+      for piece in &changes.put {
+        journal.insert(piece.key, piece.bytes.clone());
+      }
+      for key in &changes.removed {
+        journal.remove(key);
+      }
+      crate::content_holder::held_committed(state, changes.whole, false);
+      let folded: Vec<slates_vfs::recover::HeldPiece> = journal
+        .into_iter()
+        .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes })
+        .collect();
+      state.holder_records.clear();
+      state.fleet.forget_object(object);
+      state.departed_owners.remove(&object);
+      let held = crate::content_holder::split_held(&folded).unwrap();
+      assert_eq!(
+        crate::content_holder::restore_held_registers(state, local, held),
+        1
+      );
+      let restored_from = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.moved_from());
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      };
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
+      (before_move, in_delta, restored_from, departed, page)
+    });
+    assert_eq!(
+      before_move, None,
+      "the checkpoint was taken before the move"
+    );
+    assert!(in_delta > 0, "the delta carried the moved register's piece");
+    assert_eq!(
+      restored_from,
+      Some(departed),
+      "the checkpoint and its delta kept the owner the copy moved from"
+    );
+    let page = HostPromise::decode(&page).expect("the page answers");
+    assert_eq!(
+      page
+        .entries
+        .iter()
+        .map(|(listed, _)| *listed)
+        .collect::<Vec<_>>(),
+      vec![object],
+      "the restored copy is listed: {page:?}"
+    );
   }
 
   /// A-251 (b), the moved case across a warm restart: the held image keeps the retired owner a copy's authority moved
@@ -7371,22 +9345,25 @@ mod tests {
   #[test]
   fn a_takeover_recovers_an_owner_settled_beside_one_host_from_that_host() {
     use slates_db::register::ObjectId;
-    let (successor, ready, lost) = audit_on_shard(|state| {
+    let (successor, ready, past) = audit_on_shard(|state| {
       let local = state.fleet.host();
       let object = ObjectId([29; 16]);
       let departed = retire_an_owner_settled_on_a_formation_neighbourhood(state, object);
       let successor = state.fleet.object_owner(object);
       assert!(crate::takeover::begin_round(state, departed, local).is_some());
       let ready = crate::takeover::ready_objects(state, departed, local);
-      let lost = state
+      let past = state
         .refusals
-        .get("fleet.takeover.lost")
+        .get("fleet.takeover.recovered_past_tolerance")
         .copied()
         .unwrap_or(0);
-      (successor == Some(local), ready, lost)
+      (successor == Some(local), ready, past)
     });
     assert!(successor, "the one survivor of the cohort is the successor");
-    assert_eq!(lost, 0, "a record its cohort's survivor holds is not lost");
+    assert_eq!(
+      past, 0,
+      "a cohort its survivor holds the quorum of is within tolerance, not recovered past it"
+    );
     assert_eq!(
       ready.len(),
       1,
@@ -7395,6 +9372,1194 @@ mod tests {
     assert!(
       ready.iter().all(|(_, adopted)| adopted.value == b"head"),
       "the survivor adopts the record it holds"
+    );
+  }
+
+  /// A-309 (A-272 (ii)), red before it: a takeover past its tolerance is recovered by the members that exist now, the
+  /// replacement holding the newest record among them, the store-destroyed takeover's shape. Do: in a three-member
+  /// `f = 1` region of the audit node A, an owner O and a member B, every neighbourhood the whole region, take B over and
+  /// admit a fresh member B', so O's neighbourhood becomes {O, A, B'} while its settled one stays {O, A, B} (O never
+  /// reports the new one placed); give the audit node a record of O's object; take O over and run the audit node's round,
+  /// then fold in B''s answer, a newer record. Expect O's retirement to keep {O, A, B'} as its current neighbourhood and A
+  /// and B' as its survivors, the audit node the object's successor, the object waiting until B' answers and then ready
+  /// past tolerance with B''s newer record, counted `fleet.takeover.recovered_past_tolerance`. Before, the settled cohort
+  /// {O, A, B} with A alone left was short of its quorum of two, the object was counted lost and never adopted, and
+  /// nobody served the volume (diag-live-durability-66's store-destroyed arm counted `fleet.takeover.lost` 6).
+  #[test]
+  fn a_takeover_past_its_tolerance_is_recovered_by_the_members_that_exist_now() {
+    let (survivors, current, successor, waiting, ready, past) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{
+        Accepted, Acceptor, Authority, FIRST_EPOCH, HostEpoch, HostId, HostPromise, ObjectId,
+        Quorum, Record,
+      };
+      let local = state.fleet.host();
+      let (owner, old_b, fresh_b) = (
+        HostId(local.0 ^ 1),
+        HostId(local.0 ^ 2),
+        HostId(local.0 ^ 3),
+      );
+      // Shape: the candidate floor at `f = 1`, so each neighbourhood is the whole three-member region.
+      let scatter = 3;
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local, owner, old_b],
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(old_b)));
+      assert!(state.council.propose(Reconfiguration::Admit {
+        host: fresh_b,
+        domain: None,
+      }));
+      install_council(state);
+      let object = ObjectId::new(owner, 1);
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(local, Authority { generation, owner });
+      acceptor
+        .accept(&Record {
+          owner,
+          object,
+          sequence: 1,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"older".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(object, acceptor);
+      state.fleet.track_object_owner(object, owner);
+      assert!(state.council.propose(Reconfiguration::TakeOver(owner)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let regional = state.council.configuration().clone();
+      let survivors = regional.survivors_of(owner);
+      let current = regional
+        .retired
+        .get(&owner)
+        .and_then(|retirement| retirement.current.as_ref())
+        .map(|current| {
+          let mut hosts = current.hosts.clone();
+          hosts.sort_unstable_by_key(|host| host.0);
+          hosts
+        });
+      let successor = regional.successor(owner, object);
+      let requests = crate::takeover::begin_round(state, owner, local).unwrap_or_default();
+      let waiting = crate::takeover::ready_objects(state, owner, local).is_empty();
+      let (epoch, round_generation) = requests
+        .iter()
+        .find(|(host, _)| *host == fresh_b)
+        .map(|(_, prepare)| (prepare.epoch, prepare.generation))
+        .expect("the round asks the fresh member");
+      let promise = HostPromise {
+        holder: fresh_b,
+        departed: owner,
+        epoch,
+        generation: round_generation,
+        entries: vec![(
+          object,
+          Accepted {
+            sequence: 2,
+            epoch: FIRST_EPOCH,
+            value: b"newer".to_vec(),
+          },
+        )],
+        next: None,
+        fenced: None::<HostEpoch>,
+        unpromised: 0,
+        nothing: Vec::new(),
+      };
+      crate::takeover::fold_answers(state, owner, vec![(fresh_b, promise, false)]);
+      let ready = crate::takeover::ready_objects(state, owner, local);
+      let past = state
+        .refusals
+        .get("fleet.takeover.recovered_past_tolerance")
+        .copied()
+        .unwrap_or(0);
+      let mut expected = vec![local, fresh_b];
+      expected.sort_unstable_by_key(|host| host.0);
+      let mut region = vec![owner, local, fresh_b];
+      region.sort_unstable_by_key(|host| host.0);
+      (
+        survivors == expected,
+        current == Some(region),
+        successor == Some(local),
+        waiting,
+        ready,
+        past,
+      )
+    });
+    assert!(
+      survivors,
+      "the audit node and the fresh member survive the owner"
+    );
+    assert!(
+      current,
+      "the owner's current neighbourhood is kept: its joint writes reached the fresh member"
+    );
+    assert!(
+      successor,
+      "the audit node, the settled cohort's one survivor, is the successor"
+    );
+    assert!(
+      waiting,
+      "past tolerance the object waits for every surviving holder"
+    );
+    assert_eq!(ready.len(), 1, "ready once the fresh member answered");
+    assert!(
+      ready
+        .iter()
+        .all(|(_, adopted)| adopted.sequence == 2 && adopted.value == b"newer"),
+      "the newest record a surviving holder has"
+    );
+    assert_eq!(past, 1, "counted as recovered past tolerance");
+  }
+
+  /// A-309's sibling, red before it: a holder outside the successor's placement lets its stale copy go when the
+  /// takeover completes, though the last confirmation dropped the retirement in the version that recorded it. Do: make
+  /// the audit node a holder, in a seven-member `f = 1` region whose every neighbourhood is the whole region, of a second
+  /// member's object whose successor places it elsewhere; take that member over and install; then have every survivor
+  /// confirm, and install again. Expect the copy moved to the successor at the first install and reclaimed at the
+  /// second. Before, the holder judged staleness by the kept retirement alone, which the last confirmation had already
+  /// dropped, so the copy, its content and its lease-gate record stayed for good.
+  #[test]
+  fn a_holder_outside_the_successors_placement_lets_its_copy_go_when_the_takeover_completes() {
+    let (moved, reclaimed, held) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{
+        Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record,
+      };
+      let local = state.fleet.host();
+      let departed = HostId(local.0 ^ 1);
+      let others: Vec<HostId> = (2..7).map(|key| HostId(local.0 ^ key)).collect();
+      // Shape: a neighbourhood of every member, so every member survives the departed one and is asked in its round,
+      // and the successor's placement is a copyset of three among the six left.
+      let scatter = 7;
+      let mut members = vec![local, departed];
+      members.extend(others);
+      // The audit node the council's sole voter, so each proposal commits as it is made.
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let mut retired = state.council.configuration().clone();
+      retired.take_over(departed, scatter).unwrap();
+      // An object whose successor is another member that places it where the audit node is not (both of its cohorts
+      // while its change of neighbourhood is in flight).
+      let object = (0..1024u64)
+        .map(|index| ObjectId::new(departed, index))
+        .find(|object| {
+          retired
+            .successor(departed, *object)
+            .is_some_and(|successor| {
+              successor != local
+                && retired
+                  .configuration_for(successor)
+                  .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
+            })
+        })
+        .expect(
+          "some object of the departed member is placed by its successor away from this holder",
+        );
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: departed,
+        },
+      );
+      acceptor
+        .accept(&Record {
+          owner: departed,
+          object,
+          sequence: 0,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"head".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(object, acceptor);
+      state.fleet.track_object_owner(object, departed);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let successor = state.council.configuration().successor(departed, object);
+      let moved = successor.is_some() && state.fleet.object_owner(object) == successor;
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state
+          .council
+          .configuration()
+          .completed
+          .contains_key(&departed),
+        "the takeover completed"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let reclaimed = state
+        .refusals
+        .get("fleet.takeover.reclaimed")
+        .copied()
+        .unwrap_or(0);
+      (moved, reclaimed, state.holder_records.contains_key(&object))
+    });
+    assert!(moved, "the copy moves to its successor at the takeover");
+    assert_eq!(reclaimed, 1, "and is reclaimed once the takeover completes");
+    assert!(!held, "the stale copy is gone");
+  }
+
+  /// The content hazard's fixture (A-335; docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-
+  /// fetched.md): in a seven-member `f = 1` region whose every neighbourhood is the whole region, the audit node the
+  /// council's sole voter, the audit node holds a second member's volume head naming the member and itself as the
+  /// content's holders (`f + 1` of them, as a seal places it), and that content whole; the volume's successor in the
+  /// member's takeover is a third member that places it away from the audit node and holds none of the content. Returns
+  /// the member, the volume and the content's manifest identity.
+  fn hold_a_head_naming_this_holder(
+    state: &mut crate::state::ShardState,
+  ) -> (
+    slates_db::register::HostId,
+    slates_db::register::ObjectId,
+    [u8; 32],
+  ) {
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record};
+    let local = state.fleet.host();
+    let departed = HostId(local.0 ^ 1);
+    let mut members = vec![local, departed];
+    members.extend((2..7).map(|key| HostId(local.0 ^ key)));
+    // Shape: a neighbourhood of every member, so the audit node survives the departed one and is asked in its round.
+    let scatter = 7;
+    state.council = RegionalCouncil::new(
+      local,
+      members,
+      vec![local],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    install_council(state);
+    let mut retired = state.council.configuration().clone();
+    retired.take_over(departed, scatter).unwrap();
+    let volume = (0..1024u64)
+      .map(|index| ObjectId::new(departed, index))
+      .find(|object| {
+        retired
+          .successor(departed, *object)
+          .is_some_and(|successor| {
+            successor != local
+              && retired
+                .configuration_for(successor)
+                .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
+          })
+      })
+      .expect(
+        "some volume of the departed member is placed by its successor away from this holder",
+      );
+    let archive =
+      crate::merge_service::MergeShardState::inputs_archive(b"the volume's sealed bytes", 0, 4096);
+    let manifest = archive.manifest_identity();
+    let head = crate::head::HeadValue {
+      manifest: Some(manifest),
+      content_holders: vec![departed.0, local.0],
+      sealing: None,
+    };
+    let generation = state.fleet.configuration().version;
+    let mut acceptor = Acceptor::new(
+      local,
+      Authority {
+        generation,
+        owner: departed,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: departed,
+        object: volume,
+        sequence: 0,
+        epoch: FIRST_EPOCH,
+        generation,
+        value: head.to_record_bytes(),
+      })
+      .unwrap();
+    state.holder_records.insert(volume, acceptor);
+    state.fleet.track_object_owner(volume, departed);
+    state
+      .held_content
+      .hold(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        volume,
+        slates_cluster::content::Placed { sequence: 0 },
+        archive,
+      )
+      .expect("the audit shard holds the volume's content");
+    (departed, volume, manifest)
+  }
+
+  /// A-335, red before it (the bug record named in [`hold_a_head_naming_this_holder`]), and A-538's uncertified case: a
+  /// holder outside the successor's placement keeps the copy whose content its head names it for, when the successor
+  /// confirms and when the takeover completes, where the takeover is uncertified (read from a configuration an older
+  /// build wrote, layout 5, whose successors confirmed before placing the content again). Do: hold such a head and its
+  /// content (the fixture); take the departed member over and install; have the volume's successor alone confirm its
+  /// share, read the takeover as uncertified, and install; then every other survivor, so the takeover completes, read
+  /// it as uncertified again, and install again. Expect the head and the content held after both installs, each counted
+  /// `fleet.takeover.kept_holding_content`, and nothing reclaimed. Red with an uncertified takeover's content let go. A successor confirms once it adopted the head
+  /// register, before its materialization has fetched the content, and it fetches from the head's holders alone
+  /// (`fleet::fetch_into_hold`): before, this holder let the head and the content go at the confirmation, so with the
+  /// dead owner the head's only other holder the successor could fetch from nobody, and one failure lost the volume.
+  #[test]
+  fn a_holder_outside_the_successors_placement_keeps_the_content_its_head_names() {
+    let (after_one, after_all, kept, reclaimed) = audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let (departed, volume, manifest) = hold_a_head_naming_this_holder(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let successor = state
+        .council
+        .configuration()
+        .successor(departed, volume)
+        .expect("the volume ranks a survivor");
+      assert_eq!(
+        state.fleet.object_owner(volume),
+        Some(successor),
+        "the copy moves to its successor at the takeover"
+      );
+      let holds = |state: &crate::state::ShardState| {
+        state.holder_records.contains_key(&volume)
+          && state.held_content.holds_manifest(volume, &manifest)
+      };
+      assert!(state.council.propose(Reconfiguration::Confirm {
+        departed,
+        successor,
+      }));
+      adopt_uncertified(state, departed);
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let after_one = holds(state);
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state
+          .council
+          .configuration()
+          .completed
+          .contains_key(&departed),
+        "the takeover completed"
+      );
+      adopt_uncertified(state, departed);
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        after_one,
+        holds(state),
+        count("fleet.takeover.kept_holding_content"),
+        count("fleet.takeover.reclaimed"),
+      )
+    });
+    assert!(
+      after_one,
+      "an uncertified confirmation leaves the content its head names, which the successor may still fetch"
+    );
+    assert!(after_all, "and so does the completed takeover");
+    assert_eq!(kept, 2, "each install counts the copy kept for its content");
+    assert_eq!(reclaimed, 0, "nothing is reclaimed");
+  }
+
+  /// Gives the audit shard's council a learned view of its configuration in which `departed`'s takeover is
+  /// uncertified, as a configuration an older build wrote (regional layout 5) is read (A-538). The next proposal's fold
+  /// discards it, so a test adopts it again after each.
+  fn adopt_uncertified(
+    state: &mut crate::state::ShardState,
+    departed: slates_db::register::HostId,
+  ) {
+    let mut view = state.council.configuration().clone();
+    if let Some(retirement) = view.retired.get_mut(&departed) {
+      retirement.certified = false;
+    }
+    if let Some(record) = view.completed.get_mut(&departed) {
+      record.certified = false;
+    }
+    view.version = view.version.checked_add(1).unwrap();
+    assert!(state.council.adopt(view), "the uncertified view is newer");
+  }
+
+  /// A-538, red before it: a holder outside the successor's placement lets a stale copy's content go once the
+  /// successor's confirmation certifies its content (it confirms only once it serves the volume from its own placement,
+  /// A-529). Do: hold a head naming this holder and its content (the fixture of
+  /// [`a_holder_outside_the_successors_placement_keeps_the_content_its_head_names`]); take the departed member over and
+  /// install; have the volume's successor confirm its share and install. Expect the head and the content gone at that
+  /// install, counted `fleet.takeover.released_certified` once and `fleet.takeover.reclaimed` once, and nothing kept
+  /// for its content. Before, the holder kept both for good (A-335), since a confirmation said nothing of content.
+  #[test]
+  fn a_holder_outside_the_successors_placement_lets_the_content_go_on_a_certified_confirmation() {
+    let (held, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let (departed, volume, manifest) = hold_a_head_naming_this_holder(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let successor = state
+        .council
+        .configuration()
+        .successor(departed, volume)
+        .expect("the volume ranks a survivor");
+      assert!(state.council.propose(Reconfiguration::Confirm {
+        departed,
+        successor,
+      }));
+      assert!(
+        state.council.configuration().certifies_content(departed),
+        "this build's takeover certifies its content"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        state.holder_records.contains_key(&volume)
+          || state.held_content.holds_manifest(volume, &manifest),
+        [
+          count("fleet.takeover.released_certified"),
+          count("fleet.takeover.reclaimed"),
+          count("fleet.takeover.kept_holding_content"),
+        ],
+      )
+    });
+    assert!(!held, "the stale copy and its content are gone");
+    assert_eq!(
+      counts,
+      [1, 1, 0],
+      "released once, reclaimed once, never kept for its content"
+    );
+  }
+
+  /// A-335, red before it: a holder that installs a takeover only once it completed keeps the copy whose content its head
+  /// names it for. Do: hold such a head and its content (the fixture of
+  /// [`a_holder_outside_the_successors_placement_keeps_the_content_its_head_names`]); take the departed member over and
+  /// have every survivor confirm before the audit node installs anything, then install. Expect the head and the content
+  /// held, counted `fleet.takeover.kept_holding_content`. The copy's line ends at the takeover's completion record, which
+  /// names the audit node among the survivors that confirmed; before, that let the copy go whole, the content the
+  /// adopted head names with it.
+  #[test]
+  fn a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes() {
+    let (held, kept, reclaimed) = audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let (departed, volume, manifest) = hold_a_head_naming_this_holder(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state.council.configuration().settled_for(departed, local),
+        "the takeover completed with the audit node among those that confirmed"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        state.holder_records.contains_key(&volume)
+          && state.held_content.holds_manifest(volume, &manifest),
+        count("fleet.takeover.kept_holding_content"),
+        count("fleet.takeover.reclaimed"),
+      )
+    });
+    assert!(held, "the copy and the content its head names stay");
+    assert_eq!(kept, 1, "counted kept for its content");
+    assert_eq!(reclaimed, 0, "nothing is reclaimed");
+  }
+
+  /// A-341 (A-309's owed rule, its safe part) and A-484 (its owed piece, the completion record): a holder the takeover
+  /// never asked lets its copy go as a stale one goes when the copy's writer's takeover shows the object recovered within
+  /// tolerance, judged on its kept retirement or its completion record. Do: make the audit node hold copies of three
+  /// objects of a member although it is in none of that member's neighbourhoods (copies an earlier neighbourhood of the
+  /// member left there), in a six-member `f = 1` region whose neighbourhoods are three: a plain register and a head
+  /// naming this holder for content it holds, both falling to one successor, and a plain register falling to another,
+  /// each successor placing them away from the audit node. Take the member over and install; have the first successor
+  /// alone confirm and install; then every other survivor, so the takeover completes, give the audit node a fourth copy
+  /// of the member's (a lagging holder's, still routed to the member) and install again. Expect all three moved to their
+  /// successors at the first install; at the first confirmation the first register let go, and the head too, its content
+  /// released since this build's confirmation certifies the successor's content (A-538); on the completed takeover's
+  /// record the second register and the fourth copy let go. Counted `fleet.takeover.unasked_covered` four times,
+  /// `fleet.takeover.reclaimed` four times, `fleet.takeover.kept_holding_content` never and `fleet.takeover.kept_unasked`
+  /// never. Before A-341 every such copy
+  /// was kept for good (A-309), and before A-484 every copy first judged on the record, which kept no neighbourhood to
+  /// judge by; the lineage model (`crates/db/tests/lineage_model.rs`) found the history where one let go past tolerance
+  /// was the last copy of a record placed at `f + 1`.
+  #[test]
+  fn a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance() {
+    let (moved, after_one, after_all, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the departed member's and its four others', apart from the next one's.
+      let stride = 8;
+      let members_with = |departed: HostId, others: &[HostId]| {
+        let mut members = vec![local, departed];
+        members.extend(others.iter().copied());
+        members
+      };
+      // A member whose neighbourhood leaves the audit node out, two objects of it whose one successor places them
+      // elsewhere too, and a third whose other successor does: rendezvous decides all of them, so search a few regions,
+      // each with members of its own (with the other members fixed, whether a successor's neighbourhood holds the audit
+      // node is fixed by its random id alone).
+      let (departed, others, plain, named, other) = (0..64u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let departed = HostId(local.0 ^ (base + 1));
+          let others: Vec<HostId> = (2..6).map(|key| HostId(local.0 ^ (base + key))).collect();
+          let formed = RegionalConfiguration::formed(
+            members_with(departed, &others),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          if formed.neighbourhoods[&departed].hosts.contains(&local) {
+            return None;
+          }
+          let mut retired = formed.clone();
+          retired.take_over(departed, scatter)?;
+          let away: Vec<(ObjectId, HostId)> = (0..256u64)
+            .map(|index| ObjectId::new(departed, index))
+            .filter_map(|object| {
+              retired
+                .successor(departed, object)
+                .filter(|successor| {
+                  retired
+                    .configuration_for(*successor)
+                    .is_some_and(|placement| !placement.place(object).candidates.contains(&local))
+                })
+                .map(|successor| (object, successor))
+            })
+            .collect();
+          let (plain, first) = *away.first()?;
+          let (named, _) = *away
+            .iter()
+            .skip(1)
+            .find(|(_, successor)| *successor == first)?;
+          let (other, _) = *away.iter().find(|(_, successor)| *successor != first)?;
+          Some((departed, others.clone(), plain, named, other))
+        })
+        .expect(
+          "a member whose neighbourhood and two successors of its objects leave the audit node out",
+        );
+      state.council = RegionalCouncil::new(
+        local,
+        members_with(departed, &others),
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let generation = state.fleet.configuration().version;
+      let archive = crate::merge_service::MergeShardState::inputs_archive(
+        b"the volume's sealed bytes",
+        0,
+        4096,
+      );
+      let manifest = archive.manifest_identity();
+      let head = crate::head::HeadValue {
+        manifest: Some(manifest),
+        content_holders: vec![departed.0, local.0],
+        sealing: None,
+      };
+      for (object, value) in [
+        (plain, b"head".to_vec()),
+        (named, head.to_record_bytes()),
+        (other, b"head".to_vec()),
+      ] {
+        hold_written_copy(state, (departed, generation), object, value);
+      }
+      state
+        .held_content
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          named,
+          slates_cluster::content::Placed { sequence: 0 },
+          archive,
+        )
+        .expect("the audit shard holds the named head's content");
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let configuration = state.council.configuration().clone();
+      assert!(
+        !configuration.survivors_of(departed).contains(&local),
+        "the audit node is no survivor: the takeover's rounds never ask it"
+      );
+      assert!(
+        configuration.within_tolerance(departed, plain),
+        "one failure at f = 1: the objects' settled cohorts keep their recovery quorums"
+      );
+      let first = configuration
+        .successor(departed, plain)
+        .expect("the objects rank a survivor");
+      let moved = [plain, named, other].iter().all(|object| {
+        state.fleet.object_owner(*object) == configuration.successor(departed, *object)
+      });
+      assert!(state.council.propose(Reconfiguration::Confirm {
+        departed,
+        successor: first,
+      }));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let held = |state: &crate::state::ShardState| {
+        (
+          state.holder_records.contains_key(&plain),
+          state.holder_records.contains_key(&named)
+            && state.held_content.holds_manifest(named, &manifest),
+          state.holder_records.contains_key(&other),
+        )
+      };
+      let after_one = held(state);
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state
+          .council
+          .configuration()
+          .completed
+          .contains_key(&departed),
+        "the takeover completed"
+      );
+      // A copy this holder first judges on the record: a lagging holder's, still routed to the member that wrote it.
+      let late = ObjectId::new(departed, 256);
+      hold_written_copy(state, (departed, generation), late, b"head".to_vec());
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let after_all = (held(state), state.holder_records.contains_key(&late));
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let counts = [
+        count("fleet.takeover.unasked_covered"),
+        count("fleet.takeover.reclaimed"),
+        count("fleet.takeover.kept_holding_content"),
+        count("fleet.takeover.kept_unasked"),
+      ];
+      (moved, after_one, after_all, counts)
+    });
+    assert!(moved, "every copy moves to its successor at the takeover");
+    assert_eq!(
+      after_one,
+      (false, false, true),
+      "at the first confirmation the plain register and the named head go, its content released (A-538); the other waits"
+    );
+    assert_eq!(
+      after_all,
+      ((false, false, false), false),
+      "on the completed takeover's record the other register and the late copy go"
+    );
+    assert_eq!(
+      counts,
+      [4, 4, 0, 0],
+      "covered four times, reclaimed four times, never kept for content, never kept unasked"
+    );
+  }
+
+  /// Gives the audit shard a copy of `object` that `writer` wrote under configuration `generation`, routed to `writer`:
+  /// its acceptor serves `writer` and accepted the record `value` at sequence 0 (A-341, A-484).
+  fn hold_written_copy(
+    state: &mut crate::state::ShardState,
+    (writer, generation): (slates_db::register::HostId, u64),
+    object: slates_db::register::ObjectId,
+    value: Vec<u8>,
+  ) {
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, Record};
+    let local = state.fleet.host();
+    let mut acceptor = Acceptor::new(
+      local,
+      Authority {
+        generation,
+        owner: writer,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: writer,
+        object,
+        sequence: 0,
+        epoch: FIRST_EPOCH,
+        generation,
+        value,
+      })
+      .unwrap();
+    state.holder_records.insert(object, acceptor);
+    state.fleet.track_object_owner(object, writer);
+  }
+
+  /// A-484, red before it: a holder no round asked judges its copy by the first takeover since the copy was written, its
+  /// writer's, never by a later one in the object's line. Do: in an eight-member `f = 1` region whose neighbourhoods are
+  /// three, make the audit node hold a copy of an object a member wrote, though it is in none of the member's
+  /// neighbourhoods; take over another host of the object's cohort (its takeover completes) and then the member, so the
+  /// member's takeover is past tolerance for the object; have the object's successor, the cohort's one survivor, confirm
+  /// without it (nobody its round asked held it) and report its neighbourhood placed, and install; then take that
+  /// successor over, have its own successor confirm, and install. Expect the copy kept both times, counted
+  /// `fleet.takeover.kept_unasked` twice and `fleet.takeover.unasked_covered` never: no round learned the object, and this
+  /// copy may be its last. Before, the second install judged the copy by the successor's takeover, within tolerance for
+  /// the object, and let it go.
+  #[test]
+  fn a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover() {
+    let (kept, routed_to_later, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the eight members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the writer's and its six others', apart from the next one's.
+      let stride = 8;
+      // The history, dry-run on a configuration of each candidate region until one leaves the audit node out of every
+      // neighbourhood and placement that would ask it or reach it: rendezvous decides them from the random ids alone.
+      let (members, writer, first_gone, successor, later) = (0..256u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let members: Vec<HostId> = std::iter::once(local)
+            .chain((1..8).map(|key| HostId(local.0 ^ (base + key))))
+            .collect();
+          let writer = *members.get(1)?;
+          let object = ObjectId::new(writer, 0);
+          let mut dry = RegionalConfiguration::formed(
+            members.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          let cohort = dry.configuration_for(writer)?.place(object).candidates;
+          let others: Vec<HostId> = cohort
+            .iter()
+            .copied()
+            .filter(|host| *host != writer)
+            .collect();
+          let [first_gone, successor] = <[HostId; 2]>::try_from(others).ok()?;
+          let leaves_out = |dry: &RegionalConfiguration, owner: HostId| {
+            dry
+              .neighbourhoods
+              .get(&owner)
+              .is_some_and(|neighbourhood| !neighbourhood.hosts.contains(&local))
+              && dry
+                .configuration_for(owner)
+                .is_some_and(|placement| !placement.place(object).candidates.contains(&local))
+          };
+          if !leaves_out(&dry, writer) {
+            return None;
+          }
+          dry.take_over(first_gone, scatter)?;
+          for survivor in dry.survivors_of(first_gone) {
+            dry.confirm(first_gone, survivor);
+          }
+          if !leaves_out(&dry, writer) {
+            return None;
+          }
+          dry.take_over(writer, scatter)?;
+          if dry.successor(writer, object) != Some(successor)
+            || dry.survivors_of(writer).contains(&local)
+            || dry.within_tolerance(writer, object)
+          {
+            return None;
+          }
+          dry.confirm(writer, successor);
+          let generation = dry.neighbourhoods.get(&successor)?.generation;
+          dry.settle(successor, generation);
+          if !leaves_out(&dry, successor) {
+            return None;
+          }
+          dry.take_over(successor, scatter)?;
+          let later = dry.successor(successor, object)?;
+          (leaves_out(&dry, later)
+            && !dry.survivors_of(successor).contains(&local)
+            && dry.within_tolerance(successor, object))
+          .then_some((members, writer, first_gone, successor, later))
+        })
+        .expect(
+          "a region whose neighbourhoods and placements of the object leave the audit node out",
+        );
+      let object = ObjectId::new(writer, 0);
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let generation = state.fleet.configuration().version;
+      hold_written_copy(state, (writer, generation), object, b"head".to_vec());
+      let step = |state: &mut crate::state::ShardState, changes: Vec<Reconfiguration>| {
+        for change in changes {
+          state.council.propose(change);
+        }
+        install_council(state);
+        crate::takeover::resolve_held_objects(state, local);
+      };
+      step(state, vec![Reconfiguration::TakeOver(first_gone)]);
+      let confirmations: Vec<Reconfiguration> = state
+        .council
+        .configuration()
+        .survivors_of(first_gone)
+        .into_iter()
+        .map(|survivor| Reconfiguration::Confirm {
+          departed: first_gone,
+          successor: survivor,
+        })
+        .collect();
+      step(state, confirmations);
+      step(state, vec![Reconfiguration::TakeOver(writer)]);
+      let generation = state
+        .council
+        .configuration()
+        .neighbourhoods
+        .get(&successor)
+        .map(|neighbourhood| neighbourhood.generation)
+        .expect("the successor is a member");
+      step(
+        state,
+        vec![
+          Reconfiguration::Confirm {
+            departed: writer,
+            successor,
+          },
+          Reconfiguration::Settle {
+            owner: successor,
+            generation,
+          },
+        ],
+      );
+      let kept_first = state.holder_records.contains_key(&object);
+      step(state, vec![Reconfiguration::TakeOver(successor)]);
+      step(
+        state,
+        vec![Reconfiguration::Confirm {
+          departed: successor,
+          successor: later,
+        }],
+      );
+      assert!(
+        state
+          .council
+          .configuration()
+          .within_tolerance(successor, object),
+        "the later takeover is within tolerance for the object"
+      );
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        (kept_first, state.holder_records.contains_key(&object)),
+        state.fleet.object_owner(object) == Some(later),
+        [
+          count("fleet.takeover.kept_unasked"),
+          count("fleet.takeover.unasked_covered"),
+        ],
+      )
+    });
+    assert_eq!(
+      kept,
+      (true, true),
+      "the copy is kept through both takeovers"
+    );
+    assert!(
+      routed_to_later,
+      "the copy follows its line to the later successor"
+    );
+    assert_eq!(counts, [2, 0], "kept unasked twice, never covered");
+  }
+
+  /// A-508, red before it, and A-546's uncertified case: a holder a live owner's neighbourhood settled away from lets the
+  /// owner's copies go once the owner's settled cohort for each is whole and at least `f + 1` wide, and keeps whatever
+  /// content a head still names it for where the owner's settle is uncertified (read from a configuration an older build
+  /// wrote, layout 6 or before, whose owners settled before their content was placed within the neighbourhood). Each
+  /// install below reads the owner's settle as uncertified. Red with an uncertified settle's content let go. Do: in a six-member `f = 1` region whose neighbourhoods are three, make the audit node hold a plain register
+  /// and a head naming this holder for content it holds, both of a member's own writing, though it is in none of that
+  /// member's neighbourhoods, and install; then take over one of the member's neighbours, give the audit node a third
+  /// copy of the member's and install; then have the member settle its new neighbourhood and install. Expect the plain
+  /// register let go at the first install and the head kept for its content; the third copy kept while the member's
+  /// settled cohort lacks a member, and let go once the member settled; counted `fleet.settle.released` twice,
+  /// `fleet.settle.kept_outside` twice (the head and the third copy at the second install) and
+  /// `fleet.takeover.kept_holding_content` twice. Before, every such copy was kept for good.
+  #[test]
+  fn a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go() {
+    let (first, second, third, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the owner's and its four others', apart from the next one's.
+      let stride = 8;
+      // A member whose neighbourhoods leave the audit node out, before and after one of its neighbours is taken over:
+      // rendezvous decides them from the random ids alone, so search a few regions.
+      let (members, owner, neighbour) = (0..256u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let members: Vec<HostId> = std::iter::once(local)
+            .chain((1..6).map(|key| HostId(local.0 ^ (base + key))))
+            .collect();
+          let owner = *members.get(1)?;
+          let mut dry = RegionalConfiguration::formed(
+            members.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          if dry.holds_for(owner, local) {
+            return None;
+          }
+          let neighbour = dry
+            .neighbourhoods
+            .get(&owner)?
+            .hosts
+            .iter()
+            .copied()
+            .find(|host| *host != owner)?;
+          dry.take_over(neighbour, scatter)?;
+          (!dry.holds_for(owner, local)).then_some((members, owner, neighbour))
+        })
+        .expect("a member whose neighbourhoods leave the audit node out");
+      let (plain, named, third) = (
+        ObjectId::new(owner, 0),
+        ObjectId::new(owner, 1),
+        ObjectId::new(owner, 2),
+      );
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let generation = state.fleet.configuration().version;
+      let archive = crate::merge_service::MergeShardState::inputs_archive(
+        b"the volume's sealed bytes",
+        0,
+        4096,
+      );
+      let manifest = archive.manifest_identity();
+      let head = crate::head::HeadValue {
+        manifest: Some(manifest),
+        content_holders: vec![owner.0, local.0],
+        sealing: None,
+      };
+      hold_written_copy(state, (owner, generation), plain, b"head".to_vec());
+      hold_written_copy(state, (owner, generation), named, head.to_record_bytes());
+      state
+        .held_content
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          named,
+          slates_cluster::content::Placed { sequence: 0 },
+          archive,
+        )
+        .expect("the audit shard holds the named head's content");
+      adopt_settle_uncertified(state, owner);
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let held = |state: &crate::state::ShardState, object: ObjectId| {
+        state.holder_records.contains_key(&object)
+      };
+      let first = (held(state, plain), held(state, named));
+      assert!(state.council.propose(Reconfiguration::TakeOver(neighbour)));
+      let generation = state.fleet.configuration().version;
+      hold_written_copy(state, (owner, generation), third, b"head".to_vec());
+      adopt_settle_uncertified(state, owner);
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let second = held(state, third);
+      let settled_generation = state
+        .council
+        .configuration()
+        .neighbourhoods
+        .get(&owner)
+        .map(|neighbourhood| neighbourhood.generation)
+        .expect("the owner is a member");
+      assert!(state.council.propose(Reconfiguration::Settle {
+        owner,
+        generation: settled_generation,
+      }));
+      adopt_settle_uncertified(state, owner);
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let third_held = (
+        held(state, named) && state.held_content.holds_manifest(named, &manifest),
+        held(state, third),
+      );
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        first,
+        second,
+        third_held,
+        [
+          count("fleet.settle.released"),
+          count("fleet.settle.kept_outside"),
+          count("fleet.takeover.kept_holding_content"),
+        ],
+      )
+    });
+    assert_eq!(
+      first,
+      (false, true),
+      "the plain register goes at once, the head stays for its content"
+    );
+    assert!(
+      second,
+      "the third copy stays while the owner's settled cohort lacks a member"
+    );
+    assert_eq!(
+      third,
+      (true, false),
+      "once the owner settled, the head still stays for its content and the third copy goes"
+    );
+    assert_eq!(
+      counts,
+      [2, 2, 2],
+      "released twice, kept outside twice, kept for content twice"
+    );
+  }
+
+  /// Gives the audit shard's council a learned view of its configuration in which `owner`'s settle is uncertified, as a
+  /// configuration an older build wrote (regional layout 6 or before) is read (A-546). The next proposal's fold discards
+  /// it, so a test adopts it again after each.
+  fn adopt_settle_uncertified(
+    state: &mut crate::state::ShardState,
+    owner: slates_db::register::HostId,
+  ) {
+    let mut view = state.council.configuration().clone();
+    view.settle_certified.remove(&owner);
+    view.version = view.version.checked_add(1).unwrap();
+    assert!(state.council.adopt(view), "the uncertified view is newer");
+  }
+
+  /// A-546, red before it: a holder a live owner's neighbourhood settled away from lets go the content a head of the
+  /// owner's named it for, once the owner's settle certifies its content (an owner reports its neighbourhood placed only
+  /// once every volume it owns is served from within it). Do: in a six-member `f = 1` region make the audit node hold,
+  /// though it is in none of a member's neighbourhoods, a head of that member's naming this holder for content it holds,
+  /// and install. Expect the head and its content gone at that install, counted `fleet.settle.released_content` once and
+  /// `fleet.settle.released` once, and nothing kept for its content. Before, the holder kept both for good (A-508).
+  #[test]
+  fn a_holder_a_live_owners_certified_settle_left_out_lets_the_content_go() {
+    let (held, counts) = audit_on_shard(|state| {
+      use slates_cluster::config_group::RegionalCouncil;
+      use slates_db::register::{HostId, ObjectId, Quorum, RegionalConfiguration};
+      let local = state.fleet.host();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      // Shape: each candidate region's ids, the owner's and its four others', apart from the next one's.
+      let stride = 8;
+      let (members, owner) = (0..256u64)
+        .find_map(|region| {
+          let base = region * stride;
+          let members: Vec<HostId> = std::iter::once(local)
+            .chain((1..6).map(|key| HostId(local.0 ^ (base + key))))
+            .collect();
+          let owner = *members.get(1)?;
+          let formed = RegionalConfiguration::formed(
+            members.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          (!formed.holds_for(owner, local)).then_some((members, owner))
+        })
+        .expect("a member whose neighbourhoods leave the audit node out");
+      let named = ObjectId::new(owner, 1);
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      assert!(
+        state
+          .council
+          .configuration()
+          .settle_certifies_content(owner),
+        "this build's settle certifies the owner's content"
+      );
+      let generation = state.fleet.configuration().version;
+      let archive = crate::merge_service::MergeShardState::inputs_archive(
+        b"the volume's sealed bytes",
+        0,
+        4096,
+      );
+      let manifest = archive.manifest_identity();
+      let head = crate::head::HeadValue {
+        manifest: Some(manifest),
+        content_holders: vec![owner.0, local.0],
+        sealing: None,
+      };
+      hold_written_copy(state, (owner, generation), named, head.to_record_bytes());
+      state
+        .held_content
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          named,
+          slates_cluster::content::Placed { sequence: 0 },
+          archive,
+        )
+        .expect("the audit shard holds the head's content");
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        state.holder_records.contains_key(&named)
+          || state.held_content.holds_manifest(named, &manifest),
+        [
+          count("fleet.settle.released_content"),
+          count("fleet.settle.released"),
+          count("fleet.takeover.kept_holding_content"),
+        ],
+      )
+    });
+    assert!(!held, "the head and its content are gone");
+    assert_eq!(
+      counts,
+      [1, 1, 0],
+      "its content released once, the copy released once, never kept for its content"
     );
   }
 
@@ -7508,6 +10673,10 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
+        signature: None,
+        folded_below: 0,
+        checkpoint_floor: 0,
       };
       let record = Record {
         owner,

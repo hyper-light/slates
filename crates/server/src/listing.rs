@@ -178,15 +178,27 @@ fn work_paths(state: &ShardState, work: &crate::state::WorkState) -> Vec<(String
           symlinks.insert(to.clone());
         }
       }
+      // A replacing copy takes its destination's tree away before it lands (A-626): what the journal declared there
+      // goes. The copied tree's own entries are listed once the work model resolves copies (A-626 part 4, owed: GAPS).
+      VolumeOp::Copy { to, replace, .. } => {
+        if *replace {
+          let inside = |path: &String| {
+            path == to
+              || path
+                .strip_prefix(to.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+          };
+          dirs.retain(|path| !inside(path));
+          symlinks.retain(|path| !inside(path));
+        }
+      }
       _ => {}
     }
   }
   // Its files: the base's it did not change and its own (`crate::work_files`).
-  let files = work
-    .files
-    .sizes(crate::merge_service::work_base(state, work))
+  let files = crate::merge_service::with_work_base(state, work, |base| work.files.sizes(base))
     .into_iter()
-    .map(|(path, len)| (path.to_owned(), EntryKind::File, len));
+    .map(|(path, len)| (path, EntryKind::File, len));
   files
     .chain(dirs.into_iter().map(|path| (path, EntryKind::Dir, 0)))
     .chain(
@@ -205,7 +217,7 @@ fn green_entries(
   at: ReadAt,
 ) -> Result<Vec<DirEntry>, Refusal> {
   let engine = state.greens.get(&green).ok_or(Refusal::NotFound)?;
-  let version = crate::merge_service::green_version(state, engine, green, at)?;
+  let version = crate::merge_service::green_version(state, &engine, green, at)?;
   let base = engine.base_at(version);
   let paths = base
     .files
@@ -313,9 +325,6 @@ fn plain_page(
   };
   match listed {
     Ok(rows) => plain_page_of(rows, want, room),
-    Err(slates_vfs::error::VfsError::NotDirectory) => refused(Refusal::BadRequest {
-      reason: "the path is not a directory".to_owned(),
-    }),
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }
