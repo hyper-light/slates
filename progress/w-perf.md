@@ -195,3 +195,55 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   shard budget tracks only the volume arena. Asked main to rule: (i') layout range per slice, (i'') budget-grown +
   balancing, or (ii) windows as chunks of the volume ChunkStore lent per step (recommended). Waiting.
 - hg import re-run (A-732) r66 still running on Studio (or done: check logs hgimp2.out / evidence/hg-import-2.log).
+
+## A-727 (a2)(ii) -- LANDED 2026-11-20 479f950ed (merge d962caeb7 + second merge; merge-base confirmed)
+- Windows = chunks of state.store.content (ChunkWindows), lent per step by swap+guard (vcs_store::Lent, lent_state,
+  take_chunks/give_chunks for lfs). Unmade storage lent too; arena grows from pool on demand, budget extended at
+  hand-back; release outside a lend frees at next lend. Parked branch agents/w-perf-a727-a2s2 deleted (remote).
+- Fixed slates-vcs 3 red tests from my f3429bdcd (get() Here-only) -> bytes_of/len_of.
+- Merged tree: server lib 954/954 run (skip content_ranges a_sweep_completes: A-744 test spins a debug shard alone,
+  reported to main), vcs 100, hg 356, git 557.
+- PRELIMINARY (debug build, not a benchmark): swap pair lend_in+hand_back 153 ns; ChunkStore 560 bytes. Release figure
+  owed on the big Studio (adas-mac-studio.local-2) via kiln.
+- r66 (hg import) was a pre-A-740/pre-98bcb0002 build: NOT current. Main wants an interleaved A/B on the big Studio:
+  b1d001601 vs 5ad8dea09-or-later, wall time, peak RSS, record bytes; A-740 spin line names the task; whether spin
+  recurs after each restart or only on CLI retry -> w-hg (slates-work-09) and main.
+## NEXT
+1. vcs_store::tests::assert_made_again_whole holder mismatch after a plain git push (create, update main): live store
+   has extra holders vs rebuilt. Failing test first; make assert_made_again_whole usable in git_push tests.
+2. hg import A/B (above). 3. release swap cost on big Studio. 4. main: daemon_edge long-history fetch flaky (A-718
+   encode in long turns) -> slice encode under step budget or encode at intake. 5. (a3), w-balance review, S4 (c).
+- 78d5454a4 LANDED (holders made-again: live store compared settled; test t_a727_a_plain_push_then_its_update...).
+- hg import A/B: kiln r72 building release A=b1d001601 (src-A, tgt-A) and B=main de381e643 (src-B, tgt-B) on Studio
+  d1323898 (~/.cache/w-perf/bin/slates-{A,B}). Then ab.sh: A1 B1 A2 B2, wall, daemon peak RSS, status --json, spin
+  lines (A-740 task), restarts, timestamps to correlate spin vs restart vs CLI retry. Release swap probe in src-B.
+- w-balance record.rs v3 edit: not pushed yet (no branch touches record.rs).
+- main: the B run of the hg A/B is also the S5 import-half "before" (records full texts in A=b1d001601; B has
+  98bcb0002 delta+base). Record wall, peak RSS, record bytes per run, best of N with all N, in BENCHMARKS.md.
+  Record bytes: bench-only eprintln "w-perf-bench: hg import record N bytes" patched into both src trees after
+  writer.finish() in hg_import.rs (not committed). Driver: local ~/.cache/w-perf/studio/ab.sh -> Studio.
+- w-git run request A-722 part 3 (82ff3bc79, in B): push_load.py / git_scale.sh rerun on bin B after the A/B.
+- w-balance: agreed they write names_to_content/names_from_content; I call them in record v3 (A-727 b).
+- Local: build with CARGO_INCREMENTAL=0; delete debug/incremental at each landing.
+- r75 (Studio, bg): rebuild A/B with bench line, release swap probe (src-B, -> ~/.cache/w-perf/swap-probe-release.txt),
+  then ab.sh 3 rounds CAP 1800 (out ~/.cache/w-perf/ab/<ts>/results.tsv + per-run .log/.out/.peak).
+- main dropped the bisect (cause established, fixed 479f950ed). No compound rm over variable paths (kiln gate).
+- w-balance: rows codec on main slates_vcs::rows (0011a4606); their record.rs v3 branch lands right after my a3.
+- NOW (local, while r75 runs): A-727 a3 -- image table of ChunkWindows' chunks + recovery before records.
+- A-727 a3 LANDED 782eb711c (windows as held pieces kind 11; restore before volumes; release_unheld after replay;
+  test daemon::tests::t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image). Told w-balance + main.
+- Local target now ~/.cache/w-perf-local-target.noindex (old one wiped, 45 GB), CARGO_INCREMENTAL=0.
+- r75: release swap pair 38.83 ns (10M rounds), ChunkStore 560 B. A/B round 1: A-1 cap 1800 s, RSS 23,969,952 KiB,
+  record 10,049,541,313 B; B-1 record 4,657,833,574 B; both loop: record finished -> landing spins (import.rs:235
+  task) -> restart -> CLI retry re-imports. Reported to main + w-hg. Rounds 2-3 running; then BENCHMARKS.md entry.
+- NEXT: A-727 (b) record v3 is w-balance's branch (I review the call site); push_load/git_scale rerun on bin B for
+  w-git's A-722 p3 after the A/B; main's daemon_edge long-history flake (A-718 encode in long turns).
+- 8fac3f04f LANDED: fetch's encode wait bounded to LIVENESS_BUDGET_NS + encode_behind task (A-718 continued).
+  Long-history push edge test still flaky (push answer; reported to main, not taken).
+- w-balance: barrier driven by held_committed (3f4996b5f); v3 names each names window (count + 32 B/window),
+  lists not imaged; v3 waits for main's f+1 ruling. I review their record.rs call site.
+- w-hg cutting hg record (file deltas); will ping for rerun. hg A/B r75 rounds 2-3 running -> BENCHMARKS.md.
+- NEXT after A/B: push_load/git_scale rerun on bin B (w-git A-722 p3), BENCHMARKS entry (A/B + swap 38.83 ns).
+- r79 built C = de49b6bd4 (bin/slates-C, bench line in). r80 (bg): waits for r75's ab.sh, then VARIANTS=C ab2.sh 3
+  (CAP 1800) -> new ~/.cache/w-perf/ab/<ts>/results.tsv. Then BENCHMARKS.md: A x3, B x3, C x3 + swap 38.83 ns.
+- Waiting on main: S4 slice 2 cut (c1/c2/c3, skip A-716 1c by re-holding head paths at rebuild).
