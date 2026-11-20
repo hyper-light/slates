@@ -470,7 +470,7 @@ fn recovered(state: &mut ShardState, id: RepositoryId) {
   for record in &greens {
     drop(crate::verbs::rebuild_member(state, record));
   }
-  crate::vcs_store::rebuild(state, id);
+  crate::vcs_store::rebuild_whole(state, id);
 }
 
 /// The `states` repository imported in one call through the same adapter: what it found.

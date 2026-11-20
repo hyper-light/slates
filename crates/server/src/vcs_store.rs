@@ -168,6 +168,10 @@ pub(crate) struct VcsStores {
   charged: u64,
   /// The last generation a Mercurial store's index was given ([`HgStore::generation`]); counts up.
   generations: u64,
+  /// The Mercurial repositories whose stores are being made again from their records a step at a time ([`rebuild`],
+  /// A-732): not lent to a read, a push or a made changeset until they are whole; bounded by the partition's
+  /// repositories.
+  rebuilding: std::collections::BTreeSet<RepositoryId>,
   /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
   /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
   objects_charged: BTreeMap<RepositoryId, u64>,
@@ -430,6 +434,11 @@ impl VcsStores {
   /// Whether an import of repository `id` is under way ([`hg_import`], [`svn_import`]).
   pub(crate) fn importing(&self, id: RepositoryId) -> bool {
     self.imports.contains_key(&id) || self.svn_imports.contains_key(&id)
+  }
+
+  /// Whether repository `id`'s Mercurial store is being made again from its records (A-732), and so lent to nothing.
+  pub(crate) fn rebuilding(&self, id: RepositoryId) -> bool {
+    self.rebuilding.contains(&id)
   }
 
   /// Holds `answer` as the request repository `id`'s import's end answers (A-678): the answer it replaces.
@@ -1921,12 +1930,74 @@ pub(crate) async fn recover(
 /// Makes repository `id`'s store again from the log (module docs): what a commit whose entry was not made durable left
 /// ahead of the log is given back, and every record replayed, as a recovery replays them, in one step.
 pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
+  let mercurial = state
+    .db
+    .partition()
+    .repositories()
+    .repository(id)
+    .is_some_and(|record| record.tool == VcsTool::Mercurial);
+  if !mercurial {
+    rebuild_whole(state, id);
+    return;
+  }
+  // A Mercurial repository's records replayed whole in one step held a large repository's shard past the watchdog's
+  // window (A-732): its store made empty now, lent to nothing, and its records replayed a step a turn by a task.
+  free(state, id);
+  let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
+    return;
+  };
+  make(state, &record);
+  state.vcs_stores.rebuilding.insert(id);
+  let task = slates_rt::futures::spawn(replay_sliced(id)).and_then(slates_rt::futures::detach);
+  if task.is_err() {
+    // No task to run it: the store stays lent to nothing, and the next recovery makes it again a unit at a time.
+    state.count(REPLAY_REFUSED, 1);
+  }
+  state.count(REBUILT, 1);
+}
+
+/// [`rebuild`] in one step, every record replayed at once: the rebuild of a git or Subversion repository, and the tests'.
+pub(crate) fn rebuild_whole(state: &mut ShardState, id: RepositoryId) {
   free(state, id);
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
     return;
   };
   make_whole(state, &record);
   state.count(REBUILT, 1);
+}
+
+/// Repository `id`'s Mercurial records replayed into its store a step a turn, a yield between (A-732: [`rebuild`]'s
+/// task); then the store lent again, its index's generation moved, so a push forked from the store before is re-based.
+async fn replay_sliced(id: RepositoryId) {
+  let mut index = 0usize;
+  let mut replay = None;
+  loop {
+    let stepped = crate::state::with_state(|state| hg_record_step(state, id, index, replay.take()));
+    match stepped.flatten() {
+      Some(Ok(HgStep::Begun(begun) | HgStep::Stepped(Some(begun)))) => replay = Some(begun),
+      Some(Ok(HgStep::Stepped(None))) => {
+        let next = crate::state::with_state(|state| replayed(state, id, Ok(()))).unwrap_or(false);
+        if !next {
+          break;
+        }
+        index = index.saturating_add(1);
+      }
+      Some(Err(refused)) => {
+        crate::state::with_state(|state| {
+          let _ = replayed(state, id, Err(refused));
+        })
+        .unwrap_or_default();
+        break;
+      }
+      None => break,
+    }
+    slates_rt::futures::yield_now().await;
+  }
+  crate::state::with_state(|state| {
+    state.vcs_stores.rebuilding.remove(&id);
+    state.vcs_stores.index_changed(id);
+  })
+  .unwrap_or_default();
 }
 
 /// Makes `record`'s store from the log ([`make_from_log`]) and each member green's map and trees from its head, as the

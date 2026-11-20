@@ -1295,6 +1295,8 @@ pub(crate) async fn unbundle(
   (principal, heads, bundle): Pushing<'_>,
   room: &mut Admission,
 ) -> Option<PushOutcome> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::unbundle");
   let fronted = crate::state::with_state(|state| front(state, repository, (heads, bundle), room));
   let unbundle = match fronted.flatten()? {
     Ok(unbundle) => unbundle,
@@ -1345,6 +1347,8 @@ async fn record_sliced(
   forked: &mut Forked,
   room: u64,
 ) -> Option<Result<(), PushOutcome>> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::record");
   if forked.record.is_some() || forked.intaken.logs.is_empty() {
     return Some(Ok(()));
   }
@@ -1455,7 +1459,10 @@ fn begin_rebase(
   let Forked { fork, intaken, .. } = stale;
   // A refusal hands the fork back, boxed: an index is far larger than the rebase begun.
   let begun = vcs_store::within_budget(state, 0, |stores| {
-    let Some(generation) = stores.generation_of(repository) else {
+    let Some(generation) = stores
+      .generation_of(repository)
+      .filter(|_| !stores.rebuilding(repository))
+    else {
       return Err(Box::new((None, fork)));
     };
     let Some((content, store)) = stores.mercurial(repository) else {
@@ -1488,6 +1495,8 @@ async fn rebase_sliced(
   repository: RepositoryId,
   stale: Forked,
 ) -> Option<Result<Forked, PushOutcome>> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::rebase");
   let begun = crate::state::with_state(|state| begin_rebase(state, repository, stale));
   let mut rebasing = match begun.flatten()? {
     Ok(rebasing) => rebasing,
@@ -1644,6 +1653,9 @@ fn begin_intake<'g>(
   room: &mut Admission,
 ) -> Option<Result<Taking<'g>, Box<Refused>>> {
   vcs_store::within_budget(state, lend, |stores| {
+    if stores.rebuilding(repository) {
+      return None;
+    }
     let generation = stores.generation_of(repository)?;
     let (content, store) = stores.mercurial(repository)?;
     Some(match Intake::begin(part, &mut store.index, content, room) {
@@ -1663,6 +1675,8 @@ async fn take_sliced(
   lend: u64,
   room: &mut Admission,
 ) -> Option<Result<Forked, PushOutcome>> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::take");
   let begun = crate::state::with_state(|state| begin_intake(state, repository, part, lend, room));
   let mut taking = match begun.flatten()? {
     Ok(taking) => taking,

@@ -37,10 +37,13 @@ pub struct SpawnRequest {
   pub parent: Option<Encoded>,
   /// The receipt to answer at admission; none for a fire-and-forget submission.
   pub receipt: ReceiptSlot,
+  /// The task's label's index ([`crate::label`], A-740): where the request was made.
+  pub label: u32,
 }
 
 impl SpawnRequest {
-  /// A request whose admission nobody reads.
+  /// A request whose admission nobody reads, labelled with where it was made (A-740).
+  #[track_caller]
   pub fn new(
     future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     parent: Option<Encoded>,
@@ -49,10 +52,13 @@ impl SpawnRequest {
       future,
       parent,
       receipt: ReceiptSlot::none(),
+      label: crate::label::caller(),
     }
   }
 
-  /// A request whose admission the submitter reads: the request, and the receipt it answers.
+  /// A request whose admission the submitter reads: the request, and the receipt it answers. Labelled with where it
+  /// was made (A-740).
+  #[track_caller]
   pub fn with_receipt(
     future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     parent: Option<Encoded>,
@@ -63,6 +69,7 @@ impl SpawnRequest {
         future,
         parent,
         receipt: slot,
+        label: crate::label::caller(),
       },
       receipt,
     )
@@ -223,11 +230,13 @@ pub struct TaskSlot {
   pub long_steps: u32,
   /// The longest poll by the wall clock, in nanoseconds.
   pub longest_step_ns: u64,
+  /// Its label's index ([`crate::label`], A-740): where it was spawned, or the work it names itself now.
+  pub label: u32,
 }
 
 impl TaskSlot {
-  /// A fresh slot for `future` under `parent`.
-  pub fn new(future: BoxedFuture, parent: Option<u32>, joinable: bool) -> Self {
+  /// A fresh slot for `future` under `parent`, labelled `label` ([`crate::label`]).
+  pub fn new(future: BoxedFuture, parent: Option<u32>, joinable: bool, label: u32) -> Self {
     Self {
       state: State::Idle,
       future: Some(future),
@@ -243,6 +252,7 @@ impl TaskSlot {
       polls: 0,
       long_steps: 0,
       longest_step_ns: 0,
+      label,
     }
   }
 

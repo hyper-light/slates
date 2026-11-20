@@ -1848,6 +1848,16 @@ async fn serve_peer_records(
             crate::moves::serve_move_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          // A window homed by its identity (A-724 piece 6, `slates_cluster::homes`): kept on this node's home shard
+          // for it, apart from the content plane's holds, and answered once its image is published.
+          slates_cluster::homes::HOME_STREAM => {
+            crate::vcs_store::homes::serve_remote(
+              control,
+              &request,
+              crate::daemon::LIVENESS_BUDGET_NS,
+            )
+            .await
+          }
           stream if is_content_stream(stream) => {
             let reply = state::with_state(|s| {
               let peer_host = s

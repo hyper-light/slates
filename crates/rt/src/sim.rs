@@ -1089,13 +1089,15 @@ impl SimRuntime {
   }
 
   /// Spawns a detached task on a shard.
+  #[track_caller]
   pub fn spawn_on(
     &mut self,
     shard: ShardId,
     future: impl std::future::Future<Output = ()> + Send + 'static,
   ) -> Result<TaskId, RtError> {
+    let request = SpawnRequest::new(Box::pin(future), None);
     let ctx = self.context(shard)?;
-    ctx.spawn_request(SpawnRequest::new(Box::pin(future), None))
+    ctx.spawn_request(request)
   }
 
   /// Makes a shard's driver fail at its `nth` wait from now (1 = the very next one).
