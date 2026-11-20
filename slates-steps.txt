@@ -1,0 +1,5 @@
+volume list exit 0 after 1 s
+volume create exit 1
+slates: refused: ConsensusNotInitialized: this node has no consensus group yet. Create it once with `slates bootstrap root`, or, on a fleet node, wait for it to import the groups.
+
+ERROR: You cannot call a method on a null-valued expression.
