@@ -83,12 +83,19 @@ fn dump_of(state: &ShardState, name: &str) -> Option<Vec<u8>> {
   let handle = state.by_id.get(&id).copied()?;
   let slot = state.volumes.get(handle).ok()?;
   let root = slot.volume.root_inode(&state.store).ok()?;
-  let file = slot.volume.lookup_no(&state.store, root, DUMP_FILE).ok()?.inode;
+  let file = slot
+    .volume
+    .lookup_no(&state.store, root, DUMP_FILE)
+    .ok()?
+    .inode;
   let mut bytes = Vec::new();
   let mut buffer = vec![0u8; 1 << 16];
   loop {
     let offset = u64::try_from(bytes.len()).ok()?;
-    let read = slot.volume.read(&state.store, file, offset, &mut buffer).ok()?;
+    let read = slot
+      .volume
+      .read(&state.store, file, offset, &mut buffer)
+      .ok()?;
     if read == 0 {
       return Some(bytes);
     }
@@ -121,8 +128,9 @@ fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
   assert_eq!(asked, [held.clone(), held]);
   let began = Instant::now();
   let made = loop {
-    let made =
-      crate::daemon::observe_first(&daemon, |state| [dump_of(state, "whole"), dump_of(state, "part")]);
+    let made = crate::daemon::observe_first(&daemon, |state| {
+      [dump_of(state, "whole"), dump_of(state, "part")]
+    });
     if made.iter().all(Option::is_some) || began.elapsed() > TASK_WAIT {
       break made;
     }
@@ -164,7 +172,11 @@ fn file_of(state: &ShardState, job: &ExportJob) -> Option<Vec<u8>> {
 }
 
 /// A job exporting revisions `range` of `repository` in `format` into a volume named `name`, for the owner.
-fn job_of(repository: RepositoryId, (range, format): ((u64, u64), Format), name: &str) -> ExportJob {
+fn job_of(
+  repository: RepositoryId,
+  (range, format): ((u64, u64), Format),
+  name: &str,
+) -> ExportJob {
   let request = (ORIGIN, RequestId::from_word(1));
   ExportJob::new(
     (request, owner()),
@@ -235,10 +247,7 @@ fn git(state: &mut ShardState, name: &str) {
       green: None,
     },
   );
-  assert!(
-    matches!(reply, ReplyBody::GreenCreated { .. }),
-    "{reply:?}"
-  );
+  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
 }
 
 /// A-652 part 3 (refused by kind before anything is made). Do: ask for an export of a repository nobody made, of the
@@ -256,7 +265,10 @@ fn t_a652_an_export_is_refused_by_kind_before_anything_is_made() {
       reason: reason.to_owned(),
     };
     let cases = [
-      (ask(state, (&own, "none"), ((0, 1), false), "a"), Refusal::NotFound),
+      (
+        ask(state, (&own, "none"), ((0, 1), false), "a"),
+        Refusal::NotFound,
+      ),
       (
         ask(state, (&stranger(), "svn"), ((0, 1), false), "a"),
         crate::verbs::reply_refusal(crate::verbs::forbidden("export_dump")),
@@ -290,7 +302,10 @@ fn t_a652_an_export_is_refused_by_kind_before_anything_is_made() {
     let wanted = crate::verbs::refused(Refusal::AlreadyExists { existing });
     assert_eq!(held, (wanted, false));
     let unrecorded = ask(state, (&own, "svn"), ((0, 1), false), "fresh");
-    let outside = matches!(&unrecorded.0, ReplyBody::Refused { refusal: Refusal::Unsupported { .. } });
+    let outside = match &unrecorded.0 {
+      ReplyBody::Refused { refusal } => matches!(refusal, Refusal::Unsupported { .. }),
+      _ => false,
+    };
     assert!(outside && !unrecorded.1, "{unrecorded:?}");
   });
 }

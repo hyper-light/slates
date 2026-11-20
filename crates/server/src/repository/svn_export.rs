@@ -32,6 +32,7 @@ use slates_db::catalog::{
 use slates_ipc::protocol::{DUMP_FILE, NamePolicy, Refusal, ReplyBody, SizeClass};
 use slates_svn::dump::Format;
 use slates_svn::migration::{Exporter, Exporting, MigrationRefusal};
+use slates_vfs::clock::Clock;
 use slates_vfs::ids::InodeNo;
 use slates_wire::request::RequestId;
 
