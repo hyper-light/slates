@@ -2,10 +2,10 @@
 //! state in (`fixtures/state`), each imported from its store and viewed at its imported phase roots and bookmarks, held
 //! to what stock 7.2's `served` filter serves of them (`fixtures/state/make-served-fixtures.sh`): the changesets, why
 //! each other one is left out, and the answers `heads`, `branchmap` and `listkeys` give; and so `divergent`, a
-//! divergent bookmark as stock 7.2 makes one (A-690). A clone over the view, every
-//! text lent once and hashing to its node; texts longer than a window copied within the room. The model: 7.2's filter
-//! stated literally (whole ancestor sets for the phases, `_revealancestors` with its stack) on generated histories with
-//! phase roots of every phase, markers, prunes and bookmarks. And the refusals.
+//! divergent bookmark as stock 7.2 makes one (A-690), and `amended-root`, a draft root hidden by its amend (A-691). A
+//! clone over the view, every text lent once and hashing to its node; texts longer than a window copied within the
+//! room. The model: 7.2's filter stated literally (whole ancestor sets for the phases, `_revealancestors` with its
+//! stack) on generated histories with phase roots of every phase, markers, prunes and bookmarks. And the refusals.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -268,6 +268,29 @@ fn a_divergent_bookmark_is_served_as_7_2_serves_it() {
     listed("divergent-served-bookmarks.txt")
   );
   assert_eq!(view.census(), Census::default());
+}
+
+/// A-691 (golden): do serve `amended-root`, which stock 7.2 made with a draft root amended under evolution (the old
+/// changeset hidden by the marker, and both kept among the draft roots 7.2 stores) and another draft made secret
+/// afterwards, imported from its store and viewed at its imported phase roots. Expect what stock 7.2's `served` filter
+/// serves of it (`make-served-fixtures.sh`): the public root and the amended draft, the old draft left out as hidden
+/// and the secret one as secret, and `heads`, `branchmap` and `listkeys` of `bookmarks` and `phases` byte for byte,
+/// `phases` listing the hidden draft root beside the amended one, since 7.2's `listphases` reads the stored draft
+/// roots from the unfiltered changelog (`phases.py` 1049-1058).
+#[test]
+fn a_hidden_draft_root_is_listed_as_7_2_lists_it() {
+  let name = "amended-root";
+  let (imported, store) = imported(name);
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  check_served(name, &view, &imported, &store);
+  check_left_out(name, &view, &imported, &store);
+  check_answers(name, &view);
+  let census = Census {
+    hidden: 1,
+    secret: 1,
+    ..Census::default()
+  };
+  assert_eq!(view.census(), census);
 }
 
 /// The full texts of a group of a decoded changegroup, each held to its node.
@@ -604,19 +627,7 @@ fn ancestors(made: &[Made], rev: usize) -> BTreeSet<usize> {
 /// with `_revealancestors`' stack; secret, of phase secret or above. Each changeset's fate, and the census.
 fn model(made: &[Made]) -> (Vec<Fate>, Census) {
   let all = 0..made.len();
-  let phase: Vec<Phase> = all
-    .clone()
-    .map(|rev| {
-      let mine = ancestors(made, rev);
-      made
-        .iter()
-        .enumerate()
-        .filter(|(root, made)| made.root.is_some() && mine.contains(root))
-        .filter_map(|(_, made)| made.root)
-        .max()
-        .unwrap_or(Phase::Public)
-    })
-    .collect();
+  let phase = phases(made);
   let obsolete =
     |rev: usize| made[rev].marker.is_some() && matches!(phase[rev], Phase::Draft | Phase::Secret);
   let hideable: BTreeSet<usize> = all
@@ -660,6 +671,44 @@ fn model(made: &[Made]) -> (Vec<Fate>, Census) {
     dropped_roots: 0,
   };
   (fates, census)
+}
+
+/// Each changeset's phase as 7.2 computes it (`phases.py`): the highest of the roots it descends from, itself included.
+fn phases(made: &[Made]) -> Vec<Phase> {
+  (0..made.len())
+    .map(|rev| {
+      let mine = ancestors(made, rev);
+      made
+        .iter()
+        .enumerate()
+        .filter(|(root, made)| made.root.is_some() && mine.contains(root))
+        .filter_map(|(_, made)| made.root)
+        .max()
+        .unwrap_or(Phase::Public)
+    })
+    .collect()
+}
+
+/// 7.2's `listphases` over a generated history, stated literally (`phases.py` 1049-1058): the node of each changeset
+/// holding a draft root whose phase is at most draft, whether the filter serves it or not, sorted (A-691).
+fn listed_draft_roots(made: &[Made], nodes: &[Node]) -> Vec<Node> {
+  let phase = phases(made);
+  let mut roots: Vec<Node> = made
+    .iter()
+    .zip(nodes)
+    .enumerate()
+    .filter(|(rev, (made, _))| made.root == Some(Phase::Draft) && phase[*rev] <= Phase::Draft)
+    .map(|(_, (_, node))| *node)
+    .collect();
+  roots.sort_unstable();
+  roots
+}
+
+/// The draft roots the view lists, sorted.
+fn draft_roots_of(view: &Indexed<'_>) -> Vec<Node> {
+  let mut roots: Vec<Node> = view.draft_roots().collect();
+  roots.sort_unstable();
+  roots
 }
 
 /// The view's fate of each changeset of `built`, by changelog revision, each served one checked to be numbered
@@ -739,7 +788,8 @@ proptest! {
   /// A-680 part 1 (model): do view generated histories (merges, phase roots of every phase, prunes and rewrites,
   /// bookmarks, and now and then a root, a prune and a bookmark of a node the history never held). Expect each
   /// changeset's fate as 7.2's filter stated literally gives it, served ones numbered densely in order with their
-  /// parents renumbered, the census equal (the stranger's root dropped), and the publishing flag passed through.
+  /// parents renumbered, the census equal (the stranger's root dropped), the publishing flag passed through, and the
+  /// draft roots listed as 7.2's `listphases` stated literally lists them, hidden ones among them (A-691).
   #[test]
   fn the_view_serves_what_7_2s_served_filter_serves(
     choices in choices(),
@@ -754,6 +804,7 @@ proptest! {
     prop_assert_eq!(fates(&view, &built), expected);
     prop_assert_eq!(view.census(), census);
     prop_assert_eq!(view.publishing(), publishing);
+    prop_assert_eq!(draft_roots_of(&view), listed_draft_roots(&made, &built.nodes));
     let dense: BTreeMap<Node, Rev> =
       (0..view.count()).filter_map(|rev| Some((view.node(rev)?, rev))).collect();
     for (made, node) in made.iter().zip(&built.nodes) {
@@ -762,6 +813,30 @@ proptest! {
       prop_assert_eq!(view.parents(served), renumbered);
     }
   }
+}
+
+/// A-691 (7.2's `listphases`): do view a public root with two draft roots on it, the first rewritten as the second (a
+/// marker hides it); then a public root, a secret root on it and a draft root on that. Expect the hidden draft root
+/// listed beside the served one, though the view leaves it out; and the draft root under the secret one not listed,
+/// its phase being secret.
+#[test]
+fn a_hidden_draft_root_is_listed_and_one_under_a_secret_root_is_not() {
+  let rewritten = three(
+    on(0, Some(Phase::Draft), Some(Obsoleted::By(2)), false),
+    on(0, Some(Phase::Draft), None, false),
+  );
+  let built = build(&rewritten, false);
+  let view = view_of(&built, false);
+  assert_eq!(view.left_out(&built.nodes[1]), Some(LeftOut::Hidden));
+  let mut both = vec![built.nodes[1], built.nodes[2]];
+  both.sort_unstable();
+  assert_eq!(draft_roots_of(&view), both);
+  let under = three(
+    on(0, Some(Phase::Secret), None, false),
+    on(1, Some(Phase::Draft), None, false),
+  );
+  let built = build(&under, false);
+  assert_eq!(draft_roots_of(&view_of(&built, false)), Vec::<Node>::new());
 }
 
 /// A history of three: a public root, a draft on it, and a changeset on that draft, each as asked.

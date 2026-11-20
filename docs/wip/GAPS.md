@@ -348,7 +348,8 @@
 > the window given back as input is consumed (`cargo test -p slates-server --lib vcs_`, 92 of 92; slates-ssh 111 of
 > 111; as it landed over main 71a43cd97, `--lib vcs_ssh` 19 of 19, macOS arm64, Mac Studio). Owed: the daemon
 > starting the edge, the stores and entry points, four of five red-checks (main's runs under §8), and main's live
-> OpenSSH `git clone` over SSH (the credentials record behind the key lookup, closed by A-651 part 3).
+> OpenSSH `git clone` over SSH (the credentials record behind the key lookup, closed by A-651 part 3; the daemon's
+> start, by A-684).
 > **A-651 part 2 (2026-11-19, g294; git's upload-pack behind the SSH edge):** `vcs_ssh::git` drives A-640's entry
 > point over an SSH session, the store lent a step at a time by the HTTP edge's `StoreLender`: each request measured
 > whole, a flush ending the session 0, a refused request and the end of input inside a request ending it with git's
@@ -370,7 +371,7 @@
 > Owed: the daemon starting the edge (A-684; its stores are A-682's lender), main's live OpenSSH `git clone` with an
 > enrolled key; the site finds
 > a repository on its own shard's partition alone, where the HTTP edge locates one held elsewhere and moves the
-> connection there (main's finding, closed by A-651 part 4).
+> connection there (main's finding, closed by A-651 part 4). The daemon's start: closed by A-684.
 > **A-651 part 4 (2026-11-19, g294; the SSH edge serves a repository from its owner shard):** an `exec` that names a
 > repository another shard's partition holds (`SshSite::locate`, by its name's route, D-14) moves its connection there
 > whole, as the HTTP edge moves one: the socket's handle, the session with its keys, sequence numbers and channel, the
@@ -379,9 +380,9 @@
 > the `exec` is dispatched where the repository's record, policy and store live; each shard keeps its own edge state
 > (`vcs_ssh::keep_here`), only the listener's holding the host key (macOS arm64, Mac Studio: red at aa16b067,
 > `--lib -- vcs_ssh` 28 of 30, the two new tests failing; green 30 of 30, and 30 of 30 as it landed over main
-> 693bc8fe, fmt clean). Owed: the daemon keeping an SSH edge state on every shard as it starts the edge (A-684);
-> Subversion's tunnel moved to the shard of the repository its greeting names (A-688); a test of an arrival waiting
-> for a full shard's seat and of one refused past the bound; main's runs.
+> 693bc8fe, fmt clean). Owed: the daemon keeping an SSH edge state on every shard as it starts the edge (A-684, closed
+> by it); Subversion's tunnel moved to the shard of the repository its greeting names (A-688); a test of an arrival
+> waiting for a full shard's seat and of one refused past the bound; main's runs.
 > **A-688 (2026-11-19, g229; svn+ssh over slates' own SSH server, §4.17.4 piece 12):** `vcs_ssh::svn` serves the SSH
 > site's `svnserve -t` (`SvnServices` beside the other services): A-656's ra_svn connection over the channel, the
 > client's URL found as `find_repos` finds it (E125001, E125002, E210005), A-597's policy asked (E170001), the tunnel's
@@ -394,10 +395,27 @@
 > directory's entries from the green, the repository's `svnserve.conf` facts; the DAV site's own `SvnStores`, A-681,
 > waits for the same lender), without which the daemon's site cannot start the tunnel; the accepted work handed to A-655
 > part 2b's owner step (`repository::svn_commit::commit`); the tunnel moved to the shard of the repository its URL names
-> (A-651 part 4 moves a connection for a named repository); the daemon's edge (A-684); a configured hook run, not
+> (A-651 part 4 moves a connection for a named repository); the daemon's edge (A-684, built); a configured hook run, not
 > refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve`
 > exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a
 > daemon.
+> **A-684 (2026-11-19, g299; the daemon starts the SSH edge):** `slates anchor|daemon --vcs-ssh ADDRESS` (and
+> `StartSpec::vcs_ssh`, contract 56) starts A-651's edge at any IPv4 address: its listener on the control shard, an edge
+> state on every shard so a connection moves to its repository's owner (A-651 part 4), its site proving keys by the
+> credential record, git's upload-pack served from each repository's store (A-682's `ShardStores`) and Mercurial's
+> `serve --stdio` from its served view (`ServedViews`, A-679); receive-pack (A-683) and Subversion's tunnel (A-688's
+> `SvnServices`, which awaits a lender of its stores) refused as not served. Its host key: a fleet
+> node's own Ed25519 key from its plan (a node whose key is of another algorithm starts no edge, logged); else an
+> Ed25519 key the anchor makes at its start and keeps in the segment's supervision block (`SUP_SSH_HOST_SEED`, declared
+> in the segment's layout) beside the listener it holds (`ENV_VCS_SSH`), so a daemon restart keeps the port and the
+> key; a lone daemon makes its own. The daemon's log names the address and the key's SHA256 fingerprint before it
+> serves. macOS arm64 (Mac Studio): red first (kiln r302, each new test failing for its own reason; the seed's
+> undeclared layout word found there and declared), green on the tree as it lands over main 2c3fa2bcc (r445): anchor 4
+> of 4, `vcs_ssh::daemon_edge` and `vcs_http::daemon_edge` 11 of 11, api 10 of 10, the grammar 15 of 15, `--test cli
+> vcs_` 5 of 5 (the SSH edge's port and key the same across a daemon restart), fmt clean. Owed: the other services wired
+> into the daemon's site (A-683; A-688's tunnel, once its stores' lender lands); a daemon-level test of upload-pack and `serve --stdio` for an enrolled key
+> over the SSH edge; ECDSA and RSA host keys for fleet nodes whose identity is not Ed25519;
+> Windows' held listener (`docs/wip/platforms.md`, gap 2); main's live OpenSSH interop.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
@@ -1180,9 +1198,9 @@
 > last wait: the daemon's edge served git's site alone until A-680 part 2a (hg met `404`), and the site's `401`
 > offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
 > first challenge alone), until A-686 put Basic's challenge first and took Basic with the token as password on the
-> loopback edge. The HTTP round trip waits on the hg site's pushes (A-680 part 2b, g303); the SSH one on `--vcs-ssh
-> <addr>` (A-684, g299), over the same lender, which the edge's `serve --stdio` (A-679, built) reads as the HTTP site
-> does (A-680).
+> loopback edge. The HTTP round trip waits on the hg site's pushes (A-680 part 2b, g303); the SSH one on the pushes
+> over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
+> (A-679, built) reads as the HTTP site does (A-680).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
@@ -1202,9 +1220,9 @@
 > 5206419be as it landed, kiln r438, 44 of 44 with A-651 parts 3 and 4's tests): the probe stock `hg serve --stdio` 7.2
 > answered, after 7.2's handshake, byte for byte at every cut and over the real edge with a scripted SSH client. The
 > other platforms, and main's live `hg clone` over SSH once the daemon starts the edge with that lender (A-684), owed.
-> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the daemon starting the SSH edge (A-684,
-> g299) with the lender the HTTP site reads A-662's stores by (`vcs_store::hg_view::ServedViews`, built, A-680 part 2a),
-> which the edge's `serve --stdio` reads (A-679, built); the learned
+> Owed, in order, after §4.17.1's seven pieces: (4, rest) read serving: the daemon starting the SSH edge with the
+> lender the HTTP site reads A-662's stores by (`vcs_store::hg_view::ServedViews`, built, A-680 part 2a), which the
+> edge's `serve --stdio` reads (A-679, built; the start, A-684, built); the learned
 > response compression (§4.17.3's estimator: the connection's delivery rate and the repository's compression speed and
 > ratio; until it lands the first value, the fastest form the client reads); `obsolete`'s `listkeys` dump, the process
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
@@ -1226,6 +1244,15 @@
 > against `hg serve`, a 6.x client, then the measurements. Open: whether a 6.x client's changegroup `04` is the old
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
 > main measures it.
+
+> **Fixed (g083, 2026-11-19, A-691; found by g303 reading `serve/pull.rs`): a hidden draft root was not listed to
+> Mercurial peers.** `listkeys phases` answered the draft roots computed over the served view; 7.2's `listphases`
+> (`phases.py` 1049-1058) answers the stored draft roots read from the unfiltered changelog, so a draft root an amend
+> hid is listed. Reproduced by use with stock 7.2 first (`hg debugpushkey ... phases`, locally and over `hg serve`,
+> lists the hidden draft root and its successor; slates' view of the same repository listed the successor alone); now
+> `Repository::draft_roots` answers the register's draft roots still draft, read before the served filter; red first
+> (r411), green (r421) on macOS arm64, the other platforms owed
+> (`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`).
 
 > **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
 > Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part

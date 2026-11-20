@@ -16,8 +16,9 @@
 //! **Bookmarks and `listkeys`.** The `bookmarks` part carries every bookmark naming a changeset the served view holds,
 //! by name, but a divergent one (an `@` before its name's end), as 7.2 lists them to a peer (`listbinbookmarks`:
 //! `hasnode(v) and not isdivergent(k)`; A-690). `listkeys` answers `namespaces` with 7.2's four, `bookmarks` with each
-//! such bookmark's hexadecimal node, and `phases` with the served view's draft roots (each `1`, draft's number) and
-//! `publishing` `True` on a publishing repository (`listphases`), sorted by key; any other namespace answers nothing.
+//! such bookmark's hexadecimal node, and `phases` with the repository's stored draft roots still draft, read past the
+//! served filter as 7.2 reads them, so a hidden one among them (each `1`, draft's number; A-691), and `publishing`
+//! `True` on a publishing repository (`listphases`), sorted by key; any other namespace answers nothing.
 //! `obsolete`'s markers, which 7.2 lists in base85 chunks, come with the markers' exchange.
 
 use super::discovery::head_revs;
@@ -127,29 +128,13 @@ fn hex_nodes(
   Ok(())
 }
 
-/// The served view's draft roots, sorted: its draft revisions none of whose parents is draft.
+/// The repository's stored draft roots still draft, sorted, each once ([`Repository::draft_roots`]: 7.2's
+/// `listphases`, a hidden one among them; A-691), charged first.
 fn draft_roots(repo: &impl Repository, admission: &mut Admission) -> Result<Vec<Node>, Refusal> {
-  let mut roots = Vec::new();
-  let count = repo.count();
-  let is_root = |rev: Rev| -> Result<bool, Refusal> {
-    let draft_parent = parents_of(repo, rev)?
-      .into_iter()
-      .flatten()
-      .any(|parent| repo.phase(parent) != Phase::Public);
-    Ok(repo.phase(rev) != Phase::Public && !draft_parent)
-  };
-  let mut found = 0_usize;
-  for rev in 0..count {
-    found = found.saturating_add(usize::from(is_root(rev)?));
-  }
-  admission.charge_items::<Node>(found)?;
-  roots.reserve_exact(found);
-  for rev in 0..count {
-    if is_root(rev)? {
-      roots.push(node_of(repo, rev)?);
-    }
-  }
+  admission.charge_items::<Node>(repo.draft_roots().count())?;
+  let mut roots: Vec<Node> = repo.draft_roots().collect();
   roots.sort_unstable();
+  roots.dedup();
   Ok(roots)
 }
 
