@@ -163,7 +163,9 @@
 > commit clone negotiated within 4 KiB); piece 2b part 1: the choice of the pack's objects a unit at a time
 > (`negotiation::begin`, `Negotiating::step`); part 2: `upload::serve_in_turns` and `Answer::write_within` choose them
 > within the owner's quantum, the answer the same bytes; piece 3a: sets in runs or bits, whichever is smaller, and packets
-> sized from the room (a clone within 4 KiB). Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> sized from the room (a clone within 4 KiB); piece 3b: both edges admit a fetch a request's room and answer it in turns
+> (the 3,000-commit clone by use over HTTP and SSH). Owed: protocol v0 in turns, `begin`'s walks in units, scattered
+> plans, rule 4's generation hold; formerly: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is

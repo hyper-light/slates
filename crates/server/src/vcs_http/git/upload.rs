@@ -1,8 +1,12 @@
 //! git's upload-pack behind the HTTP edge (A-625 part 3; §4.17.2 "A fetch" and "Transports" item 1; A-640 part 2's
 //! `slates_git::upload`): `GET <repo>/info/refs?service=git-upload-pack` answered with the advertisement, and a `POST
 //! <repo>/git-upload-pack` answered as `git upload-pack --stateless-rpc` answers one, its request held whole once its
-//! body has ended (upload-pack reads a command request whole, `Asked::Request`) and charged to the request's room: what
-//! the repository's shard could admit when the request began ([`StoreLender::room`], A-713), never one ring region.
+//! body has ended (upload-pack reads a command request whole, `Asked::Request`) and charged to the request's room: the
+//! edge's request room, or what the repository's shard could admit when the request began where that is less
+//! ([`StoreLender::room`], A-713). A fetch fits it whatever the repository's size (A-745, §4.17.1 "A fetch's answer"): it
+//! is answered in turns (`slates_git::upload::serve_in_turns`), its pack's objects chosen a unit at a time within the
+//! shard's step quantum as the answer is written (`Answer::write_within`, the pack source's `turn`), its sets kept as
+//! runs or bits and its pack framed in packets sized from the room.
 //!
 //! **The store, lent a step at a time.** A repository's store is lent afresh for each step of an answer ([`StoreLender`];
 //! A-640 part 2: "It is lent afresh for each step of an answer, so a shard's state is never held across a wait"), and the
@@ -36,9 +40,8 @@ pub(crate) trait StoreLender {
   /// Whether the store of repository `id` is held here.
   fn holds(&self, id: RepositoryId) -> bool;
 
-  /// The room a request is admitted (A-713): what the shard the stores live on could admit now, as a push is admitted
-  /// (A-704), since everything upload-pack keeps answering it is that shard's to hold; never one request's room, which a
-  /// long history's walk and its pack's list of objects pass. None when the shard's state is not lent.
+  /// What the shard the stores live on could admit now (A-713), as a push is admitted (A-704): a request is admitted the
+  /// edge's request room, or this where it is less (A-745). None when the shard's state is not lent.
   fn room(&mut self, repository: RepositoryId) -> Option<u64>;
 
   /// Runs `step` over the store of the repository `asked` names as upload-pack answers a request of the principal it
@@ -72,12 +75,16 @@ pub(crate) trait StoreLender {
 pub(crate) struct UploadServices<L> {
   /// Where the stores are lent.
   lender: L,
+  /// The room one request may hold: the edge's (A-745, §4.17.1 "A fetch's answer" rule 2: a request's room bounds a
+  /// slice, never a repository).
+  room: u64,
 }
 
 impl<L> UploadServices<L> {
-  /// Upload-pack over `lender`'s stores.
-  pub(crate) fn new(lender: L) -> Self {
-    Self { lender }
+  /// Upload-pack over `lender`'s stores, each request admitted `room`, the edge's request room, or what its stores'
+  /// shard could admit when it began where that is less.
+  pub(crate) fn new(lender: L, room: u64) -> Self {
+    Self { lender, room }
   }
 }
 
@@ -88,10 +95,11 @@ impl<L: StoreLender + Clone> GitServices for UploadServices<L> {
     if start.service != Service::UploadPack || !self.lender.holds(start.repository.id) {
       return Err(ServiceRefused::Unavailable);
     }
-    let room = self
+    let shard = self
       .lender
       .room(start.repository.id)
       .ok_or(ServiceRefused::Unavailable)?;
+    let room = self.room.min(shard);
     Ok(Upload {
       lender: self.lender.clone(),
       repository: start.repository.id,
@@ -155,7 +163,7 @@ impl<L: StoreLender> Exchange for Upload<L> {
     };
     let made = lender
       .lend((*repository, reader), |served, packs| {
-        upload::serve(served, *version, asked, packs, admission)
+        upload::serve_in_turns(served, *version, asked, packs, admission)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     *answer = Some(made);
@@ -175,7 +183,8 @@ impl<L: StoreLender> Exchange for Upload<L> {
     };
     let written = lender
       .lend_objects(*repository, |served, packs| {
-        answer.write(served, packs, admission, out, MAX_LEN)
+        let mut spent = packs.turn();
+        answer.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     Ok(written == Written::More)

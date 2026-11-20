@@ -230,6 +230,14 @@ impl ShardPacks {
 impl PackSource for ShardPacks {
   type Pack = Streamed;
 
+  /// The shard's step quantum, begun now, on the shard's clock (§4.3; A-745): a fetch's choice of its pack's objects
+  /// stops between units once it is spent.
+  fn turn(&self) -> impl FnMut() -> bool + 'static {
+    let began = slates_rt::futures::now_ns();
+    let quantum = self.quantum_ns;
+    move || slates_rt::futures::now_ns().saturating_sub(began) >= quantum
+  }
+
   fn begin(
     &mut self,
     served: &Served<'_>,
