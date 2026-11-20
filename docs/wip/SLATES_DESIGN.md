@@ -54452,3 +54452,36 @@ Applied in the same change to:
   the paper's own 9-CPU, 18-GB example; a monorepo beside a toy; degenerate claims never not-a-number). The oracle's
   first runs found a resource with no room left that the remaining claims never use stopping them at level zero, fixed.
   Owed: the demands read from the usage rows and the weights learned (piece 2's other half), feeding admission (3).
+
+### A-725 — A WinFsp drive's receiver is relieved while it is held in a send: a second receiver with its own journal serves in its place, the operation state moved between them (bug, 2026-11-20, w-bugs for goal 87, goal-83 B3; amends A-198's single receiver; §4.6 Windows)
+
+- **Found by use.** fsx seed 1 over the WinFsp drive stopped for good after its shrink (operation 45, `TRUNCATE DOWN`
+  249,552 to 56,848) on every run, on both Windows architectures, listed `fsx-seed-1-unfinished:10000` since
+  2026-11-05. A diagnostics-only log of each operation and send (diag-w-bugs-b3-9, windows-latest, 2026-11-20) ended
+  `send begins kind 8` with no `send returned` for about 59 s, where every other send took at most 481 µs: the one
+  receive worker was held inside its own send of the shrink's answer (record:
+  `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`, "Shown 2026-11-20").
+- **Cause.** WinFsp v2.1 completes an answered request on the thread that sent the answer (`src/sys/volume.c`
+  1089-1102); SetInformation's end-of-file completion runs `CcSetFileSizes` there (`src/sys/fileinfo.c` 1407,
+  `src/sys/file.c` 1852), which can wait on a paging request for the file's last page. A-198 made slates' receive worker
+  the drive's only receiver, so that request reached no one. WinFsp's own dispatcher runs at least two receivers
+  (`src/dll/fs.c` 26, 384-401) for this reason.
+- **Change.** `crate::inflight::relief` (bridge-winfsp): a primary receiver and a relief, each with its own retained
+  journal region (`opens::JOURNALS` = 2 after the open frames; `capture`'s protocol unchanged in each). The operation
+  state (`DllStation`: the DLL's operation table, private opens, working packet, shard channel, the confirmation in
+  flight, A-275's may-link set) is moved between them, never shared (R2, D-7): the primary parks it in a one-pointer
+  slot before each send and takes it back after (two atomic exchanges a send, no wake); the relief looks once a beat
+  (the daemon's watchdog beat, `HEARTBEAT_NS`, passed to the mount as `RELIEF_BEAT`) and, when the primary has been
+  inside the same send a whole beat, takes the state and serves its own region until the primary, its send returned,
+  asks for it back. So one thread operates at a time, as A-198 requires: the DLL has one caller, the shard channel's
+  bound (`REQUEST_BOUND`) and the one outstanding confirmation are unchanged, and recovery settles both regions before
+  either receives; the ledger's one unconfirmed open is kept when either journal's saved response vouches for it
+  (`Ledger::settle_pending` over both).
+- **Tests.** `inflight::relief::tests::a_send_whose_completion_waits_on_another_request_is_relieved` (every host): a
+  modelled driver on its own thread whose completion of a shrink's answer issues a nested read and returns the send
+  only once that read is answered, over the real journal regions. Red with the relief taken out (macOS arm64, Mac
+  Studio, 2026-11-20): "the shrink's answer never completed in 10.1 s: its nested read reached no receiver"; green in
+  0.03 s. The crash oracle (`inflight::oracle`) and the ledger's tests pass unchanged over the new `settle_pending`.
+- **Residual.** A relief itself held in a send is relieved by no one (two completions each waiting on the drive at
+  once); the relief's receive may run its transaction timeout (1 s) before it hands the state back.
+- **Applied in the same change to** GAPS (the delete/purge hang entry), the fsx bug record, amendments.tsv.
