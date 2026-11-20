@@ -175,6 +175,24 @@ impl<S: ShardLender> Command for ReceiveCommand<S> {
     if self.checked {
       // The turn kept through the edge's yield is given back, then taken again behind the repository's other pushes.
       drop(self.turn.take());
+      // The push's names homed in the region before its record names them (A-724 piece 8c), off the shard's step.
+      if let Some(bytes) = push.take_homing() {
+        let (origin, shards) = lent(&mut self.lender, |state| {
+          (state.shard, state.shards.clone())
+        })?;
+        let homed = crate::vcs_store::homes::home_in_region(
+          origin,
+          &shards,
+          bytes,
+          crate::fleet::live_budget(),
+        )
+        .await;
+        lent(&mut self.lender, |state| push.homed(state, homed))?;
+        return Ok(Stepped {
+          consumed: 0,
+          next: Next::More,
+        });
+      }
       let turn = crate::vcs_share::turns::take(self.repository).await;
       let (next, kept) = answer_step(
         &mut self.lender,

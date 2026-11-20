@@ -2176,8 +2176,8 @@ pub(crate) fn published(
   // A whole entry of more than one piece is sealed in turns of this shard (A-377): sealed here in one turn, its AEAD and
   // keyed names a byte held the shard about a second a GiB (g251's trace: a taken-over volume's first publication,
   // 1.06 s in one turn).
-  if whole && sealed_in_pieces(state, &body) {
-    begin_whole_build(state, id, body);
+  if built_in_turns(state, whole, &body) {
+    begin_whole_build(state, id, body, whole);
     return;
   }
   let Some((payload, anchors)) = sealed_payload(state, id, whole, body) else {
@@ -2241,11 +2241,12 @@ fn append_entry(
 fn append_entry_hashed(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
+  whole: bool,
   payload: Vec<u8>,
   anchors: Option<Vec<u64>>,
   hashed: Option<slates_db::live::EntryHasher>,
 ) -> Result<(), NotAppended> {
-  append_entry_with(state, id, (true, false), payload, anchors, hashed)
+  append_entry_with(state, id, (whole, false), payload, anchors, hashed)
 }
 
 /// [`append_entry`]'s body: a whole entry with `hashed` appends with that identity.
@@ -2272,7 +2273,10 @@ fn append_entry_with(
       None => live.shipper.append_checkpoint_kept(payload.clone()),
     }
   } else {
-    live.shipper.append_kept(payload.clone())
+    match hashed {
+      Some(hashed) => live.shipper.append_hashed(payload.clone(), hashed),
+      None => live.shipper.append_kept(payload.clone()),
+    }
   };
   let head = appended.map_err(NotAppended::Refused)?;
   let published_ns = live
@@ -2369,6 +2373,10 @@ struct WholeBuild {
   hashing: Option<(Vec<u8>, slates_db::live::EntryHasher)>,
   /// The bytes hashed so far and the clock time their hashing took.
   hash_rate: (u64, u64),
+  /// Whether it is a whole state; else a large delta built in turns of its own (A-757 part 2b).
+  whole: bool,
+  /// Whether its body ships in the clear (this node seals nothing): nothing to seal, only to hash.
+  clear: bool,
 }
 
 impl std::fmt::Debug for WholeBuild {
@@ -2401,6 +2409,17 @@ enum Advance {
   Done,
 }
 
+/// Whether a publication of plain `body` is sealed and hashed in turns of a build of its own: a whole entry that this node
+/// seals spanning more than one piece ([`sealed_in_pieces`], A-377), or a delta over one archive page, sealed or not
+/// (A-757 part 2b: a 2.4 MB delta was sealed and hashed in the turn that published it, 1.39 ms of release CPU, 128 to
+/// 331 ms in a debug fleet under `taskpolicy -b`).
+fn built_in_turns(state: &ShardState, whole: bool, body: &[u8]) -> bool {
+  if whole {
+    return sealed_in_pieces(state, body);
+  }
+  usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES).is_ok_and(|page| body.len() > page)
+}
+
 /// Whether a whole entry of plain `body` is sealed in turns: this node seals, and the body spans more than one piece.
 fn sealed_in_pieces(state: &ShardState, body: &[u8]) -> bool {
   state.seal_root.is_some()
@@ -2428,8 +2447,13 @@ fn pending_entries(live: &LiveVolume) -> u64 {
 
 /// Begins sealing the whole entry of plain `body` in turns ([`WholeBuild`]); its first turn runs now, and a task of this
 /// shard runs the rest.
-fn begin_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId, body: Vec<u8>) {
-  begin_whole_build_with(state, id, body, (VecDeque::new(), 0));
+fn begin_whole_build(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  body: Vec<u8>,
+  whole: bool,
+) {
+  begin_whole_build_with(state, id, body, whole, (VecDeque::new(), 0));
 }
 
 /// [`begin_whole_build`] with the publications already queued behind it and their delta bytes (a queue's drain met a
@@ -2438,17 +2462,26 @@ fn begin_whole_build_with(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   body: Vec<u8>,
+  whole: bool,
   (queued, queued_bytes): (VecDeque<Queued>, usize),
 ) {
-  let Some((sealing, anchors)) = whole_sealing(state, id, true) else {
+  let clear = state.seal_root.is_none();
+  let sealed = if clear {
+    Some((None, Vec::new()))
+  } else {
+    whole_sealing(state, id, whole)
+  };
+  let Some((sealing, anchors)) = sealed else {
     drop_queue(state, id, queued.len(), "fleet.live.refused.no_payload");
     return;
   };
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return;
   };
-  // The build is the whole state the volume owed: a barrier made now waits for its position, not one after it.
-  live.owes_whole = false;
+  if whole {
+    // The build is the whole state the volume owed: a barrier made now waits for its position, not one after it.
+    live.owes_whole = false;
+  }
   live.building = Some(Box::new(WholeBuild {
     body,
     next: 0,
@@ -2461,8 +2494,17 @@ fn begin_whole_build_with(
     seal_rate: (0, 0),
     hashing: None,
     hash_rate: (0, 0),
+    whole,
+    clear,
   }));
-  state.count(LIVE_WHOLE_BUILDS, 1);
+  state.count(
+    if whole {
+      LIVE_WHOLE_BUILDS
+    } else {
+      LIVE_DELTA_BUILDS
+    },
+    1,
+  );
   if advance_whole_build(state, id) == Advance::Done {
     return;
   }
@@ -2519,11 +2561,22 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
     drop_build(state, id, LIVE_BUILD_SUPERSEDED);
     return Advance::Done;
   }
+  let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
+  let clear = state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .and_then(|live| live.building.as_ref())
+    .is_some_and(|build| build.clear);
+  if clear {
+    // A body in the clear has nothing to seal: its turns hash it ([`hash_whole_turn`]).
+    state.count(LIVE_WHOLE_BUILD_TURNS, 1);
+    return hash_then_append(state, id, slates_rt::futures::now_ns(), quantum);
+  }
   let Some((lineage, namer, segment)) = body_keys(state, id) else {
     drop_build(state, id, "fleet.live.refused.no_payload");
     return Advance::Done;
   };
-  let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
   let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES)
     .unwrap_or(usize::MAX)
     .max(1);
@@ -2579,6 +2632,17 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
   if !sealed_whole {
     return Advance::More;
   }
+  hash_then_append(state, id, began, quantum)
+}
+
+/// A sealed (or clear) build's turn past its sealing: its identity hashed this turn as far as the quantum allows
+/// ([`hash_whole_turn`]), and once every byte is, the build appended ([`append_build`]).
+fn hash_then_append(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  began: u64,
+  quantum: u64,
+) -> Advance {
   match hash_whole_turn(state, id, began, quantum) {
     Advance::More => return Advance::More,
     Advance::Done => {}
@@ -2624,14 +2688,22 @@ fn hash_whole_turn(
     return Advance::Done;
   }
   let Some((payload, hasher)) = build.hashing.as_mut() else {
-    let mut payload = vec![KIND_WHOLE, BODY_SEALED];
-    payload.extend_from_slice(
-      &SealedBody {
-        sealing: build.sealing.take(),
-        pieces: std::mem::take(&mut build.sealed),
-      }
-      .to_bytes(),
-    );
+    let kind = if build.whole { KIND_WHOLE } else { KIND_DELTA };
+    let payload = if build.clear {
+      let mut payload = vec![kind, BODY_CLEAR];
+      payload.extend_from_slice(&build.body);
+      payload
+    } else {
+      let mut payload = vec![kind, BODY_SEALED];
+      payload.extend_from_slice(
+        &SealedBody {
+          sealing: build.sealing.take(),
+          pieces: std::mem::take(&mut build.sealed),
+        }
+        .to_bytes(),
+      );
+      payload
+    };
     build.body = Vec::new();
     match live.shipper.entry_hasher(payload.len()) {
       Ok(hasher) => build.hashing = Some((payload, hasher)),
@@ -2690,9 +2762,18 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
     let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
       return appended_any;
     };
-    let admits = live.shipper.admits_checkpoint();
+    let checkpoint_admitted = live.shipper.admits_checkpoint();
     let Some(build) = live.building.as_mut() else {
       return appended_any;
+    };
+    // A whole build rides one past the credit as a checkpoint; a delta built in turns waits for the delta credit.
+    let admits = if build.whole {
+      checkpoint_admitted
+    } else {
+      build
+        .hashing
+        .as_ref()
+        .is_some_and(|(payload, _)| live.shipper.admits_delta(payload.len()))
     };
     if !build.appended {
       // Appended only once its identity is hashed, in the build's turns ([`hash_whole_turn`]).
@@ -2711,8 +2792,9 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
         return appended_any;
       };
       let anchors = std::mem::take(&mut build.anchors);
+      let whole = build.whole;
       build.appended = true;
-      match append_entry_hashed(state, id, payload, Some(anchors), Some(hasher)) {
+      match append_entry_hashed(state, id, whole, payload, Some(anchors), Some(hasher)) {
         Ok(()) => appended_any = true,
         Err(_) => {
           drop_build(state, id, "fleet.live.refused.no_position");
@@ -2728,7 +2810,7 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
     if !next.whole {
       build.queued_bytes = build.queued_bytes.saturating_sub(next.body.len());
     }
-    if next.whole && sealed_in_pieces(state, &next.body) {
+    if built_in_turns(state, next.whole, &next.body) {
       let rest = state
         .live
         .shipping
@@ -2737,7 +2819,7 @@ fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> boo
         .map_or((VecDeque::new(), 0), |build| {
           (build.queued, build.queued_bytes)
         });
-      begin_whole_build_with(state, id, next.body, rest);
+      begin_whole_build_with(state, id, next.body, next.whole, rest);
       return appended_any;
     }
     let sealed = sealed_payload(state, id, next.whole, next.body.clone());
@@ -2894,6 +2976,8 @@ const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
 /// Counter: one turn of a whole entry's sealing ([`advance_whole_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_WHOLE_BUILD_TURNS: &str = "fleet.live.whole_build_turns";
+/// Counter: the large deltas sealed and hashed in turns of a build of their own (A-757 part 2b).
+const LIVE_DELTA_BUILDS: &str = "fleet.live.delta_builds";
 /// Counter: the turns a whole build hashed its entry's identity in (A-757 part 2), a slice of the payload a turn.
 const LIVE_WHOLE_HASH_TURNS: &str = "fleet.live.whole_hash_turns";
 /// Counter: a publication captured while a whole entry sealed and queued behind it ([`queue_behind_build`]).

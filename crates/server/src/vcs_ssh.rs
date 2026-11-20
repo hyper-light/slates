@@ -107,6 +107,9 @@ use crate::vcs_http::git::Located;
 use site::{ClientGone, Command, Dispatched, Next, Refused, SshSite};
 use waits::{Overdue, Phase, PhaseWaits, Tracker};
 
+/// Format: nanoseconds in a millisecond, as a rekey's log line names its times.
+const NS_PER_MS: u64 = 1_000_000;
+
 /// Derived: the transport's packet cap: the size every peer accepts (RFC 4253 §6.1: "All implementations MUST be able to
 /// process packets with ... a total packet size of 35000 bytes or less"). A larger cap buys nothing from OpenSSH, whose
 /// session channels carry packets of 32 KiB (`CHAN_SES_PACKET_DEFAULT` in `channels.h`) \[C\], and every byte past it is
@@ -857,6 +860,20 @@ impl<S: SshSite> Link<S> {
   /// One pass of the loop: pending output written, or the session's end, an event, unread bytes fed, or a turn and a
   /// read; how the connection left if it did, `None` to go round again.
   async fn pass(&mut self) -> Option<Exit> {
+    if let Some(rekeyed) = self.session.take_rekey() {
+      // A-745 (main's order): every key exchange after the first is logged with what started it.
+      slates_machine::log_line!(
+        "slates-server: SSH key exchange begun by {:?} after {} ms of its key, {} packets and {} blocks sealed, {} \
+         packets and {} blocks opened, the key time {} ms",
+        rekeyed.trigger,
+        rekeyed.served_ns / NS_PER_MS,
+        rekeyed.sealed.packets,
+        rekeyed.sealed.blocks,
+        rekeyed.opened.packets,
+        rekeyed.opened.blocks,
+        rekeyed.key_time_ns / NS_PER_MS
+      );
+    }
     if !self.session.pending_output().is_empty() {
       return self.write().await.err().map(Exit::Ended);
     }

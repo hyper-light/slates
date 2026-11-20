@@ -43,8 +43,12 @@ pub(crate) struct GitReplay {
   push: Push,
   /// The record the admission would write again, compared with the record's names at the end.
   remade: RecordWriter,
-  /// The record's names: each object it brought by type, content identity and length, in admission order.
+  /// The record's names: each object it brought by type, content identity and length, in admission order (a version-3
+  /// record's read from their content as its replay begins, A-724 piece 8c).
   names: Vec<(Kind, ContentId, u64)>,
+  /// A version-3 record's names' content, to hold for the record at its replay's first turn where nothing holds it (a3:
+  /// a window restored from the shard image is held for no one until a record holds it again).
+  named: Option<ContentId>,
   /// The record's moves.
   moves: Vec<RecordedMove>,
   /// Where the record's pack begins in its bytes.
@@ -134,6 +138,14 @@ impl GitReplay {
     bytes: &[u8],
   ) -> Result<Box<Self>, ReplayRefused> {
     let record = Record::decode(bytes, format).map_err(ReplayRefused::Record)?;
+    let (names, named) = match record.named {
+      Some((identity, count)) => (
+        super::record_names::names_from_content(content, &identity, count)
+          .map_err(ReplayRefused::Names)?,
+        Some(identity),
+      ),
+      None => (record.names, None),
+    };
     let mut push = Push::new(format);
     push.carried(record.deepest);
     // The pack is the record's last field (`Record::decode` refuses trailing bytes), so it ends where the bytes do.
@@ -141,7 +153,8 @@ impl GitReplay {
     Ok(Box::new(Self {
       push,
       remade: RecordWriter::default(),
-      names: record.names,
+      names,
+      named,
       moves: record.moves,
       pack_at,
       stage: Stage::Reading {
@@ -160,6 +173,14 @@ impl GitReplay {
     bytes: &[u8],
     (turn, now): (Turn, &mut dyn FnMut() -> u64),
   ) -> Result<Stepped, ReplayRefused> {
+    if let Some(identity) = self.named.take()
+      && content.holders(&identity) == 0
+      && let Err(refused) = content.hold(&identity)
+    {
+      return Err(ReplayRefused::Git(GitRefused::Object(
+        PushRefused::Content(refused),
+      )));
+    }
     loop {
       match self.unit((content, store), bytes, turn.chunk) {
         Ok(false) => {}

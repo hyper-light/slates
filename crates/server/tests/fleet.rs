@@ -13989,6 +13989,7 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
         || name.starts_with("fleet.live.build")
         || name.starts_with("fleet.live.whole")
         || name.starts_with("fleet.live.appended")
+        || name.starts_with("fleet.live.change")
     })
     .collect();
   drop(observed);
@@ -14034,6 +14035,128 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
   assert!(
     settled,
     "a's log is durable at its head with nothing owed, and both holders hold its head: {line:?}"
+  );
+}
+
+/// Format: the builds a large delta was sealed and hashed in (A-757 part 2b).
+const LIVE_DELTA_BUILDS: &str = "fleet.live.delta_builds";
+/// Shape: the staged file the large-delta test writes in one verb: three MiB, as the whole-entry test's content, so its
+/// delta spans [`BUILT_PIECES`] pages at least.
+const STAGED_DELTA_BYTES: usize = BUILT_VOLUME_FILES * BURST_VOLUME_FILE_BYTES;
+/// Shape: one `StagePut`'s bytes: under the test client's 4 KiB ring slot with the request's framing.
+const STAGE_PUT_BYTES: usize = 3 << 10;
+
+/// A-757 part 2b (w-forming, 2026-11-20; found by use: a 1.8 to 2.5 MB delta sealed and appended in its publication's
+/// one turn, 128 to 331 ms of a debug owner shard's CPU, 1.39 ms in release for 2.4 MB). Do: three nodes at `f = 1`; on a,
+/// a small live-shipped volume; cut a's seal turns to a page (`Daemon::inject_seal_walk_quantum(Some(0))`); stage three
+/// MiB and write them as one file (`FsWriteStaged`), one publication. Expect the write answered at durability, its delta
+/// sealed and hashed by a build of its own over at least the content's bytes over a page in turns, and a's log durable at
+/// its head with both holders there. Before, the delta was sealed and hashed in the turn that published it.
+#[test]
+fn a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "large-delta".to_owned(),
+    size: SizeClass::Bounded {
+      limit: BUILT_VOLUME_LIMIT,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the volume was created");
+  };
+  let attachment = write_attachment(&mut client, id);
+  let first = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/small".to_owned(),
+    bytes: vec![1; BURST_WRITE_BYTES],
+    mode: 0o644,
+  });
+  assert!(matches!(first, ReplyBody::FsDone { .. }), "{first:?}");
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "{shipped:?}"
+  );
+  let second = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/small-again".to_owned(),
+    bytes: vec![2; BURST_WRITE_BYTES],
+    mode: 0o644,
+  });
+  assert!(matches!(second, ReplyBody::FsDone { .. }), "{second:?}");
+  let len = u64::try_from(STAGED_DELTA_BYTES).unwrap();
+  let ReplyBody::Staged { token } = client.call(&RequestBody::StageBegin { work: id, len }) else {
+    panic!("a staging buffer of {len} bytes");
+  };
+  let content: Vec<u8> = (0..STAGED_DELTA_BYTES)
+    .map(|at| u8::try_from(at % 241).unwrap())
+    .collect();
+  for (index, chunk) in content.chunks(STAGE_PUT_BYTES).enumerate() {
+    let put = client.call(&RequestBody::StagePut {
+      work: id,
+      token,
+      offset: u64::try_from(index * STAGE_PUT_BYTES).unwrap(),
+      bytes: chunk.to_vec(),
+    });
+    assert!(matches!(put, ReplyBody::StagePutDone { .. }), "{put:?}");
+  }
+  let counts = |daemon: &Daemon| {
+    [LIVE_DELTA_BUILDS, LIVE_WHOLE_HASH_TURNS].map(|kind| refusal_count(daemon, kind).unwrap())
+  };
+  daemons[0].inject_seal_walk_quantum(Some(0)).unwrap();
+  let before = counts(&daemons[0]);
+  let written = client.call(&RequestBody::FsWriteStaged {
+    volume: id,
+    attachment,
+    path: "/large".to_owned(),
+    token,
+    mode: 0o644,
+  });
+  let after = counts(&daemons[0]);
+  daemons[0].inject_seal_walk_quantum(None).unwrap();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let settled = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let line = owned_live_line(&mut client, id);
+    Ok(
+      matches!(line, Some((Some(head), Some(durable), false)) if head == durable)
+        && holds_every_head(&mut client, &daemons[1], &[id])
+        && holds_every_head(&mut client, &daemons[2], &[id]),
+    )
+  });
+  let line = owned_live_line(&mut client, id);
+  drop(observed);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let [builds, hash_turns] = [0, 1].map(|kind| after[kind].saturating_sub(before[kind]));
+  eprintln!(
+    "a large delta: written {written:?}; delta builds {builds}, hash turns {hash_turns}; a's log {line:?}, settled \
+     {settled}"
+  );
+  assert!(
+    matches!(written, ReplyBody::FsDone { .. }),
+    "the large write was answered at durability: {written:?}"
+  );
+  assert!(builds >= 1, "the large delta was built in turns of its own");
+  assert!(
+    hash_turns >= BUILT_PIECES,
+    "the large delta's identity was hashed a page a turn under the cut quantum: {hash_turns} turns for at least \
+     {BUILT_PIECES} pages"
+  );
+  assert!(
+    settled,
+    "a's log is durable at its head and both holders hold it: {line:?}"
   );
 }
 

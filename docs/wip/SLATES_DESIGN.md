@@ -56566,9 +56566,16 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `_in_slices`, ignored measurements). Tests: `a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once`; the
   fleet sealed-in-turns test holds the hashing to at least a page a turn under the cut quantum (48 turns for 3 MiB),
   red before (0 turns: hashed in the append's turn).
-- **Owed.** Part 2b: a large delta, sealed and hashed in its publication's turn, as a build of its own. Part 3: the body
-  held once, by identity in the content store (A-727) or an arena handle, so the retained entry and the volume's whole
-  state name one copy.
+- **Part 2b (large deltas).** A delta over one archive page (`built_in_turns`), sealed or in the clear, is built in turns
+  of its own as a whole state is: the build carries `whole` and `clear`, seals its pieces when this node seals, hashes
+  in slices, waits for the delta credit (`Shipper::admits_delta`) and appends with `Shipper::append_hashed`; a whole
+  state keeps A-377's rule. Release, 2.4 MB, best and median of 9, three runs: the append turn 0.92 to 1.77 / 0.94 to
+  2.32 ms before, 0.42 to 0.88 / 0.46 to 1.46 us after; each 64 KiB hashing turn 27 to 54 / 30 to 68 us
+  (`measure_the_delta_append_turn`). Tests: `a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once`; the fleet
+  test `a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own` (a three-MiB staged write, one publication), red
+  before (no build, no hashing turn), at least 48 hashing turns after.
+- **Owed.** Part 3: the body held once, by identity in the content store (A-727) or an arena handle, so the retained
+  entry and the volume's whole state name one copy.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
