@@ -270,6 +270,74 @@ mod tests {
       .collect()
   }
 
+  /// One round whose slice allows [`PER_SLICE`] records, and the invalidations it told; a cut
+  /// round owes the rest at once.
+  fn one_slice(
+    coherence: &mut Coherence,
+    bridge: &mut VolumeBridge<'_>,
+    cx: &OpContext,
+  ) -> (Delivered, Vec<Invalidation>) {
+    let mut left = PER_SLICE - 1;
+    let mut slice = || {
+      if left == 0 {
+        ControlFlow::Break(())
+      } else {
+        left -= 1;
+        ControlFlow::Continue(())
+      }
+    };
+    let mut told = Vec::new();
+    let delivered = coherence
+      .deliver(bridge, cx, &mut slice, &mut |invalidation| {
+        told.push(invalidation.clone());
+        Ok::<(), ()>(())
+      })
+      .unwrap();
+    assert_eq!(
+      delivered.cut,
+      coherence.owes(),
+      "a cut round owes the rest at once"
+    );
+    (delivered, told)
+  }
+
+  /// The ten took several rounds, the first its slice's three records, each at most a slice's,
+  /// every one but the last cut, none refused.
+  fn each_round_took_at_most_a_slice(rounds: &[(Delivered, Vec<String>)]) {
+    assert!(
+      rounds.len() >= MADE.div_ceil(PER_SLICE),
+      "the ten took several rounds: {rounds:?}"
+    );
+    assert_eq!(
+      rounds[0].1,
+      vec!["f0", "f1", "f2"],
+      "the first round took its slice's three records"
+    );
+    for (at, (delivered, named)) in rounds.iter().enumerate() {
+      assert!(!delivered.gather_refused, "round {at}");
+      assert_eq!(
+        delivered.cut,
+        at + 1 < rounds.len(),
+        "round {at}: {rounds:?}"
+      );
+      let records = named.iter().filter(|name| name.starts_with('f')).count();
+      assert!(
+        records <= PER_SLICE,
+        "round {at} took {records} records: {rounds:?}"
+      );
+    }
+  }
+
+  /// Every file made elsewhere told exactly once across the rounds, and in order.
+  fn every_file_made_elsewhere_told_once_in_order(rounds: &[(Delivered, Vec<String>)]) {
+    let told: Vec<String> = rounds
+      .iter()
+      .flat_map(|(_, named)| named.iter().filter(|name| name.starts_with('f')).cloned())
+      .collect();
+    let made: Vec<String> = (0..MADE).map(|made| format!("f{made}")).collect();
+    assert_eq!(told, made, "every file made elsewhere told once, in order");
+  }
+
   /// A-562 (B9; GAPS "Two rounds are built whole in one turn"). Do: start a mount's rounds at the head, make ten files
   /// through another path, then run rounds whose slice allows three records each until one is whole; between the first
   /// two, serve a request of the mount's own, which makes a file of its own. Expect at least four rounds, the first to
@@ -306,27 +374,7 @@ mod tests {
     let mut rounds: Vec<(Delivered, Vec<String>)> = Vec::new();
     loop {
       let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
-      let mut left = PER_SLICE - 1;
-      let mut slice = || {
-        if left == 0 {
-          ControlFlow::Break(())
-        } else {
-          left -= 1;
-          ControlFlow::Continue(())
-        }
-      };
-      let mut told = Vec::new();
-      let delivered = coherence
-        .deliver(&mut bridge, &cx, &mut slice, &mut |invalidation| {
-          told.push(invalidation.clone());
-          Ok::<(), ()>(())
-        })
-        .unwrap();
-      assert_eq!(
-        delivered.cut,
-        coherence.owes(),
-        "a cut round owes the rest at once"
-      );
+      let (delivered, told) = one_slice(&mut coherence, &mut bridge, &cx);
       if rounds.is_empty() {
         let root_ino = bridge.root(&cx).unwrap();
         bridge
@@ -342,34 +390,8 @@ mod tests {
     }
 
     // The mount's own request journaled a record or more after the ten, which the later rounds gather too.
-    assert!(
-      rounds.len() >= MADE.div_ceil(PER_SLICE),
-      "the ten took several rounds: {rounds:?}"
-    );
-    assert_eq!(
-      rounds[0].1,
-      vec!["f0", "f1", "f2"],
-      "the first round took its slice's three records"
-    );
-    for (at, (delivered, named)) in rounds.iter().enumerate() {
-      assert!(!delivered.gather_refused, "round {at}");
-      assert_eq!(
-        delivered.cut,
-        at + 1 < rounds.len(),
-        "round {at}: {rounds:?}"
-      );
-      let records = named.iter().filter(|name| name.starts_with('f')).count();
-      assert!(
-        records <= PER_SLICE,
-        "round {at} took {records} records: {rounds:?}"
-      );
-    }
-    let told: Vec<String> = rounds
-      .iter()
-      .flat_map(|(_, named)| named.iter().filter(|name| name.starts_with('f')).cloned())
-      .collect();
-    let made: Vec<String> = (0..MADE).map(|made| format!("f{made}")).collect();
-    assert_eq!(told, made, "every file made elsewhere told once, in order");
+    each_round_took_at_most_a_slice(&rounds);
+    every_file_made_elsewhere_told_once_in_order(&rounds);
     assert_eq!(
       coherence.take_sliced_counts(),
       (1, u64::try_from(rounds.len() - 1).unwrap()),

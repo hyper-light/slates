@@ -70,7 +70,7 @@ use slates_svn::commit::drive::Due;
 use slates_svn::commit::drive::{Setup, Work};
 use slates_svn::dav::Bounds as XmlBounds;
 use slates_svn::dav::commit::{
-  self as commit, DavCommit, Hooks, Merged, Put, World as CommitWorld,
+  self as commit, DavCommit, Hooks, Merged, PutStart, World as CommitWorld,
 };
 use slates_svn::dav::locking::{self, HttpAnswer, LockHttp, UnlockHttp};
 use slates_svn::dav::response::MergeResponse;
@@ -546,6 +546,39 @@ pub(crate) struct SvnExchange<S> {
   /// Whether the repository configures each commit hook (start-commit, pre-commit), which this site does not run yet:
   /// a commit meeting one is refused, as the svn+ssh tunnel refuses it.
   hooked: (bool, bool),
+  /// A PUT on a transaction's root, its body streamed into the transaction's drive run by run and never held
+  /// (§4.17.1 "A push's intake"); none for every other request.
+  streamed: Option<Streamed>,
+}
+
+/// A PUT whose body is streamed into its transaction (A-681): the transaction, the path below its root, whether its file
+/// is begun, and the refusal its drive met, after which the body's runs are read and dropped.
+struct Streamed {
+  /// The transaction's name.
+  transaction: String,
+  /// The path below the transaction's root.
+  path: String,
+  /// Whether the file's delta is open.
+  begun: bool,
+  /// The refusal met, which the PUT is answered with.
+  refused: Option<HttpAnswer>,
+}
+
+/// The streamed PUT `method` on `path` names, when it is a PUT under a transaction's root (`!svn/txr/NAME/...`).
+fn streamed_put(method: &str, path: &str) -> Option<Streamed> {
+  if method != "PUT" {
+    return None;
+  }
+  let segments: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
+  let [first, "txr", name, rest @ ..] = segments.as_slice() else {
+    return None;
+  };
+  (*first == site::SPECIAL).then(|| Streamed {
+    transaction: (*name).to_owned(),
+    path: format!("/{}", rest.join("/")),
+    begun: false,
+    refused: None,
+  })
 }
 
 /// The headers an HTTPv2 commit's requests carry (`libsvn_ra_serf/commit.c`), copied from the head.
@@ -630,6 +663,7 @@ impl<S> SvnExchange<S> {
       hooked_at(HookPoint::SvnPreCommit),
     );
     Some(Self {
+      streamed: streamed_put(&method, &asked.routed.path),
       name: asked.routed.name.clone(),
       commit_headers,
       hooked,
@@ -663,6 +697,9 @@ impl<S: SvnStores> SvnExchange<S> {
   /// request on a transaction's root (`!svn/txr/NAME/...`) or on the transaction itself (`!svn/txn/NAME`), a COPY
   /// whose destination is in a transaction, or a MERGE; none for every other request, which the read side answers.
   fn commit_side(&mut self) -> Option<HttpAnswer> {
+    if let Some(streamed) = self.streamed.take() {
+      return Some(self.end_stream(streamed));
+    }
     let path = self.path.clone();
     let segments: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
     let special = |segment: &str| segment == site::SPECIAL;
@@ -856,6 +893,71 @@ impl<S: SvnStores> SvnExchange<S> {
 }
 
 impl<S: SvnStores> SvnExchange<S> {
+  /// One run of a streamed PUT's body handed to its transaction's drive (the file begun at the first run, its `If`
+  /// tokens presented then), and held no longer; a run after a refusal is dropped.
+  fn stream(&mut self, run: &[u8]) {
+    let Some(mut streamed) = self.streamed.take() else {
+      return;
+    };
+    if streamed.refused.is_none() {
+      let outcome = self.put_step(&streamed, Some(run));
+      streamed.begun = true;
+      streamed.refused = outcome.err();
+    }
+    self.streamed = Some(streamed);
+  }
+
+  /// A streamed PUT's end: its refusal, or its file begun (a body with no run) and ended.
+  fn end_stream(&mut self, streamed: Streamed) -> HttpAnswer {
+    if let Some(refused) = streamed.refused {
+      return refused;
+    }
+    let started = if streamed.begun {
+      Ok(())
+    } else {
+      self.put_step(&streamed, None)
+    };
+    if let Err(refused) = started {
+      return refused;
+    }
+    let hooks = self.hooks();
+    self.on_transaction(&streamed.transaction, |commit, world, _| {
+      commit.end_put(world, &hooks)
+    })
+  }
+
+  /// One step of a streamed PUT on its transaction: the file begun where it is not yet, then `run` as the delta's next
+  /// chunk where one is given.
+  fn put_step(&mut self, streamed: &Streamed, run: Option<&[u8]>) -> Result<(), HttpAnswer> {
+    let headers = self.commit_headers.clone();
+    let hooks = self.hooks();
+    let (begun, path) = (streamed.begun, streamed.path.as_str());
+    let stepped = self.stores.on_commit(
+      self.repository,
+      &self.principal,
+      &streamed.transaction,
+      |commit, world| {
+        if !begun {
+          for token in DavCommit::if_tokens(headers.presented.as_deref().unwrap_or_default()) {
+            commit.present(path, token);
+          }
+          let start = PutStart {
+            base_md5: headers.base_md5.as_deref(),
+            result_md5: headers.result_md5.as_deref(),
+            version_name: headers.version_name,
+          };
+          commit.begin_put(world, &hooks, path, &start)?;
+        }
+        run.map_or(Ok(()), |run| commit.put_chunk(world, &hooks, run))
+      },
+    );
+    match stepped {
+      Some(Some(stepped)) => stepped,
+      Some(None) => Err(commit::no_such_transaction(&streamed.transaction)),
+      None => Err(commit::unserved("Commits")),
+    }
+  }
+
   /// A LOCK of the public path the request names (`slates_svn::dav::locking`, A-627): read, judged by the lock table
   /// at the owner's instant with a fresh token, its entries landed through the owner's step, and answered as
   /// `mod_dav_svn` answers it.
@@ -1021,7 +1123,8 @@ impl HeadView for IndexHead<'_> {
   }
 }
 
-/// One request on a transaction's root (a PUT, MKCOL, DELETE or PROPPATCH at `path`), its headers' tokens presented.
+/// One request on a transaction's root (a MKCOL, DELETE or PROPPATCH at `path`; a PUT is streamed), its headers' tokens
+/// presented.
 fn transaction_root_step(
   commit: &mut DavCommit,
   (world, hooks): (&CommitWorld<'_, SvnRecords>, Hooks<'_>),
@@ -1029,15 +1132,6 @@ fn transaction_root_step(
   (headers, body, bounds): (&CommitHeaders, &[u8], &XmlBounds),
 ) -> HttpAnswer {
   match method {
-    "PUT" => {
-      let put = Put {
-        body,
-        base_md5: headers.base_md5.as_deref(),
-        result_md5: headers.result_md5.as_deref(),
-        version_name: headers.version_name,
-      };
-      commit.put(world, hooks, path, &put)
-    }
     "MKCOL" => commit.mkcol(world, hooks, path),
     "DELETE" => commit.delete(world, hooks, path, headers.version_name),
     "PROPPATCH" => commit.proppatch(world, hooks, (path, headers.version_name), (body, bounds)),
@@ -1115,6 +1209,10 @@ fn status_of(code: u16) -> Status {
 
 impl<S: SvnStores> Exchange for SvnExchange<S> {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
+    if self.streamed.is_some() {
+      self.stream(run);
+      return Ok(());
+    }
     self
       .room
       .charge(to_u64(run.len()))

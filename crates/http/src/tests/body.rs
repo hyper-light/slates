@@ -36,7 +36,7 @@ fn read_in(
         .step(&piece[at..], admission)
         .map_err(Failed::Refused)?
       {
-        Step::Data { data: run, .. } if run.is_empty() => return Err(Failed::EmptyRun),
+        Step::Data { data: [], .. } => return Err(Failed::EmptyRun),
         Step::Data {
           data: run,
           consumed,
