@@ -12995,6 +12995,20 @@ engine: the verdict, rebase, position mapping, the register).
 > transfers served over them; locks by others than the owner once the push's policy check lands; principals' names for
 > people (§4.13); the stock git-lfs client end to end against the daemon (main's).
 >
+> **Status (2026-11-19, A-629 part 3: durable Git LFS objects, the batch API and the transfers served).** A git
+> repository's LFS objects live in its store on the owner shard (`crates/server`, `vcs_store`: `GitStore::lfs`, the
+> index `slates_git::lfs::objects::LfsObjects` over the shard's one content store). An upload is one entry of the
+> repository's logs holding the object's record (`vcs_store::lfs_record`: the oid and the bytes, magic "SGLF"), the
+> index keeping the object between the register's guard and the entry's apply (`repository::push::push_lfs`,
+> `vcs_store::admit_lfs`, the bytes checked against the oid there), so an upload is answered `200` only once its entry
+> is durable, bytes that are not their oid's are `422` with nothing kept or recorded, and an object held already
+> appends nothing. A recovery replays the record into the index through the same check (`vcs_store::replay_lfs`), told
+> from a push's record by its first word. The daemon's edge serves every LFS endpoint (`daemon_edge::ShardLfs`): the
+> batch API and the downloads read the index, each request answered with the seam its endpoint asks (`lfs::answer`:
+> the locks log, or the store's objects). Owed: uploads by others than the owner (the append's owner rule, A-635; such
+> an upload is answered `500` meanwhile); a streaming put, so an upload is not held whole; the stock git-lfs client end
+> to end against a daemon.
+>
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
 > re-encode byte for byte. `object-info`, `bundle-uri` and the `packfile-uris` choice are A-624's next part.
@@ -52494,3 +52508,38 @@ status after its body; `lfs.rs`: `NoObjects`, `bare`; the tests of `vcs_http`'s 
 - **Owed.** The objects' durable store on the owner shard (A-581), and with it the batch API and the transfers served;
   locks by others than the owner once the push's policy check lands (A-635); principals' names for people (§4.13); a
   request id named in LFS's error bodies; the stock git-lfs client end to end against the daemon (main's).
+
+### A-629 part 3 — Durable Git LFS objects: each upload an entry of the repository's logs holding the object's record, kept in its store's LFS index between the guard and the apply, replayed by a recovery; the batch API and the transfers served (2026-11-19, g230, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", §4.17.1 "Durability and residency"; after A-629 part 2c, A-662)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/git` (`lfs::objects::LfsObjects::release`
+and its test); `crates/server` (`vcs_store.rs`: `GitStore::lfs`, its release, `admit_lfs`, `LfsAdmitRefused`,
+`lfs_refusal_of`, `lfs_held`, `lfs_bytes`, `replay_lfs` and the replay's dispatch, `ReplayRefused`'s LFS kinds, the module
+doc; `vcs_store/lfs_record.rs` and its tests, new; `repository/push.rs`: `LfsUpload`, `push_lfs`, the `Stored` choice of
+what an entry's objects are, `sealed_record`; `lfs.rs`: `ShardObjects`, `NoLocks`, `answer` choosing its seams by
+endpoint, the module doc, and its tests; `vcs_http/daemon_edge.rs`: `ShardLfs` serving every endpoint; the site's test).
+- **Why.** A-629 part 2c answered the batch API and the transfers `503` at their head: no store on the owner shard kept
+  LFS objects durably, and an upload acknowledged and then forgotten by a restart would leave a pushed pointer naming
+  nothing. A-662 made a repository's store durable through its entries' records; this piece gives LFS objects the same.
+- **The record and its place.** An upload is one entry of the repository's logs that moves no green, holding the
+  object's record alone (`lfs_record`: magic "SGLF", version 1, the oid's 32 bytes, the length, the bytes; every count
+  checked, every malformation refused typed). The entry is recorded though it changes no log: its record is the object.
+  The repository's LFS index keeps the object between the register's guard and the entry's apply, as a git push's store
+  commits its objects there (A-662), with the bytes checked against the oid by LFS's own naming, so a refused guard
+  keeps nothing and a refused object records nothing. The append's choice of what its entry's objects are is one enum
+  (`Stored`: a git push's sealed objects, or an LFS upload), the shape A-687 gives Mercurial's import.
+- **Replay.** A recovery and a rebuild replay each record in log order; a git repository's record is an LFS object's
+  when its first word is "SGLF", replayed into the index through the same check (`replay_lfs`), and otherwise a push's.
+  An object the index holds already is kept as it is, so a replayed record holds one object.
+- **Serving.** `lfs::answer` answers a request with the one seam its endpoint asks, since both read and write the
+  shard's state: the locks API over the locks log, every other endpoint over the store's objects (`ShardObjects`), whose
+  upload appends through `push_lfs` and is answered `200` once the entry is durable; an object held already appends
+  nothing. Refusals in LFS's words: bytes not the oid's `422`, past the budget `507`, any other refusal of the append
+  (its owner rule among them) `500`.
+- **Tests.** `slates-git` `lfs_objects::an_index_given_back_leaves_the_store_holding_nothing`; `slates-server`
+  `vcs_store::lfs_record::tests` (the golden record, told from a push's, every malformation refused);
+  `lfs::tests::an_uploaded_object_is_durable_and_served_after_the_store_is_made_again` (an upload `200` with one record,
+  again with none, the store made again from the logs, the download's bytes and the batch's download action) and
+  `an_upload_whose_bytes_are_not_its_oid_is_refused_and_nothing_is_recorded` (`422`, no record, `404`); the site's
+  `the_daemons_lfs_serves_every_endpoint_deciding_its_status_after_its_body`.
+- **Owed.** Uploads by others than the owner (A-635's policy check, the queue's next piece); a streaming put in
+  `slates-vcs`, so an upload is not held whole and its record not copied whole; the stock git-lfs client end to end
+  against a daemon (the queue's next piece); a snapshot carrying the index by its tables, as A-662 owes for the store.

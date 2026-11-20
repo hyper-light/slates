@@ -1052,35 +1052,25 @@ fn a_served_lfs_request_is_answered_after_its_body_with_its_services_status_and_
   );
 }
 
-/// A-629 part 2c (the daemon's LFS: no upload acknowledged that a restart would forget, A-581). Do: as the owner, ask the
-/// daemon's LFS service, through the site, for the batch API, an object's upload, download and verification, and the
-/// locks API's create, list, verify and unlock. Expect: the four object endpoints `503` at their head, proven, their
-/// bodies never read; the four lock endpoints served, each deciding its status after its body.
+/// A-629 part 3 (the daemon's LFS over the repository's store). Do: as the owner, ask the daemon's LFS service, through
+/// the site, for the batch API, an object's upload, download and verification, and the locks API's create, list, verify
+/// and unlock. Expect every one served, proven, each deciding its status after its body: the objects are the
+/// repository's store's now, an upload durable before it is answered, so none is refused at its head.
 #[test]
-fn the_daemons_lfs_serves_the_locks_api_and_refuses_objects_at_their_head() {
+fn the_daemons_lfs_serves_every_endpoint_deciding_its_status_after_its_body() {
   let mut site = lfs_site(ShardLfs);
   let verify = format!("{LFS_OBJECT}/verify");
-  let objects = [
-    ("POST", "/r.git/info/lfs/objects/batch"),
-    ("PUT", LFS_OBJECT),
-    ("GET", LFS_OBJECT),
-    ("POST", verify.as_str()),
-  ];
-  for (method, target) in objects {
-    let asked = request(method, target, &[LFS_BODY, OWNER_BEARER]);
-    assert_eq!(
-      refusal(&ready(site.answer(&head(&asked), true))),
-      (Status::SERVICE_UNAVAILABLE, with_cache(&[]), true),
-      "{method} {target}"
-    );
-  }
-  let locks = [
+  let endpoints = [
+    ("POST", "/r.git/info/lfs/objects/batch".to_owned()),
+    ("PUT", LFS_OBJECT.to_owned()),
+    ("GET", LFS_OBJECT.to_owned()),
+    ("POST", verify),
     ("POST", LFS_LOCKS.to_owned()),
     ("GET", LFS_LOCKS.to_owned()),
     ("POST", format!("{LFS_LOCKS}/verify")),
     ("POST", format!("{LFS_LOCKS}/1.61/unlock")),
   ];
-  for (method, target) in locks {
+  for (method, target) in endpoints {
     let asked = request(method, &target, &[LFS_BODY, OWNER_BEARER]);
     let (_, _, status, _, proven) = served_lfs(ready(site.answer(&head(&asked), true)));
     assert_eq!(

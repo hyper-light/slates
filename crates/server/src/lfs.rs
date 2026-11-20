@@ -23,20 +23,28 @@
 //! `append` keeps its owner rule until the push's policy check lands (A-635: "until the policy of
 //! piece 7"), so today only the repository's owner takes and releases locks.
 //!
-//! **The objects** are a seam the caller hands in: the daemon holds no durable object store for a
-//! repository yet (A-581's use on the owner shard is owed), and a store that forgot its objects at
-//! a restart would lose them. So the daemon's edge serves the locks API alone, handing in
-//! [`NoObjects`], and answers the batch API and the transfers `503` at their head
-//! (`vcs_http::daemon_edge::ShardLfs`, A-629 part 2c): no upload is acknowledged that a restart
-//! would forget.
+//! **The objects** ([`ShardObjects`], A-629 part 3) are the repository's LFS index in its store on
+//! the owner shard (`crate::vcs_store`, `GitStore::lfs`): the batch API and a download read it,
+//! and an upload is one entry of the repository's logs holding the object's record, the index
+//! keeping the object between the register's guard and the entry's apply
+//! (`crate::repository::push::push_lfs`). So an upload is answered only once its entry is durable,
+//! and a recovery replays the record into the index; an upload of an object the index holds
+//! appends nothing. Bytes that are not their oid's are `422` with nothing kept, past the budget
+//! `507`. The append keeps its owner rule (A-635), so until the push's policy check lands an upload
+//! by another than the owner is `500`, its object not kept.
+//!
+//! **One seam a request.** `slates_git`'s server takes the objects and the locks as two seams, and
+//! both read and write the shard's state, so a request is answered with the one its endpoint asks
+//! and a stand-in for the other: the locks API with [`LogLocks`] and [`NoObjects`], every other
+//! endpoint with [`ShardObjects`] and [`NoLocks`]. No endpoint asks both.
 
 use slates_db::catalog::{
   Principal, RepositoryCheck, RepositoryId, RepositoryRecord, StateChange, StateLog,
 };
 use slates_git::lfs::objects::{Admitted, ObjectRefused};
 use slates_git::lfs::serve::{
-  Access, Answer, Context, Kind, LockRecord, Locks, LocksRefused, Need, Objects, Request, Routed,
-  Server, Taken, base_url,
+  Access, Answer, Context, Endpoint, Kind, LockRecord, Locks, LocksRefused, Need, Objects, Request,
+  Routed, Server, Taken, base_url,
 };
 use slates_git::lfs::{Oid, Timestamp};
 use slates_http::reply::Status;
@@ -45,7 +53,8 @@ use slates_vcs::ContentRefused;
 use slates_vfs::clock::Clock;
 use slates_wire::Wire;
 
-use crate::repository::push::{AppendRefused, EntryParts, RepositoryLogs};
+use crate::repository::push::{AppendRefused, EntryParts, LfsUpload, RepositoryLogs, push_lfs};
+use crate::vcs_store::LfsAdmitRefused;
 use crate::state::ShardState;
 use crate::vcs_policy::{Asked, Name, Right, admit};
 
@@ -294,9 +303,93 @@ pub(crate) struct LfsCall<'a> {
   pub(crate) room: u64,
 }
 
-/// The objects of a repository whose owner shard keeps none durably yet (the module doc): the
-/// daemon's edge hands them in with the locks API's requests alone, which never ask them. Asked,
-/// they hold nothing and keep nothing, so no upload is acknowledged that a restart would forget.
+/// A repository's LFS objects on its owner shard (module docs, "The objects"): read from its
+/// store's LFS index, and kept by an upload's append, durable before the upload is answered.
+pub(crate) struct ShardObjects<'s> {
+  /// The shard's state, the repository's logs and store among it.
+  state: &'s mut ShardState,
+  /// The repository.
+  repository: RepositoryId,
+  /// Who asks: an upload's entry is appended by them.
+  principal: Option<Principal>,
+}
+
+impl Objects for ShardObjects<'_> {
+  fn held(&self, oid: &Oid) -> Option<u64> {
+    crate::vcs_store::lfs_held(&self.state.vcs_stores, self.repository, oid)
+  }
+
+  fn bytes(&self, oid: &Oid) -> Option<Vec<u8>> {
+    crate::vcs_store::lfs_bytes(&self.state.vcs_stores, self.repository, oid)
+  }
+
+  fn admit(&mut self, oid: &Oid, bytes: &[u8]) -> Result<Admitted, ObjectRefused> {
+    if self.held(oid).is_some() {
+      return Ok(Admitted::Again);
+    }
+    // The access check asked for a principal before any upload; one without is the server's error.
+    let Some(principal) = self.principal.clone() else {
+      return Err(ObjectRefused::Store(ContentRefused::NotHeld));
+    };
+    let mut upload = LfsUpload {
+      oid: *oid,
+      bytes,
+      refused: None,
+    };
+    match push_lfs(self.state, (&principal, self.repository), &mut upload) {
+      Ok(_) => Ok(Admitted::New),
+      Err(refused) => Err(upload_refused(upload.refused, &refused, bytes.len())),
+    }
+  }
+}
+
+/// Why an upload's object was not kept, in the seam's terms: the LFS index's own refusal where it
+/// refused (bytes not the oid's, past the budget), the register's budget as the store's, and every
+/// other refusal of the append (its owner rule among them) as an object not kept.
+fn upload_refused(
+  index: Option<LfsAdmitRefused>,
+  refused: &AppendRefused,
+  len: usize,
+) -> ObjectRefused {
+  if let Some(LfsAdmitRefused::Object(object)) = index {
+    return object;
+  }
+  match refused {
+    AppendRefused::Entry(Refusal::BudgetExceeded { available })
+    | AppendRefused::Repository(Refusal::BudgetExceeded { available }) => {
+      ObjectRefused::Store(ContentRefused::OverBudget {
+        need: u64::try_from(len).unwrap_or(u64::MAX),
+        room: *available,
+      })
+    }
+    _ => ObjectRefused::Store(ContentRefused::NotHeld),
+  }
+}
+
+/// The locks of a request that asks for none (module docs, "One seam a request"): an object
+/// endpoint's stand-in, holding no lock and taking none.
+pub(crate) struct NoLocks;
+
+impl Locks for NoLocks {
+  fn take(&mut self, _path: &str, _owner: &str, _at: Timestamp) -> Result<Taken, LocksRefused> {
+    Err(LocksRefused::Failed)
+  }
+
+  fn find(&self, _id: &str) -> Option<LockRecord> {
+    None
+  }
+
+  fn listed_from(&self, _from: Option<&str>) -> Option<impl Iterator<Item = LockRecord> + '_> {
+    None::<core::iter::Empty<LockRecord>>
+  }
+
+  fn release(&mut self, _id: &str) -> Result<Option<LockRecord>, LocksRefused> {
+    Err(LocksRefused::Failed)
+  }
+}
+
+/// The objects of a request that asks for none (module docs, "One seam a request"): the locks
+/// API's stand-in, holding nothing and keeping nothing.
 pub(crate) struct NoObjects;
 
 impl Objects for NoObjects {
@@ -325,12 +418,9 @@ pub(crate) fn bare(status: Status) -> Answer {
 
 /// Answers `call` on the owner shard of its repository (the module doc): `404` for no repository
 /// of that name here, `500` for a clock outside RFC 3339's years, else `slates_git`'s answer over
-/// the repository's policy, its locks log and `objects`.
-pub(crate) fn answer(
-  state: &mut ShardState,
-  objects: &mut impl Objects,
-  call: &LfsCall<'_>,
-) -> Answer {
+/// the repository's policy and the seam its endpoint asks (module docs, "One seam a request"): its
+/// locks log for the locks API, its store's LFS objects for every other endpoint.
+pub(crate) fn answer(state: &mut ShardState, call: &LfsCall<'_>) -> Answer {
   let repositories = state.db.partition().repositories();
   let Some(record) = repositories.repository_named(&call.routed.repo).cloned() else {
     return bare(Status::NOT_FOUND);
@@ -353,25 +443,43 @@ pub(crate) fn answer(
     record: &record,
     principal: call.principal,
   };
-  let mut locks = LogLocks {
+  let request = Request {
+    endpoint: &call.routed.endpoint,
+    query: call.query,
+    body: call.body,
+  };
+  let mut admission = slates_git::Admission::new(call.room);
+  if asks_locks(&call.routed.endpoint) {
+    let mut locks = LogLocks {
+      state,
+      repository: record.id,
+      principal: call.principal.cloned(),
+    };
+    let mut server = Server {
+      access: &access,
+      objects: &mut NoObjects,
+      locks: &mut locks,
+    };
+    return server.answer(&request, &context, &mut admission);
+  }
+  let mut objects = ShardObjects {
     state,
     repository: record.id,
     principal: call.principal.cloned(),
   };
   let mut server = Server {
     access: &access,
-    objects,
-    locks: &mut locks,
+    objects: &mut objects,
+    locks: &mut NoLocks,
   };
-  let request = Request {
-    endpoint: &call.routed.endpoint,
-    query: call.query,
-    body: call.body,
-  };
-  server.answer(
-    &request,
-    &context,
-    &mut slates_git::Admission::new(call.room),
+  server.answer(&request, &context, &mut admission)
+}
+
+/// Whether `endpoint` is the locks API's, whose answer reads and writes the locks log alone.
+fn asks_locks(endpoint: &Endpoint) -> bool {
+  matches!(
+    endpoint,
+    Endpoint::CreateLock | Endpoint::ListLocks | Endpoint::VerifyLocks | Endpoint::Unlock { .. }
   )
 }
 

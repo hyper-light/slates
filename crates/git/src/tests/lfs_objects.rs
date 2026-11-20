@@ -86,3 +86,22 @@ fn an_object_past_the_store_s_budget_is_refused() {
   ));
   assert_eq!(objects.held(&store, &oid), None);
 }
+
+/// A-629 part 3: do keep two objects, one longer than a window, then give the index back. Expect
+/// the store to hold no content and no bytes afterwards: an index given back with its repository
+/// keeps nothing behind.
+#[test]
+fn an_index_given_back_leaves_the_store_holding_nothing() {
+  let mut store = store();
+  let mut objects = LfsObjects::new();
+  let long: Vec<u8> = (0..WINDOW * 3)
+    .map(|at| u8::try_from(at % 241).unwrap())
+    .collect();
+  for bytes in [&b"small object\n"[..], &long[..]] {
+    let oid = LfsNaming::oid(bytes);
+    assert_eq!(objects.admit(&mut store, &oid, bytes), Ok(Admitted::New));
+  }
+  assert_ne!(store.len(), 0);
+  assert_eq!(objects.release(&mut store), Ok(()));
+  assert_eq!((store.len(), store.used()), (0, 0));
+}
