@@ -12430,6 +12430,29 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > now checks its units there. Time stays the by-use signal, read in release: the diagnostics runs' past-budget counters,
 > and `window_step_times` (`--ignored`, release). On an M-series Mac, `big.txt` r5 to r6 took 1,310 calls; 5 were past
 > 5 us, the longest 54 us.
+> **A directory's listing at O(live children) (2026-11-20, A-759, w-bugs; main's ruling: fix the complexity before
+> slicing; shape agreed with w-svn, index owner).** `diag-w-bugs-svnfetch-9` named the update drive's directory step
+> as the long step: it listed both revisions' entries in one step, 100-650 us on average and up to 19.8 ms. A listing
+> walked every name ever made beneath the directory and its copy chain, resolved each in the revision, and the drive
+> resolved each child again for its entry: O(history beneath the directory) plus two resolves a child. Now every
+> directory node-revision holds a persistent ordered map of its children (`index::children`: a B-tree of up to 32
+> entries a node, a child's interned path number and node-revision, 8 bytes, in name order). The map's nodes live in
+> an arena the index owns: a change copies its path from the root once a revision (a revision's own nodes are edited
+> in place), and a copy shares its source's map whole. `Index::children` resolves the directory once and walks the
+> map. `Index::listing` gives each child's node-revision, so the drive makes an entry from the row. The maps' bytes
+> are charged to the index's room. A/B (`listing_times`, release, M-series Mac, `/trunk/big` with 10,000 names over
+> 1,000 revisions): `Index::children` took 3.84 ms at r1001 (9,001 live) and r500 (4,492 live) alike, and now 0.234
+> and 0.112 ms; the drive's listing went from 5.87 and 4.86 ms to 0.98 and 0.47 ms. The index holds 65,575 entries
+> (1.6 MB) for that history, the maps about 1.2 MB of it. **The cursor BUILT (same day, A-759 part 2).** A 9,001-entry
+> listing was still about 1 ms in one step. `Index::listing_after(path, revision, after, most)` descends the map past
+> the subtrees at or before `after` and reads `most` entries and one more, so it says whether more follow. The update
+> drive's directory step now compares the properties, then lists each side `LIST_STEP` (16) entries a step: the
+> source's first where the working copy holds its entries, then the target's. 16 entries are about 1.7 us at the
+> measured 109 ns an entry; `listing_times` measures one step of 16 at 1.6-1.75 us whether 9,001 or 4,492 live
+> (release, M-series Mac). By test (`a_very_large_directory_is_listed_a_few_entries_a_step`, 1,801 live entries;
+> a checkout and an update from r100): no step lists more than 16, where whole listings listed 1,801 in a step. The
+> checkout adds exactly the live names in order, and the update deletes exactly those gone. The replay drive's
+> `add_subdir` still lists a copied directory whole through `Repository::entries` (now the map walk).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -55710,6 +55733,14 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4f — A push's connectivity propagation a step of its stack a unit (2026-11-20, w-git for UI goal 93; the check's 57.9 ms at 100 concurrent pushes)
+- **Change.** `slates_git::receive::connect`'s walk carries the worst state back over the edges with its explicit stack
+  kept between turns (`Walk::propagation_unit`): a unit is one edge followed, one object finished, or the next root
+  opened; before, the whole propagation was one unit, the check's longest step at 100 concurrent v1.5.0 pushes (57.9 ms).
+- **Tests.** `slates-git` `receive::tests::session::a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole`
+  now holds a push to five turns an object at least (red with the whole propagation: `create`, 11 turns for 3
+  objects); `slates-git --lib -- receive::` 46 passed; fmt clean (macOS arm64, this Mac, local).
+
 ### A-722 part 4e — A stage a landing overtook is made again in turns before its append (2026-11-20, w-git for UI goal 93; the answer's 74 ms at 100 concurrent pushes)
 - **Why.** At 100 concurrent pushes to one repository the answer's longest step was 73.7 ms: every push sealed while
   another landed had its stage overtaken, and its append's commit staged it again whole, in that step.
@@ -56622,6 +56653,17 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   live_chaos fresh-member flow (2/2) send installs from the lent payload.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
+- **Part 4 (the holder's take turn).** A holder hashed each entry it took in the turn that took it (`Replica::check`,
+  twice for a duplicate): up to 179 ms of a debug holder's CPU in one poll of `serve_peer_records` under
+  `taskpolicy -b`. A live message over one page (`live_ship::hashed_in_turns`) now runs on a task of its own after its
+  claim is admitted: `serve_entries_hashed` decodes it within the admitted bound, feeds each entry's canonical bytes to
+  `EntryHasher::of` in slices sized to the quantum left (`piece_bytes`), yielding once the quantum is spent (counted
+  `fleet.live.held_hash_turns`), then takes the entries through `serve_taken` with `Replica::check_identified`; a
+  request the bound or the decode refuses is answered by the old path. The owner sends a holder's next message only once
+  this one is answered, so entries stay in order. Release, 2.4 MB: the guard 0.96 / 1.05 ms best / median hashing, 0 /
+  41 ns given the identity; each 64 KiB slice 27 / 34 us (`measure_the_holders_take_turn`). Tests:
+  `a_holder_hashing_an_entry_in_slices_admits_what_the_hashing_guard_admits`; the fleet large-delta test holds the
+  holders to at least a page a turn under the cut quantum, red before (0 turns).
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
 
