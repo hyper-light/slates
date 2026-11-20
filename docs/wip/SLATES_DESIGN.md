@@ -54835,3 +54835,9 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   --test-threads=4` 43 of 43; `slates-ipc --test wire_order` 2 of 2; fmt clean.
 - **Owed.** The svn:// edge's own CRAM user and this name agreeing for one principal (the edge names its CRAM user;
   main's by-use check); copies and symbolic links (next pieces).
+- **Piece 7, the proof harness and its first run (2026-11-20).** `crates/cli/bench/multi_repo_load.py`
+  (BENCHMARKS.md, "Many repositories of mixed sizes and skewed activity on one daemon"). At R = 100 on the 32-core
+  Studio, every push landed, but the small repositories' p99 was 14.1 times their push alone while one hot repository
+  pushed: piece 3's memory share does not schedule CPU, so the shard's step quanta scheduled fairly by repository is next.
+  R = 1,000 waits on one copy a byte (A-723, A-727). A push of git/git v2.0.0 ends the daemon (reported).
+
