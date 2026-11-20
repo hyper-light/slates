@@ -5444,6 +5444,15 @@ drops.
 > `Deadlines::reconnect_ns` remains only for the waits on a fleet owner's takeover (a request refused for now held for
 > its resend, the pause between resends, `call_through_transient`), whose own bound, the failover delay, is owed in GAPS.
 
+> **Status (2026-11-20, A-735): a macOS claim made in a replaced daemon's bootstrap object ends.** A daemon that holds
+> its own rendezvous makes the object again at its start (the create unlinks a dead predecessor's), and takes the
+> owner's bootstrap name a claim's life is judged by. A client that opened the predecessor's object (before the
+> successor's start, or between its taking the name and making the object) waited for good on a slot no daemon reads.
+> Each look on the claim's owner now also reads its own slot in the object under the name: a slot that does not name
+> this client by its pid and start (A-522; only the claimant writes them) means the object was made again, and the
+> claim is taken back and refused `DaemonUnavailable`, which a reconnect claims again. An anchor's object outlives its
+> daemon's restarts, so a claim under one keeps waiting (A-114, A-468).
+
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
 = ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = F, R9's provisioning floor, 50 µs
@@ -15874,7 +15883,23 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > out the post-hook, `locks_finished` ends it), so the connection task runs each hook between them. Held to the
 > listener's tests: a refusing pre-lock answered in `svnserve`'s words with no lock held; pre-lock's arguments and
 > token, post-lock's arguments, standard input and failure after `done`; pre- and post-unlock's arguments and standard
-> input. Owed: `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
+> input. **Part 3:** the `svn+ssh://` tunnel (`svnserve -t`) runs them the same way through the same runner, the
+> repository's policy its record's; no signal of the client gone reaches the SSH edge yet, so a run there ends at its
+> learned bound or by itself.
+>
+> **Status (2026-11-20, A-733: the DAV site runs the hooks).** Built: svn over http(s) runs them where `mod_dav_svn`
+> runs them, through A-730's runner (`HookSite::Http`, the exchange's `ClientGone` and its repository's policy):
+> start-commit as the POST makes the transaction (REPOS, the user, `mergeinfo`, which every stock client announces in its
+> `DAV` header, and the transaction), pre-commit at the MERGE before the verdict (REPOS, the transaction, the presented
+> lock tokens by repository path) and post-commit once the revision stands, its failure the MERGE response's
+> `S:post-commit-err` (`merge.c`); pre-lock before a LOCK is judged (its refusal the LOCK's, "Failed to create new
+> lock.", its standard output the lock's token) and post-lock after it, pre-unlock and post-unlock around an UNLOCK, a
+> post-hook's failure logged and counted, never told (`lock.c`: the lock stands and its answer with it). The svn crate's
+> DAV commit stops at its hooks (`DavCommit::begin_hooked` and `resume_begin`, `merge_hooked` and `resume_merge`), so
+> the exchange runs each between two lends. Held to the daemon edge's tests over HTTPS: a refusing start-commit answers
+> the POST in `svnserve`'s words; a DAV commit's start- and pre-commit given their arguments and post-commit's failure in
+> `S:post-commit-err`; a refusing pre-lock answers the LOCK. Owed: the revprop hooks' calls (A-702 part 2, w-svn), the
+> SSH edge's client-gone signal, REPOS as A-645's FSFS-layout view.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -55124,6 +55149,51 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Residual.** A relief itself held in a send is relieved by no one (two completions each waiting on the drive at
   once); the relief's receive may run its transaction timeout (1 s) before it hands the state back.
 - **Applied in the same change to** GAPS (the delete/purge hang entry), the fsx bug record, amendments.tsv.
+
+### A-735 — A macOS claim made in a replaced daemon's bootstrap object ends (bug, 2026-11-20, w-forming; found by use: main's forming sweep, live_chaos `a_member_that_never_held_the_log_never_stands_in_for_its_holder` under `taskpolicy -b`, run 25; amends A-443's macOS look; §4.7 "Rendezvous")
+
+- **What happened.** The flow replaced fleet member `a` with a fresh daemon and asked it `volume list` while it started.
+  The client hung 30+ minutes in `Claim::wait` against a daemon serving with both shards parked: read at the hang, the
+  bootstrap object under the instance's name (its start stamp the fresh daemon's) had all 64 claim slots free and no
+  slot naming either hung client's pid.
+- **Cause.** A daemon run alone takes the owner's bootstrap name (`take_ownership`), then makes the object again
+  (`owned_object`; `SharedObject::create` unlinks the dead predecessor's). A client that opened the predecessor's object,
+  still published since a killed daemon never takes its stamp back, claimed a slot there; its look asked only whether the
+  owner's name was held, and the successor held it, so the claim was due for good.
+- **The fix.** `Claim::look` (macOS) also asks `made_again`: the object now under the name is opened and the claim's slot
+  read; a pid or start other than this process's (A-522's fields, written only by the claimant) means the object was made
+  again, and the claim is taken back and refused `DaemonUnavailable`. No object under the name yet reads not made again,
+  so the next look asks again. An anchor's object outlives its daemon's restarts, so its claims keep waiting.
+- **Tests.** `slates-ipc` `rendezvous::platform::tests::a_claim_on_a_rendezvous_made_again_by_a_new_owner_ends`: red
+  before (still due 2.000 s after the object was made again), refused 178 µs after it with the fix. macOS arm64, Mac
+  Studio (adas-mac-studio-4), local: `cargo test --locked -p slates-ipc --lib rendezvous::` 16 of 16,
+  `--test rendezvous` 14 of 14, fmt clean.
+- **Applied in the same change to.** §4.7's A-468 status (a status line), GAPS (the rendezvous waits entry).
+
+### A-733 — The DAV site runs a repository's hooks (2026-11-20, w-reaper, UI goal 93; §4.17.4 items 5 "HTTP" and 9; A-730, A-681, A-627, A-661)
+
+- **What was there.** After A-730, svn:// and svn+ssh:// ran a repository's hooks, but the DAV site refused a commit
+  at a configured start-commit or pre-commit ("This server does not run this repository's hooks yet"), never ran
+  post-commit, and ignored the lock hooks.
+- **Change.** `slates_svn::dav::commit::DavCommit` stops at its hooks: `begin_hooked` (the transaction begun as far as
+  start-commit, its due handed back) and `resume_begin`; `merge_hooked` (as far as pre-commit) and `resume_merge`;
+  `begin` and `merge` with a hooks closure are wrappers over them. `pending_base` and `pending_tokens` give a hook its
+  transaction's base and its presented tokens by repository path. The server's `SvnStores::begin_commit` hands back
+  start-commit's due with the transaction's name; `SvnExchange`'s POST, MERGE, LOCK and UNLOCK are async steps of its
+  `body_end`, each running its hooks through `vcs_svn::run_hook` with `HookSite::Http` (the exchange's `ClientGone`, the
+  repository's policy, which the exchange keeps). pre-lock and pre-unlock run once the request reads as a lock or an
+  unlock, before the table judges it (a read-only lend plans it first); a post-hook's failure is counted
+  (`vcs_http.svn_post_lock_failed`, `_post_unlock_failed`) and never told, as `mod_dav_svn` logs it.
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_dav_posts_start_commit_hook_that_refuses_refuses_the_
+  transaction_in_svnserves_words`, `a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them`,
+  `a_dav_lock_runs_pre_lock_and_its_refusal_answers_the_lock` (a daemon's HTTPS edge, shell-script hooks through
+  `SetRepositoryPolicy`; red before: the not-run refusal, or the hook ignored); `vcs_http::svn`, `vcs_svn::`,
+  `vcs_ssh::` and the svn crate's `dav::` and `commit::` unchanged; stock svn 1.15's HTTP round trip, locks, blame and
+  diff on the Mac Studio. macOS arm64.
+- **Applied in the same change to** §4.17.4 item 9's status, GAPS (A-730's line), amendments.tsv.
+- **Departure, stated.** start-commit's capabilities are `mergeinfo`, which every stock client announces in its
+  requests' `DAV` header, rather than read from the request.
+- **Owed.** The revprop hooks' calls with A-702 part 2 (w-svn). REPOS as A-645's read-only view (next).
 
 ### A-736 — The SSH edge's signal of its client gone ends a hook's run (2026-11-20, w-k90-vendor, kiln goal 90; A-730's owed item, A-665 part 4a, A-651, A-683)
 - **Why.** A hook's run over SSH (git's receive-pack, A-683; Subversion's tunnel, A-730 part 3) ended only at its

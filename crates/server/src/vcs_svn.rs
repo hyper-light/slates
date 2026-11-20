@@ -1358,17 +1358,21 @@ impl Opened {
 }
 
 /// Where a hook's run is asked from (A-730): the `svn://` listener's connection, whose repository's policy is read on
-/// its owner shard and whose client's hang-up ends the run; or the `svn+ssh://` tunnel, which holds its repository's
-/// record and has no signal of its client gone yet (owed with git's on the SSH edge), so a run there ends at its learned
-/// bound or by itself.
+/// its owner shard and whose client's hang-up ends the run; the `svn+ssh://` tunnel, which holds its repository's
+/// record, its client's hang-up the SSH edge's signal (A-736); or the DAV site's exchange (A-733).
 #[derive(Clone, Copy)]
 pub(crate) enum HookSite<'a> {
   /// The listener's connection.
   Listener(&'a TcpStream),
-  /// The tunnel's repository policy, and the SSH edge's signal of its client gone.
+  /// The tunnel's repository policy, and the SSH edge's signal of its client gone (A-736).
   Tunnel(
     &'a slates_db::catalog::RepositoryPolicy,
     crate::vcs_ssh::site::ClientGone<'a>,
+  ),
+  /// The DAV site's exchange (A-733): its client's hang-up and its repository's policy.
+  Http(
+    crate::vcs_http::ClientGone<'a>,
+    &'a slates_db::catalog::RepositoryPolicy,
   ),
 }
 
@@ -1409,13 +1413,15 @@ pub(crate) async fn run_hook(
     HookSite::Tunnel(policy, gone) => {
       run_svn_hook(policy, repository, words_cap, point, input, gone.gone()).await
     }
+    HookSite::Http(client, policy) => {
+      run_svn_hook(policy, repository, words_cap, point, input, client.gone()).await
+    }
   }
 }
 
 /// Runs the hook `policy` configures at `point` (`crate::svn_hooks::run`, the hook driver of A-622 with A-623's
-/// Subversion rules), held to the bound its runs taught this shard and ended once `gone` says its client hung up (the
-/// listener's socket watched, A-665 part 4a's signal; the SSH edge's, for the tunnel), then teaches the shard what this
-/// run showed. A point with no hook answers at once, running nothing,
+/// Subversion rules), held to the bound its runs taught this shard and ended when `gone` answers (its client hung up),
+/// then teaches the shard what this run showed. A point with no hook answers at once, running nothing,
 /// as `svnserve` does.
 #[cfg(unix)]
 async fn run_svn_hook(
@@ -1948,4 +1954,4 @@ async fn read_more(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
