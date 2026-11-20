@@ -25,6 +25,16 @@
   measure(--quick) (pre-banner profile measurement, role/daemon.rs start()) past START_WAIT 30 s; control-shard beats
   of a gapped 3-5 s = host starvation while rp1 ran beside the throttled sweep. Stopped rp1. sw48 runs 1-21 overlapped
   rp1 (contaminated); plan: sweep finishes, then 21 clean runs (tag sw48b) -> 48 clean. Then resume the run-7 chase.
+- ~09:00Z sw48 run 25 HUNG 30+ min: fresh member a's `volume list` client stuck in rendezvous Claim::wait; the live
+  bootstrap object had all 64 slots free (read via shm at the hang) -> claim stranded in the predecessor's unlinked
+  object while the successor held the owner name. Evidence ~/.cache/w-forming-runs/sw48-25-evidence/ (samples).
+  Also in run 25: two daemons watchdog-killed (exit 4: shard 0 spinning 5.7 s CPU without a step) under the throttle --
+  reported, not chased. Killed run 25 (counted FAIL), sweep continues on pre-fix main.
+- LANDED A-735 727ebe674 on origin/main (verified merge-base): ipc Claim::look made_again() reads its own slot (pid+start)
+  in the object under the name; red 2.000 s -> 178 us; ipc --lib rendezvous:: 16/16, --test rendezvous 14/14, fmt.
+  Landed from ~/slates-work/w-forming-repro (main ff'd), not the wip branch. Ledger row A-735 pushed first.
+- NEXT: when sw48 ends, rebuild on current main (with A-735) and run a clean 48 (tag sw48c, taskpolicy -b, nothing
+  beside it) = the goal evidence; then GAPS line + report. Run-7 chase after that (diag aid on agents/w-forming-repro).
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
   test, fix, land (needs a machine that can push). No failure -> report count to slates-7a.
