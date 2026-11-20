@@ -49,3 +49,14 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
 - State folder ~/fanout-state-w-engine; worktree ~/slates-work/w-engine (clone of origin/main e71043ff6); target
   ~/.cache/w-engine-target. Push route: kiln `run` on adas-mac-studio-2.local (this Studio has no GitHub creds).
 - NEXT: claim A-number on the ledger, write §4.16 entry, implement S2.1.
+
+## Slice 1 (A-728 part 1) LANDED
+- f8dd10172 (merge f7e34bedc), confirmed `git merge-base --is-ancestor` on origin/main.
+- Push route that works: bundle origin/main..HEAD into ~/fanout-state-w-engine/push/w-engine.bundle (untracked, never
+  commit it), kiln `run` on adas-mac-studio-2.local with cwd ~/fanout-state-w-engine; there a blobless clone
+  ~/.cache/w-engine-clone fetches origin main + the bundle, refuses if main moved (exit 9: merge here again), pushes
+  TIP:refs/heads/main, checks merge-base.
+- NEXT: part 2: spliced's added runs name the new file block (Source::Block slot), seal_latest(path) before the splice
+  and after a removal: for each Block slot all of whose refs are the value's own pieces and whose block's only holder is
+  the history, copy the named runs into one owned chunk when they are less than the block; else keep. Needs
+  Blocks::holders.
