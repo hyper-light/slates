@@ -8,6 +8,11 @@
   4 runners link down, no other macOS runner with cargo. Left queued; it starts by itself.
 - ~23:15: r1 (cpus=8,mem=24g) never placed in ~60 min; stopped. r2 (cpus=3,mem=8g,disk=35g) placed then failed to
   start ("no room here now"). r3 (same ask) QUEUED ~40 min, first in line, no machine with room. Disk here 6.5 GB.
+- ~00:10: disk freed (100 GB); built locally (a6764af1e = branch + origin/main), loop fm1 running (12 runs).
+  Runs 1-6 PASS. Run 7 FAIL, NOT a forming shape: fleet formed+settled, fresh member rejoined 2.3 s, then the owner's
+  holder move holders [1150..,7405..] -> moving_to [1150..,10913..(fresh)] never completed; writes refused ~40 s
+  ("covers candidates false", head 1410 durable 1409); panic live_chaos.rs:4879 "the owner's holders settled within
+  the fleet wait". Log ~/.cache/w-forming-runs/fm1/run-7.log (this Mac). Out of my goal's scope -> reported to main.
 - Nothing finished, so nothing to land on main.
 - State branch now kept in ~/fanout-state-w-forming (main 4d39b11 rule); A-numbers claimed only by a pushed amendments.tsv line.
 - Next: when r1 ends, read its TALLY; a failure -> match to g225 (a) stuck dial / (b) term-1 joint entry, failing unit
