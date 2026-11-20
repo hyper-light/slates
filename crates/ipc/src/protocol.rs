@@ -1495,6 +1495,9 @@ pub struct ToolIdentities {
   pub git: Option<GitIdentity>,
   /// Mercurial's.
   pub mercurial: Option<String>,
+  /// Subversion's author: the principal's own name, as the svn+ssh edge names a commit's author (A-664's Subversion
+  /// objects). Its session fills it from the principal its channel proved, over whatever the client sent. Appended.
+  pub subversion: Option<String>,
 }
 
 /// What a submit carries for the commit the server makes of its work (§4.17.1 "A push is a work" item 4; A-664): the

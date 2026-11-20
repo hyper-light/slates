@@ -63,8 +63,9 @@
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
-> read before from the records and after from the green, recorded in the submit's transaction), its copies as rows with
-> their sources, symbolic links as `svn:special` files and `svn:author` owed; Mercurial's changesets of a submitted
+> read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
+> principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20), its copies as rows with their
+> sources and symbolic links as `svn:special` files owed; Mercurial's changesets of a submitted
 > version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
