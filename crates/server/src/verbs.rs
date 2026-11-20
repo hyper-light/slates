@@ -4065,6 +4065,8 @@ fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
 
 /// This shard's part of the status: its counters and its health signals (§4.14 catalog).
 pub fn shard_report(state: &mut ShardState) -> ShardReport {
+  // Advanced first, mutably: the sweep of the shard's slice of the anchor content object (A-744).
+  let content_ranges = crate::content_ranges::report(state);
   let now = state.clock.monotonic_ns();
   let since_boot = now.saturating_sub(state.booted_ns);
   let ring_depth: u64 = state
@@ -4241,6 +4243,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
         }),
       )
       .chain(large_counts(state))
+      .chain(content_ranges)
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,

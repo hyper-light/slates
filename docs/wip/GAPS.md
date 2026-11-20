@@ -215,8 +215,10 @@
 >
 > **A-742 (2026-11-20, w-engine; main's ruling):** BUILT: large allocations mapped directly and unmapped when freed
 > (`slates_mem::large`), large temporaries cut (`Wire::encoded_len`, `Db::mutate_owned`, `Checkpoint::into_encoded`);
-> svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. OWED: `Record::revision_bytes`'s growth, the
-> log's decode-after-encode copy, the svn commit's retry clone, the anchor content object's 581 MiB split by range.
+> svn 1,000-revision import 2.4-2.6 GB -> 1.43-1.50 GB at once, same time. A-744 closed the record's growth, the retry
+> clone and the split (the 581 MiB is the owner partition's segment log ring and snapshot slots; the content object
+> 2.3 MiB). OWED: a replay measure that does not decode (A-420), so the log's decode-after-encode copy can go; Windows'
+> residency (`QueryWorkingSetEx`).
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's

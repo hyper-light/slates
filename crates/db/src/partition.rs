@@ -573,6 +573,15 @@ impl Partition {
     self.caps
   }
 
+  /// The bytes the green chains may still grow by before an increment is refused (`green_chains` at its cap): what a
+  /// caller sizing a chain entry beforehand checks, so it can checkpoint first and append once (A-742).
+  pub fn green_chain_room(&self) -> usize {
+    self
+      .caps
+      .green_chain_bytes
+      .saturating_sub(self.green_chain_bytes)
+  }
+
   /// A green volume's merge chain (§4.16): its accepted increments after its checkpoint
   /// ([`Partition::green_checkpoint`]; all of them while it holds none), encoded, in commit order, so the chain's
   /// entry `n` is version `checkpoint + n + 1`. Empty for a green with no version past its checkpoint and for any
