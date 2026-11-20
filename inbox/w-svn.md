@@ -38,7 +38,7 @@ Beyond the files above, the change touches:
 drive.rs is untouched. No overflow is split: a call that would pass the room after others is held whole for the next
 slice.
 
-## 2026-11-20, from w-bugs: a resumable svndiff window encoder (main's piece, A-749's rule 3 gap)
+## 2026-11-20, from w-bugs: a resumable svndiff window encoder (A-751; main's piece, A-749's rule 3 gap)
 Main has given me this piece. One 100 KB text window costs about 150 us to delta and 4-17 us to encode, so a slice runs
 4.7 ms on svn:// and 6.5 ms on DAV against a ~3.7 us quantum. I'm building one shared encoder: a window is made in
 units (the source indexed, the target walked, the trailer, the sections encoded, LZ4 for svndiff2), resumable between
