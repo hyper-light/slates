@@ -803,6 +803,61 @@ fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
   assert_eq!(refused, (Vec::new(), 0));
 }
 
+/// Shape: the pushes [`t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append`] answers at
+/// once, a step of each in turn.
+const INTERLEAVED: usize = 12;
+
+/// A-722 part 4e (the answer's longest step at 100 concurrent pushes to one repository: a commit staging again whole a
+/// push whose stage another's landing overtook). Do: start [`INTERLEAVED`] pushes to one repository, each creating its
+/// own branch at the fixtures' first commit with its whole pack; hand each its request; answer them a step of each in
+/// turn. Expect: every push `ok`, and no commit staged a push again whole (the store's `restaged` count none): each
+/// stage the first landing overtook was made again in its push's turns before its append.
+#[cfg(unix)]
+#[test]
+fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append() {
+  let (outcomes, restaged) = crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "overtaken");
+    let pack = pack_of(scenario!("create").request);
+    let mut pushes: Vec<Option<ReceivePack>> = (0..INTERLEAVED)
+      .map(|k| {
+        let name = format!("refs/heads/p{k}");
+        let created = [("", FIRST, name.as_bytes())];
+        let body = request(&created, CAPABILITIES, pack);
+        let (_, mut push) = started(state, repository);
+        for piece in body.chunks(PIECE) {
+          push.input(state, piece).expect("taken");
+        }
+        push.end(state).expect("ended");
+        Some(push)
+      })
+      .collect();
+    let mut outcomes = vec![Vec::new(); INTERLEAVED];
+    while pushes.iter().any(Option::is_some) {
+      for (at, slot) in pushes.iter_mut().enumerate() {
+        let Some(push) = slot.as_mut() else {
+          continue;
+        };
+        if let Answering::Answered(received) =
+          push.answer_step(state, &mut Vec::new()).expect("answered")
+        {
+          outcomes[at] = reasons(&received);
+          *slot = None;
+        }
+      }
+    }
+    let restaged = state
+      .vcs_stores
+      .git_ref(repository)
+      .map(|(_, git)| git.repository.counters().restaged);
+    (outcomes, restaged)
+  });
+  assert!(
+    outcomes.iter().all(|reasons| reasons == &[b"ok".to_vec()]),
+    "{outcomes:?}"
+  );
+  assert_eq!(restaged, Some(0));
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The hooks (A-665 part 3; Unix, where the hook driver runs).
 

@@ -193,6 +193,9 @@ pub struct StoreCounters {
   pub reference_deltas: u64,
   /// Base packs made.
   pub rebuilds: u64,
+  /// Pushes a commit staged again whole, their stage overtaken by a landing since (A-722 part 4e: a push's judge
+  /// stages it again a turn at a time before its append, [`Repository::needs_stage`], so a commit meets none).
+  pub restaged: u64,
 }
 
 /// The entry a path names in a version's tree.
@@ -968,15 +971,23 @@ impl Repository {
     let staged = match self.adoptable_stage(store, push)? {
       Some(staged) => staged,
       None => {
+        if !push.is_empty() {
+          self.count(|counters| counters.restaged = counters.restaged.saturating_add(1));
+        }
         self.stage(store, push)?;
         push.take_staged().ok_or(StoreRefused::Unsealed)?
       }
     };
     let fresh_ids: Vec<ObjectId> = staged.positions.keys().copied().collect();
     let positions = staged.positions.clone();
-    let next = staged
-      .base
-      .saturating_add(u64::try_from(staged.positions.len()).unwrap_or(u64::MAX));
+    // A stage that gives no position leaves the next position where it is, however long ago it was made.
+    let next = if staged.positions.is_empty() {
+      self.next_position
+    } else {
+      staged
+        .base
+        .saturating_add(u64::try_from(staged.positions.len()).unwrap_or(u64::MAX))
+    };
     let brought_by = self.brought_by(moves, first);
     let landed = landed_runs(&fresh_ids, &positions, &brought_by);
     let (planned, heads) = self.plan(store, moves, &positions)?;
@@ -996,19 +1007,24 @@ impl Repository {
       give_back(store, &values)?;
       return Err(refused.into());
     }
-    let inserted = self
-      .index
-      .adopt(store, staged.fork)
-      .map_err(|refused| match refused {
-        slates_vcs::AdoptRefused::Refused(refused, fork) => {
-          let _ = fork.release(store);
-          StoreRefused::from(refused)
-        }
-        slates_vcs::AdoptRefused::Stale(fork) | slates_vcs::AdoptRefused::NotAFork(fork) => {
-          let _ = fork.release(store);
-          StoreRefused::Moved { green: first.green }
-        }
-      });
+    // A stage that gives no position writes no row: its fork is given back, never adopted.
+    let inserted = if staged.positions.is_empty() {
+      staged.fork.release(store).map_err(StoreRefused::from)
+    } else {
+      self
+        .index
+        .adopt(store, staged.fork)
+        .map_err(|refused| match refused {
+          slates_vcs::AdoptRefused::Refused(refused, fork) => {
+            let _ = fork.release(store);
+            StoreRefused::from(refused)
+          }
+          slates_vcs::AdoptRefused::Stale(fork) | slates_vcs::AdoptRefused::NotAFork(fork) => {
+            let _ = fork.release(store);
+            StoreRefused::Moved { green: first.green }
+          }
+        })
+    };
     if let Err(refused) = inserted {
       store.discharge(more.saturating_add(landing_cost))?;
       give_back(store, &values)?;
@@ -1095,6 +1111,25 @@ impl Repository {
       .saturating_add(self.index.fork_room())
   }
 
+  /// Whether `push` holds objects its commit would stage again (A-722 part 4e): none staged, or a stage a landing
+  /// overtook since ([`Self::adoptable_stage`]'s rule). A push's judge stages it again a turn at a time while it does.
+  pub fn needs_stage(&self, push: &Push) -> bool {
+    if push.is_empty() {
+      return false;
+    }
+    !push
+      .staged()
+      .is_some_and(|staged| self.stage_current(staged))
+  }
+
+  /// Whether `staged` is a stage this index takes as it is: one that gives no position (every object the push holds
+  /// indexed already, as they stay), which no landing can overtake (A-722 part 4e); or one no landing overtook, no row
+  /// taken in nor position given since its fork was made.
+  fn stage_current(&self, staged: &super::push::Staged) -> bool {
+    staged.positions.is_empty()
+      || (staged.base == self.next_position && self.index.adoptable(&staged.fork))
+  }
+
   /// The push's staged rows when this index would adopt them as they are (A-722 part 3): no row taken in nor position
   /// given by the repository since its fork was made. A stage this repository outran is given back, for the push to be
   /// staged again ([`Self::stage`]).
@@ -1103,9 +1138,9 @@ impl Repository {
     store: &mut ContentStore,
     push: &mut Push,
   ) -> Result<Option<super::push::Staged>, StoreRefused> {
-    let current = push.staged().is_some_and(|staged| {
-      staged.base == self.next_position && self.index.adoptable(&staged.fork)
-    });
+    let current = push
+      .staged()
+      .is_some_and(|staged| self.stage_current(staged));
     let Some(staged) = push.take_staged() else {
       return Ok(None);
     };
