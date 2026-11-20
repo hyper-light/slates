@@ -299,6 +299,8 @@ struct DecidingPush {
   verdicts: HookVerdicts,
   /// The decision under way.
   deciding: Deciding<Entry>,
+  /// The admission of the command under way's move, a turn at a time (A-722 part 4c).
+  admitting: Option<slates_git::store::Admitting>,
   /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
   #[cfg(unix)]
   then: Option<hooks::PushHooks>,
@@ -610,6 +612,7 @@ impl<P> ReceivePack<P> {
       name,
       verdicts,
       deciding,
+      admitting: None,
       #[cfg(unix)]
       then: None,
     })
@@ -631,6 +634,7 @@ impl<P> ReceivePack<P> {
         name,
         verdicts,
         deciding,
+        admitting,
         ..
       } = &mut decision;
       let mut judge = ServerJudge {
@@ -640,6 +644,7 @@ impl<P> ReceivePack<P> {
         principal: &self.principal,
         name: *name,
         hooks: verdicts,
+        admitting,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -1273,10 +1278,32 @@ struct ServerJudge<'j> {
   name: [u8; 32],
   /// What the push's hooks before the verdicts decided of its commands.
   hooks: &'j mut HookVerdicts,
+  /// The admission of the command under way's move, a turn at a time (A-722 part 4c).
+  admitting: &'j mut Option<slates_git::store::Admitting>,
 }
 
 impl Judge for ServerJudge<'_> {
   type Accepted = Entry;
+
+  /// A turn of the admission of `command`'s move (A-722 part 4c), for the shard's step quantum and a unit at least: the
+  /// walk of what it brings, which its append then takes whole ([`SealedPush::admit`]). A delete needs none.
+  fn ready(&mut self, command: &Command, _pushed: &Pushed<'_>) -> bool {
+    if command.is_delete() {
+      return true;
+    }
+    let repository = self.record.id;
+    let green = {
+      let state = &*self.state;
+      let Some(store) = state.vcs_stores.git_ref(repository) else {
+        return true;
+      };
+      born(state, (repository, &command.name), store).unwrap_or_else(|| unheld_key(repository))
+    };
+    let ns = self.state.config.step_quantum_ns();
+    self
+      .push
+      .admission_turn(self.state, (green, command.new), (self.admitting, ns))
+  }
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
     if let Some(declined) = self.hooks.declined(&command.name) {

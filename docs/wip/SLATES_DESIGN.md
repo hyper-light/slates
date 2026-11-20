@@ -55499,6 +55499,26 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4c — A move is admitted a unit at a time before its append (2026-11-20, w-git for UI goal 93)
+- **Change.** `slates_git::store::Admitting` (`Repository::admitting`, `admit_turn`): A-614's admission of a move (the
+  walk of what it brings against the green's reached set, the fast-forward's descent by generation number, the search
+  for a base green, the walk beyond the base) cut into units, an object or a commit each; `Repository::admit` runs the
+  same units to their end. `slates_git::receive::Judge::ready` (default ready at once) lets a judge prepare a command
+  over turns before its verdict; the server's judge admits the command's move there (`SealedPush::admission_turn`, the
+  shard's step quantum a turn) and keeps it, and the append takes it whole while its green's head is still the one it
+  was admitted from (`SealedPush::admit`), admitting again otherwise.
+- **Measured** (debug, this Mac, one command bringing 3,502 objects of a 3,500-file tree, load 20 to 30): the work build
+  374 to 642 ms, the entry's apply 114 to 196 ms, the append's judge 67 to 86 ms, the store's commit 21 to 119 ms, the
+  store's admission 13 to 58 ms (now turns), the seal 59 to 163 ms (turns since part 4b). Sent to main: the work build
+  and the apply grow with the head's files and are the works' and merge's.
+- **Tests.** `slates-git` `store::tests::a_move_admitted_a_unit_a_turn_is_the_move_admitted_whole` (a create and a
+  fast-forward); `slates-server` `vcs_store::tests::t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands`.
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-git --lib -- receive:: store::` 138 passed, 4 ignored
+  (and `store:: upload:: receive:: hook_view` 204 before the receive change); `slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 185 passed; fmt clean.
+- **Owed.** The store commit's whole passes (members' positions, landed runs, holds' release) and a stale restage
+  sliced; the work build and the entry's apply (works, merge).
+
 ### A-722 part 4b — A push is sealed and staged a unit at a time (2026-11-20, w-git for UI goal 93; main's ruling: what a push's landing ran whole held its shard past the watchdog's window at git/git's size)
 - **Change.** `slates_git::store::Staging` (`Repository::sealing`, `staging`, `stage_turn`): the seal and stage cut into
   units, a turn taking as many as its quantum allows and one at least: a commit's generation number; a held object
