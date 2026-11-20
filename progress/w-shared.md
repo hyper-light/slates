@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: hard-link copy 7fe4dc0e2 (main 95044a373). NOW: step 4 - every remaining "does not yet copy" case its
+  own typed refusal, never TypeChanged (needs a conflict class or a typed submit refusal: ask main the shape). Then svn copy
+  rows, A-697, A-658 3c.
+
 ## NOW: hard-link copy (inbox note to w-engine pushed 8afb8e625). DESIGN: crates/merge/src/engine/copy.rs: copy_of_source
   refuses `self.hardlinks.holds_tree(&spec.source)` (TypeChanged) ~L913 -> stop refusing; at commit of Effect::CopyTree
   (find where CopyTree applies; dims graft of files etc.), for each (L, P) in hardlinks under source at version: L' = dst +
