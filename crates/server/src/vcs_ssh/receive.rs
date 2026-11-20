@@ -227,6 +227,7 @@ async fn answer_step<S: ShardLender>(
   match answering {
     Answering::Answered(_) => Ok(Next::Exited(0)),
     Answering::Turned => Ok(Next::More),
+    #[cfg(unix)]
     Answering::Hook(call) => {
       let answer = call.run(core::future::pending()).await;
       lent(lender, |state| push.hook_ran(state, answer, &mut *out))?

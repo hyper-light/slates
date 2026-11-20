@@ -782,7 +782,8 @@ pub struct ShardState {
   /// repositories.
   pub(crate) vcs_usage: slates_vcs::Ledger<slates_db::catalog::RepositoryId, Principal>,
   /// The learned times of the hooks of this shard's repositories (A-622's table, `crate::vcs_hooks::HookTimesTable`):
-  /// bounded by the hooks their policies configure.
+  /// bounded by the hooks their policies configure. Unix alone, where hooks run.
+  #[cfg(unix)]
   pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.

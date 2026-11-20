@@ -202,7 +202,11 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   /// The push counted live among its repository's intakes until it drops (A-724, `crate::vcs_share`).
   _live: crate::vcs_share::Live,
   /// What shows a hook's view at a path a hook runs in.
+  #[cfg(unix)]
   presenter: P,
+  /// The presenter's type alone where no hook runs: nothing is shown.
+  #[cfg(not(unix))]
+  _presenter: core::marker::PhantomData<P>,
   /// Where its answer stands between the edge's steps (module docs, "A step at a time").
   answer: AnswerState,
   /// The quarantine its pack is read into as it arrives (A-719 part 3), until the answer seals it.
@@ -224,14 +228,15 @@ impl Clock for ShardClock {
 /// What a step of a push's answer leaves its edge to do (module docs, "A step at a time").
 #[derive(Debug)]
 pub(crate) enum Answering {
-  /// The push is answered whole: what was received.
-  Answered(Received),
+  /// The push is answered whole: what was received (boxed: it is most of the step's size).
+  Answered(Box<Received>),
   /// A turn of the push's work is done (its checks, A-719, or a hook's view's sealing): yield the
   /// shard, then step again.
   Turned,
   /// A hook is to run in its view: run it off the shard's step, then hand what it answered to
-  /// `hook_ran`.
-  Hook(HookCall),
+  /// `hook_ran`. Unix alone: no hook driver runs elsewhere, whose configured hooks answer `hook not run`.
+  #[cfg(unix)]
+  Hook(Box<HookCall>),
 }
 
 /// The daemon's presenter until a hook's view is served as a read-only attachment (A-665 part 3,
@@ -305,28 +310,6 @@ enum AnswerState {
   Done,
 }
 
-/// A hook's run handed to the edge: none where no hook driver runs, whose configured hooks answer
-/// `hook not run`.
-#[cfg(not(unix))]
-#[derive(Debug)]
-pub(crate) enum HookCall {}
-
-#[cfg(not(unix))]
-impl HookCall {
-  /// Runs the hook until it ends or `client_gone` resolves.
-  pub(crate) async fn run(
-    self,
-    _client_gone: impl core::future::Future<Output = ()>,
-  ) -> HookAnswer {
-    match self {}
-  }
-}
-
-/// What a hook's run answered: none where no hook driver runs.
-#[cfg(not(unix))]
-#[derive(Debug)]
-pub(crate) enum HookAnswer {}
-
 impl<P> ReceivePack<P> {
   /// Starts a push of `principal`'s to `repository` (module docs), its request, its pack and what
   /// reading them builds admitted [`crate::vcs_share::room`], its hooks' views shown by `presenter`; writes the
@@ -383,7 +366,13 @@ impl<P> ReceivePack<P> {
       _live: crate::vcs_share::Live::begin(repository),
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
+      #[cfg(unix)]
       presenter,
+      #[cfg(not(unix))]
+      _presenter: {
+        let _ = presenter;
+        core::marker::PhantomData
+      },
       answer: AnswerState::Unbegun,
     })
   }
@@ -556,7 +545,7 @@ impl<P> ReceivePack<P> {
       .answer_with(declining, None, out, admission)
       .map_err(PushFailed::Exchange)?
       .ok_or(PushFailed::Unchecked)?;
-    Ok(Answering::Answered(received))
+    Ok(Answering::Answered(Box::new(received)))
   }
 
   /// The decision of the sealed push (module docs, "Answering", items 3 to 6), not yet begun, each
@@ -669,7 +658,7 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
       AnswerState::Hooking(hooking) => self.hooking(state, *hooking, out),
       AnswerState::Deciding(decision) => self.decide_step(state, *decision, out),
       AnswerState::Observing(observing) => hooks::observe(self, state, *observing, out),
-      AnswerState::Reported(received) => Ok(Answering::Answered(*received)),
+      AnswerState::Reported(received) => Ok(Answering::Answered(received)),
       AnswerState::Done => Err(PushFailed::Unchecked),
     }
   }
@@ -687,7 +676,7 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
       Some((received, Some(hooks))) => hooks::reported(self, state, (received, hooks), out),
       Some((received, None)) => {
         write_report(&received, out).map_err(PushFailed::Exchange)?;
-        Ok(Answering::Answered(received))
+        Ok(Answering::Answered(Box::new(received)))
       }
     }
   }
@@ -762,19 +751,9 @@ impl<P> ReceivePack<P> {
       None => Ok(Answering::Turned),
       Some((received, ())) => {
         write_report(&received, out).map_err(PushFailed::Exchange)?;
-        Ok(Answering::Answered(received))
+        Ok(Answering::Answered(Box::new(received)))
       }
     }
-  }
-
-  /// Hands the push what a hook answered: none runs here.
-  pub(crate) fn hook_ran(
-    &mut self,
-    _state: &mut ShardState,
-    answer: HookAnswer,
-    _out: &mut impl Out,
-  ) -> Result<(), PushFailed> {
-    match answer {}
   }
 }
 
