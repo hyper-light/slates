@@ -1224,6 +1224,15 @@
 > sidedata layout (read from the document, not from 6.x code; the older-client run checks it). No speed is claimed until
 > main measures it.
 
+> **Fixed (g083, 2026-11-19, A-691; found by g303 reading `serve/pull.rs`): a hidden draft root was not listed to
+> Mercurial peers.** `listkeys phases` answered the draft roots computed over the served view; 7.2's `listphases`
+> (`phases.py` 1049-1058) answers the stored draft roots read from the unfiltered changelog, so a draft root an amend
+> hid is listed. Reproduced by use with stock 7.2 first (`hg debugpushkey ... phases`, locally and over `hg serve`,
+> lists the hidden draft root and its successor; slates' view of the same repository listed the successor alone); now
+> `Repository::draft_roots` answers the register's draft roots still draft, read before the served filter; red first
+> (r411), green (r421) on macOS arm64, the other platforms owed
+> (`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`).
+
 > **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
 > Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part
 > read, listed every bookmark naming a held changeset; 7.2's `listbinbookmarks` (`bookmarks.py` 475-484) leaves out a

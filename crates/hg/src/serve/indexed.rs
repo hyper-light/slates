@@ -33,6 +33,12 @@
 //! asked. So making a view costs the changesets that are not public, never the whole history, and an answer that
 //! reads a few nodes (`known`, `listkeys`) reads only those.
 //!
+//! **Draft roots** (A-691). `listkeys phases` lists the register's draft roots whose phase is still draft, read past
+//! the filter, as 7.2's `listphases` reads them from the unfiltered changelog (`phases.py` 1049-1058), so a hidden
+//! draft root is listed though the view does not serve it. They are taken where the forward walk has every changeset's
+//! phase from the lowest root on: a draft root a root of a higher phase reaches is not draft any more and is left out,
+//! and one whose node the changelog lacks was dropped with the others.
+//!
 //! **Texts lent** ([`Store`]). A changeset's or manifest's text, or a file revision's bytes, is lent in place where the
 //! store holds it as one window (an object no longer than the store's window is that window, `slates_vcs::content`),
 //! and copied otherwise, its length charged to the room first. A file revision with a metadata block is put back
@@ -156,6 +162,8 @@ pub struct Indexed<'a> {
   tail: Vec<Kept>,
   /// The changesets from `first` on that are left out, oldest first, each with why.
   left_out: Vec<(u32, LeftOut)>,
+  /// The register's draft roots whose phase is still draft, by node, sorted, hidden ones among them (module docs).
+  draft_roots: Vec<Node>,
   /// Each obsolescence marker, alone in its format, lent.
   markers: Vec<Cow<'a, [u8]>>,
   /// What the filter found.
@@ -188,6 +196,7 @@ impl<'a> Indexed<'a> {
       pins: &pins,
     };
     let walked = walk(index, store, (first, len), &roots, marked, room)?;
+    let draft_roots = still_draft(index, store, state.roots, (&walked, first), room)?;
     let (tail, left_out, mut census) = filter(walked, (first, len), room)?;
     census.dropped_roots = dropped_roots;
     Ok(Indexed {
@@ -197,6 +206,7 @@ impl<'a> Indexed<'a> {
       first,
       tail,
       left_out,
+      draft_roots,
       markers,
       census,
       lends,
@@ -348,6 +358,10 @@ impl Repository for Indexed<'_> {
       .iter()
       .map(|(name, node)| (name.as_slice(), *node))
   }
+
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    self.draft_roots.iter().copied()
+  }
 }
 
 impl Store for Indexed<'_> {
@@ -467,6 +481,31 @@ fn rooted(
   }
   held.sort_unstable();
   Ok((held, dropped))
+}
+
+/// The register's draft roots whose phase the forward walk found still draft, by node, sorted, each once (module docs;
+/// 7.2's `listphases`, `phases.py` 1049-1058: each root of `_phaseroots[draft]`, kept where `phase(root) <= draft`):
+/// read from every changeset the walk saw, `walked` from `first` on, so a hidden one is among them. One whose node the
+/// changelog lacks is not (`rooted` dropped and counted it). Charged to `room` before the list is made.
+fn still_draft(
+  index: &HgIndex,
+  store: &ContentStore,
+  roots: &[PhaseHead],
+  (walked, first): (&[Walked], u32),
+  room: &mut Admission,
+) -> Result<Vec<Node>, Refusal> {
+  let kept = |root: &&PhaseHead| {
+    root.phase == Phase::Draft
+      && index
+        .rev(store, Log::Changelog, &root.node)
+        .and_then(|rev| walked.get(offset_of(rev, first)?))
+        .is_some_and(|this| this.phase == Phase::Draft)
+  };
+  room.charge_items::<Node>(roots.iter().filter(kept).count())?;
+  let mut nodes: Vec<Node> = roots.iter().filter(kept).map(|root| root.node).collect();
+  nodes.sort_unstable();
+  nodes.dedup();
+  Ok(nodes)
 }
 
 /// What marks a changeset for the filter: the markers' predecessors and the bookmarks' nodes, each sorted.
