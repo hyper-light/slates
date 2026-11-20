@@ -57,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::engine::{Green, Increment};
 use crate::increment::{Base, DeriveError, PostStatePlan, VolumeOp};
 use crate::ops_doc::{Op, OpKind, OpsDoc};
-use crate::pace::{Pace, Ticks};
+use crate::pace::{Pace, Slices, Ticks};
 use crate::special::{SpecialKind, SpecialNode};
 
 /// Format: the reserved attribute a green's root holds the branch's head in (§4.17.1 "A push is a work", item 3).
@@ -374,13 +374,10 @@ pub(crate) fn identity(name: &[u8; 32], base: u64, doc: &OpsDoc, post_state: &[u
   *hasher.finalize().as_bytes()
 }
 
-/// The bytes of a unit that copies, fills or hashes: 64 KiB.
-const UNIT_BYTES: usize = 64 * 1024;
-
 /// A push's work built a unit at a time (A-752; §4.3's step budget; the module's [`build`] in turns): the walk an entry
 /// of a tree a unit, the base a named path a unit, the deriver's composition under the same pace
-/// ([`crate::increment::compose_paced`]), the post-state an operation or 64 KiB a unit, and the identity a piece of the
-/// document or 64 KiB a unit. It owns what it has made, and borrows the green and the objects only for a turn
+/// ([`crate::increment::compose_paced`]), the post-state an operation or a copy slice a unit, and the identity a piece
+/// of the document or a hash slice a unit (the owner's derived [`Slices`]). It owns what it has made, and borrows the green and the objects only for a turn
 /// ([`Building::advance`]), so a push's decision spans as many turns as its work needs and no turn runs past its pace.
 ///
 /// The green may move between two turns: each named path's base is read at the push's base version, which no later
@@ -529,17 +526,19 @@ impl Building {
       } => self.entries_unit(green, walk, (named, after), base),
       Stage::Copies { walk, at, base } => self.copies_unit(green, walk, at, base),
       Stage::Compose { walk, work } => self.compose_unit(walk, work)?,
-      Stage::Post(mut posting) => match posting.unit(objects, self.push.head.as_deref())? {
-        None => Stage::Post(posting),
-        Some((doc, post_state, reads)) => Stage::Identity(Box::new(Hashing::new(
-          (&self.push.name, self.push.base_version),
-          doc,
-          post_state,
-          reads,
-        ))),
-      },
+      Stage::Post(mut posting) => {
+        match posting.unit(objects, self.push.head.as_deref(), self.pace.slices())? {
+          None => Stage::Post(posting),
+          Some((doc, post_state, reads)) => Stage::Identity(Box::new(Hashing::new(
+            (&self.push.name, self.push.base_version),
+            doc,
+            post_state,
+            reads,
+          ))),
+        }
+      }
       Stage::Identity(mut hashing) => {
-        if hashing.unit() {
+        if hashing.unit(self.pace.slices()) {
           return Ok(Some(hashing.built(self.push.base_version)));
         }
         Stage::Identity(hashing)
@@ -1112,7 +1111,7 @@ impl<O: PushObjects> Walker<'_, O> {
   }
 }
 
-/// The post-state being laid, a unit an operation or 64 KiB of zeros.
+/// The post-state being laid, a unit an operation or a copy slice of zeros.
 struct Posting {
   /// The document.
   doc: OpsDoc,
@@ -1144,12 +1143,13 @@ impl Posting {
     }
   }
 
-  /// One unit: the length found an operation a unit, the post-state zeroed 64 KiB a unit, then each operation's run
+  /// One unit: the length found an operation a unit, the post-state zeroed a copy slice a unit, then each operation's run
   /// laid. The document, the post-state and the reads once laid. Its length was charged as the walk made the runs.
   fn unit<O: PushObjects>(
     &mut self,
     objects: &O,
     head: Option<&[u8]>,
+    slices: Slices,
   ) -> Result<Option<(OpsDoc, Vec<u8>, Reads)>, PushRefused> {
     let Some(size) = self.size else {
       match self.doc.ops.get(self.at) {
@@ -1179,7 +1179,10 @@ impl Posting {
       return Ok(None);
     };
     if self.post.len() < size {
-      let to = size.min(self.post.len().saturating_add(UNIT_BYTES));
+      let unit = usize::try_from(slices.copy_bytes)
+        .unwrap_or(usize::MAX)
+        .max(1);
+      let to = size.min(self.post.len().saturating_add(unit));
       self.post.resize(to, 0);
       return Ok(None);
     }
@@ -1247,7 +1250,7 @@ fn file_bytes<'o, O: PushObjects>(
   Ok(bytes)
 }
 
-/// The identity being hashed, a piece of the document or 64 KiB of the post-state a unit ([`identity`]'s bytes).
+/// The identity being hashed, a piece of the document or a hash slice of the post-state a unit ([`identity`]'s bytes).
 struct Hashing {
   /// The hasher.
   hasher: blake3::Hasher,
@@ -1288,17 +1291,20 @@ impl Hashing {
   }
 
   /// One unit: whether the identity is hashed whole.
-  fn unit(&mut self) -> bool {
+  fn unit(&mut self, slices: Slices) -> bool {
     self.scratch.clear();
     if self.doc.encode_piece(self.piece, &mut self.scratch) {
       self.piece = self.piece.saturating_add(1);
       self.hasher.update(&self.scratch);
       return false;
     }
-    let to = self
-      .post_state
-      .len()
-      .min(self.hashed.saturating_add(UNIT_BYTES));
+    let to = self.post_state.len().min(
+      self.hashed.saturating_add(
+        usize::try_from(slices.hash_bytes)
+          .unwrap_or(usize::MAX)
+          .max(1),
+      ),
+    );
     if let Some(bytes) = self.post_state.get(self.hashed..to) {
       self.hasher.update(bytes);
     }
