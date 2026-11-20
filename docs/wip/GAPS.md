@@ -1781,6 +1781,16 @@
 > (r411), green (r421) on macOS arm64, the other platforms owed
 > (`docs/bugs/2026-11-19-hg-a-hidden-draft-root-was-not-listed.md`).
 
+> **Fixed (w-interop, 2026-11-20, A-758; found by use, the hg matrix's bookmark-push row): stock hg saw no server key
+> but in a clone.** Neither edge listed `pushkey`, so a 7.2 client asked no `listkeys` (`wireprotov1peer.listkeys`
+> answers `{}` unasked): `hg incoming -B` and `hg outgoing -B` said "remote doesn't support bookmarks", and `hg
+> debugpushkey` listed nothing. Now `pushkey` is listed over SSH and HTTP and its command served, landed as a push of
+> one advisory `pushkey` part through the one push driver (`slates_hg::serve::keys`; heads `force`; the policy, hooks
+> and race checks a part's key meets), answered `1` or `0` with words; a namespace no key is moved in (`obsolete`, any
+> other) is refused by type before anything lands, answered `0` naming it. Red first and green by use with stock 7.2
+> over both edges (`hg_interop`'s `stock_hg_lists_and_moves_keys_over_the_*_edge`) on macOS arm64; other platforms
+> owed. OWED: `pushkey` inside a `batch` is refused as not served (7.2 serves it there).
+
 > **Fixed (g083, 2026-11-19, A-690; found by g303 reading `serve/pull.rs`): divergent bookmarks were listed to
 > Mercurial peers.** `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part
 > read, listed every bookmark naming a held changeset; 7.2's `listbinbookmarks` (`bookmarks.py` 475-484) leaves out a

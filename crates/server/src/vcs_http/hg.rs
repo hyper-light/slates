@@ -31,8 +31,9 @@
 //! request (`slates_hg::serve::http::unbundle_request`; arguments that cannot be read are answered out of band) and is
 //! handed to the lender ([`HgStores::push`]), which lands it on the repository's owner shard
 //! (`crate::repository::hg_push::unbundle`); what it came to is framed as 7.2 frames `unbundle`'s answers
-//! (`slates_hg::serve::http::pushed`). A repository whose store the shard does not lend is `503`. A `pushkey` command is
-//! answered as one not served, out of band: the bundle2 a 7.2 client pushes moves its bookmarks and phases.
+//! (`slates_hg::serve::http::pushed`). A repository whose store the shard does not lend is `503`. A `pushkey` (A-758) is
+//! landed as a push of one advisory `pushkey` part through the same lender and driver, with the `force` heads argument
+//! (`slates_hg::serve::keys`), and answered as that command's string (`slates_hg::serve::http::pushkeyed`).
 //!
 //! **Names.** A repository is the one whose name is the URL's path, decoded, its slashes at either end dropped as
 //! hgwebdir drops them (`req.dispatchpath.strip(b'/')`): a client reaches `name` at `/name?cmd=...` and at
@@ -54,6 +55,7 @@
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_hg::compression::Engine;
 use slates_hg::push::Outcome;
+use slates_hg::push::check::HeadsArgument;
 use slates_hg::serve::getbundle::Store;
 use slates_hg::serve::http::{
   self as hg_http, Answered, Compression, Compressor, Media, Permission,
@@ -197,6 +199,8 @@ struct Routed {
   permission: Option<Permission>,
   /// Whether the command is `unbundle`, a push's bundle (the module doc's push).
   unbundle: bool,
+  /// Whether the command is `pushkey`, landed as a push of one key (A-758).
+  pushkey: bool,
 }
 
 /// What a request's credentials came to.
@@ -276,12 +280,13 @@ impl<A: Authenticator, R: Repositories, S: HgStores + Clone> HgSite<A, R, S> {
     if !self.stores.holds(repository.id) {
       return refused_with(Status::SERVICE_UNAVAILABLE, Fields::new(), true);
     }
-    let pusher = routed.unbundle.then_some(principal);
+    let pusher = (routed.unbundle || routed.pushkey).then_some(principal);
     let room = match pusher {
       Some(_) => self.stores.push_room(repository.id).unwrap_or(self.room),
       None => self.room,
     };
-    match HgExchange::new(self.stores.clone(), (repository, pusher), head, room) {
+    let pushing = (repository, pusher, routed.pushkey);
+    match HgExchange::new(self.stores.clone(), pushing, head, room) {
       Some(exchange) => Decided {
         answer: Answer::Serve {
           fields: Fields::new(),
@@ -409,6 +414,7 @@ fn route(head: &Head<'_>, room: u64) -> Result<Routed, Status> {
     name,
     permission: command.as_deref().and_then(hg_http::permission),
     unbundle: command.as_deref() == Some(hg_http::UNBUNDLE),
+    pushkey: command.as_deref() == Some(slates_hg::serve::keys::COMMAND),
   })
 }
 
@@ -457,8 +463,10 @@ pub(crate) struct HgExchange<S: HgStores> {
   stores: S,
   /// The repository.
   repository: RepositoryRecord,
-  /// Who pushes, where the request is an `unbundle` (the module doc's push).
+  /// Who pushes, where the request is an `unbundle` or a `pushkey` (the module doc's push).
   pusher: Option<Principal>,
+  /// Whether the push is a `pushkey`'s, answered as that command's string (A-758).
+  pushkey: bool,
   /// The request's query.
   query: Vec<u8>,
   /// The request's `X-Hg` fields, name and value.
@@ -483,7 +491,7 @@ impl<S: HgStores> HgExchange<S> {
   /// `room`; none past it.
   fn new(
     stores: S,
-    (repository, pusher): (RepositoryRecord, Option<Principal>),
+    (repository, pusher, pushkey): (RepositoryRecord, Option<Principal>, bool),
     head: &Head<'_>,
     room: u64,
   ) -> Option<Self> {
@@ -514,6 +522,7 @@ impl<S: HgStores> HgExchange<S> {
       stores,
       repository,
       pusher,
+      pushkey,
       query: query.to_vec(),
       fields,
       body: Vec::new(),
@@ -563,6 +572,11 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       return Ok(());
     }
     let made = match &self.pusher {
+      Some(principal) if self.pushkey => {
+        answered_pushkey(&mut self.stores, (id, principal), &request, &mut admission)
+          .await
+          .map(|answered| Made::Whole(answered.media_type, answered.body))
+      }
       Some(principal) => answered_push(&mut self.stores, (id, principal), &request, &mut admission)
         .await
         .map(|answered| Made::Whole(answered.media_type, answered.body)),
@@ -677,6 +691,25 @@ async fn answered_push<S: HgStores>(
     .push(id, (principal, &heads, bundle), admission)
     .await?;
   Some(hg_http::pushed(&outcome, admission))
+}
+
+/// The answer to a `pushkey` by `principal` on repository `id` (A-758, `slates_hg::serve::keys`): the push it is landed
+/// as, made from `request`'s arguments, landed through `stores` with the `force` heads argument as an `unbundle` is,
+/// and what it came to framed as the command's string; none when the store is not lent.
+async fn answered_pushkey<S: HgStores>(
+  stores: &mut S,
+  (id, principal): (RepositoryId, &Principal),
+  request: &hg_wire::Request<'_>,
+  admission: &mut Admission,
+) -> Option<Answered> {
+  let bundle = match hg_http::pushkey_request(request, admission) {
+    Ok(bundle) => bundle,
+    Err(answered) => return Some(answered),
+  };
+  let outcome = stores
+    .push(id, (principal, &HeadsArgument::Force, &bundle), admission)
+    .await?;
+  Some(hg_http::pushkeyed(&outcome, admission))
 }
 
 #[cfg(test)]
