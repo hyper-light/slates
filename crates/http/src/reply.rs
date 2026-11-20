@@ -29,6 +29,16 @@ impl Status {
     code: 200,
     reason: "OK",
   };
+  /// Format: `201 Created` (RFC 9110 §15.3.2), a resource made by the request (a WebDAV PUT, MKCOL or COPY).
+  pub const CREATED: Status = Status {
+    code: 201,
+    reason: "Created",
+  };
+  /// Format: `204 No Content` (RFC 9110 §15.3.5), a request done with no body to answer (a WebDAV DELETE).
+  pub const NO_CONTENT: Status = Status {
+    code: 204,
+    reason: "No Content",
+  };
   /// Format: `207 Multi-Status` (RFC 4918 §11.1), a WebDAV answer holding a status for each resource it names.
   pub const MULTI_STATUS: Status = Status {
     code: 207,
@@ -53,6 +63,21 @@ impl Status {
   pub const NOT_FOUND: Status = Status {
     code: 404,
     reason: "Not Found",
+  };
+  /// Format: `409 Conflict` (RFC 9110 §15.5.10), a Subversion commit out of date or in conflict.
+  pub const CONFLICT: Status = Status {
+    code: 409,
+    reason: "Conflict",
+  };
+  /// Format: `412 Precondition Failed` (RFC 9110 §15.5.13), a WebDAV lock's condition unmet.
+  pub const PRECONDITION_FAILED: Status = Status {
+    code: 412,
+    reason: "Precondition Failed",
+  };
+  /// Format: `423 Locked` (RFC 4918 §11.3), a path another's lock holds.
+  pub const LOCKED: Status = Status {
+    code: 423,
+    reason: "Locked",
   };
   /// Format: `405 Method Not Allowed` (RFC 9110 §15.5.6), which carries `Allow`.
   pub const METHOD_NOT_ALLOWED: Status = Status {

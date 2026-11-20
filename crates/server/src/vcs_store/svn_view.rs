@@ -28,7 +28,9 @@ use slates_svn::lock::AprTime;
 use slates_svn::migration::Repository as SvnRecords;
 use slates_vfs::clock::Clock;
 
-use slates_svn::commit::drive::Work;
+use slates_svn::commit::drive::{Setup, Work};
+use slates_svn::dav::commit::{DavCommit, Hooks, World as CommitWorld};
+use slates_svn::dav::locking::HttpAnswer;
 use slates_svn::serve::{Policy, Sources};
 
 use crate::repository::svn_commit::{self, Committed};
@@ -55,6 +57,73 @@ impl SvnStores for ServedRecords {
     step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
   ) -> Option<T> {
     crate::state::with_state(|state| lend_in(state, id, step)).flatten()
+  }
+
+  fn begin_commit(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    setup_of: impl FnOnce(String, AprTime) -> Setup,
+    hooks: Hooks<'_>,
+  ) -> Option<Result<String, HttpAnswer>> {
+    crate::state::with_state(|state| {
+      let now = AprTime::from_wall_ns(state.clock.wall_ns());
+      let youngest = state.vcs_stores.subversion_records(id)?.index().youngest();
+      let name = state.vcs_stores.dav_transaction_name(youngest);
+      let records = state.vcs_stores.subversion_records(id)?;
+      let world = CommitWorld {
+        index: records.index(),
+        green: records,
+        locks: records.locks(),
+      };
+      let begun = DavCommit::begin(setup_of(name.clone(), now), &world, hooks);
+      Some(begun.map(|commit| {
+        let key = principal.key();
+        state
+          .vcs_stores
+          .begin_dav_commit(id, &key, name.clone(), commit);
+        name
+      }))
+    })
+    .flatten()
+  }
+
+  fn on_commit<T>(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    name: &str,
+    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnRecords>) -> T,
+  ) -> Option<Option<T>> {
+    crate::state::with_state(|state| {
+      let key = principal.key();
+      state.vcs_stores.subversion_records(id)?;
+      let Some(mut commit) = state.vcs_stores.take_dav_commit(id, &key, name) else {
+        return Some(None);
+      };
+      let records = state.vcs_stores.subversion_records(id)?;
+      let world = CommitWorld {
+        index: records.index(),
+        green: records,
+        locks: records.locks(),
+      };
+      let stepped = step(&mut commit, &world);
+      state.vcs_stores.keep_dav_commit(id, &key, name, commit);
+      Some(Some(stepped))
+    })
+    .flatten()
+  }
+
+  fn land(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    work: Work,
+  ) -> Option<Result<Committed, svn_commit::Uncommitted>> {
+    crate::state::with_state(|state| {
+      let now = AprTime::from_wall_ns(state.clock.wall_ns());
+      svn_commit::commit_work(state, (principal, id), work, now)
+    })
   }
 }
 

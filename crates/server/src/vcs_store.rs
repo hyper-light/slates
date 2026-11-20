@@ -89,6 +89,7 @@ use slates_hg::index::HgIndex;
 use slates_ipc::protocol::Refusal;
 use slates_svn::commit::record::{Record as SvnRecord, RecordRefused as SvnRecordRefused};
 use slates_svn::commit::revision::StepRefusal;
+use slates_svn::dav::commit::DavCommit;
 use slates_svn::index::Index as SvnIndex;
 use slates_svn::migration::{Repository as SvnRecords, Room as SvnRoom};
 use slates_vcs::{Admitted, ContentRefused, ContentStore, Derivations, Mode};
@@ -162,6 +163,12 @@ pub(crate) struct VcsStores {
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
+  /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
+  /// transaction name, with the key of the principal that made it: at most one a repository and principal, a new POST
+  /// replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the partition's repositories and principals.
+  dav_commits: BTreeMap<(RepositoryId, String), (Vec<u8>, DavCommit)>,
+  /// The HTTP transactions this shard has named, which a transaction's name counts.
+  dav_named: u64,
 }
 
 /// One repository's store, by its tool (module docs).
@@ -447,6 +454,63 @@ impl VcsStores {
   }
 
   /// Repository `id`'s Subversion records, read; none before its creation's record is replayed.
+  /// A fresh HTTP transaction's name in repository `id` (§4.17.4 item 3.1: `svnserve`'s `REV-SEQ`): the youngest
+  /// revision it is based on, then this shard's count of the transactions it has named.
+  pub(crate) fn dav_transaction_name(&mut self, youngest: u64) -> String {
+    self.dav_named = self.dav_named.saturating_add(1);
+    format!("{youngest}-{}", self.dav_named)
+  }
+
+  /// Keeps `commit`, named `name`, for repository `id` and the principal keyed `principal`, dropping any other the
+  /// same principal left open in it (the field's bound).
+  pub(crate) fn begin_dav_commit(
+    &mut self,
+    id: RepositoryId,
+    principal: &[u8],
+    name: String,
+    commit: DavCommit,
+  ) {
+    self
+      .dav_commits
+      .retain(|(repository, _), (key, _)| !(*repository == id && key.as_slice() == principal));
+    self
+      .dav_commits
+      .insert((id, name), (principal.to_vec(), commit));
+  }
+
+  /// Takes out repository `id`'s transaction `name`, made by the principal keyed `principal`; none for another's.
+  pub(crate) fn take_dav_commit(
+    &mut self,
+    id: RepositoryId,
+    principal: &[u8],
+    name: &str,
+  ) -> Option<DavCommit> {
+    let key = (id, name.to_owned());
+    if self
+      .dav_commits
+      .get(&key)
+      .is_none_or(|(maker, _)| maker.as_slice() != principal)
+    {
+      return None;
+    }
+    self.dav_commits.remove(&key).map(|(_, commit)| commit)
+  }
+
+  /// Puts back what [`VcsStores::take_dav_commit`] took, unless it has ended.
+  pub(crate) fn keep_dav_commit(
+    &mut self,
+    id: RepositoryId,
+    principal: &[u8],
+    name: &str,
+    commit: DavCommit,
+  ) {
+    if !commit.over() {
+      self
+        .dav_commits
+        .insert((id, name.to_owned()), (principal.to_vec(), commit));
+    }
+  }
+
   pub(crate) fn subversion_records(&self, id: RepositoryId) -> Option<&SvnRecords> {
     match self.entries.get(&id)? {
       RepositoryStore::Subversion(store) => store.records.as_ref(),

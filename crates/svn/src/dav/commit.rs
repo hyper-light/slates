@@ -713,6 +713,17 @@ fn bare(status: u16) -> HttpAnswer {
   }
 }
 
+/// The answer to a Subversion error `code` with `message` (`dav_svn__convert_err`: its status from the error, `500`
+/// where the error names none).
+pub fn refusal(code: u32, message: &str) -> HttpAnswer {
+  error_answer(
+    convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+    true,
+    code,
+    message,
+  )
+}
+
 /// The answer to a refused command: its outermost error, with `dav_svn__convert_err`'s status.
 fn refused(errors: &[(u32, String)]) -> HttpAnswer {
   let (code, message) = errors.first().cloned().unwrap_or((
