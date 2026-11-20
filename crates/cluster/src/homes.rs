@@ -42,6 +42,13 @@ const KIND_ANSWER: u8 = 4;
 const KIND_PUT_PART: u8 = 5;
 /// Format: the kind byte of a read of a part (appended).
 const KIND_READ_PART: u8 = 6;
+/// Format: the kind byte of several puts in one message (appended, A-724 piece 8c: concurrent homings to one member
+/// coalesced, the member publishing once for all of them).
+const KIND_PUT_MANY: u8 = 7;
+/// Format: the kind byte of the answers to a [`HomeMessage::PutMany`], one an item in its order (appended).
+const KIND_ANSWER_MANY: u8 = 8;
+/// Format: the fewest bytes an item of a many takes: its identity and its blob's length.
+const ITEM_MIN_BYTES: usize = IDENTITY_BYTES + 4;
 /// Format: the outcome byte of an answer that kept the window.
 const OUTCOME_KEPT: u8 = 1;
 /// Format: the outcome byte of an answer carrying the window's bytes.
@@ -169,6 +176,17 @@ pub enum HomeMessage {
     /// Where the part begins.
     offset: u64,
   },
+  /// Keep each of `items`, an object and its identity (the BLAKE3 of its bytes), each within one message (appended, A-724
+  /// piece 8c): concurrent homings to one member coalesced into one exchange, the member publishing once for all of them.
+  PutMany {
+    /// The items, in order.
+    items: Vec<([u8; 32], Vec<u8>)>,
+  },
+  /// The answers to a [`HomeMessage::PutMany`], one an item, in its order (appended).
+  AnswerMany {
+    /// Each item's identity and outcome.
+    answers: Vec<([u8; 32], HomeOutcome)>,
+  },
   /// A member's answer about the window named `identity`.
   Answer {
     /// Its identity.
@@ -243,33 +261,32 @@ impl HomeMessage {
         out.extend_from_slice(identity);
         out.extend_from_slice(&offset.to_le_bytes());
       }
+      HomeMessage::PutMany { items } => {
+        out.push(KIND_PUT_MANY);
+        out.extend_from_slice(&[0; IDENTITY_BYTES]);
+        out.extend_from_slice(&u32::try_from(items.len()).unwrap_or(u32::MAX).to_le_bytes());
+        for (identity, bytes) in items {
+          out.extend_from_slice(identity);
+          put_blob(&mut out, bytes);
+        }
+      }
+      HomeMessage::AnswerMany { answers } => {
+        out.push(KIND_ANSWER_MANY);
+        out.extend_from_slice(&[0; IDENTITY_BYTES]);
+        out.extend_from_slice(
+          &u32::try_from(answers.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+        );
+        for (identity, outcome) in answers {
+          out.extend_from_slice(identity);
+          put_outcome(&mut out, outcome);
+        }
+      }
       HomeMessage::Answer { identity, outcome } => {
         out.push(KIND_ANSWER);
         out.extend_from_slice(identity);
-        match outcome {
-          HomeOutcome::Kept { generation } => {
-            out.push(OUTCOME_KEPT);
-            out.extend_from_slice(&generation.to_le_bytes());
-          }
-          HomeOutcome::Bytes(bytes) => {
-            out.push(OUTCOME_BYTES);
-            put_blob(&mut out, bytes);
-          }
-          HomeOutcome::LetGo => out.push(OUTCOME_LET_GO),
-          HomeOutcome::Refused(refusal) => {
-            out.push(OUTCOME_REFUSED);
-            out.push(refusal.byte());
-          }
-          HomeOutcome::Taken { received } => {
-            out.push(OUTCOME_TAKEN);
-            out.extend_from_slice(&received.to_le_bytes());
-          }
-          HomeOutcome::Part { total, bytes } => {
-            out.push(OUTCOME_PART);
-            out.extend_from_slice(&total.to_le_bytes());
-            put_blob(&mut out, bytes);
-          }
-        }
+        put_outcome(&mut out, outcome);
       }
     }
     out
@@ -297,27 +314,27 @@ impl HomeMessage {
         identity,
         offset: reader.long()?,
       },
-      KIND_ANSWER => {
-        let outcome = match reader.byte()? {
-          OUTCOME_KEPT => HomeOutcome::Kept {
-            generation: reader.long()?,
-          },
-          OUTCOME_BYTES => HomeOutcome::Bytes(reader.blob()?),
-          OUTCOME_LET_GO => HomeOutcome::LetGo,
-          OUTCOME_REFUSED => {
-            let byte = reader.byte()?;
-            HomeOutcome::Refused(HomeRefusal::of(byte).ok_or(HomeWireError::Unknown { byte })?)
-          }
-          OUTCOME_TAKEN => HomeOutcome::Taken {
-            received: reader.long()?,
-          },
-          OUTCOME_PART => HomeOutcome::Part {
-            total: reader.long()?,
-            bytes: reader.blob()?,
-          },
-          byte => return Err(HomeWireError::Unknown { byte }),
-        };
-        HomeMessage::Answer { identity, outcome }
+      KIND_ANSWER => HomeMessage::Answer {
+        identity,
+        outcome: reader.outcome()?,
+      },
+      KIND_PUT_MANY => {
+        let count = reader.count(ITEM_MIN_BYTES)?;
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+          let identity = reader.identity()?;
+          items.push((identity, reader.blob()?));
+        }
+        HomeMessage::PutMany { items }
+      }
+      KIND_ANSWER_MANY => {
+        let count = reader.count(IDENTITY_BYTES + 1)?;
+        let mut answers = Vec::with_capacity(count);
+        for _ in 0..count {
+          let identity = reader.identity()?;
+          answers.push((identity, reader.outcome()?));
+        }
+        HomeMessage::AnswerMany { answers }
       }
       byte => return Err(HomeWireError::Unknown { byte }),
     };
@@ -325,6 +342,34 @@ impl HomeMessage {
       return Err(HomeWireError::BadLength);
     }
     Ok(message)
+  }
+}
+
+/// An answer's outcome: its byte, then its fields.
+fn put_outcome(out: &mut Vec<u8>, outcome: &HomeOutcome) {
+  match outcome {
+    HomeOutcome::Kept { generation } => {
+      out.push(OUTCOME_KEPT);
+      out.extend_from_slice(&generation.to_le_bytes());
+    }
+    HomeOutcome::Bytes(bytes) => {
+      out.push(OUTCOME_BYTES);
+      put_blob(out, bytes);
+    }
+    HomeOutcome::LetGo => out.push(OUTCOME_LET_GO),
+    HomeOutcome::Refused(refusal) => {
+      out.push(OUTCOME_REFUSED);
+      out.push(refusal.byte());
+    }
+    HomeOutcome::Taken { received } => {
+      out.push(OUTCOME_TAKEN);
+      out.extend_from_slice(&received.to_le_bytes());
+    }
+    HomeOutcome::Part { total, bytes } => {
+      out.push(OUTCOME_PART);
+      out.extend_from_slice(&total.to_le_bytes());
+      put_blob(out, bytes);
+    }
   }
 }
 
@@ -361,6 +406,43 @@ impl<'a> Reader<'a> {
     let bytes = <[u8; size_of::<u64>()]>::try_from(self.take(size_of::<u64>())?)
       .map_err(|_| HomeWireError::Truncated)?;
     Ok(u64::from_le_bytes(bytes))
+  }
+
+  /// A count of items each at least `least` bytes long, refused when the bytes left could not hold that many: so nothing
+  /// is allocated for more items than the message could carry.
+  fn count(&mut self, least: usize) -> Result<usize, HomeWireError> {
+    let bytes = <[u8; 4]>::try_from(self.take(4)?).map_err(|_| HomeWireError::Truncated)?;
+    let count = usize::try_from(u32::from_le_bytes(bytes)).map_err(|_| HomeWireError::BadLength)?;
+    if count
+      .checked_mul(least)
+      .is_none_or(|needed| needed > self.rest.len())
+    {
+      return Err(HomeWireError::BadLength);
+    }
+    Ok(count)
+  }
+
+  /// An answer's outcome ([`put_outcome`]).
+  fn outcome(&mut self) -> Result<HomeOutcome, HomeWireError> {
+    Ok(match self.byte()? {
+      OUTCOME_KEPT => HomeOutcome::Kept {
+        generation: self.long()?,
+      },
+      OUTCOME_BYTES => HomeOutcome::Bytes(self.blob()?),
+      OUTCOME_LET_GO => HomeOutcome::LetGo,
+      OUTCOME_REFUSED => {
+        let byte = self.byte()?;
+        HomeOutcome::Refused(HomeRefusal::of(byte).ok_or(HomeWireError::Unknown { byte })?)
+      }
+      OUTCOME_TAKEN => HomeOutcome::Taken {
+        received: self.long()?,
+      },
+      OUTCOME_PART => HomeOutcome::Part {
+        total: self.long()?,
+        bytes: self.blob()?,
+      },
+      byte => return Err(HomeWireError::Unknown { byte }),
+    })
   }
 
   fn identity(&mut self) -> Result<[u8; 32], HomeWireError> {
@@ -423,6 +505,20 @@ mod tests {
         .prop_map(|(identity, total, bytes)| HomeMessage::Answer {
           identity,
           outcome: HomeOutcome::Part { total, bytes },
+        })
+        .boxed(),
+      proptest::collection::vec(
+        (identity, proptest::collection::vec(any::<u8>(), 0..256)),
+        0..6,
+      )
+      .prop_map(|items| HomeMessage::PutMany { items })
+      .boxed(),
+      proptest::collection::vec((identity, any::<u64>()), 0..6)
+        .prop_map(|kept| HomeMessage::AnswerMany {
+          answers: kept
+            .into_iter()
+            .map(|(identity, generation)| (identity, HomeOutcome::Kept { generation }))
+            .collect(),
         })
         .boxed(),
       (identity, any::<u64>())

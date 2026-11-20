@@ -679,3 +679,112 @@ fn an_object_longer_than_a_window_is_homed_and_read_back_by_its_blake3() {
   let outcome = answered.recv().unwrap();
   assert!(outcome.is_empty(), "{outcome:?}");
 }
+
+/// A-724 piece 8c (main's ruling: concurrent homings to one member coalesced, a bounded queue a member). Do: queue N
+/// homings to one member in one turn, then take the queue's batches; then measure a slow rate and queue past the bound
+/// it draws. Expect: the first homing told to drain and the others not (one sender); one batch holding all N, in order;
+/// the queue then empty, its sender ended; past the bound a homing refused `Backlog`, typed, while the queue holds one.
+#[test]
+fn n_homings_queued_in_one_turn_make_one_batch_and_past_the_bound_one_is_refused_typed() {
+  use super::{Coalescing, HomeRefused};
+  let member = slates_db::HostId(7);
+  let mut coalescing = Coalescing::default();
+  let budget = crate::daemon::LIVENESS_BUDGET_NS;
+  let drains: Vec<bool> = (0..8u8)
+    .map(|n| {
+      coalescing
+        .enqueue(member, ([n; 32], vec![n; 100]), budget)
+        .unwrap()
+        .1
+    })
+    .collect();
+  assert_eq!(
+    drains,
+    [true, false, false, false, false, false, false, false]
+  );
+  let batch = coalescing.take_batch(member);
+  let order: Vec<u8> = batch.iter().map(|(_, identity, _)| identity[0]).collect();
+  assert_eq!(order, (0..8u8).collect::<Vec<_>>(), "one batch, in order");
+  assert!(
+    coalescing.take_batch(member).is_empty(),
+    "the queue drained"
+  );
+  assert!(
+    coalescing
+      .enqueue(member, ([9; 32], vec![9; 10]), budget)
+      .unwrap()
+      .1,
+    "a new sender once the last ended"
+  );
+  // A rate measured at a byte a second: the bound is the batch's cap, so past it another homing is refused at once.
+  let _ = coalescing.take_batch(member);
+  let _ = coalescing.take_batch(member);
+  let cap = usize::try_from(slates_cluster::homes::PART_BYTES).unwrap();
+  coalescing
+    .enqueue(member, ([1; 32], vec![1; cap]), budget)
+    .unwrap();
+  assert_eq!(
+    coalescing.enqueue(member, ([2; 32], vec![2; 1]), budget),
+    Err(HomeRefused::Backlog)
+  );
+}
+
+/// A-724 piece 8c (a coalesced exchange makes one publication: group commit). Do: on a node of two shards, its own
+/// region's one home, send `serve_remote` one `PutMany` of four windows that all home on one shard. Expect: four answers
+/// kept, in order; that shard's image published once for all four (`published_for_ticket` up by one).
+#[test]
+fn a_put_many_is_kept_whole_and_answered_after_one_publication() {
+  use super::{HOME_PUBLISHED, serve_remote};
+  use slates_cluster::homes::{HomeMessage, HomeOutcome};
+  let daemon = crate::daemon::audit_daemon_of(2);
+  let (sent, answered) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let origin = state.shard;
+    let shards = state.shards.clone();
+    let task = slates_rt::futures::spawn(async move {
+      let budget = crate::daemon::LIVENESS_BUDGET_NS;
+      let target = shards[0];
+      let items: Vec<([u8; 32], Vec<u8>)> = (0..)
+        .map(window)
+        .filter(|bytes| home_of(&shards, &ContentId::of(bytes)) == Some(target))
+        .take(4)
+        .map(|bytes| (ContentId::of(&bytes).0, bytes))
+        .collect();
+      let published = |shard: u16| async move {
+        crate::xshard::call_in_shard_time(
+          origin,
+          shard,
+          |state| state.refusals.get(HOME_PUBLISHED).copied().unwrap_or(0),
+          budget,
+        )
+        .await
+        .unwrap_or(0)
+      };
+      let before = published(target).await;
+      let request = HomeMessage::PutMany {
+        items: items.clone(),
+      }
+      .encode();
+      let reply = HomeMessage::decode(&serve_remote(origin, &request, budget).await);
+      let after = published(target).await;
+      let kept = match reply {
+        Ok(HomeMessage::AnswerMany { answers }) => {
+          answers.len() == items.len()
+            && answers
+              .iter()
+              .zip(&items)
+              .all(|((answered, outcome), (identity, _))| {
+                answered == identity && matches!(outcome, HomeOutcome::Kept { .. })
+              })
+        }
+        _ => false,
+      };
+      let _ = sent.send((kept, after.saturating_sub(before)));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let (kept, publications) = answered.recv().unwrap();
+  assert!(kept, "every item kept, in order");
+  assert_eq!(publications, 1, "one publication for the four");
+}
