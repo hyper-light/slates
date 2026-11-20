@@ -525,6 +525,7 @@ impl<P> ReceivePack<P> {
         self.declined(&mut declining, out)?,
       ))),
       Prepared::Sealed { sealed, name } => {
+        let sealed = *sealed;
         #[cfg(unix)]
         if hooked {
           let hooking = hooks::Hooking::new(record, (sealed, name), checked);
@@ -920,8 +921,8 @@ enum Prepared {
   Declined(Declining),
   /// The push's objects sealed in quarantine.
   Sealed {
-    /// The sealed push.
-    sealed: SealedPush,
+    /// The sealed push (boxed: it is most of a preparation's size).
+    sealed: Box<SealedPush>,
     /// The push's name (module docs).
     name: [u8; 32],
   },
@@ -956,7 +957,7 @@ fn prepare(
   push.keep_pack(pack);
   match push.seal(state) {
     Ok(sealed) => Ok(Prepared::Sealed {
-      sealed,
+      sealed: Box::new(sealed),
       name: push_name(record.id, &checked.request),
     }),
     Err(refused) => Ok(Prepared::Declined(Declining::unadmitted(&refused))),

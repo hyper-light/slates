@@ -994,7 +994,7 @@ pub fn apply_all(source: &[u8], windows: &[Window]) -> Result<Vec<u8>, SvndiffEr
 }
 
 mod deltify;
-pub use deltify::{Deltas, deltas};
+pub use deltify::{Deltas, DeltasAt, deltas, deltas_at};
 
 #[cfg(test)]
 mod tests;

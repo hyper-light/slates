@@ -227,6 +227,56 @@ fn a_history_exported_in_parts_imports_to_the_history_exported_whole() {
   assert!(history(&joined) == history(&source));
 }
 
+/// Shape: what one export call may append past a window of text: a window's svndiff framing, or a record's headers and
+/// property section, which in the fixture history are each far below a page. Measured 2026-11-20 (debug, this
+/// MacBook): the largest call 102,400 bytes in format 2 (a text's piece) and 102,413 in format 3 (a window and its 13
+/// bytes of framing); before this piece, a call wrote a revision's 107 KB text whole.
+const CALL_HEADROOM: usize = 4096;
+
+/// A-652 (the export's units): do export the whole history stock `svnadmin` dumped, in each format, a call at a time.
+/// Expect every revision written over at least its changed paths' count and two more calls (its revision record, then
+/// the directories closed), revision 0 in one; no call appending more than one window of text and [`CALL_HEADROOM`],
+/// though the history holds a 107 KB text; and the bytes `svnadmin dump` wrote (`full.dump`, `deltas.dump`). Before, a
+/// call wrote a revision whole, then a changed path with its whole text: a revision with a large text was one unit of
+/// the daemon's export (2.4 ms against a 14 µs slice, measured in debug, 2026-11-20).
+#[test]
+fn every_export_call_writes_one_changed_path_or_one_window_of_its_text() {
+  use crate::migration::{Exporter, Exporting};
+  use crate::svndiff::WINDOW_LIMIT;
+  let source = imported(&["full.dump"]);
+  let bound = usize::try_from(WINDOW_LIMIT).unwrap() + CALL_HEADROOM;
+  for (format, expected) in [
+    (Format::Two, vector("full.dump")),
+    (Format::Three, vector("deltas.dump")),
+  ] {
+    let mut exporter = Exporter::new(&source, 0, source.youngest(), format).unwrap();
+    let mut out = Vec::new();
+    let mut calls = std::collections::BTreeMap::<u64, usize>::new();
+    let mut largest = 0;
+    loop {
+      let before = out.len();
+      let Exporting::Wrote(revision) = exporter.export(&source, &mut out).unwrap() else {
+        break;
+      };
+      largest = largest.max(out.len() - before);
+      *calls.entry(revision).or_default() += 1;
+    }
+    for revision in 0..=source.youngest() {
+      let least = match revision {
+        0 => 1,
+        _ => source.index().changes(revision).unwrap().len() + 2,
+      };
+      let made = calls.get(&revision).copied().unwrap_or(0);
+      assert!(made >= least, "{format:?} r{revision}: {made} calls");
+    }
+    assert!(
+      largest <= bound,
+      "{format:?}: a call appended {largest} bytes"
+    );
+    assert!(out == expected, "{format:?}: the bytes svnadmin dump wrote");
+  }
+}
+
 /// A-652 (golden): do import the history stock `svnadmin` dumped, from format 2, from format 3, and in two parts, and
 /// export each repository in format 3, whole and from revision 4. Expect `svnadmin dump --deltas`'s bytes byte for byte
 /// (`deltas.dump`), and `svnadmin dump --deltas --incremental -r 4:13`'s (`part2.dump`): every text the deltifier's
