@@ -1,0 +1,134 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cc v1.4.5
+  Downloaded bit-set v0.8.0
+  Downloaded block-buffer v0.10.4
+  Downloaded bit-vec v0.8.0
+  Downloaded arrayvec v0.7.8
+  Downloaded autocfg v1.5.1
+  Downloaded quick-error v1.2.3
+  Downloaded errno v0.3.14
+  Downloaded rand_xorshift v0.4.0
+  Downloaded crypto-common v0.1.7
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded cfg-if v1.0.4
+  Downloaded cpufeatures v0.3.1
+  Downloaded wait-timeout v0.2.1
+  Downloaded bitflags v2.13.1
+  Downloaded generic-array v0.14.7
+  Downloaded md-5 v0.10.6
+  Downloaded version_check v0.9.5
+  Downloaded fnv v1.0.7
+  Downloaded dunce v1.0.5
+  Downloaded cmake v0.1.58
+  Downloaded fs_extra v1.3.0
+  Downloaded rand_core v0.9.5
+  Downloaded rusty-fork v0.3.1
+  Downloaded unarray v0.1.4
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded digest v0.10.7
+  Downloaded pkg-config v0.3.34
+  Downloaded shlex v2.0.1
+  Downloaded once_cell v1.21.4
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded fastrand v2.5.0
+  Downloaded jobserver v0.1.35
+  Downloaded constant_time_eq v0.4.2
+  Downloaded rand_chacha v0.9.0
+  Downloaded lz4_flex v0.11.6
+  Downloaded zeroize v1.9.0
+  Downloaded getrandom v0.4.3
+  Downloaded tempfile v3.27.0
+  Downloaded twox-hash v2.1.4
+  Downloaded getrandom v0.3.4
+  Downloaded num-traits v0.2.19
+  Downloaded tinyvec v1.13.2
+  Downloaded rand v0.9.5
+  Downloaded typenum v1.20.1
+  Downloaded unicode-normalization v0.1.25
+  Downloaded blake3 v1.8.7
+  Downloaded proptest v1.11.0
+  Downloaded zerocopy v0.8.56
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustix v1.1.4
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling libc v0.2.189
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling getrandom v0.3.4
+   Compiling version_check v0.9.5
+   Compiling fs_extra v1.3.0
+   Compiling getrandom v0.4.3
+   Compiling generic-array v0.14.7
+   Compiling rustix v1.1.4
+   Compiling dunce v1.0.5
+   Compiling pkg-config v0.3.34
+   Compiling zerocopy v0.8.56
+   Compiling linux-raw-sys v0.12.1
+   Compiling bitflags v2.13.1
+   Compiling autocfg v1.5.1
+   Compiling typenum v1.20.1
+   Compiling jobserver v0.1.35
+   Compiling cc v1.4.5
+   Compiling rand_core v0.9.5
+   Compiling num-traits v0.2.19
+   Compiling once_cell v1.21.4
+   Compiling cmake v0.1.58
+   Compiling fastrand v2.5.0
+   Compiling tempfile v3.27.0
+   Compiling aws-lc-sys v0.45.0 (/home/runner/work/slates/slates/vendor/aws-lc-sys)
+   Compiling blake3 v1.8.7
+   Compiling wait-timeout v0.2.1
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling aws-lc-rs v1.18.1 (/home/runner/work/slates/slates/vendor/aws-lc-rs)
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling rusty-fork v0.3.1
+   Compiling bit-set v0.8.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling constant_time_eq v0.4.2
+   Compiling zeroize v1.9.0
+   Compiling rand_chacha v0.9.0
+   Compiling regex-syntax v0.8.11
+   Compiling arrayvec v0.7.8
+   Compiling twox-hash v2.1.4
+   Compiling cpufeatures v0.3.1
+   Compiling unarray v0.1.4
+   Compiling lz4_flex v0.11.6
+   Compiling digest v0.10.7
+   Compiling unicode-normalization v0.1.25
+   Compiling md-5 v0.10.6
+   Compiling proptest v1.11.0
+   Compiling slates-test-seeds v0.1.0 (/home/runner/work/slates/slates/crates/test-seeds)
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-unknown-linux-gnu'
+warning: aws-lc-sys@0.45.0: Compilation of 'c11.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-c11/7dfda64fdf5a526c-c11.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-stdalign_check/7dfda64fdf5a526c-stdalign_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'builtin_swap_check.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-builtin_swap_check/7dfda64fdf5a526c-builtin_swap_check.o"]).
+warning: aws-lc-sys@0.45.0: Compilation of 'linux_random_h.c' succeeded - Ok(["/home/runner/work/slates/slates/target/debug/build/aws-lc-sys-1cc42298ea61bcf9/out/out-linux_random_h/7dfda64fdf5a526c-linux_random_h.o"]).
+   Compiling slates-svn v0.1.0 (/home/runner/work/slates/slates/crates/svn)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.59s
+     Running tests/fsfs_view.rs (target/debug/deps/fsfs_view-e0a027eeafbbbc84)
+
+running 5 tests
+test revision_zero_is_the_file_svnadmin_create_writes ... ok
+test a_budget_slices_the_layout_by_revision_and_every_header_names_its_own_place ... ok
+test stock_svnadmin_and_svnlook_read_the_view_as_the_repository_the_dump_was_taken_from ... ok
+test each_revisions_work_makes_a_transaction_directory_rooted_at_node_0_0 ... ok
+test stock_svnlook_reads_each_revisions_work_as_a_transaction_as_it_reads_the_revision ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.67s
+
