@@ -102,3 +102,7 @@
   (ruling B): index resolves oid -> (pack identity, offset); upload/encoding/sparse decode from stored pack in place;
   head files from the green; ContentStore::object_bytes inflated copy + put_object go away. Build 1-7 first, then 8.
   Piece order: (a) slates-vcs Index::adopt (+ parent epoch / stale check) ...
+- A-722 part 1 (slates-vcs Index::adopt) LANDED main de9591c70 (adfe74896). Next A-722 part 2: positions taken as each
+  object arrives + readers tolerating holes (hook_view units.rs cover, text.rs depth loop, any 0..next_position user);
+  then part 3: rows staged into a per-push fork at keep time (git store Push/Repository API), commit rows + generations
+  sliced after the pack; part 4: moves' admission sliced; part 5: landing adopts fork (O(changes)) + stale re-base.
