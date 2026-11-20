@@ -1605,21 +1605,26 @@ fn dirent<R: ?Sized>(
   Ok(history::present(sources.index, path, revision)?.map(|node| Dirent::of(&node)))
 }
 
-/// The entries of the directory at `path` in `revision`, by name (`svn_fs_dir_entries`).
+/// The entries of the directory at `path` in `revision`, by name (`svn_fs_dir_entries`): the index's listing, each
+/// child's entry made from the node-revision it lists (A-759: the directory resolved once, its live children walked,
+/// no child resolved again).
 fn entries<R: Repository + ?Sized>(
   sources: &Sources<'_, R>,
   path: &str,
   revision: Revision,
 ) -> Result<BTreeMap<String, Dirent>, DriveFailure> {
-  let names = sources
-    .repository
-    .entries(path, revision)
+  let listed = sources
+    .index
+    .listing(path, revision)
+    .map_err(|_| DriveFailure::corrupt())?
     .ok_or_else(DriveFailure::corrupt)?;
   let mut entries = BTreeMap::new();
-  for name in names {
-    let entry =
-      dirent(sources, &join_fspath(path, &name), revision)?.ok_or_else(DriveFailure::corrupt)?;
-    entries.insert(name, entry);
+  for (name, id) in listed {
+    let node = sources
+      .index
+      .node_revision(id)
+      .map_err(|_| DriveFailure::corrupt())?;
+    entries.insert(name, Dirent::of(&node));
   }
   Ok(entries)
 }

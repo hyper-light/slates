@@ -11,11 +11,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
 #[path = "support/recovered.rs"]
 mod recovered;
 
-/// Shape: how long the daemon may take to come up.
-const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the poll interval of the waits.
 const POLL: Duration = Duration::from_millis(20);
 /// Shape: consecutive answered verbs before the daemon counts as settled.
@@ -85,7 +85,9 @@ fn start_anchor(instance: &str) -> Anchor {
     }
   });
   let anchor = Anchor { child, served };
-  let started = Instant::now();
+  // Waited for while the anchor's tree lives and gains CPU (`support/process_wait.rs`; until 2026-11-20 twenty seconds,
+  // `START_WAIT`).
+  let mut judged = process_wait::Judged::of(anchor.child.id());
   let mut streak = 0;
   while streak < STABLE_STREAK {
     streak = if run(instance, &["volume", "list"]).0 == 0 {
@@ -93,7 +95,7 @@ fn start_anchor(instance: &str) -> Anchor {
     } else {
       0
     };
-    assert!(started.elapsed() < START_WAIT, "the daemon came up");
+    judged.look("the daemon came up");
     pause();
   }
   anchor
@@ -152,7 +154,12 @@ fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
   for round in 0..KILLS {
     // Each daemon is killed once the anchor has judged it recovered, so no kill here is a failed start (A-311). Until
     // 2026-11-17 the rounds were spaced by a fixed 300 ms, which a loaded machine's slower starts outran.
-    let killed = recovered::await_recovered(&instance, &|_| true, POLL, START_WAIT);
+    let killed = recovered::await_recovered_while_alive(
+      &instance,
+      &|_| true,
+      POLL,
+      &mut process_wait::Judged::of(anchor.child.id()),
+    );
     while anchor.served.try_recv().is_ok() {}
     kill_hard(killed);
     let started = Instant::now();
@@ -178,11 +185,17 @@ fn a_client_that_connects_as_its_daemon_dies_is_answered_by_the_next_daemon() {
       answered_by, killed,
       "round {round}: the next daemon answered"
     );
-    let served_after = anchor
-      .served
-      .recv_timeout(START_WAIT)
-      .expect("the next daemon said it serves")
-      .saturating_duration_since(started);
+    let mut judged = process_wait::Judged::of(anchor.child.id());
+    let served_after = loop {
+      match anchor.served.recv_timeout(POLL) {
+        Ok(at) => break at,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+          judged.look("the next daemon said it serves");
+        }
+        Err(gone) => panic!("the anchor's lines ended: {gone}"),
+      }
+    }
+    .saturating_duration_since(started);
     assert!(
       took < served_after + CLAIM_WAIT,
       "round {round}: answered in {took:?}, the next daemon serving after {served_after:?}: within a claim wait of it"
