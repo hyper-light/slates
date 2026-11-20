@@ -1,0 +1,182 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cpufeatures v0.2.17
+  Downloaded equivalent v1.0.2
+  Downloaded fs_extra v1.3.0
+  Downloaded crypto-common v0.1.7
+  Downloaded rand v0.9.5
+  Downloaded dunce v1.0.5
+  Downloaded wait-timeout v0.2.1
+  Downloaded autocfg v1.5.1
+  Downloaded zstd-safe v7.3.0
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded constant_time_eq v0.4.2
+  Downloaded zeroize v1.9.0
+  Downloaded zmij v1.0.23
+  Downloaded block-buffer v0.10.4
+  Downloaded errno v0.3.14
+  Downloaded zstd v0.13.3
+  Downloaded cmake v0.1.58
+  Downloaded flate2 v1.1.11
+  Downloaded cfg-if v1.0.4
+  Downloaded cc v1.4.5
+  Downloaded zlib-rs v0.6.8
+  Downloaded bit-set v0.8.0
+  Downloaded bitflags v2.13.1
+  Downloaded zerocopy v0.8.56
+  Downloaded digest v0.10.7
+  Downloaded bit-vec v0.8.0
+  Downloaded fnv v1.0.7
+  Downloaded crc32fast v1.5.5
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded generic-array v0.14.7
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded crc32c v0.6.8
+  Downloaded bzip2 v0.6.1
+  Downloaded serde_spanned v0.6.9
+  Downloaded arrayvec v0.7.8
+  Downloaded cpufeatures v0.3.1
+  Downloaded num-traits v0.2.19
+  Downloaded proc-macro2 v1.0.107
+  Downloaded powerfmt v0.2.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded rustls-webpki v0.103.15
+  Downloaded windows-targets v0.53.5
+  Downloaded itoa v1.0.18
+  Downloaded num-conv v0.2.2
+  Downloaded serde_derive v1.0.229
+  Downloaded rand_core v0.9.5
+  Downloaded rcgen v0.13.2
+  Downloaded serde v1.0.229
+  Downloaded blake3 v1.8.7
+  Downloaded memchr v2.8.3
+  Downloaded shlex v2.0.1
+  Downloaded getrandom v0.2.17
+  Downloaded fastrand v2.5.0
+  Downloaded quick-error v1.2.3
+  Downloaded toml v0.8.23
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded twox-hash v2.1.4
+  Downloaded deranged v0.5.8
+  Downloaded getrandom v0.4.3
+  Downloaded once_cell v1.21.4
+  Downloaded subtle v2.6.1
+  Downloaded winnow v0.7.15
+  Downloaded rand_xorshift v0.4.0
+  Downloaded jobserver v0.1.35
+  Downloaded untrusted v0.9.0
+  Downloaded version_check v0.9.5
+  Downloaded rand_chacha v0.9.0
+  Downloaded rustix v1.1.4
+  Downloaded toml_datetime v0.6.11
+  Downloaded toml_write v0.1.2
+  Downloaded windows-link v0.2.1
+  Downloaded lz4_flex v0.11.6
+  Downloaded pkg-config v0.3.34
+  Downloaded quote v1.0.47
+  Downloaded semver v1.0.28
+  Downloaded rustc_version v0.4.1
+  Downloaded unicode-ident v1.0.24
+  Downloaded rusty-fork v0.3.1
+  Downloaded serde_core v1.0.229
+  Downloaded yasna v0.5.2
+  Downloaded sha1 v0.10.7
+  Downloaded serde_json v1.0.151
+  Downloaded thiserror-impl v2.0.21
+  Downloaded time-core v0.1.9
+  Downloaded unarray v0.1.4
+  Downloaded thiserror v2.0.21
+  Downloaded tinyvec v1.13.2
+  Downloaded toml_edit v0.22.27
+  Downloaded getrandom v0.3.4
+  Downloaded libbz2-rs-sys v0.2.6
+  Downloaded memmap2 v0.9.11
+  Downloaded tempfile v3.27.0
+  Downloaded unicode-normalization v0.1.25
+  Downloaded indexmap v2.14.2
+  Downloaded syn v2.0.119
+  Downloaded typenum v1.20.1
+  Downloaded hashbrown v0.17.1
+  Downloaded proptest v1.11.0
+  Downloaded syn v3.0.5
+  Downloaded time v0.3.55
+  Downloaded regex-syntax v0.8.11
+  Downloaded rustls v0.23.44
+  Downloaded windows_x86_64_msvc v0.53.1
+  Downloaded sha1-checked v0.10.0
+  Downloaded ring v0.17.14
+  Downloaded windows-sys v0.60.2
+  Downloaded windows-sys v0.61.2
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling serde_core v1.0.229
+   Compiling jobserver v0.1.35
+   Compiling cc v1.4.5
+    Checking arrayvec v0.7.8
+   Compiling syn v3.0.5
+    Checking cpufeatures v0.3.1
+    Checking constant_time_eq v0.4.2
+    Checking windows-targets v0.53.5
+   Compiling serde v1.0.229
+    Checking windows-sys v0.60.2
+   Compiling blake3 v1.8.7
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling serde_derive v1.0.229
+    Checking memchr v2.8.3
+    Checking itoa v1.0.18
+   Compiling cmake v0.1.58
+   Compiling dunce v1.0.5
+   Compiling fs_extra v1.3.0
+   Compiling aws-lc-sys v0.45.0 (D:\a\slates\slates\vendor\aws-lc-sys)
+    Checking memmap2 v0.9.11
+   Compiling pkg-config v0.3.34
+   Compiling aws-lc-rs v1.18.1 (D:\a\slates\slates\vendor\aws-lc-rs)
+   Compiling syn v2.0.119
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+    Checking slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+    Checking slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+    Checking zeroize v1.9.0
+   Compiling slates-wire-derive v0.1.0 (D:\a\slates\slates\crates\wire-derive)
+   Compiling zstd-safe v7.3.0
+    Checking twox-hash v2.1.4
+    Checking lz4_flex v0.11.6
+    Checking tinyvec_macros v0.1.1
+    Checking slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+    Checking tinyvec v1.13.2
+    Checking unicode-normalization v0.1.25
+    Checking slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+    Checking rustls-pki-types v1.15.1
+    Checking slates-image v0.1.0 (D:\a\slates\slates\crates\image)
+    Checking slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+    Checking once_cell v1.21.4
+   Compiling version_check v0.9.5
+    Checking slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+error[E0560]: struct `supervise::Supervisor` has no field named `vcs_svn_listener`
+   --> crates\anchor\src\supervise.rs:381:7
+    |
+381 |       vcs_svn_listener: None,
+    |       ^^^^^^^^^^^^^^^^ `supervise::Supervisor` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+   Compiling generic-array v0.14.7
+For more information about this error, try `rustc --explain E0560`.
+error: could not compile `slates-anchor` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_PREBUILT_NASM': '0'
+warning: aws-lc-sys@0.45.0: Value: 0 is false.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'AWS_LC_SYS_NO_JITTER_ENTROPY': '1'
+warning: aws-lc-sys@0.45.0: Value: 1 is true.
+warning: aws-lc-sys@0.45.0: Environment Variable found 'CARGO_ENCODED_RUSTFLAGS': ''
+warning: aws-lc-sys@0.45.0: Emitting configuration: cargo:rustc-cfg=universal
+warning: aws-lc-sys@0.45.0: Building with: CC
+warning: aws-lc-sys@0.45.0: Symbol Prefix: Some("aws_lc_0_45_0")
+warning: aws-lc-sys@0.45.0: Target platform: 'x86_64-pc-windows-msvc'
+warning: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.52.37025\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\slates\\\\target\\\\debug\\\\build\\\\aws-lc-sys-adc05d15a5129420\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\slates\\\\vendor\\\\aws-lc-sys\\\\aws-lc\\\\tests\\\\compiler_features_tests\\\\stdalign_check.c\"" }).
