@@ -23,7 +23,7 @@ use super::{LIMITS, PLENTY, SVNDIFF1};
 use crate::commit::revision::Revision as RevisionToCommit;
 use crate::dav::request::svn_time;
 use crate::dump::Uuid;
-use crate::index::{Action, ContentIdentity, NodeKind};
+use crate::index::{Action, ContentIdentity, NodeKind, PropertyPairs};
 use crate::mergeinfo::Contents;
 use crate::migration::{Repository as Records, Room};
 use crate::report::recorded::{command, items, value_of};
@@ -105,7 +105,7 @@ struct Built {
   /// The texts, by identity.
   texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists, by identity.
-  lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  lists: BTreeMap<ContentIdentity, PropertyPairs>,
   /// Every revision's properties.
   revisions: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
   /// Every revision's tree: each path's kind.
@@ -143,7 +143,7 @@ impl Built {
               let rest = if source.path == "/" {
                 path.as_str()
               } else {
-                &path[source.path.len()..]
+                path.get(source.path.len()..).unwrap()
               };
               tree.insert(format!("{}{rest}", row.path), *kind);
             }

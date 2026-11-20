@@ -253,9 +253,12 @@ fn delta_checksums_are_checked(wrong: ([u8; 16], [u8; 20]), base: ([u8; 16], [u8
     sha1: None,
   };
   let mut dump = first_revision_in(Format::Three);
-  dump
-    .revision(2, &revision_properties(2))
-    .delta("f", wrong_base, &[window.clone()], base);
+  dump.revision(2, &revision_properties(2)).delta(
+    "f",
+    wrong_base,
+    std::slice::from_ref(&window),
+    base,
+  );
   let expected = MigrationRefusal::BaseChecksumMismatch {
     path: "/f".to_owned(),
     expected: Digest::Md5(wrong.0),

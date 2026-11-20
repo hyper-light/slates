@@ -1425,6 +1425,13 @@
 > working-copy state checked by the ra_svn reporter's own rules (`report::whole_report`); OPTIONS says
 > `SVN-Allow-Bulk-Updates: Prefer`, so stock svn asks send-all. Stock svn 1.15's checkout (2,000 git/git revisions'
 > trunk in 5 s), export and update over HTTP pass; blame and diff ask reports still `501`; commits wait on POST.
+> **A-681 part C, HTTPv2 commits (w-interop, 2026-11-20):** `dav::commit::DavCommit` drives a POST's transaction
+> (`create-txn-with-props`) and its PUT, MKCOL, DELETE, COPY, PROPPATCH and MERGE through the one commit drive
+> (`Drive::edit`, typed), kept on the owner shard between requests (`VcsStores`, one a repository and principal) and
+> landed by `svn_commit::commit_work`; the HTTP edge now serves a `204` with no framing (ra_serf requires it for an
+> updating PUT and a DELETE). Stock svn 1.15's HTTP round trip runs un-ignored and passes; svn matrix over HTTP 23 of
+> 27. Owed: LOCK/UNLOCK and a commit's lock tokens (`If`, `S:lock-token-list`); the reports blame, diff and merge ask
+> (`file-revs`, a diff's, `mergeinfo`); a PUT's body held whole within the room; an abandoned transaction's expiry.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential

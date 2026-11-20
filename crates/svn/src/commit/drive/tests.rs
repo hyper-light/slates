@@ -1662,7 +1662,7 @@ fn read_at_pre_commit(
   replay: &Replay,
   begun: Vec<(Vec<u8>, Vec<u8>)>,
   commands: &[u8],
-) -> (Option<HookRead>, Option<Vec<(Vec<u8>, Vec<u8>)>>) {
+) -> (Option<HookRead>, Option<PropertyPairs>) {
   let mut drive = Drive::new(alice_setup("/trunk/project", begun));
   let mut out = Vec::new();
   let (mut read, mut accepted) = (None, None);

@@ -44,6 +44,12 @@ fn as_strs(lists: &[String; 10]) -> [&str; 10] {
 /// AEAD ciphers each way; `none` as the MAC and the compression; empty language lists; no guess.
 #[test]
 fn the_server_offers_its_methods_and_its_markers_first_only() {
+  the_first_kexinit_offers_the_methods_and_the_markers();
+  the_later_kexinit_offers_no_markers();
+}
+
+/// The first KEXINIT's lists, the strict markers among them, and its cookie.
+fn the_first_kexinit_offers_the_methods_and_the_markers() {
   let first = server_kexinit(&[1; 16], true).unwrap();
   let read = KexInit::read(&first).unwrap();
   let names = |list: List| -> Vec<String> {
@@ -76,6 +82,10 @@ fn the_server_offers_its_methods_and_its_markers_first_only() {
   assert!(names(List::LanguageClientToServer).is_empty());
   assert!(!read.first_kex_packet_follows);
   assert_eq!(read.cookie, &[1; 16]);
+}
+
+/// A later KEXINIT's key exchange list: the methods alone.
+fn the_later_kexinit_offers_no_markers() {
   let later = server_kexinit(&[2; 16], false).unwrap();
   let read_later = KexInit::read(&later).unwrap();
   let kex: Vec<&[u8]> = read_later.list(List::Kex).names().collect();
@@ -314,15 +324,15 @@ proptest! {
   fn any_kexinit_negotiates_or_refuses(tail in proptest::collection::vec(any::<u8>(), 0..400)) {
     let mut payload = vec![20];
     payload.extend_from_slice(&tail);
-    if let Ok(read) = KexInit::read(&payload) {
-      if let Ok(negotiated) = negotiate(&read, true) {
-        let method = match negotiated.kex {
-          KexMethod::Mlkem768X25519Sha256 => "mlkem768x25519-sha256",
-          KexMethod::Curve25519Sha256 => "curve25519-sha256",
-        };
-        prop_assert!(read.list(List::Kex).contains(method));
-        prop_assert!(Cipher::OFFERED.contains(&negotiated.client_to_server));
-      }
+    if let Ok(read) = KexInit::read(&payload)
+      && let Ok(negotiated) = negotiate(&read, true)
+    {
+      let method = match negotiated.kex {
+        KexMethod::Mlkem768X25519Sha256 => "mlkem768x25519-sha256",
+        KexMethod::Curve25519Sha256 => "curve25519-sha256",
+      };
+      prop_assert!(read.list(List::Kex).contains(method));
+      prop_assert!(Cipher::OFFERED.contains(&negotiated.client_to_server));
     }
   }
 }

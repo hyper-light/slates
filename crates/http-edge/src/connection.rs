@@ -749,8 +749,9 @@ impl Connection {
   /// The status the service names for its reply's head as its reply begins (the module doc), in place of `200`. Taken
   /// only before any of the reply is sent, and only while a reply is under way: on a route that decides it after the
   /// body ([`StatusMode::AfterBody`]) any status a reply's content may follow, on a streamed route `200` alone, its
-  /// own. Any other (`1xx`, `204`, `205`, `304`, a code outside RFC 9110 §15's classes, or a status other than `200` on
-  /// a streamed route) fails the request `500`, in stages.
+  /// own, and `204` (A-681: a WebDAV `DELETE`'s and an updating `PUT`'s answer), whose head is written with no framing
+  /// field and nothing after it, the service's runs dropped. Any other (`1xx`, `205`, `304`, a code outside RFC 9110
+  /// §15's classes, or a status other than `200` on a streamed route) fails the request `500`, in stages.
   pub fn reply_status(&mut self, status: Status) {
     let State::Reply { reply, .. } = &mut self.state else {
       return;
@@ -759,7 +760,7 @@ impl Connection {
       return;
     }
     let taken = match reply.mode {
-      StatusMode::AfterBody => carries_content(status),
+      StatusMode::AfterBody => carries_content(status) || status.code == NO_CONTENT,
       StatusMode::Streamed => status == Status::OK,
     };
     if taken {
@@ -783,7 +784,11 @@ impl Connection {
       reply.started = true;
       reply.fields = Fields::new();
     }
-    Some(Ok((*request, reply.head_only, head)))
+    Some(Ok((
+      *request,
+      reply.head_only || reply.status.code == NO_CONTENT,
+      head,
+    )))
   }
 
   /// The service's next bytes of its reply: the head before the first, each run chunked (HTTP/1.1) or as it is
@@ -878,6 +883,7 @@ fn rendered(
   out: &mut Vec<u8>,
 ) -> Result<(), BadField> {
   let body = match request.version {
+    _ if status.code == NO_CONTENT => Body::Empty,
     Version::Http11 => Body::Chunked,
     Version::Http10 => Body::UntilClose,
   };

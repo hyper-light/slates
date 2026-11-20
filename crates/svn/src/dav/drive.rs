@@ -674,6 +674,7 @@ pub(crate) fn uri_encode(path: &str) -> Cow<'_, str> {
     return Cow::Borrowed(path);
   }
   let (upper, _) = HEX_DIGITS;
+  // Format: an escaped byte is three, `%` and its two hex digits.
   let mut text = String::with_capacity(path.len().saturating_mul(3));
   for byte in path.bytes() {
     if safe(&byte) {
