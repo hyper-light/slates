@@ -15384,6 +15384,11 @@ and export by landing).
 > (`slates_svn::migration::TextSource`; `WithTexts` pairs the records with one), so the green's content index can
 > serve every text once the records stop holding text bytes (slice 2).
 >
+> **Status (2026-11-20, A-703).** `replay` and `replay-range` serve `svnsync` and `svnrdump`: a revision driven as
+> `svn_repos_replay2` drives it (`slates_svn::report::drive::replay`), streamed over the connection's editor with each
+> range revision's readable properties, the answers held to stock `svnserve`'s recordings of stock `svnsync` and
+> `svnrdump` (`crates/svn/fixtures/replay`).
+>
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
 > token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's

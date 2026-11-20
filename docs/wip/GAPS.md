@@ -2014,6 +2014,14 @@
 > w-perf): the lenders lend the green's content index as the source, the records keep each text's identity and
 > place without its bytes, the importer's delta base, the export and `svn_commit`'s lookups read through the source,
 > and a rebuild re-holds the texts.
+> A-703, 2026-11-20 (w-svn): ra_svn's `replay` and `replay-range`: `report::drive::replay` drives a revision as
+> `svn_repos_replay2` over `svn_delta_path_driver3` does (copies with their source at or above the low-water mark, a
+> directory copied without it added whole, deltas against the copy's or the previous revision's text), and the
+> connection streams each revision (its readable `revprops` for a range) then `finish-replay`, within its budget.
+> Held to stock `svnserve` 1.15.0's own answers to stock `svnsync synchronize` and `svnrdump dump` of the reads
+> fixtures' repository (`crates/svn/fixtures/replay`, 31 revisions call for call) and six scripted replays. Owed: a
+> live `svnsync`/`svnrdump` over `svn://` against a daemon, compared with `svnsync.dump` and `svnrdump-dump.dump`
+> (main's); a deleted path's readability judged inside a copy (`was_readable`).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
