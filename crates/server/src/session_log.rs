@@ -5,8 +5,8 @@
 //! a landing awaiting a grant.
 //!
 //! **Reads sized by what it shows (Ada's rule).** A shard's part walks its works from the cursor (the works it holds,
-//! changes in RAM) and its landings awaiting a grant through the partition's waiting index
-//! (`Partition::awaiting_grant_from`), never the landing history, and stops at one page. The log is a read: it shows a
+//! changes in RAM) and the presentations it holds awaiting a grant (bounded by `landings_awaiting_per_shard`), never
+//! the landing history, and stops at one page. The log is a read: it shows a
 //! pending grant and never makes one (R10); `grant` stays the CLI's and the launcher's.
 //!
 //! **One order across shards.** A line's key is its volume and, for a landing, its id (`None` for a work's line, which
@@ -52,7 +52,8 @@ fn mark_of(work: &WorkState) -> WorkMark {
     };
   }
   match work.accepted {
-    Some(version) if version == work.base_version => WorkMark::Accepted { version },
+    Some((version, true)) if version == work.base_version => WorkMark::Identical { version },
+    Some((version, false)) if version == work.base_version => WorkMark::Accepted { version },
     _ => WorkMark::Open,
   }
 }
@@ -88,39 +89,37 @@ fn work_lines<'a>(
 }
 
 /// This shard's landings awaiting a grant past `after`, as lines, in (volume, landing) order, those whose volume the
-/// caller may read.
+/// caller may read. Read from the presentations the shard holds now (`state.landing.awaiting`), which are exactly the
+/// grantable ones: a presentation its client abandoned (AUD-29-07) or a newer one superseded (A-779) is not there,
+/// though its durable record may still read `AwaitingGrant` (abandoned). Bounded by `landings_awaiting_per_shard`, so
+/// sorting them costs that bound, never the landing history.
 fn waiting_lines<'a>(
   state: &'a ShardState,
   principal: &'a Principal,
   after: Option<LogCursor>,
 ) -> impl Iterator<Item = LogLine> + 'a {
-  let from = match after {
-    // After a work's line: every landing of that volume.
-    Some(LogCursor {
-      volume,
-      landing: None,
-    }) => std::ops::Bound::Included((to_db_volume(volume), 0)),
-    Some(LogCursor {
-      volume,
-      landing: Some(landing),
-    }) => std::ops::Bound::Excluded((to_db_volume(volume), landing)),
-    None => std::ops::Bound::Unbounded,
-  };
   let partition = state.db.partition();
-  partition
-    .awaiting_grant_from(from)
-    .filter_map(move |landing| {
-      let record = partition.volume(landing.volume)?;
+  let mut lines: Vec<LogLine> = state
+    .landing
+    .awaiting
+    .iter()
+    .filter_map(|(id, awaiting)| {
+      let record = partition.volume(awaiting.volume)?;
       if !rights_of(record, principal).read {
         return None;
       }
-      Some(LogLine::AwaitingGrant {
-        landing: landing.id,
-        volume: to_wire_volume(landing.volume),
-        target: landing.target.clone(),
-        manifest: landing.manifest,
-      })
+      let line = LogLine::AwaitingGrant {
+        landing: *id,
+        volume: to_wire_volume(awaiting.volume),
+        target: awaiting.target.clone(),
+        manifest: awaiting.manifest,
+      };
+      let past = after.is_none_or(|cursor| key_of(&line) > (cursor.volume.bytes, cursor.landing));
+      past.then_some(line)
     })
+    .collect();
+  lines.sort_by_key(key_of);
+  lines.into_iter()
 }
 
 /// Two key-ordered line streams as one, in key order.

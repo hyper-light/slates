@@ -3514,6 +3514,7 @@ pub(crate) fn recorded_verification(
 /// first answer, its deferred one (AUD-11) and its resend's after a restart agree. `SubmittedSigned` with the
 /// signature's verdict when the version records one, else `Submitted`.
 pub(crate) fn accepted_reply(state: &ShardState, green: DbVolumeId, version: u64) -> ReplyBody {
+  let identical = identical_at(state, green, version);
   match recorded_verification(state, green, version) {
     Some(verification @ slates_ipc::protocol::Verification::Verified { .. })
     | Some(verification @ slates_ipc::protocol::Verification::Invalid { .. }) => {
@@ -3523,6 +3524,7 @@ pub(crate) fn accepted_reply(state: &ShardState, green: DbVolumeId, version: u64
         verification,
         conflicts_elided: 0,
         verdict: 0,
+        identical,
       }
     }
     Some(slates_ipc::protocol::Verification::Unsigned) | None => ReplyBody::Submitted {
@@ -3530,8 +3532,20 @@ pub(crate) fn accepted_reply(state: &ShardState, green: DbVolumeId, version: u64
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical,
     },
   }
+}
+
+/// Whether `green`'s committed `version` changed nothing (A-782, D-27's identical verdict), as the green's change index
+/// tells it ([`slates_merge::engine::Green::changed_nothing_at`]); `false` where it can no longer tell (a version at or
+/// below the folded floor) or the green is not here, so an answer never claims identical without the index's word.
+pub(crate) fn identical_at(state: &ShardState, green: DbVolumeId, version: u64) -> bool {
+  state
+    .greens
+    .get(&green)
+    .and_then(|engine| engine.changed_nothing_at(version))
+    .unwrap_or(false)
 }
 
 /// Serves `MergeRecord` (A-321): a committed version's record as a consumer reads it back — how its merge's signature
@@ -3953,7 +3967,9 @@ fn recompute(
       slates_machine::clock::monotonic_ns().saturating_sub(started),
     );
     match outcome {
-      Outcome::Accepted { version } if version == value.version => {}
+      // An identical increment is accepted too (A-782): its version commits nothing new.
+      Outcome::Accepted { version } | Outcome::Identical { version }
+        if version == value.version => {}
       // The owner accepted it; a holder that computes anything else has diverged.
       _ => return Err(RECOMPUTE_MISMATCH),
     }

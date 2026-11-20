@@ -70,6 +70,8 @@ export interface MergeOutcome {
   ok: boolean
   version: number | null
   conflicts: ConflictWindow[]
+  /** An accepted increment that changed nothing: every operation was already at the head (A-782). */
+  identical: boolean
 }
 
 /** A landing's result (§4.15) — the finished outcome, or a grant-required record for a human to authorize. */

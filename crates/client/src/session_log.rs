@@ -117,7 +117,7 @@ impl SessionLog {
         windows: *windows,
         behind: self.behind(work),
       }),
-      WorkMark::Open | WorkMark::Accepted { .. } => None,
+      WorkMark::Open | WorkMark::Accepted { .. } | WorkMark::Identical { .. } => None,
     });
     let waiting = self.landings.iter().map(|landing| NeedsYou::AwaitingGrant {
       landing: landing.landing,

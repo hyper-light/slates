@@ -162,6 +162,7 @@ LandingStage 6 Done
 LandingStage 7 Partial
 LandingStage 8 Refused
 LandingStage 9 Aborted
+LandingStage 10 Superseded
 LogLine 0 Work
 LogLine 1 AwaitingGrant
 MoveRefusal 0 NotPlain
@@ -305,6 +306,7 @@ Refusal 77 IdentityRequired
 Refusal 78 ImportRefused
 Refusal 79 CopyRefused
 Refusal 80 CredentialUnreplicated
+Refusal 81 LandingSuperseded
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -580,6 +582,7 @@ WatcherState 2 Unavailable
 WorkMark 0 Open
 WorkMark 1 Accepted
 WorkMark 2 Collided
+WorkMark 3 Identical
 WorkOp 0 Unlink
 WorkOp 1 Rename
 WorkOp 2 Mkdir

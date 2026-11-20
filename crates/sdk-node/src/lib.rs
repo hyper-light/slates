@@ -215,6 +215,8 @@ pub struct MergeOutcome {
   pub conflicts: Vec<ConflictWindow>,
   pub approval_identity: Option<String>,
   pub approval_paths: Option<i64>,
+  /// A-782: an accepted increment that changed nothing (every operation was already at the head).
+  pub identical: bool,
 }
 
 /// Builds the uniform merge outcome for `submit`/`rebase`: `ok` is exactly "a version was produced";
@@ -242,6 +244,7 @@ fn merge_outcome(
     conflicts,
     approval_identity: None,
     approval_paths: None,
+    identical: false,
   })
 }
 
@@ -577,12 +580,20 @@ fn work_volume(id: VolumeId, base: u64) -> Result<WorkVolume> {
 fn submit_outcome(outcome: Submitted) -> Result<MergeOutcome> {
   match outcome {
     Submitted::Accepted(version) => merge_outcome(Some(version), Vec::new()),
+    // Accepted, changing nothing (A-782): every operation was already at the head.
+    Submitted::Identical(version) => {
+      merge_outcome(Some(version), Vec::new()).map(|outcome| MergeOutcome {
+        identical: true,
+        ..outcome
+      })
+    }
     Submitted::ApprovalRequired { identity, paths } => Ok(MergeOutcome {
       ok: false,
       version: None,
       conflicts: Vec::new(),
       approval_identity: Some(hex32(&identity)),
       approval_paths: Some(status_i64(paths, "paths")?),
+      identical: false,
     }),
     Submitted::Conflict(windows) => merge_outcome(
       None,

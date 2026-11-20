@@ -222,3 +222,122 @@ fn ten_works_one_collision_one_pending_landing_names_exactly_those_two() {
   drop(client);
   daemon.stop();
 }
+
+/// A-779 (main's ruling, 2026-11-20). Do: present a landing of a volume into a target, present it
+/// again into the same target from a second client, then grant the first. Expect: the grant refused `LandingSuperseded` naming the second,
+/// the log listing only the second as awaiting, and the second still grantable. Before A-779 the first stayed listed
+/// and a second client's re-presentation left it grantable.
+#[test]
+fn a_newer_presentation_supersedes_the_older_whose_grant_is_refused() {
+  let (daemon, instance) = daemon("supersede");
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = target_dir();
+  let volume = client.create(&scratch("presented")).unwrap();
+  let present = |client: &mut slates_client::Client| {
+    let Landing::GrantRequired {
+      landing, manifest, ..
+    } = client
+      .land(volume, None, &target.path, Filter::default(), None)
+      .unwrap()
+    else {
+      panic!("presented, awaiting a grant");
+    };
+    (landing, manifest)
+  };
+  let (first, first_manifest) = present(&mut client);
+  // A second client presents again: the rule is the volume and the target, whoever presents.
+  let mut other = connect(&instance);
+  let (second, second_manifest) = present(&mut other);
+  assert_ne!(first, second);
+
+  let proof = |landing: u64, manifest: &[u8; 32]| {
+    slates_server::landing::grant_proof(
+      &secret,
+      landing,
+      manifest,
+      GrantScope::Once,
+      common::landing::GRANT_TERM_NS,
+    )
+  };
+  let refused = client.grant(
+    first,
+    first_manifest,
+    GrantScope::Once,
+    common::landing::GRANT_TERM_NS,
+    proof(first, &first_manifest),
+  );
+  assert!(
+    matches!(
+      refused,
+      Err(slates_client::ClientError::Refused(slates_client::Refusal::LandingSuperseded { newer }))
+        if newer == second
+    ),
+    "the older presentation's grant is refused by kind, naming the newer: {refused:?}"
+  );
+
+  let waiting: Vec<u64> = client
+    .session_log()
+    .unwrap()
+    .landings
+    .iter()
+    .map(|l| l.landing)
+    .collect();
+  assert_eq!(waiting, vec![second], "only the newer awaits");
+  client
+    .grant(
+      second,
+      second_manifest,
+      GrantScope::Once,
+      common::landing::GRANT_TERM_NS,
+      proof(second, &second_manifest),
+    )
+    .expect("the newer is grantable");
+  drop((client, other));
+  daemon.stop();
+}
+
+/// A-782 (main's order, 2026-11-20): D-27's verdict is accept, identical or conflict, and the submit says which. Do: two
+/// works over one green make the same edit to `shared.txt`; the first submits, then the second; a third makes a
+/// different edit elsewhere. Expect: the first `Accepted`, the second `Identical` (every operation was already at the
+/// head), the third `Accepted`; the session log marks the second `Identical` at the version it committed. Before A-782
+/// the second answered `Accepted` and nothing told it from a change.
+#[test]
+fn an_identical_submission_is_told_from_an_accepted_one() {
+  let (daemon, instance) = daemon("identical");
+  let mut client = connect(&instance);
+  let green = client.create_green("converging", false).unwrap();
+  let (seed, _) = client.create_work(green, "seed").unwrap();
+  client.edit(seed, "/shared.txt", 0, 0, b"base\n").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  let (first, _) = client.create_work(green, "first").unwrap();
+  let (second, _) = client.create_work(green, "second").unwrap();
+  let (third, _) = client.create_work(green, "third").unwrap();
+  client.edit(first, "/shared.txt", 0, 4, b"same").unwrap();
+  client.edit(second, "/shared.txt", 0, 4, b"same").unwrap();
+  client.edit(third, "/other.txt", 0, 0, b"new\n").unwrap();
+  assert_eq!(client.submit(first).unwrap(), Submitted::Accepted(2));
+  assert_eq!(
+    client.submit(second).unwrap(),
+    Submitted::Identical(3),
+    "the same edit again changes nothing"
+  );
+  assert_eq!(client.submit(third).unwrap(), Submitted::Accepted(4));
+  let log = client.session_log().unwrap();
+  let mark_of = |work| {
+    log
+      .works
+      .iter()
+      .find(|w| w.id == work)
+      .map(|w| w.mark.clone())
+  };
+  assert_eq!(mark_of(first), Some(WorkMark::Accepted { version: 2 }));
+  assert_eq!(mark_of(second), Some(WorkMark::Identical { version: 3 }));
+  assert_eq!(mark_of(third), Some(WorkMark::Accepted { version: 4 }));
+  assert!(
+    log.needs_you().is_empty(),
+    "an identical submission needs no one"
+  );
+  drop(client);
+  daemon.stop();
+}
