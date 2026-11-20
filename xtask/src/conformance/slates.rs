@@ -14,7 +14,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use slates_conformance::Suite;
-use slates_conformance::capability::{Availability, HostOs, LINUX_NFS_ADAPTER, availability};
+use slates_conformance::capability::{
+  Availability, HostOs, LINUX_NFS_ADAPTER, RootNeed, availability,
+};
 use slates_conformance::record::Transport;
 
 use super::{Run, create_dir, pause, stdout_of};
@@ -549,6 +551,9 @@ pub(crate) enum Reach {
   /// The Linux kernel's NFSv3 client as root, standing in for the FUSE transport
   /// ([`LINUX_NFS_ADAPTER`], recorded LIMITED).
   LinuxNfsAdapter,
+  /// The daemon's own Linux FUSE mount made `--shared` (`allow_other`), for a cell that runs as root: root reaches a
+  /// user's FUSE mount through nothing else (pjdfstest, goal 226).
+  OwnShared,
 }
 
 impl Reach {
@@ -560,6 +565,12 @@ impl Reach {
         adapter: Some(adapter),
         ..
       } if adapter == LINUX_NFS_ADAPTER => Reach::LinuxNfsAdapter,
+      Availability::Runnable {
+        on: HostOs::Linux,
+        root: RootNeed::Required(_),
+        adapter: None,
+        ..
+      } if transport == Transport::NativeLinuxFuse => Reach::OwnShared,
       _ => Reach::Own,
     }
   }
@@ -730,8 +741,9 @@ pub(crate) fn mount_volume(
         export: None,
       }
     }
-    // The Linux container form binds the daemon's own shared FUSE mount: no privilege, no adapter.
-    HostOs::Linux if run.transport == Transport::OciLinux => {
+    // The Linux container form binds the daemon's own shared FUSE mount: no privilege, no adapter. A root cell of the
+    // FUSE transport reaches it the same way ([`Reach::OwnShared`]).
+    HostOs::Linux if run.transport == Transport::OciLinux || run.reach == Reach::OwnShared => {
       let point = fresh_mount_point()?;
       binary
         .run(
@@ -1238,6 +1250,8 @@ mod tests {
     for suite in [Suite::Fsx, Suite::Fsstress] {
       assert_eq!(Reach::of(transport, suite), Reach::Own, "{suite:?}");
     }
+    // pjdfstest, root's suite, reaches it shared (`allow_other`), as root reaches nothing else of the user's.
+    assert_eq!(Reach::of(transport, Suite::Pjdfstest), Reach::OwnShared);
     let session = Session::open_with(
       &run,
       SlatesBinary::at(PathBuf::from(binary)),

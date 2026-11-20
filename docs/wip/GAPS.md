@@ -147,7 +147,8 @@
 >
 > **A-713 (2026-11-20, w-git; every clone of a long history refused for its room, found by use).** BUILT: git's
 > upload-pack, HTTP and SSH, admits each request what its repository's shard could admit (`StoreLender::room`), as A-704
-> admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> admits a push. A-745 git piece 1 (2026-11-20, w-k90-vendor): the plan carries its objects as runs of positions, never a
+> handle an object. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -180,8 +181,13 @@
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
 > lands ignored. Piece 1 BUILT: `getbundle::Answering`, the answer a slice at a time, a clone of every head walked by
 > its links (the request holds ranges and a place), its least room a slice less than the whole answer's (test), the
-> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Owed: the server driving it
-> a turn at a time over HTTP and SSH (piece 2, which turns the red green); the stream clone's; w-interop's matrix rerun.
+> session's and the model's 7.2 oracles kept (the model now also states 7.2's fast path). Piece 2a BUILT (HTTP): the
+> edge begins a `getbundle` (`serve::http::begin`) and makes its body a turn at a time (`HgExchange::turn`): the view
+> lent for the turn alone, the shard's room (`vcs_share::room`) and step quantum (`HgStores::fetch_turn`), the stream
+> compressed as it is made (`compression::StreamCompressor`, each slice's engine bound charged first); a step past a
+> turn's room after others waits for the next turn's. The red is GREEN: the clone of a file twice a request's room is
+> answered whole. Owed: SSH (piece 2b); a hold on the index generation a fetch began on (rule 4: a push landing
+> mid-clone is read by the clone's later turns); the stream clone's; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -1972,8 +1978,10 @@
 > destination (an appearance record, one change-index and one `last_changed` entry), read by the latest copy above a
 > key, the identity one entry a copy, hard links refused by kind (BUILT 2026-11-20, w-shared, main's ruling: a copied
 > tree's links share the copy's nodes, a link naming a node outside it gets a node of its own, `Green::copy_link_effects`;
-> refused only where that outside node changed after the copy's version, still as `TypeChanged`, owed its own typed
-> refusal), the root a source and never a destination, a branch
+> refused only where that outside node changed after the copy's version) and every copy it does not make refused before
+> any verdict by its own case, never a conflict (2026-11-20, `Refusal::CopyRefused`/`CopyCase`: `Root`, `PastHead`,
+> `SourceEmpty` as FSFS refuses them; `VersionFolded` by retention; `OutsideNodeChanged`, `ChangedSourceLink`,
+> `LinkAcrossCopy` owed work), the root a source and never a destination, a branch
 > made before a copy cutting it, a review comment on a copied file moving with it (A-596); held to a reference green
 > that copies key by key (`cargo test -p slates-merge --lib` on the Mac Studio, red six ways, see A-586). Owed from
 > A-586: a checkpoint of a green holding a copy (its tree listed, the identity's sum carried; `None` today, the chain
@@ -7223,6 +7231,13 @@
 >   run is slower than a plain one (fsx 8.5 s to 164.5 s on the Studio, with 407 whole states shipped past the live
 >   credit, `refused.no_credit` 411; 6 to 27 s to 62 to 82 s on Linux arm64), which is AC-8.9's credit and live-write
 >   latency's to cut (g230, g076b). Windows remains as recorded above.
+> - **Linux over the daemon's own FUSE mount conforms too (2026-11-20, goal 226).** The `native-linux-fuse` lane no longer
+>   reaches its volume through the NFS adapter for fsx, fsstress and pjdfstest: the first two run over `slates mount`,
+>   unprivileged, and pjdfstest as root over `slates mount --shared`. Diagnostics run 44731860624 (`ubuntu-latest`,
+>   Ubuntu 26.04.1, load 1 to 3.3): fsx 10,000 operations and fsstress 4 × 500 passed plain and live, pjdfstest 8,770 of
+>   8,798 cases passed both ways (0 failed, 28 todo), `compare` 0 differing, every live log durable and held. The two NFS
+>   limits the lane's pjdfstest list held pass over FUSE, so the list is empty. Commands and counts:
+>   `docs/wip/conformance.md` (the live-shipped pair).
 
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher

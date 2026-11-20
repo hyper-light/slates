@@ -36,6 +36,7 @@ use super::sparse::Verdict;
 use super::{Counters, Filter, Graph, Patterns, Refusal, Request, Run, charge};
 use crate::Admission;
 use crate::object_name::{Kind, ObjectId};
+use crate::positions::Positions;
 
 /// Format: the byte between a path's segments.
 const SLASH: u8 = b'/';
@@ -60,7 +61,7 @@ pub(super) fn select<S: Graph>(
   runs: &[Run<S::Green>],
   admission: &mut Admission,
   counters: &mut Counters,
-) -> Result<Vec<S::Node>, Refusal> {
+) -> Result<Positions, Refusal> {
   let sent = commits(graph, sides, admission, counters)?;
   let left_out = left_out(graph, request, sides, &sent, admission)?;
   let mut chosen = Chosen {
@@ -90,7 +91,18 @@ pub(super) fn select<S: Graph>(
     let carried = carried_by_runs(graph, runs, request.filter, admission)?;
     chosen.tags(graph, &carried, admission)?;
   }
-  Ok(chosen.objects.into_iter().collect())
+  // Positions ascend as the set does, so each extends the last run or begins one: what is kept is a run a range of
+  // positions, charged as it begins (A-745); the set is given back as it is read.
+  let mut sent_objects = Positions::new();
+  let mut runs_kept = 0;
+  for node in chosen.objects {
+    sent_objects.insert(node.into());
+    if sent_objects.runs() > runs_kept {
+      runs_kept = sent_objects.runs();
+      charge::<(u64, u64)>(admission)?;
+    }
+  }
+  Ok(sent_objects)
 }
 
 /// The commits to send: wanted and not had.

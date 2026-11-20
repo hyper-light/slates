@@ -4729,6 +4729,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::MessageRequired => "message_required",
     Refusal::IdentityRequired { .. } => "identity_required",
     Refusal::ImportRefused { .. } => "import_refused",
+    Refusal::CopyRefused { .. } => "copy_refused",
   }
 }
 
@@ -9731,7 +9732,28 @@ fn judge_submission(
         version: base,
       })
     }
+    slates_merge::engine::Outcome::CopyRefused { path, case } => {
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
+      refused(copy_refused(path, case))
+    }
   }
+}
+
+/// A copy refused before any verdict on the wire (A-586; main's ruling of 2026-11-20): the engine's case named by an
+/// exhaustive match, so a case appended to the engine breaks this build until the wire names it.
+pub(crate) fn copy_refused(path: String, case: slates_merge::engine::CopyRefusal) -> Refusal {
+  use slates_ipc::protocol::CopyCase;
+  use slates_merge::engine::CopyRefusal;
+  let case = match case {
+    CopyRefusal::Root => CopyCase::Root,
+    CopyRefusal::PastHead => CopyCase::PastHead,
+    CopyRefusal::SourceEmpty => CopyCase::SourceEmpty,
+    CopyRefusal::VersionFolded => CopyCase::VersionFolded,
+    CopyRefusal::OutsideNodeChanged => CopyCase::OutsideNodeChanged,
+    CopyRefusal::ChangedSourceLink => CopyCase::ChangedSourceLink,
+    CopyRefusal::LinkAcrossCopy => CopyCase::LinkAcrossCopy,
+  };
+  Refusal::CopyRefused { path, case }
 }
 
 /// Whether green `green`'s chain can hold `record`, an increment about to be judged: checked guard-then-apply. A chain
@@ -9931,6 +9953,9 @@ fn map_rebase(
         green: to_wire_volume(green_id),
         version: base,
       }))
+    }
+    slates_merge::engine::Rebased::CopyRefused { path, case } => {
+      RebaseAnswer::Reply(refused(copy_refused(path, case)))
     }
   }
 }

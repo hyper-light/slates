@@ -33,7 +33,7 @@
 //! the identity already stands for the source's tree at its version, and a key's first change after the copy records
 //! the value the copy gave it. The chain entry records the fix whole, so a replay reads no history whatever its holder
 //! folded or restored, and the room it needs is derived before the verdict (`Green::copy_entry_room`). A version whose
-//! values are folded away is refused, typed (`TypeChanged`): what it held is gone.
+//! values are folded away is refused, typed (`CopyRefusal::VersionFolded`): what it held is gone.
 //!
 //! **One record a copy, never one a key.** A copy is recorded once, at its destination: an appearance record (the
 //! version, the source, the source's version), one entry of the change index and one `last_changed` entry for the
@@ -63,7 +63,16 @@
 //! needs the replace where that tree holds anything; Subversion's move inside a copied tree, a copy and a removal, lands
 //! with it. Every source is held before any copy of the version lands, since FSFS copies from a revision and never from
 //! the transaction, and the copies land in their destinations' order, an outer one before those inside its tree. A
-//! rename or a hard link with an end in a copied tree is refused, typed: Subversion has neither.
+//! rename or a hard link with an end in a copied tree is refused, typed (`CopyRefusal::LinkAcrossCopy`): Subversion has
+//! neither.
+//!
+//! **Refused before any verdict, typed** (main's ruling of 2026-11-20; [`CopyRefusal`], `Green::copy_refusal`): a copy
+//! this piece does not make is answered as its own case, never a conflict (no concurrent change caused it, no rebase
+//! answers it), by a submit and a rebase alike (`Outcome::CopyRefused`, `Rebased::CopyRefused`): the root as destination,
+//! a source version past the head and an empty source, which FSFS's commit refuses too; a version folded away, which
+//! follows from what a green retains; a hard link naming an outside node changed since the version, a hard link in a
+//! source changed since it, and a rename or link across a copied tree's edge, owed work. The verdict's own checks of
+//! these stay as guards, never reached.
 //!
 //! **The identity (A-202), relative to its copies.** The set hash adds one entry for a copy, naming its destination, its
 //! source and the source's version, and never the entries the copy brought: those stand in the copy's entry, so a copy
@@ -139,7 +148,7 @@ pub(super) struct CopySpec {
 /// Each copy's fix in one increment (A-626 part 2), by destination, computed once a verdict ([`Green::copy_fixes`]):
 /// none for a source unchanged since its version, the class that refuses one whose version's values are folded away or
 /// held a hard link.
-pub(super) type CopyFixes = BTreeMap<String, Result<Option<CopyFix>, MergeConflictClass>>;
+pub(super) type CopyFixes = BTreeMap<String, Result<Option<CopyFix>, CopyRefusal>>;
 
 /// One copy as [`Green::commit_copies`] applies it: its destination and source, the source's version and whether it
 /// replaces, and its fix.
@@ -657,7 +666,8 @@ fn split_list<T>(
 impl Resolved {
   /// Hands every operation on a path in one of this increment's copies' trees to [`Resolved::copied`], judged against
   /// the copied tree (module docs), and marks invalid what this piece does not judge there: a rename or a hard link with
-  /// either end in a copied tree (Subversion moves by a copy and a removal, which land; A-626).
+  /// either end in a copied tree (Subversion moves by a copy and a removal, which land; A-626), kept apart as what
+  /// [`Green::copy_refusal`] refuses ([`CopyRefusal::LinkAcrossCopy`]).
   pub(super) fn split_copies(&mut self) {
     if self.copies.is_empty() {
       return;
@@ -666,14 +676,14 @@ impl Resolved {
     let inside = |path: &str| destinations.iter().any(|dst| in_tree(path, dst));
     for (dst, src) in std::mem::take(&mut self.renames) {
       if inside(dst.as_str()) || inside(src.as_str()) {
-        self.invalid.insert(dst);
+        self.across_copies.insert(dst);
       } else {
         self.renames.insert(dst, src);
       }
     }
     for (path, target) in std::mem::take(&mut self.hardlinks) {
       if inside(path.as_str()) || inside(target.path.as_str()) {
-        self.invalid.insert(path);
+        self.across_copies.insert(path);
       } else {
         self.hardlinks.insert(path, target);
       }
@@ -815,7 +825,7 @@ impl Green {
   fn source_at<'a>(
     &'a self,
     spec: &'a CopySpec,
-    fix: Option<&'a Result<Option<CopyFix>, MergeConflictClass>>,
+    fix: Option<&'a Result<Option<CopyFix>, CopyRefusal>>,
   ) -> SourceAt<'a> {
     SourceAt {
       green: self,
@@ -851,7 +861,8 @@ impl Green {
     (r, fixes): (&Resolved, &CopyFixes),
   ) -> Result<Effect, ConflictWindow> {
     let fix = match fixes.get(dst) {
-      Some(Err(class)) => return Err(Green::window(dst, *class)),
+      // Refused before the verdict (`Green::copy_refusal`): a guard only, never reached.
+      Some(Err(_)) => return Err(Green::window(dst, MergeConflictClass::TypeChanged)),
       Some(Ok(fix)) => fix.as_ref(),
       None => None,
     };
@@ -932,6 +943,46 @@ impl Green {
     })
   }
 
+  /// The first copy the increment declares that this piece refuses before any verdict, by its own case (main's ruling
+  /// of 2026-11-20: none of them is a concurrent change a rebase could fix, so no conflict class names them), with its
+  /// destination: a destination at the root, a source version past the head, nothing in the source's tree at its
+  /// version (each a refusal FSFS's commit makes too); the version's values folded away (retention); a hard link in a
+  /// source changed since its version, one naming an outside node changed since, and a rename or a hard link declared
+  /// across a copied tree's edge (owed work). In the copies' order, the destinations sorted; `None` for an increment this
+  /// piece takes to its verdict.
+  pub(super) fn copy_refusal(&self, r: &Resolved) -> Option<(String, CopyRefusal)> {
+    if let Some(path) = r.across_copies.iter().next() {
+      return Some((path.clone(), CopyRefusal::LinkAcrossCopy));
+    }
+    let fixes = self.copy_fixes(r);
+    for (dst, spec) in &r.copies {
+      let refused = |case| Some((dst.clone(), case));
+      if dst.is_empty() {
+        return refused(CopyRefusal::Root);
+      }
+      if spec.version > self.head() {
+        return refused(CopyRefusal::PastHead);
+      }
+      let fix = match fixes.get(dst) {
+        Some(Err(case)) => return refused(*case),
+        Some(Ok(fix)) => fix.as_ref(),
+        None => None,
+      };
+      let brought = SourceAt {
+        green: self,
+        source: &spec.source,
+        fix,
+      };
+      if outer_of(&r.copies, dst).is_none() && !brought.holds_tree(&spec.source) {
+        return refused(CopyRefusal::SourceEmpty);
+      }
+      if self.outside_link_moved(&spec.source, spec.version) {
+        return refused(CopyRefusal::OutsideNodeChanged);
+      }
+    }
+    None
+  }
+
   /// Whether a hard link in `source`'s tree names a node outside it whose bytes or node changed after `version`: the
   /// copy gives such a link a node of its own holding the node's bytes ([`Green::copy_link_effects`]), read from the
   /// head, which holds them as they stood at the version only where nothing changed them since.
@@ -992,19 +1043,20 @@ impl Green {
   /// version (A-626 part 2; FSFS copies from any committed revision): none for a tree unchanged since. The paths the
   /// change index names in the source's tree since the version are the only keys that can differ (a key unnamed since
   /// is unchanged); a copy made since above the source replaced the whole tree, so nothing of the head's is grafted; one
-  /// made since inside it is cut. Refused, by class, when the version's values are folded away (below the fold floor or
-  /// the checkpoint the green was restored at) or a hard link stood in the tree at it. O(the change index's entries
+  /// made since inside it is cut. Refused, typed, when the version's values are folded away (below the fold floor or
+  /// the checkpoint the green was restored at, [`CopyRefusal::VersionFolded`]) or a hard link stood in the tree at it
+  /// ([`CopyRefusal::ChangedSourceLink`]). O(the change index's entries
   /// since the version, and the keys at the paths it names).
   pub(super) fn copy_fix(
     &self,
     source: &str,
     version: u64,
-  ) -> Result<Option<CopyFix>, MergeConflictClass> {
+  ) -> Result<Option<CopyFix>, CopyRefusal> {
     if !self.tree_changed_after(source, version) {
       return Ok(None);
     }
     if version < self.folded_below.max(self.deltas_from) {
-      return Err(MergeConflictClass::TypeChanged);
+      return Err(CopyRefusal::VersionFolded);
     }
     let named: BTreeSet<&str> = self
       .changes
@@ -1055,9 +1107,9 @@ impl Green {
     source: &str,
     (path, version): (&str, u64),
     fix: &mut CopyFix,
-  ) -> Result<(), MergeConflictClass> {
+  ) -> Result<(), CopyRefusal> {
     if self.hardlink_at(path, version).is_some() {
-      return Err(MergeConflictClass::TypeChanged);
+      return Err(CopyRefusal::ChangedSourceLink);
     }
     let rel = relative(path, source).unwrap_or_default().to_owned();
     let grafted = grafted_in(fix, &rel);
@@ -1934,4 +1986,26 @@ impl IdentityKey {
       IdentityKey::Copy(_) => IdentityKey::Copy(path),
     }
   }
+}
+
+/// Why this piece refuses a copy before any verdict ([`Green::copy_refusal`]; main's ruling of 2026-11-20): never a
+/// conflict, since no concurrent change caused it and no rebase answers it. FSFS's commit refuses the first three too;
+/// the fourth follows from what a green retains; the rest are copies this piece does not make yet (owed work, A-586).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyRefusal {
+  /// The destination is the root, which always stands (an editor never adds it).
+  Root,
+  /// The source's version is past the head: a version the green never made.
+  PastHead,
+  /// Nothing stood in the source's tree at its version.
+  SourceEmpty,
+  /// The source's version's values are folded away: below the fold floor, or the checkpoint the green was restored at.
+  VersionFolded,
+  /// A hard link in the source's tree names a node outside it that changed after the version: its copy would read the
+  /// node as it stands now (owed).
+  OutsideNodeChanged,
+  /// The source changed after its version and a hard link stood in its tree then (owed).
+  ChangedSourceLink,
+  /// A rename or a hard link the increment declares with an end in a copied tree (owed: Subversion has neither).
+  LinkAcrossCopy,
 }

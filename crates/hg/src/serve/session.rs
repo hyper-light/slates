@@ -527,7 +527,23 @@ fn getbundle_answer(
   arguments: &Arguments<'_>,
   admission: &mut Admission,
 ) -> (Answer, Option<Refused>) {
-  let asked = Asked {
+  let asked = getbundle_asked(arguments);
+  let mut stream = Vec::new();
+  match getbundle(store, &asked, admission, &mut stream) {
+    Ok(()) => {
+      let answer = Answer::Stream {
+        stream,
+        prefer_uncompressed: false,
+      };
+      (answer, None)
+    }
+    Err(refusal) => getbundle_refused(refusal, transport),
+  }
+}
+
+/// What a `getbundle`'s arguments ask.
+pub(crate) fn getbundle_asked<'a>(arguments: &Arguments<'a>) -> Asked<'a> {
+  Asked {
     heads: arguments.entry(b"heads").unwrap_or_default(),
     common: arguments.entry(b"common").unwrap_or_default(),
     bundlecaps: arguments.entry(b"bundlecaps").unwrap_or_default(),
@@ -536,18 +552,15 @@ fn getbundle_answer(
     bookmarks: arguments.entry(b"bookmarks"),
     obsmarkers: arguments.entry(b"obsmarkers"),
     listkeys: arguments.entry(b"listkeys"),
-  };
-  let mut stream = Vec::new();
-  let refusal = match getbundle(store, &asked, admission, &mut stream) {
-    Ok(()) => {
-      let answer = Answer::Stream {
-        stream,
-        prefer_uncompressed: false,
-      };
-      return (answer, None);
-    }
-    Err(refusal) => refusal,
-  };
+  }
+}
+
+/// The answer to a `getbundle` refused before its stream began: a bundle2 request's as an `ERROR:ABORT` part, sent
+/// uncompressed; a bundle1 request's out of band, over HTTP in 7.2's own words ([`BUNDLE2_REQUIRED`]).
+pub(crate) fn getbundle_refused(
+  refusal: Refusal,
+  transport: Transport,
+) -> (Answer, Option<Refused>) {
   let refused = Refused::Serve(refusal);
   let words = match (refusal, transport) {
     (Refusal::NoBundle2, Transport::Http { .. }) => BUNDLE2_REQUIRED.to_vec(),

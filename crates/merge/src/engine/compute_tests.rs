@@ -487,6 +487,9 @@ fn same_verdict(
     Judgment::BaseUnavailable { base, floor } => Err(TestCaseError::fail(format!(
       "the owner refused base {base} below {floor}"
     ))),
+    Judgment::CopyRefused { path, case } => Err(TestCaseError::fail(format!(
+      "the owner refused the copy to {path}: {case:?}"
+    ))),
   }
 }
 
@@ -748,7 +751,7 @@ fn judged_answer(judgment: &Judgment) -> Answer {
     Judgment::Accepted(_) => Answer::Accepted,
     Judgment::AcceptedBefore { .. } => Answer::Before,
     Judgment::Conflict { .. } => Answer::Conflict,
-    Judgment::BaseUnavailable { .. } => Answer::Unknown,
+    Judgment::BaseUnavailable { .. } | Judgment::CopyRefused { .. } => Answer::Unknown,
   }
 }
 

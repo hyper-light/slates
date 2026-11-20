@@ -307,7 +307,6 @@ impl Answering {
       let mut chunk = Vec::new();
       let more = walk.step(store, room, &mut chunk)?;
       if !chunk.is_empty() {
-        room.charge(to_u64(chunk.len()))?;
         crate::bundle2::put_payload_chunk(out, &chunk).map_err(|_| unencodable("a chunk"))?;
       }
       if !more {
@@ -667,7 +666,8 @@ impl Walk {
       out.extend_from_slice(&named);
       return Ok(false);
     }
-    let Some(at) = self.at.take() else {
+    // A refused step leaves the walk where it was, so a step given more room takes the same unit again.
+    let Some(at) = self.at.clone() else {
       return Ok(false);
     };
     self.at = match at {
