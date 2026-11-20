@@ -55,3 +55,10 @@ Target: under 30 minutes per piece.
 - You are a full Claude Code agent: your context compacts automatically. Do not end, hand off or ask for a fresh agent
   because your context is long. Keep your progress file current after each step, so compaction loses nothing, and
   carry on through your whole queue. End only when the queue is truly done.
+
+## EVERY PIECE ENDS ON origin/main (ADA 2026-11-19 ~22:15 PST)
+- When a piece is complete: commit it, `git fetch origin`, `git merge origin/main` into your branch (resolve, re-run your
+  focused test only if the merge changed code you compile against), then `git push origin HEAD:main` as its own command.
+  If the push is rejected because main moved, fetch, merge again and push again until it lands -- never force.
+- Confirm it landed: `git fetch origin && git merge-base --is-ancestor <your commit> origin/main`. Only then report it.
+- Never leave finished work on a branch. A branch that holds done work is not done.
