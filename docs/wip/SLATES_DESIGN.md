@@ -15248,8 +15248,11 @@ and export by landing).
 > `get-locations.c` writes it. Held to the fixture repository (each revision's delta replayed to the text the site's GET
 > serves there; a directory refused; a file traced back across its copy) and to stock svn 1.15 against `svnserve -t`
 > over one history: seven commands, every answer byte for byte the same but for the author. Departures: deltas in
-> svndiff 0, as the update-report writes them; locations in the trace's order, where `mod_dav_svn` walks a hash. Owed:
-> the `mergeinfo-report` (`svn blame -g`, `svn merge`).
+> svndiff 0, as the update-report writes them; locations in the trace's order, where `mod_dav_svn` walks a hash.
+> **Part 2:** the `mergeinfo-report`, the svn:// catalog (`svn_repos_fs_get_mergeinfo2`) written as `mergeinfo.c`
+> writes it (each path relative to the resource's), and OPTIONS now answers `SVN-Repository-MergeInfo: yes` and lists
+> `mergeinfo`, so stock `svn merge`, `svn blame -g` and `svn mergeinfo` work through the edge, each held to `svnserve
+> -t`'s answers. Owed: a catalog with descendants is written whole within the reply's room, refused past it.
 >
 > **Status (2026-11-19, A-616, part 2, its third slice).** Built: one report command's exchange on an ra_svn
 > connection (`report::exchange::Exchange`): the reporter, the drive and the editor writer joined as `serve.c`'s
@@ -54775,7 +54778,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `stock_svn_blames_and_diffs_over_the_vcs_http_edge_as_against_svnserve` (stock svn 1.15.0 on the Mac Studio: `blame`,
   `blame -r 2`, `diff -r 1:3`, `diff -c 2`, `diff --summarize`, a two-peg diff, `cat -r 1`, each equal to `svnserve -t`'s).
 - **Applied in the same change to** §4.17.4's status, GAPS (A-681's owed reports), amendments.tsv.
-- **Owed.** Part 2: the `mergeinfo-report` and `SVN-Repository-MergeInfo: yes` (`svn blame -g`, `svn merge`). Deltas in
+- **Part 2 (same day).** `dav::report_mergeinfo` answers the `mergeinfo-report` from the svn:// catalog
+  (`reads::repository_mergeinfo`, the `get-mergeinfo` walk opened to the site), and the site's OPTIONS answers
+  `SVN-Repository-MergeInfo: yes` and lists `mergeinfo`. Tests: `dav::report_mergeinfo::tests` (a directory's own, a file's
+  inherited, none before it was set, a revision past the youngest `404`), the OPTIONS test now holding `yes`; `slates-cli`
+  `svn_http_reports` `stock_svn_blames_merged_revisions_over_the_vcs_http_edge_as_against_svnserve` (`svn merge
+  ^/branch`'s report, `svn blame -g`, `svn mergeinfo`, `propget svn:mergeinfo`, each equal to `svnserve -t`'s).
+- **Owed.** A mergeinfo catalog with descendants streamed (written whole within the reply's room now). Deltas in
   the svndiff version `Accept-Encoding` prefers. The interop harness copied into `svn_http_reports.rs` folded into one
   module with `svn_interop.rs` once that file's pieces land.
 - **Piece 6, §4.10 amended (2026-11-20, main's ruling).** §4.10 "Content homed by identity": the owner keeps its
