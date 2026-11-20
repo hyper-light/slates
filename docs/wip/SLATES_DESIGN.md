@@ -20969,6 +20969,9 @@ Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
   back.
 - Amended by A-214 (2026-11-05): an idle shard keeps its last write burst's net growth of free pages pre-faulted, and
   the purge gives back every free block beyond it.
+- Amended by A-765 (2026-11-20, w-sizing): that reserve decays. It is the burst whole for one sweep interval after the
+  pass that closed it, then halved each interval (`daemon::decayed_reserve`), and the sweep stays armed while a
+  reserve is held, so an idle shard gives a burst's pages back within log2(burst / discard size) intervals.
 - Owed:
   - macOS: built by A-110 (2026-10-06).
   - Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.
@@ -55762,6 +55765,26 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed (part 4).** The seal's staging pass and the moves' admission sliced; the landing's remaining whole passes
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
+
+### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
+- **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
+  never main): a push of git/git's v1.5.0 (9.4 MiB, 34,296 objects) holds a transient working set of 16.9 MiB after its
+  input and 34.4 MiB at its peak, and leaves the content store at 309 MiB: every object kept inflated (git counts
+  304.6 MiB: blobs 231.0, trees 69.1, commits 4.5), 33 times the pack. Identical objects are already held once by
+  identity; the cost is the inflation.
+- **Change** (part 1 of 4, used by nothing yet). `slates_git::store::packed::read`: the object whose entry begins at an
+  offset of a held pack, its header and data read across the pack's lent pieces, a delta's base followed to a whole
+  object (an earlier entry, or a named base its caller locates: an entry of a pack or an object handed over whole), then
+  inflated and applied going up through a reused `Scratch`, so a read allocates nothing once its scratch has grown;
+  `Scratch::shrink` gives room back. One seam for where a pack is held (`PackSource`; Ada's storage ruling: an
+  in-flight push's pack in RAM, a landed repository's on disk in w-store's store): the content store implements it now,
+  w-store's store next (inbox/w-store-from-w-git-pack-source-2026-11-20.md).
+- **Next parts.** B2: rows name an object by its pack and offset, every reader through `packed::read`; B3: the
+  quarantine keeps entry places, not inflated objects; B4: `object_bytes`/`put_object` copies gone; each with a red bound
+  on resident memory against the pack.
+- **Tests.** `slates-git` `store::tests::packed::every_object_read_in_place_from_a_held_pack_is_the_object_read_whole`
+  (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
+  `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
 ### A-722's head at once — A git service's reply head is written before its body is read (2026-11-20, w-git for UI goal 93; main's ruling)
 - **Why.** The edge's engine wrote a reply's status and headers only once the service's reply began, after the whole

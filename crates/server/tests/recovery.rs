@@ -3937,6 +3937,112 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
   );
 }
 
+/// The content arena's resident figures for the status report (A-744): the idle reserve, the arena's allocated bytes
+/// and its resident bytes, read from a sweep that completed after this call began, so the figures are of now.
+fn arena_figures(client: &mut Client) -> (u64, u64, u64) {
+  let completed = counter(client, "content_range.sweep.completed");
+  let started = Instant::now();
+  while counter(client, "content_range.sweep.completed") <= completed {
+    assert!(
+      started.elapsed() < Duration::from_secs(10),
+      "a sweep of the shard's slice completed"
+    );
+    std::thread::yield_now();
+  }
+  (
+    counter(client, "content_range.arena.prefault_reserve"),
+    counter(client, "content_range.arena.allocated"),
+    counter(client, "content_range.arena.resident"),
+  )
+}
+
+/// MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing piece 1). Do:
+/// on a one-shard daemon, write a file of many chunks (the shard's write burst of N bytes), publish, and leave the shard
+/// idle for 20 seconds. Expect the idle reserve (A-214) to have decayed to under a quarter of N and its pages to have
+/// been given back (`content.purged_bytes` past the reserve at its height, less the quarter); and on Linux, where a
+/// give-back punches the object's hole, the arena to keep resident no more than N past what it holds allocated, a
+/// derived multiple of the work. On macOS a given-back page of a shared object leaves the footprint (what pressure and
+/// jetsam count) but stays in the resident set until the kernel wants it: measured on Studio-4 over a 64 MiB `shm_open`
+/// object, `MADV_FREE_REUSABLE` took the footprint 64 -> 0 MiB and left RSS and `mincore` at 64, and no advice lowers
+/// them. Before, the reserve was the last burst whole, for as long as the shard stayed idle, bounded only by
+/// `reserve_per_shard` (the machine's memory over shards and classes): a 64 MiB burst was still reserved whole after
+/// 20 s idle.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_idle_shards_reserve_decays_after_its_burst_and_gives_its_pages_back() {
+  const MARKER: &[u8] = b"SLATES-RESERVE-DECAYS-51c7";
+  /// Shape: the file is this many chunk-sized blocks, so its pages dwarf the object's metadata and image pages.
+  const CHUNKS: usize = 256;
+  /// Shape: the idle time the brief's bound is stated at (main's w-sizing brief: "after 20 s idle").
+  const IDLE: Duration = Duration::from_secs(20);
+  let profile = common::machine_profile();
+  let instance = format!("srv-reserve-decays-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let chunk = slates_vfs::content::chunk_bytes(config.page).get();
+  let tag = format!("reserve-decays-{}", std::process::id());
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let body = MARKER.repeat(chunk * CHUNKS / MARKER.len());
+  let mut spec = scratch("reserve-decays");
+  spec.size = SizeClass::Bounded {
+    limit: u64::try_from(body.len()).unwrap() * 4,
+  };
+  let volume = client.create(&spec).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let file = u64::try_from(body.len()).unwrap();
+  client
+    .fs_write((volume, attachment), "burst", &body, 0o644)
+    .unwrap();
+  daemon.publish_every_shard().unwrap();
+  let written = Instant::now();
+  // The burst closes at the first idle pass, and its reserve is pre-faulted then: read the reserve at its height.
+  let mut height = 0;
+  while written.elapsed() < IDLE / 4 {
+    height = height.max(counter(&mut client, "content_range.arena.prefault_reserve"));
+    std::thread::sleep(Duration::from_millis(100));
+  }
+  let purged_at_height = counter(&mut client, "content.purged_bytes");
+  std::thread::sleep(IDLE.saturating_sub(written.elapsed()));
+  let (reserve, allocated, resident) = arena_figures(&mut client);
+  let given_back = counter(&mut client, "content.purged_bytes").saturating_sub(purged_at_height);
+  let read_back = client
+    .read(volume, "burst", slates_ipc::protocol::ReadAt::Head)
+    .unwrap();
+  daemon.stop();
+  drop(anchor);
+  eprintln!(
+    "an idle shard's reserve after a {file}-byte burst: {height} bytes at its height, {reserve} after {IDLE:?} idle, \
+     {given_back} bytes given back since its height; the arena then held {allocated} bytes allocated and {resident} \
+     resident"
+  );
+  assert!(read_back == body, "the file reads back as written");
+  assert!(
+    height >= file / 2,
+    "the burst was reserved while it might recur (A-214 holds): {height} of {file} bytes"
+  );
+  assert!(
+    reserve * 4 < file,
+    "after {IDLE:?} idle the reserve decayed: {reserve} bytes still reserved for a {file}-byte burst"
+  );
+  assert!(
+    given_back.saturating_add(file / 4) >= height,
+    "the decayed reserve's pages went back: {given_back} bytes given back of a {height}-byte reserve"
+  );
+  #[cfg(target_os = "linux")]
+  assert!(
+    resident <= allocated.saturating_add(file),
+    "after {IDLE:?} idle the arena keeps resident at most N past what it holds: {resident} resident, {allocated} \
+     allocated, N = {file}"
+  );
+}
+
 /// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
 /// the daemon to count most of the file given back to the OS within the bound (`content.purged_bytes`: an idle
 /// shard's free blocks go back, A-105, on macOS as reusable pages, A-110), and on Linux the content object's allocated
