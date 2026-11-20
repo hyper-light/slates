@@ -3031,7 +3031,8 @@
 >   volume's whole image in one turn, at every whole entry and install image; **the whole entry's half closed
 >   2026-11-18, A-377, g230:** captured in its publication's turn and sealed a piece a turn by a task of the owner
 >   shard, the publications made meanwhile queued behind it, each appended in order as the credit admits it; install
->   images (`refresh_image`) still one turn, owed; **since A-755 (2026-11-20, w-forming) a turn's pieces are sized to the
+>   images (`refresh_image`) one turn until A-757 part 5 (2026-11-20, w-forming: sealed in turns of a build of their own,
+>   183 to 264 ms of one debug turn's CPU before); **since A-755 (2026-11-20, w-forming) a turn's pieces are sized to the
 >   seal rate measured in the build and the quantum left, a page to an archive chunk** (a turn had sealed a MiB at least
 >   however small its quantum, 87 to 302 ms of CPU against 14 to 784 us quanta, a debug fleet under `taskpolicy -b`);
 >   **still one turn, owed:** the append that ends a build (`append_build`: the sealed body joined and cloned into the
@@ -3049,10 +3050,13 @@
 >   holds its own bytes only for an install image: 50 volumes' 2.4 MB whole states at rest, peak RSS 249 MB before, 128
 >   MB after (release). **A-757 part 4 (2026-11-20):** a holder takes a live message over one page on a task of its own,
 >   its entries' identities hashed in slices across turns before the guard, which checks them as given: 2.4 MB in
->   release, the take turn's guard 0.96 to 1.05 ms before, under 0.1 us after, each 64 KiB slice 27 to 34 us. **Owed
->   (measured, w-forming's probes, debug under `taskpolicy -b`):** the record-plane coordinator `run_record_plane` held
->   one poll 312 ms of CPU; the rest of `serve_peer_records` 76 to 179 ms (now outside the live entries); a takeover's
->   `make_taken` 46 ms; one forwarded `Telemetry` verb 415 ms of wall); and, after A-347's open, the takeover's
+>   release, the take turn's guard 0.96 to 1.05 ms before, under 0.1 us after, each 64 KiB slice 27 to 34 us. **A-757
+>   part 5 (2026-11-20):** the record-plane coordinator's long polls (`run_record_plane`, 185 to 312 ms of one poll's
+>   CPU) were `refresh_image` sealing a 3 MiB volume's install image in the record period's one turn; a sealed image of
+>   more than one piece is now captured at the head, sealed in turns of an `ImageBuild` and made the image if the head
+>   has not moved (else dropped, still owed). **Still measured, debug under `taskpolicy -b` on main 359da2388:** a
+>   takeover's `make_taken` 38 ms of one poll's CPU; a forward-lane child 17 ms; the record period's capture of an owed
+>   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
@@ -7181,8 +7185,11 @@
 >   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone; `cli`'s `wait_for` (polled while
 >   the instance's processes progress; the epoch tests read the kernel's refusal before waiting on what it prevents)
 >   and its `FLEET_WAIT` waits (every node's processes judged together, `StartProgress::look_all`; the fleet submit run
->   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone. Owed in
->   `cli/tests`: `cli`'s other `WAIT_FOR` waits and its container waits, `live_fleet`, `vm`,
+>   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone; `cli`'s map,
+>   second-mount, journal-pipeline and referenced-bytes waits judged the same (`WAIT_FOR` now bounds only what no slates
+>   process holds: a sibling test's child keeping a mount busy or a pipe's end open, and a container probe's map). Owed
+>   in `cli/tests`: `cli`'s container waits (`CONTAINER_WAIT`, `DOCKER_INFO_WAIT`, on Docker) and `shards_reader`'s
+>   read timeout, `live_fleet`, `vm`,
 >   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module

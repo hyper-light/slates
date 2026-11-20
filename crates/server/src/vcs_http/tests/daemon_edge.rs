@@ -1754,6 +1754,10 @@ fn create_svn_hooked(
   name: &str,
   hooks: Vec<(slates_ipc::protocol::HookPointName, String)>,
 ) {
+  // A hook is shown its repository beneath the root mount the daemon published (A-645 P3).
+  daemon
+    .record_root_mount(std::path::Path::new(crate::vcs_svn::tests::TEST_ROOT))
+    .expect("the root mount recorded");
   let name = name.to_owned();
   let replies = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
     let created = crate::verbs::dispatch(
@@ -1999,7 +2003,7 @@ fn a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them() {
       .collect()
   };
   let (started, precommitted) = (lines("start.args"), lines("pre.args"));
-  let repos = format!("/{name}");
+  let repos = format!("{}/{name}", crate::vcs_svn::tests::TEST_ROOT);
   assert_eq!(
     (
       (posted, put, merged),
