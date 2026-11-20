@@ -56,6 +56,8 @@ pub mod commit;
 pub mod drive;
 pub mod listing;
 pub mod locking;
+mod report_file_revs;
+mod report_locations;
 pub mod request;
 pub mod response;
 pub mod site;

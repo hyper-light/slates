@@ -1305,7 +1305,10 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         let piece = self
           .stores
           .lend(self.repository, &self.principal, |lent| {
-            lent.repository.text(&text.identity, at).map(<[u8]>::to_vec)
+            lent
+              .repository
+              .text(&text.identity, at)
+              .map(std::borrow::Cow::into_owned)
           })
           .flatten()
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
