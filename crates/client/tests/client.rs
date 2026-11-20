@@ -1732,7 +1732,6 @@ fn a_map_whose_clients_shard_is_starved_at_its_hand_off_is_direct_past_a_wall_wi
               return false;
             }
             fill_held.store(true, Ordering::Release);
-            let held = Instant::now();
             // Held until the test releases it (until 2026-11-20 capped at `START_WAIT`): a test that failed first leaves
             // a spinning shard, which the daemon's own watchdog ends.
             while !released.load(Ordering::Acquire) {

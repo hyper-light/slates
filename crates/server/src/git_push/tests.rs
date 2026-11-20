@@ -888,10 +888,10 @@ fn script(point: HookPointName, name: &str, body: &str) -> Script {
   Script { _dir: dir, config }
 }
 
-/// Shape: how long a test waits for a push whose hooks run: a test's bound for each of its three
-/// hooks and one for the push itself.
-#[cfg(unix)]
-const PUSH_WAIT_NS: u64 = 4 * crate::git_hooks::tests::TEST_BOUND_NS;
+/// Shape: how long a test waits for a push whose hooks run: a test's bound (`git_hooks::tests::TEST_BOUND_NS`, ten
+/// liveness budgets) for each of its three hooks and one for the push itself. Every platform: the pushes without hooks
+/// wait by it too.
+const PUSH_WAIT_NS: u64 = 4 * 10 * crate::daemon::LIVENESS_BUDGET_NS;
 
 /// What a push driven with its hooks answered: what the driver wrote, what it received, and how
 /// many views the presenter showed and withdrew; or why the drive stopped.
@@ -997,7 +997,6 @@ fn band_two(answer: &[u8]) -> String {
 }
 
 /// The pack of a request stock git made: its bytes from the pack's magic on.
-#[cfg(unix)]
 fn pack_of(request: &[u8]) -> &[u8] {
   let at = request
     .windows(4)

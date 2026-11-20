@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use slates_client::{Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, VolumeId};
+use slates_client::{Client, CreateSpec, Deadlines, NamePolicy, SizeClass, VolumeId};
 use slates_machine::facts::Facts;
 use slates_server::{Daemon, DaemonConfig};
 

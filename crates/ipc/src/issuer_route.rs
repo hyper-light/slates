@@ -65,6 +65,7 @@ pub fn parse_secret(text: &str) -> Option<[u8; SECRET_BYTES]> {
   }
   let mut secret = [0u8; SECRET_BYTES];
   let (pairs, _) = bytes.as_chunks::<2>();
+  // Format: the secret as hex, two digits (base 16) a byte.
   for (slot, pair) in secret.iter_mut().zip(pairs) {
     let text = std::str::from_utf8(pair).ok()?;
     *slot = u8::from_str_radix(text, 16).ok()?;
