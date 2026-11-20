@@ -37,8 +37,10 @@
 //! that moved, `missing necessary objects`) and in slates' own words otherwise, one reason for each
 //! refusal, with a band-2 line naming the path.
 
-use slates_merge::push::{ObjectKey, Push, PushObjects, PushRefused, build};
+use slates_merge::pace::Pace;
+use slates_merge::push::{Building, Built, ObjectKey, Push, PushObjects, PushRefused, build};
 use slates_merge::{ConflictWindow, Green, Increment};
+use std::cell::Cell;
 
 use super::{
   ATOMIC_TRANSACTION_FAILED, Command, Declined, FAILED_TO_UPDATE, Judge, MISSING_OBJECTS, Pushed,
@@ -207,6 +209,48 @@ pub struct Verdicts<'w, G: ?Sized, R: ?Sized, O> {
   name: [u8; 32],
   /// The room each work is built within.
   room: u64,
+  /// A command's work built over the turns before its verdict ([`Verdicts::prepare`]), which its verdict takes.
+  prepared: Cell<Option<Preparing>>,
+}
+
+/// A command's work built a unit at a time over the turns before its verdict (A-752; §4.3's step budget): a push over
+/// a head of many files builds its work over as many turns as it needs ([`Verdicts::prepare`], from a judge's
+/// [`Judge::ready`]), and its verdict takes the work built ([`Verdicts::prepared`]) rather than building it in one step.
+pub struct Preparing {
+  /// The ref and the value it is built for.
+  command: (Vec<u8>, ObjectId),
+  /// The build.
+  building: Building,
+  /// What it built, once done.
+  done: Option<Result<Built, PushRefused>>,
+  /// A create's first parent, which names the green it is made at: read once, at its first turn.
+  parent: Option<ObjectId>,
+}
+
+impl Preparing {
+  /// Its build's longest unit so far, nanoseconds on its owner's clock (A-752).
+  pub fn longest_unit_ns(&self) -> u64 {
+    self.building.pace().longest_unit_ns()
+  }
+
+  /// Its last turn's opening, nanoseconds on its owner's clock: what the turn did before its first unit.
+  pub fn opening_ns(&self) -> u64 {
+    self.building.pace().opening_ns()
+  }
+
+  /// When its last turn last asked for a unit, on its owner's clock: what the turn did after is its owner's.
+  pub fn asked_at_ns(&self) -> u64 {
+    self.building.pace().asked_at_ns()
+  }
+}
+
+impl core::fmt::Debug for Preparing {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("Preparing")
+      .field("command", &self.command)
+      .field("done", &self.done.is_some())
+      .finish_non_exhaustive()
+  }
 }
 
 /// receive-pack's part 2 judge (module docs): the verdicts, appended through `appends`.
@@ -258,7 +302,92 @@ where
       objects,
       name,
       room,
+      prepared: Cell::new(None),
     }
+  }
+
+  /// These verdicts, taking the work `prepared` built for its command, where it is done and still that command's.
+  pub fn prepared(self, prepared: Option<Preparing>) -> Self {
+    self.prepared.set(prepared);
+    self
+  }
+
+  /// One turn of `command`'s work, built against the green and base its verdict will read (A-752): whether it is
+  /// ready, so this step judges it (a delete, a command whose verdict refuses before any work, or a work built); not
+  /// ready, the turn, begun at `began`, ended at `deadline` on `clock` (the owner's, nanoseconds) and `preparing` keeps
+  /// the build for the next. What the turn did before its first unit is its opening ([`Preparing::opening_ns`]). A build for another command or push is begun again.
+  pub fn prepare(
+    &self,
+    command: &Command,
+    pushed: &Pushed<'_>,
+    preparing: &mut Option<Preparing>,
+    (clock, began, deadline): (fn() -> u64, u64, u64),
+  ) -> bool {
+    if command.is_delete() {
+      return true;
+    }
+    let ours = preparing.as_ref().is_some_and(|prepared| {
+      prepared.command.0 == command.name && prepared.command.1 == command.new
+    });
+    if !ours {
+      *preparing = None;
+    }
+    if preparing
+      .as_ref()
+      .is_some_and(|prepared| prepared.done.is_some())
+    {
+      return true;
+    }
+    // A build under way continues over the green it began on: its push, read at its first turn, stands.
+    let begun = preparing.is_some();
+    let parent = match preparing.as_ref() {
+      Some(prepared) => prepared.parent,
+      None if command.is_create() => self.first_parent(&command.new, pushed),
+      None => None,
+    };
+    let mut turn = |green: &Green, base: Option<Version>| -> bool {
+      if !begun {
+        let Ok(push) = self.push_of(command, pushed, green, base) else {
+          return true;
+        };
+        *preparing = Some(Preparing {
+          command: (command.name.clone(), command.new),
+          building: Building::new(&push, self.room, Pace::new(clock)),
+          done: None,
+          parent,
+        });
+      }
+      let Some(prepared) = preparing.as_mut() else {
+        return true;
+      };
+      let pace = prepared.building.pace();
+      pace.turn_from(began, deadline);
+      prepared.done = prepared.building.advance(green, self.objects);
+      prepared.done.is_some()
+    };
+    if command.is_create() {
+      if self.greens.read(&command.name, |_| ()).is_some() {
+        return true;
+      }
+      return self
+        .greens
+        .base_of_create(parent.as_ref(), |read, version| {
+          turn(read.green, Some(version))
+        })
+        .unwrap_or_else(|| turn(&Green::new(), None));
+    }
+    self
+      .greens
+      .read(&command.name, |read| {
+        if begun {
+          return turn(read.green, None);
+        }
+        match self.greens.version_of(read.id, &command.old) {
+          Some(base) => turn(read.green, Some(base)),
+          None => true,
+        }
+      })
+      .unwrap_or(true)
   }
 
   /// `command`'s entry (module docs): an update's work, a create's new green, a delete's
@@ -363,21 +492,39 @@ where
     green: &Green,
     base: Option<Version>,
   ) -> Result<Increment, Declined> {
+    let push = self.push_of(command, pushed, green, base)?;
+    let prepared = self
+      .prepared
+      .take()
+      .filter(|prepared| prepared.building.is_of(&push))
+      .and_then(|prepared| prepared.done);
+    prepared
+      .unwrap_or_else(|| build(&push, green, self.objects, self.room))
+      .map(|built| built.increment)
+      .map_err(|refused| work_refused(&command.name, &refused))
+  }
+
+  /// The push `command` makes of `green` from `base` (none for a create over an empty green): the tree its new value
+  /// names over the base's.
+  fn push_of<'c>(
+    &self,
+    command: &'c Command,
+    pushed: &Pushed<'_>,
+    green: &Green,
+    base: Option<Version>,
+  ) -> Result<Push<'c>, Declined> {
     let tree = self.tree_of(&command.new, pushed, &command.name)?;
     let base_tree = match base {
       Some(version) => Some(key(&version.tree, &command.name)?),
       None => None,
     };
-    let push = Push {
+    Ok(Push {
       name: self.name,
       base_version: base.map_or(green.head(), |version| version.number),
       base_tree,
       tree: key(&tree, &command.name)?,
       head: Some(command.new.as_bytes()),
-    };
-    build(&push, green, self.objects, self.room)
-      .map(|built| built.increment)
-      .map_err(|refused| work_refused(&command.name, &refused))
+    })
   }
 
   /// The tree the object `head` names: a commit's, or that of the commit or tree an annotated tag

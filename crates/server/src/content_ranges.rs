@@ -314,6 +314,10 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
     format!("{PREFIX}sweep.longest_ns"),
     state.content_sweep.longest_ns,
   ));
+  // The pushes' work builds' turns (A-752): beside the sweep's, the shard's other paced work this report shows.
+  for (name, count) in state.push_turns.rows() {
+    rows.push((name.to_owned(), count));
+  }
   rows
     .into_iter()
     .map(|(kind, count)| RefusalCount { kind, count })

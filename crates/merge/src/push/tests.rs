@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 
 use super::{
-  Built, EntryKind, HEAD_ATTRIBUTE, ObjectKey, Push, PushObjects, PushRefused, ROOT, Reads,
-  TreeEntry, Unavailable, build, identity,
+  Building, Built, EntryKind, HEAD_ATTRIBUTE, ObjectKey, Push, PushObjects, PushRefused, ROOT,
+  Reads, TreeEntry, Unavailable, build, identity,
 };
 use crate::engine::{Green, Increment, Outcome};
 use crate::increment::{DeriveError, PostStatePlan, VolumeOp, compose_volume_planned};
@@ -610,6 +610,11 @@ fn land(
   let tree = put(store, files);
   let push = push(green.head(), base_tree, tree, head);
   let built = build(&push, green, store, u64::MAX).unwrap();
+  assert_eq!(
+    built_in_turns(&push, green, store, 3).0.unwrap(),
+    built,
+    "built in turns"
+  );
   let Expected::Work(increment, reads) = oracle(store, green, &push) else {
     panic!("the oracle refused what the build made");
   };
@@ -1490,4 +1495,63 @@ fn every_push_is_the_oracles_work_and_leaves_the_client_where_it_is() {
   for (case, count) in met {
     assert!(count > 0, "the histories never met {case}: {met:?}");
   }
+}
+
+/// A test clock: each read a nanosecond later.
+static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`NOW`], read.
+fn now() -> u64 {
+  NOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `push` built over turns of `units` units each (A-752), the green and the store lent a turn at a time: what it built,
+/// and the turns it took.
+fn built_in_turns(
+  push: &Push<'_>,
+  green: &Green,
+  store: &Store,
+  units: u64,
+) -> (Result<Built, PushRefused>, u64) {
+  let mut building = Building::new(push, u64::MAX, crate::pace::Pace::new(now));
+  let mut turns = 0u64;
+  loop {
+    turns += 1;
+    // The clock is read once a unit after the turn's first: a deadline `units` reads on.
+    building
+      .pace()
+      .turn(NOW.load(std::sync::atomic::Ordering::Relaxed) + units);
+    if let Some(built) = building.advance(green, store) {
+      return (built, turns);
+    }
+  }
+}
+
+/// A-752 (w-git's measure: a push over a flat 3,500-file tree built its work in one step, 374 to 642 ms debug). Do:
+/// land a flat tree of 2,000 files, then build a push changing every one over turns of a few units each. Expect: the
+/// work the one-call build makes, byte for byte, over more turns than there are files, so no turn built a file's
+/// share twice or the whole tree once; the same over turns shorter than any unit, one unit a turn.
+#[test]
+fn a_push_over_a_flat_tree_is_built_a_unit_at_a_time_over_many_turns() {
+  const FILES: usize = 2_000;
+  let mut store = Store::default();
+  let mut green = Green::new();
+  let named = |word: &str| -> Files {
+    (0..FILES)
+      .map(|at| (format!("f{at:05}"), file(format!("{word} {at}").as_bytes())))
+      .collect()
+  };
+  let (_, outcome, tree) = land(&mut store, &mut green, None, &named("base"), &head(1));
+  assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+  let pushed = put(&mut store, &named("next"));
+  let second = head(2);
+  let push = push(green.head(), Some(tree), pushed, &second);
+  let whole = build(&push, &green, &store, u64::MAX).unwrap();
+  let (built, turns) = built_in_turns(&push, &green, &store, 4);
+  assert_eq!(built.unwrap(), whole);
+  assert!(turns > FILES as u64, "{turns} turns for {FILES} files");
+  // A turn shorter than any unit runs one unit, and the build still ends (the composition's ticks take it).
+  let (built, turns) = built_in_turns(&push, &green, &store, 0);
+  assert_eq!(built.unwrap(), whole);
+  assert!(turns > FILES as u64, "{turns} turns for {FILES} files");
 }

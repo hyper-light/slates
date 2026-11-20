@@ -4716,6 +4716,7 @@ async fn init_shard(
     content,
     purge_seen_allocations: 0,
     content_sweep: crate::content_ranges::Sweep::default(),
+    push_turns: crate::git_push::PushTurns::default(),
     burst_seen: None,
     last_burst: 0,
     refill_settled: None,
