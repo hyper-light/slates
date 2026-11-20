@@ -1416,7 +1416,10 @@ fn begin_rebase(
         rebase: Some(rebase),
         generation,
       })
-      .map_err(|(refused, fork)| (Some(refused), fork))
+      .map_err(|handed| {
+        let (refused, fork) = *handed;
+        (Some(refused), fork)
+      })
   });
   match begun {
     Ok(rebasing) => Some(Ok(rebasing)),
