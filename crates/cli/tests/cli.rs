@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 /// Shape: ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s): how long a transient holder that is no slates process (a
 /// sibling test's child between its fork and its `exec`) may keep a mount busy or a pipe's end open, and a container
 /// probe's wait on its map. Until 2026-11-20 also every wait for a daemon's state to show (`wait_for` and its kin), now
-/// judged in the instance's processes' own CPU ([`StartProgress`]).
+/// judged in the instance's processes' own CPU ([`process_wait::InstanceWait`]).
 const WAIT_FOR: Duration = Duration::from_secs(10);
 /// Shape: the pause between polls of a starting or stopping daemon.
 const POLL_MS: u64 = 20;
@@ -203,7 +203,7 @@ const CRASH_LOOP_LINE: &str = "slates anchor: the daemon is in a crash loop";
 /// Reads the anchor's stderr until the daemon says it serves — and, when `issuer` is asked on a platform that prints
 /// one ([`PRINTS_ISSUER_SURFACE`]), until the anchor has printed its issuer surface too — echoing every line to this
 /// process's stderr, where the anchor's output went before it was piped. Returns the issuer surface's exports when
-/// asked for and printed. The waits for the daemon's answers begin after this ([`StartProgress`]).
+/// asked for and printed. The waits for the daemon's answers begin after this ([`process_wait::InstanceWait`]).
 ///
 /// **The lines come from two processes, so they are taken in whichever order they arrive.** The anchor prints its
 /// greeting and its issuer surface; the daemon, a separate process, prints its serving line. Nothing orders a line of
@@ -250,7 +250,7 @@ fn echo_the_rest(mut stderr: impl std::io::Read + Send + 'static) -> std::thread
 }
 
 /// Waits for [`STABLE_STREAK`] consecutive answers to `volume list`, for as long as the instance's daemons make
-/// progress ([`StartProgress`]), then bootstraps the consensus group when `bootstrap` holds. Called once the daemon
+/// progress ([`process_wait::InstanceWait`]), then bootstraps the consensus group when `bootstrap` holds. Called once the daemon
 /// serves ([`await_serving`]).
 fn await_stable_daemon(instance: &str, bootstrap: bool) {
   // The anchor restarts the daemon once at startup if its first heartbeat lapses (a known liveness
@@ -258,7 +258,7 @@ fn await_stable_daemon(instance: &str, bootstrap: bool) {
   // that restart has settled before returning — otherwise a test verb lands in the restart window and
   // gets exit 3 (no daemon). A restart resets the streak.
   let mut streak = 0u32;
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
     streak = if code == 0 {
@@ -1155,7 +1155,7 @@ fn expect_the_anchors_own_image(
   _lines: &std::sync::mpsc::Receiver<String>,
 ) {
   use std::os::unix::fs::MetadataExt;
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let successor = loop {
     if let Some(pid) = daemon_pid(instance).filter(|pid| *pid != killed) {
       break pid;
@@ -1254,13 +1254,13 @@ fn kill_anchor_and_wait_for_the_daemon_to_leave(instance: &str, anchor: AnchorPr
   drop(anchor);
   // Waited for while the daemon still runs and progresses (until 2026-11-20 `START_WAIT`): its leaving is the event, so a
   // process set already empty is no failure here, and the next ask answers 3.
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
     if code == 3 {
       return;
     }
-    if !instance_processes(instance).is_empty() {
+    if !process_wait::instance_processes(instance).is_empty() {
       progress.check(instance, "the daemon left with its anchor");
     }
     pause();
@@ -1805,12 +1805,12 @@ fn attachments_of(instance: &str, id: &str) -> String {
   value_of(&out, "attachments")
 }
 
-/// Polls `holds` at the test's pace while `instance`'s processes live and progress ([`StartProgress`]); whether it
+/// Polls `holds` at the test's pace while `instance`'s processes live and progress ([`process_wait::InstanceWait`]); whether it
 /// held. A wait on a live daemon lasts while it lives (A-232): until 2026-11-20 it ended at `WAIT_FOR`, ten liveness
 /// budgets of the wall. So nothing may be waited for here that a working daemon rightly never brings about: a kernel's
 /// refusal is read first and skipped on, as the epoch tests do.
 fn wait_for(instance: &str, mut holds: impl FnMut() -> bool) -> bool {
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   while progress.look(instance) {
     if holds() {
       return true;
@@ -3513,7 +3513,7 @@ fn assert_an_export_is_published_and_detached(fleet: &EnrolledFleet, instance: &
   let (code, _, err) = run(instance, &["bootstrap", "root"]);
   assert_eq!(code, 0, "bootstrap: {err}");
   // The fleet's consensus is ready while its processes progress (until 2026-11-20 within `START_WAIT`).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let id = loop {
     let (code, out, err) = run(
       instance,
@@ -3576,9 +3576,9 @@ fn an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart(
 }
 
 /// Waits for a daemon other than `replaced` to answer at `instance`, and returns its pid, for as long as the instance's
-/// daemons make progress ([`StartProgress`]); on every look before it answers, each of `held` must still be taken.
+/// daemons make progress ([`process_wait::InstanceWait`]); on every look before it answers, each of `held` must still be taken.
 fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     assert!(
       held.iter().all(|port| !port_is_free(*port)),
@@ -3601,150 +3601,10 @@ fn bootstrap_once(instance: &str) {
   assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
 }
 
-/// A wait for a daemon judged as the anchor judges a start (§2.6 boot step 1): by the instance's processes' own CPU
-/// progress (`slates_machine::process_clock`; the anchor and its daemon), not the wall. The wait fails once they made
-/// none for [`process_wait::STALL`] (the anchor's own lapse ceiling), or once the instance has no process left. Until
-/// 2026-11-20 it counted only the daemons, failed after twenty seconds of no progress (`START_WAIT`) and at a ceiling of
-/// several of them (`START_CEILING`); a daemon that runs and never answers is its anchor's to end, and a crash loop shows
-/// in the anchor's log ([`await_serving`]) (goal 88's sweep, main's ruling). On a machine at 8 spinners a CPU (2026-11-07) a successor
-/// served about 20 s after its predecessor's kill at roughly 1.5% of a CPU, and the 20 s wall wait failed four runs
-/// in nine of the frozen and starved tests while the anchor killed no start.
-///
-/// It replaced two bounds. The wall wait: twenty seconds was enough alone and not inside a full `cargo test
-/// --workspace` (2026-10-18). And `START_ATTEMPTS`, the streak's attempts counted from the serving line (2026-10-21:
-/// a contended host makes each attempt slower, not more numerous), which still ran out at 240 runnable processes when
-/// the first daemon's beat lapsed during the streak and its successor took the attempts' time to come up. A daemon
-/// that flaps ends the wait as a crash loop in the anchor's log ([`await_serving`]); until 2026-11-20 also at
-/// `START_CEILING`, twenty seconds at the slowest share of a CPU this suite holds a start to (a wall bound, gone with
-/// `START_WAIT`).
-struct StartProgress {
-  /// The daemons and the sum of their progress counts at the last look that saw them move.
-  seen: Option<(Vec<u32>, u64)>,
-  moved_at: Instant,
-  began: Instant,
-  /// Each process's CPU at the last look, nanoseconds; empty before the first.
-  cpu: std::collections::BTreeMap<u32, u64>,
-  /// The CPU the processes spent since the wait began: each one's gain between looks, and a process that came during
-  /// the wait (a successor) all it ran.
-  spent: Duration,
-}
-
-impl StartProgress {
-  fn new() -> StartProgress {
-    let now = Instant::now();
-    StartProgress {
-      seen: None,
-      moved_at: now,
-      began: now,
-      cpu: std::collections::BTreeMap::new(),
-      spent: Duration::ZERO,
-    }
-  }
-
-  /// Ends the test, saying it waited for `what`, once the instance's processes made no progress for
-  /// [`process_wait::STALL`], spent [`process_wait::CPU_BUDGET`] since the wait began, or none is left.
-  fn check(&mut self, instance: &str, what: &str) {
-    self.check_all(&[instance], what);
-  }
-
-  /// [`StartProgress::check`] over every process of every one of `instances` (a fleet's nodes).
-  fn check_all(&mut self, instances: &[impl AsRef<str>], what: &str) {
-    let instance = instances
-      .iter()
-      .map(AsRef::as_ref)
-      .collect::<Vec<_>>()
-      .join(", ");
-    assert!(
-      self.look_all(instances),
-      "waited for {what} at {instance}: {} ({:?} after the wait began; {:?})",
-      if self.seen.as_ref().is_none_or(|(pids, _)| pids.is_empty()) {
-        "none of its processes is left".to_owned()
-      } else if self.spent_its_budget(instances.len()) {
-        format!(
-          "its processes spent {:?} of CPU without it, the budget {:?} a node",
-          self.spent,
-          process_wait::CPU_BUDGET
-        )
-      } else {
-        format!(
-          "its processes made no progress for {:?}",
-          process_wait::STALL
-        )
-      },
-      self.began.elapsed(),
-      self.seen
-    );
-  }
-
-  /// Whether a wait on `instance` goes on: some of its processes are left, they made progress within
-  /// [`process_wait::STALL`], and they have not spent [`process_wait::CPU_BUDGET`] since the wait began (as
-  /// `live_chaos` judges its starts: a daemon that runs and never brings the answer about is not waited on forever).
-  fn look(&mut self, instance: &str) -> bool {
-    self.look_all(&[instance])
-  }
-
-  /// [`StartProgress::look`] over every process of every one of `instances` (a fleet's nodes).
-  fn look_all(&mut self, instances: &[impl AsRef<str>]) -> bool {
-    let mut pids: Vec<u32> = instances
-      .iter()
-      .flat_map(|instance| instance_processes(instance.as_ref()))
-      .collect();
-    pids.sort_unstable();
-    if pids.is_empty() {
-      self.seen = None;
-      return false;
-    }
-    let readings: Vec<(u32, slates_machine::process_clock::ProcessCpu)> = pids
-      .iter()
-      .filter_map(|pid| Some((*pid, slates_machine::process_clock::process_cpu(*pid)?)))
-      .collect();
-    let first = self.cpu.is_empty();
-    let mut cpu = std::collections::BTreeMap::new();
-    for (pid, reading) in &readings {
-      let gained = match self.cpu.get(pid) {
-        Some(then) => reading.spent_ns.saturating_sub(*then),
-        None if first => 0,
-        None => reading.spent_ns,
-      };
-      self.spent = self.spent.saturating_add(Duration::from_nanos(gained));
-      cpu.insert(*pid, reading.spent_ns);
-    }
-    self.cpu = cpu;
-    let total = readings
-      .iter()
-      .fold(0u64, |sum, (_, cpu)| sum.wrapping_add(cpu.progress));
-    let now = Some((pids, total));
-    if now != self.seen {
-      self.seen = now;
-      self.moved_at = Instant::now();
-    }
-    self.moved_at.elapsed() < process_wait::STALL && !self.spent_its_budget(instances.len())
-  }
-
-  /// Whether the processes of `nodes` instances spent [`process_wait::CPU_BUDGET`] each since the wait began.
-  fn spent_its_budget(&self, nodes: usize) -> bool {
-    self.spent >= process_wait::CPU_BUDGET.saturating_mul(u32::try_from(nodes).unwrap_or(u32::MAX))
-  }
-}
-
-/// The pids of `instance`'s processes: its anchor and its daemon run as `slates --instance NAME anchor|daemon …`.
-fn instance_processes(instance: &str) -> Vec<u32> {
-  let out = Command::new("pgrep")
-    .args(["-f", "--", &format!("--instance {instance} ")])
-    .output()
-    .unwrap();
-  let mut pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
-    .split_whitespace()
-    .filter_map(|pid| pid.parse().ok())
-    .collect();
-  pids.sort_unstable();
-  pids
-}
-
-/// The next of `lines`, waited for while `instance`'s processes progress ([`StartProgress`]); `what` names it.
+/// The next of `lines`, waited for while `instance`'s processes progress ([`process_wait::InstanceWait`]); `what` names it.
 #[cfg(unix)]
 fn recv_judged<T>(lines: &std::sync::mpsc::Receiver<T>, instance: &str, what: &str) -> T {
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     match lines.recv_timeout(Duration::from_millis(POLL_MS)) {
       Ok(line) => return line,
@@ -3824,7 +3684,7 @@ fn a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed() {
 /// Waits until the daemon at `instance` answers a verb, bounded by the start wait.
 fn wait_answers(instance: &str) {
   // Waited for while the instance's processes progress (until 2026-11-20 `START_WAIT`).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
     if code == 0 {
@@ -3879,11 +3739,11 @@ fn fleet_view(instance: &str) -> Option<FleetView> {
 }
 
 /// Polls every node's fleet view until each holds `members` members alive with `probed` peers probed, or the nodes'
-/// processes stall or are gone ([`StartProgress`]; until 2026-11-20 the fleet wait, `FLEET_WAIT`, 40 s of the wall);
+/// processes stall or are gone ([`process_wait::InstanceWait`]; until 2026-11-20 the fleet wait, `FLEET_WAIT`, 40 s of the wall);
 /// returns the views then (the caller asserts on them, so a failure shows every node's view).
 fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Option<FleetView>> {
   let began = Instant::now();
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let views: Vec<Option<FleetView>> = instances.iter().map(|i| fleet_view(i)).collect();
     let settled = views.iter().all(|view| {
@@ -4129,7 +3989,7 @@ fn share_with_peers(owner: &str, peers: &[String], id: &str) {
 fn seal_on_owner(instance: &str, peers: &[String], mountable: bool) -> (String, String) {
   // The mesh forms before a fresh learner imports the bootstrapped groups. The explicit refusal
   // precedes any create effect, so only that refusal is retried, while the nodes progress.
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let nodes: Vec<&str> = std::iter::once(instance)
     .chain(peers.iter().map(String::as_str))
     .collect();
@@ -4174,10 +4034,10 @@ fn seal_on_owner(instance: &str, peers: &[String], mountable: bool) -> (String, 
 }
 
 /// Polls the owner's `volume placed ID --snapshot N` until it answers placed (at `f = 1`, a peer process
-/// acknowledged the content and the head), while the owner's processes progress ([`StartProgress`]; until 2026-11-20
+/// acknowledged the content and the head), while the owner's processes progress ([`process_wait::InstanceWait`]; until 2026-11-20
 /// within the fleet wait).
 fn wait_placed(instance: &str, id: &str, snapshot: &str) {
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, out, err) = run(instance, &["volume", "placed", id, "--snapshot", snapshot]);
     assert_eq!(code, 0, "{err}");
@@ -4226,11 +4086,11 @@ fn assert_retired(views: &[Option<FleetView>], dead: &str) {
 }
 
 /// Polls the survivors' `volume stat ID` until one serves the volume (the successor materialized it under its id, named
-/// and placed), while the survivors' processes progress ([`StartProgress`]; until 2026-11-20 within the fleet wait);
+/// and placed), while the survivors' processes progress ([`process_wait::InstanceWait`]; until 2026-11-20 within the fleet wait);
 /// returns the successor's instance. A wait that ends fails with every survivor's status and its last answer for the
 /// volume, so the failure names its state.
 fn wait_successor(instances: &[String], id: &str) -> String {
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     for instance in instances {
       // The successor is the survivor that owns the volume: it lists it among its own. A `volume stat` alone answers on
@@ -4509,7 +4369,7 @@ fn bootstrapped_fleet(prefix: &str) -> (ScratchDir, Vec<FleetProcess>, Vec<Strin
 /// before any effect, so only that refusal is retried, while the owner's processes progress (until 2026-11-20 within
 /// the fleet wait).
 fn green_once_groups_form(owner: &str) -> String {
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   loop {
     let (code, out, err) = run(owner, &["green", "g"]);
     if code == 0 {
@@ -4525,7 +4385,7 @@ fn green_once_groups_form(owner: &str) -> String {
 }
 
 /// Runs `slates --instance INSTANCE ARGS…` while every process of `watched` (the instances whose work it waits on)
-/// progresses ([`StartProgress`]): `None` when they stalled or left first (it is killed and reaped). Until 2026-11-20
+/// progresses ([`process_wait::InstanceWait`]): `None` when they stalled or left first (it is killed and reaped). Until 2026-11-20
 /// the fleet submit's wait was [`run_within`] at the fleet wait, 40 s of the wall.
 fn run_while_progressing(
   instance: &str,
@@ -4540,7 +4400,7 @@ fn run_while_progressing(
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   while child.try_wait().unwrap().is_none() {
     if !progress.look_all(watched) {
       let _ = child.kill();
@@ -5657,7 +5517,7 @@ fn start_formed_fleet(tag: &str) -> (ScratchDir, Vec<String>, Vec<FleetProcess>)
 /// before that finds nobody to hand to (the drain reports `NoTarget`) and leaves learners that cannot elect.
 fn wait_for_full_council(instances: &[String]) -> usize {
   // While the nodes' processes progress (until 2026-11-20 within the fleet wait).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let mut leaders = council_leaders(instances);
   while !(leaders.len() == 1 && council_voters(&instances[leaders[0]]) == FLEET_NODES.len())
     && progress.look_all(instances)
@@ -5695,7 +5555,7 @@ fn diagnose_fleet_council(instance: &str) -> String {
     ));
   }
   let started = Instant::now();
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let widened = loop {
     let leaders = council_leaders(&instances);
     if let [leader] = leaders[..]
@@ -5722,7 +5582,7 @@ fn diagnose_fleet_council(instance: &str) -> String {
 /// Polls `survivors` from `asked` until exactly one leads the council, or the survivors' processes stall or leave
 /// (until 2026-11-20 the fleet wait): the leaders then, and how long after `asked`.
 fn time_the_successor(survivors: &[String], asked: Instant) -> (Vec<usize>, Duration) {
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let mut handed = council_leaders(survivors);
   while handed.len() != 1 && progress.look_all(survivors) {
     pause_for_handoff();
@@ -8359,12 +8219,12 @@ impl MappedThroughAMount {
     self.follows_bytes(&whole)
   }
 
-  /// Whether the map comes to read `expected`, waited for while the instance's processes progress ([`StartProgress`];
+  /// Whether the map comes to read `expected`, waited for while the instance's processes progress ([`process_wait::InstanceWait`];
   /// until 2026-11-20 within `WAIT_FOR`): **as memory alone on Linux**, with no request on the mount, since slates
   /// tells the kernel of a change when it is made (§4.6); on macOS once the file is `stat`ed, because an NFS v3 client
   /// cannot be told and revalidates only when asked.
   fn follows_bytes(&mut self, expected: &[u8]) -> bool {
-    let mut progress = StartProgress::new();
+    let mut progress = process_wait::InstanceWait::new();
     while progress.look(&self.instance) {
       if !cfg!(target_os = "linux") {
         let _ = rustix::fs::fstat(&self.file);
@@ -8435,7 +8295,7 @@ impl SecondMount {
   fn follows(&self, expected: &[u8]) -> bool {
     use std::os::unix::fs::FileExt;
     let mut read = vec![0u8; expected.len()];
-    let mut progress = StartProgress::new();
+    let mut progress = process_wait::InstanceWait::new();
     while progress.look(&self.instance) {
       if !cfg!(target_os = "linux") {
         let _ = rustix::fs::fstat(&self.file);
@@ -9363,7 +9223,7 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
   );
   drop(second);
   // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let mut now = referenced();
   while now > before && progress.look(&instance) {
     pause();
@@ -9422,7 +9282,7 @@ fn a_file_an_ended_mount_held_is_given_back() {
   assert!(lazily.status.success(), "the lazy unmount: {lazily:?}");
   drop(open);
   // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let mut now = referenced();
   while now > before && progress.look(&instance) {
     pause();
@@ -9500,7 +9360,7 @@ fn a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount
   assert!(lazily.status.success(), "the lazy unmount: {lazily:?}");
   drop(uncounted);
   // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let mut now = referenced();
   while now > before && progress.look(&instance) {
     pause();
@@ -9557,7 +9417,7 @@ fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_give
   #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
   std::fs::remove_file(&path).unwrap();
   // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   while referenced() > before && progress.look(&instance) {
     pause();
   }
@@ -9570,7 +9430,7 @@ fn the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_give
   let restarted = await_daemon(&instance, Some(killed), &[]);
   assert_ne!(restarted, killed, "a new daemon serves the mount");
   // Waited for while the instance's processes progress (until 2026-11-20 within `WAIT_FOR`).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let mut now = referenced();
   while now > before && progress.look(&instance) {
     pause();
@@ -9845,13 +9705,13 @@ impl OnePageJournal {
   }
 
   /// Sends every request in `batch` without waiting, then collects each reply while the instance's processes progress
-  /// ([`StartProgress`]; until 2026-11-20 within `WAIT_FOR`): every one the end of a write.
+  /// ([`process_wait::InstanceWait`]; until 2026-11-20 within `WAIT_FOR`): every one the end of a write.
   fn pipeline(&mut self, batch: &[slates_ipc::protocol::RequestBody]) {
     let sent: Vec<_> = batch
       .iter()
       .map(|body| self.writer.begin(body).unwrap())
       .collect();
-    let mut progress = StartProgress::new();
+    let mut progress = process_wait::InstanceWait::new();
     for request in sent {
       let reply = loop {
         let spin = self.writer.published_spin_ns();
@@ -9868,9 +9728,9 @@ impl OnePageJournal {
   }
 
   /// Whether reading `name` through the mount comes to show `expected`, waited for while the instance's processes
-  /// progress ([`StartProgress`]; until 2026-11-20 within `WAIT_FOR`).
+  /// progress ([`process_wait::InstanceWait`]; until 2026-11-20 within `WAIT_FOR`).
   fn comes_to_read(&self, name: &str, expected: &[u8]) -> bool {
-    let mut progress = StartProgress::new();
+    let mut progress = process_wait::InstanceWait::new();
     while self.read_through_mount(name) != expected {
       if !progress.look(&self.instance) {
         return false;
@@ -12885,7 +12745,7 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
   let mut reported = None;
   let mut last = String::new();
   // Waited for while the daemon's processes progress (until 2026-11-20 within `START_WAIT`).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   while reported != Some(GARBLED_HOLD_MESSAGES) {
     match anchor.0.step(now()).unwrap() {
       Step::Running => {}
@@ -12951,7 +12811,7 @@ fn an_anchor_whose_log_reader_went_away_keeps_supervising() {
   drop(stderr);
   let alive_and_answering = |anchor: &mut AnchorProcess, unlike: Option<u32>| {
     // Waited for while the instance's processes progress (until 2026-11-20 within `START_WAIT`).
-    let mut progress = StartProgress::new();
+    let mut progress = process_wait::InstanceWait::new();
     let mut streak = 0u32;
     let mut answered = None;
     while streak < STABLE_STREAK {
@@ -13366,7 +13226,7 @@ fn a_base_a_kept_mount_covers_is_not_reacquired_through_it() {
   let stopped = end_keeping_mounts(&instance);
   // A successor that waits on itself makes no progress, which the judgment ends (until 2026-11-20 a wall bound of the
   // start wait and the kept recovery's answer).
-  let mut progress = StartProgress::new();
+  let mut progress = process_wait::InstanceWait::new();
   let mut log = Vec::new();
   let refused = loop {
     while let Ok(line) = lines.try_recv() {
