@@ -32,7 +32,7 @@ entitlement. These limitations are open correctness/integration work, not option
 
 ```
 slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME] [--vcs-http ADDRESS]
-              [--vcs-svn ADDRESS]
+              [--vcs-ssh ADDRESS] [--vcs-svn ADDRESS]
 ```
 
 The anchor measures the machine profile (seconds; `--quick` for tests), creates the shared
@@ -58,6 +58,20 @@ CRAM-MD5 keyed contexts beside its hash, never the token. The anchor
 binds the address once and hands its listener to every daemon it supervises (on Linux and macOS), so a
 daemon's restart never drops the port: a client that connects meanwhile is answered by the next daemon.
 An address the anchor cannot bind ends its start with an error naming it.
+
+`--vcs-ssh ADDRESS` starts the SSH edge git, Mercurial and Subversion are served over, at ADDRESS, an IPv4
+address and port (port 0 lets the system pick one), on any address: SSH encrypts every connection. git's
+fetch and clone and Mercurial's `hg clone` and `hg pull` are served; the other commands land one server at
+a time, and until a command's server has, the edge refuses it in its tool's own words (`fatal:
+git-receive-pack is not served yet`). The daemon logs where it serves and its host key's fingerprint
+(`slates daemon: the version-control SSH edge serves on IP:PORT with the ED25519 host key SHA256:...`),
+which is what `ssh` shows the first time it meets the key: compare the two before trusting it. A fleet
+node's edge presents the node's own key, the one its fleet manifest names, when that key is Ed25519; a
+node whose key is of another algorithm starts no SSH edge, and says so. Otherwise the anchor makes an
+Ed25519 host key in its memory when it starts and keeps it, with the listener, for every daemon it
+supervises, so a daemon's restart keeps both the port and the key, and a client's `known_hosts` line stays
+good for as long as the anchor runs. Clients sign in with a key a person enrolled with `slates credential
+key`. Use a port above 1023: slates needs no privilege, and a host that wants port 22 forwards it.
 
 `--vcs-svn ADDRESS` serves Subversion's own protocol, `svn://`, at ADDRESS, an IPv4 address and port (port 0
 lets the system pick one; `svnserve`'s is 3690); the daemon logs where it serves (`slates daemon: the svn://
