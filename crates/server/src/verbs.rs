@@ -12327,6 +12327,7 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     keep
   });
   crate::work_charge::release(state, released);
+  remake_greens_ahead(state);
   // A rolled-back clone's pin on its origin's snapshot: the record that named the origin went with the rollback, so the
   // pins are recounted against the lineage the catalog still records, as a recovery recounts them. Before 2026-11-18
   // the teardown kept the pin, and the snapshot's destroy was refused `Pinned` until a restart.
@@ -12339,6 +12340,78 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
   #[cfg(target_os = "linux")]
   crate::virtiofs::reconcile_unrecorded(state);
   orphans.len()
+}
+
+/// Counter: a green whose engine a refused publication left past its durable head, made again from its durable
+/// checkpoint and chain ([`remake_greens_ahead`]). Format: a counter name in the daemon's status report.
+const GREEN_REMADE_UNPUBLISHED: &str = "merge.unpublished.green_remade";
+/// Counter: such a green in a lineage of several members, whose shared engine is not made again here (GAPS, owed):
+/// kept as it is. Format: a counter name in the daemon's status report.
+const GREEN_AHEAD_KEPT: &str = "merge.unpublished.green_ahead_kept";
+
+/// Makes again every green whose engine is past its durable head after a refused publication: the verb committed a
+/// version to the engine before the record that holds it was refused, and the transaction took the record back, so the
+/// engine answered a version no log holds and judged every later commit against it (found by use, w-perf, 2026-11-19:
+/// a Subversion import's record refused `Unpublished`, then every `svn commit` refused "The repository's green is not
+/// at its youngest revision"). A lone engine, and a lineage's only member, are replayed from the durable checkpoint and
+/// chain as a recovery replays them, so the green answers what its log holds; the chain since the checkpoint is
+/// bounded by the merge service's fold (W3).
+fn remake_greens_ahead(state: &mut ShardState) {
+  let ahead: Vec<VolumeRecord> = state
+    .greens
+    .keys()
+    .copied()
+    .filter(|id| {
+      state
+        .greens
+        .get(id)
+        .is_some_and(|engine| engine.head() > state.db.partition().green_head(*id))
+    })
+    .filter_map(|id| state.db.partition().volume(id).cloned())
+    .collect();
+  for record in ahead {
+    remake_green(state, &record);
+  }
+}
+
+/// Makes `record`'s green again from its durable checkpoint and chain ([`remake_greens_ahead`]).
+fn remake_green(state: &mut ShardState, record: &VolumeRecord) {
+  let member = state
+    .db
+    .partition()
+    .repositories()
+    .member(record.id)
+    .cloned();
+  match &member {
+    Some(member) => {
+      let members = state
+        .db
+        .partition()
+        .repositories()
+        .members_of(member.repository)
+        .count();
+      if members > 1 {
+        state.count(GREEN_AHEAD_KEPT, 1);
+        return;
+      }
+      if let Some((repository, Ok(mut release))) = state.greens.retire(&record.id) {
+        while state
+          .greens
+          .release_step(repository, &mut release)
+          .is_ok_and(|more| more)
+        {}
+      }
+    }
+    None => {
+      state.greens.remove(&record.id);
+    }
+  }
+  let replayed = replay_green(state, record.id);
+  match &member {
+    Some(member) => install_member_root(state, record, member, replayed),
+    None => install_green(state, record, replayed),
+  };
+  state.count(GREEN_REMADE_UNPUBLISHED, 1);
 }
 
 /// Begins a destroying volume's teardown: its snapshot views close first, unpinning the snapshots the destroy
@@ -16733,9 +16806,8 @@ fn settle_installed(
 /// acknowledged version, so each must decode and be accepted at exactly its own version — version `n` for
 /// the `n`-th entry after the checkpoint (W3) or over the origin's version 0 — or the replay is refused with the fence
 /// naming why (AUD-29-18). Until 2026-09-30 a corrupt origin installed an empty green, a corrupt entry stopped the
-/// replay and installed the shorter one, and a submit's outcome was not checked at all. [`rebuild_green`]'s replay,
-/// in one call, for the tests; a recovery runs [`replay_green_sliced`].
-#[cfg(test)]
+/// replay and installed the shorter one, and a submit's outcome was not checked at all. In one call: a refused
+/// publication's remake ([`remake_green`]) and the tests run it; a recovery runs [`replay_green_sliced`].
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,

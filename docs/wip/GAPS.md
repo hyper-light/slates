@@ -81,6 +81,13 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-720 (2026-11-20, w-hg; main's ruling after w-perf's 57,036-changeset push tripped the watchdog: a push's working
+> set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
+> push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
+> log reads it, kept once), then the manifests' and files' presence a step each; the same fork as `verify` then
+> `fork_with`, row for row, within less room. Owed: part 2, the server driving it in slices within the shard's step
+> budget (the push driver still verifies whole); part 3, the import's room per repository; the store w-perf's table
+> gives (main's ruling).
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
 > (`HgStores::push_room`, `git_push::push_room`, A-704's rule), and a bundle past it is refused in Mercurial's words
@@ -510,6 +517,14 @@
 > times: the svn records' `Repository.contents`, the green's content pool (A-716, w-perf: the records name the green's
 > content by identity) and the register's entry objects, each revision's record with its texts (~245 KB a revision
 > under `apply_advanced`, w-perf); A-716's record without text bytes takes the third with it.
+> Fixed 2026-11-19 (A-721, w-svn, found by use: an import's record refused `Unpublished`, then every `svn commit`
+> E160004): a verb commits a version to its green's engine before the record holding it is durable, and a refused
+> publication took the record back but left the engine ahead; `verbs::reconcile_unpublished_effects` now makes such a
+> green again from its durable checkpoint and chain (`remake_greens_ahead`). Test
+> `a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands`, red then green; macOS
+> arm64, this Mac, local. Owed: a green in a lineage of several members (git branches) is counted
+> (`merge.unpublished.green_ahead_kept`) and kept as it is; a submit's `vcs_store::paths`/`commits` advanced before
+> its record are not taken back either.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence

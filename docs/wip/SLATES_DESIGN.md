@@ -12487,6 +12487,11 @@ under a grant (§4.15, R10).
 > `admit_objects` first), never to the partition's merge budget, so a
 > repository's bound is what its shard can hold. This replaces A-662's "charged to the merge budget" below.
 >
+> **Status (2026-11-19, A-721, w-svn).** A refused publication takes back the verb's record; a green whose engine had
+> already committed the version is made again from its durable checkpoint and chain in the same reconciliation
+> (`verbs::remake_greens_ahead`), so the engine never answers a version no log holds. Lone engines and single-member
+> lineages; a lineage of several members is counted and owed.
+>
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
 > (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each
@@ -14489,6 +14494,8 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
    advertise it while it is held. Whether an artefact stays is learned (the table below).
 
 **Push.** Each step names what it refuses; nothing takes effect before step 6.
+Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
+working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices in part 2.
 1. **Intake.** The bundle (bundle2; bundle1 only where the policy allows legacy clients, as 7.2's `server.bundle1`
    does) is read in slices within the shard's budget per step, every length checked against the request's admission
    (A-16) before anything is held. A mandatory part or parameter slates does not know is refused, as bundle2 requires
