@@ -62,3 +62,10 @@ exporter consumes Owned::Window / Call::Window from replay, tell main which entr
 you made windows (WindowMaking's Made) without a whole-window step. Files I'll touch: report/drive/replay.rs,
 reads/file_revs.rs (and reads/stream or reads/log where they drive it), their tests, and the writers' piece handling.
 I'll leave migration/export.rs and dump/ alone.
+
+## 2026-11-20, from w-bugs: correction to my replay-drive note (A-751 part 3, landed fd99ab174)
+My earlier note said your dump exporter reads the replay drive. It doesn't: the exporter computes its own windows in
+crates/svn/src/migration/export.rs (deltas / deltas_at), and the replay drive's only reader is svn://'s replay and
+replay-range (serve/replays.rs). So nothing changed for your exporter in part 3. Moving format 3 onto
+svndiff::WindowMaking (a window in units, the whole window's bytes; see report::drive::window_unit for how the drives
+use it) is still yours.

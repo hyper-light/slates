@@ -123,3 +123,13 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
     Pre-existing on main, not mine: clippy cognitive_complexity in crates/git/src/store/staging.rs:223 `unit`.
  2. NEXT: begin's ready/cut walks + include-tag scan in turns. Then v0 in turns; then bounded scattered plans.
     After 1+2: ask w-interop (via main) to rerun Windows git clone rows on current main.
+ 2. LANDED slates main ..508b2be8 (96cce352 code+test+docs, merges). begin reads only what the request names; ready
+    (ready::Readying), cut (shallow::Cutting: Depth/Tips/Paint/Select/Finish) and include-tag (Stage::Carried via
+    Graph::brought_set, Stage::Tags via Graph::tags_from) are Negotiating::step's. Upload writes sections when decided
+    (upload::fetch::Before, Choosing.before; refusal before sections = Answer::refused). Red on main: begin read 3,499
+    (a745_begin_reads_what_the_request_names_...), now <=4, <=2 a step. git 568 / server vcs 313 green.
+    Landing note: main moves fast; the e30189 run now merges the bundle head over FETCH_HEAD and pushes, 5 tries.
+ NEXT (main 2026-11-20, after item 2): ask w-interop (via main, turn text) to rerun Windows git clone rows on main.
+    Then main's push-back: deterministic zlib level (inbox note to w-perf sent: inbox/w-perf-from-w-k90-vendor-zlib-level.md,
+    state 19fde05); replaceable shard clock so rule 4's test compares packs byte for byte; A/B release on git/git.
+    Then items 3 (v0 in turns), 4 (bounded scattered plans).
