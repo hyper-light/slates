@@ -6788,3 +6788,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 
 - w-balance (2026-11-20, finding by use, pre-existing on main b0655e8a3): `cargo test --locked -p slates-server --lib -- vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it` panics `a step that waits` (vcs_ssh/tests/hg.rs:487); macOS arm64 Mac Studio. Owner: w-hg?
 - 2026-11-20 w-shared A-664 Subversion objects (main 196ba2e15): clippy + xtask (new module vcs_store/svn_made.rs, slates-svn text_of); Linux/Windows `cargo test -p slates-server --lib -- repository::svn_commit:: vcs_store::svn`; by use: submit a work to an svn repository's green, then stock `svn update`/`svn commit` over svn:// (red: commit refused 160004)
+- 2026-11-20 w-reaper A-726 part 1 (main c1eaea6): owed (main): clippy; Linux/Windows: cargo test -p slates-svn --lib dav::report_ (stock-svn e2e svn_http_reports skips without svn 1.15; ran green on Studio-1).

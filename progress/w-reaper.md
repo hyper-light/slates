@@ -1,6 +1,14 @@
 # w-reaper progress (event-driven reaper goal). Supervisor "slates-7a".
 
 ## RESUME HERE (2026-11-20, Mac Studio relaunch)
+- GOAL 93 (svn over HTTP), main's order: (1) DAV reports svn blame/diff ask, (2) pre-lock/post-lock hooks (A-693 p2 owed).
+  A-726 PART 1 LANDED: main c1eaea6 (merged 749a56a). file-revs-report (reads::DavFileRevs via file_revs writer enum;
+  dav/report_file_revs.rs), get-locations (reads::trace_node_locations; dav/report_locations.rs); site.rs REPORT arms
+  only. E2E crates/cli/tests/svn_http_reports.rs (own copy of svn_interop harness -- w-interop owns svn_interop.rs,
+  locking.rs, site.rs method match, commit.rs, server vcs_http/svn.rs, vcs_store/svn_view.rs). Stock svn 1.15 lives on
+  Studio-1 d1323898 /opt/homebrew/bin; run e2e there via kiln run (on d1323898, PATH=/opt/homebrew/bin:$PATH,
+  CARGO_TARGET_DIR=~/.cache/w-reaper-target). svn sources (1.15.0) fetched to ~/slates-work/svn-src.
+  NEXT: part 2 mergeinfo-report + OPTIONS SVN-Repository-MergeInfo: yes (svn blame -g, svn merge); then piece (2) hooks.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
