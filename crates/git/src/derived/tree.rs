@@ -791,7 +791,7 @@ impl Work<'_> {
       },
     );
     for window in self.store.windows(&content) {
-      hasher.update(window);
+      hasher.update(&window);
     }
     self.counters.blobs = self.counters.blobs.saturating_add(1);
     hasher.finish().map_err(|attack| TreesRefused::Collision {

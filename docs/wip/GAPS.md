@@ -120,7 +120,9 @@
 > wall a 5,000-revision svn import met is the snapshot, the sum of every retained record): the vcs content store in the
 > shard's chunk arena of the anchor's content object, its table in the shard image recovered before the records, records
 > naming identities (git v3: names + the pack's root identity), entries waiting on the next image barrier (group commit).
-> OWED: slices (a1) read seam, (a2) arena storage, (a3) image table + recovery order, (b) git v3, (c) svn, (d) replication.
+> (a1) BUILT: `ContentStore::windows`/`window_at` answer `Cow` (a sealed arena window is copied out), every reader in
+> git, hg, the server and vcs moved over; lists and tables stay lent (`get`). OWED: (a2) arena storage, (a3) image table
+> + recovery order, (b) git v3, (c) svn, (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an

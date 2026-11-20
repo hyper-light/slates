@@ -615,12 +615,12 @@ pub(crate) fn write_text(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -
   if let Some(block) = kept.block {
     put(MARKER, &mut written);
     for window in store.windows(&block) {
-      put(window, &mut written);
+      put(&window, &mut written);
     }
     put(MARKER, &mut written);
   }
   for window in store.windows(&kept.bytes) {
-    put(window, &mut written);
+    put(&window, &mut written);
   }
   written
 }
@@ -633,7 +633,7 @@ fn write_markers(out: &mut Vec<u8>, index: &HgIndex, store: &ContentStore) -> Re
     let marker = index.marker(store, number).ok_or(number)?;
     out.extend_from_slice(&window_bytes(store, &marker).to_le_bytes());
     for window in store.windows(&marker) {
-      out.extend_from_slice(window);
+      out.extend_from_slice(&window);
     }
   }
   Ok(())

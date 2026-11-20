@@ -64,7 +64,10 @@ impl<'a> IndexHeld<'a> {
 /// Every window of a content, in order: a short read where the store no longer holds its tree whole, which the caller's
 /// length check refuses.
 fn whole(store: &ContentStore, root: &ContentId) -> Vec<u8> {
-  store.windows(root).flatten().copied().collect()
+  store
+    .windows(root)
+    .flat_map(|window| window.into_owned())
+    .collect()
 }
 
 impl Held for IndexHeld<'_> {

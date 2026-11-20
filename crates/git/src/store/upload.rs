@@ -77,6 +77,7 @@
 //! ([`StoreRefused::BaseRebuilt`]), never a pack of two base packs' entries; the owner makes base packs between
 //! streams. A part copied whole names its content, which holds the bytes it was made with.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
 
@@ -865,7 +866,7 @@ impl<A: Answered> Upload<A> {
       exchange: cx.exchange,
       clock: &mut *cx.clock,
     };
-    let level = fragment::level(row.kind, first, &mut learning).map_err(StoreRefused::Encoding)?;
+    let level = fragment::level(row.kind, &first, &mut learning).map_err(StoreRefused::Encoding)?;
     self.emit(&written, out);
     Ok(Pending::Deflate(Deflating {
       from: Deflated::Content(content),
@@ -914,7 +915,7 @@ impl<A: Answered> Upload<A> {
       .ok_or(StoreRefused::FragmentUnreadable)?;
     let upto = to.min(start.saturating_add(to_u64(bytes.len())));
     let piece = within(
-      bytes,
+      &bytes,
       from.saturating_sub(start),
       upto.saturating_sub(start),
     )?;
@@ -948,10 +949,10 @@ impl<A: Answered> Upload<A> {
         .store
         .window_at(content, deflating.len, deflating.next)
         .ok_or(StoreRefused::FragmentUnreadable)?,
-      Deflated::Made { delta, .. } => made_window(delta, window, deflating.next)?,
+      Deflated::Made { delta, .. } => Cow::Borrowed(made_window(delta, window, deflating.next)?),
     };
     let last = deflating.next.saturating_add(1) >= windows;
-    let given = fragment::deflate_more(&mut deflating.compress, bytes, last)
+    let given = fragment::deflate_more(&mut deflating.compress, &bytes, last)
       .map_err(StoreRefused::Encoding)?;
     self.emit(&given, out);
     if last {
@@ -1374,7 +1375,7 @@ fn read_window(
   if !whole_windows || to_u64(next.len()) != window.min(len.saturating_sub(read)) {
     return Err(unreadable);
   }
-  bytes.extend_from_slice(next);
+  bytes.extend_from_slice(&next);
   Ok(true)
 }
 
@@ -1596,7 +1597,7 @@ fn read_range(
       return Err(StoreRefused::FragmentUnreadable);
     }
     bytes.extend_from_slice(within(
-      held,
+      &held,
       at.saturating_sub(start),
       upto.saturating_sub(start),
     )?);
