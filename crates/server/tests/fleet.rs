@@ -25211,6 +25211,7 @@ fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commit
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
      {counters:?}"
@@ -25330,6 +25331,7 @@ fn a_work_catalog_with_no_session_to_ship_over_waits_for_the_period() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "once the sessions returned the catalog committed and the submit was answered"
   );
@@ -25453,6 +25455,7 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "accepted as version 1"
   );
@@ -25512,6 +25515,7 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: 0,
+        identical: false,
       },
       "submit {index} is accepted as the next version"
     );
@@ -25599,6 +25603,7 @@ fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: 0,
+        identical: false,
       },
       "submit {index} is accepted as the next version"
     );
@@ -27484,6 +27489,7 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit resent under its id after the restart is answered the version it was accepted as: {:?}",
     seen.counters
@@ -28992,6 +28998,7 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -29018,6 +29025,7 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the resend after two takeovers in sequence is answered the version it was accepted as"
   );
@@ -29100,6 +29108,7 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the submit committed at version 1"
   );
@@ -29533,6 +29542,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -29556,6 +29566,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the resend through the takeover is answered the version it was accepted as"
   );
@@ -29706,6 +29717,7 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -29737,6 +29749,7 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the route answered the resend the version it was accepted as"
   );
@@ -33798,6 +33811,7 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit resent after its owner died is answered its version by the green's successor"
   );
@@ -33931,6 +33945,7 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit was answered its version once its record committed"
   );
@@ -34063,6 +34078,7 @@ fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_v
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit was answered its version once its route and its record committed"
   );
@@ -34264,6 +34280,7 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the victim's own resend is answered its version"
   );
@@ -34445,6 +34462,7 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "d's resend is answered its version through the green the location round named"
   );

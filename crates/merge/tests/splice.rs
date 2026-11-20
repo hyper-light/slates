@@ -242,7 +242,7 @@ proptest! {
     let edit = Increment { id: [2; 32], base: 1, doc, post_state: post.clone(), evidence: Vec::new() , named: Default::default() };
     let outcome = green.submit(&edit);
     if edit.doc.ops.is_empty() {
-      prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{:?}", outcome);
+      prop_assert!(matches!(outcome, Outcome::Accepted { .. } | Outcome::Identical { .. }), "{:?}", outcome);
     } else {
       prop_assert_eq!(outcome, Outcome::Accepted { version: 2 });
       prop_assert_eq!(green.content("f"), Some(post.as_slice()));
