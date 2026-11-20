@@ -52,7 +52,7 @@
 //! offsets, which its protocol fixes (A-163). [`ShardsBackings::placed_pages`] counts the pages placed now, and
 //! [`ShardsBackings::placements`] reads where each lies. A range is placed only once it is filled and counted, and a filled range stays filled while its backing lives,
 //! so the bytes the placed ranges hold never exceed what the backings count against the budget. A decline likely to
-//! hold is remembered until the daemon's reap tick re-arms it ([`ShardsBackings::place`]), since a declined collapse
+//! hold is remembered until the shard's deadline keeper re-arms it a retry window on (A-570; [`ShardsBackings::place`]), since a declined collapse
 //! costs the shard milliseconds of the kernel's compaction effort.
 //!
 //! Bounded by the slab's capacity: the shard's chunk count, as the in-process DAX registry's. The registry also keeps

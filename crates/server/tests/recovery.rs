@@ -3488,7 +3488,7 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 /// (the non-vacuity count) and nothing more given back once it had finished. The probes' latencies are printed and not
 /// judged: a probe's wall time on a loaded host says what the host did (10.4 ms against 2.2 ms at load 65 on Linux,
 /// with nothing of the shard's own in it). Then do restart the daemon over the same anchor and give its recovery memory
-/// back a step at a time, as the idle tick does; expect the p99 step to have held its shard no more than `STEP_QUANTA`
+/// back a step at a time, as an idle sweep pass does; expect the p99 step to have held its shard no more than `STEP_QUANTA`
 /// step quanta of the shard thread's own CPU, which load does not inflate. That judge runs wherever a thread clock is
 /// fine enough to time a step by: CI's `gates` job (`cargo test --workspace` on `ubuntu-latest` and `macos-latest`,
 /// `.github/workflows/ci.yml`), and every Linux and macOS development machine whatever its load; it skips loudly on
@@ -3497,9 +3497,9 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 /// reached the shard waited.
 #[test]
 fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
-  /// Shape: a probe window, in reap ticks (`LIVENESS_BUDGET_NS` each): the first tick after the volume's create sees
-  /// allocations, the second finds the shard idle and gives back, and two more cover the give-back's slices.
-  const WINDOW_TICKS: u64 = 4;
+  /// Shape: a probe window, in sweep intervals (`LIVENESS_BUDGET_NS` each): the first pass after the volume's create
+  /// sees allocations, the second finds the shard idle and gives back, and two more cover the give-back's slices.
+  const WINDOW_INTERVALS: u64 = 4;
   let profile = common::machine_profile();
   let instance = format!("srv-recovery-slices-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
@@ -3510,8 +3510,9 @@ fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let volume = client.create(&scratch("probed")).unwrap();
-  let window =
-    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(WINDOW_TICKS));
+  let window = Duration::from_nanos(
+    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(WINDOW_INTERVALS),
+  );
   let returned = |daemon: &Daemon| {
     daemon
       .refusals_on_every_shard()
@@ -3552,25 +3553,25 @@ fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
 
 /// Leaves the shard alone until its give-back has finished: until the journal has no dead recovery memory left to give
 /// back, which is the give-back's own completion. Until 2026-11-08 this waited for the bytes given back to stand still
-/// over a window, and on a loaded host (load 41 to 62) a give-back between two reap ticks stood still with some left: 2
+/// over a window, and on a loaded host (load 41 to 62) a give-back between two sweep passes stood still with some left: 2
 /// of 7 runs then gave back the rest in the quiet window. Each look is itself a task on the shard, which ends the
-/// give-back for that tick, so they are a reap tick apart. Fails only if `STALLED_TICKS` pass with nothing more given
+/// give-back for that pass, so they are a sweep interval apart. Fails only if `STALLED_INTERVALS` pass with nothing more given
 /// back.
 fn give_back_finished(daemon: &Daemon) {
-  /// Shape: the reap ticks with no progress before the test calls the give-back stuck: well past a loaded host's gaps
-  /// between ticks that find the shard idle.
-  const STALLED_TICKS: u32 = 60;
-  let tick = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  /// Shape: the sweep intervals with no progress before the test calls the give-back stuck: well past a loaded host's
+  /// gaps between passes that find the shard idle.
+  const STALLED_INTERVALS: u32 = 60;
+  let interval = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
   let mut left = daemon.recovery_left_to_give_back().unwrap();
   let mut stalled = 0;
   while left > 0 {
     assert!(
-      stalled < STALLED_TICKS,
-      "the give-back made no progress for {STALLED_TICKS} reap ticks, {left} bytes left"
+      stalled < STALLED_INTERVALS,
+      "the give-back made no progress for {STALLED_INTERVALS} sweep intervals, {left} bytes left"
     );
     #[allow(clippy::disallowed_methods)]
     // a test leaving the shard alone, which is the state it needs
-    std::thread::sleep(tick);
+    std::thread::sleep(interval);
     let now = daemon.recovery_left_to_give_back().unwrap();
     stalled = if now < left { 0 } else { stalled + 1 };
     left = now;
@@ -3762,7 +3763,7 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
 }
 
 /// A-214 (VFS plan step 11). Do: on a one-shard daemon over a held anchor, write a file of many chunks (the shard's
-/// write burst), publish, and leave the shard idle for two reap ticks (`content.ticks.idle`), by which its idle work, the
+/// write burst), publish, and leave the shard idle for two idle purge steps (`content.ticks.idle`), by which its idle work, the
 /// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the
 /// content object's allocated bytes across each write. Expect the second burst to land on pages already resident: the
 /// object grows by less than half of what the first burst, on fresh pages, grew it, and the idle pre-fault is counted
@@ -3777,7 +3778,7 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
   const MARKER: &[u8] = b"SLATES-PREFAULT-A214-3c0d";
   /// Shape: each file is this many chunk-sized blocks, so its pages dwarf the faults of anything else in the process.
   const CHUNKS: usize = 256;
-  /// Shape: the bound on the idle shard's pre-fault: several reap ticks (one to see no allocation, the next to refill).
+  /// Shape: the bound on the idle shard's pre-fault: several sweep passes (one to see no allocation, the next to refill).
   const PREFAULT_WAIT: Duration = Duration::from_secs(20);
   let profile = common::machine_profile();
   let instance = format!("srv-prefault-{}", std::process::id());
@@ -3820,8 +3821,8 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
       .unwrap_or(0)
   };
   let file = u64::try_from(body.len()).unwrap();
-  // The refill is the shard's idle work, so once the shard has been idle a whole reap tick it has finished: wait for two
-  // idle ticks after the first write (`content.ticks.idle`), or the bound.
+  // The refill is the shard's idle work, so once the shard has been idle a whole sweep pass it has finished: wait for
+  // two idle purge steps after the first write (`content.ticks.idle`), or the bound.
   let idle_ticks = || {
     daemon
       .refusals_on_every_shard()
@@ -3869,7 +3870,7 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
 }
 
 /// A-214 with A-105 and A-205 (VFS plan steps 11 and 12). Do: on a one-shard daemon over a held anchor, write a file of
-/// many chunks, publish, and leave the shard idle for two reap ticks, so the burst closes and its reserve is pre-faulted;
+/// many chunks, publish, and leave the shard idle for two idle purge steps, so the burst closes and its reserve is pre-faulted;
 /// then delete the file, publish, and leave the shard idle. Expect the content object to fall back to within a quarter of
 /// the file of what it held before the write, within the bound: the delete's busy period nets the burst away, so the
 /// reserve goes and every page goes back. Before this was fixed the burst ended only when the arena's allocation count
@@ -3881,7 +3882,7 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
   const MARKER: &[u8] = b"SLATES-RESERVE-RETURNED-9b41";
   /// Shape: the file is this many chunk-sized blocks, so its pages dwarf the object's metadata and image pages.
   const CHUNKS: usize = 256;
-  /// Shape: the bound on the idle shard's work: several reap ticks.
+  /// Shape: the bound on the idle shard's work: several sweep passes.
   const IDLE_WAIT: Duration = Duration::from_secs(20);
   let profile = common::machine_profile();
   let instance = format!("srv-reserve-back-{}", std::process::id());
@@ -4006,8 +4007,8 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   #[cfg(target_os = "linux")]
   let written = allocated_in_content(&content);
   client.fs_remove((volume, attachment), "big").unwrap();
-  // The block is zeroed when its free is released; its pages go back when the shard is next idle at a reap tick (one
-  // tick to see no allocation, the next to purge), so the count is watched until it covers most of the file or the
+  // The block is zeroed when its free is released; its pages go back when the shard is next idle at a sweep pass (one
+  // pass to see no allocation, the next to purge), so the count is watched until it covers most of the file or the
   // bound passes.
   let file = u64::try_from(body.len()).unwrap();
   let started = Instant::now();
@@ -4043,14 +4044,14 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   }
 }
 
-/// Shape: the reap ticks an idle shard is watched for further publications once its plaintext has gone.
+/// Shape: the sweep intervals an idle shard is watched for further publications once its plaintext has gone.
 #[cfg(target_os = "linux")]
-const IDLE_TICKS_WATCHED: u64 = 3;
+const IDLE_INTERVALS_WATCHED: u64 = 3;
 
 /// Condition 9, a deleted file, and the cost of the rule that scrubs it. Do: write a marker file, publish every shard (as
 /// a transport's barrier does), delete the file, and leave the volume idle; then watch the shards' publications for a
-/// few ticks. Expect: the marker gone from the content object within the bound, and then no further publication: the
-/// reap tick publishes only while a free is deferred, so an idle shard costs nothing. The deletion's own scrub through a
+/// few sweep intervals. Expect: the marker gone from the content object within the bound, and then no further publication: the
+/// idle sweep publishes only while a free is deferred, so an idle shard costs nothing. The deletion's own scrub through a
 /// kernel mount is proven, mutation-checked, by `a_deleted_files_plaintext_leaves_the_daemons_memory`
 /// (`crates/cli/tests/cli.rs`); on this verb path the block is scrubbed with or without the rule.
 #[cfg(target_os = "linux")]
@@ -4094,10 +4095,10 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
       .unwrap_or(0)
   };
   let before = published(&daemon);
-  // A test may sleep (the lint's stated exception): the watch is wall time over the daemon's own reap ticks.
+  // A test may sleep (the lint's stated exception): the watch is wall time over the daemon's own sweep passes.
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(Duration::from_nanos(
-    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(IDLE_TICKS_WATCHED),
+    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(IDLE_INTERVALS_WATCHED),
   ));
   let after = published(&daemon);
   daemon.stop();
