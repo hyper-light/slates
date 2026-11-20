@@ -271,6 +271,11 @@ fn content(spec: &str) -> Vec<u8> {
 
 /// The fixtures' repository: its index and its green.
 pub(crate) fn repository() -> (Index, Green) {
+  repository_from(HISTORY)
+}
+
+/// The repository `history` writes, in `history.txt`'s grammar: its index and its green.
+pub(crate) fn repository_from(history: &str) -> (Index, Green) {
   let mut index = Index::new();
   let mut green = Green::default();
   let root = GreenNode {
@@ -281,7 +286,7 @@ pub(crate) fn repository() -> (Index, Green) {
     .trees
     .push(BTreeMap::from([(String::from("/"), root)]));
   green.revisions.push(Vec::new());
-  for block in HISTORY.split("\nrevision ").skip(1).map(|block| {
+  for block in history.split("\nrevision ").skip(1).map(|block| {
     block
       .lines()
       .filter(|line| !line.is_empty() && !line.starts_with('#'))
