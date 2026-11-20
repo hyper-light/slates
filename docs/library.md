@@ -64,6 +64,11 @@ fn main() -> ExitCode {
   (`--vcs-http`, contract 53): HTTPS with the node's own identity on a fleet node, else plain HTTP on a
   loopback address alone. The anchor binds the address once and holds it for every daemon it starts, so a
   restart never drops the port; an address it cannot bind ends its start.
+- `StartSpec.vcs_ssh = Some(address)` starts the version-control servers' SSH edge at `address`
+  (`--vcs-ssh`, contract 56), any IPv4 address: the anchor binds it once and makes the edge's Ed25519 host
+  key at its start, and holds both for every daemon it starts, so a restart keeps the port and the key; a
+  fleet node's edge presents the node's own Ed25519 key instead. The daemon's log names the port and the
+  key's fingerprint (`slates daemon: the version-control SSH edge serves on ...`).
 - `Started.anchor.stop()` stops the instance: a graceful stop on Unix (`SIGTERM`), the process ended
   on Windows. The instance's volumes live in its memory, so they go with it.
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can

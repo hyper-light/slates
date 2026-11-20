@@ -258,10 +258,23 @@ pub struct Daemon {
   /// The port the version-control servers' HTTP edge listens on, when the configuration asked for one and it started
   /// (A-625 part 3).
   vcs_http_port: Option<u16>,
+  /// The version-control servers' SSH edge, when the configuration asked for one and it started (A-684).
+  vcs_ssh: Option<VcsSshEdge>,
   /// The port the svn:// listener listens on, when the configuration asked for one and it started (A-656 part 2).
   vcs_svn_port: Option<u16>,
   /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
   start_beats: u64,
+}
+
+/// The version-control servers' SSH edge as a daemon started it (§4.17.2 "Transports" item 2; A-684): the port it
+/// listens on, and its host key's fingerprint as OpenSSH prints one (`ssh-keygen -l -E sha256`, and `ssh` on a key it has
+/// not seen): `SHA256:` and the key blob's SHA-256 in base64 without padding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VcsSshEdge {
+  /// The port.
+  pub port: u16,
+  /// The host key's fingerprint.
+  pub fingerprint: String,
 }
 
 /// The start's beat (§2.6 boot step 2, A-312): the supervision block's heartbeat, written by the starting thread after
@@ -505,6 +518,16 @@ pub fn bind_vcs_http_listener(
   crate::vcs_http::bind(config, address)
 }
 
+/// Binds the version-control servers' SSH edge's listener at `address` as the daemon binds its own, its backlog the
+/// edge's seats on a shard of `config` (A-684): what a supervising anchor binds once and holds across its daemons'
+/// restarts ([`slates_anchor::ENV_VCS_SSH`]), beside the host key it keeps in the segment.
+pub fn bind_vcs_ssh_listener(
+  config: &DaemonConfig,
+  address: SocketAddrV4,
+) -> Result<TcpListener, RtError> {
+  crate::vcs_ssh::bind(config, address)
+}
+
 /// Binds the svn:// listener at `address` as the daemon binds its own, its backlog the listener's seats on a shard of
 /// `config` (A-689): what a supervising anchor binds once and holds across its daemons' restarts
 /// ([`slates_anchor::ENV_VCS_SVN`]), so the listener's port never drops while a daemon restarts.
@@ -515,11 +538,11 @@ pub fn bind_vcs_svn_listener(
   crate::vcs_svn::bind(config, address)
 }
 
-/// A version-control server's listener (the HTTP edge's, A-625 part 3, or the svn:// listener's, A-689): the one a
-/// supervising anchor holds and handed over under `variable`, adopted so the port never drops while a daemon restarts (a
-/// client that connects then waits in its queue), when it listens where the configuration's `address` says
-/// ([`listens_at`]); else, with none handed over, one bound here at `address` with `backlog`. Why there is none,
-/// otherwise: a held listener elsewhere is refused, never served, since the server would then answer somewhere the
+/// A version-control server's listener (the HTTP edge's, A-625 part 3, the SSH edge's, A-684, or the svn:// listener's,
+/// A-689): the one a supervising anchor holds and handed over under `variable`, adopted so the port never drops while a
+/// daemon restarts (a client that connects then waits in its queue), when it listens where the configuration's
+/// `address` says ([`listens_at`]); else, with none handed over, one bound here at `address` with `backlog`. Why there is
+/// none, otherwise: a held listener elsewhere is refused, never served, since the server would then answer somewhere the
 /// operator did not ask.
 pub(crate) fn held_or_bound_listener(
   variable: &str,
@@ -1175,6 +1198,10 @@ impl Daemon {
     // The version-control servers' HTTP edge, when the operator asked for one (§4.17.2 "Transports" item 1, A-625 part 3):
     // its listener on the control shard beside the NFS transport, every shard keeping its seats.
     let vcs_http_port = crate::vcs_http::start(&runtime, control, &shards, &config)?;
+    // And its SSH edge (§4.17.2 "Transports" item 2, A-684): its listener on the control shard, every shard seating the
+    // connections that move to it; its host key the fleet node's own, else the one the anchor keeps in the segment, else
+    // this lone daemon's own.
+    let vcs_ssh = crate::vcs_ssh::start(&runtime, control, &shards, &config, &segment)?;
     // The svn:// listener, when the operator asked for one (§4.17.4 piece 7, A-656 part 2): on the control shard too.
     let vcs_svn_port = crate::vcs_svn::start(&runtime, control, &config)?;
     Ok(Daemon {
@@ -1187,6 +1214,7 @@ impl Daemon {
       shards,
       nfs_port,
       vcs_http_port,
+      vcs_ssh,
       vcs_svn_port,
       start_beats: start_beat.beats,
     })
@@ -1202,6 +1230,12 @@ impl Daemon {
   /// configuration asked for one and it started.
   pub fn vcs_http_port(&self) -> Option<u16> {
     self.vcs_http_port
+  }
+
+  /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2, A-684), when the configuration asked for one
+  /// and it started: its port and its host key's fingerprint.
+  pub fn vcs_ssh(&self) -> Option<&VcsSshEdge> {
+    self.vcs_ssh.as_ref()
   }
 
   /// The port the svn:// listener listens on (§4.17.4 piece 7, A-656 part 2), when the configuration asked for one and it
