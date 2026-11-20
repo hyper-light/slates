@@ -92,7 +92,7 @@ row log-graph "${HG[@]}" -R a log -G -l 2000 -T '{rev}\n'
 row annotate bash -c "cd a && ${HG[*]} annotate \$(${HG[*]} files 'glob:**.py' | head -1)"
 row diff "${HG[@]}" -R a diff -r 'tip~50' -r tip --stat
 row bookmark-push bash -c "cd a && ${HG[*]} bookmark matrix-bm && { ${HG[*]} push -B matrix-bm; [ \$? -le 1 ]; } \
-  && ${HG[*]} debugpushkey $URL bookmarks | grep -q '^matrix-bm'"
+  && ${HG[*]} debugpushkey $URL bookmarks | tee /dev/stderr | grep -q '^matrix-bm'"
 row tag-push bash -c "cd a && ${HG[*]} tag matrix-v1 && ${HG[*]} push"
 row branch-push bash -c "cd a && ${HG[*]} branch matrix-branch && echo b >matrix.txt && ${HG[*]} commit -qAm branch \
   && ${HG[*]} push --new-branch -r ."
