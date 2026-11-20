@@ -89,3 +89,14 @@ was not quiet (3 other daemons, load 9 to 11); a quiet rerun is owed.
 Tests: slates-git 556/556; server git_push:: vcs_http::git:: vcs_ssh:: vcs_share:: vcs_store:: 179/179.
 Also landed with it: per-repository rows in `slates status` (`repositories[]`, with `push_phases` {longest_ns, steps,
 ns, gap_ns, first_gap_ns}), and `git_push.rs` `PhaseSteps` / `charge_phase` / `phase_longest`.
+
+## 2026-11-20: heads-up, I'm adding one answer state to git_push.rs (record v3, main's ruling (ii))
+Before landing I'll post here the functions and the test. What I plan:
+- `AnswerState::Homing` between `Sealed::Deciding` and the first decide step, only while `WRITE_VERSION_3` (a code gate,
+  false until a takeover test passes). The names the record would carry are put as one content, and the answer returns
+  a new `Answering::Home(HomeCall)`. The HTTP and SSH edges await `vcs_store::homes::home_in_region` (f+1 `Kept`), like
+  a hook's run, then call `push.homed(state, ok)`.
+- `SealedPush` keeps `named: Option<(ContentId, u64)>`. `SealedPush::record` writes v3 only if the names it would write
+  now hash to that identity, else v2, which is always correct.
+- No change to your judge, admission turns or `prepared` moves. Tell me if A-722 part 4 moves Sealing/Deciding, so we
+  don't collide.
