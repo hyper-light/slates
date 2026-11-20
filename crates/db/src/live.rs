@@ -247,6 +247,16 @@ impl Entry {
     *hasher.finalize().as_bytes()
   }
 
+  /// The head a holder holds once it has applied this entry, its identity `identity` hashed ahead
+  /// ([`EntryHasher::of`], A-757 part 4: a holder hashes a large entry in its turns, not in the one that applies it).
+  pub fn head_with(&self, identity: Identity) -> Head {
+    Head {
+      epoch: self.epoch,
+      position: self.position,
+      identity,
+    }
+  }
+
   /// The head a holder holds once it has applied this entry.
   pub fn head(&self) -> Head {
     Head {
@@ -927,6 +937,13 @@ impl Replica {
 
   /// The guard for an entry: whether it extends the held head, is already held, or is refused.
   pub fn check(&self, entry: &Entry) -> Result<Admitted, LiveError> {
+    self.check_identified(entry, entry.identity())
+  }
+
+  /// [`Replica::check`] with the entry's identity hashed ahead ([`EntryHasher::of`]): the same guard, no hash here. The
+  /// caller hashes exactly this entry's canonical bytes: an identity of other bytes is one the chain refuses or a later
+  /// entry's `previous` does not meet.
+  pub fn check_identified(&self, entry: &Entry, identity: Identity) -> Result<Admitted, LiveError> {
     self.admit_sender(entry.owner, entry.object, entry.epoch)?;
     let extends = match self.head {
       None => entry.position == 0 && entry.previous == GENESIS,
@@ -934,16 +951,16 @@ impl Replica {
         head.position.checked_add(1) == Some(entry.position) && head.identity == entry.previous
       }
     };
+    let entry_head = entry.head_with(identity);
     if extends {
-      return Ok(Admitted::Apply(entry.head()));
+      return Ok(Admitted::Apply(entry_head));
     }
     match self.head {
       // The same entry again (a duplicate), or an older one of the same epoch's stream re-delivered: what the holder
       // holds already answers it. An older entry can only be judged as held when its epoch is the head's and its
       // position below, since one owner makes one chain per epoch and the head extends it.
       Some(head)
-        if head == entry.head()
-          || (entry.epoch == head.epoch && entry.position < head.position) =>
+        if head == entry_head || (entry.epoch == head.epoch && entry.position < head.position) =>
       {
         Ok(Admitted::Held)
       }
@@ -1189,6 +1206,45 @@ pub struct EntryHasher {
 }
 
 impl EntryHasher {
+  /// A hasher seeded with an entry's place, made by `owner` for `object`, and a payload of `payload_len` bytes.
+  fn seeded(
+    (owner, object): (HostId, ObjectId),
+    (position, epoch, previous): (u64, HostEpoch, Identity),
+    payload_len: usize,
+  ) -> Result<EntryHasher, LiveError> {
+    let length = u32::try_from(payload_len).map_err(|_| LiveError::Malformed)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&owner.0.to_le_bytes());
+    hasher.update(&object.0);
+    hasher.update(&position.to_le_bytes());
+    hasher.update(&epoch.0.to_le_bytes());
+    hasher.update(&previous);
+    hasher.update(&length.to_le_bytes());
+    Ok(EntryHasher {
+      hasher,
+      position,
+      previous,
+      epoch,
+      length: payload_len,
+      fed: 0,
+    })
+  }
+
+  /// A hasher of a received `entry`'s identity, seeded with its place, for a holder that feeds its payload a slice a
+  /// turn and checks it with [`Replica::check_identified`] (A-757 part 4).
+  pub fn of(entry: &Entry) -> Result<EntryHasher, LiveError> {
+    EntryHasher::seeded(
+      (entry.owner, entry.object),
+      (entry.position, entry.epoch, entry.previous),
+      entry.payload.len(),
+    )
+  }
+
+  /// The identity once every payload byte was fed in order; `None` before.
+  pub fn finish(self) -> Option<Identity> {
+    (self.fed == self.length).then(|| *self.hasher.finalize().as_bytes())
+  }
+
   /// Feeds the next `bytes` of the payload, in order.
   pub fn feed(&mut self, bytes: &[u8]) {
     self.hasher.update(bytes);
@@ -1586,22 +1642,11 @@ impl Shipper {
   /// canonical bytes cannot carry.
   pub fn entry_hasher(&self, payload_len: usize) -> Result<EntryHasher, LiveError> {
     let (position, previous) = self.next_link()?;
-    let length = u32::try_from(payload_len).map_err(|_| LiveError::Malformed)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&self.owner.0.to_le_bytes());
-    hasher.update(&self.object.0);
-    hasher.update(&position.to_le_bytes());
-    hasher.update(&self.epoch.0.to_le_bytes());
-    hasher.update(&previous);
-    hasher.update(&length.to_le_bytes());
-    Ok(EntryHasher {
-      hasher,
-      position,
-      previous,
-      epoch: self.epoch,
-      length: payload_len,
-      fed: 0,
-    })
+    EntryHasher::seeded(
+      (self.owner, self.object),
+      (position, self.epoch, previous),
+      payload_len,
+    )
   }
 
   /// [`Shipper::append_checkpoint_kept`] with the identity `hashed` hashed over `payload` in turns: no hash here. Refused

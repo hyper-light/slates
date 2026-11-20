@@ -3026,7 +3026,12 @@
 >   before, 0.42 to 1.46 us after, each 64 KiB hashing turn 27 to 68 us. **A-757 part 3 (2026-11-20):** a whole entry's
 >   payload is held once, by the shipper, which keeps it past the retained tail and lends it for installs; the volume
 >   holds its own bytes only for an install image: 50 volumes' 2.4 MB whole states at rest, peak RSS 249 MB before, 128
->   MB after (release)); and, after A-347's open, the takeover's
+>   MB after (release). **A-757 part 4 (2026-11-20):** a holder takes a live message over one page on a task of its own,
+>   its entries' identities hashed in slices across turns before the guard, which checks them as given: 2.4 MB in
+>   release, the take turn's guard 0.96 to 1.05 ms before, under 0.1 us after, each 64 KiB slice 27 to 34 us. **Owed
+>   (measured, w-forming's probes, debug under `taskpolicy -b`):** the record-plane coordinator `run_record_plane` held
+>   one poll 312 ms of CPU; the rest of `serve_peer_records` 76 to 179 ms (now outside the live entries); a takeover's
+>   `make_taken` 46 ms; one forwarded `Telemetry` verb 415 ms of wall); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is

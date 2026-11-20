@@ -56615,6 +56615,17 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   live_chaos fresh-member flow (2/2) send installs from the lent payload.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
+- **Part 4 (the holder's take turn).** A holder hashed each entry it took in the turn that took it (`Replica::check`,
+  twice for a duplicate): up to 179 ms of a debug holder's CPU in one poll of `serve_peer_records` under
+  `taskpolicy -b`. A live message over one page (`live_ship::hashed_in_turns`) now runs on a task of its own after its
+  claim is admitted: `serve_entries_hashed` decodes it within the admitted bound, feeds each entry's canonical bytes to
+  `EntryHasher::of` in slices sized to the quantum left (`piece_bytes`), yielding once the quantum is spent (counted
+  `fleet.live.held_hash_turns`), then takes the entries through `serve_taken` with `Replica::check_identified`; a
+  request the bound or the decode refuses is answered by the old path. The owner sends a holder's next message only once
+  this one is answered, so entries stay in order. Release, 2.4 MB: the guard 0.96 / 1.05 ms best / median hashing, 0 /
+  41 ns given the identity; each 64 KiB slice 27 / 34 us (`measure_the_holders_take_turn`). Tests:
+  `a_holder_hashing_an_entry_in_slices_admits_what_the_hashing_guard_admits`; the fleet large-delta test holds the
+  holders to at least a page a turn under the cut quantum, red before (0 turns).
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
 

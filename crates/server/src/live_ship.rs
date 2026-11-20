@@ -3012,6 +3012,8 @@ const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
 /// Counter: one turn of a whole entry's sealing ([`advance_whole_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_WHOLE_BUILD_TURNS: &str = "fleet.live.whole_build_turns";
+/// Counter: the turns a holder hashed a large live message's entries in before taking them (A-757 part 4).
+const LIVE_HELD_HASH_TURNS: &str = "fleet.live.held_hash_turns";
 /// Counter: the large deltas sealed and hashed in turns of a build of their own (A-757 part 2b).
 const LIVE_DELTA_BUILDS: &str = "fleet.live.delta_builds";
 /// Counter: the turns a whole build hashed its entry's identity in (A-757 part 2), a slice of the payload a turn.
@@ -4851,9 +4853,13 @@ pub(crate) fn serve_entry(
   request: &[u8],
 ) -> Vec<u8> {
   let epoch = slates_db::live::epoch_of(request);
-  serve_taken(state, (local, peer), (request, epoch), |request, bound| {
-    Entry::decode(request, bound).map(|entry| vec![entry])
-  })
+  serve_taken(
+    state,
+    (local, peer),
+    (request, epoch),
+    |request, bound| Entry::decode(request, bound).map(|entry| vec![entry]),
+    None,
+  )
 }
 
 /// The one way a candidate takes entries from `peer`, alone ([`serve_entry`]) or as a batch ([`serve_entries`]), so a
@@ -4867,6 +4873,7 @@ fn serve_taken(
   (local, peer): (HostId, HostId),
   (request, epoch): (&[u8], Option<HostEpoch>),
   decode: impl FnOnce(&[u8], usize) -> Result<Vec<Entry>, LiveError>,
+  identities: Option<&[slates_db::live::Identity]>,
 ) -> Vec<u8> {
   let arrived_ns = slates_machine::clock::monotonic_ns();
   let object = slates_db::live::object_of(request);
@@ -4878,7 +4885,7 @@ fn serve_taken(
     }
   };
   let (reply, taken) = match decode(request, bound) {
-    Ok(entries) => take_entries(state, peer, &entries, bound),
+    Ok(entries) => take_entries(state, peer, &entries, bound, identities),
     Err(refusal) => (Err(refusal), 0),
   };
   match &reply {
@@ -4915,8 +4922,14 @@ fn take_entry(
   room: &mut Room<'_>,
   entry: &Entry,
   bound: usize,
+  identity: Option<slates_db::live::Identity>,
 ) -> Result<Option<Head>, LiveError> {
-  match held.replica.check(entry)? {
+  // An identity hashed ahead in the holder's turns (A-757 part 4) is checked as is; else hashed here.
+  let admitted = match identity {
+    Some(identity) => held.replica.check_identified(entry, identity)?,
+    None => held.replica.check(entry)?,
+  };
+  match admitted {
     Admitted::Apply(head) => {
       let whole = entry.payload.first() == Some(&KIND_WHOLE);
       keep(held, room, &entry.payload, bound, whole)?;
@@ -4944,7 +4957,118 @@ pub(crate) fn serve_entries(
     (local, peer),
     (request, epoch),
     slates_db::live::decode_batch,
+    None,
   )
+}
+
+/// Whether a holder takes a live message of `request_len` bytes in turns of its own ([`serve_entries_hashed`]): over one
+/// archive page, as a large delta is built in turns on its owner (A-757 part 2b).
+pub(crate) fn hashed_in_turns(request_len: usize) -> bool {
+  usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES).is_ok_and(|page| request_len > page)
+}
+
+/// A candidate's answer to a large live message from `peer` (one entry, or a batch when `batch`), its entries' identities
+/// hashed in turns of this shard before they are taken (A-757 part 4): decoded within the bound [`admitted`] gives, each
+/// entry's canonical bytes fed to an [`slates_db::live::EntryHasher`] in slices sized to the quantum left at the rate
+/// it measures ([`piece_bytes`], a page to an archive chunk), the task yielding once the quantum is spent, counted
+/// `fleet.live.held_hash_turns`; then taken exactly as [`serve_entry`] and [`serve_entries`] take them, with those
+/// identities. A request [`admitted`] or the decode refuses is answered by that path, as before. Until 2026-11-20 a holder
+/// hashed a large entry in the turn that took it, twice for a duplicate: up to 179 ms of a debug holder's CPU in one poll
+/// of `serve_peer_records` under `taskpolicy -b` (w-forming's probes).
+pub(crate) async fn serve_entries_hashed(
+  local: HostId,
+  peer: HostId,
+  batch: bool,
+  request: Vec<u8>,
+) -> Vec<u8> {
+  let answered_as_before = |request: &[u8]| {
+    state::with_state(|s| {
+      if batch {
+        serve_entries(s, local, peer, request)
+      } else {
+        serve_entry(s, local, peer, request)
+      }
+    })
+    .unwrap_or_default()
+  };
+  let object = slates_db::live::object_of(&request);
+  let Some(Ok(bound)) = state::with_state(|s| admitted(s, local, peer, object)) else {
+    return answered_as_before(&request);
+  };
+  let decoded = if batch {
+    slates_db::live::decode_batch(&request, bound)
+  } else {
+    Entry::decode(&request, bound).map(|entry| vec![entry])
+  };
+  let Ok(entries) = decoded else {
+    return answered_as_before(&request);
+  };
+  let cap = usize::try_from(slates_archive::format::MAX_CHUNK_BYTES)
+    .unwrap_or(usize::MAX)
+    .max(1);
+  let floor = usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES)
+    .unwrap_or(cap)
+    .clamp(1, cap);
+  let turn = || {
+    state::with_state(|s| {
+      s.count(LIVE_HELD_HASH_TURNS, 1);
+      crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(s))
+    })
+    .unwrap_or(0)
+  };
+  let mut rate = (0_u64, 0_u64);
+  let mut quantum = turn();
+  let mut turn_began = slates_rt::futures::now_ns();
+  let mut identities = Vec::with_capacity(entries.len());
+  for entry in &entries {
+    let Ok(mut hasher) = slates_db::live::EntryHasher::of(entry) else {
+      return answered_as_before(&request);
+    };
+    let payload = entry.payload.as_slice();
+    while hasher.fed() < payload.len() {
+      let now = slates_rt::futures::now_ns();
+      if now.saturating_sub(turn_began) >= quantum {
+        slates_rt::futures::yield_now().await;
+        quantum = turn();
+        turn_began = slates_rt::futures::now_ns();
+      }
+      let left = quantum.saturating_sub(slates_rt::futures::now_ns().saturating_sub(turn_began));
+      let fed = hasher.fed();
+      let size = piece_bytes(rate, left, floor, cap);
+      let Some(slice) = payload.get(fed..fed.saturating_add(size).min(payload.len())) else {
+        return answered_as_before(&request);
+      };
+      let slice_began = slates_rt::futures::now_ns();
+      hasher.feed(slice);
+      rate = (
+        rate
+          .0
+          .saturating_add(u64::try_from(slice.len()).unwrap_or(u64::MAX)),
+        rate
+          .1
+          .saturating_add(slates_rt::futures::now_ns().saturating_sub(slice_began)),
+      );
+    }
+    let Some(identity) = hasher.finish() else {
+      return answered_as_before(&request);
+    };
+    identities.push(identity);
+  }
+  let epoch = if batch {
+    slates_db::live::epoch_of_batch(&request)
+  } else {
+    slates_db::live::epoch_of(&request)
+  };
+  state::with_state(|s| {
+    serve_taken(
+      s,
+      (local, peer),
+      (&request, epoch),
+      move |_, _| Ok(entries),
+      Some(&identities),
+    )
+  })
+  .unwrap_or_default()
 }
 
 /// A batch's entries taken in order ([`take_entry`]) until one is not: the head held after the last taken, or the first
@@ -4955,10 +5079,12 @@ fn take_entries(
   peer: HostId,
   entries: &[Entry],
   bound: usize,
+  identities: Option<&[slates_db::live::Identity]>,
 ) -> (Result<Option<Head>, LiveError>, u64) {
   let mut reached = None;
   let mut taken: u64 = 0;
-  for entry in entries {
+  for (index, entry) in entries.iter().enumerate() {
+    let identity = identities.and_then(|identities| identities.get(index).copied());
     let claimed = state.live.claims.get(&entry.object).copied().unwrap_or(0);
     let outcome = {
       let ShardState { live, store, .. } = &mut *state;
@@ -4968,6 +5094,7 @@ fn take_entries(
         &mut room,
         entry,
         bound,
+        identity,
       )
     };
     match outcome {
