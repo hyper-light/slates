@@ -270,18 +270,12 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     })
   }
 
-  fn land_locks(
+  fn land_record(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
-    entries: Vec<slates_svn::lock::LockEntry>,
+    record: slates_svn::commit::record::Record,
   ) -> Option<Result<(), svn_commit::Uncommitted>> {
-    crate::state::with_state(|state| {
-      svn_commit::record(
-        state,
-        (principal, id),
-        slates_svn::commit::record::Record::Locks(entries),
-      )
-    })
+    crate::state::with_state(|state| svn_commit::record(state, (principal, id), record))
   }
 }

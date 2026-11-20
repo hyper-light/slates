@@ -524,17 +524,17 @@ impl SvnStores for Lends {
     )
   }
 
-  fn land_locks(
+  fn land_record(
     &mut self,
     id: RepositoryId,
     _principal: &Principal,
-    entries: Vec<slates_svn::lock::LockEntry>,
+    record: slates_svn::commit::record::Record,
   ) -> Option<Result<(), Unlanded>> {
     if !self.holds(id) {
       return None;
     }
     let mut next = self.created.current.get().clone();
-    Some(match next.apply_lock_entries(&entries) {
+    Some(match next.commit_record(record) {
       Ok(()) => {
         self.created.current.set(Box::leak(Box::new(next)));
         Ok(())

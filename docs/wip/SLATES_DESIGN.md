@@ -15377,8 +15377,10 @@ and export by landing).
 >
 > **Status (2026-11-19, A-702 part 1).** `change-rev-prop` and `change-rev-prop2` are answered as `svnserve` answers a
 > repository with no pre-revprop-change hook ("Repository has not been enabled to accept revision propchanges",
-> 165006), after its checks in its order (`slates_svn::serve::revprops`). The change itself waits on ra_svn running a
-> repository's hooks.
+> 165006), after its checks in its order (`slates_svn::serve::revprops`). Since A-702 part 2 (2026-11-20) the change
+> itself is made: pre-revprop-change, the previous value's check (160049), the revision's properties landed whole as a
+> `Record::RevisionProperties` through the owner's step, then post-revprop-change with the old value, over `svn://` and
+> `svn+ssh://`.
 >
 > **Status (2026-11-19, S4 slice 1, with A-716).** A Subversion text is read through a source its reader is lent
 > (`slates_svn::migration::TextSource`; `WithTexts` pairs the records with one), so the green's content index can
@@ -15873,7 +15875,7 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > out the post-hook, `locks_finished` ends it), so the connection task runs each hook between them. Held to the
 > listener's tests: a refusing pre-lock answered in `svnserve`'s words with no lock held; pre-lock's arguments and
 > token, post-lock's arguments, standard input and failure after `done`; pre- and post-unlock's arguments and standard
-> input. Owed: `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
+> input. The revprop hooks run since A-702 part 2. Owed: DAV's.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -54980,8 +54982,7 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   and the lock verbs' through `vcs_svn::pre_lock_hooks` and `post_lock_hook`. Tests:
   `vcs_ssh::svn::tests::a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`,
   `a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them` (the tunnel driven on a runtime of its own).
-- **Owed.** The SSH edge's signal of the client gone, for a hook's run. The revprop hooks' calls with A-702 part 2
-  (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view.
+- **Owed.** The SSH edge's signal of the client gone, for a hook's run. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view.
 
 ### A-664 live whole builds, part 1 — A push's whole map built in slices after its answer, the submits that need it parked (2026-11-20, w-shared for UI goal 93; main's ruling (a))
 - **Why.** A push that leaves a git green with no map of the version before (its first push, one past a copy) built

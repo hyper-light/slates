@@ -780,8 +780,8 @@
 > standing (`fs-wrap.c`); `slates_svn::serve`'s lock verb is four calls now (`lock_verb`, `lock_judged`, `locks_landed`,
 > `locks_finished`). **Part 3 (same day):** the `svn+ssh://` tunnel runs the same hooks through the same runner
 > (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). Owed: the tunnel's signal of its client
-> gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); the revprop hooks'
-> calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
+> gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); DAV's commit and lock
+> hooks; REPOS as A-645's FSFS-layout view.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
@@ -2017,8 +2017,12 @@
 > A-702 part 1, 2026-11-19 (w-svn): `change-rev-prop` and `change-rev-prop2` answered as `svnserve` answers a
 > repository with no pre-revprop-change hook (165006), after its checks in its order (the previous-value refusal,
 > write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
-> revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
-> its `Record::RevisionProperties` through the owner's step, post-revprop-change.
+> revision held). **Part 2, 2026-11-20 (w-svn):** the change runs pre-revprop-change (165006 where none is configured),
+> its previous value's check (160049) and its `Record::RevisionProperties` through the owner's step with no wait between,
+> then post-revprop-change with the old value, over `svn://` and `svn+ssh://` (`vcs_svn::revision_property_hook`; tests
+> `a_revision_property_change_runs_its_hooks_and_lands_as_svnserve_does`, `..._runs_its_hooks_around_its_record`).
+> `SvnStores::land_locks` became `land_record`. Owed: a recorded stock `svn propset --revprop` session over each scheme
+> (run request for main); DAV's revprop change.
 > S4 slice 1 (with A-716), 2026-11-19 (w-svn): every Subversion text is read through a source its reader is lent:
 > `migration::TextSource` (`text(identity) -> Cow`), `reads::Repository::text` and `commit::drive::Green::text`
 > answering `Cow`, and `migration::WithTexts`, the records with their texts read from any lent source (test
