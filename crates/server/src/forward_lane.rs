@@ -884,9 +884,11 @@ async fn drive_turn(
     }
     Turn::SessionOut => {
       count_miss(peer, missed);
-      if futures::sleep(crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD)
+      // Waits for the session's return (or its link's change) within what is left, then looks again: a pace of a tenth
+      // of a period kept a session handed back just after a look waiting out the rest of it.
+      if crate::fleet::session_returned(&[peer], left_ns)
         .await
-        .is_err()
+        .is_none()
       {
         return Some(None);
       }
