@@ -49,7 +49,7 @@ const DEEP: u64 = 2;
 const FORMAT: ObjectFormat = ObjectFormat::Sha1;
 
 /// Format: the first committer date the histories use, seconds since the epoch.
-const FIRST_DATE: u64 = 1_700_000_000;
+pub(super) const FIRST_DATE: u64 = 1_700_000_000;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Objects as git writes them.

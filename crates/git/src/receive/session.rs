@@ -167,12 +167,26 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
     out: &mut impl Out,
     admission: &mut Admission,
   ) -> Result<Option<Received>, Refusal> {
+    let received = self.decide(judge, admission)?;
+    if let Some(received) = &received {
+      write_report(received, out)?;
+    }
+    Ok(received)
+  }
+
+  /// Decides the checked push through `judge`, writing nothing: what was received, or `None` when
+  /// no push waits checked. The session is done after it. Its answer is [`write_report`]'s, or
+  /// [`super::write_report_held`]'s and [`super::write_report_end`]'s around what git sends after
+  /// its report, `post-receive`'s words (A-665 part 3).
+  pub fn decide<J: Judge + ?Sized>(
+    &mut self,
+    judge: &mut J,
+    admission: &mut Admission,
+  ) -> Result<Option<Received>, Refusal> {
     let State::Checked(checked) = core::mem::replace(&mut self.state, State::Done) else {
       return Ok(None);
     };
-    let received = decide(checked, judge, admission)?;
-    write_report(&received, out)?;
-    Ok(Some(received))
+    decide(checked, judge, admission).map(Some)
   }
 
   /// Whether the push is answered, or was refused.

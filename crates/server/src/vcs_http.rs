@@ -3,10 +3,12 @@
 //! `slates-http-edge`'s engine (A-625 part 1) over its socket; every wait on a client learned per phase ([`waits`]); the
 //! connections served at once and each request's room derived from the shard's budget ([`Bounds`]); and a site that
 //! decides each request ([`Site`]): git's ([`git`]) first, Mercurial's ([`hg`], A-650), and Subversion's ([`svn`],
-//! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, answered by `slates_svn::dav::site`) on the same
-//! edge, the daemon's handing each request to its tool's ([`ToolSites`], A-680 part 2a: Mercurial's for a query naming a
-//! command, as hgweb tells a wire request, git's for every other). A reply's status is `200` unless the exchange names
-//! another as its reply begins ([`Exchange::reply_status`]: a PROPFIND's `207`, or a refusal its body explains).
+//! A-681: its read side's resources, OPTIONS, PROPFIND, GET and HEAD, and the `log-report`, answered by
+//! `slates_svn::dav::site`) on the same edge, the daemon's handing each request to its tool's ([`ToolSites`], A-680
+//! part 2a: Mercurial's for a query naming a command, as hgweb tells a wire request, git's for every other, Git LFS's
+//! among them). A reply's status is `200` unless its route decides it after the body and the exchange names another as
+//! its reply begins ([`Exchange::reply_status`]: Git LFS's answer's, a PROPFIND's `207`, or a refusal its body
+//! explains).
 //!
 //! **The listener** ([`serve`]) is a task on its shard and owns its connections: each is a child task
 //! (`slates_rt::futures::spawn_child`), detached so its slot is given back as soon as it ends, and cancelled and joined
@@ -54,12 +56,12 @@
 //!
 //! **Built since:** the daemon starting an edge (A-625 part 3: its address, the operator's identity, an authenticator
 //! over §4.13's principals and keys, the repositories' lookup on their partitions; `--vcs-http` from the CLI); git's
-//! receive-pack through the push driver on the repository's owner shard (A-654 part 3); Mercurial's site on the daemon's
-//! edge, each repository's served view lent from its store on its owner shard (A-680 part 2a).
+//! upload-pack served from each repository's store on its owner shard, lent from A-662's map by
+//! `crate::vcs_store::upload::ShardStores` (A-682); receive-pack through the push driver on the repository's owner shard
+//! (A-654 part 3); Mercurial's site on the daemon's edge, each repository's served view lent from its store on its
+//! owner shard (A-680 part 2a).
 //!
-//! **Owed** (GAPS, the §4.17 entry): upload-pack's server half
-//! handed the stores (A-615, A-662), which answers `503` until then;
-//! Mercurial's pushes (`unbundle`) through the push driver (A-680 part 2b);
+//! **Owed** (GAPS, the §4.17 entry): Mercurial's pushes (`unbundle`) through the push driver (A-680 part 2b);
 //! Subversion's site handed its stores (each repository's index, green, lock table and authorization file, and a
 //! principal's Subversion user) and its REPORTs, commits and locks (A-681's later parts), which it answers `503` and
 //! `501` until then; Subversion's site composed into the daemon's beside git's and Mercurial's ([`ToolSites`]); the MCP
@@ -79,7 +81,7 @@ use std::task::{Poll, Waker};
 
 use slates_http::head::Head;
 use slates_http::reply::Status;
-use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase};
+use slates_http_edge::connection::{Connection, Decision, Ended, Fields, Next, Phase, StatusMode};
 use slates_http_edge::tls::{HttpsSession, ServingIdentity};
 use slates_rt::TaskId;
 use slates_rt::error::RtError;
@@ -202,16 +204,18 @@ pub(crate) trait Exchange {
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed>;
   /// The request's body has ended.
   async fn body_end(&mut self) -> Result<(), Failed>;
+  /// The reply's status, asked once as the reply begins, after the body has ended and before the reply's fields: `200`
+  /// unless the reply's outcome decides another on a route that decides it after the body ([`StatusMode::AfterBody`]):
+  /// the status Git LFS's answer decided (A-629), a WebDAV `PROPFIND`'s `207` or a refusal its body explains
+  /// (Subversion's site, A-681). A streamed route's is `200`, as git's and Mercurial's services leave theirs; the
+  /// engine fails the request `500` for any other there.
+  fn reply_status(&self) -> Status {
+    Status::OK
+  }
   /// The fields the reply's head carries after the decision's, asked once as the reply begins, after the body has
   /// ended: none unless the reply's outcome decides them, as a Mercurial command's decides its media type (A-650).
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
     Ok(Fields::new())
-  }
-  /// The reply's status, asked once as the reply begins, after the body has ended and before the reply's fields: `200`
-  /// unless the reply's outcome decides another, as a WebDAV `PROPFIND`'s `207` or a refusal its body explains
-  /// (Subversion's site, A-681).
-  fn reply_status(&self) -> Status {
-    Status::OK
   }
   /// Appends the reply's next run to `out`: `true` while more follows, `false` once the reply has ended.
   async fn reply(&mut self, out: &mut Vec<u8>) -> Result<bool, Failed>;
@@ -219,12 +223,15 @@ pub(crate) trait Exchange {
 
 /// How a site answers a request's head.
 pub(crate) enum Answer<E> {
-  /// Serve it: `200` with `fields`, its body to `exchange` and its reply from it; the head alone when `head_only`.
+  /// Serve it: `fields`, its body to `exchange` and its reply from it; the head alone when `head_only`; its status `200`
+  /// or, on a route that decides it after the body, the one `exchange` names ([`Exchange::reply_status`]).
   Serve {
     /// The reply's fields.
     fields: Fields,
     /// Whether the reply is the head alone (`HEAD`).
     head_only: bool,
+    /// When the reply's status is decided (main's ruling, 2026-11-19: per route).
+    status: StatusMode,
     /// The service's exchange.
     exchange: E,
   },
@@ -267,10 +274,12 @@ impl<E> Decided<E> {
       Answer::Serve {
         fields,
         head_only,
+        status,
         exchange,
       } => Answer::Serve {
         fields,
         head_only,
+        status,
         exchange: wrap(exchange),
       },
       Answer::Refuse { status, fields } => Answer::Refuse { status, fields },
@@ -795,7 +804,7 @@ enum Flow {
 /// `overdue` is called, once, and the same work goes on until it ends or its task is reaped (never dropped mid-way, so a
 /// write past its deadline loses no byte it handed the kernel). The work's output and whether it was overdue; refused
 /// only where no deadline can be armed (off a shard).
-async fn awaited<F: Future>(
+pub(crate) async fn awaited<F: Future>(
   work: F,
   deadline_ns: u64,
   mut overdue: impl FnMut(),
@@ -1031,6 +1040,7 @@ impl<S: Site> Parts<S> {
       Answer::Serve {
         fields,
         head_only,
+        status,
         exchange,
       } => {
         self.service = Some(Started {
@@ -1038,7 +1048,11 @@ impl<S: Site> Parts<S> {
           head_only,
           fields_given: false,
         });
-        connection.decide(Decision::Serve { fields, head_only });
+        connection.decide(Decision::Serve {
+          fields,
+          head_only,
+          status,
+        });
       }
       Answer::Refuse { status, fields } => {
         self.service = None;
@@ -1083,7 +1097,7 @@ impl<S: Site> Parts<S> {
   }
 
   /// Passes the service's next reply run to the engine, or the reply's end, then yields: one run a turn. The service's
-  /// reply fields go to the engine first, once, before any of the reply.
+  /// reply status and its reply fields go to the engine first, once, before any of the reply.
   async fn reply(&mut self, connection: &mut Connection) -> Flow {
     let Some(started) = self.service.as_mut() else {
       connection.fail(Status::INTERNAL_SERVER_ERROR);
@@ -1092,6 +1106,12 @@ impl<S: Site> Parts<S> {
     if !started.fields_given {
       started.fields_given = true;
       connection.reply_status(started.exchange.reply_status());
+      // A status the engine refused (another than `200` on a streamed route, or one no reply's content may follow)
+      // failed the request.
+      if connection.phase() != Phase::Reply {
+        self.service = None;
+        return Flow::Go;
+      }
       match started.exchange.reply_fields().await {
         Ok(fields) => connection.reply_fields(fields),
         Err(Failed(status)) => {
