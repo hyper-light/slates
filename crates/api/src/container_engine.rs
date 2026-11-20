@@ -382,6 +382,7 @@ fn ask(runtime: &str, args: &[&str]) -> Result<Vec<u8>, EngineFault> {
 #[cfg(not(unix))]
 fn ask(runtime: &str, args: &[&str]) -> Result<Vec<u8>, EngineFault> {
   use std::io::Read as _;
+  // Shape: one page, 4 KiB on Windows (x86_64 and arm64), as [`answer_cap`] is a page on Unix.
   const CAP: usize = 4096;
   let unreachable = |why: String| EngineFault::Unreachable(Note::new(why));
   let mut child = std::process::Command::new(runtime)
@@ -423,6 +424,7 @@ fn ask(runtime: &str, args: &[&str]) -> Result<Vec<u8>, EngineFault> {
       overran = true;
       break;
     }
+    // Shape: the wait's poll step, small against the observe budget it is bounded by.
     std::thread::sleep(std::time::Duration::from_millis(10));
   }
   let _ = child.wait();
