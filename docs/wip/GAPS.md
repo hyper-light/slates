@@ -1286,6 +1286,11 @@
 > (A-696: `unbundle` over `serve --stdio` through the same driver; stock hg 7.2, macOS arm64, Mac Studio, 1 of 1).
 > Stock hg 7.2's clone over the SSH edge runs (w-interop, 2026-11-20): `stock_hg_clones_over_the_ssh_edge`, an empty
 > repository cloned and pulled, host key checked strictly (macOS arm64, Mac Studio, kiln r3: 1 of 1, fmt clean).
+> **Stock git command matrix (w-interop, 2026-11-20):** `ci/interop/git-matrix.sh SLATES GIT_REPO WORKDIR` runs 27
+> stock git 2.50.1 commands against a real anchor over both edges. On main 9f51d75 (debug build, macOS arm64, Mac Studio):
+> git/git whole (607 MiB pack) kills the daemon on either edge (shard 0 spins 3,559 ms unsliced; git hangs); cut at
+> v1.0.0 (3.4 MB) it pushes, but every non-shallow clone is refused (`upload-pack: the request needs more room than
+> the server admits`) and `fetch --deepen` reports corruption: 4 of 27 pass. Owed to w-git; re-run when they land.
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
 > token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
 > round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
