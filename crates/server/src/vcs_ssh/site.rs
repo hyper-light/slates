@@ -157,6 +157,7 @@ impl<'s> ClientGone<'s> {
   }
 
   /// No client to watch: never gone.
+  #[cfg(test)]
   pub(crate) fn never() -> Self {
     Self { watched: None }
   }

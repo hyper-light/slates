@@ -763,8 +763,11 @@
 > and post-lock or post-unlock once over the paths changed after their answers, its failure after `done`, the locks
 > standing (`fs-wrap.c`); `slates_svn::serve`'s lock verb is four calls now (`lock_verb`, `lock_judged`, `locks_landed`,
 > `locks_finished`). **Part 3 (same day):** the `svn+ssh://` tunnel runs the same hooks through the same runner
-> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). Owed: the tunnel's signal of its client
-> gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); the revprop hooks'
+> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). **A-736 (2026-11-20, w-k90-vendor):**
+> the SSH edge tells a command stepping that its client has gone (`vcs_ssh::site::ClientGone`: the client's bytes taken
+> while the step runs, kept for the session, its end of stream or a reset gone), so a hook's run over SSH ends with
+> its client, git's receive-pack and the tunnel's (which then ends E210002, as `svnserve` ends where its client leaves
+> inside a command). Owed: the revprop hooks'
 > calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on

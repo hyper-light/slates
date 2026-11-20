@@ -13409,9 +13409,10 @@ engine: the verdict, rebase, position mapping, the register).
 > `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
 > with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
 > and `protected_fixtures` 49 of 49, fmt clean). The HTTP edge's signal of a client gone ends a hook's run (A-665 part
-> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended). Each hook's run
+> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended), and the SSH
+> edge's since A-736 (`vcs_ssh::site::ClientGone`, the client's bytes taken while a step runs). Each hook's run
 > is held to the bound it learned on the owner shard and teaches it as it ends (A-665 part 4b, `ShardState::hook_times`).
-> Owed: the read-only attachment; the SSH edge's signal; seals kept as derived data.
+> Owed: the read-only attachment; seals kept as derived data.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -54968,12 +54969,12 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` (a file committed from stock `svn`'s recorded delta);
   `slates-svn` `serve::` and `commit::` (stock `svnserve`'s recorded lock sessions replayed through the four calls).
 - **Part 3 (same day): the `svn+ssh://` tunnel.** `vcs_svn::run_hook` takes a `HookSite`: the listener's connection
-  (its repository's policy read on the owner shard, `ClientGone` its hang-up) or the tunnel's repository policy (no
-  hang-up signal on the SSH edge yet). The tunnel's steps await its hooks: start-commit and pre-commit, post-commit,
+  (its repository's policy read on the owner shard, `ClientGone` its hang-up) or the tunnel's repository policy (its
+  hang-up the SSH edge's signal since A-736). The tunnel's steps await its hooks: start-commit and pre-commit, post-commit,
   and the lock verbs' through `vcs_svn::pre_lock_hooks` and `post_lock_hook`. Tests:
   `vcs_ssh::svn::tests::a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`,
   `a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them` (the tunnel driven on a runtime of its own).
-- **Owed.** The SSH edge's signal of the client gone, for a hook's run. The revprop hooks' calls with A-702 part 2
+- **Owed.** The revprop hooks' calls with A-702 part 2
   (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view.
 
 ### A-664 live whole builds, part 1 — A push's whole map built in slices after its answer, the submits that need it parked (2026-11-20, w-shared for UI goal 93; main's ruling (a))
@@ -55003,4 +55004,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   durably in the submit's transaction (main's ruling: replay reads no clock, the completion settles the owed entry,
   one owed a green); a parked submit's wait bounded by the failover delay as `base_wait`'s is; a push storm that
   restarts a build at every push; a whole map's release sliced; the timing of a large repository's first push by use
+  (main's).
+
+### A-736 — The SSH edge's signal of its client gone ends a hook's run (2026-11-20, w-k90-vendor, kiln goal 90; A-730's owed item, A-665 part 4a, A-651, A-683)
+- **Why.** A hook's run over SSH (git's receive-pack, A-683; Subversion's tunnel, A-730 part 3) ended only at its
+  learned bound or by itself: the SSH edge never learned that its client left, where the HTTP edge's `ClientGone` ends
+  a run once the connection's socket closes (A-665 part 4a).
+- **Change.** `vcs_ssh::site::ClientGone`, handed to each `Command::step` by the edge's loop: the connection's socket
+  watched while the step runs and the loop reads nothing else. An SSH client may still send then (a window adjustment,
+  its channel's EOF or close, a disconnect: encrypted packets the watch cannot read), so the watch takes the client's
+  bytes rather than peeking as the HTTP edge's does: `read_now` once readability says something came (its wait holds
+  no buffer, so a step that drops the watch loses nothing), kept after the bytes already unread and fed to the session
+  after the step as a read's are, at most the one read a connection holds (`READ_BYTES`). The client's end of stream
+  or a reset, behind whatever it sent, is gone; past the room kept the watch asks the kernel's record of the
+  connection once (`TcpStream::peer_closed`), and still there is unknown. git's receive-pack runs its hook with it
+  (`receive::answer_step`); the tunnel's hooks with it through `vcs_svn::HookSite::Tunnel` (`run_svn_hook` takes the
+  gone future; the listener's is A-665's watch of its socket), a run its client left ending the tunnel E210002 with
+  "Network connection closed unexpectedly", as `svnserve` ends where its client leaves inside a command; the tunnel's
+  "does not run this repository's hooks yet" fallback for a missing verdict goes, since only a client gone gives none.
+- **Tests** (macOS arm64, Mac Studio, local, own target, 2026-11-20). `slates-server`
+  `vcs_ssh::tests::g90_a_command_waiting_within_its_step_learns_its_ssh_client_has_gone` (a command waiting within its
+  step over the edge with a stock-shaped client: quiet while the client is there; resolved once it sent its channel's
+  EOF and closed): red with the edge passing no signal (left `(false, false)`), green with the watch. `cargo test
+  --locked -p slates-server --lib -- vcs_ssh vcs_svn vcs_store::upload` 79 of 79; fmt clean.
+- **Owed.** A live push over SSH whose client is killed while its hook runs (main's runs); Windows' build of the edge
   (main's).
