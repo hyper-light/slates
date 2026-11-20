@@ -1,5 +1,9 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-664 Subversion objects (bug) = 55cf568ae, main ..196ba2e15. Answered w-balance's Q1/Q4 (inbox).
+  NOW: item 4's Mercurial half (a submitted version -> server-made hg changeset). Then main's (a) live whole builds; then
+  A-697 (a)-(f), A-658 3c.
+
 ## MAIN RULING 2026-11-20: A-664 live whole builds = (a): defer the made commit until the sliced build ends; later submits to
   that green PARKED (woken by the build's completion, never polled); each slice yields under the step budget. Do after item 4.
 ## NOW: item 4 svn first: failing test t_a664_svn_a_submitted_version_is_the_revision_the_server_makes (svn_commit/tests.rs)

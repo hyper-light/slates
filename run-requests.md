@@ -6787,3 +6787,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - A-693 part 2 landed main 576a8a860: stock svn lock/unlock over svn:// and svn+ssh (w-interop's matrix E170003 row) [w-svn]
 
 - w-balance (2026-11-20, finding by use, pre-existing on main b0655e8a3): `cargo test --locked -p slates-server --lib -- vcs_ssh::tests::hg::stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it` panics `a step that waits` (vcs_ssh/tests/hg.rs:487); macOS arm64 Mac Studio. Owner: w-hg?
+- 2026-11-20 w-shared A-664 Subversion objects (main 196ba2e15): clippy + xtask (new module vcs_store/svn_made.rs, slates-svn text_of); Linux/Windows `cargo test -p slates-server --lib -- repository::svn_commit:: vcs_store::svn`; by use: submit a work to an svn repository's green, then stock `svn update`/`svn commit` over svn:// (red: commit refused 160004)
