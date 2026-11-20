@@ -11125,6 +11125,12 @@ numbers conflict, and the same node made twice converges.
 > `grants`, each shard reading its works and its partition's waiting-landing index, never the landing history; it
 > shows a pending grant and never makes one (R10). Owed: the MCP tool and the SDKs' read.
 
+> **Status (2026-11-20, A-785: held merges in the session log).** A submission an ask policy holds for approval
+> (A-285) needs the human as a collision and a waiting landing do: the work remembers the held increment's identity and
+> paths at its revision (`WorkState::held`), the log marks it `awaiting_approval` and names it under "needs you", and
+> an edit, a submit or a rebase, which moves the revision and so the increment an approval would bind, retires the mark.
+> The log never approves (R10): the launcher's proof does.
+
 > **Status (2026-11-20, A-782: identical told from accepted).** D-27's verdict is accept, identical or conflict, and the
 > submit now says which: an accepted increment whose verdict left no effect (every operation already at the head: pass
 > two's identical spans, an identical create, a remove of what is gone, an identical mode or attribute) is
@@ -57804,3 +57810,18 @@ passed; `-p slates-server --test session_log` 3, `presentations` 10, `mounted_wo
 `works_off_owner` 15, `verdict_pages` 5, `green_checkpoint` 6; `-p slates-client --test merge_identity` 1, `--lib
 session_log` 1; `-p slates-api --lib` 104; `-p slates-mcp --lib` 19; `-p slates-cli --bin slates log_view` 2; `-p
 slates-ipc --test wire_order` 2; `cargo check --workspace --tests --examples` clean (macOS arm64, this Mac, local).
+
+
+### A-785 — A merge held for approval is named in the session log (2026-11-20, w-sessionlog; main's order 15:20 PST, item 3; §4.16, A-285, A-773; R10)
+An ask policy answers a submit `MergeApprovalRequired` and keeps nothing, so a supervisor saw a held merge only in the
+submitting agent's own reply. The work now notes it (`WorkState::held`: the increment's identity, its paths and the
+work's revision then) where its submit settles; `WorkMark::AwaitingApproval` (appended) stands while the work's revision
+does, and `NeedsYou::AwaitingApproval` names it with the collisions and the waiting landings. Approving stays the
+launcher's (`submit_approved` under its proof).
+Applied in the same change to: §4.16 (a status line), GAPS, `crates/ipc` (the mark, its tag published),
+`crates/server` (`note_held`, `HeldMerge`, the mark), `crates/client` (`NeedsYou::AwaitingApproval`), `crates/cli`
+(`log_view`).
+Evidence: `cargo test --locked -p slates-server --test session_log a_merge_held_for_approval_needs_the_human_until_approved`
+red with the note disabled (the log named nothing), green with it; `--test session_log` 4 passed; `-p slates-cli --bin
+slates log_view` 3; `-p slates-client --lib session_log` 1; `-p slates-ipc --test wire_order` 2 (macOS arm64, this
+Mac, local).

@@ -341,3 +341,61 @@ fn an_identical_submission_is_told_from_an_accepted_one() {
   drop(client);
   daemon.stop();
 }
+
+/// Main's order 2026-11-20, item 3 (A-785): a merge an ask policy holds needs the human as a collision and a waiting
+/// landing do. Do: set a green's merge mode to ask; a work submits (held, nothing merged); read the log; approve the
+/// increment under the launcher's proof and read the log again. Expect: the log names the held merge (its work, the
+/// increment's identity and paths) as needing the human, and nothing once it is approved and merged. The log never
+/// approves (R10).
+#[test]
+fn a_merge_held_for_approval_needs_the_human_until_approved() {
+  use slates_client::{PolicySubject, WriteMode, WritePolicy};
+  let (daemon, instance) = daemon("held");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("asking", false).unwrap();
+  let subject = PolicySubject::Volume { volume: green };
+  let (_, version) = client.policy(subject).unwrap();
+  let policy = WritePolicy {
+    merge: WriteMode::Ask,
+    land: WriteMode::Ask,
+    require_signed_merges: false,
+  };
+  client
+    .set_policy(
+      subject,
+      (policy, version),
+      slates_server::landing::policy_proof(&secret, &subject, &policy, version),
+    )
+    .unwrap();
+  let (work, _) = client.create_work(green, "asking-agent").unwrap();
+  client.edit(work, "/f.txt", 0, 0, b"held\n").unwrap();
+  let Submitted::ApprovalRequired { identity, paths } = client.submit(work).unwrap() else {
+    panic!("an asked merge is held for approval");
+  };
+
+  let needs = client.session_log().unwrap().needs_you();
+  assert_eq!(
+    needs,
+    vec![NeedsYou::AwaitingApproval {
+      work,
+      name: "asking-agent".to_owned(),
+      green,
+      identity,
+      paths,
+    }],
+    "the held merge, and only it"
+  );
+
+  let proof = slates_server::landing::merge_approval_proof(&secret, work, &identity);
+  assert_eq!(
+    client.submit_approved(work, &[], identity, proof).unwrap(),
+    Submitted::Accepted(1)
+  );
+  assert!(
+    client.session_log().unwrap().needs_you().is_empty(),
+    "an approved merge needs no one"
+  );
+  drop(client);
+  daemon.stop();
+}

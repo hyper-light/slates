@@ -5821,6 +5821,15 @@ pub enum WorkMark {
     /// The version it committed.
     version: u64,
   },
+  /// Held for approval: the work's merge mode, or its green's, asks (A-285), so its last submission merged nothing and
+  /// waits for the launcher's approval of exactly this increment (A-785). The log shows it and never approves (R10).
+  /// Appended.
+  AwaitingApproval {
+    /// The increment's identity, which the approval binds.
+    identity: [u8; 32],
+    /// The paths the increment changes.
+    paths: u64,
+  },
 }
 
 /// What a checkout changed in its green's base volume (§4.16 A-201): the head's difference from the origin, by

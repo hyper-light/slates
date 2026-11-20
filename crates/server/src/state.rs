@@ -1429,6 +1429,21 @@ pub struct WorkState {
   /// leaves the work open again. Kept in RAM
   /// with the work, as its verdict is; a restart forgets it.
   pub accepted: Option<(u64, bool)>,
+  /// The work's last submission held for approval (A-785, the session log's mark): the increment's identity and paths,
+  /// and the work's `revision` when it was held. It stands while the revision does: an edit, a submit or a rebase moves
+  /// the revision and so the increment an approval would bind. Kept in RAM with the work; a restart forgets it.
+  pub held: Option<HeldMerge>,
+}
+
+/// A work's submission an ask policy holds for approval (A-785; `WorkState::held`).
+#[derive(Clone, Copy, Debug)]
+pub struct HeldMerge {
+  /// The increment's identity, which the approval binds.
+  pub identity: [u8; 32],
+  /// The paths the increment changes.
+  pub paths: u64,
+  /// The work's revision when it was held.
+  pub revision: u64,
 }
 
 /// A work's kept conflicting verdict (§4.16, A-267): its id, which the `Submitted` or `Rebased` reply named, and every
