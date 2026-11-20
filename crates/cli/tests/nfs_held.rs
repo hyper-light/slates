@@ -31,6 +31,8 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
 #[path = "support/recovered.rs"]
 mod recovered;
 

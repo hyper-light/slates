@@ -38,6 +38,8 @@
 
 mod vm;
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
 #[path = "support/recovered.rs"]
 mod recovered;
 
