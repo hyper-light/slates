@@ -2023,6 +2023,35 @@ pub struct ShardReport {
   /// This node's failover estimate (A-363): live on the control shard, which runs the coordinator; elsewhere the
   /// recovery prior alone. Appended.
   pub failover: FailoverReport,
+  /// Each repository this shard owns with an event since it was made here, and its usage (A-724 piece 1's ledger,
+  /// `slates_vcs::usage`): what the share model reads, reported so a load run can see where a shard's time went.
+  /// Appended.
+  pub repositories: Vec<RepositoryUsageReport>,
+}
+
+/// One repository's usage on its owner shard (A-724; `slates_vcs::usage::Usage`), as a shard's report carries it.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryUsageReport {
+  /// The repository's name.
+  pub name: String,
+  /// Intakes (pushes, commits) begun.
+  pub intakes_begun: u64,
+  /// Intakes answered.
+  pub intakes_answered: u64,
+  /// Intake steps run.
+  pub intake_steps: u64,
+  /// The shard clock's nanoseconds those steps ran.
+  pub intake_step_ns: u64,
+  /// Bytes the clients sent for them.
+  pub intake_bytes_in: u64,
+  /// Fetch requests begun.
+  pub fetches_begun: u64,
+  /// The shard clock's nanoseconds fetch steps ran.
+  pub fetch_step_ns: u64,
+  /// The shard clock's nanoseconds at its first event.
+  pub first_ns: u64,
+  /// The shard clock's nanoseconds at its latest event.
+  pub last_ns: u64,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last

@@ -2191,6 +2191,18 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "target_leases": s.target_leases,
     "nfs_calls": s.nfs_calls,
     "registry_attachments": s.registry_attachments,
+    "repositories": s.repositories.iter().map(|r| json!({
+      "name": r.name,
+      "intakes_begun": r.intakes_begun,
+      "intakes_answered": r.intakes_answered,
+      "intake_steps": r.intake_steps,
+      "intake_step_ns": r.intake_step_ns,
+      "intake_bytes_in": r.intake_bytes_in,
+      "fetches_begun": r.fetches_begun,
+      "fetch_step_ns": r.fetch_step_ns,
+      "first_ns": r.first_ns,
+      "last_ns": r.last_ns,
+    })).collect::<Vec<_>>(),
     "telemetry": telemetry.map(telemetry_json),
   })
 }
