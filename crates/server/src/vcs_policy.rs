@@ -530,10 +530,11 @@ impl Segment {
       return to;
     }
     for (depth, (&was, segment)) in from.iter().zip(path).enumerate() {
-      if was && self.takes(segment) {
-        if let Some(slot) = to.get_mut(depth.saturating_add(1)) {
-          *slot = true;
-        }
+      if was
+        && self.takes(segment)
+        && let Some(slot) = to.get_mut(depth.saturating_add(1))
+      {
+        *slot = true;
       }
     }
     to
@@ -1269,16 +1270,21 @@ mod tests {
       svn(&[("/trunk", Effect::Allow), ("/trunk/secret", Effect::Deny)]),
       svn(&[("/trunk/secret", Effect::Deny), ("/trunk", Effect::Allow)]),
     ] {
-      let ask = |path: &str| policy.verdict(path.as_bytes(), &anyone, Right::Submit);
-      assert!(matches!(
-        ask("/trunk/secret/plans.txt"),
-        Verdict::Denied { .. }
-      ));
-      assert!(matches!(ask("/trunk/secret"), Verdict::Denied { .. }));
-      assert!(matches!(ask("/trunk/src/main.c"), Verdict::Allowed { .. }));
-      assert!(matches!(ask("//trunk//src/"), Verdict::Allowed { .. }));
-      assert_eq!(ask("/branches/x"), Verdict::Unruled);
+      assert_the_deeper_rule_decides_beneath_it(&policy, &anyone);
     }
+  }
+
+  /// The expectations of [`the_deepest_subversion_rule_decides`] for one order of its two rules.
+  fn assert_the_deeper_rule_decides_beneath_it(policy: &SvnPolicy, anyone: &Principal) {
+    let ask = |path: &str| policy.verdict(path.as_bytes(), anyone, Right::Submit);
+    assert!(matches!(
+      ask("/trunk/secret/plans.txt"),
+      Verdict::Denied { .. }
+    ));
+    assert!(matches!(ask("/trunk/secret"), Verdict::Denied { .. }));
+    assert!(matches!(ask("/trunk/src/main.c"), Verdict::Allowed { .. }));
+    assert!(matches!(ask("//trunk//src/"), Verdict::Allowed { .. }));
+    assert_eq!(ask("/branches/x"), Verdict::Unruled);
   }
 
   /// A-597 (authz's sequence numbers, and a `**` rule's depth, `authz.c`'s `lookup` and `trim_tree`). Do: deny
@@ -1379,11 +1385,11 @@ mod tests {
 
   /// A generated `Who`: everyone, or entries naming or excepting the principals.
   fn who() -> impl Strategy<Value = Who> {
-    prop_oneof![
-      Just(Who::Anyone),
+    prop::strategy::Union::new([
+      Just(Who::Anyone).boxed(),
       prop::collection::vec(
         (prop::sample::select(PRINCIPALS.to_vec()), any::<bool>()),
-        1..3
+        1..3,
       )
       .prop_map(|entries| {
         Who::AnyOf(
@@ -1398,8 +1404,9 @@ mod tests {
             })
             .collect(),
         )
-      }),
-    ]
+      })
+      .boxed(),
+    ])
   }
 
   /// A generated right.
@@ -1572,12 +1579,12 @@ mod tests {
       let deepest = (0..=path.len())
         .rev()
         .find(|&depth| oracle_segments(&pattern, &path[..depth]));
-      if let Some(depth) = deepest {
-        if best.is_none_or(|(best_depth, best_position, _)| {
+      if let Some(depth) = deepest
+        && best.is_none_or(|(best_depth, best_position, _)| {
           (depth, position) > (best_depth, best_position)
-        }) {
-          best = Some((depth, position, *effect));
-        }
+        })
+      {
+        best = Some((depth, position, *effect));
       }
     }
     match best {

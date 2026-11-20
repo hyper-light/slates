@@ -1746,6 +1746,59 @@ impl Repository {
     })
   }
 
+  /// Every version whose fragments are kept, by green and then version, with the bytes dropping
+  /// them gives back: their content and what their entries are charged (A-724 piece 4): what a repository over its memory share may drop, since a version
+  /// whose fragments are gone is encoded again by the next fetch (A-718), as after a recovery.
+  pub fn kept_fragments(&self, store: &ContentStore) -> Vec<((u64, usize), u64)> {
+    self
+      .chains
+      .iter()
+      .flat_map(|(green, chain)| {
+        chain
+          .versions
+          .iter()
+          .enumerate()
+          .filter_map(move |(version, record)| {
+            let fragments = record.fragments.as_ref()?;
+            let bytes = [&fragments.objects, &fragments.blobs]
+              .into_iter()
+              .map(|kept| {
+                let content = store
+                  .get(&kept.content)
+                  .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                let runs = kept.positions.runs().saturating_add(kept.references.runs());
+                content
+                  .saturating_add(bytes(
+                    kept.placed.len(),
+                    PLACED_BYTES.saturating_add(ORDER_BYTES),
+                  ))
+                  .saturating_add(bytes(runs, RUN_BYTES))
+              })
+              .fold(0u64, u64::saturating_add);
+            Some(((*green, version), bytes))
+          })
+      })
+      .collect()
+  }
+
+  /// Drops `green`'s version `version`'s kept fragments (A-724 piece 4): their content let go and
+  /// the store's charge trued up, so the next fetch encodes the version again (A-718). Whether
+  /// fragments were kept to drop.
+  pub fn drop_fragments(
+    &mut self,
+    store: &mut ContentStore,
+    (green, version): (u64, usize),
+  ) -> Result<bool, StoreRefused> {
+    let Some(fragments) = fragments_slot(&mut self.chains, green, version).and_then(Option::take)
+    else {
+      return Ok(false);
+    };
+    store.release(&fragments.objects.content)?;
+    store.release(&fragments.blobs.content)?;
+    self.recharge(store)?;
+    Ok(true)
+  }
+
   /// What `green`'s version `version` brought, still to encode as its fragments; `None` once they
   /// are kept (A-653 continued (2)).
   pub(super) fn unencoded(

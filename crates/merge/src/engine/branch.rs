@@ -500,12 +500,14 @@ pub struct Lineage {
 #[derive(Debug, Default)]
 pub struct Release {
   maps: GreenRelease,
+  /// The green's content history chunks, whose files' blocks it holds (A-728), given back a chunk a step.
+  history: crate::history::Chunks,
 }
 
 impl Release {
   /// Whether every hold has been given back.
   pub fn is_done(&self) -> bool {
-    self.maps.is_done()
+    self.history.is_released() && self.maps.is_done()
   }
 }
 
@@ -660,21 +662,26 @@ impl Lineage {
     }
     let mut green = self.unseat(handle)?;
     let maps = green.releasing();
+    let history = std::mem::take(&mut green.chunks);
     if let Some(place) = self.seats.get_mut(handle.seat) {
       place.generation = place.generation.saturating_add(1);
     }
     self.free.push(handle.seat);
-    Ok(Release { maps })
+    Ok(Release { maps, history })
   }
 
-  /// One step of `release`: one node's hold given back, the node freed, and its file's block let go, when no other
+  /// One step of `release`: one chunk of its content history given back, its file's block let go when nothing else
+  /// holds it (A-728), or else one node's hold given back, the node freed, and its file's block let go, when no other
   /// member names it. False once every hold is back; refused `Busy` while a member is out, since the arenas are then in
   /// its engine.
   pub fn release_step(&mut self, release: &mut Release) -> Result<bool, LineageRefused> {
     if self.out.is_some() {
       return Err(LineageRefused::Busy);
     }
-    Ok(self.arenas.release_step(&mut release.maps))
+    Ok(
+      release.history.release_step(&mut self.arenas.blocks)
+        || self.arenas.release_step(&mut release.maps),
+    )
   }
 
   /// The members seated.

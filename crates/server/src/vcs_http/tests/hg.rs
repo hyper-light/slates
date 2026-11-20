@@ -304,6 +304,16 @@ fn stranger_may(right: PolicyRight) -> PolicyRule {
   }
 }
 
+/// One case of [`each_step_of_hgwebs_order_refuses_with_its_status`]: the site (`open` or `strict`), the method, the
+/// path, the credentials, and the refusal expected (`None`: served).
+type StepCase = (
+  &'static str,
+  &'static str,
+  &'static str,
+  &'static [&'static str],
+  Option<Status>,
+);
+
 /// AC-HG.9, A-650 part 1: do send `hg` requests that break each step of hgweb's order in turn: a wire command by `PUT`,
 /// a path escaping a slash, no credentials, a repository of no name and one of git's, hgweb's own page, `unbundle` by
 /// `GET`, `unbundle` by `POST` from a stranger who may only read, and a repository whose store this shard does not
@@ -316,7 +326,7 @@ fn stranger_may(right: PolicyRight) -> PolicyRule {
 fn each_step_of_hgwebs_order_refuses_with_its_status() {
   let mut open = site(vec![stranger_may(PolicyRight::Read)]);
   let mut strict = site(Vec::new());
-  let cases: [(&str, &str, &str, &[&str], Option<Status>); 13] = [
+  let cases: [StepCase; 13] = [
     (
       "open",
       "PUT",

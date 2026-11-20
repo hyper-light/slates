@@ -912,6 +912,23 @@ impl Digests {
   }
 }
 
+/// `bytes` as a row names its text (A-664's Subversion objects: a revision the server makes of a submitted version):
+/// its content identity, its MD5 and SHA-1 as the drive keeps them for a text a client sent, and its length.
+///
+/// # Errors
+/// [`DriveRefusal::DigestFailed`] where the digests cannot be made.
+pub fn text_of(bytes: &[u8]) -> Result<Text, DriveRefusal> {
+  let mut digests = Digests::new()?;
+  digests.update(bytes)?;
+  let (md5, sha1) = digests.finish()?;
+  Ok(Text {
+    identity: *blake3::hash(bytes).as_bytes(),
+    md5,
+    sha1,
+    size: u64::try_from(bytes.len()).map_err(|_| DriveRefusal::DigestFailed)?,
+  })
+}
+
 /// The MD5 of `bytes`.
 fn md5_of(bytes: &[u8]) -> Result<[u8; 16], DriveRefusal> {
   let mut digests = Digests::new()?;
