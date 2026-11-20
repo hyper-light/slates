@@ -1,4 +1,4 @@
-name: DIAG w-bugs -- Subversion's fetch measured over svn:// and DAV (not for main)
+name: DIAG w-bugs -- Subversion's fetch measured over svn:// and DAV, sliced, against svnadmin (not for main)
 
 on:
   push:
@@ -58,6 +58,13 @@ jobs:
           echo "$minted" | grep -v '^token:' | sed 's/^/  /' >> "$r"
           id=$(echo "$minted" | sed -n 's/^id: //p'); token=$(echo "$minted" | sed -n 's/^token: //p')
           timed() { local what=$1; shift; local t0=$(python3 -c 'import time; print(time.time())'); "$@" > "$out/$what.txt" 2>&1; local code=$?; echo "$what exit $code $(python3 -c "import time; print(round(time.time() - $t0, 3))") s" >> "$r"; }
+          # The oracle: the same dump loaded by svnadmin, checked out and updated over file://.
+          svnadmin create "$RUNNER_TEMP/local"; svnadmin load -q "$RUNNER_TEMP/local" < "$RUNNER_TEMP/git-1000.dump" > /dev/null 2>&1; echo "svnadmin load exit $?" >> "$r"
+          L=(env "HOME=$RUNNER_TEMP/home" LC_ALL=C svn --non-interactive --config-dir "$RUNNER_TEMP/cfg")
+          lyoungest=$(svnlook youngest "$RUNNER_TEMP/local")
+          "${L[@]}" checkout -q "file://$RUNNER_TEMP/local/trunk" "$RUNNER_TEMP/wc-local" > /dev/null 2>&1; echo "local checkout exit $? youngest $lyoungest" >> "$r"
+          "${L[@]}" checkout -q -r $((lyoungest - 500)) "file://$RUNNER_TEMP/local/trunk" "$RUNNER_TEMP/wc-local-old" > /dev/null 2>&1; echo "local old checkout exit $?" >> "$r"
+          same() { diff -r -q -x .svn "$1" "$2" > "$out/diff-$3.txt" 2>&1; echo "$3 against svnadmin's: diff exit $? ($(wc -l < "$out/diff-$3.txt") lines)" >> "$r"; }
           for edge in svn http; do
             if [ $edge = svn ]; then url="svn://127.0.0.1:$svnport/project/trunk"; user="$id"; else url="http://127.0.0.1:$httpport/project/trunk"; user="slates"; fi
             S=(env "HOME=$RUNNER_TEMP/home" LC_ALL=C svn --non-interactive --no-auth-cache --config-dir "$RUNNER_TEMP/cfg" --username "$user" --password "$token")
@@ -65,8 +72,12 @@ jobs:
             timed "$edge-checkout" "${S[@]}" checkout "$url" "$wc"
             youngest=$("${S[@]}" info --show-item revision "$wc" 2>/dev/null)
             echo "$edge youngest $youngest, files $(find "$wc" -type f -not -path '*/.svn/*' | wc -l)" >> "$r"
+            same "$wc" "$RUNNER_TEMP/wc-local" "$edge-checkout"
             "${S[@]}" update -q -r $((youngest - 500)) "$wc" > /dev/null 2>&1
+            same "$wc" "$RUNNER_TEMP/wc-local-old" "$edge-update-back"
             timed "$edge-update-500" "${S[@]}" update "$wc"
+            same "$wc" "$RUNNER_TEMP/wc-local" "$edge-update-500"
+            "${S[@]}" status "$wc" > "$out/$edge-status.txt" 2>&1; echo "$edge status: $(wc -l < "$out/$edge-status.txt") lines" >> "$r"
             echo "== after $edge" >> "$out/diag.txt"; grep 'diag-svnfetch' "$log" | tail -40 >> "$out/diag.txt"
           done
           "$B" --instance "$inst" status > "$out/status-slates.txt" 2>&1
