@@ -8,8 +8,9 @@
 //! is stored but the layout a reader needs to name a node-revision: its offset in its revision's file and where its
 //! representations lie.
 //!
-//! The format is FSFS format 6 (Subversion 1.8), sharded by 1000, physical addressing, every representation `PLAIN`;
-//! every stock release since 1.8 reads it (`fs.h` `SVN_FS_FS__FORMAT_NUMBER` and the formats it opens). The evidence is
+//! The format is FSFS format 8 (Subversion 1.10), sharded by 1000, physical addressing; a text is the `DELTA`
+//! representation the svn records keep it as (an svndiff of version 2 against its skip-delta base, S4 c2, read in place,
+//! A-645 P3 ruling 3), entries lists and property lists `PLAIN`; every stock release since 1.10 reads it (`fs.h` `SVN_FS_FS__FORMAT_NUMBER` and the formats it opens). The evidence is
 //! Subversion's own writer, read at `libsvn_fs_fs` of the `1.14.x` branch (`d434dc14`): `low_level.c`
 //! (`svn_fs_fs__write_noderev`, `svn_fs_fs__unparse_representation`, `write_change_entry`,
 //! `svn_fs_fs__unparse_revision_trailer`), `id.c` (`svn_fs_fs__id_unparse`) and `structure`. What a revision file
@@ -23,7 +24,7 @@
 //!   directory with no entries has none, as `make_entry` leaves it, but revision 0's root, which
 //!   `svn_fs_fs__create` writes with an empty one.
 //! - The changed paths, sorted by path (`svn_fs_fs__write_changes`), each `<id> <action>-<kind> <text-mod> <prop-mod>
-//!   <path>` and its copy source on the next line, then an empty line; format 6 writes no mergeinfo flag.
+//!   <mergeinfo-mod> <path>` (format 7 and later) and its copy source on the next line, then an empty line.
 //! - The trailer: the root's offset and the changed paths' offset.
 //!
 //! A node or copy identity made in revision R is `<number in base 36>-R`, and the root line's `0`
@@ -52,9 +53,9 @@ use crate::reads::Repository as Source;
 /// Format: `SVN_REPOS__FORMAT_NUMBER` 5 (`repos.h`), a line.
 const REPOSITORY_FORMAT: &[u8] = b"5\n";
 
-/// The filesystem's format file: format 6, sharded.
-/// Format: `fs_fs.c` `write_format` for format 6 with `max_files_per_dir` set; the `addressing` line is format 7's.
-const FILESYSTEM_FORMAT: &[u8] = b"6\nlayout sharded 1000\n";
+/// The filesystem's format file: format 8, sharded, physical addressing.
+/// Format: `fs_fs.c` `write_format` for format 8 with `max_files_per_dir` set and physical addressing.
+const FILESYSTEM_FORMAT: &[u8] = b"8\nlayout sharded 1000\naddressing physical\n";
 
 /// The revisions one shard directory holds.
 /// Format: the `layout sharded 1000` line above (`SVN_FS_FS_DEFAULT_MAX_FILES_PER_DIR`).
@@ -71,6 +72,10 @@ const MIN_UNPACKED: &[u8] = b"0\n";
 /// The next transaction's number, base 36: the view holds no transaction (P2 adds them).
 /// Format: `txn-current`, a base-36 line (`structure`, "Transaction IDs").
 const TRANSACTION_COUNTER: &[u8] = b"0\n";
+
+/// What begins a representation stored as a delta against nothing (format 4 and later): the delta's own bytes follow.
+/// Format: `REP_DELTA` and a line feed (`low_level.c` `svn_fs_fs__write_rep_header`).
+const DELTA_SELF: &[u8] = b"DELTA\n";
 
 /// What begins a representation stored whole.
 /// Format: `REP_PLAIN` and a line feed (`low_level.c` `svn_fs_fs__write_rep_header`).
@@ -133,8 +138,10 @@ struct Representation {
   revision: Revision,
   /// The offset of its `PLAIN` line.
   offset: u64,
-  /// Its bytes, header and `ENDREP` apart; a `PLAIN` representation's expanded size too.
+  /// Its bytes, header and `ENDREP` apart: a `PLAIN` representation's text, a `DELTA` one's svndiff.
   size: u64,
+  /// The bytes it stands for: a text's length, a `PLAIN` representation's own size.
+  expanded: u64,
   /// The MD5 of its bytes.
   md5: [u8; 16],
   /// A text's SHA-1 and its uniquifier's number within its revision.
@@ -164,6 +171,41 @@ enum Segment {
     /// Its length.
     size: u64,
   },
+  /// A text's delta as the records keep it ([`TextDeltas`]), read in place.
+  Delta {
+    /// The text's content identity.
+    identity: ContentIdentity,
+    /// The delta's length.
+    size: u64,
+  },
+}
+
+/// A text's delta as the svn records keep it (S4 c2): an svndiff of version 2 against the text of its node's skip-delta
+/// predecessor, or against nothing for a first version -- FSFS 1.10's own representation, so the view names it as a
+/// `DELTA` representation and reads its bytes where they are kept, never making the text (A-645 P3, main's ruling 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredDelta<'a> {
+  /// The text it is against; none for a delta against nothing.
+  pub base: Option<ContentIdentity>,
+  /// Its svndiff bytes.
+  pub bytes: std::borrow::Cow<'a, [u8]>,
+}
+
+/// Where the view reads a text's stored delta.
+pub trait TextDeltas {
+  /// The delta the text `identity` is kept as; none for a text kept whole (one whose bytes a property list holds too),
+  /// which the view writes as a `PLAIN` representation read through [`Source::text`].
+  fn text_delta(&self, identity: &ContentIdentity) -> Option<StoredDelta<'_>>;
+}
+
+impl TextDeltas for crate::migration::Repository {
+  fn text_delta(&self, identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
+    let (base, bytes) = crate::migration::Repository::text_delta(self, identity)?;
+    Some(StoredDelta {
+      base,
+      bytes: std::borrow::Cow::Borrowed(bytes),
+    })
+  }
 }
 
 /// A revision file being made.
@@ -201,6 +243,15 @@ impl Writer {
     Ok(())
   }
 
+  /// Appends a text's stored delta, read in place.
+  fn delta(&mut self, identity: ContentIdentity, size: u64) -> Result<(), ViewRefusal> {
+    self
+      .segments
+      .push((self.length, Segment::Delta { identity, size }));
+    self.length = self.length.checked_add(size).ok_or(ViewRefusal::Overflow)?;
+    Ok(())
+  }
+
   /// Appends a representation the view made whole, `PLAIN` and `ENDREP` around it, and answers where it lies.
   fn representation(
     &mut self,
@@ -211,10 +262,12 @@ impl Writer {
     self.bytes(PLAIN)?;
     self.bytes(bytes)?;
     self.bytes(END_REPRESENTATION)?;
+    let size = u64::try_from(bytes.len()).map_err(|_| ViewRefusal::Overflow)?;
     Ok(Representation {
       revision,
       offset,
-      size: u64::try_from(bytes.len()).map_err(|_| ViewRefusal::Overflow)?,
+      size,
+      expanded: size,
       md5: md5_of(bytes)?,
       shared: None,
     })
@@ -246,7 +299,7 @@ impl RevisionFile {
   ///
   /// # Errors
   /// [`ViewRefusal::MissingText`] when the green no longer holds a text the file names.
-  pub fn read<S: Source + ?Sized>(
+  pub fn read<S: Source + TextDeltas + ?Sized>(
     &self,
     source: &S,
     offset: u64,
@@ -272,6 +325,20 @@ impl RevisionFile {
             .ok_or(ViewRefusal::MissingText)?
         }
       }
+      Segment::Delta { identity, size } => {
+        let delta = source
+          .text_delta(identity)
+          .ok_or(ViewRefusal::MissingText)?;
+        let inner = usize::try_from(inner.min(*size)).map_err(|_| ViewRefusal::Overflow)?;
+        match delta.bytes {
+          std::borrow::Cow::Borrowed(bytes) => {
+            std::borrow::Cow::Borrowed(bytes.get(inner..).unwrap_or_default())
+          }
+          std::borrow::Cow::Owned(bytes) => {
+            std::borrow::Cow::Owned(bytes.get(inner..).unwrap_or_default().to_vec())
+          }
+        }
+      }
     };
     let taken = run.len().min(most);
     out.extend_from_slice(run.get(..taken).unwrap_or_default());
@@ -294,6 +361,9 @@ pub enum Advance {
 pub struct View {
   /// Every node-revision laid out so far.
   placed: BTreeMap<NodeRevisionId, Placed>,
+  /// Where each text's first representation lies: a later node of the same text names it, and a delta names its
+  /// base's.
+  texts: BTreeMap<ContentIdentity, Representation>,
   /// Each laid-out revision's file length.
   lengths: Vec<u64>,
 }
@@ -314,7 +384,7 @@ impl View {
   ///
   /// # Errors
   /// [`ViewRefusal`] when the index or the green contradicts itself.
-  pub fn advance<S: Source + ?Sized>(
+  pub fn advance<S: Source + TextDeltas + ?Sized>(
     &mut self,
     index: &Index,
     source: &S,
@@ -329,10 +399,11 @@ impl View {
       if spent > 0 && spent >= budget {
         return Ok(Advance::More);
       }
-      let (writer, placed) = build(&self.placed, index, source, next)?;
+      let (writer, placed, texts) = build((&self.placed, &self.texts), index, source, next)?;
       spent = spent.saturating_add(placed.len().max(1));
       self.lengths.push(writer.length);
       self.placed.extend(placed);
+      self.texts.extend(texts);
     }
   }
 
@@ -349,7 +420,7 @@ impl View {
   ///
   /// # Errors
   /// [`ViewRefusal::NotLaidOut`] for a revision [`View::advance`] has not reached; otherwise as `advance`.
-  pub fn revision_file<S: Source + ?Sized>(
+  pub fn revision_file<S: Source + TextDeltas + ?Sized>(
     &self,
     index: &Index,
     source: &S,
@@ -358,7 +429,7 @@ impl View {
     if revision >= self.laid_out() {
       return Err(ViewRefusal::NotLaidOut { revision });
     }
-    let (writer, _) = build(&self.placed, index, source, revision)?;
+    let (writer, _, _) = build((&self.placed, &self.texts), index, source, revision)?;
     Ok(RevisionFile {
       segments: writer.segments,
       length: writer.length,
@@ -370,7 +441,7 @@ impl View {
 ///
 /// # Errors
 /// [`ViewRefusal::MissingRevisionProperties`] when the green holds none for it.
-pub fn revision_properties_file<S: Source + ?Sized>(
+pub fn revision_properties_file<S: Source + TextDeltas + ?Sized>(
   source: &S,
   revision: Revision,
 ) -> Result<Vec<u8>, ViewRefusal> {
@@ -422,7 +493,11 @@ pub fn directories(youngest: Revision) -> Vec<String> {
 /// The files beside the revisions of a repository with UUID `uuid` and youngest revision `youngest`: each path
 /// beneath the repository and its bytes.
 pub fn fixed_files(uuid: &[u8], youngest: Revision) -> Vec<(&'static str, Vec<u8>)> {
+  // Format 7 and later keep an instance id on the line after the UUID (`fs_fs.c` `svn_fs_fs__set_uuid`); a view names
+  // its repository's own UUID there, the one instance it presents.
   let mut uuid_line = uuid.to_vec();
+  uuid_line.push(b'\n');
+  uuid_line.extend_from_slice(uuid);
   uuid_line.push(b'\n');
   vec![
     ("format", REPOSITORY_FORMAT.to_vec()),
@@ -441,17 +516,22 @@ pub fn fixed_files(uuid: &[u8], youngest: Revision) -> Vec<(&'static str, Vec<u8
 
 /// Makes revision `revision`'s file against the node-revisions `placed` holds from earlier revisions: the writer and
 /// where each node-revision the revision created lies.
-fn build<S: Source + ?Sized>(
-  placed: &BTreeMap<NodeRevisionId, Placed>,
+fn build<S: Source + TextDeltas + ?Sized>(
+  (placed, texts): (
+    &BTreeMap<NodeRevisionId, Placed>,
+    &BTreeMap<ContentIdentity, Representation>,
+  ),
   index: &Index,
   source: &S,
   revision: Revision,
-) -> Result<(Writer, BTreeMap<NodeRevisionId, Placed>), ViewRefusal> {
+) -> Result<Built, ViewRefusal> {
   let mut nodes = index.created_in(revision)?;
   nodes.sort_by(|first, second| second.created_path().cmp(first.created_path()));
   let mut layout = Layout {
     placed,
     local: BTreeMap::new(),
+    texts,
+    local_texts: BTreeMap::new(),
     index,
     revision,
     writer: Writer::default(),
@@ -469,8 +549,16 @@ fn build<S: Source + ?Sized>(
   layout.changes()?;
   let trailer = format!("{root} {changes_offset}\n");
   layout.writer.bytes(trailer.as_bytes())?;
-  Ok((layout.writer, layout.local))
+  Ok((layout.writer, layout.local, layout.local_texts))
 }
+
+/// A revision's file as [`build`] made it: its writer, where each node-revision it created lies, and where each text it
+/// wrote first lies.
+type Built = (
+  Writer,
+  BTreeMap<NodeRevisionId, Placed>,
+  BTreeMap<ContentIdentity, Representation>,
+);
 
 /// One revision's layout being made.
 struct Layout<'a> {
@@ -478,6 +566,10 @@ struct Layout<'a> {
   placed: &'a BTreeMap<NodeRevisionId, Placed>,
   /// What this revision placed so far.
   local: BTreeMap<NodeRevisionId, Placed>,
+  /// Where earlier revisions wrote each text first.
+  texts: &'a BTreeMap<ContentIdentity, Representation>,
+  /// The texts this revision wrote first.
+  local_texts: BTreeMap<ContentIdentity, Representation>,
   /// The index.
   index: &'a Index,
   /// The revision.
@@ -512,13 +604,17 @@ impl Layout<'_> {
   }
 
   /// Writes `node`'s representations and header, and answers the header's offset.
-  fn node<S: Source + ?Sized>(&mut self, source: &S, node: &Node<'_>) -> Result<u64, ViewRefusal> {
+  fn node<S: Source + TextDeltas + ?Sized>(
+    &mut self,
+    source: &S,
+    node: &Node<'_>,
+  ) -> Result<u64, ViewRefusal> {
     let predecessor = match node.predecessor() {
       Some(id) => Some((self.index.node_revision(id)?, self.placed(id)?)),
       None => None,
     };
     let data = match node.kind() {
-      NodeKind::File => self.file_text(node, predecessor.as_ref())?,
+      NodeKind::File => self.file_text(source, node, predecessor.as_ref())?,
       NodeKind::Directory => self.entries(node, predecessor.as_ref())?,
     };
     let properties = match node.properties() {
@@ -551,9 +647,25 @@ impl Layout<'_> {
     Ok(offset)
   }
 
-  /// A file's text: its predecessor's when equal, otherwise written here.
-  fn file_text(
+  /// Where a text was written first, by this revision or an earlier one.
+  fn text_placed(&self, identity: &ContentIdentity) -> Option<Representation> {
+    // The view's own map counts only what earlier revisions wrote: regenerating this revision finds its own texts there
+    // too, and must write them again where it first did.
+    self.local_texts.get(identity).copied().or_else(|| {
+      self
+        .texts
+        .get(identity)
+        .filter(|placed| placed.revision < self.revision)
+        .copied()
+    })
+  }
+
+  /// A file's text: its predecessor's when equal, the representation a text already has when it has one, otherwise
+  /// its stored delta written here as a `DELTA` representation against its base's (format 8, main's ruling 3), the
+  /// delta's bytes read where the records keep them; a text kept whole (no delta) a `PLAIN` one read through the source.
+  fn file_text<S: Source + TextDeltas + ?Sized>(
     &mut self,
+    source: &S,
     node: &Node<'_>,
     predecessor: Option<&(Node<'_>, Placed)>,
   ) -> Result<Option<Representation>, ViewRefusal> {
@@ -565,19 +677,43 @@ impl Layout<'_> {
     {
       return Ok(at.data);
     }
+    if let Some(placed) = self.text_placed(&text.identity) {
+      return Ok(Some(placed));
+    }
     let offset = self.writer.length;
-    self.writer.bytes(PLAIN)?;
-    self.writer.text(text.identity, text.size)?;
+    let size = match source.text_delta(&text.identity) {
+      Some(delta) => {
+        let size = u64::try_from(delta.bytes.len()).map_err(|_| ViewRefusal::Overflow)?;
+        match delta.base {
+          Some(base) => {
+            let base = self.text_placed(&base).ok_or(ViewRefusal::Unplaced)?;
+            let header = format!("DELTA {} {} {}\n", base.revision, base.offset, base.size);
+            self.writer.bytes(header.as_bytes())?;
+          }
+          None => self.writer.bytes(DELTA_SELF)?,
+        }
+        self.writer.delta(text.identity, size)?;
+        size
+      }
+      None => {
+        self.writer.bytes(PLAIN)?;
+        self.writer.text(text.identity, text.size)?;
+        text.size
+      }
+    };
     self.writer.bytes(END_REPRESENTATION)?;
     let number = self.uniquifier;
     self.uniquifier = number.checked_add(1).ok_or(ViewRefusal::Overflow)?;
-    Ok(Some(Representation {
+    let placed = Representation {
       revision: self.revision,
       offset,
-      size: text.size,
+      size,
+      expanded: text.size,
       md5: text.md5,
       shared: Some((text.sha1, number)),
-    }))
+    };
+    self.local_texts.insert(text.identity, placed);
+    Ok(Some(placed))
   }
 
   /// A directory's entries list: its predecessor's when no child was created or deleted beneath it in this revision,
@@ -676,7 +812,7 @@ impl Layout<'_> {
     Ok(header)
   }
 
-  /// The changed paths and the empty line ending them (`svn_fs_fs__write_changes`, format 6).
+  /// The changed paths and the empty line ending them (`svn_fs_fs__write_changes`, format 8).
   fn changes(&mut self) -> Result<(), ViewRefusal> {
     let mut rows: Vec<_> = self.index.changes(self.revision)?.iter().collect();
     rows.sort_by(|first, second| first.path.as_bytes().cmp(second.path.as_bytes()));
@@ -720,7 +856,7 @@ pub fn transaction_path(name: &str) -> String {
 }
 
 /// The transaction `trial` stands for, named `name` and holding the properties `properties`, made by the changed-path
-/// rows `work` on `trial`'s base: its directory as FSFS format 6 keeps it (`structure`, "Transaction layout"). Each
+/// rows `work` on `trial`'s base: its directory as FSFS format 8 keeps it (`structure`, "Transaction layout"). Each
 /// node-revision it made is a `node.<node>.<copy>` file with the transaction's identities (`_<number>` for one it
 /// made, `t<name>` its place); a text it gave lies in the prototype file and is named `-1 <offset> …`; a property list
 /// it changed is `-1` and a `.props` file; a directory whose entries changed is `-1` and a `.children` file holding
@@ -729,7 +865,7 @@ pub fn transaction_path(name: &str) -> String {
 ///
 /// # Errors
 /// [`ViewRefusal::NotLaidOut`] for a base the view has not reached; otherwise as [`View::advance`].
-pub fn transaction_files<S: Source + ?Sized>(
+pub fn transaction_files<S: Source + TextDeltas + ?Sized>(
   view: &View,
   index: &Index,
   trial: &Trial<'_>,
@@ -864,7 +1000,7 @@ impl Transaction<'_, '_> {
   }
 
   /// Writes `node`'s file, and its property and entries files where it changed them.
-  fn node<S: Source + ?Sized>(
+  fn node<S: Source + TextDeltas + ?Sized>(
     &mut self,
     source: &S,
     node: &Node<'_>,
@@ -918,6 +1054,9 @@ impl Transaction<'_, '_> {
     {
       let at = at.ok_or(ViewRefusal::Unplaced)?;
       return Ok(at.data.as_ref().map(representation_text));
+    }
+    if let Some(placed) = self.view.texts.get(&text.identity) {
+      return Ok(Some(representation_text(placed)));
     }
     let offset = self.writer.length;
     self.writer.bytes(PLAIN)?;
@@ -1060,7 +1199,8 @@ impl Transaction<'_, '_> {
   }
 }
 
-/// Appends changed-path row `row`'s entry, its node-revision `id` (`write_change_entry`, format 6).
+/// Appends changed-path row `row`'s entry, its node-revision `id` (`write_change_entry`, format 7 and later: the
+/// mergeinfo flag after the property flag).
 fn change_line(section: &mut String, id: &str, row: &ChangedPath) -> Result<(), ViewRefusal> {
   let action = match row.action {
     Action::Add => "add",
@@ -1070,10 +1210,11 @@ fn change_line(section: &mut String, id: &str, row: &ChangedPath) -> Result<(), 
   };
   writeln!(
     section,
-    "{id} {action}-{} {} {} {}",
+    "{id} {action}-{} {} {} {} {}",
     kind_text(row.kind),
     row.text.is_some(),
     row.properties.is_some(),
+    row.mergeinfo_modified,
     row.path
   )
   .map_err(|_| ViewRefusal::Overflow)?;
@@ -1103,7 +1244,7 @@ fn id_part(number: u64, revision: Revision) -> String {
   }
 }
 
-/// A representation's line (`svn_fs_fs__unparse_representation`, format 6): revision, offset, size, expanded size and
+/// A representation's line (`svn_fs_fs__unparse_representation`, format 8): revision, offset, size, expanded size and
 /// MD5, and a text's SHA-1 and uniquifier `<transaction>/_<number>`, its transaction named after the revision before.
 fn representation_text(representation: &Representation) -> String {
   let mut text = format!(
@@ -1111,7 +1252,7 @@ fn representation_text(representation: &Representation) -> String {
     representation.revision,
     representation.offset,
     representation.size,
-    representation.size,
+    representation.expanded,
     hex(&representation.md5)
   );
   if let Some((sha1, number)) = representation.shared {
