@@ -179,3 +179,22 @@ consider and respect the devices they're on, and preferable are as zero-alloc as
   - svn 500 MB commit, 6.2 GB peak;
   - 13 in-process daemons each sizing from the whole Windows machine, which hit the commit limit;
   - the daemon's 7.1 GB after an 84 MB hg push.
+
+## STORAGE: CHANGES IN RAM, REPOSITORIES ON DISK (ADA 2026-11-20 ~12:40 PST; a design ruling)
+Ada: "*changes* are kept in ram, and upon grant landed to disk. Full repository content obviously should be kept upon
+disk. Likewise, for git/mercurial/svn storage, while the initial clone should be treated as a unified changeset request,
+that should (given grant) almost automatically be transferred from RAM to disk. We keep *changesets and the changes in
+RAM*. Likewise, using Mantle's K/V store for metadata or even keeping track of changesets more efficiently and durably is
+ideal." And on Mantle's code: "Copy into slates".
+- **Changes live in RAM:** pushes, changesets, works, greens' increments. RAM holds only changes, plus a bounded,
+  learned cache over disk.
+- **A repository's full content lives durably on disk.** Accepted changes reach it by landing under a grant. A
+  repository's grant is standing, so landing is almost automatic. An initial clone or import is one changeset, landed
+  under that grant.
+- **Metadata and changeset tracking live in Mantle's K/V engine,** vendored into slates: refs, names, records, indexes
+  and the identity-to-location map. The engine is Mantle's crates/engine, a RocksDB 11.8.1 port. Its device layer
+  (crates/disk) and chunk store (crates/chunk) come with it.
+- **R1 still holds in spirit:** disk is written only by a landing under a grant. A repository is a landing target.
+- **New VCS storage code reads through one seam:** an in-flight change from RAM, landed content from disk. Owner of the
+  seam, the vendored crates and the store: w-store. Until it lands, keep your designs to that seam; don't build a
+  second store.
