@@ -85,12 +85,14 @@
 //! `update` refusing its own command alone. A protected name's linear history and signed commits are A-644 part 2's own
 //! tests (`git_protect/tests.rs`).
 //!
-//! **Called by** the HTTP site's receive-pack (`vcs_http::git`'s `receive`, A-654 part 3). **Owed** (GAPS' §4.17
-//! entry): the SSH channel's call (g294); a hook's view served as a read-only attachment, the daemon's presenter, with
-//! the edges' signal of a client gone that ends a hook's run and the hooks' learned times (A-665 part 3's remainder); a
-//! push based on an older version (A-664); a principal the policy allows who is not the repository's owner, whom A-635's
-//! append refuses `Forbidden` until its owner check gives way to the policy; push options; review requests
-//! (`refs/for/`); the new versions' pack fragments encoded off the answer's path (item 8); a tag of a tag.
+//! **Called by** the HTTP site's receive-pack (`vcs_http::git`'s `receive`, A-654 part 3) and the SSH site's
+//! (`vcs_ssh`'s `receive`, A-683), each lending the owner shard's state a step at a time through one seam
+//! (`vcs_http::git`'s `ShardLender`). **Owed** (GAPS' §4.17 entry): a hook's view served as a read-only attachment, the
+//! daemon's presenter, with the edges' signal of a client gone that ends a hook's run and the hooks' learned times
+//! (A-665 part 3's remainder); a push based on an older version (A-664); a principal the policy allows who is not the
+//! repository's owner, whom A-635's append refuses `Forbidden` until its owner check gives way to the policy; push
+//! options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (item 8); a
+//! tag of a tag.
 
 use core::convert::Infallible;
 use std::collections::BTreeMap;
@@ -127,7 +129,7 @@ use crate::verbs::to_wire_volume;
 #[cfg(unix)]
 mod hooks;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(unix)]
 pub(crate) use hooks::{HookAnswer, HookCall};

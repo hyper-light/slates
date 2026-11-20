@@ -731,10 +731,10 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
 /// (`--vcs-http 127.0.0.1:0`); make the repository and a token; run the round trip as stock `svn` 1.15 at
 /// `http://127.0.0.1:PORT/project`, the token as Basic's password. Expect: every step as against `svnserve`. Skips
 /// loudly without stock Subversion 1.15. Ignored until it can pass: the edge serves no Subversion site until A-681
-/// (g297: its reads, then its commits); serf sends Basic credentials only after a Basic challenge, which the loopback
-/// edge offers from A-686 (g258); `slates repository create` is A-685 (g305).
+/// (g297: its reads, then its commits); `slates repository create` is A-685 (g305). serf sends Basic credentials only
+/// after a Basic challenge, which the loopback edge offers first, and takes, since A-686 (g258).
 #[test]
-#[ignore = "waits on A-681's reads and commits (g297), A-686 (g258) and A-685 (g305)"]
+#[ignore = "waits on A-681's reads and commits (g297) and A-685 (g305)"]
 fn stock_svn_checks_out_commits_updates_and_logs_over_the_vcs_http_edge() {
   if !stock_svn() {
     eprintln!("skipping stock svn over HTTP: no stock Subversion 1.15 here (svn on the PATH)");
@@ -749,10 +749,10 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_the_vcs_http_edge() {
 /// §4.17.4 item 14's lock session over `http://` (item 7's locks: `LOCK`, `UNLOCK` and the lock discovery `svn`
 /// reads). Do: start the HTTP leg as the HTTP round trip does; run the lock session. Expect: every step as against
 /// `svnserve`. Skips loudly without stock Subversion 1.15. Ignored until it can pass: A-681 (g297) serves `LOCK` and
-/// `UNLOCK` in a part after its reads and commits (A-627 built their bodies over A-602's lock table); A-686 (g258);
-/// A-685 (g305).
+/// `UNLOCK` in a part after its reads and commits (A-627 built their bodies over A-602's lock table); A-685 (g305). The
+/// edge's Basic, offered first and taken on loopback, is built (A-686, g258).
 #[test]
-#[ignore = "waits on A-681's commits, LOCK and UNLOCK (g297), A-686 (g258) and A-685 (g305)"]
+#[ignore = "waits on A-681's commits, LOCK and UNLOCK (g297) and A-685 (g305)"]
 fn stock_svn_locks_and_unlocks_over_the_vcs_http_edge() {
   if !stock_svn() {
     eprintln!(
