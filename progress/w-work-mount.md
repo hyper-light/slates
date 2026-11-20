@@ -19,7 +19,24 @@ Signing: kiln's GIT_CONFIG_* env beats `-c commit.gpgsign=false`; use `git commi
     accepted, conflict; grant lands; landed bytes == oracle; 0.80-0.90 s debug, macOS arm64, this Mac, local.
     Red on f727b9ec4: MNT of a work answered MNT3ERR_NOENT; then land refused "landing a merge volume".
 
-## Next (queue)
+## Main's order 2026-11-20 15:20 (current queue)
+1. NOW lazy base read (mount + landing copy nothing but edits). Red test written: crates/server/tests/mounted_work_cow.rs
+   (uncommitted in ~/slates-work/w-work-mount). RED numbers (debug, this Mac, base 779840fba): 8 mounts over a 64 MiB
+   1024-file green add +548 MB resident (68.5 MB/mount, bound 11 MB); mount made in 34.2 ms median vs 1.6 ms over a
+   16-file green; presenting the green's landing +69 MB. NOTE test-profile attachment cap ~15 per partition: keep
+   mounts <= 14 per test.
+   DESIGN: overlay (VFS base plane) whose host is a new `slates_base::BaseHost::Tree(TreeHost)`: TreeHost holds only
+   handle tables; it answers HostFs only through `TreeHost::lend(&dyn TreeSource)` -> a lens; plain lends refuse
+   typed (BaseUnavailable). Server implements TreeSource over (&Green, version, &WorkFiles) [mount] or (&Green, head)
+   [landing view]. Lens sites: nfs.rs ~392 (with_export, destructure adds `greens`, `works`), fuse.rs ~997, landing,
+   declare_mount. Submit declares from `Volume::diverged()` (base.rs ~948) read through the Overlay with the lens.
+   Old version listing: Green::beneath(head) corrected by changed_between(pin, head) (no files_at walk).
+2. Restart durability of unsubmitted mount writes (red: save, restart, submit, save is there; A-127 anchor segment).
+3. D-O17 multi-span: w-rewrite-ops' minimiser on main 561c655a3, one call site (`changed_span` in mounted_work.rs).
+4. Kernel-mount real-editors variant -> run-requests.md only.
+w-work-cow fixes "first edit copies whole file" at chunk grain in the content layer; tell them files via inbox first.
+
+## Next (queue, older)
 1. PERF GAP (fix next, rule "performance gaps up front"): a mount's seed copies the work's files (O(green) per mounted
    work); the green's landing view copies the head per landing. Shape: a base plane over the Green
    (`slates_vfs::host::HostFs` implemented from `Green::content_ref_at` at the base version) so a mount pays its
