@@ -637,3 +637,44 @@ fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
     assert_kept(state, (repository, root), head, &model);
   });
 }
+
+/// A-626 part 4 (a copy made through a work). Do: submit `/d/a` to a git repository's root green; then submit a work
+/// declaring a copy of `/d` to `/e` from its base, with no other change. Expect: the second version accepted, its map of
+/// git's files built whole (the copy names a tree at its destination alone) and equal to `d/a` and `e/a`, the green
+/// holding `e/a` with `a`'s bytes beside `d/a`, and the copy composed by the green's owner (counted).
+#[test]
+fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let at = git_repository(state, "copied");
+    version(state, at.1, 1, vec![create("/d/a", b"alpha")]);
+    let copy = Op::Declare(WorkOp::Copy {
+      from: "/d".to_owned(),
+      to: "/e".to_owned(),
+      version: None,
+      replace: false,
+    });
+    let second = version(state, at.1, 2, vec![copy]);
+    // The copy names a tree at its destination alone, so its version's map is built whole (`Green::copied_after`), and
+    // equals the files git holds there (A-664's owed copy through a work's whole build).
+    let mut model = Model::new();
+    set(&mut model, "d/a", FileClass::File, b"alpha");
+    set(&mut model, "e/a", FileClass::File, b"alpha");
+    assert_kept(state, at, second, &model);
+    let green = to_db_volume(at.1);
+    let engine = state.greens.get(&green).expect("the green's engine");
+    let held = (
+      engine.content("e/a").map(<[u8]>::to_vec),
+      engine.content("d/a").map(<[u8]>::to_vec),
+    );
+    drop(engine);
+    (
+      second,
+      held,
+      count(state, "merge.work.copy_composed_by_owner"),
+    )
+  });
+  assert_eq!(
+    seen,
+    (2, (Some(b"alpha".to_vec()), Some(b"alpha".to_vec())), 1)
+  );
+}

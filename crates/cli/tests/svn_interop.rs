@@ -641,6 +641,11 @@ fn port_after(lines: &[String], prefix: &str) -> Option<u16> {
   })
 }
 
+/// The svn:// listener's port the daemon named in `lines`; a test fails when it named none.
+fn svn_listener_port(lines: &[String]) -> u16 {
+  port_after(lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port")
+}
+
 /// The HTTP edge's port the daemon named in `lines`; a test fails when it named none.
 fn http_edge_port(lines: &[String]) -> u16 {
   port_after(lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port")
@@ -718,7 +723,7 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   }
   let instance = format!("svn-protocol-{}", std::process::id());
   let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
-  let port = port_after(&lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port");
+  let port = svn_listener_port(&lines);
   let Some(issuer) = issuer_or_skip(issuer, "stock svn over svn://") else {
     return;
   };
@@ -847,7 +852,7 @@ fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
     return None;
   }
   let (anchor, lines, issuer) = start_anchor(instance, &["--vcs-svn", "127.0.0.1:0"]);
-  let port = port_after(&lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port");
+  let port = svn_listener_port(&lines);
   let issuer = issuer_or_skip(issuer, "the revision property tests")?;
   create_repository(instance);
   let (id, token) = minted_token(instance, &issuer);
@@ -905,11 +910,10 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
 /// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`: a repository with no pre-revprop-change hook refuses every
 /// revision property change). Do: over the svn:// listener, with revision 1 committed and no hook configured, change
 /// its `svn:log` with stock `svn propset --revprop` (ra_svn's `change-rev-prop2`). Expect it refused in svnserve's words
-/// (E165006) and the old value kept. Ignored until it can pass: by use (2026-11-20, Mac Studio) the change is taken
-/// (`property 'svn:log' set on repository revision 1`, exit 0); the server's own test sends `change-rev-prop`, which
-/// is refused, and stock svn 1.15 sends `change-rev-prop2`.
+/// (E165006) and the old value kept. Red by use (2026-11-20, Mac Studio) until the listener stopped writing a turn's
+/// trivial authentication request twice: stock svn read the second as the change's answer, a success (`property
+/// 'svn:log' set on repository revision 1`, exit 0), the refusal after it unread.
 #[test]
-#[ignore = "waits on w-svn: change-rev-prop2 with no pre-revprop-change hook is taken, where svnserve refuses E165006"]
 fn a_revision_property_change_without_a_hook_is_refused_as_svnserve_refuses_it() {
   let instance = format!("svn-nohook-{}", std::process::id());
   let Some((_anchor, _scratch, svn, url)) = revprop_leg(&instance) else {

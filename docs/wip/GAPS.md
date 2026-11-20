@@ -65,7 +65,7 @@
 > 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
-> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test BUILT 2026-11-20 (`WorkOp::Copy`, A-626 part 4's work verb; the SDKs', MCP's and the CLI's surfaces for it owed);
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
@@ -1598,6 +1598,14 @@
 > `Forbidden`, a stale set `PolicyChanged`. By use: a pre-revprop-change hook set this way lets stock svn 1.15 change
 > a revision property over svn://. Found by use: with no hook such a change is taken (`change-rev-prop2`), where
 > svnserve refuses E165006; `svn_interop.rs` holds that test ignored for w-svn.
+> The svn matrix sets that hook with the verb and changes revision 1's `svn:log` over svn:// and svn+ssh (rows
+> revprop-hook, revprop-svn, revprop-ssh): 32 of 32 over the reads fixtures' repository and over git/git's last 2,000
+> commits (Mac Studio, debug).
+> **`slates repository branch create|bind|retire` (w-interop, 2026-11-20; A-575, A-685's owed words):** the owner's
+> branch verbs from the command line (`CreateBranch`, `BindBranch`, `RetireBranch`; the client's `create_branch`,
+> `bind_branch`, `retire_branch`). Found by use: a branch the namespace binds is not among the refs git's site serves
+> (`git ls-remote` lists `main` alone after `branch create topic --from main`); `git_interop.rs` holds the by-use test
+> ignored for w-git.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -2093,7 +2101,14 @@
 > then post-revprop-change with the old value, over `svn://` and `svn+ssh://` (`vcs_svn::revision_property_hook`; tests
 > `a_revision_property_change_runs_its_hooks_and_lands_as_svnserve_does`, `..._runs_its_hooks_around_its_record`).
 > `SvnStores::land_locks` became `land_record`. Owed: a recorded stock `svn propset --revprop` session over each scheme
-> (run request for main); DAV's revprop change.
+> (run request for main); DAV's revprop change. **Found by use, same day (w-interop, stock svn 1.15.0 over svn://):**
+> with no pre-revprop-change hook `svn propset --revprop` was answered "property set", exit 0. The listener wrote a
+> turn's output, then wrote it again with the answer of what followed the turn: the change's trivial authentication
+> request twice, the second read by stock svn as the change's success, the 165006 after it unread. Fixed (w-svn): the
+> written output is cleared before what follows the turn (`vcs_svn::step`), which a commit's hooks and landing and a
+> lock verb follow too; the listener's no-hook test sends `change-rev-prop` and `change-rev-prop2` with the policy set
+> and never set and refuses a doubled request; `svn_interop.rs`'s by-use test runs un-ignored. Sibling: Windows'
+> hook stand-in let a change with no pre-revprop-change hook go on; it now answers 165006 too (main's Windows build).
 > S4 slice 1 (with A-716), 2026-11-19 (w-svn): every Subversion text is read through a source its reader is lent:
 > `migration::TextSource` (`text(identity) -> Cow`), `reads::Repository::text` and `commit::drive::Green::text`
 > answering `Cow`, and `migration::WithTexts`, the records with their texts read from any lent source (test
@@ -16904,6 +16919,10 @@ Owed from this measurement:
 - **Windows arm64: the 4–5 ms wait on every open and close of a written file**, all three runs, not on x86_64. The
   daemon's status named no WinFsp event, so no purge round ran, and `fsbench`'s open test (files never written) costs
   1.2 ms an open and close there. Not yet explained: find whose wait it is with the daemon's own timing first.
+  **Not reproduced 2026-11-20 (w-bugs, goal-83 B5; main 137bf3633, diag-w-bugs-b5-4):** 200 opens and closes of a
+  64 KiB file just written, timed in PowerShell on CI's runners, p50 (p90): arm64 slates 229 µs (267), WinFsp's own
+  memfs 186 µs (211), NTFS 68 µs (83); x86_64 slates 93 µs (127), memfs 44 µs (50), NTFS 13 µs (16). The 4–5 ms is gone,
+  most likely with the receiver's later changes (A-212, A-215, A-560); slates stays within 1.3× of memfs on arm64.
 - **macOS: fewer calls per change**, the transport question owed since 2026-10-07.
 - **Linux, quiet: the mutating calls' publication** (about 30 µs a call).
 - **Bare metal:** every cell here is a CI VM; the bare-metal x86_64 reference stays the 2026-10-19 box run (a FUSE create

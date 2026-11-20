@@ -55607,3 +55607,22 @@ control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, 
   `cargo test --locked -p slates-server --lib -- takeover:: fleet::state_log_tests vcs_store:: repository:: git_push::
   vcs_svn lfs:: --test-threads=4` 168 of 168.
 - **Owed.** One git record (a large push's pack) is still one turn (w-git, through the sliced intake).
+
+### A-626 part 4, the work verb — A work declares a copy (`WorkOp::Copy`), and its version holds the copied tree (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** A-626 parts 1 to 3 built the green's copy by reference and its rebase's restatement (`VolumeOp::Copy`,
+  `LoggedOp::Copy`, the owner's composition), but no client could ask a work for one: no `WorkOp` named a copy, so no
+  submitted version held one, and what reads a version's copies (a map's whole build, A-664; a Subversion revision's
+  copy-from rows) had nothing to read.
+- **Change.** `slates_ipc::protocol::WorkOp::Copy { from, to, version, replace }`, appended (wire order published):
+  `from`'s tree as version `version` of the work's green held it (the work's base when none) copied to `to` by
+  reference, replacing what `to` holds when `replace`. `verbs::declare` makes it the deriver's `VolumeOp::Copy`, which
+  the work logs (`LoggedOp::Copy`) and the green's owner composes against the copied tree
+  (`merge.work.copy_composed_by_owner`).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::paths::tests::
+  t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it` (`/d/a` submitted; a work copying `/d` to `/e` from its base:
+  version 2 accepted, its map built whole and equal to `d/a` and `e/a`, the green holding both, composed by the owner
+  once; A-664's owed copy through a work's whole build). `cargo test --locked -p slates-server --lib -- t_a626_p4
+  vcs_store:: verbs:: work_home:: work_log --test-threads=4` 135 of 135; `slates-ipc --test wire_order` published
+  (`WorkOp 10 Copy`); fmt clean.
+- **Owed.** The SDKs' (Python, Node), MCP's and the CLI's surfaces for a copy; Subversion's copy-from rows over it
+  (`vcs_store::svn_made`, next).
