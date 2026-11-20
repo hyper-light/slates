@@ -727,8 +727,8 @@
 > (kiln r392 and r429: both in hg's crash report), then 10 of 10, 52 of 52 and 4 of 4 (r415, r429), fmt clean. g309's
 > stock git round trip with the token as Basic's password in the URL against a real anchor (`git_interop`), its one
 > wait this piece, un-ignored as main merged it in (red there: `fatal: Authentication failed`, g309's kiln r426).
-> Owed: g083's stock-hg round trip over the anchor's edge, once the hg site takes pushes (A-680 part 2b); stock `hg
-> identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
+> g083's stock-hg round trip over the anchor's edge runs un-ignored since A-680 part 2b (the hg site's pushes). Owed:
+> stock `hg identify` gets past the `401` and stops at the site's capabilities, which advertise no `lookup` (7.2 always does;
 > found here, main's); stock svn over the loopback edge (A-681's later parts); the Windows and Linux runs (main's).
 > **A-604 (2026-11-19, g230; piece 14's first part, protocols v0 and v1's codecs):** `slates-git` (`v0`) reads and
 > writes, as stock git 2.50.1 does, the ref advertisement (the capabilities after the first ref's NUL, an empty
@@ -1235,7 +1235,8 @@
 > last wait: the daemon's edge served git's site alone until A-680 part 2a (hg met `404`), and the site's `401`
 > offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
 > first challenge alone), until A-686 put Basic's challenge first and took Basic with the token as password on the
-> loopback edge. The HTTP round trip waits on the hg site's pushes (A-680 part 2b, g303); the SSH one on the pushes
+> loopback edge. The HTTP round trip passes since the hg site's pushes (A-680 part 2b: stock hg 7.2, macOS arm64, Mac
+> Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one waits on the pushes
 > over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
 > (A-679, built) reads as the HTTP site does (A-680).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
