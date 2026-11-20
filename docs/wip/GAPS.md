@@ -59,7 +59,8 @@
 > creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
-> until it ends; a green's first submit's and one past a copy owed, with the owed commit main approved) and a whole
+> until it ends; a green's first submit's and one past a copy BUILT 2026-11-20 too, its commit owed durably,
+> `vcs_store::owed`, made at its build's end from what the submit staged) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
@@ -79,6 +80,15 @@
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. The partition's records shipped a log at a time BUILT (A-636 part 2b): each state log's record of each operation, carrying the operation's identity and spans, held by its holders as a prefix of the log; every server dispatch by the register's class. OWED: a repository's greens placed on its holders at their joins (A-636 part 2b-2), then the server's takeover by the rule, every log of a repository following one successor (2c).
 >
 > **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
+>
+> **A-722 part 1 (2026-11-20, w-git).** BUILT: `Index::adopt`, a fork's runs taken in whole (stale and non-fork
+> refused). Owed: rows staged per push in a fork as objects land, holes tolerated, commit rows and the seal sliced, the
+> moves' admission sliced, the landing adopting the fork, stale re-base, admission by window and post-state; then
+> ruling B's in-pack index.
+>
+> **A-719 part 4 (2026-11-20, w-git; git/git's push of 1,027 refs spun its shard, found by use).** BUILT: a push
+> decided a command a step (`receive::Deciding`, `AnswerState::Deciding`). Owed (A-722): the first append's commit of
+> every object, the moves' admission and the seal still whole; git/git by use.
 >
 > **A-719 part 3 (2026-11-20, w-git).** BUILT: git's push read straight into its quarantine (`git_push::intake`),
 > each object fsck'd as kept, the session holding places not bytes. Owed: the verdicts and the seal a turn at a time;
@@ -112,6 +122,12 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
+> FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
+> resumable, its place a byte offset; `vcs_store::replay_hg_sliced`), and an import's record is written a revision a turn
+> before its landing (`record::Writer`, the import's `Stage::Writing`), where each was one step; `docs/bugs/2026-11-20-
+> a-large-mercurial-import-crash-looped-the-daemon.md`. Owed: a rebuild's replay (`vcs_store::rebuild`, one step still);
+> the record's size itself (S5, A-729: identities, no texts); w-perf's by-use rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -2013,6 +2029,14 @@
 > w-perf): the lenders lend the green's content index as the source, the records keep each text's identity and
 > place without its bytes, the importer's delta base, the export and `svn_commit`'s lookups read through the source,
 > and a rebuild re-holds the texts.
+> A-703, 2026-11-20 (w-svn): ra_svn's `replay` and `replay-range`: `report::drive::replay` drives a revision as
+> `svn_repos_replay2` over `svn_delta_path_driver3` does (copies with their source at or above the low-water mark, a
+> directory copied without it added whole, deltas against the copy's or the previous revision's text), and the
+> connection streams each revision (its readable `revprops` for a range) then `finish-replay`, within its budget.
+> Held to stock `svnserve` 1.15.0's own answers to stock `svnsync synchronize` and `svnrdump dump` of the reads
+> fixtures' repository (`crates/svn/fixtures/replay`, 31 revisions call for call) and six scripted replays. Owed: a
+> live `svnsync`/`svnrdump` over `svn://` against a daemon, compared with `svnsync.dump` and `svnrdump-dump.dump`
+> (main's); a deleted path's readability judged inside a copy (`was_readable`).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
@@ -3454,7 +3478,10 @@
 > every earlier send returned within 481 µs and no request was received after it (diagnostics branch
 > `diag-w-bugs-b3-9`; record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`, "Shown
 > 2026-11-20"). SetInformation's completion runs `CcSetFileSizes` on the sender (`fileinfo.c` 1407, `file.c` 1852), so
-> the one receiver waits on the drive it alone receives for. The fix (a receive never waits on a send) is owed.
+> the one receiver waits on the drive it alone receives for. **Fixed by A-725 (2026-11-20):** a relief receiver with its own journal
+> serves while the primary is held in a send (`crate::inflight::relief`); fsx seed 1 now runs whole over the drive.
+> Open: whether the delete racing a coherent purge above had the same cause (the VM race, rerun with A-725); a relief
+> held in a send of its own is relieved by no one.
 > - WinFsp completes an answered IRP inline, on the thread that sent the answer. `FspVolumeTransact`
 >   (`src/sys/volume.c:1089-1102`) calls `FspIopDispatchComplete` for each answer, and the kind's `FSP_LEAVE_IOC`
 >   (`src/sys/driver.h:289-306`) ends in `IoCompleteRequest` (`src/sys/iop.c:321`).

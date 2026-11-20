@@ -64,7 +64,7 @@ impl Memory for SharedObject {
 }
 
 /// A new unnamed event, initially unsignalled, reset by hand.
-fn new_event(call: &'static str) -> Result<OwnedHandle, WinFspError> {
+pub(crate) fn new_event(call: &'static str) -> Result<OwnedHandle, WinFspError> {
   // SAFETY: no borrowed descriptor or name; the flags are plain values.
   let raw = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
   if raw.is_null() {

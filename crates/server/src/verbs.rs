@@ -9611,8 +9611,7 @@ fn judge_submission(
       // A git repository's green keeps the version's map of paths to git's files and its git trees (A-664 part 3,
       // `vcs_store::paths`), and the version becomes git's commit the server makes, recorded with the version in this
       // transaction and admitted to the repository's store (A-664 part 3, `vcs_store::commits`).
-      crate::vcs_store::paths::advance(state, green_id, version);
-      crate::vcs_store::commits::make(state, green_id, version, &policy.authorship);
+      crate::vcs_store::commits::after_submit(state, green_id, version, &policy.authorship);
       // A Subversion repository's green: the version becomes the revision the server makes of it, recorded in this
       // transaction (A-664's Subversion objects, `vcs_store::svn_made`).
       crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship);
