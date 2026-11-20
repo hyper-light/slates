@@ -832,3 +832,14 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - ~21:50 PST Ada: "Move them in so we can track them." -> asked all 8 headless (w-shared 91, w-unresolved 43, w-forming
   9e, + 2a/94/0c/88/3a = reaper/fed-*) to checkpoint (push, resume steps) and END, so kiln's queued starts get room.
   Check agents_list after: the 7 queued kiln starts from ~21:15 + w-shared starts; stop duplicates; start any missing.
+
+## 2026-11-19 ~21:30 PST — ADA (angry): run them on the Mac Studios; use kiln's move/sync. DONE:
+- Fanout state pushed to branch agents/fanout-state (a102df4de); Studio agents clone it to ~/fanout-state.
+- Started on the Studios (kiln, immediate): w-shared 01a1f76a704977e8a045258115df99be (studio), w-reaper
+  01a1f76a8ab973a0adf5dd90ef4dfb65 (studio-2), w-forming 01a1f76ab3aa702ba2277533722bcfef (studio-3), w-fed-move
+  01a1f76adade74a7a0534764ad891d5c (studio.local-2), w-fed-faults 01a1f76aff04715e8afac92cfc1a9c5f (studio), w-fed-a583
+  01a1f76b2c06751dad5b207270f1eaef (studio-2), w-fed-a503 01a1f76b478a7222bb857421e2cc7c23 (studio-3). They report via kiln
+  summaries (no cross-machine SendMessage).
+- UNRESOLVED-OBJECT GOAL MET (d9f7a795...) + parts (Lineage.tla = A-518; goal 84 audit b2a544735); A-707 05e3a2ddc.
+- hg room bug widened: import refused PastRoom 278,528 B too (w-perf A-710 verb) -> w-hg.
+- WATCH: kiln-queued copies on this Mac (7 from ~21:15 + w-shared x2) -> stop on sight.

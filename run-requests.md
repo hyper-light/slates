@@ -6766,3 +6766,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   NotFound); Linux/Windows lanes. Red would be a join test refused NotFound or a counter test reading volume_counter.
 - 2026-11-19 w-unresolved A-707 (main 05e3a2ddc): `cargo test --locked -p slates-db --test lineage_model` beyond default cases (PROPTEST_CASES=4096) on Linux x86_64/arm64 + clippy -p slates-db --all-targets; red = a violation from reclaim_settled_away (a settled-away copy left fewer than f+1 records at least as new) or an unreached verdict.
 - 2026-11-20 w-git main 0ea7a3304 (A-665 4a/4b): clippy + xtask gates; Linux x86_64/aarch64 and Windows: cargo test -p slates-server --lib -- vcs_http::tests:: vcs_http::git:: git_push:: vcs_hooks::
+- 2026-11-20 w-perf A-710 (main 5c6eb940d): owed (main): clippy -p slates-cli -p slates-client; Linux/Windows runs of `cargo test -p slates-cli --bin slates repository`.

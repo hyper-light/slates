@@ -42,3 +42,7 @@ CARGO_TARGET_DIR ~/.cache/w-interop-target, clone ~/.cache/w-interop/src (delete
   ~/slates-work/w-interop-matrix-land (branch agents/w-interop-matrix-land), one GAPS line, push.
 - Rules now: local runs only for landing, own target ~/.cache/w-interop-local-target JOBS=6; svn not on this Mac
   (not installing without Ada); svn legs on the Studio.
+- LANDED 4a: 003936b3e (git-matrix.sh + GAPS line). Reported.
+- 4b: ci/interop/hg-matrix.sh (25 rows) on branch agents/w-interop-matrix-hg (b6e76c1d0, in worktree
+  ~/slates-work/w-interop-matrix-land, over main 003936b3e). r14 on the Studio: hg's own repo (~/.cache/w-interop/hg-src)
+  cut at 1.0, then whole, binary at main 9f51d75. NEXT: land script + GAPS line, report failures; then svn matrix.

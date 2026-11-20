@@ -22,3 +22,9 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   ~05:00Z; kiln dropped (cert rotation ~05:09Z) before I read it. NEXT: read that log; if it worked, run
   SERVERS="stock slates" RUNS=3 and record; svn's slates side waits on the svn:// listener's repository lookup (A-689).
   Then git once w-git's spin fix lands. Then piece 3 (profile -> ranked plan to main).
+- ~05:30Z hg by use: whole push 413; chunked 2000 and 250 also 413; import refused PastRoom{room:278528}. Reported
+  to main (w-hg owns). A-710 (`slates repository import NAME PATH`) LANDED main 5c6eb940d with hg_scale.sh's slates
+  side (SERVERS, SLATES, PUSH_CHUNK, SLATES_FILL=import). Test: Studio `cargo test -p slates-cli --bin slates
+  repository` 3/3, fmt clean. Studio release binary now at 543606da3 (~/.cache/w-perf-local-target).
+- NEXT: svn slates side (A-695 lookup + CRAM sign-in landed): svn_scale.sh SERVERS/SLATES, fill by
+  `slates repository import project git-5000.dump` (svn), then svn:// checkout/log/commit/update vs svnserve.
