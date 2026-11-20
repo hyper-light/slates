@@ -662,6 +662,7 @@ fn started(
     Ok(ToolCommand::Mercurial(command)) if command.output().0.is_empty() => "session",
     Ok(ToolCommand::Mercurial(_)) => "warned session",
     Ok(ToolCommand::Upload(_)) => "upload-pack",
+    Ok(ToolCommand::Receive(_)) => "receive-pack",
     Err(Unserved) => "not served",
   }
 }
