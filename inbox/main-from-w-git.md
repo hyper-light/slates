@@ -49,3 +49,18 @@
   slates-server --lib git and vcs_store 161 passed.
 - Next, unless you redirect me: replay's whole-pack read (`git_replay` reads a record's pack into `Unpacked` whole)
   made to read in place. The landed half stays with w-store.
+
+## 2026-11-20 ~15:35 — RECOVERY BUG fixed: a thin push's record diverged on replay, and the repository lost its refs (w-git)
+- **LANDED fc8b29c27.**
+- **The bug.** A live push admits a thin pack's waiting deltas (REF_DELTAs to bases outside the pack) last, once the
+  pack is whole, and its record names objects in that admission order. A replay admitted them in pack order and
+  compared the names in order. So whenever a waiting delta wasn't the pack's last object, the replay refused as
+  Diverged, and the whole repository store with it: after a restart, **no refs advertised** (even earlier pushes'
+  refs).
+- Thin pushes are git's normal second-and-later pushes, so this could explain restart-time ref losses seen anywhere.
+- **The fix.** `vcs_store::names_alike` compares a pack record's names as sets (sorted). v1 records keep in-order.
+- **Red first:** `t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` (fixture `update` with its thin
+  delta moved first): before, the rebuild advertised `[]` against `[main]`; now it passes. slates-server --lib git
+  and vcs_store: 163 passed.
+- Next: replay reads its record's pack in place (today `Unpacked` holds every object inflated while the store holds
+  them again: about 600 MiB at the peak of a v1.5.0 record's recovery). The pack-homing question above still stands.
