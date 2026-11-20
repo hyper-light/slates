@@ -14859,6 +14859,21 @@ Identical in the three runs (bytes written 583.2 to 584.6 MiB; footprint 1,453 t
 (the repository records and chain entries the import logged) and its snapshot slots (the partition snapshot). The
 content object holds 2.3 MiB; a green's files are not in it.
 
+## The register by record kind after the svn import (A-746; UI goal 93; 2026-11-20)
+
+- **Machine, build, data and command:** as "The anchor's memory by range" above, with A-746's build: the import, then
+  `slates status --json` until every shard swept (28 requests); the owner shard's `content_ranges`; three runs.
+
+| Owner partition's register | repository records | chain entries | checkpoints | rest | total |
+|---|---|---|---|---|---|
+| log since the last snapshot | 87.5 MiB | 87.4 MiB | 92.2 MiB | 0.1 MiB | 267.2 MiB |
+| last snapshot | 134.9 MiB | 45.7 MiB | 45.2 MiB | 0.0 | 225.8 MiB |
+| both | 222.4 MiB | 133.1 MiB | 137.4 MiB | 0.1 MiB | 493.0 MiB |
+
+Identical in the three runs. In RAM: the log ring 355.2 MiB (the live 267.2 and 88 MiB released at the last snapshot
+and not given back), the snapshot slots 225.8 MiB (the last snapshot, exactly). The arena's prefault reserve 0. Chain
+entries and checkpoints (270.5 MiB) lead repository records (222.4 MiB).
+
 ## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
 
 - **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the
