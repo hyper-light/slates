@@ -211,3 +211,12 @@
 - Run request for main: re-run diag-w-bugs-svnfetch's checkout/update on macos-latest at 1d7a60e1d (svn:// and DAV
   against svnadmin load over file://). Red would be a diff against svnadmin's working copy, or a slice still in
   milliseconds.
+- 2026-11-20, A-751 part 3 landed fd99ab174 (base f2421b5f3): the replay drive and get-file-revs make each window through
+  window_unit, a step at a time; svn:// replay turns and the file-revs streams stop at the quantum. Red with
+  whole-window steps (~3 ms a step), green (none past 500 us); deltas byte for byte the whole-window path's;
+  svnserve sessions unchanged. The timed tests now re-time a step past budget from its state before (a preemption
+  under the suite's load reached 3.6 ms).
+- CI diag-w-bugs-svnfetch-8 (macos-latest, 1d7a60e1d): svn:// and DAV working copies are svnadmin's after the checkout,
+  the update back 500 and the update forward. Most bytes in a slice 9,216 (svn://) / 2,732 (DAV). The longest slice
+  is still 3.2-4.6 ms / 2.7-3.6 ms against a ~2.9 us quantum: the long step is not a window's. Unnamed; naming it
+  needs per-step instrumentation (a diag run).
