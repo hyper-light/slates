@@ -1095,6 +1095,24 @@ impl ChunkStore {
     Ok(open)
   }
 
+  /// The bytes of a sealed extent lent in place from the arena, borrowed, nothing copied (A-727; Ada's ruling of
+  /// 2026-11-20: a read lends a window, it allocates nothing): a chunk in the clear. None for a chunk sealed under the
+  /// cipher (A-99), whose bytes are only ever opened into a caller's buffer (`read_extent_into`), and for a zero extent.
+  pub fn chunk_bytes_lent(&self, extent: &Extent) -> Option<&[u8]> {
+    let ExtentSrc::Chunk { chunk, at } = extent.src else {
+      return None;
+    };
+    let chunk = self.chunk(chunk)?;
+    if chunk.seal.is_some() {
+      return None;
+    }
+    let bytes = self
+      .arena
+      .span(chunk.block, usize::try_from(chunk.len).ok()?)?;
+    let start = usize::try_from(at).ok()?;
+    bytes.get(start..start.checked_add(usize::try_from(extent.len).ok()?)?)
+  }
+
   /// The chunk behind an extent.
   pub fn chunk(&self, handle: Handle<Chunk>) -> Option<&Chunk> {
     self.chunks.get(handle).ok()
