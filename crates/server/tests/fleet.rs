@@ -14445,6 +14445,115 @@ fn a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs() {
   );
 }
 
+/// A-775 (main's item (b), the one-off takeover stall: no survivor served the volume; w-forming's anchor log
+/// `takeover-stall-pr15-run1.log`), §4.8 "Promotion and takeover", §4.10: a live volume whose successor gave it up while
+/// the other holder of its log was away is served once that holder is heard again. Do: three nodes at `f = 1`; on a, a
+/// live-shipped volume written its files; the holder that is not the volume's successor leaves the successor's live
+/// reports and fetches unanswered and goes unheard by it on the probe plane (a holder paused or cut off from it alone);
+/// stop a; once the successor has given the volume up, let the holder answer and be heard. Expect the successor to have
+/// given the volume up, judged it afresh, and to serve it with every file read back. Before, a give-up was final until a
+/// new configuration: the live_chaos fresh-member flow's successor gave up after 22 catalog and 11 quorum waits while
+/// the holder with the log was stopped 3 s, and answered `NotRecovered` for the volume through the fleet wait, the
+/// holder left at fence 1.
+#[test]
+fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is_heard_again() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("heard-again")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let written = write_turn_files(&mut client, id, attachment);
+  drop(client);
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  // Indices once a is stopped and removed.
+  let (at, other) = if successor == hosts[1] {
+    (0, 1)
+  } else {
+    (1, 0)
+  };
+  // The holder leaves the successor's live asks unanswered from the start: nothing asks before the takeover.
+  let silent = daemons[other + 1]
+    .inject_live_silence(&[hosts[at + 1]])
+    .is_ok();
+  daemons.remove(0).stop();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  // Unheard on the probe plane only once the successor adopted the registers, as the chaos flow stopped the holder.
+  let adopted = silent
+    && poll_for_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      readmission_periods(&observed),
+      || Ok(summed_count(&daemons[at], "fleet.takeover.adopted") > 0),
+    );
+  let away = adopted
+    && daemons[at]
+      .inject_probe_deafness(&[hosts[other + 1]])
+      .is_ok();
+  let given_up = away
+    && poll_for_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      promise_wait_periods(&observed).saturating_mul(4),
+      || Ok(summed_count(&daemons[at], "fleet.materialize.given_up") > 0),
+    );
+  let back = daemons[other].inject_live_silence(&[]).is_ok()
+    && daemons[at].inject_probe_deafness(&[]).is_ok();
+  let instance = daemons[at].instance().to_owned();
+  let served = back && poll_status_answers(&observed, &instance, id);
+  let read = turn_files_read_back(&instance, id);
+  let counters = summed_counters(&daemons[at]);
+  let counted = |name: &str| counters.get(name).copied().unwrap_or(0);
+  let (gave_up, judged, silenced) = (
+    counted("fleet.materialize.given_up"),
+    counted("fleet.materialize.judged_afresh"),
+    count_of(
+      &summed_counters(&daemons[other]),
+      "fleet.live.silenced_by_fault",
+    ),
+  );
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a live volume given up while its holder was away: given up {given_up} ({gave_up}), {silenced} answers withheld, \
+     judged afresh {judged}, served {served}, read {read:?}"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write was answered: {written:?}"
+  );
+  assert!(
+    given_up && silenced > 0,
+    "the successor gave the volume up while the holder was away ({silenced} answers withheld)"
+  );
+  assert!(
+    served,
+    "the successor serves the volume once the holder is heard again"
+  );
+  assert!(
+    judged >= 1,
+    "the successor judged the volume afresh ({judged})"
+  );
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the successor: {read:?}"
+  );
+}
+
 /// What the Continuity test saw through the successor: whether it served the volume, its first write's reply, its log's
 /// head (epoch, position) after that write, and whether each file written on the owner read back.
 struct ThroughTheSuccessor {

@@ -57571,3 +57571,28 @@ every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p sla
   green; one token clashing still a conflict; unknown bytes keep the replacement). macOS arm64, this Mac, local.
 - **Owed (main's, §8):** clippy over the new module; the Linux and Windows runs of the two filters above. A mounted Work
   reaches the seal through w-work-mount's journal (A-774), which this serves unchanged.
+
+### A-775 — A taken-over volume given up while its cohorts' members were away is judged afresh once one is heard again (2026-11-20, w-forming; main's order, item (b): the takeover stall with no survivor serving; §4.8 "Promotion and takeover", §4.10; the 2026-11-18 bound, A-304's fresh judgement)
+Applied in the same change to: §4.8's promise-wait paragraph (by this entry: a given-up volume is also judged afresh
+when a cohort member is heard again), GAPS, `docs/bugs/2026-11-20-a-live-volume-given-up-while-its-holder-was-away-was-never-served.md`,
+`crates/server/src/fleet.rs` (`judge_given_up_afresh`, `VolumeWait::waits_on_members`, `give_up_taken_over` keeps the
+volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardState::given_up_volumes`,
+`injected_live_silence`), `crates/server/src/daemon.rs` (`Daemon::inject_live_silence`), `crates/server/src/live_ship.rs`
+(a silenced report or fetch, `fleet.live.silenced_by_fault`), `crates/server/tests/fleet.rs`.
+- **What was there.** Past the failover SLO's worth of attempts without progress a taken-over volume was given up,
+  recorded unrecovered and dropped with its adopted catalog register; only a new configuration judged it afresh. A
+  holder of its log paused about the failover SLO (`live_chaos`'s fresh-member flow stops it 3 s against a 30-period
+  bound) left the volume `NotRecovered` for good once the holder came back with every acknowledged write.
+- **The change.** A volume given up while it waited on its takeover cohorts' members (its live log's holders, its
+  catalog register's or that register's placement's, its content's) keeps its pending record, its adopted catalog
+  register and the incarnation each cohort member was heard at. A member heard alive at a later incarnation has it
+  judged afresh at the next period: its owner shard's `TakeoverIncomplete` record goes, so the verbs on it wait for its
+  materialization again (A-548), and it is pending again with its catalog and its attempts from zero, counted
+  `fleet.materialize.judged_afresh`. A record gone another way (the volume destroyed) or a volume adopted again by a new
+  configuration's round is not taken up. Bounded as the round's own fresh judgement is: once per member's later
+  incarnation, each with the failover SLO's worth of attempts. A green given up is unchanged (its siblings' note in the
+  bug record).
+- **Tests.** `fleet` `a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is_heard_again` (red on
+  main: given up after 23 attempts waiting on its live, unserved through the serve deadline; after: judged afresh once,
+  served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
+  fleet tests unchanged.

@@ -3838,6 +3838,21 @@ impl Daemon {
     })
   }
 
+  /// Test support: leaves unanswered every live phase-one report and log fetch this node, as a holder, is asked by one of
+  /// `askers` (§4.10, A-240; counted `fleet.live.silenced_by_fault`), while it answers everything else: the holder of a
+  /// live log paused or cut off from its successor alone. Replaces any earlier set; an empty `askers` restores full
+  /// service. Installed on every shard; `Ok` once installed, else the first typed refusal.
+  pub fn inject_live_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
+    // On every shard: a holder's copy is answered on the shard that keeps it.
+    for shard in self.shards.iter().copied() {
+      let askers: std::collections::BTreeSet<slates_db::HostId> = askers.iter().copied().collect();
+      self.observe(Some(shard), move |s| {
+        s.injected_live_silence = askers;
+      })?;
+    }
+    Ok(())
+  }
+
   /// The owner's sealed manifest for `object` once its content has placed on its holders (§4.10), read on the shard
   /// that owns it; `Ok(None)` before then or when this node does not own it. A test or an operator reads it to follow
   /// a seal before its head ships.
@@ -5032,6 +5047,7 @@ async fn init_shard(
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
+    injected_live_silence: std::collections::BTreeSet::new(),
     injected_confirmation_withheld: false,
     injected_deaf_session: None,
     injected_discovery_hold: None,
@@ -5106,6 +5122,7 @@ async fn init_shard(
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
     pending_materializations: crate::state::PendingMaterializations::default(),
+    given_up_volumes: std::collections::BTreeMap::new(),
     making_taken_over: std::collections::BTreeMap::new(),
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
