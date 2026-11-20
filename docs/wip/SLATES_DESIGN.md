@@ -14838,7 +14838,10 @@ daemon through the rendezvous, and HTTP is served on loopback. The code is the f
    refusing every push until its view is served; each push's record in A-687's kind, replayed at recovery (A-680 part
    2c, `record::write_push`); owed: the bundle read in slices.
 6. The changesets the server makes (decision 7): agents' works, merged requests, rebases; and rebase on push with
-   pushback (decision 8).
+   pushback (decision 8). Status (A-731): a version a work submits to a line's green is the changeset the server
+   makes of it (`vcs_store::hg_made`, as 7.2's `commit` writes one), recorded in the submit's transaction
+   (`Source::Made`) and its line's head until a push on top is the newer version; merged requests, rebases and
+   pushback owed.
 7. Markers and their exchange; topics as review requests.
 8. Access and hooks: the repository's rules, acl's, the narrow ACL, the admission and observing hooks, the built-in
    ones.

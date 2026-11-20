@@ -100,6 +100,7 @@ use crate::state::ShardState;
 pub(crate) mod commits;
 pub(crate) mod git_encode;
 pub(crate) mod hg_import;
+pub(crate) mod hg_made;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
 pub(crate) mod lfs_record;
@@ -296,6 +297,10 @@ pub(crate) enum Target {
 pub(crate) struct HgStore {
   /// The index.
   pub(crate) index: HgIndex,
+  /// The changeset the server made of each green's newest made version (A-731, `hg_made`): by the green's key, the
+  /// version and the changeset; a green's newest only, so bounded by the repository's greens, and made again by a
+  /// recovery from the made records.
+  pub(crate) made: BTreeMap<u64, (u64, slates_hg::Node)>,
   /// The index's generation (A-720): a number of the shard's, taken afresh whenever the store is made or its index
   /// replaced, so a push's fork made from one index is known stale once another landed ([`VcsStores::generation_of`]).
   pub(crate) generation: u64,
@@ -1567,6 +1572,16 @@ fn replay_hg(
 ) -> Result<u64, ReplayRefused> {
   let replayed = slates_hg::import::record::replay(bytes, &mut store.index, content)
     .map_err(ReplayRefused::Mercurial)?;
+  // A made changeset's record names its green and version (A-731): the made node noted from the record alone.
+  if let Some((green, version, node)) = replayed.made {
+    let newer = store
+      .made
+      .get(&green)
+      .is_none_or(|(held, _)| *held < version);
+    if newer {
+      store.made.insert(green, (version, node));
+    }
+  }
   if replayed.whole {
     Ok(0)
   } else {

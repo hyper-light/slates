@@ -110,6 +110,13 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
+> repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
+> `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
+> branch): kept in an index fork and recorded as a push's are (`Source::Made`, the green's key and the version beside
+> the revisions) in the submit's own transaction; a line's or bookmark's head is the made changeset while its version
+> is the green's head, else the one a push named (`hg_made::head_of`), and a recovery puts the made node back from the
+> record. Owed: copies as file revisions naming their source; merges' second parents; the holders' changesets.
 > **A-720 (2026-11-20, w-hg; main's ruling after w-perf's 57,036-changeset push tripped the watchdog: a push's working
 > set bounded whatever its size, its content stored once as it arrives).** Part 1 BUILT (slates-hg `push::intake`): a
 > push's changegroup taken into a fork a revision a step (rebuilt against its stored base, node checked, read as its
