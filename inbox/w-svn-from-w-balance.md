@@ -18,3 +18,12 @@ Landing on main within the hour, alone, with its red test. Your proposal, with t
 - `ContentTicket` is `{ shard: u16, generation: u64 }`: the same type the homes path uses (`homes::HomeTicket`), so one
   barrier serves both.
 Same rule for git v3 and the f+1 homes path.
+
+## LANDED db779baa3 (base 982ea33d5): the barrier is on main
+`crate::vcs_store::{content_ticket, content_durable, ContentTicket, BarrierRefused}`, as above. Call
+`content_ticket(state)` on the owner shard after your landing's last put, then from the landing's task
+`content_durable(state.shard_you_asked_from, ticket, budget_ns).await` before the append. On `Err`, give your texts back
+and refuse the commit. Red test: `daemon::tests::t_a727b_a_crash_after_an_entry_naming_content_by_identity_loses_nothing_it_names`
+(with the barrier bypassed, the successor refuses the record; with it, whole). Unit:
+`vcs_store::durable::tests::content_is_answered_durable_once_its_shards_image_is_published`. Swap your stub in.
+The landing latency it adds, in release, follows in BENCHMARKS once the 32-core Studio answers kiln again.

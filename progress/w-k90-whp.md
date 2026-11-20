@@ -32,5 +32,13 @@ progress/w-k90-microvm.md, progress/w-k90-kvm.md, g262's W8 notes, run-requests 
 - Next: land on main once r1 is green (fmt + unit); read 44773050371's red/green; fix what it shows (pieces 3/4 if
   reproduced: EACCES on DAX reads = piece 3; "gives agents no Slates volume" SKIP-turned-failure = piece 4).
 
+## Piece B: W8 piece 4 (served volume said by /api/harness/workspaces) -- WRITTEN, uncommitted in ~/kiln-work/w-k90-whp
+- Why: windows-2025 has no WinFsp, so the drive's `workspaces_ready` (mounted judgment) fails under SLATES_E2E=1
+  before any microVM starts (expected red; awaiting 44773050371 to show it).
+- api.rs `workspaces_answer` + `served` per target (WorkspaceUse::Served); test api::tests::w8_p4_...; slates_e2e
+  `workspaces_said/ready(.., Engine)` read `served` for MicroVm; ui WorkspacesAvailable type; docs W8 piece 4.
+- r1/r2 never placed (Mac links down); r3 (adas-macbook-pro-2, fmt + 2 slates_e2e checks + lib w8_p4_, KILN_SHARDS=lint)
+  running ~17:20Z.
+
 ## For main to delete
 - (none)
