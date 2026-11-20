@@ -3784,7 +3784,9 @@
 >   root, remote or labelling stays refused typed. Owed: that profile's live check by use (filed 2026-11-19: `slates
 >   oci-runtime podman` on a rootless Linux host, the container's other ids refused through an unshared mount, and
 >   the hard-link probe through podman, which the rule's `EveryNameServedAtOnce` rests on by mechanism alone); and
->   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured;
+>   Windows, which has no bind (G-mount step 4) until a route into Docker Desktop's VM is measured. **Built 2026-11-20
+>   (A-769, `CONTRACT` = 57):** the export route's judge (`container_engine::export_engine`), asked on every host:
+>   Windows' Docker Desktop over its named pipe is taken, mounting the export from its VM; owed: its run on Windows;
 > - **a volume exported to one client, built 2026-11-19 (A-521, `CONTRACT` = 50; kiln's Kubernetes engine, kiln goal
 >   28e73c34's part 01a1f124, its `docs/agentic.md` W10):** §4.6's export was the command line's (`slates export`) and
 >   the raw client's alone, so a host that drives slates through the library alone (kiln) could not serve a pod's volume
@@ -7315,8 +7317,11 @@
 >   their stock clients' `exit_within` keeps `PATIENCE`, owed: a client waiting on a stock server has no slates tree to
 >   judge beside it. `load_scale` since 2026-11-20: its `eventually` and its wait for an anchor's daemon judged the
 >   same, its 80 s `FLEET_WAIT` gone. `cli/src/verbs.rs`' harness tests since 2026-11-20: one claim on their in-process daemon, its
->   5 s `START_WAIT` retry gone. Owed in `cli/tests`: `winfsp` (Windows-only, ~45 call sites; its own pass), with
->   `recovered::await_recovered`'s wall form; `start_judgment`, `shards`, `winfsp_semantics` and `live_winfsp` since
+>   5 s `START_WAIT` retry gone. `winfsp` since 2026-11-20: its daemon's successor, adoptions, counters and recovered
+>   daemon judged in the daemon's own CPU (`DaemonWatch`, re-aimed at each daemon `status` names); a drive's arrival and
+>   departure, a process's exit and a view following a change held to the observation budget (`KERNEL_WAIT`; owed:
+>   Windows' device-change event for the drive, which needs a window's message loop); the purge race's wedge bound kept;
+>   `recovered::await_recovered`'s wall form removed with its last caller. `start_judgment`, `shards`, `winfsp_semantics` and `live_winfsp` since
 >   2026-11-20, judged on Windows by the anchor's process or the daemon's (the pid its `status` names), since Windows
 >   lists no instance's processes by command line and a tree's children are not listed there; `start_judgment`'s
 >   replacement bound and `winfsp_semantics`' wedge bound (`within_wait`) kept as what those tests prove

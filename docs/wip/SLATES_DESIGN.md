@@ -4571,6 +4571,12 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > Since its third piece (`CONTRACT` = 48) the judge holds rootless podman on its own Linux host too, the profile
 > `a_rootless_container_reads_and_writes_the_volume_through_its_mount` ran through (2026-10-19): the container's root
 > is the user who mounted the volume, so a host runs its container as the container's root over an unshared mount.
+> Since A-769 (2026-11-20, `CONTRACT` = 57, kiln's export route by Ada's ruling) the judge answers a second question
+> for a host whose engine mounts the volume's NFS export as a volume of its own rather than binding a host mount:
+> `container_engine::export_engine` (`slates_bridge_oci::runtime::judge_export`), on every host, Windows' Docker Desktop
+> over its named pipe among them, answering where the engine mounts the export from (`MountsFrom`: the host's kernel,
+> or Docker Desktop's VM at `host.docker.internal`) or a typed refusal (`RootlessCannotMount`, appended). The bind's
+> profiles stay for Slates' own bind form.
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -57350,3 +57356,33 @@ live let a capture's pins go), `crates/vfs/tests/pinned_chunks.rs`.
   read in one turn: 1 turn), `a_whole_capture_in_turns_queues_what_publishes_behind_it_and_lets_its_pins_go` (red: the
   first turn `Done`), `a_capture_dropped_or_forgotten_leaks_no_pin`; `slates-vfs` `pinned_chunks` (red with a pin that
   holds nothing: the overwrite freed the pinned chunk at once).
+
+### A-769 — The export route's judge: whether a container engine mounts a volume's NFS export as a volume of its own, and from where, asked on every host (2026-11-20, w-k90-a520; main's ruling on kiln's export route, Ada's ruling ~09:30 PST; §4.6 A-9, A-520, A-521, A-115, A-184; `CONTRACT` = 57)
+Applied in the same change to: §4.6 (A-520's form through the library: a status line), GAPS (the library's container
+entry), `crates/bridge-oci/src/runtime.rs` (`MountsFrom`, `ExportProfile`, `judge_export`, `ProfileRefusal::
+RootlessCannotMount` appended) and `crates/api/src/container_engine.rs` (`ExportEngine`, `export_engine`, the
+profile's establishment shared by both judges, an `ask` for a host with no Unix pipes to poll, and their tests),
+`crates/api/src/lib.rs` (`CONTRACT` = 57).
+- **Why.** kiln's container engine no longer binds the machine's mount into a container (Ada's ruling, 2026-11-20): the
+  engine mounts the volume's NFS export (`Instance::export`, A-521) as a volume of its own, as kubelet does for kiln's
+  Kubernetes engine. The judge asked only the bind's question, which has no answer on Windows (no host mount is bound
+  into a container there, G-mount step 4), so `engine_profile` refused Windows `Unsupported` before asking any engine,
+  and a Windows runner with Docker Desktop could never run an agent's container though its VM reaches the host's NFS
+  export (Slates' NFS server runs on Windows: A-184).
+- **The question.** Whether the engine can mount the export itself from where it runs, and where that is: a rootful
+  Docker Engine, or podman as root, on its own Linux host from the host's kernel at its loopback; Docker Desktop on
+  macOS (its socket) and on Windows (its named pipe) from its Linux VM, reaching the host's loopback as
+  `host.docker.internal`. No share of the host's folders plays a part, so none of the bind's identity or hard-link
+  rules does: the container runs as the uid the export is bound to, every other id a stranger (A-115). Refused, typed:
+  a rootless engine (`RootlessCannotMount`: the kernel mounts a file system for a process with `CAP_SYS_ADMIN` in its
+  initial user namespace alone), a remapping one (`UserNamespaceUntested`), a labelling one (`SelinuxLabelsUntested`),
+  a remote one (`RemoteEngine`, as before), and any engine on a host not named (`ProfileUntested`).
+- **Rejected.** Removing the bind's profiles with kiln's bind: Slates' own bind form (`slates attach --oci-source`,
+  `slates oci-runtime`, the conformance suite, the transports' report) still uses them, so they go when that form does.
+  Taking the engine's word from `docker info` in kiln itself on Windows: the judge stays one implementation (A-520).
+- **Tests.** Red first, on a copy whose `judge_export` refused every profile: `the_export_route_takes_docker_desktop_
+  on_windows_and_macos_from_its_vm_and_a_rootful_linux_engine_from_the_host` and `the_export_route_refuses_a_rootless_
+  engine_and_an_unnamed_host_typed` failed; green with this change: `cargo test --locked -p slates-api --lib --
+  container_engine contract_history` 10 passed, `cargo test --locked -p slates-bridge-oci` all passed (macOS arm64,
+  Adas-Mac-Studio-4, local). Owed: the Windows `ask`'s run on Windows (main's, §8), and the export route's live run there
+  (kiln's container drive on jupiter, w-k90-containers).
