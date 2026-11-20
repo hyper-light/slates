@@ -1295,6 +1295,8 @@ pub(crate) async fn unbundle(
   (principal, heads, bundle): Pushing<'_>,
   room: &mut Admission,
 ) -> Option<PushOutcome> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::unbundle");
   let fronted = crate::state::with_state(|state| front(state, repository, (heads, bundle), room));
   let unbundle = match fronted.flatten()? {
     Ok(unbundle) => unbundle,
@@ -1345,6 +1347,8 @@ async fn record_sliced(
   forked: &mut Forked,
   room: u64,
 ) -> Option<Result<(), PushOutcome>> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::record");
   if forked.record.is_some() || forked.intaken.logs.is_empty() {
     return Some(Ok(()));
   }
@@ -1488,6 +1492,8 @@ async fn rebase_sliced(
   repository: RepositoryId,
   stale: Forked,
 ) -> Option<Result<Forked, PushOutcome>> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::rebase");
   let begun = crate::state::with_state(|state| begin_rebase(state, repository, stale));
   let mut rebasing = match begun.flatten()? {
     Ok(rebasing) => rebasing,
@@ -1663,6 +1669,8 @@ async fn take_sliced(
   lend: u64,
   room: &mut Admission,
 ) -> Option<Result<Forked, PushOutcome>> {
+  // A-740: a shard stuck in this step names it.
+  let _doing = slates_rt::futures::doing("hg_push::take");
   let begun = crate::state::with_state(|state| begin_intake(state, repository, part, lend, room));
   let mut taking = match begun.flatten()? {
     Ok(taking) => taking,

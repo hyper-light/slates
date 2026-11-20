@@ -950,6 +950,18 @@ impl Supervisor {
       .map(|seen| seen.saturating_sub(self.started_at_ns))
   }
 
+  /// What the running daemon's watchdog found its stuck shard polling when it withheld the beat (A-740), for the kill
+  /// line; none while no daemon runs, or when the record is an earlier daemon's or being written.
+  pub fn stuck_task(&self) -> Option<crate::StuckTask> {
+    let pid = u64::from(self.child_pid()?);
+    self
+      .segment
+      .stuck_task()
+      .ok()
+      .flatten()
+      .filter(|task| task.pid == pid)
+  }
+
   /// Kills the daemon without taking it (the anchor found its heartbeat lapsed, §4.14
   /// `daemon.alive`): the next `step` sees the exit and applies the policy, so a wedged
   /// daemon counts as a failure like a crashed one.

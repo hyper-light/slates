@@ -969,6 +969,8 @@ fn a_spinning_shard_stops_the_beat_role() {
   let running = &*Box::leak(Box::new(AtomicBool::new(true)));
   let spinning = &*Box::leak(Box::new(AtomicBool::new(false)));
   let worker = on_shard(&daemon, other, move || {
+    // A-740: the work the spin is named by, which the watchdog's verdict must name.
+    let _doing = slates_rt::futures::doing(SPINNER);
     spinning.store(true, Ordering::Release);
     let started = Instant::now();
     while running.load(Ordering::Relaxed) && started.elapsed() < backstop * 2 {
@@ -1009,6 +1011,9 @@ fn a_spinning_shard_stops_the_beat_role() {
     }
   }
   let cpu_at_end = Duration::from_nanos(spent().saturating_sub(at_spin));
+  // A-740: the watchdog recorded, before it withheld the beat, the task the shard was polling, for the anchor's kill
+  // line; read before the spin ends, since the record is what the anchor reads at its kill.
+  let stuck = daemon.segment().stuck_task().unwrap();
   running.store(false, Ordering::Relaxed);
   worker.join().unwrap();
   println!(
@@ -1027,8 +1032,18 @@ fn a_spinning_shard_stops_the_beat_role() {
      window of CPU, in {:?})",
     watching.elapsed()
   );
+  let stuck = stuck.expect("the watchdog recorded no stuck task when it withheld the beat");
+  assert_eq!(
+    (stuck.pid, stuck.shard, stuck.label.as_str()),
+    (u64::from(std::process::id()), other.0, SPINNER),
+    "the stuck task the watchdog recorded: {stuck:?}"
+  );
+  assert!(stuck.polls >= 1, "{stuck:?}");
   daemon.stop();
 }
+
+/// Format: the name the spinning test's work carries (A-740), which the watchdog's record must give back.
+const SPINNER: &str = "liveness::spinner";
 
 /// Shape: the CPU the slow poll of [`a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`] runs,
 /// in half budgets: three, half a budget past the one budget of CPU a poll had before A-318, and a whole budget short of
