@@ -500,6 +500,48 @@ fn t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map() {
   assert_eq!(counts, (1, 1, 2));
 }
 
+/// A-664's sliced whole builds (a recovery's remake a file a unit). Do: submit six files to a git repository's root
+/// green; give its map and trees back, as a store made again from the log holds none yet; remake them in a recovery's
+/// slices whose least slice is a nanosecond, polling the build until it ends. Expect: the build yielded between its
+/// files (polled more than once), one unit a file; the head's map equal to its model, remade once.
+#[test]
+fn t_a664_sliced_a_recoverys_whole_build_steps_a_file_a_unit() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let at = git_repository(state, "sliced");
+    let mut model = Model::new();
+    let names = ["/a", "/b", "/c", "/d", "/e", "/f"];
+    let head = version(
+      state,
+      at.1,
+      1,
+      names.map(|name| create(name, b"six")).into(),
+    );
+    crate::vcs_store::paths::forget(state, at.0, to_db_volume(at.1));
+    let mut slices = crate::recovery_slices::RecoverySlices::begin(1);
+    let polls = {
+      let build = super::remake_green_sliced(state, to_db_volume(at.1), &mut slices);
+      let mut build = std::pin::pin!(build);
+      let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+      let mut polls = 1u64;
+      while build.as_mut().poll(&mut context).is_pending() {
+        polls = polls.saturating_add(1);
+      }
+      polls
+    };
+    for name in names {
+      set(
+        &mut model,
+        name.trim_start_matches('/'),
+        FileClass::File,
+        b"six",
+      );
+    }
+    assert_kept(state, at, head, &model);
+    (polls > 1, slices.finish().units, count(state, REMADE))
+  });
+  assert_eq!(seen, (true, 6, 1));
+}
+
 /// The names log's part binding `main` to the root green, as a successor holds it.
 fn main_bound((repository, root): (RepositoryId, VolumeId)) -> slates_db::catalog::StateLogRecord {
   use slates_db::catalog::{LogName, LogSpan, LoggedChange, NameChange, StateLog};

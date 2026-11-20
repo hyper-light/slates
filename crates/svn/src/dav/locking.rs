@@ -875,7 +875,7 @@ fn lock_refused(refusal: &LockRefusal, filesystem: &str) -> HttpAnswer {
 /// `lock.c` `check_lock` 720-815 and `verify_lock` 611-626, `fs-loader.c` `svn_fs_lock_many` 1841-1868, the messages of
 /// `svn_fs_util.h` 133-176. None for the others, which `dav_svn__sanitize_error` gives its own text, and for an expired
 /// lock, whose message names a token the refusal does not carry and which the lock guard never gives.
-fn lock_error_message(refusal: &LockRefusal, filesystem: &str) -> Option<String> {
+pub(crate) fn lock_error_message(refusal: &LockRefusal, filesystem: &str) -> Option<String> {
   match refusal {
     LockRefusal::AlreadyLocked { path, owner } => Some(format!(
       "Path '{path}' is already locked by user '{owner}' in filesystem '{filesystem}'"

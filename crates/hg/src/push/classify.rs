@@ -323,11 +323,79 @@ struct Graph<'v, V> {
   phases: Vec<Phase>,
 }
 
+/// A changeset a push brought, as classifying reads it: its node, its parents, and its branch and whether it closes
+/// it, read from its text ([`Arrived`]) or as its index row keeps them ([`ReadChangeset`], A-720's intake).
+pub trait BroughtChangeset {
+  /// Its node.
+  fn node(&self) -> Node;
+  /// Its first parent.
+  fn p1(&self) -> Node;
+  /// Its second parent.
+  fn p2(&self) -> Node;
+  /// Its branch and whether it closes it, as 7.2 reads them, the branch's bytes charged to `admission`.
+  fn branch(&self, admission: &mut Admission) -> Result<(Vec<u8>, bool), changeset::Refusal>;
+}
+
+impl BroughtChangeset for Arrived {
+  fn node(&self) -> Node {
+    self.node
+  }
+
+  fn p1(&self) -> Node {
+    self.p1
+  }
+
+  fn p2(&self) -> Node {
+    self.p2
+  }
+
+  fn branch(&self, admission: &mut Admission) -> Result<(Vec<u8>, bool), changeset::Refusal> {
+    let read = changeset::decode(&self.text)?;
+    crate::import::branch_of(&read, admission)
+  }
+}
+
+/// A changeset a push brought as its index row keeps it (A-720): no text, its branch and close read when it was kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadChangeset {
+  /// Its node.
+  pub node: Node,
+  /// Its first parent.
+  pub p1: Node,
+  /// Its second parent.
+  pub p2: Node,
+  /// Its branch.
+  pub branch: Vec<u8>,
+  /// Whether it closes its branch.
+  pub closes: bool,
+}
+
+impl BroughtChangeset for ReadChangeset {
+  fn node(&self) -> Node {
+    self.node
+  }
+
+  fn p1(&self) -> Node {
+    self.p1
+  }
+
+  fn p2(&self) -> Node {
+    self.p2
+  }
+
+  fn branch(&self, admission: &mut Admission) -> Result<(Vec<u8>, bool), changeset::Refusal> {
+    admission
+      .charge(to_u64(self.branch.len()))
+      .map_err(changeset::Refusal::PastAdmission)?;
+    Ok((self.branch.clone(), self.closes))
+  }
+}
+
 impl<'v, V: Repository> Graph<'v, V> {
-  /// The graph of `brought` over `view`, each brought changeset's branch and close read from its text.
+  /// The graph of `brought` over `view`, each brought changeset's branch and close read ([`BroughtChangeset`]).
   fn new(
     view: &'v V,
-    brought: &[Arrived],
+    brought: &[impl BroughtChangeset],
     admission: &mut Admission,
   ) -> Result<Self, Unclassified> {
     admission.charge_items::<Brought>(brought.len())?;
@@ -344,21 +412,19 @@ impl<'v, V: Repository> Graph<'v, V> {
       phases: Vec::with_capacity(brought.len()),
     };
     for (index, arrived) in brought.iter().enumerate() {
-      let fault = |fault| Unclassified::Changeset {
-        node: arrived.node,
-        fault,
-      };
-      let read = changeset::decode(&arrived.text).map_err(fault)?;
-      let (branch, closes) = crate::import::branch_of(&read, admission).map_err(fault)?;
+      let node = arrived.node();
+      let (branch, closes) = arrived
+        .branch(admission)
+        .map_err(|fault| Unclassified::Changeset { node, fault })?;
       let branch = graph.intern(branch, admission)?;
-      let parents = [graph.at(&arrived.p1), graph.at(&arrived.p2)];
+      let parents = [graph.at(&arrived.p1()), graph.at(&arrived.p2())];
       graph.brought.push(Brought {
-        node: arrived.node,
+        node,
         parents,
         branch,
         closes,
       });
-      graph.by_node.insert(arrived.node, index);
+      graph.by_node.insert(node, index);
       graph.phases.push(Phase::Draft);
     }
     Ok(graph)
@@ -560,7 +626,7 @@ impl<'v, V: Repository> Graph<'v, V> {
 /// names; `view` the served view it read.
 pub fn classify(
   unbundle: &Unbundle,
-  (brought, held): (&[Arrived], &[Node]),
+  (brought, held): (&[impl BroughtChangeset], &[Node]),
   view: &impl Repository,
   (lines, marks): (&[LineRead], &[BookmarkRead]),
   publishing: bool,

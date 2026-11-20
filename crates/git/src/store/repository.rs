@@ -907,7 +907,7 @@ impl Repository {
     store: &ContentStore,
     push: &Push,
     to: ObjectId,
-  ) -> Result<(Positions, Members, Option<(u64, usize)>), StoreRefused> {
+  ) -> Result<RemadeSet, StoreRefused> {
     let (base, from) = match self.base(store, push, to)? {
       Some(green) => {
         self.count(|counters| counters.bases_found = counters.bases_found.saturating_add(1));
@@ -1121,11 +1121,7 @@ impl Repository {
 
   /// For each object a move's walk found new, the green and version that brought it: the first move in order whose D(k)
   /// holds it; an object no move's holds is the first move's.
-  fn brought_by(
-    &self,
-    moves: &[Move],
-    first: &Move,
-  ) -> (BTreeMap<ObjectId, (u64, u64)>, (u64, u64)) {
+  fn brought_by(&self, moves: &[Move], first: &Move) -> BroughtBy {
     let version_of = |green: u64| {
       self.chains.get(&green).map_or(0, |chain| {
         u64::try_from(chain.versions.len()).unwrap_or(u64::MAX)
@@ -1164,7 +1160,7 @@ impl Repository {
     push: &Push,
     fresh: &[(ObjectId, Kind, ContentId, u64)],
     positions: &BTreeMap<ObjectId, u64>,
-    (by, otherwise): &(BTreeMap<ObjectId, (u64, u64)>, (u64, u64)),
+    (by, otherwise): &BroughtBy,
   ) -> Result<Vec<OwnedRow>, StoreRefused> {
     let mut owned = Vec::with_capacity(fresh.len().saturating_mul(2));
     for (id, kind, content, len) in fresh {
@@ -1247,7 +1243,7 @@ impl Repository {
     store: &ContentStore,
     moves: &[Move],
     positions: &BTreeMap<ObjectId, u64>,
-  ) -> Result<(Vec<Planned>, BTreeMap<u64, BTreeSet<u64>>), StoreRefused> {
+  ) -> Result<(Vec<Planned>, HeadMap), StoreRefused> {
     let mut planned = Vec::with_capacity(moves.len());
     let mut heads = self.heads.clone();
     for movement in moves {
@@ -1540,6 +1536,17 @@ fn footprint(
     .fold(0_usize, |total, greens| total.saturating_add(greens.len()));
   chains.saturating_add(bytes(entries, HEAD_BYTES))
 }
+
+/// A remade reached set: its positions, its members, and the green and version of the base set it
+/// grew from, when one was found.
+type RemadeSet = (Positions, Members, Option<(u64, usize)>);
+
+/// For each object a move found new, the green and version that brought it; and the pair for an
+/// object no move holds.
+type BroughtBy = (BTreeMap<ObjectId, (u64, u64)>, (u64, u64));
+
+/// For each commit some green's head names, by its position, those greens.
+type HeadMap = BTreeMap<u64, BTreeSet<u64>>;
 
 /// A tree's entries that are objects of this repository: name, whether a subtree, id.
 pub(super) type TreeEntries = BTreeMap<Vec<u8>, (bool, ObjectId)>;

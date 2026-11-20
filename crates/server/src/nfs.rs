@@ -3967,9 +3967,6 @@ mod purge_round_tests {
 
   use crate::daemon::LIVENESS_BUDGET_NS;
 
-  /// Shape: how long the test lets its daemon run before the purge is owed: past the reap loop's first look a window
-  /// into the start, by half a window, so the loop's next look comes half a window after the refused round.
-  const PAST_THE_FIRST_LOOK_NS: u64 = LIVENESS_BUDGET_NS / 2 * 3;
   /// Shape: how long past a window after the refused round the test waits for the next round: half a window.
   const AGAIN_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
   /// Shape: the pause between the test's looks.
@@ -3977,7 +3974,7 @@ mod purge_round_tests {
   /// Shape: the NFSv4 client the test makes and drops: any owner and uid.
   const OWNER: &[u8] = b"purge-round-test";
 
-  /// A-570 (the NFS purge off the tick). Do: on a one-shard daemon past the reap loop's first look, its owners refusing
+  /// A-570 (the NFS purge off the tick). Do: on a one-shard daemon, its owners refusing
   /// every purge (`Daemon::inject_nfs_purge_refusal`'s flag), make and drop an NFSv4 client, so its table owes the
   /// purge, and run a purge round as a client's call would, refused; then watch for the next round. Expect: the next
   /// round no sooner than a window after the refused one and within half a window more, at the deadline the table's
@@ -3985,9 +3982,6 @@ mod purge_round_tests {
   #[test]
   fn a_refused_purge_goes_again_a_window_after_its_round() {
     let daemon = crate::daemon::audit_daemon_of(1);
-    // The harness waits out the reap loop's first look; the daemon under test runs on.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
     let refused_at = Instant::now();
     crate::daemon::observe_first(&daemon, |state| {
       state.nfs_purges_refused = true;

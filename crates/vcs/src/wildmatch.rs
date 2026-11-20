@@ -134,10 +134,11 @@ fn advance(token: &Token, text: &[u8], from: &[bool], to: &mut [bool]) {
 fn one_byte(text: &[u8], from: &[bool], to: &mut [bool], accepts: impl Fn(u8) -> bool) {
   to.fill(false);
   for (at, (&byte, &was)) in text.iter().zip(from).enumerate() {
-    if was && accepts(byte) {
-      if let Some(slot) = to.get_mut(at.saturating_add(1)) {
-        *slot = true;
-      }
+    if was
+      && accepts(byte)
+      && let Some(slot) = to.get_mut(at.saturating_add(1))
+    {
+      *slot = true;
     }
   }
 }
