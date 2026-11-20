@@ -36,6 +36,7 @@ Usage: multi_repo_load.py SLATES SOURCE REV [REV ...] [--steps 1,10,100,1000]
 """
 
 import asyncio
+import json
 import math
 import os
 import re
@@ -187,6 +188,35 @@ async def burst(daemon: Daemon, pushes: list[tuple[str, int, bytes, str]]) -> tu
     return results, wall, before, peak
 
 
+# Format: the daemon's counters a step reports (A-724: where a starved push waits on the server): the HTTP edge's seats,
+# arrivals, overdue marks and reaps, and the share model's own.
+WATCHED_COUNTERS = re.compile(r"vcs_http|seat|arriv|overdue|reap|vcs_share|lane|turn")
+
+
+def counters(daemon: Daemon) -> dict[str, int]:
+    """The daemon's counters whose names WATCHED_COUNTERS matches, summed over its shards (`slates status --json`)."""
+    out = daemon.cli("status", "--json", check=False).stdout
+    try:
+        report = json.loads(out)
+    except ValueError:
+        return {"status unreadable": 1}
+    found: dict[str, int] = {}
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                if isinstance(inner, int) and not isinstance(inner, bool) and WATCHED_COUNTERS.search(key):
+                    found[key] = found.get(key, 0) + inner
+                else:
+                    walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+
+    walk(report)
+    return found
+
+
 def fresh_daemon(slates: str, label: str) -> Daemon:
     return Daemon(slates, instance=f"w-balance-multi-{os.getpid()}-{label}")
 
@@ -253,9 +283,12 @@ def main():
                     pushes.append((f"r{rank}", size, request(head, pack, branch), branch))
             results, wall, before, peak = asyncio.run(burst(daemon, pushes))
             alive = rss_kib(daemon.pid) > 0
+            seen = counters(daemon) if alive else {}
         finally:
             daemon.stop()
         refused = sum(1 for _, _, words in results if words != "ok")
+        if seen:
+            print("  counters: " + ", ".join(f"{k}={v}" for k, v in sorted(seen.items())), flush=True)
         print(f"R={repositories}: {total} pushes, wall {wall:.3f} s, rss {before / 1024:.0f} -> peak {peak / 1024:.0f} MiB, "
               f"refused {refused}, daemon {'alive' if alive else 'GONE'}", flush=True)
         for size in range(len(packs)):
