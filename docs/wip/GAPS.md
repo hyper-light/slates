@@ -378,11 +378,18 @@
 > of 38 and 60 of 60). Owed: the lender of a Subversion store over A-662's map (the records A-655 part 2b keeps there, a
 > directory's entries from the green, the repository's `svnserve.conf` facts; the DAV site's own `SvnStores`, A-681,
 > waits for the same lender), without which the daemon's site cannot start the tunnel; the accepted work handed to A-655
-> part 2b's owner step (`repository::svn_commit::commit`); the tunnel moved to the shard of the repository its URL names
-> (A-651 part 4 moves a connection for a named repository); the daemon's edge (A-684); a configured hook run, not
-> refused; CRAM-MD5 through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve`
-> exits 0 (A-656's `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a
-> daemon.
+> part 2b's owner step (built since, A-698); the tunnel moved to the shard of the repository its URL names (A-651 part 4
+> moves a connection for a named repository); the daemon's edge (A-684); a configured hook run, not refused; CRAM-MD5
+> through the tunnel; a client leaving during a refused edit's drop ends E210002 where `svnserve` exits 0 (A-656's
+> `Waiting` does not tell the drop from a live edit); main's `svn checkout svn+ssh://` against a daemon.
+> **A-698 (2026-11-20, g229; commits over ra_svn):** the work A-656's connection accepts lands through A-655 part 2b's
+> step: `repository::svn_commit::commit_work`, which `svn://` and the SSH tunnel share, makes the revision at the
+> owner's instant, judges it again with the commit's locks (`Work::locks`) and lands it; `commit-info` or `close-edit`'s
+> failure answers it (the step's refusals in FSFS's words, its own under the nearest error,
+> `serve::Uncommitted::Refused`); the tunnel lands through its lender (`SvnStores::commit`). Held to the recorded
+> `mkdir` commit byte for byte through the tunnel, and on a real shard. (macOS arm64, Mac Studio, kiln r509: red 52 of
+> 55, green 55 of 55; slates-svn 115 of 115; fmt clean.) Owed: the production lender (g297's); `svn://`'s call (g234's);
+> a configured hook run.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
