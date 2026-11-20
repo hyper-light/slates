@@ -12482,6 +12482,11 @@ under a grant (§4.15, R10).
 > `admit_objects` first), never to the partition's merge budget, so a
 > repository's bound is what its shard can hold. This replaces A-662's "charged to the merge budget" below.
 >
+> **Status (2026-11-19, A-721, w-svn).** A refused publication takes back the verb's record; a green whose engine had
+> already committed the version is made again from its durable checkpoint and chain in the same reconciliation
+> (`verbs::remake_greens_ahead`), so the engine never answers a version no log holds. Lone engines and single-member
+> lineages; a lineage of several members is counted and owed.
+>
 > **Status (2026-11-19, A-662: each repository's store on its owner shard, durable as greens are).** A shard holds one
 > content store (`slates_vcs::ContentStore`, window the content plane's chunk) and one entry a repository
 > (`crates/server/src/vcs_store.rs`): git's A-614 store with its derived values (A-647's reach sets, kept as each

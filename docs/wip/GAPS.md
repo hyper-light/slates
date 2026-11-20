@@ -494,6 +494,14 @@
 > times: the svn records' `Repository.contents`, the green's content pool (A-716, w-perf: the records name the green's
 > content by identity) and the register's entry objects, each revision's record with its texts (~245 KB a revision
 > under `apply_advanced`, w-perf); A-716's record without text bytes takes the third with it.
+> Fixed 2026-11-19 (A-721, w-svn, found by use: an import's record refused `Unpublished`, then every `svn commit`
+> E160004): a verb commits a version to its green's engine before the record holding it is durable, and a refused
+> publication took the record back but left the engine ahead; `verbs::reconcile_unpublished_effects` now makes such a
+> green again from its durable checkpoint and chain (`remake_greens_ahead`). Test
+> `a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands`, red then green; macOS
+> arm64, this Mac, local. Owed: a green in a lineage of several members (git branches) is counted
+> (`merge.unpublished.green_ahead_kept`) and kept as it is; a submit's `vcs_store::paths`/`commits` advanced before
+> its record are not taken back either.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
