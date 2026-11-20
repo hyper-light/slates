@@ -32,3 +32,13 @@
 - Running: 6 cross targets, `cargo xtask check`, host clippy --keep-going.
 - For main: vcs/src/share.rs:130 `f64::EPSILON * 64.0` (4bbf7f4ba, A-724 piece 2) has no stated derivation; not
   marked by me. Skipped: land's x86_64-pc-windows-msvc cross clippy (C build scripts can't cross-build here).
+
+## 2026-11-20 round 0, server
+- Landed: 89865595c bridges/base/http tests (7, helper); cd475f43c vcs A-724 tests (5); eb1429de0 hg Rebase::begin
+  boxed (1); slates-server part B 64d292a09, da3dfd2d3, 55eec54ae (48); part A 47c4506b3, a3e06a396 (60);
+  8f6472947 server tests/fleet.rs (4).
+- Main's disk rule (2026-11-20): ONE target dir (~/.cache/w-lint-target, --target per platform), no helper targets,
+  >40 GB free between rounds. Helper worktrees and targets all deleted.
+- Waiting on main: 3 server test errors need an in-place #[allow] with reason (carry.rs:497 test sleep; deploy.rs:1238,
+  1245 rustls Arc in tests). Part B replaced test sleeps in vcs_* tests with park_timeout loops to pass the lint:
+  main should judge that (part A declined the same dodge).
