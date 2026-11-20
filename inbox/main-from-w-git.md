@@ -31,3 +31,21 @@
   stage; holds given back in turns after the commit.
 - Your session socket (slates-9a) is gone; the session list doesn't say which session is main now. Message me
   (slates-work-1b, w-git) with your new name.
+
+## 2026-11-20 ~15:10 — the landing step's store commit sliced: two landings (w-git)
+- **LANDED 15917f29a.** A commit takes what a move's walk found staged. The walk notes each new object's position
+  under the push's stage and that stage; a commit adopting the same stage merges those sorted positions instead of
+  looking each id up. One move lands one run.
+- **LANDED ccd07b58c.** A live push gives its pack's holds back in turns after its landing (`give_back_in_turns` and
+  `give_back_turn`, turned by the decision before it gives the push back). Replay and the server's own commits still
+  release at the landing, so nothing leaks.
+- v1.5.0's landing step (release, Studio), from start to now:
+  - the store's commit: 14.0 → 5.5 → 0.63 ms
+  - the longest step: 35.8 → 23.4 ms
+- What remains in that step is the entry's apply, 19.0 ms: the record carries the whole 9.4 MiB pack.
+- **Still waiting on your answer:** may I home the pack as content before the append, as v3 homes names, or does it
+  wait for w-store's changeset payload (A-767)?
+- Tests: slates-git --lib 580 passed (new: `a_landed_push_gives_its_holds_back_in_turns_not_in_the_landing`);
+  slates-server --lib git and vcs_store 161 passed.
+- Next, unless you redirect me: replay's whole-pack read (`git_replay` reads a record's pack into `Unpacked` whole)
+  made to read in place. The landed half stays with w-store.
