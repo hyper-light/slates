@@ -2305,6 +2305,13 @@
 > entry the leader lacks (the integrator's diag-green-44269355181 arm64 run 7: leader at last log 6, follower at 7, same
 > term 1, no stuck dial), and the Windows two-region root whose new voters reported no committed root voter set (run
 > 44298844583, no stuck dial).
+> **Sweep (2026-11-20, w-forming; macOS arm64, Mac Studio adas-mac-studio-4, local, origin/main 69d1f2ec3 with A-735):**
+> the live_chaos fresh-member flow `a_member_that_never_held_the_log_never_stands_in_for_its_holder` 48 times under
+> `taskpolicy -b` (the one-CPU stand-in), nothing else of the worker's beside it: the fleet formed and settled in 48 of
+> 48 and the replaced member rejoined in 48 of 48; none of the three shapes above recurred. The test passed 47 of 48;
+> run 21 failed after forming, a successor owner's shard 0 spinning 5.6 s without a step right after its takeover
+> (watchdog exit 4; owed, w-forming's queue). An earlier sweep on the build before A-735 hung twice on a replaced
+> member's client claim (A-735).
 
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
