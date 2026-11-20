@@ -63,3 +63,10 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
    jupiter (kiln 81174ac49 + branch): stand_in 4/4 (4 failed before, AttributeError), bare_metal 2 skipped loudly;
    macOS stand_in 4/4. Once WinFsp is installed on jupiter: SLATES_E2E=1 slates_e2e bare_metal:: (Python Launcher on
    PATH), no code change; target C:\Users\corph\.cache\w-k90-vendor-target kept.
+ P1 LANDED slates main bc180d63..86adda1c (86adda1c6 = merge of the piece; worktree ~/slates-work/w-k90-vendor-a745):
+    Positions moved to slates_git::positions; Graph::Node: Into<u64>+TryFrom<u64>; Pack.objects/PackPlan.objects/
+    Planned/Answered::objects are Positions; plan copy charged per run. Red (old per-object charge put back): left 96
+    right 16. Green: slates-git negotiation::/upload::/store::... 207 passed; slates-server git upload paths 25 passed.
+ NEXT P2: the walk's own sets (objects::select's BTreeSet/BTreeMap: objects, opened, done, sent commits, left_out;
+    paint's flags; ready; shallow cut) made resumable under a quantum, upload::Answering {begin, step} modelled on
+    hg's getbundle::Answering; oracle = sliced bytes == serve()'s whole for every upload test; least room < whole.
