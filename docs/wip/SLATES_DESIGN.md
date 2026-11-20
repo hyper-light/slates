@@ -56708,10 +56708,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
 - **Part 2, the build in turns.** `slates_merge::push::Building` owns a build across turns and borrows the green and
   the objects for one ([`Building::advance`]): the walk an entry of a tree a unit (`Comparing`: each side's listing
   named, then each name), the base a named path a unit (`Green::base_entries`, read at the push's base version, which
-  no later version changes), the composition, the post-state an operation or 64 KiB of zeros a unit, the identity a
-  piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or 64 KiB of the post-state a unit.
+  no later version changes), the composition, the post-state an operation or a copy slice of zeros a unit, the
+  identity a piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or a hash slice of the
+  post-state a unit. The slices are the owner's, derived from its measured memcpy and BLAKE3 rates and the quantum
+  (`pace::Slices`; the server's `copy_slice_bytes_within`, `archive_slice_bytes_within`; R3, main's 10:29 ruling).
   `build` is a `Building` run in one call. The deriver is `async` (R6): `compose_paced`'s every loop awaits a tick,
-  its sorts are a paced stable merge sort (`pace::sort_by`), its base lookups indexed (`BaseIndex`), so no unit is
+  its sorts are a paced stable merge sort of the input's own non-decreasing runs
+  (`pace::sort_by`, no tuned run length), its base lookups indexed (`BaseIndex`), so no unit is
   O(files); `compose_volume_planned` is its one-poll facade, one implementation. A `Pace` holds the turn's deadline
   and the owner's clock (a function: the merge engine reads no clock of its own); the first unit of a turn always
   runs; the composition is polled through `Pace::drive`, which lends the turn to the thread for that poll (a `Copy`
