@@ -38,6 +38,12 @@
       revision. Multi-part: (P1) FSFS rev/revprop generator + stock svnlook oracle on Studio-1; (P2) txn dir for -t;
       (P3) presenter (needs (a)+(b) decided); (P4) git presenter replacing Unpresented.
   (3) Linux run of hook tests: queued on adacachy (kiln run r15, "no room here now"); starts by itself.
+  RULING (main): placement (b) now, then (a) after P4; bytes (a), wait for A-727 a2, never copy. Go P1+P2 now.
+  A-738 P1 LANDED: main 210843f (merged): slates_svn::fsfs (FSFS 6 view: View::advance a revision/step under a
+  node-revision budget, View::revision_file generated on read, texts streamed; revprops/fixed files/dirs), Index::created_in.
+  Test crates/svn/tests/fsfs_view.rs 3/3; on Studio-1 (kiln on adas-mac-studio.local-2 = d1323898, stock 1.15.0):
+  svnadmin verify ok, dump == full.dump, dump --deltas == deltas.dump, svnlook changed == changed.txt.
+  NEXT: A-738 P2 (db/transactions/<txn>.txt + txn-protorevs for svnlook -t), then P3 after a2.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
