@@ -162,6 +162,11 @@ consider and respect the devices they're on, and preferable are as zero-alloc as
 - **Respect the device.** Read its pressure (macOS memory pressure, Linux PSI, Windows commit charge) and its other
   tenants. Shrink, and refuse typed, before pressure; never push a machine into swap, jetsam or its commit limit. A
   laptop and a 96 GB Studio get different sizes from the same code: one code path, learned per device (R8).
+- **Don't allocate (ADA ~12:20: "this holds across git, mercurial, and svn work. If we don't need to allocate or can
+  architect things in such a way that we do not allocate, we do not allocate.").** Every git, hg and svn path, and
+  every other path, is designed not to allocate: lend views of what is held, parse in place, write into the
+  connection's own buffer, reuse per-shard scratch. An allocation that design could remove is a defect, even when it
+  is bounded. One that stays must say in its `///` why no allocation-free shape exists.
 - **Zero-alloc first.** Lend views into what is already held (content once by identity), reuse buffers across turns,
   stream instead of materializing, and copy nothing on a hot path. An allocation per item, request or chunk on a data
   path is a defect.
