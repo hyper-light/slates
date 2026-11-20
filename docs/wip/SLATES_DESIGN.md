@@ -14040,6 +14040,8 @@ signature verification).
 > register's first entry, with the phase roots and bookmarks it answers, and a recovery); until then an import is not
 > served.
 >
+> **Status (2026-11-20, A-710):** the command line asks it: `slates repository import NAME PATH` (PATH absolute).
+>
 > **Status (2026-11-19, A-678: the import verb).** A client asks the daemon to import a Mercurial repository's directory
 > with `ImportRepository { repository, path }`, served on the partition the repository's name hashes to and for its
 > owner alone: the directory is opened as a base is (read-only, never through a link), A-675's import started, and the
