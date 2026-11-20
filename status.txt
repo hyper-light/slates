@@ -1,0 +1,11 @@
+started 2026-11-20T11:39:24Z at 7a9441b79ce53b4189ee3833194e59b732dd5146; 7.0.0-1019-azure; 4 cpus; load 1.39 0.36 0.12
+build exit 0
+pjdfstest plain exit 1 367s load 0.81 1.61 1.26
+conformance: native-linux-fuse × pjdfstest: RAN(238 files, 8798 cases: 8770 passed, 0 failed (0 expected, 0 unexpected, 2 listed-now-passing), 0 needs-root, 28 todo; 2026-11-20; Ubuntu 26.04.1 LTS)
+pjdfstest live exit 1 223s load 2.31 1.81 1.41
+conformance: native-linux-fuse × pjdfstest: RAN(238 files, 8798 cases: 8770 passed, 0 failed (0 expected, 0 unexpected, 2 listed-now-passing), 0 needs-root, 28 todo; 2026-11-20; Ubuntu 26.04.1 LTS)
+compare exit 0
+compare: native-linux-fuse pjdfstest-output: 8798 cases plain, 8798 live, 0 differing
+compare: record native-linux-fuse.pjdfstest.json: the same outcome
+compare: the live-shipped run conforms exactly as the plain one does
+ended 2026-11-20T11:56:11Z
