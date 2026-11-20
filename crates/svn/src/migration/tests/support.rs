@@ -56,7 +56,8 @@ pub(super) fn import(
   import_with(&mut Importer::new(ADMISSION), repository, dump, piece)
 }
 
-/// Imports `dump` into `repository` through `importer`, its bytes arriving `piece` at a time.
+/// Imports `dump` into `repository` through `importer`, its bytes arriving `piece` at a time, each record it hands over
+/// committed through the records' own step (`Repository::commit_record`, A-652 part 3).
 pub(super) fn import_with(
   importer: &mut Importer,
   repository: &mut Repository,
@@ -80,6 +81,10 @@ pub(super) fn import_with(
       } => {
         held.drain(..consumed);
         needed = more.max(held.len() + 1);
+      }
+      Importing::Commit { consumed, record } => {
+        held.drain(..consumed);
+        repository.commit_record(*record)?;
       }
     }
   }

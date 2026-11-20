@@ -5,6 +5,7 @@
 use super::{MAIN_REF, WholeObjects, WholePack, answer_v2, command, naming, pkt, serving};
 use crate::Admission;
 use crate::served::{self, REFS, TAG, THIRD, id};
+use crate::upload::answer::Said;
 use crate::upload::{Answer, Refusal, Written};
 
 /// Format: the root tree of `main`'s head (`fixtures/objects.txt`).
@@ -27,8 +28,8 @@ const RELAYED: usize = 128;
 
 /// Format: each `<blob-ish>` naming the blob `dir/file` that this server resolves: `main`'s path; the branch's full
 /// name and a shorter one; `HEAD` and `@`; the tag `v1`, peeled through its commit; the commit's and the tree's own
-/// names; and the blob's own name in either case.
-const SERVED: [&str; 10] = [
+/// names; the blob's own name in either case; and `git describe`'s name for it, whose ref names no ref.
+const SERVED: [&str; 11] = [
   "main:dir/file",
   "refs/heads/main:dir/file",
   "heads/main:dir/file",
@@ -39,6 +40,7 @@ const SERVED: [&str; 10] = [
   "cc01dbca1db1ab97354bc849d5631a785fcb68ab:file",
   "4cdb2265d30204be5463b38174b2e8e717982405",
   "4CDB2265D30204BE5463B38174B2E8E717982405",
+  "v1-1-g4cdb2265",
 ];
 
 /// Format: each `<blob-ish>` naming an object that is no blob the store holds, and the object: a commit, by a branch
@@ -57,8 +59,9 @@ const UNPARSED: [(&str, &str); 6] = [
 /// relative path, which is then never read; a path that is not there, by `side`'s tree too; an empty component, first
 /// or within; a path through a file, and through a blob named as the revision; a trailing `/` after a file; an index
 /// path, with a stage and without, and `:/` alone, as a repository with no work tree holds no index; a full name the
-/// store does not hold before a path; and a name like `git describe`'s whose ref part is no `<ref>-<count>`.
-const NOTHING: [&str; 16] = [
+/// store does not hold before a path; a name like `git describe`'s whose ref part is no `<ref>-<count>`; and the blob's
+/// abbreviated name before a path, which walks no tree.
+const NOTHING: [&str; 17] = [
   "nosuch:dir/file",
   "nosuch:./dir/file",
   "main:nosuch",
@@ -75,6 +78,7 @@ const NOTHING: [&str; 16] = [
   "3333333333333333333333333333333333333333:dir/file",
   "nosuch",
   "nosuch-gabcd",
+  "4cdb2265:x",
 ];
 
 /// Format: each `<blob-ish>` whose path is relative, after a revision that resolves (a full name the store does not
@@ -87,10 +91,9 @@ const RELATIVE: [&str; 5] = [
   ":0:../dir/file",
 ];
 
-/// Format: each `<blob-ish>` of a form git reads that this server does not resolve: an ancestor, a parent, a numbered
-/// parent, a peel, a reflog entry, a branch checked out before, an upstream, an abbreviated name, `git describe`'s
-/// name, and a search of commit messages.
-const FORMS: [&str; 10] = [
+/// Format: each `<blob-ish>` of a form git reads that this server does not resolve yet: an ancestor, a parent, a
+/// numbered parent, a peel, a reflog entry, a branch checked out before, an upstream, and a search of commit messages.
+const FORMS: [&str; 8] = [
   "main~1:dir/file",
   "main^:dir/file",
   "main^2:dir/file",
@@ -98,8 +101,6 @@ const FORMS: [&str; 10] = [
   "main@{1}:dir/file",
   "@{-1}:dir/file",
   "main@{upstream}",
-  "4cdb2265:x",
-  "v1-1-g4cdb2265",
   ":/third",
 ];
 
@@ -175,9 +176,9 @@ fn a_relative_path_is_refused_as_git_refuses_it_with_no_work_tree() {
   }
 }
 
-/// A-640 part 4 (`get_oid_1`, `peel_onion`, `get_oid_basic`'s reflog, `get_describe_name`, `get_short_oid`,
-/// `get_oid_oneline`): do clone `main` under `sparse:oid=` each `<blob-ish>` of a form git reads that this server does
-/// not resolve. Expect: each refused by that kind, with the name as sent.
+/// A-640 part 4 (`get_oid_1`, `peel_onion`, `get_oid_basic`'s reflog, `get_oid_oneline`): do clone `main` under
+/// `sparse:oid=` each `<blob-ish>` of a form git reads that this server does not resolve yet. Expect: each refused by
+/// that kind, with the name as sent.
 #[test]
 fn a_form_this_server_does_not_resolve_is_refused_by_its_kind() {
   let fixture = served::served();
@@ -204,8 +205,8 @@ fn a_relative_path_and_a_form_not_resolved_are_answered_in_their_words() {
     ),
     (
       "main~1:dir/file",
-      "unable to access sparse blob in 'main~1:dir/file': this server resolves an object's full name or a ref, \
-       alone or with :<path>"
+      "unable to access sparse blob in 'main~1:dir/file': this server resolves an object's full or abbreviated \
+       name, git describe's name or a ref, alone or with :<path>"
         .to_owned(),
     ),
   ];
@@ -228,8 +229,14 @@ fn died(fixture: &served::Served, refusal: Refusal, banded: bool) -> (Vec<u8>, O
   let served = serving(fixture, &REFS, MAIN_REF);
   let mut source = WholeObjects::new(&fixture.objects);
   let mut admission = Admission::new(u64::MAX);
-  let mut answer: Answer<WholePack> =
-    Answer::died(b"head".to_vec(), refusal, banded, &mut admission).unwrap();
+  let mut answer: Answer<WholePack> = Answer::died(
+    b"head".to_vec(),
+    Said::default(),
+    refusal,
+    banded,
+    &mut admission,
+  )
+  .unwrap();
   let mut bytes = Vec::new();
   assert_eq!(
     answer.write(&served, &mut source, &mut admission, &mut bytes, usize::MAX),

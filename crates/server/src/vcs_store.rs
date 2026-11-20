@@ -51,7 +51,9 @@
 //! (their texts, property lists and revision properties) as retention: a step is lent the room the shard could admit
 //! ([`lend_svn`]), the growth it checked is charged before its append ([`reserve_svn`]), and the charge is trued up after
 //! it ([`settle_svn`]); their index's entries are bounded by the room's bytes over the fewest an entry takes
-//! (`Index::ENTRY_BYTES`).
+//! (`Index::ENTRY_BYTES`). A dump's import ([`svn_import`], A-652 part 3) commits each record it makes through the same
+//! steps: a revision moves the green, and the UUID and revision 0's properties it sets are each an entry of their own
+//! that moves no green, replayed by the step's own apply (`commit_record`).
 //!
 //! **Owed** (each in GAPS' §4.17 entry). A snapshot carrying each store's sealed tables by identity, so a recovery
 //! replays only the log's suffix; the replay and a rebuild sliced a unit at a time within a record (a record is one unit
@@ -85,6 +87,7 @@ pub(crate) mod hg_import;
 pub(crate) mod hg_view;
 pub(crate) mod paths;
 pub(crate) mod record;
+pub(crate) mod svn_import;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
 pub(crate) mod tests;
@@ -129,6 +132,9 @@ pub(crate) struct VcsStores {
   /// Each Mercurial repository's import under way, between its turns ([`hg_import`]): one a repository, so bounded by
   /// the partition's repositories.
   imports: BTreeMap<RepositoryId, hg_import::Importing>,
+  /// Each Subversion repository's import of a dump under way, between its turns ([`svn_import`], A-652 part 3): one a
+  /// repository, so bounded by the partition's repositories.
+  svn_imports: BTreeMap<RepositoryId, svn_import::Importing>,
   /// The request each import's end answers, by repository (A-678; `crate::repository::import`): one an import, so
   /// bounded as the imports are.
   answers: BTreeMap<RepositoryId, crate::repository::import::Answer>,
@@ -295,9 +301,9 @@ impl VcsStores {
     self.entries.contains_key(&id)
   }
 
-  /// Whether an import of repository `id` is under way ([`hg_import`]).
+  /// Whether an import of repository `id` is under way ([`hg_import`], [`svn_import`]).
   pub(crate) fn importing(&self, id: RepositoryId) -> bool {
-    self.imports.contains_key(&id)
+    self.imports.contains_key(&id) || self.svn_imports.contains_key(&id)
   }
 
   /// Holds `answer` as the request repository `id`'s import's end answers (A-678): the answer it replaces.
@@ -464,11 +470,12 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
 struct Unmade;
 
 /// Frees repository `id`'s store with the repository (module docs): an import of it under way given back first
-/// ([`hg_import::abandon`]), then every hold of its rows, tables, versions and derived values given back to the content
-/// store, then the shard's charge trued up to what remains. A refusal while giving back is counted, and the rest is
-/// given back.
+/// ([`hg_import::abandon`], [`svn_import::abandon`]), then every hold of its rows, tables, versions and derived values
+/// given back to the content store, then the shard's charge trued up to what remains. A refusal while giving back is
+/// counted, and the rest is given back.
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   hg_import::abandon(state, id);
+  svn_import::abandon(state, id);
   state.vcs_stores.unrecovered.remove(&id);
   if !release_charged(state, id) {
     state.count(RELEASE_REFUSED, 1);
@@ -1219,8 +1226,9 @@ fn replay_into(
 }
 
 /// Replays one Subversion record (A-655 part 2b; module docs, "Subversion") within `room`: a creation makes the
-/// records, revision 0 dated as recorded; a revision is checked and applied by the commit step, as its live step was,
-/// its lock entries as recorded. A record out of its order is refused, and so is one the step refuses; either leaves
+/// records, revision 0 dated as recorded; every later record is committed by the step its live one took
+/// (`commit_record`): a revision checked and applied, its lock entries as recorded; the UUID and a revision's properties
+/// an import set (A-652 part 3). A record out of its order is refused, and so is one the step refuses; either leaves
 /// the records as they were.
 fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), ReplayRefused> {
   match SvnRecord::decode(bytes).map_err(ReplayRefused::SvnRecord)? {
@@ -1232,12 +1240,11 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
       store.records = Some(records);
       Ok(())
     }
-    SvnRecord::Revision(revision) => {
+    record => {
       let records = store.records.as_mut().ok_or(ReplayRefused::SvnOrder)?;
       records.set_room(room);
       records
-        .commit(revision)
-        .map(drop)
+        .commit_record(record)
         .map_err(ReplayRefused::SvnStep)
     }
   }
