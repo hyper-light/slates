@@ -16,8 +16,13 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   and kiln never ended or failed the session, so the drive waited until it was killed.
 - The respawning `kiln agent --name slatesvm` on adacachy is another session's (pid 1925357, from
   ~/.cache/envscope-test/target, orphaned to systemd --user, ~4.5 h). Not ours; not touched; told main.
-- r14 (adacachy): microvm:: at kiln main ed8991d29 with SHARDS_LOG=debug, RUST_LOG hex/shards/kiln::sandbox debug.
-  Log ~/.cache/w-k90-microvm-kvm... -> ~/.cache/w-k90-kvm/logs/r1-ed8991d29{,.pack,.build}.
+- r14 lost (adacachy's runner restarted mid-clone; ~/.cache/w-k90-kvm/clone is a broken partial clone -> for main to
+  delete). r27/r34 kiln syncs timed out (kiln server not answering). Route that works: the partial sync's .git
+  (~/.kiln/reach/d1323898.../w-k90-kvm-0afe6c0693) -> `git worktree add --detach ~/.cache/w-k90-kvm/wt ed8991d29`.
+- r36 (adacachy, 08:58 PST, unit run-p3578166): microvm:: at ed8991d29 in ~/.cache/w-k90-kvm/wt, SHARDS_LOG=debug,
+  RUST_LOG hex/shards/kiln::sandbox debug. Logs ~/.cache/w-k90-kvm/logs/r2-ed8991d29{,.pack,.build}.
+- Reading: Shards' MCP lane answers Unstarted::Failed for "its run is over" (daemon/managed/mcp.rs), so the VM's run
+  likely ended right after boot; kiln's isolated.rs bridge() logs and returns, nothing ends the session.
 - Two defects to take red-first: (a) the guest member's exec failing on KVM; (b) a session whose microVM member never
   started is never ended/said (the drive's wait has no window).
 
@@ -30,4 +35,20 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   Asked main (08:0x PST): Ada's word on podman install or user_allow_other; overlap with w-k90-containers' r52.
 
 ## For main to delete
-- (none yet)
+- adacachy ~/.cache/w-k90-kvm/clone (broken partial clone, mine)
+
+## 2026-11-20 ~10:00-11:10 PST: KVM ROOT CAUSE + fixes (big Studio rebooted 10:35; resumed)
+- ROOT CAUSE (r50 diag, adacachy, ed8991d29 + log patch): Hex refused the member: "its command never started (status
+  128): the volume at /tmp/.tmpKZErig/ask/project: a volume may not be at or under /tmp, a domain's own scratch".
+  The drive's tempdir is /tmp on Linux (/var/folders on macOS, hence HVF passed). The image itself is fine on KVM
+  (`shards run` of the stand-in image: python3 + /opt/vm-stub/stub -> WROTE, STUB_DONE, rc 0, 23 s).
+- Defect (b): kiln said exit -1 with no words (hexvm end_of drops Hex's refusal), and the drive's Watch::ended waited
+  for a word newer than its first look though kiln had already said "so kiln stopped starting it again" -> 35 min hang.
+- Fix on branch agents/w-k90-kvm-g90 (kiln a8156f377 = wip 182960104 + merge of main 715063153):
+  slates_e2e microvm drives' folders under CARGO_TARGET_TMPDIR; hexvm `refusal_said` (a refused end says why on the
+  member's stderr -> session error); session::STOPPED_STARTING shared const; vm_e2e Watch::ended refuses at once on it.
+  Tests: vm_harnesses s35_a_wait_refuses_at_once... (new case), hexvm g90_a_refused_members_end_says_why_on_its_stderr.
+- Red: local (this Studio) vm_harnesses with the rule hunk held out (running). Green: KVM run r3 (adacachy,
+  ~/.cache/w-k90-kvm/wt3 at a8156f377, logs ~/.cache/w-k90-kvm/logs/r5-a8156f377*).
+- Slip: I ran `git switch` once (to a new branch at the same commit, no file change). No more.
+- for main to delete (adacachy): ~/.cache/w-k90-kvm/wt (r2/r3 scratch, diag patch applied), ~/.cache/w-k90-kvm/clone.
