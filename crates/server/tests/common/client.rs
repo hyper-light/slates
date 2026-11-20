@@ -3,14 +3,7 @@
 //! (`landing.rs`, on every platform since the Windows writer, A-185) build on these; the NFS write-back suite, which the
 //! Windows server answers too (A-184, A-192), uses them directly.
 
-use std::time::{Duration, Instant};
-
-use slates_client::{Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass};
-
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
-/// Shape: how long a test waits for a shard of its daemon to take a client it connected, as `attachment_term.rs` waits.
-const TAKEN_WAIT: Duration = Duration::from_secs(20);
+use slates_client::{Client, CreateSpec, Deadlines, NamePolicy, SizeClass};
 
 /// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
 /// budget).
@@ -22,20 +15,11 @@ pub(crate) fn deadlines() -> Deadlines {
   .get()
 }
 
-/// A client of `instance`, retrying the rendezvous while the daemon starts.
+/// A client of `instance`, whose daemon started before this: the claim waits while the rendezvous's holder lives
+/// (A-468), so a refusal is the test's failure, never a wait (A-571's rule; until 2026-11-20 a five-second retry,
+/// `START_WAIT`, goal 88's class C).
 pub(crate) fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::hint::spin_loop();
-      }
-      Err(e) => panic!("{e}"),
-    }
-  }
+  Client::connect(instance, deadlines()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// A four-mebibyte scratch volume named `name`.
@@ -55,7 +39,8 @@ pub(crate) fn scratch(name: &str) -> CreateSpec {
 /// client: the uid a consumer of that account is enrolled under, on every platform (a Windows channel's account is the
 /// daemon's mapping of its token, never `getuid`). As `consumers.rs` and `attachment_term.rs` read it.
 pub(crate) fn channel_account(daemon: &slates_server::Daemon, client_id: u32) -> u32 {
-  let started = Instant::now();
+  // Asked while the daemon lives: each observation is answered by its shard or refused typed past the observe budget,
+  // and a daemon gone fails it at once (A-232's rule; until 2026-11-20 twenty seconds on the wall, `TAKEN_WAIT`).
   loop {
     let found = daemon.shards().iter().copied().find_map(|shard| {
       daemon
@@ -80,10 +65,6 @@ pub(crate) fn channel_account(daemon: &slates_server::Daemon, client_id: u32) ->
       };
       return uid;
     }
-    assert!(
-      started.elapsed() < TAKEN_WAIT,
-      "a shard took client {client_id}"
-    );
     std::thread::yield_now();
   }
 }
