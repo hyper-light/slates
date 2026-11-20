@@ -1633,6 +1633,7 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         let room = to_usize(self.request_room);
         let budget = slice_budget(room, self.stores.fetch_quantum());
         let diag_before = out.len();
+        let diag_began = std::time::Instant::now();
         let progress = self
           .stores
           .lend(self.repository, &self.principal, |lent| {
@@ -1642,10 +1643,17 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         // DIAG (w-bugs, never for main): each reply run's bytes against the room, and the shard's long polls so far.
         let counters = slates_rt::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
         let wrote = out.len().saturating_sub(diag_before);
+        let slice_ns = u64::try_from(diag_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        DIAG_NS.set(DIAG_NS.get().max(slice_ns));
+        DIAG_PAST.set(
+          DIAG_PAST.get() + u64::from(slice_ns > slates_rt::futures::step_budget_ns().unwrap_or(0)),
+        );
         if wrote > room || matches!(progress, ReportProgress::Done) {
           slates_machine::log_line!(
-            "diag-svnfetch dav report run: wrote {wrote}, most a run {}, room {room}, done {}, quantum_ns {}, shard long_steps {}, longest_step_ns {}",
+            "diag-svnfetch dav report run: wrote {wrote}, most a run {}, slice_ns {slice_ns}, longest slice_ns so far {}, runs past the quantum so far {}, room {room}, done {}, quantum_ns {}, shard long_steps {}, longest_step_ns {}",
             DIAG_MOST.get().max(wrote),
+            DIAG_NS.get(),
+            DIAG_PAST.get(),
             matches!(progress, ReportProgress::Done),
             slates_rt::futures::step_budget_ns().unwrap_or(0),
             counters.long_steps,
@@ -1673,6 +1681,10 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
 thread_local! {
   /// DIAG (w-bugs): the most one report run wrote on this thread.
   static DIAG_MOST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  /// DIAG (w-bugs): the longest report run, and the runs past the quantum, on this thread.
+  static DIAG_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+  /// DIAG (w-bugs): see DIAG_NS.
+  static DIAG_PAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
