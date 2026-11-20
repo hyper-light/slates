@@ -314,7 +314,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`role::Role::args`] gives back to the daemon an anchor starts; [`StartSpec`] gains `vcs_svn`, which its anchor's
 /// role and command carry; an anchor binds the listener once, at that address, and hands it to every daemon it starts,
 /// so a restart never drops its port; an address it cannot bind ends its start (2026-11-19).
-/// 55: a role starts the version-control servers' SSH edge (A-684; §4.17.2 "Transports" item 2): [`role::ProcessOptions`]
+/// 55: a Subversion repository's history imported from a dump (A-652 part 3): the re-exported [`ImportFault`] gains
+/// `ImportFault::Subversion`, the dump refused as `svnadmin load` refuses it (Subversion's error number, the revision
+/// being loaded and the path), which [`Invalid::Import`] names (2026-11-19).
+/// 56: a role starts the version-control servers' SSH edge (A-684; §4.17.2 "Transports" item 2): [`role::ProcessOptions`]
 /// and [`StartSpec`] gain `vcs_ssh`, the address `--vcs-ssh ADDRESS` names, which [`role::Role::parse`] reads with
 /// [`role::vcs_ssh_address`] (any IPv4 address and port: SSH encrypts every connection) and [`role::Role::args`] gives
 /// back to the daemon an anchor starts; the anchor binds the edge's listener once and makes its Ed25519 host key at its
@@ -323,7 +326,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (2026-11-19).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 55;
+pub const CONTRACT: u32 = 56;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;

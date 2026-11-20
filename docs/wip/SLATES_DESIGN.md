@@ -12654,12 +12654,12 @@ engine: the verdict, rebase, position mapping, the register).
 > mutations of the secret's encoding and order, the reply's order and the length check, each caught.
 >
 > **Status (2026-11-19, A-684: the daemon starts the SSH edge).** `slates anchor|daemon --vcs-ssh ADDRESS` (a library
-> starter's `StartSpec::vcs_ssh`, contract 55) starts A-651's edge in the daemon beside the HTTP edge: its listener and
+> starter's `StartSpec::vcs_ssh`, contract 56) starts A-651's edge in the daemon beside the HTTP edge: its listener and
 > connection tasks on the control shard under the shard's seats, an edge state kept on every shard so a connection moves
 > to its repository's owner (A-651 part 4), keys proved by the credential record (A-651 part 3), and the services as
 > the server has them: git's upload-pack from each repository's store through A-682's lender (`ShardStores`) and
-> Mercurial's `serve --stdio` from its served view (`ServedViews`, A-679), receive-pack and Subversion's tunnel refused
-> as not served until their entry points land. Any
+> Mercurial's `serve --stdio` from its served view (`ServedViews`, A-679); receive-pack (A-683) and Subversion's tunnel
+> (A-688's `SvnServices`, which awaits a lender of its stores) refused as not served. Any
 > IPv4 address is taken: SSH encrypts every connection. The host key, on main's ruling: a fleet node presents its own
 > key from its plan when the key is Ed25519, the edge's one host key algorithm, and starts no SSH edge otherwise,
 > logged; any other anchor makes an Ed25519 key from the system's generator at its start and keeps its seed in the
@@ -12855,7 +12855,13 @@ engine: the verdict, rebase, position mapping, the register).
 > keeps now, at the owner's exchange (a saved byte worth the time to copy it, §4.11 at neutral). The SSH site's services
 > take the same lender (`ToolServices<ShardStores>`), for the SSH edge once the daemon starts one. Owed: the objects a
 > hidden ref alone reaches, fetchable by id until slates-git hides them; the daemon starting the SSH edge (A-684); the
-> live stock `git clone` over the daemon's edge (the next piece) and the other platforms (main's).
+> other platforms (main's).
+>
+> **Status (2026-11-19, stock git's interop tests).** Stock git 2.50.1 clones a repository from a real anchor's
+> daemon, pushes to it and fetches from it over the HTTP edge, the token a bearer credential
+> (`crates/cli/tests/git_interop.rs`), each step held to what git's own server answers the same round trip over
+> `file://`, and git with no credential is refused in its own words. The round trip with the token as Basic's password
+> waits on A-686, and over the SSH edge on A-684 and A-683; each is ignored naming them.
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
@@ -12990,6 +12996,22 @@ engine: the verdict, rebase, position mapping, the register).
 > the body (LFS answers `201`, `409`, `422` and `507` after reading it); the objects' durable store on the owner
 > shard (A-581); principals' names for people (§4.13); locks by others than the owner once the push's policy
 > check lands.
+>
+> **Status (2026-11-19, A-629 part 2c: Git LFS on the shared HTTP edge).** git's HTTP site (`crates/server`,
+> `vcs_http::git`) routes a request under `<repo>/info/lfs` through `slates_git::lfs::serve::route` before git's own
+> routes, in A-625 part 3's order: a route's refusal whoever asks (`405` with `Allow`, `400`, `414`, `415`, `406`); the
+> credentials, a `401` naming each challenge in `LFS-Authenticate` too; the repository, the connection moved to its
+> owner shard, or `404`; the policy's gate for LFS's rights (`403`); and `503` at the head for an endpoint the site's
+> service does not serve. A served request decides its status after its body (main's ruling: a route's status is
+> decided at its head or after its body; `slates-http-edge`'s `StatusMode` and `Connection::reply_status`): its body is
+> kept whole within the request's room and answered with the status, fields and body `lfs::answer` decided, its hrefs
+> under the authority the request named, its actions expiring in the second the bearer token that asked expires in. A
+> status no reply's content may follow (`1xx`, `204`, `205`, `304`), or one named on a streamed route, fails the
+> request `500` in stages. The daemon (`daemon_edge::ShardLfs`) serves the locks API over the repository's locks log;
+> the batch API and the transfers answer `503` at their head until the owner shard keeps LFS objects durably (A-581),
+> so no upload is acknowledged that a restart would forget. Owed: A-581's durable objects and the batch API and the
+> transfers served over them; locks by others than the owner once the push's policy check lands; principals' names for
+> people (§4.13); the stock git-lfs client end to end against the daemon (main's).
 >
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
@@ -13193,6 +13215,27 @@ engine: the verdict, rebase, position mapping, the register).
 > namespace, §4.6); its seals kept as derived data across views; the calls of git's push driver (`git_push`, A-654
 > part 2, which answers every command `hook not run` while a git hook is configured until they land); git's words for
 > each outcome.
+>
+> **Status (2026-11-19, A-665 part 3: git's push runs its hooks, built; the view's read-only attachment owed).**
+> `crates/server` (`git_push`, its `hooks`) runs receive-pack's three points as git 2.50.1 does: `pre-receive` once
+> over every command no earlier check refused, its view showing the push in git's quarantine, its refusal answering
+> each `pre-receive hook declined` after its words; `update` for each such command the policy admits, its refusal
+> answering that command `hook declined` after its words and git's `error: hook declined to update <ref>`; then the
+> verdicts and the appends, the report written but its last flush; then `post-receive` over the applied commands in a
+> view of the refs the push left, its words between the report and the last flush. The answer is a step at a time:
+> `Answering::Sealing` while a view is sealed in the shard's slices, `Answering::Hook` for a hook the edge runs off
+> the shard's step and hands back. An accepted hook's words go to band 2 as git relays them, charged to the push's
+> room. A hook that cannot run refuses what it would have judged, typed (`hook not run`, with why); a `post-receive`
+> that cannot run or exits non-zero is counted (`git_push.post_receive_unaccepted`). A view is shown at a path by a
+> presenter (`git_hooks::PresentView`): the read-only attachment the mount edges serve is the daemon's, owed, and until
+> it lands the daemon shows none (`Unpresented`), so a push whose repository configures a git hook is refused `hook not
+> run` before any object is admitted. Proven through a presenter that writes each view into a scratch directory, the
+> hooks shell scripts: a refusing `pre-receive` in git's words with nothing recorded, accepting hooks landing the push
+> with each one's words in git's order and `post-receive` reading the moved ref in its view's `packed-refs`, a refusing
+> `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
+> with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
+> and `protected_fixtures` 49 of 49, fmt clean). Owed: the read-only attachment; the
+> edges' signal of a client gone, which ends a hook's run; the hooks' learned times; seals kept as derived data.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -13469,8 +13512,10 @@ itself from the base packs and fragments, the objects no kept part holds and the
 `objects/tmp_objdir-incoming-<six>` for `pre-receive` with receive-pack's environment, among the repository's packs for
 `update`; a pack's trailer, Adler-32s and index its seal, the rest of every file read a window at a time); part 2,
 handing it to the hook driver on the owner shard, is built (A-665 part 2: opened over the repository's store, sealed in
-the shard's slices, run with `GIT_DIR=.` and the quarantine's variables); part 3 presents it at a path, a read-only
-attachment the mount edges serve.
+the shard's slices, run with `GIT_DIR=.` and the quarantine's variables); part 3, the push running its hooks at
+receive-pack's three points in git's words, is built (A-665 part 3) over a presenter that shows a view at a path, whose
+daemon implementation, a read-only attachment the mount edges serve, is owed: until it lands a push whose repository
+configures a git hook is refused `hook not run`.
 
 **Operations on the server.** Merging a review request is §4.17.1's merge: on accept the server makes the merge commit
 (parents: the target's head and the request's head; tree: the accepted version's; author and committer the person who
@@ -13576,8 +13621,8 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
 9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
 10. Hooks over a read-only bare-repository view (part 1, the view, built: A-665; part 2, handing it to the hook driver
-    on the owner shard, built: A-665 part 2; part 3, presenting it at a path, owed); push options; push to review with
-    report-status-v2.
+    on the owner shard, built: A-665 part 2; part 3, the push running its hooks, built: A-665 part 3; the view shown at
+    a path as a read-only attachment, owed); push options; push to review with report-status-v2.
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
@@ -14786,8 +14831,23 @@ and export by landing).
 > declared yet, refused typed (`Unsupported`, counted): a directory deleted or replaced beneath a copy the same revision
 > made from a revision older than the head, whose tree no public read of the engine lists at that version, and a
 > replacement without history that changes a node's kind (the engine's `TypeChanged`, GAPS §8f). Owed: the svn://
-> connection task's call of the step (A-656) and the import's (A-652 part 3); the lock verbs' entries recorded as a
-> commit's are; the records' texts held once rather than beside the green's content and in the record.
+> connection task's call of the step (A-656) and the import's (A-652 part 3, built since); the lock verbs' entries
+> recorded as a commit's are; the records' texts held once rather than beside the green's content and in the record.
+>
+> **Status (2026-11-19, A-652, part 3: the import verb).** Built: a dump stock `svnadmin dump` wrote (format 2 or 3)
+> imported into a Subversion repository by the daemon (`slates-server`'s `vcs_store::svn_import` and
+> `repository::import`; `slates-svn`'s `migration::Importer` and `commit::record`). A-678's `ImportRepository`, on a
+> Subversion repository, names the dump's host file, which is opened read-only as a base is (§4.15) and imported on the
+> owner shard a turn at a time, a copy slice of the file read at a time. The import hands each record it makes to its
+> caller's step and reads on once it is committed: each revision through A-655's step (the green's next version and the
+> revision's record one entry), and the UUID and revision 0's properties the stream sets each through an entry of its
+> own that moves no green (`Record::Uuid`, `Record::RevisionProperties`), which a recovery replays through the records'
+> own step. Every imported revision is durable as it lands; the history keeps the stream's numbers, so a dump in parts
+> loads part after part; a refusal keeps the revisions before it, answered `ImportRefused { Subversion }` with
+> Subversion's error number, the revision being loaded and the path; the end answers `DumpImported`. Held to
+> `part1.dump` exported again byte for byte after its import through the daemon and after a rebuild from the log, and
+> to `part1.dump` then `part2.dump` exporting `full.dump`. Owed: the export verb (a range written as a dump into a
+> volume and landed under a grant); an import resumed across a restart.
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -15149,6 +15209,28 @@ for Subversion.)
   through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism). Over
   slates' own SSH server (§4.17.2, A-633) the same `svnserve -t` is read from the `exec` request and served in the
   daemon, the principal the one the client's key proved.
+
+> **Status (2026-11-19, A-688: svn+ssh over slates' own SSH server).** Built in `crates/server`'s `vcs_ssh::svn`: the
+> SSH site's `exec` of `svnserve -t` (`SvnServices`, beside the other services) runs A-656's one ra_svn connection over
+> the channel, the greeting written first. The client's URL is found as `find_repos` finds it: the longest run of
+> leading segments naming a Subversion repository here, its root URL the client's URL cut after it; `..` refused
+> E125001, another scheme E125002, no repository E210005; a principal A-597's policy lets reach it for no right refused
+> E170001 "No access allowed to this repository". The tunnel's user, which `EXTERNAL` takes, is the principal the
+> client's key proved, named by its index key in hexadecimal until §4.13 names people, never the SSH login. The
+> repository's sources are lent afresh each step (`SvnStores`); a commit begins with its transaction, its hooks pass
+> where none is configured and refuse it where one is, and its work is refused 200007 until the tunnel calls A-655 part
+> 2b's owner step. The tunnel ends as `svnserve -t` 1.15.0 ends: its error on standard error, `svnserve: E` and six
+> digits, and `EXIT_FAILURE`. Held to stock `svnserve -t`: the recorded `mkdir` commit item for item through the
+> commit's start, and the scripted sessions recorded on the Mac Studio (2026-11-19), their output, standard error and
+> exit status; and end to end over the SSH edge with a key (macOS arm64, Mac Studio, kiln r311: `--lib vcs_ssh::` red 26
+> of 35 with the site sending the tunnel to the other services, green 35 of 35; slates-svn `handshake:: serve::` 60 of
+> 60; fmt clean; as it landed over main 693bc8feb, r377: 38 of 38 and 60 of 60). Owed: the lender of a store over
+> A-662's map (its Subversion arm holds the records since A-655 part 2b; the lender adds a directory's entries from the
+> green and the repository's `svnserve.conf` facts), which the daemon's site needs to start the tunnel; the accepted
+> work handed to the owner's commit step (`repository::svn_commit::commit`); the daemon's edge (A-684); a configured
+> hook run rather than refused; CRAM-MD5 through the tunnel; a client that leaves during a refused edit's drop ends
+> E210002 where `svnserve` exits 0; `svn checkout svn+ssh://` with a stock client against a daemon (main's run).
+
 - **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
   COPY and DELETE against it with `X-SVN-Version-Name` for the out-of-date test; MERGE; LOCK and UNLOCK. DeltaV's
@@ -15490,7 +15572,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
    as its history, and a history exported as a dump for migration, each a server verb over the index and the records
    with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
-   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the wiring owed).
+   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the import's wiring built,
+   A-652 part 3; the export's owed).
    `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
    property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
@@ -51340,10 +51423,10 @@ reservation and settle, `make_from_log`; `repository.rs`: the creation's record;
   main's `each_verb_moves_the_names_log_and_each_members_version_its_own_log`, failing then on main's own tree and
   passing on the merge, and failed slates-svn's test build on one borrow in the record's round-trip test (fixed). The
   new tests name what main lacks and do not build on main's tree; the mutation red-checks are main's (§8).
-- **Owed.** The svn:// connection task's call of the step (A-656) and the import's (A-652 part 3); the lock verbs'
-  entries recorded as a commit's are; the engine's read of a tree at a version (for a directory deleted beneath a copy
-  of an older revision) and its composition of a kind change (§8f); the records' texts held once, read from the green's
-  content rather than held beside it and in each record; the Subversion index charged by its bytes; main's runs
+- **Owed.** The svn:// connection task's call of the step (A-656) and the import's (A-652 part 3, built since); the lock
+  verbs' entries recorded as a commit's are; the engine's read of a tree at a version (for a directory deleted beneath a
+  copy of an older revision) and its composition of a kind change (§8f); the records' texts held once, read from the
+  green's content rather than held beside it and in each record; the Subversion index charged by its bytes; main's runs
   (clippy, `xtask check`, the doc gate, Linux and Windows builds, the mutation red-checks).
 
 ### A-680 part 1 — A repository's served view over its index: what 7.2's `served` filter serves, numbered densely, walked from the first changeset that is not public, its texts lent in place or copied within the request's room (2026-11-19, g303 for UI goal 93 (kiln 51cef9f7); §4.17.3 decision 4, "Pull and clone" items 1 and 2, "Access" and piece 4; A-588 part 2, A-642, A-649, A-657, A-662)
@@ -52429,6 +52512,295 @@ entry), `docs/bugs/2026-11-19-an-appends-new-branches-were-minted-one-volume-id.
   55, `-p slates-server --test green_checkpoint` 6 of 6, `cargo fmt` (one rewrap of the model test, applied). Main's:
   clippy, `xtask check`, the doc gates and the other platforms.
 
+### A-629 part 2c — Git LFS on the shared HTTP edge: its routes on git's site through the edge's authentication, its status decided after its body, the locks API served by the daemon (2026-11-19, g230, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", "Access" and "Transports" item 1; after A-629 part 2b-ii, A-625 part 3 and A-650 part 1)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/http-edge` (`connection.rs`:
+`StatusMode`, `Decision::Serve`'s `status`, `Connection::reply_status`, `carries_content`; its tests); `crates/server`
+(`vcs_http.rs`: `Exchange::reply_status`, `Answer::Serve`'s `status`, the reply step; `vcs_http/git.rs`: `LfsService`,
+`NoLfs`, `LfsExchange`, `SiteExchange`, the LFS route, gate and refusals, `expiry_of`; `vcs_http/daemon_edge.rs`:
+`ShardLfs`, `DaemonSite`; `vcs_http/hg.rs`; `vcs_http/svn.rs`, at the merge with A-681 part 1: its route decides its
+status after its body; `lfs.rs`: `NoObjects`, `bare`; the tests of `vcs_http`'s git site, hg site and serving loop);
+`crates/git` (`lfs::serve::Answer::fields`); `crates/cli` (`tests/cli.rs`).
+- **A status per route** (main's ruling, 2026-11-19). A served reply's status is its route's to decide: at its head,
+  `200`, as git's services and Mercurial's commands stream theirs (`StatusMode::Streamed`); or after its body, named by
+  the service as its reply begins (`StatusMode::AfterBody`), as Git LFS answers `201`, `409`, `422`, `413` and `507`
+  only once it has read the request, and Subversion's site a PROPFIND's `207` or a refusal its body explains. The
+  engine asks the exchange once, before its fields (`Exchange::reply_status`, `200` unless the exchange names another).
+  A status no reply's content may follow (RFC 9110 §6.4.1's `1xx`, `204` and `304`; §15.3.6's `205`), a code outside
+  §15's classes, or a status other than `200` named for a streamed route fails the request `500` in stages, nothing of
+  a reply sent; one named after the reply began is never written. A-681 part 1 landed the same naming for Subversion's
+  site while this piece was in flight; at the merge the two became one mechanism, not two: A-681's synchronous
+  `Exchange::reply_status` with its `200` default, this piece's per-route mode and content rule, and Subversion's
+  route deciding its status after its body.
+- **The routes on git's site.** An LFS path (`<repo>/info/lfs/...`, the server URL git-lfs derives from a remote) is
+  routed by `slates_git::lfs::serve::route` before git's own routes; a path it does not know falls through to them,
+  and both decode a path alike. The order is A-625 part 3's: the route's refusal whoever asks (`405` naming the
+  endpoint's methods, `400`, `414`, `415`, `406`); a request naming no authority `400`; the credentials (`401` with the
+  connection's challenges, each named again in `LFS-Authenticate`, batch.md, so git-lfs asks for credentials); the
+  repository (the connection moved to its owner shard, or `404` for none or another tool's); the policy's gate, the
+  principal reaching the repository for some LFS right (read, submit or rewrite; `403`); then the service (`503` for an
+  endpoint it does not serve). Every refusal carries `http-backend`'s cache fields, as git's own do. Each endpoint's
+  own right on the ref it names stays `lfs::answer`'s (`LfsAccess`, A-629 part 2b-ii).
+- **The call.** A served LFS request's body is kept whole within the request's room, which the engine's admission
+  bounds, and answered once it ends. `LfsCall` carries the route, the query, the body, the proven principal, the
+  credential's expiry (the second a bearer token's `expires_ns` falls in, so no action outlives the token; none for
+  Basic, whose transfers authenticate as their batch did, A-625 part 3), the scheme and the authority the request named
+  (an absolute-form target's, else `Host`'s, as slates-http checked it) and the room. The answer's status, its fields
+  (`Answer::fields`: the media type, and a `401`'s `LFS-Authenticate`) and its body are the reply's.
+- **What the daemon serves** (`ShardLfs`): the locks API, on the repository's owner shard over its locks log (A-635),
+  durable as the partition's log is, the objects seam handed in holding nothing (`lfs::NoObjects`). The batch API and
+  the transfers answer `503` at their head, their bodies never read: the owner shard keeps no durable LFS object store
+  yet (A-581), and an acknowledged upload that a restart forgot would leave a pushed pointer naming nothing, against
+  §4.17.1's rule that a repository's acknowledged state is durable as greens are (A-662). Rejected on that rule: the
+  objects held in memory beside the git store (`GitStore::lfs`), as the unfinished draft this piece took over had them.
+- **Tests.** `slates-http-edge`
+  (`connection::tests::a_route_deciding_its_status_after_the_body_carries_the_status_its_service_names`: `201`, none,
+  `204`, `205`, a streamed route's `201` and its own `200`, one named after the reply began; A-681's PROPFIND test runs
+  on a route deciding after its body). `slates-server` `vcs_http::git::tests`: route
+  refusals whoever asks; `401` with `LFS-Authenticate`; the owner shard, `404`, `403` and `503`; a served call's status,
+  fields, body and what it carried (the route, query, whole body, principal, expiry, origin and room); the daemon's
+  `ShardLfs` refusing the four object endpoints at their head and serving the locks API's four. `vcs_http::tests::serve`
+  over a loopback connection: `201` heading a reply, and `204` or a status on a streamed route failing it in stages.
+  `slates-cli` `an_anchors_vcs_http_flag_starts_its_daemons_edge`: a real anchor's daemon answers its git refs and its
+  LFS locks `401`, Bearer's challenge in `WWW-Authenticate` and in `LFS-Authenticate`, no Basic in cleartext.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, `CARGO_BUILD_JOBS=2`; kiln r109 over this piece on main
+  cb9d7f5a5, 21:41 to 21:53 UTC, load 8 to 16). Failing first, the edge never taking the status its service names:
+  the edge test failed, 0 of 1. Restored: `cargo test --locked -p slates-http-edge --lib -- connection::` 18 of 18;
+  `-p slates-git --lib -- lfs::` 73 of 73; `-p slates-server --lib -- vcs_http:: lfs:: credentials:: --test-threads=4`
+  55 of 55, the six new among them and main's four `lfs::tests` passing on the seam as it was; `-p slates-cli --test cli
+  -- an_anchors_vcs_http_flag_starts_its_daemons_edge` 1 of 1, in 3.86 s. rustfmt asked for six layout changes, made
+  as it wrote them: `rustfmt --check --edition 2024` (1.9.0) clean over the twelve changed files at 8188f1214. The
+  Linux and Windows runs are owed (main's).
+- **Owed.** The objects' durable store on the owner shard (A-581), and with it the batch API and the transfers served;
+  locks by others than the owner once the push's policy check lands (A-635); principals' names for people (§4.13); a
+  request id named in LFS's error bodies; the stock git-lfs client end to end against the daemon (main's).
+
+### A-688 — svn+ssh over slates' own SSH server: the SSH site's `svnserve -t` runs A-656's ra_svn connection over the channel, the key's principal the tunnel's user (2026-11-19, g229, UI goal 93; §4.17.4 "The wire" (svn+ssh) and piece 12; after A-656, A-651, A-633, A-597 and A-662)
+Applied in the same change to:
+- §4.17.4's status under "The wire" (svn+ssh); GAPS (the §4.17 entry, after A-651 part 2's line, and A-656's owed
+  line);
+- `crates/server` (new: `vcs_ssh::svn`, `SvnServices`, `SvnCommand`, `SvnStores`, and its tests; `vcs_ssh::site`'s
+  not-served words shared; the edge's test of a tunnel end to end); `crates/svn` (`handshake::Unserved::failure`, the
+  error a refused URL is answered with, which the tunnel also ends with).
+- **The session** (`SvnCommand`). As `svnserve -t` does, the tunnel speaks first: the greeting is written as the
+  command starts. The client's answer names a URL, found as `svnserve`'s `find_repos` finds it (`serve.c` at
+  `d434dc14`, 1.15.0 alike) [C]: the path beneath the scheme (`svn`, an optional `+` and a tunnel's name, `://`) and
+  host, each segment percent-decoded as `svn_path_uri_decode` decodes one, a `..` segment refused "Couldn't determine
+  repository path" (E125001), then the longest run of leading segments naming a Subversion repository on this shard;
+  its root URL is the client's URL cut after that run. Another scheme is refused "Non-svn URL passed to svn server"
+  (E125002), a URL no Subversion repository holds "No repository found in '…'" (E210005), a git repository's name
+  alike. Then A-597's policy: a principal it lets reach the repository for none of its rights is refused "No access
+  allowed to this repository" (E170001), as the site judges Mercurial's `serve --stdio`; each command is then the
+  session's to judge (the repository's own `svnserve.conf` and authorization file, lent with its sources).
+- **Who** (§4.13; §4.17.4: "the principal the one the client's key proved"). The tunnel's user, which `EXTERNAL`
+  takes, is that principal, named as slates' version-control answers name one until §4.13 names principals for people:
+  its index key in hexadecimal (`lfs::owner_name`). The SSH login proves nothing and names no one: a client can send
+  any login, so `EXTERNAL` naming the login (`git`, as every git and svn+ssh client sends) is refused "Requested
+  username does not match", as `svnserve -t` refuses a name other than its tunnel's user.
+- **The sources** (`SvnStores`). What the handshake tells the client (the UUID, the realm, mergeinfo, who may read)
+  and, from the session's establishment on, the repository's index, green, lock table, policy and the owner's instant
+  are lent afresh for each step, as git's site lends its stores (A-640 part 2), so a shard's state is never held across
+  a wait. A repository whose store is not held here, or whose store goes away mid-session, is not served, in the site's
+  words, with nothing more written to the client.
+- **A commit.** `commit` begins A-656's drive with its transaction (the youngest revision, `-`, the connection's count
+  of commits in base 36). A hook the drive waits for (A-661) passes where the repository's policy configures none at
+  its point, as `svnserve` answers a point with no hook; where one is configured the commit is refused there, since
+  running a hook needs the transaction's view, owed with the owner's commit step, and no hook is ever skipped. An
+  accepted work is refused 200007 "This server does not make commits yet" until the tunnel hands it to A-655 part 2b's
+  owner step (`repository::svn_commit::commit`, which runs on the owner shard's state), owed with the lender.
+- **How it ends** (recorded, below). The error that ended the connection on standard error, `svnserve: E`, its number
+  in six digits, `: ` and its message, and `EXIT_FAILURE` (1); a clean end 0 with nothing: a client that leaves between
+  commands or inside a command's item. A client that leaves during the handshake, a report or an edit, E210002; a
+  malformed item, E210004; protocol version 3 and a client without `edit-pipeline`, E210006 in the handshake's words;
+  each refused URL as above, written to the client too. Where `svnserve` aborts and on the caller's own errors the
+  tunnel ends 1 with nothing more, counted.
+- **The oracle.** Stock `svnserve -t` 1.15.0 (Homebrew's, the Mac Studio, macOS arm64), two ways. The recorded `mkdir`
+  commit (`crates/svn/fixtures/commit/`, made through `svnserve -t`), item for item through the commit's start. And
+  sessions recorded for this piece at 2026-11-19T22:27:07Z and 22:33:56Z: each scripted client's bytes piped to
+  `svnserve -t --tunnel-user=alice -r ROOT`, ROOT holding `repo` (`svnadmin create`, `svnadmin setuuid
+  00000000-0000-4000-8000-00000000a617`, `anon-access = none`, `auth-access = write`) and `closed` (`auth-access =
+  none`), its output, standard error and exit status kept; the first six sessions' bytes are pinned by SHA-256 in the
+  tests. One recorded ending the tunnel does not meet: a client that leaves while a refused edit's commands are being
+  dropped (`open-dir` of a missing path, then gone) ends 0 there and E210002 here, since A-656's `Waiting` does not
+  tell the drop from a live edit (GAPS).
+- **Tests.** `vcs_ssh::svn::tests`, each held to stock `svnserve -t` 1.15.0, the command dispatched by the site and
+  stepped as the edge steps one: `the_scripted_sessions_are_the_recorded_ones` (the first batch's clients, outputs and
+  errors, their SHA-256 as recorded); `a_stock_commit_is_answered_as_svnserve_t_answers_it_until_the_owners_step` (the
+  recorded `mkdir`, split inside an item, item for item through the commit's start, then 200007; `abort-edit`, exit 0;
+  every byte consumed; the store lent); `a_scripted_session_is_answered_as_svnserve_t_answers_it` (a URL naming the
+  repository's root, and one beneath it); `the_tunnels_user_is_the_principal_the_key_proved_never_the_login`;
+  `a_url_naming_no_subversion_repository_is_refused_as_svnserve_t_refuses_it` (no repository, another scheme, `..`, a
+  git repository's name); `a_principal_the_policy_keeps_out_is_refused_as_svnserve_t_refuses_a_closed_repository`;
+  `a_repository_whose_store_is_not_held_here_is_not_served`; `the_tunnel_ends_as_svnserve_t_ends_each_session` (seven
+  recorded endings); `the_tunnel_is_served_beside_the_other_services`. And the edge's
+  `vcs_ssh::tests::an_svnserve_tunnel_serves_a_stock_session_over_the_channel`: a key's principal runs `svnserve -t`
+  over a real SSH connection on the runtime's TCP, the recorded `latest` session and EOF, its output as `svnserve -t`
+  wrote it, exit-status 0, EOF and close in order.
+- **Runs.** macOS arm64, the Mac Studio, kiln r311, 2026-11-19 (22:47 to 22:59Z, load 14 to 25), over main
+  `b94ae6e90` with the change (`934e36797`): `cargo fmt -p slates-server -p slates-svn -- --check` clean; red, a scratch
+  copy whose `SvnServices` sends `svnserve -t` to the other services as today's site does, `cargo test --locked -p
+  slates-server --lib vcs_ssh:: -- --test-threads=4` 26 passed, 9 failed (the ten new but the digests'); green, the
+  same 35 of 35, no compiler warning; `cargo test --locked -p slates-svn --lib -- handshake:: serve::` 60 of 60
+  (`Unserved::failure` moved out of `Server::refuse`). The landing tree, the change over main `693bc8feb` (A-651 part
+  3's site and A-655 part 2b's step among main's commits since): kiln r377, 23:13 to 23:21Z, fmt clean, `--lib
+  vcs_ssh::` 38 of 38 (A-651 part 3's four tests among them), slates-svn 60 of 60. No integration target reaches the
+  tunnel: the daemon starts no SSH edge yet (A-684).
+- **Owed.** The lender of a Subversion store over A-662's map: since A-655 part 2b its Subversion arm holds the
+  records (the index, revision properties, contents, lock table and UUID), and the lender adds a directory's entries
+  from the green and the repository's `svnserve.conf` facts; until it lands no store is lent and the daemon's site
+  cannot start the tunnel (the HTTP edge's DAV site, A-681, waits for the same lender behind its own `SvnStores`); the
+  accepted work handed to the owner's commit step; the daemon's SSH edge (A-684) and the connection moved to the
+  repository's owner shard; running a configured hook; CRAM-MD5 through the tunnel (the credentials record holds no
+  keys for it); a URL canonicalized as `svn_uri_canonicalize` would (stock clients send canonical URLs); the drop's
+  ending above; `svn checkout svn+ssh://` with a stock client against a daemon, the other platforms' runs and the
+  red-checks (main's).
+
+### A-665 part 3 — git's push runs its hooks: receive-pack's three points in git's order and words, a step at a time over a presenter that shows each view at a path (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-597, A-622, A-644, A-654, A-665 parts 1 and 2)
+Applied in the same change to:
+- §4.17.2 (a status block, "Hooks, in git's terms", piece 10's line) and GAPS (the §4.17 entry);
+- `crates/server`: `git_push` (the answer a step at a time, `Answering`, `Unpresented`, `HookVerdicts`; its module docs)
+  and `git_push/hooks.rs` (new, Unix); `git_hooks` (`PresentView`, `configured` crate-visible; its tests' presenter
+  shared); `vcs_http/git/receive.rs` (the edge's steps); `lib.rs` (the module's note); tests in `git_push/tests.rs`;
+- `crates/git`: `receive::{write_report_held, write_report_end, write_hook_words}`, `Session::decide`,
+  `protected::{PRE_RECEIVE_HOOK_DECLINED, pre_receive_declined}`, and two tests in `receive/tests/session.rs`.
+
+- **What.** A push whose repository configures a git hook runs it as git's receive-pack does (git 2.50.1,
+  `execute_commands`, `update()`, `run_receive_hook`, `run_update_hook`, `copy_to_sideband`, the end of
+  `cmd_receive_pack`). `pre-receive` runs once, its standard input every command no earlier check refused, in a view
+  showing the push in git's quarantine; a refusal answers each of those commands `pre-receive hook declined`, after the
+  hook's words, once, and no later hook runs. `update` runs for each such command the policy admits (A-622 part 2's
+  check point first, as git's `update()` refuses before its hook), its arguments the ref and its two ids, in a view
+  showing the push among the repository's packs; a refusal answers that command `hook declined`, after the hook's words
+  and git's `error: hook declined to update <ref>` (A-644's `protected::hook_declined`). Then the verdicts, the appends
+  and the report but its last flush; then `post-receive` over the applied commands, in a view of the refs the push
+  left, its words written after the report and before the last flush, as git writes them.
+- **A step at a time.** The answer was one step; it is now `ReceivePack::answer_step`, called until it answers:
+  `Answering::Sealing` while a view is sealed a turn at a time (the shard's step quantum, A-665 part 2), and
+  `Answering::Hook(HookCall)` for a hook the edge runs off the shard's step (`HookCall::run`), handing what it answered
+  back through `ReceivePack::hook_ran`, which withdraws the view's showing and closes it. Between steps the driver
+  holds the sealed quarantine and the view under way; a push dropped between them gives both back through the shard's
+  state (logged where the state is not lent to the drop).
+- **Words.** An accepted hook's words go to band 2 at once, as `copy_to_sideband` relays them while the hook runs; a
+  refusing one's are its refusal's. Both are kept up to the push's room and charged to it. A run that ends in a way git
+  does not have (past a bound, its client gone, its program not started, its view not opened, sealed or shown) refuses
+  what the hook would have judged, its words followed by slates' line naming why, so no command passes unjudged;
+  `post-receive` only observes, and one that cannot run or exits non-zero (git ignores its status) is counted,
+  `git_push.post_receive_unaccepted`.
+- **The presenter (the seam).** A view is shown at a path a hook process opens by the push's presenter,
+  `git_hooks::PresentView` (`can_present`, `present`, `withdraw`). Its daemon implementation is the read-only
+  attachment the mount edges serve a read at a time from `GitHookView::read` (§4.6; on Linux in the launcher's
+  namespace), which this part does not build: the mount edges serve volumes alone, through bridge-core's one
+  `VolumeBridge`, so a view shown at a path is a read-only volume whose host (the base plane's `HostFs`, as an S3 base
+  is one, A-555) reads the repository's content store, presented where a hook can open it (the root mount, D-1). Until
+  it lands the daemon's presenter shows none (`Unpresented`), so a push whose repository configures a git hook is
+  refused `hook not run` before any object is admitted, as before this part. The tests' presenter writes each view
+  into a scratch directory.
+- **Where it differs from git.** Every `update` hook runs before any append, each view showing the refs as they stood
+  before the push, where git moves each ref right after its hook (without `atomic`), so a later command's hook there
+  sees an earlier ref moved. The band-2 lines of commands refused otherwise (the policy's, the verdicts') follow every
+  hook's words, where git interleaves them command by command. A run is bounded by its client alone: the hooks'
+  learned times are A-622's owed table, and the HTTP edge's signal of a client gone is owed with the presenter.
+- **Tests.** `git_push/tests.rs`, each hook a shell script run through the scratch presenter:
+  `t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothing` (`pre-receive hook declined`, the
+  hook's line once on band 2, nothing recorded, one view shown and withdrawn);
+  `t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` (the push lands; band 2 carries
+  `pre-receive`'s line, `update`'s, then after the report `post-receive`'s, whose view's `packed-refs` names `main` at
+  the pushed commit); `t_a665_an_update_hook_refuses_its_own_command_alone` (two creates, one refused `hook declined`
+  with git's line, the other landed). `receive/tests/session.rs`: the held report and its end are the answer
+  `Session::answer` writes for every captured push; a hook's words go to band 2 in git's 128-byte pieces only when the
+  push is multiplexed. The existing tests run the driver step by step under the daemon's presenter, a configured hook
+  still refused `hook not run`.
+- **Runs.** macOS arm64, Mac Studio, stock git 2.50.1 (Apple Git-155) and rustc 1.98.1, kiln r430 over main
+  550153532: red first, the hook path stubbed out of the driver (a push decided at once, its hooks never run), the three
+  new push tests failing, 3 of 3; green, `cargo test --locked -p slates-server --lib -- git_push:: git_hooks::
+  vcs_http::` 52 of 52 with no warning from a slates crate, `cargo test --locked -p slates-git --lib -- receive::
+  protected_fixtures` 49 of 49, `cargo fmt -p slates-git -p slates-server -- --check` clean. The first run (kiln r388)
+  found the first harness held the shard through the hooks' runs, and the daemon's watchdog ended the test process: the
+  tests now drive the push as a task on the shard, as the edge does. No integration target reaches the driver; the
+  landing merge's message names the run on the merged tree.
+- **Owed.** The read-only attachment that shows a view at a path (above); the edges' signal of a client gone, which
+  ends a hook's run; the hooks' learned times (A-622's table); seals kept as derived data; the SSH channel's call of the
+  driver (g294), which takes the same steps; the Linux and Windows runs and main's gates. A hook script written and run
+  at once can meet `ETXTBSY` on Linux while another test's child still holds its descriptor (the spawn's close-on-exec
+  window): the tests' scripts are written before the push starts.
+
+### A-652 part 3 — A Subversion dump imported by the daemon: the import verb over A-655's step, each record the import makes committed and logged as it lands (2026-11-19, g268 for UI goal 93 (kiln 51cef9f7); §4.17.4 piece 6 and item 3.5; §4.15; A-628, A-655, A-678)
+Applied in the same change to: §4.17.4 (a status block, piece 6's line, A-655 part 2b's owed list), GAPS (the §4.17.4
+entry), `crates/svn` (`commit/record.rs`: `Record::Uuid` and `Record::RevisionProperties`, their kind bytes, and their
+tests; `migration/import.rs`: `Importing::Commit`, `Importer::holding`, `Importer::loading`; `migration/records.rs`:
+`Repository::set_uuid` public, `check_revision_properties` and `set_revision_properties` in place of
+`set_revision_zero`, `commit_record`; `migration.rs`; the migration tests' driver and a golden test), `crates/server`
+(`vcs_store/svn_import.rs` and its tests, new; `vcs_store.rs`: the imports' map, `importing`, `free`, `replay_svn`
+through `commit_record`; `repository/import.rs`: the verb by tool, `svn_reply_of`, `svn_refusal_of`;
+`repository/svn_commit.rs`: `record`; `repository/push.rs`: an entry of no change holding its caller's record alone;
+`repository.rs` and `verbs.rs`: their notes), `crates/ipc` (`ImportFault::Subversion` and `ReplyBody::DumpImported`,
+appended; `ImportRepository`'s doc; `tests/wire_order.txt`), `crates/api` (contract 54).
+- **What was there.** A-628's import made a dump's revisions and committed each into records it held itself (A-655 part
+  2a's step), so only slates-svn's tests held an imported history; the daemon had no verb for it (A-678's
+  `ImportRepository` refused a Subversion repository `NotMercurial`), and nothing could record an import's UUID or
+  revision 0's properties.
+- **The import hands its records over.** `Importer::import` stops at each record it makes and answers
+  `Importing::Commit { consumed, record }`, A-655 part 2b's record type: a revision made on the youngest revision; the
+  UUID, where the stream's names a repository that holds no revision but 0 by another; revision 0's properties, set
+  whole as `close_revision` sets them. It reads on once its caller committed the record. A caller that holds the records
+  alone commits each through `Repository::commit_record` (the migration tests do); the daemon commits each through its
+  owner's step. So one import serves both, and a dump's revision is a commit like a client's (item 3.5), never a second
+  path.
+- **Two records beside the revisions.** `Record::Uuid` (kind 2: the UUID's 36 bytes; `svn_fs_set_uuid`) and
+  `Record::RevisionProperties { revision, properties }` (kind 3: the revision, then its properties as a revision's are
+  written; `svn_fs_change_rev_prop2` for each difference), each held by an entry of the repository's logs that moves no
+  green. A-635's append records such an entry: one of no change whose caller brings a record (`EntryParts::objects`)
+  holds that record alone, where a sealed push's objects and a revision's record still ride with their changes.
+  `svn_commit::record` checks the record against the records (a revision they hold; the room,
+  `check_revision_properties`), charges its growth, appends it, then applies it; a recovery replays every record after
+  the creation's through `commit_record`, the step each live record took.
+- **The daemon's import** (`vcs_store::svn_import`). `ImportRepository` on a Subversion repository names the dump's
+  file: the directory it is in is opened as a base is (read-only, §4.15) and the file by its name in it. The import is
+  kept in the shard's map, one a repository, and run a turn at a time on the owner shard by the task A-678's verb
+  starts: within a turn the file is read a copy slice at a time (or what the reader asks for, when more), handed to the
+  import, and each record committed, until the turn's time (`copy_slice_ns`) is spent; a revision's step is one unit.
+  The reader's admission is one client region's bytes, a Mercurial import's room; the records are lent every byte the
+  shard could admit for each call; what the import holds between its turns (its buffer and the open revision's
+  properties, texts and new contents, `Importer::holding`) is charged to the shard's budget as retention at each turn's
+  end, trued up, and given back at its end. Freeing the repository gives an import back.
+- **Answers.** The end answers `DumpImported { revisions, youngest }`. A refusal keeps the revisions committed before
+  it, as `svnadmin load` keeps them, and is answered by kind: `ImportRefused { Subversion { code, revision, path } }`
+  for the dump refused as `svnadmin load` refuses it (A-628's refusal with Subversion's number, the revision being
+  loaded, the path the refusal names) and for a revision the step refused (its refusal read as the import's);
+  `PastRoom` past the reader's admission; `BudgetExceeded` for the shard's budget (the records' room, or what the import
+  holds); `Format` for a revision whose green version this build cannot declare yet (A-655 part 2b's `Unsupported`); an
+  append's refusal as it is; `Pending`, `UnderWay`, the host's refusal naming the file and `Abandoned` as A-678's are.
+  `NotMercurial` now answers a repository of neither tool.
+- **Departures.** None from `svnadmin load`'s rules beyond A-628's (revision numbers kept, a foreign UUID refused,
+  properties byte for byte). A restart ends an import between its records: the revisions committed are the log's and
+  are recovered; the import is not, and a request sent again begins a new one, which refuses a stream that starts
+  before the revision after the youngest (`E160006`), so a dump of the revisions after it is what loads next. Not
+  taken (decided by the design, not measured): a second import path writing the records and the green directly, which
+  would be a second commit path and an import not durable as it lands.
+- **Tests.** slates-svn: the two records pinned byte for byte by hand and read back, every truncation refused, names out
+  of their order, a byte after the last and a UUID not in RFC 4122's form refused by kind, a flipped byte never a panic
+  and what reads canonical; `part1.dump` imported through a caller that names each record handed over (the UUID,
+  revision 0's properties, revisions 1 to 3, in that order) and, with revision 2 kept back, refusing revision 3 out of
+  its sequence (`E160006`); every golden, generated, rule, refusal and step test of A-628 and A-655 through the new
+  driver. slates-server: `part1.dump` imported through the daemon's step exporting `part1.dump` byte for byte, the green
+  at version 3, the register holding the creation, the UUID, revision 0's properties and three revisions; `part1.dump`
+  then `part2.dump` exporting `full.dump`, and `part1.dump` again refused at revision 0 (`E160006` on the wire);
+  `part1.dump` cut three bytes short refused `E200003` at revision 3, revisions 1 and 2 kept; the records made again
+  from the log exporting `part1.dump`; the verb on a running shard answered once when its import ends; every failure
+  mapped to its refusal. slates-ipc: the wire's order with the two appended variants. slates-api: the contract's
+  history.
+- **Evidence** (kiln r381, macOS arm64, Mac Studio d1323898, debug, 2026-11-19, the change over main 770ae8826).
+  `cargo fmt --check` clean for slates-svn, slates-server, slates-ipc and slates-api; `cargo test --locked -p
+  slates-svn --lib -- commit:: migration::` 94 of 94, 410 filtered out, in 1.27 s; `-p slates-ipc --test wire_order` 2
+  of 2 (the two appended variants' lines written by hand as the `--ignored` writer writes them, and held by the test);
+  `-p slates-api --lib -- contract_history an_import_refusal` 2 of 2; `-p slates-server --lib -- vcs_store::
+  repository:: --test-threads=4` 58 of 58, 714 filtered out, in 3.70 s, A-678's import tests among them. The first run
+  (kiln r349) failed two of the server's new tests at the revision a refusal names: the import forgot the revision it was
+  loading once refused, and keeps it now (`Importer::loading`). No integration target reaches the verb. The new tests
+  name what main lacks and do not build on main's tree; the mutation red-checks are main's (§8).
+- **Owed.** The export verb, A-652 part 3's second half (a range of revisions written as a dump into a volume, landed
+  under a grant, §4.15); an import resumed across a restart; the CLI's and the SDKs' words for the verb (A-678's owed);
+  main's runs (clippy, `xtask check`, the doc gate, Linux and Windows builds, the mutation red-checks).
+
 ### A-684 — The daemon starts the SSH edge: `--vcs-ssh ADDRESS`, the anchor holding its listener and its Ed25519 host key across daemon restarts, a fleet node presenting its own key, and the daemon's log naming the address and the key's fingerprint (2026-11-19, g299, UI goal 93 (kiln 51cef9f7); §4.17.2 "Transports" item 2; A-651's owed start; A-625 part 3 continued's two pieces for HTTP, mirrored)
 Applied in the same change to: §4.17.2's status (A-684's block; the daemon's start closed in A-651's and A-651 part 3's);
 GAPS (the §4.17 entry: A-684's line, A-651's owed lists, the stock-hg tests' waits); `crates/anchor`
@@ -52439,7 +52811,7 @@ tests, the start keeping an edge state on every shard as A-651 part 4 asks; `dae
 `bind_vcs_ssh_listener`, and the doc of `held_or_bound_listener`, A-689's one rule for a held listener, which the SSH
 edge adopts by too; `vcs_http`'s `bounds_of` and `ShardRepositories` shared with the SSH edge); `crates/api` (`ProcessOptions::vcs_ssh`, `role::vcs_ssh_address`, the
 roles' grammar and arguments, the anchor role's `publish_ssh_host_key` and `hold_vcs_ssh_listener`, the daemon role's
-configuration and log line; `StartSpec::vcs_ssh`; `CONTRACT` 55, after A-689's 54); `crates/cli` (the grammar and usage; `tests/cli.rs`:
+configuration and log line; `StartSpec::vcs_ssh`; `CONTRACT` 56, after A-689's 54 and A-652 part 3's 55); `crates/cli` (the grammar and usage; `tests/cli.rs`:
 an SSH host key reader and the restart test, and the doc of g083's `VCS_SSH_LINE`); `docs/cli.md`, `docs/library.md`,
 `README.md`.
 - **What.** A-651 built the SSH edge and left its start owed: nothing ran it outside tests. `--vcs-ssh ADDRESS` on the
@@ -52450,8 +52822,8 @@ an SSH host key reader and the restart test, and the doc of g083's `VCS_SSH_LINE
   locating repositories by their names' routes (`ShardRepositories`), and the services as the server has them
   (`ToolServices` over the HTTP edge's lenders, on main's word as A-682 and A-679 landed: git's upload-pack from each
   repository's store, `ShardStores`, and Mercurial's `serve --stdio` from its served view, `ServedViews`, on its owner
-  shard, each request admitted the edge's room; receive-pack and Subversion's tunnel refused as not served, in their
-  tools' own words, until their entry points land).
+  shard, each request admitted the edge's room; receive-pack (A-683) and Subversion's tunnel refused as not served, in
+  their tools' own words: A-688's `SvnServices` waits for a lender of Subversion's stores over A-662's map).
 - **Decisions.** (1) Any IPv4 address, on a fleet node or not: SSH encrypts every connection and proves the server by
   its host key before a client sends anything of its own (RFC 4253 §7-§8), and a client proves itself by a signature,
   never a secret sent (RFC 4252 §7), so no address leaves anything in the clear, as `--vcs-http`'s off loopback would. A
@@ -52497,7 +52869,8 @@ an SSH host key reader and the restart test, and the doc of g083's `VCS_SSH_LINE
   with the ED25519 host key SHA256:vg+qbVEBJ5vQY284R+Ciy61q1vRy3EclQoFRXjc7BsQ`, its edge presented that key, an exchange
   begun while the killed daemon's successor started was answered by it with the same key at the same port, and the
   successor named both again.
-- **Owed.** The other services wired into the daemon's site (A-683's receive-pack, A-688's svnserve tunnel); a test of
+- **Owed.** The other services wired into the daemon's site (A-683's receive-pack; A-688's tunnel, once its stores'
+  lender lands); a test of
   the daemon's own SSH site running upload-pack and `serve --stdio` for an enrolled key (A-682's and A-679's tests run
   its services alone); host keys in a fleet node's other key algorithms (ECDSA, RFC 5656;
   RSA, RFC 8332), so a node with a P-256 identity presents its own key; Windows keeps no listener across a restart

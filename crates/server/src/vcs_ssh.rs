@@ -64,14 +64,16 @@
 //! by the anchor across daemon restarts (the fleet node's own key on a fleet node); and the daemon's log names its
 //! address and its host key's fingerprint.
 //!
-//! **Owed** (GAPS, the §4.17 entry): the two services whose server halves have not landed, each refused as not served
-//! until it does (receive-pack, A-620 and A-683; Subversion's tunnel, §4.17.4 piece 12); Subversion's tunnel moved to
-//! the shard of the repository its greeting names; the live `git clone` and `hg clone` over SSH (main's runs).
+//! **Owed** (GAPS, the §4.17 entry): Subversion's tunnel in the daemon's site (A-688's `SvnServices`), which awaits a
+//! lender of its stores over A-662's map, and is refused as not served until it lands; receive-pack's server half,
+//! refused so until it lands (A-620, A-683); Subversion's tunnel moved to the shard of the repository its greeting
+//! names; the live `git clone`, `hg clone` and `svn checkout svn+ssh://` over SSH (main's runs).
 
 mod daemon_edge;
 mod git;
 mod hg;
 pub(crate) mod site;
+mod svn;
 mod waits;
 
 pub(crate) use daemon_edge::{bind, start};
