@@ -159,3 +159,9 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
 - r51 release hg push (main 1533d52b): killed at 183 s (shard 0 spins 1093 ms > 1051 ms window), daemon peak RSS
   13,861 MiB, matrix 17/24. Reported to main for w-hg. Release target ~/.cache/w-interop-release-target (Studio).
 - r50 Windows git_interop+svn_interop building on jupiter.
+- LANDED 4997b707f: svn matrix svnrdump + svnsync rows (byte-identical with fixtures on the reads repo, 29/29; git-2000
+  svnrdump spins -> w-svn). Reported.
+- r55: release hg whole push on main (A-732 p2, 5a917afcd+) with RSS sampling. r50: Windows interop on jupiter still
+  building (first Windows build is long).
+- r55 release hg push on 4997b707f (A-732 p2 in): killed at 194 s (spin 1080 ms), RSS 13,450 MiB, nothing durable;
+  restarted daemon spun again after recovery; matrix 17/24. Reported.
