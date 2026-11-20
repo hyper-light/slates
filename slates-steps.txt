@@ -1,0 +1,111 @@
+volume list exit 0 after 1 s
+bootstrapped
+bootstrap exit 0
+volume create exit 0
+id: 684919b9331c15430000000000000005
+path: (none until a bridge exists)
+
+volume id []
+mount exit 2
+slates: bad volume ID: `` is not 32 hexadecimal characters
+
+usage: slates [--instance NAME] <command>
+
+  anchor   [--quick] [--shards N] [--fleet PATH --node NAME]   run the anchor: own the segment, supervise the daemon
+  daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
+           [--vcs-http ADDRESS]                                either role: serve git over HTTP(S) at ADDRESS; loopback
+                                                               alone unless --fleet gives the node's HTTPS identity
+           [--vcs-ssh ADDRESS]                                 either role: serve git, hg and svn over SSH at ADDRESS;
+                                                               the daemon logs the host key's SHA256 fingerprint
+           [--vcs-svn ADDRESS]                                 either role: serve svn:// (cleartext) at ADDRESS; loopback
+                                                               alone unless --fleet
+  profile  [--quick] [--json]                      measure and print the machine profile
+  version                                          print this binary's version (`slates VERSION`)
+  mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
+
+  volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR] [--json]
+  volume list [--json]
+  volume stat ID [--json]
+  volume snapshot ID [--json]
+  volume destroy-snapshot ID SNAPSHOT [--json]
+  volume clone ID SNAPSHOT NAME [--json]
+  volume resize ID (--bounded SIZE | --dynamic MAX) [--json]
+  volume destroy ID [--json]
+  green NAME [--require-evidence] [--base VOLUME --snapshot N] [--json]   create a green merge target
+  versions GREEN [--json]                          its head version
+  changed-since GREEN VERSION [--json]             files changed since a version
+  work GREEN NAME [--json]                         a work volume over a green
+  edit WORK PATH AT DELETE TEXT [--json]           declare an edit (a splice)
+  submit WORK [--evidence HEX] [--json]            submit a work's increment
+  rebase WORK [--json]                             rebase a work onto its green's head
+  checkout GREEN VOLUME ATTACHMENT --snapshot N [--json]   write a green's head into the volume it was made from
+  advance ATTACHMENT [VERSION] [--json]            re-pin a green attachment (the head when no VERSION)
+  read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
+  write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
+  volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
+  attach ID [--read | --write] [--snapshot N] [--hold]
+            [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
+  detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
+  bootstrap (root | region) [--json]             explicitly create a new consensus group
+  recovery-plan (root | region) [--join-group HASH] [--json]
+  recover (root | region) --confirm PLAN --fenced --accept-loss [--join-group HASH] [--json]
+  status [--json]                                  the daemon's status
+  oci-check SOURCE MOUNT_ID DEVICE                 is SOURCE still the mount an `attach --oci` verified (run before binding)
+  oci-runtime RUNTIME                              the profile of the runtime that will bind it, and the evidence it holds
+  status ID [--drift] [--json]
+  base read ID PATH
+  base digest ID PATH [--json]                     a clean base file's verified content digest
+  base rewitness ID [PATH ...] [--json]
+  base pin ID [PATH ...] [--json]
+  base capture ID [--json]                         capture an overlay's whole base: a snapshot whose clones move
+  land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
+  image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
+  image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
+  grants [--json]
+  grant LANDING MANIFEST [--session] [--term SECONDS] [--json]   approve a presented landing
+  audit [--since N] [--json]
+  enroll [--account UID] [--json]                  enroll a consumer; its capability is shown once
+  revoke CONSUMER [--json]                         revoke a consumer's enrollment
+  credential key LINE [--principal PRINCIPAL] [--expires SECONDS] [--json]
+            enroll an SSH public key (its .pub line) for git over SSH; PRINCIPAL is you unless given
+  credential token [--principal PRINCIPAL] [--expires SECONDS] [--json]
+            mint a token for git over HTTPS (Basic's password or a bearer token) and svn:// (CRAM-MD5's
+            password, its id the user name); shown once
+  credential revoke ID [--json]                    revoke a credential by its id (a key's SHA256:... or hex)
+  repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN] [--json]
+            create a repository and its root green, a new empty one unless GREEN; FORMAT is sha1 (git's
+            default) or sha256 for git, sha1 for hg, revisions for svn; BRANCH is git's (main when not
+            given) or Mercurial's (default), none for svn; prints the repository and its root green's id
+  repository import NAME PATH [--json]               import a history into a new repository's empty store: PATH
+            (absolute) is a Mercurial repository's directory (its .hg) for an hg repository or a
+            Subversion dump file for an svn one; answered when the import ends, with what it took
+  share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
+  run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
+  exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
+            run CMD with the volume at PATH (Linux); --apparmor-profile makes its namespace under slates'
+            AppArmor profile where the host restricts unprivileged user namespaces (off unless given)
+  apparmor profile [--executable PATH]            print slates' AppArmor profile for this binary (or PATH)
+  apparmor check [--json]                         can `exec` make its namespace here; how to load the profile
+  shards ID [--subtree DIR] [--read-only] --fd N [--resync-fd M] [--json] -- CMD [ARG ...]
+            run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
+  shards ID [--subtree DIR] [--read-only] [--json] -- CMD [ARG ...]
+            run CMD with a Shards fs stream of the volume as a handle: {handle} in its arguments names its value,
+            e.g. `shards run --slates-fs-handle {handle} ...`, and {resync}, where it stands, its resync end's (Windows)
+  vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
+            run VMM with slates' own virtio-fs device of the volume: {socket} in its arguments names the device's
+            socket end (/proc/self/fd/N) and {fd} its descriptor (N), e.g. `crosvm run --vhost-user
+            type=fs,socket={socket} ...` or `qemu-system-x86_64 -chardev socket,id=fs,fd={fd} ...` (Linux)
+  pmem ID FILE --fd N [--json] -- VMM [ARG ...]
+            run VMM with a writable copy of FILE (2 MiB multiples) at descriptor N as its pmem device's backing, with no
+            host mount: {pmem} in its arguments names the copy (/proc/self/fd/N), {fd} its descriptor (N), {len} its
+            length; SIGUSR1 compares the copy back into the file, as the VM's exit does; the guest's own flush does not
+            (Linux)
+
+SIZE is bytes with a binary unit: 512MiB, 4GiB (B, KiB, MiB, GiB, TiB).
+The instance is --instance, else SLATES_ENDPOINT, else `default`.
+Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed; `run` and `shards` exit as their command did.
+PRINCIPAL is uid:N, consumer:N (under your account) or consumer:ACCOUNT/N.
+--json emits machine-readable JSON on every client verb (the MCP schema), except `base read` which
+streams raw bytes. Ids come back as `{"id"}`, an outcome-only verb as `{"ok":true}`.
+
+ERROR: Cannot find drive. A drive with the name 'S' does not exist.
