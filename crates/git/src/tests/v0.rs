@@ -1922,22 +1922,40 @@ fn any_ref(format: ObjectFormat) -> impl Strategy<Value = OwnedRef> {
   )
 }
 
+/// Shape: the kinds of byte a ref name's component chooses among, one each: a letter, a digit, `-`, `_`.
+const REF_NAME_BYTE_KINDS: u8 = 4;
+
+/// Shape: the weights `any_ref_name` chooses by: one for `HEAD`, eight for a name under `refs/`.
+const REF_NAME_WEIGHTS: u8 = 9;
+
 /// A name an advertised ref may have (A-640: held to git's ref-name rule): `HEAD`, or one to three components under
-/// `refs/`, each of letters, digits, `-` and `_`.
+/// `refs/`, each of letters, digits, `-` and `_`; chosen by selectors (no `prop_oneof!`, whose strategy is
+/// reference-counted, R2).
 fn any_ref_name() -> impl Strategy<Value = Vec<u8>> {
-  let byte = prop_oneof![b'a'..=b'z', b'0'..=b'9', Just(b'-'), Just(b'_')];
+  let byte = (0..REF_NAME_BYTE_KINDS, b'a'..=b'z', b'0'..=b'9').prop_map(
+    |(kind, letter, digit)| match kind {
+      0 => letter,
+      1 => digit,
+      2 => b'-',
+      _ => b'_',
+    },
+  );
   let component = proptest::collection::vec(byte, 1..8);
-  prop_oneof![
-    1 => Just(b"HEAD".to_vec()),
-    8 => proptest::collection::vec(component, 1..4).prop_map(|components| {
+  (
+    0..REF_NAME_WEIGHTS,
+    proptest::collection::vec(component, 1..4),
+  )
+    .prop_map(|(weight, components)| {
+      if weight == 0 {
+        return b"HEAD".to_vec();
+      }
       let mut name = b"refs".to_vec();
       for component in components {
         name.push(b'/');
         name.extend(component);
       }
       name
-    }),
-  ]
+    })
 }
 
 /// An advertisement's parts: its version, its capabilities with an `object-format` naming its format added last, its

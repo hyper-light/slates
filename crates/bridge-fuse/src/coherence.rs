@@ -1872,41 +1872,8 @@ mod tests {
       let mut round = OverrunRound::default();
       round.begin(7);
       assert!(round.owed());
-
-      let mut slices = vec![slice_of(&mut round, &mut holds, 3)];
-      holds.forgot(14, 2);
-      holds.handed_out(1, Some("a00"), 16);
-      slices.push(slice_of(&mut round, &mut holds, 3));
-      slices.push(slice_of(&mut round, &mut holds, 3));
-      holds.handed_out(1, Some("a01"), 10);
-      holds.unnamed(2, "b12");
-      while round.owed() {
-        assert_eq!(
-          round.told_before(),
-          Some(7),
-          "the kernel stands before the overrun until the round is told"
-        );
-        assert!(slices.len() < 20, "the round ends: {slices:?}");
-        slices.push(slice_of(&mut round, &mut holds, 3));
-      }
-
-      let expected = vec![
-        vec![Told::Node(1), Told::Node(10), Told::Node(11)],
-        vec![Told::Node(12), Told::Node(13), Told::Node(15)],
-        vec![Told::Node(16), name_told(1, "a00"), name_told(1, "a10")],
-        vec![
-          name_told(1, "a11"),
-          name_told(1, "a12"),
-          name_told(1, "a13"),
-        ],
-        vec![
-          name_told(1, "a15"),
-          name_told(2, "b10"),
-          name_told(2, "b11"),
-        ],
-        vec![name_told(2, "b13"), name_told(2, "b15")],
-      ];
-      assert_eq!(slices, expected);
+      let slices = sliced_while_the_kernel_moves(&mut round, &mut holds);
+      assert_eq!(slices, six_slices_of_at_most_three());
       assert_eq!(
         holds.everything(),
         (vec![10, 11, 12, 13, 15, 16], vec![(1, "a01".to_owned())]),
@@ -1929,6 +1896,51 @@ mod tests {
         Vec::<Told>::new(),
         "nothing more is owed"
       );
+    }
+
+    /// Runs `round` out in slices of three while the kernel forgets, is handed and unlinks names
+    /// ahead of and behind the walk, as A-562's test describes; the told bound holds throughout.
+    fn sliced_while_the_kernel_moves(
+      round: &mut OverrunRound,
+      holds: &mut KernelHolds,
+    ) -> Vec<Vec<Told>> {
+      let mut slices = vec![slice_of(round, holds, 3)];
+      holds.forgot(14, 2);
+      holds.handed_out(1, Some("a00"), 16);
+      slices.push(slice_of(round, holds, 3));
+      slices.push(slice_of(round, holds, 3));
+      holds.handed_out(1, Some("a01"), 10);
+      holds.unnamed(2, "b12");
+      while round.owed() {
+        assert_eq!(
+          round.told_before(),
+          Some(7),
+          "the kernel stands before the overrun until the round is told"
+        );
+        assert!(slices.len() < 20, "the round ends: {slices:?}");
+        slices.push(slice_of(round, holds, 3));
+      }
+      slices
+    }
+
+    /// The slices A-562's test expects: the root, the nodes in order, then the names in order.
+    fn six_slices_of_at_most_three() -> Vec<Vec<Told>> {
+      vec![
+        vec![Told::Node(1), Told::Node(10), Told::Node(11)],
+        vec![Told::Node(12), Told::Node(13), Told::Node(15)],
+        vec![Told::Node(16), name_told(1, "a00"), name_told(1, "a10")],
+        vec![
+          name_told(1, "a11"),
+          name_told(1, "a12"),
+          name_told(1, "a13"),
+        ],
+        vec![
+          name_told(1, "a15"),
+          name_told(2, "b10"),
+          name_told(2, "b11"),
+        ],
+        vec![name_told(2, "b13"), name_told(2, "b15")],
+      ]
     }
 
     /// A-562. Do: a kernel holding four nodes and their names falls behind; one slice of two items runs; it falls behind
@@ -2138,7 +2150,7 @@ mod tests {
     states.adopted(file.0, adoption.from, adoption.changes.as_deref());
     assert_eq!(
       states.stale_after(file.0, 0..64, started_at, &[]),
-      Some(vec![0..32]),
+      Some(std::iter::once(0..32).collect()),
       "the replayed write's bytes are stale, and only they"
     );
   }

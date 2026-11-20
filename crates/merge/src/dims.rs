@@ -17,7 +17,9 @@
 //! borrow of a stored key: a stored whole key would be wrong after a graft.
 //!
 //! **Files hold blocks.** A file's bytes are a block of [`Blocks`], counted by the map nodes naming it, so copying a node
-//! on a path costs a count, never the file's bytes; a block is freed with its last holder.
+//! on a path costs a count, never the file's bytes; a block is freed with its last holder. The other holders are the
+//! green's identity table ([`crate::held`], A-716) and its content history ([`crate::history`], A-728), whose latest
+//! value of a file is the file's block, so a changed file's bytes are held once.
 //!
 //! **Attributes keep their order.** An attribute's key is its path with every NUL escaped ([`NUL_ESCAPED`]), then
 //! [`PATH_END`], then its name: escaping keeps byte order, and the path's end sorts before any continuation of it, so a
@@ -188,7 +190,7 @@ impl Blocks {
   }
 
   /// A block's bytes; none for a block that is gone (never, while a node names it).
-  fn bytes(&self, block: Block) -> &[u8] {
+  pub(crate) fn bytes(&self, block: Block) -> &[u8] {
     self
       .slots
       .get(block.0)
@@ -198,14 +200,14 @@ impl Blocks {
   }
 
   /// One more holder of `block`.
-  fn hold(&mut self, block: Block) {
+  pub(crate) fn hold(&mut self, block: Block) {
     if let Some(Some((_, holders))) = self.slots.get_mut(block.0) {
       *holders = holders.saturating_add(1);
     }
   }
 
   /// One holder of `block` fewer; the block is freed with its last.
-  fn release(&mut self, block: Block) {
+  pub(crate) fn release(&mut self, block: Block) {
     let Some(place) = self.slots.get_mut(block.0) else {
       return;
     };
@@ -344,6 +346,17 @@ impl Files {
   /// One holder of a held block fewer; the block is freed with its last.
   pub(crate) fn release_block(&mut self, block: Block) {
     self.blocks.release(block);
+  }
+
+  /// The blocks, for a reader of a block a green's content history names (A-728: the history's latest value is the
+  /// file's block).
+  pub(crate) fn blocks(&self) -> &Blocks {
+    &self.blocks
+  }
+
+  /// The blocks, for the history to hold or let go of a block it names (A-728).
+  pub(crate) fn blocks_mut(&mut self) -> &mut Blocks {
+    &mut self.blocks
   }
 
   /// [`Dim::fork`]: the blocks stay with the arena.
@@ -697,6 +710,16 @@ mod tests {
     }
   }
 
+  /// Give `files`' hold back a node a step until nothing is left of it.
+  fn release_a_node_a_step(files: &mut Files) {
+    let mut releasing = files.releasing();
+    while files
+      .map
+      .nodes
+      .release_step(&mut releasing, &mut files.blocks)
+    {}
+  }
+
   /// A-534, A-575. Do: put a file, fork the map, change the file in the fork and remove another, then release both
   /// maps a node a step. Expect: each map reads its own bytes, the original's blocks are untouched by the fork's changes
   /// and by the fork's release, and once both are released every node and every block is gone.
@@ -715,20 +738,10 @@ mod tests {
     files.lend(&mut fork);
     assert_eq!(fork.get("a"), Some(b"changed".as_slice()));
     assert_eq!(fork.get("b"), None);
-    let mut releasing = fork.releasing();
-    while fork
-      .map
-      .nodes
-      .release_step(&mut releasing, &mut fork.blocks)
-    {}
+    release_a_node_a_step(&mut fork);
     fork.lend(&mut files);
     assert_eq!(files.get("a"), Some(b"one".as_slice()));
-    let mut releasing = files.releasing();
-    while files
-      .map
-      .nodes
-      .release_step(&mut releasing, &mut files.blocks)
-    {}
+    release_a_node_a_step(&mut files);
     assert_eq!(files.map.nodes.live(), 0, "every node freed");
     assert_eq!(files.blocks.live(), 0, "every block freed");
   }

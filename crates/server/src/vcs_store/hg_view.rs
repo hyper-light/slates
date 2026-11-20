@@ -89,8 +89,8 @@ impl HgStores for ServedViews {
     outcome
   }
 
-  fn push_room(&self) -> Option<u64> {
-    crate::state::with_state(|state| crate::git_push::push_room(state))
+  fn push_room(&self, id: RepositoryId) -> Option<u64> {
+    crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes)
   }
 }
 
@@ -166,6 +166,9 @@ fn charge_each<T>(room: &mut Admission, count: usize) -> Result<(), PastAdmissio
   room.charge(each.saturating_mul(count))
 }
 
+/// Bookmarks: each its name and the node it names.
+type BookmarkHeads = Vec<(Vec<u8>, Node)>;
+
 /// The phase roots and bookmarks repository `id`'s register holds now, copied and charged to `room` (module docs): a
 /// root whose phase or node Mercurial does not have, a name under the bookmarks' tag that no bookmark's name is, and a
 /// bookmark whose green names no head are not read, since the register holds none of them for a push it took.
@@ -173,7 +176,7 @@ fn register_of(
   state: &ShardState,
   id: RepositoryId,
   room: &mut Admission,
-) -> Result<(Vec<PhaseHead>, Vec<(Vec<u8>, Node)>), PastAdmission> {
+) -> Result<(Vec<PhaseHead>, BookmarkHeads), PastAdmission> {
   let repositories = state.db.partition().repositories();
   charge_each::<PhaseHead>(room, repositories.phase_roots(id).count())?;
   let roots = repositories

@@ -726,7 +726,8 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     };
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
-      Err((host, refusal)) => {
+      Err(handed) => {
+        let (host, refusal) = *handed;
         slot.host = Some(BaseHost::Disk(host));
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return refused(target_refusal(&refusal, &prepared.target));
@@ -1736,7 +1737,8 @@ fn begin_granted(
     };
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
-      Err((host, refusal)) => {
+      Err(handed) => {
+        let (host, refusal) = *handed;
         slot.host = Some(BaseHost::Disk(host));
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return not_run(
@@ -4775,52 +4777,66 @@ mod landed_reply_tests {
     const BOTH: u32 = 5;
     /// Shape: see `BOTH`.
     const BOTH_ERRNO: i32 = 5;
-    let win32 = OsCode::Win32(BOTH);
-    let errno = OsCode::Errno(BOTH_ERRNO);
+    assert_answers_and_targets_keep_their_numbering(BOTH, BOTH_ERRNO);
+    assert_cells_and_bases_keep_their_numbering(BOTH, BOTH_ERRNO);
+  }
+
+  /// The reply's answer and a target's refusal carry Win32 `code` and errno `errno_code`, one number, each in its
+  /// own variant, a path on the daemon's own mount too.
+  fn assert_answers_and_targets_keep_their_numbering(code: u32, errno_code: i32) {
+    let win32 = OsCode::Win32(code);
+    let errno = OsCode::Errno(errno_code);
     assert_eq!(
       super::answer_of(HostError::Unavailable(win32)),
-      HostAnswer::Win32 { code: BOTH }
+      HostAnswer::Win32 { code }
     );
     assert_eq!(
       super::answer_of(HostError::NoSpace(errno)),
-      HostAnswer::Errno { errno: BOTH_ERRNO }
+      HostAnswer::Errno { errno: errno_code }
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::Exists(win32)),
-      TargetRefusal::HostWin32 { code: BOTH }
+      TargetRefusal::HostWin32 { code }
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::Unavailable(errno)),
-      TargetRefusal::Host { errno: BOTH_ERRNO }
+      TargetRefusal::Host { errno: errno_code }
     );
     // A path on this daemon's own mount carries the platform's deadlock-avoided code in its own numbering (A-227):
     // Windows' `ERROR_POSSIBLE_DEADLOCK` rode in an errno's place before A-539.
     assert_eq!(
       super::answer_of(HostError::OwnMount(win32)),
-      HostAnswer::Win32 { code: BOTH }
+      HostAnswer::Win32 { code }
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::OwnMount(win32)),
-      TargetRefusal::HostWin32 { code: BOTH }
+      TargetRefusal::HostWin32 { code }
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::OwnMount(errno)),
-      TargetRefusal::Host { errno: BOTH_ERRNO }
+      TargetRefusal::Host { errno: errno_code }
     );
+  }
+
+  /// A crashed landing's cell and a base directory's refusal carry Win32 `code` and errno `errno_code`, one number,
+  /// each in its own variant.
+  fn assert_cells_and_bases_keep_their_numbering(code: u32, errno_code: i32) {
+    let win32 = OsCode::Win32(code);
+    let errno = OsCode::Errno(errno_code);
     assert_eq!(
       super::degradation_of(&slates_land::engine::Degradation::Crashed { code: win32 }),
-      LandingDegradation::CrashedWin32 { code: BOTH }
+      LandingDegradation::CrashedWin32 { code }
     );
     assert_eq!(
       super::degradation_of(&slates_land::engine::Degradation::Crashed { code: errno }),
-      LandingDegradation::Crashed { errno: BOTH_ERRNO }
+      LandingDegradation::Crashed { errno: errno_code }
     );
-    let base = |code| crate::error::base_unavailable("/base".to_owned(), code);
+    let base = |os_code| crate::error::base_unavailable("/base".to_owned(), os_code);
     assert_eq!(
       base(Some(win32)),
       Refusal::BaseUnavailableWin32 {
         path: "/base".to_owned(),
-        code: BOTH
+        code
       }
     );
     assert_eq!(

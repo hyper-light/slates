@@ -72,8 +72,9 @@ use slates_hg::push::classify::{
   self, BookmarkMove, BookmarkRead, DRAFT, LineMove, LineRead, Plan, RootChange,
 };
 use slates_hg::push::commit::Unindexed;
+#[cfg(test)]
 use slates_hg::push::held::IndexHeld;
-use slates_hg::push::intake::{self, Intake, Intaken, Refused as IntakeRefused, Stepped};
+use slates_hg::push::intake::{self, Intake, Intaken, Rebase, Refused as IntakeRefused, Stepped};
 use slates_hg::push::reply::{Refused, Replied, Reply};
 use slates_hg::push::tree::{self, Move};
 use slates_hg::push::verify::{Held, Unverified, Verified};
@@ -395,7 +396,7 @@ impl Read {
   }
 
   /// The line at `line` among the lines read.
-  fn line(&self, line: usize) -> Result<&Named, Refused> {
+  fn line(&self, line: usize) -> Result<&Named, Box<Refused>> {
     self
       .lines
       .get(line)
@@ -404,7 +405,7 @@ impl Read {
   }
 
   /// The bookmark `mark` as read, where it is bound.
-  fn mark(&self, mark: &[u8]) -> Result<&Named, Refused> {
+  fn mark(&self, mark: &[u8]) -> Result<&Named, Box<Refused>> {
     self
       .marks
       .iter()
@@ -446,11 +447,11 @@ impl Read {
 }
 
 /// `error:abort` with slates' words.
-fn abort(message: Vec<u8>) -> Refused {
-  Refused::Abort {
+fn abort(message: Vec<u8>) -> Box<Refused> {
+  Box::new(Refused::Abort {
     message,
     hint: None,
-  }
+  })
 }
 
 /// Slates' words for a refusal: `push refused: ` and what refused it.
@@ -545,9 +546,9 @@ pub(crate) fn prepare<V: Repository, H: Held>(
   (brought, held_changesets): (&[ReadChangeset], &[Node]),
   terms: Terms,
   admission: &mut Admission,
-) -> Result<Prepared, Refused> {
+) -> Result<Prepared, Box<Refused>> {
   check::judge(unbundle, view, admission).map_err(|refused| match refused {
-    CheckRefusal::Raced { words } => Refused::PushRaced { message: words },
+    CheckRefusal::Raced { words } => Box::new(Refused::PushRaced { message: words }),
     CheckRefusal::View(_) => abort(VIEW_REFUSED.to_vec()),
   })?;
   // The push's revisions are the fork's (A-720): every text the works read is read through `held`, the fork.
@@ -612,7 +613,7 @@ fn work<H: Held>(
   (verified, held): (&Verified, &H),
   (_, name, room): Terms,
   admission: &mut Admission,
-) -> Result<Increment, Refused> {
+) -> Result<Increment, Box<Refused>> {
   let engine = state
     .greens
     .get(&named.green)
@@ -635,7 +636,7 @@ fn changes<H: Held>(
   revisions: (&Verified, &H),
   terms: Terms,
   admission: &mut Admission,
-) -> Result<Vec<BranchChange>, Refused> {
+) -> Result<Vec<BranchChange>, Box<Refused>> {
   let mut changes = Vec::new();
   for moved in &plan.lines {
     changes.push(match moved {
@@ -690,7 +691,7 @@ fn mark_change<H: Held>(
   revisions: (&Verified, &H),
   terms: Terms,
   admission: &mut Admission,
-) -> Result<BranchChange, Refused> {
+) -> Result<BranchChange, Box<Refused>> {
   Ok(match moved {
     BookmarkMove::Moved { name, to, .. } => {
       let named = read.mark(name)?;
@@ -932,7 +933,7 @@ pub(crate) fn admitted(
   state: &ShardState,
   (principal, repository): (&Principal, RepositoryId),
   prepared: &Prepared,
-) -> Result<(), Refused> {
+) -> Result<(), Box<Refused>> {
   let record = state
     .db
     .partition()
@@ -944,7 +945,7 @@ pub(crate) fn admitted(
 }
 
 /// The answer to a push the policy refused.
-fn policy_refused(refusal: PushRefusal, asked: &[Ask], principal: &Principal) -> Refused {
+fn policy_refused(refusal: PushRefusal, asked: &[Ask], principal: &Principal) -> Box<Refused> {
   let named = |index: u32| usize::try_from(index).ok().and_then(|at| asked.get(at));
   let words = match refusal {
     PushRefusal::Denied { index, .. } => {
@@ -1142,7 +1143,7 @@ pub(crate) async fn run_hooks<G: core::future::Future<Output = ()> + Unpin>(
       ran.output.push(Replied::Output { in_reply_to, words });
     }
     if !matches!(ended.outcome, Outcome::Accepted { .. }) {
-      ran.refused = Some(abort(hook_words(&hook.name, &ended.outcome)));
+      ran.refused = Some(*abort(hook_words(&hook.name, &ended.outcome)));
       break;
     }
   }
@@ -1176,12 +1177,27 @@ pub(crate) fn land(
     wanted,
     ..
   } = prepared;
+  // A fork made from an index another push replaced since names its parents by numbers that index no longer gives:
+  // never put in the index's place (A-720 part 2b re-bases it before its landing).
+  if forked
+    .as_ref()
+    .is_some_and(|forked| is_stale(state, repository, forked))
+  {
+    let released = match forked {
+      Some(Forked { fork, .. }) => release_index(state, fork),
+      None => Ok(()),
+    };
+    return Landed {
+      answer: Err(*abort(MOVED.to_vec())),
+      released,
+    };
+  }
   let Some(Forked { fork, intaken, .. }) = forked else {
     let appended = RepositoryLogs::append(state, principal, repository, changes, parts);
     return Landed {
       answer: appended
         .map(|_| Reply::accepted(&replied, wanted))
-        .map_err(|refused| append_refused(&refused)),
+        .map_err(|refused| *append_refused(&refused)),
       released: Ok(()),
     };
   };
@@ -1198,7 +1214,7 @@ pub(crate) fn land(
     Some(Some(Ok(bytes))) => Some(bytes),
     Some(_) => {
       return Landed {
-        answer: Err(abort(UNRECORDED.to_vec())),
+        answer: Err(*abort(UNRECORDED.to_vec())),
         released: release_index(state, fork),
       };
     }
@@ -1213,7 +1229,7 @@ pub(crate) fn land(
       released: replace_index(state, repository, fork),
     },
     Err(refused) => Landed {
-      answer: Err(append_refused(&refused)),
+      answer: Err(*append_refused(&refused)),
       released: release_index(state, fork),
     },
   }
@@ -1286,17 +1302,161 @@ pub(crate) async fn unbundle(
       Err(outcome) => return Some(outcome),
     },
   };
-  crate::state::with_state(|state| {
-    landing(
-      state,
-      repository,
-      (principal, bundle),
-      &unbundle,
-      forked,
-      room,
-    )
-  })
-  .flatten()
+  // Landed in one step against the index as it is then; a fork another push made stale meanwhile is re-based by node
+  // (A-720 part 2b), a slice at a time, and the landing tried again.
+  let mut forked = forked;
+  loop {
+    let tried = crate::state::with_state(|state| match forked.take() {
+      Some(stale) if is_stale(state, repository, &stale) => Err(Box::new(stale)),
+      fresh => Ok(landing(
+        state,
+        repository,
+        (principal, bundle),
+        &unbundle,
+        fresh,
+        room,
+      )),
+    });
+    match tried? {
+      Ok(outcome) => return outcome,
+      Err(stale) => match rebase_sliced(repository, *stale).await? {
+        Ok(rebased) => forked = Some(rebased),
+        Err(outcome) => return Some(outcome),
+      },
+    }
+  }
+}
+
+/// Whether `forked` was made from an index another push has replaced since (A-720 part 2b).
+fn is_stale(state: &ShardState, repository: RepositoryId, forked: &Forked) -> bool {
+  state.vcs_stores.generation_of(repository) != Some(forked.generation)
+}
+
+/// A stale fork's re-base while it runs (A-720 part 2b), given back by its drop if it is not finished.
+struct Rebasing {
+  /// The re-base, until it is finished or given back.
+  rebase: Option<Rebase>,
+  /// The generation of the index it re-bases onto.
+  generation: u64,
+}
+
+impl Rebasing {
+  /// One slice: rows re-appended until the re-base is done or the shard's quantum is spent; none when the content
+  /// store is gone.
+  fn slice(&mut self, state: &mut ShardState) -> Option<Result<Stepped, Unindexed>> {
+    let rebase = self.rebase.as_mut()?;
+    let quantum = vcs_store::hg_import::quantum_of(state);
+    let start = slates_rt::futures::now_ns();
+    vcs_store::within_budget(state, 0, |stores| {
+      let content = stores.content_mut()?;
+      Some(loop {
+        match rebase.step(content) {
+          Ok(Stepped::More) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          other => break other,
+        }
+      })
+    })
+  }
+
+  /// The re-based fork, the stale one given back; none, counted, when its release is refused or the store is gone.
+  fn finish_in(mut self, state: &mut ShardState) -> Option<Forked> {
+    let rebase = self.rebase.take()?;
+    let generation = self.generation;
+    let finished = vcs_store::within_budget(state, 0, |stores| {
+      stores.content_mut().map(|content| rebase.finish(content))
+    });
+    match finished {
+      Some(Ok((fork, intaken))) => Some(Forked {
+        fork,
+        intaken,
+        generation,
+      }),
+      _ => {
+        state.count(vcs_store::RELEASE_REFUSED, 1);
+        None
+      }
+    }
+  }
+}
+
+impl Drop for Rebasing {
+  fn drop(&mut self) {
+    if let Some(rebase) = self.rebase.take() {
+      // Dropped mid-re-base (its connection ended): both forks given back on the shard that holds the store.
+      crate::state::with_state(|state| {
+        let released = vcs_store::within_budget(state, 0, |stores| {
+          stores
+            .content_mut()
+            .map_or(Ok(()), |content| rebase.abandon(content))
+        });
+        if released.is_err() {
+          state.count(vcs_store::RELEASE_REFUSED, 1);
+        }
+      })
+      .unwrap_or_default();
+    }
+  }
+}
+
+/// Starts re-basing `stale` onto `repository`'s index as it is now; none when its store is not held here.
+fn begin_rebase(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  stale: Forked,
+) -> Option<Result<Rebasing, PushOutcome>> {
+  let Forked { fork, intaken, .. } = stale;
+  // A refusal hands the fork back, boxed: an index is far larger than the rebase begun.
+  let begun = vcs_store::within_budget(state, 0, |stores| {
+    let Some(generation) = stores.generation_of(repository) else {
+      return Err(Box::new((None, fork)));
+    };
+    let Some((content, store)) = stores.mercurial(repository) else {
+      return Err(Box::new((None, fork)));
+    };
+    Rebase::begin(fork, &intaken, &mut store.index, content)
+      .map(|rebase| Rebasing {
+        rebase: Some(rebase),
+        generation,
+      })
+      .map_err(|handed| {
+        let (refused, fork) = *handed;
+        Box::new((Some(refused), fork))
+      })
+  });
+  match begun {
+    Ok(rebasing) => Some(Ok(rebasing)),
+    Err(refused) => {
+      let (refused, fork) = *refused;
+      if release_index(state, fork).is_err() {
+        state.count(vcs_store::RELEASE_REFUSED, 1);
+      }
+      refused.map(|refused| Err(PushOutcome::refused(&abort(unindexed_words(&refused)))))
+    }
+  }
+}
+
+/// `stale` re-based a slice at a time, a yield between slices (A-720 part 2b); none when the store went away.
+async fn rebase_sliced(
+  repository: RepositoryId,
+  stale: Forked,
+) -> Option<Result<Forked, PushOutcome>> {
+  let begun = crate::state::with_state(|state| begin_rebase(state, repository, stale));
+  let mut rebasing = match begun.flatten()? {
+    Ok(rebasing) => rebasing,
+    Err(outcome) => return Some(Err(outcome)),
+  };
+  loop {
+    let sliced = crate::state::with_state(|state| rebasing.slice(state));
+    match sliced.flatten()? {
+      Ok(Stepped::More) => slates_rt::futures::yield_now().await,
+      Ok(Stepped::Done) => {
+        return crate::state::with_state(|state| rebasing.finish_in(state))
+          .flatten()
+          .map(Ok);
+      }
+      Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
+    }
+  }
 }
 
 /// [`unbundle`] in one call, every slice at once: the driver's steps for a caller that holds the shard's state (the
@@ -1391,7 +1551,7 @@ impl Taking<'_> {
         generation: self.generation,
       }),
       Err(intake) => {
-        self.intake = Some(intake);
+        self.intake = Some(*intake);
         None
       }
     }
@@ -1433,7 +1593,7 @@ fn begin_intake<'g>(
   part: &'g ChangegroupPart,
   lend: u64,
   room: &mut Admission,
-) -> Option<Result<Taking<'g>, Refused>> {
+) -> Option<Result<Taking<'g>, Box<Refused>>> {
   vcs_store::within_budget(state, lend, |stores| {
     let generation = stores.generation_of(repository)?;
     let (content, store) = stores.mercurial(repository)?;
@@ -1476,7 +1636,7 @@ pub(crate) fn take_whole(
   repository: RepositoryId,
   part: &ChangegroupPart,
   room: &mut Admission,
-) -> Option<Result<Forked, Refused>> {
+) -> Option<Result<Forked, Box<Refused>>> {
   let lend = u64::MAX;
   let mut taking = match begin_intake(state, repository, part, lend, room)? {
     Ok(taking) => taking,
@@ -1498,8 +1658,47 @@ pub(crate) fn take_whole(
   }
 }
 
+/// A prepared push landed as the driver lands it once its intake is done (A-720 part 2b): a fork another push made stale
+/// re-based first, every row at once, then judged at landing and landed: the driver's steps for the tests, which land
+/// pushes side by side with no runtime.
+#[cfg(test)]
+pub(crate) fn land_in(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (principal, bundle): (&Principal, &[u8]),
+  unbundle: &Unbundle,
+  forked: Option<Forked>,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
+  let forked = match forked {
+    Some(stale) if is_stale(state, repository, &stale) => {
+      let mut rebasing = match begin_rebase(state, repository, stale)? {
+        Ok(rebasing) => rebasing,
+        Err(outcome) => return Some(outcome),
+      };
+      loop {
+        match rebasing.slice(state)? {
+          Ok(Stepped::More) => {}
+          Ok(Stepped::Done) => break,
+          Err(refused) => return Some(PushOutcome::refused(&abort(unindexed_words(&refused)))),
+        }
+      }
+      Some(rebasing.finish_in(state)?)
+    }
+    fresh => fresh,
+  };
+  landing(
+    state,
+    repository,
+    (principal, bundle),
+    unbundle,
+    forked,
+    room,
+  )
+}
+
 /// What an intake's refusal answers: verification's and the keeping's words, as 7.2 aborts.
-fn intake_refused(refused: &IntakeRefused) -> Refused {
+fn intake_refused(refused: &IntakeRefused) -> Box<Refused> {
   abort(match refused {
     IntakeRefused::Unverified(fault) => unverified_words(fault),
     IntakeRefused::Unindexed(fault) => unindexed_words(fault),
@@ -1521,7 +1720,7 @@ pub(crate) fn prepare_whole<V: Repository>(
   view: &V,
   terms: Terms,
   room: &mut Admission,
-) -> Result<Prepared, Refused> {
+) -> Result<Prepared, Box<Refused>> {
   let forked = forked_whole(state, repository, unbundle, room)?;
   let prepared = match state.vcs_stores.mercurial_ref(repository) {
     None => Err(abort(NO_STORE.to_vec())),
@@ -1554,7 +1753,7 @@ pub(crate) fn prepare_served(
   unbundle: &Unbundle,
   terms: Terms,
   room: &mut Admission,
-) -> Result<Prepared, Refused> {
+) -> Result<Prepared, Box<Refused>> {
   let forked = forked_whole(state, repository, unbundle, room)?;
   let over = forked.as_ref().map(|forked| &forked.fork);
   let prepared = hg_view::with_view_over(
@@ -1587,7 +1786,7 @@ fn forked_whole(
   repository: RepositoryId,
   unbundle: &Unbundle,
   room: &mut Admission,
-) -> Result<Option<Forked>, Refused> {
+) -> Result<Option<Forked>, Box<Refused>> {
   let Some((_, part)) = unbundle.changegroup() else {
     return Ok(None);
   };
@@ -1602,19 +1801,19 @@ fn forked_whole(
 #[cfg(test)]
 fn attach(
   state: &mut ShardState,
-  prepared: Result<Prepared, Refused>,
+  prepared: Result<Prepared, Box<Refused>>,
   forked: Option<Forked>,
-) -> Result<Prepared, Refused> {
+) -> Result<Prepared, Box<Refused>> {
   match prepared {
     Ok(mut prepared) => {
       prepared.forked = forked;
       Ok(prepared)
     }
     Err(refused) => {
-      if let Some(forked) = forked {
-        if release_index(state, forked.fork).is_err() {
-          state.count(vcs_store::RELEASE_REFUSED, 1);
-        }
+      if let Some(forked) = forked
+        && release_index(state, forked.fork).is_err()
+      {
+        state.count(vcs_store::RELEASE_REFUSED, 1);
       }
       Err(refused)
     }
@@ -1627,7 +1826,7 @@ fn brought_of(
   forked: Option<&Forked>,
   content: &ContentStore,
   room: &mut Admission,
-) -> Result<(Vec<ReadChangeset>, Vec<Node>), Refused> {
+) -> Result<(Vec<ReadChangeset>, Vec<Node>), Box<Refused>> {
   let Some(forked) = forked else {
     return Ok((Vec::new(), Vec::new()));
   };
@@ -1756,7 +1955,7 @@ fn push_name(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
 
 /// The refusal of a push to `repository` while its policy configures a Mercurial hook (module docs, "The hook gate"),
 /// naming the first.
-fn hook_refused(state: &ShardState, repository: RepositoryId) -> Option<Refused> {
+fn hook_refused(state: &ShardState, repository: RepositoryId) -> Option<Box<Refused>> {
   let record = state.db.partition().repositories().repository(repository)?;
   let hook = record
     .policy
@@ -1798,16 +1997,16 @@ fn raced(refusal: &Refusal) -> bool {
 }
 
 /// 7.2's answer to a refused append (module docs).
-fn append_refused(refused: &AppendRefused) -> Refused {
+fn append_refused(refused: &AppendRefused) -> Box<Refused> {
   let race = match refused {
     AppendRefused::Changes(changes) => changes.iter().any(|change| raced_change(&change.why)),
     AppendRefused::Entry(refusal) => raced(refusal),
     AppendRefused::Repository(_) => false,
   };
   if race {
-    Refused::PushRaced {
+    Box::new(Refused::PushRaced {
       message: RACED.to_vec(),
-    }
+    })
   } else {
     abort(refused_words(refused))
   }

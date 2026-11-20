@@ -10,7 +10,7 @@ use super::{Intake, Intaken, Refused, Stepped};
 use crate::bundle2::Bundle2;
 use crate::fixtures::CG03;
 use crate::index::{HgIndex, Log};
-use crate::push::commit::fork_with;
+use crate::push::commit::{Unindexed, fork_with};
 use crate::push::verify::{Held, Unverified, Verified, verify};
 use crate::push::{ChangegroupPart, read};
 use crate::{Admission, Node};
@@ -67,7 +67,7 @@ fn intake(
       Ok(Stepped::More) => {}
       Ok(Stepped::Done) => break,
       Err(refused) => {
-        intake.abandon(store).unwrap();
+        intake.abandon(store).map_err(Unindexed::Fork)?;
         return Err(refused);
       }
     }
@@ -215,4 +215,49 @@ fn the_record_and_the_changesets_read_from_the_fork_are_the_whole_verifications(
   assert_eq!(read.len(), verified.changesets.len());
   fork.release(&mut store).unwrap();
   index.release(&mut store).unwrap();
+}
+
+/// Every row of `rebase` re-appended, a step at a time.
+fn rebased(mut rebase: super::Rebase, store: &mut ContentStore) -> (HgIndex, Intaken) {
+  while rebase.step(store).unwrap() == Stepped::More {}
+  rebase.finish(store).unwrap()
+}
+
+/// A-720 part 2b (a stale fork re-based by node). Do: take stock 7.2's bundle into a fork of an empty index; then re-base
+/// that fork onto a fork of another empty index (the index moved, holding nothing new), and onto an index that already
+/// landed the same bundle (another push brought it first). Expect: the first re-base the fork row for row, every
+/// revision kept again and its record the same; the second bringing nothing, every revision passed over and every
+/// changeset counted held, the index's rows unchanged.
+#[test]
+fn a_stale_fork_is_re_based_by_node_onto_the_index_as_it_is_now() {
+  let part = stock();
+  let mut store = store();
+  let mut empty = HgIndex::new();
+  let (mut stale, intaken, _) = intake(&part, &mut empty, &mut store, &mut room()).unwrap();
+  let expected = rows(&mut stale, &store);
+  let record = crate::import::record::write_kept(&stale, &store, &intaken.logs, 1 << 20).unwrap();
+  let mut moved = HgIndex::new();
+  let rebase = super::Rebase::begin(stale, &intaken, &mut moved, &mut store)
+    .ok()
+    .unwrap();
+  let (mut fork, again) = rebased(rebase, &mut store);
+  assert_eq!(rows(&mut fork, &store), expected);
+  assert_eq!(
+    (again.kept, &again.changesets),
+    (intaken.kept, &intaken.changesets)
+  );
+  let rerecord = crate::import::record::write_kept(&fork, &store, &again.logs, 1 << 20).unwrap();
+  assert_eq!(rerecord, record);
+  let (stale, _, _) = intake(&part, &mut empty, &mut store, &mut room()).unwrap();
+  let rebase = super::Rebase::begin(stale, &intaken, &mut fork, &mut store)
+    .ok()
+    .unwrap();
+  let (mut over, nothing) = rebased(rebase, &mut store);
+  assert_eq!(rows(&mut over, &store), expected);
+  assert_eq!(nothing.kept, 0);
+  assert_eq!(nothing.held_changesets, intaken.changesets);
+  for index in [over, fork, moved, empty] {
+    index.release(&mut store).unwrap();
+  }
+  assert_eq!(store.len(), 0, "a hold was kept");
 }

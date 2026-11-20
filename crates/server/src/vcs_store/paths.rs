@@ -457,13 +457,16 @@ fn branch_before(
   (head.version == made_at).then_some(Head { version: 0, ..head })
 }
 
+/// Paths with what each is set to: its file, or `None` where it is removed.
+type PathChanges<'g> = Vec<(Vec<u8>, Option<GitFile<'g>>)>;
+
 /// The version's change over the map `before` (module docs): each path [`named`] gives, set to its file at the head or
 /// removed where `before` holds a file and the head none; `None` when a copy names a tree by its destination alone.
 fn changed<'g>(
   engine: &'g Green,
   (content, paths, before): (&ContentStore, &GreenPaths, ContentId),
   (from, to): (u64, u64),
-) -> Result<Option<Vec<(Vec<u8>, Option<GitFile<'g>>)>>, StepRefused> {
+) -> Result<Option<PathChanges<'g>>, StepRefused> {
   let Some(named) = named(engine, from, to) else {
     return Ok(None);
   };
@@ -644,10 +647,11 @@ fn made_holding(
     }
   }
   // Every other hold goes back, past a refusal too; the first refusal is the answer (as `PathMap`'s own settle gives).
-  let released = held.iter().fold(Ok(()), |first, id| {
+  let mut released = Ok(());
+  for id in &held {
     let this = content.release(id).map(drop);
-    first.and(this)
-  });
+    released = released.and(this);
+  }
   let stepped = answer?.map_or(Stepped::Kept, |(_, _, stepped)| stepped);
   released.map_err(StepRefused::Content)?;
   Ok(stepped)

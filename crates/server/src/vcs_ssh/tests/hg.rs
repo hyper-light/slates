@@ -408,7 +408,7 @@ impl StoreLender for NoGit {
     false
   }
 
-  fn room(&mut self) -> Option<u64> {
+  fn room(&mut self, _repository: RepositoryId) -> Option<u64> {
     None
   }
 
@@ -1068,9 +1068,12 @@ fn after_first_answer(stdout: &[u8]) -> (&[u8], &[u8]) {
   stdout[line + 1..].split_at(length)
 }
 
+/// Capabilities with their values: each capability's name and its values.
+type CapabilityValues = Vec<(Vec<u8>, Vec<Vec<u8>>)>;
+
 /// Each capability of `PUSH_CAPABILITIES` in the `bundle2` value of a `hello` answer's capabilities line, with its
 /// values; and `unbundle`'s value.
-fn push_capabilities(hello: &[u8]) -> (Vec<(Vec<u8>, Vec<Vec<u8>>)>, Option<Vec<u8>>) {
+fn push_capabilities(hello: &[u8]) -> (CapabilityValues, Option<Vec<u8>>) {
   let listed = capabilities::decode_hello(hello).expect("a capabilities line");
   let mut room = slates_hg::Admission::new(u64::MAX);
   let (mut quoted, mut unquoted) = (Vec::new(), Vec::new());

@@ -532,6 +532,7 @@ pub(crate) fn uri_decode_bytes(bytes: &[u8]) -> Vec<u8> {
       _ => None,
     };
     let (value, width) = match escaped {
+      // Format: an escape is three bytes, `%` and its two hex digits.
       Some(value) => (value, 3),
       None if byte == QUERY_SPACE && query => (b' ', 1),
       None => (byte, 1),
@@ -733,7 +734,7 @@ pub struct Report {
 #[derive(Clone, Debug)]
 pub enum Begun {
   /// The command was answered and its report is awaited ([`Reporter::receive`]).
-  Reporting(Reporter),
+  Reporting(Box<Reporter>),
   /// The command was refused with this failure, written; the connection reads its next command.
   Failed(ReportFailure),
 }
@@ -851,7 +852,7 @@ impl Reporter {
     if request.depth == Depth::Exclude {
       return refused_with(ReportFailure::RequestDepthExclude, out);
     }
-    Ok(Begun::Reporting(Reporter {
+    Ok(Begun::Reporting(Box::new(Reporter {
       kind: request.kind,
       anchor,
       operand: request.target,
@@ -868,7 +869,7 @@ impl Reporter {
       room: context.room,
       parser: Parser::new(report_bounds(context.item_bytes)),
       done: false,
-    }))
+    })))
   }
 
   /// Reads on in `buffer`, the same buffer with more at its end, as the item codec takes it: the

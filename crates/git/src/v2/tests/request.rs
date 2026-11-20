@@ -43,6 +43,13 @@ fn encoded(request: &Request<'_>) -> Vec<u8> {
 /// line ending with an LF, and each stream's own bytes back.
 #[test]
 fn stock_gits_requests_decode_to_their_commands_and_arguments_and_encode_back() {
+  the_ls_refs_request_reads_as_git_wrote_it();
+  each_fetch_request_reads_as_git_wrote_it();
+}
+
+/// The `ls-refs` request: its command, `object-format=sha1`, delimiter and arguments as written, every line ending
+/// with an LF, and its own bytes back.
+fn the_ls_refs_request_reads_as_git_wrote_it() {
   let ls = command(fixtures::LS_REFS_REQUEST);
   assert_eq!(ls.command(), Command::LsRefs);
   assert_eq!(ls.object_format(), Some(ObjectFormat::Sha1));
@@ -75,6 +82,11 @@ fn stock_gits_requests_decode_to_their_commands_and_arguments_and_encode_back() 
     [&b"HEAD"[..], b"refs/"]
   );
 
+  assert_eq!(encoded(&Request::Command(ls)), fixtures::LS_REFS_REQUEST);
+}
+
+/// Each `fetch` request: its command and arguments as written, and its own bytes back.
+fn each_fetch_request_reads_as_git_wrote_it() {
   let (main, side, peeled) = (sha1(MAIN), sha1(SIDE), sha1(PEELED));
   let fetches: [(&[u8], Vec<F<'_>>); 6] = [
     (
@@ -138,7 +150,6 @@ fn stock_gits_requests_decode_to_their_commands_and_arguments_and_encode_back() 
     assert_eq!(fetch_arguments(&request), arguments);
     assert_eq!(encoded(&Request::Command(request)), stream);
   }
-  assert_eq!(encoded(&Request::Command(ls)), fixtures::LS_REFS_REQUEST);
 }
 
 /// A-582 part 2 (what git's own client writes, `fetch-pack.c` and `connect.c`): do decode a `fetch` written as
@@ -147,6 +158,15 @@ fn stock_gits_requests_decode_to_their_commands_and_arguments_and_encode_back() 
 /// flush closes; and a SHA-256 request. Expect: each read as written, its endings kept, and its own bytes back.
 #[test]
 fn the_forms_gits_own_client_writes_decode_and_encode_back_exactly() {
+  a_fetch_as_send_fetch_request_writes_one_reads_as_written();
+  a_fetch_with_cuts_reads_as_written();
+  heads_with_the_capabilities_first_or_closed_by_a_flush_read_as_written();
+  a_sha256_request_reads_as_written();
+}
+
+/// A `fetch` as `send_fetch_request` writes one: its command, capabilities, flags and cuts without an LF and its wants,
+/// haves and `done` with one, every argument kind among them; read as written, its endings kept, its own bytes back.
+fn a_fetch_as_send_fetch_request_writes_one_reads_as_written() {
   let want = format!("want {MAIN}\n");
   let have = format!("have {SIDE}\n");
   let shallow = format!("shallow {PEELED}");
@@ -203,7 +223,11 @@ fn the_forms_gits_own_client_writes_decode_and_encode_back_exactly() {
   assert_eq!(lines[0].ending, Ending::NoLf);
   assert_eq!(lines[7].ending, Ending::Lf);
   assert_eq!(encoded(&Request::Command(request)), fetch);
+}
 
+/// A `fetch` cutting by date and by ref, read as written and its own bytes back.
+fn a_fetch_with_cuts_reads_as_written() {
+  let want = format!("want {MAIN}\n");
   let cut = wire(&[
     Packet::Data(b"command=fetch"),
     Packet::Delim,
@@ -223,7 +247,11 @@ fn the_forms_gits_own_client_writes_decode_and_encode_back_exactly() {
   );
   assert_eq!(request.object_format(), Some(ObjectFormat::Sha1));
   assert_eq!(encoded(&Request::Command(request)), cut);
+}
 
+/// A `bundle-uri`-style head with the capabilities first, and a head a flush closes; each read as written and its own
+/// bytes back.
+fn heads_with_the_capabilities_first_or_closed_by_a_flush_read_as_written() {
   let capabilities_first = wire(&[
     Packet::Data(b"agent=git/2.50.1-Darwin"),
     Packet::Data(b"object-format=sha1"),
@@ -235,13 +263,15 @@ fn the_forms_gits_own_client_writes_decode_and_encode_back_exactly() {
   assert_eq!(request.head[2], Line::lf(Head::Command));
   assert!(request.delimited && request.arguments.is_empty());
   assert_eq!(encoded(&Request::Command(request)), capabilities_first);
-
   let undelimited = wire(&[Packet::Data(b"command=ls-refs\n"), Packet::Flush]);
   let request = command(&undelimited);
   assert!(!request.delimited);
   assert_eq!(request.command(), Command::LsRefs);
   assert_eq!(encoded(&Request::Command(request)), undelimited);
+}
 
+/// A SHA-256 request, read as written and its own bytes back.
+fn a_sha256_request_reads_as_written() {
   let id = "a".repeat(64);
   let want256 = format!("want {id}\n");
   let sha256 = wire(&[
@@ -305,7 +335,7 @@ fn a_request_out_of_its_grammar_is_refused_by_kind() {
   let ls = Packet::Data(b"command=ls-refs\n");
   let want = format!("want {MAIN}\n");
   let trailing = format!("want {MAIN} side\n");
-  let short = format!("want {}\n", &MAIN[..39]);
+  let short = format!("want {}\n", MAIN.get(..39).unwrap());
   let cases = [
     (
       wire(&[Packet::Data(b"command=push\n"), Packet::Flush]),

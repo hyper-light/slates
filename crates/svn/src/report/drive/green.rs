@@ -7,8 +7,8 @@
 
 use crate::authz::{Authz, Bounds, Principal, PrincipalRules};
 use crate::index::{
-  Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PropertyList, Revision,
-  RevisionRecord, Text,
+  Action, ChangedPath, ContentIdentity, CopySource, Index, NodeKind, PropertyList, PropertyPairs,
+  Revision, RevisionRecord, Text,
 };
 use crate::lock::{AprTime, Lock, LockEntry, LockTable, LockToken};
 use crate::mergeinfo::Contents;
@@ -74,7 +74,7 @@ pub(crate) struct Green {
   /// Every revision's whole tree, by repository path.
   trees: Vec<BTreeMap<String, GreenNode>>,
   /// The property lists, by identity.
-  lists: BTreeMap<ContentIdentity, Vec<(Vec<u8>, Vec<u8>)>>,
+  lists: BTreeMap<ContentIdentity, PropertyPairs>,
   /// The texts, by identity.
   pub(crate) texts: BTreeMap<ContentIdentity, Vec<u8>>,
   /// Every revision's properties.

@@ -15,8 +15,8 @@ use super::{
   TreeEntry, Unavailable, build, identity,
 };
 use crate::engine::{Green, Increment, Outcome};
-use crate::increment::{DeriveError, VolumeOp, compose_volume_planned};
-use crate::ops_doc::OpKind;
+use crate::increment::{DeriveError, PostStatePlan, VolumeOp, compose_volume_planned};
+use crate::ops_doc::{OpKind, OpsDoc};
 use crate::special::{SpecialKind, SpecialNode};
 use crate::verdict::MergeConflictClass;
 
@@ -223,9 +223,23 @@ fn files(a: EntryKind, b: EntryKind) -> bool {
 #[derive(Debug)]
 enum Expected {
   /// The work, and what the build must have read.
-  Work(Increment, Reads),
+  Work(Box<Increment>, Reads),
   /// A refusal for a path changing kind: the paths that do.
   KindChanged(BTreeSet<String>),
+}
+
+/// A tree flattened: each path's kind and object.
+type Flat = BTreeMap<String, (EntryKind, ObjectKey)>;
+
+/// What the oracle lays while it walks the two trees: the journal, the bytes of each added or changed file and the
+/// encoding of each added or changed submodule link (the post-state is laid from them), and the reads a walk by
+/// identity must make.
+#[derive(Default)]
+struct Laying {
+  journal: Vec<VolumeOp>,
+  contents: BTreeMap<String, Vec<u8>>,
+  encoded: BTreeMap<String, Vec<u8>>,
+  reads: Reads,
 }
 
 /// The oracle: compares the two whole trees path by path, with neither identity nor order taken from the build, and
@@ -236,17 +250,54 @@ enum Expected {
 fn oracle(store: &Store, green: &Green, push: &Push<'_>) -> Expected {
   let based = flatten(store, push.base_tree);
   let given = flatten(store, Some(push.tree));
-  let changed_kind: BTreeSet<String> = based
+  let changed_kind = changed_kinds(&based, &given);
+  if !changed_kind.is_empty() {
+    return Expected::KindChanged(changed_kind);
+  }
+  let mut laying = Laying::default();
+  lay_removals(&based, &given, &mut laying.journal);
+  for (path, (kind, id)) in &given {
+    if !path.is_empty() {
+      lay_entry(store, path, (*kind, *id), based.get(path), &mut laying);
+    }
+  }
+  if let Some(head) = push.head {
+    laying.journal.push(VolumeOp::SetXattr {
+      path: ROOT.to_owned(),
+      name: HEAD_ATTRIBUTE.to_owned(),
+      value: head.to_vec(),
+    });
+  }
+  count_tree_reads(&based, &given, &mut laying.reads);
+  let base = green.base_for(push.base_version, &laying.journal);
+  let (doc, plan) = compose_volume_planned(&base, &laying.journal).unwrap();
+  let post = lay_post(&doc, &plan, &laying, push.head);
+  let id = identity(&push.name, push.base_version, &doc, &post);
+  Expected::Work(
+    Box::new(Increment {
+      id,
+      base: push.base_version,
+      doc,
+      post_state: post,
+      evidence: Vec::new(),
+    }),
+    laying.reads,
+  )
+}
+
+/// The paths both trees hold whose kind changed, other than between a file and an executable one.
+fn changed_kinds(based: &Flat, given: &Flat) -> BTreeSet<String> {
+  based
     .iter()
     .filter_map(|(path, (was, _))| {
       let (now, _) = given.get(path)?;
       (was != now && !files(*was, *now)).then(|| path.clone())
     })
-    .collect();
-  if !changed_kind.is_empty() {
-    return Expected::KindChanged(changed_kind);
-  }
-  let mut journal = Vec::new();
+    .collect()
+}
+
+/// The oracle's removals: each path the base holds and the push does not, deepest first.
+fn lay_removals(based: &Flat, given: &Flat, journal: &mut Vec<VolumeOp>) {
   for (path, (kind, _)) in based.iter().rev() {
     if given.contains_key(path) {
       continue;
@@ -256,122 +307,154 @@ fn oracle(store: &Store, green: &Green, push: &Push<'_>) -> Expected {
       _ => VolumeOp::Unlink { path: path.clone() },
     });
   }
-  let mut contents: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-  let mut encoded: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-  let mut reads = Reads::default();
-  for (path, (kind, id)) in &given {
-    let was = based.get(path);
-    if path.is_empty() {
-      continue;
-    }
-    let same = was == Some(&(*kind, *id));
-    match kind {
-      EntryKind::Directory if was.is_none() => journal.push(VolumeOp::Mkdir { path: path.clone() }),
-      EntryKind::Directory => {}
-      EntryKind::Symlink if !same => {
-        let target = String::from_utf8(bytes_of(store, *id)).unwrap();
-        reads.blobs += 1;
-        if was.is_some() {
-          journal.push(VolumeOp::Unlink { path: path.clone() });
-        }
-        journal.push(VolumeOp::Symlink {
-          path: path.clone(),
-          target,
-        });
-      }
-      EntryKind::Symlink => {}
-      EntryKind::File | EntryKind::Executable => {
-        let bytes = bytes_of(store, *id);
-        let content_changed = was.is_none_or(|(_, was_id)| was_id != id);
-        if content_changed {
-          match was {
-            None => journal.push(VolumeOp::Create { path: path.clone() }),
-            Some(_) => journal.push(VolumeOp::Truncate {
-              path: path.clone(),
-              len: 0,
-            }),
-          }
-          if !bytes.is_empty() {
-            reads.blobs += 1;
-            journal.push(VolumeOp::Extend {
-              path: path.clone(),
-              at: 0,
-              len: bytes.len() as u64,
-            });
-            contents.insert(path.clone(), bytes);
-          }
-        }
-        let executable = *kind == EntryKind::Executable;
-        let was_executable = was.is_some_and(|(kind, _)| *kind == EntryKind::Executable);
-        if (was.is_none() && executable) || (was.is_some() && executable != was_executable) {
-          journal.push(VolumeOp::SetMode {
-            path: path.clone(),
-            mode: if executable { 0o755 } else { 0o644 },
-          });
-        }
-      }
-      EntryKind::Submodule if !same => {
-        if was.is_some() {
-          journal.push(VolumeOp::Unlink { path: path.clone() });
-        }
-        let node = gitlink(*id);
-        encoded.insert(path.clone(), node.encode());
-        journal.push(VolumeOp::Mknod {
-          path: path.clone(),
-          node,
-          mode: 0,
-        });
-      }
-      EntryKind::Submodule => {}
-    }
+}
+
+/// The oracle's addition or change of the pushed `entry` at `path`, which the base held as `was`.
+fn lay_entry(
+  store: &Store,
+  path: &str,
+  entry: (EntryKind, ObjectKey),
+  was: Option<&(EntryKind, ObjectKey)>,
+  laying: &mut Laying,
+) {
+  let (kind, id) = entry;
+  let same = was == Some(&entry);
+  match kind {
+    EntryKind::Directory if was.is_none() => laying.journal.push(VolumeOp::Mkdir {
+      path: path.to_owned(),
+    }),
+    EntryKind::Symlink if !same => lay_symlink(store, path, id, was.is_some(), laying),
+    EntryKind::File | EntryKind::Executable => lay_file(store, path, entry, was, laying),
+    EntryKind::Submodule if !same => lay_gitlink(path, id, was.is_some(), laying),
+    EntryKind::Directory | EntryKind::Symlink | EntryKind::Submodule => {}
   }
-  if let Some(head) = push.head {
-    journal.push(VolumeOp::SetXattr {
-      path: ROOT.to_owned(),
-      name: HEAD_ATTRIBUTE.to_owned(),
-      value: head.to_vec(),
+}
+
+/// A symbolic link added or changed (`replaces`: the base held something at its path).
+fn lay_symlink(store: &Store, path: &str, id: ObjectKey, replaces: bool, laying: &mut Laying) {
+  let target = String::from_utf8(bytes_of(store, id)).unwrap();
+  laying.reads.blobs += 1;
+  if replaces {
+    laying.journal.push(VolumeOp::Unlink {
+      path: path.to_owned(),
     });
   }
-  // The reads a walk by identity makes: a directory's trees are read when its parent's were (the root always) and its
-  // id changed; a directory whose id stayed beneath a read parent is one skip.
+  laying.journal.push(VolumeOp::Symlink {
+    path: path.to_owned(),
+    target,
+  });
+}
+
+/// A file, executable or not, the push holds: its bytes laid if they changed, its mode if it changed.
+fn lay_file(
+  store: &Store,
+  path: &str,
+  (kind, id): (EntryKind, ObjectKey),
+  was: Option<&(EntryKind, ObjectKey)>,
+  laying: &mut Laying,
+) {
+  let bytes = bytes_of(store, id);
+  if was.is_none_or(|(_, was_id)| *was_id != id) {
+    lay_bytes(path, bytes, was.is_some(), laying);
+  }
+  let executable = kind == EntryKind::Executable;
+  let was_executable = was.is_some_and(|(kind, _)| *kind == EntryKind::Executable);
+  if (was.is_none() && executable) || (was.is_some() && executable != was_executable) {
+    laying.journal.push(VolumeOp::SetMode {
+      path: path.to_owned(),
+      mode: if executable { 0o755 } else { 0o644 },
+    });
+  }
+}
+
+/// A file's new bytes: created, or truncated when `replaces` (the base held it), then extended by its bytes if any.
+fn lay_bytes(path: &str, bytes: Vec<u8>, replaces: bool, laying: &mut Laying) {
+  laying.journal.push(if replaces {
+    VolumeOp::Truncate {
+      path: path.to_owned(),
+      len: 0,
+    }
+  } else {
+    VolumeOp::Create {
+      path: path.to_owned(),
+    }
+  });
+  if !bytes.is_empty() {
+    laying.reads.blobs += 1;
+    laying.journal.push(VolumeOp::Extend {
+      path: path.to_owned(),
+      at: 0,
+      len: bytes.len() as u64,
+    });
+    laying.contents.insert(path.to_owned(), bytes);
+  }
+}
+
+/// A submodule link added or changed (`replaces`: the base held something at its path).
+fn lay_gitlink(path: &str, commit: ObjectKey, replaces: bool, laying: &mut Laying) {
+  if replaces {
+    laying.journal.push(VolumeOp::Unlink {
+      path: path.to_owned(),
+    });
+  }
+  let node = gitlink(commit);
+  laying.encoded.insert(path.to_owned(), node.encode());
+  laying.journal.push(VolumeOp::Mknod {
+    path: path.to_owned(),
+    node,
+    mode: 0,
+  });
+}
+
+/// Whether both trees hold `path` as the same object.
+fn unchanged(based: &Flat, given: &Flat, path: &str) -> bool {
+  let was = based.get(path);
+  was.is_some() && was == given.get(path)
+}
+
+/// Whether a walk by identity reads the trees of `path`'s parent (the root always has its read).
+fn parent_read(based: &Flat, given: &Flat, path: &str) -> bool {
+  match path.rsplit_once('/') {
+    _ if path.is_empty() => true,
+    Some((parent, _)) => !unchanged(based, given, parent),
+    None => !unchanged(based, given, ""),
+  }
+}
+
+/// The reads a walk by identity makes: a directory's trees are read when its parent's were (the root always) and its
+/// id changed; a directory whose id stayed beneath a read parent is one skip.
+fn count_tree_reads(based: &Flat, given: &Flat, reads: &mut Reads) {
   let directories: BTreeSet<&String> = based
     .iter()
     .chain(given.iter())
     .filter(|(_, (kind, _))| *kind == EntryKind::Directory)
     .map(|(path, _)| path)
     .collect();
-  let same = |path: &str| {
-    let was = based.get(path);
-    was.is_some() && was == given.get(path)
-  };
-  let parent_read = |path: &str| match path.rfind('/') {
-    _ if path.is_empty() => true,
-    Some(at) => !same(&path[..at]),
-    None => !same(""),
-  };
   for path in directories {
-    if !parent_read(path) {
+    if !parent_read(based, given, path) {
       continue;
     }
-    if same(path) {
+    if unchanged(based, given, path) {
       reads.skipped += 1;
     } else {
       reads.trees +=
         u64::from(based.contains_key(path.as_str())) + u64::from(given.contains_key(path.as_str()));
     }
   }
-  let base = green.base_for(push.base_version, &journal);
-  let (doc, plan) = compose_volume_planned(&base, &journal).unwrap();
+}
+
+/// The post-state the oracle lays for `doc`: each run from the trees' own bytes, at the offset its op names.
+fn lay_post(doc: &OpsDoc, plan: &PostStatePlan, laying: &Laying, head: Option<&[u8]>) -> Vec<u8> {
   let mut post = Vec::new();
   for op in doc.ops.iter().filter(|op| op.src != u64::MAX) {
     let path = doc.paths.path(op.path).unwrap();
     let run: &[u8] = match op.kind {
       OpKind::Insert | OpKind::Extend | OpKind::Overwrite => {
         let from = usize::try_from(plan[&op.src]).unwrap();
-        &contents[path][from..from + usize::try_from(op.len).unwrap()]
+        &laying.contents[path][from..from + usize::try_from(op.len).unwrap()]
       }
-      OpKind::SetXattr => push.head.unwrap(),
-      OpKind::Mknod => encoded[path].as_slice(),
+      OpKind::SetXattr => head.unwrap(),
+      OpKind::Mknod => laying.encoded[path].as_slice(),
       _ => continue,
     };
     let at = usize::try_from(op.src).unwrap();
@@ -380,52 +463,60 @@ fn oracle(store: &Store, green: &Green, push: &Push<'_>) -> Expected {
     }
     post[at..at + run.len()].copy_from_slice(run);
   }
-  let id = identity(&push.name, push.base_version, &doc, &post);
-  Expected::Work(
-    Increment {
-      id,
-      base: push.base_version,
-      doc,
-      post_state: post,
-      evidence: Vec::new(),
-    },
-    reads,
-  )
+  post
 }
 
 /// The client-fidelity test (§4.17.1 item 4): `green` holds exactly `files`, each file's bytes and executable bit, each
 /// link's target, each submodule link's commit, the directories they imply and nothing else, and its root's head is
 /// `head`.
 fn holds_exactly(green: &Green, files: &Files, head: &[u8]) {
-  let mut wanted_dirs = BTreeSet::new();
   for (path, node) in files {
+    holds_node(green, path, node);
+  }
+  holds_nothing_else(green, files);
+  assert_eq!(green.xattr(ROOT, HEAD_ATTRIBUTE), Some(head), "the head");
+}
+
+/// The directories `files` imply: every proper prefix of each path that ends before a slash.
+fn implied_dirs(files: &Files) -> BTreeSet<String> {
+  let mut dirs = BTreeSet::new();
+  for path in files.keys() {
     let mut at = path.as_str();
-    while let Some(slash) = at.rfind('/') {
-      at = &at[..slash];
-      wanted_dirs.insert(at.to_owned());
-    }
-    match node {
-      Node::File(bytes, executable) => {
-        assert_eq!(
-          green.content(path),
-          Some(bytes.as_slice()),
-          "{path}'s bytes"
-        );
-        let mode = green.mode(path).unwrap_or(0o644);
-        assert_eq!(mode & 0o111 != 0, *executable, "{path}'s mode {mode:o}");
-      }
-      Node::Link(target) => assert_eq!(
-        green.symlink(path),
-        Some(target.as_str()),
-        "{path}'s target"
-      ),
-      Node::Submodule(commit) => assert_eq!(
-        green.special(path),
-        Some(gitlink(*commit)),
-        "{path}'s commit"
-      ),
+    while let Some((parent, _)) = at.rsplit_once('/') {
+      at = parent;
+      dirs.insert(at.to_owned());
     }
   }
+  dirs
+}
+
+/// `green` holds `node` at `path`: a file's bytes and executable bit, a link's target, a submodule link's commit.
+fn holds_node(green: &Green, path: &str, node: &Node) {
+  match node {
+    Node::File(bytes, executable) => {
+      assert_eq!(
+        green.content(path),
+        Some(bytes.as_slice()),
+        "{path}'s bytes"
+      );
+      let mode = green.mode(path).unwrap_or(0o644);
+      assert_eq!(mode & 0o111 != 0, *executable, "{path}'s mode {mode:o}");
+    }
+    Node::Link(target) => assert_eq!(
+      green.symlink(path),
+      Some(target.as_str()),
+      "{path}'s target"
+    ),
+    Node::Submodule(commit) => assert_eq!(
+      green.special(path),
+      Some(gitlink(*commit)),
+      "{path}'s commit"
+    ),
+  }
+}
+
+/// `green` holds no file, link, submodule link or directory but those `files` name or imply.
+fn holds_nothing_else(green: &Green, files: &Files) {
   let held_files: BTreeSet<String> = green.files().map(|(path, _)| path).collect();
   let wanted_files: BTreeSet<String> = files
     .iter()
@@ -452,8 +543,11 @@ fn holds_exactly(green: &Green, files: &Files, head: &[u8]) {
     "the submodule links and nothing else"
   );
   let held_dirs: BTreeSet<String> = base.dirs.iter().cloned().collect();
-  assert_eq!(held_dirs, wanted_dirs, "the directories and nothing else");
-  assert_eq!(green.xattr(ROOT, HEAD_ATTRIBUTE), Some(head), "the head");
+  assert_eq!(
+    held_dirs,
+    implied_dirs(files),
+    "the directories and nothing else"
+  );
 }
 
 /// The special node a submodule's link to `commit` is (A-637): the commit, and no owner or time, since git records
@@ -519,7 +613,7 @@ fn land(
   let Expected::Work(increment, reads) = oracle(store, green, &push) else {
     panic!("the oracle refused what the build made");
   };
-  assert_eq!(built.increment, increment, "the oracle's work");
+  assert_eq!(built.increment, *increment, "the oracle's work");
   assert_eq!(built.reads, reads, "the oracle's reads");
   let outcome = green.submit(&built.increment);
   (built, outcome, tree)
@@ -1343,7 +1437,7 @@ fn history(steps: &[Vec<Option<(u8, bool)>>], census: &Census) {
       }
       Expected::Work(increment, reads) => {
         let built = built.unwrap();
-        assert_eq!(built.increment, increment, "the oracle's work");
+        assert_eq!(built.increment, *increment, "the oracle's work");
         assert_eq!(built.reads, reads, "the oracle's reads");
         let version = green.head() + 1;
         assert_eq!(

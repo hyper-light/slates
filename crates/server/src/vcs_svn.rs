@@ -762,81 +762,95 @@ async fn step(
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
-  match next {
-    Next::Read => {
-      let read = read_more(
-        stream,
-        &mut conversation.input,
-        conversation.limits,
-        conversation.deadline_ns,
-        seat,
-      )
-      .await;
-      if read { Stepped::Go } else { Stepped::End }
-    }
+  follow(stream, conversation, next, out, seat).await
+}
+
+/// What follows the call's output: `next` taken, the bytes it consumed dropped from the input; a commit, lock, hook or
+/// landing answered here, its answer written ([`written`]).
+async fn follow(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  next: Next,
+  out: &mut Vec<u8>,
+  seat: &Seat,
+) -> Stepped {
+  let went = match next {
+    Next::Read => return read_step(stream, conversation, seat).await,
     Next::Consume(taken) => {
-      conversation
-        .input
-        .drain(..taken.min(conversation.input.len()));
-      Stepped::Go
+      consume(conversation, taken);
+      return Stepped::Go;
     }
-    Next::Again => Stepped::Go,
-    Next::End => Stepped::End,
+    Next::Again => return Stepped::Go,
+    Next::End => return Stepped::End,
     Next::Challenge(consumed) => {
-      conversation
-        .input
-        .drain(..consumed.min(conversation.input.len()));
-      challenge(stream, &mut conversation.connection, out).await
+      consume(conversation, consumed);
+      return challenge(stream, &mut conversation.connection, out).await;
     }
     Next::Key { user, consumed } => {
-      conversation
-        .input
-        .drain(..consumed.min(conversation.input.len()));
-      keyed(stream, conversation, &user, out).await
-    }
-    Next::CommitAsked(consumed) => {
-      conversation
-        .input
-        .drain(..consumed.min(conversation.input.len()));
-      let begun = begin_commit(conversation, out);
-      written(stream, begun, out).await
-    }
-    Next::LockAsked(consumed) => {
-      conversation
-        .input
-        .drain(..consumed.min(conversation.input.len()));
-      let answered = lock(conversation, out);
-      written(stream, answered, out).await
-    }
-    Next::Hook { due, consumed } => {
-      conversation
-        .input
-        .drain(..consumed.min(conversation.input.len()));
-      let answered = answer_hook(conversation, &due, out);
-      written(stream, answered, out).await
-    }
-    Next::Accepted { work, consumed } => {
-      conversation
-        .input
-        .drain(..consumed.min(conversation.input.len()));
-      let landed = land(conversation, *work, out);
-      written(stream, landed, out).await
+      consume(conversation, consumed);
+      return keyed(stream, conversation, &user, out).await;
     }
     Next::Locate { found, consumed } => {
-      conversation
-        .input
-        .drain(..consumed.min(conversation.input.len()));
-      match locate(&found).await {
-        Location::Found(located) if Some(located.shard) != this_shard() => {
-          Stepped::Elsewhere(found, located)
-        }
-        Location::Found(located) => opened(stream, conversation, &found, Some(&located), out).await,
-        Location::Nowhere => opened(stream, conversation, &found, None, out).await,
-        Location::Unanswered => {
-          crate::fleet::count_refusal(LOOKUP_UNANSWERED);
-          Stepped::End
-        }
-      }
+      consume(conversation, consumed);
+      return located_step(stream, conversation, found, out).await;
+    }
+    Next::CommitAsked(consumed) => {
+      consume(conversation, consumed);
+      begin_commit(conversation, out)
+    }
+    Next::LockAsked(consumed) => {
+      consume(conversation, consumed);
+      lock(conversation, out)
+    }
+    Next::Hook { due, consumed } => {
+      consume(conversation, consumed);
+      answer_hook(conversation, &due, out)
+    }
+    Next::Accepted { work, consumed } => {
+      consume(conversation, consumed);
+      land(conversation, *work, out)
+    }
+  };
+  written(stream, went, out).await
+}
+
+/// Reads more of the client's bytes into the conversation's input: on, or the end if none came.
+async fn read_step(stream: &TcpStream, conversation: &mut Conversation, seat: &Seat) -> Stepped {
+  let read = read_more(
+    stream,
+    &mut conversation.input,
+    conversation.limits,
+    conversation.deadline_ns,
+    seat,
+  )
+  .await;
+  if read { Stepped::Go } else { Stepped::End }
+}
+
+/// Drops the first `bytes` of the conversation's input, which an answer took (all of it, if it holds fewer).
+fn consume(conversation: &mut Conversation, bytes: usize) {
+  conversation
+    .input
+    .drain(..bytes.min(conversation.input.len()));
+}
+
+/// After a URL resolved to `found`: its repository opened here, the move to the shard it lives on, or the end when the
+/// lookup went unanswered.
+async fn located_step(
+  stream: &TcpStream,
+  conversation: &mut Conversation,
+  found: Found,
+  out: &mut Vec<u8>,
+) -> Stepped {
+  match locate(&found).await {
+    Location::Found(located) if Some(located.shard) != this_shard() => {
+      Stepped::Elsewhere(found, located)
+    }
+    Location::Found(located) => opened(stream, conversation, &found, Some(&located), out).await,
+    Location::Nowhere => opened(stream, conversation, &found, None, out).await,
+    Location::Unanswered => {
+      crate::fleet::count_refusal(LOOKUP_UNANSWERED);
+      Stepped::End
     }
   }
 }
@@ -1144,7 +1158,7 @@ fn land(conversation: &mut Conversation, work: Work, out: &mut Vec<u8>) -> bool 
 /// and [`CHALLENGE_HOST`], the challenge written to `stream`.
 async fn challenge(stream: &TcpStream, connection: &mut Connection, out: &mut Vec<u8>) -> Stepped {
   out.clear();
-  let mut nonce = [0u8; 8];
+  let mut nonce = [0u8; size_of::<u64>()];
   let micros = crate::state::with_state(|state| state.clock.wall_ns() / NANOS_PER_MICRO);
   let (Ok(()), Some(micros)) = (aws_lc_rs::rand::fill(&mut nonce), micros) else {
     return Stepped::End;

@@ -248,6 +248,16 @@ fn a_copy_shares_its_source_and_reads_as_its_copy() {
   assert_eq!(green.walked(), walked, "the copy walked a map");
   assert_eq!(green.copies_grafted(), grafted + 1);
   assert_eq!(green.copies_refused(), 0);
+  holds_the_trunk_at_branches_x(&green);
+  holds_branches_x_from_version_2_only(&green);
+  assert_eq!(green.changed_between(1, 2), ["branches/x"]);
+  assert_eq!(green.changed_since(1), ["branches/x"]);
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+  assert_eq!(green.changes_bytes(), green.changes_recounted());
+}
+
+/// The trunk's files, directories, modes and properties at `branches/x`'s place, and the trunk still its own.
+fn holds_the_trunk_at_branches_x(green: &Green) {
   assert_eq!(green.content("branches/x/a"), Some(&b"alpha"[..]));
   assert_eq!(green.content("branches/x/d/b"), Some(&b"beta"[..]));
   assert!(green.is_dir("branches/x") && green.is_dir("branches/x/d"));
@@ -256,6 +266,10 @@ fn a_copy_shares_its_source_and_reads_as_its_copy() {
   assert_eq!(green.xattr("branches/x", PROPS), Some(&b"p1"[..]));
   assert_eq!(green.xattr("branches/x/d/b", PROPS), Some(&b"p2"[..]));
   assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
+}
+
+/// Nothing at `branches/x` at version 1; the copied tree there at version 2.
+fn holds_branches_x_from_version_2_only(green: &Green) {
   assert_eq!(green.content_at("branches/x/a", 1), None);
   assert_eq!(green.content_at("branches/x/a", 2), Some(b"alpha".to_vec()));
   assert_eq!(green.content_len_at("branches/x/d/b", 2), Some(4));
@@ -268,10 +282,6 @@ fn a_copy_shares_its_source_and_reads_as_its_copy() {
   let after = green.base_at(2);
   assert!(after.dirs.contains(&"branches/x/d".to_owned()));
   assert!(after.modes.contains(&("branches/x".to_owned(), 0o755)));
-  assert_eq!(green.changed_between(1, 2), ["branches/x"]);
-  assert_eq!(green.changed_since(1), ["branches/x"]);
-  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
-  assert_eq!(green.changes_bytes(), green.changes_recounted());
 }
 
 /// A-586 (O(the paths), never the tree). Do: copy a tree of 4,096 files. Expect: no map walked, the histories' bytes
@@ -321,6 +331,14 @@ fn a_keys_first_change_after_a_copy_records_the_value_the_copy_gave_it() {
       .mode("b/a", 0o700),
     3,
   );
+  reads_b_a_by_version(&green);
+  assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+  assert_eq!(green.changed_between(2, 3), ["b/a"]);
+}
+
+/// `b/a` absent at version 1, the copied bytes and mode at 2 (a page and a length read from them), the new ones at 3.
+fn reads_b_a_by_version(green: &Green) {
   assert_eq!(green.content_at("b/a", 1), None);
   assert_eq!(green.content_at("b/a", 2), Some(b"alpha".to_vec()));
   assert_eq!(green.content_at("b/a", 3), Some(b"ALpha".to_vec()));
@@ -331,9 +349,6 @@ fn a_keys_first_change_after_a_copy_records_the_value_the_copy_gave_it() {
   assert_eq!(green.content_len_at("b/a", 2), Some(5));
   assert!(green.base_at(2).modes.contains(&("b/a".to_owned(), 0o644)));
   assert!(green.base_at(3).modes.contains(&("b/a".to_owned(), 0o700)));
-  assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
-  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
-  assert_eq!(green.changed_between(2, 3), ["b/a"]);
 }
 
 /// A-586 (a commit that copies a directory and edits beneath it). Do: in one node-exclusive increment, copy the trunk
@@ -357,17 +372,7 @@ fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
   let increment = work.at(2, 1);
   let (outcome, applied) = green.submit_resolved(&increment);
   assert_eq!(outcome, Outcome::Accepted { version: 2 });
-  assert_eq!(green.content("b/a"), Some(&b"ALpha"[..]));
-  assert_eq!(green.content("b/new"), Some(&b"new"[..]));
-  assert_eq!(green.content("b/c"), None);
-  assert_eq!(green.mode("b/d"), Some(0o700));
-  assert_eq!(green.xattr("b/d/b", PROPS), Some(&b"q"[..]));
-  assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
-  assert_eq!(green.content("trunk/c"), Some(&b"gamma"[..]));
-  assert_eq!(green.content_at("b/a", 1), None);
-  assert_eq!(green.content_at("b/a", 2), Some(b"ALpha".to_vec()));
-  assert_eq!(green.content_at("b/c", 2), None);
-  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+  edits_landed_on_the_copy(&mut green);
   let applied = applied.expect("an accepted version's effects");
   let entry = chain_entry::encode(&increment.encode(), &increment, &applied, None, None, None);
   let decoded = chain_entry::decode(&entry).expect("the entry decodes");
@@ -376,13 +381,38 @@ fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
     replica.apply_recorded(&decoded.increment, &decoded.applied),
     2
   );
-  assert_eq!(replica.head_identity(), green.head_identity());
-  assert_eq!(replica.base_at(2), green.base_at(2));
-  assert_eq!(replica.content("b/a"), Some(&b"ALpha"[..]));
+  replica_reads_alike(&mut replica, &mut green);
   // The file the copy brought and its own increment edited replaced no file: A-612's removals record none, live or
   // replayed.
   assert!(!green.file_removed.contains_key("b/a"));
   assert!(!replica.file_removed.contains_key("b/a"));
+}
+
+/// The edits of the copy's own increment on what the copy brought at `b`, and the trunk untouched.
+fn edits_landed_on_the_copy(green: &mut Green) {
+  assert_eq!(green.content("b/a"), Some(&b"ALpha"[..]));
+  assert_eq!(green.content("b/new"), Some(&b"new"[..]));
+  assert_eq!(green.content("b/c"), None);
+  assert_eq!(green.mode("b/d"), Some(0o700));
+  assert_eq!(green.xattr("b/d/b", PROPS), Some(&b"q"[..]));
+  assert_eq!(green.content("trunk/a"), Some(&b"alpha"[..]));
+  assert_eq!(green.content("trunk/c"), Some(&b"gamma"[..]));
+  edits_landed_at_their_version(green);
+}
+
+/// The copy's own increment's edits read at its version and not before it, and the identity equal to its recount.
+fn edits_landed_at_their_version(green: &mut Green) {
+  assert_eq!(green.content_at("b/a", 1), None);
+  assert_eq!(green.content_at("b/a", 2), Some(b"ALpha".to_vec()));
+  assert_eq!(green.content_at("b/c", 2), None);
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+}
+
+/// The replayed `replica` reads and hashes as `green` does.
+fn replica_reads_alike(replica: &mut Green, green: &mut Green) {
+  assert_eq!(replica.head_identity(), green.head_identity());
+  assert_eq!(replica.base_at(2), green.base_at(2));
+  assert_eq!(replica.content("b/a"), Some(&b"ALpha"[..]));
 }
 
 /// A-586 (the root's copy: `svn copy ^/ ^/snap`, which a stock client sends). Do: give the root a property and copy it,
@@ -464,7 +494,9 @@ fn a_copy_is_refused_typed_and_changes_nothing() {
   let mut moved = Work::exclusive();
   moved.copy("t2", "y", 4).rename("trunk/a", "y/q");
   use MergeConflictClass::{CreateCreate, DeleteModify, TypeChanged};
-  let cases: Vec<(Work, u64, Vec<(&str, MergeConflictClass)>)> = vec![
+  /// A case: the work, the version it is judged at, and the conflicts expected of it.
+  type Case<'a> = (Work, u64, Vec<(&'a str, MergeConflictClass)>);
+  let cases: Vec<Case<'_>> = vec![
     (one_copy("t2", "taken", 5), 5, vec![("taken", CreateCreate)]),
     (
       one_copy("t2", "trunk/a", 5),
@@ -847,6 +879,19 @@ fn assert_holds_t2_at(green: &Green, at: &str) {
   assert_eq!(green.content(&joined(at, "e/g")), Some(&b"g2"[..]));
 }
 
+/// What the nested copies leave at `b`: `t2`'s tree at `b/new` and over `b/d`, `b/d/b` and its property gone, the
+/// trunk's `a` moved to `b/moved`, and the rest the trunk's.
+fn b_holds_its_nested_copies(green: &Green) {
+  assert_holds_t2_at(green, "b/new");
+  assert_holds_t2_at(green, "b/d");
+  assert_eq!(green.content("b/d/b"), None);
+  assert_eq!(green.xattr("b/d/b", PROPS), None);
+  assert_eq!(green.content("b/moved"), Some(&b"alpha"[..]));
+  assert_eq!(green.content("b/a"), None);
+  assert_eq!(green.content("b/c"), Some(&b"gamma"[..]));
+  assert_eq!(green.xattr("b", PROPS), Some(&b"p1"[..]));
+}
+
 /// A-626 (copies into a copied tree in one commit: Subversion's second copy into a new branch, and its move inside one, a
 /// copy and a removal). Do: in one node-exclusive increment, copy the trunk at version 2 to `b`, `t2` into `b/new` (a
 /// place the trunk's tree leaves empty), `t2` over `b/d` replacing it (a place the trunk's tree fills), and move `b/a` to
@@ -868,14 +913,7 @@ fn copies_nest_in_one_increment_and_a_move_inside_a_copy_lands() {
   let increment = work.at(3, 2);
   let (outcome, applied) = green.submit_resolved(&increment);
   assert_eq!(outcome, Outcome::Accepted { version: 3 });
-  assert_holds_t2_at(&green, "b/new");
-  assert_holds_t2_at(&green, "b/d");
-  assert_eq!(green.content("b/d/b"), None);
-  assert_eq!(green.xattr("b/d/b", PROPS), None);
-  assert_eq!(green.content("b/moved"), Some(&b"alpha"[..]));
-  assert_eq!(green.content("b/a"), None);
-  assert_eq!(green.content("b/c"), Some(&b"gamma"[..]));
-  assert_eq!(green.xattr("b", PROPS), Some(&b"p1"[..]));
+  b_holds_its_nested_copies(&green);
   assert!(
     base_paths(&green.base_at(2))
       .iter()

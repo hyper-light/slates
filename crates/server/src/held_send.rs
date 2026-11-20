@@ -1079,26 +1079,38 @@ mod tests {
       assert_eq!((geometry.stride * size_of::<u64>()) % line, 0, "{line}");
       let words = words(geometry);
       let ledger = LedgerView::new(words.as_slice(), geometry);
-      assert_eq!(ledger.claim(11, 100), Some(0));
-      assert_eq!(ledger.claim(22, 200), Some(1));
-      assert_eq!(ledger.claim(33, 300), Some(2));
-      ledger.free(1);
-      assert_eq!(ledger.find(22), None, "freed");
-      assert_eq!(ledger.claim(44, 400), Some(1), "the lowest free");
-      assert_eq!(ledger.claim(0, 0), None, "zero marks a free slot");
-      for (connection, committed) in [(11, 100), (44, 400), (33, 300)] {
-        assert_eq!(
-          ledger.find(connection),
-          Some(SendLedger {
-            committed,
-            in_flight: 0
-          })
-        );
-      }
-      assert_eq!(ledger.find(99), None, "never claimed");
-      assert_eq!(ledger.claim(55, 0), Some(3));
-      assert_eq!(ledger.claim(66, 0), None, "full");
+      assert_claimed_lowest_first(&ledger);
+      assert_found_only_by_their_connection(&ledger);
     }
+  }
+
+  /// Three slots claimed, the middle freed and claimed again: slots 0, 1, 2, then 1 again; zero never claims.
+  fn assert_claimed_lowest_first<W: super::LedgerWords + ?Sized>(ledger: &LedgerView<'_, W>) {
+    assert_eq!(ledger.claim(11, 100), Some(0));
+    assert_eq!(ledger.claim(22, 200), Some(1));
+    assert_eq!(ledger.claim(33, 300), Some(2));
+    ledger.free(1);
+    assert_eq!(ledger.find(22), None, "freed");
+    assert_eq!(ledger.claim(44, 400), Some(1), "the lowest free");
+    assert_eq!(ledger.claim(0, 0), None, "zero marks a free slot");
+  }
+
+  /// Each claimed connection found at its own bytes, a stranger not found, and the filled ledger refusing.
+  fn assert_found_only_by_their_connection<W: super::LedgerWords + ?Sized>(
+    ledger: &LedgerView<'_, W>,
+  ) {
+    for (connection, committed) in [(11, 100), (44, 400), (33, 300)] {
+      assert_eq!(
+        ledger.find(connection),
+        Some(SendLedger {
+          committed,
+          in_flight: 0
+        })
+      );
+    }
+    assert_eq!(ledger.find(99), None, "never claimed");
+    assert_eq!(ledger.claim(55, 0), Some(3));
+    assert_eq!(ledger.claim(66, 0), None, "full");
   }
 
   /// A-550, golden vector: a ledger's record is four little-endian words, tag first, and no record of another kind or

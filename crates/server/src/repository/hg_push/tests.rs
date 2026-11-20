@@ -69,11 +69,14 @@ fn parsed(hex: &str) -> Node {
     .unwrap()
 }
 
+/// One changeset of a test's served view: its node, its parents' revisions, its branch and its phase.
+type ViewChangeset = (Node, [Option<Rev>; 2], Vec<u8>, Phase);
+
 /// A served view a test builds from a fixture's listings: `{rev} {node} {p1} {p2} {phase} {branch}` a line, and
 /// `{name} {node}` a bookmark.
 #[derive(Clone, Debug, Default)]
 struct View {
-  changesets: Vec<(Node, [Option<Rev>; 2], Vec<u8>, Phase)>,
+  changesets: Vec<ViewChangeset>,
   bookmarks: Vec<(Vec<u8>, Node)>,
 }
 
@@ -385,7 +388,7 @@ impl Hg {
     state: &mut ShardState,
     unbundle: &Unbundle,
     view: &View,
-  ) -> Result<Prepared, Refused> {
+  ) -> Result<Prepared, Box<Refused>> {
     super::prepare_whole(
       state,
       self.repository,
@@ -412,9 +415,9 @@ impl Hg {
     state: &mut ShardState,
     unbundle: &Unbundle,
     view: &View,
-  ) -> Result<Reply, Refused> {
+  ) -> Result<Reply, Box<Refused>> {
     let prepared = self.prepare(state, unbundle, view)?;
-    self.land(state, prepared).answer
+    self.land(state, prepared).answer.map_err(Box::new)
   }
 
   /// The green a name binds.
@@ -714,20 +717,73 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
       listing!("push-plain-server.txt"),
       listing!("push-plain-bookmarks.txt"),
     );
-    let prepared = hg
-      .prepare(state, &stock(fixture!("push-plain.hg")), &view)
+    // The stock push's changegroup is taken into its fork first; then another push lands; then the stock push lands
+    // as the driver lands it, its stale fork re-based and the race judged at landing (A-720 part 2b).
+    let bundle = fixture!("push-plain.hg");
+    let unbundle = stock(bundle);
+    let (_, part) = unbundle.changegroup().unwrap();
+    let forked = super::take_whole(state, hg.repository, part, &mut room())
+      .unwrap()
       .unwrap();
     let other = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[2])))],
     };
     assert!(hg.push(state, &other, &view).is_ok());
     assert_eq!(head(state, hg.root), Some(made[2].node));
-    let refused = hg.land(state, prepared).answer.map(|reply| encoded(&reply));
-    let race = refused.map_err(|refused| encoded(&Reply::refused(&[], &refused)));
+    let landed = super::land_in(
+      state,
+      hg.repository,
+      (&owner(), bundle),
+      &unbundle,
+      Some(forked),
+      &mut room(),
+    );
+    let race = match landed {
+      Some(Outcome::Refused(reply)) => Err(encoded(&reply)),
+      other => Ok(format!("{other:?}")),
+    };
     assert_eq!(race, Err(fixture!("push-race-reply.hg").to_vec()));
     assert_eq!(head(state, hg.root), Some(made[2].node));
     assert!(!hg.holds(state, &made[3].node));
     assert_eq!(hg.roots(state), BTreeSet::from([made[2].node]));
+  });
+}
+
+/// A-720 part 2b (pushes taken side by side). Do: on the rebuilt repository, take two pushes' changegroups into their
+/// own forks from the same index (`other` and `plain`, each a child of `second`, neither asking a race check), land the
+/// first, then land the second, whose fork the first made stale. Expect both accepted and both changesets held by the
+/// repository's index after: the second re-based by node, nothing of the first lost.
+#[test]
+fn two_pushes_taken_side_by_side_both_land() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut hg = Hg::new(state, "side-by-side");
+    let made = rebuild(state, &mut hg, (&[1], 1));
+    let first = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[2])))],
+    };
+    let second = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[3])))],
+    };
+    let fork_of = |state: &mut ShardState, unbundle: &Unbundle| {
+      let (_, part) = unbundle.changegroup().unwrap();
+      super::take_whole(state, hg.repository, part, &mut room())
+        .unwrap()
+        .unwrap()
+    };
+    let (first_fork, second_fork) = (fork_of(state, &first), fork_of(state, &second));
+    let principal = owner();
+    for (unbundle, forked) in [(&first, first_fork), (&second, second_fork)] {
+      let landed = super::land_in(
+        state,
+        hg.repository,
+        (&principal, b"side"),
+        unbundle,
+        Some(forked),
+        &mut room(),
+      );
+      assert!(matches!(landed, Some(Outcome::Accepted(_))), "{landed:?}");
+    }
+    assert!(hg.holds(state, &made[2].node) && hg.holds(state, &made[3].node));
   });
 }
 
@@ -752,10 +808,11 @@ fn view_with(made: &[Made], drafts: &[usize]) -> View {
 
 /// A-657, A-642 (a check of a green the push does not move compares its position). Do: on the rebuilt repository, land
 /// a first changeset on a new branch `stable` (a line made from `default`'s), then prepare a push of `plain` on
-/// `default` carrying `check:heads` (the heads it read: `stable`'s changeset alone), then land another push moving
-/// `stable`, then land the prepared push. Expect: `stable`'s line made, numbered 0; the prepared push's own line never
-/// moved, so its verdict alone would accept it, but `stable`'s position no longer what it read, so it is refused as
-/// 7.2's race, and nothing of it is applied.
+/// `default` carrying `check:heads` (the heads it read: `stable`'s changeset alone), its changegroup taken into its fork,
+/// then land another push moving `stable`, then land the first as the driver does (A-720: its fork re-based, its checks
+/// judged at landing). Expect: `stable`'s line made, numbered 0; the first push's own line never moved, so its verdict
+/// alone would accept it, but `stable`'s heads no longer what it read, so it is refused as 7.2's race, and nothing of it
+/// is applied.
 #[test]
 fn a_push_is_refused_when_a_green_it_only_checked_moved() {
   crate::daemon::audit_on_shard(|state| {
@@ -773,17 +830,30 @@ fn a_push_is_refused_when_a_green_it_only_checked_moved() {
         taken(1, Asks::Changegroup(changegroup(&made, &[3]))),
       ],
     };
-    let prepared = hg
-      .prepare(state, &checked, &view_with(&made, &[4]))
+    // Its changegroup taken into its fork first (A-720); another push moves `stable`; then it lands as the driver lands
+    // it, its stale fork re-based and `check:heads` judged at landing.
+    let (_, part) = checked.changegroup().unwrap();
+    let forked = super::take_whole(state, hg.repository, part, &mut room())
+      .unwrap()
       .unwrap();
     let again = Unbundle {
       parts: vec![taken(0, Asks::Changegroup(changegroup(&made, &[5])))],
     };
     assert!(hg.push(state, &again, &view_with(&made, &[4])).is_ok());
     assert_eq!(head(state, stable), Some(made[5].node));
-    let raced = hg.land(state, prepared).answer;
+    let raced = super::land_in(
+      state,
+      hg.repository,
+      (&owner(), b"checked"),
+      &checked,
+      Some(forked),
+      &mut room(),
+    );
     let words = super::RACED.to_vec();
-    assert_eq!(raced, Err(Refused::PushRaced { message: words }));
+    assert_eq!(
+      raced,
+      Some(Outcome::refused(&Refused::PushRaced { message: words }))
+    );
     assert_eq!(head(state, hg.root), Some(made[1].node));
     assert!(!hg.holds(state, &made[3].node));
   });
@@ -848,11 +918,22 @@ fn a_bookmark_moves_on_its_own_green() {
 /// of one, a line's name or a name without its end read as no bookmark.
 #[test]
 fn names_read_as_themselves_and_escape_what_would_meet() {
+  assert_names_escape();
+  assert_lines_read_back();
+  assert_bookmarks_read_back();
+}
+
+/// A stock name reads as itself; `:`, `%`, a control byte and bytes not UTF-8 escaped.
+fn assert_names_escape() {
   assert_eq!(line_name(b"default", 0), "branch:default:0");
   assert_eq!(line_name(b"stable/7.2", 12), "branch:stable/7.2:12");
   assert_eq!(bookmark_name(b"main"), "bookmark:main:");
   assert_eq!(line_name(b"a:b%c\n", 1), "branch:a%3Ab%25c%0A:1");
   assert_eq!(bookmark_name(b"caf\xc3\xa9\xff"), "bookmark:caf\u{e9}%FF:");
+}
+
+/// A line's name reads back as its branch and number, and a second spelling of one as none.
+fn assert_lines_read_back() {
   assert_eq!(line_of("branch:a%3Ab:01"), None);
   assert_eq!(
     line_of("branch:%41:0"),
@@ -860,6 +941,11 @@ fn names_read_as_themselves_and_escape_what_would_meet() {
     "a second spelling of `A` read as a line"
   );
   assert_eq!(line_of("branch:a%3Ab:1"), Some((b"a:b".to_vec(), 1)));
+}
+
+/// A bookmark's name reads back as its bookmark; a second spelling of one, a line's name or a name without its end
+/// reads as no bookmark.
+fn assert_bookmarks_read_back() {
   assert_eq!(bookmark_of("bookmark:main:"), Some(b"main".to_vec()));
   assert_eq!(
     bookmark_of("bookmark:caf\u{e9}%FF:"),
@@ -1045,10 +1131,10 @@ fn the_policy_refuses_before_the_verdict_in_acls_words() {
     );
     assert_eq!(
       super::admitted(state, (&owner(), plain.repository), &prepared),
-      Err(Refused::Abort {
+      Err(Box::new(Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      })
+      }))
     );
     set_policy(state, ("acl-plain", 1), Vec::new());
     assert_eq!(
@@ -1085,10 +1171,10 @@ fn the_policy_refuses_before_the_verdict_in_acls_words() {
     );
     assert_eq!(
       super::admitted(state, (&owner(), marks.repository), &prepared),
-      Err(Refused::Abort {
+      Err(Box::new(Refused::Abort {
         message: listed.into_bytes(),
         hint: None
-      })
+      }))
     );
   });
 }
@@ -1134,10 +1220,10 @@ fn a_bookmark_deleted_is_refused_naming_the_empty_changeset_acl_names() {
     );
     assert_eq!(
       super::admitted(state, (&owner(), marks.repository), &prepared),
-      Err(Refused::Abort {
+      Err(Box::new(Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      })
+      }))
     );
   });
 }
@@ -1177,10 +1263,10 @@ fn the_policy_names_the_branch_acl_meets_first() {
     );
     assert_eq!(
       super::admitted(state, (&owner(), two.repository), &prepared),
-      Err(Refused::Abort {
+      Err(Box::new(Refused::Abort {
         message: denied.into_bytes(),
         hint: None
-      })
+      }))
     );
   });
 }

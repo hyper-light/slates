@@ -118,6 +118,7 @@ impl FileRevsRequest {
   fn parse(params: &[Value<'_>], base: &str) -> Option<Self> {
     let (path, start) = path_and_revision(params, base)?;
     let end = optional_revnum(params.get(2))?;
+    // Format: `"c(?r)(?r)?B"`'s fourth item, include-merged-revisions (`serve.c` `get_file_revs`).
     let merged = match params.get(3) {
       None => false,
       some => boolean(some)?,
@@ -565,7 +566,7 @@ impl<R: Repository + ?Sized> Reads<'_, R> {
       merged.extend(next.iter().cloned());
       previous = next;
     }
-    merged.sort_by(|first, second| second.revision.cmp(&first.revision));
+    merged.sort_by_key(|location| core::cmp::Reverse(location.revision));
     Ok(merged)
   }
 

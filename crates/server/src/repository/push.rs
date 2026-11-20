@@ -217,12 +217,13 @@ pub(crate) const PUSH_COMMIT_REFUSED: &str = "repository.push.commit_refused";
 enum Step {
   /// `green` moves by `work`.
   Update { green: DbVolumeId, work: Increment },
-  /// A new green, `record`, made at `version` of `from` and bound to `name`, moved by `work` (based at 0) if any.
+  /// A new green, `record`, made at `version` of `from` and bound to `name`, moved by `work` (based at 0) if any. The
+  /// record is boxed: it is far larger than the other variants.
   Create {
     name: String,
     from: DbVolumeId,
     version: u64,
-    record: VolumeRecord,
+    record: Box<VolumeRecord>,
     work: Option<Increment>,
   },
   /// `name` retired from `green`, which must be at `version`.
@@ -616,7 +617,7 @@ fn plan_create(
     name,
     from,
     version,
-    record,
+    record: Box::new(record),
     work,
   })
 }
@@ -663,7 +664,7 @@ fn push_planned(
   let made: Vec<VolumeRecord> = steps
     .iter()
     .filter_map(|step| match step {
-      Step::Create { record, .. } => Some(record.clone()),
+      Step::Create { record, .. } => Some(VolumeRecord::clone(record)),
       _ => None,
     })
     .collect();

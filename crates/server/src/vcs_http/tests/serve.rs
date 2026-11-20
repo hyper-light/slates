@@ -748,7 +748,7 @@ fn a_status_named_after_the_body_heads_the_reply_and_one_no_reply_may_carry_fail
 fn marked_within(for_ns: u64) -> bool {
   let until = Instant::now() + Duration::from_nanos(for_ns);
   while !SAW_ITS_CLIENT_GO.load(Ordering::SeqCst) && Instant::now() < until {
-    std::thread::sleep(Duration::from_nanos(TICK_NS));
+    std::thread::park_timeout(Duration::from_nanos(TICK_NS));
   }
   SAW_ITS_CLIENT_GO.load(Ordering::SeqCst)
 }

@@ -478,6 +478,13 @@ fn verify_made(made3: &Made3) -> Result<Verified, Unverified> {
 fn a_changegroup_breaking_a_rule_is_refused_by_kind() {
   let (good, top) = Made3::one(&NULL_NODE, &[("a", b"x\n", "")]);
   assert!(verify_made(&good).is_ok());
+  revisions_off_their_rules_are_refused(&good);
+  parents_and_bases_nobody_holds_are_refused(&good);
+  revisions_naming_what_nobody_holds_are_refused(&good, top);
+}
+
+/// `good` with a text one bit off its node, or a flag set: each refused.
+fn revisions_off_their_rules_are_refused(good: &Made3) {
   let mut bent = good.clone();
   bent.files[0].1[0].node[19] ^= 1;
   assert!(matches!(
@@ -487,6 +494,16 @@ fn a_changegroup_breaking_a_rule_is_refused_by_kind() {
       ..
     })
   ));
+  let mut flagged = good.clone();
+  flagged.files[0].1[0].flags = 1 << 15;
+  assert!(matches!(
+    verify_made(&flagged),
+    Err(Unverified::Flags { flags: 32768, .. })
+  ));
+}
+
+/// `good` with a parent and a delta base nobody holds: each refused.
+fn parents_and_bases_nobody_holds_are_refused(good: &Made3) {
   let stranger = [9; 20];
   let mut orphan = good.clone();
   orphan.manifests[0].p1 = stranger;
@@ -498,12 +515,12 @@ fn a_changegroup_breaking_a_rule_is_refused_by_kind() {
   assert!(
     matches!(verify_made(&baseless), Err(Unverified::UnknownDeltaBase { base, .. }) if base == stranger)
   );
-  let mut flagged = good.clone();
-  flagged.files[0].1[0].flags = 1 << 15;
-  assert!(matches!(
-    verify_made(&flagged),
-    Err(Unverified::Flags { flags: 32768, .. })
-  ));
+}
+
+/// `good` with a link to a changeset nobody holds, a changeset whose manifest and a manifest whose file revision
+/// nobody holds, or a tree manifest: each refused (`top` its changeset).
+fn revisions_naming_what_nobody_holds_are_refused(good: &Made3, top: Node) {
+  let stranger = [9; 20];
   let mut unlinked = good.clone();
   unlinked.manifests[0].link = stranger;
   assert!(matches!(
@@ -542,6 +559,25 @@ fn a_changegroup_breaking_a_rule_is_refused_by_kind() {
 /// push refused before anything is kept.
 #[test]
 fn a_path_mercurials_audit_refuses_is_refused() {
+  paths_mercurials_audit_refuses_are_refused();
+  for path in [
+    ".hgignore",
+    "a/.hgtags",
+    "x~1/y",
+    "HG~a",
+    "hg~",
+    "src/deep/mod.rs",
+    "c",
+  ] {
+    assert_eq!(verify::audit(path.as_bytes()), Ok(()), "{path}");
+  }
+  let (mut hidden, _) = Made3::one(&NULL_NODE, &[("a", b"x\n", "")]);
+  hidden.files[0].0 = b".hg/hgrc".to_vec();
+  assert!(matches!(verify_made(&hidden), Err(Unverified::Path { .. })));
+}
+
+/// The paths 7.2's audit refuses, and paths a slates path cannot hold: each refused by its fault.
+fn paths_mercurials_audit_refuses_are_refused() {
   let fault = |path: &[u8]| match verify::audit(path) {
     Err(Unverified::Path { fault, .. }) => Some(fault),
     _ => None,
@@ -573,20 +609,6 @@ fn a_path_mercurials_audit_refuses_is_refused() {
   for path in unheld {
     assert_eq!(fault(path), Some(PathFault::NotHeld), "{path:?}");
   }
-  for path in [
-    ".hgignore",
-    "a/.hgtags",
-    "x~1/y",
-    "HG~a",
-    "hg~",
-    "src/deep/mod.rs",
-    "c",
-  ] {
-    assert_eq!(verify::audit(path.as_bytes()), Ok(()), "{path}");
-  }
-  let (mut hidden, _) = Made3::one(&NULL_NODE, &[("a", b"x\n", "")]);
-  hidden.files[0].0 = b".hg/hgrc".to_vec();
-  assert!(matches!(verify_made(&hidden), Err(Unverified::Path { .. })));
 }
 
 /// A-641 part 2, AC-HG.3 (§4.17.1 "A push is a work" items 2 and 3). Do: push an executable, a symbolic link and files

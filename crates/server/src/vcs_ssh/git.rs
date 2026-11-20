@@ -139,7 +139,7 @@ impl<L: StoreLender> UploadCommand<L> {
       after,
       ..
     } = self;
-    *admission = Admission::new(lender.room().ok_or_else(unheld)?);
+    *admission = Admission::new(lender.room(*repository).ok_or_else(unheld)?);
     let made = lender
       .lend((*repository, reader), |served, packs| {
         upload::serve(served, *version, asked, packs, admission)

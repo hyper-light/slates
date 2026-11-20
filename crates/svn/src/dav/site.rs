@@ -257,7 +257,7 @@ pub struct Report {
 #[derive(Debug)]
 enum Walk {
   /// A `log-report`'s.
-  Log(DavLog),
+  Log(Box<DavLog>),
   /// A `file-revs-report`'s (`svn blame`; A-726), boxed beside the update.
   FileRevs(Box<super::report_file_revs::FileRevsWalk>),
   /// An `update-report`'s ([`super::update`]).
@@ -612,7 +612,7 @@ fn report<R: Repository + ?Sized>(
   match asked {
     Asked::Log(log) => match DavLog::new(&log, &place.path) {
       Some(log) => Answer::Report(Report {
-        walk: Walk::Log(log),
+        walk: Walk::Log(Box::new(log)),
       }),
       None => Answer::Whole(bare(HTTP_BAD_REQUEST)),
     },
@@ -840,7 +840,8 @@ fn rfc1123(date: &str) -> Option<String> {
   let (year, month, day) = super::time::civil_from_days(days)?;
   let (hour, minute, second) = super::time::time_of_day(seconds % super::time::SECONDS_PER_DAY);
   let week = u64::try_from(DAY_NAMES.len()).ok()?;
-  let weekday = DAY_NAMES.get(usize::try_from(days.saturating_add(EPOCH_WEEKDAY) % week).ok()?)?;
+  let weekday =
+    DAY_NAMES.get(usize::try_from(days.saturating_add(EPOCH_WEEKDAY).checked_rem(week)?).ok()?)?;
   let month_name = MONTH_NAMES.get(usize::try_from(month.checked_sub(1)?).ok()?)?;
   Some(format!(
     "{weekday}, {day:02} {month_name} {year} {hour:02}:{minute:02}:{second:02} GMT"
