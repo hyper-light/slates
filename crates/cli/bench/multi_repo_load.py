@@ -469,6 +469,17 @@ def main():
                     others = (by_shard.get(row.get("partition"), 0) - row.get("intake_step_ns", 0)) / 1e9
                     print(f"    r{rank} on shard {row.get('partition')}: span {span:.3f} s, served "
                           f"{row.get('intake_step_ns', 0) / 1e9:.3f} s, others' steps on its shard {others:.3f} s", flush=True)
+                # Who shares the slowest one's shard (A-724's profile): each repository there, its pushes and step time,
+                # so a wait from a repository's many pushes (one turn each) shows as its pushes' count.
+                if slow:
+                    part = slow[-1][2].get("partition")
+                    mates = sorted(
+                        ((name, mate) for name, mate in rows.items() if mate.get("partition") == part),
+                        key=lambda item: -item[1].get("intake_step_ns", 0),
+                    )
+                    print(f"    on shard {part}: " + ", ".join(
+                        f"{name} ({mate.get('intakes_begun', 0)} pushes, {mate.get('intake_step_ns', 0) / 1e9:.2f} s)"
+                        for name, mate in mates), flush=True)
                 # Each class's intake steps: how long one step holds its shard on average (step time over steps).
                 for cls in range(len(packs)):
                     names = [f"r{rank}" for rank in range(1, repositories + 1) if classes[rank - 1] == cls]
