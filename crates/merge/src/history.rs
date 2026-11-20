@@ -853,6 +853,17 @@ mod tests {
         .is_none(),
       "a whole replace is named, never copied"
     );
+    assert_the_block_outlives_the_map_while_named(files, chunks, [named, spliced], &first);
+  }
+
+  /// The file map lets `f`'s block go: it lives on while `named` or `spliced` names it (`named` reading `first`), and
+  /// is freed with the last value, the chunks then empty.
+  fn assert_the_block_outlives_the_map_while_named(
+    mut files: crate::dims::Files,
+    mut chunks: Chunks,
+    [named, spliced]: [Value; 2],
+    first: &[u8],
+  ) {
     files.remove("f");
     assert_eq!(files.blocks().live(), 1, "the history keeps the block");
     assert_eq!(named.materialize(&chunks, files.blocks()), first);
