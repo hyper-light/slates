@@ -106,3 +106,54 @@ fn t_a724_a_push_is_live_from_its_start_until_it_drops() {
     assert_eq!(room(state, other).bound, Bound::Shard);
   });
 }
+
+/// Turns repository `id`'s encoding until every version's fragments are kept, as a fetch's request does.
+fn encoded(state: &mut ShardState, id: RepositoryId) {
+  use crate::vcs_store::git_encode::{Turned, turn};
+  while turn(state, id) == Turned::More {}
+}
+
+/// A-724 piece 4 (§4.17.5 "The cold trigger"). Do: push stock git's fixtures into a repository and encode its versions
+/// (as its first fetch would), then ask it to give back more than it holds of fragments, at a pressure, with no fetch
+/// ever seen; then the same once its fetches outnumber its pushes a thousandfold. Expect: the encodings' time and bytes
+/// learned on its usage row; the room it holds counted with its fragments; with no reads to come every version's
+/// fragments dropped, their bytes given back exactly and counted, and the versions encoded again; and once its reads are
+/// many, at the same pressure, its fragments kept.
+#[test]
+fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room()
+ {
+  use crate::vcs_store::git_encode::{DROPPED, kept_bytes, relieve};
+  crate::daemon::audit_on_shard(|state| {
+    let pushed = git_repository(state, "pushed");
+    crate::git_push::tests::pushed_from_the_fixtures(state, pushed, &["create", "update"]);
+    encoded(state, pushed);
+    let row = state.vcs_usage.usage(&pushed).expect("a row");
+    assert!(
+      row.derive_ns > 0 && row.derive_bytes > 0,
+      "the encodings learned: {row:?}"
+    );
+    let kept = kept_bytes(state, pushed);
+    assert!(kept > 0, "fragments kept");
+    assert_eq!(
+      super::held_by(state, pushed),
+      state.vcs_stores.objects_charged(pushed) + kept
+    );
+    let given = relieve(state, pushed, kept.saturating_mul(2), 2.0);
+    assert_eq!(given, kept, "every version's fragments given back, exactly");
+    assert_eq!(kept_bytes(state, pushed), 0);
+    assert!(counted(state, DROPPED) >= 1);
+    encoded(state, pushed);
+    // Encoded again: its size may differ, since the encoder's learned rules moved with its first encodings.
+    let kept_again = kept_bytes(state, pushed);
+    assert!(kept_again > 0, "encoded again");
+    for _ in 0..2_000 {
+      state.vcs_usage.begun(&pushed, &owner(), Work::Fetch, 10);
+    }
+    assert_eq!(
+      relieve(state, pushed, kept.saturating_mul(2), 2.0),
+      0,
+      "kept: reads make rebuilding dear"
+    );
+    assert_eq!(kept_bytes(state, pushed), kept_again);
+  });
+}

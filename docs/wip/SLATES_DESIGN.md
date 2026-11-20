@@ -15945,7 +15945,8 @@ Then main runs the suite over both URLs, the differential run and the order-of-m
 > shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
 > order: the learned demand and the shares (piece 2; the division itself built, `slates_vcs::share::divide`, weighted
 > dominant-resource fairness with demands as caps, solved exactly at its breakpoints), admission by share (3; its room built, below), the cold trigger (4; its choice and git's drop built:
-> `slates_vcs::cold::choose`, `Repository::kept_fragments`/`drop_fragments`; the server's trigger owed), intake off the owner
+> `slates_vcs::cold::choose`, `Repository::kept_fragments`/`drop_fragments`, and the server's trigger in
+> `vcs_share::room`; compression of cold content owed), intake off the owner
 > shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
 > amends §4.10's content placement), the many-repository load proof (7), the snapshot sized by its data (8) and a
 > giant repository's index across partitions (9), both designed below.
@@ -54628,3 +54629,12 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   (the bytes given back exact, the version re-encoded to the same fragments, the pack read back whole). Owed (4b): the
   server's trigger (a repository whose grant `vcs_share::room` finds below what it holds drops by this choice, its
   reads from its usage row, its rebuild times measured), then compression of cold content.
+- **Piece 4b, the trigger (2026-11-20).** What a repository holds now counts its kept fragments (`vcs_share`'s
+  `held_by`); while repositories contend (`vcs_share::room`'s divided path), each claimant holding more than its grant
+  gives back what §4.11's cost model says to (`vcs_store::git_encode::relieve`, counted `vcs_store.git_encode.dropped`):
+  the rebuild of a byte priced at what this repository's own encodings took (its usage row learns `derive_ns` and
+  `derive_bytes` at every encoding turn), on each read its row expects (its fetches over its answered intakes). Nothing
+  is dropped while its encoding runs, or before one was measured. Test: `vcs_share::tests::t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room`
+  (stock git's pushes encoded; with no reads to come every fragment dropped, bytes given back exactly, encoded again;
+  with fetches a thousandfold its pushes, kept), with `vcs_share:: git_push:: vcs_store::upload::` 17 of 17 and
+  `slates-vcs` `usage` green. Owed: compression of cold content; a drop of many versions a turn at a time.
