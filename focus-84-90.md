@@ -904,3 +904,11 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   durable before the naming record), lands after w-svn's charging fix; register copy -> w-svn GAPS. w-perf landed
   183dd0e23 (BENCHMARKS "Where the svn server's time and memory go"). Next for w-perf after M2 starts: git read path
   vs git daemon once w-interop's matrix shows clones passing (A-713).
+- ~23:30 PST FIRST GIT ROW (w-perf, release 82d3538b0, git/git cut at v1.0.0: 2,930 commits, 12,233 objects, 3.5 MiB
+  pack; interleaved best of 3, slates vs git daemon): clone --mirror 2.816 vs 0.300 s (9.4x SLOWER); blob:none 1.092 vs
+  0.180 (6x slower); push 0.665 vs 0.310; shallow 0.160 vs 0.111; one-commit push 0.058 vs 0.080; fetch 0.080 vs 0.068.
+  fsck clean, refs+objects identical. Cause: every clone re-runs slates_git::store::deltas::Search::step (72% of
+  samples). RULING T4 -> w-perf NOW (before A-716): delta computed once per object and kept with it, stored deltas
+  streamed, remaining search sliced; w-git's sliced intake may keep pushed deltas as they arrive (w-git's call).
+- Ledger clash fixed: A-715 = w-reaper (idle sweep), A-716 = w-perf (svn texts once); next free A-717.
+- w-shared A-636 2c-1 landed 82d3538b0 (878fc386c); next 2c-2 (successor rebuilds the repository by keep-whole rule).

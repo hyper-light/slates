@@ -54,3 +54,15 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - LANDED main 183dd0e23: BENCHMARKS.md "Where the svn server's time and memory go, ranked" (T2 + M1-M5).
 - Worktree now ~/slates-work/w-perf-plan (agents/w-perf-plan). Waiting on: w-git push spin, w-hg sliced intake +
   import PastRoom, w-svn green_chains; main's M2 ruling. On each: rebuild on Studio, rerun harness, record.
+## A-715 (claimed; main's ruling ~07:00Z): svn texts held once (A-64), after w-svn's charging fix (A-714)
+- Readers of Repository::content: records.rs (properties, Contents::mergeinfo, ReadSource::text/properties,
+  drive::Green::text), Transaction::content/store/take_fresh_contents (importer delta base + dedupe), export.rs:542,
+  svn_commit.rs text_bytes (fresh or records). Engine: Green::content_ref_at(path, version) -> Cow (version N = rev N).
+- Seam proposed to w-svn (slates-work-3d) ~07:10Z: contents keep property lists only; texts -> TextPlace{path,
+  revision,len}; a lent TextSource (green content_ref_at); log entry's record drops text bytes (green version carries
+  them); rebuild replays green then records. Asked: green history trimming? which files A-714 touches?
+- Also queued (main): git read path vs git daemon (clone, blob:none, shallow; git/git cut v1.0.0, whole if it fits)
+  once w-interop's A-713 clone rows pass (w-interop r22).
+- LANDED fdef525e3 (on main, checked): git row at cut v1.0.0 (release 82d3538b0): clone 2.816 vs 0.300 (9.4x slower),
+  blob:none 1.092 vs 0.180, push 0.665 vs 0.310; sample: 72% of clone CPU in slates_git::store::deltas::Search::step.
+  T4 (reuse deltas) proposed to main; awaiting ruling (w-git's area). A-716 seam awaiting w-svn's reply.
