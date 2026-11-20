@@ -198,3 +198,11 @@ ideal." And on Mantle's code: "Copy into slates".
 - **New VCS storage code reads through one seam:** an in-flight change from RAM, landed content from disk. Owner of the
   seam, the vendored crates and the store: w-store. Until it lands, keep your designs to that seam; don't build a
   second store.
+- **One unit: the changeset (ADA ~13:35 PST: "More than even storing it as diffs, would it be better to store it as
+  *changesets*? This way we aren't introducing a second underlying unit.").** A repository's history on disk is the
+  append-only log of its landed changesets: the same unit that is a change in RAM before it lands, so landing is an
+  append. Everything else is derived data (A-645), computed from changesets and cached by identity within the memory
+  rules: the head tree, git's trees, packs and objects, hg's file revisions and manifests, svn's node revisions and
+  deltas, blame, and checkpoints for reading old versions. No tool keeps a second stored unit (per-file delta chains,
+  a pack store, stored texts) as truth. A pack or bundle held while a push is judged is the change in flight, not
+  history. Each version's full-text identity is recorded in metadata, so verification and content-once still hold.
