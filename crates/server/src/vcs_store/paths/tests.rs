@@ -490,6 +490,12 @@ fn t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map() {
       record,
       vec![main_bound(at)]
     ));
+    // Its store made a record a turn and its map in slices, by tasks a test's step never runs: driven to their end.
+    assert!(
+      state.vcs_stores.rebuilding(at.0) && state.vcs_stores.git_ref(at.0).is_none(),
+      "a successor's store is made again a step a turn, lent to nothing meanwhile"
+    );
+    crate::vcs_store::settle_rebuild(state, at.0);
     set(&mut model, "f", FileClass::File, b"two");
     assert_kept(state, at, second, &model);
     let third = version(state, at.1, 3, vec![create("/g", b"three")]);
