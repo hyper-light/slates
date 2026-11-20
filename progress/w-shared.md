@@ -1,5 +1,15 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## STOPPED 2026-11-20 after landing 1fc1da1fb (main 2eca76a9b), per CLAUDE.md §8 (supervisor starts the next piece).
+  Reported to slates-72 (slates-7a is gone; slates-72 presumed the relaunched main). Worktrees: ~/slates-work/w-shared-lent-wake
+  (fresh off origin/main 359da2388, no edits; for the lent-session wake piece), ~/slates-work/w-shared-state (my own
+  fanout-state worktree: the shared ~/.local/state/slates-fanout index holds a staged reversal of my ledger lines that I did
+  not make, so I push the ledger from here). Old branch archived as agents/g261-a636p2b2-archive; its worktree removed.
+  Lent-session wake design (not started): per-host waiters on the control shard (xshard::awaited), answered from
+  fleet::return_sessions and every record_sessions insert/remove site (fleet.rs 7642/7877/7907/7938/8268, member_task.rs
+  321, live_ship.rs 4469); the four waits (forward_lane SessionOut, fleet campaign 8920, owner_location 476, live_ship 4090)
+  wait on it within their own deadlines.
+
 ## LANDED 2026-11-20: forwarded completion + phase timers = 1fc1da1fb (main 2eca76a9b; tests on 306214c57, key tests
   re-run on 2eca76a9b). Release baseline (fresh mode) in BENCHMARKS. Bench branch agents/w-shared-a697-bench on origin
   (Studio clone ~/.cache/w-shared-a697-bench-src over https; target ~/.cache/w-shared-a697-bench-target).
