@@ -55,6 +55,9 @@ const RESERVED: &[u8] = b"~`!@#$^&*()[]{}\\;'\",<>?";
 /// Format: the byte a percent-encoded byte begins with.
 const PERCENT: u8 = b'%';
 
+/// Format: the bytes of a percent-encoded byte: `%` and two hexadecimal digits (`url_percent_decode`).
+const ESCAPE_LEN: usize = 3;
+
 /// Format: the radix of a percent-encoded byte's two digits.
 const HEX_RADIX: u32 = 16;
 
@@ -236,11 +239,11 @@ fn percent_decode(encoded: &[u8]) -> Vec<u8> {
   let mut decoded = Vec::with_capacity(encoded.len());
   let mut at = 0usize;
   while let Some(byte) = encoded.get(at).copied() {
-    let pair = encoded.get(at.saturating_add(1)..at.saturating_add(3));
+    let pair = encoded.get(at.saturating_add(1)..at.saturating_add(ESCAPE_LEN));
     match (byte, pair.and_then(hex_pair)) {
       (PERCENT, Some(value)) => {
         decoded.push(value);
-        at = at.saturating_add(3);
+        at = at.saturating_add(ESCAPE_LEN);
       }
       _ => {
         decoded.push(byte);
