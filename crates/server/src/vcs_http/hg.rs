@@ -115,6 +115,9 @@ fn to_u64(count: usize) -> u64 {
 pub(crate) trait HgStores {
   /// The served view a repository's commands are answered from, lent for one step.
   type Store<'s>: Store;
+  /// A fetch's hold on the generation of a repository it began on (A-745, §4.17.1 "A fetch's answer" rule 4), given
+  /// back as it is dropped.
+  type Hold;
   /// Whether the store of repository `id` is held here, to be lent.
   fn holds(&self, id: RepositoryId) -> bool;
   /// Runs `step` over repository `id`'s served view, the view made within `room` and `step` handed what is left of it;
@@ -146,6 +149,16 @@ pub(crate) trait HgStores {
   fn fetch_turn(&self, _repository: RepositoryId) -> Option<(u64, u64)> {
     None
   }
+  /// Holds repository `id` as it is now, what the hold copies charged to `room`: taken in the turn a fetch's answer
+  /// began, so its later turns read what that one read; none when its store is not held here.
+  fn hold(&mut self, id: RepositoryId, room: &mut Admission) -> Option<Self::Hold>;
+  /// Runs `step` over the served view of the generation `hold` holds, made within `room`; none when it cannot be made.
+  fn lend_held<R>(
+    &mut self,
+    hold: &Self::Hold,
+    room: &mut Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut Admission) -> R,
+  ) -> Option<R>;
 }
 
 /// An exchange's answer once made: whole, or a `getbundle`'s, made a turn at a time (A-745).
@@ -439,7 +452,7 @@ fn refused_with<E>(status: Status, fields: Fields, proven: bool) -> Decided<E> {
 
 /// A served request's exchange (the module doc's bounds): its arguments copied from the head, its body, and its answer
 /// once the body has ended.
-pub(crate) struct HgExchange<S> {
+pub(crate) struct HgExchange<S: HgStores> {
   /// Where the repository's store is read.
   stores: S,
   /// The repository.
@@ -456,6 +469,8 @@ pub(crate) struct HgExchange<S> {
   room: Admission,
   /// The answer, once made or begun.
   answered: Option<Made>,
+  /// A streamed answer's hold on the generation it began on (A-745 rule 4).
+  generation: Option<S::Hold>,
   /// The edge's room for one request, which bounds a turn of a fetch's answer where the lender names none.
   request_room: u64,
   /// Whether a push's body ran past its room: its bytes let go as they arrive, and the push refused in Mercurial's
@@ -463,7 +478,7 @@ pub(crate) struct HgExchange<S> {
   past_room: bool,
 }
 
-impl<S> HgExchange<S> {
+impl<S: HgStores> HgExchange<S> {
   /// The exchange for `head` on `repository`, by `pusher` where it is a push, its arguments copied and charged to
   /// `room`; none past it.
   fn new(
@@ -504,6 +519,7 @@ impl<S> HgExchange<S> {
       body: Vec::new(),
       room: admission,
       answered: None,
+      generation: None,
       request_room: room,
       past_room: false,
     })
@@ -558,6 +574,16 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       }),
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+    if let Made::Streamed(_) = made {
+      // Taken in the turn the answer began, with no wait between, so every later turn reads what this one read.
+      let mut held = Admission::new(self.request_room);
+      self.generation = Some(
+        self
+          .stores
+          .hold(id, &mut held)
+          .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?,
+      );
+    }
     self.answered = Some(made);
     Ok(())
   }
@@ -581,6 +607,8 @@ impl<S: HgStores> Exchange for HgExchange<S> {
         let more = self.turn(&mut streamed, out)?;
         if more {
           self.answered = Some(Made::Streamed(streamed));
+        } else {
+          self.generation = None;
         }
         Ok(more)
       }
@@ -601,21 +629,29 @@ impl<S: HgStores> HgExchange<S> {
       .map_or((self.request_room, 0), |(room, quantum)| (room, quantum));
     let mut admission = Admission::new(room);
     let start = slates_rt::futures::now_ns();
-    let turned = self.stores.lend(id, &mut admission, |store, room| {
-      let mut taken = false;
-      loop {
-        match streamed.step(store, room, out) {
-          Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => taken = true,
-          Ok(more) => break Ok(more),
-          Err(slates_hg::serve::session::Refused::Serve(
-            slates_hg::serve::Refusal::PastAdmission(_),
-          )) if taken => {
-            break Ok(true);
+    let generation = self
+      .generation
+      .as_ref()
+      .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
+    let turned = self
+      .stores
+      .lend_held(generation, &mut admission, |store, room| {
+        let mut taken = false;
+        loop {
+          match streamed.step(store, room, out) {
+            Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {
+              taken = true
+            }
+            Ok(more) => break Ok(more),
+            Err(slates_hg::serve::session::Refused::Serve(
+              slates_hg::serve::Refusal::PastAdmission(_),
+            )) if taken => {
+              break Ok(true);
+            }
+            Err(refused) => break Err(refused),
           }
-          Err(refused) => break Err(refused),
         }
-      }
-    });
+      });
     match turned {
       Some(Ok(more)) => Ok(more),
       Some(Err(_)) => Err(Failed(Status::INTERNAL_SERVER_ERROR)),

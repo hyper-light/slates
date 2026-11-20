@@ -349,6 +349,20 @@ impl Lends {
 
 impl HgStores for Lends {
   type Store<'s> = Probed;
+  type Hold = RepositoryId;
+
+  fn hold(&mut self, id: RepositoryId, _room: &mut slates_hg::Admission) -> Option<RepositoryId> {
+    self.holds(id).then_some(id)
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    hold: &RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    self.lend(*hold, room, step)
+  }
 
   fn holds(&self, id: RepositoryId) -> bool {
     id == HG && !self.gone.is_some_and(|gone| gone.load(Ordering::Acquire))
