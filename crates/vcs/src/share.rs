@@ -297,19 +297,7 @@ mod tests {
         .iter()
         .map(|at| dominant(&claims[*at]) / claims[*at].weight)
         .fold(0.0, f64::max);
-      let (mut low, mut high) = (0.0, top);
-      if fits(top) {
-        low = top;
-      } else {
-        for _ in 0..200 {
-          let middle = (low + high) / 2.0;
-          if fits(middle) {
-            low = middle
-          } else {
-            high = middle
-          }
-        }
-      }
+      let low = highest_fitting(top, fits);
       let full: Vec<bool> = (0..RESOURCES)
         .map(|r| {
           let used: f64 = open
@@ -325,13 +313,30 @@ mod tests {
         if given >= 1.0 || uses_full {
           fraction[*at] = given;
           frozen[*at] = true;
-          for r in 0..RESOURCES {
-            left[r] = (left[r] - given * claims[*at].demand[r]).max(0.0);
+          for (room, asked) in left.iter_mut().zip(&claims[*at].demand) {
+            *room = (*room - given * asked).max(0.0);
           }
         }
       }
     }
     fraction
+  }
+
+  /// The highest level up to `top` that `fits`: `top` itself when it fits, else bisected 200 times from 0.
+  fn highest_fitting(top: f64, fits: impl Fn(f64) -> bool) -> f64 {
+    if fits(top) {
+      return top;
+    }
+    let (mut low, mut high) = (0.0, top);
+    for _ in 0..200 {
+      let middle = (low + high) / 2.0;
+      if fits(middle) {
+        low = middle
+      } else {
+        high = middle
+      }
+    }
+    low
   }
 
   fn claim() -> impl Strategy<Value = Claim<RESOURCES>> {
@@ -363,9 +368,9 @@ mod tests {
       let mut used = [0.0; RESOURCES];
       for (grant, claim) in grants.iter().zip(&claims) {
         prop_assert!((0.0..=1.0).contains(&grant.fraction));
-        for r in 0..RESOURCES {
-          prop_assert!(grant.granted[r] <= claim.demand[r] * (1.0 + 1e-9));
-          used[r] += grant.granted[r];
+        for ((total, granted), asked) in used.iter_mut().zip(&grant.granted).zip(&claim.demand) {
+          prop_assert!(*granted <= asked * (1.0 + 1e-9));
+          *total += granted;
         }
       }
       let full: Vec<bool> = (0..RESOURCES).map(|r| close(used[r], capacity[r]) || used[r] > capacity[r]).collect();

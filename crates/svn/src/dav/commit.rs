@@ -20,8 +20,11 @@
 //! with its first error, `dav_svn__convert_err`'s status, and ends the transaction: what follows is refused `404`, as
 //! `mod_dav_svn` answers a transaction that no longer exists.
 //!
-//! Stricter than `mod_dav_svn`, each stated: a PUT's body is held whole within the request's room (the edge's
-//! admission), where `mod_dav_svn` streams it into FSFS; revision properties are taken from the POST alone (ra_serf 1.8
+//! A PUT's body is handed to the drive a run at a time as it arrives ([`DavCommit::begin_put`], [`DavCommit::put_chunk`],
+//! [`DavCommit::end_put`]), as `mod_dav_svn` streams it into FSFS, so a commit never holds a body whole (§4.17.1 "A
+//! push's intake").
+//!
+//! Stricter than `mod_dav_svn`, each stated: revision properties are taken from the POST alone (ra_serf 1.8
 //! and later send them there; a PROPPATCH of `!svn/txn/NAME` is refused `501`).
 //!
 //! No I/O, no clock (the caller's instant in its setup), no randomness, no panic.
