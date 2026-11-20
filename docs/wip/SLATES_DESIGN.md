@@ -55015,6 +55015,13 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   release frees its chunk at the next lend. A put the arena has no block for grows it from its pool, the lend's end
   extending the shard budget by the growth. The swap moves a `ChunkStore` (560 bytes); its release cost is measured with the slice's by-use run.
   Tests (merged with main, local, own target): `slates-server` lib 947 of 947 run (`content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`, A-744's, skipped: it spins a debug shard past its window here, alone too, and touches no repository code), `arena_windows::tests` 2 of 2; `slates-vcs` 100, `slates-hg` 356, `slates-git` 557. Slice a2 step 1's three red `slates-vcs` tests read windows through `get()`, which lends only content held Here; they read through `bytes_of`/`len_of` now.
+- **Slice a3 (2026-11-20).** The windows' table rides the shard image as held pieces (kind 11, one a window: identity,
+  length, block), whole in a checkpoint and by its changes in a delta. A recovery claims every block they name before
+  the volumes and before `commit_live`, hands the windows to the content store made at the first replay, held for no
+  one; the replay's puts hold them again by identity, storing nothing, and the rest are freed once every record is
+  replayed (`vcs_store.windows_restored`, `.windows_unrestored`, `.windows_unheld`). Test
+  `daemon::tests::t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image`. Owed: records naming
+  identities only (slice b, with w-balance's name rows and the `homes` tickets); a homed window's holders.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
