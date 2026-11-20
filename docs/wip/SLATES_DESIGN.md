@@ -13198,6 +13198,27 @@ engine: the verdict, rebase, position mapping, the register).
 > part 2, which answers every command `hook not run` while a git hook is configured until they land); git's words for
 > each outcome.
 >
+> **Status (2026-11-19, A-665 part 3: git's push runs its hooks, built; the view's read-only attachment owed).**
+> `crates/server` (`git_push`, its `hooks`) runs receive-pack's three points as git 2.50.1 does: `pre-receive` once
+> over every command no earlier check refused, its view showing the push in git's quarantine, its refusal answering
+> each `pre-receive hook declined` after its words; `update` for each such command the policy admits, its refusal
+> answering that command `hook declined` after its words and git's `error: hook declined to update <ref>`; then the
+> verdicts and the appends, the report written but its last flush; then `post-receive` over the applied commands in a
+> view of the refs the push left, its words between the report and the last flush. The answer is a step at a time:
+> `Answering::Sealing` while a view is sealed in the shard's slices, `Answering::Hook` for a hook the edge runs off
+> the shard's step and hands back. An accepted hook's words go to band 2 as git relays them, charged to the push's
+> room. A hook that cannot run refuses what it would have judged, typed (`hook not run`, with why); a `post-receive`
+> that cannot run or exits non-zero is counted (`git_push.post_receive_unaccepted`). A view is shown at a path by a
+> presenter (`git_hooks::PresentView`): the read-only attachment the mount edges serve is the daemon's, owed, and until
+> it lands the daemon shows none (`Unpresented`), so a push whose repository configures a git hook is refused `hook not
+> run` before any object is admitted. Proven through a presenter that writes each view into a scratch directory, the
+> hooks shell scripts: a refusing `pre-receive` in git's words with nothing recorded, accepting hooks landing the push
+> with each one's words in git's order and `post-receive` reading the moved ref in its view's `packed-refs`, a refusing
+> `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
+> with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
+> and `protected_fixtures` 49 of 49, fmt clean). Owed: the read-only attachment; the
+> edges' signal of a client gone, which ends a hook's run; the hooks' learned times; seals kept as derived data.
+>
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
 > capabilities and this server's agent. Each request is answered whole and statelessly: the shallow-update first,
@@ -13473,8 +13494,10 @@ itself from the base packs and fragments, the objects no kept part holds and the
 `objects/tmp_objdir-incoming-<six>` for `pre-receive` with receive-pack's environment, among the repository's packs for
 `update`; a pack's trailer, Adler-32s and index its seal, the rest of every file read a window at a time); part 2,
 handing it to the hook driver on the owner shard, is built (A-665 part 2: opened over the repository's store, sealed in
-the shard's slices, run with `GIT_DIR=.` and the quarantine's variables); part 3 presents it at a path, a read-only
-attachment the mount edges serve.
+the shard's slices, run with `GIT_DIR=.` and the quarantine's variables); part 3, the push running its hooks at
+receive-pack's three points in git's words, is built (A-665 part 3) over a presenter that shows a view at a path, whose
+daemon implementation, a read-only attachment the mount edges serve, is owed: until it lands a push whose repository
+configures a git hook is refused `hook not run`.
 
 **Operations on the server.** Merging a review request is §4.17.1's merge: on accept the server makes the merge commit
 (parents: the target's head and the request's head; tree: the accepted version's; author and committer the person who
@@ -13580,8 +13603,8 @@ say), the server would walk commit rows from C815 to meet them and answer `ACK` 
 8. The smart HTTP server: HTTP/1.1, TLS, chunked and gzip bodies, authentication.
 9. The SSH server: RFC 4253, 4252 and 4254 with the algorithms named above.
 10. Hooks over a read-only bare-repository view (part 1, the view, built: A-665; part 2, handing it to the hook driver
-    on the owner shard, built: A-665 part 2; part 3, presenting it at a path, owed); push options; push to review with
-    report-status-v2.
+    on the owner shard, built: A-665 part 2; part 3, the push running its hooks, built: A-665 part 3; the view shown at
+    a path as a read-only attachment, owed); push options; push to review with report-status-v2.
 11. Protected branches: fast-forward by generation numbers, linear history, signed commits.
 12. Git LFS: the batch API, basic transfers and locks.
 13. Server-side merge and rebase of review requests; `log` and `blame` through the API. (The commits the server makes,
@@ -52612,6 +52635,75 @@ Applied in the same change to:
   keys for it); a URL canonicalized as `svn_uri_canonicalize` would (stock clients send canonical URLs); the drop's
   ending above; `svn checkout svn+ssh://` with a stock client against a daemon, the other platforms' runs and the
   red-checks (main's).
+
+### A-665 part 3 — git's push runs its hooks: receive-pack's three points in git's order and words, a step at a time over a presenter that shows each view at a path (2026-11-19, g293 for UI goal 93 (kiln 51cef9f7); §4.17.2 "Hooks, in git's terms" and "Pieces (git)" piece 10; §4.17.1 "Policy"; A-597, A-622, A-644, A-654, A-665 parts 1 and 2)
+Applied in the same change to:
+- §4.17.2 (a status block, "Hooks, in git's terms", piece 10's line) and GAPS (the §4.17 entry);
+- `crates/server`: `git_push` (the answer a step at a time, `Answering`, `Unpresented`, `HookVerdicts`; its module docs)
+  and `git_push/hooks.rs` (new, Unix); `git_hooks` (`PresentView`, `configured` crate-visible; its tests' presenter
+  shared); `vcs_http/git/receive.rs` (the edge's steps); `lib.rs` (the module's note); tests in `git_push/tests.rs`;
+- `crates/git`: `receive::{write_report_held, write_report_end, write_hook_words}`, `Session::decide`,
+  `protected::{PRE_RECEIVE_HOOK_DECLINED, pre_receive_declined}`, and two tests in `receive/tests/session.rs`.
+
+- **What.** A push whose repository configures a git hook runs it as git's receive-pack does (git 2.50.1,
+  `execute_commands`, `update()`, `run_receive_hook`, `run_update_hook`, `copy_to_sideband`, the end of
+  `cmd_receive_pack`). `pre-receive` runs once, its standard input every command no earlier check refused, in a view
+  showing the push in git's quarantine; a refusal answers each of those commands `pre-receive hook declined`, after the
+  hook's words, once, and no later hook runs. `update` runs for each such command the policy admits (A-622 part 2's
+  check point first, as git's `update()` refuses before its hook), its arguments the ref and its two ids, in a view
+  showing the push among the repository's packs; a refusal answers that command `hook declined`, after the hook's words
+  and git's `error: hook declined to update <ref>` (A-644's `protected::hook_declined`). Then the verdicts, the appends
+  and the report but its last flush; then `post-receive` over the applied commands, in a view of the refs the push
+  left, its words written after the report and before the last flush, as git writes them.
+- **A step at a time.** The answer was one step; it is now `ReceivePack::answer_step`, called until it answers:
+  `Answering::Sealing` while a view is sealed a turn at a time (the shard's step quantum, A-665 part 2), and
+  `Answering::Hook(HookCall)` for a hook the edge runs off the shard's step (`HookCall::run`), handing what it answered
+  back through `ReceivePack::hook_ran`, which withdraws the view's showing and closes it. Between steps the driver
+  holds the sealed quarantine and the view under way; a push dropped between them gives both back through the shard's
+  state (logged where the state is not lent to the drop).
+- **Words.** An accepted hook's words go to band 2 at once, as `copy_to_sideband` relays them while the hook runs; a
+  refusing one's are its refusal's. Both are kept up to the push's room and charged to it. A run that ends in a way git
+  does not have (past a bound, its client gone, its program not started, its view not opened, sealed or shown) refuses
+  what the hook would have judged, its words followed by slates' line naming why, so no command passes unjudged;
+  `post-receive` only observes, and one that cannot run or exits non-zero (git ignores its status) is counted,
+  `git_push.post_receive_unaccepted`.
+- **The presenter (the seam).** A view is shown at a path a hook process opens by the push's presenter,
+  `git_hooks::PresentView` (`can_present`, `present`, `withdraw`). Its daemon implementation is the read-only
+  attachment the mount edges serve a read at a time from `GitHookView::read` (§4.6; on Linux in the launcher's
+  namespace), which this part does not build: the mount edges serve volumes alone, through bridge-core's one
+  `VolumeBridge`, so a view shown at a path is a read-only volume whose host (the base plane's `HostFs`, as an S3 base
+  is one, A-555) reads the repository's content store, presented where a hook can open it (the root mount, D-1). Until
+  it lands the daemon's presenter shows none (`Unpresented`), so a push whose repository configures a git hook is
+  refused `hook not run` before any object is admitted, as before this part. The tests' presenter writes each view
+  into a scratch directory.
+- **Where it differs from git.** Every `update` hook runs before any append, each view showing the refs as they stood
+  before the push, where git moves each ref right after its hook (without `atomic`), so a later command's hook there
+  sees an earlier ref moved. The band-2 lines of commands refused otherwise (the policy's, the verdicts') follow every
+  hook's words, where git interleaves them command by command. A run is bounded by its client alone: the hooks'
+  learned times are A-622's owed table, and the HTTP edge's signal of a client gone is owed with the presenter.
+- **Tests.** `git_push/tests.rs`, each hook a shell script run through the scratch presenter:
+  `t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothing` (`pre-receive hook declined`, the
+  hook's line once on band 2, nothing recorded, one view shown and withdrawn);
+  `t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update` (the push lands; band 2 carries
+  `pre-receive`'s line, `update`'s, then after the report `post-receive`'s, whose view's `packed-refs` names `main` at
+  the pushed commit); `t_a665_an_update_hook_refuses_its_own_command_alone` (two creates, one refused `hook declined`
+  with git's line, the other landed). `receive/tests/session.rs`: the held report and its end are the answer
+  `Session::answer` writes for every captured push; a hook's words go to band 2 in git's 128-byte pieces only when the
+  push is multiplexed. The existing tests run the driver step by step under the daemon's presenter, a configured hook
+  still refused `hook not run`.
+- **Runs.** macOS arm64, Mac Studio, stock git 2.50.1 (Apple Git-155) and rustc 1.98.1, kiln r430 over main
+  550153532: red first, the hook path stubbed out of the driver (a push decided at once, its hooks never run), the three
+  new push tests failing, 3 of 3; green, `cargo test --locked -p slates-server --lib -- git_push:: git_hooks::
+  vcs_http::` 52 of 52 with no warning from a slates crate, `cargo test --locked -p slates-git --lib -- receive::
+  protected_fixtures` 49 of 49, `cargo fmt -p slates-git -p slates-server -- --check` clean. The first run (kiln r388)
+  found the first harness held the shard through the hooks' runs, and the daemon's watchdog ended the test process: the
+  tests now drive the push as a task on the shard, as the edge does. No integration target reaches the driver; the
+  landing merge's message names the run on the merged tree.
+- **Owed.** The read-only attachment that shows a view at a path (above); the edges' signal of a client gone, which
+  ends a hook's run; the hooks' learned times (A-622's table); seals kept as derived data; the SSH channel's call of the
+  driver (g294), which takes the same steps; the Linux and Windows runs and main's gates. A hook script written and run
+  at once can meet `ETXTBSY` on Linux while another test's child still holds its descriptor (the spawn's close-on-exec
+  window): the tests' scripts are written before the push starts.
 
 ### A-652 part 3 — A Subversion dump imported by the daemon: the import verb over A-655's step, each record the import makes committed and logged as it lands (2026-11-19, g268 for UI goal 93 (kiln 51cef9f7); §4.17.4 piece 6 and item 3.5; §4.15; A-628, A-655, A-678)
 Applied in the same change to: §4.17.4 (a status block, piece 6's line, A-655 part 2b's owed list), GAPS (the §4.17.4

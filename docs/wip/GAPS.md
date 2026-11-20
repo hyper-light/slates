@@ -778,6 +778,16 @@
 > driver (`git_push`, A-654 part 2, which answers every command `hook not run` while a git hook is configured until
 > they land); git's words for each outcome. Found, reported to main: a git hook inherits the daemon's `GIT_*` repository
 > variables, which `update` and `post-receive` would read in place of the view's objects.
+> **A-665 part 3 (2026-11-19, g293; git's push runs its hooks):** `slates-server` (`git_push`, its `hooks`) runs
+> `pre-receive`, `update` and `post-receive` as receive-pack 2.50.1 does, a step at a time (a view sealed in the
+> shard's slices, the hook run by the edge off the shard's step), in git's words (`pre-receive hook declined`; `hook
+> declined` with `error: hook declined to update <ref>`; accepted hooks' and `post-receive`'s words on band 2, the
+> report's last flush after `post-receive`), over a presenter seam (`git_hooks::PresentView`). Held by tests through a
+> presenter that writes each view into a scratch directory (macOS arm64, Mac Studio, kiln r430: red 3 of 3 with the
+> hooks stubbed out; green 52 of 52 and slates-git's 49 of 49). Owed: the daemon's
+> presenter, a read-only attachment the mount edges serve (a read-only volume whose base-plane host reads the
+> repository's content store, under the root mount): until it lands a push whose repository configures a git hook is
+> refused `hook not run`, as before; the edges' signal of a client gone; the hooks' learned times; the SSH channel's call.
 > **A-610 (2026-11-19, g293; git piece 12's codecs, Git LFS):** `slates-git` (`lfs`) reads and writes Git LFS as the
 > stock client speaks it, at git-lfs v3.8.1:
 > - the batch API's requests and verify callbacks;
@@ -1137,6 +1147,14 @@
 > goes first on every connection and Basic with the token as password is taken on the loopback edge (A-686, g258,
 > main's ruling); `slates repository create <name> --tool hg` (A-685, g305); `--vcs-ssh <addr>` (A-684, g299); and
 > over SSH the same lender, which the edge's `serve --stdio` (A-679, built) reads as the HTTP site does (A-680).
+> Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
+> token` and `credential key` are the issuer's verbs, which refuse without the variables the anchor names, so the
+> round trips start their anchor with `anchor_with_edges_and_issuer` (the surface read, the daemon settled and
+> bootstrapped, as A-685's test starts one) and run the verbs with `run_as_issuer`, skipping loudly on Linux, whose
+> surface is a descriptor only the anchor's children hold. macOS arm64 (Mac Studio, kiln r471 over main be892650b,
+> stock hg 7.2 through `uvx`): `-- stock_hg --ignored --test-threads=1` the HTTP round trip past `repository create`
+> and `credential token` to its wait (`hg push` refused, A-680 part 2b and A-686); the SSH round trip still stops at
+> `slates: unknown flag --vcs-ssh` (A-684), before its credential step.
 > **Built (A-679, 2026-11-19, g304): `serve --stdio` behind the daemon's SSH edge.** `vcs_ssh::hg` runs A-650 part 2's
 > `serve::stdio` over an SSH session, started by `ToolServices` (beside upload-pack, `ToolCommand`) over the store the
 > HTTP site's lender holds (`HgStores`; in the daemon `ServedViews`, A-680 part 2a); the site refuses a repository
@@ -1553,7 +1571,14 @@
 > `svn+ssh://` on A-684 (g299; the test assumes its port line in the HTTP edge's words), A-688 (g229) and A-685. Owed,
 > no piece yet: ra_svn's lock verbs (answered 210001), so the `svn://` and `svn+ssh://` legs lock nothing; item 14's
 > differential run over one dump, the working copies and both `svnadmin dump`s compared whole; the Linux run (main's;
-> the file is Unix-only, as `tests/cli.rs` is).
+> the file is Unix-only, as `tests/cli.rs` is). Each slates leg mints its credential with the anchor's issuer surface
+> since 2026-11-19 (g309, main's ruling): `start_anchor` reads the surface beside the serving line, and `credential
+> token` and `credential key`, the issuer's verbs, run with it (`slates_as_issuer`), each leg skipping loudly on Linux,
+> whose surface is a descriptor only the anchor's children hold. macOS arm64 (Mac Studio, kiln r471 over main
+> be892650b): `--ignored --test-threads=1`, the `svn://` leg and both `http://` legs past `repository create` and the
+> token to their waits (`svn checkout`: `E210005 No repository found`, A-689's lookup; `E160013 '/project' path not
+> found`, A-681's later parts); `svn+ssh://` still stops at `slates: unknown flag --vcs-ssh` (A-684), before its
+> credential step; the control 1 passed.
 > Part 2, first slice, 2026-11-19 (A-689): the svn:// listener. `slates anchor|daemon --vcs-svn ADDRESS` (loopback alone
 > without `--fleet`; one address reader with `--vcs-http`) starts it on the control shard, its port logged; on Unix the
 > anchor binds it once and hands it to every daemon (`ENV_VCS_SVN`), so a restart never drops its port. Each connection,
