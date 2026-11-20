@@ -115,6 +115,7 @@ impl<L: ShardLender + Clone> GitServices for ReceiveServices<L> {
       sent: 0,
       answering: false,
       keepalive_ns: self.keepalive_ns,
+      last_written_ns: slates_rt::futures::now_ns(),
     })
   }
 }
@@ -138,9 +139,24 @@ pub(crate) struct Receive<L> {
   answering: bool,
   /// How long the answer may write nothing before git's keepalive is written.
   keepalive_ns: u64,
+  /// When the exchange last wrote: its head, or an interim keepalive while its body was read.
+  last_written_ns: u64,
 }
 
 impl<L: ShardLender> Exchange for Receive<L> {
+  /// git's keepalive while the push's pack is still being read (A-722; the module doc): once its commands show
+  /// side-band-64k, whenever the keepalive interval has passed since the exchange last wrote.
+  fn interim(&mut self, out: &mut Vec<u8>) {
+    if self.advertise || !self.push.side_band() {
+      return;
+    }
+    let now = slates_rt::futures::now_ns();
+    if now.saturating_sub(self.last_written_ns) >= self.keepalive_ns {
+      out.extend_from_slice(KEEPALIVE);
+      self.last_written_ns = now;
+    }
+  }
+
   async fn body(&mut self, run: &[u8]) -> Result<(), Failed> {
     // An advertisement's request is a `GET`, whose body asks nothing: `http-backend` reads none for it.
     if self.advertise {
@@ -219,7 +235,15 @@ impl<L: ShardLender> Receive<L> {
         .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
         .map_err(failed)?;
       match step {
-        Answering::Answered(_) => return Ok(true),
+        Answering::Answered(_) => {
+          // Acknowledged only once its records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): the report goes
+          // out after, or the push is refused, never lost with its owner.
+          drop(turn);
+          if !crate::state_log::names_committed_within(repository).await {
+            return Err(Failed(Status::SERVICE_UNAVAILABLE));
+          }
+          return Ok(true);
+        }
         Answering::Turned => {
           let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
           if due || *sent < given.len() && silent_until.is_some() {

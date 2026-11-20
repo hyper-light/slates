@@ -1884,3 +1884,33 @@ fn pushed_v3_at(
     (repository, identity, home)
   })
 }
+
+/// A-724 piece 8c (the takeover test's fix): a push's records ride its repository's names log. Do: push stock git's
+/// `create`, then take the state logs' records the partition handed on. Expect: a names-log record carrying the push's
+/// record (`LoggedChange::Objects`), the same bytes the repository's register keeps.
+#[test]
+fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "shipped");
+    let _ = state.db.take_state_log_records();
+    pushed_from_the_fixtures(state, repository, &["create"]);
+    let records = state.db.take_state_log_records();
+    let carried: Vec<Vec<u8>> = records
+      .iter()
+      .filter(|record| {
+        record.repository == repository && record.log == slates_db::catalog::StateLog::Names
+      })
+      .flat_map(|record| record.changes.iter())
+      .filter_map(|change| match change {
+        slates_db::catalog::LoggedChange::Objects { record } => Some(record.clone()),
+        _ => None,
+      })
+      .collect();
+    let kept: Vec<Vec<u8>> = crate::vcs_store::tests::records(state, repository);
+    assert!(
+      !carried.is_empty(),
+      "no names record carried the push's record: {records:?}"
+    );
+    assert_eq!(carried, kept);
+  });
+}

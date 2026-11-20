@@ -24,8 +24,10 @@ use crate::state::ShardState;
 pub(crate) const PREFIX: &str = "content_range.";
 
 /// Format: the ranges, in the slice's order, then the shard's partition's regions of the anchor segment (the
-/// metadata object beside the content object): its log ring and its two snapshot slots.
-const RANGES: [&str; 7] = [
+/// metadata object beside the content object): its log ring and its two snapshot slots; then the daemon's own memory
+/// report's ranges (§4.14, A-232's gotcha): on the control shard the anchor segment whole and the anchor content object
+/// whole, and on every shard its clients' ring regions.
+const RANGES: [&str; 10] = [
   "write_log",
   "images",
   "delta_log",
@@ -33,6 +35,9 @@ const RANGES: [&str; 7] = [
   "arena",
   "segment_log",
   "segment_snapshots",
+  "segment",
+  "content",
+  "client_regions",
 ];
 
 /// Format: the arena's place in [`RANGES`].
@@ -43,6 +48,15 @@ const SEGMENT_LOG: usize = 5;
 
 /// Format: the segment snapshot slots' place in [`RANGES`].
 const SEGMENT_SNAPSHOTS: usize = 6;
+
+/// Format: the whole anchor segment's place in [`RANGES`] (the control shard's).
+const SEGMENT_WHOLE: usize = 7;
+
+/// Format: the whole anchor content object's place in [`RANGES`] (the control shard's).
+const CONTENT_WHOLE: usize = 8;
+
+/// Format: the shard's clients' ring regions' place in [`RANGES`].
+const CLIENT_REGIONS: usize = 9;
 
 /// A sweep of the shard's slice under way, and the last one that completed.
 #[derive(Debug, Default)]
@@ -66,6 +80,8 @@ pub(crate) struct Sweep {
   longest_ns: u64,
   /// The longest single step, nanoseconds: what an advance may pass its budget by at most.
   longest_step_ns: u64,
+  /// Whether a status request's sweep task is advancing the sweep in the background ([`arm`]): one at a time.
+  running: bool,
 }
 
 /// One mapped range the sweep walks: a range of the content object, or a region of the arena.
@@ -84,13 +100,27 @@ enum Target {
     kind: slates_anchor::layout::RegionKind,
     len: usize,
   },
+  /// The anchor segment whole, `len` bytes.
+  SegmentWhole { len: usize },
+  /// The anchor content object whole, `len` bytes.
+  ContentWhole { len: usize },
+  /// The ring region of client `client`, `len` bytes. A client gone between two advances is passed over.
+  Client {
+    client: slates_mem::Handle<crate::state::ClientSlot>,
+    len: usize,
+  },
 }
 
 impl Target {
   /// Its length.
   fn len(&self) -> usize {
     match self {
-      Target::Object { len, .. } | Target::Region { len, .. } | Target::Segment { len, .. } => *len,
+      Target::Object { len, .. }
+      | Target::Region { len, .. }
+      | Target::Segment { len, .. }
+      | Target::SegmentWhole { len }
+      | Target::ContentWhole { len }
+      | Target::Client { len, .. } => *len,
     }
   }
 
@@ -99,6 +129,9 @@ impl Target {
     match self {
       Target::Object { range, .. } | Target::Segment { range, .. } => *range,
       Target::Region { .. } => ARENA,
+      Target::SegmentWhole { .. } => SEGMENT_WHOLE,
+      Target::ContentWhole { .. } => CONTENT_WHOLE,
+      Target::Client { .. } => CLIENT_REGIONS,
     }
   }
 }
@@ -153,6 +186,22 @@ fn targets(state: &ShardState) -> Vec<Target> {
       targets.push(Target::Segment { range, kind, len });
     }
   }
+  // The daemon's own memory report (§4.14): the two anchor objects whole once, on the control shard, and each shard's
+  // clients' ring regions on their shard.
+  if crate::verbs::is_control_shard(state) {
+    targets.push(Target::SegmentWhole {
+      len: state.segment.len(),
+    });
+    if let Some(content) = state.content.as_ref() {
+      targets.push(Target::ContentWhole { len: content.len() });
+    }
+  }
+  for (client, slot) in state.clients.iter() {
+    targets.push(Target::Client {
+      client,
+      len: slot.end.region().object().len(),
+    });
+  }
   targets
 }
 
@@ -176,6 +225,55 @@ fn residency(
       .residency_of(offset, len)
       .ok(),
     Target::Segment { kind, .. } => state.segment.region_residency_of(*kind, offset, len).ok(),
+    Target::SegmentWhole { .. } => state.segment.residency_of(offset, len).ok(),
+    Target::ContentWhole { .. } => state.content.as_ref()?.residency(offset, len).ok(),
+    Target::Client { client, .. } => state
+      .clients
+      .get(*client)
+      .ok()?
+      .end
+      .region()
+      .object()
+      .residency(offset, len, state.config.page)
+      .ok(),
+  }
+}
+
+/// Arms one sweep to completion in the background (§4.14, the daemon's memory report): a request's own advance walks
+/// half a step quantum, and the anchor segment and content object whole are tens of GiB, millions of pages, which a
+/// status request alone would take hundreds of requests to sweep (84 GiB unswept after 400 requests, a debug daemon on the
+/// Mac Studio, 2026-11-20). So a status request also spawns, unless one runs, a task that advances the sweep a step a
+/// turn of this shard ([`advance`]'s bound), yielding between, until one sweep completes; the next request reads it. An
+/// idle shard is woken for nothing else: the task is armed by a request and ends with its sweep. With no task to spawn
+/// the request's own advance still moves the sweep.
+fn arm(state: &mut ShardState) {
+  if state.content_sweep.running {
+    return;
+  }
+  state.content_sweep.running = true;
+  let spawned =
+    slates_rt::futures::spawn(sweep_to_completion()).and_then(slates_rt::futures::detach);
+  if spawned.is_err() {
+    state.content_sweep.running = false;
+  }
+}
+
+/// The task [`arm`] spawns: one [`advance`] a turn until a sweep completes, then the task ends.
+async fn sweep_to_completion() {
+  loop {
+    let completed = crate::state::with_state(|state| {
+      let before = state.content_sweep.sweeps;
+      advance(state);
+      let completed = state.content_sweep.sweeps != before;
+      if completed {
+        state.content_sweep.running = false;
+      }
+      completed
+    });
+    if completed != Some(false) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
   }
 }
 
@@ -273,6 +371,7 @@ fn advance(state: &mut ShardState) {
 /// allocated bytes now, and the sweeps completed.
 pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
   advance(state);
+  arm(state);
   let mut rows: Vec<(String, u64)> = Vec::new();
   if let Some(done) = &state.content_sweep.done {
     for (name, found) in RANGES.iter().zip(done) {
@@ -327,6 +426,61 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
     .into_iter()
     .map(|(kind, count)| RefusalCount { kind, count })
     .collect()
+}
+
+/// This shard's part of the daemon's memory by kind (§4.14; A-232's gotcha): on the control shard the anchor segment and
+/// content object whole, on every shard its arena's extents and its clients' ring regions. Each kind's reserved bytes
+/// and mappings are its live lengths now; its resident and written bytes are the last completed sweep's ([`advance`],
+/// which each status request moves), `measured` once one has completed. Called after [`report`], which advances it.
+pub(crate) fn memory(state: &ShardState) -> Vec<slates_ipc::protocol::MemoryKindReport> {
+  let done = state.content_sweep.done.as_ref();
+  let kind = |name: &str, range: usize, (mappings, reserved): (u64, u64)| {
+    let found = done.and_then(|done| done.get(range)).copied();
+    slates_ipc::protocol::MemoryKindReport {
+      kind: name.to_owned(),
+      mappings,
+      reserved_bytes: reserved,
+      resident_bytes: found.map_or(0, |found| found.resident.min(reserved)),
+      modified_bytes: found.and_then(|found| found.modified),
+      measured: found.is_some(),
+    }
+  };
+  let bytes = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+  let mut kinds = Vec::new();
+  if crate::verbs::is_control_shard(state) {
+    kinds.push(kind(
+      "segment",
+      SEGMENT_WHOLE,
+      (1, bytes(state.segment.len())),
+    ));
+    if let Some(content) = state.content.as_ref() {
+      kinds.push(kind("content", CONTENT_WHOLE, (1, bytes(content.len()))));
+    }
+  }
+  let arena = state.store.content.arena();
+  let (extents, extent_bytes) = arena
+    .region_ids()
+    .iter()
+    .filter_map(|id| arena.region(*id))
+    .fold((0u64, 0u64), |(count, sum), region| {
+      (
+        count.saturating_add(1),
+        sum.saturating_add(bytes(region.len())),
+      )
+    });
+  kinds.push(kind("arenas", ARENA, (extents, extent_bytes)));
+  let (clients, region_bytes) =
+    state
+      .clients
+      .iter()
+      .fold((0u64, 0u64), |(count, sum), (_, slot)| {
+        (
+          count.saturating_add(1),
+          sum.saturating_add(bytes(slot.end.region().object().len())),
+        )
+      });
+  kinds.push(kind("regions", CLIENT_REGIONS, (clients, region_bytes)));
+  kinds
 }
 
 #[cfg(test)]

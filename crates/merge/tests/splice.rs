@@ -239,7 +239,7 @@ proptest! {
       .into_iter()
       .map(|op| slates_merge::ops_doc::Op { path, ..op })
       .collect();
-    let edit = Increment { id: [2; 32], base: 1, doc, post_state: post.clone(), evidence: Vec::new() };
+    let edit = Increment { id: [2; 32], base: 1, doc, post_state: post.clone(), evidence: Vec::new() , named: Default::default() };
     let outcome = green.submit(&edit);
     if edit.doc.ops.is_empty() {
       prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{:?}", outcome);

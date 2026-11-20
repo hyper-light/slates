@@ -134,6 +134,7 @@ fn unhexlify(hex: &[u8]) -> Option<Vec<u8>> {
   pairs
     .iter()
     .map(|[high, low]| {
+      // Format: hexadecimal, radix 16.
       let high = char::from(*high).to_digit(16)?;
       let low = char::from(*low).to_digit(16)?;
       u8::try_from(high.checked_mul(16)?.checked_add(low)?).ok()

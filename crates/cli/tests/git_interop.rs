@@ -622,6 +622,7 @@ fn minted_token(instance: &str, issuer: &[(String, String)]) -> String {
 /// One HTTP leg: the anchor its daemon serves from, the edge's port, and a token for the repository's owner.
 struct HttpLeg {
   _anchor: Anchor,
+  instance: String,
   port: u16,
   token: String,
 }
@@ -638,6 +639,7 @@ fn http_leg(session: &str) -> Option<HttpLeg> {
   let token = minted_token(&instance, &issuer);
   Some(HttpLeg {
     _anchor: started.anchor,
+    instance,
     port,
     token,
   })
@@ -697,6 +699,84 @@ fn stock_git_clones_pushes_and_fetches_over_the_vcs_http_edge_with_a_bearer_toke
   let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
   let git = Git::new(&program, &scratch, "bearer", vec!["-c".to_owned(), header]);
   round_trip(&git, &format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port));
+}
+
+/// Format: the kinds of mapped memory `slates status --json` reports under `memory` (§4.14, A-232's gotcha): the anchor
+/// segment, the anchor content object (the shards' arenas among its bytes), the shards' arenas, the clients' ring
+/// regions, and the heap.
+const MEMORY_KINDS: [&str; 5] = ["segment", "content", "arenas", "regions", "heap"];
+
+/// §4.14 and A-232's gotcha (the bug record of 2026-11-20, the anchor's kills of w-hg's daemon): the daemon reports its
+/// own memory by kind, read in process with nothing suspended, so no inspector need suspend it (`vmmap`, `heap`), which
+/// past the anchor's window gets it killed by design. Do: start an anchor with its HTTP edge on loopback; make
+/// repository [`REPOSITORY`] and a token; push stock git's first commit there while a thread asks `slates status --json`
+/// again and again until the push ends. Expect every answer to report `memory` with each of [`MEMORY_KINDS`] once, each
+/// kind's resident bytes within its reserved bytes, the segment's, the content object's and the heap's reserved bytes
+/// above zero; the push to succeed; and the anchor never to have restarted the daemon (the same pid and `restarts` 0
+/// at the end). Skips loudly as the round trips do.
+#[test]
+fn a_status_during_a_push_reports_the_daemons_memory_by_kind_while_the_anchor_keeps_it() {
+  let Some(program) = stock_git() else {
+    eprintln!(
+      "skipping the memory report during a push: no stock git here (set {STOCK_GIT} to the command that runs it)"
+    );
+    return;
+  };
+  let Some(leg) = http_leg("memory") else {
+    return;
+  };
+  let status = |instance: &str| -> serde_json::Value {
+    let (code, out, err) = slates(instance, &[], &["status", "--json"]);
+    assert_eq!(code, 0, "status --json: {out}{err}");
+    serde_json::from_str(&out).unwrap()
+  };
+  let before = status(&leg.instance);
+  let scratch = Scratch::new("git-http-memory");
+  let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
+  let git = Git::new(&program, &scratch, "memory", vec!["-c".to_owned(), header]);
+  let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
+  let pushing = std::sync::atomic::AtomicBool::new(true);
+  let reports = std::thread::scope(|scope| {
+    let asking = scope.spawn(|| {
+      let mut reports = vec![status(&leg.instance)];
+      while pushing.load(std::sync::atomic::Ordering::Acquire) {
+        reports.push(status(&leg.instance));
+      }
+      reports
+    });
+    first_push(&git, &url);
+    pushing.store(false, std::sync::atomic::Ordering::Release);
+    asking.join().unwrap()
+  });
+  let after = status(&leg.instance);
+  for report in reports.iter().chain([&after]) {
+    let memory = report["memory"]
+      .as_array()
+      .unwrap_or_else(|| panic!("status reports the daemon's memory: {report}"));
+    for kind in MEMORY_KINDS {
+      let found: Vec<_> = memory.iter().filter(|row| row["kind"] == kind).collect();
+      assert_eq!(found.len(), 1, "one {kind} row: {memory:?}");
+      let (reserved, resident) = (
+        found[0]["reserved_bytes"].as_u64().unwrap(),
+        found[0]["resident_bytes"].as_u64().unwrap(),
+      );
+      assert!(
+        resident <= reserved,
+        "{kind}: resident within reserved: {memory:?}"
+      );
+      if ["segment", "content", "heap"].contains(&kind) {
+        assert!(reserved > 0, "{kind} reserves bytes: {memory:?}");
+      }
+    }
+  }
+  assert_eq!(
+    after["pid"], before["pid"],
+    "the anchor kept the daemon it started"
+  );
+  assert_eq!(
+    after["restarts"], 0,
+    "the anchor restarted nothing: {after}"
+  );
 }
 
 /// §4.17.2 "Transports" item 1 and A-686 (Basic with the token as its password on the loopback edge, Basic's challenge

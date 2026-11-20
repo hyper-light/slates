@@ -430,6 +430,14 @@ pub enum RetryCause {
   /// A move's records were not placed within the fleet's failover SLO, so it was not reported and the volume thawed
   /// (A-291): ask for the move again.
   MoveUnplaced,
+  /// A credential's enrollment or revocation reached `held` of the `needed` members of the region (A-764): what was done
+  /// stands where it reached; ask again to reach the rest.
+  CredentialUnreplicated {
+    /// The members that hold it as asked.
+    held: u64,
+    /// The members it must reach.
+    needed: u64,
+  },
 }
 
 /// Why no daemon answers.
@@ -964,6 +972,10 @@ impl Error {
       Refusal::ArchiveRefused { fault } => Error::Invalid(Invalid::Archive(fault)),
       Refusal::ImportRefused { fault } => Error::Invalid(Invalid::Import(fault)),
       Refusal::CopyRefused { path, case } => Error::Invalid(Invalid::Copy { path, case }),
+      Refusal::CredentialUnreplicated { held, needed } => retry(
+        RetryCause::CredentialUnreplicated { held, needed },
+        pause_ns,
+      ),
       Refusal::OwnMount { path, used_as } => Error::Invalid(Invalid::OwnMount { path, used_as }),
       Refusal::Destroying => Error::Unusable(Unusable::Destroying),
       Refusal::Archived => Error::Unusable(Unusable::Archived),

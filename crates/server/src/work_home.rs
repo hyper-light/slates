@@ -1540,6 +1540,9 @@ fn computed_request(
         path, case,
       ))));
     }
+    Err(ComputeRefused::ContentUnread { .. }) => {
+      return Err(Box::new(crate::verbs::refused(Refusal::ContentUnavailable)));
+    }
   };
   state.count(COMPUTED_ON_HOLDER, 1);
   let form = computed.encode(&inc);

@@ -45,9 +45,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 /// Shape: shards for the test daemon, as `tests/winfsp.rs`.
 const SHARDS: &str = "2";
-/// Shape: how long the drive gets to answer after the mount's reply: ten liveness budgets, as `tests/winfsp.rs`.
+/// Shape: how long a call on the drive gets before it counts as wedging the drive ([`within_wait`]): ten liveness
+/// budgets, as `tests/winfsp.rs`. The bound that test proves, not a wait on the daemon: the drive's answer after its
+/// mount and a change reaching another name are waited for while the daemon gains CPU (`process_wait::Judged`) since
+/// 2026-11-20.
 const WAIT_FOR: Duration = Duration::from_secs(10);
 /// Shape: the pause between polls.
 const POLL: Duration = Duration::from_millis(20);
@@ -249,12 +255,10 @@ impl Drive {
     let letter = free_drive_letter();
     let (code, _, err) = run(&instance, &["mount", &id, &letter]);
     assert_eq!(code, 0, "mount: {err}");
-    let started = Instant::now();
+    // While the anchor's process gains CPU (until 2026-11-20 within `WAIT_FOR`).
+    let mut judged = process_wait::Judged::of(anchor.child.id());
     while std::fs::metadata(format!("{letter}\\")).is_err() {
-      assert!(
-        started.elapsed() < WAIT_FOR,
-        "{letter} never answered within {WAIT_FOR:?}"
-      );
+      judged.look(&format!("{letter} answered"));
       pause();
     }
     Drive {
@@ -379,16 +383,17 @@ fn links_and_index(path: &str) -> (u32, u64) {
   )
 }
 
-/// Polls `seen` until it holds, within [`WAIT_FOR`]; answers how long that took. A change through one name of a file
+/// Polls `seen` until it holds, while `instance`'s daemon gains CPU (`process_wait::Judged` on the pid its `status` names;
+/// until 2026-11-20 within [`WAIT_FOR`]); answers how long that took. A change through one name of a file
 /// reaches the file nodes of its other names at the mount's next round, not before the change's own reply (A-360): each
 /// name has its own node in WinFsp's driver, and the mount tells them by notification.
-fn eventually(what: &str, mut seen: impl FnMut() -> bool) -> Duration {
+fn eventually(instance: &str, what: &str, mut seen: impl FnMut() -> bool) -> Duration {
   let started = Instant::now();
+  let (code, out, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "status: {err}");
+  let mut judged = process_wait::Judged::of(value_of(&out, "pid").parse().unwrap());
   while !seen() {
-    assert!(
-      started.elapsed() < WAIT_FOR,
-      "{what}: not seen within {WAIT_FOR:?}"
-    );
+    judged.look(what);
     pause();
   }
   started.elapsed()
@@ -438,18 +443,22 @@ fn a_hard_link_made_through_the_drive_names_the_same_file() {
     drive.read_through_slates("first.txt").as_deref(),
     Some("written through the second name")
   );
-  let told = eventually("the second name's write through the first name", || {
-    std::fs::read(drive.path("first.txt")).unwrap() == b"written through the second name"
-  });
+  let told = eventually(
+    &drive.instance,
+    "the second name's write through the first name",
+    || std::fs::read(drive.path("first.txt")).unwrap() == b"written through the second name",
+  );
   eprintln!("the first name read the second name's write {told:?} after its close");
   std::fs::remove_file(drive.path("first.txt")).unwrap();
   assert_eq!(
     std::fs::read(drive.path("second.txt")).unwrap(),
     b"written through the second name"
   );
-  let told = eventually("one link left after the first name's delete", || {
-    links_and_index(&drive.path("second.txt")) == (1, second_index)
-  });
+  let told = eventually(
+    &drive.instance,
+    "one link left after the first name's delete",
+    || links_and_index(&drive.path("second.txt")) == (1, second_index),
+  );
   eprintln!("the second name counted one link {told:?} after the first name's delete");
   std::fs::write(drive.path("third.txt"), b"another file").unwrap();
   assert_eq!(

@@ -1258,6 +1258,35 @@ impl ContentStore {
     }
   }
 
+  /// The bytes of the object `identity` names (its whole length `len`) from `offset` to the end of the store's window
+  /// holding `offset`: a read's next run (A-727; w-reaper's referenced files, A-645 P3; the svn reads), lent where the
+  /// storage lends its window (a chunk in the clear: nothing copied, nothing allocated). None at or past `len`, for a
+  /// length the store can tell is not the object's, or where the store does not hold the path down whole.
+  pub fn run_at(&self, identity: &ContentId, len: u64, offset: u64) -> Option<Cow<'_, [u8]>> {
+    if offset >= len {
+      return None;
+    }
+    // `len` is the object's whole length, as its holder records it: the tree a window is found down is cut from it.
+    // What the store can check of it, it does: an object of one window is that window, its length the window's; a
+    // longer one is a tree, its length past one window. A wrong length would find another tree's windows: refused.
+    let window = u64::try_from(self.window.get()).ok()?;
+    let fits = match self.form(identity)? {
+      Form::Window => self.len_of(identity) == Some(len),
+      Form::List => len > window,
+      Form::Table | Form::Derived => false,
+    };
+    if !fits {
+      return None;
+    }
+    let index = offset.checked_div(window)?;
+    let start = index.saturating_mul(window);
+    let from = usize::try_from(offset.saturating_sub(start)).ok()?;
+    match self.window_at(identity, len, index)? {
+      Cow::Borrowed(bytes) => bytes.get(from..).map(Cow::Borrowed),
+      Cow::Owned(bytes) => bytes.get(from..).map(|rest| Cow::Owned(rest.to_vec())),
+    }
+  }
+
   /// The window `index` of an object `len` bytes long whose root is `root` ([`ContentStore::put_object`]), read down
   /// the one list a level that names it (A-639): the object was cut into windows of this store's window and lists of
   /// its fanout, so the list naming window `index` at each level is that level's digit of `index` in the fanout's base.
