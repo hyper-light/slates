@@ -14639,7 +14639,12 @@ markers and topics, which git has no counterpart for, are decided here.
    closed heads.
 2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. The owner's branch
    verbs name it as Mercurial does (`topic`), spelled `bookmark:topic:` in the namespace; a line's or bookmark's
-   namespace spelling passes as it is (A-575, `hg_push::owner_name`). A bookmark moves only
+   namespace spelling passes as it is (A-575, `hg_push::owner_name`). The name a branch is made *from* is resolved as
+   Mercurial resolves a name (main's ruling of 2026-11-20; 7.2's `revsymbol`): a revision number or node, then a
+   bookmark, a global tag (the `.hgtags` of the view's heads, folded as 7.2 folds them), then a branch's tip-most open
+   head, so `--from default` is the line heading `default`'s tip; the branch is made from the green that heads that
+   changeset (the bookmark named, else the line, else another bookmark). A changeset no green heads (a tag inside a
+   line's history) is refused `Unsupported` until a branch can be made at a changeset below a head. A bookmark moves only
    when a push names it (the `bookmarks` part or a `bookmarks` pushkey), and every move is a compare and swap on the old
    value the client sent (a pushkey "should succeed iff value was old" [C: `pushkey.py`]; `check:bookmarks` [B:
    `internals.bundle2`]), so the head operation decides it as it decides a git ref. A deletion retires the green.

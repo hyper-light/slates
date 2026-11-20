@@ -183,6 +183,22 @@ impl Repository for Empty {
   fn draft_roots(&self) -> impl Iterator<Item = Node> {
     std::iter::empty()
   }
+
+  fn tags_file(
+    &self,
+    _rev: slates_hg::serve::Rev,
+    _admission: &mut slates_hg::Admission,
+  ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
+    Ok(None)
+  }
+
+  fn tags_text(
+    &self,
+    _node: &Node,
+    _admission: &mut slates_hg::Admission,
+  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
+    Err(slates_hg::serve::Refusal::Store { what: "tags" })
+  }
 }
 
 impl Store for Empty {

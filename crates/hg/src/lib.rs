@@ -99,6 +99,7 @@ pub mod revlog;
 pub mod serve;
 pub mod ssh;
 pub mod store;
+pub mod tags;
 pub mod wire;
 
 pub use admission::{Admission, PastAdmission};

@@ -29,6 +29,8 @@ pub(super) struct History {
   pub(super) bookmarks: Vec<(Vec<u8>, Node)>,
   pub(super) publishing: bool,
   pub(super) by_node: HashMap<Node, Rev>,
+  /// Each revision's `.hgtags` file revision, where its manifest names one: its node and bytes.
+  pub(super) hgtags: BTreeMap<Rev, (Node, Vec<u8>)>,
 }
 
 pub(super) fn at(rev: Rev) -> usize {
@@ -126,6 +128,18 @@ impl Repository for History {
             .all(|parent| self.phase(*parent) == Phase::Public)
       })
       .map(|changeset| changeset.node)
+  }
+  fn tags_file(&self, rev: Rev, _admission: &mut Admission) -> Result<Option<Node>, Refusal> {
+    Ok(self.hgtags.get(&rev).map(|(node, _)| *node))
+  }
+  fn tags_text(&self, node: &Node, admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
+    let (_, text) = self
+      .hgtags
+      .values()
+      .find(|(held, _)| held == node)
+      .ok_or(Refusal::Store { what: "tags" })?;
+    admission.charge(u64::try_from(text.len()).unwrap())?;
+    Ok(text.clone())
   }
 }
 

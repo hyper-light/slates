@@ -1747,6 +1747,13 @@
 > now read a plain name as the bookmark of that name and pass a line's or bookmark's namespace spelling through
 > (`hg_push::owner_name`); `hg_view`'s test creates `topic` from `one`, retires and binds it, listed as a bookmark at
 > `one`'s node, gone, and back. Owed (main's lane): the same with stock hg through the CLI (`hg pull`, `hg bookmarks`).
+> `--from` follows Mercurial's own lookup (w-hg, 2026-11-20; main's ruling): `--from default` was refused `NotFound`,
+> read as the bookmark `default`. It now resolves as 7.2's `revsymbol` does (`slates_hg::serve::lookup::resolve_name`:
+> a bookmark, then a global tag, then the branch's tip-most open head) and branches from the green heading that
+> changeset; the served `lookup` resolves tags too (`slates_hg::tags`, held to 7.2's own `_readtags`/`_updatetags` on
+> 300 generated `.hgtags` sequences and to `hg log -r` on a recorded repository). Owed: a branch made at a changeset no
+> line or bookmark heads (a tag inside a line's history), refused `Unsupported` until a green can be branched at the
+> version whose head it was.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
