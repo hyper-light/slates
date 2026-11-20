@@ -315,7 +315,8 @@ fn texts_of(
 /// A-680 part 1: do pack the changesets a clone of `states` asks for over its served view, its store's window longer
 /// than every text. Expect exactly the three served changesets, their three manifests and the file revisions they name
 /// (`a`, `b`, and `c` as amended: neither the hidden changeset's `c` nor the secret one's `d`), every text hashing to
-/// its node; the two markers lent when the view was made and each text since lent once, all in place.
+/// its node; the two markers lent when the view was made and each text since lent once: in place, but for the one
+/// manifest the index keeps as its delta against the one before (A-729), rebuilt from its chain and so copied.
 #[test]
 fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
   let (imported, store) = imported("states");
@@ -360,8 +361,8 @@ fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
   assert_eq!(
     view.lends(),
     Lends {
-      in_place: 11,
-      copied: 0
+      in_place: 10,
+      copied: 1
     }
   );
 }

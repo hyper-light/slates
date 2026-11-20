@@ -128,6 +128,13 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
+> kept in the index as its delta against the manifest before it (`delta::encode_lines`, a line walk keyed by path) while
+> its chain's delta bytes stay within its text's length, else whole (derived: a text rebuilds from at most its own
+> length of deltas, 7.2's bound); `HgIndex::revision_text` rebuilds it for every reader (the served view, the push's
+> held texts, the record writer, a re-base). Mercurial's own manifests, 5,501,443,727 bytes whole, are 9.4 MB as revlog
+> deltas. Owed: part 2, records naming identities with the changegroup's deltas (no texts), replay re-taking them;
+> file texts by the green's identity; RSS measured before and after by use.
 > **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
 > FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
 > resumable, its place a byte offset; `vcs_store::replay_hg_sliced`), and an import's record is written a revision a turn
