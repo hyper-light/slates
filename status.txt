@@ -1,0 +1,9 @@
+started 2026-11-20T09:43:17Z at 04ac8994b245a1e452ba91751db40d2a17538859; 7.0.0-1016-aws
+a_file_an_ended_mount_held_is_given_back exit 0
+a_file_kept_for_a_mount_that_survived_a_takeover_is_given_back_when_the_mount_ends exit 0
+the_handles_a_dead_daemon_issued_give_back_their_references_at_release exit 0
+the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back exit 0
+a_fuse_mount_survives_its_daemons_kill_with_its_open_files_usable exit 0
+a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon exit 0
+server fuse_mount exit 0 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+ended 2026-11-20T09:45:57Z
