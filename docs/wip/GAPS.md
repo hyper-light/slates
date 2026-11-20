@@ -46,6 +46,9 @@
 > A-682's lender fetches it; a commit git would refuse or the budget refuses not made, counted, the version standing.
 > A branch's first map derived from its source's (2026-11-20, w-shared): BUILT where the source's head is the version the
 > branch was made at (its version 0); built whole otherwise (`paths::branch_before`; macOS arm64, this Mac, local).
+> The holders' maps (2026-11-20, w-shared): BUILT through A-636 part 2c-2's rebuild: a successor's rebuilt repository
+> makes its store and each member green's map and trees from its adopted head (`vcs_store::make_whole`), as a rebuild
+> does (macOS arm64, this Mac, local).
 > OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); the holders'
@@ -54,8 +57,7 @@
 > creation (upload-pack lists it only once its green holds a commit, its first made one); a made commit's record
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' whole builds and a
 > whole map's release sliced a unit at a time (each is one step, as A-662's replay of a record is); a branch's first
-> map derived from its source's where the source's head is the version it was made at; the holders' maps (A-636's
-> fleet half); a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
 > commit is not made, counted); a `.gitmodules` blob's own checks; blob ids read by content from the git
