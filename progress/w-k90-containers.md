@@ -129,3 +129,5 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    queued for jupiter). Blocked on a PERSON only: W9 Windows measurement (WinFsp, console-session runner, Docker Desktop).
 
 ## 2026-11-20: Windows `cargo check -p kiln --bins --tests` at 2b5a3d559 PASSED on jupiter (r33). r24 failed on adacachy /tmp full (my TMPDIR mistake) -> r36 queued with TMPDIR under ~/.cache.
+
+## RULE (Ada 2026-11-20, common.md): fetch + merge origin/main at each piece start, before each reported test run, every 30 min; name the base (origin/main short hash) with every result; delete landed worktrees by exact path.
