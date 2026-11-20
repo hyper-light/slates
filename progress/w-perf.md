@@ -28,3 +28,12 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   repository` 3/3, fmt clean. Studio release binary now at 543606da3 (~/.cache/w-perf-local-target).
 - NEXT: svn slates side (A-695 lookup + CRAM sign-in landed): svn_scale.sh SERVERS/SLATES, fill by
   `slates repository import project git-5000.dump` (svn), then svn:// checkout/log/commit/update vs svnserve.
+- ~06:20Z LANDED main a11712269: svn_scale.sh slates side + KEEP_LOGS + svn rows in BENCHMARKS.md (1,000 revisions,
+  main bc2803d66: import 1.874 vs svnadmin load 62.817; log 0.062 vs 0.140; checkout/commit/update even) and the
+  blockers list. Reruns sent: svn 5000 at 9ea6e1311 still capped at 1,685 (w-svn = slates-work-3d); hg A-711 at
+  bc2803d66: 413 gone, shard 10 spins 1,152 ms, daemon killed (w-hg = slates-work-09). Studio binary = bc2803d66.
+- WAITING on: w-git push-spin fix, w-hg unbundle slicing + import PastRoom, w-svn green_chains cap. On each landing:
+  rebuild release on the Studio (~/.cache/w-perf/src-main, target ~/.cache/w-perf-local-target), rerun that tool's
+  harness SERVERS="stock slates" RUNS=3 KEEP_LOGS=..., record rows.
+- Meanwhile piece 3 (profile slowest working paths -> ranked plan to main): svn checkout/commit (client-bound?),
+  import memory (2.5 GB for 1,000 revisions).
