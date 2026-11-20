@@ -910,6 +910,12 @@
 > Owed: A-581's durable LFS objects on the owner shard, and the batch API and the transfers served over them; locks by
 > others than the owner (A-635's policy check); principals' names for people (§4.13); the stock git-lfs client end to
 > end against the daemon (main's).
+> **A-629 part 3 (2026-11-19, g230; durable Git LFS objects):** each upload is one entry of the repository's logs
+> holding the object's record (`vcs_store::lfs_record`), kept in the store's LFS index (`GitStore::lfs`) between the
+> register's guard and the entry's apply (`push_lfs`, `admit_lfs`), replayed by a recovery (`replay_lfs`); the daemon's
+> edge serves the batch API and the transfers over it (`ShardObjects`), an upload `200` once durable, bytes not the
+> oid's `422` with nothing recorded. Closes part 2c's "A-581's durable LFS objects". Owed: uploads by others than the
+> owner (A-635), a streaming put, the stock git-lfs client end to end (main's queue).
 > **A-624 part 1 (2026-11-19, g230; v2 reads ids as git's server does):** `slates-git` (`v2`) reads an object id's
 > digits in either case, as git's server does (`get_oid_hex`) and gitprotocol-pack asks ("both MUST treat obj-id as
 > case-insensitive"), and writes them back in lower case; lines keep recording their LF, so every golden stream still
