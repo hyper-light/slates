@@ -52670,7 +52670,7 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name, its symbolic links `svn:special`
-  files; its copies owed until a work makes one); Mercurial's manifests by the
+  files, its copies copy-from rows); Mercurial's manifests by the
   same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
@@ -55953,3 +55953,18 @@ at each append and each snapshot); `crates/server` (`content_ranges`: the regist
   `a_copy_refusal_is_typed_invalid_by_its_case`; by use against a real daemon, a copy of nothing refused with its case:
   MCP's test, the Python SDK 4 of 4, the Node SDK 9 of 9, the CLI's JSON flow (`SLATES_TEST_CLI=1`); `slates-ipc
   --test wire_order` published; fmt clean.
+
+### A-664 Subversion objects, copies — A copy a work submits is the made revision's copy-from row (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Change.** `verbs::judge_submission` hands the version's copies (`vcs_store::svn_made::copies_of`, its increment's
+  `Copy` operations: destination, source, the source's version, which version N = revision N makes the copy-from
+  revision, and its replace) to `svn_made::make`. A copy's destination is a row with its copy source (`copy_row`): `add`,
+  or `replace` where something stood there or it replaces, the source's kind at its revision, its text and property list
+  set where the head differs from the source's; a path beneath it is judged against the source's node at the copy-from
+  revision (`copy_beneath`); a directory above a node added beneath it stood where it stood in the source. A copy the
+  version holds and the submit did not hand over is still refused, counted.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `repository::svn_commit::tests::
+  t_a664_svn_a_submitted_copy_is_a_copy_from_row` (red before: the copy refused, revision 2 unmade; green: its one row
+  adds `/branches/b` copied from `/trunk` at revision 1, the records hold `/branches/b/a.txt`, a client's revision lands
+  as 3); `cargo test --locked -p slates-server --lib -- repository::svn_commit:: vcs_svn vcs_store:: identities::
+  --test-threads=4` 116 of 116; fmt clean.
+- **Owed.** A stock `svn log -v` and `svn checkout` over the made copy by use (main's).

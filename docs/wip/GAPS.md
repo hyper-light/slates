@@ -70,8 +70,8 @@
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
 > principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20; symbolic links as `svn:special`
-> files, `link ` and the target, BUILT 2026-11-20), its copies as rows with their sources owed until a work can make a
-> copy (A-626 part 4); Mercurial's changesets of a submitted
+> files, `link ` and the target, BUILT 2026-11-20; its copies as copy-from rows, BUILT 2026-11-20 over A-626 part 4's
+> `WorkOp::Copy`); Mercurial's changesets of a submitted
 > version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
