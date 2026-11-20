@@ -65,3 +65,14 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
 - NEXT: read r3; if green -> parts 1+2 evidence to main (plan 01a1fa36 steps 5, 8). Part 3: main's slates_e2e now has
   container::a520_in_a_container_on_its_volume_... (someone else's); my podman/user_allow_other question to main stands.
 - for main to delete: kiln branch agents/w-k90-kvm-g90 (superseded by 22bb3fb9e); local ~/kiln-work/w-k90-kvm-land once r3 is read.
+
+## 2026-11-20 ~14:50 PST: PARTS 1 AND 2 PROVEN ON KVM (reported to main)
+- Part 2: r28 microvm::g90 PASSED (adacachy, a8156f377 = 22bb3fb9e's code on 715063153): daemon 3185184 SIGKILLed, successor 135631 served the next write.
+- Part 1: r39 microvm::g266 PASSED 1/1 in 793 s (same tree): Ask held and approved, Bypass LAND_WRITTEN 3, folders exact, no host mount.
+- Lesson: the drive's server and runner time out their link after 10 s (net::limits idle_timeout). Build at low CPU weight, but run the
+  drive at the default weight (~/.cache/w-k90-kvm/kvm-test.sh on adacachy). r28's g266 and r9 failed starved, not on code.
+- Part 3 (A-520 p5): code on main; proof held by w-k90-a520 (running on adacachy). Not duplicated; told main.
+- Load finding (reported): an agent's act is refused at once while its runner's link is down (deliberate: reach/tests.rs).
+- Landing worktree ~/kiln-work/w-k90-kvm-land removed.
+- for main to delete: kiln branch agents/w-k90-kvm-g90; adacachy ~/.cache/w-k90-kvm/{wt,wt3,clone}; here ~/kiln-work/w-k90-kvm,
+  ~/.cache/w-k90-kvm-local-target.noindex.
