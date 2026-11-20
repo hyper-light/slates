@@ -2850,6 +2850,20 @@ pub enum WorkOp {
     /// The metadata recorded by the declaring volume.
     node: IpcNode,
   },
+  /// Copy `from`'s tree, as version `version` of the work's green holds it (the work's base when none), to `to`, by
+  /// reference (A-586; A-626 part 4: a copy made through a work; Subversion's copy with history): replacing what `to`
+  /// holds when `replace`, else refused where `to` holds anything. What the work does in `to`'s tree after it lands on
+  /// what the copy brings. Appended.
+  Copy {
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from; none for the work's base.
+    version: Option<u64>,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
+  },
 }
 
 /// A declared kind of name with no content: a FIFO or socket name (A-26), or a device node with its number, metadata

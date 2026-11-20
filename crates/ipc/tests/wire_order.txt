@@ -565,6 +565,7 @@ WorkOp 6 Link
 WorkOp 7 SetXattr
 WorkOp 8 RemoveXattr
 WorkOp 9 Mknod
+WorkOp 10 Copy
 WriteAct 0 Merge
 WriteAct 1 Land
 WriteMode 0 Bypass

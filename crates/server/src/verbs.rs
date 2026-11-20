@@ -8579,6 +8579,19 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       path: key(path),
       name,
     },
+    // A copy made through a work (A-626 part 4): of the work's base unless it names a version; the green's owner
+    // composes it against the copied tree (`merge.work.copy_composed_by_owner`).
+    WorkOp::Copy {
+      from,
+      to,
+      version,
+      replace,
+    } => VolumeOp::Copy {
+      from: key(from),
+      to: key(to),
+      version: version.unwrap_or(w.base_version),
+      replace,
+    },
   };
   // The work is charged for what the declaration adds before it changes anything (`crate::work_charge`): a moved
   // file it now holds, a removal it records, the operation itself. The base is read while its green is lent.
