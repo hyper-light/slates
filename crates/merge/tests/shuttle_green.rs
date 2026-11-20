@@ -145,7 +145,7 @@ fn agent(agent: usize, requests: SyncSender<Request>) {
       })
       .unwrap();
     match outcome_replies.recv().unwrap() {
-      Outcome::Accepted { version } => {
+      Outcome::Accepted { version } | Outcome::Identical { version } => {
         assert!(version > base, "an accepted version is past its base");
         floor = version;
       }
@@ -343,7 +343,7 @@ fn one_schedule() {
   let mut green = Green::new();
   let setup = setup();
   let head_after_setup = match green.submit(&setup) {
-    Outcome::Accepted { version } => version,
+    Outcome::Accepted { version } | Outcome::Identical { version } => version,
     other => panic!("the setup increment accepts: {other:?}"),
   };
   let (requests, inbox) = sync_channel::<Request>(REQUEST_BOUND);

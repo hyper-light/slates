@@ -154,6 +154,7 @@ fn a_submits_verdict_past_one_reply_is_read_whole() {
     conflicts,
     conflicts_elided,
     verdict,
+    identical: _,
   }) = submitted
   else {
     panic!("the submit's conflict is answered: {submitted:?}");
@@ -300,6 +301,7 @@ fn a_verdict_judged_on_the_greens_shard_is_kept_with_its_work_on_another() {
     conflicts,
     conflicts_elided,
     verdict,
+    identical: _,
   }) = submitted
   else {
     panic!("the submit's conflict is answered: {submitted:?}");
@@ -341,6 +343,7 @@ fn a_signed_verdict_past_one_reply_is_read_whole() {
     verification,
     conflicts_elided,
     verdict,
+    identical: _,
   }) = reply
   else {
     panic!("the signed submit's conflict is answered: {reply:?}");

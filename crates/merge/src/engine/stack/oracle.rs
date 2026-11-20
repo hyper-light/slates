@@ -301,7 +301,13 @@ impl History {
     let mut green = green_of(&files);
     for increment in self.log.get(..prefix).unwrap_or_default() {
       let outcome = green.submit(increment);
-      prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+      prop_assert!(
+        matches!(
+          outcome,
+          Outcome::Accepted { .. } | Outcome::Identical { .. }
+        ),
+        "{outcome:?}"
+      );
     }
     Ok(green)
   }
@@ -317,7 +323,7 @@ impl History {
     let files = files_at(&self.green, base);
     let (work, _) = work_over(&files, spec, (&mut self.fresh, false));
     let increment = work.increment(self.next_id(), base);
-    if let Outcome::Accepted { .. } = self.green.submit(&increment) {
+    if let Outcome::Accepted { .. } | Outcome::Identical { .. } = self.green.submit(&increment) {
       self.log.push(increment);
     }
   }
@@ -349,7 +355,7 @@ impl History {
     for spec in between {
       let (work, _) = work_over(&files, spec, (&mut self.fresh, true));
       let increment = work.increment(self.next_id(), base);
-      if let Outcome::Accepted { .. } = self.green.submit(&increment) {
+      if let Outcome::Accepted { .. } | Outcome::Identical { .. } = self.green.submit(&increment) {
         landed_between.push(increment.clone());
         self.log.push(increment);
       }
@@ -506,9 +512,18 @@ impl Stack<'_> {
       let mut green = history.replica(self.prefix)?;
       for below in self.works.get(..level.max(1)).unwrap_or_default() {
         let outcome = green.submit(below);
-        prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+        prop_assert!(
+          matches!(
+            outcome,
+            Outcome::Accepted { .. } | Outcome::Identical { .. }
+          ),
+          "{outcome:?}"
+        );
       }
-      if !matches!(green.submit(work), Outcome::Accepted { .. }) {
+      if !matches!(
+        green.submit(work),
+        Outcome::Accepted { .. } | Outcome::Identical { .. }
+      ) {
         return Ok(false);
       }
     }
@@ -525,8 +540,17 @@ impl Stack<'_> {
     for work in self.between {
       let mut green = history.replica(self.prefix)?;
       let outcome = green.submit(work);
-      prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
-      if !matches!(green.submit(bottom), Outcome::Accepted { .. }) {
+      prop_assert!(
+        matches!(
+          outcome,
+          Outcome::Accepted { .. } | Outcome::Identical { .. }
+        ),
+        "{outcome:?}"
+      );
+      if !matches!(
+        green.submit(bottom),
+        Outcome::Accepted { .. } | Outcome::Identical { .. }
+      ) {
         return Ok(false);
       }
     }
@@ -540,17 +564,29 @@ impl Stack<'_> {
     let below = self.works.get(..level.max(1)).unwrap_or_default();
     for work in below {
       let outcome = green.submit(work);
-      prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+      prop_assert!(
+        matches!(
+          outcome,
+          Outcome::Accepted { .. } | Outcome::Identical { .. }
+        ),
+        "{outcome:?}"
+      );
     }
     let mut between = true;
     for work in self.between {
-      between &= matches!(green.submit(work), Outcome::Accepted { .. });
+      between &= matches!(
+        green.submit(work),
+        Outcome::Accepted { .. } | Outcome::Identical { .. }
+      );
     }
     if level == 0 {
       return Ok((green, between, true));
     }
     let landed = match self.works.get(level) {
-      Some(work) => matches!(green.submit(work), Outcome::Accepted { .. }),
+      Some(work) => matches!(
+        green.submit(work),
+        Outcome::Accepted { .. } | Outcome::Identical { .. }
+      ),
       None => false,
     };
     Ok((green, between, landed))

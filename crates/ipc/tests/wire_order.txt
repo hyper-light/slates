@@ -582,6 +582,7 @@ WatcherState 2 Unavailable
 WorkMark 0 Open
 WorkMark 1 Accepted
 WorkMark 2 Collided
+WorkMark 3 Identical
 WorkOp 0 Unlink
 WorkOp 1 Rename
 WorkOp 2 Mkdir

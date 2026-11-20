@@ -309,7 +309,7 @@ fn tally_of(arm: Arm, set: &[Pair]) -> Tally {
     });
     let one = green.submit(&increment(b, f, &h1, 1));
     assert!(
-      matches!(one, Outcome::Accepted { .. }),
+      matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. }),
       "{arm:?} first: {one:?}"
     );
     let two = green.submit(&increment(b, s, &h2, 2));

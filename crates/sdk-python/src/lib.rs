@@ -134,6 +134,8 @@ fn merge_outcome_dict(
   let dict = PyDict::new_bound(py);
   dict.set_item("ok", version.is_some())?;
   dict.set_item("version", version)?;
+  // A-782: `True` only for an accepted increment that changed nothing; set by `submitted_to_py`.
+  dict.set_item("identical", false)?;
   let mut conflicts: Vec<Py<PyDict>> = Vec::with_capacity(windows.len());
   for (path, at, len, class) in windows {
     let window = PyDict::new_bound(py);
@@ -273,6 +275,12 @@ fn work_dict(py: Python<'_>, id: VolumeId, base: u64) -> PyResult<Py<PyDict>> {
 fn submitted_to_py(py: Python<'_>, outcome: Submitted) -> PyResult<PyObject> {
   let dict = match outcome {
     Submitted::Accepted(version) => merge_outcome_dict(py, Some(version), Vec::new())?,
+    // Accepted, changing nothing (A-782): every operation was already at the head.
+    Submitted::Identical(version) => {
+      let dict = merge_outcome_dict(py, Some(version), Vec::new())?;
+      dict.bind(py).set_item("identical", true)?;
+      dict
+    }
     // A merge an ask write policy holds (A-285): the increment's identity the launcher's approval binds, and its paths.
     Submitted::ApprovalRequired { identity, paths } => {
       let dict = merge_outcome_dict(py, None, Vec::new())?;

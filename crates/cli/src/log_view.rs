@@ -32,6 +32,7 @@ fn mark_text(mark: &WorkMark) -> String {
   match mark {
     WorkMark::Open => "open".to_owned(),
     WorkMark::Accepted { version } => format!("accepted as v{version}"),
+    WorkMark::Identical { version } => format!("identical, as v{version} (nothing changed)"),
     WorkMark::Collided { windows, first, .. } => match first {
       Some(window) => format!(
         "COLLIDED at {} [{}+{}] ({windows} window{})",
@@ -102,12 +103,15 @@ pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
   lines
 }
 
-/// A work's mark as JSON: `{"state": "open" | "accepted" | "collided", ...}`.
+/// A work's mark as JSON: `{"state": "open" | "accepted" | "identical" | "collided", ...}`.
 fn mark_json(mark: &WorkMark) -> serde_json::Value {
   match mark {
     WorkMark::Open => serde_json::json!({ "state": "open" }),
     WorkMark::Accepted { version } => {
       serde_json::json!({ "state": "accepted", "version": version })
+    }
+    WorkMark::Identical { version } => {
+      serde_json::json!({ "state": "identical", "version": version })
     }
     WorkMark::Collided {
       verdict,

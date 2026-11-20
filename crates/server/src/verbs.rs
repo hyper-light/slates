@@ -9265,12 +9265,14 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
       conflicts,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     } => {
       let room = reply_room(&ReplyBody::Submitted {
         version: None,
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: u64::MAX,
+        identical: false,
       });
       let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
       ReplyBody::Submitted {
@@ -9278,6 +9280,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         conflicts,
         conflicts_elided,
         verdict,
+        identical: false,
       }
     }
     ReplyBody::SubmittedSigned {
@@ -9286,6 +9289,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
       verification,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     } => {
       let room = reply_room(&ReplyBody::SubmittedSigned {
         version: None,
@@ -9293,6 +9297,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         verification,
         conflicts_elided: 0,
         verdict: u64::MAX,
+        identical: false,
       });
       let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
       ReplyBody::SubmittedSigned {
@@ -9301,6 +9306,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         verification,
         conflicts_elided,
         verdict,
+        identical: false,
       }
     }
     ReplyBody::Rebased {
@@ -9685,6 +9691,7 @@ fn conflicted_reply(
       verification: signed.verification,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }
   } else {
     ReplyBody::Submitted {
@@ -9692,6 +9699,7 @@ fn conflicted_reply(
       conflicts,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }
   }
 }
@@ -9709,6 +9717,22 @@ pub(crate) fn accepted_version(reply: &ReplyBody) -> Option<u64> {
     } => Some(*version),
     _ => None,
   }
+}
+
+/// Whether a submit's reply says its accepted increment changed nothing (A-782).
+fn accepted_identical(reply: &ReplyBody) -> bool {
+  matches!(
+    reply,
+    ReplyBody::Submitted {
+      version: Some(_),
+      identical: true,
+      ..
+    } | ReplyBody::SubmittedSigned {
+      version: Some(_),
+      identical: true,
+      ..
+    }
+  )
 }
 
 /// What a submit brings its verdict from its write policy (A-285): its work's own merge mode, read on the work's shard
@@ -9891,9 +9915,11 @@ fn settle_submit(
     return refused(refusal_of_db(&e));
   }
   reset_accepted_work(state, work_id, version);
-  // The session log's mark (A-773): the version the work's last submission made, which it now stands on.
+  // The session log's mark (A-773): the version the work's last submission made, which it now stands on, and whether
+  // it changed nothing (A-782).
+  let identical = accepted_identical(&reply);
   if let Some(work) = state.works.get_mut(&work_id) {
-    work.accepted = Some(version);
+    work.accepted = Some((version, identical));
   }
   crate::work_home::tell_floor(state, green_id, work_id, Some(version));
   reply
@@ -10097,6 +10123,7 @@ fn judge_submission(
   let accepted = u32::from(matches!(
     &outcome,
     slates_merge::engine::Outcome::Accepted { .. }
+      | slates_merge::engine::Outcome::Identical { .. }
   ));
   let verdict = match state.current_span {
     Some(cause) => state
@@ -10111,7 +10138,10 @@ fn judge_submission(
   };
   crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
-    slates_merge::engine::Outcome::Accepted { version } => {
+    // An identical increment commits its (empty) version as an accept does, so retries and the chain's replay answer
+    // alike; its reply says it changed nothing (A-782, `merge_service::accepted_reply`).
+    slates_merge::engine::Outcome::Accepted { version }
+    | slates_merge::engine::Outcome::Identical { version } => {
       // The copies the version made, read before the increment's parts move: a Subversion green's revision names them
       // (`vcs_store::svn_made`).
       let copies = crate::vcs_store::svn_made::copies_of(&inc);
@@ -14598,7 +14628,7 @@ pub(crate) fn adopt_taken_over_green(
     );
     return Ok(());
   }
-  record_taken_over_completions(state, &completions);
+  record_taken_over_completions(state, id, &completions);
   let object = ObjectId(id.bytes);
   let placed = state.merge.placed.entry(object).or_insert(head);
   *placed = (*placed).max(head);
@@ -14731,6 +14761,7 @@ const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unreco
 /// typed and runs nothing (the work is gone with its owner). Counted.
 fn record_taken_over_completions(
   state: &mut ShardState,
+  green: DbVolumeId,
   completions: &[(u64, crate::merge_service::SubmitCompletion)],
 ) {
   let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
@@ -14759,6 +14790,7 @@ fn record_taken_over_completions(
           conflicts: Vec::new(),
           conflicts_elided: 0,
           verdict: 0,
+          identical: crate::merge_service::identical_at(state, green, version),
         },
         work,
       );
