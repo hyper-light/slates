@@ -1754,6 +1754,12 @@
 > 300 generated `.hgtags` sequences and to `hg log -r` on a recorded repository). Owed: a branch made at a changeset no
 > line or bookmark heads (a tag inside a line's history), refused `Unsupported` until a green can be branched at the
 > version whose head it was.
+> FIXED by use (w-hg's r15, 2026-11-20, release at 1d4909821): `hg clone -r default` of hg's own history aborted
+> `PastAdmission { asked: 179155, left: 85302 }`. The served `lookup`'s tag step reads each head's manifest for its
+> `.hgtags`, charged to what the request left of the edge's room. Both edges now admit a whole answer (`lookup`,
+> `heads`, a batch) the room a fetch's turn is (`HgStores::fetch_turn`, the owner shard's `vcs_share::room`), as A-745
+> admits each streamed turn and 4136fcd89 admits git's upload-pack answer. Red first:
+> `vcs_http::hg::tests::a_lookup_is_answered_within_a_fetchs_room_not_its_requests`.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the

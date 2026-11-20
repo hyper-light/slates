@@ -823,3 +823,205 @@ fn a_batched_pushkey_is_landed_over_post_and_refused_over_get() {
     )
   );
 }
+
+/// Shape: what one head's `.hgtags` lookup charges in [`Charging`]: hg's own history's manifest at its tip, 179,155
+/// bytes, which w-hg's r15 found refused with 85,302 bytes of the request's room left.
+const TAG_READ: u64 = 179_155;
+
+/// A repository of one changeset on `default` whose head's `.hgtags` lookup charges [`TAG_READ`] to the room it is
+/// lent (as reading the head's manifest does) and finds none.
+struct Charging;
+
+/// Shape: [`Charging`]'s one changeset's node.
+const CHARGING_NODE: Node = [7; 20];
+
+impl Repository for Charging {
+  fn count(&self) -> Rev {
+    1
+  }
+
+  fn node(&self, rev: Rev) -> Option<Node> {
+    (rev == 0).then_some(CHARGING_NODE)
+  }
+
+  fn rev(&self, node: &Node) -> Option<Rev> {
+    (*node == CHARGING_NODE).then_some(0)
+  }
+
+  fn parents(&self, _rev: Rev) -> [Option<Rev>; 2] {
+    [None, None]
+  }
+
+  fn branch(&self, _rev: Rev) -> &[u8] {
+    b"default"
+  }
+
+  fn closes(&self, _rev: Rev) -> bool {
+    false
+  }
+
+  fn phase(&self, _rev: Rev) -> Phase {
+    Phase::Public
+  }
+
+  fn publishing(&self) -> bool {
+    true
+  }
+
+  fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
+    std::iter::empty()
+  }
+
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    std::iter::empty()
+  }
+
+  fn tags_file(
+    &self,
+    _rev: slates_hg::serve::Rev,
+    admission: &mut slates_hg::Admission,
+  ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
+    admission.charge(TAG_READ)?;
+    Ok(None)
+  }
+
+  fn tags_text(
+    &self,
+    _node: &Node,
+    _admission: &mut slates_hg::Admission,
+  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
+    Err(slates_hg::serve::Refusal::Store { what: "tags" })
+  }
+}
+
+impl Store for Charging {
+  fn changeset_text(
+    &self,
+    _rev: Rev,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Cow<'_, [u8]>>, slates_hg::PastAdmission> {
+    Ok(None)
+  }
+
+  fn manifest(
+    &self,
+    _node: &Node,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+    Ok(None)
+  }
+
+  fn file(
+    &self,
+    _path: &[u8],
+    _node: &Node,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+    Ok(None)
+  }
+
+  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
+    std::iter::empty()
+  }
+
+  fn manifest_linked(&self, _position: u64) -> Option<slates_hg::serve::getbundle::Linked> {
+    None
+  }
+
+  fn file_linked_from(
+    &self,
+    _from: (&[u8], u64),
+  ) -> Option<(Vec<u8>, u64, slates_hg::serve::getbundle::Linked)> {
+    None
+  }
+
+  fn holds_manifest(&self, _node: &Node) -> bool {
+    false
+  }
+
+  fn serves_every_changeset(&self) -> bool {
+    true
+  }
+}
+
+/// `hg`'s store as [`Charging`], its owner shard naming a fetch's room of [`ROOM`] (`HgStores::fetch_turn`, what the
+/// daemon's `crate::vcs_share::room` names).
+#[derive(Clone, Copy)]
+struct Roomy;
+
+impl HgStores for Roomy {
+  type Store<'s> = Charging;
+  type Hold = RepositoryId;
+
+  fn hold(&mut self, id: RepositoryId, _room: &mut slates_hg::Admission) -> Option<RepositoryId> {
+    self.holds(id).then_some(id)
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    hold: &RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    self.lend(*hold, room, step)
+  }
+
+  fn holds(&self, id: RepositoryId) -> bool {
+    id == HG
+  }
+
+  fn lend<R>(
+    &mut self,
+    id: RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    (id == HG).then(|| step(&Charging, room))
+  }
+
+  fn fetch_turn(&self, _repository: RepositoryId) -> Option<(u64, u64)> {
+    Some((ROOM, 0))
+  }
+
+  async fn push(
+    &mut self,
+    _id: RepositoryId,
+    _pushing: Pushing<'_>,
+    _room: &mut slates_hg::Admission,
+  ) -> Option<Outcome> {
+    None
+  }
+}
+
+/// A-745 rule 2 for a whole answer (found by use: w-hg's r15 at 1d4909821, `hg clone -r default` of hg's own history
+/// aborted `PastAdmission { asked: 179155, left: 85302 }`, its `lookup` reading each head's manifest for `.hgtags`
+/// within what its request left of the edge's room). Do serve the owner's `lookup default` over a site whose request
+/// room is smaller than one head's tag read, the store's owner naming a fetch's room past it. Expect `default` resolved
+/// to its one changeset: a whole answer is admitted the room a fetch's turn is, never what its request's bytes left.
+#[test]
+fn a_lookup_is_answered_within_a_fetchs_room_not_its_requests() {
+  let mut site = HgSite::new(
+    REALM.to_owned(),
+    TAG_READ / 2,
+    Tokens,
+    Held { rules: Vec::new() },
+    Roomy,
+  );
+  let (fields, body) = exchanged(
+    served(
+      &mut site,
+      "GET",
+      "/hg?cmd=lookup",
+      &["X-HgArg-1: key=default"],
+    ),
+    b"",
+  );
+  let hex: String = CHARGING_NODE
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  assert_eq!(
+    (fields, String::from_utf8_lossy(&body).into_owned()),
+    (media(hg_wire::MEDIA_TYPE_V1), format!("1 {hex}\n"))
+  );
+}
