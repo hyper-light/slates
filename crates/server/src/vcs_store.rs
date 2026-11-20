@@ -99,6 +99,7 @@ pub(crate) mod lfs_record;
 pub(crate) mod paths;
 pub(crate) mod record;
 pub(crate) mod svn_import;
+pub(crate) mod svn_view;
 // Its push helpers serve the hooks' tests too (`crate::git_hooks`, A-665 part 2).
 #[cfg(test)]
 pub(crate) mod tests;
