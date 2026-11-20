@@ -103,7 +103,7 @@ NOT COMPLETE (keep open):
   today. The switch flips in the same commit that adds the passing test. ETA: this afternoon.
 
 ### 2026-11-20 ~13:00: the takeover test is RED on v2 records: a successor serves a taken-over repository with NO refs
-Test: crates/cli/tests/v3_takeover.rs, on branch agents/w-balance-takeover-test (b51e…, not on main: it's red). Three
+Test: crates/cli/tests/v3_takeover.rs, on branch agents/w-balance-takeover-test (7e5ce95dc, not on main: it is red). Three
 `slates anchor --fleet` processes at f = 1 with their HTTPS edges; a repository on one node; three pushes acknowledged
 by stock git; a fourth in flight as the owner's anchor and daemon are SIGKILLed. Gated by SLATES_TEST_CLI.
 Four runs, the same each time:
