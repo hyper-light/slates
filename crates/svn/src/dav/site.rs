@@ -568,9 +568,14 @@ fn report<R: Repository + ?Sized>(
   bounds: &Bounds,
   room: usize,
 ) -> Answer {
+  if matches!(resource, Resource::Unserved) {
+    return Answer::Whole(unserved_method("REPORT"));
+  }
   let asked = match request::report(request.body, bounds) {
     Ok(asked) => asked,
     Err(DavRefusal::UnknownReport { .. }) => return Answer::Whole(unserved_method("REPORT")),
+    // `me` answers an update-report alone: any other body there is a report it does not know.
+    Err(_) if matches!(resource, Resource::Me) => return Answer::Whole(unserved_method("REPORT")),
     Err(refused) => return Answer::Whole(refused_body(&refused)),
   };
   if let Asked::Update(update) = &asked {
