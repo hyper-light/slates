@@ -4496,8 +4496,9 @@
 >   cohort for the object is whole and at least `f + 1` wide (`RegionalConfiguration::settled_away`,
 >   `fleet.settle.released`; kept and counted `fleet.settle.kept_outside` otherwise), its content kept while a head
 >   names it. Tests: `a_holder_a_live_owners_neighbourhood_settled_away_from_lets_its_copies_go` (red before) and
->   `a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one`. Owed: the lineage model's mirror and its
->   oracle; the content release below.
+>   `a_live_owners_copy_is_settled_away_only_from_a_whole_cohort_of_f_plus_one`. The lineage model mirrors it (A-707,
+>   2026-11-19): such a release is held to `f + 1` other members holding a record at least as new, and the model's round
+>   waits on A-556's narrowed cohorts; 400 seeds, 72 released, 2,526 kept, no violation. The content release below.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
