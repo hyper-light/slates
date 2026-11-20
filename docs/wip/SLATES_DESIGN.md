@@ -11109,6 +11109,15 @@ Applying or replicating an increment cannot import a live endpoint from the work
 such kind with its number (A-294): the number is part of its canonical identity, so two works making one path with two
 numbers conflict, and the same node made twice converges.
 
+> **Status (2026-11-20, A-773: the session log).** `slates log [--json]` shows a supervisor what needs them and
+> nothing else, as Sapling's Smartlog does: each work's base, how far its green moved past it and how its last
+> submission ended (open, accepted as a version, or collided where), and the landings awaiting a grant (§4.15), the
+> collided works and those landings named first. A read (`RequestBody::SessionLog`), a scatter over the shards like
+> `grants`, each shard reading its works and its partition's waiting-landing index, never the landing history; it
+> shows a pending grant and never makes one (R10). Owed: an identical submission told from an accepted one (the engine
+> commits an identical increment as a version, so telling it apart needs the submit's reply to say so), the MCP tool
+> and the SDKs' read.
+
 > **Status (2026-09-20, A-26).** Origin format 2 captures IPC kind, owner, group and four
 > timestamps; modes remain independent. `Mknod` carries fixed canonical metadata in the
 > increment's post-state, with no content operations. The engine preserves it through identity,
@@ -57386,3 +57395,20 @@ profile's establishment shared by both judges, an `ask` for a host with no Unix 
   container_engine contract_history` 10 passed, `cargo test --locked -p slates-bridge-oci` all passed (macOS arm64,
   Adas-Mac-Studio-4, local). Owed: the Windows `ask`'s run on Windows (main's, §8), and the export route's live run there
   (kiln's container drive on jupiter, w-k90-containers).
+
+### A-773 — The session log: what needs the human, named first, read from what it shows (2026-11-20, w-sessionlog; Ada's dispatch after the Slates-vs-Sapling comparison; §4.16, §4.15; R10)
+Ten agents over one green left their supervisor cross-referencing volume ids, `versions`, a conflict's JSON and the
+audit to find the one decision that was theirs. `slates log` is that view: a collided work and a landing awaiting its
+grant are named first; every work follows with its base, how far behind its green it is and its last submission's end.
+The daemon answers `SessionLog` a page at a time, each shard's part its works (`WorkState::accepted` is the version its
+last accepted submission made) merged in key order with its landings in `AwaitingGrant`, which the partition indexes
+(`Partition::awaiting_grant_from`, kept by `apply` and rebuilt at restore), so a page costs its lines. The client joins
+each named green's head once (`Client::session_log`, `SessionLog::needs_you`); the CLI prints it as text or one JSON
+object (`needs_you`, `greens`, `awaiting_grant`). The view never grants (R10).
+Applied in the same change to: §4.16 (a status line), GAPS (the owed items), `docs/cli.md`, `crates/ipc` (the verb,
+`LogLine`, `WorkMark`, `LogCursor`, published tags), `crates/db` (the index and its model check), `crates/server`
+(`session_log`, the scatter), `crates/client` (`session_log`), `crates/cli` (`log`, `log_view`).
+Evidence: `cargo test --locked -p slates-server --test session_log` 1 passed (two shards, ten works, one collision,
+one waiting landing: exactly two named; the landing gone once granted and run); `-p slates-db --test model
+every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
+`args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).

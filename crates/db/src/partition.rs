@@ -20,8 +20,8 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  GrantState, IdentityRecord, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge,
-  NameAliasRecord, NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  GrantState, IdentityRecord, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
+  LineageEdge, NameAliasRecord, NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
   NfsOpenRecord, NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES,
   SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone,
   VolumeId, VolumeRecord,
@@ -316,6 +316,10 @@ pub struct Partition {
   identities: BTreeMap<Vec<u8>, IdentityRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
+  /// The landings presented and awaiting a grant (§4.15 `AwaitingGrant`), by the volume they land and their id
+  /// (A-773): what the session log shows, so its read costs the landings waiting, never the partition's landing
+  /// history. Kept by `apply` beside `landings` and rebuilt from them at a restore; bounded by `landings`.
+  awaiting_grant: BTreeSet<(VolumeId, u64)>,
   /// The audit records retained, oldest first: at most `caps.audit_records` (A-265).
   audit: std::collections::VecDeque<AuditRecord>,
   /// The audit records dropped oldest first past the bound (A-265), snapshotted with the window.
@@ -484,6 +488,7 @@ impl Partition {
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
+      awaiting_grant: BTreeSet::new(),
       audit: std::collections::VecDeque::new(),
       audit_dropped: 0,
       green_chains: BTreeMap::new(),
@@ -1410,6 +1415,27 @@ impl Partition {
   /// A landing.
   pub fn landing(&self, id: u64) -> Option<&LandingRecord> {
     self.landings.get(&id)
+  }
+
+  /// The landings awaiting a grant from `from` (a volume and, within it, a landing id), in that order (A-773): a seek
+  /// into the waiting set, so a page costs the lines it carries.
+  pub fn awaiting_grant_from(
+    &self,
+    from: std::ops::Bound<(VolumeId, u64)>,
+  ) -> impl Iterator<Item = &LandingRecord> + '_ {
+    self
+      .awaiting_grant
+      .range((from, std::ops::Bound::Unbounded))
+      .filter_map(|(_, id)| self.landings.get(id))
+  }
+
+  /// Keeps `awaiting_grant` equal to the landings whose state is `AwaitingGrant`.
+  fn note_awaiting(&mut self, volume: VolumeId, id: u64, state: LandingState) {
+    if state == LandingState::AwaitingGrant {
+      self.awaiting_grant.insert((volume, id));
+    } else {
+      self.awaiting_grant.remove(&(volume, id));
+    }
   }
 
   /// The highest landing id the partition holds, or `None` when it holds none — asked once at boot, so
@@ -2551,6 +2577,7 @@ impl Partition {
       }
       Op::LandingRecorded { record } => {
         self.landings.insert(record.id, record.clone());
+        self.note_awaiting(record.volume, record.id, record.state);
         Ok(())
       }
       Op::LandingStateChanged {
@@ -2563,6 +2590,8 @@ impl Partition {
         landing.state = *state;
         landing.written = *written;
         landing.conflicts = *conflicts;
+        let volume = landing.volume;
+        self.note_awaiting(volume, *id, *state);
         Ok(())
       }
       Op::AuditAppended { record } => {
@@ -3180,6 +3209,7 @@ impl Partition {
     }
     for l in &snapshot.landings {
       p.landings.insert(l.id, l.clone());
+      p.note_awaiting(l.volume, l.id, l.state);
     }
     p.audit = snapshot.audit.iter().cloned().collect();
     p.audit_dropped = snapshot.audit_dropped;

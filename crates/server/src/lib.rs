@@ -157,6 +157,7 @@ mod reap;
 // The repository verbs (§4.17.1; A-575). What a client's create names by default is public (A-685, `slates repository
 // create`): each tool's object formats and the namespace name a new repository's root is bound to.
 mod repository;
+mod session_log;
 pub use repository::{RootRefused, object_formats, root_binding};
 // git's `dowild` transcribed line for line, the oracle `vcs_policy`'s tests hold its glob rules to (A-597): the file
 // that `slates_vcs::wildmatch`'s own tests read as their `reference`, compiled into this crate's tests too, so both
