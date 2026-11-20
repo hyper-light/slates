@@ -200,7 +200,12 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
 }
 
 /// The text a chain of deltas makes, read from the arm's log through `cache`: the first applied against nothing.
-fn rebuilt(revisions: &[Stored], at: usize, cache: &mut Cache<'_>, bytes: &mut Vec<u8>) -> (Vec<u8>, usize) {
+fn rebuilt(
+  revisions: &[Stored],
+  at: usize,
+  cache: &mut Cache<'_>,
+  bytes: &mut Vec<u8>,
+) -> (Vec<u8>, usize) {
   let mut chain = vec![at];
   while let Some(base) = revisions[*chain.last().unwrap()].base {
     chain.push(base);
