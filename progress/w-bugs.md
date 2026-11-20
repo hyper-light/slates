@@ -237,3 +237,6 @@
   the fetches read 1,024 bytes a step. Sent to w-perf's inbox with two shapes that fit the budget (a made-text cache
   or reader handle; the chain applied in units). Listing measurement landed 477abbf73 (3.84 ms children regardless
   of live count). Still waiting on w-svn's agreement for the listing index.
+- 2026-11-20 A-759 landed: part 1 088bf935b (children maps, listing O(live), children 3.84 -> 0.23 ms), part 2
+  1417c0868 (cursor, 16 entries a step, 1.6-1.75 us a step; red 1,801). Main signalled
+  (inbox/main-from-w-bugs-a759.md). Left: replay add_subdir whole listing; CI re-measure waits on w-perf's S4 c2 fix.
