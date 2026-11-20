@@ -10,6 +10,8 @@ use slates_db::catalog::{
 use slates_hg::compression::Engine;
 use slates_hg::obsmarkers::Marker;
 use slates_hg::phases::Phase;
+use slates_hg::push::Outcome;
+use slates_hg::push::reply::Reply;
 use slates_hg::serve::getbundle::{Logged, Store};
 use slates_hg::serve::http::{Compression, Compressor, Media};
 use slates_hg::serve::{Repository, Rev};
@@ -22,6 +24,7 @@ use slates_http_edge::credential::Credential;
 
 use super::super::git::{Authenticator, Located, Proven, Repositories, Unproven};
 use super::{Fastest, HgSite, HgStores};
+use crate::repository::hg_push::Pushing;
 use crate::vcs_http::{Answer, Decided, Exchange, Failed, Site};
 
 /// Shape: room enough for every request these tests send.
@@ -230,6 +233,16 @@ impl HgStores for OneStore {
     step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
   ) -> Option<R> {
     (id == HG).then(|| step(&Empty, room))
+  }
+
+  /// `hg`'s pushes are accepted with no reply part, as a push without `replycaps` is answered.
+  fn push(
+    &mut self,
+    id: RepositoryId,
+    _pushing: Pushing<'_>,
+    _room: &mut slates_hg::Admission,
+  ) -> Option<Outcome> {
+    (id == HG).then(|| Outcome::Accepted(Reply::accepted(&[], false)))
   }
 }
 
@@ -653,6 +666,15 @@ impl HgStores for Vanishing {
     _room: &mut slates_hg::Admission,
     _step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
   ) -> Option<R> {
+    None
+  }
+
+  fn push(
+    &mut self,
+    _id: RepositoryId,
+    _pushing: Pushing<'_>,
+    _room: &mut slates_hg::Admission,
+  ) -> Option<Outcome> {
     None
   }
 }

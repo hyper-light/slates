@@ -10,9 +10,16 @@ use super::super::getbundle::tests::{
   Served, check_bundle2_subset, check_streams, cloned, session_stores,
 };
 use super::super::session::Refused;
-use super::{Answered, Compression, Compressor, Media, Permission, answer, command, permission};
+use super::{
+  Answered, Compression, Compressor, Media, Permission, answer, command, permission, pushed,
+  unbundle_request,
+};
 use crate::compression::{self, EncodeRefusal, Engine};
 use crate::http::{self, MEDIA_TYPE_ERROR, MEDIA_TYPE_V1, MEDIA_TYPE_V2, Request};
+use crate::push::Outcome;
+use crate::push::check::HeadsArgument;
+use crate::push::reply::{Replied, Reply};
+use crate::serve::Refusal;
 use crate::{Admission, PastAdmission, capabilities};
 use proptest::prelude::*;
 
@@ -251,7 +258,7 @@ fn check_capabilities(ours: &[u8], theirs: &[u8]) {
     }
   }
   let names: Vec<&[u8]> = ours.iter().map(|(name, _)| name).collect();
-  let expected: [&[u8]; 8] = [
+  let expected: [&[u8]; 9] = [
     b"batch",
     b"branchmap",
     b"bundle2",
@@ -260,6 +267,7 @@ fn check_capabilities(ours: &[u8], theirs: &[u8]) {
     b"httpheader",
     b"httpmediatype",
     b"known",
+    b"unbundle",
   ];
   assert_eq!(names, expected);
 }
@@ -587,6 +595,153 @@ fn requests_mercurial_would_misread_are_answered_out_of_band() {
       (MEDIA_TYPE_ERROR, Some(refused))
     );
     assert!(ours.body.ends_with(b"\n") && ours.body.len() > 1);
+  }
+}
+
+/// Format: stock 7.2's push over HTTP (`fixtures/wire`, `make-wire-fixtures.sh`'s `http-push`): the request its client
+/// sent with `unbundle`, and the body its server answered.
+const HTTP_PUSH: &[u8] = include_bytes!("../../fixtures/wire/http-push.07.request");
+/// Format: see [`HTTP_PUSH`].
+const HTTP_PUSH_REPLY: &[u8] = include_bytes!("../../fixtures/wire/http-push.07.response-body");
+/// Format: stock 7.2's answer over HTTP to a bundle1 client where bundle2 is required (`http-oob`'s last exchange).
+const BUNDLE2_REQUIRED_BODY: &[u8] =
+  include_bytes!("../../fixtures/wire/http-oob.04.response-body");
+
+/// The parts a bundle2 stream holds, each its type, parameters and payload, `output` parts left out when `outputs` is
+/// false.
+fn reply_parts(stream: &[u8], outputs: bool) -> Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+  let bundle = crate::bundle2::Bundle2::decode(stream, &mut Admission::new(ROOM)).unwrap();
+  bundle
+    .parts
+    .iter()
+    .enumerate()
+    .filter(|(_, part)| outputs || !part.kind.eq_ignore_ascii_case(b"output"))
+    .map(|(index, part)| {
+      let params = part
+        .params
+        .iter()
+        .map(|param| (param.key.to_vec(), param.value.to_vec()))
+        .collect();
+      let payload = bundle
+        .payload_bytes(index, &mut Admission::new(ROOM))
+        .unwrap();
+      (part.kind.to_vec(), params, payload)
+    })
+    .collect()
+}
+
+/// A-680 part 2b (golden: stock 7.2's push over HTTP). Do: read the `unbundle` stock 7.2's client sent over HTTP; then
+/// frame, as an HTTP push's answers, the reply accepting it (its changegroup part 3 leaving one head), a race before
+/// its bundle was read, and a bundle1. Expect: its `heads` `force` and its bundle the body, `HG20` first; the reply in
+/// `application/mercurial-0.1` uncompressed, its parts 7.2's but the `output` parts of 7.2's progress words (the module
+/// doc); the race 7.2's `pusherr` in `0.1`; the bundle1 7.2's `bundle2required` answer byte for byte, out of band.
+#[test]
+fn a_push_is_read_and_answered_as_7_2_answers_one_over_http() {
+  let parsed = Parsed::of(HTTP_PUSH);
+  let fields: Vec<(&[u8], &[u8])> = parsed
+    .fields
+    .iter()
+    .map(|(name, value)| (name.as_slice(), value.as_slice()))
+    .collect();
+  let request = Request {
+    query: &parsed.query,
+    headers: &fields,
+    body: &parsed.body,
+  };
+  let (heads, bundle) = unbundle_request(&request, &mut Admission::new(ROOM)).unwrap();
+  assert_eq!(heads, HeadsArgument::Force);
+  assert_eq!(bundle, parsed.body.as_slice());
+  assert!(bundle.starts_with(b"HG20"));
+  let reply = Reply::accepted(
+    &[Replied::Changegroup {
+      in_reply_to: 3,
+      heads: 1,
+    }],
+    true,
+  );
+  let ours = pushed(&Outcome::Accepted(reply), &mut Admission::new(ROOM));
+  assert_eq!((ours.media_type, ours.refused), (MEDIA_TYPE_V1, None));
+  assert_eq!(
+    reply_parts(&ours.body, true),
+    reply_parts(HTTP_PUSH_REPLY, false)
+  );
+  let words = b"repository changed while preparing changes - please try again".to_vec();
+  let raced = pushed(&Outcome::Unprocessed(words), &mut Admission::new(ROOM));
+  assert_eq!(
+    (raced.media_type, raced.body.as_slice(), raced.refused),
+    (
+      MEDIA_TYPE_V1,
+      &b"0\nrepository changed while preparing changes - please try again\n"[..],
+      Some(Refused::Push)
+    )
+  );
+  let bundle1 = pushed(&Outcome::Bundle1, &mut Admission::new(ROOM));
+  assert_eq!(
+    (bundle1.media_type, bundle1.body.as_slice(), bundle1.refused),
+    (
+      MEDIA_TYPE_ERROR,
+      BUNDLE2_REQUIRED_BODY,
+      Some(Refused::Serve(Refusal::NoBundle2))
+    )
+  );
+}
+
+/// A-680 part 2b (stricter than 7.2, the module doc). Do: send `unbundle` without `heads`, with a `heads` item that is not
+/// hexadecimal, and with arguments past the request's room; then frame an accepted reply and a `pusherr` in less room
+/// than they take. Expect: each answered out of band naming why (the missing argument, the item at 0, the room), and
+/// nothing framed past the room.
+#[test]
+fn a_push_that_cannot_be_read_or_framed_within_its_room_is_answered_out_of_band() {
+  let read = |query: &[u8], room: u64| {
+    let request = Request {
+      query,
+      headers: &[],
+      body: b"HG20",
+    };
+    unbundle_request(&request, &mut Admission::new(room))
+      .map(|_| ())
+      .map_err(|answered| (answered.media_type, answered.refused))
+  };
+  assert_eq!(
+    read(b"cmd=unbundle", ROOM),
+    Err((
+      MEDIA_TYPE_ERROR,
+      Some(Refused::Http(http::Refusal::MissingArgument {
+        position: 0
+      }))
+    ))
+  );
+  assert_eq!(
+    read(b"cmd=unbundle&heads=zz", ROOM),
+    Err((
+      MEDIA_TYPE_ERROR,
+      Some(Refused::Serve(Refusal::NodeList { at: 0 }))
+    ))
+  );
+  assert!(matches!(
+    read(b"cmd=unbundle&heads=666f726365", 4),
+    Err((_, Some(Refused::Http(_))))
+  ));
+  let reply = Reply::accepted(
+    &[Replied::Changegroup {
+      in_reply_to: 3,
+      heads: 1,
+    }],
+    true,
+  );
+  for outcome in [
+    Outcome::Accepted(reply),
+    Outcome::Unprocessed(b"raced".to_vec()),
+  ] {
+    let short = pushed(&outcome, &mut Admission::new(4));
+    assert!(
+      matches!(
+        short.refused,
+        Some(Refused::Serve(Refusal::PastAdmission(_)))
+      ),
+      "{outcome:?}: {short:?}"
+    );
+    assert_eq!(short.media_type, MEDIA_TYPE_ERROR);
   }
 }
 

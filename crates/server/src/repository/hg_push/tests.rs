@@ -9,16 +9,16 @@ use proptest::prelude::*;
 use slates_db::catalog::{Principal, RepositoryId, StateLog, VolumeId as DbVolumeId};
 use slates_hg::bundle2::Bundle2;
 use slates_hg::changegroup::{Changegroup, Group, Revision, Version};
-use slates_hg::index::{HgIndex, Log};
+use slates_hg::index::Log;
 use slates_hg::phases::{Phase, PhaseHead};
+use slates_hg::push::check::HeadsArgument;
 use slates_hg::push::held::IndexHeld;
 use slates_hg::push::reply::{Refused, Replied, Reply};
-use slates_hg::push::{Asks, BookmarkAt, ChangegroupPart, Taken, Unbundle, read};
+use slates_hg::push::{Asks, BookmarkAt, ChangegroupPart, Outcome, Taken, Unbundle, read};
 use slates_hg::serve::{Repository, Rev};
 use slates_hg::{Admission, NULL_NODE, Node, delta, node};
 use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
-use slates_vcs::ContentStore;
 
 use super::{
   BOOKMARK_TAG, LINE_TAG, Landed, Prepared, bookmark_name, bookmark_of, branch_prefix, land,
@@ -29,8 +29,6 @@ use crate::verbs::{dispatch, to_db_volume};
 
 /// Shape: the room a test's work is built within, far past any of these trees.
 const ROOM: u64 = 1 << 20;
-/// Shape: the window the tests' content stores are made with, as slates-hg's import tests make theirs.
-const WINDOW: usize = 1 << 12;
 /// Shape: the push's name every test work's identity begins with.
 const NAME: [u8; 32] = [7; 32];
 
@@ -176,7 +174,7 @@ impl Repository for View {
 /// A changeset of the fixtures' repository as `make-push-fixtures.sh` made it with stock 7.2 (user `test`, date `0
 /// 0`): its description, the one file it adds and that file's bytes, its parent among those made before it, and its
 /// branch.
-type Commit = (
+pub(crate) type Commit = (
   &'static str,
   &'static str,
   &'static [u8],
@@ -198,19 +196,24 @@ const COMMITS: [Commit; 6] = [
 /// One changeset rebuilt: its node, first parent and text; its manifest's node, first parent and text; its file's
 /// path, node and text.
 #[derive(Clone, Debug)]
-struct Made {
-  node: Node,
-  p1: Node,
-  text: Vec<u8>,
-  manifest: (Node, Node, Vec<u8>),
-  file: (Vec<u8>, Node, Vec<u8>),
+pub(crate) struct Made {
+  pub(crate) node: Node,
+  pub(crate) p1: Node,
+  pub(crate) text: Vec<u8>,
+  pub(crate) manifest: (Node, Node, Vec<u8>),
+  pub(crate) file: (Vec<u8>, Node, Vec<u8>),
 }
 
 /// The fixtures' repository rebuilt from its texts as 7.2's `commit` writes them (§4.17.3 decision 7's fields).
 fn history() -> Vec<Made> {
+  history_of(&COMMITS)
+}
+
+/// `commits` rebuilt from their texts as 7.2's `commit` writes them, each adding its one file to its parent's.
+pub(crate) fn history_of(commits: &[Commit]) -> Vec<Made> {
   let mut made: Vec<Made> = Vec::new();
   let mut manifests: Vec<Vec<(Vec<u8>, Node)>> = Vec::new();
-  for (description, path, bytes, parent, branch) in COMMITS {
+  for &(description, path, bytes, parent, branch) in commits {
     let file = node::compute(&NULL_NODE, &NULL_NODE, bytes).unwrap();
     let mut entries = parent.map(|at| manifests[at].clone()).unwrap_or_default();
     entries.push((path.as_bytes().to_vec(), file));
@@ -261,7 +264,7 @@ fn full_text(node: Node, p1: Node, link: Node, data: &[u8]) -> Revision<'_> {
 }
 
 /// A changegroup 03 of the changesets `which`, every revision a full text against the null node.
-fn changegroup(made: &[Made], which: &[usize]) -> ChangegroupPart {
+pub(crate) fn changegroup(made: &[Made], which: &[usize]) -> ChangegroupPart {
   let mut deltas: Vec<Vec<u8>> = Vec::new();
   for at in which {
     for text in [&made[*at].text, &made[*at].manifest.2, &made[*at].file.2] {
@@ -341,12 +344,10 @@ fn encoded(reply: &Reply) -> Vec<u8> {
   out
 }
 
-/// A Mercurial repository on the shard, with the index and store its pushes keep their revisions in.
+/// A Mercurial repository on the shard, whose pushes keep their revisions in its store there (A-662's Mercurial arm).
 struct Hg {
   repository: RepositoryId,
   root: DbVolumeId,
-  index: HgIndex,
-  store: ContentStore,
 }
 
 impl Hg {
@@ -377,8 +378,6 @@ impl Hg {
     Hg {
       repository,
       root: to_db_volume(id),
-      index: HgIndex::new(),
-      store: ContentStore::new(1 << 24, WINDOW).unwrap(),
     }
   }
 
@@ -388,7 +387,11 @@ impl Hg {
     unbundle: &Unbundle,
     view: &View,
   ) -> Result<Prepared, Refused> {
-    let held = IndexHeld::new(&self.index, &self.store);
+    let (content, store) = state
+      .vcs_stores
+      .mercurial_ref(self.repository)
+      .expect("the repository's store, made with its record");
+    let held = IndexHeld::new(&store.index, content);
     prepare(
       state,
       self.repository,
@@ -400,13 +403,7 @@ impl Hg {
   }
 
   fn land(&mut self, state: &mut ShardState, prepared: Prepared) -> Landed {
-    let landed = land(
-      state,
-      (&owner(), self.repository),
-      prepared,
-      (&mut self.index, &mut self.store),
-      &mut room(),
-    );
+    let landed = land(state, (&owner(), self.repository), prepared, &mut room());
     assert_eq!(
       landed.released,
       Ok(()),
@@ -457,9 +454,10 @@ impl Hg {
       .unwrap()
   }
 
-  /// Whether the index holds changeset `node`.
-  fn holds(&self, node: &Node) -> bool {
-    self.index.rev(&self.store, Log::Changelog, node).is_some()
+  /// Whether the repository's index in its store holds changeset `node`.
+  fn holds(&self, state: &ShardState, node: &Node) -> bool {
+    let (content, store) = state.vcs_stores.mercurial_ref(self.repository).unwrap();
+    store.index.rev(content, Log::Changelog, node).is_some()
   }
 }
 
@@ -531,7 +529,7 @@ fn assert_rebuilt(state: &ShardState, hg: &Hg, made: &[Made]) {
   assert_eq!(hg.bound(state, &line_name(b"default", 0)), Some(hg.root));
   assert_eq!(head(state, hg.root), Some(made[1].node));
   assert_eq!(file(state, hg.root, "b").as_deref(), Some(&b"b\n"[..]));
-  assert!(hg.holds(&made[0].node) && hg.holds(&made[1].node));
+  assert!(hg.holds(state, &made[0].node) && hg.holds(state, &made[1].node));
 }
 
 /// A-657, AC-HG.3 (T-HG.3; golden, by meaning and byte for byte). Do: rebuild the fixtures' repository from its texts
@@ -592,7 +590,7 @@ fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
   assert_eq!(head(state, hg.root), Some(made[3].node));
   assert_eq!(file(state, hg.root, "d").as_deref(), Some(&b"d\n"[..]));
   assert_eq!(hg.roots(state), BTreeSet::from([made[3].node]));
-  assert!(hg.holds(&made[3].node));
+  assert!(hg.holds(state, &made[3].node));
 }
 
 /// A-657 part 4 (`HG_TXNID`; 7.2's `localrepo.transaction`). Do: prepare stock `push-plain` on the rebuilt repository,
@@ -707,7 +705,7 @@ fn a_push_whose_line_moved_after_its_read_is_answered_as_7_2s_race() {
     let race = refused.map_err(|refused| encoded(&Reply::refused(&[], &refused)));
     assert_eq!(race, Err(fixture!("push-race-reply.hg").to_vec()));
     assert_eq!(head(state, hg.root), Some(made[2].node));
-    assert!(!hg.holds(&made[3].node));
+    assert!(!hg.holds(state, &made[3].node));
     assert_eq!(hg.roots(state), BTreeSet::from([made[2].node]));
   });
 }
@@ -766,7 +764,7 @@ fn a_push_is_refused_when_a_green_it_only_checked_moved() {
     let words = super::RACED.to_vec();
     assert_eq!(raced, Err(Refused::PushRaced { message: words }));
     assert_eq!(head(state, hg.root), Some(made[1].node));
-    assert!(!hg.holds(&made[3].node));
+    assert!(!hg.holds(state, &made[3].node));
   });
 }
 
@@ -908,6 +906,69 @@ fn set_policy(
     },
   );
   assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// Configures repository `name`'s policy, from its first version, to run the `pretxnchangegroup` hook `hook`.
+fn set_hook(state: &mut ShardState, name: &str, hook: &str) {
+  let reply = dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::SetRepositoryPolicy {
+      repository: name.to_owned(),
+      read: 0,
+      rules: Vec::new(),
+      hooks: vec![slates_ipc::protocol::HookConfig {
+        point: slates_ipc::protocol::HookPointName::HgPretxnchangegroup,
+        name: hook.to_owned(),
+        program: "/usr/local/bin/check".to_owned(),
+      }],
+      hooks_env: Vec::new(),
+      signers: Vec::new(),
+    },
+  );
+  assert_eq!(reply, ReplyBody::Acknowledged);
+}
+
+/// A-680 part 2b (`hg_push`'s module docs, "The driver" and "The hook gate"; golden: stock 7.2's `push-plain`). Do:
+/// rebuild the fixtures' repository twice, configure a `pretxnchangegroup` hook on the second, then send stock
+/// `push-plain`'s bundle through the driver both edges call, `heads` `force` as 7.2's client sends it with a bundle2, to
+/// the hooked repository and then to the first. Expect: the hooked one refused in an `error:abort` naming its hook, its
+/// line's green unmoved and its store's index without the changeset; the first answered with the reply 7.2's server
+/// wrote, byte for byte, judged over the served view of its store, `default`'s line at the pushed changeset and its
+/// store's index holding it.
+#[test]
+fn a_push_through_the_driver_lands_in_the_repositorys_store_unless_a_hook_waits() {
+  crate::daemon::audit_on_shard(|state| {
+    let mut driven = Hg::new(state, "driven");
+    let made = rebuild(state, &mut driven, (&[1], 1));
+    let mut hooked = Hg::new(state, "hooked");
+    rebuild(state, &mut hooked, (&[1], 1));
+    set_hook(state, "hooked", "pretxnchangegroup.check");
+    let (principal, heads) = (owner(), HeadsArgument::Force);
+    let pushing = (&principal, &heads, &fixture!("push-plain.hg")[..]);
+    let version = state.db.partition().green_head(hooked.root);
+    let refused = super::unbundle(state, hooked.repository, pushing, &mut room());
+    let message = b"the repository's pretxnchangegroup.check hook cannot run here yet: its view of the push is \
+                    not served"
+      .to_vec();
+    assert_eq!(
+      refused,
+      Some(Outcome::refused(&Refused::Abort {
+        message,
+        hint: None
+      }))
+    );
+    assert_eq!(state.db.partition().green_head(hooked.root), version);
+    assert!(!hooked.holds(state, &made[3].node));
+    let accepted = super::unbundle(state, driven.repository, pushing, &mut room());
+    let Some(Outcome::Accepted(reply)) = accepted else {
+      panic!("not accepted: {accepted:?}");
+    };
+    assert_eq!(encoded(&reply), fixture!("push-plain-reply.hg").to_vec());
+    assert_eq!(head(state, driven.root), Some(made[3].node));
+    assert!(driven.holds(state, &made[3].node));
+  });
 }
 
 /// A rule over `names` matching `pattern`, deciding a submit with `effect` for `who`.
