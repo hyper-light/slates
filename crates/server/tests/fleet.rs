@@ -13764,8 +13764,12 @@ const BUILT_VOLUME_FILES: usize = 1536;
 const BUILT_VOLUME_LIMIT: u64 = 16 << 20;
 /// Shape: the writers that write while the whole entry seals, each one file.
 const BUILT_WRITERS: usize = 8;
-/// Shape: the pieces the whole entry spans at least: the content's mebibytes.
-const BUILT_PIECES: u64 = 3;
+/// Derived: the turns the whole entry's build takes at least under the cut quantum: the content's bytes over one archive
+/// page (`slates_archive::format::MAX_BASE_PAGE_BYTES`), the piece a turn seals when its quantum is spent (w-forming,
+/// 2026-11-20). Until then a turn sealed a whole archive chunk (a MiB) however small its quantum: 87 to 302 ms of the
+/// owner shard's CPU a turn against quanta of 14 to 784 us in a debug fleet under `taskpolicy -b`.
+const BUILT_PIECES: u64 = (BUILT_VOLUME_FILES * BURST_VOLUME_FILE_BYTES) as u64
+  / slates_archive::format::MAX_BASE_PAGE_BYTES;
 /// Format: the owner's counts of whole entries sealed in turns, of their turns, and of the publications queued behind
 /// them (`live_ship::begin_whole_build`, `advance_whole_build`, `queue_behind_build`).
 const LIVE_WHOLE_BUILDS: &str = "fleet.live.whole_builds";
@@ -13920,7 +13924,7 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
   assert!(builds >= 1, "the whole entry was sealed in turns");
   assert!(
     turns >= BUILT_PIECES,
-    "the whole entry was sealed a piece a turn: {turns} turns for at least {BUILT_PIECES} pieces"
+    "the whole entry was sealed a page a turn under the cut quantum: {turns} turns for at least {BUILT_PIECES} pages"
   );
   assert!(
     queued >= 1,

@@ -12358,9 +12358,19 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > the answer is lent from it (`lend_held`), and the last hold's release gives the fork back. By use, a push and a new tag
 > landing after a fetch's first step: the held answer's pack is the start generation's objects in its order (each by
 > id, so byte for byte; the zlib level each is deflated at is the stream's own timed choice, §4.11). Before it, the
-> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. Owed for git: protocol v0's fetch
-> in turns, `begin`'s `ready` and cut and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a
-> run); the live `git clone` rows of the matrix (main's).
+> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. **`begin`'s walks in turns BUILT
+> (same day):** `negotiation::begin` does only what the request names (its wants, haves and shallow lines, the one-round
+> runs, `deepen-not`'s names) and answers at once only where no search could make the server ready (`wait-for-done`,
+> no common have); `ready`'s search (`ready::Readying`: a parent of the path's top a unit, its place an index into the
+> parents), the cut (`shallow::Cutting`: a commit of `deepen`'s breadth-first walk, a ref's tip of `deepen-relative`'s
+> search, a commit painted or judged of `deepen-since`/`deepen-not`'s) and `include-tag` (a run's version joined to what
+> the runs carry as runs of positions, `Graph::brought_set`; then a tag a unit, `Graph::tags_from` keeping its place by
+> the ref's index) are `Negotiating::step`'s, before the choice. The sections before the pack wait for them: the answer
+> writes nothing until they are decided (`upload::fetch::Before`), the acknowledgments alone when not ready, a refusal
+> before them answered as one refused whole. By test: over 2,000 commits and 500 tags, `begin` read 3,499 parents of
+> the graph on main (the whole search and cut), at most 4 now, and each step at most 2, the answer the one made whole.
+> Owed for git: protocol v0's fetch in turns, a plan of scattered positions (16 bytes a run); the live `git clone` rows
+> of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
@@ -12394,9 +12404,20 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > version (`Drive::with_encoding`, svn://'s `editor::encoding_of`). By test: `/trunk/big.txt` (6,000 lines) driven a
 > step a call, edited and added, in version 0 and version 2 with LZ4: before, 4 steps of 2.8-3.0 ms each run (debug);
 > now none past 500 us, and its stream is the whole-window path's byte for byte. The recorded svnserve sessions are
-> unchanged. Owed: the replay drive (`report::drive::replay`, svn://'s `replay`/`replay-range` and the dump exporter's
-> source) and `get-file-revs` (`reads::file_revs`) still make a window whole; the dump exporter's format 3 adopts the
-> maker (w-svn).
+> unchanged. **The replay drive and `get-file-revs` BUILT (same day, A-751 part 3).** Both make every window through
+> the same step (`report::drive::window_unit`, which hands each piece to its caller's sink). The replay drive
+> (`report::drive::replay`, svn://'s `replay` and `replay-range`) gives a window's pieces as the update drive does, a
+> step at a time (`Replay::next_within`). Its svn:// turn ends at the first step past the budget's quantum, as the
+> report exchange's does, where it was one whole call a step. `get-file-revs` (`reads::file_revs`) sends a revision as
+> its tuple, or its DAV element's head (`dav::listing::file_rev_head`), then its delta a step at a time: a string a
+> write over svn://, streamed base64 over DAV. It holds a window's two pieces at most, where it held both texts whole
+> and made the revision whole in one step. `Stream::resume` and the DAV file-revs report take the budget, so a slice
+> stops at its quantum. By test, `big.txt` (6,000 lines; added at r5, edited at r6), a step a call, a step over budget
+> timed again from its state before (a preemption under the suite's load reached 3.6 ms, past a whole window's 3.0 ms):
+> the replay of r6 and r5 and `get-file-revs` 5:6 over svn:// (svndiff 0 and 2) and DAV made no step past 500 us, where
+> whole-window steps made several of about 3 ms. Their deltas are the whole-window path's byte for byte, and the
+> recorded svnserve sessions (replay, `get-file-revs`, svndiff 0) are unchanged. The dump exporter computes its own
+> windows (`migration::export`, `deltas_at`); its format 3 adopting the maker is w-svn's.
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -56465,6 +56486,24 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   inside a record refused `Truncated`; too many, too long).
 - **Applied in the same change to** A-625 part 3's status and decision 3, `docs/wip/platforms.md` gap 2,
   `unsafe-budget.toml`, amendments.tsv.
+
+### A-755 — A live whole entry's build sizes each piece to the quantum left at the seal rate it measures (bug, 2026-11-20, w-forming; found by use: main's performance-gaps-upfront order; amends A-377's "one piece at least"; §4.10 "Live shipping"; CLAUDE.md "Bounded work everywhere")
+
+- **What was measured.** Probes in the live_chaos fresh-member flow (a debug fleet under `taskpolicy -b`, macOS arm64,
+  Mac Studio adas-mac-studio-4) timed each part of a whole build's turn: one piece, a whole archive chunk (a MiB), took
+  87 to 302 ms of the owner shard's CPU against seal quanta of 14 to 784 us. A-377 sealed pieces until the quantum passed,
+  one piece at least, and a piece was always a whole chunk.
+- **The change.** `WholeBuild` keeps the bytes it has sealed and the clock time their seals took; `piece_bytes` sizes each
+  next piece to what that rate seals in the turn's quantum left, at least one archive page (`MAX_BASE_PAGE_BYTES`, so a
+  turn moves the build on and a piece's name and tag stay a small share of it) and at most a chunk. Pieces of any size
+  open as before (`open_body` joins them in order).
+- **Owed (GAPS).** The append that ends a build (223 to 498 ms of CPU a turn in the same runs) and a large delta's
+  shipper append stay one turn.
+- **Tests.** `live_ship::tests::a_whole_builds_piece_is_what_the_measured_rate_seals_in_the_quantum_left`; the fleet test
+  `a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it` now holds the build to at least the
+  content's bytes over a page in turns under the cut quantum (48 for 3 MiB), red before (8 turns); `--test fleet whole`
+  5/5, `--test fleet live` 20/20, `--lib live_ship::` 24/24.
+- **Applied in the same change to** A-377's doc lines in `live_ship.rs`, GAPS (the one-turn walks entry), amendments.tsv.
 
 ### A-697 part e2 — A holder creation a restart caught waiting for its admission releases the owner's floor before it is dropped (2026-11-20, w-shared for UI goal 93; main's order: performance gaps up front, held history the same waste as A-742's)
 Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's step two), `crates/db/src/catalog.rs`

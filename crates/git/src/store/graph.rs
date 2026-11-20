@@ -30,6 +30,7 @@ use super::abbrev::Abbrev;
 use super::{Chain, Place, Repository, StoreRefused};
 use crate::negotiation::{CommitRow, Graph};
 use crate::object_name::{Kind, ObjectId};
+use crate::positions::Positions;
 use crate::store::rows::ObjectRow;
 use crate::{Admission, PastAdmission};
 
@@ -398,18 +399,45 @@ impl Graph for StoreGraph<'_> {
   }
 
   fn brought(&self, green: u64, version: u64) -> impl Iterator<Item = u64> {
+    self
+      .brought_set(green, version)
+      .iter()
+      .collect::<Vec<u64>>()
+      .into_iter()
+  }
+
+  fn brought_set(&self, green: u64, version: u64) -> Positions {
     let read = usize::try_from(version)
       .map_err(|_| StoreRefused::NoVersion { green, version })
       .and_then(|index| self.repository.brought(self.store, green, index));
-    let positions = match read {
-      Ok(positions) => positions.iter().collect::<Vec<u64>>(),
-      Err(StoreRefused::NoVersion { .. }) => Vec::new(),
+    match read {
+      Ok(positions) => positions,
+      Err(StoreRefused::NoVersion { .. }) => Positions::new(),
       Err(refused) => {
         self.failed(GraphFault::Store(refused));
-        Vec::new()
+        Positions::new()
       }
-    };
-    positions.into_iter()
+    }
+  }
+
+  fn tips_from(&self, from: usize) -> impl Iterator<Item = (usize, u64)> {
+    self
+      .refs
+      .iter()
+      .enumerate()
+      .skip(from)
+      .filter_map(|(at, named)| Some((at, self.chain(named.green).and_then(Chain::head)?)))
+  }
+
+  fn tags_from(&self, from: usize) -> impl Iterator<Item = (usize, u64)> {
+    self
+      .refs
+      .iter()
+      .enumerate()
+      .skip(from)
+      .filter(|(_, named)| named.name.starts_with(TAGS))
+      .filter_map(|(at, named)| Some((at, self.chain(named.green).and_then(Chain::head)?)))
+      .filter(|(_, head)| self.kind(*head) == Kind::Tag)
   }
 }
 

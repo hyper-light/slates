@@ -2332,6 +2332,9 @@ struct WholeBuild {
   queued: VecDeque<Queued>,
   /// The bytes of the deltas in `queued`: held to the credit, as their entries would be.
   queued_bytes: usize,
+  /// The bytes sealed so far and the clock time their seals took, the rate the next piece is sized by
+  /// ([`piece_bytes`]).
+  seal_rate: (u64, u64),
 }
 
 impl std::fmt::Debug for WholeBuild {
@@ -2421,6 +2424,7 @@ fn begin_whole_build_with(
     appended: false,
     queued,
     queued_bytes,
+    seal_rate: (0, 0),
   }));
   state.count(LIVE_WHOLE_BUILDS, 1);
   if advance_whole_build(state, id) == Advance::Done {
@@ -2447,9 +2451,27 @@ async fn whole_build_task(id: slates_db::catalog::VolumeId) {
   }
 }
 
+/// The bytes of a whole build's next piece: what the seal rate measured so far in the build (`(bytes, ns)`) seals in the
+/// turn's quantum `left`, at least `floor` (one archive page, so every turn moves the build on and a piece's name and tag
+/// stay a small share of it) and at most `cap` (an archive chunk); `floor` before any rate is measured. Until 2026-11-20 a
+/// turn sealed whole chunks, a MiB at least however small its quantum: 87 to 302 ms of the owner shard's CPU a turn
+/// against quanta of 14 to 784 us in a debug fleet under `taskpolicy -b` (w-forming's probes; A-377's bound).
+fn piece_bytes((bytes, ns): (u64, u64), left: u64, floor: usize, cap: usize) -> usize {
+  if bytes == 0 || ns == 0 {
+    return floor.min(cap);
+  }
+  let fits = u128::from(bytes)
+    .saturating_mul(u128::from(left))
+    .checked_div(u128::from(ns))
+    .unwrap_or(0);
+  usize::try_from(fits)
+    .unwrap_or(usize::MAX)
+    .clamp(floor.min(cap), cap)
+}
+
 /// One turn of `id`'s [`WholeBuild`]: its next pieces sealed until the seal turns' share of the shard's quantum has
-/// passed (`config::wrap_slice_ns`, as a seal's wrap and a takeover's open are held, A-323, A-347), one piece at least,
-/// so every turn moves it on; once every piece is sealed, what the credit admits is appended ([`append_build`]). A
+/// passed (`config::wrap_slice_ns`, as a seal's wrap and a takeover's open are held, A-323, A-347), each sized to what is
+/// left of it at the rate measured so far ([`piece_bytes`]), one page at least, so every turn moves it on; once every piece is sealed, what the credit admits is appended ([`append_build`]). A
 /// build whose owner was superseded, or whose keys are refused, ends here.
 fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Advance {
   let superseded = match state.live.shipping.get(&id.bytes) {
@@ -2479,17 +2501,31 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
   else {
     return Advance::Done;
   };
+  let floor = usize::try_from(slates_archive::format::MAX_BASE_PAGE_BYTES)
+    .unwrap_or(cap)
+    .clamp(1, cap);
   let mut refused = false;
-  while let Some(piece) = build
-    .body
-    .get(build.next..build.next.saturating_add(cap).min(build.body.len()))
-    .filter(|piece| !piece.is_empty())
-  {
+  loop {
+    let left = quantum.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+    let size = piece_bytes(build.seal_rate, left, floor, cap);
+    let Some(piece) = build
+      .body
+      .get(build.next..build.next.saturating_add(size).min(build.body.len()))
+      .filter(|piece| !piece.is_empty())
+    else {
+      break;
+    };
+    let piece_began = slates_rt::futures::now_ns();
     let chunk = slates_archive::Archive::raw_chunk(piece.to_vec());
     let Ok(sealed) = slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, segment) else {
       refused = true;
       break;
     };
+    let (rate_bytes, rate_ns) = build.seal_rate;
+    build.seal_rate = (
+      rate_bytes.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX)),
+      rate_ns.saturating_add(slates_rt::futures::now_ns().saturating_sub(piece_began)),
+    );
     build.next = build.next.saturating_add(piece.len());
     build.sealed.push(SealedPiece {
       name: sealed.name.to_vec(),
@@ -6858,6 +6894,27 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A whole build's piece sizing (w-forming, 2026-11-20; found by use: a turn sealed a MiB however small its quantum).
+  /// Do: size a piece with no rate measured, with a rate that fits half a MiB in the quantum left, with one that fits a
+  /// byte, and with one that fits ten MiB. Expect: a page; half a MiB; a page (the floor); a MiB (the cap).
+  #[test]
+  fn a_whole_builds_piece_is_what_the_measured_rate_seals_in_the_quantum_left() {
+    const PAGE: usize = 64 << 10;
+    const CHUNK: usize = 1 << 20;
+    assert_eq!(super::piece_bytes((0, 0), 1_000, PAGE, CHUNK), PAGE);
+    // A MiB in 2 ms of sealing: half a MiB fits a 1 ms quantum.
+    assert_eq!(
+      super::piece_bytes((1 << 20, 2_000_000), 1_000_000, PAGE, CHUNK),
+      CHUNK / 2
+    );
+    assert_eq!(super::piece_bytes((1, 1_000_000), 1_000, PAGE, CHUNK), PAGE);
+    assert_eq!(
+      super::piece_bytes((10 << 20, 1_000), 1_000, PAGE, CHUNK),
+      CHUNK
+    );
+    assert_eq!(super::piece_bytes((1 << 20, 1_000), 0, PAGE, CHUNK), PAGE);
+  }
 
   /// A live volume grown far past its last whole record: do ask what a publication bounds the retained tail by. Expect
   /// the volume as it is now, what installing it would send. A whole record comes only once the log reaches the volume's
